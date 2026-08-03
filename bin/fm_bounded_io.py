@@ -29,6 +29,8 @@ from typing import Any, NoReturn, Sequence
 DEFAULT_CLEANUP_GRACE_SECONDS = 0.25
 DEFAULT_JSON_MAX_DEPTH = 64
 DEFAULT_JSON_MAX_ITEMS = 4096
+DEFAULT_PROCESS_CENSUS_MAX_ARGUMENT_BYTES = 4 * 1024 * 1024
+DEFAULT_PROCESS_CENSUS_MAX_ITEMS = 16_384
 INTERNAL_SUPERVISOR_MODE = "--bounded-io-supervisor"
 OWNERSHIP_ENVIRONMENT_KEY = "FM_BOUNDED_IO_OWNERSHIP"
 SUPERVISOR_STATUS_LIMIT = 4096
@@ -107,6 +109,43 @@ class DeadlineBudget:
         return min(self.deadline, now + requested)
 
 
+class _ProcessCensusBudget:
+    def __init__(
+        self,
+        deadline: float,
+        maximum_items: int = DEFAULT_PROCESS_CENSUS_MAX_ITEMS,
+        maximum_argument_bytes: int = DEFAULT_PROCESS_CENSUS_MAX_ARGUMENT_BYTES,
+    ) -> None:
+        self.deadline = deadline
+        self.maximum_items = maximum_items
+        self.maximum_argument_bytes = maximum_argument_bytes
+        self.items = 0
+        self.argument_bytes = 0
+
+    def checkpoint(self) -> None:
+        if time.monotonic() >= self.deadline:
+            raise OSError(errno.ETIMEDOUT, "bounded process inventory timed out")
+
+    def consume_item(self) -> None:
+        self.checkpoint()
+        self.items += 1
+        if self.items > self.maximum_items:
+            raise OSError(errno.EOVERFLOW, "bounded process inventory is oversized")
+
+    def ensure_item_count(self, count: int) -> None:
+        self.checkpoint()
+        if count > self.maximum_items:
+            raise OSError(errno.EOVERFLOW, "bounded process inventory is oversized")
+
+    def consume_argument_bytes(self, count: int) -> None:
+        self.checkpoint()
+        self.argument_bytes += count
+        if self.argument_bytes > self.maximum_argument_bytes:
+            raise OSError(
+                errno.EOVERFLOW, "bounded process arguments inventory is oversized"
+            )
+
+
 def _write_supervisor_status(descriptor: int, code: str, detail: str = "") -> None:
     safe_detail = detail.replace("\n", " ")[:1024]
     payload = f"{code}:{safe_detail}\n".encode("utf-8", "backslashreplace")
@@ -136,11 +175,17 @@ def _linux_enable_subreaper() -> None:
         raise OSError(error, os.strerror(error))
 
 
-def _linux_process_identity(process_id: int) -> tuple[int, int] | None:
+def _linux_process_identity(
+    process_id: int, budget: _ProcessCensusBudget | None = None
+) -> tuple[int, int] | None:
+    if budget is not None:
+        budget.checkpoint()
     try:
         raw = Path(f"/proc/{process_id}/stat").read_text(encoding="ascii")
     except (OSError, UnicodeError):
         return None
+    if budget is not None:
+        budget.checkpoint()
     closing = raw.rfind(")")
     if closing < 0:
         return None
@@ -153,31 +198,44 @@ def _linux_process_identity(process_id: int) -> tuple[int, int] | None:
         return None
 
 
-def _linux_children(process_id: int) -> list[int]:
+def _linux_children(process_id: int, budget: _ProcessCensusBudget) -> list[int]:
+    budget.checkpoint()
     try:
         raw = Path(f"/proc/{process_id}/task/{process_id}/children").read_text(
             encoding="ascii"
         )
     except (OSError, UnicodeError):
         return []
+    budget.checkpoint()
     try:
-        return [int(value) for value in raw.split()]
+        children = [int(value) for value in raw.split()]
     except ValueError:
         return []
+    budget.ensure_item_count(len(children))
+    return children
 
 
-def _linux_owned_processes() -> dict[int, tuple[int, int]]:
+def _linux_owned_processes(
+    budget: _ProcessCensusBudget,
+) -> dict[int, tuple[int, int]]:
     owned: dict[int, tuple[int, int]] = {}
-    pending = _linux_children(os.getpid())
+    pending = _linux_children(os.getpid(), budget)
+    queued = set(pending)
     while pending:
+        budget.checkpoint()
         process_id = pending.pop()
         if process_id in owned:
             continue
-        identity = _linux_process_identity(process_id)
+        budget.consume_item()
+        identity = _linux_process_identity(process_id, budget)
         if identity is None:
             continue
         owned[process_id] = identity
-        pending.extend(_linux_children(process_id))
+        for child_id in _linux_children(process_id, budget):
+            if child_id not in queued:
+                queued.add(child_id)
+                budget.ensure_item_count(len(queued))
+                pending.append(child_id)
     return owned
 
 
@@ -208,7 +266,26 @@ class _DarwinBsdInfo(ctypes.Structure):
     ]
 
 
-def _darwin_process_table() -> dict[int, tuple[int, int, int, tuple[int, int]]]:
+class _DarwinUniqueIdentifierInfo(ctypes.Structure):
+    _fields_ = [
+        ("uuid", ctypes.c_uint8 * 16),
+        ("unique_id", ctypes.c_uint64),
+        ("parent_unique_id", ctypes.c_uint64),
+        ("id_version", ctypes.c_int32),
+        ("original_parent_id_version", ctypes.c_int32),
+        ("reserved2", ctypes.c_uint64),
+        ("reserved3", ctypes.c_uint64),
+    ]
+
+
+class _DarwinAuditToken(ctypes.Structure):
+    _fields_ = [("values", ctypes.c_uint32 * 8)]
+
+
+def _darwin_process_table(
+    budget: _ProcessCensusBudget,
+) -> dict[int, tuple[int, int, int, tuple[int, int]]]:
+    budget.checkpoint()
     libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
     list_all = libproc.proc_listallpids
     list_all.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -223,18 +300,22 @@ def _darwin_process_table() -> dict[int, tuple[int, int, int, tuple[int, int]]]:
     ]
     pid_info.restype = ctypes.c_int
     capacity = list_all(None, 0)
-    if capacity < 0 or capacity > 131_072:
+    budget.checkpoint()
+    if capacity < 0 or capacity > budget.maximum_items:
         raise OSError(ctypes.get_errno(), "bounded process inventory is unavailable")
     processes = (ctypes.c_int * (capacity + 256))()
     count = list_all(processes, ctypes.sizeof(processes))
-    if count < 0 or count > len(processes):
+    budget.checkpoint()
+    if count < 0 or count > len(processes) or count > budget.maximum_items:
         raise OSError(ctypes.get_errno(), "bounded process inventory changed")
     table: dict[int, tuple[int, int, int, tuple[int, int]]] = {}
     for process_id in processes[:count]:
+        budget.consume_item()
         if process_id <= 0:
             continue
         info = _DarwinBsdInfo()
         copied = pid_info(process_id, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+        budget.checkpoint()
         if copied != ctypes.sizeof(info) or info.pid != process_id:
             continue
         table[process_id] = (
@@ -246,7 +327,11 @@ def _darwin_process_table() -> dict[int, tuple[int, int, int, tuple[int, int]]]:
     return table
 
 
-def _darwin_process_identity(process_id: int) -> tuple[int, int] | None:
+def _darwin_process_identity(
+    process_id: int, budget: _ProcessCensusBudget | None = None
+) -> tuple[int, int] | None:
+    if budget is not None:
+        budget.checkpoint()
     libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
     pid_info = libproc.proc_pidinfo
     pid_info.argtypes = [
@@ -259,12 +344,38 @@ def _darwin_process_identity(process_id: int) -> tuple[int, int] | None:
     pid_info.restype = ctypes.c_int
     info = _DarwinBsdInfo()
     copied = pid_info(process_id, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+    if budget is not None:
+        budget.checkpoint()
     if copied != ctypes.sizeof(info) or info.pid != process_id:
         return None
     return int(info.started_seconds), int(info.started_microseconds)
 
 
-def _darwin_process_arguments(process_id: int) -> bytes | None:
+def _darwin_process_audit_token(process_id: int) -> _DarwinAuditToken | None:
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    pid_info = libproc.proc_pidinfo
+    pid_info.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    pid_info.restype = ctypes.c_int
+    info = _DarwinUniqueIdentifierInfo()
+    copied = pid_info(process_id, 17, 0, ctypes.byref(info), ctypes.sizeof(info))
+    if copied != ctypes.sizeof(info):
+        return None
+    token = _DarwinAuditToken()
+    token.values[5] = process_id
+    token.values[7] = info.id_version
+    return token
+
+
+def _darwin_process_arguments(
+    process_id: int, budget: _ProcessCensusBudget
+) -> bytes | None:
+    budget.checkpoint()
     libc = ctypes.CDLL(None, use_errno=True)
     sysctl = libc.sysctl
     sysctl.argtypes = [
@@ -280,39 +391,58 @@ def _darwin_process_arguments(process_id: int) -> bytes | None:
     size = ctypes.c_size_t()
     if sysctl(query, 3, None, ctypes.byref(size), None, 0) != 0:
         return None
+    budget.checkpoint()
     if size.value <= 0 or size.value > 1_048_576:
         raise OSError(errno.EOVERFLOW, "bounded process arguments are oversized")
+    budget.consume_argument_bytes(size.value)
     buffer = ctypes.create_string_buffer(size.value)
     if sysctl(query, 3, buffer, ctypes.byref(size), None, 0) != 0:
         return None
+    budget.checkpoint()
     return buffer.raw[: size.value]
+
+
+def _darwin_descendants(
+    table: dict[int, tuple[int, int, int, tuple[int, int]]],
+    roots: dict[int, tuple[int, int]],
+    budget: _ProcessCensusBudget,
+) -> dict[int, tuple[int, int]]:
+    children: dict[int, list[tuple[int, tuple[int, int]]]] = {}
+    for process_id, (parent_id, _group_id, _uid, identity) in table.items():
+        budget.checkpoint()
+        children.setdefault(parent_id, []).append((process_id, identity))
+    owned = dict(roots)
+    pending = list(roots)
+    while pending:
+        budget.checkpoint()
+        parent_id = pending.pop()
+        for process_id, identity in children.get(parent_id, ()):
+            budget.checkpoint()
+            if process_id in owned:
+                continue
+            owned[process_id] = identity
+            pending.append(process_id)
+    return owned
 
 
 def _darwin_owned_processes(
     command_id: int,
     token: str,
     known: dict[int, tuple[int, int]],
+    budget: _ProcessCensusBudget,
 ) -> dict[int, tuple[int, int]]:
-    table = _darwin_process_table()
-    owned: dict[int, tuple[int, int]] = {}
-    pending: set[int] = set()
+    table = _darwin_process_table(budget)
+    roots: dict[int, tuple[int, int]] = {}
     for process_id, identity in known.items():
+        budget.checkpoint()
         current = table.get(process_id)
         if current is not None and current[3] == identity:
-            pending.add(process_id)
-            owned[process_id] = identity
-    changed = True
-    while changed:
-        changed = False
-        for process_id, (parent_id, _group_id, _uid, identity) in table.items():
-            if process_id in pending or parent_id in pending:
-                if process_id not in pending:
-                    pending.add(process_id)
-                    changed = True
-                owned[process_id] = identity
+            roots[process_id] = identity
+    owned = _darwin_descendants(table, roots, budget)
     marker = f"{OWNERSHIP_ENVIRONMENT_KEY}={token}\0".encode("ascii")
     earliest_owned_start = min(known.values(), default=(0, 0))
     for process_id, (_parent_id, group_id, uid, identity) in table.items():
+        budget.checkpoint()
         if process_id == os.getpid() or process_id in owned:
             continue
         if group_id == os.getpgrp():
@@ -320,7 +450,7 @@ def _darwin_owned_processes(
             continue
         if uid != os.getuid() or identity < earliest_owned_start:
             continue
-        arguments = _darwin_process_arguments(process_id)
+        arguments = _darwin_process_arguments(process_id, budget)
         if arguments is not None and marker in arguments:
             owned[process_id] = identity
     return owned
@@ -329,50 +459,90 @@ def _darwin_owned_processes(
 def _darwin_record_descendants(
     command_id: int,
     known: dict[int, tuple[int, int]],
+    budget: _ProcessCensusBudget,
 ) -> dict[int, tuple[int, int]]:
-    table = _darwin_process_table()
-    owned: dict[int, tuple[int, int]] = {}
-    pending: set[int] = set()
+    table = _darwin_process_table(budget)
+    roots: dict[int, tuple[int, int]] = {}
     command = table.get(command_id)
     if command is not None:
-        pending.add(command_id)
-        owned[command_id] = command[3]
+        roots[command_id] = command[3]
     for process_id, identity in known.items():
+        budget.checkpoint()
         current = table.get(process_id)
         if current is not None and current[3] == identity:
-            pending.add(process_id)
-            owned[process_id] = identity
-    changed = True
-    while changed:
-        changed = False
-        for process_id, (parent_id, _group_id, _uid, identity) in table.items():
-            if parent_id in pending and process_id not in pending:
-                pending.add(process_id)
-                owned[process_id] = identity
-                changed = True
-    return owned
+            roots[process_id] = identity
+    return _darwin_descendants(table, roots, budget)
 
 
-def _identity_still_matches(process_id: int, identity: tuple[int, int]) -> bool:
-    if sys.platform.startswith("linux"):
-        return _linux_process_identity(process_id) == identity
-    return _darwin_process_identity(process_id) == identity
-
-
-def _signal_owned_processes(
-    owned: dict[int, tuple[int, int]], signal_number: int
+def _linux_signal_owned_process(
+    process_id: int, identity: tuple[int, int], signal_number: int
 ) -> None:
-    for process_id, identity in owned.items():
-        if not _identity_still_matches(process_id, identity):
-            continue
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_open is None or pidfd_send_signal is None:
+        fail("identity-bound process signaling is unavailable")
+    try:
+        descriptor = pidfd_open(process_id)
+    except ProcessLookupError:
+        return
+    except OSError as exc:
+        raise BoundedIOError(
+            f"owned process {process_id} could not be identity-bound"
+        ) from exc
+    try:
+        if _linux_process_identity(process_id) != identity:
+            return
         try:
-            os.kill(process_id, signal_number)
+            pidfd_send_signal(descriptor, signal_number)
         except ProcessLookupError:
-            continue
-        except PermissionError as exc:
+            return
+        except OSError as exc:
             raise BoundedIOError(
                 f"owned process {process_id} could not be signaled"
             ) from exc
+    finally:
+        os.close(descriptor)
+
+
+def _darwin_signal_audit_token(
+    token: _DarwinAuditToken, signal_number: int
+) -> int:
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    signal_process = libproc.proc_signal_with_audittoken
+    signal_process.argtypes = [ctypes.POINTER(_DarwinAuditToken), ctypes.c_int]
+    signal_process.restype = ctypes.c_int
+    return int(signal_process(ctypes.byref(token), signal_number))
+
+
+def _darwin_signal_owned_process(
+    process_id: int, identity: tuple[int, int], signal_number: int
+) -> None:
+    token = _darwin_process_audit_token(process_id)
+    current_identity = _darwin_process_identity(process_id)
+    if token is None:
+        if current_identity == identity:
+            fail(f"owned process {process_id} could not be identity-bound")
+        return
+    if current_identity != identity:
+        return
+    result = _darwin_signal_audit_token(token, signal_number)
+    if result == 0 or result == errno.ESRCH:
+        return
+    raise BoundedIOError(f"owned process {process_id} could not be signaled")
+
+
+def _signal_owned_processes(
+    owned: dict[int, tuple[int, int]], signal_number: int, deadline: float
+) -> None:
+    for process_id, identity in owned.items():
+        if time.monotonic() >= deadline:
+            fail("owned-process signaling exceeded the absolute deadline")
+        if sys.platform.startswith("linux"):
+            _linux_signal_owned_process(process_id, identity, signal_number)
+        elif sys.platform == "darwin":
+            _darwin_signal_owned_process(process_id, identity, signal_number)
+        else:
+            fail("identity-bound process signaling is unavailable")
 
 
 def _reap_supervisor_children(
@@ -395,10 +565,12 @@ def _supervisor_owned_processes(
     command_id: int,
     token: str,
     known: dict[int, tuple[int, int]],
+    deadline: float,
 ) -> dict[int, tuple[int, int]]:
+    budget = _ProcessCensusBudget(deadline)
     if sys.platform.startswith("linux"):
-        return _linux_owned_processes()
-    return _darwin_owned_processes(command_id, token, known)
+        return _linux_owned_processes(budget)
+    return _darwin_owned_processes(command_id, token, known, budget)
 
 
 def _supervisor_cleanup(
@@ -415,7 +587,7 @@ def _supervisor_cleanup(
     while True:
         command_status = _reap_supervisor_children(command_id, command_status)
         try:
-            owned = _supervisor_owned_processes(command_id, token, known)
+            owned = _supervisor_owned_processes(command_id, token, known, deadline)
         except OSError as exc:
             return command_status, False, f"owned-process inventory failed: {exc}"
         known.update(owned)
@@ -428,10 +600,9 @@ def _supervisor_cleanup(
         if now >= term_deadline:
             signal_number = signal.SIGKILL
         try:
-            _signal_owned_processes(owned, signal_number)
+            _signal_owned_processes(owned, signal_number, deadline)
         except BoundedIOError as exc:
             return command_status, False, str(exc)
-        time.sleep(min(0.01, max(0, deadline - time.monotonic())))
 
 
 def _run_supervisor(arguments: Sequence[str]) -> int:
@@ -465,6 +636,7 @@ def _run_supervisor(arguments: Sequence[str]) -> int:
         )
         _write_supervisor_status(status_descriptor, "C")
         return 126
+    _write_supervisor_status(status_descriptor, "R")
     token = secrets.token_hex(24)
     command_environment = dict(os.environ)
     command_environment[OWNERSHIP_ENVIRONMENT_KEY] = token
@@ -495,7 +667,11 @@ def _run_supervisor(arguments: Sequence[str]) -> int:
         if sys.platform == "darwin" and time.monotonic() >= next_inventory:
             try:
                 initial_known.update(
-                    _darwin_record_descendants(command.pid, initial_known)
+                    _darwin_record_descendants(
+                        command.pid,
+                        initial_known,
+                        _ProcessCensusBudget(deadline),
+                    )
                 )
             except OSError as exc:
                 _write_supervisor_status(
@@ -542,6 +718,8 @@ def _consume_supervisor_status(
                 state["error"] = "supervisor returned a malformed command status"
         elif code == b"C":
             state["cleanup_verified"] = True
+        elif code == b"R":
+            state["ready"] = True
         elif code == b"E":
             state["error"] = decoded or "bounded command supervisor failed"
         elif code == b"U":
@@ -592,6 +770,8 @@ def run_bounded(
 
     if not arguments or any(not isinstance(item, str) or not item for item in arguments):
         fail("bounded command arguments must be nonempty strings")
+    if input_bytes is not None and not isinstance(input_bytes, bytes):
+        fail("bounded command input must be bytes")
     timeout = positive_number(timeout_seconds, "timeout seconds")
     output_limit = positive_integer(maximum_output_bytes, "maximum output bytes")
     started = time.monotonic()
@@ -606,48 +786,14 @@ def run_bounded(
         raise BoundedTimeout("bounded command deadline expired before start")
     cleanup_grace = min(
         positive_number(cleanup_grace_seconds, "cleanup grace seconds"),
-        available / 2,
+        available * 0.8,
     )
     command_deadline = deadline - cleanup_grace
-    selector = selectors.DefaultSelector()
-    status_read, status_write = os.pipe()
-    os.set_blocking(status_read, False)
-    supervisor_arguments = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        INTERNAL_SUPERVISOR_MODE,
-        str(status_write),
-        repr(deadline),
-        repr(cleanup_grace),
-        "--",
-        *arguments,
-    ]
-    try:
-        process = subprocess.Popen(
-            supervisor_arguments,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            pass_fds=(status_write,),
-        )
-    except FileNotFoundError:
-        selector.close()
-        os.close(status_read)
-        os.close(status_write)
-        fail(f"bounded supervisor is unavailable: {sys.executable}")
-    except OSError as exc:
-        selector.close()
-        os.close(status_read)
-        os.close(status_write)
-        fail(f"bounded supervisor could not start: {exc}")
-
     output = {"stdout": bytearray(), "stderr": bytearray()}
     status_buffer = bytearray()
     state: dict[str, Any] = {
         "returncode": None,
+        "ready": False,
         "cleanup_verified": False,
         "cleanup_error": None,
         "error": None,
@@ -655,9 +801,46 @@ def run_bounded(
     captured = 0
     input_offset = 0
     input_view = memoryview(input_bytes) if input_bytes else None
+    input_length = len(input_view) if input_view is not None else 0
     primary_error: BaseException | None = None
     result: CommandResult | None = None
+    process: subprocess.Popen[bytes] | None = None
+    selector: selectors.BaseSelector | None = None
+    status_read = -1
+    status_write = -1
     try:
+        selector = selectors.DefaultSelector()
+        status_read, status_write = os.pipe()
+        os.set_blocking(status_read, False)
+        supervisor_arguments = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            INTERNAL_SUPERVISOR_MODE,
+            str(status_write),
+            repr(deadline),
+            repr(cleanup_grace),
+            "--",
+            *arguments,
+        ]
+        try:
+            process = subprocess.Popen(
+                supervisor_arguments,
+                cwd=cwd,
+                env=env,
+                stdin=(
+                    subprocess.PIPE
+                    if input_bytes is not None
+                    else subprocess.DEVNULL
+                ),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                pass_fds=(status_write,),
+            )
+        except FileNotFoundError:
+            fail(f"bounded supervisor is unavailable: {sys.executable}")
+        except OSError as exc:
+            fail(f"bounded supervisor could not start: {exc}")
         os.close(status_write)
         status_write = -1
         streams = {"stdout": process.stdout, "stderr": process.stderr}
@@ -668,7 +851,7 @@ def run_bounded(
             selector.register(stream, selectors.EVENT_READ, label)
         selector.register(status_read, selectors.EVENT_READ, "status")
         if process.stdin is not None:
-            if input_bytes:
+            if input_length:
                 os.set_blocking(process.stdin.fileno(), False)
                 selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
             else:
@@ -700,7 +883,7 @@ def run_bounded(
                     except BrokenPipeError:
                         written = 0
                     input_offset += written
-                    if written == 0 or input_offset == len(input_bytes):
+                    if written == 0 or input_offset == input_length:
                         selector.unregister(stream)
                         stream.close()
                     continue
@@ -759,8 +942,13 @@ def run_bounded(
     except BaseException as exc:
         primary_error = exc
     finally:
-        if not state["cleanup_verified"]:
-            _request_anchor_abort(process)
+        cleanup_failure: str | None = None
+        anchor_reaped = process is None
+        if process is not None and not state["cleanup_verified"]:
+            abort_requested = False
+            if state["ready"]:
+                _request_anchor_abort(process)
+                abort_requested = True
             while time.monotonic() < deadline and not state["cleanup_verified"]:
                 if status_read < 0:
                     break
@@ -775,22 +963,29 @@ def run_bounded(
                 if len(status_buffer) > SUPERVISOR_STATUS_LIMIT:
                     break
                 _consume_supervisor_status(status_buffer, state)
-        anchor_reaped = _reap_anchor(process, deadline)
-        selector.close()
+                if state["ready"] and not abort_requested:
+                    _request_anchor_abort(process)
+                    abort_requested = True
+        if process is not None:
+            anchor_reaped = _reap_anchor(process, deadline)
+        if selector is not None:
+            selector.close()
         if status_read >= 0:
             os.close(status_read)
         if status_write >= 0:
             os.close(status_write)
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None and not stream.closed:
-                stream.close()
+        if process is not None:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
         if input_view is not None:
             input_view.release()
-        cleanup_failure = state["cleanup_error"]
-        if not anchor_reaped or not state["cleanup_verified"]:
-            cleanup_failure = cleanup_failure or (
-                f"cleanup could not be verified for anchored process {process.pid}"
-            )
+        if process is not None:
+            cleanup_failure = state["cleanup_error"]
+            if not anchor_reaped or not state["cleanup_verified"]:
+                cleanup_failure = cleanup_failure or (
+                    f"cleanup could not be verified for anchored process {process.pid}"
+                )
         if cleanup_failure:
             cleanup_error = BoundedIOError(str(cleanup_failure))
             if primary_error is not None:

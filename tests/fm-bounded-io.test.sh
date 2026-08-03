@@ -137,6 +137,138 @@ assert not spawned
 PY
 }
 
+test_input_validation_precedes_spawn() {
+  python3 - "$HELPER" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_bounded_io", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+spawned = []
+
+
+def unexpected_spawn(*_args, **_kwargs):
+    spawned.append(True)
+    raise AssertionError("supervisor spawned before input validation completed")
+
+
+module.subprocess.Popen = unexpected_spawn
+try:
+    module.run_bounded(
+        [sys.executable, "-c", "raise SystemExit(0)"],
+        timeout_seconds=1,
+        maximum_output_bytes=1024,
+        input_bytes=object(),
+    )
+except module.BoundedIOError as error:
+    assert "input must be bytes" in str(error), str(error)
+else:
+    raise AssertionError("non-buffer input was accepted")
+assert not spawned
+PY
+}
+
+test_identity_bound_signaling_avoids_reused_pids() {
+  python3 - "$HELPER" <<'PY'
+import errno
+import importlib.util
+import signal
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_bounded_io", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+identity = (321, 17)
+sent = []
+closed = []
+unsafe = []
+module.os.pidfd_open = lambda process_id: 44
+module.signal.pidfd_send_signal = (
+    lambda descriptor, signal_number: sent.append((descriptor, signal_number))
+)
+module._linux_process_identity = lambda process_id: identity
+module.os.close = lambda descriptor: closed.append(descriptor)
+module.os.kill = lambda process_id, signal_number: unsafe.append(
+    (process_id, signal_number)
+)
+module._linux_signal_owned_process(321, identity, signal.SIGTERM)
+assert sent == [(44, signal.SIGTERM)], sent
+assert closed == [44], closed
+assert not unsafe, unsafe
+sent.clear()
+module._linux_process_identity = lambda process_id: (321, 18)
+module._linux_signal_owned_process(321, identity, signal.SIGKILL)
+assert not sent, sent
+assert closed == [44, 44], closed
+token = object()
+darwin_sent = []
+module._darwin_process_audit_token = lambda process_id: token
+module._darwin_process_identity = lambda process_id: identity
+module._darwin_signal_audit_token = (
+    lambda observed, signal_number: darwin_sent.append(
+        (observed, signal_number)
+    ) or 0
+)
+module._darwin_signal_owned_process(321, identity, signal.SIGTERM)
+assert darwin_sent == [(token, signal.SIGTERM)], darwin_sent
+module._darwin_signal_audit_token = lambda _token, _signal_number: errno.ESRCH
+module._darwin_signal_owned_process(321, identity, signal.SIGKILL)
+assert not unsafe, unsafe
+PY
+}
+
+test_process_census_enforces_item_and_time_bounds() {
+  python3 - "$HELPER" <<'PY'
+import errno
+import importlib.util
+import sys
+import time
+
+spec = importlib.util.spec_from_file_location("fm_bounded_io", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+budget = module._ProcessCensusBudget(
+    time.monotonic() + 1,
+    maximum_items=2,
+    maximum_argument_bytes=8,
+)
+module._linux_children = lambda process_id, census: [101, 102, 103]
+try:
+    module._linux_owned_processes(budget)
+except OSError as error:
+    assert error.errno == errno.EOVERFLOW, error
+else:
+    raise AssertionError("process census item limit was not enforced")
+budget = module._ProcessCensusBudget(
+    time.monotonic() + 1,
+    maximum_items=8,
+    maximum_argument_bytes=8,
+)
+budget.consume_argument_bytes(8)
+try:
+    budget.consume_argument_bytes(1)
+except OSError as error:
+    assert error.errno == errno.EOVERFLOW, error
+else:
+    raise AssertionError("process argument census limit was not enforced")
+ticks = iter((0.0, 1.0))
+module.time.monotonic = lambda: next(ticks)
+budget = module._ProcessCensusBudget(0.75, maximum_items=8)
+module._linux_children = lambda process_id, census: [101]
+module._linux_process_identity = lambda process_id, census=None: (process_id, 1)
+try:
+    module._linux_owned_processes(budget)
+except OSError as error:
+    assert error.errno == errno.ETIMEDOUT, error
+else:
+    raise AssertionError("process census deadline was not enforced during traversal")
+PY
+}
+
 test_partial_input_writes_do_not_copy_remainder() {
   python3 - "$HELPER" <<'PY'
 import importlib.util
@@ -349,6 +481,9 @@ run_case() {
     detached-tree) test_detached_descendant_cannot_escape ;;
     batch-deadline) test_batch_deadline_remains_absolute ;;
     selector-order) test_selector_failure_precedes_spawn ;;
+    spawn-guard) test_input_validation_precedes_spawn ;;
+    identity-signal) test_identity_bound_signaling_avoids_reused_pids ;;
+    census-bounds) test_process_census_enforces_item_and_time_bounds ;;
     partial-input) test_partial_input_writes_do_not_copy_remainder ;;
     artifact) test_json_artifact_is_bounded_and_regular ;;
     artifact-open-race) test_concurrent_artifact_replacements_are_rejected ;;
@@ -363,8 +498,9 @@ if [ "$#" -gt 0 ]; then
   run_case "$1"
 else
   for case_name in output-limit final-wait residual-group detached-tree \
-    batch-deadline selector-order partial-input artifact artifact-open-race \
-    decoded-strings hostile-json batch-items; do
+    batch-deadline selector-order spawn-guard identity-signal census-bounds \
+    partial-input artifact artifact-open-race decoded-strings hostile-json \
+    batch-items; do
     run_case "$case_name"
   done
 fi

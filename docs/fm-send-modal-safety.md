@@ -2,9 +2,10 @@
 
 ## Security invariant
 
-A Herdr text send may press Enter only after Firstmate positively identifies the target as an empty agent composer.
-A permission modal, pending composer, unreadable pane, malformed capture, missing composer row, or unrecognized detector result must stop before Firstmate stages text or presses a key.
+`fm-send` may begin a Herdr text submission only after Firstmate positively identifies the target as an empty agent composer at its preflight.
+A permission modal, pending composer, unreadable pane, malformed capture, missing composer row, or unrecognized detector result that is present at that boundary must stop Firstmate before it stages text or presses a key.
 The refusal reports an explicit blocker instead of treating UNKNOWN as successful delivery.
+The remaining-race section below owns the later transition window that this preflight cannot cover.
 
 This protects the distinction that matters at the terminal boundary: a composer awaiting text is not a modal awaiting consent.
 
@@ -21,7 +22,7 @@ This establishes a live security defect in Firstmate's input automation without 
 
 - Scope: every text submission routed by `bin/fm-send.sh` to the Herdr backend.
 - Representation: the existing structural `empty|pending|unknown` composer classification, derived from the rendered agent-composer row rather than permission-dialog wording or a human pane inspection.
-- Observed layer: the real production `fm-send.sh` to `fm_backend_composer_state` to Herdr pane-read boundary immediately before literal staging and Enter submission.
+- Observed layer: the real production `fm-send.sh` to `fm_backend_composer_state` to Herdr pane-read boundary immediately before literal staging begins.
 - Retirement criterion: retire this preflight only when the Herdr transport offers an atomic semantic composer-submit operation or the Herdr adapter owns an equally fail-closed check immediately before every Enter and all callers use it.
 
 The guard does not match a permission prompt's spelling.
@@ -34,7 +35,7 @@ This makes novel modal wording and malformed screens conservative refusals rathe
 |---|---|---|
 | `empty` | Stage text and allow the backend's verified submission flow. | The stub records one text event, one Enter, and one started turn. |
 | `pending` | Refuse before staging or Enter. | Existing text remains byte-for-byte unchanged and the stub records no event. |
-| `unknown` from a permission modal | Refuse before staging or Enter. | The modal remains unapproved and the stub records no event. |
+| `unknown` from an already-open permission modal | Refuse before staging or Enter. | The modal remains unapproved and the stub records no event. |
 | `unknown` from an unreadable or failed capture | Refuse before staging or Enter. | The stub records no event and `fm-send` returns a blocker. |
 | Malformed or unrecognized classifier output | Treat as UNKNOWN and refuse. | The shell `case` permits only the literal `empty` success value. |
 
@@ -42,7 +43,7 @@ The quantifier is every Herdr text send through `fm-send.sh`, not merely sends w
 
 ## Violation and refusal proof
 
-The controllable TUI in `tests/fixtures/herdr-permission-tui.py`, driven by `tests/fm-send-permission-modal-probe.sh` from the existing strict send suite, first ran against the unmodified production path.
+The controllable TUI in `tests/fixtures/herdr-permission-tui.py`, now driven by `tests/fm-send-permission-modal-probe.sh` from the existing strict send suite, first ran manually against the unmodified production path.
 Its modal was approved and the staged text was submitted, proving the violation was reachable at the boundary.
 
 The same modal then ran after the guard was added.

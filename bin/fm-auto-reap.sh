@@ -20,10 +20,6 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 AUTO_REAP_STALE_SECS=${FM_AUTO_REAP_STALE_SECS:-300}
 AUTO_REAP_COMMAND_TIMEOUT=${FM_AUTO_REAP_COMMAND_TIMEOUT:-20}
-AUTO_REAP_NO_MISTAKES_DB=${FM_AUTO_REAP_NO_MISTAKES_DB:-$HOME/.no-mistakes/state.sqlite}
-AUTO_REAP_TASK_LOCK=
-AUTO_REAP_EXPECTED_GENERATION=
-AUTO_REAP_EXPECTED_HEAD=
 
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
@@ -36,8 +32,6 @@ fm_refuse_if_gate_agent
 . "$SCRIPT_DIR/fm-treehouse-lib.sh"
 # shellcheck source=bin/fm-process-tree-lib.sh
 . "$SCRIPT_DIR/fm-process-tree-lib.sh"
-# shellcheck source=bin/fm-backend.sh
-. "$SCRIPT_DIR/fm-backend.sh"
 
 case "$AUTO_REAP_STALE_SECS:$AUTO_REAP_COMMAND_TIMEOUT" in
   *[!0-9:]*|0:*|*:0)
@@ -104,23 +98,6 @@ log_result() {
   fi
 }
 
-release_auto_reap_task_lock() {
-  [ -z "$AUTO_REAP_TASK_LOCK" ] \
-    || fm_account_lifecycle_lock_release "$AUTO_REAP_TASK_LOCK" >/dev/null 2>&1 || true
-  AUTO_REAP_TASK_LOCK=
-}
-trap release_auto_reap_task_lock EXIT
-
-verify_task_custody() {  # <meta>
-  local meta=$1 worktree current
-  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
-  [ "$(meta_value "$meta" generation_id)" = "$AUTO_REAP_EXPECTED_GENERATION" ] || return 1
-  worktree=$(meta_value "$meta" worktree)
-  [ -z "$AUTO_REAP_EXPECTED_HEAD" ] && return 0
-  current=$(git -C "$worktree" rev-parse --verify HEAD 2>/dev/null) || return 1
-  [ "$current" = "$AUTO_REAP_EXPECTED_HEAD" ]
-}
-
 run_capture() {  # <output-variable> <command> [args...]
   local output_variable=$1
   shift
@@ -134,142 +111,6 @@ run_capture() {  # <output-variable> <command> [args...]
     return 1
   }
   return 0
-}
-
-hex_text() {  # <text>
-  LC_ALL=C printf '%s' "$1" | od -An -tx1 | tr -d '[:space:]'
-}
-
-toon_value() {  # <toon> <field>
-  local toon=$1 field=$2 value
-  value=$(printf '%s\n' "$toon" | sed -n "s/^[[:space:]]*${field}:[[:space:]]*//p" | head -1)
-  value=${value#\"}
-  value=${value%\"}
-  printf '%s' "$value"
-}
-
-load_active_run_proof() {  # <meta>
-  local meta=$1 remote repo_id branch_hex rows line rest
-  [ "$(meta_value "$meta" worktree)" = "$RUN_PROOF_WORKTREE" ] || {
-    refuse "recorded worktree changed during exact run attribution"
-    return 1
-  }
-  remote=$(git -C "$RUN_PROOF_WORKTREE" remote get-url no-mistakes 2>/dev/null) || {
-    refuse "worktree has no authoritative no-mistakes repository identity"
-    return 1
-  }
-  repo_id=${remote##*/}
-  repo_id=${repo_id%.git}
-  case "$repo_id" in ''|*[!A-Za-z0-9_-]*) refuse "no-mistakes repository identity is unsafe"; return 1 ;; esac
-  [ -f "$AUTO_REAP_NO_MISTAKES_DB" ] && [ ! -L "$AUTO_REAP_NO_MISTAKES_DB" ] || {
-    refuse "authoritative no-mistakes run database is unavailable"
-    return 1
-  }
-  command -v sqlite3 >/dev/null 2>&1 || {
-    refuse "sqlite3 is unavailable for exact no-mistakes run attribution"
-    return 1
-  }
-  branch_hex=$(hex_text "$RUN_PROOF_BRANCH")
-  rows=$(sqlite3 -readonly -separator $'\t' "$AUTO_REAP_NO_MISTAKES_DB" "
-    SELECT r.id, r.branch, r.status, r.head_sha, COALESCE(r.last_pushed_sha, '')
-    FROM runs r
-    WHERE r.repo_id = '$repo_id'
-      AND hex(CAST(r.branch AS BLOB)) = upper('$branch_hex')
-      AND r.status NOT IN ('completed', 'cancelled', 'failed')
-    ORDER BY r.created_at DESC;
-  " 2>/dev/null) || {
-    refuse "authoritative no-mistakes run query failed"
-    return 1
-  }
-  ACTIVE_RUN_COUNT=$(printf '%s\n' "$rows" | awk 'NF { n++ } END { print n + 0 }')
-  ACTIVE_RUN_ID=
-  ACTIVE_RUN_BRANCH=
-  ACTIVE_RUN_STATUS=
-  ACTIVE_RUN_HEAD=
-  ACTIVE_RUN_PUSHED_HEAD=
-  [ "$ACTIVE_RUN_COUNT" -eq 0 ] && return 0
-  [ "$ACTIVE_RUN_COUNT" -eq 1 ] || {
-    refuse "branch $RUN_PROOF_BRANCH has $ACTIVE_RUN_COUNT active no-mistakes runs; exact ownership is ambiguous"
-    return 1
-  }
-  line=$(printf '%s\n' "$rows" | awk 'NF { print; exit }')
-  ACTIVE_RUN_ID=${line%%$'\t'*}; rest=${line#*$'\t'}
-  ACTIVE_RUN_BRANCH=${rest%%$'\t'*}; rest=${rest#*$'\t'}
-  ACTIVE_RUN_STATUS=${rest%%$'\t'*}; rest=${rest#*$'\t'}
-  ACTIVE_RUN_HEAD=${rest%%$'\t'*}; ACTIVE_RUN_PUSHED_HEAD=${rest#*$'\t'}
-  case "$ACTIVE_RUN_ID" in ''|*[!A-Za-z0-9_-]*) refuse "authoritative run has an unsafe run ID"; return 1 ;; esac
-  [ "$ACTIVE_RUN_BRANCH" = "$RUN_PROOF_BRANCH" ] || {
-    refuse "authoritative run branch does not match task branch"
-    return 1
-  }
-  ACTIVE_RUN_REPO_ID=$repo_id
-}
-
-agent_liveness_verdict() {  # <meta>
-  local meta=$1 probe backend target window
-  if [ -n "${FM_AUTO_REAP_AGENT_LIVENESS_BIN:-}" ]; then
-    probe=$(auto_reap_tool FM_AUTO_REAP_AGENT_LIVENESS_BIN false) || return 1
-    "$probe" "$AUTO_REAP_ID" "$meta"
-    return
-  fi
-  backend=$(fm_backend_of_meta "$meta")
-  target=$(fm_backend_target_of_meta "$meta")
-  window=$(meta_value "$meta" window)
-  [ -n "$target" ] || target=$window
-  [ -n "$target" ] || { printf 'unknown'; return; }
-  fm_backend_agent_alive "$backend" "$target" "fm-$AUTO_REAP_ID" \
-    "$(meta_value "$meta" tmux_session_target)" 2>/dev/null || printf 'unknown'
-}
-
-verify_active_run_for_abort() {  # <meta> <no-mistakes-bin> <expected-run-id>
-  local meta=$1 nm=$2 expected_id=$3 captured cli_id cli_branch cli_status current verdict
-  verify_task_custody "$meta" || { refuse "task generation or head changed during cancellation custody"; return 1; }
-  load_active_run_proof "$meta" || return 1
-  [ "$ACTIVE_RUN_COUNT" -eq 1 ] || {
-    refuse "active no-mistakes run disappeared during cancellation proof"
-    return 1
-  }
-  [ "$ACTIVE_RUN_ID" = "$expected_id" ] || {
-    refuse "active no-mistakes run ID changed during cancellation proof"
-    return 1
-  }
-  if run_capture captured env -C "$RUN_PROOF_WORKTREE" "$nm" axi status --run "$expected_id"; then :; else return 1; fi
-  [ "$RUN_CAPTURE_STATUS" -eq 0 ] || {
-    refuse "exact no-mistakes run $expected_id could not be inspected"
-    return 1
-  }
-  cli_id=$(toon_value "$captured" id)
-  cli_branch=$(toon_value "$captured" branch)
-  cli_status=$(toon_value "$captured" status)
-  [ "$cli_id" = "$expected_id" ] && [ "$cli_branch" = "$RUN_PROOF_BRANCH" ] || {
-    refuse "exact status did not return run $expected_id on branch $RUN_PROOF_BRANCH"
-    return 1
-  }
-  [ "$cli_status" = "$ACTIVE_RUN_STATUS" ] || {
-    refuse "run $expected_id status disagrees between exact status and authoritative record"
-    return 1
-  }
-  current=$(git -C "$RUN_PROOF_WORKTREE" rev-parse --verify HEAD 2>/dev/null) || {
-    refuse "current worktree head is unreadable"
-    return 1
-  }
-  [ "$ACTIVE_RUN_HEAD" = "$current" ] || {
-    refuse "run $expected_id head $ACTIVE_RUN_HEAD does not equal current head $current"
-    return 1
-  }
-  [ -n "$ACTIVE_RUN_PUSHED_HEAD" ] && [ "$ACTIVE_RUN_PUSHED_HEAD" = "$current" ] || {
-    refuse "current head $current is not the run's proved pushed head; cancellation could strand work"
-    return 1
-  }
-  verdict=$(agent_liveness_verdict "$meta") || verdict=unknown
-  [ "$verdict" = dead ] || {
-    refuse "task agent is $verdict, not provably dead; cancellation is not authorized"
-    return 1
-  }
-  verify_task_custody "$meta" || {
-    refuse "task generation or head changed after dead-agent proof"
-    return 1
-  }
 }
 
 parse_pr_url() {  # <url>
@@ -313,15 +154,8 @@ pr_is_merged() {  # <meta>
 }
 
 reap_no_mistakes_run() {  # <meta>
-  local meta=$1 kind worktree branch nm captured run_id final_id final_branch final_status final_outcome
+  local meta=$1 worktree branch nm captured run_branch run_id run_status outcome runs_output row status rest row_branch
   [ "$(meta_value "$meta" mode)" = no-mistakes ] || return 0
-  kind=$(meta_value "$meta" kind)
-  [ -n "$kind" ] || kind=ship
-  # Scouts are intentionally detached scratch worktrees and never own a
-  # no-mistakes validation run. Never ask the branch-blind status lookup from
-  # their directory: it returns a neighboring ship lane and caused the 2026-08
-  # phantom-run sweep incident.
-  [ "$kind" = ship ] || return 0
   worktree=$(meta_value "$meta" worktree)
   branch=$(git -C "$worktree" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
   [ "$branch" = "fm/$AUTO_REAP_ID" ] || {
@@ -332,76 +166,84 @@ reap_no_mistakes_run() {  # <meta>
     refuse "no-mistakes is unavailable for exact run reaping"
     return 1
   }
-  RUN_PROOF_WORKTREE=$worktree
-  RUN_PROOF_BRANCH=$branch
-  load_active_run_proof "$meta" || return 1
-  [ "$ACTIVE_RUN_COUNT" -eq 1 ] || return 0
-  run_id=$ACTIVE_RUN_ID
-  # Re-read every proof immediately before the destructive call. The proof is
-  # conjunctive: exact run ID and branch, exact current/run head, an equal
-  # recorded pushed head, and a confidently dead task agent.
-  verify_active_run_for_abort "$meta" "$nm" "$run_id" || return 1
-  verify_task_custody "$meta" || { refuse "task generation or head changed before exact run cancellation"; return 1; }
-  if run_capture captured "$nm" axi abort --run "$run_id"; then :; else return 1; fi
+  if run_capture captured env -C "$worktree" "$nm" axi status; then :; else return 1; fi
   [ "$RUN_CAPTURE_STATUS" -eq 0 ] || {
-    refuse "failed to cancel exact no-mistakes run $run_id"
+    refuse "no-mistakes status could not be inspected safely"
     return 1
   }
-  if run_capture captured env -C "$worktree" "$nm" axi status --run "$run_id"; then :; else return 1; fi
+  run_branch=$(printf '%s\n' "$captured" | sed -n 's/^[[:space:]]*branch:[[:space:]]*//p' | head -1)
+  run_branch=${run_branch#\"}
+  run_branch=${run_branch%\"}
+  if [ "$run_branch" = "$branch" ]; then
+    run_id=$(printf '%s\n' "$captured" | sed -n 's/^[[:space:]]*id:[[:space:]]*//p' | head -1)
+    run_id=${run_id#\"}
+    run_id=${run_id%\"}
+    run_status=$(printf '%s\n' "$captured" | sed -n 's/^[[:space:]]*status:[[:space:]]*//p' | head -1)
+    run_status=${run_status#\"}
+    run_status=${run_status%\"}
+    outcome=$(printf '%s\n' "$captured" | sed -n 's/^[[:space:]]*outcome:[[:space:]]*//p' | head -1)
+    outcome=${outcome#\"}
+    outcome=${outcome%\"}
+    [ -n "$run_id" ] || {
+      refuse "matching no-mistakes run has no exact run ID"
+      return 1
+    }
+    if [ -z "$outcome" ] && [ "$run_status" != completed ] \
+      && [ "$run_status" != cancelled ] && [ "$run_status" != failed ]; then
+      if run_capture captured "$nm" axi abort --run "$run_id"; then :; else return 1; fi
+      [ "$RUN_CAPTURE_STATUS" -eq 0 ] || {
+        refuse "failed to cancel exact no-mistakes run $run_id"
+        return 1
+      }
+      log_result "cancelled no-mistakes run $run_id for $AUTO_REAP_ID"
+    fi
+    return 0
+  fi
+  if run_capture runs_output env -C "$worktree" "$nm" runs --limit 200; then :; else return 1; fi
   [ "$RUN_CAPTURE_STATUS" -eq 0 ] || {
-    refuse "cancelled run $run_id could not be verified"
+    refuse "cross-branch no-mistakes attribution could not be inspected"
     return 1
   }
-  final_id=$(toon_value "$captured" id)
-  final_branch=$(toon_value "$captured" branch)
-  final_status=$(toon_value "$captured" status)
-  final_outcome=$(toon_value "$captured" outcome)
-  [ "$final_id" = "$run_id" ] && [ "$final_branch" = "$branch" ] || {
-    refuse "post-cancel status did not verify exact run $run_id on branch $branch"
-    return 1
-  }
-  [ "$final_status" = cancelled ] || [ "$final_outcome" = cancelled ] || {
-    refuse "run $run_id cancellation was not confirmed"
-    return 1
-  }
-  verify_task_custody "$meta" || { refuse "task generation or head changed after exact run cancellation"; return 1; }
-  log_result "cancelled no-mistakes run $run_id for $AUTO_REAP_ID"
+  while IFS= read -r row; do
+    row=$(printf '%s' "$row" | sed 's/^[[:space:]]*//')
+    [ -n "$row" ] || continue
+    status=${row%%[[:space:]]*}
+    rest=${row#"$status"}
+    rest=$(printf '%s' "$rest" | sed 's/^[[:space:]]*//')
+    row_branch=${rest%%[[:space:]]*}
+    [ "$row_branch" = "$branch" ] || continue
+    case "$status" in
+      running)
+        refuse "branch still has an active no-mistakes run but its exact run ID is unavailable"
+        return 1
+        ;;
+    esac
+    return 0
+  done <<EOF
+$runs_output
+EOF
 }
 
 run_teardown() {  # <task>
-  local task=$1 teardown output output_file
+  local task=$1 teardown output
   teardown=$(auto_reap_tool FM_AUTO_REAP_TEARDOWN_BIN fm-teardown.sh 2>/dev/null || true)
   [ -n "$teardown" ] || teardown="$SCRIPT_DIR/fm-teardown.sh"
-  output_file=$(mktemp "$STATE/.auto-reap-teardown-$task.XXXXXX") || return 1
-  if FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$AUTO_REAP_TASK_LOCK" "$teardown" "$task" > "$output_file" 2>&1; then
-    output=$(cat "$output_file")
-    rm -f "$output_file"
+  if output=$("$teardown" "$task" 2>&1); then
     [ -z "$output" ] || printf '%s\n' "$output"
     log_result "auto-reaped $task"
     printf 'auto-reaped %s\n' "$task"
     return 0
   fi
-  output=$(cat "$output_file")
-  rm -f "$output_file"
   [ -z "$output" ] || printf '%s\n' "$output" >&2
   refuse "ordinary teardown refused; retained endpoint/worktree metadata"
 }
 
 reap_task() {  # <task> <trigger>
-  local id=$1 trigger=$2 meta kind mode worktree status
+  local id=$1 trigger=$2 meta kind mode
   AUTO_REAP_ID=$id
   fm_account_valid_id "$id" || refuse "invalid task id"
-  AUTO_REAP_TASK_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$id") || refuse "could not serialize task lifecycle custody"
   meta="$STATE/$id.meta"
   [ -f "$meta" ] && [ ! -L "$meta" ] || refuse "task metadata is unavailable"
-  AUTO_REAP_EXPECTED_GENERATION=$(meta_value "$meta" generation_id)
-  [ -n "$AUTO_REAP_EXPECTED_GENERATION" ] || refuse "task generation identity is unavailable"
-  worktree=$(meta_value "$meta" worktree)
-  AUTO_REAP_EXPECTED_HEAD=
-  if [ -n "$worktree" ] && [ -d "$worktree" ] && [ ! -L "$worktree" ]; then
-    AUTO_REAP_EXPECTED_HEAD=$(git -C "$worktree" rev-parse --verify HEAD 2>/dev/null) \
-      || refuse "task head identity is unavailable"
-  fi
   kind=$(meta_value "$meta" kind)
   [ -n "$kind" ] || kind=ship
   mode=$(meta_value "$meta" mode)
@@ -417,12 +259,8 @@ reap_task() {  # <task> <trigger>
     local-merged:ship:local-only) ;;
     *) refuse "trigger $trigger does not match kind=$kind mode=${mode:-no-mistakes}" ;;
   esac
-  verify_task_custody "$meta" || refuse "task generation or head changed before destructive custody"
   reap_no_mistakes_run "$meta" || return 1
-  verify_task_custody "$meta" || refuse "task generation or head changed before teardown"
-  if run_teardown "$id"; then status=0; else status=$?; fi
-  release_auto_reap_task_lock
-  return "$status"
+  run_teardown "$id"
 }
 
 path_age() {

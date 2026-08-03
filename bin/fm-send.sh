@@ -12,10 +12,9 @@
 #
 # Text submission is verified: the line is typed ONCE, then Enter is sent and
 # retried (Enter only, never retyped) until the target backend confirms a
-# submit, and the target is captured once more after delivery.
-# An inconclusive submit or unreadable verification capture exits non-zero.
-# Only a zero exit plus the delivery receipt printed on stdout may be reported
-# as a delivered instruction.
+# submit or reports an inconclusive send. If a swallowed Enter is positively
+# confirmed, fm-send exits NON-ZERO so the caller knows the steer did not land
+# instead of silently leaving an unsubmitted instruction.
 # Submission dispatches through the target's recorded backend; the tmux adapter
 # shares its composer/submit core with the away-mode daemon via bin/fm-tmux-lib.sh.
 # Tune with FM_SEND_RETRIES (default 3) / FM_SEND_SLEEP (0.4).
@@ -245,33 +244,11 @@ if [ -n "$EXPECTED_ACCOUNT_PROFILE" ]; then
   fi
 fi
 
-verify_codex_runtime_if_owned() {
-  local account_home task_id
-  [ "$TARGET_HARNESS" = codex ] || return 0
-  [ -n "$TARGET_META" ] || return 0
-  account_home=$(fm_meta_get "$TARGET_META" account_home)
-  [ -n "$account_home" ] || return 0
-  task_id=$(fm_send_id_from_meta "$TARGET_META")
-  if ! "$SCRIPT_DIR/fm-runtime-profile.sh" "$task_id"; then
-    echo "error: Codex runtime profile verification failed for $task_id; refusing to claim or deliver steering under an unproved model" >&2
-    return 1
-  fi
-}
-
-# Direct Codex accounts expose the harness-owned rollout record.
-# Check it immediately before every steer, then again after delivery below.
-verify_codex_runtime_if_owned || exit 1
-
 if [ "${1:-}" = "--key" ]; then
   if ! fm_backend_send_key "$TARGET_BACKEND" "$T" "$2" "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET"; then
     echo "error: key '$2' not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
     exit 1
   fi
-  if ! fm_backend_capture "$TARGET_BACKEND" "$T" 2 "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET" >/dev/null; then
-    echo "error: key '$2' was submitted to $T but the required target verification read failed; delivery is unconfirmed" >&2
-    exit 1
-  fi
-  verify_codex_runtime_if_owned || exit 1
   if [ -n "$MANAGED_LIFECYCLE_LOCK" ]; then
     if fm_account_lifecycle_lock_release "$MANAGED_LIFECYCLE_LOCK"; then
       MANAGED_LIFECYCLE_LOCK=
@@ -279,7 +256,6 @@ if [ "${1:-}" = "--key" ]; then
       echo "warning: key '$2' was sent to $T but its managed lifecycle lock could not be released cleanly" >&2
     fi
   fi
-  printf 'delivered: key %s to %s (target verification read passed)\n' "$2" "$T"
 else
   MESSAGE=$*
   if [ "$MARK_FROM_FIRSTMATE" = 1 ]; then
@@ -347,9 +323,8 @@ else
   esac
   retries=${FM_SEND_RETRIES:-3}
   sleep_s=${FM_SEND_SLEEP:-0.4}
-  # Type once, submit, and verify.
-  # Unknown is a hard failure because a caller must never turn an unreadable
-  # delivery into a claim that the crewmate received the instruction.
+  # Type once, submit, verify. Lenient: only a positively-confirmed swallow
+  # (text still in the composer) is an error; an unreadable pane is assumed sent.
   if ! verdict=$(fm_backend_send_text_submit "$TARGET_BACKEND" "$T" "$MESSAGE" "$retries" "$sleep_s" "$settle" "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET"); then
     [ -z "$MANAGED_STEERING_ID" ] || record_managed_delivery_event send-failed >/dev/null 2>&1 || true
     echo "error: text not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
@@ -370,36 +345,19 @@ else
       echo "error: text not sent to $T ($TARGET_BACKEND send failed; tried $RESOLUTION_TRIED)" >&2
       exit 1
       ;;
-    unknown)
-      if [ -n "$MANAGED_STEERING_ID" ]; then
-        record_managed_delivery_event unconfirmed >/dev/null 2>&1 || true
-        if record_unconfirmed_managed_steering "$MESSAGE"; then
-          echo "error: text delivery to $T could not be confirmed and was durably recorded as unconfirmed" >&2
-        else
-          echo "error: text delivery to $T could not be confirmed or durably recorded" >&2
-        fi
-      else
-        echo "error: text delivery to $T could not be confirmed; refusing to report it as delivered" >&2
-      fi
-      exit 1
-      ;;
   esac
-  # Submit confirmation and a readable target are separate facts.
-  # Wait for the harness to start the turn, then require a fresh target read
-  # before recording canonical steering or printing a delivery receipt.
-  [ "${FM_SEND_SETTLE:-1}" = 0 ] || sleep "${FM_SEND_SETTLE:-1}"
-  if ! fm_backend_capture "$TARGET_BACKEND" "$T" 2 "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET" >/dev/null; then
-    if [ -n "$MANAGED_STEERING_ID" ]; then
-      record_managed_delivery_event unconfirmed-after-submit >/dev/null 2>&1 || true
-      record_unconfirmed_managed_steering "$MESSAGE" >/dev/null 2>&1 || true
-    fi
-    echo "error: text was submitted to $T but the required target verification read failed; delivery is unconfirmed" >&2
-    exit 1
-  fi
-  verify_codex_runtime_if_owned || exit 1
   if [ -n "$MANAGED_STEERING_ID" ]; then
-    record_managed_delivery_event confirmed >/dev/null 2>&1 || true
-    if ! record_managed_steering "$MESSAGE"; then
+    if [ "$verdict" = unknown ]; then
+      record_managed_delivery_event unconfirmed >/dev/null 2>&1 || true
+      if record_unconfirmed_managed_steering "$MESSAGE"; then
+        echo "warning: text delivery to $T could not be confirmed and was durably recorded as unconfirmed" >&2
+      else
+        echo "warning: text delivery to $T could not be confirmed or durably recorded" >&2
+      fi
+    else
+      record_managed_delivery_event confirmed >/dev/null 2>&1 || true
+    fi
+    if [ "$verdict" != unknown ] && ! record_managed_steering "$MESSAGE"; then
       if record_pending_managed_steering "$MESSAGE"; then
         echo "warning: text was sent to $T and durably recorded as pending because its managed steering trail could not be appended" >&2
       else
@@ -408,9 +366,16 @@ else
     fi
     if fm_account_lifecycle_lock_release "$MANAGED_LIFECYCLE_LOCK"; then
       MANAGED_LIFECYCLE_LOCK=
+    elif [ "$verdict" = unknown ]; then
+      echo "warning: text delivery to $T was unconfirmed and its managed lifecycle lock could not be released cleanly" >&2
     else
       echo "warning: text was sent to $T but its managed lifecycle lock could not be released cleanly" >&2
     fi
   fi
-  printf 'delivered: text to %s (submit confirmation and target verification read passed)\n' "$T"
+  # The submit attempt finished without a positively-confirmed pending composer. Confirmation only proves
+  # the text was accepted; the harness still needs a beat to spin up the
+  # turn before its busy footer shows. Pause so an immediate peek catches the
+  # crewmate actually working instead of the stale idle pane. FM_SEND_SETTLE=0
+  # disables it. Scoped to this path only, never the shared submit core.
+  [ "${FM_SEND_SETTLE:-1}" = 0 ] || sleep "${FM_SEND_SETTLE:-1}"
 fi

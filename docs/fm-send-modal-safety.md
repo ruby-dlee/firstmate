@@ -76,4 +76,7 @@ The account-2 hard-limit incident proves that setting cannot replace boundary ob
 
 The released `fm-send.sh` preflight protects a modal that is already rendered when steering begins.
 A modal or provider-profile transition that appears after preflight but before an Enter can be closed only at the retry owner inside `bin/backends/herdr.sh`.
-That file, along with `bin/fm-spawn.sh`, remains owned by the concurrent `six-gates-hardening` work and must not be edited until its owner releases it.
+The modal-between-Enters atomic per-Enter check in `bin/backends/herdr.sh` is explicitly deferred to task `steer-modal-atomic-layers`.
+The requested-versus-observed metadata split in `bin/fm-spawn.sh` is explicitly deferred to task `steer-modal-atomic-layers`.
+Neither deferred implementation path is part of this change.
+a real Codex permission prompt approved END TO END was never run, so the composite case is inferred rather than observed.

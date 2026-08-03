@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Append one durable Lavish answer pointer through Firstmate's canonical wake
-# queue lock.
+# queue lock, then attempt redundant visible delivery to the home-bound
+# supervisor proven by the session lock.
 #
 # This is the narrow adapter used by the provider-neutral tools/lavish package.
-# The answer file remains authoritative; this record only makes it prominent at
-# the next ordinary wake drain.
+# The answer file remains authoritative; visible delivery failure never weakens
+# the durable record surfaced at the next ordinary wake drain.
 #
 # Usage:
 #   fm-lavish-wake.sh --home <FM_HOME> --decision <id> \

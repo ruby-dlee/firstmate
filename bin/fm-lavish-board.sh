@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Render one durable Lavish decision, open it in a dedicated headed Chrome
-# profile, and arm a one-shot watcher check for its durable download with a
-# durable browser-profile fallback.
+# profile, and arm a one-shot watcher check for its durable browser-profile
+# record with optional download corroboration.
 #
 # Usage:
 #   fm-lavish-board.sh <decision-id> [--home <path>] [--downloads <path>]
@@ -21,8 +21,8 @@ usage() {
 Usage: fm-lavish-board.sh <decision-id> [--home <path>] [--downloads <path>]
 
 Render a self-contained Lavish board, open it in a headed dedicated Chrome
-profile, and arm a watcher check that captures the downloaded payload first,
-with the verified LAVISH-SUBMIT v2 browser-profile record as a fallback.
+profile, and arm a watcher check that captures the verified LAVISH-SUBMIT v2
+browser-profile record first and accepts a matching download as corroboration.
 USAGE
 }
 

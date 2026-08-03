@@ -12,7 +12,7 @@
 //        fm-report-stack.mjs list [--json]
 //        fm-report-stack.mjs path [<task-id>]
 //        fm-report-stack.mjs open [<task-id>]
-//        fm-report-stack.mjs prune
+//        fm-report-stack.mjs prune [--status] [--force]
 //
 // FM_REPORT_STACK_ROOT overrides the default. When XDG_DATA_HOME is set, the
 // default is $XDG_DATA_HOME/firstmate/report-stack; otherwise it is
@@ -59,6 +59,7 @@ const reportRetentionCohortMs = Number(process.env.FM_REPORT_RETENTION_COHORT_MS
 const reportRetentionSweepSeconds = Number(process.env.FM_REPORT_RETENTION_INTERVAL || "300");
 const reportRetentionSweepMs = reportRetentionSweepSeconds * 1000;
 const retentionPolicyName = ".retention-policy.js";
+const retentionAttemptName = ".retention-attempt.json";
 const containedReadHelper = path.join(fmRoot, "bin", "fm-contained-read.py");
 const pythonRuntime = process.env.FM_REPORT_PYTHON || "python3";
 
@@ -643,6 +644,195 @@ function indexPage(rows, policy) {
 </main></body></html>`;
 }
 
+function validateRetentionConfiguration() {
+  if (!Number.isSafeInteger(reportRetentionBatch) || reportRetentionBatch <= 0) {
+    throw new Error("FM_REPORT_RETENTION_BATCH must be a positive integer");
+  }
+  if (!Number.isSafeInteger(reportRetentionCohortMs) || reportRetentionCohortMs <= 0) {
+    throw new Error("FM_REPORT_RETENTION_COHORT_MS must be a positive integer");
+  }
+  if (!Number.isSafeInteger(reportRetentionSweepSeconds) || reportRetentionSweepSeconds <= 0
+    || !Number.isSafeInteger(reportRetentionSweepMs)) {
+    throw new Error("FM_REPORT_RETENTION_INTERVAL must be a positive integer number of seconds");
+  }
+  if (reportRetentionCohortMs + reportRetentionSweepMs > reportRetentionDriftMs) {
+    throw new Error("FM_REPORT_RETENTION_COHORT_MS plus FM_REPORT_RETENTION_INTERVAL must not exceed 15 days");
+  }
+}
+
+function lstatIfPresent(file) {
+  try {
+    return fs.lstatSync(file);
+  } catch (error) {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function retentionWorkDueWithoutLock() {
+  validateRetentionConfiguration();
+  const rootStat = lstatIfPresent(configuredStackRoot);
+  if (!rootStat) return false;
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error(`report stack root must be a real directory at ${configuredStackRoot}`);
+  }
+
+  const previousDirectory = process.cwd();
+  const pinnedRoot = pinnedDirectory(configuredStackRoot, undefined, "report stack root");
+  let pinnedEntries;
+  let pinnedTombstones;
+  try {
+    process.chdir(configuredStackRoot);
+    if (!sameDirectoryIdentity(pinnedRoot.descriptor)) {
+      throw new Error(`report stack root changed while entering ${configuredStackRoot}`);
+    }
+    if (pathExistsNoFollow(retentionCutoverName) || pathExistsNoFollow(legacyCutoverName)) return true;
+
+    const now = Date.now();
+    let hasCohorts = false;
+    const entriesStat = lstatIfPresent("entries");
+    if (entriesStat) {
+      if (entriesStat.isSymbolicLink() || !entriesStat.isDirectory()) return true;
+      pinnedEntries = pinnedDirectory("entries", pinnedRoot.real, "report entries directory");
+      process.chdir("entries");
+      if (!sameDirectoryIdentity(pinnedEntries.descriptor)) {
+        throw new Error("report entries directory changed while checking retention work");
+      }
+      for (const entry of fs.readdirSync(".", { withFileTypes: true })) {
+        const deadline = retentionCohortDeadline(entry.name);
+        if (entry.isDirectory() && Number.isFinite(deadline)) {
+          hasCohorts = true;
+          if (deadline - reportRetentionCohortMs <= now) return true;
+          continue;
+        }
+        if (/^\.[a-zA-Z0-9][a-zA-Z0-9._-]*\.transaction$/.test(entry.name)
+          || (entry.isDirectory() && /^\.[a-zA-Z0-9][a-zA-Z0-9._-]*\.(?:previous|expired)$/.test(entry.name))) {
+          return true;
+        }
+        if (entry.isDirectory()
+          && /^\.[a-zA-Z0-9][a-zA-Z0-9._-]*\.(?:[0-9]+|[0-9a-f-]{36})\.tmp$/i.test(entry.name)
+          && now - fs.statSync(entry.name).mtimeMs >= 24 * 60 * 60 * 1000) {
+          return true;
+        }
+        if (!entry.name.startsWith(".")) return true;
+      }
+      if (!sameDirectoryIdentity(pinnedEntries.descriptor)) {
+        throw new Error("report entries directory changed while checking retention work");
+      }
+      process.chdir("..");
+      if (!sameDirectoryIdentity(pinnedRoot.descriptor)) {
+        throw new Error("report stack root changed while checking retention work");
+      }
+    }
+
+    const tombstonesStat = lstatIfPresent(".retention-tombstones");
+    if (tombstonesStat) {
+      if (tombstonesStat.isSymbolicLink() || !tombstonesStat.isDirectory()) return true;
+      pinnedTombstones = pinnedDirectory(
+        ".retention-tombstones",
+        pinnedRoot.real,
+        "report retention tombstone directory",
+      );
+      process.chdir(".retention-tombstones");
+      if (!sameDirectoryIdentity(pinnedTombstones.descriptor)) {
+        throw new Error("report retention tombstone directory changed while checking retention work");
+      }
+      if (fs.readdirSync(".").length > 0) return true;
+      if (!sameDirectoryIdentity(pinnedTombstones.descriptor)) {
+        throw new Error("report retention tombstone directory changed while checking retention work");
+      }
+      process.chdir("..");
+      if (!sameDirectoryIdentity(pinnedRoot.descriptor)) {
+        throw new Error("report stack root changed while checking retention work");
+      }
+    }
+
+    if (hasCohorts) {
+      const indexStat = lstatIfPresent("index.html");
+      const policyStat = lstatIfPresent(retentionPolicyName);
+      if (!indexStat || indexStat.isSymbolicLink() || !indexStat.isFile()
+        || !policyStat || policyStat.isSymbolicLink() || !policyStat.isFile()) return true;
+      parseRetentionPolicySource(
+        readBoundedRegularFile(
+          retentionPolicyName,
+          4096,
+          "report retention authority",
+        ).toString("utf8").trim(),
+      );
+    }
+    inspectPinnedDirectory(pinnedRoot);
+    return false;
+  } finally {
+    try { process.chdir(previousDirectory); } catch {}
+    try { fs.closeSync(pinnedTombstones?.descriptor); } catch {}
+    try { fs.closeSync(pinnedEntries?.descriptor); } catch {}
+    fs.closeSync(pinnedRoot.descriptor);
+  }
+}
+
+function claimRetentionAttempt() {
+  const previousDirectory = process.cwd();
+  const pinnedRoot = pinnedDirectory(configuredStackRoot, undefined, "report stack root");
+  const candidateName = `.retention-attempt.${process.pid}.${crypto.randomUUID()}.tmp`;
+  const attemptedAtMs = Date.now();
+  try {
+    process.chdir(configuredStackRoot);
+    if (!sameDirectoryIdentity(pinnedRoot.descriptor)) {
+      throw new Error(`report stack root changed while entering ${configuredStackRoot}`);
+    }
+    fs.writeFileSync(
+      candidateName,
+      `${JSON.stringify({ schemaVersion: 1, attemptedAtMs })}\n`,
+      { flag: "wx", mode: 0o600 },
+    );
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const markerStat = lstatIfPresent(retentionAttemptName);
+      if (!markerStat) {
+        try {
+          fs.linkSync(candidateName, retentionAttemptName);
+          return true;
+        } catch (error) {
+          if (error.code === "EEXIST") continue;
+          throw error;
+        }
+      }
+      if (markerStat.isSymbolicLink() || !markerStat.isFile()) {
+        throw new Error(`report retention attempt marker must be a real regular file at ${path.join(configuredStackRoot, retentionAttemptName)}`);
+      }
+      const record = JSON.parse(readBoundedRegularFile(
+        retentionAttemptName,
+        4096,
+        "report retention attempt marker",
+      ));
+      if (record.schemaVersion !== 1 || !Number.isSafeInteger(record.attemptedAtMs) || record.attemptedAtMs < 0) {
+        throw new Error(`invalid report retention attempt marker at ${path.join(configuredStackRoot, retentionAttemptName)}`);
+      }
+      if (attemptedAtMs - record.attemptedAtMs < reportRetentionSweepMs) return false;
+      try {
+        runContainedHelper(
+          [
+            "remove-owned-file-fd",
+            retentionAttemptName,
+            `${markerStat.dev}:${markerStat.ino}`,
+            `.${retentionAttemptName}.expired.${crypto.randomUUID()}`,
+          ],
+          [pinnedRoot.descriptor],
+          1024 * 1024,
+        );
+      } catch (error) {
+        const current = lstatIfPresent(retentionAttemptName);
+        if (!current || current.dev !== markerStat.dev || current.ino !== markerStat.ino) continue;
+        throw error;
+      }
+    }
+    return false;
+  } finally {
+    fs.rmSync(candidateName, { force: true });
+    try { process.chdir(previousDirectory); } catch {}
+    fs.closeSync(pinnedRoot.descriptor);
+  }
+}
+
 function acquireLock() {
   fs.mkdirSync(configuredStackRoot, { recursive: true, mode: 0o700 });
   const pinnedStackRoot = pinnedDirectory(configuredStackRoot, undefined, "report stack root");
@@ -1005,6 +1195,22 @@ function withLock(callback) {
   }
 }
 
+function prune(force) {
+  validateRetentionConfiguration();
+  if (!force) {
+    if (!retentionWorkDueWithoutLock()) {
+      lastPruneStatus = { pruned: 0, pending: false, admitted: false, reason: "no-work" };
+      return;
+    }
+    if (!claimRetentionAttempt()) {
+      lastPruneStatus = { pruned: 0, pending: false, admitted: false, reason: "cadence" };
+      return;
+    }
+  }
+  withLock(() => {});
+  lastPruneStatus = { ...lastPruneStatus, admitted: true, reason: force ? "forced" : "completed" };
+}
+
 function snapshotTaskArtifacts(dataRoot, taskId, sourceName, staged, sourceFile) {
   const stagedDescriptor = fs.openSync(staged, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | (fs.constants.O_NOFOLLOW || 0));
   try {
@@ -1365,11 +1571,7 @@ function cutoverLegacyEntries() {
   recoverLegacyCutover();
 }
 
-function readRetentionPolicy() {
-  const framed = runContainedHelper(["read-fd", retentionPolicyName, "4096", "strict"], [stackRootDescriptor], 1024 * 1024);
-  const item = framedItems(framed).get("source");
-  if (!item || item.missing) return { schemaVersion: 1, generation: "", cutoffMs: Number.NEGATIVE_INFINITY };
-  const source = item.content.toString("utf8").trim();
+function parseRetentionPolicySource(source) {
   const match = source.match(/^window\.firstmateRetentionPolicy=(\{.*\});$/);
   if (!match) throw new Error(`invalid report retention authority in ${retentionPolicyName}`);
   const policy = JSON.parse(match[1]);
@@ -1377,6 +1579,13 @@ function readRetentionPolicy() {
     throw new Error(`invalid report retention authority in ${retentionPolicyName}`);
   }
   return policy;
+}
+
+function readRetentionPolicy() {
+  const framed = runContainedHelper(["read-fd", retentionPolicyName, "4096", "strict"], [stackRootDescriptor], 1024 * 1024);
+  const item = framedItems(framed).get("source");
+  if (!item || item.missing) return { schemaVersion: 1, generation: "", cutoffMs: Number.NEGATIVE_INFINITY };
+  return parseRetentionPolicySource(item.content.toString("utf8").trim());
 }
 
 function publishRetentionPolicy(policy) {
@@ -1504,19 +1713,7 @@ function recoverPreviousEntries() {
 }
 
 function nextRetentionPolicy() {
-  if (!Number.isSafeInteger(reportRetentionBatch) || reportRetentionBatch <= 0) {
-    throw new Error("FM_REPORT_RETENTION_BATCH must be a positive integer");
-  }
-  if (!Number.isSafeInteger(reportRetentionCohortMs) || reportRetentionCohortMs <= 0) {
-    throw new Error("FM_REPORT_RETENTION_COHORT_MS must be a positive integer");
-  }
-  if (!Number.isSafeInteger(reportRetentionSweepSeconds) || reportRetentionSweepSeconds <= 0
-    || !Number.isSafeInteger(reportRetentionSweepMs)) {
-    throw new Error("FM_REPORT_RETENTION_INTERVAL must be a positive integer number of seconds");
-  }
-  if (reportRetentionCohortMs + reportRetentionSweepMs > reportRetentionDriftMs) {
-    throw new Error("FM_REPORT_RETENTION_COHORT_MS plus FM_REPORT_RETENTION_INTERVAL must not exceed 15 days");
-  }
+  validateRetentionConfiguration();
   const previous = readRetentionPolicy();
   const policy = {
     schemaVersion: 1,
@@ -1891,7 +2088,7 @@ try {
     execFileSync(process.platform === "darwin" ? "open" : "xdg-open", [target], { stdio: "ignore" });
     console.log(target);
   } else if (command === "prune") {
-    withLock(() => {});
+    prune(args.includes("--force"));
     if (args.includes("--status")) console.log(JSON.stringify(lastPruneStatus));
   } else {
     fail(`unknown command: ${command}`);

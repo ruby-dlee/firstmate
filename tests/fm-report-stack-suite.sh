@@ -385,14 +385,14 @@ test_retention_cohort_and_sweep_share_drift_budget() {
   mkdir -p "$stack/entries"
   if out=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
     FM_REPORT_RETENTION_COHORT_MS=691200000 FM_REPORT_RETENTION_INTERVAL=691200 \
-    "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+    "$SCRIPT" prune --status --force 2>&1); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "retention accepted cohort and sweep drift beyond 15 days"
   assert_contains "$out" "must not exceed 15 days" \
     "retention joint drift rejection was not actionable"
 
   FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
     FM_REPORT_RETENTION_COHORT_MS=604800000 FM_REPORT_RETENTION_INTERVAL=691200 \
-    "$SCRIPT" prune --status >/dev/null \
+    "$SCRIPT" prune --status --force >/dev/null \
     || fail "retention rejected cohort and sweep drift at the 15-day boundary"
   pass "retention jointly bounds cohort and sweep drift to 15 days"
 }
@@ -441,7 +441,7 @@ test_retention_cutoff_never_regresses_with_wall_time() {
   prior=$((now - retention_ms + 600000))
   printf 'window.firstmateRetentionPolicy={"schemaVersion":1,"generation":"prior-clock","cutoffMs":%s};\n' \
     "$prior" > "$stack/.retention-policy.js"
-  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" prune >/dev/null \
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" "$SCRIPT" prune --force >/dev/null \
     || fail "retention rejected an existing cutoff from a later wall-clock reading"
   actual=$(node -e '
 const source = require("fs").readFileSync(process.argv[1], "utf8");
@@ -1995,7 +1995,7 @@ test_namespace_cutover_waiter_pins_entries_after_lock_acquisition() {
 
   FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
     FM_REPORT_LOCK_TEST_READY="$owner_ready" FM_REPORT_LOCK_TEST_PROCEED="$owner_proceed" \
-    "$SCRIPT" prune --status > "$owner_out" 2>&1 &
+    "$SCRIPT" prune --status --force > "$owner_out" 2>&1 &
   owner_pid=$!
   if ! IFS= read -r -t 10 state <&7; then
     kill -TERM "$owner_pid" 2>/dev/null || true
@@ -2244,7 +2244,7 @@ test_retention_binds_manifests_to_entry_directories() {
   temp="$manifest.tmp"
   sed -e "s/\"reportId\": \"[^\"]*\"/\"reportId\": \"$fresh_report_id\"/" "$manifest" > "$temp"
   mv "$temp" "$manifest"
-  if out=$(run_stack prune 2>&1); then status=0; else status=$?; fi
+  if out=$(run_stack prune --force 2>&1); then status=0; else status=$?; fi
   [ "$status" -ne 0 ] || fail "retention accepted a manifest bound to another entry"
   assert_contains "$out" "report manifest identity mismatch" "retention mismatch refusal was unclear"
   assert_present "$old_entry" "retention mismatch deleted the enclosing expired entry"
@@ -2277,6 +2277,167 @@ test_watcher_periodically_owns_idle_report_retention() {
   pass "watcher supervision periodically owns idle report retention"
 }
 
+test_noop_retention_skips_helpers_and_publication_lock_at_scale() {
+  local stack="$TMP_ROOT/retention-noop-scale-stack" control="$TMP_ROOT/retention-noop-control-stack"
+  local helper="$TMP_ROOT/retention-helper-counter" log="$TMP_ROOT/retention-helper.log"
+  local count=1000 deadline cohort output observed
+  deadline=$(( ($(date +%s) * 1000 + 17 * 24 * 60 * 60 * 1000 + 299999) / 300000 * 300000 ))
+  cohort="cohort-$deadline"
+  node - "$stack" "$control" "$count" "$deadline" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const [stack, control, countText, deadlineText] = process.argv.slice(2);
+const count = Number(countText);
+const deadline = Number(deadlineText);
+const retentionMs = 30 * 24 * 60 * 60 * 1000;
+const completedAt = new Date(deadline - retentionMs - 60_000).toISOString();
+const cohort = `cohort-${deadline}`;
+function populate(root, total) {
+  const cohortRoot = path.join(root, "entries", cohort);
+  fs.mkdirSync(cohortRoot, { recursive: true });
+  for (let index = 0; index < total; index += 1) {
+    const reportId = `noop-report-${index}`;
+    const reportRoot = path.join(cohortRoot, reportId);
+    fs.mkdirSync(reportRoot);
+    fs.writeFileSync(path.join(reportRoot, "manifest.json"), `${JSON.stringify({
+      schemaVersion: 1,
+      reportId,
+      taskId: reportId,
+      title: reportId,
+      summary: reportId,
+      completedAt,
+      retentionCohort: cohort,
+      kind: "ship",
+      project: "example",
+      harness: "codex",
+    })}\n`);
+  }
+  fs.writeFileSync(path.join(root, "index.html"), "existing index\n");
+  fs.writeFileSync(
+    path.join(root, ".retention-policy.js"),
+    `window.firstmateRetentionPolicy=${JSON.stringify({
+      schemaVersion: 1,
+      generation: "fixture",
+      cutoffMs: Date.now() - retentionMs,
+    })};\n`,
+  );
+}
+populate(stack, count);
+populate(control, 1);
+NODE
+  cat > "$helper" <<'SH'
+#!/bin/sh
+printf 'helper\n' >> "$FM_REPORT_HELPER_LOG"
+exec "$FM_REPORT_REAL_PYTHON" "$@"
+SH
+  chmod +x "$helper"
+
+  output=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_PYTHON="$helper" \
+    FM_REPORT_HELPER_LOG="$log" FM_REPORT_REAL_PYTHON="$(command -v python3)" \
+    FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status) \
+    || fail "1,000-report no-op retention did not complete outside the publication lock"
+  assert_contains "$output" '"reason":"no-work"' "scaled no-op retention was not classified as no work"
+  [ ! -s "$log" ] || fail "scaled no-op retention launched a contained helper"
+  observed=$(find "$stack/entries/$cohort" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+  [ "$observed" -eq "$count" ] || fail "scaled no-op fixture did not contain exactly $count reports"
+
+  : > "$log"
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$control" FM_REPORT_PYTHON="$helper" \
+    FM_REPORT_HELPER_LOG="$log" FM_REPORT_REAL_PYTHON="$(command -v python3)" \
+    "$SCRIPT" prune --force >/dev/null \
+    || fail "contained-helper counter positive control could not run forced retention"
+  [ -s "$log" ] || fail "contained-helper counter could not observe the forced-retention positive control"
+  pass "1,000-report no-op retention uses no helpers and never acquires the publication lock"
+}
+
+test_retention_admission_bounds_total_fleet_attempts_above_current_population() {
+  local stack="$TMP_ROOT/retention-admission-stack" outdir="$TMP_ROOT/retention-admission-output"
+  local owner_ready="$TMP_ROOT/retention-admission-owner.ready" owner_proceed="$TMP_ROOT/retention-admission-owner.proceed"
+  local waiter_ready="$TMP_ROOT/retention-admission-waiter.ready" waiter_proceed="$TMP_ROOT/retention-admission-waiter.proceed"
+  local owner_out="$TMP_ROOT/retention-admission-owner.out" owner_pid state extra admitted skipped index status
+  local contenders=24
+  local -a pids
+  mkdir -p "$stack/entries/cohort-1" "$outdir"
+  mkfifo "$owner_ready" "$owner_proceed" "$waiter_ready" "$waiter_proceed"
+  exec 7<>"$owner_ready"
+  exec 8<>"$owner_proceed"
+  exec 9<>"$waiter_ready"
+  exec 10<>"$waiter_proceed"
+
+  FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+    FM_REPORT_LOCK_ACQUIRED_TEST_READY="$owner_ready" FM_REPORT_LOCK_ACQUIRED_TEST_PROCEED="$owner_proceed" \
+    "$SCRIPT" render > "$owner_out" 2>&1 &
+  owner_pid=$!
+  if ! IFS= read -r -t 10 state <&7; then
+    kill -TERM "$owner_pid" 2>/dev/null || true
+    fail "retention admission positive-control owner did not acquire the publication lock: $(cat "$owner_out")"
+  fi
+  [ "$state" = "lock-acquired" ] || fail "retention admission owner emitted an unexpected state: $state"
+
+  for index in $(seq 1 "$contenders"); do
+    FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_RETENTION_INTERVAL=3600 \
+      FM_REPORT_LOCK_WAITER_TEST_READY="$waiter_ready" FM_REPORT_LOCK_WAITER_TEST_PROCEED="$waiter_proceed" \
+      "$SCRIPT" prune --status > "$outdir/$index.out" 2>&1 &
+    pids[index]=$!
+  done
+  if ! IFS= read -r -t 10 state <&9; then
+    printf 'continue\n' >&8
+    kill -TERM "${pids[@]}" 2>/dev/null || true
+    wait "$owner_pid" 2>/dev/null || true
+    fail "none of $contenders scheduled contenders reached the held publication lock"
+  fi
+  [ "$state" = "lock-observed" ] || fail "retention contender emitted an unexpected lock state: $state"
+
+  skipped=0
+  for _ in $(seq 1 200); do
+    skipped=$(grep -l '"admitted":false,"reason":"cadence"' "$outdir"/*.out 2>/dev/null | wc -l | tr -d ' ')
+    [ "$skipped" -eq $((contenders - 1)) ] && break
+    sleep 0.05
+  done
+  [ "$skipped" -eq $((contenders - 1)) ] \
+    || fail "machine-global admission did not reject every non-owner contender (skipped=$skipped)"
+  if IFS= read -r -t 1 extra <&9; then
+    printf 'continue\n' >&10
+    printf 'continue\n' >&8
+    fail "more than one retention contender reached the publication lock: $extra"
+  fi
+
+  printf 'continue\n' >&10
+  printf 'continue\n' >&8
+  if wait "$owner_pid"; then status=0; else status=$?; fi
+  [ "$status" -eq 0 ] || fail "retention admission positive-control owner failed: $(cat "$owner_out")"
+  for index in $(seq 1 "$contenders"); do
+    if wait "${pids[index]}"; then status=0; else status=$?; fi
+    [ "$status" -eq 0 ] || fail "retention contender $index failed: $(cat "$outdir/$index.out")"
+  done
+  admitted=$(grep -l '"admitted":true' "$outdir"/*.out | wc -l | tr -d ' ')
+  skipped=$(grep -l '"admitted":false,"reason":"cadence"' "$outdir"/*.out | wc -l | tr -d ' ')
+  [ "$admitted" -eq 1 ] || fail "global admission allowed $admitted of $contenders contenders"
+  [ "$skipped" -eq $((contenders - 1)) ] || fail "global admission skipped $skipped of $contenders contenders"
+  assert_present "$stack/.retention-attempt.json" "global retention admission did not persist its attempt record"
+  exec 7>&-; exec 8>&-; exec 9>&-; exec 10>&-
+  pass "machine-global admission allows one lock attempt across 24 concurrent homes"
+}
+
+test_failed_retention_attempt_is_ineligible_on_the_next_loop() {
+  local stack="$TMP_ROOT/retention-failure-cadence-stack" first second status
+  mkdir -p "$stack/entries/cohort-1"
+  if first=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_RETENTION_INTERVAL=3600 \
+    FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "synthetic admitted retention failure unexpectedly succeeded"
+  assert_contains "$first" "synthetic report publication lock setup failure" \
+    "retention failure fixture did not reach the real publication-lock boundary"
+  assert_present "$stack/.retention-attempt.json" "failed retention did not persist its pre-lock attempt record"
+
+  second=$(FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" FM_REPORT_RETENTION_INTERVAL=3600 \
+    FM_REPORT_LOCK_TEST_SETUP_FAILURE=1 "$SCRIPT" prune --status) \
+    || fail "next-loop retention invocation retried the failed lock attempt"
+  assert_contains "$second" '"admitted":false,"reason":"cadence"' \
+    "failed retention became eligible again on the next watcher-equivalent loop"
+  assert_present "$stack/entries/cohort-1" "failed-retention fixture lost its still-due work"
+  pass "a failed retention lock attempt is globally ineligible on the next loop"
+}
+
 test_retention_restores_expired_entries_when_index_swap_fails() {
   local id=report-retention-rollback-k2f entry out status tombstone index
   write_task "$id" ship
@@ -2294,7 +2455,7 @@ test_retention_restores_expired_entries_when_index_swap_fails() {
   assert_present "$tombstone" "failed retention index swap lost its durable deletion tombstone"
   rmdir "$STACK/index.html"
   for index in $(seq 1 100); do
-    run_stack prune >/dev/null || fail "retention could not resume a deletion tombstone"
+    run_stack prune --force >/dev/null || fail "retention could not resume a deletion tombstone"
     [ ! -e "$tombstone" ] && break
   done
   assert_absent "$tombstone" "resumed retention kept a completed deletion tombstone"
@@ -2317,7 +2478,7 @@ test_retention_batches_make_interruption_safe_progress() {
     entries[index]=$(expire_report_entry "${entries[index]}") \
       || fail "retention batch fixture $index could not be aged"
   done
-  output=$(FM_REPORT_RETENTION_BATCH=1 run_stack prune --status) || fail "first bounded retention batch failed"
+  output=$(FM_REPORT_RETENTION_BATCH=1 run_stack prune --status --force) || fail "first bounded retention batch failed"
   assert_contains "$output" '"pending":true' "bounded retention did not advertise remaining work"
   tombstone=$(find "$STACK/.retention-tombstones" -mindepth 1 -maxdepth 1 -type d -name 'tombstone-*' -print -quit)
   [ -n "$tombstone" ] || fail "bounded retention did not retain its pending tombstone"
@@ -2328,7 +2489,7 @@ test_retention_batches_make_interruption_safe_progress() {
   assert_no_grep 'report-retention-batch-' "$STACK/index.html" \
     "bounded retention left a due report in the current index"
   for index in $(seq 1 100); do
-    output=$(FM_REPORT_RETENTION_BATCH=1 run_stack prune --status) || fail "retention progress batch $index failed"
+    output=$(FM_REPORT_RETENTION_BATCH=1 run_stack prune --status --force) || fail "retention progress batch $index failed"
     case "$output" in *'"pending":false'*) break ;; esac
   done
   assert_absent "$tombstone" "bounded retention did not finish its expired cohort tombstone"
@@ -3181,7 +3342,7 @@ test_retention_cutoff_is_authoritative_before_cleanup() {
     || fail "second retention cutoff fixture could not be aged"
   ready="$TMP_ROOT/retention-policy.ready"; output="$TMP_ROOT/retention-policy.out"
   if FM_REPORT_RETENTION_POLICY_TEST_READY="$ready" FM_REPORT_RETENTION_POLICY_TEST_ABORT=1 \
-    run_stack prune --status > "$output" 2>&1; then
+    run_stack prune --status --force > "$output" 2>&1; then
     fail "retention namespace interruption hook unexpectedly completed"
   fi
   assert_present "$ready" "retention cutoff publication hook did not run"
@@ -3197,7 +3358,7 @@ test_retention_cutoff_is_authoritative_before_cleanup() {
     || fail "retention authority did not hide the expired report before scanning manifests"
   assert_absent "$(dirname "$entry")" "interrupted retention restored expired raw artifacts"
   assert_absent "$(dirname "$second_entry")" "interrupted retention restored a later expired cohort"
-  run_stack prune --status >/dev/null || fail "retention did not recover its interrupted namespace generation"
+  run_stack prune --status --force >/dev/null || fail "retention did not recover its interrupted namespace generation"
   assert_absent "$(dirname "$entry")" "retention cutoff cleanup left the expired report live"
   assert_present "$(dirname "$fresh_entry")" "retention cleanup removed an unrelated fresh cohort"
   assert_no_grep "$id" "$STACK/index.html" "completed retention rendering left an expired report visible"
@@ -3215,7 +3376,7 @@ test_retention_cohort_tombstone_is_noreplace_owned() {
   source=$(dirname "$(dirname "$entry")")
   ready="$TMP_ROOT/cohort-rename.ready"; proceed="$TMP_ROOT/cohort-rename.proceed"; output="$TMP_ROOT/cohort-rename.out"
   FM_CONTAINED_RENAME_TEST_READY="$ready" FM_CONTAINED_RENAME_TEST_PROCEED="$proceed" \
-    run_stack prune --status > "$output" 2>&1 &
+    run_stack prune --status --force > "$output" 2>&1 &
   pid=$!
   for _ in $(seq 1 100); do [ -e "$ready" ] && break; sleep 0.02; done
   [ -e "$ready" ] || { kill -TERM "$pid" 2>/dev/null || true; fail "cohort no-replace gate did not open"; }
@@ -3760,7 +3921,7 @@ test_retention_fresh_handoff_is_cohort_bounded_and_continuous() {
   done
   probe="$STACK/entries/cohort-$((base + 300000))"
   probe_identity=$(if [ "$(uname)" = Darwin ]; then stat -f '%d:%i' "$probe"; else stat -c '%d:%i' "$probe"; fi)
-  run_stack prune --status >/dev/null || fail "retention did not retire its due cohort"
+  run_stack prune --status --force >/dev/null || fail "retention did not retire its due cohort"
   assert_absent "$due" "retention left its due cohort public while preserving fresh cohorts"
   for i in $(seq 1 "$count"); do
     name="cohort-$((base + i * 300000))"
@@ -4062,6 +4223,13 @@ if [ "${FM_TEST_FOCUSED:-}" = retention-cohort-fixtures ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = retention-admission ]; then
+  test_noop_retention_skips_helpers_and_publication_lock_at_scale
+  test_retention_admission_bounds_total_fleet_attempts_above_current_population
+  test_failed_retention_attempt_is_ineligible_on_the_next_loop
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = retention-cohort-width ]; then
   test_manifest_cohort_must_match_completion_time
   test_manifest_cohort_deadline_cannot_precede_expiry
@@ -4166,6 +4334,9 @@ run_partitioned_test test_aged_transactionless_staging_is_reclaimed
 run_partitioned_test test_completed_reports_prune_after_minimum_age
 run_partitioned_test test_retention_binds_manifests_to_entry_directories
 run_partitioned_test test_watcher_periodically_owns_idle_report_retention
+run_partitioned_test test_noop_retention_skips_helpers_and_publication_lock_at_scale
+run_partitioned_test test_retention_admission_bounds_total_fleet_attempts_above_current_population
+run_partitioned_test test_failed_retention_attempt_is_ineligible_on_the_next_loop
 run_partitioned_test test_retention_batches_make_interruption_safe_progress
 run_partitioned_group \
   test_persistent_retention_owner_prunes_without_tasks_or_watcher \

@@ -4,10 +4,16 @@ Firstmate publishes one durable report for every task created after the report-s
 The default store is `$XDG_DATA_HOME/firstmate/report-stack` when `XDG_DATA_HOME` is set, otherwise `~/.local/share/firstmate/report-stack`, outside every Firstmate home and Claude or Codex account profile.
 Set `FM_REPORT_STACK_ROOT` to relocate it.
 Every locked report-stack operation performs one bounded retention batch.
+Scheduled `prune` first checks recovery markers, cohort deadlines, publication transactions, aged staging, tombstones, and index authority without acquiring the publication lock.
+When that check proves there is no due work, `prune` exits without launching contained helpers or touching the publication lock.
+When work is due, the machine-global `.retention-attempt.json` record admits at most one retention lock attempt per configured owner interval across every Firstmate home, regardless of home count.
+The record is installed atomically before lock acquisition, so a failed admitted run remains ineligible on the next watcher or LaunchAgent loop instead of amplifying contention.
+Use `prune --force` only for an intentional operator-driven maintenance pass that must bypass scheduled admission.
 Scheduled retention is owned by a per-user macOS LaunchAgent only when it is installed explicitly with `bin/fm-bootstrap.sh install report-retention` after captain approval.
 The installer publishes immutable self-contained generations and atomically advances the LaunchAgent plist only after the referenced generation is complete, so a crash or reboot never depends on a later Firstmate session to restore executable code.
 Each sweep uses a crash-recoverable namespace cutover to isolate expired cohorts, publishes the authoritative retention cutoff, regenerates the visible index, and then makes bounded physical-deletion progress, so cleanup may span later runs without restoring an expired report to readers.
-The installed owner is a stable self-contained bundle, runs at boot and every five minutes by default, retries failed runs, and records a successful-prune heartbeat that session bootstrap validates.
+The installed owner is a stable self-contained bundle, runs at boot and every five minutes by default, and records a successful-prune heartbeat that session bootstrap validates.
+LaunchAgent failure retries and home-local fallback calls share the machine-global admission record, so neither increases the aggregate retention lock-attempt rate as homes are added.
 Merging the code does not install or activate the owner.
 The authoritative visibility cutoff is the later of its prior value and the current `now - 30 days` boundary, so ordinary forward wall time tracks that boundary exactly while a backward clock adjustment never re-exposes expired reports.
 Physical cleanup still waits for each report's 30-day minimum age, its five-minute cohort deadline, and a later retention sweep, so the shipped five-minute defaults normally remove an expired report about zero to ten minutes after its minimum age.

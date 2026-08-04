@@ -614,7 +614,6 @@ async function createCommand(options) {
   const requestPath = resolve(requireOption(options, 'request'));
   const questionsPath = resolve(requireOption(options, 'questions'));
   const request = await readFile(requestPath);
-  await validateCaptainRequest(home, request);
   let questions;
   try {
     questions = JSON.parse(await readFile(questionsPath, 'utf8'));
@@ -629,6 +628,7 @@ async function createCommand(options) {
     destination: requireOption(options, 'destination'),
     visualsDirectory: options.visuals === undefined ? undefined : resolve(options.visuals),
     createdAt: options['created-at'] ?? new Date().toISOString(),
+    beforeCreate: () => validateCaptainRequest(home, request),
   });
   process.stdout.write(
     `${result.created ? 'Created' : 'Already exists'}: ${result.decision.id}\n`

@@ -22,6 +22,7 @@ import test from 'node:test';
 import vm from 'node:vm';
 import { decode, encode } from '@toon-format/toon';
 import { parseHTML } from 'linkedom';
+import { createDecision } from '../src/protocol.mjs';
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const REPO_ROOT = resolve(PACKAGE_ROOT, '../..');
@@ -414,6 +415,29 @@ test('create refuses request text that never cleared the captain item check', as
   assert.match(result.stderr, /captain request refused by the required draft check/);
   assert.match(result.stderr, /invalid: request-assembly - unchecked prose outside item markers/);
   assert.equal(await exists(join(fx.home, 'data/decisions/unchecked-request')), false);
+});
+
+test('create permits an exact retry of a pre-wrapper decision', async () => {
+  const fx = await fixture('pre-wrapper-retry');
+  const id = 'pre-wrapper-retry';
+  const destination = 'data/replies/pre-wrapper-retry.toon';
+  const request = '# Release choice\n\nBlue is safer; green is faster.\n';
+  await writeFile(fx.request, request);
+  await createDecision(fx.home, {
+    id,
+    title: 'Release choice',
+    request,
+    questions: JSON.parse(await readFile(fx.questions, 'utf8')),
+    destination,
+  });
+
+  const retry = await createRequest(fx, { id, destination, returnResult: true });
+
+  assert.match(retry.result.stdout, /Already exists: pre-wrapper-retry/);
+  assert.equal(
+    await readFile(join(fx.home, 'data/decisions', id, 'request.md'), 'utf8'),
+    request,
+  );
 });
 
 test('create stores the exact checked multi-item request and preserves verbatim detail', async () => {

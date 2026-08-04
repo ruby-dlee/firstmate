@@ -226,6 +226,46 @@ def prepare_claude_execution_home(
     return execution_home, "scoped-keychain", f"{service}:{account_name}"
 
 
+def inspect_codex_credential(account_home: Path) -> tuple[str, str]:
+    """Validate the credential file selected by one Codex home."""
+
+    credential_file = account_home.resolve() / "auth.json"
+    try:
+        metadata = credential_file.lstat()
+    except OSError as exc:
+        tool_fail(
+            "Codex executing-account credential inspection failed at "
+            f"{credential_file}: {exc}"
+        )
+    if not stat.S_ISREG(metadata.st_mode) or credential_file.is_symlink():
+        tool_fail(
+            "Codex executing-account credential inspection requires a regular "
+            f"non-symlink file at {credential_file}"
+        )
+    try:
+        credential = read_json(
+            credential_file,
+            "Codex executing-account credential",
+            maximum_bytes=1024 * 1024,
+            maximum_items=256,
+        )
+    except CrosscheckError as exc:
+        tool_fail(str(exc))
+    tokens = credential.get("tokens") if isinstance(credential, dict) else None
+    api_key = credential.get("OPENAI_API_KEY") if isinstance(credential, dict) else None
+    token_bound = isinstance(tokens, dict) and any(
+        isinstance(tokens.get(name), str) and bool(tokens[name].strip())
+        for name in ("access_token", "id_token", "refresh_token")
+    )
+    if not token_bound and not (
+        isinstance(api_key, str) and bool(api_key.strip())
+    ):
+        tool_fail(
+            f"Codex executing-account credential is unusable at {credential_file}"
+        )
+    return "codex-auth-file", str(credential_file)
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         fail(message)
@@ -1578,6 +1618,11 @@ def run_reviewer(
     environment = os.environ.copy()
     for provider_variable in (
         "CODEX_HOME",
+        "OPENAI_API_KEY",
+        "CODEX_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "CODEX_REFRESH_TOKEN",
+        "CODEX_REVOKE_TOKEN",
         "CLAUDE_CONFIG_DIR",
         "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     ):
@@ -1591,8 +1636,9 @@ def run_reviewer(
         config["account_selector"] = "CLAUDE_SECURESTORAGE_CONFIG_DIR"
     else:
         execution_home = account_home
-        credential_source = "codex-home"
-        credential_identifier = str(account_home / "auth.json")
+        credential_source, credential_identifier = inspect_codex_credential(
+            account_home
+        )
         config["account_selector"] = "CODEX_HOME"
     config["execution_home"] = str(execution_home.resolve())
     config["credential_source"] = credential_source

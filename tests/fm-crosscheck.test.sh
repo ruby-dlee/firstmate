@@ -22,6 +22,8 @@ make_case() {
   repo="$case_dir/repo"
   mkdir -p "$repo/tests" "$case_dir/state" "$case_dir/data" \
     "$case_dir/author-home" "$case_dir/reviewer-home" "$case_dir/fakebin"
+  printf '{"tokens":{"access_token":"test-reviewer-token"}}\n' \
+    > "$case_dir/reviewer-home/auth.json"
   printf '{}\n' > "$case_dir/reviewer-home/.credentials.json"
   printf '{}\n' > "$case_dir/reviewer-home/.claude.json"
   git -C "$repo" init -q -b main
@@ -114,6 +116,10 @@ if [ -n "${FM_TEST_STATE_OBSERVATION:-}" ]; then
     -name '.task-x1.crosscheck.*' -print >> "$FM_TEST_STATE_OBSERVATION"
 fi
 [ "${1:-}" = exec ] || exit 90
+[ -f "${CODEX_HOME:-}/auth.json" ] || exit 89
+for selector in OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN CODEX_REFRESH_TOKEN CODEX_REVOKE_TOKEN; do
+  [ -z "$(printenv "$selector" 2>/dev/null)" ] || exit 88
+done
 shift
 workdir=
 output=
@@ -809,6 +815,53 @@ assert sys.argv[4] in reviewer["execution_proof"]["command"]
     || fail "Claude verdict did not record the bound executing account and exact-SHA command proof"
   assert_absent "$case_dir/codex.log" "Codex reviewer launched without model separation"
   pass "Claude Opus xhigh binds HOME, account independence, sandbox writes, and exact-SHA execution evidence"
+}
+
+test_codex_reviewer_requires_bound_auth_and_clears_ambient_credentials() {
+  local record case_dir base head rc output
+  record=$(make_case codex-bound-auth)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  output=$(OPENAI_API_KEY=ambient-openai CODEX_API_KEY=ambient-codex \
+    CODEX_ACCESS_TOKEN=ambient-access CODEX_REFRESH_TOKEN=ambient-refresh \
+    CODEX_REVOKE_TOKEN=ambient-revoke \
+    run_case "$case_dir" "$base" "$head" clear run) \
+    || fail "Codex reviewer did not use its bound auth file"
+  assert_contains "$output" 'crosscheck clear' \
+    "bound Codex auth file did not earn a clear review"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+reviewer = value["runs"][-1]["reviewer"]
+assert reviewer["credential_source"] == "codex-auth-file"
+assert reviewer["credential_identifier"] == sys.argv[2]
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    "$case_dir/reviewer-home/auth.json" \
+    || fail "Codex credential binding was not recorded"
+
+  rm "$case_dir/reviewer-home/auth.json"
+  set +e
+  OPENAI_API_KEY=ambient-openai run_case "$case_dir" "$base" "$head" clear run \
+    > "$case_dir/missing-auth.out" 2> "$case_dir/missing-auth.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "missing Codex reviewer auth"
+  assert_grep 'Codex executing-account credential inspection failed at' \
+    "$case_dir/missing-auth.err" \
+    "missing bound Codex auth did not fail credential preflight"
+  assert_no_grep 'crosscheck clear' "$case_dir/missing-auth.out" \
+    "ambient API key earned a review without bound Codex auth"
+
+  printf '{}\n' > "$case_dir/reviewer-home/auth.json"
+  set +e
+  run_case "$case_dir" "$base" "$head" clear run \
+    > "$case_dir/unusable-auth.out" 2> "$case_dir/unusable-auth.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "unusable Codex reviewer auth"
+  assert_grep 'CROSSCHECK TOOL-FAILURE: Codex executing-account credential is unusable' \
+    "$case_dir/unusable-auth.err" \
+    "unusable Codex auth was not classified as a tool failure"
+  pass "Codex reviewer requires bound auth and rejects ambient credential selectors"
 }
 
 test_reviewer_execution_home_drift_fails_closed() {
@@ -1862,6 +1915,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_review_fetches_exact_pr_head_when_author_worktree_is_behind|\
     test_missing_pr_head_ref_fails_closed|\
     test_claude_reviewer_provides_model_separation_for_codex_author|\
+    test_codex_reviewer_requires_bound_auth_and_clears_ambient_credentials|\
     test_reviewer_execution_home_drift_fails_closed|\
     test_unrouted_author_uses_cross_provider_independence|\
     test_unrouted_author_without_account_proof_fails_closed|\
@@ -1908,6 +1962,7 @@ test_bad_state_override_is_a_named_tool_failure
 test_review_fetches_exact_pr_head_when_author_worktree_is_behind
 test_missing_pr_head_ref_fails_closed
 test_claude_reviewer_provides_model_separation_for_codex_author
+test_codex_reviewer_requires_bound_auth_and_clears_ambient_credentials
 test_reviewer_execution_home_drift_fails_closed
 test_unrouted_author_uses_cross_provider_independence
 test_unrouted_author_without_account_proof_fails_closed

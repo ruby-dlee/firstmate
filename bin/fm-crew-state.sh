@@ -544,7 +544,7 @@ nm_active_step_name() {
 # failed, empty, or malformed probe is unknown, never silence and never evidence
 # of health or death.
 nm_step_liveness() {
-  local run_id out status=0 verdict procs doing grade detail detail_fields line
+  local run_id out status=0 verdict procs doing grade detail detail_fields line rest reported_run structured_detail
   run_id=$(strip_quotes "$(nm_field id)")
   [ -n "$run_id" ] || { printf 'unknown (probe unreadable: run id unavailable)'; return; }
   [ -x "$NM_LIVENESS_BIN" ] || { printf 'unknown (probe unreadable: executable unavailable)'; return; }
@@ -575,9 +575,37 @@ nm_step_liveness() {
   # from the prefix before it: argv may legitimately contain strings such as
   # `procs:` or `grade:`, which must not override the fields they describe.
   detail_fields=${out%%"$SEP"doing: *}
-  verdict=$(printf '%s\n' "$detail_fields" | sed -n 's/^liveness:[[:space:]]*\([a-z][a-z]*\).*/\1/p')
-  procs=$(printf '%s\n' "$detail_fields" | sed -n 's/.*procs:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
-  grade=$(printf '%s\n' "$detail_fields" | sed -n 's/.*grade:[[:space:]]*\([a-z][a-z-]*\).*/\1/p')
+  case "$detail_fields" in
+    *$'\n'*|liveness:\ *) ;;
+    *) printf 'unknown (probe protocol unreadable: verdict missing or invalid)'; return ;;
+  esac
+  rest=${detail_fields#liveness: }
+  case "$rest" in
+    *"$SEP"*) verdict=${rest%%"$SEP"*}; rest=${rest#*"$SEP"} ;;
+    *) printf 'unknown (probe protocol unreadable: structured prefix invalid)'; return ;;
+  esac
+  case "$rest" in
+    run:\ *) reported_run=${rest#run: } ;;
+    *) printf 'unknown (probe protocol unreadable: structured prefix invalid)'; return ;;
+  esac
+  case "$reported_run" in
+    *"$SEP"*) rest=${reported_run#*"$SEP"}; reported_run=${reported_run%%"$SEP"*} ;;
+    *) printf 'unknown (probe protocol unreadable: structured prefix invalid)'; return ;;
+  esac
+  [ "$reported_run" = "$run_id" ] \
+    || { printf 'unknown (probe protocol unreadable: run identity mismatch)'; return; }
+  case "$rest" in
+    procs:\ *) rest=${rest#procs: } ;;
+    *) printf 'unknown (probe protocol unreadable: structured prefix invalid)'; return ;;
+  esac
+  case "$rest" in
+    *"$SEP"*) procs=${rest%%"$SEP"*}; structured_detail=${rest#*"$SEP"} ;;
+    *) procs=$rest; structured_detail="" ;;
+  esac
+  grade=""
+  case "$structured_detail" in
+    grade:\ *) grade=${structured_detail#grade: }; grade=${grade%%"$SEP"*} ;;
+  esac
   case "$verdict" in
     alive|dead|unknown) ;;
     *) printf 'unknown (probe protocol unreadable: verdict missing or invalid)'; return ;;

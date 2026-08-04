@@ -1025,7 +1025,7 @@ PY
 }
 
 test_real_claude_sandbox_executes_exact_sha_git_diff() {
-  local repo base head nonce profile output claude_bin sandbox_bin reviewer_home
+  local repo base head nonce profile output event claude_bin sandbox_bin reviewer_home
   if [ "${FM_TEST_REAL_CLAUDE_SANDBOX_GIT_DIFF:-0}" != 1 ]; then
     printf 'SKIP: real Claude sandbox exact-SHA git-diff proof; set FM_TEST_REAL_CLAUDE_SANDBOX_GIT_DIFF=1 and FM_TEST_REAL_CLAUDE_CONFIG_DIR\n'
     return
@@ -1051,6 +1051,7 @@ test_real_claude_sandbox_executes_exact_sha_git_diff() {
   head=$(git -C "$repo" rev-parse HEAD)
   profile="$repo/.crosscheck/real-claude-sandbox.sb"
   output="$repo/.crosscheck/real-claude-output.json"
+  event="$repo/.crosscheck/observed-bash-event"
   python3 - "$CROSSCHECK_PY" "$profile" "$repo" "$reviewer_home" <<'PY' \
     || fail "real Claude sandbox profile did not retain the narrow write contract"
 import importlib.util
@@ -1084,20 +1085,34 @@ assert f"  (subpath {json.dumps(str(session_env))})" in text
 assert f"  (subpath {json.dumps(str(shared_claude))})" not in text
 assert f"  (subpath {json.dumps(str(repo.resolve() / '.crosscheck' / 'claude-tmp'))})" not in text
 PY
-  CLAUDE_CONFIG_DIR="$reviewer_home" \
-  CLAUDE_CODE_TMPDIR="$repo/.crosscheck/claude-tmp" \
-  "$sandbox_bin" -f "$profile" "$claude_bin" -p \
-    --model claude-opus-5 \
-    --effort xhigh \
-    --dangerously-skip-permissions \
-    --tools Bash \
-    --no-session-persistence \
-    --output-format json \
-    --json-schema '{"type":"object","properties":{"base":{"type":"string"},"head":{"type":"string"},"diff":{"type":"string"},"claude_code_tmpdir":{"type":"string"}},"required":["base","head","diff","claude_code_tmpdir"],"additionalProperties":false}' \
-    "Use Bash to run git diff $base $head -- runtime-proof.txt in the current repository. Return the exact command output, both exact SHAs, and the CLAUDE_CODE_TMPDIR environment value. This is the real sandboxed Claude Bash exact-SHA git-diff proof." \
-    > "$output" \
+  (
+    cd "$repo" || exit 1
+    CLAUDE_CONFIG_DIR="$reviewer_home" \
+    CLAUDE_CODE_TMPDIR="$repo/.crosscheck/claude-tmp" \
+    "$sandbox_bin" -f "$profile" "$claude_bin" -p \
+      --model claude-opus-5 \
+      --effort xhigh \
+      --dangerously-skip-permissions \
+      --tools Bash \
+      --no-session-persistence \
+      --output-format json \
+      --json-schema '{"type":"object","properties":{"base":{"type":"string"},"head":{"type":"string"},"cwd":{"type":"string"},"diff":{"type":"string"},"claude_code_tmpdir":{"type":"string"}},"required":["base","head","cwd","diff","claude_code_tmpdir"],"additionalProperties":false}' \
+      "Use Bash in the current repository to run git diff $base $head -- runtime-proof.txt. Save an execution record containing those exact SHAs, pwd, CLAUDE_CODE_TMPDIR, and the exact diff output to .crosscheck/observed-bash-event. Return the exact diff, pwd, both exact SHAs, and the CLAUDE_CODE_TMPDIR environment value. This is the real sandboxed Claude Bash exact-SHA git-diff proof."
+  ) > "$output" \
     || fail "real installed Claude could not execute git diff under the generated sandbox"
-  python3 - "$output" "$base" "$head" "$nonce" "$repo/.crosscheck/claude-tmp" <<'PY' \
+  assert_present "$event" \
+    "real Claude Bash did not create the exact-repository execution event"
+  assert_grep "$nonce" "$event" \
+    "real Claude Bash event did not contain the temporary repository's exact-SHA diff"
+  assert_grep "$base" "$event" \
+    "real Claude Bash event was not bound to the temporary repository's base SHA"
+  assert_grep "$head" "$event" \
+    "real Claude Bash event was not bound to the temporary repository's head SHA"
+  assert_grep "$repo" "$event" \
+    "real Claude Bash event was not bound to the temporary repository cwd"
+  assert_grep "$repo/.crosscheck/claude-tmp" "$event" \
+    "real Claude Bash event did not observe the isolated CLAUDE_CODE_TMPDIR"
+  python3 - "$output" "$base" "$head" "$nonce" "$repo" "$repo/.crosscheck/claude-tmp" <<'PY' \
     || fail "real Claude output did not prove exact-SHA git diff with isolated scratch"
 import json
 import sys
@@ -1110,7 +1125,8 @@ proof = envelope["structured_output"]
 assert proof["base"] == sys.argv[2]
 assert proof["head"] == sys.argv[3]
 assert sys.argv[4] in proof["diff"]
-assert proof["claude_code_tmpdir"] == sys.argv[5]
+assert proof["cwd"] == sys.argv[5]
+assert proof["claude_code_tmpdir"] == sys.argv[6]
 PY
   pass "real sandboxed Claude Bash executed git diff between two exact SHAs with isolated CLAUDE_CODE_TMPDIR"
 }

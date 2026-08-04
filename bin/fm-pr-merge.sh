@@ -13,9 +13,10 @@
 # itself, so neither can be skipped by omission. Use it for every PR merge.
 #
 # The installed gh-axi `pr merge` surface has no expected-head option. This
-# script instead uses GitHub's merge API through bin/fm-github-pr.py and passes
-# the exact reviewed SHA in the atomic merge request. A force-push between
-# verification and the request makes GitHub reject the merge.
+# script instead uses the private GitHub merge primitive through
+# bin/fm-crosscheck.sh, which repeats ledger verification and passes the exact
+# reviewed SHA in the atomic merge request. A force-push between verification
+# and the request makes GitHub reject the merge.
 #
 # Merge method defaults to squash. The supported optional arguments are
 # --squash, --merge, --rebase, --method, --subject, --body, and --body-file.
@@ -126,7 +127,7 @@ grep -qxF "pr_head=$REVIEWED_HEAD" "$META" || {
   exit 1
 }
 
-MERGE_COMMAND=("$SCRIPT_DIR/fm-github-pr.py" merge "$URL" "$REVIEWED_HEAD" "$MERGE_METHOD")
+MERGE_COMMAND=("$SCRIPT_DIR/fm-crosscheck.sh" merge "$ID" "$URL" "$REVIEWED_HEAD" "$MERGE_METHOD")
 [ -z "$MERGE_TITLE" ] || MERGE_COMMAND+=(--title "$MERGE_TITLE")
 [ -z "$MERGE_BODY" ] || MERGE_COMMAND+=(--body "$MERGE_BODY")
 "${MERGE_COMMAND[@]}"

@@ -85,8 +85,8 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-send.sh`             | Send one verified literal line or supported key through the target's recorded backend |
 | `fm-tmux-lib.sh`         | Shared tmux pane primitives for busy detection, composer capture, and verified submit |
 | `fm-peek.sh`             | Print a bounded tail of a crewmate endpoint                                          |
-| `fm-github-pr.py`        | Adapt observed gh-axi TOON PR reads and exact-SHA atomic merge responses             |
-| `fm-crosscheck.sh`       | Run or verify the durable independent exact-head PR finding ledger                   |
+| `fm-github-pr.py`        | Adapt observed gh-axi TOON PR reads through a fail-closed read-only CLI               |
+| `fm-crosscheck.sh`       | Run, verify, or atomically merge through the durable exact-head PR finding ledger     |
 | `fm-crosscheck.py`       | Validate and execute crosscheck reviewer evidence and finding lifecycle transitions  |
 | `fm-pr-check.sh`         | Record `pr=` and `pr_head=` for a PR-ready task, then arm the watcher's merge poll   |
 | `fm-pr-merge.sh`         | Require exact-head crosscheck, record PR metadata, and atomically merge the reviewed SHA |

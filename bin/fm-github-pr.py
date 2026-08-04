@@ -20,10 +20,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import re
-import subprocess
 import sys
 from typing import Any
+
+
+BIN_DIR = Path(__file__).resolve().parent
+if str(BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(BIN_DIR))
+
+from fm_bounded_io import BoundedIOError, run_bounded
 
 
 PR_URL_RE = re.compile(
@@ -39,6 +46,7 @@ ARRAY_HEADER_RE = re.compile(
     r"(?:\{(?P<fields>[A-Za-z_][A-Za-z0-9_]*"
     r"(?:,[A-Za-z_][A-Za-z0-9_]*)*)\})?:$"
 )
+MAX_GH_AXI_OUTPUT_BYTES = 1_000_000
 
 
 class GitHubContractError(RuntimeError):
@@ -242,11 +250,11 @@ def _validate_array_subtree(
     else:
         while index < len(lines) and lines[index][1] > depth:
             item_line, item_depth, content = lines[index]
-            if item_depth != depth + 1:
+            if item_depth != depth + 1 or not content.startswith("- "):
                 raise GitHubContractError(
-                    f"malformed gh-axi TOON array nesting at line {item_line}"
+                    f"malformed gh-axi TOON scalar array item at line {item_line}"
                 )
-            scalar = content[2:] if content.startswith("- ") else content
+            scalar = content[2:]
             _parse_scalar(scalar, item_line)
             items += 1
             index += 1
@@ -336,29 +344,25 @@ def _command_timeout() -> int:
 def run_gh_axi(arguments: list[str]) -> str:
     binary = os.environ.get("FM_GH_AXI_BIN", "gh-axi")
     try:
-        result = subprocess.run(
+        result = run_bounded(
             [binary, *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=_command_timeout(),
+            timeout_seconds=_command_timeout(),
+            maximum_output_bytes=MAX_GH_AXI_OUTPUT_BYTES,
         )
-    except FileNotFoundError as exc:
-        raise GitHubContractError(f"gh-axi is unavailable at {binary}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise GitHubContractError("gh-axi timed out") from exc
-    except OSError as exc:
-        raise GitHubContractError(f"gh-axi could not start: {exc}") from exc
+    except BoundedIOError as exc:
+        raise GitHubContractError(f"gh-axi could not complete within its bounds: {exc}") from exc
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
+        detail = (stderr or stdout).strip()
         if len(detail) > 500:
             detail = detail[:500] + "..."
         raise GitHubContractError(
             f"gh-axi exited {result.returncode}: {detail or 'no diagnostic'}"
         )
-    if not result.stdout.strip():
+    if not stdout.strip():
         raise GitHubContractError("gh-axi returned no document")
-    return result.stdout
+    return stdout
 
 
 def fetch_pr_api(url: str) -> dict[str, Any]:
@@ -490,12 +494,6 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("snapshot", "head", "state"):
         command = subparsers.add_parser(name)
         command.add_argument("pr_url")
-    merge = subparsers.add_parser("merge")
-    merge.add_argument("pr_url")
-    merge.add_argument("expected_sha")
-    merge.add_argument("method", choices=("merge", "squash", "rebase"))
-    merge.add_argument("--title")
-    merge.add_argument("--body")
     return parser
 
 
@@ -509,19 +507,6 @@ def main() -> int:
         elif args.command == "state":
             state = fetch_pr_api(args.pr_url)
             print("MERGED" if state["merged"] else str(state["state"]).upper())
-        elif args.command == "merge":
-            print(
-                json.dumps(
-                    merge_exact(
-                        args.pr_url,
-                        args.expected_sha,
-                        args.method,
-                        args.title,
-                        args.body,
-                    ),
-                    sort_keys=True,
-                )
-            )
         else:
             raise AssertionError(f"unhandled command {args.command}")
     except GitHubContractError as exc:

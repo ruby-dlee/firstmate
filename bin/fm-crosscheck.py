@@ -8,19 +8,25 @@ import copy
 import datetime as dt
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
-import selectors
 import shutil
-import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 from typing import Any, NoReturn
+
+
+BIN_DIR = Path(__file__).resolve().parent
+if str(BIN_DIR) not in sys.path:
+    sys.path.insert(0, str(BIN_DIR))
+
+from fm_bounded_io import BoundedIOError, read_bounded_json, run_bounded
 
 
 SCHEMA = "firstmate.crosscheck-ledger.v2"
@@ -32,12 +38,13 @@ ACTIVE_LIFECYCLES = {"open", "claimed-fixed"}
 ALL_LIFECYCLES = ACTIVE_LIFECYCLES | {"verified-fixed", "closed-equivalent"}
 SEVERITIES = {"blocking", "high", "medium", "low"}
 MAX_CAPTURE = 200_000
+MAX_LEDGER_BYTES = 16 * 1024 * 1024
+MAX_REVIEWER_CONFIG_BYTES = 64 * 1024
 MAX_LEDGER_PROMPT_BYTES = 64_000
 MAX_PROJECTED_FINDINGS = 512
 MAX_PROJECTED_EVENTS = 8
 MAX_REVIEW_ITEMS = 32
 MAX_EVIDENCE_ITEMS = 32
-PROCESS_TERMINATION_GRACE_SECONDS = 0.25
 TEST_RUNNERS = {
     "bash",
     "bun",
@@ -88,12 +95,21 @@ def require_exact_keys(value: dict[str, Any], allowed: set[str], label: str) -> 
     require(not extra, f"{label} has unknown fields: {', '.join(sorted(extra))}")
 
 
-def read_json(path: Path, label: str) -> Any:
+def read_json(
+    path: Path,
+    label: str,
+    *,
+    maximum_bytes: int,
+    maximum_items: int = 65_536,
+) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        fail(f"{label} is absent at {path}")
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return read_bounded_json(
+            path,
+            maximum_bytes=maximum_bytes,
+            maximum_items=maximum_items,
+            maximum_string_bytes=maximum_bytes,
+        )
+    except BoundedIOError as exc:
         fail(f"{label} is malformed at {path}: {exc}")
 
 
@@ -115,136 +131,6 @@ def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
             pass
 
 
-def process_group_exists(process_group: int) -> bool:
-    try:
-        os.killpg(process_group, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return False
-    return True
-
-
-def terminate_residual_process_group(process_group: int) -> None:
-    if not process_group_exists(process_group):
-        return
-    try:
-        os.killpg(process_group, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        return
-    deadline = time.monotonic() + PROCESS_TERMINATION_GRACE_SECONDS
-    while time.monotonic() < deadline and process_group_exists(process_group):
-        time.sleep(0.02)
-    if process_group_exists(process_group):
-        try:
-            os.killpg(process_group, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-
-def terminate_process(process: subprocess.Popen[bytes]) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
-    try:
-        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
-            pass
-    terminate_residual_process_group(process.pid)
-
-
-def bounded_communicate(
-    process: subprocess.Popen[bytes],
-    input_bytes: bytes | None,
-    timeout: float,
-    command_name: str,
-) -> tuple[str, str]:
-    selector = selectors.DefaultSelector()
-    outputs = {"stdout": bytearray(), "stderr": bytearray()}
-    streams = {
-        "stdout": process.stdout,
-        "stderr": process.stderr,
-    }
-    for name, stream in streams.items():
-        require(stream is not None, f"{command_name} output pipe is unavailable")
-        os.set_blocking(stream.fileno(), False)
-        selector.register(stream, selectors.EVENT_READ, name)
-
-    input_offset = 0
-    if process.stdin is not None:
-        if input_bytes:
-            os.set_blocking(process.stdin.fileno(), False)
-            selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
-        else:
-            process.stdin.close()
-
-    deadline = time.monotonic() + timeout
-    captured = 0
-    try:
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                terminate_process(process)
-                fail(f"{command_name} timed out after {timeout:g}s")
-            for key, _ in selector.select(min(remaining, 0.25)):
-                stream = key.fileobj
-                if key.data == "stdin":
-                    try:
-                        written = os.write(stream.fileno(), input_bytes[input_offset:])
-                    except BlockingIOError:
-                        continue
-                    except BrokenPipeError:
-                        written = 0
-                    input_offset += written
-                    if written == 0 or input_offset == len(input_bytes):
-                        selector.unregister(stream)
-                        stream.close()
-                    continue
-                try:
-                    chunk = os.read(stream.fileno(), 65_536)
-                except BlockingIOError:
-                    continue
-                if not chunk:
-                    selector.unregister(stream)
-                    stream.close()
-                    continue
-                captured += len(chunk)
-                if captured > MAX_CAPTURE:
-                    terminate_process(process)
-                    fail(
-                        f"{command_name} exceeded the {MAX_CAPTURE}-byte output limit"
-                    )
-                outputs[key.data].extend(chunk)
-    finally:
-        selector.close()
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is not None and not stream.closed:
-                stream.close()
-
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        terminate_process(process)
-        fail(f"{command_name} timed out after {timeout:g}s")
-    try:
-        process.wait(timeout=remaining)
-    except subprocess.TimeoutExpired:
-        terminate_process(process)
-        fail(f"{command_name} timed out after {timeout:g}s")
-    terminate_residual_process_group(process.pid)
-    return (
-        outputs["stdout"].decode("utf-8", errors="replace"),
-        outputs["stderr"].decode("utf-8", errors="replace"),
-    )
-
-
 def run_command(
     arguments: list[str],
     *,
@@ -256,30 +142,30 @@ def run_command(
 ) -> subprocess.CompletedProcess[str]:
     command_name = description or arguments[0]
     try:
-        process = subprocess.Popen(
+        result = run_bounded(
             arguments,
+            timeout_seconds=timeout,
+            maximum_output_bytes=MAX_CAPTURE,
             cwd=cwd,
             env=env,
-            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+            input_bytes=input_text.encode("utf-8") if input_text is not None else None,
         )
-    except FileNotFoundError as exc:
-        fail(f"required executable is unavailable: {command_name}")
-    except OSError as exc:
-        fail(f"could not start required executable {command_name}: {exc}")
-    stdout, stderr = bounded_communicate(
-        process,
-        input_text.encode("utf-8") if input_text is not None else None,
-        timeout,
-        command_name,
+    except BoundedIOError as exc:
+        fail(f"{command_name}: {exc}")
+    return subprocess.CompletedProcess(
+        arguments,
+        result.returncode,
+        result.stdout.decode("utf-8", errors="replace"),
+        result.stderr.decode("utf-8", errors="replace"),
     )
-    return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
 
 
 def write_sandbox_profile(
-    path: Path, writable_root: Path, *, allow_network: bool
+    path: Path,
+    writable_root: Path,
+    *,
+    allow_network: bool,
+    allow_posix_ipc: bool = True,
 ) -> None:
     rules = [
         "(version 1)",
@@ -289,11 +175,11 @@ def write_sandbox_profile(
     ]
     if allow_network:
         rules.append("(allow network*)")
+    rules.extend(["(allow sysctl-read)", "(allow mach-lookup)"])
+    if allow_posix_ipc:
+        rules.append("(allow ipc-posix*)")
     rules.extend(
         [
-            "(allow sysctl-read)",
-            "(allow mach-lookup)",
-            "(allow ipc-posix*)",
             "(allow file-ioctl)",
             "(allow file-write*",
             f"  (subpath {json.dumps(str(writable_root.resolve()))})",
@@ -311,12 +197,18 @@ def run_sandboxed(
     cwd: Path,
     profile_path: Path,
     allow_network: bool,
+    allow_posix_ipc: bool = True,
     env: dict[str, str] | None = None,
     timeout: float = 60,
     input_text: str | None = None,
     description: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    write_sandbox_profile(profile_path, cwd, allow_network=allow_network)
+    write_sandbox_profile(
+        profile_path,
+        cwd,
+        allow_network=allow_network,
+        allow_posix_ipc=allow_posix_ipc,
+    )
     environment = (env or os.environ).copy()
     private_tmp = cwd / ".crosscheck" / "tmp"
     private_cache = cwd / ".crosscheck" / "cache"
@@ -484,6 +376,11 @@ def safe_artifact(review_dir: Path, relative: str, prefix: str) -> Path:
         source_path.is_file() and not source_path.is_symlink(),
         f"artifact is absent: {relative}",
     )
+    try:
+        size = source_path.stat(follow_symlinks=False).st_size
+    except OSError as exc:
+        fail(f"artifact is unavailable: {relative}: {exc}")
+    require(size <= MAX_CAPTURE, f"artifact exceeds {MAX_CAPTURE} bytes: {relative}")
     return candidate
 
 
@@ -544,6 +441,7 @@ def execute_reproduction(
             / f"evidence-{hashlib.sha256(label.encode()).hexdigest()[:10]}.sb"
         ),
         allow_network=False,
+        allow_posix_ipc=False,
         timeout=evidence_command_timeout(deadline, evidence_timeout(), label),
         description=label,
     )
@@ -654,11 +552,43 @@ def create_proof_checkout(
     )
 
 
+def remove_proof_checkout(path: Path, label: str) -> None:
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        fail(f"{label} could not destroy baseline state: {exc}")
+    require(not path.exists(), f"{label} baseline state still exists after removal")
+
+
+def is_test_or_evidence_path(path: str) -> bool:
+    candidate = Path(path)
+    parts = {part.lower() for part in candidate.parts}
+    if parts & {
+        ".crosscheck",
+        "__tests__",
+        "fixture",
+        "fixtures",
+        "spec",
+        "specs",
+        "test",
+        "testdata",
+        "tests",
+    }:
+        return True
+    name = candidate.name.lower()
+    return bool(
+        re.search(r"(?:^|[._-])(?:test|tests|spec|specs)(?:[._-]|$)", name)
+        or name.startswith(("test_", "spec_"))
+        or name in {"conftest.py", "pytest.ini"}
+    )
+
+
 def execute_mutation_proof(
     value: Any,
     review_dir: Path,
     head_sha: str,
     proof_root: Path,
+    implementation_paths: set[str],
     label: str,
     deadline: float,
 ) -> dict[str, Any]:
@@ -683,28 +613,29 @@ def execute_mutation_proof(
     )
 
     proof_id = hashlib.sha256(label.encode()).hexdigest()[:10]
-    baseline_dir = proof_root / f"proof-{proof_id}-baseline"
-    mutated_dir = proof_root / f"proof-{proof_id}-mutated"
-    create_proof_checkout(review_dir, baseline_dir, head_sha, label, deadline)
-    create_proof_checkout(review_dir, mutated_dir, head_sha, label, deadline)
+    proof_dir = proof_root / f"proof-{proof_id}"
+    create_proof_checkout(review_dir, proof_dir, head_sha, label, deadline)
 
-    baseline_profile = baseline_dir / ".crosscheck" / "mutation-proof.sb"
+    baseline_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
     baseline = run_sandboxed(
-        test_arguments(invocation, test_path, baseline_dir),
-        cwd=baseline_dir,
+        test_arguments(invocation, test_path, proof_dir),
+        cwd=proof_dir,
         profile_path=baseline_profile,
         allow_network=False,
+        allow_posix_ipc=False,
         timeout=evidence_command_timeout(
             deadline, evidence_timeout(), f"{label} baseline test"
         ),
         description=f"{label} baseline test",
     )
     require(baseline.returncode == 0, f"{label} named test does not pass before mutation")
+    remove_proof_checkout(proof_dir, label)
+    create_proof_checkout(review_dir, proof_dir, head_sha, label, deadline)
     applied = run_command(
         [
             "git",
             "-C",
-            str(mutated_dir),
+            str(proof_dir),
             "apply",
             "--whitespace=nowarn",
             str(patch_path),
@@ -713,20 +644,33 @@ def execute_mutation_proof(
     )
     require(applied.returncode == 0, f"{label} mutation patch does not apply")
     changed = git(
-        mutated_dir,
+        proof_dir,
         "diff",
         "--name-only",
         timeout=evidence_command_timeout(deadline, 60, f"{label} mutation diff"),
     ).splitlines()
     require(bool(changed), f"{label} mutation patch changes no tracked implementation")
     require(test_path not in changed, f"{label} mutation changed its named test")
+    unexpected = sorted(set(changed) - implementation_paths)
+    require(
+        not unexpected,
+        f"{label} mutation changes files outside finding implementation citations: "
+        + ", ".join(unexpected),
+    )
+    test_support = sorted(path for path in changed if is_test_or_evidence_path(path))
+    require(
+        not test_support,
+        f"{label} mutation changes test or evidence support: "
+        + ", ".join(test_support),
+    )
 
-    mutated_profile = mutated_dir / ".crosscheck" / "mutation-proof.sb"
+    mutated_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
     mutated = run_sandboxed(
-        test_arguments(invocation, test_path, mutated_dir),
-        cwd=mutated_dir,
+        test_arguments(invocation, test_path, proof_dir),
+        cwd=proof_dir,
         profile_path=mutated_profile,
         allow_network=False,
+        allow_posix_ipc=False,
         timeout=evidence_command_timeout(
             deadline, evidence_timeout(), f"{label} mutated test"
         ),
@@ -966,9 +910,18 @@ def active_findings_for_head(ledger: dict[str, Any], head_sha: str) -> list[str]
 
 
 def load_ledger(path: Path, task_id: str, url: str) -> dict[str, Any]:
-    if not path.exists():
+    if not path.exists() and not path.is_symlink():
         return new_ledger(task_id, url)
-    return validate_ledger(read_json(path, "findings ledger"), task_id, url)
+    return validate_ledger(
+        read_json(
+            path,
+            "findings ledger",
+            maximum_bytes=MAX_LEDGER_BYTES,
+            maximum_items=262_144,
+        ),
+        task_id,
+        url,
+    )
 
 
 def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
@@ -978,7 +931,12 @@ def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
             str(home / "config" / "crosscheck-reviewer.json"),
         )
     )
-    value = read_json(config_path, "independent reviewer configuration")
+    value = read_json(
+        config_path,
+        "independent reviewer configuration",
+        maximum_bytes=MAX_REVIEWER_CONFIG_BYTES,
+        maximum_items=4096,
+    )
     require(isinstance(value, dict), "reviewer configuration must be an object")
     require_exact_keys(value, {"reviewers"}, "reviewer configuration")
     reviewers = value.get("reviewers")
@@ -1209,8 +1167,9 @@ Write mutation patches only under .crosscheck/mutations/.
 
 A new finding is admissible only when you provide a reproduction helper and command that you actually ran.
 The command must name its helper, and its exit code plus a distinctive output marker must reproduce the defect.
-A prior finding is verified-fixed only when you name a tracked test, provide a structured test invocation, and provide a patch under .crosscheck/mutations/ that breaks or reverts the implementation without changing that test.
-The gate appends the named test path to the approved runner invocation and runs clean baseline and mutated checkouts independently.
+A prior finding is verified-fixed only when you name a tracked test, provide a structured test invocation, and provide a patch under .crosscheck/mutations/ that breaks or reverts cited implementation without changing test or evidence support.
+The mutation may change only implementation paths already cited by that finding.
+The gate appends the named test path to the approved runner invocation, destroys all baseline state, and recreates the same clean checkout path before applying the mutation.
 The gate will independently run every reproduction and every mutation proof.
 If you cannot reproduce a concern, return it as a suspicion; suspicions block the merge.
 Silence never closes an existing finding.
@@ -1296,11 +1255,12 @@ def run_reviewer(
             result.returncode == 0,
             f"reviewer exited {result.returncode} without an earned verdict",
         )
-        require(
-            output_path.is_file() and output_path.stat().st_size > 0,
-            "reviewer stopped without a verdict artifact",
+        return read_json(
+            output_path,
+            "reviewer verdict artifact",
+            maximum_bytes=MAX_CAPTURE,
+            maximum_items=4096,
         )
-        return read_json(output_path, "reviewer verdict artifact")
 
     claude = os.environ.get("FM_CROSSCHECK_CLAUDE_BIN", "claude")
     environment["CLAUDE_CONFIG_DIR"] = config["account_home"]
@@ -1430,6 +1390,7 @@ def apply_review(
                 review_dir,
                 snapshot_value["head_sha"],
                 proof_root,
+                {citation["path"] for citation in by_id[target]["citations"]},
                 f"{label}.mutation_proof",
                 evidence_deadline,
             )
@@ -1643,7 +1604,12 @@ def assert_review_checkout_intact(review_dir: Path, head_sha: str) -> None:
 
 
 def write_ledger(path: Path, ledger: dict[str, Any]) -> None:
-    atomic_write(path, json.dumps(ledger, indent=2, sort_keys=True) + "\n")
+    encoded = json.dumps(ledger, indent=2, sort_keys=True) + "\n"
+    require(
+        len(encoded.encode("utf-8")) <= MAX_LEDGER_BYTES,
+        f"findings ledger exceeds the {MAX_LEDGER_BYTES}-byte limit",
+    )
+    atomic_write(path, encoded)
 
 
 def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
@@ -1693,7 +1659,7 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
     return 0
 
 
-def verify_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
+def verified_crosscheck_head(root: Path, home: Path, task_id: str, url: str) -> str:
     data = Path(os.environ.get("FM_DATA_OVERRIDE", str(home / "data")))
     ledger_path = data / task_id / "crosscheck-ledger.json"
     snapshot_value = github_snapshot(root, url)
@@ -1715,7 +1681,54 @@ def verify_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
     require(latest["state"] == "clear", f"latest exact-head crosscheck state is {latest['state']}")
     require(not latest.get("active_blockers"), "clear crosscheck run records active blockers")
     require(not latest.get("suspicions"), "clear crosscheck run records unresolved suspicions")
-    print(snapshot_value["head_sha"])
+    return snapshot_value["head_sha"]
+
+
+def verify_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
+    print(verified_crosscheck_head(root, home, task_id, url))
+    return 0
+
+
+def load_github_adapter(root: Path) -> Any:
+    path = root / "bin" / "fm-github-pr.py"
+    spec = importlib.util.spec_from_file_location("firstmate_github_pr_adapter", path)
+    require(spec is not None and spec.loader is not None, "GitHub adapter is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except (ImportError, OSError, SyntaxError) as exc:
+        fail(f"GitHub adapter could not load: {exc}")
+    require(callable(getattr(module, "merge_exact", None)), "GitHub merge primitive is unavailable")
+    return module
+
+
+def merge_crosschecked(
+    root: Path,
+    home: Path,
+    task_id: str,
+    url: str,
+    expected_sha: str,
+    method: str,
+    title: str | None,
+    body: str | None,
+) -> int:
+    require(
+        os.environ.get("FM_GATE_REFUSE_BYPASS") == "1"
+        or "NO_MISTAKES_GATE" not in os.environ,
+        "no-mistakes gate agent must not invoke the merge primitive",
+    )
+    require(SHA_RE.fullmatch(expected_sha) is not None, "expected merge head must be one 40-hex SHA")
+    reviewed_head = verified_crosscheck_head(root, home, task_id, url)
+    require(
+        reviewed_head == expected_sha,
+        "caller-provided merge head does not match the freshly verified Crosscheck head",
+    )
+    adapter = load_github_adapter(root)
+    try:
+        result = adapter.merge_exact(url, reviewed_head, method, title, body)
+    except adapter.GitHubContractError as exc:
+        fail(f"atomic GitHub merge failed closed: {exc}")
+    print(json.dumps(result, sort_keys=True))
     return 0
 
 
@@ -1726,6 +1739,13 @@ def build_parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(name)
         command.add_argument("task_id")
         command.add_argument("pr_url")
+    merge = subparsers.add_parser("merge")
+    merge.add_argument("task_id")
+    merge.add_argument("pr_url")
+    merge.add_argument("expected_sha")
+    merge.add_argument("method", choices=("merge", "squash", "rebase"))
+    merge.add_argument("--title")
+    merge.add_argument("--body")
     return parser
 
 
@@ -1749,7 +1769,18 @@ def main() -> int:
                 fail("another crosscheck operation already owns this task")
             if args.command == "run":
                 return run_crosscheck(root, home, args.task_id, args.pr_url)
-            return verify_crosscheck(root, home, args.task_id, args.pr_url)
+            if args.command == "verify":
+                return verify_crosscheck(root, home, args.task_id, args.pr_url)
+            return merge_crosschecked(
+                root,
+                home,
+                args.task_id,
+                args.pr_url,
+                args.expected_sha,
+                args.method,
+                args.title,
+                args.body,
+            )
     except CrosscheckError as exc:
         print(f"CROSSCHECK UNREVIEWED: {exc}", file=sys.stderr)
         return 1

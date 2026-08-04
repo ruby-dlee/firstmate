@@ -40,6 +40,16 @@ case "$*" in
       error) exit 42 ;;
       malformed) sed '/^  sha:/d' "$FM_TEST_API_FIXTURE" ;;
       malformed-array) sed 's/labels\[1\]/labels[2]/' "$FM_TEST_API_FIXTURE" ;;
+      malformed-fieldless-array)
+        sed \
+          -e 's/^labels\[1\]{.*}:$/labels[1]:/' \
+          -e 's/^  4307347680,bug,d73a4a,true,.*$/  bogus/' \
+          "$FM_TEST_API_FIXTURE"
+        ;;
+      timeout-child)
+        (sleep 2; printf leaked > "$FM_TEST_CHILD_MARKER") &
+        sleep 30
+        ;;
       boolean-number) sed 's/^number: 72$/number: true/' "$FM_TEST_API_FIXTURE" ;;
       *) exit 98 ;;
     esac
@@ -118,38 +128,53 @@ test_lookup_errors_fail_closed() {
   pass "GitHub lookup errors and malformed documents fail closed"
 }
 
-test_merge_uses_exact_sha_field() {
-  local output
+test_public_merge_subcommand_is_unavailable() {
+  local rc
   : > "$FM_TEST_GH_AXI_LOG"
-  output=$("$ADAPTER" merge "$PR_URL" c9cbe79154013efcec9aa478f1476d0eff6c63df squash) \
-    || fail "exact-head merge rejected observed success fixture"
-  assert_contains "$output" '"merged": true' "merge did not confirm success"
-  grep -qxF 'api PUT /repos/ruby-dlee/firstmate/pulls/72/merge --field sha=c9cbe79154013efcec9aa478f1476d0eff6c63df --field merge_method=squash' "$FM_TEST_GH_AXI_LOG" \
-    || fail "merge omitted or changed the exact reviewed SHA field"
-
-  printf 'sha: b507a2d799059c6a766bd0dd3d5ceebb40586b5b\nmerged: false\nmessage: refused\n' > "$TMP_ROOT/not-merged.toon"
   set +e
-  FM_TEST_MERGE_FIXTURE="$TMP_ROOT/not-merged.toon" "$ADAPTER" merge "$PR_URL" c9cbe79154013efcec9aa478f1476d0eff6c63df squash \
-    > "$TMP_ROOT/not-merged.out" 2> "$TMP_ROOT/not-merged.err"
+  "$ADAPTER" merge "$PR_URL" c9cbe79154013efcec9aa478f1476d0eff6c63df squash \
+    > "$TMP_ROOT/public-merge.out" 2> "$TMP_ROOT/public-merge.err"
   rc=$?
   set -e
-  expect_code 1 "$rc" "non-merged response"
-  assert_grep 'did not confirm merged: true' "$TMP_ROOT/not-merged.err" \
-    "merge accepted a non-merged response"
-  pass "GitHub merge sends the expected SHA atomically and requires merged true"
+  [ "$rc" -ne 0 ] || fail "public adapter merge subcommand remained executable"
+  [ ! -s "$FM_TEST_GH_AXI_LOG" ] || fail "public adapter merge reached gh-axi"
+  pass "GitHub mutation is unavailable from the read-only adapter CLI"
 }
 
 test_malformed_array_subtrees_fail_closed() {
-  local rc
+  local mode rc
+  for mode in malformed-array malformed-fieldless-array; do
+    set +e
+    FM_TEST_API_MODE=$mode "$ADAPTER" snapshot "$PR_URL" \
+      > "$TMP_ROOT/$mode.out" 2> "$TMP_ROOT/$mode.err"
+    rc=$?
+    set -e
+    expect_code 1 "$rc" "$mode TOON array"
+  done
+  assert_grep 'declares 2 rows, found 1' "$TMP_ROOT/malformed-array.err" \
+    "ignored TOON table rows were not strictly validated"
+  assert_grep 'malformed gh-axi TOON scalar array item' \
+    "$TMP_ROOT/malformed-fieldless-array.err" \
+    "fieldless TOON array accepted a row without the required list marker"
+  pass "unrelated TOON arrays are grammar-, count-, and row-validated before isolation"
+}
+
+test_timeout_reaps_gh_axi_children() {
+  local marker rc
+  marker="$TMP_ROOT/timeout-child-marker"
   set +e
-  FM_TEST_API_MODE=malformed-array "$ADAPTER" snapshot "$PR_URL" \
-    > "$TMP_ROOT/malformed-array.out" 2> "$TMP_ROOT/malformed-array.err"
+  FM_TEST_API_MODE=timeout-child \
+  FM_TEST_CHILD_MARKER="$marker" \
+  FM_GH_AXI_TIMEOUT_SECONDS=1 \
+    "$ADAPTER" snapshot "$PR_URL" > "$TMP_ROOT/timeout.out" 2> "$TMP_ROOT/timeout.err"
   rc=$?
   set -e
-  expect_code 1 "$rc" "malformed TOON array count"
-  assert_grep 'declares 2 rows, found 1' "$TMP_ROOT/malformed-array.err" \
-    "ignored TOON array rows were not strictly validated"
-  pass "unrelated TOON arrays are count- and row-validated before isolation"
+  expect_code 1 "$rc" "timed-out gh-axi lookup"
+  sleep 2.2
+  [ ! -e "$marker" ] || fail "timed-out gh-axi child survived the adapter"
+  assert_grep 'GitHub state is unreviewed' "$TMP_ROOT/timeout.err" \
+    "timed-out lookup did not fail closed"
+  pass "gh-axi timeouts terminate and reap the complete request process tree"
 }
 
 test_boolean_pr_numbers_fail_closed() {
@@ -174,7 +199,8 @@ test_boolean_pr_numbers_fail_closed() {
 
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
-    test_malformed_array_subtrees_fail_closed|test_boolean_pr_numbers_fail_closed)
+    test_malformed_array_subtrees_fail_closed|test_boolean_pr_numbers_fail_closed|\
+    test_timeout_reaps_gh_axi_children|test_public_merge_subcommand_is_unavailable)
       "$FM_TEST_CASE"
       exit 0
       ;;
@@ -186,11 +212,14 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
   test_snapshot_uses_observed_contract
   test_malformed_array_subtrees_fail_closed
   test_boolean_pr_numbers_fail_closed
+  test_timeout_reaps_gh_axi_children
+  test_public_merge_subcommand_is_unavailable
   exit 0
 fi
 
 test_snapshot_uses_observed_contract
 test_lookup_errors_fail_closed
-test_merge_uses_exact_sha_field
+test_public_merge_subcommand_is_unavailable
 test_malformed_array_subtrees_fail_closed
 test_boolean_pr_numbers_fail_closed
+test_timeout_reaps_gh_axi_children

@@ -28,11 +28,17 @@ make_case() {
   printf '#!/usr/bin/env bash\ngrep -qx fixed app.txt\n' > "$repo/tests/regression.test.sh"
   printf '#!/usr/bin/env bash\n[ ! -e .stateful-proof-marker ] || exit 19\ntouch .stateful-proof-marker\ngrep -qx fixed app.txt\n' \
     > "$repo/tests/stateful.test.sh"
+  printf '#!/usr/bin/env bash\nfind .. -maxdepth 2 -name .baseline-readable-marker -print -quit | grep -q . && exit 19\ntouch .baseline-readable-marker\n' \
+    > "$repo/tests/readable-state.test.sh"
+  printf '#!/usr/bin/env bash\ngrep -qx fixed app.txt\n' > "$repo/tests/helper.sh"
+  printf '#!/usr/bin/env bash\n. tests/helper.sh\n' > "$repo/tests/support.test.sh"
   printf '#!/usr/bin/env bash\ngrep -qx fixed app.txt\n' > "$repo/shared-test.sh"
   ln -s ../shared-test.sh "$repo/tests/symlink.test.sh"
-  chmod +x "$repo/tests/regression.test.sh" "$repo/tests/stateful.test.sh"
+  chmod +x "$repo/tests/regression.test.sh" "$repo/tests/stateful.test.sh" \
+    "$repo/tests/readable-state.test.sh" "$repo/tests/support.test.sh"
   git -C "$repo" add app.txt other.txt shared-test.sh tests/regression.test.sh \
-    tests/stateful.test.sh tests/symlink.test.sh
+    tests/helper.sh tests/readable-state.test.sh tests/stateful.test.sh \
+    tests/support.test.sh tests/symlink.test.sh
   git -C "$repo" commit -qm base
   base=$(git -C "$repo" rev-parse HEAD)
   git -C "$repo" checkout -qb feature
@@ -256,9 +262,26 @@ elif scenario == "new-finding":
             "output_contains": "REPRODUCED-BUG",
         },
     }]
-elif scenario in {"verified-fixed", "missing-proof", "forged-command", "stateful-forgery", "symlink-forgery"}:
+elif scenario in {
+    "verified-fixed",
+    "missing-proof",
+    "forged-command",
+    "readable-state-forgery",
+    "stateful-forgery",
+    "support-forgery",
+    "symlink-forgery",
+}:
     patch = protocol / "mutations" / "revert.patch"
     if scenario in {"verified-fixed", "forged-command"}:
+        patch.parent.mkdir(parents=True, exist_ok=True)
+        patch.write_text("""diff --git a/app.txt b/app.txt
+--- a/app.txt
++++ b/app.txt
+@@ -1 +1 @@
+-fixed
++broken
+""")
+    elif scenario == "readable-state-forgery":
         patch.parent.mkdir(parents=True, exist_ok=True)
         patch.write_text("""diff --git a/app.txt b/app.txt
 --- a/app.txt
@@ -276,6 +299,16 @@ elif scenario in {"verified-fixed", "missing-proof", "forged-command", "stateful
 -base
 +irrelevant
 """)
+    elif scenario == "support-forgery":
+        patch.parent.mkdir(parents=True, exist_ok=True)
+        patch.write_text("""diff --git a/tests/helper.sh b/tests/helper.sh
+--- a/tests/helper.sh
++++ b/tests/helper.sh
+@@ -1,2 +1,2 @@
+ #!/usr/bin/env bash
+-grep -qx fixed app.txt
++exit 41
+""")
     elif scenario == "symlink-forgery":
         patch.parent.mkdir(parents=True, exist_ok=True)
         patch.write_text("""diff --git a/shared-test.sh b/shared-test.sh
@@ -287,7 +320,9 @@ elif scenario in {"verified-fixed", "missing-proof", "forged-command", "stateful
 +exit 41
 """)
     test_path = {
+        "readable-state-forgery": "tests/readable-state.test.sh",
         "stateful-forgery": "tests/stateful.test.sh",
+        "support-forgery": "tests/support.test.sh",
         "symlink-forgery": "tests/symlink.test.sh",
     }.get(scenario, "tests/regression.test.sh")
     mutation_proof = {
@@ -366,6 +401,9 @@ elif scenario == "suspicion":
         "description": "The reviewer could not finish a reproduction.",
         "citations": [{"path": "app.txt", "line": 1}],
     }]
+
+if scenario == "oversized-artifact":
+    base["summary"] = "A" * 210000
 
 output.write_text(json.dumps(base))
 PY
@@ -559,6 +597,16 @@ test_stateful_test_cannot_fabricate_mutation_causality() {
   record=$(make_case stateful-forgery)
   IFS=$'\t' read -r case_dir base head <<< "$record"
   seed_open_ledger "$case_dir" "$head"
+  python3 - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+value = json.load(open(path))
+value["findings"][0]["citations"] = [{"path": "other.txt", "line": 1}]
+with open(path, "w") as stream:
+    json.dump(value, stream)
+PY
   set +e
   run_case "$case_dir" "$base" "$head" stateful-forgery run \
     > "$case_dir/out" 2> "$case_dir/err"
@@ -568,6 +616,57 @@ test_stateful_test_cannot_fabricate_mutation_causality() {
   assert_grep 'named test still passes after mutation' "$case_dir/err" \
     "baseline state leaked into the mutated checkout"
   pass "baseline and mutation tests run in independent clean checkouts"
+}
+
+test_baseline_readable_state_is_destroyed_before_mutation() {
+  local record case_dir base head rc
+  record=$(make_case readable-state-forgery)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  seed_open_ledger "$case_dir" "$head"
+  set +e
+  run_case "$case_dir" "$base" "$head" readable-state-forgery run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "readable baseline-state mutation fabrication"
+  assert_grep 'named test still passes after mutation' "$case_dir/err" \
+    "mutated proof observed state retained from the baseline proof"
+  pass "baseline proof state is destroyed before the same checkout path is recreated"
+}
+
+test_mutation_is_bound_to_cited_non_test_implementation() {
+  local mode record case_dir base head rc
+  for mode in outside-citation cited-test-support; do
+    record=$(make_case "support-$mode")
+    IFS=$'\t' read -r case_dir base head <<< "$record"
+    seed_open_ledger "$case_dir" "$head"
+    if [ "$mode" = cited-test-support ]; then
+      python3 - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+value = json.load(open(path))
+value["findings"][0]["citations"] = [{"path": "tests/helper.sh", "line": 1}]
+with open(path, "w") as stream:
+    json.dump(value, stream)
+PY
+    fi
+    set +e
+    run_case "$case_dir" "$base" "$head" support-forgery run \
+      > "$case_dir/out" 2> "$case_dir/err"
+    rc=$?
+    set -e
+    expect_code 1 "$rc" "$mode mutation support fabrication"
+    if [ "$mode" = outside-citation ]; then
+      assert_grep 'outside finding implementation citations' "$case_dir/err" \
+        "mutation changed a path the finding never identified as implementation"
+    else
+      assert_grep 'mutation changes test or evidence support' "$case_dir/err" \
+        "a cited test helper was accepted as implementation mutation"
+    fi
+  done
+  pass "mutation proof changes only cited non-test implementation paths"
 }
 
 test_final_wait_and_residual_processes_are_bounded() {
@@ -631,7 +730,13 @@ assert spec.loader is not None
 spec.loader.exec_module(module)
 profile = Path(sys.argv[2])
 marker = Path(sys.argv[3])
-module.write_sandbox_profile(profile, profile.parent, allow_network=False)
+module.write_sandbox_profile(
+    profile,
+    profile.parent,
+    allow_network=False,
+    allow_posix_ipc=False,
+)
+assert "(allow ipc-posix*)" not in profile.read_text()
 try:
     result = subprocess.run(
         [
@@ -732,9 +837,23 @@ test_reviewer_and_evidence_output_limits_fail_closed() {
     rc=$?
     set -e
     expect_code 1 "$rc" "$scenario output limit"
-    assert_grep 'exceeded the 200000-byte output limit' "$case_dir/err" \
+    assert_grep 'exceeded the 200000-byte aggregate output limit' "$case_dir/err" \
       "$scenario did not terminate loudly at the output limit"
   done
+
+  record=$(make_case oversized-artifact)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  set +e
+  run_case "$case_dir" "$base" "$head" oversized-artifact run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "oversized reviewer verdict artifact"
+  assert_grep 'reviewer verdict artifact is malformed at' \
+    "$case_dir/err" \
+    "oversized verdict artifact was not classified as malformed"
+  assert_grep 'bounded JSON artifact exceeds 200000 bytes' "$case_dir/err" \
+    "oversized verdict artifact bypassed the output ceiling: $(tr '\n' ' ' < "$case_dir/err")"
   pass "reviewer and evidence output are capped while processes are drained"
 }
 
@@ -989,6 +1108,9 @@ test_verify_rechecks_live_head_and_claims() {
 
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
+    test_baseline_readable_state_is_destroyed_before_mutation|\
+    test_mutation_is_bound_to_cited_non_test_implementation|\
+    test_reviewer_and_evidence_output_limits_fail_closed|\
     test_final_wait_and_residual_processes_are_bounded|\
     test_installed_sandbox_denies_shared_private_tmp|\
     test_symlinked_named_test_cannot_hide_test_mutation|\
@@ -1003,6 +1125,8 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
   test_verified_fix_executes_mutation_proof
+  test_baseline_readable_state_is_destroyed_before_mutation
+  test_mutation_is_bound_to_cited_non_test_implementation
   test_final_wait_and_residual_processes_are_bounded
   test_installed_sandbox_denies_shared_private_tmp
   test_symlinked_named_test_cannot_hide_test_mutation
@@ -1018,6 +1142,8 @@ test_silence_never_closes_prior_finding
 test_verified_fix_executes_mutation_proof
 test_forged_git_diff_mutation_command_is_rejected
 test_stateful_test_cannot_fabricate_mutation_causality
+test_baseline_readable_state_is_destroyed_before_mutation
+test_mutation_is_bound_to_cited_non_test_implementation
 test_final_wait_and_residual_processes_are_bounded
 test_installed_sandbox_denies_shared_private_tmp
 test_symlinked_named_test_cannot_hide_test_mutation

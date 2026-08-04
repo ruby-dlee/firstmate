@@ -81,11 +81,13 @@ Crosscheck executes the command itself and stores its actual exit and bounded ou
 
 A `verified-fixed` update must name a tracked test and provide an implementation-only patch under `.crosscheck/mutations/`.
 It supplies an approved test runner plus a structured argument array, never a free-form shell command.
-Crosscheck creates separate clean checkouts at the exact reviewed head, confirms the named test passes in the baseline checkout, applies the patch only in the mutated checkout, and requires the same test to fail there.
-Each proof checkout has its own writable temporary and cache state, while shared host temporary directories remain outside the sandbox write policy.
+Crosscheck creates one clean checkout at the exact reviewed head, confirms the named test passes, destroys the entire checkout, recreates the same path from the exact head, applies the patch, and requires the same test to fail.
+Destroying all readable baseline state before the mutated run prevents a test from manufacturing causality through a predictable sibling checkout.
+Proof sandboxes also omit shared POSIX IPC and give each run private writable temporary and cache state, while shared host temporary directories remain outside the write policy.
 The named test must be a canonical tracked regular file; symlinks are rejected so a patch cannot mutate the executed target through an unchanged alias.
 The gate positions the tracked test path itself as the interpreter script or test-framework target; generic command launchers are not approved runners.
-The patch cannot modify the named test.
+The patch may modify only non-test implementation paths already cited by the durable finding.
+It cannot modify the named test, conventional test trees, fixtures, or Crosscheck evidence support.
 
 ## Refusal and liveness
 
@@ -99,14 +101,17 @@ Because that Claude mode disables its own permission prompts, Crosscheck places 
 An unavailable sandbox blocks the reviewer rather than launching it with ambient write authority.
 A nonzero exit, timeout, missing artifact, empty artifact, malformed artifact, wrong-head artifact, or unresolved suspicion records an `unreviewed` attempt and exits nonzero.
 This includes provider refusals that surface only as a stopped or silent agent.
-Reviewer and evidence stdout plus stderr share a 200,000-byte capture ceiling; crossing it terminates the process group and records a loud `unreviewed` attempt.
-The final process wait remains inside the same deadline, and residual processes in the command group are terminated after the leader exits.
+Reviewer and evidence stdout plus stderr share a 200,000-byte capture ceiling; crossing it terminates the owned process tree and records a loud `unreviewed` attempt.
+The final wait and identity-pinned descendant cleanup remain inside the same absolute deadline.
+Structured verdict artifacts are stable regular files bounded by the same byte ceiling before JSON decoding.
+The durable ledger is bounded separately and fails closed when absent, symlinked, malformed, non-finite, or oversized.
+The platform-specific containment limits and empirical mutation evidence are recorded in [crosscheck-bounded-io.md](crosscheck-bounded-io.md).
 Reviewer result arrays are capped at 32 entries, at most 32 evidence executions are accepted, and all reproduction and mutation work shares a 900-second aggregate deadline by default.
 
 ## Installed external contracts
 
-The external surface was observed on 2026-08-02 before implementation and rechecked on 2026-08-03 for nonempty TOON arrays.
-The installed versions were `gh-axi 0.1.25`, `codex-cli 0.146.0-alpha.9.2`, and Claude Code 2.1.220.
+The external surface was observed on 2026-08-02 before implementation, rechecked on 2026-08-03 for nonempty TOON arrays, and re-run against installed `gh-axi 0.1.25` on 2026-08-04.
+The current recheck observed `gh-axi 0.1.25`, `codex-cli 0.146.0-alpha.9.2`, and Claude Code 2.1.221; the original Claude contract was first exercised on 2.1.220.
 
 `gh-axi pr view` supports `--full` but does not support raw-gh `--json` or `-q` flags.
 The production adapter therefore uses these exact forms.
@@ -122,7 +127,10 @@ gh-axi api PUT /repos/<owner>/<repo>/pulls/<number>/merge \
 The checked-in TOON fixtures under `tests/fixtures/gh-axi-v0.1.25-*.toon` are reduced from those observed documents.
 Every GitHub fake rejects command forms outside this surface.
 The `labels[1]{id,name,color,default,description}:` table in the PR API fixture was observed from installed `gh-axi 0.1.25` with `gh-axi api /repos/lance-format/lance/pulls/8166` on 2026-08-03.
+The 2026-08-04 recheck used `gh-axi api /repos/ruby-dlee/firstmate/pulls/72` and observed head `c9cbe79154013efcec9aa478f1476d0eff6c63df`, base `68f014697d0eea733a4e7c0294becff4e76c7bcf`, and `merged: true` in the installed TOON shape.
+It also confirmed from `gh-axi pr view --help` that view still accepts only `--comments`, `--reviews`, and `--full`, while `gh-axi api --help` still accepts `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, and `HEAD` with repeated `--field` values.
 The merge form with optional `commit_title` and `commit_message` fields was separately exercised against an already-merged PR and returned the observed successful no-op response.
+The read adapter exposes no merge subcommand; only the gate-refused `fm-crosscheck.sh merge` boundary can reach its private exact-SHA merge primitive, and that boundary freshly verifies the ledger before issuing the request.
 
 The installed reviewer invocation was exercised successfully with `--output-schema`, `--output-last-message`, `--model gpt-5.6-sol`, and `model_reasoning_effort="xhigh"` before production code used those flags.
 The installed Claude invocation was exercised successfully with `--model claude-opus-5`, `--effort xhigh`, `--dangerously-skip-permissions`, `--tools Bash,Read,Write,Edit,Glob,Grep`, `--no-session-persistence`, `--output-format json`, and `--json-schema` before production code used those flags.
@@ -134,6 +142,8 @@ The installed `/usr/bin/sandbox-exec` was also exercised with the generated prof
 Most of `tests/fm-crosscheck.test.sh` is hermetic coverage using observed-shape GitHub, Codex, Claude, and sandbox fakes.
 Its `test_installed_sandbox_denies_shared_private_tmp` case is the exception: it invokes the real installed `/usr/bin/sandbox-exec` and verifies the generated proof profile denies shared host temporary state.
 Its `test_forged_git_diff_mutation_command_is_rejected` case is the named regression that fails if a free-form `git diff --quiet # tests/regression.test.sh` can replace real mutation verification.
+Its `test_baseline_readable_state_is_destroyed_before_mutation` and `test_mutation_is_bound_to_cited_non_test_implementation` cases cover the two mutation-causality bypasses found in the final review round.
+`tests/fm-github-pr.test.sh` includes named cases for fieldless-array grammar, complete timeout-child cleanup, and refusal of the former public merge subcommand.
 The focused PR-check cases in `tests/fm-teardown-suite.sh` and the merge cases in `tests/fm-pr-merge.test.sh` also use observed-shape GitHub fakes.
 Those deterministic suites validate parsing, lifecycle, failure handling, and atomic request construction; they do not claim to exercise live provider availability.
 The real installed-tool exercise is separate and network-dependent: the dated `gh-axi` observations above cover successful documents, while an adapter lookup for an absent PR through installed `gh-axi` must exit nonzero with `GitHub state is unreviewed`.

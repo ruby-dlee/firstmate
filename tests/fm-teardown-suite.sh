@@ -6501,6 +6501,8 @@ TEARDOWN_FULL_SUITE_CASES=(
   test_persistent_index_lock_exhausts_retries_and_refuses_loudly
   test_empty_retry_wait_uses_default_without_aborting
   test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
+  test_closed_pr_wakes_loudly_as_unreviewed
+  test_pr_check_without_worktree_still_performs_lookup
 )
 
 for teardown_test_function in "${TEARDOWN_FULL_SUITE_CASES[@]}"; do

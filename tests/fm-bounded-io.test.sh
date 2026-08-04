@@ -58,7 +58,7 @@ test_success_reaps_residual_process_group() {
   fi
 }
 
-test_detached_descendant_cannot_escape() {
+test_tracked_detached_descendant_is_cleaned() {
   pid_file="$TMP/detached-pid"
   python3 "$HELPER" run --timeout 2 --max-output-bytes 1024 -- \
     python3 -c 'import subprocess,sys; child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,close_fds=True); print(child.pid)' \
@@ -67,7 +67,7 @@ test_detached_descendant_cannot_escape() {
   case "$child_pid" in ''|*[!0-9]*) fail "detached child PID was malformed" ;; esac
   if kill -0 "$child_pid" 2>/dev/null; then
     kill "$child_pid" 2>/dev/null || true
-    fail "detached descendant escaped ownership cleanup as $child_pid"
+    fail "tracked detached descendant escaped ownership cleanup as $child_pid"
   fi
 }
 
@@ -514,6 +514,9 @@ root = Path(sys.argv[2])
 artifacts = {
     "deep.json": ("[" * 1500 + "0" + "]" * 1500).encode(),
     "integer.json": b"1" * 5000,
+    "nan.json": b"NaN",
+    "infinity.json": b"Infinity",
+    "negative-infinity.json": b"-Infinity",
     "surrogate.json": b'"\\ud800"',
 }
 for name, value in artifacts.items():
@@ -528,7 +531,16 @@ for name, value in artifacts.items():
 recursive = root / "recursive.json"
 recursive.write_bytes(b"[]")
 original_loads = module.json.loads
-module.json.loads = lambda _value: (_ for _ in ()).throw(RecursionError("nested"))
+module.json.loads = lambda _value, **_kwargs: float("nan")
+try:
+    module.read_bounded_json(recursive, maximum_bytes=8192)
+except module.BoundedIOError as error:
+    assert "non-finite" in str(error), str(error)
+else:
+    raise AssertionError("non-finite parsed float escaped structural validation")
+module.json.loads = lambda _value, **_kwargs: (_ for _ in ()).throw(
+    RecursionError("nested")
+)
 try:
     module.read_bounded_json(recursive, maximum_bytes=8192)
 except module.BoundedIOError as error:
@@ -565,7 +577,7 @@ run_case() {
     output-limit) test_output_limit_terminates_noisy_process ;;
     final-wait) test_final_wait_keeps_original_deadline ;;
     residual-group) test_success_reaps_residual_process_group ;;
-    detached-tree) test_detached_descendant_cannot_escape ;;
+    detached-tree) test_tracked_detached_descendant_is_cleaned ;;
     batch-deadline) test_batch_deadline_remains_absolute ;;
     selector-order) test_selector_failure_precedes_spawn ;;
     spawn-guard) test_input_validation_precedes_spawn ;;

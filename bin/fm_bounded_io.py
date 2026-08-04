@@ -1086,6 +1086,12 @@ def _json_budget(
                 stack.append((child, depth + 1))
         elif isinstance(current, list):
             stack.extend((child, depth + 1) for child in current)
+        elif isinstance(current, float) and not math.isfinite(current):
+            fail("JSON contains a non-finite number")
+
+
+def _reject_json_constant(value: str) -> NoReturn:
+    fail(f"JSON contains a non-finite number: {value}")
 
 
 def read_bounded_json(
@@ -1142,7 +1148,10 @@ def read_bounded_json(
     ):
         fail(f"bounded JSON artifact changed while reading: {path}")
     try:
-        value = json.loads(raw.decode("utf-8"))
+        value = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+        )
         _json_budget(
             value,
             maximum_depth=maximum_depth,

@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import stat
@@ -20,6 +21,7 @@ import sys
 import tempfile
 import time
 from typing import Any, NoReturn
+import unicodedata
 
 
 BIN_DIR = Path(__file__).resolve().parent
@@ -101,6 +103,127 @@ def environment_value(name: str, default: str) -> str:
 
     value = os.environ.get(name)
     return default if value is None or value == "" else value
+
+
+def claude_scoped_keychain_service(account_home: Path) -> str:
+    """Return Claude's non-secret Keychain service for one config directory."""
+
+    normalized = unicodedata.normalize("NFC", str(account_home.resolve()))
+    suffix = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
+    return f"Claude Code-credentials-{suffix}"
+
+
+def current_passwd_identity() -> tuple[str, Path]:
+    """Resolve the current Unix identity independently of ambient HOME."""
+
+    try:
+        record = pwd.getpwuid(os.getuid())
+    except KeyError:
+        tool_fail("Claude executing-account inspection cannot resolve the current user")
+    home = Path(record.pw_dir)
+    if not record.pw_name or not home.is_absolute() or not home.is_dir():
+        tool_fail(
+            "Claude executing-account inspection found an invalid passwd identity"
+        )
+    return record.pw_name, home.resolve()
+
+
+def prepare_claude_execution_home(
+    protocol_dir: Path, account_home: Path
+) -> tuple[Path, str, str]:
+    """Create a private HOME bound to one Claude config and credential source."""
+
+    account_home = account_home.resolve()
+    execution_home = protocol_dir / "claude-home"
+    try:
+        execution_home.mkdir(mode=0o700)
+        (execution_home / ".claude").symlink_to(
+            account_home, target_is_directory=True
+        )
+        (execution_home / ".claude.json").symlink_to(
+            account_home / ".claude.json"
+        )
+    except OSError as exc:
+        tool_fail(
+            "Claude execution-HOME preparation failed while binding "
+            f"{execution_home} to reviewer account {account_home}: {exc}"
+        )
+
+    credential_file = account_home / ".credentials.json"
+    if credential_file.exists() or credential_file.is_symlink():
+        try:
+            metadata = credential_file.lstat()
+        except OSError as exc:
+            tool_fail(
+                "Claude executing-account credential inspection failed at "
+                f"{credential_file}: {exc}"
+            )
+        if not stat.S_ISREG(metadata.st_mode) or credential_file.is_symlink():
+            tool_fail(
+                "Claude executing-account credential inspection requires a regular "
+                f"non-symlink file at {credential_file}"
+            )
+        return execution_home, "oauth-file", str(credential_file)
+
+    if sys.platform != "darwin":
+        tool_fail(
+            "Claude executing-account credential inspection found neither an OAuth "
+            f"file at {credential_file} nor a supported scoped Keychain"
+        )
+
+    account_name, passwd_home = current_passwd_identity()
+    keychains = passwd_home / "Library" / "Keychains"
+    if not keychains.is_dir():
+        tool_fail(
+            "Claude executing-account credential inspection found no macOS Keychain "
+            f"directory at {keychains}"
+        )
+    try:
+        library = execution_home / "Library"
+        library.mkdir(mode=0o700)
+        (library / "Keychains").symlink_to(keychains, target_is_directory=True)
+    except OSError as exc:
+        tool_fail(
+            "Claude execution-HOME preparation could not bind the current user's "
+            f"Keychain directory: {exc}"
+        )
+
+    service = claude_scoped_keychain_service(account_home)
+    security = Path("/usr/bin/security")
+    if not security.is_file() or not os.access(security, os.X_OK):
+        tool_fail(
+            "Claude executing-account credential inspection found no runnable "
+            "/usr/bin/security"
+        )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "HOME": str(execution_home.resolve()),
+            "CLAUDE_CONFIG_DIR": str(account_home),
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR": str(account_home),
+        }
+    )
+    inspected = run_command(
+        [
+            str(security),
+            "find-generic-password",
+            "-a",
+            account_name,
+            "-s",
+            service,
+        ],
+        cwd=execution_home,
+        env=environment,
+        timeout=10,
+        description="Claude scoped Keychain credential inspection",
+    )
+    if inspected.returncode != 0:
+        tool_fail(
+            "Claude executing-account credential inspection found no scoped "
+            f"Keychain item service={service!r} account={account_name!r} for "
+            f"config home {account_home}"
+        )
+    return execution_home, "scoped-keychain", f"{service}:{account_name}"
 
 
 def require(condition: bool, message: str) -> None:
@@ -941,6 +1064,49 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
             require(bool(run["citations"]), f"{label}.citations must be nonempty when clear")
             require(not run["active_blockers"], f"{label} cannot be clear with blockers")
             require(not run["suspicions"], f"{label} cannot be clear with suspicions")
+        reviewer = run.get("reviewer")
+        if isinstance(reviewer, dict) and "execution_proof" in reviewer:
+            execution_home = reviewer.get("execution_home")
+            require(
+                isinstance(execution_home, str)
+                and Path(execution_home).is_absolute(),
+                f"{label}.reviewer.execution_home must be absolute",
+            )
+            require(
+                reviewer.get("account_home")
+                == reviewer.get("executing_account_home"),
+                f"{label}.reviewer executing account is not bound to account_home",
+            )
+            require_string(
+                reviewer.get("account_selector"),
+                f"{label}.reviewer.account_selector",
+            )
+            require_string(
+                reviewer.get("credential_source"),
+                f"{label}.reviewer.credential_source",
+            )
+            require_string(
+                reviewer.get("credential_identifier"),
+                f"{label}.reviewer.credential_identifier",
+            )
+            execution_proof = reviewer.get("execution_proof")
+            require(
+                isinstance(execution_proof, dict),
+                f"{label}.reviewer.execution_proof must be an object",
+            )
+            require(
+                execution_proof.get("expected_exit") == 0
+                and execution_proof.get("actual_exit") == 0,
+                f"{label}.reviewer.execution_proof did not succeed",
+            )
+            receipt = execution_proof.get("reviewer_receipt")
+            require(
+                isinstance(receipt, dict)
+                and isinstance(receipt.get("sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", receipt["sha256"])
+                is not None,
+                f"{label}.reviewer.execution_proof has no reviewer Bash receipt",
+            )
     return copy.deepcopy(value)
 
 
@@ -1110,7 +1276,9 @@ def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
     )
 
 
-def review_output_schema() -> dict[str, Any]:
+def review_output_schema(
+    executing_account_home: str, execution_home: str
+) -> dict[str, Any]:
     citation = {
         "type": "object",
         "additionalProperties": False,
@@ -1128,6 +1296,18 @@ def review_output_schema() -> dict[str, Any]:
             "output_contains": {"type": "string"},
         },
     }
+    verdict_reproduction = copy.deepcopy(reproduction)
+    verdict_reproduction["required"] = [
+        *verdict_reproduction["required"],
+        "receipt_path",
+        "receipt_contains",
+    ]
+    verdict_reproduction["properties"].update(
+        {
+            "receipt_path": {"type": "string"},
+            "receipt_contains": {"type": "string", "minLength": 1},
+        }
+    )
     mutation = {
         "type": "object",
         "additionalProperties": False,
@@ -1157,10 +1337,27 @@ def review_output_schema() -> dict[str, Any]:
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
         "additionalProperties": False,
-        "required": ["schema", "head_sha", "summary", "citations", "finding_updates", "new_findings", "suspicions"],
+        "required": [
+            "schema",
+            "head_sha",
+            "executing_account_home",
+            "execution_home",
+            "executed_reproduction",
+            "summary",
+            "citations",
+            "finding_updates",
+            "new_findings",
+            "suspicions",
+        ],
         "properties": {
             "schema": {"type": "string", "const": REVIEW_SCHEMA},
             "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "executing_account_home": {
+                "type": "string",
+                "const": executing_account_home,
+            },
+            "execution_home": {"type": "string", "const": execution_home},
+            "executed_reproduction": verdict_reproduction,
             "summary": {"type": "string", "minLength": 1},
             "citations": {
                 "type": "array",
@@ -1277,7 +1474,11 @@ def ledger_prompt_projection(
     return projection
 
 
-def make_prompt(snapshot_value: dict[str, Any], ledger: dict[str, Any]) -> str:
+def make_prompt(
+    snapshot_value: dict[str, Any],
+    ledger: dict[str, Any],
+    config: dict[str, str],
+) -> str:
     projection = ledger_prompt_projection(ledger, snapshot_value["head_sha"])
     return f"""You are the independent merge-gate reviewer for a pull request.
 Review exact head {snapshot_value['head_sha']} against exact base {snapshot_value['base_sha']}.
@@ -1297,6 +1498,14 @@ If you cannot reproduce a concern, return it as a suspicion; suspicions block th
 Silence never closes an existing finding.
 Use closed-equivalent only when equivalent_to names a currently verified-fixed ledger finding.
 Your final response must satisfy the supplied JSON schema and must name exact head {snapshot_value['head_sha']}.
+Every verdict, including CLEAR or a suspicion, must carry `executed_reproduction`.
+Use Bash to create its helper under `.crosscheck/reproductions/`, actually run it, and make its command name exact base {snapshot_value['base_sha']} and exact head {snapshot_value['head_sha']}.
+The helper must execute `git diff` between those two SHAs and emit a distinctive success marker.
+The helper must also write a separate receipt under `.crosscheck/reproductions/` while it runs.
+The receipt must name both exact SHAs, HOME, and the provider account selector, and `executed_reproduction` must name that receipt and a distinctive receipt marker.
+Report `execution_home` from HOME.
+Report `executing_account_home` from {config['account_selector']}.
+The gate will independently re-execute this verdict-level reproduction before treating the response as code evidence.
 If you cannot complete the review, do not claim a clear result.
 
 PR claims, exactly as returned by installed gh-axi:
@@ -1366,12 +1575,36 @@ def run_reviewer(
 ) -> Any:
     protocol_dir = review_dir / ".crosscheck"
     protocol_dir.mkdir(mode=0o700)
+    environment = os.environ.copy()
+    for provider_variable in (
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    ):
+        environment.pop(provider_variable, None)
+    account_home = Path(config["account_home"])
+    config["executing_account_home"] = str(account_home)
+    if config["harness"] == "claude":
+        execution_home, credential_source, credential_identifier = (
+            prepare_claude_execution_home(protocol_dir, account_home)
+        )
+        config["account_selector"] = "CLAUDE_SECURESTORAGE_CONFIG_DIR"
+    else:
+        execution_home = account_home
+        credential_source = "codex-home"
+        credential_identifier = str(account_home / "auth.json")
+        config["account_selector"] = "CODEX_HOME"
+    config["execution_home"] = str(execution_home.resolve())
+    config["credential_source"] = credential_source
+    config["credential_identifier"] = credential_identifier
     schema_path = protocol_dir / "review-schema.json"
-    schema_value = review_output_schema()
+    schema_value = review_output_schema(
+        config["executing_account_home"], config["execution_home"]
+    )
     output_path = protocol_dir / "review-result.json"
     schema_path.write_text(json.dumps(schema_value, indent=2) + "\n", encoding="utf-8")
-    environment = os.environ.copy()
-    prompt = make_prompt(snapshot_value, ledger)
+    environment["HOME"] = config["execution_home"]
+    prompt = make_prompt(snapshot_value, ledger, config)
     if config["harness"] == "codex":
         codex = reviewer_binary("FM_CROSSCHECK_CODEX_BIN", "codex", "Codex reviewer")
         environment["CODEX_HOME"] = config["account_home"]
@@ -1424,10 +1657,10 @@ def run_reviewer(
         "FM_CROSSCHECK_CLAUDE_BIN", "claude", "Claude reviewer"
     )
     environment["CLAUDE_CONFIG_DIR"] = config["account_home"]
+    environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = config["account_home"]
     claude_tmp = protocol_dir / "claude-tmp"
     claude_tmp.mkdir(mode=0o700)
     environment["CLAUDE_CODE_TMPDIR"] = str(claude_tmp)
-    claude_session_env = Path.home() / ".claude" / "session-env"
     sandbox_path = protocol_dir / "claude-sandbox.sb"
     arguments = [
         claude,
@@ -1438,7 +1671,7 @@ def run_reviewer(
         config["effort"],
         "--dangerously-skip-permissions",
         "--tools",
-        "Bash,Read,Write,Edit,Glob,Grep",
+        "Bash,Read,Glob,Grep",
         "--no-session-persistence",
         "--output-format",
         "json",
@@ -1453,7 +1686,6 @@ def run_reviewer(
         allow_network=True,
         additional_writable_roots=(
             Path(config["account_home"]),
-            claude_session_env,
         ),
         env=environment,
         timeout=reviewer_timeout(),
@@ -1478,12 +1710,72 @@ def run_reviewer(
     return envelope["structured_output"]
 
 
-def validate_review_shape(value: Any, head_sha: str, review_dir: Path) -> dict[str, Any]:
+def validate_review_shape(
+    value: Any,
+    snapshot_value: dict[str, Any],
+    review_dir: Path,
+    config: dict[str, str],
+) -> dict[str, Any]:
     require(isinstance(value, dict), "reviewer verdict must be an object")
-    required = {"schema", "head_sha", "summary", "citations", "finding_updates", "new_findings", "suspicions"}
+    if "executed_reproduction" not in value:
+        tool_fail(
+            "reviewer verdict carries no executed reproduction; reviewer command "
+            "execution was not established"
+        )
+    required = {
+        "schema",
+        "head_sha",
+        "executing_account_home",
+        "execution_home",
+        "executed_reproduction",
+        "summary",
+        "citations",
+        "finding_updates",
+        "new_findings",
+        "suspicions",
+    }
     require_exact_keys(value, required, "reviewer verdict")
     require(value.get("schema") == REVIEW_SCHEMA, f"reviewer verdict schema must equal {REVIEW_SCHEMA}")
-    require(value.get("head_sha") == head_sha, "reviewer verdict is not for the exact PR head")
+    require(
+        value.get("head_sha") == snapshot_value["head_sha"],
+        "reviewer verdict is not for the exact PR head",
+    )
+    if value.get("executing_account_home") != config["executing_account_home"]:
+        tool_fail(
+            "reviewer executing-account inspection found a provider account "
+            "selector that does not match the credential-bound reviewer account"
+        )
+    if value.get("execution_home") != config["execution_home"]:
+        tool_fail(
+            "reviewer execution-HOME inspection found a verdict HOME that does "
+            "not match the sandbox-bound private reviewer HOME"
+        )
+    execution = value.get("executed_reproduction")
+    require(
+        isinstance(execution, dict),
+        "reviewer verdict executed_reproduction must be an object",
+    )
+    execution_command = require_string(
+        execution.get("command"),
+        "reviewer verdict executed_reproduction.command",
+    )
+    require(
+        snapshot_value["base_sha"] in execution_command
+        and snapshot_value["head_sha"] in execution_command,
+        "reviewer verdict executed reproduction command must name the exact base and head SHAs",
+    )
+    require(
+        execution.get("expected_exit") == 0,
+        "reviewer verdict executed reproduction must expect a successful command",
+    )
+    require_string(
+        execution.get("receipt_path"),
+        "reviewer verdict executed_reproduction.receipt_path",
+    )
+    require_string(
+        execution.get("receipt_contains"),
+        "reviewer verdict executed_reproduction.receipt_contains",
+    )
     require_string(value.get("summary"), "reviewer verdict summary")
     value["citations"] = validate_citations(value.get("citations"), review_dir, "reviewer verdict citations")
     for key in ("finding_updates", "new_findings", "suspicions"):
@@ -1492,7 +1784,7 @@ def validate_review_shape(value: Any, head_sha: str, review_dir: Path) -> dict[s
             len(value[key]) <= MAX_REVIEW_ITEMS,
             f"reviewer verdict {key} has too many entries",
         )
-    evidence_items = len(value["new_findings"])
+    evidence_items = 1 + len(value["new_findings"])
     for update in value["finding_updates"]:
         if isinstance(update, dict):
             evidence_items += int(update.get("reproduction") is not None)
@@ -1531,6 +1823,54 @@ def apply_review(
     updated_ids: list[str] = []
     seen_updates: set[str] = set()
     evidence_deadline = time.monotonic() + evidence_run_timeout()
+    try:
+        execution = review["executed_reproduction"]
+        receipt_path = require_string(
+            execution.get("receipt_path"),
+            "reviewer verdict executed_reproduction.receipt_path",
+        )
+        receipt = safe_artifact(
+            review_dir, receipt_path, ".crosscheck/reproductions/"
+        )
+        receipt_text = receipt.read_text(encoding="utf-8", errors="replace")
+        receipt_contains = require_string(
+            execution.get("receipt_contains"),
+            "reviewer verdict executed_reproduction.receipt_contains",
+        )
+        for expected, inspected in (
+            (receipt_contains, "receipt marker"),
+            (snapshot_value["base_sha"], "exact base SHA"),
+            (snapshot_value["head_sha"], "exact head SHA"),
+            (config["execution_home"], "execution HOME"),
+            (config["executing_account_home"], "executing account home"),
+        ):
+            require(
+                expected in receipt_text,
+                "reviewer Bash execution receipt did not record the inspected "
+                f"{inspected}: {receipt_path}",
+            )
+        execution_proof = execute_reproduction(
+            {
+                key: execution[key]
+                for key in (
+                    "test_path",
+                    "command",
+                    "expected_exit",
+                    "output_contains",
+                )
+            },
+            review_dir,
+            "reviewer verdict executed_reproduction",
+            evidence_deadline,
+        )
+        execution_proof["reviewer_receipt"] = {
+            "path": receipt_path,
+            "contains": receipt_contains,
+            "sha256": hashlib.sha256(receipt_text.encode("utf-8")).hexdigest(),
+            "output": receipt_text[:MAX_CAPTURE],
+        }
+    except CrosscheckError as exc:
+        tool_fail(f"reviewer command execution proof failed: {exc}")
 
     for index, update in enumerate(review["finding_updates"]):
         label = f"finding_updates[{index}]"
@@ -1663,7 +2003,10 @@ def apply_review(
         "head_sha": snapshot_value["head_sha"],
         "base_sha": snapshot_value["base_sha"],
         "claims_sha256": snapshot_value["claims_sha256"],
-        "reviewer": config,
+        "reviewer": {
+            **config,
+            "execution_proof": execution_proof,
+        },
         "state": state,
         "summary": review["summary"],
         "citations": review["citations"],
@@ -1889,7 +2232,12 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
                 tool_fail(f"review checkout preflight failed: {exc}")
             raw_review = run_reviewer(review_dir, snapshot_value, ledger, config)
             assert_review_checkout_intact(review_dir, snapshot_value["head_sha"])
-            review = validate_review_shape(raw_review, snapshot_value["head_sha"], review_dir)
+            review = validate_review_shape(
+                raw_review,
+                snapshot_value,
+                review_dir,
+                config,
+            )
             ledger, run = apply_review(
                 ledger, review, review_dir, temp_root, snapshot_value, config
             )
@@ -1963,6 +2311,29 @@ def verified_crosscheck_head(root: Path, home: Path, task_id: str, url: str) -> 
         latest["state"] == "clear",
         "no valid review exists for the exact head; latest attempt state is "
         f"{latest['state']}",
+    )
+    reviewer = latest.get("reviewer")
+    require(
+        isinstance(reviewer, dict)
+        and reviewer.get("executing_account_home") == reviewer.get("account_home")
+        and isinstance(reviewer.get("execution_home"), str)
+        and Path(reviewer["execution_home"]).is_absolute()
+        and bool(reviewer.get("credential_source"))
+        and bool(reviewer.get("credential_identifier")),
+        "no valid review exists for the exact head; reviewer execution identity "
+        "was not credential-bound to its selected account home",
+    )
+    execution_proof = reviewer.get("execution_proof")
+    require(
+        isinstance(execution_proof, dict)
+        and execution_proof.get("expected_exit") == 0
+        and execution_proof.get("actual_exit") == 0
+        and snapshot_value["base_sha"] in str(execution_proof.get("command", ""))
+        and snapshot_value["head_sha"] in str(execution_proof.get("command", ""))
+        and isinstance(execution_proof.get("reviewer_receipt"), dict)
+        and bool(execution_proof["reviewer_receipt"].get("sha256")),
+        "no valid review exists for the exact head; the reviewer verdict has no "
+        "successful exact-base/exact-head execution proof",
     )
     require(not latest.get("active_blockers"), "clear crosscheck run records active blockers")
     require(not latest.get("suspicions"), "clear crosscheck run records unresolved suspicions")

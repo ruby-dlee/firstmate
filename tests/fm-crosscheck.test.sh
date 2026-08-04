@@ -22,6 +22,8 @@ make_case() {
   repo="$case_dir/repo"
   mkdir -p "$repo/tests" "$case_dir/state" "$case_dir/data" \
     "$case_dir/author-home" "$case_dir/reviewer-home" "$case_dir/fakebin"
+  printf '{}\n' > "$case_dir/reviewer-home/.credentials.json"
+  printf '{}\n' > "$case_dir/reviewer-home/.claude.json"
   git -C "$repo" init -q -b main
   printf 'base\n' > "$repo/app.txt"
   printf 'base\n' > "$repo/other.txt"
@@ -105,6 +107,12 @@ install_codex_fake() {
   cat > "$case_dir/fakebin/codex" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_CODEX_LOG"
+if [ -n "${FM_TEST_STATE_OBSERVATION:-}" ]; then
+  find "$FM_TEST_EXPECTED_STATE" -mindepth 1 -maxdepth 1 \
+    -name '.task-x1.crosscheck.*' -print > "$FM_TEST_STATE_OBSERVATION"
+  find "$FM_TEST_CALLER_CWD" -mindepth 1 -maxdepth 1 \
+    -name '.task-x1.crosscheck.*' -print >> "$FM_TEST_STATE_OBSERVATION"
+fi
 [ "${1:-}" = exec ] || exit 90
 shift
 workdir=
@@ -157,13 +165,20 @@ install_claude_fake() {
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_CLAUDE_LOG"
 [ "${CLAUDE_CONFIG_DIR:-}" = "$FM_TEST_REVIEWER_HOME" ] || exit 80
+[ "${CLAUDE_SECURESTORAGE_CONFIG_DIR:-}" = "$FM_TEST_REVIEWER_HOME" ] || exit 73
+case "${HOME:-}" in
+  "$PWD"/.crosscheck/claude-home) ;;
+  *) exit 74 ;;
+esac
+[ "$(cd "$HOME/.claude" 2>/dev/null && pwd -P)" = "$FM_TEST_REVIEWER_HOME" ] \
+  || exit 72
 case "${CLAUDE_CODE_TMPDIR:-}" in
   "$PWD"/.crosscheck/claude-tmp) ;;
   *) exit 76 ;;
 esac
 mkdir -p "$CLAUDE_CODE_TMPDIR/bash-runtime" || exit 75
-mkdir -p "$CLAUDE_CONFIG_DIR/session-env" || exit 77
-printf 'reviewer runtime state\n' > "$CLAUDE_CONFIG_DIR/session-env/crosscheck-runtime" \
+mkdir -p "$HOME/.claude/session-env" || exit 77
+printf 'reviewer runtime state\n' > "$HOME/.claude/session-env/crosscheck-runtime" \
   || exit 78
 [ "${1:-}" = -p ] || exit 81
 shift
@@ -178,7 +193,7 @@ while [ "$#" -gt 0 ]; do
     --model) model=$2; shift 2 ;;
     --effort) effort=$2; shift 2 ;;
     --dangerously-skip-permissions) autonomous=yes; shift ;;
-    --tools) [ "$2" = Bash,Read,Write,Edit,Glob,Grep ] || exit 89; shift 2 ;;
+    --tools) [ "$2" = Bash,Read,Glob,Grep ] || exit 89; shift 2 ;;
     --no-session-persistence) shift ;;
     --output-format) format=$2; shift 2 ;;
     --json-schema) schema=$2; shift 2 ;;
@@ -190,11 +205,17 @@ done
 [ "$autonomous" = yes ] || exit 84
 [ "$format" = json ] || exit 85
 [ -n "$schema" ] && [ -n "$prompt" ] || exit 86
-if ! git -C "$PWD" diff "$FM_TEST_BASE..$FM_TEST_HEAD" -- app.txt \
-  > "$CLAUDE_CONFIG_DIR/session-env/crosscheck-git-diff" \
-  2> "$CLAUDE_CONFIG_DIR/session-env/crosscheck-git-diff.err"; then
-  cat "$CLAUDE_CONFIG_DIR/session-env/crosscheck-git-diff.err" >&2
-  exit 79
+if [ "$FM_TEST_REVIEW_SCENARIO" != reading-only-suspicion ]; then
+  if ! git -C "$PWD" diff "$FM_TEST_BASE..$FM_TEST_HEAD" -- app.txt \
+    > "$HOME/.claude/session-env/crosscheck-git-diff" \
+    2> "$HOME/.claude/session-env/crosscheck-git-diff.err"; then
+    cat "$HOME/.claude/session-env/crosscheck-git-diff.err" >&2
+    exit 79
+  fi
+fi
+if [ "$FM_TEST_REVIEW_SCENARIO" = execution-home-drift ]; then
+  CLAUDE_SECURESTORAGE_CONFIG_DIR=$FM_TEST_AUTHOR_HOME
+  export CLAUDE_SECURESTORAGE_CONFIG_DIR
 fi
 temporary=$(mktemp "${TMPDIR:-/tmp}/fm-crosscheck-claude.XXXXXX") || exit 87
 python3 "$FM_TEST_REVIEW_DRIVER" "$PWD" "$temporary" "$FM_TEST_REVIEW_SCENARIO" "$FM_TEST_HEAD" || exit 88
@@ -230,8 +251,11 @@ grep -qxF '(allow file-read*)' "$profile" || exit 73
 case "${3:-}" in
   */claude)
     grep -qxF '(allow network*)' "$profile" || exit 74
-    grep -qF "(subpath \"$CLAUDE_CONFIG_DIR\")" "$profile" || exit 77
-    grep -qF "(subpath \"$HOME/.claude/session-env\")" "$profile" || exit 78
+    grep -qF "(subpath \"$FM_TEST_REVIEWER_HOME\")" "$profile" || exit 77
+    if [ "$FM_TEST_AMBIENT_HOME" != "$FM_TEST_REVIEWER_HOME" ]; then
+      ! grep -qF "(subpath \"$FM_TEST_AMBIENT_HOME/.claude/session-env\")" "$profile" \
+        || exit 78
+    fi
     ;;
   *)
     ! grep -qxF '(allow network*)' "$profile" || exit 76
@@ -248,6 +272,7 @@ cat > "$TMP_ROOT/review-driver.py" <<'PY'
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 workdir = Path(sys.argv[1])
@@ -259,9 +284,56 @@ if scenario == "stopped":
     raise SystemExit(0)
 
 protocol = workdir / ".crosscheck"
+base_sha = os.environ["FM_TEST_BASE"]
+execution = protocol / "reproductions" / "review-execution.sh"
+receipt = protocol / "reproductions" / "review-execution.receipt"
+execution.parent.mkdir(parents=True, exist_ok=True)
+execution.write_text(
+    "#!/usr/bin/env bash\n"
+    "set -eu\n"
+    "base=$1\n"
+    "head=$2\n"
+    "receipt=$3\n"
+    "account=${CODEX_HOME:-${CLAUDE_SECURESTORAGE_CONFIG_DIR:-}}\n"
+    "git diff \"$base\" \"$head\" -- app.txt >/dev/null\n"
+    "printf 'CROSSCHECK-REVIEW-EXECUTED base=%s head=%s HOME=%s account=%s\\n' "
+    "\"$base\" \"$head\" \"$HOME\" \"$account\" | tee \"$receipt\"\n"
+)
+os.chmod(execution, 0o755)
+command = (
+    "bash .crosscheck/reproductions/review-execution.sh "
+    f"{base_sha} {head} .crosscheck/reproductions/review-execution.receipt"
+)
+if scenario != "reading-only-suspicion":
+    subprocess.run(
+        [
+            "bash",
+            ".crosscheck/reproductions/review-execution.sh",
+            base_sha,
+            head,
+            ".crosscheck/reproductions/review-execution.receipt",
+        ],
+        cwd=workdir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+account_selector = os.environ.get("CODEX_HOME") or os.environ.get(
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR", ""
+)
 base = {
     "schema": "firstmate.crosscheck-review.v2",
     "head_sha": head,
+    "executing_account_home": str(Path(account_selector).resolve()),
+    "execution_home": str(Path(os.environ["HOME"]).resolve()),
+    "executed_reproduction": {
+        "test_path": ".crosscheck/reproductions/review-execution.sh",
+        "command": command,
+        "expected_exit": 0,
+        "output_contains": "CROSSCHECK-REVIEW-EXECUTED",
+        "receipt_path": ".crosscheck/reproductions/review-execution.receipt",
+        "receipt_contains": "CROSSCHECK-REVIEW-EXECUTED",
+    },
     "summary": "review complete",
     "citations": [{"path": "app.txt", "line": 1}],
     "finding_updates": [],
@@ -427,6 +499,14 @@ elif scenario == "suspicion":
         "description": "The reviewer could not finish a reproduction.",
         "citations": [{"path": "app.txt", "line": 1}],
     }]
+elif scenario == "reading-only-suspicion":
+    base["suspicions"] = [{
+        "description": "The reviewer reported a concern without executing a command.",
+        "citations": [{"path": "app.txt", "line": 1}],
+    }]
+    del base["executed_reproduction"]
+    execution.unlink()
+    receipt.unlink(missing_ok=True)
 
 if scenario == "oversized-artifact":
     base["summary"] = "A" * 210000
@@ -456,6 +536,8 @@ run_case() {
   FM_TEST_REVIEW_DRIVER="$TMP_ROOT/review-driver.py" \
   FM_TEST_REVIEW_SCENARIO="$scenario" \
   FM_TEST_REVIEWER_HOME="$case_dir/reviewer-home" \
+  FM_TEST_AUTHOR_HOME="$case_dir/author-home" \
+  FM_TEST_AMBIENT_HOME="$HOME" \
   FM_TEST_BASE="$base" \
   FM_TEST_HEAD="$head" \
     python3 "$CROSSCHECK_PY" "$command" task-x1 "$PR_URL" "$@"
@@ -524,14 +606,18 @@ test_clear_review_uses_policy_contract() {
 }
 
 test_empty_runtime_overrides_use_home_defaults() {
-  local record case_dir base head output
+  local record case_dir base head output observation state_temp
   record=$(make_case empty-runtime-overrides)
   IFS=$'\t' read -r case_dir base head <<< "$record"
   mkdir -p "$case_dir/home/state" "$case_dir/home/data"
   mv "$case_dir/state/task-x1.meta" "$case_dir/home/state/task-x1.meta"
+  observation="$case_dir/state-observation"
   output=$(
     cd "$case_dir" || exit 1
     FM_TEST_ROOT_OVERRIDE='' FM_TEST_STATE_OVERRIDE='' FM_TEST_DATA_OVERRIDE='' \
+    FM_TEST_STATE_OBSERVATION="$observation" \
+    FM_TEST_EXPECTED_STATE="$case_dir/home/state" \
+    FM_TEST_CALLER_CWD="$case_dir" \
       run_case "$case_dir" "$base" "$head" clear run
   ) || fail "empty runtime overrides did not fall back to the home defaults"
   assert_contains "$output" 'crosscheck clear' \
@@ -540,18 +626,56 @@ test_empty_runtime_overrides_use_home_defaults() {
     "empty FM_DATA_OVERRIDE did not resolve to FM_HOME/data"
   assert_absent "$case_dir/task-x1.meta" \
     "empty FM_STATE_OVERRIDE was treated as the current working directory"
-  pass "empty root, state, and data overrides fall back instead of collapsing to the working directory"
+  assert_present "$case_dir/home/state/.task-x1.crosscheck.lock" \
+    "the per-task lock did not use the resolved state directory"
+  assert_grep "$case_dir/home/state/.task-x1.crosscheck.lock" "$observation" \
+    "the reviewer did not observe the shared per-task lock under resolved state"
+  state_temp=$(grep -F "$case_dir/home/state/.task-x1.crosscheck." "$observation" \
+    | grep -vF '.crosscheck.lock' || true)
+  [ -n "$state_temp" ] \
+    || fail "the reviewer did not observe the temporary checkout under resolved state"
+  assert_no_grep "$case_dir/.task-x1.crosscheck." "$observation" \
+    "an empty state override placed a lock or temporary checkout in the caller cwd"
+  assert_absent "$case_dir/.task-x1.crosscheck.lock" \
+    "an empty state override created a cwd-local per-task lock"
+  pass "empty overrides keep metadata, the shared task lock, and review temp space under home defaults"
+}
+
+test_empty_environment_fallback_is_generic() {
+  python3 - "$CROSSCHECK_PY" <<'PY' \
+    || fail "generic environment fallback did not treat empty as absent"
+import importlib.util
+import os
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+name = "FM_FUTURE_OPERATIONAL_OVERRIDE"
+os.environ.pop(name, None)
+assert module.environment_value(name, "/default") == "/default"
+os.environ[name] = ""
+assert module.environment_value(name, "/default") == "/default"
+os.environ[name] = "/explicit"
+assert module.environment_value(name, "/default") == "/explicit"
+PY
+  pass "the environment accessor handles absent, empty, and set values without a variable allowlist"
 }
 
 test_set_runtime_overrides_remain_authoritative() {
-  local record case_dir base head explicit_state explicit_data output
+  local record case_dir base head explicit_state explicit_data observation output
   record=$(make_case set-runtime-overrides)
   IFS=$'\t' read -r case_dir base head <<< "$record"
   explicit_state="$case_dir/explicit-state"
   explicit_data="$case_dir/explicit-data"
+  observation="$case_dir/explicit-state-observation"
   mkdir -p "$explicit_state" "$explicit_data"
   mv "$case_dir/state/task-x1.meta" "$explicit_state/task-x1.meta"
   output=$(FM_TEST_STATE_OVERRIDE="$explicit_state" FM_TEST_DATA_OVERRIDE="$explicit_data" \
+    FM_TEST_STATE_OBSERVATION="$observation" \
+    FM_TEST_EXPECTED_STATE="$explicit_state" \
+    FM_TEST_CALLER_CWD="$case_dir" \
     run_case "$case_dir" "$base" "$head" clear run) \
     || fail "nonempty runtime overrides were not honoured"
   assert_contains "$output" 'crosscheck clear' \
@@ -560,7 +684,13 @@ test_set_runtime_overrides_remain_authoritative() {
     "nonempty FM_DATA_OVERRIDE did not select the explicit data directory"
   assert_absent "$case_dir/home/data/task-x1/crosscheck-ledger.json" \
     "the explicit data override was silently ignored"
-  pass "nonempty state and data overrides remain authoritative"
+  assert_present "$explicit_state/.task-x1.crosscheck.lock" \
+    "the explicit state override did not own the shared per-task lock"
+  assert_grep "$explicit_state/.task-x1.crosscheck.lock" "$observation" \
+    "the reviewer did not observe the lock under the explicit state override"
+  assert_no_grep "$case_dir/.task-x1.crosscheck." "$observation" \
+    "a nonempty state override placed a lock or temporary checkout in the caller cwd"
+  pass "nonempty state and data overrides remain authoritative for metadata, locks, temp space, and ledgers"
 }
 
 test_bad_state_override_is_a_named_tool_failure() {
@@ -653,14 +783,64 @@ test_claude_reviewer_provides_model_separation_for_codex_author() {
   output=$(run_case "$case_dir" "$base" "$head" clear run) \
     || fail "Claude reviewer did not complete"
   assert_contains "$output" 'crosscheck clear' "Claude reviewer did not earn a clear result"
-  assert_grep '--model claude-opus-5 --effort xhigh --dangerously-skip-permissions --tools Bash,Read,Write,Edit,Glob,Grep' "$case_dir/claude.log" \
+  assert_grep '--model claude-opus-5 --effort xhigh --dangerously-skip-permissions --tools Bash,Read,Glob,Grep' "$case_dir/claude.log" \
     "Claude reviewer was not pinned to the observed policy-grade invocation"
   assert_present "$case_dir/reviewer-home/session-env/crosscheck-runtime" \
-    "Claude reviewer could not write its runtime session state"
+    "Claude reviewer could not write runtime state beneath its bound HOME"
   assert_grep '+fixed' "$case_dir/reviewer-home/session-env/crosscheck-git-diff" \
     "Claude reviewer did not execute git diff between the exact base and head"
+  assert_absent "$HOME/.claude/session-env/crosscheck-runtime" \
+    "Claude reviewer wrote runtime state beneath the ambient operator HOME"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+reviewer = value["runs"][-1]["reviewer"]
+assert reviewer["account_home"] == sys.argv[2]
+assert reviewer["executing_account_home"] == sys.argv[2]
+assert reviewer["execution_home"].endswith("/.crosscheck/claude-home")
+assert reviewer["credential_source"] == "oauth-file"
+assert reviewer["account_selector"] == "CLAUDE_SECURESTORAGE_CONFIG_DIR"
+assert reviewer["execution_proof"]["actual_exit"] == 0
+assert reviewer["execution_proof"]["reviewer_receipt"]["sha256"]
+assert sys.argv[3] in reviewer["execution_proof"]["command"]
+assert sys.argv[4] in reviewer["execution_proof"]["command"]
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    "$case_dir/reviewer-home" "$base" "$head" \
+    || fail "Claude verdict did not record the bound executing account and exact-SHA command proof"
   assert_absent "$case_dir/codex.log" "Codex reviewer launched without model separation"
-  pass "Claude Opus xhigh completes a sandboxed review while persisting runtime state"
+  pass "Claude Opus xhigh binds HOME, account independence, sandbox writes, and exact-SHA execution evidence"
+}
+
+test_reviewer_execution_home_drift_fails_closed() {
+  local record case_dir base head rc
+  record=$(make_case reviewer-execution-home-drift)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  sed -i.bak 's/model=gpt-5.5/model=gpt-5.6-sol/' "$case_dir/state/task-x1.meta"
+  rm "$case_dir/state/task-x1.meta.bak"
+  cat > "$case_dir/reviewer.json" <<EOF
+{"reviewers":[{"harness":"claude","model":"claude-opus-5","effort":"xhigh","account_home":"$case_dir/reviewer-home"}]}
+EOF
+  set +e
+  run_case "$case_dir" "$base" "$head" execution-home-drift run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "reviewer execution-home drift"
+  assert_grep 'CROSSCHECK TOOL-FAILURE:' "$case_dir/err" \
+    "execution-account drift was not classified as a tool failure"
+  assert_grep 'reviewer executing-account inspection found a provider account selector' "$case_dir/err" \
+    "execution-account drift did not name the identity actually inspected"
+  assert_no_grep 'CROSSCHECK BLOCKING' "$case_dir/err" \
+    "a configured reviewer label overrode the executing account identity"
+  assert_no_grep 'crosscheck clear' "$case_dir/out" \
+    "a reviewer running under the author HOME earned a clear result"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["runs"][-1]["state"] == "tool-failure"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "execution-account drift was not durably classified as a tool failure"
+  pass "reviewer independence is bound to the executing credential selector, not its configured label"
 }
 
 test_unrouted_author_uses_cross_provider_independence() {
@@ -1025,7 +1205,7 @@ PY
 }
 
 test_real_claude_sandbox_executes_exact_sha_git_diff() {
-  local repo base head nonce profile output event claude_bin sandbox_bin reviewer_home
+  local repo base head nonce profile output event claude_bin sandbox_bin reviewer_home execution_home
   if [ "${FM_TEST_REAL_CLAUDE_SANDBOX_GIT_DIFF:-0}" != 1 ]; then
     printf 'SKIP: real Claude sandbox exact-SHA git-diff proof; set FM_TEST_REAL_CLAUDE_SANDBOX_GIT_DIFF=1 and FM_TEST_REAL_CLAUDE_CONFIG_DIR\n'
     return
@@ -1066,28 +1246,40 @@ spec.loader.exec_module(module)
 profile = Path(sys.argv[2])
 repo = Path(sys.argv[3])
 reviewer_home = Path(sys.argv[4]).resolve()
-shared_claude = Path.home().joinpath(".claude").resolve()
-session_env = shared_claude / "session-env"
+ambient_home = Path.home().resolve()
+shared_session_env = ambient_home / ".claude" / "session-env"
+reviewer_session_env = reviewer_home / "session-env"
 try:
-    reviewer_home.relative_to(shared_claude)
+    reviewer_home.relative_to(ambient_home / ".claude")
 except ValueError:
     pass
 else:
     raise AssertionError("reviewer home must be independent of shared ~/.claude")
+execution_home, credential_source, credential_identifier = (
+    module.prepare_claude_execution_home(repo / ".crosscheck", reviewer_home)
+)
 module.write_sandbox_profile(
     profile,
     repo,
     allow_network=True,
-    additional_writable_roots=(reviewer_home, session_env),
+    additional_writable_roots=(reviewer_home,),
 )
 text = profile.read_text()
-assert f"  (subpath {json.dumps(str(session_env))})" in text
-assert f"  (subpath {json.dumps(str(shared_claude))})" not in text
+assert f"  (subpath {json.dumps(str(reviewer_home))})" in text
+assert f"  (subpath {json.dumps(str(shared_session_env))})" not in text
+assert reviewer_session_env.is_relative_to(reviewer_home)
+assert execution_home == repo / ".crosscheck" / "claude-home"
+assert execution_home.joinpath(".claude").resolve() == reviewer_home
+assert credential_source in {"oauth-file", "scoped-keychain"}
+assert credential_identifier
 assert f"  (subpath {json.dumps(str(repo.resolve() / '.crosscheck' / 'claude-tmp'))})" not in text
 PY
+  execution_home="$repo/.crosscheck/claude-home"
   (
     cd "$repo" || exit 1
+    HOME="$execution_home" \
     CLAUDE_CONFIG_DIR="$reviewer_home" \
+    CLAUDE_SECURESTORAGE_CONFIG_DIR="$reviewer_home" \
     CLAUDE_CODE_TMPDIR="$repo/.crosscheck/claude-tmp" \
     "$sandbox_bin" -f "$profile" "$claude_bin" -p \
       --model claude-opus-5 \
@@ -1096,10 +1288,14 @@ PY
       --tools Bash \
       --no-session-persistence \
       --output-format json \
-      --json-schema '{"type":"object","properties":{"base":{"type":"string"},"head":{"type":"string"},"cwd":{"type":"string"},"diff":{"type":"string"},"claude_code_tmpdir":{"type":"string"}},"required":["base","head","cwd","diff","claude_code_tmpdir"],"additionalProperties":false}' \
-      "Use Bash in the current repository to run git diff $base $head -- runtime-proof.txt. Save an execution record containing those exact SHAs, pwd, CLAUDE_CODE_TMPDIR, and the exact diff output to .crosscheck/observed-bash-event. Return the exact diff, pwd, both exact SHAs, and the CLAUDE_CODE_TMPDIR environment value. This is the real sandboxed Claude Bash exact-SHA git-diff proof."
-  ) > "$output" \
-    || fail "real installed Claude could not execute git diff under the generated sandbox"
+      --json-schema '{"type":"object","properties":{"base":{"type":"string"},"head":{"type":"string"},"cwd":{"type":"string"},"home":{"type":"string"},"config":{"type":"string"},"secure_config":{"type":"string"},"diff":{"type":"string"},"claude_code_tmpdir":{"type":"string"}},"required":["base","head","cwd","home","config","secure_config","diff","claude_code_tmpdir"],"additionalProperties":false}' \
+      "Use Bash in the current repository to run git diff $base $head -- runtime-proof.txt. Save an execution record containing those exact SHAs, pwd, HOME, CLAUDE_CONFIG_DIR, CLAUDE_SECURESTORAGE_CONFIG_DIR, CLAUDE_CODE_TMPDIR, and the exact diff output to .crosscheck/observed-bash-event. Return all of those exact values. This is the real sandboxed Claude Bash exact-SHA git-diff proof."
+  ) > "$output" 2> "$repo/.crosscheck/real-claude-stderr.log" \
+    || {
+      tail -c 4000 "$output" 2>/dev/null || true
+      tail -c 4000 "$repo/.crosscheck/real-claude-stderr.log" 2>/dev/null || true
+      fail "real installed Claude could not execute git diff under the generated sandbox"
+    }
   assert_present "$event" \
     "real Claude Bash did not create the exact-repository execution event"
   assert_grep "$nonce" "$event" \
@@ -1112,7 +1308,7 @@ PY
     "real Claude Bash event was not bound to the temporary repository cwd"
   assert_grep "$repo/.crosscheck/claude-tmp" "$event" \
     "real Claude Bash event did not observe the isolated CLAUDE_CODE_TMPDIR"
-  python3 - "$output" "$base" "$head" "$nonce" "$repo" "$repo/.crosscheck/claude-tmp" <<'PY' \
+  python3 - "$output" "$base" "$head" "$nonce" "$repo" "$execution_home" "$reviewer_home" "$repo/.crosscheck/claude-tmp" <<'PY' \
     || fail "real Claude output did not prove exact-SHA git diff with isolated scratch"
 import json
 import sys
@@ -1126,9 +1322,14 @@ assert proof["base"] == sys.argv[2]
 assert proof["head"] == sys.argv[3]
 assert sys.argv[4] in proof["diff"]
 assert proof["cwd"] == sys.argv[5]
-assert proof["claude_code_tmpdir"] == sys.argv[6]
+assert proof["home"] == sys.argv[6]
+assert proof["config"] == sys.argv[7]
+assert proof["secure_config"] == sys.argv[7]
+assert proof["claude_code_tmpdir"] == sys.argv[8]
 PY
-  pass "real sandboxed Claude Bash executed git diff between two exact SHAs with isolated CLAUDE_CODE_TMPDIR"
+  printf 'REAL CLAUDE PROOF: reviewer=claude-opus-5/xhigh account_home=%s command=git diff %s %s -- runtime-proof.txt verdict=completed\n' \
+    "$reviewer_home" "$base" "$head"
+  pass "real sandboxed Claude Bash executed exact-SHA git diff with scoped account credentials, private HOME, and isolated scratch"
 }
 
 test_symlinked_named_test_cannot_hide_test_mutation() {
@@ -1581,6 +1782,42 @@ assert run["suspicions"][0]["description"] == "The reviewer could not finish a r
   pass "a completed review that declines clearance is blocking code evidence"
 }
 
+test_reading_only_suspicion_is_a_tool_failure() {
+  local record case_dir base head rc
+  record=$(make_case reading-only-suspicion)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  sed -i.bak 's/model=gpt-5.5/model=gpt-5.6-sol/' "$case_dir/state/task-x1.meta"
+  rm "$case_dir/state/task-x1.meta.bak"
+  cat > "$case_dir/reviewer.json" <<EOF
+{"reviewers":[{"harness":"claude","model":"claude-opus-5","effort":"xhigh","account_home":"$case_dir/reviewer-home"}]}
+EOF
+  set +e
+  run_case "$case_dir" "$base" "$head" reading-only-suspicion run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "reading-only reviewer suspicion"
+  assert_grep 'CROSSCHECK TOOL-FAILURE:' "$case_dir/err" \
+    "a verdict without command execution was not classified as a tool failure"
+  assert_grep 'reviewer verdict carries no executed reproduction' "$case_dir/err" \
+    "the command-execution failure did not name the missing inspected artifact"
+  assert_no_grep 'CROSSCHECK BLOCKING' "$case_dir/err" \
+    "a reading-only concern was accepted as blocking code evidence"
+  assert_no_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
+    "a reviewer runtime failure collapsed into a generic review outcome"
+  assert_absent "$case_dir/reviewer-home/session-env/crosscheck-git-diff" \
+    "the dead-Bash fixture unexpectedly executed git diff"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+run = value["runs"][-1]
+assert run["state"] == "tool-failure"
+assert run["suspicions"] == []
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "reading-only verdict was not durably classified as a tool failure"
+  pass "a verdict without an executed reproduction is a tool failure, never blocking code evidence"
+}
+
 test_verify_rechecks_live_head_and_claims() {
   local record case_dir base head next_base rc verified
   record=$(make_case verify-live)
@@ -1619,15 +1856,18 @@ test_verify_rechecks_live_head_and_claims() {
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
     test_empty_runtime_overrides_use_home_defaults|\
+    test_empty_environment_fallback_is_generic|\
     test_set_runtime_overrides_remain_authoritative|\
     test_bad_state_override_is_a_named_tool_failure|\
     test_review_fetches_exact_pr_head_when_author_worktree_is_behind|\
     test_missing_pr_head_ref_fails_closed|\
     test_claude_reviewer_provides_model_separation_for_codex_author|\
+    test_reviewer_execution_home_drift_fails_closed|\
     test_unrouted_author_uses_cross_provider_independence|\
     test_unrouted_author_without_account_proof_fails_closed|\
     test_missing_author_identity_is_a_named_tool_failure|\
     test_completed_reviewer_suspicion_is_blocking|\
+    test_reading_only_suspicion_is_a_tool_failure|\
     test_new_finding_requires_executed_reproduction|\
     test_silence_never_closes_prior_finding|\
     test_baseline_readable_state_is_destroyed_before_mutation|\
@@ -1662,11 +1902,13 @@ fi
 
 test_clear_review_uses_policy_contract
 test_empty_runtime_overrides_use_home_defaults
+test_empty_environment_fallback_is_generic
 test_set_runtime_overrides_remain_authoritative
 test_bad_state_override_is_a_named_tool_failure
 test_review_fetches_exact_pr_head_when_author_worktree_is_behind
 test_missing_pr_head_ref_fails_closed
 test_claude_reviewer_provides_model_separation_for_codex_author
+test_reviewer_execution_home_drift_fails_closed
 test_unrouted_author_uses_cross_provider_independence
 test_unrouted_author_without_account_proof_fails_closed
 test_missing_author_identity_is_a_named_tool_failure
@@ -1696,4 +1938,5 @@ test_claims_lookup_error_never_reaches_reviewer
 test_reviewer_configuration_failures_are_tool_failures
 test_stopped_reviewer_and_wrong_head_are_unreviewed
 test_completed_reviewer_suspicion_is_blocking
+test_reading_only_suspicion_is_a_tool_failure
 test_verify_rechecks_live_head_and_claims

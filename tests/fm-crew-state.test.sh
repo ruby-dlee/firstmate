@@ -195,6 +195,8 @@ set -u
 case "${FM_FAKE_LIVENESS_MODE:-}" in
   empty) exit 0 ;;
   malformed) printf 'not a liveness result\n' ;;
+  empty-procs) printf 'liveness: unknown · run: 01RUN · procs:  · grade: unreadable · missing count · doing: bash t.sh (1:00)\n' ;;
+  argv-fields) printf 'liveness: unknown · run: 01RUN · procs: 3 · grade: present-unproven · presence established · doing: python -c "procs: x grade: bogus" (1:00)\n' ;;
   nonzero) exit 9 ;;
   timeout) sleep 30 ;;
   *) printf 'liveness: alive · run: 01RUN · procs: 1 · processes present\n' ;;
@@ -572,7 +574,23 @@ test_quiet_step_probe_failures_are_unknown() {
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=malformed \
     run_crew_state "$d" feat-qu)
   assert_contains "$out" "liveness: unknown" "a malformed probe result is visibly unknown"
-  assert_contains "$out" "probe result unparseable" "a malformed result reports its parse failure"
+  assert_contains "$out" "probe protocol unreadable: verdict missing or invalid" \
+    "a malformed result reports its distinct protocol failure"
+
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=empty-procs \
+    run_crew_state "$d" feat-qu)
+  assert_contains "$out" "liveness: unknown" "an empty process count is visibly unknown"
+  assert_contains "$out" "probe protocol unreadable: numeric process count missing or invalid" \
+    "an empty process count reports the probe-side protocol defect"
+  assert_not_contains "$out" "grade:" \
+    "an empty process count is not collapsed into a measurement-grade unknown"
+
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=argv-fields \
+    run_crew_state "$d" feat-qu)
+  assert_contains "$out" "liveness: unknown (grade: present-unproven; 3 procs; presence established)" \
+    "structured fields are parsed before argv text containing field names"
+  assert_contains "$out" 'on python -c "procs: x grade: bogus" (1:00)' \
+    "argv field-name text remains visible without corrupting the verdict"
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_CREW_STATE_NM_TIMEOUT=1 FM_FAKE_LIVENESS_MODE=timeout \
     run_crew_state "$d" feat-qu)

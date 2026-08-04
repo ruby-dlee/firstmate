@@ -571,14 +571,23 @@ nm_step_liveness() {
   # line is the read firstmate actually makes. Omitting them would leave the
   # follow-up question ("alive, but stuck on the same script for three hours?")
   # needing a second command on every heartbeat.
-  verdict=$(printf '%s\n' "$out" | sed -n 's/^liveness:[[:space:]]*\([a-z]*\).*/\1/p')
-  procs=$(printf '%s\n' "$out" | sed -n 's/.*procs:[[:space:]]*\([0-9]*\).*/\1/p')
-  grade=$(printf '%s\n' "$out" | sed -n 's/.*grade:[[:space:]]*\([a-z-]*\).*/\1/p')
+  # `doing:` is unstructured, truncated argv. Parse every structured field only
+  # from the prefix before it: argv may legitimately contain strings such as
+  # `procs:` or `grade:`, which must not override the fields they describe.
+  detail_fields=${out%%"$SEP"doing: *}
+  verdict=$(printf '%s\n' "$detail_fields" | sed -n 's/^liveness:[[:space:]]*\([a-z][a-z]*\).*/\1/p')
+  procs=$(printf '%s\n' "$detail_fields" | sed -n 's/.*procs:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+  grade=$(printf '%s\n' "$detail_fields" | sed -n 's/.*grade:[[:space:]]*\([a-z][a-z-]*\).*/\1/p')
   case "$verdict" in
     alive|dead|unknown) ;;
-    *) printf 'unknown (probe result unparseable)'; return ;;
+    *) printf 'unknown (probe protocol unreadable: verdict missing or invalid)'; return ;;
   esac
-  case "$procs" in ''|*[!0-9]*) printf 'unknown (probe result unparseable)'; return ;; esac
+  case "$procs" in
+    ''|*[!0-9]*)
+      printf 'unknown (probe protocol unreadable: numeric process count missing or invalid)'
+      return
+      ;;
+  esac
   # `doing: <argv> (<etime>)` is the probe's last field when it could name one.
   # The probe already truncates argv, so take it verbatim rather than re-parsing
   # a command line whose shape varies by whatever the step happens to be running.
@@ -591,7 +600,6 @@ nm_step_liveness() {
       '') grade=ungraded ;;
       *) grade=unreadable ;;
     esac
-    detail_fields=${out%%"$SEP"doing: *}
     detail=${detail_fields##*"$SEP"}
     case "$detail" in
       "$detail_fields"|grade:*) detail="probe reported unknown" ;;

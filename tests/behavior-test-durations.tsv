@@ -56,7 +56,7 @@
 10	tests/fm-pi-primary-live-e2e.test.sh
 80	tests/fm-pi-primary-types.test.sh
 3170	tests/fm-pi-watch-extension.test.sh
-1574	tests/fm-pr-merge.test.sh
+2400	tests/fm-pr-merge.test.sh
 802	tests/fm-prompt-exec.test.sh
 261383	tests/fm-report-stack-a.test.sh
 243164	tests/fm-report-stack-b.test.sh
@@ -81,6 +81,7 @@
 10408	tests/fm-tangle-guard.test.sh
 321224	tests/fm-teardown-a.test.sh
 321224	tests/fm-teardown-b.test.sh
+700	tests/fm-toon-lib.test.sh
 600	tests/fm-transition-lib.test.sh
 1849	tests/fm-turnend-guard.test.sh
 1511	tests/fm-update.test.sh

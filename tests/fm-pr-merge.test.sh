@@ -17,6 +17,7 @@
 #   (i) merge-queue acceptance is not reported as success unless PR state is merged
 #   (j) no-method queue requests preserve queue statuses and record metadata first
 #   (k) draft PRs are clearly refused after metadata is recorded
+#   (l) payloads the strict reader cannot verify refuse instead of reading green
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -205,6 +206,123 @@ run_pr_merge() {
     "$PR_MERGE" "$@"
 }
 
+# gh-axi mock whose `pr view` output is supplied verbatim by the caller, so a
+# deliberately malformed payload can be driven through the real merge gate.
+# The merge call always "succeeds", which is the dangerous shape: the gate must
+# refuse on the strength of the payload it cannot verify, not on a merge error.
+add_gh_mocks_view_payload() {
+  local case_dir=$1 payload=$2
+  printf '%s\n' "$payload" > "$case_dir/view-payload"
+  cat > "$case_dir/fakebin/gh-axi" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_TEST_GH_AXI_LOG"
+case "${1:-} ${2:-}" in
+  "pr view") cat "$FM_TEST_VIEW_PAYLOAD" ; exit 0 ;;
+  "pr merge") printf '%s\n' "merged:" "  number: ${3:-}" "  status: ok" "  method: squash" ; exit 0 ;;
+esac
+exit 0
+SH
+  cat > "$case_dir/fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/gh-axi" "$case_dir/fakebin/gh"
+}
+
+# Drive one malformed-payload case end to end and require a refusal.
+# Args: label, pr view payload, expected stderr fragment
+expect_gate_refuses() {
+  local label=$1 payload=$2 needle=$3 case_dir rc
+  case_dir=$(make_case "gate-$label")
+  mkdir -p "$case_dir/wt"
+  add_gh_mocks_view_payload "$case_dir" "$payload"
+  : > "$case_dir/gh-axi.log"
+
+  set +e
+  FM_TEST_VIEW_PAYLOAD="$case_dir/view-payload" \
+    run_pr_merge "$case_dir" task-x1 https://github.com/example/repo/pull/42 \
+      > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  [ "$rc" -ne 0 ] \
+    || fail "gate-$label: merge gate exited zero on a payload it cannot verify"
+  assert_no_grep 'status: ok' "$case_dir/stdout" \
+    "gate-$label: gate reported a confirmed merge from an unverifiable payload"
+  assert_grep "$needle" "$case_dir/stderr" \
+    "gate-$label: refusal did not explain the problem"
+}
+
+# The merge gate must refuse every payload it cannot fully account for. Each
+# case below is a shape the previous pattern-matching parser turned into a
+# green read.
+test_gate_refuses_unverifiable_payloads() {
+  # An unmatched quote used to be stripped into a bare word, so a malformed
+  # payload was reported as a CONFIRMED MERGE. This is the exact false success.
+  expect_gate_refuses unmatched-quote \
+'pull_request:
+  number: 42
+  draft: no
+  state: "merged' \
+    'malformed scalar'
+
+  # Case variants used to be accepted on both the draft gate and the merged
+  # check, so a payload in the wrong vocabulary read as verified.
+  expect_gate_refuses uppercase-state \
+'pull_request:
+  number: 42
+  draft: no
+  state: MERGED' \
+    'did not confirm'
+
+  expect_gate_refuses uppercase-draft-flag \
+'pull_request:
+  number: 42
+  draft: FALSE
+  state: merged' \
+    'readable draft status'
+
+  # A key matched at any depth used to satisfy a top-level lookup: here the
+  # PR itself has no state, and a review does.
+  expect_gate_refuses state-only-nested \
+'pull_request:
+  number: 42
+  draft: no
+  reviews[1]:
+    - state: merged' \
+    'readable PR state'
+
+  # An absent flag is not a negative.
+  expect_gate_refuses draft-absent \
+'pull_request:
+  number: 42
+  state: merged' \
+    'readable draft status'
+
+  # A declared count that disagrees with the block means we do not understand
+  # the payload, so even a green-looking state elsewhere cannot be trusted.
+  expect_gate_refuses array-count-mismatch \
+'pull_request:
+  number: 42
+  draft: no
+  state: merged
+checks[1]{name,conclusion}:
+  lint,pass
+  tests,fail' \
+    'declares [1] but its block holds 2 rows'
+
+  # A line we cannot classify is never absorbed into the record before it.
+  expect_gate_refuses unclassifiable-line \
+'pull_request:
+  number: 42
+  draft: no
+  state: merged
+Traceback (most recent call last):' \
+    'not classifiable'
+
+  pass "fm-pr-merge refuses every gh-axi payload it cannot fully verify"
+}
+
 test_records_pr_and_head_before_merging() {
   local case_dir rc
   case_dir=$(make_case records-before-merge)
@@ -271,8 +389,14 @@ test_merge_queue_acceptance_is_not_success() {
   set -e
 
   expect_code 1 "$rc" "queued-not-merged: fm-pr-merge must not exit zero for an unconfirmed merge"
-  assert_grep 'status: enqueued' "$case_dir/stdout" \
-    "queued-not-merged: unmerged queue acceptance was not reported as enqueued"
+  # gh-axi labelled this result `merged:` with `status: ok` while GitHub still
+  # reports the PR open. That is a payload we do not understand, so the label
+  # must say so. The old parser fabricated `enqueued` here, which read like an
+  # orderly queue wait for a state that is actually unexplained.
+  assert_grep 'status: unrecognized' "$case_dir/stdout" \
+    "queued-not-merged: an unexplained merge result was not labelled unrecognized"
+  assert_no_grep 'status: enqueued' "$case_dir/stdout" \
+    "queued-not-merged: an unexplained merge result was fabricated as enqueued"
   assert_grep 'observed_state: open' "$case_dir/stdout" \
     "queued-not-merged: observed open state was not reported"
   assert_no_grep 'status: ok' "$case_dir/stdout" \
@@ -285,7 +409,7 @@ test_merge_queue_acceptance_is_not_success() {
     || fail "queued-not-merged: queue-specific no-method retry was not invoked"
   grep -qxF 'pr view 42 --repo example/repo' "$case_dir/gh-axi.log" \
     || fail "queued-not-merged: gh-axi pr view was not invoked to verify the merge"
-  pass "fm-pr-merge treats merge-queue acceptance as enqueued, not merged success"
+  pass "fm-pr-merge labels an unexplained merge result unrecognized, not merged success"
 }
 
 test_no_method_queue_statuses_are_not_merge_success() {
@@ -521,3 +645,4 @@ test_repo_override_args_refuse_before_recording
 test_explicit_merge_method_not_overridden
 test_method_equals_merge_method_not_overridden
 test_parses_pr_url_for_gh_axi
+test_gate_refuses_unverifiable_payloads

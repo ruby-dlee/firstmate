@@ -79,8 +79,8 @@
 # fm-config-inherit-lib.sh, fm-ff-lib.sh, fm-gate-refuse-lib.sh,
 # fm-lock-lib.sh, fm-marker-lib.sh, fm-report-contract-lib.sh,
 # fm-supervision-lib.sh, fm-supervisor-target-lib.sh, fm-tangle-lib.sh,
-# fm-tasks-axi-lib.sh, fm-tmux-lib.sh, fm-transition-lib.sh, fm-wake-lib.sh,
-# and fm-x-lib.sh.
+# fm-tasks-axi-lib.sh, fm-tmux-lib.sh, fm-toon-lib.sh, fm-transition-lib.sh,
+# fm-wake-lib.sh, and fm-x-lib.sh.
 # Excluded pure helpers are not entrypoints: backends/herdr-eventwait.py,
 # fm-contained-read.cjs, fm-contained-read.py, fm-file-transaction.cjs,
 # fm-markdown-structure.cjs, and fm-prompt-exec.py carry no fleet dispatch of

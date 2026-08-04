@@ -1530,7 +1530,8 @@ test_supervisor_read_separates_paused_wedged_unknown() {
   case "$silent_out:$(crew_absorb_class supervisor-silent)" in
     *"state: unknown"*:none) case "$silent_out" in *"state: paused"*) ;; *) correct=$((correct + 1)) ;; esac ;;
   esac
-  unset FM_FAKE_CREW_STATE FM_CREW_STATE_BIN
+  unset FM_FAKE_CREW_STATE
+  export FM_CREW_STATE_BIN="$CREW_STATE"
 
   [ "$correct" -eq 3 ] \
     || fail "$correct of 3 supervisor states were distinct: wedged=[$wedged_out] paused=[$paused_out] silent=[$silent_out]"
@@ -1752,6 +1753,14 @@ test_usage_error() {
 
 if [ "${FM_TEST_FOCUSED:-}" = supervision-states ]; then
   test_supervisor_read_separates_paused_wedged_unknown
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = state-consumer-regressions ]; then
+  test_supervisor_read_separates_paused_wedged_unknown
+  test_no_run_idle_secondmate_resolved_event_not_state
+  test_provably_working_via_runs_list_fallback
+  test_not_provably_working_when_stopped
   exit 0
 fi
 

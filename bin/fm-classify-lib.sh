@@ -376,16 +376,16 @@ signal_reason_is_actionable() {  # <file> ...
 #   paused  - the crewmate's authoritative current state is an owned-and-clearing
 #             external wait, or stale-pane triage supplied that durable pause
 #             alongside a finished run-step, so the pane is EXPECTED to idle;
-#   none    - neither, so the wake must surface (including dead and unknown
+#   none    - neither, so the wake must surface (including stalled, dead, and unknown
 #             liveness, a stopped/finished/parked/failed/torn-down crewmate, or
 #             an unreadable verdict).
 # One fm-crew-state.sh read serves BOTH absorb reasons at once. Reading the state
 # authoritatively (not the status log) keeps run-step precedence: a crewmate that
 # appended a pause but then STARTED a run reports working, never paused. The optional
 # second argument is reserved for stale-pane absorb triage. A declared pause there
-# may override only a DONE run-step (including passed and checks-passed outcomes,
-# which fm-crew-state.sh maps to done), because the run has finished and the durable
-# event explains why its pane is now expected to idle. Failed, parked, unknown, and
+# may override only a DONE run-step (including passed and checks-passed outcomes)
+# or a PARKED approval gate, because the run has stopped and the durable event
+# explains why its pane is now expected to idle. Failed, stale, unknown, and
 # actively-working run-steps never yield to that event.
 # NOT a pure local read: fm-crew-state.sh may make bounded no-mistakes and GitHub
 # PR-state calls, so signal and stale callers run it only on no-verb signal and
@@ -400,7 +400,7 @@ crew_state_line() {  # <id>
 }
 
 # Parse the optional presence-only liveness observation from a current-state
-# line. This boundary has exactly three verdicts: alive, dead, and unknown.
+# line. This boundary has four verdicts: alive, stalled, dead, and unknown.
 # An unrecognized value in an explicit liveness field is malformed evidence, so
 # it becomes unknown; a line with no liveness field remains empty for backward
 # compatibility and keeps its previous classification.
@@ -514,7 +514,7 @@ crew_is_provably_working() {  # <id>
 # The stale path absorbs such a crewmate (on a long re-surface cadence) instead of
 # escalating a possible wedge.
 crew_is_paused() {  # <id> [declared-pause-status-line]
-  # This predicate needs only pause-or-not; dead and unknown arrive as `none`
+  # This predicate needs only pause-or-not; stalled, dead, and unknown arrive as `none`
   # and stay distinct from the one absorbable paused outcome.
   case "$(crew_absorb_class "$1" "${2:-}")" in
     paused) return 0 ;;
@@ -541,7 +541,7 @@ signal_crew_provably_working() {  # <file> ...
     case " $seen " in *" $task "*) continue ;; esac
     seen="$seen $task"
     class=$(crew_absorb_class "$task")
-    # A signal needs only absorb-or-surface; `none` includes dead and unknown,
+    # A signal needs only absorb-or-surface; `none` includes stalled, dead, and unknown,
     # both of which must surface rather than be treated as assume-fine.
     case "$class" in
       working) ;;

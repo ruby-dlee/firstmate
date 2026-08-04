@@ -42,7 +42,7 @@
 #   auto-reap: <out>       stale crashed-spawn acquisition recovery made progress
 #                          or refused and retained state for operator inspection
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
-#                          status or a dead/unknown command-step liveness reading,
+#                          status or a stalled/dead/unknown command-step liveness reading,
 #                          unless afk is active
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
@@ -826,7 +826,7 @@ mark_all_captain_relevant_surfaced() {
 
 # Heartbeat fleet-scan (the always-on twin of the daemon's catch-all). Status
 # events retain their surfaced-marker dedup. Command-step liveness is handled as
-# three explicit states: alive is healthy, while dead and unknown both surface
+# four explicit states: alive is healthy, while stalled, dead, and unknown surface
 # because neither may be absorbed as positive evidence. A line with no liveness
 # observation keeps its prior behavior.
 heartbeat_scan_finds_actionable() {
@@ -1346,7 +1346,7 @@ EOF
   [ "$hb" -gt "$HEARTBEAT_MAX" ] && hb=$HEARTBEAT_MAX
   if marker_due "$STATE/.last-heartbeat" "$hb" "watcher heartbeat"; then
     # Triage: in always-on mode a heartbeat is benign unless the fleet-scan turns
-    # up a captain-relevant status or a dead/unknown command-step liveness reading.
+    # up a captain-relevant status or a stalled/dead/unknown command-step liveness reading.
     # Unknown is grouped with actionable here because a heartbeat needs only the
     # binary absorb/surface decision, and unknown is not proof of health. The
     # away-mode daemon, when present, owns triage and wants every heartbeat.

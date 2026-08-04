@@ -286,7 +286,7 @@ function push(kind, ind, p) {
   ctx_nfields[depth] = 0
 }
 
-function close_ctx(d,   cnt, parts, i, seen) {
+function close_ctx(d,   cnt, parts, i, seen, inline_seen, rowcnt, has_comma) {
   if (ctx_kind[d] == "tab") {
     if (ctx_seen[d] != ctx_expect[d])
       err(sprintf("array %s declares [%d] but its block holds %d rows", ctx_path[d], ctx_expect[d], ctx_seen[d]))
@@ -299,10 +299,17 @@ function close_ctx(d,   cnt, parts, i, seen) {
       err(sprintf("array %s declares [%d] but its block holds %d items", ctx_path[d], ctx_expect[d], seen))
     return
   }
+  inline_seen = 0
+  has_comma = 0
+  for (i = 1; i <= seen; i++) {
+    rowcnt = split_row(ctx_items[d SUBSEP i], parts)
+    if (rowcnt > 1) has_comma = 1
+    inline_seen += (rowcnt < 0) ? 0 : rowcnt
+  }
+  if (has_comma && !(seen == 1 && ctx_expect[d] != 1))
+    err(sprintf("array %s has both a %d-item block reading and a %d-item comma-separated inline reading; refusing ambiguous list grammar", ctx_path[d], seen, inline_seen))
   if (seen == ctx_expect[d]) {
     for (i = 1; i <= seen; i++) {
-      if (index(ctx_items[d SUBSEP i], ",") != 0)
-        err(sprintf("array %s can be read as both a %d-line block and a comma-separated inline list; refusing ambiguous list grammar", ctx_path[d], seen))
       setval(ctx_path[d] "[" (i - 1) "]", ctx_items[d SUBSEP i])
     }
     return

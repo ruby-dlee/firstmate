@@ -172,7 +172,13 @@ test_block_list_comma_ambiguity_refused() {
   expect_refuse "one-line block cannot hide a comma-separated item" validate '' \
 'items[1]:
   failing,passing' \
-    'both a 1-line block and a comma-separated inline list'
+    'both a 1-item block reading and a 2-item comma-separated inline reading'
+
+  expect_refuse "multi-line block names both comma interpretations" validate '' \
+'items[3]:
+  failing,passing
+  success' \
+    'both a 2-item block reading and a 3-item comma-separated inline reading'
 
   pass "fm-toon-lib refuses ambiguous block and inline list grammar"
 }

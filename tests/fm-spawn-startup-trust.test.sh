@@ -348,7 +348,7 @@ test_spawn_positive_processing_is_quiet() {
 }
 
 make_watcher_case() {  # <name> <harness> <fixture-function>
-  local name=$1 fixture_fn=$3
+  local name=$1 fixture_fn=$3 status_baseline turnend_baseline
   WATCH_ID="watch-$name"
   WATCH_GENERATION="generation:$name"
   WATCH_DIR="$TMP_ROOT/watcher-$name"
@@ -362,8 +362,11 @@ make_watcher_case() {  # <name> <harness> <fixture-function>
   mkdir -p "$WATCH_STATE" "$WATCH_CONFIG"
   "$fixture_fn" > "$WATCH_CAPTURE"
   touch "$WATCH_STATE/.last-report-retention" "$WATCH_STATE/.last-account-session-sync"
+  status_baseline=$(watch_fixture_signature "$WATCH_STATE/$WATCH_ID.status")
+  turnend_baseline=$(watch_fixture_signature "$WATCH_STATE/$WATCH_ID.turn-ended")
   fm_write_meta "$WATCH_STATE/$WATCH_ID.meta" \
-    "window=$WATCH_WINDOW" "kind=ship" "harness=$WATCH_HARNESS" "generation_id=$WATCH_GENERATION"
+    "window=$WATCH_WINDOW" "kind=ship" "harness=$WATCH_HARNESS" "generation_id=$WATCH_GENERATION" \
+    "startup_status_baseline=$status_baseline" "startup_turnend_baseline=$turnend_baseline"
   cat > "$WATCH_FAKEBIN/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -379,6 +382,20 @@ SH
 printf 'state: unknown · source: none · startup trust fixture\n'
 SH
   chmod +x "$WATCH_FAKEBIN/fm-crew-state.sh"
+}
+
+watch_fixture_signature() {  # <path>
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+try:
+    value = os.stat(sys.argv[1], follow_symlinks=False)
+except FileNotFoundError:
+    print("absent")
+else:
+    print(f"{value.st_size}:{value.st_mtime_ns}:{value.st_ctime_ns}")
+PY
 }
 
 run_watcher_case() {  # [startup-grace]
@@ -450,6 +467,14 @@ test_watcher_closes_late_render_gap_without_crossing_phase_boundary() {
     "current-generation directory trust did not take the protected mid-run path"
   assert_not_contains "$out" 'only if you choose to trust it' "mid-run directory trust received a startup acceptance instruction"
   assert_not_contains "$out" 'fm-send.sh' "mid-run directory trust exposed a send-key command"
+
+  make_watcher_case fast-turn codex fixture_codex_trust
+  : > "$WATCH_STATE/$WATCH_ID.turn-ended"
+  run_watcher_case 1 || fail "watcher fast-turn directory trust run failed"
+  out=$(cat "$WATCH_OUT")
+  assert_contains "$out" 'permission-prompt detected: waiting for a directory trust grant' \
+    "current-generation turn-end evidence did not close the startup marker race"
+  assert_not_contains "$out" 'fm-send.sh' "fast-turn directory trust exposed a startup acceptance command"
 
   make_watcher_case late-hook claude fixture_claude_hook_trust
   printf '%s' "$WATCH_GENERATION" > "$WATCH_STATE/.brief-started-$WATCH_ID"

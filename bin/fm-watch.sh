@@ -698,6 +698,38 @@ mark_brief_processing_started() {  # <task>
   mv "$tmp" "$marker"
 }
 
+watch_file_signature() {  # <path>
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+try:
+    value = os.stat(sys.argv[1], follow_symlinks=False)
+except FileNotFoundError:
+    print("absent")
+except OSError:
+    print("unknown")
+else:
+    print(f"{value.st_size}:{value.st_mtime_ns}:{value.st_ctime_ns}")
+PY
+}
+
+current_generation_processing_evidence() {  # <task>
+  local task=$1 meta artifact baseline current
+  meta="$STATE/$task.meta"
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  for artifact in status turn-ended; do
+    case "$artifact" in
+      status) baseline=$(fm_meta_get "$meta" startup_status_baseline) ;;
+      turn-ended) baseline=$(fm_meta_get "$meta" startup_turnend_baseline) ;;
+    esac
+    [ -n "$baseline" ] && [ "$baseline" != unknown ] || continue
+    current=$(watch_file_signature "$STATE/$task.$artifact")
+    [ "$current" != absent ] && [ "$current" != unknown ] && [ "$current" != "$baseline" ] && return 0
+  done
+  return 1
+}
+
 UNSAFE_MARKERS_LOGGED='|'
 safe_touch_marker_or_log() {  # <path> <label>
   local marker=$1 label=$2
@@ -1124,6 +1156,9 @@ EOF
     if [ "$window_busy" != 1 ]; then
       harness=$(window_harness "$w")
       startup_kind=$(fm_startup_trust_dialog_kind "$harness" "$tail40" || true)
+      if current_generation_processing_evidence "$task"; then
+        mark_brief_processing_started "$task" || true
+      fi
       allow_directory_trust=0
       brief_processing_started "$task" && allow_directory_trust=1
       if [ "$allow_directory_trust" != 1 ]; then

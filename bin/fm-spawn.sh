@@ -3665,6 +3665,7 @@ fi
 # processed the brief even when a fast first turn begins and ends between pane
 # samples. The reporter compares against this pre-launch baseline only.
 SPAWN_TURNEND_BASELINE=$(spawn_file_signature "$STATE/$ID.turn-ended")
+SPAWN_STATUS_BASELINE=$(spawn_file_signature "$STATE/$ID.status")
 SPAWN_CWD=${WT:-$PROJ_ABS}
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
   validate_direct_recovery_worktree_identity || exit 1
@@ -4057,6 +4058,8 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
   echo "generation_id=$SPAWN_GENERATION_ID"
+  echo "startup_status_baseline=$SPAWN_STATUS_BASELINE"
+  echo "startup_turnend_baseline=$SPAWN_TURNEND_BASELINE"
   [ "$NO_ACCOUNT_ROUTING" != 1 ] || echo "account_routing_emergency_bypass=1"
   [ -z "$BACKLOG_ROW_EXEMPTION" ] || echo "backlog_row_exemption=$BACKLOG_ROW_EXEMPTION"
   [ -z "$DIRECT_ACCOUNT_HOME" ] || echo "account_home=$DIRECT_ACCOUNT_HOME"

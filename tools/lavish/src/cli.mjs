@@ -13,7 +13,7 @@ import {
 } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
@@ -224,10 +224,7 @@ async function executable(path) {
   }
 }
 
-async function wakeAdapter(home) {
-  if (process.env.LAVISH_WAKE_COMMAND) {
-    return process.env.LAVISH_WAKE_COMMAND;
-  }
+async function configuredWakeAdapter(home) {
   const configured = resolve(home, 'config/lavish-wake-command');
   try {
     const value = (await readFile(configured, 'utf8')).trim();
@@ -239,6 +236,15 @@ async function wakeAdapter(home) {
       throw error;
     }
   }
+  return undefined;
+}
+
+async function wakeAdapter(home) {
+  if (process.env.LAVISH_WAKE_COMMAND) {
+    return process.env.LAVISH_WAKE_COMMAND;
+  }
+  const configured = await configuredWakeAdapter(home);
+  if (configured !== undefined) return configured;
   if (await executable(SOURCE_WAKE_ADAPTER)) {
     return SOURCE_WAKE_ADAPTER;
   }
@@ -608,7 +614,7 @@ async function createCommand(options) {
   const requestPath = resolve(requireOption(options, 'request'));
   const questionsPath = resolve(requireOption(options, 'questions'));
   const request = await readFile(requestPath);
-  await validateCaptainRequest(request);
+  await validateCaptainRequest(home, request);
   let questions;
   try {
     questions = JSON.parse(await readFile(questionsPath, 'utf8'));
@@ -630,14 +636,30 @@ async function createCommand(options) {
   );
 }
 
-async function validateCaptainRequest(request) {
+async function captainItemCheck(home) {
+  if (await executable(CAPTAIN_ITEM_CHECK)) {
+    return CAPTAIN_ITEM_CHECK;
+  }
+  const configured = await configuredWakeAdapter(home);
+  if (configured !== undefined) {
+    const sibling = join(dirname(configured), 'fm-captain-item-check.sh');
+    if (await executable(sibling)) return sibling;
+  }
+  throw new LavishError(
+    'captain request check is unavailable; configure the Firstmate wake adapter from its checkout before creating a decision',
+    2,
+  );
+}
+
+async function validateCaptainRequest(home, request) {
+  const check = await captainItemCheck(home);
   const temporary = await mkdtemp(join(tmpdir(), 'lavish-captain-request-'));
   const snapshot = join(temporary, 'request.md');
   try {
     await writeFile(snapshot, request, { flag: 'wx', mode: 0o600 });
     const checked = await new Promise((resolveCheck) => {
       execFile(
-        CAPTAIN_ITEM_CHECK,
+        check,
         ['request', snapshot],
         { encoding: 'utf8', maxBuffer: 1024 * 1024, windowsHide: true },
         (error, stdout, stderr) => resolveCheck({ error, stdout, stderr }),

@@ -3,6 +3,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import {
   access,
   chmod,
+  cp,
   mkdir,
   mkdtemp,
   readFile,
@@ -436,6 +437,44 @@ ${technicalFinding}
   );
   assert.equal(stored, request);
   assert.ok(stored.includes(technicalFinding));
+});
+
+test('installed-style create resolves the checker from the configured checkout', async () => {
+  const fx = await fixture('installed-create');
+  const installedPackage = join(fx.root, 'installed-lavish');
+  await cp(PACKAGE_ROOT, installedPackage, {
+    recursive: true,
+    filter: (source) => !source.includes('/node_modules'),
+  });
+  await symlink(join(PACKAGE_ROOT, 'node_modules'), join(installedPackage, 'node_modules'));
+  const installedCli = join(installedPackage, 'src/cli.mjs');
+
+  const configured = await runExecutable(
+    installedCli,
+    ['configure-wake', '--command', WAKE_ADAPTER, '--home', fx.home],
+  );
+  assert.equal(configured.code, 0, configured.stderr);
+
+  const result = await runExecutable(installedCli, [
+    'create',
+    '--id',
+    'installed-create',
+    '--title',
+    'Installed create',
+    '--request',
+    fx.request,
+    '--questions',
+    fx.questions,
+    '--destination',
+    'data/replies/installed-create.toon',
+    '--home',
+    fx.home,
+  ]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(
+    await exists(join(fx.home, 'data/decisions/installed-create/manifest.toon')),
+    true,
+  );
 });
 
 async function manifestFor(fx, id) {

@@ -1407,9 +1407,11 @@ def run_reviewer(
             description="Codex reviewer",
             maximum_output_bytes=reviewer_max_capture(),
         )
+        detail = (result.stderr or result.stdout).strip()
         require(
             result.returncode == 0,
-            f"reviewer exited {result.returncode} without an earned verdict",
+            f"reviewer exited {result.returncode} without an earned verdict: "
+            f"{detail[:500] or 'no diagnostic'}",
         )
         return read_json(
             output_path,
@@ -1422,6 +1424,7 @@ def run_reviewer(
         "FM_CROSSCHECK_CLAUDE_BIN", "claude", "Claude reviewer"
     )
     environment["CLAUDE_CONFIG_DIR"] = config["account_home"]
+    claude_session_env = Path.home() / ".claude" / "session-env"
     sandbox_path = protocol_dir / "claude-sandbox.sb"
     arguments = [
         claude,
@@ -1445,15 +1448,20 @@ def run_reviewer(
         cwd=review_dir,
         profile_path=sandbox_path,
         allow_network=True,
-        additional_writable_roots=(Path(config["account_home"]),),
+        additional_writable_roots=(
+            Path(config["account_home"]),
+            claude_session_env,
+        ),
         env=environment,
         timeout=reviewer_timeout(),
         description="Claude reviewer",
         maximum_output_bytes=reviewer_max_capture(),
     )
+    detail = (result.stderr or result.stdout).strip()
     require(
         result.returncode == 0 and bool(result.stdout.strip()),
-        f"reviewer exited {result.returncode} without a verdict artifact",
+        f"reviewer exited {result.returncode} without a verdict artifact: "
+        f"{detail[:500] or 'no diagnostic'}",
     )
     try:
         envelope = json.loads(result.stdout)

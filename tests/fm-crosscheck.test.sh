@@ -185,6 +185,12 @@ done
 [ "$autonomous" = yes ] || exit 84
 [ "$format" = json ] || exit 85
 [ -n "$schema" ] && [ -n "$prompt" ] || exit 86
+if ! git -C "$PWD" diff "$FM_TEST_BASE..$FM_TEST_HEAD" -- app.txt \
+  > "$CLAUDE_CONFIG_DIR/session-env/crosscheck-git-diff" \
+  2> "$CLAUDE_CONFIG_DIR/session-env/crosscheck-git-diff.err"; then
+  cat "$CLAUDE_CONFIG_DIR/session-env/crosscheck-git-diff.err" >&2
+  exit 79
+fi
 temporary=$(mktemp "${TMPDIR:-/tmp}/fm-crosscheck-claude.XXXXXX") || exit 87
 python3 "$FM_TEST_REVIEW_DRIVER" "$PWD" "$temporary" "$FM_TEST_REVIEW_SCENARIO" "$FM_TEST_HEAD" || exit 88
 python3 - "$temporary" <<'PY'
@@ -220,6 +226,7 @@ case "${3:-}" in
   */claude)
     grep -qxF '(allow network*)' "$profile" || exit 74
     grep -qF "(subpath \"$CLAUDE_CONFIG_DIR\")" "$profile" || exit 77
+    grep -qF "(subpath \"$HOME/.claude/session-env\")" "$profile" || exit 78
     ;;
   *)
     ! grep -qxF '(allow network*)' "$profile" || exit 76
@@ -645,6 +652,8 @@ test_claude_reviewer_provides_model_separation_for_codex_author() {
     "Claude reviewer was not pinned to the observed policy-grade invocation"
   assert_present "$case_dir/reviewer-home/session-env/crosscheck-runtime" \
     "Claude reviewer could not write its runtime session state"
+  assert_grep '+fixed' "$case_dir/reviewer-home/session-env/crosscheck-git-diff" \
+    "Claude reviewer did not execute git diff between the exact base and head"
   assert_absent "$case_dir/codex.log" "Codex reviewer launched without model separation"
   pass "Claude Opus xhigh completes a sandboxed review while persisting runtime state"
 }

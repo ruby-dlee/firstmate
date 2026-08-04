@@ -113,8 +113,10 @@ Later reviewers receive only a bounded projection of finding IDs, lifecycle stat
 Finding prose, reproduction output, test output, and lifecycle notes remain durable in the ledger but are never reinjected into a later reviewer prompt.
 The Codex path pins `gpt-5.6-sol`, xhigh reasoning, noninteractive approval, an independent `CODEX_HOME`, and the exact review checkout.
 The Claude path pins `claude-opus-5`, xhigh effort, the installed unattended `--dangerously-skip-permissions` mode, a bounded tool list, no session persistence, an independent `CLAUDE_CONFIG_DIR`, and structured JSON output.
-Because that Claude mode disables its own permission prompts, Crosscheck places the process under the installed macOS `sandbox-exec` contract: reads, process execution, and provider network access remain available, while writes are limited to the disposable review checkout, the selected reviewer's resolved `account_home`, and `/dev/null`.
-Claude needs that narrow account-home allowance for its own runtime state, including `session-env`; it does not grant write access to the author worktree or the wider filesystem.
+Because that Claude mode disables its own permission prompts, Crosscheck places the process under the installed macOS `sandbox-exec` contract: reads, process execution, and provider network access remain available, while writes are limited to the disposable review checkout, the selected reviewer's resolved `account_home`, Claude's `~/.claude/session-env` scratch subtree, and `/dev/null`.
+Claude Code writes UUID-keyed Bash session scratch under `~/.claude/session-env` even when `CLAUDE_CONFIG_DIR` names the independent account home.
+The profile permits that exact scratch subtree instead of shared `~/.claude`, so reviewer Bash works without granting write access to shared settings, skills, or other configuration.
+It does not grant write access to the author worktree or the wider filesystem.
 An unavailable reviewer binary, sandbox, author-identity proof, or exact remote PR head records a `tool-failure` attempt when the live head is already known, and otherwise emits the same tool-failure class without fabricating a ledger run.
 A nonzero reviewer exit, timeout, missing artifact, empty artifact, malformed artifact, or wrong-head artifact records an `unreviewed` attempt and exits nonzero.
 An unresolved suspicion comes from a completed reviewer and records a `blocking` attempt instead of being conflated with an invalid review artifact.

@@ -151,6 +151,32 @@ test_fault1_declared_counts_verified() {
   pass "fm-toon-lib verifies declared array counts and names both numbers"
 }
 
+test_duplicate_container_paths_refused() {
+  local payload
+  payload='pull_request:
+  draft: false
+pull_request:
+  state: merged'
+
+  expect_refuse "duplicate object blocks" validate '' "$payload" \
+    'duplicate path pull_request'
+  expect_refuse "duplicate blocks cannot supply a green draft" bool pull_request.draft "$payload" \
+    'duplicate path pull_request'
+  expect_refuse "duplicate blocks cannot supply a green state" get pull_request.state "$payload" \
+    'duplicate path pull_request'
+
+  pass "fm-toon-lib refuses duplicate container paths before reading children"
+}
+
+test_block_list_comma_ambiguity_refused() {
+  expect_refuse "one-line block cannot hide a comma-separated item" validate '' \
+'items[1]:
+  failing,passing' \
+    'both a 1-line block and a comma-separated inline list'
+
+  pass "fm-toon-lib refuses ambiguous block and inline list grammar"
+}
+
 # --- fault 2: expanded-array items counted by structure, not by key name ----
 
 test_fault2_expanded_items_counted_structurally() {
@@ -525,6 +551,8 @@ b: 2' \
 
 test_real_payloads_parse
 test_fault1_declared_counts_verified
+test_duplicate_container_paths_refused
+test_block_list_comma_ambiguity_refused
 test_fault2_expanded_items_counted_structurally
 test_fault3_unknown_is_never_permissive
 test_fault4_no_coercion

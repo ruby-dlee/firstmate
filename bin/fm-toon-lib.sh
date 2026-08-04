@@ -233,8 +233,13 @@ function note_root(parent, key) {
   rootorder[++nroot] = key
 }
 
+function declare_path(p) {
+  if (p in declared) err("duplicate path " p " at line " lineno "; refusing rather than picking one")
+  declared[p] = 1
+}
+
 function setval(p, raw) {
-  if (p in val) err("duplicate path " p " at line " lineno "; refusing rather than picking one")
+  declare_path(p)
   if (!scalar_ok(raw)) err("line " lineno ": malformed scalar at " p ": [" raw "]")
   val[p] = raw
 }
@@ -295,8 +300,11 @@ function close_ctx(d,   cnt, parts, i, seen) {
     return
   }
   if (seen == ctx_expect[d]) {
-    for (i = 1; i <= seen; i++)
+    for (i = 1; i <= seen; i++) {
+      if (index(ctx_items[d SUBSEP i], ",") != 0)
+        err(sprintf("array %s can be read as both a %d-line block and a comma-separated inline list; refusing ambiguous list grammar", ctx_path[d], seen))
       setval(ctx_path[d] "[" (i - 1) "]", ctx_items[d SUBSEP i])
+    }
     return
   }
   # A single physical line may carry N comma-separated items (the inline list
@@ -325,11 +333,15 @@ function classify(eff_ind, s, parent,   p, head, tail, v, i, n, fparts, fname, s
   if (is_key(head)) {
     note_root(parent, head)
     if (tail == "") {
-      push("obj", eff_ind, path_join(parent, head))
+      p = path_join(parent, head)
+      declare_path(p)
+      push("obj", eff_ind, p)
       return
     }
     if (tail == " []") {
-      arr_declared[path_join(parent, head)] = 0
+      p = path_join(parent, head)
+      declare_path(p)
+      arr_declared[p] = 0
       return
     }
     if (substr(tail, 1, 1) != " ")
@@ -355,7 +367,9 @@ function classify(eff_ind, s, parent,   p, head, tail, v, i, n, fparts, fname, s
       seenf[fname] = 1
     }
     note_root(parent, HKEY)
-    push("tab", eff_ind, path_join(parent, HKEY))
+    p = path_join(parent, HKEY)
+    declare_path(p)
+    push("tab", eff_ind, p)
     ctx_expect[depth] = HCOUNT
     ctx_nfields[depth] = n
     for (i = 1; i <= n; i++) ctx_field[depth SUBSEP i] = fparts[i]
@@ -366,7 +380,9 @@ function classify(eff_ind, s, parent,   p, head, tail, v, i, n, fparts, fname, s
   if (parse_count_head(head)) {
     if (tail != "") err("line " lineno ": trailing text after a list header: [" s "]")
     note_root(parent, HKEY)
-    push("lst", eff_ind, path_join(parent, HKEY))
+    p = path_join(parent, HKEY)
+    declare_path(p)
+    push("lst", eff_ind, p)
     ctx_expect[depth] = HCOUNT
     arr_declared[ctx_path[depth]] = HCOUNT
     return

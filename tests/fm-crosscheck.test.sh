@@ -46,6 +46,7 @@ make_case() {
   git -C "$repo" add app.txt
   git -C "$repo" commit -qm feature
   head=$(git -C "$repo" rev-parse HEAD)
+  git -C "$repo" update-ref refs/pull/72/head "$head"
   fm_write_meta "$case_dir/state/task-x1.meta" \
     "window=fm-task-x1" \
     "worktree=$repo" \
@@ -156,6 +157,9 @@ install_claude_fake() {
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_CLAUDE_LOG"
 [ "${CLAUDE_CONFIG_DIR:-}" = "$FM_TEST_REVIEWER_HOME" ] || exit 80
+mkdir -p "$CLAUDE_CONFIG_DIR/session-env" || exit 77
+printf 'reviewer runtime state\n' > "$CLAUDE_CONFIG_DIR/session-env/crosscheck-runtime" \
+  || exit 78
 [ "${1:-}" = -p ] || exit 81
 shift
 model=
@@ -215,6 +219,7 @@ grep -qxF '(allow file-read*)' "$profile" || exit 73
 case "${3:-}" in
   */claude)
     grep -qxF '(allow network*)' "$profile" || exit 74
+    grep -qF "(subpath \"$CLAUDE_CONFIG_DIR\")" "$profile" || exit 77
     ;;
   *)
     ! grep -qxF '(allow network*)' "$profile" || exit 76
@@ -420,14 +425,15 @@ PY
 run_case() {
   local case_dir=$1 base=$2 head=$3 scenario=$4 command=${5:-run}
   shift 5 || true
-  FM_ROOT_OVERRIDE="$ROOT" \
-  FM_HOME="$case_dir/home" \
-  FM_STATE_OVERRIDE="$case_dir/state" \
-  FM_DATA_OVERRIDE="$case_dir/data" \
+  FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE-$ROOT}" \
+  FM_HOME="${FM_TEST_HOME-$case_dir/home}" \
+  FM_STATE_OVERRIDE="${FM_TEST_STATE_OVERRIDE-$case_dir/state}" \
+  FM_DATA_OVERRIDE="${FM_TEST_DATA_OVERRIDE-$case_dir/data}" \
   FM_GH_AXI_BIN="$case_dir/fakebin/gh-axi" \
   FM_CROSSCHECK_CODEX_BIN="$case_dir/fakebin/codex" \
   FM_CROSSCHECK_CLAUDE_BIN="$case_dir/fakebin/claude" \
   FM_CROSSCHECK_SANDBOX_BIN="$case_dir/fakebin/sandbox-exec" \
+  FM_CROSSCHECK_FETCH_REMOTE="${FM_TEST_FETCH_REMOTE-$case_dir/repo}" \
   FM_CROSSCHECK_REVIEWER_CONFIG="$case_dir/reviewer.json" \
   FM_TEST_GH_LOG="$case_dir/gh.log" \
   FM_TEST_CODEX_LOG="$case_dir/codex.log" \
@@ -505,6 +511,128 @@ test_clear_review_uses_policy_contract() {
   pass "clear review uses the observed policy-grade Codex invocation"
 }
 
+test_empty_runtime_overrides_use_home_defaults() {
+  local record case_dir base head output
+  record=$(make_case empty-runtime-overrides)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  mkdir -p "$case_dir/home/state" "$case_dir/home/data"
+  mv "$case_dir/state/task-x1.meta" "$case_dir/home/state/task-x1.meta"
+  output=$(
+    cd "$case_dir" || exit 1
+    FM_TEST_ROOT_OVERRIDE='' FM_TEST_STATE_OVERRIDE='' FM_TEST_DATA_OVERRIDE='' \
+      run_case "$case_dir" "$base" "$head" clear run
+  ) || fail "empty runtime overrides did not fall back to the home defaults"
+  assert_contains "$output" 'crosscheck clear' \
+    "empty runtime overrides did not reach the task metadata under FM_HOME"
+  assert_present "$case_dir/home/data/task-x1/crosscheck-ledger.json" \
+    "empty FM_DATA_OVERRIDE did not resolve to FM_HOME/data"
+  assert_absent "$case_dir/task-x1.meta" \
+    "empty FM_STATE_OVERRIDE was treated as the current working directory"
+  pass "empty root, state, and data overrides fall back instead of collapsing to the working directory"
+}
+
+test_set_runtime_overrides_remain_authoritative() {
+  local record case_dir base head explicit_state explicit_data output
+  record=$(make_case set-runtime-overrides)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  explicit_state="$case_dir/explicit-state"
+  explicit_data="$case_dir/explicit-data"
+  mkdir -p "$explicit_state" "$explicit_data"
+  mv "$case_dir/state/task-x1.meta" "$explicit_state/task-x1.meta"
+  output=$(FM_TEST_STATE_OVERRIDE="$explicit_state" FM_TEST_DATA_OVERRIDE="$explicit_data" \
+    run_case "$case_dir" "$base" "$head" clear run) \
+    || fail "nonempty runtime overrides were not honoured"
+  assert_contains "$output" 'crosscheck clear' \
+    "nonempty FM_STATE_OVERRIDE did not select the explicit task metadata"
+  assert_present "$explicit_data/task-x1/crosscheck-ledger.json" \
+    "nonempty FM_DATA_OVERRIDE did not select the explicit data directory"
+  assert_absent "$case_dir/home/data/task-x1/crosscheck-ledger.json" \
+    "the explicit data override was silently ignored"
+  pass "nonempty state and data overrides remain authoritative"
+}
+
+test_bad_state_override_is_a_named_tool_failure() {
+  local record case_dir base head bad_state rc
+  record=$(make_case bad-state-override)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  bad_state="$case_dir/incorrect-state"
+  set +e
+  FM_TEST_STATE_OVERRIDE="$bad_state" \
+    run_case "$case_dir" "$base" "$head" clear run \
+      > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "incorrect explicit state override"
+  assert_grep "CROSSCHECK TOOL-FAILURE: task metadata inspection failed at $bad_state/task-x1.meta:" \
+    "$case_dir/err" \
+    "state-path failure did not name the inspected metadata path: $(tr '\n' ' ' < "$case_dir/err")"
+  assert_no_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
+    "a pre-review environment failure was mislabeled as a review outcome"
+  assert_absent "$case_dir/codex.log" \
+    "reviewer launched after task metadata preflight failed"
+  pass "an incorrect state override is a path-specific tool failure, not an unreviewed verdict"
+}
+
+test_review_fetches_exact_pr_head_when_author_worktree_is_behind() {
+  local record case_dir base author_head pr_head output
+  record=$(make_case behind-author-worktree)
+  IFS=$'\t' read -r case_dir base author_head <<< "$record"
+  pr_head=$(printf 'pipeline fix\n' | git -C "$case_dir/repo" commit-tree \
+    "$(git -C "$case_dir/repo" rev-parse 'HEAD^{tree}')" -p "$author_head") \
+    || fail "could not construct the pipeline-fix head fixture"
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$pr_head"
+  [ "$(git -C "$case_dir/repo" rev-parse HEAD)" = "$author_head" ] \
+    || fail "pipeline-fix fixture moved the author worktree"
+  output=$(run_case "$case_dir" "$base" "$pr_head" clear run) \
+    || fail "exact PR-head review rejected a legitimately behind author worktree"
+  assert_contains "$output" "crosscheck clear: $PR_URL at $pr_head" \
+    "clear output did not name the fetched PR head"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+run = value["runs"][-1]
+assert run["head_sha"] == sys.argv[2]
+assert run["state"] == "clear"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" "$pr_head" \
+    || fail "the durable verdict was not bound to the fetched PR head"
+  assert_grep "exact head $pr_head" "$case_dir/prompt.log" \
+    "reviewer prompt did not name the fetched exact head"
+  pass "a pipeline-updated PR is reviewed at its exact remote head while the author worktree remains behind"
+}
+
+test_missing_pr_head_ref_fails_closed() {
+  local record case_dir base head rc
+  record=$(make_case missing-pr-head-ref)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  git -C "$case_dir/repo" update-ref -d refs/pull/72/head
+  set +e
+  run_case "$case_dir" "$base" "$head" clear run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "missing remote PR head ref"
+  assert_grep 'CROSSCHECK TOOL-FAILURE: review checkout preflight failed: PR head fetch failed:' \
+    "$case_dir/err" \
+    "unresolvable PR head did not fail as a named checkout tool fault: $(tr '\n' ' ' < "$case_dir/err")"
+  assert_grep 'refs/pull/72/head' "$case_dir/err" \
+    "PR-head failure did not name the exact remote ref inspected"
+  assert_no_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
+    "unresolvable PR head collapsed into a review verdict"
+  assert_no_grep 'CROSSCHECK BLOCKING' "$case_dir/err" \
+    "unresolvable PR head collapsed into a blocking verdict"
+  assert_absent "$case_dir/codex.log" \
+    "reviewer launched without resolving the exact PR head"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+run = value["runs"][-1]
+assert run["state"] == "tool-failure"
+assert run["head_sha"] == sys.argv[2]
+' "$case_dir/data/task-x1/crosscheck-ledger.json" "$head" \
+    || fail "the exact-head fetch failure was not durably classified as a tool failure"
+  pass "an absent remote PR head ref fails closed before review"
+}
+
 test_claude_reviewer_provides_model_separation_for_codex_author() {
   local record case_dir base head output
   record=$(make_case claude-reviewer)
@@ -515,8 +643,84 @@ test_claude_reviewer_provides_model_separation_for_codex_author() {
   assert_contains "$output" 'crosscheck clear' "Claude reviewer did not earn a clear result"
   assert_grep '--model claude-opus-5 --effort xhigh --dangerously-skip-permissions --tools Bash,Read,Write,Edit,Glob,Grep' "$case_dir/claude.log" \
     "Claude reviewer was not pinned to the observed policy-grade invocation"
+  assert_present "$case_dir/reviewer-home/session-env/crosscheck-runtime" \
+    "Claude reviewer could not write its runtime session state"
   assert_absent "$case_dir/codex.log" "Codex reviewer launched without model separation"
-  pass "Claude Opus xhigh provides a verified alternate for a gpt-5.6-sol author"
+  pass "Claude Opus xhigh completes a sandboxed review while persisting runtime state"
+}
+
+test_unrouted_author_uses_cross_provider_independence() {
+  local record case_dir base head output
+  record=$(make_case unrouted-cross-provider)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  sed -i.bak '/^account_home=/d' "$case_dir/state/task-x1.meta"
+  rm "$case_dir/state/task-x1.meta.bak"
+  printf 'account_routing_emergency_bypass=1\n' >> "$case_dir/state/task-x1.meta"
+  cat > "$case_dir/reviewer.json" <<EOF
+{"reviewers":[{"harness":"claude","model":"claude-opus-5","effort":"xhigh","account_home":"$case_dir/reviewer-home"}]}
+EOF
+  output=$(run_case "$case_dir" "$base" "$head" clear run) \
+    || fail "cross-provider reviewer did not establish independence for an unrouted author"
+  assert_contains "$output" 'crosscheck clear' \
+    "structurally unrouted task did not earn a cross-provider clear result"
+  assert_grep '--model claude-opus-5' "$case_dir/claude.log" \
+    "the independent provider reviewer was not launched"
+  assert_absent "$case_dir/codex.log" \
+    "same-provider reviewer launched for an author with no account identity"
+  pass "a structurally unrouted author can prove both model and account independence across providers"
+}
+
+test_unrouted_author_without_account_proof_fails_closed() {
+  local record case_dir base head rc ledger
+  record=$(make_case unrouted-same-provider)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  sed -i.bak '/^account_home=/d' "$case_dir/state/task-x1.meta"
+  rm "$case_dir/state/task-x1.meta.bak"
+  printf 'account_routing_emergency_bypass=1\n' >> "$case_dir/state/task-x1.meta"
+  set +e
+  run_case "$case_dir" "$base" "$head" clear run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "same-provider reviewer for an unrouted author"
+  assert_grep 'CROSSCHECK TOOL-FAILURE: reviewer preflight failed: independence inspection found no configured reviewer' \
+    "$case_dir/err" \
+    "unprovable account independence did not fail as a reviewer preflight fault: $(tr '\n' ' ' < "$case_dir/err")"
+  assert_grep 'same-provider account separation cannot be proved without account_home' \
+    "$case_dir/err" "failure did not name the unavailable author-account proof"
+  assert_no_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
+    "unprovable pre-review identity was mislabeled as a review outcome"
+  assert_absent "$case_dir/codex.log" \
+    "same-provider reviewer launched without author-account proof"
+  ledger="$case_dir/data/task-x1/crosscheck-ledger.json"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["runs"][-1]["state"] == "tool-failure"
+assert value["runs"][-1]["reviewer"] is None
+' "$ledger" || fail "unprovable independence was not recorded as a tool failure"
+  pass "an unrouted same-provider lane fails closed when account independence cannot be established"
+}
+
+test_missing_author_identity_is_a_named_tool_failure() {
+  local record case_dir base head rc
+  record=$(make_case missing-author-identity)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  sed -i.bak '/^account_home=/d' "$case_dir/state/task-x1.meta"
+  rm "$case_dir/state/task-x1.meta.bak"
+  set +e
+  run_case "$case_dir" "$base" "$head" clear run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "task metadata with no author identity structure"
+  assert_grep 'author identity inspection found neither account_home nor account_routing_emergency_bypass=1' \
+    "$case_dir/err" "metadata failure did not name both inspected identity fields"
+  assert_grep 'CROSSCHECK TOOL-FAILURE:' "$case_dir/err" \
+    "metadata preflight failure did not use the tool-failure outcome: $(tr '\n' ' ' < "$case_dir/err")"
+  assert_no_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
+    "metadata preflight failure was mislabeled as a review outcome"
+  pass "missing author identity structure is a named metadata tool failure"
 }
 
 test_new_finding_requires_executed_reproduction() {
@@ -528,6 +732,12 @@ test_new_finding_requires_executed_reproduction() {
   rc=$?
   set -e
   expect_code 1 "$rc" "reproduced finding"
+  assert_grep 'CROSSCHECK BLOCKING:' "$case_dir/err" \
+    "a completed review with reproduced code evidence was not classified as blocking"
+  assert_no_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
+    "a blocking code verdict collapsed into a non-verdict outcome"
+  assert_no_grep 'CROSSCHECK TOOL-FAILURE' "$case_dir/err" \
+    "a blocking code verdict collapsed into a tool failure"
   ledger="$case_dir/data/task-x1/crosscheck-ledger.json"
   python3 -c '
 import json, sys
@@ -1130,6 +1340,10 @@ JSON
   rc=$?
   set -e
   expect_code 1 "$rc" "null findings ledger"
+  assert_grep 'CROSSCHECK TOOL-FAILURE: finding-ledger preflight failed at' \
+    "$case_dir/err" "malformed ledger did not report a tool failure"
+  assert_no_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
+    "malformed ledger was mislabeled as a review outcome"
   assert_grep 'ledger.findings must be an array' "$case_dir/err" \
     "null ledger was not rejected explicitly"
   grep -q '"findings":null' "$case_dir/data/task-x1/crosscheck-ledger.json" \
@@ -1148,15 +1362,19 @@ test_claims_lookup_error_never_reaches_reviewer() {
   rc=$?
   set -e
   expect_code 1 "$rc" "claims lookup failure"
+  assert_grep 'CROSSCHECK TOOL-FAILURE: GitHub snapshot preflight failed:' \
+    "$case_dir/err" "GitHub lookup failure did not report a tool failure"
+  assert_no_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
+    "GitHub lookup failure was mislabeled as a review outcome"
   assert_grep 'GitHub lookup failed closed' "$case_dir/err" \
     "claims error was swallowed"
   assert_absent "$case_dir/codex.log" "reviewer ran without PR claims"
   assert_absent "$case_dir/data/task-x1/crosscheck-ledger.json" \
     "claims lookup error fabricated a ledger verdict"
-  pass "PR claims lookup errors are unreviewed and never become a clean run"
+  pass "PR claims lookup errors are tool failures and never become a review run"
 }
 
-test_reviewer_unavailability_and_separation_fail_closed() {
+test_reviewer_configuration_failures_are_tool_failures() {
   local mode record case_dir base head rc
   for mode in absent same-model same-account; do
     record=$(make_case "reviewer-$mode")
@@ -1178,16 +1396,20 @@ test_reviewer_unavailability_and_separation_fail_closed() {
     rc=$?
     set -e
     expect_code 1 "$rc" "$mode reviewer"
-    assert_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
-      "$mode reviewer did not block loudly"
+    assert_grep 'CROSSCHECK TOOL-FAILURE: reviewer preflight failed:' "$case_dir/err" \
+      "$mode reviewer configuration did not fail as a named tool preflight"
+    assert_no_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
+      "$mode reviewer configuration collapsed into a review verdict"
+    assert_no_grep 'CROSSCHECK BLOCKING' "$case_dir/err" \
+      "$mode reviewer configuration collapsed into a blocking verdict"
     assert_absent "$case_dir/codex.log" "$mode reviewer still launched"
   done
-  pass "absent reviewer, same model, and same account all fail closed"
+  pass "absent reviewer, same model, and same account are tool failures that fail closed"
 }
 
 test_stopped_reviewer_and_wrong_head_are_unreviewed() {
   local scenario record case_dir base head rc
-  for scenario in stopped wrong-head suspicion; do
+  for scenario in stopped wrong-head; do
     record=$(make_case "$scenario")
     IFS=$'\t' read -r case_dir base head <<< "$record"
     set +e
@@ -1195,6 +1417,12 @@ test_stopped_reviewer_and_wrong_head_are_unreviewed() {
     rc=$?
     set -e
     expect_code 1 "$rc" "$scenario reviewer"
+    assert_grep 'CROSSCHECK UNREVIEWED:' "$case_dir/err" \
+      "$scenario reviewer did not report that no valid exact-head review exists"
+    assert_no_grep 'CROSSCHECK TOOL-FAILURE' "$case_dir/err" \
+      "$scenario reviewer collapsed into a different outcome class"
+    assert_no_grep 'CROSSCHECK BLOCKING' "$case_dir/err" \
+      "$scenario reviewer collapsed into a blocking outcome"
     python3 -c '
 import json, sys
 value = json.load(open(sys.argv[1]))
@@ -1202,7 +1430,34 @@ assert value["runs"][-1]["state"] == "unreviewed"
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" \
       || fail "$scenario reviewer created a trusted verdict"
   done
-  pass "stopped, wrong-head, and incomplete reviewers are all unreviewed"
+  pass "stopped and wrong-head reviewer artifacts remain unreviewed"
+}
+
+test_completed_reviewer_suspicion_is_blocking() {
+  local record case_dir base head rc
+  record=$(make_case completed-suspicion)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  set +e
+  run_case "$case_dir" "$base" "$head" suspicion run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "completed reviewer suspicion"
+  assert_grep 'CROSSCHECK BLOCKING:' "$case_dir/err" \
+    "a completed reviewer decline was not classified as blocking: $(tr '\n' ' ' < "$case_dir/err")"
+  assert_no_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
+    "a completed reviewer decline collapsed into a non-verdict outcome"
+  assert_no_grep 'CROSSCHECK TOOL-FAILURE' "$case_dir/err" \
+    "a completed reviewer decline collapsed into a tool failure"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+run = value["runs"][-1]
+assert run["state"] == "blocking"
+assert run["suspicions"][0]["description"] == "The reviewer could not finish a reproduction."
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "completed reviewer suspicion was not durably recorded as blocking"
+  pass "a completed review that declines clearance is blocking code evidence"
 }
 
 test_verify_rechecks_live_head_and_claims() {
@@ -1242,6 +1497,18 @@ test_verify_rechecks_live_head_and_claims() {
 
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
+    test_empty_runtime_overrides_use_home_defaults|\
+    test_set_runtime_overrides_remain_authoritative|\
+    test_bad_state_override_is_a_named_tool_failure|\
+    test_review_fetches_exact_pr_head_when_author_worktree_is_behind|\
+    test_missing_pr_head_ref_fails_closed|\
+    test_claude_reviewer_provides_model_separation_for_codex_author|\
+    test_unrouted_author_uses_cross_provider_independence|\
+    test_unrouted_author_without_account_proof_fails_closed|\
+    test_missing_author_identity_is_a_named_tool_failure|\
+    test_completed_reviewer_suspicion_is_blocking|\
+    test_new_finding_requires_executed_reproduction|\
+    test_silence_never_closes_prior_finding|\
     test_baseline_readable_state_is_destroyed_before_mutation|\
     test_mutation_is_bound_to_cited_non_test_implementation|\
     test_reviewer_output_uses_separate_capture_limit|\
@@ -1272,7 +1539,15 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
 fi
 
 test_clear_review_uses_policy_contract
+test_empty_runtime_overrides_use_home_defaults
+test_set_runtime_overrides_remain_authoritative
+test_bad_state_override_is_a_named_tool_failure
+test_review_fetches_exact_pr_head_when_author_worktree_is_behind
+test_missing_pr_head_ref_fails_closed
 test_claude_reviewer_provides_model_separation_for_codex_author
+test_unrouted_author_uses_cross_provider_independence
+test_unrouted_author_without_account_proof_fails_closed
+test_missing_author_identity_is_a_named_tool_failure
 test_new_finding_requires_executed_reproduction
 test_silence_never_closes_prior_finding
 test_verified_fix_executes_mutation_proof
@@ -1295,6 +1570,7 @@ test_mutation_proof_does_not_float_to_a_new_head
 test_equivalent_finding_reopens_when_direct_proof_regresses
 test_null_ledger_fails_without_normalization
 test_claims_lookup_error_never_reaches_reviewer
-test_reviewer_unavailability_and_separation_fail_closed
+test_reviewer_configuration_failures_are_tool_failures
 test_stopped_reviewer_and_wrong_head_are_unreviewed
+test_completed_reviewer_suspicion_is_blocking
 test_verify_rechecks_live_head_and_claims

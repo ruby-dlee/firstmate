@@ -237,10 +237,15 @@ test_missing_or_malformed_ledger_blocks_merge() {
     expect_code 1 "$rc" "$mode ledger"
     assert_no_grep 'api PUT' "$case_dir/gh-axi.log" \
       "$mode ledger reached the merge API"
-    assert_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
-      "$mode ledger did not block loudly"
+    if [ "$mode" = missing ]; then
+      assert_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
+        "missing ledger did not report that no review exists"
+    else
+      assert_grep 'CROSSCHECK TOOL-FAILURE' "$case_dir/err" \
+        "malformed ledger did not report a tool failure"
+    fi
   done
-  pass "missing and malformed findings ledgers are unreviewed"
+  pass "missing findings ledgers are unreviewed while malformed ledgers are tool failures"
 }
 
 test_changed_head_blocks_before_merge() {

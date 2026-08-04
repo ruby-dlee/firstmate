@@ -106,7 +106,8 @@ It is gitignored and is not inferred from the author account or ambient Codex co
 The current schema has one nonempty `reviewers` array, whose entries require exactly `harness`, `model`, `effort`, and `account_home`.
 The accepted policy profiles are Codex `gpt-5.6-sol` at `xhigh` effort and Claude `claude-opus-5` at `xhigh` effort.
 Every `account_home` must be an existing absolute directory.
-Crosscheck selects the first entry whose account and model both differ from the author identity recorded in task metadata.
+Crosscheck selects the first entry whose account and model both differ from the routed author identity recorded in task metadata.
+For an author task marked `account_routing_emergency_bypass=1`, a different supported provider proves both account namespace and model separation, while a same-provider reviewer fails closed without `account_home` proof.
 An absent or invalid file is an unavailable reviewer and therefore blocks crosscheck and merge.
 See [`crosscheck.md`](crosscheck.md) for the example file, reviewer capture control, evidence rules, and operator flow.
 
@@ -520,6 +521,7 @@ FM_HOME=                 # optional operational home for most scripts, unset mea
 FM_ROOT_OVERRIDE=        # override firstmate repo root, tangle-guard target, and zellij/cmux home-title hash; also legacy whole-root override when FM_HOME is unset
 FM_STATE_OVERRIDE=       # alternate state dir, mainly for tests
 FM_DATA_OVERRIDE=        # alternate data dir, mainly for tests
+FM_CROSSCHECK_FETCH_REMOTE=  # alternate Git remote for exact refs/pull/<number>/head resolution; unset derives the base GitHub repository
 FM_PROJECTS_OVERRIDE=    # alternate projects dir, mainly for tests
 FM_CONFIG_OVERRIDE=      # alternate config dir, mainly for tests
 FM_BACKEND=             # optional runtime backend override; tmux/herdr/zellij/cmux support new ship/scout spawns, Orca is legacy-recovery-only, and codex-app is not accepted

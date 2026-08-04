@@ -33,11 +33,14 @@ The file is local and gitignored at `config/crosscheck-reviewer.json`.
 }
 ```
 
-Crosscheck validates every configured entry and selects the first whose account home and model both differ from the author identity recorded in task metadata.
+Crosscheck validates every configured entry and selects the first whose account home and model both differ from the routed author identity recorded in task metadata.
+For a task explicitly marked `account_routing_emergency_bypass=1`, a reviewer on the other supported provider establishes both account-namespace and model separation without inventing an `account_home` for the author.
+A same-provider reviewer still fails closed for that structurally unrouted task because account independence cannot be proved.
 The accepted profiles are Codex `gpt-5.6-sol` xhigh and Claude `claude-opus-5` xhigh.
-Absent configuration, unavailable credentials, missing model separation, and missing account separation all produce `CROSSCHECK UNREVIEWED` and a nonzero exit.
+Absent configuration, unavailable credentials, missing model separation, and unprovable account separation all produce `CROSSCHECK TOOL-FAILURE` and a nonzero exit before reviewer launch.
 
 Start crosscheck as soon as a PR URL exists so it can overlap no-mistakes' remaining CI work.
+The reviewer is a real policy-grade agent invocation and normally takes minutes, so Crosscheck is not a fast local check.
 
 ```sh
 bin/fm-crosscheck.sh run <task-id> <https://github.com/owner/repo/pull/number>
@@ -45,6 +48,8 @@ bin/fm-crosscheck.sh run <task-id> <https://github.com/owner/repo/pull/number>
 
 The run writes `data/<task-id>/crosscheck-ledger.json` and the readable `data/<task-id>/crosscheck.md` report.
 The run exits zero only when the exact head has a complete review, the durable ledger has no active blocker, and the reviewer returned no unreproduced suspicion.
+It fetches `refs/pull/<number>/head` from the base repository into a disposable Git checkout and requires that ref to resolve to the exact live API head SHA before reviewer launch.
+The authoring worktree is not cloned, checked for cleanliness, or required to match the PR head because no verdict about the remote PR may depend on mutable author-lane filesystem state.
 
 `bin/fm-pr-merge.sh` calls the verification form automatically after approval.
 Do not call the verification form as a substitute for running a reviewer.
@@ -76,6 +81,16 @@ A later review that omits a finding leaves its lifecycle unchanged.
 Silence never closes, supersedes, or deletes a finding.
 A `verified-fixed` lifecycle remains durable, but its proof clears only the exact head on which the gate executed it; a new head requires a fresh mutation proof.
 
+Each run has one outcome class.
+
+- `tool-failure` means environment, task metadata, reviewer configuration, or exact-head fetch preflight prevented a review from running.
+- `unreviewed` means a reviewer ran but no valid exact-head verdict artifact exists.
+- `blocking` means a completed reviewer declined clearance through a suspicion or admitted finding.
+- `clear` means a completed reviewer earned clearance and no durable blocker remains.
+
+CLI banners preserve the same distinction as `CROSSCHECK TOOL-FAILURE`, `CROSSCHECK UNREVIEWED`, and `CROSSCHECK BLOCKING`.
+Only `blocking` is a review verdict about code.
+
 New findings must supply a helper under `.crosscheck/reproductions/`, a command naming that helper, an expected exit code, and a distinctive output marker.
 Crosscheck executes the command itself and stores its actual exit and bounded output in the ledger.
 
@@ -91,15 +106,18 @@ It cannot modify the named test, conventional test trees, fixtures, or Crosschec
 
 ## Refusal and liveness
 
-The reviewer is a synchronous Codex or Claude invocation with a bounded timeout and a JSON output schema.
+The reviewer is a synchronous Codex or Claude agent invocation with a bounded timeout and a JSON output schema.
+Normal runs take minutes and callers should budget them as remote agent work rather than a cheap local preflight.
 PR claims are delimited as untrusted data, and the reviewer is directed to ignore embedded instructions and use focused evidence rather than duplicate no-mistakes' broad suite.
 Later reviewers receive only a bounded projection of finding IDs, lifecycle state, severity, exact-head clearance, and proof digests.
 Finding prose, reproduction output, test output, and lifecycle notes remain durable in the ledger but are never reinjected into a later reviewer prompt.
 The Codex path pins `gpt-5.6-sol`, xhigh reasoning, noninteractive approval, an independent `CODEX_HOME`, and the exact review checkout.
 The Claude path pins `claude-opus-5`, xhigh effort, the installed unattended `--dangerously-skip-permissions` mode, a bounded tool list, no session persistence, an independent `CLAUDE_CONFIG_DIR`, and structured JSON output.
-Because that Claude mode disables its own permission prompts, Crosscheck places the process under the installed macOS `sandbox-exec` contract: reads, process execution, and provider network access remain available, while writes are limited to the disposable review checkout and `/dev/null`.
-An unavailable sandbox blocks the reviewer rather than launching it with ambient write authority.
-A nonzero exit, timeout, missing artifact, empty artifact, malformed artifact, wrong-head artifact, or unresolved suspicion records an `unreviewed` attempt and exits nonzero.
+Because that Claude mode disables its own permission prompts, Crosscheck places the process under the installed macOS `sandbox-exec` contract: reads, process execution, and provider network access remain available, while writes are limited to the disposable review checkout, the selected reviewer's resolved `account_home`, and `/dev/null`.
+Claude needs that narrow account-home allowance for its own runtime state, including `session-env`; it does not grant write access to the author worktree or the wider filesystem.
+An unavailable reviewer binary, sandbox, author-identity proof, or exact remote PR head records a `tool-failure` attempt when the live head is already known, and otherwise emits the same tool-failure class without fabricating a ledger run.
+A nonzero reviewer exit, timeout, missing artifact, empty artifact, malformed artifact, or wrong-head artifact records an `unreviewed` attempt and exits nonzero.
+An unresolved suspicion comes from a completed reviewer and records a `blocking` attempt instead of being conflated with an invalid review artifact.
 This includes provider refusals that surface only as a stopped or silent agent.
 Reviewer stdout plus stderr use a separate 16 MiB capture ceiling because a full agent transcript routinely exceeds the ordinary command budget.
 `FM_CROSSCHECK_REVIEWER_MAX_CAPTURE_BYTES` can override that ceiling between 200,000 bytes and 64 MiB, and an invalid value fails closed before reviewer launch.

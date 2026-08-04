@@ -70,6 +70,14 @@ class CrosscheckError(RuntimeError):
     """Raised whenever the gate cannot establish a trustworthy verdict."""
 
 
+class CrosscheckToolError(CrosscheckError):
+    """Raised when environment, metadata, or tooling prevents review."""
+
+
+class CrosscheckBlockingError(CrosscheckError):
+    """Raised when completed review evidence blocks the exact head."""
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace(
         "+00:00", "Z"
@@ -78,6 +86,21 @@ def utc_now() -> str:
 
 def fail(message: str) -> NoReturn:
     raise CrosscheckError(message)
+
+
+def tool_fail(message: str) -> NoReturn:
+    raise CrosscheckToolError(message)
+
+
+def blocking_fail(message: str) -> NoReturn:
+    raise CrosscheckBlockingError(message)
+
+
+def environment_value(name: str, default: str) -> str:
+    """Return the default when an environment variable is absent or empty."""
+
+    value = os.environ.get(name)
+    return default if value is None or value == "" else value
 
 
 def require(condition: bool, message: str) -> None:
@@ -169,6 +192,7 @@ def write_sandbox_profile(
     *,
     allow_network: bool,
     allow_posix_ipc: bool = True,
+    additional_writable_roots: tuple[Path, ...] = (),
 ) -> None:
     rules = [
         "(version 1)",
@@ -181,15 +205,13 @@ def write_sandbox_profile(
     rules.extend(["(allow sysctl-read)", "(allow mach-lookup)"])
     if allow_posix_ipc:
         rules.append("(allow ipc-posix*)")
-    rules.extend(
-        [
-            "(allow file-ioctl)",
-            "(allow file-write*",
-            f"  (subpath {json.dumps(str(writable_root.resolve()))})",
-            '  (literal "/dev/null"))',
-            "",
-        ]
+    rules.extend(["(allow file-ioctl)", "(allow file-write*"])
+    writable_paths = dict.fromkeys(
+        [writable_root.resolve(), *(root.resolve() for root in additional_writable_roots)]
     )
+    for writable_path in writable_paths:
+        rules.append(f"  (subpath {json.dumps(str(writable_path))})")
+    rules.extend(['  (literal "/dev/null"))', ""])
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(rules), encoding="utf-8")
 
@@ -201,6 +223,7 @@ def run_sandboxed(
     profile_path: Path,
     allow_network: bool,
     allow_posix_ipc: bool = True,
+    additional_writable_roots: tuple[Path, ...] = (),
     env: dict[str, str] | None = None,
     timeout: float = 60,
     input_text: str | None = None,
@@ -212,6 +235,7 @@ def run_sandboxed(
         cwd,
         allow_network=allow_network,
         allow_posix_ipc=allow_posix_ipc,
+        additional_writable_roots=additional_writable_roots,
     )
     environment = (env or os.environ).copy()
     private_tmp = cwd / ".crosscheck" / "tmp"
@@ -229,7 +253,16 @@ def run_sandboxed(
             "PYTHONPYCACHEPREFIX": str(python_cache),
         }
     )
-    sandbox = os.environ.get("FM_CROSSCHECK_SANDBOX_BIN", "sandbox-exec")
+    sandbox = environment_value("FM_CROSSCHECK_SANDBOX_BIN", "sandbox-exec")
+    if "/" in sandbox:
+        sandbox_available = Path(sandbox).is_file() and os.access(sandbox, os.X_OK)
+    else:
+        sandbox_available = shutil.which(sandbox) is not None
+    if not sandbox_available:
+        tool_fail(
+            "sandbox executable inspection found no runnable "
+            f"FM_CROSSCHECK_SANDBOX_BIN={sandbox!r}"
+        )
     return run_command(
         [sandbox, "-f", str(profile_path), *arguments],
         cwd=cwd,
@@ -256,17 +289,47 @@ def parse_meta(path: Path) -> dict[str, str]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as exc:
-        fail(f"task metadata is unavailable at {path}: {exc}")
+        fail(f"task metadata inspection failed at {path}: {exc}")
     result: dict[str, str] = {}
     for line_number, line in enumerate(lines, start=1):
         if not line or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        if key in {"worktree", "harness", "model", "account_home"}:
-            require(key not in result, f"task metadata duplicates {key} at line {line_number}")
+        if key in {
+            "harness",
+            "model",
+            "account_home",
+            "account_routing_emergency_bypass",
+        }:
+            require(
+                key not in result,
+                f"task metadata at {path} duplicates {key} at line {line_number}",
+            )
             result[key] = value
-    for key in ("worktree", "harness", "model", "account_home"):
-        require(result.get(key, "") != "", f"task metadata is missing {key}")
+    for key in ("harness", "model"):
+        require(
+            result.get(key, "") != "",
+            f"task metadata at {path} is missing {key}",
+        )
+    if "account_home" in result:
+        require(
+            result["account_home"] != "",
+            f"task metadata at {path} has an empty account_home",
+        )
+    if "account_routing_emergency_bypass" in result:
+        require(
+            result["account_routing_emergency_bypass"] == "1",
+            f"task metadata at {path} has an invalid "
+            "account_routing_emergency_bypass marker",
+        )
+    require(
+        not (
+            "account_home" in result
+            and "account_routing_emergency_bypass" in result
+        ),
+        f"task metadata at {path} records both account_home and the "
+        "unrouted-account marker",
+    )
     return result
 
 
@@ -287,14 +350,33 @@ def github_snapshot(root: Path, url: str) -> dict[str, Any]:
     for key in (
         "head_sha",
         "base_sha",
+        "base_ref",
+        "base_repo",
         "claims_document",
         "claims_identity",
+        "number",
+        "owner",
+        "repo",
         "state",
         "url",
     ):
         require(key in value, f"GitHub snapshot is missing {key}")
     require(SHA_RE.fullmatch(str(value["head_sha"])) is not None, "invalid PR head SHA")
     require(SHA_RE.fullmatch(str(value["base_sha"])) is not None, "invalid PR base SHA")
+    require_string(value["base_repo"], "PR base repository")
+    require_string(value["base_ref"], "PR base ref")
+    require_string(value["owner"], "PR owner")
+    require_string(value["repo"], "PR repository")
+    require(
+        value["base_repo"] == f"{value['owner']}/{value['repo']}",
+        "PR base repository does not match the requested GitHub repository",
+    )
+    require(
+        isinstance(value["number"], int)
+        and not isinstance(value["number"], bool)
+        and value["number"] >= 1,
+        "invalid PR number",
+    )
     require_string(value["claims_document"], "PR claims document")
     claims_identity = value["claims_identity"]
     require(isinstance(claims_identity, dict), "PR claims identity must be an object")
@@ -390,25 +472,28 @@ def safe_artifact(review_dir: Path, relative: str, prefix: str) -> Path:
 
 
 def evidence_timeout() -> int:
-    raw = os.environ.get("FM_CROSSCHECK_EVIDENCE_TIMEOUT_SECONDS", "300")
+    raw = environment_value("FM_CROSSCHECK_EVIDENCE_TIMEOUT_SECONDS", "300")
     try:
         value = int(raw)
-    except ValueError as exc:
-        fail("FM_CROSSCHECK_EVIDENCE_TIMEOUT_SECONDS must be an integer")
-    require(1 <= value <= 3600, "FM_CROSSCHECK_EVIDENCE_TIMEOUT_SECONDS must be between 1 and 3600")
+    except ValueError:
+        tool_fail("FM_CROSSCHECK_EVIDENCE_TIMEOUT_SECONDS must be an integer")
+    if not 1 <= value <= 3600:
+        tool_fail(
+            "FM_CROSSCHECK_EVIDENCE_TIMEOUT_SECONDS must be between 1 and 3600"
+        )
     return value
 
 
 def evidence_run_timeout() -> int:
-    raw = os.environ.get("FM_CROSSCHECK_EVIDENCE_RUN_TIMEOUT_SECONDS", "900")
+    raw = environment_value("FM_CROSSCHECK_EVIDENCE_RUN_TIMEOUT_SECONDS", "900")
     try:
         value = int(raw)
-    except ValueError as exc:
-        fail("FM_CROSSCHECK_EVIDENCE_RUN_TIMEOUT_SECONDS must be an integer")
-    require(
-        1 <= value <= 3600,
-        "FM_CROSSCHECK_EVIDENCE_RUN_TIMEOUT_SECONDS must be between 1 and 3600",
-    )
+    except ValueError:
+        tool_fail("FM_CROSSCHECK_EVIDENCE_RUN_TIMEOUT_SECONDS must be an integer")
+    if not 1 <= value <= 3600:
+        tool_fail(
+            "FM_CROSSCHECK_EVIDENCE_RUN_TIMEOUT_SECONDS must be between 1 and 3600"
+        )
     return value
 
 
@@ -836,7 +921,11 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
             "suspicions",
         }
         require_exact_keys(run, run_keys, label)
-        require(run.get("state") in {"clear", "blocking", "unreviewed"}, f"{label}.state is invalid")
+        require(
+            run.get("state")
+            in {"clear", "blocking", "unreviewed", "tool-failure"},
+            f"{label}.state is invalid",
+        )
         require_string(run.get("at"), f"{label}.at")
         head = run.get("head_sha")
         require(isinstance(head, str) and SHA_RE.fullmatch(head) is not None, f"{label}.head_sha is invalid")
@@ -931,7 +1020,7 @@ def load_ledger(path: Path, task_id: str, url: str) -> dict[str, Any]:
 
 def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
     config_path = Path(
-        os.environ.get(
+        environment_value(
             "FM_CROSSCHECK_REVIEWER_CONFIG",
             str(home / "config" / "crosscheck-reviewer.json"),
         )
@@ -953,8 +1042,23 @@ def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
         ("codex", "gpt-5.6-sol", "xhigh"),
         ("claude", "claude-opus-5", "xhigh"),
     }
-    author_home = Path(meta["account_home"])
-    require(author_home.is_absolute(), "author account_home must be absolute")
+    author_home_value = meta.get("account_home")
+    author_is_unrouted = meta.get("account_routing_emergency_bypass") == "1"
+    require(
+        author_home_value is not None or author_is_unrouted,
+        "author identity inspection found neither account_home nor "
+        "account_routing_emergency_bypass=1 in task metadata",
+    )
+    author_home = Path(author_home_value) if author_home_value is not None else None
+    if author_home is not None:
+        require(author_home.is_absolute(), "author account_home must be absolute")
+        author_home = author_home.resolve()
+    else:
+        require(
+            meta["harness"] in {"codex", "claude"},
+            "author identity inspection cannot establish a provider account "
+            f"namespace for unrouted harness={meta['harness']!r}",
+        )
     validated: list[dict[str, str]] = []
     for index, reviewer in enumerate(reviewers):
         label = f"reviewer configuration.reviewers[{index}]"
@@ -985,12 +1089,25 @@ def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
             }
         )
     for reviewer in validated:
-        if (
-            reviewer["model"] != meta["model"]
-            and Path(reviewer["account_home"]) != author_home.resolve()
-        ):
+        model_is_separate = reviewer["model"] != meta["model"]
+        if author_home is not None:
+            account_is_separate = Path(reviewer["account_home"]) != author_home
+        else:
+            account_is_separate = reviewer["harness"] != meta["harness"]
+        if model_is_separate and account_is_separate:
             return reviewer
-    fail("no configured reviewer has both model and account separation from the author")
+    if author_home is not None:
+        fail(
+            "independence inspection found no configured reviewer with both a "
+            "different model and a different account_home from the author "
+            f"(model={meta['model']!r}, account_home={str(author_home)!r})"
+        )
+    fail(
+        "independence inspection found no configured reviewer with both a "
+        "different model and a different provider from the structurally "
+        f"unrouted author (harness={meta['harness']!r}, model={meta['model']!r}); "
+        "same-provider account separation cannot be proved without account_home"
+    )
 
 
 def review_output_schema() -> dict[str, Any]:
@@ -1199,12 +1316,15 @@ Bounded durable-finding lifecycle metadata and proof digests:
 
 
 def reviewer_timeout() -> int:
-    raw = os.environ.get("FM_CROSSCHECK_REVIEWER_TIMEOUT_SECONDS", "1800")
+    raw = environment_value("FM_CROSSCHECK_REVIEWER_TIMEOUT_SECONDS", "1800")
     try:
         value = int(raw)
-    except ValueError as exc:
-        fail("FM_CROSSCHECK_REVIEWER_TIMEOUT_SECONDS must be an integer")
-    require(30 <= value <= 7200, "FM_CROSSCHECK_REVIEWER_TIMEOUT_SECONDS must be between 30 and 7200")
+    except ValueError:
+        tool_fail("FM_CROSSCHECK_REVIEWER_TIMEOUT_SECONDS must be an integer")
+    if not 30 <= value <= 7200:
+        tool_fail(
+            "FM_CROSSCHECK_REVIEWER_TIMEOUT_SECONDS must be between 30 and 7200"
+        )
     return value
 
 
@@ -1225,6 +1345,19 @@ def reviewer_max_capture() -> int:
     return value
 
 
+def reviewer_binary(name: str, default: str, label: str) -> str:
+    command = environment_value(name, default)
+    if "/" in command:
+        available = Path(command).is_file() and os.access(command, os.X_OK)
+    else:
+        available = shutil.which(command) is not None
+    if not available:
+        tool_fail(
+            f"{label} executable inspection found no runnable {name}={command!r}"
+        )
+    return command
+
+
 def run_reviewer(
     review_dir: Path,
     snapshot_value: dict[str, Any],
@@ -1240,7 +1373,7 @@ def run_reviewer(
     environment = os.environ.copy()
     prompt = make_prompt(snapshot_value, ledger)
     if config["harness"] == "codex":
-        codex = os.environ.get("FM_CROSSCHECK_CODEX_BIN", "codex")
+        codex = reviewer_binary("FM_CROSSCHECK_CODEX_BIN", "codex", "Codex reviewer")
         environment["CODEX_HOME"] = config["account_home"]
         arguments = [
             codex,
@@ -1285,7 +1418,9 @@ def run_reviewer(
             maximum_items=4096,
         )
 
-    claude = os.environ.get("FM_CROSSCHECK_CLAUDE_BIN", "claude")
+    claude = reviewer_binary(
+        "FM_CROSSCHECK_CLAUDE_BIN", "claude", "Claude reviewer"
+    )
     environment["CLAUDE_CONFIG_DIR"] = config["account_home"]
     sandbox_path = protocol_dir / "claude-sandbox.sb"
     arguments = [
@@ -1310,6 +1445,7 @@ def run_reviewer(
         cwd=review_dir,
         profile_path=sandbox_path,
         allow_network=True,
+        additional_writable_roots=(Path(config["account_home"]),),
         env=environment,
         timeout=reviewer_timeout(),
         description="Claude reviewer",
@@ -1510,7 +1646,7 @@ def apply_review(
         )
 
     active = active_findings_for_head(working_ledger, snapshot_value["head_sha"])
-    state = "unreviewed" if suspicions else ("blocking" if active else "clear")
+    state = "blocking" if suspicions or active else "clear"
     run = {
         "at": now,
         "head_sha": snapshot_value["head_sha"],
@@ -1529,19 +1665,24 @@ def apply_review(
     return working_ledger, run
 
 
-def append_unreviewed_run(
+def append_failed_run(
     ledger: dict[str, Any],
     snapshot_value: dict[str, Any],
     reason: str,
     config: dict[str, str] | None,
+    state: str,
 ) -> dict[str, Any]:
+    require(
+        state in {"tool-failure", "unreviewed"},
+        "failed run state must be tool-failure or unreviewed",
+    )
     run = {
         "at": utc_now(),
         "head_sha": snapshot_value["head_sha"],
         "base_sha": snapshot_value["base_sha"],
         "claims_sha256": snapshot_value["claims_sha256"],
         "reviewer": config,
-        "state": "unreviewed",
+        "state": state,
         "summary": reason,
         "citations": [],
         "updated_findings": [],
@@ -1549,7 +1690,11 @@ def append_unreviewed_run(
         "active_blockers": active_findings_for_head(
             ledger, snapshot_value["head_sha"]
         ),
-        "suspicions": [{"description": reason, "citations": []}],
+        "suspicions": (
+            [{"description": reason, "citations": []}]
+            if state == "unreviewed"
+            else []
+        ),
     }
     ledger["runs"].append(run)
     return run
@@ -1582,8 +1727,16 @@ def render_report(ledger: dict[str, Any], run: dict[str, Any]) -> str:
         lines.append("Active blockers: " + ", ".join(run["active_blockers"]) + ".")
     else:
         lines.append("No active reproduced blockers remain.")
-    if run["suspicions"]:
-        lines.append("Unresolved suspicions or review failures keep this head unreviewed.")
+    if run["state"] == "tool-failure":
+        lines.append(
+            "Environment, metadata, or tooling prevented a reviewer verdict."
+        )
+    elif run["state"] == "unreviewed":
+        lines.append("No valid review exists for this exact head.")
+        for suspicion in run["suspicions"]:
+            lines.append(f"- {suspicion['description']}")
+    elif run["suspicions"]:
+        lines.append("The completed reviewer declined clearance.")
         for suspicion in run["suspicions"]:
             lines.append(f"- {suspicion['description']}")
     else:
@@ -1599,18 +1752,69 @@ def render_report(ledger: dict[str, Any], run: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def prepare_review_checkout(source: Path, destination: Path, head_sha: str, base_sha: str) -> str:
-    require(source.is_absolute() and source.is_dir(), "task worktree is not an existing absolute directory")
-    require(Path(git(source, "rev-parse", "--show-toplevel")).resolve() == source.resolve(), "task worktree is not an exact Git root")
-    require(git(source, "rev-parse", "HEAD") == head_sha, "local task worktree HEAD does not match the live PR head")
-    require(not git(source, "status", "--porcelain"), "local task worktree is dirty")
-    clone = run_command(
-        ["git", "clone", "--quiet", "--no-hardlinks", str(source), str(destination)],
-        timeout=180,
+def prepare_review_checkout(
+    destination: Path, snapshot_value: dict[str, Any]
+) -> str:
+    head_sha = snapshot_value["head_sha"]
+    base_sha = snapshot_value["base_sha"]
+    pull_ref = f"refs/pull/{snapshot_value['number']}/head"
+    base_ref = f"refs/heads/{snapshot_value['base_ref']}"
+    fetched_ref = "refs/remotes/crosscheck/pr-head"
+    fetched_base_ref = "refs/remotes/crosscheck/base"
+    default_remote = f"https://github.com/{snapshot_value['base_repo']}.git"
+    remote = environment_value("FM_CROSSCHECK_FETCH_REMOTE", default_remote)
+
+    initialized = run_command(
+        ["git", "init", "--quiet", str(destination)],
+        timeout=60,
+        description="review checkout initialization",
     )
-    require(clone.returncode == 0, "could not clone the exact task worktree for review")
-    git(destination, "checkout", "--quiet", "--detach", head_sha)
+    require(
+        initialized.returncode == 0,
+        "review checkout initialization failed at "
+        f"{destination}: {(initialized.stderr or initialized.stdout).strip()[:500]}",
+    )
+    fetched = run_command(
+        [
+            "git",
+            "-C",
+            str(destination),
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--",
+            remote,
+            f"+{pull_ref}:{fetched_ref}",
+            f"+{base_ref}:{fetched_base_ref}",
+        ],
+        timeout=180,
+        description="PR head fetch",
+    )
+    require(
+        fetched.returncode == 0,
+        "PR head fetch failed: inspected "
+        f"remote={remote!r} ref={pull_ref!r} for live head={head_sha}: "
+        f"{(fetched.stderr or fetched.stdout).strip()[:500] or 'no diagnostic'}",
+    )
+    fetched_head = git(destination, "rev-parse", f"{fetched_ref}^{{commit}}")
+    require(
+        fetched_head == head_sha,
+        "PR head resolution failed: inspected "
+        f"remote={remote!r} ref={pull_ref!r}, which resolved to {fetched_head}, "
+        f"but the live GitHub snapshot names {head_sha}",
+    )
+    # Fetch the base ref so the snapshot's exact base commit is available.
+    # The mutable branch tip may advance between the API snapshot and this fetch.
     git(destination, "cat-file", "-e", f"{base_sha}^{{commit}}")
+    git(destination, "checkout", "--quiet", "--detach", head_sha)
+    require(
+        git(destination, "rev-parse", "HEAD") == head_sha,
+        "review checkout HEAD does not match the fetched live PR head",
+    )
+    require(
+        not git(destination, "status", "--porcelain", "--untracked-files=all"),
+        "fresh exact-head review checkout is dirty",
+    )
     return git(destination, "merge-base", base_sha, head_sha)
 
 
@@ -1637,27 +1841,41 @@ def write_ledger(path: Path, ledger: dict[str, Any]) -> None:
 
 
 def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
-    state = Path(os.environ.get("FM_STATE_OVERRIDE", str(home / "state")))
-    data = Path(os.environ.get("FM_DATA_OVERRIDE", str(home / "data")))
-    meta = parse_meta(state / f"{task_id}.meta")
+    state = Path(environment_value("FM_STATE_OVERRIDE", str(home / "state")))
+    data = Path(environment_value("FM_DATA_OVERRIDE", str(home / "data")))
+    try:
+        meta = parse_meta(state / f"{task_id}.meta")
+    except CrosscheckError as exc:
+        tool_fail(str(exc))
     ledger_path = data / task_id / "crosscheck-ledger.json"
     report_path = data / task_id / "crosscheck.md"
-    snapshot_value = github_snapshot(root, url)
-    ledger = load_ledger(ledger_path, task_id, url)
+    try:
+        snapshot_value = github_snapshot(root, url)
+    except CrosscheckError as exc:
+        tool_fail(f"GitHub snapshot preflight failed: {exc}")
+    try:
+        ledger = load_ledger(ledger_path, task_id, url)
+    except CrosscheckError as exc:
+        tool_fail(f"finding-ledger preflight failed at {ledger_path}: {exc}")
     config: dict[str, str] | None = None
 
     try:
-        config = reviewer_config(home, meta)
+        try:
+            config = reviewer_config(home, meta)
+        except CrosscheckError as exc:
+            tool_fail(f"reviewer preflight failed: {exc}")
         with tempfile.TemporaryDirectory(prefix=f".{task_id}.crosscheck.", dir=state) as temporary:
             temp_root = Path(temporary)
             review_dir = temp_root / "review"
-            merge_base = prepare_review_checkout(
-                Path(meta["worktree"]),
-                review_dir,
-                snapshot_value["head_sha"],
-                snapshot_value["base_sha"],
-            )
-            require(merge_base == snapshot_value["base_sha"], "PR base is not the review checkout's merge base")
+            try:
+                merge_base = prepare_review_checkout(review_dir, snapshot_value)
+                require(
+                    merge_base == snapshot_value["base_sha"],
+                    "PR base resolution failed: the live base is not the "
+                    "review checkout's merge base",
+                )
+            except CrosscheckError as exc:
+                tool_fail(f"review checkout preflight failed: {exc}")
             raw_review = run_reviewer(review_dir, snapshot_value, ledger, config)
             assert_review_checkout_intact(review_dir, snapshot_value["head_sha"])
             review = validate_review_shape(raw_review, snapshot_value["head_sha"], review_dir)
@@ -1665,8 +1883,17 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
                 ledger, review, review_dir, temp_root, snapshot_value, config
             )
             assert_review_checkout_intact(review_dir, snapshot_value["head_sha"])
+    except CrosscheckToolError as exc:
+        run = append_failed_run(
+            ledger, snapshot_value, str(exc), config, "tool-failure"
+        )
+        write_ledger(ledger_path, ledger)
+        atomic_write(report_path, render_report(ledger, run), mode=0o644)
+        raise
     except CrosscheckError as exc:
-        run = append_unreviewed_run(ledger, snapshot_value, str(exc), config)
+        run = append_failed_run(
+            ledger, snapshot_value, str(exc), config, "unreviewed"
+        )
         write_ledger(ledger_path, ledger)
         atomic_write(report_path, render_report(ledger, run), mode=0o644)
         raise
@@ -1684,12 +1911,21 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
 
 
 def verified_crosscheck_head(root: Path, home: Path, task_id: str, url: str) -> str:
-    data = Path(os.environ.get("FM_DATA_OVERRIDE", str(home / "data")))
+    data = Path(environment_value("FM_DATA_OVERRIDE", str(home / "data")))
     ledger_path = data / task_id / "crosscheck-ledger.json"
-    snapshot_value = github_snapshot(root, url)
-    ledger = load_ledger(ledger_path, task_id, url)
+    try:
+        snapshot_value = github_snapshot(root, url)
+    except CrosscheckError as exc:
+        tool_fail(f"GitHub snapshot preflight failed: {exc}")
+    try:
+        ledger = load_ledger(ledger_path, task_id, url)
+    except CrosscheckError as exc:
+        tool_fail(f"finding-ledger preflight failed at {ledger_path}: {exc}")
     active = active_findings_for_head(ledger, snapshot_value["head_sha"])
-    require(not active, "durable finding ledger still has active blockers: " + ", ".join(active))
+    if active:
+        blocking_fail(
+            "durable finding ledger still has active blockers: " + ", ".join(active)
+        )
     matching = [
         run
         for run in ledger["runs"]
@@ -1702,7 +1938,21 @@ def verified_crosscheck_head(root: Path, home: Path, task_id: str, url: str) -> 
         "no crosscheck attempt exists for the live head, base, and PR claims",
     )
     latest = matching[-1]
-    require(latest["state"] == "clear", f"latest exact-head crosscheck state is {latest['state']}")
+    if latest["state"] == "tool-failure":
+        tool_fail(
+            "latest exact-head crosscheck attempt is a tool failure: "
+            f"{latest['summary']}"
+        )
+    if latest["state"] == "blocking":
+        blocking_fail(
+            "latest exact-head crosscheck attempt is blocking: "
+            f"{latest['summary']}"
+        )
+    require(
+        latest["state"] == "clear",
+        "no valid review exists for the exact head; latest attempt state is "
+        f"{latest['state']}",
+    )
     require(not latest.get("active_blockers"), "clear crosscheck run records active blockers")
     require(not latest.get("suspicions"), "clear crosscheck run records unresolved suspicions")
     return snapshot_value["head_sha"]
@@ -1776,21 +2026,26 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     if ID_RE.fullmatch(args.task_id) is None:
-        print("CROSSCHECK UNREVIEWED: invalid task id", file=sys.stderr)
+        print(
+            f"CROSSCHECK TOOL-FAILURE: task id validation rejected {args.task_id!r}",
+            file=sys.stderr,
+        )
         return 1
     root = Path(
-        os.environ.get("FM_ROOT_OVERRIDE", str(Path(__file__).resolve().parent.parent))
+        environment_value(
+            "FM_ROOT_OVERRIDE", str(Path(__file__).resolve().parent.parent)
+        )
     ).resolve()
-    home = Path(os.environ.get("FM_HOME", os.environ.get("FM_ROOT_OVERRIDE", str(root)))).resolve()
-    state = Path(os.environ.get("FM_STATE_OVERRIDE", str(home / "state")))
-    state.mkdir(parents=True, exist_ok=True)
-    lock_path = state / f".{args.task_id}.crosscheck.lock"
+    home = Path(environment_value("FM_HOME", str(root))).resolve()
+    state = Path(environment_value("FM_STATE_OVERRIDE", str(home / "state")))
     try:
+        state.mkdir(parents=True, exist_ok=True)
+        lock_path = state / f".{args.task_id}.crosscheck.lock"
         with lock_path.open("a+", encoding="utf-8") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                fail("another crosscheck operation already owns this task")
+                tool_fail("another crosscheck operation already owns this task")
             if args.command == "run":
                 return run_crosscheck(root, home, args.task_id, args.pr_url)
             if args.command == "verify":
@@ -1805,12 +2060,18 @@ def main() -> int:
                 args.title,
                 args.body,
             )
+    except CrosscheckBlockingError as exc:
+        print(f"CROSSCHECK BLOCKING: {exc}", file=sys.stderr)
+        return 1
+    except CrosscheckToolError as exc:
+        print(f"CROSSCHECK TOOL-FAILURE: {exc}", file=sys.stderr)
+        return 1
     except CrosscheckError as exc:
         print(f"CROSSCHECK UNREVIEWED: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
         print(
-            f"CROSSCHECK UNREVIEWED: unexpected {type(exc).__name__}: {exc}",
+            f"CROSSCHECK TOOL-FAILURE: unexpected {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
         return 1

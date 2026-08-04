@@ -1,0 +1,11 @@
+pull_request:
+  number: 76
+  title: "feat(lavish): add answerability-gated captain boards"
+  state: open
+  author: ruby-dlee
+  draft: no
+  merged: no
+  checks: "14 passed, 0 failed, 14 total"
+  body: "## Intent\n\nAdd a route-complete Lavish surfacing answerability gate that refuses boards lacking radios, annotation inputs, and schema-version-2 submit machinery before pickup or browser launch; this delta assumes PR66 provides the board generator and pickup path and must not duplicate them.\n\n## What Changed\n\n- Add self-contained Lavish decision boards with Markdown context, visual evidence, radio choices, structured annotations, and schema-version-2 submission collection.\n- Open boards in an iso\n... (truncated, 3962 chars total — use --full to see complete body)"
+  comment_count: 0 — use --comments to see full comments
+  review_count: 0 — use --reviews to see full reviews

@@ -41,6 +41,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 fm_refuse_if_gate_agent
 
+# Every read of gh-axi output goes through the strict structural reader. It
+# parses the whole payload, verifies declared array counts, positively
+# classifies every line, and refuses on anything it cannot account for, so a key
+# nested under an unrelated parent can never satisfy a top-level lookup and a
+# malformed value is never normalised into a valid-looking one.
+# shellcheck source=bin/fm-toon-lib.sh
+. "$SCRIPT_DIR/fm-toon-lib.sh"
+
 ID=${1:?usage: fm-pr-merge.sh <task-id> <pr-url> [-- <extra gh-axi pr merge args>]}
 URL=${2:?usage: fm-pr-merge.sh <task-id> <pr-url> [-- <extra gh-axi pr merge args>]}
 shift 2
@@ -126,14 +134,9 @@ reject_repo_overrides() {
   return 0
 }
 
-toon_scalar() {
-  local field=$1 input=$2 value
-  value=$(printf '%s\n' "$input" | sed -n "s/^[[:space:]]*$field:[[:space:]]*//p" | head -1)
-  value=${value#\"}
-  value=${value%\"}
-  printf '%s\n' "$value"
-}
-
+# The draft gate proceeds ONLY on an affirmative false. A draft flag that is
+# missing, malformed, quoted, or spelled in any other case is not "probably not
+# a draft" - it is a payload we do not understand, and the merge is refused.
 refuse_draft_pr() {
   local view draft
   if ! view=$(gh-axi pr view "$PR_NUMBER" --repo "$PR_OWNER/$PR_REPO" 2>&1); then
@@ -141,35 +144,45 @@ refuse_draft_pr() {
     printf '%s\n' "$view" >&2
     return 1
   fi
-  draft=$(toon_scalar draft "$view")
+  if ! draft=$(printf '%s\n' "$view" | fm_toon_bool pull_request.draft); then
+    echo "error: gh-axi pr view did not report a readable draft status for $PR_OWNER/$PR_REPO#$PR_NUMBER; refusing to merge" >&2
+    return 1
+  fi
   case "$draft" in
-    yes|YES|true|TRUE)
+    false) return 0 ;;
+    true)
       echo "error: refusing to merge $PR_OWNER/$PR_REPO#$PR_NUMBER because it is a draft; run gh-axi pr ready $PR_NUMBER --repo $PR_OWNER/$PR_REPO once it is ready for review" >&2
       return 1
       ;;
-    no|NO|false|FALSE) return 0 ;;
     *)
-      echo "error: gh-axi pr view did not report draft status for $PR_OWNER/$PR_REPO#$PR_NUMBER; refusing to merge" >&2
+      # Unreachable: fm_toon_bool returns only true or false. Kept so the gate
+      # still fails closed if that contract ever changes.
+      echo "error: unreadable draft status for $PR_OWNER/$PR_REPO#$PR_NUMBER; refusing to merge" >&2
       return 1
       ;;
   esac
 }
 
+# Label a still-open PR after gh-axi reported the merge command as successful.
+# gh-axi names the outcome with the root block key (merge:, merged:, enqueued:)
+# and repeats it in status:, so both are real structural lookups. Neither is
+# invented: when the payload says something we do not recognise, the label is
+# "unrecognized" rather than the benign-sounding "enqueued" this used to
+# fabricate. The caller refuses either way; the label must not make an
+# unexplained state read like an orderly queue wait.
 pending_merge_status() {
-  local output=$1 status kind
-  status=$(toon_scalar status "$output")
-  kind=$(printf '%s\n' "$output" | sed -n 's/^\([[:alpha:]_-]*\):[[:space:]]*$/\1/p' | head -1)
+  local output=$1 root='' status=''
+  root=$(printf '%s\n' "$output" | fm_toon_root_key) || root=''
+  if [ -n "$root" ]; then
+    status=$(printf '%s\n' "$output" | fm_toon_get "$root.status") || status=''
+  fi
   case "$status" in
-    enqueued|ENQUEUED) printf '%s\n' enqueued; return 0 ;;
-    accepted|ACCEPTED) printf '%s\n' accepted; return 0 ;;
-    queued|QUEUED) printf '%s\n' queued; return 0 ;;
+    enqueued|accepted|queued) printf '%s\n' "$status"; return 0 ;;
   esac
-  case "$kind" in
-    enqueued|ENQUEUED) printf '%s\n' enqueued ;;
-    accepted|ACCEPTED) printf '%s\n' accepted ;;
-    queued|QUEUED) printf '%s\n' queued ;;
-    *) printf '%s\n' enqueued ;;
+  case "$root" in
+    enqueued|accepted|queued) printf '%s\n' "$root"; return 0 ;;
   esac
+  printf '%s\n' unrecognized
 }
 
 verify_pr_merged() {
@@ -181,30 +194,31 @@ verify_pr_merged() {
     printf '%s\n' "$view" >&2
     return 1
   fi
-  state=$(toon_scalar state "$view")
+  # Success requires an affirmative "merged". A state we cannot read at all and
+  # a state we read but do not recognise both fall through to a refusal.
+  if ! state=$(printf '%s\n' "$view" | fm_toon_get pull_request.state); then
+    printf 'merge:\n  number: %s\n  status: unknown\n  observed_state: unavailable\n  method: %s\n' \
+      "$PR_NUMBER" "$MERGE_METHOD_LABEL"
+    echo "error: gh-axi pr merge returned success, but gh-axi pr view did not report a readable PR state for $PR_OWNER/$PR_REPO#$PR_NUMBER" >&2
+    return 1
+  fi
   case "$state" in
-    merged|MERGED)
+    merged)
       printf 'merged:\n  number: %s\n  status: ok\n  method: %s\n  observed_state: merged\n' \
         "$PR_NUMBER" "$MERGE_METHOD_LABEL"
       return 0
       ;;
-    open|OPEN)
+    open)
       pending_status=$(pending_merge_status "$MERGE_OUTPUT")
       printf 'merge:\n  number: %s\n  status: %s\n  observed_state: open\n  method: %s\n' \
         "$PR_NUMBER" "$pending_status" "$MERGE_METHOD_LABEL"
       echo "error: merge request was $pending_status, but GitHub still reports $PR_OWNER/$PR_REPO#$PR_NUMBER as open; it is not verified merged" >&2
       return 1
       ;;
-    closed|CLOSED)
+    closed)
       printf 'merge:\n  number: %s\n  status: closed\n  observed_state: closed\n  method: %s\n' \
         "$PR_NUMBER" "$MERGE_METHOD_LABEL"
       echo "error: gh-axi pr merge returned success, but GitHub reports $PR_OWNER/$PR_REPO#$PR_NUMBER as closed without a confirmed merge" >&2
-      return 1
-      ;;
-    "")
-      printf 'merge:\n  number: %s\n  status: unknown\n  observed_state: unavailable\n  method: %s\n' \
-        "$PR_NUMBER" "$MERGE_METHOD_LABEL"
-      echo "error: gh-axi pr merge returned success, but gh-axi pr view did not report a PR state for $PR_OWNER/$PR_REPO#$PR_NUMBER" >&2
       return 1
       ;;
     *)

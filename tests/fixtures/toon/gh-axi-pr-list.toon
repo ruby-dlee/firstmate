@@ -1,0 +1,10 @@
+count: 5 of 16 total
+pull_requests[5]{number,title,state,author,draft,review}:
+  76,"feat(lavish): add answerability-gated captain boards",open,ruby-dlee,no,none
+  66,Make Lavish captain boards permanent and durable,open,ruby-dlee,no,none
+  61,"fix: preserve stranded teardown safety repairs",open,ruby-dlee,no,none
+  55,"feat: bridge stow sweeps across Claude compaction",open,ruby-dlee,no,none
+  52,"fix: surface ready work and harden operating rules",open,ruby-dlee,no,none
+help[2]:
+  Run `gh-axi -R ruby-dlee/firstmate pr view <number>` to view details
+  Run `gh-axi -R ruby-dlee/firstmate pr create --title "..." --body-file <path>` to create

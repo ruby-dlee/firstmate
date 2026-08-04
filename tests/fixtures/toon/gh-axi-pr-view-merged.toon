@@ -1,0 +1,11 @@
+pull_request:
+  number: 26
+  title: "fix(teardown): prevent descriptor exhaustion during Treehouse return"
+  state: merged
+  author: ruby-dlee
+  draft: no
+  merged: "2026-08-03T20:28:49Z"
+  checks: "5 passed, 0 failed, 5 total"
+  body: "## Intent\n\nPrevent production teardown failures on realistically sized repositories by capping the directory descriptors inherited by `treehouse return --force`.\n\nRelvino worktrees contain about 41,884 directories.\nThe previous walk retained one descriptor per directory and made every descriptor inheritable across `exec`, which caused Treehouse and its Git child to fail with `Too many open files`.\n\n## What changed\n\n- Validate each descendant directory with the existing descriptor-relative checks\n... (truncated, 3510 chars total — use --full to see complete body)"
+  comment_count: 0 — use --comments to see full comments
+  review_count: 0 — use --reviews to see full reviews

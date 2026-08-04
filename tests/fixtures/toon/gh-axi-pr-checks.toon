@@ -1,0 +1,10 @@
+summary: "5 passed, 0 failed, 5 total"
+checks[5]{name,conclusion}:
+  Lint shell scripts,pass
+  PR must be raised via no-mistakes,pass
+  Behavior tests,pass
+  Agent Fleet package,pass
+  Repo invariants,pass
+help[2]:
+  Run `gh-axi -R ruby-dlee/firstmate pr view 26` to see PR details
+  Run `gh-axi -R ruby-dlee/firstmate pr merge 26` to merge when ready

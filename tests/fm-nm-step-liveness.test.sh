@@ -90,11 +90,17 @@ STARTED_PIDS="$STARTED_PIDS $SLEEPER"
 out=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   out=$("$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
-  [ "$(verdict_of "$out")" = alive ] && break
+  case "$out" in *"procs: 1"*) break ;; esac
   sleep 0.3
 done
-[ "$(verdict_of "$out")" = alive ] || fail "live process in worktree must read alive, got: $out"
-pass "a live process with its cwd in the worktree reads alive"
+# What this case proves is DISCOVERY: the process is found through its working
+# directory. It deliberately does NOT assert `alive`, because presence is not
+# progress - `sleep 120` accrues no cpu and is correctly not called working (see
+# case (e)). Asserting alive here is exactly the conflation that let four field
+# hangs read healthy while frozen.
+assert_contains "$out" "procs: 1" "the live process is discovered through its cwd"
+[ "$(verdict_of "$out")" != dead ] || fail "a discovered live process must not read dead, got: $out"
+pass "a live process with its cwd in the worktree is discovered (presence, not health)"
 
 # --- (c) the false-negative regression: invisible to a name search ----------
 #
@@ -103,7 +109,7 @@ pass "a live process with its cwd in the worktree reads alive"
 # command and its `bash tests/<name>.test.sh` children.
 by_name=$(pgrep -f "$WT" 2>/dev/null || true)
 [ -z "$by_name" ] || fail "fixture is wrong: the process must be invisible to an argv search"
-[ "$(verdict_of "$out")" = alive ] || fail "cwd search must find what an argv search cannot"
+case "$out" in *"procs: 1"*) ;; *) fail "cwd search must find what an argv search cannot, got: $out" ;; esac
 pass "a process invisible to an argv search is still found by working directory"
 
 # --- (e) a sleeping process reads stalled, never dead -----------------------
@@ -195,11 +201,16 @@ pass "a missing run id is a usage error"
 ( cd "$WT" && exec bash -c 'while :; do :; done' ) &
 LIVE=$!
 STARTED_PIDS="$STARTED_PIDS $LIVE"
+# Progress is established by comparing two observations, so seed a baseline and
+# let the process accumulate cpu before the second read. A short window is
+# permitted here only to keep the suite fast; the production floor is unchanged.
+SNAP_J="$TMP_ROOT/snap-j1"
 out=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  out=$("$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
+  FM_NM_SNAP_DIR="$SNAP_J" FM_NM_MIN_WINDOW=1 "$PROBE" "$RUN_ID" --worktree "$WT" --sample 0 >/dev/null
+  sleep 1.2
+  out=$(FM_NM_SNAP_DIR="$SNAP_J" FM_NM_MIN_WINDOW=1 "$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
   [ "$(verdict_of "$out")" = alive ] && break
-  sleep 0.3
 done
 [ "$(verdict_of "$out")" = alive ] \
   || fail "REGRESSION: a working step with no axi-status liveness signal must read alive, got: $out"
@@ -227,16 +238,27 @@ wait_for_barrier "$GAP_BARRIER" "$GAP_PROBE" \
 SUCCESSOR=$!
 STARTED_PIDS="$STARTED_PIDS $SUCCESSOR"
 out=""
+# Confirm the successor is DISCOVERABLE before releasing the barrier. This is a
+# presence check on the fixture, not a health claim: presence alone is no longer
+# reported as alive, so assert on the process count rather than the verdict.
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   out=$("$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
-  [ "$(verdict_of "$out")" = alive ] && break
+  case "$out" in *"procs: 0"*) sleep 0.2 ;; *) break ;; esac
 done
-[ "$(verdict_of "$out")" = alive ] || fail "the successor was not observable before the confirming rescan"
+case "$out" in
+  *"procs: 0"*) fail "the successor was not observable before the confirming rescan" ;;
+esac
 printf 'after-empty-scan\n' > "$GAP_BARRIER/release"
 wait "$GAP_PROBE" || fail "the gap probe failed after its barrier was released"
 out=$(cat "$GAP_OUT")
-[ "$(verdict_of "$out")" = alive ] \
-  || fail "REGRESSION: a gap with a confirmed successor must be reported alive, got: $out"
+# The invariant is that a gap is never reported DEAD - dead is the only verdict
+# that authorizes discarding a run. It is deliberately not asserted to be
+# `alive`: with the successor only just observed there is no prior sample to
+# establish progress from, and claiming health on that basis would be the same
+# unfounded assertion this suite exists to prevent.
+[ "$(verdict_of "$out")" != dead ] \
+  || fail "REGRESSION: a gap between units of work must not be reported dead, got: $out"
+assert_contains "$out" "procs: 1" "the confirming rescan found the successor process"
 pass "regression: a momentary gap between units of work is not reported as death"
 
 # (j3) A process set present at the first scan but gone by the second is an
@@ -303,3 +325,65 @@ out=$(FM_NM_ABSENCE_CONFIRM_DELAY=1 "$PROBE" "$RUN_ID" --worktree "$WT" --sample
   || fail "REGRESSION: a genuinely empty worktree must still read dead, got: $out"
 assert_contains "$out" "confirmed by a second scan" "the dead verdict states that absence was confirmed"
 pass "regression: confirmed absence still reads dead, so the distinction stays usable"
+
+# --- (k) REGRESSION: present-but-frozen is NOT alive -------------------------
+#
+# Four confirmed field hangs (two lanes, one of them the keystone that held 18
+# close-outs across five homes for five hours) had this shape: test step status
+# `running`, processes PRESENT, identical pid set, no new spawns, and zero cpu
+# movement across 30-40s. The presence-only path reported every one of them as
+# `alive`, so the wake was absorbed and nobody was told.
+#
+# SIGSTOP reproduces it deterministically - it turns an intermittent field
+# failure into something anyone can trigger on demand, which is why this case
+# exists rather than a comment describing the shape.
+#
+# Both directions are pinned here on purpose. A fix tested only against hangs
+# ships a false positive that condemns healthy runs (measured: a whole-set cpu
+# SUM read a genuinely working suite as hung, because the suite churns children
+# and an exited child removes its accumulated cpu from the sum). A fix tested
+# only against working steps never detects the hang at all.
+SNAP_K="$TMP_ROOT/snap-frozen"
+WT_K="$TMP_ROOT/frozen-wt"
+mkdir -p "$WT_K"
+( cd "$WT_K" && exec bash -c 'while :; do :; done' ) &
+FROZEN=$!
+STARTED_PIDS="$STARTED_PIDS $FROZEN"
+sleep 0.5
+
+# A first observation has nothing to compare against and must say so, never alive.
+out=$(FM_NM_SNAP_DIR="$SNAP_K" FM_NM_MIN_WINDOW=1 "$PROBE" "$RUN_ID" --worktree "$WT_K" --sample 0)
+[ "$(verdict_of "$out")" = unknown ] \
+  || fail "a first observation must read unknown, not a verdict, got: $out"
+pass "regression: a first observation reports unknown rather than assuming health"
+
+# Working: the process advances its own cpu, so it is alive.
+sleep 2
+out=$(FM_NM_SNAP_DIR="$SNAP_K" FM_NM_MIN_WINDOW=1 "$PROBE" "$RUN_ID" --worktree "$WT_K" --sample 0)
+[ "$(verdict_of "$out")" = alive ] \
+  || fail "a cpu-advancing process must read alive, got: $out"
+pass "regression: a genuinely working process reads alive (no false positive)"
+
+# Frozen: present, same pid, no new spawns, no cpu movement - the field shape.
+#
+# Two reads after the freeze, not one. The first window still straddles the
+# freeze boundary and therefore contains real pre-freeze work, so it can legally
+# read alive; the verdict is asserted on the first window lying ENTIRELY inside
+# the freeze. That one-heartbeat lag is a real property of comparing two
+# observations, and it is recorded here rather than hidden - it is irrelevant
+# against hangs measured in hours, and the alternative (a lower floor) would
+# risk condemning slow-but-working steps, which is the costlier error.
+kill -STOP "$FROZEN" 2>/dev/null || true
+sleep 2
+FM_NM_SNAP_DIR="$SNAP_K" FM_NM_MIN_WINDOW=1 "$PROBE" "$RUN_ID" --worktree "$WT_K" --sample 0 >/dev/null
+sleep 2
+out=$(FM_NM_SNAP_DIR="$SNAP_K" FM_NM_MIN_WINDOW=1 "$PROBE" "$RUN_ID" --worktree "$WT_K" --sample 0)
+kill -CONT "$FROZEN" 2>/dev/null || true
+[ "$(verdict_of "$out")" != alive ] \
+  || fail "REGRESSION: a present-but-frozen process must NOT read alive, got: $out"
+[ "$(verdict_of "$out")" = stalled ] \
+  || fail "a present-but-frozen process must read stalled, got: $out"
+assert_contains "$out" "PRESENT BUT NOT PROGRESSING" "the stalled detail names the field-hang signature"
+pass "regression: a present-but-frozen process reads stalled, never alive"
+
+kill_started

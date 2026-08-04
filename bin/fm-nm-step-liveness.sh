@@ -109,6 +109,91 @@ elif ! absence_confirm_delay_is_positive; then
   emit unknown 0 "invalid absence-confirmation delay: expected a positive number"
 fi
 
+# --- cross-heartbeat progress ------------------------------------------------
+# Snapshot store for the presence path's two observations. Kept outside the
+# worktree so it survives teardown and cannot be mistaken for a run process.
+SNAP_DIR=${FM_NM_SNAP_DIR:-${TMPDIR:-/tmp}/fm-nm-liveness}
+# Minimum per-process cpu hundredths that must accumulate for a persistent
+# process to count as working. One hundredth is the trace-noise floor: the
+# keystone hang moved 4:39.05 -> 4:39.06 across 30s, which is exactly 1.
+MIN_TICKS=${FM_NM_MIN_TICKS:-2}
+# Below this window a rate means nothing; report unknown rather than guess.
+MIN_WINDOW=${FM_NM_MIN_WINDOW:-20}
+case "$MIN_TICKS" in ''|*[!0-9]*) MIN_TICKS=2 ;; esac
+case "$MIN_WINDOW" in ''|*[!0-9]*) MIN_WINDOW=20 ;; esac
+
+cpu_of_pid() {  # <pid> -> hundredths, or empty when unreadable
+  local t days part
+  t=$(ps -o time= -p "$1" 2>/dev/null | tr -d ' ') || return 1
+  [ -n "$t" ] || return 1
+  case "$t" in *-*) days=${t%%-*}; t=${t#*-} ;; *) days=0 ;; esac
+  case "$t" in *:*:*) ;; *:*) t="0:$t" ;; *) t="0:0:$t" ;; esac
+  part=$(printf '%s\n' "$t" | awk -F: '{printf "%d\n", ($1*3600+$2*60+$3)*100}' 2>/dev/null)
+  case "$part" in ''|*[!0-9]*) part=0 ;; esac
+  case "$days" in ''|*[!0-9]*) days=0 ;; esac
+  printf '%s' "$(( part + days * 8640000 ))"
+}
+
+# Emits the verdict for the presence path and exits. Never returns.
+progress_verdict() {  # <pids> <count> <doing>
+  local pids=$1 count=$2 doing=$3
+  local now snap prev prev_t cur pid cpu prior entry pe
+  local advanced=0 newpids=0 persisted=0 best=0 window
+
+  now=$(date +%s 2>/dev/null) || \
+    emit unknown "$count" "cannot read the clock to establish a progress window$doing"
+  mkdir -p "$SNAP_DIR" 2>/dev/null || \
+    emit unknown "$count" "cannot open the progress snapshot store$doing"
+  snap="$SNAP_DIR/$RUN_ID.snap"
+
+  cur=""
+  for pid in $pids; do
+    cpu=$(cpu_of_pid "$pid") || continue
+    cur="$cur$pid:$cpu "
+  done
+  [ -n "$cur" ] || emit unknown "$count" "no process cpu time was readable$doing"
+
+  prev_t=""; prev=""
+  if [ -r "$snap" ]; then
+    prev_t=$(head -1 "$snap" 2>/dev/null)
+    prev=$(tail -1 "$snap" 2>/dev/null)
+  fi
+  { printf '%s\n' "$now"; printf '%s\n' "$cur"; } > "$snap" 2>/dev/null || true
+
+  case "$prev_t" in
+    '') emit unknown "$count" "first observation of this run; no prior sample to compare against$doing" ;;
+    *[!0-9]*) emit unknown "$count" "prior progress snapshot unreadable$doing" ;;
+  esac
+  window=$(( now - prev_t ))
+  [ "$window" -ge 0 ] || window=0
+  [ "$window" -ge "$MIN_WINDOW" ] || \
+    emit unknown "$count" "only ${window}s since the last observation (need ${MIN_WINDOW}s); progress not yet establishable$doing"
+
+  for entry in $cur; do
+    pid=${entry%%:*}; cpu=${entry##*:}
+    prior=""
+    for pe in $prev; do
+      case "$pe" in "$pid":*) prior=${pe##*:}; break ;; esac
+    done
+    if [ -z "$prior" ]; then newpids=$(( newpids + 1 )); continue; fi
+    case "$prior" in ''|*[!0-9]*) continue ;; esac
+    persisted=$(( persisted + 1 ))
+    delta=$(( cpu - prior ))
+    [ "$delta" -ge 0 ] || delta=0
+    [ "$delta" -gt "$best" ] && best=$delta
+    [ "$delta" -ge "$MIN_TICKS" ] && advanced=$(( advanced + 1 ))
+  done
+
+  if [ "$advanced" -gt 0 ]; then
+    emit alive "$count" "$advanced of $persisted persistent process(es) advanced cpu over ${window}s (best +$(awk -v b="$best" 'BEGIN{printf "%.2f", b/100}')s)$doing"
+  fi
+  if [ "$newpids" -gt 0 ]; then
+    emit alive "$count" "$newpids new process(es) started in ${window}s - the step began new units of work$doing"
+  fi
+  emit stalled "$count" \
+    "PRESENT BUT NOT PROGRESSING: no new processes and no persistent process advanced cpu in ${window}s (best +$(awk -v b="$best" 'BEGIN{printf "%.2f", b/100}')s) - this is the confirmed field-hang signature, not a slow step$doing"
+}
+
 test_scan_barrier() {  # <phase>
   local phase=$1 dir=${FM_NM_TEST_BARRIER_DIR:-} released
   [ "${FM_NM_TEST_BARRIER_PHASE:-}" = "$phase" ] || return 0
@@ -258,10 +343,29 @@ if [ "$COUNT_T0" = 0 ]; then
   COUNT_T0=$COUNT_CONFIRM
 fi
 
+# --- presence is NOT progress -----------------------------------------------
+#
+# This path used to emit `alive` for any process holding the worktree cwd. That
+# was the defect restated as a feature: four confirmed field hangs had their
+# processes PRESENT and frozen - identical pid set, no new spawns, zero cpu
+# movement across 30-40s - and every one of them read `alive` here, so the wake
+# was absorbed and nobody was told. The keystone case held 18 lanes across five
+# homes for five hours that way.
+#
+# Progress is now established WITHOUT a sleep, by comparing against the previous
+# heartbeat's observation. Heartbeats recur, so consecutive reads give a free
+# window - and a far better one than any few-second sleep, since real hangs run
+# for hours. Two signals count as progress, and BOTH are needed:
+#   - a pid present in both observations advanced its own cpu, or
+#   - new pids appeared (the suite started a new unit of work)
+# Per-process, never a whole-set sum: the suite churns children constantly, and
+# an exited child takes its accumulated cpu out of a sum, so a summed rate reads
+# a working step as hung. That false positive was measured on a real run before
+# this shipped, which is why the comparison is per-pid.
 if [ "$SAMPLE" = 0 ]; then
   DOING=$(current_work "$PIDS_T0")
   [ -n "$DOING" ] && DOING="${VERDICT_SEP}doing: $DOING"
-  emit alive "$COUNT_T0" "processes present in worktree (presence only, no progress sample)$DOING"
+  progress_verdict "$PIDS_T0" "$COUNT_T0" "$DOING"
 fi
 
 # --- sample progress --------------------------------------------------------

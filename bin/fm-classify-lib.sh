@@ -431,7 +431,8 @@ _fm_status_file_sig() {
 #   paused  - the crewmate declared an owned-and-clearing external wait and nothing
 #             is outstanding (crew_declared_pause_absorbable), so its pane is
 #             EXPECTED to idle;
-#   none    - neither, so the wake must surface.
+#   none    - neither, so the wake must surface (including stalled, dead, and
+#             unknown liveness, and an unreadable verdict).
 #
 # PRECEDENCE, and why it is this way round. bin/fm-crew-state.sh's authoritative
 # verdict ("state: <s> · source: <src> · <detail>") answers "what is the PIPELINE
@@ -474,7 +475,7 @@ crew_state_line() {  # <id>
 }
 
 # Parse the optional presence-only liveness observation from a current-state
-# line. This boundary has exactly three verdicts: alive, dead, and unknown.
+# line. This boundary has four verdicts: alive, stalled, dead, and unknown.
 # An unrecognized value in an explicit liveness field is malformed evidence, so
 # it becomes unknown; a line with no liveness field remains empty for backward
 # compatibility and keeps its previous classification.
@@ -590,7 +591,7 @@ crew_is_provably_working() {  # <id>
 # escalating a possible wedge. See crew_absorb_class for the precedence and
 # crew_declared_pause_absorbable for the two proofs a pause must satisfy.
 crew_is_paused() {  # <id> [declared-pause-status-line]
-  # This predicate needs only pause-or-not; dead and unknown arrive as `none`
+  # This predicate needs only pause-or-not; stalled, dead, and unknown arrive as `none`
   # and stay distinct from the one absorbable paused outcome.
   case "$(crew_absorb_class "$1" "${2:-}")" in
     paused) return 0 ;;
@@ -617,7 +618,7 @@ signal_crew_provably_working() {  # <file> ...
     case " $seen " in *" $task "*) continue ;; esac
     seen="$seen $task"
     class=$(crew_absorb_class "$task")
-    # A signal needs only absorb-or-surface; `none` includes dead and unknown,
+    # A signal needs only absorb-or-surface; `none` includes stalled, dead, and unknown,
     # both of which must surface rather than be treated as assume-fine.
     case "$class" in
       working) ;;

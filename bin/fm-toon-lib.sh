@@ -219,6 +219,20 @@ function split_row(s, arr,   n, i, j, c, cur, L) {
   return n
 }
 
+function has_top_level_comma(s,   i, c, L) {
+  L = length(s)
+  if (substr(s, 1, 1) != "\"") return (index(s, ",") != 0)
+  for (i = 2; i <= L; i++) {
+    c = substr(s, i, 1)
+    if (c == "\\") {
+      i++
+      continue
+    }
+    if (c == "\"") return (index(substr(s, i + 1), ",") != 0)
+  }
+  return 0
+}
+
 function path_join(parent, key) {
   return (parent == "") ? key : parent "." key
 }
@@ -286,7 +300,7 @@ function push(kind, ind, p) {
   ctx_nfields[depth] = 0
 }
 
-function close_ctx(d,   cnt, parts, i, seen, inline_seen, rowcnt, has_comma) {
+function close_ctx(d,   cnt, parts, i, seen, inline_seen, rowcnt, has_comma, top_comma) {
   if (ctx_kind[d] == "tab") {
     if (ctx_seen[d] != ctx_expect[d])
       err(sprintf("array %s declares [%d] but its block holds %d rows", ctx_path[d], ctx_expect[d], ctx_seen[d]))
@@ -302,8 +316,11 @@ function close_ctx(d,   cnt, parts, i, seen, inline_seen, rowcnt, has_comma) {
   inline_seen = 0
   has_comma = 0
   for (i = 1; i <= seen; i++) {
+    top_comma = has_top_level_comma(ctx_items[d SUBSEP i])
     rowcnt = split_row(ctx_items[d SUBSEP i], parts)
-    if (rowcnt > 1) has_comma = 1
+    if (top_comma && rowcnt < 0)
+      err(sprintf("array %s block item %d carries a top-level comma whose inline reading is unparseable", ctx_path[d], i))
+    if (top_comma) has_comma = 1
     inline_seen += (rowcnt < 0) ? 0 : rowcnt
   }
   if (has_comma && !(seen == 1 && ctx_expect[d] != 1))

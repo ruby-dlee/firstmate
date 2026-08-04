@@ -180,6 +180,17 @@ test_block_list_comma_ambiguity_refused() {
   success' \
     'both a 2-item block reading and a 3-item comma-separated inline reading'
 
+  expect_refuse "malformed single-line comma reading" validate '' \
+'items[1]:
+  passing,"failing' \
+    'top-level comma whose inline reading is unparseable'
+
+  expect_refuse "malformed multi-line comma reading" validate '' \
+'items[2]:
+  a,"b
+  c' \
+    'top-level comma whose inline reading is unparseable'
+
   pass "fm-toon-lib refuses ambiguous block and inline list grammar"
 }
 

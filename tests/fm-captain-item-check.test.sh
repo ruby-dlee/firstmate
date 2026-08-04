@@ -143,8 +143,8 @@ test_wiring() {
   grep -F 'Creation snapshots the request bytes once' \
     "$ROOT/.agents/skills/lavish-decisions/SKILL.md" >/dev/null \
     || fail "lavish-decisions does not bind creation to the checked request"
-  grep -F 'await validateCaptainRequest(home, request);' "$ROOT/tools/lavish/src/cli.mjs" >/dev/null \
-    || fail "Lavish creation does not invoke the request check on its snapshot"
+  grep -F 'beforeCreate: () => validateCaptainRequest(home, request),' "$ROOT/tools/lavish/src/cli.mjs" >/dev/null \
+    || fail "Lavish creation does not wire the request check before durable creation"
   grep -F 'request,' "$ROOT/tools/lavish/src/cli.mjs" >/dev/null \
     || fail "Lavish creation does not pass the checked bytes to durable creation"
   pass "always-loaded and Lavish creation paths invoke the check"

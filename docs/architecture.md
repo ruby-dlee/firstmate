@@ -16,20 +16,21 @@ Repeated unchanged wedge or permission-stall escalations add an escalation count
 Those actionable wakes are written to a durable local queue (`state/.wake-queue`) before detector state advances, so a missed process exit can be recovered by draining the queue.
 No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when `bin/fm-crew-state.sh` reports positive evidence that the crewmate is still working: an actively running no-mistakes step for that crewmate's branch or a backend busy signature.
 A crewmate that declares `paused:` for a known external wait is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
-For stale-pane triage only, that durable declaration also explains the expected idle pane after a matching no-mistakes run has reached terminal `done` (including passed or checks-passed outcomes); active and failed runs retain normal run-step precedence, and stopped crewmates without a declared pause surface immediately.
+For stale-pane triage only, that durable declaration also explains the expected idle pane after a matching no-mistakes run has reached current-state `done`; active and failed runs retain normal run-step precedence, and stopped crewmates without a declared pause surface immediately.
 Pause cadence markers remain in force while the latest durable status still declares the pause and are cleared only after that status resumes, so every continuously declared pause still re-surfaces on the bounded long cadence.
 Its initial normal-mode status signal still surfaces through the no-verb path, while away mode self-handles that routine signal and owns the later recheck.
 Fresh stale panes use the same current-state read before trusting the status log, so an active run or busy pane outranks an old captain-relevant status-log line left behind before validation.
-No-change heartbeats are also benign.
+Heartbeats are benign only when the fleet scan finds neither an unsurfaced captain-relevant status nor a `dead` or `unknown` command-step liveness observation.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
 At each drain boundary, `fm-wake-drain.sh` first intakes durable Lavish answers, then drains queued wakes and runs the same liveness guard as the supervision scripts, so unreceipted answers recover and a lapsed watcher chain surfaces even on a turn that only drains and handles queued wakes.
 Routine watcher polling, supervision no-ops, elapsed waiting time, and absorbed benign wakes stay silent.
 A declared external wait trades that silence for one bounded recheck per pause window, so a forgotten pause cannot remain invisible indefinitely.
 Crewmate status files are append-only wake-event logs, not current-state fields.
 `bin/fm-crew-state.sh <id>` is the cheap current-state read for an actionable heartbeat review: it attributes the matching no-mistakes run, active or terminal, to the crewmate's own branch and keeps that run-step authoritative even if the pane has closed; the stale-pane pause exception above belongs to the watcher's absorb classification and does not change this general current-state precedence.
-When a terminal run reports `outcome: passed`, the helper preserves the terminal `done` state but verifies the PR detail through a bounded `gh-axi` query, distinguishing merged, open, closed without merge, and unavailable states instead of inferring them from the pipeline outcome.
+When a terminal run reports `outcome: passed`, the helper verifies the PR detail through a bounded `gh-axi` query instead of inferring GitHub state from the pipeline outcome.
+An open-PR `passed` or `checks-passed` outcome and a checks-green CI marker are classified by the exact remote-only currentness contract in `bin/fm-crew-state.sh`'s header; only `done` authorizes the PR-ready workflow.
 During no-mistakes' `ci` monitor phase, it also reads the ci step log tail because `axi status` reports both "still waiting on checks" and "checks green, waiting on merge" as `ci,running`.
-The most recent recognized ci log marker wins, so checks-green monitoring reports done while a later re-arm, failed-check, or issue marker returns the crewmate to working.
+The most recent recognized ci log marker wins, so checks-green monitoring supplies the ready claim while a later re-arm, failed-check, or issue marker returns the crewmate to working before remote currentness is considered.
 Only when no matching run exists does it fall back to the pane busy-signature and then a status-log event whose verb maps to a recognized run-state; a dead pane without a run reports unknown instead of trusting a stale log.
 Decision-only events such as `resolved` never become current state or leak their prose into the current-state detail.
 In that status-log fallback, a declared external wait reports the distinct `paused` state with its reason.
@@ -281,7 +282,7 @@ Fleet state lives in each task's session-provider backend (tmux by hard default,
 For herdr, respawning after a server-restored layout closes and replaces confirmed no-agent or dead task-tab husks instead of requiring manual tab cleanup.
 At session start, confirmed-dead secondmate agent endpoints are closed and relaunched through the same secondmate spawn path, while ambiguous liveness reads are left untouched to avoid duplicate supervisors.
 Use `/stow` before an intentional reset when the conversation may hold durable knowledge that has not yet been written to disk; after that, the next firstmate session can reconcile and carry on.
-Claude Code compaction uses the tracked deterministic anchor and compact-sourced session-start reconciliation documented in [`autocompact-recovery.md`](autocompact-recovery.md).
+Claude Code compaction follows the anchor, judgment-capture, and compact-sourced recovery contract documented in [`autocompact-recovery.md`](autocompact-recovery.md).
 
 ## Development notes
 

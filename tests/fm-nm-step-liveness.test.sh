@@ -387,3 +387,49 @@ assert_contains "$out" "PRESENT BUT NOT PROGRESSING" "the stalled detail names t
 pass "regression: a present-but-frozen process reads stalled, never alive"
 
 kill_started
+
+# --- (m) REGRESSION: child turnover is the discriminator ---------------------
+#
+# Field evidence separating a SLOW step from a STRANDED one, measured outside
+# the pipeline as well as inside it:
+#   slow-but-alive : parent cpu FLAT, but fm-teardown.sh children turning over
+#                    every few seconds (each invocation makes ~955 sequential
+#                    helper launches, so it crawls under load)
+#   stranded       : the step process has NO children at all and zero cpu across
+#                    30s at 49 minutes elapsed
+# So neither parent cpu nor the activity clock discriminates - child turnover
+# does. This pins that, because an earlier build of this probe dropped exactly
+# the pids that prove turnover: a short-lived child can exit between the cwd
+# enumeration and the `ps` read, and those unreadable pids were discarded, which
+# made a healthy crawling step read `stalled`. A false hang call on a slow step
+# is the costly direction - it condemns work that is merely starved.
+TURN_WT="$TMP_ROOT/turnover-wt"; mkdir -p "$TURN_WT"
+SNAP_M="$TMP_ROOT/snap-turnover"
+( cd "$TURN_WT" && exec bash -c 'while :; do ( sleep 1 ); done' ) &
+TURNOVER=$!
+STARTED_PIDS="$STARTED_PIDS $TURNOVER"
+sleep 0.5
+FM_NM_SNAP_DIR="$SNAP_M" FM_NM_MIN_WINDOW=1 "$PROBE" "$RUN_ID" --worktree "$TURN_WT" --sample 0 >/dev/null
+sleep 2
+out=$(FM_NM_SNAP_DIR="$SNAP_M" FM_NM_MIN_WINDOW=1 "$PROBE" "$RUN_ID" --worktree "$TURN_WT" --sample 0)
+[ "$(verdict_of "$out")" = alive ] \
+  || fail "REGRESSION: child turnover with a flat parent must read alive, got: $out"
+pass "regression: a crawling step proved alive by child turnover, not by parent cpu"
+
+kill_started
+
+# The stranded counterpart: one process, no children, no cpu movement.
+LONE_WT="$TMP_ROOT/lone-wt"; mkdir -p "$LONE_WT"
+SNAP_N="$TMP_ROOT/snap-lone"
+( cd "$LONE_WT" && exec sleep 120 ) &
+LONE=$!
+STARTED_PIDS="$STARTED_PIDS $LONE"
+sleep 0.5
+FM_NM_SNAP_DIR="$SNAP_N" FM_NM_MIN_WINDOW=1 "$PROBE" "$RUN_ID" --worktree "$LONE_WT" --sample 0 >/dev/null
+sleep 2
+out=$(FM_NM_SNAP_DIR="$SNAP_N" FM_NM_MIN_WINDOW=1 "$PROBE" "$RUN_ID" --worktree "$LONE_WT" --sample 0)
+[ "$(verdict_of "$out")" != alive ] \
+  || fail "REGRESSION: a lone childless process with no cpu must not read alive, got: $out"
+pass "regression: a stranded step with no children and no cpu is not reported alive"
+
+kill_started

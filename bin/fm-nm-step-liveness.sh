@@ -146,12 +146,23 @@ progress_verdict() {  # <pids> <count> <doing>
     emit unknown "$count" "cannot open the progress snapshot store$doing"
   snap="$SNAP_DIR/$RUN_ID.snap"
 
+  # Record EVERY enumerated pid, including ones whose cpu cannot be read.
+  #
+  # A short-lived child can exit between the cwd enumeration and the `ps` call,
+  # which makes its cpu unreadable - and those are precisely the processes that
+  # PROVE the step is working, because rapid child turnover is what a crawling
+  # but healthy step looks like. Dropping them made a step with flat parent cpu
+  # and children turning over every few seconds read `stalled`, which is a false
+  # hang call on the exact shape of a slow-but-alive step. Unreadable cpu is
+  # marked `?` so the pid still counts for membership while never contributing a
+  # bogus cpu delta.
   cur=""
   for pid in $pids; do
-    cpu=$(cpu_of_pid "$pid") || continue
+    cpu=$(cpu_of_pid "$pid") || cpu='?'
+    [ -n "$cpu" ] || cpu='?'
     cur="$cur$pid:$cpu "
   done
-  [ -n "$cur" ] || emit unknown "$count" "no process cpu time was readable$doing"
+  [ -n "$cur" ] || emit unknown "$count" "no process could be recorded for comparison$doing"
 
   prev_t=""; prev=""
   if [ -r "$snap" ]; then
@@ -175,7 +186,14 @@ progress_verdict() {  # <pids> <count> <doing>
     for pe in $prev; do
       case "$pe" in "$pid":*) prior=${pe##*:}; break ;; esac
     done
+    # Membership is judged on the enumeration, not on cpu readability: a pid the
+    # prior observation never saw is NEW work regardless of whether its cpu could
+    # be sampled. This is the child-turnover signal, and it is the discriminator
+    # between a slow-but-spawning step and a stranded one.
     if [ -z "$prior" ]; then newpids=$(( newpids + 1 )); continue; fi
+    # A cpu delta needs a readable number at BOTH ends; `?` means unreadable and
+    # contributes membership only, never a delta.
+    case "$cpu" in ''|*[!0-9]*) continue ;; esac
     case "$prior" in ''|*[!0-9]*) continue ;; esac
     persisted=$(( persisted + 1 ))
     delta=$(( cpu - prior ))

@@ -1,6 +1,6 @@
 # Spawn-time startup trust-dialog reporting
 
-Status: design approved for implementation sequencing, with `bin/fm-spawn.sh` implementation deferred until the `six-gates-hardening` lane releases that file.
+Status: implemented on the feature branch in the route-complete shape described below; live-harness and delivery-gate validation remain before publication.
 
 ## Objective
 
@@ -82,7 +82,7 @@ This lets `fm-send.sh` apply metadata identity checks and backend routing before
 An unconfirmed launch is reported to stderr in this form.
 
 ```text
-STARTUP STATE UNKNOWN: task=<id> harness=<harness> window=<target>; the endpoint exists, but brief processing and a known startup dialog were both unproven within 20s; no input was sent.
+STARTUP STATE UNKNOWN: task=<id> harness=<harness> window=<target>; brief processing and a known startup dialog were both unproven within 20s; no input was sent.
 Inspect it with: FM_HOME=<quoted-home> <quoted-root>/bin/fm-peek.sh <quoted-id>
 ```
 
@@ -201,7 +201,18 @@ Claude workspace and hook-review paths require live coverage when reproducible w
 
 ## Delivery sequence
 
-This design document can land while `six-gates-hardening` owns `bin/fm-spawn.sh`.
-Implementation must wait until that lane releases `bin/fm-spawn.sh`, `bin/fm-watch.sh`, and their tests or explicitly hands ownership to this task.
-The implementation change should extract the shared classifier, add the common post-commit spawn reporter, add the watcher fallback, extend colocated tests, run `bin/fm-lint.sh`, perform the mutation proof, and complete the isolated live Codex exercise.
+The implementation extracts the shared classifier, adds the common post-commit spawn reporter, adds the watcher fallback, and extends colocated tests in one route-complete change.
+Delivery requires `bin/fm-lint.sh`, the two mutation proofs, and the isolated live Codex exercise described above.
 No implementation step may auto-accept a prompt.
+
+## Live verification record
+
+On 2026-08-04, Codex CLI `0.146.0-alpha.9.2` was launched by the real `fm-spawn.sh` path on an isolated private tmux server and a newly leased scratch worktree.
+The spawn output reported `STARTUP TRUST DIALOG`, named `codex-directory-trust`, printed the scoped `fm-send.sh <id> --key Enter` command, and stated that no input was sent.
+A separate pane capture before any action positively showed the complete directory-trust dialog while `pane_current_command` was `codex`.
+Only then was the printed command executed, after which the directory dialog cleared.
+
+That explicit decision exposed a second Codex startup prompt for project hooks whose complete current shape is not in the verified classifier set.
+The real watcher fallback reported `startup-unconfirmed`, classified both brief processing and a known dialog as `UNKNOWN`, printed only the scoped peek command, and sent no input.
+After an explicit choice to continue without trusting hooks, Codex replied with the brief's exact `LIVE_STARTUP_TRUST_BRIEF_PROCESSING` marker and the current-launch turn-end file existed.
+This demonstrates the route-completeness distinction: endpoint creation is closed by the common spawn reporter, while a late or not-yet-recognized startup shape remains closed by the watcher's actionable UNKNOWN class rather than by an unsafe inferred absence.

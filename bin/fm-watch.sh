@@ -36,6 +36,10 @@
 #                          status, or turn-end progress surfaces after
 #                          FM_PERMISSION_STALL_ESCALATE_SECS as a possible macOS
 #                          permission/system-dialog block. Unless afk is active.
+#                          Before current-generation processing is proven, a
+#                          complete startup trust shape surfaces immediately;
+#                          an endpoint still unconfirmed after its startup grace
+#                          surfaces once as UNKNOWN. Neither path sends input.
 #   check: <script>: <out> per-task check output, always actionable
 #                          A merged-PR check first attempts fail-closed automatic
 #                          teardown; its success or refusal is included here.
@@ -85,6 +89,10 @@ mkdir -p "$STATE"
 # backstop. See bin/fm-backend.sh and docs/herdr-backend.md.
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# Startup trust and protected mid-run permission prompts deliberately have
+# separate classifiers in this shared owner.
+# shellcheck source=bin/fm-harness-prompt-lib.sh
+. "$SCRIPT_DIR/fm-harness-prompt-lib.sh"
 # Shared normalized-transition accessors and the single-owner status->action
 # policy table, so the event-wait splice reads transition records the same way
 # the herdr subscriber writes them (bin/fm-transition-lib.sh).
@@ -134,7 +142,7 @@ SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trai
 # grok: "Ctrl+c:cancel" (the mid-turn cancel hint in grok's keybind bar, shown iff a
 # turn is running; absent when idle - verified grok 0.2.73, ASCII to avoid the
 # locale fragility of matching grok's braille spinner glyph directly).
-BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'}
+BUSY_REGEX=${FM_BUSY_REGEX:-$FM_HARNESS_BUSY_REGEX_DEFAULT}
 # Always-on wake triage: most wakes during a long crewmate validation are benign (a
 # working: note or turn-end while a pipeline runs, a no-change heartbeat). Rather
 # than wake firstmate's LLM for each, this watcher classifies every wake in bash
@@ -163,6 +171,14 @@ STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provabl
 PERMISSION_STALL_ESCALATE_SECS=${FM_PERMISSION_STALL_ESCALATE_SECS:-900}
 case "$PERMISSION_STALL_ESCALATE_SECS" in
   ''|*[!0-9]*|0) PERMISSION_STALL_ESCALATE_SECS=900 ;;
+esac
+# The spawn path observes startup for 20 seconds. The watcher remains the
+# route-complete late-render fallback and surfaces an UNKNOWN startup state once
+# this slightly longer grace expires without positive current-generation
+# processing evidence.
+STARTUP_GRACE_SECS=${FM_STARTUP_GRACE_SECS:-30}
+case "$STARTUP_GRACE_SECS" in
+  ''|*[!0-9]*|0) STARTUP_GRACE_SECS=30 ;;
 esac
 # A crewmate that DECLARED a pause (paused: <reason>, fm-classify-lib.sh) is idling on
 # a known external wait, so its stale pane is absorbed rather than wedge-escalated;
@@ -454,78 +470,51 @@ surface_nonterminal_stale() {  # <window> <hash>
   wake "stale: $win"
 }
 
-# Recognize the stable confirmation chrome rendered by verified harnesses when a
-# mid-run permission or trust grant is waiting on a human. The question alone is
-# insufficient because pane output can quote it; each shape also requires its
-# title-specific choices and any verified footer in the final 16 lines, and the
-# caller requires the harness not to show its busy indicator.
-# Exact live-capture evidence and version details live in
-# docs/permission-stall-detection.md.
-# Pi has no permission system, while firstmate launches OpenCode and Grok in
-# their verified unattended modes; their unexpected
-# or future prompt shapes remain covered by the bounded no-progress fallback.
-permission_prompt_kind() {  # <harness> <tail40> <allow-directory-trust>
-  local harness=$1 tail40=$2 allow_directory_trust=${3:-0} prompt_tail
-  prompt_tail=$(printf '%s\n' "$tail40" | tail -16)
-  case "$harness" in
-    claude|unknown)
-      if printf '%s\n' "$tail40" | grep -Fq 'Do you want to proceed?' \
-        && printf '%s\n' "$prompt_tail" | grep -Eq '1\. Yes' \
-        && printf '%s\n' "$prompt_tail" | grep -Eq '3\. No' \
-        && printf '%s\n' "$prompt_tail" | grep -Eq 'Esc to cancel.*Tab to amend'; then
-        printf 'command/tool permission'
-        return 0
-      fi
-      if [ "$allow_directory_trust" = 1 ] \
-        && printf '%s\n' "$tail40" | grep -Fq 'Quick safety check: Is this a project you created or one you trust?' \
-        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, I trust this folder' \
-        && printf '%s\n' "$prompt_tail" | grep -Fq 'No, exit' \
-        && printf '%s\n' "$prompt_tail" | grep -Eq 'Enter to confirm.*Esc to cancel'; then
-        printf 'directory trust'
-        return 0
-      fi
-      ;;
-  esac
-  case "$harness" in
-    codex|unknown)
-      if printf '%s\n' "$tail40" | grep -Fq 'Would you like to run the following command?' \
-        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, proceed' \
-        && printf '%s\n' "$prompt_tail" | grep -Eq "No, (continue without running it|and tell Codex what to do differently)" \
-        && printf '%s\n' "$prompt_tail" | grep -Fqi 'Press enter to confirm or esc to cancel'; then
-        printf 'command/tool permission'
-        return 0
-      fi
-      if printf '%s\n' "$tail40" | grep -Fq 'Would you like to grant these permissions?' \
-        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, grant these permissions for this turn' \
-        && printf '%s\n' "$prompt_tail" | grep -Fq 'No, continue without permissions' \
-        && printf '%s\n' "$prompt_tail" | grep -Fqi 'Press enter to confirm or esc to cancel'; then
-        printf 'permission profile'
-        return 0
-      fi
-      if printf '%s\n' "$tail40" | grep -Fq 'Would you like to make the following edits?' \
-        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, proceed' \
-        && printf '%s\n' "$prompt_tail" | grep -Fq 'No, and tell Codex what to do differently' \
-        && printf '%s\n' "$prompt_tail" | grep -Fqi 'Press enter to confirm or esc to cancel'; then
-        printf 'file edit permission'
-        return 0
-      fi
-      if printf '%s\n' "$tail40" | grep -Eq 'Do you want to approve network access to ".+"\?' \
-        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, just this once' \
-        && printf '%s\n' "$prompt_tail" | grep -Eq "No, (continue without running it|and tell Codex what to do differently|and block this host in the future)" \
-        && printf '%s\n' "$prompt_tail" | grep -Fqi 'Press enter to confirm or esc to cancel'; then
-        printf 'network access'
-        return 0
-      fi
-      if [ "$allow_directory_trust" = 1 ] \
-        && printf '%s\n' "$tail40" | grep -Fq 'Do you trust the contents of this directory?' \
-        && printf '%s\n' "$prompt_tail" | grep -Fq 'Yes, continue' \
-        && printf '%s\n' "$prompt_tail" | grep -Fq 'No, quit'; then
-        printf 'directory trust'
-        return 0
-      fi
-      ;;
-  esac
-  return 1
+# Startup trust and mid-run permission matching live in
+# fm-harness-prompt-lib.sh. These watcher handlers own only the durable wake and
+# deduplication behavior.
+handle_startup_trust_dialog() {  # <window> <task> <hash> <harness> <kind>
+  local win=$1 task=$2 h=$3 harness=$4 kind=$5 key marker prior command heading reason
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  marker="$STATE/.stale-permission-$key"
+  prior=$(cat "$marker" 2>/dev/null || true)
+  [ "$prior" != "$h" ] || return 0
+  command=$(fm_startup_accept_command "$SCRIPT_DIR" "$FM_HOME" "$task")
+  heading='startup-trust-dialog detected'
+  [ "$kind" != claude-hook-trust ] || heading='startup-hook-trust-dialog detected'
+  reason="stale: $win ($heading: kind=$kind harness=$harness; no input was sent. Review the prompt and, only if you choose to trust it, run: $command)"
+  fm_wake_append stale "$win" "$reason" || exit 1
+  printf '%s' "$h" > "$marker"
+  clear_busy_stall_tracking "$win"
+  mark_surfaced "$STATE/$task.status"
+  wake "$reason"
+}
+
+handle_startup_unconfirmed() {  # <window> <task> <generation> <age>
+  local win=$1 task=$2 generation=$3 age=$4 key marker token command reason
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  marker="$STATE/.stale-$key"
+  token="startup-unconfirmed:$generation"
+  [ "$(cat "$marker" 2>/dev/null || true)" != "$token" ] || return 0
+  command=$(fm_startup_peek_command "$SCRIPT_DIR" "$FM_HOME" "$task")
+  reason="stale: $win (startup-unconfirmed: endpoint exists, but current-generation brief processing and a known startup dialog are both UNKNOWN after ${age}s; no input was sent. Inspect it with: $command)"
+  fm_wake_append stale "$win" "$reason" || exit 1
+  printf '%s' "$token" > "$marker"
+  mark_surfaced "$STATE/$task.status"
+  wake "$reason"
+}
+
+handle_late_startup_only_shape() {  # <window> <task> <hash> <kind>
+  local win=$1 task=$2 h=$3 kind=$4 key marker command reason
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  marker="$STATE/.stale-permission-$key"
+  [ "$(cat "$marker" 2>/dev/null || true)" != "$h" ] || return 0
+  command=$(fm_startup_peek_command "$SCRIPT_DIR" "$FM_HOME" "$task")
+  reason="stale: $win (startup-only shape appeared after current-generation brief processing: kind=$kind; state UNKNOWN and no input was sent. Inspect it with: $command)"
+  fm_wake_append stale "$win" "$reason" || exit 1
+  printf '%s' "$h" > "$marker"
+  mark_surfaced "$STATE/$task.status"
+  wake "$reason"
 }
 
 clear_busy_stall_tracking() {  # <window>
@@ -1102,9 +1091,6 @@ EOF
     if ! status_is_paused "$last" && [ -e "$STATE/.paused-$key" ]; then
       clear_pause_tracking "$w"
     fi
-    if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
-      continue
-    fi
     tail40=$(fm_backend_capture "$(window_backend "$w")" "$w" 40 "$(window_label "$w")" "$(window_scoped_target "$w")" 2>/dev/null) || continue
     h=$(printf '%s' "$tail40" | hash_pane)
     key=$(printf '%s' "$w" | tr ':/.' '___')
@@ -1136,13 +1122,50 @@ EOF
       esac
     fi
     if [ "$window_busy" != 1 ]; then
+      harness=$(window_harness "$w")
+      startup_kind=$(fm_startup_trust_dialog_kind "$harness" "$tail40" || true)
       allow_directory_trust=0
       brief_processing_started "$task" && allow_directory_trust=1
-      prompt_kind=$(permission_prompt_kind "$(window_harness "$w")" "$tail40" "$allow_directory_trust" || true)
-      if [ -n "$prompt_kind" ]; then
-        handle_permission_prompt "$w" "$task" "$h" "$prompt_kind"
-        continue
+      if [ "$allow_directory_trust" != 1 ]; then
+        if [ -n "$startup_kind" ]; then
+          handle_startup_trust_dialog "$w" "$task" "$h" "$harness" "$startup_kind"
+          continue
+        fi
+        # Command, edit, profile, and network grants are mid-run classes even
+        # when the watcher did not sample the brief's earlier busy state.
+        prompt_kind=$(fm_midrun_permission_prompt_kind "$harness" "$tail40" 0 || true)
+        if [ -n "$prompt_kind" ]; then
+          handle_permission_prompt "$w" "$task" "$h" "$prompt_kind"
+          continue
+        fi
+        startup_generation=$(task_generation_id "$task" 2>/dev/null || true)
+        if [ -n "$startup_generation" ]; then
+          startup_age=$(age_of "$STATE/$task.meta")
+          if [ "$startup_age" -ge "$STARTUP_GRACE_SECS" ]; then
+            handle_startup_unconfirmed "$w" "$task" "$startup_generation" "$startup_age"
+          fi
+          # Before the grace expires, startup observation owns this pane.
+          # After the one deduplicated UNKNOWN wake, a late complete prompt is
+          # still checked on every later watcher invocation.
+          continue
+        fi
+      else
+        if [ "$startup_kind" = claude-hook-trust ]; then
+          handle_late_startup_only_shape "$w" "$task" "$h" "$startup_kind"
+          continue
+        fi
+        prompt_kind=$(fm_midrun_permission_prompt_kind "$harness" "$tail40" 1 || true)
+        if [ -n "$prompt_kind" ]; then
+          handle_permission_prompt "$w" "$task" "$h" "$prompt_kind"
+          continue
+        fi
       fi
+    fi
+    # Keep the historical non-paused secondmate stale exemption after the new
+    # startup checks. A secondmate may surface a startup trust/UNKNOWN wake, but
+    # it still never enters ordinary pane-hash stale handling.
+    if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
+      continue
     fi
     rm -f "$STATE/.stale-permission-$key" "$STATE/.wedge-escalations-permission-$key"
     if [ "$window_busy" = 1 ]; then

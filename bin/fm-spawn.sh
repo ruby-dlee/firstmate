@@ -162,6 +162,10 @@ CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# Shared startup-trust and protected mid-run prompt shapes. Spawn uses only the
+# startup classifier and never sends a key in response to its verdict.
+# shellcheck source=bin/fm-harness-prompt-lib.sh
+. "$SCRIPT_DIR/fm-harness-prompt-lib.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
@@ -186,6 +190,42 @@ spawn_managed_endpoint_state() {  # <backend> <target> <label> <kind> <secondmat
   else
     fm_backend_target_state "$backend" "$target" "$label" "$recorded_scoped_target"
   fi
+}
+
+spawn_managed_endpoint_capture() {  # <backend> <target> <lines> <label> <kind> <secondmate-home> [recorded-scoped-target]
+  local backend=$1 target=$2 lines=$3 label=$4 kind=$5 secondmate_home=${6:-} recorded_scoped_target=${7:-} endpoint_home
+  endpoint_home=$(fm_backend_endpoint_home "$backend" "$kind" "$FM_HOME" "$secondmate_home")
+  if [ "$endpoint_home" != "$FM_HOME" ]; then
+    ( unset FM_ROOT_OVERRIDE; FM_HOME="$endpoint_home" FM_ROOT="$endpoint_home" fm_backend_capture "$backend" "$target" "$lines" "$label" "$recorded_scoped_target" )
+  else
+    fm_backend_capture "$backend" "$target" "$lines" "$label" "$recorded_scoped_target"
+  fi
+}
+
+spawn_managed_endpoint_busy_state() {  # <backend> <target> <label> <kind> <secondmate-home>
+  local backend=$1 target=$2 label=$3 kind=$4 secondmate_home=${5:-} endpoint_home
+  endpoint_home=$(fm_backend_endpoint_home "$backend" "$kind" "$FM_HOME" "$secondmate_home")
+  if [ "$endpoint_home" != "$FM_HOME" ]; then
+    ( unset FM_ROOT_OVERRIDE; FM_HOME="$endpoint_home" FM_ROOT="$endpoint_home" fm_backend_busy_state "$backend" "$target" "$label" )
+  else
+    fm_backend_busy_state "$backend" "$target" "$label"
+  fi
+}
+
+spawn_file_signature() {  # <path>
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+try:
+    value = os.stat(sys.argv[1], follow_symlinks=False)
+except FileNotFoundError:
+    print("absent")
+except OSError:
+    print("unknown")
+else:
+    print(f"{value.st_size}:{value.st_mtime_ns}:{value.st_ctime_ns}")
+PY
 }
 
 git_repository_probe() (
@@ -1105,6 +1145,10 @@ ORIGINAL_TASK_TMP_PRESENT=-1
 spawn_test_lab_enabled() {
   fm_account_test_lab_enabled \
     || [ "${FM_ACCOUNT_DIRECTORY_TEST_LAB:-}" = firstmate-account-directory-test-lab-v1 ]
+}
+
+spawn_startup_test_lab_enabled() {
+  [ "${FM_SPAWN_STARTUP_TEST_LAB:-}" = firstmate-spawn-startup-test-lab-v1 ]
 }
 
 snapshot_existing_artifacts() {
@@ -3617,6 +3661,10 @@ if [ "$BACKEND" = herdr ]; then
   prepare_launch_environment
   build_launch_command
 fi
+# A turn-end touch after this point is positive evidence that this launch
+# processed the brief even when a fast first turn begins and ends between pane
+# samples. The reporter compares against this pre-launch baseline only.
+SPAWN_TURNEND_BASELINE=$(spawn_file_signature "$STATE/$ID.turn-ended")
 SPAWN_CWD=${WT:-$PROJ_ABS}
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
   validate_direct_recovery_worktree_identity || exit 1
@@ -3839,6 +3887,92 @@ spawn_send_key() {  # <target> <key>
     orca) fm_backend_orca_send_key "$1" "$2" ;;
     cmux) fm_backend_cmux_send_key "$1" "$2" "$W" ;;
   esac
+}
+
+spawn_report_startup_unknown() {  # <observation-seconds> <reason>
+  local seconds=$1 reason=$2 command
+  command=$(fm_startup_peek_command "$SCRIPT_DIR" "$FM_HOME" "$ID")
+  printf 'STARTUP STATE UNKNOWN: task=%s harness=%s window=%s; brief processing and a known startup dialog were both unproven within %ss; no input was sent. Observation: %s.\n' \
+    "$ID" "$HARNESS" "$META_WINDOW" "$seconds" "$reason" >&2
+  printf 'Inspect it with: %s\n' "$command" >&2
+}
+
+spawn_report_startup_dialog() {  # <kind>
+  local kind=$1 heading command
+  heading='STARTUP TRUST DIALOG'
+  [ "$kind" != claude-hook-trust ] || heading='STARTUP HOOK TRUST DIALOG'
+  command=$(fm_startup_accept_command "$SCRIPT_DIR" "$FM_HOME" "$ID")
+  printf '%s: task=%s harness=%s window=%s kind=%s; no input was sent.\n' \
+    "$heading" "$ID" "$HARNESS" "$META_WINDOW" "$kind" >&2
+  printf 'Review the prompt and, only if you choose to trust it, run: %s\n' "$command" >&2
+}
+
+spawn_report_startup_state() {
+  local observation_seconds=20 poll_interval=1 started deadline now tail40 capture_status
+  local endpoint_state native_busy dialog_kind turnend_signature last_reason capture_error_file
+  if spawn_startup_test_lab_enabled; then
+    observation_seconds=${FM_TEST_SPAWN_STARTUP_TIMEOUT:-20}
+    poll_interval=${FM_TEST_SPAWN_STARTUP_POLL_INTERVAL:-1}
+  fi
+  case "$observation_seconds" in ''|*[!0-9]*) observation_seconds=20 ;; esac
+  case "$poll_interval" in ''|*[!0-9.]*|*.*.*) poll_interval=1 ;; esac
+  capture_error_file=$(mktemp "$TASK_TMP/startup-capture.XXXXXX") || {
+    spawn_report_startup_unknown "$observation_seconds" 'could not allocate the bounded capture diagnostic'
+    return 0
+  }
+  started=$(date +%s)
+  deadline=$((started + observation_seconds))
+  last_reason='pane remained readable but unclassified'
+  while :; do
+    : > "$capture_error_file"
+    if tail40=$(spawn_managed_endpoint_capture "$BACKEND" "$T" 40 "fm-$ID" "$KIND" "$PROJ_ABS" "$META_WINDOW" 2>"$capture_error_file"); then
+      native_busy=$(spawn_managed_endpoint_busy_state "$BACKEND" "$T" "fm-$ID" "$KIND" "$PROJ_ABS" 2>/dev/null || printf unknown)
+      turnend_signature=$(spawn_file_signature "$STATE/$ID.turn-ended")
+      if [ "$native_busy" = busy ] \
+        || fm_pane_has_verified_busy_signature "$tail40" \
+        || { [ "$turnend_signature" != absent ] \
+          && [ "$turnend_signature" != unknown ] \
+          && [ "$turnend_signature" != "$SPAWN_TURNEND_BASELINE" ]; }; then
+        rm -f "$capture_error_file"
+        return 0
+      fi
+      dialog_kind=$(fm_startup_trust_dialog_kind "$HARNESS" "$tail40" || true)
+      if [ -n "$dialog_kind" ]; then
+        rm -f "$capture_error_file"
+        spawn_report_startup_dialog "$dialog_kind"
+        return 0
+      fi
+      if [ -z "$tail40" ]; then
+        last_reason='the bounded capture was empty'
+      else
+        last_reason='the pane was readable but neither processing nor a complete known startup dialog was proven'
+      fi
+    else
+      capture_status=$?
+      last_reason="bounded capture failed with status $capture_status"
+    fi
+
+    endpoint_state=$(spawn_managed_endpoint_state "$BACKEND" "$T" "fm-$ID" "$KIND" "$PROJ_ABS" "$META_WINDOW" 2>/dev/null)
+    case "$endpoint_state" in
+      present) ;;
+      absent)
+        rm -f "$capture_error_file"
+        spawn_report_startup_unknown "$observation_seconds" 'the endpoint disappeared during observation'
+        return 0
+        ;;
+      *)
+        rm -f "$capture_error_file"
+        spawn_report_startup_unknown "$observation_seconds" 'endpoint presence became UNKNOWN during observation'
+        return 0
+        ;;
+    esac
+    now=$(date +%s)
+    [ "$now" -lt "$deadline" ] || break
+    sleep "$poll_interval"
+  done
+  rm -f "$capture_error_file"
+  spawn_report_startup_unknown "$observation_seconds" "$last_reason"
+  return 0
 }
 if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" != 1 ]; then
   WT_REAL=$(real_path_or_raw "$WT")
@@ -4118,6 +4252,8 @@ fi
 LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_OWNED=0
 SECONDMATE_HOME_LIFECYCLE_LOCK=
+
+spawn_report_startup_state
 
 account_summary=
 [ -z "$DIRECT_ACCOUNT_HOME" ] || account_summary=" account_home=$DIRECT_ACCOUNT_HOME"

@@ -33,6 +33,12 @@ FM_TEST_LIB_SOURCED=1
 # the boundary against the real hazard is unaffected. tests/fm-gate-refuse.test.sh
 # strips this to verify real refusal.
 export FM_GATE_REFUSE_BYPASS=1
+# Real fm-spawn behavior tests use fake endpoint panes. Keep the production
+# startup observation fixed at 20 seconds while granting only this test suite a
+# one-sample observation seam; dedicated startup tests override the timeout to
+# exercise late-render polling.
+export FM_SPAWN_STARTUP_TEST_LAB=firstmate-spawn-startup-test-lab-v1
+export FM_TEST_SPAWN_STARTUP_TIMEOUT=0
 
 # Resolve the repo root from this library's own location. Consumed by sourcing
 # test files, not by this library, so it reads as "unused" here.

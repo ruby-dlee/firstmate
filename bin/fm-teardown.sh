@@ -5195,10 +5195,10 @@ validate_reap_open_pr_absent() {
     else
       status=$?
     fi
-    [ "$status" -eq 0 ] && fm_process_tree_cleanup_verified || {
+    if [ "$status" -ne 0 ] || ! fm_process_tree_cleanup_verified; then
       echo "REFUSED: dead-task reaping cannot prove recorded PR state under the checkout lock: $PR_URL" >&2
       return 1
-    }
+    fi
     state=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*state:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)
     case "$state" in
       merged|closed) ;;
@@ -5225,10 +5225,10 @@ validate_reap_open_pr_absent() {
     else
       status=$?
     fi
-    [ "$status" -eq 0 ] && fm_process_tree_cleanup_verified || {
+    if [ "$status" -ne 0 ] || ! fm_process_tree_cleanup_verified; then
       echo "REFUSED: dead-task reaping cannot prove branch PR state under the checkout lock: $branch" >&2
       return 1
-    }
+    fi
     count=$(printf '%s\n' "$out" | sed -n 's/^count:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
     case "$count" in
       0) ;;

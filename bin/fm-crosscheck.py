@@ -1424,6 +1424,9 @@ def run_reviewer(
         "FM_CROSSCHECK_CLAUDE_BIN", "claude", "Claude reviewer"
     )
     environment["CLAUDE_CONFIG_DIR"] = config["account_home"]
+    claude_tmp = protocol_dir / "claude-tmp"
+    claude_tmp.mkdir(mode=0o700)
+    environment["CLAUDE_CODE_TMPDIR"] = str(claude_tmp)
     claude_session_env = Path.home() / ".claude" / "session-env"
     sandbox_path = protocol_dir / "claude-sandbox.sb"
     arguments = [

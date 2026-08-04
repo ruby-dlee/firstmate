@@ -116,6 +116,8 @@ The Claude path pins `claude-opus-5`, xhigh effort, the installed unattended `--
 Because that Claude mode disables its own permission prompts, Crosscheck places the process under the installed macOS `sandbox-exec` contract: reads, process execution, and provider network access remain available, while writes are limited to the disposable review checkout, the selected reviewer's resolved `account_home`, Claude's `~/.claude/session-env` scratch subtree, and `/dev/null`.
 Claude Code writes UUID-keyed Bash session scratch under `~/.claude/session-env` even when `CLAUDE_CONFIG_DIR` names the independent account home.
 The profile permits that exact scratch subtree instead of shared `~/.claude`, so reviewer Bash works without granting write access to shared settings, skills, or other configuration.
+Claude's Bash engine otherwise creates workspace scratch under shared `/tmp/claude-<uid>` independently of ordinary `TMPDIR`.
+Crosscheck sets the supported `CLAUDE_CODE_TMPDIR` to a private directory inside the disposable checkout, keeping that scratch under the existing checkout write boundary instead of widening the sandbox to shared `/tmp`.
 It does not grant write access to the author worktree or the wider filesystem.
 An unavailable reviewer binary, sandbox, author-identity proof, or exact remote PR head records a `tool-failure` attempt when the live head is already known, and otherwise emits the same tool-failure class without fabricating a ledger run.
 A nonzero reviewer exit, timeout, missing artifact, empty artifact, malformed artifact, or wrong-head artifact records an `unreviewed` attempt and exits nonzero.

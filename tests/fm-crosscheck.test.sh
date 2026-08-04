@@ -157,6 +157,11 @@ install_claude_fake() {
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_CLAUDE_LOG"
 [ "${CLAUDE_CONFIG_DIR:-}" = "$FM_TEST_REVIEWER_HOME" ] || exit 80
+case "${CLAUDE_CODE_TMPDIR:-}" in
+  "$PWD"/.crosscheck/claude-tmp) ;;
+  *) exit 76 ;;
+esac
+mkdir -p "$CLAUDE_CODE_TMPDIR/bash-runtime" || exit 75
 mkdir -p "$CLAUDE_CONFIG_DIR/session-env" || exit 77
 printf 'reviewer runtime state\n' > "$CLAUDE_CONFIG_DIR/session-env/crosscheck-runtime" \
   || exit 78

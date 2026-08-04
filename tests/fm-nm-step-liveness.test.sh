@@ -73,6 +73,19 @@ wait_for_barrier() {  # <barrier-dir> <probe-pid>
   return 1
 }
 
+# --- protocol: emit always carries a numeric process count ------------------
+
+out=$(FM_NM_TEST_EMIT_EMPTY_PROCS=1 "$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)
+[ "$(verdict_of "$out")" = unknown ] \
+  || fail "an omitted process count must fail closed to unknown, got: $out"
+assert_contains "$out" "procs: 0" \
+  "an omitted process count is replaced by a numeric fail-closed placeholder"
+assert_contains "$out" "grade: unreadable" \
+  "an omitted process count remains unreadable rather than looking absent"
+assert_contains "$out" "could not report a numeric process count" \
+  "an omitted process count explains the probe-side protocol defect"
+pass "the probe never emits an empty process-count field"
+
 # --- (a) no process in the worktree -> dead ---------------------------------
 
 out=$("$PROBE" "$RUN_ID" --worktree "$WT" --sample 0)

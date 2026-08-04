@@ -89,8 +89,16 @@ case "$SAMPLE" in ''|*[!0-9]*) SAMPLE=$SAMPLE_DEFAULT ;; esac
 
 # Emit the one canonical line and exit 0.
 emit() {  # <verdict> <procs> [detail]
-  local line="liveness: $1${VERDICT_SEP}run: $RUN_ID${VERDICT_SEP}procs: $2"
-  [ -n "${3:-}" ] && line="$line${VERDICT_SEP}$3"
+  local verdict=${1:-unknown} procs=${2:-} detail=${3:-} line
+  case "$procs" in
+    ''|*[!0-9]*)
+      verdict=unknown
+      procs=0
+      detail="grade: unreadable${VERDICT_SEP}probe could not report a numeric process count"
+      ;;
+  esac
+  line="liveness: $verdict${VERDICT_SEP}run: $RUN_ID${VERDICT_SEP}procs: $procs"
+  [ -n "$detail" ] && line="$line${VERDICT_SEP}$detail"
   printf '%s\n' "$line"
   exit 0
 }
@@ -98,6 +106,13 @@ emit() {  # <verdict> <procs> [detail]
 emit_unknown() {  # <grade> <procs> <detail>
   emit unknown "$2" "grade: $1${VERDICT_SEP}$3"
 }
+
+# Test-only proof that emit remains total if a future observation path loses
+# its process count. The public line must still carry a number and must explain
+# that zero is a fail-closed placeholder, not established absence.
+if [ "${FM_NM_TEST_EMIT_EMPTY_PROCS:-}" = 1 ]; then
+  emit unknown '' "grade: unreadable${VERDICT_SEP}simulated empty process count"
+fi
 
 absence_confirm_delay_is_positive() {
   awk -v value="$ABSENCE_CONFIRM_DELAY" 'BEGIN {

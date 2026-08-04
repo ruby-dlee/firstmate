@@ -861,7 +861,11 @@ function claimRootIndependentRetentionAttempt() {
   );
   for (const entry of fs.readdirSync(retentionAdmissionDirectory)) {
     if (!entry.startsWith(`${retentionAdmissionPrefix}.`) || entry === markerName) continue;
-    if (!/^\d+\.json$/.test(entry.slice(retentionAdmissionPrefix.length + 1))) continue;
+    const markerMatch = entry.slice(retentionAdmissionPrefix.length + 1).match(/^(\d+)\.json$/);
+    if (!markerMatch) continue;
+    const markerBucket = Number(markerMatch[1]);
+    const markerBucketOlderGuard = Number.isSafeInteger(markerBucket) && markerBucket < bucket;
+    if (!markerBucketOlderGuard) continue;
     fs.unlinkSync(path.join(retentionAdmissionDirectory, entry));
   }
   return { admitted: true, path: markerPath, dev: observed.dev, ino: observed.ino };

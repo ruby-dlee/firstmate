@@ -4180,6 +4180,82 @@ NODE
   pass "changed retention control flow has valid positive and negative controls"
 }
 
+test_root_retention_admission_preserves_newer_bucket() {
+  local implementation mutant_root executable stack prefix marker first_bucket current_bucket
+  local first_ready first_proceed second_ready second_proceed third_ready third_proceed
+  local first_output second_output third_output first_pid second_pid third_pid state status
+  for implementation in control mutant; do
+    mutant_root="$TMP_ROOT/retention-root-boundary-$implementation"
+    executable="$SCRIPT"
+    if [ "$implementation" = mutant ]; then
+      write_report_stack_mutant "$mutant_root" \
+        'markerBucketOlderGuard = Number.isSafeInteger(markerBucket) && markerBucket < bucket' \
+        'markerBucketOlderGuard = Number.isSafeInteger(markerBucket) && markerBucket >= bucket'
+      executable="$mutant_root/bin/fm-report-stack.mjs"
+    fi
+    stack="$TMP_ROOT/retention-root-boundary-stack-$implementation"
+    mkdir -p "$stack/entries/cohort-1"
+    prefix=$(retention_admission_prefix_for_stack "$stack")
+    first_ready="$TMP_ROOT/retention-root-boundary-$implementation-first.ready"
+    first_proceed="$TMP_ROOT/retention-root-boundary-$implementation-first.proceed"
+    second_ready="$TMP_ROOT/retention-root-boundary-$implementation-second.ready"
+    second_proceed="$TMP_ROOT/retention-root-boundary-$implementation-second.proceed"
+    third_ready="$TMP_ROOT/retention-root-boundary-$implementation-third.ready"
+    third_proceed="$TMP_ROOT/retention-root-boundary-$implementation-third.proceed"
+    first_output="$TMP_ROOT/retention-root-boundary-$implementation-first.out"
+    second_output="$TMP_ROOT/retention-root-boundary-$implementation-second.out"
+    third_output="$TMP_ROOT/retention-root-boundary-$implementation-third.out"
+    mkfifo "$first_ready" "$first_proceed" "$second_ready" "$second_proceed" "$third_ready" "$third_proceed"
+    exec 7<>"$first_ready"; exec 8<>"$first_proceed"
+    exec 9<>"$second_ready"; exec 10<>"$second_proceed"
+    exec 11<>"$third_ready"; exec 12<>"$third_proceed"
+    FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_RETENTION_INTERVAL=3 FM_REPORT_RETENTION_ROOT_ADMISSION_TEST_READY="$first_ready" \
+      FM_REPORT_RETENTION_ROOT_ADMISSION_TEST_PROCEED="$first_proceed" \
+      "$executable" prune --status > "$first_output" 2>&1 &
+    first_pid=$!
+    IFS= read -r -t 10 state <&7 || fail "$implementation bucket-N process missed root admission"
+    [ "$state" = root-attempt-admitted ] || fail "$implementation bucket-N process emitted $state"
+    marker=$(find "$RETENTION_ADMISSION_DIR" -mindepth 1 -maxdepth 1 -type f -name "$prefix.*.json" | head -1)
+    first_bucket=${marker#"$RETENTION_ADMISSION_DIR/$prefix."}
+    first_bucket=${first_bucket%.json}
+    current_bucket=$first_bucket
+    while [ "$current_bucket" -le "$first_bucket" ]; do
+      current_bucket=$(node -e 'process.stdout.write(String(Math.floor(Date.now() / 3000)))')
+    done
+    FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_RETENTION_INTERVAL=3 FM_REPORT_RETENTION_ROOT_ADMISSION_TEST_READY="$second_ready" \
+      FM_REPORT_RETENTION_ROOT_ADMISSION_TEST_PROCEED="$second_proceed" \
+      "$executable" prune --status > "$second_output" 2>&1 &
+    second_pid=$!
+    IFS= read -r -t 10 state <&9 || fail "$implementation bucket-N+1 process missed root admission"
+    [ "$state" = root-attempt-admitted ] || fail "$implementation bucket-N+1 process emitted $state"
+    printf 'continue\n' >&8
+    wait "$first_pid" || fail "$implementation bucket-N process failed: $(cat "$first_output")"
+    FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
+      FM_REPORT_RETENTION_INTERVAL=3 FM_REPORT_RETENTION_ROOT_ADMISSION_TEST_READY="$third_ready" \
+      FM_REPORT_RETENTION_ROOT_ADMISSION_TEST_PROCEED="$third_proceed" \
+      "$executable" prune --status > "$third_output" 2>&1 &
+    third_pid=$!
+    if [ "$implementation" = control ]; then
+      if wait "$third_pid"; then status=0; else status=$?; fi
+      [ "$status" -eq 0 ] || fail "control third process failed: $(cat "$third_output")"
+      assert_grep '"admitted":false,"reason":"cadence"' "$third_output" \
+        "control third process was not rejected by the N+1 root admission"
+    else
+      IFS= read -r -t 10 state <&11 || fail "strict-older mutant did not admit a second N+1 process"
+      [ "$state" = root-attempt-admitted ] \
+        || fail "strict-older mutant failed for the wrong second-admission reason: $state"
+      printf 'continue\n' >&12
+      wait "$third_pid" || fail "strict-older mutant third process failed: $(cat "$third_output")"
+    fi
+    printf 'continue\n' >&10
+    wait "$second_pid" || fail "$implementation bucket-N+1 process failed: $(cat "$second_output")"
+    exec 7>&-; exec 8>&-; exec 9>&-; exec 10>&-; exec 11>&-; exec 12>&-
+  done
+  pass "root admission cleanup preserves current and future buckets"
+}
+
 test_retention_admission_mutation_inventory_is_complete() {
   node - "$ROOT" "$ROOT/tests/fm-report-stack-suite.sh" "$TMP_ROOT/changed-control-mutants" <<'NODE'
 const fs = require("fs");
@@ -5263,6 +5339,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_abandoned_reclaim_marker_is_recovered
   test_publish_lock_directory_symlink_fails_closed
   test_lock_control_files_are_bounded_and_nonfollowing
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = retention-root-boundary ]; then
+  test_root_retention_admission_preserves_newer_bucket
   exit 0
 fi
 
@@ -6542,6 +6623,7 @@ run_partitioned_test test_retention_quarantine_identity_mutation_is_detected
 run_partitioned_test test_retention_quarantine_postrename_predicate_mutations
 run_partitioned_test test_retention_postquarantine_javascript_predicate_mutations
 run_partitioned_test test_retention_admission_mutation_inventory_is_complete
+run_partitioned_test test_root_retention_admission_preserves_newer_bucket
 run_partitioned_test test_invalid_retention_configuration_is_admitted_before_validation
 run_partitioned_test test_retention_admission_and_lock_share_root_generation
 run_partitioned_test test_retention_batches_make_interruption_safe_progress

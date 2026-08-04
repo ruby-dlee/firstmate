@@ -1024,6 +1024,97 @@ PY
   pass "generated sandbox confines proof writes; installed enforcement denies shared private tmp when available"
 }
 
+test_real_claude_sandbox_executes_exact_sha_git_diff() {
+  local repo base head nonce profile output claude_bin sandbox_bin reviewer_home
+  if [ "${FM_TEST_REAL_CLAUDE_SANDBOX_GIT_DIFF:-0}" != 1 ]; then
+    printf 'SKIP: real Claude sandbox exact-SHA git-diff proof; set FM_TEST_REAL_CLAUDE_SANDBOX_GIT_DIFF=1 and FM_TEST_REAL_CLAUDE_CONFIG_DIR\n'
+    return
+  fi
+  reviewer_home=${FM_TEST_REAL_CLAUDE_CONFIG_DIR:-}
+  [ -n "$reviewer_home" ] \
+    || fail "FM_TEST_REAL_CLAUDE_CONFIG_DIR is required for the real Claude sandbox proof"
+  claude_bin=${FM_TEST_REAL_CLAUDE_BIN:-$(command -v claude || true)}
+  sandbox_bin=${FM_TEST_INSTALLED_SANDBOX_BIN:-/usr/bin/sandbox-exec}
+  [ -x "$claude_bin" ] || fail "real Claude binary is unavailable"
+  [ -x "$sandbox_bin" ] || fail "installed sandbox-exec is unavailable"
+  repo="$TMP_ROOT/real-claude-sandbox-git-diff/repo"
+  mkdir -p "$repo/.crosscheck/claude-tmp"
+  git -C "$repo" init -q -b main
+  printf 'base\n' > "$repo/runtime-proof.txt"
+  git -C "$repo" add runtime-proof.txt
+  git -C "$repo" commit -qm base
+  base=$(git -C "$repo" rev-parse HEAD)
+  nonce="real-claude-git-diff-$RANDOM-$$"
+  printf '%s\n' "$nonce" > "$repo/runtime-proof.txt"
+  git -C "$repo" add runtime-proof.txt
+  git -C "$repo" commit -qm head
+  head=$(git -C "$repo" rev-parse HEAD)
+  profile="$repo/.crosscheck/real-claude-sandbox.sb"
+  output="$repo/.crosscheck/real-claude-output.json"
+  python3 - "$CROSSCHECK_PY" "$profile" "$repo" "$reviewer_home" <<'PY' \
+    || fail "real Claude sandbox profile did not retain the narrow write contract"
+import importlib.util
+import json
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+profile = Path(sys.argv[2])
+repo = Path(sys.argv[3])
+reviewer_home = Path(sys.argv[4]).resolve()
+shared_claude = Path.home().joinpath(".claude").resolve()
+session_env = shared_claude / "session-env"
+try:
+    reviewer_home.relative_to(shared_claude)
+except ValueError:
+    pass
+else:
+    raise AssertionError("reviewer home must be independent of shared ~/.claude")
+module.write_sandbox_profile(
+    profile,
+    repo,
+    allow_network=True,
+    additional_writable_roots=(reviewer_home, session_env),
+)
+text = profile.read_text()
+assert f"  (subpath {json.dumps(str(session_env))})" in text
+assert f"  (subpath {json.dumps(str(shared_claude))})" not in text
+assert f"  (subpath {json.dumps(str(repo.resolve() / '.crosscheck' / 'claude-tmp'))})" not in text
+PY
+  CLAUDE_CONFIG_DIR="$reviewer_home" \
+  CLAUDE_CODE_TMPDIR="$repo/.crosscheck/claude-tmp" \
+  "$sandbox_bin" -f "$profile" "$claude_bin" -p \
+    --model claude-opus-5 \
+    --effort xhigh \
+    --dangerously-skip-permissions \
+    --tools Bash \
+    --no-session-persistence \
+    --output-format json \
+    --json-schema '{"type":"object","properties":{"base":{"type":"string"},"head":{"type":"string"},"diff":{"type":"string"},"claude_code_tmpdir":{"type":"string"}},"required":["base","head","diff","claude_code_tmpdir"],"additionalProperties":false}' \
+    "Use Bash to run git diff $base $head -- runtime-proof.txt in the current repository. Return the exact command output, both exact SHAs, and the CLAUDE_CODE_TMPDIR environment value. This is the real sandboxed Claude Bash exact-SHA git-diff proof." \
+    > "$output" \
+    || fail "real installed Claude could not execute git diff under the generated sandbox"
+  python3 - "$output" "$base" "$head" "$nonce" "$repo/.crosscheck/claude-tmp" <<'PY' \
+    || fail "real Claude output did not prove exact-SHA git diff with isolated scratch"
+import json
+import sys
+
+envelope = json.load(open(sys.argv[1]))
+assert envelope["is_error"] is False
+assert envelope["subtype"] == "success"
+assert envelope["terminal_reason"] == "completed"
+proof = envelope["structured_output"]
+assert proof["base"] == sys.argv[2]
+assert proof["head"] == sys.argv[3]
+assert sys.argv[4] in proof["diff"]
+assert proof["claude_code_tmpdir"] == sys.argv[5]
+PY
+  pass "real sandboxed Claude Bash executed git diff between two exact SHAs with isolated CLAUDE_CODE_TMPDIR"
+}
+
 test_symlinked_named_test_cannot_hide_test_mutation() {
   local record case_dir base head rc
   record=$(make_case symlink-forgery)
@@ -1530,6 +1621,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_ordinary_output_paths_remain_bounded|\
     test_final_wait_and_residual_processes_are_bounded|\
     test_installed_sandbox_denies_shared_private_tmp|\
+    test_real_claude_sandbox_executes_exact_sha_git_diff|\
     test_symlinked_named_test_cannot_hide_test_mutation|\
     test_evidence_batch_item_limit_precedes_execution|\
     test_evidence_batch_has_aggregate_deadline)
@@ -1571,6 +1663,7 @@ test_baseline_readable_state_is_destroyed_before_mutation
 test_mutation_is_bound_to_cited_non_test_implementation
 test_final_wait_and_residual_processes_are_bounded
 test_installed_sandbox_denies_shared_private_tmp
+test_real_claude_sandbox_executes_exact_sha_git_diff
 test_symlinked_named_test_cannot_hide_test_mutation
 test_evidence_batch_item_limit_precedes_execution
 test_evidence_batch_has_aggregate_deadline

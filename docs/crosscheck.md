@@ -167,6 +167,9 @@ The installed `/usr/bin/sandbox-exec` was also exercised with the generated prof
 `tests/fm-github-pr.test.sh` is hermetic coverage using checked-in TOON shapes observed from installed `gh-axi 0.1.25`.
 Most of `tests/fm-crosscheck.test.sh` is hermetic coverage using observed-shape GitHub, Codex, Claude, and sandbox fakes.
 Its `test_installed_sandbox_denies_shared_private_tmp` case is the exception: it invokes the real installed `/usr/bin/sandbox-exec` and verifies the generated proof profile denies shared host temporary state.
+Its tracked `test_real_claude_sandbox_executes_exact_sha_git_diff` case is an opt-in real-runtime guard: with `FM_TEST_REAL_CLAUDE_SANDBOX_GIT_DIFF=1` and `FM_TEST_REAL_CLAUDE_CONFIG_DIR` set to a credentialed independent Claude home, it launches installed Claude under the generated installed sandbox, requires Bash to execute `git diff` between two real exact SHAs, checks the isolated `CLAUDE_CODE_TMPDIR`, and rejects a profile that grants the shared `~/.claude` tree instead of only `~/.claude/session-env`.
+Ordinary CI prints a named skip for this network- and credential-dependent guard instead of substituting fake-only coverage.
+The retained live `c04e600d` runtime proof is the change receipt for this patch; the opt-in test is the repeatable regression guard for future environments.
 Its `test_forged_git_diff_mutation_command_is_rejected` case is the named regression that fails if a free-form `git diff --quiet # tests/regression.test.sh` can replace real mutation verification.
 Its `test_baseline_readable_state_is_destroyed_before_mutation` and `test_mutation_is_bound_to_cited_non_test_implementation` cases cover the two mutation-causality bypasses found in the final review round.
 `tests/fm-github-pr.test.sh` includes named cases for fieldless-array grammar, complete timeout-child cleanup, and refusal of the former public merge subcommand.

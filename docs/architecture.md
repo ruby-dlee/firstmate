@@ -16,7 +16,10 @@ Repeated unchanged wedge or permission-stall escalations add an escalation count
 Those actionable wakes are written to a durable local queue (`state/.wake-queue`) before detector state advances, so a missed process exit can be recovered by draining the queue.
 No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when `bin/fm-crew-state.sh` reports positive evidence that the crewmate is still working: an actively running no-mistakes step for that crewmate's branch or a backend busy signature.
 A crewmate that declares `paused:` for a known external wait is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
-For stale-pane triage only, that durable declaration also explains the expected idle pane after a matching no-mistakes run has reached current-state `done`; active and failed runs retain normal run-step precedence, and stopped crewmates without a declared pause surface immediately.
+A pause is a statement about the work rather than about the terminal, so it is honoured whether the crewmate's pane is alive, idle, or gone, and whatever its attributed no-mistakes run reports - parked, failed or cancelled, or unreadable.
+The single exception is an actively `working` run-step or busy pane, which supersedes the declaration because the crewmate resumed after making it.
+Absorption is gated instead on two proofs taken from the crewmate's own durable status stream: the pause verb carrying no failure vocabulary in its headline, and an empty keyed open/resolved fold, so a pause can never mask a still-unanswered decision.
+A crewmate with no locatable status stream is refused rather than absorbed, and stopped crewmates without a declared pause surface immediately.
 Pause cadence markers remain in force while the latest durable status still declares the pause and are cleared only after that status resumes, so every continuously declared pause still re-surfaces on the bounded long cadence.
 Its initial normal-mode status signal still surfaces through the no-verb path, while away mode self-handles that routine signal and owns the later recheck.
 Fresh stale panes use the same current-state read before trusting the status log, so an active run or busy pane outranks an old captain-relevant status-log line left behind before validation.

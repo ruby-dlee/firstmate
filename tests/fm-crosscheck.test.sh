@@ -719,6 +719,8 @@ test_installed_sandbox_denies_shared_private_tmp() {
   python3 - "$CROSSCHECK_PY" "$profile" "$marker" <<'PY' \
     || fail "generated proof sandbox permits shared host state"
 import importlib.util
+import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -736,28 +738,52 @@ module.write_sandbox_profile(
     allow_network=False,
     allow_posix_ipc=False,
 )
-assert "(allow ipc-posix*)" not in profile.read_text()
+profile_text = profile.read_text()
+writable_root = profile.parent.resolve()
+assert profile_text.splitlines() == [
+    "(version 1)",
+    "(deny default)",
+    "(allow process*)",
+    "(allow file-read*)",
+    "(allow sysctl-read)",
+    "(allow mach-lookup)",
+    "(allow file-ioctl)",
+    "(allow file-write*",
+    f"  (subpath {json.dumps(str(writable_root))})",
+    '  (literal "/dev/null"))',
+]
+assert "(allow ipc-posix*)" not in profile_text
 try:
-    result = subprocess.run(
-        [
-            "/usr/bin/sandbox-exec",
-            "-f",
-            str(profile),
-            "/bin/sh",
-            "-c",
-            f": > {shlex.quote(str(marker))}",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=5,
+    marker.resolve().relative_to(writable_root)
+except ValueError:
+    pass
+else:
+    raise AssertionError("shared host marker unexpectedly resolves inside proof root")
+try:
+    sandbox = Path(
+        os.environ.get("FM_TEST_INSTALLED_SANDBOX_BIN", "/usr/bin/sandbox-exec")
     )
-    assert result.returncode != 0
+    if sandbox.is_file():
+        result = subprocess.run(
+            [
+                str(sandbox),
+                "-f",
+                str(profile),
+                "/bin/sh",
+                "-c",
+                f": > {shlex.quote(str(marker))}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert result.returncode != 0
     assert not marker.exists()
 finally:
     marker.unlink(missing_ok=True)
 PY
-  pass "installed sandbox denies proof access to shared private tmp"
+  pass "generated sandbox confines proof writes; installed enforcement denies shared private tmp when available"
 }
 
 test_symlinked_named_test_cannot_hide_test_mutation() {

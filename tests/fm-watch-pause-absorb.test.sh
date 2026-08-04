@@ -291,9 +291,24 @@ paused: standing by for the decision on the rollback gap
   pass "a cached pause verdict is re-proven whenever the status stream changes under it"
 }
 
+test_pause_moving_during_pipeline_read_refused() {
+  export FM_FAKE_CREW_STATE_APPEND_STATUS='blocked: stream advanced during pipeline state read'
+  run_pause_case pause-moved-during-proof \
+    'paused: awaiting ordered PR merges
+' \
+    'state: parked · source: run-step · parked at ci: 1 finding(s)'
+  unset FM_FAKE_CREW_STATE_APPEND_STATUS
+  [ "$TRIAGE" = surfaced ] \
+    || fail "a pause invalidated during the crew-state read was absorbed"
+  [ "$PAUSE_FLAG" = absent ] \
+    || fail "a pause invalidated during the crew-state read wrote .paused-<key>"
+  pass "a pause invalidated during pipeline-state validation fails closed"
+}
+
 test_live_idle_paused_pane_absorbed
 test_dead_paused_pane_absorbed
 test_paused_with_open_decision_surfaced
 test_paused_with_closed_decision_absorbed
 test_cached_pause_verdict_reproven_when_stream_changes
+test_pause_moving_during_pipeline_read_refused
 test_crew_absorb_class_pause_matrix

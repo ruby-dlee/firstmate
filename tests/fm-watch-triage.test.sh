@@ -380,6 +380,7 @@ test_crew_absorb_class_classifier() {
   FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review'
   [ "$(crew_absorb_class a)" = none ] || fail "terminal run-step without pause context was absorbed"
   # ...and yields to one when the caller supplies it.
+  printf 'paused: awaiting ordered PR merges\n' > "$state/a.status"
   [ "$(crew_absorb_class a 'paused: awaiting ordered PR merges')" = paused ] \
     || fail "terminal run-step did not yield to a declared pause for absorb classification"
   # A FAILED run-step yields to a declared pause too, as of 2026-08-03. It used not
@@ -392,8 +393,17 @@ test_crew_absorb_class_classifier() {
   FM_FAKE_CREW_STATE='state: failed · source: run-step · validation failed'
   [ "$(crew_absorb_class a 'paused: awaiting ordered PR merges')" = paused ] \
     || fail "failed run-step did not yield to a declared external wait"
+  printf 'paused: error: drive run: read response: i/o timeout\n' > "$state/a.status"
   [ "$(crew_absorb_class a 'paused: error: drive run: read response: i/o timeout')" = none ] \
     || fail "a failure reported under the pause verb was absorbed behind a failed run-step"
+  printf 'blocked: stream advanced while pipeline state was read\n' > "$state/a.status"
+  [ "$(crew_absorb_class a 'paused: awaiting ordered PR merges')" = none ] \
+    || fail "a stale caller-supplied pause overrode the current status line"
+  printf 'paused: awaiting ordered PR merges\n' > "$state/a.status"
+  export FM_FAKE_CREW_STATE_APPEND_STATUS='blocked: stream advanced during pipeline state read'
+  [ "$(crew_absorb_class a 'paused: awaiting ordered PR merges')" = none ] \
+    || fail "a pause invalidated during the crew-state read was absorbed"
+  unset FM_FAKE_CREW_STATE_APPEND_STATUS
   FM_FAKE_CREW_STATE='state: working · source: status-log · working: compiling'
   [ "$(crew_absorb_class a)" = none ] || fail "stale working: status-log classed absorbable"
   FM_FAKE_CREW_STATE='state: unknown · source: none · worktree gone'

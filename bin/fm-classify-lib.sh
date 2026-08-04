@@ -249,8 +249,13 @@ EOF
 # is the durable open-set the fleet snapshot and any point-in-time consumer must use
 # instead of trusting the last status line.
 status_open_decisions() {  # <status-file>
-  local f=$1 line verb key note resolve open='' stripped
+  local f=$1
   [ -f "$f" ] || return 0
+  _fm_status_open_decisions_stream < "$f"
+}
+
+_fm_status_open_decisions_stream() {
+  local line verb key note resolve open='' stripped
   resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
   while IFS= read -r line || [ -n "$line" ]; do
     stripped=${line//[[:space:]]/}
@@ -269,7 +274,7 @@ status_open_decisions() {  # <status-file>
         [ -n "$open" ] && open="${open}"$'\n'
         ;;
     esac
-  done < "$f"
+  done
   printf '%s' "$open"
 }
 
@@ -341,12 +346,26 @@ _fm_status_file_for() {  # <id>
 # proven either way, so it is refused rather than absorbed: absence of a signal is
 # never evidence of a pause.
 crew_declared_pause_absorbable() {  # <id> [declared-pause-status-line]
-  local id=$1 declared=${2:-} f
+  local id=$1 declared=${2:-} f snapshot current before after
   f=$(_fm_status_file_for "$id")
   [ -n "$f" ] || return 1
-  [ -n "$declared" ] || declared=$(last_status_line "$f")
-  status_is_paused "$declared" || return 1
-  [ -z "$(status_open_decisions "$f")" ]
+  before=$(_fm_status_file_sig "$f")
+  [ -n "$before" ] || return 1
+  snapshot=$(cat "$f" 2>/dev/null) || return 1
+  current=$(printf '%s\n' "$snapshot" | grep -v '^[[:space:]]*$' | tail -1)
+  [ -z "$declared" ] || [ "$declared" = "$current" ] || return 1
+  status_is_paused "$current" || return 1
+  [ -z "$(printf '%s\n' "$snapshot" | _fm_status_open_decisions_stream)" ] || return 1
+  after=$(_fm_status_file_sig "$f")
+  [ -n "$after" ] && [ "$before" = "$after" ]
+}
+
+_fm_status_file_sig() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%z:%Fm' "$1" 2>/dev/null
+  else
+    stat -c '%s:%Y' "$1" 2>/dev/null
+  fi
 }
 
 # Classify WHY an idle/stale crewmate MIGHT be safely absorbed instead of surfaced.

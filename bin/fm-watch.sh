@@ -443,7 +443,16 @@ pause_state_class() {  # <window> <task>
   fi
   class=$(crew_absorb_class "$task" "$last")
   case "$class" in
-    paused) printf '%s' "$sig" > "$recheck_file" ;;
+    paused)
+      sig=$(stat_sig "$statusf")
+      if [ -z "$sig" ] || ! crew_declared_pause_absorbable "$task" "$last" \
+         || [ "$sig" != "$(stat_sig "$statusf")" ]; then
+        class=none
+        rm -f "$recheck_file"
+      else
+        printf '%s' "$sig" > "$recheck_file"
+      fi
+      ;;
     *) rm -f "$recheck_file" ;;
   esac
   printf '%s' "$class"

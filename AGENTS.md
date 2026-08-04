@@ -122,7 +122,7 @@ state/               volatile runtime signals; gitignored
   x-poll.error       generated X-mode relay diagnostic dedupe marker
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
   .afk               durable away-mode flag; present = sub-supervisor may deliver escalations (set by /afk, cleared on user return)
-  .lock              per-home session lock written by fm-lock.sh: harness PID on line 1, holder process start time on line 2; direct readers parse only the first-line PID, while acquire/status treat it as held only when that PID is live with a matching start time (skipped for a legacy one-line lock, which is held while its PID is a live harness) and is not a Codex app-server
+  .lock              per-home session lock; bin/fm-session-lock-lib.sh owns its exact format, liveness rules, and home-bound supervisor route proof; visible delivery requires that proof and never falls back to ambient terminal state
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
   .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .brief-started-* .seen-* .hb-surfaced-* .last-* .heartbeat-streak   watcher internals; never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
@@ -533,7 +533,7 @@ During the `ci` monitor phase, `bin/fm-crew-state.sh` also reads the ci step log
 - `running`/`fixing`/`ci` - the pipeline is working (a fix round, a test, or CI monitoring); `ci` stays working until the ci log's most recent recognized marker says checks passed or no checks are terminally ready, and a later re-arm or issue marker returns it to working.
 - `awaiting_approval`/`fix_review` - the run is parked waiting on the agent, surfaced as a top-level `awaiting_agent: parked <duration>` line right after `status:` in `axi status`.
   The crewmate owes a response; if it is idle-waiting for the run to advance on its own, steer it to follow no-mistakes' active-gate help.
-- `outcome: passed` or `checks-passed` - the helper reports `done`; for `passed`, it cross-checks the actual GitHub PR state and reports merged, open, closed-without-merge, or unavailable rather than deriving PR state from the pipeline outcome, while `checks-passed` means it is ready for PR review.
+- `outcome: passed` or `checks-passed` - an open PR reports `done` only when the remote-currentness contract owned by `bin/fm-crew-state.sh`'s header succeeds; `unknown` or `stale` always means `do not merge`.
 - `outcome: failed` or `cancelled` - the helper reports `failed`; inspect the run details and recover or report failure with evidence.
 - Red flag - self-fix duplication: a validating crewmate making fresh hand-commits, aborting the run, or re-running it mid-validation is re-doing work the pipeline already owns.
   Steer it back to no-mistakes' respond flow; the pipeline, not the crewmate, applies validation fixes.
@@ -541,6 +541,7 @@ During the `ci` monitor phase, `bin/fm-crew-state.sh` also reads the ci step log
 ### PR ready
 
 For PR-based ship tasks, the ready signal depends on mode: `no-mistakes` reports `done: PR <url> checks green` after CI is green, while `direct-PR` reports `done: PR <url>` after opening the PR.
+Before treating a no-mistakes ready signal as merge input, confirm `bin/fm-crew-state.sh <id>` reports `state: done`; a status-log PR URL alone is not currentness evidence, and `state: unknown` or `state: stale` with `do not merge` blocks this stage.
 Run `bin/fm-pr-check.sh <id> <PR url>` - it records `pr=` and GitHub's `pr_head=` when available in the task's meta and arms the watcher's merge poll.
 Tell the captain: the PR's full URL (always the complete `https://...` link, never a bare `#number` - the captain's terminal makes a full URL clickable), a one-paragraph summary, and, for `no-mistakes`, the risk level it emitted.
 (The check contract, for any custom `state/<id>.check.sh` you write yourself: print one line only when firstmate should wake, print nothing otherwise, and finish before `FM_CHECK_TIMEOUT`.)
@@ -556,7 +557,7 @@ bin/fm-teardown.sh <id>
 ```
 
 The watcher normally invokes `bin/fm-auto-reap.sh` as soon as a terminal `done` task's recorded PR is provably merged.
-The approved local-only merge helper and completed-scout signal take the same automatic path.
+The approved local-only merge helper takes the same automatic path, while a completed scout is visibly parked until its report has been reviewed and promotion has been considered.
 Auto-reaping cancels only an exactly attributed no-mistakes run, never guesses cross-branch process ownership, and then calls this ordinary teardown without `--force`.
 Persistent secondmates are excluded, and X-mode-linked tasks wait for their required final follow-up.
 An automatic refusal is an actionable wake and retains its metadata, worktree, and acquisition authority; after resolving the reported cause, retry with the ordinary command above.
@@ -584,9 +585,13 @@ It never authorizes discarding child or parent work.
 
 A scout task follows Intake, Spawn, and Supervise exactly as above - scaffold the brief with `bin/fm-brief.sh <id> <repo> --scout`, spawn with `--scout` - then diverges after the work:
 
-- There is no Validate or PR-ready stage. When the crewmate's status says `done`, read `data/<id>/report.md`.
+- There is no Validate or PR-ready stage.
+  When the crewmate's status says `done`, the watcher surfaces it as parked for report review and a promotion decision instead of tearing it down.
+  Read `data/<id>/report.md` while its worktree and loaded context remain available.
 - Relay the findings to the captain: plain chat for a focused answer, and a durable Lavish decision when multiple genuine choices need structured input.
-- The watcher automatically tears down on the terminal `done` signal - no merge gate.
+- If the findings warrant promotion, follow the Promotion flow below.
+  Otherwise, after explicitly deciding not to promote, run `bin/fm-auto-reap.sh task <id> scout-reviewed`.
+  That reviewed-scout path has no merge gate and delegates to ordinary teardown.
   For a post-cutover scout that ran, ordinary teardown still requires the report's completion sections and publishes it before removing the declared scratch worktree; a missing or incomplete report refuses auto-reaping because the findings are the work product.
   A failed direct spawn whose endpoint was never created may clear its bookkeeping without a report because no scout ran.
 - Record it in Done with the report path instead of a PR link using `tasks-axi done` when the default tasks-axi backend is active and compatible, otherwise hand-edit `data/backlog.md` and keep Done to the 10 most recent, then re-evaluate the queue and dispatch only queued work whose blockers are gone and whose time/date gate, if any, has arrived.
@@ -706,6 +711,7 @@ Inline facts that must survive without a loaded skill:
 ### Stuck-crewmate recovery
 
 On `stale`, `permission-prompt detected`, `permission/system-dialog suspected`, looping, repeated confusion, an answered-by-brief question, an unresponsive pane, or a failed steer, load `stuck-crewmate-recovery`.
+Also load it when no-mistakes reattach reports `drive run: reconcile run ... read response ... socket: i/o timeout`; its home-scoped helper owns the retry and forbids shared-daemon lifecycle changes.
 That playbook escalates from peek, to one-line steer, to harness-specific interrupt, to relaunch with a progress note, to `failed` with evidence.
 
 ## 9. Escalation and captain etiquette

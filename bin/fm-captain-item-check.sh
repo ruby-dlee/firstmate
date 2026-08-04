@@ -250,6 +250,36 @@ if [ "$headings" != "$expected_headings" ]; then
   add_failure 'invalid: structure - use the five required sections once each and in the documented order'
 fi
 
+if ! printf '%s\n' "$CHECK_TEXT" | awk '
+  BEGIN {
+    expected[1] = "## System and purpose"
+    expected[2] = "## Business impact"
+    expected[3] = "## Fix cost"
+    expected[4] = "## Leave cost"
+    expected[5] = "## Decision requested"
+  }
+  /^## / {
+    section += 1
+    if ($0 != expected[section]) exit 1
+    next
+  }
+  section == 0 && /^# [^#]/ {
+    if (title || seen_nonblank) exit 1
+    title = 1
+    next
+  }
+  section == 0 && $0 !~ /^[[:space:]]*$/ { exit 1 }
+  section > 0 && /^#{1,6}[[:space:]]/ { exit 1 }
+  section == 5 && decision_ended && $0 !~ /^[[:space:]]*$/ { exit 1 }
+  section == 5 && /\?/ { decision_ended = 1 }
+  $0 !~ /^[[:space:]]*$/ { seen_nonblank = 1 }
+  END {
+    if (section != 5) exit 1
+  }
+'; then
+  add_failure 'invalid: structure - allow only one optional title, the five section bodies, and no prose after the decision question'
+fi
+
 system_body=$(section_body '## System and purpose')
 if [ -n "$system_body" ] && ! printf '%s\n' "$system_body" \
   | grep -qiE '(^|[[:space:][:punct:]])(to|so|because|exists to)([[:space:][:punct:]]|$)'; then

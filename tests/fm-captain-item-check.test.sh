@@ -78,6 +78,26 @@ test_opaque_mechanism_fails() {
   pass "opaque mechanism and engineering evidence fail specifically"
 }
 
+test_unchecked_wrapper_prose_fails() {
+  local rc
+  {
+    printf 'Unchecked introduction.\n\n'
+    cat "$FIXTURES/positive/risk-billing.md"
+  } > "$TMP_ROOT/unchecked-introduction.md"
+  rc=$(run_check risk "$TMP_ROOT/unchecked-introduction.md")
+  [ "$rc" -eq 1 ] || fail "prose before the wrapper did not fail"
+  grep -F 'invalid: structure' "$TMP_ROOT/output" >/dev/null \
+    || fail "prose before the wrapper did not get a structure failure"
+
+  cp "$FIXTURES/positive/risk-billing.md" "$TMP_ROOT/unchecked-epilogue.md"
+  printf '\nUnchecked epilogue.\n' >> "$TMP_ROOT/unchecked-epilogue.md"
+  rc=$(run_check risk "$TMP_ROOT/unchecked-epilogue.md")
+  [ "$rc" -eq 1 ] || fail "prose after the decision question did not fail"
+  grep -F 'invalid: structure' "$TMP_ROOT/output" >/dev/null \
+    || fail "prose after the decision question did not get a structure failure"
+  pass "unchecked prose outside the wrapper fails"
+}
+
 test_verbatim_block_preserves_technical_detail() {
   local rc
   cp "$FIXTURES/positive/risk-billing.md" "$TMP_ROOT/verbatim.md"
@@ -154,6 +174,7 @@ test_negative_controls
 test_positive_controls
 test_decision_mode
 test_opaque_mechanism_fails
+test_unchecked_wrapper_prose_fails
 test_verbatim_block_preserves_technical_detail
 test_request_assembly
 test_usage_and_file_errors

@@ -348,7 +348,7 @@ classify_signal() {  # <reason-after-colon> <state>
           liveness=$(crew_state_liveness_verdict "$current")
           case "$liveness" in
             alive|'') ;;
-            dead|unknown)
+            stalled|dead|unknown)
               liveness_rel=1
               distilled="${distilled}${task} liveness ${liveness}: ${current} | "
               ;;
@@ -393,7 +393,7 @@ classify_stale() {  # <window> <state>
   liveness=$(crew_state_liveness_verdict "$current")
   case "$liveness" in
     alive|'') ;;
-    dead|unknown)
+    stalled|dead|unknown)
       printf 'escalate|%s liveness %s: %s' "$task" "$liveness" "$current"
       return
       ;;
@@ -434,7 +434,7 @@ classify_heartbeat() {  # [state]
     [ -n "$task" ] || continue
     case "$liveness" in
       alive) ;;
-      dead|unknown) distilled="${distilled}${task} liveness ${liveness}: ${current} | " ;;
+      stalled|dead|unknown) distilled="${distilled}${task} liveness ${liveness}: ${current} | " ;;
       *) distilled="${distilled}${task} liveness unknown: ${current} | " ;;
     esac
   done < <(scan_crew_liveness_observations "$state")
@@ -985,7 +985,7 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  3) heartbeat scan: every HEARTBEAT_SCAN_SECS, grep state/*.status for a
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
-  local state=$1 now due f key task win marker age last max_defer oldest pause_secs
+  local state=$1 now due f key task win marker age last owner clears max_defer oldest pause_secs
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -1079,7 +1079,9 @@ housekeeping() {  # <state>
       *)
         last=$(last_status_line "$state/$task.status")
         if [ -n "$last" ] && status_is_paused "$last"; then
-          escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
+          owner=$(status_pause_owner "$last")
+          clears=$(status_pause_clearing_condition "$last")
+          escalate_add "$state" "paused ${age}s (owner=$owner, clears=$clears; if the clearing condition now holds, resume or surface the still-paused lane): $win"
           _now > "$marker"
         else
           rm -f "$marker"

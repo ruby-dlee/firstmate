@@ -15,8 +15,8 @@
 # and log reads plus fixed mapping logic, no heuristics and no LLM. Output is one
 # stable, parseable, token-tight line firstmate can read every heartbeat:
 #
-#   state: <working|parked|done|stale|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
-#   ... · liveness: <alive|dead|unknown> · step: <name>
+#   state: <working|parked|done|stale|blocked|wedged|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
+#   ... · liveness: <alive|stalled|dead|unknown> · step: <name>
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
@@ -536,12 +536,12 @@ nm_active_step_name() {
   strip_quotes "$(trim "${row%%,*}")"
 }
 
-# One-line liveness verdict for the active step's own processes. Presence-only
-# (--sample 0) keeps the heartbeat path bounded and gives this consumer exactly
-# three verdicts: alive, dead, or unknown. A missing, failed, empty, or malformed
-# probe is unknown, never silence and never evidence of health or death.
+# One-line liveness verdict for the active step's own processes. The probe's
+# cross-heartbeat `--sample 0` path owns the CPU/process-progress measurement and
+# exposes four verdicts: alive, stalled, dead, or unknown. A missing, failed,
+# empty, or malformed probe is unknown, never silence and never evidence of health.
 nm_step_liveness() {
-  local run_id out status=0 verdict procs doing detail line
+  local run_id out status=0 verdict procs doing detail progress line
   run_id=$(strip_quotes "$(nm_field id)")
   [ -n "$run_id" ] || { printf 'unknown (probe unreadable: run id unavailable)'; return; }
   [ -x "$NM_LIVENESS_BIN" ] || { printf 'unknown (probe unreadable: executable unavailable)'; return; }
@@ -571,7 +571,7 @@ nm_step_liveness() {
   verdict=$(printf '%s\n' "$out" | sed -n 's/^liveness:[[:space:]]*\([a-z]*\).*/\1/p')
   procs=$(printf '%s\n' "$out" | sed -n 's/.*procs:[[:space:]]*\([0-9]*\).*/\1/p')
   case "$verdict" in
-    alive|dead|unknown) ;;
+    alive|stalled|dead|unknown) ;;
     *) printf 'unknown (probe result unparseable)'; return ;;
   esac
   case "$procs" in ''|*[!0-9]*) printf 'unknown (probe result unparseable)'; return ;; esac
@@ -581,11 +581,15 @@ nm_step_liveness() {
   doing=${out##*doing: }
   [ "$doing" = "$out" ] && doing=""
   line="$verdict ($procs procs)"
-  if [ "$verdict" = unknown ]; then
-    detail=${out##*"$SEP"}
-    [ "$detail" = "$out" ] && detail="probe reported unknown"
-    line="unknown ($procs procs; $detail)"
+  detail=${out#*"$SEP"procs: "$procs"}
+  [ "$detail" = "$out" ] && detail=""
+  detail=${detail#"$SEP"}
+  progress=${detail%%"$SEP"doing:*}
+  [ "$progress" = "$detail" ] && [ -n "$doing" ] && progress=""
+  if [ -z "$progress" ] && [ "$verdict" = unknown ]; then
+    progress="probe reported unknown"
   fi
+  [ -n "$progress" ] && line="$line; $progress"
   [ -n "$doing" ] && line="$line on $doing"
   printf '%s' "$line"
 }
@@ -820,6 +824,17 @@ if [ "$HAVE_RUN" = 1 ]; then
       ;;
   esac
 
+  # A later owned-and-clearing pause is the current state once a run has stopped
+  # at a terminal or approval-gate boundary. Active, failed, stale, and unknown
+  # run states retain run-step precedence and cannot hide behind a pause.
+  if status_is_paused "$LOG_LINE"; then
+    case "$RUN_STATE" in
+      done|parked)
+        emit paused status-log "$(status_line_note "$LOG_LINE")${SEP}run-step $RUN_STATE"
+        ;;
+    esac
+  fi
+
   emit "$RUN_STATE" run-step "$RUN_DETAIL"
 fi
 
@@ -853,9 +868,16 @@ fi
 # `unknown` verdict as the "not a state" test needs no second verb list here.
 if [ -n "$LOG_VERB" ]; then
   LOG_STATE=$(map_log_state "$LOG_LINE")
-  if [ "$LOG_STATE" != unknown ]; then
-    emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")"
-  fi
+  case "$LOG_STATE" in
+    working)
+      [ "$KIND" = secondmate ] \
+        && emit working status-log "$(status_line_note "$LOG_LINE")"
+      emit wedged status-log "stopped without positive working evidence; last event: $(status_line_note "$LOG_LINE")"
+      ;;
+    unknown) ;;
+    *) emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")" ;;
+  esac
 fi
 
-emit unknown none "no current-state source available"
+[ "$KIND" = secondmate ] && emit unknown none "idle secondmate with no current-state event"
+emit wedged none "stopped without positive working evidence or an owned-and-clearing pause"

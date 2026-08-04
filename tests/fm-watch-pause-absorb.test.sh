@@ -125,7 +125,7 @@ run_pause_case() {  # <case-name> <status-stream> <crew-state-verdict>
 # WORK, so a run-step that is merely parked must not veto it.
 test_live_idle_paused_pane_absorbed() {
   run_pause_case live-idle-paused \
-    'paused: work complete and verified; waiting on the merge of PR 882 by the main firstmate
+    'paused: work complete and verified; waiting on the merge of PR 882 by the main firstmate; owner=main firstmate; clears=PR 882 is merged
 ' \
     'state: parked · source: run-step · parked at ci: 1 finding(s)'
   [ "$TRIAGE" = absorbed ] \
@@ -143,7 +143,7 @@ test_live_idle_paused_pane_absorbed() {
 # liveness was never the discriminator in either direction.
 test_dead_paused_pane_absorbed() {
   run_pause_case dead-paused \
-    'paused: agent is quota-dead, work preserved and verified; waiting on the account reset
+    'paused: agent is quota-dead, work preserved and verified; waiting on the account reset; owner=account owner; clears=the account quota resets
 ' \
     'state: unknown · source: none · backend target gone: test:fm-dead-paused'
   [ "$TRIAGE" = absorbed ] \
@@ -161,7 +161,7 @@ test_dead_paused_pane_absorbed() {
 test_paused_with_open_decision_surfaced() {
   run_pause_case paused-open-decision \
     'needs-decision [key=rollback-empty-pointer]: merge as-is, or fix the empty-pointer refusal here?
-paused: standing by for the decision on the rollback gap
+paused: standing by for the decision on the rollback gap; owner=captain; clears=the rollback decision is answered
 ' \
     'state: unknown · source: none · backend target gone: test:fm-paused-open-decision'
   [ "$TRIAGE" = surfaced ] \
@@ -183,7 +183,7 @@ test_paused_with_closed_decision_absorbed() {
 done: PR https://github.com/Ruby-Labs/relvino/pull/882 checks green; NOT merged
 needs-decision [key=rollback-empty-pointer]: merge as-is, or fix the empty-pointer refusal here?
 resolved [key=rollback-empty-pointer]: option (a) approved - merge this rebase as-is
-paused: work complete and verified; waiting on the merge of PR 882 by the main firstmate
+paused: work complete and verified; waiting on the merge of PR 882 by the main firstmate; owner=main firstmate; clears=PR 882 is merged
 ' \
     'state: parked · source: run-step · parked at ci: 1 finding(s)'
   [ "$TRIAGE" = absorbed ] \
@@ -203,7 +203,7 @@ test_crew_absorb_class_pause_matrix() {
   dir=$(make_case absorb-pause-matrix); state="$dir/state"; fakebin="$dir/fakebin"
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_FAKE_CREW_STATE FM_STATE_OVERRIDE="$state"
 
-  local paused='paused: waiting on the merge of PR 882'
+  local paused='paused: waiting on the merge of PR 882; owner=main firstmate; clears=PR 882 is merged'
   printf '%s\n' "$paused" > "$state/a.status"
 
   # Every non-working verdict must yield to the declared pause, including the three
@@ -252,7 +252,7 @@ test_crew_absorb_class_pause_matrix() {
     || fail "a resolved decision still blocked absorption"
 
   # A FAILURE reported under the pause verb is not a wait and must never absorb.
-  local failpause='paused: error: drive run: reconcile run: read response: i/o timeout'
+  local failpause='paused: error: drive run: reconcile run: read response: i/o timeout; owner=drive; clears=the reconcile run returns'
   printf '%s\n' "$failpause" > "$state/a.status"
   FM_FAKE_CREW_STATE='state: unknown · source: none · backend target gone'
   [ "$(crew_absorb_class a "$failpause")" = none ] \
@@ -278,9 +278,9 @@ test_crew_absorb_class_pause_matrix() {
 test_cached_pause_verdict_reproven_when_stream_changes() {
   PRESEED_PAUSED=1
   run_pause_case cached-pause-stale-proof \
-    'paused: waiting on the merge of PR 882
+    'paused: waiting on the merge of PR 882; owner=main firstmate; clears=PR 882 is merged
 needs-decision [key=rollback-empty-pointer]: merge as-is, or fix the empty-pointer refusal here?
-paused: standing by for the decision on the rollback gap
+paused: standing by for the decision on the rollback gap; owner=captain; clears=the rollback decision is answered
 ' \
     'state: unknown · source: none · backend target gone: test:fm-cached-pause-stale-proof'
   PRESEED_PAUSED=0
@@ -294,7 +294,7 @@ paused: standing by for the decision on the rollback gap
 test_pause_moving_during_pipeline_read_refused() {
   export FM_FAKE_CREW_STATE_APPEND_STATUS='blocked: stream advanced during pipeline state read'
   run_pause_case pause-moved-during-proof \
-    'paused: awaiting ordered PR merges
+    'paused: awaiting ordered PR merges; owner=merge supervisor; clears=ordered merges complete
 ' \
     'state: parked · source: run-step · parked at ci: 1 finding(s)'
   unset FM_FAKE_CREW_STATE_APPEND_STATUS

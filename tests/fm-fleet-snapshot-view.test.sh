@@ -189,9 +189,10 @@ test_snapshot_preserves_liveness_and_decision_actionability() {
   printf 'needs-decision [key=review]: inspect the stopped validation\n' > "$home/state/task.status"
   fakebin=$(make_fakebin "$home")
 
-  for verdict in alive dead unknown absent; do
+  for verdict in alive stalled dead unknown absent; do
     case "$verdict" in
       alive) current='state: working · source: run-step · validating (running) · liveness: alive (2 procs) · step: test'; expected_pending=false ;;
+      stalled) current='state: working · source: run-step · validating (running) · liveness: stalled (2 procs; cpu +0.01s/30s) · step: test'; expected_pending=true ;;
       dead) current='state: working · source: run-step · validating (running) · liveness: dead (0 procs) · step: test'; expected_pending=true ;;
       unknown) current='state: working · source: run-step · validating (running) · liveness: unknown (probe timed out) · step: test'; expected_pending=true ;;
       absent) current='state: working · source: run-step · validating (running)'; expected_pending=false ;;
@@ -217,7 +218,7 @@ test_snapshot_preserves_liveness_and_decision_actionability() {
     FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_FAKE_CREW_STATE="$current" "$VIEW")
   assert_contains "$view" "liveness:unknown" "the human fleet view keeps unknown visibly distinct"
-  pass "fleet snapshot and view preserve alive/dead/unknown liveness without assuming unknown is healthy"
+  pass "fleet snapshot and view preserve alive/stalled/dead/unknown liveness without assuming uncertainty or a stall is healthy"
 }
 
 test_event_hints_follow_reconciled_current_state() {

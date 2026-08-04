@@ -118,7 +118,7 @@ EOF
     "harness=codex" \
     "kind=ship" \
     "mode=no-mistakes"
-  printf 'paused: declared external-wait for upstream release\n' > "$home/state/external-wait.status"
+  printf 'paused: declared external-wait for upstream release; owner=release team; clears=release artifact is published\n' > "$home/state/external-wait.status"
   # The secondmate's OWN home backlog records a merge it managed. This lands in the
   # secondmate home, never the main backlog, so landed-work views only see it via the
   # bounded cross-home Done roll-up.

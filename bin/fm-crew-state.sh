@@ -15,8 +15,8 @@
 # and log reads plus fixed mapping logic, no heuristics and no LLM. Output is one
 # stable, parseable, token-tight line firstmate can read every heartbeat:
 #
-#   state: <working|parked|done|stale|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
-#   ... · liveness: <alive|dead|unknown> · step: <name>
+#   state: <working|parked|done|stale|blocked|wedged|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
+#   ... · liveness: <alive|stalled|dead|unknown> · step: <name>
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
@@ -539,12 +539,13 @@ nm_active_step_name() {
 # One-line liveness verdict for the active step's own processes. A one-second
 # in-invocation membership sample lets this one-shot caller establish child
 # turnover without paying the 20-second window CPU rates require. Stable process
-# membership falls back to the probe's preserved long-window CPU baseline. This
-# consumer accepts exactly three verdicts: alive, dead, or unknown. A missing,
+# membership falls back to the probe's preserved long-window CPU baseline. The
+# probe owns the CPU-versus-elapsed measurement and its threshold; this consumer
+# accepts exactly four verdicts: alive, stalled, dead, or unknown. A missing,
 # failed, empty, or malformed probe is unknown, never silence and never evidence
 # of health or death.
 nm_step_liveness() {
-  local run_id out status=0 verdict procs doing grade detail detail_fields line rest reported_run structured_detail
+  local run_id out status=0 verdict procs doing grade detail detail_fields line rest reported_run structured_detail progress
   run_id=$(strip_quotes "$(nm_field id)")
   [ -n "$run_id" ] || { printf 'unknown (probe unreadable: run id unavailable)'; return; }
   [ -x "$NM_LIVENESS_BIN" ] || { printf 'unknown (probe unreadable: executable unavailable)'; return; }
@@ -610,7 +611,7 @@ nm_step_liveness() {
     grade:\ *) grade=${structured_detail#grade: }; grade=${grade%%"$SEP"*} ;;
   esac
   case "$verdict" in
-    alive|dead|unknown) ;;
+    alive|stalled|dead|unknown) ;;
     *) printf 'unknown (probe protocol unreadable: verdict missing or invalid)'; return ;;
   esac
   case "$procs" in
@@ -619,11 +620,14 @@ nm_step_liveness() {
       return
       ;;
   esac
+  # Both positive-presence verdicts carry the same invariant: `stalled` means the
+  # probe watched processes that failed to advance, so a zero count is a protocol
+  # violation there exactly as it is for `alive`.
   case "$verdict" in
-    alive)
+    alive|stalled)
       case "$procs" in
         *[1-9]*) ;;
-        *) printf 'unknown (probe protocol unreadable: alive verdict requires processes)'; return ;;
+        *) printf 'unknown (probe protocol unreadable: %s verdict requires processes)' "$verdict"; return ;;
       esac
       ;;
     dead)
@@ -638,6 +642,7 @@ nm_step_liveness() {
   doing=${out##*doing: }
   [ "$doing" = "$out" ] && doing=""
   line="$verdict ($procs procs)"
+  progress=""
   if [ "$verdict" = unknown ]; then
     case "$grade" in
       unreadable|present-unproven|present-no-progress|transition) ;;
@@ -649,7 +654,14 @@ nm_step_liveness() {
       "$detail_fields"|grade:*) detail="probe reported unknown" ;;
     esac
     line="unknown (grade: $grade; $procs procs; $detail)"
+  else
+    # A decided verdict keeps the probe's own CPU-versus-elapsed evidence, which
+    # is what separates measured work from a process set sitting at the near-zero
+    # floor. `doing:` is already excluded: structured_detail comes from the
+    # prefix before it, so truncated argv can never be read as progress.
+    progress=$structured_detail
   fi
+  [ -n "$progress" ] && line="$line; $progress"
   [ -n "$doing" ] && line="$line on $doing"
   printf '%s' "$line"
 }
@@ -884,6 +896,17 @@ if [ "$HAVE_RUN" = 1 ]; then
       ;;
   esac
 
+  # A later owned-and-clearing pause is the current state once a run has stopped
+  # at a terminal or approval-gate boundary. Active, failed, stale, and unknown
+  # run states retain run-step precedence and cannot hide behind a pause.
+  if status_is_paused "$LOG_LINE"; then
+    case "$RUN_STATE" in
+      done|parked)
+        emit paused status-log "$(status_line_note "$LOG_LINE")${SEP}run-step $RUN_STATE"
+        ;;
+    esac
+  fi
+
   emit "$RUN_STATE" run-step "$RUN_DETAIL"
 fi
 
@@ -917,9 +940,16 @@ fi
 # `unknown` verdict as the "not a state" test needs no second verb list here.
 if [ -n "$LOG_VERB" ]; then
   LOG_STATE=$(map_log_state "$LOG_LINE")
-  if [ "$LOG_STATE" != unknown ]; then
-    emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")"
-  fi
+  case "$LOG_STATE" in
+    working)
+      [ "$KIND" = secondmate ] \
+        && emit working status-log "$(status_line_note "$LOG_LINE")"
+      emit wedged status-log "stopped without positive working evidence; last event: $(status_line_note "$LOG_LINE")"
+      ;;
+    unknown) ;;
+    *) emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")" ;;
+  esac
 fi
 
-emit unknown none "no current-state source available"
+[ "$KIND" = secondmate ] && emit unknown none "idle secondmate with no current-state event"
+emit wedged none "stopped without positive working evidence or an owned-and-clearing pause"

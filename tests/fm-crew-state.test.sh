@@ -1530,7 +1530,7 @@ test_supervisor_read_separates_paused_wedged_unknown() {
   case "$silent_out:$(crew_absorb_class supervisor-silent)" in
     *"state: unknown"*:none) case "$silent_out" in *"state: paused"*) ;; *) correct=$((correct + 1)) ;; esac ;;
   esac
-  unset FM_FAKE_CREW_STATE
+  unset FM_FAKE_CREW_STATE FM_CREW_STATE_BIN
 
   [ "$correct" -eq 3 ] \
     || fail "$correct of 3 supervisor states were distinct: wedged=[$wedged_out] paused=[$paused_out] silent=[$silent_out]"

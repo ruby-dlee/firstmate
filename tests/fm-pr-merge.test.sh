@@ -191,7 +191,7 @@ SH
 }
 
 run_pr_merge() {
-  local case_dir=$1 expected_head= queue_status=
+  local case_dir=$1 expected_head='' queue_status=''
   shift
   [ ! -f "$case_dir/expected-head" ] || expected_head=$(cat "$case_dir/expected-head")
   [ ! -f "$case_dir/queue-status" ] || queue_status=$(cat "$case_dir/queue-status")

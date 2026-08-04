@@ -15,17 +15,28 @@ The permission-prompt matcher and the explicitly heuristic macOS system-dialog f
 Repeated unchanged wedge or permission-stall escalations add an escalation count to the wake reason and, at `FM_WEDGE_DEMAND_INSPECT_COUNT`, a `demand-deep-inspection` marker.
 Those actionable wakes are written to a durable local queue (`state/.wake-queue`) before detector state advances, so a missed process exit can be recovered by draining the queue.
 No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when `bin/fm-crew-state.sh` reports positive evidence that the crewmate is still working: an actively running no-mistakes step for that crewmate's branch or a backend busy signature.
-A crewmate that declares `paused:` for a known external wait is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
+When such a pane stays static through `FM_STALE_ESCALATE_SECS`, the watcher re-reads the step-liveness verdict before escalating.
+The step-liveness probe owns the CPU-versus-elapsed measurement and threshold: `alive` means worktree processes measurably advanced CPU or process membership, while presence without established progress is graded `unknown` rather than called alive.
+Only `alive` refreshes the bounded wedge observation; every other verdict remains actionable, so process presence alone never suppresses a wedge.
+
+The pause contract is `paused: <reason>; owner=<named owner>; clears=<observable condition>`.
+The owner may be a person, team, service, or other accountable role, and `clears` must name a fact, event, or time a supervisor can observe rather than a vague intention.
+Only a non-failure declaration carrying both non-placeholder fields earns pause absorption.
+A bare pause verb, a missing owner, or a missing clearing condition is actionable stopped work and receives no marker or pause cadence.
+The normal watcher writes `.paused-<window>` and `.paused-rechecked-<window>` before returning the declaration's initial one-time signal wake, so re-arming cannot lose the state transition.
+An owned pause is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
 A pause is a statement about the work rather than about the terminal, so wake classification honours it whether the crewmate's pane is alive, idle, or gone, and whatever its attributed no-mistakes run reports - parked, failed or cancelled, or unreadable.
 That classification never transfers custody of an in-flight validation run: `AGENTS.md` section 8 owns the boundary that requires the supervisor to steer a paused lane back to attending and driving its run.
 The single exception is an actively `working` run-step or busy pane, which supersedes the declaration because the crewmate resumed after making it.
-Absorption is gated on two proofs taken from one immutable read of the crewmate's current durable status stream: the pause verb carrying no failure vocabulary in its headline, and an empty keyed open/resolved fold, so a pause can never mask a still-unanswered decision.
+Absorption is gated on two proofs taken from one immutable read of the crewmate's current durable status stream: an owned-and-clearing declaration carrying no failure vocabulary in its headline, and an empty keyed open/resolved fold, so a pause can never mask a still-unanswered decision.
 The Herdr native blocked-transition edge does not yet honour this invariant, which is a known defect tracked as `herdr-push-transition-pause-gate-h8`: on that edge a lane that owes an unanswered keyed decision can be silently absorbed and go quiet.
-A crewmate with no locatable status stream is refused rather than absorbed, and stopped crewmates without a declared pause surface immediately.
+A crewmate with no locatable status stream is refused rather than absorbed, and stopped crewmates without a valid declaration surface immediately.
+Inside `bin/fm-crew-state.sh` itself the same declaration also becomes the reported current state once its attributed run has stopped at a terminal or approval-gate boundary (`done` or `parked`); active, failed, stale, and unknown runs retain run-step precedence there.
 Pause cadence markers remain in force while the latest durable status still declares the pause and are cleared only after that status resumes, so every continuously declared pause still re-surfaces on the bounded long cadence.
 Its initial normal-mode status signal still surfaces through the no-verb path, while away mode self-handles that routine signal and owns the later recheck.
+The bounded recheck includes the named owner and clearing condition, so a supervisor that observes the condition has passed can resume or surface a lane whose declaration still persists.
 Fresh stale panes use the same current-state read before trusting the status log, so an active run or busy pane outranks an old captain-relevant status-log line left behind before validation.
-Heartbeats are benign only when the fleet scan finds neither an unsurfaced captain-relevant status nor a `dead` or `unknown` command-step liveness observation.
+Heartbeats are benign only when the fleet scan finds neither an unsurfaced captain-relevant status nor a `stalled`, `dead`, or `unknown` command-step liveness observation.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
 At each drain boundary, `fm-wake-drain.sh` first intakes durable Lavish answers, then drains queued wakes and runs the same liveness guard as the supervision scripts, so unreceipted answers recover and a lapsed watcher chain surfaces even on a turn that only drains and handles queued wakes.
 Routine watcher polling, supervision no-ops, elapsed waiting time, and absorbed benign wakes stay silent.
@@ -38,7 +49,8 @@ During no-mistakes' `ci` monitor phase, it also reads the ci step log tail becau
 The most recent recognized ci log marker wins, so checks-green monitoring supplies the ready claim while a later re-arm, failed-check, or issue marker returns the crewmate to working before remote currentness is considered.
 Only when no matching run exists does it fall back to the pane busy-signature and then a status-log event whose verb maps to a recognized run-state; a dead pane without a run reports unknown instead of trusting a stale log.
 Decision-only events such as `resolved` never become current state or leak their prose into the current-state detail.
-In that status-log fallback, a declared external wait reports the distinct `paused` state with its reason.
+In that status-log fallback, a valid external wait reports `paused` with its reason, owner, and clearing condition.
+A readable idle ordinary crewmate with no positive working evidence and no valid pause reports `wedged`, while missing or unreadable evidence remains `unknown`; neither is treated as healthy.
 For herdr, that pane fallback trusts a native `busy` verdict outright, but corroborates native `idle` or unknown verdicts against the rendered busy signature before deciding the crewmate is not working.
 For whole-fleet read-only review, `bin/fm-fleet-snapshot.sh --json` emits schema `fm-fleet-snapshot.v1` from the backlog, task metadata, current crewmate state, endpoint probes, PR/report pointers, scout reports, the bounded landed-work roll-up from registered secondmate homes, and secondmate return-channel guidance.
 `bin/fm-fleet-view.sh` renders that snapshot as Markdown for humans, while `bin/fm-bearings-snapshot.sh` provides the bounded bearings projection, so both views consume one structured contract instead of reparsing raw fleet files.

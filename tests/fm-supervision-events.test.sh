@@ -71,7 +71,7 @@ pass "handle_push_transition: enqueue failure cannot commit the Herdr dedupe mar
 
 reset_state
 fm_write_meta "$STATE_DIR/tk2.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
-printf 'paused: waiting on the upstream release\n' > "$STATE_DIR/tk2.status"
+printf 'paused: waiting on the upstream release; owner=release team; clears=release artifact is published\n' > "$STATE_DIR/tk2.status"
 handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
 if [ -e "$STATE_DIR/.wake-queue" ] && grep -q 'stale' "$STATE_DIR/.wake-queue"; then
   fail "a declared-pause crew must NOT be fast-escalated: $(cat "$STATE_DIR/.wake-queue")"

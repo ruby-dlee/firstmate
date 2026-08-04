@@ -207,8 +207,9 @@ case "${FM_FAKE_LIVENESS_MODE:-}" in
   empty-procs) printf 'liveness: unknown · run: 01RUN · procs:  · grade: unreadable · missing count · doing: bash t.sh (1:00)\n' ;;
   argv-fields) printf 'liveness: unknown · run: 01RUN · procs: 3 · grade: present-unproven · presence established · doing: python -c "procs: x grade: bogus" (1:00)\n' ;;
   nonzero) exit 9 ;;
+  stalled) printf 'liveness: stalled · run: 01RUN · procs: 2 · no persistent process advanced cpu in 30s (best +0.01s)\n' ;;
   timeout) sleep 30 ;;
-  *) printf 'liveness: alive · run: 01RUN · procs: 1 · processes present\n' ;;
+  *) printf 'liveness: alive · run: 01RUN · procs: 1 · persistent process advanced cpu over 30s (best +0.04s)\n' ;;
 esac
 SH
   chmod +x "$fb/no-mistakes" "$fb/tmux" "$fb/gh-axi" "$fb/git" "$fb/herdr" "$fb/fake-liveness"
@@ -554,6 +555,12 @@ test_quiet_step_probe_failures_are_unknown() {
   assert_contains "$out" "probe unreadable: active step unavailable" "a missing active step explains its unreadable cause"
 
   FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-qu test)"
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=stalled \
+    run_crew_state "$d" feat-qu)
+  assert_contains "$out" "liveness: stalled (2 procs)" "the probe's near-zero CPU verdict remains stalled"
+  assert_contains "$out" "no persistent process advanced cpu in 30s (best +0.01s)" \
+    "the stalled verdict preserves its CPU-versus-elapsed evidence"
+
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=empty \
     run_crew_state "$d" feat-qu)
   assert_contains "$out" "liveness: unknown" "an empty probe result is visibly unknown"
@@ -1495,7 +1502,7 @@ test_no_run_idle_pane_paused() {
   make_repo_on_branch "$d/wt" fm/feat-pause
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-pause.meta" "window=fm:fm-feat-pause" "worktree=$d/wt" "kind=ship"
-  printf 'paused: holding for the upstream tool release\n' > "$d/state/feat-pause.status"
+  printf 'paused: holding for the upstream tool release; owner=tool maintainer; clears=release artifact is published\n' > "$d/state/feat-pause.status"
   FM_FAKE_AXI_STATUS=""
   FM_FAKE_BUSY=0
   local out; out=$(run_crew_state "$d" feat-pause)
@@ -1511,7 +1518,7 @@ test_no_run_idle_pane_custom_paused_verb() {
   make_repo_on_branch "$d/wt" fm/feat-custom-pause
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-custom-pause.meta" "window=fm:fm-feat-custom-pause" "worktree=$d/wt" "kind=ship"
-  printf 'awaiting: vendor maintenance window\n' > "$d/state/feat-custom-pause.status"
+  printf 'awaiting: vendor maintenance window; owner=vendor; clears=maintenance window closes\n' > "$d/state/feat-custom-pause.status"
   FM_FAKE_AXI_STATUS=""
   FM_FAKE_BUSY=0
   local out; out=$(FM_CLASSIFY_PAUSED_VERB=awaiting run_crew_state "$d" feat-custom-pause)
@@ -1520,8 +1527,59 @@ test_no_run_idle_pane_custom_paused_verb() {
   assert_contains "$out" "vendor maintenance window" "custom pause preserves its reason"
   printf 'paused: default verb no longer selected\n' > "$d/state/feat-custom-pause.status"
   out=$(FM_CLASSIFY_PAUSED_VERB=awaiting run_crew_state "$d" feat-custom-pause)
-  assert_contains "$out" "state: unknown" "custom paused verb replaces the default"
+  assert_contains "$out" "state: wedged" "custom paused verb leaves the unrecognized default stopped, not paused"
   pass "no run + idle pane honors the configured paused verb"
+}
+
+# The supervisor-facing reader must preserve three separate outcomes: a readable
+# stopped lane without positive work evidence is wedged, an auditable declaration
+# is paused, and a lane with no readable evidence remains unknown.  In particular,
+# silence must never inherit paused health from the pause vocabulary.
+test_supervisor_read_separates_paused_wedged_unknown() {
+  reset_fakes
+  local wedged paused silent wedged_out paused_out silent_out correct=0
+
+  wedged=$(new_case supervisor-wedged)
+  make_repo_on_branch "$wedged/wt" fm/supervisor-wedged
+  make_fakebin "$wedged" >/dev/null
+  fm_write_meta "$wedged/state/supervisor-wedged.meta" \
+    "window=fm:fm-supervisor-wedged" "worktree=$wedged/wt" "kind=ship"
+  printf 'working: implementation was in progress\n' > "$wedged/state/supervisor-wedged.status"
+  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_BUSY=0
+  wedged_out=$(run_crew_state "$wedged" supervisor-wedged)
+  case "$wedged_out" in
+    *"state: wedged"*) case "$wedged_out" in *"state: paused"*) ;; *) correct=$((correct + 1)) ;; esac ;;
+  esac
+
+  paused=$(new_case supervisor-paused)
+  make_repo_on_branch "$paused/wt" fm/supervisor-paused
+  make_fakebin "$paused" >/dev/null
+  fm_write_meta "$paused/state/supervisor-paused.meta" \
+    "window=fm:fm-supervisor-paused" "worktree=$paused/wt" "kind=ship"
+  printf 'paused: validation hold; owner=supervisor; clears=supervisor lifts the hold after host load recovers\n' \
+    > "$paused/state/supervisor-paused.status"
+  paused_out=$(run_crew_state "$paused" supervisor-paused)
+  case "$paused_out" in
+    *"state: paused"*"owner=supervisor"*"clears=supervisor lifts the hold after host load recovers"*)
+      correct=$((correct + 1))
+      ;;
+  esac
+
+  silent=$(new_case supervisor-silent)
+  make_fakebin "$silent" >/dev/null
+  silent_out=$(run_crew_state "$silent" supervisor-silent)
+  export FM_CREW_STATE_BIN="$silent/fakebin/fm-crew-state.sh"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · no metadata'
+  case "$silent_out:$(crew_absorb_class supervisor-silent)" in
+    *"state: unknown"*:none) case "$silent_out" in *"state: paused"*) ;; *) correct=$((correct + 1)) ;; esac ;;
+  esac
+  unset FM_FAKE_CREW_STATE
+
+  [ "$correct" -eq 3 ] \
+    || fail "$correct of 3 supervisor states were distinct: wedged=[$wedged_out] paused=[$paused_out] silent=[$silent_out]"
+  pass "supervisor read keeps wedged, owned pause, and unknown silence distinct"
 }
 
 # A trailing keyed resolved: event is a decision-CLOSING event, not a run-state
@@ -1735,6 +1793,11 @@ test_usage_error() {
   pass "usage error exits 2"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = supervision-states ]; then
+  test_supervisor_read_separates_paused_wedged_unknown
+  exit 0
+fi
+
 test_active_run_is_authoritative
 test_quiet_step_reports_dead_liveness
 test_quiet_step_reports_alive_liveness
@@ -1787,6 +1850,7 @@ test_skipped_run_lookup_rejects_checks_green_log
 test_no_run_idle_pane_uses_keyed_log
 test_no_run_idle_pane_paused
 test_no_run_idle_pane_custom_paused_verb
+test_supervisor_read_separates_paused_wedged_unknown
 test_no_run_idle_secondmate_resolved_event_not_state
 test_dead_window_ignores_stale_status_log
 test_dead_window_still_reports_terminal_run_step

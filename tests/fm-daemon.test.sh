@@ -133,7 +133,7 @@ test_classify_check_and_unknown_escalate() {
 
 test_liveness_verdicts_surface_through_away_classifiers() {
   local verdict dir state fakebin current out
-  for verdict in alive dead unknown; do
+  for verdict in alive stalled dead unknown; do
     dir=$(make_supercase "away-liveness-$verdict")
     state="$dir/state"
     fakebin="$dir/fakebin"
@@ -146,7 +146,7 @@ test_liveness_verdicts_surface_through_away_classifiers() {
       FM_FAKE_CREW_STATE="$current" classify_signal "$state/task.turn-ended" "$state")
     case "$verdict:$out" in
       alive:self\|*) ;;
-      dead:escalate\|*|unknown:escalate\|*) ;;
+      stalled:escalate\|*|dead:escalate\|*|unknown:escalate\|*) ;;
       *) fail "away signal classification mishandled $verdict liveness: $out" ;;
     esac
 
@@ -154,7 +154,7 @@ test_liveness_verdicts_surface_through_away_classifiers() {
       FM_FAKE_CREW_STATE="$current" classify_stale "sess:fm-task" "$state")
     case "$verdict:$out" in
       alive:self\|*) ;;
-      dead:escalate\|*|unknown:escalate\|*) ;;
+      stalled:escalate\|*|dead:escalate\|*|unknown:escalate\|*) ;;
       *) fail "away stale classification mishandled $verdict liveness: $out" ;;
     esac
 
@@ -162,11 +162,11 @@ test_liveness_verdicts_surface_through_away_classifiers() {
       FM_FAKE_CREW_STATE="$current" classify_heartbeat "$state")
     case "$verdict:$out" in
       alive:self\|*) ;;
-      dead:escalate\|*|unknown:escalate\|*) ;;
+      stalled:escalate\|*|dead:escalate\|*|unknown:escalate\|*) ;;
       *) fail "away heartbeat classification mishandled $verdict liveness: $out" ;;
     esac
   done
-  pass "away-mode signal, stale, and heartbeat classifiers preserve alive/dead/unknown actionability"
+  pass "away-mode signal, stale, and heartbeat classifiers preserve alive/stalled/dead/unknown actionability"
 }
 
 test_stale_transient_self_records_marker() {
@@ -203,7 +203,7 @@ test_stale_paused_classifies_pause() {
   local dir state out pause_reason
   dir=$(make_supercase stale-paused)
   state="$dir/state"
-  pause_reason='paused: waiting for upstream checks green, merged, and blocked state to clear'
+  pause_reason='paused: waiting for upstream checks green, merged, and blocked state to clear; owner=upstream CI; clears=required checks become terminal'
   status_is_captain_relevant "$pause_reason" && fail "pause reason phrases made the status captain-relevant"
   printf '%s\n' "$pause_reason" > "$state/held-w9.status"
   out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-held-w9" "$state")
@@ -219,7 +219,7 @@ test_handle_wake_paused_records_pause_marker() {
   dir=$(make_supercase handle-paused)
   state="$dir/state"
   win="sess:fm-held-w10"
-  printf 'paused: awaiting the vendor rate-limit reset\n' > "$state/held-w10.status"
+  printf 'paused: awaiting the vendor rate-limit reset; owner=vendor; clears=rate-limit reset time arrives\n' > "$state/held-w10.status"
   key=$(printf '%s' "held-w10" | tr ':/.' '___')
   date +%s > "$state/.subsuper-stale-$key"
   FM_STATE_OVERRIDE="$state" handle_wake "stale: $win" "$state"
@@ -235,7 +235,7 @@ test_handle_wake_paused_signal_records_pause_marker() {
   state="$dir/state"
   win="sess:fm-held-w10-signal"
   printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w10-signal.meta"
-  printf 'paused: awaiting the vendor rate-limit reset\n' > "$state/held-w10-signal.status"
+  printf 'paused: awaiting the vendor rate-limit reset; owner=vendor; clears=rate-limit reset time arrives\n' > "$state/held-w10-signal.status"
   key=$(printf '%s' "held-w10-signal" | tr ':/.' '___')
   date +%s > "$state/.subsuper-stale-$key"
   FM_STATE_OVERRIDE="$state" handle_wake "signal: $state/held-w10-signal.status" "$state"
@@ -276,7 +276,7 @@ test_housekeeping_migrates_watcher_pause_marker() {
   state="$dir/state"
   win="sess:fm-held-w10-migrate"
   printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w10-migrate.meta"
-  printf 'paused: awaiting the upstream release\n' > "$state/held-w10-migrate.status"
+  printf 'paused: awaiting the upstream release; owner=release team; clears=release artifact is published\n' > "$state/held-w10-migrate.status"
   key=$(printf '%s' "$win" | tr '.:/' '___')
   : > "$state/.paused-$key"
   FM_STATE_OVERRIDE="$state" housekeeping "$state"
@@ -310,7 +310,7 @@ test_housekeeping_seeds_pause_marker_from_status() {
   state="$dir/state"
   win="sess:fm-held-w10-seed"
   printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w10-seed.meta"
-  printf 'paused: awaiting the upstream release\n' > "$state/held-w10-seed.status"
+  printf 'paused: awaiting the upstream release; owner=release team; clears=release artifact is published\n' > "$state/held-w10-seed.status"
   key=$(printf '%s' "held-w10-seed" | tr '.:/' '___')
   FM_STATE_OVERRIDE="$state" housekeeping "$state"
   [ -e "$state/.subsuper-paused-$key" ] || fail "paused status did not seed daemon pause tracking"
@@ -326,13 +326,14 @@ test_housekeeping_paused_resurfaces_and_resets() {
   dir=$(make_supercase paused-resurface)
   state="$dir/state"; fakebin="$dir/fakebin"
   win="sess:fm-held-w11"; pane="$dir/pane.txt"
-  printf 'paused: holding for the upstream tool release\n' > "$state/held-w11.status"
+  printf 'paused: holding for the upstream tool release; owner=tool maintainer; clears=release artifact is published\n' > "$state/held-w11.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w11" | tr ':/.' '___')
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
-  grep -F "awaiting external" "$state/.subsuper-escalations" >/dev/null 2>&1 || fail "declared pause was not re-surfaced as an awaiting-external recheck"
+  grep -F "owner=tool maintainer" "$state/.subsuper-escalations" >/dev/null 2>&1 || fail "declared pause recheck omitted its owner"
+  grep -F "clears=release artifact is published" "$state/.subsuper-escalations" >/dev/null 2>&1 || fail "declared pause recheck omitted its clearing condition"
   grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null 2>&1 && fail "declared pause was mislabeled a possible wedge"
   [ -e "$state/.subsuper-paused-$key" ] || fail "pause marker cleared instead of reset for the next window"
   age=$(( $(date +%s) - $(cat "$state/.subsuper-paused-$key" 2>/dev/null || echo 0) ))
@@ -347,7 +348,7 @@ test_housekeeping_paused_resumed_cleared() {
   dir=$(make_supercase paused-resumed)
   state="$dir/state"; fakebin="$dir/fakebin"
   win="sess:fm-held-w12"; pane="$dir/pane.txt"
-  printf 'paused: holding for the upstream tool release\n' > "$state/held-w12.status"
+  printf 'paused: holding for the upstream tool release; owner=tool maintainer; clears=release artifact is published\n' > "$state/held-w12.status"
   printf 'Working...\n' > "$pane"
   key=$(printf '%s' "held-w12" | tr ':/.' '___')
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
@@ -366,7 +367,7 @@ test_housekeeping_paused_unpaused_cleared() {
   dir=$(make_supercase paused-unpaused)
   state="$dir/state"; fakebin="$dir/fakebin"
   win="sess:fm-held-w13"; pane="$dir/pane.txt"
-  printf 'paused: holding for the upstream release\nworking: resumed, upstream landed\n' > "$state/held-w13.status"
+  printf 'paused: holding for the upstream release; owner=release team; clears=release artifact is published\nworking: resumed, upstream landed\n' > "$state/held-w13.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w13" | tr ':/.' '___')
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
@@ -381,7 +382,7 @@ test_housekeeping_stale_marker_transitions_to_pause() {
   local dir state fakebin win pane key
   dir=$(make_supercase stale-to-paused)
   state="$dir/state"; fakebin="$dir/fakebin"; win="sess:fm-held-w14"; pane="$dir/pane.txt"
-  printf 'paused: awaiting the upstream tool release\n' > "$state/held-w14.status"
+  printf 'paused: awaiting the upstream tool release; owner=tool maintainer; clears=release artifact is published\n' > "$state/held-w14.status"
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w14" | tr ':/.' '___')
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-stale-$key"

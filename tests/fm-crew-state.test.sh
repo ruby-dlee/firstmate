@@ -223,6 +223,7 @@ run_crew_state() {  # <case-dir> <id>
     FM_BACKEND_HERDR_TEST_HOOKS=firstmate-herdr-tests-v1 \
     FM_TEST_HERDR_READSTEER_REACHABLE=1 \
     FM_NM_HOME="${FM_NM_HOME:-$1/nm-home}" \
+    FM_NM_SNAP_DIR="${FM_NM_SNAP_DIR:-$1/nm-snap}" \
     "$CREW_STATE" "$2"
 }
 
@@ -516,27 +517,30 @@ test_quiet_step_reports_alive_liveness() {
   fm_write_meta "$d/state/feat-q.meta" "window=fm:fm-feat-q" "worktree=$d/wt" "kind=ship"
   FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-q test)"
   # A real process working in that worktree, named nothing like the run - the
-  # exact shape the false-negative argv search missed. It is a parent shell with
-  # a child, matching a suite loop running one script at a time, so the reported
-  # unit of work is exercised too and not just the bare verdict.
-  ( cd "$nmwt" && exec sh -c 'sleep 30 & wait' ) &
-  local sleeper=$!
-  local out=""
-  local _
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    out=$(run_crew_state "$d" feat-q)
-    case "$out" in *"liveness: alive"*" on "*) break ;; esac
-    sleep 0.3
+  # exact shape the false-negative argv search missed. The parent turns over
+  # children like the suite loop starts new scripts, so one invocation can prove
+  # progress from membership change and report the current unit of work.
+  ( cd "$nmwt" && exec sh -c 'bash -c "while :; do sleep 0.2; done" & wait' ) &
+  local worker=$!
+  sleep 0.3
+  [ ! -e "$d/nm-snap/01RUN.snap" ] \
+    || fail "the one-shot liveness fixture unexpectedly had a prior snapshot"
+  local out; out=$(run_crew_state "$d" feat-q)
+  local child
+  for child in $(pgrep -P "$worker" 2>/dev/null); do
+    pkill -9 -P "$child" 2>/dev/null || true
+    kill -9 "$child" 2>/dev/null || true
   done
-  pkill -9 -P "$sleeper" 2>/dev/null || true
-  kill -9 "$sleeper" 2>/dev/null || true
-  wait "$sleeper" 2>/dev/null || true
+  kill -9 "$worker" 2>/dev/null || true
+  wait "$worker" 2>/dev/null || true
   assert_contains "$out" "liveness: alive" "a quiet step with a live process reports alive"
   # Alive alone leaves hours of runtime unexplained; naming the current unit of
   # work and its age is what separates a slow step from a hung one without
   # spending a run to find out, so the heartbeat read must carry it.
-  assert_contains "$out" " on sleep 30 (" "the alive verdict names the current unit of work and its age"
-  pass "a quiet step with a live process reports an alive liveness verdict"
+  assert_contains "$out" " on bash -c " "the alive verdict names the current unit of work"
+  printf '%s\n' "$out" | grep -qE ' on bash -c .*\([0-9]+:[0-9]{2}' \
+    || fail "the alive verdict names the current unit of work and its age: $out"
+  pass "a one-shot quiet step reports alive with no prior liveness call"
 }
 
 test_quiet_step_probe_failures_are_unknown() {

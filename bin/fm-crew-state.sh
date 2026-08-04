@@ -536,24 +536,27 @@ nm_active_step_name() {
   strip_quotes "$(trim "${row%%,*}")"
 }
 
-# One-line liveness verdict for the active step's own processes. Presence-only
-# (--sample 0) keeps the heartbeat path bounded and gives this consumer exactly
-# three verdicts: alive, dead, or unknown. A missing, failed, empty, or malformed
-# probe is unknown, never silence and never evidence of health or death.
+# One-line liveness verdict for the active step's own processes. A one-second
+# in-invocation membership sample lets this one-shot caller establish child
+# turnover without paying the 20-second window CPU rates require. Stable process
+# membership falls back to the probe's preserved long-window CPU baseline. This
+# consumer accepts exactly three verdicts: alive, dead, or unknown. A missing,
+# failed, empty, or malformed probe is unknown, never silence and never evidence
+# of health or death.
 nm_step_liveness() {
-  local run_id out status=0 verdict procs doing detail line
+  local run_id out status=0 verdict procs doing grade detail detail_fields line
   run_id=$(strip_quotes "$(nm_field id)")
   [ -n "$run_id" ] || { printf 'unknown (probe unreadable: run id unavailable)'; return; }
   [ -x "$NM_LIVENESS_BIN" ] || { printf 'unknown (probe unreadable: executable unavailable)'; return; }
   case "$HAVE_TIMEOUT" in
-    timeout)  out=$(timeout "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 0 2>/dev/null) || status=$? ;;
-    gtimeout) out=$(gtimeout "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 0 2>/dev/null) || status=$? ;;
+    timeout)  out=$(timeout "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 1 2>/dev/null) || status=$? ;;
+    gtimeout) out=$(gtimeout "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 1 2>/dev/null) || status=$? ;;
     # Same bounded perl fallback nm_run already uses. Without this case, a host
     # with neither timeout nor gtimeout - the ordinary macOS default, including
     # this one - fell through to an UNBOUNDED probe call, so a slow lsof or
     # process scan could block the supervision read for as long as it took.
     perl)     out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
-                  "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 0 2>/dev/null) || status=$? ;;
+                  "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 1 2>/dev/null) || status=$? ;;
     *)        printf 'unknown (probe unreadable: no bounded runner available)'; return ;;
   esac
   case "$status" in
@@ -570,6 +573,7 @@ nm_step_liveness() {
   # needing a second command on every heartbeat.
   verdict=$(printf '%s\n' "$out" | sed -n 's/^liveness:[[:space:]]*\([a-z]*\).*/\1/p')
   procs=$(printf '%s\n' "$out" | sed -n 's/.*procs:[[:space:]]*\([0-9]*\).*/\1/p')
+  grade=$(printf '%s\n' "$out" | sed -n 's/.*grade:[[:space:]]*\([a-z-]*\).*/\1/p')
   case "$verdict" in
     alive|dead|unknown) ;;
     *) printf 'unknown (probe result unparseable)'; return ;;
@@ -582,9 +586,17 @@ nm_step_liveness() {
   [ "$doing" = "$out" ] && doing=""
   line="$verdict ($procs procs)"
   if [ "$verdict" = unknown ]; then
-    detail=${out##*"$SEP"}
-    [ "$detail" = "$out" ] && detail="probe reported unknown"
-    line="unknown ($procs procs; $detail)"
+    case "$grade" in
+      unreadable|present-unproven|present-no-progress|transition) ;;
+      '') grade=ungraded ;;
+      *) grade=unreadable ;;
+    esac
+    detail_fields=${out%%"$SEP"doing: *}
+    detail=${detail_fields##*"$SEP"}
+    case "$detail" in
+      "$detail_fields"|grade:*) detail="probe reported unknown" ;;
+    esac
+    line="unknown (grade: $grade; $procs procs; $detail)"
   fi
   [ -n "$doing" ] && line="$line on $doing"
   printf '%s' "$line"

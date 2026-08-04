@@ -347,6 +347,37 @@ test_spawn_positive_processing_is_quiet() {
   pass "positive processing evidence stays quiet"
 }
 
+test_startup_baselines_replace_prior_generation_metadata() {
+  local dir source destination
+  dir="$TMP_ROOT/meta-merge"
+  mkdir -p "$dir"
+  source="$dir/source.meta"
+  destination="$dir/destination.meta"
+  printf '%s\n' \
+    'generation_id=old-generation' \
+    'startup_status_baseline=old-status' \
+    'startup_turnend_baseline=old-turnend' \
+    'custom_extension=preserved' > "$source"
+  printf '%s\n' \
+    'generation_id=new-generation' \
+    'startup_status_baseline=new-status' \
+    'startup_turnend_baseline=new-turnend' > "$destination"
+  bash -c '. "$1"; fm_account_meta_merge_extensions "$2" "$3"' bash \
+    "$ROOT/bin/fm-account-routing-lib.sh" "$source" "$destination" \
+    || fail "startup baseline metadata merge failed"
+  assert_contains "$(cat "$destination")" 'startup_status_baseline=new-status' \
+    "respawn metadata merge discarded the new status baseline"
+  assert_contains "$(cat "$destination")" 'startup_turnend_baseline=new-turnend' \
+    "respawn metadata merge discarded the new turn-end baseline"
+  assert_not_contains "$(cat "$destination")" 'old-status' \
+    "respawn metadata merge retained the old status baseline"
+  assert_not_contains "$(cat "$destination")" 'old-turnend' \
+    "respawn metadata merge retained the old turn-end baseline"
+  assert_contains "$(cat "$destination")" 'custom_extension=preserved' \
+    "respawn metadata merge dropped extension metadata"
+  pass "respawn metadata keeps current-generation startup baselines"
+}
+
 make_watcher_case() {  # <name> <harness> <fixture-function>
   local name=$1 fixture_fn=$3 status_baseline turnend_baseline
   WATCH_ID="watch-$name"
@@ -493,12 +524,14 @@ case "${FM_TEST_FOCUSED:-all}" in
     test_spawn_reports_every_known_dialog_without_approval
     test_spawn_unknown_outcome_classes
     test_spawn_positive_processing_is_quiet
+    test_startup_baselines_replace_prior_generation_metadata
     test_watcher_closes_late_render_gap_without_crossing_phase_boundary
     ;;
   classifier) test_pure_startup_classifier_distinguishes_every_shape ;;
   spawn-dialogs) test_spawn_reports_every_known_dialog_without_approval ;;
   spawn-unknown) test_spawn_unknown_outcome_classes ;;
   spawn-processing) test_spawn_positive_processing_is_quiet ;;
+  metadata) test_startup_baselines_replace_prior_generation_metadata ;;
   watcher) test_watcher_closes_late_render_gap_without_crossing_phase_boundary ;;
   *) fail "unknown FM_TEST_FOCUSED group: $FM_TEST_FOCUSED" ;;
 esac

@@ -195,6 +195,7 @@ set -u
 case "${FM_FAKE_LIVENESS_MODE:-}" in
   empty) exit 0 ;;
   malformed) printf 'not a liveness result\n' ;;
+  multiline) printf 'liveness: alive · run: 01RUN · procs: 3\nunexpected extra output\n' ;;
   malformed-verdict) printf 'liveness: alive junk · run: 01RUN · procs: 3\n' ;;
   malformed-procs) printf 'liveness: alive · run: 01RUN · procs: 3x\n' ;;
   empty-procs) printf 'liveness: unknown · run: 01RUN · procs:  · grade: unreadable · missing count · doing: bash t.sh (1:00)\n' ;;
@@ -578,6 +579,12 @@ test_quiet_step_probe_failures_are_unknown() {
   assert_contains "$out" "liveness: unknown" "a malformed probe result is visibly unknown"
   assert_contains "$out" "probe protocol unreadable: verdict missing or invalid" \
     "a malformed result reports its distinct protocol failure"
+
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=multiline \
+    run_crew_state "$d" feat-qu)
+  assert_contains "$out" "liveness: unknown" "a multiline probe result is visibly unknown"
+  assert_contains "$out" "probe protocol unreadable: multiline result" \
+    "a multiline probe result is rejected before field parsing"
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=malformed-verdict \
     run_crew_state "$d" feat-qu)

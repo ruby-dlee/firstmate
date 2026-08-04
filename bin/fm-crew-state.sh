@@ -574,9 +574,12 @@ nm_step_liveness() {
   # `doing:` is unstructured, truncated argv. Parse every structured field only
   # from the prefix before it: argv may legitimately contain strings such as
   # `procs:` or `grade:`, which must not override the fields they describe.
+  case "$out" in
+    *$'\n'*) printf 'unknown (probe protocol unreadable: multiline result)'; return ;;
+  esac
   detail_fields=${out%%"$SEP"doing: *}
   case "$detail_fields" in
-    *$'\n'*|liveness:\ *) ;;
+    liveness:\ *) ;;
     *) printf 'unknown (probe protocol unreadable: verdict missing or invalid)'; return ;;
   esac
   rest=${detail_fields#liveness: }

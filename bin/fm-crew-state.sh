@@ -619,6 +619,19 @@ nm_step_liveness() {
       return
       ;;
   esac
+  case "$verdict" in
+    alive)
+      case "$procs" in
+        *[1-9]*) ;;
+        *) printf 'unknown (probe protocol unreadable: alive verdict requires processes)'; return ;;
+      esac
+      ;;
+    dead)
+      case "$procs" in
+        *[!0]*) printf 'unknown (probe protocol unreadable: dead verdict requires zero processes)'; return ;;
+      esac
+      ;;
+  esac
   # `doing: <argv> (<etime>)` is the probe's last field when it could name one.
   # The probe already truncates argv, so take it verbatim rather than re-parsing
   # a command line whose shape varies by whatever the step happens to be running.

@@ -198,6 +198,8 @@ case "${FM_FAKE_LIVENESS_MODE:-}" in
   multiline) printf 'liveness: alive · run: 01RUN · procs: 3\nunexpected extra output\n' ;;
   malformed-verdict) printf 'liveness: alive junk · run: 01RUN · procs: 3\n' ;;
   malformed-procs) printf 'liveness: alive · run: 01RUN · procs: 3x\n' ;;
+  alive-zero) printf 'liveness: alive · run: 01RUN · procs: 0\n' ;;
+  dead-nonzero) printf 'liveness: dead · run: 01RUN · procs: 2\n' ;;
   empty-procs) printf 'liveness: unknown · run: 01RUN · procs:  · grade: unreadable · missing count · doing: bash t.sh (1:00)\n' ;;
   argv-fields) printf 'liveness: unknown · run: 01RUN · procs: 3 · grade: present-unproven · presence established · doing: python -c "procs: x grade: bogus" (1:00)\n' ;;
   nonzero) exit 9 ;;
@@ -597,6 +599,18 @@ test_quiet_step_probe_failures_are_unknown() {
   assert_contains "$out" "liveness: unknown" "a process count with trailing data is visibly unknown"
   assert_contains "$out" "probe protocol unreadable: numeric process count missing or invalid" \
     "a process count with trailing data is rejected at its field boundary"
+
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=alive-zero \
+    run_crew_state "$d" feat-qu)
+  assert_contains "$out" "liveness: unknown" "an alive verdict with no processes is visibly unknown"
+  assert_contains "$out" "probe protocol unreadable: alive verdict requires processes" \
+    "an alive verdict requires a positive process count"
+
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=dead-nonzero \
+    run_crew_state "$d" feat-qu)
+  assert_contains "$out" "liveness: unknown" "a dead verdict with processes is visibly unknown"
+  assert_contains "$out" "probe protocol unreadable: dead verdict requires zero processes" \
+    "a dead verdict requires a zero process count"
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=empty-procs \
     run_crew_state "$d" feat-qu)

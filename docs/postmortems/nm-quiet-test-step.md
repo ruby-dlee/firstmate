@@ -196,6 +196,24 @@ A slow step, with no liveness signal, whose slowness is amplified by unbounded p
 That combination is what produced four wrong calls in one day, and no single one of the three explains it.
 Fixing the liveness signal does not make a multi-hour gate step operable; it only makes the difference between working and dead observable, so a wrong call is no longer the default outcome.
 
+### The dominant mechanism is contention, not a deadlock
+
+This must be said plainly, because the work was filed under a deadlock and the name invites the wrong conclusion.
+**The detection here makes the failure shapes visible. It does not cure the slowness, and nothing in it makes a slow step faster.**
+
+Three distinct things wore the same costume, and separating them is the actual finding:
+
+1. **Healthy steps misread as dead.** The original four reports. Disproved above; the cost was three aborted runs.
+2. **Pathological slowness under contention.** Fifteen concurrent e2e loops on fourteen cores at load 38; roughly 955 sequential helper launches per `fm-teardown.sh` invocation; a suite that is 59 minutes serially before any contention. Critically, this reproduces when the suite is run **directly, outside the pipeline**, so it is not a pipeline defect at all.
+3. **A genuinely stranded step** - no children, zero CPU, hours elapsed - which is real, and is plausibly the *aftermath* of (2): something upstream timing out, reaping, or losing a pipe on a step that was merely crawling.
+
+The discriminator between (2) and (3) is **child turnover**, not parent CPU and not the activity clock.
+A crawling but healthy step keeps replacing its children every few seconds while its parent CPU stays flat; a stranded one has no children at all.
+
+The fleet-level lever that actually stops this recurring is **bounding how many validation runs share the machine**.
+That is tracked separately and is deliberately not addressed here.
+Detection without that bound means wrong calls stop being the default outcome - it does not mean the gate became operable.
+
 ### Correction: the gate is serialized per BRANCH, not per repo
 
 It is natural to read the queueing as lanes waiting behind a single per-repo gate slot.

@@ -4,7 +4,8 @@
 # A send that cannot be tied to a recorded task/lane or to an explicit
 # well-formed backend target must fail loudly. These tests pin the historical
 # silent-fallback failures: missing FM_HOME, unresolved selectors, prefixless
-# herdr pane ids, dead explicit endpoints, and the healthy exact/fm-id paths.
+# herdr pane ids, dead explicit endpoints, reassigned live labels, and the
+# healthy exact/fm-id paths.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -48,9 +49,12 @@ case "${1:-}" in
     if [ -n "${FM_FAKE_TMUX_DEAD_TARGET:-}" ] && [ "$target" = "$FM_FAKE_TMUX_DEAD_TARGET" ]; then
       exit 1
     fi
+    label=${FM_FAKE_TMUX_LABEL:-}
+    [ -n "$label" ] || label=${target#*:}
     case "$all" in
       *'#{cursor_y}'*) printf '0\n' ;;
-      *'#{session_name}'*) printf '%s\t%s\n' "${FM_FAKE_TMUX_SESSION:-sess}" "${FM_FAKE_TMUX_LABEL:-fm-lost}" ;;
+      *'#{session_name}'*) printf '%s\t%s\n' "${FM_FAKE_TMUX_SESSION:-sess}" "$label" ;;
+      *'#{window_name}'*) printf '%s\n' "$label" ;;
       *) printf '%%1\n' ;;
     esac
     exit 0 ;;
@@ -200,6 +204,26 @@ case "$*" in
   pane\ list*) printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w2:t2","workspace_id":"w2"}]}}\n' ;;
   workspace\ list*) printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"},{"workspace_id":"w2","label":"2ndmate-other"}]}}\n' ;;
   tab\ list*) printf '{"result":{"tabs":[{"tab_id":"w2:t2","label":"fm-local-task","workspace_id":"w2"}]}}\n' ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/herdr"
+  printf '%s\n' "$fb"
+}
+
+make_herdr_label_stub() {  # <dir> -> echoes fakebin dir
+  local dir=$1 fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "$FM_HERDR_LOG"
+case "$*" in
+  status\ --json*) printf '{"client":{"protocol":14},"server":{"running":true}}\n' ;;
+  pane\ get*) printf '{"result":{"pane":{"pane_id":"w1:p2"}}}\n' ;;
+  pane\ list*) printf '{"result":{"panes":[{"pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}]}}\n' ;;
+  workspace\ list*) printf '{"result":{"workspaces":[{"workspace_id":"w1","label":"firstmate"}]}}\n' ;;
+  tab\ list*) printf '{"result":{"tabs":[{"tab_id":"w1:t2","label":"fm-other-lane","workspace_id":"w1"}]}}\n' ;;
 esac
 exit 0
 SH
@@ -554,6 +578,55 @@ test_healthy_fm_id_send_still_works() {
   pass "fm-send strict: healthy fm-<id> sends still type once and submit"
 }
 
+# A recorded endpoint is not authority to steer forever. A live tmux window can
+# be reassigned after the metadata was written; fm-send must prove that its live
+# label still belongs to this task before it types even one byte. The pre-fix
+# implementation sent this message to the unrelated fm-other-lane window.
+test_managed_tmux_send_rejects_mismatched_live_label() {
+  local dir fb home err log rc
+  dir="$TMP_ROOT/reassigned-label"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home=$(setup_home reassigned-label)
+  err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
+  fm_write_meta "$home/state/label-owner.meta" \
+    "window=sess:reassigned-window" "kind=ship" "harness=codex"
+
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" \
+    FM_FAKE_TMUX_SESSION=sess FM_FAKE_TMUX_LABEL=fm-other-lane FM_SEND_SETTLE=0 \
+    "$SEND" label-owner "must not cross lanes" >/dev/null 2>"$err"; rc=$?
+
+  [ "$rc" -ne 0 ] || fail "fm-send sent to a live window whose label belongs to another lane"
+  ! grep -q '^send-keys ' "$log" || fail "fm-send typed into the mismatched-label window"
+  assert_contains "$(cat "$err")" "expected 'fm-label-owner'" \
+    "label-mismatch refusal names the expected task label"
+  assert_contains "$(cat "$err")" "observed 'fm-other-lane'" \
+    "label-mismatch refusal names the live observed label"
+  pass "fm-send refuses a live recorded window whose label belongs to another lane"
+}
+
+test_managed_herdr_send_rejects_mismatched_live_label() {
+  local dir fb home err log rc
+  dir="$TMP_ROOT/reassigned-herdr-label"; mkdir -p "$dir"
+  fb=$(make_herdr_label_stub "$dir"); home=$(setup_home reassigned-herdr-label)
+  err="$dir/send.err"; log="$dir/herdr.log"; : > "$log"
+  fm_write_meta "$home/state/herdr-label-owner.meta" \
+    "window=default:w1:p2" "backend=herdr" "kind=ship" "harness=codex" \
+    "herdr_workspace_id=w1" "herdr_tab_id=w1:t2" "herdr_pane_id=w1:p2"
+
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_HERDR_LOG="$log" \
+    FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 FM_SEND_SETTLE=0 \
+    "$SEND" herdr-label-owner --key Enter >/dev/null 2>"$err"; rc=$?
+
+  [ "$rc" -ne 0 ] || fail "fm-send sent to a live Herdr tab whose label belongs to another lane"
+  if grep -Eq 'pane (send-text|send-keys)' "$log"; then
+    fail "fm-send typed into the mismatched-label Herdr tab"
+  fi
+  assert_contains "$(cat "$err")" "expected 'fm-herdr-label-owner'" \
+    "Herdr label-mismatch refusal names the expected task label"
+  assert_contains "$(cat "$err")" "observed 'fm-other-lane'" \
+    "Herdr label-mismatch refusal names the live observed label"
+  pass "fm-send refuses a live recorded Herdr tab whose label belongs to another lane"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = managed-steering ]; then
   test_explicit_managed_target_records_steering
   test_managed_steering_intent_precedes_external_submission
@@ -586,6 +659,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = label-mismatch ]; then
+  test_managed_tmux_send_rejects_mismatched_live_label
+  test_managed_herdr_send_rejects_mismatched_live_label
+  exit 0
+fi
+
 test_exact_lane_id_send_still_works
 test_unset_fm_home_fails
 test_unresolvable_target_does_not_tmux_fallback
@@ -602,6 +681,8 @@ test_managed_send_holds_lifecycle_through_audit
 test_managed_key_revalidates_after_respawn_wait
 test_managed_steering_rejects_parent_swap_during_persistence
 test_healthy_fm_id_send_still_works
+test_managed_tmux_send_rejects_mismatched_live_label
+test_managed_herdr_send_rejects_mismatched_live_label
 test_managed_tmux_send_rejects_reused_id_in_other_session
 test_managed_tmux_send_retains_verified_stable_id
 bash "$ROOT/tests/fm-send-permission-modal-probe.sh" \

@@ -16,7 +16,9 @@
 # stable, parseable, token-tight line firstmate can read every heartbeat:
 #
 #   state: <working|parked|done|stale|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
-#   ... · liveness: <alive|dead|unknown> · step: <name>
+#   ... · agent-liveness: <alive|dead|unknown> [agent detail]
+#   ... · run-liveness: <alive|dead|unknown> · step: <name>
+#   ... · liveness: <alive|dead|unknown> [fail-closed aggregate]
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
@@ -157,6 +159,7 @@ LOG_VERB=$(status_line_verb "$LOG_LINE")
 # herdr task is read through fm_backend_capture instead of a bare tmux probe.
 TASK_BACKEND=$(fm_backend_of_meta "$META")
 BACKEND_TARGET=$(fm_backend_target_of_meta "$META")
+TASK_HARNESS=$(meta_value harness)
 EXPECTED_LABEL="fm-$ID"
 RECORDED_SCOPED_TARGET=$(fm_meta_get "$META" tmux_session_target)
 pane_readable() {  # <target>
@@ -222,6 +225,92 @@ if command -v timeout >/dev/null 2>&1; then HAVE_TIMEOUT=timeout
 elif command -v gtimeout >/dev/null 2>&1; then HAVE_TIMEOUT=gtimeout
 elif command -v perl >/dev/null 2>&1; then HAVE_TIMEOUT=perl
 fi
+
+# Exact exhaustion banners in the bottom status/composer region. These matches
+# are deliberately line-anchored and harness-scoped: arbitrary pane content can
+# contain the same words in a search query, diff, fixture, or instruction. Even
+# an exact line is not enough by itself; agent_liveness_detail names terminal
+# quota exhaustion only when fm_backend_agent_alive independently reports dead.
+agent_quota_banner_present() {  # <harness> <pane-sample>
+  local harness=$1 sample=$2 line status_region
+  status_region=$(printf '%s\n' "$sample" | fm_composer_strip_ansi \
+    | grep -v '^[[:space:]]*$' | tail -8)
+  while IFS= read -r line; do
+    line=$(trim "$line")
+    case "$harness:$line" in
+      "codex:You've hit your usage limit"|"codex:You've hit your usage limit.") return 0 ;;
+      "claude:You've hit your limit"|"claude:You've hit your limit."|claude:"You've hit your limit · resets "*) return 0 ;;
+      "opencode:Usage limit reached"|"opencode:Usage limit reached."|"opencode:Usage limit exceeded"|"opencode:Usage limit exceeded.") return 0 ;;
+      "pi:Usage limit reached"|"pi:Usage limit reached."|"pi:Usage limit exceeded"|"pi:Usage limit exceeded.") return 0 ;;
+      "grok:402 Payment Required: Grok Build usage balance exhausted") return 0 ;;
+    esac
+  done <<< "$status_region"
+  return 1
+}
+
+# One bounded read answers agent-process liveness and captures only enough pane
+# tail to identify a status-region exhaustion banner. Both legs must complete:
+# a timeout, failed capture, empty sample, malformed verdict, or backend-level
+# ambiguity is unknown, never healthy. The returned agent-liveness field
+# describes the AGENT only; quiet validation-command processes use
+# run-liveness below.
+agent_liveness_detail() {
+  local probe_script out status=0 verdict sample
+  [ -n "$BACKEND_TARGET" ] || { printf 'unknown (agent probe unreadable: target unavailable)'; return; }
+  # shellcheck disable=SC2016 # Positional parameters expand in the nested bash, not this shell.
+  probe_script='backend_file=$1; backend=$2; target=$3; expected=$4; scoped=$5
+. "$backend_file" || exit 70
+verdict=$(fm_backend_agent_alive "$backend" "$target" "$expected" "$scoped" 2>/dev/null) || verdict=unknown
+printf "__FM_AGENT_LIVENESS__%s\n" "$verdict"
+fm_backend_capture "$backend" "$target" 20 "$expected" "$scoped" 2>/dev/null
+capture_status=$?
+printf "\n__FM_AGENT_SAMPLE_END__"
+exit "$capture_status"'
+  case "$HAVE_TIMEOUT" in
+    timeout)
+      out=$(timeout "$NM_TIMEOUT" bash -c "$probe_script" fm-agent-probe \
+        "$SCRIPT_DIR/fm-backend.sh" "$TASK_BACKEND" "$BACKEND_TARGET" "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET") || status=$?
+      ;;
+    gtimeout)
+      out=$(gtimeout "$NM_TIMEOUT" bash -c "$probe_script" fm-agent-probe \
+        "$SCRIPT_DIR/fm-backend.sh" "$TASK_BACKEND" "$BACKEND_TARGET" "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET") || status=$?
+      ;;
+    perl)
+      out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
+        "$NM_TIMEOUT" bash -c "$probe_script" fm-agent-probe \
+        "$SCRIPT_DIR/fm-backend.sh" "$TASK_BACKEND" "$BACKEND_TARGET" "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET") || status=$?
+      ;;
+    *) printf 'unknown (agent probe unreadable: no bounded runner available)'; return ;;
+  esac
+  case "$status" in
+    0) ;;
+    124) printf 'unknown (agent probe timed out after %ss)' "$NM_TIMEOUT"; return ;;
+    *) printf 'unknown (agent probe unreadable: exited %s)' "$status"; return ;;
+  esac
+  case "$out" in
+    __FM_AGENT_LIVENESS__*$'\n'*$'\n__FM_AGENT_SAMPLE_END__') ;;
+    *) printf 'unknown (agent probe result unparseable)'; return ;;
+  esac
+  verdict=${out%%$'\n'*}
+  verdict=${verdict#__FM_AGENT_LIVENESS__}
+  sample=${out#*$'\n'}
+  sample=${sample%$'\n__FM_AGENT_SAMPLE_END__'}
+  [ -n "${sample//[[:space:]]/}" ] \
+    || { printf 'unknown (agent probe unreadable: empty pane sample)'; return; }
+  case "$verdict" in
+    alive) printf 'alive (agent process confirmed)' ;;
+    dead)
+      if agent_quota_banner_present "$TASK_HARNESS" "$sample"; then
+        printf 'dead (agent quota-exhausted; relaunch on another account)'
+      else
+        printf 'dead (agent process unavailable)'
+      fi
+      ;;
+    unknown) printf 'unknown (agent probe inconclusive)' ;;
+    *) printf 'unknown (agent probe result unparseable)' ;;
+  esac
+}
+
 nm_run() {  # <args...>
   case "$HAVE_TIMEOUT" in
     timeout)  ( cd "$WT" && timeout "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true ;;
@@ -831,6 +920,20 @@ if [ "$HAVE_RUN" = 1 ]; then
     verify_ready_head_or_emit "$RUN_ID" "$RUN_HEAD" "$RUN_PR"
   fi
 
+  # Run-step precedence remains intact: this observation never overwrites the
+  # pipeline's state or detail. It separately answers whether the lane still has
+  # an agent able to act at the next gate. The existing supervision boundary
+  # already surfaces dead and unknown `liveness:` verdicts, so a live run with a
+  # dead worker produces an actionable heartbeat instead of being absorbed as
+  # healthy until it parks forever. `liveness:` remains the supervision-facing
+  # fail-closed aggregate so the older quiet-run axis stays actionable too.
+  if [ "$RUN_STATE" = working ] || [ "$RUN_STATE" = parked ]; then
+    AGENT_LIVENESS=$(agent_liveness_detail)
+    AGENT_LIVENESS_VERDICT=${AGENT_LIVENESS%% *}
+    RUN_DETAIL="$RUN_DETAIL${SEP}agent-liveness: $AGENT_LIVENESS"
+    AGGREGATE_LIVENESS=$AGENT_LIVENESS
+  fi
+
   # A quiet working step is the exact reading that made firstmate abort two
   # healthy runs on 2026-08-02, so answer "dead or just slow?" here instead of
   # leaving it to a hand check that gets it wrong. The verdict is APPENDED as an
@@ -843,12 +946,26 @@ if [ "$HAVE_RUN" = 1 ]; then
     ACTIVE_STEP=$(nm_active_step_name)
     case "$ACTIVE_STEP" in
       ci) ;;
-      '') RUN_DETAIL="$RUN_DETAIL${SEP}liveness: unknown (probe unreadable: active step unavailable)${SEP}step: unknown" ;;
+      '')
+        RUN_DETAIL="$RUN_DETAIL${SEP}run-liveness: unknown (probe unreadable: active step unavailable)${SEP}step: unknown"
+        AGGREGATE_LIVENESS="unknown (run process probe unreadable)"
+        ;;
       *)
         LIVENESS=$(nm_step_liveness)
-        RUN_DETAIL="$RUN_DETAIL${SEP}liveness: $LIVENESS${SEP}step: $ACTIVE_STEP"
+        RUN_LIVENESS_VERDICT=${LIVENESS%% *}
+        RUN_DETAIL="$RUN_DETAIL${SEP}run-liveness: $LIVENESS${SEP}step: $ACTIVE_STEP"
+        case "$AGENT_LIVENESS_VERDICT:$RUN_LIVENESS_VERDICT" in
+          dead:*) AGGREGATE_LIVENESS=$AGENT_LIVENESS ;;
+          *:dead) AGGREGATE_LIVENESS="dead (run process unavailable)" ;;
+          alive:alive) AGGREGATE_LIVENESS="alive (agent and run processes confirmed)" ;;
+          *) AGGREGATE_LIVENESS="unknown (agent or run process probe inconclusive)" ;;
+        esac
         ;;
     esac
+  fi
+
+  if [ -n "${AGGREGATE_LIVENESS:-}" ]; then
+    RUN_DETAIL="$RUN_DETAIL${SEP}liveness: $AGGREGATE_LIVENESS"
   fi
 
   if [ "$RUN_STATE" = working ] && log_reports_ci_ready; then

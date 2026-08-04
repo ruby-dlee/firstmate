@@ -98,6 +98,84 @@ fm_send_count_colons() {  # <string>
   printf '%s' $(( ${#s} - ${#no_colons} ))
 }
 
+# Read the live Herdr tab label for a pane without sending or mutating the
+# session. Herdr targets are pane ids while the task label lives on their tab, so
+# the proof resolves pane -> workspace/tab -> label instead of guessing from the
+# target string.
+fm_send_observed_herdr_label() {  # <target>
+  local target=$1 panes pane_record tab tabs label
+  fm_backend_source herdr >/dev/null 2>&1 || return 1
+  fm_backend_herdr_parse_target "$target" >/dev/null 2>&1 || return 1
+  panes=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane list 2>/dev/null) || return 1
+  # shellcheck disable=SC2016 # $pane is a jq variable, not a shell expansion.
+  pane_record=$(printf '%s\n' "$panes" | fm_backend_herdr_control_jq -cr \
+    --arg pane "$FM_BACKEND_HERDR_PANE" \
+    '[.result.panes[]? | select(.pane_id == $pane)] | first // null' 2>/dev/null) || return 1
+  [ "$pane_record" != null ] || return 1
+  tab=$(printf '%s\n' "$pane_record" | fm_backend_herdr_control_jq -r '.tab_id // empty' 2>/dev/null) || return 1
+  [ -n "$tab" ] || return 1
+  # `pane list` guarantees a tab id, not a workspace id. The unfiltered tab
+  # inventory carries each tab's label and lets this read the live pane's tab
+  # without assuming an optional pane field exists.
+  tabs=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" tab list 2>/dev/null) || return 1
+  # shellcheck disable=SC2016 # $tab is a jq variable, not a shell expansion.
+  label=$(printf '%s\n' "$tabs" | fm_backend_herdr_control_jq -r \
+    --arg tab "$tab" '[.result.tabs[]? | select(.tab_id == $tab)] | first | .label // empty' 2>/dev/null) || return 1
+  [ -n "$label" ] || return 1
+  printf '%s' "$label"
+}
+
+# Prove that a metadata-routed endpoint still belongs to the task that recorded
+# it before typing any text or key. A live tmux endpoint is not sufficient: a
+# stable window id can be reused or stale metadata can point at a window that was
+# reassigned to another lane. Read the live label and require exact fm-<id>
+# equality; on mismatch, name both identities and fail closed. Other backends'
+# target-exists adapters already include their native label/tab/workspace check,
+# so they use that same positive proof before sending. An explicit target with no
+# local metadata remains the documented unbound escape hatch and has no task
+# label to prove.
+fm_send_assert_live_task_label() {
+  local id observed
+  [ -n "$TARGET_META" ] && [ -n "$EXPECTED_LABEL" ] || return 0
+  id=$(fm_send_id_from_meta "$TARGET_META")
+  if [ "$TARGET_BACKEND" = tmux ]; then
+    observed=$(tmux display-message -p -t "$T" '#{window_name}' 2>/dev/null) || {
+      echo "error: target identity unreadable for $id: expected '$EXPECTED_LABEL', observed '<unreadable>' at $T; refusing to send" >&2
+      return 1
+    }
+    case "$observed" in ''|*$'\n'*)
+      echo "error: target identity unreadable for $id: expected '$EXPECTED_LABEL', observed '<malformed>' at $T; refusing to send" >&2
+      return 1
+      ;;
+    esac
+    if [ "$observed" != "$EXPECTED_LABEL" ]; then
+      echo "error: target identity mismatch for $id: expected '$EXPECTED_LABEL', observed '$observed' at $T; refusing to send" >&2
+      return 1
+    fi
+    return 0
+  fi
+  if [ "$TARGET_BACKEND" = herdr ]; then
+    observed=$(fm_send_observed_herdr_label "$T") || {
+      echo "error: target identity unreadable for $id: expected '$EXPECTED_LABEL', observed '<unreadable>' at $T; refusing to send" >&2
+      return 1
+    }
+    case "$observed" in ''|*$'\n'*)
+      echo "error: target identity unreadable for $id: expected '$EXPECTED_LABEL', observed '<malformed>' at $T; refusing to send" >&2
+      return 1
+      ;;
+    esac
+    if [ "$observed" != "$EXPECTED_LABEL" ]; then
+      echo "error: target identity mismatch for $id: expected '$EXPECTED_LABEL', observed '$observed' at $T; refusing to send" >&2
+      return 1
+    fi
+  fi
+  if ! fm_backend_target_exists "$TARGET_BACKEND" "$T" "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET"; then
+    observed=${observed:-<unavailable from $TARGET_BACKEND>}
+    echo "error: target identity mismatch or unreadable for $id: expected '$EXPECTED_LABEL', observed '$observed' at $T; refusing to send" >&2
+    return 1
+  fi
+}
+
 fm_send_resolve_target() {  # <raw-target>
   local raw=$1 meta pane_meta target backend assumed colons id session hint
 
@@ -207,11 +285,9 @@ fi
 # unknown and treated as non-codex (the safe default that keeps the fast path).
 # The target's BACKEND comes from selector meta, from matching an explicit target
 # back to recorded meta, or from strict explicit-target shape validation.
-# Do not add a separate passive liveness preflight here. Active send paths own
-# backend readiness: herdr, for example, must route through its session-aware
-# target_ready path before sending, while zellij verifies pane labels in its
-# send implementation. A failed backend send is still surfaced below as a hard
-# error with the attempted resolution attached.
+# Agent-process liveness remains owned by active send paths. Target identity is
+# different: every metadata-routed send must positively prove the live endpoint
+# still carries this task's label before it is allowed to reach those paths.
 
 MANAGED_LIFECYCLE_LOCK=
 MANAGED_STEERING_ID=
@@ -246,6 +322,8 @@ if [ -n "$EXPECTED_ACCOUNT_PROFILE" ]; then
     exit 1
   fi
 fi
+
+fm_send_assert_live_task_label || exit 1
 
 if [ "${1:-}" = "--key" ]; then
   if ! fm_backend_send_key "$TARGET_BACKEND" "$T" "$2" "$EXPECTED_LABEL" "$RECORDED_SCOPED_TARGET"; then

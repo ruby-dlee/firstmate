@@ -537,15 +537,18 @@ Firstmate's wrapper stays narrow: `ask-user` findings return through `needs-deci
 That checks-green status is owed at the CI-ready return point, when `/no-mistakes` first reports CI green, not after the monitor-until-merge loop observes the PR merged or closed.
 Use chat for yes/no decisions; use the durable `lavish-axi` decision flow when there are multiple findings or options to triage.
 
-Judge a validating crewmate by the run's step status, never by whether its shell is still running.
+Judge a validating crewmate's run progress by the run's step status and its ability to act by the separate agent-liveness reading; neither substitutes for the other.
 Read its current state with `bin/fm-crew-state.sh <id>`: a deterministic, token-tight one-line read that takes the matching no-mistakes run-step as the source of truth and reconciles it against the crewmate's `state/<id>.status` log.
-Because the run-step is authoritative before pane liveness, a crewmate whose window closed after or during validation can still report `done` or `working` from its run; a missing pane becomes `unknown` only when no matching run exists.
+Because the run-step remains authoritative for run progress, a crewmate whose agent died during validation still reports the advancing run as `working`, while its separate `agent-liveness` field reports the worker unavailable.
 That log is an append-only wake-*event* log, not a current-state field, and it goes stale the moment a resolved gate lets the run resume: after you answer a `needs-decision`/`blocked` and the crewmate silently resumes (responds to the gate, the pipeline fixes, it re-validates), the log's last line still reads `needs-decision`/`blocked` while the run-step has moved on.
 So never infer current state from a `tail` of that log; `bin/fm-crew-state.sh` reports the live run-step state and explicitly flags the stale log line superseded, where a raw `tail` would mislead you into re-escalating settled work.
 The fields below name the run-step states and outcomes it reads from `no-mistakes axi status`; run that command directly when you want the full gate findings.
 During the `ci` monitor phase, `bin/fm-crew-state.sh` also reads the ci step log tail because `axi status` reports both "still waiting on checks" and "checks green, waiting on merge" as `ci,running`.
 A step that `axi status` renders as `quiet` is NOT evidence that anything died: a step running a configured `commands.*` shell command reports no pid, no round, and no log for its whole duration, which for this repo's test step is routinely hours.
-`bin/fm-crew-state.sh` appends a real liveness verdict there from `bin/fm-nm-step-liveness.sh`, which finds the step's own processes by working directory; the supervision boundary absorbs `alive` but surfaces `dead` and `unknown`, and a run must never be aborted without a `dead` verdict (`docs/postmortems/nm-quiet-test-step.md`).
+Every active or parked run carries `agent-liveness: alive|dead|unknown` from the recorded backend endpoint, while a quiet command step separately carries `run-liveness: alive|dead|unknown` from `bin/fm-nm-step-liveness.sh`, which finds the step's own processes by working directory.
+The supervision-facing `liveness` field is their fail-closed aggregate: only positive readings are healthy, while `dead` and `unknown` both surface and `unknown` is never promoted to healthy.
+A quota-exhausted agent is named only when a dead agent probe corroborates an exact harness exhaustion banner in the bottom status region; arbitrary displayed pane content containing the same text is not exhaustion evidence.
+A run must never be aborted without a `dead` `run-liveness` verdict (`docs/postmortems/nm-quiet-test-step.md`).
 
 - `running`/`fixing`/`ci` - the pipeline is working (a fix round, a test, or CI monitoring); `ci` stays working until the ci log's most recent recognized marker says checks passed or no checks are terminally ready, and a later re-arm or issue marker returns it to working.
 - `awaiting_approval`/`fix_review` - the run is parked waiting on the agent, surfaced as a top-level `awaiting_agent: parked <duration>` line right after `status:` in `axi status`.

@@ -286,7 +286,19 @@ case "${1:-}" in
     done
     printf 'send-keys target=%s literal=%s arg=%s\n' "$target" "$literal" "${1:-}" >> "$FM_TMUX_LOG"
     exit 0 ;;
-  display-message) printf '%%1\n'; exit 0 ;;
+  display-message)
+    target=; next_is_target=0
+    for a in "$@"; do
+      if [ "$next_is_target" = 1 ]; then target=$a; next_is_target=0
+      elif [ "$a" = -t ]; then next_is_target=1
+      fi
+    done
+    for a in "$@"; do
+      case "$a" in
+        *window_name*) printf '%s\n' "${target#*:}"; exit 0 ;;
+      esac
+    done
+    printf '%%1\n'; exit 0 ;;
   capture-pane) printf '\xe2\x94\x82 \xe2\x94\x82\n'; exit 0 ;;
 esac
 exit 0

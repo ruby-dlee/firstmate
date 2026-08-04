@@ -110,11 +110,12 @@ Calls made sooner than 20 seconds do not overwrite that snapshot, so fast heartb
 The verdict appears in the ordinary heartbeat read:
 
 ```
-state: working · source: run-step · validating (running) · liveness: alive (3 procs) on bash tests/fm-teardown-a.test.sh (38:37) · step: test
+state: working · source: run-step · validating (running) · agent-liveness: alive (agent process confirmed) · run-liveness: alive (3 procs) on bash tests/fm-teardown-a.test.sh (38:37) · step: test · liveness: alive (agent and run processes confirmed)
 ```
 
-The verdict is appended as an observation and never overrides the run state, because a step caught momentarily between processes would otherwise be reported dead - recreating the failure in the opposite direction.
-The shared supervision boundary absorbs `alive`, but surfaces both `dead` and `unknown`; an unreadable observation is not evidence of health.
+The run-process verdict is appended as an observation and never overrides the run state, because a step caught momentarily between processes would otherwise be reported dead - recreating the failure in the opposite direction.
+The agent process is independently reported as `agent-liveness`, while this command-process reading is reported as `run-liveness`.
+The shared supervision boundary consumes the fail-closed `liveness` aggregate, which absorbs `alive` but surfaces both `dead` and `unknown`; an unreadable observation on either sampled axis is not evidence of health.
 The `ci` step is exempt: its monitoring runs inside the daemon and owns no worktree process, so a verdict there would always read `dead` and mean nothing.
 
 The unit of work and its age ride along on that line because "alive" alone still leaves hours of runtime unexplained.

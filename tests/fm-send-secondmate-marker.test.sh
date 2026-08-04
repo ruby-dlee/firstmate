@@ -53,7 +53,18 @@ case "${1:-}" in
     fi
     exit 0 ;;
   display-message)
-    for a in "$@"; do case "$a" in *cursor_y*) printf '0\n'; exit 0 ;; esac; done
+    target=; next_is_target=0
+    for a in "$@"; do
+      if [ "$next_is_target" = 1 ]; then target=$a; next_is_target=0
+      elif [ "$a" = -t ]; then next_is_target=1
+      fi
+    done
+    for a in "$@"; do
+      case "$a" in
+        *cursor_y*) printf '0\n'; exit 0 ;;
+        *window_name*) printf '%s\n' "${target#*:}"; exit 0 ;;
+      esac
+    done
     printf 'fakepane\n'; exit 0 ;;
   capture-pane) printf '\xe2\x94\x82 \xe2\x94\x82\n'; exit 0 ;;
   list-windows) exit 0 ;;
@@ -156,8 +167,8 @@ test_explicit_window_is_not_marked() {
   home=$(setup_home explicit)
   # An explicit endpoint is not a task selector, so even matching secondmate
   # metadata must not make fm-send guess the caller's intent and mark it.
-  fm_write_secondmate_meta "$home/state/win.meta" "$home" "other:win"
-  run_send "$fb" "$home" "$log" "other:win" "ping"; rc=$?
+  fm_write_secondmate_meta "$home/state/win.meta" "$home" "other:fm-win"
+  run_send "$fb" "$home" "$log" "other:fm-win" "ping"; rc=$?
   expect_code 0 "$rc" "send to an explicit window with matching meta should succeed"
   got=$(cat "$log")
   [ "$got" = "ping" ] \

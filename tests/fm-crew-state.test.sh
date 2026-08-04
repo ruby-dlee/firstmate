@@ -20,10 +20,10 @@
 #   (h) dead pane: no run -> unknown/none; with a run -> run-step (not the shell)
 #   (i) kind=scout skips the run lookup                           -> pane/status-log
 #   (j) torn-down worktree / missing meta                         -> unknown/none
-#   (l) a quiet active step carries a real liveness verdict (dead / alive /
-#       unknown) from
-#       bin/fm-nm-step-liveness.sh, and the ci step is exempted because it owns
-#       no worktree process - the 2026-08-02 false-dead regression pair
+#   (l) an active or parked run carries separate agent-liveness; a quiet active
+#       command step also carries run-liveness from bin/fm-nm-step-liveness.sh,
+#       and liveness remains their fail-closed supervision aggregate; the ci
+#       step is exempt from run-liveness because it owns no worktree process
 #   (k) crew_is_provably_working end-to-end over the REAL helper (not a canned
 #       fake fm-crew-state.sh verdict): cross-branch attribution via the runs
 #       list -> absorbed; genuinely no run anywhere + idle pane -> surfaced.
@@ -84,13 +84,21 @@ SH
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+all=$*
 case "${1:-}" in
   display-message)
     [ "${FM_FAKE_TMUX_MISSING:-0}" = 1 ] && exit 1
-    printf '%%1\n' ;;
+    case "$all" in
+      *'#{pane_current_command}'*) printf '%s\n' "${FM_FAKE_TMUX_COMMAND:-codex}" ;;
+      *'#{window_name}'*) printf '%s\n' "${FM_FAKE_TMUX_LABEL:-fm-fixture}" ;;
+      *) printf '%%1\n' ;;
+    esac ;;
   capture-pane)
     [ "${FM_FAKE_TMUX_MISSING:-0}" = 1 ] && exit 1
-    if [ "${FM_FAKE_BUSY:-0}" = 1 ]; then printf 'work in progress\nesc to interrupt\n'
+    [ "${FM_FAKE_TMUX_CAPTURE_TIMEOUT:-0}" = 0 ] || sleep 30
+    [ "${FM_FAKE_TMUX_EMPTY_PANE:-0}" = 0 ] || exit 0
+    if [ -n "${FM_FAKE_TMUX_PANE:-}" ]; then printf '%s\n' "$FM_FAKE_TMUX_PANE"
+    elif [ "${FM_FAKE_BUSY:-0}" = 1 ]; then printf 'work in progress\nesc to interrupt\n'
     else printf 'all quiet\n> \n'; fi ;;
 esac
 exit 0
@@ -251,6 +259,11 @@ reset_fakes() {
   FM_FAKE_RUNS_LIST=""
   FM_FAKE_BUSY=0
   FM_FAKE_TMUX_MISSING=0
+  FM_FAKE_TMUX_CAPTURE_TIMEOUT=0
+  FM_FAKE_TMUX_EMPTY_PANE=0
+  FM_FAKE_TMUX_COMMAND=codex
+  FM_FAKE_TMUX_LABEL=fm-fixture
+  FM_FAKE_TMUX_PANE=""
   FM_FAKE_HERDR_BUSY=0
   FM_FAKE_HERDR_MISSING=0
   FM_FAKE_HERDR_AGENT_STATUS=""
@@ -262,6 +275,8 @@ reset_fakes() {
   FM_FAKE_REMOTE_COMMIT_FAIL=0
   FM_FAIL_ON_LOCAL_COMMIT_LOOKUP=0
   export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_TMUX_MISSING
+  export FM_FAKE_TMUX_CAPTURE_TIMEOUT FM_FAKE_TMUX_EMPTY_PANE
+  export FM_FAKE_TMUX_COMMAND FM_FAKE_TMUX_LABEL FM_FAKE_TMUX_PANE
   export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS
   export FM_FAKE_PR_STATE FM_FAKE_PR_HEAD FM_FAKE_GH_AXI_FAIL
   export FM_FAKE_REMOTE_COMMIT_HEAD FM_FAKE_REMOTE_COMMIT_FAIL FM_FAIL_ON_LOCAL_COMMIT_LOOKUP
@@ -497,6 +512,150 @@ test_active_run_is_authoritative() {
   pass "active run-step is authoritative"
 }
 
+# An active validation run and its agent answer different questions. The run may
+# continue after the harness process exits, so the current-state line must keep
+# the run working while making a dead agent observably different from a healthy
+# one. Before the agent-liveness field existed these two outputs were byte-for-
+# byte identical; this assertion is the direct mutation proof for that defect.
+test_active_run_distinguishes_dead_agent() {
+  reset_fakes
+  local d healthy dead
+  d=$(new_case agent-dead-vs-alive)
+  make_repo_on_branch "$d/wt" fm/feat-agent
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-agent.meta" \
+    "window=fm:fm-feat-agent" "worktree=$d/wt" "kind=ship" "harness=codex"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-agent)"
+
+  healthy=$(FM_FAKE_TMUX_COMMAND=codex run_crew_state "$d" feat-agent)
+  dead=$(FM_FAKE_TMUX_COMMAND=zsh run_crew_state "$d" feat-agent)
+
+  [ "$healthy" != "$dead" ] \
+    || fail "a dead agent on a live run is still reported identically to a healthy agent: $dead"
+  assert_contains "$healthy" "agent-liveness: alive" "a confirmed harness process reports alive"
+  assert_contains "$healthy" "liveness: alive" "healthy agent evidence keeps aggregate liveness alive"
+  assert_contains "$dead" "state: working" "agent death does not overwrite advancing run progress"
+  assert_contains "$dead" "validating (running)" "agent death preserves the active run-step detail"
+  assert_contains "$dead" "agent-liveness: dead" "a missing harness process is separately visible"
+  assert_contains "$dead" "liveness: dead" "dead agent evidence makes aggregate liveness actionable"
+  PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" FM_NM_HOME="$d/nm-home" \
+    FM_FAKE_TMUX_COMMAND=codex crew_is_provably_working feat-agent \
+    || fail "a healthy agent on an active run was not absorbable as provably working"
+  PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" FM_NM_HOME="$d/nm-home" \
+    FM_FAKE_TMUX_COMMAND=zsh crew_is_provably_working feat-agent \
+    && fail "a dead agent on an active run was absorbed instead of producing an actionable wake"
+  pass "an active run reports dead and healthy agents distinctly without weakening run-step precedence"
+}
+
+test_dead_agent_quota_banner_names_terminal_exhaustion() {
+  reset_fakes
+  local d out
+  d=$(new_case agent-quota-exhausted)
+  make_repo_on_branch "$d/wt" fm/feat-quota
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-quota.meta" \
+    "window=fm:fm-feat-quota" "worktree=$d/wt" "kind=ship" "harness=codex"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-quota)"
+  FM_FAKE_TMUX_COMMAND=zsh
+  FM_FAKE_TMUX_PANE="The previous turn has ended.
+You've hit your usage limit
+> "
+
+  out=$(run_crew_state "$d" feat-quota)
+  assert_contains "$out" "agent-liveness: dead (agent quota-exhausted; relaunch on another account)" \
+    "a dead Codex agent with the status-region banner names quota exhaustion and its only remedy"
+  assert_contains "$out" "liveness: dead (agent quota-exhausted; relaunch on another account)" \
+    "quota exhaustion makes aggregate liveness actionable"
+  assert_not_contains "$out" "stale" "quota exhaustion is not mislabeled as stale"
+  assert_not_contains "$out" "wedge" "quota exhaustion is not mislabeled as a wedge"
+  pass "a corroborated quota banner is a named terminal agent state"
+}
+
+# The banner words can legitimately appear in search output, a diff, a fixture,
+# or prose the agent is displaying. Even an exact standalone line inside the
+# bounded status region is insufficient by itself: a live harness process is the
+# independent signal that prevents a healthy lane from being relaunched.
+test_working_agent_displaying_banner_text_is_not_dead() {
+  reset_fakes
+  local d out
+  d=$(new_case agent-banner-content)
+  make_repo_on_branch "$d/wt" fm/feat-banner-content
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-banner-content.meta" \
+    "window=fm:fm-feat-banner-content" "worktree=$d/wt" "kind=ship" "harness=codex"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-banner-content)"
+  FM_FAKE_TMUX_COMMAND=codex
+  FM_FAKE_TMUX_PANE="Search You've hit your usage limit|quota exhausted
+You've hit your usage limit
+esc to interrupt"
+
+  out=$(run_crew_state "$d" feat-banner-content)
+  assert_contains "$out" "agent-liveness: alive" "a working agent remains alive while displaying banner text"
+  assert_contains "$out" "liveness: alive" "displayed content keeps aggregate liveness healthy"
+  assert_not_contains "$out" "quota-exhausted" "displayed content is not mistaken for a harness exhaustion state"
+  assert_not_contains "$out" "liveness: dead" "displayed content cannot make a live agent dead"
+  pass "ordinary pane content containing the exhaustion banner does not kill a working lane"
+}
+
+test_unreadable_agent_probe_remains_unknown() {
+  reset_fakes
+  local d out
+  d=$(new_case agent-unknown)
+  make_repo_on_branch "$d/wt" fm/feat-agent-unknown
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-agent-unknown.meta" \
+    "window=fm:fm-feat-agent-unknown" "worktree=$d/wt" "kind=ship" "harness=pi"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-agent-unknown)"
+  FM_FAKE_TMUX_COMMAND=node
+
+  out=$(run_crew_state "$d" feat-agent-unknown)
+  assert_contains "$out" "agent-liveness: unknown" "an ambiguous harness process is visibly unknown"
+  assert_contains "$out" "liveness: unknown" "unknown agent evidence keeps aggregate liveness unknown"
+  assert_not_contains "$out" "agent-liveness: alive" "unknown agent evidence is never promoted to healthy"
+  assert_not_contains "$out" "agent-liveness: dead" "unknown agent evidence is never promoted to dead"
+  PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" FM_NM_HOME="$d/nm-home" \
+    FM_FAKE_TMUX_COMMAND=node crew_is_provably_working feat-agent-unknown \
+    && fail "unknown agent evidence was absorbed as provably working"
+  pass "unknown agent liveness remains a distinct fail-closed third state"
+}
+
+test_agent_probe_failures_remain_unknown() {
+  reset_fakes
+  local d out
+  d=$(new_case agent-probe-failures)
+  make_repo_on_branch "$d/wt" fm/feat-agent-probe-failures
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-agent-probe-failures.meta" \
+    "window=fm:fm-feat-agent-probe-failures" "worktree=$d/wt" "kind=ship" "harness=codex"
+  FM_FAKE_AXI_STATUS="$(run_running fm/feat-agent-probe-failures)"
+
+  out=$(FM_FAKE_TMUX_EMPTY_PANE=1 run_crew_state "$d" feat-agent-probe-failures)
+  assert_contains "$out" "agent-liveness: unknown (agent probe unreadable: empty pane sample)" \
+    "an empty agent sample is visibly unknown"
+  assert_contains "$out" " · liveness: unknown" \
+    "an empty agent sample keeps aggregate liveness unknown"
+  assert_not_contains "$out" "agent-liveness: alive" \
+    "an empty agent sample is never promoted to healthy"
+
+  out=$(FM_FAKE_TMUX_CAPTURE_TIMEOUT=1 FM_CREW_STATE_NM_TIMEOUT=1 \
+    run_crew_state "$d" feat-agent-probe-failures)
+  assert_contains "$out" "agent-liveness: unknown (agent probe timed out after 1s)" \
+    "a timed-out agent sample is visibly unknown"
+  assert_contains "$out" " · liveness: unknown" \
+    "a timed-out agent sample keeps aggregate liveness unknown"
+  assert_not_contains "$out" "agent-liveness: alive" \
+    "a timed-out agent sample is never promoted to healthy"
+
+  out=$(FM_FAKE_TMUX_MISSING=1 run_crew_state "$d" feat-agent-probe-failures)
+  assert_contains "$out" "agent-liveness: unknown (agent probe unreadable:" \
+    "an unreadable agent endpoint is visibly unknown"
+  assert_contains "$out" " · liveness: unknown" \
+    "an unreadable agent endpoint keeps aggregate liveness unknown"
+  assert_not_contains "$out" "agent-liveness: alive" \
+    "an unreadable agent endpoint is never promoted to healthy"
+  pass "empty, timed-out, and unreadable agent probes remain fail-closed unknown"
+}
+
 # (l) a quiet step carries the liveness probe's verdict instead of leaving
 # firstmate to hand-check it. The probe's real process enumeration is covered by
 # fm-nm-step-liveness.test.sh; these cases isolate this consumer's mapping.
@@ -512,7 +671,8 @@ test_quiet_step_reports_dead_liveness() {
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$d/fakebin/fake-liveness" \
     FM_FAKE_LIVENESS_MODE=dead run_crew_state "$d" feat-q)
   assert_contains "$out" "state: working" "a quiet step is still reported working"
-  assert_contains "$out" "liveness: dead (0 procs)" "a quiet step with no process reports dead"
+  assert_contains "$out" "run-liveness: dead (0 procs)" "a quiet step with no process reports dead"
+  assert_contains "$out" "liveness: dead (run process unavailable)" "dead run-process evidence remains actionable"
   assert_contains "$out" "step: test" "the liveness observation names its active step"
   pass "a quiet step with no live process reports a dead liveness verdict"
 }
@@ -528,7 +688,9 @@ test_quiet_step_reports_alive_liveness() {
   local out
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$d/fakebin/fake-liveness" \
     FM_FAKE_LIVENESS_MODE=alive run_crew_state "$d" feat-q)
-  assert_contains "$out" "liveness: alive" "a quiet step with a live process reports alive"
+  assert_contains "$out" "run-liveness: alive" "a quiet step with a live process reports alive"
+  assert_contains "$out" "liveness: alive (agent and run processes confirmed)" \
+    "positive evidence on both axes makes aggregate liveness healthy"
   # Alive alone leaves hours of runtime unexplained; naming the current unit of
   # work and its age is what separates a slow step from a hung one without
   # spending a run to find out, so the heartbeat read must carry it.
@@ -548,59 +710,60 @@ test_quiet_step_probe_failures_are_unknown() {
 
   FM_FAKE_AXI_STATUS=$(printf '%s\n' "$FM_FAKE_AXI_STATUS" | sed '/active_steps\[1\]/d')
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" run_crew_state "$d" feat-qu)
-  assert_contains "$out" "liveness: unknown" "a quiet result without an identifiable step is visibly unknown"
+  assert_contains "$out" "run-liveness: unknown" "a quiet result without an identifiable step is visibly unknown"
+  assert_contains "$out" "liveness: unknown" "missing run-process identity keeps aggregate liveness unknown"
   assert_contains "$out" "probe unreadable: active step unavailable" "a missing active step explains its unreadable cause"
 
   FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-qu test)"
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=empty \
     run_crew_state "$d" feat-qu)
-  assert_contains "$out" "liveness: unknown" "an empty probe result is visibly unknown"
+  assert_contains "$out" "run-liveness: unknown" "an empty probe result is visibly unknown"
   assert_contains "$out" "probe unreadable: empty result" "an empty result explains its unreadable cause"
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=nonzero \
     run_crew_state "$d" feat-qu)
-  assert_contains "$out" "liveness: unknown" "a nonzero probe result is visibly unknown"
+  assert_contains "$out" "run-liveness: unknown" "a nonzero probe result is visibly unknown"
   assert_contains "$out" "probe unreadable: exited 9" "a nonzero result reports its exit status"
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=malformed \
     run_crew_state "$d" feat-qu)
-  assert_contains "$out" "liveness: unknown" "a malformed probe result is visibly unknown"
+  assert_contains "$out" "run-liveness: unknown" "a malformed probe result is visibly unknown"
   assert_contains "$out" "probe protocol unreadable: verdict missing or invalid" \
     "a malformed result reports its distinct protocol failure"
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=multiline \
     run_crew_state "$d" feat-qu)
-  assert_contains "$out" "liveness: unknown" "a multiline probe result is visibly unknown"
+  assert_contains "$out" "run-liveness: unknown" "a multiline probe result is visibly unknown"
   assert_contains "$out" "probe protocol unreadable: multiline result" \
     "a multiline probe result is rejected before field parsing"
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=malformed-verdict \
     run_crew_state "$d" feat-qu)
-  assert_contains "$out" "liveness: unknown" "a verdict with trailing data is visibly unknown"
+  assert_contains "$out" "run-liveness: unknown" "a verdict with trailing data is visibly unknown"
   assert_contains "$out" "probe protocol unreadable: verdict missing or invalid" \
     "a verdict with trailing data is rejected at its field boundary"
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=malformed-procs \
     run_crew_state "$d" feat-qu)
-  assert_contains "$out" "liveness: unknown" "a process count with trailing data is visibly unknown"
+  assert_contains "$out" "run-liveness: unknown" "a process count with trailing data is visibly unknown"
   assert_contains "$out" "probe protocol unreadable: numeric process count missing or invalid" \
     "a process count with trailing data is rejected at its field boundary"
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=alive-zero \
     run_crew_state "$d" feat-qu)
-  assert_contains "$out" "liveness: unknown" "an alive verdict with no processes is visibly unknown"
+  assert_contains "$out" "run-liveness: unknown" "an alive verdict with no processes is visibly unknown"
   assert_contains "$out" "probe protocol unreadable: alive verdict requires processes" \
     "an alive verdict requires a positive process count"
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=dead-nonzero \
     run_crew_state "$d" feat-qu)
-  assert_contains "$out" "liveness: unknown" "a dead verdict with processes is visibly unknown"
+  assert_contains "$out" "run-liveness: unknown" "a dead verdict with processes is visibly unknown"
   assert_contains "$out" "probe protocol unreadable: dead verdict requires zero processes" \
     "a dead verdict requires a zero process count"
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=empty-procs \
     run_crew_state "$d" feat-qu)
-  assert_contains "$out" "liveness: unknown" "an empty process count is visibly unknown"
+  assert_contains "$out" "run-liveness: unknown" "an empty process count is visibly unknown"
   assert_contains "$out" "probe protocol unreadable: numeric process count missing or invalid" \
     "an empty process count reports the probe-side protocol defect"
   assert_not_contains "$out" "grade:" \
@@ -608,14 +771,16 @@ test_quiet_step_probe_failures_are_unknown() {
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=argv-fields \
     run_crew_state "$d" feat-qu)
-  assert_contains "$out" "liveness: unknown (grade: present-unproven; 3 procs; presence established)" \
+  assert_contains "$out" "run-liveness: unknown (grade: present-unproven; 3 procs; presence established)" \
     "structured fields are parsed before argv text containing field names"
+  assert_contains "$out" " · liveness: unknown" \
+    "an unknown run-process reading keeps aggregate liveness unknown"
   assert_contains "$out" 'on python -c "procs: x grade: bogus" (1:00)' \
     "argv field-name text remains visible without corrupting the verdict"
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_CREW_STATE_NM_TIMEOUT=1 FM_FAKE_LIVENESS_MODE=timeout \
     run_crew_state "$d" feat-qu)
-  assert_contains "$out" "liveness: unknown" "a timed-out probe result is visibly unknown"
+  assert_contains "$out" "run-liveness: unknown" "a timed-out probe result is visibly unknown"
   assert_contains "$out" "probe timed out after 1s" "a timed-out result reports its timeout"
   pass "quiet-step probe failures remain visibly unknown with distinct causes"
 }
@@ -631,7 +796,9 @@ test_quiet_ci_step_skips_liveness() {
   fm_write_meta "$d/state/feat-q.meta" "window=fm:fm-feat-q" "worktree=$d/wt" "kind=ship"
   FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-q ci)"
   local out; out=$(run_crew_state "$d" feat-q)
-  assert_not_contains "$out" "liveness:" "the ci step never carries a liveness verdict"
+  assert_contains "$out" "agent-liveness: alive" "the ci lane still reports its agent availability"
+  assert_contains "$out" "liveness: alive" "the ci lane aggregate follows its agent availability"
+  assert_not_contains "$out" "run-liveness:" "the ci step never carries a command-process liveness verdict"
   assert_not_contains "$out" "procs" "the ci step is not probed for worktree processes"
   pass "a quiet ci step is not given a meaningless liveness verdict"
 }
@@ -1733,7 +1900,31 @@ test_usage_error() {
   pass "usage error exits 2"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = agent-distinct ]; then
+  test_active_run_distinguishes_dead_agent
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = agent-banner-content ]; then
+  test_working_agent_displaying_banner_text_is_not_dead
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = agent-liveness ]; then
+  test_active_run_distinguishes_dead_agent
+  test_dead_agent_quota_banner_names_terminal_exhaustion
+  test_working_agent_displaying_banner_text_is_not_dead
+  test_unreadable_agent_probe_remains_unknown
+  test_agent_probe_failures_remain_unknown
+  exit 0
+fi
+
 test_active_run_is_authoritative
+test_active_run_distinguishes_dead_agent
+test_dead_agent_quota_banner_names_terminal_exhaustion
+test_working_agent_displaying_banner_text_is_not_dead
+test_unreadable_agent_probe_remains_unknown
+test_agent_probe_failures_remain_unknown
 test_quiet_step_reports_dead_liveness
 test_quiet_step_reports_alive_liveness
 test_quiet_step_probe_failures_are_unknown

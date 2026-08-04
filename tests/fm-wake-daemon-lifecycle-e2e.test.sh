@@ -90,18 +90,16 @@ test_routine_then_terminal_after_restart() {
   [ "$(wc -l < "$state/.subsuper-escalations" | tr -d ' ')" -eq 1 ] \
     || fail "catch-all scan duplicated the already-buffered digest"
 
-  # With afk active, the buffered digest flushes to the supervisor pane as ONE
-  # submission (one typed line + one Enter), then the buffer clears.
+  # With afk active, the buffered digest flushes as ONE native reap wake, then
+  # the buffer clears.
   local sent
   sent="$dir/sent.log"; : > "$sent"
-  : > "$dir/pane.txt"
   afk_enter "$state"
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
-    FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
+  FM_AFK_DELIVERY=reap-wake FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" > "$sent" \
     || fail "escalate_flush failed for the buffered digest"
-  [ "$(grep -c '\[ENTER\]' "$sent")" -eq 1 ] || fail "buffered digest was not submitted exactly once"
+  [ "$(grep -c '^afk-reap-wake:' "$sent")" -eq 1 ] || fail "buffered digest did not emit exactly one reap wake"
   [ ! -s "$state/.subsuper-escalations" ] || fail "buffer not cleared after a successful flush"
-  pass "lifecycle: routine self-handles, terminal survives a watcher restart, buffers once, no dup, injects once"
+  pass "lifecycle: routine self-handles, terminal survives a watcher restart, buffers once, no dup, wakes once"
 }
 
 # --- Phase 2: stale working-pane transient -> persistent -> resumed ----------

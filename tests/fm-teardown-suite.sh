@@ -81,6 +81,34 @@ export REAL_STAT_FOR_TEST
 REAL_PS_FOR_TEST=$(command -v ps)
 export REAL_PS_FOR_TEST
 
+# Secondmate retirement repeatedly proves that the firstmate source repository's
+# complete Git object graph survives the home being removed. Point those proofs at
+# one compact repository per test file instead of the developer checkout, whose
+# object population and history vary with unrelated local work and made every case
+# pay that host-specific cost. The same refs, remote, complete-object, and source/home
+# separation proofs still run; cases that need a special object graph build it.
+make_firstmate_source_fixture() {
+  local source="$TMP_ROOT/firstmate-source" origin="$TMP_ROOT/firstmate-source-origin.git" root_origin tip
+  git init --quiet "$source"
+  git -C "$source" symbolic-ref HEAD refs/heads/main
+  cp "$ROOT/.gitignore" "$source/.gitignore"
+  git -C "$source" add .gitignore
+  git -C "$source" -c user.name=fmtest -c user.email=fmtest@example.invalid \
+    commit --quiet -m 'firstmate source fixture'
+  tip=$(git -C "$source" rev-parse HEAD)
+  git clone --quiet --bare "$source" "$origin"
+  git -C "$source" remote add origin "$origin"
+  if root_origin=$(git -C "$ROOT" remote get-url origin 2>/dev/null); then
+    git -C "$source" remote set-url origin "$root_origin"
+  fi
+  git -C "$source" update-ref refs/remotes/origin/main "$tip"
+  git -C "$source" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+  ln -s "$ROOT/bin" "$source/bin"
+  printf '%s\n' "$source"
+}
+
+FM_TEST_FIRSTMATE_SOURCE=$(make_firstmate_source_fixture)
+
 write_treehouse_lease() {
   local worktree=$1 holder=$2 slot pool state
   slot=$(cd "$(dirname "$worktree")" && pwd -P)
@@ -216,14 +244,15 @@ prepare_secondmate_home_fixture() {
   home_abs=$(cd "$case_dir/wt" && pwd -P)
   printf '%s\n' "- $id - test secondmate (home: $home_abs; scope: test; projects: test; added 2026-07-23)" \
     > "$case_dir/data/secondmates.md"
-  root_default=$(git -C "$ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || printf 'origin/main')
+  root_default=$(git -C "$FM_TEST_FIRSTMATE_SOURCE" \
+    symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || printf 'origin/main')
   default=${root_default#origin/}
-  root_tip=$(git -C "$ROOT" rev-parse "$root_default")
-  git -C "$case_dir/project" fetch --quiet "$ROOT" "$root_tip"
+  root_tip=$(git -C "$FM_TEST_FIRSTMATE_SOURCE" rev-parse "$root_default")
+  git -C "$case_dir/project" fetch --quiet "$FM_TEST_FIRSTMATE_SOURCE" "$root_tip"
   git -C "$case_dir/project" checkout --quiet --detach
   git -C "$case_dir/wt" checkout --quiet -B "$default" "$root_tip"
   git -C "$case_dir/project" branch -D fm/task-x1 >/dev/null 2>&1 || true
-  git -C "$case_dir/project" remote set-url origin "$ROOT"
+  git -C "$case_dir/project" remote set-url origin "$FM_TEST_FIRSTMATE_SOURCE"
   git -C "$case_dir/project" update-ref "refs/remotes/origin/$default" "$root_tip"
   git -C "$case_dir/project" symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$default"
   git -C "$case_dir/wt" reflog expire --expire=now --all
@@ -846,7 +875,7 @@ SH
 # Run teardown with PATH mocking. Args: case_dir [extra args...]
 run_teardown() {
   local case_dir=$1; shift
-  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_ROOT_OVERRIDE="$FM_TEST_FIRSTMATE_SOURCE" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_DATA_OVERRIDE="${FM_DATA_OVERRIDE:-$case_dir/data}" \
   FM_CONFIG_OVERRIDE="$case_dir/config" \
@@ -854,7 +883,7 @@ run_teardown() {
   FM_CHECKOUT_REFRESH_LOCK_ROOT="${FM_CHECKOUT_REFRESH_LOCK_ROOT:-$case_dir/checkout-locks}" \
   FM_EXPECT_CHECKOUT_LOCK="${FM_EXPECT_CHECKOUT_LOCK:-}" \
   FM_EXPECT_CHECKOUT_LOCK_MARKER="${FM_EXPECT_CHECKOUT_LOCK_MARKER:-}" \
-  FM_FAKE_FIRSTMATE_SOURCE="${FM_FAKE_FIRSTMATE_SOURCE:-$ROOT}" \
+  FM_FAKE_FIRSTMATE_SOURCE="${FM_FAKE_FIRSTMATE_SOURCE:-$FM_TEST_FIRSTMATE_SOURCE}" \
   FM_TEARDOWN_TEST_MOUNT_PATH="${FM_TEARDOWN_TEST_MOUNT_PATH:-}" \
   HOME="${FM_TEST_TEARDOWN_HOME:-$HOME}" \
   FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
@@ -865,13 +894,13 @@ run_teardown() {
 run_teardown_named() {
   local case_dir=$1 task=$2
   shift 2
-  FM_ROOT_OVERRIDE="$ROOT" \
+  FM_ROOT_OVERRIDE="$FM_TEST_FIRSTMATE_SOURCE" \
   FM_STATE_OVERRIDE="$case_dir/state" \
   FM_DATA_OVERRIDE="$case_dir/data" \
   FM_CONFIG_OVERRIDE="$case_dir/config" \
   FM_PROJECTS_OVERRIDE="${FM_PROJECTS_OVERRIDE:-$case_dir/source-projects}" \
   FM_CHECKOUT_REFRESH_LOCK_ROOT="$case_dir/checkout-locks" \
-  FM_FAKE_FIRSTMATE_SOURCE="$ROOT" \
+  FM_FAKE_FIRSTMATE_SOURCE="$FM_TEST_FIRSTMATE_SOURCE" \
   FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
   PATH="$case_dir/fakebin:$PATH" \
     "$TEARDOWN" "$task" "$@"
@@ -5362,9 +5391,10 @@ test_secondmate_retirement_validates_top_level_source_storage() {
   write_secondmate_meta "$case_dir"
   owner="$case_dir/wt/data/top-source-owner"
   source="$case_dir/top-source"
-  root_ref=$(git -C "$ROOT" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || printf 'origin/main')
-  root_tip=$(git -C "$ROOT" rev-parse "$root_ref")
-  git clone --quiet "$ROOT" "$owner"
+  root_ref=$(git -C "$FM_TEST_FIRSTMATE_SOURCE" \
+    symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || printf 'origin/main')
+  root_tip=$(git -C "$FM_TEST_FIRSTMATE_SOURCE" rev-parse "$root_ref")
+  git clone --quiet "$FM_TEST_FIRSTMATE_SOURCE" "$owner"
   git -C "$owner" checkout --quiet --detach "$root_tip"
   git -C "$owner" branch --force main "$root_tip"
   git -C "$owner" update-ref refs/remotes/origin/main "$root_tip"
@@ -5951,7 +5981,7 @@ test_nested_secondmate_cleanup_requires_child_home_lock() {
   assert_present "$case_dir/wt/state/nested.meta" "nested lock contention removed child metadata"
   assert_present "$case_dir/wt" "nested lock contention allowed parent home removal"
   assert_grep 'secondmate home lifecycle lock' "$case_dir/stderr" \
-    "nested secondmate home lock contention was not surfaced"
+    "nested secondmate home lock contention was not surfaced: $(cat "$case_dir/stderr")"
   pass "recursive secondmate cleanup acquires each child home lock"
 }
 
@@ -6339,18 +6369,28 @@ if [ "${FM_TEST_FOCUSED:-}" = tasktmp-unknown-classification ]; then
 fi
 
 run_partitioned_test() {
-  local assigned_part test_function=$1
-  assigned_part=$((FM_TEST_PART_SEQUENCE % FM_TEST_PART_TOTAL + 1))
-  FM_TEST_PART_SEQUENCE=$((FM_TEST_PART_SEQUENCE + 1))
+  local assigned_part=1 candidate case_weight=$1 started_seconds test_function=$2
+  for ((candidate = 2; candidate <= FM_TEST_PART_TOTAL; candidate++)); do
+    if [ "${FM_TEARDOWN_PART_LOADS[candidate]}" -lt \
+      "${FM_TEARDOWN_PART_LOADS[assigned_part]}" ]; then
+      assigned_part=$candidate
+    fi
+  done
+  FM_TEARDOWN_PART_LOADS[assigned_part]=$((
+    FM_TEARDOWN_PART_LOADS[assigned_part] + case_weight
+  ))
   if [ "$assigned_part" -ne "$FM_TEST_PART_INDEX" ]; then
     return 0
   fi
   FM_TEARDOWN_PART_CASES=$((FM_TEARDOWN_PART_CASES + 1))
+  FM_TEARDOWN_PART_WEIGHT_MS=$((FM_TEARDOWN_PART_WEIGHT_MS + case_weight))
   printf 'FM_TEARDOWN_CASE_BEGIN part=%s/%s case=%s\n' \
     "$FM_TEST_PART_INDEX" "$FM_TEST_PART_TOTAL" "$test_function"
+  started_seconds=$SECONDS
   "$test_function"
-  printf 'FM_TEARDOWN_CASE_END part=%s/%s case=%s exit=0\n' \
-    "$FM_TEST_PART_INDEX" "$FM_TEST_PART_TOTAL" "$test_function"
+  printf 'FM_TEARDOWN_CASE_END part=%s/%s case=%s exit=0 duration_seconds=%s\n' \
+    "$FM_TEST_PART_INDEX" "$FM_TEST_PART_TOTAL" "$test_function" \
+    "$((SECONDS - started_seconds))"
 }
 
 FM_TEST_PART_INDEX=${FM_TEST_PART_INDEX:-1}
@@ -6362,152 +6402,171 @@ case "$FM_TEST_PART_INDEX:$FM_TEST_PART_TOTAL" in
 esac
 [ "$FM_TEST_PART_INDEX" -le "$FM_TEST_PART_TOTAL" ] \
   || fail "teardown partition index exceeds total"
-FM_TEST_PART_SEQUENCE=0
 FM_TEARDOWN_PART_CASES=0
+FM_TEARDOWN_PART_WEIGHT_MS=0
+FM_TEARDOWN_PART_LOADS=()
+for ((teardown_part = 1; teardown_part <= FM_TEST_PART_TOTAL; teardown_part++)); do
+  FM_TEARDOWN_PART_LOADS[teardown_part]=0
+done
 
+# Each entry is "<measured-local-ms> <test-function>". The weights came from
+# one complete eight-way run on 2026-08-04 and drive deterministic
+# longest-processing-time assignment; they are not CI duration weights.
 TEARDOWN_FULL_SUITE_CASES=(
-  test_local_only_fork_remote_allows
-  test_teardown_prompts_tasks_axi_done_when_compatible
-  test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
-  test_local_only_truly_unpushed_refuses
-  test_local_only_merged_to_local_main_allows
-  test_no_mistakes_origin_remote_allows
-  test_no_mistakes_truly_unpushed_refuses
-  test_local_only_force_retains_unpushed
-  test_managed_force_teardown_retains_unlanded_lease_and_session
-  test_managed_teardown_retains_lease_when_endpoint_state_is_unknown
-  test_managed_release_failure_preserves_unrecycled_worktree_for_retry
-  test_managed_teardown_locks_generation_before_endpoint_cleanup
-  test_managed_child_teardown_locks_generation_before_snapshot
-  test_forced_secondmate_child_uses_child_home_for_endpoint_verification
-  test_forced_secondmate_quiesces_parent_before_child_cleanup
-  test_forced_secondmate_retains_child_on_treehouse_failure
-  test_forced_secondmate_retains_unverified_process_group
-  test_forced_secondmate_retains_child_when_treehouse_unavailable
-  test_forced_secondmate_retains_child_on_checkout_lock_contention
-  test_herdr_teardown_clears_escalation_marker
-  test_required_report_blocks_then_publishes_before_cleanup
-  test_required_report_restores_rollback_generation_before_publish
-  test_required_report_revalidates_after_quiescence
-  test_legacy_teardown_revalidates_after_quiescence
-  test_teardown_rejects_nested_metadata_roots_before_quiescence
-  test_teardown_rejects_drifted_treehouse_task_lease
-  test_teardown_rechecks_treehouse_lease_after_locked_safety
-  test_secondmate_rejects_drifted_home_repository_identity
-  test_normal_secondmate_retires_proven_detached_head
-  test_forced_secondmate_retains_untracked_skill_draft
-  test_forced_secondmate_retains_unique_detached_head
-  test_forced_secondmate_retains_stash
-  test_forced_secondmate_retains_unlanded_child_work
-  test_forced_secondmate_retains_unquiesced_unmanaged_child
-  test_secondmate_registry_duplicate_home_blocks_removal
-  test_secondmate_retirement_retains_idle_registered_child
-  test_secondmate_retirement_retains_unlanded_project_clone
-  test_secondmate_project_tags_do_not_prove_landing
-  test_secondmate_project_origin_authority_survives_home_removal
-  test_secondmate_retirement_recurses_into_ignored_nested_repositories
-  test_secondmate_retirement_rejects_linked_worktree_graphs
-  test_secondmate_retirement_accounts_for_directory_symlinks
-  test_secondmate_retirement_rejects_loopback_and_stale_tracking_authority
-  test_secondmate_retirement_rejects_mount_boundaries
-  test_secondmate_retirement_rejects_effective_ssh_redirects
-  test_secondmate_retirement_rejects_incomplete_surviving_authority
-  test_secondmate_retirement_validates_top_level_source_storage
-  test_secondmate_retirement_rejects_local_network_aliases
-  test_secondmate_retirement_rejects_in_home_remote_object_storage
-  test_secondmate_retirement_rejects_source_common_dir_in_home
-  test_teardown_removal_roots_fail_closed
-  test_treehouse_return_stays_bound_to_validated_root
-  test_teardown_distinguishes_dead_and_live_harness_processes
-  test_secondmate_retirement_retains_reflog_and_rewritten_history
-  test_secondmate_retirement_rejects_http_proxy_and_object_redirects
-  test_secondmate_network_fetches_pin_validated_addresses
-  test_surviving_object_storage_is_bound_through_graph_proof
-  test_secondmate_retirement_serializes_child_spawn
-  test_nested_secondmate_cleanup_requires_child_home_lock
-  test_secondmate_registry_updates_are_locked_and_literal
-  test_teardown_retains_untracked_claude_skill_draft
-  test_teardown_refuses_unsafe_tasktmp_metadata
-  test_teardown_accepts_legacy_tasktmp_with_clean_absent_endpoint
-  test_teardown_refuses_tasktmp_bound_to_different_generation
-  test_teardown_refuses_unknown_tasktmp_classification
-  test_teardown_removes_safe_tasktmp_and_accepts_absence
-  test_teardown_rejects_malformed_report_requirement
-  test_secondmate_state_enumeration_fails_closed
-  test_secondmate_missing_treehouse_child_is_retained
-  test_secondmate_registry_home_drift_blocks_removal
-  test_retained_direct_spawn_requires_confirmed_endpoint_quiescence
-  test_missing_ship_worktree_retains_endpoint_and_metadata
-  test_never_created_direct_spawn_endpoint_is_not_quiesced
-  test_never_created_scout_without_report_cleans_bookkeeping
-  test_squash_merged_branch_deleted_allows
-  test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
-  test_no_pr_recorded_discovers_merged_pr_by_branch_allows
-  test_squash_merged_pr_allows_replayed_unpushed_patch
-  test_merged_pr_with_later_local_commit_refuses
-  test_pr_check_does_not_refresh_stale_pr_head
-  test_pr_check_records_remote_head_when_local_lags
-  test_pr_check_lookup_errors_are_loud_and_bounded
-  test_pr_check_serializes_with_account_session_updates
-  test_pr_check_rejects_reused_task_generation
-  test_content_in_default_fallback_allows
-  test_content_fallback_refreshes_stale_origin_ref
-  test_content_fallback_uses_live_default
-  test_content_fallback_reprobes_live_default_after_fetch
-  test_content_fallback_honors_shared_checkout_lock
-  test_locked_return_reuses_checkout_lock_for_landing_recheck
-  test_treehouse_return_timeout_reaps_children_before_unlock
-  test_dirty_worktree_refuses
-  test_dead_task_reaper_returns_only_clean_landed_work_without_force
-  test_dead_task_reaper_treats_stale_status_as_no_liveness_evidence
-  test_dead_task_reaper_reconciles_an_already_returned_lease
-  test_dead_task_reaper_retains_dirty_work_and_live_endpoints
-  test_dead_task_reaper_requires_exact_lease_and_closed_pr
-  test_treehouse_capacity_reports_low_clean_availability
-  test_nonignored_untracked_work_refuses_without_preservation
-  test_already_returned_worktree_finishes_bookkeeping
-  test_already_returned_worktree_refuses_preservation_without_mutation
-  test_watchman_cookies_do_not_block_teardown
-  test_ignored_worktree_content_is_summarized_without_blocking
-  test_dead_reap_allows_generated_ignored_output_with_summary
-  test_dead_reap_refuses_work_shaped_ignored_output
-  test_dead_reap_refuses_ambiguous_ignored_output
-  test_dead_reap_refuses_recent_hand_edit_shaped_output
-  test_dead_reap_refuses_old_ambiguous_output
-  test_dead_reap_protects_work_roots_before_dependencies
-  test_dead_reap_allows_dependency_tree_contents
-  test_dead_reap_rechecks_open_pr_at_locked_return
-  test_dead_reap_rechecks_endpoint_after_local_proofs
-  test_treehouse_reaper_safe_refusals_exit_success
-  test_treehouse_reaper_operational_failure_exits_nonzero
-  test_treehouse_reaper_translates_only_safety_status
-  test_treehouse_reaper_executable_failures_remain_nonzero
-  test_dead_reap_leaf_helper_failures_remain_operational
-  test_dead_reap_authority_statuses_are_distinct
-  test_dead_reap_lock_refusal_and_cleanup_failure_are_distinct
-  test_dead_reap_landing_statuses_are_distinct
-  test_preserve_scratch_captures_then_reclaims_dirty_worktree
-  test_preserve_scratch_never_cleans_unlanded_commits
-  test_preserve_scratch_refuses_tracked_drift_before_cleanup
-  test_preserve_scratch_refuses_index_drift_during_tracked_verification
-  test_gh_error_and_content_absent_refuses
-  test_stale_index_lock_cleared_and_teardown_succeeds
-  test_live_index_lock_is_never_removed_and_teardown_refuses
-  test_lsof_error_never_clears_index_lock
-  test_stale_index_lock_cleanup_rechecks_dirty_worktree
-  test_non_linked_index_lock_path_is_checked_from_worktree
-  test_index_lock_mtime_read_failure_refuses
-  test_transient_index_lock_clears_after_first_attempt_and_retry_succeeds
-  test_persistent_index_lock_exhausts_retries_and_refuses_loudly
-  test_empty_retry_wait_uses_default_without_aborting
-  test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
-  test_closed_pr_wakes_loudly_as_unreviewed
-  test_pr_check_without_worktree_still_performs_lookup
+  "11082 test_local_only_fork_remote_allows"
+  "14861 test_teardown_prompts_tasks_axi_done_when_compatible"
+  "14532 test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present"
+  "5019 test_local_only_truly_unpushed_refuses"
+  "10699 test_local_only_merged_to_local_main_allows"
+  "15651 test_no_mistakes_origin_remote_allows"
+  "7135 test_no_mistakes_truly_unpushed_refuses"
+  "5294 test_local_only_force_retains_unpushed"
+  "3968 test_managed_force_teardown_retains_unlanded_lease_and_session"
+  "5850 test_managed_teardown_retains_lease_when_endpoint_state_is_unknown"
+  "15200 test_managed_release_failure_preserves_unrecycled_worktree_for_retry"
+  "12321 test_managed_teardown_locks_generation_before_endpoint_cleanup"
+  "69573 test_managed_child_teardown_locks_generation_before_snapshot"
+  "17601 test_forced_secondmate_child_uses_child_home_for_endpoint_verification"
+  "68606 test_forced_secondmate_quiesces_parent_before_child_cleanup"
+  "22418 test_forced_secondmate_retains_child_on_treehouse_failure"
+  "22644 test_forced_secondmate_retains_unverified_process_group"
+  "15958 test_forced_secondmate_retains_child_when_treehouse_unavailable"
+  "17716 test_forced_secondmate_retains_child_on_checkout_lock_contention"
+  "11453 test_herdr_teardown_clears_escalation_marker"
+  "18824 test_required_report_blocks_then_publishes_before_cleanup"
+  "20393 test_required_report_restores_rollback_generation_before_publish"
+  "4574 test_required_report_revalidates_after_quiescence"
+  "5044 test_legacy_teardown_revalidates_after_quiescence"
+  "1072 test_teardown_rejects_nested_metadata_roots_before_quiescence"
+  "2308 test_teardown_rejects_drifted_treehouse_task_lease"
+  "10477 test_teardown_rechecks_treehouse_lease_after_locked_safety"
+  "2454 test_secondmate_rejects_drifted_home_repository_identity"
+  "55081 test_normal_secondmate_retires_proven_detached_head"
+  "3529 test_forced_secondmate_retains_untracked_skill_draft"
+  "4267 test_forced_secondmate_retains_unique_detached_head"
+  "5920 test_forced_secondmate_retains_stash"
+  "8418 test_forced_secondmate_retains_unlanded_child_work"
+  "15885 test_forced_secondmate_retains_unquiesced_unmanaged_child"
+  "1569 test_secondmate_registry_duplicate_home_blocks_removal"
+  "6360 test_secondmate_retirement_retains_idle_registered_child"
+  "20784 test_secondmate_retirement_retains_unlanded_project_clone"
+  "18756 test_secondmate_project_tags_do_not_prove_landing"
+  "31147 test_secondmate_project_origin_authority_survives_home_removal"
+  "30079 test_secondmate_retirement_recurses_into_ignored_nested_repositories"
+  "30414 test_secondmate_retirement_rejects_linked_worktree_graphs"
+  "22828 test_secondmate_retirement_accounts_for_directory_symlinks"
+  "32999 test_secondmate_retirement_rejects_loopback_and_stale_tracking_authority"
+  "70153 test_secondmate_retirement_rejects_mount_boundaries"
+  "20049 test_secondmate_retirement_rejects_effective_ssh_redirects"
+  "27541 test_secondmate_retirement_rejects_incomplete_surviving_authority"
+  "13399 test_secondmate_retirement_validates_top_level_source_storage"
+  "15109 test_secondmate_retirement_rejects_local_network_aliases"
+  "15049 test_secondmate_retirement_rejects_in_home_remote_object_storage"
+  "13585 test_secondmate_retirement_rejects_source_common_dir_in_home"
+  "2803 test_teardown_removal_roots_fail_closed"
+  "7945 test_treehouse_return_stays_bound_to_validated_root"
+  "18007 test_teardown_distinguishes_dead_and_live_harness_processes"
+  "35686 test_secondmate_retirement_retains_reflog_and_rewritten_history"
+  "38658 test_secondmate_retirement_rejects_http_proxy_and_object_redirects"
+  "16620 test_secondmate_network_fetches_pin_validated_addresses"
+  "14221 test_surviving_object_storage_is_bound_through_graph_proof"
+  "53108 test_secondmate_retirement_serializes_child_spawn"
+  "24787 test_nested_secondmate_cleanup_requires_child_home_lock"
+  "69528 test_secondmate_registry_updates_are_locked_and_literal"
+  "5740 test_teardown_retains_untracked_claude_skill_draft"
+  "972 test_teardown_refuses_unsafe_tasktmp_metadata"
+  "10931 test_teardown_accepts_legacy_tasktmp_with_clean_absent_endpoint"
+  "810 test_teardown_refuses_tasktmp_bound_to_different_generation"
+  "626 test_teardown_refuses_unknown_tasktmp_classification"
+  "24895 test_teardown_removes_safe_tasktmp_and_accepts_absence"
+  "1728 test_teardown_rejects_malformed_report_requirement"
+  "13803 test_secondmate_state_enumeration_fails_closed"
+  "6667 test_secondmate_missing_treehouse_child_is_retained"
+  "1916 test_secondmate_registry_home_drift_blocks_removal"
+  "4240 test_retained_direct_spawn_requires_confirmed_endpoint_quiescence"
+  "1096 test_missing_ship_worktree_retains_endpoint_and_metadata"
+  "7414 test_never_created_direct_spawn_endpoint_is_not_quiesced"
+  "10539 test_never_created_scout_without_report_cleans_bookkeeping"
+  "15833 test_squash_merged_branch_deleted_allows"
+  "18236 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head"
+  "18105 test_no_pr_recorded_discovers_merged_pr_by_branch_allows"
+  "18453 test_squash_merged_pr_allows_replayed_unpushed_patch"
+  "8101 test_merged_pr_with_later_local_commit_refuses"
+  "7003 test_pr_check_does_not_refresh_stale_pr_head"
+  "1238 test_pr_check_records_remote_head_when_local_lags"
+  "2612 test_pr_check_lookup_errors_are_loud_and_bounded"
+  "1453 test_pr_check_serializes_with_account_session_updates"
+  "1540 test_pr_check_rejects_reused_task_generation"
+  "19207 test_content_in_default_fallback_allows"
+  "20889 test_content_fallback_refreshes_stale_origin_ref"
+  "8143 test_content_fallback_uses_live_default"
+  "7155 test_content_fallback_reprobes_live_default_after_fetch"
+  "5923 test_content_fallback_honors_shared_checkout_lock"
+  "27394 test_locked_return_reuses_checkout_lock_for_landing_recheck"
+  "14212 test_treehouse_return_timeout_reaps_children_before_unlock"
+  "6168 test_dirty_worktree_refuses"
+  "12910 test_dead_task_reaper_returns_only_clean_landed_work_without_force"
+  "20967 test_dead_task_reaper_treats_stale_status_as_no_liveness_evidence"
+  "15711 test_dead_task_reaper_reconciles_an_already_returned_lease"
+  "6816 test_dead_task_reaper_retains_dirty_work_and_live_endpoints"
+  "2827 test_dead_task_reaper_requires_exact_lease_and_closed_pr"
+  "847 test_treehouse_capacity_reports_low_clean_availability"
+  "6415 test_nonignored_untracked_work_refuses_without_preservation"
+  "14403 test_already_returned_worktree_finishes_bookkeeping"
+  "3677 test_already_returned_worktree_refuses_preservation_without_mutation"
+  "17455 test_watchman_cookies_do_not_block_teardown"
+  "16959 test_ignored_worktree_content_is_summarized_without_blocking"
+  "13562 test_dead_reap_allows_generated_ignored_output_with_summary"
+  "7336 test_dead_reap_refuses_work_shaped_ignored_output"
+  "8312 test_dead_reap_refuses_ambiguous_ignored_output"
+  "9247 test_dead_reap_refuses_recent_hand_edit_shaped_output"
+  "7735 test_dead_reap_refuses_old_ambiguous_output"
+  "6309 test_dead_reap_protects_work_roots_before_dependencies"
+  "14902 test_dead_reap_allows_dependency_tree_contents"
+  "8647 test_dead_reap_rechecks_open_pr_at_locked_return"
+  "11364 test_dead_reap_rechecks_endpoint_after_local_proofs"
+  "555 test_treehouse_reaper_safe_refusals_exit_success"
+  "513 test_treehouse_reaper_operational_failure_exits_nonzero"
+  "1346 test_treehouse_reaper_translates_only_safety_status"
+  "2440 test_treehouse_reaper_executable_failures_remain_nonzero"
+  "3455 test_dead_reap_leaf_helper_failures_remain_operational"
+  "5286 test_dead_reap_authority_statuses_are_distinct"
+  "10913 test_dead_reap_lock_refusal_and_cleanup_failure_are_distinct"
+  "13401 test_dead_reap_landing_statuses_are_distinct"
+  "19918 test_preserve_scratch_captures_then_reclaims_dirty_worktree"
+  "9284 test_preserve_scratch_never_cleans_unlanded_commits"
+  "11105 test_preserve_scratch_refuses_tracked_drift_before_cleanup"
+  "8688 test_preserve_scratch_refuses_index_drift_during_tracked_verification"
+  "6177 test_gh_error_and_content_absent_refuses"
+  "27838 test_stale_index_lock_cleared_and_teardown_succeeds"
+  "19092 test_live_index_lock_is_never_removed_and_teardown_refuses"
+  "24110 test_lsof_error_never_clears_index_lock"
+  "7781 test_stale_index_lock_cleanup_rechecks_dirty_worktree"
+  "30883 test_non_linked_index_lock_path_is_checked_from_worktree"
+  "23461 test_index_lock_mtime_read_failure_refuses"
+  "17289 test_transient_index_lock_clears_after_first_attempt_and_retry_succeeds"
+  "14084 test_persistent_index_lock_exhausts_retries_and_refuses_loudly"
+  "18334 test_empty_retry_wait_uses_default_without_aborting"
+  "13185 test_fractional_legacy_retry_wait_refuses_without_arithmetic_error"
+  "1486 test_closed_pr_wakes_loudly_as_unreviewed"
+  "1284 test_pr_check_without_worktree_still_performs_lookup"
 )
 
-for teardown_test_function in "${TEARDOWN_FULL_SUITE_CASES[@]}"; do
-  run_partitioned_test "$teardown_test_function"
-done
-printf 'FM_TEARDOWN_PART_RESULT part=%s/%s cases=%s total=%s\n' \
+TEARDOWN_SORTED_CASES=$(printf '%s\n' "${TEARDOWN_FULL_SUITE_CASES[@]}" \
+  | LC_ALL=C sort -k1,1nr -k2,2)
+while IFS=' ' read -r teardown_case_weight teardown_test_function teardown_extra; do
+  case "$teardown_case_weight" in
+    '' | *[!0-9]*) fail "teardown case weight must be a positive integer" ;;
+  esac
+  [ "$teardown_case_weight" -gt 0 ] && [ -n "$teardown_test_function" ] \
+    && [ -z "$teardown_extra" ] \
+    || fail "teardown case entry is malformed"
+  declare -F "$teardown_test_function" >/dev/null \
+    || fail "teardown case function is undefined: $teardown_test_function"
+  run_partitioned_test "$teardown_case_weight" "$teardown_test_function"
+done <<EOF
+$TEARDOWN_SORTED_CASES
+EOF
+printf 'FM_TEARDOWN_PART_RESULT part=%s/%s cases=%s total=%s weight_ms=%s\n' \
   "$FM_TEST_PART_INDEX" "$FM_TEST_PART_TOTAL" "$FM_TEARDOWN_PART_CASES" \
-  "${#TEARDOWN_FULL_SUITE_CASES[@]}"
+  "${#TEARDOWN_FULL_SUITE_CASES[@]}" "$FM_TEARDOWN_PART_WEIGHT_MS"

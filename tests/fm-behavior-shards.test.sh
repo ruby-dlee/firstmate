@@ -22,8 +22,8 @@ test_checked_in_plan_is_complete_balanced_and_deterministic() {
 
   out=$("$SHARDER" --check "$SHARD_COUNT") \
     || fail "checked-in behavior shard plan failed its coverage guard"
-  assert_contains "$out" "FM_BEHAVIOR_PLAN ok tests=97 shards=8" \
-    "coverage guard did not report the complete 97-test inventory"
+  assert_contains "$out" "FM_BEHAVIOR_PLAN ok tests=103 shards=8" \
+    "coverage guard did not report the complete 103-test inventory"
   "$SHARDER" --plan "$SHARD_COUNT" > "$plan_a"
   "$SHARDER" --plan "$SHARD_COUNT" > "$plan_b"
   cmp -s "$plan_a" "$plan_b" || fail "same durations produced different shard plans"
@@ -165,7 +165,7 @@ test_post_run_guard_requires_the_exact_executed_union() {
   write_complete_manifests "$plan" "$good"
   out=$("$SHARDER" --verify "$SHARD_COUNT" "$good") \
     || fail "post-run guard rejected the exact complete manifest union"
-  assert_contains "$out" "FM_BEHAVIOR_COMPLETENESS ok tests=97 shards=8" \
+  assert_contains "$out" "FM_BEHAVIOR_COMPLETENESS ok tests=103 shards=8" \
     "post-run guard did not report complete execution"
 
   cp -R "$good" "$missing"
@@ -225,21 +225,36 @@ test_ci_wires_matrix_isolation_timeout_and_union_verification() {
 }
 
 test_teardown_partition_preserves_every_full_suite_case() {
-  local tmp definitions listed focused expected_focused wrapper_a wrapper_b
+  local tmp definitions listed focused expected_focused wrapper expected_part
+  local wrappers
   tmp=$(fm_test_tmproot fm-teardown-partition)
   definitions="$tmp/definitions.txt"
   listed="$tmp/listed.txt"
   focused="$tmp/focused.txt"
   expected_focused="$tmp/expected-focused.txt"
-  wrapper_a="$ROOT/tests/fm-teardown-a.test.sh"
-  wrapper_b="$ROOT/tests/fm-teardown-b.test.sh"
+  wrappers=(
+    "$ROOT/tests/fm-teardown-a.test.sh"
+    "$ROOT/tests/fm-teardown-b.test.sh"
+    "$ROOT/tests/fm-teardown-c.test.sh"
+    "$ROOT/tests/fm-teardown-d.test.sh"
+    "$ROOT/tests/fm-teardown-e.test.sh"
+    "$ROOT/tests/fm-teardown-f.test.sh"
+    "$ROOT/tests/fm-teardown-g.test.sh"
+    "$ROOT/tests/fm-teardown-h.test.sh"
+  )
 
   sed -n 's/^\(test_[A-Za-z0-9_]*\)() {.*/\1/p' "$TEARDOWN_SUITE" \
     | LC_ALL=C sort > "$definitions"
   awk '
     /^TEARDOWN_FULL_SUITE_CASES=\($/ { in_cases = 1; next }
     in_cases && /^\)$/ { exit }
-    in_cases && $1 ~ /^test_[A-Za-z0-9_]+$/ { print $1 }
+    in_cases {
+      weight = $1
+      name = $2
+      sub(/^"/, "", weight)
+      sub(/"$/, "", name)
+      if (weight ~ /^[1-9][0-9]*$/ && name ~ /^test_[A-Za-z0-9_]+$/) print name
+    }
   ' "$TEARDOWN_SUITE" > "$listed"
   [ "$(wc -l < "$listed" | tr -d ' ')" -eq 137 ] \
     || fail "teardown partition does not retain all 137 normal-run cases"
@@ -256,17 +271,15 @@ test_teardown_partition_preserves_every_full_suite_case() {
     | LC_ALL=C sort > "$expected_focused"
   cmp -s "$expected_focused" "$focused" \
     || fail "teardown partition dropped or absorbed a focused-only case"
-  [ "$(awk 'NR % 2 == 1 { count++ } END { print count + 0 }' "$listed")" -eq 69 ] \
-    || fail "teardown partition A does not own exactly 69 cases"
-  [ "$(awk 'NR % 2 == 0 { count++ } END { print count + 0 }' "$listed")" -eq 68 ] \
-    || fail "teardown partition B does not own exactly 68 cases"
-  assert_grep 'FM_TEST_PART_INDEX=1 FM_TEST_PART_TOTAL=2' "$wrapper_a" \
-    "teardown wrapper A does not select partition 1/2"
-  assert_grep 'FM_TEST_PART_INDEX=2 FM_TEST_PART_TOTAL=2' "$wrapper_b" \
-    "teardown wrapper B does not select partition 2/2"
+  expected_part=1
+  for wrapper in "${wrappers[@]}"; do
+    assert_grep "FM_TEST_PART_INDEX=$expected_part FM_TEST_PART_TOTAL=8" "$wrapper" \
+      "teardown wrapper $wrapper does not select partition $expected_part/8"
+    expected_part=$((expected_part + 1))
+  done
   [ ! -e "$ROOT/tests/fm-teardown.test.sh" ] \
     || fail "the unsplit teardown test remains in the behavior inventory"
-  pass "teardown wrappers preserve all 137 normal cases and three focused-only cases"
+  pass "eight weighted teardown wrappers preserve all 137 normal cases and three focused-only cases"
 }
 
 test_checked_in_plan_is_complete_balanced_and_deterministic

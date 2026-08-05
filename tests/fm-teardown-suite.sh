@@ -1130,7 +1130,7 @@ test_squash_merged_pr_allows_replayed_unpushed_patch() {
 }
 
 test_rebased_merge_queue_head_landed_on_default_allows() {
-  local case_dir rc local_first local_head rewritten_first pr_head merge_commit
+  local case_dir rc local_first local_head rewritten_first pr_head altered_first altered_head merge_commit
   local local_patch rewritten_patch queue
   case_dir=$(make_case rebased-merge-queue)
   write_meta "$case_dir" no-mistakes ship
@@ -1188,13 +1188,32 @@ test_rebased_merge_queue_head_landed_on_default_allows() {
       commit -q -m "apply CI fix"
   pr_head=$(git -C "$queue" rev-parse HEAD)
   git -C "$queue" push -q origin pr-head
+  git -C "$queue" checkout -q -b altered-head main
+  printf '%s\n' 'rows[3]{name}:' '  baseline' '  upstream' '  substituted' \
+    > "$queue/inventory.toon"
+  printf '%s\n' 'task-code-1' 'task-code-2' 'task-code-3' 'task-code-4' \
+    > "$queue/task-code.txt"
+  git -C "$queue" add inventory.toon task-code.txt
+  GIT_AUTHOR_DATE='2026-08-05T00:00:00+0000' \
+  GIT_COMMITTER_DATE='2026-08-05T00:02:00+0000' \
+    git -C "$queue" -c user.email=t@t -c user.name=t \
+      commit -q -m "add task inventory row"
+  altered_first=$(git -C "$queue" rev-parse HEAD)
+  printf '%s\n' 'validated' > "$queue/ci-fix.txt"
+  git -C "$queue" add ci-fix.txt
+  GIT_AUTHOR_DATE='2026-08-05T00:01:00+0000' \
+  GIT_COMMITTER_DATE='2026-08-05T00:03:00+0000' \
+    git -C "$queue" -c user.email=t@t -c user.name=t \
+      commit -q -m "apply CI fix"
+  altered_head=$(git -C "$queue" rev-parse HEAD)
+  git -C "$queue" push -q origin altered-head
   git -C "$queue" checkout -q main
   git -C "$queue" merge -q --squash pr-head
   git -C "$queue" -c user.email=t@t -c user.name=t \
     commit -q -m "land rebased task (#7)"
   merge_commit=$(git -C "$queue" rev-parse HEAD)
   git -C "$queue" push -q origin main
-  git -C "$case_dir/project" fetch -q origin main pr-head
+  git -C "$case_dir/project" fetch -q origin main pr-head altered-head
   rm -rf "$queue"
 
   local_patch=$(git -C "$case_dir/wt" show --pretty=medium --no-ext-diff \
@@ -1205,6 +1224,25 @@ test_rebased_merge_queue_head_landed_on_default_allows() {
     || fail "rebased-merge-queue: setup did not change the conflict-adjusted patch id"
   ! git -C "$case_dir/wt" merge-base --is-ancestor "$local_head" "$pr_head" \
     || fail "rebased-merge-queue: setup left local HEAD ancestral to rewritten PR head"
+  add_gh_pr_merged_for_head "$case_dir" "$altered_head" "$merge_commit"
+
+  set +e
+  FM_TEST_PR_REWRITE_FROM="$local_head" \
+    run_teardown "$case_dir" > "$case_dir/altered-stdout" 2> "$case_dir/altered-stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" \
+    "rebased-merge-queue: altered conflict resolution must refuse teardown"
+  assert_grep "rewrite difference between $local_first" "$case_dir/altered-stderr" \
+    "rebased-merge-queue: refusal did not identify the original commit"
+  assert_grep "$altered_first" "$case_dir/altered-stderr" \
+    "rebased-merge-queue: refusal did not identify the rewritten commit"
+  assert_grep 'inventory.toon could not be attributed' "$case_dir/altered-stderr" \
+    "rebased-merge-queue: refusal did not identify the unattributed path"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "rebased-merge-queue: ambiguous rewrite removed task bookkeeping"
+
   add_gh_pr_merged_for_head "$case_dir" "$pr_head" "$merge_commit"
 
   set +e

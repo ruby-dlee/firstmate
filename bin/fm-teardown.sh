@@ -1045,6 +1045,128 @@ commit_patch_has_upstream_overlap() {
   [ -n "$overlap" ] || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
 }
 
+commit_path_entry() {
+  local commit=$1 path=$2 entry
+  entry=$(git -C "$WT" ls-tree "$commit" -- "$path" 2>/dev/null) || return 1
+  if [ -z "$entry" ]; then
+    printf '%s\n' -
+    return 0
+  fi
+  printf '%s\n' "$entry" | awk 'NR == 1 { print $1 ":" $3 }'
+}
+
+rewrite_difference_refusal() {
+  local original=$1 rewritten=$2 path=$3 reason=$4
+  echo "teardown: rewrite difference between $original and $rewritten at $path could not be attributed: $reason" >&2
+  return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+}
+
+union_blob_hash() {
+  local ours=$1 base=$2 theirs=$3 status
+  set -o pipefail
+  {
+    git merge-file --union -p \
+      <(git -C "$WT" cat-file blob "$ours") \
+      <(git -C "$WT" cat-file blob "$base") \
+      <(git -C "$WT" cat-file blob "$theirs") 2>/dev/null
+    status=$?
+    [ "$status" -le 1 ]
+  } | git -C "$WT" hash-object --stdin 2>/dev/null
+}
+
+union_resolution_is_attributable() {
+  local ours=$1 base=$2 theirs=$3 rewritten=$4
+  python3 - \
+    <(git -C "$WT" cat-file blob "$base") \
+    <(git -C "$WT" cat-file blob "$ours") \
+    <(git -C "$WT" cat-file blob "$theirs") \
+    <(git merge-file --union -p \
+      <(git -C "$WT" cat-file blob "$ours") \
+      <(git -C "$WT" cat-file blob "$base") \
+      <(git -C "$WT" cat-file blob "$theirs") 2>/dev/null) \
+    <(git -C "$WT" cat-file blob "$rewritten") <<'PY'
+from collections import Counter
+from pathlib import Path
+import sys
+
+base, ours, theirs, union, rewritten = (
+    Path(path).read_bytes().splitlines(keepends=True) for path in sys.argv[1:]
+)
+base_lines = Counter(base)
+shared_side_lines = Counter(ours) & Counter(theirs)
+replaceable = shared_side_lines - base_lines
+union_lines = Counter(union)
+rewritten_lines = Counter(rewritten)
+removed = union_lines - rewritten_lines
+added = rewritten_lines - union_lines
+if not removed or removed - replaceable or sum(added.values()) > sum(removed.values()):
+    raise SystemExit(1)
+PY
+}
+
+commit_rewrite_differences_are_attributable() {
+  local original=$1 rewritten=$2 original_parent=$3 rewritten_parent=$4
+  local path old_entry original_entry new_entry rewritten_entry
+  local old_oid original_oid new_oid rewritten_oid union_hash reverse_union_hash
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    old_entry=$(commit_path_entry "$original_parent" "$path") || return 1
+    original_entry=$(commit_path_entry "$original" "$path") || return 1
+    new_entry=$(commit_path_entry "$rewritten_parent" "$path") || return 1
+    rewritten_entry=$(commit_path_entry "$rewritten" "$path") || return 1
+    if [ "$old_entry" = "$new_entry" ]; then
+      if [ "$original_entry" != "$rewritten_entry" ]; then
+        rewrite_difference_refusal "$original" "$rewritten" "$path" \
+          "the upstream version did not change"
+        return $?
+      fi
+      continue
+    fi
+    if [ "$old_entry" = "$original_entry" ]; then
+      if [ "$new_entry" != "$rewritten_entry" ]; then
+        rewrite_difference_refusal "$original" "$rewritten" "$path" \
+          "the local commit did not change this path"
+        return $?
+      fi
+      continue
+    fi
+    case "$old_entry:$original_entry:$new_entry:$rewritten_entry" in
+      *:-*|*-:*)
+        rewrite_difference_refusal "$original" "$rewritten" "$path" \
+          "a concurrent add or delete has no deterministic union proof"
+        return $?
+        ;;
+    esac
+    old_oid=${old_entry#*:}
+    original_oid=${original_entry#*:}
+    new_oid=${new_entry#*:}
+    rewritten_oid=${rewritten_entry#*:}
+    union_hash=$(union_blob_hash "$original_oid" "$old_oid" "$new_oid") \
+      || return 1
+    reverse_union_hash=$(union_blob_hash "$new_oid" "$old_oid" "$original_oid") \
+      || return 1
+    if [ "$rewritten_oid" != "$union_hash" ] \
+        && [ "$rewritten_oid" != "$reverse_union_hash" ] \
+        && ! union_resolution_is_attributable \
+          "$original_oid" "$old_oid" "$new_oid" "$rewritten_oid" \
+        && ! union_resolution_is_attributable \
+          "$new_oid" "$old_oid" "$original_oid" "$rewritten_oid"; then
+      rewrite_difference_refusal "$original" "$rewritten" "$path" \
+        "the rewritten blob is not either deterministic union of local and upstream content"
+      return $?
+    fi
+    case "${rewritten_entry%%:*}" in
+      "${original_entry%%:*}"|"${new_entry%%:*}") ;;
+      *)
+        rewrite_difference_refusal "$original" "$rewritten" "$path" \
+          "the rewritten file mode is neither the local nor upstream mode"
+        return $?
+        ;;
+    esac
+  done < <(git -C "$WT" diff-tree --no-commit-id --name-only -r \
+    "$original_parent" "$original" 2>/dev/null)
+}
+
 commit_is_rebased_counterpart() {
   local original=$1 rewritten=$2 old_base=$3 new_base=$4
   local original_identity rewritten_identity original_paths rewritten_paths
@@ -1073,6 +1195,8 @@ commit_is_rebased_counterpart() {
   printf '%s\n' "$comparison" \
     | grep -Eq '^[[:space:]]*1:[[:space:]]+[0-9a-f]{40}[[:space:]]+![[:space:]]+1:[[:space:]]+[0-9a-f]{40}[[:space:]]' \
     || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  commit_rewrite_differences_are_attributable \
+    "$original" "$rewritten" "$original^" "$rewritten^"
 }
 
 rebased_pr_head_contains_unpushed() {

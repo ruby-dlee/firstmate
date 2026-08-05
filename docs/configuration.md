@@ -308,6 +308,41 @@ If no dispatch rule fits, firstmate uses the dispatch profile `default` when pre
 Because the spawn backstop is gated by file presence, any fallback path after a missing match, validation error, or missing `jq` still passes a resolved harness explicitly until the file is fixed or removed.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 
+## Worktree provisioning (config/worktree-provision)
+
+A git worktree carries only tracked files, and Treehouse v2.0.0 exposes no setup hook, so a freshly leased task worktree arrives with the project's source and none of the gitignored machinery that runs it - no virtual environment, no installed packages.
+A lane launched into that state cannot run the project's own tests, formatters, or browser checks, so it validates on another agent's evidence or on none.
+`bin/fm-spawn.sh` therefore provisions each acquired ship/scout worktree after its identity, cleanliness, and freshness proof and before any endpoint exists.
+`bin/fm-provision-lib.sh`'s header owns the full contract: detection, install commands, fingerprint, readiness probes, bounds, and tunables.
+This section records the operator-facing behavior only.
+
+Detection is driven by what the worktree declares, never by a project name.
+A directory holding `uv.lock` provisions with `uv sync --frozen`; one holding `requirements.txt` gets a `uv venv` virtual environment plus its `requirements.txt` and any conventional `requirements-dev.txt` / `requirements-test.txt` companions; `package-lock.json` runs `npm ci`; `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile`.
+Python always goes through uv, never pip or venv directly.
+A uv workspace has exactly one `uv.lock` and one `.venv` at its root, so it is detected once at that root and synced with `--all-packages`; a plain sync there would install only the root package and leave a member's checks unrunnable.
+An ambient `UV_PROJECT_ENVIRONMENT` pointing anywhere but `.venv` refuses the spawn, because the readiness probe could not then prove the environment it just installed.
+A worktree declaring nothing recognized provisions nothing and spawns exactly as before.
+No interpreter or runtime version is hardcoded: uv resolves the interpreter from the project's own `.python-version` or `requires-python`, and a Node runtime is pinned only when the project declares one unambiguously through `.nvmrc` or a single-major `engines.node`.
+When a Node pin is declared, the highest matching runtime under `$NVM_DIR`, `$FNM_DIR`, `$VOLTA_HOME`, or `~/.asdf` is used for the install and prepended to the crewmate's `PATH`, so the lane validates on the same runtime its native modules were built against.
+
+Provisioning is cached per worktree, per component, in the home's `state/provision-cache/`, never inside the worktree.
+A cache hit requires both a fingerprint match over that component's manifests, installer version, and runtime identity, and a live readiness probe of the installed environment.
+Directory existence alone is never accepted: a pool slot keeps its ignored directories across leases, but a previous agent may have deleted or broken them.
+A spawn into an already-provisioned, unchanged worktree therefore pays probe cost only, not install cost.
+The provisioned directories are added to the repository's git exclude file when the project does not already ignore them, so provisioning cannot dirty a checkout that the freshness proof and teardown both require to be clean.
+
+The failure contract is one mode: provisioning either succeeds or the spawn is refused.
+There is no launched-but-degraded state, because a lane that cannot validate its own work is the defect this exists to remove.
+A missing installer, a failing install, an install that exceeds its bound, a declared runtime that cannot be found, a recognized-but-unsupported package manager (`yarn`, `bun`), or more components than `FM_PROVISION_MAX_COMPONENTS` all refuse the spawn, name the cause, and print the opt-out.
+Installer output lands in `state/<id>.provision.log`, and the outcome is recorded as `provision=` in `state/<id>.meta`.
+Every install and probe is wall-clock bounded; a host with no `timeout`, `gtimeout`, or `perl` refuses rather than risking an unbounded install wedging a spawn.
+
+The local, gitignored `config/worktree-provision` file is the home-level switch: absent or `on` provisions, `off` disables it.
+Any other content refuses the spawn rather than silently disabling the gate.
+`--no-provision` is the per-spawn opt-out.
+Provisioning currently covers genuinely new ship and scout spawns - the point at which a worktree is acquired.
+Secondmate homes, Orca's legacy recovery path, and the account recovery paths reuse an existing worktree and are not provisioned; a recovery into a worktree whose environment was destroyed still needs manual repair.
+
 ## Checkout refresh
 
 `bin/fm-checkout-refresh.sh` keeps worktree seed checkouts current independently of Firstmate's own PR lifecycle.
@@ -551,6 +586,10 @@ FM_ACCOUNT_CONTINUATION_FINGERPRINT_BYTES=268435456  # maximum repository conten
 FM_ACCOUNT_CONTINUATION_ENUMERATION_BYTES=33554432  # maximum bytes used to enumerate repository identity inputs
 FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS=30  # seconds allowed to verify the continuation repository identity
 FM_DISPATCH_AGENT_FLEET_TIMEOUT=120  # optional positive seconds per live-proof pool summary; unset uses FM_ACCOUNT_SELECTION_TIMEOUT, an explicit legacy FM_ACCOUNT_CONTROL_TIMEOUT, then 120
+FM_PROVISION_SCAN_DEPTH=4        # worktree provisioning: manifest search depth below the worktree root
+FM_PROVISION_MAX_COMPONENTS=8    # worktree provisioning: refuse a spawn above this many detected components
+FM_PROVISION_INSTALL_TIMEOUT=600 # worktree provisioning: seconds allowed per component install
+FM_PROVISION_PROBE_TIMEOUT=60    # worktree provisioning: seconds allowed per readiness probe
 FM_REPORT_STACK_ROOT=  # machine-global completion-report store override; unset uses $XDG_DATA_HOME/firstmate/report-stack or ~/.local/share/firstmate/report-stack
 FM_REPORT_RETENTION_INTERVAL=  # optional shared cadence: owner/policy default 300s, opportunistic watcher default 86400s; constrained by docs/report-stack.md
 FM_REPORT_RETENTION_OWNER_FRESH_SECS=660  # fresh successful-owner heartbeat window before watchers use their opportunistic fallback

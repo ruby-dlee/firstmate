@@ -3260,7 +3260,7 @@ exclude_path() {
 PROVISION_SUMMARY=
 PROVISION_PATH_PREFIX=
 spawn_provision_worktree() {
-  local mode line
+  local mode line rc=0
   if [ "$NO_PROVISION" = 1 ]; then
     PROVISION_SUMMARY=off
     return 0
@@ -3273,9 +3273,7 @@ spawn_provision_worktree() {
     PROVISION_SUMMARY=off
     return 0
   fi
-  fm_provision_worktree "$WT" "$STATE/provision-cache" "$STATE/$ID.provision.log" || return 1
-  PROVISION_SUMMARY=$FM_PROVISION_SUMMARY
-  PROVISION_PATH_PREFIX=$FM_PROVISION_PATH_PREFIX
+  fm_provision_worktree "$WT" "$STATE/provision-cache" "$STATE/$ID.provision.log" || rc=$?
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     # Only exclude what git would otherwise report; a project that already
@@ -3287,6 +3285,9 @@ spawn_provision_worktree() {
   done <<EOF
 $FM_PROVISION_EXCLUDES
 EOF
+  [ "$rc" -eq 0 ] || return "$rc"
+  PROVISION_SUMMARY=$FM_PROVISION_SUMMARY
+  PROVISION_PATH_PREFIX=$FM_PROVISION_PATH_PREFIX
   return 0
 }
 

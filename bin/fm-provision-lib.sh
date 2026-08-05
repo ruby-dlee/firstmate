@@ -67,7 +67,7 @@ FM_PROVISION_PROBE_TIMEOUT=${FM_PROVISION_PROBE_TIMEOUT:-60}
 
 # Bumped whenever a recorded field's meaning changes; a record from another
 # schema is treated as a miss rather than misread.
-FM_PROVISION_CACHE_SCHEMA=2
+FM_PROVISION_CACHE_SCHEMA=3
 
 # Outputs of fm_provision_worktree, read by the sourcing caller (fm-spawn.sh),
 # so shellcheck cannot see their consumers from this file alone.
@@ -216,7 +216,7 @@ fm_provision_detect() {  # <worktree>
 # The files whose content defines a component's fingerprint. Only files that
 # exist are listed, so an added or removed optional manifest is itself a change.
 fm_provision_manifests() {  # <worktree> <ecosystem> <relative-dir>
-  local wt=$1 eco=$2 rel=$3 dir name
+  local wt=$1 eco=$2 rel=$3 dir name member_manifests
   dir=$wt/$rel
   [ "$rel" != . ] || dir=$wt
   local -a names=()
@@ -235,6 +235,128 @@ fm_provision_manifests() {  # <worktree> <ecosystem> <relative-dir>
     [ -f "$dir/$name" ] || continue
     printf '%s\n' "$name"
   done
+  if [ "$eco" = uv ] && [ -f "$dir/pyproject.toml" ]; then
+    member_manifests=$(fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
+      python3 - "$dir" <<'PY'
+import ast
+import os
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+lines = (root / "pyproject.toml").read_text(encoding="utf-8").splitlines()
+start = next((index for index, line in enumerate(lines) if re.fullmatch(r"\s*\[tool\.uv\.workspace\]\s*(?:#.*)?", line)), None)
+if start is None:
+    raise SystemExit(0)
+
+def without_comment(line):
+    quote = None
+    escaped = False
+    out = []
+    for char in line:
+        if escaped:
+            out.append(char)
+            escaped = False
+            continue
+        if quote == '"' and char == "\\":
+            out.append(char)
+            escaped = True
+            continue
+        if char in ("'", '"'):
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+            out.append(char)
+            continue
+        if char == "#" and quote is None:
+            break
+        out.append(char)
+    return "".join(out)
+
+def bracket_depth(value):
+    quote = None
+    escaped = False
+    depth = 0
+    for char in value:
+        if escaped:
+            escaped = False
+            continue
+        if quote == '"' and char == "\\":
+            escaped = True
+            continue
+        if char in ("'", '"'):
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+            continue
+        if quote is None:
+            depth += (char == "[") - (char == "]")
+    return depth
+
+values = {}
+index = start + 1
+while index < len(lines):
+    line = without_comment(lines[index]).strip()
+    if line.startswith("["):
+        break
+    match = re.match(r"^(members|exclude)\s*=\s*(.*)$", line)
+    if not match:
+        index += 1
+        continue
+    key, value = match.groups()
+    if key in values:
+        raise SystemExit(1)
+    while bracket_depth(value) > 0:
+        index += 1
+        if index >= len(lines):
+            raise SystemExit(1)
+        value += "\n" + without_comment(lines[index])
+    try:
+        parsed = ast.literal_eval(value)
+    except (SyntaxError, ValueError):
+        raise SystemExit(1)
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        raise SystemExit(1)
+    values[key] = parsed
+    index += 1
+
+members = values.get("members", [])
+excludes = values.get("exclude", [])
+
+def matches(patterns):
+    found = set()
+    for pattern in patterns:
+        if os.path.isabs(pattern):
+            raise SystemExit(1)
+        for candidate in root.glob(pattern):
+            resolved = candidate.resolve()
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                raise SystemExit(1)
+            if resolved.is_dir():
+                found.add(resolved)
+    return found
+
+member_dirs = matches(members) - matches(excludes)
+paths = []
+for member in member_dirs:
+    manifest = member / "pyproject.toml"
+    if not manifest.is_file():
+        continue
+    paths.append(manifest.relative_to(root).as_posix())
+    python_version = member / ".python-version"
+    if python_version.is_file():
+        paths.append(python_version.relative_to(root).as_posix())
+for path in sorted(paths):
+    print(path)
+PY
+    ) || return 1
+    [ -z "$member_manifests" ] || printf '%s\n' "$member_manifests"
+  fi
 }
 
 # The requirements files a pip component installs: requirements.txt plus the
@@ -328,9 +450,10 @@ fm_provision_find_node_bin() {  # <major>
 # --- fingerprint and cache --------------------------------------------------
 
 fm_provision_fingerprint() {  # <worktree> <eco> <rel> <installer-id> <runtime-id>
-  local wt=$1 eco=$2 rel=$3 installer=$4 runtime=$5 dir name
+  local wt=$1 eco=$2 rel=$3 installer=$4 runtime=$5 dir name manifests
   dir=$wt/$rel
   [ "$rel" != . ] || dir=$wt
+  manifests=$(fm_provision_manifests "$wt" "$eco" "$rel") || return 1
   {
     printf 'schema=%s\n' "$FM_PROVISION_CACHE_SCHEMA"
     printf 'ecosystem=%s\n' "$eco"
@@ -340,7 +463,7 @@ fm_provision_fingerprint() {  # <worktree> <eco> <rel> <installer-id> <runtime-i
     while IFS= read -r name; do
       [ -n "$name" ] || continue
       printf 'manifest=%s:%s\n' "$name" "$(fm_provision_sha256 < "$dir/$name")"
-    done < <(fm_provision_manifests "$wt" "$eco" "$rel")
+    done <<< "$manifests"
   } | fm_provision_sha256
 }
 
@@ -356,8 +479,8 @@ fm_provision_record_get() {  # <record> <key>
   LC_ALL=C sed -n "s/^$key=//p" "$record" | head -1
 }
 
-fm_provision_record_write() {  # <record> <eco> <rel> <fingerprint> <runtime> <installer>
-  local record=$1 eco=$2 rel=$3 fingerprint=$4 runtime=$5 installer=$6 tmp
+fm_provision_record_write() {  # <record> <eco> <rel> <fingerprint> <runtime> <installer> <environment>
+  local record=$1 eco=$2 rel=$3 fingerprint=$4 runtime=$5 installer=$6 environment=$7 tmp
   tmp=$(mktemp "$record.XXXXXX") || return 1
   {
     printf 'schema=%s\n' "$FM_PROVISION_CACHE_SCHEMA"
@@ -366,17 +489,153 @@ fm_provision_record_write() {  # <record> <eco> <rel> <fingerprint> <runtime> <i
     printf 'fingerprint=%s\n' "$fingerprint"
     printf 'runtime=%s\n' "$runtime"
     printf 'installer=%s\n' "$installer"
+    printf 'environment=%s\n' "$environment"
   } > "$tmp" || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$record"
 }
 
 # --- readiness probes -------------------------------------------------------
 
+fm_provision_environment_signature() {  # <worktree> <eco> <rel>
+  local wt=$1 eco=$2 rel=$3 dir python inventory
+  dir=$wt/$rel
+  [ "$rel" != . ] || dir=$wt
+  case "$eco" in
+    uv|pip)
+      python="$dir/.venv/bin/python"
+      [ -x "$python" ] || return 1
+      inventory=$(fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
+        "$python" -c '
+import hashlib
+import pathlib
+import sys
+
+venv = pathlib.Path(sys.argv[1])
+site_dirs = sorted(path for path in venv.glob("lib*/python*/site-packages") if path.is_dir())
+if not site_dirs:
+    raise SystemExit(1)
+rows = []
+for site_dir in site_dirs:
+    for entry in sorted(site_dir.iterdir(), key=lambda item: item.name):
+        if entry.name == "__pycache__":
+            continue
+        kind = "link" if entry.is_symlink() else "dir" if entry.is_dir() else "file"
+        material = entry / "__init__.py" if entry.is_dir() else entry
+        digest = ""
+        if material.is_file():
+            digest = hashlib.sha256(material.read_bytes()).hexdigest()
+        rows.append(f"{site_dir.relative_to(venv).as_posix()}/{entry.name}\t{kind}\t{entry.exists()}\t{digest}")
+print("\n".join(rows))
+' "$dir/.venv" 2>/dev/null) || return 1
+      ;;
+    npm|pnpm)
+      inventory=$(fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
+        python3 -c '
+import hashlib
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+rows = []
+for entry in sorted(root.iterdir(), key=lambda item: item.name):
+    entries = sorted(entry.iterdir(), key=lambda item: item.name) if (entry.name.startswith("@") or entry.name == ".bin") and entry.is_dir() else [entry]
+    for package in entries:
+        rel = package.relative_to(root).as_posix()
+        kind = "link" if package.is_symlink() else "dir" if package.is_dir() else "file"
+        manifest = package / "package.json" if package.is_dir() else package
+        digest = ""
+        if manifest.is_file():
+            digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        rows.append(f"{rel}\t{kind}\t{package.exists()}\t{digest}")
+print("\n".join(rows))
+' "$dir/node_modules" 2>/dev/null) || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$inventory" | fm_provision_sha256
+}
+
+fm_provision_declared_packages_ready() {  # <worktree> <eco> <rel>
+  local wt=$1 eco=$2 rel=$3 dir python
+  dir=$wt/$rel
+  [ "$rel" != . ] || dir=$wt
+  case "$eco" in
+    uv) return 0 ;;
+    pip)
+      python="$dir/.venv/bin/python"
+      local -a requirements=()
+      while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        requirements+=("$dir/$name")
+      done < <(fm_provision_pip_requirements "$dir")
+      fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
+        "$python" -c '
+import email.parser
+import pathlib
+import re
+import sys
+
+venv = pathlib.Path(sys.argv[1])
+site_dirs = [path for path in venv.glob("lib*/python*/site-packages") if path.is_dir()]
+installed = set()
+for site_dir in site_dirs:
+    for metadata in site_dir.glob("*.dist-info/METADATA"):
+        message = email.parser.Parser().parsestr(metadata.read_text(errors="replace"), headersonly=True)
+        name = message.get("Name")
+        if name:
+            installed.add(re.sub(r"[-_.]+", "-", name).lower())
+pattern = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^]]+\])?(?:\s*@\s*\S+|\s*(?:===|==|~=|!=|<=|>=|<|>).*)?$")
+for requirement_file in sys.argv[2:]:
+    pending = ""
+    for raw in pathlib.Path(requirement_file).read_text(errors="strict").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.endswith("\\") or pending:
+            raise SystemExit(1)
+        line = line.split(" ;", 1)[0].strip()
+        match = pattern.fullmatch(line)
+        if not match:
+            raise SystemExit(1)
+        if re.sub(r"[-_.]+", "-", match.group(1)).lower() not in installed:
+            raise SystemExit(1)
+' "$dir/.venv" "${requirements[@]}" >/dev/null 2>&1
+      ;;
+    npm|pnpm)
+      fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
+        python3 -c '
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+with (root / "package.json").open("rb") as fh:
+    package = json.load(fh)
+if not isinstance(package, dict):
+    raise SystemExit(1)
+declared = set()
+for field in ("dependencies", "devDependencies"):
+    values = package.get(field, {})
+    if not isinstance(values, dict):
+        raise SystemExit(1)
+    declared.update(values)
+for name in declared:
+    if not isinstance(name, str) or name in ("", ".", "..") or name.startswith("/"):
+        raise SystemExit(1)
+    path = root / "node_modules" / name
+    if not path.exists() or not (path / "package.json").is_file():
+        raise SystemExit(1)
+' "$dir" >/dev/null 2>&1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 # The installed environment must actually work, not merely exist. A pool slot
 # keeps ignored directories across leases, and a previous agent may have removed
 # or broken them; a fingerprint alone would then report a false cache hit.
-fm_provision_probe() {  # <worktree> <eco> <rel> <record> <log> <runtime>
-  local wt=$1 eco=$2 rel=$3 record=$4 log=$5 runtime=$6 dir python actual
+fm_provision_probe() {  # <worktree> <eco> <rel> <log> <runtime> <environment> <phase>
+  local wt=$1 eco=$2 rel=$3 log=$4 runtime=$5 environment=$6 phase=$7 dir python actual current
   dir=$wt/$rel
   [ "$rel" != . ] || dir=$wt
   case "$eco" in
@@ -401,6 +660,13 @@ fm_provision_probe() {  # <worktree> <eco> <rel> <record> <log> <runtime>
       ;;
     *) return 1 ;;
   esac
+  if [ "$phase" = cache ]; then
+    current=$(fm_provision_environment_signature "$wt" "$eco" "$rel") || return 1
+    [ -n "$environment" ] && [ "$current" = "$environment" ] || return 1
+    fm_provision_declared_packages_ready "$wt" "$eco" "$rel" || return 1
+  else
+    [ -n "$environment" ] || return 1
+  fi
   return 0
 }
 
@@ -482,7 +748,7 @@ fm_provision_fail() {  # <message>
 # Returns 0 on success or a clean no-op, non-zero when the spawn must refuse.
 fm_provision_worktree() {  # <worktree> <cache-dir> <log>
   local wt=$1 cache=$2 log=$3
-  local eco rel dir line record fingerprint recorded runtime installer
+  local eco rel dir line record fingerprint recorded runtime installer environment
   local declared_major pinned_major='' pinned_bin='' rc=0 state
   local -a components=() results=()
 
@@ -608,19 +874,24 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log>
     esac
 
     record=$(fm_provision_record_path "$cache" "$wt" "$eco" "$rel")
-    fingerprint=$(fm_provision_fingerprint "$wt" "$eco" "$rel" "$installer" "$runtime")
+    fingerprint=$(fm_provision_fingerprint "$wt" "$eco" "$rel" "$installer" "$runtime") || {
+      fm_provision_fail "cannot resolve the declared manifests for the $eco component in $rel"
+      return 1
+    }
     recorded=$(fm_provision_record_get "$record" fingerprint 2>/dev/null || true)
     state=installed
     if [ -n "$recorded" ] && [ "$recorded" = "$fingerprint" ] \
       && [ "$(fm_provision_record_get "$record" schema 2>/dev/null || true)" = "$FM_PROVISION_CACHE_SCHEMA" ]; then
       local probe_runtime
       probe_runtime=$(fm_provision_record_get "$record" runtime 2>/dev/null || true)
-      if fm_provision_probe "$wt" "$eco" "$rel" "$record" "$log" "$probe_runtime"; then
+      environment=$(fm_provision_record_get "$record" environment 2>/dev/null || true)
+      if fm_provision_probe "$wt" "$eco" "$rel" "$log" "$probe_runtime" "$environment" cache; then
         state=cached
       fi
     fi
 
     if [ "$state" = installed ]; then
+      FM_PROVISION_EXCLUDES="${FM_PROVISION_EXCLUDES}$(fm_provision_artifact_path "$eco" "$rel")"$'\n'
       echo "fm-spawn: provisioning $eco dependencies in $rel" >&2
       rc=0
       fm_provision_install "$wt" "$eco" "$rel" "$log" || rc=$?
@@ -642,16 +913,18 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log>
           fi
           ;;
       esac
-      if ! fm_provision_probe "$wt" "$eco" "$rel" "$record" "$log" "$runtime"; then
+      environment=$(fm_provision_environment_signature "$wt" "$eco" "$rel") || environment=
+      if ! fm_provision_probe "$wt" "$eco" "$rel" "$log" "$runtime" "$environment" installed; then
         fm_provision_fail "the $eco environment in $rel is not usable after installing; see $log"
         return 1
       fi
-      fm_provision_record_write "$record" "$eco" "$rel" "$fingerprint" "$runtime" "$installer" \
+      fm_provision_record_write "$record" "$eco" "$rel" "$fingerprint" "$runtime" "$installer" "$environment" \
         || { fm_provision_fail "cannot record the provisioning fingerprint at $record"; return 1; }
+    else
+      FM_PROVISION_EXCLUDES="${FM_PROVISION_EXCLUDES}$(fm_provision_artifact_path "$eco" "$rel")"$'\n'
     fi
 
     results+=("$eco:$rel=$state")
-    FM_PROVISION_EXCLUDES="${FM_PROVISION_EXCLUDES}$(fm_provision_artifact_path "$eco" "$rel")"$'\n'
   done
 
   FM_PROVISION_SUMMARY=$(IFS=,; printf '%s' "${results[*]}")

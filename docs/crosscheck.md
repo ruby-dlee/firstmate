@@ -130,13 +130,6 @@ Crosscheck therefore redirects `CLAUDE_CONFIG_DIR` to a per-run home seeded insi
 Account separation survives that redirect because `CLAUDE_SECURESTORAGE_CONFIG_DIR` still pins the credential store at the selected reviewer account; the seeded home copies configuration, creates runtime directories empty, and reads credentials through a symlink rather than duplicating a secret into the checkout.
 The reviewer binary is resolved from the account's recorded provider binary before `PATH`, because a launcher earlier on `PATH` may unset `CLAUDE_CONFIG_DIR` to pin its own account and would silently discard both the redirect and the separation.
 
-## Executed-review self-test
-
-Every reviewer must prove it executed at least one command in addition to supplying the verdict-level receipt bound to the exact base, exact head, execution `HOME`, and executing account.
-Crosscheck writes an attestation script into `.crosscheck/` and hands the harness a secret through its environment only; recording that secret's digest therefore requires actually running a command, which reading or writing files cannot fake.
-A reviewer whose command-execution tool is broken can still return a confident, well-formed verdict built from static reading alone, but that verdict can never reach this gate's executed-evidence standard.
-A missing or mismatched attestation is recorded as `unreviewed` and exits nonzero rather than degrading quietly to static-only analysis.
-The Claude attestation additionally records the harness config directory it actually ran under, so a discarded redirect fails loudly instead of costing the gate its account separation in silence.
 An unavailable reviewer binary, sandbox, author-identity proof, executing-account binding, verdict-level execution proof, or exact remote PR head records a `tool-failure` attempt when the live head is already known, and otherwise emits the same tool-failure class without fabricating a ledger run.
 A nonzero reviewer exit, timeout, missing artifact, empty artifact, malformed artifact, or wrong-head artifact records an `unreviewed` attempt and exits nonzero.
 An unresolved suspicion comes from a completed reviewer and records a `blocking` attempt instead of being conflated with an invalid review artifact.
@@ -151,6 +144,14 @@ Structured verdict artifacts are stable regular files bounded by the ordinary 20
 The durable ledger is bounded separately and fails closed when absent, symlinked, malformed, non-finite, or oversized.
 The platform-specific containment limits and empirical mutation evidence are recorded in [crosscheck-bounded-io.md](crosscheck-bounded-io.md).
 Reviewer result arrays are capped at 32 entries, at most 32 evidence executions are accepted, and all reproduction and mutation work shares a 900-second aggregate deadline by default.
+
+## Executed-review self-test
+
+Every reviewer must prove it executed at least one command in addition to supplying the verdict-level receipt bound to the exact base, exact head, execution `HOME`, and executing account.
+Crosscheck writes an attestation script into `.crosscheck/` and hands the harness a secret through its environment only; recording that secret's digest therefore requires actually running a command, which reading or writing files cannot fake.
+A reviewer whose command-execution tool is broken can still return a confident, well-formed verdict built from static reading alone, but that verdict can never reach this gate's executed-evidence standard.
+A missing or mismatched attestation is recorded as `unreviewed` and exits nonzero rather than degrading quietly to static-only analysis.
+The Claude attestation additionally records the harness config directory it actually ran under, so a discarded redirect fails loudly instead of costing the gate its account separation in silence.
 
 ## Installed external contracts
 

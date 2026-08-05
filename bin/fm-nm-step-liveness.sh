@@ -442,33 +442,43 @@ fi
 
 # --- short membership sample ------------------------------------------------
 # A one-second CPU rate is not meaningful, but process membership change is.
-# Compare two process sets inside this invocation first. Only when membership is
-# stable does progress_verdict consult the preserved, at-least-MIN_WINDOW CPU
-# baseline. This makes a one-shot call useful without paying a 20s heartbeat wait.
+# Observe membership throughout the short window, rather than only at its two
+# endpoints: a child can start and finish between endpoint scans while its flat
+# parent remains. Only when every observed set is stable does progress_verdict
+# consult the preserved, at-least-MIN_WINDOW CPU baseline.
 test_scan_barrier before-progress-sample || \
   emit_unknown unreadable "$COUNT_T0" "progress-sample test barrier could not be completed"
-sleep "$SAMPLE"
-WAIT_STATUS=$?
-[ "$WAIT_STATUS" -eq 0 ] || \
-  emit_unknown unreadable "$COUNT_T0" "progress-sample wait failed: sleep exited $WAIT_STATUS"
-PIDS_T1=$(procs_in_worktree) || \
-  emit_unknown unreadable "$COUNT_T0" "process enumeration failed mid-sample"
-COUNT_T1=$(printf '%s' "$PIDS_T1" | grep -c . || true)
-case "$COUNT_T1" in ''|*[!0-9]*) COUNT_T1=0 ;; esac
-
-if [ "$COUNT_T1" = 0 ]; then
-  emit_unknown transition 0 "processes present at the first scan were gone by the second; the step transition could not be established"
-fi
+PIDS_T1=$PIDS_T0
+COUNT_T1=$COUNT_T0
+SAMPLE_TICKS=$(( SAMPLE * 4 ))
+SAMPLE_TICK=0
+while [ "$SAMPLE_TICK" -lt "$SAMPLE_TICKS" ]; do
+  sleep 0.25
+  WAIT_STATUS=$?
+  [ "$WAIT_STATUS" -eq 0 ] || \
+    emit_unknown unreadable "$COUNT_T1" "progress-sample wait failed: sleep exited $WAIT_STATUS"
+  PIDS_NEXT=$(procs_in_worktree) || \
+    emit_unknown unreadable "$COUNT_T1" "process enumeration failed mid-sample"
+  COUNT_NEXT=$(printf '%s' "$PIDS_NEXT" | grep -c . || true)
+  case "$COUNT_NEXT" in ''|*[!0-9]*) COUNT_NEXT=0 ;; esac
+  if [ "$COUNT_NEXT" = 0 ]; then
+    emit_unknown transition 0 "processes present at the first scan were gone by the second; the step transition could not be established"
+  fi
+  CHANGES=$(membership_changes "$PIDS_T1" "$PIDS_NEXT")
+  STARTED=${CHANGES%% *}
+  STOPPED=${CHANGES##* }
+  if [ "$STARTED" -gt 0 ] || [ "$STOPPED" -gt 0 ]; then
+    DOING=$(current_work "$PIDS_NEXT")
+    [ -n "$DOING" ] && DOING="${VERDICT_SEP}doing: $DOING"
+    emit alive "$COUNT_NEXT" \
+      "process membership changed in ${SAMPLE}s ($STARTED started, $STOPPED stopped)$DOING"
+  fi
+  PIDS_T1=$PIDS_NEXT
+  COUNT_T1=$COUNT_NEXT
+  SAMPLE_TICK=$(( SAMPLE_TICK + 1 ))
+done
 
 DOING=$(current_work "$PIDS_T1")
 [ -n "$DOING" ] && DOING="${VERDICT_SEP}doing: $DOING"
-CHANGES=$(membership_changes "$PIDS_T0" "$PIDS_T1")
-STARTED=${CHANGES%% *}
-STOPPED=${CHANGES##* }
-
-if [ "$STARTED" -gt 0 ] || [ "$STOPPED" -gt 0 ]; then
-  emit alive "$COUNT_T1" \
-    "process membership changed in ${SAMPLE}s ($STARTED started, $STOPPED stopped)$DOING"
-fi
 
 progress_verdict "$PIDS_T1" "$COUNT_T1" "$DOING"

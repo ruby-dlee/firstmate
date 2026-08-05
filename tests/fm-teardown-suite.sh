@@ -861,6 +861,25 @@ SH
   chmod +x "$case_dir/fakebin/git"
 }
 
+add_git_rewrite_path_inspection_failure() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/git" <<'SH'
+#!/usr/bin/env bash
+if [ "${FM_TEST_FAIL_REWRITE_DIFF_TREE:-}" = 1 ]; then
+  case " $* " in
+    *" diff-tree --no-commit-id --name-only -r "*)
+      case " $* " in
+        *" --root "*) ;;
+        *) echo "fatal: simulated rewrite path inspection failure" >&2; exit 2 ;;
+      esac
+      ;;
+  esac
+fi
+exec "${REAL_GIT_FOR_TEST:?}" "$@"
+SH
+  chmod +x "$case_dir/fakebin/git"
+}
+
 # Run teardown with PATH mocking. Args: case_dir [extra args...]
 run_teardown() {
   local case_dir=$1; shift
@@ -1136,15 +1155,14 @@ test_rebased_merge_queue_head_landed_on_default_allows() {
   write_meta "$case_dir" no-mistakes ship
   append_pr_meta_url "$case_dir"
 
-  printf '%s\n' 'rows[1]{name}:' '  baseline' > "$case_dir/wt/inventory.toon"
+  printf '%s\n' 'baseline' > "$case_dir/wt/inventory.toon"
   git -C "$case_dir/wt" add inventory.toon
   git -C "$case_dir/wt" -c user.email=t@t -c user.name=t \
     commit -q -m "seed inventory"
   git -C "$case_dir/wt" push -q origin HEAD:main
   git -C "$case_dir/project" fetch -q origin main
 
-  printf '%s\n' 'rows[2]{name}:' '  baseline' '  task' \
-    > "$case_dir/wt/inventory.toon"
+  printf '%s\n' 'task' > "$case_dir/wt/inventory.toon"
   printf '%s\n' 'task-code-1' 'task-code-2' 'task-code-3' 'task-code-4' \
     > "$case_dir/wt/task-code.txt"
   git -C "$case_dir/wt" add inventory.toon task-code.txt
@@ -1163,15 +1181,13 @@ test_rebased_merge_queue_head_landed_on_default_allows() {
 
   queue="$case_dir/_queue"
   git clone -q "$case_dir/origin.git" "$queue"
-  printf '%s\n' 'rows[2]{name}:' '  baseline' '  upstream' \
-    > "$queue/inventory.toon"
+  printf '%s\n' 'upstream' > "$queue/inventory.toon"
   git -C "$queue" add inventory.toon
   git -C "$queue" -c user.email=t@t -c user.name=t \
     commit -q -m "add upstream inventory row"
   git -C "$queue" push -q origin main
   git -C "$queue" checkout -q -b pr-head
-  printf '%s\n' 'rows[3]{name}:' '  baseline' '  upstream' '  task' \
-    > "$queue/inventory.toon"
+  printf '%s\n' 'upstream' 'task' > "$queue/inventory.toon"
   printf '%s\n' 'task-code-1' 'task-code-2' 'task-code-3' 'task-code-4' \
     > "$queue/task-code.txt"
   git -C "$queue" add inventory.toon task-code.txt
@@ -1189,8 +1205,7 @@ test_rebased_merge_queue_head_landed_on_default_allows() {
   pr_head=$(git -C "$queue" rev-parse HEAD)
   git -C "$queue" push -q origin pr-head
   git -C "$queue" checkout -q -b altered-head main
-  printf '%s\n' 'rows[3]{name}:' '  baseline' '  upstream' '  substituted' \
-    > "$queue/inventory.toon"
+  printf '%s\n' 'upstream' 'task' 'injected' > "$queue/inventory.toon"
   printf '%s\n' 'task-code-1' 'task-code-2' 'task-code-3' 'task-code-4' \
     > "$queue/task-code.txt"
   git -C "$queue" add inventory.toon task-code.txt
@@ -1240,8 +1255,29 @@ test_rebased_merge_queue_head_landed_on_default_allows() {
     "rebased-merge-queue: refusal did not identify the rewritten commit"
   assert_grep 'inventory.toon could not be attributed' "$case_dir/altered-stderr" \
     "rebased-merge-queue: refusal did not identify the unattributed path"
+  assert_grep 'removed_line_hashes=- removed_truncated=0 added_line_hashes=' \
+    "$case_dir/altered-stderr" \
+    "rebased-merge-queue: refusal did not include the bounded rejected delta fingerprint"
+  assert_grep 'added_truncated=0' "$case_dir/altered-stderr" \
+    "rebased-merge-queue: refusal did not include the rejected delta truncation count"
   assert_present "$case_dir/state/task-x1.meta" \
     "rebased-merge-queue: ambiguous rewrite removed task bookkeeping"
+
+  add_git_rewrite_path_inspection_failure "$case_dir"
+  set +e
+  FM_TEST_FAIL_REWRITE_DIFF_TREE=1 FM_TEST_PR_REWRITE_FROM="$local_head" \
+    run_teardown "$case_dir" > "$case_dir/inspection-stdout" 2> "$case_dir/inspection-stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" \
+    "rebased-merge-queue: rewrite path inspection failure must refuse teardown"
+  assert_grep 'landing proof could not execute' "$case_dir/inspection-stderr" \
+    "rebased-merge-queue: path inspection failure was not operational"
+  assert_not_contains "$(cat "$case_dir/inspection-stderr")" 'could not be attributed' \
+    "rebased-merge-queue: path inspection failure was mislabeled semantic"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "rebased-merge-queue: path inspection failure removed task bookkeeping"
 
   add_gh_pr_merged_for_head "$case_dir" "$pr_head" "$merge_commit"
 

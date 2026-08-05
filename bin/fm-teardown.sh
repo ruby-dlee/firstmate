@@ -1056,8 +1056,8 @@ commit_path_entry() {
 }
 
 rewrite_difference_refusal() {
-  local original=$1 rewritten=$2 path=$3 reason=$4
-  echo "teardown: rewrite difference between $original and $rewritten at $path could not be attributed: $reason" >&2
+  local original=$1 rewritten=$2 path=$3 reason=$4 fingerprint=$5
+  echo "teardown: rewrite difference between $original and $rewritten at $path could not be attributed: $reason; delta=$fingerprint" >&2
   return "$TEARDOWN_REAP_SAFETY_REFUSAL"
 }
 
@@ -1074,33 +1074,39 @@ union_blob_hash() {
   } | git -C "$WT" hash-object --stdin 2>/dev/null
 }
 
-union_resolution_is_attributable() {
+concatenated_blob_hash() {
+  local first=$1 second=$2
+  set -o pipefail
+  {
+    git -C "$WT" cat-file blob "$first"
+    git -C "$WT" cat-file blob "$second"
+  } | git -C "$WT" hash-object --stdin 2>/dev/null
+}
+
+union_delta_fingerprint() {
   local ours=$1 base=$2 theirs=$3 rewritten=$4
   python3 - \
-    <(git -C "$WT" cat-file blob "$base") \
-    <(git -C "$WT" cat-file blob "$ours") \
-    <(git -C "$WT" cat-file blob "$theirs") \
     <(git merge-file --union -p \
       <(git -C "$WT" cat-file blob "$ours") \
       <(git -C "$WT" cat-file blob "$base") \
       <(git -C "$WT" cat-file blob "$theirs") 2>/dev/null) \
     <(git -C "$WT" cat-file blob "$rewritten") <<'PY'
 from collections import Counter
+from hashlib import sha256
 from pathlib import Path
 import sys
 
-base, ours, theirs, union, rewritten = (
-    Path(path).read_bytes().splitlines(keepends=True) for path in sys.argv[1:]
+expected, rewritten = (
+    Counter(Path(path).read_bytes().splitlines(keepends=True))
+    for path in sys.argv[1:]
 )
-base_lines = Counter(base)
-shared_side_lines = Counter(ours) & Counter(theirs)
-replaceable = shared_side_lines - base_lines
-union_lines = Counter(union)
-rewritten_lines = Counter(rewritten)
-removed = union_lines - rewritten_lines
-added = rewritten_lines - union_lines
-if not removed or removed - replaceable or sum(added.values()) > sum(removed.values()):
-    raise SystemExit(1)
+
+def describe(label, lines):
+    expanded = sorted(line for line, count in lines.items() for _ in range(count))
+    shown = [sha256(line).hexdigest()[:16] for line in expanded[:4]]
+    return f"{label}_line_hashes={','.join(shown) or '-'} {label}_truncated={max(0, len(expanded) - 4)}"
+
+print(f"{describe('removed', expected - rewritten)} {describe('added', rewritten - expected)}")
 PY
 }
 
@@ -1108,6 +1114,10 @@ commit_rewrite_differences_are_attributable() {
   local original=$1 rewritten=$2 original_parent=$3 rewritten_parent=$4
   local path old_entry original_entry new_entry rewritten_entry
   local old_oid original_oid new_oid rewritten_oid union_hash reverse_union_hash
+  local concatenated_hash reverse_concatenated_hash
+  local paths fingerprint
+  paths=$(git -C "$WT" diff-tree --no-commit-id --name-only -r \
+    "$original_parent" "$original" 2>/dev/null) || return 1
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     old_entry=$(commit_path_entry "$original_parent" "$path") || return 1
@@ -1117,7 +1127,8 @@ commit_rewrite_differences_are_attributable() {
     if [ "$old_entry" = "$new_entry" ]; then
       if [ "$original_entry" != "$rewritten_entry" ]; then
         rewrite_difference_refusal "$original" "$rewritten" "$path" \
-          "the upstream version did not change"
+          "the upstream version did not change" \
+          "old=$old_entry local=$original_entry upstream=$new_entry rewritten=$rewritten_entry"
         return $?
       fi
       continue
@@ -1125,7 +1136,8 @@ commit_rewrite_differences_are_attributable() {
     if [ "$old_entry" = "$original_entry" ]; then
       if [ "$new_entry" != "$rewritten_entry" ]; then
         rewrite_difference_refusal "$original" "$rewritten" "$path" \
-          "the local commit did not change this path"
+          "the local commit did not change this path" \
+          "old=$old_entry local=$original_entry upstream=$new_entry rewritten=$rewritten_entry"
         return $?
       fi
       continue
@@ -1133,7 +1145,8 @@ commit_rewrite_differences_are_attributable() {
     case "$old_entry:$original_entry:$new_entry:$rewritten_entry" in
       *:-*|*-:*)
         rewrite_difference_refusal "$original" "$rewritten" "$path" \
-          "a concurrent add or delete has no deterministic union proof"
+          "a concurrent add or delete has no deterministic union proof" \
+          "old=$old_entry local=$original_entry upstream=$new_entry rewritten=$rewritten_entry"
         return $?
         ;;
     esac
@@ -1145,26 +1158,31 @@ commit_rewrite_differences_are_attributable() {
       || return 1
     reverse_union_hash=$(union_blob_hash "$new_oid" "$old_oid" "$original_oid") \
       || return 1
+    concatenated_hash=$(concatenated_blob_hash "$original_oid" "$new_oid") \
+      || return 1
+    reverse_concatenated_hash=$(concatenated_blob_hash "$new_oid" "$original_oid") \
+      || return 1
     if [ "$rewritten_oid" != "$union_hash" ] \
         && [ "$rewritten_oid" != "$reverse_union_hash" ] \
-        && ! union_resolution_is_attributable \
-          "$original_oid" "$old_oid" "$new_oid" "$rewritten_oid" \
-        && ! union_resolution_is_attributable \
-          "$new_oid" "$old_oid" "$original_oid" "$rewritten_oid"; then
+        && [ "$rewritten_oid" != "$concatenated_hash" ] \
+        && [ "$rewritten_oid" != "$reverse_concatenated_hash" ]; then
+      fingerprint=$(union_delta_fingerprint \
+        "$original_oid" "$old_oid" "$new_oid" "$rewritten_oid") || return 1
       rewrite_difference_refusal "$original" "$rewritten" "$path" \
-        "the rewritten blob is not either deterministic union of local and upstream content"
+        "the rewritten blob is not either deterministic union of local and upstream content" \
+        "old=$old_entry local=$original_entry upstream=$new_entry rewritten=$rewritten_entry $fingerprint"
       return $?
     fi
     case "${rewritten_entry%%:*}" in
       "${original_entry%%:*}"|"${new_entry%%:*}") ;;
       *)
         rewrite_difference_refusal "$original" "$rewritten" "$path" \
-          "the rewritten file mode is neither the local nor upstream mode"
+          "the rewritten file mode is neither the local nor upstream mode" \
+          "local_mode=${original_entry%%:*} upstream_mode=${new_entry%%:*} rewritten_mode=${rewritten_entry%%:*}"
         return $?
         ;;
     esac
-  done < <(git -C "$WT" diff-tree --no-commit-id --name-only -r \
-    "$original_parent" "$original" 2>/dev/null)
+  done <<< "$paths"
 }
 
 commit_is_rebased_counterpart() {

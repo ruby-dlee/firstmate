@@ -108,6 +108,7 @@ The accepted policy profiles are Codex `gpt-5.6-sol` at `xhigh` effort and Claud
 Every `account_home` must be an existing absolute directory.
 Crosscheck selects the first entry whose account and model both differ from the author identity recorded in task metadata.
 An absent or invalid file is an unavailable reviewer and therefore blocks crosscheck and merge.
+Reviewer subprocess capture defaults to 16 MiB and can be overridden with `FM_CROSSCHECK_REVIEWER_MAX_CAPTURE_BYTES` between 200,000 bytes and 64 MiB; an invalid override blocks the review before launch.
 See [`crosscheck.md`](crosscheck.md) for the example file, evidence rules, and operator flow.
 
 ## Captain preferences (data/captain.md)

@@ -88,13 +88,18 @@ verdict_field() {
 # --- engine behavior --------------------------------------------------------
 
 test_absent_manifest_is_a_no_op() {
-  local rec out status
+  local rec out status state
   rec=$(make_case absent-manifest)
   read_case "$rec"
-  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/nothing-here.json")
+  state="$CASE_DIR/state"
+  mkdir -p "$state"
+  out=$(FM_STATE_OVERRIDE="$state" provision "$PROJ_DIR" "$WT_DIR" \
+    "$CASE_DIR/nothing-here.json" --task absent-a1)
   status=$?
   expect_code 0 "$status" "an absent manifest must not fail a spawn"
   [ "$(verdict_field "$out" .status)" = skipped ] || fail "absent manifest should be skipped, got: $out"
+  assert_absent "$state/absent-a1.provision" "an absent manifest must not create a verdict record"
+  assert_absent "$state/absent-a1.provision.log" "an absent manifest must not create a log"
   pass "a project with no manifest provisions nothing and exits clean"
 }
 
@@ -201,6 +206,22 @@ test_state_dependent_fingerprint_is_refused_not_recorded() {
   pass "a version command that depends on what it fingerprints is reported, not silently recorded"
 }
 
+test_empty_to_nonempty_fingerprint_is_refused_not_recorded() {
+  local rec out
+  rec=$(make_case fingerprint-empty-then-present)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  jq '.components[0].fingerprint.versions = [{"name":"state appears","argv":["sh","-c","test -d built && echo after"]}]' \
+    "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 0 "$?" "an empty-to-non-empty fingerprint transition should still provision"
+  assert_contains "$(verdict_field "$out" '.components[0].detail')" "fingerprint not recorded" \
+    "the verdict should expose an empty-to-non-empty fingerprint transition: $out"
+  assert_absent "$WT_DIR/component/built/.fm-provision-fingerprint" \
+    "a fingerprint unavailable before the build must not be recorded afterward"
+  pass "a fingerprint that appears only after installation is refused"
+}
+
 test_runtime_check_mismatch_fails_before_building() {
   local rec out status
   rec=$(make_case runtime-mismatch)
@@ -232,6 +253,30 @@ test_runtime_check_with_no_output_fails() {
   pass "a runtime check that prints nothing never satisfies an expected value"
 }
 
+test_probe_expect_is_enforced() {
+  local rec out
+  rec=$(make_case probe-expect-mismatch)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  jq '.components[0].probes = [{"name":"interpreter","argv":["sh","-c","echo 3.12"],"expect":"3.11"}]' \
+    "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 3 "$?" "a probe whose output differs from expect must fail"
+  assert_contains "$(verdict_field "$out" .reason)" "reported '3.12', expected '3.11'" \
+    "the probe failure should name its actual and expected output"
+
+  rec=$(make_case probe-expect-silent)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  jq '.components[0].probes = [{"name":"interpreter","argv":["true"],"expect":"3.11"}]' \
+    "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 3 "$?" "a silent probe with expect must fail"
+  assert_contains "$(verdict_field "$out" .reason)" "printed nothing, expected '3.11'" \
+    "the silent probe failure should name the missing expected output"
+  pass "probe expectations use the same exact-output boundary as runtime checks"
+}
+
 test_step_timeout_is_reported_and_bounded() {
   local rec out started elapsed
   rec=$(make_case timeout)
@@ -249,6 +294,34 @@ test_step_timeout_is_reported_and_bounded() {
   pass "a hanging step is killed at its bound and reported as a timeout"
 }
 
+test_reset_is_bounded_by_the_total_budget() {
+  local rec out started elapsed fakebin
+  rec=$(make_case reset-timeout)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json" timeout_seconds 2
+  fakebin="$CASE_DIR/fakebin"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/rm" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = -rf ]; then
+  : > "${FM_FAKE_RESET_CALLED:?}"
+  sleep 120
+fi
+exec /bin/rm "$@"
+SH
+  chmod +x "$fakebin/rm"
+  started=$(date +%s)
+  out=$(FM_FAKE_RESET_CALLED="$CASE_DIR/reset-called" PATH="$fakebin:$PATH" \
+    provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m.json")
+  expect_code 3 "$?" "a reset that exceeds the whole-run budget must fail"
+  elapsed=$(( $(date +%s) - started ))
+  [ "$elapsed" -lt 15 ] || fail "the reset bound did not hold; the run took ${elapsed}s"
+  assert_present "$CASE_DIR/reset-called" "the fake reset should have started"
+  assert_contains "$(verdict_field "$out" .reason)" "reset 'built' timed out" \
+    "the failure should identify the bounded reset"
+  pass "reset deletion cannot outlive the whole-run provisioning budget"
+}
+
 test_block_policy_uses_a_distinct_exit_code() {
   local rec out
   rec=$(make_case block-policy)
@@ -263,14 +336,19 @@ test_block_policy_uses_a_distinct_exit_code() {
 }
 
 test_kind_gate_and_force() {
-  local rec out
+  local rec out state
   rec=$(make_case kind-gate)
   read_case "$rec"
+  state="$CASE_DIR/state"
+  mkdir -p "$state"
   write_manifest "$CASE_DIR/m.json"
-  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m.json" --kind scout)
+  out=$(FM_STATE_OVERRIDE="$state" provision "$PROJ_DIR" "$WT_DIR" \
+    "$CASE_DIR/m.json" --kind scout --task excluded-a1)
   expect_code 0 "$?" "an excluded kind should skip, not fail"
   [ "$(verdict_field "$out" .status)" = skipped ] || fail "scout should be skipped by default: $out"
   [ "$(build_count "$WT_DIR")" = 0 ] || fail "a skipped kind must not build"
+  assert_absent "$state/excluded-a1.provision" "an excluded kind must not create a verdict record"
+  assert_absent "$state/excluded-a1.provision.log" "an excluded kind must not create a log"
   out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m.json" --kind scout --force)
   expect_code 0 "$?" "--force should provision an otherwise-excluded kind"
   [ "$(verdict_field "$out" .status)" = ready ] || fail "--force should provision the scout: $out"
@@ -293,6 +371,43 @@ test_paths_are_contained() {
   assert_contains "$(verdict_field "$out" .reason)" "escapes the component directory" \
     "the failure should name the refused reset path"
   pass "component and reset paths that escape their base are refused"
+}
+
+test_symlinked_paths_are_refused_before_access() {
+  local rec out outside before after
+  rec=$(make_case symlink-reset)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  outside="$CASE_DIR/outside"
+  mkdir -p "$outside/env"
+  printf 'keep\n' > "$outside/env/sentinel"
+  ln -s "$outside" "$WT_DIR/component/cache"
+  jq '.components[0].reset = ["cache/env"]' "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 3 "$?" "a reset path through a symlink must fail"
+  assert_present "$outside/env/sentinel" "a refused reset must not delete outside the component"
+  assert_contains "$(verdict_field "$out" .reason)" "reset path escapes" \
+    "the reset failure should report containment refusal"
+
+  rec=$(make_case symlink-fingerprint)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m.json" >/dev/null
+  outside="$CASE_DIR/outside"
+  mkdir -p "$outside"
+  cp "$WT_DIR/component/built/.fm-provision-fingerprint" "$outside/fingerprint"
+  /bin/rm -f "$WT_DIR/component/built/.fm-provision-fingerprint"
+  ln -s "$outside" "$WT_DIR/component/cache"
+  before=$(shasum -a 256 "$outside/fingerprint" | awk '{print $1}')
+  jq '.components[0].fingerprint.path = "cache/fingerprint"' \
+    "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 0 "$?" "a refused fingerprint symlink should force a safe rebuild"
+  [ "$(verdict_field "$out" '.components[0].result')" = installed ] \
+    || fail "a fingerprint reached through a symlink must not authorize reuse: $out"
+  after=$(shasum -a 256 "$outside/fingerprint" | awk '{print $1}')
+  [ "$before" = "$after" ] || fail "a fingerprint write escaped through an in-tree symlink"
+  pass "symlinked reset and fingerprint paths cannot escape the worktree"
 }
 
 test_env_may_not_hijack_path() {
@@ -598,6 +713,26 @@ test_spawn_no_provision_opt_out() {
   pass "--no-provision skips provisioning entirely"
 }
 
+test_spawn_skipped_provisioning_is_a_true_no_op() {
+  local rec id out path_line
+  id=provision-skip-p5
+  rec=$(make_spawn_case skip "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" --scout)
+  expect_code 0 "$?" "an excluded-kind provisioning skip should not disturb the spawn: $out"
+  assert_absent "$HOME_DIR/state/$id.provision" "a skipped spawn must not leave a verdict"
+  assert_absent "$HOME_DIR/state/$id.provision.log" "a skipped spawn must not leave a log"
+  assert_not_contains "$(cat "$HOME_DIR/data/$id/brief.md")" "Environment readiness" \
+    "a skipped spawn must not claim the worktree was provisioned"
+  path_line=$(exported_path "$SEND_LOG")
+  case "$path_line" in
+    *"$CASE_DIR/pinned-bin"*) fail "a skipped run must not publish a runtime pin: $path_line" ;;
+  esac
+  pass "a skipped provisioning verdict publishes no readiness evidence"
+}
+
 test_absent_manifest_is_a_no_op
 test_fresh_worktree_is_built_and_probed
 test_unchanged_healthy_environment_is_reused
@@ -605,12 +740,16 @@ test_existing_directory_is_never_assumed_healthy
 test_changed_input_rebuilds
 test_unavailable_fingerprint_never_reuses
 test_state_dependent_fingerprint_is_refused_not_recorded
+test_empty_to_nonempty_fingerprint_is_refused_not_recorded
 test_runtime_check_mismatch_fails_before_building
 test_runtime_check_with_no_output_fails
+test_probe_expect_is_enforced
 test_step_timeout_is_reported_and_bounded
+test_reset_is_bounded_by_the_total_budget
 test_block_policy_uses_a_distinct_exit_code
 test_kind_gate_and_force
 test_paths_are_contained
+test_symlinked_paths_are_refused_before_access
 test_env_may_not_hijack_path
 test_malformed_manifest_warns_rather_than_bricking_spawns
 test_path_prepend_is_published_only_when_ready
@@ -620,5 +759,6 @@ test_spawn_pins_the_proven_runtime_into_the_crew_path
 test_spawn_continues_loudly_when_provisioning_warns
 test_spawn_aborts_when_the_project_declares_block
 test_spawn_no_provision_opt_out
+test_spawn_skipped_provisioning_is_a_true_no_op
 
 echo "# all fm-provision tests passed"

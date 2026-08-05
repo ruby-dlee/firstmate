@@ -225,13 +225,13 @@ test_ci_wires_matrix_isolation_timeout_and_union_verification() {
 }
 
 test_teardown_partition_preserves_every_full_suite_case() {
-  local tmp definitions listed focused expected_focused wrapper expected_part
+  local tmp definitions listed focused wrapper expected_part
+  local guard_probe guard_stdout guard_stderr guard_rc
   local wrappers
   tmp=$(fm_test_tmproot fm-teardown-partition)
   definitions="$tmp/definitions.txt"
   listed="$tmp/listed.txt"
   focused="$tmp/focused.txt"
-  expected_focused="$tmp/expected-focused.txt"
   wrappers=(
     "$ROOT/tests/fm-teardown-a.test.sh"
     "$ROOT/tests/fm-teardown-b.test.sh"
@@ -256,21 +256,43 @@ test_teardown_partition_preserves_every_full_suite_case() {
       if (weight ~ /^[1-9][0-9]*$/ && name ~ /^test_[A-Za-z0-9_]+$/) print name
     }
   ' "$TEARDOWN_SUITE" > "$listed"
-  [ "$(wc -l < "$listed" | tr -d ' ')" -eq 137 ] \
-    || fail "teardown partition does not retain all 137 normal-run cases"
+  [ "$(wc -l < "$listed" | tr -d ' ')" -eq 140 ] \
+    || fail "teardown partition does not retain all 140 normal-run cases"
   [ "$(LC_ALL=C sort "$listed" | uniq -d | wc -l | tr -d ' ')" -eq 0 ] \
     || fail "teardown partition lists a normal-run case more than once"
   comm -13 "$definitions" <(LC_ALL=C sort "$listed") > "$tmp/undefined.txt"
   [ ! -s "$tmp/undefined.txt" ] \
     || fail "teardown partition lists an undefined test function"
   comm -23 "$definitions" <(LC_ALL=C sort "$listed") > "$focused"
-  printf '%s\n' \
-    test_bounded_runner_preserves_command_status_125 \
-    test_pr_check_backfills_legacy_generation_and_records_state \
-    test_pr_check_backfills_legacy_generation_before_race_check \
-    | LC_ALL=C sort > "$expected_focused"
-  cmp -s "$expected_focused" "$focused" \
-    || fail "teardown partition dropped or absorbed a focused-only case"
+  [ ! -s "$focused" ] \
+    || fail "teardown partition omits defined cases from normal dispatch"
+
+  guard_probe=$(mktemp "$ROOT/tests/.fm-teardown-guard-probe.XXXXXX") \
+    || fail "could not create teardown coverage guard probe"
+  guard_stdout="$tmp/guard-stdout.txt"
+  guard_stderr="$tmp/guard-stderr.txt"
+  awk '
+    !inserted && /^run_partitioned_test\(\) \{/ {
+      print "test_intentionally_undispatched_guard_probe() { :; }"
+      print ""
+      inserted = 1
+    }
+    { print }
+  ' "$TEARDOWN_SUITE" > "$guard_probe" || {
+    rm -f "$guard_probe"
+    fail "could not build teardown coverage guard probe"
+  }
+  guard_rc=0
+  FM_TEST_PART_INDEX=1 FM_TEST_PART_TOTAL=8 \
+    bash "$guard_probe" > "$guard_stdout" 2> "$guard_stderr" || guard_rc=$?
+  rm -f "$guard_probe"
+  [ "$guard_rc" -ne 0 ] \
+    || fail "teardown dispatch coverage guard accepted an undispatched test function"
+  assert_grep 'defined-but-undispatched cases' "$guard_stderr" \
+    "teardown dispatch coverage guard failure was unclear"
+  assert_grep 'test_intentionally_undispatched_guard_probe' "$guard_stderr" \
+    "teardown dispatch coverage guard did not name the omitted test function"
+
   expected_part=1
   for wrapper in "${wrappers[@]}"; do
     assert_grep "FM_TEST_PART_INDEX=$expected_part FM_TEST_PART_TOTAL=8" "$wrapper" \
@@ -279,7 +301,7 @@ test_teardown_partition_preserves_every_full_suite_case() {
   done
   [ ! -e "$ROOT/tests/fm-teardown.test.sh" ] \
     || fail "the unsplit teardown test remains in the behavior inventory"
-  pass "eight weighted teardown wrappers preserve all 137 normal cases and three focused-only cases"
+  pass "eight weighted teardown wrappers preserve all 140 normal cases and reject omissions"
 }
 
 test_checked_in_plan_is_complete_balanced_and_deterministic

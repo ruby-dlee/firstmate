@@ -6099,7 +6099,7 @@ fi
 
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
-    test_pr_check_without_worktree_still_performs_lookup|test_closed_pr_wakes_loudly_as_unreviewed)
+    test_pr_check_without_worktree_still_performs_lookup|test_closed_pr_wakes_loudly_as_unreviewed|test_bounded_runner_preserves_command_status_125|test_pr_check_backfills_legacy_generation_and_records_state|test_pr_check_backfills_legacy_generation_before_race_check)
       "$FM_TEST_CASE"
       exit 0
       ;;
@@ -6410,8 +6410,9 @@ for ((teardown_part = 1; teardown_part <= FM_TEST_PART_TOTAL; teardown_part++));
 done
 
 # Each entry is "<measured-local-ms> <test-function>". The weights came from
-# one complete eight-way run on 2026-08-04 and drive deterministic
-# longest-processing-time assignment; they are not CI duration weights.
+# one complete eight-way run on 2026-08-04, with the three restored cases
+# measured directly on 2026-08-05, and drive deterministic longest-processing-
+# time assignment. They are not CI duration weights.
 TEARDOWN_FULL_SUITE_CASES=(
   "11082 test_local_only_fork_remote_allows"
   "14861 test_teardown_prompts_tasks_axi_done_when_compatible"
@@ -6431,6 +6432,7 @@ TEARDOWN_FULL_SUITE_CASES=(
   "22418 test_forced_secondmate_retains_child_on_treehouse_failure"
   "22644 test_forced_secondmate_retains_unverified_process_group"
   "15958 test_forced_secondmate_retains_child_when_treehouse_unavailable"
+  "300 test_bounded_runner_preserves_command_status_125"
   "17716 test_forced_secondmate_retains_child_on_checkout_lock_contention"
   "11453 test_herdr_teardown_clears_escalation_marker"
   "18824 test_required_report_blocks_then_publishes_before_cleanup"
@@ -6497,6 +6499,8 @@ TEARDOWN_FULL_SUITE_CASES=(
   "2612 test_pr_check_lookup_errors_are_loud_and_bounded"
   "1453 test_pr_check_serializes_with_account_session_updates"
   "1540 test_pr_check_rejects_reused_task_generation"
+  "1260 test_pr_check_backfills_legacy_generation_and_records_state"
+  "1210 test_pr_check_backfills_legacy_generation_before_race_check"
   "19207 test_content_in_default_fallback_allows"
   "20889 test_content_fallback_refreshes_stale_origin_ref"
   "8143 test_content_fallback_uses_live_default"
@@ -6551,6 +6555,24 @@ TEARDOWN_FULL_SUITE_CASES=(
   "1486 test_closed_pr_wakes_loudly_as_unreviewed"
   "1284 test_pr_check_without_worktree_still_performs_lookup"
 )
+
+TEARDOWN_DEFINED_CASES="$TMP_ROOT/teardown-defined-cases.txt"
+TEARDOWN_DISPATCHED_CASES="$TMP_ROOT/teardown-dispatched-cases.txt"
+TEARDOWN_UNDISPATCHED_CASES="$TMP_ROOT/teardown-undispatched-cases.txt"
+declare -F \
+  | awk '$3 ~ /^test_[A-Za-z0-9_]+$/ { print $3 }' \
+  | LC_ALL=C sort -u > "$TEARDOWN_DEFINED_CASES"
+printf '%s\n' "${TEARDOWN_FULL_SUITE_CASES[@]}" \
+  | awk '{ print $2 }' \
+  | LC_ALL=C sort -u > "$TEARDOWN_DISPATCHED_CASES"
+comm -23 "$TEARDOWN_DEFINED_CASES" "$TEARDOWN_DISPATCHED_CASES" \
+  > "$TEARDOWN_UNDISPATCHED_CASES"
+if [ -s "$TEARDOWN_UNDISPATCHED_CASES" ]; then
+  printf '%s\n' \
+    'not ok - teardown dispatch coverage guard found defined-but-undispatched cases:' >&2
+  sed 's/^/  - /' "$TEARDOWN_UNDISPATCHED_CASES" >&2
+  exit 1
+fi
 
 TEARDOWN_SORTED_CASES=$(printf '%s\n' "${TEARDOWN_FULL_SUITE_CASES[@]}" \
   | LC_ALL=C sort -k1,1nr -k2,2)

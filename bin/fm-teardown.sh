@@ -1061,36 +1061,22 @@ rewrite_difference_refusal() {
   return "$TEARDOWN_REAP_SAFETY_REFUSAL"
 }
 
-union_blob_hash() {
-  local ours=$1 base=$2 theirs=$3 status
-  set -o pipefail
-  {
-    git merge-file --union -p \
-      <(git -C "$WT" cat-file blob "$ours") \
-      <(git -C "$WT" cat-file blob "$base") \
-      <(git -C "$WT" cat-file blob "$theirs") 2>/dev/null
-    status=$?
-    [ "$status" -le 1 ]
-  } | git -C "$WT" hash-object --stdin 2>/dev/null
+materialize_blob() {
+  local oid=$1 destination=$2
+  git -C "$WT" cat-file blob "$oid" > "$destination" 2>/dev/null
 }
 
-concatenated_blob_hash() {
-  local first=$1 second=$2
-  set -o pipefail
-  {
-    git -C "$WT" cat-file blob "$first"
-    git -C "$WT" cat-file blob "$second"
-  } | git -C "$WT" hash-object --stdin 2>/dev/null
+materialize_union() {
+  local ours=$1 base=$2 theirs=$3 destination=$4 status
+  git merge-file --union -p "$ours" "$base" "$theirs" \
+    > "$destination" 2>/dev/null
+  status=$?
+  [ "$status" -le 1 ]
 }
 
 union_delta_fingerprint() {
-  local ours=$1 base=$2 theirs=$3 rewritten=$4
-  python3 - \
-    <(git merge-file --union -p \
-      <(git -C "$WT" cat-file blob "$ours") \
-      <(git -C "$WT" cat-file blob "$base") \
-      <(git -C "$WT" cat-file blob "$theirs") 2>/dev/null) \
-    <(git -C "$WT" cat-file blob "$rewritten") <<'PY'
+  local expected=$1 rewritten=$2
+  python3 - "$expected" "$rewritten" <<'PY'
 from collections import Counter
 from hashlib import sha256
 from pathlib import Path
@@ -1115,7 +1101,7 @@ commit_rewrite_differences_are_attributable() {
   local path old_entry original_entry new_entry rewritten_entry
   local old_oid original_oid new_oid rewritten_oid union_hash reverse_union_hash
   local concatenated_hash reverse_concatenated_hash
-  local paths fingerprint
+  local paths fingerprint proof_dir
   paths=$(git -C "$WT" diff-tree --no-commit-id --name-only -r \
     "$original_parent" "$original" 2>/dev/null) || return 1
   while IFS= read -r path; do
@@ -1154,28 +1140,53 @@ commit_rewrite_differences_are_attributable() {
     original_oid=${original_entry#*:}
     new_oid=${new_entry#*:}
     rewritten_oid=${rewritten_entry#*:}
-    union_hash=$(union_blob_hash "$original_oid" "$old_oid" "$new_oid") \
-      || return 1
-    reverse_union_hash=$(union_blob_hash "$new_oid" "$old_oid" "$original_oid") \
-      || return 1
-    concatenated_hash=$(concatenated_blob_hash "$original_oid" "$new_oid") \
-      || return 1
-    reverse_concatenated_hash=$(concatenated_blob_hash "$new_oid" "$original_oid") \
-      || return 1
+    proof_dir=$(mktemp -d "${TMPDIR:-/tmp}/fm-rewrite-proof.XXXXXX") || return 1
+    materialize_blob "$old_oid" "$proof_dir/old" \
+      || { rm -rf "$proof_dir"; return 1; }
+    materialize_blob "$original_oid" "$proof_dir/local" \
+      || { rm -rf "$proof_dir"; return 1; }
+    materialize_blob "$new_oid" "$proof_dir/upstream" \
+      || { rm -rf "$proof_dir"; return 1; }
+    materialize_blob "$rewritten_oid" "$proof_dir/rewritten" \
+      || { rm -rf "$proof_dir"; return 1; }
+    materialize_union \
+      "$proof_dir/local" "$proof_dir/old" "$proof_dir/upstream" \
+      "$proof_dir/union" || { rm -rf "$proof_dir"; return 1; }
+    materialize_union \
+      "$proof_dir/upstream" "$proof_dir/old" "$proof_dir/local" \
+      "$proof_dir/reverse-union" || { rm -rf "$proof_dir"; return 1; }
+    command cat "$proof_dir/local" "$proof_dir/upstream" \
+      > "$proof_dir/concatenated" || { rm -rf "$proof_dir"; return 1; }
+    command cat "$proof_dir/upstream" "$proof_dir/local" \
+      > "$proof_dir/reverse-concatenated" || { rm -rf "$proof_dir"; return 1; }
+    union_hash=$(git -C "$WT" hash-object "$proof_dir/union" 2>/dev/null) \
+      || { rm -rf "$proof_dir"; return 1; }
+    reverse_union_hash=$(git -C "$WT" hash-object "$proof_dir/reverse-union" 2>/dev/null) \
+      || { rm -rf "$proof_dir"; return 1; }
+    concatenated_hash=$(git -C "$WT" hash-object "$proof_dir/concatenated" 2>/dev/null) \
+      || { rm -rf "$proof_dir"; return 1; }
+    reverse_concatenated_hash=$(git -C "$WT" hash-object \
+      "$proof_dir/reverse-concatenated" 2>/dev/null) \
+      || { rm -rf "$proof_dir"; return 1; }
     if [ "$rewritten_oid" != "$union_hash" ] \
         && [ "$rewritten_oid" != "$reverse_union_hash" ] \
         && [ "$rewritten_oid" != "$concatenated_hash" ] \
         && [ "$rewritten_oid" != "$reverse_concatenated_hash" ]; then
       fingerprint=$(union_delta_fingerprint \
-        "$original_oid" "$old_oid" "$new_oid" "$rewritten_oid") || return 1
+        "$proof_dir/union" "$proof_dir/rewritten") \
+        || { rm -rf "$proof_dir"; return 1; }
+      rm -rf "$proof_dir"
       rewrite_difference_refusal "$original" "$rewritten" "$path" \
         "the rewritten blob is not either deterministic union of local and upstream content" \
         "old=$old_entry local=$original_entry upstream=$new_entry rewritten=$rewritten_entry $fingerprint"
       return $?
     fi
     case "${rewritten_entry%%:*}" in
-      "${original_entry%%:*}"|"${new_entry%%:*}") ;;
+      "${original_entry%%:*}"|"${new_entry%%:*}")
+        rm -rf "$proof_dir"
+        ;;
       *)
+        rm -rf "$proof_dir"
         rewrite_difference_refusal "$original" "$rewritten" "$path" \
           "the rewritten file mode is neither the local nor upstream mode" \
           "local_mode=${original_entry%%:*} upstream_mode=${new_entry%%:*} rewritten_mode=${rewritten_entry%%:*}"

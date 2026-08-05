@@ -875,6 +875,14 @@ if [ "${FM_TEST_FAIL_REWRITE_DIFF_TREE:-}" = 1 ]; then
       ;;
   esac
 fi
+if [ -n "${FM_TEST_FAIL_REWRITE_BLOB:-}" ]; then
+  case " $* " in
+    *" cat-file blob $FM_TEST_FAIL_REWRITE_BLOB "*)
+      echo "fatal: simulated rewrite blob inspection failure" >&2
+      exit 2
+      ;;
+  esac
+fi
 exec "${REAL_GIT_FOR_TEST:?}" "$@"
 SH
   chmod +x "$case_dir/fakebin/git"
@@ -1150,7 +1158,7 @@ test_squash_merged_pr_allows_replayed_unpushed_patch() {
 
 test_rebased_merge_queue_head_landed_on_default_allows() {
   local case_dir rc local_first local_head rewritten_first pr_head altered_first altered_head merge_commit
-  local local_patch rewritten_patch queue
+  local local_patch rewritten_patch local_blob queue
   case_dir=$(make_case rebased-merge-queue)
   write_meta "$case_dir" no-mistakes ship
   append_pr_meta_url "$case_dir"
@@ -1233,6 +1241,7 @@ test_rebased_merge_queue_head_landed_on_default_allows() {
 
   local_patch=$(git -C "$case_dir/wt" show --pretty=medium --no-ext-diff \
     "$local_first" | git patch-id --stable | awk 'NR == 1 { print $1 }')
+  local_blob=$(git -C "$case_dir/wt" rev-parse "$local_first:inventory.toon")
   rewritten_patch=$(git -C "$case_dir/wt" show --pretty=medium --no-ext-diff \
     "$rewritten_first" | git patch-id --stable | awk 'NR == 1 { print $1 }')
   [ "$local_patch" != "$rewritten_patch" ] \
@@ -1278,6 +1287,21 @@ test_rebased_merge_queue_head_landed_on_default_allows() {
     "rebased-merge-queue: path inspection failure was mislabeled semantic"
   assert_present "$case_dir/state/task-x1.meta" \
     "rebased-merge-queue: path inspection failure removed task bookkeeping"
+
+  set +e
+  FM_TEST_FAIL_REWRITE_BLOB="$local_blob" FM_TEST_PR_REWRITE_FROM="$local_head" \
+    run_teardown "$case_dir" > "$case_dir/blob-stdout" 2> "$case_dir/blob-stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" \
+    "rebased-merge-queue: rewrite blob inspection failure must refuse teardown"
+  assert_grep 'landing proof could not execute' "$case_dir/blob-stderr" \
+    "rebased-merge-queue: blob inspection failure was not operational"
+  assert_not_contains "$(cat "$case_dir/blob-stderr")" 'could not be attributed' \
+    "rebased-merge-queue: blob inspection failure was mislabeled semantic"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "rebased-merge-queue: blob inspection failure removed task bookkeeping"
 
   add_gh_pr_merged_for_head "$case_dir" "$pr_head" "$merge_commit"
 

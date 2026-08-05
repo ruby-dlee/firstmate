@@ -317,7 +317,7 @@ Worktree provisioning is Firstmate's answer: `bin/fm-spawn.sh` calls `bin/fm-pro
 
 Provisioning is opt-in per project and per home.
 `config/provision/<project>.json` is a local, gitignored manifest named after the project directory under `projects/`.
-With no manifest the step is a single file-existence check and nothing else happens, so projects and homes that have not opted in are unchanged.
+After spawn retires any prior task evidence, the engine's no-manifest path is a single file-existence check with no environment work, so projects and homes that have not opted in remain unchanged.
 This section is the single owner of the manifest schema; `bin/fm-provision.sh`'s header owns the readiness contract, the exit codes, and the operational guarantees, and `AGENTS.md` keeps only the one-line pointer.
 See [`docs/examples/provision-relvino.json`](examples/provision-relvino.json) for a working manifest to copy and adapt.
 
@@ -354,7 +354,7 @@ See [`docs/examples/provision-relvino.json`](examples/provision-relvino.json) fo
 `components` is required and every component needs a `name`.
 Every other field is optional.
 `kinds` defaults to `["ship"]`, so scouts are skipped unless the manifest lists them or the spawn passes `--provision`; a scout that only reads code does not need a toolchain.
-A no-manifest or excluded-kind skip is a true no-op: it creates no provision record or log, appends no brief section, and publishes no `path_prepend`.
+A no-manifest or excluded-kind skip publishes no provision record, log, brief section, or `path_prepend`; spawn retires any evidence from a prior attempt before taking an early-return path.
 `on_failure` is `warn` or `block` and defaults to `warn`; the reasoning behind that default lives in `bin/fm-provision.sh`'s header.
 `timeout_seconds` bounds the whole run, including reset deletions, and `step_timeout_seconds` is the per-step default, which a step overrides with its own `timeout_seconds`.
 Every step is a `{name, argv, timeout_seconds}` object; `argv` is an argument vector rather than a shell string, so quoting is unambiguous and `["sh", "-c", "..."]` is the explicit opt-in when a shell is genuinely wanted.
@@ -375,6 +375,8 @@ Put `fingerprint.path` inside the tree it describes, such as `.venv/` or `node_m
 A `versions` command must be independent of the thing it fingerprints; the value is recomputed after a build, and the fingerprint is recorded only when both readings are non-empty and equal.
 If those readings differ, including an empty-to-non-empty transition, the verdict reports the refusal rather than silently rebuilding on every future lease.
 Existing ancestors of `dir`, `reset`, fingerprint input, and `fingerprint.path` paths are resolved before use; symlinks and physical escapes from the worktree are refused before reads, writes, or deletion.
+A component `dir` may be the worktree root, but every reset, fingerprint input, and `fingerprint.path` must be a strict descendant of that component directory.
+This strict-descendant invariant structurally prevents `.`, `sub/..`, an empty value, or an absolute reset from ever resolving to the component root passed to deletion.
 
 `bin/fm-spawn.sh` takes `--provision` to force provisioning for one spawn, including for a kind the manifest excludes, and `--no-provision` to skip it entirely.
 Both apply to every pair of a batch spawn.

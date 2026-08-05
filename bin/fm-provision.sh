@@ -50,13 +50,13 @@
 #     (`uv python find 3.11` is exactly this trap: it resolves the project's own
 #     .venv once one exists. Use `uv python find --system 3.11`.)
 #   - Every step is bounded by its local limit and the whole-run budget, and
-#     every reset is bounded by the whole-run budget. Timeouts are the reason
-#     this exists: the original failure was an import that hung for over five
-#     minutes and ran zero assertions. A bounded operation reports a timeout
-#     instead of stalling a lease.
+#     every reset is bounded by the whole-run budget. The whole child process
+#     group stays supervised through completion or TERM-then-KILL escalation,
+#     including when its leader exits before a background descendant.
 #   - Manifest paths are contained: existing ancestors are resolved, symlinks
-#     are refused, and component, reset, input, and fingerprint paths must stay
-#     physically inside the worktree.
+#     are refused, and component paths must stay physically inside the worktree.
+#     Reset and fingerprint paths must be strict descendants of their component,
+#     so no normalized reset can ever target the component root itself.
 #
 # FAILURE POLICY
 #   The manifest's on_failure decides, and the DEFAULT IS "warn": a provisioning
@@ -375,41 +375,54 @@ contained_path() {
   printf '%s' "$resolved"
 }
 
+strict_descendant_path() {
+  local base=$1 rel=$2 base_real resolved
+  case "$rel" in
+    ''|.|/*) return 1 ;;
+  esac
+  base_real=$(cd "$base" 2>/dev/null && pwd -P) || return 1
+  resolved=$(contained_path "$base_real" "$rel") || return 1
+  case "$resolved" in
+    "$base_real"/*) printf '%s' "$resolved" ;;
+    *) return 1 ;;
+  esac
+}
+
 # --- bounded execution ------------------------------------------------------
 #
 # This host has neither timeout(1) nor gtimeout(1), and the failure this script
 # exists to prevent was an unbounded hang, so the bound is implemented here.
-# set -m gives the child its own process group, so the watchdog kills the whole
-# tree rather than orphaning grandchildren.
+# set -m gives the child its own process group, which stays supervised as one
+# unit rather than orphaning grandchildren when its leader exits.
 run_bounded() {
   local seconds=$1 marker=$2
   shift 2
-  local pid watchdog status=0 waited=0
+  local pid status=0 ticks=0 limit grace=0
   /bin/rm -f "$marker"
   set -m
   "$@" &
   pid=$!
   set +m
-  (
-    while [ "$waited" -lt "$seconds" ]; do
-      kill -0 "$pid" 2>/dev/null || exit 0
-      sleep 1
-      waited=$((waited + 1))
-    done
-    kill -0 "$pid" 2>/dev/null || exit 0
-    : > "$marker"
-    kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-    sleep 2
-    kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-  ) &
-  watchdog=$!
+  limit=$((seconds * 10))
+  while kill -0 -"$pid" 2>/dev/null; do
+    if [ "$ticks" -ge "$limit" ]; then
+      : > "$marker"
+      kill -TERM -"$pid" 2>/dev/null || true
+      while kill -0 -"$pid" 2>/dev/null && [ "$grace" -lt 20 ]; do
+        sleep 0.1
+        grace=$((grace + 1))
+      done
+      if kill -0 -"$pid" 2>/dev/null; then
+        kill -KILL -"$pid" 2>/dev/null || true
+      fi
+      wait "$pid" 2>/dev/null || status=$?
+      /bin/rm -f "$marker"
+      return 124
+    fi
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
   wait "$pid" 2>/dev/null || status=$?
-  kill -TERM "$watchdog" 2>/dev/null || true
-  wait "$watchdog" 2>/dev/null || true
-  if [ -e "$marker" ]; then
-    /bin/rm -f "$marker"
-    return 124
-  fi
   return "$status"
 }
 
@@ -550,8 +563,8 @@ component_fingerprint() {
   FINGERPRINT=
   FINGERPRINT_INPUTS=
   while IFS= read -r -d '' rel; do
-    if ! abs=$(contained_path "$dir" "$(expand_tokens "$rel")"); then
-      log_line "fingerprint: refusing an input outside the component: $rel"
+    if ! abs=$(strict_descendant_path "$dir" "$(expand_tokens "$rel")"); then
+      log_line "fingerprint: refusing an input that is not a strict descendant of the component: $rel"
       return 0
     fi
     if [ ! -f "$abs" ]; then
@@ -602,8 +615,8 @@ run_probes() {
 run_install() {
   local comp=$1 dir=$2 rel abs step budget status
   while IFS= read -r -d '' rel; do
-    if ! abs=$(contained_path "$dir" "$(expand_tokens "$rel")"); then
-      STEP_FAILURE="reset path escapes the component directory: $rel"
+    if ! abs=$(strict_descendant_path "$dir" "$(expand_tokens "$rel")"); then
+      STEP_FAILURE="reset path must be a strict descendant of the component directory: '$rel'"
       return 1
     fi
     budget=$(remaining_budget)
@@ -636,7 +649,7 @@ read_fingerprint() {
   local dir=$1 rel=$2 abs
   STORED_FINGERPRINT=
   [ -n "$rel" ] || return 0
-  abs=$(contained_path "$dir" "$rel") || return 0
+  abs=$(strict_descendant_path "$dir" "$(expand_tokens "$rel")") || return 0
   [ -f "$abs" ] || return 0
   STORED_FINGERPRINT=$(jq -r 'select(.schema=="fm-provision-fingerprint.v1") | .digest // ""' "$abs" 2>/dev/null)
 }
@@ -645,8 +658,8 @@ write_fingerprint() {
   local dir=$1 rel=$2 abs parent
   [ -n "$FINGERPRINT" ] || return 0
   [ -n "$rel" ] || return 0
-  if ! abs=$(contained_path "$dir" "$rel"); then
-    log_line "fingerprint: refusing to write outside $dir"
+  if ! abs=$(strict_descendant_path "$dir" "$(expand_tokens "$rel")"); then
+    log_line "fingerprint: refusing to write outside the strict descendants of $dir"
     return 0
   fi
   parent=$(dirname "$abs")
@@ -657,6 +670,31 @@ write_fingerprint() {
   jq -c -n --arg digest "$FINGERPRINT" --arg inputs "$FINGERPRINT_INPUTS" \
     '{schema:"fm-provision-fingerprint.v1",digest:$digest,inputs:$inputs}' > "$abs" 2>/dev/null \
     || log_line "fingerprint: cannot write $abs"
+}
+
+validate_component_paths() {
+  local comp=$1 dir=$2 rel fp_path fp_path_present
+  while IFS= read -r -d '' rel; do
+    if ! strict_descendant_path "$dir" "$(expand_tokens "$rel")" >/dev/null; then
+      FAILURE_REASON="reset path must be a strict descendant of the component directory: '$rel'"
+      return 1
+    fi
+  done < <(printf '%s' "$comp" | jq -j '.reset[]? | tostring + "\u0000"' 2>/dev/null)
+  while IFS= read -r -d '' rel; do
+    if ! strict_descendant_path "$dir" "$(expand_tokens "$rel")" >/dev/null; then
+      FAILURE_REASON="fingerprint file must be a strict descendant of the component directory: '$rel'"
+      return 1
+    fi
+  done < <(printf '%s' "$comp" | jq -j '.fingerprint.files[]? | tostring + "\u0000"' 2>/dev/null)
+  fp_path_present=$(printf '%s' "$comp" | jq -r 'if (.fingerprint? | type) == "object" then if (.fingerprint | has("path")) then "yes" else "no" end else "no" end' 2>/dev/null)
+  if [ "$fp_path_present" = yes ]; then
+    fp_path=$(printf '%s' "$comp" | jq -r '.fingerprint.path // ""' 2>/dev/null)
+    if ! strict_descendant_path "$dir" "$(expand_tokens "$fp_path")" >/dev/null; then
+      FAILURE_REASON="fingerprint path must be a strict descendant of the component directory: '$fp_path'"
+      return 1
+    fi
+  fi
+  return 0
 }
 
 run_component() {
@@ -684,6 +722,11 @@ run_component() {
     *) FAILURE_REASON="component $name: directory resolves outside the worktree"; return 1 ;;
   esac
   fp_path=$(printf '%s' "$comp" | jq -r '.fingerprint.path // ""' 2>/dev/null)
+
+  if ! validate_component_paths "$comp" "$dir"; then
+    FAILURE_REASON="component $name: ${FAILURE_REASON:-manifest path validation failed}"
+    return 1
+  fi
 
   if ! component_env "$comp"; then
     FAILURE_REASON="component $name: ${FAILURE_REASON:-environment could not be built}"

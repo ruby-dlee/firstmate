@@ -1,11 +1,11 @@
-projects/
-state/
-data/
-.no-mistakes/
-.lavish/
+/projects/
+/state/
+/data/
+/.no-mistakes/
+/.lavish/
 /.treehouse
 tools/lavish/node_modules/
-.fm-secondmate-home
+/.fm-secondmate-home
 /.*.crosscheck.lock
 .DS_Store
 __pycache__/

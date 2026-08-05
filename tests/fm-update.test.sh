@@ -24,7 +24,7 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-UPDATE="$ROOT/bin/fm-update.sh"
+STALE_UPDATE_COMMIT=8fce09f31a3c1fb28bb891e4b26e97367391b965
 
 # Deterministic, isolated git identity for fixture commits.
 fm_git_identity fmtest fmtest@example.com
@@ -33,8 +33,8 @@ fm_test_tmproot_into TMP_ROOT fm-update-tests
 
 # Build a fresh world: a bare origin seeded with one commit, a firstmate repo
 # clone checked out on main, and a home dir with state/ and data/. Echoes the
-# world dir. Files seeded: the home marker ignore, AGENTS.md, README.md,
-# bin/tool.sh, and an internal skill note.
+# world dir. Files seeded: the stale updater, AGENTS.md, README.md, bin/tool.sh,
+# and an internal skill note.
 new_world() {
   local name=$1 w
   w="$TMP_ROOT/$name"
@@ -48,8 +48,15 @@ new_world() {
 
   printf 'v1\n' > "$w/seed/AGENTS.md"
   printf 'r1\n' > "$w/seed/README.md"
-  printf '.fm-secondmate-home\n' > "$w/seed/.gitignore"
   mkdir -p "$w/seed/bin" "$w/seed/.agents/skills"
+  git -C "$ROOT" show "$STALE_UPDATE_COMMIT:.gitignore" > "$w/seed/.gitignore"
+  git -C "$ROOT" show "$STALE_UPDATE_COMMIT:bin/fm-update.sh" > "$w/seed/bin/fm-update.sh"
+  git -C "$ROOT" show "$STALE_UPDATE_COMMIT:bin/fm-ff-lib.sh" > "$w/seed/bin/fm-ff-lib.sh"
+  git -C "$ROOT" show "$STALE_UPDATE_COMMIT:bin/fm-gate-refuse-lib.sh" > "$w/seed/bin/fm-gate-refuse-lib.sh"
+  git -C "$ROOT" show "$STALE_UPDATE_COMMIT:.agents/skills/updatefirstmate/SKILL.md" \
+    > "$w/seed/.agents/skills/updatefirstmate.md"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$w/seed/bin/fm-guard.sh"
+  chmod +x "$w/seed/bin/fm-update.sh" "$w/seed/bin/fm-guard.sh"
   printf 'echo a\n' > "$w/seed/bin/tool.sh"
   printf 's1\n' > "$w/seed/.agents/skills/note.md"
   git -C "$w/seed" add -A
@@ -97,10 +104,10 @@ bump_origin() {
 land_crosscheck_ignore_fix() {
   local w=$1
   git -C "$w/seed" pull -q origin main >/dev/null 2>&1 || true
-  {
-    printf '/config/\n'
-    printf '/.*.crosscheck.lock\n'
-  } >> "$w/seed/.gitignore"
+  cp "$ROOT/.gitignore" "$w/seed/.gitignore"
+  cp "$ROOT/bin/fm-ff-lib.sh" "$w/seed/bin/fm-ff-lib.sh"
+  cp "$ROOT/.agents/skills/updatefirstmate/SKILL.md" \
+    "$w/seed/.agents/skills/updatefirstmate.md"
   printf 'crosscheck ignore fix\n' >> "$w/seed/README.md"
   git -C "$w/seed" add -A
   git -C "$w/seed" commit -qm 'ignore home-local crosscheck artifacts'
@@ -109,7 +116,22 @@ land_crosscheck_ignore_fix() {
 
 run_update() {
   local w=$1
-  FM_ROOT_OVERRIDE="$w/main" FM_HOME="$w/home" "$UPDATE" 2>/dev/null
+  FM_ROOT_OVERRIDE="$w/main" FM_HOME="$w/home" "$w/main/bin/fm-update.sh" 2>/dev/null
+}
+
+run_artifact_bootstrap_update() {
+  local w=$1 excludes result
+  excludes="$w/home/state/.fm-update-bootstrap-excludes"
+  printf '/config/\n/.*.crosscheck.lock\n' > "$excludes"
+  GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_KEY_0=core.excludesFile \
+  GIT_CONFIG_VALUE_0="$excludes" \
+  FM_ROOT_OVERRIDE="$w/main" \
+  FM_HOME="$w/home" \
+    "$w/main/bin/fm-update.sh" 2>/dev/null
+  result=$?
+  unlink "$excludes"
+  return "$result"
 }
 
 # --- T1: main + secondmate behind, instruction change; FF, not a merge ------
@@ -181,7 +203,9 @@ test_dirty_secondmate_skipped() {
 }
 
 test_crosscheck_artifacts_do_not_strand_stale_homes() {
-  local w out main_before secondmate_before target
+  local w stale_out out main_before secondmate_before target
+  local main_inventory_before secondmate_inventory_before target_inventory
+  local main_inventory_after secondmate_inventory_after
   w=$(new_world crosscheck-artifacts)
   add_sm "$w" sm1
   mkdir -p "$w/main/config" "$w/sm1/config"
@@ -196,10 +220,22 @@ test_crosscheck_artifacts_do_not_strand_stale_homes() {
     || fail "precondition: secondmate artifacts did not dirty the stale checkout"
   main_before=$(git -C "$w/main" rev-parse HEAD)
   secondmate_before=$(git -C "$w/sm1" rev-parse HEAD)
+  main_inventory_before=$(git -C "$w/main" ls-files | LC_ALL=C sort)
+  secondmate_inventory_before=$(git -C "$w/sm1" ls-files | LC_ALL=C sort)
   land_crosscheck_ignore_fix "$w"
   target=$(git -C "$w/seed" rev-parse HEAD)
+  target_inventory=$(git -C "$w/seed" ls-tree -r --name-only "$target" | LC_ALL=C sort)
 
-  out=$(run_update "$w")
+  stale_out=$(run_update "$w")
+  assert_contains "$stale_out" "firstmate: skipped: dirty working tree" \
+    "stale firstmate entrypoint reproduced its pre-fix rejection"
+  assert_contains "$stale_out" "secondmate sm1: skipped: dirty working tree" \
+    "stale secondmate path reproduced its pre-fix rejection"
+  [ "$(git -C "$w/main" rev-parse HEAD)" = "$main_before" ] \
+    && [ "$(git -C "$w/sm1" rev-parse HEAD)" = "$secondmate_before" ] \
+    || fail "stale updater moved an artifact-dirty home before bootstrapping"
+
+  out=$(run_artifact_bootstrap_update "$w")
 
   assert_contains "$out" "firstmate: updated " \
     "artifact-only dirty firstmate fast-forwarded onto the ignore fix"
@@ -209,6 +245,14 @@ test_crosscheck_artifacts_do_not_strand_stale_homes() {
     || fail "firstmate did not advance to the ignore fix"
   [ "$secondmate_before" != "$target" ] && [ "$(git -C "$w/sm1" rev-parse HEAD)" = "$target" ] \
     || fail "secondmate did not advance to the ignore fix"
+  main_inventory_after=$(git -C "$w/main" ls-files | LC_ALL=C sort)
+  secondmate_inventory_after=$(git -C "$w/sm1" ls-files | LC_ALL=C sort)
+  [ "$main_inventory_before" = "$main_inventory_after" ] \
+    && [ "$main_inventory_after" = "$target_inventory" ] \
+    || fail "firstmate tracked-file inventory changed across the bootstrap update"
+  [ "$secondmate_inventory_before" = "$secondmate_inventory_after" ] \
+    && [ "$secondmate_inventory_after" = "$target_inventory" ] \
+    || fail "secondmate tracked-file inventory changed across the bootstrap update"
   [ -z "$(git -C "$w/main" status --porcelain)" ] \
     || fail "firstmate remained dirty after landing the ignore fix"
   [ -z "$(git -C "$w/sm1" status --porcelain)" ] \
@@ -218,6 +262,8 @@ test_crosscheck_artifacts_do_not_strand_stale_homes() {
     && [ -f "$w/sm1/config/crosscheck-reviewer.json" ] \
     && [ -f "$w/sm1/.example-secondmate.crosscheck.lock" ] \
     || fail "fm-update deleted a live local Crosscheck artifact"
+  [ ! -e "$w/home/state/.fm-update-bootstrap-excludes" ] \
+    || fail "artifact bootstrap left its temporary excludes file behind"
   pass "Crosscheck artifacts remain on disk while stale homes become clean and fast-forwardable"
 }
 
@@ -232,7 +278,7 @@ test_crosscheck_tolerance_does_not_hide_unrelated_dirt() {
   before=$(git -C "$w/sm1" rev-parse HEAD)
   land_crosscheck_ignore_fix "$w"
 
-  out=$(run_update "$w")
+  out=$(run_artifact_bootstrap_update "$w")
 
   assert_contains "$out" "secondmate sm1: skipped: dirty working tree" \
     "unrelated untracked dirt still blocked the fast-forward"
@@ -244,7 +290,7 @@ test_crosscheck_tolerance_does_not_hide_unrelated_dirt() {
 }
 
 test_repo_gitignores_every_documented_local_config() {
-  local config_path ignored_tracked
+  local label root_path sibling_path config_path ignored_tracked
   while IFS= read -r config_path; do
     [ -n "$config_path" ] || continue
     git -C "$ROOT" check-ignore --quiet --no-index "$config_path" \
@@ -254,18 +300,29 @@ test_repo_gitignores_every_documented_local_config() {
       | grep -Eo 'config/[A-Za-z0-9_.-]+' \
       | LC_ALL=C sort -u
   )
-  git -C "$ROOT" check-ignore --quiet --no-index .example.crosscheck.lock \
-    || fail "root Crosscheck lock files are not ignored"
+  while IFS='|' read -r label root_path sibling_path; do
+    git -C "$ROOT" check-ignore --quiet --no-index "$root_path" \
+      || fail "$label root artifact is not ignored: $root_path"
+    if git -C "$ROOT" check-ignore --quiet --no-index "$sibling_path"; then
+      fail "$label ignore pattern leaked into a sibling path: $sibling_path"
+    fi
+  done <<'EOF'
+state|state/example|nested/state/example
+data|data/example|nested/data/example
+projects|projects/example|nested/projects/example
+.no-mistakes|.no-mistakes/example|nested/.no-mistakes/example
+.lavish|.lavish/example|nested/.lavish/example
+.fm-secondmate-home|.fm-secondmate-home|nested/.fm-secondmate-home
+config|config/example|nested/config/example
+Crosscheck lock|.example.crosscheck.lock|nested/.example.crosscheck.lock
+EOF
   if git -C "$ROOT" check-ignore --quiet --no-index .unrelated.lock; then
     fail "the Crosscheck pattern also ignored an unrelated root lock"
-  fi
-  if git -C "$ROOT" check-ignore --quiet --no-index nested/.example.crosscheck.lock; then
-    fail "the root Crosscheck pattern also ignored a nested lock"
   fi
   ignored_tracked=$(git -C "$ROOT" ls-files -ci --exclude-standard)
   [ -z "$ignored_tracked" ] \
     || fail "tracked files became ignored: $ignored_tracked"
-  pass "Every documented local config and root Crosscheck lock is ignored without masking tracked files"
+  pass "Generated roots and local config are ignored without sibling leaks or masked tracked files"
 }
 
 # --- T5: diverged secondmate is skipped, its commit preserved --------------

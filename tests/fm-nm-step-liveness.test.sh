@@ -44,6 +44,9 @@ mkdir -p "$WT"
 STARTED_PIDS=""
 kill_tree() {  # <pid>
   local child
+  # Freeze the parent before enumerating descendants so a turnover fixture
+  # cannot spawn a replacement child between the pgrep and kill operations.
+  kill -STOP "$1" 2>/dev/null || true
   for child in $(pgrep -P "$1" 2>/dev/null); do
     kill_tree "$child"
   done

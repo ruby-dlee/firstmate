@@ -1158,7 +1158,7 @@ started = time.monotonic()
 try:
     module.run_command(
         ["/bin/bash", "-c", "exec 1>&- 2>&-; sleep 2"],
-        timeout=0.3,
+        timeout=1,
         description="closed-pipe command",
     )
 except module.CrosscheckError as exc:

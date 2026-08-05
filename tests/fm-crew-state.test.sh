@@ -521,13 +521,18 @@ test_quiet_step_reports_alive_liveness() {
   # unit of work is exercised too and not just the bare verdict.
   ( cd "$nmwt" && exec sh -c 'sleep 30 & wait' ) &
   local sleeper=$!
-  local out=""
-  local _
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    out=$(run_crew_state "$d" feat-q)
-    case "$out" in *"liveness: alive"*" on "*) break ;; esac
-    sleep 0.3
-  done
+  local newcomer out
+  FM_NM_MIN_WINDOW=0 FM_NM_SNAP_DIR="$d/snapshots" \
+    run_crew_state "$d" feat-q >/dev/null
+  # Presence alone is deliberately unknown on the first observation. Start a
+  # new unit of work before the second observation so the cross-heartbeat probe
+  # has deterministic evidence of progress without a wall-clock wait.
+  ( cd "$nmwt" && exec sleep 30 ) &
+  newcomer=$!
+  out=$(FM_NM_MIN_WINDOW=0 FM_NM_SNAP_DIR="$d/snapshots" \
+    run_crew_state "$d" feat-q)
+  kill -9 "$newcomer" 2>/dev/null || true
+  wait "$newcomer" 2>/dev/null || true
   pkill -9 -P "$sleeper" 2>/dev/null || true
   kill -9 "$sleeper" 2>/dev/null || true
   wait "$sleeper" 2>/dev/null || true

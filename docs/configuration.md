@@ -353,8 +353,9 @@ See [`docs/examples/provision-relvino.json`](examples/provision-relvino.json) fo
 `components` is required and every component needs a `name`.
 Every other field is optional.
 `kinds` defaults to `["ship"]`, so scouts are skipped unless the manifest lists them or the spawn passes `--provision`; a scout that only reads code does not need a toolchain.
+A no-manifest or excluded-kind skip is a true no-op: it creates no provision record or log, appends no brief section, and publishes no `path_prepend`.
 `on_failure` is `warn` or `block` and defaults to `warn`; the reasoning behind that default lives in `bin/fm-provision.sh`'s header.
-`timeout_seconds` bounds the whole run and `step_timeout_seconds` is the per-step default, which a step overrides with its own `timeout_seconds`.
+`timeout_seconds` bounds the whole run, including reset deletions, and `step_timeout_seconds` is the per-step default, which a step overrides with its own `timeout_seconds`.
 Every step is a `{name, argv, timeout_seconds}` object; `argv` is an argument vector rather than a shell string, so quoting is unambiguous and `["sh", "-c", "..."]` is the explicit opt-in when a shell is genuinely wanted.
 `${HOME}` and `${WORKTREE}` are the only tokens that expand in manifest strings, so a manifest can name a host runtime directory or a path inside the lease without being rewritten per worktree, and a manifest is never a shell.
 
@@ -364,14 +365,15 @@ Without it, provisioning could build a project under its pinned runtime while th
 A component's `env` may not set `PATH`; use `path_prepend`, so a manifest cannot route around its own runtime checks.
 
 `runtime_checks` run before anything is built, so a component is never compiled or installed under the wrong runtime.
-A check with `expect` must print exactly that value; a check that prints nothing never satisfies an `expect`.
+A runtime check or probe with `expect` must print exactly that value; one that prints nothing never satisfies an `expect`.
 The value a step contributes - to `expect` and to a fingerprint - is its last non-empty output line, trimmed.
 
 `fingerprint` is what makes an unchanged environment reusable.
 Reuse requires both a matching digest over the declared `files` and `versions` AND passing `probes`; probes run on every invocation, so a merely existing directory is never assumed healthy, and a fingerprint hit whose probes fail rebuilds instead.
 Put `fingerprint.path` inside the tree it describes, such as `.venv/` or `node_modules/`, so deleting the environment deletes its claim of health.
-A `versions` command must be independent of the thing it fingerprints; the value is recomputed after a build and refused if it changed, which the verdict reports rather than silently rebuilding on every future lease.
-`dir`, `reset` paths, and `fingerprint.path` must all resolve inside the worktree.
+A `versions` command must be independent of the thing it fingerprints; the value is recomputed after a build, and the fingerprint is recorded only when both readings are non-empty and equal.
+If those readings differ, including an empty-to-non-empty transition, the verdict reports the refusal rather than silently rebuilding on every future lease.
+Existing ancestors of `dir`, `reset`, fingerprint input, and `fingerprint.path` paths are resolved before use; symlinks and physical escapes from the worktree are refused before reads, writes, or deletion.
 
 `bin/fm-spawn.sh` takes `--provision` to force provisioning for one spawn, including for a kind the manifest excludes, and `--no-provision` to skip it entirely.
 Both apply to every pair of a batch spawn.

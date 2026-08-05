@@ -3247,12 +3247,12 @@ fi
 # fm-provision.sh owns everything project-specific through a per-project
 # manifest; this call stays project-agnostic. With no manifest for the project it
 # is a single file test, so a spawn for any other project is unchanged.
-# fm-provision.sh's header owns the readiness contract and the exit codes; the
-# only decision made here is what a failure does to the spawn, and that follows
-# the manifest's declared policy: exit 4 (block) aborts, exit 3 (warn) continues
-# loudly. Everything else here just makes the outcome impossible to miss.
+# fm-provision.sh's header owns the readiness contract and the exit codes. A
+# skipped verdict is a true no-op with no state artifact, brief section, or PATH
+# handoff. Only status=ready publishes readiness; failures follow the manifest's
+# policy, where exit 4 blocks and exit 3 continues loudly.
 provision_worktree() {
-  local status=0 verdict='' reason banner_state
+  local status=0 verdict='' verdict_status='' reason banner_state
   [ "$PROVISION_MODE" != off ] || return 0
   [ "$KIND" != secondmate ] || return 0
   [ "$BACKEND" != orca ] || return 0
@@ -3261,18 +3261,28 @@ provision_worktree() {
   local provision_args=(--task "$ID" --kind "$KIND")
   [ "$PROVISION_MODE" != force ] || provision_args+=(--force)
   verdict=$("$SCRIPT_DIR/fm-provision.sh" "$PROJ_ABS" "$WT" "${provision_args[@]}") || status=$?
-  case "$status" in
-    0)
+  if [ "$status" -eq 0 ]; then
+    verdict_status=$(printf '%s' "$verdict" | jq -r '.status // ""' 2>/dev/null || true)
+    case "$verdict_status" in
+      ready)
       PROVISION_PATH_PREPEND=$(printf '%s' "$verdict" | jq -r '.path_prepend // ""' 2>/dev/null || true)
       spawn_brief_provision_note "$verdict" ready
       return 0
       ;;
+      skipped) return 0 ;;
+      *) status=3 ;;
+    esac
+  fi
+  case "$status" in
     3) banner_state=continuing ;;
     4) banner_state=aborting ;;
     *) banner_state=continuing ;;
   esac
   PROVISION_PATH_PREPEND=
   reason=$(printf '%s' "$verdict" | jq -r '.reason // ""' 2>/dev/null || true)
+  if [ -z "$reason" ] && [ -n "$verdict_status" ]; then
+    reason="provisioning exited successfully with non-ready status '$verdict_status'"
+  fi
   [ -n "$reason" ] || reason="provisioning failed without a readable reason (exit $status)"
   echo "################################################################" >&2
   echo "# fm-spawn: WORKTREE PROVISIONING FAILED for fm-$ID ($banner_state)" >&2

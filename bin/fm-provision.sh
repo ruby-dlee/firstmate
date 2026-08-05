@@ -43,16 +43,20 @@
 #     .venv/), so it cannot outlive that tree. This script never creates that
 #     parent directory just to record a fingerprint.
 #   - A fingerprint version command must be independent of the thing it
-#     fingerprints. The value is recomputed after a build, and if it changed the
-#     fingerprint is not recorded and the verdict says why, instead of silently
-#     recording a value that can never match and rebuilding on every lease.
+#     fingerprints. The value is recomputed after a build, and a fingerprint is
+#     recorded only when both values are non-empty and equal. A changed value is
+#     reported instead of silently recording a digest that can never match and
+#     rebuilding on every lease.
 #     (`uv python find 3.11` is exactly this trap: it resolves the project's own
 #     .venv once one exists. Use `uv python find --system 3.11`.)
-#   - Every step is time-bounded. Timeouts are the reason this exists: the
-#     original failure was an import that hung for over five minutes and ran zero
-#     assertions. A bounded step reports a timeout instead of stalling a lease.
-#   - Manifest paths are contained: a component directory, a reset path, and a
-#     fingerprint path must all resolve inside the worktree.
+#   - Every step is bounded by its local limit and the whole-run budget, and
+#     every reset is bounded by the whole-run budget. Timeouts are the reason
+#     this exists: the original failure was an import that hung for over five
+#     minutes and ran zero assertions. A bounded operation reports a timeout
+#     instead of stalling a lease.
+#   - Manifest paths are contained: existing ancestors are resolved, symlinks
+#     are refused, and component, reset, input, and fingerprint paths must stay
+#     physically inside the worktree.
 #
 # FAILURE POLICY
 #   The manifest's on_failure decides, and the DEFAULT IS "warn": a provisioning
@@ -75,9 +79,10 @@
 # OUTPUT
 #   stdout: exactly one compact JSON verdict (schema fm-provision.v1).
 #   stderr: human progress and failure reasons.
-#   With --task <id>, the verdict is also written to $FM_STATE/<id>.provision and
-#   the full step log to $FM_STATE/<id>.provision.log, so a failure stays
-#   diagnosable long after the spawn output scrolled away.
+#   With --task <id>, an applicable run also writes the verdict to
+#   $FM_STATE/<id>.provision and the full step log to
+#   $FM_STATE/<id>.provision.log, so a failure stays diagnosable long after the
+#   spawn output scrolled away. A skipped run creates neither artifact.
 #   A step's captured value - what "expect" compares against, and what a
 #   fingerprint version command contributes - is its LAST non-empty output line,
 #   trimmed. Commands that trail their value with chatter need a wrapper that
@@ -170,6 +175,14 @@ case "$TASK_ID" in
   *[!A-Za-z0-9._-]*) die_usage "task id must be [A-Za-z0-9._-]" ;;
 esac
 
+if [ -z "$MANIFEST" ]; then
+  MANIFEST=$(manifest_for_project "$PROJECT") || die_usage "cannot derive a manifest path"
+fi
+if [ ! -f "$MANIFEST" ]; then
+  printf '{"schema":"fm-provision.v1","status":"skipped","reason":"no provisioning manifest","path_prepend":"","components":[]}\n'
+  exit 0
+fi
+
 PROJECT_REAL=$(cd "$PROJECT" 2>/dev/null && pwd -P) || die_usage "project directory is unreadable: $PROJECT"
 WORKTREE_REAL=$(cd "$WORKTREE" 2>/dev/null && pwd -P) || die_usage "worktree directory is unreadable: $WORKTREE"
 PROJECT_NAME=$(basename "$PROJECT_REAL")
@@ -178,18 +191,34 @@ PROJECT_NAME=$(basename "$PROJECT_REAL")
 RECORD_FILE=
 if [ -n "$TASK_ID" ] && [ -d "$STATE" ]; then
   RECORD_FILE="$STATE/$TASK_ID.provision"
-  LOG_FILE="$STATE/$TASK_ID.provision.log"
-  : > "$LOG_FILE" 2>/dev/null || LOG_FILE=
 fi
 
 # --- verdict emission -------------------------------------------------------
 
-COMPONENT_RECORDS=$(mktemp "${TMPDIR:-/tmp}/fm-provision-components.XXXXXX") || exit 2
-WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-provision.XXXXXX") || exit 2
-trap 'rm -f "$COMPONENT_RECORDS"; rm -rf "$WORK_DIR"' EXIT
+COMPONENT_RECORDS=
+WORK_DIR=
+
+# shellcheck disable=SC2329
+cleanup() {
+  [ -z "$COMPONENT_RECORDS" ] || /bin/rm -f "$COMPONENT_RECORDS"
+  [ -z "$WORK_DIR" ] || /bin/rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
 
 POLICY=warn
 PATH_PREPEND=
+
+activate_artifacts() {
+  [ -z "$LOG_FILE" ] || return 0
+  [ -n "$RECORD_FILE" ] || return 0
+  LOG_FILE="$STATE/$TASK_ID.provision.log"
+  : > "$LOG_FILE" 2>/dev/null || LOG_FILE=
+}
+
+init_work_area() {
+  COMPONENT_RECORDS=$(mktemp "${TMPDIR:-/tmp}/fm-provision-components.XXXXXX") || return 1
+  WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-provision.XXXXXX") || return 1
+}
 
 # emit <status> <reason>: print the one JSON verdict, mirror it to the task
 # record, and exit with the code that status maps to. A non-ready verdict never
@@ -197,7 +226,8 @@ PATH_PREPEND=
 # that did not finish proving it.
 emit() {
   local status=$1 reason=$2 verdict code=0 components='[]'
-  if [ -s "$COMPONENT_RECORDS" ]; then
+  [ "$status" = skipped ] || activate_artifacts
+  if [ -n "$COMPONENT_RECORDS" ] && [ -s "$COMPONENT_RECORDS" ]; then
     components=$(jq -c -s '.' "$COMPONENT_RECORDS" 2>/dev/null) || components='[]'
     [ -n "$components" ] || components='[]'
   fi
@@ -217,7 +247,7 @@ emit() {
     2>/dev/null)
   [ -n "$verdict" ] || verdict="{\"schema\":\"fm-provision.v1\",\"status\":\"failed\",\"reason\":\"verdict could not be encoded\",\"policy\":\"$POLICY\",\"path_prepend\":\"\",\"components\":[]}"
   printf '%s\n' "$verdict"
-  if [ -n "$RECORD_FILE" ]; then
+  if [ "$status" != skipped ] && [ -n "$RECORD_FILE" ]; then
     printf '%s\n' "$verdict" > "$RECORD_FILE" 2>/dev/null || true
   fi
   log_line "verdict: $verdict"
@@ -236,19 +266,8 @@ record_component() {
 
 # --- manifest ---------------------------------------------------------------
 
-if [ -z "$MANIFEST" ]; then
-  MANIFEST=$(manifest_for_project "$PROJECT_REAL") || die_usage "cannot derive a manifest path"
-fi
-if [ ! -f "$MANIFEST" ]; then
-  MANIFEST=
-  command -v jq >/dev/null 2>&1 || { printf '{"schema":"fm-provision.v1","status":"skipped","reason":"no provisioning manifest","path_prepend":"","components":[]}\n'; exit 0; }
-  emit skipped "no provisioning manifest for $PROJECT_NAME"
-fi
-
 if ! command -v jq >/dev/null 2>&1; then
-  printf 'fm-provision: jq is required to read %s\n' "$MANIFEST" >&2
-  printf '{"schema":"fm-provision.v1","status":"failed","reason":"jq is required to read the provisioning manifest","policy":"warn","path_prepend":"","components":[]}\n'
-  exit 3
+  emit failed "jq is required to read the provisioning manifest"
 fi
 
 MANIFEST_JSON=$(jq -c '.' "$MANIFEST" 2>/dev/null) || emit failed "manifest is not valid JSON: $MANIFEST"
@@ -280,6 +299,9 @@ if [ "$FORCE" != 1 ]; then
   esac
 fi
 
+activate_artifacts
+init_work_area || emit failed "temporary provisioning workspace could not be created"
+
 COMPONENT_COUNT=$(mq '.components | length')
 case "$COMPONENT_COUNT" in ''|*[!0-9]*) emit failed "manifest has no readable components array" ;; esac
 [ "$COMPONENT_COUNT" -gt 0 ] || emit failed "manifest declares no components"
@@ -299,25 +321,58 @@ expand_tokens() {
   printf '%s' "$out"
 }
 
-# contained_path <base> <relative>: echo the absolute path of <relative> under
-# <base>, refusing absolute inputs and any traversal that escapes <base>.
+# contained_path <base> <relative>: echo a physically contained path, refusing
+# absolute inputs, symlinks, non-directory ancestors, and traversal escapes.
 contained_path() {
-  local base=$1 rel=$2 candidate resolved parent
+  local base=$1 rel=$2 base_real resolved rest part next physical
   case "$rel" in
     ''|/*) return 1 ;;
   esac
-  candidate="$base/$rel"
-  case "$rel" in
-    *..*)
-      parent=$(cd "$(dirname "$candidate")" 2>/dev/null && pwd -P) || return 1
-      resolved="$parent/$(basename "$candidate")"
-      case "$resolved" in
-        "$base"|"$base"/*) printf '%s' "$resolved"; return 0 ;;
-        *) return 1 ;;
-      esac
-      ;;
-  esac
-  printf '%s' "$candidate"
+  base_real=$(cd "$base" 2>/dev/null && pwd -P) || return 1
+  resolved=$base_real
+  rest=$rel
+  while :; do
+    part=${rest%%/*}
+    if [ "$rest" = "$part" ]; then
+      rest=
+    else
+      rest=${rest#*/}
+    fi
+    case "$part" in
+      ''|.) ;;
+      ..)
+        [ "$resolved" != "$base_real" ] || return 1
+        resolved=${resolved%/*}
+        case "$resolved" in
+          "$base_real"|"$base_real"/*) ;;
+          *) return 1 ;;
+        esac
+        ;;
+      *)
+        next="$resolved/$part"
+        [ ! -L "$next" ] || return 1
+        if [ -e "$next" ]; then
+          if [ -n "$rest" ] && [ ! -d "$next" ]; then
+            return 1
+          fi
+          if [ -d "$next" ]; then
+            physical=$(cd "$next" 2>/dev/null && pwd -P) || return 1
+          else
+            physical=$next
+          fi
+          case "$physical" in
+            "$base_real"|"$base_real"/*) ;;
+            *) return 1 ;;
+          esac
+          resolved=$physical
+        else
+          resolved=$next
+        fi
+        ;;
+    esac
+    [ -n "$rest" ] || break
+  done
+  printf '%s' "$resolved"
 }
 
 # --- bounded execution ------------------------------------------------------
@@ -330,7 +385,7 @@ run_bounded() {
   local seconds=$1 marker=$2
   shift 2
   local pid watchdog status=0 waited=0
-  rm -f "$marker"
+  /bin/rm -f "$marker"
   set -m
   "$@" &
   pid=$!
@@ -352,7 +407,7 @@ run_bounded() {
   kill -TERM "$watchdog" 2>/dev/null || true
   wait "$watchdog" 2>/dev/null || true
   if [ -e "$marker" ]; then
-    rm -f "$marker"
+    /bin/rm -f "$marker"
     return 124
   fi
   return "$status"
@@ -390,7 +445,7 @@ step_argv() {
 # on failure, STEP_FAILURE to a diagnosable reason.
 run_step() {
   local label=$1 cwd=$2 step=$3
-  local timeout name budget status out_file
+  local timeout name budget status out_file expect actual
   STEP_OUT=
   STEP_FAILURE=
   name=$(printf '%s' "$step" | jq -r '.name // ""' 2>/dev/null)
@@ -430,6 +485,19 @@ run_step() {
     STEP_FAILURE="$label '$name' exited $status"
     [ -z "$STEP_OUT" ] || STEP_FAILURE="$STEP_FAILURE: $STEP_OUT"
     return 1
+  fi
+  expect=$(printf '%s' "$step" | jq -r '.expect // ""' 2>/dev/null)
+  if [ -n "$expect" ]; then
+    actual=$STEP_OUT
+    expect=$(expand_tokens "$expect")
+    if [ -z "$actual" ]; then
+      STEP_FAILURE="$label '$name' printed nothing, expected '$expect'"
+      return 1
+    fi
+    if [ "$actual" != "$expect" ]; then
+      STEP_FAILURE="$label '$name' reported '$actual', expected '$expect'"
+      return 1
+    fi
   fi
   return 0
 }
@@ -532,14 +600,29 @@ run_probes() {
 }
 
 run_install() {
-  local comp=$1 dir=$2 rel abs step
+  local comp=$1 dir=$2 rel abs step budget status
   while IFS= read -r -d '' rel; do
     if ! abs=$(contained_path "$dir" "$(expand_tokens "$rel")"); then
       STEP_FAILURE="reset path escapes the component directory: $rel"
       return 1
     fi
-    log_line "=== reset :: rm -rf $abs"
-    rm -rf "$abs" || { STEP_FAILURE="cannot remove $abs"; return 1; }
+    budget=$(remaining_budget)
+    if [ "$budget" -le 0 ]; then
+      STEP_FAILURE="reset '$rel' skipped: the ${TOTAL_TIMEOUT}s provisioning budget is exhausted"
+      return 1
+    fi
+    log_line "=== reset :: rm -rf $abs (timeout ${budget}s)"
+    status=0
+    run_bounded "$budget" "$WORK_DIR/reset.timeout" rm -rf -- "$abs" || status=$?
+    log_line "--- exit $status"
+    if [ "$status" -eq 124 ]; then
+      STEP_FAILURE="reset '$rel' timed out after ${budget}s"
+      return 1
+    fi
+    if [ "$status" -ne 0 ]; then
+      STEP_FAILURE="cannot remove $abs (exit $status)"
+      return 1
+    fi
   done < <(printf '%s' "$comp" | jq -j '.reset[]? | tostring + "\u0000"' 2>/dev/null)
   while IFS= read -r -d '' step; do
     run_step install "$dir" "$step" || return 1
@@ -578,7 +661,7 @@ write_fingerprint() {
 
 run_component() {
   local comp=$1
-  local name dir_rel dir fp_path result detail check expect actual built
+  local name dir_rel dir fp_path result detail check built
   name=$(printf '%s' "$comp" | jq -r '.name // ""' 2>/dev/null)
   if [ -z "$name" ]; then
     FAILURE_REASON="a component has no name"
@@ -613,18 +696,6 @@ run_component() {
     if ! run_step "runtime check" "$dir" "$check"; then
       FAILURE_REASON="component $name: ${STEP_FAILURE:-runtime check failed}"
       return 1
-    fi
-    expect=$(printf '%s' "$check" | jq -r '.expect // ""' 2>/dev/null)
-    if [ -n "$expect" ]; then
-      actual=$STEP_OUT
-      if [ -z "$actual" ]; then
-        FAILURE_REASON="component $name: runtime check printed nothing, expected '$expect'"
-        return 1
-      fi
-      if [ "$actual" != "$(expand_tokens "$expect")" ]; then
-        FAILURE_REASON="component $name: runtime check reported '$actual', expected '$expect'"
-        return 1
-      fi
     fi
   done < <(printf '%s' "$comp" | jq -j '.runtime_checks[]? | tostring + "\u0000"' 2>/dev/null)
 
@@ -670,12 +741,14 @@ run_component() {
   # to record it turns that manifest bug into a visible one instead.
   built=$FINGERPRINT
   component_fingerprint "$comp" "$dir"
-  if [ -n "$built" ] && [ -n "$FINGERPRINT" ] && [ "$built" != "$FINGERPRINT" ]; then
+  if [ "$built" != "$FINGERPRINT" ]; then
     detail="$detail; fingerprint not recorded: a version command's value changed across the build, so it depends on what it fingerprints"
     note "$name: $detail"
     log_line "fingerprint: unstable across the build; not recorded"
-  else
+  elif [ -n "$built" ] && [ -n "$FINGERPRINT" ]; then
     write_fingerprint "$dir" "$fp_path"
+  else
+    log_line "fingerprint: unavailable before and after the build; not recorded"
   fi
   record_component "$name" "$result" "$detail"
   return 0

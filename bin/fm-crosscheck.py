@@ -24,6 +24,12 @@ from typing import Any, NoReturn
 import unicodedata
 
 
+if sys.version_info < (3, 9):
+    raise SystemExit(
+        "CROSSCHECK UNREVIEWED: this gate requires Python 3.9 or newer, "
+        f"but {sys.executable} is {'.'.join(str(part) for part in sys.version_info[:3])}"
+    )
+
 BIN_DIR = Path(__file__).resolve().parent
 if str(BIN_DIR) not in sys.path:
     sys.path.insert(0, str(BIN_DIR))
@@ -437,6 +443,178 @@ def run_sandboxed(
     )
 
 
+MAX_SEEDED_CONFIG_BYTES = 4 * 1024 * 1024
+CREDENTIALS_NAME = ".credentials.json"
+
+
+def seed_reviewer_home(protocol_dir: Path, account_home: Path) -> Path:
+    """Project the reviewer account into a writable home inside the checkout.
+
+    The reviewer harness must create session and shell-snapshot state before its
+    command-execution tool works, and the sandbox denies every write outside the
+    review checkout. Redirecting the harness config directory here keeps that
+    state inside the boundary instead of widening the profile to the real
+    account home. Identity is not copied: ``run_reviewer`` pins the harness
+    credential store back at ``account_home`` so account separation survives the
+    redirect and no secret is duplicated onto disk.
+    """
+    home = protocol_dir / "reviewer-home"
+    home.mkdir(mode=0o700)
+    try:
+        entries = sorted(account_home.iterdir(), key=lambda entry: entry.name)
+    except OSError as exc:
+        fail(f"reviewer account home is unreadable at {account_home}: {exc}")
+    for entry in entries:
+        destination = home / entry.name
+        try:
+            if entry.is_symlink():
+                os.symlink(os.readlink(entry), destination)
+            elif entry.is_dir():
+                # Fresh and empty: the harness owns this state for one run, and
+                # a symlink here would send its writes back outside the sandbox.
+                destination.mkdir(mode=0o700)
+            elif entry.name == CREDENTIALS_NAME:
+                # Read through to the account's own store rather than copying a
+                # secret into the checkout. A refresh write fails closed under
+                # the sandbox, which is the intended isolation.
+                os.symlink(str(entry), destination)
+            elif entry.is_file():
+                if entry.stat().st_size <= MAX_SEEDED_CONFIG_BYTES:
+                    shutil.copy2(entry, destination)
+        except OSError as exc:
+            fail(f"could not seed reviewer home entry {entry.name}: {exc}")
+    for name in ("session-env", "shell-snapshots", "statsig"):
+        (home / name).mkdir(mode=0o700, exist_ok=True)
+    return home
+
+
+def resolve_claude_binary(account_home: Path) -> str:
+    """Resolve a Claude executable that honours the harness config directory.
+
+    A launcher earlier on ``PATH`` may unset ``CLAUDE_CONFIG_DIR`` to pin its own
+    account. Running that launcher would silently discard both the sandbox
+    redirect and the reviewer's account separation, so prefer the account's own
+    recorded provider binary. ``require_reviewer_execution`` still proves the
+    resolved binary actually ran under the intended directory.
+    """
+    override = environment_value("FM_CROSSCHECK_CLAUDE_BIN", "")
+    if override:
+        if "/" in override:
+            available = Path(override).is_file() and os.access(override, os.X_OK)
+        else:
+            available = shutil.which(override) is not None
+        if not available:
+            tool_fail(
+                "Claude reviewer executable inspection found no runnable "
+                f"FM_CROSSCHECK_CLAUDE_BIN={override!r}"
+            )
+        return override
+    pin = account_home / ".agent-fleet-provider-binary.json"
+    if pin.is_file():
+        try:
+            recorded = json.loads(pin.read_text(encoding="utf-8"))
+            candidate = recorded["binary"]["resolved_path"]
+        except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+            candidate = None
+        if (
+            isinstance(candidate, str)
+            and Path(candidate).is_file()
+            and os.access(candidate, os.X_OK)
+        ):
+            return candidate
+    discovered = shutil.which("claude")
+    if discovered is None:
+        tool_fail("Claude reviewer executable inspection found no runnable binary")
+    return str(discovered)
+
+
+def write_attestation(protocol_dir: Path) -> dict[str, str]:
+    """Author the execution beacon that proves the reviewer ran a command.
+
+    The digest can only be produced by executing the script, because its input
+    is handed to the harness through the environment and never written to the
+    checkout. A reviewer whose execution tool is dead therefore cannot fabricate
+    this file by reading or writing one.
+    """
+    nonce = hashlib.sha256(os.urandom(32)).hexdigest()
+    secret = hashlib.sha256(os.urandom(32)).hexdigest()
+    script = protocol_dir / "attest.sh"
+    script.write_text(
+        "#!/bin/bash\n"
+        "set -u\n"
+        'out="$(dirname "$0")/attest.json"\n'
+        "if command -v sha256sum >/dev/null 2>&1; then\n"
+        '  digest=$(printf %s "$FM_CROSSCHECK_ATTEST_SECRET" | sha256sum | cut -d" " -f1)\n'
+        "else\n"
+        '  digest=$(printf %s "$FM_CROSSCHECK_ATTEST_SECRET" | shasum -a 256 | cut -d" " -f1)\n'
+        "fi\n"
+        'printf \'{"nonce":"%s","digest":"%s","pid":"%s","config_dir":"%s"}\\n\' '
+        f'"{nonce}" '
+        '"$digest" "$$" "${CLAUDE_CONFIG_DIR:-unset}" > "$out"\n'
+        "echo crosscheck-attestation-recorded\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o700)
+    return {
+        "script": str(script),
+        "secret": secret,
+        "nonce": nonce,
+        "digest": hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+    }
+
+
+def require_reviewer_execution(
+    protocol_dir: Path, attestation: dict[str, str], expected_config_dir: str | None
+) -> None:
+    """Fail closed unless the reviewer actually executed a command.
+
+    A reviewer whose execution tool is broken still returns a well-formed,
+    confident-looking verdict built from static reading alone. That verdict can
+    never meet this gate's evidentiary standard, so treat a missing attestation
+    as unreviewed rather than as a clear result.
+    """
+    path = protocol_dir / "attest.json"
+    require(
+        path.is_file(),
+        "reviewer executed no command: the mandatory execution attestation "
+        f"{path.name} is absent, so this review is static-only and cannot meet "
+        "the gate's executed-evidence standard",
+    )
+    recorded = read_json(
+        path, "reviewer execution attestation", maximum_bytes=64 * 1024, maximum_items=64
+    )
+    require(isinstance(recorded, dict), "reviewer execution attestation must be an object")
+    require(
+        recorded.get("nonce") == attestation["nonce"],
+        "reviewer execution attestation does not carry this run's nonce",
+    )
+    require(
+        recorded.get("digest") == attestation["digest"],
+        "reviewer execution attestation lacks the execution-only digest, so no "
+        "command actually ran in the reviewer's execution environment",
+    )
+    pid = str(recorded.get("pid", ""))
+    require(pid.isdigit() and int(pid) > 0, "reviewer execution attestation records no process id")
+    if expected_config_dir is not None:
+        require(
+            recorded.get("config_dir") == expected_config_dir,
+            "reviewer ran under harness config directory "
+            f"{recorded.get('config_dir')!r} instead of the isolated "
+            f"{expected_config_dir!r}; a launcher on PATH is discarding the "
+            "gate's directory redirect and its account separation",
+        )
+
+
+def attestation_instructions(script: str) -> str:
+    return (
+        "Before any other work, use your command-execution tool to run exactly:\n"
+        f"  bash {script}\n"
+        "It prints crosscheck-attestation-recorded. This proves your execution "
+        "tool works; the gate rejects the whole review as unreviewed without it. "
+        "If it fails, report that failure instead of reviewing statically.\n"
+    )
+
+
 def git(cwd: Path, *arguments: str, timeout: float = 60) -> str:
     result = run_command(["git", "-C", str(cwd), *arguments], timeout=timeout)
     if result.returncode != 0:
@@ -584,7 +762,12 @@ def validate_citation(
             else 60
         ),
     )
-    require(tracked.returncode == 0, f"{label}.path is not tracked at the reviewed head")
+    # Name the offending path: the temp checkout is destroyed right after this
+    # rejection, so a message without the value cannot be diagnosed afterwards.
+    require(
+        tracked.returncode == 0,
+        f"{label}.path is not tracked at the reviewed head: {relative!r}",
+    )
     try:
         line_count = len(candidate.read_text(encoding="utf-8", errors="replace").splitlines())
     except OSError as exc:
@@ -627,7 +810,9 @@ def safe_artifact(review_dir: Path, relative: str, prefix: str) -> Path:
         f"artifact is absent: {relative}",
     )
     try:
-        size = source_path.stat(follow_symlinks=False).st_size
+        # os.stat keeps follow_symlinks on Python 3.9, where Path.stat does not
+        # accept it and dies with a raw TypeError before the gate can run.
+        size = os.stat(source_path, follow_symlinks=False).st_size
     except OSError as exc:
         fail(f"artifact is unavailable: {relative}: {exc}")
     require(size <= MAX_CAPTURE, f"artifact exceeds {MAX_CAPTURE} bytes: {relative}")
@@ -1650,7 +1835,11 @@ def run_reviewer(
     output_path = protocol_dir / "review-result.json"
     schema_path.write_text(json.dumps(schema_value, indent=2) + "\n", encoding="utf-8")
     environment["HOME"] = config["execution_home"]
-    prompt = make_prompt(snapshot_value, ledger, config)
+    attestation = write_attestation(protocol_dir)
+    environment["FM_CROSSCHECK_ATTEST_SECRET"] = attestation["secret"]
+    prompt = attestation_instructions(attestation["script"]) + "\n" + make_prompt(
+        snapshot_value, ledger, config
+    )
     if config["harness"] == "codex":
         codex = reviewer_binary("FM_CROSSCHECK_CODEX_BIN", "codex", "Codex reviewer")
         environment["CODEX_HOME"] = config["account_home"]
@@ -1692,6 +1881,7 @@ def run_reviewer(
             f"reviewer exited {result.returncode} without an earned verdict: "
             f"{detail[:500] or 'no diagnostic'}",
         )
+        require_reviewer_execution(protocol_dir, attestation, None)
         return read_json(
             output_path,
             "reviewer verdict artifact",
@@ -1699,14 +1889,18 @@ def run_reviewer(
             maximum_items=4096,
         )
 
-    claude = reviewer_binary(
-        "FM_CROSSCHECK_CLAUDE_BIN", "claude", "Claude reviewer"
-    )
-    environment["CLAUDE_CONFIG_DIR"] = config["account_home"]
-    environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = config["account_home"]
+    claude = resolve_claude_binary(account_home)
+    # The harness writes session and scratch state before its execution tool
+    # works; keep every one of those writes inside the sandboxed checkout.
+    reviewer_home = seed_reviewer_home(protocol_dir, account_home)
     claude_tmp = protocol_dir / "claude-tmp"
-    claude_tmp.mkdir(mode=0o700)
+    claude_tmp.mkdir(mode=0o700, exist_ok=True)
+    environment["CLAUDE_CONFIG_DIR"] = str(reviewer_home)
     environment["CLAUDE_CODE_TMPDIR"] = str(claude_tmp)
+    environment["CLAUDE_TMPDIR"] = str(claude_tmp)
+    # Credentials stay in the real account home, so redirecting the config
+    # directory above cannot cost the reviewer its account separation.
+    environment["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(account_home)
     sandbox_path = protocol_dir / "claude-sandbox.sb"
     arguments = [
         claude,
@@ -1730,9 +1924,6 @@ def run_reviewer(
         cwd=review_dir,
         profile_path=sandbox_path,
         allow_network=True,
-        additional_writable_roots=(
-            Path(config["account_home"]),
-        ),
         env=environment,
         timeout=reviewer_timeout(),
         description="Claude reviewer",
@@ -1753,6 +1944,7 @@ def run_reviewer(
     require(envelope.get("subtype") == "success", "reviewer result did not complete successfully")
     require(envelope.get("terminal_reason") == "completed", "reviewer stopped before completion")
     require(isinstance(envelope.get("structured_output"), dict), "reviewer stopped without structured output")
+    require_reviewer_execution(protocol_dir, attestation, str(reviewer_home))
     return envelope["structured_output"]
 
 

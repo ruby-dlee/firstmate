@@ -151,6 +151,9 @@ done
 [ -f "$schema" ] || exit 98
 [ -n "$workdir" ] && [ -n "$output" ] || exit 99
 cat > "$FM_TEST_PROMPT_LOG"
+if [ "${FM_TEST_SKIP_ATTESTATION:-}" != 1 ]; then
+  bash "$workdir/.crosscheck/attest.sh" >/dev/null || exit 97
+fi
 if [ "$FM_TEST_REVIEW_SCENARIO" = noisy-reviewer ]; then
   python3 "$FM_TEST_REVIEW_DRIVER" "$workdir" "$output" "$FM_TEST_REVIEW_SCENARIO" "$FM_TEST_HEAD"
   python3 -c 'import sys; sys.stdout.write("R" * 210000)'
@@ -170,7 +173,6 @@ install_claude_fake() {
   cat > "$case_dir/fakebin/claude" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FM_TEST_CLAUDE_LOG"
-[ "${CLAUDE_CONFIG_DIR:-}" = "$FM_TEST_REVIEWER_HOME" ] || exit 80
 [ "${CLAUDE_SECURESTORAGE_CONFIG_DIR:-}" = "$FM_TEST_REVIEWER_HOME" ] || exit 73
 case "${HOME:-}" in
   "$PWD"/.crosscheck/claude-home) ;;
@@ -178,14 +180,24 @@ case "${HOME:-}" in
 esac
 [ "$(cd "$HOME/.claude" 2>/dev/null && pwd -P)" = "$FM_TEST_REVIEWER_HOME" ] \
   || exit 72
-case "${CLAUDE_CODE_TMPDIR:-}" in
-  "$PWD"/.crosscheck/claude-tmp) ;;
-  *) exit 76 ;;
-esac
+# Identity stays pinned at the reviewer account home, so redirecting the
+# harness config directory cannot cost the gate its account separation.
+# The writable harness config and scratch directories must sit inside the
+# sandboxed review checkout, never at the real account home.
+case "${CLAUDE_CONFIG_DIR:-}" in "$PWD"/.crosscheck/*) ;; *) exit 61 ;; esac
+case "${CLAUDE_CODE_TMPDIR:-}" in "$PWD"/.crosscheck/*) ;; *) exit 62 ;; esac
+[ -d "${CLAUDE_CONFIG_DIR}/session-env" ] || exit 63
+[ -d "${CLAUDE_CONFIG_DIR}/shell-snapshots" ] || exit 64
 mkdir -p "$CLAUDE_CODE_TMPDIR/bash-runtime" || exit 75
-mkdir -p "$HOME/.claude/session-env" || exit 77
-printf 'reviewer runtime state\n' > "$HOME/.claude/session-env/crosscheck-runtime" \
-  || exit 78
+printf 'reviewer runtime state\n' > \
+  "$CLAUDE_CONFIG_DIR/session-env/crosscheck-runtime" || exit 78
+if [ "${FM_TEST_STRIP_CONFIG_DIR:-}" = 1 ]; then
+  # Stand in for a launcher on PATH that pins its own account by discarding
+  # the gate's directory redirect.
+  env -u CLAUDE_CONFIG_DIR bash "$PWD/.crosscheck/attest.sh" >/dev/null || exit 66
+elif [ "${FM_TEST_SKIP_ATTESTATION:-}" != 1 ]; then
+  bash "$PWD/.crosscheck/attest.sh" >/dev/null || exit 65
+fi
 [ "${1:-}" = -p ] || exit 81
 shift
 model=
@@ -213,9 +225,9 @@ done
 [ -n "$schema" ] && [ -n "$prompt" ] || exit 86
 if [ "$FM_TEST_REVIEW_SCENARIO" != reading-only-suspicion ]; then
   if ! git -C "$PWD" diff "$FM_TEST_BASE..$FM_TEST_HEAD" -- app.txt \
-    > "$HOME/.claude/session-env/crosscheck-git-diff" \
-    2> "$HOME/.claude/session-env/crosscheck-git-diff.err"; then
-    cat "$HOME/.claude/session-env/crosscheck-git-diff.err" >&2
+    > "$CLAUDE_CONFIG_DIR/session-env/crosscheck-git-diff" \
+    2> "$CLAUDE_CONFIG_DIR/session-env/crosscheck-git-diff.err"; then
+    cat "$CLAUDE_CONFIG_DIR/session-env/crosscheck-git-diff.err" >&2
     exit 79
   fi
 fi
@@ -257,7 +269,7 @@ grep -qxF '(allow file-read*)' "$profile" || exit 73
 case "${3:-}" in
   */claude)
     grep -qxF '(allow network*)' "$profile" || exit 74
-    grep -qF "(subpath \"$FM_TEST_REVIEWER_HOME\")" "$profile" || exit 77
+    ! grep -qF "(subpath \"$FM_TEST_REVIEWER_HOME\")" "$profile" || exit 77
     if [ "$FM_TEST_AMBIENT_HOME" != "$FM_TEST_REVIEWER_HOME" ]; then
       ! grep -qF "(subpath \"$FM_TEST_AMBIENT_HOME/.claude/session-env\")" "$profile" \
         || exit 78
@@ -791,10 +803,10 @@ test_claude_reviewer_provides_model_separation_for_codex_author() {
   assert_contains "$output" 'crosscheck clear' "Claude reviewer did not earn a clear result"
   assert_grep '--model claude-opus-5 --effort xhigh --dangerously-skip-permissions --tools Bash,Read,Glob,Grep' "$case_dir/claude.log" \
     "Claude reviewer was not pinned to the observed policy-grade invocation"
-  assert_present "$case_dir/reviewer-home/session-env/crosscheck-runtime" \
-    "Claude reviewer could not write runtime state beneath its bound HOME"
-  assert_grep '+fixed' "$case_dir/reviewer-home/session-env/crosscheck-git-diff" \
-    "Claude reviewer did not execute git diff between the exact base and head"
+  assert_absent "$case_dir/reviewer-home/session-env/crosscheck-runtime" \
+    "Claude reviewer wrote runtime state into its credential account home"
+  assert_absent "$case_dir/reviewer-home/session-env/crosscheck-git-diff" \
+    "Claude reviewer wrote reproduction state into its credential account home"
   assert_absent "$HOME/.claude/session-env/crosscheck-runtime" \
     "Claude reviewer wrote runtime state beneath the ambient operator HOME"
   python3 -c '
@@ -1258,7 +1270,7 @@ PY
 }
 
 test_real_claude_sandbox_executes_exact_sha_git_diff() {
-  local repo base head nonce profile output event claude_bin sandbox_bin reviewer_home execution_home
+  local repo base head nonce profile output event claude_bin sandbox_bin reviewer_home execution_home reviewer_config_home
   if [ "${FM_TEST_REAL_CLAUDE_SANDBOX_GIT_DIFF:-0}" != 1 ]; then
     printf 'SKIP: real Claude sandbox exact-SHA git-diff proof; set FM_TEST_REAL_CLAUDE_SANDBOX_GIT_DIFF=1 and FM_TEST_REAL_CLAUDE_CONFIG_DIR\n'
     return
@@ -1311,27 +1323,33 @@ else:
 execution_home, credential_source, credential_identifier = (
     module.prepare_claude_execution_home(repo / ".crosscheck", reviewer_home)
 )
+reviewer_config_home = module.seed_reviewer_home(
+    repo / ".crosscheck", reviewer_home
+)
 module.write_sandbox_profile(
     profile,
     repo,
     allow_network=True,
-    additional_writable_roots=(reviewer_home,),
 )
 text = profile.read_text()
-assert f"  (subpath {json.dumps(str(reviewer_home))})" in text
+assert f"  (subpath {json.dumps(str(reviewer_home))})" not in text
 assert f"  (subpath {json.dumps(str(shared_session_env))})" not in text
 assert reviewer_session_env.is_relative_to(reviewer_home)
 assert execution_home == repo / ".crosscheck" / "claude-home"
 assert execution_home.joinpath(".claude").resolve() == reviewer_home
+assert reviewer_config_home == repo / ".crosscheck" / "reviewer-home"
+assert reviewer_config_home.joinpath("session-env").is_dir()
+assert reviewer_config_home.joinpath("shell-snapshots").is_dir()
 assert credential_source in {"oauth-file", "scoped-keychain"}
 assert credential_identifier
 assert f"  (subpath {json.dumps(str(repo.resolve() / '.crosscheck' / 'claude-tmp'))})" not in text
 PY
   execution_home="$repo/.crosscheck/claude-home"
+  reviewer_config_home="$repo/.crosscheck/reviewer-home"
   (
     cd "$repo" || exit 1
     HOME="$execution_home" \
-    CLAUDE_CONFIG_DIR="$reviewer_home" \
+    CLAUDE_CONFIG_DIR="$reviewer_config_home" \
     CLAUDE_SECURESTORAGE_CONFIG_DIR="$reviewer_home" \
     CLAUDE_CODE_TMPDIR="$repo/.crosscheck/claude-tmp" \
     "$sandbox_bin" -f "$profile" "$claude_bin" -p \
@@ -1361,7 +1379,7 @@ PY
     "real Claude Bash event was not bound to the temporary repository cwd"
   assert_grep "$repo/.crosscheck/claude-tmp" "$event" \
     "real Claude Bash event did not observe the isolated CLAUDE_CODE_TMPDIR"
-  python3 - "$output" "$base" "$head" "$nonce" "$repo" "$execution_home" "$reviewer_home" "$repo/.crosscheck/claude-tmp" <<'PY' \
+  python3 - "$output" "$base" "$head" "$nonce" "$repo" "$execution_home" "$reviewer_config_home" "$reviewer_home" "$repo/.crosscheck/claude-tmp" <<'PY' \
     || fail "real Claude output did not prove exact-SHA git diff with isolated scratch"
 import json
 import sys
@@ -1377,8 +1395,8 @@ assert sys.argv[4] in proof["diff"]
 assert proof["cwd"] == sys.argv[5]
 assert proof["home"] == sys.argv[6]
 assert proof["config"] == sys.argv[7]
-assert proof["secure_config"] == sys.argv[7]
-assert proof["claude_code_tmpdir"] == sys.argv[8]
+assert proof["secure_config"] == sys.argv[8]
+assert proof["claude_code_tmpdir"] == sys.argv[9]
 PY
   printf 'REAL CLAUDE PROOF: reviewer=claude-opus-5/xhigh account_home=%s command=git diff %s %s -- runtime-proof.txt verdict=completed\n' \
     "$reviewer_home" "$base" "$head"
@@ -1871,6 +1889,68 @@ assert run["suspicions"] == []
   pass "a verdict without an executed reproduction is a tool failure, never blocking code evidence"
 }
 
+test_reviewer_that_executes_nothing_is_unreviewed() {
+  local harness record case_dir base head rc
+  # A reviewer whose execution tool is dead still returns a confident, well
+  # formed verdict. Without this gate self-test that verdict reads as a clean
+  # review, so the merge gate silently degrades to static-only analysis.
+  for harness in claude codex; do
+    record=$(make_case "no-exec-$harness")
+    IFS=$'\t' read -r case_dir base head <<< "$record"
+    if [ "$harness" = claude ]; then
+      sed -i.bak 's/model=gpt-5.5/model=gpt-5.6-sol/' "$case_dir/state/task-x1.meta"
+      rm "$case_dir/state/task-x1.meta.bak"
+      cat > "$case_dir/reviewer.json" <<EOF
+{"reviewers":[
+  {"harness":"claude","model":"claude-opus-5","effort":"xhigh","account_home":"$case_dir/reviewer-home"}
+]}
+EOF
+    fi
+    export FM_TEST_SKIP_ATTESTATION=1
+    set +e
+    run_case "$case_dir" "$base" "$head" clear run > "$case_dir/out" 2> "$case_dir/err"
+    rc=$?
+    set -e
+    unset FM_TEST_SKIP_ATTESTATION
+    expect_code 1 "$rc" "$harness reviewer that executed nothing"
+    assert_contains "$(cat "$case_dir/err")" 'reviewer executed no command' \
+      "$harness reviewer that executed nothing did not fail loudly"
+    python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["runs"][-1]["state"] == "unreviewed", value["runs"][-1]["state"]
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+      || fail "$harness reviewer that executed nothing produced a trusted verdict"
+  done
+  pass "a reviewer that executes nothing fails loudly as unreviewed"
+}
+
+test_stripped_config_redirect_is_unreviewed() {
+  local record case_dir base head rc
+  # The sandbox denies every write outside the review checkout, so a launcher
+  # that discards the redirect leaves the reviewer unable to execute anything
+  # and silently drops its account separation too.
+  record=$(make_case stripped-redirect)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  sed -i.bak 's/model=gpt-5.5/model=gpt-5.6-sol/' "$case_dir/state/task-x1.meta"
+  rm "$case_dir/state/task-x1.meta.bak"
+  cat > "$case_dir/reviewer.json" <<EOF
+{"reviewers":[
+  {"harness":"claude","model":"claude-opus-5","effort":"xhigh","account_home":"$case_dir/reviewer-home"}
+]}
+EOF
+  export FM_TEST_STRIP_CONFIG_DIR=1
+  set +e
+  run_case "$case_dir" "$base" "$head" clear run > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  unset FM_TEST_STRIP_CONFIG_DIR
+  expect_code 1 "$rc" "reviewer launched without the directory redirect"
+  assert_contains "$(cat "$case_dir/err")" 'discarding the' \
+    "a discarded directory redirect was not reported"
+  pass "a launcher that discards the config redirect is caught, not trusted"
+}
+
 test_verify_rechecks_live_head_and_claims() {
   local record case_dir base head next_base rc verified
   record=$(make_case verify-live)
@@ -1994,4 +2074,6 @@ test_reviewer_configuration_failures_are_tool_failures
 test_stopped_reviewer_and_wrong_head_are_unreviewed
 test_completed_reviewer_suspicion_is_blocking
 test_reading_only_suspicion_is_a_tool_failure
+test_reviewer_that_executes_nothing_is_unreviewed
+test_stripped_config_redirect_is_unreviewed
 test_verify_rechecks_live_head_and_claims

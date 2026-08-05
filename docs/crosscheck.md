@@ -119,15 +119,24 @@ PR claims are delimited as untrusted data, and the reviewer is directed to ignor
 Later reviewers receive only a bounded projection of finding IDs, lifecycle state, severity, exact-head clearance, and proof digests.
 Finding prose, reproduction output, test output, and lifecycle notes remain durable in the ledger but are never reinjected into a later reviewer prompt.
 The Codex path pins `gpt-5.6-sol`, xhigh reasoning, noninteractive approval, an independent `CODEX_HOME`, the same account-bound `HOME`, and the exact review checkout.
-The Claude path pins `claude-opus-5`, xhigh effort, the installed unattended `--dangerously-skip-permissions` mode, a Bash-required bounded tool list, no session persistence, an independent `CLAUDE_CONFIG_DIR`, the same `CLAUDE_SECURESTORAGE_CONFIG_DIR`, a disposable private `HOME`, and structured JSON output.
-That private `HOME` maps `.claude` and `.claude.json` to the selected reviewer account directory, so Claude's hard-coded `~/.claude/session-env` writes land in per-account state rather than shared operator state.
-For a Keychain-backed account, it maps only the current user's Keychain directory needed for secure-storage discovery, derives Claude's exact scoped service from the selected account directory, and verifies the non-secret service metadata before reviewer launch.
+The Claude path pins `claude-opus-5`, xhigh effort, the installed unattended `--dangerously-skip-permissions` mode, a Bash-required bounded tool list, no session persistence, a disposable private `HOME`, an isolated per-run `CLAUDE_CONFIG_DIR`, the selected account's `CLAUDE_SECURESTORAGE_CONFIG_DIR`, and structured JSON output.
+For a Keychain-backed account, the private `HOME` exposes only the current user's Keychain directory needed for secure-storage discovery, derives Claude's exact scoped service from the selected account directory, and verifies the non-secret service metadata before reviewer launch.
 An OAuth-file-backed account instead requires a regular non-symlink `.credentials.json` in the selected account directory.
-Because Claude's unattended mode disables its own permission prompts, Crosscheck places the process under the installed macOS `sandbox-exec` contract: reads, process execution, and provider network access remain available, while writes are limited to the disposable review checkout, the selected per-account reviewer directory, and `/dev/null`.
-The profile never grants the ambient operator `~/.claude` tree or its session scratch subtree.
-Claude's Bash engine otherwise creates workspace scratch under shared `/tmp/claude-<uid>` independently of ordinary `TMPDIR`.
-Crosscheck sets the supported `CLAUDE_CODE_TMPDIR` to a private directory inside the disposable checkout, keeping that scratch under the existing checkout write boundary instead of widening the sandbox to shared `/tmp`.
-It does not grant write access to the author worktree or the wider filesystem.
+Because Claude's unattended mode disables its own permission prompts, Crosscheck places the process under the installed macOS `sandbox-exec` contract: reads, process execution, and provider network access remain available, while writes are limited to the disposable review checkout and `/dev/null`.
+The profile never grants write access to the reviewer account home, the ambient operator `~/.claude` tree, the author worktree, or the wider filesystem.
+
+That write boundary means the Claude harness cannot use the reviewer account home as its working config directory: it creates session and shell-snapshot state before its command-execution tool works, and a workspace scratch directory under the shared host temporary root.
+Crosscheck therefore redirects `CLAUDE_CONFIG_DIR` to a per-run home seeded inside the review checkout and `CLAUDE_CODE_TMPDIR` to a scratch directory beside it, the same treatment `TMPDIR`, `XDG_CACHE_HOME`, and `PYTHONPYCACHEPREFIX` already receive.
+Account separation survives that redirect because `CLAUDE_SECURESTORAGE_CONFIG_DIR` still pins the credential store at the selected reviewer account; the seeded home copies configuration, creates runtime directories empty, and reads credentials through a symlink rather than duplicating a secret into the checkout.
+The reviewer binary is resolved from the account's recorded provider binary before `PATH`, because a launcher earlier on `PATH` may unset `CLAUDE_CONFIG_DIR` to pin its own account and would silently discard both the redirect and the separation.
+
+## Executed-review self-test
+
+Every reviewer must prove it executed at least one command in addition to supplying the verdict-level receipt bound to the exact base, exact head, execution `HOME`, and executing account.
+Crosscheck writes an attestation script into `.crosscheck/` and hands the harness a secret through its environment only; recording that secret's digest therefore requires actually running a command, which reading or writing files cannot fake.
+A reviewer whose command-execution tool is broken can still return a confident, well-formed verdict built from static reading alone, but that verdict can never reach this gate's executed-evidence standard.
+A missing or mismatched attestation is recorded as `unreviewed` and exits nonzero rather than degrading quietly to static-only analysis.
+The Claude attestation additionally records the harness config directory it actually ran under, so a discarded redirect fails loudly instead of costing the gate its account separation in silence.
 An unavailable reviewer binary, sandbox, author-identity proof, executing-account binding, verdict-level execution proof, or exact remote PR head records a `tool-failure` attempt when the live head is already known, and otherwise emits the same tool-failure class without fabricating a ledger run.
 A nonzero reviewer exit, timeout, missing artifact, empty artifact, malformed artifact, or wrong-head artifact records an `unreviewed` attempt and exits nonzero.
 An unresolved suspicion comes from a completed reviewer and records a `blocking` attempt instead of being conflated with an invalid review artifact.
@@ -168,8 +177,13 @@ The merge form with optional `commit_title` and `commit_message` fields was sepa
 The read adapter exposes no merge subcommand; only the gate-refused `fm-crosscheck.sh merge` boundary can reach its private exact-SHA merge primitive, and that boundary freshly verifies the ledger before issuing the request.
 
 The installed reviewer invocation was exercised successfully with `--output-schema`, `--output-last-message`, `--model gpt-5.6-sol`, and `model_reasoning_effort="xhigh"` before production code used those flags.
-The installed Claude invocation was exercised successfully with a private `HOME`, selected-account `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `--model claude-opus-5`, `--effort xhigh`, `--dangerously-skip-permissions`, `--tools Bash,Read,Glob,Grep`, `--no-session-persistence`, `--output-format json`, and `--json-schema` before production code used those flags.
+The installed Claude invocation was exercised successfully with a private `HOME`, isolated per-run `CLAUDE_CONFIG_DIR`, selected-account `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `--model claude-opus-5`, `--effort xhigh`, `--dangerously-skip-permissions`, `--tools Bash,Read,Glob,Grep`, `--no-session-persistence`, `--output-format json`, and `--json-schema` before production code used those flags.
 The installed `/usr/bin/sandbox-exec` was also exercised with the generated profile: a write inside the allowed review directory succeeded, while sibling and `/private/tmp` writes failed with `Operation not permitted`.
+
+The 2026-08-05 directory-redirect work was exercised against a live installed Claude reviewer rather than a fake.
+Under the pre-fix profile the reviewer reported `mkdir … Operation not permitted` for its session directory and returned a clean-looking envelope (`is_error: false`, `subtype: success`) with a dead command-execution tool, which is the silent degradation this gate must never produce.
+Under the fixed profile the same installed binary ran `bash .crosscheck/attest.sh` successfully, recorded the execution-only digest and the redirected config directory, and `bin/fm-crosscheck.py`'s own `run_reviewer` returned a schema-valid `claude-opus-5` xhigh verdict for the exact head.
+The generated profile is unchanged by that work: writes to the reviewer account home, the real `~/.claude`, the home directory, shared `/tmp`, and the firstmate checkout were each re-confirmed denied, while only the review checkout stayed writable.
 
 ## Validation evidence boundaries
 

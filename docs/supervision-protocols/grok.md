@@ -8,7 +8,7 @@ When this session owns supervision and away mode is not active:
    `run_terminal_command` with `background: true` on:
    `[ -f __FM_X_MODE_ENV_SH__ ] && . __FM_X_MODE_ENV_SH__; exec bin/fm-watch-arm.sh`
 
-4. Trust only the arm's one-line status.
+4. Trust only the arm's status lines.
 5. `watcher: started ...` or `watcher: attached ...` means a live cycle exists **while that background task is still running**.
    On attach, the background task stays live until that existing cycle ends; it does not exit immediately.
    Once the task has completed, those lines are history, not a claim about now.

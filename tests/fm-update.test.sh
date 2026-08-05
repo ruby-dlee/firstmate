@@ -119,20 +119,25 @@ run_update() {
   FM_ROOT_OVERRIDE="$w/main" FM_HOME="$w/home" "$w/main/bin/fm-update.sh" 2>/dev/null
 }
 
-run_artifact_bootstrap_update() {
-  local w=$1 excludes result
-  excludes="$w/home/state/.fm-update-bootstrap-excludes"
-  printf '/config/\n/.*.crosscheck.lock\n' > "$excludes"
+run_artifact_bootstrap_update() (
+  local w=$1
+  fm_update_state="$w/home/state"
+  mkdir -p "$fm_update_state" || exit
+  fm_update_excludes=$(mktemp "$fm_update_state/.fm-update-bootstrap-excludes.XXXXXX") || exit
+  trap 'unlink "$fm_update_excludes"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  printf '/config/\n/.*.crosscheck.lock\n' > "$fm_update_excludes" || exit
   GIT_CONFIG_COUNT=1 \
   GIT_CONFIG_KEY_0=core.excludesFile \
-  GIT_CONFIG_VALUE_0="$excludes" \
+  GIT_CONFIG_VALUE_0="$fm_update_excludes" \
   FM_ROOT_OVERRIDE="$w/main" \
   FM_HOME="$w/home" \
     "$w/main/bin/fm-update.sh" 2>/dev/null
-  result=$?
-  unlink "$excludes"
-  return "$result"
-}
+  fm_update_result=$?
+  exit "$fm_update_result"
+)
 
 # --- T1: main + secondmate behind, instruction change; FF, not a merge ------
 # Combines the former T1 (fast-forward + reread + nudge signalling) and T2
@@ -225,6 +230,7 @@ test_crosscheck_artifacts_do_not_strand_stale_homes() {
   land_crosscheck_ignore_fix "$w"
   target=$(git -C "$w/seed" rev-parse HEAD)
   target_inventory=$(git -C "$w/seed" ls-tree -r --name-only "$target" | LC_ALL=C sort)
+  printf 'preserve existing file\n' > "$w/home/state/.fm-update-bootstrap-excludes"
 
   stale_out=$(run_update "$w")
   assert_contains "$stale_out" "firstmate: skipped: dirty working tree" \
@@ -262,9 +268,25 @@ test_crosscheck_artifacts_do_not_strand_stale_homes() {
     && [ -f "$w/sm1/config/crosscheck-reviewer.json" ] \
     && [ -f "$w/sm1/.example-secondmate.crosscheck.lock" ] \
     || fail "fm-update deleted a live local Crosscheck artifact"
-  [ ! -e "$w/home/state/.fm-update-bootstrap-excludes" ] \
-    || fail "artifact bootstrap left its temporary excludes file behind"
+  [ "$(cat "$w/home/state/.fm-update-bootstrap-excludes")" = "preserve existing file" ] \
+    || fail "artifact bootstrap changed a pre-existing path"
+  [ -z "$(find "$w/home/state" -maxdepth 1 -name '.fm-update-bootstrap-excludes.*' -print -quit)" ] \
+    || fail "artifact bootstrap left its exclusive temporary file behind"
   pass "Crosscheck artifacts remain on disk while stale homes become clean and fast-forwardable"
+}
+
+test_artifact_bootstrap_preserves_updater_failure_status() {
+  local w status
+  w=$(new_world crosscheck-bootstrap-status)
+  printf '#!/usr/bin/env bash\nexit 23\n' > "$w/main/bin/fm-update.sh"
+
+  run_artifact_bootstrap_update "$w" >/dev/null 2>&1
+  status=$?
+
+  [ "$status" -eq 23 ] || fail "artifact bootstrap replaced updater status 23 with $status"
+  [ -z "$(find "$w/home/state" -maxdepth 1 -name '.fm-update-bootstrap-excludes.*' -print -quit)" ] \
+    || fail "failed artifact bootstrap left its exclusive temporary file behind"
+  pass "Artifact bootstrap preserves updater failures and cleans its temporary file"
 }
 
 test_crosscheck_tolerance_does_not_hide_unrelated_dirt() {
@@ -460,6 +482,7 @@ test_updates_main_and_secondmate
 test_reread_gate_is_instruction_only
 test_dirty_secondmate_skipped
 test_crosscheck_artifacts_do_not_strand_stale_homes
+test_artifact_bootstrap_preserves_updater_failure_status
 test_crosscheck_tolerance_does_not_hide_unrelated_dirt
 test_repo_gitignores_every_documented_local_config
 test_diverged_secondmate_skipped

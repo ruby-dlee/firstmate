@@ -30,15 +30,22 @@ This touches only the firstmate repo and its own worktrees, never anything under
    - `nudge-secondmates: fm-<id>...|none`
    If an older updater skips a home whose only reported dirt is untracked `config/` content or root `.*.crosscheck.lock` files, rerun that same stale entrypoint with a command-scoped excludes file:
    ```sh
-   fm_update_excludes="${FM_HOME:-$(pwd -P)}/state/.fm-update-bootstrap-excludes"
-   mkdir -p "$(dirname "$fm_update_excludes")"
-   printf '/config/\n/.*.crosscheck.lock\n' > "$fm_update_excludes"
-   GIT_CONFIG_COUNT=1 \
-   GIT_CONFIG_KEY_0=core.excludesFile \
-   GIT_CONFIG_VALUE_0="$fm_update_excludes" \
-   bin/fm-update.sh
-   unlink "$fm_update_excludes"
-   unset fm_update_excludes
+   (
+     fm_update_state="${FM_HOME:-$(pwd -P)}/state"
+     mkdir -p "$fm_update_state" || exit
+     fm_update_excludes=$(mktemp "$fm_update_state/.fm-update-bootstrap-excludes.XXXXXX") || exit
+     trap 'unlink "$fm_update_excludes"' EXIT
+     trap 'exit 129' HUP
+     trap 'exit 130' INT
+     trap 'exit 143' TERM
+     printf '/config/\n/.*.crosscheck.lock\n' > "$fm_update_excludes" || exit
+     GIT_CONFIG_COUNT=1 \
+     GIT_CONFIG_KEY_0=core.excludesFile \
+     GIT_CONFIG_VALUE_0="$fm_update_excludes" \
+     bin/fm-update.sh
+     fm_update_result=$?
+     exit "$fm_update_result"
+   )
    ```
    This changes only the stale process's untracked-file view, so tracked changes and unrelated untracked files still block while the fast-forward lands the durable ignore rules.
 

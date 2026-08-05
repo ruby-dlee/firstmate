@@ -3,7 +3,7 @@
 # Spawn a direct report: a new crewmate in a treehouse worktree, an eligible
 # pre-cutover Orca direct recovery with empirically verified provider authority,
 # or a secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] [--backlog-row-exemption <test-fixture|tracking-backend-repair>] [--scout]
+# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] [--backlog-row-exemption <test-fixture|tracking-backend-repair>] [--provision|--no-provision] [--scout]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] --secondmate
 #        fm-spawn.sh <task-id> --recover-direct-account
 #        fm-spawn.sh <task-id> (--resume-account|--continue-account) [--harness <claude|codex>] [--account-pool <pool>] [--account-profile <profile>]
@@ -73,6 +73,15 @@
 #   Agent Fleet selection input for secondmate agents when routing is enabled. A
 #   secondmate's own crewmates use inherited crewmate dispatch/routing policy, not
 #   this setting.
+#   --provision forces worktree provisioning for this spawn, including for a kind
+#   the project's manifest excludes; --no-provision skips it entirely. Both apply
+#   to every pair of a batch. Without either, provisioning runs for a leased or
+#   recorded non-orca crewmate worktree exactly when the project has a manifest at
+#   config/provision/<project>.json and the task's kind is in its kinds list.
+#   fm-provision.sh's header owns the readiness contract and exit codes; this
+#   script only decides what a failure does to the spawn (block aborts, warn
+#   continues with a banner, a durable verdict, and a brief note) and hands a
+#   ready verdict's proven runtime pin to the crewmate's exported PATH.
 #   --resume-account and --continue-account are legacy recovery paths only for
 #   existing account_profile metadata. They retain the sealed Agent Fleet
 #   session/lease behavior needed to recover those already-managed generations;
@@ -132,7 +141,7 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,78p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,87p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -351,6 +360,8 @@ BACKLOG_ROW_EXEMPTION_SET=0
 RESUME_ACCOUNT=0
 CONTINUE_ACCOUNT=0
 DIRECT_ACCOUNT_RECOVERY=0
+PROVISION_MODE=auto
+PROVISION_PATH_PREPEND=
 CONTINUATION_LAUNCH_DIR=
 CONTINUATION_PROMPT_FILE=
 CONTINUATION_PROMPT_DIR_ID=
@@ -403,6 +414,8 @@ for a in "$@"; do
     --resume-account) RESUME_ACCOUNT=1 ;;
     --continue-account) CONTINUE_ACCOUNT=1 ;;
     --recover-direct-account) DIRECT_ACCOUNT_RECOVERY=1 ;;
+    --provision) PROVISION_MODE=force ;;
+    --no-provision) PROVISION_MODE=off ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -2092,6 +2105,10 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$ACCOUNT_PROFILE" ] || shared_args+=(--account-profile "$ACCOUNT_PROFILE")
   [ "$NO_ACCOUNT_ROUTING" = 0 ] || shared_args+=(--no-account-routing)
   [ -z "$BACKLOG_ROW_EXEMPTION" ] || shared_args+=(--backlog-row-exemption "$BACKLOG_ROW_EXEMPTION")
+  case "$PROVISION_MODE" in
+    force) shared_args+=(--provision) ;;
+    off) shared_args+=(--no-provision) ;;
+  esac
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     echo "error: batch dispatch does not support account recovery; recover tasks individually" >&2
     exit 1
@@ -3244,6 +3261,91 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" 
   WORKTREE_RETAIN_ON_ABORT=0
 fi
 
+# Worktree provisioning. A Treehouse lease carries no gitignored environment, so
+# without this a crewmate cannot run the project's own checks and has to borrow
+# evidence from a second agent in a different worktree. This is the one seam
+# where the worktree is proven isolated and clean and no agent is running in it
+# yet, so it is the only place the environment can be built without either
+# racing an agent or dirtying the tree an agent is about to branch from.
+#
+# fm-provision.sh owns everything project-specific through a per-project
+# manifest; this call stays project-agnostic. With no manifest for the project it
+# is a single file test, so a spawn for any other project is unchanged.
+# fm-provision.sh's header owns the readiness contract and the exit codes; the
+# only decision made here is what a failure does to the spawn, and that follows
+# the manifest's declared policy: exit 4 (block) aborts, exit 3 (warn) continues
+# loudly. Everything else here just makes the outcome impossible to miss.
+provision_worktree() {
+  local status=0 verdict='' reason banner_state
+  [ "$PROVISION_MODE" != off ] || return 0
+  [ "$KIND" != secondmate ] || return 0
+  [ "$BACKEND" != orca ] || return 0
+  [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
+  [ -x "$SCRIPT_DIR/fm-provision.sh" ] || return 0
+  local provision_args=(--task "$ID" --kind "$KIND")
+  [ "$PROVISION_MODE" != force ] || provision_args+=(--force)
+  verdict=$("$SCRIPT_DIR/fm-provision.sh" "$PROJ_ABS" "$WT" "${provision_args[@]}") || status=$?
+  case "$status" in
+    0)
+      PROVISION_PATH_PREPEND=$(printf '%s' "$verdict" | jq -r '.path_prepend // ""' 2>/dev/null || true)
+      spawn_brief_provision_note "$verdict" ready
+      return 0
+      ;;
+    3) banner_state=continuing ;;
+    4) banner_state=aborting ;;
+    *) banner_state=continuing ;;
+  esac
+  PROVISION_PATH_PREPEND=
+  reason=$(printf '%s' "$verdict" | jq -r '.reason // ""' 2>/dev/null || true)
+  [ -n "$reason" ] || reason="provisioning failed without a readable reason (exit $status)"
+  echo "################################################################" >&2
+  echo "# fm-spawn: WORKTREE PROVISIONING FAILED for fm-$ID ($banner_state)" >&2
+  echo "#   $reason" >&2
+  echo "#   log: $STATE/$ID.provision.log" >&2
+  echo "#   verdict: $STATE/$ID.provision" >&2
+  if [ "$banner_state" = aborting ]; then
+    echo "#   This project declares on_failure=block, so no agent is launched." >&2
+    echo "################################################################" >&2
+    return 1
+  fi
+  echo "#   The crewmate is launched anyway and told it cannot validate locally." >&2
+  echo "#   It must report blocked rather than substitute borrowed evidence." >&2
+  echo "################################################################" >&2
+  spawn_brief_provision_note "$verdict" failed
+  return 0
+}
+
+# The crewmate learns the readiness verdict where it actually reads: its brief.
+# The section is delimited and rewritten in place, so a recovery respawn refreshes
+# it rather than stacking copies.
+spawn_brief_provision_note() {
+  local verdict=$1 state=$2 tmp
+  [ -n "${BRIEF:-}" ] && [ -f "$BRIEF" ] && [ -w "$BRIEF" ] || return 0
+  tmp=$(mktemp "$STATE/.$ID.brief.XXXXXX") || return 0
+  awk '/^<!-- fm-provision:begin -->$/ { skip = 1 } !skip { print } /^<!-- fm-provision:end -->$/ { skip = 0 }' \
+    "$BRIEF" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  {
+    printf '\n<!-- fm-provision:begin -->\n'
+    printf '\n# Environment readiness\n\n'
+    if [ "$state" = ready ]; then
+      printf 'This worktree was provisioned before you started, so you can run this project'"'"'s own checks here.\n'
+      printf 'Component status: %s\n' \
+        "$(printf '%s' "$verdict" | jq -r '[.components[]? | .name + "=" + .result] | join(", ")' 2>/dev/null)"
+      printf 'Use the environments in place rather than building your own; report what you actually ran.\n'
+    else
+      printf '**Provisioning this worktree FAILED, so the project'"'"'s local checks may not run here.**\n\n'
+      printf 'Reason: %s\n\n' "$(printf '%s' "$verdict" | jq -r '.reason // "unknown"' 2>/dev/null)"
+      printf 'Full log: %s\n\n' "$STATE/$ID.provision.log"
+      printf 'Do the work, but do NOT report validation you did not perform.\n'
+      printf 'If you cannot run the checks, append a blocked status naming what failed, and stop.\n'
+    fi
+    printf '\n<!-- fm-provision:end -->\n'
+  } >> "$tmp"
+  mv "$tmp" "$BRIEF" 2>/dev/null || rm -f "$tmp"
+}
+
+provision_worktree || exit 1
+
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   direct_recovery_context_matches || {
@@ -3319,10 +3421,17 @@ fi
 # command (notably `claude`, which a host may front with a shim) - it only ever adds
 # reach. The standard locations are appended for the case where firstmate itself was
 # launched with a thin PATH; missing directories and duplicates are dropped.
+#
+# PROVISION_PATH_PREPEND leads the seed when worktree provisioning proved a
+# pinned runtime. That pin is the whole point: provisioning can build a project
+# under its declared node, but if the crewmate's own PATH still resolves a
+# different one, the crewmate re-triggers the very runtime drift provisioning
+# just ruled out. It is only ever set from a ready verdict, so an unproven or
+# failed run hands over nothing.
 crew_tool_path() {
   local seed dir out='' brew=/opt/homebrew
   [ -d "$brew" ] || brew=/usr/local
-  seed="$PATH:$HOME/.local/bin:$brew/bin:$brew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  seed="${PROVISION_PATH_PREPEND:+$PROVISION_PATH_PREPEND:}$PATH:$HOME/.local/bin:$brew/bin:$brew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   local IFS=:
   for dir in $seed; do
     [ -n "$dir" ] || continue

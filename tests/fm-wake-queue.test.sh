@@ -14,8 +14,16 @@ set -u
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 
-# Per-suite process bound: this root process, three concurrent append workers,
-# and one concurrent drain worker.
+# Concurrency contract: keep all 40 queue-safety append records and assertions,
+# but cap append workers at three regardless of input size. Every submission at
+# the limit blocks while the pool waits for its oldest PID, making the cap
+# absolute rather than a proportional reduction from the incident's 62
+# processes. The bounded path starts one unpooled drain helper, so the effective
+# background ceiling is three append workers plus that constant helper: four
+# background processes, or five test-script processes including this root.
+# The concurrency-bound probe simulates a slow host, continuously records every
+# process transition under a serialized counter, and measures the historical
+# 10-process sample against the bounded 5-process sample.
 WAKE_QUEUE_TEST_PROCESS_BOUND=5
 WAKE_QUEUE_TEST_APPEND_WORKERS=$((WAKE_QUEUE_TEST_PROCESS_BOUND - 2))
 

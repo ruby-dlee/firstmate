@@ -308,6 +308,76 @@ If no dispatch rule fits, firstmate uses the dispatch profile `default` when pre
 Because the spawn backstop is gated by file presence, any fallback path after a missing match, validation error, or missing `jq` still passes a resolved harness explicitly until the file is fixed or removed.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 
+## Worktree provisioning (config/provision/<project>.json)
+
+A Treehouse lease delivers a clean Git worktree and nothing else.
+The environments a project's own checks need - its virtualenv, its `node_modules`, the interpreter and runtime those were built for - are gitignored, so a fresh lease never carries them, and Treehouse exposes no setup hook.
+Worktree provisioning is Firstmate's answer: `bin/fm-spawn.sh` calls `bin/fm-provision.sh` after the leased worktree is proven isolated and clean and before the endpoint is created, so a crewmate can validate its own work instead of borrowing evidence from a second agent in a different worktree.
+
+Provisioning is opt-in per project and per home.
+`config/provision/<project>.json` is a local, gitignored manifest named after the project directory under `projects/`.
+With no manifest the step is a single file-existence check and nothing else happens, so projects and homes that have not opted in are unchanged.
+This section is the single owner of the manifest schema; `bin/fm-provision.sh`'s header owns the readiness contract, the exit codes, and the operational guarantees, and `AGENTS.md` keeps only the one-line pointer.
+See [`docs/examples/provision-relvino.json`](examples/provision-relvino.json) for a working manifest to copy and adapt.
+
+```json
+{
+  "description": "<human note>",
+  "kinds": ["ship"],
+  "on_failure": "warn",
+  "timeout_seconds": 1800,
+  "step_timeout_seconds": 600,
+  "path_prepend": ["<absolute directory placed ahead of PATH>"],
+  "components": [
+    {
+      "name": "<component name>",
+      "dir": "<directory relative to the worktree>",
+      "env": { "<NAME>": "<value>" },
+      "path_prepend": ["<absolute directory, this component only>"],
+      "runtime_checks": [
+        { "name": "<label>", "argv": ["<cmd>", "<arg>"], "expect": "<exact expected output>", "timeout_seconds": 60 }
+      ],
+      "fingerprint": {
+        "path": "<file inside the built tree, relative to dir>",
+        "files": ["<input file relative to dir>"],
+        "versions": [ { "name": "<label>", "argv": ["<cmd>", "<arg>"] } ]
+      },
+      "reset": ["<path relative to dir removed before a rebuild>"],
+      "install": [ { "name": "<label>", "argv": ["<cmd>", "<arg>"], "timeout_seconds": 900 } ],
+      "probes": [ { "name": "<label>", "argv": ["<cmd>", "<arg>"], "expect": "<optional exact output>" } ]
+    }
+  ]
+}
+```
+
+`components` is required and every component needs a `name`.
+Every other field is optional.
+`kinds` defaults to `["ship"]`, so scouts are skipped unless the manifest lists them or the spawn passes `--provision`; a scout that only reads code does not need a toolchain.
+`on_failure` is `warn` or `block` and defaults to `warn`; the reasoning behind that default lives in `bin/fm-provision.sh`'s header.
+`timeout_seconds` bounds the whole run and `step_timeout_seconds` is the per-step default, which a step overrides with its own `timeout_seconds`.
+Every step is a `{name, argv, timeout_seconds}` object; `argv` is an argument vector rather than a shell string, so quoting is unambiguous and `["sh", "-c", "..."]` is the explicit opt-in when a shell is genuinely wanted.
+`${HOME}` and `${WORKTREE}` are the only tokens that expand in manifest strings, so a manifest can name a host runtime directory or a path inside the lease without being rewritten per worktree, and a manifest is never a shell.
+
+`path_prepend` directories go ahead of `PATH` for every step, and the manifest-level entries are also handed to `fm-spawn.sh`, which puts them ahead of the crewmate's own exported `PATH`.
+That handover only happens for a `ready` verdict.
+Without it, provisioning could build a project under its pinned runtime while the crewmate's shell still resolved a different one, which is precisely the drift that had npm delegating a native build to an unpinned node.
+A component's `env` may not set `PATH`; use `path_prepend`, so a manifest cannot route around its own runtime checks.
+
+`runtime_checks` run before anything is built, so a component is never compiled or installed under the wrong runtime.
+A check with `expect` must print exactly that value; a check that prints nothing never satisfies an `expect`.
+The value a step contributes - to `expect` and to a fingerprint - is its last non-empty output line, trimmed.
+
+`fingerprint` is what makes an unchanged environment reusable.
+Reuse requires both a matching digest over the declared `files` and `versions` AND passing `probes`; probes run on every invocation, so a merely existing directory is never assumed healthy, and a fingerprint hit whose probes fail rebuilds instead.
+Put `fingerprint.path` inside the tree it describes, such as `.venv/` or `node_modules/`, so deleting the environment deletes its claim of health.
+A `versions` command must be independent of the thing it fingerprints; the value is recomputed after a build and refused if it changed, which the verdict reports rather than silently rebuilding on every future lease.
+`dir`, `reset` paths, and `fingerprint.path` must all resolve inside the worktree.
+
+`bin/fm-spawn.sh` takes `--provision` to force provisioning for one spawn, including for a kind the manifest excludes, and `--no-provision` to skip it entirely.
+Both apply to every pair of a batch spawn.
+With `--task`, the verdict is written to `state/<id>.provision` and the full step log to `state/<id>.provision.log`, both removed by teardown.
+On a failure the spawn prints a bordered banner and appends a delimited "Environment readiness" section to the crewmate's brief, so the crewmate reports a blocker instead of substituting evidence it did not produce.
+
 ## Checkout refresh
 
 `bin/fm-checkout-refresh.sh` keeps worktree seed checkouts current independently of Firstmate's own PR lifecycle.

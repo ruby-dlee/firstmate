@@ -63,6 +63,7 @@ REPORT_STACK="$ROOT/bin/fm-report-stack.mjs"
 TASK_FILE_APPEND="$ROOT/bin/fm-task-file-append.mjs"
 BRIEF="$ROOT/bin/fm-brief.sh"
 ENSURE_AGENTS="$ROOT/bin/fm-ensure-agents-md.sh"
+PROVISION="$ROOT/bin/fm-provision.sh"
 LOCK="$ROOT/bin/fm-lock.sh"
 REVIEW_DIFF="$ROOT/bin/fm-review-diff.sh"
 SUPERVISE_DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
@@ -670,7 +671,7 @@ test_extended_mutating_entrypoints_refuse_gate_context() {
   stack="$TMP/extended-report-stack"
   mkdir -p "$home/state" "$home/data" "$home/projects"
 
-  for name in crosscheck fleet-sync x-reply x-dismiss x-followup x-link x-poll watch watch-arm watch-checkpoint wake-drain brief ensure-agents lock review-diff supervise-daemon; do
+  for name in crosscheck fleet-sync x-reply x-dismiss x-followup x-link x-poll watch watch-arm watch-checkpoint wake-drain brief ensure-agents provision lock review-diff supervise-daemon; do
     case "$name" in
       crosscheck) script=$(guarded_script "$NORMAL_CWD" "$CROSSCHECK"); set -- run task-x https://github.com/example/repo/pull/9 ;;
       fleet-sync) script=$(guarded_script "$NORMAL_CWD" "$FLEET_SYNC"); set -- --help ;;
@@ -685,6 +686,7 @@ test_extended_mutating_entrypoints_refuse_gate_context() {
       wake-drain) script=$(guarded_script "$NORMAL_CWD" "$WAKE_DRAIN"); set -- ;;
       brief) script=$(guarded_script "$NORMAL_CWD" "$BRIEF"); set -- task-x ship project-x objective ;;
       ensure-agents) script=$(guarded_script "$NORMAL_CWD" "$ENSURE_AGENTS"); set -- "$home" ;;
+      provision) script=$(guarded_script "$NORMAL_CWD" "$PROVISION"); set -- "$home" "$home" ;;
       lock) script=$(guarded_script "$NORMAL_CWD" "$LOCK"); set -- ;;
       review-diff) script=$(guarded_script "$NORMAL_CWD" "$REVIEW_DIFF"); set -- task-x ;;
       supervise-daemon) script=$(guarded_script "$NORMAL_CWD" "$SUPERVISE_DAEMON"); set -- ;;

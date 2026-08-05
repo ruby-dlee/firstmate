@@ -86,7 +86,7 @@ A `verified-fixed` lifecycle remains durable, but its proof clears only the exac
 
 Each run has one outcome class.
 
-- `tool-failure` means environment, task metadata, reviewer configuration, or exact-head fetch preflight prevented a review from running.
+- `tool-failure` means environment, task metadata, reviewer configuration, exact-head fetch, executing-account binding, or required command-execution proof prevented a trustworthy verdict.
 - `unreviewed` means a reviewer ran but no valid exact-head verdict artifact exists.
 - `blocking` means a completed reviewer with successful command-execution evidence declined clearance through a suspicion or admitted finding.
 - `clear` means a completed reviewer with successful command-execution evidence earned clearance and no durable blocker remains.

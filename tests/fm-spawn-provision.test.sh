@@ -33,27 +33,44 @@ case "${1:-}" in
   venv)
     [ "${FM_TEST_UV_FAIL:-0}" != 1 ] || exit 3
     rm -rf .venv
-    mkdir -p .venv/bin
+    mkdir -p .venv/bin .venv/lib/python3.11/site-packages
     cat > .venv/bin/python <<'PY'
 #!/usr/bin/env bash
-printf '%s' "${FM_TEST_PYTHON_VERSION:-3.11.9}"
+case "${2:-}" in
+  *sys.version_info*) printf '%s' "${FM_TEST_PYTHON_VERSION:-3.11.9}" ;;
+  *) exec python3 "$@" ;;
+esac
 PY
     chmod +x .venv/bin/python
     exit 0
     ;;
   sync)
     [ "${FM_TEST_UV_FAIL:-0}" != 1 ] || exit 3
-    mkdir -p .venv/bin
+    mkdir -p .venv/bin .venv/lib/python3.11/site-packages
+    printf 'fake uv project\n' > .venv/lib/python3.11/site-packages/fake_uv_project.pth
     cat > .venv/bin/python <<'PY'
 #!/usr/bin/env bash
-printf '%s' "${FM_TEST_PYTHON_VERSION:-3.11.9}"
+case "${2:-}" in
+  *sys.version_info*) printf '%s' "${FM_TEST_PYTHON_VERSION:-3.11.9}" ;;
+  *) exec python3 "$@" ;;
+esac
 PY
     chmod +x .venv/bin/python
     exit 0
     ;;
   pip)
     case "${2:-}" in
-      install) [ "${FM_TEST_UV_FAIL:-0}" != 1 ] || exit 3; printf 'installed\n' > .venv/installed; exit 0 ;;
+      install)
+        [ "${FM_TEST_UV_FAIL:-0}" != 1 ] || exit 3
+        mkdir -p .venv/lib/python3.11/site-packages/pytest \
+          .venv/lib/python3.11/site-packages/six-1.16.0.dist-info \
+          .venv/lib/python3.11/site-packages/pytest-8.3.4.dist-info
+        printf 'six module\n' > .venv/lib/python3.11/site-packages/six.py
+        printf 'pytest package\n' > .venv/lib/python3.11/site-packages/pytest/__init__.py
+        printf 'Name: six\nVersion: 1.16.0\n' > .venv/lib/python3.11/site-packages/six-1.16.0.dist-info/METADATA
+        printf 'Name: pytest\nVersion: 8.3.4\n' > .venv/lib/python3.11/site-packages/pytest-8.3.4.dist-info/METADATA
+        exit 0
+        ;;
       check) [ -x .venv/bin/python ] || exit 1; exit 0 ;;
     esac
     exit 0
@@ -69,8 +86,14 @@ case "${1:-}" in
   --version) printf '10.9.2\n'; exit 0 ;;
   ci)
     [ "${FM_TEST_NPM_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_NPM_SLEEP"
-    [ "${FM_TEST_NPM_FAIL:-0}" != 1 ] || { printf 'npm ci exploded\n' >&2; exit 7; }
+    [ "${FM_TEST_NPM_FAIL:-0}" != 1 ] || {
+      mkdir -p node_modules/partial-package
+      printf 'partial\n' > node_modules/partial-package/partial.txt
+      printf 'npm ci exploded\n' >&2
+      exit 7
+    }
     mkdir -p node_modules/is-number
+    printf '{"name":"is-number","version":"7.0.0"}\n' > node_modules/is-number/package.json
     printf '{}\n' > node_modules/.package-lock.json
     exit 0
     ;;
@@ -85,6 +108,7 @@ case "${1:-}" in
   --version) printf '9.0.0\n'; exit 0 ;;
   install)
     mkdir -p node_modules/is-number
+    printf '{"name":"is-number","version":"7.0.0"}\n' > node_modules/is-number/package.json
     printf 'hoistPattern:\n' > node_modules/.modules.yaml
     exit 0
     ;;
@@ -118,7 +142,7 @@ make_worktree() {
   case "$shape" in
     js|both)
       mkdir -p "$dir/web"
-      printf '{"name":"web","private":true}\n' > "$dir/web/package.json"
+      printf '{"name":"web","private":true,"dependencies":{"is-number":"7.0.0"}}\n' > "$dir/web/package.json"
       printf '{"lockfileVersion":3}\n' > "$dir/web/package-lock.json"
       ;;
   esac
@@ -223,19 +247,17 @@ test_a_removed_environment_invalidates_a_matching_fingerprint() {
   fakebin=$(case_fakebin "$case_dir")
   run_provision "$case_dir" "$case_dir/wt" "$fakebin" >/dev/null
 
-  # A pool slot keeps its ignored directories across leases, but a previous
-  # agent may have deleted them. The manifests are untouched, so the
-  # fingerprint still matches and only the readiness probe can catch this.
-  rm -rf "$case_dir/wt/web/node_modules"
+  rm -rf "$case_dir/wt/web/node_modules/is-number"
   : > "$case_dir/install.log"
   out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
-  assert_contains "$out" 'npm:web=installed' "a deleted node_modules was reported as cached: $out"
+  assert_contains "$out" 'npm:web=installed' "a deleted declared Node package was reported as cached: $out"
   assert_contains "$out" 'pip:svc=cached' "an untouched python component was needlessly reinstalled: $out"
 
-  rm -rf "$case_dir/wt/svc/.venv"
+  rm -f "$case_dir/wt/svc/.venv/lib/python3.11/site-packages/six.py"
   : > "$case_dir/install.log"
   out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
-  assert_contains "$out" 'pip:svc=installed' "a deleted virtualenv was reported as cached: $out"
+  assert_contains "$out" 'pip:svc=installed' "a deleted declared Python package was reported as cached: $out"
+  assert_contains "$out" 'npm:web=cached' "an untouched Node component was needlessly reinstalled: $out"
   pass "a fingerprint match with a broken environment is a miss, not a hit"
 }
 
@@ -374,6 +396,36 @@ test_a_uv_workspace_syncs_every_member() {
   assert_grep 'uv sync --frozen
 ' "$case_dir/install.log" "a non-workspace uv project did not use the plain sync form"
   pass "a uv workspace syncs every member while a single project keeps the plain sync"
+}
+
+test_a_uv_workspace_member_manifest_invalidates_the_cache() {
+  local case_dir fakebin out
+  case_dir=$(new_case uv-workspace-manifest none)
+  fakebin=$(case_fakebin "$case_dir")
+  mkdir -p "$case_dir/wt/mono/packages/alpha"
+  printf 'version = 1\n' > "$case_dir/wt/mono/uv.lock"
+  printf '[project]\nname = "mono"\n\n[tool.uv.workspace]\nmembers = ["packages/*"]\n' \
+    > "$case_dir/wt/mono/pyproject.toml"
+  printf '[project]\nname = "alpha"\nversion = "1.0.0"\n' \
+    > "$case_dir/wt/mono/packages/alpha/pyproject.toml"
+  printf '3.11\n' > "$case_dir/wt/mono/packages/alpha/.python-version"
+  run_provision "$case_dir" "$case_dir/wt" "$fakebin" >/dev/null
+
+  printf '[project]\nname = "alpha"\nversion = "1.0.1"\n' \
+    > "$case_dir/wt/mono/packages/alpha/pyproject.toml"
+  : > "$case_dir/install.log"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'uv:mono=installed' "a changed uv member manifest did not invalidate the cache: $out"
+  assert_grep 'uv sync --frozen --all-packages' "$case_dir/install.log" \
+    "a changed uv member manifest did not trigger a workspace reinstall"
+
+  printf '3.12\n' > "$case_dir/wt/mono/packages/alpha/.python-version"
+  : > "$case_dir/install.log"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'uv:mono=installed' "a changed uv member Python declaration did not invalidate the cache: $out"
+  assert_grep 'uv sync --frozen --all-packages' "$case_dir/install.log" \
+    "a changed uv member Python declaration did not trigger a workspace reinstall"
+  pass "uv workspace member manifests participate in the cache fingerprint"
 }
 
 test_declared_node_version_is_read_only_when_unambiguous() {
@@ -572,6 +624,24 @@ test_spawn_refuses_when_provisioning_fails() {
   pass "provisioning failure refuses the spawn instead of launching a lane that cannot validate"
 }
 
+test_spawn_failure_excludes_every_mutated_component() {
+  local record id out status exclude_file dirty
+  id=provision-spawn-p7
+  record=$(make_spawn_case spawn-multi-fail both "$id")
+  read_spawn_case "$record"
+  out=$(FM_TEST_NPM_FAIL=1 run_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR")
+  status=$?
+  expect_code 1 "$status" "a later component failure should refuse the spawn: $out"
+  assert_grep 'uv pip install' "$CASE_DIR/install.log" "the earlier Python component did not install before the Node failure"
+  assert_grep 'npm ci' "$CASE_DIR/install.log" "the later Node component did not reach its failing installer"
+  exclude_file=$(git -C "$WORKTREE_DIR" rev-parse --git-path info/exclude)
+  assert_grep '/svc/.venv/' "$exclude_file" "the successful earlier component was not excluded after a later failure"
+  assert_grep '/web/node_modules/' "$exclude_file" "the partially created failing component was not excluded"
+  dirty=$(git -C "$WORKTREE_DIR" status --porcelain --untracked-files=all)
+  [ -z "$dirty" ] || fail "a multi-component provisioning failure left the leased worktree dirty: $dirty"
+  pass "a later provisioning failure leaves every mutated component excluded"
+}
+
 test_provisioning_can_be_opted_out_per_spawn_and_per_home() {
   local record id out status
   id=provision-spawn-p3
@@ -634,11 +704,13 @@ test_an_unsupported_package_manager_refuses_the_spawn
 test_too_many_components_refuse_the_spawn
 test_detection_is_declaration_driven_and_prunes_installed_trees
 test_a_uv_workspace_syncs_every_member
+test_a_uv_workspace_member_manifest_invalidates_the_cache
 test_declared_node_version_is_read_only_when_unambiguous
 test_a_declared_but_absent_node_runtime_refuses_the_spawn
 test_a_declared_node_runtime_is_resolved_and_exported
 test_spawn_provisions_the_worktree_before_creating_the_endpoint
 test_spawn_refuses_when_provisioning_fails
+test_spawn_failure_excludes_every_mutated_component
 test_provisioning_can_be_opted_out_per_spawn_and_per_home
 test_an_unreadable_provisioning_setting_refuses_the_spawn
 test_spawn_into_an_undeclared_project_is_unchanged

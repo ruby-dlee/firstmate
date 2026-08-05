@@ -3245,14 +3245,42 @@ fi
 # racing an agent or dirtying the tree an agent is about to branch from.
 #
 # fm-provision.sh owns everything project-specific through a per-project
-# manifest; this call stays project-agnostic. With no manifest for the project it
-# is a single file test, so a spawn for any other project is unchanged.
-# fm-provision.sh's header owns the readiness contract and the exit codes. A
-# skipped verdict is a true no-op with no state artifact, brief section, or PATH
-# handoff. Only status=ready publishes readiness; failures follow the manifest's
-# policy, where exit 4 blocks and exit 3 continues loudly.
+# manifest; this call stays project-agnostic. After prior evidence is retired,
+# the engine's no-manifest path is one file test and does no environment work.
+# fm-provision.sh's header owns the readiness contract and the exit codes. Prior
+# evidence is retired before every attempt because an unverified readiness claim
+# is more harmful than a lost diagnostic. Only status=ready publishes readiness;
+# failures follow the manifest's policy, where exit 4 blocks and exit 3 warns.
+spawn_brief_without_provision_section() {
+  local output=$1
+  awk '/^<!-- fm-provision:begin -->$/ { skip = 1 } !skip { print } /^<!-- fm-provision:end -->$/ { skip = 0 }' \
+    "$BRIEF" > "$output"
+}
+
+spawn_retire_provision_evidence() {
+  local tmp grep_status=0
+  PROVISION_PATH_PREPEND=
+  rm -f "$STATE/$ID.provision" "$STATE/$ID.provision.log" || return 1
+  [ -n "${BRIEF:-}" ] && [ -f "$BRIEF" ] || return 0
+  grep -q '^<!-- fm-provision:begin -->$' "$BRIEF" 2>/dev/null || grep_status=$?
+  case "$grep_status" in
+    1) return 0 ;;
+    0) ;;
+    *) return 1 ;;
+  esac
+  [ -r "$BRIEF" ] && [ -w "$BRIEF" ] || return 1
+  tmp=$(mktemp "$STATE/.$ID.brief.XXXXXX") || return 1
+  spawn_brief_without_provision_section "$tmp" 2>/dev/null \
+    || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$BRIEF" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
 provision_worktree() {
   local status=0 verdict='' verdict_status='' reason banner_state
+  spawn_retire_provision_evidence || {
+    echo "error: could not retire stale provisioning evidence for $ID" >&2
+    return 1
+  }
   [ "$PROVISION_MODE" != off ] || return 0
   [ "$KIND" != secondmate ] || return 0
   [ "$BACKEND" != orca ] || return 0
@@ -3308,8 +3336,7 @@ spawn_brief_provision_note() {
   local verdict=$1 state=$2 tmp
   [ -n "${BRIEF:-}" ] && [ -f "$BRIEF" ] && [ -w "$BRIEF" ] || return 0
   tmp=$(mktemp "$STATE/.$ID.brief.XXXXXX") || return 0
-  awk '/^<!-- fm-provision:begin -->$/ { skip = 1 } !skip { print } /^<!-- fm-provision:end -->$/ { skip = 0 }' \
-    "$BRIEF" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  spawn_brief_without_provision_section "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
   {
     printf '\n<!-- fm-provision:begin -->\n'
     printf '\n# Environment readiness\n\n'

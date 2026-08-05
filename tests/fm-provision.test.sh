@@ -294,11 +294,33 @@ test_step_timeout_is_reported_and_bounded() {
   pass "a hanging step is killed at its bound and reported as a timeout"
 }
 
+test_bounded_step_supervises_background_descendants() {
+  local rec out pid attempt=0
+  rec=$(make_case background-descendant)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  jq '.components[0].probes = [{"name":"background hang","argv":["sh","-c","sh -c '\''trap \"\" TERM; sleep 120'\'' & echo $! > ../background-pid"],"timeout_seconds":2}]' \
+    "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 3 "$?" "a background descendant must keep the bounded step open"
+  assert_contains "$(verdict_field "$out" .reason)" "timed out after 2s" \
+    "the background descendant should exhaust the step bound"
+  pid=$(cat "$WT_DIR/background-pid")
+  while kill -0 "$pid" 2>/dev/null && [ "$attempt" -lt 20 ]; do
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    fail "the bounded step left background descendant $pid running"
+  fi
+  pass "bounded steps supervise and kill their complete process group"
+}
+
 test_reset_is_bounded_by_the_total_budget() {
   local rec out started elapsed fakebin
   rec=$(make_case reset-timeout)
   read_case "$rec"
-  write_manifest "$CASE_DIR/m.json" timeout_seconds 2
+  write_manifest "$CASE_DIR/m.json" timeout_seconds 4
   fakebin="$CASE_DIR/fakebin"
   mkdir -p "$fakebin"
   cat > "$fakebin/rm" <<'SH'
@@ -368,9 +390,71 @@ test_paths_are_contained() {
   jq '.components[0].reset = ["../../escape"]' "$CASE_DIR/m.json" > "$CASE_DIR/escape-reset.json"
   out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/escape-reset.json")
   expect_code 3 "$?" "a reset path outside the component should fail"
-  assert_contains "$(verdict_field "$out" .reason)" "escapes the component directory" \
+  assert_contains "$(verdict_field "$out" .reason)" "strict descendant" \
     "the failure should name the refused reset path"
   pass "component and reset paths that escape their base are refused"
+}
+
+assert_reset_target_refused() {
+  local name=$1 target=$2 rec out
+  rec=$(make_case "reset-$name")
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  jq --arg target "$target" '.components[0].reset = [$target]' \
+    "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 3 "$?" "reset target '$target' must be refused"
+  assert_contains "$(verdict_field "$out" .reason)" "strict descendant" \
+    "reset target '$target' should fail the structural descendant check"
+  assert_present "$WT_DIR/component" "refusing reset '$target' must preserve the component directory"
+}
+
+test_reset_targets_are_structurally_strict_descendants() {
+  assert_reset_target_refused dot .
+  assert_reset_target_refused normalized-root sub/..
+  assert_reset_target_refused empty ''
+  assert_reset_target_refused absolute "$TMP_ROOT/outside-reset"
+  pass "reset targets can never resolve to the component root"
+}
+
+test_fingerprint_paths_are_structurally_strict_descendants() {
+  local rec out
+  rec=$(make_case fingerprint-root-path)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  jq '.components[0].fingerprint.path = "."' "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 3 "$?" "a component-root fingerprint path must be refused"
+  assert_contains "$(verdict_field "$out" .reason)" "fingerprint path must be a strict descendant" \
+    "the fingerprint path should fail the structural descendant check"
+
+  rec=$(make_case fingerprint-root-input)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  jq '.components[0].fingerprint.files = ["."]' "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 3 "$?" "a component-root fingerprint input must be refused"
+  assert_contains "$(verdict_field "$out" .reason)" "fingerprint file must be a strict descendant" \
+    "the fingerprint input should fail the structural descendant check"
+  pass "fingerprint paths cannot name their component root"
+}
+
+test_component_directory_may_be_the_worktree_root() {
+  local rec out
+  rec=$(make_case worktree-root-component)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  jq 'del(.components[0].dir)
+    | .components[0].fingerprint.path = "component/built/.fm-provision-fingerprint"
+    | .components[0].fingerprint.files = ["component/lock.txt"]
+    | .components[0].reset = ["component/built"]
+    | .components[0].install = [{"name":"build","argv":["sh","-c","mkdir -p component/built && echo built > component/built/log"]}]
+    | .components[0].probes = [{"name":"artifact present","argv":["sh","-c","test -s component/built/log"]}]' \
+    "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 0 "$?" "a component may legitimately use the worktree root: $out"
+  [ "$(verdict_field "$out" .status)" = ready ] || fail "the root component should be ready: $out"
+  pass "component roots retain the deliberate worktree-root asymmetry"
 }
 
 test_symlinked_paths_are_refused_before_access() {
@@ -386,7 +470,7 @@ test_symlinked_paths_are_refused_before_access() {
   out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
   expect_code 3 "$?" "a reset path through a symlink must fail"
   assert_present "$outside/env/sentinel" "a refused reset must not delete outside the component"
-  assert_contains "$(verdict_field "$out" .reason)" "reset path escapes" \
+  assert_contains "$(verdict_field "$out" .reason)" "reset path must be a strict descendant" \
     "the reset failure should report containment refusal"
 
   rec=$(make_case symlink-fingerprint)
@@ -402,9 +486,9 @@ test_symlinked_paths_are_refused_before_access() {
   jq '.components[0].fingerprint.path = "cache/fingerprint"' \
     "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
   out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
-  expect_code 0 "$?" "a refused fingerprint symlink should force a safe rebuild"
-  [ "$(verdict_field "$out" '.components[0].result')" = installed ] \
-    || fail "a fingerprint reached through a symlink must not authorize reuse: $out"
+  expect_code 3 "$?" "a fingerprint path through a symlink must fail"
+  assert_contains "$(verdict_field "$out" .reason)" "fingerprint path must be a strict descendant" \
+    "the fingerprint failure should report containment refusal"
   after=$(shasum -a 256 "$outside/fingerprint" | awk '{print $1}')
   [ "$before" = "$after" ] || fail "a fingerprint write escaped through an in-tree symlink"
   pass "symlinked reset and fingerprint paths cannot escape the worktree"
@@ -637,6 +721,18 @@ install_spawn_manifest() {
   jq "$filter" "$target" > "$home/config/provision/project.json"
 }
 
+seed_spawn_provision_evidence() {
+  local home=$1 id=$2
+  printf '{"status":"ready"}\n' > "$home/state/$id.provision"
+  printf 'stale log\n' > "$home/state/$id.provision.log"
+  {
+    printf '\n<!-- fm-provision:begin -->\n'
+    printf '\n# Environment readiness\n\n'
+    printf 'This stale section must be retired.\n'
+    printf '\n<!-- fm-provision:end -->\n'
+  } >> "$home/data/$id/brief.md"
+}
+
 exported_path() {
   awk -F '\t' '$2 ~ /^export PATH=/ { print $2 }' "$1" | head -n 1
 }
@@ -705,12 +801,16 @@ test_spawn_no_provision_opt_out() {
   read_spawn_case "$rec"
   install_spawn_manifest "$HOME_DIR" "$CASE_DIR" \
     '.components[0].probes = [{"name":"always fails","argv":["false"]}]'
+  seed_spawn_provision_evidence "$HOME_DIR" "$id"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" --no-provision)
   expect_code 0 "$?" "--no-provision should spawn without provisioning: $out"
   assert_not_contains "$out" "WORKTREE PROVISIONING FAILED" "--no-provision should not run the manifest at all"
   assert_absent "$HOME_DIR/state/$id.provision" "--no-provision should leave no verdict"
-  pass "--no-provision skips provisioning entirely"
+  assert_absent "$HOME_DIR/state/$id.provision.log" "--no-provision should leave no log"
+  assert_not_contains "$(cat "$HOME_DIR/data/$id/brief.md")" "Environment readiness" \
+    "--no-provision should retire a prior readiness section"
+  pass "--no-provision retires stale evidence and skips provisioning"
 }
 
 test_spawn_skipped_provisioning_is_a_true_no_op() {
@@ -719,6 +819,7 @@ test_spawn_skipped_provisioning_is_a_true_no_op() {
   rec=$(make_spawn_case skip "$id")
   read_spawn_case "$rec"
   install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+  seed_spawn_provision_evidence "$HOME_DIR" "$id"
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" --scout)
   expect_code 0 "$?" "an excluded-kind provisioning skip should not disturb the spawn: $out"
@@ -745,10 +846,14 @@ test_runtime_check_mismatch_fails_before_building
 test_runtime_check_with_no_output_fails
 test_probe_expect_is_enforced
 test_step_timeout_is_reported_and_bounded
+test_bounded_step_supervises_background_descendants
 test_reset_is_bounded_by_the_total_budget
 test_block_policy_uses_a_distinct_exit_code
 test_kind_gate_and_force
 test_paths_are_contained
+test_reset_targets_are_structurally_strict_descendants
+test_fingerprint_paths_are_structurally_strict_descendants
+test_component_directory_may_be_the_worktree_root
 test_symlinked_paths_are_refused_before_access
 test_env_may_not_hijack_path
 test_malformed_manifest_warns_rather_than_bricking_spawns

@@ -3178,10 +3178,20 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 # further down use it.
 exclude_path() {
   local rel=$1 EXCL
-  EXCL=$(git_repository_probe -C "$WT" rev-parse --git-path info/exclude 2>/dev/null || true)
-  [ -n "$EXCL" ] || return 0
-  mkdir -p "$(dirname "$EXCL")"
-  grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
+  EXCL=$(git_repository_probe -C "$WT" rev-parse --git-path info/exclude 2>/dev/null) || return 1
+  [ -n "$EXCL" ] || return 1
+  mkdir -p "$(dirname "$EXCL")" || return 1
+  grep -qxF "$rel" "$EXCL" 2>/dev/null && return 0
+  printf '%s\n' "$rel" >> "$EXCL" || return 1
+  grep -qxF "$rel" "$EXCL" 2>/dev/null
+}
+
+fm_provision_register_exclude() {
+  local rel=$1
+  if git_repository_probe -C "$WT" check-ignore -q "${rel#/}" 2>/dev/null; then
+    return 0
+  fi
+  exclude_path "$rel"
 }
 
 # Provision the freshly proven worktree's declared project dependencies, so the
@@ -3195,7 +3205,7 @@ exclude_path() {
 PROVISION_SUMMARY=
 PROVISION_PATH_PREFIX=
 spawn_provision_worktree() {
-  local mode line rc=0
+  local mode
   if [ "$NO_PROVISION" = 1 ]; then
     PROVISION_SUMMARY=off
     return 0
@@ -3208,19 +3218,7 @@ spawn_provision_worktree() {
     PROVISION_SUMMARY=off
     return 0
   fi
-  fm_provision_worktree "$WT" "$STATE/provision-cache" "$STATE/$ID.provision.log" || rc=$?
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    # Only exclude what git would otherwise report; a project that already
-    # ignores its own build directories keeps a clean shared exclude file.
-    if git_repository_probe -C "$WT" check-ignore -q "${line#/}" 2>/dev/null; then
-      continue
-    fi
-    exclude_path "$line"
-  done <<EOF
-$FM_PROVISION_EXCLUDES
-EOF
-  [ "$rc" -eq 0 ] || return "$rc"
+  fm_provision_worktree "$WT" "$STATE/provision-cache" "$STATE/$ID.provision.log" || return 1
   PROVISION_SUMMARY=$FM_PROVISION_SUMMARY
   PROVISION_PATH_PREFIX=$FM_PROVISION_PATH_PREFIX
   return 0

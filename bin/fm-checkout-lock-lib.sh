@@ -116,10 +116,11 @@ fm_checkout_lexical_path() {
 #
 # Modes:
 #   strict   - print one resolved path per input; fail if ANY input is untrusted.
-#   lenient  - print one line per input in input order, empty when that input is
-#              untrusted, and succeed. Callers that must tolerate an individual
-#              unresolvable path (a stale inventory entry) use this and decide
-#              per entry, exactly as a per-path call would have let them.
+#   lenient  - print one non-empty tagged line per input in input order: `+path`
+#              for a trusted path and `-` for an untrusted path, then succeed.
+#              Callers that must tolerate an individual unresolvable path (a
+#              stale inventory entry) use this and decide per entry, exactly as
+#              a per-path call would have let them.
 fm_checkout_trusted_dirs() {
   local mode=$1
   shift
@@ -133,10 +134,10 @@ fm_checkout_trusted_dirs() {
       my $resolved = resolve($raw, $base);
       if (!defined $resolved) {
         exit 1 if $mode eq q{strict};
-        print qq{\n};
+        print qq{-\n};
         next;
       }
-      print $resolved . qq{\n};
+      print(($mode eq q{lenient} ? q{+} : q{}) . $resolved . qq{\n});
     }
     exit 0;
 

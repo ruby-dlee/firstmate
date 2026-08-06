@@ -113,10 +113,34 @@ test_batch_resolution_is_positional_and_mode_aware() {
   first=$(printf '%s\n' "$out" | sed -n '1p')
   second=$(printf '%s\n' "$out" | sed -n '2p')
   third=$(printf '%s\n' "$out" | sed -n '3p')
-  [ "$first" = "$real" ] || fail "lenient batch resolution lost a trusted directory"
-  [ -z "$second" ] || fail "lenient batch resolution trusted a symlinked directory"
-  [ "$third" = "$real/nested" ] \
+  [ "$first" = "+$real" ] || fail "lenient batch resolution lost a trusted directory"
+  [ "$second" = - ] || fail "lenient batch resolution trusted a symlinked directory"
+  [ "$third" = "+$real/nested" ] \
     || fail "lenient batch resolution did not keep later rows aligned after an untrusted one"
+
+  out=$(fm_checkout_trusted_dirs lenient "$real" "$real/nested" "$untrusted") \
+    || fail "lenient batch resolution failed with a trailing untrusted input"
+  line_count=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
+  [ "$line_count" -eq 3 ] \
+    || fail "lenient batch resolution dropped a trailing untrusted row"
+  [ "$(printf '%s\n' "$out" | sed -n '1p')" = "+$real" ] \
+    || fail "trailing-untrusted resolution lost its first trusted row"
+  [ "$(printf '%s\n' "$out" | sed -n '2p')" = "+$real/nested" ] \
+    || fail "trailing-untrusted resolution lost its second trusted row"
+  [ "$(printf '%s\n' "$out" | sed -n '3p')" = - ] \
+    || fail "trailing-untrusted resolution lost its final rejection row"
+
+  out=$(fm_checkout_trusted_dirs lenient "$untrusted" "$untrusted" "$untrusted") \
+    || fail "lenient batch resolution failed when every input was untrusted"
+  [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" -eq 3 ] \
+    || fail "all-untrusted batch resolution did not preserve every row"
+  [ "$out" = $'-\n-\n-' ] \
+    || fail "all-untrusted batch resolution returned an unexpected wire format"
+
+  out=$(fm_checkout_trusted_dirs lenient "$untrusted") \
+    || fail "lenient batch resolution failed for one untrusted input"
+  [ "$out" = - ] \
+    || fail "single-untrusted batch resolution did not preserve its rejection row"
 
   out=$(fm_checkout_trusted_dirs strict "$real" "$real/nested") \
     || fail "strict batch resolution rejected two trusted directories"
@@ -131,7 +155,11 @@ test_batch_resolution_matches_single_path_resolution() {
     "$TMP_ROOT/missing-entirely" "$TMP_ROOT/batch-real/nested/.." /; do
     single=$(fm_checkout_trusted_dir "$candidate" 2>/dev/null) || single='<rejected>'
     batch=$(fm_checkout_trusted_dirs lenient "$candidate" 2>/dev/null) || batch='<rejected>'
-    [ -n "$batch" ] || batch='<rejected>'
+    case "$batch" in
+      +/*) batch=${batch#+} ;;
+      -) batch='<rejected>' ;;
+      *) batch='<invalid>' ;;
+    esac
     [ "$single" = "$batch" ] || fail \
       "batch and single-path resolution disagree for $candidate: single=$single batch=$batch"
   done

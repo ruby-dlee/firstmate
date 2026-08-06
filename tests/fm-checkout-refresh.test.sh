@@ -701,6 +701,10 @@ SH
   fm_git_init_commit "$fixture/target"
   target=$(cd "$fixture/target" && pwd -P)
   add_pool_worktree "$target" "$home/user/.treehouse/target-pool" 2
+  mkdir -p "$home/user/.treehouse/zz-trailing-uninspectable"
+  printf '{"worktrees":[{"name":"gone","path":"%s"}]}\n' \
+    "$home/user/.treehouse/zz-trailing-uninspectable/never-existed" \
+    > "$home/user/.treehouse/zz-trailing-uninspectable/treehouse-state.json"
   alone=$(count_preflight)
   [ "$alone" -gt 0 ] || fail "the preflight cost probe recorded no git invocations at all"
 
@@ -2606,6 +2610,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
   test_reinspection_failure_invalidates_coverage_health
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-trusted-dirs ]; then
+  test_pool_preflight_cost_is_scoped_to_the_target_pool
   exit 0
 fi
 

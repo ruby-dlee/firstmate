@@ -2872,7 +2872,7 @@ preflight() {
 # common Git directory amounts to - is what made a whole-pool sweep scale as
 # candidates x registrations instead of candidates + registrations.
 registered_worktree_roots() {
-  local source=$1 listed line registration_output
+  local source=$1 listed line registration_output failed=0
   local -a registrations
   listed=$(GIT_OPTIONAL_LOCKS=0 git -C "$source" -c core.quotePath=false worktree list --porcelain 2>/dev/null) || return 1
   registrations=()
@@ -2892,14 +2892,22 @@ EOF
   # the whole preflight on that race would turn a transient state into a refusal
   # to spawn.
   registration_output=$(fm_checkout_trusted_dirs lenient "${registrations[@]}") || return 1
-  printf '%s\n' "$registration_output" | grep -v '^$'
-  return 0
+  while IFS= read -r line; do
+    case "$line" in
+      +/*) printf '%s\n' "${line#+}" ;;
+      -) ;;
+      *) failed=1 ;;
+    esac
+  done <<EOF
+$registration_output
+EOF
+  [ "$failed" -eq 0 ]
 }
 
 pool_preflight() {
   local expected_source=$1 expected_common treehouse_paths treehouse_state pool worktree
   local canonical common dirty example failed=0 line index
-  local registry_file scoped_file joined_file canonical_output
+  local registry_file scoped_file joined_file canonical_output canonical_valid
   local -a rows_state rows_pool rows_worktree rows_canonical
   resolve_exact_git_root "$expected_source" || {
     echo "error: expected Treehouse source must be an exact inspectable Git repository root: $expected_source" >&2
@@ -2952,16 +2960,22 @@ pool_preflight() {
   rows_canonical=()
   if [ "${#rows_worktree[@]}" -gt 0 ]; then
     # Lenient: a Treehouse inventory can name a path that no longer resolves, and
-    # one stale entry must not fail the whole preflight. Output is positional -
-    # one line per input, empty where the path is untrusted - so an unresolvable
-    # entry stays attached to its own row and is decided on its own below.
+    # one stale entry must not fail the whole preflight. Output is positional and
+    # every row is non-empty, so an unresolvable entry stays attached to its own
+    # row and is decided on its own below.
     canonical_output=$(fm_checkout_trusted_dirs lenient "${rows_worktree[@]}") || canonical_output=''
+    canonical_valid=1
     while IFS= read -r line; do
-      rows_canonical+=("$line")
+      case "$line" in
+        +/*) rows_canonical+=("${line#+}") ;;
+        -) rows_canonical+=('') ;;
+        *) canonical_valid=0 ;;
+      esac
     done <<EOF
 $canonical_output
 EOF
-    if [ "${#rows_canonical[@]}" -ne "${#rows_worktree[@]}" ]; then
+    if [ "$canonical_valid" -ne 1 ] \
+        || [ "${#rows_canonical[@]}" -ne "${#rows_worktree[@]}" ]; then
       # Alignment is the only thing that makes the scoping safe. If it is not
       # exact, do not guess: treat every row as needing full inspection.
       rows_canonical=()

@@ -98,6 +98,7 @@ The tracked `.no-mistakes.yaml` keeps test evidence outside the repo and defines
 That evidence policy is specific to the firstmate repo: target projects may legitimately commit `.no-mistakes/evidence/` from their own no-mistakes pipeline, but firstmate keeps `.no-mistakes/` local and CI rejects tracked entries under that path.
 That command requires `tmux` on `PATH`, prints `tmux -V`, dispatches the behavior tests through [`bin/fm-behavior-shards.sh`](../bin/fm-behavior-shards.sh) `--run` across eight concurrent shards, and fails if any script exits non-zero.
 Each shard runs its assigned scripts serially, and the command finishes with the helper's `--verify` pass to prove the executed union is complete and disjoint.
+The gate gives each shard private `TMPDIR` and `TMUX_TMPDIR` roots, captures output per shard, and prints those logs in shard order after every shard finishes.
 Reusing the same planner and runner as CI restores local-CI parity without duplicating the helper's shard-planning contract here.
 
 ## Crosscheck reviewer

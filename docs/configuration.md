@@ -106,7 +106,7 @@ Reusing the same planner and runner as CI restores local-CI parity without dupli
 `config/crosscheck-reviewer.json` selects the local independent identity for the PR merge-gate reviewer.
 It is gitignored and is not inferred from the author account or ambient Codex configuration.
 The current schema has one nonempty `reviewers` array, whose entries require exactly `harness`, `model`, `effort`, and `account_home`.
-The accepted policy profiles are Codex `gpt-5.6-sol` at `xhigh` effort and Claude `claude-opus-5` at `xhigh` effort.
+The accepted policy profiles are Codex `gpt-5.6-sol` at `xhigh` effort, Claude `claude-opus-5` at `xhigh` effort, and Pi `gpt-5.6-sol` at `xhigh` effort.
 Every `account_home` must be an existing absolute directory.
 Crosscheck resolves each configured account home and selects the first entry whose account home and model both differ from the routed author identity recorded in task metadata.
 Codex binds both `CODEX_HOME` and `HOME` to that path.

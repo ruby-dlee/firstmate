@@ -28,6 +28,12 @@ The file is local and gitignored at `config/crosscheck-reviewer.json`.
       "model": "claude-opus-5",
       "effort": "xhigh",
       "account_home": "/absolute/path/to/an/independent/claude/home"
+    },
+    {
+      "harness": "pi",
+      "model": "gpt-5.6-sol",
+      "effort": "xhigh",
+      "account_home": "/absolute/path/to/an/independent/pi/home"
     }
   ]
 }
@@ -38,7 +44,7 @@ It then binds the provider's executing credential selector to that exact path an
 Account separation therefore depends on the executing credential source rather than a configuration label.
 For a task explicitly marked `account_routing_emergency_bypass=1`, a reviewer on the other supported provider establishes both account-namespace and model separation without inventing an `account_home` for the author.
 A same-provider reviewer still fails closed for that structurally unrouted task because account independence cannot be proved.
-The accepted profiles are Codex `gpt-5.6-sol` xhigh and Claude `claude-opus-5` xhigh.
+The accepted profiles are Codex `gpt-5.6-sol` xhigh, Claude `claude-opus-5` xhigh, and Pi `gpt-5.6-sol` xhigh.
 Absent configuration, unavailable credentials, missing model separation, and unprovable account separation all produce `CROSSCHECK TOOL-FAILURE` and a nonzero exit before reviewer launch.
 
 Start crosscheck as soon as a PR URL exists so it can overlap no-mistakes' remaining CI work.

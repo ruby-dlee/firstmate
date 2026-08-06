@@ -1247,7 +1247,12 @@ def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
     allowed_profiles = {
         ("codex", "gpt-5.6-sol", "xhigh"),
         ("claude", "claude-opus-5", "xhigh"),
+        ("pi", "gpt-5.6-sol", "xhigh"),
     }
+    allowed_profiles_message = " or ".join(
+        f"{harness} {model} {effort}"
+        for harness, model, effort in sorted(allowed_profiles)
+    )
     author_home_value = meta.get("account_home")
     author_is_unrouted = meta.get("account_routing_emergency_bypass") == "1"
     require(
@@ -1280,7 +1285,7 @@ def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
         )
         require(
             (harness, model, effort) in allowed_profiles,
-            f"{label} must be codex gpt-5.6-sol xhigh or claude claude-opus-5 xhigh",
+            f"{label} must be {allowed_profiles_message}",
         )
         require(
             account_home.is_absolute() and account_home.is_dir(),

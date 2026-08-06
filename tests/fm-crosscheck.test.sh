@@ -589,6 +589,139 @@ select_claude_reviewer() {
 EOF
 }
 
+test_reviewer_policy_profiles_and_independence() {
+  python3 - "$CROSSCHECK_PY" "$TMP_ROOT" <<'PY' \
+    || fail "reviewer policy profiles or independence validation regressed"
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+root = Path(sys.argv[2]) / "reviewer-policy-profiles"
+root.mkdir()
+homes = {
+    name: root / name
+    for name in ("author-home", "codex-home", "claude-home", "pi-home")
+}
+for account_home in homes.values():
+    account_home.mkdir()
+config_path = root / "reviewer.json"
+os.environ["FM_CROSSCHECK_REVIEWER_CONFIG"] = str(config_path)
+
+profiles = [
+    ("codex", "gpt-5.6-sol", "xhigh", "codex-home"),
+    ("claude", "claude-opus-5", "xhigh", "claude-home"),
+    ("pi", "gpt-5.6-sol", "xhigh", "pi-home"),
+]
+
+
+def reviewer(harness, model, effort, home_name):
+    return {
+        "harness": harness,
+        "model": model,
+        "effort": effort,
+        "account_home": str(homes[home_name]),
+    }
+
+
+def write_config(reviewers):
+    config_path.write_text(json.dumps({"reviewers": reviewers}), encoding="utf-8")
+
+
+def expect_refused(meta, expected):
+    try:
+        module.reviewer_config(root, meta)
+    except module.CrosscheckError as exc:
+        message = str(exc)
+        assert expected in message, message
+        return message
+    raise AssertionError("reviewer_config unexpectedly selected a reviewer")
+
+
+validation_author = {
+    "harness": "validation-author",
+    "model": "validation-author-model",
+    "account_home": str(homes["author-home"]),
+}
+for harness, model, effort, home_name in profiles:
+    candidate = reviewer(harness, model, effort, home_name)
+    write_config([candidate])
+    selected = module.reviewer_config(root, validation_author)
+    assert selected == candidate
+    print(f"VALID harness={harness} model={model} effort={effort}")
+
+write_config(
+    [
+        {
+            "harness": "pi",
+            "model": "unlisted-model",
+            "effort": "xhigh",
+            "account_home": str(homes["pi-home"]),
+        }
+    ]
+)
+unlisted = expect_refused(validation_author, "must be")
+for accepted in (
+    "claude claude-opus-5 xhigh",
+    "codex gpt-5.6-sol xhigh",
+    "pi gpt-5.6-sol xhigh",
+):
+    assert accepted in unlisted, unlisted
+print(f"REFUSED unlisted-profile: {unlisted}")
+
+claude_author = {
+    "harness": "claude",
+    "model": "claude-opus-5",
+    "account_home": str(homes["author-home"]),
+}
+write_config(
+    [
+        reviewer("claude", "claude-opus-5", "xhigh", "claude-home"),
+        reviewer("pi", "gpt-5.6-sol", "xhigh", "pi-home"),
+    ]
+)
+selected = module.reviewer_config(root, claude_author)
+assert selected["harness"] == "pi"
+assert selected["model"] == "gpt-5.6-sol"
+assert selected["effort"] == "xhigh"
+assert selected["account_home"] == str(homes["pi-home"].resolve())
+print(
+    "SELECTED "
+    f"harness={selected['harness']} model={selected['model']} "
+    f"effort={selected['effort']} account_home={selected['account_home']}"
+)
+
+same_model_author = {
+    "harness": "codex",
+    "model": "gpt-5.6-sol",
+    "account_home": str(homes["author-home"]),
+}
+write_config([reviewer("pi", "gpt-5.6-sol", "xhigh", "pi-home")])
+same_model = expect_refused(same_model_author, "different model")
+print(f"REFUSED shared-model: {same_model}")
+
+write_config(
+    [
+        {
+            "harness": "pi",
+            "model": "gpt-5.6-sol",
+            "effort": "xhigh",
+            "account_home": str(homes["author-home"]),
+        }
+    ]
+)
+same_account = expect_refused(claude_author, "different account_home")
+print(f"REFUSED shared-account: {same_account}")
+PY
+  pass "all reviewer profiles validate while model and account independence still fail closed"
+}
+
 test_clear_review_uses_policy_contract() {
   local record case_dir base head output
   record=$(make_case clear)
@@ -1908,6 +2041,7 @@ test_verify_rechecks_live_head_and_claims() {
 
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
+    test_reviewer_policy_profiles_and_independence|\
     test_empty_runtime_overrides_use_home_defaults|\
     test_empty_environment_fallback_is_generic|\
     test_set_runtime_overrides_remain_authoritative|\
@@ -1954,6 +2088,7 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
   exit 0
 fi
 
+test_reviewer_policy_profiles_and_independence
 test_clear_review_uses_policy_contract
 test_empty_runtime_overrides_use_home_defaults
 test_empty_environment_fallback_is_generic

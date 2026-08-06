@@ -44,6 +44,30 @@ test_final_wait_keeps_original_deadline() {
     || fail "final wait exceeded the original deadline: ${elapsed}s"
   assert_contains "$(cat "$output")" "timed out after 0.25 seconds" \
     "final-wait timeout was not loud"
+  python3 - "$HELPER" <<'PY'
+import importlib.util
+import sys
+import time
+
+spec = importlib.util.spec_from_file_location("fm_bounded_io", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+
+class ExitedSupervisor:
+    def __init__(self):
+        self.polls = 0
+
+    def poll(self):
+        self.polls += 1
+        return 0
+
+
+supervisor = ExitedSupervisor()
+assert module._reap_anchor(supervisor, time.monotonic() - 1)
+assert supervisor.polls == 1
+PY
 }
 
 test_success_reaps_residual_process_group() {

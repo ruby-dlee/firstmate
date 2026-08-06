@@ -791,6 +791,9 @@ def _request_anchor_abort(process: subprocess.Popen[bytes]) -> None:
 
 
 def _reap_anchor(process: subprocess.Popen[bytes], deadline: float) -> bool:
+    # Deadline expiry forbids waiting, not observing an already-exited anchor.
+    if process.poll() is not None:
+        return True
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return False
@@ -1012,6 +1015,16 @@ def run_bounded(
                 if state["ready"] and not abort_requested:
                     _request_anchor_abort(process)
                     abort_requested = True
+            # Consume already-buffered proof without extending the deadline.
+            if status_read >= 0 and not state["cleanup_verified"]:
+                try:
+                    chunk = os.read(status_read, SUPERVISOR_STATUS_LIMIT + 1)
+                except BlockingIOError:
+                    chunk = b""
+                if chunk:
+                    status_buffer.extend(chunk)
+                    if len(status_buffer) <= SUPERVISOR_STATUS_LIMIT:
+                        _consume_supervisor_status(status_buffer, state)
         if process is not None:
             anchor_reaped = _reap_anchor(process, deadline)
         if selector is not None:

@@ -109,9 +109,9 @@ The current schema has one nonempty `reviewers` array, whose entries require exa
 The accepted policy profiles are Codex `gpt-5.6-sol` at `xhigh` effort, Claude `claude-opus-5` at `xhigh` effort, and Pi `gpt-5.6-sol` at `xhigh` effort.
 Every `account_home` must be an existing absolute directory.
 Crosscheck resolves each configured account home and selects the first entry whose account home and model both differ from the routed author identity recorded in task metadata.
-Codex binds both `CODEX_HOME` and `HOME` to that path.
-Claude creates a disposable private `HOME` whose `.claude` resolves to that path, binds both `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` to it, and verifies the exact OAuth-file or scoped-Keychain credential source before launch.
-Pi creates a disposable private `HOME` whose `.pi/agent` resolves to that path, binds `PI_CODING_AGENT_DIR` to it, and requires an `openai-codex` OAuth credential in its `auth.json` before launch.
+Codex binds both `CODEX_HOME` and `HOME` to that path and sets `project_doc_max_bytes=0` so reviewed-repository `AGENTS.md` files cannot supply reviewer instructions.
+Claude creates a disposable private `HOME` whose `.claude` resolves to that path, binds both `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` to it, verifies the exact OAuth-file or scoped-Keychain credential source before launch, and uses `--safe-mode` so reviewed-repository `CLAUDE.md` files cannot supply reviewer instructions.
+Pi creates a disposable private `HOME` whose `.pi/agent` resolves to that path, binds `PI_CODING_AGENT_DIR` to it, requires an `openai-codex` OAuth credential in its `auth.json` before launch, and uses `--no-context-files` so reviewed-repository context files cannot supply reviewer instructions.
 The verdict and its Bash-created receipt must report the executing selector and private `HOME`, so a configured label cannot establish separation from a different executing account.
 For an author task marked `account_routing_emergency_bypass=1`, a different supported provider proves both account namespace and model separation, while a same-provider reviewer fails closed without `account_home` proof.
 An absent or invalid file is an unavailable reviewer and therefore blocks crosscheck and merge.

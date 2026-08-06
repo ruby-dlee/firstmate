@@ -24,7 +24,10 @@ make_case() {
     "$case_dir/author-home" "$case_dir/reviewer-home" "$case_dir/fakebin"
   printf '{"tokens":{"access_token":"test-reviewer-token"}}\n' \
     > "$case_dir/reviewer-home/auth.json"
-  printf '{}\n' > "$case_dir/reviewer-home/.credentials.json"
+  # A signed-IN reviewer account: the credential predicate requires a non-empty
+  # token, so an empty object here would model a signed-out account instead.
+  printf '{"claudeAiOauth":{"accessToken":"test-reviewer-access-token"}}\n' \
+    > "$case_dir/reviewer-home/.credentials.json"
   printf '{}\n' > "$case_dir/reviewer-home/.claude.json"
   git -C "$repo" init -q -b main
   printf 'base\n' > "$repo/app.txt"
@@ -1951,6 +1954,84 @@ EOF
   pass "a launcher that discards the config redirect is caught, not trusted"
 }
 
+test_signed_out_oauth_file_is_not_a_credential() {
+  python3 - "$CROSSCHECK_PY" <<'PY' \
+    || fail "a signed-out OAuth file was accepted as an executing credential"
+import importlib.util
+import json
+import pathlib
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+root = pathlib.Path(tempfile.mkdtemp())
+
+
+def credential(payload):
+    path = root / f"c{abs(hash(json.dumps(payload, sort_keys=True)))}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+# A provisioned-but-signed-out account leaves empty tokens behind. Mere
+# existence must never certify a credential source.
+for payload in (
+    {"claudeAiOauth": {"accessToken": "", "refreshToken": ""}},
+    {"claudeAiOauth": {"accessToken": "   ", "refreshToken": "\t"}},
+    {"claudeAiOauth": {}},
+    {"other": 1},
+):
+    assert not module.claude_oauth_file_carries_token(credential(payload)), payload
+
+for payload in (
+    {"claudeAiOauth": {"accessToken": "live", "refreshToken": ""}},
+    {"claudeAiOauth": {"accessToken": "", "refreshToken": "live"}},
+):
+    assert module.claude_oauth_file_carries_token(credential(payload)), payload
+
+assert not module.claude_oauth_file_carries_token(root / "absent.json")
+
+# The rejection must name which sources were tried and why each failed, rather
+# than reporting one indistinguishable message for every cause.
+account = root / "signed-out-account"
+account.mkdir()
+(account / ".credentials.json").write_text(
+    json.dumps({"claudeAiOauth": {"accessToken": "", "refreshToken": ""}}),
+    encoding="utf-8",
+)
+protocol = root / "signed-out-protocol" / ".crosscheck"
+protocol.mkdir(parents=True)
+try:
+    module.prepare_claude_execution_home(protocol, account)
+except module.CrosscheckError as exc:
+    detail = str(exc)
+else:
+    raise AssertionError("signed-out account produced an executing credential")
+
+assert "carries no non-empty" in detail, detail
+assert ".credentials.json" in detail, detail
+
+bare = root / "bare-account"
+bare.mkdir()
+protocol = root / "bare-protocol" / ".crosscheck"
+protocol.mkdir(parents=True)
+try:
+    module.prepare_claude_execution_home(protocol, bare)
+except module.CrosscheckError as exc:
+    bare_detail = str(exc)
+else:
+    raise AssertionError("account with no credential produced one")
+
+assert "no OAuth file at" in bare_detail, bare_detail
+assert bare_detail != detail, "distinct causes shared one diagnostic"
+PY
+  pass "a signed-out OAuth file is rejected with a cause-naming diagnostic"
+}
+
 test_verify_rechecks_live_head_and_claims() {
   local record case_dir base head next_base rc verified
   record=$(make_case verify-live)
@@ -2076,4 +2157,5 @@ test_completed_reviewer_suspicion_is_blocking
 test_reading_only_suspicion_is_a_tool_failure
 test_reviewer_that_executes_nothing_is_unreviewed
 test_stripped_config_redirect_is_unreviewed
+test_signed_out_oauth_file_is_not_a_credential
 test_verify_rechecks_live_head_and_claims

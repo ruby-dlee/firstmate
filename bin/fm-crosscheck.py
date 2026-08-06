@@ -134,6 +134,34 @@ def current_passwd_identity() -> tuple[str, Path]:
     return record.pw_name, home.resolve()
 
 
+def claude_oauth_file_carries_token(path: Path) -> bool:
+    """Report whether a Claude OAuth file actually holds a usable token.
+
+    A provisioned-but-signed-out account leaves a well-formed file behind whose
+    ``accessToken`` and ``refreshToken`` are empty strings. Treating mere
+    existence as a credential certifies a source that cannot authenticate, which
+    is the same failure mode as a check that runs and concludes nothing.
+    """
+    try:
+        value = read_json(
+            path,
+            "Claude executing-account OAuth file",
+            maximum_bytes=MAX_REVIEWER_CONFIG_BYTES,
+            maximum_items=4096,
+        )
+    except CrosscheckError:
+        return False
+    if not isinstance(value, dict):
+        return False
+    oauth = value.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return False
+    return any(
+        isinstance(oauth.get(key), str) and oauth[key].strip()
+        for key in ("accessToken", "refreshToken")
+    )
+
+
 def prepare_claude_execution_home(
     protocol_dir: Path, account_home: Path
 ) -> tuple[Path, str, str]:
@@ -169,12 +197,22 @@ def prepare_claude_execution_home(
                 "Claude executing-account credential inspection requires a regular "
                 f"non-symlink file at {credential_file}"
             )
-        return execution_home, "oauth-file", str(credential_file)
+        if claude_oauth_file_carries_token(credential_file):
+            return execution_home, "oauth-file", str(credential_file)
+        # Present but unusable is not a credential; fall through to the Keychain
+        # rather than certifying a source that cannot authenticate.
+        file_rejection = (
+            f"OAuth file {credential_file} is present but carries no non-empty "
+            "claudeAiOauth accessToken or refreshToken"
+        )
+    else:
+        file_rejection = f"no OAuth file at {credential_file}"
 
     if sys.platform != "darwin":
         tool_fail(
-            "Claude executing-account credential inspection found neither an OAuth "
-            f"file at {credential_file} nor a supported scoped Keychain"
+            "Claude executing-account credential inspection found no usable "
+            f"credential for config home {account_home}: {file_rejection}; "
+            "scoped Keychain inspection is unsupported on this platform"
         )
 
     account_name, passwd_home = current_passwd_identity()
@@ -225,9 +263,35 @@ def prepare_claude_execution_home(
     )
     if inspected.returncode != 0:
         tool_fail(
-            "Claude executing-account credential inspection found no scoped "
-            f"Keychain item service={service!r} account={account_name!r} for "
-            f"config home {account_home}"
+            "Claude executing-account credential inspection found no usable "
+            f"credential for config home {account_home}: {file_rejection}; "
+            f"scoped Keychain item service={service!r} account={account_name!r} "
+            "is absent"
+        )
+    # Existence is not readability. Probe through a shell that discards stdout so
+    # the secret is never captured, bounded, logged, or stored in the ledger; only
+    # the exit status is consulted.
+    readable = run_command(
+        [
+            "/bin/sh",
+            "-c",
+            'exec "$1" find-generic-password -a "$2" -s "$3" -w >/dev/null 2>&1',
+            "sh",
+            str(security),
+            account_name,
+            service,
+        ],
+        cwd=execution_home,
+        env=environment,
+        timeout=10,
+        description="Claude scoped Keychain credential readability probe",
+    )
+    if readable.returncode != 0:
+        tool_fail(
+            "Claude executing-account credential inspection found no usable "
+            f"credential for config home {account_home}: {file_rejection}; "
+            f"scoped Keychain item service={service!r} account={account_name!r} "
+            "is present but cannot be read non-interactively"
         )
     return execution_home, "scoped-keychain", f"{service}:{account_name}"
 

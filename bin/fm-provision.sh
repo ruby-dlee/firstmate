@@ -6,6 +6,8 @@
 #   fm-provision.sh <project-dir> <worktree-dir> [--task <id>] [--kind <kind>]
 #                   [--force] [--manifest <file>] [--quiet]
 #   fm-provision.sh --manifest-path <project-dir>   print the resolved manifest path
+#   --force overrides the manifest's kind gate and rebuilds every component
+#   instead of reusing a matching fingerprint.
 #
 # WHY THIS EXISTS
 #   A Treehouse lease delivers a clean Git worktree and nothing else. The
@@ -310,10 +312,11 @@ STARTED=$(date +%s)
 
 # --- token expansion and containment ----------------------------------------
 #
-# Manifest strings may reference exactly two tokens, so one manifest can name a
-# host runtime directory or a path inside the lease without being rewritten per
-# worktree: ${HOME} and ${WORKTREE}. Nothing else expands, so a manifest is
-# never a shell.
+# Command arguments, expected output, environment values, and path fields may
+# reference exactly two tokens, so one manifest can name a host runtime directory
+# or a path inside the lease without being rewritten per worktree: ${HOME} and
+# ${WORKTREE}. Labels and descriptions do not expand, and no value is implicitly
+# evaluated as a shell command.
 expand_tokens() {
   local out=$1
   out=${out//\$\{HOME\}/$HOME}

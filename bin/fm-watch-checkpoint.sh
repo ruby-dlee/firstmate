@@ -86,6 +86,20 @@ run_with_perl_timeout() {
   ' "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh"
 }
 
+cleanup_timed_out_watcher_lock() {
+  local checkpoint_root checkpoint_home checkpoint_lock
+  checkpoint_root="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+  checkpoint_home="${FM_HOME:-${FM_ROOT_OVERRIDE:-$checkpoint_root}}"
+  STATE="${FM_STATE_OVERRIDE:-$checkpoint_home/state}"
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$SCRIPT_DIR/fm-wake-lib.sh" || return 1
+  checkpoint_lock="$STATE/.watch.lock"
+  if fm_lock_try_acquire "$checkpoint_lock"; then
+    fm_lock_release "$checkpoint_lock"
+  fi
+  [ ! -e "$checkpoint_lock" ] && [ ! -L "$checkpoint_lock" ]
+}
+
 set +e
 if command -v timeout >/dev/null 2>&1; then
   timeout --kill-after=2 "$SECONDS_ARG" "$SCRIPT_DIR/fm-watch.sh" >"$OUT" 2>"$ERR"
@@ -113,6 +127,10 @@ if grep -E '^watcher: already running' "$OUT" "$ERR" >/dev/null 2>&1; then
 fi
 
 if [ "$RC" -eq 124 ]; then
+  cleanup_timed_out_watcher_lock || {
+    echo "checkpoint: timed-out watcher lock is still live or could not be reclaimed" >&2
+    exit 1
+  }
   printf 'checkpoint: no actionable wake within %ss\n' "$SECONDS_ARG"
   exit 124
 fi

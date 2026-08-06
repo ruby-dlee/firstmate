@@ -874,10 +874,13 @@ if [ -n "$LOG_VERB" ]; then
         && emit working status-log "$(status_line_note "$LOG_LINE")"
       emit wedged status-log "stopped without positive working evidence; last event: $(status_line_note "$LOG_LINE")"
       ;;
-    unknown) ;;
+    unknown)
+      [ "$KIND" = secondmate ] \
+        || emit wedged status-log "stopped without positive working evidence; last event: $(status_line_note "$LOG_LINE")"
+      ;;
     *) emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")" ;;
   esac
 fi
 
 [ "$KIND" = secondmate ] && emit unknown none "idle secondmate with no current-state event"
-emit wedged none "stopped without positive working evidence or an owned-and-clearing pause"
+emit unknown none "idle lane with no current-state event"

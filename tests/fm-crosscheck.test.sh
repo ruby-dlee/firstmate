@@ -282,7 +282,7 @@ while [ "$#" -gt 0 ]; do
     --thinking) thinking=$2; shift 2 ;;
     --tools) tools=$2; shift 2 ;;
     --no-session) ephemeral=yes; shift ;;
-    --no-extensions|--no-skills|--no-prompt-templates|--no-themes|--no-approve)
+    --no-extensions|--no-skills|--no-prompt-templates|--no-themes|--no-context-files|--no-approve)
       isolated=$((isolated + 1)); shift ;;
     *) prompt=$1; shift ;;
   esac
@@ -292,7 +292,7 @@ done
 [ "$model" = gpt-5.6-sol ] || exit 66
 [ "$thinking" = xhigh ] || exit 67
 [ "$tools" = read,bash,grep,find,ls ] || exit 68
-[ "$ephemeral" = yes ] && [ "$isolated" -eq 5 ] && [ -n "$prompt" ] || exit 69
+[ "$ephemeral" = yes ] && [ "$isolated" -eq 6 ] && [ -n "$prompt" ] || exit 69
 temporary=$(mktemp "${TMPDIR:-/tmp}/fm-crosscheck-pi.XXXXXX") || exit 70
 python3 "$FM_TEST_REVIEW_DRIVER" "$PWD" "$temporary" "$FM_TEST_REVIEW_SCENARIO" "$FM_TEST_HEAD" || exit 71
 python3 - "$temporary" <<'PY'
@@ -307,6 +307,7 @@ print(json.dumps({
     "message": {
         "role": "assistant",
         "content": [{"type": "text", "text": json.dumps(structured)}],
+        "stopReason": "stop",
     },
     "toolResults": [{"toolName": "bash", "isError": False}],
 }))
@@ -818,6 +819,90 @@ PY
   pass "all reviewer profiles validate while model and account independence still fail closed"
 }
 
+test_pi_reviewer_accepts_only_successful_terminal_turn() {
+  python3 - "$CROSSCHECK_PY" <<'PY' \
+    || fail "Pi terminal-turn validation regressed"
+import importlib.util
+import json
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+
+def assistant_turn(text, stop_reason=...):
+    message = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}],
+    }
+    if stop_reason is not ...:
+        message["stopReason"] = stop_reason
+    return {"type": "turn_end", "message": message, "toolResults": []}
+
+
+def event_stream(turns, *, agent_end=True):
+    events = [{"type": "agent_start"}, *turns]
+    if agent_end:
+        events.append({"type": "agent_end", "messages": []})
+    return "\n".join(json.dumps(event) for event in events) + "\n"
+
+
+def expect_tool_failure(label, turns, expected, *, agent_end=True):
+    try:
+        module.pi_review_result(event_stream(turns, agent_end=agent_end))
+    except module.CrosscheckToolError as exc:
+        assert expected in str(exc), (label, str(exc))
+    else:
+        raise AssertionError(f"{label} Pi output was accepted")
+
+
+verdict_text = json.dumps({"verdict": "clear"})
+verdict, turn_count = module.pi_review_result(
+    event_stream([assistant_turn(verdict_text, "stop")])
+)
+assert verdict == {"verdict": "clear"}
+assert turn_count == 1
+
+expect_tool_failure(
+    "stale final error",
+    [
+        assistant_turn(verdict_text, "toolUse"),
+        assistant_turn("provider failed", "error"),
+    ],
+    "stopReason='error'",
+)
+expect_tool_failure(
+    "truncated final turn",
+    [assistant_turn(verdict_text, "length")],
+    "stopReason='length'",
+)
+expect_tool_failure(
+    "nonterminal tool-use turn",
+    [assistant_turn(verdict_text, "toolUse")],
+    "stopReason='toolUse'",
+)
+expect_tool_failure(
+    "aborted final turn",
+    [assistant_turn(verdict_text, "aborted")],
+    "stopReason='aborted'",
+)
+expect_tool_failure(
+    "missing stop reason",
+    [assistant_turn(verdict_text)],
+    "stopReason=None",
+)
+expect_tool_failure(
+    "missing agent completion",
+    [assistant_turn(verdict_text, "stop")],
+    "stopped before agent completion",
+    agent_end=False,
+)
+PY
+  pass "Pi accepts only a successful terminal assistant turn"
+}
+
 test_pi_reviewer_executes_bound_policy_profile() {
   local record case_dir base head output
   record=$(make_case pi-reviewer)
@@ -831,6 +916,8 @@ test_pi_reviewer_executes_bound_policy_profile() {
   assert_grep '--mode json --provider openai-codex --model gpt-5.6-sol --thinking xhigh --tools read,bash,grep,find,ls --no-session' \
     "$case_dir/pi.log" \
     "Pi reviewer was not invoked with its pinned provider, model, effort, and tools"
+  assert_grep '--no-context-files' "$case_dir/pi.log" \
+    "Pi reviewer did not disable untrusted repository context files"
   python3 -c '
 import json, sys
 value = json.load(open(sys.argv[1]))
@@ -2235,6 +2322,7 @@ test_verify_rechecks_live_head_and_claims() {
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
     test_reviewer_policy_profiles_and_independence|\
+    test_pi_reviewer_accepts_only_successful_terminal_turn|\
     test_pi_reviewer_executes_bound_policy_profile|\
     test_pi_reviewer_failures_are_tool_failures|\
     test_empty_runtime_overrides_use_home_defaults|\
@@ -2284,6 +2372,7 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
 fi
 
 test_reviewer_policy_profiles_and_independence
+test_pi_reviewer_accepts_only_successful_terminal_turn
 test_pi_reviewer_executes_bound_policy_profile
 test_pi_reviewer_failures_are_tool_failures
 test_clear_review_uses_policy_contract

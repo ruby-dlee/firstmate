@@ -74,8 +74,9 @@
 #   secondmate's own crewmates use inherited crewmate dispatch/routing policy, not
 #   this setting.
 #   --provision forces worktree provisioning for this spawn, including for a kind
-#   the project's manifest excludes; --no-provision skips it entirely. Both apply
-#   to every pair of a batch. Without either, provisioning runs for a leased or
+#   the project's manifest excludes, and rebuilds instead of reusing matching
+#   fingerprints; --no-provision skips it entirely. Both apply to every pair of a
+#   batch. Without either, provisioning runs for a leased or
 #   recorded non-orca crewmate worktree exactly when the project has a manifest at
 #   config/provision/<project>.json and the task's kind is in its kinds list.
 #   fm-provision.sh's header owns the readiness contract and exit codes; this

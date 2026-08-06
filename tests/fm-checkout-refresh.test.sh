@@ -653,6 +653,122 @@ test_pool_preflight_surfaces_dirty_worktrees_without_blocking_clean_selection() 
   pass "pool preflight surfaces dirty entries and leaves them unavailable untouched"
 }
 
+test_pool_preflight_cost_is_scoped_to_the_target_pool() {
+  local fixture home state fakebin log target other index
+  local alone with_unrelated with_more_unrelated grown per_worktree
+  local out status budget=8
+  fixture="$TMP_ROOT/pool-cost"
+  home="$fixture/home"
+  state="$fixture/state"
+  fakebin="$fixture/fakebin"
+  log="$fixture/git-calls"
+  mkdir -p "$home/user/.treehouse" "$home/projects" "$home/config" "$state" "$fakebin"
+
+  # Count every git process the preflight launches. Processes, not seconds: it
+  # is the actual cost driver and it cannot flake on a loaded machine.
+  cat > "$fakebin/git" <<'SH'
+#!/usr/bin/env bash
+printf 'x' >> "$FM_GIT_CALL_LOG"
+exec "$FM_REAL_GIT" "$@"
+SH
+  chmod +x "$fakebin/git"
+
+  # add_pool_worktree <repo> <pool> <count>: register <count> detached
+  # worktrees under <pool> and publish them as that pool's Treehouse state.
+  add_pool_worktree() {
+    local repo=$1 pool=$2 count=$3 slot=1 entries=''
+    mkdir -p "$pool"
+    while [ "$slot" -le "$count" ]; do
+      if [ ! -d "$pool/$slot" ]; then
+        git -C "$repo" worktree add --quiet --detach "$pool/$slot/checkout" \
+          || fail "could not add pool worktree $slot"
+      fi
+      entries="$entries{\"name\":\"$slot\",\"path\":\"$(cd "$pool/$slot/checkout" && pwd -P)\"},"
+      slot=$((slot + 1))
+    done
+    printf '{"worktrees":[%s]}\n' "${entries%,}" > "$pool/treehouse-state.json"
+  }
+
+  count_preflight() {
+    : > "$log"
+    set +e
+    FM_REAL_GIT="$(command -v git)" FM_GIT_CALL_LOG="$log" PATH="$fakebin:$PATH" \
+      run_isolated_refresh "$home" "$state" pool-preflight "$target" >/dev/null 2>&1
+    set -e
+    wc -c < "$log" | tr -d ' '
+  }
+
+  fm_git_init_commit "$fixture/target"
+  target=$(cd "$fixture/target" && pwd -P)
+  add_pool_worktree "$target" "$home/user/.treehouse/target-pool" 2
+  alone=$(count_preflight)
+  [ "$alone" -gt 0 ] || fail "the preflight cost probe recorded no git invocations at all"
+
+  # An unrelated repository, its own pool, and registrations of its own. None of
+  # it belongs to the repository being spawned into, so none of it may cost
+  # anything. This is the fleet growth that used to dominate every spawn.
+  fm_git_init_commit "$fixture/other"
+  other=$(cd "$fixture/other" && pwd -P)
+  index=1
+  while [ "$index" -le 5 ]; do
+    git -C "$other" worktree add --quiet --detach "$fixture/other-extra-$index" \
+      || fail "could not add an unrelated registration"
+    index=$((index + 1))
+  done
+  add_pool_worktree "$other" "$home/user/.treehouse/other-pool" 4
+  with_unrelated=$(count_preflight)
+  [ "$with_unrelated" = "$alone" ] || fail \
+    "preflight cost grew with an unrelated pool: $alone git processes alone, $with_unrelated with an unrelated repository's pool present. Scope the sweep to the pool being spawned into."
+
+  add_pool_worktree "$other" "$home/user/.treehouse/other-pool" 9
+  with_more_unrelated=$(count_preflight)
+  [ "$with_more_unrelated" = "$alone" ] || fail \
+    "preflight cost grew with unrelated worktrees: $alone git processes with 4, $with_more_unrelated with 9 unrelated pool worktrees."
+
+  # Cost may grow with the target pool - that is the work actually being asked
+  # for - but only by a bounded amount per worktree. Re-deriving one
+  # repository's worktree list per pool member is what this bound rejects.
+  add_pool_worktree "$target" "$home/user/.treehouse/target-pool" 6
+  grown=$(count_preflight)
+  per_worktree=$(( (grown - alone) / 4 ))
+  [ "$per_worktree" -le "$budget" ] || fail \
+    "each additional in-pool worktree costs $per_worktree git processes, above the $budget budget ($alone at 2 worktrees, $grown at 6). Compute the repository's worktree facts once per preflight, not once per worktree."
+
+  # Scoping must not cost the safety property. A dirty worktree of THIS
+  # repository is still surfaced with the unrelated fleet in place.
+  printf '%s\n' dirty-scoped >> "$home/user/.treehouse/target-pool/1/checkout/README.md"
+  printf '%s\n' dirty-unrelated >> "$home/user/.treehouse/other-pool/1/checkout/README.md"
+  set +e
+  out=$(run_isolated_refresh "$home" "$state" pool-preflight "$target" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] || fail "a dirty in-pool worktree made pool preflight fatal"
+  assert_contains "$out" "$(cd "$home/user/.treehouse/target-pool/1/checkout" && pwd -P): skipped: dirty Treehouse pool worktree" \
+    "scoping hid a dirty worktree of the repository being spawned into"
+  assert_not_contains "$out" "other-pool" \
+    "pool preflight reported on a worktree of an unrelated repository"
+
+  # Pool entries this repository does not own stay skipped, not fatal, and must
+  # not suppress the findings for the entries it does own. Both shapes matter:
+  # a directory that exists but is not a worktree of ours, and one that has
+  # gone away entirely so it cannot be inspected at all.
+  mkdir -p "$home/user/.treehouse/target-pool/stray"
+  printf '{"worktrees":[{"name":"1","path":"%s"},{"name":"stray","path":"%s"},{"name":"gone","path":"%s"}]}\n' \
+    "$(cd "$home/user/.treehouse/target-pool/1/checkout" && pwd -P)" \
+    "$(cd "$home/user/.treehouse/target-pool/stray" && pwd -P)" \
+    "$home/user/.treehouse/target-pool/never-existed" \
+    > "$home/user/.treehouse/target-pool/treehouse-state.json"
+  set +e
+  out=$(run_isolated_refresh "$home" "$state" pool-preflight "$target" 2>&1)
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] || fail "an uninspectable pool entry made pool preflight fatal"
+  assert_contains "$out" "$(cd "$home/user/.treehouse/target-pool/1/checkout" && pwd -P): skipped: dirty Treehouse pool worktree" \
+    "an uninspectable sibling entry suppressed the dirty finding for the rest of the pool"
+  unset -f add_pool_worktree count_preflight
+  pass "pool preflight cost follows the target pool, not the size of the fleet"
+}
+
 test_bootstrap_relays_hygiene_alerts() {
   local project draft out config_backup config_real
   project=$(cd "$FM_TEST_HOME/projects/relvino" && pwd -P)
@@ -2565,6 +2681,7 @@ test_preflight_rejects_hygiene_without_an_origin
 test_treehouse_pool_skill_drafts_are_inventoried
 test_ignored_skill_files_are_outside_the_collision_guard
 test_pool_preflight_surfaces_dirty_worktrees_without_blocking_clean_selection
+test_pool_preflight_cost_is_scoped_to_the_target_pool
 test_bootstrap_relays_hygiene_alerts
 test_treehouse_discovery_failure_invalidates_coverage_health
 test_raw_treehouse_root_symlink_invalidates_coverage_health

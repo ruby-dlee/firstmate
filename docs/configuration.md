@@ -110,7 +110,7 @@ The accepted policy profiles are Codex `gpt-5.6-sol` at `xhigh` effort and Claud
 Every `account_home` must be an existing absolute directory.
 Crosscheck resolves each configured account home and selects the first entry whose account home and model both differ from the routed author identity recorded in task metadata.
 Codex binds both `CODEX_HOME` and `HOME` to that path.
-Claude creates a disposable private `HOME` whose `.claude` resolves to that path, binds both `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` to it, and verifies the exact OAuth-file or scoped-Keychain credential source before launch.
+Claude creates a disposable private `HOME` whose `.claude` resolves to the configured account home, redirects `CLAUDE_CONFIG_DIR` to a per-run `.crosscheck/reviewer-home` inside the review checkout, pins `CLAUDE_SECURESTORAGE_CONFIG_DIR` to the configured account home, and verifies the exact OAuth-file or scoped-Keychain credential source before launch.
 The verdict and its Bash-created receipt must report the executing selector and private `HOME`, so a configured label cannot establish separation from a different executing account.
 For an author task marked `account_routing_emergency_bypass=1`, a different supported provider proves both account namespace and model separation, while a same-provider reviewer fails closed without `account_home` proof.
 An absent or invalid file is an unavailable reviewer and therefore blocks crosscheck and merge.

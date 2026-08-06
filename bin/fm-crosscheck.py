@@ -1763,7 +1763,7 @@ def reviewer_timeout() -> int:
 
 
 def reviewer_max_capture() -> int:
-    raw = env_value(
+    raw = environment_value(
         "FM_CROSSCHECK_REVIEWER_MAX_CAPTURE_BYTES",
         str(DEFAULT_REVIEWER_CAPTURE),
     )

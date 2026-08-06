@@ -21,11 +21,15 @@ make_case() {
   case_dir="$TMP_ROOT/$name"
   repo="$case_dir/repo"
   mkdir -p "$repo/tests" "$case_dir/state" "$case_dir/data" \
-    "$case_dir/author-home" "$case_dir/reviewer-home" "$case_dir/fakebin"
+    "$case_dir/author-home" "$case_dir/reviewer-home" "$case_dir/pi-home" \
+    "$case_dir/fakebin"
   printf '{"tokens":{"access_token":"test-reviewer-token"}}\n' \
     > "$case_dir/reviewer-home/auth.json"
   printf '{}\n' > "$case_dir/reviewer-home/.credentials.json"
   printf '{}\n' > "$case_dir/reviewer-home/.claude.json"
+  printf '%s\n' \
+    '{"openai-codex":{"type":"oauth","access":"test-access","refresh":"test-refresh","expires":4102444800000,"accountId":"test-pi-account"}}' \
+    > "$case_dir/pi-home/auth.json"
   git -C "$repo" init -q -b main
   printf 'base\n' > "$repo/app.txt"
   printf 'base\n' > "$repo/other.txt"
@@ -66,6 +70,7 @@ EOF
   install_gh_axi_fake "$case_dir"
   install_codex_fake "$case_dir"
   install_claude_fake "$case_dir"
+  install_pi_fake "$case_dir"
   install_sandbox_fake "$case_dir"
   printf '%s\t%s\t%s\n' "$case_dir" "$base" "$head"
 }
@@ -245,6 +250,73 @@ SH
   chmod +x "$case_dir/fakebin/claude"
 }
 
+install_pi_fake() {
+  local case_dir=$1
+  cat > "$case_dir/fakebin/pi" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_TEST_PI_LOG"
+[ "${PI_CODING_AGENT_DIR:-}" = "$FM_TEST_PI_HOME" ] || exit 60
+case "${HOME:-}" in
+  "$PWD"/.crosscheck/pi-home) ;;
+  *) exit 61 ;;
+esac
+[ "$(cd "$HOME/.pi/agent" 2>/dev/null && pwd -P)" = "$FM_TEST_PI_HOME" ] \
+  || exit 62
+for selector in OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN CODEX_REFRESH_TOKEN CODEX_REVOKE_TOKEN; do
+  [ -z "$(printenv "$selector" 2>/dev/null)" ] || exit 63
+done
+[ -z "${FM_TEST_PI_EXIT:-}" ] || exit "$FM_TEST_PI_EXIT"
+mode=
+provider=
+model=
+thinking=
+tools=
+ephemeral=no
+isolated=0
+prompt=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --mode) mode=$2; shift 2 ;;
+    --provider) provider=$2; shift 2 ;;
+    --model) model=$2; shift 2 ;;
+    --thinking) thinking=$2; shift 2 ;;
+    --tools) tools=$2; shift 2 ;;
+    --no-session) ephemeral=yes; shift ;;
+    --no-extensions|--no-skills|--no-prompt-templates|--no-themes|--no-approve)
+      isolated=$((isolated + 1)); shift ;;
+    *) prompt=$1; shift ;;
+  esac
+done
+[ "$mode" = json ] || exit 64
+[ "$provider" = openai-codex ] || exit 65
+[ "$model" = gpt-5.6-sol ] || exit 66
+[ "$thinking" = xhigh ] || exit 67
+[ "$tools" = read,bash,grep,find,ls ] || exit 68
+[ "$ephemeral" = yes ] && [ "$isolated" -eq 5 ] && [ -n "$prompt" ] || exit 69
+temporary=$(mktemp "${TMPDIR:-/tmp}/fm-crosscheck-pi.XXXXXX") || exit 70
+python3 "$FM_TEST_REVIEW_DRIVER" "$PWD" "$temporary" "$FM_TEST_REVIEW_SCENARIO" "$FM_TEST_HEAD" || exit 71
+python3 - "$temporary" <<'PY'
+import json
+import sys
+structured = json.load(open(sys.argv[1]))
+print(json.dumps({"type": "session", "version": 3, "id": "test-pi-session"}))
+print(json.dumps({"type": "agent_start"}))
+print(json.dumps({"type": "turn_start"}))
+print(json.dumps({
+    "type": "turn_end",
+    "message": {
+        "role": "assistant",
+        "content": [{"type": "text", "text": json.dumps(structured)}],
+    },
+    "toolResults": [{"toolName": "bash", "isError": False}],
+}))
+print(json.dumps({"type": "agent_end", "messages": []}))
+PY
+rm -f "$temporary"
+SH
+  chmod +x "$case_dir/fakebin/pi"
+}
+
 install_sandbox_fake() {
   local case_dir=$1
   cat > "$case_dir/fakebin/sandbox-exec" <<'SH'
@@ -262,6 +334,10 @@ case "${3:-}" in
       ! grep -qF "(subpath \"$FM_TEST_AMBIENT_HOME/.claude/session-env\")" "$profile" \
         || exit 78
     fi
+    ;;
+  */pi)
+    grep -qxF '(allow network*)' "$profile" || exit 79
+    grep -qF "(subpath \"$FM_TEST_PI_HOME\")" "$profile" || exit 80
     ;;
   *)
     ! grep -qxF '(allow network*)' "$profile" || exit 76
@@ -300,7 +376,7 @@ execution.write_text(
     "base=$1\n"
     "head=$2\n"
     "receipt=$3\n"
-    "account=${CODEX_HOME:-${CLAUDE_SECURESTORAGE_CONFIG_DIR:-}}\n"
+    "account=${CODEX_HOME:-${CLAUDE_SECURESTORAGE_CONFIG_DIR:-${PI_CODING_AGENT_DIR:-}}}\n"
     "git diff \"$base\" \"$head\" -- app.txt >/dev/null\n"
     "printf 'CROSSCHECK-REVIEW-EXECUTED base=%s head=%s HOME=%s account=%s\\n' "
     "\"$base\" \"$head\" \"$HOME\" \"$account\" | tee \"$receipt\"\n"
@@ -324,8 +400,10 @@ if scenario != "reading-only-suspicion":
         capture_output=True,
         text=True,
     )
-account_selector = os.environ.get("CODEX_HOME") or os.environ.get(
-    "CLAUDE_SECURESTORAGE_CONFIG_DIR", ""
+account_selector = (
+    os.environ.get("CODEX_HOME")
+    or os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    or os.environ.get("PI_CODING_AGENT_DIR", "")
 )
 base = {
     "schema": "firstmate.crosscheck-review.v2",
@@ -530,18 +608,21 @@ run_case() {
   FM_GH_AXI_BIN="$case_dir/fakebin/gh-axi" \
   FM_CROSSCHECK_CODEX_BIN="$case_dir/fakebin/codex" \
   FM_CROSSCHECK_CLAUDE_BIN="$case_dir/fakebin/claude" \
+  FM_CROSSCHECK_PI_BIN="${FM_TEST_PI_BIN-$case_dir/fakebin/pi}" \
   FM_CROSSCHECK_SANDBOX_BIN="$case_dir/fakebin/sandbox-exec" \
   FM_CROSSCHECK_FETCH_REMOTE="${FM_TEST_FETCH_REMOTE-$case_dir/repo}" \
   FM_CROSSCHECK_REVIEWER_CONFIG="$case_dir/reviewer.json" \
   FM_TEST_GH_LOG="$case_dir/gh.log" \
   FM_TEST_CODEX_LOG="$case_dir/codex.log" \
   FM_TEST_CLAUDE_LOG="$case_dir/claude.log" \
+  FM_TEST_PI_LOG="$case_dir/pi.log" \
   FM_TEST_PROMPT_LOG="$case_dir/prompt.log" \
   FM_TEST_API_FIXTURE="$API_FIXTURE" \
   FM_TEST_CLAIMS_FIXTURE="$CLAIMS_FIXTURE" \
   FM_TEST_REVIEW_DRIVER="$TMP_ROOT/review-driver.py" \
   FM_TEST_REVIEW_SCENARIO="$scenario" \
   FM_TEST_REVIEWER_HOME="$case_dir/reviewer-home" \
+  FM_TEST_PI_HOME="$case_dir/pi-home" \
   FM_TEST_AUTHOR_HOME="$case_dir/author-home" \
   FM_TEST_AMBIENT_HOME="$HOME" \
   FM_TEST_BASE="$base" \
@@ -585,6 +666,21 @@ select_claude_reviewer() {
 {"reviewers":[
   {"harness":"codex","model":"gpt-5.6-sol","effort":"xhigh","account_home":"$case_dir/author-home"},
   {"harness":"claude","model":"claude-opus-5","effort":"xhigh","account_home":"$case_dir/reviewer-home"}
+]}
+EOF
+}
+
+select_pi_reviewer() {
+  local case_dir=$1
+  sed -i.bak \
+    -e 's/harness=codex/harness=claude/' \
+    -e 's/model=gpt-5.5/model=claude-opus-5/' \
+    "$case_dir/state/task-x1.meta"
+  rm "$case_dir/state/task-x1.meta.bak"
+  cat > "$case_dir/reviewer.json" <<EOF
+{"reviewers":[
+  {"harness":"claude","model":"claude-opus-5","effort":"xhigh","account_home":"$case_dir/reviewer-home"},
+  {"harness":"pi","model":"gpt-5.6-sol","effort":"xhigh","account_home":"$case_dir/pi-home"}
 ]}
 EOF
 }
@@ -720,6 +816,103 @@ same_account = expect_refused(claude_author, "different account_home")
 print(f"REFUSED shared-account: {same_account}")
 PY
   pass "all reviewer profiles validate while model and account independence still fail closed"
+}
+
+test_pi_reviewer_executes_bound_policy_profile() {
+  local record case_dir base head output
+  record=$(make_case pi-reviewer)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  select_pi_reviewer "$case_dir"
+  output=$(FM_TEST_PI_BIN=pi PATH="$case_dir/fakebin:$PATH" \
+    run_case "$case_dir" "$base" "$head" clear run) \
+    || fail "Pi reviewer did not complete"
+  assert_contains "$output" 'crosscheck clear' \
+    "Pi reviewer did not earn a clear result"
+  assert_grep '--mode json --provider openai-codex --model gpt-5.6-sol --thinking xhigh --tools read,bash,grep,find,ls --no-session' \
+    "$case_dir/pi.log" \
+    "Pi reviewer was not invoked with its pinned provider, model, effort, and tools"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+reviewer = value["runs"][-1]["reviewer"]
+assert reviewer["harness"] == "pi"
+assert reviewer["account_home"] == sys.argv[2]
+assert reviewer["executing_account_home"] == sys.argv[2]
+assert reviewer["execution_home"].endswith("/.crosscheck/pi-home")
+assert reviewer["account_selector"] == "PI_CODING_AGENT_DIR"
+assert reviewer["credential_source"] == "pi-openai-codex-oauth-file"
+assert reviewer["reviewer_turn_count"] == "1"
+assert reviewer["execution_proof"]["actual_exit"] == 0
+receipt = reviewer["execution_proof"]["reviewer_receipt"]["output"]
+assert sys.argv[2] in receipt
+assert sys.argv[3] in reviewer["execution_proof"]["command"]
+assert sys.argv[4] in reviewer["execution_proof"]["command"]
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    "$case_dir/pi-home" "$base" "$head" \
+    || fail "Pi review did not record its bound account, nonzero turn, and executed command"
+  assert_absent "$case_dir/codex.log" "Codex launched instead of the selected Pi reviewer"
+  assert_absent "$case_dir/claude.log" "Claude launched instead of the selected Pi reviewer"
+  pass "Pi reviewer executes a bound nonzero-turn exact-head review"
+}
+
+test_pi_reviewer_failures_are_tool_failures() {
+  local record case_dir base head rc
+
+  record=$(make_case pi-missing-binary)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  select_pi_reviewer "$case_dir"
+  set +e
+  FM_TEST_PI_BIN="$case_dir/fakebin/missing-pi" \
+    run_case "$case_dir" "$base" "$head" clear run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "missing Pi binary"
+  assert_grep 'CROSSCHECK TOOL-FAILURE: Pi reviewer executable inspection' \
+    "$case_dir/err" "missing Pi binary was not a named tool failure"
+
+  record=$(make_case pi-missing-credential)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  select_pi_reviewer "$case_dir"
+  rm "$case_dir/pi-home/auth.json"
+  set +e
+  run_case "$case_dir" "$base" "$head" clear run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "missing Pi credential"
+  assert_grep 'CROSSCHECK TOOL-FAILURE: Pi executing-account credential inspection failed' \
+    "$case_dir/err" "missing Pi credential was not a named tool failure"
+
+  record=$(make_case pi-launch-failure)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  select_pi_reviewer "$case_dir"
+  set +e
+  FM_TEST_PI_EXIT=47 run_case "$case_dir" "$base" "$head" clear run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "Pi launch failure"
+  assert_grep 'CROSSCHECK TOOL-FAILURE: Pi reviewer exited 47' \
+    "$case_dir/err" "Pi launch failure was not a named tool failure"
+
+  python3 - "$CROSSCHECK_PY" <<'PY' \
+    || fail "Pi zero-turn output was not rejected as a tool failure"
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+try:
+    module.pi_review_result('{"type":"agent_end","messages":[]}\n')
+except module.CrosscheckToolError as exc:
+    assert "without executing a turn" in str(exc)
+else:
+    raise AssertionError("zero-turn Pi output was accepted")
+PY
+  pass "Pi binary, credential, and launch failures fail as tooling"
 }
 
 test_clear_review_uses_policy_contract() {
@@ -2042,6 +2235,8 @@ test_verify_rechecks_live_head_and_claims() {
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
     test_reviewer_policy_profiles_and_independence|\
+    test_pi_reviewer_executes_bound_policy_profile|\
+    test_pi_reviewer_failures_are_tool_failures|\
     test_empty_runtime_overrides_use_home_defaults|\
     test_empty_environment_fallback_is_generic|\
     test_set_runtime_overrides_remain_authoritative|\
@@ -2089,6 +2284,8 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
 fi
 
 test_reviewer_policy_profiles_and_independence
+test_pi_reviewer_executes_bound_policy_profile
+test_pi_reviewer_failures_are_tool_failures
 test_clear_review_uses_policy_contract
 test_empty_runtime_overrides_use_home_defaults
 test_empty_environment_fallback_is_generic

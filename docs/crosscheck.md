@@ -42,6 +42,10 @@ The file is local and gitignored at `config/crosscheck-reviewer.json`.
 Crosscheck resolves each configured account home and selects the first whose account home and model both differ from the routed author identity recorded in task metadata.
 It then binds the provider's executing credential selector to that exact path and requires the verdict plus a Bash-created receipt to report the selector and actual private `HOME`.
 Account separation therefore depends on the executing credential source rather than a configuration label.
+Pi is launched through the resolved installed executable with `openai-codex/gpt-5.6-sol` at `xhigh`, JSON event output, an ephemeral session, and only the read and Bash-capable review tools.
+Its event stream must contain at least one completed turn and a completed agent before Crosscheck accepts the final JSON verdict.
+Pi credential provisioning is a captain-owned prerequisite: the selected `account_home` must contain a usable `openai-codex` OAuth entry in `auth.json`, and Firstmate does not create or copy that credential.
+On 2026-08-06 rollout inspection, the operator's default Pi home had no `openai-codex` credential and `/opt/homebrew/bin/pi --version` failed during startup under Node `v20.20.2`, so live authenticated Pi review remains unverified until the captain-owned credential and runtime prerequisites are satisfied.
 For a task explicitly marked `account_routing_emergency_bypass=1`, a reviewer on the other supported provider establishes both account-namespace and model separation without inventing an `account_home` for the author.
 A same-provider reviewer still fails closed for that structurally unrouted task because account independence cannot be proved.
 The accepted profiles are Codex `gpt-5.6-sol` xhigh, Claude `claude-opus-5` xhigh, and Pi `gpt-5.6-sol` xhigh.

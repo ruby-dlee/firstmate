@@ -226,6 +226,23 @@ def prepare_claude_execution_home(
     return execution_home, "scoped-keychain", f"{service}:{account_name}"
 
 
+def prepare_pi_execution_home(protocol_dir: Path, account_home: Path) -> Path:
+    account_home = account_home.resolve()
+    execution_home = protocol_dir / "pi-home"
+    try:
+        agent_parent = execution_home / ".pi"
+        agent_parent.mkdir(parents=True, mode=0o700)
+        (agent_parent / "agent").symlink_to(
+            account_home, target_is_directory=True
+        )
+    except OSError as exc:
+        tool_fail(
+            "Pi execution-HOME preparation failed while binding "
+            f"{execution_home} to reviewer account {account_home}: {exc}"
+        )
+    return execution_home
+
+
 def inspect_codex_credential(account_home: Path) -> tuple[str, str]:
     """Validate the credential file selected by one Codex home."""
 
@@ -264,6 +281,52 @@ def inspect_codex_credential(account_home: Path) -> tuple[str, str]:
             f"Codex executing-account credential is unusable at {credential_file}"
         )
     return "codex-auth-file", str(credential_file)
+
+
+def inspect_pi_credential(account_home: Path) -> tuple[str, str]:
+    credential_file = account_home.resolve() / "auth.json"
+    try:
+        metadata = credential_file.lstat()
+    except OSError as exc:
+        tool_fail(
+            "Pi executing-account credential inspection failed at "
+            f"{credential_file}: {exc}"
+        )
+    if not stat.S_ISREG(metadata.st_mode) or credential_file.is_symlink():
+        tool_fail(
+            "Pi executing-account credential inspection requires a regular "
+            f"non-symlink file at {credential_file}"
+        )
+    try:
+        credentials = read_json(
+            credential_file,
+            "Pi executing-account credential",
+            maximum_bytes=1024 * 1024,
+            maximum_items=256,
+        )
+    except CrosscheckError as exc:
+        tool_fail(str(exc))
+    credential = (
+        credentials.get("openai-codex")
+        if isinstance(credentials, dict)
+        else None
+    )
+    if not (
+        isinstance(credential, dict)
+        and credential.get("type") == "oauth"
+        and all(
+            isinstance(credential.get(name), str)
+            and bool(credential[name].strip())
+            for name in ("access", "refresh", "accountId")
+        )
+        and isinstance(credential.get("expires"), (int, float))
+        and not isinstance(credential.get("expires"), bool)
+    ):
+        tool_fail(
+            "Pi executing-account credential is unusable for openai-codex at "
+            f"{credential_file}"
+        )
+    return "pi-openai-codex-oauth-file", str(credential_file)
 
 
 def require(condition: bool, message: str) -> None:
@@ -1129,6 +1192,15 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
                 reviewer.get("credential_identifier"),
                 f"{label}.reviewer.credential_identifier",
             )
+            if reviewer.get("harness") == "pi":
+                turn_count = require_string(
+                    reviewer.get("reviewer_turn_count"),
+                    f"{label}.reviewer.reviewer_turn_count",
+                )
+                require(
+                    turn_count.isdigit() and int(turn_count) > 0,
+                    f"{label}.reviewer.reviewer_turn_count must be positive",
+                )
             execution_proof = reviewer.get("execution_proof")
             require(
                 isinstance(execution_proof, dict),
@@ -1602,14 +1674,68 @@ def reviewer_max_capture() -> int:
 def reviewer_binary(name: str, default: str, label: str) -> str:
     command = environment_value(name, default)
     if "/" in command:
-        available = Path(command).is_file() and os.access(command, os.X_OK)
+        candidate = Path(command)
     else:
-        available = shutil.which(command) is not None
-    if not available:
+        resolved = shutil.which(command)
+        candidate = Path(resolved) if resolved is not None else Path(command)
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
         tool_fail(
             f"{label} executable inspection found no runnable {name}={command!r}"
         )
-    return command
+    return str(candidate.resolve())
+
+
+def pi_review_result(output: str) -> tuple[dict[str, Any], int]:
+    turn_count = 0
+    agent_ended = False
+    final_text: str | None = None
+    for line_number, line in enumerate(output.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            tool_fail(
+                "Pi reviewer returned malformed JSON events at line "
+                f"{line_number}: {exc.msg}"
+            )
+        if not isinstance(event, dict):
+            tool_fail(
+                f"Pi reviewer returned a non-object event at line {line_number}"
+            )
+        event_type = event.get("type")
+        if event_type == "turn_end":
+            turn_count += 1
+            message = event.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                content = message.get("content")
+                if isinstance(content, str):
+                    final_text = content
+                elif isinstance(content, list):
+                    text_parts = [
+                        part["text"]
+                        for part in content
+                        if isinstance(part, dict)
+                        and part.get("type") == "text"
+                        and isinstance(part.get("text"), str)
+                    ]
+                    if text_parts:
+                        final_text = "".join(text_parts)
+        elif event_type == "agent_end":
+            agent_ended = True
+    if turn_count == 0:
+        tool_fail("Pi reviewer completed without executing a turn")
+    if not agent_ended:
+        tool_fail("Pi reviewer stopped before agent completion")
+    if final_text is None or not final_text.strip():
+        tool_fail("Pi reviewer completed without a verdict artifact")
+    try:
+        verdict = json.loads(final_text)
+    except json.JSONDecodeError as exc:
+        tool_fail(f"Pi reviewer returned a malformed verdict artifact: {exc.msg}")
+    if not isinstance(verdict, dict):
+        tool_fail("Pi reviewer verdict artifact must be an object")
+    return verdict, turn_count
 
 
 def run_reviewer(
@@ -1618,6 +1744,11 @@ def run_reviewer(
     ledger: dict[str, Any],
     config: dict[str, str],
 ) -> Any:
+    pi_binary = (
+        reviewer_binary("FM_CROSSCHECK_PI_BIN", "pi", "Pi reviewer")
+        if config["harness"] == "pi"
+        else None
+    )
     protocol_dir = review_dir / ".crosscheck"
     protocol_dir.mkdir(mode=0o700)
     environment = os.environ.copy()
@@ -1630,6 +1761,11 @@ def run_reviewer(
         "CODEX_REVOKE_TOKEN",
         "CLAUDE_CONFIG_DIR",
         "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+        "PI_PROVIDER",
+        "PI_MODEL",
+        "PI_REASONING_LEVEL",
     ):
         environment.pop(provider_variable, None)
     account_home = Path(config["account_home"])
@@ -1639,12 +1775,18 @@ def run_reviewer(
             prepare_claude_execution_home(protocol_dir, account_home)
         )
         config["account_selector"] = "CLAUDE_SECURESTORAGE_CONFIG_DIR"
-    else:
+    elif config["harness"] == "codex":
         execution_home = account_home
         credential_source, credential_identifier = inspect_codex_credential(
             account_home
         )
         config["account_selector"] = "CODEX_HOME"
+    else:
+        execution_home = prepare_pi_execution_home(protocol_dir, account_home)
+        credential_source, credential_identifier = inspect_pi_credential(
+            account_home
+        )
+        config["account_selector"] = "PI_CODING_AGENT_DIR"
     config["execution_home"] = str(execution_home.resolve())
     config["credential_source"] = credential_source
     config["credential_identifier"] = credential_identifier
@@ -1703,6 +1845,63 @@ def run_reviewer(
             maximum_bytes=MAX_CAPTURE,
             maximum_items=4096,
         )
+
+    if config["harness"] == "pi":
+        require(pi_binary is not None, "Pi reviewer binary was not resolved")
+        environment["PI_CODING_AGENT_DIR"] = config["account_home"]
+        environment["PI_CODING_AGENT_SESSION_DIR"] = str(
+            protocol_dir / "pi-sessions"
+        )
+        sandbox_path = protocol_dir / "pi-sandbox.sb"
+        pi_prompt = (
+            prompt
+            + "\nReturn only one JSON object matching this exact JSON Schema as "
+            "the final assistant text:\n"
+            + json.dumps(schema_value, separators=(",", ":"))
+        )
+        arguments = [
+            pi_binary,
+            "--mode",
+            "json",
+            "--provider",
+            "openai-codex",
+            "--model",
+            config["model"],
+            "--thinking",
+            config["effort"],
+            "--tools",
+            "read,bash,grep,find,ls",
+            "--no-session",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-approve",
+            pi_prompt,
+        ]
+        try:
+            result = run_sandboxed(
+                arguments,
+                cwd=review_dir,
+                profile_path=sandbox_path,
+                allow_network=True,
+                additional_writable_roots=(Path(config["account_home"]),),
+                env=environment,
+                timeout=reviewer_timeout(),
+                description="Pi reviewer",
+                maximum_output_bytes=reviewer_max_capture(),
+            )
+        except CrosscheckError as exc:
+            tool_fail(f"Pi reviewer launch failed: {exc}")
+        detail = (result.stderr or result.stdout).strip()
+        if result.returncode != 0:
+            tool_fail(
+                f"Pi reviewer exited {result.returncode} without an earned verdict: "
+                f"{detail[:500] or 'no diagnostic'}"
+            )
+        verdict, turn_count = pi_review_result(result.stdout)
+        config["reviewer_turn_count"] = str(turn_count)
+        return verdict
 
     claude = reviewer_binary(
         "FM_CROSSCHECK_CLAUDE_BIN", "claude", "Claude reviewer"

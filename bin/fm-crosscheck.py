@@ -525,7 +525,11 @@ MAX_SEEDED_CONFIG_BYTES = 4 * 1024 * 1024
 CREDENTIALS_NAME = ".credentials.json"
 
 
-def seed_reviewer_home(protocol_dir: Path, account_home: Path) -> Path:
+def seed_reviewer_home(
+    protocol_dir: Path,
+    account_home: Path,
+    credential_source: str | None = None,
+) -> Path:
     """Project the reviewer account into a writable home inside the checkout.
 
     The reviewer harness must create session and shell-snapshot state before its
@@ -545,6 +549,16 @@ def seed_reviewer_home(protocol_dir: Path, account_home: Path) -> Path:
     for entry in entries:
         destination = home / entry.name
         try:
+            if (
+                entry.name == CREDENTIALS_NAME
+                and credential_source == "scoped-keychain"
+            ):
+                # It is unproven that installed Claude starts cleanly without
+                # .credentials.json while authenticating from scoped Keychain.
+                # All three reviewer OAuth sessions are expired, so this cannot
+                # be proven until those accounts are re-authenticated; confine
+                # omission to the path where the file was already rejected.
+                continue
             if entry.is_symlink():
                 os.symlink(os.readlink(entry), destination)
             elif entry.is_dir():
@@ -1970,7 +1984,9 @@ def run_reviewer(
     claude = resolve_claude_binary(account_home)
     # The harness writes session and scratch state before its execution tool
     # works; keep every one of those writes inside the sandboxed checkout.
-    reviewer_home = seed_reviewer_home(protocol_dir, account_home)
+    reviewer_home = seed_reviewer_home(
+        protocol_dir, account_home, credential_source
+    )
     claude_tmp = protocol_dir / "claude-tmp"
     claude_tmp.mkdir(mode=0o700, exist_ok=True)
     environment["CLAUDE_CONFIG_DIR"] = str(reviewer_home)

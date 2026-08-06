@@ -1327,7 +1327,7 @@ execution_home, credential_source, credential_identifier = (
     module.prepare_claude_execution_home(repo / ".crosscheck", reviewer_home)
 )
 reviewer_config_home = module.seed_reviewer_home(
-    repo / ".crosscheck", reviewer_home
+    repo / ".crosscheck", reviewer_home, credential_source
 )
 module.write_sandbox_profile(
     profile,
@@ -2035,6 +2035,46 @@ assert "could not be read" in malformed_detail, malformed_detail
 assert "malformed" in malformed_detail, malformed_detail
 assert "scoped Keychain" in malformed_detail, malformed_detail
 assert malformed_detail != detail, "read failure shared the empty-token diagnostic"
+
+oauth_account = root / "oauth-seed-account"
+oauth_account.mkdir()
+oauth_credential = oauth_account / ".credentials.json"
+oauth_credential.write_text(
+    json.dumps({"claudeAiOauth": {"accessToken": "live", "refreshToken": ""}}),
+    encoding="utf-8",
+)
+oauth_protocol = root / "oauth-seed-protocol" / ".crosscheck"
+oauth_protocol.mkdir(parents=True)
+oauth_home = module.seed_reviewer_home(
+    oauth_protocol, oauth_account, "oauth-file"
+)
+assert oauth_home.joinpath(".credentials.json").is_symlink()
+assert oauth_home.joinpath(".credentials.json").resolve() == oauth_credential.resolve()
+
+rejected_account = root / "rejected-seed-account"
+rejected_account.mkdir()
+rejected_credential = rejected_account / ".credentials.json"
+rejected_credential.write_text(
+    json.dumps({"claudeAiOauth": {"accessToken": "", "refreshToken": ""}}),
+    encoding="utf-8",
+)
+
+keychain_protocol = root / "keychain-seed-protocol" / ".crosscheck"
+keychain_protocol.mkdir(parents=True)
+keychain_home = module.seed_reviewer_home(
+    keychain_protocol, rejected_account, "scoped-keychain"
+)
+assert not keychain_home.joinpath(".credentials.json").exists()
+assert not keychain_home.joinpath(".credentials.json").is_symlink()
+
+unselected_protocol = root / "unselected-seed-protocol" / ".crosscheck"
+unselected_protocol.mkdir(parents=True)
+unselected_home = module.seed_reviewer_home(unselected_protocol, rejected_account)
+assert unselected_home.joinpath(".credentials.json").is_symlink()
+assert (
+    unselected_home.joinpath(".credentials.json").resolve()
+    == rejected_credential.resolve()
+)
 
 bare = root / "bare-account"
 bare.mkdir()

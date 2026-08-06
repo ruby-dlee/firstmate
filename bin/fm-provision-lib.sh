@@ -591,7 +591,6 @@ fm_provision_declared_packages_ready() {  # <worktree> <eco> <rel>
       done < <(fm_provision_pip_requirements "$dir")
       fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
         "$python" -c '
-import importlib.metadata
 import pathlib
 import re
 import sys
@@ -613,7 +612,13 @@ for requirement_file in sys.argv[2:]:
             raise SystemExit(1)
         declared.add(match.group(1))
 for name in declared:
-    if not list(importlib.metadata.Distribution.discover(name=name, path=site_dirs)):
+    normalized = re.sub(r"[-_.]+", "_", name).lower()
+    found = any(
+        (candidate / "METADATA").is_file()
+        for site_dir in site_dirs
+        for candidate in site_dir.glob(f"{normalized}-*.dist-info")
+    )
+    if not found:
         raise SystemExit(1)
 ' "$dir/.venv" "${requirements[@]}" >/dev/null 2>&1
       ;;
@@ -683,9 +688,9 @@ fm_provision_install() {  # <worktree> <eco> <rel> <log>
       if [ "${workspace_info%%$'\n'*}" = workspace ]; then
         sync_args+=(--all-packages)
       fi
-      sync_args+=(--dev)
       fm_provision_run_logged "$FM_PROVISION_INSTALL_TIMEOUT" "$dir" "$log" \
-        uv "${sync_args[@]}" || return $?
+        env -u UV_NO_DEV -u UV_ONLY_DEV -u UV_NO_DEFAULT_GROUPS \
+        -u UV_NO_GROUP -u UV_ONLY_GROUP uv "${sync_args[@]}" || return $?
       ;;
     pip)
       local -a args=(pip install --python .venv/bin/python)
@@ -743,7 +748,7 @@ fm_provision_fail() {  # <message>
 # Returns 0 on success or a clean no-op, non-zero when the spawn must refuse.
 fm_provision_worktree() {  # <worktree> <cache-dir> <log>
   local wt=$1 cache=$2 log=$3
-  local eco rel dir line record fingerprint recorded runtime installer environment
+  local eco rel dir line record fingerprint recorded runtime installer environment artifact
   local declared_major pinned_major='' pinned_bin='' rc=0 state
   local -a components=() results=()
 
@@ -788,6 +793,18 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log>
     if [ "$eco" = uv ] && [ -n "${UV_PROJECT_ENVIRONMENT:-}" ] \
       && [ "$UV_PROJECT_ENVIRONMENT" != .venv ]; then
       fm_provision_fail "UV_PROJECT_ENVIRONMENT is set to '$UV_PROJECT_ENVIRONMENT', so the environment for $rel would not be provable at $rel/.venv"
+      return 1
+    fi
+  done
+
+  for line in "${components[@]}"; do
+    eco=${line%% *}
+    rel=${line#* }
+    artifact=$(fm_provision_artifact_path "$eco" "$rel") || return 1
+    FM_PROVISION_EXCLUDES="${FM_PROVISION_EXCLUDES}${artifact}"$'\n'
+    if declare -F fm_provision_register_exclude >/dev/null \
+      && ! fm_provision_register_exclude "$artifact"; then
+      fm_provision_fail "cannot register the git exclusion for $artifact before provisioning"
       return 1
     fi
   done
@@ -886,7 +903,6 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log>
     fi
 
     if [ "$state" = installed ]; then
-      FM_PROVISION_EXCLUDES="${FM_PROVISION_EXCLUDES}$(fm_provision_artifact_path "$eco" "$rel")"$'\n'
       echo "fm-spawn: provisioning $eco dependencies in $rel" >&2
       rc=0
       fm_provision_install "$wt" "$eco" "$rel" "$log" || rc=$?
@@ -915,8 +931,6 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log>
       fi
       fm_provision_record_write "$record" "$eco" "$rel" "$fingerprint" "$runtime" "$installer" "$environment" \
         || { fm_provision_fail "cannot record the provisioning fingerprint at $record"; return 1; }
-    else
-      FM_PROVISION_EXCLUDES="${FM_PROVISION_EXCLUDES}$(fm_provision_artifact_path "$eco" "$rel")"$'\n'
     fi
 
     results+=("$eco:$rel=$state")

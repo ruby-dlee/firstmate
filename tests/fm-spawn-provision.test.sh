@@ -46,6 +46,10 @@ PY
     ;;
   sync)
     [ "${FM_TEST_UV_FAIL:-0}" != 1 ] || exit 3
+    if [ "${FM_TEST_REQUIRE_UV_DEFAULT_GROUPS:-0}" = 1 ]; then
+      [ -z "${UV_NO_DEV:-}${UV_ONLY_DEV:-}${UV_NO_DEFAULT_GROUPS:-}${UV_NO_GROUP:-}${UV_ONLY_GROUP:-}" ] \
+        || exit 9
+    fi
     mkdir -p .venv/bin .venv/lib/python3.11/site-packages
     printf 'fake uv project\n' > .venv/lib/python3.11/site-packages/fake_uv_project.pth
     cat > .venv/bin/python <<'PY'
@@ -430,14 +434,18 @@ test_a_uv_workspace_syncs_every_member() {
   printf 'version = 1\n' > "$case_dir/wt/solo/uv.lock"
   printf '[project]\nname = "solo"\n' > "$case_dir/wt/solo/pyproject.toml"
 
-  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" \
+    FM_TEST_REQUIRE_UV_DEFAULT_GROUPS=1 UV_NO_DEV=1 UV_ONLY_DEV=1 \
+    UV_NO_DEFAULT_GROUPS=1 UV_NO_GROUP=dev UV_ONLY_GROUP=runtime)
   assert_contains "$out" 'rc=0' "uv provisioning failed: $out"
   # A workspace has one uv.lock and one .venv at its root, so a plain sync
   # would install only the root package and leave a member's checks unrunnable.
   assert_grep 'uv sync --frozen --all-packages' "$case_dir/install.log" \
     "a declared uv workspace was synced without its members"
-  assert_grep 'uv sync --frozen --dev' "$case_dir/install.log" \
-    "a non-workspace uv project did not use the plain sync form"
+  grep -qxF 'uv sync --frozen' "$case_dir/install.log" \
+    || fail "a non-workspace uv project did not use the plain sync form"
+  assert_no_grep ' --dev' "$case_dir/install.log" \
+    "uv provisioning depended on the undocumented --dev alias"
   pass "a uv workspace syncs every member while a single project keeps the plain sync"
 }
 
@@ -685,6 +693,25 @@ test_spawn_failure_excludes_every_mutated_component() {
   pass "a later provisioning failure leaves every mutated component excluded"
 }
 
+test_spawn_refuses_before_install_when_exclusion_cannot_be_registered() {
+  local record id out status exclude_file
+  id=provision-spawn-p8
+  record=$(make_spawn_case spawn-exclude-fail both "$id")
+  read_spawn_case "$record"
+  exclude_file=$(git -C "$WORKTREE_DIR" rev-parse --git-path info/exclude)
+  chmod 400 "$exclude_file"
+  out=$(run_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR")
+  status=$?
+  chmod 600 "$exclude_file"
+  expect_code 1 "$status" "an unwritable exclusion target should refuse the spawn: $out"
+  assert_contains "$out" 'cannot register the git exclusion' \
+    "the refusal did not identify exclusion registration: $out"
+  [ ! -s "$CASE_DIR/install.log" ] \
+    || fail "an installer ran before exclusion registration succeeded: $(cat "$CASE_DIR/install.log")"
+  assert_not_contains "$out" "spawned $id" "a spawn with an unprotected dependency directory still succeeded: $out"
+  pass "an exclusion failure refuses before any installer mutates the worktree"
+}
+
 test_provisioning_can_be_opted_out_per_spawn_and_per_home() {
   local record id out status
   id=provision-spawn-p3
@@ -755,6 +782,7 @@ test_a_declared_node_runtime_is_resolved_and_exported
 test_spawn_provisions_the_worktree_before_creating_the_endpoint
 test_spawn_refuses_when_provisioning_fails
 test_spawn_failure_excludes_every_mutated_component
+test_spawn_refuses_before_install_when_exclusion_cannot_be_registered
 test_provisioning_can_be_opted_out_per_spawn_and_per_home
 test_an_unreadable_provisioning_setting_refuses_the_spawn
 test_spawn_into_an_undeclared_project_is_unchanged

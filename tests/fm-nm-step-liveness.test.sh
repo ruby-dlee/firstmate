@@ -40,7 +40,7 @@ mkdir -p "$WT"
 # Descendants are killed too, not just the tracked pid: a leaked grandchild
 # inherits this suite's stdout and holds the pipe open until it exits on its
 # own, which makes a passing suite look like a hung one to whatever is reading
-# it - including the gate's serial test loop.
+# it - including the gate's sharded test run, which is serial within each shard.
 STARTED_PIDS=""
 kill_tree() {  # <pid>
   local child

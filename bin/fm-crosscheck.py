@@ -1825,6 +1825,8 @@ def run_reviewer(
             "workspace-write",
             "--ephemeral",
             "--strict-config",
+            "-c",
+            "project_doc_max_bytes=0",
             "--model",
             config["model"],
             "-c",
@@ -1931,6 +1933,7 @@ def run_reviewer(
     arguments = [
         claude,
         "-p",
+        "--safe-mode",
         "--model",
         config["model"],
         "--effort",

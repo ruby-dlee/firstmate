@@ -67,7 +67,7 @@ FM_PROVISION_PROBE_TIMEOUT=${FM_PROVISION_PROBE_TIMEOUT:-60}
 
 # Bumped whenever a recorded field's meaning changes; a record from another
 # schema is treated as a miss rather than misread.
-FM_PROVISION_CACHE_SCHEMA=3
+FM_PROVISION_CACHE_SCHEMA=4
 
 # Outputs of fm_provision_worktree, read by the sourcing caller (fm-spawn.sh),
 # so shellcheck cannot see their consumers from this file alone.
@@ -213,31 +213,11 @@ fm_provision_detect() {  # <worktree>
   done
 }
 
-# The files whose content defines a component's fingerprint. Only files that
-# exist are listed, so an added or removed optional manifest is itself a change.
-fm_provision_manifests() {  # <worktree> <ecosystem> <relative-dir>
-  local wt=$1 eco=$2 rel=$3 dir name member_manifests
-  dir=$wt/$rel
-  [ "$rel" != . ] || dir=$wt
-  local -a names=()
-  case "$eco" in
-    uv) names=(uv.lock pyproject.toml .python-version) ;;
-    pip)
-      names=(requirements.txt requirements-dev.txt requirements-test.txt
-             requirements_dev.txt requirements_test.txt
-             constraints.txt pyproject.toml .python-version)
-      ;;
-    npm) names=(package-lock.json package.json .nvmrc) ;;
-    pnpm) names=(pnpm-lock.yaml package.json pnpm-workspace.yaml .nvmrc) ;;
-    *) return 0 ;;
-  esac
-  for name in "${names[@]}"; do
-    [ -f "$dir/$name" ] || continue
-    printf '%s\n' "$name"
-  done
-  if [ "$eco" = uv ] && [ -f "$dir/pyproject.toml" ]; then
-    member_manifests=$(fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
-      python3 - "$dir" <<'PY'
+fm_provision_uv_workspace_info() {  # <component-dir>
+  local dir=$1
+  [ -f "$dir/pyproject.toml" ] || return 0
+  fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
+    python3 - "$dir" <<'PY'
 import ast
 import os
 import pathlib
@@ -249,6 +229,7 @@ lines = (root / "pyproject.toml").read_text(encoding="utf-8").splitlines()
 start = next((index for index, line in enumerate(lines) if re.fullmatch(r"\s*\[tool\.uv\.workspace\]\s*(?:#.*)?", line)), None)
 if start is None:
     raise SystemExit(0)
+print("workspace")
 
 def without_comment(line):
     quote = None
@@ -354,8 +335,36 @@ for member in member_dirs:
 for path in sorted(paths):
     print(path)
 PY
-    ) || return 1
-    [ -z "$member_manifests" ] || printf '%s\n' "$member_manifests"
+}
+
+# The files whose content defines a component's fingerprint. Only files that
+# exist are listed, so an added or removed optional manifest is itself a change.
+fm_provision_manifests() {  # <worktree> <ecosystem> <relative-dir>
+  local wt=$1 eco=$2 rel=$3 dir name workspace_info
+  dir=$wt/$rel
+  [ "$rel" != . ] || dir=$wt
+  local -a names=()
+  case "$eco" in
+    uv) names=(uv.lock pyproject.toml .python-version) ;;
+    pip)
+      names=(requirements.txt requirements-dev.txt requirements-test.txt
+             requirements_dev.txt requirements_test.txt
+             constraints.txt pyproject.toml .python-version)
+      ;;
+    npm) names=(package-lock.json package.json .nvmrc) ;;
+    pnpm) names=(pnpm-lock.yaml package.json pnpm-workspace.yaml .nvmrc) ;;
+    *) return 0 ;;
+  esac
+  for name in "${names[@]}"; do
+    [ -f "$dir/$name" ] || continue
+    printf '%s\n' "$name"
+  done
+  if [ "$eco" = uv ]; then
+    workspace_info=$(fm_provision_uv_workspace_info "$dir") || return 1
+    while IFS= read -r name; do
+      [ -n "$name" ] && [ "$name" != workspace ] || continue
+      printf '%s\n' "$name"
+    done <<< "$workspace_info"
   fi
 }
 
@@ -497,14 +506,14 @@ fm_provision_record_write() {  # <record> <eco> <rel> <fingerprint> <runtime> <i
 # --- readiness probes -------------------------------------------------------
 
 fm_provision_environment_signature() {  # <worktree> <eco> <rel>
-  local wt=$1 eco=$2 rel=$3 dir python inventory
+  local wt=$1 eco=$2 rel=$3 dir python state
   dir=$wt/$rel
   [ "$rel" != . ] || dir=$wt
   case "$eco" in
     uv|pip)
       python="$dir/.venv/bin/python"
       [ -x "$python" ] || return 1
-      inventory=$(fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
+      state=$(fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
         "$python" -c '
 import hashlib
 import pathlib
@@ -514,45 +523,57 @@ venv = pathlib.Path(sys.argv[1])
 site_dirs = sorted(path for path in venv.glob("lib*/python*/site-packages") if path.is_dir())
 if not site_dirs:
     raise SystemExit(1)
+paths = [venv, venv / "bin", venv / "bin" / "python", *site_dirs]
+config = venv / "pyvenv.cfg"
+if config.exists():
+    paths.append(config)
 rows = []
-for site_dir in site_dirs:
-    for entry in sorted(site_dir.iterdir(), key=lambda item: item.name):
-        if entry.name == "__pycache__":
-            continue
-        kind = "link" if entry.is_symlink() else "dir" if entry.is_dir() else "file"
-        material = entry / "__init__.py" if entry.is_dir() else entry
-        digest = ""
-        if material.is_file():
-            digest = hashlib.sha256(material.read_bytes()).hexdigest()
-        rows.append(f"{site_dir.relative_to(venv).as_posix()}/{entry.name}\t{kind}\t{entry.exists()}\t{digest}")
+for path in paths:
+    stat = path.stat()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() and not path.is_symlink() else ""
+    rows.append(f"{path.relative_to(venv)}\t{stat.st_dev}\t{stat.st_ino}\t{stat.st_mode}\t{stat.st_size}\t{stat.st_mtime_ns}\t{stat.st_ctime_ns}\t{digest}")
 print("\n".join(rows))
 ' "$dir/.venv" 2>/dev/null) || return 1
       ;;
     npm|pnpm)
-      inventory=$(fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
+      state=$(fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
         python3 -c '
-import hashlib
+import json
 import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1])
+with (root / "package.json").open("rb") as fh:
+    package = json.load(fh)
+if not isinstance(package, dict):
+    raise SystemExit(1)
+declared = set()
+for field in ("dependencies", "devDependencies"):
+    values = package.get(field, {})
+    if not isinstance(values, dict):
+        raise SystemExit(1)
+    declared.update(values)
+paths = [root / "node_modules"]
+bin_dir = root / "node_modules" / ".bin"
+if bin_dir.exists():
+    paths.append(bin_dir)
+for name in sorted(declared):
+    if not isinstance(name, str) or name in ("", ".", "..") or name.startswith("/"):
+        raise SystemExit(1)
+    package_dir = root / "node_modules" / name
+    if not package_dir.is_dir() or not (package_dir / "package.json").is_file():
+        raise SystemExit(1)
+    paths.append(package_dir)
 rows = []
-for entry in sorted(root.iterdir(), key=lambda item: item.name):
-    entries = sorted(entry.iterdir(), key=lambda item: item.name) if (entry.name.startswith("@") or entry.name == ".bin") and entry.is_dir() else [entry]
-    for package in entries:
-        rel = package.relative_to(root).as_posix()
-        kind = "link" if package.is_symlink() else "dir" if package.is_dir() else "file"
-        manifest = package / "package.json" if package.is_dir() else package
-        digest = ""
-        if manifest.is_file():
-            digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
-        rows.append(f"{rel}\t{kind}\t{package.exists()}\t{digest}")
+for path in paths:
+    stat = path.stat()
+    rows.append(f"{path.relative_to(root)}\t{stat.st_dev}\t{stat.st_ino}\t{stat.st_mode}\t{stat.st_size}\t{stat.st_mtime_ns}\t{stat.st_ctime_ns}")
 print("\n".join(rows))
-' "$dir/node_modules" 2>/dev/null) || return 1
+' "$dir" 2>/dev/null) || return 1
       ;;
     *) return 1 ;;
   esac
-  printf '%s' "$inventory" | fm_provision_sha256
+  printf '%s' "$state" | fm_provision_sha256
 }
 
 fm_provision_declared_packages_ready() {  # <worktree> <eco> <rel>
@@ -570,62 +591,31 @@ fm_provision_declared_packages_ready() {  # <worktree> <eco> <rel>
       done < <(fm_provision_pip_requirements "$dir")
       fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
         "$python" -c '
-import email.parser
+import importlib.metadata
 import pathlib
 import re
 import sys
 
 venv = pathlib.Path(sys.argv[1])
 site_dirs = [path for path in venv.glob("lib*/python*/site-packages") if path.is_dir()]
-installed = set()
-for site_dir in site_dirs:
-    for metadata in site_dir.glob("*.dist-info/METADATA"):
-        message = email.parser.Parser().parsestr(metadata.read_text(errors="replace"), headersonly=True)
-        name = message.get("Name")
-        if name:
-            installed.add(re.sub(r"[-_.]+", "-", name).lower())
 pattern = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^]]+\])?(?:\s*@\s*\S+|\s*(?:===|==|~=|!=|<=|>=|<|>).*)?$")
+declared = set()
 for requirement_file in sys.argv[2:]:
-    pending = ""
     for raw in pathlib.Path(requirement_file).read_text(errors="strict").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        if line.endswith("\\") or pending:
+        if line.endswith("\\"):
             raise SystemExit(1)
         line = line.split(" ;", 1)[0].strip()
         match = pattern.fullmatch(line)
         if not match:
             raise SystemExit(1)
-        if re.sub(r"[-_.]+", "-", match.group(1)).lower() not in installed:
-            raise SystemExit(1)
-' "$dir/.venv" "${requirements[@]}" >/dev/null 2>&1
-      ;;
-    npm|pnpm)
-      fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
-        python3 -c '
-import json
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-with (root / "package.json").open("rb") as fh:
-    package = json.load(fh)
-if not isinstance(package, dict):
-    raise SystemExit(1)
-declared = set()
-for field in ("dependencies", "devDependencies"):
-    values = package.get(field, {})
-    if not isinstance(values, dict):
-        raise SystemExit(1)
-    declared.update(values)
+        declared.add(match.group(1))
 for name in declared:
-    if not isinstance(name, str) or name in ("", ".", "..") or name.startswith("/"):
+    if not list(importlib.metadata.Distribution.discover(name=name, path=site_dirs)):
         raise SystemExit(1)
-    path = root / "node_modules" / name
-    if not path.exists() or not (path / "package.json").is_file():
-        raise SystemExit(1)
-' "$dir" >/dev/null 2>&1
+' "$dir/.venv" "${requirements[@]}" >/dev/null 2>&1
       ;;
     *) return 1 ;;
   esac
@@ -663,7 +653,9 @@ fm_provision_probe() {  # <worktree> <eco> <rel> <log> <runtime> <environment> <
   if [ "$phase" = cache ]; then
     current=$(fm_provision_environment_signature "$wt" "$eco" "$rel") || return 1
     [ -n "$environment" ] && [ "$current" = "$environment" ] || return 1
-    fm_provision_declared_packages_ready "$wt" "$eco" "$rel" || return 1
+    if [ "$eco" = pip ]; then
+      fm_provision_declared_packages_ready "$wt" "$eco" "$rel" || return 1
+    fi
   else
     [ -n "$environment" ] || return 1
   fi
@@ -685,10 +677,13 @@ fm_provision_install() {  # <worktree> <eco> <rel> <log>
       # the root package - a lane could not then run a member's checks - so a
       # declared workspace syncs every member. Non-workspace projects keep the
       # plain form, so they carry no uv-version floor for --all-packages.
+      local workspace_info
       local -a sync_args=(sync --frozen)
-      if [ -f "$dir/pyproject.toml" ] && grep -q '^\[tool\.uv\.workspace\]' "$dir/pyproject.toml"; then
+      workspace_info=$(fm_provision_uv_workspace_info "$dir") || return
+      if [ "${workspace_info%%$'\n'*}" = workspace ]; then
         sync_args+=(--all-packages)
       fi
+      sync_args+=(--dev)
       fm_provision_run_logged "$FM_PROVISION_INSTALL_TIMEOUT" "$dir" "$log" \
         uv "${sync_args[@]}" || return $?
       ;;
@@ -705,11 +700,11 @@ fm_provision_install() {  # <worktree> <eco> <rel> <log>
       ;;
     npm)
       fm_provision_run_logged "$FM_PROVISION_INSTALL_TIMEOUT" "$dir" "$log" \
-        npm ci || return $?
+        npm ci --include=dev || return $?
       ;;
     pnpm)
       fm_provision_run_logged "$FM_PROVISION_INSTALL_TIMEOUT" "$dir" "$log" \
-        pnpm install --frozen-lockfile || return $?
+        pnpm install --frozen-lockfile --prod=false || return $?
       ;;
     *) return 1 ;;
   esac

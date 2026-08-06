@@ -1985,15 +1985,19 @@ for payload in (
     {"claudeAiOauth": {}},
     {"other": 1},
 ):
-    assert not module.claude_oauth_file_carries_token(credential(payload)), payload
+    inspection = module.inspect_claude_oauth_file(credential(payload))
+    assert inspection.status == "empty", (payload, inspection)
 
 for payload in (
     {"claudeAiOauth": {"accessToken": "live", "refreshToken": ""}},
     {"claudeAiOauth": {"accessToken": "", "refreshToken": "live"}},
 ):
-    assert module.claude_oauth_file_carries_token(credential(payload)), payload
+    inspection = module.inspect_claude_oauth_file(credential(payload))
+    assert inspection.status == "usable", (payload, inspection)
 
-assert not module.claude_oauth_file_carries_token(root / "absent.json")
+inspection = module.inspect_claude_oauth_file(root / "absent.json")
+assert inspection.status == "unreadable", inspection
+assert "unavailable" in inspection.read_failure, inspection
 
 # The rejection must name which sources were tried and why each failed, rather
 # than reporting one indistinguishable message for every cause.
@@ -2014,6 +2018,23 @@ else:
 
 assert "carries no non-empty" in detail, detail
 assert ".credentials.json" in detail, detail
+
+malformed = root / "malformed-account"
+malformed.mkdir()
+(malformed / ".credentials.json").write_text("{", encoding="utf-8")
+protocol = root / "malformed-protocol" / ".crosscheck"
+protocol.mkdir(parents=True)
+try:
+    module.prepare_claude_execution_home(protocol, malformed)
+except module.CrosscheckError as exc:
+    malformed_detail = str(exc)
+else:
+    raise AssertionError("malformed OAuth file produced an executing credential")
+
+assert "could not be read" in malformed_detail, malformed_detail
+assert "malformed" in malformed_detail, malformed_detail
+assert "scoped Keychain" in malformed_detail, malformed_detail
+assert malformed_detail != detail, "read failure shared the empty-token diagnostic"
 
 bare = root / "bare-account"
 bare.mkdir()
@@ -2095,7 +2116,8 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_real_claude_sandbox_executes_exact_sha_git_diff|\
     test_symlinked_named_test_cannot_hide_test_mutation|\
     test_evidence_batch_item_limit_precedes_execution|\
-    test_evidence_batch_has_aggregate_deadline)
+    test_evidence_batch_has_aggregate_deadline|\
+    test_signed_out_oauth_file_is_not_a_credential)
       "$FM_TEST_CASE"
       exit 0
       ;;

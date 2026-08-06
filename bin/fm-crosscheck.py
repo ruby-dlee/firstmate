@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, NoReturn
+from typing import Any, Literal, NamedTuple, NoReturn
 import unicodedata
 
 
@@ -134,8 +134,13 @@ def current_passwd_identity() -> tuple[str, Path]:
     return record.pw_name, home.resolve()
 
 
-def claude_oauth_file_carries_token(path: Path) -> bool:
-    """Report whether a Claude OAuth file actually holds a usable token.
+class ClaudeOAuthInspection(NamedTuple):
+    status: Literal["usable", "empty", "unreadable"]
+    read_failure: str = ""
+
+
+def inspect_claude_oauth_file(path: Path) -> ClaudeOAuthInspection:
+    """Inspect whether a Claude OAuth file actually holds a usable token.
 
     A provisioned-but-signed-out account leaves a well-formed file behind whose
     ``accessToken`` and ``refreshToken`` are empty strings. Treating mere
@@ -149,17 +154,19 @@ def claude_oauth_file_carries_token(path: Path) -> bool:
             maximum_bytes=MAX_REVIEWER_CONFIG_BYTES,
             maximum_items=4096,
         )
-    except CrosscheckError:
-        return False
+    except CrosscheckError as exc:
+        return ClaudeOAuthInspection("unreadable", str(exc))
     if not isinstance(value, dict):
-        return False
+        return ClaudeOAuthInspection("empty")
     oauth = value.get("claudeAiOauth")
     if not isinstance(oauth, dict):
-        return False
-    return any(
+        return ClaudeOAuthInspection("empty")
+    if any(
         isinstance(oauth.get(key), str) and oauth[key].strip()
         for key in ("accessToken", "refreshToken")
-    )
+    ):
+        return ClaudeOAuthInspection("usable")
+    return ClaudeOAuthInspection("empty")
 
 
 def prepare_claude_execution_home(
@@ -197,14 +204,19 @@ def prepare_claude_execution_home(
                 "Claude executing-account credential inspection requires a regular "
                 f"non-symlink file at {credential_file}"
             )
-        if claude_oauth_file_carries_token(credential_file):
+        oauth_inspection = inspect_claude_oauth_file(credential_file)
+        if oauth_inspection.status == "usable":
             return execution_home, "oauth-file", str(credential_file)
-        # Present but unusable is not a credential; fall through to the Keychain
-        # rather than certifying a source that cannot authenticate.
-        file_rejection = (
-            f"OAuth file {credential_file} is present but carries no non-empty "
-            "claudeAiOauth accessToken or refreshToken"
-        )
+        if oauth_inspection.status == "unreadable":
+            file_rejection = (
+                f"OAuth file {credential_file} could not be read: "
+                f"{oauth_inspection.read_failure}"
+            )
+        else:
+            file_rejection = (
+                f"OAuth file {credential_file} is present but carries no non-empty "
+                "claudeAiOauth accessToken or refreshToken"
+            )
     else:
         file_rejection = f"no OAuth file at {credential_file}"
 
@@ -219,8 +231,9 @@ def prepare_claude_execution_home(
     keychains = passwd_home / "Library" / "Keychains"
     if not keychains.is_dir():
         tool_fail(
-            "Claude executing-account credential inspection found no macOS Keychain "
-            f"directory at {keychains}"
+            "Claude executing-account credential inspection found no usable "
+            f"credential for config home {account_home}: {file_rejection}; "
+            f"no macOS Keychain directory at {keychains}"
         )
     try:
         library = execution_home / "Library"
@@ -236,8 +249,9 @@ def prepare_claude_execution_home(
     security = Path("/usr/bin/security")
     if not security.is_file() or not os.access(security, os.X_OK):
         tool_fail(
-            "Claude executing-account credential inspection found no runnable "
-            "/usr/bin/security"
+            "Claude executing-account credential inspection found no usable "
+            f"credential for config home {account_home}: {file_rejection}; "
+            "no runnable /usr/bin/security"
         )
     environment = os.environ.copy()
     environment.update(

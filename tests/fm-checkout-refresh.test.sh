@@ -654,14 +654,15 @@ test_pool_preflight_surfaces_dirty_worktrees_without_blocking_clean_selection() 
 }
 
 test_pool_preflight_cost_is_scoped_to_the_target_pool() {
-  local fixture home state fakebin log target other index
-  local alone with_unrelated with_more_unrelated grown per_worktree
+  local fixture home state fakebin log worktree_list_log target other index
+  local alone alone_lists with_unrelated with_more_unrelated grown grown_lists per_worktree
   local out status budget=8
   fixture="$TMP_ROOT/pool-cost"
   home="$fixture/home"
   state="$fixture/state"
   fakebin="$fixture/fakebin"
   log="$fixture/git-calls"
+  worktree_list_log="$fixture/git-worktree-list-calls"
   mkdir -p "$home/user/.treehouse" "$home/projects" "$home/config" "$state" "$fakebin"
 
   # Count every git process the preflight launches. Processes, not seconds: it
@@ -669,6 +670,9 @@ test_pool_preflight_cost_is_scoped_to_the_target_pool() {
   cat > "$fakebin/git" <<'SH'
 #!/usr/bin/env bash
 printf 'x' >> "$FM_GIT_CALL_LOG"
+case " $* " in
+  *" worktree list --porcelain "*) printf 'x' >> "$FM_GIT_WORKTREE_LIST_LOG" ;;
+esac
 exec "$FM_REAL_GIT" "$@"
 SH
   chmod +x "$fakebin/git"
@@ -691,8 +695,10 @@ SH
 
   count_preflight() {
     : > "$log"
+    : > "$worktree_list_log"
     set +e
-    FM_REAL_GIT="$(command -v git)" FM_GIT_CALL_LOG="$log" PATH="$fakebin:$PATH" \
+    FM_REAL_GIT="$(command -v git)" FM_GIT_CALL_LOG="$log" \
+      FM_GIT_WORKTREE_LIST_LOG="$worktree_list_log" PATH="$fakebin:$PATH" \
       run_isolated_refresh "$home" "$state" pool-preflight "$target" >/dev/null 2>&1
     set -e
     wc -c < "$log" | tr -d ' '
@@ -706,7 +712,9 @@ SH
     "$home/user/.treehouse/zz-trailing-uninspectable/never-existed" \
     > "$home/user/.treehouse/zz-trailing-uninspectable/treehouse-state.json"
   alone=$(count_preflight)
+  alone_lists=$(wc -c < "$worktree_list_log" | tr -d ' ')
   [ "$alone" -gt 0 ] || fail "the preflight cost probe recorded no git invocations at all"
+  [ "$alone_lists" -gt 0 ] || fail "the preflight cost probe recorded no git worktree list invocations"
 
   # An unrelated repository, its own pool, and registrations of its own. None of
   # it belongs to the repository being spawned into, so none of it may cost
@@ -734,9 +742,12 @@ SH
   # repository's worktree list per pool member is what this bound rejects.
   add_pool_worktree "$target" "$home/user/.treehouse/target-pool" 6
   grown=$(count_preflight)
+  grown_lists=$(wc -c < "$worktree_list_log" | tr -d ' ')
   per_worktree=$(( (grown - alone) / 4 ))
   [ "$per_worktree" -le "$budget" ] || fail \
     "each additional in-pool worktree costs $per_worktree git processes, above the $budget budget ($alone at 2 worktrees, $grown at 6). Compute the repository's worktree facts once per preflight, not once per worktree."
+  [ "$grown_lists" = "$alone_lists" ] || fail \
+    "git worktree list grew with in-pool worktrees: $alone_lists calls at 2 worktrees, $grown_lists at 6. Derive registrations once per preflight."
 
   # Scoping must not cost the safety property. A dirty worktree of THIS
   # repository is still surfaced with the unrelated fleet in place.

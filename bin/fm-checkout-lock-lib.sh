@@ -188,20 +188,21 @@ fm_checkout_trusted_dir() {
 }
 
 fm_checkout_git_common_dir() {
-  fm_checkout_validate_git_metadata "$1"
+  fm_checkout_validate_git_metadata "$@"
 }
 
 # Every check below is the same check this function has always made. What
 # changed is how many processes they cost: the Git queries are asked once
 # together, and every path this function must trust is resolved in a single
-# batch instead of one process launch per path. The registration walk is the
+# batch instead of one process launch per path unless the caller supplies an
+# already-trusted registration snapshot. The registration walk is the
 # reason that mattered - it resolves one path per registered worktree, so the
 # old per-path form made a single identity check scale with the repository's
 # worktree count, and any caller that ran it per worktree scale quadratically.
 fm_checkout_validate_git_metadata() {
-  local checkout=$1 root metadata rev_output listed line resolved_output
+  local checkout=$1 trusted_registrations_file=${2:-} root metadata rev_output listed line resolved_output
   local absolute_git common top registrations index found=0
-  local -a probe resolved
+  local -a probe resolved registration_roots
   root=$(fm_checkout_trusted_dir "$checkout") || return 1
   metadata="$root/.git"
   [ -e "$metadata" ] && [ ! -L "$metadata" ] || return 1
@@ -221,7 +222,6 @@ EOF
     /*) ;;
     *) common="$root/$common" ;;
   esac
-  listed=$(git -C "$root" worktree list --porcelain 2>/dev/null) || return 1
   # Batch layout: the three Git-reported paths, then the `.git` directory when
   # there is one to compare, then every registration. Registrations are last so
   # their offset is a single fixed base regardless of the metadata shape.
@@ -232,13 +232,19 @@ EOF
   else
     registrations=3
   fi
-  while IFS= read -r line; do
-    case "$line" in
-      "worktree "*) probe+=("${line#worktree }") ;;
-    esac
-  done <<EOF
+  if [ -z "$trusted_registrations_file" ]; then
+    listed=$(git -C "$root" worktree list --porcelain 2>/dev/null) || return 1
+    while IFS= read -r line; do
+      case "$line" in
+        "worktree "*) probe+=("${line#worktree }") ;;
+      esac
+    done <<EOF
 $listed
 EOF
+  else
+    [ -f "$trusted_registrations_file" ] && [ ! -L "$trusted_registrations_file" ] \
+      && [ -r "$trusted_registrations_file" ] || return 1
+  fi
   # Strict mode: an untrusted path anywhere in this set fails the whole
   # validation, exactly as each individual `|| return 1` did before.
   resolved_output=$(fm_checkout_trusted_dirs strict "${probe[@]}") || return 1
@@ -263,9 +269,24 @@ EOF
   else
     return 1
   fi
-  index=$registrations
-  while [ "$index" -lt "${#resolved[@]}" ]; do
-    line=${resolved[$index]}
+  registration_roots=()
+  if [ -n "$trusted_registrations_file" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        /*) ;;
+        *) return 1 ;;
+      esac
+      case "$line" in *$'\t'*|*$'\r'*|*$'\n'*) return 1 ;; esac
+      registration_roots+=("$line")
+    done < "$trusted_registrations_file"
+  else
+    index=$registrations
+    while [ "$index" -lt "${#resolved[@]}" ]; do
+      registration_roots+=("${resolved[$index]}")
+      index=$((index + 1))
+    done
+  fi
+  for line in "${registration_roots[@]}"; do
     if [ "$line" = "$root" ]; then
       found=$((found + 1))
     elif [ -f "$metadata" ] && [ "$absolute_git" = "$common" ] \
@@ -275,7 +296,6 @@ EOF
       # show-toplevel proof above binds that Git directory back to root.
       found=$((found + 1))
     fi
-    index=$((index + 1))
   done
   [ "$found" -eq 1 ] || return 1
   printf '%s\n' "$common"

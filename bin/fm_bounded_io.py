@@ -1047,6 +1047,10 @@ def run_bounded(
                 )
         if cleanup_failure:
             cleanup_error = BoundedIOError(str(cleanup_failure))
+            if isinstance(primary_error, BoundedTimeout):
+                raise BoundedTimeout(
+                    f"{primary_error}; cleanup could not be verified: {cleanup_failure}"
+                ) from cleanup_error
             if primary_error is not None:
                 raise cleanup_error from primary_error
             raise cleanup_error

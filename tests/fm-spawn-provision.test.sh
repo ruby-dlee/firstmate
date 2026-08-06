@@ -69,6 +69,8 @@ PY
         printf 'pytest package\n' > .venv/lib/python3.11/site-packages/pytest/__init__.py
         printf 'Name: six\nVersion: 1.16.0\n' > .venv/lib/python3.11/site-packages/six-1.16.0.dist-info/METADATA
         printf 'Name: pytest\nVersion: 8.3.4\n' > .venv/lib/python3.11/site-packages/pytest-8.3.4.dist-info/METADATA
+        printf '#!/usr/bin/env bash\nexit 0\n' > .venv/bin/pytest
+        chmod +x .venv/bin/pytest
         exit 0
         ;;
       check) [ -x .venv/bin/python ] || exit 1; exit 0 ;;
@@ -94,6 +96,13 @@ case "${1:-}" in
     }
     mkdir -p node_modules/is-number
     printf '{"name":"is-number","version":"7.0.0"}\n' > node_modules/is-number/package.json
+    printf 'module.exports = true\n' > node_modules/is-number/index.js
+    case " $* " in
+      *' --include=dev '*)
+        mkdir -p node_modules/test-runner
+        printf '{"name":"test-runner","version":"1.0.0"}\n' > node_modules/test-runner/package.json
+        ;;
+    esac
     printf '{}\n' > node_modules/.package-lock.json
     exit 0
     ;;
@@ -109,6 +118,13 @@ case "${1:-}" in
   install)
     mkdir -p node_modules/is-number
     printf '{"name":"is-number","version":"7.0.0"}\n' > node_modules/is-number/package.json
+    printf 'module.exports = true\n' > node_modules/is-number/index.js
+    case " $* " in
+      *' --prod=false '*)
+        mkdir -p node_modules/test-runner
+        printf '{"name":"test-runner","version":"1.0.0"}\n' > node_modules/test-runner/package.json
+        ;;
+    esac
     printf 'hoistPattern:\n' > node_modules/.modules.yaml
     exit 0
     ;;
@@ -142,7 +158,7 @@ make_worktree() {
   case "$shape" in
     js|both)
       mkdir -p "$dir/web"
-      printf '{"name":"web","private":true,"dependencies":{"is-number":"7.0.0"}}\n' > "$dir/web/package.json"
+      printf '{"name":"web","private":true,"dependencies":{"is-number":"7.0.0"},"devDependencies":{"test-runner":"1.0.0"}}\n' > "$dir/web/package.json"
       printf '{"lockfileVersion":3}\n' > "$dir/web/package-lock.json"
       ;;
   esac
@@ -207,13 +223,16 @@ test_first_spawn_installs_and_second_reuses_the_cache() {
   case_dir=$(new_case cache both)
   fakebin=$(case_fakebin "$case_dir")
 
-  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" NODE_ENV=production NPM_CONFIG_OMIT=dev)
   assert_contains "$out" 'rc=0' "cold provisioning failed: $out"
   assert_contains "$out" 'pip:svc=installed' "cold provisioning did not install the python component: $out"
   assert_contains "$out" 'npm:web=installed' "cold provisioning did not install the js component: $out"
   assert_grep 'uv venv --clear .venv' "$case_dir/install.log" "python provisioning did not create a uv virtualenv"
   assert_grep 'uv pip install' "$case_dir/install.log" "python provisioning did not install requirements"
   assert_grep 'npm ci' "$case_dir/install.log" "js provisioning did not run npm ci"
+  assert_grep 'npm ci --include=dev' "$case_dir/install.log" "npm provisioning inherited an ambient development-dependency omission"
+  [ -f "$case_dir/wt/web/node_modules/test-runner/package.json" ] \
+    || fail "npm provisioning omitted a declared validation dependency"
   assert_grep 'requirements-test.txt' "$case_dir/install.log" \
     "python provisioning ignored the companion test requirements"
 
@@ -258,7 +277,31 @@ test_a_removed_environment_invalidates_a_matching_fingerprint() {
   out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
   assert_contains "$out" 'pip:svc=installed' "a deleted declared Python package was reported as cached: $out"
   assert_contains "$out" 'npm:web=cached' "an untouched Node component was needlessly reinstalled: $out"
+
+  rm -f "$case_dir/wt/svc/.venv/bin/pytest" "$case_dir/wt/web/node_modules/is-number/index.js"
+  : > "$case_dir/install.log"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'pip:svc=installed' "a deleted Python validation executable was reported as cached: $out"
+  assert_contains "$out" 'npm:web=installed' "a changed declared Node package was reported as cached: $out"
   pass "a fingerprint match with a broken environment is a miss, not a hit"
+}
+
+test_node_installs_include_validation_dependencies() {
+  local case_dir out fakebin
+  case_dir=$(new_case node-validation-deps none)
+  fakebin=$(case_fakebin "$case_dir")
+  mkdir -p "$case_dir/wt/tools"
+  printf 'lockfileVersion: 9\n' > "$case_dir/wt/tools/pnpm-lock.yaml"
+  printf '{"name":"tools","dependencies":{"is-number":"7.0.0"},"devDependencies":{"test-runner":"1.0.0"}}\n' \
+    > "$case_dir/wt/tools/package.json"
+
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" NODE_ENV=production)
+  assert_contains "$out" 'pnpm:tools=installed' "pnpm provisioning failed under a production environment: $out"
+  assert_grep 'pnpm install --frozen-lockfile --prod=false' "$case_dir/install.log" \
+    "pnpm provisioning inherited an ambient development-dependency omission"
+  [ -f "$case_dir/wt/tools/node_modules/test-runner/package.json" ] \
+    || fail "pnpm provisioning omitted a declared validation dependency"
+  pass "Node installs include declared validation dependencies deterministically"
 }
 
 test_a_replaced_interpreter_invalidates_the_cache() {
@@ -382,7 +425,7 @@ test_a_uv_workspace_syncs_every_member() {
   fakebin=$(case_fakebin "$case_dir")
   mkdir -p "$case_dir/wt/mono/packages/alpha" "$case_dir/wt/solo"
   printf 'version = 1\n' > "$case_dir/wt/mono/uv.lock"
-  printf '[project]\nname = "mono"\n\n[tool.uv.workspace]\nmembers = ["packages/*"]\n' \
+  printf '[project]\nname = "mono"\n\n  [tool.uv.workspace]\nmembers = ["packages/*"]\n' \
     > "$case_dir/wt/mono/pyproject.toml"
   printf 'version = 1\n' > "$case_dir/wt/solo/uv.lock"
   printf '[project]\nname = "solo"\n' > "$case_dir/wt/solo/pyproject.toml"
@@ -393,8 +436,8 @@ test_a_uv_workspace_syncs_every_member() {
   # would install only the root package and leave a member's checks unrunnable.
   assert_grep 'uv sync --frozen --all-packages' "$case_dir/install.log" \
     "a declared uv workspace was synced without its members"
-  assert_grep 'uv sync --frozen
-' "$case_dir/install.log" "a non-workspace uv project did not use the plain sync form"
+  assert_grep 'uv sync --frozen --dev' "$case_dir/install.log" \
+    "a non-workspace uv project did not use the plain sync form"
   pass "a uv workspace syncs every member while a single project keeps the plain sync"
 }
 
@@ -404,7 +447,7 @@ test_a_uv_workspace_member_manifest_invalidates_the_cache() {
   fakebin=$(case_fakebin "$case_dir")
   mkdir -p "$case_dir/wt/mono/packages/alpha"
   printf 'version = 1\n' > "$case_dir/wt/mono/uv.lock"
-  printf '[project]\nname = "mono"\n\n[tool.uv.workspace]\nmembers = ["packages/*"]\n' \
+  printf '[project]\nname = "mono"\n\n  [tool.uv.workspace]\nmembers = ["packages/*"]\n' \
     > "$case_dir/wt/mono/pyproject.toml"
   printf '[project]\nname = "alpha"\nversion = "1.0.0"\n' \
     > "$case_dir/wt/mono/packages/alpha/pyproject.toml"
@@ -696,6 +739,7 @@ test_worktree_declaring_nothing_is_a_clean_noop
 test_first_spawn_installs_and_second_reuses_the_cache
 test_a_changed_manifest_invalidates_the_cache
 test_a_removed_environment_invalidates_a_matching_fingerprint
+test_node_installs_include_validation_dependencies
 test_a_replaced_interpreter_invalidates_the_cache
 test_a_failing_install_refuses_the_spawn
 test_a_hung_install_is_bounded

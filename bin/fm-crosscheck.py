@@ -1689,6 +1689,7 @@ def pi_review_result(output: str) -> tuple[dict[str, Any], int]:
     turn_count = 0
     agent_ended = False
     final_text: str | None = None
+    final_stop_reason: str | None = None
     for line_number, line in enumerate(output.splitlines(), start=1):
         if not line.strip():
             continue
@@ -1705,9 +1706,16 @@ def pi_review_result(output: str) -> tuple[dict[str, Any], int]:
             )
         event_type = event.get("type")
         if event_type == "turn_end":
+            if agent_ended:
+                tool_fail("Pi reviewer emitted a turn after agent completion")
             turn_count += 1
+            final_text = None
+            final_stop_reason = None
             message = event.get("message")
             if isinstance(message, dict) and message.get("role") == "assistant":
+                stop_reason = message.get("stopReason")
+                if isinstance(stop_reason, str):
+                    final_stop_reason = stop_reason
                 content = message.get("content")
                 if isinstance(content, str):
                     final_text = content
@@ -1722,11 +1730,18 @@ def pi_review_result(output: str) -> tuple[dict[str, Any], int]:
                     if text_parts:
                         final_text = "".join(text_parts)
         elif event_type == "agent_end":
+            if agent_ended:
+                tool_fail("Pi reviewer emitted duplicate agent completion")
             agent_ended = True
     if turn_count == 0:
         tool_fail("Pi reviewer completed without executing a turn")
     if not agent_ended:
         tool_fail("Pi reviewer stopped before agent completion")
+    if final_stop_reason != "stop":
+        tool_fail(
+            "Pi reviewer final assistant turn did not stop successfully: "
+            f"stopReason={final_stop_reason!r}"
+        )
     if final_text is None or not final_text.strip():
         tool_fail("Pi reviewer completed without a verdict artifact")
     try:
@@ -1876,6 +1891,7 @@ def run_reviewer(
             "--no-skills",
             "--no-prompt-templates",
             "--no-themes",
+            "--no-context-files",
             "--no-approve",
             pi_prompt,
         ]

@@ -26,19 +26,40 @@ fm_refuse_if_gate_agent
 # weaker bounds than the gate documents.
 FM_CROSSCHECK_MIN_PYTHON="3.11"
 fm_python_is_supported() {
-  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
-    >/dev/null 2>&1
+  "$1" -c 'import sys
+minimum = tuple(int(part) for part in sys.argv[1].split("."))
+raise SystemExit(0 if sys.version_info >= minimum else 1)' \
+    "$FM_CROSSCHECK_MIN_PYTHON" >/dev/null 2>&1
 }
 
+# An explicit pin is honoured or refused, never quietly replaced: substituting a
+# different interpreter for the one an operator named is the same silent
+# degradation this gate exists to make impossible.
 interpreter=""
-for candidate in "${FM_CROSSCHECK_PYTHON:-}" python3.14 python3.13 python3.12 python3.11 python3; do
-  [ -n "$candidate" ] || continue
-  command -v "$candidate" >/dev/null 2>&1 || continue
-  if fm_python_is_supported "$candidate"; then
-    interpreter=$candidate
-    break
+pinned="${FM_CROSSCHECK_PYTHON:-}"
+if [ -n "$pinned" ]; then
+  if ! command -v "$pinned" >/dev/null 2>&1; then
+    printf 'CROSSCHECK UNREVIEWED: FM_CROSSCHECK_PYTHON=%s names no runnable command; %s\n' \
+      "$pinned" \
+      "point it at a Python $FM_CROSSCHECK_MIN_PYTHON or newer interpreter, or unset it to select one" >&2
+    exit 1
   fi
-done
+  if ! fm_python_is_supported "$pinned"; then
+    printf 'CROSSCHECK UNREVIEWED: FM_CROSSCHECK_PYTHON=%s did not report Python %s or newer; %s\n' \
+      "$pinned" "$FM_CROSSCHECK_MIN_PYTHON" \
+      'the gate refuses rather than silently reviewing under an interpreter nobody pinned' >&2
+    exit 1
+  fi
+  interpreter=$pinned
+else
+  for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if fm_python_is_supported "$candidate"; then
+      interpreter=$candidate
+      break
+    fi
+  done
+fi
 
 if [ -z "$interpreter" ]; then
   printf 'CROSSCHECK UNREVIEWED: no Python %s or newer interpreter is available; %s\n' \

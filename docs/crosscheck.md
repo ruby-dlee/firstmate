@@ -127,7 +127,11 @@ The profile never grants write access to the reviewer account home, the ambient 
 
 That write boundary means the Claude harness cannot use the reviewer account home as its working config directory: it creates session and shell-snapshot state before its command-execution tool works, and a workspace scratch directory under the shared host temporary root.
 Crosscheck therefore redirects `CLAUDE_CONFIG_DIR` to a per-run home seeded inside the review checkout and `CLAUDE_CODE_TMPDIR` to a scratch directory beside it, the same treatment `TMPDIR`, `XDG_CACHE_HOME`, and `PYTHONPYCACHEPREFIX` already receive.
-Account separation survives that redirect because `CLAUDE_SECURESTORAGE_CONFIG_DIR` still pins the credential store at the selected reviewer account; the seeded home copies configuration, creates runtime directories empty, and reads credentials through a symlink rather than duplicating a secret into the checkout.
+Account separation survives that redirect because `CLAUDE_SECURESTORAGE_CONFIG_DIR` still pins the credential store at the selected reviewer account.
+The seeded home is a projection of that account, and what it does with each entry is worth stating exactly rather than as a blanket guarantee.
+`.credentials.json` alone is read through a symlink to the account's own store, so the OAuth secret is never duplicated into the checkout, and a refresh write through that link fails closed under the sandbox.
+Every other regular file within the 4 MiB seeding bound is copied, so any other token-bearing configuration an account home holds - `.claude.json`, or a settings file whose `env` block carries a provider key - does exist as a copy for the length of the run; that copy lives in the disposable review checkout under a `0700` directory and is destroyed with it.
+Directories are recreated fresh and empty, and so is a symlink that resolves to a directory: reproducing such a link would send the harness's session and shell-snapshot writes back outside the sandbox and kill the execution tool this redirect exists to keep alive.
 The reviewer binary is resolved from the account's recorded provider binary before `PATH`, because a launcher earlier on `PATH` may unset `CLAUDE_CONFIG_DIR` to pin its own account and would silently discard both the redirect and the separation.
 
 An unavailable reviewer binary, sandbox, author-identity proof, executing-account binding, verdict-level execution proof, or exact remote PR head records a `tool-failure` attempt when the live head is already known, and otherwise emits the same tool-failure class without fabricating a ledger run.
@@ -155,6 +159,9 @@ The Claude attestation additionally records the harness config directory it actu
 
 The witness variable is named `FM_CROSSCHECK_ATTEST_WITNESS` because harnesses filter the environment they hand to shell commands: Codex's default `shell_environment_policy` drops every name matching `*KEY*`, `*SECRET*`, or `*TOKEN*`, so a witness named after a secret would never reach the reviewer's shell and would force every Codex review to `unreviewed`.
 The Codex invocation additionally pins `shell_environment_policy.inherit=all` so an account configuration cannot narrow that inheritance out from under the self-test.
+That pin is a deliberate widening and should be read as one: Codex's default `core` policy hands its shell commands a curated set (`HOME`, `PATH`, `USER`, `TERM`, `TMPDIR`, and a few others) in which the witness would not survive, so `inherit=all` replaces that curated set with the gate's entire environment.
+Crosscheck removes the provider credential variables before launch and Codex's default `*KEY*`, `*SECRET*`, and `*TOKEN*` exclusion globs still apply on top of `inherit`, but everything else the operator's environment carries is now readable by a reviewer that processes untrusted PR claims and writes prose into a durable ledger.
+Do not assume the Codex reviewer runs in a curated environment; run the gate from an environment you would be willing to show it.
 When the script runs but the witness is absent it records a distinguishing marker rather than an empty digest, so a filtered environment is reported as exactly that instead of as a dead command-execution tool.
 
 ## Installed external contracts

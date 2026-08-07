@@ -552,14 +552,23 @@ def seed_reviewer_home(
     state inside the boundary instead of widening the profile to the real
     account home. Identity is not copied: ``run_reviewer`` pins the harness
     credential store back at ``account_home`` so account separation survives the
-    redirect and no secret is duplicated onto disk.
+    redirect.
+
+    Exactly one entry is read through rather than copied. ``.credentials.json``
+    is recreated as a symlink to the account's own store, so that secret is
+    never duplicated. Every other regular file within
+    ``MAX_SEEDED_CONFIG_BYTES`` - including ``.claude.json`` and any settings
+    file whose ``env`` block carries a provider token - is copied into this
+    seeded home, which lives inside the disposable review checkout and dies with
+    it. Directories, and symlinks that resolve to directories, are recreated
+    fresh and empty so no harness write escapes the sandbox through a link.
     """
     home = protocol_dir / "reviewer-home"
     home.mkdir(mode=0o700)
     try:
         entries = sorted(account_home.iterdir(), key=lambda entry: entry.name)
     except OSError as exc:
-        fail(f"reviewer account home is unreadable at {account_home}: {exc}")
+        tool_fail(f"reviewer account home is unreadable at {account_home}: {exc}")
     for entry in entries:
         destination = home / entry.name
         try:
@@ -573,12 +582,14 @@ def seed_reviewer_home(
                 # be proven until those accounts are re-authenticated; confine
                 # omission to the path where the file was already rejected.
                 continue
-            if entry.is_symlink():
-                os.symlink(os.readlink(entry), destination)
-            elif entry.is_dir():
-                # Fresh and empty: the harness owns this state for one run, and
-                # a symlink here would send its writes back outside the sandbox.
+            if entry.is_dir():
+                # Fresh and empty: the harness owns this state for one run. A
+                # symlink resolving to a directory lands here too, because
+                # reproducing it would send the harness's writes back outside
+                # the sandbox and kill its execution tool.
                 destination.mkdir(mode=0o700)
+            elif entry.is_symlink():
+                os.symlink(os.readlink(entry), destination)
             elif entry.name == CREDENTIALS_NAME:
                 # Read through to the account's own store rather than copying a
                 # secret into the checkout. A refresh write fails closed under
@@ -597,7 +608,7 @@ def seed_reviewer_home(
                         file=sys.stderr,
                     )
         except OSError as exc:
-            fail(f"could not seed reviewer home entry {entry.name}: {exc}")
+            tool_fail(f"could not seed reviewer home entry {entry.name}: {exc}")
     for name in ("session-env", "shell-snapshots", "statsig"):
         (home / name).mkdir(mode=0o700, exist_ok=True)
     return home

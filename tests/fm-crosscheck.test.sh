@@ -2197,6 +2197,238 @@ PY
   pass "a signed-out OAuth file is rejected with a cause-naming diagnostic"
 }
 
+test_recorded_provider_binary_is_preferred_over_path() {
+  # The `claude` on PATH here is a launcher that unsets CLAUDE_CONFIG_DIR, which
+  # would discard both the sandbox redirect and the reviewer's account
+  # separation. Preferring the account's own recorded binary is what keeps the
+  # gate off that launcher; every hermetic case pins FM_CROSSCHECK_CLAUDE_BIN and
+  # so never exercises it.
+  env -u FM_CROSSCHECK_CLAUDE_BIN "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' \
+    || fail "the account's recorded provider binary was not preferred over PATH"
+import importlib.util
+import json
+import pathlib
+import os
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+root = pathlib.Path(tempfile.mkdtemp())
+
+
+def executable(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def record(payload):
+    marker = account / ".agent-fleet-provider-binary.json"
+    if payload is None:
+        marker.unlink(missing_ok=True)
+        return
+    marker.write_text(
+        payload if isinstance(payload, str) else json.dumps(payload),
+        encoding="utf-8",
+    )
+
+
+path_directory = root / "path-bin"
+path_claude = executable(path_directory / "claude")
+os.environ["PATH"] = str(path_directory)
+os.environ.pop("FM_CROSSCHECK_CLAUDE_BIN", None)
+
+account = root / "account"
+account.mkdir()
+pinned = executable(root / "managed" / "claude")
+
+record(
+    {
+        "schema": 1,
+        "profile": "reviewer-one",
+        "provider": "claude",
+        "binary": {"resolved_path": str(pinned)},
+    }
+)
+resolved = module.resolve_claude_binary(account)
+assert resolved == str(pinned), resolved
+
+# The marker file is owned by agent-fleet provisioning. Any shape this gate
+# cannot use must degrade to PATH discovery, never to a crash and never to a
+# silently unusable path.
+unreadable = root / "managed" / "not-executable"
+unreadable.write_text("", encoding="utf-8")
+unreadable.chmod(0o644)
+for payload in (
+    None,
+    "{",
+    "[]",
+    {"binary": {}},
+    {"binary": "not-an-object"},
+    {"binary": {"resolved_path": 7}},
+    {"binary": {"resolved_path": str(root / "managed" / "absent")}},
+    {"binary": {"resolved_path": str(unreadable)}},
+    {"binary": {"resolved_path": str(root / "managed")}},
+    {"schema": 1, "profile": "reviewer-one"},
+):
+    record(payload)
+    resolved = module.resolve_claude_binary(account)
+    assert resolved == str(path_claude), (payload, resolved)
+
+# An explicit override still outranks both, and an unusable one is a named tool
+# failure rather than a quiet fallback to the launcher on PATH.
+override = executable(root / "override" / "claude")
+os.environ["FM_CROSSCHECK_CLAUDE_BIN"] = str(override)
+record(
+    {
+        "schema": 1,
+        "profile": "reviewer-one",
+        "provider": "claude",
+        "binary": {"resolved_path": str(pinned)},
+    }
+)
+resolved = module.resolve_claude_binary(account)
+assert resolved == str(override), resolved
+
+os.environ["FM_CROSSCHECK_CLAUDE_BIN"] = str(root / "override" / "absent")
+try:
+    module.resolve_claude_binary(account)
+except module.CrosscheckToolError as exc:
+    assert "FM_CROSSCHECK_CLAUDE_BIN" in str(exc), exc
+else:
+    raise AssertionError("an unusable override fell back to another binary")
+os.environ.pop("FM_CROSSCHECK_CLAUDE_BIN")
+
+# With neither a usable pin nor a PATH binary the gate must fail closed.
+record(None)
+os.environ["PATH"] = str(root / "empty-bin")
+try:
+    module.resolve_claude_binary(account)
+except module.CrosscheckToolError as exc:
+    assert "no runnable binary" in str(exc), exc
+else:
+    raise AssertionError("an absent Claude binary resolved anyway")
+PY
+  pass "the account's recorded provider binary outranks the launcher on PATH"
+}
+
+test_seeded_home_never_links_a_writable_directory_outward() {
+  # The sandbox denies every write outside the review checkout, so a directory
+  # in the seeded home that is really a link to the account home would send the
+  # harness's session and shell-snapshot writes straight back out and kill its
+  # execution tool - the defect this redirect exists to remove.
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' \
+    || fail "the seeded reviewer home reproduced a directory symlink out of the checkout"
+import importlib.util
+import json
+import pathlib
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+root = pathlib.Path(tempfile.mkdtemp())
+outside = root / "outside"
+(outside / "shared-skills").mkdir(parents=True)
+(outside / "shared-skills" / "marker").write_text("shared\n", encoding="utf-8")
+(outside / "CLAUDE.md").write_text("shared instructions\n", encoding="utf-8")
+
+account = root / "account"
+account.mkdir()
+(account / "shell-snapshots").symlink_to(outside, target_is_directory=True)
+(account / "skills").symlink_to(
+    outside / "shared-skills", target_is_directory=True
+)
+(account / "projects").mkdir()
+(account / "projects" / "stale").write_text("prior run\n", encoding="utf-8")
+(account / "CLAUDE.md").symlink_to(outside / "CLAUDE.md")
+(account / ".claude.json").write_text(json.dumps({"config": 1}), encoding="utf-8")
+credential = account / ".credentials.json"
+credential.write_text(
+    json.dumps({"claudeAiOauth": {"accessToken": "live"}}), encoding="utf-8"
+)
+
+protocol = root / "protocol" / ".crosscheck"
+protocol.mkdir(parents=True)
+home = module.seed_reviewer_home(protocol, account, "oauth-file")
+
+for name in ("shell-snapshots", "skills", "projects", "session-env", "statsig"):
+    entry = home / name
+    assert entry.is_dir(), name
+    assert not entry.is_symlink(), f"{name} was reproduced as a symlink"
+    assert list(entry.iterdir()) == [], f"{name} carried state into the run"
+    probe = entry / "harness-write"
+    probe.write_text("state\n", encoding="utf-8")
+    assert probe.resolve().is_relative_to(home.resolve()), name
+
+# A symlink to a file still reads through: that is the deliberate credential
+# pattern, and it does not give the harness a way to write outside.
+assert (home / "CLAUDE.md").is_symlink()
+assert (home / "CLAUDE.md").read_text(encoding="utf-8") == "shared instructions\n"
+assert (home / ".credentials.json").is_symlink()
+assert (home / ".credentials.json").resolve() == credential.resolve()
+
+# Other regular files are copied, not linked - the seeded home is a copy that
+# dies with the checkout, and the documentation says so.
+copied = home / ".claude.json"
+assert copied.is_file() and not copied.is_symlink()
+assert json.loads(copied.read_text(encoding="utf-8")) == {"config": 1}
+PY
+  pass "the seeded reviewer home keeps every writable directory inside the checkout"
+}
+
+test_pinned_interpreter_is_honoured_or_refused() {
+  # Substituting another interpreter for the one an operator pinned would run
+  # the gate under bounds nobody chose - the same silent degradation the
+  # version floor exists to prevent.
+  local launcher case_dir rc
+  launcher="$ROOT/bin/fm-crosscheck.sh"
+  case_dir="$TMP_ROOT/pinned-interpreter"
+  mkdir -p "$case_dir"
+  printf '#!/bin/sh\nexit 1\n' > "$case_dir/python-too-old"
+  chmod +x "$case_dir/python-too-old"
+
+  set +e
+  FM_CROSSCHECK_PYTHON="$case_dir/absent-python" \
+    bash "$launcher" run task-x1 "$PR_URL" > "$case_dir/missing.out" 2> "$case_dir/missing.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "pinned interpreter that does not exist"
+  assert_grep "FM_CROSSCHECK_PYTHON=$case_dir/absent-python names no runnable command" \
+    "$case_dir/missing.err" "an absent interpreter pin was not named in the refusal"
+  assert_no_grep 'CROSSCHECK TOOL-FAILURE' "$case_dir/missing.err" \
+    "an absent interpreter pin fell through to an interpreter nobody chose"
+
+  set +e
+  FM_CROSSCHECK_PYTHON="$case_dir/python-too-old" \
+    bash "$launcher" run task-x1 "$PR_URL" > "$case_dir/old.out" 2> "$case_dir/old.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "pinned interpreter below the version floor"
+  assert_grep "FM_CROSSCHECK_PYTHON=$case_dir/python-too-old did not report Python 3.11 or newer" \
+    "$case_dir/old.err" "a below-floor interpreter pin was not named in the refusal"
+  assert_no_grep 'CROSSCHECK TOOL-FAILURE' "$case_dir/old.err" \
+    "a below-floor interpreter pin fell through to an interpreter nobody chose"
+
+  # An unset or empty pin keeps the existing discovery order.
+  set +e
+  FM_CROSSCHECK_PYTHON='' bash "$launcher" > "$case_dir/discovery.out" 2> "$case_dir/discovery.err"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "interpreter discovery with no pin"
+  assert_grep 'usage: fm-crosscheck.py' "$case_dir/discovery.err" \
+    "an empty interpreter pin did not fall back to interpreter discovery"
+  pass "an unusable interpreter pin is refused by name rather than silently replaced"
+}
+
 test_verify_rechecks_live_head_and_claims() {
   local record case_dir base head next_base rc verified
   record=$(make_case verify-live)
@@ -2262,6 +2494,9 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_evidence_batch_item_limit_precedes_execution|\
     test_evidence_batch_has_aggregate_deadline|\
     test_default_environment_exclusions_do_not_block_attestation|\
+    test_recorded_provider_binary_is_preferred_over_path|\
+    test_seeded_home_never_links_a_writable_directory_outward|\
+    test_pinned_interpreter_is_honoured_or_refused|\
     test_signed_out_oauth_file_is_not_a_credential)
       "$FM_TEST_CASE"
       exit 0
@@ -2326,4 +2561,7 @@ test_reviewer_that_executes_nothing_is_unreviewed
 test_default_environment_exclusions_do_not_block_attestation
 test_stripped_config_redirect_is_unreviewed
 test_signed_out_oauth_file_is_not_a_credential
+test_recorded_provider_binary_is_preferred_over_path
+test_seeded_home_never_links_a_writable_directory_outward
+test_pinned_interpreter_is_honoured_or_refused
 test_verify_rechecks_live_head_and_claims

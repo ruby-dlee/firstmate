@@ -83,11 +83,11 @@
 #   script only decides what a failure does to the spawn (block aborts, warn
 #   continues with a banner, a durable verdict, and a brief note) and hands a
 #   ready verdict's proven runtime pin to the crewmate's exported PATH.
-#   A provisioner that dies WITHOUT a parseable verdict is decided by the
-#   manifest policy this script read before the run, so block fails closed; an
-#   unreadable policy is treated as block. A leased worktree is re-proven
-#   returnable after provisioning wrote into it, and residue is a failure under
-#   that same policy.
+#   The policy is read from the manifest BEFORE the run, and a resolved block
+#   aborts whatever comes back: a verdict-less death, and equally a non-ready
+#   verdict. An unreadable policy resolves to block. A leased worktree is
+#   re-proven returnable after provisioning wrote into it, and residue is a
+#   failure under that same policy.
 #   --resume-account and --continue-account are legacy recovery paths only for
 #   existing account_profile metadata. They retain the sealed Agent Fleet
 #   session/lease behavior needed to recover those already-managed generations;
@@ -3283,14 +3283,14 @@ fi
 # evidence is retired before every attempt because an unverified readiness claim
 # is more harmful than a lost diagnostic. Only status=ready publishes readiness.
 #
-# A failure follows the manifest's on_failure policy, and the discriminator is
-# whether fm-provision emitted a PARSEABLE VERDICT, not the exit code alone. With
-# a verdict, the exit code decides exactly as fm-provision documents it: 3 warns
-# and continues, 4 blocks. WITHOUT one - signal death, a usage error, a gate
-# refusal, any exit nobody anticipated - there is no verdict to read, so the
-# policy resolved from the manifest BEFORE the run decides instead, and a block
-# project aborts. A block policy that let the spawn continue whenever the
-# provisioner died in an unanticipated way would defeat the point of choosing it.
+# A failure follows the manifest's on_failure policy, and the policy resolved
+# from the manifest BEFORE the run is consulted on every path that could still
+# launch an agent, because resolving a policy is not the same as honoring it.
+# A resolved block aborts whatever arrives: a verdict-less death - signal death,
+# a usage error, a gate refusal, any exit nobody anticipated - and equally an
+# exit 3 that did carry a verdict, so the two scripts cannot silently disagree
+# about what block means. Exit 3 with a verdict continues only under a resolved
+# warn, which is the documented non-ready path and stays exactly as it was.
 # Rewrite the brief's delimited provisioning section through the repo's pinned
 # task-file transaction, the same primitive every other brief mutator uses. It
 # pins the task directory by fd and identity, refuses symlinks, stages in the
@@ -3309,13 +3309,12 @@ const [dataDir, taskId, fileName] = process.argv.slice(2);
 const BEGIN = '<!-- fm-provision:begin -->';
 const END = '<!-- fm-provision:end -->';
 const section = process.env.FM_PROVISION_BRIEF_SECTION || '';
-const addition = Buffer.from(section && !section.endsWith('\n') ? `${section}\n` : section);
 
-// Both delimiters and everything between them are dropped, and every kept line
-// is newline-terminated, so a rewrite is idempotent rather than stacking copies.
-function withoutSection(text) {
+// Both delimiters and everything between them are dropped, along with the blank
+// lines that separated the section from the body, so writing and retiring are
+// BYTE-idempotent: neither copies nor whitespace accumulate across respawns.
+function bodyWithoutSection(text) {
   const lines = text.split('\n');
-  if (lines.length && lines[lines.length - 1] === '') lines.pop();
   const kept = [];
   let skip = false;
   for (const line of lines) {
@@ -3323,12 +3322,21 @@ function withoutSection(text) {
     if (!skip) kept.push(line);
     if (line === END) skip = false;
   }
-  return kept.length ? Buffer.from(`${kept.join('\n')}\n`) : Buffer.alloc(0);
+  while (kept.length && kept[kept.length - 1] === '') kept.pop();
+  return kept.length ? `${kept.join('\n')}\n` : '';
+}
+
+function rewrite(text) {
+  const body = bodyWithoutSection(text);
+  if (!section) return Buffer.from(body);
+  const separated = section.startsWith('\n') ? section : `\n${section}`;
+  const terminated = separated.endsWith('\n') ? separated : `${separated}\n`;
+  return Buffer.from(body ? `${body}${terminated}` : terminated.replace(/^\n+/, ''));
 }
 
 try {
   pinnedTaskFileTransaction(dataDir, taskId, fileName, (content) =>
-    Buffer.concat([withoutSection(content.toString('utf8')), addition]));
+    rewrite(content.toString('utf8')));
 } catch (error) {
   console.error(`error: provisioning brief transaction failed for ${taskId}/${fileName}: ${error.message}`);
   process.exitCode = 1;
@@ -3378,12 +3386,14 @@ spawn_resolve_provision_policy() {
 
 # Provisioning runs manifest-declared steps inside the lease, so the cleanliness
 # proven before the run is no longer proof. Re-prove it with the SAME predicate
-# the return path will later apply, while the spawn can still refuse: residue
-# discovered at return time keeps the lease under a warning, and pool preflight
-# then skips that worktree on every future acquisition, permanently shrinking the
-# pool. Only a worktree this spawn leased and proved clean is re-proven; a
-# recorded recovery worktree was never proven clean here and carries the
-# crewmate's own in-progress state.
+# the return path will later apply. This does not save the lease - residue is
+# still residue, so a refused spawn still leaves it dirty, retained rather than
+# returned, and skipped by pool preflight until someone attends to it. What it
+# buys is that no agent starts on a base that is no longer proven, and that the
+# residue is named at dispatch by the manifest step that caused it instead of
+# surfacing later as an unexplained shrinking pool. Only a worktree this spawn
+# leased and proved clean is re-proven; a recorded recovery worktree was never
+# proven clean here and carries the crewmate's own in-progress state.
 spawn_provisioned_worktree_still_returnable() {
   [ "$WORKTREE_CREATED" = 1 ] || return 0
   [ -n "$WORKTREE_EXPECTED_TIP" ] || return 0
@@ -3441,10 +3451,13 @@ provision_worktree() {
   PROVISION_PATH_PREPEND=
   reason=$(printf '%s' "$verdict" | jq -r '.reason // ""' 2>/dev/null || true)
   if [ "$residue" -eq 0 ] && [ -n "$verdict_status" ]; then
-    case "$status" in
-      3) banner_state=continuing; verdict_decides=1 ;;
-      4) banner_state=aborting; verdict_decides=1 ;;
-    esac
+    if [ "$status" -eq 4 ]; then
+      banner_state=aborting
+      verdict_decides=1
+    elif [ "$status" -eq 3 ] && [ "$PROVISION_POLICY" != block ]; then
+      banner_state=continuing
+      verdict_decides=1
+    fi
   fi
   if [ "$verdict_decides" -eq 0 ]; then
     if [ "$residue" -eq 1 ]; then

@@ -507,16 +507,31 @@ test_env_may_not_hijack_path() {
   pass "a manifest cannot smuggle a runtime past the runtime checks through env PATH"
 }
 
-test_malformed_manifest_warns_rather_than_bricking_spawns() {
+test_unreadable_policy_fails_closed() {
   local rec out
   rec=$(make_case malformed)
   read_case "$rec"
   printf '{ not json\n' > "$CASE_DIR/m.json"
   out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m.json")
-  expect_code 3 "$?" "a malformed local manifest must not block every spawn"
+  expect_code 4 "$?" "a manifest whose policy cannot be read must fail closed"
   assert_contains "$(verdict_field "$out" .reason)" "not valid JSON" \
     "the failure should name the parse problem"
-  pass "a malformed manifest fails loudly under the warn default"
+  [ "$(verdict_field "$out" .policy)" = block ] \
+    || fail "an unreadable policy should be reported as block: $out"
+
+  write_manifest "$CASE_DIR/bad-policy.json" on_failure '"maybe"'
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/bad-policy.json")
+  expect_code 4 "$?" "an unrecognized on_failure must fail closed, not take the warn default"
+  assert_contains "$(verdict_field "$out" .reason)" "on_failure must be" \
+    "the failure should name the rejected policy value"
+
+  write_manifest "$CASE_DIR/absent-policy.json"
+  jq 'del(.on_failure)' "$CASE_DIR/absent-policy.json" > "$CASE_DIR/absent2.json"
+  jq '.components[0].probes = [{"name":"always fails","argv":["false"]}]' \
+    "$CASE_DIR/absent2.json" > "$CASE_DIR/absent3.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/absent3.json")
+  expect_code 3 "$?" "an ABSENT on_failure is not ambiguous and keeps the warn default"
+  pass "an unreadable or unrecognized policy fails closed while an absent one still warns"
 }
 
 test_path_prepend_is_published_only_when_ready() {
@@ -718,35 +733,51 @@ run_spawn() {
     "${SPAWN_CMD:-$SPAWN}" "$@" 2>&1
 }
 
-# make_dying_provisioner_bin <case-dir>: mirror bin/ with symlinks and replace
-# ONLY fm-provision.sh with a stub that is killed before it can print anything.
-# The spawn under test stays the real one; what is substituted is a provisioner
-# that dies the way an OOM kill, a signal, or an unanticipated exit does - with
-# no verdict on stdout for fm-spawn to read. --manifest-path still reaches the
-# real script, because resolving the manifest is exactly what fm-spawn must be
-# able to do independently of the run that dies.
-make_dying_provisioner_bin() {
-  local case_dir=$1 bin entry
+# make_stub_provisioner_bin <case-dir> <name> <body>: mirror bin/ with symlinks
+# and replace ONLY fm-provision.sh with a stub running <body>. The spawn under
+# test stays the real one; what is substituted is the provisioner, so a test can
+# present fm-spawn with an outcome the real provisioner would not currently
+# produce. --manifest-path still reaches the real script, because resolving the
+# manifest is exactly what fm-spawn must be able to do independently of the run.
+make_stub_provisioner_bin() {
+  local case_dir=$1 name=$2 body=$3 bin entry
   # Mirrored as <root>/bin so the spawn's own FM_ROOT still resolves siblings
   # such as bin/fm-harness.sh exactly as it does in the real tree.
-  bin="$case_dir/dying-root/bin"
+  bin="$case_dir/$name-root/bin"
   mkdir -p "$bin"
   for entry in "$ROOT"/bin/*; do
     ln -s "$entry" "$bin/$(basename "$entry")"
   done
   rm -f "$bin/fm-provision.sh"
-  cat > "$bin/fm-provision.sh" <<SH
-#!/usr/bin/env bash
-set -u
-if [ "\${1:-}" = "--manifest-path" ]; then
-  exec "$ROOT/bin/fm-provision.sh" "\$@"
-fi
-printf 'fm-provision: killed before any verdict\n' >&2
-kill -KILL \$\$
-sleep 5
-SH
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -u\n'
+    # shellcheck disable=SC2016 # Stub source text; it must not expand here.
+    printf 'if [ "${1:-}" = "--manifest-path" ]; then\n'
+    printf '  exec %s "$@"\n' "$ROOT/bin/fm-provision.sh"
+    printf 'fi\n'
+    printf '%s\n' "$body"
+  } > "$bin/fm-provision.sh"
   chmod +x "$bin/fm-provision.sh"
   printf '%s\n' "$bin"
+}
+
+# A provisioner that dies the way an OOM kill, a signal, or an unanticipated exit
+# does - with no verdict on stdout for fm-spawn to read.
+make_dying_provisioner_bin() {
+  make_stub_provisioner_bin "$1" dying \
+"printf 'fm-provision: killed before any verdict\n' >&2
+kill -KILL \$\$
+sleep 5"
+}
+
+# A provisioner that emits a well-formed non-ready verdict and exits 3, the
+# documented warn-policy failure, regardless of what the manifest says. This is
+# what fm-spawn would see if the two scripts ever disagreed about the policy.
+make_warn_exit_provisioner_bin() {
+  make_stub_provisioner_bin "$1" warnexit \
+"printf '%s\n' '{\"schema\":\"fm-provision.v1\",\"status\":\"failed\",\"reason\":\"probe failed\",\"policy\":\"warn\",\"path_prepend\":\"\",\"components\":[]}'
+exit 3"
 }
 
 file_mode() {
@@ -876,6 +907,67 @@ test_spawn_unreadable_failure_policy_is_treated_as_block() {
   pass "an unreadable failure policy is resolved as block, not as the warn default"
 }
 
+test_spawn_aborts_on_a_verdict_from_an_unreadable_policy_manifest() {
+  local rec id out
+  id=provision-badpolicy-verdict-pa
+  rec=$(make_spawn_case badpolicy-verdict "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR" \
+    '.on_failure = "maybe" | .components[0].probes = [{"name":"always fails","argv":["false"]}]'
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
+  expect_code 1 "$?" "an unrecognized on_failure must abort even when a verdict was emitted: $out"
+  assert_contains "$out" "WORKTREE PROVISIONING FAILED" "the refusal should be unmissable"
+  assert_absent "$HOME_DIR/state/$id.meta" "an ambiguous policy must not launch an agent"
+  pass "an unreadable policy aborts the spawn on the verdict-bearing path too"
+}
+
+test_spawn_honors_a_resolved_block_over_a_warn_exit_code() {
+  local rec id out bin
+  id=provision-policy-divergence-pb
+  rec=$(make_spawn_case policy-divergence "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR" '.on_failure = "block"'
+  bin=$(make_warn_exit_provisioner_bin "$CASE_DIR")
+
+  out=$(SPAWN_CMD="$bin/fm-spawn.sh" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
+  expect_code 1 "$?" "a resolved block must not be discarded because the exit code said warn: $out"
+  assert_absent "$HOME_DIR/state/$id.meta" "a block project must never launch on a non-ready verdict"
+  assert_grep 'probe failed' "$HOME_DIR/state/$id.provision" \
+    "the durable verdict should keep the provisioner's own reason"
+  pass "a resolved block policy survives a provisioner that reported the warn exit code"
+}
+
+# A recovery respawn rewrites a section that is already there, which is the cycle
+# that can accumulate whitespace: the retire strips the section but not the blank
+# line that separated it, and the fresh note then adds its own separator again.
+# Seeding the section reproduces that cycle inside one lease.
+test_spawn_readiness_note_is_byte_idempotent() {
+  local rec id out blanks markers
+  id=provision-idempotent-pc
+  rec=$(make_spawn_case idempotent "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+  seed_spawn_provision_evidence "$HOME_DIR" "$id"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
+  expect_code 0 "$?" "a provisioned respawn over an existing section should succeed: $out"
+  assert_no_grep 'This stale section must be retired' "$HOME_DIR/data/$id/brief.md" \
+    "the stale section must be replaced, not kept"
+  markers=$(grep -c '^<!-- fm-provision:begin -->$' "$HOME_DIR/data/$id/brief.md")
+  [ "$markers" = 1 ] || fail "the readiness section should appear exactly once, got $markers"
+  blanks=$(awk '
+    BEGIN { run = 0 }
+    /^<!-- fm-provision:begin -->$/ { print run; found = 1; exit }
+    /^$/ { run++; next }
+    { run = 0 }
+    END { if (!found) print "no-marker" }' "$HOME_DIR/data/$id/brief.md")
+  [ "$blanks" = 1 ] \
+    || fail "rewriting the section must not accumulate blank lines before it, got '$blanks'"
+  pass "rewriting the readiness section over an existing one keeps the brief byte-stable"
+}
+
 test_spawn_continues_loudly_when_provisioning_warns() {
   local rec id out path_line
   id=provision-warn-p2
@@ -975,7 +1067,7 @@ test_fingerprint_paths_are_structurally_strict_descendants
 test_component_directory_may_be_the_worktree_root
 test_symlinked_paths_are_refused_before_access
 test_env_may_not_hijack_path
-test_malformed_manifest_warns_rather_than_bricking_spawns
+test_unreadable_policy_fails_closed
 test_path_prepend_is_published_only_when_ready
 test_task_record_and_log_are_written
 test_manifest_path_resolution
@@ -988,5 +1080,8 @@ test_spawn_treats_provisioning_residue_as_a_failure
 test_spawn_fails_closed_when_the_provisioner_dies_without_a_verdict
 test_spawn_warn_policy_survives_a_verdict_less_provisioner_death
 test_spawn_unreadable_failure_policy_is_treated_as_block
+test_spawn_aborts_on_a_verdict_from_an_unreadable_policy_manifest
+test_spawn_honors_a_resolved_block_over_a_warn_exit_code
+test_spawn_readiness_note_is_byte_idempotent
 
 echo "# all fm-provision tests passed"

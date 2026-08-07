@@ -357,9 +357,12 @@ The remaining component fields are optional, with `dir` defaulting to the worktr
 A no-manifest or excluded-kind skip publishes no provision record, log, brief section, or `path_prepend`; spawn retires any evidence from a prior attempt before taking an early-return path.
 `on_failure` is `warn` or `block` and defaults to `warn`; the reasoning behind that default lives in `bin/fm-provision.sh`'s header.
 `bin/fm-spawn.sh` reads `on_failure` from the manifest before it runs the provisioner, so the policy is known even when the provisioner dies without saying anything.
-When the provisioner emits a verdict, that verdict's own exit code decides: a non-ready verdict continues under `warn` and aborts under `block`.
-When it dies without a parseable verdict - signal death, a usage error, a gate refusal, any exit the readiness contract does not document - the pre-read policy decides instead, so `block` aborts the spawn rather than launching an agent into an unproven worktree, and `warn` continues with the banner and a durable verdict recording that provisioning died without one.
-A manifest whose `on_failure` cannot be read, or is neither `warn` nor `block`, is treated as `block`, because an unreadable policy is exactly the ambiguity that must not fail open.
+A resolved `block` aborts the spawn no matter what the provisioner did, and a non-ready verdict continues only under a resolved `warn`, so the two scripts cannot silently disagree about what `block` means.
+That covers the documented non-ready verdict and equally a provisioner that died without a parseable verdict - signal death, a usage error, a gate refusal, any exit the readiness contract does not document.
+Under `warn` such a death still continues, with the banner and a durable verdict recording that provisioning died without one.
+A manifest whose `on_failure` cannot be read, or is present and is neither `warn` nor `block`, is treated as `block`, because an unreadable policy is exactly the ambiguity that must not fail open.
+`bin/fm-provision.sh` applies that same rule and exits 4 for such a manifest, so only the one project whose manifest is malformed is blocked.
+An absent `on_failure` is not ambiguous and still takes the `warn` default.
 A project with no manifest at all is untouched by any of this: provisioning is skipped, nothing is created, and the spawn proceeds.
 `timeout_seconds` bounds the whole run, including reset deletions, and `step_timeout_seconds` is the per-step default, which a step overrides with its own `timeout_seconds`.
 Every declared step is an object with a required non-empty `argv` argument vector and optional `name`, `expect`, and `timeout_seconds`; using an argument vector makes quoting unambiguous, and `["sh", "-c", "..."]` is the explicit opt-in when a shell is genuinely wanted.
@@ -391,7 +394,9 @@ Automatic provisioning applies to new or recorded non-Orca ship and scout worktr
 Both apply to every pair of a batch spawn.
 With `--task`, the verdict is written to `state/<id>.provision` and the full step log to `state/<id>.provision.log`, both removed by teardown.
 A leased worktree is re-proven clean, isolated, and still at its expected detached tip after provisioning has written into it and before the endpoint is created, using the same predicate the return path applies.
-Residue an install step left behind is therefore a provisioning failure under the manifest's own policy, caught while the spawn can still refuse, rather than a dirty lease that is retained at return time and skipped by pool preflight ever after.
+Residue an install step left behind is therefore a provisioning failure under the manifest's own policy: it is loud and durable at dispatch, and no agent is launched onto a base that is no longer proven.
+Refusing the spawn does not clean the residue up, so under `block` the abort still leaves that lease dirty, and a dirty lease is retained rather than returned and is skipped by pool preflight until someone attends to it.
+What the re-proof buys is that the residue is named at dispatch by the manifest step that caused it, instead of surfacing later as an unexplained shrinking pool.
 Every applicable ready or failed run appends a delimiter-idempotent "Environment readiness" section to the crewmate's brief; a ready section reports component results, while a failure section directs the crewmate to report a blocker instead of substituting evidence it did not produce.
 That section is written through the same pinned task-file transaction the other brief mutators use, so it stages inside the task directory, preserves the brief's mode, and refuses a brief whose task directory or file identity changed under it.
 On failure, spawn also prints a bordered banner with the durable verdict and log paths.

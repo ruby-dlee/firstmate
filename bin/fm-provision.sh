@@ -75,8 +75,12 @@
 #   2  usage error
 #   3  provisioning failed and the policy is warn (caller should continue loudly)
 #   4  provisioning failed and the policy is block (caller must abort the spawn)
-#   A manifest that cannot be read or parsed is a failure under the warn default,
-#   because a typo in one home's local config must not brick that fleet's spawns.
+#   An ABSENT on_failure still defaults to "warn". But a manifest that cannot be
+#   read or parsed, or whose on_failure is present and is neither "warn" nor
+#   "block", fails under BLOCK and exits 4, because a policy that cannot be read
+#   is exactly the ambiguity that must not fail open. Only the one project whose
+#   manifest is malformed is affected; a project with no manifest is untouched.
+#   docs/configuration.md "Worktree provisioning" owns this contract.
 #
 # OUTPUT
 #   stdout: exactly one compact JSON verdict (schema fm-provision.v1).
@@ -99,7 +103,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fm_refuse_if_gate_agent
 
 usage() {
-  sed -n '2,91p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,95p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -207,7 +211,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-POLICY=warn
+# Until the manifest's own on_failure has been read and validated the policy is
+# unknown, and an unknown policy must not fail open, so every failure emitted
+# before that point carries block. Reading a valid on_failure is what relaxes it.
+POLICY=block
 PATH_PREPEND=
 
 activate_artifacts() {

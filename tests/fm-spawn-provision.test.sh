@@ -182,9 +182,9 @@ run_provision() {
   local case_dir=$1 worktree=$2 fakebin=$3
   shift 3
   # shellcheck disable=SC2016  # the bash -c body expands its own positionals
-  env "$@" \
-    FM_TEST_INSTALL_LOG="$case_dir/install.log" \
+  env FM_TEST_INSTALL_LOG="$case_dir/install.log" \
     PATH="$fakebin:/usr/bin:/bin:/usr/sbin:/sbin" \
+    "$@" \
     bash -c '
       set -u
       . "$1"
@@ -209,6 +209,30 @@ new_case() {
 }
 
 case_fakebin() { cat "$1/fakebin.path"; }
+
+# Run one library helper directly, for contracts that fm_provision_worktree
+# reaches only through a component install.
+run_lib() {
+  # shellcheck disable=SC2016  # the bash -c body expands its own positionals
+  env PATH="/usr/bin:/bin:/usr/sbin:/sbin" "$@" \
+    bash -c '
+      set -u
+      . "$1"
+      eval "$FM_TEST_SNIPPET"
+    ' _ "$LIB" 2>&1
+}
+
+# A PATH carrying everything provisioning needs before its pre-flight tool
+# checks, minus python3, so the "no python3" refusal can be exercised for real.
+make_python3_free_path() {
+  local dir=$1 tool
+  mkdir -p "$dir"
+  for tool in bash find sort dirname basename perl mkdir rm cat date tr awk sed \
+    grep head mktemp mv chmod ls shasum; do
+    [ -e "$dir/$tool" ] || ln -s "$(command -v "$tool")" "$dir/$tool" 2>/dev/null || true
+  done
+  printf '%s\n' "$dir"
+}
 
 # --- library: no-op ---------------------------------------------------------
 
@@ -432,6 +456,73 @@ test_a_directory_name_containing_another_is_not_deduped_away() {
   [ -d "$case_dir/wt/my app/node_modules" ] \
     || fail "the space-containing component was reported but never actually provisioned"
   pass "a directory name containing another as a token is not deduped away"
+}
+
+# Regression: the perl child must exit when exec fails instead of falling
+# through into the parent's tail, where a failed waitpid could report success.
+test_a_bounded_call_to_a_missing_command_is_a_failure() {
+  local out
+  out=$(FM_TEST_SNIPPET='
+    FM_PROVISION_BOUND_KIND=perl
+    if captured=$(fm_provision_run_bounded 5 "$PWD" /nonexistent/fm-provision-probe arg); then
+      printf "rc=0 out=[%s]\n" "$captured"
+    else
+      printf "rc=%s out=[%s]\n" "$?" "${captured:-}"
+    fi
+  ' run_lib)
+  case "$out" in
+    rc=0*) fail "a bounded call to a missing command reported success: $out" ;;
+  esac
+  assert_contains "$out" 'rc=127' \
+    "a bounded call to a missing command did not report a command-not-found status: $out"
+  assert_contains "$out" 'out=[]' \
+    "a bounded call to a missing command produced output: $out"
+  pass "a bounded call to a command that cannot be executed is a failure"
+}
+
+# Regression: a helper that exits 0 having captured nothing must refuse, not
+# hand back the digest of the empty string as though it were a real signature.
+test_an_environment_signature_that_captures_nothing_refuses() {
+  local case_dir out fakebin empty_digest
+  case_dir=$(new_case empty-signature js)
+  fakebin=$(case_fakebin "$case_dir")
+  mkdir -p "$case_dir/wt/web/node_modules"
+  cat > "$fakebin/python3" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fakebin/python3"
+  empty_digest=$(printf '' | shasum -a 256 | awk '{ print $1 }')
+  out=$(FM_TEST_SNIPPET='
+    FM_PROVISION_BOUND_KIND=perl
+    if captured=$(fm_provision_environment_signature "$FM_TEST_WT" npm web); then
+      printf "rc=0 sig=[%s]\n" "$captured"
+    else
+      printf "rc=%s sig=[%s]\n" "$?" "${captured:-}"
+    fi
+  ' run_lib PATH="$fakebin:/usr/bin:/bin" FM_TEST_WT="$case_dir/wt")
+  case "$out" in
+    rc=0*) fail "a signature that captured nothing reported success: $out" ;;
+  esac
+  case "$out" in
+    *"$empty_digest"*)
+      fail "a signature that captured nothing returned the empty-string digest: $out" ;;
+  esac
+  pass "an environment signature that captures nothing refuses instead of hashing nothing"
+}
+
+test_a_missing_python3_refuses_the_spawn() {
+  local case_dir out fakebin lean_path
+  case_dir=$(new_case no-python3 both)
+  fakebin=$(case_fakebin "$case_dir")
+  lean_path=$(make_python3_free_path "$case_dir/nopy")
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" PATH="$fakebin:$lean_path")
+  assert_contains "$out" 'rc=1' "a host without python3 did not refuse: $out"
+  assert_contains "$out" 'python3 is not installed' \
+    "a host without python3 did not name the missing interpreter: $out"
+  [ ! -s "$case_dir/install.log" ] \
+    || fail "a host without python3 still invoked an installer: $(cat "$case_dir/install.log")"
+  pass "a host without python3 refuses before installing rather than failing obscurely later"
 }
 
 test_a_missing_installer_refuses_the_spawn() {
@@ -856,6 +947,9 @@ test_a_signal_killed_install_refuses_the_spawn
 test_invalid_provisioning_tunables_refuse_before_detection
 test_an_unreadable_subtree_refuses_instead_of_becoming_a_noop
 test_a_directory_name_containing_another_is_not_deduped_away
+test_a_bounded_call_to_a_missing_command_is_a_failure
+test_an_environment_signature_that_captures_nothing_refuses
+test_a_missing_python3_refuses_the_spawn
 test_a_missing_installer_refuses_the_spawn
 test_an_unsupported_package_manager_refuses_the_spawn
 test_too_many_components_refuse_the_spawn

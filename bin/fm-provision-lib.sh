@@ -49,21 +49,23 @@
 # teardown and the freshness proof both require to be clean.
 #
 # BOUNDS. Every install and probe runs through fm_provision_run_bounded, which
-# reuses bin/fm-crew-state.sh's timeout/gtimeout/perl-alarm pattern verbatim
-# (this machine has neither timeout nor gtimeout). With no bounding mechanism
-# available, provisioning refuses rather than risking an unbounded install
-# wedging a spawn.
+# follows the established timeout/gtimeout/perl-alarm pattern (this machine has
+# neither timeout nor gtimeout). With no bounding mechanism available,
+# provisioning refuses rather than risking an unbounded install wedging a spawn.
 #
-# Tunables (seconds unless noted):
+# Tunables (seconds unless noted). Each is validated as a positive integer
+# before anything is scanned or run, and the defaults are unset-only, so an
+# explicitly empty or zero override refuses rather than silently becoming the
+# default and removing the bound it was meant to set.
 #   FM_PROVISION_SCAN_DEPTH=4        manifest search depth below the worktree
 #   FM_PROVISION_MAX_COMPONENTS=8    refuse above this many detected components
 #   FM_PROVISION_INSTALL_TIMEOUT=600 per-component install bound
 #   FM_PROVISION_PROBE_TIMEOUT=60    per-readiness-probe bound
 
-FM_PROVISION_SCAN_DEPTH=${FM_PROVISION_SCAN_DEPTH:-4}
-FM_PROVISION_MAX_COMPONENTS=${FM_PROVISION_MAX_COMPONENTS:-8}
-FM_PROVISION_INSTALL_TIMEOUT=${FM_PROVISION_INSTALL_TIMEOUT:-600}
-FM_PROVISION_PROBE_TIMEOUT=${FM_PROVISION_PROBE_TIMEOUT:-60}
+FM_PROVISION_SCAN_DEPTH=${FM_PROVISION_SCAN_DEPTH-4}
+FM_PROVISION_MAX_COMPONENTS=${FM_PROVISION_MAX_COMPONENTS-8}
+FM_PROVISION_INSTALL_TIMEOUT=${FM_PROVISION_INSTALL_TIMEOUT-600}
+FM_PROVISION_PROBE_TIMEOUT=${FM_PROVISION_PROBE_TIMEOUT-60}
 
 # Bumped whenever a recorded field's meaning changes; a record from another
 # schema is treated as a miss rather than misread.
@@ -75,8 +77,6 @@ FM_PROVISION_CACHE_SCHEMA=4
 FM_PROVISION_SUMMARY=
 # shellcheck disable=SC2034
 FM_PROVISION_PATH_PREFIX=
-# shellcheck disable=SC2034
-FM_PROVISION_EXCLUDES=
 
 # --- primitives -------------------------------------------------------------
 
@@ -105,14 +105,15 @@ fm_provision_bound_kind() {
 
 # Run a command with cwd and a hard wall-clock bound, preserving its exit code.
 # Exit 124 means the bound expired; exit 125 means this host cannot bound at all.
-# The perl branch is bin/fm-crew-state.sh's established alarm wrapper, unchanged.
+# A signal-terminated child is reported as 128 + signal, so an installer the OOM
+# killer reaps can never be mistaken for a successful install.
 fm_provision_run_bounded() {  # <seconds> <cwd> <cmd> [args...]
   local secs=$1 cwd=$2
   shift 2
   case "$(fm_provision_bound_kind)" in
     timeout)  ( cd "$cwd" && timeout "$secs" "$@" ) ;;
     gtimeout) ( cd "$cwd" && gtimeout "$secs" "$@" ) ;;
-    perl)     ( cd "$cwd" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$secs" "$@" ) ;;
+    perl)     ( cd "$cwd" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' "$secs" "$@" ) ;;
     *)        return 125 ;;
   esac
 }
@@ -161,13 +162,13 @@ fm_provision_mode() {  # <config-dir>
 
 # Emit "<ecosystem> <relative-dir>" per detected component, deterministically
 # ordered. A directory can yield at most one Python and one JS component.
+# Returns non-zero when the traversal itself failed, which is a refusal and not
+# the same thing as a traversal that succeeded and found nothing.
 fm_provision_detect() {  # <worktree>
-  local wt=$1 file dir rel
+  local wt=$1 file dir rel seen found manifest_output
   local -a manifests=()
-  while IFS= read -r file; do
-    [ -n "$file" ] || continue
-    manifests+=("$file")
-  done < <(
+  manifest_output=$(
+    set -o pipefail
     find "$wt" -maxdepth "$FM_PROVISION_SCAN_DEPTH" \
       \( -name .git -o -name node_modules -o -name .venv -o -name venv \
          -o -name .tox -o -name .nox -o -name .mypy_cache -o -name __pycache__ \
@@ -176,8 +177,12 @@ fm_provision_detect() {  # <worktree>
       -type f \( -name uv.lock -o -name requirements.txt \
                  -o -name package-lock.json -o -name pnpm-lock.yaml \
                  -o -name yarn.lock -o -name bun.lockb -o -name bun.lock \) \
-      -print 2>/dev/null | LC_ALL=C sort
-  )
+      -print | LC_ALL=C sort
+  ) || return 1
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    manifests+=("$file")
+  done <<< "$manifest_output"
   [ "${#manifests[@]}" -gt 0 ] || return 0
 
   local -a dirs=()
@@ -186,7 +191,18 @@ fm_provision_detect() {  # <worktree>
     rel=${dir#"$wt"}
     rel=${rel#/}
     [ -n "$rel" ] || rel=.
-    case " ${dirs[*]-} " in *" $rel "*) continue ;; esac
+    # Exact element comparison, never a pattern match over a joined list: a
+    # directory whose name contains another as a token would otherwise dedup
+    # away a real component and leave it silently unprovisioned.
+    found=
+    if [ "${#dirs[@]}" -gt 0 ]; then
+      for seen in "${dirs[@]}"; do
+        [ "$seen" = "$rel" ] || continue
+        found=1
+        break
+      done
+    fi
+    [ -z "$found" ] || continue
     dirs+=("$rel")
   done
 
@@ -738,30 +754,52 @@ fm_provision_fail() {  # <message>
   return 1
 }
 
+# Refuse before anything is scanned or run when a tunable is not a positive
+# integer. Silently substituting a default here would defeat the bound the
+# operator was trying to set: under the perl fallback an empty or zero timeout
+# becomes "alarm 0", which cancels the alarm and removes the bound entirely.
+fm_provision_validate_tunables() {
+  local name value
+  for name in FM_PROVISION_SCAN_DEPTH FM_PROVISION_MAX_COMPONENTS \
+    FM_PROVISION_INSTALL_TIMEOUT FM_PROVISION_PROBE_TIMEOUT; do
+    value=${!name}
+    case "$value" in
+      ''|*[!0-9]*) ;;
+      *[1-9]*) continue ;;
+    esac
+    fm_provision_fail "$name must be a positive integer, got '$value'"
+    return 1
+  done
+  return 0
+}
+
 # --- entry point ------------------------------------------------------------
 
 # Provision every component the worktree declares. Prints per-component
 # progress to stderr, appends all installer output to <log>, and sets
-# FM_PROVISION_SUMMARY (the compact task-metadata value), FM_PROVISION_EXCLUDES
-# (newline-separated ignored paths the caller should exclude from git's view),
-# and FM_PROVISION_PATH_PREFIX (a PATH prefix pinning a declared Node runtime).
+# FM_PROVISION_SUMMARY (the compact task-metadata value) and
+# FM_PROVISION_PATH_PREFIX (a PATH prefix pinning a declared Node runtime).
 # Returns 0 on success or a clean no-op, non-zero when the spawn must refuse.
 fm_provision_worktree() {  # <worktree> <cache-dir> <log>
   local wt=$1 cache=$2 log=$3
-  local eco rel dir line record fingerprint recorded runtime installer environment artifact
+  local eco rel dir line detected record fingerprint recorded runtime installer environment artifact
   local declared_major pinned_major='' pinned_bin='' rc=0 state
   local -a components=() results=()
 
   FM_PROVISION_SUMMARY=none
   FM_PROVISION_PATH_PREFIX=
-  FM_PROVISION_EXCLUDES=
 
+  fm_provision_validate_tunables || return 1
   [ -d "$wt" ] || { fm_provision_fail "worktree $wt is not a directory"; return 1; }
 
+  detected=$(fm_provision_detect "$wt") || {
+    fm_provision_fail "cannot scan $wt for dependency manifests"
+    return 1
+  }
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     components+=("$line")
-  done < <(fm_provision_detect "$wt")
+  done <<< "$detected"
 
   if [ "${#components[@]}" -eq 0 ]; then
     return 0
@@ -801,7 +839,6 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log>
     eco=${line%% *}
     rel=${line#* }
     artifact=$(fm_provision_artifact_path "$eco" "$rel") || return 1
-    FM_PROVISION_EXCLUDES="${FM_PROVISION_EXCLUDES}${artifact}"$'\n'
     if declare -F fm_provision_register_exclude >/dev/null \
       && ! fm_provision_register_exclude "$artifact"; then
       fm_provision_fail "cannot register the git exclusion for $artifact before provisioning"

@@ -19,8 +19,8 @@ TMP_ROOT=$(fm_test_tmproot fm-spawn-provision)
 
 # Stub installers that record every invocation to $FM_TEST_INSTALL_LOG and
 # produce exactly the artifacts the real ones do, so the readiness probes are
-# exercised for real. FM_TEST_UV_FAIL / FM_TEST_NPM_FAIL / FM_TEST_NPM_SLEEP
-# steer the failure and hang cases.
+# exercised for real. FM_TEST_UV_FAIL / FM_TEST_NPM_FAIL / FM_TEST_NPM_SLEEP /
+# FM_TEST_NPM_SIGNAL steer the failure, hang, and signal-death cases.
 make_installer_fakebin() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
@@ -91,6 +91,7 @@ set -u
 case "${1:-}" in
   --version) printf '10.9.2\n'; exit 0 ;;
   ci)
+    [ -z "${FM_TEST_NPM_SIGNAL:-}" ] || kill -"$FM_TEST_NPM_SIGNAL" "$$"
     [ "${FM_TEST_NPM_SLEEP:-0}" = 0 ] || sleep "$FM_TEST_NPM_SLEEP"
     [ "${FM_TEST_NPM_FAIL:-0}" != 1 ] || {
       mkdir -p node_modules/partial-package
@@ -187,6 +188,8 @@ run_provision() {
     bash -c '
       set -u
       . "$1"
+      [ -z "${FM_TEST_PROVISION_BOUND_KIND:-}" ] \
+        || FM_PROVISION_BOUND_KIND=$FM_TEST_PROVISION_BOUND_KIND
       if fm_provision_worktree "$2" "$3" "$4"; then
         printf "rc=0 summary=%s\n" "$FM_PROVISION_SUMMARY"
       else
@@ -350,6 +353,85 @@ test_a_hung_install_is_bounded() {
   assert_contains "$out" 'exceeded its 2s bound' "the refusal did not report the expired bound: $out"
   [ "$elapsed" -lt 30 ] || fail "a hung install was not bounded (took ${elapsed}s)"
   pass "an install that hangs is bounded and refuses instead of wedging the spawn"
+}
+
+test_a_signal_killed_install_refuses_the_spawn() {
+  local case_dir out fakebin
+  case_dir=$(new_case install-signal js)
+  fakebin=$(case_fakebin "$case_dir")
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" \
+    FM_TEST_PROVISION_BOUND_KIND=perl FM_TEST_NPM_SIGNAL=TERM)
+  assert_contains "$out" 'rc=1' "a signal-killed install did not refuse: $out"
+  assert_contains "$out" 'the npm install in web exited 143' \
+    "a signal-killed install did not preserve its signal-derived status: $out"
+  [ ! -d "$case_dir/cache" ] || [ -z "$(ls -A "$case_dir/cache")" ] \
+    || fail "a signal-killed install still recorded a provisioning fingerprint"
+  pass "a signal-killed bounded install is reported as a failure"
+}
+
+test_invalid_provisioning_tunables_refuse_before_detection() {
+  local case_dir out fakebin setting name value
+  case_dir=$(new_case invalid-tunables none)
+  fakebin=$(case_fakebin "$case_dir")
+  for setting in \
+    FM_PROVISION_SCAN_DEPTH=0 \
+    FM_PROVISION_MAX_COMPONENTS=invalid \
+    FM_PROVISION_INSTALL_TIMEOUT=0 \
+    FM_PROVISION_INSTALL_TIMEOUT= \
+    FM_PROVISION_PROBE_TIMEOUT=invalid; do
+    name=${setting%%=*}
+    value=${setting#*=}
+    out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" "$setting")
+    assert_contains "$out" 'rc=1' "$name=$value did not refuse: $out"
+    assert_contains "$out" "$name must be a positive integer, got '$value'" \
+      "$name=$value refusal did not name the offending setting: $out"
+  done
+  [ ! -s "$case_dir/install.log" ] \
+    || fail "invalid tunables still invoked an installer: $(cat "$case_dir/install.log")"
+  pass "empty, zero, and nonnumeric provisioning tunables refuse before detection"
+}
+
+test_an_unreadable_subtree_refuses_instead_of_becoming_a_noop() {
+  local case_dir out fakebin
+  case_dir=$(new_case scan-failure none)
+  fakebin=$(case_fakebin "$case_dir")
+  mkdir -p "$case_dir/wt/private/component"
+  printf 'six==1.16.0\n' > "$case_dir/wt/private/component/requirements.txt"
+  chmod 000 "$case_dir/wt/private"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  chmod 700 "$case_dir/wt/private"
+  assert_contains "$out" 'rc=1' "an unreadable subtree did not refuse: $out"
+  assert_contains "$out" "cannot scan $case_dir/wt for dependency manifests" \
+    "a traversal failure was mistaken for an undeclared-worktree no-op: $out"
+  [ ! -s "$case_dir/install.log" ] \
+    || fail "a traversal failure still invoked an installer: $(cat "$case_dir/install.log")"
+  pass "a traversal failure is distinct from a successful undeclared-worktree no-op"
+}
+
+# Regression: dedup by exact element, never by pattern-matching a joined list.
+# "app" is a substring token of "my app", so a substring dedup silently drops
+# the "app" component while still reporting success.
+test_a_directory_name_containing_another_is_not_deduped_away() {
+  local case_dir out fakebin
+  case_dir=$(new_case dedup-substring none)
+  fakebin=$(case_fakebin "$case_dir")
+  mkdir -p "$case_dir/wt/app" "$case_dir/wt/my app"
+  printf 'six==1.16.0\n' > "$case_dir/wt/app/requirements.txt"
+  printf '{"name":"myapp","private":true,"dependencies":{"is-number":"7.0.0"}}\n' \
+    > "$case_dir/wt/my app/package.json"
+  printf '{"lockfileVersion":3}\n' > "$case_dir/wt/my app/package-lock.json"
+
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'rc=0' "provisioning two similarly named directories failed: $out"
+  assert_contains "$out" 'pip:app=installed' \
+    "the app component was deduped away by a directory whose name contains it: $out"
+  assert_contains "$out" 'npm:my app=installed' \
+    "the space-containing component was not provisioned: $out"
+  [ -d "$case_dir/wt/app/.venv" ] \
+    || fail "the app component was reported but never actually provisioned"
+  [ -d "$case_dir/wt/my app/node_modules" ] \
+    || fail "the space-containing component was reported but never actually provisioned"
+  pass "a directory name containing another as a token is not deduped away"
 }
 
 test_a_missing_installer_refuses_the_spawn() {
@@ -770,6 +852,10 @@ test_node_installs_include_validation_dependencies
 test_a_replaced_interpreter_invalidates_the_cache
 test_a_failing_install_refuses_the_spawn
 test_a_hung_install_is_bounded
+test_a_signal_killed_install_refuses_the_spawn
+test_invalid_provisioning_tunables_refuse_before_detection
+test_an_unreadable_subtree_refuses_instead_of_becoming_a_noop
+test_a_directory_name_containing_another_is_not_deduped_away
 test_a_missing_installer_refuses_the_spawn
 test_an_unsupported_package_manager_refuses_the_spawn
 test_too_many_components_refuse_the_spawn

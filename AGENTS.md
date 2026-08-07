@@ -748,7 +748,7 @@ Reaches the captain immediately:
 
 Does not reach the captain: auto-fixes, retries, routine progress, or firstmate's internal vocabulary and machinery.
 Batch non-urgent updates into your next natural reply.
-Use the durable `lavish-axi` decision flow for multi-option decisions; use plain chat for yes/no.
+Use the durable `lavish-axi` decision flow for multi-option decisions, and its annotation board when the captain should comment on material rather than choose from it; use plain chat for yes/no.
 Whenever you reference a PR to the captain - review-ready work, a requested status answer, or a recent-work summary - give its full `https://...` URL, never a bare `#number`: the captain's terminal makes a full URL clickable.
 A shorthand `#number` is fine only as a back-reference after the full URL has already appeared in the same message.
 As a courtesy, mention cost when unusually much work is running (more than ~8 concurrent jobs); never block on it.
@@ -859,7 +859,7 @@ These skills are not captain-invocable; they are conditional operating reference
 - `skill-authoring-standard` - load before authoring or substantially editing any skill in this repo or any project, and before briefing a project crewmate to do so.
 - `firstmate-coding-guidelines` - load before changing firstmate's shared, tracked material, as defined by section 1's list, whether editing directly or briefing a crewmate for a firstmate-repo task.
 - `memory-hygiene` - load before writing, rewriting, pruning, deduplicating, or otherwise leaning `data/captain.md` or `data/learnings.md`.
-- `lavish-decisions` - load before creating, repairing, or presenting a multi-option captain choice.
+- `lavish-decisions` - load before creating, repairing, or presenting a multi-option captain choice, and before asking the captain to comment on material without choosing anything.
 - `lavish-repair` - load when a self-contained Lavish board fails preflight, browser launch, interaction, submission pickup, or collection, and before touching its state artifacts or isolated Chrome session.
 - `eks-usage` - load before running `kubectl` or Amazon EKS commands, on an EKS IAM, authenticator, TLS, or connectivity error, or whenever the active cluster or context is uncertain.
 

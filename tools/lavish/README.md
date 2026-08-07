@@ -34,6 +34,8 @@ The command prints `answer saved; wake not queued`, exits nonzero, and the next 
 
 `bin/fm-lavish-board.sh` owns the dedicated Chrome-profile launch, fail-closed answerability preflight, and bounded pickup integration around the generated file.
 `bin/fm-lavish-board.sh` renders the same immutable request into self-contained HTML and opens it with a decision-specific Chrome profile below the effective state root (`FM_STATE_OVERRIDE` or `$FM_HOME/state`).
+The board form refuses to submit nothing, because `answer.toon` is write-once: a decision board requires a choice on every question, and an annotation board requires at least one item comment or the overall note.
+That guard is the rendered form's alone; `collect` stays permissive, so a hand-recovered payload is never refused for it.
 Submit first writes and reads back a browser-profile record, then shows a confirmation describing that durable record; the optional browser download is not treated as confirmed delivery.
 Both records carry the resolved absolute Firstmate home as `home_marker`, so a shared Downloads directory cannot route one home's answer into another home.
 The armed check recovers the record from the same profile even after the visible browser closes, validates it through `lavish-axi collect`, and runs intake.

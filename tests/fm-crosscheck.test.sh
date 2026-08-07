@@ -12,6 +12,29 @@ fm_git_identity fmtest fmtest@example.invalid
 
 CROSSCHECK_PY="${FM_TEST_CROSSCHECK_PY:-$ROOT/bin/fm-crosscheck.py}"
 fm_test_tmproot_into TMP_ROOT fm-crosscheck-tests
+
+# The gate module refuses to run below Python 3.11 (bin/fm-crosscheck.py), and
+# bin/fm-crosscheck.sh resolves a supported interpreter before exec'ing it. Bare
+# `python3` is 3.9 on stock macOS, and that refusal also exits 1 - so it would be
+# silently indistinguishable from the refusals these cases assert. Resolve the
+# interpreter exactly as the launcher does, and refuse loudly if none qualifies.
+CROSSCHECK_VERSION_REFUSAL='CROSSCHECK UNREVIEWED: this gate requires Python 3.11 or newer'
+CROSSCHECK_PYTHON=""
+for candidate in "${FM_CROSSCHECK_PYTHON:-}" python3.14 python3.13 python3.12 python3.11 python3; do
+  [ -n "$candidate" ] || continue
+  command -v "$candidate" >/dev/null 2>&1 || continue
+  if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
+    >/dev/null 2>&1; then
+    CROSSCHECK_PYTHON=$candidate
+    break
+  fi
+done
+[ -n "$CROSSCHECK_PYTHON" ] || fail \
+  'no Python 3.11 or newer interpreter is available to drive the crosscheck gate; install one or set FM_CROSSCHECK_PYTHON to its path'
+# Cases redirect run_case's stderr into per-case files, so a harness-level
+# failure reported on fd 2 would be swallowed by the case it broke. Keep the
+# suite's own report channel on fd 7; it is closed for every gate child.
+exec 7>&2
 API_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-api.toon"
 CLAIMS_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-view-full.toon"
 PR_URL=https://github.com/ruby-dlee/firstmate/pull/72
@@ -563,6 +586,9 @@ PY
 run_case() {
   local case_dir=$1 base=$2 head=$3 scenario=$4 command=${5:-run}
   shift 5 || true
+  local errfile status
+  mkdir -p "$TMP_ROOT/run-case-stderr"
+  errfile=$(mktemp "$TMP_ROOT/run-case-stderr/err.XXXXXX")
   FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE-$ROOT}" \
   FM_HOME="${FM_TEST_HOME-$case_dir/home}" \
   FM_STATE_OVERRIDE="${FM_TEST_STATE_OVERRIDE-$case_dir/state}" \
@@ -586,7 +612,20 @@ run_case() {
   FM_TEST_AMBIENT_HOME="$HOME" \
   FM_TEST_BASE="$base" \
   FM_TEST_HEAD="$head" \
-    python3 "$CROSSCHECK_PY" "$command" task-x1 "$PR_URL" "$@"
+    "$CROSSCHECK_PYTHON" "$CROSSCHECK_PY" "$command" task-x1 "$PR_URL" "$@" 2>"$errfile" 7>&-
+  status=$?
+  # A version refusal exits 1 like the refusals these cases assert, so never let
+  # one reach a caller as if it were the behavior under test.
+  if grep -Fq "$CROSSCHECK_VERSION_REFUSAL" "$errfile"; then
+    cat "$errfile" >&2
+    rm -f "$errfile"
+    printf 'not ok - %s\n' \
+      "the gate refused on interpreter version ($CROSSCHECK_PYTHON), not on the behavior under test" >&7
+    exit 1
+  fi
+  cat "$errfile" >&2
+  rm -f "$errfile"
+  return "$status"
 }
 
 seed_open_ledger() {
@@ -688,7 +727,7 @@ test_empty_runtime_overrides_use_home_defaults() {
 }
 
 test_empty_environment_fallback_is_generic() {
-  python3 - "$CROSSCHECK_PY" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' \
     || fail "generic environment fallback did not treat empty as absent"
 import importlib.util
 import os
@@ -1181,7 +1220,7 @@ PY
 }
 
 test_final_wait_and_residual_processes_are_bounded() {
-  python3 - "$CROSSCHECK_PY" "$TMP_ROOT/residual-child-marker" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$TMP_ROOT/residual-child-marker" <<'PY' \
     || fail "process lifetime escaped its deadline or process group"
 import importlib.util
 from pathlib import Path
@@ -1227,7 +1266,7 @@ test_installed_sandbox_denies_shared_private_tmp() {
   local marker profile
   marker="/private/tmp/fm-crosscheck-shared-state-$$"
   profile="$TMP_ROOT/isolated-proof.sb"
-  python3 - "$CROSSCHECK_PY" "$profile" "$marker" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$profile" "$marker" <<'PY' \
     || fail "generated proof sandbox permits shared host state"
 import importlib.util
 import json
@@ -1325,7 +1364,7 @@ test_real_claude_sandbox_executes_exact_sha_git_diff() {
   profile="$repo/.crosscheck/real-claude-sandbox.sb"
   output="$repo/.crosscheck/real-claude-output.json"
   event="$repo/.crosscheck/observed-bash-event"
-  python3 - "$CROSSCHECK_PY" "$profile" "$repo" "$reviewer_home" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$profile" "$repo" "$reviewer_home" <<'PY' \
     || fail "real Claude sandbox profile did not retain the narrow write contract"
 import importlib.util
 import json
@@ -1571,7 +1610,7 @@ test_reviewer_capture_override_is_validated() {
 
 test_ordinary_output_paths_remain_bounded() {
   local record case_dir base head rc
-  python3 - "$CROSSCHECK_PY" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' \
     || fail "ordinary run_command output did not retain the original ceiling"
 import importlib.util
 import sys
@@ -1712,7 +1751,7 @@ assert value["runs"][-1]["active_blockers"] == ["cc-aaaaaaaaaaaa"]
 }
 
 test_equivalent_finding_reopens_when_direct_proof_regresses() {
-  python3 - "$CROSSCHECK_PY" <<'PY' || fail "equivalent finding did not fail closed after target regression"
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' || fail "equivalent finding did not fail closed after target regression"
 import importlib.util
 import sys
 
@@ -2020,7 +2059,7 @@ EOF
 }
 
 test_signed_out_oauth_file_is_not_a_credential() {
-  python3 - "$CROSSCHECK_PY" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' \
     || fail "a signed-out OAuth file was accepted as an executing credential"
 import importlib.util
 import json

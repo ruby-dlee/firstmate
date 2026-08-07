@@ -653,6 +653,26 @@ test_pool_preflight_surfaces_dirty_worktrees_without_blocking_clean_selection() 
   pass "pool preflight surfaces dirty entries and leaves them unavailable untouched"
 }
 
+# Session-start relay is only observable once bootstrap's bounded sweep actually
+# runs (bin/fm-bootstrap.sh fleet_sync). Under a loaded parallel shard that bound
+# expires before the sweep computes anything, and bootstrap honestly relays
+# 'fleet: skipped:' naming the timeout. Asserting only the success line cannot
+# tell that unrun sweep apart from a computed alert that was dropped, so this
+# helper gives the fixture an explicit sweep budget and, if the sweep still did
+# not complete, fails naming THAT cause instead of the relay.
+BOOTSTRAP_SWEEP_OUT=""
+run_bootstrap_sweep() {
+  local skip
+  BOOTSTRAP_SWEEP_OUT=$(HOME="$TEST_HOME" FM_HOME="$FM_TEST_HOME" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_CHECKOUT_REFRESH_STATE_ROOT="$STATE_ROOT" FM_TREEHOUSE_ROOT="$TEST_HOME/.treehouse" \
+    FM_CHECKOUT_REFRESH_BOOTSTRAP_TEST=1 \
+    FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT="${FM_TEST_BOOTSTRAP_SWEEP_BUDGET:-180}" \
+    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  skip=$(printf '%s\n' "$BOOTSTRAP_SWEEP_OUT" | grep -F 'FLEET_SYNC: fleet: skipped:' | head -1) || :
+  [ -z "$skip" ] || fail \
+    "bootstrap's sweep never ran, so no hygiene alert could be computed: $skip"
+}
+
 test_bootstrap_relays_hygiene_alerts() {
   local project draft out config_backup config_real
   project=$(cd "$FM_TEST_HOME/projects/relvino" && pwd -P)
@@ -662,18 +682,14 @@ test_bootstrap_relays_hygiene_alerts() {
   config_backup=$(mktemp "$TMP_ROOT/checkout-refresh-config.XXXXXX")
   cp "$FM_TEST_HOME/config/checkout-refresh" "$config_backup"
 
-  out=$(HOME="$TEST_HOME" FM_HOME="$FM_TEST_HOME" FM_ROOT_OVERRIDE="$ROOT" \
-    FM_CHECKOUT_REFRESH_STATE_ROOT="$STATE_ROOT" FM_TREEHOUSE_ROOT="$TEST_HOME/.treehouse" \
-    FM_CHECKOUT_REFRESH_BOOTSTRAP_TEST=1 \
-    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  run_bootstrap_sweep
+  out=$BOOTSTRAP_SWEEP_OUT
   assert_contains "$out" "FLEET_SYNC: $project: HYGIENE: 1 untracked skill-draft files" \
     "session-start bootstrap did not relay the unresolved hygiene alert"
 
   printf '%s\n' 'unexpected directive' >> "$FM_TEST_HOME/config/checkout-refresh"
-  out=$(HOME="$TEST_HOME" FM_HOME="$FM_TEST_HOME" FM_ROOT_OVERRIDE="$ROOT" \
-    FM_CHECKOUT_REFRESH_STATE_ROOT="$STATE_ROOT" FM_TREEHOUSE_ROOT="$TEST_HOME/.treehouse" \
-    FM_CHECKOUT_REFRESH_BOOTSTRAP_TEST=1 \
-    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  run_bootstrap_sweep
+  out=$BOOTSTRAP_SWEEP_OUT
   mv "$config_backup" "$FM_TEST_HOME/config/checkout-refresh"
 
   assert_contains "$out" "FLEET_SYNC: checkout-refresh: skipped: unknown config directive 'unexpected'" \
@@ -682,10 +698,8 @@ test_bootstrap_relays_hygiene_alerts() {
   config_real="$TMP_ROOT/checkout-refresh-real"
   mv "$FM_TEST_HOME/config/checkout-refresh" "$config_real"
   ln -s "$config_real" "$FM_TEST_HOME/config/checkout-refresh"
-  out=$(HOME="$TEST_HOME" FM_HOME="$FM_TEST_HOME" FM_ROOT_OVERRIDE="$ROOT" \
-    FM_CHECKOUT_REFRESH_STATE_ROOT="$STATE_ROOT" FM_TREEHOUSE_ROOT="$TEST_HOME/.treehouse" \
-    FM_CHECKOUT_REFRESH_BOOTSTRAP_TEST=1 \
-    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  run_bootstrap_sweep
+  out=$BOOTSTRAP_SWEEP_OUT
   rm "$FM_TEST_HOME/config/checkout-refresh"
   mv "$config_real" "$FM_TEST_HOME/config/checkout-refresh"
   assert_contains "$out" "FLEET_SYNC: checkout-refresh: skipped: unsafe config path" \

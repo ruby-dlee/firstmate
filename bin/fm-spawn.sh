@@ -98,10 +98,14 @@
 #   and before any endpoint is created, a ship/scout spawn provisions that
 #   worktree's declared project dependencies (bin/fm-provision-lib.sh owns the
 #   detection, cache, readiness, and bound contracts). A worktree that declares
-#   no recognized manifest is a no-op; any other provisioning outcome than
-#   success refuses the spawn, because a launched lane that cannot run the
-#   project's own checks is the defect this exists to remove. --no-provision
-#   skips it for one spawn, and config/worktree-provision=off for the home.
+#   no recognized manifest is a no-op. Otherwise there are exactly two
+#   non-success outcomes, and that library's header enumerates both: a
+#   CAPABILITY GAP - a component this provisioner was never able to provision -
+#   warns, is recorded in the spawn's provision= metadata, and launches the lane
+#   with that component unprovisioned; a FAILURE - an attempt that was made and
+#   did not complete - refuses the spawn, because a lane launched onto a
+#   half-built environment is worse than no lane. --no-provision skips
+#   provisioning for one spawn, and config/worktree-provision=off for the home.
 #   Ship/scout spawns refresh the primary checkout before Treehouse acquisition,
 #   surface dirty pool entries, and durably lease one available worktree before
 #   creating the endpoint. They refuse to create that endpoint unless the leased
@@ -1112,7 +1116,9 @@ ORIGINAL_TURN_ENDED_PRESENT=-1
 ORIGINAL_CHECK_PRESENT=-1
 ORIGINAL_PI_EXT_PRESENT=-1
 ORIGINAL_GROK_TOKEN_PRESENT=-1
+ORIGINAL_PROVISION_LOG_PRESENT=-1
 ORIGINAL_TASK_TMP_PRESENT=-1
+PROVISION_LOG=
 
 spawn_test_lab_enabled() {
   fm_account_test_lab_enabled \
@@ -1787,6 +1793,14 @@ spawn_abort_cleanup() {
   # rollback, leaking prepared resources.
   set +e
   [ -z "${META_TMP:-}" ] || rm -f "$META_TMP"
+  # The provisioning log belongs to this attempt. An abort that leaves it behind
+  # accumulates one orphaned file per task in the home's state directory, which
+  # is exactly the leak the ORIGINAL_*_PRESENT bookkeeping exists to prevent;
+  # spawn_provision_worktree has already printed what it contained.
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "$ORIGINAL_PROVISION_LOG_PRESENT" = 0 ] \
+    && [ -n "${PROVISION_LOG:-}" ]; then
+    rm -f "$PROVISION_LOG"
+  fi
   if [ -n "${META_WRITE_LOCK:-}" ]; then
     rollback_lock=$META_WRITE_LOCK
     META_WRITE_LOCK=
@@ -3208,7 +3222,14 @@ fm_provision_register_exclude() {
 # the only place it can: the directories involved are gitignored so they never
 # travel with a worktree, and Treehouse v2.0.0 exposes no setup hook.
 # bin/fm-provision-lib.sh owns detection, caching, readiness, bounds, and the
-# refuse-rather-than-degrade contract.
+# capability-gap versus failure contract.
+#
+# The provisioning log is a per-task state artifact like $ID.status and
+# $ID.meta: teardown removes it with the rest of the set, and an aborted spawn
+# removes it here rather than leaking one file per attempt into the home's state
+# directory. Because the abort path removes it, a refusal prints the tail of the
+# log itself - the installer output IS the diagnosis, and pointing at a file the
+# rollback is about to delete would be pointing at nothing.
 PROVISION_SUMMARY=
 PROVISION_PATH_PREFIX=
 spawn_provision_worktree() {
@@ -3225,7 +3246,19 @@ spawn_provision_worktree() {
     PROVISION_SUMMARY=off
     return 0
   fi
-  fm_provision_worktree "$WT" "$STATE/provision-cache" "$STATE/$ID.provision.log" || return 1
+  PROVISION_LOG="$STATE/$ID.provision.log"
+  if [ -e "$PROVISION_LOG" ] || [ -L "$PROVISION_LOG" ]; then
+    ORIGINAL_PROVISION_LOG_PRESENT=1
+  else
+    ORIGINAL_PROVISION_LOG_PRESENT=0
+  fi
+  if ! fm_provision_worktree "$WT" "$STATE/provision-cache" "$PROVISION_LOG"; then
+    if [ -s "$PROVISION_LOG" ]; then
+      echo "error: last 40 lines of the provisioning log for $ID (not retained past this refused spawn):" >&2
+      tail -n 40 "$PROVISION_LOG" >&2
+    fi
+    return 1
+  fi
   PROVISION_SUMMARY=$FM_PROVISION_SUMMARY
   PROVISION_PATH_PREFIX=$FM_PROVISION_PATH_PREFIX
   return 0
@@ -3374,7 +3407,13 @@ fi
 # declares (e.g. a .nvmrc Node): the crewmate must validate on the SAME runtime
 # its dependencies were installed against, or native modules load against the
 # wrong ABI and the lane cannot run its own checks even though node_modules is
-# present (data/v3-env-repair-e3/report.md, 2026-08-05).
+# present (data/v3-env-repair-e3/report.md, 2026-08-05). That prefix holds
+# EXACTLY node, npm, npx, and corepack (fm_provision_node_path_prefix), never a
+# version-manager bin directory - such a directory also holds every globally
+# npm-installed CLI for that Node, including the harnesses launched below, so
+# leading with it would repoint `claude` or `codex` at whichever copy sits under
+# the pinned runtime. The invariant above therefore still holds for every
+# command except the Node toolchain the pin exists to fix.
 crew_tool_path() {
   local seed dir out='' brew=/opt/homebrew
   [ -d "$brew" ] || brew=/usr/local

@@ -925,6 +925,49 @@ PY
   pass "Pi accepts only a successful terminal assistant turn"
 }
 
+test_pi_reviewer_pins_sibling_node_before_path() {
+  python3 - "$CROSSCHECK_PY" <<'PY' \
+    || fail "Pi did not pin its installed sibling Node runtime"
+import importlib.util
+import os
+from pathlib import Path
+import tempfile
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", os.sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+with tempfile.TemporaryDirectory() as raw:
+    root = Path(raw)
+    toolchain = root / "toolchain"
+    hostile = root / "hostile"
+    toolchain.mkdir()
+    hostile.mkdir()
+    pi = toolchain / "pi"
+    sibling_node = toolchain / "node"
+    hostile_node = hostile / "node"
+    pi.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    sibling_node.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    hostile_node.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    for path in (pi, sibling_node, hostile_node):
+        path.chmod(0o700)
+
+    prior = os.environ.copy()
+    try:
+        os.environ["FM_CROSSCHECK_PI_BIN"] = str(pi)
+        os.environ.pop("FM_CROSSCHECK_PI_NODE_BIN", None)
+        os.environ["PATH"] = str(hostile)
+        command = module.pi_reviewer_command()
+    finally:
+        os.environ.clear()
+        os.environ.update(prior)
+
+    assert command == [str(sibling_node.resolve()), str(pi.resolve())], command
+PY
+  pass "Pi pins its installed sibling Node runtime before hostile PATH entries"
+}
+
 test_pi_reviewer_executes_bound_policy_profile() {
   local record case_dir base head output
   record=$(make_case pi-reviewer)
@@ -2355,6 +2398,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
     test_reviewer_policy_profiles_and_independence|\
     test_pi_reviewer_accepts_only_successful_terminal_turn|\
+    test_pi_reviewer_pins_sibling_node_before_path|\
     test_pi_reviewer_executes_bound_policy_profile|\
     test_pi_reviewer_failures_are_tool_failures|\
     test_clear_review_uses_policy_contract|\
@@ -2406,6 +2450,7 @@ fi
 
 test_reviewer_policy_profiles_and_independence
 test_pi_reviewer_accepts_only_successful_terminal_turn
+test_pi_reviewer_pins_sibling_node_before_path
 test_pi_reviewer_executes_bound_policy_profile
 test_pi_reviewer_failures_are_tool_failures
 test_clear_review_uses_policy_contract

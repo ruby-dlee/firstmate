@@ -47,10 +47,26 @@ Pi is launched through the resolved installed executable with `openai-codex/gpt-
 For the installed npm entrypoint, Crosscheck also resolves Pi's sibling Node runtime before launch instead of allowing the reviewer environment's `PATH` to substitute another interpreter.
 Its event stream must contain at least one completed turn, end with a successful `stop` assistant turn, and complete the agent before Crosscheck accepts that terminal turn's JSON verdict.
 Pi credential provisioning is a captain-owned prerequisite: the selected `account_home` must contain a usable `openai-codex` OAuth entry in `auth.json`, and Firstmate does not create or copy that credential.
+Because Pi selects only the default `openai-codex` slot and reviewer launches disable extension discovery, a Pi reviewer home holds exactly one account; a multi-slot Pi home reviews as its default slot, not as whichever slot has capacity.
+
+Pi is a third client, not extra capacity.
+It authenticates against the same upstream OpenAI accounts the Codex reviewer uses, so a Codex account at its usage limit is equally unavailable through Pi, and a Pi reviewer does not route around an exhausted Codex account.
+What Pi adds is an independent client path and a reviewer that is separate from a Claude author by construction.
+A usage-limited reviewer account records a `tool-failure`, never a verdict about code, and Crosscheck does not fail over to another configured reviewer: the first independent entry is the one it runs, so an operator whose leading reviewer is rate-limited must reorder `reviewers` or wait for that account's window to reset.
+
+Because Codex and Pi both authenticate against OpenAI, one account routinely exists behind several directories at once, and two different `account_home` paths can execute as the same account.
+Path inequality therefore cannot establish account separation between two OpenAI-backed identities.
+When both the author and the reviewer are OpenAI-backed, Crosscheck compares the executing OpenAI account recorded in each credential and refuses a reviewer that resolves to the author's account, an unreadable author identity, or a reviewer credential such as an API key that names no account at all.
 For a task explicitly marked `account_routing_emergency_bypass=1`, a reviewer on the other supported provider establishes both account-namespace and model separation without inventing an `account_home` for the author.
 A same-provider reviewer still fails closed for that structurally unrouted task because account independence cannot be proved.
 The accepted profiles are Codex `gpt-5.6-sol` xhigh, Claude `claude-opus-5` xhigh, and Pi `gpt-5.6-sol` xhigh.
 Absent configuration, unavailable credentials, missing model separation, and unprovable account separation all produce `CROSSCHECK TOOL-FAILURE` and a nonzero exit before reviewer launch.
+
+Crosscheck requires Python 3.11 or newer and refuses to run on anything older.
+This is a safety floor rather than a style preference: the bounded-read layer rejects hostile JSON integers by relying on CPython's integer/string conversion limit, which first exists in 3.11, and on an older interpreter that rejection silently stops happening while every banner the gate prints reads exactly the same.
+Stock macOS `python3` is 3.9, so `bin/fm-crosscheck.sh` resolves a supported sibling interpreter instead of assuming `python3` qualifies, and `bin/fm-crosscheck.py` enforces the same minimum itself so a direct invocation cannot bypass it.
+`bin/fm-crosscheck-python-lib.sh` owns that resolution for both the wrapper and the behavior tests; `FM_CROSSCHECK_PYTHON` selects an explicit interpreter and `FM_CROSSCHECK_MIN_PYTHON` overrides the minimum.
+CI pins a single modern interpreter and therefore cannot observe this class of defect on its own, which is why the floor is asserted at runtime rather than assumed from the CI matrix.
 
 Start crosscheck as soon as a PR URL exists so it can overlap no-mistakes' remaining CI work.
 The reviewer is a real policy-grade agent invocation and normally takes minutes, so Crosscheck is not a fast local check.

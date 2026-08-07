@@ -11,6 +11,12 @@ set -u
 fm_git_identity fmtest fmtest@example.invalid
 
 CROSSCHECK_PY="${FM_TEST_CROSSCHECK_PY:-$ROOT/bin/fm-crosscheck.py}"
+# The gate's interpreter floor has one owner; tests resolve through it so a
+# stock-macOS python3 does not silently exercise a different interpreter than
+# production would use.
+# shellcheck source=bin/fm-crosscheck-python-lib.sh
+. "$ROOT/bin/fm-crosscheck-python-lib.sh"
+CROSSCHECK_PYTHON="$(fm_crosscheck_resolve_python)"
 fm_test_tmproot_into TMP_ROOT fm-crosscheck-tests
 API_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-api.toon"
 CLAIMS_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-view-full.toon"
@@ -23,8 +29,12 @@ make_case() {
   mkdir -p "$repo/tests" "$case_dir/state" "$case_dir/data" \
     "$case_dir/author-home" "$case_dir/reviewer-home" "$case_dir/pi-home" \
     "$case_dir/fakebin"
-  printf '{"tokens":{"access_token":"test-reviewer-token"}}\n' \
+  # Real Codex homes always carry tokens.account_id; the independence gate
+  # proves OpenAI-backed separation on that executing identity, not the path.
+  printf '{"tokens":{"access_token":"test-reviewer-token","account_id":"test-reviewer-account"}}\n' \
     > "$case_dir/reviewer-home/auth.json"
+  printf '{"tokens":{"access_token":"test-author-token","account_id":"test-author-account"}}\n' \
+    > "$case_dir/author-home/auth.json"
   printf '{}\n' > "$case_dir/reviewer-home/.credentials.json"
   printf '{}\n' > "$case_dir/reviewer-home/.claude.json"
   printf '%s\n' \
@@ -650,7 +660,7 @@ run_case() {
   FM_TEST_AMBIENT_HOME="$HOME" \
   FM_TEST_BASE="$base" \
   FM_TEST_HEAD="$head" \
-    python3 "$CROSSCHECK_PY" "$command" task-x1 "$PR_URL" "$@"
+    "$CROSSCHECK_PYTHON" "$CROSSCHECK_PY" "$command" task-x1 "$PR_URL" "$@"
 }
 
 seed_open_ledger() {
@@ -709,7 +719,7 @@ EOF
 }
 
 test_reviewer_policy_profiles_and_independence() {
-  python3 - "$CROSSCHECK_PY" "$TMP_ROOT" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$TMP_ROOT" <<'PY' \
     || fail "reviewer policy profiles or independence validation regressed"
 import importlib.util
 import json
@@ -835,14 +845,220 @@ write_config(
         }
     ]
 )
-same_account = expect_refused(claude_author, "different account_home")
+same_account = expect_refused(claude_author, "proven-separate account")
 print(f"REFUSED shared-account: {same_account}")
 PY
   pass "all reviewer profiles validate while model and account independence still fail closed"
 }
 
+test_openai_backed_reviewer_proves_account_separation() {
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$TMP_ROOT" <<'PY' \
+    || fail "OpenAI-backed account separation regressed to a path comparison"
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+root = Path(sys.argv[2]) / "openai-account-separation"
+root.mkdir()
+config_path = root / "reviewer.json"
+os.environ["FM_CROSSCHECK_REVIEWER_CONFIG"] = str(config_path)
+
+
+def codex_home(name, account_id):
+    home = root / name
+    home.mkdir()
+    if account_id is not None:
+        (home / "auth.json").write_text(
+            json.dumps({"tokens": {"account_id": account_id}}), encoding="utf-8"
+        )
+    return home
+
+
+def pi_home(name, account_id):
+    home = root / name
+    home.mkdir()
+    if account_id is not None:
+        (home / "auth.json").write_text(
+            json.dumps(
+                {
+                    "openai-codex": {
+                        "type": "oauth",
+                        "access": "a",
+                        "refresh": "r",
+                        "accountId": account_id,
+                        "expires": 1,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+    return home
+
+
+author = codex_home("codex-author", "openai-account-A")
+aliased = pi_home("pi-aliased", "openai-account-A")
+distinct = pi_home("pi-distinct", "openai-account-B")
+opaque = pi_home("pi-unreadable", None)
+
+
+def write_config(home):
+    config_path.write_text(
+        json.dumps(
+            {
+                "reviewers": [
+                    {
+                        "harness": "pi",
+                        "model": "gpt-5.6-sol",
+                        "effort": "xhigh",
+                        "account_home": str(home),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+meta = {
+    "harness": "codex",
+    "model": "claude-opus-5",
+    "account_home": str(author),
+}
+
+
+def expect_refused(home, label):
+    write_config(home)
+    try:
+        module.reviewer_config(root, meta)
+    except module.CrosscheckError as exc:
+        message = str(exc)
+        assert "proven-separate account" in message, message
+        print(f"REFUSED {label}: {message[:120]}")
+        return
+    raise AssertionError(f"{label} was accepted as an independent reviewer")
+
+
+# One OpenAI account behind two different directories is not separation.
+expect_refused(aliased, "same-openai-account-different-path")
+
+write_config(distinct)
+selected = module.reviewer_config(root, meta)
+assert selected["account_home"] == str(distinct.resolve()), selected
+assert selected["author_openai_account"] == "openai-account-A", selected
+print(f"SELECTED distinct-openai-account: {selected['account_home']}")
+
+# An unreadable reviewer identity is deferred, not assumed separate: the
+# author identity rides along so the bound credential decides at execution.
+write_config(opaque)
+deferred = module.reviewer_config(root, meta)
+assert deferred["author_openai_account"] == "openai-account-A", deferred
+print("DEFERRED unreadable-reviewer-identity to executing-credential proof")
+
+# An unreadable author identity can never become provable separation,
+# because nothing downstream re-inspects the author.
+unreadable_author = {
+    "harness": "codex",
+    "model": "claude-opus-5",
+    "account_home": str(codex_home("codex-author-opaque", None)),
+}
+write_config(distinct)
+try:
+    module.reviewer_config(root, unreadable_author)
+except module.CrosscheckError as exc:
+    assert "proven-separate account" in str(exc), str(exc)
+    print("REFUSED unreadable-author-identity")
+else:
+    raise AssertionError("unreadable author identity was accepted as separate")
+
+# A non-OpenAI author is unaffected: path separation still governs.
+claude_meta = {
+    "harness": "claude",
+    "model": "claude-opus-5",
+    "account_home": str(codex_home("claude-author", None)),
+}
+write_config(aliased)
+selected = module.reviewer_config(root, claude_meta)
+assert selected["account_home"] == str(aliased.resolve()), selected
+print("SELECTED claude-author-unaffected")
+PY
+  pass "OpenAI-backed reviewers prove account separation on the executing credential"
+}
+
+test_api_key_reviewer_cannot_prove_openai_separation() {
+  # An API-key Codex credential passes credential preflight but names no
+  # OpenAI account, so it can never prove separation from an OpenAI author.
+  local record case_dir base head rc
+  record=$(make_case api-key-openai-separation)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  printf '{"OPENAI_API_KEY":"test-api-key"}\n' > "$case_dir/reviewer-home/auth.json"
+  set +e
+  run_case "$case_dir" "$base" "$head" clear run \
+    > "$case_dir/api-key.out" 2> "$case_dir/api-key.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "api-key reviewer without a provable OpenAI account"
+  assert_grep 'executing-account separation is unprovable' \
+    "$case_dir/api-key.err" \
+    "an API-key reviewer was allowed to stand in for a proven-separate account"
+  assert_no_grep 'crosscheck clear' "$case_dir/api-key.out" \
+    "an unprovable executing account earned a clear review"
+  pass "an API-key reviewer cannot substitute for proven OpenAI account separation"
+}
+
+test_gate_refuses_an_unsupported_interpreter() {
+  # CI pins one modern Python, so it structurally cannot catch a defect that
+  # only appears under the operator's own `python3`. On stock macOS that is
+  # 3.9, where the bounded-read layer's hostile-integer rejection silently
+  # does not happen because CPython's conversion limit arrived in 3.11.
+  local old_python out
+  out="$TMP_ROOT/interpreter-floor"
+  mkdir -p "$out"
+
+  # No supported interpreter at all: refuse loudly instead of reviewing.
+  set +e
+  FM_CROSSCHECK_MIN_PYTHON=99.0 "$ROOT/bin/fm-crosscheck.sh" \
+    run task-x1 "$PR_URL" > "$out/none.out" 2> "$out/none.err"
+  local rc=$?
+  set -e
+  expect_code 1 "$rc" "unsatisfiable interpreter floor"
+  assert_grep 'refuses to review under a weaker hostile-JSON guarantee' \
+    "$out/none.err" "an unsatisfiable interpreter floor did not refuse loudly"
+
+  # The wrapper selects a supported interpreter when one exists.
+  local resolved
+  resolved="$(fm_crosscheck_resolve_python)" \
+    || fail "no supported interpreter resolved for the gate"
+  "$resolved" -c 'import sys; sys.exit(0 if sys.version_info[:2] >= (3, 11) else 1)' \
+    || fail "the resolved gate interpreter is below the safety floor"
+
+  # A direct invocation cannot bypass the floor either.
+  old_python="${FM_TEST_UNSUPPORTED_PYTHON:-/usr/bin/python3}"
+  if [ -x "$old_python" ] \
+    && ! "$old_python" -c 'import sys; sys.exit(0 if sys.version_info[:2] >= (3, 11) else 1)'
+  then
+    set +e
+    "$old_python" "$CROSSCHECK_PY" run task-x1 "$PR_URL" \
+      > "$out/direct.out" 2> "$out/direct.err"
+    rc=$?
+    set -e
+    expect_code 1 "$rc" "direct run on an unsupported interpreter"
+    assert_grep 'requires 3.11 or newer' "$out/direct.err" \
+      "a direct run on an unsupported interpreter was not refused"
+  else
+    echo "# note: no sub-3.11 interpreter available to probe the direct path"
+  fi
+  pass "the gate refuses an interpreter without its hostile-JSON defense"
+}
+
 test_pi_reviewer_accepts_only_successful_terminal_turn() {
-  python3 - "$CROSSCHECK_PY" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' \
     || fail "Pi terminal-turn validation regressed"
 import importlib.util
 import json
@@ -926,7 +1142,7 @@ PY
 }
 
 test_pi_reviewer_pins_sibling_node_before_path() {
-  python3 - "$CROSSCHECK_PY" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' \
     || fail "Pi did not pin its installed sibling Node runtime"
 import importlib.util
 import os
@@ -1050,7 +1266,7 @@ test_pi_reviewer_failures_are_tool_failures() {
   assert_grep 'CROSSCHECK TOOL-FAILURE: Pi reviewer exited 47' \
     "$case_dir/err" "Pi launch failure was not a named tool failure"
 
-  python3 - "$CROSSCHECK_PY" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' \
     || fail "Pi zero-turn output was not rejected as a tool failure"
 import importlib.util
 import sys
@@ -1132,7 +1348,7 @@ test_empty_runtime_overrides_use_home_defaults() {
 }
 
 test_empty_environment_fallback_is_generic() {
-  python3 - "$CROSSCHECK_PY" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' \
     || fail "generic environment fallback did not treat empty as absent"
 import importlib.util
 import os
@@ -1629,7 +1845,7 @@ PY
 }
 
 test_final_wait_and_residual_processes_are_bounded() {
-  python3 - "$CROSSCHECK_PY" "$TMP_ROOT/residual-child-marker" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$TMP_ROOT/residual-child-marker" <<'PY' \
     || fail "process lifetime escaped its deadline or process group"
 import importlib.util
 from pathlib import Path
@@ -1675,7 +1891,7 @@ test_installed_sandbox_denies_shared_private_tmp() {
   local marker profile
   marker="/private/tmp/fm-crosscheck-shared-state-$$"
   profile="$TMP_ROOT/isolated-proof.sb"
-  python3 - "$CROSSCHECK_PY" "$profile" "$marker" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$profile" "$marker" <<'PY' \
     || fail "generated proof sandbox permits shared host state"
 import importlib.util
 import json
@@ -1773,7 +1989,7 @@ test_real_claude_sandbox_executes_exact_sha_git_diff() {
   profile="$repo/.crosscheck/real-claude-sandbox.sb"
   output="$repo/.crosscheck/real-claude-output.json"
   event="$repo/.crosscheck/observed-bash-event"
-  python3 - "$CROSSCHECK_PY" "$profile" "$repo" "$reviewer_home" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$profile" "$repo" "$reviewer_home" <<'PY' \
     || fail "real Claude sandbox profile did not retain the narrow write contract"
 import importlib.util
 import json
@@ -2013,7 +2229,7 @@ test_reviewer_capture_override_is_validated() {
 
 test_ordinary_output_paths_remain_bounded() {
   local record case_dir base head rc
-  python3 - "$CROSSCHECK_PY" <<'PY' \
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' \
     || fail "ordinary run_command output did not retain the original ceiling"
 import importlib.util
 import sys
@@ -2154,7 +2370,7 @@ assert value["runs"][-1]["active_blockers"] == ["cc-aaaaaaaaaaaa"]
 }
 
 test_equivalent_finding_reopens_when_direct_proof_regresses() {
-  python3 - "$CROSSCHECK_PY" <<'PY' || fail "equivalent finding did not fail closed after target regression"
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' || fail "equivalent finding did not fail closed after target regression"
 import importlib.util
 import sys
 
@@ -2397,6 +2613,9 @@ test_verify_rechecks_live_head_and_claims() {
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
     test_reviewer_policy_profiles_and_independence|\
+    test_openai_backed_reviewer_proves_account_separation|\
+    test_api_key_reviewer_cannot_prove_openai_separation|\
+    test_gate_refuses_an_unsupported_interpreter|\
     test_pi_reviewer_accepts_only_successful_terminal_turn|\
     test_pi_reviewer_pins_sibling_node_before_path|\
     test_pi_reviewer_executes_bound_policy_profile|\
@@ -2449,6 +2668,9 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
 fi
 
 test_reviewer_policy_profiles_and_independence
+test_openai_backed_reviewer_proves_account_separation
+test_api_key_reviewer_cannot_prove_openai_separation
+test_gate_refuses_an_unsupported_interpreter
 test_pi_reviewer_accepts_only_successful_terminal_turn
 test_pi_reviewer_pins_sibling_node_before_path
 test_pi_reviewer_executes_bound_policy_profile

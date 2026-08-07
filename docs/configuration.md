@@ -329,8 +329,10 @@ No interpreter or runtime version is hardcoded: uv resolves the interpreter from
 When a Node pin is declared, the highest matching runtime under `$NVM_DIR`, `$FNM_DIR`, `$VOLTA_HOME`, or `~/.asdf` is used for the install, so the lane validates on the same runtime its native modules were built against.
 What is prepended to the crewmate's `PATH` is a firstmate-owned directory holding exactly `node`, `npm`, `npx`, and `corepack`, never the version manager's own bin directory: that directory also holds every globally npm-installed CLI for that Node version, so leading with it would silently repoint `claude`, `codex`, `opencode`, `pi`, or `grok` at whichever copy happens to sit under the pinned runtime.
 Resolution order for every command other than the Node toolchain is therefore exactly the host's own.
-That directory is shared by every spawn in the home that pins the same runtime, and a launched lane keeps it on its `PATH` for the lane's whole life, so it is immutable once published: a spawn that finds one reuses it untouched, and a spawn that does not builds a private copy and publishes it with a single rename.
+That directory is shared by every spawn in the home that pins the same runtime, and a launched lane keeps it on its `PATH` for the lane's whole life, so it is only ever created, never rewritten.
+The name is claimed with a single `mkdir`, which is atomic and fails when the name is already taken, so there is no window between deciding a name is free and taking it; a spawn that loses that race validates and reuses the winner's directory untouched.
 A concurrent spawn can therefore never unlink a running lane's `node`.
+A directory that exists but does not validate - a binary removed from underneath it, a half-deleted state directory - is stepped over rather than repaired in place: the next generation suffix is used, so a lane still holding the stale one keeps what it has while new spawns get a good prefix instead of refusing forever.
 
 Provisioning is cached per worktree, per component, in the home's `state/provision-cache/`, never inside the worktree.
 A cache hit requires both a fingerprint match over that component's manifests, installer version, and runtime identity, and a live readiness probe of the installed environment.
@@ -350,6 +352,7 @@ The complete set of capability gaps is:
 - A JS component whose package manager is neither named by package.json's `packageManager` field nor implied by a single lockfile - including a directory carrying two lockfiles while declaring nothing.
 - A declared Node major that cannot be found under `$NVM_DIR`, `$FNM_DIR`, `$VOLTA_HOME`, or `~/.asdf`, components declaring conflicting Node majors, or a `node` that does not run. The worktree's Python components are still provisioned.
 - A missing installer (`uv`, `npm`, `pnpm`).
+- A pinned-Node toolchain directory that cannot be established under the provisioning cache, reported as `skipped:node-prefix-unavailable`. A stale one is stepped over rather than rewritten, so this can only mean the cache itself is unwritable.
 - A pip component whose `-r` / `-c` include graph reaches more requirements files than the library traverses. No fingerprint over the traversed prefix could cover what the component installs, and a fingerprint that cannot be stood behind would become a false cache hit, so the component is reported as `skipped:unresolved-manifests`.
 - A host with no bounded-execution mechanism (`timeout`, `gtimeout`, or `perl`), or without `python3`. Neither one can be worked around, so nothing is attempted and the whole worktree is recorded as `unavailable:`.
 
@@ -361,7 +364,7 @@ The complete set of refusal causes is:
 - A worktree path that is not a directory, or a dependency scan that fails to traverse it. A scan that succeeds and finds nothing is a clean no-op, not a refusal.
 - A `UV_PROJECT_ENVIRONMENT` that would place a component's environment somewhere other than its own `.venv`, where it could not be proven.
 - A provisioned directory whose git exclusion cannot be registered before the installer runs.
-- A provisioning cache directory, pinned-Node toolchain directory, or log that cannot be written. An already-published pinned-Node directory is never rewritten - see below - so this covers only creating one that was absent.
+- A provisioning cache directory or log that cannot be written.
 - Declared manifests that cannot be read for a component, including a requirements include that cannot be opened.
 - An install that exceeds its bound, exits non-zero, or is terminated by a signal.
 - An installed environment that is still not usable afterwards: no working interpreter at `.venv/bin/python`, or a readiness probe that cannot capture the environment's state.
@@ -370,6 +373,8 @@ The complete set of refusal causes is:
 `bin/fm-provision-lib.sh` routes every non-success outcome through one of two functions - `fm_provision_gap` or `fm_provision_fail` - so a capability limit added later cannot become a spawn refusal by accident.
 
 Installer output lands in `state/<id>.provision.log`, which is removed with the rest of the task's state on teardown and on a spawn abort; a refusal prints the tail of that log to stderr, since the rollback deletes the file.
+Those surfaces all live in the firstmate home, where the crewmate cannot read them, so provisioning also writes `.fm-provisioning.md` at the root of the leased worktree naming every component and what happened to it.
+That file is registered with the repository's git exclude file before it is written, so it cannot dirty the checkout; if that registration is impossible the report is skipped with a warning rather than written, and a report that cannot be filed never refuses a spawn.
 The outcome is recorded as `provision=` in `state/<id>.meta`: `none` for a worktree that declares nothing, `off` for an opt-out, `unavailable:<reason>` for a host gap, or a comma-separated list of `<manager>:<dir>=installed|cached|skipped:<reason>`.
 Every install and probe is wall-clock bounded; a host with no `timeout`, `gtimeout`, or `perl` runs nothing at all and the lane launches unprovisioned, rather than risking an unbounded install wedging a spawn.
 

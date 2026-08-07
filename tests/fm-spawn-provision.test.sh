@@ -653,6 +653,47 @@ test_over_the_component_budget_provisions_what_it_can_and_reports_the_rest() {
   pass "a worktree over the component budget provisions what it can and reports what it skipped"
 }
 
+# The three firstmate-side surfaces (stderr, the provisioning log, provision=
+# metadata) all live in the firstmate home, which the crewmate cannot read. The
+# skip list has to reach the LANE, so provisioning writes it into the worktree
+# the lane actually works in - and it must not dirty that checkout.
+test_the_lane_can_read_what_provisioning_skipped() {
+  local record id out status report dirty
+  id=provision-spawn-p10
+  record=$(make_spawn_case spawn-lane-report both "$id")
+  read_spawn_case "$record"
+  out=$(FM_PROVISION_MAX_COMPONENTS=1 run_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR")
+  status=$?
+  expect_code 0 "$status" "a partially provisioned spawn should launch: $out"
+  report="$WORKTREE_DIR/.fm-provisioning.md"
+  [ -f "$report" ] || fail "the lane got no in-worktree provisioning report: $out"
+  assert_grep 'NOT provisioned' "$report" "the report does not tell the lane anything was skipped"
+  assert_grep 'npm in web - NOT provisioned: over-budget' "$report" \
+    "the report does not name the skipped component and its reason"
+  assert_grep 'pip in svc - installed' "$report" \
+    "the report does not tell the lane which component it DID get"
+  dirty=$(git -C "$WORKTREE_DIR" status --porcelain --untracked-files=all)
+  [ -z "$dirty" ] || fail "the lane-readable report dirtied the leased worktree: $dirty"
+  pass "the crewmate can read, inside its own worktree, what provisioning skipped and why"
+}
+
+# A host capability gap provisions nothing at all, so the lane's only clue that
+# every environment is missing by decision rather than by breakage is the report.
+test_the_lane_can_read_an_unavailable_host_gap() {
+  local case_dir out fakebin report
+  case_dir=$(new_case lane-report-unavailable both)
+  fakebin=$(case_fakebin "$case_dir")
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" FM_TEST_PROVISION_BOUND_KIND=none)
+  assert_contains "$out" 'rc=0' "a host gap refused instead of launching: $out"
+  report="$case_dir/wt/.fm-provisioning.md"
+  [ -f "$report" ] || fail "a host capability gap left the lane no report: $out"
+  assert_grep 'NOT provisioned: no-bounded-execution' "$report" \
+    "the report does not name the host gap that left every component unprovisioned"
+  assert_grep 'pip in svc' "$report" "the report does not name every component it skipped"
+  assert_grep 'npm in web' "$report" "the report does not name every component it skipped"
+  pass "a host capability gap is reported to the lane, not only to the operator"
+}
+
 # The budget must not be spent alphabetically. The task's own brief is the one
 # path signal a spawn actually has, so a component the brief names is provisioned
 # even when detection order would have pushed it past the budget.
@@ -1054,11 +1095,111 @@ SH
     || fail "the shared pinned prefix was repointed under a running lane ($link_before -> $link_after)"
   [ "$ident_after" = "$ident_before" ] \
     || fail "the shared pinned prefix's node was unlinked and recreated under a running lane"
-  for leftover in "$(dirname "$prefix_a")"/.build.*; do
+  for leftover in "$prefix_a"/*; do
     [ -e "$leftover" ] || continue
-    fail "a partially built pinned prefix was left behind: $leftover"
+    case "${leftover##*/}" in
+      node|npm|npx|corepack) ;;
+      *) fail "a losing spawn nested its own build inside the published prefix: $leftover" ;;
+    esac
   done
   pass "a shared pinned Node prefix is published once and never rebuilt under a running lane"
+}
+
+# The publish must be a single atomic claim, not a guard followed by a rename.
+# Two spawns that both find the prefix absent must not nest one build inside the
+# other's published directory: the loser has to validate and reuse the winner's.
+test_a_lost_prefix_publish_race_reuses_the_winner() {
+  local case_dir fakebin nvm_bin prefix entry racer
+  case_dir=$(new_case node-pin-publish-race js)
+  fakebin=$(case_fakebin "$case_dir")
+  nvm_bin="$case_dir/nvm/versions/node/v20.20.2/bin"
+  mkdir -p "$nvm_bin"
+  cat > "$nvm_bin/node" <<'SH'
+#!/usr/bin/env bash
+printf '20.20.2'
+SH
+  chmod +x "$nvm_bin/node"
+  cp "$fakebin/npm" "$nvm_bin/npm"
+
+  # Both calls start before either has published, so one of them is genuinely the
+  # loser of the publish race. Every assertion below holds whichever one wins.
+  publish_prefix() {
+    # shellcheck disable=SC2016  # the bash -c body expands its own positionals
+    env PATH="$fakebin:/usr/bin:/bin" bash -c '
+        set -u
+        . "$1"
+        fm_provision_node_path_prefix "$2" "$3"
+      ' _ "$LIB" "$case_dir/cache" "$nvm_bin" > "$1" 2>/dev/null
+  }
+  publish_prefix "$case_dir/prefix-a" &
+  racer=$!
+  publish_prefix "$case_dir/prefix-b"
+  wait "$racer"
+
+  for prefix in "$(cat "$case_dir/prefix-a")" "$(cat "$case_dir/prefix-b")"; do
+    [ -n "$prefix" ] || fail "a racing publish produced no prefix"
+    [ "$(readlink "$prefix/node")" = "$nvm_bin/node" ] \
+      || fail "a racing publish returned a prefix not pointing at the pinned runtime: $prefix"
+    [ "$(readlink "$prefix/npm")" = "$nvm_bin/npm" ] \
+      || fail "a racing publish returned an incomplete prefix: $prefix"
+  done
+  for prefix in "$case_dir"/cache/node-toolchain/*; do
+    [ -e "$prefix" ] || continue
+    for entry in "$prefix"/*; do
+      [ -e "$entry" ] || continue
+      [ ! -d "$entry" ] \
+        || fail "a losing publish nested its build inside a published prefix: $entry"
+    done
+  done
+  pass "concurrent publishes each return a complete prefix and never nest one inside the other"
+}
+
+# Immutability must not become a permanent brick. A published prefix that stops
+# validating is stepped over, never rewritten, so a lane still holding the stale
+# directory keeps what it has while the next spawn gets a working prefix.
+test_a_stale_pinned_prefix_is_stepped_over_not_rewritten() {
+  local case_dir fakebin nvm_bin first second stale_link
+  case_dir=$(new_case node-pin-stale js)
+  fakebin=$(case_fakebin "$case_dir")
+  nvm_bin="$case_dir/nvm/versions/node/v20.20.2/bin"
+  mkdir -p "$nvm_bin"
+  cat > "$nvm_bin/node" <<'SH'
+#!/usr/bin/env bash
+printf '20.20.2'
+SH
+  chmod +x "$nvm_bin/node"
+  cp "$fakebin/npm" "$nvm_bin/npm"
+
+  # shellcheck disable=SC2016  # the bash -c body expands its own positionals
+  first=$(env PATH="$fakebin:/usr/bin:/bin" bash -c '
+      set -u
+      . "$1"
+      fm_provision_node_path_prefix "$2" "$3"
+    ' _ "$LIB" "$case_dir/cache" "$nvm_bin")
+  [ -n "$first" ] || fail "the first publish produced no prefix"
+
+  # Something outside this code breaks the published prefix.
+  rm -f "$first/npm"
+  printf 'not-a-symlink\n' > "$first/stale-marker"
+
+  # shellcheck disable=SC2016  # the bash -c body expands its own positionals
+  second=$(env PATH="$fakebin:/usr/bin:/bin" bash -c '
+      set -u
+      . "$1"
+      fm_provision_node_path_prefix "$2" "$3"
+    ' _ "$LIB" "$case_dir/cache" "$nvm_bin")
+  [ -n "$second" ] || fail "a stale published prefix bricked every later spawn"
+  [ "$second" != "$first" ] || fail "the stale prefix was rewritten in place instead of stepped over"
+  [ -f "$first/stale-marker" ] \
+    || fail "the stale prefix was mutated, which a lane still holding it would observe"
+  stale_link=$(readlink "$first/node")
+  [ "$stale_link" = "$nvm_bin/node" ] \
+    || fail "the stale prefix's surviving entries were disturbed"
+  [ "$(readlink "$second/node")" = "$nvm_bin/node" ] \
+    || fail "the replacement prefix does not point at the pinned runtime"
+  [ "$(readlink "$second/npm")" = "$nvm_bin/npm" ] \
+    || fail "the replacement prefix is missing the entry the stale one lost"
+  pass "a published prefix that stops validating is stepped over, leaving the stale one untouched"
 }
 
 # --- fm-spawn.sh integration ------------------------------------------------
@@ -1325,6 +1466,7 @@ test_a_missing_installer_leaves_that_component_unprovisioned
 test_an_unsupported_package_manager_leaves_that_component_unprovisioned
 test_over_the_component_budget_provisions_what_it_can_and_reports_the_rest
 test_the_component_budget_prefers_what_the_task_brief_names
+test_the_lane_can_read_an_unavailable_host_gap
 test_a_requirements_graph_too_large_to_traverse_is_not_fingerprinted
 test_a_js_package_manager_is_read_from_what_the_project_declares
 test_detection_is_declaration_driven_and_prunes_installed_trees
@@ -1335,9 +1477,12 @@ test_a_declared_but_absent_node_runtime_leaves_js_unprovisioned
 test_a_declared_node_runtime_is_resolved_and_exported
 test_a_node_pin_does_not_shadow_harness_binaries
 test_a_pinned_node_prefix_is_never_rebuilt_under_a_running_lane
+test_a_lost_prefix_publish_race_reuses_the_winner
+test_a_stale_pinned_prefix_is_stepped_over_not_rewritten
 test_spawn_provisions_the_worktree_before_creating_the_endpoint
 test_spawn_refuses_when_provisioning_fails
 test_spawn_over_the_component_budget_still_launches
+test_the_lane_can_read_what_provisioning_skipped
 test_teardown_removes_the_provisioning_log_with_the_task_state
 test_spawn_failure_excludes_every_mutated_component
 test_spawn_refuses_before_install_when_exclusion_cannot_be_registered

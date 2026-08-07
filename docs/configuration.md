@@ -334,7 +334,23 @@ The provisioned directories are added to the repository's git exclude file when 
 
 The failure contract is one mode: provisioning either succeeds or the spawn is refused.
 There is no launched-but-degraded state, because a lane that cannot validate its own work is the defect this exists to remove.
-A missing installer, a failing install, an install that exceeds its bound, a declared runtime that cannot be found, a recognized-but-unsupported package manager (`yarn`, `bun`), or more components than `FM_PROVISION_MAX_COMPONENTS` all refuse the spawn, name the cause, and print the opt-out.
+Every refusal names its cause and prints the opt-out. The complete set of refusal causes is:
+
+- A tunable (`FM_PROVISION_SCAN_DEPTH`, `FM_PROVISION_MAX_COMPONENTS`, `FM_PROVISION_INSTALL_TIMEOUT`, `FM_PROVISION_PROBE_TIMEOUT`) that is not a positive integer, including an explicitly empty or zero override.
+- A worktree path that is not a directory, or a dependency scan that fails to traverse it. A scan that succeeds and finds nothing is a clean no-op, not a refusal.
+- More detected components than `FM_PROVISION_MAX_COMPONENTS`.
+- A host with no bounded-execution mechanism (`timeout`, `gtimeout`, or `perl`), or without `python3`, which resolves declared manifests and environment readiness for every component.
+- A recognized-but-unsupported package manager (`yarn`, `bun`).
+- A `UV_PROJECT_ENVIRONMENT` that would place a component's environment somewhere other than its own `.venv`, where it could not be proven.
+- A provisioned directory whose git exclusion cannot be registered before the installer runs.
+- Components declaring conflicting Node majors, or a declared Node runtime that cannot be found.
+- A provisioning cache directory or log that cannot be written.
+- A missing installer (`uv`, `npm`, `pnpm`) or a declared `node` that does not run.
+- Declared manifests that cannot be resolved for a component.
+- An install that exceeds its bound, exits non-zero, or is terminated by a signal.
+- An installed environment that is still not usable afterwards: no working interpreter at `.venv/bin/python`, or a readiness probe that cannot capture the environment's state.
+- A fingerprint that cannot be recorded.
+
 Installer output lands in `state/<id>.provision.log`, and the outcome is recorded as `provision=` in `state/<id>.meta`.
 Every install and probe is wall-clock bounded; a host with no `timeout`, `gtimeout`, or `perl` refuses rather than risking an unbounded install wedging a spawn.
 
@@ -590,10 +606,10 @@ FM_ACCOUNT_CONTINUATION_FINGERPRINT_BYTES=268435456  # maximum repository conten
 FM_ACCOUNT_CONTINUATION_ENUMERATION_BYTES=33554432  # maximum bytes used to enumerate repository identity inputs
 FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS=30  # seconds allowed to verify the continuation repository identity
 FM_DISPATCH_AGENT_FLEET_TIMEOUT=120  # optional positive seconds per live-proof pool summary; unset uses FM_ACCOUNT_SELECTION_TIMEOUT, an explicit legacy FM_ACCOUNT_CONTROL_TIMEOUT, then 120
-FM_PROVISION_SCAN_DEPTH=4        # worktree provisioning: manifest search depth below the worktree root
-FM_PROVISION_MAX_COMPONENTS=8    # worktree provisioning: refuse a spawn above this many detected components
-FM_PROVISION_INSTALL_TIMEOUT=600 # worktree provisioning: seconds allowed per component install
-FM_PROVISION_PROBE_TIMEOUT=60    # worktree provisioning: seconds allowed per readiness probe
+FM_PROVISION_SCAN_DEPTH=4        # worktree provisioning: manifest search depth below the worktree root; must be a positive integer, and an empty or zero override refuses the spawn rather than falling back to this default
+FM_PROVISION_MAX_COMPONENTS=8    # worktree provisioning: refuse a spawn above this many detected components; must be a positive integer, and an empty or zero override refuses the spawn rather than falling back to this default
+FM_PROVISION_INSTALL_TIMEOUT=600 # worktree provisioning: seconds allowed per component install; must be a positive integer, and an empty or zero override refuses the spawn rather than removing the bound
+FM_PROVISION_PROBE_TIMEOUT=60    # worktree provisioning: seconds allowed per readiness probe; must be a positive integer, and an empty or zero override refuses the spawn rather than removing the bound
 FM_REPORT_STACK_ROOT=  # machine-global completion-report store override; unset uses $XDG_DATA_HOME/firstmate/report-stack or ~/.local/share/firstmate/report-stack
 FM_REPORT_RETENTION_INTERVAL=  # optional shared cadence: owner/policy default 300s, opportunistic watcher default 86400s; constrained by docs/report-stack.md
 FM_REPORT_RETENTION_OWNER_FRESH_SECS=660  # fresh successful-owner heartbeat window before watchers use their opportunistic fallback

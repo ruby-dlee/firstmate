@@ -3176,6 +3176,13 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 # that the freshness proof and teardown both require to be clean. Defined here
 # because both the provisioning step below and the per-harness turn-end hooks
 # further down use it.
+#
+# Returns 0 only once the exclusion is present in info/exclude and read back,
+# and non-zero otherwise. Provisioning depends on that real status: it treats
+# registration as a checked prerequisite and refuses to run an installer that
+# would otherwise leave an unignored directory behind. The turn-end hook call
+# sites below deliberately tolerate a failure instead, since losing a hook
+# exclusion is a dirty-checkout nuisance, not a reason to refuse a spawn.
 exclude_path() {
   local rel=$1 EXCL
   EXCL=$(git_repository_probe -C "$WT" rev-parse --git-path info/exclude 2>/dev/null) || return 1
@@ -3447,7 +3454,8 @@ if [ "$KIND" != secondmate ]; then
         cat > "$WT/.claude/settings.local.json" <<EOF
 {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch '$TURNEND'"}]}]}}
 EOF
-        exclude_path '.claude/settings.local.json'
+        exclude_path '.claude/settings.local.json' \
+          || echo "warning: could not exclude .claude/settings.local.json from git's view" >&2
       fi
       ;;
     opencode*)
@@ -3459,7 +3467,8 @@ export const FmTurnEnd = async ({ \$ }) => ({
   },
 })
 EOF
-      exclude_path '.opencode/plugins/fm-turn-end.js'
+      exclude_path '.opencode/plugins/fm-turn-end.js' \
+        || echo "warning: could not exclude .opencode/plugins/fm-turn-end.js from git's view" >&2
       ;;
     pi*)
       # Written OUTSIDE the worktree: pi's project-trust gate fires on any extension
@@ -3526,7 +3535,8 @@ EOF
       hook_command=$(json_escape "bash $(shell_quote "$GROK_HOOKS_DIR/fm-turn-end.sh")")
       printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"%s"}]}]}}\n' "$hook_command" > "$GROK_HOOKS_DIR/fm-turn-end.json"
       printf 'token=%s\n' "${auth_file##*/}" > "$WT/.fm-grok-turnend"
-      exclude_path '.fm-grok-turnend'
+      exclude_path '.fm-grok-turnend' \
+        || echo "warning: could not exclude .fm-grok-turnend from git's view" >&2
       ;;
   esac
 fi

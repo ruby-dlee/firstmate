@@ -16,7 +16,8 @@ CROSSCHECK_PY="${FM_TEST_CROSSCHECK_PY:-$ROOT/bin/fm-crosscheck.py}"
 # production would use.
 # shellcheck source=bin/fm-crosscheck-python-lib.sh
 . "$ROOT/bin/fm-crosscheck-python-lib.sh"
-CROSSCHECK_PYTHON="$(fm_crosscheck_resolve_python)"
+CROSSCHECK_PYTHON="$(fm_crosscheck_resolve_python)" \
+  || fail "no Python meeting the crosscheck safety floor is available"
 fm_test_tmproot_into TMP_ROOT fm-crosscheck-tests
 API_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-api.toon"
 CLAIMS_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-view-full.toon"

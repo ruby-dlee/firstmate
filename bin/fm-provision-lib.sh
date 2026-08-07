@@ -10,18 +10,36 @@
 # none. This library closes that gap between worktree verification and endpoint
 # launch.
 #
-# CONTRACT (one mode, no silent degradation)
-#   Provisioning either succeeds or the spawn fails. There is no "launched but
-#   degraded" state, because a lane that cannot validate its own work is the
-#   exact defect this exists to remove, and a recorded-degradation mode would
-#   reintroduce it one indirection away. A worktree that declares no recognized
-#   dependency manifest is a clean no-op, not a failure. Every other outcome -
-#   a recognized manifest whose installer is missing, an install that fails, an
-#   install that exceeds its bound, a declared runtime that cannot be found, a
-#   recognized-but-unsupported package manager - refuses the spawn and names
-#   both the cause and the opt-out. fm-spawn.sh's --no-provision flag and the
-#   home-local config/worktree-provision file are the opt-out; the caller owns
-#   reading them.
+# CONTRACT (exactly two non-success outcomes, one decision point each)
+#   A CAPABILITY GAP is work this provisioner was never able to do here. It
+#   WARNS, is RECORDED in the provisioning summary, and LAUNCHES the lane
+#   unprovisioned for that component. Refusing a gap would be strictly worse
+#   than the behavior this library replaced, which launched every lane
+#   unprovisioned; it would also brick the spawn on projects this feature
+#   exists to serve. The gaps are: more provisionable components than the
+#   budget allows, a recognized-but-unsupported package manager (yarn, bun), a
+#   JS component whose package manager cannot be determined from what the
+#   project declares, a declared runtime that cannot be found or does not run,
+#   a missing installer, and a host missing a tool provisioning itself needs
+#   (python3, or any bounded-execution mechanism).
+#   A FAILURE is an attempt that was made and did not complete. It REFUSES the
+#   spawn and names both the cause and the opt-out, because a lane launched on
+#   a half-built environment is worse than no lane. The failures are: an
+#   install that fails or exceeds its bound, a readiness probe that fails after
+#   installing, a git exclusion that cannot be registered, a dependency scan
+#   that cannot traverse, a tunable that is not a positive integer, an
+#   environment signature that is empty or unprovable, a UV_PROJECT_ENVIRONMENT
+#   that would put an environment where the probe cannot see it, and a cache
+#   directory, log, pinned-toolchain directory, or record that cannot be
+#   written.
+#   fm_provision_gap and fm_provision_fail are those two decision points, and
+#   every non-success outcome goes through exactly one of them, so a capability
+#   limit added later cannot become a spawn refusal by accident.
+#   A worktree that declares no recognized dependency manifest is a clean
+#   no-op, and so is a traversal that succeeds and finds nothing.
+#   fm-spawn.sh's --no-provision flag and the home-local
+#   config/worktree-provision file are the opt-out; the caller owns reading
+#   them.
 #
 # DETECTION is per-project and declaration-driven. Nothing here knows the name
 # of any project, and no interpreter or runtime version is hardcoded: uv reads
@@ -35,9 +53,14 @@
 #   npm     package-lock.json  -> npm ci
 #   pnpm    pnpm-lock.yaml     -> pnpm install --frozen-lockfile
 # Python always goes through uv, never pip/venv directly (AGENTS.md toolchain
-# convention). yarn and bun lockfiles are recognized but unsupported: they
-# refuse the spawn rather than silently leaving a lane unprovisioned, because
-# no verified install invocation for them exists in this repo yet.
+# convention). The JS package manager is read from what the project DECLARES -
+# package.json's corepack `packageManager` field - and only falls back to the
+# lockfile when the project declares nothing; lockfile-filename precedence is
+# convention, not evidence, and a directory carrying two committed lockfiles
+# would otherwise be resolved by this library's opinion rather than by what the
+# project actually installs with. yarn and bun, and a JS component whose
+# manager cannot be determined, are capability gaps: they are left
+# unprovisioned and reported, never installed with a guessed installer.
 #
 # CACHING. Every component carries a fingerprint over its own manifests plus
 # the resolved installer and runtime identity. A cache hit needs BOTH a
@@ -50,15 +73,17 @@
 #
 # BOUNDS. Every install and probe runs through fm_provision_run_bounded, which
 # follows the established timeout/gtimeout/perl-alarm pattern (this machine has
-# neither timeout nor gtimeout). With no bounding mechanism available,
-# provisioning refuses rather than risking an unbounded install wedging a spawn.
+# neither timeout nor gtimeout). With no bounding mechanism available nothing is
+# run at all - the whole worktree is a capability gap - rather than risking an
+# unbounded install wedging a spawn.
 #
 # Tunables (seconds unless noted). Each is validated as a positive integer
 # before anything is scanned or run, and the defaults are unset-only, so an
 # explicitly empty or zero override refuses rather than silently becoming the
 # default and removing the bound it was meant to set.
 #   FM_PROVISION_SCAN_DEPTH=4        manifest search depth below the worktree
-#   FM_PROVISION_MAX_COMPONENTS=8    refuse above this many detected components
+#   FM_PROVISION_MAX_COMPONENTS=8    provision at most this many components;
+#                                    the rest are reported as a capability gap
 #   FM_PROVISION_INSTALL_TIMEOUT=600 per-component install bound
 #   FM_PROVISION_PROBE_TIMEOUT=60    per-readiness-probe bound
 
@@ -90,7 +115,8 @@ fm_provision_sha256() {  # reads stdin, prints the hex digest
   fi
 }
 
-# Which bounding mechanism this host has. Resolved once; "none" refuses.
+# Which bounding mechanism this host has. Resolved once; "none" provisions
+# nothing, because nothing can be run under a bound this host does not have.
 FM_PROVISION_BOUND_KIND=
 fm_provision_bound_kind() {
   if [ -z "$FM_PROVISION_BOUND_KIND" ]; then
@@ -164,13 +190,57 @@ fm_provision_mode() {  # <config-dir>
 
 # --- detection --------------------------------------------------------------
 
+# Exact element membership, never a pattern match over a joined list: a value
+# that contains another as a token would otherwise compare equal and silently
+# drop a real entry.
+fm_provision_list_has() {  # <needle> [element...]
+  local needle=$1 item
+  shift
+  for item in "$@"; do
+    if [ "$item" = "$needle" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The JS package manager a directory DECLARES, through package.json's corepack
+# `packageManager` field. This is evidence; a lockfile's filename is only
+# convention. Empty when the project declares nothing, which is also what a
+# host without python3 sees - such a host provisions nothing anyway.
+fm_provision_declared_js_manager() {  # <component-dir>
+  local dir=$1 raw=''
+  [ -f "$dir/package.json" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  raw=$(python3 -c '
+import json, re, sys
+try:
+    with open(sys.argv[1], "rb") as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+declared = data.get("packageManager")
+if not isinstance(declared, str):
+    sys.exit(0)
+name = declared.strip().split("@", 1)[0].strip().lower()
+if re.fullmatch(r"[a-z][a-z0-9-]*", name):
+    sys.stdout.write(name)
+' "$dir/package.json" 2>/dev/null) || raw=
+  printf '%s' "$raw"
+}
+
 # Emit "<ecosystem> <relative-dir>" per detected component, deterministically
-# ordered. A directory can yield at most one Python and one JS component.
+# ordered. A directory can yield at most one Python and one JS component. The
+# "js" pseudo-ecosystem means a JS component whose package manager could not be
+# determined; the caller records it as a capability gap rather than guessing an
+# installer the project does not use.
 # Returns non-zero when the traversal itself failed, which is a refusal and not
 # the same thing as a traversal that succeeded and found nothing.
 fm_provision_detect() {  # <worktree>
-  local wt=$1 file dir rel seen found manifest_output
-  local -a manifests=()
+  local wt=$1 file dir rel found manifest_output declared
+  local -a manifests=() js_managers=()
   manifest_output=$(
     set -o pipefail
     find "$wt" -maxdepth "$FM_PROVISION_SCAN_DEPTH" \
@@ -198,15 +268,11 @@ fm_provision_detect() {  # <worktree>
     # Exact element comparison, never a pattern match over a joined list: a
     # directory whose name contains another as a token would otherwise dedup
     # away a real component and leave it silently unprovisioned.
-    found=
-    if [ "${#dirs[@]}" -gt 0 ]; then
-      for seen in "${dirs[@]}"; do
-        [ "$seen" = "$rel" ] || continue
-        found=1
-        break
-      done
+    found=0
+    if [ "${#dirs[@]}" -gt 0 ] && fm_provision_list_has "$rel" "${dirs[@]}"; then
+      found=1
     fi
-    [ -z "$found" ] || continue
+    [ "$found" = 0 ] || continue
     dirs+=("$rel")
   done
 
@@ -219,16 +285,32 @@ fm_provision_detect() {  # <worktree>
     elif [ -f "$dir/requirements.txt" ]; then
       printf '%s %s\n' pip "$rel"
     fi
-    # JS: the lockfile names the package manager. Precedence is fixed so a
-    # directory carrying two lockfiles still resolves deterministically.
-    if [ -f "$dir/pnpm-lock.yaml" ]; then
-      printf '%s %s\n' pnpm "$rel"
-    elif [ -f "$dir/yarn.lock" ]; then
-      printf '%s %s\n' yarn "$rel"
-    elif [ -f "$dir/bun.lockb" ] || [ -f "$dir/bun.lock" ]; then
-      printf '%s %s\n' bun "$rel"
-    elif [ -f "$dir/package-lock.json" ]; then
-      printf '%s %s\n' npm "$rel"
+    # JS: what the project DECLARES decides the package manager, and a lockfile
+    # is only the fallback when it declares nothing. A directory carrying more
+    # than one lockfile while declaring nothing is undecidable, and a declared
+    # manager whose lockfile is absent is a contradiction; both emit "js" so the
+    # caller leaves that component unprovisioned instead of running an installer
+    # the project never validated against.
+    js_managers=()
+    [ ! -f "$dir/pnpm-lock.yaml" ] || js_managers+=(pnpm)
+    [ ! -f "$dir/yarn.lock" ] || js_managers+=(yarn)
+    if [ -f "$dir/bun.lockb" ] || [ -f "$dir/bun.lock" ]; then
+      js_managers+=(bun)
+    fi
+    [ ! -f "$dir/package-lock.json" ] || js_managers+=(npm)
+    if [ "${#js_managers[@]}" -gt 0 ]; then
+      declared=$(fm_provision_declared_js_manager "$dir")
+      if [ -n "$declared" ]; then
+        if fm_provision_list_has "$declared" "${js_managers[@]}"; then
+          printf '%s %s\n' "$declared" "$rel"
+        else
+          printf 'js %s\n' "$rel"
+        fi
+      elif [ "${#js_managers[@]}" -eq 1 ]; then
+        printf '%s %s\n' "${js_managers[0]}" "$rel"
+      else
+        printf 'js %s\n' "$rel"
+      fi
     fi
   done
 }
@@ -357,10 +439,172 @@ for path in sorted(paths):
 PY
 }
 
+# One parser for the real requirements.txt grammar, shared by the fingerprint's
+# file list and the readiness check so the two can never disagree about what a
+# component declares. It accepts what pip accepts: -r/-c includes, -e editable
+# installs, --index-url and its siblings, standalone --hash lines, VCS, URL and
+# local-path requirements, extras, environment markers, inline comments, and
+# line continuations.
+#   files - print every requirements file reached, relative to the component
+#   ready - verify every requirement whose package identity is determinable
+# Exit 0 succeeded, 1 a declared package is not installed, 2 the declaration
+# could not be determined. A line whose package identity cannot be established
+# cheaply yields 2, which the caller treats as a cache MISS - never a hit, and
+# never an error that would make the miss permanent and silent.
+fm_provision_pip_parse() {  # <files|ready> <component-dir> <venv> [requirements-file...]
+  local dir=$2
+  fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
+    python3 - "$@" <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+mode = sys.argv[1]
+root = pathlib.Path(sys.argv[2]).resolve()
+venv = pathlib.Path(sys.argv[3])
+roots = [pathlib.Path(path) for path in sys.argv[4:]]
+
+MAX_FILES = 64
+INCLUDE = ("-r", "--requirement", "-c", "--constraint")
+EDITABLE = ("-e", "--editable")
+URLISH = ("git+", "hg+", "svn+", "bzr+", "./", "../", "/", "~/", "file:", "http:", "https:")
+ARCHIVE = (".whl", ".zip", ".tar.gz", ".tar.bz2", ".tar.xz")
+SPECIFIER = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^]]*\])?\s*(?P<rest>.*)$")
+
+visited = []
+seen = set()
+declared = set()
+unreadable = False
+unverifiable = False
+
+
+def strip_comment(line):
+    index = 0
+    while True:
+        index = line.find("#", index)
+        if index < 0:
+            return line
+        if index == 0 or line[index - 1] in " \t":
+            return line[:index]
+        index += 1
+
+
+def logical_lines(text):
+    buffer = ""
+    for raw in text.splitlines():
+        line = strip_comment(raw)
+        if line.rstrip().endswith("\\"):
+            buffer += line.rstrip()[:-1]
+            continue
+        buffer += line
+        yield buffer
+        buffer = ""
+    if buffer:
+        yield buffer
+
+
+def visit(path):
+    global unreadable, unverifiable
+    try:
+        resolved = path.resolve()
+        text = resolved.read_text(encoding="utf-8", errors="strict")
+    except (OSError, ValueError, UnicodeDecodeError):
+        unreadable = True
+        return
+    if resolved in seen:
+        return
+    if len(seen) >= MAX_FILES:
+        unverifiable = True
+        return
+    seen.add(resolved)
+    visited.append(resolved)
+    for line in logical_lines(text):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        token = parts[0]
+        rest = parts[1] if len(parts) > 1 else ""
+        base = token.split("=", 1)[0]
+        if base in INCLUDE:
+            target = token.split("=", 1)[1] if "=" in token else rest.strip()
+            if not target:
+                unreadable = True
+                continue
+            visit(resolved.parent / target)
+            continue
+        if base in EDITABLE:
+            unverifiable = True
+            continue
+        if token.startswith("-"):
+            continue
+        requirement = line.split(";", 1)[0].strip()
+        lowered = requirement.lower()
+        if (
+            not requirement
+            or requirement in (".", "..")
+            or "://" in lowered
+            or lowered.startswith(URLISH)
+            or lowered.endswith(ARCHIVE)
+        ):
+            unverifiable = True
+            continue
+        match = SPECIFIER.match(requirement)
+        tail = match.group("rest").strip() if match else "?"
+        if not match or (tail and tail[0] not in "=<>!~@"):
+            unverifiable = True
+            continue
+        declared.add(match.group("name"))
+
+
+for path in roots:
+    visit(path)
+
+if mode == "files":
+    # An include that cannot be read leaves the declared set unknown, so the
+    # caller must not fingerprint the partial one it can see.
+    if unreadable:
+        raise SystemExit(2)
+    for path in visited:
+        print(os.path.relpath(path, root))
+    raise SystemExit(0)
+
+site_dirs = [path for path in venv.glob("lib*/python*/site-packages") if path.is_dir()]
+if not site_dirs:
+    raise SystemExit(1)
+for name in sorted(declared):
+    normalized = re.sub(r"[-_.]+", "_", name).lower()
+    found = any(
+        (candidate / "METADATA").is_file()
+        for site_dir in site_dirs
+        for candidate in site_dir.glob("%s-*.dist-info" % normalized)
+    )
+    if not found:
+        raise SystemExit(1)
+raise SystemExit(2 if (unreadable or unverifiable) else 0)
+PY
+}
+
+# The requirements files a pip component reaches through -r/-c includes. A
+# component whose real declaration lives in an included file must be
+# fingerprinted on what it actually installs; without this, editing that
+# include would be a false cache HIT.
+fm_provision_pip_included_files() {  # <component-dir>
+  local dir=$1 name
+  local -a requirements=()
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    requirements+=("$dir/$name")
+  done < <(fm_provision_pip_requirements "$dir")
+  [ "${#requirements[@]}" -gt 0 ] || return 0
+  fm_provision_pip_parse files "$dir" "$dir/.venv" "${requirements[@]}" 2>/dev/null
+}
+
 # The files whose content defines a component's fingerprint. Only files that
 # exist are listed, so an added or removed optional manifest is itself a change.
 fm_provision_manifests() {  # <worktree> <ecosystem> <relative-dir>
-  local wt=$1 eco=$2 rel=$3 dir name workspace_info
+  local wt=$1 eco=$2 rel=$3 dir name workspace_info included
   dir=$wt/$rel
   [ "$rel" != . ] || dir=$wt
   local -a names=()
@@ -385,6 +629,16 @@ fm_provision_manifests() {  # <worktree> <ecosystem> <relative-dir>
       [ -n "$name" ] && [ "$name" != workspace ] || continue
       printf '%s\n' "$name"
     done <<< "$workspace_info"
+  fi
+  if [ "$eco" = pip ]; then
+    included=$(fm_provision_pip_included_files "$dir") || return 1
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      if fm_provision_list_has "$name" "${names[@]}"; then
+        continue
+      fi
+      printf '%s\n' "$name"
+    done <<< "$included"
   fi
 }
 
@@ -474,6 +728,35 @@ fm_provision_find_node_bin() {  # <major>
     return 0
   fi
   return 0
+}
+
+# A PATH prefix that pins ONLY the Node toolchain. A version-manager bin
+# directory also holds every globally npm-installed CLI for that Node version,
+# and the harnesses this repo launches (claude, codex, opencode, pi, grok) are
+# commonly installed exactly that way, so putting that directory in front would
+# silently repoint the command the spawn is about to launch at whichever copy
+# happens to live under the pinned runtime - a failure that would look like
+# anything except a PATH bug. fm-spawn.sh's crew_tool_path guarantees the host's
+# own resolution ORDER is preserved and that seeding only ever adds reach; a
+# directory holding exactly node, npm, npx, and corepack keeps that guarantee
+# while still giving native modules the ABI they were installed against.
+# The entry names are a fixed set, so nothing outside them is ever removed.
+fm_provision_node_path_prefix() {  # <cache-dir> <pinned-bin>
+  local cache=$1 bin=$2 key shim name
+  key=$(printf '%s' "$bin" | fm_provision_sha256) || return 1
+  case "$key" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+    *) return 1 ;;
+  esac
+  shim="$cache/node-toolchain/${key:0:40}"
+  mkdir -p "$shim" || return 1
+  for name in node npm npx corepack; do
+    rm -f "$shim/$name" || return 1
+    [ -x "$bin/$name" ] || continue
+    ln -s "$bin/$name" "$shim/$name" || return 1
+  done
+  [ -x "$shim/node" ] || return 1
+  printf '%s' "$shim"
 }
 
 # --- fingerprint and cache --------------------------------------------------
@@ -602,53 +885,31 @@ print("\n".join(rows))
   printf '%s' "$state" | fm_provision_sha256
 }
 
+# Tri-state: 0 every determinable requirement is installed, 1 a declared package
+# is missing, 2 the declaration could not be verified. 2 is still a cache miss,
+# but a distinguishable one, so the caller can say why it is reinstalling rather
+# than reinstalling on every spawn forever with no explanation.
 fm_provision_declared_packages_ready() {  # <worktree> <eco> <rel>
-  local wt=$1 eco=$2 rel=$3 dir python
+  local wt=$1 eco=$2 rel=$3 dir name rc=0
   dir=$wt/$rel
   [ "$rel" != . ] || dir=$wt
   case "$eco" in
     uv) return 0 ;;
-    pip)
-      python="$dir/.venv/bin/python"
-      local -a requirements=()
-      while IFS= read -r name; do
-        [ -n "$name" ] || continue
-        requirements+=("$dir/$name")
-      done < <(fm_provision_pip_requirements "$dir")
-      fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
-        "$python" -c '
-import pathlib
-import re
-import sys
-
-venv = pathlib.Path(sys.argv[1])
-site_dirs = [path for path in venv.glob("lib*/python*/site-packages") if path.is_dir()]
-pattern = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^]]+\])?(?:\s*@\s*\S+|\s*(?:===|==|~=|!=|<=|>=|<|>).*)?$")
-declared = set()
-for requirement_file in sys.argv[2:]:
-    for raw in pathlib.Path(requirement_file).read_text(errors="strict").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.endswith("\\"):
-            raise SystemExit(1)
-        line = line.split(" ;", 1)[0].strip()
-        match = pattern.fullmatch(line)
-        if not match:
-            raise SystemExit(1)
-        declared.add(match.group(1))
-for name in declared:
-    normalized = re.sub(r"[-_.]+", "_", name).lower()
-    found = any(
-        (candidate / "METADATA").is_file()
-        for site_dir in site_dirs
-        for candidate in site_dir.glob(f"{normalized}-*.dist-info")
-    )
-    if not found:
-        raise SystemExit(1)
-' "$dir/.venv" "${requirements[@]}" >/dev/null 2>&1
-      ;;
-    *) return 1 ;;
+    pip) ;;
+    *) return 2 ;;
+  esac
+  [ -x "$dir/.venv/bin/python" ] || return 1
+  local -a requirements=()
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    requirements+=("$dir/$name")
+  done < <(fm_provision_pip_requirements "$dir")
+  [ "${#requirements[@]}" -gt 0 ] || return 2
+  fm_provision_pip_parse ready "$dir" "$dir/.venv" "${requirements[@]}" \
+    >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0|1) return "$rc" ;;
+    *) return 2 ;;
   esac
 }
 
@@ -656,7 +917,7 @@ for name in declared:
 # keeps ignored directories across leases, and a previous agent may have removed
 # or broken them; a fingerprint alone would then report a false cache hit.
 fm_provision_probe() {  # <worktree> <eco> <rel> <log> <runtime> <environment> <phase>
-  local wt=$1 eco=$2 rel=$3 log=$4 runtime=$5 environment=$6 phase=$7 dir python actual current
+  local wt=$1 eco=$2 rel=$3 log=$4 runtime=$5 environment=$6 phase=$7 dir python actual current ready_rc=0
   dir=$wt/$rel
   [ "$rel" != . ] || dir=$wt
   case "$eco" in
@@ -685,7 +946,12 @@ fm_provision_probe() {  # <worktree> <eco> <rel> <log> <runtime> <environment> <
     current=$(fm_provision_environment_signature "$wt" "$eco" "$rel") || return 1
     [ -n "$environment" ] && [ "$current" = "$environment" ] || return 1
     if [ "$eco" = pip ]; then
-      fm_provision_declared_packages_ready "$wt" "$eco" "$rel" || return 1
+      fm_provision_declared_packages_ready "$wt" "$eco" "$rel" || ready_rc=$?
+      if [ "$ready_rc" -eq 2 ]; then
+        printf '[cache miss] %s declares requirements whose package identity could not be determined\n' "$rel" >> "$log"
+        echo "fm-spawn: reinstalling $rel because its requirements could not be verified against the installed environment" >&2
+      fi
+      [ "$ready_rc" -eq 0 ] || return 1
     fi
   else
     [ -n "$environment" ] || return 1
@@ -757,6 +1023,33 @@ fm_provision_artifact_path() {  # <eco> <rel>
   fi
 }
 
+# --- the two decision points ------------------------------------------------
+#
+# Every non-success outcome goes through exactly one of these. Which one it is
+# never depends on where in the flow it happened, only on what kind of thing it
+# is: something provisioning could not have done here (gap) versus something it
+# tried to do and could not finish (failure). Adding a new limit means picking
+# one of these two functions, and the gap one cannot refuse a spawn.
+
+# A capability gap. Warns, and returns the state string the caller records for
+# the component, so a gap is never possible without also being reported.
+fm_provision_gap() {  # <eco> <rel> <reason-token> <message>
+  local eco=$1 rel=$2 reason=$3 message=$4
+  echo "warning: leaving the $eco component in $rel unprovisioned: $message" >&2
+  printf 'skipped:%s' "$reason"
+}
+
+# A capability gap covering the whole worktree, for a host that lacks a tool
+# provisioning itself needs. Nothing is attempted and the spawn still launches.
+fm_provision_unavailable() {  # <reason-token> <message>
+  local reason=$1 message=$2
+  echo "warning: worktree provisioning is unavailable on this host: $message" >&2
+  echo "         the lane launches unprovisioned, so it may not be able to run this project's own checks." >&2
+  FM_PROVISION_SUMMARY="unavailable:$reason"
+  return 0
+}
+
+# An attempt that failed. Refuses the spawn.
 fm_provision_fail() {  # <message>
   echo "error: worktree provisioning failed: $1" >&2
   echo "       a lane launched here could not run this project's own checks, so the spawn is refused." >&2
@@ -785,16 +1078,19 @@ fm_provision_validate_tunables() {
 
 # --- entry point ------------------------------------------------------------
 
-# Provision every component the worktree declares. Prints per-component
-# progress to stderr, appends all installer output to <log>, and sets
-# FM_PROVISION_SUMMARY (the compact task-metadata value) and
+# Provision every component the worktree declares that this provisioner can.
+# Prints per-component progress to stderr, appends all installer output to
+# <log>, and sets FM_PROVISION_SUMMARY (the compact task-metadata value) and
 # FM_PROVISION_PATH_PREFIX (a PATH prefix pinning a declared Node runtime).
-# Returns 0 on success or a clean no-op, non-zero when the spawn must refuse.
+# Returns 0 on success, on a partial result whose gaps are recorded in the
+# summary, or on a clean no-op; non-zero only when an attempt failed and the
+# spawn must refuse.
 fm_provision_worktree() {  # <worktree> <cache-dir> <log>
   local wt=$1 cache=$2 log=$3
   local eco rel dir line detected record fingerprint recorded runtime installer environment artifact
-  local declared_major pinned_major='' pinned_bin='' rc=0 state
-  local -a components=() results=()
+  local declared_major pinned_major='' pinned_bin='' pinned_prefix='' rc=0 state
+  local index=0 provisionable=0 budgeted=0 skipped=0
+  local -a components=() states=() results=()
 
   FM_PROVISION_SUMMARY=none
   FM_PROVISION_PATH_PREFIX=
@@ -809,103 +1105,188 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log>
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     components+=("$line")
+    states+=(planned)
   done <<< "$detected"
 
   if [ "${#components[@]}" -eq 0 ]; then
     return 0
   fi
-  if [ "${#components[@]}" -gt "$FM_PROVISION_MAX_COMPONENTS" ]; then
-    fm_provision_fail "detected ${#components[@]} dependency components under $wt, above the FM_PROVISION_MAX_COMPONENTS limit of $FM_PROVISION_MAX_COMPONENTS"
-    return 1
-  fi
+
+  # Host prerequisites. Provisioning was never going to work here, so it warns
+  # and launches unprovisioned; refusing would make every spawn on such a host
+  # impossible while buying nothing, and nothing has been mutated yet.
   if [ "$(fm_provision_bound_kind)" = none ]; then
-    fm_provision_fail "no bounded-execution mechanism (timeout, gtimeout, or perl) is available, so an install could not be prevented from wedging the spawn"
-    return 1
+    fm_provision_unavailable no-bounded-execution \
+      "no bounded-execution mechanism (timeout, gtimeout, or perl) is available, so no install could be prevented from wedging the spawn"
+    return 0
   fi
   if ! command -v python3 >/dev/null 2>&1; then
-    fm_provision_fail "python3 is not installed, so declared manifests and installed-environment readiness could not be resolved for any component"
-    return 1
+    fm_provision_unavailable no-python3 \
+      "python3 is not installed, so no component's declared manifests or installed-environment readiness could be resolved"
+    return 0
   fi
 
-  # Refuse recognized-but-unsupported package managers before installing
-  # anything, so a partially provisioned worktree is never left behind.
+  # Package managers with no verified install command here, and JS components
+  # whose manager could not be determined from what the project declares.
+  index=0
   for line in "${components[@]}"; do
     eco=${line%% *}
     rel=${line#* }
     case "$eco" in
       uv|pip|npm|pnpm) ;;
+      js)
+        states[index]=$(fm_provision_gap js "$rel" ambiguous-manager \
+          "its package manager is not determined by package.json's packageManager field and it carries no single lockfile that names one")
+        ;;
       *)
-        fm_provision_fail "$rel declares a $eco lockfile, which this firstmate has no verified install command for"
-        return 1
+        states[index]=$(fm_provision_gap "$eco" "$rel" unsupported-manager \
+          "this firstmate has no verified $eco install command")
         ;;
     esac
-    # Every Python readiness probe reads <component>/.venv. An ambient
-    # UV_PROJECT_ENVIRONMENT would move uv's environment somewhere the probe
-    # cannot see, which would silently degrade a cache hit into a false one.
-    if [ "$eco" = uv ] && [ -n "${UV_PROJECT_ENVIRONMENT:-}" ] \
-      && [ "$UV_PROJECT_ENVIRONMENT" != .venv ]; then
-      fm_provision_fail "UV_PROJECT_ENVIRONMENT is set to '$UV_PROJECT_ENVIRONMENT', so the environment for $rel would not be provable at $rel/.venv"
-      return 1
-    fi
+    index=$((index + 1))
   done
 
+  # An ambient UV_PROJECT_ENVIRONMENT would move uv's environment somewhere the
+  # readiness probe cannot see, so an installed component could never be proven
+  # and a cache hit would be a false one. That is an attempt we cannot make.
+  index=0
   for line in "${components[@]}"; do
     eco=${line%% *}
     rel=${line#* }
-    artifact=$(fm_provision_artifact_path "$eco" "$rel") || return 1
-    if declare -F fm_provision_register_exclude >/dev/null \
-      && ! fm_provision_register_exclude "$artifact"; then
-      fm_provision_fail "cannot register the git exclusion for $artifact before provisioning"
+    if [ "${states[$index]}" = planned ] && [ "$eco" = uv ] \
+      && [ -n "${UV_PROJECT_ENVIRONMENT:-}" ] && [ "$UV_PROJECT_ENVIRONMENT" != .venv ]; then
+      fm_provision_fail "UV_PROJECT_ENVIRONMENT is set to '$UV_PROJECT_ENVIRONMENT', so the environment for $rel would not be provable at $rel/.venv"
       return 1
     fi
+    [ "${states[$index]}" != planned ] || provisionable=$((provisionable + 1))
+    index=$((index + 1))
   done
+
+  # The component budget bounds how much one spawn will install; the components
+  # past it are left unprovisioned and reported, never installed silently and
+  # never a reason to refuse the whole spawn.
+  if [ "$provisionable" -gt "$FM_PROVISION_MAX_COMPONENTS" ]; then
+    index=0
+    for line in "${components[@]}"; do
+      if [ "${states[$index]}" = planned ]; then
+        budgeted=$((budgeted + 1))
+        if [ "$budgeted" -gt "$FM_PROVISION_MAX_COMPONENTS" ]; then
+          eco=${line%% *}
+          rel=${line#* }
+          states[index]=$(fm_provision_gap "$eco" "$rel" over-budget \
+            "the worktree declares $provisionable provisionable components, above the FM_PROVISION_MAX_COMPONENTS budget of $FM_PROVISION_MAX_COMPONENTS")
+        fi
+      fi
+      index=$((index + 1))
+    done
+  fi
+
+  mkdir -p "$cache" || { fm_provision_fail "cannot create the provisioning cache directory $cache"; return 1; }
 
   # Resolve one Node runtime for the whole worktree before any JS install, so
   # every JS component installs its native modules against the runtime the
   # crewmate will later validate with. A project that declares nothing keeps
-  # the ambient runtime.
+  # the ambient runtime. A pin no installed runtime can satisfy - including two
+  # components that declare different majors - is a capability gap that leaves
+  # the JS components unprovisioned rather than installing them against an ABI
+  # the lane will not validate on.
+  index=0
   for line in "${components[@]}"; do
     eco=${line%% *}
     rel=${line#* }
-    case "$eco" in npm|pnpm) ;; *) continue ;; esac
-    dir=$wt/$rel
-    [ "$rel" != . ] || dir=$wt
-    declared_major=$(fm_provision_declared_node_major "$dir")
-    [ -n "$declared_major" ] || continue
-    if [ -n "$pinned_major" ] && [ "$pinned_major" != "$declared_major" ]; then
-      fm_provision_fail "components under $wt declare conflicting Node major versions ($pinned_major and $declared_major); no single runtime can serve both"
-      return 1
+    if [ "${states[$index]}" = planned ]; then
+      case "$eco" in
+        npm|pnpm)
+          dir=$wt/$rel
+          [ "$rel" != . ] || dir=$wt
+          declared_major=$(fm_provision_declared_node_major "$dir")
+          if [ -n "$declared_major" ]; then
+            if [ -n "$pinned_major" ] && [ "$pinned_major" != "$declared_major" ]; then
+              pinned_major=conflict
+            elif [ "$pinned_major" != conflict ]; then
+              pinned_major=$declared_major
+            fi
+          fi
+          ;;
+      esac
     fi
-    pinned_major=$declared_major
+    index=$((index + 1))
   done
-  if [ -n "$pinned_major" ]; then
+  if [ -n "$pinned_major" ] && [ "$pinned_major" != conflict ]; then
     runtime=$(fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$wt" node -p 'process.versions.node' 2>/dev/null) || runtime=
     if [ -n "$runtime" ] && [ "${runtime%%.*}" = "$pinned_major" ]; then
       pinned_bin=
     else
       pinned_bin=$(fm_provision_find_node_bin "$pinned_major")
       if [ -z "$pinned_bin" ]; then
-        fm_provision_fail "this project declares Node $pinned_major, but no Node $pinned_major runtime was found on PATH or under the standard version-manager directories (\$NVM_DIR, \$FNM_DIR, \$VOLTA_HOME, ~/.asdf)"
-        return 1
+        pinned_major=unsatisfiable
+      else
+        pinned_prefix=$(fm_provision_node_path_prefix "$cache" "$pinned_bin") || {
+          fm_provision_fail "cannot create the pinned Node $pinned_major toolchain directory under $cache"
+          return 1
+        }
+        # Read by the sourcing caller (fm-spawn.sh's crew_tool_path).
+        # shellcheck disable=SC2034
+        FM_PROVISION_PATH_PREFIX=$pinned_prefix
+        PATH="$pinned_prefix:$PATH"
+        export PATH
+        echo "fm-spawn: pinning Node $pinned_major from $pinned_bin for this worktree" >&2
       fi
-      # Read by the sourcing caller (fm-spawn.sh's crew_tool_path).
-      # shellcheck disable=SC2034
-      FM_PROVISION_PATH_PREFIX=$pinned_bin
-      PATH="$pinned_bin:$PATH"
-      export PATH
-      echo "fm-spawn: pinning Node $pinned_major from $pinned_bin for this worktree" >&2
     fi
   fi
+  if [ "$pinned_major" = conflict ] || [ "$pinned_major" = unsatisfiable ]; then
+    index=0
+    for line in "${components[@]}"; do
+      eco=${line%% *}
+      rel=${line#* }
+      if [ "${states[$index]}" = planned ]; then
+        case "$eco" in
+          npm|pnpm)
+            if [ "$pinned_major" = conflict ]; then
+              states[index]=$(fm_provision_gap "$eco" "$rel" conflicting-node \
+                "components under $wt declare different Node major versions, and no single runtime can serve both")
+            else
+              states[index]=$(fm_provision_gap "$eco" "$rel" node-not-found \
+                "this project declares a Node major that was not found on PATH or under the standard version-manager directories (\$NVM_DIR, \$FNM_DIR, \$VOLTA_HOME, ~/.asdf)")
+            fi
+            ;;
+        esac
+      fi
+      index=$((index + 1))
+    done
+  fi
 
-  mkdir -p "$cache" || { fm_provision_fail "cannot create the provisioning cache directory $cache"; return 1; }
+  # Registering the exclusion is a prerequisite, not a courtesy: an installer
+  # that runs first would leave an unignored directory in a checkout the
+  # freshness proof and teardown both require to be clean.
+  index=0
+  for line in "${components[@]}"; do
+    if [ "${states[$index]}" = planned ]; then
+      eco=${line%% *}
+      rel=${line#* }
+      artifact=$(fm_provision_artifact_path "$eco" "$rel") || return 1
+      if declare -F fm_provision_register_exclude >/dev/null \
+        && ! fm_provision_register_exclude "$artifact"; then
+        fm_provision_fail "cannot register the git exclusion for $artifact before provisioning"
+        return 1
+      fi
+    fi
+    index=$((index + 1))
+  done
+
   : >> "$log" || { fm_provision_fail "cannot write the provisioning log $log"; return 1; }
   printf '=== provisioning %s at %s ===\n' "$wt" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$log"
 
+  index=0
   for line in "${components[@]}"; do
     eco=${line%% *}
     rel=${line#* }
     dir=$wt/$rel
     [ "$rel" != . ] || dir=$wt
+    if [ "${states[$index]}" != planned ]; then
+      index=$((index + 1))
+      continue
+    fi
 
     case "$eco" in
       uv|pip) installer=$(fm_provision_tool_version uv --version) || installer= ;;
@@ -914,10 +1295,17 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log>
     esac
     if [ -z "$installer" ]; then
       case "$eco" in
-        uv|pip) fm_provision_fail "$rel is a Python project but uv is not installed; firstmate provisions Python through uv, never pip or venv" ;;
-        *) fm_provision_fail "$rel needs $eco, which is not installed" ;;
+        uv|pip)
+          states[index]=$(fm_provision_gap "$eco" "$rel" missing-installer \
+            "firstmate provisions Python through uv, never pip or venv, and uv is not installed")
+          ;;
+        *)
+          states[index]=$(fm_provision_gap "$eco" "$rel" missing-installer \
+            "$eco is not installed")
+          ;;
       esac
-      return 1
+      index=$((index + 1))
+      continue
     fi
 
     # The runtime identity a component is fingerprinted and probed against.
@@ -929,8 +1317,10 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log>
       npm|pnpm)
         runtime=$(fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" node -p 'process.versions.node' 2>/dev/null) || runtime=
         if [ -z "$runtime" ]; then
-          fm_provision_fail "$rel needs node, which did not run"
-          return 1
+          states[index]=$(fm_provision_gap "$eco" "$rel" node-not-found \
+            "node did not run, so its dependencies cannot be installed against the runtime the lane would validate on")
+          index=$((index + 1))
+          continue
         fi
         ;;
       *) runtime= ;;
@@ -984,10 +1374,25 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log>
         || { fm_provision_fail "cannot record the provisioning fingerprint at $record"; return 1; }
     fi
 
-    results+=("$eco:$rel=$state")
+    states[index]=$state
+    index=$((index + 1))
   done
 
+  index=0
+  for line in "${components[@]}"; do
+    eco=${line%% *}
+    rel=${line#* }
+    results+=("$eco:$rel=${states[$index]}")
+    case "${states[$index]}" in
+      skipped:*) skipped=$((skipped + 1)) ;;
+    esac
+    index=$((index + 1))
+  done
   FM_PROVISION_SUMMARY=$(IFS=,; printf '%s' "${results[*]}")
-  echo "fm-spawn: worktree provisioned - $FM_PROVISION_SUMMARY" >&2
+  if [ "$skipped" -gt 0 ]; then
+    echo "warning: worktree provisioning left $skipped of ${#components[@]} components unprovisioned - $FM_PROVISION_SUMMARY" >&2
+  else
+    echo "fm-spawn: worktree provisioned - $FM_PROVISION_SUMMARY" >&2
+  fi
   return 0
 }

@@ -12,6 +12,9 @@
 # and claims document to be clear, and prints only the reviewed SHA.
 # `merge` repeats that verification and is the sole entrypoint to the private
 # exact-SHA GitHub merge primitive.
+#
+# The interpreter floor and the reason for it are owned by
+# bin/fm-crosscheck-python-lib.sh.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,4 +23,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 fm_refuse_if_gate_agent
 
-exec python3 "$SCRIPT_DIR/fm-crosscheck.py" "$@"
+# shellcheck source=bin/fm-crosscheck-python-lib.sh
+. "$SCRIPT_DIR/fm-crosscheck-python-lib.sh"
+CROSSCHECK_PYTHON="$(fm_crosscheck_resolve_python)"
+
+exec "$CROSSCHECK_PYTHON" "$SCRIPT_DIR/fm-crosscheck.py" "$@"

@@ -329,6 +329,47 @@ def inspect_pi_credential(account_home: Path) -> tuple[str, str]:
     return "pi-openai-codex-oauth-file", str(credential_file)
 
 
+OPENAI_BACKED_HARNESSES = {"codex", "pi"}
+
+
+def openai_account_identity(harness: str, account_home: Path) -> str | None:
+    """Return the upstream OpenAI account one account home executes as.
+
+    Codex and Pi both authenticate against OpenAI accounts, and one account
+    is routinely present in several directories at once: a Codex home and a
+    Pi auth slot can carry the same credential, and two Codex homes can be
+    copies of one account. Directory inequality therefore cannot establish
+    account separation between OpenAI-backed identities, so the independence
+    gate compares this executing identity instead. Returns None when the
+    identity is not readable, which callers must treat as unproven rather
+    than as separate.
+    """
+
+    if harness not in OPENAI_BACKED_HARNESSES:
+        return None
+    credential_file = account_home / "auth.json"
+    try:
+        credentials = read_bounded_json(
+            credential_file,
+            maximum_bytes=1024 * 1024,
+            maximum_items=256,
+            maximum_string_bytes=1024 * 1024,
+        )
+    except BoundedIOError:
+        return None
+    if not isinstance(credentials, dict):
+        return None
+    if harness == "pi":
+        entry = credentials.get("openai-codex")
+        identity = entry.get("accountId") if isinstance(entry, dict) else None
+    else:
+        tokens = credentials.get("tokens")
+        identity = tokens.get("account_id") if isinstance(tokens, dict) else None
+    if isinstance(identity, str) and identity.strip():
+        return identity.strip()
+    return None
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         fail(message)
@@ -1371,19 +1412,55 @@ def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
                 "account_home": str(account_home.resolve()),
             }
         )
+    author_openai_identity = (
+        openai_account_identity(meta["harness"], author_home)
+        if author_home is not None
+        else None
+    )
     for reviewer in validated:
         model_is_separate = reviewer["model"] != meta["model"]
         if author_home is not None:
             account_is_separate = Path(reviewer["account_home"]) != author_home
+            if (
+                account_is_separate
+                and meta["harness"] in OPENAI_BACKED_HARNESSES
+                and reviewer["harness"] in OPENAI_BACKED_HARNESSES
+            ):
+                # Two distinct directories can still execute as one OpenAI
+                # account, so an OpenAI-backed pair must prove separation on
+                # the executing credential rather than on the path. This is
+                # the selection screen; run_reviewer repeats it against the
+                # credential it actually binds, which is authoritative.
+                reviewer_openai_identity = openai_account_identity(
+                    reviewer["harness"], Path(reviewer["account_home"])
+                )
+                if author_openai_identity is None:
+                    # Nothing later inspects the author, so an unreadable
+                    # author identity can never become provable separation.
+                    account_is_separate = False
+                elif reviewer_openai_identity is not None:
+                    account_is_separate = (
+                        author_openai_identity != reviewer_openai_identity
+                    )
         else:
             account_is_separate = reviewer["harness"] != meta["harness"]
         if model_is_separate and account_is_separate:
+            if (
+                author_openai_identity is not None
+                and reviewer["harness"] in OPENAI_BACKED_HARNESSES
+            ):
+                # Carried so the executing credential, not the configured
+                # path, has the final word on account separation.
+                reviewer["author_openai_account"] = author_openai_identity
             return reviewer
     if author_home is not None:
         fail(
             "independence inspection found no configured reviewer with both a "
-            "different model and a different account_home from the author "
-            f"(model={meta['model']!r}, account_home={str(author_home)!r})"
+            "different model and a proven-separate account from the author "
+            f"(model={meta['model']!r}, account_home={str(author_home)!r}); "
+            "an OpenAI-backed reviewer must also resolve a different "
+            "executing OpenAI account than the author, because a Codex home "
+            "and a Pi auth slot can carry one account behind two paths"
         )
     fail(
         "independence inspection found no configured reviewer with both a "
@@ -1715,6 +1792,7 @@ def pi_review_result(output: str) -> tuple[dict[str, Any], int]:
     agent_ended = False
     final_text: str | None = None
     final_stop_reason: str | None = None
+    final_error: str | None = None
     for line_number, line in enumerate(output.splitlines(), start=1):
         if not line.strip():
             continue
@@ -1736,11 +1814,15 @@ def pi_review_result(output: str) -> tuple[dict[str, Any], int]:
             turn_count += 1
             final_text = None
             final_stop_reason = None
+            final_error = None
             message = event.get("message")
             if isinstance(message, dict) and message.get("role") == "assistant":
                 stop_reason = message.get("stopReason")
                 if isinstance(stop_reason, str):
                     final_stop_reason = stop_reason
+                error_message = message.get("errorMessage")
+                if isinstance(error_message, str) and error_message.strip():
+                    final_error = error_message.strip()
                 content = message.get("content")
                 if isinstance(content, str):
                     final_text = content
@@ -1766,6 +1848,7 @@ def pi_review_result(output: str) -> tuple[dict[str, Any], int]:
         tool_fail(
             "Pi reviewer final assistant turn did not stop successfully: "
             f"stopReason={final_stop_reason!r}"
+            + (f": {final_error[:500]}" if final_error else "")
         )
     if final_text is None or not final_text.strip():
         tool_fail("Pi reviewer completed without a verdict artifact")
@@ -1830,6 +1913,29 @@ def run_reviewer(
     config["execution_home"] = str(execution_home.resolve())
     config["credential_source"] = credential_source
     config["credential_identifier"] = credential_identifier
+    author_openai_account = config.pop("author_openai_account", "")
+    if author_openai_account:
+        # The credential preflights above have already accepted this account
+        # home, so this is the authoritative separation proof: it reads the
+        # identity of the credential actually bound for execution rather than
+        # trusting the configured directory to name a distinct account.
+        executing_openai_account = openai_account_identity(
+            config["harness"], account_home
+        )
+        if executing_openai_account is None:
+            tool_fail(
+                "executing-account separation is unprovable: reviewer "
+                f"{config['harness']} credential at {credential_identifier} "
+                "exposes no OpenAI account identity to compare against the "
+                "author's"
+            )
+        if executing_openai_account == author_openai_account:
+            tool_fail(
+                "executing-account separation failed: reviewer "
+                f"{config['harness']} account home {account_home} executes as "
+                "the same OpenAI account as the author, so this reviewer is "
+                "not independent despite a different configured path"
+            )
     schema_path = protocol_dir / "review-schema.json"
     schema_value = review_output_schema(
         config["executing_account_home"], config["execution_home"]
@@ -2699,6 +2805,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def assert_supported_interpreter() -> None:
+    """Refuse to gate a merge under a weakened hostile-JSON guarantee.
+
+    The bounded-read layer rejects hostile integers by relying on CPython's
+    integer/string conversion limit, which first exists in 3.11. On an older
+    interpreter that rejection silently stops happening while every banner
+    this tool prints still reads the same, so the floor is enforced here as
+    well as in the shell entrypoint: a direct `python3 fm-crosscheck.py` must
+    not be a way to review without it.
+    """
+
+    minimum = (3, 11)
+    if sys.version_info[:2] < minimum:
+        running = ".".join(str(part) for part in sys.version_info[:3])
+        required = ".".join(str(part) for part in minimum)
+        tool_fail(
+            f"interpreter inspection found Python {running}, but the gate "
+            f"requires {required} or newer because its hostile-JSON defense "
+            "does not exist on older interpreters"
+        )
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if ID_RE.fullmatch(args.task_id) is None:
@@ -2706,6 +2834,11 @@ def main() -> int:
             f"CROSSCHECK TOOL-FAILURE: task id validation rejected {args.task_id!r}",
             file=sys.stderr,
         )
+        return 1
+    try:
+        assert_supported_interpreter()
+    except CrosscheckToolError as exc:
+        print(f"CROSSCHECK TOOL-FAILURE: {exc}", file=sys.stderr)
         return 1
     root = Path(
         environment_value(

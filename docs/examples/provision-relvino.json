@@ -1,0 +1,65 @@
+{
+  "description": "Relvino: pinned Node 20 runtime, uv-managed API virtualenv, and the two native web-app modules whose absence made local validation impossible. Copy to config/provision/relvino.json and adjust the pinned versions to what this host actually has installed.",
+  "kinds": ["ship"],
+  "on_failure": "warn",
+  "timeout_seconds": 2400,
+  "step_timeout_seconds": 900,
+  "path_prepend": ["${HOME}/.nvm/versions/node/v20.20.2/bin"],
+  "components": [
+    {
+      "name": "api",
+      "dir": "services/api",
+      "env": {
+        "AWS_CONFIG_FILE": "/dev/null",
+        "AWS_SHARED_CREDENTIALS_FILE": "/dev/null"
+      },
+      "runtime_checks": [
+        { "name": "uv is installed", "argv": ["uv", "--version"], "timeout_seconds": 60 }
+      ],
+      "fingerprint": {
+        "path": ".venv/.fm-provision-fingerprint",
+        "files": ["requirements.txt", "requirements-test.txt"],
+        "versions": [
+          { "name": "resolved CPython 3.11", "argv": ["uv", "python", "find", "--system", "3.11"], "timeout_seconds": 120 }
+        ]
+      },
+      "reset": [".venv"],
+      "install": [
+        { "name": "create the 3.11 virtualenv", "argv": ["uv", "venv", "--python", "3.11", ".venv"], "timeout_seconds": 300 },
+        { "name": "install runtime and test requirements", "argv": ["uv", "pip", "install", "--python", ".venv/bin/python", "-r", "requirements.txt", "-r", "requirements-test.txt"], "timeout_seconds": 900 },
+        { "name": "dependency consistency", "argv": ["uv", "pip", "check", "--python", ".venv/bin/python"], "timeout_seconds": 120 }
+      ],
+      "probes": [
+        { "name": "interpreter is 3.11", "argv": [".venv/bin/python", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"], "expect": "3.11", "timeout_seconds": 60 },
+        { "name": "pymongo imports promptly", "argv": [".venv/bin/python", "-c", "import pymongo; print(pymongo.version)"], "timeout_seconds": 60 },
+        { "name": "google.genai imports promptly", "argv": [".venv/bin/python", "-c", "from google import genai; print(genai.__file__)"], "timeout_seconds": 60 },
+        { "name": "black is available", "argv": [".venv/bin/black", "--version"], "timeout_seconds": 60 },
+        { "name": "isort is available", "argv": [".venv/bin/isort", "--version-number"], "timeout_seconds": 60 },
+        { "name": "pytest reaches collection", "argv": [".venv/bin/pytest", "tests/", "-m", "not integration and not manual", "--no-cov", "--collect-only", "-q"], "timeout_seconds": 300 }
+      ]
+    },
+    {
+      "name": "web-app",
+      "dir": "apps/web-app",
+      "runtime_checks": [
+        { "name": "node is the pinned runtime", "argv": ["node", "-p", "process.versions.node"], "expect": "20.20.2", "timeout_seconds": 60 },
+        { "name": "npm runs on the pinned runtime", "argv": ["sh", "-c", "npm version --json | jq -r .node"], "expect": "20.20.2", "timeout_seconds": 120 }
+      ],
+      "fingerprint": {
+        "path": "node_modules/.fm-provision-fingerprint",
+        "files": ["package-lock.json"],
+        "versions": [
+          { "name": "node runtime", "argv": ["node", "-p", "process.versions.node"], "timeout_seconds": 60 }
+        ]
+      },
+      "reset": ["node_modules"],
+      "install": [
+        { "name": "npm ci", "argv": ["npm", "ci", "--no-audit", "--no-fund"], "timeout_seconds": 900 }
+      ],
+      "probes": [
+        { "name": "isolated-vm loads for this ABI", "argv": ["node", "-e", "require('isolated-vm'); console.log('isolated-vm ok')"], "timeout_seconds": 120 },
+        { "name": "esbuild transforms", "argv": ["node", "-e", "const e = require('esbuild'); e.transformSync('let x = 1'); console.log('esbuild ' + e.version)"], "timeout_seconds": 120 }
+      ]
+    }
+  ]
+}

@@ -101,3 +101,4 @@
 6200	tests/lavish.test.sh
 160	tests/no-mistakes-required.test.sh
 92	tests/operating-fundamentals.test.sh
+70000	tests/fm-provision.test.sh

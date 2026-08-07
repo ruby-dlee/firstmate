@@ -308,6 +308,86 @@ If no dispatch rule fits, firstmate uses the dispatch profile `default` when pre
 Because the spawn backstop is gated by file presence, any fallback path after a missing match, validation error, or missing `jq` still passes a resolved harness explicitly until the file is fixed or removed.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 
+## Worktree provisioning (config/provision/<project>.json)
+
+A Treehouse lease delivers a clean Git worktree and nothing else.
+The environments a project's own checks need - its virtualenv, its `node_modules`, the interpreter and runtime those were built for - are gitignored, so a fresh lease never carries them, and Treehouse exposes no setup hook.
+Worktree provisioning is Firstmate's answer: `bin/fm-spawn.sh` calls `bin/fm-provision.sh` after the leased worktree is proven isolated and clean and before the endpoint is created, so a crewmate can validate its own work instead of borrowing evidence from a second agent in a different worktree.
+
+Provisioning is opt-in per project and per home.
+`config/provision/<project>.json` is a local, gitignored manifest named after the project directory under `projects/`.
+After spawn retires any prior task evidence, the engine's no-manifest path is a single file-existence check with no environment work, so projects and homes that have not opted in remain unchanged.
+This section is the single owner of the manifest schema; `bin/fm-provision.sh`'s header owns the readiness contract, the exit codes, and the operational guarantees, and `AGENTS.md` keeps only concise operational pointers.
+See [`docs/examples/provision-relvino.json`](examples/provision-relvino.json) for a working manifest to copy and adapt.
+
+```json
+{
+  "description": "<human note>",
+  "kinds": ["ship"],
+  "on_failure": "warn",
+  "timeout_seconds": 1800,
+  "step_timeout_seconds": 600,
+  "path_prepend": ["<absolute directory placed ahead of PATH>"],
+  "components": [
+    {
+      "name": "<component name>",
+      "dir": "<directory relative to the worktree>",
+      "env": { "<NAME>": "<value>" },
+      "path_prepend": ["<absolute directory, this component only>"],
+      "runtime_checks": [
+        { "name": "<label>", "argv": ["<cmd>", "<arg>"], "expect": "<exact expected output>", "timeout_seconds": 60 }
+      ],
+      "fingerprint": {
+        "path": "<file inside the built tree, relative to dir>",
+        "files": ["<input file relative to dir>"],
+        "versions": [ { "name": "<label>", "argv": ["<cmd>", "<arg>"] } ]
+      },
+      "reset": ["<path relative to dir removed before a rebuild>"],
+      "install": [ { "name": "<label>", "argv": ["<cmd>", "<arg>"], "timeout_seconds": 900 } ],
+      "probes": [ { "name": "<label>", "argv": ["<cmd>", "<arg>"], "expect": "<optional exact output>" } ]
+    }
+  ]
+}
+```
+
+`components` is required and every component needs a `name`.
+The remaining component fields are optional, with `dir` defaulting to the worktree root, but every step included in a step list still needs the non-empty `argv` described below.
+`kinds` defaults to `["ship"]`, so scouts are skipped unless the manifest lists them or the spawn passes `--provision`; a scout that only reads code does not need a toolchain.
+A no-manifest or excluded-kind skip publishes no provision record, log, brief section, or `path_prepend`; spawn retires any evidence from a prior attempt before taking an early-return path.
+`on_failure` is `warn` or `block` and defaults to `warn`; the reasoning behind that default lives in `bin/fm-provision.sh`'s header.
+`timeout_seconds` bounds the whole run, including reset deletions, and `step_timeout_seconds` is the per-step default, which a step overrides with its own `timeout_seconds`.
+Every declared step is an object with a required non-empty `argv` argument vector and optional `name`, `expect`, and `timeout_seconds`; using an argument vector makes quoting unambiguous, and `["sh", "-c", "..."]` is the explicit opt-in when a shell is genuinely wanted.
+`${HOME}` and `${WORKTREE}` are the only tokens that expand in command arguments, expected output, environment values, and the manifest's path fields, so a manifest can name a host runtime directory or a path inside the lease without being rewritten per worktree.
+Names and `description` are labels and do not expand, and no value is implicitly evaluated as a shell command.
+
+`path_prepend` directories go ahead of `PATH` for every step, and the manifest-level entries are also handed to `fm-spawn.sh`, which puts them ahead of the crewmate's own exported `PATH`.
+That handover only happens for a `ready` verdict.
+Without it, provisioning could build a project under its pinned runtime while the crewmate's shell still resolved a different one, which is precisely the drift that had npm delegating a native build to an unpinned node.
+A manifest-level `path_prepend` entry must already be a directory and may not contain a space or single quote because it is also transported into that exported `PATH`; component-level entries affect only that component's provisioning steps.
+A component's `env` may not set `PATH`; use `path_prepend`, so a manifest cannot route around its own runtime checks.
+
+`runtime_checks` run before anything is built, so a component is never compiled or installed under the wrong runtime.
+A runtime check or probe with `expect` must print exactly that value; one that prints nothing never satisfies an `expect`.
+The value a step contributes - to `expect` and to a fingerprint - is its last non-empty output line, trimmed.
+
+`fingerprint` is what makes an unchanged environment reusable.
+Reuse requires both a matching digest over the declared `files` and `versions` AND passing `probes`; probes run on every invocation, so a merely existing directory is never assumed healthy, and a fingerprint hit whose probes fail rebuilds instead.
+An absent or unavailable fingerprint forces a rebuild on every applicable invocation.
+Put `fingerprint.path` inside the tree it describes, such as `.venv/` or `node_modules/`, so deleting the environment deletes its claim of health.
+A `versions` command must be independent of the thing it fingerprints; the value is recomputed after a build, and the fingerprint is recorded only when both readings are non-empty and equal.
+If those readings differ, including an empty-to-non-empty transition, the verdict reports the refusal rather than silently rebuilding on every future lease.
+Existing ancestors of `dir`, `reset`, fingerprint input, and `fingerprint.path` paths are resolved before use; symlinks and physical escapes from the worktree are refused before reads, writes, or deletion.
+A component `dir` may be the worktree root, but every reset, fingerprint input, and `fingerprint.path` must be a strict descendant of that component directory.
+This strict-descendant invariant structurally prevents `.`, `sub/..`, an empty value, or an absolute reset from ever resolving to the component root passed to deletion.
+
+Automatic provisioning applies to new or recorded non-Orca ship and scout worktrees; secondmate and Orca launches do not use this seam.
+`bin/fm-spawn.sh` takes `--provision` to force provisioning for one spawn, including for a kind the manifest excludes and rebuilding rather than reusing a matching fingerprint, and `--no-provision` to skip it entirely.
+Both apply to every pair of a batch spawn.
+With `--task`, the verdict is written to `state/<id>.provision` and the full step log to `state/<id>.provision.log`, both removed by teardown.
+Every applicable ready or failed run appends a delimiter-idempotent "Environment readiness" section to the crewmate's brief; a ready section reports component results, while a failure section directs the crewmate to report a blocker instead of substituting evidence it did not produce.
+On failure, spawn also prints a bordered banner with the durable verdict and log paths.
+The legacy `--continue-account` path replaces the brief with its continuation packet after provisioning, so that path retains the durable verdict and any failure banner but not the appended readiness section.
+
 ## Checkout refresh
 
 `bin/fm-checkout-refresh.sh` keeps worktree seed checkouts current independently of Firstmate's own PR lifecycle.

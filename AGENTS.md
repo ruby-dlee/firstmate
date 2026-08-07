@@ -82,6 +82,7 @@ config/claude-crew-model  Claude crewmate/scout model anchor; LOCAL, gitignored,
 config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; firstmate-maintained but human-editable natural-language rules that choose a per-task harness/model/effort profile (section 4). Inherited by secondmate homes
 config/crosscheck-reviewer.json  policy-grade independent reviewer identity for the PR crosscheck merge gate; LOCAL, gitignored; see docs/crosscheck.md
 config/checkout-refresh  optional extra checkout and shallow scan-root directives for this home's safe checkout refresher; LOCAL, gitignored; see docs/configuration.md "Checkout refresh"
+config/provision/<project>.json  optional per-project worktree provisioning manifest; LOCAL, gitignored; absent means a spawn provisions nothing for that project; see docs/configuration.md "Worktree provisioning"
 config/secondmate-harness  harness the PRIMARY uses to launch SECONDMATE agents, optionally followed by a model and effort token on the same line ("<harness> [<model>] [<effort>]"; section 4); LOCAL, gitignored; absent or "default" harness falls back to config/crew-harness then firstmate's own. The primary's own setting; NOT inherited into secondmate homes (secondmates do not spawn secondmates)
 config/account-routing-mode  optional account routing policy (`off`, `observe`, or `enforce`); new ship/scout observe/enforce launches use direct account directories, secondmate launches retain legacy Agent Fleet routing, and existing managed metadata retains legacy Agent Fleet recovery; LOCAL, gitignored; default off; inherited by secondmate homes (docs/configuration.md "Agent Fleet account routing")
 config/secondmate-account-pool  optional Agent Fleet pool the PRIMARY uses for SECONDMATE launches when routing is enabled; LOCAL, gitignored; selection-only and NOT inherited
@@ -461,15 +462,17 @@ bin/fm-spawn.sh <id> --resume-account             # sticky legacy managed recove
 bin/fm-spawn.sh <id> --continue-account           # fresh legacy managed session from verified task-owned continuation state
 bin/fm-spawn.sh <id> projects/<repo> --backend <tmux|herdr|zellij|cmux>   # explicit new-task runtime backend (docs/configuration.md "Runtime backend")
 bin/fm-spawn.sh <id> projects/<repo> --scout     # scout task; records kind=scout in meta
+bin/fm-spawn.sh <id> projects/<repo> --provision|--no-provision   # force or skip worktree provisioning for this spawn
 bin/fm-spawn.sh <id> [<firstmate-home>] --secondmate   # launch a persistent secondmate in its home
 bin/fm-spawn.sh <id1>=projects/<repo1> <id2>=projects/<repo2> [--scout]   # batch: one call, several tasks
 ```
 
-Batch dispatch spawns each `id=repo` pair through the same single-task path, with shared `--scout`, `--harness`, `--model`, `--effort`, `--backend`, `--account-pool`, `--account-profile`, and `--no-account-routing` flags applying to all; one failed pair does not stop the rest, and the batch exits non-zero.
+Batch dispatch spawns each `id=repo` pair through the same single-task path, with shared `--scout`, `--harness`, `--model`, `--effort`, `--backend`, `--account-pool`, `--account-profile`, `--no-account-routing`, and `--provision`/`--no-provision` flags applying to all; one failed pair does not stop the rest, and the batch exits non-zero.
 When `config/crew-dispatch.json` exists, include an explicit resolved harness for every crewmate or scout spawn or batch after consulting the dispatch rules (section 4).
 `bin/fm-spawn.sh`'s header owns the full resolution contract: harness and runtime-backend resolution order, spawn-capable backends and the `codex-app` rejection, verified launch templates, delivery-mode resolution, recorded meta fields, and per-harness turn-end hook installation.
 A backend spawn refusal - a missing dependency, an unauthenticated socket, or a version gate - must be surfaced to the captain as a blocker; never silently retry the spawn on a different backend to work around it.
 For ship and scout tasks, the script asserts the resolved worktree is a genuine isolated worktree distinct from the primary checkout, aborting the spawn otherwise to prevent the worktree tangle of section 8.
+Once that worktree is proven, and before the endpoint is created, `bin/fm-provision.sh` brings it to a proven-ready state from the project's optional `config/provision/<project>.json` manifest so the crewmate can run the project's own checks instead of borrowing evidence from another worktree; with no manifest nothing happens, a failure warns loudly and still launches unless the manifest declares `on_failure: block`, and `docs/configuration.md` "Worktree provisioning" owns the contract.
 For `kind=secondmate`, it launches in the registered or explicit firstmate home with the charter brief as the launch prompt, after the guarded home sync and inheritable-config propagation owned by `secondmate-provisioning`.
 Project worktrees start at detached HEAD on a clean default branch; ship briefs tell the crewmate to create its branch, while scout briefs keep the worktree scratch.
 For a genuinely new ship or scout task, `bin/fm-spawn.sh` asserts an In flight or Queued backlog row before endpoint creation.

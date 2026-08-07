@@ -319,11 +319,16 @@ This section records the operator-facing behavior only.
 Detection is driven by what the worktree declares, never by a project name.
 A directory holding `uv.lock` provisions with `uv sync --frozen`; one holding `requirements.txt` gets a `uv venv` virtual environment plus its `requirements.txt` and any conventional `requirements-dev.txt` / `requirements-test.txt` companions; `package-lock.json` runs `npm ci`; `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile`.
 Python always goes through uv, never pip or venv directly.
+A pip component's fingerprint covers the requirements files it reaches through `-r` / `-c` includes as well as the ones named directly, so editing an included file is a cache miss rather than a false hit.
+For JS, the package manager comes from what the project declares - package.json's corepack `packageManager` field - and only falls back to the lockfile when the project declares nothing; a lockfile's filename is convention, not evidence, and a directory carrying two committed lockfiles would otherwise be resolved by firstmate's opinion rather than by what the project actually installs with.
+A JS component whose manager cannot be determined that way is left unprovisioned and reported rather than installed with a guessed installer.
 A uv workspace has exactly one `uv.lock` and one `.venv` at its root, so it is detected once at that root and synced with `--all-packages`; a plain sync there would install only the root package and leave a member's checks unrunnable.
 An ambient `UV_PROJECT_ENVIRONMENT` pointing anywhere but `.venv` refuses the spawn, because the readiness probe could not then prove the environment it just installed.
 A worktree declaring nothing recognized provisions nothing and spawns exactly as before.
 No interpreter or runtime version is hardcoded: uv resolves the interpreter from the project's own `.python-version` or `requires-python`, and a Node runtime is pinned only when the project declares one unambiguously through `.nvmrc` or a single-major `engines.node`.
-When a Node pin is declared, the highest matching runtime under `$NVM_DIR`, `$FNM_DIR`, `$VOLTA_HOME`, or `~/.asdf` is used for the install and prepended to the crewmate's `PATH`, so the lane validates on the same runtime its native modules were built against.
+When a Node pin is declared, the highest matching runtime under `$NVM_DIR`, `$FNM_DIR`, `$VOLTA_HOME`, or `~/.asdf` is used for the install, so the lane validates on the same runtime its native modules were built against.
+What is prepended to the crewmate's `PATH` is a firstmate-owned directory holding exactly `node`, `npm`, `npx`, and `corepack`, never the version manager's own bin directory: that directory also holds every globally npm-installed CLI for that Node version, so leading with it would silently repoint `claude`, `codex`, `opencode`, `pi`, or `grok` at whichever copy happens to sit under the pinned runtime.
+Resolution order for every command other than the Node toolchain is therefore exactly the host's own.
 
 Provisioning is cached per worktree, per component, in the home's `state/provision-cache/`, never inside the worktree.
 A cache hit requires both a fingerprint match over that component's manifests, installer version, and runtime identity, and a live readiness probe of the installed environment.
@@ -331,26 +336,38 @@ Directory existence alone is never accepted: a pool slot keeps its ignored direc
 A spawn into an already-provisioned, unchanged worktree therefore pays probe cost only, not install cost.
 The provisioned directories are added to the repository's git exclude file when the project does not already ignore them, so provisioning cannot dirty a checkout that the freshness proof and teardown both require to be clean.
 
-The failure contract is one mode: provisioning either succeeds or the spawn is refused.
-There is no launched-but-degraded state, because a lane that cannot validate its own work is the defect this exists to remove.
-Every refusal names its cause and prints the opt-out. The complete set of refusal causes is:
+Besides success there are exactly two outcomes, and which one applies never depends on where in the flow it happened, only on what kind of thing it is.
+
+A **capability gap** is work this provisioner was never able to do here.
+It warns, is recorded in the spawn's `provision=` metadata, and launches the lane with that component unprovisioned.
+Refusing a gap would be strictly worse than the behavior provisioning replaced, which launched every lane unprovisioned, and would brick the spawn on the very monorepos this feature exists to serve.
+The complete set of capability gaps is:
+
+- More provisionable components than `FM_PROVISION_MAX_COMPONENTS`. The components within the budget are still provisioned, in detection order; the rest are reported as `skipped:over-budget`, never dropped silently.
+- A recognized-but-unsupported package manager (`yarn`, `bun`).
+- A JS component whose package manager is neither named by package.json's `packageManager` field nor implied by a single lockfile - including a directory carrying two lockfiles while declaring nothing.
+- A declared Node major that cannot be found under `$NVM_DIR`, `$FNM_DIR`, `$VOLTA_HOME`, or `~/.asdf`, components declaring conflicting Node majors, or a `node` that does not run. The worktree's Python components are still provisioned.
+- A missing installer (`uv`, `npm`, `pnpm`).
+- A host with no bounded-execution mechanism (`timeout`, `gtimeout`, or `perl`), or without `python3`. Neither one can be worked around, so nothing is attempted and the whole worktree is recorded as `unavailable:`.
+
+A **failure** is an attempt that was made and did not complete.
+It refuses the spawn, names its cause, and prints the opt-out, because a lane launched onto a half-built environment is worse than no lane.
+The complete set of refusal causes is:
 
 - A tunable (`FM_PROVISION_SCAN_DEPTH`, `FM_PROVISION_MAX_COMPONENTS`, `FM_PROVISION_INSTALL_TIMEOUT`, `FM_PROVISION_PROBE_TIMEOUT`) that is not a positive integer, including an explicitly empty or zero override.
 - A worktree path that is not a directory, or a dependency scan that fails to traverse it. A scan that succeeds and finds nothing is a clean no-op, not a refusal.
-- More detected components than `FM_PROVISION_MAX_COMPONENTS`.
-- A host with no bounded-execution mechanism (`timeout`, `gtimeout`, or `perl`), or without `python3`, which resolves declared manifests and environment readiness for every component.
-- A recognized-but-unsupported package manager (`yarn`, `bun`).
 - A `UV_PROJECT_ENVIRONMENT` that would place a component's environment somewhere other than its own `.venv`, where it could not be proven.
 - A provisioned directory whose git exclusion cannot be registered before the installer runs.
-- Components declaring conflicting Node majors, or a declared Node runtime that cannot be found.
-- A provisioning cache directory or log that cannot be written.
-- A missing installer (`uv`, `npm`, `pnpm`) or a declared `node` that does not run.
+- A provisioning cache directory, pinned-Node toolchain directory, or log that cannot be written.
 - Declared manifests that cannot be resolved for a component.
 - An install that exceeds its bound, exits non-zero, or is terminated by a signal.
 - An installed environment that is still not usable afterwards: no working interpreter at `.venv/bin/python`, or a readiness probe that cannot capture the environment's state.
 - A fingerprint that cannot be recorded.
 
-Installer output lands in `state/<id>.provision.log`, and the outcome is recorded as `provision=` in `state/<id>.meta`.
+`bin/fm-provision-lib.sh` routes every non-success outcome through one of two functions - `fm_provision_gap` or `fm_provision_fail` - so a capability limit added later cannot become a spawn refusal by accident.
+
+Installer output lands in `state/<id>.provision.log`, which is removed with the rest of the task's state on teardown and on a spawn abort; a refusal prints the tail of that log to stderr, since the rollback deletes the file.
+The outcome is recorded as `provision=` in `state/<id>.meta`: `none` for a worktree that declares nothing, `off` for an opt-out, `unavailable:<reason>` for a host gap, or a comma-separated list of `<manager>:<dir>=installed|cached|skipped:<reason>`.
 Every install and probe is wall-clock bounded; a host with no `timeout`, `gtimeout`, or `perl` refuses rather than risking an unbounded install wedging a spawn.
 
 The local, gitignored `config/worktree-provision` file is the home-level switch: absent or `on` provisions, `off` disables it.
@@ -603,7 +620,7 @@ FM_ACCOUNT_CONTINUATION_ENUMERATION_BYTES=33554432  # maximum bytes used to enum
 FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS=30  # seconds allowed to verify the continuation repository identity
 FM_DISPATCH_AGENT_FLEET_TIMEOUT=120  # optional positive seconds per live-proof pool summary; unset uses FM_ACCOUNT_SELECTION_TIMEOUT, an explicit legacy FM_ACCOUNT_CONTROL_TIMEOUT, then 120
 FM_PROVISION_SCAN_DEPTH=4        # worktree provisioning: manifest search depth below the worktree root; must be a positive integer, and an empty or zero override refuses the spawn rather than falling back to this default
-FM_PROVISION_MAX_COMPONENTS=8    # worktree provisioning: refuse a spawn above this many detected components; must be a positive integer, and an empty or zero override refuses the spawn rather than falling back to this default
+FM_PROVISION_MAX_COMPONENTS=8    # worktree provisioning: provision at most this many components per spawn, reporting the rest as a recorded capability gap; must be a positive integer, and an empty or zero override refuses the spawn rather than falling back to this default
 FM_PROVISION_INSTALL_TIMEOUT=600 # worktree provisioning: seconds allowed per component install; must be a positive integer, and an empty or zero override refuses the spawn rather than removing the bound
 FM_PROVISION_PROBE_TIMEOUT=60    # worktree provisioning: seconds allowed per readiness probe; must be a positive integer, and an empty or zero override refuses the spawn rather than removing the bound
 FM_REPORT_STACK_ROOT=  # machine-global completion-report store override; unset uses $XDG_DATA_HOME/firstmate/report-stack or ~/.local/share/firstmate/report-stack

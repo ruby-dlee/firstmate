@@ -349,6 +349,55 @@ test_a_replaced_interpreter_invalidates_the_cache() {
   pass "an environment whose recorded runtime no longer matches is reprovisioned"
 }
 
+# Regression: the readiness check must accept the real requirements.txt grammar.
+# It runs only in the cache phase, so a line it cannot parse is not a refusal -
+# it is a permanent cache miss that reinstalls on EVERY spawn into a pool slot,
+# silently defeating the caching this exists for.
+test_pip_requirement_directives_do_not_force_a_reinstall_every_spawn() {
+  local case_dir out fakebin
+  case_dir=$(new_case pip-directives none)
+  fakebin=$(case_fakebin "$case_dir")
+  mkdir -p "$case_dir/wt/svc"
+  cat > "$case_dir/wt/svc/requirements.txt" <<'REQ'
+--index-url https://example.invalid/simple
+# the real declaration lives in an included file
+-r base.txt
+six==1.16.0 \
+    --hash=sha256:0000000000000000000000000000000000000000000000000000000000000000
+REQ
+  printf 'pytest[testing]==8.3.4 ; python_version >= "3.9"\n' > "$case_dir/wt/svc/base.txt"
+
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'pip:svc=installed' "cold provisioning failed: $out"
+
+  : > "$case_dir/install.log"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'pip:svc=cached' \
+    "ordinary pip directives forced a reinstall on an unchanged component: $out"
+  assert_no_grep 'uv pip install' "$case_dir/install.log" \
+    "an unchanged component with pip directives still paid install cost"
+
+  # An included file is part of what the component declares, so editing it must
+  # be a cache MISS - reusing the environment there would be a false hit.
+  printf 'pytest[testing]==8.3.4 ; python_version >= "3.10"\n' > "$case_dir/wt/svc/base.txt"
+  : > "$case_dir/install.log"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'pip:svc=installed' \
+    "a changed included requirements file was a false cache hit: $out"
+
+  # A requirement whose package identity cannot be determined cheaply is a miss,
+  # never a hit - and the miss says so instead of looping silently.
+  printf -- '-e .\n' >> "$case_dir/wt/svc/requirements.txt"
+  run_provision "$case_dir" "$case_dir/wt" "$fakebin" >/dev/null
+  : > "$case_dir/install.log"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'pip:svc=installed' \
+    "an unverifiable requirement was reported as cached: $out"
+  assert_contains "$out" 'could not be verified' \
+    "an unverifiable requirement reinstalled without saying why: $out"
+  pass "pip directives and includes are parsed, so an unchanged component stays cached"
+}
+
 # --- library: the failure contract ------------------------------------------
 
 test_a_failing_install_refuses_the_spawn() {
@@ -462,6 +511,7 @@ test_a_directory_name_containing_another_is_not_deduped_away() {
 # through into the parent's tail, where a failed waitpid could report success.
 test_a_bounded_call_to_a_missing_command_is_a_failure() {
   local out
+  # shellcheck disable=SC2016  # the snippet is evaluated inside run_lib's own shell
   out=$(FM_TEST_SNIPPET='
     FM_PROVISION_BOUND_KIND=perl
     if captured=$(fm_provision_run_bounded 5 "$PWD" /nonexistent/fm-provision-probe arg); then
@@ -493,6 +543,7 @@ exit 0
 SH
   chmod +x "$fakebin/python3"
   empty_digest=$(printf '' | shasum -a 256 | awk '{ print $1 }')
+  # shellcheck disable=SC2016  # the snippet is evaluated inside run_lib's own shell
   out=$(FM_TEST_SNIPPET='
     FM_PROVISION_BOUND_KIND=perl
     if captured=$(fm_provision_environment_signature "$FM_TEST_WT" npm web); then
@@ -511,58 +562,126 @@ SH
   pass "an environment signature that captures nothing refuses instead of hashing nothing"
 }
 
-test_a_missing_python3_refuses_the_spawn() {
+# --- library: capability gaps warn, record, and still launch ------------------
+#
+# A CAPABILITY GAP is work provisioning was never able to do here. Refusing one
+# would be strictly worse than the behavior this library replaced, which
+# launched every lane unprovisioned; it would also brick a spawn on the very
+# monorepos this feature exists to serve. Each of these asserts the same three
+# things: the spawn still succeeds, the gap is warned about, and it is recorded.
+
+test_a_host_without_python3_launches_unprovisioned() {
   local case_dir out fakebin lean_path
   case_dir=$(new_case no-python3 both)
   fakebin=$(case_fakebin "$case_dir")
   lean_path=$(make_python3_free_path "$case_dir/nopy")
   out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" PATH="$fakebin:$lean_path")
-  assert_contains "$out" 'rc=1' "a host without python3 did not refuse: $out"
+  assert_contains "$out" 'rc=0' "a host without python3 refused instead of launching: $out"
+  assert_contains "$out" 'summary=unavailable:no-python3' \
+    "a host without python3 did not record the unprovisioned outcome: $out"
   assert_contains "$out" 'python3 is not installed' \
     "a host without python3 did not name the missing interpreter: $out"
   [ ! -s "$case_dir/install.log" ] \
     || fail "a host without python3 still invoked an installer: $(cat "$case_dir/install.log")"
-  pass "a host without python3 refuses before installing rather than failing obscurely later"
+  pass "a host without python3 warns and launches unprovisioned rather than refusing"
 }
 
-test_a_missing_installer_refuses_the_spawn() {
+test_a_host_without_a_bounded_execution_mechanism_launches_unprovisioned() {
+  local case_dir out fakebin
+  case_dir=$(new_case no-bound both)
+  fakebin=$(case_fakebin "$case_dir")
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" FM_TEST_PROVISION_BOUND_KIND=none)
+  assert_contains "$out" 'rc=0' "a host that cannot bound an install refused instead of launching: $out"
+  assert_contains "$out" 'summary=unavailable:no-bounded-execution' \
+    "a host that cannot bound an install did not record the unprovisioned outcome: $out"
+  [ ! -s "$case_dir/install.log" ] \
+    || fail "a host that cannot bound an install still invoked one: $(cat "$case_dir/install.log")"
+  pass "a host with no bounding mechanism runs nothing and launches unprovisioned"
+}
+
+test_a_missing_installer_leaves_that_component_unprovisioned() {
   local case_dir out empty_bin
   case_dir=$(new_case installer-missing python)
   empty_bin="$case_dir/empty-bin"
   mkdir -p "$empty_bin"
   out=$(run_provision "$case_dir" "$case_dir/wt" "$empty_bin")
-  assert_contains "$out" 'rc=1' "a missing installer did not refuse: $out"
-  assert_contains "$out" 'uv is not installed' "the refusal did not name the missing installer: $out"
-  assert_contains "$out" 'never pip or venv' "the refusal did not restate the uv-only python convention: $out"
-  pass "a python project with no uv refuses the spawn instead of launching unprovisioned"
+  assert_contains "$out" 'rc=0' "a missing installer refused instead of launching: $out"
+  assert_contains "$out" 'pip:svc=skipped:missing-installer' \
+    "a missing installer was not recorded against the component: $out"
+  assert_contains "$out" 'never pip or venv' "the warning did not restate the uv-only python convention: $out"
+  pass "a python project with no uv is left unprovisioned and reported, not refused"
 }
 
-test_an_unsupported_package_manager_refuses_the_spawn() {
+test_an_unsupported_package_manager_leaves_that_component_unprovisioned() {
   local case_dir out fakebin
   case_dir=$(new_case unsupported none)
   fakebin=$(case_fakebin "$case_dir")
-  mkdir -p "$case_dir/wt/app"
+  mkdir -p "$case_dir/wt/app" "$case_dir/wt/svc"
   printf '# yarn lockfile v1\n' > "$case_dir/wt/app/yarn.lock"
+  printf 'six==1.16.0\n' > "$case_dir/wt/svc/requirements.txt"
   out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
-  assert_contains "$out" 'rc=1' "an unsupported lockfile did not refuse: $out"
-  assert_contains "$out" 'declares a yarn lockfile' "the refusal did not name the unsupported manager: $out"
-  [ ! -s "$case_dir/install.log" ] \
-    || fail "an unsupported component was detected only after other installs ran: $(cat "$case_dir/install.log")"
-  pass "a recognized but unsupported package manager refuses before anything is installed"
+  assert_contains "$out" 'rc=0' "an unsupported lockfile refused instead of launching: $out"
+  assert_contains "$out" 'yarn:app=skipped:unsupported-manager' \
+    "the unsupported manager was not recorded against the component: $out"
+  assert_contains "$out" 'pip:svc=installed' \
+    "one unsupported component stopped the components that could be provisioned: $out"
+  assert_no_grep 'yarn' "$case_dir/install.log" "an unsupported package manager was invoked anyway"
+  pass "a recognized but unsupported package manager is a recorded gap, not a refusal"
 }
 
-test_too_many_components_refuse_the_spawn() {
+test_over_the_component_budget_provisions_what_it_can_and_reports_the_rest() {
   local case_dir out fakebin i
   case_dir=$(new_case too-many none)
   fakebin=$(case_fakebin "$case_dir")
   for i in 1 2 3; do
     mkdir -p "$case_dir/wt/pkg$i"
-    printf 'six\n' > "$case_dir/wt/pkg$i/requirements.txt"
+    printf 'six==1.16.0\n' > "$case_dir/wt/pkg$i/requirements.txt"
   done
   out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" FM_PROVISION_MAX_COMPONENTS=2)
-  assert_contains "$out" 'rc=1' "an oversized component set did not refuse: $out"
-  assert_contains "$out" 'above the FM_PROVISION_MAX_COMPONENTS limit' "the refusal did not name the limit: $out"
-  pass "more components than the configured limit refuses rather than fanning out installs"
+  assert_contains "$out" 'rc=0' "an oversized component set refused instead of launching: $out"
+  assert_contains "$out" 'pip:pkg1=installed' "the first in-budget component was not provisioned: $out"
+  assert_contains "$out" 'pip:pkg2=installed' "the second in-budget component was not provisioned: $out"
+  assert_contains "$out" 'pip:pkg3=skipped:over-budget' \
+    "the over-budget component was not recorded: $out"
+  assert_contains "$out" 'left 1 of 3 components unprovisioned' \
+    "a partial provisioning was not reported: $out"
+  [ -d "$case_dir/wt/pkg1/.venv" ] && [ -d "$case_dir/wt/pkg2/.venv" ] \
+    || fail "the in-budget components were reported but never actually provisioned"
+  [ ! -d "$case_dir/wt/pkg3/.venv" ] || fail "the over-budget component was installed anyway"
+  pass "a worktree over the component budget provisions what it can and reports what it skipped"
+}
+
+test_a_js_package_manager_is_read_from_what_the_project_declares() {
+  local case_dir out fakebin
+  case_dir=$(new_case js-manager none)
+  fakebin=$(case_fakebin "$case_dir")
+  mkdir -p "$case_dir/wt/web"
+  printf '{"name":"web","private":true,"dependencies":{"is-number":"7.0.0"}}\n' \
+    > "$case_dir/wt/web/package.json"
+  printf '{"lockfileVersion":3}\n' > "$case_dir/wt/web/package-lock.json"
+  printf 'lockfileVersion: 9\n' > "$case_dir/wt/web/pnpm-lock.yaml"
+
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'rc=0' "an undecidable JS component refused instead of launching: $out"
+  assert_contains "$out" 'js:web=skipped:ambiguous-manager' \
+    "a component carrying two lockfiles and declaring nothing was not recorded as a gap: $out"
+  assert_no_grep 'pnpm install' "$case_dir/install.log" \
+    "two committed lockfiles were resolved by filename precedence instead of by evidence"
+  assert_no_grep 'npm ci' "$case_dir/install.log" \
+    "two committed lockfiles were resolved by filename precedence instead of by evidence"
+
+  # The declarative signal decides, and it is not the lockfile this library
+  # would have preferred: package.json names npm while pnpm-lock.yaml is also
+  # committed, exactly the shape that would install the wrong tree.
+  printf '{"name":"web","private":true,"packageManager":"npm@10.9.2","dependencies":{"is-number":"7.0.0"}}\n' \
+    > "$case_dir/wt/web/package.json"
+  : > "$case_dir/install.log"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'npm:web=installed' "the declared package manager was not used: $out"
+  assert_grep 'npm ci' "$case_dir/install.log" "the declared package manager did not install"
+  assert_no_grep 'pnpm install' "$case_dir/install.log" \
+    "a lockfile outvoted the package manager the project declares"
+  pass "the JS package manager comes from what the project declares, not from lockfile precedence"
 }
 
 # --- library: detection is per-project, not hardcoded ------------------------
@@ -681,21 +800,25 @@ test_declared_node_version_is_read_only_when_unambiguous() {
   pass "a Node pin is read from what the project declares, and only when unambiguous"
 }
 
-test_a_declared_but_absent_node_runtime_refuses_the_spawn() {
+test_a_declared_but_absent_node_runtime_leaves_js_unprovisioned() {
   local case_dir out fakebin
-  case_dir=$(new_case node-absent js)
+  case_dir=$(new_case node-absent both)
   fakebin=$(case_fakebin "$case_dir")
   printf '99\n' > "$case_dir/wt/web/.nvmrc"
   out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" NVM_DIR="$case_dir/no-nvm" \
     FNM_DIR="$case_dir/no-fnm" VOLTA_HOME="$case_dir/no-volta" HOME="$case_dir/no-home")
-  assert_contains "$out" 'rc=1' "an unsatisfiable Node pin did not refuse: $out"
-  assert_contains "$out" 'declares Node 99' "the refusal did not name the declared runtime: $out"
-  [ ! -s "$case_dir/install.log" ] || fail "an unsatisfiable Node pin still ran an install"
-  pass "a declared Node runtime that cannot be found refuses before installing"
+  assert_contains "$out" 'rc=0' "an unsatisfiable Node pin refused instead of launching: $out"
+  assert_contains "$out" 'npm:web=skipped:node-not-found' \
+    "an unsatisfiable Node pin was not recorded against the component: $out"
+  assert_contains "$out" 'pip:svc=installed' \
+    "an unsatisfiable Node pin stopped the Python component that could be provisioned: $out"
+  assert_no_grep 'npm ci' "$case_dir/install.log" \
+    "an unsatisfiable Node pin still installed against the wrong runtime"
+  pass "a declared Node runtime that cannot be found leaves the JS components unprovisioned"
 }
 
 test_a_declared_node_runtime_is_resolved_and_exported() {
-  local case_dir out fakebin nvm_bin
+  local case_dir out fakebin nvm_bin prefix
   case_dir=$(new_case node-pinned js)
   fakebin=$(case_fakebin "$case_dir")
   printf '20\n' > "$case_dir/wt/web/.nvmrc"
@@ -721,9 +844,74 @@ SH
       fm_provision_worktree "$2" "$3" "$4" || exit 1
       printf "prefix=%s\n" "$FM_PROVISION_PATH_PREFIX"
     ' _ "$LIB" "$case_dir/wt" "$case_dir/cache" "$case_dir/provision.log" 2>&1)
-  assert_contains "$out" "prefix=$nvm_bin" "the declared Node runtime was not resolved and exported: $out"
   assert_contains "$out" 'pinning Node 20' "the pinned runtime was not surfaced: $out"
+  prefix=${out##*prefix=}
+  prefix=${prefix%%$'\n'*}
+  [ -n "$prefix" ] || fail "the declared Node runtime was not exported for the lane: $out"
+  [ "$(readlink "$prefix/node")" = "$nvm_bin/node" ] \
+    || fail "the exported prefix does not resolve node to the highest installed match: $out"
   pass "a declared Node runtime is resolved to its highest installed match and exported for the lane"
+}
+
+# The PATH prefix must pin the Node toolchain WITHOUT reordering resolution for
+# anything else. A version-manager bin directory also holds every globally
+# npm-installed CLI for that Node version, and the harnesses this repo launches
+# are commonly installed exactly that way, so leading with that directory would
+# silently repoint the command the spawn is about to launch - a failure that
+# would look like anything except a PATH bug.
+test_a_node_pin_does_not_shadow_harness_binaries() {
+  local case_dir fakebin nvm_bin host_bin prefix tool before after base_path
+  case_dir=$(new_case node-pin-shadow js)
+  fakebin=$(case_fakebin "$case_dir")
+  printf '20\n' > "$case_dir/wt/web/.nvmrc"
+  nvm_bin="$case_dir/nvm/versions/node/v20.20.2/bin"
+  host_bin="$case_dir/host-bin"
+  mkdir -p "$nvm_bin" "$host_bin"
+  cat > "$nvm_bin/node" <<'SH'
+#!/usr/bin/env bash
+printf '20.20.2'
+SH
+  chmod +x "$nvm_bin/node"
+  cp "$fakebin/npm" "$nvm_bin/npm"
+  for tool in claude codex opencode pi grok; do
+    printf '#!/usr/bin/env bash\nprintf pinned\n' > "$nvm_bin/$tool"
+    printf '#!/usr/bin/env bash\nprintf host\n' > "$host_bin/$tool"
+    chmod +x "$nvm_bin/$tool" "$host_bin/$tool"
+  done
+  base_path="$fakebin:$host_bin:/usr/bin:/bin"
+
+  # shellcheck disable=SC2016  # the bash -c body expands its own positionals
+  prefix=$(env FM_TEST_INSTALL_LOG="$case_dir/install.log" FM_TEST_NODE_VERSION=23.8.0 \
+    NVM_DIR="$case_dir/nvm" FNM_DIR="$case_dir/no-fnm" VOLTA_HOME="$case_dir/no-volta" \
+    PATH="$base_path" \
+    bash -c '
+      set -u
+      . "$1"
+      fm_provision_worktree "$2" "$3" "$4" >/dev/null 2>&1 || exit 1
+      printf "%s" "$FM_PROVISION_PATH_PREFIX"
+    ' _ "$LIB" "$case_dir/wt" "$case_dir/cache" "$case_dir/provision.log")
+  [ -n "$prefix" ] || fail "provisioning did not export a pinned Node prefix"
+
+  for tool in claude codex opencode pi grok; do
+    # shellcheck disable=SC2016  # the bash -c body expands its own positionals
+    before=$(env PATH="$base_path" bash -c 'command -v "$1"' _ "$tool")
+    # shellcheck disable=SC2016  # the bash -c body expands its own positionals
+    after=$(env PATH="$prefix:$base_path" bash -c 'command -v "$1"' _ "$tool")
+    [ "$before" = "$after" ] \
+      || fail "the Node pin repointed $tool from $before to $after"
+    [ ! -e "$prefix/$tool" ] \
+      || fail "the pinned-runtime PATH prefix carries the harness binary $tool"
+  done
+
+  # shellcheck disable=SC2016  # the bash -c body expands its own positionals
+  for tool in node npm; do
+    after=$(env PATH="$prefix:$base_path" bash -c 'command -v "$1"' _ "$tool")
+    [ "$after" = "$prefix/$tool" ] \
+      || fail "the Node pin did not win for $tool (resolved $after)"
+    [ "$(readlink "$prefix/$tool")" = "$nvm_bin/$tool" ] \
+      || fail "$tool in the pinned prefix does not point at the pinned runtime"
+  done
+  pass "a Node pin wins for the Node toolchain and changes resolution for nothing else"
 }
 
 # --- fm-spawn.sh integration ------------------------------------------------
@@ -845,7 +1033,39 @@ test_spawn_refuses_when_provisioning_fails() {
   assert_not_contains "$out" "spawned $id" "a spawn with failed provisioning still reported success: $out"
   assert_no_grep 'LAUNCH' "$CASE_DIR/install.log" "a lane was launched into an unprovisioned worktree"
   assert_absent "$HOME_DIR/state/$id.meta" "a refused spawn wrote task metadata"
+  assert_contains "$out" 'npm ci exploded' \
+    "the refusal did not surface the installer output it is the only remaining copy of: $out"
+  assert_absent "$HOME_DIR/state/$id.provision.log" \
+    "a refused spawn left its provisioning log behind in the home's state directory"
   pass "provisioning failure refuses the spawn instead of launching a lane that cannot validate"
+}
+
+test_spawn_over_the_component_budget_still_launches() {
+  local record id out status
+  id=provision-spawn-p9
+  record=$(make_spawn_case spawn-over-budget both "$id")
+  read_spawn_case "$record"
+  out=$(FM_PROVISION_MAX_COMPONENTS=1 run_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR")
+  status=$?
+  expect_code 0 "$status" "a worktree over the component budget should still spawn: $out"
+  assert_contains "$out" "spawned $id" "an over-budget worktree did not reach endpoint creation: $out"
+  assert_contains "$out" 'unprovisioned' "the over-budget component was not warned about: $out"
+  assert_grep 'provision=pip:svc=installed,npm:web=skipped:over-budget' "$HOME_DIR/state/$id.meta" \
+    "the partial provisioning outcome was not recorded in task metadata"
+  assert_grep 'uv pip install' "$CASE_DIR/install.log" "the in-budget component was not provisioned"
+  assert_no_grep 'npm ci' "$CASE_DIR/install.log" "the over-budget component was installed anyway"
+  pass "a worktree over the component budget launches, warns, and records what it skipped"
+}
+
+# The provisioning log is a per-task state artifact; teardown owns removing it
+# alongside the rest of the set, and this asserts the two lists cannot drift.
+test_teardown_removes_the_provisioning_log_with_the_task_state() {
+  local missing
+  missing=$(grep -n 'rm -f .*grok-turnend-token' "$ROOT/bin/fm-teardown.sh" \
+    | grep -v 'provision\.log' || true)
+  [ -z "$missing" ] \
+    || fail "a teardown per-task state removal omits the provisioning log: $missing"
+  pass "teardown removes the provisioning log with the rest of the per-task state"
 }
 
 test_spawn_failure_excludes_every_mutated_component() {
@@ -941,6 +1161,7 @@ test_a_changed_manifest_invalidates_the_cache
 test_a_removed_environment_invalidates_a_matching_fingerprint
 test_node_installs_include_validation_dependencies
 test_a_replaced_interpreter_invalidates_the_cache
+test_pip_requirement_directives_do_not_force_a_reinstall_every_spawn
 test_a_failing_install_refuses_the_spawn
 test_a_hung_install_is_bounded
 test_a_signal_killed_install_refuses_the_spawn
@@ -949,18 +1170,23 @@ test_an_unreadable_subtree_refuses_instead_of_becoming_a_noop
 test_a_directory_name_containing_another_is_not_deduped_away
 test_a_bounded_call_to_a_missing_command_is_a_failure
 test_an_environment_signature_that_captures_nothing_refuses
-test_a_missing_python3_refuses_the_spawn
-test_a_missing_installer_refuses_the_spawn
-test_an_unsupported_package_manager_refuses_the_spawn
-test_too_many_components_refuse_the_spawn
+test_a_host_without_python3_launches_unprovisioned
+test_a_host_without_a_bounded_execution_mechanism_launches_unprovisioned
+test_a_missing_installer_leaves_that_component_unprovisioned
+test_an_unsupported_package_manager_leaves_that_component_unprovisioned
+test_over_the_component_budget_provisions_what_it_can_and_reports_the_rest
+test_a_js_package_manager_is_read_from_what_the_project_declares
 test_detection_is_declaration_driven_and_prunes_installed_trees
 test_a_uv_workspace_syncs_every_member
 test_a_uv_workspace_member_manifest_invalidates_the_cache
 test_declared_node_version_is_read_only_when_unambiguous
-test_a_declared_but_absent_node_runtime_refuses_the_spawn
+test_a_declared_but_absent_node_runtime_leaves_js_unprovisioned
 test_a_declared_node_runtime_is_resolved_and_exported
+test_a_node_pin_does_not_shadow_harness_binaries
 test_spawn_provisions_the_worktree_before_creating_the_endpoint
 test_spawn_refuses_when_provisioning_fails
+test_spawn_over_the_component_budget_still_launches
+test_teardown_removes_the_provisioning_log_with_the_task_state
 test_spawn_failure_excludes_every_mutated_component
 test_spawn_refuses_before_install_when_exclusion_cannot_be_registered
 test_provisioning_can_be_opted_out_per_spawn_and_per_home

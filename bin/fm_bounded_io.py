@@ -790,6 +790,22 @@ def _request_anchor_abort(process: subprocess.Popen[bytes]) -> None:
         return
 
 
+def _fold_cleanup_into_primary(
+    primary_error: BaseException | None, cleanup_failure: str
+) -> BoundedIOError | None:
+    # An unverified cleanup must never displace the failure that caused it: only
+    # __str__ is rendered to the operator, so the primary message is folded in and
+    # re-raised as the primary error's own type. Returns None when there is no
+    # primary bounded failure to preserve.
+    if not isinstance(primary_error, BoundedIOError):
+        return None
+    message = f"{primary_error}; cleanup could not be verified: {cleanup_failure}"
+    try:
+        return type(primary_error)(message)
+    except Exception:
+        return BoundedIOError(message)
+
+
 def _reap_anchor(process: subprocess.Popen[bytes], deadline: float) -> bool:
     # Deadline expiry forbids waiting, not observing an already-exited anchor.
     if process.poll() is not None:
@@ -1047,10 +1063,9 @@ def run_bounded(
                 )
         if cleanup_failure:
             cleanup_error = BoundedIOError(str(cleanup_failure))
-            if isinstance(primary_error, BoundedTimeout):
-                raise BoundedTimeout(
-                    f"{primary_error}; cleanup could not be verified: {cleanup_failure}"
-                ) from cleanup_error
+            folded_error = _fold_cleanup_into_primary(primary_error, str(cleanup_failure))
+            if folded_error is not None:
+                raise folded_error from cleanup_error
             if primary_error is not None:
                 raise cleanup_error from primary_error
             raise cleanup_error

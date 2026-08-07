@@ -24,6 +24,7 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+UPDATE="$ROOT/bin/fm-update.sh"
 STALE_UPDATE_COMMIT=8fce09f31a3c1fb28bb891e4b26e97367391b965
 
 # Deterministic, isolated git identity for fixture commits.
@@ -114,7 +115,16 @@ land_crosscheck_ignore_fix() {
   git -C "$w/seed" push -q origin main
 }
 
+# The updater under test is always the one in this working tree; the fixture's
+# own bin/fm-update.sh is a frozen pre-fix snapshot and is only ever driven
+# through run_stale_update / run_artifact_bootstrap_update, which exist to
+# reproduce the one-time bootstrap boundary.
 run_update() {
+  local w=$1
+  FM_ROOT_OVERRIDE="$w/main" FM_HOME="$w/home" "$UPDATE" 2>/dev/null
+}
+
+run_stale_update() {
   local w=$1
   FM_ROOT_OVERRIDE="$w/main" FM_HOME="$w/home" "$w/main/bin/fm-update.sh" 2>/dev/null
 }
@@ -232,7 +242,7 @@ test_crosscheck_artifacts_do_not_strand_stale_homes() {
   target_inventory=$(git -C "$w/seed" ls-tree -r --name-only "$target" | LC_ALL=C sort)
   printf 'preserve existing file\n' > "$w/home/state/.fm-update-bootstrap-excludes"
 
-  stale_out=$(run_update "$w")
+  stale_out=$(run_stale_update "$w")
   assert_contains "$stale_out" "firstmate: skipped: dirty working tree" \
     "stale firstmate entrypoint reproduced its pre-fix rejection"
   assert_contains "$stale_out" "secondmate sm1: skipped: dirty working tree" \
@@ -312,16 +322,24 @@ test_crosscheck_tolerance_does_not_hide_unrelated_dirt() {
 }
 
 test_repo_gitignores_every_documented_local_config() {
-  local label root_path sibling_path config_path ignored_tracked
-  while IFS= read -r config_path; do
-    [ -n "$config_path" ] || continue
-    git -C "$ROOT" check-ignore --quiet --no-index "$config_path" \
-      || fail "documented local path is not ignored: $config_path"
-  done < <(
+  local label root_path sibling_path config_path ignored_tracked documented_configs
+  # An empty extraction means the AGENTS.md headings moved, not that every
+  # documented path is ignored: a silently empty loop would report coverage the
+  # audit no longer has.
+  documented_configs=$(
     sed -n '/^## 2\. Layout and state/,/^## 3\. Session start/p' "$ROOT/AGENTS.md" \
       | grep -Eo 'config/[A-Za-z0-9_.-]+' \
       | LC_ALL=C sort -u
   )
+  [ -n "$documented_configs" ] \
+    || fail "no documented config/ paths were extracted from AGENTS.md; the audit covers nothing"
+  while IFS= read -r config_path; do
+    [ -n "$config_path" ] || continue
+    git -C "$ROOT" check-ignore --quiet --no-index "$config_path" \
+      || fail "documented local path is not ignored: $config_path"
+  done <<EOF
+$documented_configs
+EOF
   while IFS='|' read -r label root_path sibling_path; do
     git -C "$ROOT" check-ignore --quiet --no-index "$root_path" \
       || fail "$label root artifact is not ignored: $root_path"

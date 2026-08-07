@@ -17,12 +17,15 @@
 #   than the behavior this library replaced, which launched every lane
 #   unprovisioned; it would also brick the spawn on projects this feature
 #   exists to serve. The gaps are: more provisionable components than the
-#   budget allows, a recognized-but-unsupported package manager (yarn, bun), a
-#   JS component whose package manager cannot be determined from what the
-#   project declares, a declared runtime that cannot be found or does not run,
-#   a missing installer, a pinned-Node toolchain directory that cannot be
-#   established, a declaration reaching more requirements files than this
-#   library traverses, and a host missing a tool provisioning itself needs
+#   FM_PROVISION_MAX_COMPONENTS budget allows, a recognized-but-unsupported
+#   package manager (yarn, bun), a JS component whose package manager is neither
+#   named by package.json's packageManager field nor implied by a single
+#   lockfile, a declared Node major that cannot be found under the standard
+#   version-manager directories, components declaring conflicting Node majors,
+#   a node that does not run, a missing installer (uv, npm, pnpm), a
+#   pinned-Node toolchain directory that cannot be established under the
+#   provisioning cache, a pip declaration reaching more requirements files than
+#   this library traverses, and a host missing a tool provisioning itself needs
 #   (python3, or any bounded-execution mechanism). Every gap is named on stderr,
 #   in the provisioning log, in the summary the caller records as task metadata,
 #   and - the only one of the four the LANE itself can read - in
@@ -33,14 +36,17 @@
 #   firstmate home layout.
 #   A FAILURE is an attempt that was made and did not complete. It REFUSES the
 #   spawn and names both the cause and the opt-out, because a lane launched on
-#   a half-built environment is worse than no lane. The failures are: an
-#   install that fails or exceeds its bound, a readiness probe that fails after
-#   installing, a git exclusion that cannot be registered, a dependency scan
-#   that cannot traverse, a tunable that is not a positive integer, an
-#   environment signature that is empty or unprovable, a UV_PROJECT_ENVIRONMENT
-#   that would put an environment where the probe cannot see it, a cache
-#   directory, log, or record that cannot be written, and a previous lease's
-#   report that cannot be removed from the worktree.
+#   a half-built environment is worse than no lane. The failures are: a tunable
+#   that is not a positive integer, a worktree path that is not a directory, a
+#   dependency scan that cannot traverse it, a UV_PROJECT_ENVIRONMENT that would
+#   put an environment where the probe cannot see it, a component that declares
+#   no ignored install directory to protect, a git exclusion that cannot be
+#   registered, declared manifests that cannot be resolved for a component, an
+#   install that fails, exceeds its bound, or is killed by a signal, an install
+#   that leaves no working interpreter, a readiness probe that fails after
+#   installing, an environment signature that is empty or unprovable, and a
+#   cache directory, log, record, or previous lease's report that cannot be
+#   written or removed.
 #   fm_provision_gap and fm_provision_fail are those two decision points, and
 #   every non-success outcome goes through exactly one of them, so a capability
 #   limit added later cannot become a spawn refusal by accident.
@@ -71,8 +77,10 @@
 # manager cannot be determined, are capability gaps: they are left
 # unprovisioned and reported, never installed with a guessed installer.
 #
-# CACHING. Every component carries a fingerprint over its own manifests plus
-# the resolved installer and runtime identity. A cache hit needs BOTH a
+# CACHING. Every component carries a fingerprint over its own manifests - the
+# installer's configuration files (.npmrc, uv.toml) among them, because they
+# decide what the installer actually produces without any lockfile changing -
+# plus the resolved installer and runtime identity. A cache hit needs BOTH a
 # matching fingerprint AND a live readiness probe of the installed environment,
 # because a pool slot's ignored directories survive leases but a previous agent
 # may have deleted or broken them - directory existence alone is not readiness
@@ -220,12 +228,16 @@ fm_provision_list_has() {  # <needle> [element...]
 # The JS package manager a directory DECLARES, through package.json's corepack
 # `packageManager` field. This is evidence; a lockfile's filename is only
 # convention. Empty when the project declares nothing, which is also what a
-# host without python3 sees - such a host provisions nothing anyway.
+# host without python3 and a host with no bounding mechanism see - both
+# provision nothing anyway, and the parse goes through fm_provision_run_bounded
+# like every other one so the second of those decisions is reached before this
+# reads a project-controlled file at all.
 fm_provision_declared_js_manager() {  # <component-dir>
   local dir=$1 raw=''
   [ -f "$dir/package.json" ] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
-  raw=$(python3 -c '
+  raw=$(fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
+    python3 - "$dir/package.json" 2>/dev/null <<'PY'
 import json, re, sys
 try:
     with open(sys.argv[1], "rb") as fh:
@@ -240,20 +252,22 @@ if not isinstance(declared, str):
 name = declared.strip().split("@", 1)[0].strip().lower()
 if re.fullmatch(r"[a-z][a-z0-9-]*", name):
     sys.stdout.write(name)
-' "$dir/package.json" 2>/dev/null) || raw=
+PY
+  ) || raw=
   printf '%s' "$raw"
 }
 
-# Emit "<ecosystem> <relative-dir>" per detected component, deterministically
-# ordered. A directory can yield at most one Python and one JS component. The
-# "js" pseudo-ecosystem means a JS component whose package manager could not be
-# determined; the caller records it as a capability gap rather than guessing an
-# installer the project does not use.
+# The component directories a worktree declares, deduplicated and
+# deterministically ordered, relative to the worktree ("." for its root). Only
+# `find` runs here. Deciding WHICH ecosystem a directory carries reads the
+# project's own package.json through python3, so that step is separate: the
+# caller has to be able to decide this host can bound nothing - and therefore
+# provisions nothing at all - before any such read is reached.
 # Returns non-zero when the traversal itself failed, which is a refusal and not
 # the same thing as a traversal that succeeded and found nothing.
-fm_provision_detect() {  # <worktree>
-  local wt=$1 file dir rel found manifest_output declared
-  local -a manifests=() js_managers=()
+fm_provision_scan() {  # <worktree>
+  local wt=$1 file dir rel found manifest_output
+  local -a manifests=() dirs=()
   manifest_output=$(
     set -o pipefail
     find "$wt" -maxdepth "$FM_PROVISION_SCAN_DEPTH" \
@@ -272,7 +286,6 @@ fm_provision_detect() {  # <worktree>
   done <<< "$manifest_output"
   [ "${#manifests[@]}" -gt 0 ] || return 0
 
-  local -a dirs=()
   for file in "${manifests[@]}"; do
     dir=$(dirname "$file")
     rel=${dir#"$wt"}
@@ -288,6 +301,34 @@ fm_provision_detect() {  # <worktree>
     [ "$found" = 0 ] || continue
     dirs+=("$rel")
   done
+  [ "${#dirs[@]}" -gt 0 ] || return 0
+  printf '%s\n' "${dirs[@]}"
+}
+
+# Emit "<ecosystem> <relative-dir>" per detected component, deterministically
+# ordered. A directory can yield at most one Python and one JS component. The
+# "js" pseudo-ecosystem means a JS component whose package manager could not be
+# determined; the caller records it as a capability gap rather than guessing an
+# installer the project does not use.
+# The component directories can be passed in by a caller that already scanned -
+# fm_provision_worktree does, so its host-prerequisite decision lands before
+# anything here reads a project-controlled file - and are scanned for otherwise.
+# Returns non-zero when the traversal itself failed, which is a refusal and not
+# the same thing as a traversal that succeeded and found nothing.
+fm_provision_detect() {  # <worktree> [<relative-dir>...]
+  local wt=$1 dir rel scanned declared
+  shift
+  local -a dirs=() js_managers=()
+  if [ "$#" -gt 0 ]; then
+    dirs=("$@")
+  else
+    scanned=$(fm_provision_scan "$wt") || return 1
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      dirs+=("$rel")
+    done <<< "$scanned"
+  fi
+  [ "${#dirs[@]}" -gt 0 ] || return 0
 
   for rel in "${dirs[@]}"; do
     dir=$wt/$rel
@@ -627,6 +668,12 @@ fm_provision_pip_included_files() {  # <component-dir>
 
 # The files whose content defines a component's fingerprint. Only files that
 # exist are listed, so an added or removed optional manifest is itself a change.
+# The installer's own configuration is part of that declaration: .npmrc decides
+# the registry npm and pnpm install from, what they omit, and pnpm's
+# node-linker, and uv.toml carries uv configuration that pyproject.toml does
+# not. A component whose config changed with no lockfile change installs a
+# different tree, so leaving them out would make the next lease a confidently
+# wrong cache HIT against a tree built under superseded configuration.
 # Returns 1 when the declaration could not be read at all and 2 when it is
 # larger than this library will traverse, so the caller can refuse the first and
 # leave the component unprovisioned for the second.
@@ -636,14 +683,14 @@ fm_provision_manifests() {  # <worktree> <ecosystem> <relative-dir>
   [ "$rel" != . ] || dir=$wt
   local -a names=()
   case "$eco" in
-    uv) names=(uv.lock pyproject.toml .python-version) ;;
+    uv) names=(uv.lock uv.toml pyproject.toml .python-version) ;;
     pip)
       names=(requirements.txt requirements-dev.txt requirements-test.txt
              requirements_dev.txt requirements_test.txt
-             constraints.txt pyproject.toml .python-version)
+             constraints.txt uv.toml pyproject.toml .python-version)
       ;;
-    npm) names=(package-lock.json package.json .nvmrc) ;;
-    pnpm) names=(pnpm-lock.yaml package.json pnpm-workspace.yaml .nvmrc) ;;
+    npm) names=(package-lock.json package.json .npmrc .nvmrc) ;;
+    pnpm) names=(pnpm-lock.yaml package.json pnpm-workspace.yaml .npmrc .nvmrc) ;;
     *) return 0 ;;
   esac
   for name in "${names[@]}"; do
@@ -693,7 +740,8 @@ fm_provision_declared_node_major() {  # <component-dir>
   if [ -f "$dir/.nvmrc" ]; then
     raw=$(tr -d '[:space:]' < "$dir/.nvmrc")
   elif [ -f "$dir/package.json" ]; then
-    raw=$(python3 -c '
+    raw=$(fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
+      python3 - "$dir/package.json" 2>/dev/null <<'PY'
 import json, sys
 try:
     with open(sys.argv[1], "rb") as fh:
@@ -707,7 +755,8 @@ if isinstance(engines, dict):
     node = engines.get("node")
     if isinstance(node, str):
         sys.stdout.write(node.strip())
-' "$dir/package.json" 2>/dev/null) || raw=
+PY
+    ) || raw=
   fi
   [ -n "$raw" ] || return 0
   case "$raw" in
@@ -1296,10 +1345,10 @@ fm_provision_validate_tunables() {
 # before falling back to detection order.
 fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
   local wt=$1 cache=$2 log=$3 needs=${4:-}
-  local eco rel dir line detected record fingerprint recorded runtime installer environment artifact
+  local eco rel dir line scanned detected record fingerprint recorded runtime installer environment artifact
   local declared_major pinned_major='' pinned_bin='' pinned_prefix='' rc=0 state
-  local index=0 provisionable=0 budgeted=0 skipped=0 unprovisioned=''
-  local -a components=() states=() results=() order=()
+  local index=0 provisionable=0 budgeted=0 skipped=0 unprovisioned='' unavailable=''
+  local -a components=() states=() results=() order=() dirs=()
 
   FM_PROVISION_SUMMARY=none
   FM_PROVISION_PATH_PREFIX=
@@ -1312,7 +1361,46 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
   }
   fm_provision_resolve_bound_kind
 
-  detected=$(fm_provision_detect "$wt") || {
+  scanned=$(fm_provision_scan "$wt") || {
+    fm_provision_fail "cannot scan $wt for dependency manifests"
+    return 1
+  }
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    dirs+=("$line")
+  done <<< "$scanned"
+
+  if [ "${#dirs[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  # Opened before anything is decided, so every capability gap below lands in the
+  # log as well as on stderr. A worktree that declares nothing returns above and
+  # never creates one.
+  mkdir -p "$cache" || { fm_provision_fail "cannot create the provisioning cache directory $cache"; return 1; }
+  : >> "$log" || { fm_provision_fail "cannot write the provisioning log $log"; return 1; }
+  printf '=== provisioning %s at %s ===\n' "$wt" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$log"
+
+  # Host prerequisites, decided before a single component is classified, because
+  # classification itself reads the project's package.json through python3 under
+  # a bound: a host that has neither must reach this verdict first, or something
+  # would have run on it after all. Provisioning was never going to work here, so
+  # it warns and launches unprovisioned; refusing would make every spawn on such
+  # a host impossible while buying nothing, and nothing has been mutated yet.
+  # Classification still runs afterwards - it degrades to lockfile precedence
+  # without running anything - so the lane's report can still name each component
+  # it is not getting rather than only the host verdict.
+  if [ "$FM_PROVISION_BOUND_KIND" = none ]; then
+    unavailable=no-bounded-execution
+    fm_provision_unavailable "$log" no-bounded-execution \
+      "no bounded-execution mechanism (timeout, gtimeout, or perl) is available, so no install could be prevented from wedging the spawn"
+  elif ! command -v python3 >/dev/null 2>&1; then
+    unavailable=no-python3
+    fm_provision_unavailable "$log" no-python3 \
+      "python3 is not installed, so no component's declared manifests or installed-environment readiness could be resolved"
+  fi
+
+  detected=$(fm_provision_detect "$wt" "${dirs[@]}") || {
     fm_provision_fail "cannot scan $wt for dependency manifests"
     return 1
   }
@@ -1325,27 +1413,8 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
   if [ "${#components[@]}" -eq 0 ]; then
     return 0
   fi
-
-  # Opened before anything is decided, so every capability gap below lands in the
-  # log as well as on stderr. A worktree that declares nothing returns above and
-  # never creates one.
-  mkdir -p "$cache" || { fm_provision_fail "cannot create the provisioning cache directory $cache"; return 1; }
-  : >> "$log" || { fm_provision_fail "cannot write the provisioning log $log"; return 1; }
-  printf '=== provisioning %s at %s ===\n' "$wt" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$log"
-
-  # Host prerequisites. Provisioning was never going to work here, so it warns
-  # and launches unprovisioned; refusing would make every spawn on such a host
-  # impossible while buying nothing, and nothing has been mutated yet.
-  if [ "$FM_PROVISION_BOUND_KIND" = none ]; then
-    fm_provision_unavailable "$log" no-bounded-execution \
-      "no bounded-execution mechanism (timeout, gtimeout, or perl) is available, so no install could be prevented from wedging the spawn"
-    fm_provision_report_unavailable "$wt" "$log" no-bounded-execution
-    return 0
-  fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    fm_provision_unavailable "$log" no-python3 \
-      "python3 is not installed, so no component's declared manifests or installed-environment readiness could be resolved"
-    fm_provision_report_unavailable "$wt" "$log" no-python3
+  if [ -n "$unavailable" ]; then
+    fm_provision_report_unavailable "$wt" "$log" "$unavailable"
     return 0
   fi
 

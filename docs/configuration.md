@@ -336,6 +336,8 @@ A directory that exists but does not validate - a binary removed from underneath
 
 Provisioning is cached per worktree, per component, in the home's `state/provision-cache/`, never inside the worktree.
 A cache hit requires both a fingerprint match over that component's manifests, installer version, and runtime identity, and a live readiness probe of the installed environment.
+The installer's own configuration counts as a manifest: `.npmrc` for npm and pnpm, `uv.toml` for uv and pip.
+Both change what the installer produces without any lockfile changing, so a registry switch or a `node-linker` change is a cache miss rather than a confidently wrong hit against a tree built under the superseded configuration.
 Directory existence alone is never accepted: a pool slot keeps its ignored directories across leases, but a previous agent may have deleted or broken them.
 A spawn into an already-provisioned, unchanged worktree therefore pays probe cost only, not install cost.
 The provisioned directories are added to the repository's git exclude file when the project does not already ignore them, so provisioning cannot dirty a checkout that the freshness proof and teardown both require to be clean.
@@ -354,7 +356,7 @@ The complete set of capability gaps is:
 - A missing installer (`uv`, `npm`, `pnpm`).
 - A pinned-Node toolchain directory that cannot be established under the provisioning cache, reported as `skipped:node-prefix-unavailable`. A stale one is stepped over rather than rewritten, so this can only mean the cache itself is unwritable.
 - A pip component whose `-r` / `-c` include graph reaches more requirements files than the library traverses. No fingerprint over the traversed prefix could cover what the component installs, and a fingerprint that cannot be stood behind would become a false cache hit, so the component is reported as `skipped:unresolved-manifests`.
-- A host with no bounded-execution mechanism (`timeout`, `gtimeout`, or `perl`), or without `python3`. Neither one can be worked around, so nothing is attempted and the whole worktree is recorded as `unavailable:`.
+- A host with no bounded-execution mechanism (`timeout`, `gtimeout`, or `perl`), or without `python3`. Neither one can be worked around, so nothing is attempted and the whole worktree is recorded as `unavailable:`. That verdict is reached before any component is classified, because classification itself reads the project's own `package.json` through `python3` under a bound; the components are still enumerated afterwards, without running anything, so the lane's report names each one it is not getting rather than only the host verdict.
 
 A **failure** is an attempt that was made and did not complete.
 It refuses the spawn, names its cause, and prints the opt-out, because a lane launched onto a half-built environment is worse than no lane.
@@ -363,7 +365,7 @@ The complete set of refusal causes is:
 - A tunable (`FM_PROVISION_SCAN_DEPTH`, `FM_PROVISION_MAX_COMPONENTS`, `FM_PROVISION_INSTALL_TIMEOUT`, `FM_PROVISION_PROBE_TIMEOUT`) that is not a positive integer, including an explicitly empty or zero override.
 - A worktree path that is not a directory, or a dependency scan that fails to traverse it. A scan that succeeds and finds nothing is a clean no-op, not a refusal.
 - A `UV_PROJECT_ENVIRONMENT` that would place a component's environment somewhere other than its own `.venv`, where it could not be proven.
-- A provisioned directory whose git exclusion cannot be registered before the installer runs.
+- A component that declares no ignored install directory to protect, or a provisioned directory whose git exclusion cannot be registered before the installer runs.
 - A provisioning cache directory or log that cannot be written.
 - A previous lease's `.fm-provisioning.md` that cannot be removed from the worktree. A report that cannot be written is only a missing diagnostic; one left over from another task is a wrong one.
 - Declared manifests that cannot be read for a component, including a requirements include that cannot be opened.

@@ -291,6 +291,46 @@ test_a_changed_manifest_invalidates_the_cache() {
   pass "a changed dependency manifest invalidates the cache"
 }
 
+# The installer's own configuration decides what the install produces - .npmrc
+# carries the registry, omissions, and pnpm's node-linker; uv.toml carries uv
+# configuration pyproject.toml does not - and neither is a lockfile. A project
+# that commits such a change with no lockfile change would otherwise re-lease
+# the same pool slot, match the old fingerprint, pass the readiness probe
+# against a byte-identical tree, and hand the lane an environment built under
+# the superseded configuration: a confidently wrong cache HIT.
+test_changed_installer_configuration_invalidates_the_cache() {
+  local case_dir out fakebin
+  case_dir=$(new_case installer-config both)
+  fakebin=$(case_fakebin "$case_dir")
+  printf 'registry=https://registry.npmjs.org/\n' > "$case_dir/wt/web/.npmrc"
+  printf 'concurrent-builds = 4\n' > "$case_dir/wt/svc/uv.toml"
+  run_provision "$case_dir" "$case_dir/wt" "$fakebin" >/dev/null
+
+  : > "$case_dir/install.log"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'npm:web=cached' "unchanged installer configuration was not a cache hit: $out"
+  assert_contains "$out" 'pip:svc=cached' "unchanged installer configuration was not a cache hit: $out"
+
+  printf 'registry=https://registry.example.com/\n' > "$case_dir/wt/web/.npmrc"
+  : > "$case_dir/install.log"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'npm:web=installed' "a changed .npmrc did not invalidate the cache: $out"
+  assert_grep 'npm ci' "$case_dir/install.log" "a changed .npmrc did not trigger a reinstall"
+  assert_contains "$out" 'pip:svc=cached' "a changed .npmrc reinstalled an untouched python component: $out"
+
+  printf 'concurrent-builds = 1\n' > "$case_dir/wt/svc/uv.toml"
+  : > "$case_dir/install.log"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'pip:svc=installed' "a changed uv.toml did not invalidate the cache: $out"
+  assert_grep 'uv pip install' "$case_dir/install.log" "a changed uv.toml did not trigger a reinstall"
+
+  rm -f "$case_dir/wt/web/.npmrc"
+  : > "$case_dir/install.log"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'npm:web=installed' "a removed .npmrc did not invalidate the cache: $out"
+  pass "installer configuration that changes what is installed invalidates the cache"
+}
+
 test_a_removed_environment_invalidates_a_matching_fingerprint() {
   local case_dir out fakebin
   case_dir=$(new_case env-removed both)
@@ -1523,6 +1563,7 @@ test_spawn_into_an_undeclared_project_is_unchanged() {
 test_worktree_declaring_nothing_is_a_clean_noop
 test_first_spawn_installs_and_second_reuses_the_cache
 test_a_changed_manifest_invalidates_the_cache
+test_changed_installer_configuration_invalidates_the_cache
 test_a_removed_environment_invalidates_a_matching_fingerprint
 test_node_installs_include_validation_dependencies
 test_a_replaced_interpreter_invalidates_the_cache

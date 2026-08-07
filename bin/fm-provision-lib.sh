@@ -104,16 +104,20 @@ fm_provision_bound_kind() {
 }
 
 # Run a command with cwd and a hard wall-clock bound, preserving its exit code.
-# Exit 124 means the bound expired; exit 125 means this host cannot bound at all.
-# A signal-terminated child is reported as 128 + signal, so an installer the OOM
-# killer reaps can never be mistaken for a successful install.
+# Exit 124 means the bound expired; exit 125 means this host cannot bound at all;
+# exit 126 means the child's status could not be determined; exit 127 means the
+# command could not be executed. A signal-terminated child is reported as
+# 128 + signal, so an installer the OOM killer reaps can never be mistaken for a
+# successful install. The perl child exits explicitly when exec fails rather than
+# falling through into the parent's tail, so a missing command can never be
+# reported as a success that produced no output.
 fm_provision_run_bounded() {  # <seconds> <cwd> <cmd> [args...]
   local secs=$1 cwd=$2
   shift 2
   case "$(fm_provision_bound_kind)" in
     timeout)  ( cd "$cwd" && timeout "$secs" "$@" ) ;;
     gtimeout) ( cd "$cwd" && gtimeout "$secs" "$@" ) ;;
-    perl)     ( cd "$cwd" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' "$secs" "$@" ) ;;
+    perl)     ( cd "$cwd" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; my $reaped = waitpid $pid, 0; my $status = $?; exit 126 if $reaped != $pid; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' "$secs" "$@" ) ;;
     *)        return 125 ;;
   esac
 }
@@ -521,6 +525,11 @@ fm_provision_record_write() {  # <record> <eco> <rel> <fingerprint> <runtime> <i
 
 # --- readiness probes -------------------------------------------------------
 
+# A digest over the installed environment's observable state, or non-zero when
+# that state could not be captured. Empty state refuses rather than hashing:
+# the digest of nothing is a well-formed digest, so returning it would let a
+# caller treat "captured nothing" as "captured this", which is exactly how an
+# unprovisioned component would come to report itself cached.
 fm_provision_environment_signature() {  # <worktree> <eco> <rel>
   local wt=$1 eco=$2 rel=$3 dir python state
   dir=$wt/$rel
@@ -589,6 +598,7 @@ print("\n".join(rows))
       ;;
     *) return 1 ;;
   esac
+  [ -n "$state" ] || return 1
   printf '%s' "$state" | fm_provision_sha256
 }
 
@@ -810,6 +820,10 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log>
   fi
   if [ "$(fm_provision_bound_kind)" = none ]; then
     fm_provision_fail "no bounded-execution mechanism (timeout, gtimeout, or perl) is available, so an install could not be prevented from wedging the spawn"
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    fm_provision_fail "python3 is not installed, so declared manifests and installed-environment readiness could not be resolved for any component"
     return 1
   fi
 

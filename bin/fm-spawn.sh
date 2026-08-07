@@ -101,11 +101,14 @@
 #   no recognized manifest is a no-op. Otherwise there are exactly two
 #   non-success outcomes, and that library's header enumerates both: a
 #   CAPABILITY GAP - a component this provisioner was never able to provision -
-#   warns, is recorded in the spawn's provision= metadata, and launches the lane
-#   with that component unprovisioned; a FAILURE - an attempt that was made and
-#   did not complete - refuses the spawn, because a lane launched onto a
-#   half-built environment is worse than no lane. --no-provision skips
-#   provisioning for one spawn, and config/worktree-provision=off for the home.
+#   is named on stderr and in the provisioning log, is recorded in the spawn's
+#   provision= metadata, and launches the lane with that component
+#   unprovisioned; a FAILURE - an attempt that was made and did not complete -
+#   refuses the spawn, because a lane launched onto a half-built environment is
+#   worse than no lane. The task's brief is passed in so an over-budget worktree
+#   spends its component budget on what the task actually names.
+#   --no-provision skips provisioning for one spawn, and
+#   config/worktree-provision=off for the home.
 #   Ship/scout spawns refresh the primary checkout before Treehouse acquisition,
 #   surface dirty pool entries, and durably lease one available worktree before
 #   creating the endpoint. They refuse to create that endpoint unless the leased
@@ -3317,7 +3320,7 @@ spawn_provision_worktree() {
   else
     ORIGINAL_PROVISION_LOG_PRESENT=0
   fi
-  if ! fm_provision_worktree "$WT" "$STATE/provision-cache" "$PROVISION_LOG"; then
+  if ! fm_provision_worktree "$WT" "$STATE/provision-cache" "$PROVISION_LOG" "$DATA/$ID/brief.md"; then
     if [ -s "$PROVISION_LOG" ]; then
       echo "error: last 40 lines of the provisioning log for $ID (not retained past this refused spawn):" >&2
       tail -n 40 "$PROVISION_LOG" >&2

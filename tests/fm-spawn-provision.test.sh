@@ -190,7 +190,7 @@ run_provision() {
       . "$1"
       [ -z "${FM_TEST_PROVISION_BOUND_KIND:-}" ] \
         || FM_PROVISION_BOUND_KIND=$FM_TEST_PROVISION_BOUND_KIND
-      if fm_provision_worktree "$2" "$3" "$4"; then
+      if fm_provision_worktree "$2" "$3" "$4" "${FM_TEST_NEEDS:-}"; then
         printf "rc=0 summary=%s\n" "$FM_PROVISION_SUMMARY"
       else
         printf "rc=%s summary=%s\n" "$?" "$FM_PROVISION_SUMMARY"
@@ -643,12 +643,74 @@ test_over_the_component_budget_provisions_what_it_can_and_reports_the_rest() {
   assert_contains "$out" 'pip:pkg2=installed' "the second in-budget component was not provisioned: $out"
   assert_contains "$out" 'pip:pkg3=skipped:over-budget' \
     "the over-budget component was not recorded: $out"
-  assert_contains "$out" 'left 1 of 3 components unprovisioned' \
-    "a partial provisioning was not reported: $out"
+  assert_contains "$out" 'left 1 of 3 components UNPROVISIONED: pkg3' \
+    "a partial provisioning did not NAME what it skipped: $out"
+  assert_grep 'UNPROVISIONED: pkg3' "$case_dir/provision.log" \
+    "the skipped component was named on stderr but not in the provisioning log"
   [ -d "$case_dir/wt/pkg1/.venv" ] && [ -d "$case_dir/wt/pkg2/.venv" ] \
     || fail "the in-budget components were reported but never actually provisioned"
   [ ! -d "$case_dir/wt/pkg3/.venv" ] || fail "the over-budget component was installed anyway"
   pass "a worktree over the component budget provisions what it can and reports what it skipped"
+}
+
+# The budget must not be spent alphabetically. The task's own brief is the one
+# path signal a spawn actually has, so a component the brief names is provisioned
+# even when detection order would have pushed it past the budget.
+test_the_component_budget_prefers_what_the_task_brief_names() {
+  local case_dir out fakebin i
+  case_dir=$(new_case budget-need none)
+  fakebin=$(case_fakebin "$case_dir")
+  for i in 1 2 3; do
+    mkdir -p "$case_dir/wt/pkg$i"
+    printf 'six==1.16.0\n' > "$case_dir/wt/pkg$i/requirements.txt"
+  done
+  printf 'Fix the flaky collection failure in pkg3 before shipping.\n' > "$case_dir/brief.md"
+
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" \
+    FM_PROVISION_MAX_COMPONENTS=1 FM_TEST_NEEDS="$case_dir/brief.md")
+  assert_contains "$out" 'rc=0' "a needs-directed budget refused instead of launching: $out"
+  assert_contains "$out" 'pip:pkg3=installed' \
+    "the component the brief names was not the one provisioned: $out"
+  assert_contains "$out" 'pip:pkg1=skipped:over-budget' \
+    "an unmentioned component consumed the budget: $out"
+  assert_contains "$out" 'pip:pkg2=skipped:over-budget' \
+    "an unmentioned component consumed the budget: $out"
+  [ -d "$case_dir/wt/pkg3/.venv" ] || fail "the needed component was reported but never provisioned"
+  [ ! -d "$case_dir/wt/pkg1/.venv" ] || fail "an unmentioned component was installed over the budget"
+  pass "the component budget is spent on what the task names before detection order"
+}
+
+# A fingerprint the library cannot stand behind must never become a cache hit: a
+# declaration reaching past the traversal cap is left unprovisioned rather than
+# fingerprinted over the prefix it managed to read.
+test_a_requirements_graph_too_large_to_traverse_is_not_fingerprinted() {
+  local case_dir out fakebin i next record
+  case_dir=$(new_case pip-truncated none)
+  fakebin=$(case_fakebin "$case_dir")
+  mkdir -p "$case_dir/wt/svc"
+  printf -- '-r req-1.txt\n' > "$case_dir/wt/svc/requirements.txt"
+  i=1
+  while [ "$i" -le 70 ]; do
+    next=$((i + 1))
+    if [ "$i" -eq 70 ]; then
+      printf 'six==1.16.0\n' > "$case_dir/wt/svc/req-$i.txt"
+    else
+      printf -- '-r req-%s.txt\n' "$next" > "$case_dir/wt/svc/req-$i.txt"
+    fi
+    i=$next
+  done
+
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'rc=0' "an untraversable declaration refused instead of launching: $out"
+  assert_contains "$out" 'pip:svc=skipped:unresolved-manifests' \
+    "an untraversable declaration was not recorded as a capability gap: $out"
+  assert_no_grep 'uv pip install' "$case_dir/install.log" \
+    "a component whose declaration could not be traversed was installed anyway"
+  for record in "$case_dir"/cache/*.record; do
+    [ -e "$record" ] || continue
+    fail "a component that could not be fingerprinted still recorded one: $record"
+  done
+  pass "a requirements graph past the traversal cap is a gap, never a fingerprint over a prefix"
 }
 
 test_a_js_package_manager_is_read_from_what_the_project_declares() {
@@ -914,6 +976,91 @@ SH
   pass "a Node pin wins for the Node toolchain and changes resolution for nothing else"
 }
 
+# The pinned prefix is SHARED - one directory per pinned runtime per home - and a
+# launched lane keeps it first on its PATH for the lane's whole life. A spawn
+# that rebuilt it in place would unlink a running crewmate's `node` mid-run,
+# which surfaces as `command not found` with nothing pointing at provisioning.
+# This holds lane A's resolved prefix and watches it CONTINUOUSLY while a second
+# spawn provisions the same pin, so the assertion covers the window rather than
+# only the end state.
+test_a_pinned_node_prefix_is_never_rebuilt_under_a_running_lane() {
+  local case_dir fakebin nvm_bin prefix_a link_before link_after ident_before ident_after
+  local watcher_pid base_path out leftover
+  case_dir=$(new_case node-pin-race js)
+  fakebin=$(case_fakebin "$case_dir")
+  make_worktree "$case_dir/wt-b" js
+  printf '20\n' > "$case_dir/wt/web/.nvmrc"
+  printf '20\n' > "$case_dir/wt-b/web/.nvmrc"
+  nvm_bin="$case_dir/nvm/versions/node/v20.20.2/bin"
+  mkdir -p "$nvm_bin"
+  cat > "$nvm_bin/node" <<'SH'
+#!/usr/bin/env bash
+printf '20.20.2'
+SH
+  chmod +x "$nvm_bin/node"
+  cp "$fakebin/npm" "$nvm_bin/npm"
+  base_path="$fakebin:/usr/bin:/bin"
+
+  # shellcheck disable=SC2016  # the bash -c body expands its own positionals
+  prefix_a=$(env FM_TEST_INSTALL_LOG="$case_dir/install.log" FM_TEST_NODE_VERSION=23.8.0 \
+    NVM_DIR="$case_dir/nvm" FNM_DIR="$case_dir/no-fnm" VOLTA_HOME="$case_dir/no-volta" \
+    PATH="$base_path" \
+    bash -c '
+      set -u
+      . "$1"
+      fm_provision_worktree "$2" "$3" "$4" >/dev/null 2>&1 || exit 1
+      printf "%s" "$FM_PROVISION_PATH_PREFIX"
+    ' _ "$LIB" "$case_dir/wt" "$case_dir/cache" "$case_dir/provision.log")
+  [ -n "$prefix_a" ] || fail "the first spawn did not publish a pinned Node prefix"
+  link_before=$(readlink "$prefix_a/node")
+  ident_before=$(python3 -c 'import os,sys; s=os.lstat(sys.argv[1]); print("%d:%d" % (s.st_dev, s.st_ino))' "$prefix_a/node")
+
+  : > "$case_dir/misses"
+  rm -f "$case_dir/watcher.stop"
+  (
+    while [ ! -f "$case_dir/watcher.stop" ]; do
+      if [ ! -x "$prefix_a/node" ]; then
+        printf 'the pinned prefix had no executable node\n' >> "$case_dir/misses"
+      fi
+      # shellcheck disable=SC2016  # the bash -c body expands its own positionals
+      resolved=$(env PATH="$prefix_a:$base_path" bash -c 'command -v node' 2>/dev/null) || resolved=
+      if [ "$resolved" != "$prefix_a/node" ]; then
+        printf 'node resolved to %s\n' "${resolved:-<nothing>}" >> "$case_dir/misses"
+      fi
+    done
+  ) &
+  watcher_pid=$!
+
+  # shellcheck disable=SC2016  # the bash -c body expands its own positionals
+  out=$(env FM_TEST_INSTALL_LOG="$case_dir/install.log" FM_TEST_NODE_VERSION=23.8.0 \
+    NVM_DIR="$case_dir/nvm" FNM_DIR="$case_dir/no-fnm" VOLTA_HOME="$case_dir/no-volta" \
+    PATH="$base_path" \
+    bash -c '
+      set -u
+      . "$1"
+      fm_provision_worktree "$2" "$3" "$4" || exit 1
+      printf "prefix=%s\n" "$FM_PROVISION_PATH_PREFIX"
+    ' _ "$LIB" "$case_dir/wt-b" "$case_dir/cache" "$case_dir/provision-b.log" 2>&1)
+  : > "$case_dir/watcher.stop"
+  wait "$watcher_pid"
+
+  assert_contains "$out" "prefix=$prefix_a" \
+    "the second spawn did not resolve to the same shared pinned prefix: $out"
+  [ ! -s "$case_dir/misses" ] \
+    || fail "a running lane observed its pinned node disappear while a second spawn provisioned: $(cat "$case_dir/misses")"
+  link_after=$(readlink "$prefix_a/node")
+  ident_after=$(python3 -c 'import os,sys; s=os.lstat(sys.argv[1]); print("%d:%d" % (s.st_dev, s.st_ino))' "$prefix_a/node")
+  [ "$link_after" = "$link_before" ] \
+    || fail "the shared pinned prefix was repointed under a running lane ($link_before -> $link_after)"
+  [ "$ident_after" = "$ident_before" ] \
+    || fail "the shared pinned prefix's node was unlinked and recreated under a running lane"
+  for leftover in "$(dirname "$prefix_a")"/.build.*; do
+    [ -e "$leftover" ] || continue
+    fail "a partially built pinned prefix was left behind: $leftover"
+  done
+  pass "a shared pinned Node prefix is published once and never rebuilt under a running lane"
+}
+
 # --- fm-spawn.sh integration ------------------------------------------------
 
 make_spawn_fakebin() {
@@ -1052,6 +1199,8 @@ test_spawn_over_the_component_budget_still_launches() {
   assert_contains "$out" 'unprovisioned' "the over-budget component was not warned about: $out"
   assert_grep 'provision=pip:svc=installed,npm:web=skipped:over-budget' "$HOME_DIR/state/$id.meta" \
     "the partial provisioning outcome was not recorded in task metadata"
+  assert_grep 'UNPROVISIONED: web' "$HOME_DIR/state/$id.provision.log" \
+    "the skipped component was not named in the provisioning log the lane can read"
   assert_grep 'uv pip install' "$CASE_DIR/install.log" "the in-budget component was not provisioned"
   assert_no_grep 'npm ci' "$CASE_DIR/install.log" "the over-budget component was installed anyway"
   pass "a worktree over the component budget launches, warns, and records what it skipped"
@@ -1175,6 +1324,8 @@ test_a_host_without_a_bounded_execution_mechanism_launches_unprovisioned
 test_a_missing_installer_leaves_that_component_unprovisioned
 test_an_unsupported_package_manager_leaves_that_component_unprovisioned
 test_over_the_component_budget_provisions_what_it_can_and_reports_the_rest
+test_the_component_budget_prefers_what_the_task_brief_names
+test_a_requirements_graph_too_large_to_traverse_is_not_fingerprinted
 test_a_js_package_manager_is_read_from_what_the_project_declares
 test_detection_is_declaration_driven_and_prunes_installed_trees
 test_a_uv_workspace_syncs_every_member
@@ -1183,6 +1334,7 @@ test_declared_node_version_is_read_only_when_unambiguous
 test_a_declared_but_absent_node_runtime_leaves_js_unprovisioned
 test_a_declared_node_runtime_is_resolved_and_exported
 test_a_node_pin_does_not_shadow_harness_binaries
+test_a_pinned_node_prefix_is_never_rebuilt_under_a_running_lane
 test_spawn_provisions_the_worktree_before_creating_the_endpoint
 test_spawn_refuses_when_provisioning_fails
 test_spawn_over_the_component_budget_still_launches

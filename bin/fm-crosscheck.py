@@ -1671,7 +1671,7 @@ def reviewer_max_capture() -> int:
     return value
 
 
-def reviewer_binary(name: str, default: str, label: str) -> str:
+def reviewer_binary_path(name: str, default: str, label: str) -> Path:
     command = environment_value(name, default)
     if "/" in command:
         candidate = Path(command)
@@ -1682,7 +1682,32 @@ def reviewer_binary(name: str, default: str, label: str) -> str:
         tool_fail(
             f"{label} executable inspection found no runnable {name}={command!r}"
         )
-    return str(candidate.resolve())
+    return candidate
+
+
+def reviewer_binary(name: str, default: str, label: str) -> str:
+    return str(reviewer_binary_path(name, default, label).resolve())
+
+
+def pi_reviewer_command() -> list[str]:
+    """Resolve Pi and its env-selected Node runtime before reviewer launch."""
+
+    entrypoint = reviewer_binary_path("FM_CROSSCHECK_PI_BIN", "pi", "Pi reviewer")
+    resolved_entrypoint = entrypoint.resolve()
+    try:
+        with resolved_entrypoint.open("rb") as handle:
+            shebang = handle.readline(256).decode("utf-8", errors="replace").strip()
+    except OSError as exc:
+        tool_fail(f"Pi reviewer executable inspection failed at {entrypoint}: {exc}")
+
+    if shebang == "#!/usr/bin/env node":
+        sibling_node = entrypoint.parent / "node"
+        node_default = str(sibling_node) if sibling_node.is_file() else "node"
+        node = reviewer_binary(
+            "FM_CROSSCHECK_PI_NODE_BIN", node_default, "Pi Node runtime"
+        )
+        return [node, str(resolved_entrypoint)]
+    return [str(resolved_entrypoint)]
 
 
 def pi_review_result(output: str) -> tuple[dict[str, Any], int]:
@@ -1759,8 +1784,8 @@ def run_reviewer(
     ledger: dict[str, Any],
     config: dict[str, str],
 ) -> Any:
-    pi_binary = (
-        reviewer_binary("FM_CROSSCHECK_PI_BIN", "pi", "Pi reviewer")
+    pi_command = (
+        pi_reviewer_command()
         if config["harness"] == "pi"
         else None
     )
@@ -1864,7 +1889,7 @@ def run_reviewer(
         )
 
     if config["harness"] == "pi":
-        require(pi_binary is not None, "Pi reviewer binary was not resolved")
+        require(pi_command is not None, "Pi reviewer command was not resolved")
         environment["PI_CODING_AGENT_DIR"] = config["account_home"]
         environment["PI_CODING_AGENT_SESSION_DIR"] = str(
             protocol_dir / "pi-sessions"
@@ -1877,7 +1902,7 @@ def run_reviewer(
             + json.dumps(schema_value, separators=(",", ":"))
         )
         arguments = [
-            pi_binary,
+            *pi_command,
             "--mode",
             "json",
             "--provider",

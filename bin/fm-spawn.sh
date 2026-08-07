@@ -101,8 +101,10 @@
 #   no recognized manifest is a no-op. Otherwise there are exactly two
 #   non-success outcomes, and that library's header enumerates both: a
 #   CAPABILITY GAP - a component this provisioner was never able to provision -
-#   is named on stderr and in the provisioning log, is recorded in the spawn's
-#   provision= metadata, and launches the lane with that component
+#   is named on stderr, in the provisioning log, in the spawn's provision=
+#   metadata, and in the git-excluded .fm-provisioning.md at the root of the
+#   leased worktree - the only one of those the crewmate can read - and launches
+#   the lane with that component
 #   unprovisioned; a FAILURE - an attempt that was made and did not complete -
 #   refuses the spawn, because a lane launched onto a half-built environment is
 #   worse than no lane. The task's brief is passed in so an over-budget worktree

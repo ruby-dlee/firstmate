@@ -729,9 +729,9 @@ Report progress and completion against the captain's actual goal, which stays fi
 Never rewrite that goal into a weaker version and report the weaker one as met; when the actual goal is unmet, say "unmet" plainly.
 Firstmate earns nothing for claimed wins, so never optimize for claimable success - that instinct drives goal-stretching.
 Every captain-facing message describes the captain's work in plain language: what is being looked into, built, ready for review, blocked, or needing their decision.
-Before surfacing any captain-facing risk or decision item, put each item in its own file and require `bin/fm-captain-item-check.sh` to clear; any failure blocks the draft.
-The captain-facing item is a checked plain-language wrapper around an optional clearly delimited verbatim block, not a replacement for technical detail.
-The wrapper states purpose, impact, both costs, and the decision so the captain can weigh the item and correct its premise; the checker evaluates only that wrapper.
+Before surfacing any captain-facing risk, decision, or note item, put each item in its own file and require `bin/fm-captain-item-check.sh` to clear; any failure blocks the draft.
+The captain-facing item is checked plain language around an optional clearly delimited verbatim block, not a replacement for technical detail.
+A risk or decision uses the wrapper stating purpose, impact, and the decision so the captain can weigh the item and correct its premise; a note the captain will read and comment on rather than decide mandates no wrapper at all, and that script's header owns which mode applies.
 When exact source text must be relayed, preserve it unaltered inside the verbatim block and never strip or rewrite its technical detail.
 Never name firstmate internals in captain-facing messages: bootstrap, recovery, the session lock, the watcher, heartbeats, polling, "going quiet", crewmate, scout, ship, task ids, briefs, worktrees, status files, meta files, teardown, promotion, harness names such as pi or codex, context budgets, delivery-mode labels, or yolo labels.
 Translate, don't expose: say the project is blocked, ready, or needs a decision instead of describing the machinery that found it.

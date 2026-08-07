@@ -694,6 +694,29 @@ test_the_lane_can_read_an_unavailable_host_gap() {
   pass "a host capability gap is reported to the lane, not only to the operator"
 }
 
+# Whoever held the pool slot before had write access to the worktree, and the
+# report path is git-excluded, so nothing in the cleanliness proof would notice
+# a symlink planted there. Writing the report must replace that path, never
+# follow it into a file outside the worktree.
+test_a_symlinked_report_path_is_replaced_not_followed() {
+  local case_dir out fakebin report victim
+  case_dir=$(new_case lane-report-symlink both)
+  fakebin=$(case_fakebin "$case_dir")
+  victim="$case_dir/victim.txt"
+  printf 'precious\n' > "$victim"
+  report="$case_dir/wt/.fm-provisioning.md"
+  ln -s "$victim" "$report"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" FM_TEST_PROVISION_BOUND_KIND=none)
+  assert_contains "$out" 'rc=0' "a host gap refused instead of launching: $out"
+  [ ! -L "$report" ] || fail "the report path is still a symlink, so the next write follows it too"
+  [ -f "$report" ] || fail "no report was written in place of the symlink: $out"
+  assert_grep 'NOT provisioned: no-bounded-execution' "$report" \
+    "the replacement report does not carry this run's outcome"
+  [ "$(cat "$victim")" = precious ] \
+    || fail "the report was written THROUGH the symlink, truncating its target"
+  pass "a symlink planted at the report path is replaced rather than written through"
+}
+
 # The budget must not be spent alphabetically. The task's own brief is the one
 # path signal a spawn actually has, so a component the brief names is provisioned
 # even when detection order would have pushed it past the budget.
@@ -1418,6 +1441,58 @@ test_provisioning_can_be_opted_out_per_spawn_and_per_home() {
   pass "provisioning is opt-out per spawn and per home, and the choice is recorded"
 }
 
+# A pool slot outlives the lease that used it: the report is git-excluded, so no
+# cleanliness proof sees it and neither teardown nor `treehouse return` removes
+# it. The leases that provision nothing - both opt-outs, and a worktree that
+# declares nothing - are exactly the ones that would otherwise inherit the
+# previous task's report and read it as a description of their own worktree.
+test_a_stale_lane_report_never_survives_into_the_next_lease() {
+  local record id out status report exclude_file case_dir fakebin
+  plant_stale_report() {  # <worktree>
+    printf '# firstmate worktree provisioning\n\nfirstmate provisioned this worktree (%s) before launching this lane.\n\n## provisioned\n\n- npm in web - installed\n' \
+      "$1" > "$1/.fm-provisioning.md"
+  }
+
+  id=provision-spawn-p11
+  record=$(make_spawn_case spawn-stale-flag-off both "$id")
+  read_spawn_case "$record"
+  # Excluded exactly as a previous lease's provisioning would have left it,
+  # so the stale report is invisible to the worktree cleanliness proof.
+  exclude_file=$(git -C "$WORKTREE_DIR" rev-parse --git-path info/exclude)
+  printf '/.fm-provisioning.md\n' >> "$exclude_file"
+  plant_stale_report "$WORKTREE_DIR"
+  out=$(run_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR" --no-provision)
+  status=$?
+  expect_code 0 "$status" "--no-provision should still spawn: $out"
+  assert_absent "$WORKTREE_DIR/.fm-provisioning.md" \
+    "a --no-provision lease inherited the previous task's provisioning report"
+
+  id=provision-spawn-p12
+  record=$(make_spawn_case spawn-stale-config-off both "$id")
+  read_spawn_case "$record"
+  exclude_file=$(git -C "$WORKTREE_DIR" rev-parse --git-path info/exclude)
+  printf '/.fm-provisioning.md\n' >> "$exclude_file"
+  plant_stale_report "$WORKTREE_DIR"
+  printf 'off\n' > "$HOME_DIR/config/worktree-provision"
+  out=$(run_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR")
+  status=$?
+  expect_code 0 "$status" "config/worktree-provision=off should still spawn: $out"
+  assert_absent "$WORKTREE_DIR/.fm-provisioning.md" \
+    "a home-level opt-out lease inherited the previous task's provisioning report"
+
+  # The library's own no-op return, reached before any report would be written.
+  case_dir=$(new_case stale-report-noop none)
+  fakebin=$(case_fakebin "$case_dir")
+  report="$case_dir/wt/.fm-provisioning.md"
+  plant_stale_report "$case_dir/wt"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'rc=0' "a worktree declaring nothing refused: $out"
+  assert_absent "$report" "a worktree declaring nothing kept a previous lease's report"
+
+  unset -f plant_stale_report
+  pass "a lease that provisions nothing clears the previous task's report instead of inheriting it"
+}
+
 test_an_unreadable_provisioning_setting_refuses_the_spawn() {
   local record id out status
   id=provision-spawn-p5
@@ -1467,6 +1542,7 @@ test_an_unsupported_package_manager_leaves_that_component_unprovisioned
 test_over_the_component_budget_provisions_what_it_can_and_reports_the_rest
 test_the_component_budget_prefers_what_the_task_brief_names
 test_the_lane_can_read_an_unavailable_host_gap
+test_a_symlinked_report_path_is_replaced_not_followed
 test_a_requirements_graph_too_large_to_traverse_is_not_fingerprinted
 test_a_js_package_manager_is_read_from_what_the_project_declares
 test_detection_is_declaration_driven_and_prunes_installed_trees
@@ -1487,6 +1563,7 @@ test_teardown_removes_the_provisioning_log_with_the_task_state
 test_spawn_failure_excludes_every_mutated_component
 test_spawn_refuses_before_install_when_exclusion_cannot_be_registered
 test_provisioning_can_be_opted_out_per_spawn_and_per_home
+test_a_stale_lane_report_never_survives_into_the_next_lease
 test_an_unreadable_provisioning_setting_refuses_the_spawn
 test_spawn_into_an_undeclared_project_is_unchanged
 

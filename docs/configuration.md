@@ -365,6 +365,7 @@ The complete set of refusal causes is:
 - A `UV_PROJECT_ENVIRONMENT` that would place a component's environment somewhere other than its own `.venv`, where it could not be proven.
 - A provisioned directory whose git exclusion cannot be registered before the installer runs.
 - A provisioning cache directory or log that cannot be written.
+- A previous lease's `.fm-provisioning.md` that cannot be removed from the worktree. A report that cannot be written is only a missing diagnostic; one left over from another task is a wrong one.
 - Declared manifests that cannot be read for a component, including a requirements include that cannot be opened.
 - An install that exceeds its bound, exits non-zero, or is terminated by a signal.
 - An installed environment that is still not usable afterwards: no working interpreter at `.venv/bin/python`, or a readiness probe that cannot capture the environment's state.
@@ -375,6 +376,7 @@ The complete set of refusal causes is:
 Installer output lands in `state/<id>.provision.log`, which is removed with the rest of the task's state on teardown and on a spawn abort; a refusal prints the tail of that log to stderr, since the rollback deletes the file.
 Those surfaces all live in the firstmate home, where the crewmate cannot read them, so provisioning also writes `.fm-provisioning.md` at the root of the leased worktree naming every component and what happened to it.
 That file is registered with the repository's git exclude file before it is written, so it cannot dirty the checkout; if that registration is impossible the report is skipped with a warning rather than written, and a report that cannot be filed never refuses a spawn.
+Because it is excluded, nothing else removes it, and a pool slot outlives the lease that used it: every spawn deletes whatever occupies that path before it decides anything - including a spawn that opts out, which is exactly the lease that would otherwise inherit a stale report - and the path is unlinked rather than truncated, so a symlink left there is replaced instead of followed.
 The outcome is recorded as `provision=` in `state/<id>.meta`: `none` for a worktree that declares nothing, `off` for an opt-out, `unavailable:<reason>` for a host gap, or a comma-separated list of `<manager>:<dir>=installed|cached|skipped:<reason>`.
 Every install and probe is wall-clock bounded; a host with no `timeout`, `gtimeout`, or `perl` runs nothing at all and the lane launches unprovisioned, rather than risking an unbounded install wedging a spawn.
 

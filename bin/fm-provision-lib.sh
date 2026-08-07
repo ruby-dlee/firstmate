@@ -27,8 +27,10 @@
 #   in the provisioning log, in the summary the caller records as task metadata,
 #   and - the only one of the four the LANE itself can read - in
 #   .fm-provisioning.md at the root of the worktree, git-excluded before it is
-#   written. What was NOT provisioned is as loud as what was, on a surface the
-#   crewmate reaches without knowing the firstmate home layout.
+#   written and removed before every lease decides anything, so a pool slot
+#   never carries one task's report into the next. What was NOT provisioned is
+#   as loud as what was, on a surface the crewmate reaches without knowing the
+#   firstmate home layout.
 #   A FAILURE is an attempt that was made and did not complete. It REFUSES the
 #   spawn and names both the cause and the opt-out, because a lane launched on
 #   a half-built environment is worse than no lane. The failures are: an
@@ -36,8 +38,9 @@
 #   installing, a git exclusion that cannot be registered, a dependency scan
 #   that cannot traverse, a tunable that is not a positive integer, an
 #   environment signature that is empty or unprovable, a UV_PROJECT_ENVIRONMENT
-#   that would put an environment where the probe cannot see it, and a cache
-#   directory, log, or record that cannot be written.
+#   that would put an environment where the probe cannot see it, a cache
+#   directory, log, or record that cannot be written, and a previous lease's
+#   report that cannot be removed from the worktree.
 #   fm_provision_gap and fm_provision_fail are those two decision points, and
 #   every non-success outcome goes through exactly one of them, so a capability
 #   limit added later cannot become a spawn refusal by accident.
@@ -122,18 +125,20 @@ fm_provision_sha256() {  # reads stdin, prints the hex digest
   fi
 }
 
-# Which bounding mechanism this host has. Resolved once; "none" provisions
-# nothing, because nothing can be run under a bound this host does not have.
+# Which bounding mechanism this host has. The probe resolves into
+# FM_PROVISION_BOUND_KIND in the caller's own shell and callers read that
+# variable, so the resolution really is paid once per run - a resolver called
+# through a command substitution would assign in a subshell and be re-probed by
+# every caller after it. "none" provisions nothing, because nothing can be run
+# under a bound this host does not have.
 FM_PROVISION_BOUND_KIND=
-fm_provision_bound_kind() {
-  if [ -z "$FM_PROVISION_BOUND_KIND" ]; then
-    if command -v timeout >/dev/null 2>&1; then FM_PROVISION_BOUND_KIND=timeout
-    elif command -v gtimeout >/dev/null 2>&1; then FM_PROVISION_BOUND_KIND=gtimeout
-    elif command -v perl >/dev/null 2>&1; then FM_PROVISION_BOUND_KIND=perl
-    else FM_PROVISION_BOUND_KIND=none
-    fi
+fm_provision_resolve_bound_kind() {
+  [ -z "$FM_PROVISION_BOUND_KIND" ] || return 0
+  if command -v timeout >/dev/null 2>&1; then FM_PROVISION_BOUND_KIND=timeout
+  elif command -v gtimeout >/dev/null 2>&1; then FM_PROVISION_BOUND_KIND=gtimeout
+  elif command -v perl >/dev/null 2>&1; then FM_PROVISION_BOUND_KIND=perl
+  else FM_PROVISION_BOUND_KIND=none
   fi
-  printf '%s' "$FM_PROVISION_BOUND_KIND"
 }
 
 # Run a command with cwd and a hard wall-clock bound, preserving its exit code.
@@ -147,7 +152,8 @@ fm_provision_bound_kind() {
 fm_provision_run_bounded() {  # <seconds> <cwd> <cmd> [args...]
   local secs=$1 cwd=$2
   shift 2
-  case "$(fm_provision_bound_kind)" in
+  fm_provision_resolve_bound_kind
+  case "$FM_PROVISION_BOUND_KIND" in
     timeout)  ( cd "$cwd" && timeout "$secs" "$@" ) ;;
     gtimeout) ( cd "$cwd" && gtimeout "$secs" "$@" ) ;;
     perl)     ( cd "$cwd" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; my $reaped = waitpid $pid, 0; my $status = $?; exit 126 if $reaped != $pid; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' "$secs" "$@" ) ;;
@@ -1165,6 +1171,23 @@ fm_provision_unavailable() {  # <log> <reason-token> <message>
 # and a diagnostic that cannot be filed is never a reason to refuse a spawn.
 FM_PROVISION_REPORT_NAME=.fm-provisioning.md
 
+# The report describes ONE lease, but a pool slot outlives the task that leased
+# it: nothing in teardown or `treehouse return` deletes an excluded file, so a
+# report left by the previous task would be read by the next lane as its own.
+# Every entry into provisioning therefore clears it before deciding anything -
+# including the entries that decide to provision nothing at all, which are
+# exactly the ones that would otherwise inherit a stale "provisioned" claim.
+# Removed rather than truncated, so a symlink planted at the path by whoever
+# held the slot before is replaced instead of written through. Silent on
+# failure: each caller decides whether a path it cannot clear is a refusal or a
+# report it declines to write.
+fm_provision_clear_report() {  # <worktree>
+  local wt=$1 report
+  report="$wt/$FM_PROVISION_REPORT_NAME"
+  rm -f "$report" 2>/dev/null || :
+  [ ! -e "$report" ] && [ ! -L "$report" ]
+}
+
 fm_provision_report_body() {  # <worktree>; reads "<eco>\t<rel>\t<state>" on stdin
   local wt=$1 eco rel state
   local -a done_lines=() gap_lines=()
@@ -1207,6 +1230,11 @@ fm_provision_write_report() {  # <worktree> <log> <body>
     && ! fm_provision_register_exclude "/$FM_PROVISION_REPORT_NAME"; then
     fm_provision_announce "$log" \
       "warning: cannot keep /$FM_PROVISION_REPORT_NAME out of git's view, so this lane gets no in-worktree provisioning report"
+    return 0
+  fi
+  if ! fm_provision_clear_report "$wt"; then
+    fm_provision_announce "$log" \
+      "warning: cannot replace what already occupies $report, so this lane gets no in-worktree provisioning report"
     return 0
   fi
   printf '%s\n' "$body" > "$report" || {
@@ -1278,6 +1306,11 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
 
   fm_provision_validate_tunables || return 1
   [ -d "$wt" ] || { fm_provision_fail "worktree $wt is not a directory"; return 1; }
+  fm_provision_clear_report "$wt" || {
+    fm_provision_fail "cannot remove a previous lease's provisioning report at $wt/$FM_PROVISION_REPORT_NAME, so this lane would read it as a description of its own worktree"
+    return 1
+  }
+  fm_provision_resolve_bound_kind
 
   detected=$(fm_provision_detect "$wt") || {
     fm_provision_fail "cannot scan $wt for dependency manifests"
@@ -1303,7 +1336,7 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
   # Host prerequisites. Provisioning was never going to work here, so it warns
   # and launches unprovisioned; refusing would make every spawn on such a host
   # impossible while buying nothing, and nothing has been mutated yet.
-  if [ "$(fm_provision_bound_kind)" = none ]; then
+  if [ "$FM_PROVISION_BOUND_KIND" = none ]; then
     fm_provision_unavailable "$log" no-bounded-execution \
       "no bounded-execution mechanism (timeout, gtimeout, or perl) is available, so no install could be prevented from wedging the spawn"
     fm_provision_report_unavailable "$wt" "$log" no-bounded-execution

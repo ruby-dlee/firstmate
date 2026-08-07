@@ -110,7 +110,9 @@
 #   worse than no lane. The task's brief is passed in so an over-budget worktree
 #   spends its component budget on what the task actually names.
 #   --no-provision skips provisioning for one spawn, and
-#   config/worktree-provision=off for the home.
+#   config/worktree-provision=off for the home. Both still clear any
+#   .fm-provisioning.md the previous lease of that pool slot left behind, so an
+#   opted-out lane cannot read another task's report as its own.
 #   Ship/scout spawns refresh the primary checkout before Treehouse acquisition,
 #   surface dirty pool entries, and durably lease one available worktree before
 #   creating the endpoint. They refuse to create that endpoint unless the leased
@@ -3304,6 +3306,14 @@ PROVISION_SUMMARY=
 PROVISION_PATH_PREFIX=
 spawn_provision_worktree() {
   local mode
+  # Before either opt-out, because an opted-out lease is the one that would
+  # otherwise read the previous task's report as a description of its own
+  # worktree - the more provisioning does here, the louder its absence must be.
+  fm_provision_clear_report "$WT" || {
+    echo "error: cannot remove a previous lease's provisioning report at $WT/$FM_PROVISION_REPORT_NAME" >&2
+    echo "       fm-$ID would read it as a description of its own worktree, so the spawn is refused; remove that path by hand." >&2
+    return 1
+  }
   if [ "$NO_PROVISION" = 1 ]; then
     PROVISION_SUMMARY=off
     return 0

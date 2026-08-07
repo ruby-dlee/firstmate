@@ -992,6 +992,163 @@ PY
   pass "OpenAI-backed reviewers prove account separation on the executing credential"
 }
 
+test_unrouted_lane_compares_provider_not_harness() {
+  # With no author account_home there is no credential to compare, so the only
+  # separation left is the provider namespace. Harness inequality is not that:
+  # Pi reaches the same OpenAI accounts a Codex author uses.
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$TMP_ROOT" <<'PY' \
+    || fail "unrouted independence regressed to a harness-name comparison"
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+root = Path(sys.argv[2]) / "unrouted-provider-separation"
+root.mkdir()
+homes = {name: root / name for name in ("codex-home", "claude-home", "pi-home")}
+for account_home in homes.values():
+    account_home.mkdir()
+config_path = root / "reviewer.json"
+os.environ["FM_CROSSCHECK_REVIEWER_CONFIG"] = str(config_path)
+
+reviewers = {
+    "codex": ("codex", "gpt-5.6-sol", "codex-home"),
+    "claude": ("claude", "claude-opus-5", "claude-home"),
+    "pi": ("pi", "gpt-5.6-sol", "pi-home"),
+}
+
+
+def write_config(name):
+    harness, model, home_name = reviewers[name]
+    config_path.write_text(
+        json.dumps(
+            {
+                "reviewers": [
+                    {
+                        "harness": harness,
+                        "model": model,
+                        "effort": "xhigh",
+                        "account_home": str(homes[home_name]),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def unrouted(harness, model):
+    return {
+        "harness": harness,
+        "model": model,
+        "account_routing_emergency_bypass": "1",
+    }
+
+
+def expect_selected(author, name, label):
+    write_config(name)
+    selected = module.reviewer_config(root, author)
+    assert selected["harness"] == reviewers[name][0], selected
+    assert "author_openai_account" not in selected, selected
+    print(f"SELECTED {label}: {selected['harness']}")
+
+
+def expect_refused(author, name, expected, label):
+    write_config(name)
+    try:
+        module.reviewer_config(root, author)
+    except module.CrosscheckError as exc:
+        message = str(exc)
+        assert expected in message, message
+        print(f"REFUSED {label}: {message[:120]}")
+        return
+    raise AssertionError(f"{label} was accepted as an independent reviewer")
+
+
+codex_author = unrouted("codex", "gpt-5.5")
+claude_author = unrouted("claude", "claude-opus-5")
+
+expect_refused(
+    codex_author, "pi", "different provider", "unrouted-codex-author-pi-reviewer"
+)
+expect_refused(
+    codex_author, "codex", "different provider", "unrouted-codex-author-codex-reviewer"
+)
+expect_selected(codex_author, "claude", "unrouted-codex-author-claude-reviewer")
+expect_selected(claude_author, "pi", "unrouted-claude-author-pi-reviewer")
+expect_selected(claude_author, "codex", "unrouted-claude-author-codex-reviewer")
+
+# A harness with no known provider namespace can never prove separation.
+expect_refused(
+    unrouted("unknown-harness", "gpt-5.5"),
+    "claude",
+    "cannot establish a provider account namespace",
+    "unrouted-unmapped-author-harness",
+)
+
+assert module.HARNESS_PROVIDERS["codex"] == module.HARNESS_PROVIDERS["pi"], (
+    module.HARNESS_PROVIDERS
+)
+assert module.HARNESS_PROVIDERS["claude"] != module.HARNESS_PROVIDERS["codex"], (
+    module.HARNESS_PROVIDERS
+)
+assert module.OPENAI_BACKED_HARNESSES == {"codex", "pi"}, (
+    module.OPENAI_BACKED_HARNESSES
+)
+PY
+  pass "the unrouted lane proves independence on provider, not on harness name"
+}
+
+test_reviewer_binary_never_resolves_from_working_directory() {
+  # The gate runs with its working directory inside the repository under
+  # review, so a bare reviewer command must resolve through PATH only.
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$TMP_ROOT" <<'PY' \
+    || fail "reviewer binary resolution regressed to a working-directory fallback"
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+root = Path(sys.argv[2]) / "reviewer-binary-resolution"
+root.mkdir()
+decoy = root / "pi"
+decoy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+decoy.chmod(0o755)
+
+os.environ["FM_CROSSCHECK_PI_BIN"] = "pi"
+os.environ["PATH"] = str(root / "no-such-path-entry")
+previous = Path.cwd()
+os.chdir(root)
+try:
+    module.reviewer_binary_path("FM_CROSSCHECK_PI_BIN", "pi", "Pi reviewer")
+except module.CrosscheckToolError as exc:
+    assert "found no runnable FM_CROSSCHECK_PI_BIN='pi'" in str(exc), str(exc)
+    print(f"REFUSED working-directory reviewer binary: {exc}")
+else:
+    raise AssertionError("a working-directory binary was accepted as the reviewer")
+finally:
+    os.chdir(previous)
+
+# An explicit path is still honoured, so the refusal is about PATH resolution.
+os.environ["FM_CROSSCHECK_PI_BIN"] = str(decoy)
+resolved = module.reviewer_binary_path("FM_CROSSCHECK_PI_BIN", "pi", "Pi reviewer")
+assert resolved == decoy, resolved
+print(f"RESOLVED explicit path: {resolved}")
+PY
+  pass "a bare reviewer command resolves through PATH and never from the working directory"
+}
+
 test_api_key_reviewer_cannot_prove_openai_separation() {
   # An API-key Codex credential passes credential preflight but names no
   # OpenAI account, so it can never prove separation from an OpenAI author.
@@ -1031,6 +1188,18 @@ test_gate_refuses_an_unsupported_interpreter() {
   expect_code 1 "$rc" "unsatisfiable interpreter floor"
   assert_grep 'refuses to review under a weaker hostile-JSON guarantee' \
     "$out/none.err" "an unsatisfiable interpreter floor did not refuse loudly"
+
+  # An explicit interpreter that cannot satisfy the floor refuses by name
+  # instead of falling through to whichever python3 happens to be installed.
+  set +e
+  FM_CROSSCHECK_PYTHON="$out/pyhton3.12" "$ROOT/bin/fm-crosscheck.sh" \
+    run task-x1 "$PR_URL" > "$out/explicit.out" 2> "$out/explicit.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "an explicit interpreter that does not exist"
+  assert_grep "FM_CROSSCHECK_PYTHON='$out/pyhton3.12' is missing or below Python 3.11" \
+    "$out/explicit.err" \
+    "an unusable explicit interpreter was silently replaced: $(tr '\n' ' ' < "$out/explicit.err")"
 
   # The wrapper selects a supported interpreter when one exists.
   local resolved
@@ -1477,6 +1646,10 @@ value = json.load(open(sys.argv[1]))
 run = value["runs"][-1]
 assert run["state"] == "tool-failure"
 assert run["head_sha"] == sys.argv[2]
+# A failure before launch must record the reviewer identity and nothing else;
+# the author account id carried for the launch check is not reviewer identity.
+assert set(run["reviewer"]) == {"harness", "model", "effort", "account_home"}, \
+    run["reviewer"]
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" "$head" \
     || fail "the exact-head fetch failure was not durably classified as a tool failure"
   pass "an absent remote PR head ref fails closed before review"
@@ -2615,6 +2788,8 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
     test_reviewer_policy_profiles_and_independence|\
     test_openai_backed_reviewer_proves_account_separation|\
+    test_unrouted_lane_compares_provider_not_harness|\
+    test_reviewer_binary_never_resolves_from_working_directory|\
     test_api_key_reviewer_cannot_prove_openai_separation|\
     test_gate_refuses_an_unsupported_interpreter|\
     test_pi_reviewer_accepts_only_successful_terminal_turn|\
@@ -2670,6 +2845,8 @@ fi
 
 test_reviewer_policy_profiles_and_independence
 test_openai_backed_reviewer_proves_account_separation
+test_unrouted_lane_compares_provider_not_harness
+test_reviewer_binary_never_resolves_from_working_directory
 test_api_key_reviewer_cannot_prove_openai_separation
 test_gate_refuses_an_unsupported_interpreter
 test_pi_reviewer_accepts_only_successful_terminal_turn

@@ -329,7 +329,15 @@ def inspect_pi_credential(account_home: Path) -> tuple[str, str]:
     return "pi-openai-codex-oauth-file", str(credential_file)
 
 
-OPENAI_BACKED_HARNESSES = {"codex", "pi"}
+# The upstream account namespace each harness authenticates against. Codex and
+# Pi are two clients onto one OpenAI namespace, so a different harness is not
+# by itself a different account namespace. A harness absent from this mapping
+# has no known namespace and can never establish separation.
+HARNESS_PROVIDERS = {"codex": "openai", "pi": "openai", "claude": "anthropic"}
+
+OPENAI_BACKED_HARNESSES = {
+    harness for harness, provider in HARNESS_PROVIDERS.items() if provider == "openai"
+}
 
 
 def openai_account_identity(harness: str, account_home: Path) -> str | None:
@@ -1443,7 +1451,17 @@ def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
                         author_openai_identity != reviewer_openai_identity
                     )
         else:
-            account_is_separate = reviewer["harness"] != meta["harness"]
+            # Without an author account_home the only separation available is
+            # the provider namespace, and a different harness is not one: a Pi
+            # reviewer reaches the same OpenAI accounts a Codex author uses. An
+            # unmapped harness on either side proves nothing and stays refused.
+            author_provider = HARNESS_PROVIDERS.get(meta["harness"])
+            reviewer_provider = HARNESS_PROVIDERS.get(reviewer["harness"])
+            account_is_separate = (
+                author_provider is not None
+                and reviewer_provider is not None
+                and author_provider != reviewer_provider
+            )
         if model_is_separate and account_is_separate:
             if (
                 author_openai_identity is not None
@@ -1753,8 +1771,15 @@ def reviewer_binary_path(name: str, default: str, label: str) -> Path:
     if "/" in command:
         candidate = Path(command)
     else:
+        # A bare name resolves through PATH only. Falling back to the name as a
+        # relative path would let the repository under review supply the
+        # reviewer binary from the gate's working directory.
         resolved = shutil.which(command)
-        candidate = Path(resolved) if resolved is not None else Path(command)
+        if resolved is None:
+            tool_fail(
+                f"{label} executable inspection found no runnable {name}={command!r}"
+            )
+        candidate = Path(resolved)
     if not candidate.is_file() or not os.access(candidate, os.X_OK):
         tool_fail(
             f"{label} executable inspection found no runnable {name}={command!r}"
@@ -1866,6 +1891,7 @@ def run_reviewer(
     snapshot_value: dict[str, Any],
     ledger: dict[str, Any],
     config: dict[str, str],
+    author_openai_account: str,
 ) -> Any:
     pi_command = (
         pi_reviewer_command()
@@ -1913,7 +1939,6 @@ def run_reviewer(
     config["execution_home"] = str(execution_home.resolve())
     config["credential_source"] = credential_source
     config["credential_identifier"] = credential_identifier
-    author_openai_account = config.pop("author_openai_account", "")
     if author_openai_account:
         # The credential preflights above have already accepted this account
         # home, so this is the authoritative separation proof: it reads the
@@ -2612,12 +2637,17 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
     except CrosscheckError as exc:
         tool_fail(f"finding-ledger preflight failed at {ledger_path}: {exc}")
     config: dict[str, str] | None = None
+    author_openai_account = ""
 
     try:
         try:
             config = reviewer_config(home, meta)
         except CrosscheckError as exc:
             tool_fail(f"reviewer preflight failed: {exc}")
+        # Detached before anything can fail: the author's account id is proof
+        # material for the launch check, not part of the reviewer identity the
+        # ledger records for a failed run.
+        author_openai_account = config.pop("author_openai_account", "")
         with tempfile.TemporaryDirectory(prefix=f".{task_id}.crosscheck.", dir=state) as temporary:
             temp_root = Path(temporary)
             review_dir = temp_root / "review"
@@ -2630,7 +2660,9 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
                 )
             except CrosscheckError as exc:
                 tool_fail(f"review checkout preflight failed: {exc}")
-            raw_review = run_reviewer(review_dir, snapshot_value, ledger, config)
+            raw_review = run_reviewer(
+                review_dir, snapshot_value, ledger, config, author_openai_account
+            )
             assert_review_checkout_intact(review_dir, snapshot_value["head_sha"])
             review = validate_review_shape(
                 raw_review,

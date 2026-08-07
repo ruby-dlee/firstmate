@@ -21,8 +21,18 @@
 #   interpreter="$(fm_crosscheck_resolve_python)" || exit 1
 #
 # Overrides:
-#   FM_CROSSCHECK_PYTHON      try this interpreter first
+#   FM_CROSSCHECK_PYTHON      use this interpreter; the gate refuses to run if
+#                             it is missing or below the floor rather than
+#                             silently reviewing under a different one
 #   FM_CROSSCHECK_MIN_PYTHON  minimum "<major>.<minor>" (default 3.11)
+
+fm_crosscheck_python_meets_floor() {
+  local candidate=$1 major=$2 minor=$3
+  command -v "$candidate" >/dev/null 2>&1 || return 1
+  "$candidate" -c 'import sys
+sys.exit(0 if sys.version_info[:2] >= (int(sys.argv[1]), int(sys.argv[2])) else 1)' \
+    "$major" "$minor" 2>/dev/null
+}
 
 fm_crosscheck_resolve_python() {
   local minimum major minor candidate
@@ -30,15 +40,20 @@ fm_crosscheck_resolve_python() {
   major="${minimum%%.*}"
   minor="${minimum#*.}"
 
-  for candidate in \
-    "${FM_CROSSCHECK_PYTHON:-}" python3 python3.14 python3.13 python3.12 python3.11
-  do
-    [ -n "$candidate" ] || continue
-    command -v "$candidate" >/dev/null 2>&1 || continue
-    if "$candidate" -c 'import sys
-sys.exit(0 if sys.version_info[:2] >= (int(sys.argv[1]), int(sys.argv[2])) else 1)' \
-      "$major" "$minor" 2>/dev/null
+  if [ -n "${FM_CROSSCHECK_PYTHON:-}" ]; then
+    if fm_crosscheck_python_meets_floor "$FM_CROSSCHECK_PYTHON" "$major" "$minor"
     then
+      printf '%s\n' "$FM_CROSSCHECK_PYTHON"
+      return 0
+    fi
+    printf 'CROSSCHECK TOOL-FAILURE: %s\n' \
+      "FM_CROSSCHECK_PYTHON='$FM_CROSSCHECK_PYTHON' is missing or below Python $minimum, and the gate refuses to review under a weaker hostile-JSON guarantee; point it at Python $minimum or newer, or unset it to let the gate resolve a supported interpreter" \
+      >&2
+    return 1
+  fi
+
+  for candidate in python3 python3.14 python3.13 python3.12 python3.11; do
+    if fm_crosscheck_python_meets_floor "$candidate" "$major" "$minor"; then
       printf '%s\n' "$candidate"
       return 0
     fi

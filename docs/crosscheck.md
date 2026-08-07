@@ -58,6 +58,7 @@ Because Codex and Pi both authenticate against OpenAI, one account routinely exi
 Path inequality therefore cannot establish account separation between two OpenAI-backed identities.
 When both the author and the reviewer are OpenAI-backed, Crosscheck compares the executing OpenAI account recorded in each credential and refuses a reviewer that resolves to the author's account, an unreadable author identity, or a reviewer credential such as an API key that names no account at all.
 For a task explicitly marked `account_routing_emergency_bypass=1`, a reviewer on the other supported provider establishes both account-namespace and model separation without inventing an `account_home` for the author.
+Provider is what that lane compares, not harness: Codex and Pi are both the OpenAI provider, so an unrouted Codex author is reviewable only by Claude, while an unrouted Claude author is reviewable by either Codex or Pi.
 A same-provider reviewer still fails closed for that structurally unrouted task because account independence cannot be proved.
 The accepted profiles are Codex `gpt-5.6-sol` xhigh, Claude `claude-opus-5` xhigh, and Pi `gpt-5.6-sol` xhigh.
 Absent configuration, unavailable credentials, missing model separation, and unprovable account separation all produce `CROSSCHECK TOOL-FAILURE` and a nonzero exit before reviewer launch.
@@ -66,6 +67,7 @@ Crosscheck requires Python 3.11 or newer and refuses to run on anything older.
 This is a safety floor rather than a style preference: the bounded-read layer rejects hostile JSON integers by relying on CPython's integer/string conversion limit, which first exists in 3.11, and on an older interpreter that rejection silently stops happening while every banner the gate prints reads exactly the same.
 Stock macOS `python3` is 3.9, so `bin/fm-crosscheck.sh` resolves a supported sibling interpreter instead of assuming `python3` qualifies, and `bin/fm-crosscheck.py` enforces the same minimum itself so a direct invocation cannot bypass it.
 `bin/fm-crosscheck-python-lib.sh` owns that resolution for both the wrapper and the behavior tests; `FM_CROSSCHECK_PYTHON` selects an explicit interpreter and `FM_CROSSCHECK_MIN_PYTHON` overrides the minimum.
+An explicitly configured `FM_CROSSCHECK_PYTHON` that is missing or below the floor refuses by name rather than falling through to some other interpreter, so a typo or a stale path cannot silently unpin the gate.
 CI pins a single modern interpreter and therefore cannot observe this class of defect on its own, which is why the floor is asserted at runtime rather than assumed from the CI matrix.
 
 Start crosscheck as soon as a PR URL exists so it can overlap no-mistakes' remaining CI work.

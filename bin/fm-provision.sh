@@ -99,7 +99,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fm_refuse_if_gate_agent
 
 usage() {
-  sed -n '2,84p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,91p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -398,10 +398,9 @@ strict_descendant_path() {
 # set -m gives the child its own process group, which stays supervised as one
 # unit rather than orphaning grandchildren when its leader exits.
 run_bounded() {
-  local seconds=$1 marker=$2
-  shift 2
+  local seconds=$1
+  shift
   local pid status=0 ticks=0 limit grace=0
-  /bin/rm -f "$marker"
   set -m
   "$@" &
   pid=$!
@@ -409,7 +408,6 @@ run_bounded() {
   limit=$((seconds * 10))
   while kill -0 -"$pid" 2>/dev/null; do
     if [ "$ticks" -ge "$limit" ]; then
-      : > "$marker"
       kill -TERM -"$pid" 2>/dev/null || true
       while kill -0 -"$pid" 2>/dev/null && [ "$grace" -lt 20 ]; do
         sleep 0.1
@@ -419,7 +417,6 @@ run_bounded() {
         kill -KILL -"$pid" 2>/dev/null || true
       fi
       wait "$pid" 2>/dev/null || status=$?
-      /bin/rm -f "$marker"
       return 124
     fi
     sleep 0.1
@@ -484,7 +481,7 @@ run_step() {
   status=0
   (
     cd "$cwd" || exit 126
-    run_bounded "$timeout" "$WORK_DIR/step.timeout" \
+    run_bounded "$timeout" \
       /usr/bin/env "${COMPONENT_ENV[@]}" "${STEP_ARGV[@]}"
   ) > "$out_file" 2>&1 || status=$?
   if [ -n "$LOG_FILE" ] && [ -s "$out_file" ]; then
@@ -616,7 +613,8 @@ run_probes() {
 }
 
 run_install() {
-  local comp=$1 dir=$2 rel abs step budget status
+  local comp=$1 dir=$2 rel abs step budget status out_file detail
+  out_file="$WORK_DIR/reset.out"
   while IFS= read -r -d '' rel; do
     if ! abs=$(strict_descendant_path "$dir" "$(expand_tokens "$rel")"); then
       STEP_FAILURE="reset path must be a strict descendant of the component directory: '$rel'"
@@ -629,7 +627,10 @@ run_install() {
     fi
     log_line "=== reset :: rm -rf $abs (timeout ${budget}s)"
     status=0
-    run_bounded "$budget" "$WORK_DIR/reset.timeout" rm -rf -- "$abs" || status=$?
+    run_bounded "$budget" rm -rf -- "$abs" > "$out_file" 2>&1 || status=$?
+    if [ -n "$LOG_FILE" ] && [ -s "$out_file" ]; then
+      cat "$out_file" >> "$LOG_FILE"
+    fi
     log_line "--- exit $status"
     if [ "$status" -eq 124 ]; then
       STEP_FAILURE="reset '$rel' timed out after ${budget}s"
@@ -637,6 +638,9 @@ run_install() {
     fi
     if [ "$status" -ne 0 ]; then
       STEP_FAILURE="cannot remove $abs (exit $status)"
+      detail=$(awk 'NF { last = $0 } END { if (last != "") print last }' "$out_file" 2>/dev/null \
+        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      [ -z "$detail" ] || STEP_FAILURE="$STEP_FAILURE: $detail"
       return 1
     fi
   done < <(printf '%s' "$comp" | jq -j '.reset[]? | tostring + "\u0000"' 2>/dev/null)

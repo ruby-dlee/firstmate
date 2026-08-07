@@ -679,10 +679,15 @@ make_spawn_case() {
   printf -- '- [ ] %s - provisioning test (repo: project)\n' "$id" >> "$home/data/backlog.md"
   printf '\n## Queued\n\n## Done\n' >> "$home/data/backlog.md"
   printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+  chmod 0644 "$home/data/$id/brief.md"
   fm_git_worktree "$proj" "$wt" "wt-$name"
   mkdir -p "$proj/component"
   printf 'lock-v1\n' > "$proj/component/lock.txt"
-  git -C "$proj" add component/lock.txt
+  # A real manifest builds gitignored trees (.venv, node_modules), so the
+  # fixture's built artifacts are gitignored too. What provisioning leaves
+  # UNIGNORED is residue, and residue has its own test below.
+  printf 'built/\nbuild-count\n' > "$proj/.gitignore"
+  git -C "$proj" add component/lock.txt .gitignore
   git -C "$proj" -c user.name=t -c user.email=t@example.invalid commit -qm component
   git -C "$wt" checkout --quiet --detach HEAD
   git -C "$proj" branch --quiet -D "wt-$name"
@@ -710,7 +715,42 @@ run_spawn() {
     FM_FAKE_TREEHOUSE_CURRENT="$case_dir/acquired-worktree" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
     FM_FAKE_SEND_LOG="$sendlog" PATH="$fakebin:$PATH" \
-    "$SPAWN" "$@" 2>&1
+    "${SPAWN_CMD:-$SPAWN}" "$@" 2>&1
+}
+
+# make_dying_provisioner_bin <case-dir>: mirror bin/ with symlinks and replace
+# ONLY fm-provision.sh with a stub that is killed before it can print anything.
+# The spawn under test stays the real one; what is substituted is a provisioner
+# that dies the way an OOM kill, a signal, or an unanticipated exit does - with
+# no verdict on stdout for fm-spawn to read. --manifest-path still reaches the
+# real script, because resolving the manifest is exactly what fm-spawn must be
+# able to do independently of the run that dies.
+make_dying_provisioner_bin() {
+  local case_dir=$1 bin entry
+  # Mirrored as <root>/bin so the spawn's own FM_ROOT still resolves siblings
+  # such as bin/fm-harness.sh exactly as it does in the real tree.
+  bin="$case_dir/dying-root/bin"
+  mkdir -p "$bin"
+  for entry in "$ROOT"/bin/*; do
+    ln -s "$entry" "$bin/$(basename "$entry")"
+  done
+  rm -f "$bin/fm-provision.sh"
+  cat > "$bin/fm-provision.sh" <<SH
+#!/usr/bin/env bash
+set -u
+if [ "\${1:-}" = "--manifest-path" ]; then
+  exec "$ROOT/bin/fm-provision.sh" "\$@"
+fi
+printf 'fm-provision: killed before any verdict\n' >&2
+kill -KILL \$\$
+sleep 5
+SH
+  chmod +x "$bin/fm-provision.sh"
+  printf '%s\n' "$bin"
+}
+
+file_mode() {
+  stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"
 }
 
 # install_spawn_manifest <home> <case-dir> [<jq-filter>]: write the project
@@ -738,7 +778,7 @@ exported_path() {
 }
 
 test_spawn_pins_the_proven_runtime_into_the_crew_path() {
-  local rec id out path_line
+  local rec id out path_line brief_mode
   id=provision-ready-p1
   rec=$(make_spawn_case ready "$id")
   read_spawn_case "$rec"
@@ -754,7 +794,86 @@ test_spawn_pins_the_proven_runtime_into_the_crew_path() {
   assert_grep 'Environment readiness' "$HOME_DIR/data/$id/brief.md" \
     "a provisioned crewmate should be told its environment is ready"
   assert_present "$HOME_DIR/state/$id.provision" "the spawn should leave a durable verdict"
+  brief_mode=$(file_mode "$HOME_DIR/data/$id/brief.md")
+  [ "$brief_mode" = 644 ] \
+    || fail "the readiness note must not narrow the brief's mode, got $brief_mode"
   pass "a ready provisioning run pins its proven runtime ahead of the crewmate PATH"
+}
+
+test_spawn_treats_provisioning_residue_as_a_failure() {
+  local rec id out
+  id=provision-residue-p6
+  rec=$(make_spawn_case residue "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR" \
+    '.on_failure = "block"
+     | .components[0].install += [{"name":"stray artifact","argv":["sh","-c","echo stray > ../stray.log"]}]'
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
+  expect_code 1 "$?" "residue left in the lease must not reach an agent under block: $out"
+  assert_contains "$out" "WORKTREE PROVISIONING FAILED" "residue should be reported as a provisioning failure"
+  assert_contains "$out" "not a safe base for this task" "the banner should name the unclean lease"
+  assert_absent "$HOME_DIR/state/$id.meta" "a worktree left dirty by provisioning must not be launched into"
+  pass "provisioning residue is caught while the spawn can still refuse"
+}
+
+test_spawn_fails_closed_when_the_provisioner_dies_without_a_verdict() {
+  local rec id out bin
+  id=provision-death-block-p7
+  rec=$(make_spawn_case death-block "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR" '.on_failure = "block"'
+  bin=$(make_dying_provisioner_bin "$CASE_DIR")
+
+  out=$(SPAWN_CMD="$bin/fm-spawn.sh" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
+  expect_code 1 "$?" "on_failure=block must abort when the provisioner dies without a verdict: $out"
+  assert_contains "$out" "died without emitting a verdict" "the banner should say the provisioner emitted nothing"
+  assert_contains "$out" "no agent is launched" "the banner should say why nothing was launched"
+  assert_absent "$HOME_DIR/state/$id.meta" "a verdict-less provisioner death must not launch an agent under block"
+  assert_grep 'died without emitting a verdict' "$HOME_DIR/state/$id.provision" \
+    "the death must still leave a durable verdict artifact"
+  pass "on_failure=block fails closed when the provisioner dies without a verdict"
+}
+
+test_spawn_warn_policy_survives_a_verdict_less_provisioner_death() {
+  local rec id out path_line bin
+  id=provision-death-warn-p8
+  rec=$(make_spawn_case death-warn "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+  bin=$(make_dying_provisioner_bin "$CASE_DIR")
+
+  out=$(SPAWN_CMD="$bin/fm-spawn.sh" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
+  expect_code 0 "$?" "the warn default must still launch after a verdict-less death: $out"
+  assert_contains "$out" "died without emitting a verdict" "the death must be loud even under warn"
+  assert_contains "$out" "continuing" "the banner should say the spawn continued"
+  assert_present "$HOME_DIR/state/$id.meta" "a warn-policy death still launches the task"
+  assert_grep 'died without emitting a verdict' "$HOME_DIR/state/$id.provision" \
+    "the warn path must record the death durably too"
+  assert_grep 'Provisioning this worktree FAILED' "$HOME_DIR/data/$id/brief.md" \
+    "the crewmate must be told it cannot validate locally"
+  path_line=$(exported_path "$SEND_LOG")
+  case "$path_line" in
+    *"$CASE_DIR/pinned-bin"*) fail "a dead provisioner must not pin a runtime: $path_line" ;;
+  esac
+  pass "the warn default continues loudly when the provisioner dies without a verdict"
+}
+
+test_spawn_unreadable_failure_policy_is_treated_as_block() {
+  local rec id out bin
+  id=provision-death-badpolicy-p9
+  rec=$(make_spawn_case death-badpolicy "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR" '.on_failure = "maybe"'
+  bin=$(make_dying_provisioner_bin "$CASE_DIR")
+
+  out=$(SPAWN_CMD="$bin/fm-spawn.sh" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
+  expect_code 1 "$?" "an unrecognized on_failure must not fail open on a verdict-less death: $out"
+  assert_absent "$HOME_DIR/state/$id.meta" "an ambiguous policy must not launch an agent into an unproven worktree"
+  pass "an unreadable failure policy is resolved as block, not as the warn default"
 }
 
 test_spawn_continues_loudly_when_provisioning_warns() {
@@ -865,5 +984,9 @@ test_spawn_continues_loudly_when_provisioning_warns
 test_spawn_aborts_when_the_project_declares_block
 test_spawn_no_provision_opt_out
 test_spawn_skipped_provisioning_is_a_true_no_op
+test_spawn_treats_provisioning_residue_as_a_failure
+test_spawn_fails_closed_when_the_provisioner_dies_without_a_verdict
+test_spawn_warn_policy_survives_a_verdict_less_provisioner_death
+test_spawn_unreadable_failure_policy_is_treated_as_block
 
 echo "# all fm-provision tests passed"

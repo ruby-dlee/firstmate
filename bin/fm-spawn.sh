@@ -83,6 +83,11 @@
 #   script only decides what a failure does to the spawn (block aborts, warn
 #   continues with a banner, a durable verdict, and a brief note) and hands a
 #   ready verdict's proven runtime pin to the crewmate's exported PATH.
+#   A provisioner that dies WITHOUT a parseable verdict is decided by the
+#   manifest policy this script read before the run, so block fails closed; an
+#   unreadable policy is treated as block. A leased worktree is re-proven
+#   returnable after provisioning wrote into it, and residue is a failure under
+#   that same policy.
 #   --resume-account and --continue-account are legacy recovery paths only for
 #   existing account_profile metadata. They retain the sealed Agent Fleet
 #   session/lease behavior needed to recover those already-managed generations;
@@ -142,7 +147,7 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,87p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,93p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -363,6 +368,8 @@ CONTINUE_ACCOUNT=0
 DIRECT_ACCOUNT_RECOVERY=0
 PROVISION_MODE=auto
 PROVISION_PATH_PREPEND=
+PROVISION_MANIFEST=
+PROVISION_POLICY=
 CONTINUATION_LAUNCH_DIR=
 CONTINUATION_PROMPT_FILE=
 CONTINUATION_PROMPT_DIR_ID=
@@ -3274,16 +3281,63 @@ fi
 # the engine's no-manifest path is one file test and does no environment work.
 # fm-provision.sh's header owns the readiness contract and the exit codes. Prior
 # evidence is retired before every attempt because an unverified readiness claim
-# is more harmful than a lost diagnostic. Only status=ready publishes readiness;
-# failures follow the manifest's policy, where exit 4 blocks and exit 3 warns.
-spawn_brief_without_provision_section() {
-  local output=$1
-  awk '/^<!-- fm-provision:begin -->$/ { skip = 1 } !skip { print } /^<!-- fm-provision:end -->$/ { skip = 0 }' \
-    "$BRIEF" > "$output"
+# is more harmful than a lost diagnostic. Only status=ready publishes readiness.
+#
+# A failure follows the manifest's on_failure policy, and the discriminator is
+# whether fm-provision emitted a PARSEABLE VERDICT, not the exit code alone. With
+# a verdict, the exit code decides exactly as fm-provision documents it: 3 warns
+# and continues, 4 blocks. WITHOUT one - signal death, a usage error, a gate
+# refusal, any exit nobody anticipated - there is no verdict to read, so the
+# policy resolved from the manifest BEFORE the run decides instead, and a block
+# project aborts. A block policy that let the spawn continue whenever the
+# provisioner died in an unanticipated way would defeat the point of choosing it.
+# Rewrite the brief's delimited provisioning section through the repo's pinned
+# task-file transaction, the same primitive every other brief mutator uses. It
+# pins the task directory by fd and identity, refuses symlinks, stages in the
+# brief's own directory, preserves the brief's mode, and detects concurrent
+# modification - none of which a mktemp-and-mv across STATE and DATA can do.
+# An empty replacement section retires the section instead of rewriting it.
+spawn_brief_provision_section() {  # <section-text>
+  [ -n "${BRIEF:-}" ] && [ -f "$BRIEF" ] || return 1
+  [ "$BRIEF" = "$DATA/$ID/brief.md" ] || return 1
+  FM_FILE_TRANSACTION_LIB="$SCRIPT_DIR/fm-file-transaction.cjs" \
+    FM_PROVISION_BRIEF_SECTION="$1" \
+    node - "$DATA" "$ID" brief.md <<'JS'
+const { pinnedTaskFileTransaction } = require(process.env.FM_FILE_TRANSACTION_LIB);
+
+const [dataDir, taskId, fileName] = process.argv.slice(2);
+const BEGIN = '<!-- fm-provision:begin -->';
+const END = '<!-- fm-provision:end -->';
+const section = process.env.FM_PROVISION_BRIEF_SECTION || '';
+const addition = Buffer.from(section && !section.endsWith('\n') ? `${section}\n` : section);
+
+// Both delimiters and everything between them are dropped, and every kept line
+// is newline-terminated, so a rewrite is idempotent rather than stacking copies.
+function withoutSection(text) {
+  const lines = text.split('\n');
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  const kept = [];
+  let skip = false;
+  for (const line of lines) {
+    if (line === BEGIN) skip = true;
+    if (!skip) kept.push(line);
+    if (line === END) skip = false;
+  }
+  return kept.length ? Buffer.from(`${kept.join('\n')}\n`) : Buffer.alloc(0);
+}
+
+try {
+  pinnedTaskFileTransaction(dataDir, taskId, fileName, (content) =>
+    Buffer.concat([withoutSection(content.toString('utf8')), addition]));
+} catch (error) {
+  console.error(`error: provisioning brief transaction failed for ${taskId}/${fileName}: ${error.message}`);
+  process.exitCode = 1;
+}
+JS
 }
 
 spawn_retire_provision_evidence() {
-  local tmp grep_status=0
+  local grep_status=0
   PROVISION_PATH_PREPEND=
   rm -f "$STATE/$ID.provision" "$STATE/$ID.provision.log" || return 1
   [ -n "${BRIEF:-}" ] && [ -f "$BRIEF" ] || return 0
@@ -3293,15 +3347,72 @@ spawn_retire_provision_evidence() {
     0) ;;
     *) return 1 ;;
   esac
-  [ -r "$BRIEF" ] && [ -w "$BRIEF" ] || return 1
-  tmp=$(mktemp "$STATE/.$ID.brief.XXXXXX") || return 1
-  spawn_brief_without_provision_section "$tmp" 2>/dev/null \
-    || { rm -f "$tmp"; return 1; }
-  mv "$tmp" "$BRIEF" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  spawn_brief_provision_section '' || return 1
+}
+
+# Resolve the manifest and its failure policy BEFORE fm-provision runs, so a
+# provisioner that dies without a verdict can never leave the policy unknown.
+# Returns non-zero when there is nothing to provision. fm-provision owns where a
+# project's manifest lives, so the path is asked of it rather than rebuilt here;
+# the absent-manifest default stays exactly one file-existence check away from
+# skipping, which is what leaves every non-opted-in project untouched.
+spawn_resolve_provision_policy() {
+  local raw
+  PROVISION_MANIFEST=
+  PROVISION_POLICY=
+  PROVISION_MANIFEST=$("$SCRIPT_DIR/fm-provision.sh" --manifest-path "$PROJ_ABS" 2>/dev/null) || PROVISION_MANIFEST=
+  if [ -z "$PROVISION_MANIFEST" ]; then
+    echo "warning: skipping worktree provisioning for $ID because no manifest path could be resolved for $PROJ_ABS" >&2
+    return 1
+  fi
+  [ -f "$PROVISION_MANIFEST" ] || return 1
+  # An unreadable or unrecognized policy is exactly the ambiguity that must not
+  # fail open, so it resolves to block rather than to the warn default.
+  raw=$(jq -r '.on_failure // "warn"' "$PROVISION_MANIFEST" 2>/dev/null) || raw=
+  case "$raw" in
+    warn|block) PROVISION_POLICY=$raw ;;
+    *) PROVISION_POLICY=block ;;
+  esac
+  return 0
+}
+
+# Provisioning runs manifest-declared steps inside the lease, so the cleanliness
+# proven before the run is no longer proof. Re-prove it with the SAME predicate
+# the return path will later apply, while the spawn can still refuse: residue
+# discovered at return time keeps the lease under a warning, and pool preflight
+# then skips that worktree on every future acquisition, permanently shrinking the
+# pool. Only a worktree this spawn leased and proved clean is re-proven; a
+# recorded recovery worktree was never proven clean here and carries the
+# crewmate's own in-progress state.
+spawn_provisioned_worktree_still_returnable() {
+  [ "$WORKTREE_CREATED" = 1 ] || return 0
+  [ -n "$WORKTREE_EXPECTED_TIP" ] || return 0
+  "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable \
+    "$WT" "${PROJ_ABS_REAL:-$PROJ_ABS}" "$WORKTREE_EXPECTED_TIP"
+}
+
+# Make a failure firstmate itself concluded durable in the same place and shape
+# fm-provision's own verdict would have been, so a provisioner that died before
+# writing anything still leaves a diagnosable record.
+spawn_record_provision_failure() {  # <verdict-or-empty> <reason>
+  local verdict=$1 reason=$2 record=''
+  if [ -n "$verdict" ]; then
+    record=$(printf '%s' "$verdict" | jq -c --arg reason "$reason" --arg policy "$PROVISION_POLICY" \
+      '. + {status:"failed",reason:$reason,policy:$policy,path_prepend:""}' 2>/dev/null) || record=
+  fi
+  if [ -z "$record" ]; then
+    record=$(jq -c -n --arg reason "$reason" --arg policy "$PROVISION_POLICY" \
+      --arg manifest "$PROVISION_MANIFEST" --arg task "$ID" --arg worktree "$WT" \
+      '{schema:"fm-provision.v1",status:"failed",reason:$reason,policy:$policy,worktree:$worktree,manifest:$manifest,task:$task,log:"",path_prepend:"",components:[]}' \
+      2>/dev/null) || record=
+  fi
+  [ -n "$record" ] || record='{"schema":"fm-provision.v1","status":"failed","reason":"provisioning died without emitting a verdict","path_prepend":"","components":[]}'
+  printf '%s\n' "$record" > "$STATE/$ID.provision" 2>/dev/null || true
+  printf '%s' "$record"
 }
 
 provision_worktree() {
-  local status=0 verdict='' verdict_status='' reason banner_state
+  local status=0 verdict='' verdict_status='' reason='' banner_state='' residue=0 verdict_decides=0
   spawn_retire_provision_evidence || {
     echo "error: could not retire stale provisioning evidence for $ID" >&2
     return 1
@@ -3311,30 +3422,39 @@ provision_worktree() {
   [ "$BACKEND" != orca ] || return 0
   [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
   [ -x "$SCRIPT_DIR/fm-provision.sh" ] || return 0
+  spawn_resolve_provision_policy || return 0
   local provision_args=(--task "$ID" --kind "$KIND")
   [ "$PROVISION_MODE" != force ] || provision_args+=(--force)
   verdict=$("$SCRIPT_DIR/fm-provision.sh" "$PROJ_ABS" "$WT" "${provision_args[@]}") || status=$?
-  if [ "$status" -eq 0 ]; then
+  if [ -n "$verdict" ]; then
     verdict_status=$(printf '%s' "$verdict" | jq -r '.status // ""' 2>/dev/null || true)
-    case "$verdict_status" in
-      ready)
-      PROVISION_PATH_PREPEND=$(printf '%s' "$verdict" | jq -r '.path_prepend // ""' 2>/dev/null || true)
-      spawn_brief_provision_note "$verdict" ready
-      return 0
-      ;;
-      skipped) return 0 ;;
-      *) status=3 ;;
-    esac
   fi
-  case "$status" in
-    3) banner_state=continuing ;;
-    4) banner_state=aborting ;;
-    *) banner_state=continuing ;;
-  esac
+  if [ "$status" -eq 0 ] && [ "$verdict_status" = skipped ]; then
+    return 0
+  fi
+  spawn_provisioned_worktree_still_returnable || residue=1
+  if [ "$status" -eq 0 ] && [ "$verdict_status" = ready ] && [ "$residue" -eq 0 ]; then
+    PROVISION_PATH_PREPEND=$(printf '%s' "$verdict" | jq -r '.path_prepend // ""' 2>/dev/null || true)
+    spawn_brief_provision_note "$verdict" ready
+    return 0
+  fi
   PROVISION_PATH_PREPEND=
   reason=$(printf '%s' "$verdict" | jq -r '.reason // ""' 2>/dev/null || true)
-  if [ -z "$reason" ] && [ -n "$verdict_status" ]; then
-    reason="provisioning exited successfully with non-ready status '$verdict_status'"
+  if [ "$residue" -eq 0 ] && [ -n "$verdict_status" ]; then
+    case "$status" in
+      3) banner_state=continuing; verdict_decides=1 ;;
+      4) banner_state=aborting; verdict_decides=1 ;;
+    esac
+  fi
+  if [ "$verdict_decides" -eq 0 ]; then
+    if [ "$residue" -eq 1 ]; then
+      reason="${reason:+$reason; }provisioning left $WT no longer provably clean, isolated, and at its expected detached tip, so it is not a safe base for this task"
+    elif [ -z "$reason" ] && [ -n "$verdict_status" ]; then
+      reason="provisioning exited $status with unrecognized status '$verdict_status'"
+    fi
+    [ -n "$reason" ] || reason="provisioning died without emitting a verdict (exit $status)"
+    verdict=$(spawn_record_provision_failure "$verdict" "$reason")
+    if [ "$PROVISION_POLICY" = block ]; then banner_state=aborting; else banner_state=continuing; fi
   fi
   [ -n "$reason" ] || reason="provisioning failed without a readable reason (exit $status)"
   echo "################################################################" >&2
@@ -3358,11 +3478,9 @@ provision_worktree() {
 # The section is delimited and rewritten in place, so a recovery respawn refreshes
 # it rather than stacking copies.
 spawn_brief_provision_note() {
-  local verdict=$1 state=$2 tmp
-  [ -n "${BRIEF:-}" ] && [ -f "$BRIEF" ] && [ -w "$BRIEF" ] || return 0
-  tmp=$(mktemp "$STATE/.$ID.brief.XXXXXX") || return 0
-  spawn_brief_without_provision_section "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
-  {
+  local verdict=$1 state=$2 section
+  [ -n "${BRIEF:-}" ] && [ -f "$BRIEF" ] || return 0
+  section=$({
     printf '\n<!-- fm-provision:begin -->\n'
     printf '\n# Environment readiness\n\n'
     if [ "$state" = ready ]; then
@@ -3378,8 +3496,10 @@ spawn_brief_provision_note() {
       printf 'If you cannot run the checks, append a blocked status naming what failed, and stop.\n'
     fi
     printf '\n<!-- fm-provision:end -->\n'
-  } >> "$tmp"
-  mv "$tmp" "$BRIEF" 2>/dev/null || rm -f "$tmp"
+  })
+  spawn_brief_provision_section "$section" \
+    || echo "warning: could not record the provisioning readiness note in $BRIEF for $ID" >&2
+  return 0
 }
 
 provision_worktree || exit 1

@@ -554,9 +554,16 @@ def seed_reviewer_home(
     credential store back at ``account_home`` so account separation survives the
     redirect.
 
-    Exactly one entry is read through rather than copied. ``.credentials.json``
-    is recreated as a symlink to the account's own store, so that secret is
-    never duplicated. Every other regular file within
+    Entries are read through as symlinks rather than copied in two cases, so
+    state the rule rather than a count. Any symlink to a non-directory is
+    reproduced as a symlink, because copying it would duplicate whatever it
+    points at into the checkout; a real reviewer account home carries at least
+    one of these (``CLAUDE.md``, linked to the operator's own file).
+    ``.credentials.json`` is handled by credential source: read through as a
+    symlink to the account's own store when that file *is* the verified source,
+    so the secret is never duplicated, and omitted entirely when the selected
+    source is the scoped Keychain, so the seeded home never carries a file the
+    gate just rejected. Every other regular file within
     ``MAX_SEEDED_CONFIG_BYTES`` - including ``.claude.json`` and any settings
     file whose ``env`` block carries a provider token - is copied into this
     seeded home, which lives inside the disposable review checkout and dies with
@@ -576,11 +583,13 @@ def seed_reviewer_home(
                 entry.name == CREDENTIALS_NAME
                 and credential_source == "scoped-keychain"
             ):
-                # It is unproven that installed Claude starts cleanly without
-                # .credentials.json while authenticating from scoped Keychain.
-                # All three reviewer OAuth sessions are expired, so this cannot
-                # be proven until those accounts are re-authenticated; confine
-                # omission to the path where the file was already rejected.
+                # Proven 2026-08-07: installed Claude starts cleanly without
+                # .credentials.json while authenticating from the scoped
+                # Keychain. A live claude-opus-5 reviewer on an account whose
+                # .credentials.json is an empty-token stub - so this omission
+                # branch fired - executed a command and returned a schema-valid
+                # verdict end to end. Omission stays confined to the path where
+                # the file was already rejected as not the credential source.
                 continue
             if entry.is_dir():
                 # Fresh and empty: the harness owns this state for one run. A

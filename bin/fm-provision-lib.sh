@@ -20,11 +20,15 @@
 #   budget allows, a recognized-but-unsupported package manager (yarn, bun), a
 #   JS component whose package manager cannot be determined from what the
 #   project declares, a declared runtime that cannot be found or does not run,
-#   a missing installer, a declaration reaching more requirements files than
-#   this library traverses, and a host missing a tool provisioning itself needs
+#   a missing installer, a pinned-Node toolchain directory that cannot be
+#   established, a declaration reaching more requirements files than this
+#   library traverses, and a host missing a tool provisioning itself needs
 #   (python3, or any bounded-execution mechanism). Every gap is named on stderr,
-#   in the provisioning log, and in the summary the caller records as task
-#   metadata - what was NOT provisioned is as loud as what was.
+#   in the provisioning log, in the summary the caller records as task metadata,
+#   and - the only one of the four the LANE itself can read - in
+#   .fm-provisioning.md at the root of the worktree, git-excluded before it is
+#   written. What was NOT provisioned is as loud as what was, on a surface the
+#   crewmate reaches without knowing the firstmate home layout.
 #   A FAILURE is an attempt that was made and did not complete. It REFUSES the
 #   spawn and names both the cause and the opt-out, because a lane launched on
 #   a half-built environment is worse than no lane. The failures are: an
@@ -33,8 +37,7 @@
 #   that cannot traverse, a tunable that is not a positive integer, an
 #   environment signature that is empty or unprovable, a UV_PROJECT_ENVIRONMENT
 #   that would put an environment where the probe cannot see it, and a cache
-#   directory, log, pinned-toolchain directory, or record that cannot be
-#   written.
+#   directory, log, or record that cannot be written.
 #   fm_provision_gap and fm_provision_fail are those two decision points, and
 #   every non-success outcome goes through exactly one of them, so a capability
 #   limit added later cannot become a spawn refusal by accident.
@@ -763,14 +766,24 @@ fm_provision_find_node_bin() {  # <major>
 # A published prefix is IMMUTABLE. It is shared - the key is derived from the
 # pinned runtime, so every spawn in this home that pins the same Node resolves to
 # the same directory - and crew_tool_path bakes it into a launched lane's PATH
-# for that lane's entire lifetime. Rebuilding it in place would reach into a
-# running crewmate's live PATH and unlink its binaries, which surfaces as
+# for that lane's entire lifetime. Rewriting one would reach into a running
+# crewmate's live PATH and unlink its binaries, which surfaces as
 # `node: command not found` mid-validation with nothing pointing at provisioning.
-# So a prefix is only ever created when absent: it is built under a private
-# temporary name and published with one rename(2), and an existing directory is
-# validated and reused, never rewritten. The key covers which toolchain entries
-# exist, so two builds for the same key produce identical content.
+# So a prefix is only ever CREATED, never rewritten, and the creation is claimed
+# with a single mkdir: mkdir is atomic and fails when the name already exists, so
+# there is no window between deciding the name is free and taking it. A spawn
+# that loses that race validates and reuses the winner's directory.
+# The key covers which toolchain entries exist, so two builds for the same key
+# produce identical content.
+#
+# Immutability needs a repair path, or one prefix that stops validating - a
+# binary removed from underneath it, a half-deleted state directory - would brick
+# every later spawn pinning that runtime forever. A name that exists but does not
+# validate is therefore STEPPED OVER, never rewritten: the next generation suffix
+# is tried, so a lane still holding the stale directory keeps whatever it has
+# while new spawns get a good prefix.
 FM_PROVISION_NODE_TOOLCHAIN='node npm npx corepack'
+FM_PROVISION_NODE_PREFIX_GENERATIONS=4
 
 fm_provision_node_prefix_valid() {  # <prefix> <pinned-bin>
   local shim=$1 bin=$2 name
@@ -786,8 +799,17 @@ fm_provision_node_prefix_valid() {  # <prefix> <pinned-bin>
   return 0
 }
 
+fm_provision_node_prefix_fill() {  # <prefix> <pinned-bin>
+  local shim=$1 bin=$2 name
+  for name in $FM_PROVISION_NODE_TOOLCHAIN; do
+    [ -x "$bin/$name" ] || continue
+    ln -s "$bin/$name" "$shim/$name" || return 1
+  done
+  fm_provision_node_prefix_valid "$shim" "$bin"
+}
+
 fm_provision_node_path_prefix() {  # <cache-dir> <pinned-bin>
-  local cache=$1 bin=$2 key shim name root build
+  local cache=$1 bin=$2 key shim name root base generation=0
   key=$(
     printf '%s\n' "$bin"
     for name in $FM_PROVISION_NODE_TOOLCHAIN; do
@@ -801,31 +823,28 @@ fm_provision_node_path_prefix() {  # <cache-dir> <pinned-bin>
     *) return 1 ;;
   esac
   root="$cache/node-toolchain"
-  shim="$root/${key:0:40}"
-  if [ -e "$shim" ] || [ -L "$shim" ]; then
-    fm_provision_node_prefix_valid "$shim" "$bin" || return 1
-    printf '%s' "$shim"
-    return 0
-  fi
+  base="$root/${key:0:40}"
   mkdir -p "$root" || return 1
-  build=$(mktemp -d "$root/.build.XXXXXX") || return 1
-  for name in $FM_PROVISION_NODE_TOOLCHAIN; do
-    [ -x "$bin/$name" ] || continue
-    ln -s "$bin/$name" "$build/$name" || { rm -rf "$build"; return 1; }
+  while [ "$generation" -lt "$FM_PROVISION_NODE_PREFIX_GENERATIONS" ]; do
+    shim=$base
+    [ "$generation" -eq 0 ] || shim="$base.$generation"
+    if mkdir "$shim" 2>/dev/null; then
+      if fm_provision_node_prefix_fill "$shim" "$bin"; then
+        printf '%s' "$shim"
+        return 0
+      fi
+      # Nothing ever saw this directory valid, so removing the claim this call
+      # just made cannot take a prefix out from under anyone.
+      rm -rf "$shim"
+      return 1
+    fi
+    if fm_provision_node_prefix_valid "$shim" "$bin"; then
+      printf '%s' "$shim"
+      return 0
+    fi
+    generation=$((generation + 1))
   done
-  if ! fm_provision_node_prefix_valid "$build" "$bin"; then
-    rm -rf "$build"
-    return 1
-  fi
-  if [ ! -e "$shim" ] && [ ! -L "$shim" ] && mv "$build" "$shim" 2>/dev/null; then
-    printf '%s' "$shim"
-    return 0
-  fi
-  # A concurrent spawn published first. Reuse its directory rather than touching
-  # it, and discard the copy this spawn built.
-  rm -rf "$build"
-  fm_provision_node_prefix_valid "$shim" "$bin" || return 1
-  printf '%s' "$shim"
+  return 1
 }
 
 # --- fingerprint and cache --------------------------------------------------
@@ -1133,6 +1152,71 @@ fm_provision_unavailable() {  # <log> <reason-token> <message>
   return 0
 }
 
+# The one provisioning surface the LANE can reach. stderr goes to the operator's
+# terminal, and the provisioning log and provision= metadata both live in the
+# firstmate home; a crewmate that hits a missing environment mid-validation can
+# read none of them, so what provisioning declared would be announced to nobody
+# who can act on it. This file sits at the root of the worktree the lane works
+# in, and names every component and what happened to it.
+#
+# The git exclusion is registered BEFORE the write and the report is skipped when
+# that cannot be done: a report that dirtied a checkout the freshness proof and
+# teardown both require to be clean would be a worse defect than a missing one,
+# and a diagnostic that cannot be filed is never a reason to refuse a spawn.
+FM_PROVISION_REPORT_NAME=.fm-provisioning.md
+
+fm_provision_report_body() {  # <worktree>; reads "<eco>\t<rel>\t<state>" on stdin
+  local wt=$1 eco rel state
+  local -a done_lines=() gap_lines=()
+  while IFS=$'\t' read -r eco rel state; do
+    [ -n "$eco" ] || continue
+    case "$state" in
+      installed|cached) done_lines+=("- $eco in $rel - $state") ;;
+      skipped:*) gap_lines+=("- $eco in $rel - NOT provisioned: ${state#skipped:}") ;;
+      *) gap_lines+=("- $eco in $rel - NOT provisioned: $state") ;;
+    esac
+  done
+  printf '# firstmate worktree provisioning\n\n'
+  printf 'firstmate provisioned this worktree (%s) before launching this lane.\n' "$wt"
+  printf 'Anything listed as NOT provisioned was decided here, at launch. If a check\n'
+  printf 'fails because that dependency environment is missing, provisioning declared\n'
+  printf 'it - nothing broke later.\n'
+  if [ "${#done_lines[@]}" -gt 0 ]; then
+    printf '\n## provisioned\n\n'
+    printf '%s\n' "${done_lines[@]}"
+  fi
+  if [ "${#gap_lines[@]}" -gt 0 ]; then
+    printf '\n## not provisioned\n\n'
+    printf '%s\n' "${gap_lines[@]}"
+  fi
+}
+
+fm_provision_report_unavailable() {  # <worktree> <log> <reason>
+  local wt=$1 log=$2 reason=$3 line
+  fm_provision_write_report "$wt" "$log" "$(
+    for line in "${components[@]}"; do
+      printf '%s\t%s\tskipped:%s\n' "${line%% *}" "${line#* }" "$reason"
+    done | fm_provision_report_body "$wt"
+  )"
+}
+
+fm_provision_write_report() {  # <worktree> <log> <body>
+  local wt=$1 log=$2 body=$3 report
+  report="$wt/$FM_PROVISION_REPORT_NAME"
+  if declare -F fm_provision_register_exclude >/dev/null \
+    && ! fm_provision_register_exclude "/$FM_PROVISION_REPORT_NAME"; then
+    fm_provision_announce "$log" \
+      "warning: cannot keep /$FM_PROVISION_REPORT_NAME out of git's view, so this lane gets no in-worktree provisioning report"
+    return 0
+  fi
+  printf '%s\n' "$body" > "$report" || {
+    fm_provision_announce "$log" \
+      "warning: cannot write the in-worktree provisioning report at $report"
+    return 0
+  }
+  return 0
+}
+
 # Whether the task this spawn is for names a component's directory. The brief is
 # the one path signal a spawn actually has, so an over-budget worktree spends its
 # budget on the components the task itself mentions before falling back to
@@ -1222,11 +1306,13 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
   if [ "$(fm_provision_bound_kind)" = none ]; then
     fm_provision_unavailable "$log" no-bounded-execution \
       "no bounded-execution mechanism (timeout, gtimeout, or perl) is available, so no install could be prevented from wedging the spawn"
+    fm_provision_report_unavailable "$wt" "$log" no-bounded-execution
     return 0
   fi
   if ! command -v python3 >/dev/null 2>&1; then
     fm_provision_unavailable "$log" no-python3 \
       "python3 is not installed, so no component's declared manifests or installed-environment readiness could be resolved"
+    fm_provision_report_unavailable "$wt" "$log" no-python3
     return 0
   fi
 
@@ -1338,40 +1424,50 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
       if [ -z "$pinned_bin" ]; then
         pinned_major=unsatisfiable
       else
-        pinned_prefix=$(fm_provision_node_path_prefix "$cache" "$pinned_bin") || {
-          fm_provision_fail "cannot create the pinned Node $pinned_major toolchain directory under $cache"
-          return 1
-        }
-        # Read by the sourcing caller (fm-spawn.sh's crew_tool_path).
-        # shellcheck disable=SC2034
-        FM_PROVISION_PATH_PREFIX=$pinned_prefix
-        PATH="$pinned_prefix:$PATH"
-        export PATH
-        echo "fm-spawn: pinning Node $pinned_major from $pinned_bin for this worktree" >&2
+        pinned_prefix=$(fm_provision_node_path_prefix "$cache" "$pinned_bin") || pinned_prefix=
+        if [ -z "$pinned_prefix" ]; then
+          pinned_major=no-prefix
+        else
+          # Read by the sourcing caller (fm-spawn.sh's crew_tool_path).
+          # shellcheck disable=SC2034
+          FM_PROVISION_PATH_PREFIX=$pinned_prefix
+          PATH="$pinned_prefix:$PATH"
+          export PATH
+          echo "fm-spawn: pinning Node $pinned_major from $pinned_bin for this worktree" >&2
+        fi
       fi
     fi
   fi
-  if [ "$pinned_major" = conflict ] || [ "$pinned_major" = unsatisfiable ]; then
-    index=0
-    for line in "${components[@]}"; do
-      eco=${line%% *}
-      rel=${line#* }
-      if [ "${states[$index]}" = planned ]; then
-        case "$eco" in
-          npm|pnpm)
-            if [ "$pinned_major" = conflict ]; then
-              states[index]=$(fm_provision_gap "$log" "$eco" "$rel" conflicting-node \
-                "components under $wt declare different Node major versions, and no single runtime can serve both")
-            else
-              states[index]=$(fm_provision_gap "$log" "$eco" "$rel" node-not-found \
-                "this project declares a Node major that was not found on PATH or under the standard version-manager directories (\$NVM_DIR, \$FNM_DIR, \$VOLTA_HOME, ~/.asdf)")
-            fi
-            ;;
-        esac
-      fi
-      index=$((index + 1))
-    done
-  fi
+  case "$pinned_major" in
+    conflict|unsatisfiable|no-prefix)
+      index=0
+      for line in "${components[@]}"; do
+        eco=${line%% *}
+        rel=${line#* }
+        if [ "${states[$index]}" = planned ]; then
+          case "$eco" in
+            npm|pnpm)
+              case "$pinned_major" in
+                conflict)
+                  states[index]=$(fm_provision_gap "$log" "$eco" "$rel" conflicting-node \
+                    "components under $wt declare different Node major versions, and no single runtime can serve both")
+                  ;;
+                unsatisfiable)
+                  states[index]=$(fm_provision_gap "$log" "$eco" "$rel" node-not-found \
+                    "this project declares a Node major that was not found on PATH or under the standard version-manager directories (\$NVM_DIR, \$FNM_DIR, \$VOLTA_HOME, ~/.asdf)")
+                  ;;
+                *)
+                  states[index]=$(fm_provision_gap "$log" "$eco" "$rel" node-prefix-unavailable \
+                    "no pinned Node toolchain directory could be established under $cache, so its dependencies cannot be installed against the runtime the lane would validate on")
+                  ;;
+              esac
+              ;;
+          esac
+        fi
+        index=$((index + 1))
+      done
+      ;;
+  esac
 
   # Registering the exclusion is a prerequisite, not a courtesy: an installer
   # that runs first would leave an unignored directory in a checkout the
@@ -1517,13 +1613,22 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
     index=$((index + 1))
   done
   FM_PROVISION_SUMMARY=$(IFS=,; printf '%s' "${results[*]}")
+  index=0
+  fm_provision_write_report "$wt" "$log" "$(
+    for line in "${components[@]}"; do
+      printf '%s\t%s\t%s\n' "${line%% *}" "${line#* }" "${states[$index]}"
+      index=$((index + 1))
+    done | fm_provision_report_body "$wt"
+  )"
   if [ "$skipped" -gt 0 ]; then
-    # Named, not counted: a lane that finds an empty environment mid-validation
-    # has to be able to see that provisioning said so at launch, and the same
-    # list is in the log and in the task's provision= metadata.
+    # Named, not counted, and on a surface the LANE can reach: the report written
+    # into the worktree above says the same thing, because stderr, the log, and
+    # provision= metadata all live in the firstmate home where a crewmate that
+    # hits a missing environment mid-validation cannot read any of them.
     fm_provision_announce "$log" \
       "warning: worktree provisioning left $skipped of ${#components[@]} components UNPROVISIONED:$unprovisioned"
     fm_provision_announce "$log" "warning: provisioning outcome per component - $FM_PROVISION_SUMMARY"
+    fm_provision_announce "$log" "warning: the lane's own copy is at $wt/$FM_PROVISION_REPORT_NAME"
   else
     fm_provision_announce "$log" "fm-spawn: worktree provisioned - $FM_PROVISION_SUMMARY"
   fi

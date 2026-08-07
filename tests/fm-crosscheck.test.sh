@@ -107,10 +107,32 @@ SH
   chmod +x "$case_dir/fakebin/gh-axi"
 }
 
+# Reviewer harnesses filter the environment they hand to shell commands. Codex
+# drops every name matching *KEY*, *SECRET*, or *TOKEN* by default, so the fakes
+# reproduce that filter before running the gate's attestation script.
+ATTEST_HELPER="$TMP_ROOT/attest-helper.sh"
+cat > "$ATTEST_HELPER" <<'SH'
+#!/usr/bin/env bash
+fm_test_attest() {
+  local script=$1 name upper
+  local -a strip
+  strip=()
+  if [ "${FM_TEST_EXCLUDE_DEFAULT_ENV:-}" = 1 ]; then
+    for name in $(python3 -c 'import os,sys; sys.stdout.write("\n".join(os.environ))'); do
+      upper=$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')
+      case "$upper" in
+        *KEY*|*SECRET*|*TOKEN*) strip+=(-u "$name") ;;
+      esac
+    done
+  fi
+  env ${strip[@]+"${strip[@]}"} bash "$script" >/dev/null
+}
+SH
+
 install_codex_fake() {
   local case_dir=$1
-  cat > "$case_dir/fakebin/codex" <<'SH'
-#!/usr/bin/env bash
+  cat "$ATTEST_HELPER" > "$case_dir/fakebin/codex"
+  cat >> "$case_dir/fakebin/codex" <<'SH'
 printf '%s\n' "$*" >> "$FM_TEST_CODEX_LOG"
 if [ -n "${FM_TEST_STATE_OBSERVATION:-}" ]; then
   find "$FM_TEST_EXPECTED_STATE" -mindepth 1 -maxdepth 1 \
@@ -129,6 +151,7 @@ output=
 model=
 effort=no
 approval=no
+envpolicy=no
 schema=
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -139,6 +162,7 @@ while [ "$#" -gt 0 ]; do
     -c)
       [ "$2" = 'model_reasoning_effort="xhigh"' ] && effort=yes
       [ "$2" = 'approval_policy="never"' ] && approval=yes
+      [ "$2" = 'shell_environment_policy.inherit=all' ] && envpolicy=yes
       shift 2
       ;;
     --color) [ "$2" = never ] || exit 92; shift 2 ;;
@@ -151,11 +175,12 @@ done
 [ "$model" = gpt-5.6-sol ] || exit 94
 [ "$effort" = yes ] || exit 95
 [ "$approval" = yes ] || exit 96
+[ "$envpolicy" = yes ] || exit 86
 [ -f "$schema" ] || exit 98
 [ -n "$workdir" ] && [ -n "$output" ] || exit 99
 cat > "$FM_TEST_PROMPT_LOG"
 if [ "${FM_TEST_SKIP_ATTESTATION:-}" != 1 ]; then
-  bash "$workdir/.crosscheck/attest.sh" >/dev/null || exit 97
+  fm_test_attest "$workdir/.crosscheck/attest.sh" || exit 97
 fi
 if [ "$FM_TEST_REVIEW_SCENARIO" = noisy-reviewer ]; then
   python3 "$FM_TEST_REVIEW_DRIVER" "$workdir" "$output" "$FM_TEST_REVIEW_SCENARIO" "$FM_TEST_HEAD"
@@ -173,8 +198,8 @@ SH
 
 install_claude_fake() {
   local case_dir=$1
-  cat > "$case_dir/fakebin/claude" <<'SH'
-#!/usr/bin/env bash
+  cat "$ATTEST_HELPER" > "$case_dir/fakebin/claude"
+  cat >> "$case_dir/fakebin/claude" <<'SH'
 printf '%s\n' "$*" >> "$FM_TEST_CLAUDE_LOG"
 [ "${CLAUDE_SECURESTORAGE_CONFIG_DIR:-}" = "$FM_TEST_REVIEWER_HOME" ] || exit 73
 case "${HOME:-}" in
@@ -199,7 +224,7 @@ if [ "${FM_TEST_STRIP_CONFIG_DIR:-}" = 1 ]; then
   # the gate's directory redirect.
   env -u CLAUDE_CONFIG_DIR bash "$PWD/.crosscheck/attest.sh" >/dev/null || exit 66
 elif [ "${FM_TEST_SKIP_ATTESTATION:-}" != 1 ]; then
-  bash "$PWD/.crosscheck/attest.sh" >/dev/null || exit 65
+  fm_test_attest "$PWD/.crosscheck/attest.sh" || exit 65
 fi
 [ "${1:-}" = -p ] || exit 81
 shift
@@ -1928,6 +1953,46 @@ assert value["runs"][-1]["state"] == "unreviewed", value["runs"][-1]["state"]
   pass "a reviewer that executes nothing fails loudly as unreviewed"
 }
 
+test_default_environment_exclusions_do_not_block_attestation() {
+  local harness record case_dir base head rc
+  # Reviewer harnesses filter the environment handed to their shell commands:
+  # Codex drops every name matching *KEY*, *SECRET*, or *TOKEN* by default. A
+  # witness delivered under such a name never reaches the reviewer's shell, so
+  # the self-test could never be satisfied and every review on that path would
+  # be forced to unreviewed - a self-inflicted denial of review.
+  for harness in codex claude; do
+    record=$(make_case "excluded-env-$harness")
+    IFS=$'\t' read -r case_dir base head <<< "$record"
+    if [ "$harness" = claude ]; then
+      sed -i.bak 's/model=gpt-5.5/model=gpt-5.6-sol/' "$case_dir/state/task-x1.meta"
+      rm "$case_dir/state/task-x1.meta.bak"
+      cat > "$case_dir/reviewer.json" <<EOF
+{"reviewers":[
+  {"harness":"claude","model":"claude-opus-5","effort":"xhigh","account_home":"$case_dir/reviewer-home"}
+]}
+EOF
+    fi
+    export FM_TEST_EXCLUDE_DEFAULT_ENV=1
+    set +e
+    run_case "$case_dir" "$base" "$head" clear run > "$case_dir/out" 2> "$case_dir/err"
+    rc=$?
+    set -e
+    unset FM_TEST_EXCLUDE_DEFAULT_ENV
+    expect_code 0 "$rc" "$harness reviewer under the default environment exclusions"
+    assert_contains "$(cat "$case_dir/out")" 'crosscheck clear' \
+      "$harness execution witness did not survive the harness environment exclusions"
+    assert_no_grep 'reviewer executed no command' "$case_dir/err" \
+      "a filtered environment was misreported as a dead execution tool"
+    python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["runs"][-1]["state"] == "clear", value["runs"][-1]["state"]
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+      || fail "$harness review under the default environment exclusions was not clear"
+  done
+  pass "the execution witness survives the reviewer harness environment exclusions"
+}
+
 test_stripped_config_redirect_is_unreviewed() {
   local record case_dir base head rc
   # The sandbox denies every write outside the review checkout, so a launcher
@@ -2157,6 +2222,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_symlinked_named_test_cannot_hide_test_mutation|\
     test_evidence_batch_item_limit_precedes_execution|\
     test_evidence_batch_has_aggregate_deadline|\
+    test_default_environment_exclusions_do_not_block_attestation|\
     test_signed_out_oauth_file_is_not_a_credential)
       "$FM_TEST_CASE"
       exit 0
@@ -2218,6 +2284,7 @@ test_stopped_reviewer_and_wrong_head_are_unreviewed
 test_completed_reviewer_suspicion_is_blocking
 test_reading_only_suspicion_is_a_tool_failure
 test_reviewer_that_executes_nothing_is_unreviewed
+test_default_environment_exclusions_do_not_block_attestation
 test_stripped_config_redirect_is_unreviewed
 test_signed_out_oauth_file_is_not_a_credential
 test_verify_rechecks_live_head_and_claims

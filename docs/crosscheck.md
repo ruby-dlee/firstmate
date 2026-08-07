@@ -148,10 +148,14 @@ Reviewer result arrays are capped at 32 entries, at most 32 evidence executions 
 ## Executed-review self-test
 
 Every reviewer must prove it executed at least one command in addition to supplying the verdict-level receipt bound to the exact base, exact head, execution `HOME`, and executing account.
-Crosscheck writes an attestation script into `.crosscheck/` and hands the harness a secret through its environment only; recording that secret's digest therefore requires actually running a command, which reading or writing files cannot fake.
+Crosscheck writes an attestation script into `.crosscheck/` and hands the harness a one-run witness value through its environment only; recording that witness's digest therefore requires actually running a command, which reading or writing files cannot fake.
 A reviewer whose command-execution tool is broken can still return a confident, well-formed verdict built from static reading alone, but that verdict can never reach this gate's executed-evidence standard.
 A missing or mismatched attestation is recorded as `unreviewed` and exits nonzero rather than degrading quietly to static-only analysis.
 The Claude attestation additionally records the harness config directory it actually ran under, so a discarded redirect fails loudly instead of costing the gate its account separation in silence.
+
+The witness variable is named `FM_CROSSCHECK_ATTEST_WITNESS` because harnesses filter the environment they hand to shell commands: Codex's default `shell_environment_policy` drops every name matching `*KEY*`, `*SECRET*`, or `*TOKEN*`, so a witness named after a secret would never reach the reviewer's shell and would force every Codex review to `unreviewed`.
+The Codex invocation additionally pins `shell_environment_policy.inherit=all` so an account configuration cannot narrow that inheritance out from under the self-test.
+When the script runs but the witness is absent it records a distinguishing marker rather than an empty digest, so a filtered environment is reported as exactly that instead of as a dead command-execution tool.
 
 ## Installed external contracts
 
@@ -178,6 +182,7 @@ The merge form with optional `commit_title` and `commit_message` fields was sepa
 The read adapter exposes no merge subcommand; only the gate-refused `fm-crosscheck.sh merge` boundary can reach its private exact-SHA merge primitive, and that boundary freshly verifies the ledger before issuing the request.
 
 The installed reviewer invocation was exercised successfully with `--output-schema`, `--output-last-message`, `--model gpt-5.6-sol`, and `model_reasoning_effort="xhigh"` before production code used those flags.
+`shell_environment_policy.inherit=all` is documented as a valid `-c` override by installed `codex-cli 0.146.0-alpha.9.2`'s own help text and is a known field of its `ShellEnvironmentPolicyTomlRaw`, so `--strict-config` accepts it; it has not been exercised through a live reviewer turn, and the same binary's embedded `*KEY*`, `*SECRET*`, and `*TOKEN*` default exclusion globs were read directly from it.
 The installed Claude invocation was exercised successfully with a private `HOME`, isolated per-run `CLAUDE_CONFIG_DIR`, selected-account `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `--model claude-opus-5`, `--effort xhigh`, `--dangerously-skip-permissions`, `--tools Bash,Read,Glob,Grep`, `--no-session-persistence`, `--output-format json`, and `--json-schema` before production code used those flags.
 The installed `/usr/bin/sandbox-exec` was also exercised with the generated profile: a write inside the allowed review directory succeeded, while sibling and `/private/tmp` writes failed with `Operation not permitted`.
 

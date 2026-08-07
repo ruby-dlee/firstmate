@@ -24,10 +24,13 @@ from typing import Any, Literal, NamedTuple, NoReturn
 import unicodedata
 
 
-if sys.version_info < (3, 9):
+if sys.version_info < (3, 11):
     raise SystemExit(
-        "CROSSCHECK UNREVIEWED: this gate requires Python 3.9 or newer, "
-        f"but {sys.executable} is {'.'.join(str(part) for part in sys.version_info[:3])}"
+        "CROSSCHECK UNREVIEWED: this gate requires Python 3.11 or newer because "
+        "older CPython applies no integer-literal bound, so a hostile artifact "
+        "parses unbounded; refuse rather than review with weaker bounds than the "
+        f"gate documents. {sys.executable} is "
+        f"{'.'.join(str(part) for part in sys.version_info[:3])}"
     )
 
 BIN_DIR = Path(__file__).resolve().parent
@@ -109,6 +112,21 @@ def environment_value(name: str, default: str) -> str:
 
     value = os.environ.get(name)
     return default if value is None or value == "" else value
+
+
+def executable_available(command: str) -> bool:
+    """Report whether a command names a runnable executable.
+
+    A path-shaped command is probed directly; a bare name is resolved through
+    ``PATH``. An empty command is never runnable, so a caller whose default is
+    empty never produces a misleading ``PATH`` lookup for the empty name.
+    """
+
+    if not command:
+        return False
+    if "/" in command:
+        return Path(command).is_file() and os.access(command, os.X_OK)
+    return shutil.which(command) is not None
 
 
 def claude_scoped_keychain_service(account_home: Path) -> str:
@@ -501,11 +519,7 @@ def run_sandboxed(
         }
     )
     sandbox = environment_value("FM_CROSSCHECK_SANDBOX_BIN", "sandbox-exec")
-    if "/" in sandbox:
-        sandbox_available = Path(sandbox).is_file() and os.access(sandbox, os.X_OK)
-    else:
-        sandbox_available = shutil.which(sandbox) is not None
-    if not sandbox_available:
+    if not executable_available(sandbox):
         tool_fail(
             "sandbox executable inspection found no runnable "
             f"FM_CROSSCHECK_SANDBOX_BIN={sandbox!r}"
@@ -571,8 +585,17 @@ def seed_reviewer_home(
                 # the sandbox, which is the intended isolation.
                 os.symlink(str(entry), destination)
             elif entry.is_file():
-                if entry.stat().st_size <= MAX_SEEDED_CONFIG_BYTES:
+                size = entry.stat().st_size
+                if size <= MAX_SEEDED_CONFIG_BYTES:
                     shutil.copy2(entry, destination)
+                else:
+                    print(
+                        f"CROSSCHECK NOTICE: reviewer home entry {entry.name} was "
+                        f"omitted from the seeded home at {home}: {size} bytes "
+                        f"exceeds the {MAX_SEEDED_CONFIG_BYTES}-byte seeding "
+                        "bound",
+                        file=sys.stderr,
+                    )
         except OSError as exc:
             fail(f"could not seed reviewer home entry {entry.name}: {exc}")
     for name in ("session-env", "shell-snapshots", "statsig"):
@@ -591,11 +614,7 @@ def resolve_claude_binary(account_home: Path) -> str:
     """
     override = environment_value("FM_CROSSCHECK_CLAUDE_BIN", "")
     if override:
-        if "/" in override:
-            available = Path(override).is_file() and os.access(override, os.X_OK)
-        else:
-            available = shutil.which(override) is not None
-        if not available:
+        if not executable_available(override):
             tool_fail(
                 "Claude reviewer executable inspection found no runnable "
                 f"FM_CROSSCHECK_CLAUDE_BIN={override!r}"
@@ -604,9 +623,14 @@ def resolve_claude_binary(account_home: Path) -> str:
     pin = account_home / ".agent-fleet-provider-binary.json"
     if pin.is_file():
         try:
-            recorded = json.loads(pin.read_text(encoding="utf-8"))
+            recorded = read_json(
+                pin,
+                "Claude reviewer provider-binary pin",
+                maximum_bytes=MAX_REVIEWER_CONFIG_BYTES,
+                maximum_items=64,
+            )
             candidate = recorded["binary"]["resolved_path"]
-        except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+        except (CrosscheckError, OSError, UnicodeError, ValueError, KeyError, TypeError):
             candidate = None
         if (
             isinstance(candidate, str)
@@ -620,6 +644,10 @@ def resolve_claude_binary(account_home: Path) -> str:
     return str(discovered)
 
 
+ATTEST_WITNESS_VARIABLE = "FM_CROSSCHECK_ATTEST_WITNESS"
+ATTEST_WITNESS_ABSENT = "witness-absent"
+
+
 def write_attestation(protocol_dir: Path) -> dict[str, str]:
     """Author the execution beacon that proves the reviewer ran a command.
 
@@ -627,18 +655,30 @@ def write_attestation(protocol_dir: Path) -> dict[str, str]:
     is handed to the harness through the environment and never written to the
     checkout. A reviewer whose execution tool is dead therefore cannot fabricate
     this file by reading or writing one.
+
+    The witness variable's name is load-bearing: harnesses filter the
+    environment they hand to shell commands, and Codex drops every name
+    matching ``*KEY*``, ``*SECRET*``, or ``*TOKEN*`` by default. A name that
+    matches one of those globs never reaches the reviewer's shell, so the
+    attestation can never be satisfied on that path. When the witness is
+    missing the script records a distinguishing marker instead of a truncated
+    digest, so a filtered environment is not misreported as a dead execution
+    tool.
     """
     nonce = hashlib.sha256(os.urandom(32)).hexdigest()
-    secret = hashlib.sha256(os.urandom(32)).hexdigest()
+    witness = hashlib.sha256(os.urandom(32)).hexdigest()
     script = protocol_dir / "attest.sh"
     script.write_text(
         "#!/bin/bash\n"
         "set -u\n"
         'out="$(dirname "$0")/attest.json"\n'
-        "if command -v sha256sum >/dev/null 2>&1; then\n"
-        '  digest=$(printf %s "$FM_CROSSCHECK_ATTEST_SECRET" | sha256sum | cut -d" " -f1)\n'
+        f'witness="${{{ATTEST_WITNESS_VARIABLE}:-}}"\n'
+        'if [ -z "$witness" ]; then\n'
+        f"  digest={ATTEST_WITNESS_ABSENT}\n"
+        "elif command -v sha256sum >/dev/null 2>&1; then\n"
+        '  digest=$(printf %s "$witness" | sha256sum | cut -d" " -f1)\n'
         "else\n"
-        '  digest=$(printf %s "$FM_CROSSCHECK_ATTEST_SECRET" | shasum -a 256 | cut -d" " -f1)\n'
+        '  digest=$(printf %s "$witness" | shasum -a 256 | cut -d" " -f1)\n'
         "fi\n"
         'printf \'{"nonce":"%s","digest":"%s","pid":"%s","config_dir":"%s"}\\n\' '
         f'"{nonce}" '
@@ -649,9 +689,9 @@ def write_attestation(protocol_dir: Path) -> dict[str, str]:
     script.chmod(0o700)
     return {
         "script": str(script),
-        "secret": secret,
+        "witness": witness,
         "nonce": nonce,
-        "digest": hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+        "digest": hashlib.sha256(witness.encode("utf-8")).hexdigest(),
     }
 
 
@@ -679,6 +719,13 @@ def require_reviewer_execution(
     require(
         recorded.get("nonce") == attestation["nonce"],
         "reviewer execution attestation does not carry this run's nonce",
+    )
+    require(
+        recorded.get("digest") != ATTEST_WITNESS_ABSENT,
+        "reviewer ran the attestation script, but the gate's execution witness "
+        f"never reached its command environment: {ATTEST_WITNESS_VARIABLE} was "
+        "absent or empty there, so the harness is filtering the environment the "
+        "gate delivers it through and execution cannot be proven",
     )
     require(
         recorded.get("digest") == attestation["digest"],
@@ -1873,11 +1920,7 @@ def reviewer_max_capture() -> int:
 
 def reviewer_binary(name: str, default: str, label: str) -> str:
     command = environment_value(name, default)
-    if "/" in command:
-        available = Path(command).is_file() and os.access(command, os.X_OK)
-    else:
-        available = shutil.which(command) is not None
-    if not available:
+    if not executable_available(command):
         tool_fail(
             f"{label} executable inspection found no runnable {name}={command!r}"
         )
@@ -1928,7 +1971,7 @@ def run_reviewer(
     schema_path.write_text(json.dumps(schema_value, indent=2) + "\n", encoding="utf-8")
     environment["HOME"] = config["execution_home"]
     attestation = write_attestation(protocol_dir)
-    environment["FM_CROSSCHECK_ATTEST_SECRET"] = attestation["secret"]
+    environment[ATTEST_WITNESS_VARIABLE] = attestation["witness"]
     prompt = attestation_instructions(attestation["script"]) + "\n" + make_prompt(
         snapshot_value, ledger, config
     )
@@ -1950,6 +1993,11 @@ def run_reviewer(
             f'model_reasoning_effort="{config["effort"]}"',
             "-c",
             'approval_policy="never"',
+            # The execution witness only reaches the reviewer through the
+            # environment its shell commands inherit, so pin that inheritance
+            # here rather than letting an account configuration narrow it.
+            "-c",
+            "shell_environment_policy.inherit=all",
             "--color",
             "never",
             "--output-schema",

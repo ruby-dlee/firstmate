@@ -335,24 +335,16 @@ function sameBatch(answer, batch) {
 
 function landingCandidate(name) {
   let match = name.match(/^lavish-board-([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)\.payload\.json$/);
-  if (match !== null) return { id: match[1], kind: 'legacy-state' };
-  match = name.match(/^lavish-answer-([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)-([a-f0-9]{64})(?: \(([0-9]+)\))?\.json$/);
+  if (match !== null) return { id: match[1] };
+  match = name.match(/^lavish-answer-([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)-([a-f0-9]{64})(?: \([0-9]+\))?\.json$/);
   if (match !== null) {
     return {
       id: match[1],
-      kind: 'request-bound-download',
       requestSha256: `sha256:${match[2]}`,
-      collisionIndex: Number(match[3] ?? 0),
     };
   }
-  match = name.match(/^lavish-answer-([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)(?: \(([0-9]+)\))?\.json$/);
-  if (match !== null) {
-    return {
-      id: match[1],
-      kind: 'legacy-download',
-      collisionIndex: Number(match[2] ?? 0),
-    };
-  }
+  match = name.match(/^lavish-answer-([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)(?: \([0-9]+\))?\.json$/);
+  if (match !== null) return { id: match[1] };
   return undefined;
 }
 
@@ -411,7 +403,7 @@ async function discoverLandingCandidates(home) {
           });
           continue;
         }
-        candidates.push({ ...landing, path, mtimeMs: info.mtimeMs });
+        candidates.push({ ...landing, path });
       } catch (error) {
         errors.push({ id: landing.id, path, error: `payload_scan_error: ${error.message}` });
       }
@@ -419,7 +411,6 @@ async function discoverLandingCandidates(home) {
   }
   candidates.sort((left, right) => (
     left.id.localeCompare(right.id)
-    || (right.mtimeMs ?? 0) - (left.mtimeMs ?? 0)
     || left.path.localeCompare(right.path)
   ));
   return { candidates, errors };
@@ -550,24 +541,14 @@ async function recoverLandingPayloads(home) {
       validatedCandidates.push({ candidate, batch });
     }
 
-    const requestBound = validatedCandidates.filter(
-      (entry) => entry.candidate.kind === 'request-bound-download',
+    const payloadBound = validatedCandidates.filter((entry) => entry.batch.landing !== undefined);
+    const latestSubmittedAt = payloadBound.reduce(
+      (latest, entry) => Math.max(latest, entry.batch.landing.submittedAtMs),
+      Number.NEGATIVE_INFINITY,
     );
-    const eligibleCandidates = requestBound.length > 0
-      ? requestBound
+    const authorizedCandidates = payloadBound.length > 0
+      ? payloadBound.filter((entry) => entry.batch.landing.submittedAtMs === latestSubmittedAt)
       : validatedCandidates;
-    const browserDownloads = eligibleCandidates.filter(
-      (entry) => entry.candidate.collisionIndex !== undefined,
-    );
-    const landingSeries = browserDownloads.length > 0
-      ? browserDownloads
-      : eligibleCandidates;
-    const highestCollisionIndex = Math.max(
-      ...landingSeries.map((entry) => entry.candidate.collisionIndex ?? 0),
-    );
-    const authorizedCandidates = landingSeries.filter(
-      (entry) => (entry.candidate.collisionIndex ?? 0) === highestCollisionIndex,
-    );
     const selected = authorizedCandidates[0];
     for (const contender of authorizedCandidates.slice(1)) {
       if (!sameBatch(
@@ -577,7 +558,9 @@ async function recoverLandingPayloads(home) {
         errors.push({
           id,
           status: 'payload-conflict',
-          detail: `${contender.candidate.path}: equally ranked landing payloads disagree`,
+          detail: payloadBound.length > 0
+            ? `${contender.candidate.path}: equally authoritative landing payloads disagree`
+            : `${contender.candidate.path}: landing payloads disagree without payload authority`,
         });
       }
     }

@@ -623,7 +623,11 @@ PY
   chmod +x "$dir/.venv/bin/python"
   : > "$case_dir/probe.log"
 
-  for code in 124 125 126 127 1; do
+  # 124/125/126/127 are the bounded runner's reserved codes. 2 is uv's OWN CLI
+  # exit for a usage error - a real code from a real invocation that still
+  # answered nothing about the environment - and 3 stands for any future exit uv
+  # grows. Only 1 is uv pip check's "I ran and found an inconsistency".
+  for code in 124 125 126 127 2 3 1; do
     printf '#!/usr/bin/env bash\nexit %s\n' "$code" > "$case_dir/probe-bin/uv"
     chmod +x "$case_dir/probe-bin/uv"
     # shellcheck disable=SC2016  # the snippet is evaluated inside run_lib's own shell
@@ -687,6 +691,36 @@ test_a_lockless_python_project_is_named_rather_than_invisible() {
   assert_not_contains "$out" 'python:mono/packages/alpha' \
     "a uv workspace member its root already installs was reported as an unprovisioned gap: $out"
   pass "a python project with no committed lock or requirements file is named, not silently skipped"
+}
+
+# The lockless-Python decision reads a PROJECT-CONTROLLED file, so like every
+# other such read in this library it runs under the bound. Without one, a
+# pathological pyproject.toml could hold a spawn open indefinitely - and this
+# check was added in the same round that bounded every sibling traversal, so it
+# is exactly the gap that round was closing.
+test_the_pyproject_declaration_read_is_bounded() {
+  local case_dir out
+  case_dir=$(new_case pyproject-bound none)
+  mkdir -p "$case_dir/wt/svc" "$case_dir/bound-bin"
+  printf '[project]\nname = "svc"\n' > "$case_dir/wt/svc/pyproject.toml"
+
+  # A grep that never returns. If the read is bounded, the tri-state resolves to
+  # "could not be determined" (2) and provisioning still answers; if it is not,
+  # this case hangs and the suite's own timeout is the failure.
+  printf '#!/usr/bin/env bash\nsleep 600\n' > "$case_dir/bound-bin/grep"
+  chmod +x "$case_dir/bound-bin/grep"
+
+  # shellcheck disable=SC2016  # the snippet is evaluated inside run_lib's own shell
+  out=$(FM_TEST_SNIPPET='
+    FM_PROVISION_BOUND_KIND=perl
+    FM_PROVISION_PROBE_TIMEOUT=2
+    fm_provision_python_project_declared "$FM_TEST_WT/svc"
+    printf "rc=%s\n" "$?"
+  ' run_lib PATH="$case_dir/bound-bin:/usr/bin:/bin" \
+    FM_TEST_WT="$case_dir/wt")
+  assert_contains "$out" 'rc=2' \
+    "an unreadable-within-bound pyproject.toml did not resolve to the undetermined state: $out"
+  pass "the pyproject declaration read is bounded and degrades to undetermined"
 }
 
 # The other side of that gap: a pyproject.toml carrying only tool configuration
@@ -1621,8 +1655,15 @@ SH
   printf '%s\n' "$fakebin"
 }
 
+# <name> <shape> <id> [ignore-mode]
+#
+# ignore-mode defaults to "ignored": the project commits a .gitignore covering
+# the install directories, which is what a real project does and is now the
+# precondition for provisioning at all - firstmate refuses rather than writing an
+# exclusion, because the only exclusion that would work is one in the MAIN
+# clone's info/exclude. Pass "unignored" for the refusal case.
 make_spawn_case() {
-  local name=$1 shape=$2 id=$3 case_dir home project worktree fakebin
+  local name=$1 shape=$2 id=$3 ignore_mode=${4:-ignored} case_dir home project worktree fakebin
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
   project="$case_dir/project"
@@ -1635,6 +1676,9 @@ make_spawn_case() {
   # fails the cleanliness proof long before provisioning is reached.
   fm_git_init_commit "$project"
   make_worktree "$project" "$shape"
+  if [ "$ignore_mode" = ignored ]; then
+    printf '.venv/\nnode_modules/\n.fm-provisioning.md\n' > "$project/.gitignore"
+  fi
   git -C "$project" add -A
   git -C "$project" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
     commit -qm 'project manifests'
@@ -1751,31 +1795,51 @@ test_spawn_failure_excludes_every_mutated_component() {
   expect_code 1 "$status" "a later component failure should refuse the spawn: $out"
   assert_grep 'uv pip install' "$CASE_DIR/install.log" "the earlier Python component did not install before the Node failure"
   assert_grep 'npm ci' "$CASE_DIR/install.log" "the later Node component did not reach its failing installer"
-  exclude_file=$(git -C "$WORKTREE_DIR" rev-parse --git-path info/exclude)
-  assert_grep '/svc/.venv/' "$exclude_file" "the successful earlier component was not excluded after a later failure"
-  assert_grep '/web/node_modules/' "$exclude_file" "the partially created failing component was not excluded"
+  # The property that matters is the worktree still being returnable, and it now
+  # holds because the PROJECT ignores these paths - not because provisioning wrote
+  # anything. Assert the outcome, and assert the primary clone was left alone:
+  # `--git-path info/exclude` from a linked worktree resolves to the MAIN clone,
+  # so a write there would make the path invisible to `git status` in the
+  # captain's own checkout, and repeatedly hiding install trees in a shared
+  # checkout is how work stops being visible at all.
   dirty=$(git -C "$WORKTREE_DIR" status --porcelain --untracked-files=all)
   [ -z "$dirty" ] || fail "a multi-component provisioning failure left the leased worktree dirty: $dirty"
-  pass "a later provisioning failure leaves every mutated component excluded"
+  exclude_file=$(git -C "$WORKTREE_DIR" rev-parse --git-path info/exclude)
+  assert_no_grep '\.venv' "$exclude_file" \
+    "provisioning wrote a Python install path into the main clone's info/exclude"
+  assert_no_grep 'node_modules' "$exclude_file" \
+    "provisioning wrote a Node install path into the main clone's info/exclude"
+  pass "a later provisioning failure leaves the worktree clean without writing to the main clone"
 }
 
-test_spawn_refuses_before_install_when_exclusion_cannot_be_registered() {
+# Provisioning refuses rather than hiding. It cannot make an unignored install
+# directory invisible to only this worktree: git ignores a linked worktree's own
+# info/exclude, and `--git-path info/exclude` resolves to the MAIN clone, so the
+# only working write is one that changes the captain's primary checkout
+# repo-wide. Installing anyway would leave the worktree untracked-dirty, fail its
+# returnable check on abort, and strand the pool lease - the condition that
+# hard-blocks the fleet once every workspace is held.
+test_spawn_refuses_before_install_when_the_project_does_not_ignore_the_install_dir() {
   local record id out status exclude_file
   id=provision-spawn-p8
-  record=$(make_spawn_case spawn-exclude-fail both "$id")
+  record=$(make_spawn_case spawn-exclude-fail both "$id" unignored)
   read_spawn_case "$record"
-  exclude_file=$(git -C "$WORKTREE_DIR" rev-parse --git-path info/exclude)
-  chmod 400 "$exclude_file"
   out=$(run_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR")
   status=$?
-  chmod 600 "$exclude_file"
-  expect_code 1 "$status" "an unwritable exclusion target should refuse the spawn: $out"
-  assert_contains "$out" 'cannot register the git exclusion' \
-    "the refusal did not identify exclusion registration: $out"
+  expect_code 1 "$status" "an unignored install directory should refuse the spawn: $out"
+  assert_contains "$out" 'does not ignore' \
+    "the refusal did not identify the unignored install directory: $out"
+  assert_contains "$out" '.gitignore' \
+    "the refusal did not tell the operator how to fix it: $out"
   [ ! -s "$CASE_DIR/install.log" ] \
-    || fail "an installer ran before exclusion registration succeeded: $(cat "$CASE_DIR/install.log")"
+    || fail "an installer ran despite an unprotected dependency directory: $(cat "$CASE_DIR/install.log")"
   assert_not_contains "$out" "spawned $id" "a spawn with an unprotected dependency directory still succeeded: $out"
-  pass "an exclusion failure refuses before any installer mutates the worktree"
+  exclude_file=$(git -C "$WORKTREE_DIR" rev-parse --git-path info/exclude)
+  assert_no_grep '\.venv' "$exclude_file" \
+    "the refusal still wrote a Python install path into the main clone's info/exclude"
+  assert_no_grep 'node_modules' "$exclude_file" \
+    "the refusal still wrote a Node install path into the main clone's info/exclude"
+  pass "an unignored install directory refuses before any installer runs, and never writes to the main clone"
 }
 
 test_provisioning_can_be_opted_out_per_spawn_and_per_home() {
@@ -1894,6 +1958,7 @@ test_a_component_below_the_scan_depth_is_reported_not_dropped
 test_a_scan_that_outlives_its_bound_launches_unprovisioned
 test_a_check_that_could_not_run_is_never_reported_as_a_verdict
 test_a_lockless_python_project_is_named_rather_than_invisible
+test_the_pyproject_declaration_read_is_bounded
 test_a_tool_configuration_pyproject_is_a_clean_noop
 test_an_inconsistent_environment_is_reported_rather_than_refused
 test_a_failing_install_refuses_the_spawn
@@ -1930,7 +1995,7 @@ test_spawn_over_the_component_budget_still_launches
 test_the_lane_can_read_what_provisioning_skipped
 test_teardown_removes_the_provisioning_log_with_the_task_state
 test_spawn_failure_excludes_every_mutated_component
-test_spawn_refuses_before_install_when_exclusion_cannot_be_registered
+test_spawn_refuses_before_install_when_the_project_does_not_ignore_the_install_dir
 test_provisioning_can_be_opted_out_per_spawn_and_per_home
 test_a_stale_lane_report_never_survives_into_the_next_lease
 test_an_unreadable_provisioning_setting_refuses_the_spawn

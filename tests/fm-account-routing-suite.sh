@@ -5608,6 +5608,7 @@ test_account_lock_owner_controls_reject_symlinks() {
 
 test_bounded_account_lock_reclaim_requires_exact_dead_owner() {
   local case_dir state task lock held start outside status before_inode after_inode
+  local identity_claim identity_key identity_value identity_saved identity_outside identity_mv
   . "$ROOT/bin/fm-account-routing-lib.sh"
   case_dir="$TMP_ROOT/bounded-account-lock-reclaim"
   state="$case_dir/state"
@@ -5697,6 +5698,68 @@ test_bounded_account_lock_reclaim_requires_exact_dead_owner() {
   [ "$status" -ne 0 ] || fail "bounded reclaim accepted an owner replacement during reclamation"
   [ -d "$lock" ] && [ ! -L "$lock" ] || fail "bounded reclaim deleted a replacement owner carrier"
   [ "$(sed -n '1p' "$lock/owner")" != 1 ] || fail "bounded reclaim did not install the replacement race fixture"
+
+  rm -rf "$lock"
+  mkdir "$lock"
+  printf '1\nstale-owner\n' > "$lock/owner"
+  identity_key=${lock##*/}
+  identity_key=${identity_key#"$FM_ACCOUNT_LOCK_PATH_PREFIX"}
+  identity_claim="$state/$FM_ACCOUNT_LOCK_IDENTITY_PREFIX$identity_key"
+  identity_value=$(fm_account_lock_identity_value account-meta "$task") \
+    || fail "bounded identity-race fixture could not render its exact claim"
+  identity_mv="$case_dir/identity-race-mv"
+  cat > "$identity_mv" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = "${FM_TEST_IDENTITY_RACE_LOCK:?}" ]; then
+  case "${FM_TEST_IDENTITY_RACE_MODE:?}" in
+    malformed)
+      printf 'malformed-identity\n' > "$FM_TEST_IDENTITY_RACE_CLAIM.replacement"
+      /bin/mv "$FM_TEST_IDENTITY_RACE_CLAIM.replacement" "$FM_TEST_IDENTITY_RACE_CLAIM"
+      ;;
+    symlink)
+      /bin/mv "$FM_TEST_IDENTITY_RACE_CLAIM" "$FM_TEST_IDENTITY_RACE_SAVED"
+      /bin/ln -s "$FM_TEST_IDENTITY_RACE_OUTSIDE" "$FM_TEST_IDENTITY_RACE_CLAIM"
+      ;;
+    *) exit 91 ;;
+  esac
+fi
+exec /bin/mv "$@"
+SH
+  chmod +x "$identity_mv"
+  if FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_TEST_ACCOUNT_MV_BIN="$identity_mv" FM_TEST_IDENTITY_RACE_LOCK="$lock" \
+    FM_TEST_IDENTITY_RACE_CLAIM="$identity_claim" FM_TEST_IDENTITY_RACE_MODE=malformed \
+    bash -c '. "$1"; fm_account_lock_exact_reclaim "$FM_TEST_IDENTITY_RACE_LOCK"' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh"; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim accepted a malformed task-identity replacement"
+  [ -d "$lock" ] && [ ! -L "$lock" ] || fail "bounded reclaim deleted the lock after task-identity substitution"
+  [ "$(cat "$identity_claim")" = malformed-identity ] \
+    || fail "bounded reclaim changed a substituted malformed task-identity claim"
+
+  printf '%s' "$identity_value" > "$identity_claim.replacement"
+  mv "$identity_claim.replacement" "$identity_claim"
+  identity_saved="$case_dir/identity.saved"
+  identity_outside="$case_dir/identity.outside"
+  printf 'outside-identity\n' > "$identity_outside"
+  if FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_TEST_ACCOUNT_MV_BIN="$identity_mv" FM_TEST_IDENTITY_RACE_LOCK="$lock" \
+    FM_TEST_IDENTITY_RACE_CLAIM="$identity_claim" FM_TEST_IDENTITY_RACE_MODE=symlink \
+    FM_TEST_IDENTITY_RACE_SAVED="$identity_saved" FM_TEST_IDENTITY_RACE_OUTSIDE="$identity_outside" \
+    bash -c '. "$1"; fm_account_lock_exact_reclaim "$FM_TEST_IDENTITY_RACE_LOCK"' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh"; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim accepted a symlinked task-identity replacement"
+  [ -d "$lock" ] && [ ! -L "$lock" ] || fail "bounded reclaim deleted the lock after task-identity symlinking"
+  [ -L "$identity_claim" ] || fail "bounded reclaim replaced a substituted task-identity symlink"
+  [ "$(cat "$identity_outside")" = outside-identity ] || fail "bounded reclaim changed a task-identity symlink target"
+  [ "$(cat "$identity_saved")" = "$identity_value" ] || fail "bounded reclaim changed the pinned task-identity generation"
   rm -rf "$case_dir"
   pass "bounded account locks reclaim only exact proven-dead owners"
 }
@@ -7236,6 +7299,7 @@ run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_prob
 run_isolated_test test_account_locks_support_maximum_task_identity
 run_isolated_test test_ownerless_lock_marker_rejects_symlink_clobber
 run_isolated_test test_account_lock_owner_controls_reject_symlinks
+run_isolated_test test_bounded_account_lock_reclaim_requires_exact_dead_owner
 run_isolated_test test_linux_stat_selection_avoids_filesystem_stat_output
 run_isolated_test test_darwin_stat_mode_preserves_special_permission_bits
 run_isolated_test test_stale_reclaim_guard_is_owned_before_lock_removal

@@ -865,10 +865,16 @@ fm_account_lock_is_bounded() {
 
 FM_ACCOUNT_LOCK_IDENTITY_NAME=
 FM_ACCOUNT_LOCK_IDENTITY_TASK=
+FM_ACCOUNT_LOCK_IDENTITY_FILE=
+FM_ACCOUNT_LOCK_IDENTITY_VALUE=
+FM_ACCOUNT_LOCK_IDENTITY_FS_IDENTITY=
 fm_account_lock_identity_validate() {  # <bounded-lock-path>
-  local lock=$1 state leaf key owner identity name task
+  local lock=$1 state leaf key owner identity name task remainder fs_identity value
   FM_ACCOUNT_LOCK_IDENTITY_NAME=
   FM_ACCOUNT_LOCK_IDENTITY_TASK=
+  FM_ACCOUNT_LOCK_IDENTITY_FILE=
+  FM_ACCOUNT_LOCK_IDENTITY_VALUE=
+  FM_ACCOUNT_LOCK_IDENTITY_FS_IDENTITY=
   fm_account_lock_is_bounded "$lock" || return 1
   state=${lock%/*}
   fm_account_real_directory "$state" || return 1
@@ -887,14 +893,21 @@ fm_account_lock_identity_validate() {  # <bounded-lock-path>
     exit 1 if !defined($value) || sha256_hex($value) ne $key;
     my ($name, $task) = $value =~ /\Aname=([A-Za-z0-9._-]+)\ntask=([A-Za-z0-9][A-Za-z0-9._-]*)\z/;
     exit 1 if !defined($name) || !defined($task);
-    print $name, qq{\n}, $task;
+    print $name, qq{\n}, $task, qq{\n}, $before[0], q{:}, $before[1];
   ' "$owner" "$key") || return 1
   case "$identity" in *$'\n'*) ;; *) return 1 ;; esac
   name=${identity%%$'\n'*}
-  task=${identity#*$'\n'}
-  case "$task" in *$'\n'*) return 1 ;; esac
+  remainder=${identity#*$'\n'}
+  task=${remainder%%$'\n'*}
+  fs_identity=${remainder#*$'\n'}
+  case "$task" in ''|*$'\n'*) return 1 ;; esac
+  case "$fs_identity" in *:* ) ;; *) return 1 ;; esac
+  value=$(fm_account_lock_identity_value "$name" "$task") || return 1
   FM_ACCOUNT_LOCK_IDENTITY_NAME=$name
   FM_ACCOUNT_LOCK_IDENTITY_TASK=$task
+  FM_ACCOUNT_LOCK_IDENTITY_FILE=$owner
+  FM_ACCOUNT_LOCK_IDENTITY_VALUE=$value
+  FM_ACCOUNT_LOCK_IDENTITY_FS_IDENTITY=$fs_identity
 }
 
 fm_account_lock_identity_claim() {  # <state-dir> <task> <name>
@@ -1081,9 +1094,25 @@ fm_account_lock_reclaim_owner_classify() {  # <lock-path>
   return "$owner_state"
 }
 
+fm_account_lock_identity_matches_pinned() {  # <lock> <claim> <value> <fs-identity> <inode> <pin>
+  local lock=$1 claim=$2 value=$3 fs_identity=$4 inode=$5 pin=$6
+  if [ -z "$claim" ]; then
+    ! fm_account_lock_is_bounded "$lock"
+    return
+  fi
+  fm_account_lock_identity_validate "$lock" || return 1
+  [ "$FM_ACCOUNT_LOCK_IDENTITY_FILE" = "$claim" ] \
+    && [ "$FM_ACCOUNT_LOCK_IDENTITY_VALUE" = "$value" ] \
+    && [ "$FM_ACCOUNT_LOCK_IDENTITY_FS_IDENTITY" = "$fs_identity" ] \
+    && [ "$(fm_account_path_inode "$claim" 2>/dev/null || true)" = "$inode" ] \
+    && [ "$(fm_account_path_inode "$pin" 2>/dev/null || true)" = "$inode" ] \
+    && fm_account_lock_safe_file_equals "$pin" "$value"
+}
+
 fm_account_lock_exact_reclaim() {  # <lock-path>
   local lock=$1 state owner carrier_inode owner_inode pinned_inode generation guard key reclaim moved_inode moved_owner_inode
-  local owner_pid owner_start owner_state carrier_identity owner_identity
+  local owner_pid owner_start owner_state carrier_identity owner_identity bounded=0
+  local identity_file identity_value identity_fs_identity identity_inode pinned_identity_inode
   local PATH=$FM_ACCOUNT_SYSTEM_PATH
   if fm_account_lock_reclaim_owner_classify "$lock"; then owner_state=0; else owner_state=$?; fi
   [ "$owner_state" -eq 1 ] || return 1
@@ -1091,6 +1120,18 @@ fm_account_lock_exact_reclaim() {  # <lock-path>
   owner_start=$FM_ACCOUNT_LOCK_RECLAIM_OWNER_START
   carrier_identity=$FM_ACCOUNT_LOCK_RECLAIM_CARRIER_IDENTITY
   owner_identity=$FM_ACCOUNT_LOCK_RECLAIM_OWNER_IDENTITY
+  if fm_account_lock_is_bounded "$lock"; then
+    bounded=1
+    identity_file=$FM_ACCOUNT_LOCK_IDENTITY_FILE
+    identity_value=$FM_ACCOUNT_LOCK_IDENTITY_VALUE
+    identity_fs_identity=$FM_ACCOUNT_LOCK_IDENTITY_FS_IDENTITY
+    identity_inode=$(fm_account_path_inode "$identity_file") || return 1
+  else
+    identity_file=
+    identity_value=
+    identity_fs_identity=
+    identity_inode=
+  fi
   carrier_inode=$(fm_account_path_inode "$lock") || return 1
   if [ -f "$lock" ] && [ ! -L "$lock" ]; then owner=$lock; else owner=$lock/owner; fi
   owner_inode=$(fm_account_path_inode "$owner") || return 1
@@ -1109,6 +1150,22 @@ fm_account_lock_exact_reclaim() {  # <lock-path>
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
     return 1
   }
+  if [ "$bounded" -eq 1 ]; then
+    if ! fm_account_system_exec "$FM_ACCOUNT_SYSTEM_LN_BIN" -n \
+      "$identity_file" "$generation/identity" 2>/dev/null; then
+      fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
+      return 1
+    fi
+    pinned_identity_inode=$(fm_account_path_inode "$generation/identity") || {
+      fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
+      return 1
+    }
+    [ "$pinned_identity_inode" = "$identity_inode" ] \
+      && fm_account_lock_safe_file_equals "$generation/identity" "$identity_value" || {
+        fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
+        return 1
+      }
+  fi
   key=$(fm_account_lock_artifact_key "$lock") || {
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
     return 1
@@ -1125,7 +1182,9 @@ fm_account_lock_exact_reclaim() {  # <lock-path>
     || [ "$FM_ACCOUNT_LOCK_RECLAIM_CARRIER_IDENTITY" != "$carrier_identity" ] \
     || [ "$FM_ACCOUNT_LOCK_RECLAIM_OWNER_IDENTITY" != "$owner_identity" ] \
     || [ "$(fm_account_path_inode "$lock" 2>/dev/null || true)" != "$carrier_inode" ] \
-    || [ "$(fm_account_path_inode "$owner" 2>/dev/null || true)" != "$owner_inode" ]; then
+    || [ "$(fm_account_path_inode "$owner" 2>/dev/null || true)" != "$owner_inode" ] \
+    || ! fm_account_lock_identity_matches_pinned "$lock" "$identity_file" "$identity_value" \
+      "$identity_fs_identity" "$identity_inode" "$generation/identity"; then
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
     fm_account_reclaim_guard_release "$guard"
     return 1
@@ -1141,6 +1200,12 @@ fm_account_lock_exact_reclaim() {  # <lock-path>
     fm_account_reclaim_guard_release "$guard"
     return 1
   }
+  if ! fm_account_lock_identity_matches_pinned "$lock" "$identity_file" "$identity_value" \
+    "$identity_fs_identity" "$identity_inode" "$generation/identity"; then
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
+    fm_account_reclaim_guard_release "$guard"
+    return 1
+  fi
   if ! fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MV_BIN" "$lock" "$reclaim" 2>/dev/null; then
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
     fm_account_reclaim_guard_release "$guard"
@@ -1155,6 +1220,15 @@ fm_account_lock_exact_reclaim() {  # <lock-path>
     moved_owner_inode=
   fi
   if [ "$moved_inode" != "$carrier_inode" ] || [ "$moved_owner_inode" != "$owner_inode" ]; then
+    if [ ! -e "$lock" ] && [ ! -L "$lock" ]; then
+      fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MV_BIN" "$reclaim" "$lock" 2>/dev/null || true
+    fi
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
+    fm_account_reclaim_guard_release "$guard"
+    return 1
+  fi
+  if ! fm_account_lock_identity_matches_pinned "$lock" "$identity_file" "$identity_value" \
+    "$identity_fs_identity" "$identity_inode" "$generation/identity"; then
     if [ ! -e "$lock" ] && [ ! -L "$lock" ]; then
       fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MV_BIN" "$reclaim" "$lock" 2>/dev/null || true
     fi

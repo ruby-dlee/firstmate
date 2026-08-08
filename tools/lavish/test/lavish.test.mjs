@@ -615,6 +615,13 @@ function browserDownloadName(manifest, collisionIndex = 0) {
   return `lavish-answer-${manifest.decision_id}-${digest}${suffix}.json`;
 }
 
+function landingAuthority(sequence, submittedAt) {
+  return {
+    id: `00000000-0000-4000-8000-${String(sequence).padStart(12, '0')}`,
+    submitted_at: submittedAt,
+  };
+}
+
 async function answer(fx, id, {
   choice = 1,
   note = '',
@@ -954,6 +961,11 @@ test('B1 board submit downloads the payload before showing its manual handoff', 
   assert.deepEqual(JSON.parse(submitted.downloaded[0].text), submitted.payload);
   assert.equal(submitted.payload.decision_id, id);
   assert.equal(submitted.payload.home_marker, resolve(fx.home));
+  assert.match(submitted.payload.landing.id, /^[0-9a-f-]{36}$/);
+  assert.equal(
+    new Date(submitted.payload.landing.submitted_at).toISOString(),
+    submitted.payload.landing.submitted_at,
+  );
   const confirmation = submitted.document.querySelector('#confirmation');
   assert.equal(confirmation.hidden, false);
   assert.match(confirmation.textContent, /Answer downloaded/);
@@ -1472,7 +1484,7 @@ test('intake recovers a browser download payload without manual copy', async () 
   assert.equal(again.stdout, '');
 });
 
-test('intake authorizes the highest numbered browser download collision', async () => {
+test('intake uses payload-bound authority for numbered download collisions', async () => {
   const fx = await fixture('download-numbered-collision');
   const id = await createRequest(fx);
   const manifest = await manifestFor(fx, id);
@@ -1480,7 +1492,9 @@ test('intake authorizes the highest numbered browser download collision', async 
   await mkdir(downloads);
   await writeFile(
     join(downloads, browserDownloadName(manifest)),
-    `${JSON.stringify(browserPayload(fx, manifest))}\n`,
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      landing: landingAuthority(1, '2026-08-08T12:00:00.000Z'),
+    }))}\n`,
   );
   await writeFile(
     join(downloads, browserDownloadName(manifest, 1)),
@@ -1491,6 +1505,7 @@ test('intake authorizes the highest numbered browser download collision', async 
         question_note: 'This later download is authoritative.',
         option_comments: {},
       }],
+      landing: landingAuthority(2, '2026-08-08T12:01:00.000Z'),
     }))}\n`,
   );
 
@@ -1514,7 +1529,7 @@ test('intake authorizes the highest numbered browser download collision', async 
   assert.equal(again.stdout, '');
 });
 
-test('intake refuses equally ranked request-bound download collisions', async () => {
+test('intake refuses cross-directory disagreements without payload authority', async () => {
   const fx = await fixture('download-equal-collision');
   const id = await createRequest(fx);
   const manifest = await manifestFor(fx, id);
@@ -1543,9 +1558,83 @@ test('intake refuses equally ranked request-bound download collisions', async ()
   });
   assert.equal(intake.code, 6, intake.stderr);
   assert.match(intake.stdout, /payload-conflict/);
-  assert.match(intake.stdout, /equally ranked landing payloads disagree/);
+  assert.match(intake.stdout, /landing payloads disagree without payload authority/);
   assert.equal(await exists(join(fx.home, 'data/decisions', id, 'answer.toon')), false);
   assert.equal(await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')), false);
+});
+
+test('intake ignores cross-directory filename rank when payload authority is newer', async () => {
+  const fx = await fixture('download-cross-directory-authority');
+  const id = await createRequest(fx);
+  const manifest = await manifestFor(fx, id);
+  const downloads = join(fx.root, 'Downloads');
+  await mkdir(downloads);
+  await mkdir(join(fx.home, 'state'), { recursive: true });
+  await writeFile(
+    join(downloads, browserDownloadName(manifest)),
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      landing: landingAuthority(2, '2026-08-08T12:01:00.000Z'),
+    }))}\n`,
+  );
+  await writeFile(
+    join(fx.home, 'state', browserDownloadName(manifest, 1)),
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      answers: [{
+        key: 'rollout',
+        value: 'green',
+        question_note: 'Stale answer with a higher directory-local suffix.',
+        option_comments: {},
+      }],
+      landing: landingAuthority(1, '2026-08-08T12:00:00.000Z'),
+    }))}\n`,
+  );
+
+  const intake = await runCli(['intake'], {
+    home: fx.home,
+    env: { LAVISH_DOWNLOADS_DIR: downloads },
+  });
+  assert.equal(intake.code, 0, intake.stderr);
+  assert.match(intake.stdout, /release-choice,payload-collected/);
+  const stored = decode(
+    await readFile(join(fx.home, 'data/decisions', id, 'answer.toon'), 'utf8'),
+    { strict: true },
+  );
+  assert.equal(stored.answers[0].value, 'blue');
+});
+
+test('intake refuses tied payload authority when answer content differs', async () => {
+  const fx = await fixture('download-tied-authority');
+  const id = await createRequest(fx);
+  const manifest = await manifestFor(fx, id);
+  const downloads = join(fx.root, 'Downloads');
+  await mkdir(downloads);
+  await mkdir(join(fx.home, 'state'), { recursive: true });
+  await writeFile(
+    join(downloads, browserDownloadName(manifest)),
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      landing: landingAuthority(1, '2026-08-08T12:00:00.000Z'),
+    }))}\n`,
+  );
+  await writeFile(
+    join(fx.home, 'state', browserDownloadName(manifest)),
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      answers: [{
+        key: 'rollout',
+        value: 'green',
+        question_note: '',
+        option_comments: {},
+      }],
+      landing: landingAuthority(2, '2026-08-08T12:00:00.000Z'),
+    }))}\n`,
+  );
+
+  const intake = await runCli(['intake'], {
+    home: fx.home,
+    env: { LAVISH_DOWNLOADS_DIR: downloads },
+  });
+  assert.equal(intake.code, 6, intake.stderr);
+  assert.match(intake.stdout, /equally authoritative landing payloads disagree/);
+  assert.equal(await exists(join(fx.home, 'data/decisions', id, 'answer.toon')), false);
 });
 
 test('intake refuses a request-bound filename for another question set', async () => {
@@ -1782,6 +1871,12 @@ test('collect fails closed with named errors for count, key, option, and request
     {
       name: 'payload_wrong_home',
       payload: browserPayload(fx, manifest, { home_marker: resolve(fx.root, 'other-home') }),
+    },
+    {
+      name: 'payload_invalid_landing',
+      payload: browserPayload(fx, manifest, {
+        landing: landingAuthority(1, '2026-08-08T12:00:00Z'),
+      }),
     },
   ];
   for (const failure of cases) {

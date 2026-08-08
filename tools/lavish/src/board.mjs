@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -358,6 +359,7 @@ function boardScript(decision) {
       decision_id: decision.id,
       home_marker: decision.home,
       request_sha256: decision.manifest.request_sha256,
+      landing_id: randomUUID(),
       items: decision.manifest.items.map((item) => ({
         key: item.key,
         title: item.title,
@@ -367,6 +369,7 @@ function boardScript(decision) {
       decision_id: decision.id,
       home_marker: decision.home,
       request_sha256: decision.manifest.request_sha256,
+      landing_id: randomUUID(),
       questions: decision.manifest.questions.map((question) => ({
         key: question.key,
         prompt: question.prompt,
@@ -389,12 +392,13 @@ function boardScript(decision) {
   const downloadFilename = 'lavish-answer-' + MANIFEST.decision_id + '-'
     + requestDigest + '.json';
 
-  function buildPayload() {
+  function buildPayload(landing) {
     return {
       schema_version: ${ANSWER_SCHEMA_VERSION},
       decision_id: MANIFEST.decision_id,
       home_marker: MANIFEST.home_marker,
       request_sha256: MANIFEST.request_sha256,
+      ...(landing === undefined ? {} : { landing }),
       ${parts.buildEntries}
       note: overallNote.value,
     };
@@ -450,7 +454,10 @@ function boardScript(decision) {
   });
 
   document.querySelector('#submit-button').addEventListener('click', (event) => {
-    const payload = buildPayload();
+    const payload = buildPayload({
+      id: MANIFEST.landing_id,
+      submitted_at: new Date().toISOString(),
+    });
     const payloadJson = JSON.stringify(payload, null, 2) + '\\n';
     submitError.hidden = true;
     submittedPayload.value = payloadJson;

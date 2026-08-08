@@ -131,7 +131,8 @@ Field-less protocol-1 manifests infer that same contract from the destination ex
 Payload recovery scans configured download locations plus the effective state root's legacy landing files as one batch.
 An unreadable configured location fails the batch before any candidate is committed or any intake result is published.
 New payloads route by `home_marker`; legacy unmarked downloads remain recoverable only in a home whose immutable decision id and request digest match.
-Request-bound browser filenames isolate each immutable question set, and intake authorizes the highest numbered browser collision while refusing equally ranked disagreements.
+Request-bound browser filenames isolate each immutable question set.
+Schema-version-2 board payloads carry a unique landing id and canonical submission timestamp; intake uses that validated payload metadata across every scanned directory and refuses disagreements when payload authority is absent or tied.
 
 All commands require either `FM_HOME` or an explicit `--home <path>` and never guess a fleet home.
 Firstmate's internal commands use `FM_HOME`; captain-facing commands carry the resolved absolute `--home` path.
@@ -167,7 +168,8 @@ TOON's strict decoder validates every encoded array count before Lavish applies 
 - schema version `2` treats omitted annotations as empty; present question notes, item notes, and the overall note must be strings, option comments must map declared option values to strings, and explicit `null` is invalid for any annotation field
 - annotation answers are schema version `2` only, because annotations did not exist in version `1`
 
-Schema-version-2 browser and JSON-destination payloads also carry the resolved absolute `home_marker` used for fail-closed cross-home routing.
+Schema-version-2 browser payloads also carry the resolved absolute `home_marker` used for fail-closed cross-home routing plus landing metadata used only to authorize one candidate when downloads collide.
+JSON-destination payloads carry the same `home_marker` but omit transport-only landing metadata after collection.
 
 `receipt.toon` contains:
 

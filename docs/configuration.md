@@ -434,6 +434,8 @@ Gitignored files are intentional local material and remain outside this collisio
 A new or growing inventory produces a durable `HYGIENE:` alert immediately, while forced session-start and spawn-preflight checks repeat any unresolved alert for an operator.
 An inventory read failure preserves the prior hygiene alert and marks the latest coverage result unhealthy until a complete scan succeeds.
 Unreadable active-home project directories, unreadable or malformed Treehouse state, or a covered checkout that becomes uninspectable during either refresh pass surface an actionable diagnostic and mark the latest coverage result unhealthy.
+Acquisition has a narrower ownership scope than background coverage: malformed or unreadable state under the active home's managed `$FM_HOME/.treehouse` root remains unknown and blocks that home's acquisition, while state under the scan-only legacy `~/.treehouse` root is named and skipped for acquisition only so one foreign home cannot veto another.
+That foreign-state skip never reclassifies null, missing, or malformed data as an empty pool, and broad refresh coverage remains unhealthy until every scanned state is inspectable.
 The ordinary safe-refresh warning separately quantifies every non-ignored untracked file and the subset under those skill directories, so other untracked accumulation is bounded by the same 15-minute backstop.
 These checks inspect paths only and never delete, move, stash, reset, or edit a draft.
 The signal interval and backstop are configurable through `FM_CHECKOUT_REFRESH_INTERVAL` and `FM_CHECKOUT_REFRESH_BACKSTOP`.

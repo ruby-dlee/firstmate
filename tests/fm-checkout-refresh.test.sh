@@ -766,7 +766,7 @@ test_treehouse_discovery_failure_invalidates_coverage_health() {
 
 test_treehouse_state_failure_is_scoped_to_owning_home() {
   local owner_home="$TMP_ROOT/treehouse-null-owner" owner_source owner_root owner_state
-  local other_home other_source fakebin marker out status lease
+  local other_home other_source fakebin marker out status outcome state_json expected
   fakebin="$TMP_ROOT/treehouse-null-fakebin"
   owner_source="$owner_home/projects/source"
   owner_root="$owner_home/.treehouse"
@@ -782,45 +782,76 @@ SH
 
   printf '%s\n' '{"worktrees":[]}' > "$owner_state"
   marker="$TMP_ROOT/treehouse-owner-empty-called"
-  lease=$(HOME="$TEST_HOME" FM_HOME="$owner_home" FM_ROOT_OVERRIDE="$ROOT" \
+  set +e
+  out=$(HOME="$TEST_HOME" FM_HOME="$owner_home" FM_ROOT_OVERRIDE="$ROOT" \
     FM_CHECKOUT_REFRESH_STATE_ROOT="$owner_home/refresh-state" \
     FM_CHECKOUT_REFRESH_LOCK_ROOT="$owner_home/refresh-locks" \
     FM_TREEHOUSE_ROOT="$owner_root" FM_TEST_TREEHOUSE_CALLED="$marker" \
     PATH="$fakebin:$PATH" \
-    "$ROOT/bin/fm-checkout-refresh.sh" acquire-worktree "$owner_source" owner-empty)
+    "$ROOT/bin/fm-checkout-refresh.sh" acquire-worktree "$owner_source" owner-empty 2>&1)
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] || fail "known-empty owner pool blocked Treehouse acquisition: $out"
   [ -e "$marker" ] || fail "known-empty owner pool did not reach the Treehouse acquisition boundary"
-  assert_contains "$lease" fake-acquired \
+  assert_contains "$out" fake-acquired \
     "known-empty owner pool did not return the fake acquisition result"
   rm -f "$marker"
 
-  printf '%s\n' '{"worktrees":null}' > "$owner_state"
   for other_home in "$TMP_ROOT/treehouse-null-other-a" "$TMP_ROOT/treehouse-null-other-b"; do
     other_source="$other_home/projects/source"
     mkdir -p "$other_source" "$other_home/config"
     fm_git_init_commit "$other_source"
-    set +e
-    out=$(HOME="$TEST_HOME" FM_HOME="$other_home" FM_ROOT_OVERRIDE="$ROOT" \
-      FM_CHECKOUT_REFRESH_STATE_ROOT="$other_home/refresh-state" \
-      FM_CHECKOUT_REFRESH_LOCK_ROOT="$other_home/refresh-locks" \
-      FM_TREEHOUSE_ROOT="$owner_root" \
-      "$ROOT/bin/fm-checkout-refresh.sh" pool-preflight "$other_source" 2>&1)
-    status=$?
-    set -e
-    [ "$status" -eq 0 ] \
-      || fail "foreign malformed state blocked pool preflight for other home $other_home: $out"
-    marker="$other_home/treehouse-called"
-    lease=$(HOME="$TEST_HOME" FM_HOME="$other_home" FM_ROOT_OVERRIDE="$ROOT" \
-      FM_CHECKOUT_REFRESH_STATE_ROOT="$other_home/refresh-state" \
-      FM_CHECKOUT_REFRESH_LOCK_ROOT="$other_home/refresh-locks" \
-      FM_TREEHOUSE_ROOT="$owner_root" FM_TEST_TREEHOUSE_CALLED="$marker" \
-      PATH="$fakebin:$PATH" \
-      "$ROOT/bin/fm-checkout-refresh.sh" acquire-worktree "$other_source" other-home)
-    [ -e "$marker" ] \
-      || fail "foreign malformed state blocked acquisition for other home $other_home"
-    assert_contains "$lease" fake-acquired \
-      "other home did not receive the fake acquisition result"
   done
 
+  # EVERY synthetic foreign home must reach acquisition for EVERY corrupt
+  # foreign-state outcome below, while the diagnostic preserves UNKNOWN.
+  while IFS='|' read -r outcome state_json expected; do
+    printf '%s\n' "$state_json" > "$owner_state"
+    for other_home in "$TMP_ROOT/treehouse-null-other-a" "$TMP_ROOT/treehouse-null-other-b"; do
+      other_source="$other_home/projects/source"
+      set +e
+      out=$(HOME="$TEST_HOME" FM_HOME="$other_home" FM_ROOT_OVERRIDE="$ROOT" \
+        FM_CHECKOUT_REFRESH_STATE_ROOT="$other_home/refresh-state" \
+        FM_CHECKOUT_REFRESH_LOCK_ROOT="$other_home/refresh-locks" \
+        FM_TREEHOUSE_ROOT="$owner_root" \
+        "$ROOT/bin/fm-checkout-refresh.sh" pool-preflight "$other_source" 2>&1)
+      status=$?
+      set -e
+      [ "$status" -eq 0 ] \
+        || fail "foreign $outcome state blocked pool preflight for other home $other_home: $out"
+      assert_contains "$out" "ignored foreign Treehouse state at $owner_state" \
+        "foreign $outcome state was skipped without naming its path"
+      assert_contains "$out" "$expected" \
+        "foreign $outcome diagnostic did not identify its outcome class"
+
+      marker="$other_home/treehouse-called-$outcome"
+      rm -f "$marker"
+      set +e
+      out=$(HOME="$TEST_HOME" FM_HOME="$other_home" FM_ROOT_OVERRIDE="$ROOT" \
+        FM_CHECKOUT_REFRESH_STATE_ROOT="$other_home/refresh-state" \
+        FM_CHECKOUT_REFRESH_LOCK_ROOT="$other_home/refresh-locks" \
+        FM_TREEHOUSE_ROOT="$owner_root" FM_TEST_TREEHOUSE_CALLED="$marker" \
+        PATH="$fakebin:$PATH" \
+        "$ROOT/bin/fm-checkout-refresh.sh" acquire-worktree "$other_source" "other-home-$outcome" 2>&1)
+      status=$?
+      set -e
+      [ "$status" -eq 0 ] \
+        || fail "foreign $outcome state blocked acquisition for other home $other_home: $out"
+      [ -e "$marker" ] \
+        || fail "foreign $outcome state stopped acquisition before the Treehouse boundary for $other_home"
+      assert_contains "$out" fake-acquired \
+        "other home did not receive the fake acquisition result for foreign $outcome state"
+      assert_contains "$out" "ignored foreign Treehouse state at $owner_state" \
+        "acquisition skipped foreign $outcome state without naming its path"
+    done
+  done <<'CASES'
+null|{"worktrees":null}|worktrees is null; state is unknown, not an empty pool
+malformed-json|{"worktrees":[|Expecting value
+missing-worktrees|{}|worktrees is required; state is unknown, not an empty pool
+wrong-container|{"worktrees":{}}|worktrees must be an array
+CASES
+
+  printf '%s\n' '{"worktrees":null}' > "$owner_state"
   marker="$TMP_ROOT/treehouse-owner-null-called"
   set +e
   out=$(HOME="$TEST_HOME" FM_HOME="$owner_home" FM_ROOT_OVERRIDE="$ROOT" \

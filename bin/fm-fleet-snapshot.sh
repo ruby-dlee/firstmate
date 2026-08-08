@@ -313,8 +313,8 @@ task_json_lines() {
     current_source=$(printf '%s' "$current_json" | jq -r '.source // ""')
     current_liveness=$(printf '%s' "$current_json" | jq -r '.liveness // ""')
     case "$current_liveness" in
-      alive|'') current_activity_usable=1 ;;
-      dead|unknown) current_activity_usable=0 ;;
+      alive) current_activity_usable=1 ;;
+      dead|unknown|'') current_activity_usable=0 ;;
       *) current_activity_usable=0 ;;
     esac
 
@@ -325,10 +325,10 @@ task_json_lines() {
     # reconciled against the crewmate LIFECYCLE, which only clears a stale decision the
     # crewmate has provably moved past. Two lifecycle signals clear it, neither of which
     # reads any report content:
-    #   - a live activity read (run-step or busy pane) that is working/done, so a
+    #   - an exact run-step with affirmative liveness that is working/done, so a
     #     crewmate that resumed past a gate is not still reported as parked. A
-    #     dead or unknown liveness observation is not usable activity evidence;
-    #     a line with no observation keeps the historical behavior; and
+    #     dead, unknown, absent, or pane-only liveness observation is not usable
+    #     activity evidence; and
     #   - a TERMINAL done/failed state on a single-owner task (scout or ship), whose
     #     deliverable is its report or PR, so a COMPLETED scout surfaces only as a
     #     report POINTER, never as a reopened pending decision.
@@ -339,7 +339,7 @@ task_json_lines() {
     # open decision surfacing.
     open_decisions_tsv=$(status_open_decisions "$status_log")
     if [ "$kind" != secondmate ] && \
-       { { { [ "$current_source" = run-step ] || [ "$current_source" = pane ]; } \
+       { { [ "$current_source" = run-step ] \
            && [ "$current_activity_usable" = 1 ] \
            && [ "$current_state" != parked ] && [ "$current_state" != blocked ]; } \
          || { [ "$current_state" = "done" ] || [ "$current_state" = "failed" ]; }; }; then

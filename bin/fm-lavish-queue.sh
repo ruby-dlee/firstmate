@@ -139,9 +139,14 @@ esac
 
 relative_answer=${ANSWER#"$FM_HOME/"}
 message="Captain submitted Lavish decision $DECISION. The durable answer is saved at $relative_answer and should now be ingested at $DESTINATION. Run bin/fm-lavish-intake.sh if needed, read the answer, and do not ask the captain to resubmit."
-verdict=$(fm_backend_send_text_submit "$backend" "$target" "$message" 3 0.4 0.2)
+verdict=$(fm_backend_send_steering "$backend" "$target" "$message" 2>/dev/null) \
+  || verdict=send-failed
 case "$verdict" in
-  empty)
+  confirmed)
+    fm_backend_capture "$backend" "$target" 1 >/dev/null 2>&1 || {
+      echo "fm-lavish-queue: atomic prompt receipt could not be bound to a readable supervisor target" >&2
+      exit 4
+    }
     tmp=$(mktemp "$delivery_dir/.$DECISION.digest.XXXXXX")
     printf '%s\n' "$DIGEST" > "$tmp"
     chmod 600 "$tmp"
@@ -149,7 +154,7 @@ case "$verdict" in
     printf 'lavish-delivery: prompt queued for %s via %s %s\n' "$DECISION" "$backend" "$target"
     ;;
   *)
-    printf 'fm-lavish-queue: prompt submit was not confirmed for %s: %s\n' "$DECISION" "$verdict" >&2
+    printf 'fm-lavish-queue: no identity-bound atomic prompt receipt for %s: %s\n' "$DECISION" "$verdict" >&2
     exit 4
     ;;
 esac

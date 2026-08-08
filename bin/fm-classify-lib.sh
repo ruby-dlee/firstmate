@@ -232,8 +232,14 @@ status_blocker_has_proof() {  # <status-line>
     $1 !~ /^assumption=[^[:space:]].*/ { exit 1 }
     $2 !~ /^test=[^[:space:]].*/ { exit 1 }
     $3 !~ /^result=[^[:space:]].*/ { exit 1 }
-    tolower($2) ~ /^test=(untested|none|unknown|not run)([[:space:]]|$)/ { exit 1 }
-    tolower($3) ~ /^result=(untested|none|unknown|not run)([[:space:]]|$)/ { exit 1 }
+    {
+      assumption = tolower(substr($1, length("assumption=") + 1))
+      test = tolower(substr($2, length("test=") + 1))
+      result = tolower(substr($3, length("result=") + 1))
+    }
+    assumption ~ /^(none|unknown|n\/a|na|nil|null|tbd|todo|pending|unsure|not sure|no assumption|will|plan|planned|future)([[:space:][:punct:]]|$)/ { exit 1 }
+    test ~ /^(untested|none|unknown|n\/a|na|nil|null|tbd|todo|pending|not run|not yet|will|would|should|could|plan|planned|to run|future|later)([[:space:][:punct:]]|$)/ { exit 1 }
+    result ~ /^(untested|none|unknown|n\/a|na|nil|null|tbd|todo|pending|not run|not yet|will|would|should|could|awaiting|future|later)([[:space:][:punct:]]|$)/ { exit 1 }
   '
 }
 
@@ -427,9 +433,9 @@ scan_crew_liveness_observations() {  # <state-dir>
 }
 
 # A run's `working` field selects the exact process window but never proves life.
-# BUSY requires any affirmative run-owned process sample; every absence or read
-# failure is UNKNOWN. A busy pane is already affirmative evidence. A proven
-# durable pause applies only after no active run/pane evidence was established.
+# BUSY requires an affirmative run-owned process sample; every absence, read
+# failure, and pane-only working signal is UNKNOWN. A proven durable pause applies
+# only after no active run evidence was established.
 crew_absorb_observation() {  # <id> [declared-pause-status-line]
   local id=$1 declared_pause=${2:-} line state src run_rc
   [ -n "$id" ] || { printf 'none'; return; }
@@ -448,7 +454,7 @@ crew_absorb_observation() {  # <id> [declared-pause-status-line]
               *) printf 'unknown'; return ;;
             esac
             ;;
-          pane) printf 'working'; return ;;
+          pane) printf 'unknown'; return ;;
         esac
       fi
       ;;

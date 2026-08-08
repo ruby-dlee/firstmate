@@ -14,21 +14,21 @@ They also include recognized mid-run Claude or Codex permission prompts and busy
 The permission-prompt matcher and the explicitly heuristic macOS system-dialog fallback are detailed in [permission-stall-detection.md](permission-stall-detection.md).
 Repeated permission-stall escalations add an escalation count to the wake reason and, at `FM_PERMISSION_DEMAND_INSPECT_COUNT`, a `demand-deep-inspection` marker.
 Those actionable wakes are written to a durable local queue (`state/.wake-queue`) before detector state advances, so a missed process exit can be recovered by draining the queue.
-No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when a backend busy signature is present or `bin/fm-run-liveness.sh` finds at least one exact-run process in its repeated process window.
+No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when `bin/fm-run-liveness.sh` finds at least one exact-run process in its repeated process window; a pane-only busy signature remains UNKNOWN.
 Signal and stale-lane task windows run concurrently up to `FM_LIVENESS_MAX_PARALLEL`; a larger batch surfaces without guessing so no supervisor classification pass serializes an unbounded fleet.
 The run status is only the record that selects the process window and never proves life by itself.
 The sampler can emit BUSY only from affirmative evidence; absence at any window length is UNKNOWN and can never become idle, dead, or wedged.
-It rejects detached scouts and any run whose exact ID and branch do not both belong to the ship lane, then records a contemporaneous `uptime` and `vm_stat` snapshot before interpreting process evidence.
+It rejects detached scouts and any run whose exact ID, branch, and head do not all belong to the ship lane before and after sampling, then records a contemporaneous `uptime` and `vm_stat` snapshot before interpreting process evidence.
 Measured load peaks up to 88 make descheduling a well-supported mechanism for widening observation gaps, but not a proven cause of any particular gap because the samples and spikes were not time-correlated; either way, the absence predicate has no safe threshold to tune.
 A crewmate that declares `paused:` for a known external wait is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
 A pause is a statement about the work rather than about the terminal, so it is honoured whether the crewmate's pane is alive, idle, or gone, and whatever its attributed no-mistakes run reports - parked, failed or cancelled, or unreadable.
-The single exception is an actively `working` run-step or busy pane, which supersedes the declaration because the crewmate resumed after making it.
+The single exception is an actively `working` exact run-step with affirmative process evidence, which supersedes the declaration because the crewmate resumed after making it.
 Absorption is gated on two proofs taken from one immutable read of the crewmate's current durable status stream: the pause verb carrying no failure vocabulary in its headline, and an empty keyed open/resolved fold, so a pause can never mask a still-unanswered decision.
 The Herdr native blocked-transition edge does not yet honour this invariant, which is a known defect tracked as `herdr-push-transition-pause-gate-h8`: on that edge a lane that owes an unanswered keyed decision can be silently absorbed and go quiet.
 A crewmate with no locatable status stream is refused rather than absorbed, and stopped crewmates without a declared pause surface immediately.
 Pause cadence markers remain in force while the latest durable status still declares the pause and are cleared only after that status resumes, so every continuously declared pause still re-surfaces on the bounded long cadence.
 Its initial normal-mode status signal still surfaces through the no-verb path, while away mode self-handles that routine signal and owns the later recheck.
-Fresh stale panes use the same current-state read before trusting the status log, so an active run or busy pane outranks an old captain-relevant status-log line left behind before validation.
+Fresh stale panes use the same current-state read before trusting the status log, so only an active exact run-step outranks an old captain-relevant status-log line left behind before validation; pane-only evidence remains UNKNOWN.
 Heartbeats inspect unsurfaced captain-relevant statuses only; they never promote a one-shot run field or process absence into a liveness verdict.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
 At each drain boundary, `fm-wake-drain.sh` first intakes durable Lavish answers, then drains queued wakes and runs the same liveness guard as the supervision scripts, so unreceipted answers recover and a lapsed watcher chain surfaces even on a turn that only drains and handles queued wakes.

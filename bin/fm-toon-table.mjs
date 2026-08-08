@@ -75,16 +75,22 @@ function decodeScalar(value) {
   return trimmed;
 }
 
-function assignField(target, text) {
+function assignField(target, text, prefix = "") {
   const fieldMatch = text.match(/^([A-Za-z0-9_]+):(?: +(.*))?$/);
-  if (!fieldMatch || !wanted.includes(fieldMatch[1])) return;
+  if (!fieldMatch) return null;
+  const field = prefix ? `${prefix}.${fieldMatch[1]}` : fieldMatch[1];
   if (fieldMatch[2] === undefined || fieldMatch[2] === "") {
-    throw new Error(`required field ${fieldMatch[1]} is nested or empty`);
+    if (wanted.some((name) => name.startsWith(`${field}.`))) return field;
+    if (!wanted.includes(field)) return null;
+    throw new Error(`required field ${field} is nested or empty`);
   }
-  target[fieldMatch[1]] = decodeScalar(fieldMatch[2]);
+  if (!wanted.includes(field)) return null;
+  target[field] = decodeScalar(fieldMatch[2]);
+  return null;
 }
 
 try {
+  let nestedPrefix = null;
   for (let i = headerIndex + 1; i < lines.length; i += 1) {
     const line = lines[i];
     if (line.trim() === "") continue;
@@ -93,9 +99,11 @@ try {
     if (indent === rowIndent && line.slice(indent).startsWith("- ")) {
       if (row !== null) rows.push(row);
       row = {};
-      assignField(row, line.slice(indent + 2));
+      nestedPrefix = assignField(row, line.slice(indent + 2));
     } else if (row !== null && indent === fieldIndent) {
-      assignField(row, line.slice(indent));
+      nestedPrefix = assignField(row, line.slice(indent));
+    } else if (row !== null && indent === fieldIndent + 2 && nestedPrefix !== null) {
+      assignField(row, line.slice(indent), nestedPrefix);
     }
   }
   if (row !== null) rows.push(row);

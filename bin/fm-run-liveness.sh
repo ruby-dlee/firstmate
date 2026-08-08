@@ -76,7 +76,7 @@ mv "$host_tmp" "$HOST_CACHE" \
 HOST_EVIDENCE=$HOST_CACHE
 
 read_run_record() {  # [exact-run-id]
-  local expected=${1:-} out
+  local expected=${1:-} out resolved_head
   if [ -n "$expected" ]; then
     out=$(cd "$WORKTREE" && "$NM_BIN" axi status --run "$expected" 2>/dev/null) || return 1
   else
@@ -85,14 +85,25 @@ read_run_record() {  # [exact-run-id]
   RUN_ID=$(printf '%s\n' "$out" | sed -n 's/^  id: *"\([^"]*\)".*/\1/p' | head -1)
   RUN_BRANCH=$(printf '%s\n' "$out" | sed -n 's/^  branch: *\([^[:space:]]*\).*/\1/p' | head -1)
   RUN_BRANCH=${RUN_BRANCH#\"}; RUN_BRANCH=${RUN_BRANCH%\"}
+  RUN_HEAD=$(printf '%s\n' "$out" | sed -n 's/^  head: *\([^[:space:]]*\).*/\1/p' | head -1)
+  RUN_HEAD=${RUN_HEAD#\"}; RUN_HEAD=${RUN_HEAD%\"}
   RUN_STATUS=$(printf '%s\n' "$out" | sed -n 's/^  status: *\([^[:space:]]*\).*/\1/p' | head -1)
-  [ -n "$RUN_ID" ] && [ -n "$RUN_BRANCH" ] && [ -n "$RUN_STATUS" ] || return 1
+  [ -n "$RUN_ID" ] && [ -n "$RUN_BRANCH" ] && [ -n "$RUN_HEAD" ] && [ -n "$RUN_STATUS" ] || return 1
+  case "$RUN_HEAD" in
+    ????????????????????????????????????????) case "$RUN_HEAD" in *[!0-9a-fA-F]*) return 1 ;; esac ;;
+    *) return 1 ;;
+  esac
   [ "$RUN_BRANCH" = "$OWN_BRANCH" ] || return 1
+  resolved_head=$(git -C "$WORKTREE" rev-parse --verify "$RUN_HEAD^{commit}" 2>/dev/null) || return 1
+  [ "$resolved_head" = "$OWN_HEAD" ] || return 1
   [ -z "$expected" ] || [ "$RUN_ID" = "$expected" ]
 }
 
-read_run_record || emit_result 2 "inconclusive: no exact branch-matched no-mistakes run record for $ID"
+OWN_HEAD=$(git -C "$WORKTREE" rev-parse --verify HEAD 2>/dev/null) \
+  || emit_result 2 "inconclusive: task head is unreadable for $ID"
+read_run_record || emit_result 2 "inconclusive: no exact branch-and-head-matched no-mistakes run record for $ID"
 START_RUN=$RUN_ID
+START_HEAD=$RUN_HEAD
 case "$START_RUN" in ''|*[!A-Za-z0-9_-]*) emit_result 2 "inconclusive: unsafe run id in no-mistakes status" ;; esac
 [ "$RUN_STATUS" = running ] || emit_result 2 "inconclusive: run $START_RUN status is $RUN_STATUS, not running"
 read_run_record "$START_RUN" \
@@ -177,9 +188,13 @@ while [ "$i" -le "$SAMPLES" ]; do
   i=$((i + 1))
 done
 
+CURRENT_HEAD=$(git -C "$WORKTREE" rev-parse --verify HEAD 2>/dev/null) \
+  || emit_result 2 "inconclusive: task head became unreadable during sampling run $START_RUN"
+[ "$CURRENT_HEAD" = "$OWN_HEAD" ] \
+  || emit_result 2 "inconclusive: task head changed during sampling run $START_RUN"
 read_run_record "$START_RUN" || emit_result 2 "inconclusive: exact run record disappeared after sampling run $START_RUN"
-if [ "$RUN_ID" != "$START_RUN" ] || [ "$RUN_STATUS" != running ]; then
-  emit_result 2 "inconclusive: run record changed during sampling (start=$START_RUN end=${RUN_ID:-none} status=${RUN_STATUS:-none})"
+if [ "$RUN_ID" != "$START_RUN" ] || [ "$RUN_HEAD" != "$START_HEAD" ] || [ "$RUN_STATUS" != running ]; then
+  emit_result 2 "inconclusive: run record changed during sampling (start=$START_RUN head=$START_HEAD end=${RUN_ID:-none} end_head=${RUN_HEAD:-none} status=${RUN_STATUS:-none})"
 fi
 
 baseline_seconds=

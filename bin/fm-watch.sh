@@ -3,8 +3,8 @@
 # Classifies supervision wakes in bash. In normal mode it absorbs benign wakes
 # and keeps blocking; it queues and exits only for actionable wakes.
 # The no-verb signal and stale path is absorb-only-when-provably-working: a wake
-# is absorbed only when the crewmate shows POSITIVE evidence it is still working (an
-# actively-running no-mistakes step, or a backend busy signal), and surfaced
+# is absorbed only when the crewmate shows POSITIVE evidence it is still working
+# through an actively-running no-mistakes step, and surfaced
 # otherwise, so a crewmate that finishes (or stops and waits) without a current
 # working signal is never silently swallowed. A declared external-wait pause is
 # the separate idle absorb case and re-surfaces only on its long bounded cadence,
@@ -15,8 +15,8 @@
 #                          has a captain-relevant verb OR a no-verb signal's crewmate
 #                          is not provably working, unless afk is active
 #   stale: <window>        a process-window-proved run is absorbed regardless of
-#                          what the status log says - an active
-#                          run-step or busy pane outranks even a captain-relevant log
+#                          what the status log says - an active run-step outranks
+#                          even a captain-relevant log
 #                          line, since the crewmate's own log gets no new entry once
 #                          firstmate hands it to a no-mistakes validation. A declared
 #                          external-wait pause is absorbed instead with its own long
@@ -146,9 +146,8 @@ BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'}
 # debug log, and keeps blocking WITHOUT enqueuing or exiting. The no-verb signal
 # / stale path is absorb-only-when-provably-working: such a wake is absorbed ONLY
 # while the crewmate shows positive evidence it is still working (an actively-running
-# no-mistakes step, or a busy pane, via crew_is_provably_working over
-# fm-crew-state.sh); a crewmate that stopped its turn with no running pipeline and no
-# busy pane is SURFACED, so a finish reported only through interactive pane menus
+# no-mistakes step via crew_is_provably_working over
+# fm-crew-state.sh); pane-only evidence is UNKNOWN and is SURFACED, so a finish reported only through interactive pane menus
 # (no done: status) is never swallowed. An ACTIONABLE wake (a captain-relevant
 # signal, a no-verb signal whose crewmate is not provably working, any check, a stale
 # pane whose crewmate is not provably working, a stale whose repeated process
@@ -1233,7 +1232,7 @@ EOF
     #   - any status file carries a captain-relevant verb;
     #   - or it is a no-verb wake (a bare turn-end, a working: note) whose crewmate is
     #     NOT provably working - the crewmate stopped its turn with no actively-running
-    #     pipeline and no busy pane, so it may be done (even via an interactive menu
+    #     pipeline, so it may be done (even via an interactive menu
     #     that wrote no done: status), waiting on a decision, or wedged. Absorbing
     #     such a turn-end is exactly the swallowed-finish this change guards against.
     # Actionable -> enqueue, advance .seen-* markers, exit. Benign (a no-verb wake
@@ -1419,9 +1418,8 @@ EOF
           # poll. Root cause of the 2026-07 herdr false-surface incidents: a
           # validating crewmate was surfaced as stale every few minutes despite an
           # actively-running pipeline, purely because of this stale leftover
-          # line. On a NEW hash, give an active run/busy pane (the same
-          # authoritative source fm-crew-state.sh itself already prioritizes
-          # over the log) a chance to override before trusting the log.
+          # line. On a NEW hash, give an active exact run-step a chance to
+          # override before trusting the log.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             if [ "$(watch_absorb_class "$(window_to_task "$w" "$STATE")")" = working ]; then
               printf '%s' "$h" > "$sf"

@@ -4369,6 +4369,72 @@ if [ "$BACKEND" != herdr ]; then
   spawn_send_key "$T" Enter
 fi
 
+bind_codex_runtime_generation() {
+  local wait_seconds deadline provider identify_out verify_out rc session lock tmp
+  wait_seconds=${FM_CODEX_RUNTIME_BIND_WAIT_SECONDS:-10}
+  case "$wait_seconds" in ''|*[!0-9]*|0) echo "error: invalid Codex runtime bind wait '$wait_seconds'" >&2; return 1 ;; esac
+  deadline=$(( $(date +%s) + wait_seconds ))
+  while :; do
+    if [ "$(fm_account_meta_value "$STATE/$ID.meta" generation_id)" != "$SPAWN_GENERATION_ID" ] \
+      || [ "$(fm_account_meta_value "$STATE/$ID.meta" runtime_started_at_ns)" != "$RUNTIME_STARTED_AT_NS" ]; then
+      echo "error: Codex task generation changed during provider-session binding for $ID" >&2
+      return 1
+    fi
+    provider=$(fm_account_meta_value "$STATE/$ID.meta" provider_session_id)
+    if [ -z "$provider" ]; then
+      if identify_out=$(node "$SCRIPT_DIR/fm-codex-runtime-profile.mjs" \
+        "$CODEX_RUNTIME_HOME" "$WT" gpt-5.6-sol xhigh - "$RUNTIME_STARTED_AT_NS" 2>&1); then
+        session=${identify_out#verified: session=}
+        session=${session%% *}
+        case "$session" in ''|*[!A-Za-z0-9._:-]*) echo "error: Codex returned an unsafe provider session identity" >&2; return 1 ;; esac
+        lock=$(fm_account_meta_lock_acquire "$STATE" "$ID") || return 1
+        if [ "$(fm_account_meta_value "$STATE/$ID.meta" generation_id)" != "$SPAWN_GENERATION_ID" ] \
+          || [ "$(fm_account_meta_value "$STATE/$ID.meta" runtime_started_at_ns)" != "$RUNTIME_STARTED_AT_NS" ]; then
+          fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+          echo "error: Codex task generation changed before provider-session binding for $ID" >&2
+          return 1
+        fi
+        tmp=$(mktemp "$STATE/.$ID.meta.runtime-bind.XXXXXX") || {
+          fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+          return 1
+        }
+        if ! awk -F= '$1 != "provider_session_id" { print }' "$STATE/$ID.meta" > "$tmp" \
+          || ! printf 'provider_session_id=%s\n' "$session" >> "$tmp" \
+          || ! fm_account_safe_file_destination "$STATE/$ID.meta" \
+          || ! mv "$tmp" "$STATE/$ID.meta"; then
+          rm -f "$tmp"
+          fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+          echo "error: could not bind Codex provider session to generation $SPAWN_GENERATION_ID" >&2
+          return 1
+        fi
+        fm_account_meta_lock_release "$lock" || return 1
+      else
+        rc=$?
+        [ "$rc" -ne 1 ] || { printf '%s\n' "$identify_out" >&2; return 1; }
+      fi
+    fi
+    if [ -n "$(fm_account_meta_value "$STATE/$ID.meta" provider_session_id)" ]; then
+      if verify_out=$("$SCRIPT_DIR/fm-runtime-profile.sh" "$ID" 2>&1); then
+        if [ "$(fm_account_meta_value "$STATE/$ID.meta" generation_id)" = "$SPAWN_GENERATION_ID" ] \
+          && [ "$(fm_account_meta_value "$STATE/$ID.meta" runtime_started_at_ns)" = "$RUNTIME_STARTED_AT_NS" ] \
+          && [ "$(fm_account_meta_value "$STATE/$ID.meta" provider_session_id)" = "${provider:-$session}" ]; then
+          return 0
+        fi
+        echo "error: Codex task generation changed after runtime verification for $ID" >&2
+        return 1
+      else
+        rc=$?
+        [ "$rc" -ne 1 ] || { printf '%s\n' "$verify_out" >&2; return 1; }
+      fi
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || {
+      echo "error: Codex generation $SPAWN_GENERATION_ID did not bind and verify an exact provider session" >&2
+      return 1
+    }
+    sleep 0.1
+  done
+}
+
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   session_sync_args=("$ID" --wait "${FM_ACCOUNT_SESSION_WAIT_SECONDS:-10}" --require)
   if [ "$RESUME_ACCOUNT" = 1 ]; then
@@ -4390,6 +4456,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     echo "error: managed provider launch for $ID did not bind a fresh SessionStart mapping" >&2
     exit 1
   fi
+  [ "$HARNESS" != codex ] || bind_codex_runtime_generation || exit 1
   [ -z "$ACCOUNT_NATIVE_LAUNCH_DIR" ] || rm -rf "$ACCOUNT_NATIVE_LAUNCH_DIR" || exit 1
   ACCOUNT_NATIVE_LAUNCH_DIR=
   ACCOUNT_NATIVE_LAUNCH_GO=
@@ -4420,6 +4487,8 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     fi
   fi
 fi
+[ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || [ "$HARNESS" != codex ] \
+  || bind_codex_runtime_generation || exit 1
 [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || ACCOUNT_SPAWN_COMMITTED=1
 if [ -n "$EXISTING_TASK_TMP" ] && [ "$EXISTING_TASK_TMP" != "$TASK_TMP" ]; then
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1

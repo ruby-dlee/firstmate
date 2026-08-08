@@ -188,7 +188,7 @@ test_managed_tmux_window_id_reverse_mapping() {
 
 # crew_is_provably_working: the absorb-only-when-provably-working predicate. It is
 # benign (absorb) ONLY when fm-crew-state.sh reports the crewmate as working from an
-# actively-running pipeline step (source run-step) or a busy pane (source pane);
+# actively-running pipeline step (source run-step);
 # everything else - a stale working: status-log line, a finished/parked/failed run,
 # an unknown/torn-down crewmate, or an empty id - is NOT provable, so it surfaces. The
 # fake fm-crew-state.sh (FM_CREW_STATE_BIN) returns a canned verdict per case.
@@ -212,7 +212,7 @@ test_crew_is_provably_working_classifier() {
   FM_FAKE_RUN_LIVENESS_RC=2 crew_is_provably_working a \
     && fail "unknown command-step record with no affirmative process sample was treated as working"
   FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
-  crew_is_provably_working a || fail "busy pane not treated as provably working"
+  ! crew_is_provably_working a || fail "pane-only evidence was treated as provably working"
   FM_FAKE_CREW_STATE='state: working · source: status-log · working: compiling'
   ! crew_is_provably_working a || fail "stale status-log working: treated as provably working"
   FM_FAKE_CREW_STATE='state: done · source: run-step · checks green'
@@ -226,7 +226,7 @@ test_crew_is_provably_working_classifier() {
   FM_FAKE_CREW_STATE='state: working · source: run-step · x'
   ! crew_is_provably_working "" || fail "empty id treated as provably working"
   unset FM_FAKE_CREW_STATE
-  pass "crew_is_provably_working: only working+run-step/pane is provable; idle/finished/parked/failed/unknown surface"
+  pass "crew_is_provably_working: only an affirmative exact run-step is provable"
 }
 
 # status_is_paused: the shared pause verb test both consumers read (so neither
@@ -334,7 +334,7 @@ test_failure_pause_is_failure_classifier() {
 }
 
 # crew_absorb_class: the single fm-crew-state.sh read that distinguishes working
-# (positive process window/busy pane), unknown (complete all-zero process window),
+# (positive process window), unknown (complete all-zero process window or pane-only signal),
 # paused (declared external wait), and none (surface it without a wedge claim).
 # crew_is_paused delegates to it exactly as crew_is_provably_working does.
 #
@@ -356,7 +356,7 @@ test_crew_absorb_class_classifier() {
     || fail "historical dead field was not downgraded to unknown"
   unset FM_FAKE_RUN_LIVENESS_RC
   FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
-  [ "$(crew_absorb_class a)" = working ] || fail "busy pane not classed working"
+  [ "$(crew_absorb_class a)" = unknown ] || fail "pane-only evidence not classed unknown"
   printf 'paused: awaiting upstream\n' > "$state/a.status"
   FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting upstream'
   [ "$(crew_absorb_class a)" = paused ] || fail "declared pause not classed paused"
@@ -521,22 +521,22 @@ test_provably_working_signal_absorbed() {
   pass "a no-verb signal whose crew is provably working is absorbed (no exit, no queue, suppressor advanced, beacon present)"
 }
 
-test_turn_ended_provably_working_absorbed() {
-  local dir state fakebin out pid
-  dir=$(make_case turn-ended-working); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
+test_turn_ended_pane_only_surfaced() {
+  local dir state fakebin out drain_out pid
+  dir=$(make_case turn-ended-pane-only); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; drain_out="$dir/drain.out"
   : > "$state/task.turn-ended"
-  # A busy pane is the second form of positive evidence (covers a queued
-  # continuation right after the turn-end).
   export FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited for a turn-end whose crew is provably working (should absorb): $(cat "$out")"
-  fi
-  [ ! -s "$out" ] || fail "provably-working turn-end printed a wake reason: $(cat "$out")"
-  [ ! -s "$state/.wake-queue" ] || fail "provably-working turn-end enqueued a durable wake record"
-  reap "$pid"
-  pass "a bare turn-end whose crew is provably working (busy pane) is absorbed"
+  wait_for_exit "$pid" 40 || fail "watcher did not surface pane-only turn-end evidence"
+  grep -F "signal: $state/task.turn-ended" "$out" >/dev/null \
+    || fail "watcher did not print the pane-only turn-end signal"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null \
+    || fail "drain after pane-only turn-end failed"
+  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$state/task.turn-ended" >/dev/null \
+    || fail "pane-only turn-end was not queued"
+  pass "a bare turn-end with pane-only evidence surfaces as UNKNOWN"
 }
 
 # --- a no-verb signal whose crewmate is NOT provably working SURFACES ---------
@@ -2076,6 +2076,12 @@ case "${FM_TEST_FOCUSED:-}" in
     test_heartbeat_ignores_recorded_liveness_absence
     exit 0
     ;;
+  gate-hardening)
+    test_crew_is_provably_working_classifier
+    test_crew_absorb_class_classifier
+    test_turn_ended_pane_only_surfaced
+    exit 0
+    ;;
 esac
 
 test_signal_reason_is_actionable_classifier
@@ -2091,7 +2097,7 @@ test_signal_crew_provably_working_classifier
 test_signal_crew_provably_working_runs_one_bounded_parallel_window
 test_watcher_stale_liveness_runs_one_bounded_parallel_window
 test_provably_working_signal_absorbed
-test_turn_ended_provably_working_absorbed
+test_turn_ended_pane_only_surfaced
 test_turn_ended_not_working_surfaced
 test_working_note_not_working_surfaced
 test_actionable_signal_surfaced

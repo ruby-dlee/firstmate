@@ -48,9 +48,11 @@ read_pr() {
   PR_STATE=$(scalar "$PR_DOC" state)
   PR_DRAFT=$(scalar "$PR_DOC" draft)
   PR_AUTO=$(scalar "$PR_DOC" auto_merge)
-  PR_AUTHOR=$(scalar "$PR_DOC" user)
+  PR_AUTHOR=$(section_scalar "$PR_DOC" user login)
   PR_CHANGED=$(scalar "$PR_DOC" changed_files)
   case "$PR_CHANGED" in ''|*[!0-9]*) return 1 ;; esac
+  case "$PR_AUTHOR" in ''|*[!A-Za-z0-9-]*|-|*-) return 1 ;; esac
+  [ "${#PR_AUTHOR}" -le 39 ] || return 1
   case "$PR_BASE_REF" in ''|*[!A-Za-z0-9._/-]*) return 1 ;; esac
   case "$PR_HEAD:$PR_BASE" in
     ????????????????????????????????????????:????????????????????????????????????????)
@@ -180,21 +182,38 @@ review_page=1
 while :; do
   [ "$review_page" -le 1000 ] || { echo "error: review pagination exceeded the safe bound" >&2; exit 1; }
   REVIEWS_DOC=$(gh-axi api "/repos/$OWNER/$REPO/pulls/$NUMBER/reviews?per_page=100&page=$review_page") || exit 1
-  printf '%s\n' "$REVIEWS_DOC" | node "$SCRIPT_DIR/fm-toon-table.mjs" user state commit_id > "$TMP_DIR/reviews-page"
+  printf '%s\n' "$REVIEWS_DOC" | node "$SCRIPT_DIR/fm-toon-table.mjs" id user.login state commit_id > "$TMP_DIR/reviews-page"
   review_page_count=$(wc -l < "$TMP_DIR/reviews-page" | tr -d ' ')
   cat "$TMP_DIR/reviews-page" >> "$TMP_DIR/reviews"
   [ "$review_page_count" -eq 100 ] || break
   review_page=$((review_page + 1))
 done
 : > "$TMP_DIR/approved-reviewers"
+: > "$TMP_DIR/review-ids"
+: > "$TMP_DIR/exact-review-states"
 review_blocked=0
-while IFS=$'\t' read -r reviewer review_state review_head; do
+while IFS=$'\t' read -r review_id reviewer review_state review_head; do
+  case "$review_id" in ''|*[!0-9]*) echo "error: exact-head review id is malformed" >&2; exit 1 ;; esac
+  case "$reviewer" in ''|*[!A-Za-z0-9-]*|-|*-) echo "error: exact-head review identity is malformed" >&2; exit 1 ;; esac
+  [ "${#reviewer}" -le 39 ] || { echo "error: exact-head review identity is malformed" >&2; exit 1; }
+  grep -qxF "$review_id" "$TMP_DIR/review-ids" \
+    && { echo "error: exact-head review enumeration contains a duplicate id" >&2; exit 1; }
+  printf '%s\n' "$review_id" >> "$TMP_DIR/review-ids"
   [ "$review_head" = "$PR_HEAD" ] || continue
+  reviewer=$(printf '%s' "$reviewer" | tr '[:upper:]' '[:lower:]')
+  printf '%s\t%s\t%s\n' "$review_id" "$reviewer" "$review_state" >> "$TMP_DIR/exact-review-states"
+done < "$TMP_DIR/reviews"
+LC_ALL=C sort -t $'\t' -k2,2 -k1,1n "$TMP_DIR/exact-review-states" \
+  | awk -F '\t' '{ latest[$2] = $0 } END { for (reviewer in latest) print latest[reviewer] }' \
+  > "$TMP_DIR/latest-review-states"
+author_key=$(printf '%s' "$PR_AUTHOR" | tr '[:upper:]' '[:lower:]')
+while IFS=$'\t' read -r review_id reviewer review_state; do
+  [ -n "$review_id" ] || continue
   [ "$review_state" != CHANGES_REQUESTED ] || { review_blocked=1; continue; }
   [ "$review_state" = APPROVED ] || continue
-  [ -n "$reviewer" ] && [ "$reviewer" != "$PR_AUTHOR" ] || continue
+  [ "$reviewer" != "$author_key" ] || continue
   printf '%s\n' "$reviewer" >> "$TMP_DIR/approved-reviewers"
-done < "$TMP_DIR/reviews"
+done < "$TMP_DIR/latest-review-states"
 reviewers=$(LC_ALL=C sort -u "$TMP_DIR/approved-reviewers" | wc -l | tr -d ' ')
 [ "$review_blocked" -eq 0 ] && [ "$reviewers" -ge 2 ] || {
   echo "error: exact head is UNREVIEWED: need two distinct non-author APPROVED verdicts and no exact-head change request (approvals=$reviewers blocked=$review_blocked)" >&2

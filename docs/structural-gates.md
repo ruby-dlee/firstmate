@@ -73,7 +73,7 @@ Absence of a process sample, a stale status field, or one quiet observation can 
 
 ### Complete route inventory
 
-- `bin/fm-run-liveness.sh` is the exact run-ID and branch-attributed process owner and emits only `BUSY` from affirmative process evidence or `UNKNOWN` otherwise.
+- `bin/fm-run-liveness.sh` is the exact run-ID, branch, and head-attributed process owner and emits only `BUSY` from affirmative process evidence or `UNKNOWN` otherwise.
 - `bin/fm-nm-step-liveness.sh` maps affirmative process evidence to `alive` and every absence, timeout, unreadable state, and repeated zero sample to `unknown`.
 - `bin/fm-crew-state.sh` consumes branch-matched run evidence before pane and status evidence and downgrades legacy `dead` vocabulary to unknown.
 - `bin/fm-classify-lib.sh`, `bin/fm-watch.sh`, and `bin/fm-supervise-daemon.sh` absorb a lane only from an affirmative process or pane sample and never from a recorded liveness or status field.
@@ -110,7 +110,7 @@ A scheduled merge can execute after its evidence becomes stale, and writing a me
 - `bin/fm-pr-check.sh` records the canonical PR URL and live head only and does not create, replace, chmod, or remove `state/<id>.check.sh`.
 - `bin/fm-pr-merge.sh` rejects `--auto`, `--queue`, `--admin`, `--delete-branch`, repository overrides, and unknown options before any GitHub merge request.
 - `bin/fm-pr-merge.sh` is a synchronous preflight only and ends in an unconditional atomic-boundary refusal after all evidence checks.
-- `bin/fm-crosscheck.sh merge` also refuses before API access, and the retired Python merge subcommand is unreachable.
+- `bin/fm-crosscheck.sh` and its Python parser expose only `run` and `verify`, and the read-only GitHub adapter exports no merge mutation primitive.
 - Watcher PR handling reads canonical PR metadata instead of depending on a generated task poll file.
 
 ### Trigger, predicate, and failure mode
@@ -132,7 +132,7 @@ A remembered scheduler mode, stale configuration assumption, or neighboring fail
 ### Complete route inventory
 
 - `bin/fm-brief.sh` requires every crewmate and secondmate blocker to state one premise, name the mechanical probe actually run, and carry the observed result in the same status event.
-- `bin/fm-classify-lib.sh` accepts a blocker into the durable keyed open-decision set only when the note has `assumption=...; test=...; result=...` and rejects placeholder tests or results.
+- `bin/fm-classify-lib.sh` accepts a blocker into the durable keyed open-decision set only when the note has `assumption=...; test=...; result=...` and rejects placeholder assumptions, future tests, or unobserved results.
 - A malformed blocker remains captain-relevant for internal repair, so the proof gate cannot hide a real lane failure merely because its report is incomplete.
 - The always-loaded escalation contract requires `operating-fundamentals` before blocker claims and consequential config or system changes, and its proof rule requires an authoritative live probe with exact actor, surface, target, and result.
 - Before a blocker reaches the captain, `AGENTS.md` requires the same proof rule rather than permitting a status line or confidence statement to stand as evidence.
@@ -163,7 +163,7 @@ A merge can be treated as ready while checks are pending, the reviewed head has 
 ### Complete route inventory
 
 - `bin/fm-pr-check.sh` records canonical live PR metadata without granting merge authority.
-- `bin/fm-pr-admit.sh` independently reads the live PR and requires an open non-draft PR, exact expected head, settled successful checks, clean exact-head review state, PR-file and worktree containment, and a verified Crosscheck ledger for the same head and claims digest.
+- `bin/fm-pr-admit.sh` independently reads the live PR and requires an open non-draft PR, exact expected head, settled successful checks, clean exact-head review state, and PR-file and worktree containment.
 - Pending, queued, missing, unreadable, stale, stopped, wrong-head, or absent reviewer output is `UNREVIEWED`, never clean.
 - `bin/fm-crosscheck.sh verify` rechecks live head, base, claims digest, reviewer independence, executed reproduction evidence, and durable finding lifecycle.
 - `bin/fm-pr-merge.sh` orders canonical PR recording, Crosscheck verification, native five-part admission, and then unconditional refusal before any mutation.
@@ -177,7 +177,7 @@ A merge can be treated as ready while checks are pending, the reviewed head has 
 
 ### Deterministic evidence
 
-- `tests/fm-pr-admit.test.sh` mutation-tests every native admission property, pending checks, missing independent output, containment mismatch, and head movement.
+- `tests/fm-pr-admit.test.sh` mutation-tests nested review identities, pending checks, dirty and mismatched containment, weak policy, and head movement.
 - `tests/fm-crosscheck.test.sh` covers exact-head reviewer execution, independence, evidence reproduction, claims binding, stale artifacts, and UNREVIEWED states.
 - `tests/fm-pr-merge.test.sh` proves the sole entrypoint orders exact evidence before an unconditional no-network refusal.
 

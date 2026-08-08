@@ -103,6 +103,55 @@ test_missing_session_binding_is_unverified() {
   pass "runtime profile refuses every unbound Codex generation instead of guessing a session"
 }
 
+test_exact_generation_identifies_one_provider_session() {
+  local dir file out
+  dir=$(make_case identify-session)
+  file="$dir/codex/sessions/2026/08/02/rollout-identify.jsonl"
+  write_session "$file" session-new
+  write_context "$file" 2026-08-02T20:00:01Z "$dir/wt" gpt-5.6-sol xhigh
+  out=$(node "$ROOT/bin/fm-codex-runtime-profile.mjs" "$dir/codex" "$dir/wt" \
+    gpt-5.6-sol xhigh - 1785700000000000000) \
+    || fail "exact generation did not identify its unique provider session"
+  assert_contains "$out" 'session=session-new' "identified runtime omitted the provider session"
+  pass "runtime binding identifies one exact post-launch provider session"
+}
+
+test_exact_generation_refuses_ambiguous_provider_sessions() {
+  local dir first second rc
+  dir=$(make_case ambiguous-session)
+  first="$dir/codex/sessions/2026/08/02/rollout-first.jsonl"
+  second="$dir/codex/sessions/2026/08/02/rollout-second.jsonl"
+  write_session "$first" session-first
+  write_context "$first" 2026-08-02T20:00:01Z "$dir/wt" gpt-5.6-sol xhigh
+  write_session "$second" session-second
+  write_context "$second" 2026-08-02T20:00:02Z "$dir/wt" gpt-5.6-sol xhigh
+  node "$ROOT/bin/fm-codex-runtime-profile.mjs" "$dir/codex" "$dir/wt" \
+    gpt-5.6-sol xhigh - 1785700000000000000 >"$dir/out" 2>"$dir/err"
+  rc=$?
+  expect_code 2 "$rc" "ambiguous provider-session binding"
+  assert_grep 'candidates=2' "$dir/err" "ambiguous runtime generation guessed a provider session"
+  pass "runtime binding refuses ambiguous exact-generation sessions"
+}
+
+test_spawn_binds_runtime_before_generation_commit() {
+  python3 - "$ROOT/bin/fm-spawn.sh" <<'PY' \
+    || fail "Codex provider identity is not bound at the spawn commit boundary"
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+definition = text.index("bind_codex_runtime_generation()")
+generation_guard = text.index('generation_id)" != "$SPAWN_GENERATION_ID"', definition)
+provider_write = text.index("provider_session_id=%s", generation_guard)
+direct_guard = text.index('[ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || [ "$HARNESS" != codex ]', provider_write)
+direct_call = text.index('bind_codex_runtime_generation || exit 1', direct_guard)
+direct_commit = text.index('ACCOUNT_SPAWN_COMMITTED=1', direct_call)
+if not definition < generation_guard < provider_write < direct_guard < direct_call < direct_commit:
+    raise SystemExit("direct Codex generation can publish before provider-session binding")
+PY
+  pass "spawn commits direct Codex generations only after exact-session binding"
+}
+
 test_mismatched_session_skips_large_tail_within_total_budget() {
   local dir file good rc out
   dir=$(make_case bounded-mismatch)
@@ -134,4 +183,7 @@ test_later_substitution_fails
 test_previous_generation_is_not_runtime_proof
 test_missing_runtime_is_unknown
 test_missing_session_binding_is_unverified
+test_exact_generation_identifies_one_provider_session
+test_exact_generation_refuses_ambiguous_provider_sessions
+test_spawn_binds_runtime_before_generation_commit
 test_mismatched_session_skips_large_tail_within_total_budget

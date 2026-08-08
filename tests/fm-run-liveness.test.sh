@@ -21,10 +21,12 @@ status=running
 if [ "${FM_TEST_STATUS_CHANGES:-0}" = 1 ] && [ "$n" -gt 2 ]; then status=completed; fi
 run_id=${FM_TEST_RUN_ID:-RUN123}
 branch=${FM_TEST_RUN_BRANCH:-fm/lane}
+head=${FM_TEST_RUN_HEAD:?}
+if [ -n "${FM_TEST_RUN_HEAD_AFTER:-}" ] && [ "$n" -gt 2 ]; then head=$FM_TEST_RUN_HEAD_AFTER; fi
 if [ "$#" -eq 4 ] && [ "$1:$2:$3" = axi:status:--run ]; then
   [ "$4" = "$run_id" ] || exit 3
 fi
-printf 'run:\n  id: "%s"\n  branch: %s\n  status: %s\n' "$run_id" "$branch" "$status"
+printf 'run:\n  id: "%s"\n  branch: %s\n  head: "%s"\n  status: %s\n' "$run_id" "$branch" "$head" "$status"
 SH
   cat > "$dir/fakebin/ps" <<'SH'
 #!/usr/bin/env bash
@@ -68,7 +70,8 @@ SH
 
 run_live() {
   local dir=$1; shift
-  FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/home/state" \
+  FM_TEST_RUN_HEAD=${FM_TEST_RUN_HEAD:-$(git -C "$dir/wt" rev-parse HEAD)} \
+    FM_HOME="$dir/home" FM_STATE_OVERRIDE="$dir/home/state" \
     FM_RUN_LIVENESS_NM_BIN="$dir/fakebin/no-mistakes" \
     FM_RUN_LIVENESS_PS_BIN="$dir/fakebin/ps" \
     FM_RUN_LIVENESS_CWD_BIN="$dir/fakebin/lsof" \
@@ -77,6 +80,21 @@ run_live() {
     FM_RUN_LIVENESS_TEST_LAB=firstmate-run-liveness-test-lab-v1 \
     FM_RUN_LIVENESS_INTERVAL=0 FM_TEST_NM_COUNT="$dir/nm.count" \
     FM_TEST_PS_COUNT="$dir/ps.count" "$@" "$LIVE" lane
+}
+
+test_stale_run_head_is_inconclusive_before_sampling() {
+  local dir old rc
+  dir=$(make_case stale-head)
+  old=$(git -C "$dir/wt" rev-parse HEAD)
+  printf 'advance\n' > "$dir/wt/advance"
+  git -C "$dir/wt" add advance
+  git -C "$dir/wt" commit -qm advance
+  FM_TEST_RUN_HEAD="$old" FM_TEST_COUNTS=9,9 FM_RUN_LIVENESS_SAMPLES=2 \
+    run_live "$dir" env >"$dir/out" 2>"$dir/err"; rc=$?
+  expect_code 2 "$rc" "stale run head must not prove current task liveness"
+  assert_grep 'branch-and-head-matched' "$dir/err" "stale-head refusal was unclear"
+  [ ! -e "$dir/ps.count" ] || fail "stale run head reached the process sampler"
+  pass "run liveness binds custody to the exact current branch head"
 }
 
 test_any_process_sample_is_alive() {
@@ -96,7 +114,7 @@ test_neighbor_run_is_inconclusive_before_sampling() {
   FM_TEST_RUN_BRANCH=fm/neighbor FM_TEST_COUNTS=9,9 FM_RUN_LIVENESS_SAMPLES=2 \
     run_live "$dir" env >"$dir/out" 2>"$dir/err"; rc=$?
   expect_code 2 "$rc" "neighbor branch must not be sampled as task liveness"
-  assert_grep 'no exact branch-matched' "$dir/err" "neighbor-run attribution refusal was unclear"
+  assert_grep 'no exact branch-and-head-matched' "$dir/err" "neighbor-run attribution refusal was unclear"
   [ ! -e "$dir/ps.count" ] || fail "neighboring run reached the process sampler"
   pass "liveness rejects a branch-blind neighboring run before any process decision"
 }
@@ -149,6 +167,22 @@ test_record_change_is_inconclusive() {
   pass "run liveness rechecks the same running record after the process window"
 }
 
+test_run_head_change_after_sampling_is_inconclusive() {
+  local dir old rc
+  dir=$(make_case changed-head)
+  old=$(git -C "$dir/wt" rev-parse HEAD)
+  printf 'advance\n' > "$dir/wt/advance"
+  git -C "$dir/wt" add advance
+  git -C "$dir/wt" commit -qm advance
+  FM_TEST_RUN_HEAD_AFTER="$old" FM_TEST_COUNTS=2,2 FM_RUN_LIVENESS_SAMPLES=2 \
+    run_live "$dir" env >"$dir/out" 2>"$dir/err"
+  rc=$?
+  expect_code 2 "$rc" "run-head movement after sampling"
+  assert_grep 'exact run record disappeared after sampling' "$dir/err" \
+    "post-sampling run-head movement was not rejected"
+  pass "run liveness rechecks exact head custody after sampling"
+}
+
 test_baseline_is_repository_scoped() {
   local dir out
   dir=$(make_case baseline)
@@ -167,6 +201,8 @@ test_any_process_sample_is_alive
 test_entire_zero_window_is_unknown
 test_sampler_processes_are_not_run_evidence
 test_record_change_is_inconclusive
+test_run_head_change_after_sampling_is_inconclusive
 test_baseline_is_repository_scoped
 test_neighbor_run_is_inconclusive_before_sampling
+test_stale_run_head_is_inconclusive_before_sampling
 test_detached_scout_never_queries_run_state

@@ -246,7 +246,8 @@ An older home that does not track the support may still launch with a warning wh
 Firstmate's spawn flags and `config/secondmate-account-pool` continue to accept aliases made only of letters, digits, dot, underscore, and dash, excluding values that begin with dot or dash; `config/crew-dispatch.json` deliberately narrows those fields to an alphanumeric first character.
 Account email addresses and filesystem paths are invalid in every input surface.
 Direct ship/scout task metadata records only `account_home=` from this account mechanism.
-It never creates `account_pool=`, `account_profile=`, `account_task=`, `account_attempt=`, or `provider_session_id=`.
+It never creates `account_pool=`, `account_profile=`, `account_task=`, or `account_attempt=`.
+Every Codex launch binds `provider_session_id=` to the exact post-launch runtime generation before spawn commit, including direct account-directory and routing-off lanes.
 
 Existing ship/scout tasks that already carry `account_profile=` metadata remain legacy Agent Fleet managed generations.
 That compatibility path is recovery-only for ordinary crewmates and is not used for any new ship/scout task.

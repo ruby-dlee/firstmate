@@ -328,9 +328,8 @@ test_housekeeping_paused_resurfaces_and_resets() {
   pass "housekeeping re-surfaces a stale declared pause on the long cadence and resets its window"
 }
 
-# A pause whose pane became busy again (the crewmate resumed) drops its marker without
-# escalating, exactly like a resumed wedge.
-test_housekeeping_paused_resumed_cleared() {
+# A pause whose pane became busy remains unknown without run-owned process evidence.
+test_housekeeping_paused_busy_pane_is_unknown() {
   local dir state fakebin win pane key
   dir=$(make_supercase paused-resumed)
   state="$dir/state"; fakebin="$dir/fakebin"
@@ -339,11 +338,15 @@ test_housekeeping_paused_resumed_cleared() {
   printf 'Working...\n' > "$pane"
   key=$(printf '%s' "held-w12" | tr ':/.' '___')
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
+  make_fake_crew_state "$fakebin" >/dev/null
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
-    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
-  [ -e "$state/.subsuper-paused-$key" ] && fail "resumed (busy) pause marker was not cleared"
-  [ ! -s "$state/.subsuper-escalations" ] || fail "a resumed pause was escalated"
-  pass "housekeeping clears a paused marker whose pane became busy again, without escalating"
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: working · source: pane · harness busy' \
+    FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
+  [ -e "$state/.subsuper-paused-$key" ] || fail "busy-pane pause marker was discarded"
+  assert_grep 'pane liveness UNKNOWN' "$state/.subsuper-escalations" \
+    "busy-pane pause was treated as process evidence"
+  pass "housekeeping preserves a busy-pane pause as UNKNOWN"
 }
 
 # A pane still idle but whose status is no longer a pause (the crewmate changed state
@@ -415,6 +418,44 @@ test_housekeeping_persistent_stale_escalates() {
   pass "persistent stale escalates after threshold and clears its marker"
 }
 
+test_housekeeping_unreadable_stale_preserves_unknown_tracking() {
+  local dir state win key
+  dir=$(make_supercase stale-unreadable)
+  state="$dir/state"
+  win="sess:fm-unreadable"
+  fm_write_meta "$state/unreadable.meta" "window=$win" "kind=ship"
+  printf 'working: validating\n' > "$state/unreadable.status"
+  key=$(_stale_key unreadable)
+  echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
+  (
+    stale_window_is_busy() { return 2; }
+    FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
+  ) || fail "unreadable stale housekeeping failed"
+  assert_grep 'liveness UNKNOWN' "$state/.subsuper-escalations" \
+    "unreadable pane absence did not enter UNKNOWN escalation"
+  [ -e "$state/.subsuper-stale-$key" ] || fail "unreadable stale marker was discarded"
+  pass "unreadable stale capture preserves tracking and surfaces UNKNOWN"
+}
+
+test_housekeeping_unreadable_pause_preserves_recheck_tracking() {
+  local dir state win key
+  dir=$(make_supercase pause-unreadable)
+  state="$dir/state"
+  win="sess:fm-pause-unreadable"
+  fm_write_meta "$state/pause-unreadable.meta" "window=$win" "kind=ship"
+  printf 'paused: awaiting external review\n' > "$state/pause-unreadable.status"
+  key=$(_stale_key pause-unreadable)
+  echo $(( $(date +%s) - 500 )) > "$state/.subsuper-paused-$key"
+  (
+    stale_window_is_busy() { return 2; }
+    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
+  ) || fail "unreadable pause housekeeping failed"
+  assert_grep 'pane liveness UNKNOWN' "$state/.subsuper-escalations" \
+    "unreadable paused pane did not enter UNKNOWN escalation"
+  [ -e "$state/.subsuper-paused-$key" ] || fail "unreadable pause marker was discarded"
+  pass "unreadable paused capture preserves recheck tracking and surfaces UNKNOWN"
+}
+
 test_housekeeping_stale_liveness_runs_one_bounded_parallel_window() {
   local dir state fakebin pane liveness_log task win key marker_epoch first last span
   dir=$(make_supercase stale-parallel)
@@ -453,7 +494,7 @@ test_housekeeping_stale_liveness_runs_one_bounded_parallel_window() {
   pass "away-daemon stale lanes share one explicitly bounded parallel window"
 }
 
-test_housekeeping_resumed_stale_cleared() {
+test_housekeeping_busy_pane_stale_is_unknown() {
   local dir state fakebin win pane key
   dir=$(make_supercase stale-resumed)
   state="$dir/state"
@@ -466,9 +507,10 @@ test_housekeeping_resumed_stale_cleared() {
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
-  [ -e "$state/.subsuper-stale-$key" ] && fail "resumed stale marker was not cleared"
-  [ -s "$state/.subsuper-escalations" ] && fail "resumed stale was escalated"
-  pass "resumed (busy) stale clears its marker without escalating"
+  [ ! -s "$state/.subsuper-escalations" ] && fail "busy-pane stale did not surface UNKNOWN"
+  assert_grep 'liveness UNKNOWN' "$state/.subsuper-escalations" \
+    "busy-pane stale was treated as process evidence"
+  pass "busy-pane stale remains UNKNOWN without affirmative process evidence"
 }
 
 test_housekeeping_herdr_persistent_stale_resolves_meta() {
@@ -499,7 +541,7 @@ test_housekeeping_herdr_persistent_stale_resolves_meta() {
   pass "persistent herdr stale resolves the target from metadata and escalates"
 }
 
-test_housekeeping_herdr_idle_busy_footer_clears_stale() {
+test_housekeeping_herdr_idle_busy_footer_is_unknown() {
   local dir state key
   dir=$(make_supercase stale-herdr-idle-busy-footer)
   state="$dir/state"
@@ -523,11 +565,11 @@ test_housekeeping_herdr_idle_busy_footer_clears_stale() {
     FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
   ) || fail "herdr idle busy-footer housekeeping failed"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "idle+busy-footer herdr stale marker was not cleared"
-  [ ! -s "$state/.subsuper-escalations" ] || fail "idle+busy-footer herdr stale was escalated"
-  pass "herdr idle busy-footer stale clears through capture corroboration"
+  [ -s "$state/.subsuper-escalations" ] || fail "idle+busy-footer herdr stale did not surface UNKNOWN"
+  pass "herdr busy footer never substitutes for affirmative process evidence"
 }
 
-test_housekeeping_herdr_resumed_stale_cleared() {
+test_housekeeping_herdr_native_busy_is_unknown() {
   local dir state key
   dir=$(make_supercase stale-herdr-resumed)
   state="$dir/state"
@@ -551,8 +593,8 @@ test_housekeeping_herdr_resumed_stale_cleared() {
     FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
   ) || fail "herdr resumed stale housekeeping failed"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "busy herdr stale marker was not cleared"
-  [ ! -s "$state/.subsuper-escalations" ] || fail "busy herdr stale was escalated"
-  pass "resumed herdr stale clears through backend-aware busy state"
+  [ -s "$state/.subsuper-escalations" ] || fail "busy herdr stale did not surface UNKNOWN"
+  pass "herdr native busy state never substitutes for affirmative process evidence"
 }
 
 test_housekeeping_orca_persistent_stale_resolves_terminal() {
@@ -1735,6 +1777,16 @@ case "${FM_TEST_FOCUSED:-}" in
     test_liveness_verdicts_surface_through_away_classifiers
     exit 0
     ;;
+  gate-hardening)
+    test_liveness_verdicts_surface_through_away_classifiers
+    test_housekeeping_unreadable_stale_preserves_unknown_tracking
+    test_housekeeping_unreadable_pause_preserves_recheck_tracking
+    test_housekeeping_busy_pane_stale_is_unknown
+    test_housekeeping_paused_busy_pane_is_unknown
+    test_housekeeping_herdr_idle_busy_footer_is_unknown
+    test_housekeeping_herdr_native_busy_is_unknown
+    exit 0
+    ;;
 esac
 
 test_afk_start_refuses_when_flag_cannot_be_written
@@ -1755,16 +1807,18 @@ test_housekeeping_migrates_watcher_pause_marker
 test_housekeeping_migrates_watcher_unpaused_marker_to_clear
 test_housekeeping_seeds_pause_marker_from_status
 test_housekeeping_persistent_stale_escalates
+test_housekeeping_unreadable_stale_preserves_unknown_tracking
+test_housekeeping_unreadable_pause_preserves_recheck_tracking
 test_housekeeping_stale_liveness_runs_one_bounded_parallel_window
-test_housekeeping_resumed_stale_cleared
+test_housekeeping_busy_pane_stale_is_unknown
 test_housekeeping_paused_resurfaces_and_resets
-test_housekeeping_paused_resumed_cleared
+test_housekeeping_paused_busy_pane_is_unknown
 test_housekeeping_paused_unpaused_cleared
 test_housekeeping_stale_marker_transitions_to_pause
 test_housekeeping_pause_marker_transitions_to_clear
 test_housekeeping_herdr_persistent_stale_resolves_meta
-test_housekeeping_herdr_idle_busy_footer_clears_stale
-test_housekeeping_herdr_resumed_stale_cleared
+test_housekeeping_herdr_idle_busy_footer_is_unknown
+test_housekeeping_herdr_native_busy_is_unknown
 test_housekeeping_orca_persistent_stale_resolves_terminal
 test_escalate_batches_into_one_digest
 test_escalate_batch_age_uses_first_append

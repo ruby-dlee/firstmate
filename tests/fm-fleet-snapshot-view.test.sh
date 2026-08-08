@@ -152,7 +152,7 @@ test_fixture_snapshot_json() {
       and .current_state.source == "pane"
       and .pr.url == "https://github.com/kunchenguid/firstmate/pull/9"
       and .backlog.body_excerpt == "Preserve this detail for bearings."
-      and .hints.pending_decision == false
+      and .hints.pending_decision == true
       and .paths.status_log.kind == "event_history"
   ' >/dev/null || fail "ship task state, PR, body, and stale event hints wrong"
   printf '%s' "$out" | jq -e '
@@ -183,7 +183,7 @@ test_fixture_snapshot_json() {
 }
 
 test_snapshot_preserves_liveness_and_decision_actionability() {
-  local home fakebin out view current verdict expected_pending
+  local home fakebin out view current verdict expected_liveness expected_pending
   home=$(make_home liveness)
   mkdir -p "$home/projects/task"
   fm_write_meta "$home/state/task.meta" \
@@ -194,11 +194,12 @@ test_snapshot_preserves_liveness_and_decision_actionability() {
   fakebin=$(make_fakebin "$home")
 
   for verdict in alive dead unknown absent; do
+    expected_liveness=$verdict
     case "$verdict" in
       alive) current='state: working · source: run-step · validating (running) · liveness: alive (2 procs) · step: test'; expected_pending=false ;;
-      dead) current='state: working · source: run-step · validating (running) · liveness: dead (0 procs) · step: test'; expected_pending=true ;;
+      dead) current='state: working · source: run-step · validating (running) · liveness: dead (0 procs) · step: test'; expected_liveness=unknown; expected_pending=true ;;
       unknown) current='state: working · source: run-step · validating (running) · liveness: unknown (probe timed out) · step: test'; expected_pending=true ;;
-      absent) current='state: working · source: run-step · validating (running)'; expected_pending=false ;;
+      absent) current='state: working · source: run-step · validating (running)'; expected_pending=true ;;
     esac
     out=$(PATH="$fakebin:$PATH" FM_HOME="$home" \
       FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
@@ -209,10 +210,10 @@ test_snapshot_preserves_liveness_and_decision_actionability() {
         | .current_state.liveness == null and .hints.pending_decision == $pending
       ' >/dev/null || fail "a line without liveness did not preserve snapshot behavior: $out"
     else
-      printf '%s' "$out" | jq -e --arg verdict "$verdict" --argjson pending "$expected_pending" '
+      printf '%s' "$out" | jq -e --arg verdict "$expected_liveness" --argjson pending "$expected_pending" '
         .tasks[] | select(.id == "task")
         | .current_state.liveness == $verdict and .hints.pending_decision == $pending
-      ' >/dev/null || fail "$verdict liveness was collapsed in the snapshot: $out"
+      ' >/dev/null || fail "$verdict liveness did not preserve the fail-closed snapshot verdict: $out"
     fi
   done
 
@@ -247,7 +248,7 @@ test_event_hints_follow_reconciled_current_state() {
     "harness=codex" \
     "kind=ship" \
     "mode=ship"
-  printf 'blocked: waiting on access\n' > "$home/state/active-blocked.status"
+  printf 'blocked: assumption=repository access is missing; test=gh-axi repo view; result=command exited 1 with HTTP 403\n' > "$home/state/active-blocked.status"
   fm_write_meta "$home/state/stale-decision.meta" \
     "window=firstmate:fm-stale-decision" \
     "worktree=$home/projects/stale-decision" \
@@ -263,7 +264,7 @@ test_event_hints_follow_reconciled_current_state() {
     "harness=codex" \
     "kind=ship" \
     "mode=ship"
-  printf 'blocked: old failure\n' > "$home/state/stale-blocked.status"
+  printf 'blocked: assumption=repository access is missing; test=gh-axi repo view; result=command exited 1 with HTTP 403\n' > "$home/state/stale-blocked.status"
   fakebin=$(make_fakebin "$home")
   out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
   printf '%s' "$out" | jq -e '
@@ -273,9 +274,9 @@ test_event_hints_follow_reconciled_current_state() {
       and task("active-blocked").current_state.state == "blocked"
       and task("active-blocked").hints.blocked_event == true
       and task("stale-decision").current_state.state == "working"
-      and task("stale-decision").hints.pending_decision == false
+      and task("stale-decision").hints.pending_decision == true
       and task("stale-blocked").current_state.state == "working"
-      and task("stale-blocked").hints.blocked_event == false
+      and task("stale-blocked").hints.blocked_event == true
   ' >/dev/null || fail "event hints must follow reconciled current state"
   pass "snapshot event hints follow reconciled current state"
 }
@@ -605,6 +606,13 @@ test_parked_scout_decision_stays_pending() {
 
 if [ "${FM_TEST_FOCUSED:-}" = liveness-verdicts ]; then
   test_snapshot_preserves_liveness_and_decision_actionability
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = gate-hardening ]; then
+  test_fixture_snapshot_json
+  test_snapshot_preserves_liveness_and_decision_actionability
+  test_event_hints_follow_reconciled_current_state
   exit 0
 fi
 

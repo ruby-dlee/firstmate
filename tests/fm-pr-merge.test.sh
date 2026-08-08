@@ -100,9 +100,9 @@ test_every_repository_merge_route_refuses_before_api() {
     > "$dir/out" 2> "$dir/err"
   rc=$?
   set -e
-  expect_code 1 "$rc" "crosscheck merge route"
-  assert_grep 'no merge API call was made' "$dir/err" \
-    "crosscheck merge refusal omitted its failure mode"
+  expect_code 2 "$rc" "removed crosscheck merge route"
+  assert_grep 'supports only run and verify' "$dir/err" \
+    "crosscheck merge command remained selectable"
   [ ! -s "$dir/gh.log" ] || fail "crosscheck merge refusal reached GitHub"
 
   set +e

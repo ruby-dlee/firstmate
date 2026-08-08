@@ -12,10 +12,7 @@ if (!codexHomeArg || !worktreeArg || !expectedModel || !expectedEffort
   console.error("error: expected <codex-home> <worktree> <model> <effort> <session> <runtime-start-ns>");
   process.exit(2);
 }
-if (expectedSessionArg === "-") {
-  console.error("unknown: Codex runtime profile UNVERIFIED without an exact provider session identity");
-  process.exit(2);
-}
+const identifySession = expectedSessionArg === "-";
 
 const codexHome = fs.realpathSync(codexHomeArg);
 const worktree = fs.realpathSync(worktreeArg);
@@ -106,6 +103,7 @@ function readHead(file) {
 }
 
 let latest = null;
+const identified = new Map();
 try {
   for (const file of collectRollouts(sessions)) {
     const records = [];
@@ -118,7 +116,7 @@ try {
         sessionIds.add(record.payload.id);
       }
     }
-    if (!sessionIds.has(expectedSession)) continue;
+    if (!identifySession && !sessionIds.has(expectedSession)) continue;
     for (const line of readTail(file).split("\n")) {
       if (!line) continue;
       let record;
@@ -148,7 +146,14 @@ try {
       if (!settings?.model || !settings?.effort) continue;
       const timestamp = timestampNs(record.timestamp);
       if (timestamp === null || timestamp < runtimeStartNs) continue;
-      if (!latest || timestamp > latest.timestamp) {
+      if (identifySession) {
+        if (sessionIds.size !== 1) continue;
+        const session = [...sessionIds][0];
+        const prior = identified.get(session);
+        if (!prior || timestamp > prior.timestamp) {
+          identified.set(session, { ...settings, timestamp, source: file.item });
+        }
+      } else if (!latest || timestamp > latest.timestamp) {
         latest = { ...settings, timestamp, source: file.item };
       }
     }
@@ -156,6 +161,23 @@ try {
 } catch (error) {
   console.error(`unknown: Codex runtime profile could not be read (${error.message})`);
   process.exit(2);
+}
+
+if (identifySession) {
+  if (identified.size !== 1) {
+    console.error(`unknown: exact Codex provider session is ambiguous for worktree ${worktree} (candidates=${identified.size})`);
+    process.exit(2);
+  }
+  const entry = [...identified.entries()][0];
+  const session = entry[0];
+  latest = entry[1];
+  const observed = `model=${latest.model} effort=${latest.effort}`;
+  if (latest.model !== expectedModel || latest.effort !== expectedEffort) {
+    console.error(`mismatch: Codex runtime ${observed}; expected model=${expectedModel} effort=${expectedEffort}`);
+    process.exit(1);
+  }
+  console.log(`verified: session=${session} Codex runtime ${observed}`);
+  process.exit(0);
 }
 
 if (!latest) {

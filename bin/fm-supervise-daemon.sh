@@ -931,22 +931,23 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #     Never silently defer forever.
 #  2) stale recheck: for each pending stale marker past its repository-derived
 #     cadence, re-peek the pane and repeat the run-owned process window. Any
-#     positive sample resets the timer; an all-zero complete window (or no
+#     positive process sample resets the timer; an all-zero complete window (or no
 #     positive working evidence for a stopped task) surfaces UNKNOWN.
 #  2b) pause re-surface: for each declared-pause marker past PAUSE_RESURFACE_SECS,
-#     re-peek; busy/gone -> clear; still idle + still paused -> escalate a recheck
-#     digest and reset the window (repeating bounded re-surface, never a wedge).
+#     re-peek; exact run liveness clears, pane-only evidence remains UNKNOWN,
+#     and a still-declared pause escalates a recheck digest and resets the window.
 #  3) heartbeat scan: every HEARTBEAT_SCAN_SECS, grep state/*.status for a
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
   local state=$1 now due f key task win marker age last max_defer oldest pause_secs i
-  local cache baseline threshold class evidence observations observation
+  local cache baseline threshold class evidence observations observation capture capture_rc
   local -a stale_markers=()
   local -a stale_tasks=()
   local -a stale_windows=()
   local -a stale_ages=()
   local -a stale_caches=()
   local -a stale_thresholds=()
+  local -a stale_captures=()
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -1014,8 +1015,15 @@ housekeeping() {  # <state>
     [ "$age" -ge "$threshold" ] || continue
     stale_window_is_busy "$win" "$state"
     case "$?" in
-      0) rm -f "$marker" ;;
-      2) rm -f "$marker" ;;
+      2)
+        stale_markers+=("$marker")
+        stale_tasks+=("$task")
+        stale_windows+=("$win")
+        stale_ages+=("$age")
+        stale_caches+=("$cache")
+        stale_thresholds+=("$threshold")
+        stale_captures+=(unreadable)
+        ;;
       *)
         stale_markers+=("$marker")
         stale_tasks+=("$task")
@@ -1023,6 +1031,7 @@ housekeeping() {  # <state>
         stale_ages+=("$age")
         stale_caches+=("$cache")
         stale_thresholds+=("$threshold")
+        stale_captures+=(readable)
         ;;
     esac
   done
@@ -1037,6 +1046,7 @@ housekeeping() {  # <state>
     age=${stale_ages[$i]}
     cache=${stale_caches[$i]}
     threshold=${stale_thresholds[$i]}
+    capture=${stale_captures[$i]}
     observation=$(crew_absorb_observation_from_batch "$observations" "$task") || observation=unknown
     class=$(crew_absorb_class_from_observation "$observation")
     evidence=$(cat "$cache" 2>/dev/null || echo "no process-window evidence")
@@ -1051,7 +1061,7 @@ housekeeping() {  # <state>
         ;;
       *)
         escalate_add "$state" "stale process-window liveness UNKNOWN after ${age}s; no death proof: $win ($evidence)"
-        stale_marker_remove "$win" "$state"
+        if [ "$capture" = unreadable ]; then _now > "$marker"; else stale_marker_remove "$win" "$state"; fi
         ;;
     esac
   done
@@ -1059,9 +1069,9 @@ housekeeping() {  # <state>
   # (2b) pause re-surface recheck. A DECLARED external-wait pause idles by design,
   # so it is rechecked on a much longer cadence than a wedge (PAUSE_RESURFACE_SECS)
   # and never escalated as one - but it MUST re-surface, so a forgotten pause cannot
-  # rot invisibly. Past the window: busy (resumed) or gone -> drop; still idle and
-  # still declaring the pause -> escalate a recheck digest and reset the marker so
-  # the window repeats.
+  # rot invisibly. Past the window, only affirmative run-owned process evidence
+  # proves a resume; unreadable and pane-only observations remain UNKNOWN, while a
+  # still-declared pause escalates a recheck digest and resets its marker.
   pause_secs=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
   for marker in "$state"/.subsuper-paused-*; do
     [ -e "$marker" ] || continue
@@ -1079,10 +1089,19 @@ housekeeping() {  # <state>
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
     [ "$age" -ge "$pause_secs" ] || continue
     stale_window_is_busy "$win" "$state"
-    case "$?" in
-      0) rm -f "$marker" ;;
-      2) rm -f "$marker" ;;
-      *)
+    capture_rc=$?
+    if [ "$capture_rc" -eq 2 ]; then
+      class=unknown
+    else
+      class=$(crew_absorb_class "$task" "$last")
+    fi
+    case "$class" in
+      working) rm -f "$marker" ;;
+      unknown)
+        escalate_add "$state" "paused ${age}s with pane liveness UNKNOWN; recheck whether the external wait still holds: $win"
+        _now > "$marker"
+        ;;
+      paused)
         last=$(last_status_line "$state/$task.status")
         if [ -n "$last" ] && status_is_paused "$last"; then
           escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
@@ -1091,6 +1110,7 @@ housekeeping() {  # <state>
           rm -f "$marker"
         fi
         ;;
+      *) reconcile_pause_tracking "$win" "$state" "$last" ;;
     esac
   done
 

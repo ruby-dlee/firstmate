@@ -75,7 +75,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-tasks-axi-lib.sh`    | Shared backlog-backend selector and `tasks-axi` compatibility probe                  |
 | `fm-lavish-board.sh`     | Open a self-contained decision or annotation board and arm its profile-first bounded submission check |
 | `fm-lavish-intake.sh`    | Invoke compatible store-and-forward Lavish intake at an existing turn boundary       |
-| `fm-lavish-queue.sh`     | Queue redundant visible delivery only to a session-lock-proven home-bound supervisor |
+| `fm-lavish-queue.sh`     | Refuse visible delivery unless a session-bound atomic steering receipt is available  |
 | `fm-lavish-version-lib.sh` | Shared Lavish store-forward minimum-version compatibility check                    |
 | `fm-lavish-wake.sh`      | Append a durable answer pointer, then attempt proven home-bound visible delivery      |
 | `fm-wake-drain.sh`       | Intake Lavish answers, atomically drain queued wakes, then assert watcher liveness    |
@@ -89,7 +89,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-tmux-lib.sh`         | Shared tmux pane primitives for busy detection, composer capture, and verified submit |
 | `fm-peek.sh`             | Print a bounded tail of a crewmate endpoint                                          |
 | `fm-github-pr.py`        | Adapt observed gh-axi TOON PR reads through a fail-closed read-only CLI               |
-| `fm-crosscheck.sh`       | Run, verify, or atomically merge through the durable exact-head PR finding ledger     |
+| `fm-crosscheck.sh`       | Run or verify the durable exact-head PR finding ledger                                |
 | `fm-crosscheck.py`       | Validate and execute crosscheck reviewer evidence and finding lifecycle transitions  |
 | `fm-pr-check.sh`         | Record exact PR metadata without arming merge execution or replacing task checks      |
 | `fm-pr-admit.sh`         | Require four settled native properties on one unchanged exact PR head                 |

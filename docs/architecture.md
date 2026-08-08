@@ -22,17 +22,18 @@ Only `alive` refreshes the bounded wedge observation; every other verdict remain
 The pause contract is `paused: <reason>; owner=<named owner>; clears=<observable condition>`.
 The owner may be a person, team, service, or other accountable role, and `clears` must name a fact, event, or time a supervisor can observe rather than a vague intention.
 Only a non-failure declaration carrying both non-placeholder fields earns pause absorption.
+A pause declared after a no-mistakes run exists also carries `run=<current run id>`; exact association with the attributed run proves that the pause postdates that run's start.
 A bare pause verb, a missing owner, or a missing clearing condition is actionable stopped work and receives no marker or pause cadence.
 The normal watcher writes `.paused-<window>` and clears any stale wedge timing before returning the declaration's initial one-time signal wake, so re-arming cannot lose the state transition.
-Registration proves only the declaration itself, so it never seeds the `.paused-rechecked-<window>` verdict cache; the first stale classification establishes that cache after the keyed open-decision fold has also passed.
+Registration proves only the declaration itself, so it never seeds the `.paused-rechecked-<window>` proof signature; the first stale classification writes that signature after the keyed open-decision fold passes, while every later classification still rechecks authoritative run state.
 An owned pause is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
-A pause is a statement about the work rather than about the terminal, so wake classification honours it whether the crewmate's pane is alive, idle, or gone, and whatever its attributed no-mistakes run reports - parked, failed or cancelled, or unreadable.
+A pause is a statement about the work rather than about terminal liveness, but authoritative run state still constrains it.
+An active, failed, stale, or unknown run verdict supersedes the declaration; a done or parked run yields only to a declaration associated with its exact run id.
 That classification never transfers custody of an in-flight validation run: `AGENTS.md` section 8 owns the boundary that requires the supervisor to steer a paused lane back to attending and driving its run.
-The single exception is an actively `working` run-step or busy pane, which supersedes the declaration because the crewmate resumed after making it.
 Absorption is gated on two proofs taken from one immutable read of the crewmate's current durable status stream: an owned-and-clearing declaration carrying no failure vocabulary in any of its prose-clause headlines, and an empty keyed open/resolved fold, so a pause can never mask a still-unanswered decision.
-The Herdr native blocked-transition edge does not yet honour this invariant, which is a known defect tracked as `herdr-push-transition-pause-gate-h8`: on that edge a lane that owes an unanswered keyed decision can be silently absorbed and go quiet.
+The Herdr native blocked-transition edge uses this same proof and precedence boundary before absorbing a transition.
 A crewmate with no locatable status stream is refused rather than absorbed, and stopped crewmates without a valid declaration surface immediately.
-Inside `bin/fm-crew-state.sh` itself the same declaration also becomes the reported current state once its attributed run has stopped at a terminal or approval-gate boundary (`done` or `parked`); active, failed, stale, and unknown runs retain run-step precedence there.
+Inside `bin/fm-crew-state.sh` itself a declaration with the matching run id becomes the reported current state once that run has stopped at a terminal or approval-gate boundary (`done` or `parked`); an unassociated older pause and active, failed, stale, or unknown runs retain run-step precedence there.
 Pause cadence markers remain in force while the latest durable status still declares the pause and are cleared only after that status resumes, so every continuously declared pause still re-surfaces on the bounded long cadence.
 Its initial normal-mode status signal still surfaces through the no-verb path, while away mode self-handles that routine signal and owns the later recheck.
 The bounded recheck includes the named owner and clearing condition, so a supervisor that observes the condition has passed can resume or surface a lane whose declaration still persists.

@@ -1,37 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck source=tests/test-entry.sh
 . "$(dirname "$0")/test-entry.sh"
-# tests/fm-watch-pause-absorb.test.sh - a DECLARED pause must be honoured on its
-# own evidence, independent of what the crewmate's terminal or its attributed
-# no-mistakes run happens to be doing.
-#
-# The 2026-08-03 incident this suite pins down: lane priors-882-rebase-c8 declared
-# `paused: work complete and verified; waiting on the merge of PR 882` with its one
-# keyed decision opened AND explicitly resolved, yet wedge-escalated eight times in
-# a row as a suspected wedge and never once created state/.paused-<key>. The
-# supervisor's hypothesis was pane liveness (its agent was alive and idle at the
-# composer, while a comparison lane whose agent was quota-dead did absorb). That was
-# WRONG, and this suite encodes the refutation: absorption never consulted pane
-# liveness at all. crew_absorb_class asked fm-crew-state.sh for one authoritative
-# verdict and admitted the declared pause only when that verdict was exactly `done`
-# (bin/fm-classify-lib.sh, the `done`-only carve-out added in #53). Any other verdict
-# - `parked` (c8: its recycled worktree had been re-checked-out onto ANOTHER lane's
-# branch, so a foreign parked run was attributed to it), `failed` (a routinely
-# CANCELLED run maps here too), or `unknown` (backend target gone, i.e. a genuinely
-# DEAD pane) - discarded the pause and returned `none`, so the watcher took
-# surface_nonterminal_stale and emitted a bare `stale: <window>`.
-#
-# The dead-pane branch is the direct refutation: a gone pane classified `unknown` and
-# was surfaced, so "only a dead pane reaches the pause path" had the truth backwards.
-# The comparison lane absorbed because a quota-dead agent has no attributed run at
-# all, which routes fm-crew-state.sh to its status-log fallback and reports `paused` -
-# an absence-of-run effect, not a pane-liveness effect.
-#
-# Four branches, one per row of the truth table, driven through a REAL fm-watch.sh:
-#   live-idle paused           run-step `parked`, pane alive and idle -> ABSORB
-#   dead paused                pane gone, verdict `unknown`           -> ABSORB
-#   paused + OPEN decision     an unanswered question                 -> SURFACE
-#   paused + CLOSED decision   opened then resolved (the c8 shape)    -> ABSORB
+# tests/fm-watch-pause-absorb.test.sh - pause absorption requires a durable
+# declaration, no open keyed decision, and precedence-compatible current state.
 #
 # The third row is the safety boundary and the reason this is not simply "absorb
 # every pause": a lane with an unanswered captain question must never go quiet, so
@@ -71,17 +42,12 @@ wait_live() {
 # surfaced), PAUSE_FLAG, WAKE_QUEUE, WATCH_OUT. Call it directly, never in a command
 # substitution, or the globals are lost with the subshell.
 #
-# <verdict> is the canned fm-crew-state.sh answer - the ONE input the old
-# implementation keyed its whole decision on, which is why each branch below differs
-# only in that string and in the status stream. The pane is primed as already-stale
+# <verdict> is the canned fm-crew-state.sh answer. The pane is primed as already-stale
 # (.hash/.count pre-seeded) so the poll reaches stale triage immediately, and
 # .seen-* is primed so the signal scan does not pre-empt it. A generous
 # FM_PAUSE_RESURFACE_SECS keeps a legitimate absorb silent, so any wake at all is a
 # genuine surface rather than the hourly pause recheck.
-# PRESEED_PAUSED=1 makes the case start from an already-absorbed pause: the
-# .paused-<key> flag plus a fresh .paused-rechecked-<key> marker, as a lane that
-# absorbed on an earlier poll would carry. Used to prove the cached verdict cannot
-# outlive the status stream it was proven from.
+# PRESEED_PAUSED=1 starts from an already-absorbed pause with an old proof signature.
 PRESEED_PAUSED=0
 run_pause_case() {  # <case-name> <status-stream> <crew-state-verdict>
   local name=$1 stream=$2 verdict=$3
@@ -98,8 +64,6 @@ run_pause_case() {  # <case-name> <status-stream> <crew-state-verdict>
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
   if [ "$PRESEED_PAUSED" = 1 ]; then
-    # A stale cache: flagged paused, rechecked seconds ago, but proven against a
-    # DIFFERENT (earlier) status stream than the one on disk now.
     : > "$state/.paused-$key"
     printf 'stale-signature-from-an-earlier-stream' > "$state/.paused-rechecked-$key"
   fi
@@ -121,15 +85,12 @@ run_pause_case() {  # <case-name> <status-stream> <crew-state-verdict>
 }
 
 # --- branch 1: live-but-idle paused pane -----------------------------------------
-# The exact c8 shape. Its worktree had been recycled onto another lane's branch, so
-# fm-crew-state.sh attributed that foreign run and answered `parked`. The pane was
-# alive and idle at the composer the whole time. A pause is a statement about the
-# WORK, so a run-step that is merely parked must not veto it.
+# A parked run yields to a pause that names its exact run id.
 test_live_idle_paused_pane_absorbed() {
   run_pause_case live-idle-paused \
-    'paused: work complete and verified; waiting on the merge of PR 882 by the main firstmate; owner=main firstmate; clears=PR 882 is merged
+    'paused: work complete and verified; waiting on the merge of PR 882 by the main firstmate; owner=main firstmate; clears=PR 882 is merged; run=01RUN
 ' \
-    'state: parked · source: run-step · parked at ci: 1 finding(s)'
+    'state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN'
   [ "$TRIAGE" = absorbed ] \
     || fail "live-but-idle declared pause was surfaced as a suspected wedge: $WATCH_OUT"
   [ "$PAUSE_FLAG" = present ] \
@@ -139,21 +100,19 @@ test_live_idle_paused_pane_absorbed() {
 }
 
 # --- branch 2: dead paused pane --------------------------------------------------
-# The refutation of the pane-liveness hypothesis. A gone backend target makes
-# fm-crew-state.sh answer `unknown · source: none`, which the old carve-out treated
-# exactly like `parked` - discarded. So a DEAD pane was surfaced too, and pane
-# liveness was never the discriminator in either direction.
-test_dead_paused_pane_absorbed() {
+# A gone backend target is unknown current state and remains actionable.
+test_dead_paused_pane_surfaced() {
   run_pause_case dead-paused \
     'paused: agent is quota-dead, work preserved and verified; waiting on the account reset; owner=account owner; clears=the account quota resets
 ' \
     'state: unknown · source: none · backend target gone: test:fm-dead-paused'
-  [ "$TRIAGE" = absorbed ] \
-    || fail "declared pause with a gone pane was surfaced as a suspected wedge: $WATCH_OUT"
-  [ "$PAUSE_FLAG" = present ] \
-    || fail "declared pause with a gone pane never recorded .paused-<key>"
-  [ -z "$WAKE_QUEUE" ] || fail "declared pause with a gone pane enqueued a wake: $WAKE_QUEUE"
-  pass "dead paused pane: a declared pause is honoured with no readable terminal at all"
+  [ "$TRIAGE" = surfaced ] \
+    || fail "unknown current state was hidden behind a pause: $WATCH_OUT"
+  [ "$PAUSE_FLAG" = absent ] \
+    || fail "unknown current state recorded .paused-<key>"
+  printf '%s' "$WAKE_QUEUE" | grep -q 'stale' \
+    || fail "unknown current state did not enqueue a stale wake: $WAKE_QUEUE"
+  pass "dead paused pane: unknown current state retains precedence"
 }
 
 # --- branch 3: paused with an OPEN decision --------------------------------------
@@ -165,7 +124,7 @@ test_paused_with_open_decision_surfaced() {
     'needs-decision [key=rollback-empty-pointer]: merge as-is, or fix the empty-pointer refusal here?
 paused: standing by for the decision on the rollback gap; owner=captain; clears=the rollback decision is answered
 ' \
-    'state: unknown · source: none · backend target gone: test:fm-paused-open-decision'
+    'state: paused · source: status-log · standing by for the decision'
   [ "$TRIAGE" = surfaced ] \
     || fail "a pause masking an UNANSWERED decision was absorbed and went quiet"
   [ "$PAUSE_FLAG" = absent ] \
@@ -185,9 +144,9 @@ test_paused_with_closed_decision_absorbed() {
 done: PR https://github.com/Ruby-Labs/relvino/pull/882 checks green; NOT merged
 needs-decision [key=rollback-empty-pointer]: merge as-is, or fix the empty-pointer refusal here?
 resolved [key=rollback-empty-pointer]: option (a) approved - merge this rebase as-is
-paused: work complete and verified; waiting on the merge of PR 882 by the main firstmate; owner=main firstmate; clears=PR 882 is merged
+paused: work complete and verified; waiting on the merge of PR 882 by the main firstmate; owner=main firstmate; clears=PR 882 is merged; run=01RUN
 ' \
-    'state: parked · source: run-step · parked at ci: 1 finding(s)'
+    'state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN'
   [ "$TRIAGE" = absorbed ] \
     || fail "a pause whose only decision was explicitly resolved was surfaced: $WATCH_OUT"
   [ "$PAUSE_FLAG" = present ] \
@@ -198,29 +157,36 @@ paused: work complete and verified; waiting on the merge of PR 882 by the main f
 
 # --- the same four branches at the classifier level -------------------------------
 # The behavioral cases above prove the watcher wires this correctly; this matrix pins
-# the decision itself, including the run-step verdicts that used to veto a pause and
-# the `working` verdict that legitimately still does.
+# the decision itself.
 test_crew_absorb_class_pause_matrix() {
   local dir state fakebin
   dir=$(make_case absorb-pause-matrix); state="$dir/state"; fakebin="$dir/fakebin"
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_FAKE_CREW_STATE FM_STATE_OVERRIDE="$state"
 
-  local paused='paused: waiting on the merge of PR 882; owner=main firstmate; clears=PR 882 is merged'
+  local paused='paused: waiting on the merge of PR 882; owner=main firstmate; clears=PR 882 is merged; run=01RUN'
   printf '%s\n' "$paused" > "$state/a.status"
 
-  # Every non-working verdict must yield to the declared pause, including the three
-  # that used to veto it.
   local v
-  for v in 'state: parked · source: run-step · parked at ci: 1 finding(s)' \
-           'state: failed · source: run-step · run cancelled' \
-           'state: unknown · source: none · backend target gone' \
-           'state: done · source: run-step · run passed: PR merged (verified)' \
-           'state: paused · source: status-log · waiting on the merge'; do
+  for v in 'state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN' \
+           'state: done · source: run-step · run passed: PR merged (verified) · run: 01RUN' \
+           'state: paused · source: status-log · waiting on the merge · run: 01RUN'; do
     FM_FAKE_CREW_STATE="$v"
     [ "$(crew_absorb_class a "$paused")" = paused ] \
       || fail "declared pause not honoured over verdict [$v]"
     crew_is_paused a || fail "crew_is_paused disagreed with the class for verdict [$v]"
   done
+
+  for v in 'state: failed · source: run-step · run cancelled · run: 01RUN' \
+           'state: stale · source: run-step · stale run' \
+           'state: unknown · source: none · backend target gone'; do
+    FM_FAKE_CREW_STATE="$v"
+    [ "$(crew_absorb_class a "$paused")" = none ] \
+      || fail "authoritative verdict was hidden behind a pause [$v]"
+  done
+
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at ci: 1 finding(s) · run: 02NEW'
+  [ "$(crew_absorb_class a "$paused")" = none ] \
+    || fail "pause associated with an older run overrode the current parked run"
 
   # A crewmate that appended a pause and then STARTED working is working, not paused:
   # active work supersedes the stale declaration. This precedence is unchanged.
@@ -233,30 +199,30 @@ test_crew_absorb_class_pause_matrix() {
 
   # The pause must be read from the durable stream even when no caller passes it,
   # so the two call sites in bin/fm-watch.sh cannot disagree.
-  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at ci: 1 finding(s)'
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN'
   [ "$(crew_absorb_class a)" = paused ] \
     || fail "the declared pause was not read from the status stream when unspecified"
 
   # An open keyed decision blocks absorption on every verdict.
   printf 'needs-decision [key=api-shape]: which shape?\n%s\n' "$paused" > "$state/a.status"
-  for v in 'state: parked · source: run-step · parked at ci: 1 finding(s)' \
+  for v in 'state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN' \
            'state: unknown · source: none · backend target gone' \
-           'state: done · source: run-step · run passed: PR merged (verified)' \
-           'state: paused · source: status-log · waiting on the merge'; do
+           'state: done · source: run-step · run passed: PR merged (verified) · run: 01RUN' \
+           'state: paused · source: status-log · waiting on the merge · run: 01RUN'; do
     FM_FAKE_CREW_STATE="$v"
     [ "$(crew_absorb_class a "$paused")" = none ] \
       || fail "an OPEN decision failed to block absorption under verdict [$v]"
   done
   # ...and stops blocking once it is explicitly resolved.
   printf 'needs-decision [key=api-shape]: which shape?\nresolved [key=api-shape]: option (a)\n%s\n' "$paused" > "$state/a.status"
-  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at ci: 1 finding(s)'
+  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN'
   [ "$(crew_absorb_class a "$paused")" = paused ] \
     || fail "a resolved decision still blocked absorption"
 
   # A FAILURE reported under the pause verb is not a wait and must never absorb.
   local failpause='paused: error: drive run: reconcile run: read response: i/o timeout; owner=drive; clears=the reconcile run returns'
   printf '%s\n' "$failpause" > "$state/a.status"
-  FM_FAKE_CREW_STATE='state: unknown · source: none · backend target gone'
+  FM_FAKE_CREW_STATE='state: paused · source: status-log · failure-shaped pause'
   [ "$(crew_absorb_class a "$failpause")" = none ] \
     || fail "a failure reported under the pause verb was absorbed as a declared wait"
 
@@ -267,38 +233,32 @@ test_crew_absorb_class_pause_matrix() {
   [ "$(crew_absorb_class "")" = none ] || fail "empty id not classed none"
 
   unset FM_FAKE_CREW_STATE FM_STATE_OVERRIDE
-  pass "crew_absorb_class: a declared pause outranks every verdict but working, and an open decision blocks it"
+  pass "crew_absorb_class enforces run association, precedence, and open-decision proof"
 }
 
-# --- a cached pause verdict cannot outlive the stream it was proven from ----------
-# pause_state_class skips the authoritative re-read while a recent recheck marker
-# stands, so that cache is the one way an open decision could still slip past the
-# boundary: a lane absorbs cleanly, THEN appends needs-decision and re-declares its
-# pause, leaving the pause verb on the last line again. The marker carries the status
-# signature it was proven against, so any append invalidates it and forces a fresh
-# proof instead of riding out the age window.
-test_cached_pause_verdict_reproven_when_stream_changes() {
+# --- a pause proof marker cannot outlive the stream it was proven from -------------
+test_pause_marker_reproven_when_stream_changes() {
   PRESEED_PAUSED=1
   run_pause_case cached-pause-stale-proof \
     'paused: waiting on the merge of PR 882; owner=main firstmate; clears=PR 882 is merged
 needs-decision [key=rollback-empty-pointer]: merge as-is, or fix the empty-pointer refusal here?
 paused: standing by for the decision on the rollback gap; owner=captain; clears=the rollback decision is answered
 ' \
-    'state: unknown · source: none · backend target gone: test:fm-cached-pause-stale-proof'
+    'state: paused · source: status-log · standing by for the decision'
   PRESEED_PAUSED=0
   [ "$TRIAGE" = surfaced ] \
     || fail "a decision opened after the pause flag rode out the cache window and went quiet"
   printf '%s' "$WAKE_QUEUE" | grep -q 'stale' \
     || fail "the re-proven pause did not enqueue a stale wake: $WAKE_QUEUE"
-  pass "a cached pause verdict is re-proven whenever the status stream changes under it"
+  pass "a pause proof marker is re-proven whenever the status stream changes"
 }
 
 test_pause_moving_during_pipeline_read_refused() {
   export FM_FAKE_CREW_STATE_APPEND_STATUS='blocked: stream advanced during pipeline state read'
   run_pause_case pause-moved-during-proof \
-    'paused: awaiting ordered PR merges; owner=merge supervisor; clears=ordered merges complete
+    'paused: awaiting ordered PR merges; owner=merge supervisor; clears=ordered merges complete; run=01RUN
 ' \
-    'state: parked · source: run-step · parked at ci: 1 finding(s)'
+    'state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN'
   unset FM_FAKE_CREW_STATE_APPEND_STATUS
   [ "$TRIAGE" = surfaced ] \
     || fail "a pause invalidated during the crew-state read was absorbed"
@@ -308,9 +268,9 @@ test_pause_moving_during_pipeline_read_refused() {
 }
 
 test_live_idle_paused_pane_absorbed
-test_dead_paused_pane_absorbed
+test_dead_paused_pane_surfaced
 test_paused_with_open_decision_surfaced
 test_paused_with_closed_decision_absorbed
-test_cached_pause_verdict_reproven_when_stream_changes
+test_pause_marker_reproven_when_stream_changes
 test_pause_moving_during_pipeline_read_refused
 test_crew_absorb_class_pause_matrix

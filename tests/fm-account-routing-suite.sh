@@ -5279,13 +5279,19 @@ set -eu
 state=$2
 critical=$3
 overlap=$4
-held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=30 fm_account_meta_lock_acquire "$state" lock-task)
+held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=30 fm_account_meta_lock_acquire "$state" lock-task) || {
+  printf 'worker %s failed to acquire metadata lock\n' "$$" >&2
+  exit 81
+}
 if ! mkdir "$critical" 2>/dev/null; then
   printf 'overlap\n' >> "$overlap"
 fi
 sleep 0.05
 rmdir "$critical" 2>/dev/null || true
-fm_account_meta_lock_release "$held"
+fm_account_meta_lock_release "$held" || {
+  printf 'worker %s failed to release metadata lock\n' "$$" >&2
+  exit 82
+}
 SH
   chmod +x "$workers"
   pids=
@@ -5406,6 +5412,8 @@ test_account_locks_support_maximum_task_identity() {
   templates="$FM_ACCOUNT_LOCK_OWNER_TEMPLATE
 $FM_ACCOUNT_LOCK_IDENTITY_TEMPLATE
 $FM_ACCOUNT_LOCK_IDENTITY_PREFIX$digest
+$FM_ACCOUNT_LOCK_IDENTITY_MUTATION_PREFIX$digest
+$FM_ACCOUNT_LOCK_IDENTITY_MUTATION_PREFIX$digest.candidate.XXXXXX
 $FM_ACCOUNT_LOCK_PATH_PREFIX$digest
 $FM_ACCOUNT_LOCK_GENERATION_TEMPLATE
 $FM_ACCOUNT_LOCK_RECLAIM_TEMPLATE
@@ -5609,6 +5617,7 @@ test_account_lock_owner_controls_reject_symlinks() {
 test_bounded_account_lock_reclaim_requires_exact_dead_owner() {
   local case_dir state task lock held start outside status before_inode after_inode
   local identity_claim identity_key identity_value identity_saved identity_outside identity_mv
+  local delete_observed delete_release reclaim_pid attempts mutation
   . "$ROOT/bin/fm-account-routing-lib.sh"
   case_dir="$TMP_ROOT/bounded-account-lock-reclaim"
   state="$case_dir/state"
@@ -5760,6 +5769,41 @@ SH
   [ -L "$identity_claim" ] || fail "bounded reclaim replaced a substituted task-identity symlink"
   [ "$(cat "$identity_outside")" = outside-identity ] || fail "bounded reclaim changed a task-identity symlink target"
   [ "$(cat "$identity_saved")" = "$identity_value" ] || fail "bounded reclaim changed the pinned task-identity generation"
+  rm "$identity_claim"
+  mv "$identity_saved" "$identity_claim"
+  before_inode=$(fm_account_path_inode "$lock") \
+    || fail "bounded final-delete race fixture could not pin the lock carrier"
+  delete_observed="$case_dir/delete.observed"
+  delete_release="$case_dir/delete.release"
+  FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_ACCOUNT_IDENTITY_DELETE_TEST_OBSERVED="$delete_observed" \
+    FM_ACCOUNT_IDENTITY_DELETE_TEST_RELEASE="$delete_release" \
+    bash -c '. "$1"; fm_account_lock_exact_reclaim "$2"' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$lock" &
+  reclaim_pid=$!
+  attempts=0
+  while [ ! -f "$delete_observed" ] && [ "$attempts" -lt 200 ]; do
+    attempts=$((attempts + 1))
+    sleep 0.05
+  done
+  [ -f "$delete_observed" ] || fail "bounded final-delete race did not reach its synchronization boundary"
+  mutation=$(fm_account_lock_identity_mutation_path "$lock") \
+    || fail "bounded final-delete race could not resolve its mutation boundary"
+  [ -f "$mutation" ] && [ ! -L "$mutation" ] \
+    || fail "bounded final-delete race released its mutation boundary before deletion"
+  printf 'malformed-after-post-move\n' > "$identity_claim.replacement"
+  mv "$identity_claim.replacement" "$identity_claim"
+  : > "$delete_release"
+  if wait "$reclaim_pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim deleted after post-move task-identity substitution"
+  [ -d "$lock" ] && [ ! -L "$lock" ] \
+    || fail "bounded reclaim discarded lock state after final task-identity substitution"
+  [ "$(fm_account_path_inode "$lock")" = "$before_inode" ] \
+    || fail "bounded reclaim replaced lock state after final task-identity substitution"
+  [ "$(cat "$identity_claim")" = malformed-after-post-move ] \
+    || fail "bounded reclaim changed the final substituted task-identity claim"
+  [ ! -e "$mutation" ] && [ ! -L "$mutation" ] \
+    || fail "bounded final-delete race retained its mutation boundary"
   rm -rf "$case_dir"
   pass "bounded account locks reclaim only exact proven-dead owners"
 }

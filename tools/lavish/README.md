@@ -37,7 +37,7 @@ It renders the same immutable request into self-contained HTML below the effecti
 It creates no dedicated browser profile, Chrome DevTools process, automation session, armed submission check, watcher, or listener.
 The board form refuses to save nothing, because the eventual `answer.toon` is write-once: a decision board requires a choice on every question, and an annotation board requires at least one item comment or the overall note.
 That guard is the rendered form's alone; `collect` stays permissive, so a hand-recovered payload is never refused for it.
-Saving downloads one schema-version-2 JSON payload named `lavish-answer-<decision-id>.json` and exposes the same bytes as a manual backup.
+Saving downloads one schema-version-2 JSON payload named `lavish-answer-<decision-id>-<request-digest>.json` and exposes the same bytes as a manual backup.
 The payload carries the resolved absolute Firstmate home as `home_marker`, so a shared Downloads directory cannot route one home's answer into another home.
 The board does not claim to notify firstmate automatically.
 The captain tells firstmate after answering, and the next bounded `lavish-axi intake` scan finds the downloaded payload, validates it against the immutable manifest, commits `answer.toon`, writes the declared destination, and then writes `receipt.toon`.
@@ -131,6 +131,7 @@ Field-less protocol-1 manifests infer that same contract from the destination ex
 Payload recovery scans configured download locations plus the effective state root's legacy landing files as one batch.
 An unreadable configured location fails the batch before any candidate is committed or any intake result is published.
 New payloads route by `home_marker`; legacy unmarked downloads remain recoverable only in a home whose immutable decision id and request digest match.
+Request-bound browser filenames isolate each immutable question set, and intake authorizes the highest numbered browser collision while refusing equally ranked disagreements.
 
 All commands require either `FM_HOME` or an explicit `--home <path>` and never guess a fleet home.
 Firstmate's internal commands use `FM_HOME`; captain-facing commands carry the resolved absolute `--home` path.

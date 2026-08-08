@@ -7,7 +7,7 @@
 #   fm-lavish-board.sh <decision-id> [--home <path>]
 #
 # FM_LAVISH_OPEN_COMMAND may name an absolute executable for tests or hosts that
-# do not provide macOS `open` or `xdg-open`. The executable receives the board's
+# do not provide macOS `open`. The executable receives the board's
 # absolute HTML path as its only argument and must return after handing the file
 # to the user's browser.
 set -euo pipefail
@@ -50,7 +50,7 @@ resolve_home() {
 }
 
 resolve_open_command() {
-  local requested=${FM_LAVISH_OPEN_COMMAND:-} resolved
+  local requested=${FM_LAVISH_OPEN_COMMAND:-} board_path=$1
   if [ -n "$requested" ]; then
     case "$requested" in
       /*) ;;
@@ -61,14 +61,11 @@ resolve_open_command() {
     printf '%s\n' "$requested"
     return
   fi
-  if [ -x /usr/bin/open ]; then
+  if [ "$(uname -s)" = Darwin ] && [ -x /usr/bin/open ]; then
     printf '%s\n' /usr/bin/open
     return
   fi
-  resolved=$(command -v xdg-open 2>/dev/null || true)
-  [ -n "$resolved" ] && [ -x "$resolved" ] \
-    || fail 'no default browser opener found (expected /usr/bin/open or xdg-open)'
-  printf '%s\n' "$resolved"
+  fail "automatic default-browser handoff is unsupported on this host; open the board manually: $board_path"
 }
 
 assert_answerable_board() {
@@ -179,8 +176,6 @@ STATE_DIR=$(cd "$STATE_ARG" && pwd -P)
 
 [ -x "$LAVISH_BIN" ] || fail "Lavish fork CLI is not executable: $LAVISH_BIN"
 command -v node >/dev/null 2>&1 || fail 'node is not installed'
-OPEN_COMMAND=$(resolve_open_command)
-
 umask 077
 HTML_PATH="$STATE_DIR/lavish-board-$DECISION_ID.html"
 "$LAVISH_BIN" board "$DECISION_ID" --home "$HOME_PATH" --out "$HTML_PATH"
@@ -190,6 +185,7 @@ if ! ANSWERABILITY_ERROR=$(assert_answerable_board "$HTML_PATH" 2>&1); then
   fail "refusing to surface an unanswerable board: $ANSWERABILITY_ERROR"
 fi
 
+OPEN_COMMAND=$(resolve_open_command "$HTML_PATH")
 if ! "$OPEN_COMMAND" "$HTML_PATH"; then
   fail 'could not open the board in the default browser'
 fi

@@ -92,7 +92,7 @@ test_preflight_and_browser_contracts() {
 }
 
 test_download_and_intake_contracts() {
-  assert_grep "landing record is \`lavish-answer-<decision-id>.json\`" \
+  assert_grep "landing record is \`lavish-answer-<decision-id>-<request-digest>.json\`" \
     "$SKILL" "downloaded landing record is missing"
   assert_grep "exposes the exact JSON as a manual backup" \
     "$SKILL" "manual payload recovery is missing"

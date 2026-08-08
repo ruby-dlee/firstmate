@@ -75,6 +75,7 @@ case "${1:-}" in
         else
           case "${FM_FAKE_AXI_STATUS_MODE:-ok}" in
             fail) exit 9 ;;
+            signal) kill -TERM "$$" ;;
             timeout) sleep 30 ;;
           esac
           printf '%s\n' "${FM_FAKE_AXI_STATUS:-}"
@@ -1603,6 +1604,25 @@ test_timed_out_run_lookup_rejects_pause() {
   pass "timed-out run discovery cannot authorize a status-log pause"
 }
 
+test_signaled_run_lookup_rejects_pause() {
+  reset_fakes
+  local d out toolbin
+  d=$(new_case signaled-run-paused)
+  make_repo_on_branch "$d/wt" fm/signaled-run-paused
+  make_fakebin "$d" >/dev/null
+  toolbin=$(make_no_timeout_toolbin "$d")
+  fm_write_meta "$d/state/signaled-run-paused.meta" \
+    "window=fm:fm-signaled-run-paused" "worktree=$d/wt" "kind=ship"
+  printf 'paused: awaiting release; owner=release team; clears=release artifact is published\n' \
+    > "$d/state/signaled-run-paused.status"
+  FM_FAKE_AXI_STATUS_MODE=signal
+  out=$(PATH="$d/fakebin:$toolbin" FM_STATE_OVERRIDE="$d/state" "$CREW_STATE" signaled-run-paused)
+  assert_contains "$out" "state: unknown" "signaled run lookup -> unknown"
+  assert_contains "$out" "run lookup unavailable" "signaled run lookup names the unavailable proof"
+  assert_not_contains "$out" "state: paused" "signaled run lookup trusted a stale pause"
+  pass "signaled run discovery cannot authorize a status-log pause"
+}
+
 test_no_run_idle_pane_custom_paused_verb() {
   reset_fakes
   local d; d=$(new_case custom-paused)
@@ -1920,6 +1940,7 @@ if [ "${FM_TEST_FOCUSED:-}" = run-discovery ]; then
   test_no_run_idle_pane_paused
   test_unreadable_run_lookup_rejects_pause
   test_timed_out_run_lookup_rejects_pause
+  test_signaled_run_lookup_rejects_pause
   test_no_timeout_uses_perl_bound
   exit 0
 fi
@@ -1978,6 +1999,7 @@ test_no_run_idle_pane_uses_keyed_log
 test_no_run_idle_pane_paused
 test_unreadable_run_lookup_rejects_pause
 test_timed_out_run_lookup_rejects_pause
+test_signaled_run_lookup_rejects_pause
 test_no_run_idle_pane_custom_paused_verb
 test_supervisor_read_separates_paused_wedged_unknown
 test_no_run_idle_secondmate_resolved_event_not_state

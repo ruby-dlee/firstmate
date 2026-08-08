@@ -202,6 +202,8 @@ fm_backend_tmux_expected_label_matches() {  # <target> [expected-label] [recorde
   esac
 }
 
+# fm_backend_tmux_operation_target: resolve <target> for an operation, refusing
+# it when the recorded identity does not line up with what the caller expects.
 #
 # No separate existence probe here on purpose. The operations this resolves for
 # are capture-pane and send-keys, and BOTH already fail correctly on a target

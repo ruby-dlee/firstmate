@@ -562,7 +562,95 @@ test_a_component_below_the_scan_depth_is_reported_not_dropped() {
     "the lane's report does not name the component the depth limit left it without"
   [ ! -d "$case_dir/wt/$deep/.venv" ] \
     || fail "a component past the depth limit was installed anyway"
+
+  # The traversal is bounded, and the bound is real: it descends exactly one
+  # level past the limit so the first component beyond it can be NAMED, and no
+  # further. This pins that boundary rather than leaving it to prose.
+  mkdir -p "$case_dir/wt/$deep/internal"
+  printf 'six==1.16.0\n' > "$case_dir/wt/$deep/internal/requirements.txt"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" "unscanned:$deep=skipped:below-scan-depth" \
+    "the first component past the depth limit stopped being reported: $out"
+  assert_not_contains "$out" "$deep/internal" \
+    "the traversal reached past its own bound: $out"
   pass "a component nested past the scan depth is reported everywhere, not dropped"
+}
+
+# A manifest scan that outlives its bound is work provisioning could not do
+# here, not an attempt that failed: it warns, records the whole worktree as
+# unavailable, and still launches - and because nothing was enumerated, the
+# lane's report has to say so rather than carry a header that would read like a
+# worktree that needed nothing.
+test_a_scan_that_outlives_its_bound_launches_unprovisioned() {
+  local case_dir out fakebin report slow_find
+  case_dir=$(new_case scan-bound both)
+  fakebin=$(case_fakebin "$case_dir")
+  slow_find="$case_dir/slow"
+  mkdir -p "$slow_find"
+  cat > "$slow_find/find" <<'SH'
+#!/usr/bin/env bash
+sleep 30
+SH
+  chmod +x "$slow_find/find"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$slow_find:$fakebin" \
+    FM_PROVISION_PROBE_TIMEOUT=2)
+  assert_contains "$out" 'rc=0' "a scan that outlived its bound refused the spawn: $out"
+  assert_contains "$out" 'summary=unavailable:scan-too-large' \
+    "a scan that outlived its bound was not recorded as a whole-worktree gap: $out"
+  [ ! -s "$case_dir/install.log" ] \
+    || fail "a scan that never finished still invoked an installer: $(cat "$case_dir/install.log")"
+  report="$case_dir/wt/.fm-provisioning.md"
+  [ -f "$report" ] || fail "a scan that outlived its bound left the lane no report: $out"
+  assert_grep 'NOT provisioned: scan-too-large' "$report" \
+    "the lane's report does not say the scan is why it got nothing"
+  pass "a dependency scan that outlives its bound warns, reports, and launches unprovisioned"
+}
+
+# Regression: a note is a verdict, and a verdict requires a check that ran.
+# fm_provision_run_bounded reserves 124/125/126/127 for a check that did NOT
+# run, and reporting one of those as "uv pip check reports ..." tells the lane a
+# fact about its own environment that was never established - the same
+# something-from-nothing shape as an empty digest or an empty signature.
+test_a_check_that_could_not_run_is_never_reported_as_a_verdict() {
+  local case_dir dir code out note
+  case_dir=$(new_case probe-check-codes none)
+  dir="$case_dir/wt/svc"
+  mkdir -p "$dir/.venv/bin" "$case_dir/probe-bin"
+  cat > "$dir/.venv/bin/python" <<'PY'
+#!/usr/bin/env bash
+printf '3.11.9'
+PY
+  chmod +x "$dir/.venv/bin/python"
+  : > "$case_dir/probe.log"
+
+  for code in 124 125 126 127 1; do
+    printf '#!/usr/bin/env bash\nexit %s\n' "$code" > "$case_dir/probe-bin/uv"
+    chmod +x "$case_dir/probe-bin/uv"
+    # shellcheck disable=SC2016  # the snippet is evaluated inside run_lib's own shell
+    out=$(FM_TEST_SNIPPET='
+      FM_PROVISION_BOUND_KIND=perl
+      if fm_provision_probe "$FM_TEST_WT" pip svc "$FM_TEST_LOG" 3.11.9 sig installed; then
+        printf "rc=0 note=%s\n" "$FM_PROVISION_PROBE_NOTE"
+      else
+        printf "rc=%s note=%s\n" "$?" "$FM_PROVISION_PROBE_NOTE"
+      fi
+    ' run_lib PATH="$case_dir/probe-bin:/usr/bin:/bin" \
+      FM_TEST_WT="$case_dir/wt" FM_TEST_LOG="$case_dir/probe.log")
+    assert_contains "$out" 'rc=0' \
+      "a uv pip check exiting $code turned a usable environment into a probe failure: $out"
+    note=${out##*note=}
+    note=${note%%$'\n'*}
+    if [ "$code" = 1 ]; then
+      [ "$note" = inconsistent-dependency-metadata ] \
+        || fail "a real uv pip check verdict was not recorded as one (got '$note')"
+    else
+      [ "$note" != inconsistent-dependency-metadata ] \
+        || fail "exit $code means uv pip check never ran, but it was recorded as a verdict about the environment"
+      [ "$note" = unverified-dependency-metadata ] \
+        || fail "exit $code did not record that the check could not be run (got '$note')"
+    fi
+  done
+  pass "a uv pip check that could not run is recorded as unverified, never as a verdict"
 }
 
 # The same silence, one directory shape over: a project declaring only a
@@ -599,6 +687,44 @@ test_a_lockless_python_project_is_named_rather_than_invisible() {
   assert_not_contains "$out" 'python:mono/packages/alpha' \
     "a uv workspace member its root already installs was reported as an unprovisioned gap: $out"
   pass "a python project with no committed lock or requirements file is named, not silently skipped"
+}
+
+# The other side of that gap: a pyproject.toml carrying only tool configuration
+# declares nothing to provision, so naming it would put a false line on the one
+# surface this feature built for signal - and make a worktree that is in fact
+# complete announce that it left a component UNPROVISIONED.
+test_a_tool_configuration_pyproject_is_a_clean_noop() {
+  local case_dir out fakebin
+  case_dir=$(new_case pyproject-tool-config python)
+  fakebin=$(case_fakebin "$case_dir")
+  cat > "$case_dir/wt/pyproject.toml" <<'TOML'
+[tool.ruff]
+line-length = 100
+
+[tool.black]
+line-length = 100
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+TOML
+
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'rc=0' "a tool-configuration pyproject.toml refused: $out"
+  assert_contains "$out" 'pip:svc=installed' "the real python component was not provisioned: $out"
+  assert_not_contains "$out" 'python:.=' \
+    "a pyproject.toml holding only tool configuration was reported as a component: $out"
+  assert_not_contains "$out" 'UNPROVISIONED' \
+    "a fully provisioned worktree announced that it left something unprovisioned: $out"
+  assert_no_grep '## not provisioned' "$case_dir/wt/.fm-provisioning.md" \
+    "the lane's report opens a gap section for a directory with nothing to provision"
+
+  # And the distinction holds: adding real packaging metadata to that same file
+  # makes it a component again.
+  printf '\n[project]\nname = "root"\nversion = "0.1.0"\n' >> "$case_dir/wt/pyproject.toml"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'python:.=skipped:no-python-lockfile' \
+    "a pyproject.toml that declares a project was not reported as a lockless component: $out"
+  pass "a pyproject.toml holding only tool configuration provisions nothing and reports nothing"
 }
 
 # `uv pip check` verifies that installed metadata is mutually consistent, which
@@ -1765,7 +1891,10 @@ test_pip_requirement_directives_do_not_force_a_reinstall_every_spawn
 test_lane_build_output_in_node_modules_is_not_a_cache_miss
 test_an_unreadable_manifest_refuses_instead_of_hashing_nothing
 test_a_component_below_the_scan_depth_is_reported_not_dropped
+test_a_scan_that_outlives_its_bound_launches_unprovisioned
+test_a_check_that_could_not_run_is_never_reported_as_a_verdict
 test_a_lockless_python_project_is_named_rather_than_invisible
+test_a_tool_configuration_pyproject_is_a_clean_noop
 test_an_inconsistent_environment_is_reported_rather_than_refused
 test_a_failing_install_refuses_the_spawn
 test_a_hung_install_is_bounded

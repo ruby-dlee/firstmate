@@ -6415,6 +6415,13 @@ test_secondmate_registry_updates_are_locked_and_literal() {
   case_dir=$(make_case secondmate-registry-locked-literal)
   id='foo.bar'
   prepare_secondmate_home_fixture "$case_dir" "$id"
+  # This case is about registry locking, and a secondmate teardown legitimately
+  # requires an already-quiesced endpoint, so model one the way the rest of this
+  # suite does. It previously read as gone only by accident: the stub's
+  # list-windows answers with a hardcoded fm-task-x1, which never matched this
+  # task's fm-foo.bar window, so the bare-name lookup missed it whatever the
+  # live marker said.
+  rm -f "$case_dir/fakebin/.tmux-live"
   fm_write_meta "$case_dir/state/$id.meta" \
     "window=fm-$id" \
     "tmux_session_target=firstmate:fm-$id" \

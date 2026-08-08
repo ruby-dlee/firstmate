@@ -241,8 +241,14 @@ done
 [ "$autonomous" = yes ] || exit 84
 [ "$format" = json ] || exit 85
 [ -n "$schema" ] && [ -n "$prompt" ] || exit 86
+if [ "${FM_TEST_CLAUDE_ZERO_TURN:-}" = 1 ]; then
+  # The observed shape of a Claude reviewer that never reached the provider:
+  # one turn, no API duration, no usage, and the only explanation in `result`.
+  printf '%s\n' '{"is_error":true,"duration_api_ms":0,"num_turns":1,"stop_reason":"stop_sequence","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"modelUsage":{},"permission_denials":[],"terminal_reason":"error","subtype":"error_during_execution","api_error_status":null,"result":"Claude AI usage limit reached|1786000000","type":"result"}'
+  exit 1
+fi
 if [ "$FM_TEST_REVIEW_SCENARIO" != reading-only-suspicion ]; then
-  if ! git -C "$PWD" diff "$FM_TEST_BASE..$FM_TEST_HEAD" -- app.txt \
+  if ! git -C "$PWD" diff "${FM_TEST_REVIEWED_BASE:-$FM_TEST_BASE}..$FM_TEST_HEAD" -- app.txt \
     > "$HOME/.claude/session-env/crosscheck-git-diff" \
     2> "$HOME/.claude/session-env/crosscheck-git-diff.err"; then
     cat "$HOME/.claude/session-env/crosscheck-git-diff.err" >&2
@@ -399,7 +405,9 @@ if scenario == "stopped":
     raise SystemExit(0)
 
 protocol = workdir / ".crosscheck"
-base_sha = os.environ["FM_TEST_BASE"]
+# The reviewed base is the merge base the gate resolved, which is not the
+# base.sha the API reported once the default branch has moved past it.
+base_sha = os.environ.get("FM_TEST_REVIEWED_BASE") or os.environ["FM_TEST_BASE"]
 execution = protocol / "reproductions" / "review-execution.sh"
 receipt = protocol / "reproductions" / "review-execution.receipt"
 execution.parent.mkdir(parents=True, exist_ok=True)
@@ -766,12 +774,12 @@ def write_config(reviewers):
 
 def expect_refused(meta, expected):
     try:
-        module.reviewer_config(root, meta)
+        module.reviewer_candidates(root, meta)
     except module.CrosscheckError as exc:
         message = str(exc)
         assert expected in message, message
         return message
-    raise AssertionError("reviewer_config unexpectedly selected a reviewer")
+    raise AssertionError("reviewer_candidates unexpectedly returned a reviewer")
 
 
 validation_author = {
@@ -782,7 +790,7 @@ validation_author = {
 for harness, model, effort, home_name in profiles:
     candidate = reviewer(harness, model, effort, home_name)
     write_config([candidate])
-    selected = module.reviewer_config(root, validation_author)
+    selected = module.reviewer_candidates(root, validation_author)[0]
     assert selected == candidate
     print(f"VALID harness={harness} model={model} effort={effort}")
 
@@ -816,7 +824,7 @@ write_config(
         reviewer("pi", "gpt-5.6-sol", "xhigh", "pi-home"),
     ]
 )
-selected = module.reviewer_config(root, claude_author)
+selected = module.reviewer_candidates(root, claude_author)[0]
 assert selected["harness"] == "pi"
 assert selected["model"] == "gpt-5.6-sol"
 assert selected["effort"] == "xhigh"
@@ -937,7 +945,7 @@ meta = {
 def expect_refused(home, label):
     write_config(home)
     try:
-        module.reviewer_config(root, meta)
+        module.reviewer_candidates(root, meta)
     except module.CrosscheckError as exc:
         message = str(exc)
         assert "proven-separate account" in message, message
@@ -950,7 +958,7 @@ def expect_refused(home, label):
 expect_refused(aliased, "same-openai-account-different-path")
 
 write_config(distinct)
-selected = module.reviewer_config(root, meta)
+selected = module.reviewer_candidates(root, meta)[0]
 assert selected["account_home"] == str(distinct.resolve()), selected
 assert selected["author_account_identity"] == "openai-account-A", selected
 print(f"SELECTED distinct-openai-account: {selected['account_home']}")
@@ -969,7 +977,7 @@ unreadable_author = {
 }
 write_config(distinct)
 try:
-    module.reviewer_config(root, unreadable_author)
+    module.reviewer_candidates(root, unreadable_author)
 except module.CrosscheckError as exc:
     assert "proven-separate account" in str(exc), str(exc)
     print("REFUSED unreadable-author-identity")
@@ -984,7 +992,7 @@ claude_meta = {
     "account_home": str(codex_home("claude-author", None)),
 }
 write_config(aliased)
-selected = module.reviewer_config(root, claude_meta)
+selected = module.reviewer_candidates(root, claude_meta)[0]
 assert selected["account_home"] == str(aliased.resolve()), selected
 print("SELECTED claude-author-unaffected")
 PY
@@ -1059,7 +1067,7 @@ meta = {
 def expect_refused(home, label):
     write_config(home)
     try:
-        module.reviewer_config(root, meta)
+        module.reviewer_candidates(root, meta)
     except module.CrosscheckError as exc:
         message = str(exc)
         assert "proven-separate account" in message, message
@@ -1082,7 +1090,7 @@ borrowed_author = {
 }
 write_config(distinct)
 try:
-    module.reviewer_config(root, borrowed_author)
+    module.reviewer_candidates(root, borrowed_author)
 except module.CrosscheckError as exc:
     assert "proven-separate account" in str(exc), str(exc)
     print("REFUSED unreadable-anthropic-author-identity")
@@ -1091,18 +1099,18 @@ else:
 
 # Two genuinely distinct Anthropic accounts are independent.
 write_config(distinct)
-selected = module.reviewer_config(root, meta)
+selected = module.reviewer_candidates(root, meta)[0]
 assert selected["account_home"] == str(distinct.resolve()), selected
 assert selected["author_account_identity"] == "anthropic-account-A", selected
 print("SELECTED distinct-anthropic-account")
 
 # A cross-provider reviewer is unaffected by Anthropic identity comparison.
 write_config(aliased, harness="codex", model="gpt-5.6-sol")
-cross = module.reviewer_config(root, {
+cross = module.reviewer_candidates(root, {
     "harness": "claude",
     "model": "claude-opus-5",
     "account_home": str(author),
-})
+})[0]
 assert cross["harness"] == "codex", cross
 assert "author_account_identity" not in cross, cross
 print("SELECTED cross-provider-unaffected")
@@ -1171,7 +1179,7 @@ def unrouted(harness, model):
 
 def expect_selected(author, name, label):
     write_config(name)
-    selected = module.reviewer_config(root, author)
+    selected = module.reviewer_candidates(root, author)[0]
     assert selected["harness"] == reviewers[name][0], selected
     assert "author_account_identity" not in selected, selected
     print(f"SELECTED {label}: {selected['harness']}")
@@ -1180,7 +1188,7 @@ def expect_selected(author, name, label):
 def expect_refused(author, name, expected, label):
     write_config(name)
     try:
-        module.reviewer_config(root, author)
+        module.reviewer_candidates(root, author)
     except module.CrosscheckError as exc:
         message = str(exc)
         assert expected in message, message
@@ -2877,6 +2885,82 @@ assert run["suspicions"] == []
   pass "a verdict without an executed reproduction is a tool failure, never blocking code evidence"
 }
 
+test_moved_default_branch_stays_reviewable() {
+  local record case_dir base head moved reviewed
+  record=$(make_case moved-default-branch)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+
+  # Move the default branch past the PR's branch point, exactly as merging
+  # anything else does. GitHub then reports base.sha as this new tip, which is
+  # not an ancestor of the PR head.
+  git -C "$case_dir/repo" checkout -q main
+  printf 'unrelated\n' > "$case_dir/repo/unrelated.txt"
+  git -C "$case_dir/repo" add unrelated.txt
+  git -C "$case_dir/repo" commit -qm "unrelated main commit"
+  moved=$(git -C "$case_dir/repo" rev-parse HEAD)
+  [ "$moved" != "$base" ] || fail "default branch did not move"
+
+  FM_TEST_REVIEWED_BASE="$base" run_case "$case_dir" "$moved" "$head" clear run \
+    > "$case_dir/out" 2> "$case_dir/err" \
+    || fail "a moved default branch made the PR unreviewable"
+
+  assert_grep "against exact base $base" "$case_dir/prompt.log" \
+    "reviewer was not pointed at the merge base"
+  if grep -q "$moved" "$case_dir/prompt.log"; then
+    fail "reviewer was pointed at the moved base branch tip"
+  fi
+
+  reviewed=$("$CROSSCHECK_PYTHON" -c '
+import json, sys
+ledger = json.load(open(sys.argv[1]))
+run = ledger["runs"][-1]
+print(run["state"], run["base_sha"])
+' "$case_dir/data/task-x1/crosscheck-ledger.json")
+  [ "$reviewed" = "clear $base" ] \
+    || fail "ledger recorded '$reviewed', expected 'clear $base'"
+
+  FM_TEST_REVIEWED_BASE="$base" run_case "$case_dir" "$moved" "$head" clear verify \
+    > "$case_dir/verify.out" 2> "$case_dir/verify.err" \
+    || fail "verify refused an exact-head review after the default branch moved"
+  assert_grep "$head" "$case_dir/verify.out" "verify did not emit the reviewed SHA"
+  pass "a moved default branch never makes an exact-head PR unreviewable"
+}
+
+test_unavailable_reviewer_fails_over_to_the_next_account() {
+  local record case_dir base head states
+  record=$(make_case reviewer-failover)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  # Both entries are independently screened; the first cannot reach its
+  # provider, so the gate must reach the second rather than refuse the merge.
+  cat > "$case_dir/reviewer.json" <<EOF
+{"reviewers":[
+  {"harness":"claude","model":"claude-opus-5","effort":"xhigh","account_home":"$case_dir/reviewer-home"},
+  {"harness":"codex","model":"gpt-5.6-sol","effort":"xhigh","account_home":"$case_dir/reviewer-home"}
+]}
+EOF
+  FM_TEST_CLAUDE_ZERO_TURN=1 run_case "$case_dir" "$base" "$head" clear run \
+    > "$case_dir/out" 2> "$case_dir/err" \
+    || fail "an unreachable leading reviewer refused the whole gate"
+
+  assert_grep 'trying the next independent reviewer' "$case_dir/err" \
+    "failover was silent"
+  states=$("$CROSSCHECK_PYTHON" -c '
+import json, sys
+ledger = json.load(open(sys.argv[1]))
+print(" ".join(run["state"] for run in ledger["runs"]))
+' "$case_dir/data/task-x1/crosscheck-ledger.json")
+  [ "$states" = "tool-failure clear" ] \
+    || fail "ledger recorded runs '$states', expected 'tool-failure clear'"
+
+  # The abandoned attempt must name why it was abandoned, not a truncated
+  # envelope: the reason lives past the point a raw excerpt stops.
+  assert_grep 'Claude AI usage limit reached' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    "the abandoned reviewer did not record its reported reason"
+  assert_grep 'never reached the provider' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    "the abandoned reviewer was not identified as an environment fault"
+  pass "an unreachable reviewer fails over to the next independent account"
+}
+
 test_verify_rechecks_live_head_and_claims() {
   local record case_dir base head next_base rc verified
   record=$(make_case verify-live)
@@ -2893,23 +2977,33 @@ test_verify_rechecks_live_head_and_claims() {
   rc=$?
   set -e
   expect_code 1 "$rc" "changed claims"
-  assert_grep 'no crosscheck attempt exists for the live head, base, and PR claims' "$case_dir/changed.err" \
+  assert_grep 'no crosscheck attempt exists for the live head and PR claims' "$case_dir/changed.err" \
     "changed claims reused a stale verdict"
 
   verified=$(FM_TEST_CLAIMS_VARIANT=dynamic run_case "$case_dir" "$base" "$head" clear verify) \
     || fail "dynamic full-document metadata invalidated stable PR claims"
   [ "$verified" = "$head" ] || fail "dynamic metadata verify did not emit the exact head"
 
+  # The default branch advancing must NOT invalidate an exact-head review.
+  # GitHub reports base.sha as the base branch tip at snapshot time, so it
+  # changes whenever anything else merges. Refusing on that made a valid ledger
+  # unusable minutes after it was written and forced the gate to be bypassed.
   next_base=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+  verified=$(run_case "$case_dir" "$next_base" "$head" clear verify) \
+    || fail "a moved base branch tip invalidated an exact-head review"
+  [ "$verified" = "$head" ] || fail "moved-base verify did not emit the exact reviewed SHA"
+
+  # The head remains the pin: any change to the PR itself invalidates it.
   set +e
-  run_case "$case_dir" "$next_base" "$head" clear verify \
-    > "$case_dir/base.out" 2> "$case_dir/base.err"
+  run_case "$case_dir" "$base" \
+    cccccccccccccccccccccccccccccccccccccccc clear verify \
+    > "$case_dir/head.out" 2> "$case_dir/head.err"
   rc=$?
   set -e
-  expect_code 1 "$rc" "changed base"
-  assert_grep 'no crosscheck attempt exists for the live head, base, and PR claims' "$case_dir/base.err" \
-    "changed base reused a stale verdict"
-  pass "merge verification rechecks the exact live head, base, and stable claims digest"
+  expect_code 1 "$rc" "changed head"
+  assert_grep 'no crosscheck attempt exists for the live head and PR claims' "$case_dir/head.err" \
+    "changed head reused a stale verdict"
+  pass "merge verification pins the exact live head and stable claims while tolerating a moved base branch"
 }
 
 if [ -n "${FM_TEST_CASE:-}" ]; then
@@ -3023,4 +3117,6 @@ test_reviewer_configuration_failures_are_tool_failures
 test_stopped_reviewer_and_wrong_head_are_unreviewed
 test_completed_reviewer_suspicion_is_blocking
 test_reading_only_suspicion_is_a_tool_failure
+test_moved_default_branch_stays_reviewable
+test_unavailable_reviewer_fails_over_to_the_next_account
 test_verify_rechecks_live_head_and_claims

@@ -1393,7 +1393,19 @@ def load_ledger(path: Path, task_id: str, url: str) -> dict[str, Any]:
     )
 
 
-def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
+def reviewer_candidates(home: Path, meta: dict[str, str]) -> list[dict[str, str]]:
+    """Return every independent reviewer for this author, in configured order.
+
+    Selection screens the whole roster instead of stopping at the first match.
+    A single pick made the gate only as available as one account: a reviewer at
+    its usage limit, or one whose provider refused the launch, refused the merge
+    for the whole fleet even though other proven-independent accounts were
+    configured and idle. Every entry returned here has already passed the same
+    model and account separation screen, so failing over between them cannot
+    weaken independence, and `run_reviewer` still re-proves separation against
+    the credential it actually binds.
+    """
+
     config_path = Path(
         environment_value(
             "FM_CROSSCHECK_REVIEWER_CONFIG",
@@ -1477,6 +1489,7 @@ def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
         else None
     )
     author_provider_for_pairs = HARNESS_PROVIDERS.get(meta["harness"])
+    independent: list[dict[str, str]] = []
     for reviewer in validated:
         model_is_separate = reviewer["model"] != meta["model"]
         if author_home is not None:
@@ -1521,7 +1534,9 @@ def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
                 # Carried so the executing credential, not the configured
                 # path, has the final word on account separation.
                 reviewer["author_account_identity"] = author_identity
-            return reviewer
+            independent.append(reviewer)
+    if independent:
+        return independent
     if author_home is not None:
         fail(
             "independence inspection found no configured reviewer with both a "
@@ -1893,6 +1908,82 @@ def pi_reviewer_command() -> list[str]:
     return [str(resolved_entrypoint)]
 
 
+def claude_envelope_report(stdout: str, stderr: str) -> tuple[str, bool]:
+    """Explain a Claude reviewer failure and say whether the model was reached.
+
+    Claude reports its own failures inside the result envelope, and the reason
+    lives in `result` -- past the point where a raw 500-character excerpt of the
+    envelope stops. Truncating the envelope produced the fleet's least
+    actionable banner: a wall of zeroed usage counters with the sentence that
+    explains them cut off. This reads the fields that carry the explanation.
+
+    The boolean reports whether any model work happened. An envelope with no API
+    duration, no token usage, and no per-model usage means the request never
+    reached the provider, which is an account, credential, quota, or launch
+    fault rather than anything learned about the code under review.
+    """
+
+    stderr_tail = stderr.strip()[-500:]
+    try:
+        envelope = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError):
+        excerpt = stdout.strip()[:500] or "no stdout"
+        detail = f"reviewer emitted no decodable result envelope: {excerpt}"
+        if stderr_tail:
+            detail += f"; stderr: {stderr_tail}"
+        return detail, False
+    if not isinstance(envelope, dict):
+        return "reviewer result envelope was not an object", False
+
+    usage = envelope.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    token_fields = (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    )
+    tokens = sum(
+        value
+        for field in token_fields
+        if isinstance(value := usage.get(field), int)
+        and not isinstance(value, bool)
+    )
+    api_ms = envelope.get("duration_api_ms")
+    api_ms = api_ms if isinstance(api_ms, (int, float)) else 0
+    model_usage = envelope.get("modelUsage")
+    reached_model = bool(api_ms) or tokens > 0 or bool(model_usage)
+
+    parts = []
+    for field in (
+        "subtype",
+        "terminal_reason",
+        "stop_reason",
+        "num_turns",
+        "api_error_status",
+    ):
+        if envelope.get(field) not in (None, ""):
+            parts.append(f"{field}={envelope[field]!r}")
+    denials = envelope.get("permission_denials")
+    if isinstance(denials, list) and denials:
+        parts.append(f"permission_denials={json.dumps(denials)[:300]}")
+    reason = envelope.get("result")
+    if isinstance(reason, str) and reason.strip():
+        parts.append(f"reported reason: {reason.strip()[:600]}")
+    elif isinstance(envelope.get("error"), str) and envelope["error"].strip():
+        parts.append(f"reported error: {envelope['error'].strip()[:600]}")
+    else:
+        parts.append("the envelope carried no reason text")
+    if not reached_model:
+        parts.append(
+            "no model work occurred (no API duration, tokens, or model usage), "
+            "so the reviewer account never reached the provider"
+        )
+    if stderr_tail:
+        parts.append(f"stderr: {stderr_tail}")
+    return "; ".join(parts), reached_model
+
+
 def pi_review_result(output: str) -> tuple[dict[str, Any], int]:
     turn_count = 0
     agent_ended = False
@@ -2089,12 +2180,29 @@ def run_reviewer(
             description="Codex reviewer",
             maximum_output_bytes=reviewer_max_capture(),
         )
-        detail = (result.stderr or result.stdout).strip()
-        require(
-            result.returncode == 0,
-            f"reviewer exited {result.returncode} without an earned verdict: "
-            f"{detail[:500] or 'no diagnostic'}",
-        )
+        if result.returncode != 0:
+            stderr_tail = result.stderr.strip()[-700:]
+            stdout_tail = result.stdout.strip()[-500:]
+            detail = "; ".join(
+                part
+                for part in (
+                    f"stderr: {stderr_tail}" if stderr_tail else "",
+                    f"stdout: {stdout_tail}" if stdout_tail else "",
+                )
+            ) or "no diagnostic"
+            message = (
+                f"Codex reviewer at {config['account_home']} exited "
+                f"{result.returncode} without an earned verdict: {detail}"
+            )
+            # Codex always writes its result artifact when a review completes,
+            # so a nonzero exit with no artifact means the account never
+            # produced one -- a launch, credential, or quota fault. Classifying
+            # that as a tool failure keeps the ledger honest and lets the run
+            # fail over to another independent account instead of refusing the
+            # merge on behalf of an account that never spoke.
+            if output_path.exists() and output_path.stat().st_size:
+                fail(message)
+            tool_fail(message)
         return read_json(
             output_path,
             "reviewer verdict artifact",
@@ -2200,21 +2308,46 @@ def run_reviewer(
         description="Claude reviewer",
         maximum_output_bytes=reviewer_max_capture(),
     )
-    detail = (result.stderr or result.stdout).strip()
-    require(
-        result.returncode == 0 and bool(result.stdout.strip()),
-        f"reviewer exited {result.returncode} without a verdict artifact: "
-        f"{detail[:500] or 'no diagnostic'}",
-    )
+    if result.returncode != 0 or not result.stdout.strip():
+        detail, reached_model = claude_envelope_report(result.stdout, result.stderr)
+        message = (
+            f"Claude reviewer at {config['account_home']} exited "
+            f"{result.returncode} without a verdict artifact: {detail}"
+        )
+        # A reviewer that never reached the provider taught the gate nothing
+        # about the code. Recording that as `unreviewed` also manufactures a
+        # suspicion, which reads in the ledger like the reviewer raised a
+        # concern; it is a tool failure so the banner is honest and the run can
+        # fail over to another independent account.
+        if reached_model:
+            fail(message)
+        tool_fail(message)
     try:
         envelope = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         fail(f"reviewer returned a malformed result envelope: {exc.msg}")
     require(isinstance(envelope, dict), "reviewer result envelope must be an object")
-    require(envelope.get("is_error") is False, "reviewer result envelope reports an error")
-    require(envelope.get("subtype") == "success", "reviewer result did not complete successfully")
-    require(envelope.get("terminal_reason") == "completed", "reviewer stopped before completion")
-    require(isinstance(envelope.get("structured_output"), dict), "reviewer stopped without structured output")
+    if envelope.get("is_error") is not False:
+        detail, reached_model = claude_envelope_report(result.stdout, result.stderr)
+        message = (
+            f"Claude reviewer at {config['account_home']} reported an error "
+            f"envelope: {detail}"
+        )
+        if reached_model:
+            fail(message)
+        tool_fail(message)
+    for field, expected, label in (
+        ("subtype", "success", "reviewer result did not complete successfully"),
+        ("terminal_reason", "completed", "reviewer stopped before completion"),
+    ):
+        if envelope.get(field) != expected:
+            detail, _ = claude_envelope_report(result.stdout, result.stderr)
+            fail(f"{label}: {detail}")
+    require(
+        isinstance(envelope.get("structured_output"), dict),
+        "reviewer stopped without structured output: "
+        f"{claude_envelope_report(result.stdout, result.stderr)[0]}",
+    )
     return envelope["structured_output"]
 
 
@@ -2618,7 +2751,6 @@ def prepare_review_checkout(
     destination: Path, snapshot_value: dict[str, Any]
 ) -> str:
     head_sha = snapshot_value["head_sha"]
-    base_sha = snapshot_value["base_sha"]
     pull_ref = f"refs/pull/{snapshot_value['number']}/head"
     base_ref = f"refs/heads/{snapshot_value['base_ref']}"
     fetched_ref = "refs/remotes/crosscheck/pr-head"
@@ -2665,9 +2797,6 @@ def prepare_review_checkout(
         f"remote={remote!r} ref={pull_ref!r}, which resolved to {fetched_head}, "
         f"but the live GitHub snapshot names {head_sha}",
     )
-    # Fetch the base ref so the snapshot's exact base commit is available.
-    # The mutable branch tip may advance between the API snapshot and this fetch.
-    git(destination, "cat-file", "-e", f"{base_sha}^{{commit}}")
     git(destination, "checkout", "--quiet", "--detach", head_sha)
     require(
         git(destination, "rev-parse", "HEAD") == head_sha,
@@ -2677,7 +2806,29 @@ def prepare_review_checkout(
         not git(destination, "status", "--porcelain", "--untracked-files=all"),
         "fresh exact-head review checkout is dirty",
     )
-    return git(destination, "merge-base", base_sha, head_sha)
+    # The reviewed base is the merge base of the PR head and the live base
+    # branch, never the API's base.sha. GitHub reports base.sha as the base
+    # branch tip observed at snapshot time, so on a busy default branch it is
+    # usually NOT an ancestor of the head and it changes under the gate between
+    # `run` and `verify`. Requiring it to be the merge base made every
+    # un-rebased PR unreviewable and made an otherwise valid ledger stop
+    # matching the moment the default branch moved.
+    #
+    # The merge base is the convergent quantity: it is what the PR's diff is
+    # actually taken against, and the default branch advancing cannot change it
+    # unless the branch absorbs commits that are already ancestors of this head
+    # -- in which case the remaining diff is a subset of what was reviewed, so
+    # the review stays sound. A rebase or any new commit changes head_sha, which
+    # invalidates the ledger match on its own.
+    base_tip = git(destination, "rev-parse", f"{fetched_base_ref}^{{commit}}")
+    merge_base = git(destination, "merge-base", base_tip, head_sha)
+    require(
+        SHA_RE.fullmatch(merge_base) is not None,
+        "PR base resolution failed: "
+        f"merge-base of base branch {snapshot_value['base_ref']!r} at {base_tip} "
+        f"and head {head_sha} did not resolve to a commit",
+    )
+    return merge_base
 
 
 def assert_review_checkout_intact(review_dir: Path, head_sha: str) -> None:
@@ -2724,39 +2875,95 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
 
     try:
         try:
-            config = reviewer_config(home, meta)
+            candidates = reviewer_candidates(home, meta)
         except CrosscheckError as exc:
             tool_fail(f"reviewer preflight failed: {exc}")
-        # Detached before anything can fail: the author's account id is proof
-        # material for the launch check, not part of the reviewer identity the
-        # ledger records for a failed run.
-        author_account_identity = config.pop("author_account_identity", "")
         with tempfile.TemporaryDirectory(prefix=f".{task_id}.crosscheck.", dir=state) as temporary:
             temp_root = Path(temporary)
-            review_dir = temp_root / "review"
-            try:
-                merge_base = prepare_review_checkout(review_dir, snapshot_value)
-                require(
-                    merge_base == snapshot_value["base_sha"],
-                    "PR base resolution failed: the live base is not the "
-                    "review checkout's merge base",
+            # A reviewer whose account cannot produce a verdict is an
+            # environment fault, not a verdict about the code, so the gate
+            # advances to the next independently-screened reviewer instead of
+            # refusing the merge. Only a completed reviewer's own conclusion
+            # (blocking, or an invalid verdict artifact) ends the run. Each
+            # abandoned reviewer is recorded, so the audit trail names every
+            # account that was tried and why it was left.
+            #
+            # Every attempt gets its own pristine exact-head checkout rather
+            # than a cleaned-up reused one: a later reviewer must never inherit
+            # an earlier reviewer's helpers, receipts, or scratch state, and a
+            # fresh checkout proves that without a destructive reset step.
+            run = None
+            reviewed_base = ""
+            for position, candidate in enumerate(candidates):
+                config = candidate
+                # Detached before anything can fail: the author's account id is
+                # proof material for the launch check, not part of the reviewer
+                # identity the ledger records for a failed run.
+                author_account_identity = config.pop("author_account_identity", "")
+                remaining = len(candidates) - position - 1
+                review_dir = temp_root / f"review-{position}"
+                try:
+                    snapshot_value["base_branch_sha"] = snapshot_value.get(
+                        "base_branch_sha", snapshot_value["base_sha"]
+                    )
+                    # The reviewed base becomes the merge base for every
+                    # downstream consumer -- prompt, execution proof, ledger,
+                    # and verify -- so one stable value is used end to end.
+                    resolved_base = prepare_review_checkout(
+                        review_dir, snapshot_value
+                    )
+                    if reviewed_base:
+                        require(
+                            resolved_base == reviewed_base,
+                            "PR base resolution failed: the reviewed merge base "
+                            f"moved from {reviewed_base} to {resolved_base} "
+                            "between reviewer attempts",
+                        )
+                    reviewed_base = resolved_base
+                    snapshot_value["base_sha"] = reviewed_base
+                except CrosscheckError as exc:
+                    tool_fail(f"review checkout preflight failed: {exc}")
+                try:
+                    raw_review = run_reviewer(
+                        review_dir,
+                        snapshot_value,
+                        ledger,
+                        config,
+                        author_account_identity,
+                    )
+                except CrosscheckToolError as exc:
+                    if not remaining:
+                        raise
+                    run = append_failed_run(
+                        ledger,
+                        snapshot_value,
+                        f"{exc} (reviewer {position + 1} of {len(candidates)}; "
+                        f"{remaining} independent reviewer(s) remaining)",
+                        config,
+                        "tool-failure",
+                    )
+                    write_ledger(ledger_path, ledger)
+                    atomic_write(report_path, render_report(ledger, run), mode=0o644)
+                    print(
+                        f"crosscheck: reviewer {config['harness']} at "
+                        f"{config['account_home']} could not return a verdict "
+                        f"({exc}); trying the next independent reviewer",
+                        file=sys.stderr,
+                    )
+                    continue
+                assert_review_checkout_intact(review_dir, snapshot_value["head_sha"])
+                review = validate_review_shape(
+                    raw_review,
+                    snapshot_value,
+                    review_dir,
+                    config,
                 )
-            except CrosscheckError as exc:
-                tool_fail(f"review checkout preflight failed: {exc}")
-            raw_review = run_reviewer(
-                review_dir, snapshot_value, ledger, config, author_account_identity
-            )
-            assert_review_checkout_intact(review_dir, snapshot_value["head_sha"])
-            review = validate_review_shape(
-                raw_review,
-                snapshot_value,
-                review_dir,
-                config,
-            )
-            ledger, run = apply_review(
-                ledger, review, review_dir, temp_root, snapshot_value, config
-            )
-            assert_review_checkout_intact(review_dir, snapshot_value["head_sha"])
+                ledger, run = apply_review(
+                    ledger, review, review_dir, temp_root, snapshot_value, config
+                )
+                assert_review_checkout_intact(review_dir, snapshot_value["head_sha"])
+                break
+            require(run is not None, "no configured reviewer was attempted")
     except CrosscheckToolError as exc:
         run = append_failed_run(
             ledger, snapshot_value, str(exc), config, "tool-failure"
@@ -2800,16 +3007,23 @@ def verified_crosscheck_head(root: Path, home: Path, task_id: str, url: str) -> 
         blocking_fail(
             "durable finding ledger still has active blockers: " + ", ".join(active)
         )
+    # Matched on head and claims, never on GitHub's live base.sha. base.sha is
+    # the base branch tip observed at snapshot time, so it changes every time
+    # the default branch moves and a run recorded minutes earlier stopped
+    # matching for a reason that has nothing to do with this PR. The reviewed
+    # base is the merge base the run itself recorded, and it cannot change
+    # without changing head_sha except by absorbing commits already in this
+    # head -- so the head pin carries the guarantee, and the recorded base is
+    # what the execution proof below is checked against.
     matching = [
         run
         for run in ledger["runs"]
         if run["head_sha"] == snapshot_value["head_sha"]
-        and run["base_sha"] == snapshot_value["base_sha"]
         and run["claims_sha256"] == snapshot_value["claims_sha256"]
     ]
     require(
         matching,
-        "no crosscheck attempt exists for the live head, base, and PR claims",
+        "no crosscheck attempt exists for the live head and PR claims",
     )
     latest = matching[-1]
     if latest["state"] == "tool-failure":
@@ -2843,7 +3057,7 @@ def verified_crosscheck_head(root: Path, home: Path, task_id: str, url: str) -> 
         isinstance(execution_proof, dict)
         and execution_proof.get("expected_exit") == 0
         and execution_proof.get("actual_exit") == 0
-        and snapshot_value["base_sha"] in str(execution_proof.get("command", ""))
+        and latest["base_sha"] in str(execution_proof.get("command", ""))
         and snapshot_value["head_sha"] in str(execution_proof.get("command", ""))
         and isinstance(execution_proof.get("reviewer_receipt"), dict)
         and bool(execution_proof["reviewer_receipt"].get("sha256")),

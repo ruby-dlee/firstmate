@@ -551,6 +551,87 @@ test_path_prepend_is_published_only_when_ready() {
   pass "the pinned runtime is published only by a verdict that proved it"
 }
 
+# jq's `length` answers for values that cannot be iterated: a string "abc" is 3,
+# the number 7 is 7. Trusting that length let a manifest declare components the
+# run then iterated into nothing, and the run still called itself ready.
+test_a_non_array_components_field_fails_closed() {
+  local rec out status malformed
+  rec=$(make_case components-not-an-array)
+  read_case "$rec"
+  for malformed in '"abc"' '7'; do
+    printf '{"kinds":["ship"],"components":%s}\n' "$malformed" > "$CASE_DIR/m.json"
+    out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m.json")
+    status=$?
+    expect_code 3 "$status" "a non-array components ($malformed) must fail, not report ready: $out"
+    [ "$(verdict_field "$out" .status)" = failed ] \
+      || fail "a non-array components ($malformed) must not be ready, got: $out"
+    assert_contains "$(verdict_field "$out" .reason)" "components must be an array" \
+      "the failure should name the malformed field: $out"
+  done
+  printf '{"kinds":["ship"],"on_failure":"block","components":"abc"}\n' > "$CASE_DIR/m.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m.json")
+  expect_code 4 "$?" "a block project must abort on a non-array components: $out"
+  pass "a components field that is not an array fails closed instead of reporting ready"
+}
+
+# The same class one level down: any manifest list that is not an array used to
+# iterate into nothing, so a component could report "installed" having run no
+# install steps at all.
+test_a_non_array_step_list_fails_closed() {
+  local rec out
+  rec=$(make_case steps-not-an-array)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  jq '.components[0].install = "make"' "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 3 "$?" "a non-array install list must fail rather than install nothing: $out"
+  assert_contains "$(verdict_field "$out" .reason)" "install must be an array" \
+    "the failure should name the malformed list: $out"
+  [ "$(build_count "$WT_DIR")" = 0 ] || fail "nothing should have been built"
+  pass "a step list that is not an array fails closed instead of provisioning nothing"
+}
+
+# Every step is driven from a list this script is reading, so a step that reads
+# stdin must not be able to consume the rest of that list. Each step here counts
+# itself, and the count is what proves the whole list ran.
+test_a_step_cannot_consume_the_list_that_drives_it() {
+  local rec out installs probes
+  rec=$(make_case stdin-draining-step)
+  read_case "$rec"
+  cat > "$CASE_DIR/m.json" <<JSON
+{
+  "kinds": ["ship"],
+  "components": [
+    {
+      "name": "component",
+      "dir": "component",
+      "runtime_checks": [
+        { "name": "drains stdin", "argv": ["sh", "-c", "cat > /dev/null"] },
+        { "name": "still runs", "argv": ["sh", "-c", "echo ok"], "expect": "ok" }
+      ],
+      "install": [
+        { "name": "drains stdin", "argv": ["sh", "-c", "cat > /dev/null; echo i >> ../install-count"] },
+        { "name": "builds", "argv": ["sh", "-c", "mkdir -p built && echo built > built/log && echo i >> ../install-count"] }
+      ],
+      "probes": [
+        { "name": "drains stdin", "argv": ["sh", "-c", "cat > /dev/null; echo p >> ../probe-count"] },
+        { "name": "artifact present", "argv": ["sh", "-c", "test -s built/log && echo p >> ../probe-count"] }
+      ]
+    }
+  ]
+}
+JSON
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m.json")
+  expect_code 0 "$?" "a step that reads stdin should not disturb the run: $out"
+  installs=$(awk 'END { print NR }' "$WT_DIR/install-count" 2>/dev/null || printf '0\n')
+  probes=$(awk 'END { print NR }' "$WT_DIR/probe-count" 2>/dev/null || printf '0\n')
+  [ "$installs" = 2 ] || fail "both install steps must run, got $installs"
+  [ "$probes" = 2 ] || fail "both probes must run, got $probes"
+  assert_present "$WT_DIR/component/built/log" \
+    "a ready verdict must not be reachable with the build step skipped"
+  pass "a step that reads stdin cannot skip the remaining steps of its own list"
+}
+
 test_task_record_and_log_are_written() {
   local rec state out
   rec=$(make_case task-record)
@@ -583,6 +664,10 @@ test_manifest_path_resolution() {
 make_spawn_fakebin() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
+  # A real harness binary on firstmate's own PATH. Nothing executes it; a spawn
+  # that publishes a runtime pin resolves the harness to an absolute path before
+  # that pin exists, and refuses to launch a harness it cannot resolve.
+  fm_fake_exit0 "$fakebin" claude
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -808,6 +893,19 @@ exported_path() {
   awk -F '\t' '$2 ~ /^export PATH=/ { print $2 }' "$1" | head -n 1
 }
 
+sent_launch_line() {
+  awk -F '\t' '$2 ~ /--dangerously-skip-permissions/ { print $2 }' "$1" | head -n 1
+}
+
+# A provisioner that is present but has lost its exec bit. Firstmate still has to
+# be able to tell that this project opted in, and under block it must refuse.
+make_unrunnable_provisioner_bin() {
+  local bin
+  bin=$(make_stub_provisioner_bin "$1" unrunnable "exit 0")
+  chmod -x "$bin/fm-provision.sh"
+  printf '%s\n' "$bin"
+}
+
 test_spawn_pins_the_proven_runtime_into_the_crew_path() {
   local rec id out path_line brief_mode
   id=provision-ready-p1
@@ -829,6 +927,53 @@ test_spawn_pins_the_proven_runtime_into_the_crew_path() {
   [ "$brief_mode" = 644 ] \
     || fail "the readiness note must not narrow the brief's mode, got $brief_mode"
   pass "a ready provisioning run pins its proven runtime ahead of the crewmate PATH"
+}
+
+# The pinned runtime leads the crewmate's PATH, and a pinned node prefix is
+# exactly where a globally installed `claude` lives. The harness must therefore
+# be launched by the path firstmate resolved for itself, not by a bare name the
+# manifest's own directory could answer.
+test_spawn_launches_the_harness_by_the_path_firstmate_resolved() {
+  local rec id out launch
+  id=provision-harness-pin-pd
+  rec=$(make_spawn_case harness-pin "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+  # A decoy the pinned directory would answer with, since it leads the exported
+  # PATH the pane shell resolves against.
+  printf '#!/bin/sh\nexit 0\n' > "$CASE_DIR/pinned-bin/claude"
+  chmod +x "$CASE_DIR/pinned-bin/claude"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
+  expect_code 0 "$?" "a ready provisioning run should still launch: $out"
+  launch=$(sent_launch_line "$SEND_LOG")
+  assert_contains "$launch" "$FAKEBIN_DIR/claude" \
+    "the harness must be launched by the absolute path firstmate resolved: $launch"
+  case "$launch" in
+    *"$CASE_DIR/pinned-bin/claude"*)
+      fail "the manifest's pinned directory must not name the harness binary: $launch" ;;
+  esac
+  pass "a published runtime pin cannot repoint the harness the spawn launches"
+}
+
+test_spawn_fails_closed_when_the_provisioner_cannot_be_run() {
+  local rec id out bin
+  id=provision-unrunnable-block-pe
+  rec=$(make_spawn_case unrunnable-block "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR" '.on_failure = "block"'
+  bin=$(make_unrunnable_provisioner_bin "$CASE_DIR")
+
+  out=$(SPAWN_CMD="$bin/fm-spawn.sh" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
+  expect_code 1 "$?" "a provisioner that cannot run must not launch under block: $out"
+  assert_contains "$out" "WORKTREE PROVISIONING FAILED" "the refusal should be unmissable"
+  assert_contains "$out" "not executable" "the banner should name the unrunnable provisioner"
+  assert_absent "$HOME_DIR/state/$id.meta" \
+    "a block project must not launch a crewmate into an unprovisioned worktree"
+  assert_grep 'not executable' "$HOME_DIR/state/$id.provision" \
+    "the refusal must leave a durable verdict like any other provisioning failure"
+  pass "a provisioner that lost its exec bit is a provisioning failure, not a silent skip"
 }
 
 test_spawn_treats_provisioning_residue_as_a_failure() {
@@ -1069,9 +1214,14 @@ test_symlinked_paths_are_refused_before_access
 test_env_may_not_hijack_path
 test_unreadable_policy_fails_closed
 test_path_prepend_is_published_only_when_ready
+test_a_non_array_components_field_fails_closed
+test_a_non_array_step_list_fails_closed
+test_a_step_cannot_consume_the_list_that_drives_it
 test_task_record_and_log_are_written
 test_manifest_path_resolution
 test_spawn_pins_the_proven_runtime_into_the_crew_path
+test_spawn_launches_the_harness_by_the_path_firstmate_resolved
+test_spawn_fails_closed_when_the_provisioner_cannot_be_run
 test_spawn_continues_loudly_when_provisioning_warns
 test_spawn_aborts_when_the_project_declares_block
 test_spawn_no_provision_opt_out

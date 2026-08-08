@@ -34,6 +34,15 @@
 #   - A merely existing environment directory is never assumed healthy. Reuse
 #     requires BOTH a matching fingerprint AND passing probes; probes run on
 #     every invocation, including a fingerprint hit.
+#   - Every list the manifest declares is read whole, and proved whole, before
+#     any of it runs: the record count is reconciled against the length jq
+#     reports for that same list, and a list that is not an array is refused
+#     rather than iterated into nothing. A malformed field can therefore make a
+#     run FAIL, but it can never make it quietly do less than it claims.
+#   - No manifest step is ever run while the list it came from is still being
+#     read, and every step runs with stdin on /dev/null, so a step that reads
+#     stdin cannot consume the records that drive the run. A step that genuinely
+#     needs input redirects it itself, e.g. ["sh","-c","cmd < file"].
 #   - A fingerprint whose inputs cannot be read, or whose version commands fail
 #     or print nothing, is unavailable rather than empty, and an unavailable
 #     fingerprint forces a rebuild. No verdict is ever derived from an empty
@@ -103,7 +112,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fm_refuse_if_gate_agent
 
 usage() {
-  sed -n '2,95p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,104p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -286,6 +295,40 @@ mq() {
   printf '%s' "$MANIFEST_JSON" | jq -r "$1" 2>/dev/null
 }
 
+# manifest_records <json> <list-expression>: fill MANIFEST_RECORDS with one
+# record per element of the declared list, and prove the list was read whole.
+#
+# This is the single boundary every manifest list crosses, and it is where two
+# silent failures are turned into loud ones. jq's `length` is defined for values
+# that cannot be iterated (a string "abc" has length 3, the number 7 has length
+# 7), so trusting a length alone let a non-array `components` report work it
+# never did: iteration failed, the loop body never ran, and the run still
+# emitted ready. And a stream that stops early - a jq error partway through, a
+# truncated pipe - used to end the loop indistinguishably from a complete read.
+# A list that is absent is an empty list; a list that is present and is not an
+# array, or that yields fewer records than it declared, fails.
+#
+# Reading the whole list up front is also what keeps a step from consuming the
+# records that drive it: nothing is executed while this pipe is open. Callers
+# copy MANIFEST_RECORDS into their own array before acting on it, because a
+# nested read replaces it.
+MANIFEST_RECORDS=()
+manifest_records() {
+  local json=$1 expr=$2 declared record
+  MANIFEST_RECORDS=()
+  declared=$(printf '%s' "$json" \
+    | jq -r "$expr"' as $list
+        | if $list == null then 0
+          elif ($list | type) == "array" then ($list | length)
+          else -1 end' 2>/dev/null)
+  case "$declared" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$declared" -gt 0 ] || return 0
+  while IFS= read -r -d '' record; do
+    MANIFEST_RECORDS[${#MANIFEST_RECORDS[@]}]=$record
+  done < <(printf '%s' "$json" | jq -j "$expr"'[] | tostring + "\u0000"' 2>/dev/null)
+  [ "${#MANIFEST_RECORDS[@]}" -eq "$declared" ]
+}
+
 policy_raw=$(mq '.on_failure // "warn"')
 case "$policy_raw" in
   warn|block) POLICY=$policy_raw ;;
@@ -311,8 +354,11 @@ fi
 activate_artifacts
 init_work_area || emit failed "temporary provisioning workspace could not be created"
 
-COMPONENT_COUNT=$(mq '.components | length')
-case "$COMPONENT_COUNT" in ''|*[!0-9]*) emit failed "manifest has no readable components array" ;; esac
+COMPONENT_LIST=()
+manifest_records "$MANIFEST_JSON" '.components' \
+  || emit failed "manifest components must be an array of component objects"
+[ "${#MANIFEST_RECORDS[@]}" -eq 0 ] || COMPONENT_LIST=("${MANIFEST_RECORDS[@]}")
+COMPONENT_COUNT=${#COMPONENT_LIST[@]}
 [ "$COMPONENT_COUNT" -gt 0 ] || emit failed "manifest declares no components"
 
 STARTED=$(date +%s)
@@ -404,12 +450,19 @@ strict_descendant_path() {
 # exists to prevent was an unbounded hang, so the bound is implemented here.
 # set -m gives the child its own process group, which stays supervised as one
 # unit rather than orphaning grandchildren when its leader exits.
+#
+# Every bounded child reads from /dev/null. Whether an asynchronous command
+# inherits the caller's stdin is a bash-version and job-control detail, and what
+# it would inherit here is whatever fd the caller happens to be reading, so a
+# step that reads stdin could otherwise consume its own caller's records. This
+# makes that impossible rather than incidental; a step that wants input opens it
+# itself.
 run_bounded() {
   local seconds=$1
   shift
   local pid status=0 ticks=0 limit grace=0
   set -m
-  "$@" &
+  "$@" </dev/null &
   pid=$!
   set +m
   limit=$((seconds * 10))
@@ -449,13 +502,16 @@ STEP_OUT=
 STEP_FAILURE=
 COMPONENT_ENV=()
 
-# step_argv <step-json>: fill STEP_ARGV with the step's token-expanded argv.
+# step_argv <step-json>: fill STEP_ARGV with the step's token-expanded argv. A
+# partially read argv would run a DIFFERENT command from the one declared, so an
+# argv that cannot be read whole is treated as no argv at all.
 step_argv() {
-  local step=$1 arg
+  local step=$1 i
   STEP_ARGV=()
-  while IFS= read -r -d '' arg; do
-    STEP_ARGV[${#STEP_ARGV[@]}]=$(expand_tokens "$arg")
-  done < <(printf '%s' "$step" | jq -j '.argv[]? | tostring + "\u0000"' 2>/dev/null)
+  manifest_records "$step" '.argv' || return 1
+  for ((i = 0; i < ${#MANIFEST_RECORDS[@]}; i++)); do
+    STEP_ARGV[${#STEP_ARGV[@]}]=$(expand_tokens "${MANIFEST_RECORDS[$i]}")
+  done
   [ "${#STEP_ARGV[@]}" -gt 0 ]
 }
 
@@ -533,8 +589,14 @@ ALL_PATH_PREPEND=
 # manifest env map, so the resolved runtime cannot be smuggled past the runtime
 # checks.
 component_env() {
-  local comp=$1 key value prefix path_extra=''
+  local comp=$1 key value prefix path_extra='' declared i
+  local -a prefixes=()
   COMPONENT_ENV=()
+  declared=$(printf '%s' "$comp" \
+    | jq -r '(.env // {}) | if type == "object" then length else -1 end' 2>/dev/null)
+  case "$declared" in
+    ''|*[!0-9]*) FAILURE_REASON="env must be an object of NAME/value pairs"; return 1 ;;
+  esac
   while IFS= read -r -d '' key; do
     IFS= read -r -d '' value || break
     case "$key" in
@@ -543,17 +605,26 @@ component_env() {
     esac
     COMPONENT_ENV[${#COMPONENT_ENV[@]}]="$key=$(expand_tokens "$value")"
   done < <(printf '%s' "$comp" | jq -j '(.env // {}) | to_entries[] | (.key + "\u0000" + (.value|tostring) + "\u0000")' 2>/dev/null)
+  if [ "${#COMPONENT_ENV[@]}" -ne "$declared" ]; then
+    FAILURE_REASON="env declares $declared entries but only ${#COMPONENT_ENV[@]} could be read"
+    return 1
+  fi
   for prefix in $ALL_PATH_PREPEND; do
     path_extra="${path_extra:+$path_extra:}$prefix"
   done
-  while IFS= read -r -d '' prefix; do
-    prefix=$(expand_tokens "$prefix")
+  if ! manifest_records "$comp" '.path_prepend'; then
+    FAILURE_REASON="path_prepend must be an array of directories"
+    return 1
+  fi
+  [ "${#MANIFEST_RECORDS[@]}" -eq 0 ] || prefixes=("${MANIFEST_RECORDS[@]}")
+  for ((i = 0; i < ${#prefixes[@]}; i++)); do
+    prefix=$(expand_tokens "${prefixes[$i]}")
     if [ ! -d "$prefix" ]; then
       FAILURE_REASON="path_prepend directory does not exist: $prefix"
       return 1
     fi
     path_extra="${path_extra:+$path_extra:}$prefix"
-  done < <(printf '%s' "$comp" | jq -j '.path_prepend[]? | tostring + "\u0000"' 2>/dev/null)
+  done
   COMPONENT_ENV[${#COMPONENT_ENV[@]}]="PATH=${path_extra:+$path_extra:}$PATH"
   return 0
 }
@@ -566,10 +637,22 @@ component_env() {
 FINGERPRINT=
 FINGERPRINT_INPUTS=
 component_fingerprint() {
-  local comp=$1 dir=$2 rel abs sum inputs='' step out
+  local comp=$1 dir=$2 rel abs sum inputs='' step out i
+  local -a files=() versions=()
   FINGERPRINT=
   FINGERPRINT_INPUTS=
-  while IFS= read -r -d '' rel; do
+  if ! manifest_records "$comp" '.fingerprint.files'; then
+    log_line "fingerprint: files must be an array of input paths"
+    return 0
+  fi
+  [ "${#MANIFEST_RECORDS[@]}" -eq 0 ] || files=("${MANIFEST_RECORDS[@]}")
+  if ! manifest_records "$comp" '.fingerprint.versions'; then
+    log_line "fingerprint: versions must be an array of steps"
+    return 0
+  fi
+  [ "${#MANIFEST_RECORDS[@]}" -eq 0 ] || versions=("${MANIFEST_RECORDS[@]}")
+  for ((i = 0; i < ${#files[@]}; i++)); do
+    rel=${files[$i]}
     if ! abs=$(strict_descendant_path "$dir" "$(expand_tokens "$rel")"); then
       log_line "fingerprint: refusing an input that is not a strict descendant of the component: $rel"
       return 0
@@ -585,8 +668,9 @@ component_fingerprint() {
     fi
     inputs="$inputs
 file:$rel=$sum"
-  done < <(printf '%s' "$comp" | jq -j '.fingerprint.files[]? | tostring + "\u0000"' 2>/dev/null)
-  while IFS= read -r -d '' step; do
+  done
+  for ((i = 0; i < ${#versions[@]}; i++)); do
+    step=${versions[$i]}
     if ! run_step "fingerprint version" "$dir" "$step"; then
       log_line "fingerprint: ${STEP_FAILURE:-version command failed}"
       return 0
@@ -599,7 +683,7 @@ file:$rel=$sum"
     step_argv "$step" || return 0
     inputs="$inputs
 version:${STEP_ARGV[*]}=$out"
-  done < <(printf '%s' "$comp" | jq -j '.fingerprint.versions[]? | tostring + "\u0000"' 2>/dev/null)
+  done
   if [ -z "$inputs" ]; then
     log_line "fingerprint: no inputs declared"
     return 0
@@ -611,18 +695,71 @@ version:${STEP_ARGV[*]}=$out"
   return 0
 }
 
+# fingerprint_changed_inputs <before> <after>: name the declared inputs whose
+# value differs between two readings of FINGERPRINT_INPUTS. Each line is
+# "<kind>:<label>=<value>", so the answer already says whether a `files` entry
+# or a `versions` command is the one that moved, which is the difference between
+# fixing an installer that rewrites its own lockfile and fixing a version
+# command that resolves the environment it is meant to describe.
+fingerprint_changed_inputs() {
+  local before=$1 after=$2 line key value other changed=''
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    key=${line%%=*}
+    value=${line#*=}
+    if other=$(fingerprint_input_value "$after" "$key"); then
+      [ "$other" != "$value" ] || continue
+    fi
+    changed="${changed:+$changed, }$key"
+  done <<EOF
+$before
+EOF
+  printf '%s' "$changed"
+}
+
+fingerprint_input_value() {
+  local inputs=$1 key=$2 line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    [ "${line%%=*}" = "$key" ] || continue
+    printf '%s' "${line#*=}"
+    return 0
+  done <<EOF
+$inputs
+EOF
+  return 1
+}
+
 run_probes() {
-  local comp=$1 dir=$2 step
-  while IFS= read -r -d '' step; do
-    run_step probe "$dir" "$step" || return 1
-  done < <(printf '%s' "$comp" | jq -j '.probes[]? | tostring + "\u0000"' 2>/dev/null)
+  local comp=$1 dir=$2 i
+  local -a steps=()
+  if ! manifest_records "$comp" '.probes'; then
+    STEP_FAILURE="probes must be an array of steps"
+    return 1
+  fi
+  [ "${#MANIFEST_RECORDS[@]}" -eq 0 ] || steps=("${MANIFEST_RECORDS[@]}")
+  for ((i = 0; i < ${#steps[@]}; i++)); do
+    run_step probe "$dir" "${steps[$i]}" || return 1
+  done
   return 0
 }
 
 run_install() {
-  local comp=$1 dir=$2 rel abs step budget status out_file detail
+  local comp=$1 dir=$2 rel abs budget status out_file detail i
+  local -a resets=() steps=()
   out_file="$WORK_DIR/reset.out"
-  while IFS= read -r -d '' rel; do
+  if ! manifest_records "$comp" '.reset'; then
+    STEP_FAILURE="reset must be an array of paths"
+    return 1
+  fi
+  [ "${#MANIFEST_RECORDS[@]}" -eq 0 ] || resets=("${MANIFEST_RECORDS[@]}")
+  if ! manifest_records "$comp" '.install'; then
+    STEP_FAILURE="install must be an array of steps"
+    return 1
+  fi
+  [ "${#MANIFEST_RECORDS[@]}" -eq 0 ] || steps=("${MANIFEST_RECORDS[@]}")
+  for ((i = 0; i < ${#resets[@]}; i++)); do
+    rel=${resets[$i]}
     if ! abs=$(strict_descendant_path "$dir" "$(expand_tokens "$rel")"); then
       STEP_FAILURE="reset path must be a strict descendant of the component directory: '$rel'"
       return 1
@@ -650,10 +787,10 @@ run_install() {
       [ -z "$detail" ] || STEP_FAILURE="$STEP_FAILURE: $detail"
       return 1
     fi
-  done < <(printf '%s' "$comp" | jq -j '.reset[]? | tostring + "\u0000"' 2>/dev/null)
-  while IFS= read -r -d '' step; do
-    run_step install "$dir" "$step" || return 1
-  done < <(printf '%s' "$comp" | jq -j '.install[]? | tostring + "\u0000"' 2>/dev/null)
+  done
+  for ((i = 0; i < ${#steps[@]}; i++)); do
+    run_step install "$dir" "${steps[$i]}" || return 1
+  done
   return 0
 }
 
@@ -687,19 +824,32 @@ write_fingerprint() {
 }
 
 validate_component_paths() {
-  local comp=$1 dir=$2 rel fp_path fp_path_present
-  while IFS= read -r -d '' rel; do
+  local comp=$1 dir=$2 rel fp_path fp_path_present i
+  local -a resets=() files=()
+  if ! manifest_records "$comp" '.reset'; then
+    FAILURE_REASON="reset must be an array of paths"
+    return 1
+  fi
+  [ "${#MANIFEST_RECORDS[@]}" -eq 0 ] || resets=("${MANIFEST_RECORDS[@]}")
+  if ! manifest_records "$comp" '.fingerprint.files'; then
+    FAILURE_REASON="fingerprint files must be an array of input paths"
+    return 1
+  fi
+  [ "${#MANIFEST_RECORDS[@]}" -eq 0 ] || files=("${MANIFEST_RECORDS[@]}")
+  for ((i = 0; i < ${#resets[@]}; i++)); do
+    rel=${resets[$i]}
     if ! strict_descendant_path "$dir" "$(expand_tokens "$rel")" >/dev/null; then
       FAILURE_REASON="reset path must be a strict descendant of the component directory: '$rel'"
       return 1
     fi
-  done < <(printf '%s' "$comp" | jq -j '.reset[]? | tostring + "\u0000"' 2>/dev/null)
-  while IFS= read -r -d '' rel; do
+  done
+  for ((i = 0; i < ${#files[@]}; i++)); do
+    rel=${files[$i]}
     if ! strict_descendant_path "$dir" "$(expand_tokens "$rel")" >/dev/null; then
       FAILURE_REASON="fingerprint file must be a strict descendant of the component directory: '$rel'"
       return 1
     fi
-  done < <(printf '%s' "$comp" | jq -j '.fingerprint.files[]? | tostring + "\u0000"' 2>/dev/null)
+  done
   fp_path_present=$(printf '%s' "$comp" | jq -r 'if (.fingerprint? | type) == "object" then if (.fingerprint | has("path")) then "yes" else "no" end else "no" end' 2>/dev/null)
   if [ "$fp_path_present" = yes ]; then
     fp_path=$(printf '%s' "$comp" | jq -r '.fingerprint.path // ""' 2>/dev/null)
@@ -713,7 +863,8 @@ validate_component_paths() {
 
 run_component() {
   local comp=$1
-  local name dir_rel dir fp_path result detail check built
+  local name dir_rel dir fp_path result detail built built_inputs changed i
+  local -a checks=()
   name=$(printf '%s' "$comp" | jq -r '.name // ""' 2>/dev/null)
   if [ -z "$name" ]; then
     FAILURE_REASON="a component has no name"
@@ -749,12 +900,17 @@ run_component() {
 
   # Runtime checks run before anything is built, so a component is never
   # compiled or installed under a runtime the project does not pin.
-  while IFS= read -r -d '' check; do
-    if ! run_step "runtime check" "$dir" "$check"; then
+  if ! manifest_records "$comp" '.runtime_checks'; then
+    FAILURE_REASON="component $name: runtime_checks must be an array of steps"
+    return 1
+  fi
+  [ "${#MANIFEST_RECORDS[@]}" -eq 0 ] || checks=("${MANIFEST_RECORDS[@]}")
+  for ((i = 0; i < ${#checks[@]}; i++)); do
+    if ! run_step "runtime check" "$dir" "${checks[$i]}"; then
       FAILURE_REASON="component $name: ${STEP_FAILURE:-runtime check failed}"
       return 1
     fi
-  done < <(printf '%s' "$comp" | jq -j '.runtime_checks[]? | tostring + "\u0000"' 2>/dev/null)
+  done
 
   component_fingerprint "$comp" "$dir"
   read_fingerprint "$dir" "$fp_path"
@@ -791,21 +947,34 @@ run_component() {
     FAILURE_REASON="component $name: ${STEP_FAILURE:-probe failed after install}"
     return 1
   fi
-  # Recompute before recording. A version command that reads the very thing it
-  # fingerprints (uv python find resolves a project .venv once one exists) yields
-  # one value before the build and another after, so recording the pre-build
-  # value would silently guarantee a full rebuild on every future lease. Refusing
-  # to record it turns that manifest bug into a visible one instead.
+  # Recompute before recording. An input that reads the very thing it
+  # fingerprints (uv python find resolves a project .venv once one exists, and a
+  # lockfile-updating installer rewrites the lockfile it is fingerprinted by)
+  # yields one value before the build and another after, so recording the
+  # pre-build value would silently guarantee a full rebuild on every future
+  # lease. Refusing to record it turns that manifest bug into a visible one -
+  # but only if the refusal names the cause it actually saw, because the three
+  # causes here are fixed in three different places.
   built=$FINGERPRINT
+  built_inputs=$FINGERPRINT_INPUTS
   component_fingerprint "$comp" "$dir"
-  if [ "$built" != "$FINGERPRINT" ]; then
-    detail="$detail; fingerprint not recorded: a version command's value changed across the build, so it depends on what it fingerprints"
-    note "$name: $detail"
-    log_line "fingerprint: unstable across the build; not recorded"
-  elif [ -n "$built" ] && [ -n "$FINGERPRINT" ]; then
-    write_fingerprint "$dir" "$fp_path"
-  else
+  if [ -z "$built" ] && [ -z "$FINGERPRINT" ]; then
     log_line "fingerprint: unavailable before and after the build; not recorded"
+  elif [ -z "$FINGERPRINT" ]; then
+    detail="$detail; fingerprint not recorded: its inputs could not be recomputed after the build (see the provisioning log for which one)"
+    note "$name: $detail"
+    log_line "fingerprint: unavailable after the build; not recorded"
+  elif [ -z "$built" ]; then
+    detail="$detail; fingerprint not recorded: its inputs were unavailable before the build but readable after it, so the build produces an input it is fingerprinted by"
+    note "$name: $detail"
+    log_line "fingerprint: unavailable before the build only; not recorded"
+  elif [ "$built" != "$FINGERPRINT" ]; then
+    changed=$(fingerprint_changed_inputs "$built_inputs" "$FINGERPRINT_INPUTS")
+    detail="$detail; fingerprint not recorded: ${changed:-its declared inputs} changed across the build, so what it fingerprints is not independent of the build"
+    note "$name: $detail"
+    log_line "fingerprint: ${changed:-inputs} changed across the build; not recorded"
+  else
+    write_fingerprint "$dir" "$fp_path"
   fi
   record_component "$name" "$result" "$detail"
   return 0
@@ -813,8 +982,12 @@ run_component() {
 
 # --- run --------------------------------------------------------------------
 
-while IFS= read -r -d '' entry; do
-  entry=$(expand_tokens "$entry")
+MANIFEST_PATH_PREPEND=()
+manifest_records "$MANIFEST_JSON" '.path_prepend' \
+  || emit failed "manifest path_prepend must be an array of directories"
+[ "${#MANIFEST_RECORDS[@]}" -eq 0 ] || MANIFEST_PATH_PREPEND=("${MANIFEST_RECORDS[@]}")
+for ((entry_index = 0; entry_index < ${#MANIFEST_PATH_PREPEND[@]}; entry_index++)); do
+  entry=$(expand_tokens "${MANIFEST_PATH_PREPEND[$entry_index]}")
   [ -d "$entry" ] || emit failed "path_prepend directory does not exist: $entry"
   case "$entry" in
     *"'"*) emit failed "path_prepend directory contains a quote: $entry" ;;
@@ -822,15 +995,16 @@ while IFS= read -r -d '' entry; do
   esac
   ALL_PATH_PREPEND="${ALL_PATH_PREPEND:+$ALL_PATH_PREPEND }$entry"
   PATH_PREPEND="${PATH_PREPEND:+$PATH_PREPEND:}$entry"
-done < <(printf '%s' "$MANIFEST_JSON" | jq -j '.path_prepend[]? | tostring + "\u0000"' 2>/dev/null)
+done
 
 note "provisioning $PROJECT_NAME in $WORKTREE_REAL ($COMPONENT_COUNT component(s), policy $POLICY)"
 log_line "manifest: $MANIFEST"
 log_line "worktree: $WORKTREE_REAL"
 log_line "kind: $KIND force: $FORCE policy: $POLICY"
 
-while IFS= read -r component_json; do
-  [ -n "$component_json" ] || continue
+PROVISIONED=0
+for ((component_index = 0; component_index < COMPONENT_COUNT; component_index++)); do
+  component_json=${COMPONENT_LIST[$component_index]}
   FAILURE_REASON=
   if ! run_component "$component_json"; then
     FAILURES=$((FAILURES + 1))
@@ -840,10 +1014,24 @@ while IFS= read -r component_json; do
     note "FAILED: ${FAILURE_REASON:-unknown failure}"
     break
   fi
-done < <(printf '%s' "$MANIFEST_JSON" | jq -c '.components[]' 2>/dev/null)
+  PROVISIONED=$((PROVISIONED + 1))
+done
 
 if [ "$FAILURES" -gt 0 ]; then
   emit failed "${FAILURE_REASON:-provisioning failed}"
+fi
+
+# Ready is a claim about every declared component, so it is made only when the
+# run has one recorded outcome per declared component. Anything less means the
+# loop did less work than the manifest declared, which is exactly the shape of
+# failure that used to be reported as ready.
+RECORDED=0
+if [ -n "$COMPONENT_RECORDS" ] && [ -s "$COMPONENT_RECORDS" ]; then
+  RECORDED=$(awk 'END { print NR }' "$COMPONENT_RECORDS" 2>/dev/null)
+fi
+case "$RECORDED" in ''|*[!0-9]*) RECORDED=0 ;; esac
+if [ "$PROVISIONED" -ne "$COMPONENT_COUNT" ] || [ "$RECORDED" -ne "$COMPONENT_COUNT" ]; then
+  emit failed "provisioning recorded $RECORDED of $COMPONENT_COUNT declared components ($PROVISIONED processed), so readiness cannot be claimed"
 fi
 
 note "ready"

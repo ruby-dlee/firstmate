@@ -353,6 +353,9 @@ See [`docs/examples/provision-relvino.json`](examples/provision-relvino.json) fo
 
 `components` is required and every component needs a `name`.
 The remaining component fields are optional, with `dir` defaulting to the worktree root, but every step included in a step list still needs the non-empty `argv` described below.
+Every list in the manifest must actually be an array, and a run reads each list whole and reconciles the records it read against the length that list declares before acting on any of it.
+A field that is present but is not an array fails the run rather than being iterated into nothing, and a `ready` verdict is emitted only when the run recorded one outcome per declared component.
+That matters because a JSON `length` is defined for values that cannot be iterated, so `"components": "abc"` would otherwise look like three components and provision none of them.
 `kinds` defaults to `["ship"]`, so scouts are skipped unless the manifest lists them or the spawn passes `--provision`; a scout that only reads code does not need a toolchain.
 A no-manifest or excluded-kind skip publishes no provision record, log, brief section, or `path_prepend`; spawn retires any evidence from a prior attempt before taking an early-return path.
 `on_failure` is `warn` or `block` and defaults to `warn`; the reasoning behind that default lives in `bin/fm-provision.sh`'s header.
@@ -366,6 +369,7 @@ An absent `on_failure` is not ambiguous and still takes the `warn` default.
 A project with no manifest at all is untouched by any of this: provisioning is skipped, nothing is created, and the spawn proceeds.
 `timeout_seconds` bounds the whole run, including reset deletions, and `step_timeout_seconds` is the per-step default, which a step overrides with its own `timeout_seconds`.
 Every declared step is an object with a required non-empty `argv` argument vector and optional `name`, `expect`, and `timeout_seconds`; using an argument vector makes quoting unambiguous, and `["sh", "-c", "..."]` is the explicit opt-in when a shell is genuinely wanted.
+Every step runs with its standard input on `/dev/null`, so a step that wants input opens it itself, as in `["sh", "-c", "cmd < file"]`.
 `${HOME}` and `${WORKTREE}` are the only tokens that expand in command arguments, expected output, environment values, and the manifest's path fields, so a manifest can name a host runtime directory or a path inside the lease without being rewritten per worktree.
 Names and `description` are labels and do not expand, and no value is implicitly evaluated as a shell command.
 
@@ -373,6 +377,9 @@ Names and `description` are labels and do not expand, and no value is implicitly
 That handover only happens for a `ready` verdict.
 Without it, provisioning could build a project under its pinned runtime while the crewmate's shell still resolved a different one, which is precisely the drift that had npm delegating a native build to an unpinned node.
 A manifest-level `path_prepend` entry must already be a directory and may not contain a space or single quote because it is also transported into that exported `PATH`; component-level entries affect only that component's provisioning steps.
+A published pin leads the crewmate's `PATH`, so it can carry any command name, including a harness name: a pinned Node prefix is exactly where a globally npm-installed `claude` or `codex` lives.
+It never decides which binary the harness name means, because a spawn that publishes a pin launches the harness by the absolute path Firstmate resolved from its own `PATH` before the pin existed, and refuses to launch a harness it could not resolve that way.
+The pin still wins for the project's own tools, which is the whole point of declaring it.
 A component's `env` may not set `PATH`; use `path_prepend`, so a manifest cannot route around its own runtime checks.
 
 `runtime_checks` run before anything is built, so a component is never compiled or installed under the wrong runtime.
@@ -383,8 +390,9 @@ The value a step contributes - to `expect` and to a fingerprint - is its last no
 Reuse requires both a matching digest over the declared `files` and `versions` AND passing `probes`; probes run on every invocation, so a merely existing directory is never assumed healthy, and a fingerprint hit whose probes fail rebuilds instead.
 An absent or unavailable fingerprint forces a rebuild on every applicable invocation.
 Put `fingerprint.path` inside the tree it describes, such as `.venv/` or `node_modules/`, so deleting the environment deletes its claim of health.
-A `versions` command must be independent of the thing it fingerprints; the value is recomputed after a build, and the fingerprint is recorded only when both readings are non-empty and equal.
-If those readings differ, including an empty-to-non-empty transition, the verdict reports the refusal rather than silently rebuilding on every future lease.
+A `versions` command must be independent of the thing it fingerprints, and so must a `files` input: a lockfile that the install step rewrites is not a usable input.
+Every declared input is recomputed after a build, and the fingerprint is recorded only when both readings are non-empty and equal.
+If those readings differ, including an empty-to-non-empty transition, the verdict reports the refusal rather than silently rebuilding on every future lease, and it names which cause applied: an input that could not be recomputed at all, an input that only became readable after the build, or the specific `files` or `versions` inputs whose value moved.
 Existing ancestors of `dir`, `reset`, fingerprint input, and `fingerprint.path` paths are resolved before use; symlinks and physical escapes from the worktree are refused before reads, writes, or deletion.
 A component `dir` may be the worktree root, but every reset, fingerprint input, and `fingerprint.path` must be a strict descendant of that component directory.
 This strict-descendant invariant structurally prevents `.`, `sub/..`, an empty value, or an absolute reset from ever resolving to the component root passed to deletion.
@@ -392,6 +400,7 @@ This strict-descendant invariant structurally prevents `.`, `sub/..`, an empty v
 Automatic provisioning applies to new or recorded non-Orca ship and scout worktrees; secondmate and Orca launches do not use this seam.
 `bin/fm-spawn.sh` takes `--provision` to force provisioning for one spawn, including for a kind the manifest excludes and rebuilding rather than reusing a matching fingerprint, and `--no-provision` to skip it entirely.
 Both apply to every pair of a batch spawn.
+An opted-in project whose provisioner cannot be run at all, such as one whose file lost its executable bit, is a provisioning failure governed by that manifest's `on_failure` rather than a silent skip, so `block` still refuses the spawn.
 With `--task`, the verdict is written to `state/<id>.provision` and the full step log to `state/<id>.provision.log`, both removed by teardown.
 A leased worktree is re-proven clean, isolated, and still at its expected detached tip after provisioning has written into it and before the endpoint is created, using the same predicate the return path applies.
 Residue an install step left behind is therefore a provisioning failure under the manifest's own policy: it is loud and durable at dispatch, and no agent is launched onto a base that is no longer proven.

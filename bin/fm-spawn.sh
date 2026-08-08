@@ -2485,7 +2485,7 @@ launch_template() {
         printf '%s' '__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(cat __BRIEF__)"'
       fi
       ;;
-    opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(cat __BRIEF__)"' ;;
+    opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' __AGENT__ __MODELFLAG__--prompt "$(cat __BRIEF__)"' ;;
     # pi: --approve ("Trust project-local files for this run") is what keeps an
     # unattended pi agent off the project-trust dialog. Pi has no permission system,
     # but it DOES gate every not-yet-trusted directory behind that dialog on first
@@ -2506,7 +2506,7 @@ launch_template() {
         # revisit this if pi ever ships a question tool that can park a secondmate -
         # fm-watch.sh skips stale-pane wakes for kind=secondmate, so a parked
         # secondmate would not trip stale detection.
-        printf '%s' 'pi --approve __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ "$(cat __BRIEF__)"'
+        printf '%s' '__AGENT__ --approve __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ "$(cat __BRIEF__)"'
       else
         # --exclude-tools is a plain denylist over built-in, extension, and custom
         # tool names (pi 0.84.0 filters it as a Set, ignoring names that are not
@@ -2514,7 +2514,7 @@ launch_template() {
         # crewmate's contract is to run autonomously and report through its status
         # file, so a tool that halts the run to ask a question nobody is watching is
         # never the right behavior here.
-        printf '%s' 'pi --approve --exclude-tools ask_question __MODELFLAG____EFFORTFLAG__-e __PIEXT__ "$(cat __BRIEF__)"'
+        printf '%s' '__AGENT__ --approve --exclude-tools ask_question __MODELFLAG____EFFORTFLAG__-e __PIEXT__ "$(cat __BRIEF__)"'
       fi
       ;;
     # grok (Grok Build TUI): a positional prompt starts the supervised interactive
@@ -2524,7 +2524,7 @@ launch_template() {
     # --dangerously-skip-permissions. grok's turn-end signal does NOT ride the
     # launch command - it is a Stop-event hook installed below (global hook +
     # per-task pointer), so the template is identical for ship/scout/secondmate.
-    grok) printf '%s' 'grok --always-approve __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
+    grok) printf '%s' '__AGENT__ --always-approve __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
     *) return 1 ;;
   esac
 }
@@ -2565,6 +2565,28 @@ case "$ARG3" in
     LAUNCH=$(launch_template "$HARNESS" "$KIND") || { echo "error: unknown harness '$HARNESS'; pass a raw launch command to use an unverified adapter" >&2; exit 1; }
     ;;
 esac
+
+# The harness binary as FIRSTMATE resolves it, pinned here - at harness
+# selection, before worktree provisioning has run and therefore before any
+# manifest-supplied directory can reach a PATH this spawn composes or exports.
+# The pane shell resolves a bare command name against the PATH it is handed, and
+# a provisioning manifest may put its own directory at the head of that PATH, so
+# a bare name is a name the manifest could answer: a pinned node prefix carries
+# exactly the globally npm-installed CLIs (`claude`, `codex`) a harness name
+# matches. Resolving here rather than at launch is what makes the ordering
+# structural instead of incidental - a refactor that moved provisioning earlier
+# would leave this empty rather than silently resolving through the manifest, and
+# an empty value refuses to launch (see build_launch_command). `type -P` is a
+# PATH lookup only, so a shell function or alias of the same name cannot answer
+# for the binary either.
+HARNESS_BIN=
+if [ "$RAW_LAUNCH" != 1 ] && [ -n "$HARNESS" ]; then
+  HARNESS_BIN=$(type -P "$HARNESS" 2>/dev/null || true)
+  case "$HARNESS_BIN" in
+    /*) [ -x "$HARNESS_BIN" ] || HARNESS_BIN= ;;
+    *) HARNESS_BIN= ;;
+  esac
+fi
 
 # config/secondmate-harness may carry optional model/effort tokens alongside the
 # harness ("<harness> [<model>] [<effort>]"). They apply only when this is a
@@ -3364,11 +3386,21 @@ spawn_retire_provision_evidence() {
 # project's manifest lives, so the path is asked of it rather than rebuilt here;
 # the absent-manifest default stays exactly one file-existence check away from
 # skipping, which is what leaves every non-opted-in project untouched.
+# --manifest-path is a pure path computation with no side effects, and it is
+# asked through the interpreter rather than through the provisioner's exec bit on
+# purpose: a provisioner that lost that bit must look like a broken provisioner,
+# which the policy below then governs, and never like a project that never opted
+# in. Running the provisioner still requires the bit.
+spawn_provision_manifest_path() {
+  [ -f "$SCRIPT_DIR/fm-provision.sh" ] || return 1
+  "${BASH:-bash}" "$SCRIPT_DIR/fm-provision.sh" --manifest-path "$PROJ_ABS" 2>/dev/null
+}
+
 spawn_resolve_provision_policy() {
   local raw
   PROVISION_MANIFEST=
   PROVISION_POLICY=
-  PROVISION_MANIFEST=$("$SCRIPT_DIR/fm-provision.sh" --manifest-path "$PROJ_ABS" 2>/dev/null) || PROVISION_MANIFEST=
+  PROVISION_MANIFEST=$(spawn_provision_manifest_path) || PROVISION_MANIFEST=
   if [ -z "$PROVISION_MANIFEST" ]; then
     echo "warning: skipping worktree provisioning for $ID because no manifest path could be resolved for $PROJ_ABS" >&2
     return 1
@@ -3431,25 +3463,35 @@ provision_worktree() {
   [ "$KIND" != secondmate ] || return 0
   [ "$BACKEND" != orca ] || return 0
   [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
-  [ -x "$SCRIPT_DIR/fm-provision.sh" ] || return 0
   spawn_resolve_provision_policy || return 0
-  local provision_args=(--task "$ID" --kind "$KIND")
-  [ "$PROVISION_MODE" != force ] || provision_args+=(--force)
-  verdict=$("$SCRIPT_DIR/fm-provision.sh" "$PROJ_ABS" "$WT" "${provision_args[@]}") || status=$?
-  if [ -n "$verdict" ]; then
-    verdict_status=$(printf '%s' "$verdict" | jq -r '.status // ""' 2>/dev/null || true)
-  fi
-  if [ "$status" -eq 0 ] && [ "$verdict_status" = skipped ]; then
-    return 0
-  fi
-  spawn_provisioned_worktree_still_returnable || residue=1
-  if [ "$status" -eq 0 ] && [ "$verdict_status" = ready ] && [ "$residue" -eq 0 ]; then
-    PROVISION_PATH_PREPEND=$(printf '%s' "$verdict" | jq -r '.path_prepend // ""' 2>/dev/null || true)
-    spawn_brief_provision_note "$verdict" ready
-    return 0
+  # Checked AFTER the policy is known, and treated as a failure the policy
+  # governs. An opted-in project that cannot run its provisioner has exactly the
+  # unproven worktree its on_failure setting is about; skipping here instead
+  # would launch every crewmate unprovisioned with no banner and no durable
+  # verdict, including under block. The WT guard above is different in kind: it
+  # is a precondition for there being anything to provision at all.
+  if [ -x "$SCRIPT_DIR/fm-provision.sh" ]; then
+    local provision_args=(--task "$ID" --kind "$KIND")
+    [ "$PROVISION_MODE" != force ] || provision_args+=(--force)
+    verdict=$("$SCRIPT_DIR/fm-provision.sh" "$PROJ_ABS" "$WT" "${provision_args[@]}") || status=$?
+    if [ -n "$verdict" ]; then
+      verdict_status=$(printf '%s' "$verdict" | jq -r '.status // ""' 2>/dev/null || true)
+    fi
+    if [ "$status" -eq 0 ] && [ "$verdict_status" = skipped ]; then
+      return 0
+    fi
+    spawn_provisioned_worktree_still_returnable || residue=1
+    if [ "$status" -eq 0 ] && [ "$verdict_status" = ready ] && [ "$residue" -eq 0 ]; then
+      PROVISION_PATH_PREPEND=$(printf '%s' "$verdict" | jq -r '.path_prepend // ""' 2>/dev/null || true)
+      spawn_brief_provision_note "$verdict" ready
+      return 0
+    fi
+  else
+    status=126
+    reason="the provisioner $SCRIPT_DIR/fm-provision.sh is not executable, so this project's declared environment could not be built or proven"
   fi
   PROVISION_PATH_PREPEND=
-  reason=$(printf '%s' "$verdict" | jq -r '.reason // ""' 2>/dev/null || true)
+  [ -n "$reason" ] || reason=$(printf '%s' "$verdict" | jq -r '.reason // ""' 2>/dev/null || true)
   if [ "$residue" -eq 0 ] && [ -n "$verdict_status" ]; then
     if [ "$status" -eq 4 ]; then
       banner_state=aborting
@@ -3599,6 +3641,19 @@ fi
 # different one, the crewmate re-triggers the very runtime drift provisioning
 # just ruled out. It is only ever set from a ready verdict, so an unproven or
 # failed run hands over nothing.
+#
+# That prepend is the one seed entry that does NOT come from firstmate's own
+# resolution order, so for a provisioned spawn "only ever adds reach" holds for
+# every command except one the prepended directory also carries - and a pinned
+# node prefix carries every globally npm-installed CLI, harness names included.
+# The invariant is restored on the launch side rather than by reordering here,
+# which would just reinstate the drift the pin exists to prevent: a spawn that
+# publishes a pin names the harness by the absolute path resolved into
+# HARNESS_BIN at harness selection, before any manifest value reached this
+# function, and refuses to launch if that path is unavailable. So a manifest can
+# still put its runtime first for the project's own tools, and still cannot
+# decide which binary the harness name resolves to, on either the exported-PATH
+# or the HERDR_AGENT_ENV channel below.
 crew_tool_path() {
   local seed dir out='' brew=/opt/homebrew
   [ -d "$brew" ] || brew=/usr/local
@@ -3845,7 +3900,23 @@ if [ "$RESUME_ACCOUNT" = 1 ]; then
     *) echo "error: managed recovery supports only claude and codex" >&2; exit 1 ;;
   esac
 fi
-AGENT_COMMAND=$HARNESS
+# A published runtime pin leads the crewmate's PATH with a manifest-supplied
+# directory, so from here on the harness is named by the absolute path firstmate
+# resolved for itself BEFORE that pin existed. The pin still wins for the
+# project's own tools, which is what it is for, but it cannot decide which binary
+# the harness name means. Without a pin nothing outside firstmate's own PATH
+# order is in play and the bare name resolves exactly as it always has.
+# An unresolvable harness under a pin is refused rather than launched: that is
+# the one case where the name and the binary may genuinely disagree.
+HARNESS_WORD=$HARNESS
+if [ -n "$PROVISION_PATH_PREPEND" ]; then
+  if [ -z "$HARNESS_BIN" ]; then
+    echo "error: refusing to launch fm-$ID with a provisioning runtime pin ahead of PATH because the '$HARNESS' harness could not be resolved to an absolute executable from firstmate's own PATH" >&2
+    exit 1
+  fi
+  HARNESS_WORD=$(shell_quote "$HARNESS_BIN")
+fi
+AGENT_COMMAND=$HARNESS_WORD
 if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
   # herdr delivers the account directory NATIVELY, as `agent start --env KEY=VALUE`
   # (HERDR_AGENT_ENV below), instead of as a command-scoped shell prefix. Verified
@@ -3856,8 +3927,8 @@ if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
   case "$HARNESS:$BACKEND" in
     claude:herdr) HERDR_AGENT_ENV+=("CLAUDE_CONFIG_DIR=$DIRECT_ACCOUNT_HOME") ;;
     codex:herdr) HERDR_AGENT_ENV+=("CODEX_HOME=$DIRECT_ACCOUNT_HOME") ;;
-    claude:*) AGENT_COMMAND="CLAUDE_CONFIG_DIR=$(shell_quote "$DIRECT_ACCOUNT_HOME") $HARNESS" ;;
-    codex:*) AGENT_COMMAND="CODEX_HOME=$(shell_quote "$DIRECT_ACCOUNT_HOME") $HARNESS" ;;
+    claude:*) AGENT_COMMAND="CLAUDE_CONFIG_DIR=$(shell_quote "$DIRECT_ACCOUNT_HOME") $HARNESS_WORD" ;;
+    codex:*) AGENT_COMMAND="CODEX_HOME=$(shell_quote "$DIRECT_ACCOUNT_HOME") $HARNESS_WORD" ;;
   esac
 fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then

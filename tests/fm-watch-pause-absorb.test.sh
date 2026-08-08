@@ -39,6 +39,8 @@ set -u
 
 # shellcheck source=tests/wake-helpers.sh
 . "$(dirname "${BASH_SOURCE[0]}")/wake-helpers.sh"
+# shellcheck source=bin/fm-marker-state-lib.sh
+. "$ROOT/bin/fm-marker-state-lib.sh"
 # shellcheck source=bin/fm-classify-lib.sh
 . "$ROOT/bin/fm-classify-lib.sh"
 
@@ -91,7 +93,7 @@ run_pause_case() {  # <case-name> <status-stream> <crew-state-verdict>
   printf 'window=%s\nkind=ship\n' "$window" > "$state/$name.meta"
   printf '%s' "$stream" > "$state/$name.status"
   sig=$(seen_sig "$state/$name.status"); printf '%s' "$sig" > "$state/.seen-${name}_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle at the composer")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -305,6 +307,12 @@ test_pause_moving_during_pipeline_read_refused() {
     || fail "a pause invalidated during the crew-state read wrote .paused-<key>"
   pass "a pause invalidated during pipeline-state validation fails closed"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = watcher-state-key ]; then
+  test_live_idle_paused_pane_absorbed
+  test_paused_with_open_decision_surfaced
+  exit 0
+fi
 
 test_live_idle_paused_pane_absorbed
 test_dead_paused_pane_absorbed

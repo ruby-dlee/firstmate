@@ -28,6 +28,8 @@ set -u
 . "$ROOT/bin/fm-classify-lib.sh"
 # shellcheck source=bin/fm-transition-lib.sh
 . "$ROOT/bin/fm-transition-lib.sh"
+# shellcheck source=bin/fm-marker-state-lib.sh
+. "$ROOT/bin/fm-marker-state-lib.sh"
 
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
@@ -469,7 +471,7 @@ test_watcher_stale_liveness_runs_one_bounded_parallel_window() {
     printf 'working: validating\n' > "$state/$task.status"
     sig=$(seen_sig "$state/$task.status")
     printf '%s' "$sig" > "$state/.seen-${task}_status"
-    key=$(printf '%s' "$window" | tr ':/.' '___')
+    key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
     printf '%s' "$pane_hash" > "$state/.hash-$key"
     printf '1\n' > "$state/.count-$key"
   done
@@ -480,7 +482,7 @@ test_watcher_stale_liveness_runs_one_bounded_parallel_window() {
   pid=$!
   for task in a b c d e; do
     window="test:fm-$task"
-    key=$(printf '%s' "$window" | tr ':/.' '___')
+    key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
     wait_file_value "$state/.stale-$key" "$pane_hash" 80 \
       || { reap "$pid"; fail "watcher did not classify all stale validation lanes"; }
   done
@@ -584,7 +586,7 @@ test_working_note_not_working_surfaced() {
 # --- actionable wakes are surfaced (queue + exit) ---------------------------
 
 test_actionable_signal_surfaced() {
-  local dir state fakebin out drain_out status_file pid
+  local dir state fakebin out drain_out status_file pid surfaced_key
   dir=$(make_case actionable-signal); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; drain_out="$dir/drain.out"
   status_file="$state/task.status"
@@ -595,7 +597,8 @@ test_actionable_signal_surfaced() {
   grep -F "signal: $status_file" "$out" >/dev/null || fail "watcher did not print the actionable signal reason"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the actionable signal failed"
   grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "actionable signal was not queued"
-  [ -s "$state/.hb-surfaced-task" ] || fail "actionable signal did not record the surfaced marker"
+  surfaced_key=$(fm_marker_task_key task)
+  [ -s "$state/.hb-surfaced-$surfaced_key" ] || fail "actionable signal did not record the surfaced marker"
   pass "captain-relevant signal is surfaced (queue + exit) and marked surfaced"
 }
 
@@ -791,7 +794,7 @@ EOF
   printf 'window=%s\nkind=ship\nharness=codex\n' "$window" > "$state/paused-permission.meta"
   printf 'paused: awaiting the upstream release\n' > "$statusf"
   printf '%s' "$(seen_sig "$statusf")" > "$state/.seen-paused-permission_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   export FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting the upstream release'
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
@@ -820,7 +823,7 @@ test_busy_no_progress_suspects_system_permission_dialog() {
   dir=$(make_case busy-permission-stall); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
   window="test:fm-busy-permission"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   since_file="$state/.stale-busy-since-$key"
   printf 'window=%s\nkind=ship\nharness=codex\n' "$window" > "$state/busy-permission.meta"
   cat > "$capture_file" <<'EOF'
@@ -891,7 +894,7 @@ test_terminal_stale_surfaced() {
   printf 'window=%s\nkind=ship\n' "$window" > "$state/done.meta"
   printf 'done: PR https://example.test/pr/3\n' > "$state/done.status"
   sig=$(seen_sig "$state/done.status"); printf '%s' "$sig" > "$state/.seen-done_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "finished, awaiting review")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -927,7 +930,7 @@ test_stale_terminal_status_overridden_by_active_run() {
   # pipeline itself runs.
   printf 'done: implementation complete, ready to validate\n' > "$state/validating.status"
   sig=$(seen_sig "$state/validating.status"); printf '%s' "$sig" > "$state/.seen-validating_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "no-mistakes axi run: validating...")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -946,7 +949,7 @@ test_stale_terminal_status_overridden_by_active_run() {
   [ ! -s "$state/.wake-queue" ] || fail "the overridden stale terminal status enqueued a wake during absorb"
   [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on absorb"
   [ -s "$state/.stale-since-$key" ] || fail "stale-since escalation timer was not recorded on absorb"
-  [ ! -e "$state/.hb-surfaced-validating" ] || fail "an absorbed wake must not mark the status line as surfaced"
+  [ ! -e "$state/.hb-surfaced-$(fm_marker_task_key validating)" ] || fail "an absorbed wake must not mark the status line as surfaced"
   reap "$pid"
 
   # Phase B: backdate the idle timer past the threshold and make the repeated,
@@ -985,7 +988,7 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated() {
   # the stale path.
   printf 'working: still compiling\n' > "$state/quiet.status"
   sig=$(seen_sig "$state/quiet.status"); printf '%s' "$sig" > "$state/.seen-quiet_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle building output")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -1043,7 +1046,7 @@ test_nonterminal_stale_not_working_surfaced() {
   # primed so the signal scan does not pre-empt the stale path.
   printf 'working: implementing\n' > "$state/stopped.status"
   sig=$(seen_sig "$state/stopped.status"); printf '%s' "$sig" > "$state/.seen-stopped_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle prompt, finished")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -1084,7 +1087,7 @@ test_terminal_run_step_declared_pause_absorbed_with_markers() {
   printf 'paused: waiting on the captain to merge PRs #63, #64, and #65 in order before D4 can start\n' \
     > "$state/terminal-paused.status"
   sig=$(seen_sig "$state/terminal-paused.status"); printf '%s' "$sig" > "$state/.seen-terminal-paused_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle after checks passed, awaiting ordered merges")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -1116,7 +1119,7 @@ test_surface_nonterminal_stale_clears_pause_only_after_status_resumes() {
   dir=$(make_case surface-stale-pause-markers); state="$dir/state"; window="firstmate:fm-marker-owner"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/marker-owner.meta"
   printf 'paused: awaiting ordered PR merges\n' > "$state/marker-owner.status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   : > "$state/.paused-$key"
   : > "$state/.paused-rechecked-$key"
   : > "$state/.paused-resurfaced-$key"
@@ -1166,7 +1169,7 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
   # not pre-empt the stale path.
   printf 'paused: holding for the upstream tool release\n' > "$statusf"
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-held_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle, holding for upstream")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -1253,7 +1256,7 @@ test_failure_pause_stale_surfaced_not_absorbed() {
   printf 'paused: run 01KYQ8NGB3YTQC9PS82P3E6C81 drive failed on no-mistakes v1.41.2: drive run: reconcile run: read response\n' \
     > "$state/failpause.status"
   sig=$(seen_sig "$state/failpause.status"); printf '%s' "$sig" > "$state/.seen-failpause_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle after the run died")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -1282,9 +1285,9 @@ test_herdr_blocked_transition_enters_pause_absorb_path() {
   local dir state fakebin window key record
   dir=$(make_case herdr-paused-transition); state="$dir/state"; fakebin="$dir/fakebin"
   window="default:w6:p3H"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
   printf 'window=%s\nbackend=herdr\nkind=ship\n' "$window" > "$state/herdr-paused.meta"
   printf 'paused: awaiting an external release\n' > "$state/herdr-paused.status"
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   printf 'stable-pane-hash' > "$state/.hash-$key"
   export FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting an external release'
   record=$(fm_transition_record 'w6:p3H' 'w6' '' blocked codex)
@@ -1318,7 +1321,7 @@ test_secondmate_paused_resurfaces_in_normal_mode() {
   if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$statusf"
   else touch -m -d "@$back" "$statusf"; fi
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-secondmate-held_status"
-  key=$(printf '%s' "$window" | tr '.:/' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle awaiting external")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -1344,7 +1347,7 @@ test_secondmate_nonpaused_stale_remains_suppressed() {
   printf 'window=%s\nkind=secondmate\n' "$window" > "$state/secondmate-working.meta"
   printf 'working: the parent supervises this secondmate\n' > "$statusf"
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-secondmate-working_status"
-  key=$(printf '%s' "$window" | tr '.:/' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle while the parent supervises")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -1393,7 +1396,7 @@ test_nonterminal_stale_pause_transitions_reclassify_unchanged_hash() {
   printf 'window=%s\nkind=ship\n' "$window" > "$state/transition.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/transition.status"
   sig=$(seen_sig "$state/transition.status"); printf '%s' "$sig" > "$state/.seen-transition_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle awaiting external")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '%s' "$pane_hash" > "$state/.stale-$key"
@@ -1438,7 +1441,7 @@ test_nonterminal_paused_rechecks_authoritative_state() {
   printf 'window=%s\nkind=ship\n' "$window" > "$state/pause-recheck.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/pause-recheck.status"
   sig=$(seen_sig "$state/pause-recheck.status"); printf '%s' "$sig" > "$state/.seen-pause-recheck_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle awaiting external")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '%s' "$pane_hash" > "$state/.stale-$key"
@@ -1468,7 +1471,7 @@ test_paused_authoritative_working_preserves_wedge_timer() {
   printf 'window=%s\nkind=ship\n' "$window" > "$state/paused-working.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/paused-working.status"
   sig=$(seen_sig "$state/paused-working.status"); printf '%s' "$sig" > "$state/.seen-paused-working_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle awaiting external")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '%s' "$pane_hash" > "$state/.stale-$key"
@@ -1514,7 +1517,7 @@ test_repeated_alive_process_windows_never_escalate() {
   printf 'window=%s\nkind=ship\n' "$window" > "$state/long-suite.meta"
   printf 'working: still running tests\n' > "$state/long-suite.status"
   sig=$(seen_sig "$state/long-suite.status"); printf '%s' "$sig" > "$state/.seen-long-suite_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle building output")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -1564,7 +1567,7 @@ test_obsolete_wedge_bookkeeping_resets_when_pane_becomes_active() {
   printf 'window=%s\nkind=ship\n' "$window" > "$state/wedged-reset.meta"
   printf 'working: still monitoring ci\n' > "$state/wedged-reset.status"
   sig=$(seen_sig "$state/wedged-reset.status"); printf '%s' "$sig" > "$state/.seen-wedged-reset_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle building output")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -1597,7 +1600,7 @@ test_nonterminal_stale_repairs_missing_or_corrupt_timer() {
   printf 'window=%s\nkind=ship\n' "$window" > "$state/quiet-timer.meta"
   printf 'working: still compiling\n' > "$state/quiet-timer.status"
   sig=$(seen_sig "$state/quiet-timer.status"); printf '%s' "$sig" > "$state/.seen-quiet-timer_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle building output")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -1693,7 +1696,7 @@ test_heartbeat_no_change_absorbed() {
 }
 
 test_heartbeat_backstop_surfaces_unsurfaced_status() {
-  local dir state fakebin out drain_out sig pid
+  local dir state fakebin out drain_out sig pid surfaced_key
   dir=$(make_case heartbeat-backstop); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; drain_out="$dir/drain.out"
   # A captain-relevant status whose .seen-* signature ALREADY matches (so the
@@ -1707,7 +1710,8 @@ test_heartbeat_backstop_surfaces_unsurfaced_status() {
   pid=$!
   wait_for_exit "$pid" 40 || fail "heartbeat backstop did not surface an unsurfaced captain-relevant status"
   grep -Fx "heartbeat" "$out" >/dev/null || fail "backstop did not exit with a heartbeat wake"
-  [ "$(cat "$state/.hb-surfaced-miss" 2>/dev/null || true)" = "done: PR https://example.test/pr/5" ] \
+  surfaced_key=$(fm_marker_task_key miss)
+  [ "$(cat "$state/.hb-surfaced-$surfaced_key" 2>/dev/null || true)" = "done: PR https://example.test/pr/5" ] \
     || fail "backstop did not record the status as surfaced (would re-fire next heartbeat)"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the backstop heartbeat failed"
   grep "$(printf '\theartbeat\t')" "$drain_out" >/dev/null || fail "backstop heartbeat was not queued"
@@ -1807,7 +1811,7 @@ test_afk_paused_changed_pane_hands_off_plain_stale() {
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-afk-held_status"
   date '+%s' > "$state/.afk"
   touch "$state/.last-check" "$state/.last-account-session-sync" "$state/.last-report-retention"
-  key=$(printf '%s' "$window" | tr '.:/' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
 
   # Deliberately do not seed .hash-*: this is the changed-pane path that used to
   # call handle_paused_stale before AFK's one-shot daemon handoff.
@@ -2007,6 +2011,40 @@ SH
   pass "watcher timeouts force-kill TERM-resistant subprocesses"
 }
 
+test_watcher_state_identity_is_collision_free_and_legacy_migration_is_owned() {
+  local dir state legacy key_dot key_under family
+  dir=$(make_case watcher-state-identity); state="$dir/state"
+  fm_write_meta "$state/lane.a.meta" 'window=firstmate:fm-lane.a' 'kind=ship'
+  fm_write_meta "$state/lane_a.meta" 'window=firstmate:fm-lane_a' 'kind=ship'
+  (
+    export FM_STATE_OVERRIDE="$state"
+    . "$WATCH"
+    legacy=$(fm_marker_legacy_key 'firstmate:fm-lane.a')
+    [ "$legacy" = "$(fm_marker_legacy_key 'firstmate:fm-lane_a')" ] || fail "watcher collision fixture did not collide"
+    for family in hash count stale stale-since wedge-escalations paused paused-rechecked paused-resurfaced stale-busy-hash stale-busy-since wedge-escalations-busy stale-permission wedge-escalations-permission; do
+      printf '%s\n' "$family" > "$state/.$family-$legacy"
+    done
+    migrate_watcher_state 'firstmate:fm-lane.a' lane.a || fail "ambiguous watcher legacy migration failed closed incorrectly"
+    [ -e "$state/.hash-$legacy" ] || fail "ambiguous watcher legacy state was attributed to one sibling"
+    key_dot=$(watcher_state_key 'firstmate:fm-lane.a' lane.a)
+    key_under=$(watcher_state_key 'firstmate:fm-lane_a' lane_a)
+    [ "$key_dot" != "$key_under" ] || fail "watcher exact task keys collide"
+    : > "$state/.paused-$key_dot"
+    : > "$state/.paused-$key_under"
+    clear_pause_tracking 'firstmate:fm-lane.a'
+    [ ! -e "$state/.paused-$key_dot" ] || fail "watcher cleanup retained its exact task marker"
+    [ -e "$state/.paused-$key_under" ] || fail "watcher cleanup erased a sibling task marker"
+    [ -e "$state/.paused-$legacy" ] || fail "watcher cleanup erased ambiguous legacy state"
+    rm -f "$state/lane_a.meta"
+    migrate_watcher_state 'firstmate:fm-lane.a' lane.a || fail "uniquely owned watcher legacy state did not migrate"
+    for family in hash count stale stale-since wedge-escalations paused paused-rechecked paused-resurfaced stale-busy-hash stale-busy-since wedge-escalations-busy stale-permission wedge-escalations-permission; do
+      [ ! -e "$state/.$family-$legacy" ] || fail "watcher legacy $family state remained after positive ownership"
+      [ -e "$state/.$family-$key_dot" ] || fail "watcher legacy $family state did not migrate to exact custody"
+    done
+  ) || fail "watcher state identity migration assertions failed"
+  pass "watcher families use collision-free task custody and owned legacy migration"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_watcher_markers_refuse_symlinks
   exit 0
@@ -2080,6 +2118,7 @@ case "${FM_TEST_FOCUSED:-}" in
     test_crew_is_provably_working_classifier
     test_crew_absorb_class_classifier
     test_turn_ended_pane_only_surfaced
+    test_watcher_state_identity_is_collision_free_and_legacy_migration_is_owned
     exit 0
     ;;
 esac
@@ -2134,3 +2173,4 @@ test_runtime_profile_verifies_each_new_generation_before_periodic_cadence
 test_runtime_profile_mismatches_do_not_starve_later_tasks
 test_watcher_markers_refuse_symlinks
 test_watcher_timeout_wrapper_uses_hard_kill_fallback
+test_watcher_state_identity_is_collision_free_and_legacy_migration_is_owned

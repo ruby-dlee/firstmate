@@ -243,7 +243,7 @@ test_handle_wake_terminal_signal_clears_pause_tracking() {
   printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w10-terminal.meta"
   printf 'done: upstream landed\n' > "$state/held-w10-terminal.status"
   key=$(_task_marker_key held-w10-terminal)
-  watcher_key=$(_stale_key "$win")
+  watcher_key=$(_watcher_marker_key "$state" "$win" held-w10-terminal)
   date +%s > "$state/.subsuper-paused-$key"
   date +%s > "$state/.subsuper-stale-$key"
   : > "$state/.paused-$watcher_key"
@@ -267,7 +267,7 @@ test_housekeeping_migrates_watcher_pause_marker() {
   win="sess:fm-held-w10-migrate"
   printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w10-migrate.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/held-w10-migrate.status"
-  key=$(_stale_key "$win")
+  key=$(_watcher_marker_key "$state" "$win" held-w10-migrate)
   : > "$state/.paused-$key"
   FM_STATE_OVERRIDE="$state" housekeeping "$state"
   key=$(_task_marker_key held-w10-migrate)
@@ -283,7 +283,7 @@ test_housekeeping_migrates_watcher_unpaused_marker_to_clear() {
   win="sess:fm-held-w10-migrate-unpaused"
   printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w10-migrate-unpaused.meta"
   printf 'working: upstream landed, resuming\n' > "$state/held-w10-migrate-unpaused.status"
-  watcher_key=$(_stale_key "$win")
+  watcher_key=$(_watcher_marker_key "$state" "$win" held-w10-migrate-unpaused)
   : > "$state/.paused-$watcher_key"
   FM_STATE_OVERRIDE="$state" housekeeping "$state"
   key=$(_task_marker_key held-w10-migrate-unpaused)
@@ -523,6 +523,37 @@ test_marker_identity_is_collision_free_and_legacy_fails_closed() {
   [ -e "$state/.subsuper-stale-$lane_dot_key" ] || fail "legacy marker migration did not bind the exact task key"
   [ ! -e "$state/.subsuper-stale-$legacy" ] || fail "legacy marker remained after positive ownership migration"
   pass "marker identity is collision-free and ambiguous legacy state fails closed"
+}
+
+test_ambiguous_legacy_unknown_is_cadenced_and_buffer_deduped() {
+  local dir state legacy stale_marker pause_marker stale_retry pause_retry stale_count pause_count
+  dir=$(make_supercase ambiguous-legacy-cadence)
+  state="$dir/state"
+  fm_write_meta "$state/lane.a.meta" "window=sess:fm-lane.a" "kind=ship"
+  fm_write_meta "$state/lane_a.meta" "window=sess:fm-lane_a" "kind=ship"
+  legacy=$(fm_marker_legacy_key lane.a)
+  stale_marker="$state/.subsuper-stale-$legacy"
+  pause_marker="$state/.subsuper-paused-$legacy"
+  echo $(( $(date +%s) - 500 )) > "$stale_marker"
+  echo $(( $(date +%s) - 500 )) > "$pause_marker"
+  FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=1 housekeeping "$state"
+  stale_retry=$(marker_unknown_retry_path "$state" stale "$legacy")
+  pause_retry=$(marker_unknown_retry_path "$state" paused "$legacy")
+  [ -e "$stale_retry" ] && [ -e "$pause_retry" ] \
+    || fail "ambiguous legacy UNKNOWN did not record ownership-independent retry cadences"
+  stale_count=$(grep -Fc -- "[unknown-marker=stale:$legacy]" "$state/.subsuper-escalations" 2>/dev/null || true)
+  pause_count=$(grep -Fc -- "[unknown-marker=paused:$legacy]" "$state/.subsuper-escalations" 2>/dev/null || true)
+  [ "$stale_count" -eq 1 ] && [ "$pause_count" -eq 1 ] \
+    || fail "ambiguous legacy UNKNOWN did not buffer exactly one escalation per marker"
+  FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=1 housekeeping "$state"
+  sleep 1.1
+  FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=1 housekeeping "$state"
+  stale_count=$(grep -Fc -- "[unknown-marker=stale:$legacy]" "$state/.subsuper-escalations" 2>/dev/null || true)
+  pause_count=$(grep -Fc -- "[unknown-marker=paused:$legacy]" "$state/.subsuper-escalations" 2>/dev/null || true)
+  [ "$stale_count" -eq 1 ] && [ "$pause_count" -eq 1 ] \
+    || fail "ambiguous legacy UNKNOWN duplicated a buffered escalation"
+  [ -e "$stale_marker" ] && [ -e "$pause_marker" ] || fail "ambiguous legacy UNKNOWN discarded a marker"
+  pass "ambiguous legacy UNKNOWN retains state with cadenced deduplicated escalation"
 }
 
 test_marker_refresh_cannot_recreate_after_lifecycle_teardown() {
@@ -1878,6 +1909,8 @@ case "${FM_TEST_FOCUSED:-}" in
     test_liveness_verdicts_surface_through_away_classifiers
     test_housekeeping_unreadable_stale_preserves_unknown_tracking
     test_housekeeping_unreadable_pause_preserves_recheck_tracking
+    test_marker_identity_is_collision_free_and_legacy_fails_closed
+    test_ambiguous_legacy_unknown_is_cadenced_and_buffer_deduped
     test_housekeeping_busy_pane_stale_is_unknown
     test_housekeeping_paused_busy_pane_is_unknown
     test_housekeeping_herdr_idle_busy_footer_is_unknown
@@ -1909,6 +1942,7 @@ test_housekeeping_unreadable_pause_preserves_recheck_tracking
 test_housekeeping_missing_stale_target_preserves_unknown_tracking
 test_housekeeping_missing_paused_target_preserves_unknown_tracking
 test_marker_identity_is_collision_free_and_legacy_fails_closed
+test_ambiguous_legacy_unknown_is_cadenced_and_buffer_deduped
 test_marker_refresh_cannot_recreate_after_lifecycle_teardown
 test_housekeeping_stale_liveness_runs_one_bounded_parallel_window
 test_housekeeping_busy_pane_stale_is_unknown

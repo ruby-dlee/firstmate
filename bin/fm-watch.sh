@@ -80,6 +80,8 @@ mkdir -p "$STATE"
 # backstop. See bin/fm-backend.sh and docs/herdr-backend.md.
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-marker-state-lib.sh
+. "$SCRIPT_DIR/fm-marker-state-lib.sh"
 # Shared normalized-transition accessors and the single-owner status->action
 # policy table, so the event-wait splice reads transition records the same way
 # the herdr subscriber writes them (bin/fm-transition-lib.sh).
@@ -408,9 +410,21 @@ watch_age_of() {  # <file>
   printf '%s' "$age"
 }
 
+watcher_state_key() {  # <window> [task]
+  local win=$1 task=${2:-}
+  [ -n "$task" ] || task=$(window_to_task "$win" "$STATE")
+  [ -f "$STATE/$task.meta" ] && [ ! -L "$STATE/$task.meta" ] || return 1
+  [ "$(fm_backend_target_of_meta "$STATE/$task.meta")" = "$win" ] || return 1
+  fm_marker_task_key "$task"
+}
+
+migrate_watcher_state() {  # <window> <task>
+  fm_marker_migrate_watcher_state "$STATE" "$2" "$1" >/dev/null
+}
+
 pause_state_needs_observation() {  # <window> <status-line>
   local win=$1 last=$2 key recheck_file
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  key=$(watcher_state_key "$win") || return 0
   if ! status_is_paused "$last"; then
     return 0
   fi
@@ -426,7 +440,7 @@ watch_window_needs_observation() {  # <window> <kind> <task> <status-line> <hash
   if status_is_paused "$last" && pause_state_needs_observation "$win" "$last"; then
     return 0
   fi
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  key=$(watcher_state_key "$win" "$task") || return 0
   prev=$(cat "$STATE/.hash-$key" 2>/dev/null || true)
   [ "$h" = "$prev" ] || return 1
   n=$(( $(cat "$STATE/.count-$key" 2>/dev/null || echo 0) + 1 ))
@@ -460,7 +474,7 @@ watch_window_needs_observation() {  # <window> <kind> <task> <status-line> <hash
 # every poll. Advances the stale suppressor to <hash> and flags the key paused.
 handle_paused_stale() {  # <window> <task> <hash>
   local win=$1 task=$2 h=$3 key statusf mtime age rf rf_age reason
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  key=$(watcher_state_key "$win" "$task") || return 1
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
@@ -480,26 +494,20 @@ handle_paused_stale() {  # <window> <task> <hash>
 
 clear_pause_state() {  # <window>
   local win=$1 key
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
+  key=$(watcher_state_key "$win") || return 1
   rm -f "$STATE/.paused-$key" "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key"
 }
 
 clear_pause_tracking() {  # <window>
   local win=$1 key
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
+  key=$(watcher_state_key "$win") || return 1
   clear_pause_state "$win"
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
 }
 
 pause_state_class() {  # <window> <task>
   local win=$1 task=$2 key last recheck_file statusf sig class
-  key=${win//:/_}
-  key=${key//\//_}
-  key=${key//./_}
+  key=$(watcher_state_key "$win" "$task") || { printf 'unknown'; return; }
   statusf="$STATE/$task.status"
   last=$(last_status_line "$statusf")
   recheck_file="$STATE/.paused-rechecked-$key"
@@ -538,12 +546,12 @@ pause_state_class() {  # <window> <task>
 # declares a pause, and clear them only after the task has genuinely resumed.
 surface_nonterminal_stale() {  # <window> <hash> [reason]
   local win=$1 h=$2 reason=${3:-} key task last
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  task=$(window_to_task "$win" "$STATE")
+  key=$(watcher_state_key "$win" "$task") || return 1
   [ -n "$reason" ] || reason="stale: $win"
   fm_wake_append stale "$win" "$reason" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
   rm -f "$STATE/.stale-since-$key"
-  task=$(window_to_task "$win" "$STATE")
   last=$(last_status_line "$STATE/$task.status")
   if ! status_is_paused "$last"; then
     clear_pause_state "$win"
@@ -631,16 +639,16 @@ permission_prompt_kind() {  # <harness> <tail40> <allow-directory-trust>
   return 1
 }
 
-clear_busy_stall_tracking() {  # <window>
-  local win=$1 key
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+clear_busy_stall_tracking() {  # <window> [task]
+  local win=$1 task=${2:-} key
+  key=$(watcher_state_key "$win" "$task") || return 1
   rm -f "$STATE/.stale-busy-hash-$key" "$STATE/.stale-busy-since-$key" \
     "$STATE/.wedge-escalations-busy-$key"
 }
 
 handle_permission_prompt() {  # <window> <task> <hash> <kind>
   local win=$1 task=$2 h=$3 kind=$4 key marker escalation_file prior n reason
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  key=$(watcher_state_key "$win" "$task") || return 1
   marker="$STATE/.stale-permission-$key"
   escalation_file="$STATE/.wedge-escalations-permission-$key"
   prior=$(cat "$marker" 2>/dev/null || true)
@@ -659,7 +667,7 @@ handle_permission_prompt() {  # <window> <task> <hash> <kind>
   fi
   fm_wake_append stale "$win" "$reason" || exit 1
   printf '%s' "$h" > "$marker"
-  clear_busy_stall_tracking "$win"
+  clear_busy_stall_tracking "$win" "$task"
   mark_surfaced "$STATE/$task.status"
   wake "$reason"
 }
@@ -689,7 +697,7 @@ busy_progress_hash() {  # <task> <tail40>
 # threshold window while preserving the existing demand-deep-inspection counter.
 busy_stall_check() {  # <window> <task> <tail40>
   local win=$1 task=$2 tail40=$3 key hash_file since_file escalation_file h prev since age n reason now
-  key=$(printf '%s' "$win" | tr ':/.' '___')
+  key=$(watcher_state_key "$win" "$task") || return 1
   hash_file="$STATE/.stale-busy-hash-$key"
   since_file="$STATE/.stale-busy-since-$key"
   escalation_file="$STATE/.wedge-escalations-busy-$key"
@@ -888,7 +896,11 @@ report_retention_owner_is_fresh() {
 # surface and absorb), .hb-surfaced is advanced ONLY on surface, so the heartbeat
 # fleet-scan can tell apart a captain-relevant status that already woke firstmate
 # from one that has not - the latter being a per-wake-path miss it must surface.
-_hb_surfaced_path() { printf '%s/.hb-surfaced-%s' "$STATE" "$(printf '%s' "$1" | tr ':/.' '___')"; }
+_hb_surfaced_path() {
+  local key
+  key=$(fm_marker_migrate_task_state "$STATE" "$1" hb-surfaced) || key=$(fm_marker_task_key "$1") || return 1
+  printf '%s/.hb-surfaced-%s' "$STATE" "$key"
+}
 
 # Record a status file's captain-relevant last line as surfaced (no-op for a
 # non-captain-relevant or empty status). Call AFTER the wake is enqueued, so the
@@ -1021,11 +1033,12 @@ handle_push_transition() {  # <backend> <session> <record>
   [ -n "$pane_id" ] || { sleep 1; return; }
   window="$session:$pane_id"
   task=$(window_to_task "$window" "$STATE")
+  migrate_watcher_state "$window" "$task" || { sleep 1; return 1; }
   if status_is_paused "$(last_status_line "$STATE/$task.status")"; then
     # The durable status is the trusted gate on this native edge. Commit the
     # handled transition, then enter the shared pause path so it owns the marker
     # and bounded re-surface cadence even when no auxiliary crew-state read exists.
-    key=$(printf '%s' "$window" | tr ':/.' '___')
+    key=$(watcher_state_key "$window" "$task") || return 1
     h=$(cat "$STATE/.hash-$key" 2>/dev/null || true)
     fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
     handle_paused_stale "$window" "$task" "$h"
@@ -1284,9 +1297,8 @@ EOF
   while IFS= read -r w; do
     kind=$(window_kind "$w")
     task=$(window_to_task "$w" "$STATE")
-    key=${w//:/_}
-    key=${key//\//_}
-    key=${key//./_}
+    migrate_watcher_state "$w" "$task" || continue
+    key=$(watcher_state_key "$w" "$task") || continue
     last=$(last_status_line "$STATE/$task.status")
     if ! status_is_paused "$last" && [ -e "$STATE/.paused-$key" ]; then
       clear_pause_tracking "$w"
@@ -1335,7 +1347,7 @@ EOF
     tail40=${stale_tails[$stale_i]}
     h=${stale_hashes[$stale_i]}
     window_busy=${stale_busies[$stale_i]}
-    key=$(printf '%s' "$w" | tr ':/.' '___')
+    key=$(watcher_state_key "$w" "$task") || continue
     if [ "$window_busy" = 1 ]; then
       mark_brief_processing_started "$task" || true
     fi
@@ -1374,7 +1386,7 @@ EOF
     if [ "$window_busy" = 1 ]; then
       busy_stall_check "$w" "$task" "$tail40"
     else
-      clear_busy_stall_tracking "$w"
+      clear_busy_stall_tracking "$w" "$task"
     fi
     hf="$STATE/.hash-$key"
     cf="$STATE/.count-$key"

@@ -10,6 +10,8 @@ set -u
 
 # shellcheck source=tests/wake-helpers.sh
 . "$(dirname "${BASH_SOURCE[0]}")/wake-helpers.sh"
+# shellcheck source=bin/fm-marker-state-lib.sh
+. "$ROOT/bin/fm-marker-state-lib.sh"
 
 WATCH="$ROOT/bin/fm-watch.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
@@ -238,7 +240,7 @@ test_stale_enqueue_before_suppressor() {
   printf 'done: ready in branch fm/stale\n' > "$state/stale.status"
   if [ "$(uname)" = Darwin ]; then sig=$(stat -f '%z:%Fm' "$state/stale.status"); else sig=$(stat -c '%s:%Y' "$state/stale.status"); fi
   printf '%s' "$sig" > "$state/.seen-stale_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key stale)
   pane_hash=$(hash_text "idle prompt")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -271,7 +273,7 @@ test_not_working_stale_enqueue_before_suppressor() {
   printf 'working: implementing\n' > "$state/stopped.status"
   if [ "$(uname)" = Darwin ]; then sig=$(stat -f '%z:%Fm' "$state/stopped.status"); else sig=$(stat -c '%s:%Y' "$state/stopped.status"); fi
   printf '%s' "$sig" > "$state/.seen-stopped_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key stopped)
   pane_hash=$(hash_text "idle prompt, finished")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -403,6 +405,12 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = concurrency-bound ]; then
   test_process_bound_under_simulated_slow_host
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = watcher-state-key ]; then
+  test_stale_enqueue_before_suppressor
+  test_not_working_stale_enqueue_before_suppressor
   exit 0
 fi
 

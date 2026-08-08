@@ -415,8 +415,35 @@ classify_unknown() {  # <reason>
 # Seen:     state/.subsuper-seen-status-<task>  last status line the scan
 #           escalated, so the catch-all does not re-fire the same terminal.
 
-_stale_key() { printf '%s' "$1" | tr ':/.' '___'; }
 _task_marker_key() { fm_marker_task_key "$1"; }
+
+_watcher_marker_key() {
+  local state=$1 win=$2 task=$3
+  fm_marker_migrate_watcher_state "$state" "$task" "$win" >/dev/null 2>&1 || return 1
+  fm_marker_task_key "$task"
+}
+
+marker_unknown_retry_path() {
+  local state=$1 kind=$2 key=$3 retry_key
+  retry_key=$(fm_marker_identity_key "$kind:$key") || return 1
+  printf '%s/.subsuper-unknown-retry-%s' "$state" "$retry_key"
+}
+
+marker_unknown_retry_clear() {
+  local retry
+  retry=$(marker_unknown_retry_path "$1" "$2" "$3") || return 1
+  rm -f "$retry"
+}
+
+marker_unknown_escalate() {
+  local state=$1 kind=$2 key=$3 cadence=$4 item=$5 retry token buf
+  retry=$(marker_unknown_retry_path "$state" "$kind" "$key") || return 1
+  [ "$(_file_age "$retry")" -ge "$cadence" ] || return 0
+  token="[unknown-marker=$kind:$key]"
+  buf="$state/.subsuper-escalations"
+  grep -Fq -- "$token" "$buf" 2>/dev/null || escalate_add "$state" "$item $token"
+  _now > "$retry"
+}
 
 marker_meta_is_safe() {
   [ -f "$1/$2.meta" ] && [ ! -L "$1/$2.meta" ]
@@ -511,7 +538,7 @@ pause_marker_remove() {  # <window> <state>
 clear_pause_tracking() {  # <window> <state>
   local win=$1 state=$2 task watcher_key
   task=$(window_to_task "$win" "$state")
-  watcher_key=$(_stale_key "$win")
+  watcher_key=$(_watcher_marker_key "$state" "$win" "$task") || return 1
   marker_remove_owned "$state" "$task" paused || true
   marker_remove_owned "$state" "$task" stale || true
   rm -f \
@@ -524,7 +551,7 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line>
   task=$(window_to_task "$win" "$state")
   key=$(_task_marker_key "$task")
   marker="$state/.subsuper-paused-$key"
-  watcher_key=$(_stale_key "$win")
+  watcher_key=$(_watcher_marker_key "$state" "$win" "$task") || return 1
   if status_is_paused "$last"; then
     stale_marker_remove "$win" "$state"
     pause_marker_record "$win" "$state"
@@ -541,7 +568,7 @@ migrate_watcher_pause_markers() {  # <state>
     [ -n "$win" ] || continue
     task=$(basename "$meta"); task=${task%.meta}
     key=$(_task_marker_key "$task")
-    watcher_key=$(_stale_key "$win")
+    watcher_key=$(_watcher_marker_key "$state" "$win" "$task") || continue
     last=$(last_status_line "$state/$task.status")
     if status_is_paused "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
       reconcile_pause_tracking "$win" "$state" "$last"
@@ -1006,7 +1033,7 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  3) heartbeat scan: every HEARTBEAT_SCAN_SECS, grep state/*.status for a
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
-  local state=$1 now due f key task win marker age last max_defer oldest pause_secs i
+  local state=$1 now due f key legacy_key task win marker age last max_defer oldest pause_secs i
   local cache baseline threshold class evidence observations observation capture capture_rc
   local -a stale_markers=()
   local -a stale_tasks=()
@@ -1055,21 +1082,28 @@ housekeeping() {  # <state>
   for marker in "$state"/.subsuper-stale-*; do
     [ -e "$marker" ] || continue
     key="${marker##*.subsuper-stale-}"
+    legacy_key=$key
     task=$(fm_marker_task_for_key "$state" "$key" 2>/dev/null || true)
     if [ -n "$task" ] && [ "$key" != "$(fm_marker_task_key "$task" 2>/dev/null || true)" ]; then
       marker=$(marker_migrate_owned "$state" "$task" stale 2>/dev/null || true)
-      if [ -n "$marker" ]; then key=${marker##*.subsuper-stale-}; else task=; fi
+      if [ -n "$marker" ]; then
+        key=${marker##*.subsuper-stale-}
+        marker_unknown_retry_clear "$state" stale "$legacy_key" 2>/dev/null || true
+      else
+        task=
+      fi
     fi
     if [ -n "$task" ]; then win=$(window_for_task "$task" "$state" 2>/dev/null || true); else win=; fi
     if [ -z "$win" ]; then
       age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
       threshold=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}
       if [ "$age" -ge "$threshold" ]; then
-        escalate_add "$state" "stale endpoint attribution UNKNOWN after ${age}s; backend target or metadata is unreadable: task-key=$key"
-        [ -z "$task" ] || marker_refresh_owned "$state" "$task" stale "$marker" 2>/dev/null || true
+        marker_unknown_escalate "$state" stale "$key" "$threshold" \
+          "stale endpoint attribution UNKNOWN after ${age}s; backend target or metadata is unreadable: task-key=$key" || true
       fi
       continue
     fi
+    marker_unknown_retry_clear "$state" stale "$key" 2>/dev/null || true
     last=$(last_status_line "$state/$task.status")
     if [ -n "$last" ] && status_is_paused "$last"; then
       reconcile_pause_tracking "$win" "$state" "$last"
@@ -1157,20 +1191,27 @@ housekeeping() {  # <state>
   for marker in "$state"/.subsuper-paused-*; do
     [ -e "$marker" ] || continue
     key="${marker##*.subsuper-paused-}"
+    legacy_key=$key
     task=$(fm_marker_task_for_key "$state" "$key" 2>/dev/null || true)
     if [ -n "$task" ] && [ "$key" != "$(fm_marker_task_key "$task" 2>/dev/null || true)" ]; then
       marker=$(marker_migrate_owned "$state" "$task" paused 2>/dev/null || true)
-      if [ -n "$marker" ]; then key=${marker##*.subsuper-paused-}; else task=; fi
+      if [ -n "$marker" ]; then
+        key=${marker##*.subsuper-paused-}
+        marker_unknown_retry_clear "$state" paused "$legacy_key" 2>/dev/null || true
+      else
+        task=
+      fi
     fi
     if [ -n "$task" ]; then win=$(window_for_task "$task" "$state" 2>/dev/null || true); else win=; fi
     if [ -z "$win" ]; then
       age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
       if [ "$age" -ge "$pause_secs" ]; then
-        escalate_add "$state" "paused endpoint attribution UNKNOWN after ${age}s; backend target or metadata is unreadable: task-key=$key"
-        [ -z "$task" ] || marker_refresh_owned "$state" "$task" paused "$marker" 2>/dev/null || true
+        marker_unknown_escalate "$state" paused "$key" "$pause_secs" \
+          "paused endpoint attribution UNKNOWN after ${age}s; backend target or metadata is unreadable: task-key=$key" || true
       fi
       continue
     fi
+    marker_unknown_retry_clear "$state" paused "$key" 2>/dev/null || true
     last=$(last_status_line "$state/$task.status")
     if [ -z "$last" ] || ! status_is_paused "$last"; then
       reconcile_pause_tracking "$win" "$state" "$last"

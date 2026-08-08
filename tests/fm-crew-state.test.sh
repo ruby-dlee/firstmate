@@ -72,8 +72,15 @@ case "${1:-}" in
     case "${1:-}" in
       status)
         shift
-        if [ "${1:-}" = --run ]; then printf '%s\n' "${FM_FAKE_AXI_STATUS_RUN:-}"
-        else printf '%s\n' "${FM_FAKE_AXI_STATUS:-}"; fi ;;
+        if [ "${1:-}" = --run ]; then
+          printf '%s\n' "${FM_FAKE_AXI_STATUS_RUN:-}"
+        else
+          case "${FM_FAKE_AXI_STATUS_MODE:-ok}" in
+            fail) exit 9 ;;
+            timeout) sleep 30 ;;
+          esac
+          printf '%s\n' "${FM_FAKE_AXI_STATUS:-}"
+        fi ;;
       logs)
         printf '%s\n' "${FM_FAKE_CI_LOGS:-}" ;;
     esac
@@ -250,6 +257,7 @@ new_case() {  # <name> -> echoes case dir with an empty state/
 # command-substitution assignment (SC2155).
 reset_fakes() {
   FM_FAKE_AXI_STATUS=""
+  FM_FAKE_AXI_STATUS_MODE=ok
   FM_FAKE_AXI_STATUS_RUN=""
   FM_FAKE_RUNS_LIST=""
   FM_FAKE_BUSY=0
@@ -264,7 +272,7 @@ reset_fakes() {
   FM_FAKE_REMOTE_COMMIT_HEAD=abc1234cafebabeabc1234cafebabeabc1234caf
   FM_FAKE_REMOTE_COMMIT_FAIL=0
   FM_FAIL_ON_LOCAL_COMMIT_LOOKUP=0
-  export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_TMUX_MISSING
+  export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_MODE FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_TMUX_MISSING
   export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS
   export FM_FAKE_PR_STATE FM_FAKE_PR_HEAD FM_FAKE_GH_AXI_FAIL
   export FM_FAKE_REMOTE_COMMIT_HEAD FM_FAKE_REMOTE_COMMIT_FAIL FM_FAIL_ON_LOCAL_COMMIT_LOOKUP
@@ -1546,6 +1554,57 @@ test_no_run_idle_pane_paused() {
   pass "no run + idle pane on a paused: status reports state: paused with its reason"
 }
 
+test_unreadable_run_lookup_rejects_pause() {
+  reset_fakes
+  local d out
+  d=$(new_case unreadable-run-paused)
+  make_repo_on_branch "$d/wt" fm/unreadable-run-paused
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/unreadable-run-paused.meta" \
+    "window=fm:fm-unreadable-run-paused" "worktree=$d/wt" "kind=ship"
+  printf 'paused: awaiting release; owner=release team; clears=release artifact is published\n' \
+    > "$d/state/unreadable-run-paused.status"
+  FM_FAKE_AXI_STATUS='not a run status response'
+  FM_FAKE_BUSY=0
+  out=$(run_crew_state "$d" unreadable-run-paused)
+  assert_contains "$out" "state: unknown" "malformed run lookup -> unknown"
+  assert_contains "$out" "run lookup unavailable" "malformed run lookup names the unavailable proof"
+  assert_not_contains "$out" "state: paused" "malformed run lookup trusted a stale pause"
+
+  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_AXI_STATUS_MODE=fail
+  out=$(run_crew_state "$d" unreadable-run-paused)
+  assert_contains "$out" "state: unknown" "failed run lookup -> unknown"
+  assert_not_contains "$out" "state: paused" "failed run lookup trusted a stale pause"
+
+  FM_FAKE_AXI_STATUS_MODE=ok
+  FM_FAKE_AXI_STATUS="$(run_running fm/some-other)"
+  FM_FAKE_RUNS_LIST='not a runs-list row'
+  out=$(run_crew_state "$d" unreadable-run-paused)
+  assert_contains "$out" "state: unknown" "malformed runs-list fallback -> unknown"
+  assert_not_contains "$out" "state: paused" "malformed runs-list fallback trusted a stale pause"
+  pass "unreadable run discovery cannot authorize a status-log pause"
+}
+
+test_timed_out_run_lookup_rejects_pause() {
+  reset_fakes
+  local d out
+  d=$(new_case timed-out-run-paused)
+  make_repo_on_branch "$d/wt" fm/timed-out-run-paused
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/timed-out-run-paused.meta" \
+    "window=fm:fm-timed-out-run-paused" "worktree=$d/wt" "kind=ship"
+  printf 'paused: awaiting release; owner=release team; clears=release artifact is published\n' \
+    > "$d/state/timed-out-run-paused.status"
+  FM_FAKE_AXI_STATUS_MODE=timeout
+  FM_FAKE_BUSY=0
+  out=$(FM_CREW_STATE_NM_TIMEOUT=1 run_crew_state "$d" timed-out-run-paused)
+  assert_contains "$out" "state: unknown" "timed-out run lookup -> unknown"
+  assert_contains "$out" "run lookup unavailable" "timed-out run lookup names the unavailable proof"
+  assert_not_contains "$out" "state: paused" "timed-out run lookup trusted a stale pause"
+  pass "timed-out run discovery cannot authorize a status-log pause"
+}
+
 test_no_run_idle_pane_custom_paused_verb() {
   reset_fakes
   local d; d=$(new_case custom-paused)
@@ -1737,8 +1796,8 @@ SH
   start=$SECONDS
   out=$(FM_FAKE_NM_CALLS="$calls_file" PATH="$d/fakebin:$toolbin" FM_STATE_OVERRIDE="$d/state" FM_CREW_STATE_NM_TIMEOUT=1 "$CREW_STATE" feat-timeout)
   elapsed=$((SECONDS - start))
-  assert_contains "$out" "state: working" "timed-out no-mistakes falls back to pane"
-  assert_contains "$out" "source: pane" "timed-out no-mistakes -> pane source"
+  assert_contains "$out" "state: unknown" "timed-out no-mistakes remains unknown"
+  assert_contains "$out" "run lookup unavailable" "timed-out no-mistakes names the unavailable proof"
   [ "$elapsed" -lt 5 ] || fail "perl timeout did not bound no-mistakes calls (elapsed ${elapsed}s)"
   calls=$(awk 'END { print NR + 0 }' "$calls_file" 2>/dev/null || echo 0)
   [ "$calls" -eq 1 ] || fail "empty no-mistakes status triggered extra lookups ($calls calls)"
@@ -1856,6 +1915,17 @@ if [ "${FM_TEST_FOCUSED:-}" = state-consumer-regressions ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = run-discovery ]; then
+  test_matching_run_state_overrides_pause
+  test_cross_branch_attribution_via_runs_list
+  test_other_branch_run_ignored
+  test_no_run_idle_pane_paused
+  test_unreadable_run_lookup_rejects_pause
+  test_timed_out_run_lookup_rejects_pause
+  test_no_timeout_uses_perl_bound
+  exit 0
+fi
+
 test_active_run_is_authoritative
 test_quiet_step_reports_dead_liveness
 test_quiet_step_reports_alive_liveness
@@ -1908,6 +1978,8 @@ test_empty_run_lookup_rejects_checks_green_log
 test_skipped_run_lookup_rejects_checks_green_log
 test_no_run_idle_pane_uses_keyed_log
 test_no_run_idle_pane_paused
+test_unreadable_run_lookup_rejects_pause
+test_timed_out_run_lookup_rejects_pause
 test_no_run_idle_pane_custom_paused_verb
 test_supervisor_read_separates_paused_wedged_unknown
 test_no_run_idle_secondmate_resolved_event_not_state

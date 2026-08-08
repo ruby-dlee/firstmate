@@ -5312,7 +5312,7 @@ if [ "$ORCA_CLEANUP_PENDING" = 1 ]; then
   pending_orca_endpoint_absent || exit 1
   fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" remove_pending_orca_worktree_locked || exit 1
   remove_grok_turnend_auth "$STATE" "$ID"
-  fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
+  fm_backend_clear_transition "$BACKEND" "$STATE" "$T" "$ID" "$ACCOUNT_DELETE_LOCK" || true
   safe_remove_task_tmp "$TASK_TMP" || exit 1
   fm_marker_cleanup_owned "$STATE" "$ID" || exit 1
   rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log"
@@ -5799,7 +5799,7 @@ if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then
     exit 1
   fi
   fm_account_meta_lock_release "$direct_spawn_restore_lock" || exit 1
-  fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
+  fm_backend_clear_transition "$BACKEND" "$STATE" "$T" "$ID" "$ACCOUNT_DELETE_LOCK" || true
   [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
   echo "cleaned failed direct spawn for $ID and restored the prior task generation"
   exit 0
@@ -5840,7 +5840,10 @@ EOF
   PREPARED_REGISTRY_LOCK=
 fi
 remove_grok_turnend_auth "$STATE" "$ID"
-fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
+fm_backend_clear_transition "$BACKEND" "$STATE" "$T" "$ID" "$ACCOUNT_DELETE_LOCK" || {
+  echo "error: transition state custody could not be cleared for $ID" >&2
+  exit 1
+}
 # Remove the exact recorded per-generation task temp root, including gotmp.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -z "$TASK_TMP" ] || safe_remove_task_tmp "$TASK_TMP" || exit 1

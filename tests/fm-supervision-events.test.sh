@@ -31,7 +31,9 @@ sleep() { printf 'SLEEP\n' >> "$SLEEP_LOG"; }
 reset_state() {
   rm -f "$STATE_DIR"/*.meta "$STATE_DIR"/*.status "$STATE_DIR"/.wake-queue \
     "$STATE_DIR"/.wake-queue.seq "$STATE_DIR"/.watch-triage.log \
-    "$STATE_DIR"/.herdr-escalated-* "$TMP"/panes "$TMP"/wtcalls "$TMP"/wtcalled 2>/dev/null || true
+    "$STATE_DIR"/.herdr-escalated-* "$STATE_DIR"/.marker-owner-* \
+    "$STATE_DIR"/.paused-* "$STATE_DIR"/.hash-* \
+    "$TMP"/panes "$TMP"/wtcalls "$TMP"/wtcalled 2>/dev/null || true
   : > "$WAKE_LOG"
   : > "$SLEEP_LOG"
   _event_cap_key=""
@@ -43,32 +45,40 @@ mkrec() {  # <pane_id> <status>
   fm_transition_record "$1" "wG" "" "$2" claude
 }
 
+transition_marker() {
+  printf '%s/.herdr-escalated-%s' "$STATE_DIR" "$(fm_marker_identity_key "$1")"
+}
+
 # --- handle_push_transition: enqueue + wake for a non-paused blocked crewmate ---
 
 reset_state
 fm_write_meta "$STATE_DIR/tk1.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+MARKER=$(transition_marker default:wG:pQ)
 handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
 [ -e "$STATE_DIR/.wake-queue" ] || fail "handle_push_transition should enqueue a wake for a blocked crew"
 grep -q 'stale' "$STATE_DIR/.wake-queue" || fail "the enqueued wake must be a stale record: $(cat "$STATE_DIR/.wake-queue")"
 grep -q 'default:wG:pQ' "$STATE_DIR/.wake-queue" || fail "the stale record must name the crew's window"
 grep -q 'herdr: agent blocked' "$STATE_DIR/.wake-queue" || fail "the stale payload must name the herdr-blocked cause"
 [ -s "$WAKE_LOG" ] || fail "handle_push_transition must wake the supervisor for a blocked crew"
-[ -e "$STATE_DIR/.herdr-escalated-default_wG_pQ" ] || fail "handle_push_transition must commit dedupe only after enqueue"
+[ -e "$MARKER" ] || fail "handle_push_transition must commit dedupe only after enqueue"
 pass "handle_push_transition: a blocked crew enqueues a stale wake naming its window and wakes the supervisor"
 
 reset_state
 fm_write_meta "$STATE_DIR/tk1.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+MARKER=$(transition_marker default:wG:pQ)
 (
   fm_wake_append() { return 1; }
   handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
 ) >/dev/null 2>&1 || true
-[ ! -e "$STATE_DIR/.herdr-escalated-default_wG_pQ" ] || fail "a failed durable enqueue must leave the blocked edge eligible for reconnect reconciliation"
+[ ! -e "$MARKER" ] || fail "a failed durable enqueue must leave the blocked edge eligible for reconnect reconciliation"
 pass "handle_push_transition: enqueue failure cannot commit the Herdr dedupe marker"
 
 # --- handle_push_transition: absorb (no wake, no enqueue) for a declared pause -
 
 reset_state
 fm_write_meta "$STATE_DIR/tk2.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+MARKER=$(transition_marker default:wG:pQ)
+PAUSED_KEY=$(fm_marker_task_key tk2)
 printf 'paused: waiting on the upstream release\n' > "$STATE_DIR/tk2.status"
 handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
 if [ -e "$STATE_DIR/.wake-queue" ] && grep -q 'stale' "$STATE_DIR/.wake-queue"; then
@@ -76,8 +86,8 @@ if [ -e "$STATE_DIR/.wake-queue" ] && grep -q 'stale' "$STATE_DIR/.wake-queue"; 
 fi
 [ ! -s "$WAKE_LOG" ] || fail "a declared-pause crew must not wake the supervisor from the event fast-path"
 grep -q 'absorbed push' "$STATE_DIR/.watch-triage.log" 2>/dev/null || fail "the paused absorb should be logged to the triage log"
-[ -e "$STATE_DIR/.paused-default_wG_pQ" ] || fail "the paused event path must create the shared pause marker"
-[ -e "$STATE_DIR/.herdr-escalated-default_wG_pQ" ] || fail "the paused event path must commit the handled transition"
+[ -e "$STATE_DIR/.paused-$PAUSED_KEY" ] || fail "the paused event path must create the shared pause marker"
+[ -e "$MARKER" ] || fail "the paused event path must commit the handled transition"
 pass "handle_push_transition: a declared-pause crew enters the shared pause cadence without a fast wake"
 
 # --- event_wait_or_sleep: secondmate windows are excluded from the pane list --

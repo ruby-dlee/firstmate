@@ -4038,9 +4038,16 @@ herdr_escalation_marker_path() {
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_escalation_marker "$1" "$2"' "$ROOT" "$1" "$2"
 }
 
+write_herdr_transition_meta() {
+  fm_write_meta "$1/$2.meta" "window=$3" "backend=herdr" "kind=ship"
+}
+
 test_escalation_marker_keys_are_collision_free() {
   local m dotted underscored dir state legacy old
   dir="$TMP_ROOT/escalation-marker-identity"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
+  write_herdr_transition_meta "$state" lane-dot default:lane.a
+  write_herdr_transition_meta "$state" lane-under default:lane_a
   m=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   [ "$m" = "$state/.herdr-escalated-v3-04338efa3648e18b33e36e474752ba667ef492615b96e5d6577485dcb31891a5" ] \
     || fail "escalation marker did not encode the exact window identity, got '$m'"
@@ -4048,6 +4055,7 @@ test_escalation_marker_keys_are_collision_free() {
   underscored=$(herdr_escalation_marker_path "$state" default:lane_a)
   [ "$dotted" != "$underscored" ] || fail "distinct Herdr window identities shared an escalation marker"
   dir="$TMP_ROOT/escalation-marker-v2"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
   legacy=$(printf '%s' default:wG:pQ | od -An -tx1 | tr -d ' \n')
   old="$state/.herdr-escalated-v2-$legacy"
   printf 'handled\n' > "$old"
@@ -4057,9 +4065,58 @@ test_escalation_marker_keys_are_collision_free() {
   pass "fm_backend_herdr_escalation_marker is collision-free for exact window identities"
 }
 
+test_escalation_marker_migrates_uniquely_owned_pre_v2_state() {
+  local dir state old marker
+  dir="$TMP_ROOT/escalation-marker-pre-v2"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-dot default:lane.a
+  old="$state/.herdr-escalated-default_lane_a"
+  printf 'handled\n' > "$old"
+  marker=$(herdr_escalation_marker_path "$state" default:lane.a)
+  [ -e "$marker" ] || fail "uniquely owned pre-v2 Herdr state did not migrate"
+  [ ! -e "$old" ] || fail "uniquely owned pre-v2 Herdr state remained after migration"
+  pass "Herdr transition state migrates uniquely owned pre-v2 carriers"
+}
+
+test_escalation_marker_retains_ambiguous_pre_v2_state() {
+  local dir state old key marker rc
+  dir="$TMP_ROOT/escalation-marker-pre-v2-ambiguous"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-dot default:lane.a
+  write_herdr_transition_meta "$state" lane-under default:lane_a
+  old="$state/.herdr-escalated-default_lane_a"
+  printf 'handled\n' > "$old"
+  key=$(bash -c '. "$0/bin/fm-marker-state-lib.sh"; fm_marker_identity_key "$1"' "$ROOT" default:lane.a)
+  marker="$state/.herdr-escalated-$key"
+  herdr_escalation_marker_path "$state" default:lane.a >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "ambiguous pre-v2 Herdr state was attributed to one sibling"
+  [ -e "$old" ] || fail "ambiguous pre-v2 Herdr state was not retained visibly"
+  [ ! -e "$marker" ] || fail "ambiguous pre-v2 Herdr state created an exact suppressor"
+  pass "ambiguous pre-v2 Herdr transition state remains fail-closed and visible"
+}
+
+test_escalation_marker_quarantines_unsafe_pre_v2_state() {
+  local dir state old marker sentinel rc
+  dir="$TMP_ROOT/escalation-marker-pre-v2-unsafe"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-dot default:lane.a
+  old="$state/.herdr-escalated-default_lane_a"
+  sentinel="$dir/sentinel"
+  printf 'preserve-me\n' > "$sentinel"
+  ln -s "$sentinel" "$old"
+  marker=$(bash -c '. "$0/bin/fm-marker-state-lib.sh"; printf "%s/.herdr-escalated-%s" "$1" "$(fm_marker_identity_key "$2")"' \
+    "$ROOT" "$state" default:lane.a)
+  herdr_escalation_marker_path "$state" default:lane.a >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "unsafe pre-v2 Herdr state authorized exact attribution"
+  [ "$(cat "$sentinel")" = preserve-me ] || fail "unsafe pre-v2 Herdr migration followed its symlink"
+  [ ! -L "$old" ] || fail "unsafe pre-v2 Herdr state was not quarantined"
+  [ ! -e "$marker" ] || fail "unsafe pre-v2 Herdr state created an exact suppressor"
+  find "$state" -path '*/carrier' -type l -print -quit | grep . >/dev/null \
+    || fail "unsafe pre-v2 Herdr state was not retained visibly in quarantine"
+  pass "unsafe pre-v2 Herdr transition state is quarantined without attribution"
+}
+
 test_escalation_marker_rejects_adversarial_owner_substitution() {
   local dir state rec key owner marker out rc
   dir="$TMP_ROOT/escalation-owner-substitution"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
   rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
   marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec"
@@ -4079,6 +4136,7 @@ test_escalation_marker_rejects_adversarial_owner_substitution() {
 test_escalation_marker_refuses_symlink_carriers() {
   local dir state rec marker sentinel out rc
   dir="$TMP_ROOT/escalation-marker-symlink"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
   rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
   marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   sentinel="$dir/sentinel"
@@ -4101,9 +4159,54 @@ test_escalation_marker_refuses_symlink_carriers() {
   pass "Herdr transition markers quarantine symlinks without following targets"
 }
 
+test_transition_commit_refuses_teardown_and_window_reuse_races() {
+  local dir state rec marker ready release observed holder commit_pid
+  dir="$TMP_ROOT/escalation-marker-lifecycle"; state="$dir/state"; mkdir -p "$state"
+  ready="$dir/holder.ready"; release="$dir/holder.release"; observed="$dir/commit.waiting"
+  write_herdr_transition_meta "$state" lane-old default:wG:pQ
+  rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3" "$4"' \
+    "$ROOT" "$state" default "$rec" lane-old || fail "lifecycle setup commit failed"
+  (
+    . "$ROOT/bin/backends/herdr.sh"
+    lock=$(fm_account_lifecycle_lock_acquire "$state" lane-old) || exit 1
+    : > "$ready"
+    while [ ! -e "$release" ]; do sleep 0.02; done
+    fm_backend_herdr_clear_transition "$state" default:wG:pQ lane-old "$lock" || exit 1
+    rm -f "$state/lane-old.meta"
+    fm_account_lifecycle_lock_release "$lock"
+  ) &
+  holder=$!
+  fm_test_wait_for_file "$ready" "$holder" || fail "teardown race holder did not acquire lifecycle custody"
+  FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_ACCOUNT_LOCK_WAIT_TEST_OBSERVED="$observed" \
+    FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=5 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3" "$4"' \
+      "$ROOT" "$state" default "$rec" lane-old >/dev/null 2>&1 &
+  commit_pid=$!
+  fm_test_wait_for_file "$observed" "$commit_pid" || fail "racing commit did not wait on lifecycle custody"
+  : > "$release"
+  wait "$holder" || fail "teardown race holder failed"
+  if wait "$commit_pid"; then
+    fail "commit recreated transition state after teardown removed metadata"
+  fi
+  [ ! -e "$marker" ] || fail "post-teardown commit recreated the retired marker"
+  write_herdr_transition_meta "$state" lane-new default:wG:pQ
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3" "$4"' \
+    "$ROOT" "$state" default "$rec" lane-old >/dev/null 2>&1 \
+    && fail "retired task committed against a reassigned Herdr window"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3" "$4"' \
+    "$ROOT" "$state" default "$rec" lane-new || fail "reassigned Herdr window rejected its exact current task"
+  [ -e "$marker" ] || fail "exact current task did not commit the reassigned window marker"
+  pass "Herdr commits refuse post-teardown recreation and stale window reuse"
+}
+
 test_apply_transition_blocked_requires_commit_to_dedupe() {
   local dir state rec out rc marker
   dir="$TMP_ROOT/apply-blocked"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
   rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
   marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec"); rc=$?
@@ -4122,6 +4225,7 @@ test_apply_transition_blocked_requires_commit_to_dedupe() {
 test_apply_transition_working_clears_marker() {
   local dir state blocked working marker rc
   dir="$TMP_ROOT/apply-working"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
   marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   blocked=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
   working=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" working claude' "$ROOT")
@@ -4139,6 +4243,7 @@ test_apply_transition_working_clears_marker() {
 test_clear_transition_removes_task_marker() {
   local dir state marker
   dir="$TMP_ROOT/clear-transition"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
   marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   : > "$marker"
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2"' "$ROOT" "$state" default:wG:pQ
@@ -4149,6 +4254,7 @@ test_clear_transition_removes_task_marker() {
 test_apply_transition_defer_and_fallback_are_noops() {
   local dir state marker rc s
   dir="$TMP_ROOT/apply-defer"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
   marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   for s in idle "done" unknown ""; do
     local rec
@@ -4170,6 +4276,7 @@ test_wait_transition_no_panes_returns_2() {
 test_wait_transition_not_capable_returns_2() {
   local dir state fb rc
   dir="$TMP_ROOT/wt-incapable"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   rc=$(PATH="$fb:$PATH" FM_BACKEND_HERDR_EVENTS_FORCE=0 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_wait_transition sess 1 "$1" sess:wG:pQ; echo $?' "$ROOT" "$state" | tail -1)
@@ -4180,6 +4287,7 @@ test_wait_transition_not_capable_returns_2() {
 test_wait_transition_reconcile_blocked_returns_record() {
   local dir state agent temp fb reader lines out rc marker
   dir="$TMP_ROOT/wt-reconcile"; state="$dir/state"; agent="$dir/agents"; temp="$dir/temp"; mkdir -p "$state" "$agent" "$temp"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" blocked
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"; : > "$lines"
@@ -4197,6 +4305,7 @@ test_wait_transition_reconcile_blocked_returns_record() {
 test_wait_transition_subscribes_before_reconcile() {
   local dir state agent fb reader lines ready rc
   dir="$TMP_ROOT/wt-subscribe-first"; state="$dir/state"; agent="$dir/agents"; mkdir -p "$state" "$agent"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" idle
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"; ready="$dir/subscribed"; : > "$lines"
@@ -4210,6 +4319,7 @@ test_wait_transition_subscribes_before_reconcile() {
 test_wait_transition_reconcile_dedupes_when_marked() {
   local dir state agent fb rc marker
   dir="$TMP_ROOT/wt-reconcile-dedupe"; state="$dir/state"; agent="$dir/agents"; mkdir -p "$state" "$agent"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" blocked
   # Pre-mark: this blocked was already escalated.
@@ -4228,6 +4338,7 @@ test_wait_transition_reconcile_dedupes_when_marked() {
 test_wait_transition_stream_blocked_returns_record() {
   local dir state agent fb reader lines out rc marker
   dir="$TMP_ROOT/wt-stream-blocked"; state="$dir/state"; agent="$dir/agents"; mkdir -p "$state" "$agent"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" idle   # reconcile sees idle -> proceeds to stream
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"
@@ -4245,6 +4356,7 @@ test_wait_transition_stream_blocked_returns_record() {
 test_wait_transition_stream_absorb_clears_then_timeout() {
   local dir state agent fb reader lines rc marker
   dir="$TMP_ROOT/wt-stream-absorb"; state="$dir/state"; agent="$dir/agents"; mkdir -p "$state" "$agent"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" idle
   marker=$(herdr_escalation_marker_path "$state" sess:wG:pQ)
@@ -4265,6 +4377,7 @@ test_wait_transition_stream_absorb_clears_then_timeout() {
 test_wait_transition_reader_failure_returns_2() {
   local dir state agent temp fb reader lines rc
   dir="$TMP_ROOT/wt-reader-fail"; state="$dir/state"; agent="$dir/agents"; temp="$dir/temp"; mkdir -p "$state" "$agent" "$temp"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" idle
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"; : > "$lines"
@@ -4279,6 +4392,7 @@ test_wait_transition_reader_failure_returns_2() {
 test_wait_transition_bad_ack_returns_2_and_cleans_up() {
   local dir state agent temp fb reader lines result rc fd_open
   dir="$TMP_ROOT/wt-bad-ack"; state="$dir/state"; agent="$dir/agents"; temp="$dir/temp"; mkdir -p "$state" "$agent" "$temp"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" idle
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"; : > "$lines"
@@ -4295,6 +4409,7 @@ test_wait_transition_bad_ack_returns_2_and_cleans_up() {
 test_wait_transition_clean_timeout_returns_1() {
   local dir state agent temp fb reader lines result rc fd_open
   dir="$TMP_ROOT/wt-timeout"; state="$dir/state"; agent="$dir/agents"; temp="$dir/temp"; mkdir -p "$state" "$agent" "$temp"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" idle
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"; : > "$lines"   # no events, reader exits 0
@@ -4400,8 +4515,12 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = transition-marker-identity ]; then
   test_escalation_marker_keys_are_collision_free
+  test_escalation_marker_migrates_uniquely_owned_pre_v2_state
+  test_escalation_marker_retains_ambiguous_pre_v2_state
+  test_escalation_marker_quarantines_unsafe_pre_v2_state
   test_escalation_marker_rejects_adversarial_owner_substitution
   test_escalation_marker_refuses_symlink_carriers
+  test_transition_commit_refuses_teardown_and_window_reuse_races
   test_apply_transition_blocked_requires_commit_to_dedupe
   test_apply_transition_working_clears_marker
   test_clear_transition_removes_task_marker
@@ -4523,8 +4642,12 @@ test_scripts_route_explicit_target_through_meta_backend
 test_events_capable_consumes_schema_without_broken_pipe
 test_normalize_event_leaves_from_empty
 test_escalation_marker_keys_are_collision_free
+test_escalation_marker_migrates_uniquely_owned_pre_v2_state
+test_escalation_marker_retains_ambiguous_pre_v2_state
+test_escalation_marker_quarantines_unsafe_pre_v2_state
 test_escalation_marker_rejects_adversarial_owner_substitution
 test_escalation_marker_refuses_symlink_carriers
+test_transition_commit_refuses_teardown_and_window_reuse_races
 test_apply_transition_blocked_requires_commit_to_dedupe
 test_apply_transition_working_clears_marker
 test_clear_transition_removes_task_marker

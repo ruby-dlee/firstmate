@@ -82,6 +82,8 @@ mkdir -p "$STATE"
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-marker-state-lib.sh
 . "$SCRIPT_DIR/fm-marker-state-lib.sh"
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$SCRIPT_DIR/fm-account-routing-lib.sh"
 # Shared normalized-transition accessors and the single-owner status->action
 # policy table, so the event-wait splice reads transition records the same way
 # the herdr subscriber writes them (bin/fm-transition-lib.sh).
@@ -1049,28 +1051,48 @@ event_wait_or_sleep() {
 # machinery already understands it (queued by key=window, so a later poll-path
 # stale for the same pane collapses on drain).
 handle_push_transition() {  # <backend> <session> <record>
-  local backend=$1 session=$2 record=$3 pane_id to window task key h reason
+  local backend=$1 session=$2 record=$3 pane_id to window task exact_task lock key h reason
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
   window="$session:$pane_id"
   task=$(window_to_task "$window" "$STATE")
-  migrate_watcher_state "$window" "$task" || { sleep 1; return 1; }
+  lock=$(fm_account_lifecycle_lock_acquire "$STATE" "$task") || { sleep 1; return 1; }
+  exact_task=$(fm_backend_transition_task "$backend" "$STATE" "$window" 2>/dev/null || true)
+  if [ "$exact_task" != "$task" ] || ! migrate_watcher_state "$window" "$task"; then
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+    sleep 1
+    return 1
+  fi
   if status_is_paused "$(last_status_line "$STATE/$task.status")"; then
     # The durable status is the trusted gate on this native edge. Commit the
     # handled transition, then enter the shared pause path so it owns the marker
     # and bounded re-surface cadence even when no auxiliary crew-state read exists.
-    key=$(watcher_state_key "$window" "$task") || return 1
+    key=$(watcher_state_key "$window" "$task") || {
+      fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+      return 1
+    }
     h=$(cat "$STATE/.hash-$key" 2>/dev/null || true)
-    fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
+    fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" "$task" "$lock" || {
+      fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+      exit 1
+    }
+    fm_account_lifecycle_lock_release "$lock" || exit 1
     handle_paused_stale "$window" "$task" "$h"
     triage_log "absorbed push $to (declared pause, awaiting external): $window"
     return
   fi
   reason="stale: $window (herdr: agent $to - waiting on human, escalated immediately, not via wedge timer)"
-  fm_wake_append stale "$window" "$reason" || exit 1
-  fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
+  fm_wake_append stale "$window" "$reason" || {
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+    exit 1
+  }
+  fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" "$task" "$lock" || {
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+    exit 1
+  }
   mark_surfaced "$STATE/$task.status"
+  fm_account_lifecycle_lock_release "$lock" || exit 1
   wake "$reason"
 }
 

@@ -4431,6 +4431,8 @@ SH
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" \
     || fail "herdr-marker-cleanup: forced teardown failed: $(cat "$case_dir/stderr")"
   [ ! -e "$marker" ] || fail "herdr-marker-cleanup: teardown left the pane's escalation marker behind"
+  [ -z "$(find "$case_dir/state" -maxdepth 1 \( -name '.herdr-escalated-*' -o -name '.marker-owner-herdr-transition-*' \) -print -quit)" ] \
+    || fail "herdr-marker-cleanup: teardown left migrated transition custody behind"
   pass "herdr teardown removes pane-owned escalation dedupe state"
 }
 

@@ -35,6 +35,9 @@
 #      on checks" from "checks green, waiting on merge" (see nm_ci_checks_state),
 #      so a ci-step log-tail marker supplies the ready claim before the same
 #      remote-currentness checks decide whether it is done.
+#      A narrow orphan-record fallback reports a declared pause only when a
+#      checks-green report immediately precedes it, the ci log has no newer state,
+#      and the liveness probe specifically cannot find that run's worktree.
 #   3. Reconcile the status log: if its last line says needs-decision/blocked but
 #      the run-step shows the run moved on, the log is deterministically stale and
 #      is flagged superseded. A genuinely parked run plus a needs-decision log
@@ -433,6 +436,22 @@ log_reports_ci_ready() {
   esac
 }
 
+# True only for the exact CI-ready-to-declared-hold transition. Requiring the
+# checks-green report to be the immediately preceding non-empty event prevents an
+# old ready line from surviving a later working/fixing transition and disguising
+# genuinely resumed work as paused.
+log_reports_ci_ready_immediately_before_pause() {
+  local previous
+  status_is_paused "$LOG_LINE" || return 1
+  [ -f "$LOG" ] || return 1
+  previous=$(grep -v '^[[:space:]]*$' "$LOG" 2>/dev/null | tail -2 | head -1)
+  [ "$(status_line_verb "$previous")" = "done" ] || return 1
+  case "$(status_line_note "$previous")" in
+    *PR*"checks green"*|*"checks green"*PR*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 nm_ci_step_status() {
   local row rest
   row=$(printf '%s\n' "$RUN_OUT" | grep -E '^[[:space:]]*ci,[[:space:]]*"?(running|fixing)"?[[:space:]]*,' | head -1)
@@ -654,6 +673,19 @@ nm_step_liveness() {
   printf '%s' "$line"
 }
 
+# A missing run worktree is an unreadable liveness observation, never a death
+# verdict and never permission to abort a run. This predicate uses that exact
+# observation only as corroboration for the independent CI-ready report and current
+# declared pause checked by the caller.
+nm_ci_record_has_no_worktree() {
+  local observation
+  observation=$(nm_step_liveness)
+  case "$observation" in
+    unknown\ \(grade:\ unreadable\;\ 0\ procs\;\ *no\ worktree\ for\ this\ run*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 nm_runs_status_for_branch() {  # <branch>
   local branch=$1 out row st rest br head pr field
   out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
@@ -824,6 +856,20 @@ if [ "$HAVE_RUN" = 1 ]; then
     fi
   fi
 
+  # An orphaned ci row is not positive working evidence forever. This fallback is
+  # intentionally conjunctive: the durable ready report must immediately precede
+  # the current declared pause, the ci log must be unreadable rather than showing a
+  # re-arm/fix, and the bounded liveness probe must specifically find no worktree
+  # for this run. The unreadable probe is corroboration only. On its own, or beside
+  # any positive working evidence, ordinary run-step precedence remains unchanged.
+  if [ "$RUN_STATE" = working ] && [ "$RUN_SOURCE" = full ] \
+     && [ "$CI_STEP_STATUS" = running ] && [ "$CI_LOG_STATE" = unknown ] \
+     && log_reports_ci_ready_immediately_before_pause \
+     && nm_ci_record_has_no_worktree; then
+    emit paused status-log \
+      "$(status_line_note "$LOG_LINE")${SEP}reported checks green immediately before pause${SEP}orphaned ci run record has no worktree"
+  fi
+
   if [ "$RUN_STATE" = "done" ] && [ "$READY_CLAIM" = 1 ]; then
     if [ "$RUN_SOURCE" = full ] && [ "$RUN_STATUS" = completed ]; then
       verify_no_newer_active_run_or_emit "$CREW_BRANCH"
@@ -836,9 +882,10 @@ if [ "$HAVE_RUN" = 1 ]; then
   # leaving it to a hand check that gets it wrong. The verdict is APPENDED as an
   # observation and never overrides RUN_STATE: a step momentarily between
   # processes would otherwise be misreported as dead, which is the very failure
-  # mode this exists to end. The ci step is excluded because its monitoring runs
-  # inside the daemon with no worktree process at all, so `dead` there is
-  # meaningless rather than informative.
+  # mode this exists to end. The ordinary ci path is excluded because its monitoring
+  # runs inside the daemon with no worktree process at all, so `dead` there is
+  # meaningless rather than informative. The narrow orphan-record check above uses
+  # only the distinct missing-worktree observation and never treats it as dead.
   if [ "$RUN_STATE" = working ] && [ "$RUN_SOURCE" = full ] && nm_step_is_quiet; then
     ACTIVE_STEP=$(nm_active_step_name)
     case "$ACTIVE_STEP" in

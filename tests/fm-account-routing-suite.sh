@@ -3154,6 +3154,51 @@ test_enforced_orca_is_rejected_before_owned_resource_creation() {
   pass "enforced account routing refuses Orca before creating owned resources"
 }
 
+# A continuation launch runs the recorded prompt through python3, and python3 is
+# firstmate's command, not the project's. A provisioning manifest can lead the
+# crewmate's PATH with its own directory - a pyenv shim, a virtualenv bin - so
+# the interpreter that carries the prompt must be named by the path firstmate
+# resolved for itself, never by a name that directory could answer.
+test_continuation_prompt_interpreter_is_not_repointed_by_a_runtime_pin() {
+  local id rec out status launch
+  id=account-continue-pin-z21e
+  rec=$(make_case continue-pin claude "$id")
+  read_case "$rec"
+  mkdir -p "$CASE_DIR/pinned-bin" "$HOME_DIR/config/provision"
+  printf '#!/bin/sh\nexit 0\n' > "$CASE_DIR/pinned-bin/python3"
+  chmod +x "$CASE_DIR/pinned-bin/python3"
+  cat > "$HOME_DIR/config/provision/project.json" <<JSON
+{
+  "kinds": ["ship"],
+  "path_prepend": ["$CASE_DIR/pinned-bin"],
+  "components": [
+    { "name": "declared", "probes": [ { "name": "present", "argv": ["true"] } ] }
+  ]
+}
+JSON
+  out=$(FM_FAKE_AF_PROVIDER=claude FM_FAKE_AF_PROFILE=claude-2 FM_FAKE_AF_POOL=claude-crew \
+    run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
+  status=$?
+  [ "$status" -eq 0 ] || fail "pinned-runtime continuation precondition spawn failed: $out"
+  rm -f "$CASE_DIR/endpoint-live"
+  clear_case_logs
+  out=$(FM_FAKE_AF_PROVIDER=claude FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
+    run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -eq 0 ] || fail "pinned-runtime continuation failed: $out"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "fm-prompt-exec.py" "continuation did not use the prompt transport at all"
+  case "$launch" in
+    *"$CASE_DIR/pinned-bin/python3"*)
+      fail "the manifest's pinned directory named the continuation interpreter: $launch" ;;
+  esac
+  case "$launch" in
+    *"/python3'"*|*"/python3 "*) ;;
+    *) fail "the continuation interpreter must be an absolute path firstmate resolved: $launch" ;;
+  esac
+  pass "a runtime pin cannot repoint the interpreter that carries a continuation prompt"
+}
+
 test_cross_profile_continuation_for_harness() {
   local harness=$1 old_profile=$2 new_profile=$3 provider=$4 id rec old_task new_task new_attempt packet canonical out status launch source_model
   id="account-continue-$harness-z21"
@@ -6819,6 +6864,7 @@ run_isolated_test test_explicit_secondmate_profile_ignores_configured_pool
 run_isolated_test test_enforced_orca_is_rejected_before_owned_resource_creation
 run_isolated_test test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
 run_isolated_test test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+run_isolated_test test_continuation_prompt_interpreter_is_not_repointed_by_a_runtime_pin
 run_isolated_test test_cross_provider_continuation_uses_target_default_pool claude codex
 run_isolated_test test_cross_provider_continuation_uses_target_default_pool codex claude
 run_isolated_test test_continuation_refuses_unknown_endpoint_state

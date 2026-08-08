@@ -377,9 +377,12 @@ Names and `description` are labels and do not expand, and no value is implicitly
 That handover only happens for a `ready` verdict.
 Without it, provisioning could build a project under its pinned runtime while the crewmate's shell still resolved a different one, which is precisely the drift that had npm delegating a native build to an unpinned node.
 A manifest-level `path_prepend` entry must already be a directory and may not contain a space or single quote because it is also transported into that exported `PATH`; component-level entries affect only that component's provisioning steps.
-A published pin leads the crewmate's `PATH`, so it can carry any command name, including a harness name: a pinned Node prefix is exactly where a globally npm-installed `claude` or `codex` lives.
-It never decides which binary the harness name means, because a spawn that publishes a pin launches the harness by the absolute path Firstmate resolved from its own `PATH` before the pin existed, and refuses to launch a harness it could not resolve that way.
+A published pin leads the crewmate's `PATH`, so it can carry any command name: a pinned Node prefix is exactly where a globally npm-installed `claude` or `codex` lives, and a pyenv shim or virtualenv prefix carries `python3`.
+It never decides which binary any command Firstmate itself names resolves to, because a spawn that publishes a pin names every one of them by the absolute path Firstmate resolved from its own `PATH` before the pin existed.
+That covers the harness, the first word of a raw launch command, the interpreter that carries a recorded continuation prompt, and the shell a harness turn-end hook runs.
 The pin still wins for the project's own tools, which is the whole point of declaring it.
+A launch command Firstmate cannot pin that way is refused before a worktree is leased and before any install runs, so the refusal never costs a lease; the refusal names the command word it could not resolve.
+A raw launch command is pinnable when its first word is a plain command name on Firstmate's own `PATH`, or already carries a path, which `PATH` cannot repoint.
 A component's `env` may not set `PATH`; use `path_prepend`, so a manifest cannot route around its own runtime checks.
 
 `runtime_checks` run before anything is built, so a component is never compiled or installed under the wrong runtime.
@@ -400,7 +403,8 @@ This strict-descendant invariant structurally prevents `.`, `sub/..`, an empty v
 Automatic provisioning applies to new or recorded non-Orca ship and scout worktrees; secondmate and Orca launches do not use this seam.
 `bin/fm-spawn.sh` takes `--provision` to force provisioning for one spawn, including for a kind the manifest excludes and rebuilding rather than reusing a matching fingerprint, and `--no-provision` to skip it entirely.
 Both apply to every pair of a batch spawn.
-An opted-in project whose provisioner cannot be run at all, such as one whose file lost its executable bit, is a provisioning failure governed by that manifest's `on_failure` rather than a silent skip, so `block` still refuses the spawn.
+An opted-in project whose provisioner cannot be run at all, whether the file is missing or has lost its executable bit, is a provisioning failure governed by that manifest's `on_failure` rather than a silent skip, so `block` still refuses the spawn.
+Where a project's manifest lives is asked of `bin/fm-provision.sh`, which owns that answer, and derived locally only when the provisioner itself is unavailable, so a broken provisioner can never make an opted-in project look like one that never opted in.
 With `--task`, the verdict is written to `state/<id>.provision` and the full step log to `state/<id>.provision.log`, both removed by teardown.
 A leased worktree is re-proven clean, isolated, and still at its expected detached tip after provisioning has written into it and before the endpoint is created, using the same predicate the return path applies.
 Residue an install step left behind is therefore a provisioning failure under the manifest's own policy: it is loud and durable at dispatch, and no agent is launched onto a base that is no longer proven.

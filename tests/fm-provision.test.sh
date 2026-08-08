@@ -897,6 +897,24 @@ sent_launch_line() {
   awk -F '\t' '$2 ~ /--dangerously-skip-permissions/ { print $2 }' "$1" | head -n 1
 }
 
+sent_line_containing() {
+  awk -F '\t' -v needle="$2" 'index($2, needle) { print $2 }' "$1" | head -n 1
+}
+
+# A provisioner file that is absent rather than merely unrunnable. Firstmate must
+# still be able to tell that this project opted in, which is why the manifest
+# path has an answer that does not come from the provisioner.
+make_absent_provisioner_bin() {
+  local case_dir=$1 bin entry
+  bin="$case_dir/absent-root/bin"
+  mkdir -p "$bin"
+  for entry in "$ROOT"/bin/*; do
+    ln -s "$entry" "$bin/$(basename "$entry")"
+  done
+  rm -f "$bin/fm-provision.sh"
+  printf '%s\n' "$bin"
+}
+
 # A provisioner that is present but has lost its exec bit. Firstmate still has to
 # be able to tell that this project opted in, and under block it must refuse.
 make_unrunnable_provisioner_bin() {
@@ -954,6 +972,123 @@ test_spawn_launches_the_harness_by_the_path_firstmate_resolved() {
       fail "the manifest's pinned directory must not name the harness binary: $launch" ;;
   esac
   pass "a published runtime pin cannot repoint the harness the spawn launches"
+}
+
+# The raw launch command is the documented unverified-adapter escape hatch, and
+# its first word is resolved by the pane shell against the same pinned PATH. It
+# gets the same absolute-path treatment the harness name does.
+test_spawn_pins_a_raw_launch_commands_first_word() {
+  local rec id out launch
+  id=provision-raw-pin-pf
+  rec=$(make_spawn_case raw-pin "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+  fm_fake_exit0 "$FAKEBIN_DIR" crewtool
+  printf '#!/bin/sh\nexit 0\n' > "$CASE_DIR/pinned-bin/crewtool"
+  chmod +x "$CASE_DIR/pinned-bin/crewtool"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" \
+    --harness 'crewtool --go')
+  expect_code 0 "$?" "a raw launch command must still spawn under a runtime pin: $out"
+  launch=$(sent_line_containing "$SEND_LOG" crewtool)
+  assert_contains "$launch" "$FAKEBIN_DIR/crewtool" \
+    "the raw launch command's first word must be the path firstmate resolved: $launch"
+  assert_contains "$launch" "--go" "the rest of the raw launch command must be untouched: $launch"
+  case "$launch" in
+    *"$CASE_DIR/pinned-bin/crewtool"*)
+      fail "the manifest's pinned directory must not name the launched binary: $launch" ;;
+  esac
+  pass "a raw launch command's first word is pinned exactly as a harness name is"
+}
+
+# Whether the command can be pinned is knowable from the manifest and firstmate's
+# own PATH alone, so refusing must not cost a lease and an install first.
+test_spawn_refuses_an_unpinnable_raw_launch_before_leasing() {
+  local rec id out
+  id=provision-raw-unpinnable-pg
+  rec=$(make_spawn_case raw-unpinnable "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" \
+    --harness 'crewtool-does-not-exist --go')
+  expect_code 1 "$?" "an unpinnable raw launch command must not spawn under a pin: $out"
+  assert_contains "$out" "crewtool-does-not-exist" "the refusal must name the word it could not resolve"
+  assert_contains "$out" "before leasing a worktree" "the refusal must say it happened before the lease"
+  assert_absent "$CASE_DIR/acquired-worktree" \
+    "a refusal that could be decided up front must not cost a Treehouse lease"
+  assert_absent "$HOME_DIR/state/$id.provision" "nothing may be provisioned for a refused spawn"
+  assert_absent "$HOME_DIR/state/$id.meta" "an unpinnable launch must not record a live task"
+  pass "an unpinnable raw launch command is refused before a lease is taken"
+}
+
+# The codex turn-end hook runs bash, and bash is firstmate's command, not the
+# project's. A pinned directory carrying its own bash must not answer for it.
+test_spawn_pins_the_turn_end_shell_under_a_runtime_pin() {
+  local rec id out launch
+  id=provision-notify-pin-ph
+  rec=$(make_spawn_case notify-pin "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+  fm_fake_exit0 "$FAKEBIN_DIR" codex
+  printf '#!/bin/sh\nexit 0\n' > "$CASE_DIR/pinned-bin/bash"
+  chmod +x "$CASE_DIR/pinned-bin/bash"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" --harness codex)
+  expect_code 0 "$?" "a codex spawn should not be disturbed by a runtime pin: $out"
+  launch=$(sent_line_containing "$SEND_LOG" 'notify=')
+  assert_contains "$launch" 'notify=[\"/' \
+    "the turn-end hook must name an absolute shell, not a bare name: $launch"
+  case "$launch" in
+    *"$CASE_DIR/pinned-bin/bash"*)
+      fail "the manifest's pinned directory must not name the turn-end shell: $launch" ;;
+  esac
+  pass "the turn-end hook's shell is pinned like every other command firstmate names"
+}
+
+test_spawn_fails_closed_when_the_provisioner_is_missing() {
+  local rec id out bin
+  id=provision-absent-block-pi
+  rec=$(make_spawn_case absent-block "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR" '.on_failure = "block"'
+  bin=$(make_absent_provisioner_bin "$CASE_DIR")
+
+  out=$(SPAWN_CMD="$bin/fm-spawn.sh" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
+  expect_code 1 "$?" "a missing provisioner must not launch under block: $out"
+  assert_contains "$out" "WORKTREE PROVISIONING FAILED" "the refusal should be unmissable"
+  assert_contains "$out" "is missing" "the banner should say the provisioner is missing"
+  assert_absent "$HOME_DIR/state/$id.meta" \
+    "a block project must not launch a crewmate into an unprovisioned worktree"
+  assert_grep 'is missing' "$HOME_DIR/state/$id.provision" \
+    "a missing provisioner must leave a durable verdict like any other failure"
+  pass "a missing provisioner is a policy-governed failure, not a silent skip"
+}
+
+test_spawn_warn_policy_survives_a_missing_provisioner() {
+  local rec id out bin path_line
+  id=provision-absent-warn-pj
+  rec=$(make_spawn_case absent-warn "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+  bin=$(make_absent_provisioner_bin "$CASE_DIR")
+
+  out=$(SPAWN_CMD="$bin/fm-spawn.sh" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
+  expect_code 0 "$?" "the warn default must still launch when the provisioner is missing: $out"
+  assert_contains "$out" "WORKTREE PROVISIONING FAILED" "a missing provisioner must be loud even under warn"
+  assert_contains "$out" "continuing" "the banner should say the spawn continued"
+  assert_present "$HOME_DIR/state/$id.meta" "a warn-policy missing provisioner still launches the task"
+  assert_grep 'is missing' "$HOME_DIR/state/$id.provision" \
+    "the warn path must record the missing provisioner durably too"
+  assert_grep 'Provisioning this worktree FAILED' "$HOME_DIR/data/$id/brief.md" \
+    "the crewmate must be told it cannot validate locally"
+  path_line=$(exported_path "$SEND_LOG")
+  case "$path_line" in
+    *"$CASE_DIR/pinned-bin"*) fail "a missing provisioner must not pin a runtime: $path_line" ;;
+  esac
+  pass "the warn default continues loudly when the provisioner is missing"
 }
 
 test_spawn_fails_closed_when_the_provisioner_cannot_be_run() {
@@ -1221,7 +1356,12 @@ test_task_record_and_log_are_written
 test_manifest_path_resolution
 test_spawn_pins_the_proven_runtime_into_the_crew_path
 test_spawn_launches_the_harness_by_the_path_firstmate_resolved
+test_spawn_pins_a_raw_launch_commands_first_word
+test_spawn_refuses_an_unpinnable_raw_launch_before_leasing
+test_spawn_pins_the_turn_end_shell_under_a_runtime_pin
 test_spawn_fails_closed_when_the_provisioner_cannot_be_run
+test_spawn_fails_closed_when_the_provisioner_is_missing
+test_spawn_warn_policy_survives_a_missing_provisioner
 test_spawn_continues_loudly_when_provisioning_warns
 test_spawn_aborts_when_the_project_declares_block
 test_spawn_no_provision_opt_out

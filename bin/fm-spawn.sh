@@ -2482,7 +2482,7 @@ launch_template() {
       if [ "$kind" = secondmate ]; then
         printf '%s' '__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(cat __BRIEF__)"'
       else
-        printf '%s' '__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(cat __BRIEF__)"'
+        printf '%s' '__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"__BASHBIN__\",\"-c\",\"touch __TURNEND__\"]" "$(cat __BRIEF__)"'
       fi
       ;;
     opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' __AGENT__ __MODELFLAG__--prompt "$(cat __BRIEF__)"' ;;
@@ -2529,14 +2529,62 @@ launch_template() {
   esac
 }
 
+# spawn_own_path_bin <name>: the absolute executable <name> resolves to on
+# FIRSTMATE's own PATH. `type -P` is a PATH lookup only, so a shell function or
+# alias of the same name cannot answer for the binary.
+spawn_own_path_bin() {
+  local found
+  found=$(type -P "$1" 2>/dev/null || true)
+  case "$found" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  [ -x "$found" ] || return 1
+  printf '%s' "$found"
+}
+
+# spawn_split_raw_launch <command>: split a raw launch command into its leading
+# VAR=value assignments, the command word itself, and the untouched remainder.
+# Splitting rather than re-joining is what lets the command word be replaced
+# without rewriting a single byte the operator typed around it.
+RAW_LAUNCH_PREFIX=
+RAW_LAUNCH_WORD=
+RAW_LAUNCH_REST=
+spawn_split_raw_launch() {
+  local rest=$1 lead token
+  RAW_LAUNCH_PREFIX=
+  RAW_LAUNCH_WORD=
+  RAW_LAUNCH_REST=
+  while [ -n "$rest" ]; do
+    lead=${rest%%[![:space:]]*}
+    if [ -n "$lead" ]; then
+      RAW_LAUNCH_PREFIX="$RAW_LAUNCH_PREFIX$lead"
+      rest=${rest#"$lead"}
+      continue
+    fi
+    token=${rest%%[[:space:]]*}
+    case "$token" in
+      [A-Za-z_]*=*)
+        RAW_LAUNCH_PREFIX="$RAW_LAUNCH_PREFIX$token"
+        rest=${rest#"$token"}
+        continue
+        ;;
+    esac
+    RAW_LAUNCH_WORD=$token
+    RAW_LAUNCH_REST=${rest#"$token"}
+    return 0
+  done
+  return 1
+}
+
 case "$ARG3" in
   *' '*)  # raw launch command (unverified-adapter escape hatch)
     LAUNCH=$ARG3
     RAW_LAUNCH=1
     HARNESS=""
-    for word in $LAUNCH; do
-      case "$word" in [A-Za-z_]*=*) continue ;; *) HARNESS=$(basename "$word"); break ;; esac
-    done
+    if spawn_split_raw_launch "$LAUNCH"; then
+      HARNESS=$(basename "$RAW_LAUNCH_WORD")
+    fi
     ;;
   '')
     # No explicit harness: resolve from config. A secondmate AGENT launches on the
@@ -2566,27 +2614,58 @@ case "$ARG3" in
     ;;
 esac
 
-# The harness binary as FIRSTMATE resolves it, pinned here - at harness
-# selection, before worktree provisioning has run and therefore before any
-# manifest-supplied directory can reach a PATH this spawn composes or exports.
-# The pane shell resolves a bare command name against the PATH it is handed, and
-# a provisioning manifest may put its own directory at the head of that PATH, so
-# a bare name is a name the manifest could answer: a pinned node prefix carries
-# exactly the globally npm-installed CLIs (`claude`, `codex`) a harness name
-# matches. Resolving here rather than at launch is what makes the ordering
-# structural instead of incidental - a refactor that moved provisioning earlier
-# would leave this empty rather than silently resolving through the manifest, and
-# an empty value refuses to launch (see build_launch_command). `type -P` is a
-# PATH lookup only, so a shell function or alias of the same name cannot answer
-# for the binary either.
+# Every command firstmate itself will NAME in a launch line is resolved to an
+# absolute path here - at harness selection, before a worktree is leased, before
+# provisioning runs, and therefore before any manifest-supplied directory can
+# reach a PATH this spawn composes or exports. The pane shell resolves a bare
+# command name against the PATH it is handed, and a provisioning manifest may put
+# its own directory at the head of that PATH, so a bare name is a name the
+# manifest could answer: a pinned node prefix carries exactly the globally
+# npm-installed CLIs (`claude`, `codex`) a harness name matches, and a pyenv shim
+# or virtualenv prefix carries `python3`. Resolving here rather than at launch is
+# what makes the ordering structural instead of incidental - a refactor that moved
+# provisioning earlier would leave these empty rather than silently resolving
+# through the manifest, and an empty value refuses to launch.
+#
+# LAUNCH_PIN_REFUSAL records WHY the launch command could not be pinned, so the
+# refusals that consult it report what actually happened rather than asserting
+# the outcome of a lookup that may never have run. A raw launch command whose
+# first word already carries a slash is not PATH-resolved at all, so it is left
+# exactly as the operator wrote it and needs no pin.
 HARNESS_BIN=
-if [ "$RAW_LAUNCH" != 1 ] && [ -n "$HARNESS" ]; then
-  HARNESS_BIN=$(type -P "$HARNESS" 2>/dev/null || true)
-  case "$HARNESS_BIN" in
-    /*) [ -x "$HARNESS_BIN" ] || HARNESS_BIN= ;;
-    *) HARNESS_BIN= ;;
-  esac
+RAW_LAUNCH_BIN=
+PYTHON3_BIN=
+BASH_BIN=
+LAUNCH_PIN_REFUSAL=
+if [ "$RAW_LAUNCH" = 1 ]; then
+  if [ -z "$RAW_LAUNCH_WORD" ]; then
+    LAUNCH_PIN_REFUSAL="the raw launch command names no command word to resolve"
+  else
+    case "$RAW_LAUNCH_WORD" in
+      */*) ;;
+      *[!A-Za-z0-9._+-]*)
+        LAUNCH_PIN_REFUSAL="the raw launch command begins with '$RAW_LAUNCH_WORD', which is not a plain command name, so firstmate cannot resolve it to one binary"
+        ;;
+      *)
+        RAW_LAUNCH_BIN=$(spawn_own_path_bin "$RAW_LAUNCH_WORD") \
+          || LAUNCH_PIN_REFUSAL="the raw launch command's first word '$RAW_LAUNCH_WORD' is not an executable on firstmate's own PATH"
+        ;;
+    esac
+  fi
+elif [ -n "$HARNESS" ]; then
+  HARNESS_BIN=$(spawn_own_path_bin "$HARNESS") \
+    || LAUNCH_PIN_REFUSAL="the '$HARNESS' harness is not an executable on firstmate's own PATH"
+else
+  LAUNCH_PIN_REFUSAL="this spawn resolved no harness name to look up"
 fi
+PYTHON3_BIN=$(spawn_own_path_bin python3) || PYTHON3_BIN=
+BASH_BIN=$(spawn_own_path_bin bash) || BASH_BIN=
+# The bash path is embedded in a JSON string inside a double-quoted shell word
+# (codex's notify hook), so a path carrying a quote or a backslash cannot be
+# transported there even though it exists.
+case "$BASH_BIN" in
+  *'"'*|*'\'*|*"'"*) BASH_BIN= ;;
+esac
 
 # config/secondmate-harness may carry optional model/effort tokens alongside the
 # harness ("<harness> [<model>] [<effort>]"). They apply only when this is a
@@ -3155,6 +3234,85 @@ fi
 PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_ABS"
 PROJ_ABS=$PROJ_ABS_REAL
 
+# Whether this project can publish a runtime pin is knowable from its manifest
+# alone, and so is whether every command firstmate will name in the launch line
+# resolved. Deciding both HERE - before the Treehouse lease and before any
+# install runs - is the difference between a refusal that costs nothing and one
+# that strands a dirty lease the pool then has to skip. The manifest read is the
+# same one the provisioner would do, and it is answered without the provisioner
+# so a broken provisioner cannot make an opted-in project look untouched.
+# fm-provision owns where a project's manifest lives, so the path is asked of it
+# rather than rebuilt here. --manifest-path is a pure path computation with no
+# side effects, and it is asked through the interpreter rather than through the
+# provisioner's exec bit on purpose: a provisioner that lost that bit must look
+# like a broken provisioner, which the resolved policy then governs, and never
+# like a project that never opted in. Running the provisioner still requires the
+# bit.
+#
+# spawn_provision_manifest_derived is the same derivation fm-provision.sh's
+# manifest_for_project applies, kept here as a FALLBACK for the one question the
+# provisioner cannot answer: where the manifest is when the provisioner itself is
+# gone. Without it a missing file is indistinguishable from a project that never
+# opted in, and an opted-in project would fail OPEN under block for the file's
+# absence rather than for anything about the project. Keep it in step with
+# manifest_for_project; docs/configuration.md owns the location.
+spawn_provision_manifest_derived() {
+  local name
+  name=$(basename "$PROJ_ABS") || return 1
+  [ -n "$name" ] || return 1
+  printf '%s/provision/%s.json\n' "$CONFIG" "$name"
+}
+
+spawn_provision_manifest_path() {
+  local path=''
+  if [ -f "$SCRIPT_DIR/fm-provision.sh" ]; then
+    path=$("${BASH:-bash}" "$SCRIPT_DIR/fm-provision.sh" --manifest-path "$PROJ_ABS" 2>/dev/null) || path=
+  fi
+  [ -n "$path" ] || path=$(spawn_provision_manifest_derived) || return 1
+  [ -n "$path" ] || return 1
+  printf '%s\n' "$path"
+}
+
+spawn_project_manifest_may_pin() {
+  local manifest
+  manifest=$(spawn_provision_manifest_path) || return 1
+  [ -n "$manifest" ] && [ -f "$manifest" ] || return 1
+  if jq -e '(.path_prepend | if type == "array" then (length > 0) else . != null end)' \
+    "$manifest" >/dev/null 2>&1; then
+    return 0
+  fi
+  # A manifest that cannot be parsed is treated as one that could pin, so an
+  # unreadable file never buys a launch a readable one would refuse.
+  jq -e . "$manifest" >/dev/null 2>&1 || return 0
+  return 1
+}
+
+spawn_refuse_unpinnable_launch() {
+  local blocker=''
+  [ "$PROVISION_MODE" != off ] || return 0
+  [ "$KIND" != secondmate ] || return 0
+  [ "$BACKEND" != orca ] || return 0
+  spawn_project_manifest_may_pin || return 0
+  blocker=$LAUNCH_PIN_REFUSAL
+  if [ -z "$blocker" ] && [ "$CONTINUE_ACCOUNT" = 1 ] && [ -z "$PYTHON3_BIN" ]; then
+    blocker="python3, which carries this task's recorded continuation prompt, is not an executable on firstmate's own PATH"
+  fi
+  if [ -z "$blocker" ]; then
+    case "$LAUNCH" in
+      *__BASHBIN__*)
+        [ -n "$BASH_BIN" ] \
+          || blocker="bash, which this harness's turn-end hook runs, did not resolve on firstmate's own PATH to a path this launch line can carry"
+        ;;
+    esac
+  fi
+  [ -n "$blocker" ] || return 0
+  echo "error: refusing to spawn fm-$ID before leasing a worktree: $(basename "$PROJ_ABS")'s provisioning manifest declares path_prepend, which leads the crewmate's PATH, and $blocker" >&2
+  echo "       a manifest-supplied directory must never decide which binary a launch line runs, so every command firstmate names is pinned to an absolute path first" >&2
+  return 1
+}
+
+spawn_refuse_unpinnable_launch || exit 1
+
 real_path_or_raw() {  # <path>
   local path=$1 real
   if real=$(cd "$path" 2>/dev/null && pwd -P); then
@@ -3386,16 +3544,9 @@ spawn_retire_provision_evidence() {
 # project's manifest lives, so the path is asked of it rather than rebuilt here;
 # the absent-manifest default stays exactly one file-existence check away from
 # skipping, which is what leaves every non-opted-in project untouched.
-# --manifest-path is a pure path computation with no side effects, and it is
-# asked through the interpreter rather than through the provisioner's exec bit on
-# purpose: a provisioner that lost that bit must look like a broken provisioner,
-# which the policy below then governs, and never like a project that never opted
-# in. Running the provisioner still requires the bit.
-spawn_provision_manifest_path() {
-  [ -f "$SCRIPT_DIR/fm-provision.sh" ] || return 1
-  "${BASH:-bash}" "$SCRIPT_DIR/fm-provision.sh" --manifest-path "$PROJ_ABS" 2>/dev/null
-}
-
+# spawn_provision_manifest_path, which answers where this project's manifest
+# lives, is defined with the pre-lease pin gate further up, because that gate is
+# the earliest caller.
 spawn_resolve_provision_policy() {
   local raw
   PROVISION_MANIFEST=
@@ -3486,9 +3637,12 @@ provision_worktree() {
       spawn_brief_provision_note "$verdict" ready
       return 0
     fi
-  else
+  elif [ -e "$SCRIPT_DIR/fm-provision.sh" ]; then
     status=126
     reason="the provisioner $SCRIPT_DIR/fm-provision.sh is not executable, so this project's declared environment could not be built or proven"
+  else
+    status=127
+    reason="the provisioner $SCRIPT_DIR/fm-provision.sh is missing, so this project's declared environment could not be built or proven"
   fi
   PROVISION_PATH_PREPEND=
   [ -n "$reason" ] || reason=$(printf '%s' "$verdict" | jq -r '.reason // ""' 2>/dev/null || true)
@@ -3896,25 +4050,65 @@ if [ "$RESUME_ACCOUNT" = 1 ]; then
   case "$HARNESS:$KIND" in
     claude:*) LAUNCH='CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false __AGENT__ --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__' ;;
     codex:secondmate) LAUNCH='__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox' ;;
-    codex:*) LAUNCH='__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]"' ;;
+    codex:*) LAUNCH='__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"__BASHBIN__\",\"-c\",\"touch __TURNEND__\"]"' ;;
     *) echo "error: managed recovery supports only claude and codex" >&2; exit 1 ;;
   esac
 fi
 # A published runtime pin leads the crewmate's PATH with a manifest-supplied
-# directory, so from here on the harness is named by the absolute path firstmate
-# resolved for itself BEFORE that pin existed. The pin still wins for the
-# project's own tools, which is what it is for, but it cannot decide which binary
-# the harness name means. Without a pin nothing outside firstmate's own PATH
-# order is in play and the bare name resolves exactly as it always has.
-# An unresolvable harness under a pin is refused rather than launched: that is
-# the one case where the name and the binary may genuinely disagree.
+# directory, so from here on every command firstmate names is named by the
+# absolute path firstmate resolved for itself BEFORE that pin existed - the
+# harness, the raw launch command's own first word, the interpreter that carries
+# a continuation prompt, and the shell a turn-end hook runs. The pin still wins
+# for the project's own tools, which is what it is for, but it cannot decide
+# which binary any of those names means. Without a pin nothing outside
+# firstmate's own PATH order is in play and the bare names resolve exactly as
+# they always have.
+#
+# The pre-lease gate has already refused an unpinnable launch for any project
+# whose manifest declares path_prepend, so reaching this with a refusal recorded
+# means the pin arrived from somewhere that gate could not see. It is still
+# fail-closed here, and it reports the recorded reason rather than asserting one.
+LAUNCH_PINNED=0
+[ -z "$PROVISION_PATH_PREPEND" ] || LAUNCH_PINNED=1
 HARNESS_WORD=$HARNESS
-if [ -n "$PROVISION_PATH_PREPEND" ]; then
-  if [ -z "$HARNESS_BIN" ]; then
-    echo "error: refusing to launch fm-$ID with a provisioning runtime pin ahead of PATH because the '$HARNESS' harness could not be resolved to an absolute executable from firstmate's own PATH" >&2
+PYTHON3_WORD=python3
+BASH_WORD=bash
+if [ "$LAUNCH_PINNED" = 1 ]; then
+  if [ -n "$LAUNCH_PIN_REFUSAL" ]; then
+    echo "error: refusing to launch fm-$ID with a provisioning runtime pin ahead of PATH because $LAUNCH_PIN_REFUSAL" >&2
     exit 1
   fi
-  HARNESS_WORD=$(shell_quote "$HARNESS_BIN")
+  if [ "$RAW_LAUNCH" = 1 ]; then
+    if [ -n "$RAW_LAUNCH_BIN" ]; then
+      spawn_split_raw_launch "$LAUNCH" || {
+        echo "error: refusing to launch fm-$ID because its raw launch command no longer names a command word to pin" >&2
+        exit 1
+      }
+      [ "$RAW_LAUNCH_WORD" = "$(basename "$RAW_LAUNCH_BIN")" ] || {
+        echo "error: refusing to launch fm-$ID because its raw launch command's first word changed from '$(basename "$RAW_LAUNCH_BIN")' to '$RAW_LAUNCH_WORD' after it was resolved" >&2
+        exit 1
+      }
+      LAUNCH="$RAW_LAUNCH_PREFIX$(shell_quote "$RAW_LAUNCH_BIN")$RAW_LAUNCH_REST"
+    fi
+  else
+    HARNESS_WORD=$(shell_quote "$HARNESS_BIN")
+  fi
+  if [ "$CONTINUE_ACCOUNT" = 1 ]; then
+    [ -n "$PYTHON3_BIN" ] || {
+      echo "error: refusing to launch fm-$ID with a provisioning runtime pin ahead of PATH because python3, which carries its recorded continuation prompt, is not an executable on firstmate's own PATH" >&2
+      exit 1
+    }
+    PYTHON3_WORD=$PYTHON3_BIN
+  fi
+  case "$LAUNCH" in
+    *__BASHBIN__*)
+      [ -n "$BASH_BIN" ] || {
+        echo "error: refusing to launch fm-$ID with a provisioning runtime pin ahead of PATH because bash, which its turn-end hook runs, did not resolve on firstmate's own PATH to a path this launch line can carry" >&2
+        exit 1
+      }
+      BASH_WORD=$BASH_BIN
+      ;;
+  esac
 fi
 AGENT_COMMAND=$HARNESS_WORD
 if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
@@ -3981,13 +4175,14 @@ LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
 LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}
 LAUNCH=${LAUNCH//__PITURNEND__/$sq_piturnend}
 LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
+LAUNCH=${LAUNCH//__BASHBIN__/$BASH_WORD}
 if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")
   LAUNCH="env -u FM_ROOT_OVERRIDE -u FM_STATE_OVERRIDE -u FM_DATA_OVERRIDE -u FM_PROJECTS_OVERRIDE -u FM_CONFIG_OVERRIDE FM_HOME=$sq_home $LAUNCH"
 fi
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   continuation_launch_command=$LAUNCH
-  LAUNCH="$(shell_quote python3) $(shell_quote "$SCRIPT_DIR/fm-prompt-exec.py") $(shell_quote "$CONTINUATION_PROMPT_FILE") $(shell_quote "$CONTINUATION_PROMPT_DIR_ID") $(shell_quote "$CONTINUATION_PROMPT_FILE_ID") $(shell_quote "$CONTINUATION_PROMPT_CONTENT_ID") $(shell_quote "$continuation_launch_command")"
+  LAUNCH="$(shell_quote "$PYTHON3_WORD") $(shell_quote "$SCRIPT_DIR/fm-prompt-exec.py") $(shell_quote "$CONTINUATION_PROMPT_FILE") $(shell_quote "$CONTINUATION_PROMPT_DIR_ID") $(shell_quote "$CONTINUATION_PROMPT_FILE_ID") $(shell_quote "$CONTINUATION_PROMPT_CONTENT_ID") $(shell_quote "$continuation_launch_command")"
 fi
 }
 

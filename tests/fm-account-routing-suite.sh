@@ -5550,6 +5550,87 @@ EOF
   pass "account locks preserve maximum task identities across acquire, reclaim, and release"
 }
 
+test_account_lock_deadline_bounds_nested_custody() {
+  local case_dir state task lock mutation held start before after elapsed status lock_inode mutation_inode
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  case_dir="$TMP_ROOT/account-lock-deadline"
+  state="$case_dir/state"
+  task=$(printf '%0232d' 0)
+  mkdir -p "$state"
+
+  before=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "account lock creation deadline fixture could not read its start time"
+  held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task") \
+    || fail "zero-budget account lock creation refused an uncontended immediate attempt"
+  after=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "account lock creation deadline fixture could not read its end time"
+  elapsed=$((after - before))
+  [ "$elapsed" -lt 4 ] || fail "uncontended account lock creation exceeded its elapsed bound: ${elapsed}s"
+  fm_account_meta_lock_release "$held" || fail "account lock creation deadline fixture could not release custody"
+
+  lock=$(fm_account_lock_path "$state" "$task" account-meta) \
+    || fail "account lock deadline fixture could not resolve its bounded lock"
+  mutation=$(fm_account_lock_identity_mutation_path "$lock") \
+    || fail "account lock deadline fixture could not resolve its mutation boundary"
+  mkdir "$lock"
+  printf '1\nstale-owner\n' > "$lock/owner"
+  start=$(fm_account_process_start_time "$$") \
+    || fail "account lock deadline fixture could not read its live owner identity"
+  printf '%s\n%s\n' "$$" "$start" > "$mutation"
+  lock_inode=$(fm_account_path_inode "$lock") || fail "account lock deadline fixture could not pin its lock"
+  mutation_inode=$(fm_account_path_inode "$mutation") \
+    || fail "account lock deadline fixture could not pin its mutation boundary"
+  before=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "zero-budget account lock fixture could not read its start time"
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  after=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "zero-budget account lock fixture could not read its end time"
+  elapsed=$((after - before))
+  [ "$status" -ne 0 ] || fail "zero-budget account lock acquisition bypassed live mutation custody"
+  [ "$elapsed" -lt 4 ] || fail "zero-budget account lock acquisition incurred a nested wait: ${elapsed}s"
+  [ "$(fm_account_path_inode "$lock")" = "$lock_inode" ] \
+    || fail "zero-budget account lock acquisition changed dead lock state behind live mutation custody"
+  [ "$(fm_account_path_inode "$mutation")" = "$mutation_inode" ] \
+    || fail "zero-budget account lock acquisition changed live mutation custody"
+
+  before=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "live-mutation account lock fixture could not read its start time"
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  after=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "live-mutation account lock fixture could not read its end time"
+  elapsed=$((after - before))
+  [ "$status" -ne 0 ] || fail "bounded account lock acquisition bypassed live mutation custody"
+  [ "$elapsed" -lt 4 ] || fail "live mutation custody reset the account lock deadline: ${elapsed}s"
+  [ "$(fm_account_path_inode "$lock")" = "$lock_inode" ] \
+    || fail "bounded account lock acquisition changed lock state after its shared deadline"
+  [ "$(fm_account_path_inode "$mutation")" = "$mutation_inode" ] \
+    || fail "bounded account lock acquisition changed live mutation state after its shared deadline"
+
+  rm "$mutation"
+  printf '1\nstale-owner\n' > "$mutation"
+  before=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "dead-mutation account lock fixture could not read its start time"
+  held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task") \
+    || fail "zero-budget account lock acquisition refused immediate exact dead-owner reclaim"
+  after=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "dead-mutation account lock fixture could not read its end time"
+  elapsed=$((after - before))
+  [ "$elapsed" -lt 15 ] || fail "dead mutation reclaim exceeded the account lock elapsed bound: ${elapsed}s"
+  [ ! -e "$mutation" ] && [ ! -L "$mutation" ] \
+    || fail "dead mutation reclaim retained obsolete mutation custody"
+  fm_account_meta_lock_release "$held" || fail "dead-mutation account lock fixture could not release custody"
+  rm -rf "$case_dir"
+  pass "account lock deadlines bound creation, mutation waits, and reclaim"
+}
+
 test_ownerless_lock_marker_rejects_symlink_clobber() {
   local case_dir state lock marker outside out status
   case_dir="$TMP_ROOT/account-ownerless-marker"
@@ -6966,6 +7047,7 @@ if [ "${FM_TEST_FOCUSED:-}" = account-lock-compatibility ]; then
   run_isolated_test test_account_metadata_lock_serializes_exact_owners_without_overlap
   run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
   run_isolated_test test_account_locks_support_maximum_task_identity
+  run_isolated_test test_account_lock_deadline_bounds_nested_custody
   run_isolated_test test_account_lock_owner_controls_reject_symlinks
   run_isolated_test test_bounded_account_lock_reclaim_requires_exact_dead_owner
   exit 0
@@ -7341,6 +7423,7 @@ run_isolated_test test_continuation_rejects_metadata_ancestor_swap
 run_isolated_test test_account_metadata_lock_serializes_exact_owners_without_overlap
 run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
 run_isolated_test test_account_locks_support_maximum_task_identity
+run_isolated_test test_account_lock_deadline_bounds_nested_custody
 run_isolated_test test_ownerless_lock_marker_rejects_symlink_clobber
 run_isolated_test test_account_lock_owner_controls_reject_symlinks
 run_isolated_test test_bounded_account_lock_reclaim_requires_exact_dead_owner

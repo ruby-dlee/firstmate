@@ -942,8 +942,20 @@ fm_account_lock_identity_claim_under_mutation() {  # <state-dir> <task> <name> <
   printf '%s' "$lock"
 }
 
-fm_account_lock_identity_claim() {  # <state-dir> <task> <name>
-  local state=$1 task=$2 name=$3 wait_seconds=${4:-10} lock mutation result status
+fm_account_lock_deadline_from_wait() {  # <wait-seconds>
+  local wait_seconds=$1 now
+  case "$wait_seconds" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$FM_ACCOUNT_SYSTEM_DATE_BIN" ] || return 1
+  now=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) || return 1
+  printf '%s' "$((now + wait_seconds))"
+}
+
+fm_account_lock_identity_claim() {  # <state-dir> <task> <name> [deadline-epoch]
+  local state=$1 task=$2 name=$3 deadline=${4:-} lock mutation result status
+  if [ -z "$deadline" ]; then
+    deadline=$(fm_account_lock_deadline_from_wait 10) || return 1
+  fi
+  case "$deadline" in ''|*[!0-9]*) return 1 ;; esac
   lock=$(fm_account_lock_path "$state" "$task" "$name") || return 1
   if fm_account_lock_identity_validate "$lock" \
     && [ "$FM_ACCOUNT_LOCK_IDENTITY_NAME" = "$name" ] \
@@ -951,7 +963,7 @@ fm_account_lock_identity_claim() {  # <state-dir> <task> <name>
     printf '%s' "$lock"
     return 0
   fi
-  mutation=$(fm_account_lock_identity_mutation_acquire "$lock" "$wait_seconds") || return 1
+  mutation=$(fm_account_lock_identity_mutation_acquire "$lock" "$deadline") || return 1
   if result=$(fm_account_lock_identity_claim_under_mutation "$state" "$task" "$name" "$mutation"); then
     status=0
   else
@@ -1313,15 +1325,19 @@ fm_account_lock_exact_reclaim_under_identity_mutation() {  # <lock-path> <mutati
   fm_account_reclaim_guard_release "$guard"
 }
 
-fm_account_lock_exact_reclaim() {  # <lock-path>
-  local lock=$1 mutation status owner_state
+fm_account_lock_exact_reclaim() {  # <lock-path> [deadline-epoch]
+  local lock=$1 deadline=${2:-} mutation status owner_state
   if ! fm_account_lock_is_bounded "$lock"; then
     fm_account_lock_exact_reclaim_under_identity_mutation "$lock" ""
     return
   fi
+  if [ -z "$deadline" ]; then
+    deadline=$(fm_account_lock_deadline_from_wait 5) || return 1
+  fi
+  case "$deadline" in ''|*[!0-9]*) return 1 ;; esac
   if fm_account_lock_reclaim_owner_classify "$lock"; then owner_state=0; else owner_state=$?; fi
   [ "$owner_state" -eq 1 ] || return 1
-  mutation=$(fm_account_lock_identity_mutation_acquire "$lock" 5) || return 1
+  mutation=$(fm_account_lock_identity_mutation_acquire "$lock" "$deadline") || return 1
   if fm_account_lock_exact_reclaim_under_identity_mutation "$lock" "$mutation"; then
     status=0
   else
@@ -1479,19 +1495,20 @@ fm_account_lock_identity_mutation_owned() {  # <mutation-path>
     && [ "$FM_ACCOUNT_LOCK_SAFE_OWNER_START" = "$start" ]
 }
 
-fm_account_lock_identity_mutation_acquire() {  # <bounded-lock-path> <wait-seconds>
-  local lock=$1 wait_seconds=${2:-5} mutation start candidate candidate_inode mutation_inode owner_state deadline now
-  case "$wait_seconds" in ''|*[!0-9]*) return 1 ;; esac
+fm_account_lock_identity_mutation_acquire() {  # <bounded-lock-path> [deadline-epoch]
+  local lock=$1 deadline=${2:-} mutation start candidate candidate_inode mutation_inode owner_state now
+  if [ -z "$deadline" ]; then
+    deadline=$(fm_account_lock_deadline_from_wait 5) || return 1
+  fi
+  case "$deadline" in ''|*[!0-9]*) return 1 ;; esac
   mutation=$(fm_account_lock_identity_mutation_path "$lock") || return 1
   start=$(fm_account_process_start_time "$$") || return 1
   [ -n "$FM_ACCOUNT_SYSTEM_DATE_BIN" ] && [ -n "$FM_ACCOUNT_SYSTEM_SLEEP_BIN" ] || return 1
-  now=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) || return 1
-  deadline=$((now + wait_seconds))
   while :; do
     if [ -e "$mutation" ] || [ -L "$mutation" ]; then
       if fm_account_lock_reclaim_owner_classify "$mutation"; then owner_state=0; else owner_state=$?; fi
       case "$owner_state" in
-        1) fm_account_lock_exact_reclaim "$mutation" || return 1 ;;
+        1) fm_account_lock_exact_reclaim "$mutation" "$deadline" || return 1 ;;
         0|2)
           now=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) || return 1
           [ "$now" -lt "$deadline" ] || return 1
@@ -1551,10 +1568,11 @@ fm_account_lock_identity_mutation_release() {  # <mutation-path>
 
 fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
   local lock=$1 grace=$2 now mtime reclaim guard inode_before inode_after generation state key guard_leaf guard_candidate_leaf
-  local ownerless_since ownerless_tmp baseline required_grace
+  local ownerless_since ownerless_tmp baseline required_grace deadline
   local PATH=$FM_ACCOUNT_SYSTEM_PATH
   if fm_account_lock_is_bounded "$lock"; then
-    fm_account_lock_exact_reclaim "$lock"
+    deadline=$(fm_account_lock_deadline_from_wait 0) || return 1
+    fm_account_lock_exact_reclaim "$lock" "$deadline"
     return
   fi
   [ ! -L "$lock" ] || return 1
@@ -1699,13 +1717,14 @@ fm_account_lock_acquire() {  # <state-dir> <task> <name> <label> <wait-seconds>
   fm_account_valid_id "$task" || { echo "error: invalid task id '$task' for $label lock" >&2; return 1; }
   case "$name" in *[!A-Za-z0-9._-]*|'') echo "error: invalid account lock name '$name'" >&2; return 1 ;; esac
   case "$wait_seconds" in ''|*[!0-9]*) echo "error: invalid $label lock wait '$wait_seconds'" >&2; return 1 ;; esac
+  deadline=$(fm_account_lock_deadline_from_wait "$wait_seconds") || return 1
   start=$(fm_account_process_start_time "$$") || {
     echo "error: cannot record $label lock owner for $task" >&2
     return 1
   }
   fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKDIR_BIN" -p "$state" || return 1
   fm_account_real_directory "$state" || return 1
-  lock=$(fm_account_lock_identity_claim "$state" "$task" "$name" "$wait_seconds") || return 1
+  lock=$(fm_account_lock_identity_claim "$state" "$task" "$name" "$deadline") || return 1
   legacy=$(fm_account_lock_legacy_path "$state" "$task" "$name") || return 1
   legacy_leaf=${legacy##*/}
   [ "${#legacy_leaf}" -gt 255 ] || legacy_supported=1
@@ -1716,8 +1735,6 @@ fm_account_lock_acquire() {  # <state-dir> <task> <name> <label> <wait-seconds>
     return 1
   }
   owner_inode=$(fm_account_path_inode "$owner_tmp") || { fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$owner_tmp"; return 1; }
-  [ -n "$FM_ACCOUNT_SYSTEM_DATE_BIN" ] || return 1
-  deadline=$(( $(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) + wait_seconds ))
   while :; do
     wait_target=$lock
     if [ "$legacy_supported" -eq 1 ] && [ "$legacy_owned" -eq 0 ]; then
@@ -1734,7 +1751,7 @@ fm_account_lock_acquire() {  # <state-dir> <task> <name> <label> <wait-seconds>
         fi
         [ "$legacy_inode" != "$owner_inode" ] \
           || fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$legacy" 2>/dev/null || true
-      elif fm_account_lock_exact_reclaim "$legacy"; then
+      elif fm_account_lock_exact_reclaim "$legacy" "$deadline"; then
         continue
       fi
     else
@@ -1765,7 +1782,7 @@ fm_account_lock_acquire() {  # <state-dir> <task> <name> <label> <wait-seconds>
             || fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$lock/owner" 2>/dev/null || true
           fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RMDIR_BIN" "$lock" 2>/dev/null || true
         fi
-      elif fm_account_lock_exact_reclaim "$lock"; then
+      elif fm_account_lock_exact_reclaim "$lock" "$deadline"; then
         continue
       fi
     fi

@@ -330,7 +330,7 @@ _collapse_newlines() {  # <text>
 
 classify_signal() {  # <reason-after-colon> <state>
   local reason=$1 state=$2 f last distilled="" rel="" all_seen=1 task seen
-  local current liveness liveness_rel="" liveness_seen=""
+  local current liveness pause_class liveness_rel="" liveness_seen=""
   for f in $reason; do
     [ -e "$f" ] || continue
     last=$(last_status_line "$f")
@@ -358,9 +358,16 @@ classify_signal() {  # <reason-after-colon> <state>
     fi
     [ -n "$last" ] || continue
     distilled="${distilled}$(basename "$f"): ${last} | "
-    if status_is_paused "$last" \
-      && ! crew_declared_pause_absorbable "$task" "$last" "" "$state"; then
-      rel=1
+    if status_is_paused "$last"; then
+      if ! crew_declared_pause_absorbable "$task" "$last" "$state"; then
+        rel=1
+      else
+        pause_class=$(crew_absorb_class "$task" "$last" "$current" "$state")
+        case "$pause_class" in
+          paused|working) continue ;;
+          *) rel=1 ;;
+        esac
+      fi
     elif status_is_captain_relevant "$last"; then
       rel=1
     else

@@ -258,6 +258,31 @@ test_signal_pause_with_open_decision_escalates_without_marker() {
   pass "away-mode pause signal refuses an unresolved keyed decision"
 }
 
+test_signal_pause_with_terminal_run_escalates_without_marker() {
+  local dir state fakebin out key win
+  dir=$(make_supercase signal-paused-terminal-run)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  make_fake_crew_state "$fakebin" >/dev/null
+  win="sess:fm-signal-terminal"
+  printf 'window=%s\nkind=ship\n' "$win" > "$state/signal-terminal.meta"
+  printf 'paused: awaiting release; owner=release team; clears=release artifact is published\n' \
+    > "$state/signal-terminal.status"
+  out=$(FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    classify_signal "$state/signal-terminal.status" "$state")
+  case "$out" in
+    escalate\|*) ;;
+    *) fail "pause signal hid a terminal run outcome: $out" ;;
+  esac
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review' \
+    handle_wake "signal: $state/signal-terminal.status" "$state"
+  key=$(printf '%s' "signal-terminal" | tr '.:/' '___')
+  [ ! -e "$state/.subsuper-paused-$key" ] || fail "terminal run registered a daemon pause marker"
+  pass "away-mode pause signal preserves terminal run authority"
+}
+
 # handle_wake on a paused stale records a pause marker, drops any pre-existing wedge
 # marker (so a working->paused pane is not still wedge-aged), and does NOT escalate
 # on the wake itself - the recheck is housekeeping's job on the long cadence.
@@ -1792,6 +1817,7 @@ if [ "${FM_TEST_FOCUSED:-}" = pause-proof ]; then
   test_stale_paused_classifies_pause
   test_stale_pause_with_open_decision_escalates
   test_signal_pause_with_open_decision_escalates_without_marker
+  test_signal_pause_with_terminal_run_escalates_without_marker
   test_handle_wake_paused_records_pause_marker
   test_handle_wake_paused_signal_records_pause_marker
   test_housekeeping_migrates_watcher_pause_marker
@@ -1819,6 +1845,7 @@ test_stale_terminal_escalates
 test_stale_paused_classifies_pause
 test_stale_pause_with_open_decision_escalates
 test_signal_pause_with_open_decision_escalates_without_marker
+test_signal_pause_with_terminal_run_escalates_without_marker
 test_handle_wake_paused_records_pause_marker
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking

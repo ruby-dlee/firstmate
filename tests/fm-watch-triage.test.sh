@@ -355,7 +355,7 @@ test_failure_pause_is_failure_classifier() {
 # the full pause truth table lives in tests/fm-watch-pause-absorb.test.sh.
 test_crew_absorb_class_classifier() {
   local dir fakebin malformed state owned_pause
-  owned_pause='paused: awaiting ordered PR merges; owner=merge supervisor; clears=ordered merges complete; run=01RUN'
+  owned_pause='paused: awaiting ordered PR merges; owner=merge supervisor; clears=ordered merges complete'
   dir=$(make_case absorb-class); fakebin="$dir/fakebin"; state="$dir/state"
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
   export FM_FAKE_CREW_STATE FM_STATE_OVERRIDE="$state"
@@ -400,16 +400,16 @@ test_crew_absorb_class_classifier() {
   [ "$(crew_absorb_class a 'paused: awaiting upstream; owner=upstream; clears=upstream release lands')" = paused ] || fail "declared pause not classed paused"
   crew_is_paused a 'paused: awaiting upstream; owner=upstream; clears=upstream release lands' || fail "crew_is_paused did not recognize a paused verdict"
   ! crew_is_provably_working a || fail "a paused crew was treated as provably working"
-  # A terminal run-step with NO pause in the stream is not absorbable...
+  # A terminal run-step remains authoritative with or without a pause in the stream.
   printf 'done: PR ready\n' > "$state/a.status"
   FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review · run: 01RUN'
   [ "$(crew_absorb_class a)" = none ] || fail "terminal run-step without pause context was absorbed"
-  # ...and yields to one when the caller supplies it.
   printf '%s\n' "$owned_pause" > "$state/a.status"
-  [ "$(crew_absorb_class a "$owned_pause")" = paused ] \
-    || fail "terminal run-step did not yield to a declared pause for absorb classification"
-  # Yielding is earned by the registration, not by the verb: a bare pause names
+  [ "$(crew_absorb_class a "$owned_pause")" = none ] \
+    || fail "terminal run-step yielded to a declared pause for absorb classification"
+  # Absorption is earned by the registration, not by the verb: a bare pause names
   # nobody who owns the wait and no fact that ends it, so it stays actionable.
+  FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting ordered PR merges'
   printf 'paused: awaiting ordered PR merges\n' > "$state/a.status"
   [ "$(crew_absorb_class a 'paused: awaiting ordered PR merges')" = none ] \
     || fail "a pause with no owner and no clearing condition was absorbed"
@@ -793,11 +793,11 @@ test_owned_pause_signal_registers_marker() {
   window="test:fm-owned-pause"
   printf 'idle under a declared hold\n' > "$capture_file"
   printf 'window=%s\nkind=ship\nharness=codex\n' "$window" > "$state/owned-pause.meta"
-  printf 'paused: validation hold; owner=supervisor; clears=supervisor lifts the hold after host load recovers; run=01RUN\n' > "$statusf"
+  printf 'paused: validation hold; owner=supervisor; clears=supervisor lifts the hold after host load recovers\n' > "$statusf"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   printf '1\n' > "$state/.stale-since-$key"
   printf '4\n' > "$state/.wedge-escalations-$key"
-  export FM_FAKE_CREW_STATE='state: parked · source: run-step · validation approval gate · run: 01RUN'
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · validation hold'
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 \
@@ -829,10 +829,10 @@ test_owned_pause_absorbs_repeated_changed_stale() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/owned-repeat.status"
   window="test:fm-owned-repeat"
   printf 'window=%s\nkind=ship\nharness=codex\n' "$window" > "$state/owned-repeat.meta"
-  printf 'paused: validation hold; owner=supervisor; clears=supervisor lifts the hold after host load recovers; run=01RUN\n' > "$statusf"
+  printf 'paused: validation hold; owner=supervisor; clears=supervisor lifts the hold after host load recovers\n' > "$statusf"
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-owned-repeat_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
-  export FM_FAKE_CREW_STATE='state: parked · source: run-step · validation approval gate · run: 01RUN'
+  export FM_FAKE_CREW_STATE='state: paused · source: status-log · validation hold'
 
   for token in one two; do
     printf 'idle under declared hold, render %s\n' "$token" > "$capture_file"
@@ -1155,17 +1155,15 @@ test_nonterminal_stale_not_working_surfaced() {
   pass "a not-provably-working non-terminal stale is surfaced immediately (never left to wait out the timer)"
 }
 
-# A terminal no-mistakes run-step remains authoritative current-state evidence,
-# but for stale-pane ABSORB classification a newer durable declared pause says why
-# the finished crewmate is intentionally idle. The pause must therefore enter the
-# long-cadence path without losing cadence markers from an earlier watcher cycle.
-test_terminal_run_step_declared_pause_absorbed_with_markers() {
+# A terminal no-mistakes run-step remains authoritative current-state evidence even
+# when the durable status stream still ends in a declared pause.
+test_terminal_run_step_overrides_declared_pause() {
   local dir state fakebin out capture_file window key pane_hash sig pid
   dir=$(make_case terminal-run-declared-pause); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="firstmate:fm-terminal-paused"
   printf 'idle after checks passed, awaiting ordered merges\n' > "$capture_file"
   printf 'window=%s\nkind=ship\nharness=codex\n' "$window" > "$state/terminal-paused.meta"
-  printf 'paused: waiting on ordered PR merges before D4 can start; owner=captain; clears=PRs #63, #64, and #65 are merged in order; run=01RUN\n' \
+  printf 'paused: waiting on ordered PR merges before D4 can start; owner=captain; clears=PRs #63, #64, and #65 are merged in order\n' \
     > "$state/terminal-paused.status"
   sig=$(seen_sig "$state/terminal-paused.status"); printf '%s' "$sig" > "$state/.seen-terminal-paused_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
@@ -1179,20 +1177,14 @@ test_terminal_run_step_declared_pause_absorbed_with_markers() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "terminal run-step overrode its declared pause and surfaced: $(cat "$out")"
-  fi
-  [ ! -s "$out" ] || { reap "$pid"; fail "terminal-run declared pause printed a stale wake: $(cat "$out")"; }
-  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "terminal-run declared pause enqueued a stale wake"; }
-  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] \
-    || { reap "$pid"; fail "terminal-run declared pause did not advance its stale suppressor"; }
-  [ -e "$state/.paused-$key" ] || { reap "$pid"; fail "terminal-run declared pause did not create its pause marker"; }
-  [ -e "$state/.paused-rechecked-$key" ] || { reap "$pid"; fail "terminal-run declared pause did not retain its authoritative recheck marker"; }
-  [ -e "$state/.paused-resurfaced-$key" ] || { reap "$pid"; fail "terminal-run declared pause lost its long-cadence resurface marker"; }
-  [ ! -e "$state/.stale-since-$key" ] || { reap "$pid"; fail "terminal-run declared pause started a wedge timer"; }
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "terminal run-step was absorbed behind a declared pause"; }
+  grep -F "stale: $window" "$out" >/dev/null \
+    || fail "terminal run-step did not surface its stale pane: $(cat "$out")"
+  grep -F "$window" "$state/.wake-queue" >/dev/null \
+    || fail "terminal run-step did not enqueue an actionable stale wake"
   reap "$pid"
   unset FM_FAKE_CREW_STATE
-  pass "terminal run-step plus durable declared pause is absorbed and preserves pause cadence markers"
+  pass "terminal run-step remains actionable over a durable declared pause"
 }
 
 test_surface_nonterminal_stale_clears_pause_only_after_status_resumes() {
@@ -2156,7 +2148,7 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = pause-regressions ]; then
   test_declared_pause_preempts_permission_prompt_stale
   test_nonterminal_stale_not_working_surfaced
-  test_terminal_run_step_declared_pause_absorbed_with_markers
+  test_terminal_run_step_overrides_declared_pause
   test_surface_nonterminal_stale_clears_pause_only_after_status_resumes
   test_nonterminal_stale_paused_absorbed_then_resurfaced
   test_herdr_blocked_transition_enters_pause_absorb_path
@@ -2229,7 +2221,7 @@ test_nonterminal_stale_provably_working_absorbed_then_escalated
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
 test_wedge_escalation_resets_when_pane_becomes_active
 test_nonterminal_stale_not_working_surfaced
-test_terminal_run_step_declared_pause_absorbed_with_markers
+test_terminal_run_step_overrides_declared_pause
 test_surface_nonterminal_stale_clears_pause_only_after_status_resumes
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_failure_pause_stale_surfaced_not_absorbed

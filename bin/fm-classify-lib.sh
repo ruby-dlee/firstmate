@@ -61,7 +61,6 @@ FM_CLASSIFY_PAUSED_VERB_DEFAULT='paused'
 # scan that must skip them - so the grammar cannot drift between them.
 _FM_CLASSIFY_PAUSE_OWNER_KEY='owner'
 _FM_CLASSIFY_PAUSE_CLEARS_KEY='clears'
-_FM_CLASSIFY_PAUSE_RUN_KEY='run'
 
 # Failure vocabulary for the FAILURE-PAUSE discriminator.
 #
@@ -170,13 +169,12 @@ _fm_status_has_pause_verb() {  # <status-line>
 _fm_status_pause_prose_headlines() {  # <status-line>
   local n=${FM_CLASSIFY_PAUSE_HEAD_WORDS:-$FM_CLASSIFY_PAUSE_HEAD_WORDS_DEFAULT}
   status_line_note "$1" | awk -F';' -v n="$n" \
-    -v owner_key="$_FM_CLASSIFY_PAUSE_OWNER_KEY" -v clears_key="$_FM_CLASSIFY_PAUSE_CLEARS_KEY" \
-    -v run_key="$_FM_CLASSIFY_PAUSE_RUN_KEY" '
+    -v owner_key="$_FM_CLASSIFY_PAUSE_OWNER_KEY" -v clears_key="$_FM_CLASSIFY_PAUSE_CLEARS_KEY" '
     { for (i = 1; i <= NF; i++) {
         clause = $i
         sub(/^[[:space:]]+/, "", clause)
         sub(/[[:space:]]+$/, "", clause)
-        if (index(clause, owner_key "=") == 1 || index(clause, clears_key "=") == 1 || index(clause, run_key "=") == 1) continue
+        if (index(clause, owner_key "=") == 1 || index(clause, clears_key "=") == 1) continue
         sub(/:.*/, "", clause)
         words = split(clause, word, /[[:space:]]+/)
         out = ""
@@ -208,7 +206,7 @@ status_pause_is_failure() {  # <status-line>
 # Print one semicolon-delimited field from a pause note. Explicit field names make
 # the absorption contract mechanically auditable; inferring ownership or
 # observability from free prose would make malformed waits look healthy again.
-status_pause_field() {  # <status-line> <owner|clears|run>
+status_pause_field() {  # <status-line> <owner|clears>
   local key=$2
   status_line_note "$1" | awk -F';' -v key="$key" '
     { for (i = 1; i <= NF; i++) {
@@ -228,7 +226,6 @@ status_pause_field() {  # <status-line> <owner|clears|run>
 
 status_pause_owner() { status_pause_field "$1" "$_FM_CLASSIFY_PAUSE_OWNER_KEY"; }
 status_pause_clearing_condition() { status_pause_field "$1" "$_FM_CLASSIFY_PAUSE_CLEARS_KEY"; }
-status_pause_run_id() { status_pause_field "$1" "$_FM_CLASSIFY_PAUSE_RUN_KEY"; }
 
 _fm_pause_field_is_named() {  # <value>
   local value normalized
@@ -423,8 +420,6 @@ _fm_status_file_for() {  # <id> [state-dir]
 #      rejects a FAILURE reported under the pause verb (status_pause_is_failure), and
 #   2. the keyed open/resolved fold (status_open_decisions) is empty, so no question
 #      is still unanswered underneath that pause.
-# When a run id is supplied, the declaration must also name that exact run.
-#
 # (2) is the safety boundary and is not redundant with (1): the status stream is an
 # append-only EVENT log, so a later `paused:` line MASKS an earlier still-open
 # needs-decision from any last-line read. A lane with an unanswered question must
@@ -433,8 +428,8 @@ _fm_status_file_for() {  # <id> [state-dir]
 # Fails closed in both directions. An id with no locatable status file cannot be
 # proven either way, so it is refused rather than absorbed: absence of a signal is
 # never evidence of a pause.
-crew_declared_pause_absorbable() {  # <id> [declared-pause-status-line] [run-id] [state-dir]
-  local id=$1 declared=${2:-} expected_run=${3:-} state=${4:-} f snapshot current before after
+crew_declared_pause_absorbable() {  # <id> [declared-pause-status-line] [state-dir]
+  local id=$1 declared=${2:-} state=${3:-} f snapshot current before after
   f=$(_fm_status_file_for "$id" "$state")
   [ -n "$f" ] || return 1
   before=$(_fm_status_file_sig "$f")
@@ -443,7 +438,6 @@ crew_declared_pause_absorbable() {  # <id> [declared-pause-status-line] [run-id]
   current=$(printf '%s\n' "$snapshot" | grep -v '^[[:space:]]*$' | tail -1)
   [ -z "$declared" ] || [ "$declared" = "$current" ] || return 1
   status_is_paused "$current" || return 1
-  [ -z "$expected_run" ] || [ "$(status_pause_run_id "$current")" = "$expected_run" ] || return 1
   [ -z "$(printf '%s\n' "$snapshot" | _fm_status_open_decisions_stream)" ] || return 1
   after=$(_fm_status_file_sig "$f")
   [ -n "$after" ] && [ "$before" = "$after" ]
@@ -468,12 +462,11 @@ _fm_status_file_sig() {
 #   none    - neither, so the wake must surface (including dead and unknown
 #             liveness, and an unreadable verdict).
 #
-# PRECEDENCE. A working, failed, stale, or unknown current-state verdict is
-# authoritative. A done or parked run yields only when the declaration carries that
-# exact run id, proving the pause was appended after that run began. A no-run
-# status-log pause needs no run association. Every absorbed pause also passes the
-# durable declaration and open-decision proofs above and re-surfaces on the caller's
-# bounded FM_PAUSE_RESURFACE_SECS cadence.
+# PRECEDENCE. Every current run-step verdict is authoritative because a pause gates
+# starting new validation work and cannot suspend an in-flight run. Only a no-run
+# status-log pause can be absorbed. Every absorbed pause also passes the durable
+# declaration and open-decision proofs above and re-surfaces on the caller's bounded
+# FM_PAUSE_RESURFACE_SECS cadence.
 #
 # One fm-crew-state.sh read serves both absorb reasons at once. The optional second
 # argument lets stale-pane triage pass the status line it already read; omitted, the
@@ -525,20 +518,6 @@ crew_state_liveness_verdict() {  # <current-state-line>
   done
 }
 
-crew_state_named_field() {  # <current-state-line> <field-name>
-  local rest=$1 wanted=$2 field sep=' · '
-  while :; do
-    case "$rest" in
-      *"$sep"*) field=${rest%%"$sep"*}; rest=${rest#*"$sep"} ;;
-      *) field=$rest; rest= ;;
-    esac
-    case "$field" in
-      "$wanted: "*) printf '%s' "${field#*: }"; return 0 ;;
-    esac
-    [ -n "$rest" ] || return 0
-  done
-}
-
 # Print task, verdict, and current-state line for each ship carrying a liveness
 # observation. Callers explicitly decide alive/dead/unknown actionability; a
 # line with no observation is omitted so its existing behavior is unchanged.
@@ -558,7 +537,7 @@ scan_crew_liveness_observations() {  # <state-dir>
 }
 
 crew_absorb_class() {  # <id> [declared-pause-status-line] [current-state-line] [state-dir]
-  local id=$1 declared_pause=${2:-} line=${3:-} state_dir=${4:-} state src liveness run_id
+  local id=$1 declared_pause=${2:-} line=${3:-} state_dir=${4:-} state src liveness
   [ -n "$id" ] || { printf 'none'; return; }
   if [ -z "$line" ]; then
     if [ -n "$state_dir" ]; then
@@ -579,21 +558,9 @@ crew_absorb_class() {  # <id> [declared-pause-status-line] [current-state-line] 
           run-step:alive|run-step:|pane:alive|pane:) printf 'working'; return ;;
         esac
       fi
-      case "$state" in
-        failed|stale|unknown) printf 'none'; return ;;
-        done|parked)
-          run_id=$(crew_state_named_field "$line" run)
-          [ -n "$run_id" ] || { printf 'none'; return; }
-          if crew_declared_pause_absorbable "$id" "$declared_pause" "$run_id" "$state_dir"; then
-            printf 'paused'
-          else
-            printf 'none'
-          fi
-          return
-          ;;
-        paused)
-          run_id=$(crew_state_named_field "$line" run)
-          if crew_declared_pause_absorbable "$id" "$declared_pause" "$run_id" "$state_dir"; then
+      case "$state:$src" in
+        paused:status-log)
+          if crew_declared_pause_absorbable "$id" "$declared_pause" "$state_dir"; then
             printf 'paused'
           else
             printf 'none'

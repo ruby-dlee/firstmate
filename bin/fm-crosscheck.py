@@ -2748,8 +2748,19 @@ def render_report(ledger: dict[str, Any], run: dict[str, Any]) -> str:
 
 
 def prepare_review_checkout(
-    destination: Path, snapshot_value: dict[str, Any]
+    destination: Path, snapshot_value: dict[str, Any], source: Path | None = None
 ) -> str:
+    """Build one disposable exact-head checkout and return its reviewed base.
+
+    `source` reuses an existing review checkout as the fetch source instead of
+    the network. Every reviewer attempt gets its own pristine checkout, and on a
+    large repository the remote fetch, not the review, dominates that setup; a
+    failover that re-fetched from GitHub each time would spend more wall time on
+    transfers than on reviewing. The reused source is still only a carrier: the
+    fetched head is re-checked against the live API head SHA and the merge base
+    is recomputed, so nothing is taken on trust from the earlier attempt.
+    """
+
     head_sha = snapshot_value["head_sha"]
     pull_ref = f"refs/pull/{snapshot_value['number']}/head"
     base_ref = f"refs/heads/{snapshot_value['base_ref']}"
@@ -2757,6 +2768,8 @@ def prepare_review_checkout(
     fetched_base_ref = "refs/remotes/crosscheck/base"
     default_remote = f"https://github.com/{snapshot_value['base_repo']}.git"
     remote = environment_value("FM_CROSSCHECK_FETCH_REMOTE", default_remote)
+    if source is not None:
+        remote = str(source)
 
     initialized = run_command(
         ["git", "init", "--quiet", str(destination)],
@@ -2821,6 +2834,10 @@ def prepare_review_checkout(
     # the review stays sound. A rebase or any new commit changes head_sha, which
     # invalidates the ledger match on its own.
     base_tip = git(destination, "rev-parse", f"{fetched_base_ref}^{{commit}}")
+    # Republish both fetched refs under the names a fetch expects, so this
+    # checkout can serve as the local source for a later reviewer attempt.
+    git(destination, "update-ref", pull_ref, head_sha)
+    git(destination, "update-ref", base_ref, base_tip)
     merge_base = git(destination, "merge-base", base_tip, head_sha)
     require(
         SHA_RE.fullmatch(merge_base) is not None,
@@ -2894,6 +2911,7 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
             # fresh checkout proves that without a destructive reset step.
             run = None
             reviewed_base = ""
+            fetched_source: Path | None = None
             for position, candidate in enumerate(candidates):
                 config = candidate
                 # Detached before anything can fail: the author's account id is
@@ -2910,8 +2928,9 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
                     # downstream consumer -- prompt, execution proof, ledger,
                     # and verify -- so one stable value is used end to end.
                     resolved_base = prepare_review_checkout(
-                        review_dir, snapshot_value
+                        review_dir, snapshot_value, fetched_source
                     )
+                    fetched_source = review_dir
                     if reviewed_base:
                         require(
                             resolved_base == reviewed_base,

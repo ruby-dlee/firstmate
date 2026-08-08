@@ -107,6 +107,8 @@ FM_BACKEND_HERDR_MIN_EVENTS_PROTOCOL=16
 # ->blocked edge and a reconnect level-reconcile never re-delivers a still-
 # blocked pane. Uses the bounded identity key shared with watcher state.
 FM_BACKEND_HERDR_ESCALATED_PREFIX=".herdr-escalated-"
+FM_BACKEND_HERDR_GENERATION_CANDIDATE_TEMPLATE=".herdr-generation-candidate.XXXXXX"
+FM_BACKEND_HERDR_GENERATION_BACKUP_TEMPLATE=".herdr-generation-backup.XXXXXX"
 # .fm-secondmate-home is written by bin/fm-home-seed.sh (AGENTS.md section 6)
 # at a seeded secondmate home's root, containing exactly that secondmate's id.
 # The primary firstmate home never carries this marker.
@@ -3437,20 +3439,53 @@ fm_backend_herdr_meta_lock_owned() {
   fm_account_reclaim_guard_owned "$lock"
 }
 
+fm_backend_herdr_meta_identity_inode() {
+  local identity=$1 device rest inode
+  case "$identity" in *:*:*:*) ;; *) return 1 ;; esac
+  device=${identity%%:*}
+  rest=${identity#*:}
+  inode=${rest%%:*}
+  case "$device:$inode" in ''|*[!0-9:]*) return 1 ;; esac
+  [ -n "$device" ] && [ -n "$inode" ] || return 1
+  printf '%s:%s' "$device" "$inode"
+}
+
+fm_backend_herdr_remove_owned_generation_artifact() {
+  local path=$1 inode=$2
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    return 0
+  fi
+  fm_marker_safe_regular_file "$path" || return 1
+  [ "$(fm_backend_herdr_path_inode "$path" 2>/dev/null)" = "$inode" ] || return 1
+  fm_backend_herdr_artifact_remove_attributed "$path" "$inode"
+}
+
 fm_backend_herdr_backfill_legacy_generation_locked() {
-  local state=$1 task=$2 window=$3 identity=$4 lock=$5 meta current attempt generation tmp backup candidate_identity binding published result=0
-  fm_backend_herdr_meta_lock_owned "$state" "$task" "$lock" || return 1
+  local state=$1 task=$2 window=$3 identity=$4 lifecycle_lock=$5 meta_lock=$6
+  local meta current attempt generation tmp backup original_inode candidate_identity candidate_inode
+  local backup_identity backup_inode binding published result=0
+  fm_backend_herdr_lifecycle_lock_owned "$state" "$task" "$lifecycle_lock" || return 1
+  fm_backend_herdr_meta_lock_owned "$state" "$task" "$meta_lock" || return 1
+  original_inode=$(fm_backend_herdr_meta_identity_inode "$identity") || return 1
   current=$(fm_backend_herdr_binding_for_window "$state" "$window" allow-legacy) || return 1
   [ "$current" = "$task"$'\t'$'\t'"$window"$'\t'"$identity" ] || return 1
   attempt=$(fm_account_attempt_id "$FM_HOME" "$task") || return 1
   generation="legacy-$attempt"
   meta="$state/$task.meta"
-  tmp=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" "$state/.$task.meta.generation.XXXXXX" 2>/dev/null) || return 1
+  [ "$(fm_backend_herdr_path_inode "$meta" 2>/dev/null)" = "$original_inode" ] || return 1
+  tmp=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" \
+    "$state/$FM_BACKEND_HERDR_GENERATION_CANDIDATE_TEMPLATE" 2>/dev/null) || return 1
+  candidate_inode=$(fm_backend_herdr_path_inode "$tmp") || return 1
+  if ! fm_marker_safe_regular_file "$tmp" \
+    || [ "$(fm_backend_herdr_path_inode "$tmp" 2>/dev/null)" != "$candidate_inode" ]; then
+    fm_backend_herdr_remove_owned_generation_artifact "$tmp" "$candidate_inode" || return 1
+    return 1
+  fi
   {
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_AWK_BIN" '!/^generation_id=/' "$meta"
     printf 'generation_id=%s\n' "$generation"
   } > "$tmp" || {
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+    fm_backend_herdr_remove_owned_generation_artifact "$tmp" "$candidate_inode" || return 1
     return 1
   }
   fm_backend_herdr_safe_meta_load "$tmp" || result=1
@@ -3458,40 +3493,66 @@ fm_backend_herdr_backfill_legacy_generation_locked() {
   [ "$result" -ne 0 ] || [ "$FM_BACKEND_HERDR_META_WINDOW" = "$window" ] || result=1
   [ "$result" -ne 0 ] || [ "$FM_BACKEND_HERDR_META_GENERATION" = "$generation" ] || result=1
   [ "$result" -ne 0 ] || candidate_identity=$FM_BACKEND_HERDR_META_IDENTITY
+  [ "$result" -ne 0 ] || [ "$(fm_backend_herdr_meta_identity_inode "$candidate_identity")" = "$candidate_inode" ] || result=1
   if [ "$result" -ne 0 ]; then
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+    fm_backend_herdr_remove_owned_generation_artifact "$tmp" "$candidate_inode" || return 1
     return 1
   fi
   current=$(fm_backend_herdr_binding_for_window "$state" "$window" allow-legacy) || result=1
   [ "$result" -ne 0 ] || [ "$current" = "$task"$'\t'$'\t'"$window"$'\t'"$identity" ] || result=1
   if [ "$result" -ne 0 ]; then
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+    fm_backend_herdr_remove_owned_generation_artifact "$tmp" "$candidate_inode" || return 1
     return 1
   fi
-  backup=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" "$state/.$task.meta.generation-backup.XXXXXX" 2>/dev/null) || {
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+  fm_backend_herdr_lifecycle_lock_owned "$state" "$task" "$lifecycle_lock" || result=1
+  [ "$result" -ne 0 ] || fm_backend_herdr_meta_lock_owned "$state" "$task" "$meta_lock" || result=1
+  if [ "$result" -ne 0 ]; then
+    fm_backend_herdr_remove_owned_generation_artifact "$tmp" "$candidate_inode" || return 1
+    return 1
+  fi
+  backup=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" \
+    "$state/$FM_BACKEND_HERDR_GENERATION_BACKUP_TEMPLATE" 2>/dev/null) || {
+    fm_backend_herdr_remove_owned_generation_artifact "$tmp" "$candidate_inode" || return 1
     return 1
   }
-  fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$backup" || {
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp" "$backup"
+  backup_inode=$(fm_backend_herdr_path_inode "$backup") || {
+    fm_backend_herdr_remove_owned_generation_artifact "$tmp" "$candidate_inode" || return 1
+    return 1
+  }
+  if ! fm_marker_safe_regular_file "$backup" \
+    || [ "$(fm_backend_herdr_path_inode "$backup" 2>/dev/null)" != "$backup_inode" ]; then
+    fm_backend_herdr_remove_owned_generation_artifact "$tmp" "$candidate_inode" || return 1
+    fm_backend_herdr_remove_owned_generation_artifact "$backup" "$backup_inode" || return 1
+    return 1
+  fi
+  fm_backend_herdr_remove_owned_generation_artifact "$backup" "$backup_inode" || {
+    fm_backend_herdr_remove_owned_generation_artifact "$tmp" "$candidate_inode" || return 1
     return 1
   }
   fm_account_system_exec "$FM_ACCOUNT_SYSTEM_LN_BIN" "$meta" "$backup" || {
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+    fm_backend_herdr_remove_owned_generation_artifact "$tmp" "$candidate_inode" || return 1
     return 1
   }
+  backup_inode=$original_inode
+  fm_backend_herdr_safe_meta_load "$backup" || result=1
+  [ "$result" -ne 0 ] || backup_identity=$FM_BACKEND_HERDR_META_IDENTITY
+  [ "$result" -ne 0 ] || [ "$backup_identity" = "$identity" ] || result=1
   current=$(fm_backend_herdr_binding_for_window "$state" "$window" allow-legacy) || result=1
   [ "$result" -ne 0 ] || [ "$current" = "$task"$'\t'$'\t'"$window"$'\t'"$identity" ] || result=1
-  fm_account_safe_file_destination "$meta" || {
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp" "$backup"
-    return 1
-  }
+  [ "$result" -ne 0 ] || fm_backend_herdr_safe_meta_load "$tmp" || result=1
+  [ "$result" -ne 0 ] || [ "$FM_BACKEND_HERDR_META_IDENTITY" = "$candidate_identity" ] || result=1
+  [ "$result" -ne 0 ] || [ "$(fm_backend_herdr_path_inode "$tmp" 2>/dev/null)" = "$candidate_inode" ] || result=1
+  [ "$result" -ne 0 ] || fm_backend_herdr_lifecycle_lock_owned "$state" "$task" "$lifecycle_lock" || result=1
+  [ "$result" -ne 0 ] || fm_backend_herdr_meta_lock_owned "$state" "$task" "$meta_lock" || result=1
+  [ "$result" -ne 0 ] || fm_account_safe_file_destination "$meta" || result=1
   if [ "$result" -ne 0 ]; then
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp" "$backup"
+    fm_backend_herdr_remove_owned_generation_artifact "$tmp" "$candidate_inode" || return 1
+    fm_backend_herdr_remove_owned_generation_artifact "$backup" "$backup_inode" || return 1
     return 1
   fi
   fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MV_BIN" "$tmp" "$meta" || {
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp" "$backup"
+    fm_backend_herdr_remove_owned_generation_artifact "$tmp" "$candidate_inode" || return 1
+    fm_backend_herdr_remove_owned_generation_artifact "$backup" "$backup_inode" || return 1
     return 1
   }
   fm_backend_herdr_safe_meta_load "$meta" || result=1
@@ -3504,15 +3565,19 @@ fm_backend_herdr_backfill_legacy_generation_locked() {
   fi
   [ "$result" -ne 0 ] || [ "$published" = "$task"$'\t'"$generation"$'\t'"$window"$'\t'"$candidate_identity" ] || result=1
   if [ "$result" -ne 0 ]; then
-    fm_account_safe_file_destination "$meta" \
+    fm_backend_herdr_safe_meta_load "$backup" \
+      && [ "$FM_BACKEND_HERDR_META_IDENTITY" = "$identity" ] \
+      && [ "$(fm_backend_herdr_path_inode "$backup" 2>/dev/null)" = "$backup_inode" ] \
+      && fm_backend_herdr_safe_meta_load "$meta" \
+      && [ "$FM_BACKEND_HERDR_META_IDENTITY" = "$candidate_identity" ] \
+      && fm_account_safe_file_destination "$meta" \
       && fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MV_BIN" "$backup" "$meta" \
+      && fm_backend_herdr_safe_meta_load "$meta" \
+      && [ "$FM_BACKEND_HERDR_META_IDENTITY" = "$identity" ] \
       || return 1
     return 1
   fi
-  fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$backup" || {
-    fm_account_safe_file_destination "$meta" \
-      && fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MV_BIN" "$backup" "$meta" \
-      || return 1
+  fm_backend_herdr_remove_owned_generation_artifact "$backup" "$backup_inode" || {
     return 1
   }
   binding=$published
@@ -3706,7 +3771,8 @@ fm_backend_herdr_clear_transition() {  # <state_dir> <window> [task] [lifecycle-
   current=$(fm_backend_herdr_binding_for_window "$state" "$window" allow-legacy) || result=1
   [ "$result" -ne 0 ] || [ "$current" = "$binding" ] || result=1
   if [ "$result" -eq 0 ] && [ -z "$generation" ]; then
-    binding=$(fm_backend_herdr_backfill_legacy_generation_locked "$state" "$task" "$window" "$identity" "$meta_lock") || result=1
+    binding=$(fm_backend_herdr_backfill_legacy_generation_locked \
+      "$state" "$task" "$window" "$identity" "$lock" "$meta_lock") || result=1
     if [ "$result" -eq 0 ]; then
       generation=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f2)
       identity=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f4)

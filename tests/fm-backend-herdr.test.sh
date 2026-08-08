@@ -4362,9 +4362,56 @@ test_clear_transition_migrates_legacy_generation() {
     case "$generation" in legacy-a???????????????) ;; *) fail "$form legacy generation was not migrated exactly: $generation" ;; esac
     [ "$(grep -c '^generation_id=' "$state/lane-q.meta")" -eq 1 ] || fail "$form legacy migration did not publish exactly one generation identity"
     [ ! -e "$marker" ] && [ ! -e "$owner" ] || fail "$form legacy generation clear retained transition custody"
-    [ -z "$(find "$state" -name '.lane-q.meta.generation*' -print -quit)" ] || fail "$form legacy migration retained a publication transient"
+    [ -z "$(find "$state" \( -name '.lane-q.meta.generation*' -o -name '.herdr-generation-*' \) -print -quit)" ] || fail "$form legacy migration retained a publication transient"
   done
   pass "Herdr teardown migrates absent and empty legacy generation identities"
+}
+
+test_clear_transition_migrates_maximum_legacy_identity_with_bounded_artifacts() {
+  local dir state window task meta generation templates candidate_template backup_template
+  local template artifact quarantine max_inode_key meta_leaf lifecycle_lock_leaf meta_lock_leaf
+  window=default:wG:pQ
+  task=$(printf '%0225d' 0)
+  [ "${#task}" -eq 225 ] || fail "maximum legacy identity fixture has the wrong length"
+  templates=$(bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s" "$FM_BACKEND_HERDR_GENERATION_CANDIDATE_TEMPLATE" "$FM_BACKEND_HERDR_GENERATION_BACKUP_TEMPLATE"' "$ROOT")
+  candidate_template=${templates%%$'\t'*}
+  backup_template=${templates#*$'\t'}
+  max_inode_key=18446744073709551615_18446744073709551615
+  for template in "$candidate_template" "$backup_template"; do
+    artifact=${template%XXXXXX}ABCDEF
+    quarantine="$artifact.quarantine.$max_inode_key"
+    [ "${#artifact}" -le 255 ] || fail "legacy migration artifact exceeds the filesystem component budget: $artifact"
+    [ "${#quarantine}" -le 255 ] || fail "legacy migration cleanup artifact exceeds the filesystem component budget: $quarantine"
+    case "$artifact" in *"$task"*) fail "legacy migration artifact embeds the durable task identity" ;; esac
+  done
+  meta_leaf="$task.meta"
+  lifecycle_lock_leaf=".account-lifecycle-$task.lock"
+  meta_lock_leaf=".account-meta-$task.lock"
+  [ "${#meta_leaf}" -le 255 ] || fail "maximum legacy metadata basename exceeds the filesystem component budget"
+  [ "${#lifecycle_lock_leaf}" -le 255 ] || fail "maximum legacy lifecycle lock exceeds the filesystem component budget"
+  [ "${#meta_lock_leaf}" -le 255 ] || fail "maximum legacy metadata lock exceeds the filesystem component budget"
+  dir="$TMP_ROOT/clear-transition-maximum-legacy-identity"; state="$dir/state"; mkdir -p "$state"
+  meta="$state/$task.meta"
+  fm_write_meta "$meta" "window=$window" "backend=herdr" "kind=ship" "generation_id="
+  bash -c '
+    . "$0/bin/backends/herdr.sh"
+    lifecycle_lock="$1/.account-lifecycle-$3.lock"
+    meta_lock="$1/.account-meta-$3.lock"
+    start=$(fm_account_process_start_time "$$") || exit 1
+    printf "%s\n%s\n" "$$" "$start" > "$lifecycle_lock" || exit 1
+    printf "%s\n%s\n" "$$" "$start" > "$meta_lock" || exit 1
+    result=0
+    fm_backend_herdr_clear_transition "$1" "$2" "$3" "$lifecycle_lock" "$meta_lock" || result=1
+    fm_account_meta_lock_release "$meta_lock" >/dev/null 2>&1 || result=1
+    fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || result=1
+    exit "$result"
+  ' \
+    "$ROOT" "$state" "$window" "$task" || fail "maximum-length legacy generation teardown clear was refused"
+  generation=$(sed -n 's/^generation_id=//p' "$meta")
+  case "$generation" in legacy-a???????????????) ;; *) fail "maximum legacy generation was not migrated exactly: $generation" ;; esac
+  [ "$(grep -c '^generation_id=' "$meta")" -eq 1 ] || fail "maximum legacy migration did not publish exactly one generation identity"
+  [ -z "$(find "$state" -name '.herdr-generation-*' -print -quit)" ] || fail "maximum legacy migration retained a fixed-width artifact generation"
+  pass "Herdr teardown migrates maximum legacy identities within fixed artifact budgets"
 }
 
 test_clear_transition_legacy_refusals_preserve_metadata() {
@@ -4704,6 +4751,7 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = legacy-generation-migration ]; then
   test_clear_transition_migrates_legacy_generation
+  test_clear_transition_migrates_maximum_legacy_identity_with_bounded_artifacts
   test_clear_transition_legacy_refusals_preserve_metadata
   exit 0
 fi
@@ -4832,6 +4880,7 @@ test_buffered_transition_refuses_reassigned_window
 test_transition_refuses_replaced_metadata_identity
 test_transition_commit_serializes_metadata_replacement
 test_clear_transition_migrates_legacy_generation
+test_clear_transition_migrates_maximum_legacy_identity_with_bounded_artifacts
 test_clear_transition_legacy_refusals_preserve_metadata
 test_clear_transition_removes_task_marker
 test_apply_transition_defer_and_fallback_are_noops

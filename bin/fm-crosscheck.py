@@ -2189,6 +2189,7 @@ def run_reviewer(
                     f"stderr: {stderr_tail}" if stderr_tail else "",
                     f"stdout: {stdout_tail}" if stdout_tail else "",
                 )
+                if part
             ) or "no diagnostic"
             message = (
                 f"Codex reviewer at {config['account_home']} exited "

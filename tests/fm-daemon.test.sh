@@ -556,6 +556,29 @@ test_ambiguous_legacy_unknown_is_cadenced_and_buffer_deduped() {
   pass "ambiguous legacy UNKNOWN retains state with cadenced deduplicated escalation"
 }
 
+test_unknown_retry_sidecar_is_safe_and_atomic() {
+  local dir state legacy marker retry sentinel count
+  dir=$(make_supercase unknown-retry-safe)
+  state="$dir/state"
+  fm_write_meta "$state/lane.a.meta" "window=sess:fm-lane.a" "kind=ship"
+  fm_write_meta "$state/lane_a.meta" "window=sess:fm-lane_a" "kind=ship"
+  legacy=$(fm_marker_legacy_key lane.a)
+  marker="$state/.subsuper-stale-$legacy"
+  echo $(( $(date +%s) - 500 )) > "$marker"
+  retry=$(marker_unknown_retry_path "$state" stale "$legacy")
+  sentinel="$dir/sentinel"
+  printf 'preserve-me\n' > "$sentinel"
+  ln -s "$sentinel" "$retry"
+  FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=1 housekeeping "$state"
+  [ "$(cat "$sentinel")" = preserve-me ] || fail "UNKNOWN retry refresh followed its symlink"
+  [ -f "$retry" ] && [ ! -L "$retry" ] || fail "UNKNOWN retry was not atomically published as a safe file"
+  count=$(grep -Fc -- "[unknown-marker=stale:$legacy]" "$state/.subsuper-escalations" 2>/dev/null || true)
+  [ "$count" -eq 1 ] || fail "unsafe UNKNOWN retry sidecar suppressed its escalation"
+  find "$state" -path '*/carrier' -type l -print -quit | grep . >/dev/null \
+    || fail "unsafe UNKNOWN retry sidecar was not retained in quarantine"
+  pass "UNKNOWN retry sidecars reject symlinks and refresh atomically"
+}
+
 test_marker_refresh_cannot_recreate_after_lifecycle_teardown() {
   local dir state task key marker held pid lock
   dir=$(make_supercase marker-refresh-teardown-race)
@@ -1911,6 +1934,7 @@ case "${FM_TEST_FOCUSED:-}" in
     test_housekeeping_unreadable_pause_preserves_recheck_tracking
     test_marker_identity_is_collision_free_and_legacy_fails_closed
     test_ambiguous_legacy_unknown_is_cadenced_and_buffer_deduped
+    test_unknown_retry_sidecar_is_safe_and_atomic
     test_housekeeping_busy_pane_stale_is_unknown
     test_housekeeping_paused_busy_pane_is_unknown
     test_housekeeping_herdr_idle_busy_footer_is_unknown
@@ -1943,6 +1967,7 @@ test_housekeeping_missing_stale_target_preserves_unknown_tracking
 test_housekeeping_missing_paused_target_preserves_unknown_tracking
 test_marker_identity_is_collision_free_and_legacy_fails_closed
 test_ambiguous_legacy_unknown_is_cadenced_and_buffer_deduped
+test_unknown_retry_sidecar_is_safe_and_atomic
 test_marker_refresh_cannot_recreate_after_lifecycle_teardown
 test_housekeeping_stale_liveness_runs_one_bounded_parallel_window
 test_housekeeping_busy_pane_stale_is_unknown

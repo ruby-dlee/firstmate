@@ -418,8 +418,10 @@ classify_unknown() {  # <reason>
 _task_marker_key() { fm_marker_task_key "$1"; }
 
 _watcher_marker_key() {
-  local state=$1 win=$2 task=$3
-  fm_marker_migrate_watcher_state "$state" "$task" "$win" >/dev/null 2>&1 || return 1
+  local state=$1 win=$2 task=$3 rc
+  fm_marker_migrate_watcher_state "$state" "$task" "$win" >/dev/null 2>&1
+  rc=$?
+  case "$rc" in 0|2) ;; *) return "$rc" ;; esac
   fm_marker_task_key "$task"
 }
 
@@ -432,17 +434,24 @@ marker_unknown_retry_path() {
 marker_unknown_retry_clear() {
   local retry
   retry=$(marker_unknown_retry_path "$1" "$2" "$3") || return 1
+  if ! fm_marker_state_path_safe_or_absent "$retry"; then
+    fm_marker_quarantine_unsafe "$retry" >/dev/null || return 1
+  fi
   rm -f "$retry"
 }
 
 marker_unknown_escalate() {
   local state=$1 kind=$2 key=$3 cadence=$4 item=$5 retry token buf
   retry=$(marker_unknown_retry_path "$state" "$kind" "$key") || return 1
+  if ! fm_marker_state_path_safe_or_absent "$retry"; then
+    fm_marker_quarantine_unsafe "$retry" >/dev/null || return 1
+  fi
+  fm_marker_state_path_safe_or_absent "$retry" || return 1
   [ "$(_file_age "$retry")" -ge "$cadence" ] || return 0
   token="[unknown-marker=$kind:$key]"
   buf="$state/.subsuper-escalations"
   grep -Fq -- "$token" "$buf" 2>/dev/null || escalate_add "$state" "$item $token"
-  _now > "$retry"
+  fm_marker_atomic_write "$retry" "$(_now)"
 }
 
 marker_meta_is_safe() {

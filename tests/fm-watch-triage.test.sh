@@ -517,7 +517,7 @@ test_provably_working_signal_absorbed() {
   fi
   [ ! -s "$out" ] || fail "provably-working signal printed a wake reason: $(cat "$out")"
   [ ! -s "$state/.wake-queue" ] || fail "provably-working signal enqueued a durable wake record"
-  [ -s "$state/.seen-task_status" ] || fail "provably-working signal did not advance its .seen-* suppressor"
+  [ -s "$state/.seen-status-$(fm_marker_task_key task)" ] || fail "provably-working signal did not advance its .seen-* suppressor"
   [ -e "$state/.last-watcher-beat" ] || fail "watcher beacon was not touched while absorbing"
   reap "$pid"
   pass "a no-verb signal whose crew is provably working is absorbed (no exit, no queue, suppressor advanced, beacon present)"
@@ -579,7 +579,7 @@ test_working_note_not_working_surfaced() {
   grep -F "signal: $status_file" "$out" >/dev/null || fail "watcher did not print the surfaced working: signal"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the surfaced working: note failed"
   grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null || fail "surfaced working: note was not queued"
-  [ -s "$state/.seen-task_status" ] || fail "surfaced working: note did not advance its .seen-* suppressor"
+  [ -s "$state/.seen-status-$(fm_marker_task_key task)" ] || fail "surfaced working: note did not advance its .seen-* suppressor"
   pass "a no-verb working: note whose crew is idle with no running pipeline is surfaced"
 }
 
@@ -2045,6 +2045,87 @@ test_watcher_state_identity_is_collision_free_and_legacy_migration_is_owned() {
   pass "watcher families use collision-free task custody and owned legacy migration"
 }
 
+test_signal_seen_identity_is_collision_free_and_legacy_migration_is_owned() {
+  local dir state legacy key_dot key_under status_dot status_under seen_dot seen_under lines changed turn_seen sig
+  dir=$(make_case signal-seen-identity); state="$dir/state"
+  fm_write_meta "$state/lane.a.meta" 'window=firstmate:fm-lane.a' 'kind=ship'
+  fm_write_meta "$state/lane_a.meta" 'window=firstmate:fm-lane_a' 'kind=ship'
+  status_dot="$state/lane.a.status"
+  status_under="$state/lane_a.status"
+  printf 'working: same\n' > "$status_dot"
+  printf 'working: same\n' > "$status_under"
+  (
+    export FM_STATE_OVERRIDE="$state"
+    . "$WATCH"
+    legacy=$(fm_marker_signal_legacy_key lane.a status)
+    [ "$legacy" = "$(fm_marker_signal_legacy_key lane_a status)" ] || fail "signal collision fixture did not collide"
+    sig=$(stat_sig "$status_dot")
+    printf '%s' "$sig" > "$state/.seen-$legacy"
+    key_dot=$(fm_marker_task_key lane.a)
+    key_under=$(fm_marker_task_key lane_a)
+    seen_dot="$state/.seen-status-$key_dot"
+    seen_under="$state/.seen-status-$key_under"
+    lines=$(scan_signals)
+    printf '%s\n' "$lines" | grep -F "$seen_dot" >/dev/null || fail "dot task signal was suppressed by a colliding legacy carrier"
+    printf '%s\n' "$lines" | grep -F "$seen_under" >/dev/null || fail "underscore task signal was suppressed by a colliding legacy carrier"
+    [ -e "$state/.seen-$legacy" ] || fail "ambiguous signal legacy state was not preserved"
+    fm_marker_atomic_write "$seen_dot" "$(stat_sig "$status_dot")" || fail "dot task seen state write failed"
+    fm_marker_atomic_write "$seen_under" "$(stat_sig "$status_under")" || fail "underscore task seen state write failed"
+    printf 'working: changed\n' >> "$status_dot"
+    changed=$(scan_signals)
+    printf '%s\n' "$changed" | grep -F "$seen_dot" >/dev/null || fail "changed dot task signal was not observed"
+    if printf '%s\n' "$changed" | grep -F "$seen_under" >/dev/null; then
+      fail "unchanged underscore task signal re-fired"
+    fi
+    : > "$state/lane.a.turn-ended"
+    turn_seen=$(fm_marker_migrate_signal_seen "$state" lane.a turn-ended)
+    [ "$turn_seen" != "$seen_dot" ] || fail "status and turn-end signals shared a seen carrier"
+    rm -f "$status_under" "$state/lane_a.meta" "$seen_dot"
+    printf '%s' "$(stat_sig "$status_dot")" > "$state/.seen-$legacy"
+    scan_signals >/dev/null
+    [ -e "$seen_dot" ] || fail "uniquely owned signal legacy state did not migrate"
+    [ ! -e "$state/.seen-$legacy" ] || fail "uniquely owned signal legacy state remained after migration"
+    rm -f "$seen_dot"
+    printf 'preserve-me\n' > "$dir/seen-sentinel"
+    ln -s "$dir/seen-sentinel" "$state/.seen-$legacy"
+    lines=$(scan_signals)
+    [ "$(cat "$dir/seen-sentinel")" = preserve-me ] || fail "signal legacy migration followed its symlink"
+    [ ! -L "$state/.seen-$legacy" ] || fail "unsafe signal legacy state was not quarantined"
+    printf '%s\n' "$lines" | grep -F "$seen_dot" >/dev/null || fail "unsafe signal legacy state suppressed exact observation"
+  ) || fail "signal seen identity assertions failed"
+  pass "signal seen carriers use collision-free task and signal-kind custody"
+}
+
+test_unsafe_watcher_legacy_state_is_quarantined_without_skipping_exact_custody() {
+  local dir state legacy key sentinel
+  dir=$(make_case unsafe-watcher-legacy); state="$dir/state"
+  fm_write_meta "$state/lane.a.meta" 'window=firstmate:fm-lane.a' 'kind=ship'
+  legacy=$(fm_marker_legacy_key 'firstmate:fm-lane.a')
+  sentinel="$dir/sentinel"
+  printf 'preserve-me\n' > "$sentinel"
+  ln -s "$sentinel" "$state/.hash-$legacy"
+  printf '1\n' > "$state/.count-$legacy"
+  (
+    export FM_STATE_OVERRIDE="$state"
+    . "$WATCH"
+    WATCHER_UNSAFE_STATE_REASON=
+    migrate_watcher_state 'firstmate:fm-lane.a' lane.a || fail "unsafe legacy state silenced the lane"
+    key=$(watcher_state_key 'firstmate:fm-lane.a' lane.a)
+    [ "$(cat "$sentinel")" = preserve-me ] || fail "unsafe legacy migration followed its symlink"
+    [ ! -L "$state/.hash-$legacy" ] || fail "unsafe legacy carrier was not quarantined"
+    [ -e "$state/.count-$key" ] || fail "safe legacy sibling state did not migrate to exact custody"
+    [ -n "$WATCHER_UNSAFE_STATE_REASON" ] || fail "unsafe legacy state did not become fail-visible"
+    ln -s "$sentinel" "$state/.hash-$key"
+    WATCHER_UNSAFE_STATE_REASON=
+    migrate_watcher_state 'firstmate:fm-lane.a' lane.a || fail "unsafe exact state silenced the lane"
+    [ ! -L "$state/.hash-$key" ] || fail "unsafe exact carrier was not quarantined"
+    [ -n "$WATCHER_UNSAFE_STATE_REASON" ] || fail "unsafe exact state did not become fail-visible"
+    find "$state" -path '*/carrier' -type l -print -quit | grep . >/dev/null \
+      || fail "unsafe legacy carrier was not retained in quarantine"
+  ) || fail "unsafe watcher legacy assertions failed"
+  pass "unsafe watcher legacy state is quarantined without dropping exact observation"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_watcher_markers_refuse_symlinks
   exit 0
@@ -2119,6 +2200,8 @@ case "${FM_TEST_FOCUSED:-}" in
     test_crew_absorb_class_classifier
     test_turn_ended_pane_only_surfaced
     test_watcher_state_identity_is_collision_free_and_legacy_migration_is_owned
+    test_signal_seen_identity_is_collision_free_and_legacy_migration_is_owned
+    test_unsafe_watcher_legacy_state_is_quarantined_without_skipping_exact_custody
     exit 0
     ;;
 esac
@@ -2174,3 +2257,5 @@ test_runtime_profile_mismatches_do_not_starve_later_tasks
 test_watcher_markers_refuse_symlinks
 test_watcher_timeout_wrapper_uses_hard_kill_fallback
 test_watcher_state_identity_is_collision_free_and_legacy_migration_is_owned
+test_signal_seen_identity_is_collision_free_and_legacy_migration_is_owned
+test_unsafe_watcher_legacy_state_is_quarantined_without_skipping_exact_custody

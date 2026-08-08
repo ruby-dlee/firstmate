@@ -55,6 +55,35 @@ fm_marker_state_path_safe_or_absent() {
   [ ! -e "$1" ] || [ -f "$1" ]
 }
 
+fm_marker_rename_exact() {
+  _fm_marker_system_exec perl -e 'exit(rename($ARGV[0], $ARGV[1]) ? 0 : 1)' "$1" "$2"
+}
+
+fm_marker_quarantine_unsafe() {
+  local path=$1 state leaf key quarantine
+  [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; } || return 0
+  state=${path%/*}
+  leaf=${path##*/}
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  key=$(fm_marker_identity_key "$leaf") || return 1
+  quarantine=$(_fm_marker_system_exec mktemp -d "$state/.marker-quarantine-$key.XXXXXX") || return 1
+  if fm_marker_rename_exact "$path" "$quarantine/carrier"; then
+    printf '%s' "$quarantine/carrier"
+    return 0
+  fi
+  _fm_marker_system_exec rmdir "$quarantine" 2>/dev/null || true
+  fm_marker_state_path_safe_or_absent "$path"
+}
+
+fm_marker_atomic_write() {
+  local path=$1 value=$2 tmp
+  fm_marker_state_path_safe_or_absent "$path" || return 1
+  tmp=$(_fm_marker_system_exec mktemp "$path.pending.XXXXXX") || return 1
+  printf '%s' "$value" > "$tmp" || { rm -f "$tmp"; return 1; }
+  fm_marker_state_path_safe_or_absent "$path" || { rm -f "$tmp"; return 1; }
+  fm_marker_rename_exact "$tmp" "$path" || { rm -f "$tmp"; return 1; }
+}
+
 fm_marker_legacy_owner() {
   local state=$1 key=$2 meta task owner= count=0
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
@@ -100,45 +129,119 @@ fm_marker_legacy_window_owner() {
   printf '%s' "$owner"
 }
 
+fm_marker_signal_legacy_key() {
+  local task=$1 kind=$2
+  case "$kind" in status|turn-ended) ;; *) return 1 ;; esac
+  printf '%s.%s' "$task" "$kind" | _fm_marker_system_exec tr '.' '_'
+}
+
+fm_marker_signal_legacy_owner() {
+  local state=$1 key=$2 kind=$3 meta task owner= count=0
+  case "$kind" in status|turn-ended) ;; *) return 1 ;; esac
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  for meta in "$state"/*.meta; do
+    [ -e "$meta" ] || continue
+    [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+    task=${meta##*/}
+    task=${task%.meta}
+    case "$task" in ''|.*|-*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+    [ "$(fm_marker_signal_legacy_key "$task" "$kind")" = "$key" ] || continue
+    owner=$task
+    count=$((count + 1))
+  done
+  [ "$count" -eq 1 ] || return 1
+  [ -f "$state/$owner.$kind" ] && [ ! -L "$state/$owner.$kind" ] || return 1
+  printf '%s' "$owner"
+}
+
+fm_marker_migrate_signal_seen() {
+  local state=$1 task=$2 kind=$3 key legacy owner old new unsafe=0
+  key=$(fm_marker_task_key "$task") || return 1
+  legacy=$(fm_marker_signal_legacy_key "$task" "$kind") || return 1
+  new="$state/.seen-$kind-$key"
+  if ! fm_marker_state_path_safe_or_absent "$new"; then
+    fm_marker_quarantine_unsafe "$new" >/dev/null || return 1
+    fm_marker_state_path_safe_or_absent "$new" || return 1
+    unsafe=2
+  fi
+  owner=$(fm_marker_signal_legacy_owner "$state" "$legacy" "$kind" 2>/dev/null || true)
+  if [ "$owner" = "$task" ]; then
+    old="$state/.seen-$legacy"
+    if [ -e "$old" ] || [ -L "$old" ]; then
+      if [ -f "$old" ] && [ ! -L "$old" ]; then
+        if [ -e "$new" ]; then
+          rm -f "$old" || return 1
+        else
+          fm_marker_rename_exact "$old" "$new" || return 1
+        fi
+      elif fm_marker_quarantine_unsafe "$old" >/dev/null; then
+        unsafe=2
+      else
+        unsafe=2
+      fi
+    fi
+  fi
+  printf '%s' "$new"
+  return "$unsafe"
+}
+
 fm_marker_migrate_watcher_state() {
-  local state=$1 task=$2 target=$3 key legacy owner family old new
+  local state=$1 task=$2 target=$3 key legacy owner family old new unsafe=0
   key=$(fm_marker_task_key "$task") || return 1
   [ -f "$state/$task.meta" ] && [ ! -L "$state/$task.meta" ] || return 1
   [ "$(fm_backend_target_of_meta "$state/$task.meta")" = "$target" ] || return 1
   legacy=$(fm_marker_legacy_key "$target")
   owner=$(fm_marker_legacy_window_owner "$state" "$legacy" 2>/dev/null || true)
-  [ "$owner" = "$task" ] || { printf '%s' "$key"; return 0; }
   for family in hash count stale stale-since wedge-escalations paused paused-rechecked paused-resurfaced stale-busy-hash stale-busy-since wedge-escalations-busy stale-permission wedge-escalations-permission; do
     old="$state/.$family-$legacy"
     new="$state/.$family-$key"
+    if ! fm_marker_state_path_safe_or_absent "$new"; then
+      fm_marker_quarantine_unsafe "$new" >/dev/null || return 1
+      fm_marker_state_path_safe_or_absent "$new" || return 1
+      unsafe=2
+    fi
+    [ "$owner" = "$task" ] || continue
     [ -e "$old" ] || [ -L "$old" ] || continue
-    [ -f "$old" ] && [ ! -L "$old" ] || return 1
-    fm_marker_state_path_safe_or_absent "$new" || return 1
+    if ! { [ -f "$old" ] && [ ! -L "$old" ]; }; then
+      fm_marker_quarantine_unsafe "$old" >/dev/null || unsafe=2
+      unsafe=2
+      continue
+    fi
     if [ -e "$new" ]; then
       rm -f "$old" || return 1
     else
-      mv "$old" "$new" || return 1
+      fm_marker_rename_exact "$old" "$new" || return 1
     fi
   done
   printf '%s' "$key"
+  return "$unsafe"
 }
 
 fm_marker_migrate_task_state() {
-  local state=$1 task=$2 family=$3 key legacy owner old new
+  local state=$1 task=$2 family=$3 key legacy owner old new unsafe=0
   case "$family" in hb-surfaced) ;; *) return 1 ;; esac
   key=$(fm_marker_task_key "$task") || return 1
   legacy=$(fm_marker_legacy_key "$task")
+  new="$state/.$family-$key"
+  if ! fm_marker_state_path_safe_or_absent "$new"; then
+    fm_marker_quarantine_unsafe "$new" >/dev/null || return 1
+    fm_marker_state_path_safe_or_absent "$new" || return 1
+    unsafe=2
+  fi
   owner=$(fm_marker_legacy_owner "$state" "$legacy" 2>/dev/null || true)
   if [ "$owner" = "$task" ]; then
     old="$state/.$family-$legacy"
-    new="$state/.$family-$key"
     if [ -e "$old" ] || [ -L "$old" ]; then
-      [ -f "$old" ] && [ ! -L "$old" ] || return 1
-      fm_marker_state_path_safe_or_absent "$new" || return 1
-      if [ -e "$new" ]; then rm -f "$old" || return 1; else mv "$old" "$new" || return 1; fi
+      if [ -f "$old" ] && [ ! -L "$old" ]; then
+        if [ -e "$new" ]; then rm -f "$old" || return 1; else fm_marker_rename_exact "$old" "$new" || return 1; fi
+      else
+        fm_marker_quarantine_unsafe "$old" >/dev/null || unsafe=2
+        unsafe=2
+      fi
     fi
   fi
   printf '%s' "$key"
+  return "$unsafe"
 }
 
 fm_marker_remove_owned_kind() {

@@ -419,7 +419,20 @@ watcher_state_key() {  # <window> [task]
 }
 
 migrate_watcher_state() {  # <window> <task>
+  local rc
   fm_marker_migrate_watcher_state "$STATE" "$2" "$1" >/dev/null
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2)
+      WATCHER_UNSAFE_STATE_REASON="watcher state custody UNKNOWN for $1; unsafe carrier quarantined or retained, exact-key observation continued"
+      return 0
+      ;;
+    *)
+      WATCHER_UNSAFE_STATE_REASON="watcher state custody UNKNOWN for $1; exact metadata or state ownership could not be verified"
+      return "$rc"
+      ;;
+  esac
 }
 
 pause_state_needs_observation() {  # <window> <status-line>
@@ -740,16 +753,22 @@ age_of() {  # seconds since file mtime; "due immediately" if missing
 # compared against a persisted size:mtime signature (.seen-*) rather than
 # mtime-vs-a-startup-touch, so signals that land while no watcher is running
 # are caught by the next one, and same-second writes cannot slip through a
-# strict -nt comparison. Pure read: prints one "<seen-file>\t<sig>\t<file>"
-# line per changed file. .seen-* is updated only after the wake is either
+# strict -nt comparison. The scan prints one
+# "<seen-file>\t<sig>\t<file>" line per changed file. .seen-* is updated only after the wake is either
 # surfaced or intentionally absorbed, so a watcher killed mid-cycle never
 # swallows a signal.
 scan_signals() {
-  local f sig sf
+  local f sig sf task kind
   for f in "$STATE"/*.status "$STATE"/*.turn-ended; do
     [ -e "$f" ] || continue
     sig=$(stat_sig "$f") || continue
-    sf="$STATE/.seen-$(basename "$f" | tr '.' '_')"
+    case "$f" in
+      "$STATE"/*.status) kind=status; task=${f##*/}; task=${task%.status} ;;
+      "$STATE"/*.turn-ended) kind=turn-ended; task=${f##*/}; task=${task%.turn-ended} ;;
+      *) continue ;;
+    esac
+    sf=$(fm_marker_migrate_signal_seen "$STATE" "$task" "$kind" 2>/dev/null)
+    [ -n "$sf" ] || continue
     if [ "$sig" != "$(cat "$sf" 2>/dev/null)" ]; then
       printf '%s\t%s\t%s\n' "$sf" "$sig" "$f"
     fi
@@ -897,8 +916,11 @@ report_retention_owner_is_fresh() {
 # fleet-scan can tell apart a captain-relevant status that already woke firstmate
 # from one that has not - the latter being a per-wake-path miss it must surface.
 _hb_surfaced_path() {
-  local key
-  key=$(fm_marker_migrate_task_state "$STATE" "$1" hb-surfaced) || key=$(fm_marker_task_key "$1") || return 1
+  local key rc
+  key=$(fm_marker_migrate_task_state "$STATE" "$1" hb-surfaced)
+  rc=$?
+  [ -n "$key" ] || return 1
+  case "$rc" in 0|2) ;; *) return "$rc" ;; esac
   printf '%s/.hb-surfaced-%s' "$STATE" "$key"
 }
 
@@ -911,7 +933,7 @@ mark_surfaced() {  # <status-file>
   last=$(last_status_line "$f")
   [ -n "$last" ] || return 0
   status_is_captain_relevant "$last" || return 0
-  printf '%s' "$last" > "$(_hb_surfaced_path "$task")"
+  fm_marker_atomic_write "$(_hb_surfaced_path "$task")" "$last"
 }
 
 # Mark every current captain-relevant status as surfaced. Called after the
@@ -921,7 +943,7 @@ mark_all_captain_relevant_surfaced() {
   local f task last
   while IFS=$(printf '\t') read -r f task last; do
     [ -n "$f" ] || continue
-    printf '%s' "$last" > "$(_hb_surfaced_path "$task")"
+    fm_marker_atomic_write "$(_hb_surfaced_path "$task")" "$last" || return 1
   done < <(scan_captain_relevant_statuses "$STATE")
 }
 
@@ -1146,6 +1168,7 @@ if ! safe_marker_path "$STATE/.last-heartbeat" || [ ! -e "$STATE/.last-heartbeat
 fi
 
 while :; do
+  WATCHER_UNSAFE_STATE_REASON=
   # Self-eviction: if the singleton lock no longer names this process, a second
   # watcher has taken over (e.g. a transient duplicate from a racy arm). Stand
   # down so the rightful singleton continues alone. The EXIT trap's release
@@ -1263,7 +1286,7 @@ $pending
 EOF
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
-        printf '%s' "$sig" > "$sf"
+        fm_marker_atomic_write "$sf" "$sig" || exit 1
         mark_surfaced "$f"
       done <<EOF
 $pending
@@ -1272,7 +1295,7 @@ EOF
     else
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
-        printf '%s' "$sig" > "$sf"
+        fm_marker_atomic_write "$sf" "$sig" || exit 1
       done <<EOF
 $pending
 EOF
@@ -1532,6 +1555,11 @@ EOF
       fi
     fi
   done
+
+  if [ -n "$WATCHER_UNSAFE_STATE_REASON" ]; then
+    fm_wake_append stale watcher-state "$WATCHER_UNSAFE_STATE_REASON" || exit 1
+    wake "$WATCHER_UNSAFE_STATE_REASON"
+  fi
 
   # Heartbeat: the watcher runs a bounded fleet-scan at a regular cadence no matter
   # what. Time-based via .last-heartbeat mtime; interval doubles per consecutive

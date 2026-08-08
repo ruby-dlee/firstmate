@@ -1233,6 +1233,7 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
             "at",
             "head_sha",
             "base_sha",
+            "base_branch_sha",
             "claims_sha256",
             "reviewer",
             "state",
@@ -2644,6 +2645,9 @@ def apply_review(
         "at": now,
         "head_sha": snapshot_value["head_sha"],
         "base_sha": snapshot_value["base_sha"],
+        "base_branch_sha": snapshot_value.get(
+            "base_branch_sha", snapshot_value["base_sha"]
+        ),
         "claims_sha256": snapshot_value["claims_sha256"],
         "reviewer": {
             **config,
@@ -2676,6 +2680,9 @@ def append_failed_run(
         "at": utc_now(),
         "head_sha": snapshot_value["head_sha"],
         "base_sha": snapshot_value["base_sha"],
+        "base_branch_sha": snapshot_value.get(
+            "base_branch_sha", snapshot_value["base_sha"]
+        ),
         "claims_sha256": snapshot_value["claims_sha256"],
         "reviewer": config,
         "state": state,

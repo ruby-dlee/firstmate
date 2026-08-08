@@ -148,9 +148,13 @@ fm_backend_tmux_split_target() {  # <target>
 # fm_backend_tmux_target_exists first, because display-message would otherwise
 # hand back the session's CURRENT window's identity for a window that is gone.
 fm_backend_tmux_expected_label_matches() {  # <target> [expected-label] [recorded-scoped-target]
-  local target=$1 expected_label=${2:-} recorded_scoped_target=${3:-} expected_session
-  local FM_TMUX_TARGET_SESSION FM_TMUX_TARGET_WINDOW FM_TMUX_TARGET_PANE
-  local actual_identity actual_session actual_label
+  # Every local is given an explicit empty value, never bare `local x`. Callers
+  # run under `set -u`, and bash 4.4+ leaves a bare `local x` genuinely unset, so
+  # reading it aborts the whole calling script - while bash 3.2 (macOS) reads it
+  # as empty and hides the fault entirely.
+  local target=$1 expected_label=${2:-} recorded_scoped_target=${3:-} expected_session=''
+  local FM_TMUX_TARGET_SESSION='' FM_TMUX_TARGET_WINDOW='' FM_TMUX_TARGET_PANE=''
+  local actual_identity='' actual_session='' actual_label=''
   [ -n "$expected_label" ] || [ -n "$recorded_scoped_target" ] || return 0
   if [ -n "$recorded_scoped_target" ]; then
     case "$recorded_scoped_target" in

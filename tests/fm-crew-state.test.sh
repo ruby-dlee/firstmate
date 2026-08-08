@@ -727,7 +727,7 @@ test_gate_block_parked_not_superseded() {
   pass "gate block parked run is not flagged superseded"
 }
 
-test_run_pause_requires_matching_run_id() {
+test_matching_run_state_overrides_pause() {
   reset_fakes
   local d out pause
   d=$(new_case run-pause-chronology)
@@ -738,22 +738,13 @@ test_run_pause_requires_matching_run_id() {
   pause='paused: awaiting release; owner=release team; clears=release artifact is published'
 
   FM_FAKE_AXI_STATUS="$(run_passed fm/run-pause-chronology)"
-  printf '%s\n' "$pause" > "$d/state/run-pause-chronology.status"
-  out=$(run_crew_state "$d" run-pause-chronology)
-  assert_contains "$out" "state: done" "an unassociated old pause overrode a later completed run"
-
-  printf '%s; run=00OLDER\n' "$pause" > "$d/state/run-pause-chronology.status"
-  out=$(run_crew_state "$d" run-pause-chronology)
-  assert_contains "$out" "state: done" "a pause associated with another run overrode the completed run"
-
   printf '%s; run=01RUN\n' "$pause" > "$d/state/run-pause-chronology.status"
   out=$(run_crew_state "$d" run-pause-chronology)
-  assert_contains "$out" "state: paused" "a pause associated with the completed run was not preserved"
-  assert_contains "$out" "run: 01RUN" "the current paused state omitted its run association"
+  assert_contains "$out" "state: done" "a completed run hid behind a matching-run pause"
 
   FM_FAKE_AXI_STATUS="$(run_parked fm/run-pause-chronology)"
   out=$(run_crew_state "$d" run-pause-chronology)
-  assert_contains "$out" "state: paused" "a pause associated with the parked run was not preserved"
+  assert_contains "$out" "state: parked" "a parked run hid behind a matching-run pause"
 
   FM_FAKE_AXI_STATUS="$(run_running fm/run-pause-chronology)"
   out=$(run_crew_state "$d" run-pause-chronology)
@@ -766,7 +757,7 @@ test_run_pause_requires_matching_run_id() {
   FM_FAKE_AXI_STATUS="$(run_completed_without_outcome fm/run-pause-chronology)"
   out=$(run_crew_state "$d" run-pause-chronology)
   assert_contains "$out" "state: unknown" "an unknown run hid behind its associated pause"
-  pass "run-associated pauses preserve chronology and run-state precedence"
+  pass "every matching run state remains authoritative over a pause declaration"
 }
 
 test_ci_ready_done_log_beats_monitoring_run() {
@@ -1855,7 +1846,7 @@ if [ "${FM_TEST_FOCUSED:-}" = supervision-states ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = state-consumer-regressions ]; then
-  test_run_pause_requires_matching_run_id
+  test_matching_run_state_overrides_pause
   test_supervisor_read_separates_paused_wedged_unknown
   test_no_run_idle_secondmate_resolved_event_not_state
   test_provably_working_via_runs_list_fallback
@@ -1873,7 +1864,7 @@ test_stale_blocked_superseded
 test_genuine_parked_not_superseded
 test_scalar_gate_parked_not_superseded
 test_gate_block_parked_not_superseded
-test_run_pause_requires_matching_run_id
+test_matching_run_state_overrides_pause
 test_ci_ready_done_log_beats_monitoring_run
 test_ci_ready_log_pr_url_does_not_supply_run_identity
 test_ci_monitoring_checks_green_surfaces_done

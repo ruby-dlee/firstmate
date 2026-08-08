@@ -83,18 +83,18 @@ run_pause_case() {  # <case-name> <status-stream> <crew-state-verdict>
 }
 
 # --- branch 1: live-but-idle paused pane -----------------------------------------
-# A parked run yields to a pause that names its exact run id.
+# With no matching run, the status-log pause is current state.
 test_live_idle_paused_pane_absorbed() {
   run_pause_case live-idle-paused \
-    'paused: work complete and verified; waiting on the merge of PR 882 by the main firstmate; owner=main firstmate; clears=PR 882 is merged; run=01RUN
+    'paused: work complete and verified; waiting on the merge of PR 882 by the main firstmate; owner=main firstmate; clears=PR 882 is merged
 ' \
-    'state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN'
+    'state: paused · source: status-log · waiting on the merge'
   [ "$TRIAGE" = absorbed ] \
     || fail "live-but-idle declared pause was surfaced as a suspected wedge: $WATCH_OUT"
   [ "$PAUSE_FLAG" = present ] \
     || fail "live-but-idle declared pause never recorded .paused-<key> (handle_paused_stale did not run)"
   [ -z "$WAKE_QUEUE" ] || fail "live-but-idle declared pause enqueued a wake: $WAKE_QUEUE"
-  pass "live-but-idle paused pane: a parked run-step no longer vetoes a declared pause"
+  pass "live-but-idle paused pane: a no-run status pause is absorbed"
 }
 
 # --- branch 2: dead paused pane --------------------------------------------------
@@ -142,9 +142,9 @@ test_paused_with_closed_decision_absorbed() {
 done: PR https://github.com/Ruby-Labs/relvino/pull/882 checks green; NOT merged
 needs-decision [key=rollback-empty-pointer]: merge as-is, or fix the empty-pointer refusal here?
 resolved [key=rollback-empty-pointer]: option (a) approved - merge this rebase as-is
-paused: work complete and verified; waiting on the merge of PR 882 by the main firstmate; owner=main firstmate; clears=PR 882 is merged; run=01RUN
+paused: work complete and verified; waiting on the merge of PR 882 by the main firstmate; owner=main firstmate; clears=PR 882 is merged
 ' \
-    'state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN'
+    'state: paused · source: status-log · waiting on the merge'
   [ "$TRIAGE" = absorbed ] \
     || fail "a pause whose only decision was explicitly resolved was surfaced: $WATCH_OUT"
   [ "$PAUSE_FLAG" = present ] \
@@ -161,30 +161,24 @@ test_crew_absorb_class_pause_matrix() {
   dir=$(make_case absorb-pause-matrix); state="$dir/state"; fakebin="$dir/fakebin"
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_FAKE_CREW_STATE FM_STATE_OVERRIDE="$state"
 
-  local paused='paused: waiting on the merge of PR 882; owner=main firstmate; clears=PR 882 is merged; run=01RUN'
+  local paused='paused: waiting on the merge of PR 882; owner=main firstmate; clears=PR 882 is merged'
   printf '%s\n' "$paused" > "$state/a.status"
 
   local v
+  FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting on the merge'
+  [ "$(crew_absorb_class a "$paused")" = paused ] \
+    || fail "a no-run status-log pause was not honoured"
+  crew_is_paused a || fail "crew_is_paused disagreed with the no-run pause class"
+
   for v in 'state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN' \
            'state: done · source: run-step · run passed: PR merged (verified) · run: 01RUN' \
-           'state: paused · source: status-log · waiting on the merge · run: 01RUN'; do
-    FM_FAKE_CREW_STATE="$v"
-    [ "$(crew_absorb_class a "$paused")" = paused ] \
-      || fail "declared pause not honoured over verdict [$v]"
-    crew_is_paused a || fail "crew_is_paused disagreed with the class for verdict [$v]"
-  done
-
-  for v in 'state: failed · source: run-step · run cancelled · run: 01RUN' \
+           'state: failed · source: run-step · run cancelled · run: 01RUN' \
            'state: stale · source: run-step · stale run' \
            'state: unknown · source: none · backend target gone'; do
     FM_FAKE_CREW_STATE="$v"
     [ "$(crew_absorb_class a "$paused")" = none ] \
       || fail "authoritative verdict was hidden behind a pause [$v]"
   done
-
-  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at ci: 1 finding(s) · run: 02NEW'
-  [ "$(crew_absorb_class a "$paused")" = none ] \
-    || fail "pause associated with an older run overrode the current parked run"
 
   # A crewmate that appended a pause and then STARTED working is working, not paused:
   # active work supersedes the stale declaration. This precedence is unchanged.
@@ -197,7 +191,7 @@ test_crew_absorb_class_pause_matrix() {
 
   # The pause must be read from the durable stream even when no caller passes it,
   # so the two call sites in bin/fm-watch.sh cannot disagree.
-  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN'
+  FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting on the merge'
   [ "$(crew_absorb_class a)" = paused ] \
     || fail "the declared pause was not read from the status stream when unspecified"
 
@@ -206,14 +200,14 @@ test_crew_absorb_class_pause_matrix() {
   for v in 'state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN' \
            'state: unknown · source: none · backend target gone' \
            'state: done · source: run-step · run passed: PR merged (verified) · run: 01RUN' \
-           'state: paused · source: status-log · waiting on the merge · run: 01RUN'; do
+           'state: paused · source: status-log · waiting on the merge'; do
     FM_FAKE_CREW_STATE="$v"
     [ "$(crew_absorb_class a "$paused")" = none ] \
       || fail "an OPEN decision failed to block absorption under verdict [$v]"
   done
   # ...and stops blocking once it is explicitly resolved.
   printf 'needs-decision [key=api-shape]: which shape?\nresolved [key=api-shape]: option (a)\n%s\n' "$paused" > "$state/a.status"
-  FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN'
+  FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting on the merge'
   [ "$(crew_absorb_class a "$paused")" = paused ] \
     || fail "a resolved decision still blocked absorption"
 
@@ -231,7 +225,7 @@ test_crew_absorb_class_pause_matrix() {
   [ "$(crew_absorb_class "")" = none ] || fail "empty id not classed none"
 
   unset FM_FAKE_CREW_STATE FM_STATE_OVERRIDE
-  pass "crew_absorb_class enforces run association, precedence, and open-decision proof"
+  pass "crew_absorb_class enforces run precedence and the open-decision proof"
 }
 
 # --- a pause proof marker cannot outlive the stream it was proven from -------------
@@ -254,9 +248,9 @@ paused: standing by for the decision on the rollback gap; owner=captain; clears=
 test_pause_moving_during_pipeline_read_refused() {
   export FM_FAKE_CREW_STATE_APPEND_STATUS='blocked: stream advanced during pipeline state read'
   run_pause_case pause-moved-during-proof \
-    'paused: awaiting ordered PR merges; owner=merge supervisor; clears=ordered merges complete; run=01RUN
+    'paused: awaiting ordered PR merges; owner=merge supervisor; clears=ordered merges complete
 ' \
-    'state: parked · source: run-step · parked at ci: 1 finding(s) · run: 01RUN'
+    'state: paused · source: status-log · awaiting ordered PR merges'
   unset FM_FAKE_CREW_STATE_APPEND_STATUS
   [ "$TRIAGE" = surfaced ] \
     || fail "a pause invalidated during the crew-state read was absorbed"

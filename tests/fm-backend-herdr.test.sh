@@ -4369,10 +4369,10 @@ test_clear_transition_migrates_legacy_generation() {
 
 test_clear_transition_migrates_maximum_legacy_identity_with_bounded_artifacts() {
   local dir state window task meta generation templates candidate_template backup_template
-  local template artifact quarantine max_inode_key meta_leaf lifecycle_lock_leaf meta_lock_leaf
+  local template artifact quarantine max_inode_key meta_leaf
   window=default:wG:pQ
-  task=$(printf '%0225d' 0)
-  [ "${#task}" -eq 225 ] || fail "maximum legacy identity fixture has the wrong length"
+  task=$(printf '%0232d' 0)
+  [ "${#task}" -eq 232 ] || fail "maximum legacy identity fixture has the wrong length"
   templates=$(bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s" "$FM_BACKEND_HERDR_GENERATION_CANDIDATE_TEMPLATE" "$FM_BACKEND_HERDR_GENERATION_BACKUP_TEMPLATE"' "$ROOT")
   candidate_template=${templates%%$'\t'*}
   backup_template=${templates#*$'\t'}
@@ -4385,11 +4385,7 @@ test_clear_transition_migrates_maximum_legacy_identity_with_bounded_artifacts() 
     case "$artifact" in *"$task"*) fail "legacy migration artifact embeds the durable task identity" ;; esac
   done
   meta_leaf="$task.meta"
-  lifecycle_lock_leaf=".account-lifecycle-$task.lock"
-  meta_lock_leaf=".account-meta-$task.lock"
   [ "${#meta_leaf}" -le 255 ] || fail "maximum legacy metadata basename exceeds the filesystem component budget"
-  [ "${#lifecycle_lock_leaf}" -le 255 ] || fail "maximum legacy lifecycle lock exceeds the filesystem component budget"
-  [ "${#meta_lock_leaf}" -le 255 ] || fail "maximum legacy metadata lock exceeds the filesystem component budget"
   dir="$TMP_ROOT/clear-transition-maximum-legacy-identity"; state="$dir/state"; mkdir -p "$state"
   meta="$state/$task.meta"
   fm_write_meta "$meta" "window=$window" "backend=herdr" "kind=ship" "generation_id="

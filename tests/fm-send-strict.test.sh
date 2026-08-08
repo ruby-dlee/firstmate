@@ -406,7 +406,7 @@ test_concurrent_managed_steering_is_serialized_and_atomic() {
 }
 
 test_managed_send_revalidates_after_respawn_wait() {
-  local dir fb home err log lock sender_pid sender_rc staged owner_wait
+  local dir fb home err log lock sender_pid sender_rc staged lock_wait
   dir="$TMP_ROOT/managed-respawn-race"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home managed-respawn-race)
   err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
@@ -416,16 +416,17 @@ test_managed_send_revalidates_after_respawn_wait() {
 
   lock=$(fm_account_lifecycle_lock_acquire "$home/state" managed-race) \
     || fail "could not hold the managed lifecycle lock for the respawn race"
+  lock_wait="$dir/lifecycle-wait-observed"
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 FM_ACCOUNT_LOCK_WAIT_TEST_OBSERVED="$lock_wait" \
     "$SEND" managed-race "Do not deliver across respawn." >"$dir/send.out" 2>"$err" &
   sender_pid=$!
-  owner_wait=
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    owner_wait=$(find "$home/state" -maxdepth 1 -name '.account-lifecycle-managed-race.owner.*' -print -quit)
-    [ -n "$owner_wait" ] && break
+  for _ in $(seq 1 600); do
+    [ -f "$lock_wait" ] && break
     /bin/sleep 0.05
   done
-  if [ -z "$owner_wait" ]; then
+  if [ ! -f "$lock_wait" ]; then
     fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
     kill "$sender_pid" 2>/dev/null || true
     wait "$sender_pid" 2>/dev/null || true
@@ -449,7 +450,7 @@ test_managed_send_revalidates_after_respawn_wait() {
 }
 
 test_managed_key_revalidates_after_respawn_wait() {
-  local dir fb home err log lock sender_pid sender_rc staged owner_wait
+  local dir fb home err log lock sender_pid sender_rc staged lock_wait
   dir="$TMP_ROOT/managed-key-respawn-race"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home managed-key-respawn-race)
   err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
@@ -459,16 +460,17 @@ test_managed_key_revalidates_after_respawn_wait() {
 
   lock=$(fm_account_lifecycle_lock_acquire "$home/state" managed-key-race) \
     || fail "could not hold the managed lifecycle lock for the key respawn race"
+  lock_wait="$dir/lifecycle-wait-observed"
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 FM_ACCOUNT_LOCK_WAIT_TEST_OBSERVED="$lock_wait" \
     "$SEND" managed-key-race --key C-c >"$dir/send.out" 2>"$err" &
   sender_pid=$!
-  owner_wait=
-  for _ in $(seq 1 100); do
-    owner_wait=$(find "$home/state" -maxdepth 1 -name '.account-lifecycle-managed-key-race.owner.*' -print -quit)
-    [ -n "$owner_wait" ] && break
-    sleep 0.02
+  for _ in $(seq 1 600); do
+    [ -f "$lock_wait" ] && break
+    sleep 0.05
   done
-  if [ -z "$owner_wait" ]; then
+  if [ ! -f "$lock_wait" ]; then
     fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
     kill "$sender_pid" 2>/dev/null || true
     wait "$sender_pid" 2>/dev/null || true

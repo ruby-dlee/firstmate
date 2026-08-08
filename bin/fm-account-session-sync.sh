@@ -239,9 +239,8 @@ META_LOCK=
 META_TMP=
 META_ROLLBACK_TMP=
 if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
-  expected_lifecycle_lock="$STATE/.account-lifecycle-$ID.lock"
   inherited_lock_identity=
-  if [ "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" = "$expected_lifecycle_lock" ]; then
+  if fm_account_lock_matches "$STATE" "$ID" account-lifecycle "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD"; then
     inherited_lock_identity=$(fm_account_lifecycle_lock_identity "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" 2>/dev/null) || inherited_lock_identity=
   fi
   case "$inherited_lock_identity" in

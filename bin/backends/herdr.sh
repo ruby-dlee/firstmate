@@ -3418,7 +3418,7 @@ fm_backend_herdr_legacy_task_for_key() {
 
 fm_backend_herdr_lifecycle_lock_owned() {
   local state=$1 task=$2 lock=$3 identity pid start parent_start
-  [ "$lock" = "$state/.account-lifecycle-$task.lock" ] || return 1
+  fm_account_lock_matches "$state" "$task" account-lifecycle "$lock" || return 1
   fm_account_lifecycle_lock_owned "$lock" && return 0
   [ "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" = "$lock" ] || return 1
   identity=$(fm_account_lifecycle_lock_identity "$lock" 2>/dev/null) || return 1
@@ -3435,7 +3435,7 @@ fm_backend_herdr_lifecycle_lock_owned() {
 
 fm_backend_herdr_meta_lock_owned() {
   local state=$1 task=$2 lock=$3
-  [ "$lock" = "$state/.account-meta-$task.lock" ] || return 1
+  fm_account_lock_matches "$state" "$task" account-meta "$lock" || return 1
   fm_account_reclaim_guard_owned "$lock"
 }
 

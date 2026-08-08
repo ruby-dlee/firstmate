@@ -470,17 +470,16 @@ meta="$FM_HOME/state/$1.meta"
 if [ "$count" -eq 1 ]; then
   . "$FM_TEST_REAL_ROOT/bin/fm-account-routing-lib.sh"
   lock=${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:?}
-  start=$(fm_account_process_start_time "$$") || exit 1
-  handoff=$(mktemp "$FM_HOME/state/.rollback-handoff.XXXXXX") || exit 1
-  printf '%s\n%s\n' "$$" "$start" > "$handoff" || exit 1
-  mv "$handoff" "$lock" || exit 1
+  identity=$(fm_account_lifecycle_lock_identity "$lock") || exit 1
+  fm_account_lifecycle_lock_handoff "$lock" "$identity" || exit 1
   trap 'fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true' EXIT
   tmp=$(mktemp "$FM_HOME/state/.rollback-test.XXXXXX") || exit 1
   grep -v '^account_rollback_cleanup=pending$' "$meta" > "$tmp" || exit 1
   mv "$tmp" "$meta" || exit 1
   exit 1
 fi
-[ -f "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:?}" ] || exit 9
+lock=${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:?}
+{ [ -f "$lock" ] || [ -d "$lock" ]; } && [ ! -L "$lock" ] || exit 9
 printf 'fresh-lock %s\n' "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" >> "$FM_ROLLBACK_CALL_LOG"
 exit 0
 SH
@@ -535,7 +534,8 @@ pid=$!
 start=$(fm_account_process_start_time "$pid") || exit 1
 handoff=$(mktemp "$FM_HOME/state/.parent-skip-handoff.XXXXXX") || exit 1
 printf '%s\n%s\n' "$pid" "$start" > "$handoff" || exit 1
-mv "$handoff" "$lock" || exit 1
+if [ -d "$lock" ] && [ ! -L "$lock" ]; then owner=$lock/owner; else owner=$lock; fi
+mv "$handoff" "$owner" || exit 1
 printf '%s\n' "$pid" > "$FM_PARENT_SKIP_PID"
 exit 0
 SH
@@ -549,23 +549,26 @@ SH
   out=$(run_bootstrap "$tmuxfb:$fb" "$w/home" zsh "$log" \
     FM_ROOT_OVERRIDE="$fake_root" FM_TEST_REAL_ROOT="$ROOT" FM_PARENT_SKIP_PID="$w/sleeper-pid")
   sleeper_pid=$(cat "$w/sleeper-pid" 2>/dev/null || true)
-  lock="$w/home/state/.account-lifecycle-sm1.lock"
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  lock=$(fm_account_lock_path "$w/home/state" sm1 account-lifecycle) \
+    || fail "parent handoff fixture could not resolve its bounded lifecycle lock"
   assert_contains "$out" "SECONDMATE_LIVENESS: secondmate sm1: respawned" \
     "parent treated a successfully handed-off lock as its own release failure"
   if [ -z "$sleeper_pid" ] || ! kill -0 "$sleeper_pid" 2>/dev/null; then
     fail "handoff simulation did not leave its child owner alive"
   fi
-  [ "$(sed -n '1p' "$lock" 2>/dev/null)" = "$sleeper_pid" ] \
+  [ "$(sed -n '1p' "$lock/owner" 2>/dev/null)" = "$sleeper_pid" ] \
     || fail "parent released or replaced the child-owned lifecycle lock"
   kill "$sleeper_pid" 2>/dev/null || true
   wait "$sleeper_pid" 2>/dev/null || true
-  rm -f "$lock"
+  rm -rf "$lock"
   pass "sweep: parent skips release after lifecycle ownership handoff"
 }
 
 test_enforced_recovery_sweep_installs_meta_with_inherited_lock() {
   local w workspace primary_tip spawn_root fb tmuxfb fake_root fake_af log out meta account_task generation task_tmp native_dir_file refreshed
   w=$(new_world sweep-enforced-inherited-lock)
+  printf 'claude claude-opus-5 high\n' > "$w/home/config/secondmate-harness"
   add_sm_home "$w" sm1 firstmate:fm-sm1 claude
   primary_tip=$(git -C "$ROOT" rev-parse HEAD)
   rm -rf "$w/sm1"
@@ -610,7 +613,7 @@ EOF
   mkdir -p "$fake_root/bin"
   cat > "$fake_root/bin/fm-spawn.sh" <<'SH'
 #!/usr/bin/env bash
-FM_ROOT_OVERRIDE="$FM_TEST_SPAWN_ROOT" "$FM_TEST_SPAWN_ROOT/bin/fm-spawn.sh" "$@" > "$FM_MANAGED_SPAWN_OUT" 2>&1
+FM_ROOT_OVERRIDE="$FM_TEST_SPAWN_ROOT" "$FM_TEST_REAL_ROOT/bin/fm-spawn.sh" "$@" > "$FM_MANAGED_SPAWN_OUT" 2>&1
 status=$?
 cat "$FM_MANAGED_SPAWN_OUT"
 exit "$status"

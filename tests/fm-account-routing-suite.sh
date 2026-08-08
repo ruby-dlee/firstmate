@@ -5259,8 +5259,8 @@ test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
   owner_lines=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 bash -c '
     . "$1"
     held=$(fm_account_meta_lock_acquire "$2" lock-task)
-    [ -f "$held" ] || exit 71
-    wc -l < "$held" | tr -d "[:space:]"
+    [ -d "$held" ] && [ -f "$held/owner" ] || exit 71
+    wc -l < "$held/owner" | tr -d "[:space:]"
     fm_account_meta_lock_release "$held"
   ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$state") || fail "metadata lock ownership was not atomically published"
   [ "$owner_lines" -eq 2 ] || fail "published metadata lock did not contain complete ownership"
@@ -5277,7 +5277,7 @@ set -eu
 state=$2
 critical=$3
 overlap=$4
-held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=5 fm_account_meta_lock_acquire "$state" lock-task)
+held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=30 fm_account_meta_lock_acquire "$state" lock-task)
 if ! mkdir "$critical" 2>/dev/null; then
   printf 'overlap\n' >> "$overlap"
 fi
@@ -5350,9 +5350,9 @@ SH
     fi
     held=$($acquire "$state" "indeterminate-$kind") \
       || fail "could not acquire $kind lock fixture"
-    owner_pid=$(sed -n '1p' "$held")
+    owner_pid=$(sed -n '1p' "$held/owner")
     inode_before=$(fm_account_path_inode "$held")
-    owner_before=$(cat "$held")
+    owner_before=$(cat "$held/owner")
     if FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
       FM_TEST_ACCOUNT_PS_BIN="$fake_ps" FM_TEST_ACCOUNT_PS_TARGET="$owner_pid" \
       FM_TEST_ACCOUNT_PS_ENV_LOG="$ps_env_log" \
@@ -5374,7 +5374,7 @@ SH
     fi
     [ "$status" -ne 0 ] || fail "$kind lock was stolen after an indeterminate process probe"
     inode_after=$(fm_account_path_inode "$held")
-    owner_after=$(cat "$held")
+    owner_after=$(cat "$held/owner")
     [ "$inode_after" = "$inode_before" ] && [ "$owner_after" = "$owner_before" ] \
       || fail "$kind lock identity changed after an indeterminate process probe"
     fm_account_meta_lock_release "$held" || fail "could not release preserved $kind lock"
@@ -5386,18 +5386,23 @@ SH
 }
 
 test_account_locks_support_maximum_task_identity() {
-  local case_dir state task kind acquire lock lock_leaf held templates template artifact guard digest start
+  local case_dir state task kind name acquire lock legacy legacy_leaf lock_leaf held templates template artifact
+  local digest identity_owner identity_before identity_saved sentinel start parent_identity status transient legacy_task
   . "$ROOT/bin/fm-account-routing-lib.sh"
   case_dir="$TMP_ROOT/account-lock-maximum-task"
   state="$case_dir/state"
-  task=$(printf '%0225d' 0)
+  task=$(printf '%0232d' 0)
   mkdir -p "$state"
-  [ "${#task}" -eq 225 ] || fail "maximum account-lock identity fixture has the wrong length"
+  [ "${#task}" -eq 232 ] || fail "maximum account-lock identity fixture has the wrong length"
   digest=$(printf '%064d' 0)
   templates="$FM_ACCOUNT_LOCK_OWNER_TEMPLATE
+$FM_ACCOUNT_LOCK_IDENTITY_TEMPLATE
+$FM_ACCOUNT_LOCK_IDENTITY_PREFIX$digest
+$FM_ACCOUNT_LOCK_PATH_PREFIX$digest
 $FM_ACCOUNT_LOCK_GENERATION_TEMPLATE
 $FM_ACCOUNT_LOCK_RECLAIM_TEMPLATE
 $FM_ACCOUNT_LOCK_RELEASE_TEMPLATE
+$FM_ACCOUNT_LOCK_HANDOFF_TEMPLATE
 $FM_ACCOUNT_LOCK_RECLAIMING_PREFIX$digest
 $FM_ACCOUNT_LOCK_RECLAIMING_PREFIX$digest.candidate.XXXXXX
 $FM_ACCOUNT_LOCK_RECLAIMING_PREFIX$digest.stale.XXXXXX
@@ -5414,21 +5419,37 @@ $templates
 EOF
   for kind in meta lifecycle; do
     case "$kind" in
-      meta) acquire=fm_account_meta_lock_acquire ;;
-      lifecycle) acquire=fm_account_lifecycle_lock_acquire ;;
+      meta) name=account-meta; acquire=fm_account_meta_lock_acquire ;;
+      lifecycle) name=account-lifecycle; acquire=fm_account_lifecycle_lock_acquire ;;
     esac
-    lock="$state/.account-$kind-$task.lock"
+    lock=$(fm_account_lock_path "$state" "$task" "$name") || fail "maximum $kind lock path was unavailable"
+    legacy=$(fm_account_lock_legacy_path "$state" "$task" "$name") || fail "maximum $kind legacy path was unavailable"
     lock_leaf=${lock##*/}
+    legacy_leaf=${legacy##*/}
     [ "${#lock_leaf}" -le 255 ] || fail "maximum $kind lock exceeds the filesystem component budget"
     held=$($acquire "$state" "$task") || fail "ordinary maximum $kind lock acquisition failed"
     [ "$held" = "$lock" ] || fail "maximum $kind lock returned the wrong custody path"
+    [ -d "$held" ] && [ ! -L "$held" ] || fail "maximum $kind lock was not a safe bounded directory"
+    fm_account_lock_matches "$state" "$task" "$name" "$held" || fail "maximum $kind lock lost exact task ownership"
     fm_account_meta_lock_release "$held" || fail "ordinary maximum $kind lock release failed"
-    printf '1\nstale-owner\n' > "$lock"
-    touch -t 200001010000 "$lock"
-    held=$(FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
-      FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=2 \
-      $acquire "$state" "$task") || fail "maximum $kind file-owner reclaim failed"
-    fm_account_meta_lock_release "$held" || fail "maximum $kind lock release after file-owner reclaim failed"
+    if [ "${#legacy_leaf}" -le 255 ]; then
+      start=$(fm_account_process_start_time "$$") || fail "maximum $kind legacy fixture could not read its process identity"
+      printf '%s\n%s\n' "$$" "$start" > "$legacy"
+      if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 \
+        bash -c '. "$1"; "$2" "$3" "$4"' _ "$ROOT/bin/fm-account-routing-lib.sh" "$acquire" "$state" "$task" \
+        >/dev/null 2>&1; then
+        fail "maximum $kind acquisition bypassed a live exact legacy owner"
+      fi
+      fm_account_meta_lock_release "$legacy" || fail "maximum $kind live legacy owner could not release custody"
+      printf '1\nstale-owner\n' > "$legacy"
+      touch -t 200001010000 "$legacy"
+      held=$(FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
+        FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=2 \
+        $acquire "$state" "$task") || fail "maximum $kind legacy file-owner migration failed"
+      [ "$held" = "$lock" ] || fail "maximum $kind legacy migration did not enter bounded custody"
+      assert_absent "$legacy" "maximum $kind legacy migration retained the raw lock"
+      fm_account_meta_lock_release "$held" || fail "maximum $kind release after legacy migration failed"
+    fi
     mkdir -p "$lock"
     printf '1\nstale-owner\n' > "$lock/owner"
     touch -t 200001010000 "$lock" "$lock/owner"
@@ -5441,9 +5462,60 @@ EOF
     printf '%s\n%s\n' "$$" "$start" > "$lock/owner"
     fm_account_meta_lock_release "$lock" || fail "maximum $kind directory release failed"
     assert_absent "$lock" "maximum $kind route retained its durable lock"
+    if [ "$kind" = lifecycle ]; then
+      [ "${#legacy_leaf}" -gt 255 ] || fail "maximum lifecycle fixture did not cross the raw lock filename limit"
+      held=$($acquire "$state" "$task") || fail "maximum lifecycle handoff could not acquire parent custody"
+      parent_identity=$(fm_account_lifecycle_lock_identity "$held") || fail "maximum lifecycle handoff could not read parent custody"
+      FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 bash -c '
+        . "$1"
+        fm_account_lifecycle_lock_handoff "$2" "$3" || exit 1
+        fm_account_lifecycle_lock_release "$2"
+      ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$held" "$parent_identity" \
+        || fail "maximum lifecycle inherited handoff failed"
+      assert_absent "$held" "maximum lifecycle inherited handoff did not release child custody"
+    fi
   done
-  guard=$(find "$state" -maxdepth 1 -name '.account-lock-*' -print -quit)
-  [ -z "$guard" ] || fail "maximum account lock route retained a fixed-width custody artifact: $guard"
+  legacy_task=legacy-handoff-task
+  legacy=$(fm_account_lock_legacy_path "$state" "$legacy_task" account-lifecycle) \
+    || fail "legacy lifecycle handoff fixture lost its raw path"
+  start=$(fm_account_process_start_time "$$") || fail "legacy lifecycle handoff fixture could not read parent identity"
+  printf '%s\n%s\n' "$$" "$start" > "$legacy"
+  parent_identity=$(fm_account_lifecycle_lock_identity "$legacy") \
+    || fail "legacy lifecycle handoff fixture could not read parent custody"
+  bash -c '
+    . "$1"
+    fm_account_lifecycle_lock_handoff "$2" "$3" || exit 1
+    fm_account_lifecycle_lock_release "$2"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$legacy" "$parent_identity" \
+    || fail "legacy raw lifecycle handoff compatibility failed"
+  assert_absent "$legacy" "legacy raw lifecycle handoff retained custody"
+  lock=$(fm_account_lock_path "$state" "$task" account-meta) || fail "maximum identity substitution fixture lost its lock path"
+  digest=${lock##*/}
+  digest=${digest#"$FM_ACCOUNT_LOCK_PATH_PREFIX"}
+  identity_owner="$state/$FM_ACCOUNT_LOCK_IDENTITY_PREFIX$digest"
+  identity_before=$(cat "$identity_owner")
+  printf 'name=account-meta\ntask=other-task' > "$identity_owner"
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "maximum lock accepted a substituted exact-owner record"
+  [ "$(cat "$identity_owner")" = $'name=account-meta\ntask=other-task' ] \
+    || fail "maximum lock rewrote an adversarial exact-owner record"
+  printf '%s' "$identity_before" > "$identity_owner"
+  identity_saved="$case_dir/identity.saved"
+  sentinel="$case_dir/identity.sentinel"
+  printf 'preserve-me\n' > "$sentinel"
+  mv "$identity_owner" "$identity_saved"
+  ln -s "$sentinel" "$identity_owner"
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "maximum lock followed a symlinked exact-owner record"
+  [ "$(cat "$sentinel")" = preserve-me ] || fail "maximum lock changed a symlinked exact-owner target"
+  [ -L "$identity_owner" ] || fail "maximum lock replaced a symlinked exact-owner record"
+  rm "$identity_owner"
+  mv "$identity_saved" "$identity_owner"
+  transient=$(find "$state" -maxdepth 1 \( -name '.account-lock-owner.*' -o -name '.account-lock-identity.*' \
+    -o -name '.account-lock-generation.*' -o -name '.account-lock-reclaim.*' \
+    -o -name '.account-lock-release.*' -o -name '.account-lock-handoff.*' \
+    -o -name "$FM_ACCOUNT_LOCK_PATH_PREFIX*" \) -print -quit)
+  [ -z "$transient" ] || fail "maximum account lock route retained a transient custody artifact: $transient"
   pass "account locks preserve maximum task identities across acquire, reclaim, and release"
 }
 
@@ -6852,6 +6924,7 @@ if [ "${FM_TEST_FOCUSED:-}" = session-workspace ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = account-locks ]; then
+  run_isolated_test test_managed_recovery_accepts_inherited_lifecycle_lock
   run_isolated_test test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
   run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
   run_isolated_test test_account_locks_support_maximum_task_identity

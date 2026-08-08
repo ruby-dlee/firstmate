@@ -270,9 +270,8 @@ if [ "$PRELOCK_KIND" = secondmate ]; then
   TEARDOWN_ACCOUNT_LOCKS+=("$SECONDMATE_HOME_LIFECYCLE_LOCK")
 fi
 if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
-  expected_delete_lock="$STATE/.account-lifecycle-$ID.lock"
   inherited_delete_identity=
-  if [ "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" = "$expected_delete_lock" ]; then
+  if fm_account_lock_matches "$STATE" "$ID" account-lifecycle "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD"; then
     inherited_delete_identity=$(fm_account_lifecycle_lock_identity "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" 2>/dev/null) || inherited_delete_identity=
   fi
   case "$inherited_delete_identity" in

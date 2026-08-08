@@ -364,12 +364,11 @@ test_managed_steering_intent_precedes_external_submission() {
 }
 
 test_concurrent_managed_steering_is_serialized_and_atomic() {
-  local dir fb home log trail lock pid rc=0 i count wait_seconds
+  local dir fb home log trail pid rc=0 i count wait_seconds
   local pids=()
   dir="$TMP_ROOT/managed-concurrent"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home managed-concurrent)
   log="$dir/tmux.log"; trail="$home/data/managed-concurrent/steering.md"
-  lock="$home/state/.account-steering-managed-concurrent.lock"
   mkdir -p "$home/data/managed-concurrent"
   : > "$log"
   fm_write_meta "$home/state/managed-concurrent.meta" \
@@ -398,7 +397,8 @@ test_concurrent_managed_steering_is_serialized_and_atomic() {
     count=$(grep -F -c "> Concurrent managed steer $i." "$trail")
     [ "$count" -eq 1 ] || fail "concurrent steering retained message $i $count times"
   done
-  assert_absent "$lock" "concurrent steering left its serialization lock behind"
+  fm_test_assert_account_lock_absent "$home/state" managed-concurrent account-steering \
+    "concurrent steering left its serialization lock behind"
   if find "$(dirname "$trail")" -maxdepth 1 -name '.steering.md.*' -print -quit | grep -q .; then
     fail "concurrent steering leaked an atomic staging file"
   fi

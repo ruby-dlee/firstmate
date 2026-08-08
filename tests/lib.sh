@@ -323,6 +323,17 @@ assert_absent() {
   [ ! -e "$1" ] || fail "$2"
 }
 
+fm_test_assert_account_lock_absent() {
+  local state=$1 task=$2 name=$3 label=$4 bounded legacy legacy_leaf
+  bounded=$(fm_account_lock_path "$state" "$task" "$name") || fail "could not resolve $label bounded lock"
+  legacy=$(fm_account_lock_legacy_path "$state" "$task" "$name") || fail "could not resolve $label raw compatibility lock"
+  [ ! -e "$bounded" ] && [ ! -L "$bounded" ] || fail "$label"
+  legacy_leaf=${legacy##*/}
+  if [ "${#legacy_leaf}" -le 255 ]; then
+    [ ! -e "$legacy" ] && [ ! -L "$legacy" ] || fail "$label (raw compatibility fence)"
+  fi
+}
+
 # assert_present <path> <msg>: path must exist.
 assert_present() {
   [ -e "$1" ] || fail "$2"

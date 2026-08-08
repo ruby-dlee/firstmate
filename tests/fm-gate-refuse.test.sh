@@ -30,6 +30,9 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$ROOT/bin/fm-account-routing-lib.sh"
+
 GATE_LIB="$ROOT/bin/fm-gate-refuse-lib.sh"
 SPAWN="$ROOT/bin/fm-spawn.sh"
 SEND="$ROOT/bin/fm-send.sh"
@@ -658,7 +661,8 @@ test_primary_mutators_refuse_gate_contexts() {
   assert_absent "$home/state/.lock" "refused session start acquired the fleet lock"
   assert_absent "$home/state/.afk-launch.lock" "refused AFK launch acquired the lifecycle lock"
   assert_absent "$home/state/.afk" "refused AFK launch entered away mode"
-  assert_absent "$home/state/.account-meta-task-x1.lock" "refused session sync acquired the metadata lock"
+  fm_test_assert_account_lock_absent "$home/state" task-x1 account-meta \
+    "refused session sync acquired the metadata lock"
   assert_absent "$home/data/secondmates.md" "refused home seed changed the secondmate registry"
   assert_absent "$home/state/task-x1.check.sh" "refused PR check armed a merge poll"
   if grep -q '^pr=' "$home/state/task-x1.meta"; then

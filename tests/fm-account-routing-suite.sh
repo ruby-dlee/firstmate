@@ -11,6 +11,9 @@ export FM_ORCA_TEST_AUTHORITY_CAPABILITIES=verified-v1
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$ROOT/bin/fm-account-routing-lib.sh"
+
 SPAWN="$ROOT/bin/fm-spawn.sh"
 SEND="$ROOT/bin/fm-send.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
@@ -1847,7 +1850,8 @@ test_session_sync_bounds_agent_fleet_queries() {
     "session timeout allowed the blocking query to complete"
   assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$id.meta" \
     "session query timeout published a result from the terminated command"
-  assert_absent "$HOME_DIR/state/.account-meta-$id.lock" "timed-out session query retained the metadata lock"
+  fm_test_assert_account_lock_absent "$HOME_DIR/state" "$id" account-meta \
+    "timed-out session query retained the metadata lock"
   [ -n "$out" ] || true
   pass "session synchronization bounds every Agent Fleet query"
 }
@@ -2033,7 +2037,8 @@ test_session_sync_all_signals_terminate_worker_groups() {
   done
   child_state=$(ps -p "$child_pid" -o stat= 2>/dev/null | tr -d '[:space:]')
   case "$child_state" in ''|Z*) ;; *) fail "sync sweep left its Agent Fleet descendant running (state $child_state)" ;; esac
-  assert_absent "$HOME_DIR/state/.account-meta-session-sync-all.lock" "signaled sync sweep retained its sweep lock"
+  fm_test_assert_account_lock_absent "$HOME_DIR/state" session-sync-all account-meta \
+    "signaled sync sweep retained its sweep lock"
   pass "sync-all signals terminate and reap complete worker groups"
 }
 
@@ -3683,7 +3688,8 @@ test_session_sync_cannot_recreate_metadata_after_teardown() {
   expect_code 0 "$teardown_rc" "session sync race teardown should succeed while holding the metadata lock"
   [ "$sync_rc" -ne 0 ] || fail "late SessionStart sync unexpectedly succeeded after teardown"
   assert_absent "$HOME_DIR/state/$id.meta" "late SessionStart sync recreated metadata after teardown"
-  assert_absent "$HOME_DIR/state/.account-meta-$id.lock" "session sync race left the metadata lock behind"
+  fm_test_assert_account_lock_absent "$HOME_DIR/state" "$id" account-meta \
+    "session sync race left the metadata lock behind"
   pass "session synchronization cannot recreate metadata after teardown"
 }
 
@@ -5237,7 +5243,8 @@ test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
   local case_dir state lock workers pids pid rc owner_lines
   case_dir="$TMP_ROOT/account-lock"
   state="$case_dir/state"
-  lock="$state/.account-meta-lock-task.lock"
+  mkdir -p "$state"
+  lock=$(fm_account_lock_identity_claim "$state" lock-task account-meta) || fail "could not resolve bounded metadata lock"
   mkdir -p "$lock"
 
   set +e
@@ -5387,7 +5394,7 @@ SH
 
 test_account_locks_support_maximum_task_identity() {
   local case_dir state task kind name acquire lock legacy legacy_leaf lock_leaf held templates template artifact
-  local digest identity_owner identity_before identity_saved sentinel start parent_identity status transient legacy_task
+  local digest identity_owner identity_before identity_saved sentinel start parent_identity status transient legacy_task legacy_contender
   . "$ROOT/bin/fm-account-routing-lib.sh"
   case_dir="$TMP_ROOT/account-lock-maximum-task"
   state="$case_dir/state"
@@ -5403,6 +5410,7 @@ $FM_ACCOUNT_LOCK_GENERATION_TEMPLATE
 $FM_ACCOUNT_LOCK_RECLAIM_TEMPLATE
 $FM_ACCOUNT_LOCK_RELEASE_TEMPLATE
 $FM_ACCOUNT_LOCK_HANDOFF_TEMPLATE
+$FM_ACCOUNT_LOCK_COMPAT_TEMPLATE
 $FM_ACCOUNT_LOCK_RECLAIMING_PREFIX$digest
 $FM_ACCOUNT_LOCK_RECLAIMING_PREFIX$digest.candidate.XXXXXX
 $FM_ACCOUNT_LOCK_RECLAIMING_PREFIX$digest.stale.XXXXXX
@@ -5431,7 +5439,19 @@ EOF
     [ "$held" = "$lock" ] || fail "maximum $kind lock returned the wrong custody path"
     [ -d "$held" ] && [ ! -L "$held" ] || fail "maximum $kind lock was not a safe bounded directory"
     fm_account_lock_matches "$state" "$task" "$name" "$held" || fail "maximum $kind lock lost exact task ownership"
+    if [ "${#legacy_leaf}" -le 255 ]; then
+      [ -f "$legacy" ] && [ ! -L "$legacy" ] || fail "maximum $kind bounded custody did not hold its raw compatibility fence"
+      [ "$(fm_account_path_inode "$legacy")" = "$(fm_account_path_inode "$held/owner")" ] \
+        || fail "maximum $kind raw compatibility fence did not share exact ownership"
+      legacy_contender="$case_dir/$kind-legacy-contender"
+      printf '1\nlegacy-contender\n' > "$legacy_contender"
+      if ln "$legacy_contender" "$legacy" 2>/dev/null; then
+        fail "maximum $kind bounded custody admitted a simultaneous raw owner"
+      fi
+      rm -f "$legacy_contender"
+    fi
     fm_account_meta_lock_release "$held" || fail "ordinary maximum $kind lock release failed"
+    assert_absent "$legacy" "maximum $kind release retained its raw compatibility fence"
     if [ "${#legacy_leaf}" -le 255 ]; then
       start=$(fm_account_process_start_time "$$") || fail "maximum $kind legacy fixture could not read its process identity"
       printf '%s\n%s\n' "$$" "$start" > "$legacy"
@@ -5447,8 +5467,10 @@ EOF
         FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=2 \
         $acquire "$state" "$task") || fail "maximum $kind legacy file-owner migration failed"
       [ "$held" = "$lock" ] || fail "maximum $kind legacy migration did not enter bounded custody"
-      assert_absent "$legacy" "maximum $kind legacy migration retained the raw lock"
+      [ "$(fm_account_path_inode "$legacy")" = "$(fm_account_path_inode "$held/owner")" ] \
+        || fail "maximum $kind migration did not retain an exact raw compatibility fence"
       fm_account_meta_lock_release "$held" || fail "maximum $kind release after legacy migration failed"
+      assert_absent "$legacy" "maximum $kind release after migration retained the raw compatibility fence"
     fi
     mkdir -p "$lock"
     printf '1\nstale-owner\n' > "$lock/owner"
@@ -5513,7 +5535,7 @@ EOF
   mv "$identity_saved" "$identity_owner"
   transient=$(find "$state" -maxdepth 1 \( -name '.account-lock-owner.*' -o -name '.account-lock-identity.*' \
     -o -name '.account-lock-generation.*' -o -name '.account-lock-reclaim.*' \
-    -o -name '.account-lock-release.*' -o -name '.account-lock-handoff.*' \
+    -o -name '.account-lock-release.*' -o -name '.account-lock-handoff.*' -o -name '.account-lock-compat.*' \
     -o -name "$FM_ACCOUNT_LOCK_PATH_PREFIX*" \) -print -quit)
   [ -z "$transient" ] || fail "maximum account lock route retained a transient custody artifact: $transient"
   pass "account locks preserve maximum task identities across acquire, reclaim, and release"
@@ -5554,12 +5576,17 @@ test_account_lock_owner_controls_reject_symlinks() {
   printf '999999\nstale-owner\n' > "$outside"
   ln -s "$outside" "$lock/owner"
   touch -t 200001010000 "$lock"
-  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 bash -c '
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 bash -c '
     . "$1"
-    held=$(fm_account_meta_lock_acquire "$2" task) || exit 1
+    held=$(fm_account_meta_lock_acquire "$2" lock-task) || exit 1
     fm_account_meta_lock_release "$held"
-  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" \
-    || fail "symlinked stale owner blocked metadata-lock recovery"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "metadata-lock recovery deleted an ambiguously owned raw lock"
+  [ -d "$lock" ] && [ -L "$lock/owner" ] || fail "metadata-lock recovery changed an ambiguously owned raw lock"
   [ "$(cat "$outside")" = $'999999\nstale-owner' ] || fail "metadata-lock recovery followed a symlinked owner"
 
   rm -rf "$lock"
@@ -5783,7 +5810,8 @@ test_account_lineage_rejects_parent_swap_during_transaction() {
     || fail "account-lineage transaction wrote through a raced task parent"
   [ "$(cat "$moved/account-attempts.md")" = "$before" ] \
     || fail "failed account-lineage transaction changed the pinned original file"
-  assert_absent "$data/.account-lineage-$id.lock" "failed account-lineage transaction retained its serialization lock"
+  fm_test_assert_account_lock_absent "$data" "$id" account-lineage \
+    "failed account-lineage transaction retained its serialization lock"
   pass "account lineage rejects parent swaps during pinned atomic persistence"
 }
 
@@ -6728,6 +6756,14 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
   run_isolated_test test_managed_recovery_accepts_inherited_lifecycle_lock
   run_isolated_test test_inherited_lifecycle_handoff_releases_on_child_abort
   run_isolated_test test_off_metadata_merge_waits_for_metadata_lock
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = account-lock-compatibility ]; then
+  run_isolated_test test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
+  run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
+  run_isolated_test test_account_locks_support_maximum_task_identity
+  run_isolated_test test_account_lock_owner_controls_reject_symlinks
   exit 0
 fi
 

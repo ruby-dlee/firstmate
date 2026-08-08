@@ -4040,11 +4040,12 @@ herdr_escalation_marker_path() {
 
 test_escalation_marker_keys_are_collision_free() {
   local m dotted underscored dir state legacy old
-  m=$(herdr_escalation_marker_path /st default:wG:pQ)
-  [ "$m" = "/st/.herdr-escalated-v3-04338efa3648e18b33e36e474752ba667ef492615b96e5d6577485dcb31891a5" ] \
+  dir="$TMP_ROOT/escalation-marker-identity"; state="$dir/state"; mkdir -p "$state"
+  m=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  [ "$m" = "$state/.herdr-escalated-v3-04338efa3648e18b33e36e474752ba667ef492615b96e5d6577485dcb31891a5" ] \
     || fail "escalation marker did not encode the exact window identity, got '$m'"
-  dotted=$(herdr_escalation_marker_path /st default:lane.a)
-  underscored=$(herdr_escalation_marker_path /st default:lane_a)
+  dotted=$(herdr_escalation_marker_path "$state" default:lane.a)
+  underscored=$(herdr_escalation_marker_path "$state" default:lane_a)
   [ "$dotted" != "$underscored" ] || fail "distinct Herdr window identities shared an escalation marker"
   dir="$TMP_ROOT/escalation-marker-v2"; state="$dir/state"; mkdir -p "$state"
   legacy=$(printf '%s' default:wG:pQ | od -An -tx1 | tr -d ' \n')
@@ -4054,6 +4055,50 @@ test_escalation_marker_keys_are_collision_free() {
   [ -e "$m" ] || fail "bounded Herdr key did not retain its v2 dedupe state"
   [ ! -e "$old" ] || fail "Herdr v2 dedupe state remained after bounded migration"
   pass "fm_backend_herdr_escalation_marker is collision-free for exact window identities"
+}
+
+test_escalation_marker_rejects_adversarial_owner_substitution() {
+  local dir state rec key owner marker out rc
+  dir="$TMP_ROOT/escalation-owner-substitution"; state="$dir/state"; mkdir -p "$state"
+  rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec"
+  key=${marker##*escalated-}
+  owner="$state/.marker-owner-herdr-transition-$key"
+  printf '%s' default:wG:pR > "$owner"
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec"); rc=$?
+  [ "$rc" = 1 ] && [ -z "$out" ] || fail "substituted Herdr ownership authorized a blocked transition"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec" \
+    && fail "substituted Herdr ownership authorized a marker commit"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2"' "$ROOT" "$state" default:wG:pQ \
+    && fail "substituted Herdr ownership authorized marker deletion"
+  [ -e "$marker" ] || fail "failed Herdr ownership validation deleted the marker"
+  pass "Herdr transition markers reject adversarial exact-owner substitution"
+}
+
+test_escalation_marker_refuses_symlink_carriers() {
+  local dir state rec marker sentinel out rc
+  dir="$TMP_ROOT/escalation-marker-symlink"; state="$dir/state"; mkdir -p "$state"
+  rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  sentinel="$dir/sentinel"
+  printf 'preserve-me\n' > "$sentinel"
+  ln -s "$sentinel" "$marker"
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec"); rc=$?
+  [ "$rc" = 1 ] && [ -z "$out" ] || fail "symlink Herdr marker authorized a blocked transition"
+  [ "$(cat "$sentinel")" = preserve-me ] || fail "Herdr marker read followed its symlink"
+  [ ! -L "$marker" ] || fail "unsafe Herdr marker was not quarantined"
+  ln -s "$sentinel" "$marker"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec" \
+    && fail "symlink Herdr marker authorized a commit"
+  [ "$(cat "$sentinel")" = preserve-me ] || fail "Herdr marker commit followed its symlink"
+  [ ! -L "$marker" ] || fail "unsafe Herdr commit marker was not quarantined"
+  ln -s "$sentinel" "$marker"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2"' "$ROOT" "$state" default:wG:pQ \
+    && fail "symlink Herdr marker authorized a clear"
+  [ "$(cat "$sentinel")" = preserve-me ] || fail "Herdr marker clear followed its symlink"
+  [ ! -L "$marker" ] || fail "unsafe Herdr clear marker was not quarantined"
+  pass "Herdr transition markers quarantine symlinks without following targets"
 }
 
 test_apply_transition_blocked_requires_commit_to_dedupe() {
@@ -4355,6 +4400,8 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = transition-marker-identity ]; then
   test_escalation_marker_keys_are_collision_free
+  test_escalation_marker_rejects_adversarial_owner_substitution
+  test_escalation_marker_refuses_symlink_carriers
   test_apply_transition_blocked_requires_commit_to_dedupe
   test_apply_transition_working_clears_marker
   test_clear_transition_removes_task_marker
@@ -4476,6 +4523,8 @@ test_scripts_route_explicit_target_through_meta_backend
 test_events_capable_consumes_schema_without_broken_pipe
 test_normalize_event_leaves_from_empty
 test_escalation_marker_keys_are_collision_free
+test_escalation_marker_rejects_adversarial_owner_substitution
+test_escalation_marker_refuses_symlink_carriers
 test_apply_transition_blocked_requires_commit_to_dedupe
 test_apply_transition_working_clears_marker
 test_clear_transition_removes_task_marker

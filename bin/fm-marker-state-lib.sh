@@ -54,7 +54,7 @@ fm_marker_task_from_legacy_key() {
   case "$key" in v2-*) hex=${key#v2-} ;; *) return 1 ;; esac
   case "$hex" in ''|*[!0-9a-f]*) return 1 ;; esac
   [ $(( ${#hex} % 2 )) -eq 0 ] || return 1
-  task=$(printf '%s' "$hex" | perl -e '
+  task=$(printf '%s' "$hex" | _fm_marker_system_exec perl -e '
     my $hex = <STDIN>;
     exit 1 if !defined($hex) || $hex !~ /\A[0-9a-f]+\z/ || length($hex) % 2;
     print pack(q{H*}, $hex);
@@ -68,9 +68,14 @@ fm_marker_task_from_key() {
   fm_marker_task_from_legacy_key "$1"
 }
 
-fm_marker_owner_path() {
-  local state=$1 key=$2 digest
+fm_marker_identity_owner_path() {
+  local state=$1 namespace=$2 key=$3 digest prefix
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  case "$namespace" in
+    task) prefix=.marker-owner ;;
+    herdr-transition) prefix=.marker-owner-herdr-transition ;;
+    *) return 1 ;;
+  esac
   case "$key" in v3-*) digest=${key#v3-} ;; *) return 1 ;; esac
   [ "${#digest}" -eq 64 ] || return 1
   case "$digest" in *[!0-9a-f]*) return 1 ;; esac
@@ -78,7 +83,22 @@ fm_marker_owner_path() {
     v3-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
     *) return 1 ;;
   esac
-  printf '%s/.marker-owner-%s' "$state" "$key"
+  printf '%s/%s-%s' "$state" "$prefix" "$key"
+}
+
+fm_marker_owner_path() {
+  fm_marker_identity_owner_path "$1" task "$2"
+}
+
+fm_marker_safe_regular_file() {
+  _fm_marker_system_exec perl -MFcntl=:mode -e '
+    my ($path) = @ARGV;
+    my @before = lstat($path);
+    exit 1 if !@before || !S_ISREG($before[2]) || S_ISLNK($before[2]);
+    open my $fh, q{<}, $path or exit 1;
+    my @after = stat($fh);
+    exit 1 if !@after || $before[0] != $after[0] || $before[1] != $after[1];
+  ' "$1"
 }
 
 fm_marker_safe_file_read() {
@@ -102,23 +122,31 @@ fm_marker_safe_file_equals() {
   [ "$actual" = "$2" ]
 }
 
-fm_marker_task_owner_claim() {
-  local state=$1 key=$2 task=$3 owner tmp
+fm_marker_identity_owner_claim() {
+  local state=$1 namespace=$2 key=$3 identity=$4 owner tmp
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
-  [ "$(fm_marker_task_key "$task")" = "$key" ] || return 1
-  owner=$(fm_marker_owner_path "$state" "$key") || return 1
+  [ "$(fm_marker_identity_key "$identity")" = "$key" ] || return 1
+  owner=$(fm_marker_identity_owner_path "$state" "$namespace" "$key") || return 1
   if [ -e "$owner" ] || [ -L "$owner" ]; then
-    fm_marker_safe_file_equals "$owner" "$task"
+    fm_marker_safe_file_equals "$owner" "$identity"
     return
   fi
   tmp=$(_fm_marker_system_exec mktemp "$owner.pending.XXXXXX") || return 1
-  printf '%s' "$task" > "$tmp" || { rm -f "$tmp"; return 1; }
+  printf '%s' "$identity" > "$tmp" || { rm -f "$tmp"; return 1; }
   if _fm_marker_system_exec ln "$tmp" "$owner" 2>/dev/null; then
     rm -f "$tmp" || return 1
   else
     rm -f "$tmp" || return 1
+    fm_marker_safe_file_equals "$owner" "$identity"
+    return
   fi
-  fm_marker_safe_file_equals "$owner" "$task"
+  fm_marker_safe_file_equals "$owner" "$identity"
+}
+
+fm_marker_task_owner_claim() {
+  local state=$1 key=$2 task=$3
+  case "$task" in ''|.*|-*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  fm_marker_identity_owner_claim "$state" task "$key" "$task"
 }
 
 fm_marker_task_key_for_state() {

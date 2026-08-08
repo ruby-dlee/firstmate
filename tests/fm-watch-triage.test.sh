@@ -2176,6 +2176,42 @@ test_marker_keys_bound_long_identity_to_exact_safe_owner() {
   pass "bounded marker keys retain exact long-identity ownership and reject forged custody"
 }
 
+test_marker_legacy_decode_scrubs_hostile_perl_environment() {
+  local dir fakebin called key task
+  dir=$(make_case marker-legacy-hostile-perl); fakebin="$dir/fakebin"; called="$dir/perl.called"
+  mkdir -p "$fakebin"
+  cat > "$fakebin/perl" <<'SH'
+#!/usr/bin/env bash
+: > "$FM_FAKE_PERL_CALLED"
+exit 99
+SH
+  chmod +x "$fakebin/perl"
+  key=$(fm_marker_task_legacy_v2_key lane.a)
+  task=$(PATH="$fakebin:$PATH" PERL5OPT=-MDefinitelyMissingMarkerModule PERL5LIB="$dir/modules" \
+    FM_FAKE_PERL_CALLED="$called" fm_marker_task_from_legacy_key "$key") \
+    || fail "legacy marker decode accepted hostile Perl startup state"
+  [ "$task" = lane.a ] || fail "legacy marker decode changed the exact task identity"
+  [ ! -e "$called" ] || fail "legacy marker decode invoked ambient Perl"
+  pass "legacy marker decoding uses the fixed scrubbed system executor"
+}
+
+test_marker_owner_claim_accepts_exact_concurrent_winner() {
+  local dir state task key pid
+  local pids=()
+  dir=$(make_case marker-owner-race); state="$dir/state"; task=lane.concurrent
+  key=$(fm_marker_task_key "$task")
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    (fm_marker_task_owner_claim "$state" "$key" "$task") &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || fail "matching concurrent owner claimant rejected the exact winner"
+  done
+  fm_marker_safe_file_equals "$(fm_marker_owner_path "$state" "$key")" "$task" \
+    || fail "concurrent owner claims did not publish one exact safe winner"
+  pass "concurrent marker owner claims accept only the exact safe winner"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_watcher_markers_refuse_symlinks
   exit 0
@@ -2253,6 +2289,8 @@ case "${FM_TEST_FOCUSED:-}" in
     test_signal_seen_identity_is_collision_free_and_legacy_migration_is_owned
     test_unsafe_watcher_legacy_state_is_quarantined_without_skipping_exact_custody
     test_marker_keys_bound_long_identity_to_exact_safe_owner
+    test_marker_legacy_decode_scrubs_hostile_perl_environment
+    test_marker_owner_claim_accepts_exact_concurrent_winner
     exit 0
     ;;
 esac
@@ -2311,3 +2349,5 @@ test_watcher_state_identity_is_collision_free_and_legacy_migration_is_owned
 test_signal_seen_identity_is_collision_free_and_legacy_migration_is_owned
 test_unsafe_watcher_legacy_state_is_quarantined_without_skipping_exact_custody
 test_marker_keys_bound_long_identity_to_exact_safe_owner
+test_marker_legacy_decode_scrubs_hostile_perl_environment
+test_marker_owner_claim_accepts_exact_concurrent_winner

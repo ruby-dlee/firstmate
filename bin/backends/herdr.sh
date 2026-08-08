@@ -3317,16 +3317,27 @@ fm_backend_herdr_event_reader_cmd() {
 # fm_backend_herdr_escalation_marker: the per-pane dedupe marker path for a
 # <window> ("<session>:<pane_id>"), under <state_dir>.
 fm_backend_herdr_escalation_marker() {  # <state_dir> <window>
-  local state=$1 window=$2 key legacy marker old rc
+  local state=$1 window=$2 key legacy marker old owner rc
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
   key=$(fm_marker_identity_key_with_executor "$window" fm_backend_herdr_control_exec) || return 1
+  owner=$(fm_marker_identity_owner_path "$state" herdr-transition "$key") || return 1
+  fm_marker_identity_owner_claim "$state" herdr-transition "$key" "$window" || return 1
   marker="$state/$FM_BACKEND_HERDR_ESCALATED_PREFIX$key"
-  if [ -d "$state" ] && [ ! -L "$state" ]; then
-    legacy=$(fm_marker_identity_legacy_v2_key "$window") || return 1
-    old="$state/$FM_BACKEND_HERDR_ESCALATED_PREFIX$legacy"
-    fm_marker_migrate_carrier "$old" "$marker"
-    rc=$?
-    case "$rc" in 0|2) ;; *) return "$rc" ;; esac
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    if ! fm_marker_safe_regular_file "$marker"; then
+      fm_marker_quarantine_unsafe "$marker" >/dev/null || return 1
+      return 2
+    fi
   fi
+  legacy=$(fm_marker_identity_legacy_v2_key "$window") || return 1
+  old="$state/$FM_BACKEND_HERDR_ESCALATED_PREFIX$legacy"
+  fm_marker_migrate_carrier "$old" "$marker"
+  rc=$?
+  case "$rc" in 0) ;; 2) return 2 ;; *) return "$rc" ;; esac
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    fm_marker_safe_regular_file "$marker" || return 1
+  fi
+  fm_marker_safe_file_equals "$owner" "$window" || return 1
   printf '%s' "$marker"
 }
 
@@ -3346,7 +3357,8 @@ fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record>
   to=$(fm_transition_to_status "$record")
   action=$(fm_transition_policy "$to")
   window="$session:$pane_id"
-  marker=$(fm_backend_herdr_escalation_marker "$state" "$window")
+  marker=$(fm_backend_herdr_escalation_marker "$state" "$window") || return 1
+  fm_marker_state_path_safe_or_absent "$marker" || return 1
   case "$action" in
     actionable)
       if [ ! -e "$marker" ]; then
@@ -3366,14 +3378,15 @@ fm_backend_herdr_commit_transition() {  # <state_dir> <session> <record>
   pane_id=$(fm_transition_pane_id "$record")
   [ -n "$pane_id" ] || return 1
   window="$session:$pane_id"
-  marker=$(fm_backend_herdr_escalation_marker "$state" "$window")
-  : > "$marker"
+  marker=$(fm_backend_herdr_escalation_marker "$state" "$window") || return 1
+  fm_marker_atomic_write "$marker" "$window"
 }
 
 fm_backend_herdr_clear_transition() {  # <state_dir> <window>
   local state=$1 window=$2 marker
   [ -n "$window" ] || return 0
-  marker=$(fm_backend_herdr_escalation_marker "$state" "$window")
+  marker=$(fm_backend_herdr_escalation_marker "$state" "$window") || return 1
+  fm_marker_state_path_safe_or_absent "$marker" || return 1
   fm_backend_herdr_control_exec rm -f "$marker" 2>/dev/null || true
 }
 

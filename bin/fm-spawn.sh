@@ -3152,6 +3152,12 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       ;;
   esac
 fi
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] && [ "$BACKEND" = herdr ]; then
+  fm_backend_clear_transition "$BACKEND" "$STATE" "$RECORDED_TARGET" "$ID" "$LIFECYCLE_LOCK" || {
+    echo "error: recorded Herdr transition state could not be cleared before direct recovery for $ID" >&2
+    exit 1
+  }
+fi
 
 if [ "$KIND" = secondmate ]; then
   sm_primary_head=$(primary_head_commit "$FM_ROOT") || {

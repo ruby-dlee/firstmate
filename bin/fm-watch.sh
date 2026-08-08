@@ -1051,7 +1051,7 @@ event_wait_or_sleep() {
 # machinery already understands it (queued by key=window, so a later poll-path
 # stale for the same pane collapses on drain).
 handle_push_transition() {  # <backend> <session> <record>
-  local backend=$1 session=$2 record=$3 pane_id to window task generation identity lock key h reason
+  local backend=$1 session=$2 record=$3 pane_id to window task generation identity lock meta_lock key h reason
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
@@ -1062,8 +1062,14 @@ handle_push_transition() {  # <backend> <session> <record>
   [ -n "$task" ] && [ -n "$generation" ] && [ "$window" = "$session:$pane_id" ] && [ -n "$identity" ] \
     || { sleep 1; return 1; }
   lock=$(fm_account_lifecycle_lock_acquire "$STATE" "$task") || { sleep 1; return 1; }
+  meta_lock=$(fm_account_meta_lock_acquire "$STATE" "$task") || {
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+    sleep 1
+    return 1
+  }
   if ! fm_backend_transition_record_matches "$backend" "$STATE" "$session" "$record" \
     || ! migrate_watcher_state "$window" "$task"; then
+    fm_account_meta_lock_release "$meta_lock" >/dev/null 2>&1 || true
     fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
     sleep 1
     return 1
@@ -1073,14 +1079,17 @@ handle_push_transition() {  # <backend> <session> <record>
     # handled transition, then enter the shared pause path so it owns the marker
     # and bounded re-surface cadence even when no auxiliary crew-state read exists.
     key=$(watcher_state_key "$window" "$task") || {
+      fm_account_meta_lock_release "$meta_lock" >/dev/null 2>&1 || true
       fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
       return 1
     }
     h=$(cat "$STATE/.hash-$key" 2>/dev/null || true)
-    fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" "$task" "$lock" || {
+    fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" "$task" "$lock" "$meta_lock" || {
+      fm_account_meta_lock_release "$meta_lock" >/dev/null 2>&1 || true
       fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
-      exit 1
+      return 1
     }
+    fm_account_meta_lock_release "$meta_lock" || exit 1
     fm_account_lifecycle_lock_release "$lock" || exit 1
     handle_paused_stale "$window" "$task" "$h"
     triage_log "absorbed push $to (declared pause, awaiting external): $window"
@@ -1088,14 +1097,18 @@ handle_push_transition() {  # <backend> <session> <record>
   fi
   reason="stale: $window (herdr: agent $to - waiting on human, escalated immediately, not via wedge timer)"
   fm_wake_append stale "$window" "$reason" || {
+    fm_account_meta_lock_release "$meta_lock" >/dev/null 2>&1 || true
     fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
     exit 1
   }
-  fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" "$task" "$lock" || {
+  fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" "$task" "$lock" "$meta_lock" || {
+    fm_account_meta_lock_release "$meta_lock" >/dev/null 2>&1 || true
     fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
-    exit 1
+    wake "$reason"
+    return 1
   }
   mark_surfaced "$STATE/$task.status"
+  fm_account_meta_lock_release "$meta_lock" || exit 1
   fm_account_lifecycle_lock_release "$lock" || exit 1
   wake "$reason"
 }

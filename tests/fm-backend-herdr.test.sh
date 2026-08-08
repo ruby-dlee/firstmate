@@ -4303,6 +4303,63 @@ test_transition_refuses_replaced_metadata_identity() {
   pass "Herdr transition custody includes the safe metadata file identity"
 }
 
+test_transition_commit_serializes_metadata_replacement() {
+  local dir state rec marker observed ready release holder commit_pid
+  dir="$TMP_ROOT/transition-metadata-lock"; state="$dir/state"; mkdir -p "$state"
+  observed="$dir/commit.waiting"; ready="$dir/writer.ready"; release="$dir/writer.release"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
+  rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  rec=$(bind_herdr_transition "$state" default "$rec")
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  (
+    . "$ROOT/bin/fm-account-routing-lib.sh"
+    lock=$(fm_account_meta_lock_acquire "$state" lane-q) || exit 1
+    : > "$ready"
+    while [ ! -e "$release" ]; do sleep 0.02; done
+    replacement="$state/.lane-q.meta.replacement"
+    cp "$state/lane-q.meta" "$replacement"
+    printf 'replacement=1\n' >> "$replacement"
+    mv "$replacement" "$state/lane-q.meta"
+    fm_account_meta_lock_release "$lock"
+  ) &
+  holder=$!
+  fm_test_wait_for_file "$ready" "$holder" || fail "metadata replacement fixture could not acquire custody"
+  FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_ACCOUNT_LOCK_WAIT_TEST_OBSERVED="$observed" \
+    FM_ACCOUNT_META_LOCK_WAIT_SECONDS=5 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3" "$4"' \
+      "$ROOT" "$state" default "$rec" lane-q >/dev/null 2>&1 &
+  commit_pid=$!
+  fm_test_wait_for_file "$observed" "$commit_pid" || fail "transition commit did not wait for metadata custody"
+  : > "$release"
+  wait "$holder" || fail "metadata replacement fixture could not publish under custody"
+  if wait "$commit_pid"; then
+    fail "transition commit accepted metadata replaced under its shared lock boundary"
+  fi
+  [ ! -e "$marker" ] || fail "stale transition committed after metadata replacement"
+  pass "Herdr transition commits serialize and revalidate metadata replacement"
+}
+
+test_clear_transition_migrates_legacy_generation() {
+  local dir state window key marker owner generation
+  dir="$TMP_ROOT/clear-transition-legacy-generation"; state="$dir/state"; mkdir -p "$state"
+  window=default:wG:pQ
+  fm_write_meta "$state/lane-q.meta" "window=$window" "backend=herdr" "kind=ship"
+  key=$(bash -c '. "$0/bin/fm-marker-state-lib.sh"; fm_marker_identity_key "$1"' "$ROOT" "$window")
+  marker="$state/.herdr-escalated-$key"
+  owner="$state/.marker-owner-herdr-transition-$key"
+  printf '%s' "$window" > "$marker"
+  printf '%s' "$window" > "$owner"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" "$window" lane-q || fail "legacy generation teardown clear was refused"
+  generation=$(sed -n 's/^generation_id=//p' "$state/lane-q.meta")
+  case "$generation" in legacy-a???????????????) ;; *) fail "legacy generation was not migrated exactly: $generation" ;; esac
+  [ "$(grep -c '^generation_id=' "$state/lane-q.meta")" -eq 1 ] || fail "legacy migration published duplicate generation identity"
+  [ ! -e "$marker" ] && [ ! -e "$owner" ] || fail "legacy generation clear retained transition custody"
+  pass "Herdr teardown migrates legacy generation identity before exact clear"
+}
+
 test_clear_transition_removes_task_marker() {
   local dir state marker
   dir="$TMP_ROOT/clear-transition"; state="$dir/state"; mkdir -p "$state"
@@ -4589,6 +4646,8 @@ if [ "${FM_TEST_FOCUSED:-}" = transition-marker-identity ]; then
   test_apply_transition_working_clears_marker
   test_buffered_transition_refuses_reassigned_window
   test_transition_refuses_replaced_metadata_identity
+  test_transition_commit_serializes_metadata_replacement
+  test_clear_transition_migrates_legacy_generation
   test_clear_transition_removes_task_marker
   test_apply_transition_defer_and_fallback_are_noops
   test_wait_transition_reconcile_dedupes_when_marked
@@ -4718,6 +4777,8 @@ test_apply_transition_blocked_requires_commit_to_dedupe
 test_apply_transition_working_clears_marker
 test_buffered_transition_refuses_reassigned_window
 test_transition_refuses_replaced_metadata_identity
+test_transition_commit_serializes_metadata_replacement
+test_clear_transition_migrates_legacy_generation
 test_clear_transition_removes_task_marker
 test_apply_transition_defer_and_fallback_are_noops
 test_wait_transition_no_panes_returns_2

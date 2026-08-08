@@ -1136,7 +1136,7 @@ fm_backend_wait_transition() {  # <backend> <session> <timeout_secs> <state_dir>
   esac
 }
 
-fm_backend_commit_transition() {  # <backend> <state_dir> <session> <record> [task] [lifecycle-lock]
+fm_backend_commit_transition() {  # <backend> <state_dir> <session> <record> [task] [lifecycle-lock] [metadata-lock]
   local backend=$1
   shift
   fm_backend_has_push "$backend" || return 1
@@ -1169,7 +1169,7 @@ fm_backend_transition_record_matches() {  # <backend> <state_dir> <session> <rec
   esac
 }
 
-fm_backend_clear_transition() {  # <backend> <state_dir> <window> [task] [lifecycle-lock]
+fm_backend_clear_transition() {  # <backend> <state_dir> <window> [task] [lifecycle-lock] [metadata-lock]
   local backend=$1
   shift
   fm_backend_has_push "$backend" || return 0

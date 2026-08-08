@@ -82,6 +82,18 @@ MARKER=$(transition_marker default:wG:pQ)
 pass "handle_push_transition: enqueue failure cannot commit the Herdr dedupe marker"
 
 reset_state
+write_event_meta tk1 default:wG:pQ ship
+MARKER=$(transition_marker default:wG:pQ)
+(
+  fm_backend_commit_transition() { return 1; }
+  handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
+) >/dev/null 2>&1 || true
+[ -e "$STATE_DIR/.wake-queue" ] || fail "a post-enqueue commit failure lost durable wake evidence"
+[ -s "$WAKE_LOG" ] || fail "a post-enqueue commit failure did not surface its durable wake"
+[ ! -e "$MARKER" ] || fail "a failed transition commit published a dedupe marker"
+pass "handle_push_transition resurfaces durable wake evidence after commit failure"
+
+reset_state
 write_event_meta tk-old default:wG:pQ ship
 OLD_RECORD=$(mkrec wG:pQ blocked)
 rm -f "$STATE_DIR/tk-old.meta"

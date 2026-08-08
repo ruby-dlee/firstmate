@@ -3355,7 +3355,7 @@ fm_backend_herdr_safe_meta_load() {
 }
 
 fm_backend_herdr_binding_for_window() {
-  local state=$1 window=$2 meta task owner= generation= identity= count=0
+  local state=$1 window=$2 allow_legacy=${3:-} meta task owner= generation= identity= count=0
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || [ -L "$meta" ] || continue
@@ -3366,7 +3366,7 @@ fm_backend_herdr_binding_for_window() {
     fm_backend_herdr_safe_meta_load "$meta" || return 1
     [ "$FM_BACKEND_HERDR_META_BACKEND" = herdr ] || continue
     [ "$FM_BACKEND_HERDR_META_WINDOW" = "$window" ] || continue
-    [ -n "$FM_BACKEND_HERDR_META_GENERATION" ] || return 1
+    [ -n "$FM_BACKEND_HERDR_META_GENERATION" ] || [ "$allow_legacy" = allow-legacy ] || return 1
     owner=$task
     generation=$FM_BACKEND_HERDR_META_GENERATION
     identity=$FM_BACKEND_HERDR_META_IDENTITY
@@ -3429,6 +3429,40 @@ fm_backend_herdr_lifecycle_lock_owned() {
   esac
   parent_start=$(fm_account_process_start_time "$PPID" 2>/dev/null) || return 1
   [ "$pid" = "$PPID" ] && [ -n "$parent_start" ] && [ "$start" = "$parent_start" ]
+}
+
+fm_backend_herdr_meta_lock_owned() {
+  local state=$1 task=$2 lock=$3
+  [ "$lock" = "$state/.account-meta-$task.lock" ] || return 1
+  fm_account_reclaim_guard_owned "$lock"
+}
+
+fm_backend_herdr_backfill_legacy_generation_locked() {
+  local state=$1 task=$2 window=$3 identity=$4 lock=$5 meta current attempt generation tmp binding
+  fm_backend_herdr_meta_lock_owned "$state" "$task" "$lock" || return 1
+  current=$(fm_backend_herdr_binding_for_window "$state" "$window" allow-legacy) || return 1
+  [ "$current" = "$task"$'\t'$'\t'"$window"$'\t'"$identity" ] || return 1
+  attempt=$(fm_account_attempt_id "$FM_HOME" "$task") || return 1
+  generation="legacy-$attempt"
+  meta="$state/$task.meta"
+  tmp=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" "$state/.$task.meta.generation.XXXXXX" 2>/dev/null) || return 1
+  {
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_CAT_BIN" "$meta"
+    printf '\ngeneration_id=%s\n' "$generation"
+  } > "$tmp" || {
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+    return 1
+  }
+  fm_account_safe_file_destination "$meta" || {
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+    return 1
+  }
+  fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MV_BIN" "$tmp" "$meta" || {
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+    return 1
+  }
+  binding=$(fm_backend_herdr_binding_for_window "$state" "$window") || return 1
+  printf '%s' "$binding"
 }
 
 fm_backend_herdr_record_binding_matches() {
@@ -3508,7 +3542,7 @@ fm_backend_herdr_escalation_marker() {  # <state_dir> <window>
 # with no output. <session> reconstructs the exact window
 # ("<session>:<pane_id>") for the marker key.
 fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record>
-  local state=$1 session=$2 record=$3 pane_id to action window task generation identity lock marker result=1 output=
+  local state=$1 session=$2 record=$3 pane_id to action window task generation identity lock meta_lock marker result=1 output=
   pane_id=$(fm_transition_pane_id "$record")
   [ -n "$pane_id" ] || return 1
   to=$(fm_transition_to_status "$record")
@@ -3519,6 +3553,10 @@ fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record>
   identity=$(fm_transition_meta_identity "$record")
   [ "$window" = "$session:$pane_id" ] || return 1
   lock=$(fm_account_lifecycle_lock_acquire "$state" "$task") || return 1
+  meta_lock=$(fm_account_meta_lock_acquire "$state" "$task") || {
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+    return 1
+  }
   if fm_backend_herdr_binding_matches "$state" "$task" "$generation" "$window" "$identity"; then
     marker=$(fm_backend_herdr_escalation_marker "$state" "$window" "$task" "$generation" "$identity" 2>/dev/null || true)
     if [ -n "$marker" ] && fm_marker_state_path_safe_or_absent "$marker"; then
@@ -3536,13 +3574,14 @@ fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record>
       esac
     fi
   fi
+  fm_account_meta_lock_release "$meta_lock" >/dev/null 2>&1 || result=1
   fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || result=1
   [ "$result" -ne 0 ] || printf '%s' "$output"
   return "$result"
 }
 
-fm_backend_herdr_commit_transition() {  # <state_dir> <session> <record> [task] [lifecycle-lock]
-  local state=$1 session=$2 record=$3 expected_task=${4:-} inherited=${5:-} pane_id task generation window identity lock marker result=0 owned=0
+fm_backend_herdr_commit_transition() {  # <state_dir> <session> <record> [task] [lifecycle-lock] [metadata-lock]
+  local state=$1 session=$2 record=$3 expected_task=${4:-} inherited=${5:-} inherited_meta=${6:-} pane_id task generation window identity lock meta_lock marker result=0 owned=0 meta_owned=0
   pane_id=$(fm_transition_pane_id "$record")
   [ -n "$pane_id" ] || return 1
   task=$(fm_transition_task_id "$record")
@@ -3558,20 +3597,34 @@ fm_backend_herdr_commit_transition() {  # <state_dir> <session> <record> [task] 
     lock=$(fm_account_lifecycle_lock_acquire "$state" "$task") || return 1
     owned=1
   fi
+  if [ -n "$inherited_meta" ]; then
+    fm_backend_herdr_meta_lock_owned "$state" "$task" "$inherited_meta" || {
+      [ "$owned" -ne 1 ] || fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+      return 1
+    }
+    meta_lock=$inherited_meta
+  else
+    meta_lock=$(fm_account_meta_lock_acquire "$state" "$task") || {
+      [ "$owned" -ne 1 ] || fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+      return 1
+    }
+    meta_owned=1
+  fi
   fm_backend_herdr_binding_matches "$state" "$task" "$generation" "$window" "$identity" || result=1
   if [ "$result" -eq 0 ]; then
     marker=$(fm_backend_herdr_escalation_marker "$state" "$window" "$task" "$generation" "$identity") || result=1
   fi
   [ "$result" -ne 0 ] || fm_backend_herdr_binding_matches "$state" "$task" "$generation" "$window" "$identity" || result=1
   [ "$result" -ne 0 ] || fm_marker_atomic_write "$marker" "$window" || result=1
+  [ "$meta_owned" -ne 1 ] || fm_account_meta_lock_release "$meta_lock" >/dev/null 2>&1 || result=1
   [ "$owned" -ne 1 ] || fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || result=1
   return "$result"
 }
 
-fm_backend_herdr_clear_transition() {  # <state_dir> <window> [task] [lifecycle-lock]
-  local state=$1 window=$2 expected_task=${3:-} inherited=${4:-} binding task generation identity lock marker key owner result=0 owned=0
+fm_backend_herdr_clear_transition() {  # <state_dir> <window> [task] [lifecycle-lock] [metadata-lock]
+  local state=$1 window=$2 expected_task=${3:-} inherited=${4:-} inherited_meta=${5:-} binding current task generation identity lock meta_lock marker key owner result=0 owned=0 meta_owned=0
   [ -n "$window" ] || return 0
-  binding=$(fm_backend_herdr_binding_for_window "$state" "$window") || return 1
+  binding=$(fm_backend_herdr_binding_for_window "$state" "$window" allow-legacy) || return 1
   task=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f1)
   generation=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f2)
   identity=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f4)
@@ -3582,6 +3635,28 @@ fm_backend_herdr_clear_transition() {  # <state_dir> <window> [task] [lifecycle-
   else
     lock=$(fm_account_lifecycle_lock_acquire "$state" "$task") || return 1
     owned=1
+  fi
+  if [ -n "$inherited_meta" ]; then
+    fm_backend_herdr_meta_lock_owned "$state" "$task" "$inherited_meta" || {
+      [ "$owned" -ne 1 ] || fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+      return 1
+    }
+    meta_lock=$inherited_meta
+  else
+    meta_lock=$(fm_account_meta_lock_acquire "$state" "$task") || {
+      [ "$owned" -ne 1 ] || fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+      return 1
+    }
+    meta_owned=1
+  fi
+  current=$(fm_backend_herdr_binding_for_window "$state" "$window" allow-legacy) || result=1
+  [ "$result" -ne 0 ] || [ "$current" = "$binding" ] || result=1
+  if [ "$result" -eq 0 ] && [ -z "$generation" ]; then
+    binding=$(fm_backend_herdr_backfill_legacy_generation_locked "$state" "$task" "$window" "$identity" "$meta_lock") || result=1
+    if [ "$result" -eq 0 ]; then
+      generation=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f2)
+      identity=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f4)
+    fi
   fi
   fm_backend_herdr_binding_matches "$state" "$task" "$generation" "$window" "$identity" || result=1
   if [ "$result" -eq 0 ]; then
@@ -3598,6 +3673,7 @@ fm_backend_herdr_clear_transition() {  # <state_dir> <window> [task] [lifecycle-
   fi
   [ "$result" -ne 0 ] || fm_marker_safe_file_equals "$owner" "$window" || result=1
   [ "$result" -ne 0 ] || fm_backend_herdr_control_exec rm -f "$owner" 2>/dev/null || result=1
+  [ "$meta_owned" -ne 1 ] || fm_account_meta_lock_release "$meta_lock" >/dev/null 2>&1 || result=1
   [ "$owned" -ne 1 ] || fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || result=1
   return "$result"
 }

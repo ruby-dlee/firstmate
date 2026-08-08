@@ -1493,6 +1493,25 @@ PY
   pass "immediate direct-spawn rollback clears transition custody before metadata restore"
 }
 
+test_direct_recovery_clears_old_herdr_transition_before_replacement() {
+  python3 - "$ROOT/bin/fm-spawn.sh" <<'PY'
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+start = text.index('if [ "$RECOVERY_ACCOUNT" = 1 ]; then\n  RECORDED_TARGET=')
+install = text.index('META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1', start)
+block = text[start:install]
+clear = block.index('fm_backend_clear_transition "$BACKEND" "$STATE" "$RECORDED_TARGET" "$ID" "$LIFECYCLE_LOCK"')
+absence = block.index('case "$RECOVERY_ENDPOINT_STATE" in')
+if clear <= absence:
+    raise SystemExit("direct recovery clears before endpoint absence is proved")
+if '[ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] && [ "$BACKEND" = herdr ]' not in block:
+    raise SystemExit("direct recovery transition clear is not restricted to the Herdr route")
+PY
+  pass "direct recovery clears old Herdr transition custody before replacement"
+}
+
 test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails() {
   local record id out status meta
   reset_accounts
@@ -1586,6 +1605,7 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = direct-spawn-transition-custody ]; then
   test_failed_direct_spawn_clears_transition_before_metadata_restore
+  test_direct_recovery_clears_old_herdr_transition_before_replacement
   exit 0
 fi
 
@@ -1595,6 +1615,7 @@ if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
   test_direct_recovery_rejects_secondmate_metadata
   test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
   test_failed_direct_spawn_clears_transition_before_metadata_restore
+  test_direct_recovery_clears_old_herdr_transition_before_replacement
   test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
   test_failed_new_direct_spawn_never_records_an_uncreated_endpoint
   exit 0
@@ -1654,6 +1675,7 @@ test_direct_recovery_tracks_retained_replacement_endpoint
 test_new_direct_spawn_tracks_retained_endpoint_and_worktree
 test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
 test_failed_direct_spawn_clears_transition_before_metadata_restore
+test_direct_recovery_clears_old_herdr_transition_before_replacement
 test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
 test_failed_new_direct_spawn_never_records_an_uncreated_endpoint
 test_routing_off_keeps_default_provider_launch

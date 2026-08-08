@@ -1081,6 +1081,14 @@ ACCOUNT_NATIVE_LAUNCH_READY=
 ACCOUNT_NATIVE_LAUNCH_GO=
 ACCOUNT_NATIVE_LAUNCH_DIR=
 DIRECT_ACCOUNT_ROUTING=0
+# Secondmate account selection. A secondmate is a long-lived supervisor whose
+# workspace is a firstmate home, not a task worktree, so it must NOT take on
+# DIRECT_ACCOUNT_ROUTING's worktree-identity, authoritative-final-state, and
+# fresh-selection-per-respawn contract. This flag is the narrow half it does
+# need: pick a rotated account directory and bind the provider identity onto the
+# launch, so secondmates stop inheriting whatever ambient identity the primary
+# happened to be running under and stop piling onto one account.
+DIRECT_ACCOUNT_SECONDMATE=0
 DIRECT_ACCOUNT_HOME=
 # Environment delivered natively by `herdr agent start --env KEY=VALUE` (one
 # repeated flag per entry). Empty for every other backend, which has no native
@@ -2629,6 +2637,26 @@ if { [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] \
     ACCOUNT_EFFECTIVE_MODE=off
   fi
 fi
+# Secondmate launches take the same rotated account directory as crewmates.
+# Before this, they fell through to the legacy Agent Fleet path, which in observe
+# mode is shadow-only ("no lease; legacy launch unchanged") and never binds an
+# identity - so every secondmate inherited the ambient CLAUDE_CONFIG_DIR and the
+# whole fleet's supervisor load landed on one account. Only the account binding is
+# shared; DIRECT_ACCOUNT_ROUTING stays 0 so a secondmate home is never treated as a
+# task worktree, and its metadata keeps the same shape ordinary respawn expects.
+if [ "$KIND" = secondmate ] && [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$RAW_LAUNCH" != 1 ] \
+  && [ "$ACCOUNT_EFFECTIVE_MODE" != off ]; then
+  case "$HARNESS" in
+    claude|codex)
+      DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS") || exit 1
+      DIRECT_ACCOUNT_SECONDMATE=1
+      echo "fm-spawn: selected direct $HARNESS account home $DIRECT_ACCOUNT_HOME for secondmate $ID" >&2
+      # The shadow Agent Fleet observe pass below would only re-derive a decision
+      # nothing applies; the account is already bound, so skip it.
+      ACCOUNT_EFFECTIVE_MODE=off
+      ;;
+  esac
+fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ -z "$ACCOUNT_POOL" ]; then
   if [ -n "$ACCOUNT_PROFILE" ]; then
     ACCOUNT_POOL=explicit
@@ -3542,7 +3570,7 @@ if [ "$RESUME_ACCOUNT" = 1 ]; then
   esac
 fi
 AGENT_COMMAND=$HARNESS
-if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
+if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ] || [ "$DIRECT_ACCOUNT_SECONDMATE" = 1 ]; then
   # herdr delivers the account directory NATIVELY, as `agent start --env KEY=VALUE`
   # (HERDR_AGENT_ENV below), instead of as a command-scoped shell prefix. Verified
   # before making the switch: no login profile on this machine sets CODEX_HOME or

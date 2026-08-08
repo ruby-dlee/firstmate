@@ -559,6 +559,36 @@ lavish_axi_compatible() {
   fm_lavish_version_compatible "$output" 1
 }
 
+# quota-axi needs a version floor, not just presence. Releases before 0.1.19
+# hardcode Claude's default ~/.claude credential path and ignore
+# CLAUDE_CONFIG_DIR, so every per-account probe silently answers for one shared
+# identity. That reads as "all accounts look identical", which is
+# indistinguishable from a healthy fleet right up until dispatch routes work into
+# an account that is already empty. A silent downgrade must be a reported
+# problem, not an invisible loss of the signal account selection depends on.
+QUOTA_AXI_MIN_MAJOR=0
+QUOTA_AXI_MIN_MINOR=1
+QUOTA_AXI_MIN_PATCH=19
+
+quota_axi_compatible() {
+  local output parts major minor patch rest
+  command -v quota-axi >/dev/null 2>&1 || return 1
+  output=$(quota-axi --version 2>/dev/null) || return 1
+  parts=$(printf '%s\n' "$output" |
+    sed -n 's/.*\([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2 \3/p' |
+    head -1)
+  [ -n "$parts" ] || return 1
+  major=${parts%% *}
+  rest=${parts#* }
+  minor=${rest%% *}
+  patch=${rest##* }
+  [ "$major" -gt "$QUOTA_AXI_MIN_MAJOR" ] && return 0
+  [ "$major" -lt "$QUOTA_AXI_MIN_MAJOR" ] && return 1
+  [ "$minor" -gt "$QUOTA_AXI_MIN_MINOR" ] && return 0
+  [ "$minor" -lt "$QUOTA_AXI_MIN_MINOR" ] && return 1
+  [ "$patch" -ge "$QUOTA_AXI_MIN_PATCH" ]
+}
+
 # Write CONTENT to DEST only when it differs, so re-running bootstrap does not
 # churn mtimes or duplicate generated files (idempotence).
 write_if_changed() {
@@ -885,6 +915,9 @@ if command -v lavish-axi >/dev/null 2>&1 && ! lavish_axi_compatible; then
 fi
 if command -v tasks-axi >/dev/null 2>&1 && ! fm_tasks_axi_compatible; then
   echo "MISSING: tasks-axi (install: $(install_cmd tasks-axi))"
+fi
+if command -v quota-axi >/dev/null 2>&1 && ! quota_axi_compatible; then
+  echo "MISSING: quota-axi $QUOTA_AXI_MIN_MAJOR.$QUOTA_AXI_MIN_MINOR.$QUOTA_AXI_MIN_PATCH+ required for per-account Claude quota; older releases ignore CLAUDE_CONFIG_DIR and report one shared identity for every account (install: $(install_cmd quota-axi))"
 fi
 gh auth status >/dev/null 2>&1 || echo "NEEDS_GH_AUTH"
 # Worktree-tangle check: the firstmate primary checkout (FM_ROOT) must sit on its

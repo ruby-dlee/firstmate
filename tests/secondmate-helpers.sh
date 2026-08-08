@@ -46,7 +46,7 @@ case "${1:-}" in
     fi
     exit 0
     ;;
-  display-message)
+  has-session|display-message)
     target= format=
     prev=
     for arg in "$@"; do

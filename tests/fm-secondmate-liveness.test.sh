@@ -60,7 +60,7 @@ make_probe_tmux() {
 #!/usr/bin/env bash
 set -u
 case "\${1:-}" in
-  display-message)
+  has-session|display-message)
     for a in "\$@"; do case "\$a" in *pane_current_command*) printf '%s\n' '$comm'; exit 0 ;; esac; done
     exit 0 ;;
 esac
@@ -238,7 +238,7 @@ make_liveness_tmux() {
 #!/usr/bin/env bash
 set -u
 case "${1:-}" in
-  display-message)
+  has-session|display-message)
     for a in "$@"; do
       case "$a" in
         *pane_current_command*)
@@ -249,24 +249,6 @@ case "${1:-}" in
           fi
           [ -z "${FM_TEST_PROBE_LOG:-}" ] || printf 'probe\n' >> "$FM_TEST_PROBE_LOG"
           printf '%s\n' "$pane_command"
-          exit 0
-          ;;
-        # The endpoint identity read. Real tmux answers this with the target's
-        # live session and window name, and the adapter's identity guard now
-        # actually checks it, so the stub has to model it rather than return
-        # nothing: it echoes back the session:window it was asked about, and
-        # only while the endpoint still exists.
-        *window_name*)
-          [ -f "${FM_TEST_ENDPOINT_FILE:?}" ] || exit 1
-          prev=
-          for arg in "$@"; do
-            [ "$prev" = -t ] && { target=$arg; break; }
-            prev=$arg
-          done
-          case "${target:-}" in
-            *:*) printf '%s\t%s\n' "${target%%:*}" "${target#*:}" ;;
-            *) exit 1 ;;
-          esac
           exit 0
           ;;
       esac
@@ -312,10 +294,6 @@ case "${1:-}" in
     esac
     exit 0 ;;
   list-windows) exit 0 ;;
-  # Existence is now proven with has-session, so it has to track the endpoint
-  # the same way the identity read does; an unconditional success here would
-  # report a killed window as still live.
-  has-session) [ -f "${FM_TEST_ENDPOINT_FILE:?}" ]; exit $? ;;
 esac
 exit 0
 SH

@@ -31,20 +31,12 @@ done
 case "${1:-}" in
   # Endpoint existence is proven with has-session now; every target in this
   # fixture models a window that still exists.
-  has-session) exit 0 ;;
-  display-message)
+  has-session|display-message)
     case "$*" in
       *pane_current_command*)
         case "$target" in
           *dead-secondmate*) printf 'zsh\n' ;;
           *) printf 'codex\n' ;;
-        esac
-        ;;
-      # The identity read is echoed back from the target, as tmux answers it.
-      *window_name*)
-        case "$target" in
-          *:*) printf '%s\t%s\n' "${target%%:*}" "${target#*:}" ;;
-          *) exit 1 ;;
         esac
         ;;
       *) printf '%%1\n' ;;

@@ -37,7 +37,7 @@ case "${1:-}" in
     done
     printf 'send-keys target=%s literal=%s arg=%s\n' "$target" "$literal" "${1:-}" >> "$FM_TMUX_LOG"
     exit 0 ;;
-  display-message)
+  has-session|display-message)
     target=
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -55,11 +55,13 @@ case "${1:-}" in
       # resolves; the tests that deliberately exercise an identity MISMATCH set
       # FM_FAKE_TMUX_SESSION/FM_FAKE_TMUX_LABEL explicitly to override it.
       *'#{session_name}'*)
-        default_session=sess; default_label=fm-lost
-        case "$target" in
-          *:*) default_session=${target%%:*}; default_label=${target#*:} ;;
-        esac
-        printf '%s\t%s\n' "${FM_FAKE_TMUX_SESSION:-$default_session}" "${FM_FAKE_TMUX_LABEL:-$default_label}" ;;
+        default_session=sess
+        case "$target" in *:*) default_session=${target%%:*} ;; esac
+        printf '%s\n' "${FM_FAKE_TMUX_SESSION:-$default_session}" ;;
+      *'#{window_name}'*)
+        default_label=fm-lost
+        case "$target" in *:*) default_label=${target#*:} ;; esac
+        printf '%s\n' "${FM_FAKE_TMUX_LABEL:-$default_label}" ;;
       *) printf '%%1\n' ;;
     esac
     exit 0 ;;
@@ -72,16 +74,6 @@ case "${1:-}" in
     exit 0 ;;
   # Existence is proven with has-session now, so a target the fixture declares
   # dead has to fail here too, not only on the identity read.
-  has-session)
-    target=
-    while [ $# -gt 0 ]; do
-      case "$1" in
-        -t) target=$2; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    [ -z "${FM_FAKE_TMUX_DEAD_TARGET:-}" ] || [ "$target" != "$FM_FAKE_TMUX_DEAD_TARGET" ] || exit 1
-    exit 0 ;;
 esac
 exit 0
 SH

@@ -152,7 +152,7 @@ make_fake_tmux() {
 #!/usr/bin/env bash
 set -u
 case "\${1:-}" in
-  display-message)
+  has-session|display-message)
     target=""
     prev=""
     for a in "\$@"; do

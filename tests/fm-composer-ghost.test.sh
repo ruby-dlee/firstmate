@@ -43,17 +43,8 @@ make_fake_tmux() {  # <dir>
 #!/usr/bin/env bash
 set -u
 case "${1:-}" in
-  display-message)
+  has-session|display-message)
     for a in "$@"; do case "$a" in *cursor_y*) printf '%s\n' "${FM_FAKE_CY:-0}"; exit 0 ;; esac; done
-    for a in "$@"; do case "$a" in
-      *window_name*)
-        prev=; ident_target=
-        for arg in "$@"; do [ "$prev" = -t ] && { ident_target=$arg; break; }; prev=$arg; done
-        case "$ident_target" in
-          *:*) printf '%s\t%s\n' "${ident_target%%:*}" "${ident_target#*:}"; exit 0 ;;
-          *) exit 1 ;;
-        esac ;;
-    esac; done
     printf 'fakepane\n'; exit 0 ;;
   capture-pane)
     has_e=0
@@ -70,7 +61,6 @@ case "${1:-}" in
   # The fixture models a LIVE pane, and endpoint existence is proven with
   # has-session; this stub's catch-all is a failure, so it has to be answered
   # explicitly or every read would treat the pane as gone.
-  has-session) exit 0 ;;
 esac
 exit 1
 SH

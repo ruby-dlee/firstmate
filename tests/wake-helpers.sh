@@ -183,7 +183,7 @@ make_supercase() {
 #!/usr/bin/env bash
 set -u
 case "${1:-}" in
-  display-message)
+  has-session|display-message)
     [ "${FM_FAKE_TMUX_PANE_ALIVE:-1}" = "1" ] || exit 1
     _print=0
     # Return cursor_y when the format asks for it (pane_input_pending).
@@ -264,7 +264,7 @@ make_bordered_case() {
 set -u
 COMPOSER="${FM_FAKE_COMPOSER:?FM_FAKE_COMPOSER unset}"
 case "${1:-}" in
-  display-message)
+  has-session|display-message)
     print=0
     for a in "$@"; do case "$a" in *cursor_y*) printf '0\n'; exit 0 ;; esac; done
     for a in "$@"; do [ "$a" = "-p" ] && print=1; done

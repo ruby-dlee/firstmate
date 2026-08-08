@@ -92,7 +92,7 @@ case "$*" in
     ;;
 esac
 case "${1:-}" in
-  display-message) printf 'firstmate\n'; exit 0 ;;
+  has-session|display-message) printf 'firstmate\n'; exit 0 ;;
   capture-pane) printf '│ │\n'; exit 0 ;;
   list-panes) [ "${FM_FAKE_TARGET_STATE:-auto}" != unknown ]; exit $? ;;
   list-windows)

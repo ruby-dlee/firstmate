@@ -198,20 +198,7 @@ case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
 esac
 case "${1:-}" in
-  display-message)
-    # The identity read is echoed back from the -t target, as tmux answers it;
-    # the bare 'firstmate' answer is the container-ensure '#S' query and must
-    # stay unchanged.
-    case "$*" in
-      *window_name*)
-        target=""; prev=""
-        for arg in "$@"; do [ "$prev" = "-t" ] && target=$arg; prev=$arg; done
-        case "$target" in
-          *:*) printf '%s\t%s\n' "${target%%:*}" "${target#*:}"; exit 0 ;;
-          *) exit 1 ;;
-        esac ;;
-    esac
-    printf 'firstmate\n'; exit 0 ;;
+  has-session|display-message) printf 'firstmate\n'; exit 0 ;;
   list-windows) [ -z "${FM_FAKE_TMUX_WINDOWS:-}" ] || printf '%s\n' "$FM_FAKE_TMUX_WINDOWS"; exit 0 ;;
   has-session|new-session|new-window|send-keys|set-window-option) exit 0 ;;
 esac
@@ -299,18 +286,7 @@ case "${1:-}" in
     done
     printf 'send-keys target=%s literal=%s arg=%s\n' "$target" "$literal" "${1:-}" >> "$FM_TMUX_LOG"
     exit 0 ;;
-  display-message)
-    # The identity read is echoed back from the -t target, as tmux answers it.
-    case "$*" in
-      *window_name*)
-        ident_target=""; prev=""
-        for arg in "$@"; do [ "$prev" = "-t" ] && ident_target=$arg; prev=$arg; done
-        case "$ident_target" in
-          *:*) printf '%s\t%s\n' "${ident_target%%:*}" "${ident_target#*:}"; exit 0 ;;
-          *) exit 1 ;;
-        esac ;;
-    esac
-    printf '%%1\n'; exit 0 ;;
+  has-session|display-message) printf '%%1\n'; exit 0 ;;
   capture-pane) printf '\xe2\x94\x82 \xe2\x94\x82\n'; exit 0 ;;
 esac
 exit 0
@@ -379,18 +355,10 @@ case "${1:-}" in
   # marker the rest of this stub does: leaving it an unconditional success
   # would report the window as alive forever after kill-window, which is
   # exactly the false positive that blocks teardown.
-  has-session) [ -f "$state" ] || exit 1; exit 0 ;;
-  display-message)
+  has-session|display-message)
     [ -f "$state" ] || exit 1
     case " $* " in
       *' #{pane_current_command} '*) printf '%s\n' bash ;;
-      *'#{window_name}'*)
-        ident_target=""; prev=""
-        for arg in "$@"; do [ "$prev" = "-t" ] && ident_target=$arg; prev=$arg; done
-        case "$ident_target" in
-          *:*) printf '%s\t%s\n' "${ident_target%%:*}" "${ident_target#*:}" ;;
-          *) exit 1 ;;
-        esac ;;
     esac
     exit 0
     ;;

@@ -711,8 +711,18 @@ test_managed_tmux_target_identity_checks_recorded_session() {
   fake_label=fm-intended-task
   tmux() {
     printf '%s\n' "$*" >> "$log"
-    case "$*" in
-      *'#{session_name}'*) printf '%s\t%s\n' "$fake_session" "$fake_label" ;;
+    # Scoped to display-message: the identity fields are queried one at a time
+    # (a tab inside a tmux format string is not portable - tmux 3.4 renders it
+    # as "_" - so the adapter reads #{session_name} and #{window_name}
+    # separately), and `list-windows -F '#{window_name}'` must NOT be answered
+    # as an identity read.
+    case "${1:-}" in
+      has-session|display-message)
+        case "$*" in
+          *'#{session_name}'*) printf '%s\n' "$fake_session" ;;
+          *'#{window_name}'*) printf '%s\n' "$fake_label" ;;
+        esac
+        ;;
     esac
   }
 
@@ -771,7 +781,7 @@ test_managed_tmux_target_state_finds_replacement_window() {
   tmux() {
     printf '%s\n' "$*" >> "$log"
     case "${1:-}" in
-      display-message) return 1 ;;
+      has-session|display-message) return 1 ;;
       list-windows)
         [ "${2:-}" = -t ] && [ "${3:-}" = recorded-session ] || return 1
         printf '%s\n' "$window_names"
@@ -813,12 +823,14 @@ test_managed_tmux_target_state_resolves_id_after_recorded_session_disappears() {
         ;;
       # Whether the stable id still resolves is decided by has-session, not by
       # display-message: real tmux exits 0 from display-message even for a
-      # target that no longer resolves, and with a two-field format it still
-      # prints the separator, so its output is non-empty for a dead id too.
-      has-session) [ "$resolved" = 1 ] ;;
-      display-message)
+      # target that no longer resolves, so its status carries no existence
+      # information at all.
+      has-session|display-message)
         [ "$resolved" = 1 ] || return 1
-        printf 'other-session\tfm-renamed-task\n'
+        case "$*" in
+          *'#{session_name}'*) printf 'other-session\n' ;;
+          *'#{window_name}'*) printf 'fm-renamed-task\n' ;;
+        esac
         ;;
       *) return 1 ;;
     esac
@@ -843,7 +855,7 @@ set -u
 { printf 'tmux'; for a in "$@"; do printf '\x1f%s' "$a"; done; printf '\n'; } >> "${FM_TMUX_LOG:?}"
 case "${1:-}" in
   send-keys) exit 0 ;;
-  display-message)
+  has-session|display-message)
     for a in "$@"; do case "$a" in *cursor_y*) printf '0\n'; exit 0 ;; esac; done
     printf 'fakepane\n'; exit 0 ;;
   capture-pane) printf '\xe2\x94\x82 \xe2\x94\x82\n'; exit 0 ;;
@@ -995,7 +1007,7 @@ make_spawn_fakebin() {  # <dir> <fake-worktree-path> -> echoes fakebin dir
 set -u
 { printf 'tmux'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
 case "\${1:-}" in
-  display-message)
+  has-session|display-message)
     for a in "\$@"; do case "\$a" in *pane_current_path*) printf '%s\\n' "$wt"; exit 0 ;; esac; done
     printf 'firstmate\\n'; exit 0 ;;
   list-windows) exit 0 ;;
@@ -1065,7 +1077,7 @@ make_spawn_symlink_fakebin() {  # <dir> <initial-project-path> <worktree-path> -
 set -u
 { printf 'tmux'; for a in "\$@"; do printf '\\x1f%s' "\$a"; done; printf '\\n'; } >> "\${FM_TMUX_LOG:?}"
 case "\${1:-}" in
-  display-message)
+  has-session|display-message)
     for a in "\$@"; do case "\$a" in *pane_current_path*)
       printf x >> "$counter"
       if [ "\$(wc -c < "$counter")" -le 1 ]; then
@@ -1155,7 +1167,7 @@ for argument in "$@"; do
   previous=$argument
 done
 case "${1:-}" in
-  display-message)
+  has-session|display-message)
     [ -e "$live" ] || exit 1
     case "${*: -1}" in
       *session_name*window_name*) printf 'firstmate\t%s\n' "${target#*:}" ;;

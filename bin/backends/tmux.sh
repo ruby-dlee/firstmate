@@ -154,7 +154,7 @@ fm_backend_tmux_expected_label_matches() {  # <target> [expected-label] [recorde
   # as empty and hides the fault entirely.
   local target=$1 expected_label=${2:-} recorded_scoped_target=${3:-} expected_session=''
   local FM_TMUX_TARGET_SESSION='' FM_TMUX_TARGET_WINDOW='' FM_TMUX_TARGET_PANE=''
-  local actual_identity='' actual_session='' actual_label=''
+  local actual_session='' actual_label=''
   [ -n "$expected_label" ] || [ -n "$recorded_scoped_target" ] || return 0
   if [ -n "$recorded_scoped_target" ]; then
     case "$recorded_scoped_target" in
@@ -171,10 +171,15 @@ fm_backend_tmux_expected_label_matches() {  # <target> [expected-label] [recorde
       # format its output is non-empty (a bare separator) even then, so the
       # old non-empty check could not tell a live id from a dead one.
       fm_backend_tmux_target_exists "$target" || return 1
-      actual_identity=$(tmux display-message -p -t "$target" '#{session_name}	#{window_name}' 2>/dev/null) || return 1
-      actual_session=${actual_identity%%$'\t'*}
-      actual_label=${actual_identity#*$'\t'}
-      [ "$actual_identity" != "$actual_session" ] || return 1
+      # The two identity fields are read SEPARATELY rather than joined by a tab
+      # in one format string. A tab-joined read is not portable: tmux 3.4
+      # renders a literal TAB inside a format as "_", so
+      # '#{session_name}<TAB>#{window_name}' comes back as "S_fm-live" and can
+      # never be split into its two fields again - which silently made the
+      # identity of every @window-id unverifiable there.
+      actual_session=$(tmux display-message -p -t "$target" '#{session_name}' 2>/dev/null) || return 1
+      actual_label=$(tmux display-message -p -t "$target" '#{window_name}' 2>/dev/null) || return 1
+      [ -n "$actual_session" ] && [ -n "$actual_label" ] || return 1
       [ -z "$expected_label" ] || [ "$actual_label" = "$expected_label" ] || return 1
       [ -z "$expected_session" ] || [ "$actual_session" = "$expected_session" ]
       ;;

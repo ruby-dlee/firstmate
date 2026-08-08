@@ -61,6 +61,7 @@ FM_CLASSIFY_PAUSED_VERB_DEFAULT='paused'
 # scan that must skip them - so the grammar cannot drift between them.
 _FM_CLASSIFY_PAUSE_OWNER_KEY='owner'
 _FM_CLASSIFY_PAUSE_CLEARS_KEY='clears'
+_FM_CLASSIFY_PAUSE_RUN_KEY='run'
 
 # Failure vocabulary for the FAILURE-PAUSE discriminator.
 #
@@ -169,12 +170,13 @@ _fm_status_has_pause_verb() {  # <status-line>
 _fm_status_pause_prose_headlines() {  # <status-line>
   local n=${FM_CLASSIFY_PAUSE_HEAD_WORDS:-$FM_CLASSIFY_PAUSE_HEAD_WORDS_DEFAULT}
   status_line_note "$1" | awk -F';' -v n="$n" \
-    -v owner_key="$_FM_CLASSIFY_PAUSE_OWNER_KEY" -v clears_key="$_FM_CLASSIFY_PAUSE_CLEARS_KEY" '
+    -v owner_key="$_FM_CLASSIFY_PAUSE_OWNER_KEY" -v clears_key="$_FM_CLASSIFY_PAUSE_CLEARS_KEY" \
+    -v run_key="$_FM_CLASSIFY_PAUSE_RUN_KEY" '
     { for (i = 1; i <= NF; i++) {
         clause = $i
         sub(/^[[:space:]]+/, "", clause)
         sub(/[[:space:]]+$/, "", clause)
-        if (index(clause, owner_key "=") == 1 || index(clause, clears_key "=") == 1) continue
+        if (index(clause, owner_key "=") == 1 || index(clause, clears_key "=") == 1 || index(clause, run_key "=") == 1) continue
         sub(/:.*/, "", clause)
         words = split(clause, word, /[[:space:]]+/)
         out = ""
@@ -206,7 +208,7 @@ status_pause_is_failure() {  # <status-line>
 # Print one semicolon-delimited field from a pause note. Explicit field names make
 # the absorption contract mechanically auditable; inferring ownership or
 # observability from free prose would make malformed waits look healthy again.
-status_pause_field() {  # <status-line> <owner|clears>
+status_pause_field() {  # <status-line> <owner|clears|run>
   local key=$2
   status_line_note "$1" | awk -F';' -v key="$key" '
     { for (i = 1; i <= NF; i++) {
@@ -226,6 +228,7 @@ status_pause_field() {  # <status-line> <owner|clears>
 
 status_pause_owner() { status_pause_field "$1" "$_FM_CLASSIFY_PAUSE_OWNER_KEY"; }
 status_pause_clearing_condition() { status_pause_field "$1" "$_FM_CLASSIFY_PAUSE_CLEARS_KEY"; }
+status_pause_run_id() { status_pause_field "$1" "$_FM_CLASSIFY_PAUSE_RUN_KEY"; }
 
 _fm_pause_field_is_named() {  # <value>
   local value normalized
@@ -405,8 +408,8 @@ signal_reason_is_actionable() {  # <file> ...
 # STATE/FM_STATE_OVERRIDE resolution window_to_task already relies on. Prints nothing
 # when no state dir is known or the file is absent - which the pause gate below treats
 # as "this pause cannot be proven", never as "no decisions are open".
-_fm_status_file_for() {  # <id>
-  local id=$1 state=${STATE:-${FM_STATE_OVERRIDE:-}}
+_fm_status_file_for() {  # <id> [state-dir]
+  local id=$1 state=${2:-${STATE:-${FM_STATE_OVERRIDE:-}}}
   [ -n "$id" ] && [ -n "$state" ] || return 0
   [ -f "$state/$id.status" ] || return 0
   printf '%s/%s.status' "$state" "$id"
@@ -420,6 +423,7 @@ _fm_status_file_for() {  # <id>
 #      rejects a FAILURE reported under the pause verb (status_pause_is_failure), and
 #   2. the keyed open/resolved fold (status_open_decisions) is empty, so no question
 #      is still unanswered underneath that pause.
+# When a run id is supplied, the declaration must also name that exact run.
 #
 # (2) is the safety boundary and is not redundant with (1): the status stream is an
 # append-only EVENT log, so a later `paused:` line MASKS an earlier still-open
@@ -429,9 +433,9 @@ _fm_status_file_for() {  # <id>
 # Fails closed in both directions. An id with no locatable status file cannot be
 # proven either way, so it is refused rather than absorbed: absence of a signal is
 # never evidence of a pause.
-crew_declared_pause_absorbable() {  # <id> [declared-pause-status-line]
-  local id=$1 declared=${2:-} f snapshot current before after
-  f=$(_fm_status_file_for "$id")
+crew_declared_pause_absorbable() {  # <id> [declared-pause-status-line] [run-id] [state-dir]
+  local id=$1 declared=${2:-} expected_run=${3:-} state=${4:-} f snapshot current before after
+  f=$(_fm_status_file_for "$id" "$state")
   [ -n "$f" ] || return 1
   before=$(_fm_status_file_sig "$f")
   [ -n "$before" ] || return 1
@@ -439,6 +443,7 @@ crew_declared_pause_absorbable() {  # <id> [declared-pause-status-line]
   current=$(printf '%s\n' "$snapshot" | grep -v '^[[:space:]]*$' | tail -1)
   [ -z "$declared" ] || [ "$declared" = "$current" ] || return 1
   status_is_paused "$current" || return 1
+  [ -z "$expected_run" ] || [ "$(status_pause_run_id "$current")" = "$expected_run" ] || return 1
   [ -z "$(printf '%s\n' "$snapshot" | _fm_status_open_decisions_stream)" ] || return 1
   after=$(_fm_status_file_sig "$f")
   [ -n "$after" ] && [ "$before" = "$after" ]
@@ -463,29 +468,12 @@ _fm_status_file_sig() {
 #   none    - neither, so the wake must surface (including dead and unknown
 #             liveness, and an unreadable verdict).
 #
-# PRECEDENCE, and why it is this way round. bin/fm-crew-state.sh's authoritative
-# verdict ("state: <s> · source: <src> · <detail>") answers "what is the PIPELINE
-# doing"; a declared pause answers "what is the WORK doing". Only one of those can
-# overrule the other, and active work is the one that does: a crewmate that appended
-# `paused:` and then STARTED a run has superseded its own declaration, so a `working`
-# run-step or busy pane still wins. Every OTHER verdict yields to a proven pause.
-#
-# That last sentence is the 2026-08-03 fix. This used to admit a pause only against a
-# `done` run-step (the narrower #53 carve-out), which made the pipeline verdict the
-# discriminator for a signal that is not about the pipeline at all:
-#   - `parked` vetoed it, so a lane whose recycled worktree had been re-checked-out
-#     onto another lane's branch inherited that foreign run's parked gate and
-#     wedge-escalated eight times in a row against an explicit, resolved pause;
-#   - `failed` vetoed it, though fm-crew-state.sh maps a routinely CANCELLED run here
-#     too, so ordinary teardown-cancelled runs silenced legitimate pauses; and
-#   - `unknown` vetoed it, so a pause whose pane was GONE - the case with the least
-#     reason to suspect a wedge - surfaced as one.
-# Absorption never consulted pane liveness in any branch; the pipeline verdict was
-# always the discriminator. Safety does not rest on those vetoes: it rests on the two
-# proofs in crew_declared_pause_absorbable (an owned-and-clearing, non-failure pause
-# declaration, and an empty open-decision fold) and on the caller's bounded
-# FM_PAUSE_RESURFACE_SECS recheck, which re-surfaces an absorbed pause once per
-# window so one cannot rot invisibly.
+# PRECEDENCE. A working, failed, stale, or unknown current-state verdict is
+# authoritative. A done or parked run yields only when the declaration carries that
+# exact run id, proving the pause was appended after that run began. A no-run
+# status-log pause needs no run association. Every absorbed pause also passes the
+# durable declaration and open-decision proofs above and re-surfaces on the caller's
+# bounded FM_PAUSE_RESURFACE_SECS cadence.
 #
 # One fm-crew-state.sh read serves both absorb reasons at once. The optional second
 # argument lets stale-pane triage pass the status line it already read; omitted, the
@@ -537,6 +525,20 @@ crew_state_liveness_verdict() {  # <current-state-line>
   done
 }
 
+crew_state_named_field() {  # <current-state-line> <field-name>
+  local rest=$1 wanted=$2 field sep=' · '
+  while :; do
+    case "$rest" in
+      *"$sep"*) field=${rest%%"$sep"*}; rest=${rest#*"$sep"} ;;
+      *) field=$rest; rest= ;;
+    esac
+    case "$field" in
+      "$wanted: "*) printf '%s' "${field#*: }"; return 0 ;;
+    esac
+    [ -n "$rest" ] || return 0
+  done
+}
+
 # Print task, verdict, and current-state line for each ship carrying a liveness
 # observation. Callers explicitly decide alive/dead/unknown actionability; a
 # line with no observation is omitted so its existing behavior is unchanged.
@@ -555,10 +557,16 @@ scan_crew_liveness_observations() {  # <state-dir>
   done
 }
 
-crew_absorb_class() {  # <id> [declared-pause-status-line]
-  local id=$1 declared_pause=${2:-} line state src liveness
+crew_absorb_class() {  # <id> [declared-pause-status-line] [current-state-line] [state-dir]
+  local id=$1 declared_pause=${2:-} line=${3:-} state_dir=${4:-} state src liveness run_id
   [ -n "$id" ] || { printf 'none'; return; }
-  line=$(crew_state_line "$id")
+  if [ -z "$line" ]; then
+    if [ -n "$state_dir" ]; then
+      line=$(FM_STATE_OVERRIDE="$state_dir" crew_state_line "$id")
+    else
+      line=$(crew_state_line "$id")
+    fi
+  fi
   case "$line" in
     state:*)
       state=${line#state: }; state=${state%% *}
@@ -571,14 +579,30 @@ crew_absorb_class() {  # <id> [declared-pause-status-line]
           run-step:alive|run-step:|pane:alive|pane:) printf 'working'; return ;;
         esac
       fi
+      case "$state" in
+        failed|stale|unknown) printf 'none'; return ;;
+        done|parked)
+          run_id=$(crew_state_named_field "$line" run)
+          [ -n "$run_id" ] || { printf 'none'; return; }
+          if crew_declared_pause_absorbable "$id" "$declared_pause" "$run_id" "$state_dir"; then
+            printf 'paused'
+          else
+            printf 'none'
+          fi
+          return
+          ;;
+        paused)
+          run_id=$(crew_state_named_field "$line" run)
+          if crew_declared_pause_absorbable "$id" "$declared_pause" "$run_id" "$state_dir"; then
+            printf 'paused'
+          else
+            printf 'none'
+          fi
+          return
+          ;;
+      esac
       ;;
   esac
-  # An unreadable verdict falls through here too: it is not evidence against a pause
-  # the crewmate durably declared, and it is exactly what a torn-down pane produces.
-  if crew_declared_pause_absorbable "$id" "$declared_pause"; then
-    printf 'paused'
-    return
-  fi
   printf 'none'
 }
 
@@ -618,7 +642,7 @@ crew_is_provably_working() {  # <id>
 # 0 if crewmate <id> is in a declared external-wait pause with nothing outstanding.
 # The stale path absorbs such a crewmate (on a long re-surface cadence) instead of
 # escalating a possible wedge. See crew_absorb_class for the precedence and
-# crew_declared_pause_absorbable for the two proofs a pause must satisfy.
+# crew_declared_pause_absorbable for the pause proof contract.
 crew_is_paused() {  # <id> [declared-pause-status-line]
   # This predicate needs only pause-or-not; dead and unknown arrive as `none`
   # and stay distinct from the one absorbable paused outcome.

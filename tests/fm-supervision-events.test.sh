@@ -31,7 +31,8 @@ sleep() { printf 'SLEEP\n' >> "$SLEEP_LOG"; }
 reset_state() {
   rm -f "$STATE_DIR"/*.meta "$STATE_DIR"/*.status "$STATE_DIR"/.wake-queue \
     "$STATE_DIR"/.wake-queue.seq "$STATE_DIR"/.watch-triage.log \
-    "$STATE_DIR"/.herdr-escalated-* "$TMP"/panes "$TMP"/wtcalls "$TMP"/wtcalled 2>/dev/null || true
+    "$STATE_DIR"/.herdr-escalated-* "$STATE_DIR"/.paused-* \
+    "$STATE_DIR"/.stale-* "$TMP"/panes "$TMP"/wtcalls "$TMP"/wtcalled 2>/dev/null || true
   : > "$WAKE_LOG"
   : > "$SLEEP_LOG"
   _event_cap_key=""
@@ -70,6 +71,7 @@ pass "handle_push_transition: enqueue failure cannot commit the Herdr dedupe mar
 reset_state
 fm_write_meta "$STATE_DIR/tk2.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
 printf 'paused: waiting on the upstream release; owner=release team; clears=release artifact is published\n' > "$STATE_DIR/tk2.status"
+crew_state_line() { printf 'state: paused · source: status-log · waiting on the upstream release\n'; }
 handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
 if [ -e "$STATE_DIR/.wake-queue" ] && grep -q 'stale' "$STATE_DIR/.wake-queue"; then
   fail "a declared-pause crew must NOT be fast-escalated: $(cat "$STATE_DIR/.wake-queue")"
@@ -79,6 +81,15 @@ grep -q 'absorbed push' "$STATE_DIR/.watch-triage.log" 2>/dev/null || fail "the 
 [ -e "$STATE_DIR/.paused-default_wG_pQ" ] || fail "the paused event path must create the shared pause marker"
 [ -e "$STATE_DIR/.herdr-escalated-default_wG_pQ" ] || fail "the paused event path must commit the handled transition"
 pass "handle_push_transition: a declared-pause crew enters the shared pause cadence without a fast wake"
+
+reset_state
+fm_write_meta "$STATE_DIR/tk2.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+printf 'needs-decision [key=q]: choose the release target\n' > "$STATE_DIR/tk2.status"
+printf 'paused: waiting on the upstream release; owner=release team; clears=release artifact is published\n' >> "$STATE_DIR/tk2.status"
+handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
+grep -q 'stale' "$STATE_DIR/.wake-queue" || fail "an open decision under a pause was absorbed by the event fast-path"
+[ ! -e "$STATE_DIR/.paused-default_wG_pQ" ] || fail "an open decision created a pause marker on the event fast-path"
+pass "handle_push_transition: an open keyed decision prevents pause absorption"
 
 # --- event_wait_or_sleep: secondmate windows are excluded from the pane list --
 

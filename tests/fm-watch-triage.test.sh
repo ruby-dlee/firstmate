@@ -350,11 +350,10 @@ test_failure_pause_is_failure_classifier() {
 #
 # The pause half is proven from the crewmate's own durable status stream, not from
 # the fm-crew-state.sh verdict, so every pause case here needs a real status file;
-# the full pause truth table (including the run-step verdicts that used to veto a
-# pause) lives in tests/fm-watch-pause-absorb.test.sh.
+# the full pause truth table lives in tests/fm-watch-pause-absorb.test.sh.
 test_crew_absorb_class_classifier() {
   local dir fakebin malformed state owned_pause
-  owned_pause='paused: awaiting ordered PR merges; owner=merge supervisor; clears=ordered merges complete'
+  owned_pause='paused: awaiting ordered PR merges; owner=merge supervisor; clears=ordered merges complete; run=01RUN'
   dir=$(make_case absorb-class); fakebin="$dir/fakebin"; state="$dir/state"
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
   export FM_FAKE_CREW_STATE FM_STATE_OVERRIDE="$state"
@@ -401,7 +400,7 @@ test_crew_absorb_class_classifier() {
   ! crew_is_provably_working a || fail "a paused crew was treated as provably working"
   # A terminal run-step with NO pause in the stream is not absorbable...
   printf 'done: PR ready\n' > "$state/a.status"
-  FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review'
+  FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review · run: 01RUN'
   [ "$(crew_absorb_class a)" = none ] || fail "terminal run-step without pause context was absorbed"
   # ...and yields to one when the caller supplies it.
   printf '%s\n' "$owned_pause" > "$state/a.status"
@@ -413,16 +412,9 @@ test_crew_absorb_class_classifier() {
   [ "$(crew_absorb_class a 'paused: awaiting ordered PR merges')" = none ] \
     || fail "a pause with no owner and no clearing condition was absorbed"
   printf '%s\n' "$owned_pause" > "$state/a.status"
-  # A FAILED run-step yields to a declared pause too, as of 2026-08-03. It used not
-  # to, which silenced nothing but did surface plenty: fm-crew-state.sh maps a
-  # routinely CANCELLED run onto `failed`, so ordinary teardown-cancelled runs
-  # wedge-escalated lanes that had legitimately declared a wait. A crewmate that
-  # genuinely failed reports it with the captain-relevant `failed:` verb, and a
-  # failure written under the pause verb is caught by status_pause_is_failure below -
-  # neither route depends on this veto.
-  FM_FAKE_CREW_STATE='state: failed · source: run-step · validation failed'
-  [ "$(crew_absorb_class a "$owned_pause")" = paused ] \
-    || fail "failed run-step did not yield to a declared external wait"
+  FM_FAKE_CREW_STATE='state: failed · source: run-step · validation failed · run: 01RUN'
+  [ "$(crew_absorb_class a "$owned_pause")" = none ] \
+    || fail "failed run-step yielded to a pause declaration"
   printf 'paused: error: drive run: read response: i/o timeout; owner=drive; clears=the drive run returns\n' > "$state/a.status"
   [ "$(crew_absorb_class a 'paused: error: drive run: read response: i/o timeout; owner=drive; clears=the drive run returns')" = none ] \
     || fail "a failure reported under the pause verb was absorbed behind a failed run-step"
@@ -799,11 +791,11 @@ test_owned_pause_signal_registers_marker() {
   window="test:fm-owned-pause"
   printf 'idle under a declared hold\n' > "$capture_file"
   printf 'window=%s\nkind=ship\nharness=codex\n' "$window" > "$state/owned-pause.meta"
-  printf 'paused: validation hold; owner=supervisor; clears=supervisor lifts the hold after host load recovers\n' > "$statusf"
+  printf 'paused: validation hold; owner=supervisor; clears=supervisor lifts the hold after host load recovers; run=01RUN\n' > "$statusf"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   printf '1\n' > "$state/.stale-since-$key"
   printf '4\n' > "$state/.wedge-escalations-$key"
-  export FM_FAKE_CREW_STATE='state: parked · source: run-step · validation approval gate'
+  export FM_FAKE_CREW_STATE='state: parked · source: run-step · validation approval gate · run: 01RUN'
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 \
@@ -835,10 +827,10 @@ test_owned_pause_absorbs_repeated_changed_stale() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/owned-repeat.status"
   window="test:fm-owned-repeat"
   printf 'window=%s\nkind=ship\nharness=codex\n' "$window" > "$state/owned-repeat.meta"
-  printf 'paused: validation hold; owner=supervisor; clears=supervisor lifts the hold after host load recovers\n' > "$statusf"
+  printf 'paused: validation hold; owner=supervisor; clears=supervisor lifts the hold after host load recovers; run=01RUN\n' > "$statusf"
   sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-owned-repeat_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
-  export FM_FAKE_CREW_STATE='state: parked · source: run-step · validation approval gate'
+  export FM_FAKE_CREW_STATE='state: parked · source: run-step · validation approval gate · run: 01RUN'
 
   for token in one two; do
     printf 'idle under declared hold, render %s\n' "$token" > "$capture_file"
@@ -1171,7 +1163,7 @@ test_terminal_run_step_declared_pause_absorbed_with_markers() {
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; window="default:w6:pKV"
   printf 'idle after checks passed, awaiting ordered merges\n' > "$capture_file"
   printf 'window=%s\nkind=ship\nharness=codex\n' "$window" > "$state/terminal-paused.meta"
-  printf 'paused: waiting on ordered PR merges before D4 can start; owner=captain; clears=PRs #63, #64, and #65 are merged in order\n' \
+  printf 'paused: waiting on ordered PR merges before D4 can start; owner=captain; clears=PRs #63, #64, and #65 are merged in order; run=01RUN\n' \
     > "$state/terminal-paused.status"
   sig=$(seen_sig "$state/terminal-paused.status"); printf '%s' "$sig" > "$state/.seen-terminal-paused_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
@@ -1179,7 +1171,7 @@ test_terminal_run_step_declared_pause_absorbed_with_markers() {
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
   : > "$state/.paused-resurfaced-$key"
-  export FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review'
+  export FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review · run: 01RUN'
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 \
@@ -1536,6 +1528,7 @@ test_nonterminal_paused_rechecks_authoritative_state() {
   printf '%s' "$pane_hash" > "$state/.stale-$key"
   printf '1\n' > "$state/.count-$key"
   : > "$state/.paused-$key"
+  printf '%s' "$sig" > "$state/.paused-rechecked-$key"
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
@@ -1549,7 +1542,7 @@ test_nonterminal_paused_rechecks_authoritative_state() {
   [ -s "$state/.stale-since-$key" ] || { reap "$pid"; fail "authoritative active run did not resume wedge tracking"; }
   reap "$pid"
   unset FM_FAKE_CREW_STATE
-  pass "a declared pause is periodically rechecked against authoritative active-run state"
+  pass "a cached declared pause cannot hide a later active run"
 }
 
 test_paused_authoritative_working_preserves_wedge_timer() {

@@ -358,8 +358,14 @@ classify_signal() {  # <reason-after-colon> <state>
     fi
     [ -n "$last" ] || continue
     distilled="${distilled}$(basename "$f"): ${last} | "
-    status_is_captain_relevant "$last" || continue
-    rel=1
+    if status_is_paused "$last" \
+      && ! crew_declared_pause_absorbable "$task" "$last" "" "$state"; then
+      rel=1
+    elif status_is_captain_relevant "$last"; then
+      rel=1
+    else
+      continue
+    fi
     # Dedupe against the catch-all scan: if this status was already escalated
     # (seen marker matches), skip escalating again. The seen marker is the
     # single source of truth shared between the per-wake signal path and the
@@ -387,7 +393,7 @@ classify_signal() {  # <reason-after-colon> <state>
 # first sight of a non-terminal stale it returns "self" and the caller records a
 # timestamp marker; persistence is escalated by housekeeping's recheck, not here.
 classify_stale() {  # <window> <state>
-  local win=$1 state=$2 task last seen current liveness
+  local win=$1 state=$2 task last seen current liveness pause_class
   task=$(window_to_task "$win" "$state")
   current=$(crew_state_line "$task")
   liveness=$(crew_state_liveness_verdict "$current")
@@ -399,13 +405,17 @@ classify_stale() {  # <window> <state>
       ;;
   esac
   last=$(last_status_line "$state/$task.status")
-  if [ -n "$last" ] && status_is_paused "$last"; then
+  pause_class=$(crew_absorb_class "$task" "$last" "$current" "$state")
+  if [ -n "$last" ] && [ "$pause_class" = paused ]; then
     # A DECLARED external-wait pause (fm-classify-lib.sh): an idle pane is EXPECTED,
     # so this is not a wedge. The caller records a pause marker (long re-surface
-    # cadence in housekeeping) rather than a wedge stale marker. Cheap: reuses the
-    # status line already read, no fm-crew-state.sh call, mirroring the daemon's
-    # existing status-log classification.
+    # cadence in housekeeping) rather than a wedge stale marker. The current-state
+    # read above and the shared durable stream proof jointly establish this result.
     printf 'pause|paused (awaiting external), rechecked on a long cadence: %s' "$last"
+    return
+  fi
+  if [ -n "$last" ] && status_is_paused "$last"; then
+    printf 'escalate|declared pause is not absorbable because its durable status stream is unresolved or changed: %s' "$last"
     return
   fi
   if [ -n "$last" ] && status_is_captain_relevant "$last"; then
@@ -500,13 +510,18 @@ clear_pause_tracking() {  # <window> <state>
     "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key"
 }
 
-reconcile_pause_tracking() {  # <window> <state> <last-status-line>
-  local win=$1 state=$2 last=$3 task key marker watcher_key
+reconcile_pause_tracking() {  # <window> <state> <last-status-line> [pause-class]
+  local win=$1 state=$2 last=$3 task key marker watcher_key pause_class
   task=$(window_to_task "$win" "$state")
   key=$(_stale_key "$task")
   marker="$state/.subsuper-paused-$key"
   watcher_key=$(_stale_key "$win")
-  if status_is_paused "$last"; then
+  if [ "$#" -ge 4 ]; then
+    pause_class=$4
+  else
+    pause_class=$(crew_absorb_class "$task" "$last" "" "$state")
+  fi
+  if [ "$pause_class" = paused ]; then
     stale_marker_remove "$win" "$state"
     pause_marker_record "$win" "$state"
   elif [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
@@ -524,7 +539,8 @@ migrate_watcher_pause_markers() {  # <state>
     key=$(_stale_key "$task")
     watcher_key=$(_stale_key "$win")
     last=$(last_status_line "$state/$task.status")
-    if status_is_paused "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
+    if status_is_paused "$last" \
+      || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
       reconcile_pause_tracking "$win" "$state" "$last"
     fi
   done
@@ -985,7 +1001,7 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  3) heartbeat scan: every HEARTBEAT_SCAN_SECS, grep state/*.status for a
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
-  local state=$1 now due f key task win marker age last owner clears max_defer oldest pause_secs
+  local state=$1 now due f key task win marker age last owner clears max_defer oldest pause_secs pause_class
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -1035,8 +1051,9 @@ housekeeping() {  # <state>
     fi
     task=$(window_to_task "$win" "$state")
     last=$(last_status_line "$state/$task.status")
-    if [ -n "$last" ] && status_is_paused "$last"; then
-      reconcile_pause_tracking "$win" "$state" "$last"
+    pause_class=$(crew_absorb_class "$task" "$last" "" "$state")
+    if [ -n "$last" ] && [ "$pause_class" = paused ]; then
+      reconcile_pause_tracking "$win" "$state" "$last" "$pause_class"
       continue
     fi
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
@@ -1066,8 +1083,9 @@ housekeeping() {  # <state>
     fi
     task=$(window_to_task "$win" "$state")
     last=$(last_status_line "$state/$task.status")
-    if [ -z "$last" ] || ! status_is_paused "$last"; then
-      reconcile_pause_tracking "$win" "$state" "$last"
+    pause_class=$(crew_absorb_class "$task" "$last" "" "$state")
+    if [ -z "$last" ] || [ "$pause_class" != paused ]; then
+      reconcile_pause_tracking "$win" "$state" "$last" "$pause_class"
       continue
     fi
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
@@ -1078,7 +1096,7 @@ housekeeping() {  # <state>
       2) rm -f "$marker" ;;
       *)
         last=$(last_status_line "$state/$task.status")
-        if [ -n "$last" ] && status_is_paused "$last"; then
+        if [ -n "$last" ] && [ "$(crew_absorb_class "$task" "$last" "" "$state")" = paused ]; then
           owner=$(status_pause_owner "$last")
           clears=$(status_pause_clearing_condition "$last")
           escalate_add "$state" "paused ${age}s (owner=$owner, clears=$clears; if the clearing condition now holds, resume or surface the still-paused lane): $win"

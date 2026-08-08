@@ -431,10 +431,9 @@ clear_pause_tracking() {  # <window>
 # that return; otherwise a freshly re-armed watcher loses the declaration and
 # repeatedly enters stale handling. Registration proves only the pause CONTRACT
 # (the line itself), never the keyed open-decision fold, so it deliberately does not
-# write the .paused-rechecked-<key> cache pause_state_class reads: seeding that here
-# would let a declaration skip the fold and absorb a lane that still owes an
-# unanswered decision. Any stale cache from an earlier declaration is dropped for the
-# same reason, leaving the first stale classification to establish a fresh one.
+# write the .paused-rechecked-<key> proof signature. Any stale signature from an
+# earlier declaration is dropped, leaving the first stale classification to establish
+# a fresh one.
 register_pause_declaration() {  # <window> <status-line>
   local win=$1 last=$2 key
   key=$(printf '%s' "$win" | tr ':/.' '___')
@@ -480,22 +479,7 @@ pause_state_class() {  # <window> <task>
     crew_absorb_class "$task"
     return
   fi
-  # Cached verdict: skip the costly authoritative re-read (an fm-crew-state.sh call
-  # plus the keyed open/resolved fold) while a recent recheck still stands AND the
-  # status stream it was taken from is byte-identical. Both halves of the pause proof
-  # are pure functions of that stream, so an unchanged signature means the earlier
-  # verdict is still exactly as true - while any append, including one that OPENS a
-  # decision after the pause flag was written, invalidates the cache and forces a
-  # fresh proof rather than riding out the age window behind a stale `paused`.
-  # The recheck marker carries the signature as its content; callers read only its
-  # mtime for the age bound, and a marker left by an older watcher simply mismatches
-  # and re-proves.
   sig=$(stat_sig "$statusf")
-  if [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ] \
-     && [ -n "$sig" ] && [ "$sig" = "$(cat "$recheck_file" 2>/dev/null || true)" ]; then
-    printf 'paused'
-    return
-  fi
   class=$(crew_absorb_class "$task" "$last")
   case "$class" in
     paused)
@@ -997,16 +981,14 @@ event_wait_or_sleep() {
 # machinery already understands it (queued by key=window, so a later poll-path
 # stale for the same pane collapses on drain).
 handle_push_transition() {  # <backend> <session> <record>
-  local backend=$1 session=$2 record=$3 pane_id to window task key h reason
+  local backend=$1 session=$2 record=$3 pane_id to window task key h reason last
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
   window="$session:$pane_id"
   task=$(window_to_task "$window" "$STATE")
-  if status_is_paused "$(last_status_line "$STATE/$task.status")"; then
-    # The durable status is the trusted gate on this native edge. Commit the
-    # handled transition, then enter the shared pause path so it owns the marker
-    # and bounded re-surface cadence even when no auxiliary crew-state read exists.
+  last=$(last_status_line "$STATE/$task.status")
+  if status_is_paused "$last" && [ "$(pause_state_class "$window" "$task")" = paused ]; then
     key=$(printf '%s' "$window" | tr ':/.' '___')
     h=$(cat "$STATE/.hash-$key" 2>/dev/null || true)
     fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1

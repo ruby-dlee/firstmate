@@ -453,6 +453,8 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
       "$kind brief still instructs the default paused status"
     assert_grep 'or a blocker clears' "$brief" \
       "$kind brief did not require durable resolution when a blocker clears"
+    assert_grep 'run={current run id}' "$brief" \
+      "$kind brief did not require exact run association for a post-run pause"
   done
   pass "fm-brief.sh: custom pause verb renders in every scaffold"
 }

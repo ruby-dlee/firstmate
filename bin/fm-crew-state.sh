@@ -22,7 +22,8 @@
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
 #   2. Matching no-mistakes run for this crewmate's branch, active or terminal
 #      (from `axi status`, or the coarse `no-mistakes runs` fallback)?
-#      The run-step is AUTHORITATIVE for active, parked, and failed states:
+#      The run-step is AUTHORITATIVE for active, failed, stale, and unknown states.
+#      A parked or done run yields only to a pause associated with its exact run id:
 #      running/fixing -> working, ci -> working, awaiting_approval/fix_review ->
 #      parked (with gate findings), and failed/cancelled -> failed. A PR-ready
 #      passed/checks-passed claim becomes done only after GitHub resolves the
@@ -894,13 +895,16 @@ if [ "$HAVE_RUN" = 1 ]; then
       ;;
   esac
 
+  [ -z "$RUN_ID" ] || RUN_DETAIL="$RUN_DETAIL${SEP}run: $RUN_ID"
+
   # A later owned-and-clearing pause is the current state once a run has stopped
   # at a terminal or approval-gate boundary. Active, failed, stale, and unknown
   # run states retain run-step precedence and cannot hide behind a pause.
-  if status_is_paused "$LOG_LINE"; then
+  if [ -n "$RUN_ID" ] \
+    && crew_declared_pause_absorbable "$ID" "$LOG_LINE" "$RUN_ID" "$STATE"; then
     case "$RUN_STATE" in
       done|parked)
-        emit paused status-log "$(status_line_note "$LOG_LINE")${SEP}run-step $RUN_STATE"
+        emit paused status-log "$(status_line_note "$LOG_LINE")${SEP}run-step $RUN_STATE${SEP}run: $RUN_ID"
         ;;
     esac
   fi

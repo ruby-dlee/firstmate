@@ -319,7 +319,9 @@ This section records the operator-facing behavior only.
 Detection is driven by what the worktree declares, never by a project name.
 A directory holding `uv.lock` provisions with `uv sync --frozen`; one holding `requirements.txt` gets a `uv venv` virtual environment plus its `requirements.txt` and any conventional `requirements-dev.txt` / `requirements-test.txt` companions; `package-lock.json` runs `npm ci`; `pnpm-lock.yaml` runs `pnpm install --frozen-lockfile`.
 Python always goes through uv, never pip or venv directly.
+A directory that declares a `pyproject.toml` with neither of those two Python manifests is enumerated and reported as a capability gap rather than installed from a guess; a uv workspace member is excused, because its root's `uv sync --all-packages` already installs it.
 A pip component's fingerprint covers the requirements files it reaches through `-r` / `-c` includes as well as the ones named directly, so editing an included file is a cache miss rather than a false hit.
+The manifest traversal itself is not depth-limited: `FM_PROVISION_SCAN_DEPTH` bounds what is classified and installed, and anything deeper is reported as a capability gap, because a component that never appears on any surface reads as one that does not exist.
 For JS, the package manager comes from what the project declares - package.json's corepack `packageManager` field - and only falls back to the lockfile when the project declares nothing; a lockfile's filename is convention, not evidence, and a directory carrying two committed lockfiles would otherwise be resolved by firstmate's opinion rather than by what the project actually installs with.
 A JS component whose manager cannot be determined that way is left unprovisioned and reported rather than installed with a guessed installer.
 A uv workspace has exactly one `uv.lock` and one `.venv` at its root, so it is detected once at that root and synced with `--all-packages`; a plain sync there would install only the root package and leave a member's checks unrunnable.
@@ -339,6 +341,8 @@ A cache hit requires both a fingerprint match over that component's manifests, i
 The installer's own configuration counts as a manifest: `.npmrc` for npm and pnpm, `uv.toml` for uv and pip.
 Both change what the installer produces without any lockfile changing, so a registry switch or a `node-linker` change is a cache miss rather than a confidently wrong hit against a tree built under the superseded configuration.
 Directory existence alone is never accepted: a pool slot keeps its ignored directories across leases, but a previous agent may have deleted or broken them.
+The probe proves an installed environment from what the installer left behind, including a local editable requirement (`-e .`) which is verified against the PEP 610 `direct_url.json` and the `.pth` an editable install writes; a requirement whose identity still cannot be established that cheaply - a VCS or URL editable, an archive, a bare local path - is a cache miss that says so on stderr rather than a hit.
+What the lane writes into `node_modules` during ordinary work - the `.cache` directory webpack, vite, eslint, and babel all create - is not a change to the installed environment, so it does not invalidate the cache; a declared package directory that changes underneath it still does.
 A spawn into an already-provisioned, unchanged worktree therefore pays probe cost only, not install cost.
 The provisioned directories are added to the repository's git exclude file when the project does not already ignore them, so provisioning cannot dirty a checkout that the freshness proof and teardown both require to be clean.
 
@@ -350,6 +354,8 @@ Refusing a gap would be strictly worse than the behavior provisioning replaced, 
 The complete set of capability gaps is:
 
 - More provisionable components than `FM_PROVISION_MAX_COMPONENTS`. The components within the budget are still provisioned; the rest are reported as `skipped:over-budget`, never dropped silently. Which ones land past the budget is decided by need before order: the spawn passes the task's own brief in, components whose directory that brief names are provisioned first, and detection order only breaks the remaining tie.
+- A component whose manifest lies deeper below the worktree root than `FM_PROVISION_SCAN_DEPTH`, reported as `skipped:below-scan-depth`. It is named without being classified or installed, so a monorepo's deeply nested service is a gap the lane can read rather than a component no surface mentions.
+- A Python component declaring a `pyproject.toml` but neither a `uv.lock` nor a `requirements.txt`, reported as `skipped:no-python-lockfile`. Choosing an installer for a lockless project is a design decision firstmate has not made, and installing from a guess is not one provisioning gets to make on the project's behalf; a uv workspace member is not reported, since its root's sync installs it.
 - A recognized-but-unsupported package manager (`yarn`, `bun`).
 - A JS component whose package manager is neither named by package.json's `packageManager` field nor implied by a single lockfile - including a directory carrying two lockfiles while declaring nothing.
 - A declared Node major that cannot be found under `$NVM_DIR`, `$FNM_DIR`, `$VOLTA_HOME`, or `~/.asdf`, components declaring conflicting Node majors, or a `node` that does not run. The worktree's Python components are still provisioned.
@@ -368,18 +374,23 @@ The complete set of refusal causes is:
 - A component that declares no ignored install directory to protect, or a provisioned directory whose git exclusion cannot be registered before the installer runs.
 - A provisioning cache directory or log that cannot be written.
 - A previous lease's `.fm-provisioning.md` that cannot be removed from the worktree. A report that cannot be written is only a missing diagnostic; one left over from another task is a wrong one.
-- Declared manifests that cannot be read for a component, including a requirements include that cannot be opened.
+- Declared manifests that cannot be read for a component, including a requirements include that cannot be opened, or a manifest that exists but yields no digest. The digest of nothing is a well-formed digest, so accepting one would give the component a stable fingerprint that does not depend on that file's content at all.
 - An install that exceeds its bound, exits non-zero, or is terminated by a signal.
-- An installed environment that is still not usable afterwards: no working interpreter at `.venv/bin/python`, or a readiness probe that cannot capture the environment's state.
+- An installed environment that is still not usable afterwards: no working interpreter at `.venv/bin/python`, an interpreter that does not report the runtime recorded for it, or a readiness probe that cannot capture the environment's state.
 - A fingerprint that cannot be recorded.
 
 `bin/fm-provision-lib.sh` routes every non-success outcome through one of two functions - `fm_provision_gap` or `fm_provision_fail` - so a capability limit added later cannot become a spawn refusal by accident.
+
+A **note** is neither outcome, and is the one thing a component that WAS provisioned can also carry.
+A non-zero `uv pip check` is the only one: it verifies that installed dependency metadata is mutually consistent, which is not the same thing as usable, and a project pinning through uv's `[tool.uv] override-dependencies` or `constraint-dependencies` installs a version some package's own metadata calls incompatible on purpose.
+Refusing there would block every spawn into an environment that installs, runs, and validates fine, so it is announced on stderr, written to the provisioning log, recorded as `<manager>:<dir>=installed+inconsistent-dependency-metadata`, and carried into the lane's own report, while the component still counts as provisioned.
+The proofs kept as refusals are the ones that mean unusable: an interpreter that is missing, not executable, does not run, or does not report the runtime recorded for it.
 
 Installer output lands in `state/<id>.provision.log`, which is removed with the rest of the task's state on teardown and on a spawn abort; a refusal prints the tail of that log to stderr, since the rollback deletes the file.
 Those surfaces all live in the firstmate home, where the crewmate cannot read them, so provisioning also writes `.fm-provisioning.md` at the root of the leased worktree naming every component and what happened to it.
 That file is registered with the repository's git exclude file before it is written, so it cannot dirty the checkout; if that registration is impossible the report is skipped with a warning rather than written, and a report that cannot be filed never refuses a spawn.
 Because it is excluded, nothing else removes it, and a pool slot outlives the lease that used it: every spawn deletes whatever occupies that path before it decides anything - including a spawn that opts out, which is exactly the lease that would otherwise inherit a stale report - and the path is unlinked rather than truncated, so a symlink left there is replaced instead of followed.
-The outcome is recorded as `provision=` in `state/<id>.meta`: `none` for a worktree that declares nothing, `off` for an opt-out, `unavailable:<reason>` for a host gap, or a comma-separated list of `<manager>:<dir>=installed|cached|skipped:<reason>`.
+The outcome is recorded as `provision=` in `state/<id>.meta`: `none` for a worktree that declares nothing, `off` for an opt-out, `unavailable:<reason>` for a host gap, or a comma-separated list of `<manager>:<dir>=installed|cached|skipped:<reason>`, where a provisioned component that carries a note reads `installed+<note>`.
 Every install and probe is wall-clock bounded; a host with no `timeout`, `gtimeout`, or `perl` runs nothing at all and the lane launches unprovisioned, rather than risking an unbounded install wedging a spawn.
 
 The local, gitignored `config/worktree-provision` file is the home-level switch: absent or `on` provisions, `off` disables it.
@@ -631,7 +642,7 @@ FM_ACCOUNT_CONTINUATION_FINGERPRINT_BYTES=268435456  # maximum repository conten
 FM_ACCOUNT_CONTINUATION_ENUMERATION_BYTES=33554432  # maximum bytes used to enumerate repository identity inputs
 FM_ACCOUNT_CONTINUATION_FINGERPRINT_SECONDS=30  # seconds allowed to verify the continuation repository identity
 FM_DISPATCH_AGENT_FLEET_TIMEOUT=120  # optional positive seconds per live-proof pool summary; unset uses FM_ACCOUNT_SELECTION_TIMEOUT, an explicit legacy FM_ACCOUNT_CONTROL_TIMEOUT, then 120
-FM_PROVISION_SCAN_DEPTH=4        # worktree provisioning: manifest search depth below the worktree root; must be a positive integer, and an empty or zero override refuses the spawn rather than falling back to this default
+FM_PROVISION_SCAN_DEPTH=4        # worktree provisioning: how deep below the worktree root a manifest is still classified and installed, anything deeper being reported as a capability gap; must be a positive integer, and an empty or zero override refuses the spawn rather than falling back to this default
 FM_PROVISION_MAX_COMPONENTS=8    # worktree provisioning: provision at most this many components per spawn, reporting the rest as a recorded capability gap; must be a positive integer, and an empty or zero override refuses the spawn rather than falling back to this default
 FM_PROVISION_INSTALL_TIMEOUT=600 # worktree provisioning: seconds allowed per component install; must be a positive integer, and an empty or zero override refuses the spawn rather than removing the bound
 FM_PROVISION_PROBE_TIMEOUT=60    # worktree provisioning: seconds allowed per readiness probe; must be a positive integer, and an empty or zero override refuses the spawn rather than removing the bound

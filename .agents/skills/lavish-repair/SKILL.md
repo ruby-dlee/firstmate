@@ -50,7 +50,7 @@ Do not edit the generated page to manufacture an answer path.
 
 ### 4. Downloaded answer
 
-The board's landing record is `lavish-answer-<decision-id>.json` in the browser's download location.
+The board's landing record is `lavish-answer-<decision-id>-<request-digest>.json` in the browser's download location.
 The board also exposes the exact JSON as a manual backup so a blocked automatic download does not erase the completed batch.
 If needed, save that backup under the same filename in the normal or `LAVISH_DOWNLOADS_DIR` location, preserving every byte the board produced.
 

@@ -385,7 +385,9 @@ function boardScript(decision) {
   const payloadBackup = document.querySelector('#payload-backup');
   const submittedPayload = document.querySelector('#submitted-payload');
   const submitError = document.querySelector('#submit-error');
-  const downloadFilename = 'lavish-answer-' + MANIFEST.decision_id + '.json';
+  const requestDigest = MANIFEST.request_sha256.slice('sha256:'.length);
+  const downloadFilename = 'lavish-answer-' + MANIFEST.decision_id + '-'
+    + requestDigest + '.json';
 
   function buildPayload() {
     return {
@@ -523,7 +525,7 @@ export async function renderBoard(decision) {
       <p id="submit-error" class="form-error" role="alert" hidden></p>
       <section id="payload-backup" class="payload-backup" aria-labelledby="payload-backup-title" hidden>
         <h3 id="payload-backup-title">Manual payload backup</h3>
-        <p>If the browser blocked the download, save this complete JSON payload in Downloads as <code>lavish-answer-${escapeHtml(decision.id)}.json</code>, then tell firstmate.</p>
+        <p>If the browser blocked the download, save this complete JSON payload in Downloads as <code>lavish-answer-${escapeHtml(decision.id)}-${escapeHtml(decision.manifest.request_sha256.slice('sha256:'.length))}.json</code>, then tell firstmate.</p>
         <textarea id="submitted-payload" rows="14" readonly spellcheck="false" aria-label="Submitted payload JSON"></textarea>
       </section>
       <div class="actions">

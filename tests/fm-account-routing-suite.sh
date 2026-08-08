@@ -5569,7 +5569,7 @@ test_account_lock_deadline_bounds_nested_custody() {
     || fail "account lock creation deadline fixture could not read its monotonic end"
   elapsed=$(fm_account_system_perl -e 'printf "%.3f", $ARGV[1] - $ARGV[0]' "$before" "$after") \
     || fail "account lock creation deadline fixture could not calculate monotonic elapsed time"
-  fm_account_system_perl -e 'exit !($ARGV[0] < 8)' "$elapsed" \
+  fm_account_system_perl -e 'exit !($ARGV[0] < 4)' "$elapsed" \
     || fail "uncontended account lock creation exceeded its elapsed bound: ${elapsed}s"
   fm_account_meta_lock_release "$held" || fail "account lock creation deadline fixture could not release custody"
 
@@ -5590,7 +5590,7 @@ test_account_lock_deadline_bounds_nested_custody() {
     deadline=$(fm_account_lock_deadline_from_wait 20) || exit 71
     mutation=$(fm_account_lock_identity_mutation_acquire "$2" "$deadline") || exit 72
     : > "$3" || exit 73
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_SLEEP_BIN" 6 || exit 74
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_SLEEP_BIN" 8 || exit 74
     fm_account_lock_identity_mutation_release "$mutation"
   ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$sequence_lock" "$sequence_observed" &
   mutation_pid=$!
@@ -5603,7 +5603,7 @@ test_account_lock_deadline_bounds_nested_custody() {
   before=$(fm_account_system_perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
     -e 'printf "%.6f", clock_gettime(CLOCK_MONOTONIC)') \
     || fail "cross-phase deadline fixture could not read its monotonic start"
-  if FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=8 \
+  if FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=12 \
     fm_account_lifecycle_lock_acquire "$sequence_state" "$sequence_task" >/dev/null 2>&1; then
     status=0
   else
@@ -5621,7 +5621,7 @@ test_account_lock_deadline_bounds_nested_custody() {
   [ "$FM_ACCOUNT_LOCK_IDENTITY_NAME" = account-lifecycle ] \
     && [ "$FM_ACCOUNT_LOCK_IDENTITY_TASK" = "$sequence_task" ] \
     || fail "cross-phase deadline fixture published the wrong exact claim"
-  fm_account_system_perl -e 'exit !(($ARGV[0] >= 5.5) && ($ARGV[0] < 12.5))' "$elapsed" \
+  fm_account_system_perl -e 'exit !(($ARGV[0] >= 7.5) && ($ARGV[0] < 17))' "$elapsed" \
     || fail "claim waiting reset the remaining carrier deadline: ${elapsed}s"
   [ ! -e "$sequence_mutation" ] && [ ! -L "$sequence_mutation" ] \
     || fail "cross-phase deadline fixture retained mutation custody"

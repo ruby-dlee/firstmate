@@ -17,7 +17,10 @@
 #   than the behavior this library replaced, which launched every lane
 #   unprovisioned; it would also brick the spawn on projects this feature
 #   exists to serve. The gaps are: more provisionable components than the
-#   FM_PROVISION_MAX_COMPONENTS budget allows, a recognized-but-unsupported
+#   FM_PROVISION_MAX_COMPONENTS budget allows, a component whose directory lies
+#   deeper below the worktree root than FM_PROVISION_SCAN_DEPTH, a Python
+#   component declaring a pyproject.toml but neither a uv.lock nor a
+#   requirements.txt, a recognized-but-unsupported
 #   package manager (yarn, bun), a JS component whose package manager is neither
 #   named by package.json's packageManager field nor implied by a single
 #   lockfile, a declared Node major that cannot be found under the standard
@@ -44,12 +47,23 @@
 #   registered, declared manifests that cannot be resolved for a component, an
 #   install that fails, exceeds its bound, or is killed by a signal, an install
 #   that leaves no working interpreter, a readiness probe that fails after
-#   installing, an environment signature that is empty or unprovable, and a
+#   installing, an environment signature that is empty or unprovable, a declared
+#   manifest that exists but yields no digest, and a
 #   cache directory, log, record, or previous lease's report that cannot be
 #   written or removed.
 #   fm_provision_gap and fm_provision_fail are those two decision points, and
 #   every non-success outcome goes through exactly one of them, so a capability
 #   limit added later cannot become a spawn refusal by accident.
+#   A NOTE is neither, and is the one thing a SUCCESSFUL component can also
+#   carry: something the installer's own consistency check reported about an
+#   environment that installed and runs. `uv pip check` verifies that installed
+#   metadata is mutually consistent, which is not the same thing as usable - a
+#   project using uv's [tool.uv] override-dependencies or constraint-dependencies
+#   installs a version some package's own metadata calls incompatible ON PURPOSE
+#   - so it is announced, recorded beside the component's state, and carried into
+#   the lane's report, while the component still counts as provisioned. The
+#   proofs of usability stay failures: the interpreter must exist, be executable,
+#   run, and report the runtime recorded for it.
 #   A worktree that declares no recognized dependency manifest is a clean
 #   no-op, and so is a traversal that succeeds and finds nothing.
 #   fm-spawn.sh's --no-provision flag and the home-local
@@ -68,7 +82,13 @@
 #   npm     package-lock.json  -> npm ci
 #   pnpm    pnpm-lock.yaml     -> pnpm install --frozen-lockfile
 # Python always goes through uv, never pip/venv directly (AGENTS.md toolchain
-# convention). The JS package manager is read from what the project DECLARES -
+# convention). A directory that declares a pyproject.toml with neither of those
+# two Python manifests is a capability gap: choosing an installer for a lockless
+# project is a design decision this library has not made, and provisioning
+# something it cannot install from a committed declaration would be a guess. It
+# is still ENUMERATED and reported, because the lane silently lacking an
+# environment it needs to validate is the failure this library exists to
+# prevent. The JS package manager is read from what the project DECLARES -
 # package.json's corepack `packageManager` field - and only falls back to the
 # lockfile when the project declares nothing; lockfile-filename precedence is
 # convention, not evidence, and a directory carrying two committed lockfiles
@@ -98,7 +118,11 @@
 # before anything is scanned or run, and the defaults are unset-only, so an
 # explicitly empty or zero override refuses rather than silently becoming the
 # default and removing the bound it was meant to set.
-#   FM_PROVISION_SCAN_DEPTH=4        manifest search depth below the worktree
+#   FM_PROVISION_SCAN_DEPTH=4        how deep below the worktree root a manifest
+#                                    is still classified and installed; the
+#                                    traversal itself goes all the way down, so
+#                                    anything deeper is enumerated and reported
+#                                    as a capability gap rather than dropped
 #   FM_PROVISION_MAX_COMPONENTS=8    provision at most this many components,
 #                                    the ones the task's brief names first;
 #                                    the rest are reported as a capability gap
@@ -122,6 +146,18 @@ FM_PROVISION_SUMMARY=
 FM_PROVISION_PATH_PREFIX=
 
 # --- primitives -------------------------------------------------------------
+
+# Where a component lives. Every component is named by a path RELATIVE to the
+# worktree, and the worktree root itself is named "."; one helper owns that
+# convention so a new call site cannot get the special case wrong.
+fm_provision_component_dir() {  # <worktree> <relative-dir>
+  local wt=$1 rel=$2
+  if [ "$rel" = . ]; then
+    printf '%s' "$wt"
+  else
+    printf '%s/%s' "$wt" "$rel"
+  fi
+}
 
 fm_provision_sha256() {  # reads stdin, prints the hex digest
   if command -v shasum >/dev/null 2>&1; then
@@ -258,24 +294,35 @@ PY
 }
 
 # The component directories a worktree declares, deduplicated and
-# deterministically ordered, relative to the worktree ("." for its root). Only
-# `find` runs here. Deciding WHICH ecosystem a directory carries reads the
-# project's own package.json through python3, so that step is separate: the
-# caller has to be able to decide this host can bound nothing - and therefore
-# provisions nothing at all - before any such read is reached.
+# deterministically ordered, as "<scope> <relative-dir>" lines - "component" for
+# a directory within FM_PROVISION_SCAN_DEPTH and "below-depth" for one past it,
+# relative to the worktree ("." for its root). Only `find` runs here. Deciding
+# WHICH ecosystem a directory carries reads the project's own package.json
+# through python3, so that step is separate: the caller has to be able to decide
+# this host can bound nothing - and therefore provisions nothing at all - before
+# any such read is reached.
+#
+# The traversal is NOT depth-limited; the depth bound is applied afterwards, to
+# what gets classified and installed. A `find -maxdepth` would make a component
+# nested past the bound invisible to every surface this library reports on -
+# the summary, the log, the metadata, and the lane's own report would each name
+# only the shallower components and read as complete. A monorepo carrying
+# platform/services/billing/api/requirements.txt is exactly the shape this
+# feature exists for, and the crewmate has to be told that directory got
+# nothing, whether or not this spawn was willing to install it.
 # Returns non-zero when the traversal itself failed, which is a refusal and not
 # the same thing as a traversal that succeeded and found nothing.
 fm_provision_scan() {  # <worktree>
-  local wt=$1 file dir rel found manifest_output
-  local -a manifests=() dirs=()
+  local wt=$1 file dir rel depth separators found manifest_output
+  local -a manifests=() dirs=() shallow=() deep=()
   manifest_output=$(
     set -o pipefail
-    find "$wt" -maxdepth "$FM_PROVISION_SCAN_DEPTH" \
+    find "$wt" \
       \( -name .git -o -name node_modules -o -name .venv -o -name venv \
          -o -name .tox -o -name .nox -o -name .mypy_cache -o -name __pycache__ \
          -o -name site-packages -o -name vendor -o -name target -o -name dist \
          -o -name build -o -name .next -o -name .treehouse \) -prune -o \
-      -type f \( -name uv.lock -o -name requirements.txt \
+      -type f \( -name uv.lock -o -name requirements.txt -o -name pyproject.toml \
                  -o -name package-lock.json -o -name pnpm-lock.yaml \
                  -o -name yarn.lock -o -name bun.lockb -o -name bun.lock \) \
       -print | LC_ALL=C sort
@@ -300,44 +347,104 @@ fm_provision_scan() {  # <worktree>
     fi
     [ "$found" = 0 ] || continue
     dirs+=("$rel")
+    # The manifest's own depth, counted the way `find -maxdepth` counts it: a
+    # manifest directly in the worktree root is depth 1.
+    if [ "$rel" = . ]; then
+      depth=1
+    else
+      separators=${rel//[!\/]}
+      depth=$(( ${#separators} + 2 ))
+    fi
+    if [ "$depth" -le "$FM_PROVISION_SCAN_DEPTH" ]; then
+      shallow+=("$rel")
+    else
+      deep+=("$rel")
+    fi
   done
-  [ "${#dirs[@]}" -gt 0 ] || return 0
-  printf '%s\n' "${dirs[@]}"
+  [ "${#shallow[@]}" -eq 0 ] || printf 'component %s\n' "${shallow[@]}"
+  [ "${#deep[@]}" -eq 0 ] || printf 'below-depth %s\n' "${deep[@]}"
 }
 
 # Emit "<ecosystem> <relative-dir>" per detected component, deterministically
-# ordered. A directory can yield at most one Python and one JS component. The
-# "js" pseudo-ecosystem means a JS component whose package manager could not be
-# determined; the caller records it as a capability gap rather than guessing an
-# installer the project does not use.
-# The component directories can be passed in by a caller that already scanned -
+# ordered. A directory can yield at most one Python and one JS component. Three
+# pseudo-ecosystems name a component this library will not install but must
+# still report: "js" is a JS component whose package manager could not be
+# determined, "python" is a directory declaring a pyproject.toml with neither a
+# uv.lock nor a requirements.txt, and "unscanned" is a directory past
+# FM_PROVISION_SCAN_DEPTH. The caller records each as a capability gap rather
+# than guessing an installer the project does not use.
+# The scan lines can be passed in by a caller that already scanned -
 # fm_provision_worktree does, so its host-prerequisite decision lands before
 # anything here reads a project-controlled file - and are scanned for otherwise.
 # Returns non-zero when the traversal itself failed, which is a refusal and not
 # the same thing as a traversal that succeeded and found nothing.
-fm_provision_detect() {  # <worktree> [<relative-dir>...]
-  local wt=$1 dir rel scanned declared
+fm_provision_detect() {  # <worktree> [<scan-line>...]
+  local wt=$1 dir rel scope line entry member workspace_info scanned declared
   shift
-  local -a dirs=() js_managers=()
+  local -a lines=() js_managers=() candidates=() covered=()
   if [ "$#" -gt 0 ]; then
-    dirs=("$@")
+    lines=("$@")
   else
     scanned=$(fm_provision_scan "$wt") || return 1
-    while IFS= read -r rel; do
-      [ -n "$rel" ] || continue
-      dirs+=("$rel")
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      lines+=("$line")
     done <<< "$scanned"
   fi
-  [ "${#dirs[@]}" -gt 0 ] || return 0
+  [ "${#lines[@]}" -gt 0 ] || return 0
 
-  for rel in "${dirs[@]}"; do
-    dir=$wt/$rel
-    [ "$rel" != . ] || dir=$wt
-    # Python: uv-managed project wins over a bare requirements install.
+  # A uv workspace member declares a pyproject.toml and no lock of its own, and
+  # is nonetheless installed by its root's `uv sync --all-packages`. Reporting
+  # every member as an unprovisioned Python component would bury the real gaps
+  # this enumeration exists to surface, so the workspace's own membership - the
+  # same resolution that decides --all-packages - is what excuses them. Resolved
+  # only when some directory actually looks lockless, so an ordinary worktree
+  # pays nothing for it.
+  for line in "${lines[@]}"; do
+    [ "${line%% *}" = component ] || continue
+    rel=${line#* }
+    dir=$(fm_provision_component_dir "$wt" "$rel")
+    if [ -f "$dir/pyproject.toml" ] && [ ! -f "$dir/uv.lock" ] && [ ! -f "$dir/requirements.txt" ]; then
+      candidates+=("$rel")
+    fi
+  done
+  if [ "${#candidates[@]}" -gt 0 ]; then
+    for line in "${lines[@]}"; do
+      [ "${line%% *}" = component ] || continue
+      rel=${line#* }
+      dir=$(fm_provision_component_dir "$wt" "$rel")
+      [ -f "$dir/uv.lock" ] || continue
+      workspace_info=$(fm_provision_uv_workspace_info "$dir") || continue
+      while IFS= read -r entry; do
+        case "$entry" in */pyproject.toml) ;; *) continue ;; esac
+        member=${entry%/pyproject.toml}
+        [ -n "$member" ] || continue
+        if [ "$rel" = . ]; then
+          covered+=("$member")
+        else
+          covered+=("$rel/$member")
+        fi
+      done <<< "$workspace_info"
+    done
+  fi
+
+  for line in "${lines[@]}"; do
+    scope=${line%% *}
+    rel=${line#* }
+    if [ "$scope" != component ]; then
+      printf 'unscanned %s\n' "$rel"
+      continue
+    fi
+    dir=$(fm_provision_component_dir "$wt" "$rel")
+    # Python: uv-managed project wins over a bare requirements install, and a
+    # project declaring neither is named rather than passed over in silence.
     if [ -f "$dir/uv.lock" ]; then
       printf '%s %s\n' uv "$rel"
     elif [ -f "$dir/requirements.txt" ]; then
       printf '%s %s\n' pip "$rel"
+    elif [ -f "$dir/pyproject.toml" ] \
+      && ! { [ "${#covered[@]}" -gt 0 ] && fm_provision_list_has "$rel" "${covered[@]}"; }; then
+      printf 'python %s\n' "$rel"
     fi
     # JS: what the project DECLARES decides the package manager, and a lockfile
     # is only the fallback when it declares nothing. A directory carrying more
@@ -501,6 +608,12 @@ PY
 # line continuations.
 #   files - print every requirements file reached, relative to the component
 #   ready - verify every requirement whose package identity is determinable
+# A local editable requirement - `-e .`, which is about as common as a
+# requirements.txt gets - is verified from the artifacts the installer ITSELF
+# wrote: the PEP 610 direct_url.json beside a dist-info, and the .pth an editable
+# install drops into site-packages. Without that it would be permanently
+# unverifiable, and a component carrying one line of it would pay a full
+# `uv venv --clear` plus reinstall on every single lease forever.
 # Exit 0 succeeded. In `ready`, 1 means a declared package is not installed and
 # 2 means the declaration could not be determined; a line whose package identity
 # cannot be established cheaply yields 2, which the caller treats as a cache MISS
@@ -513,10 +626,12 @@ fm_provision_pip_parse() {  # <files|ready> <component-dir> <venv> [requirements
   local dir=$2
   fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
     python3 - "$@" <<'PY'
+import json
 import os
 import pathlib
 import re
 import sys
+from urllib.parse import unquote, urlparse
 
 mode = sys.argv[1]
 root = pathlib.Path(sys.argv[2]).resolve()
@@ -526,6 +641,7 @@ roots = [pathlib.Path(path) for path in sys.argv[4:]]
 MAX_FILES = 64
 INCLUDE = ("-r", "--requirement", "-c", "--constraint")
 EDITABLE = ("-e", "--editable")
+REMOTE = ("git+", "hg+", "svn+", "bzr+", "file:", "http:", "https:")
 URLISH = ("git+", "hg+", "svn+", "bzr+", "./", "../", "/", "~/", "file:", "http:", "https:")
 ARCHIVE = (".whl", ".zip", ".tar.gz", ".tar.bz2", ".tar.xz")
 SPECIFIER = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^]]*\])?\s*(?P<rest>.*)$")
@@ -533,6 +649,7 @@ SPECIFIER = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^]]*\])?\
 visited = []
 seen = set()
 declared = set()
+editables = set()
 unreadable = False
 unverifiable = False
 truncated = False
@@ -594,7 +711,19 @@ def visit(path):
             visit(resolved.parent / target)
             continue
         if base in EDITABLE:
-            unverifiable = True
+            target = token.split("=", 1)[1] if "=" in token else rest.strip()
+            target = target.split(";", 1)[0].strip()
+            if target.endswith("]") and "[" in target:
+                target = target[: target.rindex("[")].strip()
+            lowered = target.lower()
+            if not target or "://" in lowered or lowered.startswith(REMOTE):
+                # A VCS or URL editable names no local tree to look for, so its
+                # identity stays undeterminable and the caller says so.
+                unverifiable = True
+                continue
+            # Relative to the component root, which is the directory the install
+            # itself ran in.
+            editables.add(os.path.realpath(os.path.join(str(root), os.path.expanduser(target))))
             continue
         if token.startswith("-"):
             continue
@@ -638,6 +767,58 @@ if mode == "files":
 site_dirs = [path for path in venv.glob("lib*/python*/site-packages") if path.is_dir()]
 if not site_dirs:
     raise SystemExit(1)
+
+
+def installed_editable_paths():
+    """Every local tree site-packages says an editable install points at.
+
+    Read from what the installer wrote and nothing else: PEP 610's
+    direct_url.json beside a dist-info, and the .pth an editable install leaves
+    behind (PEP 660's __editable__*.pth names the package's source directory,
+    which can sit under the project root rather than at it).
+    """
+    found = set()
+    for site_dir in site_dirs:
+        for dist in site_dir.glob("*.dist-info"):
+            try:
+                data = json.loads((dist / "direct_url.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            info = data.get("dir_info")
+            url = data.get("url")
+            if not isinstance(info, dict) or not info.get("editable") or not isinstance(url, str):
+                continue
+            parsed = urlparse(url)
+            if parsed.scheme != "file" or not parsed.path:
+                continue
+            found.add(os.path.realpath(unquote(parsed.path)))
+        for pth in site_dir.glob("*.pth"):
+            try:
+                text = pth.read_text(encoding="utf-8", errors="strict")
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+            for entry in text.splitlines():
+                entry = entry.strip()
+                if not entry or entry.startswith("#") or entry.startswith(("import ", "import\t")):
+                    continue
+                if os.path.isabs(entry) and os.path.isdir(entry):
+                    found.add(os.path.realpath(entry))
+    return found
+
+
+if editables:
+    installed = installed_editable_paths()
+    for target in sorted(editables):
+        prefix = target + os.sep
+        if not any(path == target or path.startswith(prefix) for path in installed):
+            # The tree is declared editable but nothing in site-packages points
+            # at it. Whether the install never happened or this installer leaves
+            # no artifact naming it, the honest answer is that it could not be
+            # verified - which is a miss that explains itself, never a hit.
+            unverifiable = True
+            break
 for name in sorted(declared):
     normalized = re.sub(r"[-_.]+", "_", name).lower()
     found = any(
@@ -679,8 +860,7 @@ fm_provision_pip_included_files() {  # <component-dir>
 # leave the component unprovisioned for the second.
 fm_provision_manifests() {  # <worktree> <ecosystem> <relative-dir>
   local wt=$1 eco=$2 rel=$3 dir name workspace_info included rc=0
-  dir=$wt/$rel
-  [ "$rel" != . ] || dir=$wt
+  dir=$(fm_provision_component_dir "$wt" "$rel")
   local -a names=()
   case "$eco" in
     uv) names=(uv.lock uv.toml pyproject.toml .python-version) ;;
@@ -904,23 +1084,33 @@ fm_provision_node_path_prefix() {  # <cache-dir> <pinned-bin>
 
 # --- fingerprint and cache --------------------------------------------------
 
+# A component's fingerprint, or non-zero when it could not be computed over
+# everything the component declares. A manifest that exists but cannot be read
+# is the dangerous case: the digest of nothing is a well-formed digest, so
+# emitting `manifest=<name>:` would produce a perfectly stable fingerprint that
+# does not depend on that file's CONTENT at all - the next lease would recompute
+# the same value after the file changed and hand the lane a confidently wrong
+# cache hit. The rows are therefore built before anything is hashed, so a digest
+# that is missing or empty refuses the whole fingerprint instead of being
+# swallowed inside a pipeline's subshell.
 fm_provision_fingerprint() {  # <worktree> <eco> <rel> <installer-id> <runtime-id>
-  local wt=$1 eco=$2 rel=$3 installer=$4 runtime=$5 dir name manifests rc=0
-  dir=$wt/$rel
-  [ "$rel" != . ] || dir=$wt
+  local wt=$1 eco=$2 rel=$3 installer=$4 runtime=$5 dir name digest manifests rc=0
+  local -a rows=()
+  dir=$(fm_provision_component_dir "$wt" "$rel")
   manifests=$(fm_provision_manifests "$wt" "$eco" "$rel") || rc=$?
   [ "$rc" -eq 0 ] || return "$rc"
-  {
-    printf 'schema=%s\n' "$FM_PROVISION_CACHE_SCHEMA"
-    printf 'ecosystem=%s\n' "$eco"
-    printf 'component=%s\n' "$rel"
-    printf 'installer=%s\n' "$installer"
-    printf 'runtime=%s\n' "$runtime"
-    while IFS= read -r name; do
-      [ -n "$name" ] || continue
-      printf 'manifest=%s:%s\n' "$name" "$(fm_provision_sha256 < "$dir/$name")"
-    done <<< "$manifests"
-  } | fm_provision_sha256
+  rows+=("schema=$FM_PROVISION_CACHE_SCHEMA")
+  rows+=("ecosystem=$eco")
+  rows+=("component=$rel")
+  rows+=("installer=$installer")
+  rows+=("runtime=$runtime")
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    digest=$(fm_provision_sha256 < "$dir/$name") || return 1
+    [ -n "$digest" ] || return 1
+    rows+=("manifest=$name:$digest")
+  done <<< "$manifests"
+  printf '%s\n' "${rows[@]}" | fm_provision_sha256
 }
 
 fm_provision_record_path() {  # <cache-dir> <worktree> <eco> <rel>
@@ -959,8 +1149,7 @@ fm_provision_record_write() {  # <record> <eco> <rel> <fingerprint> <runtime> <i
 # unprovisioned component would come to report itself cached.
 fm_provision_environment_signature() {  # <worktree> <eco> <rel>
   local wt=$1 eco=$2 rel=$3 dir python state
-  dir=$wt/$rel
-  [ "$rel" != . ] || dir=$wt
+  dir=$(fm_provision_component_dir "$wt" "$rel")
   case "$eco" in
     uv|pip)
       python="$dir/.venv/bin/python"
@@ -1005,21 +1194,35 @@ for field in ("dependencies", "devDependencies"):
     if not isinstance(values, dict):
         raise SystemExit(1)
     declared.update(values)
-paths = [root / "node_modules"]
-bin_dir = root / "node_modules" / ".bin"
+modules_root = root / "node_modules"
+paths = [modules_root]
+bin_dir = modules_root / ".bin"
 if bin_dir.exists():
     paths.append(bin_dir)
 for name in sorted(declared):
     if not isinstance(name, str) or name in ("", ".", "..") or name.startswith("/"):
         raise SystemExit(1)
-    package_dir = root / "node_modules" / name
+    package_dir = modules_root / name
     if not package_dir.is_dir() or not (package_dir / "package.json").is_file():
         raise SystemExit(1)
     paths.append(package_dir)
 rows = []
 for path in paths:
     stat = path.stat()
-    rows.append(f"{path.relative_to(root)}\t{stat.st_dev}\t{stat.st_ino}\t{stat.st_mode}\t{stat.st_size}\t{stat.st_mtime_ns}\t{stat.st_ctime_ns}")
+    if path == modules_root:
+        # node_modules itself is the ONE path a lane writes into during ordinary
+        # work: webpack, vite, eslint and babel all create node_modules/.cache,
+        # and on APFS adding a single entry to a directory moves its mtime,
+        # ctime and size. Hashing those here made every second spawn into a
+        # healthy, unchanged worktree pay a full reinstall. Its identity
+        # (dev/ino/mode) still proves the directory was not replaced. Every
+        # other path keeps the volatile fields, because for a declared package
+        # directory they are the only thing that notices a file deleted from
+        # INSIDE it - the structural check above only proves the directory and
+        # its package.json exist.
+        rows.append(f"{path.relative_to(root)}\t{stat.st_dev}\t{stat.st_ino}\t{stat.st_mode}")
+    else:
+        rows.append(f"{path.relative_to(root)}\t{stat.st_dev}\t{stat.st_ino}\t{stat.st_mode}\t{stat.st_size}\t{stat.st_mtime_ns}\t{stat.st_ctime_ns}")
 print("\n".join(rows))
 ' "$dir" 2>/dev/null) || return 1
       ;;
@@ -1035,8 +1238,7 @@ print("\n".join(rows))
 # than reinstalling on every spawn forever with no explanation.
 fm_provision_declared_packages_ready() {  # <worktree> <eco> <rel>
   local wt=$1 eco=$2 rel=$3 dir name rc=0
-  dir=$wt/$rel
-  [ "$rel" != . ] || dir=$wt
+  dir=$(fm_provision_component_dir "$wt" "$rel")
   case "$eco" in
     uv) return 0 ;;
     pip) ;;
@@ -1060,10 +1262,21 @@ fm_provision_declared_packages_ready() {  # <worktree> <eco> <rel>
 # The installed environment must actually work, not merely exist. A pool slot
 # keeps ignored directories across leases, and a previous agent may have removed
 # or broken them; a fingerprint alone would then report a false cache hit.
+#
+# Sets FM_PROVISION_PROBE_NOTE for the caller: what `uv pip check` reported is
+# recorded, never a verdict on the probe. That command verifies that installed
+# metadata is mutually consistent, which a working environment is allowed to
+# fail - a project using uv's [tool.uv] override-dependencies or
+# constraint-dependencies installs a version some package's metadata calls
+# incompatible ON PURPOSE - so refusing on it would block every spawn into an
+# environment that installs, runs, and validates fine. The proofs kept as
+# verdicts are the ones that mean unusable: an interpreter that is missing, not
+# executable, does not run, or does not report the runtime recorded for it.
+FM_PROVISION_PROBE_NOTE=
 fm_provision_probe() {  # <worktree> <eco> <rel> <log> <runtime> <environment> <phase>
   local wt=$1 eco=$2 rel=$3 log=$4 runtime=$5 environment=$6 phase=$7 dir python actual current ready_rc=0
-  dir=$wt/$rel
-  [ "$rel" != . ] || dir=$wt
+  dir=$(fm_provision_component_dir "$wt" "$rel")
+  FM_PROVISION_PROBE_NOTE=
   case "$eco" in
     uv|pip)
       python="$dir/.venv/bin/python"
@@ -1072,7 +1285,8 @@ fm_provision_probe() {  # <worktree> <eco> <rel> <log> <runtime> <environment> <
         "$python" -c 'import sys; sys.stdout.write("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null) || return 1
       [ -n "$actual" ] && [ "$actual" = "$runtime" ] || return 1
       fm_provision_run_logged "$FM_PROVISION_PROBE_TIMEOUT" "$dir" "$log" \
-        uv pip check --python "$python" || return 1
+        uv pip check --python "$python" \
+        || FM_PROVISION_PROBE_NOTE=inconsistent-dependency-metadata
       ;;
     npm|pnpm)
       [ -d "$dir/node_modules" ] || return 1
@@ -1107,8 +1321,7 @@ fm_provision_probe() {  # <worktree> <eco> <rel> <log> <runtime> <environment> <
 
 fm_provision_install() {  # <worktree> <eco> <rel> <log>
   local wt=$1 eco=$2 rel=$3 log=$4 dir name
-  dir=$wt/$rel
-  [ "$rel" != . ] || dir=$wt
+  dir=$(fm_provision_component_dir "$wt" "$rel")
   case "$eco" in
     uv)
       # --frozen installs the lock exactly as committed and never rewrites it,
@@ -1197,6 +1410,18 @@ fm_provision_gap() {  # <log> <eco> <rel> <reason-token> <message>
   printf 'skipped:%s' "$reason"
 }
 
+# Something reported ABOUT a component that was provisioned. Not a third
+# non-success outcome: the component installed, runs, and counts as provisioned,
+# and the note rides beside its state so the operator and the lane both learn
+# what the installer's own consistency check said without a working environment
+# being refused over it.
+fm_provision_note() {  # <log> <eco> <rel> <note-token> <message>
+  local log=$1 eco=$2 rel=$3 note=$4 message=$5
+  fm_provision_announce "$log" \
+    "warning: the $eco environment in $rel is provisioned, but $message"
+  printf '%s' "$note"
+}
+
 # A capability gap covering the whole worktree, for a host that lacks a tool
 # provisioning itself needs. Nothing is attempted and the spawn still launches.
 fm_provision_unavailable() {  # <log> <reason-token> <message>
@@ -1237,13 +1462,19 @@ fm_provision_clear_report() {  # <worktree>
   [ ! -e "$report" ] && [ ! -L "$report" ]
 }
 
-fm_provision_report_body() {  # <worktree>; reads "<eco>\t<rel>\t<state>" on stdin
-  local wt=$1 eco rel state
+fm_provision_report_body() {  # <worktree>; reads "<eco>\t<rel>\t<state>[\t<note>]" on stdin
+  local wt=$1 eco rel state note
   local -a done_lines=() gap_lines=()
-  while IFS=$'\t' read -r eco rel state; do
+  while IFS=$'\t' read -r eco rel state note; do
     [ -n "$eco" ] || continue
     case "$state" in
-      installed|cached) done_lines+=("- $eco in $rel - $state") ;;
+      installed|cached)
+        if [ -n "${note:-}" ]; then
+          done_lines+=("- $eco in $rel - $state, with one thing reported about it: $note")
+        else
+          done_lines+=("- $eco in $rel - $state")
+        fi
+        ;;
       skipped:*) gap_lines+=("- $eco in $rel - NOT provisioned: ${state#skipped:}") ;;
       *) gap_lines+=("- $eco in $rel - NOT provisioned: $state") ;;
     esac
@@ -1263,10 +1494,16 @@ fm_provision_report_body() {  # <worktree>; reads "<eco>\t<rel>\t<state>" on std
   fi
 }
 
-fm_provision_report_unavailable() {  # <worktree> <log> <reason>
+# The components are read from stdin, never from the caller's scope: a function
+# that reached into fm_provision_worktree's own `components` local would, from
+# any other call site or after that local is renamed, hit an unbound variable
+# under `set -u` inside a command substitution and quietly write a report with
+# no body at all.
+fm_provision_report_unavailable() {  # <worktree> <log> <reason>; reads "<eco> <rel>" on stdin
   local wt=$1 log=$2 reason=$3 line
   fm_provision_write_report "$wt" "$log" "$(
-    for line in "${components[@]}"; do
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
       printf '%s\t%s\tskipped:%s\n' "${line%% *}" "${line#* }" "$reason"
     done | fm_provision_report_body "$wt"
   )"
@@ -1346,9 +1583,9 @@ fm_provision_validate_tunables() {
 fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
   local wt=$1 cache=$2 log=$3 needs=${4:-}
   local eco rel dir line scanned detected record fingerprint recorded runtime installer environment artifact
-  local declared_major pinned_major='' pinned_bin='' pinned_prefix='' rc=0 state
-  local index=0 provisionable=0 budgeted=0 skipped=0 unprovisioned='' unavailable=''
-  local -a components=() states=() results=() order=() dirs=()
+  local declared_major pinned_major='' pinned_bin='' pinned_prefix='' rc=0 state note
+  local index=0 provisionable=0 budgeted=0 skipped=0 noted=0 unprovisioned='' unavailable=''
+  local -a components=() states=() notes=() results=() order=() scan_lines=()
 
   FM_PROVISION_SUMMARY=none
   FM_PROVISION_PATH_PREFIX=
@@ -1367,10 +1604,10 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
   }
   while IFS= read -r line; do
     [ -n "$line" ] || continue
-    dirs+=("$line")
+    scan_lines+=("$line")
   done <<< "$scanned"
 
-  if [ "${#dirs[@]}" -eq 0 ]; then
+  if [ "${#scan_lines[@]}" -eq 0 ]; then
     return 0
   fi
 
@@ -1400,7 +1637,7 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
       "python3 is not installed, so no component's declared manifests or installed-environment readiness could be resolved"
   fi
 
-  detected=$(fm_provision_detect "$wt" "${dirs[@]}") || {
+  detected=$(fm_provision_detect "$wt" "${scan_lines[@]}") || {
     fm_provision_fail "cannot scan $wt for dependency manifests"
     return 1
   }
@@ -1408,18 +1645,25 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
     [ -n "$line" ] || continue
     components+=("$line")
     states+=(planned)
+    notes+=('')
   done <<< "$detected"
 
   if [ "${#components[@]}" -eq 0 ]; then
     return 0
   fi
   if [ -n "$unavailable" ]; then
-    fm_provision_report_unavailable "$wt" "$log" "$unavailable"
+    printf '%s\n' "${components[@]}" \
+      | fm_provision_report_unavailable "$wt" "$log" "$unavailable"
     return 0
   fi
 
-  # Package managers with no verified install command here, and JS components
-  # whose manager could not be determined from what the project declares.
+  # Everything this provisioner will not install: package managers with no
+  # verified install command here, JS components whose manager could not be
+  # determined from what the project declares, Python projects declaring no
+  # committed lock or requirements file, and directories the depth bound put out
+  # of reach. Each is NAMED here rather than dropped, because a lane that
+  # silently lacks the environment it needs to validate is the failure this
+  # library exists to prevent.
   index=0
   for line in "${components[@]}"; do
     eco=${line%% *}
@@ -1429,6 +1673,14 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
       js)
         states[index]=$(fm_provision_gap "$log" js "$rel" ambiguous-manager \
           "its package manager is not determined by package.json's packageManager field and it carries no single lockfile that names one")
+        ;;
+      python)
+        states[index]=$(fm_provision_gap "$log" python "$rel" no-python-lockfile \
+          "it declares a pyproject.toml but neither a uv.lock nor a requirements.txt, and this firstmate installs Python only from a committed declaration")
+        ;;
+      unscanned)
+        states[index]=$(fm_provision_gap "$log" "$eco" "$rel" below-scan-depth \
+          "its manifest lies deeper than the FM_PROVISION_SCAN_DEPTH limit of $FM_PROVISION_SCAN_DEPTH, so it was never classified or installed")
         ;;
       *)
         states[index]=$(fm_provision_gap "$log" "$eco" "$rel" unsupported-manager \
@@ -1502,8 +1754,7 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
     if [ "${states[$index]}" = planned ]; then
       case "$eco" in
         npm|pnpm)
-          dir=$wt/$rel
-          [ "$rel" != . ] || dir=$wt
+          dir=$(fm_provision_component_dir "$wt" "$rel")
           declared_major=$(fm_provision_declared_node_major "$dir")
           if [ -n "$declared_major" ]; then
             if [ -n "$pinned_major" ] && [ "$pinned_major" != "$declared_major" ]; then
@@ -1596,8 +1847,7 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
   for line in "${components[@]}"; do
     eco=${line%% *}
     rel=${line#* }
-    dir=$wt/$rel
-    [ "$rel" != . ] || dir=$wt
+    dir=$(fm_provision_component_dir "$wt" "$rel")
     if [ "${states[$index]}" != planned ]; then
       index=$((index + 1))
       continue
@@ -1697,6 +1947,14 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
         || { fm_provision_fail "cannot record the provisioning fingerprint at $record"; return 1; }
     fi
 
+    # Whatever the probe that decided this component's state reported about it.
+    # The environment is provisioned either way; this is the one thing a
+    # successful component can still have to say.
+    if [ "$FM_PROVISION_PROBE_NOTE" = inconsistent-dependency-metadata ]; then
+      notes[index]=$(fm_provision_note "$log" "$eco" "$rel" "$FM_PROVISION_PROBE_NOTE" \
+        "uv pip check reports that its installed dependency metadata is not self-consistent, which a project pinning through uv's override-dependencies or constraint-dependencies does deliberately - the interpreter runs and the environment is usable, but a check that runs uv pip check will fail here")
+    fi
+
     states[index]=$state
     index=$((index + 1))
   done
@@ -1705,20 +1963,22 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
   for line in "${components[@]}"; do
     eco=${line%% *}
     rel=${line#* }
-    results+=("$eco:$rel=${states[$index]}")
+    note=${notes[$index]}
+    results+=("$eco:$rel=${states[$index]}${note:++$note}")
     case "${states[$index]}" in
       skipped:*)
         skipped=$((skipped + 1))
         unprovisioned="$unprovisioned $rel"
         ;;
     esac
+    [ -z "$note" ] || noted=$((noted + 1))
     index=$((index + 1))
   done
   FM_PROVISION_SUMMARY=$(IFS=,; printf '%s' "${results[*]}")
   index=0
   fm_provision_write_report "$wt" "$log" "$(
     for line in "${components[@]}"; do
-      printf '%s\t%s\t%s\n' "${line%% *}" "${line#* }" "${states[$index]}"
+      printf '%s\t%s\t%s\t%s\n' "${line%% *}" "${line#* }" "${states[$index]}" "${notes[$index]}"
       index=$((index + 1))
     done | fm_provision_report_body "$wt"
   )"
@@ -1731,6 +1991,10 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
       "warning: worktree provisioning left $skipped of ${#components[@]} components UNPROVISIONED:$unprovisioned"
     fm_provision_announce "$log" "warning: provisioning outcome per component - $FM_PROVISION_SUMMARY"
     fm_provision_announce "$log" "warning: the lane's own copy is at $wt/$FM_PROVISION_REPORT_NAME"
+  elif [ "$noted" -gt 0 ]; then
+    fm_provision_announce "$log" \
+      "fm-spawn: worktree provisioned, with $noted of ${#components[@]} components carrying a reported problem - $FM_PROVISION_SUMMARY"
+    fm_provision_announce "$log" "         the lane's own copy is at $wt/$FM_PROVISION_REPORT_NAME"
   else
     fm_provision_announce "$log" "fm-spawn: worktree provisioned - $FM_PROVISION_SUMMARY"
   fi

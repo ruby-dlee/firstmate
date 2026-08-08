@@ -20,7 +20,10 @@ TMP_ROOT=$(fm_test_tmproot fm-spawn-provision)
 # Stub installers that record every invocation to $FM_TEST_INSTALL_LOG and
 # produce exactly the artifacts the real ones do, so the readiness probes are
 # exercised for real. FM_TEST_UV_FAIL / FM_TEST_NPM_FAIL / FM_TEST_NPM_SLEEP /
-# FM_TEST_NPM_SIGNAL steer the failure, hang, and signal-death cases.
+# FM_TEST_NPM_SIGNAL steer the failure, hang, and signal-death cases, and
+# FM_TEST_UV_CHECK_FAIL / FM_TEST_UV_BREAK_PYTHON steer the two ways a finished
+# install can be unhappy: metadata a consistency check dislikes, and no working
+# interpreter at all.
 make_installer_fakebin() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
@@ -34,6 +37,7 @@ case "${1:-}" in
     [ "${FM_TEST_UV_FAIL:-0}" != 1 ] || exit 3
     rm -rf .venv
     mkdir -p .venv/bin .venv/lib/python3.11/site-packages
+    [ "${FM_TEST_UV_BREAK_PYTHON:-0}" != 1 ] || exit 0
     cat > .venv/bin/python <<'PY'
 #!/usr/bin/env bash
 case "${2:-}" in
@@ -75,9 +79,36 @@ PY
         printf 'Name: pytest\nVersion: 8.3.4\n' > .venv/lib/python3.11/site-packages/pytest-8.3.4.dist-info/METADATA
         printf '#!/usr/bin/env bash\nexit 0\n' > .venv/bin/pytest
         chmod +x .venv/bin/pytest
+        # A real editable install records where it points through PEP 610's
+        # direct_url.json, which is the artifact the readiness check reads back.
+        prev=
+        for arg in "$@"; do
+          if [ "$prev" = -r ] && [ -f "$arg" ]; then
+            while IFS= read -r line; do
+              case "$line" in
+                '-e '*)
+                  target=$(cd "${line#-e }" 2>/dev/null && pwd) || continue
+                  dist=.venv/lib/python3.11/site-packages/editable_local-0.1.0.dist-info
+                  mkdir -p "$dist"
+                  printf 'Name: editable-local\nVersion: 0.1.0\n' > "$dist/METADATA"
+                  printf '{"url": "file://%s", "dir_info": {"editable": true}}\n' "$target" \
+                    > "$dist/direct_url.json"
+                  ;;
+              esac
+            done < "$arg"
+          fi
+          prev=$arg
+        done
         exit 0
         ;;
-      check) [ -x .venv/bin/python ] || exit 1; exit 0 ;;
+      check)
+        [ -x .venv/bin/python ] || exit 1
+        [ "${FM_TEST_UV_CHECK_FAIL:-0}" != 1 ] || {
+          printf 'six 1.16.0 requires attrs>=25, but you have attrs 24.2.0.\n' >&2
+          exit 1
+        }
+        exit 0
+        ;;
     esac
     exit 0
     ;;
@@ -425,9 +456,22 @@ REQ
   assert_contains "$out" 'pip:svc=installed' \
     "a changed included requirements file was a false cache hit: $out"
 
-  # A requirement whose package identity cannot be determined cheaply is a miss,
-  # never a hit - and the miss says so instead of looping silently.
+  # A local editable install is about as common as a requirements.txt line gets.
+  # Its identity is not in the line, but the installer records where it points,
+  # so it is verified from that artifact - otherwise the component could never
+  # cache and would pay a full `uv venv --clear` plus reinstall on every lease.
   printf -- '-e .\n' >> "$case_dir/wt/svc/requirements.txt"
+  run_provision "$case_dir" "$case_dir/wt" "$fakebin" >/dev/null
+  : > "$case_dir/install.log"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'pip:svc=cached' \
+    "an editable install the installer recorded was not verified from its own artifacts: $out"
+  assert_no_grep 'uv pip install' "$case_dir/install.log" \
+    "a verifiable editable requirement still paid install cost on every lease"
+
+  # A requirement whose package identity still cannot be determined cheaply is a
+  # miss, never a hit - and the miss says so instead of looping silently.
+  printf -- '-e git+https://example.invalid/pkg.git#egg=pkg\n' >> "$case_dir/wt/svc/requirements.txt"
   run_provision "$case_dir" "$case_dir/wt" "$fakebin" >/dev/null
   : > "$case_dir/install.log"
   out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
@@ -436,6 +480,156 @@ REQ
   assert_contains "$out" 'could not be verified' \
     "an unverifiable requirement reinstalled without saying why: $out"
   pass "pip directives and includes are parsed, so an unchanged component stays cached"
+}
+
+# Regression: ordinary lane activity must not look like a changed environment.
+# webpack, vite, eslint, and babel all write node_modules/.cache, and adding one
+# entry to a directory moves its mtime, ctime, and size - so hashing those for
+# the node_modules root made the very next spawn into a healthy, untouched
+# worktree pay a full reinstall, which is the one thing the cache exists to
+# prevent.
+test_lane_build_output_in_node_modules_is_not_a_cache_miss() {
+  local case_dir out fakebin
+  case_dir=$(new_case env-build-output both)
+  fakebin=$(case_fakebin "$case_dir")
+  run_provision "$case_dir" "$case_dir/wt" "$fakebin" >/dev/null
+
+  mkdir -p "$case_dir/wt/web/node_modules/.cache"
+  printf 'compiled\n' > "$case_dir/wt/web/node_modules/.cache/webpack.bin"
+  : > "$case_dir/install.log"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'npm:web=cached' \
+    "a build tool's own cache file inside node_modules invalidated a healthy environment: $out"
+  assert_contains "$out" 'pip:svc=cached' \
+    "an untouched python component was reinstalled: $out"
+  assert_no_grep 'npm ci' "$case_dir/install.log" \
+    "a lane's build output made an unchanged worktree pay npm install cost"
+  assert_no_grep 'uv pip install' "$case_dir/install.log" \
+    "a lane's build output made an unchanged worktree pay uv install cost"
+  pass "build output written inside node_modules does not invalidate a healthy cache"
+}
+
+# Regression: the digest of nothing is a well-formed digest. A manifest that
+# exists but cannot be read must refuse, because recording `manifest=<name>:`
+# gives the component a perfectly stable fingerprint that does not depend on
+# that file's content at all - and the NEXT lease recomputes the same value
+# after the file changes and calls it a hit.
+test_an_unreadable_manifest_refuses_instead_of_hashing_nothing() {
+  local case_dir out fakebin record
+  case_dir=$(new_case unreadable-manifest python)
+  fakebin=$(case_fakebin "$case_dir")
+  printf 'attrs<25\n' > "$case_dir/wt/svc/constraints.txt"
+  chmod 000 "$case_dir/wt/svc/constraints.txt"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  chmod 600 "$case_dir/wt/svc/constraints.txt"
+  assert_contains "$out" 'rc=1' "an unreadable declared manifest did not refuse: $out"
+  assert_contains "$out" 'cannot resolve the declared manifests for the pip component in svc' \
+    "the refusal did not name the component whose declaration could not be read: $out"
+  assert_no_grep 'uv pip install' "$case_dir/install.log" \
+    "a component whose declaration could not be hashed was installed anyway"
+  for record in "$case_dir"/cache/*.record; do
+    [ -e "$record" ] || continue
+    fail "a component that could not be fingerprinted still recorded one: $record"
+  done
+  pass "a declared manifest that cannot be read refuses instead of hashing to nothing"
+}
+
+# Regression: every other bound in this library reports what it did not do. A
+# component nested past the depth limit was the one that reported nowhere - not
+# in the summary, the log, the metadata, or the lane's report - so a monorepo
+# spawned a lane whose report named only the shallower components and read as
+# complete.
+test_a_component_below_the_scan_depth_is_reported_not_dropped() {
+  local case_dir out fakebin report deep
+  case_dir=$(new_case scan-depth python)
+  fakebin=$(case_fakebin "$case_dir")
+  deep=platform/services/billing/api
+  mkdir -p "$case_dir/wt/$deep"
+  printf 'six==1.16.0\n' > "$case_dir/wt/$deep/requirements.txt"
+
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'rc=0' "a component past the depth limit refused instead of launching: $out"
+  assert_contains "$out" "unscanned:$deep=skipped:below-scan-depth" \
+    "a component past the depth limit was not recorded in the summary: $out"
+  assert_contains "$out" "UNPROVISIONED: $deep" \
+    "a component past the depth limit was not named on stderr: $out"
+  assert_contains "$out" 'pip:svc=installed' \
+    "a component past the depth limit stopped the ones within it: $out"
+  assert_grep 'below-scan-depth' "$case_dir/provision.log" \
+    "a component past the depth limit was named on stderr but not in the provisioning log"
+  report="$case_dir/wt/.fm-provisioning.md"
+  assert_grep "unscanned in $deep - NOT provisioned: below-scan-depth" "$report" \
+    "the lane's report does not name the component the depth limit left it without"
+  [ ! -d "$case_dir/wt/$deep/.venv" ] \
+    || fail "a component past the depth limit was installed anyway"
+  pass "a component nested past the scan depth is reported everywhere, not dropped"
+}
+
+# The same silence, one directory shape over: a project declaring only a
+# pyproject.toml is not something this library installs from, but a lane that
+# needs it must still be told so. Choosing an installer for a lockless project
+# stays a separate decision; only the silence is fixed here.
+test_a_lockless_python_project_is_named_rather_than_invisible() {
+  local case_dir out fakebin report
+  case_dir=$(new_case pyproject-only none)
+  fakebin=$(case_fakebin "$case_dir")
+  mkdir -p "$case_dir/wt/svc"
+  printf '[project]\nname = "svc"\nversion = "0.1.0"\n' > "$case_dir/wt/svc/pyproject.toml"
+
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'rc=0' "a lockless python project refused instead of launching: $out"
+  assert_contains "$out" 'python:svc=skipped:no-python-lockfile' \
+    "a python project declaring no lock or requirements file was not recorded: $out"
+  assert_no_grep 'uv venv' "$case_dir/install.log" \
+    "a lockless python project was installed from a guessed installer"
+  report="$case_dir/wt/.fm-provisioning.md"
+  assert_grep 'python in svc - NOT provisioned: no-python-lockfile' "$report" \
+    "the lane's report does not name the python component it is not getting"
+
+  # A uv workspace member declares exactly the same shape and IS installed, by
+  # its root's --all-packages sync, so reporting it would bury the real gaps.
+  mkdir -p "$case_dir/wt/mono/packages/alpha"
+  printf 'version = 1\n' > "$case_dir/wt/mono/uv.lock"
+  printf '[project]\nname = "mono"\n\n  [tool.uv.workspace]\nmembers = ["packages/*"]\n' \
+    > "$case_dir/wt/mono/pyproject.toml"
+  printf '[project]\nname = "alpha"\nversion = "1.0.0"\n' \
+    > "$case_dir/wt/mono/packages/alpha/pyproject.toml"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'uv:mono=installed' "the uv workspace root was not provisioned: $out"
+  assert_not_contains "$out" 'python:mono/packages/alpha' \
+    "a uv workspace member its root already installs was reported as an unprovisioned gap: $out"
+  pass "a python project with no committed lock or requirements file is named, not silently skipped"
+}
+
+# `uv pip check` verifies that installed metadata is mutually consistent, which
+# is not the same thing as usable: a project pinning through uv's
+# override-dependencies or constraint-dependencies makes it inconsistent ON
+# PURPOSE. Refusing there blocked every spawn into an environment that installs
+# and runs fine, so it is reported instead - loudly, and where the lane reads.
+test_an_inconsistent_environment_is_reported_rather_than_refused() {
+  local case_dir out fakebin report
+  case_dir=$(new_case pip-check-conflict python)
+  fakebin=$(case_fakebin "$case_dir")
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" FM_TEST_UV_CHECK_FAIL=1)
+  assert_contains "$out" 'rc=0' \
+    "an environment uv pip check disagrees with refused the spawn: $out"
+  assert_contains "$out" 'pip:svc=installed+inconsistent-dependency-metadata' \
+    "what uv pip check reported was not recorded beside the component's state: $out"
+  assert_contains "$out" 'uv pip check reports' \
+    "the operator was not told what was reported about the environment: $out"
+  [ -x "$case_dir/wt/svc/.venv/bin/python" ] \
+    || fail "the environment was not provisioned: $out"
+  assert_grep 'uv pip check reports' "$case_dir/provision.log" \
+    "the reported inconsistency reached stderr but not the provisioning log"
+  report="$case_dir/wt/.fm-provisioning.md"
+  assert_grep 'pip in svc - installed, with one thing reported about it: inconsistent-dependency-metadata' \
+    "$report" "the lane's report does not carry what was reported about its own environment"
+
+  # A missing interpreter still means unusable, and still refuses.
+  rm -f "$case_dir/wt/svc/.venv/bin/python"
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin" FM_TEST_UV_BREAK_PYTHON=1)
+  assert_contains "$out" 'rc=1' "an install leaving no working interpreter did not refuse: $out"
+  pass "a reported metadata inconsistency is recorded and launches; an unusable environment still refuses"
 }
 
 # --- library: the failure contract ------------------------------------------
@@ -1568,6 +1762,11 @@ test_a_removed_environment_invalidates_a_matching_fingerprint
 test_node_installs_include_validation_dependencies
 test_a_replaced_interpreter_invalidates_the_cache
 test_pip_requirement_directives_do_not_force_a_reinstall_every_spawn
+test_lane_build_output_in_node_modules_is_not_a_cache_miss
+test_an_unreadable_manifest_refuses_instead_of_hashing_nothing
+test_a_component_below_the_scan_depth_is_reported_not_dropped
+test_a_lockless_python_project_is_named_rather_than_invisible
+test_an_inconsistent_environment_is_reported_rather_than_refused
 test_a_failing_install_refuses_the_spawn
 test_a_hung_install_is_bounded
 test_a_signal_killed_install_refuses_the_spawn

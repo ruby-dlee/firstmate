@@ -121,7 +121,7 @@ log_last_line() {
 }
 # Map a status-log verb onto a canonical state for the fallback path. `paused` is
 # the deliberate-external-wait verb (fm-classify-lib.sh's FM_CLASSIFY_PAUSED_VERB):
-# a crewmate with no active run and an idle pane that declared a known external wait
+# a crewmate with no active run and an idle pane that declared a valid owned-and-clearing wait
 # reports `paused` distinctly, so a supervisor reading this sees a declared pause
 # and its reason rather than a wedge-suspect idle. A line that uses the pause verb to
 # report a FAILURE is not a pause (fm-classify-lib.sh's status_pause_is_failure); it

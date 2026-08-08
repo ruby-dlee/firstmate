@@ -168,7 +168,7 @@ TOON's strict decoder validates every encoded array count before Lavish applies 
 - schema version `2` treats omitted annotations as empty; present question notes, item notes, and the overall note must be strings, option comments must map declared option values to strings, and explicit `null` is invalid for any annotation field
 - annotation answers are schema version `2` only, because annotations did not exist in version `1`
 
-Schema-version-2 browser payloads also carry the resolved absolute `home_marker` used for fail-closed cross-home routing plus landing metadata used only to authorize one candidate when downloads collide.
+Schema-version-2 browser payloads also carry the resolved absolute `home_marker` used for fail-closed cross-home routing plus landing metadata used only to authorize one candidate when downloads collide; landing metadata is invalid without that home marker.
 JSON-destination payloads carry the same `home_marker` but omit transport-only landing metadata after collection.
 
 `receipt.toon` contains:

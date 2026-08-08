@@ -468,22 +468,29 @@ test_signal_crew_provably_working_classifier() {
 # --- benign wakes are absorbed ONLY when the crewmate is provably working -----
 
 test_provably_working_signal_absorbed() {
-  local dir state fakebin out status_file pid
+  local dir state fakebin out status_file sig pid
   dir=$(make_case provably-working-signal); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"
   status_file="$state/task.status"
   printf 'working: compiling step 2\n' > "$status_file"
+  sig=$(seen_sig "$status_file")
   # The crewmate's pipeline is in an actively-running step: positive evidence it is
   # still working, so a no-verb working: signal is absorbed (the original low-churn
   # case during a long validation).
   export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
   watch_bg "$state" "$fakebin" "$out"
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "watcher exited for a working: signal whose crew is provably working (should absorb): $(cat "$out")"
+  if ! wait_file_value "$state/.seen-task_status" "$sig" 300; then
+    if ! kill -0 "$pid" 2>/dev/null; then
+      reap "$pid"; fail "watcher exited for a working: signal whose crew is provably working (should absorb): $(cat "$out")"
+    fi
+    reap "$pid"; fail "provably-working signal did not advance its .seen-* suppressor"
   fi
+  kill -0 "$pid" 2>/dev/null \
+    || { reap "$pid"; fail "watcher exited after absorbing a provably-working signal: $(cat "$out")"; }
   [ ! -s "$out" ] || fail "provably-working signal printed a wake reason: $(cat "$out")"
   [ ! -s "$state/.wake-queue" ] || fail "provably-working signal enqueued a durable wake record"
-  [ -s "$state/.seen-task_status" ] || fail "provably-working signal did not advance its .seen-* suppressor"
+  [ "$(cat "$state/.seen-task_status" 2>/dev/null || true)" = "$sig" ] \
+    || fail "provably-working signal did not persist the observed .seen-* suppressor"
   [ -e "$state/.last-watcher-beat" ] || fail "watcher beacon was not touched while absorbing"
   reap "$pid"
   pass "a no-verb signal whose crew is provably working is absorbed (no exit, no queue, suppressor advanced, beacon present)"

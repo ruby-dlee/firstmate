@@ -1513,8 +1513,8 @@ test_skipped_run_lookup_rejects_checks_green_log() {
   FM_FAKE_BUSY=0
   local out; out=$(run_crew_state "$d" feat-detached-ready)
   assert_contains "$out" "state: unknown" "skipped run lookup with ready log -> unknown"
-  assert_contains "$out" "currentness is unavailable" "skipped lookup names missing currentness"
-  assert_contains "$out" "do not merge" "skipped lookup is merge-safe"
+  assert_contains "$out" "no-mistakes run lookup unavailable for this lane" "skipped lookup names missing currentness"
+  assert_not_contains "$out" "state: paused" "skipped lookup must not authorize a pause"
   assert_not_contains "$out" "state: done" "skipped lookup must not authorize done"
   pass "skipped run lookup rejects a stale checks-green log"
 }

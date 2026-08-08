@@ -44,8 +44,12 @@
 #   that is not a positive integer, a worktree path that is not a directory, a
 #   dependency scan that cannot traverse it, a UV_PROJECT_ENVIRONMENT that would
 #   put an environment where the probe cannot see it, a component that declares
-#   no ignored install directory to protect, a git exclusion that cannot be
-#   registered, declared manifests that cannot be resolved for a component, an
+#   no ignored install directory to protect, an install directory the project
+#   does not already ignore (provisioning refuses rather than hiding it: the only
+#   exclusion git would honour for a linked worktree lives in the MAIN clone, and
+#   installing into a path git can see strands the pool lease when the abort path
+#   cannot prove the worktree returnable), declared manifests that cannot be
+#   resolved for a component, an
 #   install that fails, exceeds its bound, or is killed by a signal, an install
 #   that leaves no working interpreter, a readiness probe that fails after
 #   installing, an environment signature that is empty or unprovable, a declared
@@ -530,8 +534,13 @@ fm_provision_detect() {  # <worktree> [<scan-line>...]
 fm_provision_python_project_declared() {  # <component-dir>
   local file=$1/pyproject.toml rc=0
   [ -f "$file" ] || return 1
-  LC_ALL=C grep -qE '^[[:space:]]*\[[[:space:]]*(project|build-system|tool\.poetry)[].]' \
-    "$file" 2>/dev/null || rc=$?
+  # Bounded like every other read of a project-controlled file in this library: a
+  # pathological pyproject.toml must not be able to hold a spawn open. The
+  # reserved bound codes fall through to 2 below, which is reported rather than
+  # treated as "declares nothing".
+  fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$1" \
+    env LC_ALL=C grep -qE '^[[:space:]]*\[[[:space:]]*(project|build-system|tool\.poetry)[].]' \
+    "$file" >/dev/null 2>&1 || rc=$?
   case "$rc" in
     0|1) return "$rc" ;;
     *) return 2 ;;
@@ -1357,10 +1366,18 @@ fm_provision_probe() {  # <worktree> <eco> <rel> <log> <runtime> <environment> <
       [ -n "$actual" ] && [ "$actual" = "$runtime" ] || return 1
       fm_provision_run_logged "$FM_PROVISION_PROBE_TIMEOUT" "$dir" "$log" \
         uv pip check --python "$python" || check_rc=$?
+      # Exit 1 is the only code that means `uv pip check` RAN and found an
+      # inconsistency. Everything else means no verdict was produced: the
+      # bounded runner reserves 124/125/126/127 for an expired bound, no
+      # bounding mechanism, an undeterminable child status, and a command that
+      # could not execute, and uv's own CLI exits 2 on a usage error. Reporting
+      # any of those as "not self-consistent" would tell the lane the check
+      # found something when the check never answered - the same
+      # something-from-nothing defect this file fails closed on elsewhere.
       case "$check_rc" in
         0) ;;
-        124|125|126|127) FM_PROVISION_PROBE_NOTE=unverified-dependency-metadata ;;
-        *) FM_PROVISION_PROBE_NOTE=inconsistent-dependency-metadata ;;
+        1) FM_PROVISION_PROBE_NOTE=inconsistent-dependency-metadata ;;
+        *) FM_PROVISION_PROBE_NOTE=unverified-dependency-metadata ;;
       esac
       ;;
     npm|pnpm)
@@ -1514,10 +1531,14 @@ fm_provision_unavailable() {  # <log> <reason-token> <message>
 # who can act on it. This file sits at the root of the worktree the lane works
 # in, and names every component and what happened to it.
 #
-# The git exclusion is registered BEFORE the write and the report is skipped when
-# that cannot be done: a report that dirtied a checkout the freshness proof and
-# teardown both require to be clean would be a worse defect than a missing one,
-# and a diagnostic that cannot be filed is never a reason to refuse a spawn.
+# The path must ALREADY be ignored by the project, checked before the write, and
+# the report is skipped when it is not: a report that dirtied a checkout the
+# freshness proof and teardown both require to be clean would be a worse defect
+# than a missing one, and a diagnostic that cannot be filed is never a reason to
+# refuse a spawn. Note the consequence - a project that does not list
+# .fm-provisioning.md in its own .gitignore gets no in-worktree report, and the
+# warning says so. Firstmate does not add the entry itself, because writing an
+# exclusion that git would honour means writing into the primary clone.
 FM_PROVISION_REPORT_NAME=.fm-provisioning.md
 
 # The report describes ONE lease, but a pool slot outlives the task that leased
@@ -1598,7 +1619,7 @@ fm_provision_write_report() {  # <worktree> <log> <body>
   if declare -F fm_provision_register_exclude >/dev/null \
     && ! fm_provision_register_exclude "/$FM_PROVISION_REPORT_NAME"; then
     fm_provision_announce "$log" \
-      "warning: cannot keep /$FM_PROVISION_REPORT_NAME out of git's view, so this lane gets no in-worktree provisioning report"
+      "warning: the project does not ignore /$FM_PROVISION_REPORT_NAME, so this lane gets no in-worktree provisioning report - add it to the project's .gitignore to enable it"
     return 0
   fi
   if ! fm_provision_clear_report "$wt"; then
@@ -1925,9 +1946,10 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
       ;;
   esac
 
-  # Registering the exclusion is a prerequisite, not a courtesy: an installer
-  # that runs first would leave an unignored directory in a checkout the
-  # freshness proof and teardown both require to be clean.
+  # The project ALREADY ignoring each install directory is a prerequisite, not a
+  # courtesy, and it is checked for every planned component before any installer
+  # runs: installing into a path git can see leaves the leased worktree dirty,
+  # fails its returnable check on abort, and strands the workspace lease.
   index=0
   for line in "${components[@]}"; do
     if [ "${states[$index]}" = planned ]; then
@@ -1939,7 +1961,7 @@ fm_provision_worktree() {  # <worktree> <cache-dir> <log> [<needs-file>]
       }
       if declare -F fm_provision_register_exclude >/dev/null \
         && ! fm_provision_register_exclude "$artifact"; then
-        fm_provision_fail "cannot register the git exclusion for $artifact before provisioning"
+        fm_provision_fail "the project does not ignore $artifact, so installing there would leave the worktree dirty, fail its returnable check on abort, and strand the pool lease - add $artifact to the project's own .gitignore, or disable provisioning for this home with config/worktree-provision=off"
         return 1
       fi
     fi

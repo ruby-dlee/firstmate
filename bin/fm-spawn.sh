@@ -3214,12 +3214,30 @@ exclude_path() {
   grep -qxF "$rel" "$EXCL" 2>/dev/null
 }
 
+# Whether a path provisioning is about to create is ALREADY outside git's view,
+# by the project's own ignore rules. It deliberately does NOT write an exclusion
+# to make that true.
+#
+# It used to call exclude_path, and that was wrong in a way worth recording. For
+# a linked worktree `git rev-parse --git-path info/exclude` resolves to the
+# MAIN clone's .git/info/exclude, so provisioning a leased worktree wrote a
+# durable, repo-wide rule into the captain's primary checkout and made that path
+# invisible to `git status` there. Writing the linked worktree's own
+# info/exclude instead does not work - git does not read it - and it would still
+# pass this function's read-back check, so the exclusion would silently apply to
+# nothing. Per-worktree core.excludesFile via extensions.worktreeConfig does
+# work, but it displaces the operator's global excludes inside the worktree and
+# is durable config complexity for a case that should be rare.
+#
+# So provisioning now refuses instead of hiding. A component whose install
+# directory the project does not already ignore is one whose installed tree
+# would show up as untracked, which fails the returnable check on abort and
+# strands the pool lease - the failure that hard-blocks the fleet when every
+# workspace is held. Refusing costs that project one line in its own .gitignore;
+# guessing costs a lease and mutates a checkout firstmate must never write to.
 fm_provision_register_exclude() {
   local rel=$1
-  if git_repository_probe -C "$WT" check-ignore -q "${rel#/}" 2>/dev/null; then
-    return 0
-  fi
-  exclude_path "$rel"
+  git_repository_probe -C "$WT" check-ignore -q "${rel#/}" 2>/dev/null
 }
 
 # Provision the freshly proven worktree's declared project dependencies, so the

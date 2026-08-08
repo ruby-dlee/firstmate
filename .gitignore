@@ -25,3 +25,4 @@ config/cmux-socket-password
 config/wedge-alarm
 config/lavish-wake-command
 config/worktree-provision
+.fm-provisioning.md

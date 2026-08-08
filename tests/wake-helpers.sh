@@ -140,6 +140,13 @@ if [ "${1:-}" = "capture-pane" ]; then
   fi
   exit 0
 fi
+# This fixture models a LIVE pane - capture-pane above always answers - and
+# endpoint existence is proven with has-session, so it has to agree. Falling
+# through to the catch-all failure would make the pane readable and
+# simultaneously non-existent.
+if [ "${1:-}" = "has-session" ]; then
+  exit 0
+fi
 exit 1
 SH
   chmod +x "$fakebin/tmux"

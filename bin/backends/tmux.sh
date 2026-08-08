@@ -203,10 +203,13 @@ fm_backend_tmux_expected_label_matches() {  # <target> [expected-label] [recorde
 }
 
 #
-# The trailing existence gate matters for the no-expectations call shape: with
-# neither an expected label nor a recorded scoped target there is nothing for
-# fm_backend_tmux_expected_label_matches to verify, so without it a gone target
-# would be handed straight back to the caller as if it were live.
+# No separate existence probe here on purpose. The operations this resolves for
+# are capture-pane and send-keys, and BOTH already fail correctly on a target
+# whose window is gone ("can't find window", exit 1) - verified alongside the
+# display-message quirk. Only the display-message-based readers
+# (fm_backend_tmux_current_path/current_command) need an explicit gate, and they
+# carry their own; adding one here would just make every capture and send pay
+# for a second tmux round-trip.
 fm_backend_tmux_operation_target() {  # <target> [expected-label] [recorded-scoped-target]
   local target=$1 expected_label=${2:-} recorded_scoped_target=${3:-} recorded_session recorded_label
   if [ -n "$recorded_scoped_target" ]; then
@@ -220,7 +223,6 @@ fm_backend_tmux_operation_target() {  # <target> [expected-label] [recorded-scop
     return 0
   fi
   fm_backend_tmux_expected_label_matches "$target" "$expected_label" || return 1
-  fm_backend_tmux_target_exists "$target" || return 1
   printf '%s\n' "$target"
 }
 
@@ -262,7 +264,10 @@ fm_backend_tmux_container_ensure() {
   if [ -n "${TMUX:-}" ]; then
     tmux display-message -p '#S'
   else
-    tmux has-session -t firstmate 2>/dev/null || tmux new-session -d -s firstmate
+    # stdout is discarded as well as stderr: this function's own stdout is the
+    # resolved session name the caller captures, so a probe must not be able to
+    # contribute a line to it.
+    tmux has-session -t firstmate >/dev/null 2>&1 || tmux new-session -d -s firstmate >/dev/null
     printf 'firstmate'
   fi
 }

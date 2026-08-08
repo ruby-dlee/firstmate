@@ -24,7 +24,7 @@ make_fake_tmux() {
 #!/usr/bin/env bash
 set -u
 case "${1:-}" in
-  has-session|new-session|new-window|send-keys)
+  new-session|new-window|send-keys)
     printf '%s\n' "$*" >> "$FM_FAKE_TMUX_LOG"
     exit 0
     ;;
@@ -61,8 +61,11 @@ case "${1:-}" in
       *pane_current_command*)
         printf '%s\n' "${FM_FAKE_TMUX_COMMAND:-bash}"
         ;;
-      *session_name*window_name*)
-        printf '%s\t%s\n' "${target%%:*}" "${target#*:}"
+      *session_name*)
+        printf '%s\n' "${target%%:*}"
+        ;;
+      *window_name*)
+        printf '%s\n' "${target#*:}"
         ;;
       *pane_id*) printf '%%1\n' ;;
       *) printf 'firstmate\n' ;;

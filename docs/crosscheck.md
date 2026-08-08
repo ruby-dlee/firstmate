@@ -97,7 +97,7 @@ GitHub reports `base.sha` as the base branch tip observed when the snapshot was 
 Treating it as the reviewed base made two failures routine: an un-rebased PR was refused before launch because the live base was not the checkout's merge base, and a ledger written minutes earlier stopped matching at the merge gate because the branch had moved for reasons unrelated to the PR.
 Both refusals were artifacts of comparing a moving value, not evidence about the change, and a gate that cannot be satisfied is worse than no gate because it trains its operators to route around it.
 The merge base converges instead: the default branch advancing cannot change it unless the branch absorbs commits already reachable from this head, in which case the remaining diff is a subset of what was reviewed and the review stays sound.
-Any change to the PR itself — a new commit, a rebase, a force-push — changes the head SHA, which invalidates the ledger match on its own, so the head remains the pin GitHub's atomic merge enforces.
+Any change to the PR itself - a new commit, a rebase, a force-push - changes the head SHA, which invalidates the ledger match on its own, so the head remains the pin GitHub's atomic merge enforces.
 Verification therefore matches the live head and the stable claims digest, and checks the execution proof against the merge base the run recorded.
 The authoring worktree is not cloned, checked for cleanliness, or required to match the PR head because no verdict about the remote PR may depend on mutable author-lane filesystem state.
 An empty `FM_STATE_OVERRIDE` falls back to the home state directory, so task metadata, the shared per-task lock, and the disposable review checkout cannot split across callers' current working directories.
@@ -180,7 +180,7 @@ An unavailable reviewer binary, sandbox, author-identity proof, executing-accoun
 A reviewer that never reached its provider is also a `tool-failure` rather than an `unreviewed` attempt, and is the case that fails over.
 The two are distinguished by evidence of model work: a Claude result envelope with no API duration, no token usage, and no per-model usage, or a Codex exit that wrote no result artifact at all, means the account never spoke and the gate learned nothing about the code.
 Recording that as `unreviewed` also manufactured a suspicion in the ledger, which reads like the reviewer raised a concern about the change when it had not started.
-Failure banners quote what the reviewer actually reported — for Claude the envelope's `result`, `subtype`, `terminal_reason`, `api_error_status`, and any permission denials, plus captured stderr — rather than a fixed-length excerpt of the raw envelope, because the sentence that explains a failure sits past the point such an excerpt stops.
+Failure banners quote what the reviewer actually reported - for Claude the envelope's `result`, `subtype`, `terminal_reason`, `api_error_status`, and any permission denials, plus captured stderr - rather than a fixed-length excerpt of the raw envelope, because the sentence that explains a failure sits past the point such an excerpt stops.
 A timeout, or a reviewer that reached the model and then produced a missing, empty, malformed, or wrong-head artifact, records an `unreviewed` attempt and exits nonzero.
 An unresolved suspicion comes from a completed reviewer and records a `blocking` attempt instead of being conflated with an invalid review artifact.
 This includes provider refusals that surface only as a stopped or silent agent.

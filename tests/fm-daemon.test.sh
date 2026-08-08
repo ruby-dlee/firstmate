@@ -456,6 +456,40 @@ test_housekeeping_unreadable_pause_preserves_recheck_tracking() {
   pass "unreadable paused capture preserves recheck tracking and surfaces UNKNOWN"
 }
 
+test_housekeeping_missing_stale_target_preserves_unknown_tracking() {
+  local dir state fakebin key
+  dir=$(make_supercase stale-target-missing)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  key=$(_stale_key missing-stale)
+  echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
+  (
+    unset FM_FAKE_TMUX_WINDOW
+    PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
+  ) || fail "missing stale target housekeeping failed"
+  assert_grep 'stale endpoint attribution UNKNOWN' "$state/.subsuper-escalations" \
+    "missing stale target did not enter UNKNOWN escalation"
+  [ -e "$state/.subsuper-stale-$key" ] || fail "missing stale target discarded its escalation marker"
+  pass "missing stale target preserves tracking and surfaces UNKNOWN"
+}
+
+test_housekeeping_missing_paused_target_preserves_unknown_tracking() {
+  local dir state fakebin key
+  dir=$(make_supercase paused-target-missing)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  key=$(_stale_key missing-paused)
+  echo $(( $(date +%s) - 500 )) > "$state/.subsuper-paused-$key"
+  (
+    unset FM_FAKE_TMUX_WINDOW
+    PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
+  ) || fail "missing paused target housekeeping failed"
+  assert_grep 'paused endpoint attribution UNKNOWN' "$state/.subsuper-escalations" \
+    "missing paused target did not enter UNKNOWN escalation"
+  [ -e "$state/.subsuper-paused-$key" ] || fail "missing paused target discarded its recheck marker"
+  pass "missing paused target preserves tracking and surfaces UNKNOWN"
+}
+
 test_housekeeping_stale_liveness_runs_one_bounded_parallel_window() {
   local dir state fakebin pane liveness_log task win key marker_epoch first last span
   dir=$(make_supercase stale-parallel)
@@ -1809,6 +1843,8 @@ test_housekeeping_seeds_pause_marker_from_status
 test_housekeeping_persistent_stale_escalates
 test_housekeeping_unreadable_stale_preserves_unknown_tracking
 test_housekeeping_unreadable_pause_preserves_recheck_tracking
+test_housekeeping_missing_stale_target_preserves_unknown_tracking
+test_housekeeping_missing_paused_target_preserves_unknown_tracking
 test_housekeeping_stale_liveness_runs_one_bounded_parallel_window
 test_housekeeping_busy_pane_stale_is_unknown
 test_housekeeping_paused_resurfaces_and_resets

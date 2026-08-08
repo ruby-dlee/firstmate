@@ -55,16 +55,38 @@ EOF
     printf 'total_count: 1\ncheck_runs[1]{id}:\n  11\n'
     ;;
   'api /repos/ruby-dlee/firstmate/check-runs/11')
+    count=$(cat "$FM_TEST_CHECK_COUNT" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FM_TEST_CHECK_COUNT"
+    check_name=ci
+    check_app=17
+    [ "$FM_TEST_CHECK_MODE" != unrelated ] || check_name=lint
+    [ "$FM_TEST_CHECK_MODE" != status-context ] || check_name=lint
+    [ "$FM_TEST_CHECK_MODE" != wrong-app ] || check_app=18
+    if [ "$FM_TEST_CHECK_MODE" = race ] && [ "$count" -gt 1 ]; then
+      check_name=ci-rerun
+    fi
     if [ "$FM_TEST_CHECK_MODE" = pending ]; then
-      printf 'status: in_progress\nconclusion: null\n'
+      check_status=in_progress
+      check_conclusion=null
     else
-      printf 'status: completed\nconclusion: success\n'
+      check_status=completed
+      check_conclusion=success
+    fi
+    printf 'id: 11\nname: %s\napp:\n  id: %s\nstatus: %s\nconclusion: %s\n' \
+      "$check_name" "$check_app" "$check_status" "$check_conclusion"
+    ;;
+  'api /repos/ruby-dlee/firstmate/commits/'"$FM_TEST_HEAD"'/status?per_page=100&page=1')
+    if [ "$FM_TEST_CHECK_MODE" = status-context ]; then
+      printf 'total_count: 1\nstate: success\nstatuses[1]:\n  - id: 21\n    context: ci\n    state: success\n'
+    else
+      printf 'total_count: 0\nstate: success\nstatuses[0]: []\n'
     fi
     ;;
-  'api /repos/ruby-dlee/firstmate/commits/'"$FM_TEST_HEAD"'/status')
-    printf 'total_count: 0\nstate: success\n'
-    ;;
   'api /repos/ruby-dlee/firstmate/pulls/7/reviews?per_page=100&page=1')
+    count=$(cat "$FM_TEST_REVIEW_COUNT" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FM_TEST_REVIEW_COUNT"
     case "$FM_TEST_REVIEW_MODE" in
       missing)
         printf 'reviews: []\n'
@@ -115,6 +137,7 @@ EOF
         [ "$FM_TEST_REVIEW_MODE" != author ] || reviewer_two=author
         [ "$FM_TEST_REVIEW_MODE" != stale ] || review_head=$FM_TEST_BASE
         [ "$FM_TEST_REVIEW_MODE" != malformed ] || reviewer_two=bad/reviewer
+        if [ "$FM_TEST_REVIEW_MODE" = race ] && [ "$count" -gt 1 ]; then reviewer_two=reviewer-four; fi
         cat <<EOF
 reviews[2]:
   - id: 1
@@ -132,7 +155,11 @@ EOF
     esac
     ;;
   'api /repos/ruby-dlee/firstmate/branches/main/protection/required_status_checks')
-    printf 'strict: true\ncontexts[1]:\n  - ci\nchecks[0]: []\n'
+    if [ "$FM_TEST_CHECK_MODE" = status-context ]; then
+      printf 'strict: true\ncontexts[1]:\n  - ci\nchecks[0]: []\n'
+    else
+      printf 'strict: true\ncontexts[1]:\n  - ci\nchecks[1]:\n  - context: ci\n    app_id: 17\n'
+    fi
     ;;
   'api /repos/ruby-dlee/firstmate/branches/main/protection/required_pull_request_reviews')
     if [ "$FM_TEST_POLICY_MODE" = weak ]; then
@@ -152,9 +179,10 @@ chmod +x "$FAKEBIN/gh-axi"
 run_admit() {
   local review_mode=${1:-valid} check_mode=${2:-success} file_mode=${3:-valid}
   local policy_mode=${4:-strict} pr_mode=${5:-stable}
-  rm -f "$TMP_ROOT/pr.count"
+  rm -f "$TMP_ROOT/pr.count" "$TMP_ROOT/check.count" "$TMP_ROOT/review.count"
   PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$STATE" \
     FM_TEST_HEAD="$HEAD_SHA" FM_TEST_BASE="$BASE" FM_TEST_PR_COUNT="$TMP_ROOT/pr.count" \
+    FM_TEST_CHECK_COUNT="$TMP_ROOT/check.count" FM_TEST_REVIEW_COUNT="$TMP_ROOT/review.count" \
     FM_TEST_REVIEW_MODE=$review_mode FM_TEST_CHECK_MODE=$check_mode \
     FM_TEST_FILE_MODE=$file_mode FM_TEST_POLICY_MODE=$policy_mode \
     FM_TEST_PR_MODE=$pr_mode \
@@ -163,6 +191,8 @@ run_admit() {
 
 out=$(run_admit) || fail "nested review identities were not admitted"
 assert_contains "$out" "reviewers=2" "admission did not count two nested non-author identities"
+out=$(run_admit valid status-context) || fail "protected status context was not admitted"
+assert_contains "$out" "passed=2" "admission did not bind the protected exact-head status context"
 
 expect_refusal() {  # <name> <stderr-pattern> [review] [check] [files] [policy] [pr]
   local name=$1 pattern=$2 rc
@@ -182,6 +212,10 @@ expect_refusal change-request 'blocked=1' changes
 expect_refusal dismissed-review 'approvals=1' dismissed
 expect_refusal malformed-review 'review identity is malformed' malformed
 expect_refusal pending-checks 'checks are not green and settled' valid pending
+expect_refusal unrelated-check 'protected exact-head check is missing' valid unrelated
+expect_refusal wrong-check-app 'required app' valid wrong-app
+expect_refusal check-evidence-race 'evidence changed during admission' valid race
+expect_refusal review-evidence-race 'evidence changed during admission' race
 expect_refusal containment-mismatch 'GitHub PR files differ' valid success mismatch
 expect_refusal weak-policy 'base branch does not enforce' valid success valid weak
 expect_refusal moving-head 'PR head/base/state changed during admission' valid success valid strict move

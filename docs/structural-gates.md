@@ -76,21 +76,21 @@ Absence of a process sample, a stale status field, or one quiet observation can 
 - `bin/fm-run-liveness.sh` is the exact run-ID, branch, and head-attributed process owner and emits only `BUSY` from affirmative process evidence or `UNKNOWN` otherwise.
 - `bin/fm-nm-step-liveness.sh` maps affirmative process evidence to `alive` and every absence, timeout, unreadable state, and repeated zero sample to `unknown`.
 - `bin/fm-crew-state.sh` consumes branch-matched run evidence before pane and status evidence and downgrades legacy `dead` vocabulary to unknown.
-- `bin/fm-classify-lib.sh`, `bin/fm-watch.sh`, and `bin/fm-supervise-daemon.sh` absorb a lane only from an affirmative process or pane sample and never from a recorded liveness or status field.
+- `bin/fm-classify-lib.sh`, `bin/fm-watch.sh`, and `bin/fm-supervise-daemon.sh` absorb a lane only from affirmative run-owned process evidence; pane, status, missing-target, and unreadable observations remain UNKNOWN.
 - `bin/fm-auto-reap.sh` has no validation-abort route and retains every active, cross-branch, ambiguously attributed, or otherwise uncustodied run.
 - Teardown remains the sole destructive boundary and still requires its independent exact ownership, cleanliness, landed-work, and endpoint proofs.
 
 ### Trigger, predicate, and failure mode
 
 - Trigger: current-state reads, watcher triage, away-mode triage, stale classification, and automatic reap attempts.
-- Predicate: BUSY requires a current affirmative process sample attributed to the exact run ID and branch, while destructive cleanup additionally requires terminal state and exact safe custody.
+- Predicate: BUSY requires a current affirmative process sample attributed to the exact run ID, task branch, and head before and after sampling, while destructive cleanup additionally requires terminal state and exact safe custody.
 - Failure mode: any absence, mismatch, timeout, single quiet sample, repeated zero sample, stale field, unknown owner, or cross-branch run becomes UNKNOWN and retains the lane without cancellation.
 
 ### BUSY, UNKNOWN, and not acceptable
 
 - BUSY means affirmative evidence says attributed work is executing now, and it is sufficient only to suppress a benign wake.
 - UNKNOWN means the system cannot prove activity or inactivity, and it must surface or retain custody without claiming idle, dead, wedged, or safe to cancel.
-- A cancellation-quality verdict would require exact run and branch attribution, terminal state from the authoritative run, no contradictory process evidence, and safe endpoint and worktree custody; this hardening intentionally grants no automatic validation-abort authority even when those facts appear available.
+- A cancellation-quality verdict would require exact run, task branch, and head attribution, terminal state from the authoritative run, no contradictory process evidence, and safe endpoint and worktree custody; this hardening intentionally grants no automatic validation-abort authority even when those facts appear available.
 
 ### Deterministic evidence
 
@@ -163,7 +163,8 @@ A merge can be treated as ready while checks are pending, the reviewed head has 
 ### Complete route inventory
 
 - `bin/fm-pr-check.sh` records canonical live PR metadata without granting merge authority.
-- `bin/fm-pr-admit.sh` independently reads the live PR and requires an open non-draft PR, exact expected head, settled successful checks, clean exact-head review state, and PR-file and worktree containment.
+- `bin/fm-pr-admit.sh` independently reads the live PR and requires an open non-draft PR, exact expected head, every protected context and app identity in settled successful exact-head evidence, clean exact-head review state, and PR-file and worktree containment.
+- Immediately before admission, `bin/fm-pr-admit.sh` re-snapshots protected policy plus the complete exact-head check and review evidence and refuses any same-head change.
 - Pending, queued, missing, unreadable, stale, stopped, wrong-head, or absent reviewer output is `UNREVIEWED`, never clean.
 - `bin/fm-crosscheck.sh verify` rechecks live head, base, claims digest, reviewer independence, executed reproduction evidence, and durable finding lifecycle.
 - `bin/fm-pr-merge.sh` orders canonical PR recording, Crosscheck verification, native five-part admission, and then unconditional refusal before any mutation.
@@ -177,7 +178,7 @@ A merge can be treated as ready while checks are pending, the reviewed head has 
 
 ### Deterministic evidence
 
-- `tests/fm-pr-admit.test.sh` mutation-tests nested review identities, pending checks, dirty and mismatched containment, weak policy, and head movement.
+- `tests/fm-pr-admit.test.sh` mutation-tests nested review identities, missing required contexts, wrong app identity, same-head evidence races, pending checks, dirty and mismatched containment, weak policy, and head movement.
 - `tests/fm-crosscheck.test.sh` covers exact-head reviewer execution, independence, evidence reproduction, claims binding, stale artifacts, and UNREVIEWED states.
 - `tests/fm-pr-merge.test.sh` proves the sole entrypoint orders exact evidence before an unconditional no-network refusal.
 

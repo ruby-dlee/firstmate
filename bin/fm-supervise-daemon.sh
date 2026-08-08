@@ -992,8 +992,13 @@ housekeeping() {  # <state>
     # legacy fallback for old markers that predate meta lookup.
     win=$(window_for_task "$key" "$state" 2>/dev/null || true)
     if [ -z "$win" ]; then
-      # Window gone (task torn down): drop the marker, nothing to escalate.
-      rm -f "$marker"; continue
+      age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
+      threshold=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}
+      if [ "$age" -ge "$threshold" ]; then
+        escalate_add "$state" "stale endpoint attribution UNKNOWN after ${age}s; backend target or metadata is unreadable: task-key=$key"
+        _now > "$marker"
+      fi
+      continue
     fi
     task=$(window_to_task "$win" "$state")
     last=$(last_status_line "$state/$task.status")
@@ -1078,7 +1083,12 @@ housekeeping() {  # <state>
     key="${marker##*.subsuper-paused-}"
     win=$(window_for_task "$key" "$state" 2>/dev/null || true)
     if [ -z "$win" ]; then
-      rm -f "$marker"; continue
+      age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
+      if [ "$age" -ge "$pause_secs" ]; then
+        escalate_add "$state" "paused endpoint attribution UNKNOWN after ${age}s; backend target or metadata is unreadable: task-key=$key"
+        _now > "$marker"
+      fi
+      continue
     fi
     task=$(window_to_task "$win" "$state")
     last=$(last_status_line "$state/$task.status")

@@ -5,17 +5,26 @@
 
 import fs from "node:fs";
 
-const wanted = process.argv.slice(2);
+const args = process.argv.slice(2);
+let arrayName = null;
+if (args[0] === "--array") {
+  args.shift();
+  arrayName = args.shift();
+}
+const wanted = args;
 if (wanted.length === 0) process.exit(2);
 const lines = fs.readFileSync(0, "utf8").split(/\r?\n/);
-const headerIndex = lines.findIndex((line) => /^(?:[A-Za-z0-9_]+)?\[\d+\](?:\{[^}]+\})?:$/.test(line.trim()));
+const headerPattern = arrayName === null
+  ? /^(?:[A-Za-z0-9_]+)?\[\d+\](?:\{[^}]+\})?:(?: \[\])?$/
+  : new RegExp(`^${arrayName}\\[\\d+\\](?:\\{[^}]+\\})?:(?: \\[\\])?$`);
+const headerIndex = lines.findIndex((line) => headerPattern.test(line.trim()));
 if (headerIndex < 0) {
   if (lines.some((line) => /^(?:[A-Za-z0-9_]+: *)?\[\]$/.test(line.trim()))) process.exit(0);
   console.error("error: TOON table header not found");
   process.exit(2);
 }
 const header = lines[headerIndex];
-const match = header.trim().match(/^(?:[A-Za-z0-9_]+)?\[(\d+)\](?:\{([^}]+)\})?:$/);
+const match = header.trim().match(/^(?:[A-Za-z0-9_]+)?\[(\d+)\](?:\{([^}]+)\})?:(?: \[\])?$/);
 const expected = Number.parseInt(match[1], 10);
 const fields = match[2]?.split(",") ?? [];
 const indexes = wanted.map((field) => fields.indexOf(field));
@@ -73,6 +82,28 @@ function decodeScalar(value) {
     try { return JSON.parse(trimmed); } catch { throw new Error("invalid quoted scalar"); }
   }
   return trimmed;
+}
+
+if (wanted.length === 1 && wanted[0] === "value") {
+  const scalarRows = [];
+  for (let i = headerIndex + 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (line.trim() === "") continue;
+    const indent = line.match(/^ */)[0].length;
+    if (indent <= headerIndent) break;
+    if (indent === rowIndent && line.slice(indent).startsWith("- ")) scalarRows.push(line);
+  }
+  if (scalarRows.length !== expected) {
+    console.error(`error: TOON scalar row count mismatch: header=${expected} rows=${scalarRows.length}`);
+    process.exit(2);
+  }
+  try {
+    for (const scalarRow of scalarRows) console.log(String(decodeScalar(scalarRow.trimStart().slice(2))).replace(/[\t\n]/g, " "));
+  } catch (error) {
+    console.error(`error: TOON scalar-list parse failed: ${error.message}`);
+    process.exit(2);
+  }
+  process.exit(0);
 }
 
 function assignField(target, text, prefix = "") {

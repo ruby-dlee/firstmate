@@ -37,6 +37,7 @@
 5222	tests/fm-backlog-handoff.test.sh
 17908	tests/fm-bearings-snapshot.test.sh
 2000	tests/fm-behavior-shards.test.sh
+2000	tests/fm-blocker-discipline-gap.test.sh
 9402	tests/fm-bootstrap.test.sh
 2000	tests/fm-bounded-io.test.sh
 1875	tests/fm-brief.test.sh
@@ -47,6 +48,7 @@
 263	tests/fm-composer-ghost.test.sh
 30	tests/fm-composer-lib.test.sh
 10055	tests/fm-crew-state.test.sh
+2000	tests/fm-crosscheck-no-merge.test.sh
 94232	tests/fm-crosscheck.test.sh
 13991	tests/fm-daemon.test.sh
 340	tests/fm-decision-pretool-check.test.sh
@@ -58,7 +60,9 @@
 4809	tests/fm-github-pr.test.sh
 25	tests/fm-gotmp.test.sh
 3459	tests/fm-grok-harness.test.sh
+15000	tests/fm-herdr-codex-steer.test.sh
 6995	tests/fm-herdr-lab.test.sh
+5000	tests/fm-host-pressure.test.sh
 98	tests/fm-lint.test.sh
 187	tests/fm-lock.test.sh
 1686	tests/fm-macos-permissions.test.sh
@@ -67,11 +71,14 @@
 10	tests/fm-pi-primary-live-e2e.test.sh
 80	tests/fm-pi-primary-types.test.sh
 3170	tests/fm-pi-watch-extension.test.sh
+15000	tests/fm-pr-admit.test.sh
 1574	tests/fm-pr-merge.test.sh
 802	tests/fm-prompt-exec.test.sh
 261383	tests/fm-report-stack-a.test.sh
 243164	tests/fm-report-stack-b.test.sh
 495	tests/fm-review-diff.test.sh
+10000	tests/fm-run-liveness.test.sh
+5000	tests/fm-runtime-profile.test.sh
 26463	tests/fm-secondmate-harness.test.sh
 37513	tests/fm-secondmate-lifecycle-e2e.test.sh
 6623	tests/fm-secondmate-liveness.test.sh

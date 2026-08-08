@@ -952,15 +952,13 @@ expect_refused(aliased, "same-openai-account-different-path")
 write_config(distinct)
 selected = module.reviewer_config(root, meta)
 assert selected["account_home"] == str(distinct.resolve()), selected
-assert selected["author_openai_account"] == "openai-account-A", selected
+assert selected["author_account_identity"] == "openai-account-A", selected
 print(f"SELECTED distinct-openai-account: {selected['account_home']}")
 
-# An unreadable reviewer identity is deferred, not assumed separate: the
-# author identity rides along so the bound credential decides at execution.
-write_config(opaque)
-deferred = module.reviewer_config(root, meta)
-assert deferred["author_openai_account"] == "openai-account-A", deferred
-print("DEFERRED unreadable-reviewer-identity to executing-credential proof")
+# An unreadable reviewer identity is refused at selection rather than carried
+# forward: an identity that cannot be resolved is never separation, and
+# skipping the entry lets a genuinely provable reviewer later in the list win.
+expect_refused(opaque, "unreadable-reviewer-identity")
 
 # An unreadable author identity can never become provable separation,
 # because nothing downstream re-inspects the author.
@@ -978,7 +976,8 @@ except module.CrosscheckError as exc:
 else:
     raise AssertionError("unreadable author identity was accepted as separate")
 
-# A non-OpenAI author is unaffected: path separation still governs.
+# A cross-provider pair is unaffected: there is no shared account namespace to
+# collide in, so path separation still governs.
 claude_meta = {
     "harness": "claude",
     "model": "claude-opus-5",
@@ -990,6 +989,125 @@ assert selected["account_home"] == str(aliased.resolve()), selected
 print("SELECTED claude-author-unaffected")
 PY
   pass "OpenAI-backed reviewers prove account separation on the executing credential"
+}
+
+test_anthropic_backed_reviewer_proves_account_separation() {
+  # Anthropic pairs must prove separation on the account each home executes as,
+  # exactly as OpenAI pairs do. Path inequality is not proof: a Claude home that
+  # names no account borrows whatever credential the environment supplies, which
+  # is how a "different" reviewer can be the author's own account.
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$TMP_ROOT" <<'PY' \
+    || fail "Anthropic independence regressed to a path comparison"
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+root = Path(sys.argv[2]) / "anthropic-account-separation"
+root.mkdir()
+config_path = root / "reviewer.json"
+os.environ["FM_CROSSCHECK_REVIEWER_CONFIG"] = str(config_path)
+
+
+def claude_home(name, account_uuid):
+    home = root / name
+    home.mkdir()
+    payload = {} if account_uuid is None else {
+        "oauthAccount": {"accountUuid": account_uuid}
+    }
+    (home / ".claude.json").write_text(json.dumps(payload), encoding="utf-8")
+    return home
+
+
+author = claude_home("claude-author", "anthropic-account-A")
+aliased = claude_home("claude-aliased", "anthropic-account-A")
+distinct = claude_home("claude-distinct", "anthropic-account-B")
+opaque = claude_home("claude-borrowed", None)
+
+
+def write_config(home, harness="claude", model="claude-opus-5"):
+    config_path.write_text(
+        json.dumps(
+            {
+                "reviewers": [
+                    {
+                        "harness": harness,
+                        "model": model,
+                        "effort": "xhigh",
+                        "account_home": str(home),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+meta = {
+    "harness": "claude",
+    "model": "gpt-5.6-sol",
+    "account_home": str(author),
+}
+
+
+def expect_refused(home, label):
+    write_config(home)
+    try:
+        module.reviewer_config(root, meta)
+    except module.CrosscheckError as exc:
+        message = str(exc)
+        assert "proven-separate account" in message, message
+        print(f"REFUSED {label}")
+        return
+    raise AssertionError(f"{label} was accepted as an independent reviewer")
+
+
+# One Anthropic account behind two different directories is not separation.
+expect_refused(aliased, "same-anthropic-account-different-path")
+
+# A home that names no account cannot be shown distinct from the author.
+expect_refused(opaque, "borrowed-credential-reviewer-identity")
+
+# An unreadable author identity can never become provable separation.
+borrowed_author = {
+    "harness": "claude",
+    "model": "gpt-5.6-sol",
+    "account_home": str(opaque),
+}
+write_config(distinct)
+try:
+    module.reviewer_config(root, borrowed_author)
+except module.CrosscheckError as exc:
+    assert "proven-separate account" in str(exc), str(exc)
+    print("REFUSED unreadable-anthropic-author-identity")
+else:
+    raise AssertionError("unreadable author identity was accepted as separate")
+
+# Two genuinely distinct Anthropic accounts are independent.
+write_config(distinct)
+selected = module.reviewer_config(root, meta)
+assert selected["account_home"] == str(distinct.resolve()), selected
+assert selected["author_account_identity"] == "anthropic-account-A", selected
+print("SELECTED distinct-anthropic-account")
+
+# A cross-provider reviewer is unaffected by Anthropic identity comparison.
+write_config(aliased, harness="codex", model="gpt-5.6-sol")
+cross = module.reviewer_config(root, {
+    "harness": "claude",
+    "model": "claude-opus-5",
+    "account_home": str(author),
+})
+assert cross["harness"] == "codex", cross
+assert "author_account_identity" not in cross, cross
+print("SELECTED cross-provider-unaffected")
+PY
+  pass "Anthropic-backed reviewers prove account separation on the executing account"
 }
 
 test_unrouted_lane_compares_provider_not_harness() {
@@ -1055,7 +1173,7 @@ def expect_selected(author, name, label):
     write_config(name)
     selected = module.reviewer_config(root, author)
     assert selected["harness"] == reviewers[name][0], selected
-    assert "author_openai_account" not in selected, selected
+    assert "author_account_identity" not in selected, selected
     print(f"SELECTED {label}: {selected['harness']}")
 
 
@@ -1088,7 +1206,7 @@ expect_selected(claude_author, "codex", "unrouted-claude-author-codex-reviewer")
 expect_refused(
     unrouted("unknown-harness", "gpt-5.5"),
     "claude",
-    "cannot establish a provider account namespace",
+    "no known provider namespace",
     "unrouted-unmapped-author-harness",
 )
 
@@ -1162,7 +1280,10 @@ test_api_key_reviewer_cannot_prove_openai_separation() {
   rc=$?
   set -e
   expect_code 1 "$rc" "api-key reviewer without a provable OpenAI account"
-  assert_grep 'executing-account separation is unprovable' \
+  # Refused at selection now that an unresolvable identity is never separation;
+  # run_reviewer's launch-time re-check remains as defense in depth for a
+  # credential that resolves differently than the configured directory did.
+  assert_grep 'proven-separate account' \
     "$case_dir/api-key.err" \
     "an API-key reviewer was allowed to stand in for a proven-separate account"
   assert_no_grep 'crosscheck clear' "$case_dir/api-key.out" \
@@ -1717,6 +1838,13 @@ assert reviewer["credential_identifier"] == sys.argv[2]
     || fail "Codex credential binding was not recorded"
 
   rm "$case_dir/reviewer-home/auth.json"
+  # Switch the author to the other provider so selection does not compare
+  # account identities: this case exists to exercise the launch-time Codex
+  # credential preflight, and a same-provider pair would now be refused at
+  # selection before the reviewer is ever bound.
+  sed -i.bak -e 's/harness=codex/harness=claude/' -e 's/model=gpt-5.5/model=claude-opus-5/' \
+    "$case_dir/state/task-x1.meta"
+  rm "$case_dir/state/task-x1.meta.bak"
   set +e
   OPENAI_API_KEY=ambient-openai run_case "$case_dir" "$base" "$head" clear run \
     > "$case_dir/missing-auth.out" 2> "$case_dir/missing-auth.err"
@@ -2788,6 +2916,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
     test_reviewer_policy_profiles_and_independence|\
     test_openai_backed_reviewer_proves_account_separation|\
+    test_anthropic_backed_reviewer_proves_account_separation|\
     test_unrouted_lane_compares_provider_not_harness|\
     test_reviewer_binary_never_resolves_from_working_directory|\
     test_api_key_reviewer_cannot_prove_openai_separation|\
@@ -2845,6 +2974,7 @@ fi
 
 test_reviewer_policy_profiles_and_independence
 test_openai_backed_reviewer_proves_account_separation
+test_anthropic_backed_reviewer_proves_account_separation
 test_unrouted_lane_compares_provider_not_harness
 test_reviewer_binary_never_resolves_from_working_directory
 test_api_key_reviewer_cannot_prove_openai_separation

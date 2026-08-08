@@ -39,12 +39,13 @@ The file is local and gitignored at `config/crosscheck-reviewer.json`.
 }
 ```
 
-Crosscheck resolves each configured account home and selects the first whose account home and model both differ from the routed author identity recorded in task metadata.
+Crosscheck resolves each configured account home and selects the first whose model differs from the routed author identity recorded in task metadata and whose account is provably not the author's.
 It then binds the provider's executing credential selector to that exact path and requires the verdict plus a Bash-created receipt to report the selector and actual private `HOME`.
 Account separation therefore depends on the executing credential source rather than a configuration label.
 Every reviewer disables reviewed-repository instruction discovery at launch: Codex sets `project_doc_max_bytes=0`, Claude uses `--safe-mode`, and Pi uses `--no-context-files`.
 Pi is launched through the resolved installed executable with `openai-codex/gpt-5.6-sol` at `xhigh`, JSON event output, an ephemeral session, and only the read and Bash-capable review tools.
 For the installed npm entrypoint, Crosscheck also resolves Pi's sibling Node runtime before launch instead of allowing the reviewer environment's `PATH` to substitute another interpreter.
+That pin recognizes every `env`-based Node shebang, including `#!/usr/bin/env -S node --flag`, and preserves the flags; an `env` shebang naming no interpreter fails closed rather than silently falling back to `PATH`.
 Its event stream must contain at least one completed turn, end with a successful `stop` assistant turn, and complete the agent before Crosscheck accepts that terminal turn's JSON verdict.
 Pi credential provisioning is a captain-owned prerequisite: the selected `account_home` must contain a usable `openai-codex` OAuth entry in `auth.json`, and Firstmate does not create or copy that credential.
 Because Pi selects only the default `openai-codex` slot and reviewer launches disable extension discovery, a Pi reviewer home holds exactly one account; a multi-slot Pi home reviews as its default slot, not as whichever slot has capacity.
@@ -54,9 +55,13 @@ It authenticates against the same upstream OpenAI accounts the Codex reviewer us
 What Pi adds is an independent client path and a reviewer that is separate from a Claude author by construction.
 A usage-limited reviewer account records a `tool-failure`, never a verdict about code, and Crosscheck does not fail over to another configured reviewer: the first independent entry is the one it runs, so an operator whose leading reviewer is rate-limited must reorder `reviewers` or wait for that account's window to reset.
 
-Because Codex and Pi both authenticate against OpenAI, one account routinely exists behind several directories at once, and two different `account_home` paths can execute as the same account.
-Path inequality therefore cannot establish account separation between two OpenAI-backed identities.
-When both the author and the reviewer are OpenAI-backed, Crosscheck compares the executing OpenAI account recorded in each credential and refuses a reviewer that resolves to the author's account, an unreadable author identity, or a reviewer credential such as an API key that names no account at all.
+One upstream account routinely exists behind several directories at once, so two different `account_home` paths can execute as the same account.
+Codex and Pi both authenticate against OpenAI, and a Claude config home that records no account of its own borrows whatever credential the environment supplies.
+Path inequality therefore cannot establish account separation on either provider.
+When the author and the reviewer resolve to the same provider, Crosscheck compares the account each home executes as and refuses a reviewer that resolves to the author's account, an unreadable identity on either side, or a credential such as an API key that names no account at all.
+An identity that cannot be resolved is never separation, and the refusal happens at selection so a genuinely provable reviewer later in the list can still be chosen.
+The account is read from `tokens.account_id` for Codex, `openai-codex.accountId` for Pi, and `oauthAccount.accountUuid` in `.claude.json` for Claude; `bin/fm-crosscheck.py`'s `account_identity` keys that resolution on the provider so a new client on an existing provider cannot reopen the hole.
+`run_reviewer` repeats the comparison against the credential it actually binds, and that launch-time check is the authoritative one.
 For a task explicitly marked `account_routing_emergency_bypass=1`, a reviewer on the other supported provider establishes both account-namespace and model separation without inventing an `account_home` for the author.
 Provider is what that lane compares, not harness: Codex and Pi are both the OpenAI provider, so an unrouted Codex author is reviewable only by Claude, while an unrouted Claude author is reviewable by either Codex or Pi.
 A same-provider reviewer still fails closed for that structurally unrouted task because account independence cannot be proved.
@@ -67,6 +72,7 @@ Crosscheck requires Python 3.11 or newer and refuses to run on anything older.
 This is a safety floor rather than a style preference: the bounded-read layer rejects hostile JSON integers by relying on CPython's integer/string conversion limit, which first exists in 3.11, and on an older interpreter that rejection silently stops happening while every banner the gate prints reads exactly the same.
 Stock macOS `python3` is 3.9, so `bin/fm-crosscheck.sh` resolves a supported sibling interpreter instead of assuming `python3` qualifies, and `bin/fm-crosscheck.py` enforces the same minimum itself so a direct invocation cannot bypass it.
 `bin/fm-crosscheck-python-lib.sh` owns that resolution for both the wrapper and the behavior tests; `FM_CROSSCHECK_PYTHON` selects an explicit interpreter and `FM_CROSSCHECK_MIN_PYTHON` overrides the minimum.
+A `FM_CROSSCHECK_MIN_PYTHON` that is not `<major>.<minor>` is refused rather than parsed into a lower floor, because a bare `3` would otherwise silently admit Python 3.3.
 An explicitly configured `FM_CROSSCHECK_PYTHON` that is missing or below the floor refuses by name rather than falling through to some other interpreter, so a typo or a stale path cannot silently unpin the gate.
 CI pins a single modern interpreter and therefore cannot observe this class of defect on its own, which is why the floor is asserted at runtime rather than assumed from the CI matrix.
 

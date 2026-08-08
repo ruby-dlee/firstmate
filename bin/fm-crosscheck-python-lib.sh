@@ -35,8 +35,23 @@ sys.exit(0 if sys.version_info[:2] >= (int(sys.argv[1]), int(sys.argv[2])) else 
 }
 
 fm_crosscheck_resolve_python() {
-  local minimum major minor candidate
+  local minimum major minor candidate malformed
   minimum="${FM_CROSSCHECK_MIN_PYTHON:-3.11}"
+  # A malformed override must fail closed, not silently lower the floor:
+  # "${minimum#*.}" returns the whole string when there is no dot, so a bare
+  # "3" used to yield major=3 minor=3 and quietly admit Python 3.3 - and the
+  # bounded-io suite resolves its interpreter solely through this function.
+  case $minimum in
+    *[!0-9.]*) malformed=1 ;;
+    *.*.*) malformed=1 ;;
+    [0-9]*.[0-9]*) malformed=0 ;;
+    *) malformed=1 ;;
+  esac
+  if [ "$malformed" -ne 0 ]; then
+    printf 'CROSSCHECK TOOL-FAILURE: %s\n' \
+      "FM_CROSSCHECK_MIN_PYTHON='$minimum' is not a <major>.<minor> version, and the gate refuses to guess a floor" >&2
+    return 1
+  fi
   major="${minimum%%.*}"
   minor="${minimum#*.}"
 

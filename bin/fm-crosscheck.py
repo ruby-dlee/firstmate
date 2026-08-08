@@ -378,6 +378,54 @@ def openai_account_identity(harness: str, account_home: Path) -> str | None:
     return None
 
 
+def anthropic_account_identity(account_home: Path) -> str | None:
+    """Return the upstream Anthropic account one Claude config home executes as.
+
+    A Claude config home names its account in `.claude.json` under
+    `oauthAccount.accountUuid`. A home that carries no such record - notably a
+    bare `~/.claude` that borrows whatever credential the environment supplies
+    - has no identity of its own, so it cannot establish separation from
+    anything. Returns None when the identity is not readable, which callers
+    must treat as unproven rather than as separate.
+    """
+
+    configuration_file = account_home / ".claude.json"
+    try:
+        configuration = read_bounded_json(
+            configuration_file,
+            maximum_bytes=8 * 1024 * 1024,
+            maximum_items=65_536,
+            maximum_string_bytes=1024 * 1024,
+        )
+    except BoundedIOError:
+        return None
+    if not isinstance(configuration, dict):
+        return None
+    account = configuration.get("oauthAccount")
+    identity = account.get("accountUuid") if isinstance(account, dict) else None
+    if isinstance(identity, str) and identity.strip():
+        return identity.strip()
+    return None
+
+
+def account_identity(harness: str, account_home: Path) -> str | None:
+    """Return the upstream account one account home executes as, by provider.
+
+    Every provider needs this because directory inequality never establishes
+    account separation: one upstream account routinely sits behind several
+    directories, and a home that borrows an ambient credential has no identity
+    at all. Resolution is keyed on the provider rather than the harness so a
+    future client on an existing provider cannot reopen that hole.
+    """
+
+    provider = HARNESS_PROVIDERS.get(harness)
+    if provider == "openai":
+        return openai_account_identity(harness, account_home)
+    if provider == "anthropic":
+        return anthropic_account_identity(account_home)
+    return None
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         fail(message)
@@ -1386,10 +1434,13 @@ def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
         require(author_home.is_absolute(), "author account_home must be absolute")
         author_home = author_home.resolve()
     else:
+        # HARNESS_PROVIDERS is the only owner of harness-to-provider knowledge.
+        # A second copy here would drift from it, which is how a mapped harness
+        # such as pi came to be refused for having "no provider namespace".
         require(
-            meta["harness"] in {"codex", "claude"},
-            "author identity inspection cannot establish a provider account "
-            f"namespace for unrouted harness={meta['harness']!r}",
+            meta["harness"] in HARNESS_PROVIDERS,
+            "author identity inspection found no known provider namespace for "
+            f"unrouted harness={meta['harness']!r}",
         )
     validated: list[dict[str, str]] = []
     for index, reviewer in enumerate(reviewers):
@@ -1420,36 +1471,37 @@ def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
                 "account_home": str(account_home.resolve()),
             }
         )
-    author_openai_identity = (
-        openai_account_identity(meta["harness"], author_home)
+    author_identity = (
+        account_identity(meta["harness"], author_home)
         if author_home is not None
         else None
     )
+    author_provider_for_pairs = HARNESS_PROVIDERS.get(meta["harness"])
     for reviewer in validated:
         model_is_separate = reviewer["model"] != meta["model"]
         if author_home is not None:
             account_is_separate = Path(reviewer["account_home"]) != author_home
-            if (
-                account_is_separate
-                and meta["harness"] in OPENAI_BACKED_HARNESSES
-                and reviewer["harness"] in OPENAI_BACKED_HARNESSES
+            if account_is_separate and (
+                author_provider_for_pairs is not None
+                and author_provider_for_pairs
+                == HARNESS_PROVIDERS.get(reviewer["harness"])
             ):
-                # Two distinct directories can still execute as one OpenAI
-                # account, so an OpenAI-backed pair must prove separation on
-                # the executing credential rather than on the path. This is
-                # the selection screen; run_reviewer repeats it against the
+                # Two distinct directories can still execute as one upstream
+                # account, so a same-provider pair must prove separation on the
+                # executing credential rather than on the path. This is the
+                # selection screen; run_reviewer repeats it against the
                 # credential it actually binds, which is authoritative.
-                reviewer_openai_identity = openai_account_identity(
+                reviewer_identity = account_identity(
                     reviewer["harness"], Path(reviewer["account_home"])
                 )
-                if author_openai_identity is None:
-                    # Nothing later inspects the author, so an unreadable
-                    # author identity can never become provable separation.
+                if author_identity is None or reviewer_identity is None:
+                    # An unresolvable identity on either side is never
+                    # separation: a home that names no account cannot be shown
+                    # distinct from the author's, and path inequality is
+                    # exactly the proof this branch exists to replace.
                     account_is_separate = False
-                elif reviewer_openai_identity is not None:
-                    account_is_separate = (
-                        author_openai_identity != reviewer_openai_identity
-                    )
+                else:
+                    account_is_separate = author_identity != reviewer_identity
         else:
             # Without an author account_home the only separation available is
             # the provider namespace, and a different harness is not one: a Pi
@@ -1463,22 +1515,21 @@ def reviewer_config(home: Path, meta: dict[str, str]) -> dict[str, str]:
                 and author_provider != reviewer_provider
             )
         if model_is_separate and account_is_separate:
-            if (
-                author_openai_identity is not None
-                and reviewer["harness"] in OPENAI_BACKED_HARNESSES
+            if author_identity is not None and author_provider_for_pairs == (
+                HARNESS_PROVIDERS.get(reviewer["harness"])
             ):
                 # Carried so the executing credential, not the configured
                 # path, has the final word on account separation.
-                reviewer["author_openai_account"] = author_openai_identity
+                reviewer["author_account_identity"] = author_identity
             return reviewer
     if author_home is not None:
         fail(
             "independence inspection found no configured reviewer with both a "
             "different model and a proven-separate account from the author "
             f"(model={meta['model']!r}, account_home={str(author_home)!r}); "
-            "an OpenAI-backed reviewer must also resolve a different "
-            "executing OpenAI account than the author, because a Codex home "
-            "and a Pi auth slot can carry one account behind two paths"
+            "a same-provider reviewer must also resolve a different executing "
+            "account than the author, because two directories can carry one "
+            "upstream account and a home that names no account proves nothing"
         )
     fail(
         "independence inspection found no configured reviewer with both a "
@@ -1791,6 +1842,35 @@ def reviewer_binary(name: str, default: str, label: str) -> str:
     return str(reviewer_binary_path(name, default, label).resolve())
 
 
+def env_shebang_node_arguments(shebang: str) -> list[str] | None:
+    """Return Node flags when a shebang resolves `node` through `env`.
+
+    Matching the one literal `#!/usr/bin/env node` was too narrow: npm CLIs
+    also ship `#!/usr/bin/env -S node --flag`, and every unmatched env form
+    fell through to executing the script directly, which let the kernel
+    resolve `node` from the reviewer environment's PATH - exactly what pinning
+    exists to prevent, and silently. Returns None when the interpreter is not
+    reached through `env` (an absolute path carries no PATH risk), and fails
+    loudly when an `env` shebang cannot be read confidently.
+    """
+
+    if not shebang.startswith("#!"):
+        return None
+    tokens = shebang[2:].strip().split()
+    if not tokens or os.path.basename(tokens[0]) != "env":
+        return None
+    rest = tokens[1:]
+    while rest and (rest[0] in {"-S", "--split-string"} or "=" in rest[0]):
+        rest = rest[1:]
+    if not rest:
+        tool_fail(
+            f"Pi reviewer shebang names no interpreter after env: {shebang!r}"
+        )
+    if os.path.basename(rest[0]) != "node":
+        return None
+    return rest[1:]
+
+
 def pi_reviewer_command() -> list[str]:
     """Resolve Pi and its env-selected Node runtime before reviewer launch."""
 
@@ -1802,13 +1882,14 @@ def pi_reviewer_command() -> list[str]:
     except OSError as exc:
         tool_fail(f"Pi reviewer executable inspection failed at {entrypoint}: {exc}")
 
-    if shebang == "#!/usr/bin/env node":
+    node_arguments = env_shebang_node_arguments(shebang)
+    if node_arguments is not None:
         sibling_node = entrypoint.parent / "node"
         node_default = str(sibling_node) if sibling_node.is_file() else "node"
         node = reviewer_binary(
             "FM_CROSSCHECK_PI_NODE_BIN", node_default, "Pi Node runtime"
         )
-        return [node, str(resolved_entrypoint)]
+        return [node, *node_arguments, str(resolved_entrypoint)]
     return [str(resolved_entrypoint)]
 
 
@@ -1823,10 +1904,15 @@ def pi_review_result(output: str) -> tuple[dict[str, Any], int]:
             continue
         try:
             event = json.loads(line)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+            # Not only JSONDecodeError: an integer literal past CPython's
+            # conversion limit raises plain ValueError and deep nesting raises
+            # RecursionError. Letting either escape would skip the tool-failure
+            # run and leave a prior clear verdict standing at this head, which
+            # is precisely the hostile-JSON defense the 3.11 floor preserves.
             tool_fail(
                 "Pi reviewer returned malformed JSON events at line "
-                f"{line_number}: {exc.msg}"
+                f"{line_number}: {exc}"
             )
         if not isinstance(event, dict):
             tool_fail(
@@ -1879,8 +1965,8 @@ def pi_review_result(output: str) -> tuple[dict[str, Any], int]:
         tool_fail("Pi reviewer completed without a verdict artifact")
     try:
         verdict = json.loads(final_text)
-    except json.JSONDecodeError as exc:
-        tool_fail(f"Pi reviewer returned a malformed verdict artifact: {exc.msg}")
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        tool_fail(f"Pi reviewer returned a malformed verdict artifact: {exc}")
     if not isinstance(verdict, dict):
         tool_fail("Pi reviewer verdict artifact must be an object")
     return verdict, turn_count
@@ -1891,7 +1977,7 @@ def run_reviewer(
     snapshot_value: dict[str, Any],
     ledger: dict[str, Any],
     config: dict[str, str],
-    author_openai_account: str,
+    author_account_identity: str,
 ) -> Any:
     pi_command = (
         pi_reviewer_command()
@@ -1939,26 +2025,23 @@ def run_reviewer(
     config["execution_home"] = str(execution_home.resolve())
     config["credential_source"] = credential_source
     config["credential_identifier"] = credential_identifier
-    if author_openai_account:
+    if author_account_identity:
         # The credential preflights above have already accepted this account
         # home, so this is the authoritative separation proof: it reads the
         # identity of the credential actually bound for execution rather than
         # trusting the configured directory to name a distinct account.
-        executing_openai_account = openai_account_identity(
-            config["harness"], account_home
-        )
-        if executing_openai_account is None:
+        executing_account = account_identity(config["harness"], account_home)
+        if executing_account is None:
             tool_fail(
                 "executing-account separation is unprovable: reviewer "
                 f"{config['harness']} credential at {credential_identifier} "
-                "exposes no OpenAI account identity to compare against the "
-                "author's"
+                "exposes no account identity to compare against the author's"
             )
-        if executing_openai_account == author_openai_account:
+        if executing_account == author_account_identity:
             tool_fail(
                 "executing-account separation failed: reviewer "
                 f"{config['harness']} account home {account_home} executes as "
-                "the same OpenAI account as the author, so this reviewer is "
+                "the same upstream account as the author, so this reviewer is "
                 "not independent despite a different configured path"
             )
     schema_path = protocol_dir / "review-schema.json"
@@ -2637,7 +2720,7 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
     except CrosscheckError as exc:
         tool_fail(f"finding-ledger preflight failed at {ledger_path}: {exc}")
     config: dict[str, str] | None = None
-    author_openai_account = ""
+    author_account_identity = ""
 
     try:
         try:
@@ -2647,7 +2730,7 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
         # Detached before anything can fail: the author's account id is proof
         # material for the launch check, not part of the reviewer identity the
         # ledger records for a failed run.
-        author_openai_account = config.pop("author_openai_account", "")
+        author_account_identity = config.pop("author_account_identity", "")
         with tempfile.TemporaryDirectory(prefix=f".{task_id}.crosscheck.", dir=state) as temporary:
             temp_root = Path(temporary)
             review_dir = temp_root / "review"
@@ -2661,7 +2744,7 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
             except CrosscheckError as exc:
                 tool_fail(f"review checkout preflight failed: {exc}")
             raw_review = run_reviewer(
-                review_dir, snapshot_value, ledger, config, author_openai_account
+                review_dir, snapshot_value, ledger, config, author_account_identity
             )
             assert_review_checkout_intact(review_dir, snapshot_value["head_sha"])
             review = validate_review_shape(

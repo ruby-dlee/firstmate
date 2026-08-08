@@ -87,10 +87,9 @@ run_with_perl_timeout() {
 }
 
 cleanup_timed_out_watcher_lock() {
-  local checkpoint_root checkpoint_home checkpoint_lock
-  checkpoint_root="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
-  checkpoint_home="${FM_HOME:-${FM_ROOT_OVERRIDE:-$checkpoint_root}}"
-  STATE="${FM_STATE_OVERRIDE:-$checkpoint_home/state}"
+  local checkpoint_lock
+  # fm-wake-lib.sh owns the root/home/state resolution rule; sourcing it here reuses
+  # that one owner instead of keeping a second copy in step with it.
   # shellcheck source=bin/fm-wake-lib.sh
   . "$SCRIPT_DIR/fm-wake-lib.sh" || return 1
   checkpoint_lock="$STATE/.watch.lock"

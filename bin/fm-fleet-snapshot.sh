@@ -17,7 +17,7 @@
 #   tasks[]: one row per state/<id>.meta, sorted by id.
 #     current_state is parsed from bin/fm-crew-state.sh <id> and preserves
 #     state, source, detail, liveness, and raw line separately. Liveness is
-#     alive, stalled, dead, unknown, or null when no observation was made.
+#     alive, dead, unknown, or null when no observation was made.
 #     paths.status_log.last_event is historical wake-event data only, never
 #     current state.
 #     hints.open_decisions is the keyed open-decision set returned by
@@ -122,7 +122,7 @@ crew_state_json() {  # <id>
   esac
   liveness=$(crew_state_liveness_verdict "$raw")
   case "$liveness" in
-    alive|stalled|dead|unknown|'') ;;
+    alive|dead|unknown|'') ;;
     *) liveness=unknown ;;
   esac
   jq -n --arg raw "$raw" --arg state "$state" --arg source "$source" --arg detail "$detail" --arg liveness "$liveness" \
@@ -314,7 +314,7 @@ task_json_lines() {
     current_liveness=$(printf '%s' "$current_json" | jq -r '.liveness // ""')
     case "$current_liveness" in
       alive|'') current_activity_usable=1 ;;
-      stalled|dead|unknown) current_activity_usable=0 ;;
+      dead|unknown) current_activity_usable=0 ;;
       *) current_activity_usable=0 ;;
     esac
 

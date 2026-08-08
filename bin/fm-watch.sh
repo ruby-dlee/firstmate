@@ -42,7 +42,7 @@
 #   auto-reap: <out>       stale crashed-spawn acquisition recovery made progress
 #                          or refused and retained state for operator inspection
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
-#                          status or a stalled/dead/unknown command-step liveness reading,
+#                          status or a dead/unknown command-step liveness reading,
 #                          unless afk is active
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
@@ -429,17 +429,25 @@ clear_pause_tracking() {  # <window>
 # Register a valid pause declaration as soon as its status signal is observed.
 # The initial signal still surfaces once, but marker creation must happen before
 # that return; otherwise a freshly re-armed watcher loses the declaration and
-# repeatedly enters stale handling. The recheck timestamp is separate from the
-# long-cadence resurface marker and makes the declaration immediately authoritative.
+# repeatedly enters stale handling. Registration proves only the pause CONTRACT
+# (the line itself), never the keyed open-decision fold, so it deliberately does not
+# write the .paused-rechecked-<key> cache pause_state_class reads: seeding that here
+# would let a declaration skip the fold and absorb a lane that still owes an
+# unanswered decision. Any stale cache from an earlier declaration is dropped for the
+# same reason, leaving the first stale classification to establish a fresh one.
 register_pause_declaration() {  # <window> <status-line>
   local win=$1 last=$2 key
   key=$(printf '%s' "$win" | tr ':/.' '___')
   printf '%s\n' "$last" > "$STATE/.paused-$key"
-  date +%s > "$STATE/.paused-rechecked-$key"
-  rm -f "$STATE/.paused-resurfaced-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  rm -f "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key" \
+    "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
 }
 
-sync_pause_markers_from_signal() {  # <space-separated signal paths>
+# Watcher-local signal-path reconciliation. Named apart from the away-mode daemon's
+# own sync_pause_markers_from_signal (bin/fm-supervise-daemon.sh), which takes a
+# different argument shape: both files are routinely sourced for their pure
+# functions, and a shared name would silently redefine one of them.
+register_pause_markers_from_signal() {  # <space-separated signal paths>
   local paths=$1 f task meta win last key
   for f in $paths; do
     case "$f" in "$STATE"/*.status) ;; *) continue ;; esac
@@ -880,7 +888,7 @@ mark_all_captain_relevant_surfaced() {
 
 # Heartbeat fleet-scan (the always-on twin of the daemon's catch-all). Status
 # events retain their surfaced-marker dedup. Command-step liveness is handled as
-# four explicit states: alive is healthy, while stalled, dead, and unknown surface
+# three explicit states: alive is healthy, while dead and unknown both surface
 # because neither may be absorbed as positive evidence. A line with no liveness
 # observation keeps its prior behavior.
 heartbeat_scan_finds_actionable() {
@@ -895,7 +903,7 @@ heartbeat_scan_finds_actionable() {
     [ -n "$task" ] || continue
     case "$verdict" in
       alive) ;;
-      stalled|dead|unknown) return 0 ;;
+      dead|unknown) return 0 ;;
       *) return 0 ;;
     esac
   done < <(scan_crew_liveness_observations "$STATE")
@@ -1127,7 +1135,7 @@ while :; do
 $pending
 EOF
     reason="signal:$files"
-    sync_pause_markers_from_signal "$files"
+    register_pause_markers_from_signal "$files"
     # A scout's terminal done event is its automatic reaping trigger. Ship work
     # waits for the separate merged-PR or approved local-merge authority.
     for f in $files; do
@@ -1400,7 +1408,7 @@ EOF
   [ "$hb" -gt "$HEARTBEAT_MAX" ] && hb=$HEARTBEAT_MAX
   if marker_due "$STATE/.last-heartbeat" "$hb" "watcher heartbeat"; then
     # Triage: in always-on mode a heartbeat is benign unless the fleet-scan turns
-    # up a captain-relevant status or a stalled/dead/unknown command-step liveness reading.
+    # up a captain-relevant status or a dead/unknown command-step liveness reading.
     # Unknown is grouped with actionable here because a heartbeat needs only the
     # binary absorb/surface decision, and unknown is not proof of health. The
     # away-mode daemon, when present, owns triage and wants every heartbeat.

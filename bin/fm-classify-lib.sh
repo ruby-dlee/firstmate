@@ -56,6 +56,12 @@ FM_CLASSIFY_CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|
 # independent refusal.
 FM_CLASSIFY_PAUSED_VERB_DEFAULT='paused'
 
+# The two structured field names a pause declaration must carry. Defined once here
+# and read by every consumer - the field reader, the contract check, and the prose
+# scan that must skip them - so the grammar cannot drift between them.
+_FM_CLASSIFY_PAUSE_OWNER_KEY='owner'
+_FM_CLASSIFY_PAUSE_CLEARS_KEY='clears'
+
 # Failure vocabulary for the FAILURE-PAUSE discriminator.
 #
 # A crewmate reporting a FAILURE frequently reaches for the pause verb - it has
@@ -131,46 +137,69 @@ _fm_status_has_pause_verb() {  # <status-line>
   [ "$verb" = "${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}" ]
 }
 
-# Print the HEADLINE of a pause reason: its leading clause, bounded to
-# FM_CLASSIFY_PAUSE_HEAD_WORDS words.
+# Print the HEADLINE of every PROSE clause of a pause reason, one per line.
 #
-# POSITION IS THE DISCRIMINATOR. A crewmate writes a status reason as
+# POSITION IS THE DISCRIMINATOR. A crewmate writes each clause of a status reason as
 # "<headline>[: <detail>]", and the headline is its own one-phrase answer to "why am
 # I stopped". A failure report puts the failure there ("error: ...", "... fresh run
 # error: ...", "run <id> drive failed on ...: ..."), while a deliberate wait puts the
 # wait there ("waiting on upstream CI", "rate limit until 15:00") and can only mention
 # a failure LATER, in passing ("waiting for the captain to decide how to handle the
 # failed Shopify webhook"). Scanning the whole reason would escalate that last line;
-# scanning only the headline keeps it absorbed, which is the point of the pause verb.
+# scanning only the headlines keeps it absorbed, which is the point of the pause verb.
 #
-# Two bounds define the headline, and both are needed:
-#   - the text before the first colon of the reason, so a failure headline is not
+# Two bounds define a clause headline, and both are needed:
+#   - the text before that clause's first colon, so a failure headline is not
 #     diluted by however long its stack-trace/detail tail happens to be; and
-#   - a word cap, because a colon-free prose reason would otherwise make the ENTIRE
+#   - a word cap, because a colon-free prose clause would otherwise make the ENTIRE
 #     sentence the headline and re-admit exactly the passing-mention false positive
 #     the clause bound was meant to avoid.
 # The cap is deliberately loose (8) rather than tight: a real failure headline names
 # the run, the tool, and the verb before it gets to the failure word, and the cost
 # asymmetry runs one way - a false wake is one cheap read, a false absorb hid six
 # stalled crewmates for hours - so ambiguity resolves toward escalating.
-status_pause_headline() {  # <status-line>
+#
+# Semicolons separate clauses, and EVERY prose clause is a headline of its own: a
+# crewmate that opens with a wait and then reports a failure in a later clause is
+# still reporting a failure, so bounding the scan to the leading clause would hide
+# it. The recognized owner=/clears= fields are the one exception and are dropped -
+# they are structured contract metadata, and the observable condition that ends a
+# wait may legitimately name a failure ("clears=the upstream timeout stops"), which
+# would otherwise escalate exactly the declarations the contract asks for.
+_fm_status_pause_prose_headlines() {  # <status-line>
   local n=${FM_CLASSIFY_PAUSE_HEAD_WORDS:-$FM_CLASSIFY_PAUSE_HEAD_WORDS_DEFAULT}
-  status_line_note "$1" | awk -v n="$n" '
-    { sub(/[;:].*/, "")
-      out = ""
-      for (i = 1; i <= NF && i <= n; i++) out = out (i > 1 ? " " : "") $i
-      print out }'
+  status_line_note "$1" | awk -F';' -v n="$n" \
+    -v owner_key="$_FM_CLASSIFY_PAUSE_OWNER_KEY" -v clears_key="$_FM_CLASSIFY_PAUSE_CLEARS_KEY" '
+    { for (i = 1; i <= NF; i++) {
+        clause = $i
+        sub(/^[[:space:]]+/, "", clause)
+        sub(/[[:space:]]+$/, "", clause)
+        if (index(clause, owner_key "=") == 1 || index(clause, clears_key "=") == 1) continue
+        sub(/:.*/, "", clause)
+        words = split(clause, word, /[[:space:]]+/)
+        out = ""
+        for (w = 1; w <= words && w <= n; w++) out = out (w > 1 ? " " : "") word[w]
+        if (out != "") print out
+      }
+    }'
 }
 
-# 0 if <status-line> uses the pause verb but its HEADLINE carries failure vocabulary
-# (FM_CLASSIFY_PAUSE_FAILURE_RE) - i.e. the crewmate reported a FAILURE under the
-# pause verb rather than declaring an external wait. Such a line is not a pause at all
-# for triage purposes: status_is_paused rejects it (so no consumer absorbs it on the
-# pause cadence) and status_is_captain_relevant escalates it like blocked:/failed:.
-# Pure read of the line; both supervisors inherit it through those two predicates.
+# The leading prose clause's headline - the reason's own one-phrase answer, used to
+# prove a declaration actually states a reason rather than only its contract fields.
+status_pause_headline() {  # <status-line>
+  _fm_status_pause_prose_headlines "$1" | sed -n '1p'
+}
+
+# 0 if <status-line> uses the pause verb but one of its prose-clause HEADLINES carries
+# failure vocabulary (FM_CLASSIFY_PAUSE_FAILURE_RE) - i.e. the crewmate reported a
+# FAILURE under the pause verb rather than declaring an external wait. Such a line is
+# not a pause at all for triage purposes: status_is_paused rejects it (so no consumer
+# absorbs it on the pause cadence) and status_is_captain_relevant escalates it like
+# blocked:/failed:. Pure read of the line; both supervisors inherit it through those
+# two predicates.
 status_pause_is_failure() {  # <status-line>
   _fm_status_has_pause_verb "$1" || return 1
-  status_pause_headline "$1" \
+  _fm_status_pause_prose_headlines "$1" \
     | grep -qiE "${FM_CLASSIFY_PAUSE_FAILURE_RE:-$FM_CLASSIFY_PAUSE_FAILURE_RE_DEFAULT}"
 }
 
@@ -195,8 +224,8 @@ status_pause_field() {  # <status-line> <owner|clears>
     }'
 }
 
-status_pause_owner() { status_pause_field "$1" owner; }
-status_pause_clearing_condition() { status_pause_field "$1" clears; }
+status_pause_owner() { status_pause_field "$1" "$_FM_CLASSIFY_PAUSE_OWNER_KEY"; }
+status_pause_clearing_condition() { status_pause_field "$1" "$_FM_CLASSIFY_PAUSE_CLEARS_KEY"; }
 
 _fm_pause_field_is_named() {  # <value>
   local value normalized
@@ -431,8 +460,8 @@ _fm_status_file_sig() {
 #   paused  - the crewmate declared an owned-and-clearing external wait and nothing
 #             is outstanding (crew_declared_pause_absorbable), so its pane is
 #             EXPECTED to idle;
-#   none    - neither, so the wake must surface (including stalled, dead, and
-#             unknown liveness, and an unreadable verdict).
+#   none    - neither, so the wake must surface (including dead and unknown
+#             liveness, and an unreadable verdict).
 #
 # PRECEDENCE, and why it is this way round. bin/fm-crew-state.sh's authoritative
 # verdict ("state: <s> · source: <src> · <detail>") answers "what is the PIPELINE
@@ -475,7 +504,7 @@ crew_state_line() {  # <id>
 }
 
 # Parse the optional presence-only liveness observation from a current-state
-# line. This boundary has four verdicts: alive, stalled, dead, and unknown.
+# line. This boundary has exactly three verdicts: alive, dead, and unknown.
 # An unrecognized value in an explicit liveness field is malformed evidence, so
 # it becomes unknown; a line with no liveness field remains empty for backward
 # compatibility and keeps its previous classification.
@@ -496,7 +525,7 @@ crew_state_liveness_verdict() {  # <current-state-line>
           value=${field#liveness: }
           value=${value%% *}
           case "$value" in
-            alive|stalled|dead|unknown) printf '%s' "$value" ;;
+            alive|dead|unknown) printf '%s' "$value" ;;
             *) printf 'unknown' ;;
           esac
           ;;
@@ -509,9 +538,8 @@ crew_state_liveness_verdict() {  # <current-state-line>
 }
 
 # Print task, verdict, and current-state line for each ship carrying a liveness
-# observation. Callers explicitly decide alive/stalled/dead/unknown
-# actionability; a line with no observation is omitted so its existing behavior
-# is unchanged.
+# observation. Callers explicitly decide alive/dead/unknown actionability; a
+# line with no observation is omitted so its existing behavior is unchanged.
 scan_crew_liveness_observations() {  # <state-dir>
   local state=$1 meta task kind line verdict
   for meta in "$state"/*.meta; do
@@ -537,8 +565,8 @@ crew_absorb_class() {  # <id> [declared-pause-status-line]
       src=${line#*source: }; src=${src%% *}
       if [ "$state" = working ]; then
         liveness=$(crew_state_liveness_verdict "$line")
-        # Only a positive or absent verdict is working evidence; `stalled`, `dead`,
-        # and `unknown` all fall through to the pause gate and then to `none`.
+        # Only a positive or absent verdict is working evidence; `dead` and
+        # `unknown` both fall through to the pause gate and then to `none`.
         case "$src:$liveness" in
           run-step:alive|run-step:|pane:alive|pane:) printf 'working'; return ;;
         esac
@@ -556,9 +584,10 @@ crew_absorb_class() {  # <id> [declared-pause-status-line]
 
 # 0 only when the current run-step carries the probe's positive progress verdict.
 # The probe owns the CPU-versus-elapsed measurement and threshold; this consumer
-# deliberately trusts only `alive`, while `stalled`, `dead`, and `unknown` stay on
-# the surface side. Used at the wedge threshold to distinguish a starved-but-
-# computing static pane from a process set accumulating near-zero CPU.
+# deliberately trusts only `alive`, while `dead` and `unknown` - the grade the probe
+# gives presence without established progress - stay on the surface side. Used at the
+# wedge threshold to distinguish a starved-but-computing static pane from a process
+# set accumulating near-zero CPU.
 crew_has_measured_progress() {  # <id>
   local line state src liveness
   line=$(crew_state_line "$1")
@@ -591,7 +620,7 @@ crew_is_provably_working() {  # <id>
 # escalating a possible wedge. See crew_absorb_class for the precedence and
 # crew_declared_pause_absorbable for the two proofs a pause must satisfy.
 crew_is_paused() {  # <id> [declared-pause-status-line]
-  # This predicate needs only pause-or-not; stalled, dead, and unknown arrive as `none`
+  # This predicate needs only pause-or-not; dead and unknown arrive as `none`
   # and stay distinct from the one absorbable paused outcome.
   case "$(crew_absorb_class "$1" "${2:-}")" in
     paused) return 0 ;;
@@ -618,7 +647,7 @@ signal_crew_provably_working() {  # <file> ...
     case " $seen " in *" $task "*) continue ;; esac
     seen="$seen $task"
     class=$(crew_absorb_class "$task")
-    # A signal needs only absorb-or-surface; `none` includes stalled, dead, and unknown,
+    # A signal needs only absorb-or-surface; `none` includes dead and unknown,
     # both of which must surface rather than be treated as assume-fine.
     case "$class" in
       working) ;;

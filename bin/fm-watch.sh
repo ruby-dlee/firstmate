@@ -1023,8 +1023,8 @@ while :; do
 $pending
 EOF
     reason="signal:$files"
-    # A scout's terminal done event visibly parks it for report review and a
-    # promotion decision. Ship work waits for merged-PR or local-merge authority.
+    # A scout's terminal done event is its automatic reaping trigger. Ship work
+    # waits for the separate merged-PR or approved local-merge authority.
     for f in $files; do
       case "$f" in
         "$STATE"/*.status)

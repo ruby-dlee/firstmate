@@ -587,7 +587,6 @@ test_watcher_routes_merge_checks_and_scout_done_events_to_auto_reap() {
 printf '%s\n' "$*" >> "$FM_FAKE_AUTO_REAP_CALLS"
 case "$*" in
   maintenance) ;;
-  task\ *\ scout-done) printf 'auto-reap parked by watcher: awaiting report review and promotion decision\n' ;;
   *) printf 'auto-reaped by watcher: %s\n' "$*" ;;
 esac
 SH
@@ -636,8 +635,8 @@ SH
   fi
   wait "$pid" 2>/dev/null || true
   assert_contains "$(cat "$calls")" "task scout-watch scout-done" "watcher scout route"
-  assert_contains "$(cat "$out")" "auto-reap parked by watcher" "watcher scout parking result"
-  pass "watcher reaps merged work and parks terminal scouts for review"
+  assert_contains "$(cat "$out")" "auto-reaped by watcher" "watcher scout wake result"
+  pass "watcher continuously routes merged checks and scout terminal signals to auto-reap"
 }
 
 test_local_merge_immediately_auto_reaps() {

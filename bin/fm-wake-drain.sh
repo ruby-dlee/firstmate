@@ -19,7 +19,7 @@ DRAIN_LOCK_HELD=false
 LAVISH_INTAKE_OUT=$("$SCRIPT_DIR/fm-lavish-intake.sh" 2>&1)
 LAVISH_INTAKE_RC=$?
 if [ -n "$LAVISH_INTAKE_OUT" ]; then
-  printf 'LAVISH_INTAKE:\n%s\n' "$LAVISH_INTAKE_OUT" >&2
+  printf 'LAVISH_INTAKE:\n%s\n' "$LAVISH_INTAKE_OUT"
 fi
 if [ "$LAVISH_INTAKE_RC" -ne 0 ]; then
   printf 'LAVISH_INTAKE: failed with status %s; durable answers remain unreceipted\n' \

@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
 # Automatically reap terminal crewmate resources through fm-teardown.sh.
 #
-# `task <id> scout-done` validates the terminal event and visibly parks the scout
-# for report review and a promotion decision. `task <id> scout-reviewed` asserts
-# that explicit decision boundary, then reaps an exactly-attributed no-mistakes
-# run when necessary and delegates all endpoint, cleanliness, landing, report,
-# and Treehouse-return proofs to ordinary teardown without --force. PR-merged and
-# local-merged ship tasks take that teardown path immediately.
+# `task <id> <pr-merged|scout-done|local-merged>` validates the terminal event,
+# reaps an exactly-attributed no-mistakes run when necessary, and delegates all
+# endpoint, cleanliness, landing, report, and Treehouse-return proofs to ordinary
+# teardown without --force.
 #
 # `maintenance` recovers pre-metadata Treehouse acquisitions left by a crashed
 # spawn. A record is eligible only after an age threshold and exact PID/start-time
 # death proof. Recovery installs fail-closed cleanup metadata, then invokes the
 # same ordinary teardown proof. Every refusal stays on disk and is printed.
-# Usage: fm-auto-reap.sh task <id> <pr-merged|scout-done|scout-reviewed|local-merged>
+# Usage: fm-auto-reap.sh task <id> <pr-merged|scout-done|local-merged>
 #        fm-auto-reap.sh maintenance
 set -eu
 
@@ -258,20 +256,15 @@ reap_task() {  # <task> <trigger>
   kind=$(meta_value "$meta" kind)
   [ -n "$kind" ] || kind=ship
   mode=$(meta_value "$meta" mode)
+  [ -z "$(meta_value "$meta" x_request)" ] || refuse "X-linked tasks require their final follow-up before teardown"
   [ "$kind" != secondmate ] || refuse "persistent secondmates are never auto-reaped"
   [ "$(status_last_verb "$id")" = "done" ] || refuse "last task status is not terminal done"
-  if [ "$trigger:$kind" = scout-done:scout ]; then
-    printf 'auto-reap parked %s: awaiting report review and promotion decision; after review run bin/fm-promote.sh %s or bin/fm-auto-reap.sh task %s scout-reviewed\n' \
-      "$id" "$id" "$id"
-    return 0
-  fi
-  [ -z "$(meta_value "$meta" x_request)" ] || refuse "X-linked tasks require their final follow-up before teardown"
   case "$trigger:$kind:$mode" in
     pr-merged:ship:local-only) refuse "local-only tasks cannot use a PR-merged trigger" ;;
     pr-merged:ship:*)
       [ "${AUTO_REAP_PR_VERIFIED:-0}" = 1 ] || pr_is_merged "$meta" || return 1
       ;;
-    scout-reviewed:scout:*) ;;
+    scout-done:scout:*) ;;
     local-merged:ship:local-only) ;;
     *) refuse "trigger $trigger does not match kind=$kind mode=${mode:-no-mistakes}" ;;
   esac
@@ -592,7 +585,7 @@ case "${1:-}" in
     maintenance
     ;;
   *)
-    echo "usage: fm-auto-reap.sh task <id> <pr-merged|scout-done|scout-reviewed|local-merged> | maintenance" >&2
+    echo "usage: fm-auto-reap.sh task <id> <trigger> | maintenance" >&2
     exit 2
     ;;
 esac

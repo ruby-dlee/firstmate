@@ -55,7 +55,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-watch-arm.sh`        | Verified home-scoped watcher arm wrapper with honest status reporting                |
 | `fm-watch-checkpoint.sh` | Run one bounded foreground watcher checkpoint for Codex-style supervision            |
 | `fm-watch.sh`            | Singleton-safe always-on watcher: absorb benign wakes, queue and exit on actionable ones |
-| `fm-auto-reap.sh`        | Park terminal scouts; reap reviewed scouts, landed ships, and owner-dead acquisitions |
+| `fm-auto-reap.sh`        | Reap proven terminal tasks and aged, owner-dead pre-metadata Treehouse acquisitions  |
 | `fm-afk-start.sh`        | Run the common sourceable away-mode daemon entry in the foreground                      |
 | `fm-afk-launch.sh`       | Own away-mode entry, exit, rollback, and any backend terminal lifecycle                 |
 | `fm-supervisor-target-lib.sh` | Resolve the compatibility injection target and backend for the daemon and launcher |

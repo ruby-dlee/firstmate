@@ -4342,22 +4342,68 @@ test_transition_commit_serializes_metadata_replacement() {
 }
 
 test_clear_transition_migrates_legacy_generation() {
-  local dir state window key marker owner generation
-  dir="$TMP_ROOT/clear-transition-legacy-generation"; state="$dir/state"; mkdir -p "$state"
+  local form dir state window key marker owner generation
   window=default:wG:pQ
-  fm_write_meta "$state/lane-q.meta" "window=$window" "backend=herdr" "kind=ship"
-  key=$(bash -c '. "$0/bin/fm-marker-state-lib.sh"; fm_marker_identity_key "$1"' "$ROOT" "$window")
-  marker="$state/.herdr-escalated-$key"
-  owner="$state/.marker-owner-herdr-transition-$key"
-  printf '%s' "$window" > "$marker"
-  printf '%s' "$window" > "$owner"
+  for form in absent empty; do
+    dir="$TMP_ROOT/clear-transition-legacy-generation-$form"; state="$dir/state"; mkdir -p "$state"
+    if [ "$form" = empty ]; then
+      fm_write_meta "$state/lane-q.meta" "window=$window" "backend=herdr" "kind=ship" "generation_id="
+    else
+      fm_write_meta "$state/lane-q.meta" "window=$window" "backend=herdr" "kind=ship"
+    fi
+    key=$(bash -c '. "$0/bin/fm-marker-state-lib.sh"; fm_marker_identity_key "$1"' "$ROOT" "$window")
+    marker="$state/.herdr-escalated-$key"
+    owner="$state/.marker-owner-herdr-transition-$key"
+    printf '%s' "$window" > "$marker"
+    printf '%s' "$window" > "$owner"
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2" "$3"' \
+      "$ROOT" "$state" "$window" lane-q || fail "$form legacy generation teardown clear was refused"
+    generation=$(sed -n 's/^generation_id=//p' "$state/lane-q.meta")
+    case "$generation" in legacy-a???????????????) ;; *) fail "$form legacy generation was not migrated exactly: $generation" ;; esac
+    [ "$(grep -c '^generation_id=' "$state/lane-q.meta")" -eq 1 ] || fail "$form legacy migration did not publish exactly one generation identity"
+    [ ! -e "$marker" ] && [ ! -e "$owner" ] || fail "$form legacy generation clear retained transition custody"
+    [ -z "$(find "$state" -name '.lane-q.meta.generation*' -print -quit)" ] || fail "$form legacy migration retained a publication transient"
+  done
+  pass "Herdr teardown migrates absent and empty legacy generation identities"
+}
+
+test_clear_transition_legacy_refusals_preserve_metadata() {
+  local form dir state window meta before
+  window=default:wG:pQ
+  for form in duplicate invalid wrong-owner; do
+    dir="$TMP_ROOT/clear-transition-legacy-refusal-$form"; state="$dir/state"; mkdir -p "$state"
+    meta="$state/lane-q.meta"; before="$dir/before.meta"
+    case "$form" in
+      duplicate)
+        fm_write_meta "$meta" "window=$window" "backend=herdr" "kind=ship" "generation_id=" "generation_id="
+        ;;
+      invalid)
+        fm_write_meta "$meta" "window=$window" "backend=herdr" "kind=ship" $'generation_id=bad\tvalue'
+        ;;
+      wrong-owner)
+        fm_write_meta "$meta" "window=$window" "backend=herdr" "kind=ship" "generation_id="
+        ;;
+    esac
+    cp "$meta" "$before"
+    if [ "$form" = wrong-owner ]; then
+      bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2" "$3"' \
+        "$ROOT" "$state" "$window" other >/dev/null 2>&1 \
+        && fail "wrong-owner legacy generation unexpectedly cleared"
+    else
+      bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2" "$3"' \
+        "$ROOT" "$state" "$window" lane-q >/dev/null 2>&1 \
+        && fail "$form legacy generation unexpectedly cleared"
+    fi
+    cmp -s "$before" "$meta" || fail "$form legacy refusal changed metadata bytes"
+  done
+  dir="$TMP_ROOT/clear-transition-existing-legacy-generation"; state="$dir/state"; mkdir -p "$state"
+  meta="$state/lane-q.meta"; before="$dir/before.meta"
+  fm_write_meta "$meta" "window=$window" "backend=herdr" "kind=ship" "generation_id=legacy-existing"
+  cp "$meta" "$before"
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2" "$3"' \
-    "$ROOT" "$state" "$window" lane-q || fail "legacy generation teardown clear was refused"
-  generation=$(sed -n 's/^generation_id=//p' "$state/lane-q.meta")
-  case "$generation" in legacy-a???????????????) ;; *) fail "legacy generation was not migrated exactly: $generation" ;; esac
-  [ "$(grep -c '^generation_id=' "$state/lane-q.meta")" -eq 1 ] || fail "legacy migration published duplicate generation identity"
-  [ ! -e "$marker" ] && [ ! -e "$owner" ] || fail "legacy generation clear retained transition custody"
-  pass "Herdr teardown migrates legacy generation identity before exact clear"
+    "$ROOT" "$state" "$window" lane-q || fail "existing nonempty legacy generation could not clear"
+  cmp -s "$before" "$meta" || fail "existing nonempty legacy generation was unnecessarily rewritten"
+  pass "Herdr legacy refusals preserve bytes and valid generations remain stable"
 }
 
 test_clear_transition_removes_task_marker() {
@@ -4648,10 +4694,17 @@ if [ "${FM_TEST_FOCUSED:-}" = transition-marker-identity ]; then
   test_transition_refuses_replaced_metadata_identity
   test_transition_commit_serializes_metadata_replacement
   test_clear_transition_migrates_legacy_generation
+  test_clear_transition_legacy_refusals_preserve_metadata
   test_clear_transition_removes_task_marker
   test_apply_transition_defer_and_fallback_are_noops
   test_wait_transition_reconcile_dedupes_when_marked
   test_wait_transition_stream_absorb_clears_then_timeout
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = legacy-generation-migration ]; then
+  test_clear_transition_migrates_legacy_generation
+  test_clear_transition_legacy_refusals_preserve_metadata
   exit 0
 fi
 
@@ -4779,6 +4832,7 @@ test_buffered_transition_refuses_reassigned_window
 test_transition_refuses_replaced_metadata_identity
 test_transition_commit_serializes_metadata_replacement
 test_clear_transition_migrates_legacy_generation
+test_clear_transition_legacy_refusals_preserve_metadata
 test_clear_transition_removes_task_marker
 test_apply_transition_defer_and_fallback_are_noops
 test_wait_transition_no_panes_returns_2

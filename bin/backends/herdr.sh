@@ -3438,7 +3438,7 @@ fm_backend_herdr_meta_lock_owned() {
 }
 
 fm_backend_herdr_backfill_legacy_generation_locked() {
-  local state=$1 task=$2 window=$3 identity=$4 lock=$5 meta current attempt generation tmp binding
+  local state=$1 task=$2 window=$3 identity=$4 lock=$5 meta current attempt generation tmp backup candidate_identity binding published result=0
   fm_backend_herdr_meta_lock_owned "$state" "$task" "$lock" || return 1
   current=$(fm_backend_herdr_binding_for_window "$state" "$window" allow-legacy) || return 1
   [ "$current" = "$task"$'\t'$'\t'"$window"$'\t'"$identity" ] || return 1
@@ -3447,21 +3447,75 @@ fm_backend_herdr_backfill_legacy_generation_locked() {
   meta="$state/$task.meta"
   tmp=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" "$state/.$task.meta.generation.XXXXXX" 2>/dev/null) || return 1
   {
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_CAT_BIN" "$meta"
-    printf '\ngeneration_id=%s\n' "$generation"
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_AWK_BIN" '!/^generation_id=/' "$meta"
+    printf 'generation_id=%s\n' "$generation"
   } > "$tmp" || {
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
     return 1
   }
+  fm_backend_herdr_safe_meta_load "$tmp" || result=1
+  [ "$result" -ne 0 ] || [ "$FM_BACKEND_HERDR_META_BACKEND" = herdr ] || result=1
+  [ "$result" -ne 0 ] || [ "$FM_BACKEND_HERDR_META_WINDOW" = "$window" ] || result=1
+  [ "$result" -ne 0 ] || [ "$FM_BACKEND_HERDR_META_GENERATION" = "$generation" ] || result=1
+  [ "$result" -ne 0 ] || candidate_identity=$FM_BACKEND_HERDR_META_IDENTITY
+  if [ "$result" -ne 0 ]; then
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+    return 1
+  fi
+  current=$(fm_backend_herdr_binding_for_window "$state" "$window" allow-legacy) || result=1
+  [ "$result" -ne 0 ] || [ "$current" = "$task"$'\t'$'\t'"$window"$'\t'"$identity" ] || result=1
+  if [ "$result" -ne 0 ]; then
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+    return 1
+  fi
+  backup=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" "$state/.$task.meta.generation-backup.XXXXXX" 2>/dev/null) || {
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+    return 1
+  }
+  fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$backup" || {
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp" "$backup"
+    return 1
+  }
+  fm_account_system_exec "$FM_ACCOUNT_SYSTEM_LN_BIN" "$meta" "$backup" || {
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+    return 1
+  }
+  current=$(fm_backend_herdr_binding_for_window "$state" "$window" allow-legacy) || result=1
+  [ "$result" -ne 0 ] || [ "$current" = "$task"$'\t'$'\t'"$window"$'\t'"$identity" ] || result=1
   fm_account_safe_file_destination "$meta" || {
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp" "$backup"
     return 1
   }
+  if [ "$result" -ne 0 ]; then
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp" "$backup"
+    return 1
+  fi
   fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MV_BIN" "$tmp" "$meta" || {
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp"
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$tmp" "$backup"
     return 1
   }
-  binding=$(fm_backend_herdr_binding_for_window "$state" "$window") || return 1
+  fm_backend_herdr_safe_meta_load "$meta" || result=1
+  [ "$result" -ne 0 ] || [ "$FM_BACKEND_HERDR_META_BACKEND" = herdr ] || result=1
+  [ "$result" -ne 0 ] || [ "$FM_BACKEND_HERDR_META_WINDOW" = "$window" ] || result=1
+  [ "$result" -ne 0 ] || [ "$FM_BACKEND_HERDR_META_GENERATION" = "$generation" ] || result=1
+  [ "$result" -ne 0 ] || [ "$FM_BACKEND_HERDR_META_IDENTITY" = "$candidate_identity" ] || result=1
+  if [ "$result" -eq 0 ]; then
+    published=$(fm_backend_herdr_binding_for_window "$state" "$window") || result=1
+  fi
+  [ "$result" -ne 0 ] || [ "$published" = "$task"$'\t'"$generation"$'\t'"$window"$'\t'"$candidate_identity" ] || result=1
+  if [ "$result" -ne 0 ]; then
+    fm_account_safe_file_destination "$meta" \
+      && fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MV_BIN" "$backup" "$meta" \
+      || return 1
+    return 1
+  fi
+  fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$backup" || {
+    fm_account_safe_file_destination "$meta" \
+      && fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MV_BIN" "$backup" "$meta" \
+      || return 1
+    return 1
+  }
+  binding=$published
   printf '%s' "$binding"
 }
 

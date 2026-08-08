@@ -495,6 +495,72 @@ function reportLockGenerationMtime(lockStat, ownerFile) {
   return staleMtimeMs;
 }
 
+function reportPublicationContentionState(resource, ownerFile, generationMtimeMs) {
+  const now = Date.now();
+  const ownerState = reportPublicationOwnerState(ownerFile, `report ${resource} owner`);
+  const recordedAcquisition = ownerState.kind === "identified"
+    && Number.isSafeInteger(ownerState.owner.acquiredAtMs)
+    && ownerState.owner.acquiredAtMs >= 0
+    && ownerState.owner.acquiredAtMs <= now + retentionAdmissionClockSkewMs;
+  const ageFromMs = recordedAcquisition ? ownerState.owner.acquiredAtMs : generationMtimeMs;
+  const result = {
+    resource,
+    kind: ownerState.kind,
+    liveness: reportPublicationOwnerLiveness(ownerState),
+    ageMs: Number.isFinite(ageFromMs) ? Math.max(0, Math.floor(now - ageFromMs)) : null,
+    ageBasis: recordedAcquisition ? "recorded-acquisition" : "resource-generation",
+  };
+  if (ownerState.kind === "identified") {
+    return {
+      ...result,
+      pid: ownerState.owner.pid,
+      operation: typeof ownerState.owner.operation === "string" && ownerState.owner.operation
+        ? ownerState.owner.operation
+        : "unknown",
+      processStartedAt: ownerState.owner.startedAt,
+      acquiredAtMs: recordedAcquisition ? ownerState.owner.acquiredAtMs : null,
+    };
+  }
+  return { ...result, identity: "unknown", reason: ownerState.reason || "owner metadata is unreadable" };
+}
+
+function reportPublicationContentionDiagnostic(lock, reclaimGuard) {
+  try {
+    const lockStat = lstatIfPresent(lock);
+    if (lockStat) {
+      const ownerFile = path.join(lock, "owner");
+      return reportPublicationContentionState(
+        "publication-lock",
+        ownerFile,
+        reportLockGenerationMtime(lockStat, ownerFile),
+      );
+    }
+    const guardStat = lstatIfPresent(reclaimGuard);
+    if (guardStat) {
+      return reportPublicationContentionState("reclaim-guard", reclaimGuard, guardStat.mtimeMs);
+    }
+    return {
+      resource: "unknown",
+      kind: "unknown",
+      identity: "unknown",
+      liveness: "unknown",
+      ageMs: null,
+      ageBasis: "unknown",
+      reason: "contention cleared after the wait budget expired",
+    };
+  } catch (error) {
+    return {
+      resource: "unknown",
+      kind: "unknown",
+      identity: "unknown",
+      liveness: "unknown",
+      ageMs: null,
+      ageBasis: "unknown",
+      reason: error.message,
+    };
+  }
+}
+
 function removeOwnedReportLockControl(file, token, label) {
   const owner = reportLockControlOwner(file, label);
   if (owner.token !== token) throw new Error(`${label} token changed`);
@@ -860,7 +926,7 @@ function claimRootIndependentRetentionAttempt() {
     "root-independent retention admission test gate",
   );
   for (const entry of fs.readdirSync(retentionAdmissionDirectory)) {
-    if (!entry.startsWith(`${retentionAdmissionPrefix}.`) || entry === markerName) continue;
+    if (!entry.startsWith(`${retentionAdmissionPrefix}.`)) continue;
     const markerMatch = entry.slice(retentionAdmissionPrefix.length + 1).match(/^(\d+)\.json$/);
     if (!markerMatch) continue;
     const markerBucket = Number(markerMatch[1]);
@@ -1207,7 +1273,6 @@ function acquireLock(admittedStackRoot) {
       try {
         const startedAt = processStartIdentity(process.pid);
         if (!startedAt) throw new Error(`cannot identify report publisher process ${process.pid}`);
-        fs.writeFileSync(path.join(candidate, "owner"), `${JSON.stringify({ pid: process.pid, startedAt, token })}\n`, { mode: 0o600 });
         let reclaimGuardExists = true;
         try { fs.lstatSync(reclaimGuard); } catch (error) { if (error.code === "ENOENT") reclaimGuardExists = false; else throw error; }
         if (!reclaimGuardExists) {
@@ -1246,6 +1311,13 @@ function acquireLock(admittedStackRoot) {
             throw existsError;
           }
           inspectPinnedDirectory(pinnedStackRoot);
+          const acquiredAtMs = Date.now();
+          const operation = [command, ...args].join(" ").slice(0, 512);
+          fs.writeFileSync(
+            path.join(candidate, "owner"),
+            `${JSON.stringify({ pid: process.pid, startedAt, token, operation, acquiredAtMs })}\n`,
+            { flag: "wx", mode: 0o600 },
+          );
           fs.renameSync(candidate, lock);
           installedLock = true;
           runTestFifoHandshake(
@@ -1477,7 +1549,8 @@ function acquireLock(admittedStackRoot) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
     }
   }
-  throw new Error(`report stack is busy at ${lock}`);
+  const holder = reportPublicationContentionDiagnostic(lock, reclaimGuard);
+  throw new Error(`report stack is busy at ${lock}; holder ${JSON.stringify(holder)}`);
 }
 
 let lastPruneStatus = { pruned: 0, pending: false };

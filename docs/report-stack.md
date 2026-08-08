@@ -4,6 +4,7 @@ Firstmate publishes one durable report for every task created after the report-s
 The default store is `$XDG_DATA_HOME/firstmate/report-stack` when `XDG_DATA_HOME` is set, otherwise `~/.local/share/firstmate/report-stack`, outside every Firstmate home and Claude or Codex account profile.
 Set `FM_REPORT_STACK_ROOT` to relocate it.
 Every locked report-stack operation performs one bounded retention batch.
+A command that exhausts the 60-second publication-lock wait reports the holder PID, operation, process-start identity, liveness, acquisition timestamp, and measured hold age; legacy owner records report an explicit unknown acquisition time and the observed lock-generation age instead.
 Scheduled `prune` first checks recovery markers, cohort deadlines, publication transactions, aged staging, tombstones, and index authority without acquiring the publication lock.
 When that check proves there is no due work, `prune` exits without launching contained helpers or touching the publication lock.
 When work is due, an atomic bucket marker in the machine temporary directory admits at most one retention lock attempt per configured owner interval across every Firstmate home, regardless of home count.

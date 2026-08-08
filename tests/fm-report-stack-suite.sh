@@ -2750,6 +2750,7 @@ test_retention_invalid_marker_quarantine_is_inode_owned() {
   fi
   [ "$state" = "invalid-marker-observed" ] || fail "invalid-marker race emitted an unexpected state: $state"
   mv "$stack/.retention-attempt.json" "$saved"
+  # shellcheck disable=SC2016
   node -e '
     const fs = require("fs");
     fs.writeFileSync(process.argv[1], `${JSON.stringify({ schemaVersion: 1, attemptedAtMs: Date.now() })}\n`);
@@ -2945,6 +2946,7 @@ test_retention_future_timestamp_uses_bounded_file_age_fallback() {
   local first second third before after status
   write_retention_scale_fixture "$stack" 1 1 valid
   mkdir "$stack/entries/cohort-1"
+  # shellcheck disable=SC2016
   node -e '
     const fs = require("fs");
     fs.writeFileSync(process.argv[1], `${JSON.stringify({ schemaVersion: 1, attemptedAtMs: Date.now() + 86400000 })}\n`);
@@ -2974,6 +2976,7 @@ test_retention_future_timestamp_uses_bounded_file_age_fallback() {
 
   write_retention_scale_fixture "$near_stack" 1 1 valid
   mkdir "$near_stack/entries/cohort-1"
+  # shellcheck disable=SC2016
   node -e '
     const fs = require("fs");
     fs.writeFileSync(process.argv[1], `${JSON.stringify({ schemaVersion: 1, attemptedAtMs: Date.now() + 30000 })}\n`);
@@ -3096,6 +3099,7 @@ test_retention_candidate_predicate_mutations() {
         mv "$stack/.retention-attempt.json" "$saved"
         cp "$saved" "$stack/.retention-attempt.json"
       else
+        # shellcheck disable=SC2016
         node -e '
           const fs = require("fs");
           const file = process.argv[1];
@@ -3383,6 +3387,7 @@ test_retention_postquarantine_javascript_predicate_mutations() {
   write_retention_scale_fixture "$stack" 1 1 valid
   mkdir "$stack/entries/cohort-1"
   printf 'observed invalid admission\n' > "$stack/.retention-attempt.json"
+  # shellcheck disable=SC2016
   write_report_stack_mutant "$mutant_root" \
     'pathIdentityChangedGuard = `${current.dev}:${current.ino}` !== `${observed.dev}:${observed.ino}`' \
     'pathIdentityChangedGuard = false'
@@ -3416,6 +3421,7 @@ test_retention_postquarantine_javascript_predicate_mutations() {
 }
 
 retention_admission_prefix_for_stack() {
+  # shellcheck disable=SC2016
   node -e '
     const crypto = require("crypto");
     const path = require("path");
@@ -4177,6 +4183,8 @@ NODE
   test_retention_invalid_marker_quarantine_is_inode_owned
   test_retention_quarantine_postrename_predicate_mutations
   test_retention_admission_and_lock_share_root_generation
+  test_root_retention_admission_preserves_newer_bucket
+  test_busy_lock_error_names_holder_identity_and_age
   pass "changed retention control flow has valid positive and negative controls"
 }
 
@@ -4232,6 +4240,7 @@ test_root_retention_admission_preserves_newer_bucket() {
     [ "$state" = root-attempt-admitted ] || fail "$implementation bucket-N+1 process emitted $state"
     printf 'continue\n' >&8
     wait "$first_pid" || fail "$implementation bucket-N process failed: $(cat "$first_output")"
+    mkdir -p "$stack/entries/cohort-1"
     FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$stack" \
       FM_REPORT_RETENTION_INTERVAL=3 FM_REPORT_RETENTION_ROOT_ADMISSION_TEST_READY="$third_ready" \
       FM_REPORT_RETENTION_ROOT_ADMISSION_TEST_PROCEED="$third_proceed" \
@@ -4257,7 +4266,8 @@ test_root_retention_admission_preserves_newer_bucket() {
 }
 
 test_retention_admission_mutation_inventory_is_complete() {
-  node - "$ROOT" "$ROOT/tests/fm-report-stack-suite.sh" "$TMP_ROOT/changed-control-mutants" <<'NODE'
+  node - "$ROOT" "$ROOT/tests/fm-report-stack-suite.sh" "$TMP_ROOT/changed-control-mutants" <<'NODE' \
+    || fail "changed-control mutation inventory failed"
 const fs = require("fs");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
@@ -4595,7 +4605,6 @@ async function main() {
 }
 main().catch((error) => { console.error(error.stack || error.message); process.exit(1); });
 NODE
-  [ "$?" -eq 0 ] || fail "changed-control mutation inventory failed"
   pass "complete changed control flow has executed red mutants"
 }
 
@@ -5098,6 +5107,142 @@ test_readers_wait_for_publication_lock() {
   pass "report readers hold the publication lock while resolving entries"
 }
 
+test_busy_lock_error_names_holder_identity_and_age() {
+  local short_root="$TMP_ROOT/report-lock-diagnostic-short" executable ready proceed
+  local STACK="$TMP_ROOT/report-lock-diagnostic-stack"
+  local owner_output="$TMP_ROOT/report-lock-diagnostic-owner.out"
+  local waiter_output="$TMP_ROOT/report-lock-diagnostic-waiter.out"
+  local legacy_output="$TMP_ROOT/report-lock-diagnostic-legacy.out"
+  local guard_output="$TMP_ROOT/report-lock-diagnostic-guard.out"
+  local ownerless_output="$TMP_ROOT/report-lock-diagnostic-ownerless.out"
+  local owner_pid owner_state owner_status waiter_status legacy_status guard_status ownerless_status
+  local started control
+  mkdir -p "$STACK"
+  write_report_stack_mutant "$short_root" \
+    'const reportLockWaitMs = 60_000;' \
+    'const reportLockWaitMs = 250;'
+  executable="$short_root/bin/fm-report-stack.mjs"
+  ready="$TMP_ROOT/report-lock-diagnostic.ready"
+  proceed="$TMP_ROOT/report-lock-diagnostic.proceed"
+  mkfifo "$ready" "$proceed"
+  exec 7<>"$ready"; exec 8<>"$proceed"
+  FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$STACK" \
+    FM_REPORT_LOCK_TEST_READY="$ready" FM_REPORT_LOCK_TEST_PROCEED="$proceed" \
+    "$executable" prune --force --status > "$owner_output" 2>&1 &
+  owner_pid=$!
+  if ! IFS= read -r -t 10 owner_state <&7; then
+    kill -TERM "$owner_pid" 2>/dev/null || true
+    wait "$owner_pid" 2>/dev/null || true
+    fail "report lock diagnostic owner did not acquire the publication lock: $(cat "$owner_output")"
+  fi
+  if [ "$owner_state" != "lock-acquired" ]; then
+    printf 'continue\n' >&8
+    wait "$owner_pid" 2>/dev/null || true
+    exec 7>&-; exec 8>&-
+    fail "report lock diagnostic owner emitted an unexpected state: $owner_state"
+  fi
+
+  if FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$STACK" \
+    "$executable" list --json > "$waiter_output" 2>&1; then
+    waiter_status=0
+  else
+    waiter_status=$?
+  fi
+  printf 'continue\n' >&8
+  if wait "$owner_pid"; then owner_status=0; else owner_status=$?; fi
+  exec 7>&-; exec 8>&-
+  [ "$owner_status" -eq 0 ] || fail "report lock diagnostic owner failed: $(cat "$owner_output")"
+  [ "$waiter_status" -ne 0 ] || fail "report lock diagnostic waiter unexpectedly crossed the held publication lock"
+
+  started=$(LC_ALL=C ps -p "$$" -o lstart= | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/[[:space:]][[:space:]]*/ /g')
+  mkdir "$STACK/.publish.lock"
+  printf '{"pid":%s,"startedAt":"%s"}\n' "$$" "$started" > "$STACK/.publish.lock/owner"
+  if FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$STACK" \
+    "$executable" list --json > "$legacy_output" 2>&1; then
+    legacy_status=0
+  else
+    legacy_status=$?
+  fi
+  rm -rf "$STACK/.publish.lock"
+
+  printf '{"pid":%s,"startedAt":"%s","token":"diagnostic-guard"}\n' "$$" "$started" \
+    > "$STACK/.publish.lock.reclaim"
+  if FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$STACK" \
+    "$executable" list --json > "$guard_output" 2>&1; then
+    guard_status=0
+  else
+    guard_status=$?
+  fi
+  rm -f "$STACK/.publish.lock.reclaim"
+
+  mkdir "$STACK/.publish.lock"
+  if FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$STACK" \
+    "$executable" list --json > "$ownerless_output" 2>&1; then
+    ownerless_status=0
+  else
+    ownerless_status=$?
+  fi
+  rm -rf "$STACK/.publish.lock"
+
+  if control=$(FM_GATE_REFUSE_BYPASS=1 FM_HOME="$HOME_DIR" FM_REPORT_STACK_ROOT="$STACK" \
+    "$executable" list --json 2>&1); then
+    :
+  else
+    fail "report lock diagnostic positive control could not cross the released boundary: $control"
+  fi
+  [ "$legacy_status" -ne 0 ] || fail "legacy report lock unexpectedly crossed the held publication lock"
+  [ "$guard_status" -ne 0 ] || fail "report reclaim guard unexpectedly crossed the held publication boundary"
+  [ "$ownerless_status" -ne 0 ] || fail "ownerless report lock unexpectedly crossed the held publication lock"
+
+  node - "$waiter_output" "$legacy_output" "$guard_output" "$ownerless_output" "$owner_pid" "$$" <<'NODE' \
+    || fail "busy holder diagnostic payload did not satisfy the boundary contract"
+const fs = require("fs");
+const [currentFile, legacyFile, guardFile, ownerlessFile, ownerPidText, shellPidText] = process.argv.slice(2);
+const marker = "; holder ";
+function holder(file) {
+  const line = fs.readFileSync(file, "utf8").split(/\r?\n/)
+    .find((candidate) => candidate.includes("report stack is busy at .publish.lock; holder "));
+  if (!line) throw new Error(`busy refusal omitted structured holder diagnostics in ${file}`);
+  return JSON.parse(line.slice(line.indexOf(marker) + marker.length));
+}
+const current = holder(currentFile);
+if (current.resource !== "publication-lock" || current.kind !== "identified") {
+  throw new Error(`busy refusal did not identify the publication lock holder: ${JSON.stringify(current)}`);
+}
+if (current.pid !== Number(ownerPidText) || current.operation !== "prune --force --status") {
+  throw new Error(`busy refusal named the wrong holder: ${JSON.stringify(current)}`);
+}
+if (current.liveness !== "live" || typeof current.processStartedAt !== "string" || !current.processStartedAt) {
+  throw new Error(`busy refusal omitted the holder process generation or liveness: ${JSON.stringify(current)}`);
+}
+if (!Number.isSafeInteger(current.acquiredAtMs) || !Number.isSafeInteger(current.ageMs)
+  || current.ageMs < 0 || current.ageBasis !== "recorded-acquisition") {
+  throw new Error(`busy refusal omitted the measured lock-hold age: ${JSON.stringify(current)}`);
+}
+const legacy = holder(legacyFile);
+if (legacy.resource !== "publication-lock" || legacy.kind !== "identified"
+  || legacy.pid !== Number(shellPidText) || legacy.operation !== "unknown"
+  || legacy.acquiredAtMs !== null || !Number.isSafeInteger(legacy.ageMs)
+  || legacy.ageBasis !== "resource-generation") {
+  throw new Error(`legacy busy refusal did not make its acquisition-time limit explicit: ${JSON.stringify(legacy)}`);
+}
+const guard = holder(guardFile);
+if (guard.resource !== "reclaim-guard" || guard.kind !== "identified"
+  || guard.pid !== Number(shellPidText) || !Number.isSafeInteger(guard.ageMs)
+  || guard.ageBasis !== "resource-generation") {
+  throw new Error(`reclaim-guard refusal did not identify its holder and age: ${JSON.stringify(guard)}`);
+}
+const ownerless = holder(ownerlessFile);
+if (ownerless.resource !== "publication-lock" || ownerless.kind !== "legacy-unowned"
+  || ownerless.identity !== "unknown" || ownerless.liveness !== "legacy-unowned"
+  || !Number.isSafeInteger(ownerless.ageMs) || ownerless.ageBasis !== "resource-generation"
+  || typeof ownerless.reason !== "string" || !ownerless.reason) {
+  throw new Error(`ownerless busy refusal claimed unsupported identity evidence: ${JSON.stringify(ownerless)}`);
+}
+NODE
+  pass "busy report-lock refusals name the live holder identity and measured age"
+}
+
 test_source_symlinks_fail_closed() {
   local id out status outside
   outside="$TMP_ROOT/outside-artifact"
@@ -5332,6 +5477,22 @@ PY
   fi
   pass "report publication traverses every artifact through one pinned task directory"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = lock-diagnostics ]; then
+  test_busy_lock_error_names_holder_identity_and_age
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = retention-noop-benchmark ]; then
+  test_noop_retention_skips_helpers_and_publication_lock_at_scale
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = retention-admission-core ]; then
+  test_retention_admission_bounds_total_fleet_attempts_above_current_population
+  test_failed_retention_attempt_is_ineligible_on_the_next_loop
+  exit 0
+fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_stale_lock_rejects_reused_pid
@@ -6659,6 +6820,7 @@ run_partitioned_test test_report_destination_roots_remain_pinned_during_ancestor
 run_partitioned_test test_report_publication_gate_uses_framed_fifo
 run_partitioned_test test_index_failure_restores_previous_generation
 run_partitioned_test test_readers_wait_for_publication_lock
+run_partitioned_test test_busy_lock_error_names_holder_identity_and_age
 run_partitioned_test test_visual_symlink_fails_closed_and_cleans_staging
 run_partitioned_test test_visual_copy_is_descriptor_bounded
 run_partitioned_test test_visual_containment_precedes_ancestor_swap

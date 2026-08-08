@@ -29,6 +29,9 @@ for arg in "$@"; do
   prev=$arg
 done
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now; every target in this
+  # fixture models a window that still exists.
+  has-session) exit 0 ;;
   display-message)
     case "$*" in
       *pane_current_command*)
@@ -37,12 +40,21 @@ case "${1:-}" in
           *) printf 'codex\n' ;;
         esac
         ;;
+      # The identity read is echoed back from the target, as tmux answers it.
+      *window_name*)
+        case "$target" in
+          *:*) printf '%s\t%s\n' "${target%%:*}" "${target#*:}" ;;
+          *) exit 1 ;;
+        esac
+        ;;
       *) printf '%%1\n' ;;
     esac
     ;;
   capture-pane)
     case "$target" in
-      *ship-task*|*active-secondmate*) printf 'work in progress\nesc to interrupt\n' ;;
+      # The stale lanes are meant to read BUSY: their panes are what makes
+      # the reconciled state "working" despite an older status event.
+      *ship-task*|*active-secondmate*|*fm-stale-*) printf 'work in progress\nesc to interrupt\n' ;;
       *) printf 'all quiet\n> \n' ;;
     esac
     ;;
@@ -245,7 +257,7 @@ test_event_hints_follow_reconciled_current_state() {
     "mode=ship"
   printf 'blocked: waiting on access\n' > "$home/state/active-blocked.status"
   fm_write_meta "$home/state/stale-decision.meta" \
-    "window=firstmate:fm-stale-decision-ship-task" \
+    "window=firstmate:fm-stale-decision" \
     "worktree=$home/projects/stale-decision" \
     "project=alpha" \
     "harness=codex" \
@@ -253,7 +265,7 @@ test_event_hints_follow_reconciled_current_state() {
     "mode=ship"
   printf 'needs-decision: already answered\n' > "$home/state/stale-decision.status"
   fm_write_meta "$home/state/stale-blocked.meta" \
-    "window=firstmate:fm-stale-blocked-ship-task" \
+    "window=firstmate:fm-stale-blocked" \
     "worktree=$home/projects/stale-blocked" \
     "project=alpha" \
     "harness=codex" \

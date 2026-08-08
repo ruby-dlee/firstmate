@@ -306,6 +306,10 @@ SH
 #!/usr/bin/env bash
 state="$(dirname "$0")/.tmux-live"
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session) [ -f "$state" ] || exit 1; exit 0 ;;
   display-message)
     [ -f "$state" ] || exit 1
     case "$*" in
@@ -3590,6 +3594,10 @@ SH
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session) exit 1 ;;
   display-message) exit 1 ;;
   *) exit 0 ;;
 esac
@@ -3641,6 +3649,10 @@ test_managed_teardown_retains_lease_when_endpoint_state_is_unknown() {
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session) exit 1 ;;
   display-message) exit 1 ;;
   list-windows) echo 'permission denied' >&2; exit 74 ;;
   kill-window) exit 74 ;;
@@ -3727,6 +3739,10 @@ test_managed_teardown_locks_generation_before_endpoint_cleanup() {
 set -u
 state="$(dirname "$0")/.tmux-live"
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session) [ -f "$state" ] || exit 1; exit 0 ;;
   display-message)
     [ -f "$state" ] || exit 1
     case "$*" in
@@ -3834,6 +3850,16 @@ set -u
 parent_state="$(dirname "$0")/.tmux-live"
 child_state="$(dirname "$0")/.child-tmux-live"
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session)
+    case "$*" in
+      *fm-child-lock-x3*) state=$child_state ;;
+      *) state=$parent_state ;;
+    esac
+    [ -f "$state" ] || exit 1
+    exit 0 ;;
   display-message)
     case "$*" in
       *fm-child-lock-x3*) state=$child_state; label=fm-child-lock-x3 ;;
@@ -4038,6 +4064,13 @@ live_marker() {
   esac
 }
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session)
+    marker=$(live_marker "$@")
+    [ -n "$marker" ] && [ -f "$marker" ] || exit 1
+    exit 0 ;;
   display-message)
     marker=$(live_marker "$@")
     [ -n "$marker" ] && [ -f "$marker" ] || exit 1
@@ -4123,6 +4156,13 @@ live_marker() {
   esac
 }
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session)
+    marker=$(live_marker "$@")
+    [ -n "$marker" ] && [ -f "$marker" ] || exit 1
+    exit 0 ;;
   display-message)
     marker=$(live_marker "$@")
     [ -n "$marker" ] && [ -f "$marker" ] || exit 1
@@ -4358,6 +4398,13 @@ live_marker() {
   esac
 }
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session)
+    marker=$(live_marker "$@")
+    [ -n "$marker" ] && [ -f "$marker" ] || exit 1
+    exit 0 ;;
   display-message)
     marker=$(live_marker "$@")
     [ -n "$marker" ] && [ -f "$marker" ] || exit 1
@@ -4452,6 +4499,10 @@ test_required_report_blocks_then_publishes_before_cleanup() {
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session) [ -f "$FM_FAKE_REPORT_LIVE" ] || exit 1; exit 0 ;;
   display-message)
     [ -f "$FM_FAKE_REPORT_LIVE" ] || exit 1
     case " $* " in
@@ -4542,6 +4593,10 @@ test_required_report_restores_rollback_generation_before_publish() {
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session) [ -f "$FM_FAKE_REPORT_LIVE" ] || exit 1; exit 0 ;;
   display-message)
     [ -f "$FM_FAKE_REPORT_LIVE" ] || exit 1
     case "$*" in
@@ -4596,6 +4651,10 @@ test_required_report_revalidates_after_quiescence() {
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session) [ -f "$FM_FAKE_REPORT_LIVE" ] || exit 1; exit 0 ;;
   display-message)
     [ -f "$FM_FAKE_REPORT_LIVE" ] || exit 1
     case " $* " in
@@ -4640,6 +4699,10 @@ test_legacy_teardown_revalidates_after_quiescence() {
   cat > "$case_dir/fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session) [ -f "$FM_FAKE_REPORT_LIVE" ] || exit 1; exit 0 ;;
   display-message)
     [ -f "$FM_FAKE_REPORT_LIVE" ] || exit 1
     case " $* " in
@@ -4999,6 +5062,16 @@ for arg in "$@"; do
   prev=$arg
 done
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session)
+    case "$target" in
+      *task-x1) [ -f "$FM_FAKE_PARENT_LIVE" ] || exit 1 ;;
+      *child-live-x9) [ -f "$FM_FAKE_CHILD_LIVE" ] || exit 1 ;;
+      *) exit 1 ;;
+    esac
+    exit 0 ;;
   display-message)
     case "$target" in
       *task-x1) [ -f "$FM_FAKE_PARENT_LIVE" ] || exit 1 ;;
@@ -5315,6 +5388,10 @@ test_retained_direct_spawn_requires_confirmed_endpoint_quiescence() {
 case "${1:-}" in
   kill-window) exit 0 ;;
   list-windows) echo "control plane unavailable" >&2; exit 1 ;;
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session) exit 1 ;;
   display-message) exit 1 ;;
 esac
 exit 0
@@ -6029,6 +6106,10 @@ test_teardown_distinguishes_dead_and_live_harness_processes() {
 #!/usr/bin/env bash
 state="$(dirname "$0")/.tmux-live"
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session) [ -f "$state" ] || exit 1; exit 0 ;;
   display-message)
     [ -f "$state" ] || exit 1
     case " $* " in *pane_current_command*) printf 'zsh\n' ;; esac
@@ -6296,6 +6377,10 @@ state="$(dirname "$0")/.tmux-live"
 started="$(dirname "$0")/.retirement-started"
 release="$(dirname "$0")/.retirement-release"
 case "${1:-}" in
+  # Endpoint existence is proven with has-session now, so it has to follow
+  # the SAME live marker the rest of this stub does; an unconditional
+  # success would report a killed window as alive forever.
+  has-session) [ -f "$state" ] || exit 1; exit 0 ;;
   display-message)
     [ -f "$state" ] || exit 1
     case " $* " in

@@ -811,6 +811,11 @@ test_managed_tmux_target_state_resolves_id_after_recorded_session_disappears() {
         printf "can't find session: recorded-session\n" >&2
         return 1
         ;;
+      # Whether the stable id still resolves is decided by has-session, not by
+      # display-message: real tmux exits 0 from display-message even for a
+      # target that no longer resolves, and with a two-field format it still
+      # prints the separator, so its output is non-empty for a dead id too.
+      has-session) [ "$resolved" = 1 ] ;;
       display-message)
         [ "$resolved" = 1 ] || return 1
         printf 'other-session\tfm-renamed-task\n'
@@ -859,10 +864,19 @@ run_send_case() {  # <bin-root> <fakebin> <log> <home> -- <send args...>
     "$bin/bin/fm-send.sh" "$@" >/dev/null 2>&1
 }
 
+# The target preflight is the ONE tmux call that deliberately differs old vs
+# new, so it is stripped from both logs before the conformance diff. The old
+# preflight was `display-message -p -t <target> '#{pane_id}'`, which exits 0
+# even when the target's window no longer exists (tmux falls back to the
+# session's current window), so it verified nothing; the new one is
+# `has-session -t <target>`, which resolves the full target and fails. Both
+# forms are stripped so this diff keeps asserting what it is actually for -
+# that the SEND sequence is unchanged - rather than the probe verb.
 strip_send_preflight() {  # <log>
-  local preflight
-  preflight=$'tmux\x1fdisplay-message\x1f-p\x1f-t\x1fsess:win\x1f#{pane_id}'
-  awk -v preflight="$preflight" '$0 != preflight { print }' "$1"
+  local old_preflight new_preflight
+  old_preflight=$'tmux\x1fdisplay-message\x1f-p\x1f-t\x1fsess:win\x1f#{pane_id}'
+  new_preflight=$'tmux\x1fhas-session\x1f-t\x1fsess:win'
+  awk -v old="$old_preflight" -v new="$new_preflight" '$0 != old && $0 != new { print }' "$1"
 }
 
 test_send_conformance_old_vs_new() {
@@ -879,8 +893,14 @@ test_send_conformance_old_vs_new() {
   run_send_case "$ROOT" "$fb" "$log_new" "$home" -- "sess:win" --key Escape
   rc_new=$?
   expect_code "$rc_old" "$rc_new" "fm-send --key: old vs new exit code"
-  assert_contains "$(cat "$log_new")" $'\x1f''display-message'$'\x1f''-p'$'\x1f''-t'$'\x1f''sess:win'$'\x1f''#{pane_id}' \
+  # The explicit target must still be verified before sending, and it must be
+  # verified with a command whose exit status actually means something: a
+  # display-message probe exits 0 for a window that is gone, so it never
+  # blocked a send into a dead target.
+  assert_contains "$(cat "$log_new")" $'\x1f''has-session'$'\x1f''-t'$'\x1f''sess:win' \
     "fm-send --key did not verify the explicit tmux target before sending"
+  ! grep -q $'\x1f''display-message'$'\x1f''-p'$'\x1f''-t'$'\x1f''sess:win'$'\x1f''#{pane_id}' "$log_new" \
+    || fail "fm-send --key still uses display-message as its target preflight, which exits 0 for a target that no longer exists"
   strip_send_preflight "$log_old" > "$filtered_old"
   strip_send_preflight "$log_new" > "$filtered_new"
   diff -u "$filtered_old" "$filtered_new" > "$TMP_ROOT/send-diff-key.txt" 2>&1 \

@@ -51,6 +51,15 @@ case "${1:-}" in
   send-keys) exit 0 ;;
   display-message)
     for a in "$@"; do case "$a" in *cursor_y*) printf '0\n'; exit 0 ;; esac; done
+    for a in "$@"; do case "$a" in
+      *window_name*)
+        prev=; ident_target=
+        for arg in "$@"; do [ "$prev" = -t ] && { ident_target=$arg; break; }; prev=$arg; done
+        case "$ident_target" in
+          *:*) printf '%s\t%s\n' "${ident_target%%:*}" "${ident_target#*:}"; exit 0 ;;
+          *) exit 1 ;;
+        esac ;;
+    esac; done
     printf 'fakepane\n'; exit 0 ;;
   capture-pane) printf '\xe2\x94\x82 \xe2\x94\x82\n'; exit 0 ;;
   list-windows) exit 0 ;;
@@ -97,7 +106,11 @@ first_settle() {  # <expected> <label> <harness|--explicit> <message> [selector-
         fail "$label: unknown selector form '$selector_form'"
         ;;
     esac
-    fm_write_meta "$home/state/$meta_id.meta" "window=sess:win" "harness=$harness"
+    # The recorded window must carry the task's own fm-<id> label, exactly as
+    # fm-spawn.sh records it: the adapter verifies that the window a target
+    # resolves to really is this task's, so a fixture recording someone else's
+    # label is not a valid stand-in for a live task endpoint.
+    fm_write_meta "$home/state/$meta_id.meta" "window=sess:fm-$meta_id" "harness=$harness"
   fi
   : > "$log"
   env FM_SEND_SETTLE=0 PATH="$fb:$PATH" \

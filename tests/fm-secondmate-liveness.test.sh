@@ -251,6 +251,24 @@ case "${1:-}" in
           printf '%s\n' "$pane_command"
           exit 0
           ;;
+        # The endpoint identity read. Real tmux answers this with the target's
+        # live session and window name, and the adapter's identity guard now
+        # actually checks it, so the stub has to model it rather than return
+        # nothing: it echoes back the session:window it was asked about, and
+        # only while the endpoint still exists.
+        *window_name*)
+          [ -f "${FM_TEST_ENDPOINT_FILE:?}" ] || exit 1
+          prev=
+          for arg in "$@"; do
+            [ "$prev" = -t ] && { target=$arg; break; }
+            prev=$arg
+          done
+          case "${target:-}" in
+            *:*) printf '%s\t%s\n' "${target%%:*}" "${target#*:}" ;;
+            *) exit 1 ;;
+          esac
+          exit 0
+          ;;
       esac
     done
     [ -f "${FM_TEST_ENDPOINT_FILE:?}" ]
@@ -293,7 +311,11 @@ case "${1:-}" in
         ;;
     esac
     exit 0 ;;
-  list-windows|has-session) exit 0 ;;
+  list-windows) exit 0 ;;
+  # Existence is now proven with has-session, so it has to track the endpoint
+  # the same way the identity read does; an unconditional success here would
+  # report a killed window as still live.
+  has-session) [ -f "${FM_TEST_ENDPOINT_FILE:?}" ]; exit $? ;;
 esac
 exit 0
 SH
@@ -745,6 +767,11 @@ test_sweep_converges_no_retouch_once_alive() {
 
   # Round 2: the (now-respawned) secondmate is genuinely alive - a second
   # sweep must converge to a pure no-op, not respawn again.
+  # Round 1 kills the dead generation's endpoint before deferring the respawn,
+  # so the endpoint has to be re-created here for "genuinely alive" to hold:
+  # that is the operator relaunch the deferral asked for. A live pane command
+  # alone is not liveness when the endpoint itself is gone.
+  touch "$w/home/state/.fake-endpoint"
   : > "$log"
   out2=$(run_bootstrap "$tmuxfb:$fb" "$w/home" claude "$log")
   assert_contains "$out2" "SECONDMATE_LIVENESS: secondmate sm1: already-live" "round 2 should see the now-live secondmate and stop touching it"

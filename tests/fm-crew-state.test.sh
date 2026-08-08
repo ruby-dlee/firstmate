@@ -85,8 +85,31 @@ SH
 #!/usr/bin/env bash
 set -u
 case "${1:-}" in
+  has-session)
+    # Endpoint existence is proven with has-session now, so it has to follow
+    # the same missing-pane switch the pane reads do.
+    [ "${FM_FAKE_TMUX_MISSING:-0}" = 1 ] && exit 1
+    exit 0 ;;
   display-message)
     [ "${FM_FAKE_TMUX_MISSING:-0}" = 1 ] && exit 1
+    # The identity read gets a real session/window answer (echoed back from the
+    # -t target, as tmux would), not the pane id: the adapter's identity guard
+    # parses this and a pane id would read as a malformed identity.
+    for a in "$@"; do
+      case "$a" in
+        *window_name*)
+          prev=
+          for arg in "$@"; do
+            [ "$prev" = -t ] && { target=$arg; break; }
+            prev=$arg
+          done
+          case "${target:-}" in
+            *:*) printf '%s\t%s\n' "${target%%:*}" "${target#*:}"; exit 0 ;;
+            *) exit 1 ;;
+          esac
+          ;;
+      esac
+    done
     printf '%%1\n' ;;
   capture-pane)
     [ "${FM_FAKE_TMUX_MISSING:-0}" = 1 ] && exit 1

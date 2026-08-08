@@ -27,8 +27,24 @@ exit 0
 SH
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
+# A target whose name carries "dead-" models a window that no longer exists, so
+# it has to fail the has-session existence probe as well as the identity read.
+target=""; prev=""
+for arg in "$@"; do [ "$prev" = "-t" ] && target=$arg; prev=$arg; done
 case "${1:-}" in
-  display-message) case "$*" in *dead-*) exit 1 ;; *) printf '%%1\n' ;; esac ;;
+  has-session) case "$*" in *dead-*) exit 1 ;; esac; exit 0 ;;
+  display-message)
+    case "$*" in *dead-*) exit 1 ;; esac
+    case "$*" in
+      # The identity read gets a real session/window pair, echoed back from the
+      # target, the way tmux answers it; a pane id would read as malformed.
+      *window_name*)
+        case "$target" in
+          *:*) printf '%s\t%s\n' "${target%%:*}" "${target#*:}" ;;
+          *) exit 1 ;;
+        esac ;;
+      *) printf '%%1\n' ;;
+    esac ;;
   capture-pane) printf 'all quiet\n> \n' ;;
 esac
 exit 0

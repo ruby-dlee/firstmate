@@ -4039,13 +4039,20 @@ herdr_escalation_marker_path() {
 }
 
 test_escalation_marker_keys_are_collision_free() {
-  local m dotted underscored
+  local m dotted underscored dir state legacy old
   m=$(herdr_escalation_marker_path /st default:wG:pQ)
-  [ "$m" = "/st/.herdr-escalated-v2-64656661756c743a77473a7051" ] \
+  [ "$m" = "/st/.herdr-escalated-v3-04338efa3648e18b33e36e474752ba667ef492615b96e5d6577485dcb31891a5" ] \
     || fail "escalation marker did not encode the exact window identity, got '$m'"
   dotted=$(herdr_escalation_marker_path /st default:lane.a)
   underscored=$(herdr_escalation_marker_path /st default:lane_a)
   [ "$dotted" != "$underscored" ] || fail "distinct Herdr window identities shared an escalation marker"
+  dir="$TMP_ROOT/escalation-marker-v2"; state="$dir/state"; mkdir -p "$state"
+  legacy=$(printf '%s' default:wG:pQ | od -An -tx1 | tr -d ' \n')
+  old="$state/.herdr-escalated-v2-$legacy"
+  printf 'handled\n' > "$old"
+  m=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  [ -e "$m" ] || fail "bounded Herdr key did not retain its v2 dedupe state"
+  [ ! -e "$old" ] || fail "Herdr v2 dedupe state remained after bounded migration"
   pass "fm_backend_herdr_escalation_marker is collision-free for exact window identities"
 }
 

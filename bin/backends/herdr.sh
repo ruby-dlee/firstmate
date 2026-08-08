@@ -101,7 +101,7 @@ FM_BACKEND_HERDR_MIN_EVENTS_PROTOCOL=16
 # exact window identity: set when a ->blocked edge
 # is enqueued, cleared on any working edge, so exactly one wake fires per
 # ->blocked edge and a reconnect level-reconcile never re-delivers a still-
-# blocked pane. Uses the same v2 identity encoding as watcher state.
+# blocked pane. Uses the bounded identity key shared with watcher state.
 FM_BACKEND_HERDR_ESCALATED_PREFIX=".herdr-escalated-"
 # .fm-secondmate-home is written by bin/fm-home-seed.sh (AGENTS.md section 6)
 # at a seeded secondmate home's root, containing exactly that secondmate's id.
@@ -3317,9 +3317,17 @@ fm_backend_herdr_event_reader_cmd() {
 # fm_backend_herdr_escalation_marker: the per-pane dedupe marker path for a
 # <window> ("<session>:<pane_id>"), under <state_dir>.
 fm_backend_herdr_escalation_marker() {  # <state_dir> <window>
-  local state=$1 window=$2 key
+  local state=$1 window=$2 key legacy marker old rc
   key=$(fm_marker_identity_key_with_executor "$window" fm_backend_herdr_control_exec) || return 1
-  printf '%s/%s%s' "$state" "$FM_BACKEND_HERDR_ESCALATED_PREFIX" "$key"
+  marker="$state/$FM_BACKEND_HERDR_ESCALATED_PREFIX$key"
+  if [ -d "$state" ] && [ ! -L "$state" ]; then
+    legacy=$(fm_marker_identity_legacy_v2_key "$window") || return 1
+    old="$state/$FM_BACKEND_HERDR_ESCALATED_PREFIX$legacy"
+    fm_marker_migrate_carrier "$old" "$marker"
+    rc=$?
+    case "$rc" in 0|2) ;; *) return "$rc" ;; esac
+  fi
+  printf '%s' "$marker"
 }
 
 # fm_backend_herdr_apply_transition: route one normalized record through the

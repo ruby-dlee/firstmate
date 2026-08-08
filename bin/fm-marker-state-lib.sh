@@ -15,11 +15,16 @@ _fm_marker_system_exec() {
 }
 
 fm_marker_identity_key_with_executor() {
-  local identity=$1 executor=$2 hex
+  local identity=$1 executor=$2 digest
   case "$identity" in ''|*$'\n'*) return 1 ;; esac
-  hex=$(LC_ALL=C printf '%s' "$identity" | "$executor" od -An -tx1 | "$executor" tr -d ' \n') || return 1
-  [ -n "$hex" ] || return 1
-  printf 'v2-%s' "$hex"
+  digest=$(LC_ALL=C printf '%s' "$identity" | "$executor" perl -MDigest::SHA=sha256_hex -e 'local $/; my $value = <STDIN>; exit 1 if !defined($value); print sha256_hex($value)') || return 1
+  [ "${#digest}" -eq 64 ] || return 1
+  case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+  case "${digest%?}" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+    *) return 1 ;;
+  esac
+  printf 'v3-%s' "$digest"
 }
 
 fm_marker_identity_key() {
@@ -31,7 +36,20 @@ fm_marker_task_key() {
   fm_marker_identity_key "$1"
 }
 
-fm_marker_task_from_key() {
+fm_marker_identity_legacy_v2_key() {
+  local identity=$1 hex
+  case "$identity" in ''|*$'\n'*) return 1 ;; esac
+  hex=$(LC_ALL=C printf '%s' "$identity" | _fm_marker_system_exec od -An -tx1 | _fm_marker_system_exec tr -d ' \n') || return 1
+  [ -n "$hex" ] || return 1
+  printf 'v2-%s' "$hex"
+}
+
+fm_marker_task_legacy_v2_key() {
+  case "$1" in ''|.*|-*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  fm_marker_identity_legacy_v2_key "$1"
+}
+
+fm_marker_task_from_legacy_key() {
   local key=$1 hex task
   case "$key" in v2-*) hex=${key#v2-} ;; *) return 1 ;; esac
   case "$hex" in ''|*[!0-9a-f]*) return 1 ;; esac
@@ -41,6 +59,79 @@ fm_marker_task_from_key() {
     exit 1 if !defined($hex) || $hex !~ /\A[0-9a-f]+\z/ || length($hex) % 2;
     print pack(q{H*}, $hex);
   ') || return 1
+  case "$task" in ''|.*|-*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  [ "$(fm_marker_task_legacy_v2_key "$task")" = "$key" ] || return 1
+  printf '%s' "$task"
+}
+
+fm_marker_task_from_key() {
+  fm_marker_task_from_legacy_key "$1"
+}
+
+fm_marker_owner_path() {
+  local state=$1 key=$2 digest
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  case "$key" in v3-*) digest=${key#v3-} ;; *) return 1 ;; esac
+  [ "${#digest}" -eq 64 ] || return 1
+  case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+  case "${key%?}" in
+    v3-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+    *) return 1 ;;
+  esac
+  printf '%s/.marker-owner-%s' "$state" "$key"
+}
+
+fm_marker_safe_file_read() {
+  _fm_marker_system_exec perl -MFcntl=:mode -e '
+    my ($path) = @ARGV;
+    my @before = lstat($path);
+    exit 1 if !@before || !S_ISREG($before[2]) || S_ISLNK($before[2]);
+    open my $fh, q{<}, $path or exit 1;
+    my @after = stat($fh);
+    exit 1 if !@after || $before[0] != $after[0] || $before[1] != $after[1];
+    local $/;
+    my $actual = <$fh>;
+    exit 1 if !defined($actual);
+    print $actual;
+  ' "$1"
+}
+
+fm_marker_safe_file_equals() {
+  local actual
+  actual=$(fm_marker_safe_file_read "$1") || return 1
+  [ "$actual" = "$2" ]
+}
+
+fm_marker_task_owner_claim() {
+  local state=$1 key=$2 task=$3 owner tmp
+  [ -d "$state" ] && [ ! -L "$state" ] || return 1
+  [ "$(fm_marker_task_key "$task")" = "$key" ] || return 1
+  owner=$(fm_marker_owner_path "$state" "$key") || return 1
+  if [ -e "$owner" ] || [ -L "$owner" ]; then
+    fm_marker_safe_file_equals "$owner" "$task"
+    return
+  fi
+  tmp=$(_fm_marker_system_exec mktemp "$owner.pending.XXXXXX") || return 1
+  printf '%s' "$task" > "$tmp" || { rm -f "$tmp"; return 1; }
+  if _fm_marker_system_exec ln "$tmp" "$owner" 2>/dev/null; then
+    rm -f "$tmp" || return 1
+  else
+    rm -f "$tmp" || return 1
+  fi
+  fm_marker_safe_file_equals "$owner" "$task"
+}
+
+fm_marker_task_key_for_state() {
+  local state=$1 task=$2 key
+  key=$(fm_marker_task_key "$task") || return 1
+  fm_marker_task_owner_claim "$state" "$key" "$task" || return 1
+  printf '%s' "$key"
+}
+
+fm_marker_task_owner_for_key() {
+  local state=$1 key=$2 owner task
+  owner=$(fm_marker_owner_path "$state" "$key") || return 1
+  task=$(fm_marker_safe_file_read "$owner") || return 1
   case "$task" in ''|.*|-*|*[!A-Za-z0-9._-]*) return 1 ;; esac
   [ "$(fm_marker_task_key "$task")" = "$key" ] || return 1
   printf '%s' "$task"
@@ -102,9 +193,14 @@ fm_marker_legacy_owner() {
 }
 
 fm_marker_task_for_key() {
-  local state=$1 key=$2
+  local state=$1 key=$2 task
   case "$key" in
-    v2-*) fm_marker_task_from_key "$key" ;;
+    v3-*) fm_marker_task_owner_for_key "$state" "$key" ;;
+    v2-*)
+      task=$(fm_marker_task_from_legacy_key "$key") || return 1
+      [ -f "$state/$task.meta" ] && [ ! -L "$state/$task.meta" ] || return 1
+      printf '%s' "$task"
+      ;;
     *) fm_marker_legacy_owner "$state" "$key" ;;
   esac
 }
@@ -154,9 +250,24 @@ fm_marker_signal_legacy_owner() {
   printf '%s' "$owner"
 }
 
+fm_marker_migrate_carrier() {
+  local old=$1 new=$2
+  [ -e "$old" ] || [ -L "$old" ] || return 0
+  if ! { [ -f "$old" ] && [ ! -L "$old" ]; }; then
+    fm_marker_quarantine_unsafe "$old" >/dev/null || true
+    return 2
+  fi
+  if [ -e "$new" ]; then
+    rm -f "$old" || return 1
+  else
+    fm_marker_rename_exact "$old" "$new" || return 1
+  fi
+}
+
 fm_marker_migrate_signal_seen() {
-  local state=$1 task=$2 kind=$3 key legacy owner old new unsafe=0
-  key=$(fm_marker_task_key "$task") || return 1
+  local state=$1 task=$2 kind=$3 key v2 legacy owner old new rc unsafe=0
+  key=$(fm_marker_task_key_for_state "$state" "$task") || return 1
+  v2=$(fm_marker_task_legacy_v2_key "$task") || return 1
   legacy=$(fm_marker_signal_legacy_key "$task" "$kind") || return 1
   new="$state/.seen-$kind-$key"
   if ! fm_marker_state_path_safe_or_absent "$new"; then
@@ -164,30 +275,25 @@ fm_marker_migrate_signal_seen() {
     fm_marker_state_path_safe_or_absent "$new" || return 1
     unsafe=2
   fi
+  old="$state/.seen-$kind-$v2"
+  fm_marker_migrate_carrier "$old" "$new"
+  rc=$?
+  case "$rc" in 0) ;; 2) unsafe=2 ;; *) return "$rc" ;; esac
   owner=$(fm_marker_signal_legacy_owner "$state" "$legacy" "$kind" 2>/dev/null || true)
   if [ "$owner" = "$task" ]; then
     old="$state/.seen-$legacy"
-    if [ -e "$old" ] || [ -L "$old" ]; then
-      if [ -f "$old" ] && [ ! -L "$old" ]; then
-        if [ -e "$new" ]; then
-          rm -f "$old" || return 1
-        else
-          fm_marker_rename_exact "$old" "$new" || return 1
-        fi
-      elif fm_marker_quarantine_unsafe "$old" >/dev/null; then
-        unsafe=2
-      else
-        unsafe=2
-      fi
-    fi
+    fm_marker_migrate_carrier "$old" "$new"
+    rc=$?
+    case "$rc" in 0) ;; 2) unsafe=2 ;; *) return "$rc" ;; esac
   fi
   printf '%s' "$new"
   return "$unsafe"
 }
 
 fm_marker_migrate_watcher_state() {
-  local state=$1 task=$2 target=$3 key legacy owner family old new unsafe=0
-  key=$(fm_marker_task_key "$task") || return 1
+  local state=$1 task=$2 target=$3 key v2 legacy owner family old new rc unsafe=0
+  key=$(fm_marker_task_key_for_state "$state" "$task") || return 1
+  v2=$(fm_marker_task_legacy_v2_key "$task") || return 1
   [ -f "$state/$task.meta" ] && [ ! -L "$state/$task.meta" ] || return 1
   [ "$(fm_backend_target_of_meta "$state/$task.meta")" = "$target" ] || return 1
   legacy=$(fm_marker_legacy_key "$target")
@@ -200,77 +306,81 @@ fm_marker_migrate_watcher_state() {
       fm_marker_state_path_safe_or_absent "$new" || return 1
       unsafe=2
     fi
+    old="$state/.$family-$v2"
+    fm_marker_migrate_carrier "$old" "$new"
+    rc=$?
+    case "$rc" in 0) ;; 2) unsafe=2 ;; *) return "$rc" ;; esac
     [ "$owner" = "$task" ] || continue
-    [ -e "$old" ] || [ -L "$old" ] || continue
-    if ! { [ -f "$old" ] && [ ! -L "$old" ]; }; then
-      fm_marker_quarantine_unsafe "$old" >/dev/null || unsafe=2
-      unsafe=2
-      continue
-    fi
-    if [ -e "$new" ]; then
-      rm -f "$old" || return 1
-    else
-      fm_marker_rename_exact "$old" "$new" || return 1
-    fi
+    old="$state/.$family-$legacy"
+    fm_marker_migrate_carrier "$old" "$new"
+    rc=$?
+    case "$rc" in 0) ;; 2) unsafe=2 ;; *) return "$rc" ;; esac
   done
   printf '%s' "$key"
   return "$unsafe"
 }
 
 fm_marker_migrate_task_state() {
-  local state=$1 task=$2 family=$3 key legacy owner old new unsafe=0
-  case "$family" in hb-surfaced) ;; *) return 1 ;; esac
-  key=$(fm_marker_task_key "$task") || return 1
+  local state=$1 task=$2 family=$3 key v2 legacy owner old new prefix rc unsafe=0
+  case "$family" in
+    hb-surfaced) prefix=.$family ;;
+    subsuper-seen-status) prefix=.$family ;;
+    *) return 1 ;;
+  esac
+  key=$(fm_marker_task_key_for_state "$state" "$task") || return 1
+  v2=$(fm_marker_task_legacy_v2_key "$task") || return 1
   legacy=$(fm_marker_legacy_key "$task")
-  new="$state/.$family-$key"
+  new="$state/$prefix-$key"
   if ! fm_marker_state_path_safe_or_absent "$new"; then
     fm_marker_quarantine_unsafe "$new" >/dev/null || return 1
     fm_marker_state_path_safe_or_absent "$new" || return 1
     unsafe=2
   fi
+  old="$state/$prefix-$v2"
+  fm_marker_migrate_carrier "$old" "$new"
+  rc=$?
+  case "$rc" in 0) ;; 2) unsafe=2 ;; *) return "$rc" ;; esac
   owner=$(fm_marker_legacy_owner "$state" "$legacy" 2>/dev/null || true)
   if [ "$owner" = "$task" ]; then
-    old="$state/.$family-$legacy"
-    if [ -e "$old" ] || [ -L "$old" ]; then
-      if [ -f "$old" ] && [ ! -L "$old" ]; then
-        if [ -e "$new" ]; then rm -f "$old" || return 1; else fm_marker_rename_exact "$old" "$new" || return 1; fi
-      else
-        fm_marker_quarantine_unsafe "$old" >/dev/null || unsafe=2
-        unsafe=2
-      fi
-    fi
+    old="$state/$prefix-$legacy"
+    fm_marker_migrate_carrier "$old" "$new"
+    rc=$?
+    case "$rc" in 0) ;; 2) unsafe=2 ;; *) return "$rc" ;; esac
   fi
   printf '%s' "$key"
   return "$unsafe"
 }
 
 fm_marker_remove_owned_kind() {
-  local state=$1 task=$2 kind=$3 key legacy owner
+  local state=$1 task=$2 kind=$3 key v2 legacy owner
   case "$kind" in stale|paused) ;; *) return 1 ;; esac
-  key=$(fm_marker_task_key "$task") || return 1
+  key=$(fm_marker_task_key_for_state "$state" "$task") || return 1
+  v2=$(fm_marker_task_legacy_v2_key "$task") || return 1
   rm -f "$state/.subsuper-$kind-$key" || return 1
+  fm_marker_task_owner_claim "$state" "$key" "$task" || return 1
+  rm -f "$state/.subsuper-$kind-$v2" || return 1
   legacy=$(fm_marker_legacy_key "$task")
   owner=$(fm_marker_legacy_owner "$state" "$legacy" 2>/dev/null || true)
   [ "$owner" != "$task" ] || rm -f "$state/.subsuper-$kind-$legacy"
 }
 
 fm_marker_migrate_owned_kind() {
-  local state=$1 task=$2 kind=$3 key legacy owner old new
+  local state=$1 task=$2 kind=$3 key v2 legacy owner old new rc
   case "$kind" in stale|paused) ;; *) return 1 ;; esac
-  key=$(fm_marker_task_key "$task") || return 1
+  key=$(fm_marker_task_key_for_state "$state" "$task") || return 1
+  v2=$(fm_marker_task_legacy_v2_key "$task") || return 1
   legacy=$(fm_marker_legacy_key "$task")
-  old="$state/.subsuper-$kind-$legacy"
   new="$state/.subsuper-$kind-$key"
-  [ -e "$old" ] || [ -L "$old" ] || { printf '%s' "$new"; return 0; }
-  [ -f "$old" ] && [ ! -L "$old" ] || return 1
   fm_marker_state_path_safe_or_absent "$new" || return 1
+  old="$state/.subsuper-$kind-$v2"
+  fm_marker_migrate_carrier "$old" "$new"
+  rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  old="$state/.subsuper-$kind-$legacy"
+  [ -e "$old" ] || [ -L "$old" ] || { printf '%s' "$new"; return 0; }
   owner=$(fm_marker_legacy_owner "$state" "$legacy") || return 1
   [ "$owner" = "$task" ] || return 1
-  if [ -e "$new" ]; then
-    rm -f "$old" || return 1
-  else
-    mv "$old" "$new" || return 1
-  fi
+  fm_marker_migrate_carrier "$old" "$new" || return $?
   printf '%s' "$new"
 }
 

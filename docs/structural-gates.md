@@ -77,9 +77,10 @@ Absence of a process sample, a stale status field, or one quiet observation can 
 - `bin/fm-nm-step-liveness.sh` maps affirmative process evidence to `alive` and every absence, timeout, unreadable state, and repeated zero sample to `unknown`.
 - `bin/fm-crew-state.sh` consumes branch-matched run evidence before pane and status evidence and downgrades legacy `dead` vocabulary to unknown.
 - `bin/fm-classify-lib.sh`, `bin/fm-watch.sh`, and `bin/fm-supervise-daemon.sh` absorb a lane only from affirmative run-owned process evidence; pane, status, missing-target, and unreadable observations remain UNKNOWN.
-- Watcher hash, pause, permission, signal, turn-end, surfaced-heartbeat, and daemon state families use collision-free task and carrier-kind keys and migrate legacy state only for one positively verified owner.
+- Watcher hash, pause, permission, signal, turn-end, surfaced-heartbeat, and daemon state families use bounded SHA-256 task keys with safe exact-identity owner records and migrate legacy state only for one positively verified owner.
+- The owner record is claimed without overwrite and revalidated before carrier reads, migration, attribution, or deletion, so a digest collision or forged owner fails closed.
 - Unsafe uniquely owned carriers are quarantined without following links, exact-key observation continues, and ambiguous UNKNOWN markers remain behind an atomic per-marker retry cadence and buffered-event dedupe.
-- Herdr native-transition dedupe keys preserve the exact window identity and cannot alias punctuation variants.
+- Herdr native-transition dedupe keys use the same bounded SHA-256 identity key, preserve v2 dedupe state during migration, and cannot alias punctuation variants.
 - Daemon stale and pause marker writes serialize with the task lifecycle lock held by spawn and teardown.
 - `bin/fm-auto-reap.sh` has no validation-abort route and retains every active, cross-branch, ambiguously attributed, or otherwise uncustodied run.
 - Teardown remains the sole destructive boundary and still requires its independent exact ownership, cleanliness, landed-work, and endpoint proofs.
@@ -100,7 +101,7 @@ Absence of a process sample, a stale status field, or one quiet observation can 
 
 - `tests/fm-run-liveness.test.sh` covers affirmative BUSY, absence as UNKNOWN, branch blindness, detached work, and host-pressure recording.
 - `tests/fm-nm-step-liveness.test.sh` covers quiet, frozen, vanished, repeated-zero, and working process windows without a dead verdict.
-- Focused liveness shards in `tests/fm-watch-triage.test.sh` and `tests/fm-daemon.test.sh` cover status-field and heartbeat non-inference, collision-free signal custody, unsafe legacy quarantine, and atomic UNKNOWN retry publication.
+- Focused liveness shards in `tests/fm-watch-triage.test.sh` and `tests/fm-daemon.test.sh` cover status-field and heartbeat non-inference, bounded long-identity custody, adversarial owner rejection, collision-free signal custody, unsafe legacy quarantine, and atomic UNKNOWN retry publication.
 - `tests/fm-backend-herdr.test.sh` proves native transition markers remain collision-free and preserve dedupe semantics.
 - `tests/fm-auto-reap.test.sh` covers active-run and ambiguous-run retention and the absence of abort authority.
 

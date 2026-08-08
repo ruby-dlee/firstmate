@@ -166,7 +166,7 @@ test_stale_transient_self_records_marker() {
   stale_marker_record "sess:fm-qux-w4" "$state"
   out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-qux-w4" "$state")
   case "$out" in self\|*) ;; *) fail "transient stale did not self-handle: $out" ;; esac
-  key=$(_task_marker_key "$(window_to_task "sess:fm-qux-w4")")
+  key=$(_task_marker_key "$(window_to_task "sess:fm-qux-w4")" "$state")
   [ -e "$state/.subsuper-stale-$key" ] || fail "stale marker was not recorded"
   pass "transient stale self-handles and records a persistence marker"
 }
@@ -210,7 +210,7 @@ test_handle_wake_paused_records_pause_marker() {
   win="sess:fm-held-w10"
   fm_write_meta "$state/held-w10.meta" "window=$win" "kind=ship"
   printf 'paused: awaiting the vendor rate-limit reset\n' > "$state/held-w10.status"
-  key=$(_task_marker_key held-w10)
+  key=$(_task_marker_key held-w10 "$state")
   date +%s > "$state/.subsuper-stale-$key"
   FM_STATE_OVERRIDE="$state" handle_wake "stale: $win" "$state"
   [ -e "$state/.subsuper-paused-$key" ] || fail "pause marker not recorded by handle_wake"
@@ -226,7 +226,7 @@ test_handle_wake_paused_signal_records_pause_marker() {
   win="sess:fm-held-w10-signal"
   printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w10-signal.meta"
   printf 'paused: awaiting the vendor rate-limit reset\n' > "$state/held-w10-signal.status"
-  key=$(_task_marker_key held-w10-signal)
+  key=$(_task_marker_key held-w10-signal "$state")
   date +%s > "$state/.subsuper-stale-$key"
   FM_STATE_OVERRIDE="$state" handle_wake "signal: $state/held-w10-signal.status" "$state"
   [ -e "$state/.subsuper-paused-$key" ] || fail "pause signal did not record a pause marker"
@@ -242,7 +242,7 @@ test_handle_wake_terminal_signal_clears_pause_tracking() {
   win="sess:fm-held-w10-terminal"
   printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w10-terminal.meta"
   printf 'done: upstream landed\n' > "$state/held-w10-terminal.status"
-  key=$(_task_marker_key held-w10-terminal)
+  key=$(_task_marker_key held-w10-terminal "$state")
   watcher_key=$(_watcher_marker_key "$state" "$win" held-w10-terminal)
   date +%s > "$state/.subsuper-paused-$key"
   date +%s > "$state/.subsuper-stale-$key"
@@ -270,7 +270,7 @@ test_housekeeping_migrates_watcher_pause_marker() {
   key=$(_watcher_marker_key "$state" "$win" held-w10-migrate)
   : > "$state/.paused-$key"
   FM_STATE_OVERRIDE="$state" housekeeping "$state"
-  key=$(_task_marker_key held-w10-migrate)
+  key=$(_task_marker_key held-w10-migrate "$state")
   [ -e "$state/.subsuper-paused-$key" ] || fail "watcher pause marker was not migrated into daemon tracking"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "watcher pause migration left a wedge marker behind"
   pass "housekeeping migrates a normal-watcher's declared pause into daemon tracking"
@@ -286,7 +286,7 @@ test_housekeeping_migrates_watcher_unpaused_marker_to_clear() {
   watcher_key=$(_watcher_marker_key "$state" "$win" held-w10-migrate-unpaused)
   : > "$state/.paused-$watcher_key"
   FM_STATE_OVERRIDE="$state" housekeeping "$state"
-  key=$(_task_marker_key held-w10-migrate-unpaused)
+  key=$(_task_marker_key held-w10-migrate-unpaused "$state")
   [ ! -e "$state/.paused-$watcher_key" ] || fail "stale watcher pause marker was not cleared after resume"
   [ ! -e "$state/.subsuper-paused-$key" ] || fail "unpaused watcher handoff created a daemon pause marker"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "unpaused watcher handoff retained daemon stale tracking"
@@ -301,7 +301,7 @@ test_housekeeping_seeds_pause_marker_from_status() {
   win="sess:fm-held-w10-seed"
   printf 'window=%s\nkind=ship\n' "$win" > "$state/held-w10-seed.meta"
   printf 'paused: awaiting the upstream release\n' > "$state/held-w10-seed.status"
-  key=$(_task_marker_key held-w10-seed)
+  key=$(_task_marker_key held-w10-seed "$state")
   FM_STATE_OVERRIDE="$state" housekeeping "$state"
   [ -e "$state/.subsuper-paused-$key" ] || fail "paused status did not seed daemon pause tracking"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "paused status seeded wedge tracking"
@@ -319,7 +319,7 @@ test_housekeeping_paused_resurfaces_and_resets() {
   fm_write_meta "$state/held-w11.meta" "window=$win" "kind=ship"
   printf 'paused: holding for the upstream tool release\n' > "$state/held-w11.status"
   printf 'idle prompt $\n' > "$pane"
-  key=$(_task_marker_key held-w11)
+  key=$(_task_marker_key held-w11 "$state")
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
@@ -340,7 +340,7 @@ test_housekeeping_paused_busy_pane_is_unknown() {
   fm_write_meta "$state/held-w12.meta" "window=$win" "kind=ship"
   printf 'paused: holding for the upstream tool release\n' > "$state/held-w12.status"
   printf 'Working...\n' > "$pane"
-  key=$(_task_marker_key held-w12)
+  key=$(_task_marker_key held-w12 "$state")
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
   make_fake_crew_state "$fakebin" >/dev/null
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
@@ -364,7 +364,7 @@ test_housekeeping_paused_unpaused_cleared() {
   fm_write_meta "$state/held-w13.meta" "window=$win" "kind=ship"
   printf 'paused: holding for the upstream release\nworking: resumed, upstream landed\n' > "$state/held-w13.status"
   printf 'idle prompt $\n' > "$pane"
-  key=$(_task_marker_key held-w13)
+  key=$(_task_marker_key held-w13 "$state")
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
@@ -380,7 +380,7 @@ test_housekeeping_stale_marker_transitions_to_pause() {
   fm_write_meta "$state/held-w14.meta" "window=$win" "kind=ship"
   printf 'paused: awaiting the upstream tool release\n' > "$state/held-w14.status"
   printf 'idle prompt $\n' > "$pane"
-  key=$(_task_marker_key held-w14)
+  key=$(_task_marker_key held-w14 "$state")
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-stale-$key"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
@@ -397,7 +397,7 @@ test_housekeeping_pause_marker_transitions_to_clear() {
   fm_write_meta "$state/held-w15.meta" "window=$win" "kind=ship"
   printf 'working: upstream landed, resuming\n' > "$state/held-w15.status"
   printf 'idle prompt $\n' > "$pane"
-  key=$(_task_marker_key held-w15)
+  key=$(_task_marker_key held-w15 "$state")
   date +%s > "$state/.subsuper-paused-$key"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=999999 housekeeping "$state"
@@ -417,7 +417,7 @@ test_housekeeping_persistent_stale_escalates() {
   pane="$dir/pane.txt"
   printf 'working\n' > "$state/pers-w5.status"
   printf 'idle prompt $\n' > "$pane"
-  key=$(_task_marker_key pers-w5)
+  key=$(_task_marker_key pers-w5 "$state")
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
@@ -433,7 +433,7 @@ test_housekeeping_unreadable_stale_preserves_unknown_tracking() {
   win="sess:fm-unreadable"
   fm_write_meta "$state/unreadable.meta" "window=$win" "kind=ship"
   printf 'working: validating\n' > "$state/unreadable.status"
-  key=$(_task_marker_key unreadable)
+  key=$(_task_marker_key unreadable "$state")
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
   (
     stale_window_is_busy() { return 2; }
@@ -452,7 +452,7 @@ test_housekeeping_unreadable_pause_preserves_recheck_tracking() {
   win="sess:fm-pause-unreadable"
   fm_write_meta "$state/pause-unreadable.meta" "window=$win" "kind=ship"
   printf 'paused: awaiting external review\n' > "$state/pause-unreadable.status"
-  key=$(_task_marker_key pause-unreadable)
+  key=$(_task_marker_key pause-unreadable "$state")
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-paused-$key"
   (
     stale_window_is_busy() { return 2; }
@@ -469,7 +469,7 @@ test_housekeeping_missing_stale_target_preserves_unknown_tracking() {
   dir=$(make_supercase stale-target-missing)
   state="$dir/state"
   fakebin="$dir/fakebin"
-  key=$(_task_marker_key missing-stale)
+  key=$(_task_marker_key missing-stale "$state")
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
   (
     unset FM_FAKE_TMUX_WINDOW
@@ -486,7 +486,7 @@ test_housekeeping_missing_paused_target_preserves_unknown_tracking() {
   dir=$(make_supercase paused-target-missing)
   state="$dir/state"
   fakebin="$dir/fakebin"
-  key=$(_task_marker_key missing-paused)
+  key=$(_task_marker_key missing-paused "$state")
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-paused-$key"
   (
     unset FM_FAKE_TMUX_WINDOW
@@ -618,7 +618,7 @@ test_housekeeping_stale_liveness_runs_one_bounded_parallel_window() {
     win="sess:fm-$task"
     printf 'window=%s\nkind=ship\n' "$win" > "$state/$task.meta"
     printf 'working: validating\n' > "$state/$task.status"
-    key=$(_task_marker_key "$task")
+    key=$(_task_marker_key "$task" "$state")
     echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
   done
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_CAPTURE="$pane" \
@@ -635,7 +635,7 @@ test_housekeeping_stale_liveness_runs_one_bounded_parallel_window() {
   [ "$span" -lt 3 ] \
     || fail "away-daemon stale process windows still started serially across ${span}s"
   for task in a b c d e; do
-    key=$(_task_marker_key "$task")
+    key=$(_task_marker_key "$task" "$state")
     marker_epoch=$(cat "$state/.subsuper-stale-$key" 2>/dev/null || true)
     case "$marker_epoch" in ''|*[!0-9]*) fail "away daemon did not refresh stale marker for $task" ;; esac
   done
@@ -653,7 +653,7 @@ test_housekeeping_busy_pane_stale_is_unknown() {
   pane="$dir/pane.txt"
   printf 'working\n' > "$state/res-w6.status"
   printf 'Working...\n' > "$pane"
-  key=$(_task_marker_key res-w6)
+  key=$(_task_marker_key res-w6 "$state")
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
@@ -669,7 +669,7 @@ test_housekeeping_herdr_persistent_stale_resolves_meta() {
   state="$dir/state"
   fm_write_meta "$state/herdr-w7.meta" "window=default:w1:p2" "backend=herdr"
   printf 'working\n' > "$state/herdr-w7.status"
-  key=$(_task_marker_key herdr-w7)
+  key=$(_task_marker_key herdr-w7 "$state")
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
   (
     fm_backend_capture() {
@@ -697,7 +697,7 @@ test_housekeeping_herdr_idle_busy_footer_is_unknown() {
   state="$dir/state"
   fm_write_meta "$state/herdr-footer.meta" "window=default:w1:p4" "backend=herdr"
   printf 'working\n' > "$state/herdr-footer.status"
-  key=$(_task_marker_key herdr-footer)
+  key=$(_task_marker_key herdr-footer "$state")
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
   (
     fm_backend_capture() {
@@ -725,7 +725,7 @@ test_housekeeping_herdr_native_busy_is_unknown() {
   state="$dir/state"
   fm_write_meta "$state/herdr-busy.meta" "window=default:w1:p3" "backend=herdr"
   printf 'working\n' > "$state/herdr-busy.status"
-  key=$(_task_marker_key herdr-busy)
+  key=$(_task_marker_key herdr-busy "$state")
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
   (
     fm_backend_capture() {
@@ -753,7 +753,7 @@ test_housekeeping_orca_persistent_stale_resolves_terminal() {
   state="$dir/state"
   fm_write_meta "$state/orca-w8.meta" "window=fm-orca-w8" "terminal=term-orca-w8" "backend=orca"
   printf 'working\n' > "$state/orca-w8.status"
-  key=$(_task_marker_key orca-w8)
+  key=$(_task_marker_key orca-w8 "$state")
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
   (
     fm_backend_capture() {
@@ -869,7 +869,7 @@ test_terminal_stale_escalate_leaves_no_marker() {
   win="sess:fm-fin-n7"
   fm_write_meta "$state/fin-n7.meta" "window=$win" "kind=ship"
   printf 'done: PR https://x/y/pull/7\n' > "$state/fin-n7.status"
-  key=$(_task_marker_key fin-n7)
+  key=$(_task_marker_key fin-n7 "$state")
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
   FM_STATE_OVERRIDE="$state" handle_wake "stale: $win" "$state"
   [ -s "$state/.subsuper-escalations" ] || fail "terminal stale was not escalated"
@@ -888,7 +888,7 @@ test_signal_escalate_marks_seen_no_catchall_refire() {
   printf 'done: PR https://x/y/pull/8\n' > "$state/sig-t8.status"
   FM_STATE_OVERRIDE="$state" handle_wake "signal: $state/sig-t8.status" "$state"
   [ -s "$state/.subsuper-escalations" ] || fail "captain signal was not escalated"
-  key=$(_task_marker_key sig-t8)
+  key=$(_task_marker_key sig-t8 "$state")
   [ "$(cat "$state/.subsuper-seen-status-$key" 2>/dev/null || true)" = "done: PR https://x/y/pull/8" ] \
     || fail "captain signal escalate did not write the seen-status marker"
   : > "$state/.subsuper-escalations"
@@ -1159,7 +1159,7 @@ test_classify_signal_dedup_against_scan() {
   state="$dir/state"
   printf 'done: PR https://x/y/pull/9\n' > "$state/dup-s9.status"
   # Simulate the catch-all scan having already escalated this status.
-  key=$(_task_marker_key dup-s9)
+  key=$(_task_marker_key dup-s9 "$state")
   printf 'done: PR https://x/y/pull/9' > "$state/.subsuper-seen-status-$key"
   out=$(FM_STATE_OVERRIDE="$state" classify_signal "$state/dup-s9.status" "$state")
   case "$out" in self\|*) ;; *) fail "signal not deduped against scan: $out" ;; esac
@@ -1177,7 +1177,7 @@ test_classify_stale_dedup_against_signal() {
   dir=$(make_supercase stale-dedup)
   state="$dir/state"
   printf 'done: PR https://x/y/pull/10\n' > "$state/dup-s10.status"
-  key=$(_task_marker_key dup-s10)
+  key=$(_task_marker_key dup-s10 "$state")
   printf 'done: PR https://x/y/pull/10' > "$state/.subsuper-seen-status-$key"
   out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-dup-s10" "$state")
   case "$out" in self\|*) ;; *) fail "stale not deduped against signal: $out" ;; esac

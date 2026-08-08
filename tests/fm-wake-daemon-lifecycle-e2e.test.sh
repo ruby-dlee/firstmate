@@ -111,7 +111,7 @@ test_stale_pane_transient_persistent_resume() {
   fakebin="$dir/fakebin"
   win="sess:fm-stale-w2"
   fm_write_meta "$state/stale-w2.meta" "window=$win" "kind=ship"
-  key=$(_task_marker_key stale-w2)
+  key=$(_task_marker_key stale-w2 "$state")
   printf 'working: compiling\n' > "$state/stale-w2.status"
 
   # Transient: first stale observation self-handles and records a marker.

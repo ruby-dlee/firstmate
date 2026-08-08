@@ -348,7 +348,7 @@ classify_signal() {  # <reason-after-colon> <state>
     # single source of truth shared between the per-wake signal path and the
     # heartbeat scan. all_seen stays 1 only if EVERY relevant file was seen.
     task=$(basename "$f"); task="${task%.status}"
-    seen="$state/.subsuper-seen-status-$(_task_marker_key "$task")"
+    seen=$(_seen_status_path "$state" "$task") || { all_seen=0; continue; }
     [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ] || all_seen=0
   done
   # strip a trailing " | " separator so the distilled line is clean
@@ -383,7 +383,10 @@ classify_stale() {  # <window> <state>
   if [ -n "$last" ] && status_is_captain_relevant "$last"; then
     # Dedupe against the signal path: if this status was already escalated
     # (seen marker matches), self-handle to avoid a duplicate in the digest.
-    seen="$state/.subsuper-seen-status-$(_task_marker_key "$task")"
+    seen=$(_seen_status_path "$state" "$task") || {
+      printf 'escalate|stale + terminal status with UNKNOWN marker custody: %s' "$last"
+      return
+    }
     if [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ]; then
       printf 'self|stale + terminal (already escalated by signal): %s' "$last"
       return
@@ -415,14 +418,29 @@ classify_unknown() {  # <reason>
 # Seen:     state/.subsuper-seen-status-<task>  last status line the scan
 #           escalated, so the catch-all does not re-fire the same terminal.
 
-_task_marker_key() { fm_marker_task_key "$1"; }
+_task_marker_key() {
+  if [ "$#" -ge 2 ]; then
+    fm_marker_task_key_for_state "$2" "$1"
+  else
+    fm_marker_task_key "$1"
+  fi
+}
+
+_seen_status_path() {
+  local state=$1 task=$2 key rc
+  key=$(fm_marker_migrate_task_state "$state" "$task" subsuper-seen-status)
+  rc=$?
+  [ -n "$key" ] || return 1
+  case "$rc" in 0|2) ;; *) return "$rc" ;; esac
+  printf '%s/.subsuper-seen-status-%s' "$state" "$key"
+}
 
 _watcher_marker_key() {
   local state=$1 win=$2 task=$3 rc
   fm_marker_migrate_watcher_state "$state" "$task" "$win" >/dev/null 2>&1
   rc=$?
   case "$rc" in 0|2) ;; *) return "$rc" ;; esac
-  fm_marker_task_key "$task"
+  fm_marker_task_key_for_state "$state" "$task"
 }
 
 marker_unknown_retry_path() {
@@ -558,7 +576,7 @@ clear_pause_tracking() {  # <window> <state>
 reconcile_pause_tracking() {  # <window> <state> <last-status-line>
   local win=$1 state=$2 last=$3 task key marker watcher_key
   task=$(window_to_task "$win" "$state")
-  key=$(_task_marker_key "$task")
+  key=$(_task_marker_key "$task" "$state")
   marker="$state/.subsuper-paused-$key"
   watcher_key=$(_watcher_marker_key "$state" "$win" "$task") || return 1
   if status_is_paused "$last"; then
@@ -576,7 +594,7 @@ migrate_watcher_pause_markers() {  # <state>
     win=$(fm_backend_target_of_meta "$meta")
     [ -n "$win" ] || continue
     task=$(basename "$meta"); task=${task%.meta}
-    key=$(_task_marker_key "$task")
+    key=$(_task_marker_key "$task" "$state")
     watcher_key=$(_watcher_marker_key "$state" "$win" "$task") || continue
     last=$(last_status_line "$state/$task.status")
     if status_is_paused "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
@@ -605,8 +623,9 @@ sync_pause_markers_from_signal() {  # <state> <signal files>
 # the .subsuper-seen-status-<task> dedup state: called from both the per-wake
 # escalate path and the catch-all scan.
 mark_status_seen() {  # <state> <task> <last-line>
-  local state=$1 task=$2 line=$3
-  printf '%s' "$line" > "$state/.subsuper-seen-status-$(_task_marker_key "$task")"
+  local state=$1 task=$2 line=$3 seen
+  seen=$(_seen_status_path "$state" "$task") || return 1
+  fm_marker_atomic_write "$seen" "$line"
 }
 
 # Mark every captain-relevant status line a per-wake classification escalated as
@@ -1093,7 +1112,7 @@ housekeeping() {  # <state>
     key="${marker##*.subsuper-stale-}"
     legacy_key=$key
     task=$(fm_marker_task_for_key "$state" "$key" 2>/dev/null || true)
-    if [ -n "$task" ] && [ "$key" != "$(fm_marker_task_key "$task" 2>/dev/null || true)" ]; then
+    if [ -n "$task" ] && [ "$key" != "$(fm_marker_task_key_for_state "$state" "$task" 2>/dev/null || true)" ]; then
       marker=$(marker_migrate_owned "$state" "$task" stale 2>/dev/null || true)
       if [ -n "$marker" ]; then
         key=${marker##*.subsuper-stale-}
@@ -1202,7 +1221,7 @@ housekeeping() {  # <state>
     key="${marker##*.subsuper-paused-}"
     legacy_key=$key
     task=$(fm_marker_task_for_key "$state" "$key" 2>/dev/null || true)
-    if [ -n "$task" ] && [ "$key" != "$(fm_marker_task_key "$task" 2>/dev/null || true)" ]; then
+    if [ -n "$task" ] && [ "$key" != "$(fm_marker_task_key_for_state "$state" "$task" 2>/dev/null || true)" ]; then
       marker=$(marker_migrate_owned "$state" "$task" paused 2>/dev/null || true)
       if [ -n "$marker" ]; then
         key=${marker##*.subsuper-paused-}
@@ -1263,7 +1282,7 @@ housekeeping() {  # <state>
     local seen
     while IFS="$(printf '\t')" read -r f task last; do
       [ -n "$f" ] || continue
-      seen="$state/.subsuper-seen-status-$(_task_marker_key "$task")"
+      seen=$(_seen_status_path "$state" "$task") || continue
       [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ] && continue
       escalate_add "$state" "$(basename "$f"): $last (catch-all scan)"
       mark_status_seen "$state" "$task" "$last"

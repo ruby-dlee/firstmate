@@ -415,7 +415,7 @@ watcher_state_key() {  # <window> [task]
   [ -n "$task" ] || task=$(window_to_task "$win" "$STATE")
   [ -f "$STATE/$task.meta" ] && [ ! -L "$STATE/$task.meta" ] || return 1
   [ "$(fm_backend_target_of_meta "$STATE/$task.meta")" = "$win" ] || return 1
-  fm_marker_task_key "$task"
+  fm_marker_task_key_for_state "$STATE" "$task"
 }
 
 migrate_watcher_state() {  # <window> <task>

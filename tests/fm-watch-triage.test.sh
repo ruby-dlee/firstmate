@@ -2126,6 +2126,56 @@ test_unsafe_watcher_legacy_state_is_quarantined_without_skipping_exact_custody()
   pass "unsafe watcher legacy state is quarantined without dropping exact observation"
 }
 
+test_marker_keys_bound_long_identity_to_exact_safe_owner() {
+  local dir state task window key owner longest other sentinel prior prior_window prior_v2 prior_key
+  dir=$(make_case bounded-marker-owner); state="$dir/state"
+  task=lane-
+  while [ "${#task}" -lt 124 ]; do task="${task}x"; done
+  window="firstmate:fm-$task"
+  fm_write_meta "$state/$task.meta" "window=$window" 'kind=ship'
+  printf 'working: long identity\n' > "$state/$task.status"
+  (
+  export FM_STATE_OVERRIDE="$state"
+  . "$WATCH"
+  key=$(fm_marker_task_key_for_state "$state" "$task") || fail "long task identity could not claim bounded custody"
+  case "$key" in v3-[0-9a-f]*) ;; *) fail "long task identity did not use a cryptographic v3 key" ;; esac
+  [ "${#key}" -eq 67 ] || fail "long task key was not fixed-width: ${#key}"
+  owner=$(fm_marker_owner_path "$state" "$key") || fail "long task owner path was not representable"
+  fm_marker_safe_file_equals "$owner" "$task" || fail "long task owner record did not preserve the exact identity"
+  longest=".wedge-escalations-permission-$key"
+  [ "${#longest}" -lt 255 ] || fail "longest watcher carrier exceeded the strict filesystem basename budget"
+  [ "$(fm_marker_task_for_key "$state" "$key")" = "$task" ] || fail "long task owner record did not authorize attribution"
+  printf '1\n' > "$state/.subsuper-stale-$key"
+  other=lane-adversarial-owner
+  rm -f "$owner"
+  printf '%s' "$other" > "$owner"
+  fm_marker_task_for_key "$state" "$key" >/dev/null 2>&1 && fail "forged owner record authorized attribution"
+  fm_marker_migrate_watcher_state "$state" "$task" "$window" >/dev/null 2>&1 \
+    && fail "forged owner record authorized watcher migration"
+  fm_marker_remove_owned_kind "$state" "$task" stale >/dev/null 2>&1 \
+    && fail "forged owner record authorized marker deletion"
+  [ -e "$state/.subsuper-stale-$key" ] || fail "failed owner validation deleted the task marker"
+  rm -f "$owner"
+  sentinel="$dir/owner-sentinel"
+  printf 'preserve-me\n' > "$sentinel"
+  ln -s "$sentinel" "$owner"
+  fm_marker_task_key_for_state "$state" "$task" >/dev/null 2>&1 \
+    && fail "symlink owner record authorized task custody"
+  [ "$(cat "$sentinel")" = preserve-me ] || fail "owner validation followed its symlink"
+  prior=prior.v2
+  prior_window=firstmate:fm-prior.v2
+  fm_write_meta "$state/$prior.meta" "window=$prior_window" 'kind=ship'
+  prior_v2=$(fm_marker_task_legacy_v2_key "$prior")
+  printf 'legacy-hash\n' > "$state/.hash-$prior_v2"
+  fm_marker_migrate_watcher_state "$state" "$prior" "$prior_window" >/dev/null \
+    || fail "exact v2 watcher state did not migrate"
+  prior_key=$(fm_marker_task_key_for_state "$state" "$prior")
+  [ -e "$state/.hash-$prior_key" ] || fail "v2 watcher state did not move to bounded custody"
+  [ ! -e "$state/.hash-$prior_v2" ] || fail "v2 watcher state remained after bounded migration"
+  ) || fail "bounded marker owner assertions failed"
+  pass "bounded marker keys retain exact long-identity ownership and reject forged custody"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_watcher_markers_refuse_symlinks
   exit 0
@@ -2202,6 +2252,7 @@ case "${FM_TEST_FOCUSED:-}" in
     test_watcher_state_identity_is_collision_free_and_legacy_migration_is_owned
     test_signal_seen_identity_is_collision_free_and_legacy_migration_is_owned
     test_unsafe_watcher_legacy_state_is_quarantined_without_skipping_exact_custody
+    test_marker_keys_bound_long_identity_to_exact_safe_owner
     exit 0
     ;;
 esac
@@ -2259,3 +2310,4 @@ test_watcher_timeout_wrapper_uses_hard_kill_fallback
 test_watcher_state_identity_is_collision_free_and_legacy_migration_is_owned
 test_signal_seen_identity_is_collision_free_and_legacy_migration_is_owned
 test_unsafe_watcher_legacy_state_is_quarantined_without_skipping_exact_custody
+test_marker_keys_bound_long_identity_to_exact_safe_owner

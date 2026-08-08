@@ -1001,10 +1001,14 @@ fm_account_lock_owner_identity() {  # <lock-path>
 
 FM_ACCOUNT_LOCK_SAFE_OWNER_PID=
 FM_ACCOUNT_LOCK_SAFE_OWNER_START=
+FM_ACCOUNT_LOCK_SAFE_CARRIER_IDENTITY=
+FM_ACCOUNT_LOCK_SAFE_OWNER_IDENTITY=
 fm_account_lock_safe_owner_read() {  # <lock-path>
-  local identity
+  local identity remainder
   FM_ACCOUNT_LOCK_SAFE_OWNER_PID=
   FM_ACCOUNT_LOCK_SAFE_OWNER_START=
+  FM_ACCOUNT_LOCK_SAFE_CARRIER_IDENTITY=
+  FM_ACCOUNT_LOCK_SAFE_OWNER_IDENTITY=
   identity=$(fm_account_system_perl -MFcntl=:mode -e '
     my ($lock) = @ARGV;
     my @carrier = lstat($lock);
@@ -1027,25 +1031,66 @@ fm_account_lock_safe_owner_read() {  # <lock-path>
     exit 1 if !defined($value) || $value !~ /\A([0-9]+)\n([^\n]+)\n\z/;
     my @after = lstat($lock);
     exit 1 if !@after || $carrier[0] != $after[0] || $carrier[1] != $after[1];
-    print $1, qq{\n}, $2;
+    print $1, qq{\n}, $2, qq{\n}, $carrier[0], q{:}, $carrier[1], qq{\n},
+      $before[0], q{:}, $before[1];
   ' "$1") || return 1
   case "$identity" in *$'\n'*) ;; *) return 1 ;; esac
   FM_ACCOUNT_LOCK_SAFE_OWNER_PID=${identity%%$'\n'*}
-  FM_ACCOUNT_LOCK_SAFE_OWNER_START=${identity#*$'\n'}
-  case "$FM_ACCOUNT_LOCK_SAFE_OWNER_START" in ''|*$'\n'*) return 1 ;; esac
+  remainder=${identity#*$'\n'}
+  FM_ACCOUNT_LOCK_SAFE_OWNER_START=${remainder%%$'\n'*}
+  remainder=${remainder#*$'\n'}
+  FM_ACCOUNT_LOCK_SAFE_CARRIER_IDENTITY=${remainder%%$'\n'*}
+  FM_ACCOUNT_LOCK_SAFE_OWNER_IDENTITY=${remainder#*$'\n'}
+  case "$FM_ACCOUNT_LOCK_SAFE_OWNER_START" in '') return 1 ;; esac
+  case "$FM_ACCOUNT_LOCK_SAFE_CARRIER_IDENTITY" in
+    *:* ) ;;
+    *) return 1 ;;
+  esac
+  case "$FM_ACCOUNT_LOCK_SAFE_OWNER_IDENTITY" in
+    *:* ) ;;
+    *) return 1 ;;
+  esac
 }
 
-fm_account_legacy_lock_reclaim() {  # <legacy-lock-path>
-  local lock=$1 state owner carrier_inode owner_inode pinned_inode generation guard key reclaim moved_inode moved_owner_inode
-  local owner_pid owner_start owner_state
-  local PATH=$FM_ACCOUNT_SYSTEM_PATH
-  fm_account_lock_safe_owner_read "$lock" || return 1
+FM_ACCOUNT_LOCK_RECLAIM_OWNER_PID=
+FM_ACCOUNT_LOCK_RECLAIM_OWNER_START=
+FM_ACCOUNT_LOCK_RECLAIM_CARRIER_IDENTITY=
+FM_ACCOUNT_LOCK_RECLAIM_OWNER_IDENTITY=
+fm_account_lock_reclaim_owner_classify() {  # <lock-path>
+  local lock=$1 owner_pid owner_start carrier_identity owner_identity owner_state
+  FM_ACCOUNT_LOCK_RECLAIM_OWNER_PID=
+  FM_ACCOUNT_LOCK_RECLAIM_OWNER_START=
+  FM_ACCOUNT_LOCK_RECLAIM_CARRIER_IDENTITY=
+  FM_ACCOUNT_LOCK_RECLAIM_OWNER_IDENTITY=
+  if fm_account_lock_is_bounded "$lock"; then
+    fm_account_lock_identity_validate "$lock" || return 3
+  fi
+  fm_account_lock_safe_owner_read "$lock" || return 3
   owner_pid=$FM_ACCOUNT_LOCK_SAFE_OWNER_PID
   owner_start=$FM_ACCOUNT_LOCK_SAFE_OWNER_START
+  carrier_identity=$FM_ACCOUNT_LOCK_SAFE_CARRIER_IDENTITY
+  owner_identity=$FM_ACCOUNT_LOCK_SAFE_OWNER_IDENTITY
   if fm_account_lock_owner_state_after_identity "$lock"; then owner_state=0; else owner_state=$?; fi
-  [ "$owner_state" -eq 1 ] || return 1
+  case "$owner_state" in 0|1|2) ;; *) return 3 ;; esac
   [ "$FM_ACCOUNT_LOCK_OWNER_PID" = "$owner_pid" ] \
-    && [ "$FM_ACCOUNT_LOCK_OWNER_START" = "$owner_start" ] || return 1
+    && [ "$FM_ACCOUNT_LOCK_OWNER_START" = "$owner_start" ] || return 3
+  FM_ACCOUNT_LOCK_RECLAIM_OWNER_PID=$owner_pid
+  FM_ACCOUNT_LOCK_RECLAIM_OWNER_START=$owner_start
+  FM_ACCOUNT_LOCK_RECLAIM_CARRIER_IDENTITY=$carrier_identity
+  FM_ACCOUNT_LOCK_RECLAIM_OWNER_IDENTITY=$owner_identity
+  return "$owner_state"
+}
+
+fm_account_lock_exact_reclaim() {  # <lock-path>
+  local lock=$1 state owner carrier_inode owner_inode pinned_inode generation guard key reclaim moved_inode moved_owner_inode
+  local owner_pid owner_start owner_state carrier_identity owner_identity
+  local PATH=$FM_ACCOUNT_SYSTEM_PATH
+  if fm_account_lock_reclaim_owner_classify "$lock"; then owner_state=0; else owner_state=$?; fi
+  [ "$owner_state" -eq 1 ] || return 1
+  owner_pid=$FM_ACCOUNT_LOCK_RECLAIM_OWNER_PID
+  owner_start=$FM_ACCOUNT_LOCK_RECLAIM_OWNER_START
+  carrier_identity=$FM_ACCOUNT_LOCK_RECLAIM_CARRIER_IDENTITY
+  owner_identity=$FM_ACCOUNT_LOCK_RECLAIM_OWNER_IDENTITY
   carrier_inode=$(fm_account_path_inode "$lock") || return 1
   if [ -f "$lock" ] && [ ! -L "$lock" ]; then owner=$lock; else owner=$lock/owner; fi
   owner_inode=$(fm_account_path_inode "$owner") || return 1
@@ -1073,19 +1118,14 @@ fm_account_legacy_lock_reclaim() {  # <legacy-lock-path>
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
     return 1
   }
-  if ! fm_account_lock_safe_owner_read "$lock" \
-    || [ "$FM_ACCOUNT_LOCK_SAFE_OWNER_PID" != "$owner_pid" ] \
-    || [ "$FM_ACCOUNT_LOCK_SAFE_OWNER_START" != "$owner_start" ] \
+  if fm_account_lock_reclaim_owner_classify "$lock"; then owner_state=0; else owner_state=$?; fi
+  if [ "$owner_state" -ne 1 ] \
+    || [ "$FM_ACCOUNT_LOCK_RECLAIM_OWNER_PID" != "$owner_pid" ] \
+    || [ "$FM_ACCOUNT_LOCK_RECLAIM_OWNER_START" != "$owner_start" ] \
+    || [ "$FM_ACCOUNT_LOCK_RECLAIM_CARRIER_IDENTITY" != "$carrier_identity" ] \
+    || [ "$FM_ACCOUNT_LOCK_RECLAIM_OWNER_IDENTITY" != "$owner_identity" ] \
     || [ "$(fm_account_path_inode "$lock" 2>/dev/null || true)" != "$carrier_inode" ] \
     || [ "$(fm_account_path_inode "$owner" 2>/dev/null || true)" != "$owner_inode" ]; then
-    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
-    fm_account_reclaim_guard_release "$guard"
-    return 1
-  fi
-  if fm_account_lock_owner_state_after_identity "$lock"; then owner_state=0; else owner_state=$?; fi
-  if [ "$owner_state" -ne 1 ] \
-    || [ "$FM_ACCOUNT_LOCK_OWNER_PID" != "$owner_pid" ] \
-    || [ "$FM_ACCOUNT_LOCK_OWNER_START" != "$owner_start" ]; then
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
     fm_account_reclaim_guard_release "$guard"
     return 1
@@ -1267,10 +1307,11 @@ fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
   local lock=$1 grace=$2 now mtime reclaim guard inode_before inode_after generation state key guard_leaf guard_candidate_leaf
   local ownerless_since ownerless_tmp baseline required_grace
   local PATH=$FM_ACCOUNT_SYSTEM_PATH
-  [ ! -L "$lock" ] || return 1
   if fm_account_lock_is_bounded "$lock"; then
-    fm_account_lock_identity_validate "$lock" || return 1
+    fm_account_lock_exact_reclaim "$lock"
+    return
   fi
+  [ ! -L "$lock" ] || return 1
   required_grace=$grace
   [ "$required_grace" -ge 1 ] || required_grace=1
   state=${lock%/*}
@@ -1315,13 +1356,6 @@ fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
       fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
       fm_account_reclaim_guard_release "$guard"
       return 1
-    fi
-    if fm_account_lock_is_bounded "$lock"; then
-      fm_account_lock_identity_validate "$lock" || {
-        fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
-        fm_account_reclaim_guard_release "$guard"
-        return 1
-      }
     fi
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$lock" || {
       fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
@@ -1404,9 +1438,6 @@ fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
   fm_account_reclaim_guard_owned "$guard" || return 1
   inode_after=$(fm_account_path_inode "$lock") || return 1
   [ "$inode_before" = "$inode_after" ] || return 1
-  if fm_account_lock_is_bounded "$lock"; then
-    fm_account_lock_identity_validate "$lock" || { fm_account_reclaim_guard_release "$guard"; return 1; }
-  fi
   reclaim=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" -d \
     "$state/$FM_ACCOUNT_LOCK_RECLAIM_TEMPLATE" 2>/dev/null) || { fm_account_reclaim_guard_release "$guard"; return 1; }
   fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RMDIR_BIN" "$reclaim" \
@@ -1418,12 +1449,10 @@ fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
 fm_account_lock_acquire() {  # <state-dir> <task> <name> <label> <wait-seconds>
   local state=$1 task=$2 name=$3 label=$4 wait_seconds=$5 lock legacy legacy_leaf legacy_supported=0
   local deadline now start owner_tmp owner_inode lock_inode published_inode wait_target legacy_owned=0 legacy_inode
-  local ownerless_grace=${FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS:-2}
   local PATH=$FM_ACCOUNT_SYSTEM_PATH
   fm_account_valid_id "$task" || { echo "error: invalid task id '$task' for $label lock" >&2; return 1; }
   case "$name" in *[!A-Za-z0-9._-]*|'') echo "error: invalid account lock name '$name'" >&2; return 1 ;; esac
   case "$wait_seconds" in ''|*[!0-9]*) echo "error: invalid $label lock wait '$wait_seconds'" >&2; return 1 ;; esac
-  case "$ownerless_grace" in ''|*[!0-9]*) echo "error: invalid $label lock ownerless grace '$ownerless_grace'" >&2; return 1 ;; esac
   start=$(fm_account_process_start_time "$$") || {
     echo "error: cannot record $label lock owner for $task" >&2
     return 1
@@ -1459,7 +1488,7 @@ fm_account_lock_acquire() {  # <state-dir> <task> <name> <label> <wait-seconds>
         fi
         [ "$legacy_inode" != "$owner_inode" ] \
           || fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$legacy" 2>/dev/null || true
-      elif fm_account_legacy_lock_reclaim "$legacy"; then
+      elif fm_account_lock_exact_reclaim "$legacy"; then
         continue
       fi
     else
@@ -1490,7 +1519,7 @@ fm_account_lock_acquire() {  # <state-dir> <task> <name> <label> <wait-seconds>
             || fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$lock/owner" 2>/dev/null || true
           fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RMDIR_BIN" "$lock" 2>/dev/null || true
         fi
-      elif fm_account_meta_lock_reclaim "$lock" "$ownerless_grace"; then
+      elif fm_account_lock_exact_reclaim "$lock"; then
         continue
       fi
     fi

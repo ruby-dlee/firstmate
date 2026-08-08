@@ -5239,7 +5239,7 @@ test_continuation_rejects_metadata_ancestor_swap() {
   pass "continuation pins metadata ancestors before parsing task identity"
 }
 
-test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
+test_account_metadata_lock_serializes_exact_owners_without_overlap() {
   local case_dir state lock workers pids pid rc owner_lines
   case_dir="$TMP_ROOT/account-lock"
   state="$case_dir/state"
@@ -5253,15 +5253,10 @@ test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
     > "$case_dir/young-stdout" 2> "$case_dir/young-stderr"
   rc=$?
   set -e
-  [ "$rc" -ne 0 ] || fail "young ownerless metadata lock was reclaimed before its grace"
-  assert_present "$lock" "young ownerless metadata lock was deleted"
-  assert_present "$lock/.ownerless-since" "ownerless metadata lock did not persist its grace baseline"
-
-  printf '946684800\n' > "$lock/.ownerless-since"
-  touch -t 200001010000 "$lock"
-  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
-    bash -c '. "$1"; held=$(fm_account_meta_lock_acquire "$2" lock-task) || exit; fm_account_meta_lock_release "$held"' \
-    _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" || fail "old ownerless metadata lock was not reclaimed"
+  [ "$rc" -ne 0 ] || fail "ownerless bounded metadata lock was reclaimed without exact ownership"
+  assert_present "$lock" "ownerless bounded metadata lock was deleted"
+  assert_absent "$lock/.ownerless-since" "ownerless metadata lock was assigned speculative age evidence"
+  rm -rf "$lock"
 
   owner_lines=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 bash -c '
     . "$1"
@@ -5316,11 +5311,17 @@ SH
   mkdir -p "$lock/.reclaiming"
   printf '1\nstale-reclaimer\n' > "$lock/.reclaiming/owner"
   touch -t 200001010000 "$lock" "$lock/.reclaiming"
-  FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 \
     bash -c '. "$1"; held=$(fm_account_meta_lock_acquire "$2" lock-task) || exit $?; fm_account_meta_lock_release "$held"' \
-    _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" || fail "abandoned metadata reclaim owner blocked acquisition"
-  assert_absent "$lock" "metadata lock retained an abandoned reclaim owner"
-  pass "metadata locks reclaim abandoned directories without deleting new owners"
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" >/dev/null 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -ne 0 ] || fail "ownerless bounded lock trusted an abandoned nested reclaim owner"
+  assert_present "$lock" "ownerless bounded lock deleted ambiguous nested reclaim state"
+  rm -rf "$lock"
+  pass "metadata locks preserve ambiguous carriers and serialize exact owners"
 }
 
 test_account_locks_never_reclaim_on_indeterminate_process_probe() {
@@ -5603,6 +5604,101 @@ test_account_lock_owner_controls_reject_symlinks() {
   [ "$(cat "$outside")" = $'999999\nstale-owner' ] || fail "metadata-lock release changed a symlink target"
   rm -rf "$case_dir"
   pass "account lock owner controls reject symlinks by call-site semantics"
+}
+
+test_bounded_account_lock_reclaim_requires_exact_dead_owner() {
+  local case_dir state task lock held start outside status before_inode after_inode
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  case_dir="$TMP_ROOT/bounded-account-lock-reclaim"
+  state="$case_dir/state"
+  task=bounded-reclaim-task
+  mkdir -p "$state"
+  lock=$(fm_account_lock_identity_claim "$state" "$task" account-meta) \
+    || fail "bounded reclaim fixture could not resolve its exact lock"
+
+  mkdir "$lock"
+  start=$(fm_account_process_start_time "$$") || fail "bounded live-owner fixture could not read its identity"
+  printf '%s\n%s\n' "$$" "$start" > "$lock/owner"
+  before_inode=$(fm_account_path_inode "$lock")
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim displaced a live exact owner"
+  after_inode=$(fm_account_path_inode "$lock")
+  [ "$after_inode" = "$before_inode" ] || fail "bounded reclaim changed a live owner carrier"
+
+  printf '1\nstale-owner\n' > "$lock/owner"
+  held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 fm_account_meta_lock_acquire "$state" "$task") \
+    || fail "bounded reclaim refused an exact proven-dead owner"
+  fm_account_meta_lock_release "$held" || fail "bounded dead-owner fixture could not release replacement custody"
+
+  mkdir "$lock"
+  printf 'malformed-owner\n' > "$lock/owner"
+  before_inode=$(fm_account_path_inode "$lock")
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim accepted a malformed owner"
+  [ "$(fm_account_path_inode "$lock")" = "$before_inode" ] \
+    || fail "bounded reclaim deleted a malformed owner carrier"
+  [ "$(cat "$lock/owner")" = malformed-owner ] || fail "bounded reclaim changed a malformed owner"
+
+  printf '1\nstale-owner\n' > "$lock/owner"
+  chmod 000 "$lock/owner"
+  before_inode=$(fm_account_path_inode "$lock")
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim accepted an unreadable owner"
+  [ "$(fm_account_path_inode "$lock")" = "$before_inode" ] \
+    || fail "bounded reclaim deleted an unreadable owner carrier"
+  chmod 600 "$lock/owner"
+
+  rm -rf "$lock"
+  mkdir "$lock"
+  outside="$case_dir/outside-owner"
+  printf '1\nstale-owner\n' > "$outside"
+  ln -s "$outside" "$lock/owner"
+  before_inode=$(fm_account_path_inode "$lock")
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim accepted a symlinked owner"
+  [ "$(fm_account_path_inode "$lock")" = "$before_inode" ] && [ -L "$lock/owner" ] \
+    || fail "bounded reclaim changed a symlinked owner carrier"
+  [ "$(cat "$outside")" = $'1\nstale-owner' ] || fail "bounded reclaim followed a symlinked owner"
+
+  rm -rf "$lock"
+  mkdir "$lock"
+  printf '1\nstale-owner\n' > "$lock/owner"
+  if LOCK="$lock" bash -c '
+    . "$1"
+    fm_account_reclaim_guard_acquire() {
+      local replacement_start
+      replacement_start=$(fm_account_process_start_time "$$") || return 1
+      printf "%s\n%s\n" "$$" "$replacement_start" > "$LOCK/owner.replacement"
+      mv "$LOCK/owner.replacement" "$LOCK/owner"
+    }
+    fm_account_reclaim_guard_release() { return 0; }
+    fm_account_lock_exact_reclaim "$LOCK"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh"; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim accepted an owner replacement during reclamation"
+  [ -d "$lock" ] && [ ! -L "$lock" ] || fail "bounded reclaim deleted a replacement owner carrier"
+  [ "$(sed -n '1p' "$lock/owner")" != 1 ] || fail "bounded reclaim did not install the replacement race fixture"
+  rm -rf "$case_dir"
+  pass "bounded account locks reclaim only exact proven-dead owners"
 }
 
 test_linux_stat_selection_avoids_filesystem_stat_output() {
@@ -6760,10 +6856,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = account-lock-compatibility ]; then
-  run_isolated_test test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
+  run_isolated_test test_account_metadata_lock_serializes_exact_owners_without_overlap
   run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
   run_isolated_test test_account_locks_support_maximum_task_identity
   run_isolated_test test_account_lock_owner_controls_reject_symlinks
+  run_isolated_test test_bounded_account_lock_reclaim_requires_exact_dead_owner
   exit 0
 fi
 
@@ -6961,7 +7058,7 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = account-locks ]; then
   run_isolated_test test_managed_recovery_accepts_inherited_lifecycle_lock
-  run_isolated_test test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
+  run_isolated_test test_account_metadata_lock_serializes_exact_owners_without_overlap
   run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
   run_isolated_test test_account_locks_support_maximum_task_identity
   run_isolated_test test_ownerless_lock_marker_rejects_symlink_clobber
@@ -7134,7 +7231,7 @@ run_isolated_test test_continuation_rollback_preserves_concurrent_packet_replace
 run_isolated_test test_continuation_rejects_load_bearing_source_replacement_during_open
 run_isolated_test test_continuation_rejects_task_source_ancestor_swap
 run_isolated_test test_continuation_rejects_metadata_ancestor_swap
-run_isolated_test test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
+run_isolated_test test_account_metadata_lock_serializes_exact_owners_without_overlap
 run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
 run_isolated_test test_account_locks_support_maximum_task_identity
 run_isolated_test test_ownerless_lock_marker_rejects_symlink_clobber

@@ -733,6 +733,22 @@ $1
 EOF
 }
 
+# Inside the test lab the quota binary must come FROM the lab. quota_command's
+# fallback to the ambient `command -v quota-axi` is fine in production but wrong
+# under test: it makes an isolated case reach the real network, take real
+# per-account timeouts, and depend on whatever happens to be installed on the
+# machine running it - so the same suite behaves differently on a developer box
+# with quota-axi installed than on CI without it. A lab that has not declared a
+# quota binary gets no Claude usage signal, which is the honest answer.
+claude_quota_command() {
+  if test_lab_enabled; then
+    [ -n "${FM_ACCOUNT_DIRECTORY_QUOTA_AXI:-}" ] || return 1
+    printf '%s\n' "$FM_ACCOUNT_DIRECTORY_QUOTA_AXI"
+    return 0
+  fi
+  command -v quota-axi 2>/dev/null
+}
+
 claude_status() { # <quota-json>
   jq -er '[.providers[]? | select(.provider == "claude") | .state.status // "unknown"][0]' \
     2>/dev/null <<EOF
@@ -891,7 +907,7 @@ EOF
   # moment quota-axi can resolve a config-dir-specific credential the same code
   # starts ranking and starts skipping accounts that are spent.
   reserve_lines=$(pool_reserve_percents claude "$pool" 2>/dev/null) || reserve_lines=
-  quota_bin=$(quota_command 2>/dev/null) || quota_bin=
+  quota_bin=$(claude_quota_command 2>/dev/null) || quota_bin=
   if [ -n "$quota_bin" ] && command -v jq >/dev/null 2>&1; then
     LC_ALL=C
     export LC_ALL

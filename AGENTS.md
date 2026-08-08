@@ -131,6 +131,7 @@ state/               volatile runtime signals; gitignored
   .hash-* .count-* .stale-* .stale-since-* .paused-* .wedge-escalations-* .brief-started-* .seen-* .hb-surfaced-* .last-* .heartbeat-streak   watcher internals; never touch
   .watch-triage.log  watcher's absorbed-wake debug log (size-capped); never relied on, safe to delete
   .last-watcher-beat watcher liveness beacon, touched every poll (including while absorbing benign wakes); guard scripts read it
+  .watcher-handoff intentional actionable-wake exit marker, cleared by every new watcher before its first beat; never touch
   .subsuper-* .supervise-daemon.*   sub-supervisor internals; never touch
 .no-mistakes/        local validation state and evidence; gitignored
 ```
@@ -629,6 +630,7 @@ Do not substitute another harness's command shape for it.
 `bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crewmates with positive working evidence (an actively-running no-mistakes step for their branch, or a busy pane read via `bin/fm-crew-state.sh`) unless the separate permission-stall no-progress threshold has expired, a declared `paused:` external wait until its bounded recheck cadence under the proof and precedence contract owned by `docs/architecture.md`, and no-change heartbeats; that owner also records the known defect `herdr-push-transition-pause-gate-h8`, under which the Herdr native edge can silently absorb a lane that owes an unanswered keyed decision and let it go quiet.
 It never absorbs a crewmate that stopped without that evidence - whatever its stale status log claims - and only an actionable wake is queued durably and ends the supervision wait, so you resume the emitted protocol exactly once per actionable event.
 A `paused:` status is a deliberate external wait, not `blocked:`; its initial signal still surfaces once, and a forgotten pause re-surfaces for a recheck once per window.
+When an earlier keyed captain decision remains open, that pause is retained as a distinct captain-owed wait and re-surfaces under that label instead of reading as either silence or a wedge.
 A pause gates starting new work only and never suspends custody of a validation run already in flight, because a gated run parks at its next gate whether or not anyone is watching; this is the in-flight validation-custody boundary.
 Repeated unchanged wedge or permission-stall escalations eventually add `demand-deep-inspection` to the wake reason so they are not mistaken for another routine validation wait.
 `docs/architecture.md` ("Event-driven supervision") owns the general classification mechanism and shared classifier library, while `docs/permission-stall-detection.md` owns permission-prompt matching and the macOS timeout heuristic; while `state/.afk` exists the daemon owns triage and the watcher surfaces every wake to it.
@@ -688,7 +690,7 @@ This exception is narrow: ordinary crewmates still trip stale detection when the
 
 **Watcher liveness is guarded, not just disciplined.**
 Resuming the emitted supervision protocol is the last action of every wake-handling turn - but the protocol no longer relies on remembering that.
-The supervision scripts and `bin/fm-wake-drain.sh` call `bin/fm-guard.sh`, which prints a prominent bordered banner when tasks are in flight but queued wakes are pending or the watcher's liveness beacon is missing or stale; `docs/architecture.md` ("Event-driven supervision") owns the beacon and grace mechanics.
+The supervision scripts and `bin/fm-wake-drain.sh` call `bin/fm-guard.sh`, which prints a prominent bordered banner when tasks are in flight but queued wakes are pending, the exact recorded watcher process is down, its beacon is stale, or that process proof is indeterminate; `docs/architecture.md` ("Event-driven supervision") owns the process, beacon, intentional-handoff, and grace mechanics.
 The banner is only a supervision warning: the supervision guard itself does not cancel the requested operation.
 `fm-send` may still refuse at a later target, identity, or Herdr composer safety check, so its continuation banner is not a delivery confirmation.
 If a guard warning says queued wakes are pending, drain them before doing anything else.

@@ -28,13 +28,12 @@
 # Four branches, one per row of the truth table, driven through a REAL fm-watch.sh:
 #   live-idle paused           run-step `parked`, pane alive and idle -> ABSORB
 #   dead paused                pane gone, verdict `unknown`           -> ABSORB
-#   paused + OPEN decision     an unanswered question                 -> SURFACE
+#   paused + OPEN decision     an unanswered question                 -> CAPTAIN-OWED
 #   paused + CLOSED decision   opened then resolved (the c8 shape)    -> ABSORB
 #
-# The third row is the safety boundary and the reason this is not simply "absorb
-# every pause": a lane with an unanswered captain question must never go quiet, so
-# the open/resolved fold (status_open_decisions) gates absorption independently of
-# the pause verb. Run this file on demand to reproduce the incident.
+# The third row is a distinct bounded state: it does not wedge-escalate, but it
+# re-surfaces on the pause cadence with an explicit captain-decision-owed label.
+# Run this file on demand to reproduce the incident.
 set -u
 
 # shellcheck source=tests/wake-helpers.sh
@@ -81,6 +80,8 @@ wait_live() {
 # absorbed on an earlier poll would carry. Used to prove the cached verdict cannot
 # outlive the status stream it was proven from.
 PRESEED_PAUSED=0
+PAUSE_RESURFACE_OVERRIDE=999999
+BACKDATE_PAUSE_STATUS=0
 run_pause_case() {  # <case-name> <status-stream> <crew-state-verdict>
   local name=$1 stream=$2 verdict=$3
   local dir state fakebin out capture window key pane_hash sig pid
@@ -90,6 +91,7 @@ run_pause_case() {  # <case-name> <status-stream> <crew-state-verdict>
   printf 'idle at the composer' > "$capture"
   printf 'window=%s\nkind=ship\n' "$window" > "$state/$name.meta"
   printf '%s' "$stream" > "$state/$name.status"
+  [ "$BACKDATE_PAUSE_STATUS" != 1 ] || touch -t 202001010000 "$state/$name.status"
   sig=$(seen_sig "$state/$name.status"); printf '%s' "$sig" > "$state/.seen-${name}_status"
   key=$(printf '%s' "$window" | tr ':/.' '___')
   pane_hash=$(hash_text "idle at the composer")
@@ -104,7 +106,7 @@ run_pause_case() {  # <case-name> <status-stream> <crew-state-verdict>
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
-    FM_FAKE_CREW_STATE="$verdict" FM_PAUSE_RESURFACE_SECS=999999 \
+    FM_FAKE_CREW_STATE="$verdict" FM_PAUSE_RESURFACE_SECS="$PAUSE_RESURFACE_OVERRIDE" \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
     "$WATCH" > "$out" &
   pid=$!
@@ -114,6 +116,7 @@ run_pause_case() {  # <case-name> <status-stream> <crew-state-verdict>
   # Cross-check the outcome against the durable artifacts triage leaves behind, so a
   # case can never pass on liveness timing alone.
   PAUSE_FLAG=absent; [ -e "$state/.paused-$key" ] && PAUSE_FLAG=present
+  PAUSE_CLASS=$(cat "$state/.paused-$key" 2>/dev/null || true)
   WAKE_QUEUE=$(cat "$state/.wake-queue" 2>/dev/null || true)
   WATCH_OUT=$(cat "$out" 2>/dev/null || true)
 }
@@ -155,22 +158,38 @@ test_dead_paused_pane_absorbed() {
 }
 
 # --- branch 3: paused with an OPEN decision --------------------------------------
-# The safety boundary. The pause verb is the LAST line, so a last-line read alone
-# says "absorb"; only the durable open/resolved fold sees the still-unanswered
-# question underneath it. That lane must keep surfacing.
-test_paused_with_open_decision_surfaced() {
+# The pause verb is the last line, but the whole-stream fold retains the still-open
+# question as `captain-owed`. It idles without wedge alarms and re-surfaces on the
+# bounded wait cadence under that explicit label.
+test_paused_with_open_decision_is_captain_owed() {
   run_pause_case paused-open-decision \
     'needs-decision [key=rollback-empty-pointer]: merge as-is, or fix the empty-pointer refusal here?
 paused: standing by for the decision on the rollback gap
 ' \
     'state: unknown · source: none · backend target gone: test:fm-paused-open-decision'
-  [ "$TRIAGE" = surfaced ] \
-    || fail "a pause masking an UNANSWERED decision was absorbed and went quiet"
-  [ "$PAUSE_FLAG" = absent ] \
-    || fail "a pause masking an unanswered decision was flagged .paused-<key>"
-  printf '%s' "$WAKE_QUEUE" | grep -q 'stale' \
-    || fail "a pause masking an unanswered decision did not enqueue a stale wake: $WAKE_QUEUE"
-  pass "paused with an OPEN decision: an unanswered question still surfaces, pause verb notwithstanding"
+  [ "$TRIAGE" = absorbed ] \
+    || fail "a deliberate captain-decision wait was surfaced as a suspected wedge: $WATCH_OUT"
+  [ "$PAUSE_FLAG" = present ] \
+    || fail "a captain-decision wait never entered bounded wait tracking"
+  [ "$PAUSE_CLASS" = captain-owed ] \
+    || fail "an open decision plus pause collapsed to '$PAUSE_CLASS' instead of captain-owed"
+  [ -z "$WAKE_QUEUE" ] || fail "fresh captain-owed wait enqueued an immediate wedge wake: $WAKE_QUEUE"
+
+  PAUSE_RESURFACE_OVERRIDE=1
+  BACKDATE_PAUSE_STATUS=1
+  run_pause_case paused-open-decision-recheck \
+    'needs-decision [key=rollback-empty-pointer]: merge as-is, or fix the empty-pointer refusal here?
+paused: standing by for the decision on the rollback gap
+' \
+    'state: unknown · source: none · backend target gone: test:fm-paused-open-decision-recheck'
+  PAUSE_RESURFACE_OVERRIDE=999999
+  BACKDATE_PAUSE_STATUS=0
+  [ "$TRIAGE" = surfaced ] || fail "captain-owed wait did not re-surface on its bounded cadence: class=$PAUSE_CLASS queue=$WAKE_QUEUE out=$WATCH_OUT"
+  printf '%s' "$WAKE_QUEUE" | grep -q 'captain decision still owed' \
+    || fail "captain-owed recheck was not labelled distinctly: $WAKE_QUEUE"
+  printf '%s' "$WAKE_QUEUE" | grep -q 'possible wedge' \
+    && fail "captain-owed recheck was mislabeled as a wedge: $WAKE_QUEUE"
+  pass "paused with an OPEN decision: bounded captain-owed cadence, never a stall"
 }
 
 # --- branch 4: paused with a CLOSED decision -------------------------------------
@@ -235,17 +254,20 @@ test_crew_absorb_class_pause_matrix() {
   [ "$(crew_absorb_class a)" = paused ] \
     || fail "the declared pause was not read from the status stream when unspecified"
 
-  # An open keyed decision blocks absorption on every verdict.
+  # An open keyed decision becomes the distinct captain-owed wait under every
+  # lingering verdict, including an active run record.
   printf 'needs-decision [key=api-shape]: which shape?\n%s\n' "$paused" > "$state/a.status"
   for v in 'state: parked · source: run-step · parked at ci: 1 finding(s)' \
+           'state: working · source: run-step · ci monitor active' \
            'state: unknown · source: none · backend target gone' \
            'state: done · source: run-step · run passed: PR merged (verified)' \
            'state: paused · source: status-log · waiting on the merge'; do
     FM_FAKE_CREW_STATE="$v"
-    [ "$(crew_absorb_class a "$paused")" = none ] \
-      || fail "an OPEN decision failed to block absorption under verdict [$v]"
+    [ "$(crew_absorb_class a "$paused")" = captain-owed ] \
+      || fail "an OPEN decision did not become captain-owed under verdict [$v]"
+    crew_is_captain_owed a || fail "crew_is_captain_owed disagreed under verdict [$v]"
   done
-  # ...and stops blocking once it is explicitly resolved.
+  # ...and becomes an ordinary pause once explicitly resolved.
   printf 'needs-decision [key=api-shape]: which shape?\nresolved [key=api-shape]: option (a)\n%s\n' "$paused" > "$state/a.status"
   FM_FAKE_CREW_STATE='state: parked · source: run-step · parked at ci: 1 finding(s)'
   [ "$(crew_absorb_class a "$paused")" = paused ] \
@@ -265,7 +287,7 @@ test_crew_absorb_class_pause_matrix() {
   [ "$(crew_absorb_class "")" = none ] || fail "empty id not classed none"
 
   unset FM_FAKE_CREW_STATE FM_STATE_OVERRIDE
-  pass "crew_absorb_class: a declared pause outranks every verdict but working, and an open decision blocks it"
+  pass "crew_absorb_class: working, paused, captain-owed, and indeterminate remain distinct"
 }
 
 # --- a cached pause verdict cannot outlive the stream it was proven from ----------
@@ -284,10 +306,11 @@ paused: standing by for the decision on the rollback gap
 ' \
     'state: unknown · source: none · backend target gone: test:fm-cached-pause-stale-proof'
   PRESEED_PAUSED=0
-  [ "$TRIAGE" = surfaced ] \
-    || fail "a decision opened after the pause flag rode out the cache window and went quiet"
-  printf '%s' "$WAKE_QUEUE" | grep -q 'stale' \
-    || fail "the re-proven pause did not enqueue a stale wake: $WAKE_QUEUE"
+  [ "$TRIAGE" = absorbed ] \
+    || fail "a decision opened after the pause flag was treated as a suspected wedge"
+  [ "$PAUSE_CLASS" = captain-owed ] \
+    || fail "the stale cached pause was not re-proven as captain-owed after the stream changed"
+  [ -z "$WAKE_QUEUE" ] || fail "fresh re-proven captain-owed wait enqueued a wedge wake: $WAKE_QUEUE"
   pass "a cached pause verdict is re-proven whenever the status stream changes under it"
 }
 
@@ -307,7 +330,7 @@ test_pause_moving_during_pipeline_read_refused() {
 
 test_live_idle_paused_pane_absorbed
 test_dead_paused_pane_absorbed
-test_paused_with_open_decision_surfaced
+test_paused_with_open_decision_is_captain_owed
 test_paused_with_closed_decision_absorbed
 test_cached_pause_verdict_reproven_when_stream_changes
 test_pause_moving_during_pipeline_read_refused

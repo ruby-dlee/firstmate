@@ -35,9 +35,9 @@
 #      on checks" from "checks green, waiting on merge" (see nm_ci_checks_state),
 #      so a ci-step log-tail marker supplies the ready claim before the same
 #      remote-currentness checks decide whether it is done.
-#      A narrow orphan-record fallback reports a declared pause only when a
-#      checks-green report immediately precedes it, the ci log has no newer state,
-#      and the liveness probe specifically cannot find that run's worktree.
+#      A narrow held-PR fallback reports the declared pause when a checks-green
+#      report immediately precedes it and the ci log cannot determine whether the
+#      still-running monitor re-armed; missing worktree state is extra context.
 #   3. Reconcile the status log: if its last line says needs-decision/blocked but
 #      the run-step shows the run moved on, the log is deterministically stale and
 #      is flagged superseded. A genuinely parked run plus a needs-decision log
@@ -856,18 +856,25 @@ if [ "$HAVE_RUN" = 1 ]; then
     fi
   fi
 
-  # An orphaned ci row is not positive working evidence forever. This fallback is
-  # intentionally conjunctive: the durable ready report must immediately precede
-  # the current declared pause, the ci log must be unreadable rather than showing a
-  # re-arm/fix, and the bounded liveness probe must specifically find no worktree
-  # for this run. The unreadable probe is corroboration only. On its own, or beside
-  # any positive working evidence, ordinary run-step precedence remains unchanged.
+  # A ci,running row is not positive working evidence forever. No-mistakes keeps
+  # that row active while an already-green PR waits for merge, and the ci monitor
+  # itself has no worktree process, so an "alive" process probe cannot settle the
+  # question. When a checks-green report immediately precedes a declared hold and
+  # the ci log cannot say whether checks were re-armed, preserve both truths:
+  # the work is deliberately paused, while current monitor custody could not be
+  # determined. This routes the lane to the bounded pause recheck instead of a
+  # false wedge, without allowing an older ready line or a readable not-ready/fix
+  # marker to hide genuinely resumed validation.
   if [ "$RUN_STATE" = working ] && [ "$RUN_SOURCE" = full ] \
      && [ "$CI_STEP_STATUS" = running ] && [ "$CI_LOG_STATE" = unknown ] \
-     && log_reports_ci_ready_immediately_before_pause \
-     && nm_ci_record_has_no_worktree; then
+     && log_reports_ci_ready_immediately_before_pause; then
+    if nm_ci_record_has_no_worktree; then
+      RUN_DETAIL="orphaned ci run record has no worktree"
+    else
+      RUN_DETAIL="ci monitor remains active"
+    fi
     emit paused status-log \
-      "$(status_line_note "$LOG_LINE")${SEP}reported checks green immediately before pause${SEP}orphaned ci run record has no worktree"
+      "$(status_line_note "$LOG_LINE")${SEP}reported checks green immediately before pause${SEP}current ci monitor state could not be determined${SEP}$RUN_DETAIL"
   fi
 
   if [ "$RUN_STATE" = "done" ] && [ "$READY_CLAIM" = 1 ]; then

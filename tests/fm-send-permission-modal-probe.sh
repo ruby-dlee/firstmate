@@ -39,6 +39,20 @@ send_to_stub() {
     PATH="$FAKEBIN:$PATH" "$SEND" "$TARGET" "$MESSAGE"
 }
 
+stub stub-init cursor
+send_to_stub >/dev/null 2>"$TMP_ROOT/cursor.err" \
+  || fail "reverse-cursor empty composer did not submit: $(cat "$TMP_ROOT/cursor.err")"
+CURSOR=$(stub stub-snapshot)
+jq -e --arg message "$MESSAGE" '
+  .approved == false
+  and .turn_started == true
+  and ([.events[] | select(.event == "text" and .value == $message)] | length == 1)
+  and ([.events[] | select(.event == "key" and .value == "enter")] | length == 1)
+' >/dev/null <<<"$CURSOR" \
+  || fail "reverse-cursor composer did not receive one safe send: $CURSOR"
+printf 'cursor-events=%s\n' "$CURSOR"
+pass "permission TUI: Pi reverse-video cursor-only composer is reachable when native agent state proves idle"
+
 stub stub-init composer
 send_to_stub >/dev/null 2>"$TMP_ROOT/composer.err" \
   || fail "empty-composer control did not submit: $(cat "$TMP_ROOT/composer.err")"

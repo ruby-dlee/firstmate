@@ -62,6 +62,9 @@ The `attached` reading is stamped with the clock time it was taken for the same 
 Without that closure the arm exited zero and silent when its peer died, leaving `attached pid=<N>` as the caller's final word for a watcher that no longer existed - a fleet nobody was watching, read as healthy.
 Its `--restart` mode signals only the watcher recorded in the current home's `state/.watch.lock`, so restarting one home cannot kill sibling secondmate watchers.
 A pull-based guard (`bin/fm-guard.sh`) warns through supervision tool output if the primary checkout is tangled, or if tasks are in flight and that watcher stops running or queued wakes are waiting to be drained.
+Watcher health requires the exact identity-matched lock process plus a fresh beacon, so a killed writer is down immediately even while its beacon mtime remains inside the grace window.
+The shared proof preserves `healthy`, `down`, and `unknown`; malformed or unreadable process evidence surfaces as "could not determine" rather than being collapsed into either health or death.
+An actionable watcher exit writes `state/.watcher-handoff`, which suppresses only the pull guard's expected short handoff alarm; every new watcher removes that marker before its first beat, so an externally killed process has no stale-healthy carve-out.
 The drain script calls that guard after emptying the queue, which avoids repeating the queued-wakes warning for records it just consumed while still warning on stale watcher liveness.
 It leads with prominent bordered banners for the tangle and no-watcher cases so they cannot be skimmed past.
 On every verified primary harness, tracked hook integration gives the primary session a push-based backstop: when work is in flight and no identity-matched watcher lock with a fresh beacon is live, direct Stop hooks block and passive turn-end hooks force one bounded follow-up.
@@ -70,6 +73,7 @@ The guard covers the main primary and genuinely marked secondmate homes, exempts
 A presence-gated sub-supervisor (`bin/fm-supervise-daemon.sh`) extends this for walk-away supervision: the `/afk` skill starts it through the tracked foreground helper `bin/fm-afk-start.sh`, after which the watcher reverts to daemon-managed one-shot mode and the daemon self-handles routine wakes in bash.
 The watcher and daemon share `bin/fm-classify-lib.sh` for captain-relevant status verbs, declared-external-wait vocabulary, and status-scan primitives.
 The always-on watcher also uses that library's absorb classification on no-verb signals and first-sighting stale panes before status-log terminality is trusted, while the daemon maintains distinct wedge and declared-pause recheck cadences.
+A pause over an unresolved keyed decision is retained as `captain-owed`, not hidden by the later pause event and not mislabeled a wedge; both supervisors re-surface it on the bounded pause cadence under that explicit label.
 The daemon escalates captain-relevant events, plus a bounded recheck for a declared pause that remains idle, as one batched, single-line digest.
 On a native background-notify harness such as Claude, the daemon itself is the tracked background task and completes with an `afk-reap-wake:` reason when a batch becomes due.
 That native completion path never reads or types into the primary pane, and `state/.wake-queue` remains the lossless backlog the woken LLM drains before restarting the away daemon.

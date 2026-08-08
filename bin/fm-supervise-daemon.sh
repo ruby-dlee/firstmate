@@ -400,12 +400,14 @@ classify_stale() {  # <window> <state>
   esac
   last=$(last_status_line "$state/$task.status")
   if [ -n "$last" ] && status_is_paused "$last"; then
-    # A DECLARED external-wait pause (fm-classify-lib.sh): an idle pane is EXPECTED,
-    # so this is not a wedge. The caller records a pause marker (long re-surface
-    # cadence in housekeeping) rather than a wedge stale marker. Cheap: reuses the
-    # status line already read, no fm-crew-state.sh call, mirroring the daemon's
-    # existing status-log classification.
-    printf 'pause|paused (awaiting external), rechecked on a long cadence: %s' "$last"
+    # A DECLARED wait is expected to idle, not wedge. Preserve an earlier open
+    # decision as the distinct captain-owed state instead of letting the later
+    # pause line hide it or mislabeling the stopped pane as a stall.
+    if [ -n "$(status_open_decisions "$state/$task.status")" ]; then
+      printf 'pause|paused (captain decision still owed), rechecked on a long cadence: %s' "$last"
+    else
+      printf 'pause|paused (awaiting external), rechecked on a long cadence: %s' "$last"
+    fi
     return
   fi
   if [ -n "$last" ] && status_is_captain_relevant "$last"; then
@@ -1079,7 +1081,11 @@ housekeeping() {  # <state>
       *)
         last=$(last_status_line "$state/$task.status")
         if [ -n "$last" ] && status_is_paused "$last"; then
-          escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
+          if [ -n "$(status_open_decisions "$state/$task.status")" ]; then
+            escalate_add "$state" "paused ${age}s (captain decision still owed, recheck whether the decision is still pending): $win"
+          else
+            escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
+          fi
           _now > "$marker"
         else
           rm -f "$marker"

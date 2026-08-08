@@ -26,7 +26,7 @@ def write_state(state: dict[str, Any]) -> None:
 
 
 def initialize(mode: str) -> None:
-    if mode not in {"composer", "malformed", "modal", "pending", "unreadable"}:
+    if mode not in {"composer", "cursor", "malformed", "modal", "pending", "unreadable"}:
         raise SystemExit(f"unsupported stub mode: {mode}")
     composer_text = "existing unsent input" if mode == "pending" else ""
     stored_mode = "composer" if mode == "pending" else mode
@@ -61,6 +61,8 @@ def render(state: dict[str, Any]) -> str:
         )
     if state["mode"] == "malformed":
         return "corrupted screen without a recognizable composer row"
+    if state["mode"] == "cursor" and not state["composer_text"]:
+        return "\x1b[7m \x1b[27m"
     text = state["composer_text"]
     return f"› {text}" if text else "›"
 

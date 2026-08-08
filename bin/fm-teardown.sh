@@ -1331,23 +1331,52 @@ pr_is_merged() {
 # Is the branch's content already present in the up-to-date default branch?
 # Origin-backed proof holds the common checkout lock across probe, fetch,
 # unchanged branch-and-tip re-probe, and both direct and PR-corroborated checks.
+#
+# git merge-tree uses exit 1 for a semantic conflict, but wrappers and execution
+# failures can also return 1. A real conflict still materializes a valid result
+# tree as the first output line. Require that object before issuing a content
+# verdict; otherwise this check reports the distinct operational state instead
+# of manufacturing "conflicts" from a proof that did not run.
+CONTENT_MATCHES_REF_REASON=
 content_matches_ref() {
-  local ref=$1 default_tree merged_output merged_tree status
-  default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
-  [ -n "$default_tree" ] || return 1
-  if merged_output=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null); then
+  local ref=$1 default_tree merged_output merged_tree status detail
+  CONTENT_MATCHES_REF_REASON=
+  default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || {
+    echo "teardown: cannot inspect the authoritative tree for $ref; retaining $WT" >&2
+    return 1
+  }
+  [ -n "$default_tree" ] || {
+    echo "teardown: authoritative tree for $ref is empty or unreadable; retaining $WT" >&2
+    return 1
+  }
+  if merged_output=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>&1); then
     status=0
   else
     status=$?
   fi
+  merged_tree=$(printf '%s\n' "$merged_output" | sed -n '1p')
   if [ "$status" -eq 1 ]; then
-    echo "teardown: task content conflicts with authoritative $ref; retaining $WT" >&2
-    return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+    if printf '%s\n' "$merged_tree" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' \
+        && git -C "$WT" cat-file -e "$merged_tree^{tree}" 2>/dev/null; then
+      CONTENT_MATCHES_REF_REASON=conflict
+      return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+    fi
+    detail=$(printf '%s\n' "$merged_output" | sed -n '1s/[[:space:]]\{1,\}/ /g;1p')
+    echo "teardown: could not execute the content comparison against authoritative $ref (git merge-tree exit 1${detail:+: $detail}); retaining $WT" >&2
+    return 1
   fi
-  [ "$status" -eq 0 ] || return "$status"
-  merged_tree=$(printf '%s\n' "$merged_output" | head -1)
+  if [ "$status" -ne 0 ]; then
+    detail=$(printf '%s\n' "$merged_output" | sed -n '1s/[[:space:]]\{1,\}/ /g;1p')
+    echo "teardown: could not execute the content comparison against authoritative $ref (git merge-tree exit $status${detail:+: $detail}); retaining $WT" >&2
+    return "$status"
+  fi
+  if ! printf '%s\n' "$merged_tree" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' \
+      || ! git -C "$WT" cat-file -e "$merged_tree^{tree}" 2>/dev/null; then
+    echo "teardown: content comparison against authoritative $ref returned no verifiable tree; retaining $WT" >&2
+    return 1
+  fi
   if [ "$merged_tree" != "$default_tree" ]; then
-    echo "teardown: task content is not present in authoritative $ref; retaining $WT" >&2
+    CONTENT_MATCHES_REF_REASON=not-present
     return "$TEARDOWN_REAP_SAFETY_REFUSAL"
   fi
   return 0
@@ -1400,11 +1429,31 @@ content_in_origin_default() {
   fi
   [ "$content_status" -eq "$TEARDOWN_REAP_SAFETY_REFUSAL" ] \
     || return "$content_status"
-  pr_is_merged "$branch" "$ref"
+  local direct_reason=$CONTENT_MATCHES_REF_REASON direct_detail pr_status
+  if pr_is_merged "$branch" "$ref"; then
+    return 0
+  else
+    pr_status=$?
+  fi
+  if [ "$pr_status" -eq "$TEARDOWN_REAP_SAFETY_REFUSAL" ]; then
+    case "$direct_reason" in
+      conflict) echo "teardown: task content conflicts with authoritative $ref; retaining $WT" >&2 ;;
+      not-present) echo "teardown: task content is not present in authoritative $ref; retaining $WT" >&2 ;;
+      *) echo "teardown: task content is not provably present in authoritative $ref; retaining $WT" >&2 ;;
+    esac
+    return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  fi
+  case "$direct_reason" in
+    conflict) direct_detail="the direct tree comparison conflicted" ;;
+    not-present) direct_detail="the direct tree comparison did not match" ;;
+    *) direct_detail="the direct tree comparison was inconclusive" ;;
+  esac
+  echo "teardown: landing proof could not determine whether work landed: $direct_detail, and PR corroboration could not execute; retry after restoring Git/GitHub access; retaining $WT" >&2
+  return "$pr_status"
 }
 
 content_in_default() {
-  local branch=$1 name ref
+  local branch=$1 name ref content_status
   if git -C "$WT" remote get-url origin >/dev/null 2>&1; then
     fm_checkout_lock_run \
       "$WT" "$CHECKOUT_LOCK_ROOT" content_in_origin_default "$branch"
@@ -1416,7 +1465,19 @@ content_in_default() {
   else
     return 1
   fi
-  content_matches_ref "$ref"
+  if content_matches_ref "$ref"; then
+    return 0
+  else
+    content_status=$?
+  fi
+  if [ "$content_status" -eq "$TEARDOWN_REAP_SAFETY_REFUSAL" ]; then
+    case "$CONTENT_MATCHES_REF_REASON" in
+      conflict) echo "teardown: task content conflicts with authoritative $ref; retaining $WT" >&2 ;;
+      not-present) echo "teardown: task content is not present in authoritative $ref; retaining $WT" >&2 ;;
+      *) echo "teardown: task content is not provably present in authoritative $ref; retaining $WT" >&2 ;;
+    esac
+  fi
+  return "$content_status"
 }
 
 # Has the worktree's committed work actually LANDED, though its commits are not

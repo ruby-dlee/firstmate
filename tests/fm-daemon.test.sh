@@ -209,6 +209,22 @@ test_stale_paused_classifies_pause() {
   pass "paused reasons with captain phrases remain pause-classified"
 }
 
+test_stale_paused_open_decision_classifies_captain_owed() {
+  local dir state out
+  dir=$(make_supercase stale-captain-owed)
+  state="$dir/state"
+  cat > "$state/held-captain.status" <<'EOF'
+needs-decision [key=rollout]: approve the production rollout?
+paused: standing by for the rollout decision
+EOF
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-held-captain" "$state")
+  case "$out" in pause\|*"captain decision still owed"*) ;;
+    *) fail "open decision plus pause did not classify captain-owed: $out" ;;
+  esac
+  case "$out" in *"possible wedge"*) fail "captain-owed wait was mislabeled a wedge: $out" ;; esac
+  pass "away-mode stale classification preserves captain-owed as a distinct wait"
+}
+
 # handle_wake on a paused stale records a pause marker, drops any pre-existing wedge
 # marker (so a working->paused pane is not still wedge-aged), and does NOT escalate
 # on the wake itself - the recheck is housekeeping's job on the long cadence.
@@ -336,6 +352,27 @@ test_housekeeping_paused_resurfaces_and_resets() {
   age=$(( $(date +%s) - $(cat "$state/.subsuper-paused-$key" 2>/dev/null || echo 0) ))
   [ "$age" -lt 60 ] || fail "pause marker was not reset to now on re-surface (age ${age}s)"
   pass "housekeeping re-surfaces a stale declared pause on the long cadence and resets its window"
+}
+
+test_housekeeping_captain_owed_resurfaces_distinctly() {
+  local dir state fakebin win pane key
+  dir=$(make_supercase captain-owed-resurface)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  win="sess:fm-held-captain"; pane="$dir/pane.txt"
+  cat > "$state/held-captain.status" <<'EOF'
+needs-decision [key=rollout]: approve the production rollout?
+paused: standing by for the rollout decision
+EOF
+  printf 'idle prompt $\n' > "$pane"
+  key=$(printf '%s' "held-captain" | tr ':/.' '___')
+  echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
+  grep -F "captain decision still owed" "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    || fail "captain-owed wait did not re-surface under its distinct label"
+  grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null 2>&1 \
+    && fail "captain-owed away-mode recheck was mislabeled a wedge"
+  pass "away-mode housekeeping re-surfaces captain-owed waits distinctly"
 }
 
 # A pause whose pane became busy again (the crewmate resumed) drops its marker without
@@ -1731,6 +1768,7 @@ test_liveness_verdicts_surface_through_away_classifiers
 test_stale_transient_self_records_marker
 test_stale_terminal_escalates
 test_stale_paused_classifies_pause
+test_stale_paused_open_decision_classifies_captain_owed
 test_handle_wake_paused_records_pause_marker
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking
@@ -1740,6 +1778,7 @@ test_housekeeping_seeds_pause_marker_from_status
 test_housekeeping_persistent_stale_escalates
 test_housekeeping_resumed_stale_cleared
 test_housekeeping_paused_resurfaces_and_resets
+test_housekeeping_captain_owed_resurfaces_distinctly
 test_housekeeping_paused_resumed_cleared
 test_housekeeping_paused_unpaused_cleared
 test_housekeeping_stale_marker_transitions_to_pause

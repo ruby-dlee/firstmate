@@ -328,36 +328,39 @@ _fm_status_file_for() {  # <id>
   printf '%s/%s.status' "$state" "$id"
 }
 
-# 0 if <id> carries a DECLARED external wait that is safe to absorb on the pause
-# cadence. Two independent proofs are required, and BOTH come from the crewmate's own
-# durable status stream rather than from anything about its terminal:
+# Classify a durable declared wait without collapsing an unanswered decision into
+# either ordinary pause or wedge. Prints exactly one token:
+#   paused       - deliberate external wait, no captain decision outstanding
+#   captain-owed - deliberate wait whose keyed decision fold remains open
+#   none         - the stream is absent, moving, malformed, or does not end paused
 #
-#   1. the stream's current line declares a pause (status_is_paused), which already
-#      rejects a FAILURE reported under the pause verb (status_pause_is_failure), and
-#   2. the keyed open/resolved fold (status_open_decisions) is empty, so no question
-#      is still unanswered underneath that pause.
-#
-# (2) is the safety boundary and is not redundant with (1): the status stream is an
-# append-only EVENT log, so a later `paused:` line MASKS an earlier still-open
-# needs-decision from any last-line read. A lane with an unanswered question must
-# never go quiet, so the fold - not the last line - decides.
-#
-# Fails closed in both directions. An id with no locatable status file cannot be
-# proven either way, so it is refused rather than absorbed: absence of a signal is
-# never evidence of a pause.
-crew_declared_pause_absorbable() {  # <id> [declared-pause-status-line]
-  local id=$1 declared=${2:-} f snapshot current before after
+# Both pause outcomes use bounded recheck cadence, but captain-owed is labelled and
+# periodically resurfaced as an unanswered decision rather than hidden or called a
+# stall. The whole stream is snapshotted between signatures so a moving proof is
+# `none`, never a stale optimistic classification.
+crew_declared_pause_class() {  # <id> [declared-pause-status-line]
+  local id=$1 declared=${2:-} f snapshot current before after open result
   f=$(_fm_status_file_for "$id")
-  [ -n "$f" ] || return 1
+  [ -n "$f" ] || { printf 'none'; return; }
   before=$(_fm_status_file_sig "$f")
-  [ -n "$before" ] || return 1
-  snapshot=$(cat "$f" 2>/dev/null) || return 1
+  [ -n "$before" ] || { printf 'none'; return; }
+  snapshot=$(cat "$f" 2>/dev/null) || { printf 'none'; return; }
   current=$(printf '%s\n' "$snapshot" | grep -v '^[[:space:]]*$' | tail -1)
-  [ -z "$declared" ] || [ "$declared" = "$current" ] || return 1
-  status_is_paused "$current" || return 1
-  [ -z "$(printf '%s\n' "$snapshot" | _fm_status_open_decisions_stream)" ] || return 1
+  [ -z "$declared" ] || [ "$declared" = "$current" ] \
+    || { printf 'none'; return; }
+  status_is_paused "$current" || { printf 'none'; return; }
+  open=$(printf '%s\n' "$snapshot" | _fm_status_open_decisions_stream)
+  if [ -n "$open" ]; then result=captain-owed; else result=paused; fi
   after=$(_fm_status_file_sig "$f")
-  [ -n "$after" ] && [ "$before" = "$after" ]
+  [ -n "$after" ] && [ "$before" = "$after" ] \
+    || { printf 'none'; return; }
+  printf '%s' "$result"
+}
+
+# Backward-compatible predicate for callers that specifically require an ordinary
+# external wait with no captain decision outstanding.
+crew_declared_pause_absorbable() {  # <id> [declared-pause-status-line]
+  [ "$(crew_declared_pause_class "$@")" = paused ]
 }
 
 _fm_status_file_sig() {
@@ -370,12 +373,10 @@ _fm_status_file_sig() {
 
 # Classify WHY an idle/stale crewmate MIGHT be safely absorbed instead of surfaced.
 # Prints exactly one token:
-#   working - an actively-running no-mistakes step (running/fixing/ci) or a busy
-#             pane; the crewmate is legitimately mid-work on a static-looking pane
-#             (e.g. waiting on CI);
-#   paused  - the crewmate declared an external wait and nothing is outstanding
-#             (crew_declared_pause_absorbable), so its pane is EXPECTED to idle;
-#   none    - neither, so the wake must surface.
+#   working      - an actively-running no-mistakes step or a busy pane;
+#   paused       - the crewmate declared an external wait with no open decision;
+#   captain-owed - the pause is real and a keyed captain decision remains open;
+#   none         - none of those states could be proved, so the wake must surface.
 #
 # PRECEDENCE, and why it is this way round. bin/fm-crew-state.sh's authoritative
 # verdict ("state: <s> · source: <src> · <detail>") answers "what is the PIPELINE
@@ -469,9 +470,17 @@ scan_crew_liveness_observations() {  # <state-dir>
 }
 
 crew_absorb_class() {  # <id> [declared-pause-status-line]
-  local id=$1 declared_pause=${2:-} line state src liveness
+  local id=$1 declared_pause=${2:-} line state src liveness pause_class
   [ -n "$id" ] || { printf 'none'; return; }
   line=$(crew_state_line "$id")
+  pause_class=$(crew_declared_pause_class "$id" "$declared_pause")
+  # An explicitly open captain decision plus a current pause is its own state.
+  # It outranks a lingering run record because waiting for that decision is the
+  # durable reason the lane stopped; bounded captain-owed rechecks keep it visible.
+  if [ "$pause_class" = captain-owed ]; then
+    printf 'captain-owed'
+    return
+  fi
   case "$line" in
     state:*)
       state=${line#state: }; state=${state%% *}
@@ -486,7 +495,7 @@ crew_absorb_class() {  # <id> [declared-pause-status-line]
   esac
   # An unreadable verdict falls through here too: it is not evidence against a pause
   # the crewmate durably declared, and it is exactly what a torn-down pane produces.
-  if crew_declared_pause_absorbable "$id" "$declared_pause"; then
+  if [ "$pause_class" = paused ]; then
     printf 'paused'
     return
   fi
@@ -510,16 +519,20 @@ crew_is_provably_working() {  # <id>
   esac
 }
 
-# 0 if crewmate <id> is in a declared external-wait pause with nothing outstanding.
-# The stale path absorbs such a crewmate (on a long re-surface cadence) instead of
-# escalating a possible wedge. See crew_absorb_class for the precedence and
-# crew_declared_pause_absorbable for the two proofs a pause must satisfy.
+# 0 if crewmate <id> is in a declared external-wait pause with no open decision.
 crew_is_paused() {  # <id>
-  # This predicate needs only pause-or-not; dead and unknown arrive as `none`
-  # and stay distinct from the one absorbable paused outcome.
   case "$(crew_absorb_class "$1")" in
     paused) return 0 ;;
-    working|none) return 1 ;;
+    working|captain-owed|none) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 0 if crewmate <id> is deliberately waiting on a still-open captain decision.
+crew_is_captain_owed() {  # <id>
+  case "$(crew_absorb_class "$1")" in
+    captain-owed) return 0 ;;
+    working|paused|none) return 1 ;;
     *) return 1 ;;
   esac
 }

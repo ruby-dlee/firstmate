@@ -2867,6 +2867,22 @@ fm_backend_herdr_is_bare_prompt_row() {  # <plain-trimmed-row>
   esac
 }
 
+# Pi renders its empty composer as one reverse-video cursor cell with no prompt
+# glyph. Plain capture turns that cell into whitespace, which is not structural
+# proof by itself. Recognize only the styled cursor-only row here; the caller
+# still requires Herdr's native agent state to prove this is a registered idle
+# agent rather than a blank shell row.
+fm_backend_herdr_is_reverse_cursor_only_row() {  # <raw-ansi-row>
+  local raw=$1 plain trimmed esc
+  plain=$(printf '%s\n' "$raw" | fm_composer_strip_ansi)
+  [ -n "$plain" ] || return 1
+  trimmed="${plain#"${plain%%[![:space:]]*}"}"
+  trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+  [ -z "$trimmed" ] || return 1
+  esc=$(printf '\033')
+  printf '%s' "$raw" | LC_ALL=C grep -Eq "${esc}\\[([0-9;]*;)?7(;[0-9;]*)?m"
+}
+
 fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
   local target=$1 cap line trimmed found=0 shape="" raw_match="" bordered=0 stripped
   cap=$(fm_backend_herdr_capture_ansi "$target" "$FM_BACKEND_HERDR_COMPOSER_LINES" 2>/dev/null \
@@ -2879,7 +2895,14 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
     trimmed=$(fm_backend_herdr_strip_ansi "$line")
     trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
     trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
-    [ -n "$trimmed" ] || continue
+    if [ -z "$trimmed" ]; then
+      if fm_backend_herdr_is_reverse_cursor_only_row "$line"; then
+        shape=cursor
+        raw_match=$line
+        found=1
+      fi
+      continue
+    fi
     case "$trimmed" in
       '│'*'│'|'┃'*'┃'|'|'*'|')
         shape=bordered
@@ -2896,6 +2919,15 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
     esac
   done < <(printf '%s\n' "$cap")
   [ "$found" -eq 1 ] || { printf 'unknown'; return 0; }
+  if [ "$shape" = cursor ]; then
+    fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }
+    case "$(fm_backend_herdr_classify_agent_status \
+      "$(fm_backend_herdr_agent_status_raw "$FM_BACKEND_HERDR_SESSION" "$FM_BACKEND_HERDR_PANE")")" in
+      idle) printf 'empty' ;;
+      *) printf 'unknown' ;;
+    esac
+    return 0
+  fi
   # Content: extract the real typed text from the raw row with the shared,
   # fleet-wide ghost stripper (bin/fm-composer-lib.sh), which drops dim/faint AND
   # dark-truecolor ghost/placeholder runs. This replaces the former herdr-only

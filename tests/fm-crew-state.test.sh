@@ -766,10 +766,10 @@ EOF
   pass "a green held PR is paused when its lingering ci record has no worktree"
 }
 
-# The orphan discriminator is deliberately conjunctive. No ready report means
-# there is no proof that the work reached the CI-ready boundary, and a positive
-# process reading means the run really is active. Either one preserves working
-# precedence so the watcher's ordinary wedge timer still applies.
+# The held-PR discriminator is deliberately conjunctive. No immediately prior
+# ready report preserves working precedence. A ready report plus an unreadable ci
+# log preserves the work-level pause while naming monitor custody indeterminate;
+# a readable re-arm marker returns it to working.
 test_ci_pause_does_not_hide_a_real_active_run() {
   reset_fakes
   local d out
@@ -792,9 +792,18 @@ paused: stale declaration while validation is active again
 EOF
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$d/fakebin/fake-liveness" \
     FM_FAKE_LIVENESS_MODE=alive run_crew_state "$d" feat-ci-paused-real-work)
-  assert_contains "$out" "state: working" "a live run still outranks an old ready report and pause"
-  assert_not_contains "$out" "state: paused" "positive run liveness must not be silenced by a pause"
-  pass "a stale pause still leaves a genuinely active ci run on the wedge path"
+  assert_contains "$out" "state: paused" "held green PR remains work-level paused while ci custody is indeterminate"
+  assert_contains "$out" "current ci monitor state could not be determined" \
+    "held green PR omitted the honest unknown monitor state"
+  assert_contains "$out" "ci monitor remains active" \
+    "active monitor context was not preserved beside the pause"
+
+  FM_FAKE_CI_LOGS="CI checks running, waiting for results..."
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$d/fakebin/fake-liveness" \
+    FM_FAKE_LIVENESS_MODE=alive run_crew_state "$d" feat-ci-paused-real-work)
+  assert_contains "$out" "state: working" "readable CI re-arm must outrank an older green hold"
+  assert_not_contains "$out" "state: paused" "a readable not-ready marker must not be hidden by the pause"
+  pass "held CI distinguishes paused-with-unknown-custody from provably resumed validation"
 }
 
 # A status-log URL is an event-log detail, not evidence that it belongs to the

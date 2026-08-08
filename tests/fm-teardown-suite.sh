@@ -1324,6 +1324,8 @@ test_rebased_merge_queue_head_landed_on_default_allows() {
     "rebased-merge-queue: path inspection failure was not operational"
   assert_not_contains "$(cat "$case_dir/inspection-stderr")" 'could not be attributed' \
     "rebased-merge-queue: path inspection failure was mislabeled semantic"
+  assert_not_contains "$(cat "$case_dir/inspection-stderr")" 'task content conflicts with authoritative' \
+    "rebased-merge-queue: an inconclusive direct comparison leaked a content verdict before PR proof failed"
   assert_present "$case_dir/state/task-x1.meta" \
     "rebased-merge-queue: path inspection failure removed task bookkeeping"
 
@@ -1339,6 +1341,8 @@ test_rebased_merge_queue_head_landed_on_default_allows() {
     "rebased-merge-queue: blob inspection failure was not operational"
   assert_not_contains "$(cat "$case_dir/blob-stderr")" 'could not be attributed' \
     "rebased-merge-queue: blob inspection failure was mislabeled semantic"
+  assert_not_contains "$(cat "$case_dir/blob-stderr")" 'task content conflicts with authoritative' \
+    "rebased-merge-queue: a failed blob proof leaked a content verdict"
   assert_present "$case_dir/state/task-x1.meta" \
     "rebased-merge-queue: blob inspection failure removed task bookkeeping"
 
@@ -2895,7 +2899,34 @@ SH
   expect_code 1 "$rc" "failed landing fetch must remain operational"
   assert_grep 'landing proof could not execute' "$case_dir/stderr" \
     "landing machinery failure was not classified operationally"
-  pass "unlanded proof and landing machinery failure have distinct statuses"
+
+  case_dir=$(make_case reap-merge-tree-exit-one)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" feature.txt unlanded "unlanded task work"
+  rm -f "$case_dir/fakebin/.tmux-live"
+  cat > "$case_dir/fakebin/git" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *' merge-tree --write-tree '*)
+    echo 'fatal: unable to create temporary merge-tree state' >&2
+    exit 1
+    ;;
+esac
+exec "$REAL_GIT_FOR_TEST" "$@"
+SH
+  chmod +x "$case_dir/fakebin/git"
+  set +e
+  run_teardown "$case_dir" --reap-dead > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "merge-tree exit 1 without a result tree must remain operational"
+  assert_grep 'could not execute the content comparison' "$case_dir/stderr" \
+    "merge-tree execution failure did not expose the indeterminate state"
+  assert_grep 'fatal: unable to create temporary merge-tree state' "$case_dir/stderr" \
+    "merge-tree execution failure omitted its actionable cause"
+  assert_not_contains "$(cat "$case_dir/stderr")" 'task content conflicts with authoritative' \
+    "merge-tree execution failure was mislabeled as a content conflict"
+  pass "unlanded, execution-failed, and conflict outcomes remain distinct"
 }
 
 test_preserve_scratch_captures_then_reclaims_dirty_worktree() {

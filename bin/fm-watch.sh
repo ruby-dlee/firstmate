@@ -320,6 +320,10 @@ wake() {  # <reason> [durable-resurface-marker]
     safe_touch_marker "$resurface_marker" \
       || { echo "error: unsafe watcher re-surface marker: $resurface_marker" >&2; exit 1; }
   fi
+  # Distinguish this intentional wake handoff from an externally killed watcher.
+  # The pull guard may suppress only this exact fresh handoff gap; a new watcher
+  # removes the marker before publishing its first beacon.
+  safe_touch_marker_or_log "$STATE/.watcher-handoff" "watcher handoff" || true
   echo "$reason"
   exit 0
 }
@@ -379,11 +383,12 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
 # hash-tied timer would. A .paused-resurfaced-<key> throttle marker records the last
 # re-surface epoch so, once past the window, it fires once per window rather than
 # every poll. Advances the stale suppressor to <hash> and flags the key paused.
-handle_paused_stale() {  # <window> <task> <hash>
-  local win=$1 task=$2 h=$3 key statusf mtime age rf rf_age reason
+handle_paused_stale() {  # <window> <task> <hash> [paused|captain-owed]
+  local win=$1 task=$2 h=$3 wait_class=${4:-paused} key statusf mtime age rf rf_age reason
+  case "$wait_class" in paused|captain-owed) ;; *) wait_class=paused ;; esac
   key=$(printf '%s' "$win" | tr ':/.' '___')
   printf '%s' "$h" > "$STATE/.stale-$key"
-  : > "$STATE/.paused-$key"
+  printf '%s' "$wait_class" > "$STATE/.paused-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
   statusf="$STATE/$task.status"
   mtime=$(stat_mtime "$statusf")
@@ -392,11 +397,15 @@ handle_paused_stale() {  # <window> <task> <hash>
   rf="$STATE/.paused-resurfaced-$key"
   rf_age=$(age_of "$rf")   # 999999 when no prior re-surface
   if [ "$age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$PAUSE_RESURFACE_SECS" ]; then
-    reason="stale: $win (paused ${age}s, awaiting external - declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds)"
+    if [ "$wait_class" = captain-owed ]; then
+      reason="stale: $win (paused ${age}s, captain decision still owed - deliberate wait, rechecked on a long cadence not a wedge; confirm the decision is still pending)"
+    else
+      reason="stale: $win (paused ${age}s, awaiting external - declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds)"
+    fi
     fm_wake_append stale "$win" "$reason" || exit 1
     wake "$reason" "$rf"
   fi
-  triage_log "absorbed stale (paused, awaiting external, age ${age}s): $win"
+  triage_log "absorbed stale ($wait_class, age ${age}s): $win"
 }
 
 clear_pause_state() {  # <window>
@@ -442,14 +451,15 @@ pause_state_class() {  # <window> <task>
   sig=$(stat_sig "$statusf")
   if [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ] \
      && [ -n "$sig" ] && [ "$sig" = "$(cat "$recheck_file" 2>/dev/null || true)" ]; then
-    printf 'paused'
+    class=$(cat "$STATE/.paused-$key" 2>/dev/null || true)
+    case "$class" in paused|captain-owed) printf '%s' "$class" ;; *) printf 'paused' ;; esac
     return
   fi
   class=$(crew_absorb_class "$task" "$last")
   case "$class" in
-    paused)
+    paused|captain-owed)
       sig=$(stat_sig "$statusf")
-      if [ -z "$sig" ] || ! crew_declared_pause_absorbable "$task" "$last" \
+      if [ -z "$sig" ] || [ "$(crew_declared_pause_class "$task" "$last")" != "$class" ] \
          || [ "$sig" != "$(stat_sig "$statusf")" ]; then
         class=none
         rm -f "$recheck_file"
@@ -946,23 +956,26 @@ event_wait_or_sleep() {
 # machinery already understands it (queued by key=window, so a later poll-path
 # stale for the same pane collapses on drain).
 handle_push_transition() {  # <backend> <session> <record>
-  local backend=$1 session=$2 record=$3 pane_id to window task key h reason
+  local backend=$1 session=$2 record=$3 pane_id to window task key h reason wait_class
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
   window="$session:$pane_id"
   task=$(window_to_task "$window" "$STATE")
-  if status_is_paused "$(last_status_line "$STATE/$task.status")"; then
-    # The durable status is the trusted gate on this native edge. Commit the
-    # handled transition, then enter the shared pause path so it owns the marker
-    # and bounded re-surface cadence even when no auxiliary crew-state read exists.
-    key=$(printf '%s' "$window" | tr ':/.' '___')
-    h=$(cat "$STATE/.hash-$key" 2>/dev/null || true)
-    fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
-    handle_paused_stale "$window" "$task" "$h"
-    triage_log "absorbed push $to (declared pause, awaiting external): $window"
-    return
-  fi
+  wait_class=$(crew_declared_pause_class "$task")
+  case "$wait_class" in
+    paused|captain-owed)
+      # The durable status is the trusted gate on this native edge. Commit the
+      # handled transition, then enter the shared wait path so it owns the marker
+      # and bounded re-surface cadence even when no auxiliary crew-state read exists.
+      key=$(printf '%s' "$window" | tr ':/.' '___')
+      h=$(cat "$STATE/.hash-$key" 2>/dev/null || true)
+      fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
+      handle_paused_stale "$window" "$task" "$h" "$wait_class"
+      triage_log "absorbed push $to ($wait_class): $window"
+      return
+      ;;
+  esac
   reason="stale: $window (herdr: agent $to - waiting on human, escalated immediately, not via wedge timer)"
   fm_wake_append stale "$window" "$reason" || exit 1
   fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
@@ -1004,6 +1017,11 @@ WATCHER_PID=${BASHPID:-$$}
 printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
 printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
+if safe_marker_path "$STATE/.watcher-handoff"; then
+  rm -f "$STATE/.watcher-handoff"
+else
+  triage_log "unsafe watcher handoff marker: $STATE/.watcher-handoff"
+fi
 
 if ! safe_marker_path "$STATE/.last-heartbeat" || [ ! -e "$STATE/.last-heartbeat" ]; then
   safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
@@ -1175,7 +1193,11 @@ EOF
     if ! afk_present && [ "$window_busy" != 1 ] && status_is_paused "$last"; then
       case "$(pause_state_class "$w" "$task")" in
         paused)
-          handle_paused_stale "$w" "$task" "$h"
+          handle_paused_stale "$w" "$task" "$h" paused
+          continue
+          ;;
+        captain-owed)
+          handle_paused_stale "$w" "$task" "$h" captain-owed
           continue
           ;;
         working)
@@ -1223,7 +1245,8 @@ EOF
         # firstmate. Detection itself is unchanged from above.
         if [ "$kind" = secondmate ]; then
           case "$(pause_state_class "$w" "$task")" in
-            paused) handle_paused_stale "$w" "$task" "$h" ;;
+            paused) handle_paused_stale "$w" "$task" "$h" paused ;;
+            captain-owed) handle_paused_stale "$w" "$task" "$h" captain-owed ;;
             working|none) clear_pause_tracking "$w" ;;
             *)      clear_pause_tracking "$w" ;;
           esac
@@ -1296,7 +1319,10 @@ EOF
                 triage_log "absorbed non-terminal stale (provably working): $w"
                 ;;
               paused)
-                handle_paused_stale "$w" "$task" "$h"
+                handle_paused_stale "$w" "$task" "$h" paused
+                ;;
+              captain-owed)
+                handle_paused_stale "$w" "$task" "$h" captain-owed
                 ;;
               none)
                 surface_nonterminal_stale "$w" "$h"
@@ -1309,7 +1335,8 @@ EOF
             task=$(window_to_task "$w" "$STATE")
             if [ -e "$pf" ] || status_is_paused "$(last_status_line "$STATE/$task.status")"; then
               case "$(pause_state_class "$w" "$task")" in
-                paused)  handle_paused_stale "$w" "$task" "$h" ;;
+                paused)  handle_paused_stale "$w" "$task" "$h" paused ;;
+                captain-owed) handle_paused_stale "$w" "$task" "$h" captain-owed ;;
                 working) clear_pause_state "$w"
                          printf '%s' "$h" > "$sf"
                          wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
@@ -1336,7 +1363,8 @@ EOF
       task=$(window_to_task "$w" "$STATE")
       if ! afk_present && status_is_paused "$(last_status_line "$STATE/$task.status")" && [ "$window_busy" != 1 ]; then
         case "$(pause_state_class "$w" "$task")" in
-          paused) handle_paused_stale "$w" "$task" "$h" ;;
+          paused) handle_paused_stale "$w" "$task" "$h" paused ;;
+          captain-owed) handle_paused_stale "$w" "$task" "$h" captain-owed ;;
           working|none) clear_pause_tracking "$w" ;;
           *)      clear_pause_tracking "$w" ;;
         esac

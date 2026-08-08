@@ -115,9 +115,9 @@ fi
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
 
-fm_supervision_status "$STATE" "$GRACE"
+fm_supervision_status "$STATE" "$GRACE" "$WATCH" "$FM_HOME"
 [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
-fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" && exit 0
+[ "$FM_SUP_WATCHER_STATE" = healthy ] && exit 0
 
 afk=0
 [ -e "$STATE/.afk" ] && afk=1
@@ -128,8 +128,13 @@ REASON=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_
 rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 {
   printf '●%s\n' "$rule"
-  printf '●  TURN WOULD END BLIND - SUPERVISION IS OFF\n'
-  printf '●  %s task(s) in flight, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$FM_SUP_BEACON_DESC"
+  if [ "$FM_SUP_WATCHER_STATE" = unknown ]; then
+    printf '●  TURN WOULD END BLIND - WATCHER LIVENESS COULD NOT BE VERIFIED\n'
+    printf '●  %s task(s) in flight; could not determine watcher liveness: %s (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$FM_SUP_WATCHER_REASON" "$FM_SUP_BEACON_DESC"
+  else
+    printf '●  TURN WOULD END BLIND - SUPERVISION IS OFF\n'
+    printf '●  %s task(s) in flight; %s (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$FM_SUP_WATCHER_REASON" "$FM_SUP_BEACON_DESC"
+  fi
   printf '●  %s\n' "$REASON"
   printf '●%s\n' "$rule"
 } >&2

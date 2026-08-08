@@ -100,8 +100,10 @@ test_guard_warnings() {
   #       title, in-flight count, beacon age, fix command), the queued-wakes
   #       warning follows it, and the guidance is re-arm-after-drain (never the
   #       old conflicting "restart NOW first").
-  #   (2) a fresh watcher and an empty queue: total silence.
-  local dir state err first banner_line queue_line
+  #   (2) a fresh beacon with no live lock: immediate watcher-down alarm.
+  #   (3) a live identity-matched watcher with a fresh beacon: total silence.
+  #   (4) a malformed lock: explicit indeterminate-liveness alarm.
+  local dir state err first banner_line queue_line pid identity
   dir=$(make_case guard)
   state="$dir/state"
   err="$dir/guard.err"
@@ -141,17 +143,96 @@ test_guard_warnings() {
   FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=1 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "guard failed"
   grep -F "source '$dir/config/x-mode.env' first" "$err" >/dev/null || fail "guard repair line did not source the X-mode cadence config"
 
-  # (2) fresh watcher, empty queue -> silence.
-  dir=$(make_case guard-fresh)
+  # (2) A beacon outlives its writer. With no live lock it is DOWN immediately,
+  # never healthy for the rest of the grace window.
+  dir=$(make_case guard-fresh-dead)
   state="$dir/state"
   err="$dir/guard.err"
   printf 'project=x\n' > "$state/task.meta"
   touch "$state/.last-watcher-beat"
-  # Non-git FM_ROOT keeps the worktree-tangle check inert so "fresh watcher ->
-  # total silence" stays a pure assertion about watcher state.
   FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "guard failed"
-  [ ! -s "$err" ] || fail "guard warned with a fresh watcher and no queued wakes: $(cat "$err")"
-  pass "guard banner leads when down with pending wakes (re-arm-after-drain) and stays silent when fresh"
+  grep -F 'WATCHER DOWN - SUPERVISION IS OFF' "$err" >/dev/null \
+    || fail "fresh orphaned beacon hid dead supervision: $(cat "$err")"
+  grep -F 'watcher lock is absent' "$err" >/dev/null \
+    || fail "dead-watcher alarm did not name the failed process proof"
+
+  # An intentional actionable wake writes a distinct handoff marker. That exact
+  # short gap is quiet, while the health proof itself remains down.
+  touch "$state/.watcher-handoff"
+  FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "guard failed"
+  [ ! -s "$err" ] || fail "guard alarmed during a proven fresh watcher handoff: $(cat "$err")"
+  rm -f "$state/.watcher-handoff"
+
+  # (3) Only an exact live process plus a fresh beacon is healthy and silent.
+  dir=$(make_case guard-fresh-live)
+  state="$dir/state"
+  err="$dir/guard.err"
+  printf 'project=x\n' > "$state/task.meta"
+  sleep 60 &
+  pid=$!
+  identity=$(FM_STATE_OVERRIDE="$state" FM_HOME="$dir" bash -c \
+    '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$pid") \
+    || { kill "$pid" 2>/dev/null || true; fail "could not identify guard fixture watcher"; }
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$pid" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$ROOT/bin/fm-watch.sh" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  touch "$state/.last-watcher-beat"
+  FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "guard failed"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ ! -s "$err" ] || fail "guard warned despite an exact live watcher and fresh beacon: $(cat "$err")"
+
+  # (4) An unreadable/malformed proof is neither healthy nor a death verdict.
+  dir=$(make_case guard-unknown)
+  state="$dir/state"
+  err="$dir/guard.err"
+  printf 'project=x\n' > "$state/task.meta"
+  mkdir "$state/.watch.lock"
+  printf 'not-a-pid\n' > "$state/.watch.lock/pid"
+  touch "$state/.last-watcher-beat"
+  FM_ROOT_OVERRIDE="$dir" FM_STATE_OVERRIDE="$state" FM_GUARD_GRACE=300 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "guard failed"
+  grep -F 'WATCHER LIVENESS UNKNOWN - SUPERVISION COULD NOT BE VERIFIED' "$err" >/dev/null \
+    || fail "malformed watcher proof collapsed into healthy/down: $(cat "$err")"
+  grep -F 'watcher lock pid is malformed' "$err" >/dev/null \
+    || fail "indeterminate watcher alarm omitted its actionable cause"
+  pass "guard distinguishes live, down, and indeterminate watcher states"
+}
+
+test_watcher_health_process_probe_unknown() {
+  local dir state fakebin pid identity out
+  dir=$(make_case watcher-probe-unknown)
+  state="$dir/state"
+  fakebin="$dir/probe-bin"
+  mkdir -p "$fakebin" "$state/.watch.lock"
+  sleep 60 &
+  pid=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$pid") \
+    || { kill "$pid" 2>/dev/null || true; fail "could not identify unknown-probe fixture pid"; }
+  printf '%s\n' "$pid" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  touch "$state/.last-watcher-beat"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+echo 'process inspection denied' >&2
+exit 42
+SH
+  chmod +x "$fakebin/ps"
+  out=$(PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_HOME="$dir" bash -c '
+    . "$1"
+    if fm_watcher_health_state "$2" "$3" 300 "$4"; then rc=0; else rc=$?; fi
+    printf "rc=%s state=%s reason=%s" "$rc" "$FM_WATCHER_HEALTH_STATE" "$FM_WATCHER_HEALTH_REASON"
+  ' _ "$LIB" "$state" "$WATCH" "$dir")
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  assert_contains "$out" 'rc=2 state=unknown' \
+    "failed process probe collapsed into healthy or down"
+  assert_contains "$out" 'process probe failed with exit 42' \
+    "indeterminate process proof omitted its actionable cause"
+  pass "watcher liveness preserves a failed process probe as unknown"
 }
 
 test_lock_single_winner_under_concurrency() {
@@ -448,7 +529,14 @@ test_watch_restart_rejects_reused_pid() {
   lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
   { [ -n "$lock_pid" ] && [ "$lock_pid" != "$live" ] && kill -0 "$lock_pid" 2>/dev/null; } \
     || fail "restart did not replace stale reused-pid lock with a live watcher (got '$lock_pid')"
-  grep -F "watcher: started pid=$lock_pid" "$out" >/dev/null || fail "restart did not report the fresh watcher it confirmed"
+  grep -F "watcher: started pid=$lock_pid" "$out" >/dev/null || {
+    health=$(FM_STATE_OVERRIDE="$state" FM_HOME="$dir" bash -c '
+      . "$1"
+      if fm_watcher_health_state "$2" "$3" 300 "$4"; then rc=0; else rc=$?; fi
+      printf "rc=%s state=%s reason=%s" "$rc" "$FM_WATCHER_HEALTH_STATE" "$FM_WATCHER_HEALTH_REASON"
+    ' _ "$LIB" "$state" "$WATCH" "$dir")
+    fail "restart did not report the fresh watcher it confirmed; $health; output=$(cat "$out")"
+  }
   is_live_non_zombie "$live" || fail "restart killed a reused unrelated pid"
   kill "$pid" "$lock_pid" "$live" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
@@ -847,6 +935,7 @@ SH
   [ "$rc" -eq 0 ] || fail "arm returned non-zero for an immediate wake (status $rc): $(cat "$armout")"
   grep -F "check: $check_file: merged: https://example.test/pr/7" "$armout" >/dev/null || fail "arm did not propagate the immediate check wake"
   ! grep -qF 'watcher: FAILED' "$armout" || fail "arm printed FAILED after a valid immediate wake"
+  [ -f "$state/.watcher-handoff" ] || fail "actionable watcher exit omitted its intentional-handoff proof"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" || fail "drain after immediate arm wake failed"
   grep "$(printf '\tcheck\t')" "$drain_out" | grep -F "$check_file" | grep -F 'merged: https://example.test/pr/7' >/dev/null || fail "immediate arm wake was not queued"
   pass "arm propagates an immediate watcher wake before confirmation"
@@ -963,6 +1052,7 @@ test_pid_identity_is_locale_invariant
 test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
+test_watcher_health_process_probe_unknown
 test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency

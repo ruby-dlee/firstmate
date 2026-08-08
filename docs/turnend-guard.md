@@ -26,10 +26,11 @@ It also requires `AGENTS.md`, `bin/`, and the effective state directory to exist
 
 For an in-scope primary checkout, it counts in-flight work from `state/*.meta`.
 If no task is in flight, it exits silently.
-If work is in flight, it requires `fm_watcher_healthy <state-dir> <watch-path> [grace-seconds] [home]` from `bin/fm-wake-lib.sh`.
-That is the same identity-matched live lock and fresh beacon check used by `bin/fm-watch-arm.sh`.
+If work is in flight, it requires the process-bound `fm_watcher_health_state <state-dir> <watch-path> [grace-seconds] [home]` proof from `bin/fm-wake-lib.sh` through `bin/fm-supervision-lib.sh`.
+That proof returns healthy, down, or unknown and uses the same identity-matched live lock plus fresh beacon contract as `bin/fm-watch-arm.sh`.
 A stale beacon blocks even if a watcher pid is still live.
-A fresh leftover beacon blocks if the watcher lock is missing, dead, or identity-mismatched.
+A fresh leftover beacon blocks immediately if the watcher lock is missing, dead, or identity-mismatched instead of reading healthy for the beacon grace window.
+Malformed or unreadable lock/process evidence blocks under an explicit "could not determine" reason rather than being mislabeled as a death verdict.
 
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
 `FM_GUARD_GRACE` controls the beacon freshness window and defaults to 300 seconds.

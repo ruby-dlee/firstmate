@@ -5,14 +5,13 @@
 # First, always warn if the firstmate primary checkout (FM_ROOT) is on a named
 # non-default branch, because that means firstmate-on-itself work landed in the
 # primary instead of an isolated worktree.
-# Then, if any task is in flight (a state/<id>.meta exists) and the watcher's
-# liveness beacon (state/.last-watcher-beat, touched every poll cycle) is
-# missing or older than FM_GUARD_GRACE seconds, prints a loud, clearly delimited
-# banner so the agent cannot skim past it in the tool output of whatever it was
-# doing - the one channel every harness has. Normal wake handling (watcher
-# briefly down between a wake and the next supervision resume) stays inside the
-# grace window and stays silent. Always exits 0: the guard warns, it never
-# blocks.
+# Then, if any task is in flight (a state/<id>.meta exists), prove the exact
+# process recorded by this home's watcher lock is alive and identity-matched AND
+# its beacon is fresh. A fresh beacon whose writer died is down immediately; an
+# unreadable process proof is a distinct actionable unknown, never stale-healthy.
+# Prints a loud, clearly delimited banner so the agent cannot skim past it in the
+# tool output of whatever it was doing - the one channel every harness has.
+# Always exits 0: the guard warns, it never blocks.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +21,7 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 GRACE=${FM_GUARD_GRACE:-300}
 queue_pending=false
+expected_handoff=false
 READ_ONLY=${FM_GUARD_READ_ONLY:-0}
 case "$READ_ONLY" in 1|true|TRUE|yes|YES) READ_ONLY=1 ;; *) READ_ONLY=0 ;; esac
 CONTINUE_LINE=${FM_GUARD_CONTINUE_LINE:-This is a supervision warning only; the guarded operation WILL still run.}
@@ -60,21 +60,34 @@ if [ -n "$tangle_branch" ]; then
   } >&2
 fi
 
-# Compute in-flight count and watcher-beacon freshness via the shared
-# grace-based predicate (bin/fm-supervision-lib.sh). Only act with tasks in
-# flight; count them so the banner can say how much is riding on an absent
-# watcher.
-fm_supervision_status "$STATE" "$GRACE"
+# Compute in-flight count plus the process-bound three-state watcher verdict.
+# Only act with tasks in flight; count them so the banner can say how much is
+# riding on down or indeterminate supervision.
+fm_supervision_status "$STATE" "$GRACE" "$SCRIPT_DIR/fm-watch.sh" "$FM_HOME"
 in_flight=$FM_SUP_IN_FLIGHT
-watcher_fresh=$FM_SUP_WATCHER_FRESH
+watcher_state=$FM_SUP_WATCHER_STATE
+watcher_reason=$FM_SUP_WATCHER_REASON
 beacon_desc=$FM_SUP_BEACON_DESC
 [ "$in_flight" -eq 0 ] && exit 0
 
 [ -s "$FM_WAKE_QUEUE" ] && queue_pending=true
 
-# No fresh watcher with tasks in flight is the dangerous state: emit a prominent,
-# bordered banner FIRST so it reads as an alarm, not a buried stderr line.
-if [ "$watcher_fresh" = false ]; then
+# The watcher intentionally exits after writing an actionable wake. It records a
+# generation-cleared handoff marker immediately before that exit, so ordinary
+# wake handling can retain the old grace behavior without mistaking every handoff
+# for a crash. An external kill writes no marker, and a new watcher removes an old
+# one before its first beat, so a fresh orphaned beacon still alarms immediately.
+if [ "$watcher_state" = down ] && [ "$watcher_reason" = "watcher lock is absent" ] \
+   && [ -f "$STATE/.watcher-handoff" ] && [ ! -L "$STATE/.watcher-handoff" ] \
+   && [ "$(fm_path_age "$STATE/.watcher-handoff")" -lt "$GRACE" ]; then
+  expected_handoff=true
+fi
+
+# A down OR indeterminate watcher with tasks in flight is dangerous: emit a
+# prominent, bordered banner FIRST so it reads as an alarm, not a buried stderr
+# line. Unknown stays visibly distinct from down so the operator repairs the
+# failed proof rather than believing a content verdict.
+if [ "$watcher_state" != healthy ] && [ "$expected_handoff" = false ]; then
   afk=0
   [ -e "$STATE/.afk" ] && afk=1
   queue_arg=0
@@ -90,8 +103,13 @@ if [ "$watcher_fresh" = false ]; then
   rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
   {
     printf '●%s\n' "$rule"
-    printf '●  WATCHER DOWN - SUPERVISION IS OFF\n'
-    printf '●  %s task(s) in flight, but no watcher has a fresh beacon (last beat: %s, grace %ss).\n' "$in_flight" "$beacon_desc" "$GRACE"
+    if [ "$watcher_state" = unknown ]; then
+      printf '●  WATCHER LIVENESS UNKNOWN - SUPERVISION COULD NOT BE VERIFIED\n'
+      printf '●  %s task(s) in flight; could not determine watcher liveness: %s (last beat: %s).\n' "$in_flight" "$watcher_reason" "$beacon_desc"
+    else
+      printf '●  WATCHER DOWN - SUPERVISION IS OFF\n'
+      printf '●  %s task(s) in flight; %s (last beat: %s, grace %ss).\n' "$in_flight" "$watcher_reason" "$beacon_desc" "$GRACE"
+    fi
     if [ "$READ_ONLY" -eq 1 ]; then
       printf '●  This read-only session should report the lapse, not repair it.\n'
     else

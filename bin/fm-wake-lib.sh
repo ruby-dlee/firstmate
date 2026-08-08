@@ -72,20 +72,129 @@ fm_watcher_lock_matches_pid() {
   [ "$current_identity" = "$lock_identity" ]
 }
 
+# Three-state watcher health proof.
+#
+# Return 0 only when the exact process recorded by this home's watcher lock is
+# alive, identity-matched, and has a fresh beacon. Return 1 when the proof
+# positively establishes that supervision is down (no lock, absent/reused pid,
+# missing/stale beacon). Return 2 when the proof itself cannot run or its lock is
+# malformed. Callers must surface both non-healthy outcomes, but the distinct
+# status keeps "down" separate from "could not determine".
+FM_WATCHER_HEALTH_STATE=unknown
+FM_WATCHER_HEALTH_REASON="watcher health has not been checked"
 FM_WATCHER_HEALTHY_PID=
-fm_watcher_healthy() {
-  local state=$1 watch_path=$2 grace=${3:-${FM_GUARD_GRACE:-300}} home=${4:-$FM_HOME} lockdir beat pid age
+fm_watcher_health_state() {  # <state> <watch-path> [grace] [home]
+  local state=$1 watch_path=$2 grace=${3:-${FM_GUARD_GRACE:-300}} home=${4:-$FM_HOME}
+  local lockdir lock_read beat pid lock_home lock_path lock_identity current_identity probe_status m age
+  FM_WATCHER_HEALTH_STATE=unknown
+  FM_WATCHER_HEALTH_REASON="watcher health could not be determined"
   FM_WATCHER_HEALTHY_PID=
   lockdir="$state/.watch.lock"
   beat="$state/.last-watcher-beat"
-  pid=$(cat "$lockdir/pid" 2>/dev/null || true)
-  fm_pid_alive "$pid" || return 1
-  fm_watcher_lock_matches_pid "$state" "$watch_path" "$pid" "$home" || return 1
-  age=$(fm_path_age "$beat")
-  [ "$age" -lt "$grace" ] || return 1
-  # shellcheck disable=SC2034 # Read by callers after fm_watcher_healthy returns.
+
+  if [ ! -e "$lockdir" ] && [ ! -L "$lockdir" ]; then
+    FM_WATCHER_HEALTH_STATE=down
+    FM_WATCHER_HEALTH_REASON="watcher lock is absent"
+    return 1
+  fi
+  if [ -L "$lockdir" ]; then
+    lock_read=$(fm_lock_link_owner "$lockdir") \
+      || { FM_WATCHER_HEALTH_REASON="watcher lock owner could not be resolved safely"; return 2; }
+  elif [ -d "$lockdir" ]; then
+    # Backward-compatible lock shape used by older homes and fixtures.
+    lock_read=$lockdir
+  else
+    FM_WATCHER_HEALTH_REASON="watcher lock is not a safe directory"
+    return 2
+  fi
+  [ -f "$lock_read/pid" ] && [ ! -L "$lock_read/pid" ] \
+    || { FM_WATCHER_HEALTH_REASON="watcher lock pid is missing or unsafe"; return 2; }
+  pid=$(cat "$lock_read/pid" 2>/dev/null) \
+    || { FM_WATCHER_HEALTH_REASON="watcher lock pid could not be read"; return 2; }
+  case "$pid" in
+    ''|*[!0-9]*)
+      FM_WATCHER_HEALTH_REASON="watcher lock pid is malformed"
+      return 2
+      ;;
+  esac
+  lock_home=$(cat "$lock_read/fm-home" 2>/dev/null) \
+    || { FM_WATCHER_HEALTH_REASON="watcher lock home could not be read"; return 2; }
+  lock_path=$(cat "$lock_read/watcher-path" 2>/dev/null) \
+    || { FM_WATCHER_HEALTH_REASON="watcher lock path could not be read"; return 2; }
+  lock_identity=$(cat "$lock_read/pid-identity" 2>/dev/null) \
+    || { FM_WATCHER_HEALTH_REASON="watcher lock process identity could not be read"; return 2; }
+  [ -n "$lock_identity" ] \
+    || { FM_WATCHER_HEALTH_REASON="watcher lock process identity is empty"; return 2; }
+  if [ "$lock_home" != "$home" ]; then
+    FM_WATCHER_HEALTH_STATE=down
+    FM_WATCHER_HEALTH_REASON="watcher lock belongs to a different home"
+    return 1
+  fi
+  if [ "$lock_path" != "$watch_path" ]; then
+    FM_WATCHER_HEALTH_STATE=down
+    FM_WATCHER_HEALTH_REASON="watcher lock belongs to a different executable"
+    return 1
+  fi
+
+  if current_identity=$(LC_ALL=C ps -p "$pid" -o lstart= -o command= 2>&1); then
+    probe_status=0
+  else
+    probe_status=$?
+  fi
+  current_identity=$(printf '%s\n' "$current_identity" | sed 's/^[[:space:]]*//')
+  if [ "$probe_status" -ne 0 ]; then
+    if [ -n "$current_identity" ]; then
+      FM_WATCHER_HEALTH_REASON="watcher process probe failed with exit $probe_status"
+      return 2
+    fi
+    FM_WATCHER_HEALTH_STATE=down
+    FM_WATCHER_HEALTH_REASON="recorded watcher pid $pid is absent"
+    return 1
+  fi
+  if [ -z "$current_identity" ]; then
+    FM_WATCHER_HEALTH_REASON="watcher process probe returned no identity"
+    return 2
+  fi
+  if [ "$current_identity" != "$lock_identity" ]; then
+    FM_WATCHER_HEALTH_STATE=down
+    FM_WATCHER_HEALTH_REASON="recorded watcher pid $pid was reused by another process"
+    return 1
+  fi
+  if [ ! -e "$beat" ] && [ ! -L "$beat" ]; then
+    FM_WATCHER_HEALTH_STATE=down
+    FM_WATCHER_HEALTH_REASON="watcher beacon is absent"
+    return 1
+  fi
+  if [ -L "$beat" ] || [ ! -f "$beat" ]; then
+    FM_WATCHER_HEALTH_REASON="watcher beacon is not a safe regular file"
+    return 2
+  fi
+  m=$(fm_path_mtime "$beat") \
+    || { FM_WATCHER_HEALTH_REASON="watcher beacon timestamp could not be read"; return 2; }
+  age=$(( $(date +%s) - m ))
+  if [ "$age" -lt 0 ]; then
+    FM_WATCHER_HEALTH_REASON="watcher beacon timestamp is in the future"
+    return 2
+  fi
+  if [ "$age" -ge "$grace" ]; then
+    FM_WATCHER_HEALTH_STATE=down
+    FM_WATCHER_HEALTH_REASON="watcher beacon is stale (${age}s, grace ${grace}s)"
+    return 1
+  fi
+  # shellcheck disable=SC2034 # Read by callers after fm_watcher_health_state returns.
+  FM_WATCHER_HEALTH_STATE=healthy
+  # shellcheck disable=SC2034 # Read by callers after fm_watcher_health_state returns.
+  FM_WATCHER_HEALTH_REASON="recorded watcher pid $pid is live and its beacon is fresh (${age}s)"
+  # shellcheck disable=SC2034 # Read by callers after fm_watcher_health_state returns.
   FM_WATCHER_HEALTHY_PID=$pid
   return 0
+}
+
+fm_watcher_healthy() {
+  if fm_watcher_health_state "$@"; then
+    return 0
+  fi
+  return 1
 }
 
 fm_lock_clean_known_files() {

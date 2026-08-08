@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck source=tests/test-entry.sh
 . "$(dirname "$0")/test-entry.sh"
-# Behavioral contract for the lavish-repair skill's routing, diagnosis order,
-# process-safety guard, and durable recovery boundaries.
+# Behavioral contract for the lavish-repair skill's route order, download-only
+# recovery boundary, and prohibition on browser-owned pickup machinery.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -39,94 +39,82 @@ test_internal_skill_and_trigger() {
   section_count=$(printf '%s\n' "$section" | grep -Fc "\`lavish-repair\`")
   [ "$global_count" -eq 1 ] || fail "AGENTS.md must reference lavish-repair exactly once"
   [ "$section_count" -eq 1 ] || fail "lavish-repair trigger must live in section 13"
-  assert_grep "self-contained Lavish board fails preflight, browser launch, interaction, submission pickup, or collection" \
-    "$AGENTS" "trigger must cover every self-contained board failure stage"
-  assert_grep "before touching its state artifacts or isolated Chrome session" \
-    "$AGENTS" "trigger must fire before state or browser repair"
+  assert_grep "self-contained Lavish board fails preflight, default-browser open, interaction, answer download, or bounded intake" \
+    "$AGENTS" "trigger must cover every file-board failure stage"
+  assert_grep "before touching a generated board or downloaded-answer artifact" \
+    "$AGENTS" "trigger must fire before artifact repair"
   pass "lavish-repair is internal and has one route-complete conditional trigger"
 }
 
 test_route_order_and_owners() {
-  local preflight_line browser_line interaction_line pickup_line collection_line
+  local preflight_line browser_line interaction_line download_line intake_line
 
   preflight_line=$(grep -nF '### 1. Answerability preflight' "$SKILL" | cut -d: -f1) ||
     fail "answerability-preflight diagnosis stage is missing"
-  browser_line=$(grep -nF '### 2. Browser launch' "$SKILL" | cut -d: -f1) ||
-    fail "browser-launch diagnosis stage is missing"
+  browser_line=$(grep -nF '### 2. Browser open' "$SKILL" | cut -d: -f1) ||
+    fail "browser-open diagnosis stage is missing"
   interaction_line=$(grep -nF '### 3. Board interaction' "$SKILL" | cut -d: -f1) ||
     fail "board-interaction diagnosis stage is missing"
-  pickup_line=$(grep -nF '### 4. Submission pickup' "$SKILL" | cut -d: -f1) ||
-    fail "submission-pickup diagnosis stage is missing"
-  collection_line=$(grep -nF '### 5. Collection' "$SKILL" | cut -d: -f1) ||
-    fail "collection diagnosis stage is missing"
+  download_line=$(grep -nF '### 4. Downloaded answer' "$SKILL" | cut -d: -f1) ||
+    fail "downloaded-answer diagnosis stage is missing"
+  intake_line=$(grep -nF '### 5. Intake and collection' "$SKILL" | cut -d: -f1) ||
+    fail "intake diagnosis stage is missing"
   [ "$preflight_line" -lt "$browser_line" ] || fail "preflight must precede browser diagnosis"
-  [ "$browser_line" -lt "$interaction_line" ] || fail "browser launch must precede interaction diagnosis"
-  [ "$interaction_line" -lt "$pickup_line" ] || fail "interaction must precede pickup diagnosis"
-  [ "$pickup_line" -lt "$collection_line" ] || fail "pickup must precede collection diagnosis"
+  [ "$browser_line" -lt "$interaction_line" ] || fail "browser open must precede interaction diagnosis"
+  [ "$interaction_line" -lt "$download_line" ] || fail "interaction must precede download diagnosis"
+  [ "$download_line" -lt "$intake_line" ] || fail "download must precede intake diagnosis"
 
   assert_grep "Read \`bin/fm-lavish-board.sh\`'s header and \`--help\` output" \
     "$SKILL" "board helper ownership is missing"
-  assert_grep "Read \`tools/lavish/README.md\` for the durable decision and payload protocol" \
+  assert_grep "Read \`tools/lavish/README.md\` for the durable decision, downloaded payload, and intake protocol" \
     "$SKILL" "durable protocol ownership is missing"
-  assert_grep "Load \`lavish-decisions\` before completing the normal collect and consume workflow" \
+  assert_grep "Load \`lavish-decisions\` before completing the normal consume workflow" \
     "$SKILL" "normal workflow handoff is missing"
-  assert_grep "The Lavish fork has no server, session URL, live channel, listener, or poller to repair" \
-    "$SKILL" "self-contained route boundary is missing"
-  assert_grep "Never invoke upstream serve, poll, or server-lifecycle commands" \
-    "$SKILL" "upstream server lifecycle must remain forbidden"
-  pass "lavish-repair diagnoses the self-contained route in owner-defined order"
+  assert_grep "has no server, session URL, live channel, browser automation session, listener, poller, or armed submission check" \
+    "$SKILL" "removed browser-anchor boundary is missing"
+  pass "lavish-repair diagnoses the download-only route in owner-defined order"
 }
 
 test_preflight_and_browser_contracts() {
   assert_grep "read its named missing components" "$SKILL" \
     "preflight failure must report missing answerability components"
-  assert_grep "Do not bypass the preflight, arm pickup by hand, or substitute hand-authored HTML" \
+  assert_grep "Do not bypass the preflight or substitute hand-authored HTML" \
     "$SKILL" "preflight bypasses must remain forbidden"
-  assert_grep "has not opened Chrome or armed pickup when this check fails" \
+  assert_grep "has not invoked the default browser when this check fails" \
     "$SKILL" "preflight failure boundary is missing"
   assert_grep "exact terminal fallback emitted by \`lavish-axi create\`" \
     "$SKILL" "preflight terminal fallback is missing"
-  assert_grep "The helper removes the armed check on an open failure" \
-    "$SKILL" "browser-open cleanup boundary is missing"
-  assert_grep "inspect only the helper's named isolated session" \
-    "$SKILL" "browser diagnosis is not scoped to the isolated session"
-  assert_grep "Never attach the board to the captain's main Chrome profile" \
-    "$SKILL" "main-profile isolation guard is missing"
-  assert_grep "inspect that page in the named isolated session before reloading or reopening it" \
-    "$SKILL" "visible interaction diagnosis is missing"
-  assert_grep "Protect any unsubmitted captain input before a page-level repair" \
+  assert_grep "Do not launch a dedicated browser profile, Chrome DevTools process, browser automation session, server, or resident helper" \
+    "$SKILL" "browser-anchor workaround is not forbidden"
+  assert_grep "protect any unsubmitted captain input before reloading or reopening" \
     "$SKILL" "unsubmitted-input guard is missing"
-  assert_grep "return to the answerability-preflight branch" \
-    "$SKILL" "missing controls must route back through preflight"
-  pass "lavish-repair preserves preflight and isolated-browser boundaries"
+  assert_grep "download button, or manual payload backup are missing" \
+    "$SKILL" "answerability drift must include the new landing surfaces"
+  pass "lavish-repair preserves preflight and unowned-browser boundaries"
 }
 
-test_pickup_and_collection_contracts() {
-  assert_grep "browser-profile record is the authoritative pickup route" \
-    "$SKILL" "authoritative browser-profile pickup is missing"
-  assert_grep "matching download is optional corroboration" \
-    "$SKILL" "download corroboration boundary is missing"
-  assert_grep "Keep the helper's existing one-shot check armed" \
-    "$SKILL" "existing bounded pickup path is missing"
-  assert_grep "Do not add another storage bridge, filesystem watcher, timer sweep, long poll, or resident process" \
-    "$SKILL" "duplicate pickup machinery is not forbidden"
-  assert_grep "Confirm receipt only after \`lavish-axi collect\` validates and saves the answer" \
-    "$SKILL" "validated collection boundary is missing"
-  assert_grep "Treat a named \`lavish-axi collect\` validation error as a payload or immutable-request mismatch" \
-    "$SKILL" "collection-error classification is missing"
-  assert_grep "do not weaken the schema, key, option, annotation, or request-digest checks" \
+test_download_and_intake_contracts() {
+  assert_grep "landing record is \`lavish-answer-<decision-id>.json\`" \
+    "$SKILL" "downloaded landing record is missing"
+  assert_grep "exposes the exact JSON as a manual backup" \
+    "$SKILL" "manual payload recovery is missing"
+  assert_grep "Do not report automatic delivery or wait for a submission prompt; neither exists" \
+    "$SKILL" "removed automatic pickup is still being promised"
+  assert_grep "Do not add browser-profile storage, an armed check, filesystem watcher, timer sweep, long poll, server, or resident process" \
+    "$SKILL" "replacement pickup machinery is not forbidden"
+  assert_grep "Run \`lavish-axi intake --home <resolved-absolute-home>\` once" \
+    "$SKILL" "bounded intake handoff is missing"
+  assert_grep "validates the schema, decision id, request digest, ordered keys, and declared values" \
+    "$SKILL" "immutable request and ordered-entry validation is missing"
+  assert_grep "commits \`answer.toon\`, writes the declared destination, and then writes \`receipt.toon\`" \
+    "$SKILL" "durable answer publication order is missing"
+  assert_grep "do not weaken the schema, key, option, annotation, home-marker, or request-digest checks" \
     "$SKILL" "collection validation must remain fail-closed"
-  pass "lavish-repair preserves the existing pickup and collection contracts"
+  pass "lavish-repair retains the downloaded answer and durable intake contracts"
 }
 
-test_process_safety_and_recovery_contracts() {
-  assert_grep "Never use \`pkill -f\` or signal a process selected only by a tool-name pattern" \
-    "$SKILL" "fleet-wide process-name signaling is not forbidden"
-  assert_grep "inspect every candidate's PID, parent, elapsed time, and full command" \
-    "$SKILL" "explicit process identity proof is missing"
-  assert_grep "Never pipe unfiltered process-search output into \`kill\`" \
-    "$SKILL" "unfiltered process signaling is not forbidden"
-  assert_grep "A surface failure does not erase the durable decision, a downloaded payload, or a collected answer" \
+test_recovery_contract() {
+  assert_grep "A surface failure does not erase the durable decision, a downloaded payload, a manual payload backup, or a collected answer" \
     "$SKILL" "durable-state survival boundary is missing"
   assert_grep "Use \`lavish show\` and \`lavish inbox\` with the explicit Firstmate home" \
     "$SKILL" "durable-state inspection sequence is missing"
@@ -134,11 +122,11 @@ test_process_safety_and_recovery_contracts() {
     "$SKILL" "safe reopen gate is missing"
   assert_grep "the exact \`lavish answer ... --home ...\` creation fallback keeps the decision answerable" \
     "$SKILL" "browser-independent answer fallback is missing"
-  pass "lavish-repair retains process safety and durable recovery boundaries"
+  pass "lavish-repair retains durable recovery without process lifecycle advice"
 }
 
 test_internal_skill_and_trigger
 test_route_order_and_owners
 test_preflight_and_browser_contracts
-test_pickup_and_collection_contracts
-test_process_safety_and_recovery_contracts
+test_download_and_intake_contracts
+test_recovery_contract

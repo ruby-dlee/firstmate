@@ -871,7 +871,7 @@ These skills are not captain-invocable; they are conditional operating reference
 - `firstmate-coding-guidelines` - load before changing firstmate's shared, tracked material, as defined by section 1's list, whether editing directly or briefing a crewmate for a firstmate-repo task.
 - `memory-hygiene` - load before writing, rewriting, pruning, deduplicating, or otherwise leaning `data/captain.md` or `data/learnings.md`.
 - `lavish-decisions` - load before creating, repairing, or presenting a multi-option captain choice, and before asking the captain to comment on material without choosing anything.
-- `lavish-repair` - load when a self-contained Lavish board fails preflight, browser launch, interaction, submission pickup, or collection, and before touching its state artifacts or isolated Chrome session.
+- `lavish-repair` - load when a self-contained Lavish board fails preflight, default-browser open, interaction, answer download, or bounded intake, and before touching a generated board or downloaded-answer artifact.
 - `eks-usage` - load before running `kubectl` or Amazon EKS commands, on an EKS IAM, authenticator, TLS, or connectivity error, or whenever the active cluster or context is uncertain.
 
 ## 14. X mode

@@ -651,8 +651,9 @@ export function validateCollectPayload(raw, manifest, {
   if (raw.request_sha256 !== manifest.request_sha256) {
     payloadError('payload_stale_request', 'request hash does not match manifest');
   }
+  const landing = validatePayloadLanding(raw);
   if (raw.home_marker === undefined) {
-    if (expectedHomeMarker !== undefined && !allowMissingHomeMarker) {
+    if (landing !== undefined || (expectedHomeMarker !== undefined && !allowMissingHomeMarker)) {
       payloadError('payload_missing_home', 'home marker is required');
     }
   } else {
@@ -667,7 +668,6 @@ export function validateCollectPayload(raw, manifest, {
       payloadError('payload_wrong_home', 'home marker does not match the selected Firstmate home');
     }
   }
-  const landing = validatePayloadLanding(raw);
   if (manifest.mode === ANNOTATION_MODE) {
     return { ...validateAnnotationPayload(raw, manifest), landing };
   }

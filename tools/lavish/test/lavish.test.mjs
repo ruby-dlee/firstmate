@@ -1637,6 +1637,43 @@ test('intake refuses tied payload authority when answer content differs', async 
   assert.equal(await exists(join(fx.home, 'data/decisions', id, 'answer.toon')), false);
 });
 
+test('intake refuses landing authority without a home marker', async () => {
+  const fx = await fixture('download-unbound-authority');
+  const id = await createRequest(fx);
+  const manifest = await manifestFor(fx, id);
+  const downloads = join(fx.root, 'Downloads');
+  const unbound = browserPayload(fx, manifest, {
+    answers: [{
+      key: 'rollout',
+      value: 'green',
+      question_note: 'This unbound answer must never outrank the home-bound answer.',
+      option_comments: {},
+    }],
+    landing: landingAuthority(2, '2026-08-08T12:01:00.000Z'),
+  });
+  delete unbound.home_marker;
+  await mkdir(downloads);
+  await writeFile(
+    join(downloads, browserDownloadName(manifest)),
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      landing: landingAuthority(1, '2026-08-08T12:00:00.000Z'),
+    }))}\n`,
+  );
+  await writeFile(
+    join(downloads, browserDownloadName(manifest, 1)),
+    `${JSON.stringify(unbound)}\n`,
+  );
+
+  const intake = await runCli(['intake'], {
+    home: fx.home,
+    env: { LAVISH_DOWNLOADS_DIR: downloads },
+  });
+  assert.equal(intake.code, 6, intake.stderr);
+  assert.match(intake.stdout, /payload_missing_home/);
+  assert.equal(await exists(join(fx.home, 'data/decisions', id, 'answer.toon')), false);
+  assert.equal(await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')), false);
+});
+
 test('intake refuses a request-bound filename for another question set', async () => {
   const fx = await fixture('download-filename-request-mismatch');
   const id = await createRequest(fx);

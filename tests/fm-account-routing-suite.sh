@@ -5385,6 +5385,68 @@ SH
   pass "metadata and lifecycle locks preserve live owners when pinned ps is indeterminate"
 }
 
+test_account_locks_support_maximum_task_identity() {
+  local case_dir state task kind acquire lock lock_leaf held templates template artifact guard digest start
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  case_dir="$TMP_ROOT/account-lock-maximum-task"
+  state="$case_dir/state"
+  task=$(printf '%0225d' 0)
+  mkdir -p "$state"
+  [ "${#task}" -eq 225 ] || fail "maximum account-lock identity fixture has the wrong length"
+  digest=$(printf '%064d' 0)
+  templates="$FM_ACCOUNT_LOCK_OWNER_TEMPLATE
+$FM_ACCOUNT_LOCK_GENERATION_TEMPLATE
+$FM_ACCOUNT_LOCK_RECLAIM_TEMPLATE
+$FM_ACCOUNT_LOCK_RELEASE_TEMPLATE
+$FM_ACCOUNT_LOCK_RECLAIMING_PREFIX$digest
+$FM_ACCOUNT_LOCK_RECLAIMING_PREFIX$digest.candidate.XXXXXX
+$FM_ACCOUNT_LOCK_RECLAIMING_PREFIX$digest.stale.XXXXXX
+.reclaiming.candidate.XXXXXX
+.reclaiming.stale.XXXXXX
+.ownerless-since.XXXXXX"
+  while IFS= read -r template; do
+    [ -n "$template" ] || continue
+    artifact=${template%XXXXXX}ABCDEF
+    [ "${#artifact}" -le 255 ] || fail "account lock artifact exceeds the filesystem component budget: $artifact"
+    case "$artifact" in *"$task"*) fail "account lock artifact embeds the durable task identity" ;; esac
+  done <<EOF
+$templates
+EOF
+  for kind in meta lifecycle; do
+    case "$kind" in
+      meta) acquire=fm_account_meta_lock_acquire ;;
+      lifecycle) acquire=fm_account_lifecycle_lock_acquire ;;
+    esac
+    lock="$state/.account-$kind-$task.lock"
+    lock_leaf=${lock##*/}
+    [ "${#lock_leaf}" -le 255 ] || fail "maximum $kind lock exceeds the filesystem component budget"
+    held=$($acquire "$state" "$task") || fail "ordinary maximum $kind lock acquisition failed"
+    [ "$held" = "$lock" ] || fail "maximum $kind lock returned the wrong custody path"
+    fm_account_meta_lock_release "$held" || fail "ordinary maximum $kind lock release failed"
+    printf '1\nstale-owner\n' > "$lock"
+    touch -t 200001010000 "$lock"
+    held=$(FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
+      FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=2 \
+      $acquire "$state" "$task") || fail "maximum $kind file-owner reclaim failed"
+    fm_account_meta_lock_release "$held" || fail "maximum $kind lock release after file-owner reclaim failed"
+    mkdir -p "$lock"
+    printf '1\nstale-owner\n' > "$lock/owner"
+    touch -t 200001010000 "$lock" "$lock/owner"
+    held=$(FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
+      FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=2 \
+      $acquire "$state" "$task") || fail "maximum $kind directory-owner reclaim failed"
+    fm_account_meta_lock_release "$held" || fail "maximum $kind lock release after directory-owner reclaim failed"
+    mkdir -p "$lock"
+    start=$(fm_account_process_start_time "$$") || fail "maximum $kind release fixture could not read its process identity"
+    printf '%s\n%s\n' "$$" "$start" > "$lock/owner"
+    fm_account_meta_lock_release "$lock" || fail "maximum $kind directory release failed"
+    assert_absent "$lock" "maximum $kind route retained its durable lock"
+  done
+  guard=$(find "$state" -maxdepth 1 -name '.account-lock-*' -print -quit)
+  [ -z "$guard" ] || fail "maximum account lock route retained a fixed-width custody artifact: $guard"
+  pass "account locks preserve maximum task identities across acquire, reclaim, and release"
+}
+
 test_ownerless_lock_marker_rejects_symlink_clobber() {
   local case_dir state lock marker outside out status
   case_dir="$TMP_ROOT/account-ownerless-marker"
@@ -6792,6 +6854,15 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = account-locks ]; then
   run_isolated_test test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
   run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
+  run_isolated_test test_account_locks_support_maximum_task_identity
+  run_isolated_test test_ownerless_lock_marker_rejects_symlink_clobber
+  run_isolated_test test_account_lock_owner_controls_reject_symlinks
+  run_isolated_test test_stale_reclaim_guard_is_owned_before_lock_removal
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = account-lock-maximum ]; then
+  run_isolated_test test_account_locks_support_maximum_task_identity
   exit 0
 fi
 
@@ -6956,6 +7027,7 @@ run_isolated_test test_continuation_rejects_task_source_ancestor_swap
 run_isolated_test test_continuation_rejects_metadata_ancestor_swap
 run_isolated_test test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
 run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
+run_isolated_test test_account_locks_support_maximum_task_identity
 run_isolated_test test_ownerless_lock_marker_rejects_symlink_clobber
 run_isolated_test test_account_lock_owner_controls_reject_symlinks
 run_isolated_test test_linux_stat_selection_avoids_filesystem_stat_output

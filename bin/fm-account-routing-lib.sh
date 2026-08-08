@@ -101,6 +101,11 @@ FM_ACCOUNT_SYSTEM_CP_BIN=
 FM_ACCOUNT_SYSTEM_MKTEMP_BIN=
 [ ! -x /usr/bin/mktemp ] || FM_ACCOUNT_SYSTEM_MKTEMP_BIN=/usr/bin/mktemp
 [ -n "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" ] || [ ! -x /bin/mktemp ] || FM_ACCOUNT_SYSTEM_MKTEMP_BIN=/bin/mktemp
+FM_ACCOUNT_LOCK_OWNER_TEMPLATE=.account-lock-owner.XXXXXX
+FM_ACCOUNT_LOCK_RECLAIMING_PREFIX=.account-lock-reclaiming-
+FM_ACCOUNT_LOCK_GENERATION_TEMPLATE=.account-lock-generation.XXXXXX
+FM_ACCOUNT_LOCK_RECLAIM_TEMPLATE=.account-lock-reclaim.XXXXXX
+FM_ACCOUNT_LOCK_RELEASE_TEMPLATE=.account-lock-release.XXXXXX
 FM_ACCOUNT_SYSTEM_SLEEP_BIN=
 [ ! -x /bin/sleep ] || FM_ACCOUNT_SYSTEM_SLEEP_BIN=/bin/sleep
 [ -n "$FM_ACCOUNT_SYSTEM_SLEEP_BIN" ] || [ ! -x /usr/bin/sleep ] || FM_ACCOUNT_SYSTEM_SLEEP_BIN=/usr/bin/sleep
@@ -875,6 +880,20 @@ fm_account_path_inode() {
   fi
 }
 
+fm_account_lock_artifact_key() {
+  local lock=$1 parent leaf physical digest
+  [ -n "$FM_ACCOUNT_SYSTEM_GIT_BIN" ] || return 1
+  parent=${lock%/*}
+  leaf=${lock##*/}
+  [ "$parent" != "$lock" ] && [ -n "$leaf" ] || return 1
+  physical=$(cd "$parent" 2>/dev/null && pwd -P) || return 1
+  digest=$(printf '%s/%s' "$physical" "$leaf" \
+    | fm_account_system_exec "$FM_ACCOUNT_SYSTEM_GIT_BIN" hash-object --stdin 2>/dev/null) || return 1
+  case "${#digest}" in 40|64) ;; *) return 1 ;; esac
+  case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+  printf '%s' "$digest"
+}
+
 fm_account_reclaim_owner_alive() {  # <reclaim-directory>
   fm_account_meta_lock_owner_alive "$1"
 }
@@ -954,21 +973,29 @@ fm_account_reclaim_guard_acquire() {  # <reclaim-directory> <grace-seconds>
 }
 
 fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
-  local lock=$1 grace=$2 now mtime reclaim guard inode_before inode_after generation
+  local lock=$1 grace=$2 now mtime reclaim guard inode_before inode_after generation state key guard_leaf guard_candidate_leaf
   local ownerless_since ownerless_tmp baseline required_grace
   local PATH=$FM_ACCOUNT_SYSTEM_PATH
   [ ! -L "$lock" ] || return 1
   required_grace=$grace
   [ "$required_grace" -ge 1 ] || required_grace=1
+  state=${lock%/*}
   if [ -f "$lock" ]; then
     mtime=$(fm_account_path_mtime "$lock") || return 1
     [ -n "$FM_ACCOUNT_SYSTEM_DATE_BIN" ] || return 1
     now=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s)
     [ $((now - mtime)) -ge "$required_grace" ] || return 1
     guard="$lock.reclaiming"
+    guard_leaf=${guard##*/}
+    guard_candidate_leaf="$guard_leaf.candidate.XXXXXX"
+    if [ "${#guard_candidate_leaf}" -gt 255 ]; then
+      key=$(fm_account_lock_artifact_key "$lock") || return 1
+      guard="$state/$FM_ACCOUNT_LOCK_RECLAIMING_PREFIX$key"
+    fi
     fm_account_reclaim_guard_acquire "$guard" "$required_grace" || return 1
     # Pin the observed generation so unlink-and-replace cannot recycle its inode before comparison.
-    generation=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" -d "$lock.generation.XXXXXX" 2>/dev/null) || { fm_account_reclaim_guard_release "$guard"; return 1; }
+    generation=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" -d \
+      "$state/$FM_ACCOUNT_LOCK_GENERATION_TEMPLATE" 2>/dev/null) || { fm_account_reclaim_guard_release "$guard"; return 1; }
     if ! fm_account_system_exec "$FM_ACCOUNT_SYSTEM_LN_BIN" -n "$lock" "$generation/lock" 2>/dev/null; then
       fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
       fm_account_reclaim_guard_release "$guard"
@@ -1073,7 +1100,8 @@ fm_account_meta_lock_reclaim() {  # <lock-path> <ownerless-grace-seconds>
   fm_account_reclaim_guard_owned "$guard" || return 1
   inode_after=$(fm_account_path_inode "$lock") || return 1
   [ "$inode_before" = "$inode_after" ] || return 1
-  reclaim=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" -d "$lock.reclaim.XXXXXX" 2>/dev/null) || { fm_account_reclaim_guard_release "$guard"; return 1; }
+  reclaim=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" -d \
+    "$state/$FM_ACCOUNT_LOCK_RECLAIM_TEMPLATE" 2>/dev/null) || { fm_account_reclaim_guard_release "$guard"; return 1; }
   fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RMDIR_BIN" "$reclaim" \
     || { fm_account_reclaim_guard_release "$guard"; return 1; }
   fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MV_BIN" "$lock" "$reclaim" 2>/dev/null || { fm_account_reclaim_guard_release "$guard"; return 1; }
@@ -1095,7 +1123,8 @@ fm_account_lock_acquire() {  # <state-dir> <task> <name> <label> <wait-seconds>
   fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKDIR_BIN" -p "$state" || return 1
   fm_account_real_directory "$state" || return 1
   lock="$state/.$name-$task.lock"
-  owner_tmp=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" "$state/.$name-$task.owner.XXXXXX" 2>/dev/null) || return 1
+  owner_tmp=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" \
+    "$state/$FM_ACCOUNT_LOCK_OWNER_TEMPLATE" 2>/dev/null) || return 1
   printf '%s\n%s\n' "$$" "$start" > "$owner_tmp" || {
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$owner_tmp"
     return 1
@@ -1246,7 +1275,7 @@ fm_account_lifecycle_lock_identity() {  # <lock-path>
 }
 
 fm_account_meta_lock_release() {  # <lock-path>
-  local lock=$1 owner pid released
+  local lock=$1 owner pid released state
   local PATH=$FM_ACCOUNT_SYSTEM_PATH
   [ -e "$lock" ] || return 0
   if [ -f "$lock" ] && [ ! -L "$lock" ]; then
@@ -1271,7 +1300,9 @@ fm_account_meta_lock_release() {  # <lock-path>
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -f "$lock" || return 1
     return 0
   fi
-  released=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" -d "$lock.release.XXXXXX" 2>/dev/null) || return 1
+  state=${lock%/*}
+  released=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MKTEMP_BIN" -d \
+    "$state/$FM_ACCOUNT_LOCK_RELEASE_TEMPLATE" 2>/dev/null) || return 1
   fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RMDIR_BIN" "$released" || return 1
   fm_account_system_exec "$FM_ACCOUNT_SYSTEM_MV_BIN" "$lock" "$released" || return 1
   fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$released"

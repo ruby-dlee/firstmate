@@ -4393,19 +4393,7 @@ test_clear_transition_migrates_maximum_legacy_identity_with_bounded_artifacts() 
   dir="$TMP_ROOT/clear-transition-maximum-legacy-identity"; state="$dir/state"; mkdir -p "$state"
   meta="$state/$task.meta"
   fm_write_meta "$meta" "window=$window" "backend=herdr" "kind=ship" "generation_id="
-  bash -c '
-    . "$0/bin/backends/herdr.sh"
-    lifecycle_lock="$1/.account-lifecycle-$3.lock"
-    meta_lock="$1/.account-meta-$3.lock"
-    start=$(fm_account_process_start_time "$$") || exit 1
-    printf "%s\n%s\n" "$$" "$start" > "$lifecycle_lock" || exit 1
-    printf "%s\n%s\n" "$$" "$start" > "$meta_lock" || exit 1
-    result=0
-    fm_backend_herdr_clear_transition "$1" "$2" "$3" "$lifecycle_lock" "$meta_lock" || result=1
-    fm_account_meta_lock_release "$meta_lock" >/dev/null 2>&1 || result=1
-    fm_account_lifecycle_lock_release "$lifecycle_lock" >/dev/null 2>&1 || result=1
-    exit "$result"
-  ' \
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2" "$3"' \
     "$ROOT" "$state" "$window" "$task" || fail "maximum-length legacy generation teardown clear was refused"
   generation=$(sed -n 's/^generation_id=//p' "$meta")
   case "$generation" in legacy-a???????????????) ;; *) fail "maximum legacy generation was not migrated exactly: $generation" ;; esac

@@ -1167,10 +1167,11 @@ for argument in "$@"; do
   previous=$argument
 done
 case "${1:-}" in
-  has-session|display-message)
+  display-message)
     [ -e "$live" ] || exit 1
     case "${*: -1}" in
-      *session_name*window_name*) printf 'firstmate\t%s\n' "${target#*:}" ;;
+      *session_name*) printf 'firstmate\n' ;;
+      *window_name*) printf '%s\n' "${target#*:}" ;;
       *pane_current_command*) printf 'bash\n' ;;
       *pane_id*) printf '%%1\n' ;;
     esac

@@ -310,7 +310,8 @@ case "${1:-}" in
     [ -f "$state" ] || exit 1
     case "$*" in
       *pane_current_command*) printf 'bash\n' ;;
-      *session_name*window_name*) printf 'firstmate\tfm-task-x1\n' ;;
+      *session_name*) printf 'firstmate\n' ;;
+      *window_name*) printf 'fm-task-x1\n' ;;
       *) printf '%%1\n' ;;
     esac
     exit 0
@@ -3731,7 +3732,8 @@ case "${1:-}" in
     [ -f "$state" ] || exit 1
     case "$*" in
       *pane_current_command*) printf 'claude\n' ;;
-      *session_name*window_name*) printf 'firstmate\tfm-task-x1\n' ;;
+      *session_name*) printf 'firstmate\n' ;;
+      *window_name*) printf 'fm-task-x1\n' ;;
       *) printf '%%1\n' ;;
     esac
     ;;
@@ -3842,7 +3844,8 @@ case "${1:-}" in
     [ -f "$state" ] || exit 1
     case "$*" in
       *pane_current_command*) printf 'claude\n' ;;
-      *session_name*window_name*) printf 'firstmate\t%s\n' "$label" ;;
+      *session_name*) printf 'firstmate\n' ;;
+      *window_name*) printf '%s\n' "$label" ;;
       *) printf '%%1\n' ;;
     esac
     ;;
@@ -4546,7 +4549,8 @@ case "${1:-}" in
     [ -f "$FM_FAKE_REPORT_LIVE" ] || exit 1
     case "$*" in
       *pane_current_command*) printf 'claude\n' ;;
-      *session_name*window_name*) printf 'firstmate\tfm-task-x1\n' ;;
+      *session_name*) printf 'firstmate\n' ;;
+      *window_name*) printf 'fm-task-x1\n' ;;
       *) printf '%%1\n' ;;
     esac
     ;;

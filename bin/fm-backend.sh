@@ -709,7 +709,6 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label] [recorded-sc
   case "$backend" in
     tmux)
       fm_backend_source tmux || return 1
-      fm_backend_tmux_expected_label_matches "$target" "$expected_label" "$recorded_scoped_target" || return 1
       # The probe was `tmux display-message -p -t <target> '#{pane_id}'`, which
       # exits 0 for a window that no longer exists (tmux silently falls back to
       # the session's current window - see fm_backend_tmux_target_exists), so
@@ -718,12 +717,20 @@ fm_backend_target_exists() {  # <backend> <target> [expected-label] [recorded-sc
       # fm-teardown.sh refuse to release the task forever, leaking its worktree
       # lease.
       #
-      # The probe used to fall back to the recorded scoped target for a
-      # @window-id. That indirection is gone: the guard above already proves a
-      # @window-id resolves AND that the session and window it resolves to are
-      # the recorded ones, which is strictly stronger than probing the recorded
-      # session:window on its own.
-      fm_backend_tmux_target_exists "$target"
+      # ONE tmux round-trip either way. When the caller supplies an expectation
+      # the identity guard already RESOLVES the target to prove that identity -
+      # exactly for a session:window, and by reading the id back for a
+      # @window-id - so its success is itself the existence proof and a second
+      # probe would only re-ask a question already answered. With no
+      # expectation there is nothing to verify and the probe is the whole check.
+      # This path runs in a bounded retry loop in fm-teardown.sh's
+      # managed_endpoint_is_gone, so a redundant probe there is a doubled
+      # process spawn per iteration on a machine that may already be loaded.
+      if [ -n "$expected_label" ] || [ -n "$recorded_scoped_target" ]; then
+        fm_backend_tmux_expected_label_matches "$target" "$expected_label" "$recorded_scoped_target"
+      else
+        fm_backend_tmux_target_exists "$target"
+      fi
       ;;
     herdr)
       fm_backend_source herdr || return 1

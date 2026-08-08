@@ -239,6 +239,109 @@ test_runtime_check_mismatch_fails_before_building() {
   pass "a runtime mismatch fails before anything is built under the wrong runtime"
 }
 
+# A step's value is an answer the manifest asked for, and every real toolchain
+# writes things that are not that answer to stderr. This is not hypothetical: the
+# shipped example manifest checks node with `npm version --json | jq -r .node`,
+# and npm emits its update notice on stderr.
+test_a_steps_value_ignores_its_stderr() {
+  local rec out
+  rec=$(make_case stderr-value)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  jq '.components[0].runtime_checks = [{"name":"pinned runtime","argv":["sh","-c","echo 20.20.2; echo \"npm notice New major version of npm available\" >&2"],"expect":"20.20.2"}]' \
+    "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 0 "$?" "a notice on stderr must not fail a check whose stdout printed the expected value: $out"
+  [ "$(build_count "$WT_DIR")" = 1 ] || fail "the component should have been built once"
+  pass "a step's expect compares against its stdout, not against a trailing stderr notice"
+}
+
+# The same merge poisoned fingerprints, where the damage is silent instead of
+# loud: a stderr line that differs between two readings of the same command makes
+# the digest move across the build, so the fingerprint is never recorded and the
+# component is rebuilt on every future lease.
+test_stderr_noise_cannot_move_a_fingerprint() {
+  local rec out
+  rec=$(make_case stderr-fingerprint)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  jq '.components[0].fingerprint.versions = [{"name":"toolchain","argv":["sh","-c","echo tool-v1; n=$(cat ../warn-count 2>/dev/null || echo 0); n=$((n+1)); echo \"$n\" > ../warn-count; echo \"warning: run $n\" >&2"]}]' \
+    "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 0 "$?" "a version command that warns on stderr should still provision: $out"
+  assert_present "$WT_DIR/component/built/.fm-provision-fingerprint" \
+    "a stderr warning must not look like a fingerprint input that moved across the build"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  [ "$(verdict_field "$out" '.components[0].result')" = reused ] \
+    || fail "a stderr warning must not force a rebuild on every lease, got: $out"
+  pass "a version command's stderr never contributes to the fingerprint it computes"
+}
+
+# Separating the streams must not cost diagnosis: most tools that fail say why on
+# stderr and print nothing at all on stdout.
+test_a_failing_step_still_reports_its_stderr() {
+  local rec out
+  rec=$(make_case stderr-diagnosis)
+  read_case "$rec"
+  write_manifest "$CASE_DIR/m.json"
+  jq '.components[0].install = [{"name":"build","argv":["sh","-c","echo \"ENOENT: no such file\" >&2; exit 7"]}]' \
+    "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 3 "$?" "a failing install should report the warn-policy failure: $out"
+  assert_contains "$(verdict_field "$out" .reason)" "ENOENT: no such file" \
+    "a step that failed with output only on stderr must still name its reason: $out"
+  pass "a failing step is still diagnosed from its stderr"
+}
+
+# The more specific declaration wins. A component that declares its own runtime is
+# stating a requirement about itself; the manifest-level entry is the default for
+# components that declare nothing. The old order was worse than surprising: the
+# component's own runtime_checks validated the manifest's interpreter, which is
+# not the one the component was being built under.
+test_component_path_prepend_leads_the_manifest_default() {
+  local rec out
+  rec=$(make_case path-precedence)
+  read_case "$rec"
+  mkdir -p "$CASE_DIR/manifest-bin" "$CASE_DIR/component-bin"
+  printf '#!/bin/sh\necho manifest\n' > "$CASE_DIR/manifest-bin/toolver"
+  printf '#!/bin/sh\necho component\n' > "$CASE_DIR/component-bin/toolver"
+  chmod +x "$CASE_DIR/manifest-bin/toolver" "$CASE_DIR/component-bin/toolver"
+  write_manifest "$CASE_DIR/m.json" path_prepend "[\"$CASE_DIR/manifest-bin\"]"
+  jq --arg dir "$CASE_DIR/component-bin" \
+    '.components[0].path_prepend = [$dir]
+     | .components[0].runtime_checks = [{"name":"declared runtime","argv":["toolver"],"expect":"component"}]' \
+    "$CASE_DIR/m.json" > "$CASE_DIR/m2.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m2.json")
+  expect_code 0 "$?" "a component's own path_prepend must lead its steps' PATH: $out"
+  pass "a component's own path_prepend wins over the manifest-level default"
+}
+
+# A colon is the separator of every PATH this value is composed into, so an entry
+# carrying one would split into two fragments naming no directory at all - the
+# pin would read as declared and silently not apply.
+test_path_prepend_with_a_colon_is_refused() {
+  local rec out
+  rec=$(make_case path-colon)
+  read_case "$rec"
+  mkdir -p "$CASE_DIR/pin:bin"
+  write_manifest "$CASE_DIR/m.json" path_prepend "[\"$CASE_DIR/pin:bin\"]"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m.json")
+  expect_code 3 "$?" "a colon-bearing manifest path_prepend must fail rather than publish: $out"
+  assert_contains "$(verdict_field "$out" .reason)" "contains a colon" \
+    "the refusal should name the colon: $out"
+  [ "$(verdict_field "$out" .path_prepend)" = "" ] \
+    || fail "a refused path_prepend must not be published: $out"
+
+  write_manifest "$CASE_DIR/m2.json"
+  jq --arg dir "$CASE_DIR/pin:bin" '.components[0].path_prepend = [$dir]' \
+    "$CASE_DIR/m2.json" > "$CASE_DIR/m3.json"
+  out=$(provision "$PROJ_DIR" "$WT_DIR" "$CASE_DIR/m3.json")
+  expect_code 3 "$?" "a colon-bearing component path_prepend must fail too: $out"
+  assert_contains "$(verdict_field "$out" .reason)" "contains a colon" \
+    "the component-level refusal should name the colon too: $out"
+  pass "a path_prepend entry carrying the PATH separator is refused at both levels"
+}
+
 test_runtime_check_with_no_output_fails() {
   local rec out
   rec=$(make_case runtime-silent)
@@ -924,8 +1027,48 @@ make_unrunnable_provisioner_bin() {
   printf '%s\n' "$bin"
 }
 
-test_spawn_pins_the_proven_runtime_into_the_crew_path() {
-  local rec id out path_line brief_mode
+# bin/fm-launch-pinned.sh is the whole structural fix in one file, so its two
+# halves are proved directly: the command word is resolved against the PATH the
+# launcher INHERITED, and the pin leads the PATH everything it starts sees.
+# Losing either half silently converts one failure into the other.
+test_pinned_launcher_resolves_before_it_pins() {
+  local dir out status
+  dir="$TMP_ROOT/pinned-launcher"
+  mkdir -p "$dir/own" "$dir/pin"
+  printf '#!/bin/sh\necho own\n' > "$dir/own/toolx"
+  printf '#!/bin/sh\necho pinned\n' > "$dir/pin/toolx"
+  # A project tool that resolves `toolx` from whatever PATH it is handed - this
+  # stands in for npm delegating a native build to a node it did not choose.
+  printf '#!/bin/sh\nexec toolx\n' > "$dir/own/project-tool"
+  # shellcheck disable=SC2016 # Stub source text; it must expand when run, not here.
+  printf '#!/bin/sh\nprintf "%%s\\n" "$FM_TEST_ASSIGNED"\n' > "$dir/own/showenv"
+  chmod +x "$dir/own/toolx" "$dir/pin/toolx" "$dir/own/project-tool" "$dir/own/showenv"
+
+  out=$(PATH="$dir/own:$PATH" "$ROOT/bin/fm-launch-pinned.sh" "$dir/pin" toolx)
+  [ "$out" = own ] \
+    || fail "the launched command must resolve from the inherited PATH, not from the pin, got: $out"
+
+  out=$(PATH="$dir/own:$PATH" "$ROOT/bin/fm-launch-pinned.sh" "$dir/pin" project-tool)
+  [ "$out" = pinned ] \
+    || fail "project tooling inside the session must resolve the pin first, got: $out"
+
+  out=$(PATH="$dir/own:$PATH" "$ROOT/bin/fm-launch-pinned.sh" "$dir/pin" FM_TEST_ASSIGNED=carried showenv)
+  [ "$out" = carried ] \
+    || fail "a launch line's own VAR=value prefix must reach the command, got: $out"
+
+  out=$(PATH="$dir/own:$PATH" "$ROOT/bin/fm-launch-pinned.sh" "$dir/pin" not-a-real-command 2>&1)
+  status=$?
+  expect_code 127 "$status" "an unresolvable command must fail like a missing command: $out"
+  assert_contains "$out" "not-a-real-command" "the failure should name the command it could not resolve"
+  pass "the pinned launcher resolves against the inherited PATH and only then applies the pin"
+}
+
+# The capability and the invariant are one test on purpose. A change that dropped
+# the pin would satisfy the invariant, and a change that put the pin back on the
+# launch-resolution PATH would satisfy the capability; neither is acceptable
+# alone.
+test_spawn_delivers_the_proven_runtime_to_the_crewmate_session() {
+  local rec id out path_line launch brief_mode
   id=provision-ready-p1
   rec=$(make_spawn_case ready "$id")
   read_spawn_case "$rec"
@@ -934,50 +1077,119 @@ test_spawn_pins_the_proven_runtime_into_the_crew_path() {
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
   expect_code 0 "$?" "a ready provisioning run should not disturb the spawn: $out"
   path_line=$(exported_path "$SEND_LOG")
-  case "$path_line" in
-    "export PATH='$CASE_DIR/pinned-bin:"*) ;;
-    *) fail "the crewmate PATH should lead with the proven runtime, got: $path_line" ;;
-  esac
+  assert_not_contains "$path_line" "$CASE_DIR/pinned-bin" \
+    "the PATH that resolves the typed launch line must carry no manifest directory"
+  launch=$(sent_launch_line "$SEND_LOG")
+  assert_contains "$launch" "$ROOT/bin/fm-launch-pinned.sh" \
+    "a ready verdict's pin should be delivered by the pinned launcher: $launch"
+  assert_contains "$launch" "$CASE_DIR/pinned-bin" \
+    "the launcher should carry the proven runtime directory: $launch"
   assert_grep 'Environment readiness' "$HOME_DIR/data/$id/brief.md" \
     "a provisioned crewmate should be told its environment is ready"
   assert_present "$HOME_DIR/state/$id.provision" "the spawn should leave a durable verdict"
   brief_mode=$(file_mode "$HOME_DIR/data/$id/brief.md")
   [ "$brief_mode" = 644 ] \
     || fail "the readiness note must not narrow the brief's mode, got $brief_mode"
-  pass "a ready provisioning run pins its proven runtime ahead of the crewmate PATH"
+  pass "a ready provisioning run delivers its proven runtime to the crewmate's session"
 }
 
-# The pinned runtime leads the crewmate's PATH, and a pinned node prefix is
-# exactly where a globally installed `claude` lives. The harness must therefore
-# be launched by the path firstmate resolved for itself, not by a bare name the
-# manifest's own directory could answer.
-test_spawn_launches_the_harness_by_the_path_firstmate_resolved() {
+# spawn_hook_artifacts <harness> <worktree> <state> <id> <grok-home>: every file
+# a harness's turn-end hook is written into. codex has none - its hook rides the
+# launch line - so it contributes nothing here.
+spawn_hook_artifacts() {
+  local harness=$1 wt=$2 state=$3 id=$4 grok_home=$5
+  case "$harness" in
+    claude) printf '%s\n' "$wt/.claude/settings.local.json" ;;
+    opencode) printf '%s\n' "$wt/.opencode/plugins/fm-turn-end.js" ;;
+    pi) printf '%s\n' "$state/$id.pi-ext.ts" ;;
+    grok) printf '%s\n' "$grok_home/hooks/fm-turn-end.json" "$grok_home/hooks/fm-turn-end.sh" ;;
+  esac
+}
+
+# THE CLASS TEST. One manifest whose pinned directory carries decoys for several
+# distinct words at once - the harness name, python3, bash, touch, sh, node, and
+# `env` as a wrapper target - and the assertion is that none of them decides what
+# firstmate's own machinery runs, in the typed launch line OR in the turn-end
+# hook command, for every harness that has one. A sixth location fails this
+# rather than waiting for a sixth review round to find it.
+test_a_runtime_pin_decides_nothing_firstmate_names() {
+  local rec id out path_line launch harness decoy artifact grok_home leased
+  for harness in claude codex opencode pi grok; do
+    id="provision-class-$harness"
+    rec=$(make_spawn_case "class-$harness" "$id")
+    read_spawn_case "$rec"
+    install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+    fm_fake_exit0 "$FAKEBIN_DIR" "$harness"
+    for decoy in "$harness" python3 bash touch env sh node; do
+      printf '#!/bin/sh\nexit 0\n' > "$CASE_DIR/pinned-bin/$decoy"
+      chmod +x "$CASE_DIR/pinned-bin/$decoy"
+    done
+    grok_home="$CASE_DIR/grok-home"
+    mkdir -p "$grok_home"
+
+    out=$(GROK_HOME="$grok_home" \
+      run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" --harness "$harness")
+    expect_code 0 "$?" "a $harness spawn must not be disturbed by a runtime pin: $out"
+
+    path_line=$(exported_path "$SEND_LOG")
+    assert_not_contains "$path_line" "$CASE_DIR/pinned-bin" \
+      "$harness: the PATH that resolves the launch line must carry no manifest directory"
+    launch=$(sent_line_containing "$SEND_LOG" fm-launch-pinned.sh)
+    [ -n "$launch" ] || fail "$harness: the launch line should carry the pinned launcher"
+    assert_not_contains "$launch" "$CASE_DIR/pinned-bin/" \
+      "$harness: no word of the launch line may name a binary from the manifest's directory"
+
+    leased=$(cat "$CASE_DIR/acquired-worktree")
+    while IFS= read -r artifact; do
+      [ -n "$artifact" ] || continue
+      assert_present "$artifact" "$harness: its turn-end hook should have been written"
+      assert_no_grep "$CASE_DIR/pinned-bin/" "$artifact" \
+        "$harness: its turn-end hook must not name a binary from the manifest's directory"
+      # Every occurrence must be immediately preceded by a path separator, which
+      # is what "named absolutely" means for a word the pinned session would
+      # otherwise resolve from the manifest's directory.
+      ! grep -Eq '(^|[^/])touch' "$artifact" \
+        || fail "$harness: its turn-end hook must name touch absolutely, not as a bare command"
+      ! grep -Eq '(^|[^/])bash' "$artifact" \
+        || fail "$harness: its turn-end hook must name its shell absolutely, not as a bare command"
+    done <<EOF
+$(spawn_hook_artifacts "$harness" "$leased" "$HOME_DIR/state" "$id" "$grok_home")
+EOF
+  done
+  pass "a runtime pin decides nothing firstmate names, in the launch line or in a turn-end hook"
+}
+
+# The codex turn-end hook rides the launch line rather than a file, and it runs
+# from inside the crewmate's session where the pin is in effect. Both the shell
+# it runs and the touch that shell runs are firstmate's commands, not the
+# project's.
+test_spawn_pins_the_turn_end_shell_under_a_runtime_pin() {
   local rec id out launch
-  id=provision-harness-pin-pd
-  rec=$(make_spawn_case harness-pin "$id")
+  id=provision-notify-pin-ph
+  rec=$(make_spawn_case notify-pin "$id")
   read_spawn_case "$rec"
   install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
-  # A decoy the pinned directory would answer with, since it leads the exported
-  # PATH the pane shell resolves against.
-  printf '#!/bin/sh\nexit 0\n' > "$CASE_DIR/pinned-bin/claude"
-  chmod +x "$CASE_DIR/pinned-bin/claude"
+  fm_fake_exit0 "$FAKEBIN_DIR" codex
+  printf '#!/bin/sh\nexit 0\n' > "$CASE_DIR/pinned-bin/bash"
+  printf '#!/bin/sh\nexit 0\n' > "$CASE_DIR/pinned-bin/touch"
+  chmod +x "$CASE_DIR/pinned-bin/bash" "$CASE_DIR/pinned-bin/touch"
 
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
-  expect_code 0 "$?" "a ready provisioning run should still launch: $out"
-  launch=$(sent_launch_line "$SEND_LOG")
-  assert_contains "$launch" "$FAKEBIN_DIR/claude" \
-    "the harness must be launched by the absolute path firstmate resolved: $launch"
-  case "$launch" in
-    *"$CASE_DIR/pinned-bin/claude"*)
-      fail "the manifest's pinned directory must not name the harness binary: $launch" ;;
-  esac
-  pass "a published runtime pin cannot repoint the harness the spawn launches"
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" --harness codex)
+  expect_code 0 "$?" "a codex spawn should not be disturbed by a runtime pin: $out"
+  launch=$(sent_line_containing "$SEND_LOG" 'notify=')
+  assert_contains "$launch" 'notify=[\"/' \
+    "the turn-end hook must name an absolute shell, not a bare name: $launch"
+  assert_contains "$launch" '\",\"-c\",\"/' \
+    "the turn-end hook's own touch must be absolute too: $launch"
+  assert_not_contains "$launch" "$CASE_DIR/pinned-bin/" \
+    "the manifest's pinned directory must not name the turn-end shell or its touch: $launch"
+  pass "a turn-end hook that rides the launch line names both its shell and its touch absolutely"
 }
 
-# The raw launch command is the documented unverified-adapter escape hatch, and
-# its first word is resolved by the pane shell against the same pinned PATH. It
-# gets the same absolute-path treatment the harness name does.
-test_spawn_pins_a_raw_launch_commands_first_word() {
+# The raw launch command is the documented unverified-adapter escape hatch. It
+# spawns under a pin without firstmate resolving a single word of it, because the
+# PATH it resolves against carries nothing the manifest supplied.
+test_spawn_pins_a_raw_launch_command_without_resolving_it() {
   local rec id out launch
   id=provision-raw-pin-pf
   rec=$(make_spawn_case raw-pin "$id")
@@ -991,20 +1203,20 @@ test_spawn_pins_a_raw_launch_commands_first_word() {
     --harness 'crewtool --go')
   expect_code 0 "$?" "a raw launch command must still spawn under a runtime pin: $out"
   launch=$(sent_line_containing "$SEND_LOG" crewtool)
-  assert_contains "$launch" "$FAKEBIN_DIR/crewtool" \
-    "the raw launch command's first word must be the path firstmate resolved: $launch"
+  assert_contains "$launch" "$ROOT/bin/fm-launch-pinned.sh" \
+    "a raw launch command should receive the pin through the launcher: $launch"
   assert_contains "$launch" "--go" "the rest of the raw launch command must be untouched: $launch"
-  case "$launch" in
-    *"$CASE_DIR/pinned-bin/crewtool"*)
-      fail "the manifest's pinned directory must not name the launched binary: $launch" ;;
-  esac
-  pass "a raw launch command's first word is pinned exactly as a harness name is"
+  assert_not_contains "$launch" "$CASE_DIR/pinned-bin/crewtool" \
+    "the manifest's pinned directory must not name the launched binary: $launch"
+  pass "a raw launch command receives the pin without firstmate resolving its words"
 }
 
-# Whether the command can be pinned is knowable from the manifest and firstmate's
-# own PATH alone, so refusing must not cost a lease and an install first.
-test_spawn_refuses_an_unpinnable_raw_launch_before_leasing() {
-  local rec id out
+# A raw launch command firstmate cannot resolve is no longer a refusal. There is
+# nothing left to refuse: the line resolves against firstmate's own PATH whatever
+# it names, so an unresolvable word fails exactly as it would with no manifest at
+# all - in the pane, at launch, not by costing a lease up front.
+test_spawn_launches_a_raw_command_it_cannot_resolve() {
+  local rec id out launch
   id=provision-raw-unpinnable-pg
   rec=$(make_spawn_case raw-unpinnable "$id")
   read_spawn_case "$rec"
@@ -1012,38 +1224,76 @@ test_spawn_refuses_an_unpinnable_raw_launch_before_leasing() {
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" \
     --harness 'crewtool-does-not-exist --go')
-  expect_code 1 "$?" "an unpinnable raw launch command must not spawn under a pin: $out"
-  assert_contains "$out" "crewtool-does-not-exist" "the refusal must name the word it could not resolve"
-  assert_contains "$out" "before leasing a worktree" "the refusal must say it happened before the lease"
-  assert_absent "$CASE_DIR/acquired-worktree" \
-    "a refusal that could be decided up front must not cost a Treehouse lease"
-  assert_absent "$HOME_DIR/state/$id.provision" "nothing may be provisioned for a refused spawn"
-  assert_absent "$HOME_DIR/state/$id.meta" "an unpinnable launch must not record a live task"
-  pass "an unpinnable raw launch command is refused before a lease is taken"
+  expect_code 0 "$?" "a raw launch command firstmate cannot resolve must still spawn: $out"
+  launch=$(sent_line_containing "$SEND_LOG" crewtool-does-not-exist)
+  assert_contains "$launch" "$ROOT/bin/fm-launch-pinned.sh" \
+    "it should still receive the pin through the launcher: $launch"
+  assert_present "$HOME_DIR/state/$id.meta" "the spawn should have recorded a live task"
+  pass "a raw launch command firstmate cannot resolve spawns instead of being refused"
 }
 
-# The codex turn-end hook runs bash, and bash is firstmate's command, not the
-# project's. A pinned directory carrying its own bash must not answer for it.
-test_spawn_pins_the_turn_end_shell_under_a_runtime_pin() {
+# A raw launch command that opens with a shell construct has no command word to
+# hand the launcher, so the pin is not applied to it. It still launches and still
+# resolves against firstmate's own PATH, and the spawn says what it did not do
+# rather than leaving the operator to infer a pin that is not there.
+test_spawn_reports_a_raw_launch_it_cannot_pin() {
   local rec id out launch
-  id=provision-notify-pin-ph
-  rec=$(make_spawn_case notify-pin "$id")
+  id=provision-raw-construct-pk
+  rec=$(make_spawn_case raw-construct "$id")
   read_spawn_case "$rec"
   install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
-  fm_fake_exit0 "$FAKEBIN_DIR" codex
-  printf '#!/bin/sh\nexit 0\n' > "$CASE_DIR/pinned-bin/bash"
-  chmod +x "$CASE_DIR/pinned-bin/bash"
+  fm_fake_exit0 "$FAKEBIN_DIR" crewtool
 
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" --harness codex)
-  expect_code 0 "$?" "a codex spawn should not be disturbed by a runtime pin: $out"
-  launch=$(sent_line_containing "$SEND_LOG" 'notify=')
-  assert_contains "$launch" 'notify=[\"/' \
-    "the turn-end hook must name an absolute shell, not a bare name: $launch"
-  case "$launch" in
-    *"$CASE_DIR/pinned-bin/bash"*)
-      fail "the manifest's pinned directory must not name the turn-end shell: $launch" ;;
-  esac
-  pass "the turn-end hook's shell is pinned like every other command firstmate names"
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" \
+    --harness '( crewtool --go )')
+  expect_code 0 "$?" "a raw launch command that opens with a shell construct must still spawn: $out"
+  assert_contains "$out" "runtime pin is not applied" \
+    "the spawn should say the pin was not delivered: $out"
+  launch=$(sent_line_containing "$SEND_LOG" crewtool)
+  assert_not_contains "$launch" "fm-launch-pinned.sh" \
+    "a line with no command word must be typed exactly as written: $launch"
+  pass "a raw launch command with no command word launches unpinned and says so"
+}
+
+# The pre-lease gate exists so a refusal never costs a lease, and it must key on
+# whether THIS spawn can publish a pin. A manifest whose kinds excludes this
+# task's kind publishes nothing, so the scout below is in the position of a
+# project with no manifest and must spawn.
+test_pre_lease_hook_pin_gate_honors_kinds() {
+  local rec id out quotedir
+  id=provision-hookgate-pl
+  rec=$(make_spawn_case hookgate "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+  # A bash whose own path cannot be transported into a hook file, which is how a
+  # hook command becomes unpinnable without breaking anything else firstmate runs.
+  quotedir="$CASE_DIR/quo'te"
+  mkdir -p "$quotedir"
+  ln -s "$(command -v bash)" "$quotedir/bash"
+
+  out=$(PATH="$quotedir:$PATH" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
+  expect_code 1 "$?" "a ship spawn whose hook shell cannot be pinned must be refused: $out"
+  assert_contains "$out" "before leasing a worktree" "the refusal must say it happened before the lease"
+  assert_contains "$out" "turn-end hook" "the refusal must name what it could not pin"
+  assert_absent "$CASE_DIR/acquired-worktree" \
+    "a refusal that could be decided up front must not cost a Treehouse lease"
+  assert_absent "$HOME_DIR/state/$id.meta" "a refused spawn must not record a live task"
+
+  # Same project, same unpinnable hook shell, but a kind the manifest excludes.
+  id=provision-hookgate-scout-pm
+  rec=$(make_spawn_case hookgate-scout "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+  quotedir="$CASE_DIR/quo'te"
+  mkdir -p "$quotedir"
+  ln -s "$(command -v bash)" "$quotedir/bash"
+
+  out=$(PATH="$quotedir:$PATH" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" --scout)
+  expect_code 0 "$?" "a scout the manifest's kinds excludes must not inherit a pin refusal: $out"
+  assert_present "$HOME_DIR/state/$id.meta" "the scout should have spawned"
+  pass "the pre-lease hook pin gate refuses only a spawn that could publish a pin"
 }
 
 test_spawn_fails_closed_when_the_provisioner_is_missing() {
@@ -1334,6 +1584,11 @@ test_unavailable_fingerprint_never_reuses
 test_state_dependent_fingerprint_is_refused_not_recorded
 test_empty_to_nonempty_fingerprint_is_refused_not_recorded
 test_runtime_check_mismatch_fails_before_building
+test_a_steps_value_ignores_its_stderr
+test_stderr_noise_cannot_move_a_fingerprint
+test_a_failing_step_still_reports_its_stderr
+test_component_path_prepend_leads_the_manifest_default
+test_path_prepend_with_a_colon_is_refused
 test_runtime_check_with_no_output_fails
 test_probe_expect_is_enforced
 test_step_timeout_is_reported_and_bounded
@@ -1354,11 +1609,14 @@ test_a_non_array_step_list_fails_closed
 test_a_step_cannot_consume_the_list_that_drives_it
 test_task_record_and_log_are_written
 test_manifest_path_resolution
-test_spawn_pins_the_proven_runtime_into_the_crew_path
-test_spawn_launches_the_harness_by_the_path_firstmate_resolved
-test_spawn_pins_a_raw_launch_commands_first_word
-test_spawn_refuses_an_unpinnable_raw_launch_before_leasing
+test_pinned_launcher_resolves_before_it_pins
+test_spawn_delivers_the_proven_runtime_to_the_crewmate_session
+test_a_runtime_pin_decides_nothing_firstmate_names
 test_spawn_pins_the_turn_end_shell_under_a_runtime_pin
+test_spawn_pins_a_raw_launch_command_without_resolving_it
+test_spawn_launches_a_raw_command_it_cannot_resolve
+test_spawn_reports_a_raw_launch_it_cannot_pin
+test_pre_lease_hook_pin_gate_honors_kinds
 test_spawn_fails_closed_when_the_provisioner_cannot_be_run
 test_spawn_fails_closed_when_the_provisioner_is_missing
 test_spawn_warn_policy_survives_a_missing_provisioner

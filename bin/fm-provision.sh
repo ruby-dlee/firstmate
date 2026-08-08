@@ -99,9 +99,13 @@
 #   $FM_STATE/<id>.provision.log, so a failure stays diagnosable long after the
 #   spawn output scrolled away. A skipped run creates neither artifact.
 #   A step's captured value - what "expect" compares against, and what a
-#   fingerprint version command contributes - is its LAST non-empty output line,
-#   trimmed. Commands that trail their value with chatter need a wrapper that
-#   prints only the value.
+#   fingerprint version command contributes - is the last non-empty line the step
+#   printed on STANDARD OUTPUT, trimmed. Standard error is logged for diagnosis
+#   but is never part of the value, because the tools these manifests call
+#   routinely trail their answer with an unrelated notice on stderr (npm's update
+#   banner, uv's warnings), and merging the two streams let that notice decide
+#   both an expect comparison and a fingerprint input. Commands that trail their
+#   value with chatter on stdout still need a wrapper that prints only the value.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -112,7 +116,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fm_refuse_if_gate_agent
 
 usage() {
-  sed -n '2,104p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,108p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -499,8 +503,15 @@ remaining_budget() {
 
 STEP_ARGV=()
 STEP_OUT=
+STEP_DIAGNOSTIC=
 STEP_FAILURE=
 COMPONENT_ENV=()
+
+# last_value_line <file>: the last non-empty line of <file>, trimmed.
+last_value_line() {
+  awk 'NF { last = $0 } END { if (last != "") print last }' "$1" 2>/dev/null \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
 
 # step_argv <step-json>: fill STEP_ARGV with the step's token-expanded argv. A
 # partially read argv would run a DIFFERENT command from the one declared, so an
@@ -517,12 +528,21 @@ step_argv() {
 
 # run_step <label> <cwd> <step-json>: run one manifest step in <cwd> under the
 # component environment, bounded by its own timeout and by whatever is left of
-# the total budget. Sets STEP_OUT to the step's last non-empty output line and,
-# on failure, STEP_FAILURE to a diagnosable reason.
+# the total budget. Sets STEP_OUT to the last non-empty line the step printed on
+# STDOUT and, on failure, STEP_FAILURE to a diagnosable reason.
+#
+# The two streams are captured SEPARATELY and only the log merges them. A step's
+# value is an answer the manifest asked for, and every real toolchain writes
+# things that are not that answer to stderr: npm's update notice, uv's warnings,
+# a deprecation banner. Merging the streams made the last of those the step's
+# value, which silently broke `expect` comparisons and, worse, moved a
+# fingerprint input so a component rebuilt on every future lease. Diagnosis still
+# needs stderr, so STEP_DIAGNOSTIC falls back to it when stdout said nothing.
 run_step() {
   local label=$1 cwd=$2 step=$3
-  local timeout name budget status out_file expect actual
+  local timeout name budget status out_file err_file expect actual
   STEP_OUT=
+  STEP_DIAGNOSTIC=
   STEP_FAILURE=
   name=$(printf '%s' "$step" | jq -r '.name // ""' 2>/dev/null)
   [ -n "$name" ] || name=$label
@@ -540,26 +560,29 @@ run_step() {
     return 1
   fi
   out_file="$WORK_DIR/step.out"
+  err_file="$WORK_DIR/step.err"
   log_line "=== $label :: $name :: ${STEP_ARGV[*]} (cwd $cwd, timeout ${timeout}s)"
   status=0
   (
     cd "$cwd" || exit 126
     run_bounded "$timeout" \
       /usr/bin/env "${COMPONENT_ENV[@]}" "${STEP_ARGV[@]}"
-  ) > "$out_file" 2>&1 || status=$?
-  if [ -n "$LOG_FILE" ] && [ -s "$out_file" ]; then
-    cat "$out_file" >> "$LOG_FILE"
+  ) > "$out_file" 2> "$err_file" || status=$?
+  if [ -n "$LOG_FILE" ]; then
+    [ ! -s "$out_file" ] || cat "$out_file" >> "$LOG_FILE"
+    [ ! -s "$err_file" ] || cat "$err_file" >> "$LOG_FILE"
   fi
   log_line "--- exit $status"
-  STEP_OUT=$(awk 'NF { last = $0 } END { if (last != "") print last }' "$out_file" 2>/dev/null \
-    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  STEP_OUT=$(last_value_line "$out_file")
+  STEP_DIAGNOSTIC=$STEP_OUT
+  [ -n "$STEP_DIAGNOSTIC" ] || STEP_DIAGNOSTIC=$(last_value_line "$err_file")
   if [ "$status" -eq 124 ]; then
     STEP_FAILURE="$label '$name' timed out after ${timeout}s"
     return 1
   fi
   if [ "$status" -ne 0 ]; then
     STEP_FAILURE="$label '$name' exited $status"
-    [ -z "$STEP_OUT" ] || STEP_FAILURE="$STEP_FAILURE: $STEP_OUT"
+    [ -z "$STEP_DIAGNOSTIC" ] || STEP_FAILURE="$STEP_FAILURE: $STEP_DIAGNOSTIC"
     return 1
   fi
   expect=$(printf '%s' "$step" | jq -r '.expect // ""' 2>/dev/null)
@@ -588,6 +611,14 @@ ALL_PATH_PREPEND=
 # this component runs under. PATH is composed here and never taken from the
 # manifest env map, so the resolved runtime cannot be smuggled past the runtime
 # checks.
+#
+# THE MORE SPECIFIC DECLARATION WINS: a component's own path_prepend leads, and
+# the manifest-level entries follow it as the default for components that declare
+# nothing. The other order is not merely surprising - it is actively misleading,
+# because a component that declares node 18 under a node 20 manifest pin would
+# build against node 20 AND its runtime_checks would then validate the wrong
+# interpreter, and a check that passes against something the component is not
+# using manufactures confidence rather than providing it.
 component_env() {
   local comp=$1 key value prefix path_extra='' declared i
   local -a prefixes=()
@@ -609,9 +640,6 @@ component_env() {
     FAILURE_REASON="env declares $declared entries but only ${#COMPONENT_ENV[@]} could be read"
     return 1
   fi
-  for prefix in $ALL_PATH_PREPEND; do
-    path_extra="${path_extra:+$path_extra:}$prefix"
-  done
   if ! manifest_records "$comp" '.path_prepend'; then
     FAILURE_REASON="path_prepend must be an array of directories"
     return 1
@@ -623,6 +651,15 @@ component_env() {
       FAILURE_REASON="path_prepend directory does not exist: $prefix"
       return 1
     fi
+    # A colon is the PATH separator, so an entry carrying one would compose into
+    # two fragments that name no directory at all - the pin would read as
+    # declared and silently not apply.
+    case "$prefix" in
+      *:*) FAILURE_REASON="path_prepend directory contains a colon: $prefix"; return 1 ;;
+    esac
+    path_extra="${path_extra:+$path_extra:}$prefix"
+  done
+  for prefix in $ALL_PATH_PREPEND; do
     path_extra="${path_extra:+$path_extra:}$prefix"
   done
   COMPONENT_ENV[${#COMPONENT_ENV[@]}]="PATH=${path_extra:+$path_extra:}$PATH"
@@ -782,8 +819,7 @@ run_install() {
     fi
     if [ "$status" -ne 0 ]; then
       STEP_FAILURE="cannot remove $abs (exit $status)"
-      detail=$(awk 'NF { last = $0 } END { if (last != "") print last }' "$out_file" 2>/dev/null \
-        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      detail=$(last_value_line "$out_file")
       [ -z "$detail" ] || STEP_FAILURE="$STEP_FAILURE: $detail"
       return 1
     fi
@@ -989,9 +1025,17 @@ manifest_records "$MANIFEST_JSON" '.path_prepend' \
 for ((entry_index = 0; entry_index < ${#MANIFEST_PATH_PREPEND[@]}; entry_index++)); do
   entry=$(expand_tokens "${MANIFEST_PATH_PREPEND[$entry_index]}")
   [ -d "$entry" ] || emit failed "path_prepend directory does not exist: $entry"
+  # These three refusals all protect the same transport: a manifest-level entry
+  # is handed to fm-spawn.sh and composed into the PATH the crewmate's session
+  # runs under. A colon is the separator of that composition, so an entry
+  # carrying one splits into two fragments that name no directory, and the
+  # verdict would still report ready with a non-empty path_prepend while the
+  # crewmate's PATH silently lacked the pinned runtime - exactly the drift the
+  # pin exists to prevent, with no diagnostic.
   case "$entry" in
     *"'"*) emit failed "path_prepend directory contains a quote: $entry" ;;
     *" "*) emit failed "path_prepend directory contains a space: $entry" ;;
+    *:*) emit failed "path_prepend directory contains a colon: $entry" ;;
   esac
   ALL_PATH_PREPEND="${ALL_PATH_PREPEND:+$ALL_PATH_PREPEND }$entry"
   PATH_PREPEND="${PATH_PREPEND:+$PATH_PREPEND:}$entry"

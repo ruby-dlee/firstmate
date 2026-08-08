@@ -373,21 +373,35 @@ Every step runs with its standard input on `/dev/null`, so a step that wants inp
 `${HOME}` and `${WORKTREE}` are the only tokens that expand in command arguments, expected output, environment values, and the manifest's path fields, so a manifest can name a host runtime directory or a path inside the lease without being rewritten per worktree.
 Names and `description` are labels and do not expand, and no value is implicitly evaluated as a shell command.
 
-`path_prepend` directories go ahead of `PATH` for every step, and the manifest-level entries are also handed to `fm-spawn.sh`, which puts them ahead of the crewmate's own exported `PATH`.
+`path_prepend` directories go ahead of `PATH` for every step, and the manifest-level entries are also handed to `fm-spawn.sh`, which delivers them to the crewmate's session environment.
 That handover only happens for a `ready` verdict.
 Without it, provisioning could build a project under its pinned runtime while the crewmate's shell still resolved a different one, which is precisely the drift that had npm delegating a native build to an unpinned node.
-A manifest-level `path_prepend` entry must already be a directory and may not contain a space or single quote because it is also transported into that exported `PATH`; component-level entries affect only that component's provisioning steps.
-A published pin leads the crewmate's `PATH`, so it can carry any command name: a pinned Node prefix is exactly where a globally npm-installed `claude` or `codex` lives, and a pyenv shim or virtualenv prefix carries `python3`.
-It never decides which binary any command Firstmate itself names resolves to, because a spawn that publishes a pin names every one of them by the absolute path Firstmate resolved from its own `PATH` before the pin existed.
-That covers the harness, the first word of a raw launch command, the interpreter that carries a recorded continuation prompt, and the shell a harness turn-end hook runs.
-The pin still wins for the project's own tools, which is the whole point of declaring it.
-A launch command Firstmate cannot pin that way is refused before a worktree is leased and before any install runs, so the refusal never costs a lease; the refusal names the command word it could not resolve.
-A raw launch command is pinnable when its first word is a plain command name on Firstmate's own `PATH`, or already carries a path, which `PATH` cannot repoint.
+A `path_prepend` entry must already be a directory and may not contain a space, a single quote, or a colon, because it is composed into a `PATH` a shell will read and a colon is that composition's separator; an entry carrying one would split into two fragments naming no directory at all, so the pin would read as declared and silently not apply.
+
+Precedence, when both levels declare `path_prepend`: **the more specific declaration wins.**
+A component's own entries lead its steps' `PATH`, and the manifest-level entries follow them as the default for components that declare nothing.
+The other order is not merely surprising, it is actively misleading: a component that declares Node 18 under a Node 20 manifest pin would build against Node 20 and its own `runtime_checks` would then validate the wrong interpreter, and a check that passes against something the component is not using manufactures confidence rather than providing it.
+Only the manifest-level entries are handed to `fm-spawn.sh`; component-level entries affect that component's provisioning steps alone.
+
+Where a published pin applies is deliberately not "the `PATH` that resolves the launch line".
+A pin can carry any command name - a pinned Node prefix is exactly where a globally npm-installed `claude` or `codex` lives, and a pyenv shim or virtualenv prefix carries `python3` - so a manifest directory on that `PATH` would decide which binary every bare word of the launch line means: the harness, a wrapper, that wrapper's target, an interpreter.
+The crewmate `PATH` Firstmate exports therefore carries no manifest-supplied entry at all, and the whole launch line resolves from Firstmate's own resolution order as a property of the line rather than as a list of remembered words.
+The pin is applied instead by `bin/fm-launch-pinned.sh`, which is named by an absolute path, resolves the launch command against that un-pinned `PATH`, and only then exports the pin for the agent and every process it starts.
+So the pin still wins for the project's own tools inside the crewmate's session, which is the whole point of declaring it, and it decides nothing about what Firstmate itself launches.
+Any launch command works under a pin, including a raw launch command whose first word Firstmate cannot resolve; nothing is refused for being unpinnable.
+The one exception is a raw launch command that opens with a shell construct rather than a command word: it still launches and still resolves against Firstmate's own `PATH`, but the pin is not applied to it, and the spawn says so.
+
+A harness turn-end hook is not part of the launch line - it is a command Firstmate writes into a file the harness runs from inside the crewmate's session, where the pin is in effect by design - so those commands are pinned in their own right.
+The shell a hook runs, the hook script's own interpreter, and the `touch` that marks the turn are all named by the absolute path Firstmate resolved from its own `PATH`, for every harness that has a hook.
+A spawn that could publish a pin but could not resolve those is refused before a worktree is leased and before any install runs, so the refusal never costs a lease, and it names the command it could not resolve.
+That pre-lease refusal applies only when this spawn could actually publish a pin: a manifest whose `kinds` excludes this task's kind publishes nothing, so a scout on a `"kinds": ["ship"]` project is treated exactly like a project with no manifest, unless `--provision` overrides the kinds gate.
+An unreadable or malformed manifest is treated as one that could pin, so an unreadable file never buys a launch that a readable one would refuse.
 A component's `env` may not set `PATH`; use `path_prepend`, so a manifest cannot route around its own runtime checks.
 
 `runtime_checks` run before anything is built, so a component is never compiled or installed under the wrong runtime.
 A runtime check or probe with `expect` must print exactly that value; one that prints nothing never satisfies an `expect`.
-The value a step contributes - to `expect` and to a fingerprint - is its last non-empty output line, trimmed.
+The value a step contributes - to `expect` and to a fingerprint - is the last non-empty line it printed on standard output, trimmed.
+Standard error is captured to the step log for diagnosis but never contributes to that value, so a tool that trails its answer with an unrelated notice on stderr - npm's update banner, a uv warning, a deprecation note - cannot fail an `expect` comparison or move a fingerprint input.
 
 `fingerprint` is what makes an unchanged environment reusable.
 Reuse requires both a matching digest over the declared `files` and `versions` AND passing `probes`; probes run on every invocation, so a merely existing directory is never assumed healthy, and a fingerprint hit whose probes fail rebuilds instead.

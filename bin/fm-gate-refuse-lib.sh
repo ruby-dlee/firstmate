@@ -84,9 +84,9 @@
 # and fm-x-lib.sh.
 # Excluded pure helpers are not entrypoints: backends/herdr-eventwait.py,
 # fm-contained-read.cjs, fm-contained-read.py, fm-file-transaction.cjs,
-# fm-markdown-structure.cjs, and fm-prompt-exec.py carry no fleet dispatch of
-# their own and are reached only through the entrypoints and libraries above,
-# so they inherit the caller's refusal.
+# fm-launch-pinned.sh, fm-markdown-structure.cjs, and fm-prompt-exec.py carry no
+# fleet dispatch of their own and are reached only through the entrypoints and
+# libraries above, so they inherit the caller's refusal.
 # fm-herdr-lab.sh is excluded because it accepts only isolated fm-lab-* sessions
 # and protects the live default session with its own tripwire.
 # fm-install-shellcheck.sh and fm-lint.sh are excluded developer verification

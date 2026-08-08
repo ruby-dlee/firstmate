@@ -155,6 +155,8 @@ CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
 fm_refuse_if_gate_agent
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
+# shellcheck source=bin/fm-marker-state-lib.sh
+. "$SCRIPT_DIR/fm-marker-state-lib.sh"
 # shellcheck source=bin/fm-treehouse-lib.sh
 . "$SCRIPT_DIR/fm-treehouse-lib.sh"
 FM_LOCK_LOG_PREFIX=teardown
@@ -231,7 +233,6 @@ require_safe_task_metadata() {
 }
 
 require_safe_task_metadata || exit 1
-SUBSUPER_TASK_KEY=$(printf '%s' "$ID" | tr ':/.' '___')
 TEARDOWN_ACCOUNT_LOCKS=('')
 MANAGED_ACCOUNT_LOCK=
 ACCOUNT_DELETE_LOCK=
@@ -5177,6 +5178,7 @@ EOF
       fi
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id"
+    fm_marker_cleanup_owned "$sub_state" "$child_id" || return 1
     rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.provision.log"
     [ -z "$child_account_lock" ] || fm_account_lifecycle_lock_release "$child_account_lock" >/dev/null 2>&1 || true
   done <<EOF
@@ -5312,8 +5314,8 @@ if [ "$ORCA_CLEANUP_PENDING" = 1 ]; then
   remove_grok_turnend_auth "$STATE" "$ID"
   fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
   safe_remove_task_tmp "$TASK_TMP" || exit 1
-  rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log" \
-    "$STATE/.subsuper-stale-$SUBSUPER_TASK_KEY" "$STATE/.subsuper-paused-$SUBSUPER_TASK_KEY"
+  fm_marker_cleanup_owned "$STATE" "$ID" || exit 1
+  rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log"
   [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
   ACCOUNT_DELETE_LOCK=
   echo "teardown $ID complete (Orca cleanup quarantine cleared)"
@@ -5842,8 +5844,8 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the exact recorded per-generation task temp root, including gotmp.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -z "$TASK_TMP" ] || safe_remove_task_tmp "$TASK_TMP" || exit 1
-rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log" \
-  "$STATE/.subsuper-stale-$SUBSUPER_TASK_KEY" "$STATE/.subsuper-paused-$SUBSUPER_TASK_KEY"
+fm_marker_cleanup_owned "$STATE" "$ID" || exit 1
+rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log"
 [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true

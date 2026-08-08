@@ -48,6 +48,8 @@ read_pr() {
   PR_STATE=$(scalar "$PR_DOC" state)
   PR_DRAFT=$(scalar "$PR_DOC" draft)
   PR_AUTO=$(scalar "$PR_DOC" auto_merge)
+  PR_MERGEABLE=$(scalar "$PR_DOC" mergeable)
+  PR_MERGEABLE_STATE=$(scalar "$PR_DOC" mergeable_state)
   PR_AUTHOR=$(section_scalar "$PR_DOC" user login)
   PR_CHANGED=$(scalar "$PR_DOC" changed_files)
   case "$PR_CHANGED" in ''|*[!0-9]*) return 1 ;; esac
@@ -66,6 +68,10 @@ read_pr || { echo "error: could not read exact PR head/base for $URL" >&2; exit 
 [ "$PR_STATE" = open ] || { echo "error: PR is not open (state=$PR_STATE)" >&2; exit 1; }
 [ "$PR_DRAFT" = false ] || { echo "error: PR is draft" >&2; exit 1; }
 [ "$PR_AUTO" = null ] || { echo "error: PR already has an armed auto-merge" >&2; exit 1; }
+[ "$PR_MERGEABLE" = true ] && [ "$PR_MERGEABLE_STATE" = clean ] || {
+  echo "error: exact head is UNREVIEWED: GitHub protected-review eligibility is not clean (mergeable=$PR_MERGEABLE mergeable_state=$PR_MERGEABLE_STATE)" >&2
+  exit 1
+}
 
 LOCAL_HEAD=$(git -C "$WORKTREE" rev-parse HEAD)
 [ "$LOCAL_HEAD" = "$PR_HEAD" ] || {
@@ -111,7 +117,7 @@ git -C "$WORKTREE" status --porcelain=v1 --untracked-files=all > "$TMP_DIR/workt
 }
 
 fm_pr_require_server_admission_rule "$OWNER" "$REPO" "$PR_BASE_REF" "$TMP_DIR/policy-initial" || {
-  echo "error: base branch does not enforce strict required checks, stale-review dismissal, code-owner and last-push review, two approvals, and admin protection" >&2
+  echo "error: base branch does not enforce strict required checks, stale-review dismissal, code-owner and last-push review, required approvals, and admin protection" >&2
   exit 1
 }
 
@@ -241,8 +247,12 @@ require_protected_checks() {
 }
 
 snapshot_reviews() {
-  local prefix=$1 review_page=1 review_page_count review_id reviewer review_state review_head
-  local author_key review_blocked=0 reviewers
+  local prefix=$1 policy=$2 review_page=1 review_page_count review_id reviewer review_state review_head
+  local author_key review_blocked=0 reviewers required_approvals
+  required_approvals=$(awk -F '\t' '
+    $1 == "required_approvals" && $2 ~ /^[1-9][0-9]*$/ { value=$2; count++ }
+    END { if (count != 1) exit 1; print value }
+  ' "$policy") || { echo "error: required approval policy is unreadable" >&2; return 1; }
   : > "$prefix-reviews-unsorted"
   : > "$prefix-reviews-unsorted-normalized"
   while :; do
@@ -287,8 +297,8 @@ snapshot_reviews() {
     printf '%s\n' "$reviewer" >> "$prefix-approved-reviewers"
   done < "$prefix-latest-review-states"
   reviewers=$(LC_ALL=C sort -u "$prefix-approved-reviewers" | wc -l | tr -d ' ')
-  [ "$review_blocked" -eq 0 ] && [ "$reviewers" -ge 2 ] || {
-    echo "error: exact head is UNREVIEWED: need two distinct non-author APPROVED verdicts and no exact-head change request (approvals=$reviewers blocked=$review_blocked)" >&2
+  [ "$review_blocked" -eq 0 ] && [ "$reviewers" -ge "$required_approvals" ] || {
+    echo "error: exact head is UNREVIEWED: need $required_approvals distinct non-author APPROVED verdicts and no exact-head change request (approvals=$reviewers blocked=$review_blocked)" >&2
     return 1
   }
   printf '%s\t%s\n' "$reviewers" "$review_blocked" > "$prefix-review-summary"
@@ -296,7 +306,7 @@ snapshot_reviews() {
 
 snapshot_checks "$TMP_DIR/initial" || exit 1
 require_protected_checks "$TMP_DIR/policy-initial" "$TMP_DIR/initial-check-runs" "$TMP_DIR/initial-statuses" || exit 1
-snapshot_reviews "$TMP_DIR/initial" || exit 1
+snapshot_reviews "$TMP_DIR/initial" "$TMP_DIR/policy-initial" || exit 1
 IFS=$'\t' read -r total passed failed skipped pending < "$TMP_DIR/initial-check-summary"
 IFS=$'\t' read -r reviewers review_blocked < "$TMP_DIR/initial-review-summary"
 
@@ -308,13 +318,14 @@ FIRST_BASE_REF=$PR_BASE_REF
 read_pr || { echo "error: PR moved or became unreadable during admission" >&2; exit 1; }
 [ "$PR_HEAD" = "$FIRST_HEAD" ] && [ "$PR_BASE" = "$FIRST_BASE" ] \
   && [ "$PR_BASE_REF" = "$FIRST_BASE_REF" ] && [ "$PR_STATE" = open ] \
-  && [ "$PR_DRAFT" = false ] && [ "$PR_AUTO" = null ] || {
+  && [ "$PR_DRAFT" = false ] && [ "$PR_AUTO" = null ] \
+  && [ "$PR_MERGEABLE" = true ] && [ "$PR_MERGEABLE_STATE" = clean ] || {
     echo "error: PR head/base/state changed during admission; all verdicts are stale" >&2
     exit 1
   }
 
 fm_pr_require_server_admission_rule "$OWNER" "$REPO" "$PR_BASE_REF" "$TMP_DIR/policy-final" || {
-  echo "error: base branch does not enforce strict required checks, stale-review dismissal, code-owner and last-push review, two approvals, and admin protection" >&2
+  echo "error: base branch does not enforce strict required checks, stale-review dismissal, code-owner and last-push review, required approvals, and admin protection" >&2
   exit 1
 }
 cmp -s "$TMP_DIR/policy-initial" "$TMP_DIR/policy-final" || {
@@ -327,7 +338,7 @@ git -C "$WORKTREE" status --porcelain=v1 --untracked-files=all > "$TMP_DIR/final
   exit 1
 }
 snapshot_checks "$TMP_DIR/final" || exit 1
-snapshot_reviews "$TMP_DIR/final" || exit 1
+snapshot_reviews "$TMP_DIR/final" "$TMP_DIR/policy-final" || exit 1
 cmp -s "$TMP_DIR/initial-check-runs" "$TMP_DIR/final-check-runs" \
   && cmp -s "$TMP_DIR/initial-statuses" "$TMP_DIR/final-statuses" \
   && cmp -s "$TMP_DIR/initial-reviews" "$TMP_DIR/final-reviews" || {
@@ -338,7 +349,8 @@ require_protected_checks "$TMP_DIR/policy-final" "$TMP_DIR/final-check-runs" "$T
 read_pr || { echo "error: PR moved after server policy verification" >&2; exit 1; }
 [ "$PR_HEAD" = "$FIRST_HEAD" ] && [ "$PR_BASE" = "$FIRST_BASE" ] \
   && [ "$PR_BASE_REF" = "$FIRST_BASE_REF" ] && [ "$PR_STATE" = open ] \
-  && [ "$PR_DRAFT" = false ] && [ "$PR_AUTO" = null ] || {
+  && [ "$PR_DRAFT" = false ] && [ "$PR_AUTO" = null ] \
+  && [ "$PR_MERGEABLE" = true ] && [ "$PR_MERGEABLE_STATE" = clean ] || {
     echo "error: PR changed after server policy verification" >&2
     exit 1
   }

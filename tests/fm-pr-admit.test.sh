@@ -27,13 +27,18 @@ case "$*" in
     count=$((count + 1))
     printf '%s\n' "$count" > "$FM_TEST_PR_COUNT"
     pr_head=$FM_TEST_HEAD
+    mergeable_state=clean
     if [ "$FM_TEST_PR_MODE" = move ] && [ "$count" -gt 1 ]; then
       pr_head=$FM_TEST_BASE
     fi
+    [ "$FM_TEST_PR_MODE" != review-blocked ] || mergeable_state=blocked
+    if [ "$FM_TEST_PR_MODE" = eligibility-race ] && [ "$count" -gt 1 ]; then mergeable_state=blocked; fi
     cat <<EOF
 state: open
 draft: false
 auto_merge: null
+mergeable: true
+mergeable_state: $mergeable_state
 changed_files: 1
 user:
   login: author
@@ -131,6 +136,26 @@ reviews[3]:
     commit_id: $FM_TEST_HEAD
 EOF
         ;;
+      three)
+        cat <<EOF
+reviews[3]:
+  - id: 1
+    user:
+      login: reviewer-one
+    state: APPROVED
+    commit_id: $FM_TEST_HEAD
+  - id: 2
+    user:
+      login: reviewer-two
+    state: APPROVED
+    commit_id: $FM_TEST_HEAD
+  - id: 3
+    user:
+      login: reviewer-three
+    state: APPROVED
+    commit_id: $FM_TEST_HEAD
+EOF
+        ;;
       *)
         reviewer_two=reviewer-two
         review_head=$FM_TEST_HEAD
@@ -162,11 +187,11 @@ EOF
     fi
     ;;
   'api /repos/ruby-dlee/firstmate/branches/main/protection/required_pull_request_reviews')
-    if [ "$FM_TEST_POLICY_MODE" = weak ]; then
-      printf 'required_approving_review_count: 1\ndismiss_stale_reviews: false\nrequire_code_owner_reviews: false\nrequire_last_push_approval: false\n'
-    else
-      printf 'required_approving_review_count: 2\ndismiss_stale_reviews: true\nrequire_code_owner_reviews: true\nrequire_last_push_approval: true\n'
-    fi
+    case "$FM_TEST_POLICY_MODE" in
+      weak) printf 'required_approving_review_count: 1\ndismiss_stale_reviews: false\nrequire_code_owner_reviews: false\nrequire_last_push_approval: false\n' ;;
+      three) printf 'required_approving_review_count: 3\ndismiss_stale_reviews: true\nrequire_code_owner_reviews: true\nrequire_last_push_approval: true\n' ;;
+      *) printf 'required_approving_review_count: 2\ndismiss_stale_reviews: true\nrequire_code_owner_reviews: true\nrequire_last_push_approval: true\n' ;;
+    esac
     ;;
   'api /repos/ruby-dlee/firstmate/branches/main/protection/enforce_admins')
     printf 'enabled: true\n'
@@ -193,6 +218,8 @@ out=$(run_admit) || fail "nested review identities were not admitted"
 assert_contains "$out" "reviewers=2" "admission did not count two nested non-author identities"
 out=$(run_admit valid status-context) || fail "protected status context was not admitted"
 assert_contains "$out" "passed=2" "admission did not bind the protected exact-head status context"
+out=$(run_admit three success valid three) || fail "three policy-qualified approvals were not admitted"
+assert_contains "$out" "reviewers=3" "admission did not enforce the live three-approval policy"
 
 expect_refusal() {  # <name> <stderr-pattern> [review] [check] [files] [policy] [pr]
   local name=$1 pattern=$2 rc
@@ -218,6 +245,9 @@ expect_refusal check-evidence-race 'evidence changed during admission' valid rac
 expect_refusal review-evidence-race 'evidence changed during admission' race
 expect_refusal containment-mismatch 'GitHub PR files differ' valid success mismatch
 expect_refusal weak-policy 'base branch does not enforce' valid success valid weak
+expect_refusal policy-approval-count 'need 3 distinct' valid success valid three
+expect_refusal protected-review-eligibility 'protected-review eligibility is not clean' valid success valid strict review-blocked
+expect_refusal protected-review-race 'head/base/state changed during admission' valid success valid strict eligibility-race
 expect_refusal moving-head 'PR head/base/state changed during admission' valid success valid strict move
 
 printf 'dirty\n' > "$WT/untracked.txt"

@@ -77,6 +77,7 @@ Absence of a process sample, a stale status field, or one quiet observation can 
 - `bin/fm-nm-step-liveness.sh` maps affirmative process evidence to `alive` and every absence, timeout, unreadable state, and repeated zero sample to `unknown`.
 - `bin/fm-crew-state.sh` consumes branch-matched run evidence before pane and status evidence and downgrades legacy `dead` vocabulary to unknown.
 - `bin/fm-classify-lib.sh`, `bin/fm-watch.sh`, and `bin/fm-supervise-daemon.sh` absorb a lane only from affirmative run-owned process evidence; pane, status, missing-target, and unreadable observations remain UNKNOWN.
+- Daemon stale and pause markers use collision-free task keys, attribute legacy keys only to one positively verified metadata owner, and serialize every marker write with the task lifecycle lock held by spawn and teardown.
 - `bin/fm-auto-reap.sh` has no validation-abort route and retains every active, cross-branch, ambiguously attributed, or otherwise uncustodied run.
 - Teardown remains the sole destructive boundary and still requires its independent exact ownership, cleanliness, landed-work, and endpoint proofs.
 
@@ -164,6 +165,7 @@ A merge can be treated as ready while checks are pending, the reviewed head has 
 
 - `bin/fm-pr-check.sh` records canonical live PR metadata without granting merge authority.
 - `bin/fm-pr-admit.sh` independently reads the live PR and requires an open non-draft PR, exact expected head, every protected context and app identity in settled successful exact-head evidence, clean exact-head review state, and PR-file and worktree containment.
+- Review admission uses the live policy approval count and GitHub's clean protected-merge eligibility to prove enabled code-owner and last-push requirements are satisfied by the exact head.
 - Immediately before admission, `bin/fm-pr-admit.sh` re-snapshots protected policy plus the complete exact-head check and review evidence and refuses any same-head change.
 - Pending, queued, missing, unreadable, stale, stopped, wrong-head, or absent reviewer output is `UNREVIEWED`, never clean.
 - `bin/fm-crosscheck.sh verify` rechecks live head, base, claims digest, reviewer independence, executed reproduction evidence, and durable finding lifecycle.

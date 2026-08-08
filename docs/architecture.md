@@ -47,7 +47,7 @@ When a terminal run reports `outcome: passed`, the helper verifies the PR detail
 An open-PR `passed` or `checks-passed` outcome and a checks-green CI marker are classified by the exact remote-only currentness contract in `bin/fm-crew-state.sh`'s header; only `done` authorizes the PR-ready workflow.
 During no-mistakes' `ci` monitor phase, it also reads the ci step log tail because `axi status` reports both "still waiting on checks" and "checks green, waiting on merge" as `ci,running`.
 The most recent recognized ci log marker wins, so checks-green monitoring supplies the ready claim while a later re-arm, failed-check, or issue marker returns the crewmate to working before remote currentness is considered.
-Only when no matching run exists does it fall back to the pane busy-signature and then a status-log event whose verb maps to a recognized run-state; a dead pane without a run reports unknown instead of trusting a stale log.
+Only when run discovery affirmatively proves no matching run exists does it fall back to the pane busy-signature and then a status-log event whose verb maps to a recognized run-state; a timeout, malformed response, or other lookup uncertainty reports unknown instead of trusting the pane or a stale log.
 Decision-only events such as `resolved` never become current state or leak their prose into the current-state detail.
 In that status-log fallback, a valid external wait reports `paused` with its reason, owner, and clearing condition.
 An idle ordinary crewmate whose last event still claims work in progress, with no positive working evidence and no valid pause, reports `wedged`; decision-only events, unrecognized verbs, and evidence-free silence remain `unknown`.

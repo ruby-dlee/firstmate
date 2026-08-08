@@ -228,7 +228,7 @@ nm_run_capture() {  # <output-variable> <args...>
   case "$HAVE_TIMEOUT" in
     timeout)  _nm_captured=$(cd "$WT" && timeout "$NM_TIMEOUT" no-mistakes "$@" 2>/dev/null); _nm_status=$? ;;
     gtimeout) _nm_captured=$(cd "$WT" && gtimeout "$NM_TIMEOUT" no-mistakes "$@" 2>/dev/null); _nm_status=$? ;;
-    perl)     _nm_captured=$(cd "$WT" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$NM_TIMEOUT" no-mistakes "$@" 2>/dev/null); _nm_status=$? ;;
+    perl)     _nm_captured=$(cd "$WT" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' "$NM_TIMEOUT" no-mistakes "$@" 2>/dev/null); _nm_status=$? ;;
     *)        _nm_captured=; _nm_status=127 ;;
   esac
   printf -v "$output_var" '%s' "$_nm_captured"
@@ -246,7 +246,7 @@ gh_axi_run() {  # <args...>
   case "$HAVE_TIMEOUT" in
     timeout)  ( cd "$WT" && timeout "$GH_TIMEOUT" gh-axi "$@" ) 2>/dev/null || true ;;
     gtimeout) ( cd "$WT" && gtimeout "$GH_TIMEOUT" gh-axi "$@" ) 2>/dev/null || true ;;
-    perl)     ( cd "$WT" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$GH_TIMEOUT" gh-axi "$@" ) 2>/dev/null || true ;;
+    perl)     ( cd "$WT" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' "$GH_TIMEOUT" gh-axi "$@" ) 2>/dev/null || true ;;
     *)        true ;;
   esac
 }
@@ -565,7 +565,7 @@ nm_step_liveness() {
     # with neither timeout nor gtimeout - the ordinary macOS default, including
     # this one - fell through to an UNBOUNDED probe call, so a slow lsof or
     # process scan could block the supervision read for as long as it took.
-    perl)     out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
+    perl)     out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' \
                   "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 1 2>/dev/null) || status=$? ;;
     *)        printf 'unknown (probe unreadable: no bounded runner available)'; return ;;
   esac

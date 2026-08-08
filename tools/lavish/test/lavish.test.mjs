@@ -52,7 +52,7 @@ async function fixture(name) {
   await mkdir(home, { recursive: true });
   await writeFile(
     request,
-    '# Release choice\n\nRecommendation: choose blue.\n\nBlue is safer; green is faster.\n',
+    '<!-- fm-captain-item: note -->\n# Release choice\n\nRecommendation: choose blue.\n\nBlue is safer; green is faster.\n<!-- /fm-captain-item -->\n',
   );
   await writeFile(
     questions,
@@ -957,7 +957,10 @@ test('intake recovers a browser download payload without manual copy', async () 
   assert.match(intake.stdout, /release-choice,consumed/);
 
   const destinationPath = join(fx.home, 'data/lavish-answers/release-choice.json');
-  assert.deepEqual(JSON.parse(await readFile(destinationPath, 'utf8')), payload);
+  assert.deepEqual(
+    JSON.parse(await readFile(destinationPath, 'utf8')),
+    { ...payload, home_marker: fx.home },
+  );
   assert.equal(manifest.destination_format, 'payload-json-v2');
   assert.equal(
     await exists(join(fx.home, 'data/decisions', id, 'answer.toon')),
@@ -1041,7 +1044,7 @@ test('protocol-1 JSON destinations recover byte-for-byte before receipt', async 
   await writeFile(destinationPath, answerBytes);
 
   const intake = await runCli(['intake'], { home: fx.home });
-  assert.equal(intake.code, 0, intake.stderr);
+  assert.equal(intake.code, 0, `${intake.stderr}\n${intake.stdout}`);
   assert.match(intake.stdout, /release-choice,consumed/);
   assert.deepEqual(await readFile(destinationPath), answerBytes);
   assert.equal(

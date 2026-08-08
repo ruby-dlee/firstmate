@@ -5,6 +5,8 @@
 # deterministically reach (persistent-Enter-swallow, max-defer wedge alarms,
 # fm-send swallow reporting, composer-pending ANSI parsing). The operator-visible
 # inject flow lives in fm-afk-inject-e2e and fm-wake-daemon-lifecycle-e2e.
+# Test-local backend stubs are invoked indirectly by sourced production functions.
+# shellcheck disable=SC2329
 set -u
 export FM_ORCA_TEST_LAB=firstmate-orca-test-lab-v1
 export FM_ORCA_TEST_AUTHORITY_CAPABILITIES=verified-v1
@@ -117,14 +119,42 @@ test_classify_terminal_signal_escalates() {
 }
 
 test_classify_check_and_unknown_escalate() {
-  local out
+  local dir state out
+  dir=$(make_supercase classify-check)
+  state="$dir/state"
   out=$(classify_check "check: /s/c.check.sh: merged: https://x")
   case "$out" in escalate\|*) ;; *) fail "check did not escalate: $out" ;; esac
   out=$(classify_unknown "frobnicate: weird")
   case "$out" in escalate\|*) ;; *) fail "unknown did not fail-safe escalate: $out" ;; esac
-  out=$(classify_heartbeat)
+  out=$(classify_heartbeat "$state")
   case "$out" in self\|*) ;; *) fail "heartbeat did not self-handle: $out" ;; esac
   pass "check + unknown escalate; heartbeat self-handles"
+}
+
+test_liveness_verdicts_surface_through_away_classifiers() {
+  local verdict dir state fakebin current out
+  for verdict in alive dead unknown; do
+    dir=$(make_supercase "away-liveness-$verdict")
+    state="$dir/state"
+    fakebin="$dir/fakebin"
+    make_fake_crew_state "$fakebin" >/dev/null
+    fm_write_meta "$state/task.meta" "window=sess:fm-task" "kind=ship"
+    : > "$state/task.turn-ended"
+    current="state: working · source: run-step · validating (running) · liveness: $verdict (probe result) · step: test"
+
+    out=$(FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_FAKE_CREW_STATE="$current" classify_signal "$state/task.turn-ended" "$state")
+    case "$out" in self\|*) ;; *) fail "away signal inferred liveness from $verdict field: $out" ;; esac
+
+    out=$(FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_FAKE_CREW_STATE="$current" classify_stale "sess:fm-task" "$state")
+    case "$out" in self\|*) ;; *) fail "away stale inferred liveness from $verdict field: $out" ;; esac
+
+    out=$(FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_FAKE_CREW_STATE="$current" classify_heartbeat "$state")
+    case "$out" in self\|*) ;; *) fail "away heartbeat inferred liveness from $verdict field: $out" ;; esac
+  done
+  pass "away-mode signal, stale, and heartbeat classifiers never infer liveness from a recorded field"
 }
 
 test_stale_transient_self_records_marker() {
@@ -1481,7 +1511,7 @@ test_fm_send_exits_nonzero_on_confirmed_swallow() {
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_STATE_OVERRIDE="$dir/state" FM_FAKE_COMPOSER="$dir/composer" \
     FM_FAKE_SENT="$sent" "$ROOT/bin/fm-send.sh" sess:win 'route this work' >/dev/null 2>"$err"; rc=$?
   expect_code 1 "$rc" "fm-send must refuse a split literal-plus-Enter adapter"
-  grep -F 'no atomic agent-session-bound tmux route' "$err" >/dev/null \
+  grep -F 'atomic tmux steering verdict=send-failed' "$err" >/dev/null \
     || fail "fm-send did not explain the atomic steering refusal: $(cat "$err")"
   [ ! -s "$sent" ] || fail "atomic steering refusal still wrote pane input"
   pass "fm-send refuses split submit adapters before pane input"
@@ -1696,10 +1726,16 @@ test_inject_msg_defers_on_dead_shell_unknown() {
   pass "inject_msg: defers on a dead-shell/unreadable composer (unknown), never typing the escalation into a shell"
 }
 
-if [ "${FM_TEST_FOCUSED:-}" = liveness-batches ]; then
-  test_housekeeping_stale_liveness_runs_one_bounded_parallel_window
-  exit 0
-fi
+case "${FM_TEST_FOCUSED:-}" in
+  liveness-batches)
+    test_housekeeping_stale_liveness_runs_one_bounded_parallel_window
+    exit 0
+    ;;
+  liveness-verdicts)
+    test_liveness_verdicts_surface_through_away_classifiers
+    exit 0
+    ;;
+esac
 
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
@@ -1708,6 +1744,7 @@ test_daemon_state_root_uses_fm_home
 test_classify_routine_signal_self
 test_classify_terminal_signal_escalates
 test_classify_check_and_unknown_escalate
+test_liveness_verdicts_surface_through_away_classifiers
 test_stale_transient_self_records_marker
 test_stale_terminal_escalates
 test_stale_paused_classifies_pause

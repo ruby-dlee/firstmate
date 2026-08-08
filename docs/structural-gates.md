@@ -1,241 +1,186 @@
-# Structural hardening gates
+# Structural gates
 
-This document records the six gates added after the 2026-08-01 supervision failures.
+This document records the six hardening gates, every production route each gate covers, the mechanical trigger and predicate, and the fail-closed result.
+The route inventory was checked against the firstmate instruction-surface audit and the gate taxonomy report supplied with the implementation.
 
-Every claimed gate names its covered route, mechanical trigger, deterministic predicate, and failure mode.
+## Gate A - Codex capability and runtime integrity
 
-An instruction-only boundary is labelled as such instead of being presented as a hard gate.
+### Risk
 
-## Gate A: Codex dispatch and runtime profile
+A Codex lane can silently run below the required reasoning policy because launch metadata, quota telemetry, and process presence do not prove which model actually completed a turn.
 
-Covered route: every verified `harness=codex` launch through `bin/fm-spawn.sh`, every direct-account Codex steer through `bin/fm-send.sh`, and every recorded Codex task inspected by the watcher.
+### Complete route inventory
 
-Mechanical trigger: spawn admission runs before endpoint creation, attempted direct-account text steering verifies before backend admission, and the watcher invokes `bin/fm-runtime-profile.sh` every five minutes.
+- New Codex ship and scout launches pass through `bin/fm-spawn.sh`, which calls the runtime-policy assertion before endpoint creation and emits explicit `--model gpt-5.6-sol -c model_reasoning_effort=xhigh` launch settings.
+- Direct-account selection passes through `bin/fm-account-directory.sh`, which considers only accounts with a current positive completion proof from an isolated real `codex exec` probe and ignores quota telemetry for admission.
+- Positive and negative account proofs have bounded lifetimes, are serialized, and are bound to the physical account-directory identity, so stale or redirected caches cannot authorize routing.
+- Direct-account recovery passes through `bin/fm-spawn.sh --recover-direct-account`, which re-resolves the current harness and Codex policy instead of replaying the recorded model and effort.
+- Steering a managed Codex target passes through `bin/fm-send.sh`, which runs `bin/fm-runtime-profile.sh` before delivering text and refuses when the current generation is not positively verified.
+- Runtime supervision passes through `bin/fm-watch.sh` and `bin/fm-supervise-daemon.sh`, which re-run the exact-generation runtime verifier at bounded intervals and surface a mismatch instead of treating the lane as healthy.
+- `bin/fm-codex-runtime-profile.mjs` reads Codex's own session records and requires the recorded provider session, generation, model, and reasoning effort to match the task metadata and policy.
+- Herdr's Codex pane-input steering route is closed because pane input cannot atomically preserve the registered agent session and Herdr's native send can reapply stored settings.
 
-Each new Codex task generation also lacks a runtime receipt by construction, so the already-required live watcher verifies its harness record immediately after start, with a sixty-second startup grace only for rollout publication.
+### Trigger, predicate, and failure mode
 
-Deterministic predicate: the only admitted profile is `model=gpt-5.6-sol effort=xhigh`, and the latest matching Codex `turn_context` or `thread_settings_applied` rollout record from the recorded provider session and runtime start must contain those exact values.
+- Trigger: account selection, new spawn, direct recovery, each managed steer, startup verification, and periodic in-flight verification.
+- Predicate: a ground-truth completion probe succeeds under the selected account and the live exact-generation Codex record says `gpt-5.6-sol` with `xhigh` effort.
+- Failure mode: account selection excludes the account, launch or recovery refuses, steering exits nonzero before input, or supervision reports an unverified runtime and retains the lane for diagnosis.
 
-The launch record persists the exact runtime home used by direct selection or the Agent Fleet profile, and the verifier never falls back to its own ambient Codex home.
+### Provider boundary
 
-Recovery re-resolves the current harness, model, and effort policy instead of replaying their recorded metadata values.
+Firstmate can deterministically set and verify launch settings and can repeatedly read Codex's own turn record, but it cannot interpose inside Codex's provider-side model substitution mechanism.
+The structural response is therefore prevention at every firstmate-owned launch and steer boundary plus automatic bounded re-verification while the lane remains live.
+A substitution may exist until the next Codex-owned record is readable, so no status or process signal is allowed to conceal that interval as verified.
 
-When natural-language dispatch rules are active, recovery mechanically requires the caller to pass the freshly selected concrete harness profile because shell code cannot re-evaluate those rules.
+### Deterministic evidence
 
-A native same-session recovery proceeds only when its recorded provider still equals current harness policy; otherwise it refuses and requires an explicit continuation profile.
+- `tests/fm-account-directory.test.sh` covers ground-truth routing, cache bounds, identity binding, exact launch policy, and recovery re-resolution.
+- `tests/fm-spawn-dispatch-profile.test.sh` covers the mandatory Codex model and effort policy.
+- `tests/fm-runtime-profile.test.sh` covers exact-generation verification, substitution detection, mismatched sessions, and unreadable records.
+- `tests/fm-send-strict.test.sh` covers refusal to steer an unverified Codex runtime.
 
-Failure mode: a below-policy spawn exits before endpoint creation; a runtime mismatch or unreadable runtime record wakes supervision; a direct-account steer exits nonzero.
+## Gate B - Verified message delivery
 
-Text steering refuses on Herdr and every pane-backed adapter because none exposes one atomic operation bound to an expected agent session that both writes and submits the instruction.
+### Risk
 
-Native Herdr `agent send` writes literal input but does not submit it, so it cannot satisfy this boundary for any harness.
+A command can be accepted by a backend client without reaching the intended live target, which previously allowed callers to report delivery on submit success alone.
 
-An opaque raw custom executable remains outside the verified Codex adapter contract because its transitive behavior cannot be inspected deterministically.
+### Complete route inventory
 
-Codex account routing does not consume quota-axi telemetry as either an eligibility or refusal signal because measured fixtures proved it wrong in both directions.
+- Text delivery through `bin/fm-send.sh` requires target resolution, endpoint identity verification, lifecycle revalidation for managed targets, an atomic agent-session-bound backend confirmation, and a fresh identity-bound target read after submission.
+- No current backend can bind terminal input atomically to the registered agent session, so every production text-steering adapter refuses before pane input instead of falling back to split text-plus-Enter.
+- Key delivery through `bin/fm-send.sh` uses the same managed identity and lifecycle checks and records an explicit delivered or not-delivered event.
+- Tmux verification binds the recorded stable window ID and session identity, so a reused window name in another session is not the target.
+- Herdr verification preserves the exact backend target and registered label when metadata exists, and an explicit metadata-free target remains visibly unbound.
+- Secondmate markers and ordinary steering both use the same `fm-send` boundary, so no alternate supervisor send path can claim success from submit alone.
 
-Those fixtures make the telemetry permanently contested, not just stale; it never becomes a routing predicate, and an expired ground-truth proof always requires a fresh codex completion probe.
+### Trigger, predicate, and failure mode
 
-The deterministic capacity predicate is successful completion of a tiny ephemeral exact-profile `codex exec` probe under the account home.
+- Trigger: every `fm-send` text or key request.
+- Predicate: the exact target remains identity-matched, the backend returns `confirmed` from an atomic agent-session-bound submit, and a fresh post-submit read succeeds from that same target.
+- Failure mode: an unavailable atomic route, submit failure, pending confirmation, unknown confirmation, malformed verdict, lifecycle drift, identity mismatch, or failed post-submit read exits nonzero and is journaled as not delivered or not submitted.
 
-Positive proofs are cached for thirty minutes and unavailable probes for one minute; the former bounds healthy-account probe cost to two per hour, while the latter avoids a spawn loop hammering an exhausted or unauthenticated account.
+### Deterministic evidence
 
-If the probe command is missing, times out, refuses, fails authentication, or returns no exact sentinel, that account is unavailable; no positive account proof fails spawn closed.
+- `tests/fm-send-strict.test.sh` covers successful verified delivery, submit-only false positives, malformed verdicts, identity reuse, lifecycle races, and audit outcomes.
+- `tests/fm-send-permission-modal-probe.sh` proves every Herdr composer and modal state remains untouched when no atomic steering route exists.
 
-Pane activity and pipeline liveness are never capacity evidence.
+## Gate C - Epistemically safe liveness and custody
 
-Account config pins and explicit launch flags preserve the `refuse loudly rather than degrade silently` invariant for future launches, but they do not retroactively repair a session that already substituted its model; that session remains mismatched until relaunched.
+### Risk
 
-## Gate B: Steering delivery
+Absence of a process sample, a stale status field, or one quiet observation can be mistaken for death and used to cancel or destroy work that is still active.
 
-Status: unshipped stated gap, with a production hard-stop protecting the away-mode supervisor route.
+### Complete route inventory
 
-Gate B is not shipped by this lane after the ownership split.
+- `bin/fm-run-liveness.sh` is the exact run-ID and branch-attributed process owner and emits only `BUSY` from affirmative process evidence or `UNKNOWN` otherwise.
+- `bin/fm-nm-step-liveness.sh` maps affirmative process evidence to `alive` and every absence, timeout, unreadable state, and repeated zero sample to `unknown`.
+- `bin/fm-crew-state.sh` consumes branch-matched run evidence before pane and status evidence and downgrades legacy `dead` vocabulary to unknown.
+- `bin/fm-classify-lib.sh`, `bin/fm-watch.sh`, and `bin/fm-supervise-daemon.sh` absorb a lane only from an affirmative process or pane sample and never from a recorded liveness or status field.
+- `bin/fm-auto-reap.sh` has no validation-abort route and retains every active, cross-branch, ambiguously attributed, or otherwise uncustodied run.
+- Teardown remains the sole destructive boundary and still requires its independent exact ownership, cleanliness, landed-work, and endpoint proofs.
 
-Covered route: every text instruction sent through `bin/fm-send.sh` or the away-mode supervisor injection path.
+### Trigger, predicate, and failure mode
 
-Mechanical trigger: the away-mode supervisor dispatches through `fm_backend_send_steering` before any pane input operation, while `bin/fm-send.sh` remains a separately owned route-completeness gap.
+- Trigger: current-state reads, watcher triage, away-mode triage, stale classification, and automatic reap attempts.
+- Predicate: BUSY requires a current affirmative process sample attributed to the exact run ID and branch, while destructive cleanup additionally requires terminal state and exact safe custody.
+- Failure mode: any absence, mismatch, timeout, single quiet sample, repeated zero sample, stale field, unknown owner, or cross-branch run becomes UNKNOWN and retains the lane without cancellation.
 
-Deterministic predicate: text can be delivered only by one backend operation that atomically binds the expected live agent session and instruction submission.
+### BUSY, UNKNOWN, and not acceptable
 
-Failure mode: every current `fm_backend_send_steering` adapter exits nonzero before sending literal text or Enter because none implements that primitive, while special-key control and the separately owned `bin/fm-send.sh` path remain outside that hard-stop.
+- BUSY means affirmative evidence says attributed work is executing now, and it is sufficient only to suppress a benign wake.
+- UNKNOWN means the system cannot prove activity or inactivity, and it must surface or retain custody without claiming idle, dead, wedged, or safe to cancel.
+- A cancellation-quality verdict would require exact run and branch attribution, terminal state from the authoritative run, no contradictory process evidence, and safe endpoint and worktree custody; this hardening intentionally grants no automatic validation-abort authority even when those facts appear available.
 
-A supervisor claim made after a nonzero exit is free-form prose and cannot be intercepted mechanically, and no current backend can produce a supported text-delivery receipt.
+### Deterministic evidence
 
-Finding F16 remains open: sibling pane adapters can change from an agent session to a bare shell between text entry and Enter, so the checked session and the acted-on session are not atomic.
+- `tests/fm-run-liveness.test.sh` covers affirmative BUSY, absence as UNKNOWN, branch blindness, detached work, and host-pressure recording.
+- `tests/fm-nm-step-liveness.test.sh` covers quiet, frozen, vanished, repeated-zero, and working process windows without a dead verdict.
+- Focused liveness shards in `tests/fm-watch-triage.test.sh` and `tests/fm-daemon.test.sh` cover status-field and heartbeat non-inference.
+- `tests/fm-auto-reap.test.sh` covers active-run and ambiguous-run retention and the absence of abort authority.
 
-The production refusal is verified through `inject_msg` and `fm_backend_send_steering` without replacing either symbol, but refusal is not a delivery receipt and does not make this gate shipped.
+## Gate D - No armed merge and preserved task checks
 
-## Gate C: Positive-only run liveness and destructive-run custody
+### Risk
 
-Covered route: every run-step-based `working` classification shared by the watcher and away-mode supervisor, plus every no-mistakes cancellation performed by the repository-owned automatic reaper.
+A scheduled merge can execute after its evidence becomes stale, and writing a merge poll into `state/<id>.check.sh` can overwrite a task-owned custom check.
 
-Mechanical trigger: `crew_absorb_class` invokes `bin/fm-run-liveness.sh` before a running status can be absorbed, and the watcher repeats the same sampler when the repository-derived recheck cadence expires.
+### Complete route inventory
 
-The sampler rejects scouts, detached worktrees, non-task branches, and branch-blind status answers before sampling; it re-reads the selected run by exact run ID and requires that response to carry the task branch.
+- `bin/fm-pr-check.sh` records the canonical PR URL and live head only and does not create, replace, chmod, or remove `state/<id>.check.sh`.
+- `bin/fm-pr-merge.sh` rejects `--auto`, `--queue`, `--admin`, `--delete-branch`, repository overrides, and unknown options before any GitHub merge request.
+- `bin/fm-pr-merge.sh` is a synchronous preflight only and ends in an unconditional atomic-boundary refusal after all evidence checks.
+- `bin/fm-crosscheck.sh merge` also refuses before API access, and the retired Python merge subcommand is unreachable.
+- Watcher PR handling reads canonical PR metadata instead of depending on a generated task poll file.
 
-Before interpreting the window, it mechanically records contemporaneous `uptime` and `vm_stat` output through `bin/fm-host-pressure.sh`.
+### Trigger, predicate, and failure mode
 
-The repository-owned reaper skips no-mistakes lookup entirely for detached scouts, selects an active run from the authoritative database by exact repository and task branch, and verifies that run again by both ID and branch.
+- Trigger: PR recording, merge preflight, Crosscheck merge invocation, and watcher PR observation.
+- Predicate: no accepted route may arm deferred execution or mutate the task-owned poll file.
+- Failure mode: armed, queued, administrative, branch-deleting, repository-overriding, or direct Crosscheck merge attempts exit nonzero before network mutation, while custom checks remain byte-identical and executable.
 
-Deterministic liveness predicate: seven untruncated, exact-run process-table samples span sixty seconds by default; the sampler excludes its own process family, attributes exact-path process roots, follows their descendants, and any sample with a run-owned process proves `BUSY`; every result without affirmative evidence is `UNKNOWN`, never `IDLE`, dead, or wedged.
+### Deterministic evidence
 
-CPU totals and cumulative CPU delta are recorded as evidence but never override the asymmetric process predicate.
+- `tests/fm-pr-merge.test.sh` covers every refused merge mode, custom-check preservation, retired routes, and unconditional refusal ordering.
 
-This positive-only formulation is required and no longer a tunable preference.
+## Gate E - Falsifiable blocker assumptions
 
-Sixteen consecutive zero samples across two minutes were observed on a provably healthy run.
+### Risk
 
-Natural subprocess sawtooth behavior is one measured explanation.
+A remembered scheduler mode, stale configuration assumption, or neighboring failure can be promoted into a blocker and drive the wrong operational action.
 
-Host load was separately measured at 21-30, later 60, and a peak of 88 before an xdist cap returned it to 21; under 60-88 load, descheduling that widens observable process gaps is a well-supported mechanism.
+### Complete route inventory
 
-It is not established as the cause of the particular sixteen-sample gaps because those sampling windows were not correlated to those load spikes.
+- `bin/fm-brief.sh` requires every crewmate and secondmate blocker to state one premise, name the mechanical probe actually run, and carry the observed result in the same status event.
+- `bin/fm-classify-lib.sh` accepts a blocker into the durable keyed open-decision set only when the note has `assumption=...; test=...; result=...` and rejects placeholder tests or results.
+- A malformed blocker remains captain-relevant for internal repair, so the proof gate cannot hide a real lane failure merely because its report is incomplete.
+- The always-loaded escalation contract requires `operating-fundamentals` before blocker claims and consequential config or system changes, and its proof rule requires an authoritative live probe with exact actor, surface, target, and result.
+- Before a blocker reaches the captain, `AGENTS.md` requires the same proof rule rather than permitting a status line or confidence statement to stand as evidence.
 
-That epistemic label is part of the gate: a well-supported mechanism must not be persisted as a proven incident cause.
+### Trigger, predicate, and failure mode
 
-The implementation does not need to decide between them: if the observable gap has no proved upper bound, no fixed sampling window at any length can establish absence.
+- Trigger: generated task instructions, every durable blocked event entering the open-decision fold, any blocker escalation, and every consequential config or system change.
+- Predicate: the key assumption is falsifiable, the named probe was run against the authoritative live surface, and the observed result supports only the stated scope.
+- Failure mode: a blocker missing any field, carrying an unexecuted placeholder, or relying on a neighboring observation cannot enter the durable open-decision set and must be repaired before escalation or action.
 
-The stronger host-load evidence strengthens the conclusion that no threshold exists; it does not license tuning a longer window.
+### Structural boundary
 
-The governing principle is `absence of evidence is not evidence of absence`.
+No repository script can intercept every arbitrary shell command an operator could use to edit external system configuration.
+The hard mechanical boundary is complete for the durable blocker carrier, while direct external config mutation remains governed by the mandatory load-before-action instruction and exact-evidence requirement rather than an operating-system interposition layer.
+This limitation is explicit and must not be described as universal syscall-level prevention.
 
-Inferring idle from an empty process sample is the same invalid predicate shape as treating a missing consent row as permission, confusing never-acquired with released custody, or reading an empty reviewer result as clean; all four failure classes occurred in this fleet.
+### Deterministic evidence
 
-No daemon-side heartbeat or other load-independent affirmative run-liveness signal is currently exposed.
+- `tests/fm-blocker-discipline-gap.test.sh` mutation-tests malformed, placeholder, valid, and resolved blocker events through the production decision fold.
+- `tests/fm-captain-item-check.test.sh` covers the separate captain-facing explanation gate.
 
-Lifecycle `status` and `updated_at` values remain records rather than heartbeats and are not relabelled as one.
+## Gate F - Exact-head merge admission and independent verdict
 
-If an independently verified load-independent signal becomes available, it should precede process sampling as affirmative evidence without changing the UNKNOWN result for absence.
+### Risk
 
-The positive-only liveness half is shipped, but safe destructive-run custody remains an unshipped stated gap.
+A merge can be treated as ready while checks are pending, the reviewed head has moved, the local change is not contained in the PR, or the independent reviewer produced no exact-head verdict.
 
-Failure mode for liveness: an all-zero window, changed or cross-branch run record, unreadable status, or failed process sample is surfaced as UNKNOWN and routes only to the non-destructive alternative.
+### Complete route inventory
 
-The automatic reaper resolves the task branch and exact run ID when the current status supplies one, but an independent no-mistakes executor can still advance the same run before run-ID-only cancellation.
+- `bin/fm-pr-check.sh` records canonical live PR metadata without granting merge authority.
+- `bin/fm-pr-admit.sh` independently reads the live PR and requires an open non-draft PR, exact expected head, settled successful checks, clean exact-head review state, PR-file and worktree containment, and a verified Crosscheck ledger for the same head and claims digest.
+- Pending, queued, missing, unreadable, stale, stopped, wrong-head, or absent reviewer output is `UNREVIEWED`, never clean.
+- `bin/fm-crosscheck.sh verify` rechecks live head, base, claims digest, reviewer independence, executed reproduction evidence, and durable finding lifecycle.
+- `bin/fm-pr-merge.sh` orders canonical PR recording, Crosscheck verification, native five-part admission, and then unconditional refusal before any mutation.
+- No retired Crosscheck or GitHub CLI route can bypass the native admission owner.
 
-That concurrent run-head writer is not serialized with repository-owned task teardown, so the current route cannot make proof, expected generation and head, cancellation, and teardown one atomic transition.
+### Trigger, predicate, and failure mode
 
-The required deterministic cancellation predicate would hold one authority shared by every run-head writer from the initial generation, run, and head snapshot through expected-identity cancellation and terminal teardown.
+- Trigger: every merge preflight and every attempt to use a retired merge entrypoint.
+- Predicate: all native admission properties and the independent exact-head adversarial verdict are simultaneously clear for the live head and stable claims digest.
+- Failure mode: any pending check, stale or dirty review, head movement, containment mismatch, blocking finding, missing reviewer artifact, tool failure, or unreviewed verdict exits nonzero, and even a clear admission currently ends at the explicit atomic-boundary refusal.
 
-Failure mode for destructive custody: an absent exact run ID or branch mismatch causes refusal, while missing pre-abort pushed-head, dead-agent, and shared run-head authority leave automatic cancellation unshipped.
+### Deterministic evidence
 
-Nothing reachable from absence authorizes cancellation, restart, replacement, or teardown.
+- `tests/fm-pr-admit.test.sh` mutation-tests every native admission property, pending checks, missing independent output, containment mismatch, and head movement.
+- `tests/fm-crosscheck.test.sh` covers exact-head reviewer execution, independence, evidence reproduction, claims binding, stale artifacts, and UNREVIEWED states.
+- `tests/fm-pr-merge.test.sh` proves the sole entrypoint orders exact evidence before an unconditional no-network refusal.
 
-Destructive run-control instructions remain a carried two-sided boundary outside the automatic reaper, not a structural gate: the sender must identify the exact run ID and branch, include authoritative proof that the target is dead, and prove current head equals pushed head; a receiving lane must independently verify every property before acting, whether or not the instruction claims proof.
+## Behavior-shard inventory
 
-Process absence at any sampled window is explicitly not acceptable proof.
-
-Free-form instructions and arbitrary shell commands have no route-complete deterministic intercept in the current architecture, so this change does not mislabel that carrier as a hard gate.
-
-Likewise, the automatic liveness route records host pressure before its diagnosis, while a free-form claim that repeated agent death, a daemon socket timeout, or a test flake is a code defect cannot be structurally intercepted today.
-
-Generated briefs therefore require contemporaneous `bin/fm-host-pressure.sh` evidence for such a claim, but that prose route remains an explicitly stated carrier gap.
-
-Recent completed `test` durations are selected by the same no-mistakes repository id, and the median controls recheck cadence.
-
-Another repository's durations never enter the query.
-
-## Gate D: One-shot merge
-
-Status: unshipped stated gap, with a nondestructive production preflight and unconditional fail-closed boundary.
-
-Covered route: `bin/fm-pr-merge.sh`, the canonical Firstmate PR merge entrypoint.
-
-Mechanical trigger: the script rejects scheduling flags before any GitHub call, acquires the task lifecycle and shared checkout locks, runs synchronous snapshot admission, repeats local and remote identity checks, and invokes `fm_pr_require_atomic_merge_boundary` before any PR metadata write, endpoint teardown, or merge request.
-
-Deterministic snapshot predicate: `--auto`, queueing, admin, and delete-after flags are forbidden; protected-branch required checks must be strict and nonempty; base-branch policy must be configured to dismiss stale reviews and require code-owner and last-push approval; at least two generic non-author approvals and admin enforcement must apply; and the sampled head, base, local content, checks, reviews, and residual must agree.
-
-GitHub branch protection atomically enforces only configured required contexts, so a new failing unrequired context at the same head can appear after snapshot admission and still permit merge.
-
-Firstmate's checkout and lifecycle locks cover cooperating repository callers, but they cannot prevent a task process, detached child, human shell, or external tool from writing the worktree by path.
-
-Failure mode: after the complete nondestructive preflight, the atomic boundary exits nonzero, leaves task metadata and the endpoint intact, and never calls the merge endpoint.
-
-Retirement requires a server-native required aggregate that is authoritatively invalidated by every exact-head check mutation and a worktree execution authority that excludes every writer for the entire residual-sample-and-merge interval.
-
-`bin/fm-pr-check.sh` now records only PR metadata and never creates or overwrites `state/<id>.check.sh`.
-
-Raw GitHub clients are outside this repository entrypoint, so the standing operating contract still forbids bypassing `fm-pr-merge.sh`.
-
-## Gate E: Blocker discipline gap
-
-This requested gate cannot meet the structural bar in the current architecture.
-
-The blocker routes include free-form supervisor prose and direct append-only writes to `state/<id>.status`.
-
-There is no single interceptable operation and no deterministic parser can prove that an unstated premise was identified and tested.
-
-A helper or prose checklist would be an intentional-trigger control with ordinary bypass routes, so this change does not ship one and does not label instruction text as a gate.
-
-The failure mode remains explicit: a supervisor can still invent a blocker unless blocker reporting is moved behind a structured, mandatory transport carrying `assumption`, `test`, and `result` fields.
-
-That transport is a separate owner-level architecture change.
-
-## Gate F: Exact-head merge evidence
-
-Status: unshipped stated gap, while exact-head snapshot admission remains available for diagnosis.
-
-Covered route: every merge execution through `bin/fm-pr-merge.sh`.
-
-Mechanical trigger: synchronous `bin/fm-pr-admit.sh` runs from the merge preflight and emits a receipt explicitly labelled `snapshot-native-strict`.
-
-Deterministic predicate: one unchanged head, base, and base ref must have a nonempty green and settled check set; two distinct non-author exact-head `APPROVED` review verdicts with no exact-head change request; exact local and PR head equality; an identical GitHub-file and local base-to-head file set; and a mechanically clean index and worktree including untracked paths.
-
-Files, check runs, and reviews are fetched as explicit bounded pages and combined only after every page is structurally validated and its reported count reconciles.
-
-Admission counts two generic non-author exact-head approvals and separately verifies that base-branch policy is configured to require code-owner reviews, stale-review dismissal, and last-push approval.
-
-It does not prove that this PR has a current exact-head code-owner approval or otherwise satisfies that policy at the PR level.
-
-A reviewer that stopped without submitting an exact-head `APPROVED` review contributes no verdict and the head is `UNREVIEWED`.
-
-Admission does not publish a sticky client-side success status because same-head review and check state can change afterward.
-
-The snapshot catches absent, pending, failed, stale, truncated, moved, dirty, unprotected, or contradictory evidence, but it does not claim an authoritative same-SHA review dismissal or post-snapshot worktree mutation catch.
-
-Failure mode: the merge route refuses after snapshot admission because neither complete mutable server evidence nor exclusive local writer custody is available.
-
-The code-owner and independent-review mutation leg is unverified and unshipped because the repository fixture cannot prove PR-level code-owner satisfaction or perform an authoritative GitHub review dismissal.
-
-Free-form recommendations remain prose and cannot be made route-complete by this repository without the structured reporting transport described under Gate E.
-
-The merge executor itself never treats CI colour as sufficient.
-
-## Shared TOCTOU coverage
-
-The server-side atomic unit must bind the admitted head and base, every exact-head check and review mutation, and the merge request against concurrent GitHub App, reviewer, and base-branch writers.
-
-The local atomic unit must bind task generation and endpoint ownership, complete worktree-writer exclusion, the final tracked, staged, and untracked residual sample, and the merge request against task, child-process, shell, recovery, and external-tool writers.
-
-- Direct writers include the active harness and any command it launches in the task worktree; checkout and lifecycle locks do not cover them after spawn.
-- Reconciliation writers include `fm-teardown.sh` cleanup and Treehouse return paths; their cooperating mutations use checkout or lifecycle locks, but an already-running task child does not.
-- Retry writers include teardown retry and stale-lock recovery plus checkout-refresh and fleet-sync retries; repository-owned checkout operations are covered where they call `fm_checkout_lock_run`, while raw process writes remain uncovered.
-- Watcher writers include `fm-watch.sh` routes into automatic reap and recovery; task lifecycle serialization covers cooperating metadata transitions, but the independent no-mistakes run-head writer remains uncovered.
-- Recovery writers include `fm-bootstrap.sh` secondmate liveness recovery and direct or managed recovery through `fm-spawn.sh`; generation checks cover installation of a replacement, but the resumed process can write after the lock is released.
-- Resume writers include `fm-spawn.sh --resume-account`, `--continue-account`, and direct-account recovery; their setup is serialized, but their launched harnesses and descendants are deliberately long-lived and therefore outside merge custody.
-- Uncovered routes are an arbitrary task process, detached or background descendant, human shell, raw Git or filesystem command, provider-owned worktree process, and any external no-mistakes executor that does not share Firstmate's locks.
-
-No current route supplies both atomic units, so Gates D and F refuse rather than converting cooperative-lock coverage into a claim of exclusive custody.
-
-## Mutation evidence ledger
-
-This ledger distinguishes firing proofs from stated gaps and does not count a snapshot, spelling assertion, wrong observing layer, unreachable symbol, or test-side semantic reimplementation as a shipped catch.
-
-The prior F20 and F21 gate acceptances are RETRACTED because their fixtures demonstrated nothing about the production guards.
-
-All A-F firing proofs were freshly re-executed against real production violations.
-
-Any leg not demonstrated is a STATED GAP.
-
-Gate B's current production-route refusal proof is separate from the retracted F21 fixture.
-
-- Gate A scope is one recorded Codex generation, the behavioral representation is a later wrong `thread_settings_applied` record, the observing layer is `bin/fm-runtime-profile.sh`, the reachable production path is `fm-codex-runtime-profile.mjs`, deterministic failure is exit 1 with the observed wrong axes, and retirement is a later exact-profile runtime record that verifies in `tests/fm-runtime-profile.test.sh`.
-- Gate B scope is the away-mode supervisor injection route, the behavioral representation is an actual text digest passed to `inject_msg`, the observing layer is `bin/fm-supervise-daemon.sh`, the reachable production symbol is the unmodified `fm_backend_send_steering`, deterministic failure is nonzero before pane input in `tests/fm-daemon.test.sh`, and retirement requires an atomic agent-session-bound backend receipt; this is a verified refusal and an unshipped delivery gap.
-- Gate B has no shipped delivery mutation proof in this lane because F16 and its released `bin/fm-send.sh` boundary are owned by `steer-enter-accepts-open-modal`; retirement requires that lane to inject an agent-to-shell transition between entry and submission and prove atomic delivery or refusal.
-- Gate C liveness scope is one exact run, the behavioral representation is an all-zero real sampler window, the observing layer and reachable production path are `bin/fm-run-liveness.sh`, deterministic failure is UNKNOWN, and retirement supplies an affirmative owned process in `tests/fm-run-liveness.test.sh`.
-- Gate C destructive custody has no shipped mutation proof in this lane because F12 and its released `bin/fm-auto-reap.sh` boundary are owned by `autoreap-cancels-before-containment`; retirement requires that lane to race a real run-head transition against abort and prove the transition or abort is rejected atomically under one authority shared by every run-head writer.
-- Gate D scope is one PR head and base preflight, the behavioral representation is `strict: false` on the protected-branch policy response, the observing layer is `bin/fm-pr-merge.sh`, the reachable production symbol is `fm_pr_require_server_admission_rule`, deterministic failure occurs before metadata, endpoint, or merge mutation, and restoring strict policy retires that violation only as far as the unconditional atomic-boundary refusal in `tests/fm-pr-merge.test.sh`; the merge gate remains unshipped.
-- Gate E scope is the append-only task status carrier, the behavioral representation is an invented `blocked [key=premise]:` event with no assumption test, the observing layer is the shared watcher classifier, the reachable production symbols are `status_is_captain_relevant` and `status_open_decisions`, deterministic evidence is that the carrier accepts rather than rejects it, and retirement requires an explicit `resolved` event in `tests/fm-blocker-discipline-gap.test.sh`.
-- Gate E remains unshipped until a mandatory structured blocker transport rejects missing `assumption`, `test`, and `result` fields, at which point the mutation test must flip from demonstrating acceptance to demonstrating refusal.
-- Gate F scope is one exact-head snapshot evidence set, the behavioral representations exercised through production parsing are a missing generic exact-head approval and a dirty tracked or untracked worktree, the observing layer is `bin/fm-pr-admit.sh`, deterministic failure is snapshot refusal, and removing those violations reaches only `fm_pr_require_atomic_merge_boundary`; PR-level code-owner proof, authoritative review dismissal, and concurrent-writer retirement evidence do not exist, so Gate F remains a STATED GAP.
+The slow behavior suite inventories these gates explicitly in `tests/behavior-test-durations.tsv` so the route checks remain part of the normal repository evidence surface.

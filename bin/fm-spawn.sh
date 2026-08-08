@@ -3,7 +3,7 @@
 # Spawn a direct report: a new crewmate in a treehouse worktree, an eligible
 # pre-cutover Orca direct recovery with empirically verified provider authority,
 # or a secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] [--backlog-row-exemption <test-fixture|tracking-backend-repair>] [--scout]
+# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] [--no-provision] [--backlog-row-exemption <test-fixture|tracking-backend-repair>] [--scout]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] --secondmate
 #        fm-spawn.sh <task-id> --recover-direct-account
 #        fm-spawn.sh <task-id> (--resume-account|--continue-account) [--harness <claude|codex>] [--account-pool <pool>] [--account-profile <profile>]
@@ -94,6 +94,25 @@
 #   Before a secondmate launch, the home must fast-forward safely to the primary
 #   default-branch commit and independently match the live default tip.
 #   Any unproven freshness state refuses launch.
+#   After a leased worktree passes its identity, cleanliness, and freshness proof
+#   and before any endpoint is created, a ship/scout spawn provisions that
+#   worktree's declared project dependencies (bin/fm-provision-lib.sh owns the
+#   detection, cache, readiness, and bound contracts). A worktree that declares
+#   no recognized manifest is a no-op. Otherwise there are exactly two
+#   non-success outcomes, and that library's header enumerates both: a
+#   CAPABILITY GAP - a component this provisioner was never able to provision -
+#   is named on stderr, in the provisioning log, in the spawn's provision=
+#   metadata, and in the git-excluded .fm-provisioning.md at the root of the
+#   leased worktree - the only one of those the crewmate can read - and launches
+#   the lane with that component
+#   unprovisioned; a FAILURE - an attempt that was made and did not complete -
+#   refuses the spawn, because a lane launched onto a half-built environment is
+#   worse than no lane. The task's brief is passed in so an over-budget worktree
+#   spends its component budget on what the task actually names.
+#   --no-provision skips provisioning for one spawn, and
+#   config/worktree-provision=off for the home. Both still clear any
+#   .fm-provisioning.md the previous lease of that pool slot left behind, so an
+#   opted-out lane cannot read another task's report as its own.
 #   Ship/scout spawns refresh the primary checkout before Treehouse acquisition,
 #   surface dirty pool entries, and durably lease one available worktree before
 #   creating the endpoint. They refuse to create that endpoint unless the leased
@@ -164,6 +183,8 @@ CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
+# shellcheck source=bin/fm-provision-lib.sh
+. "$SCRIPT_DIR/fm-provision-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -349,6 +370,7 @@ BACKEND_ARG=
 ACCOUNT_POOL=
 ACCOUNT_PROFILE=
 NO_ACCOUNT_ROUTING=0
+NO_PROVISION=0
 BACKLOG_ROW_EXEMPTION=
 BACKLOG_ROW_EXEMPTION_SET=0
 RESUME_ACCOUNT=0
@@ -401,6 +423,7 @@ for a in "$@"; do
     --account-profile) want_value=account-profile ;;
     --account-profile=*) ACCOUNT_PROFILE=${a#--account-profile=}; ACCOUNT_PROFILE_SET=1 ;;
     --no-account-routing) NO_ACCOUNT_ROUTING=1 ;;
+    --no-provision) NO_PROVISION=1 ;;
     --backlog-row-exemption) want_value='backlog-row-exemption' ;;
     --backlog-row-exemption=*) BACKLOG_ROW_EXEMPTION=${a#--backlog-row-exemption=}; BACKLOG_ROW_EXEMPTION_SET=1 ;;
     --resume-account) RESUME_ACCOUNT=1 ;;
@@ -605,7 +628,9 @@ spawn_refuse_missing_backlog_row() {  # <task-id> <kind> <project-dir>
   [ -n "$repo" ] || repo=unknown
   backlog="$DATA/backlog.md"
   echo "error: new $kind task $task_id has no In flight or Queued row in $backlog; file it before dispatch." >&2
-  printf 'fix: tasks-axi add %s %s --kind %s --repo %s --start --backend markdown --file %s\n' \
+  printf 'fix: %s --data %s -- tasks-axi add %s %s --kind %s --repo %s --start --backend markdown --file %s\n' \
+    "$(spawn_shell_quote "$SCRIPT_DIR/fm-data-write.py")" \
+    "$(spawn_shell_quote "$DATA")" \
     "$(spawn_shell_quote "$task_id")" "$(spawn_shell_quote '<one line>')" \
     "$(spawn_shell_quote "$kind")" "$(spawn_shell_quote "$repo")" \
     "$(spawn_shell_quote "$backlog")" >&2
@@ -1081,6 +1106,18 @@ ACCOUNT_NATIVE_LAUNCH_READY=
 ACCOUNT_NATIVE_LAUNCH_GO=
 ACCOUNT_NATIVE_LAUNCH_DIR=
 DIRECT_ACCOUNT_ROUTING=0
+# Secondmate account selection. A secondmate is a long-lived supervisor whose
+# workspace is a firstmate home, not a task worktree, so it must NOT take on
+# DIRECT_ACCOUNT_ROUTING's worktree-identity, authoritative-final-state, and
+# fresh-selection-per-respawn contract. This flag is the narrow half it does
+# need: pick a rotated account directory and bind the provider identity onto the
+# launch, so secondmates stop inheriting whatever ambient identity the primary
+# happened to be running under and stop piling onto one account.
+DIRECT_ACCOUNT_SECONDMATE=0
+# Set when an observe-mode secondmate wanted a routed account but none could be
+# selected, so it launched on the provider's default identity. Recorded in task
+# metadata so a degraded launch is visible rather than looking like a routed one.
+DIRECT_ACCOUNT_DEGRADED=0
 DIRECT_ACCOUNT_HOME=
 # Environment delivered natively by `herdr agent start --env KEY=VALUE` (one
 # repeated flag per entry). Empty for every other backend, which has no native
@@ -1100,7 +1137,9 @@ ORIGINAL_TURN_ENDED_PRESENT=-1
 ORIGINAL_CHECK_PRESENT=-1
 ORIGINAL_PI_EXT_PRESENT=-1
 ORIGINAL_GROK_TOKEN_PRESENT=-1
+ORIGINAL_PROVISION_LOG_PRESENT=-1
 ORIGINAL_TASK_TMP_PRESENT=-1
+PROVISION_LOG=
 
 spawn_test_lab_enabled() {
   fm_account_test_lab_enabled \
@@ -1675,8 +1714,16 @@ spawn_return_created_worktree() {
   [ "${BACKEND:-tmux}" != orca ] || return 0
   [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
   if [ "$WORKTREE_RETAIN_ON_ABORT" = 1 ]; then
-    echo "warning: retained unsafe acquired worktree $WT for manual recovery" >&2
-    return 1
+    if return_output=$(fm_checkout_treehouse_return_safe \
+        "$WT" "$CHECKOUT_LOCK_ROOT" "$PROJ_ABS" "firstmate-$ID" 2>&1); then
+      [ -z "$return_output" ] || printf '%s\n' "$return_output" >&2
+      return 0
+    else
+      return_status=$?
+    fi
+    [ -z "$return_output" ] || printf '%s\n' "$return_output" >&2
+    echo "warning: retained unsafe acquired worktree $WT because a non-forcing rollback refused it" >&2
+    return "$return_status"
   fi
   if [ -z "$WORKTREE_EXPECTED_TIP" ] \
     || ! "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable "$WT" "${PROJ_ABS_REAL:-$PROJ_ABS}" "$WORKTREE_EXPECTED_TIP"; then
@@ -1688,7 +1735,8 @@ spawn_return_created_worktree() {
     echo "warning: retained acquired worktree $WT because post-cleanup repository safety could not be re-proven" >&2
     return 1
   fi
-  if return_output=$(fm_checkout_treehouse_return "$WT" "$CHECKOUT_LOCK_ROOT" "${PROJ_ABS_REAL:-$PROJ_ABS}" 2>&1); then
+  if return_output=$(fm_checkout_treehouse_return_safe \
+      "$WT" "$CHECKOUT_LOCK_ROOT" "${PROJ_ABS_REAL:-$PROJ_ABS}" "firstmate-$ID" 2>&1); then
     [ -z "$return_output" ] || printf '%s\n' "$return_output" >&2
     return 0
   else
@@ -1766,6 +1814,14 @@ spawn_abort_cleanup() {
   # rollback, leaking prepared resources.
   set +e
   [ -z "${META_TMP:-}" ] || rm -f "$META_TMP"
+  # The provisioning log belongs to this attempt. An abort that leaves it behind
+  # accumulates one orphaned file per task in the home's state directory, which
+  # is exactly the leak the ORIGINAL_*_PRESENT bookkeeping exists to prevent;
+  # spawn_provision_worktree has already printed what it contained.
+  if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "$ORIGINAL_PROVISION_LOG_PRESENT" = 0 ] \
+    && [ -n "${PROVISION_LOG:-}" ]; then
+    rm -f "$PROVISION_LOG"
+  fi
   if [ -n "${META_WRITE_LOCK:-}" ]; then
     rollback_lock=$META_WRITE_LOCK
     META_WRITE_LOCK=
@@ -2082,6 +2138,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$ACCOUNT_POOL" ] || shared_args+=(--account-pool "$ACCOUNT_POOL")
   [ -z "$ACCOUNT_PROFILE" ] || shared_args+=(--account-profile "$ACCOUNT_PROFILE")
   [ "$NO_ACCOUNT_ROUTING" = 0 ] || shared_args+=(--no-account-routing)
+  [ "$NO_PROVISION" = 0 ] || shared_args+=(--no-provision)
   [ -z "$BACKLOG_ROW_EXEMPTION" ] || shared_args+=(--backlog-row-exemption "$BACKLOG_ROW_EXEMPTION")
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     echo "error: batch dispatch does not support account recovery; recover tasks individually" >&2
@@ -2473,11 +2530,35 @@ launch_template() {
       fi
       ;;
     opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(cat __BRIEF__)"' ;;
+    # pi: --approve ("Trust project-local files for this run") is what keeps an
+    # unattended pi agent off the project-trust dialog. Pi has no permission system,
+    # but it DOES gate every not-yet-trusted directory behind that dialog on first
+    # run - observed even on clean worktrees - and a task worktree or a freshly
+    # seeded secondmate home is always a new path, so without --approve the agent
+    # parks on a prompt nobody is watching. It is per-run and scoped to this
+    # firstmate-launched agent; it never touches the captain's machine-wide
+    # defaultProjectTrust posture in ~/.pi/agent/settings.json. Both flags go ahead
+    # of __MODELFLAG__/__EFFORTFLAG__ so --exclude-tools stays adjacent to its value
+    # and the line renders correctly whether or not those placeholders expand.
     pi)
       if [ "$kind" = secondmate ]; then
-        printf '%s' 'pi __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ "$(cat __BRIEF__)"'
+        # A secondmate gets --approve for the same trust-dialog reason (and it also
+        # lets pi auto-discover the home's project-local extensions), but NOT
+        # --exclude-tools ask_question: a secondmate is a firstmate-class supervisor
+        # the captain may type into directly, so its interactive surface is
+        # deliberately left intact. Excluding the tool is only a denylist entry, so
+        # revisit this if pi ever ships a question tool that can park a secondmate -
+        # fm-watch.sh skips stale-pane wakes for kind=secondmate, so a parked
+        # secondmate would not trip stale detection.
+        printf '%s' 'pi --approve __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ "$(cat __BRIEF__)"'
       else
-        printf '%s' 'pi __MODELFLAG____EFFORTFLAG__-e __PIEXT__ "$(cat __BRIEF__)"'
+        # --exclude-tools is a plain denylist over built-in, extension, and custom
+        # tool names (pi 0.84.0 filters it as a Set, ignoring names that are not
+        # registered), and ask_question is pi's own documented example for it. A
+        # crewmate's contract is to run autonomously and report through its status
+        # file, so a tool that halts the run to ask a question nobody is watching is
+        # never the right behavior here.
+        printf '%s' 'pi --approve --exclude-tools ask_question __MODELFLAG____EFFORTFLAG__-e __PIEXT__ "$(cat __BRIEF__)"'
       fi
       ;;
     # grok (Grok Build TUI): a positional prompt starts the supervised interactive
@@ -2673,6 +2754,35 @@ if { [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] \
     # launches deliberately rejoin the ordinary unmanaged spawn path after selection.
     ACCOUNT_EFFECTIVE_MODE=off
   fi
+fi
+# Secondmate launches under OBSERVE take the same rotated account directory as
+# crewmates. Before this they fell through to the legacy Agent Fleet path, which
+# in observe mode is shadow-only ("no lease; legacy launch unchanged") and binds
+# no identity at all - so every secondmate inherited the ambient
+# CLAUDE_CONFIG_DIR and the fleet's whole supervisor load landed on one account.
+#
+# ENFORCE is deliberately NOT diverted here. That mode already binds a real
+# account through its Agent Fleet lease and native launch, so it was never the
+# defect; routing it through direct selection would change the enforced lease,
+# rollback, and recovery contract for no gain.
+#
+# Only the account binding is shared with the crewmate path. DIRECT_ACCOUNT_ROUTING
+# stays 0, so a secondmate home is never treated as a task worktree and its
+# metadata keeps the shape ordinary respawn expects. Selection is deferred to the
+# shared prepare point further down: no account is chosen and no Herdr hook is
+# installed until the home has proved its identity and its routing-policy
+# inheritance, so a launch that is going to be refused never consumes a rotation.
+if [ "$KIND" = secondmate ] && [ "$RECOVERY_ACCOUNT" = 0 ] && [ "$RAW_LAUNCH" != 1 ] \
+  && [ "$ACCOUNT_EFFECTIVE_MODE" = observe ]; then
+  case "$HARNESS" in
+    claude|codex)
+      DIRECT_ACCOUNT_SECONDMATE=1
+      DIRECT_ACCOUNT_PREPARE_DEFERRED=1
+      # The shadow Agent Fleet observe pass below would only re-derive a decision
+      # that nothing applies; this launch binds a real account instead.
+      ACCOUNT_EFFECTIVE_MODE=off
+      ;;
+  esac
 fi
 if [ "$ACCOUNT_EFFECTIVE_MODE" != off ] && [ -z "$ACCOUNT_POOL" ]; then
   if [ -n "$ACCOUNT_PROFILE" ]; then
@@ -3203,6 +3313,111 @@ validate_spawn_worktree() {  # <source> <inspect-target>
   fi
 }
 
+# Keep a worktree-resident file out of git's view, so firstmate-owned launch
+# machinery and provisioned dependency directories can never dirty the checkout
+# that the freshness proof and teardown both require to be clean. Defined here
+# because both the provisioning step below and the per-harness turn-end hooks
+# further down use it.
+#
+# Returns 0 only once the exclusion is present in info/exclude and read back,
+# and non-zero otherwise. Provisioning depends on that real status: it treats
+# registration as a checked prerequisite and refuses to run an installer that
+# would otherwise leave an unignored directory behind. The turn-end hook call
+# sites below deliberately tolerate a failure instead, since losing a hook
+# exclusion is a dirty-checkout nuisance, not a reason to refuse a spawn.
+exclude_path() {
+  local rel=$1 EXCL
+  EXCL=$(git_repository_probe -C "$WT" rev-parse --git-path info/exclude 2>/dev/null) || return 1
+  [ -n "$EXCL" ] || return 1
+  mkdir -p "$(dirname "$EXCL")" || return 1
+  grep -qxF "$rel" "$EXCL" 2>/dev/null && return 0
+  printf '%s\n' "$rel" >> "$EXCL" || return 1
+  grep -qxF "$rel" "$EXCL" 2>/dev/null
+}
+
+# Whether a path provisioning is about to create is ALREADY outside git's view,
+# by the project's own ignore rules. It deliberately does NOT write an exclusion
+# to make that true.
+#
+# It used to call exclude_path, and that was wrong in a way worth recording. For
+# a linked worktree `git rev-parse --git-path info/exclude` resolves to the
+# MAIN clone's .git/info/exclude, so provisioning a leased worktree wrote a
+# durable, repo-wide rule into the captain's primary checkout and made that path
+# invisible to `git status` there. Writing the linked worktree's own
+# info/exclude instead does not work - git does not read it - and it would still
+# pass this function's read-back check, so the exclusion would silently apply to
+# nothing. Per-worktree core.excludesFile via extensions.worktreeConfig does
+# work, but it displaces the operator's global excludes inside the worktree and
+# is durable config complexity for a case that should be rare.
+#
+# So provisioning now refuses instead of hiding. A component whose install
+# directory the project does not already ignore is one whose installed tree
+# would show up as untracked, which fails the returnable check on abort and
+# strands the pool lease - the failure that hard-blocks the fleet when every
+# workspace is held. Refusing costs that project one line in its own .gitignore;
+# guessing costs a lease and mutates a checkout firstmate must never write to.
+fm_provision_register_exclude() {
+  local rel=$1
+  git_repository_probe -C "$WT" check-ignore -q "${rel#/}" 2>/dev/null
+}
+
+# Provision the freshly proven worktree's declared project dependencies, so the
+# lane launched into it can run the project's own tests, formatters, and browser
+# checks instead of shipping on another agent's evidence. Runs after the
+# identity/cleanliness/freshness proof and before any endpoint exists, which is
+# the only place it can: the directories involved are gitignored so they never
+# travel with a worktree, and Treehouse v2.0.0 exposes no setup hook.
+# bin/fm-provision-lib.sh owns detection, caching, readiness, bounds, and the
+# capability-gap versus failure contract.
+#
+# The provisioning log is a per-task state artifact like $ID.status and
+# $ID.meta: teardown removes it with the rest of the set, and an aborted spawn
+# removes it here rather than leaking one file per attempt into the home's state
+# directory. Because the abort path removes it, a refusal prints the tail of the
+# log itself - the installer output IS the diagnosis, and pointing at a file the
+# rollback is about to delete would be pointing at nothing.
+PROVISION_SUMMARY=
+PROVISION_PATH_PREFIX=
+spawn_provision_worktree() {
+  local mode
+  # Before either opt-out, because an opted-out lease is the one that would
+  # otherwise read the previous task's report as a description of its own
+  # worktree - the more provisioning does here, the louder its absence must be.
+  fm_provision_clear_report "$WT" || {
+    echo "error: cannot remove a previous lease's provisioning report at $WT/$FM_PROVISION_REPORT_NAME" >&2
+    echo "       fm-$ID would read it as a description of its own worktree, so the spawn is refused; remove that path by hand." >&2
+    return 1
+  }
+  if [ "$NO_PROVISION" = 1 ]; then
+    PROVISION_SUMMARY=off
+    return 0
+  fi
+  mode=$(fm_provision_mode "$CONFIG") || {
+    echo "error: config/worktree-provision must contain exactly 'on' or 'off'" >&2
+    return 1
+  }
+  if [ "$mode" = off ]; then
+    PROVISION_SUMMARY=off
+    return 0
+  fi
+  PROVISION_LOG="$STATE/$ID.provision.log"
+  if [ -e "$PROVISION_LOG" ] || [ -L "$PROVISION_LOG" ]; then
+    ORIGINAL_PROVISION_LOG_PRESENT=1
+  else
+    ORIGINAL_PROVISION_LOG_PRESENT=0
+  fi
+  if ! fm_provision_worktree "$WT" "$STATE/provision-cache" "$PROVISION_LOG" "$DATA/$ID/brief.md"; then
+    if [ -s "$PROVISION_LOG" ]; then
+      echo "error: last 40 lines of the provisioning log for $ID (not retained past this refused spawn):" >&2
+      tail -n 40 "$PROVISION_LOG" >&2
+    fi
+    return 1
+  fi
+  PROVISION_SUMMARY=$FM_PROVISION_SUMMARY
+  PROVISION_PATH_PREFIX=$FM_PROVISION_PATH_PREFIX
+  return 0
+}
+
 validate_orca_abort_worktree_identity() {
   local wt_root project_root wt_common project_common provider_path provider_root
   [ -n "${ORCA_WORKTREE_ID:-}" ] && [ -n "${WT:-}" ] && [ -n "${PROJ_ABS:-}" ] || return 1
@@ -3263,6 +3478,7 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" 
   fi
   WORKTREE_EXPECTED_TIP=$(git -C "$WT" rev-parse HEAD) || exit 1
   WORKTREE_RETAIN_ON_ABORT=0
+  spawn_provision_worktree || exit 1
 fi
 
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
@@ -3279,8 +3495,28 @@ if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
 fi
 
 if [ "$DIRECT_ACCOUNT_PREPARE_DEFERRED" = 1 ]; then
-  DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS") || exit 1
-  echo "fm-spawn: selected direct $HARNESS account home $DIRECT_ACCOUNT_HOME" >&2
+  if [ "$DIRECT_ACCOUNT_SECONDMATE" = 1 ]; then
+    # observe means "route when routing is possible", never "refuse to launch".
+    # On a fresh install, or any home whose account directories have not been
+    # provisioned, selection legitimately has nothing to choose from. Refusing
+    # here would leave a domain supervisor down entirely, which is strictly worse
+    # than running it on the provider's default identity - the outcome observe
+    # mode produced before this path existed.
+    # The degrade is deliberately LOUD and recorded in metadata rather than
+    # silent: a silently un-routed secondmate is the exact bug this change fixes,
+    # so it must be visible as a degraded launch instead of looking healthy.
+    if DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS"); then
+      echo "fm-spawn: selected direct $HARNESS account home $DIRECT_ACCOUNT_HOME" >&2
+    else
+      DIRECT_ACCOUNT_HOME=
+      DIRECT_ACCOUNT_SECONDMATE=0
+      DIRECT_ACCOUNT_DEGRADED=1
+      echo "WARNING: secondmate $ID could not be routed to a $HARNESS account directory; launching on the provider's default identity instead of refusing. This secondmate shares whatever identity the environment supplies, so account load is NOT balanced for it. Provision this machine's $HARNESS account directories and respawn to restore routing." >&2
+    fi
+  else
+    DIRECT_ACCOUNT_HOME=$("$SCRIPT_DIR/fm-account-directory.sh" prepare "$HARNESS") || exit 1
+    echo "fm-spawn: selected direct $HARNESS account home $DIRECT_ACCOUNT_HOME" >&2
+  fi
   DIRECT_ACCOUNT_PREPARE_DEFERRED=0
 fi
 
@@ -3340,10 +3576,22 @@ fi
 # command (notably `claude`, which a host may front with a shim) - it only ever adds
 # reach. The standard locations are appended for the case where firstmate itself was
 # launched with a thin PATH; missing directories and duplicates are dropped.
+#
+# PROVISION_PATH_PREFIX leads when provisioning pinned a runtime the project
+# declares (e.g. a .nvmrc Node): the crewmate must validate on the SAME runtime
+# its dependencies were installed against, or native modules load against the
+# wrong ABI and the lane cannot run its own checks even though node_modules is
+# present (data/v3-env-repair-e3/report.md, 2026-08-05). That prefix holds
+# EXACTLY node, npm, npx, and corepack (fm_provision_node_path_prefix), never a
+# version-manager bin directory - such a directory also holds every globally
+# npm-installed CLI for that Node, including the harnesses launched below, so
+# leading with it would repoint `claude` or `codex` at whichever copy sits under
+# the pinned runtime. The invariant above therefore still holds for every
+# command except the Node toolchain the pin exists to fix.
 crew_tool_path() {
   local seed dir out='' brew=/opt/homebrew
   [ -d "$brew" ] || brew=/usr/local
-  seed="$PATH:$HOME/.local/bin:$brew/bin:$brew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  seed="${PROVISION_PATH_PREFIX:+$PROVISION_PATH_PREFIX:}$PATH:$HOME/.local/bin:$brew/bin:$brew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   local IFS=:
   for dir in $seed; do
     [ -n "$dir" ] || continue
@@ -3411,13 +3659,6 @@ mkdir -p "$STATE"
 fm_account_real_directory "$STATE" || { echo "error: unsafe state directory at $STATE" >&2; exit 1; }
 STATE_REAL=$(cd "$STATE" && pwd -P)
 TURNEND="$STATE_REAL/$ID.turn-ended"
-exclude_path() {
-  local rel=$1 EXCL
-  EXCL=$(git_repository_probe -C "$WT" rev-parse --git-path info/exclude 2>/dev/null || true)
-  [ -n "$EXCL" ] || return 0
-  mkdir -p "$(dirname "$EXCL")"
-  grep -qxF "$rel" "$EXCL" 2>/dev/null || echo "$rel" >> "$EXCL"
-}
 if [ "$KIND" != secondmate ]; then
   case "$HARNESS" in
     claude*)
@@ -3426,7 +3667,8 @@ if [ "$KIND" != secondmate ]; then
         cat > "$WT/.claude/settings.local.json" <<EOF
 {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch '$TURNEND'"}]}]}}
 EOF
-        exclude_path '.claude/settings.local.json'
+        exclude_path '.claude/settings.local.json' \
+          || echo "warning: could not exclude .claude/settings.local.json from git's view" >&2
       fi
       ;;
     opencode*)
@@ -3438,7 +3680,8 @@ export const FmTurnEnd = async ({ \$ }) => ({
   },
 })
 EOF
-      exclude_path '.opencode/plugins/fm-turn-end.js'
+      exclude_path '.opencode/plugins/fm-turn-end.js' \
+        || echo "warning: could not exclude .opencode/plugins/fm-turn-end.js from git's view" >&2
       ;;
     pi*)
       # Written OUTSIDE the worktree: pi's project-trust gate fires on any extension
@@ -3505,7 +3748,8 @@ EOF
       hook_command=$(json_escape "bash $(shell_quote "$GROK_HOOKS_DIR/fm-turn-end.sh")")
       printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"%s"}]}]}}\n' "$hook_command" > "$GROK_HOOKS_DIR/fm-turn-end.json"
       printf 'token=%s\n' "${auth_file##*/}" > "$WT/.fm-grok-turnend"
-      exclude_path '.fm-grok-turnend'
+      exclude_path '.fm-grok-turnend' \
+        || echo "warning: could not exclude .fm-grok-turnend from git's view" >&2
       ;;
   esac
 fi
@@ -3607,7 +3851,7 @@ if [ "$RESUME_ACCOUNT" = 1 ]; then
   esac
 fi
 AGENT_COMMAND=$HARNESS
-if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
+if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ] || [ "$DIRECT_ACCOUNT_SECONDMATE" = 1 ]; then
   # herdr delivers the account directory NATIVELY, as `agent start --env KEY=VALUE`
   # (HERDR_AGENT_ENV below), instead of as a command-scoped shell prefix. Verified
   # before making the switch: no login profile on this machine sets CODEX_HOME or
@@ -3673,7 +3917,7 @@ LAUNCH=${LAUNCH//__PITURNEND__/$sq_piturnend}
 LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
 if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")
-  LAUNCH="FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE= FM_CONFIG_OVERRIDE= FM_HOME=$sq_home $LAUNCH"
+  LAUNCH="env -u FM_ROOT_OVERRIDE -u FM_STATE_OVERRIDE -u FM_DATA_OVERRIDE -u FM_PROJECTS_OVERRIDE -u FM_CONFIG_OVERRIDE FM_HOME=$sq_home $LAUNCH"
 fi
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   continuation_launch_command=$LAUNCH
@@ -4005,9 +4249,11 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "generation_id=$SPAWN_GENERATION_ID"
   [ "$HARNESS" != codex ] || echo "runtime_home=$CODEX_RUNTIME_HOME"
   [ "$HARNESS" != codex ] || echo "runtime_started_at_ns=$RUNTIME_STARTED_AT_NS"
+  [ -z "${PROVISION_SUMMARY:-}" ] || echo "provision=$PROVISION_SUMMARY"
   [ "$NO_ACCOUNT_ROUTING" != 1 ] || echo "account_routing_emergency_bypass=1"
   [ -z "$BACKLOG_ROW_EXEMPTION" ] || echo "backlog_row_exemption=$BACKLOG_ROW_EXEMPTION"
   [ -z "$DIRECT_ACCOUNT_HOME" ] || echo "account_home=$DIRECT_ACCOUNT_HOME"
+  [ "$DIRECT_ACCOUNT_DEGRADED" != 1 ] || echo "account_routing_degraded=1"
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     if grep -q '^report_required=' "$RESUME_META"; then
       RECORDED_REPORT_REQUIRED=$(fm_account_meta_value "$RESUME_META" report_required)

@@ -16,6 +16,7 @@
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: fm-<id>...",
 #                 "REPORT_RETENTION: unavailable: <reason>",
+#                 "TREEHOUSE_CAPACITY: LOW pool=<path> available=<n> ...",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: <outcome>",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
 #          A NUDGE_SECONDMATES line lists the RUNNING secondmate task selectors
@@ -129,6 +130,23 @@ report_retention_ensure() {
     [ -n "$out" ] || out="persistent owner did not start"
     echo "REPORT_RETENTION: unavailable: ${out%%$'\n'*}"
   fi
+}
+
+treehouse_capacity_check() {
+  local out status
+  if fm_run_bounded_capture --combine-stderr out 15 \
+      "$SCRIPT_DIR/fm-treehouse-reap.sh" capacity --low-only; then
+    status=0
+  else
+    status=$?
+  fi
+  if ! fm_process_tree_cleanup_verified; then
+    echo "TREEHOUSE_CAPACITY: unavailable reason=cleanup-unverified"
+    return 0
+  fi
+  [ -z "$out" ] || printf '%s\n' "$out"
+  [ "$status" -eq 0 ] \
+    || echo "TREEHOUSE_CAPACITY: unavailable reason=capacity-check-failed status=$status"
 }
 
 checkout_refresh_ensure() {
@@ -541,6 +559,50 @@ lavish_axi_compatible() {
   fm_lavish_version_compatible "$output" 1
 }
 
+# Releases before 0.1.19 hardcode Claude's default ~/.claude credential path and
+# ignore CLAUDE_CONFIG_DIR, so every per-account probe answers for one shared
+# identity. That reads as "all accounts look identical", which is
+# indistinguishable from a healthy fleet right up until dispatch routes work into
+# an account that is already empty, so a downgrade must not be invisible.
+#
+# It is reported, NOT gated. An old quota-axi does not break the fleet: Claude
+# selection just falls back to rotation across every eligible account, which is
+# the behavior that shipped before per-account ranking existed and still spreads
+# load. Making it a MISSING: line would block all dispatch (see the "do not
+# dispatch until tools are present" rule) over the loss of exhaustion-awareness
+# alone, which is out of proportion to the harm.
+#
+# It also reports only on POSITIVE detection of an old version. Unparseable or
+# absent --version output means we could not tell, not that it is old; claiming
+# "too old" from output we could not read would be a false statement and would
+# fire against any future output-format change.
+QUOTA_AXI_MIN_MAJOR=0
+QUOTA_AXI_MIN_MINOR=1
+QUOTA_AXI_MIN_PATCH=19
+
+# Prints the parsed version when quota-axi positively reports one older than the
+# floor. Silent (non-zero) when quota-axi is absent, when its version cannot be
+# parsed, or when it is new enough.
+quota_axi_known_outdated() {
+  local output parts major minor patch rest
+  command -v quota-axi >/dev/null 2>&1 || return 1
+  output=$(quota-axi --version 2>/dev/null) || return 1
+  parts=$(printf '%s\n' "$output" |
+    sed -n 's/.*\([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2 \3/p' |
+    head -1)
+  [ -n "$parts" ] || return 1
+  major=${parts%% *}
+  rest=${parts#* }
+  minor=${rest%% *}
+  patch=${rest##* }
+  [ "$major" -lt "$QUOTA_AXI_MIN_MAJOR" ] && { printf '%s.%s.%s\n' "$major" "$minor" "$patch"; return 0; }
+  [ "$major" -gt "$QUOTA_AXI_MIN_MAJOR" ] && return 1
+  [ "$minor" -lt "$QUOTA_AXI_MIN_MINOR" ] && { printf '%s.%s.%s\n' "$major" "$minor" "$patch"; return 0; }
+  [ "$minor" -gt "$QUOTA_AXI_MIN_MINOR" ] && return 1
+  [ "$patch" -lt "$QUOTA_AXI_MIN_PATCH" ] || return 1
+  printf '%s.%s.%s\n' "$major" "$minor" "$patch"
+}
+
 # Write CONTENT to DEST only when it differs, so re-running bootstrap does not
 # churn mtimes or duplicate generated files (idempotence).
 write_if_changed() {
@@ -875,6 +937,9 @@ fi
 if command -v tasks-axi >/dev/null 2>&1 && ! fm_tasks_axi_compatible; then
   echo "MISSING: tasks-axi (install: $(install_cmd tasks-axi))"
 fi
+if QUOTA_AXI_OUTDATED=$(quota_axi_known_outdated); then
+  echo "ACCOUNT_ROUTING: quota-axi $QUOTA_AXI_OUTDATED ignores CLAUDE_CONFIG_DIR, so per-account Claude quota reads one shared identity; account selection still rotates but cannot skip an exhausted account. Upgrade to $QUOTA_AXI_MIN_MAJOR.$QUOTA_AXI_MIN_MINOR.$QUOTA_AXI_MIN_PATCH+ with: $(install_cmd quota-axi)"
+fi
 gh auth status >/dev/null 2>&1 || echo "NEEDS_GH_AUTH"
 # Worktree-tangle check: the firstmate primary checkout (FM_ROOT) must sit on its
 # default branch, not a feature branch (see fm-tangle-lib.sh). Scoped to the
@@ -905,4 +970,5 @@ if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   x_mode_setup
   fleet_sync
 fi
+treehouse_capacity_check
 exit 0

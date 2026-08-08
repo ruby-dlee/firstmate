@@ -66,6 +66,55 @@ append_wake() {
   ' _ "$lib" "$kind" "$key" "$payload"
 }
 
+# Portable bounded worker pool for wake-suite subprocesses.
+# Bash 3.2 has no wait -n, so submissions wait for the oldest outstanding PID
+# before starting another worker once the declared limit is full.
+# A failed worker is remembered while the pool still reaps every submitted PID.
+WAKE_TEST_POOL_LIMIT=0
+WAKE_TEST_POOL_ACTIVE=0
+WAKE_TEST_POOL_PIDS=
+WAKE_TEST_POOL_FAILED=0
+
+wake_test_pool_start() {  # <positive-limit>
+  case "${1:-}" in
+    ''|*[!0-9]*|0) return 2 ;;
+  esac
+  WAKE_TEST_POOL_LIMIT=$1
+  WAKE_TEST_POOL_ACTIVE=0
+  WAKE_TEST_POOL_PIDS=
+  WAKE_TEST_POOL_FAILED=0
+}
+
+wake_test_pool_wait_oldest() {
+  local pid
+  [ "$WAKE_TEST_POOL_ACTIVE" -gt 0 ] || return 0
+  # PIDs contain digits only, so shell word splitting is intentional here.
+  # shellcheck disable=SC2086
+  set -- $WAKE_TEST_POOL_PIDS
+  pid=$1
+  shift
+  WAKE_TEST_POOL_PIDS=$*
+  wait "$pid" || WAKE_TEST_POOL_FAILED=1
+  WAKE_TEST_POOL_ACTIVE=$((WAKE_TEST_POOL_ACTIVE - 1))
+}
+
+wake_test_pool_submit() {  # <command> [args...]
+  [ "$WAKE_TEST_POOL_LIMIT" -gt 0 ] || return 2
+  if [ "$WAKE_TEST_POOL_ACTIVE" -ge "$WAKE_TEST_POOL_LIMIT" ]; then
+    wake_test_pool_wait_oldest
+  fi
+  "$@" &
+  WAKE_TEST_POOL_PIDS="${WAKE_TEST_POOL_PIDS:+$WAKE_TEST_POOL_PIDS }$!"
+  WAKE_TEST_POOL_ACTIVE=$((WAKE_TEST_POOL_ACTIVE + 1))
+}
+
+wake_test_pool_finish() {
+  while [ "$WAKE_TEST_POOL_ACTIVE" -gt 0 ]; do
+    wake_test_pool_wait_oldest
+  done
+  [ "$WAKE_TEST_POOL_FAILED" -eq 0 ]
+}
+
 make_case() {
   local name=$1 dir fakebin
   dir="$TMP_ROOT/$name"
@@ -116,6 +165,8 @@ id=${1:-}
 key=$(printf '%s' "$id" | tr -c 'A-Za-z0-9' '_')
 var="FM_FAKE_CREW_STATE_$key"
 val=${!var:-${FM_FAKE_CREW_STATE:-}}
+[ -z "${FM_FAKE_CREW_STATE_APPEND_STATUS:-}" ] \
+  || printf '%s\n' "$FM_FAKE_CREW_STATE_APPEND_STATUS" >> "${FM_STATE_OVERRIDE:?}/$id.status"
 printf '%s\n' "${val:-state: unknown · source: none · fake default}"
 exit 0
 SH
@@ -124,7 +175,9 @@ SH
 #!/usr/bin/env bash
 set -u
 id=${1:-unknown}
-rc=${FM_FAKE_RUN_LIVENESS_RC:-0}
+key=$(printf '%s' "$id" | tr -c 'A-Za-z0-9' '_')
+var="FM_FAKE_RUN_LIVENESS_RC_$key"
+rc=${!var:-${FM_FAKE_RUN_LIVENESS_RC:-0}}
 [ -z "${FM_FAKE_RUN_LIVENESS_LOG:-}" ] || printf '%s\t%s\n' "$(date +%s)" "$id" >> "$FM_FAKE_RUN_LIVENESS_LOG"
 [ -z "${FM_FAKE_RUN_LIVENESS_SLEEP:-}" ] || sleep "$FM_FAKE_RUN_LIVENESS_SLEEP"
 if [ "$rc" -eq 0 ]; then

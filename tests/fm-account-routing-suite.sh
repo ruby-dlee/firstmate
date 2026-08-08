@@ -196,6 +196,16 @@ SH
 if [ "${1:-}" = return ] && [ -n "${FM_FAKE_TREEHOUSE_RETURN_SLEEP:-}" ]; then
   sleep "$FM_FAKE_TREEHOUSE_RETURN_SLEEP"
 fi
+if [ "${1:-}" = return ]; then
+  case " $* " in
+    *' --force '*) ;;
+    *)
+      target=${!#}
+      [ "$target" != . ] || target=$PWD
+      [ -z "$(git -C "$target" status --porcelain=v1 --untracked-files=all 2>/dev/null)" ] || exit 1
+      ;;
+  esac
+fi
 if [ "${1:-}" = return ] && [ -n "${FM_EXPECT_CHECKOUT_LOCK_ROOT:-}" ]; then
   # Prove the live lock through the guarded owner exported to the bounded return.
   # Recomputing the private lock hash here made the assertion depend on path-normalization details instead of the lock guarantee.
@@ -558,6 +568,7 @@ run_teardown() {
     FM_FAKE_TREEHOUSE_LOG="$TREEHOUSE_LOG" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
     FM_FAKE_TREEHOUSE_RETURN_SLEEP="${FM_FAKE_TREEHOUSE_RETURN_SLEEP:-}" \
     FM_TREEHOUSE_ROOT="$CASE_DIR/treehouse-pools" \
+    FM_REPORT_STACK_ROOT="$CASE_DIR/report-stack" \
     FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" \
     FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
     TMUX="fake,1,0" PATH="$FAKEBIN_DIR:$PATH" "$TEARDOWN" "$@"
@@ -665,15 +676,17 @@ test_failed_freshness_proof_rolls_back_unmanaged_resources() {
     "failed freshness proof did not identify the stale acquired worktree"
   assert_not_grep '^new-window ' "$TMUX_LOG" \
     "failed unmanaged freshness proof created an endpoint before verification"
+  assert_grep 'return .' "$TREEHOUSE_LOG" \
+    "failed unmanaged freshness proof did not roll back its clean lease"
   assert_not_grep 'return --force' "$TREEHOUSE_LOG" \
-    "failed unmanaged freshness proof force-returned an unverified acquired worktree"
-  assert_contains "$out" "retained unsafe acquired worktree" \
-    "failed unmanaged freshness proof did not surface retain-only cleanup"
+    "failed unmanaged freshness proof used the forcing return path"
+  assert_not_contains "$out" "retained unsafe acquired worktree" \
+    "failed unmanaged freshness proof reported a clean lease as retained"
   assert_absent "$CASE_DIR/endpoint-live" \
     "failed unmanaged freshness proof left its endpoint alive"
   assert_absent "$HOME_DIR/state/$id.meta" \
     "failed unmanaged freshness proof published task metadata"
-  pass "failed freshness proofs unwind endpoints and retain unverified worktrees"
+  pass "failed freshness proofs unwind endpoints and return clean leases without forcing"
 }
 
 test_local_only_spawn_uses_local_default_tip() {
@@ -719,6 +732,8 @@ test_dirty_acquisition_is_retained_without_force_return() {
     "dirty acquisition was not durably leased before verification"
   assert_not_grep 'return --force' "$TREEHOUSE_LOG" \
     "dirty acquisition was returned through the destructive Treehouse path"
+  assert_grep 'return .' "$TREEHOUSE_LOG" \
+    "dirty acquisition cleanup did not attempt the non-forcing rollback path"
   grep -Fq '# unlanded work' "$draft" || fail "dirty acquisition cleanup changed its draft"
   assert_absent "$CASE_DIR/endpoint-live" \
     "dirty acquisition refusal left its prepared endpoint alive"
@@ -828,7 +843,7 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
   done
   assert_absent "$CASE_DIR/endpoint-live" \
     "post-metadata unmanaged failure left its endpoint alive"
-  assert_grep "return --force ." "$TREEHOUSE_LOG" \
+  assert_grep 'return .' "$TREEHOUSE_LOG" \
     "post-metadata unmanaged failure did not return its clean worktree"
   assert_present "$lock_marker" \
     "spawn rollback did not hold the common checkout lock during Treehouse return"
@@ -1217,7 +1232,7 @@ test_enforce_failure_rolls_back_prepared_endpoint() {
   [ "$status" -ne 0 ] || fail "failed Agent Fleet selection should block spawn"
   assert_regex '^new-window ' "$TMUX_LOG" "selection did not happen after endpoint preparation"
   assert_regex '^kill-window ' "$TMUX_LOG" "selection failure did not remove its prepared endpoint"
-  assert_grep 'return --force' "$TREEHOUSE_LOG" \
+  assert_grep 'return .' "$TREEHOUSE_LOG" \
     "selection failure did not return its prepared worktree (spawn: $out; lifecycle: $(tr '\n' '|' < "$LIFECYCLE_LOG"))"
   assert_absent "$HOME_DIR/state/$id.meta" "selection failure wrote task meta"
   [ -n "$out" ] || true
@@ -1873,8 +1888,8 @@ test_session_sync_all_bounds_each_task_and_reaches_later_mappings() {
   : > "$FAKEBIN_DIR/.session-block-$first"
   out=$(FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$HOME_DIR/state" \
     FM_DATA_OVERRIDE="$HOME_DIR/data" FM_AGENT_FLEET_BIN="$FAKEBIN_DIR/agent-fleet" \
-    FM_FAKE_AF_LOG="$AF_LOG" FM_FAKE_AF_SESSION_SLEEP=10 FM_FAKE_AF_SESSION_SLEEP_TASK="$first" \
-    FM_ACCOUNT_SESSION_QUERY_TIMEOUT=1 FM_ACCOUNT_SESSION_TASK_TIMEOUT=3 \
+    FM_FAKE_AF_LOG="$AF_LOG" FM_FAKE_AF_SESSION_SLEEP=30 FM_FAKE_AF_SESSION_SLEEP_TASK="$first" \
+    FM_ACCOUNT_SESSION_QUERY_TIMEOUT=1 FM_ACCOUNT_SESSION_TASK_TIMEOUT=8 \
     PATH="$FAKEBIN_DIR:$PATH" "$SESSION_SYNC" --all 2>&1)
   status=$?
   [ "$status" -ne 0 ] || fail "sync-all hid the timed-out first mapping"
@@ -2418,6 +2433,38 @@ test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits() {
   pass "secondmate routing uses the primary pool while the mode, but not that pool, inherits"
 }
 
+# observe mode must never be able to keep a supervisor down. A fresh install, or
+# any machine whose account directories have not been provisioned, has nothing to
+# select from; refusing there would trade "shares an identity" for "does not run
+# at all", which is strictly worse. The degrade has to stay visible though -
+# silently un-routed secondmates are the original defect - so it is asserted as a
+# warning plus recorded metadata, not merely as a successful launch.
+test_observe_secondmate_degrades_when_no_account_directories_exist() {
+  local id rec sm out status empty_root
+  id=account-secondmate-observe-degrade-z11j
+  rec=$(make_case secondmate-observe-degrade claude)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  sm=$(cd "$sm" && pwd -P)
+  printf 'observe\n' > "$HOME_DIR/config/account-routing-mode"
+  empty_root="$CASE_DIR/no-accounts"
+  mkdir -p "$empty_root"
+
+  out=$(FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
+    FM_ACCOUNT_DIRECTORY_ROOT="$empty_root" \
+    FM_TEST_PANE_PATH="$sm" run_spawn "$id" "$sm" --secondmate)
+  status=$?
+  [ "$status" -eq 0 ] || fail "unprovisioned observe secondmate refused to launch (exit $status): $out"
+  assert_contains "$out" "launching on the provider's default identity" \
+    "degraded secondmate launch was not warned"
+  assert_regex '^account_routing_degraded=1$' "$HOME_DIR/state/$id.meta" \
+    "degraded secondmate launch was not recorded in metadata"
+  assert_not_grep '^account_home=' "$HOME_DIR/state/$id.meta" \
+    "degraded secondmate recorded an account home it never received"
+  pass "an observe secondmate degrades to the default identity when no account directories exist"
+}
+
 test_explicit_secondmate_route_preserves_ambient_primary_enforce() {
   local id rec sm out status
   id=account-secondmate-explicit-env-z11c
@@ -2862,7 +2909,7 @@ test_fresh_launch_requires_session_binding_and_fully_rolls_back() {
   assert_grep "lease release --task $task --force" "$AF_LOG" "unbound launch did not release its lease"
   assert_grep "session remove --task $task" "$AF_LOG" "unbound launch did not remove its attempt mapping"
   assert_regex '^kill-window ' "$TMUX_LOG" "unbound launch did not kill its endpoint"
-  assert_grep 'return --force' "$TREEHOUSE_LOG" "unbound launch did not return its worktree"
+  assert_grep 'return .' "$TREEHOUSE_LOG" "unbound launch did not return its worktree without forcing"
   assert_absent "$HOME_DIR/state/$id.meta" "unbound launch left phantom recovery metadata"
   assert_contains "$out" "did not bind a fresh SessionStart mapping" "unbound launch did not report its binding failure"
   pass "fresh managed launches commit only after provider binding and otherwise unwind"
@@ -3638,12 +3685,14 @@ test_managed_steering_audit_failure_does_not_reclassify_delivery() {
 
   out=$(run_send "$id" "This delivered steer must not be retried." 2>&1)
   status=$?
-  [ "$status" -ne 0 ] || fail "unconfirmed steering delivery returned success without a verification receipt: $out"
-  assert_contains "$out" "could not be confirmed" "audit failure overstated delivery truth"
-  assert_grep 'This delivered steer must not be retried' "$LAUNCH_LOG" "steering text was not submitted before confirmation failed"
-  assert_grep 'This delivered steer must not be retried' "$HOME_DIR/data/$id/steering-unconfirmed.md" \
-    "unconfirmed steering was not durably recorded for reconciliation"
-  pass "unconfirmed steering is durably spooled and returns the required hard-stop signal"
+  [ "$status" -ne 0 ] || fail "unavailable atomic steering returned success: $out"
+  assert_contains "$out" "atomic tmux steering verdict=send-failed" \
+    "pre-delivery refusal overstated delivery truth"
+  assert_not_grep 'This delivered steer must not be retried' "$LAUNCH_LOG" \
+    "atomic steering refusal still submitted text"
+  assert_absent "$HOME_DIR/data/$id/steering-unconfirmed.md" \
+    "pre-delivery refusal was mislabeled as an unconfirmed delivered message"
+  pass "unavailable atomic steering is reported as not submitted"
 }
 
 test_managed_tmux_identity_survives_window_rename() {
@@ -5538,10 +5587,12 @@ test_task_owned_account_artifacts_reject_symlink_paths() {
   out=$(run_send "$id" "Delivered without following the steering symlink." 2>&1)
   status=$?
   set -e
-  [ "$status" -ne 0 ] || fail "unconfirmed steering incorrectly exited zero: $out"
+  [ "$status" -ne 0 ] || fail "unavailable atomic steering incorrectly exited zero: $out"
   [ "$(cat "$CASE_DIR/outside-steering")" = outside ] || fail "managed steering followed a symlinked output file"
-  assert_grep 'Delivered without following the steering symlink' "$original/steering-unconfirmed.md" \
-    "safe unconfirmed steering was not recorded without following the canonical trail symlink"
+  assert_contains "$out" "atomic tmux steering verdict=send-failed" \
+    "steering refusal omitted the atomic delivery boundary"
+  assert_absent "$original/steering-unconfirmed.md" \
+    "a pre-delivery atomic refusal was mislabeled as an unconfirmed delivered message"
   pass "task-owned lineage, steering, and continuation artifacts reject symlink escapes"
 }
 
@@ -6493,7 +6544,8 @@ if [ "${FM_TEST_FOCUSED:-}" = enforce-select-failure ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = explicit-secondmate-route ]; then
-  run_isolated_test test_explicit_secondmate_route_preserves_ambient_primary_enforce
+  run_isolated_test test_observe_secondmate_degrades_when_no_account_directories_exist
+run_isolated_test test_explicit_secondmate_route_preserves_ambient_primary_enforce
   exit 0
 fi
 
@@ -6832,6 +6884,7 @@ run_isolated_test test_native_resume_accepts_agent_fleet_utc_offset_timestamps
 run_isolated_test test_native_resume_uses_private_launch_directory_and_cleans_it
 run_isolated_test test_secondmate_pool_is_nonactivating_and_noninherited
 run_isolated_test test_secondmate_pool_routes_when_mode_is_enforced_and_mode_inherits
+run_isolated_test test_observe_secondmate_degrades_when_no_account_directories_exist
 run_isolated_test test_explicit_secondmate_route_preserves_ambient_primary_enforce
 run_isolated_test test_enforced_secondmate_requires_routing_inheritance_and_capable_home
 run_isolated_test test_secondmate_routing_inheritance_is_authoritative_for_every_mode

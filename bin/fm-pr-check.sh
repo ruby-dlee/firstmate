@@ -26,9 +26,7 @@ LOOKUP_GENERATION=
 PR_HEAD=
 if [[ "$URL" =~ ^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]+)/pull/([0-9]+)/?$ ]] \
   && [[ "${BASH_REMATCH[1]}" != *- ]]; then
-  PR_OWNER=${BASH_REMATCH[1]}
-  PR_REPO=${BASH_REMATCH[2]}
-  PR_NUMBER=${BASH_REMATCH[3]}
+  : "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
 else
   echo "error: PR URL must match https://github.com/<owner>/<repo>/pull/<number> (got: $URL)" >&2
   exit 1
@@ -62,15 +60,12 @@ if [ -z "$LOOKUP_GENERATION" ]; then
   fi
 fi
 fm_account_meta_lock_release "$META_LOCK"
-REMOTE_PR=$(gh-axi api "/repos/$PR_OWNER/$PR_REPO/pulls/$PR_NUMBER") || {
-  echo "error: could not read PR $URL through gh-axi" >&2
+if ! PR_HEAD_LOOKUP=$("$SCRIPT_DIR/fm-github-pr.py" head "$URL" 2>&1); then
+  PR_HEAD_DIAGNOSTIC=$(printf '%s' "$PR_HEAD_LOOKUP" | tr '\r\n' '  ')
+  printf 'UNREVIEWED: PR head lookup failed: %.500s\n' "$PR_HEAD_DIAGNOSTIC" >&2
   exit 1
-}
-PR_HEAD=$(printf '%s\n' "$REMOTE_PR" | awk '
-  /^head:$/ { in_head = 1; next }
-  /^base:$/ { in_head = 0 }
-  in_head && $1 == "sha:" { gsub(/"/, "", $2); print $2; exit }
-')
+fi
+PR_HEAD=$PR_HEAD_LOOKUP
 case "$PR_HEAD" in
   ????????????????????????????????????????)
     case "$PR_HEAD" in *[!0-9a-fA-F]*) echo "error: GitHub returned a non-hex PR head for $URL" >&2; exit 1 ;; esac

@@ -50,6 +50,11 @@ printf '%s\n' "${1:-}" >> "$FM_SLEEP_LOG"
 exit 0
 SH
   chmod +x "$fb/sleep"
+  cat > "$fb/atomic-steer" <<'SH'
+#!/usr/bin/env bash
+printf 'confirmed'
+SH
+  chmod +x "$fb/atomic-steer"
   printf '%s\n' "$fb"
 }
 
@@ -64,6 +69,7 @@ run_send() {
   : > "$log"
   env "$@" PATH="$fb:$PATH" \
     FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SLEEP_LOG="$log" \
+    FM_SEND_TEST_HOOKS=firstmate-fm-send-tests-v1 FM_SEND_STEERING_BIN="$fb/atomic-steer" \
     "$SEND" "sess:win" "hello captain" 2>/dev/null
 }
 

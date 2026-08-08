@@ -1925,11 +1925,11 @@ unit_legacy_supervisor_fallback_is_usable() {
     fm_afk_launch_flag_write() { return 0; }
     fm_afk_launch_create_tmux() { printf "%s|%s" "$1" "$2" > "$FM_HOME/fallback"; }
     fm_afk_launch_start
-  ' _ "$LAUNCH" && [ "$(cat "$st/fallback" 2>/dev/null)" = 'firstmate:0|tmux' ]; then
-    pass "supervisor discovery: the explicit legacy fallback remains usable"
-  else
-    fail "supervisor discovery: the legacy fallback was rejected"
+  ' _ "$LAUNCH" >/dev/null 2>&1; then
+    fail "supervisor discovery guessed the legacy ambient target"
   fi
+  [ ! -e "$st/fallback" ] || fail "legacy fallback reached endpoint creation"
+  pass "supervisor discovery refuses the unbound legacy fallback"
   rm -rf "$st"
 }
 

@@ -206,8 +206,6 @@ WEDGE_ALARM_NOTIFIER_PID=
 # bin/fm-tmux-lib.sh (FM_TMUX_BUSY_REGEX_DEFAULT / fm_tmux_composer_state);
 # FM_BUSY_REGEX still overrides the fallback busy set here, as before.
 INJECT_FAIL_SLEEP_DEFAULT=30
-INJECT_CONFIRM_RETRIES_DEFAULT=3
-INJECT_CONFIRM_SLEEP_DEFAULT=0.5
 CRASH_THRESHOLD_DEFAULT=10
 CRASH_WINDOW_DEFAULT=60
 CRASH_BACKOFF_DEFAULT=60
@@ -396,10 +394,8 @@ classify_check() {  # <full reason>  — check scripts print only when firstmate
   printf 'escalate|%s' "$1"
 }
 
-classify_heartbeat() {
-  # The wake itself is routine; the catch-all scan runs separately in
-  # housekeeping on the HEARTBEAT_SCAN_SECS cadence.
-  printf 'self|heartbeat (catch-all scan runs in housekeeping)'
+classify_heartbeat() {  # [state]
+  printf 'self|heartbeat (process absence is never an away-mode verdict)'
 }
 
 # Anything unrecognized is escalated (fail-safe).
@@ -1243,7 +1239,7 @@ handle_wake() {  # <reason> <state>
     stale:*)  kind=stale; arg="${reason#stale: }"
               decision=$(classify_stale "$arg" "$state") ;;
     check:*)  decision=$(classify_check "$reason") ;;
-    heartbeat|heartbeat:*) decision=$(classify_heartbeat) ;;
+    heartbeat|heartbeat:*) decision=$(classify_heartbeat "$state") ;;
     *)        decision=$(classify_unknown "$reason") ;;
   esac
   action=${decision%%|*}

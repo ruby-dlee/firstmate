@@ -1,14 +1,24 @@
 #!/usr/bin/env node
 
 import { execFile } from 'node:child_process';
-import { access, lstat, readFile, readdir, stat } from 'node:fs/promises';
+import {
+  access,
+  lstat,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
-import { homedir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { basename, dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 import {
+  ANNOTATION_MODE,
   LavishError,
   atomicWrite,
   commitAnswer,
@@ -21,14 +31,18 @@ import {
   readDecision,
   validateCollectPayload,
   validateDecisionId,
+  validateItems,
 } from './protocol.mjs';
 import { renderBoard } from './board.mjs';
 import { migrateLegacy } from './migration.mjs';
 
-const VERSION = '1.1.0';
+const VERSION = '1.3.0';
 const PROGRAM = basename(process.argv[1] ?? 'lavish-axi');
 const SOURCE_WAKE_ADAPTER = fileURLToPath(
   new URL('../../../bin/fm-lavish-wake.sh', import.meta.url),
+);
+const CAPTAIN_ITEM_CHECK = fileURLToPath(
+  new URL('../../../bin/fm-captain-item-check.sh', import.meta.url),
 );
 
 function usage() {
@@ -42,13 +56,17 @@ Human commands:
 
 Agent commands:
   lavish-axi create --id <id> --title <title> --request <request.md>
-    --questions <questions.json> --destination <relative-path>
-    [--visuals <dir>] [--home <path>]
+    (--questions <questions.json> | --items <items.json>)
+    --destination <relative-path> [--visuals <dir>] [--home <path>]
   lavish-axi collect <decision-id> --payload <json-file> [--home <path>]
   lavish-axi intake [--home <path>]
   lavish-axi configure-wake --command <absolute-executable> [--home <path>]
   lavish-axi migrate-legacy --state <state.json> --snapshot-dir <dir>
     [--pending-map <map.json>] [--home <path>]
+
+Pass --questions for an ordered multiple-choice decision, or --items for an
+annotation board that asks nothing and collects a comment on each item plus an
+overall note. A decision declares one or the other, never both.
 
 Every command reads files, performs bounded local work, and exits.
 There is no server, listener, poller, watcher, or resident process.
@@ -110,8 +128,22 @@ function shellQuote(value) {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
+function isAnnotation(decision) {
+  return decision.manifest.mode === ANNOTATION_MODE;
+}
+
 function printRequest(decision) {
   process.stdout.write(`${decision.requestText.trimEnd()}\n\n`);
+  if (isAnnotation(decision)) {
+    process.stdout.write(`Annotation: ${decision.manifest.title} (${decision.id})\n`);
+    for (const [itemIndex, item] of decision.manifest.items.entries()) {
+      process.stdout.write(`\n${itemIndex + 1}. ${item.title} [${item.key}]\n`);
+      if (item.body !== '') {
+        process.stdout.write(`${item.body.trimEnd()}\n`);
+      }
+    }
+    return;
+  }
   process.stdout.write(`Decision: ${decision.manifest.title} (${decision.id})\n`);
   for (const [questionIndex, question] of decision.manifest.questions.entries()) {
     process.stdout.write(`\n${questionIndex + 1}. ${question.prompt} [${question.key}]\n`);
@@ -132,8 +164,10 @@ async function inboxCommand(options) {
   }
   process.stdout.write('Pending Lavish decisions:\n');
   for (const decision of pending) {
+    const count = decision.manifest.expected_count;
+    const noun = isAnnotation(decision) ? 'item' : 'question';
     process.stdout.write(
-      `- ${decision.id}: ${decision.manifest.title} (${decision.manifest.expected_count} question${decision.manifest.expected_count === 1 ? '' : 's'})\n`,
+      `- ${decision.id}: ${decision.manifest.title} (${count} ${noun}${count === 1 ? '' : 's'})\n`,
     );
   }
 }
@@ -165,31 +199,45 @@ async function collectAnswers(decision) {
     }
     return next.value;
   };
-  const selections = [];
+  const entries = [];
+  const annotation = isAnnotation(decision);
   try {
-    for (const question of decision.manifest.questions) {
-      let selected;
-      while (selected === undefined) {
-        const raw = (await ask(
-          `Choose 1-${question.options.length} for ${question.key}: `,
+    if (annotation) {
+      for (const item of decision.manifest.items) {
+        const note = (await ask(
+          `Comment on ${item.key} (press Enter to skip): `,
         )).trim();
-        if (!/^[0-9]+$/.test(raw)) {
-          process.stdout.write('Enter one option number.\n');
-          continue;
-        }
-        const option = question.options[Number(raw) - 1];
-        if (option === undefined) {
-          process.stdout.write(`Enter a number from 1 to ${question.options.length}.\n`);
-          continue;
-        }
-        selected = { key: question.key, value: option.value, label: option.label };
+        entries.push({ key: item.key, note });
       }
-      selections.push(selected);
+    } else {
+      for (const question of decision.manifest.questions) {
+        let selected;
+        while (selected === undefined) {
+          const raw = (await ask(
+            `Choose 1-${question.options.length} for ${question.key}: `,
+          )).trim();
+          if (!/^[0-9]+$/.test(raw)) {
+            process.stdout.write('Enter one option number.\n');
+            continue;
+          }
+          const option = question.options[Number(raw) - 1];
+          if (option === undefined) {
+            process.stdout.write(`Enter a number from 1 to ${question.options.length}.\n`);
+            continue;
+          }
+          selected = { key: question.key, value: option.value, label: option.label };
+        }
+        entries.push(selected);
+      }
     }
     const note = await ask('Optional note (press Enter to skip): ');
-    process.stdout.write('\nComplete answer batch:\n');
-    for (const selection of selections) {
-      process.stdout.write(`- ${selection.key}: ${selection.label}\n`);
+    process.stdout.write(annotation ? '\nComplete comment batch:\n' : '\nComplete answer batch:\n');
+    for (const entry of entries) {
+      process.stdout.write(
+        annotation
+          ? `- ${entry.key}: ${entry.note === '' ? '(no comment)' : entry.note}\n`
+          : `- ${entry.key}: ${entry.label}\n`,
+      );
     }
     if (note.trim() !== '') {
       process.stdout.write(`- note: ${note.trim()}\n`);
@@ -197,7 +245,7 @@ async function collectAnswers(decision) {
     const confirmation = (await ask('Submit this complete batch? [y/N]: '))
       .trim()
       .toLowerCase();
-    return { selections, note: note.trim(), confirmed: confirmation === 'y' || confirmation === 'yes' };
+    return { entries, note: note.trim(), confirmed: confirmation === 'y' || confirmation === 'yes' };
   } finally {
     terminal.close();
   }
@@ -212,10 +260,7 @@ async function executable(path) {
   }
 }
 
-async function wakeAdapter(home) {
-  if (process.env.LAVISH_WAKE_COMMAND) {
-    return process.env.LAVISH_WAKE_COMMAND;
-  }
+async function configuredWakeAdapter(home) {
   const configured = resolve(home, 'config/lavish-wake-command');
   try {
     const value = (await readFile(configured, 'utf8')).trim();
@@ -227,6 +272,15 @@ async function wakeAdapter(home) {
       throw error;
     }
   }
+  return undefined;
+}
+
+async function wakeAdapter(home) {
+  if (process.env.LAVISH_WAKE_COMMAND) {
+    return process.env.LAVISH_WAKE_COMMAND;
+  }
+  const configured = await configuredWakeAdapter(home);
+  if (configured !== undefined) return configured;
   if (await executable(SOURCE_WAKE_ADAPTER)) {
     return SOURCE_WAKE_ADAPTER;
   }
@@ -266,9 +320,15 @@ async function enqueueWake(home, decision, answerDigest) {
   });
 }
 
+// Decision answers land under `answers`; annotation answers under
+// `annotations`. Both are the validated entry list for their manifest.
+function answerEntries(answer) {
+  return answer.annotations ?? answer.answers;
+}
+
 function sameBatch(answer, batch) {
   return (
-    JSON.stringify(answer.answers) === JSON.stringify(batch.selections)
+    JSON.stringify(answerEntries(answer)) === JSON.stringify(batch.entries)
     && answer.note === batch.note
   );
 }
@@ -283,25 +343,39 @@ function landingCandidateId(name) {
 
 async function discoverLandingCandidates(home) {
   const stateDirectory = resolve(process.env.FM_STATE_OVERRIDE || join(home, 'state'));
-  const directories = [
-    stateDirectory,
-    process.env.LAVISH_DOWNLOADS_DIR,
-    process.env.LAVISH_SCAN_HOME_DOWNLOADS === '0' ? undefined : join(homedir(), 'Downloads'),
-  ].filter((directory, index, all) => (
-    typeof directory === 'string'
-    && directory.trim() !== ''
-    && all.indexOf(directory) === index
-  ));
+  const configuredDownloads = process.env.LAVISH_DOWNLOADS_DIR?.trim();
+  if (process.env.FM_STATE_OVERRIDE === undefined) {
+    await ensureSafeDirectoryTree(home, stateDirectory, { create: true });
+  }
+  const requestedDirectories = [
+    { path: stateDirectory, missingAllowed: false },
+    configuredDownloads === undefined || configuredDownloads === ''
+      ? undefined
+      : { path: resolve(configuredDownloads), missingAllowed: false },
+    process.env.LAVISH_SCAN_HOME_DOWNLOADS === '0'
+      ? undefined
+      : { path: join(homedir(), 'Downloads'), missingAllowed: true },
+  ].filter((entry) => entry !== undefined);
+  const directories = [];
+  for (const requested of requestedDirectories) {
+    const existing = directories.find((entry) => entry.path === requested.path);
+    if (existing === undefined) {
+      directories.push({ ...requested });
+    } else {
+      existing.missingAllowed &&= requested.missingAllowed;
+    }
+  }
   const candidates = [];
+  const errors = [];
   for (const directory of directories) {
     let entries;
     try {
-      entries = await readdir(directory, { withFileTypes: true });
+      entries = await readdir(directory.path, { withFileTypes: true });
     } catch (error) {
-      if (error.code === 'ENOENT') continue;
-      candidates.push({
+      if (error.code === 'ENOENT' && directory.missingAllowed) continue;
+      errors.push({
         id: '<scan>',
-        path: directory,
+        path: directory.path,
         error: `payload_scan_error: ${error.message}`,
       });
       continue;
@@ -309,13 +383,13 @@ async function discoverLandingCandidates(home) {
     for (const entry of entries) {
       const id = landingCandidateId(entry.name);
       if (id === undefined) continue;
-      let path = join(directory, entry.name);
+      let path = join(directory.path, entry.name);
       try {
         validateDecisionId(id);
         path = resolve(path);
         const info = await lstat(path);
         if (!info.isFile() || info.isSymbolicLink()) {
-          candidates.push({
+          errors.push({
             id,
             path,
             error: 'payload_unsafe_file: candidate is not a regular file',
@@ -324,7 +398,7 @@ async function discoverLandingCandidates(home) {
         }
         candidates.push({ id, path, mtimeMs: info.mtimeMs });
       } catch (error) {
-        candidates.push({ id, path, error: `payload_scan_error: ${error.message}` });
+        errors.push({ id, path, error: `payload_scan_error: ${error.message}` });
       }
     }
   }
@@ -333,37 +407,92 @@ async function discoverLandingCandidates(home) {
     || (right.mtimeMs ?? 0) - (left.mtimeMs ?? 0)
     || left.path.localeCompare(right.path)
   ));
-  return candidates;
+  return { candidates, errors };
 }
 
 async function recoverLandingPayloads(home) {
-  const candidates = await discoverLandingCandidates(home);
+  const discovered = await discoverLandingCandidates(home);
+  if (discovered.errors.length > 0) {
+    return {
+      results: discovered.errors.map((candidate) => ({
+        id: candidate.id,
+        status: 'scan-incomplete',
+        detail: `${candidate.path}: ${candidate.error}`,
+      })),
+      failed: true,
+      complete: false,
+    };
+  }
+  const expectedHomeMarker = resolve(home);
   const byId = new Map();
-  for (const candidate of candidates) {
+  for (const candidate of discovered.candidates) {
     if (!byId.has(candidate.id)) byId.set(candidate.id, []);
     byId.get(candidate.id).push(candidate);
   }
-  const results = [];
-  let failed = false;
+  const errors = [];
+  const plans = [];
 
   for (const [id, idCandidates] of byId) {
-    if (id === '<scan>') {
-      failed = true;
-      for (const candidate of idCandidates) {
-        results.push({ id, status: 'error', detail: `${candidate.path}: ${candidate.error}` });
+    const routedCandidates = [];
+    for (const candidate of idCandidates) {
+      let payload;
+      try {
+        payload = JSON.parse(await readFile(candidate.path, 'utf8'));
+      } catch (error) {
+        errors.push({
+          id,
+          status: 'payload-invalid',
+          detail: `${candidate.path}: payload_invalid_json: ${error.message}`,
+        });
+        continue;
       }
-      continue;
+      if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+        errors.push({
+          id,
+          status: 'payload-invalid',
+          detail: `${candidate.path}: payload_invalid: payload must be an object`,
+        });
+        continue;
+      }
+      const marker = payload?.home_marker;
+      if (marker !== undefined) {
+        if (typeof marker !== 'string' || resolve(marker) !== marker) {
+          errors.push({
+            id,
+            status: 'payload-invalid',
+            detail: `${candidate.path}: payload_invalid_home: home marker must be a normalized absolute path`,
+          });
+          continue;
+        }
+        if (marker !== expectedHomeMarker) continue;
+      }
+      routedCandidates.push({ candidate, payload, legacy: marker === undefined });
+    }
+    if (routedCandidates.length === 0) continue;
+
+    if (routedCandidates.every((entry) => entry.legacy)) {
+      const manifestPath = join(home, 'data/decisions', id, 'manifest.toon');
+      try {
+        await access(manifestPath, fsConstants.F_OK);
+      } catch (error) {
+        if (error.code === 'ENOENT') continue;
+        errors.push({
+          id,
+          status: 'payload-unmatched',
+          detail: `${routedCandidates[0].candidate.path}: ${error.message}`,
+        });
+        continue;
+      }
     }
 
     let decision;
     try {
       decision = await readDecision(home, id);
     } catch (error) {
-      failed = true;
-      results.push({
+      errors.push({
         id,
         status: 'payload-unmatched',
-        detail: `${idCandidates[0].path}: ${error.message}`,
+        detail: `${routedCandidates[0].candidate.path}: ${error.message}`,
       });
       continue;
     }
@@ -373,45 +502,30 @@ async function recoverLandingPayloads(home) {
       existingAnswer = (await readAnswer(decision)).answer;
     } catch (error) {
       if (error.code !== 'ENOENT') {
-        failed = true;
-        results.push({ id, status: 'error', detail: error.message });
+        errors.push({ id, status: 'error', detail: error.message });
         continue;
       }
     }
 
     let selected;
-    for (const candidate of idCandidates) {
-      if (candidate.error !== undefined) {
-        failed = true;
-        results.push({ id, status: 'error', detail: `${candidate.path}: ${candidate.error}` });
-        continue;
-      }
-      let payload;
-      try {
-        payload = JSON.parse(await readFile(candidate.path, 'utf8'));
-      } catch (error) {
-        failed = true;
-        results.push({
-          id,
-          status: 'payload-invalid',
-          detail: `${candidate.path}: payload_invalid_json: ${error.message}`,
-        });
-        continue;
-      }
+    for (const routed of routedCandidates) {
+      const { candidate, payload, legacy } = routed;
+      if (legacy && payload.request_sha256 !== decision.manifest.request_sha256) continue;
       let batch;
       try {
-        batch = validateCollectPayload(payload, decision.manifest);
+        batch = validateCollectPayload(payload, decision.manifest, {
+          expectedHomeMarker,
+          allowMissingHomeMarker: true,
+        });
       } catch (error) {
-        failed = true;
-        results.push({ id, status: 'payload-invalid', detail: `${candidate.path}: ${error.message}` });
+        errors.push({ id, status: 'payload-invalid', detail: `${candidate.path}: ${error.message}` });
         continue;
       }
       if (existingAnswer !== undefined) {
         if (sameBatch(existingAnswer, batch)) {
           continue;
         } else {
-          failed = true;
-          results.push({
+          errors.push({
             id,
             status: 'payload-conflict',
             detail: `${candidate.path}: decision already has different answer content`,
@@ -419,9 +533,11 @@ async function recoverLandingPayloads(home) {
         }
         continue;
       }
-      if (selected !== undefined && !sameBatch({ answers: selected.batch.selections, note: selected.batch.note }, batch)) {
-        failed = true;
-        results.push({
+      if (selected !== undefined && !sameBatch(
+        { answers: selected.batch.entries, note: selected.batch.note },
+        batch,
+      )) {
+        errors.push({
           id,
           status: 'payload-conflict',
           detail: `${candidate.path}: multiple landing payloads disagree`,
@@ -431,13 +547,20 @@ async function recoverLandingPayloads(home) {
       selected ??= { candidate, batch };
     }
 
-    if (existingAnswer !== undefined || selected === undefined) {
-      continue;
-    }
+    if (existingAnswer === undefined && selected !== undefined) plans.push({ id, decision, selected });
+  }
+
+  if (errors.length > 0) {
+    return { results: errors, failed: true, complete: false };
+  }
+
+  const results = [];
+  let failed = false;
+  for (const { id, decision, selected } of plans) {
     try {
       const committed = await commitAnswer(
         decision,
-        selected.batch.selections,
+        selected.batch.entries,
         selected.batch.note,
       );
       const wake = await enqueueWake(home, decision, committed.digest);
@@ -453,7 +576,7 @@ async function recoverLandingPayloads(home) {
     }
   }
 
-  return { results, failed };
+  return { results, failed, complete: !failed };
 }
 
 async function configureWakeCommand(options) {
@@ -502,7 +625,7 @@ async function answerCommand(id, options) {
     : undefined;
   const committed = await commitAnswer(
     decision,
-    batch.selections,
+    batch.entries,
     batch.note,
     { beforeRename },
   );
@@ -549,11 +672,14 @@ async function collectCommand(id, options) {
   } catch (error) {
     throw new LavishError(`payload_invalid_json: ${error.message}`, 2);
   }
-  const batch = validateCollectPayload(payload, decision.manifest);
+  const batch = validateCollectPayload(payload, decision.manifest, {
+    expectedHomeMarker: decision.home,
+    allowMissingHomeMarker: true,
+  });
   try {
     const existing = await readAnswer(decision);
     if (
-      JSON.stringify(existing.answer.answers) === JSON.stringify(batch.selections)
+      JSON.stringify(answerEntries(existing.answer)) === JSON.stringify(batch.entries)
       && existing.answer.note === batch.note
     ) {
       process.stdout.write(
@@ -567,7 +693,7 @@ async function collectCommand(id, options) {
       throw error;
     }
   }
-  const committed = await commitAnswer(decision, batch.selections, batch.note);
+  const committed = await commitAnswer(decision, batch.entries, batch.note);
   const wake = await enqueueWake(home, decision, committed.digest);
   if (!wake.ok) {
     process.stderr.write(
@@ -581,6 +707,15 @@ async function collectCommand(id, options) {
   );
 }
 
+async function readDefinition(options, key) {
+  const path = resolve(requireOption(options, key));
+  try {
+    return JSON.parse(await readFile(path, 'utf8'));
+  } catch (error) {
+    throw new LavishError(`could not parse ${key} JSON: ${error.message}`, 2);
+  }
+}
+
 async function createCommand(options) {
   rejectUnknownOptions(options, [
     'home',
@@ -588,27 +723,41 @@ async function createCommand(options) {
     'title',
     'request',
     'questions',
+    'items',
     'destination',
     'visuals',
     'created-at',
   ]);
   const home = resolveHome(options);
   const requestPath = resolve(requireOption(options, 'request'));
-  const questionsPath = resolve(requireOption(options, 'questions'));
-  let questions;
-  try {
-    questions = JSON.parse(await readFile(questionsPath, 'utf8'));
-  } catch (error) {
-    throw new LavishError(`could not parse questions JSON: ${error.message}`, 2);
+  const request = await readFile(requestPath);
+  if (options.questions !== undefined && options.items !== undefined) {
+    throw new LavishError('pass --questions or --items, never both', 2);
   }
+  if (options.questions === undefined && options.items === undefined) {
+    throw new LavishError(
+      'pass --questions for a multiple-choice decision, or --items for an annotation board that asks nothing',
+      2,
+    );
+  }
+  const annotation = options.items !== undefined;
+  const definition = annotation
+    ? await readDefinition(options, 'items')
+    : await readDefinition(options, 'questions');
   const result = await createDecision(home, {
     id: requireOption(options, 'id'),
     title: requireOption(options, 'title'),
-    request: await readFile(requestPath),
-    questions,
+    request,
+    ...(annotation ? { items: definition } : { questions: definition }),
     destination: requireOption(options, 'destination'),
     visualsDirectory: options.visuals === undefined ? undefined : resolve(options.visuals),
     createdAt: options['created-at'] ?? new Date().toISOString(),
+    beforeCreate: async () => {
+      await validateCaptainRequest(home, request);
+      if (annotation) {
+        await validateCaptainItems(home, definition);
+      }
+    },
   });
   process.stdout.write(
     `${result.created ? 'Created' : 'Already exists'}: ${result.decision.id}\n`
@@ -616,10 +765,84 @@ async function createCommand(options) {
   );
 }
 
+async function captainItemCheck(home) {
+  if (await executable(CAPTAIN_ITEM_CHECK)) {
+    return CAPTAIN_ITEM_CHECK;
+  }
+  const configured = await configuredWakeAdapter(home);
+  if (configured !== undefined) {
+    const sibling = join(dirname(configured), 'fm-captain-item-check.sh');
+    if (await executable(sibling)) return sibling;
+  }
+  throw new LavishError(
+    'captain request check is unavailable; configure the Firstmate wake adapter from its checkout before creating a decision',
+    2,
+  );
+}
+
+async function runCaptainCheck(home, label, filename, content, refusal) {
+  const check = await captainItemCheck(home);
+  const temporary = await mkdtemp(join(tmpdir(), `lavish-captain-${label}-`));
+  const snapshot = join(temporary, filename);
+  try {
+    await writeFile(snapshot, content, { flag: 'wx', mode: 0o600 });
+    const checked = await new Promise((resolveCheck) => {
+      execFile(
+        check,
+        ['request', snapshot],
+        { encoding: 'utf8', maxBuffer: 1024 * 1024, windowsHide: true },
+        (error, stdout, stderr) => resolveCheck({ error, stdout, stderr }),
+      );
+    });
+    if (checked.error !== null) {
+      const detail = `${checked.stdout}${checked.stderr}`.trim();
+      throw new LavishError(
+        `${refusal}${detail === '' ? '' : `:\n${detail}`}`,
+        2,
+      );
+    }
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+}
+
+async function validateCaptainRequest(home, request) {
+  await runCaptainCheck(
+    home,
+    'request',
+    'request.md',
+    request,
+    'captain request refused by the required draft check',
+  );
+}
+
+// An annotation board puts each item's own text in front of the captain, so
+// those bytes need the same plain-language gate the request gets. Checking the
+// normalized items is what keeps the checked text identical to the stored text.
+async function validateCaptainItems(home, items) {
+  const assembly = `${validateItems(items).map((item) => (
+    `<!-- fm-captain-item: note -->\n${`${item.title}\n\n${item.body}`.trimEnd()}\n<!-- /fm-captain-item -->`
+  )).join('\n\n')}\n`;
+  await runCaptainCheck(
+    home,
+    'items',
+    'items.md',
+    assembly,
+    'captain items refused by the required draft check; each item is checked in note mode, numbered in declared order',
+  );
+}
+
 async function intakeCommand(options) {
   rejectUnknownOptions(options, ['home']);
   const home = resolveHome(options);
   const recovered = await recoverLandingPayloads(home);
+  if (!recovered.complete) {
+    if (recovered.results.length > 0) {
+      process.stdout.write(encodeToon({ decisions: recovered.results }));
+    }
+    process.exitCode = 6;
+    return;
+  }
   const result = await intakeAll(home);
   const results = [...recovered.results, ...result.results];
   if (results.length === 0) {

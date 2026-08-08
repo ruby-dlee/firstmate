@@ -12,6 +12,30 @@ set -u
 
 SEND="$ROOT/bin/fm-send.sh"
 fm_test_tmproot_into TMP_ROOT fm-send-strict
+RUNTIME_PROFILE_STUB="$TMP_ROOT/fm-runtime-profile.sh"
+cat > "$RUNTIME_PROFILE_STUB" <<'SH'
+#!/usr/bin/env bash
+printf 'verified: test runtime profile for %s\n' "${1:-unknown}"
+exit "${FM_FAKE_RUNTIME_PROFILE_RC:-0}"
+SH
+chmod +x "$RUNTIME_PROFILE_STUB"
+STEERING_STUB="$TMP_ROOT/fm-send-steering.sh"
+cat > "$STEERING_STUB" <<'SH'
+#!/usr/bin/env bash
+if [ "${FM_FAKE_SEND_FAIL:-0}" = 1 ]; then
+  printf 'send-failed'
+else
+  verdict=${FM_FAKE_SEND_VERDICT:-confirmed}
+  if [ "$verdict" = confirmed ] && [ -n "${FM_TMUX_LOG:-}" ]; then
+    printf 'atomic-steer backend=%s target=%s arg=%s\n' "$1" "$2" "$3" >> "$FM_TMUX_LOG"
+  fi
+  printf '%s' "$verdict"
+fi
+SH
+chmod +x "$STEERING_STUB"
+export FM_SEND_TEST_HOOKS=firstmate-fm-send-tests-v1
+export FM_SEND_RUNTIME_PROFILE_BIN="$RUNTIME_PROFILE_STUB"
+export FM_SEND_STEERING_BIN="$STEERING_STUB"
 
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$ROOT/bin/fm-account-routing-lib.sh"
@@ -55,6 +79,7 @@ case "${1:-}" in
     esac
     exit 0 ;;
   capture-pane)
+    printf 'capture-pane %s\n' "$*" >> "$FM_TMUX_LOG"
     [ "${FM_FAKE_TMUX_CAPTURE_FAIL:-0}" != 1 ] || exit 1
     printf '\xe2\x94\x82 \xe2\x94\x82\n'
     exit 0 ;;
@@ -113,22 +138,23 @@ setup_home() {  # <name> -> echoes home dir
   printf '%s\n' "$home"
 }
 
-test_exact_lane_id_text_refuses_and_control_key_retires_violation() {
-  local dir fb home err log rc got
+test_exact_lane_id_text_requires_verified_read() {
+  local dir fb home err log rc
   dir="$TMP_ROOT/exact"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home exact); err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
   fm_write_meta "$home/state/mpf-lane-m8.meta" "window=sess:fm-mpf-lane-m8" "kind=ship"
 
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
-    "$SEND" mpf-lane-m8 "lost dispatch" >/dev/null 2>"$err"; rc=$?
-  expect_code 1 "$rc" "pane text steering must refuse even when metadata exists"
-  assert_grep 'no atomic agent-session-bound tmux route' "$err" "unsafe text refusal omitted the route gap"
-  got=$(cat "$log")
-  assert_not_contains "$got" 'send-keys ' "refused text reached pane input"
+    "$SEND" mpf-lane-m8 "verified dispatch" >/dev/null 2>"$err"; rc=$?
+  expect_code 0 "$rc" "identity-bound text with a readable empty composer should verify"
+  assert_grep 'atomic-steer backend=tmux target=sess:fm-mpf-lane-m8 arg=verified dispatch' "$log" \
+    "verified text never reached the exact target"
+  [ "$(grep -c '^capture-pane ' "$log")" -ge 1 ] \
+    || fail "verified text did not perform its post-submit target read"
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" \
-    "$SEND" mpf-lane-m8 --key C-c >/dev/null 2>"$err" || fail "control key failed after text was removed"
-  assert_grep 'literal=0 arg=C-c' "$log" "control-only retirement did not reach the exact target"
-  pass "fm-send rejects unsafe text and retires it as a control-only action"
+    "$SEND" mpf-lane-m8 --key C-c >/dev/null 2>"$err" || fail "control key failed after verified text"
+  assert_grep 'literal=0 arg=C-c' "$log" "control key did not reach the exact target"
+  pass "fm-send returns success only after a fresh identity-bound target read"
 }
 
 test_unset_fm_home_fails() {
@@ -256,13 +282,14 @@ test_explicit_managed_target_records_steering() {
 
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
     "$SEND" sess:fm-managed-task "Preserve this explicit managed steer." >/dev/null 2>"$err"; rc=$?
-  expect_code 1 "$rc" "explicit managed text steering must refuse"
+  expect_code 0 "$rc" "explicit managed text steering should succeed only after verification"
   assert_grep "Preserve this explicit managed steer" "$journal" \
-    "explicit managed refusal lost its durable intent: $(cat "$err")"
-  assert_grep 'send-failed' "$journal" "explicit managed refusal omitted its terminal journal verdict"
-  assert_absent "$home/data/managed-task/steering.md" "refused managed text was recorded as delivered"
-  assert_no_grep '^send-keys ' "$log" "refused managed text reached pane input"
-  pass "fm-send strict: managed unsafe text is refused and audited"
+    "explicit managed send lost its durable intent: $(cat "$err")"
+  assert_grep 'confirmed' "$journal" "explicit managed send omitted its confirmed journal verdict"
+  assert_grep '> Preserve this explicit managed steer.' "$home/data/managed-task/steering.md" \
+    "verified managed text was not recorded as delivered"
+  assert_grep 'atomic-steer backend=tmux' "$log" "verified managed text never reached the target"
+  pass "fm-send strict: managed verified text is delivered and audited"
 }
 
 test_unknown_managed_delivery_is_recorded_unconfirmed() {
@@ -279,7 +306,7 @@ test_unknown_managed_delivery_is_recorded_unconfirmed() {
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" \
     FM_FAKE_TMUX_CAPTURE_FAIL=1 FM_SEND_SETTLE=0 \
     "$SEND" managed-unknown "Preserve this unknown delivery verbatim." >/dev/null 2>"$err"; rc=$?
-  expect_code 0 "$rc" "unknown managed delivery should retain the lenient send result"
+  expect_code 1 "$rc" "unknown managed delivery must hard-stop the caller"
   assert_present "$unconfirmed" "unknown managed delivery was not durably audited"
   assert_grep 'delivery unconfirmed' "$unconfirmed" "unknown steering audit omitted its delivery verdict"
   assert_grep '> Preserve this unknown delivery verbatim.' "$unconfirmed" \
@@ -288,9 +315,9 @@ test_unknown_managed_delivery_is_recorded_unconfirmed() {
     "unknown delivery was recorded as canonical steering"
   assert_absent "$home/data/managed-unknown/steering-pending.md" \
     "unknown delivery was recorded as delivered pending steering"
-  assert_contains "$(cat "$err")" "durably recorded as unconfirmed" \
-    "unknown delivery warning omitted its explicit verdict"
-  pass "fm-send strict: unknown managed delivery remains explicitly unconfirmed"
+  assert_contains "$(cat "$err")" "UNVERIFIED" \
+    "unknown delivery failure omitted its explicit verdict"
+  pass "fm-send strict: unknown managed delivery is recorded and exits nonzero"
 }
 
 test_managed_steering_intent_precedes_external_submission() {
@@ -544,20 +571,38 @@ test_managed_steering_rejects_parent_swap_during_persistence() {
   pass "fm-send strict: steering persistence rejects raced task parents"
 }
 
-test_healthy_fm_id_text_still_refuses() {
-  local dir fb home err log rc got
+test_codex_steer_requires_current_runtime_profile() {
+  local dir fb home err log rc
+  dir="$TMP_ROOT/runtime-profile"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home=$(setup_home runtime-profile)
+  err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
+  fm_write_meta "$home/state/runtime-profile.meta" \
+    "window=sess:fm-runtime-profile" "kind=ship" "harness=codex"
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" \
+    FM_FAKE_RUNTIME_PROFILE_RC=1 FM_SEND_SETTLE=0 \
+    "$SEND" runtime-profile "must not run below policy" >/dev/null 2>"$err"; rc=$?
+  expect_code 1 "$rc" "mismatched Codex runtime steer"
+  assert_contains "$(cat "$err")" "runtime profile is not currently verified" \
+    "Codex steer refusal omitted the runtime predicate"
+  assert_no_grep 'atomic-steer ' "$log" \
+    "Codex runtime mismatch reached agent steering"
+  pass "fm-send refuses Codex steering while runtime policy is unverified"
+}
+
+test_healthy_fm_id_text_requires_post_submit_read() {
+  local dir fb home err log rc
   dir="$TMP_ROOT/healthy"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home healthy); err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
   fm_write_meta "$home/state/lane-ok.meta" "window=sess:fm-lane-ok" "kind=ship" "harness=codex"
 
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
-    "$SEND" fm-lane-ok "hello captain" >/dev/null 2>"$err"; rc=$?
-  expect_code 1 "$rc" "healthy pane identity must not bypass atomic steering refusal"
-  got=$(cat "$log")
-  assert_not_contains "$got" 'send-keys ' "healthy endpoint identity bypassed text refusal"
-  assert_contains "$(cat "$err")" "no atomic agent-session-bound tmux route" "healthy refusal omitted the route gap"
-  assert_contains "$(cat "$err")" "backend admission still decides" "fm-send guard banner should describe the refusal boundary"
-  pass "fm-send strict: endpoint health never authorizes unbound text steering"
+    "$SEND" fm-lane-ok "verified hello" >/dev/null 2>"$err"; rc=$?
+  expect_code 0 "$rc" "healthy exact target should succeed after verification"
+  assert_grep 'atomic-steer backend=tmux target=sess:fm-lane-ok arg=verified hello' "$log" \
+    "healthy target never received the text"
+  [ "$(grep -c '^capture-pane ' "$log")" -ge 1 ] \
+    || fail "healthy target did not receive a post-submit verification read"
+  pass "fm-send strict: endpoint health plus a post-submit read authorizes success"
 }
 
 if [ "${FM_TEST_FOCUSED:-}" = managed-steering ]; then
@@ -587,7 +632,7 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
   exit 0
 fi
 
-test_exact_lane_id_text_refuses_and_control_key_retires_violation
+test_exact_lane_id_text_requires_verified_read
 test_unset_fm_home_fails
 test_unresolvable_target_does_not_tmux_fallback
 test_prefixless_herdr_pane_id_fails
@@ -597,5 +642,10 @@ test_metadata_free_explicit_herdr_target_remains_unbound
 test_explicit_managed_target_records_steering
 test_managed_send_revalidates_after_respawn_wait
 test_managed_key_revalidates_after_respawn_wait
-test_healthy_fm_id_text_still_refuses
+test_codex_steer_requires_current_runtime_profile
+test_healthy_fm_id_text_requires_post_submit_read
 test_managed_tmux_send_rejects_reused_id_in_other_session
+test_managed_tmux_send_retains_verified_stable_id
+env -u FM_SEND_STEERING_BIN -u FM_SEND_RUNTIME_PROFILE_BIN -u FM_SEND_TEST_HOOKS \
+  bash "$ROOT/tests/fm-send-permission-modal-probe.sh" \
+  || fail "fm-send strict: Herdr permission-modal boundary probe failed"

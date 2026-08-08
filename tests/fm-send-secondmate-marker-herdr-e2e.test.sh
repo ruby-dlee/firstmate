@@ -178,15 +178,15 @@ wait_for_prompt 'Isolated marker capture secondmate' \
   || fail "real Pi before_agent_start capture did not load for the startup charter"
 wait_for_idle || fail "real Pi did not become idle after the startup capture"
 
-PATH="$FAKEBIN:$ORIGINAL_PATH" FM_GATE_REFUSE_BYPASS=1 FM_HOME="$SENDER_HOME" \
-  "$ROOT/bin/fm-send.sh" "$ID" "$REQUEST" >/dev/null
-wait_for_prompt "$REQUEST" || fail "real Pi did not receive the exact-id fm-send request"
-GOT=$(jq -r --arg needle "$REQUEST" 'select(.prompt | contains($needle)) | .prompt' "$CAPTURE" | tail -1)
-[ "$GOT" = "${FM_FROMFIRST_MARK}${REQUEST}" ] \
-  || fail "real Pi exact-id prompt did not contain exactly one terminal-safe marker"$'\n'"--- bytes ---"$'\n'"$(printf '%s' "$GOT" | od -An -tx1)"
-printf 'evidence: exact-id received-hex=%s\n' "$(printf '%s' "$GOT" | od -An -tx1 | tr -d ' \n')"
-pass "real Pi/Herdr: exact-id FM_HOME send delivers exactly one from-firstmate marker"
-wait_for_idle || fail "real Pi did not become idle after the exact-id capture"
+if PATH="$FAKEBIN:$ORIGINAL_PATH" FM_GATE_REFUSE_BYPASS=1 FM_HOME="$SENDER_HOME" \
+  "$ROOT/bin/fm-send.sh" "$ID" "$REQUEST" >/dev/null 2>&1; then
+  fail "real Pi/Herdr admitted unbound pane steering"
+fi
+sleep 1
+if jq -e --arg needle "$REQUEST" 'select(.prompt | contains($needle))' "$CAPTURE" >/dev/null 2>&1; then
+  fail "atomic steering refusal still delivered the exact-id request"
+fi
+pass "real Pi/Herdr: exact-id fm-send refuses before pane input"
 
 # Direct terminal input bypasses fm-send's metadata-routed transformation and
 # therefore remains conversational captain input.

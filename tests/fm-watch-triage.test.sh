@@ -16,7 +16,10 @@
 #
 # Daemon-side classification/injection lives in fm-daemon.test.sh; watcher/lock
 # liveness in fm-watcher-lock.test.sh; the durable-queue safety matrix in
-# fm-wake-queue.test.sh.
+# fm-wake-queue.test.sh; the full declared-pause truth table - live-idle, dead,
+# open-decision, and closed-decision panes - in fm-watch-pause-absorb.test.sh.
+# Runtime-profile cases deliberately source the watcher inside isolated subshells.
+# shellcheck disable=SC1090,SC2030,SC2031
 set -u
 
 # shellcheck source=tests/wake-helpers.sh
@@ -200,6 +203,14 @@ test_crew_is_provably_working_classifier() {
   export FM_FAKE_CREW_STATE
   FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
   crew_is_provably_working a || fail "active run-step not treated as provably working"
+  FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running) · liveness: alive (2 procs) · step: test'
+  crew_is_provably_working a || fail "alive command-step liveness not treated as provably working"
+  FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running) · liveness: dead (0 procs) · step: test'
+  FM_FAKE_RUN_LIVENESS_RC=1 crew_is_provably_working a \
+    && fail "dead command-step record with no affirmative process sample was treated as working"
+  FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running) · liveness: unknown (probe timed out) · step: test'
+  FM_FAKE_RUN_LIVENESS_RC=2 crew_is_provably_working a \
+    && fail "unknown command-step record with no affirmative process sample was treated as working"
   FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
   crew_is_provably_working a || fail "busy pane not treated as provably working"
   FM_FAKE_CREW_STATE='state: working · source: status-log · working: compiling'
@@ -326,36 +337,67 @@ test_failure_pause_is_failure_classifier() {
 # (positive process window/busy pane), unknown (complete all-zero process window),
 # paused (declared external wait), and none (surface it without a wedge claim).
 # crew_is_paused delegates to it exactly as crew_is_provably_working does.
+#
+# The pause half is proven from the crewmate's own durable status stream, not from
+# the fm-crew-state.sh verdict, so every pause case here needs a real status file;
+# the full pause truth table (including the run-step verdicts that used to veto a
+# pause) lives in tests/fm-watch-pause-absorb.test.sh.
 test_crew_absorb_class_classifier() {
-  local dir fakebin
-  dir=$(make_case absorb-class); fakebin="$dir/fakebin"
+  local dir fakebin state
+  dir=$(make_case absorb-class); fakebin="$dir/fakebin"; state="$dir/state"
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
-  export FM_FAKE_CREW_STATE
+  export FM_FAKE_CREW_STATE FM_STATE_OVERRIDE="$state"
+  printf 'working: compiling\n' > "$state/a.status"
   FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
   [ "$(crew_absorb_class a)" = working ] || fail "active run-step not classed working"
   export FM_FAKE_RUN_LIVENESS_RC=1
   [ "$(crew_absorb_class a)" = unknown ] || fail "all-zero complete process window not classed unknown"
+  [ "$(crew_state_liveness_verdict 'state: working · source: run-step · liveness: dead (0 procs)')" = unknown ] \
+    || fail "historical dead field was not downgraded to unknown"
   unset FM_FAKE_RUN_LIVENESS_RC
   FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
   [ "$(crew_absorb_class a)" = working ] || fail "busy pane not classed working"
+  printf 'paused: awaiting upstream\n' > "$state/a.status"
   FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting upstream'
   [ "$(crew_absorb_class a)" = paused ] || fail "declared pause not classed paused"
   crew_is_paused a || fail "crew_is_paused did not recognize a paused verdict"
   ! crew_is_provably_working a || fail "a paused crew was treated as provably working"
+  # A terminal run-step with NO pause in the stream is not absorbable...
+  printf 'done: PR ready\n' > "$state/a.status"
   FM_FAKE_CREW_STATE='state: done · source: run-step · checks green: PR ready for review'
   [ "$(crew_absorb_class a)" = none ] || fail "terminal run-step without pause context was absorbed"
+  # ...and yields to one when the caller supplies it.
+  printf 'paused: awaiting ordered PR merges\n' > "$state/a.status"
   [ "$(crew_absorb_class a 'paused: awaiting ordered PR merges')" = paused ] \
     || fail "terminal run-step did not yield to a declared pause for absorb classification"
+  # A FAILED run-step yields to a declared pause too, as of 2026-08-03. It used not
+  # to, which silenced nothing but did surface plenty: fm-crew-state.sh maps a
+  # routinely CANCELLED run onto `failed`, so ordinary teardown-cancelled runs
+  # wedge-escalated lanes that had legitimately declared a wait. A crewmate that
+  # genuinely failed reports it with the captain-relevant `failed:` verb, and a
+  # failure written under the pause verb is caught by status_pause_is_failure below -
+  # neither route depends on this veto.
   FM_FAKE_CREW_STATE='state: failed · source: run-step · validation failed'
+  [ "$(crew_absorb_class a 'paused: awaiting ordered PR merges')" = paused ] \
+    || fail "failed run-step did not yield to a declared external wait"
+  printf 'paused: error: drive run: read response: i/o timeout\n' > "$state/a.status"
+  [ "$(crew_absorb_class a 'paused: error: drive run: read response: i/o timeout')" = none ] \
+    || fail "a failure reported under the pause verb was absorbed behind a failed run-step"
+  printf 'blocked: stream advanced while pipeline state was read\n' > "$state/a.status"
   [ "$(crew_absorb_class a 'paused: awaiting ordered PR merges')" = none ] \
-    || fail "failed run-step was absorbed behind a declared pause"
+    || fail "a stale caller-supplied pause overrode the current status line"
+  printf 'paused: awaiting ordered PR merges\n' > "$state/a.status"
+  export FM_FAKE_CREW_STATE_APPEND_STATUS='blocked: stream advanced during pipeline state read'
+  [ "$(crew_absorb_class a 'paused: awaiting ordered PR merges')" = none ] \
+    || fail "a pause invalidated during the crew-state read was absorbed"
+  unset FM_FAKE_CREW_STATE_APPEND_STATUS
   FM_FAKE_CREW_STATE='state: working · source: status-log · working: compiling'
   [ "$(crew_absorb_class a)" = none ] || fail "stale working: status-log classed absorbable"
   FM_FAKE_CREW_STATE='state: unknown · source: none · worktree gone'
   [ "$(crew_absorb_class a)" = none ] || fail "unknown crew classed absorbable"
   ! crew_is_paused a || fail "unknown crew classed paused"
   [ "$(crew_absorb_class "")" = none ] || fail "empty id not classed none"
-  unset FM_FAKE_CREW_STATE
+  unset FM_FAKE_CREW_STATE FM_STATE_OVERRIDE
   pass "crew_absorb_class: process-proved working, unknown, paused, and none remain distinct"
 }
 
@@ -369,17 +411,25 @@ test_signal_crew_provably_working_classifier() {
   export FM_RUN_LIVENESS_BIN="$fakebin/fm-run-liveness.sh"
   export FM_FAKE_CREW_STATE_a='state: working · source: run-step · running'
   export FM_FAKE_CREW_STATE_b='state: done · source: run-step · run passed'
+  export FM_FAKE_CREW_STATE_c='state: working · source: run-step · running · liveness: dead (0 procs) · step: test'
+  export FM_FAKE_CREW_STATE_d='state: working · source: run-step · running · liveness: unknown (probe timed out) · step: test'
+  export FM_FAKE_RUN_LIVENESS_RC_c=1 FM_FAKE_RUN_LIVENESS_RC_d=2
   signal_crew_provably_working "$state/a.status" "$state/a.turn-ended" \
     || fail "a single provably-working crew (status+turn-end) was not benign"
   ! signal_crew_provably_working "$state/a.status" "$state/b.turn-ended" \
     || fail "a coalesced batch including a stopped crew was treated as benign"
   ! signal_crew_provably_working "$state/b.turn-ended" \
     || fail "a stopped crew's bare turn-end was treated as benign"
+  ! signal_crew_provably_working "$state/c.turn-ended" \
+    || fail "a dead command-step turn-end was treated as benign"
+  ! signal_crew_provably_working "$state/d.turn-ended" \
+    || fail "an unknown command-step turn-end was treated as benign"
   ! signal_crew_provably_working "$state/a.meta" \
     || fail "a non-signal file resolved to a benign verdict"
   ! signal_crew_provably_working \
     || fail "an empty signal file list was treated as benign"
-  unset FM_FAKE_CREW_STATE_a FM_FAKE_CREW_STATE_b
+  unset FM_FAKE_CREW_STATE_a FM_FAKE_CREW_STATE_b FM_FAKE_CREW_STATE_c FM_FAKE_CREW_STATE_d
+  unset FM_FAKE_RUN_LIVENESS_RC_c FM_FAKE_RUN_LIVENESS_RC_d
   pass "signal_crew_provably_working: benign only when every referenced crew is provably working"
 }
 
@@ -1664,6 +1714,28 @@ test_heartbeat_backstop_surfaces_unsurfaced_status() {
   pass "heartbeat backstop fail-safe surfaces a captain-relevant status the per-wake path missed"
 }
 
+test_heartbeat_ignores_recorded_liveness_absence() {
+  local verdict dir state fakebin out pid
+  for verdict in dead unknown; do
+    dir=$(make_case "heartbeat-liveness-$verdict")
+    state="$dir/state"
+    fakebin="$dir/fakebin"
+    out="$dir/watch.out"
+    fm_write_meta "$state/task.meta" "kind=ship"
+    PATH="$fakebin:$PATH" \
+      FM_STATE_OVERRIDE="$state" \
+      FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_FAKE_CREW_STATE="state: working · source: run-step · validating (running) · liveness: $verdict (probe result) · step: test" \
+      FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 \
+      "$WATCH" > "$out" &
+    pid=$!
+    wait_live "$pid" 30 || { reap "$pid"; fail "heartbeat acted on a $verdict record"; }
+    [ ! -s "$out" ] || { reap "$pid"; fail "heartbeat surfaced a $verdict record: $(cat "$out")"; }
+    reap "$pid"
+  done
+  pass "heartbeat never infers liveness from a recorded dead or unknown field"
+}
+
 # --- beacon stays fresh while absorbing -------------------------------------
 
 test_beacon_stays_fresh_while_absorbing() {
@@ -1981,23 +2053,30 @@ if [ "${FM_TEST_FOCUSED:-}" = failure-pause ]; then
   exit 0
 fi
 
-if [ "${FM_TEST_FOCUSED:-}" = runtime-profiles ]; then
-  test_runtime_profile_verifies_each_new_generation_before_periodic_cadence
-  test_runtime_profile_mismatches_do_not_starve_later_tasks
-  exit 0
-fi
-
-if [ "${FM_TEST_FOCUSED:-}" = signal-parallel ]; then
-  test_signal_crew_provably_working_classifier
-  test_signal_crew_provably_working_runs_one_bounded_parallel_window
-  exit 0
-fi
-
-if [ "${FM_TEST_FOCUSED:-}" = liveness-batches ]; then
-  test_signal_crew_provably_working_runs_one_bounded_parallel_window
-  test_watcher_stale_liveness_runs_one_bounded_parallel_window
-  exit 0
-fi
+case "${FM_TEST_FOCUSED:-}" in
+  runtime-profiles)
+    test_runtime_profile_verifies_each_new_generation_before_periodic_cadence
+    test_runtime_profile_mismatches_do_not_starve_later_tasks
+    exit 0
+    ;;
+  signal-parallel)
+    test_signal_crew_provably_working_classifier
+    test_signal_crew_provably_working_runs_one_bounded_parallel_window
+    exit 0
+    ;;
+  liveness-batches)
+    test_signal_crew_provably_working_runs_one_bounded_parallel_window
+    test_watcher_stale_liveness_runs_one_bounded_parallel_window
+    exit 0
+    ;;
+  liveness-verdicts)
+    test_crew_is_provably_working_classifier
+    test_crew_absorb_class_classifier
+    test_signal_crew_provably_working_classifier
+    test_heartbeat_ignores_recorded_liveness_absence
+    exit 0
+    ;;
+esac
 
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
@@ -2040,6 +2119,7 @@ test_nonterminal_stale_repairs_missing_or_corrupt_timer
 test_triage_log_size_cap_accepts_spaced_wc_counts
 test_heartbeat_no_change_absorbed
 test_heartbeat_backstop_surfaces_unsurfaced_status
+test_heartbeat_ignores_recorded_liveness_absence
 test_beacon_stays_fresh_while_absorbing
 test_afk_present_reverts_watcher_to_one_shot
 test_afk_paused_changed_pane_hands_off_plain_stale

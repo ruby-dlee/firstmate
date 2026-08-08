@@ -37,6 +37,14 @@ export const ANSWER_KIND = 'lavish-decision-answer';
 export const RECEIPT_KIND = 'lavish-decision-receipt';
 export const DECISIONS_RELATIVE_DIR = 'data/decisions';
 
+// A decision asks the captain to choose between ordered options. An annotation
+// asks for nothing: it presents items and collects free text against each one.
+// Both travel the same durable request, answer, receipt, and intake path; the
+// mode only changes what a board renders and what an answer carries.
+export const DECISION_MODE = 'decision';
+export const ANNOTATION_MODE = 'annotation';
+const MODES = [DECISION_MODE, ANNOTATION_MODE];
+
 const ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 const SHA_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const VISUAL_MEDIA_TYPES = new Map([
@@ -125,9 +133,30 @@ function validateVisualFilename(value, label) {
   return { filename, mediaType };
 }
 
+function validateEntryVisuals(rawVisuals, label, key) {
+  if (rawVisuals === undefined) {
+    return [];
+  }
+  if (!Array.isArray(rawVisuals)) {
+    throw new LavishError(`${label}.visuals must be an array`, 2);
+  }
+  const names = new Set();
+  return rawVisuals.map((rawVisual, visualIndex) => {
+    const { filename } = validateVisualFilename(rawVisual, `${label}.visuals[${visualIndex}]`);
+    if (names.has(filename)) {
+      throw new LavishError(`${key} repeats visual ${filename}`, 2);
+    }
+    names.add(filename);
+    return filename;
+  });
+}
+
 export function validateQuestions(questions) {
   if (!Array.isArray(questions) || questions.length === 0) {
-    throw new LavishError('questions must be a nonempty array', 2);
+    throw new LavishError(
+      'questions must be a nonempty array; use items for an annotation board that asks nothing',
+      2,
+    );
   }
 
   const keys = new Set();
@@ -175,25 +204,40 @@ export function validateQuestions(questions) {
       values.add(value);
       return { value, label };
     });
-    let visuals = [];
-    if (question.visuals !== undefined) {
-      if (!Array.isArray(question.visuals)) {
-        throw new LavishError(`questions[${questionIndex}].visuals must be an array`, 2);
-      }
-      const visualNames = new Set();
-      visuals = question.visuals.map((rawVisual, visualIndex) => {
-        const { filename } = validateVisualFilename(
-          rawVisual,
-          `questions[${questionIndex}].visuals[${visualIndex}]`,
-        );
-        if (visualNames.has(filename)) {
-          throw new LavishError(`question ${key} repeats visual ${filename}`, 2);
-        }
-        visualNames.add(filename);
-        return filename;
-      });
-    }
+    const visuals = validateEntryVisuals(
+      question.visuals,
+      `questions[${questionIndex}]`,
+      `question ${key}`,
+    );
     return { key, prompt, options, ...(visuals.length === 0 ? {} : { visuals }) };
+  });
+}
+
+export function validateItems(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new LavishError('items must be a nonempty array', 2);
+  }
+
+  const keys = new Set();
+  return items.map((rawItem, itemIndex) => {
+    const item = requirePlainObject(rawItem, `items[${itemIndex}]`);
+    const key = requireString(item.key, `items[${itemIndex}].key`);
+    if (!ID_PATTERN.test(key)) {
+      throw new LavishError(`items[${itemIndex}].key must be a lowercase slug`, 2);
+    }
+    if (keys.has(key)) {
+      throw new LavishError(`duplicate item key: ${key}`, 2);
+    }
+    keys.add(key);
+
+    const title = requireString(item.title, `items[${itemIndex}].title`);
+    // Body is always stored, empty included, so every item encodes the same
+    // fields and TOON can keep the array tabular.
+    const body = item.body === undefined
+      ? ''
+      : requireString(item.body, `items[${itemIndex}].body`, { allowEmpty: true });
+    const visuals = validateEntryVisuals(item.visuals, `items[${itemIndex}]`, `item ${key}`);
+    return { key, title, body, ...(visuals.length === 0 ? {} : { visuals }) };
   });
 }
 
@@ -241,8 +285,8 @@ export function validateManifest(raw, expectedId = undefined) {
   const title = requireString(manifest.title, 'manifest.title');
   const createdAt = requireTimestamp(manifest.created_at, 'manifest.created_at');
   const destination = validateDestination(manifest.destination);
-  let destinationFormat;
-  if (manifest.destination_format !== undefined) {
+  let destinationFormat = manifest.destination_format;
+  if (destinationFormat !== undefined) {
     destinationFormat = requireString(
       manifest.destination_format,
       'manifest.destination_format',
@@ -250,12 +294,44 @@ export function validateManifest(raw, expectedId = undefined) {
     if (!['answer-toon', 'payload-json-v2'].includes(destinationFormat)) {
       throw new LavishError('unsupported manifest.destination_format', 2);
     }
+  } else {
+    // Protocol-1 manifests predate destination_format and copy answer.toon
+    // byte-for-byte even when their destination happens to end in .json.
+    destinationFormat = 'answer-toon';
+  }
+  if (
+    manifest.destination_format !== undefined
+    && extname(destination).toLowerCase() === '.json'
+    && destinationFormat !== 'payload-json-v2'
+  ) {
+    throw new LavishError('JSON destinations require manifest.destination_format payload-json-v2', 2);
   }
   const requestSha256 = requireDigest(
     manifest.request_sha256,
     'manifest.request_sha256',
   );
-  const questions = validateQuestions(manifest.questions);
+  // Absent mode is a protocol-1 decision manifest written before annotation
+  // boards existed, so it keeps its original meaning.
+  const mode = manifest.mode === undefined
+    ? DECISION_MODE
+    : requireString(manifest.mode, 'manifest.mode');
+  if (!MODES.includes(mode)) {
+    throw new LavishError('unsupported manifest.mode', 2);
+  }
+  let questions = [];
+  let items = [];
+  if (mode === ANNOTATION_MODE) {
+    if (Array.isArray(manifest.questions) && manifest.questions.length > 0) {
+      throw new LavishError('an annotation manifest must not declare questions', 2);
+    }
+    items = validateItems(manifest.items);
+  } else {
+    if (Array.isArray(manifest.items) && manifest.items.length > 0) {
+      throw new LavishError('a decision manifest must not declare items', 2);
+    }
+    questions = validateQuestions(manifest.questions);
+  }
+  const entries = mode === ANNOTATION_MODE ? items : questions;
   let visuals = [];
   if (manifest.visuals !== undefined) {
     if (!Array.isArray(manifest.visuals)) {
@@ -297,11 +373,12 @@ export function validateManifest(raw, expectedId = undefined) {
     });
   }
   const declaredVisuals = new Set(visuals.map((visual) => visual.file));
-  for (const question of questions) {
-    for (const filename of question.visuals ?? []) {
+  const entryLabel = mode === ANNOTATION_MODE ? 'item' : 'question';
+  for (const entry of entries) {
+    for (const filename of entry.visuals ?? []) {
       if (!declaredVisuals.has(filename)) {
         throw new LavishError(
-          `question ${question.key} references undeclared visual ${filename}`,
+          `${entryLabel} ${entry.key} references undeclared visual ${filename}`,
           2,
         );
       }
@@ -310,9 +387,9 @@ export function validateManifest(raw, expectedId = undefined) {
   if (!Number.isInteger(manifest.expected_count) || manifest.expected_count < 1) {
     throw new LavishError('manifest.expected_count must be a positive integer', 2);
   }
-  if (manifest.expected_count !== questions.length) {
+  if (manifest.expected_count !== entries.length) {
     throw new LavishError(
-      `manifest expected_count ${manifest.expected_count} does not match ${questions.length} questions`,
+      `manifest expected_count ${manifest.expected_count} does not match ${entries.length} ${entryLabel}s`,
       2,
     );
   }
@@ -330,12 +407,67 @@ export function validateManifest(raw, expectedId = undefined) {
     title,
     created_at: createdAt,
     destination,
-    ...(destinationFormat === undefined ? {} : { destination_format: destinationFormat }),
+    ...(manifest.destination_format === undefined ? {} : { destination_format: destinationFormat }),
+    mode,
     expected_count: manifest.expected_count,
     request_sha256: requestSha256,
     questions,
+    items,
     ...(visuals.length === 0 ? {} : { visuals }),
     ...(legacySource === undefined ? {} : { legacy_source: legacySource }),
+  };
+}
+
+function validateAnnotationAnswer(answer, manifest) {
+  // Annotations are a schema-version-2 concept, so there is no version-1 shape
+  // to stay compatible with here.
+  if (answer.schema_version !== ANSWER_SCHEMA_VERSION) {
+    throw new LavishError(
+      `an annotation answer requires schema version ${ANSWER_SCHEMA_VERSION}`,
+      2,
+    );
+  }
+  if (!Array.isArray(answer.annotations)) {
+    throw new LavishError('answer.annotations must be an array', 2);
+  }
+  if (answer.annotations.length !== manifest.expected_count) {
+    throw new LavishError(
+      `annotation count ${answer.annotations.length} does not match expected count ${manifest.expected_count}`,
+      2,
+    );
+  }
+
+  const seen = new Set();
+  const annotations = answer.annotations.map((rawAnnotation, index) => {
+    const annotation = requirePlainObject(rawAnnotation, `answer.annotations[${index}]`);
+    const key = requireString(annotation.key, `answer.annotations[${index}].key`);
+    if (seen.has(key)) {
+      throw new LavishError(`duplicate annotation key: ${key}`, 2);
+    }
+    seen.add(key);
+    if (key !== manifest.items[index].key) {
+      throw new LavishError(
+        `annotation key ${key} is out of order; expected ${manifest.items[index].key}`,
+        2,
+      );
+    }
+    const note = annotation.note === undefined
+      ? ''
+      : requireString(annotation.note, `answer.annotations[${index}].note`, { allowEmpty: true });
+    return { key, note };
+  });
+
+  const note = answer.note === undefined
+    ? ''
+    : requireString(answer.note, 'answer.note', { allowEmpty: true });
+  return {
+    kind: ANSWER_KIND,
+    schema_version: answer.schema_version,
+    decision_id: manifest.decision_id,
+    request_sha256: manifest.request_sha256,
+    submitted_at: answer.submitted_at,
+    annotations,
+    note,
   };
 }
 
@@ -354,6 +486,9 @@ export function validateAnswer(raw, manifest) {
     throw new LavishError('answer request digest does not match manifest', 2);
   }
   requireTimestamp(answer.submitted_at, 'answer.submitted_at');
+  if (manifest.mode === ANNOTATION_MODE) {
+    return validateAnnotationAnswer(answer, manifest);
+  }
   if (!Array.isArray(answer.answers)) {
     throw new LavishError('answer.answers must be an array', 2);
   }
@@ -450,7 +585,10 @@ function payloadError(name, message) {
   throw new LavishError(`${name}: ${message}`, 2);
 }
 
-export function validateCollectPayload(raw, manifest) {
+export function validateCollectPayload(raw, manifest, {
+  expectedHomeMarker = undefined,
+  allowMissingHomeMarker = false,
+} = {}) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     payloadError('payload_invalid', 'payload must be an object');
   }
@@ -465,6 +603,25 @@ export function validateCollectPayload(raw, manifest) {
   }
   if (raw.request_sha256 !== manifest.request_sha256) {
     payloadError('payload_stale_request', 'request hash does not match manifest');
+  }
+  if (raw.home_marker === undefined) {
+    if (expectedHomeMarker !== undefined && !allowMissingHomeMarker) {
+      payloadError('payload_missing_home', 'home marker is required');
+    }
+  } else {
+    if (
+      typeof raw.home_marker !== 'string'
+      || !isAbsolute(raw.home_marker)
+      || resolve(raw.home_marker) !== raw.home_marker
+    ) {
+      payloadError('payload_invalid_home', 'home marker must be a normalized absolute path');
+    }
+    if (expectedHomeMarker !== undefined && raw.home_marker !== expectedHomeMarker) {
+      payloadError('payload_wrong_home', 'home marker does not match the selected Firstmate home');
+    }
+  }
+  if (manifest.mode === ANNOTATION_MODE) {
+    return validateAnnotationPayload(raw, manifest);
   }
   if (!Array.isArray(raw.answers)) {
     payloadError('payload_count_mismatch', 'answers must be an array');
@@ -561,21 +718,94 @@ export function validateCollectPayload(raw, manifest) {
       payloadError('payload_unknown_key', `missing question key ${question.key}`);
     }
   }
+  return {
+    entries: manifest.questions.map((question) => answersByKey.get(question.key)),
+    note: requirePayloadNote(raw),
+  };
+}
+
+function requirePayloadNote(raw) {
   const note = raw.note === undefined ? '' : raw.note;
   if (typeof note !== 'string') {
     payloadError('payload_invalid_annotation', 'overall note must be a string');
   }
+  return note;
+}
+
+function validateAnnotationPayload(raw, manifest) {
+  if (!Array.isArray(raw.annotations)) {
+    payloadError('payload_count_mismatch', 'annotations must be an array');
+  }
+  if (raw.annotations.length !== manifest.expected_count) {
+    payloadError(
+      'payload_count_mismatch',
+      `received ${raw.annotations.length}; expected ${manifest.expected_count}`,
+    );
+  }
+
+  const itemKeys = new Set(manifest.items.map((item) => item.key));
+  const notesByKey = new Map();
+  for (const [index, rawAnnotation] of raw.annotations.entries()) {
+    if (
+      rawAnnotation === null
+      || typeof rawAnnotation !== 'object'
+      || Array.isArray(rawAnnotation)
+    ) {
+      payloadError('payload_invalid_answer', `annotation ${index} must be an object`);
+    }
+    if (typeof rawAnnotation.key !== 'string' || !itemKeys.has(rawAnnotation.key)) {
+      payloadError('payload_unknown_key', `unknown item key ${String(rawAnnotation.key)}`);
+    }
+    if (notesByKey.has(rawAnnotation.key)) {
+      payloadError('payload_duplicate_key', `duplicate item key ${rawAnnotation.key}`);
+    }
+    const note = rawAnnotation.note === undefined ? '' : rawAnnotation.note;
+    if (typeof note !== 'string') {
+      payloadError(
+        'payload_invalid_annotation',
+        `note for ${rawAnnotation.key} must be a string`,
+      );
+    }
+    notesByKey.set(rawAnnotation.key, note);
+  }
+
+  for (const item of manifest.items) {
+    if (!notesByKey.has(item.key)) {
+      payloadError('payload_unknown_key', `missing item key ${item.key}`);
+    }
+  }
   return {
-    selections: manifest.questions.map((question) => answersByKey.get(question.key)),
-    note,
+    entries: manifest.items.map((item) => ({ key: item.key, note: notesByKey.get(item.key) })),
+    note: requirePayloadNote(raw),
   };
 }
 
-export function payloadFromAnswer(answer) {
-  return {
+export function payloadFromAnswer(answer, homeMarker) {
+  if (
+    typeof homeMarker !== 'string'
+    || !isAbsolute(homeMarker)
+    || resolve(homeMarker) !== homeMarker
+  ) {
+    throw new LavishError('home marker must be a normalized absolute path', 2);
+  }
+  const identity = {
     schema_version: ANSWER_SCHEMA_VERSION,
     decision_id: answer.decision_id,
+    home_marker: homeMarker,
     request_sha256: answer.request_sha256,
+  };
+  if (answer.annotations !== undefined) {
+    return {
+      ...identity,
+      annotations: answer.annotations.map((annotation) => ({
+        key: annotation.key,
+        note: annotation.note,
+      })),
+      note: answer.note,
+    };
+  }
+  return {
+    ...identity,
     answers: answer.answers.map((selection) => ({
       key: selection.key,
       value: selection.value,
@@ -592,7 +822,7 @@ export function encodeJsonPayload(payload) {
 
 function destinationTextForAnswer(decision, answer, answerText) {
   if (decision.manifest.destination_format === 'payload-json-v2') {
-    return encodeJsonPayload(payloadFromAnswer(answer));
+    return encodeJsonPayload(payloadFromAnswer(answer, decision.home));
   }
   return answerText;
 }
@@ -822,8 +1052,9 @@ async function readDecisionVisuals(home, visualsDirectory, declaredVisuals) {
 
 export async function readDecision(home, id) {
   validateDecisionId(id);
-  const decisionDirectory = join(resolve(home), DECISIONS_RELATIVE_DIR, id);
-  await ensureSafeDirectoryTree(home, decisionDirectory);
+  const resolvedHome = resolve(home);
+  const decisionDirectory = join(resolvedHome, DECISIONS_RELATIVE_DIR, id);
+  await ensureSafeDirectoryTree(resolvedHome, decisionDirectory);
   const requestPath = join(decisionDirectory, 'request.md');
   const manifestPath = join(decisionDirectory, 'manifest.toon');
   await assertNoSymlink(requestPath, requestPath);
@@ -839,12 +1070,13 @@ export async function readDecision(home, id) {
   }
   const visualsDirectory = join(decisionDirectory, 'visuals');
   const visuals = await readDecisionVisuals(
-    home,
+    resolvedHome,
     visualsDirectory,
     manifest.visuals ?? [],
   );
   return {
     id,
+    home: resolvedHome,
     directory: decisionDirectory,
     request,
     requestText: request.toString('utf8'),
@@ -933,10 +1165,12 @@ export async function createDecision(home, {
   title,
   request,
   destination,
-  questions,
+  questions = undefined,
+  items = undefined,
   visualsDirectory = undefined,
   createdAt = new Date().toISOString(),
   legacySource = undefined,
+  beforeCreate = undefined,
 }) {
   validateDecisionId(id);
   requireString(title, 'title');
@@ -945,7 +1179,18 @@ export async function createDecision(home, {
   const destinationFormat = extname(normalizedDestination).toLowerCase() === '.json'
     ? 'payload-json-v2'
     : 'answer-toon';
-  const normalizedQuestions = validateQuestions(questions);
+  if (questions !== undefined && items !== undefined) {
+    throw new LavishError('a decision declares questions or items, never both', 2);
+  }
+  if (questions === undefined && items === undefined) {
+    throw new LavishError('a decision must declare questions or items', 2);
+  }
+  const mode = items === undefined ? DECISION_MODE : ANNOTATION_MODE;
+  const normalizedQuestions = items === undefined ? validateQuestions(questions) : [];
+  const normalizedItems = items === undefined ? [] : validateItems(items);
+  const entryCount = mode === ANNOTATION_MODE
+    ? normalizedItems.length
+    : normalizedQuestions.length;
   const requestBytes = Buffer.isBuffer(request) ? request : Buffer.from(request, 'utf8');
   if (requestBytes.length === 0) {
     throw new LavishError('request.md must not be empty', 2);
@@ -961,9 +1206,11 @@ export async function createDecision(home, {
     created_at: createdAt,
     destination: normalizedDestination,
     destination_format: destinationFormat,
-    expected_count: normalizedQuestions.length,
+    mode,
+    expected_count: entryCount,
     request_sha256: requestDigest,
     questions: normalizedQuestions,
+    items: normalizedItems,
     ...(visuals.length === 0 ? {} : { visuals }),
     ...(legacySource === undefined ? {} : { legacy_source: legacySource }),
   }, id);
@@ -992,6 +1239,10 @@ export async function createDecision(home, {
       return { decision: current, created: false };
     }
     throw new LavishError(`decision ${id} already exists with different content`, 3);
+  }
+
+  if (beforeCreate !== undefined) {
+    await beforeCreate();
   }
 
   const staging = join(
@@ -1109,19 +1360,23 @@ async function cleanStaleAnswerTemps(decisionDirectory) {
   }
 }
 
-export async function commitAnswer(decision, selections, note, {
+export async function commitAnswer(decision, entries, note, {
   submittedAt = new Date().toISOString(),
   beforeRename = undefined,
 } = {}) {
-  const answer = validateAnswer({
+  const identity = {
     kind: ANSWER_KIND,
     schema_version: ANSWER_SCHEMA_VERSION,
     decision_id: decision.id,
     request_sha256: decision.manifest.request_sha256,
     submitted_at: submittedAt,
-    answers: selections,
-    note,
-  }, decision.manifest);
+  };
+  const answer = validateAnswer(
+    decision.manifest.mode === ANNOTATION_MODE
+      ? { ...identity, annotations: entries, note }
+      : { ...identity, answers: entries, note },
+    decision.manifest,
+  );
   const text = encodeToon(answer);
   await withDecisionLock(decision.directory, async () => {
     await cleanStaleAnswerTemps(decision.directory);

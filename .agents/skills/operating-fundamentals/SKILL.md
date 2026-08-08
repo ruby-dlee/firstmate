@@ -51,6 +51,8 @@ Execute it directly or find a compliant route; if none exists, surface the exact
 ## 7. Prove each consequential claim at the scope you report
 
 Before reporting any mechanism, capability, check, or outcome as working, failed, blocked, or unavailable, record its exact actor or credential, command or surface, target environment, and every leg covered.
+Before a consequential config or system change, and before diagnosing or relaying any blocker, write the key assumption in falsifiable terms, run a mechanical probe against the authoritative live surface, and record the exact test and observed result; confidence, recollection, a neighboring result, and an unexecuted command are all unverified.
+A task status blocker must carry the canonical `assumption=...; test=...; result=...` note shape owned by `bin/fm-classify-lib.sh`, or it remains visible as a malformed event but cannot enter the durable open-decision set.
 Evidence about one coordinate or leg supports only it: neither a neighboring pass nor a single failure proves an untested positive or global absence.
 Contradictory directly relevant evidence blocks the claim until reproduced and resolved or proven out-of-scope; unresolved, report observations only.
 A positive needs direct end-to-end evidence on the actual target or an `unverified` label; a blocker or absence also needs the authoritative reference, one materially independent safe in-scope route or why none exists, and the narrowest supported result: `this route failed`, `capability unavailable`, or `captain action required`.

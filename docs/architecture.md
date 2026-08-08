@@ -21,17 +21,21 @@ The sampler can emit BUSY only from affirmative evidence; absence at any window 
 It rejects detached scouts and any run whose exact ID and branch do not both belong to the ship lane, then records a contemporaneous `uptime` and `vm_stat` snapshot before interpreting process evidence.
 Measured load peaks up to 88 make descheduling a well-supported mechanism for widening observation gaps, but not a proven cause of any particular gap because the samples and spikes were not time-correlated; either way, the absence predicate has no safe threshold to tune.
 A crewmate that declares `paused:` for a known external wait is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
-For stale-pane triage only, that durable declaration also explains the expected idle pane after a matching no-mistakes run has reached current-state `done`; active and failed runs retain normal run-step precedence, and stopped crewmates without a declared pause surface immediately.
+A pause is a statement about the work rather than about the terminal, so it is honoured whether the crewmate's pane is alive, idle, or gone, and whatever its attributed no-mistakes run reports - parked, failed or cancelled, or unreadable.
+The single exception is an actively `working` run-step or busy pane, which supersedes the declaration because the crewmate resumed after making it.
+Absorption is gated on two proofs taken from one immutable read of the crewmate's current durable status stream: the pause verb carrying no failure vocabulary in its headline, and an empty keyed open/resolved fold, so a pause can never mask a still-unanswered decision.
+The Herdr native blocked-transition edge does not yet honour this invariant, which is a known defect tracked as `herdr-push-transition-pause-gate-h8`: on that edge a lane that owes an unanswered keyed decision can be silently absorbed and go quiet.
+A crewmate with no locatable status stream is refused rather than absorbed, and stopped crewmates without a declared pause surface immediately.
 Pause cadence markers remain in force while the latest durable status still declares the pause and are cleared only after that status resumes, so every continuously declared pause still re-surfaces on the bounded long cadence.
 Its initial normal-mode status signal still surfaces through the no-verb path, while away mode self-handles that routine signal and owns the later recheck.
 Fresh stale panes use the same current-state read before trusting the status log, so an active run or busy pane outranks an old captain-relevant status-log line left behind before validation.
-No-change heartbeats are also benign.
+Heartbeats inspect unsurfaced captain-relevant statuses only; they never promote a one-shot run field or process absence into a liveness verdict.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
 At each drain boundary, `fm-wake-drain.sh` first intakes durable Lavish answers, then drains queued wakes and runs the same liveness guard as the supervision scripts, so unreceipted answers recover and a lapsed watcher chain surfaces even on a turn that only drains and handles queued wakes.
 Routine watcher polling, supervision no-ops, elapsed waiting time, and absorbed benign wakes stay silent.
 A declared external wait trades that silence for one bounded recheck per pause window, so a forgotten pause cannot remain invisible indefinitely.
 Crewmate status files are append-only wake-event logs, not current-state fields.
-`bin/fm-crew-state.sh <id>` is the cheap current-state read for an actionable heartbeat review: it attributes the matching no-mistakes run, active or terminal, to the crewmate's own branch and keeps that run-step authoritative even if the pane has closed; the stale-pane pause exception above belongs to the watcher's absorb classification and does not change this general current-state precedence.
+`bin/fm-crew-state.sh <id>` is the cheap current-state read for an actionable heartbeat review: it attributes the matching no-mistakes run, active or terminal, to the crewmate's own branch and keeps that run-step authoritative even if the pane has closed; the pause precedence above belongs to the watcher's absorb classification and does not change this general current-state precedence.
 When a terminal run reports `outcome: passed`, the helper verifies the PR detail through a bounded `gh-axi` query instead of inferring GitHub state from the pipeline outcome.
 An open-PR `passed` or `checks-passed` outcome and a checks-green CI marker are classified by the exact remote-only currentness contract in `bin/fm-crew-state.sh`'s header; only `done` authorizes the PR-ready workflow.
 During no-mistakes' `ci` monitor phase, it also reads the ci step log tail because `axi status` reports both "still waiting on checks" and "checks green, waiting on merge" as `ci,running`.
@@ -45,21 +49,24 @@ For whole-fleet read-only review, `bin/fm-fleet-snapshot.sh --json` emits schema
 The script header owns the exact JSON schema.
 Optional X mode rides the same check path: the locked session-start bootstrap step drops a local `state/x-watch.check.sh` shim only after the user opts in with `FMX_PAIRING_TOKEN`, and non-X homes keep the default watcher behavior.
 The same supervision loop continuously reaps terminal task resources through `bin/fm-auto-reap.sh`.
-A merged PR check, an approved local-only merge, or a completed scout delegates to ordinary `bin/fm-teardown.sh`, so endpoint removal, report publication, dirty-worktree refusal, landed-work proof, and Treehouse return keep one fail-closed authority.
-Before that teardown, a ship lane's active no-mistakes run is selected by exact repository and branch, verified by exact run ID plus branch, and cancelled only after its run head and last-pushed head both equal current `HEAD` and the task agent is affirmatively dead.
-The cancellation result is re-read by exact ID and branch before teardown proceeds.
-Detached scouts never query branch-blind run status, while an attribution mismatch, missing pushed-head proof, live or unknown agent, or cancellation uncertainty retains the lane without destructive action.
+A merged PR check, an approved local-only merge, or a completed scout delegates to ordinary `bin/fm-teardown.sh`, so endpoint removal, report publication, kind-specific worktree safety, landed-work proof, and Treehouse return keep one fail-closed authority.
+Detached scouts skip branch-based no-mistakes lookup entirely.
+For a ship lane, the reaper selects by exact task branch, re-reads the selected run by exact ID and branch, and refuses teardown while that run is active; it never cancels a run from process absence or from a run status field.
+The retained lane is the non-destructive alternative when current-head/pushed-head equality and shared cancellation custody cannot be proven atomically.
 X-mode-linked tasks wait for their final follow-up, and persistent secondmates are never auto-reaped.
 Every spawn writes an owner-stamped Treehouse acquisition record before leasing a slot and removes it once task metadata takes authority.
 The watcher recovers a stranded pre-metadata lease only after the record exceeds `FM_AUTO_REAP_STALE_SECS` and the recorded PID plus process start time proves dead or reused, then installs cleanup metadata and runs the same ordinary teardown proof.
-An indeterminate owner, ambiguous lease, uncommitted worktree, unlanded commit, endpoint uncertainty, or teardown error stays on disk and produces an actionable `auto-reap:` wake.
+An indeterminate owner, ambiguous lease, protected worktree state, unlanded commit, endpoint uncertainty, or teardown error stays on disk and produces an actionable `auto-reap:` wake.
 `state/.auto-reap.log` records successful reaping and the recovery cases that need a durable corruption or retention diagnostic.
 This Firstmate tooling change requires no web-app, API, or realtime deployment.
 
 At session start, `bin/fm-session-start.sh` emits exactly one primary-harness supervision block rendered by `bin/fm-supervision-instructions.sh` from `docs/supervision-protocols/`.
 That block owns the live wait shape for the running primary harness: Claude and Grok use background-notify cycles, Codex uses bounded foreground checkpoints, Pi uses its two tracked primary extensions, and OpenCode uses its TUI plugin.
-`bin/fm-watch-arm.sh` remains the verified arm wrapper for protocols that call it; it forks the watcher as a tracked child, verifies it is genuinely alive with a fresh liveness beacon, and prints exactly one honest status line (`started` / `attached` / restart-only `healthy` / `FAILED`, the last exiting non-zero).
+`bin/fm-watch-arm.sh` remains the verified arm wrapper for protocols that call it; it forks the watcher as a tracked child, verifies it is genuinely alive with a fresh liveness beacon, and prints an honest initial status (`started` / `attached` / restart-only `healthy` / `FAILED`, the last exiting non-zero).
 On `attached` it stays live until that existing cycle ends so background-notify harnesses do not get an empty false wake from a healthy no-op exit.
+Because the initial status stays in the task's buffer long after the instant it describes, an attach is always closed by a terminal `FAILED` line - either `attached cycle ended` when the holder stops passing the liveness proof, or `attach interrupted` when the arm itself is signalled away - with the beacon age re-measured at exit and a non-zero status.
+The `attached` reading is stamped with the clock time it was taken for the same reason: it is printed once and read much later, and an undated age silently understates the true one by however long the attach ran.
+Without that closure the arm exited zero and silent when its peer died, leaving `attached pid=<N>` as the caller's final word for a watcher that no longer existed - a fleet nobody was watching, read as healthy.
 Its `--restart` mode signals only the watcher recorded in the current home's `state/.watch.lock`, so restarting one home cannot kill sibling secondmate watchers.
 A pull-based guard (`bin/fm-guard.sh`) warns through supervision tool output if the primary checkout is tangled, or if tasks are in flight and that watcher stops running or queued wakes are waiting to be drained.
 The drain script calls that guard after emptying the queue, which avoids repeating the queued-wakes warning for records it just consumed while still warning on stale watcher liveness.
@@ -207,9 +214,10 @@ The `data/secondmates.md` line schema and the secondmate environment variables a
 Review diffs go through `bin/fm-review-diff.sh`, which refreshes the authoritative base and, when task meta records `pr=`, compares against the reachable recorded `pr_head=` or a freshly fetched `refs/pull/<n>/head` before falling back to the local branch with a warning.
 For target project repos shipped through their own no-mistakes pipeline, commits under `.no-mistakes/evidence/` are the pipeline's PR-viewable validation evidence and are expected to stay in the crewmate branch until the evidence-hosting design changes.
 The firstmate repo itself is the exception: its `.no-mistakes/` directory is local state, stays gitignored, and is rejected by CI if tracked.
-PR-based task merge requests go through `bin/fm-pr-merge.sh`, which runs nondestructive exact-head snapshot admission and then refuses because arbitrary later check contexts and detached worktree writers are not yet covered by one atomic merge boundary.
-Admission snapshots green settled checks, two distinct non-author exact-head approvals, a clean local worktree, local and remote content containment, and strict protected-branch policy on one unchanged head, base, and base ref without claiming that the snapshot is merge-safe.
-The helper defaults to squash, preserves explicit merge-method flags, and rejects scheduling, malformed URLs, side-effect flags, or repository overrides before merge admission.
+PR-based task merge attempts go through `bin/fm-pr-merge.sh`, which records `pr=` and the live `pr_head=` through `bin/fm-pr-check.sh`, requires synchronous five-part admission and a clear crosscheck ledger for that exact head and claims digest, then refuses before any merge API call until future execution cannot be armed.
+Admission requires a nonempty green settled check set, two distinct non-author exact-head approvals, exact local and remote content containment with no worktree residual, and strict protected-branch policy on one unchanged head and base.
+[`crosscheck.md`](crosscheck.md) owns the independent adversarial verdict, finding lifecycle, executed evidence, installed-tool, and exact-head contracts.
+The helper requires a full `https://github.com/<owner>/<repo>/pull/<n>` URL, defaults to `squash`, accepts only a future merge method, and rejects malformed URLs, repo overrides, asynchronous or queued merge, admin bypass, or branch deletion.
 Teardown is fail-closed for ship worktrees: dirty worktrees refuse, and committed work must be landed before the worktree is returned.
 Terminal auto-reaping invokes that exact teardown path without `--force`; it does not introduce a second or weaker landed-work definition.
 [`bin/fm-teardown.sh`](../bin/fm-teardown.sh)'s header owns the landed-work proofs, PR-discovery fallback, and stale-lock recovery procedure.
@@ -290,7 +298,7 @@ Fleet state lives in each task's session-provider backend (tmux by hard default,
 For herdr, respawning after a server-restored layout closes and replaces confirmed no-agent or dead task-tab husks instead of requiring manual tab cleanup.
 At session start, confirmed-dead secondmate agent endpoints are closed and relaunched through the same secondmate spawn path, while ambiguous liveness reads are left untouched to avoid duplicate supervisors.
 Use `/stow` before an intentional reset when the conversation may hold durable knowledge that has not yet been written to disk; after that, the next firstmate session can reconcile and carry on.
-Claude Code compaction uses the tracked deterministic anchor and compact-sourced session-start reconciliation documented in [`autocompact-recovery.md`](autocompact-recovery.md).
+Claude Code compaction follows the anchor, judgment-capture, and compact-sourced recovery contract documented in [`autocompact-recovery.md`](autocompact-recovery.md).
 
 ## Development notes
 

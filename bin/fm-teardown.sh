@@ -8,9 +8,11 @@
 # hard-resets/removes the worktree and kills its processes. Work has landed when it is
 # reachable from any remote-tracking branch (a fork counts as a remote, so
 # upstream-contribution PRs pushed to a fork satisfy this in any mode), OR - for a
-# normal ship task whose commits are not so reachable - when its PR is merged and
-# GitHub reports a PR head that contains the current local work, or its content is
-# already present in the up-to-date default branch. This recognizes the common
+# normal ship task whose commits are not so reachable - when its content is already
+# present in the up-to-date default branch, or when GitHub ties a contained or
+# conflict-adjusted rebased PR head to a merge commit on that live default branch.
+# The default branch is always the landing authority; a merged PR alone is never
+# sufficient. This recognizes the common
 # squash-merge-then-delete-branch flow, where the branch's own commits live nowhere
 # on a remote yet the change is fully in main.
 # The PR itself is resolved from the task's recorded pr= when present, or - when
@@ -27,6 +29,9 @@
 # FM_TREEHOUSE_RETURN_TIMEOUT while holding the same common checkout mutation
 # lock across its retry and stale-index-lock recovery sequence.
 # Uncommitted changes are never landed.
+# The report-satisfied scout carve-out discards only non-ignored untracked
+# scratch; tracked or staged changes, stashes, and committed-but-unlanded work
+# retain the ordinary protection.
 # Ordinary teardown first proves that metadata names the exact registered project,
 # worktree, and task lease, then quiesces the endpoint before its final safety checks.
 # Each locked Treehouse return repeats repository, lease, and landed-work checks
@@ -42,12 +47,17 @@
 # --preserve-scratch first proves committed work landed, captures tracked diffs
 # and non-ignored untracked payloads under data/<task-id>/scratch/, then cleans
 # and repeats the ordinary safety proof before reclaim proceeds.
+# If a process regenerates untracked content inside an untracked-only root that
+# the completed archive already captured, teardown may discard that regenerated
+# content instead of stranding the worktree after the expensive capture.
+# New paths outside captured roots and every form of tracked drift still refuse.
 # local-only projects additionally accept work merged into the local default
 # branch (firstmate performs that merge on the captain's approval) as a fallback
 # for the common case where there is no remote at all.
-# Scout tasks (kind=scout in meta) carve out of that check: their worktree is
-# declared scratch and the report at data/<task-id>/report.md is the work
-# product. A pre-cutover scout proceeds once that report exists; a task carrying
+# Scout tasks (kind=scout in meta) carve non-ignored untracked paths out of that
+# check: their worktree is declared scratch and the report at
+# data/<task-id>/report.md is the work product.
+# A pre-cutover scout proceeds once that report exists; a task carrying
 # report_required=1 must satisfy the shared completion and publication contract
 # owned by docs/report-stack.md before teardown discards the scratch worktree.
 # Orca tasks use the same safety checks, then close the recorded terminal, prove
@@ -68,13 +78,20 @@
 # the pool slot is freed,
 # never left leased forever. If the treehouse return fails, teardown leaves the
 # leased home and state in place instead of hiding a still-held lease.
-# Usage: fm-teardown.sh <task-id> [--force] [--preserve-scratch]
+# Usage: fm-teardown.sh <task-id> [--force] [--preserve-scratch] [--reap-dead]
 #   --force permits recursive kind=secondmate retirement. It never bypasses
 #   dirty, untracked, stash, landed-work, endpoint, identity, or report proofs.
 #   --preserve-scratch permits a ship/scout teardown to preserve tracked diffs
 #   and non-ignored untracked files under data/<task-id>/scratch/ before cleaning.
 #   Ignored files remain exempt and are summarized before a leased return.
 #   Committed work must still pass the ordinary landed-work proof first.
+#   --reap-dead is the conservative dead-endpoint path used by
+#   bin/fm-treehouse-reap.sh.
+#   It refuses a present or unknown endpoint, repeats that absence proof under
+#   the checkout lock, and uses non-forcing `treehouse return` after the ordinary
+#   identity, cleanliness, stash, and landed-work proofs pass.
+#   Classified safety refusals exit 77; operational failures retain their normal
+#   nonzero status so bin/fm-treehouse-reap.sh can distinguish the outcomes.
 #
 # Transient / stale worktree git lock recovery (teardown-lock-race): a crewmate process
 # killed mid-git-operation can leave a .git/worktrees/<wt>/index.lock (or, for a
@@ -150,13 +167,15 @@ case "$TEARDOWN_UPSTREAM_TIMEOUT" in
     ;;
 esac
 [ "$#" -ge 1 ] || {
-  echo "usage: fm-teardown.sh <task-id> [--force] [--preserve-scratch]" >&2
+  echo "usage: fm-teardown.sh <task-id> [--force] [--preserve-scratch] [--reap-dead]" >&2
   exit 2
 }
 ID=$1
 shift
 FORCE=
 PRESERVE_SCRATCH=0
+REAP_DEAD=0
+TEARDOWN_REAP_SAFETY_REFUSAL=77
 for option in "$@"; do
   case "$option" in
     --force)
@@ -173,12 +192,24 @@ for option in "$@"; do
       }
       PRESERVE_SCRATCH=1
       ;;
+    --reap-dead)
+      [ "$REAP_DEAD" -eq 0 ] || {
+        echo "error: duplicate teardown option: --reap-dead" >&2
+        exit 2
+      }
+      REAP_DEAD=1
+      ;;
     *)
       echo "error: unknown teardown option: $option" >&2
       exit 2
       ;;
   esac
 done
+if [ "$REAP_DEAD" -eq 1 ] && { [ -n "$FORCE" ] || [ "$PRESERVE_SCRATCH" -eq 1 ]; }; then
+  echo "error: --reap-dead cannot be combined with --force or --preserve-scratch" >&2
+  exit 2
+fi
+
 META="$STATE/$ID.meta"
 
 require_safe_task_metadata() {
@@ -281,16 +312,59 @@ PR_URL=$(grep '^pr=' "$META" | tail -1 | cut -d= -f2- || true)
 # absent for tasks spawned before that change, so tolerate empty legacy metadata.
 TASK_TMP=$(grep '^tasktmp=' "$META" | cut -d= -f2- || true)
 TASK_GENERATION=$(grep '^generation_id=' "$META" | cut -d= -f2- || true)
-if [ -n "$TASK_TMP" ] && ! fm_account_task_tmp_is_expected "$ID" "$TASK_TMP" "$TASK_GENERATION"; then
-  echo "REFUSED: unsafe task temp path in metadata for $ID: $TASK_TMP" >&2
-  exit 1
-fi
+
+classify_teardown_task_tmp() {  # <task-id> <path> <generation-id>
+  local task=$1 target=$2 generation=$3 generation_root suffix
+  if [ -z "$target" ]; then
+    printf 'absent\n'
+  elif fm_account_task_tmp_is_current "$task" "$target" "$generation"; then
+    printf 'current\n'
+  elif fm_account_task_tmp_is_legacy "$task" "$target"; then
+    printf 'legacy\n'
+  elif fm_account_task_tmp_is_previous "$task" "$target"; then
+    printf 'previous\n'
+  elif fm_account_task_tmp_path "$task" "$generation" >/dev/null 2>&1 \
+    && generation_root=$(fm_account_previous_task_tmp_path "$task"); then
+    case "$target" in
+      "$generation_root"-*)
+        suffix=${target#"$generation_root"-}
+        if fm_account_valid_id "$suffix"; then
+          printf 'different-generation\n'
+        else
+          printf 'unknown\n'
+        fi
+        ;;
+      *) printf 'unknown\n' ;;
+    esac
+  else
+    printf 'unknown\n'
+  fi
+}
+
+TASK_TMP_CLASSIFICATION=$(classify_teardown_task_tmp "$ID" "$TASK_TMP" "$TASK_GENERATION")
+case "$TASK_TMP_CLASSIFICATION" in
+  absent|current|legacy|previous) ;;
+  different-generation)
+    echo "REFUSED: task temp path belongs to a different task generation for $ID: $TASK_TMP" >&2
+    exit 1
+    ;;
+  unknown)
+    echo "REFUSED: unsafe task temp path in metadata for $ID; unknown or unprovable task temp path: $TASK_TMP" >&2
+    exit 1
+    ;;
+  *)
+    echo "REFUSED: invalid task temp path classification for $ID" >&2
+    exit 1
+    ;;
+esac
 TASK_TMP_PHASE=$(fm_meta_get "$META" tasktmp_phase)
 case "$TASK_TMP_PHASE" in
   '') ;;
   created)
-    fm_account_task_tmp_is_current "$ID" "$TASK_TMP" "$TASK_GENERATION" \
-      || { echo "error: created task temp phase is not bound to the exact task generation for $ID" >&2; exit 1; }
+    case "$TASK_TMP_CLASSIFICATION" in
+      current|legacy) ;;
+      *) echo "error: created task temp phase is not bound to the exact task generation for $ID" >&2; exit 1 ;;
+    esac
     ;;
   not-created)
     fm_account_task_tmp_is_current "$ID" "$TASK_TMP" "$TASK_GENERATION" || {
@@ -382,9 +456,14 @@ if [ "$PRESERVE_SCRATCH" -eq 1 ] && [ "$KIND" = secondmate ]; then
   echo "error: --preserve-scratch is supported only for ship and scout worktrees" >&2
   exit 2
 fi
+if [ "$REAP_DEAD" -eq 1 ] && [ "$KIND" != ship ]; then
+  echo "error: --reap-dead is supported only for ship worktrees" >&2
+  exit 2
+fi
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
 [ -n "$MODE" ] || MODE=no-mistakes
 REPORT_GATED=0
+SCOUT_SCRATCH_RELEASABLE=0
 REPORT_REQUIRED_COUNT=$(grep -c '^report_required=' "$META" 2>/dev/null || true)
 if [ "$BACKEND" = orca ] && [ "$REPORT_REQUIRED_COUNT" -ne 0 ]; then
   echo "error: invalid report_required metadata for legacy Orca task $ID; the marker must be absent" >&2
@@ -811,11 +890,17 @@ remove_grok_turnend_auth() {
 # single match and returns 0; returns non-zero on no match or any lookup failure,
 # so the caller treats it as "no PR found" (fail-safe).
 pr_number_from_branch() {
-  local branch=$1 out n
-  [ -n "$branch" ] && [ "$branch" != HEAD ] || return 1
-  out=$( cd "$WT" && gh-axi pr list --state all --head "$branch" --limit 1 2>/dev/null ) || return 1
+  local branch=$1 out n status
+  [ -n "$branch" ] && [ "$branch" != HEAD ] \
+    || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  if out=$(cd "$WT" && gh-axi pr list --state all --head "$branch" --limit 1 2>/dev/null); then
+    :
+  else
+    status=$?
+    return "$status"
+  fi
   n=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*\([0-9][0-9]*\),.*/\1/p' | head -1)
-  [ -n "$n" ] || return 1
+  [ -n "$n" ] || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
   printf '%s' "$n"
 }
 
@@ -864,65 +949,435 @@ unpushed_patches_are_in_pr_head() {
       | sed '/^$/d' \
       | sort -u
   ) || return 1
-  [ -n "$pr_patch_ids" ] || return 1
   unpushed=$(git -C "$WT" log --format=%H HEAD --not --remotes -- 2>/dev/null) || return 1
-  [ -n "$unpushed" ] || return 1
+  # A remote ref may have advanced after the caller's first unpushed-work read.
+  # Empty now is the safest possible answer, not a failed proof.
+  [ -n "$unpushed" ] || return 0
+  [ -n "$pr_patch_ids" ] || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
   while IFS= read -r commit; do
     [ -n "$commit" ] || continue
     patch_id=$(patch_id_for_commit "$commit") || return 1
     [ -n "$patch_id" ] || return 1
-    printf '%s\n' "$pr_patch_ids" | grep -qxF "$patch_id" || return 1
+    printf '%s\n' "$pr_patch_ids" | grep -qxF "$patch_id" \
+      || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
   done <<EOF
 $unpushed
 EOF
 }
 
-# Is the worktree's PR merged for local work contained in that PR? Resolves the
-# PR from the recorded pr= URL first, then from the branch name, and asks GitHub
-# for both the PR state and head. Returns non-zero when the PR is not merged, the
-# current work is not contained in the PR head, no PR is found, or any gh error
-# occurs - the caller then falls back to the content check.
+github_repo_for_pr_rewrite() {
+  local target=$1 url rest owner repo
+  case "$target" in
+    https://github.com/*/pull/*)
+      rest=${target#https://github.com/}
+      rest=${rest%%/pull/*}
+      ;;
+    *)
+      url=$(git -C "$WT" remote get-url origin 2>/dev/null) || return 1
+      case "$url" in
+        https://github.com/*) rest=${url#https://github.com/} ;;
+        git@github.com:*) rest=${url#git@github.com:} ;;
+        ssh://git@github.com/*) rest=${url#ssh://git@github.com/} ;;
+        *) return "$TEARDOWN_REAP_SAFETY_REFUSAL" ;;
+      esac
+      rest=${rest%.git}
+      ;;
+  esac
+  case "$rest" in
+    */*/*|/*|*/|'') return "$TEARDOWN_REAP_SAFETY_REFUSAL" ;;
+    */*) ;;
+    *) return "$TEARDOWN_REAP_SAFETY_REFUSAL" ;;
+  esac
+  owner=${rest%%/*}
+  repo=${rest#*/}
+  [ -n "$owner" ] && [ -n "$repo" ] \
+    || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  case "$owner$repo" in
+    *[!A-Za-z0-9_.-]*) return "$TEARDOWN_REAP_SAFETY_REFUSAL" ;;
+  esac
+  printf '%s\t%s\n' "$owner" "$repo"
+}
+
+pr_rewrite_path_contains_head() {
+  local target=$1 current=$2 pr_head=$3 repo_parts owner repo number edges query status
+  repo_parts=$(github_repo_for_pr_rewrite "$target") || return $?
+  owner=${repo_parts%%$'\t'*}
+  repo=${repo_parts#*$'\t'}
+  number=$(pr_number_from_target "$target") \
+    || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  # GraphQL expands these variables remotely; the shell must preserve them literally.
+  # shellcheck disable=SC2016
+  query='query($owner: String!, $repo: String!, $number: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $number) {
+        timelineItems(last: 100, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) {
+          nodes {
+            ... on HeadRefForcePushedEvent {
+              beforeCommit { oid }
+              afterCommit { oid }
+            }
+          }
+        }
+      }
+    }
+  }'
+  if edges=$(cd "$WT" && gh api graphql \
+      -F owner="$owner" -F repo="$repo" -F number="$number" \
+      -f query="$query" \
+      --jq '.data.repository.pullRequest.timelineItems.nodes[] | select(.beforeCommit.oid != null and .afterCommit.oid != null) | [.beforeCommit.oid, .afterCommit.oid] | @tsv' \
+      2>/dev/null); then
+    :
+  else
+    status=$?
+    return "$status"
+  fi
+  [ -n "$edges" ] || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  printf '%s\n' "$edges" | awk -F '\t' \
+    -v from="$current" -v to="$pr_head" \
+    -v refusal="$TEARDOWN_REAP_SAFETY_REFUSAL" '
+    BEGIN { reachable[from] = 1 }
+    NF == 2 && reachable[$1] { reachable[$2] = 1 }
+    END { exit reachable[to] ? 0 : refusal }
+  '
+}
+
+commit_rebase_identity() {
+  local commit=$1
+  git -C "$WT" cat-file commit "$commit" 2>/dev/null \
+    | awk '
+        /^author / { print; next }
+        body { print; next }
+        /^$/ { body = 1; print }
+      ' \
+    | git hash-object --stdin 2>/dev/null
+}
+
+commit_changed_paths_identity() {
+  local commit=$1
+  git -C "$WT" diff-tree --no-commit-id --name-status -r --root "$commit" \
+      2>/dev/null \
+    | LC_ALL=C sort \
+    | git hash-object --stdin 2>/dev/null
+}
+
+commit_has_one_parent() {
+  local commit=$1 parents
+  parents=$(git -C "$WT" rev-list --parents -n 1 "$commit" 2>/dev/null) || return 1
+  [ "$(printf '%s\n' "$parents" | awk '{ print NF }')" -eq 2 ]
+}
+
+commit_patch_has_upstream_overlap() {
+  local commit=$1 old_base=$2 new_base=$3 overlap
+  overlap=$(comm -12 \
+    <(git -C "$WT" diff-tree --no-commit-id --name-only -r --root "$commit" \
+        2>/dev/null | LC_ALL=C sort -u) \
+    <(git -C "$WT" diff --name-only "$old_base" "$new_base" -- \
+        2>/dev/null | LC_ALL=C sort -u)) || return 1
+  [ -n "$overlap" ] || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+}
+
+commit_path_entry() {
+  local commit=$1 path=$2 entry
+  entry=$(git -C "$WT" ls-tree "$commit" -- "$path" 2>/dev/null) || return 1
+  if [ -z "$entry" ]; then
+    printf '%s\n' -
+    return 0
+  fi
+  printf '%s\n' "$entry" | awk 'NR == 1 { print $1 ":" $3 }'
+}
+
+rewrite_difference_refusal() {
+  local original=$1 rewritten=$2 path=$3 reason=$4 fingerprint=$5
+  echo "teardown: rewrite difference between $original and $rewritten at $path could not be attributed: $reason; delta=$fingerprint" >&2
+  return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+}
+
+materialize_blob() {
+  local oid=$1 destination=$2
+  git -C "$WT" cat-file blob "$oid" > "$destination" 2>/dev/null
+}
+
+materialize_union() {
+  local ours=$1 base=$2 theirs=$3 destination=$4 status
+  git merge-file --union -p "$ours" "$base" "$theirs" \
+    > "$destination" 2>/dev/null
+  status=$?
+  [ "$status" -le 1 ]
+}
+
+union_delta_fingerprint() {
+  local expected=$1 rewritten=$2
+  python3 - "$expected" "$rewritten" <<'PY'
+from collections import Counter
+from hashlib import sha256
+from pathlib import Path
+import sys
+
+expected, rewritten = (
+    Counter(Path(path).read_bytes().splitlines(keepends=True))
+    for path in sys.argv[1:]
+)
+
+def describe(label, lines):
+    expanded = sorted(line for line, count in lines.items() for _ in range(count))
+    shown = [sha256(line).hexdigest()[:16] for line in expanded[:4]]
+    return f"{label}_line_hashes={','.join(shown) or '-'} {label}_truncated={max(0, len(expanded) - 4)}"
+
+print(f"{describe('removed', expected - rewritten)} {describe('added', rewritten - expected)}")
+PY
+}
+
+commit_rewrite_differences_are_attributable() {
+  local original=$1 rewritten=$2 original_parent=$3 rewritten_parent=$4
+  local path old_entry original_entry new_entry rewritten_entry
+  local old_oid original_oid new_oid rewritten_oid union_hash reverse_union_hash
+  local concatenated_hash reverse_concatenated_hash
+  local paths fingerprint proof_dir
+  paths=$(git -C "$WT" diff-tree --no-commit-id --name-only -r \
+    "$original_parent" "$original" 2>/dev/null) || return 1
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    old_entry=$(commit_path_entry "$original_parent" "$path") || return 1
+    original_entry=$(commit_path_entry "$original" "$path") || return 1
+    new_entry=$(commit_path_entry "$rewritten_parent" "$path") || return 1
+    rewritten_entry=$(commit_path_entry "$rewritten" "$path") || return 1
+    if [ "$old_entry" = "$new_entry" ]; then
+      if [ "$original_entry" != "$rewritten_entry" ]; then
+        rewrite_difference_refusal "$original" "$rewritten" "$path" \
+          "the upstream version did not change" \
+          "old=$old_entry local=$original_entry upstream=$new_entry rewritten=$rewritten_entry"
+        return $?
+      fi
+      continue
+    fi
+    if [ "$old_entry" = "$original_entry" ]; then
+      if [ "$new_entry" != "$rewritten_entry" ]; then
+        rewrite_difference_refusal "$original" "$rewritten" "$path" \
+          "the local commit did not change this path" \
+          "old=$old_entry local=$original_entry upstream=$new_entry rewritten=$rewritten_entry"
+        return $?
+      fi
+      continue
+    fi
+    case "$old_entry:$original_entry:$new_entry:$rewritten_entry" in
+      *:-*|*-:*)
+        rewrite_difference_refusal "$original" "$rewritten" "$path" \
+          "a concurrent add or delete has no deterministic union proof" \
+          "old=$old_entry local=$original_entry upstream=$new_entry rewritten=$rewritten_entry"
+        return $?
+        ;;
+    esac
+    old_oid=${old_entry#*:}
+    original_oid=${original_entry#*:}
+    new_oid=${new_entry#*:}
+    rewritten_oid=${rewritten_entry#*:}
+    proof_dir=$(mktemp -d "${TMPDIR:-/tmp}/fm-rewrite-proof.XXXXXX") || return 1
+    materialize_blob "$old_oid" "$proof_dir/old" \
+      || { rm -rf "$proof_dir"; return 1; }
+    materialize_blob "$original_oid" "$proof_dir/local" \
+      || { rm -rf "$proof_dir"; return 1; }
+    materialize_blob "$new_oid" "$proof_dir/upstream" \
+      || { rm -rf "$proof_dir"; return 1; }
+    materialize_blob "$rewritten_oid" "$proof_dir/rewritten" \
+      || { rm -rf "$proof_dir"; return 1; }
+    materialize_union \
+      "$proof_dir/local" "$proof_dir/old" "$proof_dir/upstream" \
+      "$proof_dir/union" || { rm -rf "$proof_dir"; return 1; }
+    materialize_union \
+      "$proof_dir/upstream" "$proof_dir/old" "$proof_dir/local" \
+      "$proof_dir/reverse-union" || { rm -rf "$proof_dir"; return 1; }
+    command cat "$proof_dir/local" "$proof_dir/upstream" \
+      > "$proof_dir/concatenated" || { rm -rf "$proof_dir"; return 1; }
+    command cat "$proof_dir/upstream" "$proof_dir/local" \
+      > "$proof_dir/reverse-concatenated" || { rm -rf "$proof_dir"; return 1; }
+    union_hash=$(git -C "$WT" hash-object "$proof_dir/union" 2>/dev/null) \
+      || { rm -rf "$proof_dir"; return 1; }
+    reverse_union_hash=$(git -C "$WT" hash-object "$proof_dir/reverse-union" 2>/dev/null) \
+      || { rm -rf "$proof_dir"; return 1; }
+    concatenated_hash=$(git -C "$WT" hash-object "$proof_dir/concatenated" 2>/dev/null) \
+      || { rm -rf "$proof_dir"; return 1; }
+    reverse_concatenated_hash=$(git -C "$WT" hash-object \
+      "$proof_dir/reverse-concatenated" 2>/dev/null) \
+      || { rm -rf "$proof_dir"; return 1; }
+    if [ "$rewritten_oid" != "$union_hash" ] \
+        && [ "$rewritten_oid" != "$reverse_union_hash" ] \
+        && [ "$rewritten_oid" != "$concatenated_hash" ] \
+        && [ "$rewritten_oid" != "$reverse_concatenated_hash" ]; then
+      fingerprint=$(union_delta_fingerprint \
+        "$proof_dir/union" "$proof_dir/rewritten") \
+        || { rm -rf "$proof_dir"; return 1; }
+      rm -rf "$proof_dir"
+      rewrite_difference_refusal "$original" "$rewritten" "$path" \
+        "the rewritten blob is not either deterministic union of local and upstream content" \
+        "old=$old_entry local=$original_entry upstream=$new_entry rewritten=$rewritten_entry $fingerprint"
+      return $?
+    fi
+    case "${rewritten_entry%%:*}" in
+      "${original_entry%%:*}"|"${new_entry%%:*}")
+        rm -rf "$proof_dir"
+        ;;
+      *)
+        rm -rf "$proof_dir"
+        rewrite_difference_refusal "$original" "$rewritten" "$path" \
+          "the rewritten file mode is neither the local nor upstream mode" \
+          "local_mode=${original_entry%%:*} upstream_mode=${new_entry%%:*} rewritten_mode=${rewritten_entry%%:*}"
+        return $?
+        ;;
+    esac
+  done <<< "$paths"
+}
+
+commit_is_rebased_counterpart() {
+  local original=$1 rewritten=$2 old_base=$3 new_base=$4
+  local original_identity rewritten_identity original_paths rewritten_paths
+  local original_patch rewritten_patch comparison
+  commit_has_one_parent "$original" || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  commit_has_one_parent "$rewritten" || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  original_identity=$(commit_rebase_identity "$original") || return 1
+  rewritten_identity=$(commit_rebase_identity "$rewritten") || return 1
+  [ -n "$original_identity" ] && [ "$original_identity" = "$rewritten_identity" ] \
+    || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  original_paths=$(commit_changed_paths_identity "$original") || return 1
+  rewritten_paths=$(commit_changed_paths_identity "$rewritten") || return 1
+  [ -n "$original_paths" ] && [ "$original_paths" = "$rewritten_paths" ] \
+    || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  original_patch=$(patch_id_for_commit "$original") || return 1
+  rewritten_patch=$(patch_id_for_commit "$rewritten") || return 1
+  [ -n "$original_patch" ] && [ -n "$rewritten_patch" ] || return 1
+  [ "$original_patch" != "$rewritten_patch" ] || return 0
+  commit_patch_has_upstream_overlap "$original" "$old_base" "$new_base" \
+    || return $?
+  comparison=$(git -C "$WT" range-diff --no-color --no-dual-color --no-patch \
+    --abbrev=40 "$original^..$original" "$rewritten^..$rewritten" 2>/dev/null) \
+    || return 1
+  [ "$(printf '%s\n' "$comparison" | sed '/^$/d' | wc -l | tr -d ' ')" -eq 1 ] \
+    || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  printf '%s\n' "$comparison" \
+    | grep -Eq '^[[:space:]]*1:[[:space:]]+[0-9a-f]{40}[[:space:]]+![[:space:]]+1:[[:space:]]+[0-9a-f]{40}[[:space:]]' \
+    || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  commit_rewrite_differences_are_attributable \
+    "$original" "$rewritten" "$original^" "$rewritten^"
+}
+
+rebased_pr_head_contains_unpushed() {
+  local target=$1 pr_head=$2 current local_commits rewritten_commits count
+  local original rewritten original_oldest rewritten_oldest old_base new_base
+  local original_parent rewritten_parent previous_original previous_rewritten
+  current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
+  local_commits=$(git -C "$WT" rev-list --reverse HEAD --not --remotes -- \
+    2>/dev/null) || return 1
+  [ -n "$local_commits" ] || return 0
+  count=$(printf '%s\n' "$local_commits" | sed '/^$/d' | wc -l | tr -d ' ')
+  case "$count" in ''|*[!0-9]*|0) return 1 ;; esac
+  rewritten_commits=$(git -C "$WT" rev-list --first-parent --reverse \
+    --max-count="$count" "$pr_head" 2>/dev/null) || return 1
+  [ "$(printf '%s\n' "$rewritten_commits" | sed '/^$/d' | wc -l | tr -d ' ')" -eq "$count" ] \
+    || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  original_oldest=$(printf '%s\n' "$local_commits" | sed -n '1p')
+  rewritten_oldest=$(printf '%s\n' "$rewritten_commits" | sed -n '1p')
+  commit_has_one_parent "$original_oldest" \
+    || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  commit_has_one_parent "$rewritten_oldest" \
+    || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  old_base=$(git -C "$WT" rev-parse "$original_oldest^" 2>/dev/null) || return 1
+  new_base=$(git -C "$WT" rev-parse "$rewritten_oldest^" 2>/dev/null) || return 1
+  git -C "$WT" merge-base --is-ancestor "$old_base" "$new_base" 2>/dev/null \
+    || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  previous_original=$old_base
+  previous_rewritten=$new_base
+  while IFS=$'\t' read -r original rewritten; do
+    [ -n "$original" ] && [ -n "$rewritten" ] \
+      || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+    original_parent=$(git -C "$WT" rev-parse "$original^" 2>/dev/null) || return 1
+    rewritten_parent=$(git -C "$WT" rev-parse "$rewritten^" 2>/dev/null) || return 1
+    [ "$original_parent" = "$previous_original" ] \
+      && [ "$rewritten_parent" = "$previous_rewritten" ] \
+      || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+    commit_is_rebased_counterpart \
+      "$original" "$rewritten" "$old_base" "$new_base" || return $?
+    previous_original=$original
+    previous_rewritten=$rewritten
+  done < <(paste <(printf '%s\n' "$local_commits") <(printf '%s\n' "$rewritten_commits"))
+  [ "$previous_original" = "$current" ] && [ "$previous_rewritten" = "$pr_head" ] \
+    || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  pr_rewrite_path_contains_head "$target" "$current" "$pr_head"
+}
+
+# Does a merged PR corroborate local work landing in the authoritative default ref?
+# The PR's merge commit must be an ancestor of that ref, and its head must contain
+# the current local work directly, by stable patch identity, or through an exact
+# force-push rewrite lineage whose commit series satisfies the strict rebase checks.
+# A merged PR without both legs is only a safety refusal, never landing proof.
 pr_is_merged() {
-  local branch=$1 target view state head current
+  local branch=$1 authoritative_ref=$2 target view state rest head merge_commit current status
   if [ -n "$PR_URL" ]; then
     target=$PR_URL
   else
-    target=$(pr_number_from_branch "$branch") || return 1
+    if target=$(pr_number_from_branch "$branch"); then
+      :
+    else
+      status=$?
+      return "$status"
+    fi
   fi
-  [ -n "$target" ] || return 1
-  view=$(cd "$WT" && gh pr view "$target" --json state,headRefOid -q '.state + "\t" + .headRefOid' 2>/dev/null) || return 1
+  [ -n "$target" ] || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  view=$(cd "$WT" && gh pr view "$target" --json state,headRefOid,mergeCommit \
+    -q '.state + "\t" + .headRefOid + "\t" + (.mergeCommit.oid // "")' \
+    2>/dev/null) || return 1
   state=${view%%$'\t'*}
-  head=${view#*$'\t'}
+  rest=${view#*$'\t'}
   [ "$state" != "$view" ] || return 1
+  head=${rest%%$'\t'*}
+  merge_commit=${rest#*$'\t'}
+  [ "$head" != "$rest" ] || return 1
   case "$state" in
     MERGED|merged) ;;
-    *) return 1 ;;
+    *) return "$TEARDOWN_REAP_SAFETY_REFUSAL" ;;
   esac
-  [ -n "$head" ] || return 1
+  [ -n "$head" ] && [ -n "$merge_commit" ] || return 1
+  git -C "$WT" cat-file -e "$merge_commit^{commit}" 2>/dev/null || return 1
+  git -C "$WT" merge-base --is-ancestor "$merge_commit" "$authoritative_ref" \
+    2>/dev/null || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
   ensure_commit_object "$target" "$head" || return 1
   current=$(git -C "$WT" rev-parse --verify HEAD 2>/dev/null) || return 1
   git -C "$WT" merge-base --is-ancestor "$current" "$head" 2>/dev/null && return 0
-  unpushed_patches_are_in_pr_head "$head"
+  if unpushed_patches_are_in_pr_head "$head"; then
+    return 0
+  else
+    status=$?
+  fi
+  [ "$status" -eq "$TEARDOWN_REAP_SAFETY_REFUSAL" ] || return "$status"
+  rebased_pr_head_contains_unpushed "$target" "$head"
 }
 
 # Is the branch's content already present in the up-to-date default branch?
 # Origin-backed proof holds the common checkout lock across probe, fetch,
-# unchanged branch-and-tip re-probe, and tree comparison.
+# unchanged branch-and-tip re-probe, and both direct and PR-corroborated checks.
 content_matches_ref() {
-  local ref=$1 default_tree merged_tree
+  local ref=$1 default_tree merged_output merged_tree status
   default_tree=$(git -C "$WT" rev-parse --quiet --verify "$ref^{tree}" 2>/dev/null) || return 1
   [ -n "$default_tree" ] || return 1
-  merged_tree=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null) || return 1
-  merged_tree=$(printf '%s\n' "$merged_tree" | head -1)
+  if merged_output=$(git -C "$WT" merge-tree --write-tree "$ref" HEAD 2>/dev/null); then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$status" -eq 1 ]; then
+    echo "teardown: task content conflicts with authoritative $ref; retaining $WT" >&2
+    return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  fi
+  [ "$status" -eq 0 ] || return "$status"
+  merged_tree=$(printf '%s\n' "$merged_output" | head -1)
   if [ "$merged_tree" != "$default_tree" ]; then
     echo "teardown: task content is not present in authoritative $ref; retaining $WT" >&2
-    return 1
+    return "$TEARDOWN_REAP_SAFETY_REFUSAL"
   fi
   return 0
 }
 
 content_in_origin_default() {
-  local initial_branch initial_tip ref fetched fetch_output reason fetch_status
+  local branch=$1 initial_branch initial_tip ref fetched fetch_output reason fetch_status
+  local content_status
   if ! probe_live_origin_default; then
     reason=$(printf '%s\n' "$LIVE_DEFAULT_OUTPUT" | sed -n '1s/[[:space:]]\{1,\}/ /g;1p')
     echo "teardown: cannot prove the live origin default for $PROJ${reason:+: $reason}; retaining $WT" >&2
@@ -960,13 +1415,21 @@ content_in_origin_default() {
     echo "teardown: fetched origin/$initial_branch does not match live origin HEAD; retaining $WT" >&2
     return 1
   fi
-  content_matches_ref "$ref"
+  if content_matches_ref "$ref"; then
+    return 0
+  else
+    content_status=$?
+  fi
+  [ "$content_status" -eq "$TEARDOWN_REAP_SAFETY_REFUSAL" ] \
+    || return "$content_status"
+  pr_is_merged "$branch" "$ref"
 }
 
 content_in_default() {
-  local name ref
+  local branch=$1 name ref
   if git -C "$WT" remote get-url origin >/dev/null 2>&1; then
-    fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" content_in_origin_default
+    fm_checkout_lock_run \
+      "$WT" "$CHECKOUT_LOCK_ROOT" content_in_origin_default "$branch"
     return
   fi
   name=$(default_branch) || return 1
@@ -979,14 +1442,17 @@ content_in_default() {
 }
 
 # Has the worktree's committed work actually LANDED, though its commits are not
-# reachable from any remote-tracking branch? True when a merged PR proves the
-# current local work is contained in the PR head, OR the content is already in the
-# default branch (fallback, which also covers the no-PR and gh-error paths). False
-# only for genuinely unlanded work.
+# reachable from any remote-tracking branch? The live default branch is the primary
+# authority. Direct content containment is sufficient; a rewritten PR head is only
+# corroboration when GitHub's exact merge commit is also on that default branch.
 work_is_landed() {
-  local branch=$1
-  pr_is_merged "$branch" && return 0
-  content_in_default
+  local branch=$1 content_status
+  if content_in_default "$branch"; then
+    return 0
+  else
+    content_status=$?
+  fi
+  return "$content_status"
 }
 
 backlog_refresh_reminder() {
@@ -1000,24 +1466,24 @@ backlog_refresh_reminder() {
     case "$KIND" in
       scout)
         report_path="data/$ID/report.md"
-        done_cmd="tasks-axi done $ID --report $report_path"
+        done_cmd="bin/fm-data-write.py --data \"\$FM_HOME/data\" -- tasks-axi done $ID --report $report_path"
         ;;
       *)
         if [ "$MODE" = local-only ]; then
-          done_cmd="tasks-axi done $ID --note \"local main\""
+          done_cmd="bin/fm-data-write.py --data \"\$FM_HOME/data\" -- tasks-axi done $ID --note \"local main\""
         else
           pr=$PR_URL
           if [ -n "$pr" ]; then
-            done_cmd="tasks-axi done $ID --pr $pr"
+            done_cmd="bin/fm-data-write.py --data \"\$FM_HOME/data\" -- tasks-axi done $ID --pr $pr"
           else
-            done_cmd="tasks-axi done $ID --pr PR_URL"
+            done_cmd="bin/fm-data-write.py --data \"\$FM_HOME/data\" -- tasks-axi done $ID --pr PR_URL"
           fi
         fi
         ;;
     esac
     printf '%s\n' "Backlog: $ID just finished. Run $done_cmd, then run tasks-axi ready for dependency-cleared candidates, check date gates, and dispatch only work whose blockers are gone and date is due."
   else
-    printf '%s\n' "Backlog: $ID just finished. Update data/backlog.md - move $ID to Done, keep Done to the 10 most recent, then re-scan Queued and dispatch only work whose blockers are gone and date is due."
+    printf '%s\n' "Backlog: $ID just finished. Through bin/fm-data-write.py --data \"\$FM_HOME/data\" -- <command>, update data/backlog.md - move $ID to Done, keep Done to the 10 most recent, then re-scan Queued and dispatch only work whose blockers are gone and date is due."
   fi
 }
 
@@ -1062,7 +1528,7 @@ worktree_registered_for_project() {
   done <<EOF
 $listed
 EOF
-  return 1
+  return "$TEARDOWN_REAP_SAFETY_REFUSAL"
 }
 
 inspectable_git_worktree() {
@@ -1105,12 +1571,12 @@ treehouse_task_lease_state() {
     echo "error: cannot resolve authoritative Treehouse state for $worktree" >&2
     return 1
   }
-  python3 - "$state" "$worktree" "$expected_holder" <<'PY'
+  python3 - "$state" "$worktree" "$expected_holder" "$TEARDOWN_REAP_SAFETY_REFUSAL" <<'PY'
 import json
 import os
 import sys
 
-state_path, expected_path, expected_holder = sys.argv[1:]
+state_path, expected_path, expected_holder, safety_status = sys.argv[1:]
 try:
     with open(state_path, encoding="utf-8") as stream:
         state = json.load(stream)
@@ -1127,13 +1593,13 @@ try:
         if os.path.realpath(path) == expected_path:
             matches.append(entry)
     if len(matches) != 1:
-        raise ValueError("expected exactly one matching worktree entry")
+        raise RuntimeError("expected exactly one matching worktree entry")
     entry = matches[0]
     if entry.get("destroying") is True:
-        raise ValueError("worktree is already being destroyed")
+        raise RuntimeError("worktree is already being destroyed")
     if entry.get("leased") is True:
         if entry.get("lease_holder") != expected_holder:
-            raise ValueError(
+            raise RuntimeError(
                 f"lease holder is {entry.get('lease_holder')!r}, "
                 f"expected {expected_holder!r}"
             )
@@ -1144,7 +1610,13 @@ try:
     ):
         print("returned")
     else:
-        raise ValueError("worktree lease state is neither owned nor cleanly returned")
+        raise RuntimeError("worktree lease state is neither owned nor cleanly returned")
+except RuntimeError as error:
+    print(
+        f"error: Treehouse ownership for {expected_path} is unprovable: {error}",
+        file=sys.stderr,
+    )
+    raise SystemExit(int(safety_status))
 except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
     print(
         f"error: Treehouse ownership for {expected_path} is unprovable: {error}",
@@ -1155,19 +1627,29 @@ PY
 }
 
 require_treehouse_task_lease() {
-  local state
-  state=$(treehouse_task_lease_state "$1" "$2") || return 1
+  local state status
+  if state=$(treehouse_task_lease_state "$1" "$2"); then
+    :
+  else
+    status=$?
+    return "$status"
+  fi
   [ "$state" = leased ] || {
     echo "error: Treehouse ownership for $1 is unprovable: worktree is not durably leased" >&2
-    return 1
+    return "$TEARDOWN_REAP_SAFETY_REFUSAL"
   }
 }
 
 TREEHOUSE_TARGET_ALREADY_RETURNED=0
 require_treehouse_task_lease_or_returned() {
-  local state
+  local state status
   TREEHOUSE_TARGET_ALREADY_RETURNED=0
-  state=$(treehouse_task_lease_state "$1" "$2") || return 1
+  if state=$(treehouse_task_lease_state "$1" "$2"); then
+    :
+  else
+    status=$?
+    return "$status"
+  fi
   case "$state" in
     leased) ;;
     returned) TREEHOUSE_TARGET_ALREADY_RETURNED=1 ;;
@@ -1175,24 +1657,27 @@ require_treehouse_task_lease_or_returned() {
   esac
 }
 require_treehouse_return_authority() {
-  local worktree=$1 project=$2 worktree_root project_root worktree_common project_common
+  local worktree=$1 project=$2 worktree_root project_root worktree_common project_common status
   worktree_root=$(exact_git_worktree_root "$worktree") || return 1
   project_root=$(exact_git_worktree_root "$project") || return 1
   worktree_common=$(fm_checkout_git_common_dir "$worktree_root") || return 1
   project_common=$(fm_checkout_git_common_dir "$project_root") || return 1
   [ "$worktree_common" = "$project_common" ] || {
     echo "error: Treehouse return target $worktree_root does not belong to $project_root" >&2
-    return 1
+    return "$TEARDOWN_REAP_SAFETY_REFUSAL"
   }
-  worktree_registered_for_project "$project_root" "$worktree_root" || {
+  if worktree_registered_for_project "$project_root" "$worktree_root"; then
+    :
+  else
+    status=$?
     echo "error: Treehouse return target $worktree_root is not registered to $project_root" >&2
-    return 1
-  }
-  fm_treehouse_require_task_lease "$worktree_root" "$3"
+    return "$status"
+  fi
+  require_treehouse_task_lease "$worktree_root" "$3"
 }
 
 validate_teardown_target_identity() {
-  local project_root worktree_root project_common worktree_common
+  local project_root worktree_root project_common worktree_common identity_status
   [ "$KIND" != secondmate ] || return 0
   require_safe_task_metadata || return 1
   project_root=$(exact_git_worktree_root "$PROJ") || {
@@ -1219,7 +1704,7 @@ validate_teardown_target_identity() {
   worktree_common=$(fm_checkout_git_common_dir "$worktree_root") || return 1
   [ "$project_common" = "$worktree_common" ] || {
     echo "error: teardown worktree does not belong to the recorded project: $worktree_root" >&2
-    return 1
+    return "$TEARDOWN_REAP_SAFETY_REFUSAL"
   }
   if [ "$BACKEND" = orca ]; then
     require_orca_task_metadata_identity "$META" "$ID" || return 1
@@ -1227,10 +1712,13 @@ validate_teardown_target_identity() {
     ORCA_PATH_MATCH_VERIFIED=1
     return 0
   fi
-  worktree_registered_for_project "$project_root" "$worktree_root" || {
+  if worktree_registered_for_project "$project_root" "$worktree_root"; then
+    :
+  else
+    identity_status=$?
     echo "error: teardown worktree is not registered to the recorded project: $worktree_root" >&2
-    return 1
-  }
+    return "$identity_status"
+  fi
   require_treehouse_task_lease_or_returned "$worktree_root" "firstmate-$ID"
 }
 
@@ -1290,8 +1778,11 @@ worktree_safety_blocked_by_lock() {
 }
 
 cleanup_stale_lock_for_safety_check() {
-  local dir=$1 lock
-  lock=$(worktree_git_lock_path "$dir") || lock=""
+  local dir=$1 lock staleness
+  lock=$(worktree_git_lock_path "$dir") || {
+    echo "teardown: cannot resolve worktree git lock during safety cleanup" >&2
+    return 1
+  }
   [ -n "$lock" ] && [ -e "$lock" ] || return 0
 
   echo "teardown: worktree safety check blocked by git lock $lock; waiting ${STALE_WORKTREE_LOCK_RETRY_WAIT_SECS}s and retrying (owning process may be exiting)" >&2
@@ -1302,34 +1793,58 @@ cleanup_stale_lock_for_safety_check() {
     return 0
   fi
 
-  if fm_lock_is_provably_stale "$lock" "$dir" "$STALE_WORKTREE_LOCK_AGE_SECS"; then
-    rm -f "$lock"
+  staleness=$(fm_lock_staleness_state "$lock" "$dir" "$STALE_WORKTREE_LOCK_AGE_SECS") || {
+    echo "teardown: cannot inspect git lock $lock during safety cleanup" >&2
+    return 1
+  }
+  if [ "$staleness" = stale ]; then
+    rm -f "$lock" || return 1
     echo "teardown: removed provably-stale git lock $lock (age >= ${STALE_WORKTREE_LOCK_AGE_SECS}s, no live holder) and retrying worktree safety checks" >&2
     return 0
   fi
 
   echo "teardown: worktree safety check blocked by git lock $lock that is not provably stale (may belong to a live process); leaving it in place" >&2
-  return "$TEARDOWN_TREEHOUSE_LOCK_REFUSED"
+  return "$TEARDOWN_REAP_SAFETY_REFUSAL"
 }
 
-# Return a worktree/home via `treehouse return --force`, tolerating a transient or
-# stale git index.lock left by a killed crewmate process. See the script header.
+# Return a worktree/home via Treehouse, tolerating a transient or stale git
+# index.lock left by a killed crewmate process. See the script header.
 teardown_treehouse_return_locked() {
   local dir=$1 cd_dir=$2 label=$3 expected_holder=$4 post_cleanup_check=${5:-} post_return_cleanup=${6:-}
+  local return_mode=${7:---force}
   local out lock attempt=0 max_retries lock_desc return_status return_branch=
 
-  require_treehouse_return_authority "$dir" "$cd_dir" "$expected_holder" || {
+  case "$return_mode" in
+    --force|--safe) ;;
+    *)
+      echo "teardown: $label return aborted because its return mode is invalid" >&2
+      return 1
+      ;;
+  esac
+
+  if require_treehouse_return_authority "$dir" "$cd_dir" "$expected_holder"; then
+    :
+  else
+    return_status=$?
     echo "teardown: $label return aborted because Treehouse task ownership changed" >&2
-    return 1
-  }
-  if [ -n "$post_cleanup_check" ] && ! "$post_cleanup_check" "$dir" "$cd_dir" "$expected_holder"; then
-    echo "teardown: $label return aborted because the final locked safety check failed" >&2
-    return 1
+    return "$return_status"
   fi
-  require_treehouse_return_authority "$dir" "$cd_dir" "$expected_holder" || {
+  if [ -n "$post_cleanup_check" ]; then
+    if "$post_cleanup_check" "$dir" "$cd_dir" "$expected_holder"; then
+      :
+    else
+      return_status=$?
+      echo "teardown: $label return aborted because the final locked safety check failed" >&2
+      return "$return_status"
+    fi
+  fi
+  if require_treehouse_return_authority "$dir" "$cd_dir" "$expected_holder"; then
+    :
+  else
+    return_status=$?
     echo "teardown: $label return aborted because Treehouse task ownership changed during final safety checks" >&2
-    return 1
-  }
+    return "$return_status"
+  fi
   if [ -n "$post_return_cleanup" ]; then
     return_branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null) || {
       echo "teardown: $label return aborted because the task branch cannot be inspected under lock" >&2
@@ -1337,7 +1852,7 @@ teardown_treehouse_return_locked() {
     }
   fi
   validate_removal_tree_boundaries "$dir" "$label" || return 1
-  if out=$(fm_checkout_treehouse_return_locked "$dir" "$CHECKOUT_LOCK_ROOT" "$cd_dir" 2>&1); then
+  if out=$(fm_checkout_treehouse_return_locked "$dir" "$CHECKOUT_LOCK_ROOT" "$cd_dir" "$return_mode" 2>&1); then
     [ -n "$out" ] && printf '%s\n' "$out"
     if [ -n "$post_return_cleanup" ]; then
       "$post_return_cleanup" "$return_branch" "$dir" "$cd_dir" || return 1
@@ -1370,20 +1885,31 @@ teardown_treehouse_return_locked() {
     echo "teardown: $label return failed with transient git lock ($lock_desc); waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s and retrying ($attempt/${max_retries})" >&2
     sleep "$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS"
 
-    if ! require_treehouse_return_authority "$dir" "$cd_dir" "$expected_holder"; then
+    if require_treehouse_return_authority "$dir" "$cd_dir" "$expected_holder"; then
+      :
+    else
+      return_status=$?
       echo "teardown: $label return aborted because Treehouse task ownership changed" >&2
-      return 1
+      return "$return_status"
     fi
-    if [ -n "$post_cleanup_check" ] && ! "$post_cleanup_check" "$dir" "$cd_dir" "$expected_holder"; then
-      echo "teardown: $label return aborted because the final locked safety check failed" >&2
-      return 1
+    if [ -n "$post_cleanup_check" ]; then
+      if "$post_cleanup_check" "$dir" "$cd_dir" "$expected_holder"; then
+        :
+      else
+        return_status=$?
+        echo "teardown: $label return aborted because the final locked safety check failed" >&2
+        return "$return_status"
+      fi
     fi
-    if ! require_treehouse_return_authority "$dir" "$cd_dir" "$expected_holder"; then
+    if require_treehouse_return_authority "$dir" "$cd_dir" "$expected_holder"; then
+      :
+    else
+      return_status=$?
       echo "teardown: $label return aborted because Treehouse task ownership changed during final safety checks" >&2
-      return 1
+      return "$return_status"
     fi
     validate_removal_tree_boundaries "$dir" "$label" || return 1
-    if out=$(fm_checkout_treehouse_return_locked "$dir" "$CHECKOUT_LOCK_ROOT" "$cd_dir" 2>&1); then
+    if out=$(fm_checkout_treehouse_return_locked "$dir" "$CHECKOUT_LOCK_ROOT" "$cd_dir" "$return_mode" 2>&1); then
       [ -n "$out" ] && printf '%s\n' "$out"
       if [ -n "$post_return_cleanup" ]; then
         "$post_return_cleanup" "$return_branch" "$dir" "$cd_dir" || return 1
@@ -1412,22 +1938,31 @@ teardown_treehouse_return_locked() {
     if fm_lock_is_provably_stale "$lock" "$dir" "$STALE_WORKTREE_LOCK_AGE_SECS"; then
       rm -f "$lock"
       echo "teardown: removed provably-stale git lock $lock (age >= ${STALE_WORKTREE_LOCK_AGE_SECS}s, no live holder) and retrying $label return" >&2
-      if ! require_treehouse_return_authority "$dir" "$cd_dir" "$expected_holder"; then
+      if require_treehouse_return_authority "$dir" "$cd_dir" "$expected_holder"; then
+        :
+      else
+        return_status=$?
         echo "teardown: $label return aborted after stale-lock cleanup because Treehouse task ownership changed" >&2
-        return 1
+        return "$return_status"
       fi
       if [ -n "$post_cleanup_check" ]; then
-        if ! "$post_cleanup_check" "$dir" "$cd_dir" "$expected_holder"; then
+        if "$post_cleanup_check" "$dir" "$cd_dir" "$expected_holder"; then
+          :
+        else
+          return_status=$?
           echo "teardown: $label return aborted after stale-lock cleanup because safety checks failed" >&2
-          return 1
+          return "$return_status"
         fi
       fi
-      if ! require_treehouse_return_authority "$dir" "$cd_dir" "$expected_holder"; then
+      if require_treehouse_return_authority "$dir" "$cd_dir" "$expected_holder"; then
+        :
+      else
+        return_status=$?
         echo "teardown: $label return aborted after stale-lock cleanup because Treehouse task ownership changed during safety checks" >&2
-        return 1
+        return "$return_status"
       fi
       validate_removal_tree_boundaries "$dir" "$label" || return 1
-      if out=$(fm_checkout_treehouse_return_locked "$dir" "$CHECKOUT_LOCK_ROOT" "$cd_dir" 2>&1); then
+      if out=$(fm_checkout_treehouse_return_locked "$dir" "$CHECKOUT_LOCK_ROOT" "$cd_dir" "$return_mode" 2>&1); then
         [ -n "$out" ] && printf '%s\n' "$out"
         if [ -n "$post_return_cleanup" ]; then
           "$post_return_cleanup" "$return_branch" "$dir" "$cd_dir" || return 1
@@ -1482,13 +2017,34 @@ teardown_path_is_known_tool_artifact() {
   return 1
 }
 
+preserved_untracked_path_is_tolerated() {
+  local path=$1 root capture=${PRESERVED_SCRATCH_CAPTURE:-}
+  [ -n "$capture" ] && [ -f "$capture/untracked-roots.paths" ] || return 1
+  while IFS= read -r -d '' root; do
+    case "$root" in
+      */)
+        case "$path" in
+          "$root"*) return 0 ;;
+        esac
+        ;;
+      *) [ "$path" != "$root" ] || return 0 ;;
+    esac
+  done < "$capture/untracked-roots.paths"
+  return 1
+}
+
 first_actionable_dirty_status() {
-  local line path
+  local preserve_scout_untracked=${1:-0} line path
   while IFS= read -r line; do
     case "$line" in
       '?? '*)
         path=${line#?? }
         teardown_path_is_known_tool_artifact "$path" && continue
+        preserved_untracked_path_is_tolerated "$path" && continue
+        if [ "$SCOUT_SCRATCH_RELEASABLE" -eq 1 ] \
+          && [ "$preserve_scout_untracked" -ne 1 ]; then
+          continue
+        fi
         ;;
     esac
     printf '%s\n' "$line"
@@ -1504,12 +2060,12 @@ validate_worktree_stash_absent() {
   }
   [ -z "$stash_list" ] || {
     echo "REFUSED: worktree $WT has retained stash history." >&2
-    return 1
+    return "$TEARDOWN_REAP_SAFETY_REFUSAL"
   }
 }
 
 validate_worktree_committed_landing() {
-  local unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch
+  local unpushed_raw unpushed DEFAULT unmerged_raw unmerged branch landing_status
   if ! unpushed_raw=$(git -C "$WT" log --oneline HEAD --not --remotes -- 2>/dev/null); then
     if worktree_safety_blocked_by_lock "commits not on a remote"; then
       return "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED"
@@ -1535,7 +2091,7 @@ validate_worktree_committed_landing() {
       echo "REFUSED: local-only worktree $WT has work not yet merged into $DEFAULT and not on any remote." >&2
       printf 'commits not yet on %s:\n%s\n' "$DEFAULT" "$unmerged" >&2
       echo "Merge the branch into local $DEFAULT first (bin/fm-merge-local.sh after the captain approves), or push it to a fork or remote, then retry teardown." >&2
-      return 1
+      return "$TEARDOWN_REAP_SAFETY_REFUSAL"
     fi
   elif [ -n "$unpushed" ]; then
     branch=${TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY:-}
@@ -1543,11 +2099,18 @@ validate_worktree_committed_landing() {
       branch=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
       TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY=$branch
     fi
-    if ! work_is_landed "$branch"; then
+    if work_is_landed "$branch"; then
+      :
+    else
+      landing_status=$?
+      if [ "$landing_status" -ne "$TEARDOWN_REAP_SAFETY_REFUSAL" ]; then
+        echo "REFUSED: worktree $WT landing proof could not execute." >&2
+        return "$landing_status"
+      fi
       echo "REFUSED: worktree $WT has work not on any remote and not landed." >&2
       printf 'unpushed commits:\n%s\n' "$unpushed" >&2
       echo "Push the branch or land its PR, then retry teardown." >&2
-      return 1
+      return "$TEARDOWN_REAP_SAFETY_REFUSAL"
     fi
   fi
 }
@@ -1558,7 +2121,7 @@ validate_worktree_teardown_safety() {
   case "$KIND" in
     secondmate) return 0 ;;
   esac
-  validate_worktree_stash_absent || return 1
+  validate_worktree_stash_absent || return $?
 
   if ! dirty_raw=$(git -C "$WT" status --porcelain=v1 --untracked-files=all 2>/dev/null); then
     if worktree_safety_blocked_by_lock "uncommitted changes"; then
@@ -1579,8 +2142,22 @@ validate_worktree_teardown_safety() {
     else
       echo "Retry with --preserve-scratch to capture the diff and untracked files before cleaning, or commit and land them first." >&2
     fi
-    return 1
+    return "$TEARDOWN_REAP_SAFETY_REFUSAL"
   fi
+}
+
+validate_reap_worktree_safety() {
+  local dirty_raw
+  validate_worktree_teardown_safety || return $?
+  dirty_raw=$(git -C "$WT" status --porcelain=v1 --untracked-files=all 2>/dev/null) || {
+    echo "REFUSED: dead-task reaping cannot inspect worktree $WT for uncommitted changes." >&2
+    return 1
+  }
+  [ -z "$dirty_raw" ] || {
+    echo "REFUSED: dead-task reaping never discards uncommitted changes in $WT." >&2
+    printf '%s\n' "$dirty_raw" | sed -n '1,5p' >&2
+    return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  }
 }
 
 summarize_ignored_worktree_paths() {
@@ -1617,6 +2194,101 @@ print(
   printf '%s\n' "$summary"
 }
 
+validate_reap_ignored_worktree_paths() {
+  local output status
+  output=$(
+    set -o pipefail
+    git -C "$WT" ls-files --others --ignored --exclude-standard -z -- |
+      python3 -c '
+import os
+import sys
+import time
+
+worktree = sys.argv[1]
+entries = [
+    item.decode("utf-8", "surrogateescape").rstrip("/")
+    for item in sys.stdin.buffer.read().split(b"\0")
+    if item
+]
+dependency_roots = {
+    ".bundle", ".pnpm", ".venv", "node_modules", "pods", "venv",
+}
+generated_roots = {
+    ".cache", ".mypy_cache", ".next", ".nuxt", ".parcel-cache",
+    ".pytest_cache", ".ruff_cache", "__pycache__", "build", "cache",
+    "caches", "coverage", "dist", "target",
+}
+generated_path_parts = {"assets", "chunks", "generated", "static"}
+generated_names = {
+    ".coverage", "coverage-final.json", "lcov.info", "results.json",
+}
+work_roots = {"data", "docs"}
+work_words = ("draft", "note", "report", "skill")
+recent_cutoff = time.time() - 24 * 60 * 60
+refused = []
+
+for entry in entries:
+    parts = tuple(part for part in entry.split("/") if part)
+    lowered = tuple(part.lower() for part in parts)
+    basename = lowered[-1] if lowered else ""
+    dependency_owned = any(part in dependency_roots for part in lowered)
+    generated_root = next((part for part in lowered if part in generated_roots), None)
+    generated_evidence = (
+        any(part in generated_path_parts for part in lowered[:-1])
+        or basename in generated_names
+        or basename.endswith((".map", ".pyc"))
+    )
+    reason = None
+    dependency_index = next(
+        (index for index, part in enumerate(lowered) if part in dependency_roots),
+        len(lowered),
+    )
+    protected_prefix = lowered[:dependency_index]
+    protected_work_path = (
+        not parts
+        or lowered[0] in work_roots
+        or ".agents" in protected_prefix and "skills" in protected_prefix
+        or any(part in {"draft", "drafts", "note", "notes", "report", "reports"}
+               for part in protected_prefix)
+    )
+    if protected_work_path:
+        reason = "work-shaped"
+    elif dependency_owned:
+        continue
+    elif any(word in basename for word in work_words):
+        reason = "work-shaped"
+    elif generated_root is None:
+        reason = "ambiguous"
+    elif not generated_evidence:
+        try:
+            if os.stat(os.path.join(worktree, entry), follow_symlinks=False).st_mtime >= recent_cutoff:
+                reason = "recent-ambiguous"
+            else:
+                reason = "ambiguous"
+        except OSError:
+            reason = "uninspectable"
+    if reason:
+        refused.append((entry, reason))
+
+if refused:
+    print(f"REFUSED: dead-task reaping found {len(refused)} unsafe ignored path(s).")
+    for path, reason in refused[:10]:
+        print(f"ignored path refused: {path} ({reason})")
+    if len(refused) > 10:
+        print(f"ignored path refused: ... {len(refused) - 10} more")
+    raise SystemExit(int(sys.argv[2]))
+' "$WT" "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  )
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    [ -z "$output" ] || printf '%s\n' "$output" >&2
+    [ "$status" -eq "$TEARDOWN_REAP_SAFETY_REFUSAL" ] \
+      || echo "REFUSED: cannot classify ignored files in worktree $WT." >&2
+    return "$status"
+  fi
+  summarize_ignored_worktree_paths
+}
+
 validate_worktree_teardown_safety_and_summarize_ignored() {
   validate_worktree_teardown_safety || return 1
   summarize_ignored_worktree_paths
@@ -1631,7 +2303,7 @@ filter_preservable_untracked_paths() {
 }
 
 capture_worktree_scratch() {
-  local task_dir scratch_root capture_dir all_untracked
+  local task_dir scratch_root capture_dir all_untracked root_candidates
   [ -d "$DATA" ] || mkdir -p "$DATA" || return 1
   [ -d "$DATA" ] && [ ! -L "$DATA" ] || {
     echo "REFUSED: scratch data root is not a real directory: $DATA" >&2
@@ -1657,6 +2329,7 @@ capture_worktree_scratch() {
   umask 077
   mkdir "$capture_dir" || return 1
   all_untracked="$capture_dir/.all-untracked.paths"
+  root_candidates="$capture_dir/.untracked-root-candidates.paths"
 
   git -C "$WT" status --porcelain=v1 --untracked-files=all \
     > "$capture_dir/status.txt" || return 1
@@ -1668,9 +2341,11 @@ capture_worktree_scratch() {
     > "$capture_dir/unstaged.patch" || return 1
   git -C "$WT" ls-files --others --exclude-standard -z -- \
     > "$all_untracked" || return 1
+  git -C "$WT" ls-files --others --exclude-standard \
+    --directory --no-empty-directory -z -- \
+    > "$root_candidates" || return 1
   filter_preservable_untracked_paths \
     "$all_untracked" "$capture_dir/untracked.paths" || return 1
-  rm -f "$all_untracked"
 
   python3 - "$WT" "$capture_dir" <<'PY'
 import hashlib
@@ -1681,8 +2356,40 @@ import sys
 import tarfile
 
 root, capture = sys.argv[1:]
-with open(os.path.join(capture, "untracked.paths"), "rb") as stream:
-    paths = [item.decode("utf-8", "surrogateescape") for item in stream.read().split(b"\0") if item]
+
+def read_paths(name):
+    with open(os.path.join(capture, name), "rb") as stream:
+        return [
+            item.decode("utf-8", "surrogateescape")
+            for item in stream.read().split(b"\0")
+            if item
+        ]
+
+paths = read_paths("untracked.paths")
+all_paths = read_paths(".all-untracked.paths")
+root_candidates = read_paths(".untracked-root-candidates.paths")
+preserved = set(paths)
+excluded = set(all_paths) - preserved
+
+roots = []
+for candidate in root_candidates:
+    if candidate.endswith("/"):
+        safe = not any(path.startswith(candidate) for path in excluded)
+    else:
+        safe = candidate in preserved
+    if safe:
+        roots.append(candidate)
+
+root_set = set(roots)
+for path in paths:
+    components = path.split("/")
+    ancestors = {
+        "/".join(components[:index]) + "/"
+        for index in range(1, len(components))
+    }
+    if path not in root_set and not ancestors.intersection(root_set):
+        roots.append(path)
+        root_set.add(path)
 
 def snapshot(path):
     metadata = os.lstat(path)
@@ -1734,7 +2441,11 @@ with open(os.path.join(capture, "untracked.txt"), "w", encoding="utf-8") as stre
 with open(os.path.join(capture, "untracked-manifest.json"), "w", encoding="utf-8") as stream:
     json.dump(manifest, stream, indent=2, ensure_ascii=False)
     stream.write("\n")
+with open(os.path.join(capture, "untracked-roots.paths"), "wb") as stream:
+    for path in roots:
+        stream.write(path.encode("utf-8", "surrogateescape") + b"\0")
 PY
+  rm -f "$all_untracked" "$root_candidates"
   capture_preserved_tracked_snapshot "$capture_dir" || return 1
   verify_preserved_tracked_capture "$capture_dir" || return 1
   : > "$capture_dir/capture-complete"
@@ -1947,7 +2658,7 @@ clean_preserved_worktree_scratch() {
 }
 
 prepare_preserved_worktree_scratch_locked() {
-  local dirty_raw dirty
+  local handoff=${1:-} dirty_raw dirty
   validate_teardown_target_identity || return 1
   [ "$TREEHOUSE_TARGET_ALREADY_RETURNED" -eq 0 ] || {
     echo "REFUSED: --preserve-scratch cannot mutate an already-returned Treehouse worktree." >&2
@@ -1958,8 +2669,11 @@ prepare_preserved_worktree_scratch_locked() {
     echo "REFUSED: cannot inspect worktree $WT before scratch preservation." >&2
     return 1
   }
-  dirty=$(printf '%s\n' "$dirty_raw" | first_actionable_dirty_status || true)
-  [ -n "$dirty" ] || return 0
+  dirty=$(printf '%s\n' "$dirty_raw" | first_actionable_dirty_status 1 || true)
+  if [ -z "$dirty" ]; then
+    [ -z "$handoff" ] || : > "$handoff"
+    return 0
+  fi
   validate_worktree_committed_landing || return 1
   PRESERVED_SCRATCH_CAPTURE=
   capture_worktree_scratch || {
@@ -1976,12 +2690,26 @@ prepare_preserved_worktree_scratch_locked() {
     echo "Scratch capture: $PRESERVED_SCRATCH_CAPTURE" >&2
     return 1
   }
+  [ -z "$handoff" ] \
+    || printf '%s\n' "$PRESERVED_SCRATCH_CAPTURE" > "$handoff" \
+    || return 1
   echo "teardown: preserved worktree scratch at $PRESERVED_SCRATCH_CAPTURE"
 }
 
 prepare_preserved_worktree_scratch() {
-  fm_checkout_lock_run \
-    "$WT" "$CHECKOUT_LOCK_ROOT" prepare_preserved_worktree_scratch_locked
+  local handoff status
+  handoff=$(mktemp "$STATE/.${ID}.preserved-scratch.XXXXXX") || return 1
+  if fm_checkout_lock_run \
+    "$WT" "$CHECKOUT_LOCK_ROOT" prepare_preserved_worktree_scratch_locked "$handoff"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$status" -eq 0 ] && [ -s "$handoff" ]; then
+    IFS= read -r PRESERVED_SCRATCH_CAPTURE < "$handoff" || status=1
+  fi
+  rm -f "$handoff" || status=1
+  return "$status"
 }
 
 validate_child_worktree_landed_state() {
@@ -4448,7 +5176,7 @@ EOF
       fi
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id"
-    rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token"
+    rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.provision.log"
     [ -z "$child_account_lock" ] || fm_account_lifecycle_lock_release "$child_account_lock" >/dev/null 2>&1 || true
   done <<EOF
 $child_metas
@@ -4583,7 +5311,7 @@ if [ "$ORCA_CLEANUP_PENDING" = 1 ]; then
   remove_grok_turnend_auth "$STATE" "$ID"
   fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
   safe_remove_task_tmp "$TASK_TMP" || exit 1
-  rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
+  rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log"
   [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
   ACCOUNT_DELETE_LOCK=
   echo "teardown $ID complete (Orca cleanup quarantine cleared)"
@@ -4635,13 +5363,52 @@ if [ "$KIND" = scout ] && [ "$SPAWN_NEVER_LAUNCHED" != 1 ]; then
     echo "The report is the work product. Have the crewmate write it, then retry teardown." >&2
     exit 1
   fi
+  SCOUT_SCRATCH_RELEASABLE=1
 fi
 
-[ "$KIND" = secondmate ] || validate_teardown_target_identity || exit 1
+if [ "$KIND" != secondmate ]; then
+  if validate_teardown_target_identity; then
+    :
+  else
+    identity_status=$?
+    [ "$REAP_DEAD" -eq 1 ] && exit "$identity_status"
+    exit 1
+  fi
+fi
 
 PROBE_HOME=
 ENDPOINT_HOME=$(fm_backend_endpoint_home "$BACKEND" "$KIND" "$FM_HOME" "$HOME_PATH")
 [ "$ENDPOINT_HOME" = "$FM_HOME" ] || PROBE_HOME=$ENDPOINT_HOME
+
+require_reap_endpoint_absent() {
+  local endpoint_status scoped_target
+  if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ "$DIRECT_SPAWN_ENDPOINT" = not-created ]; then
+    return 0
+  fi
+  scoped_target=$(meta_value "$META" tmux_session_target)
+  if managed_endpoint_is_gone "$BACKEND" "$T" "fm-$ID" "$PROBE_HOME" "$scoped_target"; then
+    return 0
+  else
+    endpoint_status=$?
+  fi
+  if [ "$endpoint_status" -eq 2 ]; then
+    echo "REFUSED: dead-task reaping cannot prove the endpoint absent for $ID." >&2
+  else
+    echo "REFUSED: dead-task reaping found a live endpoint for $ID." >&2
+  fi
+  return 1
+}
+
+REPORT_PUBLISHED=0
+publish_completion_report_if_required() {
+  [ "$REPORT_GATED" = 1 ] && [ "$SPAWN_NEVER_LAUNCHED" != 1 ] || return 0
+  if [ "$MANAGED_ACCOUNT" = 1 ]; then
+    reconcile_managed_account_rollback "$META" "$ID" "$DATA" || return $?
+  fi
+  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
+    "$SCRIPT_DIR/fm-report-stack.mjs" publish "$ID" || return 1
+  REPORT_PUBLISHED=1
+}
 
 quiesce_task_endpoint() {
   local endpoint_status zellij_tab scoped_target
@@ -4728,7 +5495,18 @@ post_quiescence_safety_refusal() {
   echo "The task endpoint has already been shut down; the worktree and task metadata are preserved for a safe retry." >&2
 }
 
-if [ "$DIRECT_SPAWN_CLEANUP" = pending ]; then
+if [ "$REAP_DEAD" -eq 1 ]; then
+  [ "$BACKEND" != orca ] || {
+    echo "error: --reap-dead does not support Orca worktrees" >&2
+    exit 2
+  }
+  require_reap_endpoint_absent || exit "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  validate_teardown_target_identity || exit $?
+  # Publication is non-destructive and owns a globally contended lock.
+  # Join that queue before the slower landing proof, then still require every
+  # ordinary and reaper-specific safety proof before releasing the lease.
+  publish_completion_report_if_required || exit $?
+elif [ "$DIRECT_SPAWN_CLEANUP" = pending ]; then
   if [ "$DIRECT_SPAWN_ENDPOINT" != not-created ]; then
     quiesce_retained_direct_spawn_endpoint || exit 1
   fi
@@ -4762,15 +5540,32 @@ if [ "$PRESERVE_SCRATCH" -eq 1 ] && [ -d "$WT" ]; then
 fi
 
 if [ -d "$WT" ]; then
-  if validate_worktree_teardown_safety; then
+  if [ "$REAP_DEAD" -eq 1 ]; then
+    safety_command=validate_reap_worktree_safety
+  else
+    safety_command=validate_worktree_teardown_safety
+  fi
+  if "$safety_command"; then
     :
   else
     safety_rc=$?
     if [ "$safety_rc" -eq "$TEARDOWN_WORKTREE_SAFETY_LOCK_BLOCKED" ]; then
-      cleanup_stale_lock_for_safety_check "$WT" || { post_quiescence_safety_refusal; exit 1; }
-      validate_worktree_teardown_safety || { post_quiescence_safety_refusal; exit 1; }
+      if cleanup_stale_lock_for_safety_check "$WT"; then
+        :
+      else
+        safety_rc=$?
+        post_quiescence_safety_refusal
+        [ "$REAP_DEAD" -eq 1 ] && exit "$safety_rc"
+        exit 1
+      fi
+      "$safety_command" || {
+        post_quiescence_safety_refusal
+        [ "$REAP_DEAD" -eq 1 ] && exit "$TEARDOWN_REAP_SAFETY_REFUSAL"
+        exit 1
+      }
     else
       post_quiescence_safety_refusal
+      [ "$REAP_DEAD" -eq 1 ] && exit "$safety_rc"
       exit 1
     fi
   fi
@@ -4778,12 +5573,8 @@ fi
 
 # Report-gated tasks restore any pending rollback generation and fail closed on
 # their machine-global completion report before lease release or worktree removal.
-if [ "$REPORT_GATED" = 1 ] && [ "$SPAWN_NEVER_LAUNCHED" != 1 ]; then
-  if [ "$MANAGED_ACCOUNT" = 1 ]; then
-    reconcile_managed_account_rollback "$META" "$ID" "$DATA" || exit $?
-  fi
-  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
-    "$FM_ROOT/bin/fm-report-stack.mjs" publish "$ID" || exit 1
+if [ "$REPORT_PUBLISHED" -ne 1 ]; then
+  publish_completion_report_if_required || exit $?
 fi
 
 if [ "$MANAGED_ACCOUNT" = 1 ]; then
@@ -4794,7 +5585,15 @@ if [ "$KIND" = secondmate ] && [ "$FORCE" = "--force" ]; then
   cleanup_firstmate_home_children "$HOME_PATH" || exit $?
 fi
 
-[ "$KIND" = secondmate ] || validate_teardown_target_identity || exit 1
+if [ "$KIND" != secondmate ]; then
+  if validate_teardown_target_identity; then
+    :
+  else
+    identity_status=$?
+    [ "$REAP_DEAD" -eq 1 ] && exit "$identity_status"
+    exit 1
+  fi
+fi
 
 remove_orca_worktree_locked() {
   local branch=HEAD boundary_token
@@ -4830,6 +5629,104 @@ validate_returned_worktree_bookkeeping_locked() {
   }
 }
 
+validate_reap_return_safety() {
+  validate_reap_worktree_safety_and_summarize_ignored || return $?
+  require_reap_endpoint_absent || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+  validate_reap_open_pr_absent || return "$TEARDOWN_REAP_SAFETY_REFUSAL"
+}
+
+reap_github_repo_for_worktree() {
+  local url rest owner repo
+  url=$(git -C "$WT" remote get-url origin 2>/dev/null) || return 1
+  case "$url" in
+    https://github.com/*) rest=${url#https://github.com/} ;;
+    git@github.com:*) rest=${url#git@github.com:} ;;
+    ssh://git@github.com/*) rest=${url#ssh://git@github.com/} ;;
+    *) return 1 ;;
+  esac
+  rest=${rest%.git}
+  owner=${rest%%/*}
+  repo=${rest#*/}
+  [ -n "$owner" ] && [ -n "$repo" ] && [ "$repo" != "$rest" ] \
+    && [ "${repo#*/}" = "$repo" ] || return 1
+  printf '%s/%s' "$owner" "$repo"
+}
+
+validate_reap_open_pr_absent() {
+  local out status state branch recorded_ref count repo seen='|'
+  command -v gh-axi >/dev/null 2>&1 || {
+    echo "REFUSED: dead-task reaping cannot recheck open PRs under the checkout lock." >&2
+    return 1
+  }
+  repo=$(reap_github_repo_for_worktree) || {
+    echo "REFUSED: dead-task reaping cannot resolve the worktree GitHub repository under the checkout lock." >&2
+    return 1
+  }
+  if [ -n "$PR_URL" ]; then
+    if fm_run_bounded_capture --combine-stderr out 10 \
+        gh-axi pr view "$PR_URL" --repo "$repo"; then
+      status=0
+    else
+      status=$?
+    fi
+    if [ "$status" -ne 0 ] || ! fm_process_tree_cleanup_verified; then
+      echo "REFUSED: dead-task reaping cannot prove recorded PR state under the checkout lock: $PR_URL" >&2
+      return 1
+    fi
+    state=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*state:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)
+    case "$state" in
+      merged|closed) ;;
+      open)
+        echo "REFUSED: dead-task reaping found an open recorded PR under the checkout lock: $PR_URL" >&2
+        return 1
+        ;;
+      *)
+        echo "REFUSED: dead-task reaping cannot prove recorded PR state under the checkout lock: $PR_URL" >&2
+        return 1
+        ;;
+    esac
+  fi
+
+  recorded_ref=$(meta_value "$META" worktree_git_ref)
+  case "$recorded_ref" in refs/heads/*) recorded_ref=${recorded_ref#refs/heads/} ;; *) recorded_ref= ;; esac
+  for branch in "$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null)" "$recorded_ref"; do
+    [ -n "$branch" ] || continue
+    case "$seen" in *"|$branch|"*) continue ;; esac
+    seen="$seen$branch|"
+    if fm_run_bounded_capture --combine-stderr out 10 \
+        gh-axi pr list --repo "$repo" --state open --head "$branch" --limit 2 --fields url; then
+      status=0
+    else
+      status=$?
+    fi
+    if [ "$status" -ne 0 ] || ! fm_process_tree_cleanup_verified; then
+      echo "REFUSED: dead-task reaping cannot prove branch PR state under the checkout lock: $branch" >&2
+      return 1
+    fi
+    count=$(printf '%s\n' "$out" | sed -n 's/^count:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
+    case "$count" in
+      0) ;;
+      ''|*[!0-9]*)
+        echo "REFUSED: dead-task reaping cannot prove branch PR state under the checkout lock: $branch" >&2
+        return 1
+        ;;
+      *)
+        echo "REFUSED: dead-task reaping found an open PR under the checkout lock: branch=$branch" >&2
+        return 1
+        ;;
+    esac
+  done
+  [ "$seen" != '|' ] || {
+    echo "REFUSED: dead-task reaping cannot identify a branch for the final open-PR proof." >&2
+    return 1
+  }
+}
+
+validate_reap_worktree_safety_and_summarize_ignored() {
+  validate_reap_worktree_safety || return $?
+  validate_reap_ignored_worktree_paths
+}
+
 if [ "$BACKEND" = orca ] && [ "$KIND" != secondmate ]; then
   if [ "$ORCA_PATH_MATCH_VERIFIED" != 1 ]; then
     require_orca_worktree_path_match_if_present "$ORCA_WORKTREE_ID" "$WT" || exit 1
@@ -4848,11 +5745,24 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
     # directory, so run it from the project.
     # teardown_treehouse_return tolerates transient and stale git locks left by
     # a killed crewmate process; see the script header for the retry proof.
-    post_lock_cleanup_check=validate_worktree_teardown_safety_and_summarize_ignored
-    teardown_treehouse_return "$WT" "$PROJ" "worktree" "firstmate-$ID" "$post_lock_cleanup_check" cleanup_returned_worktree || {
+    if [ "$REAP_DEAD" -eq 1 ]; then
+      post_lock_cleanup_check=validate_reap_return_safety
+      treehouse_return_mode=--safe
+    else
+      post_lock_cleanup_check=validate_worktree_teardown_safety_and_summarize_ignored
+      treehouse_return_mode=--force
+    fi
+    if teardown_treehouse_return "$WT" "$PROJ" "worktree" "firstmate-$ID" "$post_lock_cleanup_check" cleanup_returned_worktree "$treehouse_return_mode"; then
+      :
+    else
+      treehouse_return_status=$?
       echo "error: treehouse return failed for worktree $WT; teardown aborted" >&2
+      if [ "$REAP_DEAD" -eq 1 ] \
+          && [ "$treehouse_return_status" -eq "$TEARDOWN_REAP_SAFETY_REFUSAL" ]; then
+        exit "$TEARDOWN_REAP_SAFETY_REFUSAL"
+      fi
       exit 1
-    }
+    fi
   fi
 fi
 
@@ -4930,7 +5840,7 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the exact recorded per-generation task temp root, including gotmp.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -z "$TASK_TMP" ] || safe_remove_task_tmp "$TASK_TMP" || exit 1
-rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token"
+rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log"
 [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true

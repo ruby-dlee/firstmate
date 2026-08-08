@@ -16,6 +16,7 @@
 # stable, parseable, token-tight line firstmate can read every heartbeat:
 #
 #   state: <working|parked|done|stale|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
+#   ... · liveness: <alive|unknown> · step: <name>
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
@@ -67,8 +68,12 @@ ID=${1:-}
 
 META="$STATE/$ID.meta"
 LOG="$STATE/$ID.status"
-NM_TIMEOUT=${FM_CREW_STATE_NM_TIMEOUT:-10}
-case "$NM_TIMEOUT" in ''|*[!0-9]*) NM_TIMEOUT=10 ;; esac
+NM_TIMEOUT=${FM_CREW_STATE_NM_TIMEOUT:-20}
+case "$NM_TIMEOUT" in
+  ''|*[!0-9]*) NM_TIMEOUT=20 ;;
+  *) case "$NM_TIMEOUT" in *[1-9]*) ;; *) NM_TIMEOUT=20 ;; esac ;;
+esac
+NM_LIVENESS_BIN=${FM_CREW_STATE_NM_LIVENESS_BIN:-$SCRIPT_DIR/fm-nm-step-liveness.sh}
 GH_TIMEOUT=${FM_CREW_STATE_GH_TIMEOUT:-10}
 case "$GH_TIMEOUT" in
   ''|*[!0-9]*) GH_TIMEOUT=10 ;;
@@ -513,6 +518,137 @@ nm_ci_checks_state() {
 # is a run for THIS branch active right now. Echoes the first (most recent)
 # matching row's status word (running/completed/cancelled/failed), or empty
 # when the branch has no run within FM_CREW_STATE_RUNS_LIMIT rows.
+# True when `axi status` renders the active step as quiet. A configured shell
+# command step (commands.test / commands.lint) ALWAYS renders quiet for its whole
+# duration, because no-mistakes flushes that step's log only when the step ends
+# (2026-08-02 incident; docs/postmortems/nm-quiet-test-step.md). So quiet here is
+# a prompt to check real liveness, never on its own evidence that anything died.
+nm_step_is_quiet() {
+  printf '%s\n' "$RUN_OUT" | grep -qE 'quiet[[:space:]]+[0-9]'
+}
+
+# Name of the step in the active_steps table, e.g. `test`. Empty when absent.
+nm_active_step_name() {
+  local row
+  row=$(printf '%s\n' "$RUN_OUT" | sed -n '/^[[:space:]]*active_steps\[/,$p' | sed -n '2p')
+  row=$(trim "$row")
+  [ -n "$row" ] || return 0
+  strip_quotes "$(trim "${row%%,*}")"
+}
+
+# One-line liveness verdict for the active step's own processes. A one-second
+# in-invocation membership sample lets this one-shot caller establish child
+# turnover without paying the 20-second window CPU rates require. Stable process
+# membership falls back to the probe's preserved long-window CPU baseline. This
+# consumer accepts only alive or unknown. A missing, failed, empty, malformed,
+# or legacy dead verdict is unknown, never silence and never evidence of death.
+nm_step_liveness() {
+  local run_id out status=0 verdict procs doing grade detail detail_fields line rest reported_run structured_detail
+  run_id=$(strip_quotes "$(nm_field id)")
+  [ -n "$run_id" ] || { printf 'unknown (probe unreadable: run id unavailable)'; return; }
+  [ -x "$NM_LIVENESS_BIN" ] || { printf 'unknown (probe unreadable: executable unavailable)'; return; }
+  case "$HAVE_TIMEOUT" in
+    timeout)  out=$(timeout "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 1 2>/dev/null) || status=$? ;;
+    gtimeout) out=$(gtimeout "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 1 2>/dev/null) || status=$? ;;
+    # Same bounded perl fallback nm_run already uses. Without this case, a host
+    # with neither timeout nor gtimeout - the ordinary macOS default, including
+    # this one - fell through to an UNBOUNDED probe call, so a slow lsof or
+    # process scan could block the supervision read for as long as it took.
+    perl)     out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
+                  "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 1 2>/dev/null) || status=$? ;;
+    *)        printf 'unknown (probe unreadable: no bounded runner available)'; return ;;
+  esac
+  case "$status" in
+    0) ;;
+    124) printf 'unknown (probe timed out after %ss)' "$NM_TIMEOUT"; return ;;
+    *) printf 'unknown (probe unreadable: exited %s)' "$status"; return ;;
+  esac
+  [ -n "$out" ] || { printf 'unknown (probe unreadable: empty result)'; return; }
+  # Compact the probe's own line to `<verdict> (<n> procs) on <unit> (<age>)`.
+  # This rides on every heartbeat read, so it stays token-tight - but the unit of
+  # work and its age are the two fields that separate SLOW from HUNG, and this
+  # line is the read firstmate actually makes. Omitting them would leave the
+  # follow-up question ("alive, but stuck on the same script for three hours?")
+  # needing a second command on every heartbeat.
+  # `doing:` is unstructured, truncated argv. Parse every structured field only
+  # from the prefix before it: argv may legitimately contain strings such as
+  # `procs:` or `grade:`, which must not override the fields they describe.
+  case "$out" in
+    *$'\n'*) printf 'unknown (probe protocol unreadable: multiline result)'; return ;;
+  esac
+  detail_fields=${out%%"$SEP"doing: *}
+  case "$detail_fields" in
+    liveness:\ *) ;;
+    *) printf 'unknown (probe protocol unreadable: verdict missing or invalid)'; return ;;
+  esac
+  rest=${detail_fields#liveness: }
+  case "$rest" in
+    *"$SEP"*) verdict=${rest%%"$SEP"*}; rest=${rest#*"$SEP"} ;;
+    *) printf 'unknown (probe protocol unreadable: structured prefix invalid)'; return ;;
+  esac
+  case "$rest" in
+    run:\ *) reported_run=${rest#run: } ;;
+    *) printf 'unknown (probe protocol unreadable: structured prefix invalid)'; return ;;
+  esac
+  case "$reported_run" in
+    *"$SEP"*) rest=${reported_run#*"$SEP"}; reported_run=${reported_run%%"$SEP"*} ;;
+    *) printf 'unknown (probe protocol unreadable: structured prefix invalid)'; return ;;
+  esac
+  [ "$reported_run" = "$run_id" ] \
+    || { printf 'unknown (probe protocol unreadable: run identity mismatch)'; return; }
+  case "$rest" in
+    procs:\ *) rest=${rest#procs: } ;;
+    *) printf 'unknown (probe protocol unreadable: structured prefix invalid)'; return ;;
+  esac
+  case "$rest" in
+    *"$SEP"*) procs=${rest%%"$SEP"*}; structured_detail=${rest#*"$SEP"} ;;
+    *) procs=$rest; structured_detail="" ;;
+  esac
+  grade=""
+  case "$structured_detail" in
+    grade:\ *) grade=${structured_detail#grade: }; grade=${grade%%"$SEP"*} ;;
+  esac
+  case "$verdict" in
+    alive|unknown) ;;
+    dead) verdict=unknown; [ -n "$grade" ] || grade=absent ;;
+    *) printf 'unknown (probe protocol unreadable: verdict missing or invalid)'; return ;;
+  esac
+  case "$procs" in
+    ''|*[!0-9]*)
+      printf 'unknown (probe protocol unreadable: numeric process count missing or invalid)'
+      return
+      ;;
+  esac
+  case "$verdict" in
+    alive)
+      case "$procs" in
+        *[1-9]*) ;;
+        *) printf 'unknown (probe protocol unreadable: alive verdict requires processes)'; return ;;
+      esac
+      ;;
+  esac
+  # `doing: <argv> (<etime>)` is the probe's last field when it could name one.
+  # The probe already truncates argv, so take it verbatim rather than re-parsing
+  # a command line whose shape varies by whatever the step happens to be running.
+  doing=${out##*doing: }
+  [ "$doing" = "$out" ] && doing=""
+  line="$verdict ($procs procs)"
+  if [ "$verdict" = unknown ]; then
+    case "$grade" in
+      unreadable|present-unproven|present-no-progress|transition) ;;
+      '') grade=ungraded ;;
+      *) grade=unreadable ;;
+    esac
+    detail=${detail_fields##*"$SEP"}
+    case "$detail" in
+      "$detail_fields"|grade:*) detail="probe reported unknown" ;;
+    esac
+    line="unknown (grade: $grade; $procs procs; $detail)"
+  fi
+  [ -n "$doing" ] && line="$line on $doing"
+  printf '%s' "$line"
+}
+
 nm_runs_status_for_branch() {  # <branch>
   local branch=$1 out row st rest br head pr field
   out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
@@ -688,6 +824,23 @@ if [ "$HAVE_RUN" = 1 ]; then
       verify_no_newer_active_run_or_emit "$CREW_BRANCH"
     fi
     verify_ready_head_or_emit "$RUN_ID" "$RUN_HEAD" "$RUN_PR"
+  fi
+
+  # A quiet working step is the exact reading that made firstmate abort two
+  # healthy runs on 2026-08-02, so attach affirmative BUSY evidence when it
+  # exists and UNKNOWN otherwise. The observation never overrides RUN_STATE and
+  # process absence can never become death. The ci step is excluded because its
+  # monitoring runs inside the daemon with no worktree process at all.
+  if [ "$RUN_STATE" = working ] && [ "$RUN_SOURCE" = full ] && nm_step_is_quiet; then
+    ACTIVE_STEP=$(nm_active_step_name)
+    case "$ACTIVE_STEP" in
+      ci) ;;
+      '') RUN_DETAIL="$RUN_DETAIL${SEP}liveness: unknown (probe unreadable: active step unavailable)${SEP}step: unknown" ;;
+      *)
+        LIVENESS=$(nm_step_liveness)
+        RUN_DETAIL="$RUN_DETAIL${SEP}liveness: $LIVENESS${SEP}step: $ACTIVE_STEP"
+        ;;
+    esac
   fi
 
   if [ "$RUN_STATE" = working ] && log_reports_ci_ready; then

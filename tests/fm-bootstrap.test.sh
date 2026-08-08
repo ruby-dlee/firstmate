@@ -24,6 +24,8 @@ export FM_ORCA_TEST_AUTHORITY_CAPABILITIES=verified-v1
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 fm_test_tmproot_into TMP_ROOT fm-bootstrap-tests
 export FM_BACKEND_CMUX_BUNDLE_BIN="$TMP_ROOT/no-bundled-cmux"
+export FM_TREEHOUSE_ROOT="$TMP_ROOT/treehouse-pools"
+mkdir -p "$FM_TREEHOUSE_ROOT"
 
 # Hermetic runtime-backend detection. These cases pin the backend per-home via
 # config/backend; the dev shell's explicit FM_BACKEND and ambient runtime
@@ -258,9 +260,23 @@ test_bootstrap_reporting() {
       esac
       add_tasks_axi "$fakebin" "$tasks" "$archive_body" "$multi_id"
     fi
-    if [ "$quota" = "0" ]; then
-      rm -f "$fakebin/quota-axi"
-    fi
+    # quota column: 0 removes quota-axi, 1 keeps the version-silent stub (its
+    # version is unknowable, which must stay silent), and a dotted version makes
+    # the stub report exactly that version so the outdated notice can be pinned.
+    case "$quota" in
+      0)
+        rm -f "$fakebin/quota-axi"
+        ;;
+      1) ;;
+      *)
+        cat > "$fakebin/quota-axi" <<SH
+#!/usr/bin/env bash
+[ "\${1:-}" = --version ] && { printf '%s\n' "$quota"; exit 0; }
+exit 0
+SH
+        chmod +x "$fakebin/quota-axi"
+        ;;
+    esac
     # FM_ROOT_OVERRIDE points the worktree-tangle check at the non-git home dir so
     # it stays inert: this suite pins tool detection, not the tangle guard, and the
     # ambient checkout (CI runs on a feature branch) must not leak a TANGLE line in.
@@ -287,6 +303,10 @@ incompatible tasks-axi is required by default^1^0.1.0^1^-^exact^MISSING: tasks-a
 tasks-axi without archive-body is required by default^1^0.1.2:noarchive^1^-^exact^MISSING: tasks-axi (install: npm install -g tasks-axi)^
 tasks-axi without multi-id mv is required by default^1^0.2.2:nomulti^1^-^exact^MISSING: tasks-axi (install: npm install -g tasks-axi)^
 missing quota-axi is required by default^1^0.1.1^0^manual^exact^MISSING: quota-axi (install: npm install -g quota-axi)^
+quota-axi with an unreadable version stays silent rather than guessing it is old^1^0.1.1^1^manual^empty^^
+outdated quota-axi is reported as degraded routing, never as a blocking install^1^0.1.1^0.1.5^manual^exact^ACCOUNT_ROUTING: quota-axi 0.1.5 ignores CLAUDE_CONFIG_DIR, so per-account Claude quota reads one shared identity; account selection still rotates but cannot skip an exhausted account. Upgrade to 0.1.19+ with: npm install -g quota-axi^
+quota-axi at the floor is silent^1^0.1.1^0.1.19^manual^empty^^
+quota-axi above the floor is silent^1^0.1.1^0.2.0^manual^empty^^
 manual backlog backend still requires missing tasks-axi^1^-^1^manual^exact^MISSING: tasks-axi (install: npm install -g tasks-axi)^
 manual backlog backend suppresses tasks-axi availability^1^0.1.1^1^manual^empty^^
 ROWS
@@ -1000,9 +1020,81 @@ SH
   chmod +x "$fakebin/lavish-axi"
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
     FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "MISSING: lavish-axi" \
+    "bootstrap accepted Lavish 1.1 without the captain-item check"
+
+  cat > "$fakebin/lavish-axi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' 'lavish-axi 1.2.0 (store-forward protocol 1)'
+fi
+exit 0
+SH
+  chmod +x "$fakebin/lavish-axi"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" "MISSING: lavish-axi" \
+    "bootstrap accepted a stale Lavish 1.2 without annotation mode"
+
+  cat > "$fakebin/lavish-axi" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' 'lavish-axi 1.3.0 (store-forward protocol 1)'
+fi
+exit 0
+SH
+  chmod +x "$fakebin/lavish-axi"
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" FM_ROOT_OVERRIDE="$case_dir/home" \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 "$ROOT/bin/fm-bootstrap.sh")
   assert_not_contains "$out" "MISSING: lavish-axi" \
-    "bootstrap rejected destination-aware Lavish 1.1"
-  pass "bootstrap requires the destination-aware Lavish fork"
+    "bootstrap rejected annotation-aware Lavish 1.3"
+  pass "bootstrap requires the annotation-aware Lavish fork"
+}
+
+test_bootstrap_surfaces_low_treehouse_capacity_read_only() {
+  local case_dir fakebin pool out
+  case_dir="$TMP_ROOT/treehouse-capacity"
+  pool="$case_dir/pools/demo"
+  mkdir -p "$case_dir/home/config" "$pool"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fm_git_init_commit "$pool/1/wt"
+  fm_git_init_commit "$pool/2/wt"
+  printf '%s\n' dirty > "$pool/2/wt/operator-note.txt"
+  python3 - "$pool/treehouse-state.json" "$pool" <<'PY'
+import json
+import os
+import sys
+
+state, pool = sys.argv[1:]
+entries = [
+    {"name": "1", "path": os.path.join(pool, "1", "wt")},
+    {"name": "2", "path": os.path.join(pool, "2", "wt")},
+    {
+        "name": "3",
+        "path": os.path.join(pool, "3", "wt"),
+        "leased": True,
+        "lease_holder": "firstmate-a",
+    },
+    {
+        "name": "4",
+        "path": os.path.join(pool, "4", "wt"),
+        "leased": True,
+        "lease_holder": "firstmate-b",
+    },
+]
+with open(state, "w", encoding="utf-8") as stream:
+    json.dump({"worktrees": entries}, stream)
+PY
+  fakebin=$(make_fake_toolchain "$case_dir")
+
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" \
+    FM_ROOT_OVERRIDE="$case_dir/home" FM_TREEHOUSE_ROOT="$case_dir/pools" \
+    FM_BOOTSTRAP_DETECT_ONLY=1 FM_FAKE_TREEHOUSE_LEASE_HELP=1 \
+    "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" \
+    "TREEHOUSE_CAPACITY: LOW pool=$pool available=1 total=4 leased=2 dirty=1 invalid=0 threshold=2 threshold_percent=50" \
+    "bootstrap did not surface low Treehouse capacity during read-only detection"
+  pass "bootstrap reports low Treehouse capacity before spawn pressure becomes a failure"
 }
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-22 ]; then
@@ -1027,6 +1119,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-40 ]; then
   test_perl_is_a_universal_process_control_dependency
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = treehouse-capacity ]; then
+  test_bootstrap_surfaces_low_treehouse_capacity_read_only
   exit 0
 fi
 
@@ -1055,3 +1152,4 @@ test_agent_fleet_install_requires_manual_release
 test_invalid_account_routing_policy_is_reported
 test_enforced_dispatch_validation_rejects_poolless_quota_rules
 test_lavish_requires_store_forward_fork
+test_bootstrap_surfaces_low_treehouse_capacity_read_only

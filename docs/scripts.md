@@ -8,7 +8,8 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | Script                   | Purpose                                                                              |
 | ------------------------ | ------------------------------------------------------------------------------------ |
 | `fm-session-start.sh`    | Compose lock, bootstrap, and wake drain into the single ordered session-start digest |
-| `fm-autocompact.sh`      | Bridge Claude context compaction through a durable anchor and session-start recovery |
+| `fm-autocompact.sh`      | Bridge Claude context compaction through deterministic state, bounded judgment capture, and session-start recovery |
+| `fm-autocompact-judgment.py` | Extract transcript judgment and publish validated private-memory or backlog edits safely |
 | `fm-bootstrap.sh`        | Detect toolchain and fleet problems, run the locked session-start sweeps, and install approved tools |
 | `fm-checkout-refresh.sh` | Discover worktree seed checkouts, react to live upstream-default changes, surface untracked skill drafts, enforce the timed backstop, and manage the home-scoped scheduler |
 | `fm-fleet-sync.sh`       | Serialize live-default-proven project refreshes with safe fast-forwards, `STUCK:` reports, branch pruning, and orphaned-lock recovery |
@@ -62,15 +63,17 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-supervise-daemon.sh` | Presence-gated away-mode sub-supervisor: self-handle routine wakes, complete native tasks or inject compatibility digests |
 | `fm-crew-state.sh`       | Print one deterministic current-state line for a crewmate                            |
 | `fm-no-mistakes-reattach.sh` | Retry one home-scoped existing run after its transient reconciliation timeout    |
+| `fm-nm-step-liveness.sh` | Read a no-mistakes step's processes as alive, dead, or graded unknown                |
 | `fm-tangle-lib.sh`       | Shared default-branch resolution and primary-checkout tangle classification          |
 | `fm-supervision-lib.sh`  | Shared in-flight-work-without-fresh-watcher-beacon predicate                         |
 | `fm-ff-lib.sh`           | Shared guarded fast-forward helper for origin pulls and local secondmate syncs       |
 | `fm-lock-lib.sh`         | Shared "is this git lock provably abandoned?" proof used by teardown and fleet-sync   |
 | `fm-checkout-lock-lib.sh` | Shared common-Git-directory lock identity and ownership for checkout mutation       |
 | `fm-process-tree-lib.sh` | Shared bounded command runner that terminates and reaps complete process trees         |
+| `fm_bounded_io.py`      | Shared Python bounds for process trees, aggregate output, JSON artifacts, and item batches |
 | `fm-config-inherit-lib.sh` | Shared primary-to-secondmate inheritable-config propagation                        |
 | `fm-tasks-axi-lib.sh`    | Shared backlog-backend selector and `tasks-axi` compatibility probe                  |
-| `fm-lavish-board.sh`     | Open a self-contained decision board and arm its profile-first bounded submission check |
+| `fm-lavish-board.sh`     | Open a self-contained decision or annotation board and arm its profile-first bounded submission check |
 | `fm-lavish-intake.sh`    | Invoke compatible store-and-forward Lavish intake at an existing turn boundary       |
 | `fm-lavish-queue.sh`     | Queue redundant visible delivery only to a session-lock-proven home-bound supervisor |
 | `fm-lavish-version-lib.sh` | Shared Lavish store-forward minimum-version compatibility check                    |
@@ -85,9 +88,12 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-host-pressure.sh`    | Record contemporaneous uptime and vm_stat evidence before a host-sensitive diagnosis |
 | `fm-tmux-lib.sh`         | Shared tmux pane primitives for busy detection, composer capture, and verified submit |
 | `fm-peek.sh`             | Print a bounded tail of a crewmate endpoint                                          |
-| `fm-pr-check.sh`         | Record `pr=` and exact `pr_head=` without arming merge execution or replacing task checks |
-| `fm-pr-admit.sh`         | Snapshot five settled properties on one unchanged PR head without merge authority   |
-| `fm-pr-merge.sh`         | Preflight one exact PR head and refuse until atomic server and worktree custody exists |
+| `fm-github-pr.py`        | Adapt observed gh-axi TOON PR reads through a fail-closed read-only CLI               |
+| `fm-crosscheck.sh`       | Run, verify, or atomically merge through the durable exact-head PR finding ledger     |
+| `fm-crosscheck.py`       | Validate and execute crosscheck reviewer evidence and finding lifecycle transitions  |
+| `fm-pr-check.sh`         | Record exact PR metadata without arming merge execution or replacing task checks      |
+| `fm-pr-admit.sh`         | Require four settled native properties on one unchanged exact PR head                 |
+| `fm-pr-merge.sh`         | Combine exact-head admission and independent crosscheck, then refuse before merge arming |
 | `fm-promote.sh`          | Promote a scout task in place to a protected ship task                               |
 | `fm-report-contract-lib.sh` | Render the shared ship completion-report contract inserted into briefs and continuation prompts |
 | `fm-report-stack.mjs`    | Publish and browse machine-global, account-independent completion reports            |

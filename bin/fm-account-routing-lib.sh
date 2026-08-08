@@ -1753,6 +1753,7 @@ fm_account_profile_home() {  # <provider> <profile>
   binary=$FM_ACCOUNT_FLEET_PINNED_BIN
   fm_account_validate_contract "$binary" || return 1
   json=$(fm_account_run_control "$binary" --format json profile list) || return 1
+  # shellcheck disable=SC2016  # jq variables are deliberately single-quoted shell input.
   home=$(printf '%s\n' "$json" | fm_account_system_exec "$FM_ACCOUNT_SYSTEM_JQ_BIN" -er \
     --arg provider "$provider" --arg profile "$profile" '
       [.profiles[]

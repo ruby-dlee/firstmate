@@ -583,6 +583,9 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
   esac
 }
 
+# An admitted implementation must bind delivery atomically to the registered
+# agent session and echo confirmed|pending|unknown|send-failed.
+# No current backend satisfies that predicate, so every production route refuses.
 fm_backend_send_steering() {  # <backend> <target> <text> [expected-label] [recorded-scoped-target]
   local backend=$1
   case "$backend" in

@@ -35,6 +35,7 @@ SPAWN="$ROOT/bin/fm-spawn.sh"
 SEND="$ROOT/bin/fm-send.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 PR_MERGE="$ROOT/bin/fm-pr-merge.sh"
+CROSSCHECK="$ROOT/bin/fm-crosscheck.sh"
 MERGE_LOCAL="$ROOT/bin/fm-merge-local.sh"
 PROMOTE="$ROOT/bin/fm-promote.sh"
 SESSION_START="$ROOT/bin/fm-session-start.sh"
@@ -310,7 +311,7 @@ test_send_refuses_and_admits() {
   home="$TMP/send-home"; mkdir -p "$home/state"
   fakebin=$(make_send_fakebin "$TMP/send-fake")
   log="$TMP/send-tmux.log"
-  fm_write_meta "$home/state/lane-ok.meta" "window=sess:fm-lane-ok" "kind=ship" "harness=codex"
+  fm_write_meta "$home/state/lane-ok.meta" "window=sess:fm-lane-ok" "kind=ship" "harness=pi"
 
   # env-marker refuse.
   : > "$log"
@@ -326,14 +327,18 @@ test_send_refuses_and_admits() {
   assert_contains "$out" "$PATH_MSG" "send: path-backstop refusal message"
   [ ! -s "$log" ] || fail "send: refused backstop send still typed to the endpoint"$'\n'"$(cat "$log")"
 
-  # no-regression.
+  # A normal caller clears this gate and then reaches the independent atomic
+  # steering refusal, which still must not type pane input.
   : > "$log"
   out=$(run_send "$NORMAL_CWD" "$home" "$fakebin" "$log" fm-lane-ok "hello captain"); rc=$?
-  expect_code 0 "$rc" "send: a normal session must still send"
+  expect_code 1 "$rc" "send: a normal session reaches backend admission"
   assert_not_contains "$out" "$ENV_MSG" "send: normal send must not print the gate refusal"
   assert_not_contains "$out" "$PATH_MSG" "send: normal send must not print the backstop refusal"
-  assert_contains "$(cat "$log")" "target=sess:fm-lane-ok literal=1 arg=hello captain" "send: normal send should type the text"
-  pass "fm-send: refuses on marker and gate-worktree backstop; a normal steer is unaffected"
+  assert_contains "$out" "atomic tmux steering verdict=send-failed" \
+    "send: normal caller did not reach backend admission"
+  assert_not_contains "$(cat "$log")" "literal=1 arg=hello captain" \
+    "send: backend refusal still typed the text"
+  pass "fm-send: gate agents refuse earlier while normal callers reach atomic backend admission"
 }
 
 # --- fm-teardown ------------------------------------------------------------
@@ -669,8 +674,9 @@ test_extended_mutating_entrypoints_refuse_gate_context() {
   stack="$TMP/extended-report-stack"
   mkdir -p "$home/state" "$home/data" "$home/projects"
 
-  for name in fleet-sync x-reply x-dismiss x-followup x-link x-poll watch watch-arm watch-checkpoint wake-drain brief ensure-agents lock review-diff supervise-daemon; do
+  for name in crosscheck fleet-sync x-reply x-dismiss x-followup x-link x-poll watch watch-arm watch-checkpoint wake-drain brief ensure-agents lock review-diff supervise-daemon; do
     case "$name" in
+      crosscheck) script=$(guarded_script "$NORMAL_CWD" "$CROSSCHECK"); set -- run task-x https://github.com/example/repo/pull/9 ;;
       fleet-sync) script=$(guarded_script "$NORMAL_CWD" "$FLEET_SYNC"); set -- --help ;;
       x-reply) script=$(guarded_script "$NORMAL_CWD" "$X_REPLY"); set -- request-x "reply" ;;
       x-dismiss) script=$(guarded_script "$NORMAL_CWD" "$X_DISMISS"); set -- request-x ;;

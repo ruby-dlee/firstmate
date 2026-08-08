@@ -37,7 +37,8 @@
 #   auto-reap: <out>       stale crashed-spawn acquisition recovery made progress
 #                          or refused and retained state for operator inspection
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
-#                          status, unless afk is active
+#                          status or a dead/unknown command-step liveness reading,
+#                          unless afk is active
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock.
@@ -125,6 +126,10 @@ ACCOUNT_SESSION_SYNC_TIMEOUT=${FM_ACCOUNT_SESSION_SYNC_TIMEOUT:-5}
 ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT=${FM_ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT:-$((ACCOUNT_SESSION_SYNC_TIMEOUT + 3))}
 REPORT_RETENTION_INTERVAL=${FM_REPORT_RETENTION_INTERVAL:-86400}
 REPORT_RETENTION_TIMEOUT=${FM_REPORT_RETENTION_TIMEOUT:-30}
+REPORT_RETENTION_OWNER_FRESH_SECS=${FM_REPORT_RETENTION_OWNER_FRESH_SECS:-660}
+case "$REPORT_RETENTION_OWNER_FRESH_SECS" in
+  ''|*[!0-9]*) REPORT_RETENTION_OWNER_FRESH_SECS=660 ;;
+esac
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -492,24 +497,38 @@ clear_pause_tracking() {  # <window>
 }
 
 pause_state_class() {  # <window> <task>
-  local win=$1 task=$2 key last recheck_file class
+  local win=$1 task=$2 key last recheck_file statusf sig class
   key=${win//:/_}
   key=${key//\//_}
   key=${key//./_}
-  last=$(last_status_line "$STATE/$task.status")
+  statusf="$STATE/$task.status"
+  last=$(last_status_line "$statusf")
   recheck_file="$STATE/.paused-rechecked-$key"
   if ! status_is_paused "$last"; then
     rm -f "$recheck_file"
     watch_absorb_class "$task"
     return
   fi
-  if [ -e "$STATE/.paused-$key" ] && [ "$(watch_age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ]; then
+  # Reuse a pause proof only while its durable status stream is byte-identical.
+  # Any append, including a newly opened decision, invalidates the cache.
+  sig=$(stat_sig "$statusf")
+  if [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ] \
+     && [ -n "$sig" ] && [ "$sig" = "$(cat "$recheck_file" 2>/dev/null || true)" ]; then
     printf 'paused'
     return
   fi
   class=$(watch_absorb_class "$task" "$last")
   case "$class" in
-    paused) date +%s > "$recheck_file" ;;
+    paused)
+      sig=$(stat_sig "$statusf")
+      if [ -z "$sig" ] || ! crew_declared_pause_absorbable "$task" "$last" \
+         || [ "$sig" != "$(stat_sig "$statusf")" ]; then
+        class=none
+        rm -f "$recheck_file"
+      else
+        printf '%s' "$sig" > "$recheck_file"
+      fi
+      ;;
     *) rm -f "$recheck_file" ;;
   esac
   printf '%s' "$class"
@@ -827,11 +846,40 @@ sync_account_sessions_if_due() {
 }
 
 prune_reports_if_due() {
-  local cadence="$STATE/.last-report-retention"
-  marker_due "$cadence" "$REPORT_RETENTION_INTERVAL" "report retention cadence" || return 0
-  if run_bounded "$REPORT_RETENTION_TIMEOUT" "$FM_ROOT/bin/fm-report-stack.mjs" prune >/dev/null 2>&1; then
-    safe_touch_marker_or_log "$cadence" "report retention cadence" || true
+  local attempt="$STATE/.last-report-retention-attempt"
+  local success="$STATE/.last-report-retention"
+  local cadence=$attempt status
+  if [ ! -e "$attempt" ] && [ ! -L "$attempt" ]; then
+    cadence=$success
   fi
+  marker_due "$cadence" "$REPORT_RETENTION_INTERVAL" "report retention cadence" || return 0
+  safe_touch_marker_or_log "$attempt" "report retention attempt cadence" || return 0
+  if report_retention_owner_is_fresh; then
+    return 0
+  fi
+  if run_bounded "$REPORT_RETENTION_TIMEOUT" "$FM_ROOT/bin/fm-report-stack.mjs" prune >/dev/null 2>&1; then
+    safe_touch_marker_or_log "$success" "report retention success" || true
+    return 0
+  else
+    status=$?
+  fi
+  triage_log "report retention fallback prune failed status=$status; next attempt remains cadenced"
+}
+
+report_retention_owner_is_fresh() {
+  local root heartbeat epoch provenance run_identity extra now age
+  root=${FM_REPORT_STACK_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/firstmate/report-stack}
+  heartbeat="$root/.retention-heartbeat"
+  [ -f "$heartbeat" ] && [ ! -L "$heartbeat" ] || return 1
+  epoch=$(sed -n '1p' "$heartbeat")
+  provenance=$(sed -n '2p' "$heartbeat")
+  run_identity=$(sed -n '4p' "$heartbeat")
+  extra=$(sed -n '5p' "$heartbeat")
+  case "$epoch" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$provenance" ] && [ -n "$run_identity" ] && [ -z "$extra" ] || return 1
+  now=$(date +%s)
+  age=$((now - epoch))
+  [ "$age" -ge 0 ] && [ "$age" -le "$REPORT_RETENTION_OWNER_FRESH_SECS" ]
 }
 
 # Surfaced-marker bookkeeping for the heartbeat backstop. The watcher records the
@@ -866,14 +914,10 @@ mark_all_captain_relevant_surfaced() {
   done < <(scan_captain_relevant_statuses "$STATE")
 }
 
-# Cheap heartbeat fleet-scan (the always-on twin of the daemon's catch-all). 0 if
-# any captain-relevant status has NOT already been surfaced to firstmate (its
-# content differs from the .hb-surfaced-<task> marker). Pure detect, no side
-# effects: the caller enqueues first, then marks surfaced. Because every
-# captain-relevant signal/stale already marks itself surfaced when it wakes
-# firstmate, this normally finds nothing and the heartbeat is absorbed; it
-# surfaces only a captain-relevant status the per-wake path absorbed by mistake -
-# the fail-safe backstop.
+# Heartbeat fleet-scan (the always-on twin of the daemon's catch-all). Status
+# events retain their surfaced-marker dedup. Run liveness is deliberately absent
+# here: only the repeated exact-run process window on the stale path can prove
+# BUSY, and a one-shot current-state field cannot prove death or a wedge.
 heartbeat_scan_finds_actionable() {
   local f task last surfaced
   while IFS=$(printf '\t') read -r f task last; do
@@ -1310,6 +1354,9 @@ EOF
         working)
           clear_pause_state "$w"
           ;;
+        none)
+          clear_pause_tracking "$w"
+          ;;
         *)
           clear_pause_tracking "$w"
           ;;
@@ -1350,6 +1397,7 @@ EOF
         if [ "$kind" = secondmate ]; then
           case "$(pause_state_class "$w" "$task")" in
             paused) handle_paused_stale "$w" "$task" "$h" ;;
+            working|none) clear_pause_tracking "$w" ;;
             *)      clear_pause_tracking "$w" ;;
           esac
         elif afk_present; then
@@ -1426,6 +1474,9 @@ EOF
               unknown)
                 surface_process_window_unknown "$w" "$task" "$h"
                 ;;
+              none)
+                surface_nonterminal_stale "$w" "$h"
+                ;;
               *)
                 surface_nonterminal_stale "$w" "$h"
                 ;;
@@ -1440,6 +1491,7 @@ EOF
                          liveness_recheck_if_due "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
                 unknown) surface_process_window_unknown "$w" "$task" "$h" ;;
+                none)    surface_nonterminal_stale "$w" "$h" ;;
                 *)       surface_nonterminal_stale "$w" "$h" ;;
               esac
             else
@@ -1462,6 +1514,7 @@ EOF
       if ! afk_present && status_is_paused "$(last_status_line "$STATE/$task.status")" && [ "$window_busy" != 1 ]; then
         case "$(pause_state_class "$w" "$task")" in
           paused) handle_paused_stale "$w" "$task" "$h" ;;
+          working|none) clear_pause_tracking "$w" ;;
           *)      clear_pause_tracking "$w" ;;
         esac
       else
@@ -1470,7 +1523,7 @@ EOF
     fi
   done
 
-  # Heartbeat: the watcher runs a cheap fleet-scan at a regular cadence no matter
+  # Heartbeat: the watcher runs a bounded fleet-scan at a regular cadence no matter
   # what. Time-based via .last-heartbeat mtime; interval doubles per consecutive
   # no-change heartbeat (idle fleet) up to HEARTBEAT_MAX, and resets on any
   # surfaced non-heartbeat wake.
@@ -1479,11 +1532,11 @@ EOF
   hb=$(( HEARTBEAT * (1 << streak) ))
   [ "$hb" -gt "$HEARTBEAT_MAX" ] && hb=$HEARTBEAT_MAX
   if marker_due "$STATE/.last-heartbeat" "$hb" "watcher heartbeat"; then
-    # Triage: in always-on mode a heartbeat is benign unless the cheap fleet-scan
-    # turns up a captain-relevant status the per-wake path missed. Absorb the
-    # no-change case (advance the schedule and back off exactly as wake() would,
-    # without exiting); the away-mode daemon, when present, owns triage and wants
-    # every heartbeat.
+    # Triage: in always-on mode a heartbeat is benign unless the fleet-scan turns
+    # up a captain-relevant status or a dead/unknown command-step liveness reading.
+    # Unknown is grouped with actionable here because a heartbeat needs only the
+    # binary absorb/surface decision, and unknown is not proof of health. The
+    # away-mode daemon, when present, owns triage and wants every heartbeat.
     if afk_present; then
       fm_wake_append heartbeat heartbeat heartbeat || exit 1
       safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true

@@ -37,6 +37,22 @@ set -u
 SEND="$ROOT/bin/fm-send.sh"
 
 fm_test_tmproot_into TMP_ROOT fm-send-popup-settle
+RUNTIME_PROFILE_STUB="$TMP_ROOT/fm-runtime-profile.sh"
+cat > "$RUNTIME_PROFILE_STUB" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$RUNTIME_PROFILE_STUB"
+STEERING_STUB="$TMP_ROOT/fm-send-steering.sh"
+cat > "$STEERING_STUB" <<'SH'
+#!/usr/bin/env bash
+sleep "${6:-0}"
+printf 'confirmed'
+SH
+chmod +x "$STEERING_STUB"
+export FM_SEND_TEST_HOOKS=firstmate-fm-send-tests-v1
+export FM_SEND_RUNTIME_PROFILE_BIN="$RUNTIME_PROFILE_STUB"
+export FM_SEND_STEERING_BIN="$STEERING_STUB"
 
 # Same stub shape as fm-send-settle.test.sh: a fake tmux that drives the submit
 # path to a clean "empty" verdict on the first Enter, and a fake sleep that records

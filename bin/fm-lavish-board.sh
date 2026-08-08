@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Render one durable Lavish decision, open it in a dedicated headed Chrome
-# profile, and arm a one-shot watcher check for its durable browser-profile
-# record with optional download corroboration.
+# Render one durable Lavish decision, assert its answering machinery before it
+# can be surfaced, open it in a dedicated headed Chrome profile, and arm a
+# one-shot watcher check for its durable browser-profile record with optional
+# download corroboration.
 #
 # Usage:
 #   fm-lavish-board.sh <decision-id> [--home <path>] [--downloads <path>]
@@ -23,6 +24,11 @@ Usage: fm-lavish-board.sh <decision-id> [--home <path>] [--downloads <path>]
 Render a self-contained Lavish board, open it in a headed dedicated Chrome
 profile, and arm a watcher check that captures the verified LAVISH-SUBMIT v2
 browser-profile record first and accepts a matching download as corroboration.
+The helper refuses before arming pickup or opening Chrome when the rendered
+page lacks the inputs its declared mode needs or its schema-version-2 submit
+path. A decision board needs radio choices with per-option and per-question
+annotations; an annotation board needs one comment box per item and no choices
+at all.
 USAGE
 }
 
@@ -73,8 +79,78 @@ isolated_chrome() {
   )
 }
 
-write_evaluation_payload() {  # <evaluation-output> <target> <decision-id>
-  local evaluation=$1 target=$2 decision_id=$3 result_line
+assert_answerable_board() {
+  local board_path=$1
+  node - "$board_path" <<'NODE'
+const fs = require('node:fs');
+
+let html;
+try {
+  html = fs.readFileSync(process.argv[2], 'utf8');
+} catch (error) {
+  process.stderr.write(`could not read generated HTML: ${error.message}\n`);
+  process.exit(1);
+}
+
+const tags = (name) => html.match(new RegExp(`<${name}\\b[^>]*>`, 'gis')) ?? [];
+const hasAttribute = (tag, name, value = undefined) => {
+  const match = tag.match(new RegExp(`\\b${name}\\s*=\\s*(["'])(.*?)\\1`, 'is'));
+  if (match === null) return value === undefined && new RegExp(`\\b${name}(?:\\s|>|$)`, 'i').test(tag);
+  return value === undefined || match[2].toLowerCase() === value.toLowerCase();
+};
+const hasClass = (tag, className) => {
+  const match = tag.match(/\bclass\s*=\s*(["'])(.*?)\1/is);
+  return match !== null && match[2].split(/\s+/).includes(className);
+};
+
+const radios = tags('input').filter((tag) => hasAttribute(tag, 'type', 'radio'));
+const optionNotes = tags('textarea').filter((tag) => hasAttribute(tag, 'data-option-comment'));
+const questionNotes = tags('textarea').filter((tag) => hasAttribute(tag, 'data-question-note'));
+const itemNotes = tags('textarea').filter((tag) => hasAttribute(tag, 'data-item-note'));
+const cards = tags('section').filter((tag) => hasClass(tag, 'question'));
+const submit = tags('button').some((tag) => hasAttribute(tag, 'id', 'submit-button'));
+const overallNote = tags('textarea').some((tag) => hasAttribute(tag, 'id', 'overall-note'));
+// An annotation board is answerable without a single choice on it, so asserting
+// radios there would refuse exactly the board this mode exists to surface.
+const annotation = tags('body').some((tag) => hasAttribute(tag, 'data-lavish-mode', 'annotation'));
+const missing = [];
+
+if (annotation) {
+  if (itemNotes.length === 0) missing.push('per-item annotation inputs');
+  if (cards.length === 0 || itemNotes.length !== cards.length) {
+    missing.push(`one per-item annotation for each item (${itemNotes.length}/${cards.length})`);
+  }
+  if (radios.length > 0) missing.push('an annotation board must offer no choices');
+} else {
+  if (radios.length === 0) missing.push('radio choices');
+  if (optionNotes.length === 0) missing.push('per-option annotation inputs');
+  if (radios.length !== optionNotes.length) {
+    missing.push(`one per-option annotation for each radio (${optionNotes.length}/${radios.length})`);
+  }
+  if (questionNotes.length === 0) missing.push('per-question annotation inputs');
+  if (cards.length === 0 || questionNotes.length !== cards.length) {
+    missing.push(`one per-question annotation for each question (${questionNotes.length}/${cards.length})`);
+  }
+}
+if (!overallNote) missing.push('overall note input');
+if (!submit) missing.push('submit button');
+if (!/\bschema_version\s*:\s*2\b/.test(html)) missing.push('schema_version 2 payload');
+if (!/querySelector\(\s*['"]#submit-button['"]\s*\)\.addEventListener\(\s*['"]click['"]/.test(html)) {
+  missing.push('submit click handler');
+}
+if (!/JSON\.stringify\(\s*payload\b/.test(html)) missing.push('JSON payload serialization');
+if (!/new Blob\(\s*\[\s*payloadJson\s*\]/.test(html)) missing.push('JSON download');
+if (!/window\.__lavishPayload\s*=\s*payload\b/.test(html)) missing.push('pickup payload publication');
+
+if (missing.length > 0) {
+  process.stderr.write(`missing ${missing.join(', ')}\n`);
+  process.exit(1);
+}
+NODE
+}
+
+write_evaluation_payload() {  # <evaluation-output> <target> <decision-id> <home-marker>
+  local evaluation=$1 target=$2 decision_id=$3 home_marker=$4 result_line
   result_line=$(printf '%s\n' "$evaluation" | sed -n 's/^result: //p' | sed -n '1p')
   [ -n "$result_line" ] || return 1
   printf '%s\n' "$result_line" | node -e '
@@ -83,6 +159,7 @@ write_evaluation_payload() {  # <evaluation-output> <target> <decision-id>
     const target = process.argv[1];
     const marker = process.argv[2];
     const decisionId = process.argv[3];
+    const homeMarker = process.argv[4];
     let snapshot = raw;
     try {
       for (let depth = 0; depth < 4 && typeof snapshot === "string"; depth += 1) {
@@ -97,12 +174,16 @@ write_evaluation_payload() {  # <evaluation-output> <target> <decision-id>
         payload = durable.payload;
         markerMatches = true;
       }
-      if (!markerMatches || payload?.decision_id !== decisionId) process.exit(3);
+      if (
+        !markerMatches
+        || payload?.decision_id !== decisionId
+        || payload?.home_marker !== homeMarker
+      ) process.exit(3);
       fs.writeFileSync(target, JSON.stringify(payload) + "\n", { mode: 0o600 });
     } catch {
       process.exit(4);
     }
-  ' "$target" "$SUBMIT_MARKER" "$decision_id"
+  ' "$target" "$SUBMIT_MARKER" "$decision_id" "$home_marker"
 }
 
 collect_submission() {
@@ -143,12 +224,13 @@ check_submission() {
   [ -d "$profile_path" ] && [ ! -L "$profile_path" ] || exit 0
   [ -f "$html_path" ] && [ ! -L "$html_path" ] || exit 0
 
-  downloaded_path=$(node -e '
+  if ! downloaded_path=$(node -e '
     const fs = require("node:fs");
     const path = require("node:path");
     const directory = process.argv[1];
     const decisionId = process.argv[2];
     const openedAt = Number(process.argv[3]);
+    const homeMarker = process.argv[4];
     const pattern = new RegExp(
       "^lavish-answer-" + decisionId + "(?: \\(\\d+\\))?\\.json$",
     );
@@ -160,7 +242,10 @@ check_submission() {
       if (info.mtimeMs < openedAt) continue;
       try {
         const payload = JSON.parse(fs.readFileSync(candidate, "utf8"));
-        if (payload?.decision_id !== decisionId) continue;
+        if (
+          payload?.decision_id !== decisionId
+          || payload?.home_marker !== homeMarker
+        ) continue;
       } catch {
         continue;
       }
@@ -168,14 +253,18 @@ check_submission() {
     }
     candidates.sort((left, right) => right.mtimeMs - left.mtimeMs);
     if (candidates[0]) process.stdout.write(candidates[0].candidate);
-  ' "$downloads" "$decision_id" "$opened_at" 2>/dev/null) || downloaded_path=
+  ' "$downloads" "$decision_id" "$opened_at" "$home" 2>/dev/null); then
+    printf 'lavish-submit-error: download scan failed for %s in %s\n' \
+      "$decision_id" "$downloads"
+    return 1
+  fi
 
   temporary=$(mktemp "$state_dir/.lavish-board-$decision_id.payload.XXXXXX")
   evaluation=$(isolated_chrome "$session" "$profile_path" 0 eval \
     'JSON.stringify({title: document.title, payload: window.__lavishPayload ?? null, durable_record: typeof window.__lavishStorageKey === "string" ? localStorage.getItem(window.__lavishStorageKey) : null})' \
     2>/dev/null) || evaluation=
   if [ -n "$evaluation" ]; then
-    if write_evaluation_payload "$evaluation" "$temporary" "$decision_id"; then
+    if write_evaluation_payload "$evaluation" "$temporary" "$decision_id" "$home"; then
       mv "$temporary" "$payload_path"
     else
       rm -f "$temporary"
@@ -195,7 +284,7 @@ check_submission() {
         exit 0
       }
     temporary=$(mktemp "$state_dir/.lavish-board-$decision_id.payload.XXXXXX")
-    if write_evaluation_payload "$evaluation" "$temporary" "$decision_id"; then
+    if write_evaluation_payload "$evaluation" "$temporary" "$decision_id" "$home"; then
       mv "$temporary" "$payload_path"
     else
       rm -f "$temporary"
@@ -316,14 +405,21 @@ HTML_PATH="$STATE_DIR/lavish-board-$DECISION_ID.html"
 PAYLOAD_PATH="$STATE_DIR/lavish-board-$DECISION_ID.payload.json"
 PROFILE_PATH="$STATE_DIR/lavish-board-$DECISION_ID.chrome-profile"
 CHECK_PATH="$STATE_DIR/lavish-board-$DECISION_ID.check.sh"
-CHECK_TMP=$(mktemp "$STATE_DIR/.lavish-board-$DECISION_ID.check.XXXXXX")
 OPENED_AT=$(node -e 'process.stdout.write(String(Date.now()))')
 
+rm -f "$CHECK_PATH"
 "$LAVISH_BIN" board "$DECISION_ID" --home "$HOME_PATH" --out "$HTML_PATH"
+ANSWERABILITY_ERROR=
+if ! ANSWERABILITY_ERROR=$(assert_answerable_board "$HTML_PATH" 2>&1); then
+  rm -f "$HTML_PATH"
+  fail "refusing to surface an unanswerable board: $ANSWERABILITY_ERROR"
+fi
+
 rm -f "$PAYLOAD_PATH"
 mkdir -p "$PROFILE_PATH"
 [ -d "$PROFILE_PATH" ] && [ ! -L "$PROFILE_PATH" ] \
   || fail "unsafe Chrome profile directory: $PROFILE_PATH"
+CHECK_TMP=$(mktemp "$STATE_DIR/.lavish-board-$DECISION_ID.check.XXXXXX")
 {
   printf '#!/usr/bin/env bash\n'
   printf 'exec env FM_STATE_OVERRIDE=%q %q --check %q --home %q --state %q --session %q --downloads %q --opened-at %q\n' \

@@ -147,8 +147,10 @@ phase_spawn() {
   # Launch ran in the subhome, with the persistent charter and cleared overrides,
   # and never ran a project-style treehouse get.
   assert_grep "FM_HOME='$SUB_ABS'" "$LOG" "secondmate launch did not set FM_HOME to the subhome"
-  assert_grep 'FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE= FM_PROJECTS_OVERRIDE=' "$LOG" "launch did not clear operational overrides"
-  assert_grep 'FM_CONFIG_OVERRIDE=' "$LOG" "launch did not clear the config override"
+  assert_grep 'env -u FM_ROOT_OVERRIDE -u FM_STATE_OVERRIDE -u FM_DATA_OVERRIDE -u FM_PROJECTS_OVERRIDE -u FM_CONFIG_OVERRIDE' "$LOG" \
+    "launch did not remove operational overrides from the child environment"
+  assert_no_grep 'FM_ROOT_OVERRIDE= FM_STATE_OVERRIDE= FM_DATA_OVERRIDE=' "$LOG" \
+    "launch still exported empty operational overrides"
   assert_grep "$SUB_ABS/data/charter.md" "$LOG" "launch did not use the persistent charter"
   assert_no_grep 'notify=' "$LOG" "secondmate codex launch included the parent turn-end notify hook"
   assert_no_grep 'turn-ended' "$LOG" "secondmate codex launch referenced a parent turn-ended signal"
@@ -157,20 +159,23 @@ phase_spawn() {
 }
 
 phase_send() {
+  local err="$TMP_ROOT/send.err"
   : > "$LOG"
   # The meta window (firstmate:fm-design) must win over a foreign same-named
-  # window returned by list-windows.
-  PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_WINDOW="other-session:fm-design" \
+  # window returned by list-windows, then the atomic steering gate must refuse
+  # before either pane receives input.
+  if PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_WINDOW="other-session:fm-design" \
     FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
-    "$ROOT/bin/fm-send.sh" fm-design 'route this work' >/dev/null 2>&1 \
-    || fail "fm-send failed for a bare firstmate window with home metadata"
-  # design is a kind=secondmate target, so the request is prefixed with the
-  # from-firstmate marker (bin/fm-marker-lib.sh): the send targets the meta window
-  # AND carries the marker label, and the original payload still follows it.
-  assert_grep 'send-keys -t firstmate:fm-design -l [fm-from-firstmate]' "$LOG" "send did not use the window recorded in this home's meta, or did not mark the secondmate request"
-  assert_grep 'route this work' "$LOG" "the original request text did not survive the marker"
+    "$ROOT/bin/fm-send.sh" fm-design 'route this work' >/dev/null 2>"$err"; then
+    fail "fm-send admitted split secondmate steering"
+  fi
+  case "$(cat "$err")" in
+    *"runtime profile is not currently verified"*|*"atomic tmux steering verdict=send-failed"*) ;;
+    *) fail "send did not reach a pre-delivery hard gate: $(cat "$err")" ;;
+  esac
+  assert_no_grep 'send-keys .* -l ' "$LOG" "atomic refusal still typed pane text"
   assert_no_grep 'send-keys -t other-session:fm-design' "$LOG" "send targeted a foreign same-named window"
-  pass "send: a bare fm-<id> secondmate routes to the meta window with the from-firstmate marker"
+  pass "send: a bare fm-<id> resolves home metadata and refuses before pane input"
 }
 
 phase_handoff() {

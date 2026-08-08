@@ -775,10 +775,10 @@ EOF
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=999 \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 30; then
-    reap "$pid"; fail "a declared pause fell through to the permission-prompt stale path: $(cat "$out")"
-  fi
-  [ -e "$state/.paused-$key" ] || { reap "$pid"; fail "declared pause did not create its suppression marker before permission-prompt detection"; }
+  fm_test_wait_for_file "$state/.paused-$key" "$pid" \
+    || { reap "$pid"; fail "declared pause did not create its suppression marker before permission-prompt detection: $(cat "$out")"; }
+  kill -0 "$pid" 2>/dev/null \
+    || { reap "$pid"; fail "a declared pause fell through to the permission-prompt stale path: $(cat "$out")"; }
   [ ! -e "$state/.stale-permission-$key" ] || { reap "$pid"; fail "declared pause incorrectly entered permission-prompt escalation tracking"; }
   [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "declared pause enqueued a permission-prompt stale wake"; }
   [ ! -s "$out" ] || { reap "$pid"; fail "declared pause printed a permission-prompt stale wake: $(cat "$out")"; }

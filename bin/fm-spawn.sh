@@ -1805,7 +1805,7 @@ spawn_restore_unmanaged_state() {
 }
 
 spawn_abort_cleanup() {
-  local status=$? endpoint_state endpoint_gone=1 account_clean=1 state_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name release_status orca_cleanup_failed=0 orca_boundary_token=
+  local status=$? endpoint_state endpoint_gone=1 account_clean=1 state_clean=1 worktree_clean=1 transition_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name release_status orca_cleanup_failed=0 orca_boundary_token=
   trap - EXIT
   # This is an EXIT trap whose job is to attempt every independent cleanup
   # action and then return the original spawn status. The parent script runs
@@ -1960,14 +1960,20 @@ spawn_abort_cleanup() {
   fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_ROUTING:-0}" = 1 ] \
     && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" != 1 ] && [ "$endpoint_gone" = 1 ]; then
-    if [ "$WORKTREE_CREATED" = 1 ] && [ -n "${WT:-}" ] && [ -d "$WT" ]; then
+    if [ "${ENDPOINT_CREATED:-0}" = 1 ] && [ "$META_INSTALLED" = 1 ] \
+      && ! fm_backend_clear_transition "${BACKEND:-tmux}" "$STATE" "${T:-}" "$ID" "$LIFECYCLE_LOCK"; then
+      transition_clean=0
+      worktree_clean=0
+      echo "warning: retained failed direct spawn state for ${ID:-unknown} because transition cleanup is unverified" >&2
+    fi
+    if [ "$transition_clean" = 1 ] && [ "$WORKTREE_CREATED" = 1 ] && [ -n "${WT:-}" ] && [ -d "$WT" ]; then
       spawn_return_created_worktree || worktree_clean=0
       [ "$worktree_clean" = 1 ] || echo "warning: failed to return direct spawn worktree for ${ID:-unknown}; retaining cleanup metadata" >&2
     fi
     if [ -z "$rollback_lock" ]; then
       rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}" 2>/dev/null) || rollback_lock=
     fi
-    if [ -n "$rollback_lock" ] && [ "$worktree_clean" = 1 ]; then
+    if [ -n "$rollback_lock" ] && [ "$worktree_clean" = 1 ] && [ "$transition_clean" = 1 ]; then
       if [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
         artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
         if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-$SPAWN_TASK_TMP}" 1 "$SPAWN_GENERATION_ID" \

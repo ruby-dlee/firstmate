@@ -1282,15 +1282,22 @@ test_failure_pause_stale_surfaced_not_absorbed() {
 }
 
 test_herdr_blocked_transition_enters_pause_absorb_path() {
-  local dir state fakebin window key record
+  local dir state fakebin window key record marker
   dir=$(make_case herdr-paused-transition); state="$dir/state"; fakebin="$dir/fakebin"
   window="default:w6:p3H"
-  printf 'window=%s\nbackend=herdr\nkind=ship\n' "$window" > "$state/herdr-paused.meta"
+  printf 'window=%s\nbackend=herdr\nkind=ship\ngeneration_id=generation-herdr-paused\n' "$window" > "$state/herdr-paused.meta"
   printf 'paused: awaiting an external release\n' > "$state/herdr-paused.status"
   key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   printf 'stable-pane-hash' > "$state/.hash-$key"
   export FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting an external release'
-  record=$(fm_transition_record 'w6:p3H' 'w6' '' blocked codex)
+  record=$(bash -c '
+    . "$0/bin/backends/herdr.sh"
+    raw=$(fm_transition_record w6:p3H w6 "" blocked codex)
+    binding=$(fm_backend_herdr_binding_for_window "$1" "$2") || exit 1
+    fm_backend_herdr_bind_transition_record "$raw" "$binding"
+  ' "$ROOT" "$state" "$window") || fail "could not bind the Herdr transition fixture"
+  marker=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_escalation_marker "$1" "$2"' \
+    "$ROOT" "$state" "$window") || fail "could not resolve the Herdr transition marker"
 
   FM_HOME="$dir" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_PAUSE_RESURFACE_SECS=999 bash -c '
@@ -1303,7 +1310,7 @@ test_herdr_blocked_transition_enters_pause_absorb_path() {
   [ -e "$state/.paused-$key" ] || fail "Herdr pane-id target did not enter the shared pause absorb path"
   [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = stable-pane-hash ] \
     || fail "Herdr pane-id target did not advance the shared stale suppressor"
-  [ -e "$state/.herdr-escalated-$key" ] || fail "absorbed Herdr blocked transition was not committed"
+  [ -e "$marker" ] || fail "absorbed Herdr blocked transition was not committed"
   [ ! -s "$state/.wake-queue" ] || fail "absorbed Herdr blocked transition enqueued a stale wake"
   unset FM_FAKE_CREW_STATE
   pass "a Herdr pane-id blocked transition enters the shared declared-pause absorb path"
@@ -2239,6 +2246,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = afk-paused-handoff ]; then
   test_afk_paused_changed_pane_hands_off_plain_stale
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = herdr-transition-custody ]; then
+  test_herdr_blocked_transition_enters_pause_absorb_path
   exit 0
 fi
 

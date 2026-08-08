@@ -4039,7 +4039,15 @@ herdr_escalation_marker_path() {
 }
 
 write_herdr_transition_meta() {
-  fm_write_meta "$1/$2.meta" "window=$3" "backend=herdr" "kind=ship"
+  fm_write_meta "$1/$2.meta" "window=$3" "backend=herdr" "kind=ship" "generation_id=generation-$2"
+}
+
+bind_herdr_transition() {
+  bash -c '
+    . "$0/bin/backends/herdr.sh"
+    binding=$(fm_backend_herdr_binding_for_window "$1" "$2:$3") || exit 1
+    fm_backend_herdr_bind_transition_record "$4" "$binding"
+  ' "$ROOT" "$1" "$2" "$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_pane_id "$1"' "$ROOT" "$3")" "$3"
 }
 
 test_escalation_marker_keys_are_collision_free() {
@@ -4118,6 +4126,7 @@ test_escalation_marker_rejects_adversarial_owner_substitution() {
   dir="$TMP_ROOT/escalation-owner-substitution"; state="$dir/state"; mkdir -p "$state"
   write_herdr_transition_meta "$state" lane-q default:wG:pQ
   rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  rec=$(bind_herdr_transition "$state" default "$rec")
   marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec"
   key=${marker##*escalated-}
@@ -4138,6 +4147,7 @@ test_escalation_marker_refuses_symlink_carriers() {
   dir="$TMP_ROOT/escalation-marker-symlink"; state="$dir/state"; mkdir -p "$state"
   write_herdr_transition_meta "$state" lane-q default:wG:pQ
   rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  rec=$(bind_herdr_transition "$state" default "$rec")
   marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   sentinel="$dir/sentinel"
   printf 'preserve-me\n' > "$sentinel"
@@ -4160,11 +4170,12 @@ test_escalation_marker_refuses_symlink_carriers() {
 }
 
 test_transition_commit_refuses_teardown_and_window_reuse_races() {
-  local dir state rec marker ready release observed holder commit_pid
+  local dir state rec new_rec marker ready release observed holder commit_pid
   dir="$TMP_ROOT/escalation-marker-lifecycle"; state="$dir/state"; mkdir -p "$state"
   ready="$dir/holder.ready"; release="$dir/holder.release"; observed="$dir/commit.waiting"
   write_herdr_transition_meta "$state" lane-old default:wG:pQ
   rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  rec=$(bind_herdr_transition "$state" default "$rec")
   marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3" "$4"' \
     "$ROOT" "$state" default "$rec" lane-old || fail "lifecycle setup commit failed"
@@ -4197,8 +4208,10 @@ test_transition_commit_refuses_teardown_and_window_reuse_races() {
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3" "$4"' \
     "$ROOT" "$state" default "$rec" lane-old >/dev/null 2>&1 \
     && fail "retired task committed against a reassigned Herdr window"
+  new_rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  new_rec=$(bind_herdr_transition "$state" default "$new_rec")
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3" "$4"' \
-    "$ROOT" "$state" default "$rec" lane-new || fail "reassigned Herdr window rejected its exact current task"
+    "$ROOT" "$state" default "$new_rec" lane-new || fail "reassigned Herdr window rejected its exact current task"
   [ -e "$marker" ] || fail "exact current task did not commit the reassigned window marker"
   pass "Herdr commits refuse post-teardown recreation and stale window reuse"
 }
@@ -4208,6 +4221,7 @@ test_apply_transition_blocked_requires_commit_to_dedupe() {
   dir="$TMP_ROOT/apply-blocked"; state="$dir/state"; mkdir -p "$state"
   write_herdr_transition_meta "$state" lane-q default:wG:pQ
   rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  rec=$(bind_herdr_transition "$state" default "$rec")
   marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec"); rc=$?
   [ "$rc" = 0 ] || fail "a fresh blocked edge must return 0 (actionable), got $rc"
@@ -4229,6 +4243,8 @@ test_apply_transition_working_clears_marker() {
   marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   blocked=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
   working=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" working claude' "$ROOT")
+  blocked=$(bind_herdr_transition "$state" default "$blocked")
+  working=$(bind_herdr_transition "$state" default "$working")
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$blocked"
   [ -e "$marker" ] || fail "setup: committed blocked edge should have set the marker"
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$working"; rc=$?
@@ -4238,6 +4254,53 @@ test_apply_transition_working_clears_marker() {
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$blocked" >/dev/null; rc=$?
   [ "$rc" = 0 ] || fail "a re-block after a working clear must re-fire (return 0), got $rc"
   pass "fm_backend_herdr_apply_transition: a working edge clears the marker so the next ->blocked re-escalates"
+}
+
+test_buffered_transition_refuses_reassigned_window() {
+  local dir state old_blocked old_working new_blocked marker out rc
+  dir="$TMP_ROOT/apply-buffered-reuse"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-old default:wG:pQ
+  old_blocked=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  old_working=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" working claude' "$ROOT")
+  old_blocked=$(bind_herdr_transition "$state" default "$old_blocked")
+  old_working=$(bind_herdr_transition "$state" default "$old_working")
+  rm -f "$state/lane-old.meta"
+  write_herdr_transition_meta "$state" lane-new default:wG:pQ
+  new_blocked=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  new_blocked=$(bind_herdr_transition "$state" default "$new_blocked")
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" default "$new_blocked" || fail "replacement generation marker setup failed"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" default "$old_working" >/dev/null; rc=$?
+  [ "$rc" = 1 ] || fail "buffered working edge from the retired generation did not become UNKNOWN"
+  [ -e "$marker" ] || fail "buffered working edge cleared the replacement generation marker"
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" default "$old_blocked"); rc=$?
+  [ "$rc" = 1 ] && [ -z "$out" ] || fail "buffered blocked edge rebound to the replacement generation"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" default "$old_blocked" >/dev/null 2>&1 \
+    && fail "retired generation transition committed against the replacement owner"
+  [ -e "$marker" ] || fail "retired generation commit altered the replacement marker"
+  pass "buffered Herdr edges cannot clear, wake, or commit after window reassignment"
+}
+
+test_transition_refuses_replaced_metadata_identity() {
+  local dir state rec replacement out rc
+  dir="$TMP_ROOT/apply-metadata-replacement"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
+  rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  rec=$(bind_herdr_transition "$state" default "$rec")
+  replacement="$state/.lane-q.meta.replacement"
+  cp "$state/lane-q.meta" "$replacement"
+  mv "$replacement" "$state/lane-q.meta"
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" default "$rec"); rc=$?
+  [ "$rc" = 1 ] && [ -z "$out" ] || fail "replaced metadata identity retained a buffered transition"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" default "$rec" >/dev/null 2>&1 \
+    && fail "replaced metadata identity authorized a buffered commit"
+  pass "Herdr transition custody includes the safe metadata file identity"
 }
 
 test_clear_transition_removes_task_marker() {
@@ -4259,6 +4322,7 @@ test_apply_transition_defer_and_fallback_are_noops() {
   for s in idle "done" unknown ""; do
     local rec
     rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" "$1" claude' "$ROOT" "$s")
+    rec=$(bind_herdr_transition "$state" default "$rec")
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec"; rc=$?
     [ "$rc" = 1 ] || fail "defer/fallback status '$s' must return 1 (no fast action), got $rc"
     [ ! -e "$marker" ] || fail "defer/fallback status '$s' must not touch the escalation marker"
@@ -4523,6 +4587,8 @@ if [ "${FM_TEST_FOCUSED:-}" = transition-marker-identity ]; then
   test_transition_commit_refuses_teardown_and_window_reuse_races
   test_apply_transition_blocked_requires_commit_to_dedupe
   test_apply_transition_working_clears_marker
+  test_buffered_transition_refuses_reassigned_window
+  test_transition_refuses_replaced_metadata_identity
   test_clear_transition_removes_task_marker
   test_apply_transition_defer_and_fallback_are_noops
   test_wait_transition_reconcile_dedupes_when_marked
@@ -4650,6 +4716,8 @@ test_escalation_marker_refuses_symlink_carriers
 test_transition_commit_refuses_teardown_and_window_reuse_races
 test_apply_transition_blocked_requires_commit_to_dedupe
 test_apply_transition_working_clears_marker
+test_buffered_transition_refuses_reassigned_window
+test_transition_refuses_replaced_metadata_identity
 test_clear_transition_removes_task_marker
 test_apply_transition_defer_and_fallback_are_noops
 test_wait_transition_no_panes_returns_2

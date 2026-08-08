@@ -1472,6 +1472,27 @@ test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup() {
   pass "failed new direct spawn removes its endpoint and returns its exactly owned lease without force"
 }
 
+test_failed_direct_spawn_clears_transition_before_metadata_restore() {
+  python3 - "$ROOT/bin/fm-spawn.sh" <<'PY'
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+start = text.index('&& [ "${DIRECT_ACCOUNT_RECOVERY:-0}" != 1 ] && [ "$endpoint_gone" = 1 ]; then')
+end = text.index('if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ]', start)
+block = text[start:end]
+clear = block.index('fm_backend_clear_transition "${BACKEND:-tmux}" "$STATE" "${T:-}" "$ID" "$LIFECYCLE_LOCK"')
+restore = block.index('fm_account_restore_artifacts "$STATE" "$ID"')
+if clear >= restore:
+    raise SystemExit("transition cleanup follows metadata restore")
+if '[ "$META_INSTALLED" = 1 ]' not in block:
+    raise SystemExit("transition cleanup is not bound to an installed failed generation")
+if 'transition_clean=0' not in block or '[ "$transition_clean" = 1 ]' not in block:
+    raise SystemExit("transition cleanup failure does not retain failed-generation state")
+PY
+  pass "immediate direct-spawn rollback clears transition custody before metadata restore"
+}
+
 test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails() {
   local record id out status meta
   reset_accounts
@@ -1563,11 +1584,17 @@ if [ "${FM_TEST_FOCUSED:-}" = account-directory-trust ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = direct-spawn-transition-custody ]; then
+  test_failed_direct_spawn_clears_transition_before_metadata_restore
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
   test_direct_spawn_and_recovery_support_detached_worktree
   test_direct_recovery_preserves_recorded_task_context
   test_direct_recovery_rejects_secondmate_metadata
   test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
+  test_failed_direct_spawn_clears_transition_before_metadata_restore
   test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
   test_failed_new_direct_spawn_never_records_an_uncreated_endpoint
   exit 0
@@ -1626,6 +1653,7 @@ test_direct_recovery_rechecks_identity_after_account_prepare
 test_direct_recovery_tracks_retained_replacement_endpoint
 test_new_direct_spawn_tracks_retained_endpoint_and_worktree
 test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
+test_failed_direct_spawn_clears_transition_before_metadata_restore
 test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
 test_failed_new_direct_spawn_never_records_an_uncreated_endpoint
 test_routing_off_keeps_default_provider_launch

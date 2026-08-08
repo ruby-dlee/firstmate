@@ -5340,6 +5340,64 @@ SH
   pass "retained direct-spawn teardown requires confirmed endpoint quiescence"
 }
 
+test_retained_direct_spawn_clears_failed_generation_before_restore() {
+  local case_dir state meta backup_name artifacts_name key marker owner
+  case_dir=$(make_case retained-direct-spawn-transition-restore)
+  state="$case_dir/state"
+  meta="$state/task-x1.meta"
+  backup_name=.task-x1.meta.rollback.transition1
+  artifacts_name=.task-x1.artifacts.rollback.transition1
+  fm_write_meta "$state/$backup_name" \
+    'window=default:wOld:pOld' \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    'kind=ship' \
+    'mode=local-only' \
+    'backend=herdr' \
+    'generation_id=generation-prior'
+  mkdir -p "$state/$artifacts_name"
+  fm_write_meta "$meta" \
+    'window=default:wG:pQ' \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    'kind=ship' \
+    'mode=local-only' \
+    'backend=herdr' \
+    'generation_id=generation-failed' \
+    'account_home=/tmp/direct-account-home' \
+    'direct_spawn_cleanup=pending' \
+    "direct_spawn_backup=$backup_name" \
+    "direct_spawn_artifacts=$artifacts_name" \
+    'rollback_pending=1'
+  cat > "$case_dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'session list --json') printf '{"sessions":[]}\n' ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/herdr"
+  key=$(bash -c '. "$0/bin/fm-marker-state-lib.sh"; fm_marker_identity_key "$1"' "$ROOT" default:wG:pQ)
+  marker="$state/.herdr-escalated-$key"
+  owner="$state/.marker-owner-herdr-transition-$key"
+  printf '%s' default:wG:pQ > "$marker"
+  printf '%s' default:wG:pQ > "$owner"
+
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "retained direct-spawn transition cleanup failed: $(cat "$case_dir/stderr")"
+  assert_grep 'cleaned failed direct spawn for task-x1 and restored the prior task generation' "$case_dir/stdout" \
+    "retained direct-spawn cleanup missed its restoration boundary: $(cat "$case_dir/stdout")"
+  assert_present "$meta" "retained direct-spawn cleanup removed restored task metadata"
+  grep -Fx 'window=default:wOld:pOld' "$meta" >/dev/null \
+    || fail "retained direct-spawn cleanup did not restore the prior window: $(cat "$meta")"
+  grep -Fx 'generation_id=generation-prior' "$meta" >/dev/null \
+    || fail "retained direct-spawn cleanup did not restore the prior generation"
+  assert_absent "$marker" "retained direct-spawn cleanup orphaned the failed generation marker"
+  assert_absent "$owner" "retained direct-spawn cleanup orphaned the failed generation owner"
+  assert_absent "$state/$artifacts_name" "retained direct-spawn cleanup left its artifact backup"
+  pass "retained direct-spawn cleanup clears failed transition custody before metadata restore"
+}
+
 test_missing_ship_worktree_retains_endpoint_and_metadata() {
   local case_dir rc
   case_dir=$(make_case missing-ship-worktree)
@@ -6541,8 +6599,14 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-3-pr-check ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = direct-spawn-transition-custody ]; then
+  test_retained_direct_spawn_clears_failed_generation_before_restore
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = direct-spawn-cleanup ]; then
   test_retained_direct_spawn_requires_confirmed_endpoint_quiescence
+  test_retained_direct_spawn_clears_failed_generation_before_restore
   test_never_created_direct_spawn_endpoint_is_not_quiesced
   exit 0
 fi
@@ -6930,6 +6994,7 @@ TEARDOWN_FULL_SUITE_CASES=(
   test_secondmate_missing_treehouse_child_is_retained
   test_secondmate_registry_home_drift_blocks_removal
   test_retained_direct_spawn_requires_confirmed_endpoint_quiescence
+  test_retained_direct_spawn_clears_failed_generation_before_restore
   test_missing_ship_worktree_retains_endpoint_and_metadata
   test_never_created_direct_spawn_endpoint_is_not_quiesced
   test_never_created_scout_without_report_cleans_bookkeeping

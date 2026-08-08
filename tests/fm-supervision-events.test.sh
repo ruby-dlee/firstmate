@@ -21,6 +21,7 @@ export FM_STATE_OVERRIDE="$STATE_DIR"
 export FM_ROOT_OVERRIDE="$ROOT"
 # shellcheck source=bin/fm-watch.sh
 . "$ROOT/bin/fm-watch.sh"
+fm_backend_source herdr || fail "could not load Herdr transition helpers"
 
 # Overrides: capture wake reasons and neutralize real sleeps (POLL is 15s).
 WAKE_LOG="$TMP/wakes"
@@ -42,7 +43,14 @@ reset_state() {
 }
 
 mkrec() {  # <pane_id> <status>
-  fm_transition_record "$1" "wG" "" "$2" claude
+  local raw binding
+  raw=$(fm_transition_record "$1" "wG" "" "$2" claude)
+  binding=$(fm_backend_herdr_binding_for_window "$STATE_DIR" "default:$1") || return 1
+  fm_backend_herdr_bind_transition_record "$raw" "$binding"
+}
+
+write_event_meta() {
+  fm_write_meta "$STATE_DIR/$1.meta" "window=$2" "backend=herdr" "kind=$3" "generation_id=generation-$1"
 }
 
 transition_marker() {
@@ -52,7 +60,7 @@ transition_marker() {
 # --- handle_push_transition: enqueue + wake for a non-paused blocked crewmate ---
 
 reset_state
-fm_write_meta "$STATE_DIR/tk1.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+write_event_meta tk1 default:wG:pQ ship
 MARKER=$(transition_marker default:wG:pQ)
 handle_push_transition herdr default "$(mkrec wG:pQ blocked)"
 [ -e "$STATE_DIR/.wake-queue" ] || fail "handle_push_transition should enqueue a wake for a blocked crew"
@@ -64,7 +72,7 @@ grep -q 'herdr: agent blocked' "$STATE_DIR/.wake-queue" || fail "the stale paylo
 pass "handle_push_transition: a blocked crew enqueues a stale wake naming its window and wakes the supervisor"
 
 reset_state
-fm_write_meta "$STATE_DIR/tk1.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+write_event_meta tk1 default:wG:pQ ship
 MARKER=$(transition_marker default:wG:pQ)
 (
   fm_wake_append() { return 1; }
@@ -73,10 +81,21 @@ MARKER=$(transition_marker default:wG:pQ)
 [ ! -e "$MARKER" ] || fail "a failed durable enqueue must leave the blocked edge eligible for reconnect reconciliation"
 pass "handle_push_transition: enqueue failure cannot commit the Herdr dedupe marker"
 
+reset_state
+write_event_meta tk-old default:wG:pQ ship
+OLD_RECORD=$(mkrec wG:pQ blocked)
+rm -f "$STATE_DIR/tk-old.meta"
+write_event_meta tk-new default:wG:pQ ship
+handle_push_transition herdr default "$OLD_RECORD" >/dev/null 2>&1 || true
+[ ! -e "$STATE_DIR/.wake-queue" ] || fail "retired buffered event enqueued a wake for the replacement task"
+[ ! -s "$WAKE_LOG" ] || fail "retired buffered event woke the replacement task"
+[ ! -e "$(transition_marker default:wG:pQ)" ] || fail "retired buffered event committed against the replacement task"
+pass "handle_push_transition treats reassigned buffered events as UNKNOWN"
+
 # --- handle_push_transition: absorb (no wake, no enqueue) for a declared pause -
 
 reset_state
-fm_write_meta "$STATE_DIR/tk2.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+write_event_meta tk2 default:wG:pQ ship
 MARKER=$(transition_marker default:wG:pQ)
 PAUSED_KEY=$(fm_marker_task_key tk2)
 printf 'paused: waiting on the upstream release\n' > "$STATE_DIR/tk2.status"
@@ -93,8 +112,8 @@ pass "handle_push_transition: a declared-pause crew enters the shared pause cade
 # --- event_wait_or_sleep: secondmate windows are excluded from the pane list --
 
 reset_state
-fm_write_meta "$STATE_DIR/tk3.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
-fm_write_meta "$STATE_DIR/sm1.meta" "window=default:wA:pS" "backend=herdr" "kind=secondmate"
+write_event_meta tk3 default:wG:pQ ship
+write_event_meta sm1 default:wA:pS secondmate
 fm_backend_events_capable() { return 0; }
 fm_backend_wait_transition() { shift 4; printf '%s\n' "$*" > "$TMP/panes"; return 1; }
 event_wait_or_sleep
@@ -104,7 +123,7 @@ case "$PANES" in *"default:wA:pS"*) fail "a kind=secondmate window must be EXCLU
 pass "event_wait_or_sleep: herdr windows go on the event pane list, but kind=secondmate endpoints are excluded"
 
 reset_state
-fm_write_meta "$STATE_DIR/tk3.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+write_event_meta tk3 default:wG:pQ ship
 CAP_CALLS=0
 fm_backend_events_capable() { CAP_CALLS=$((CAP_CALLS + 1)); return 0; }
 fm_backend_wait_transition() {
@@ -129,7 +148,7 @@ pass "event_wait_or_sleep: a home with no push-capable window is inert (sleeps P
 # --- event_wait_or_sleep: runtime failures disable the event path (fail-closed)
 
 reset_state
-fm_write_meta "$STATE_DIR/tk5.meta" "window=default:wG:pQ" "backend=herdr" "kind=ship"
+write_event_meta tk5 default:wG:pQ ship
 EVENT_CAP_FAIL_MAX=2
 fm_backend_events_capable() { return 0; }
 fm_backend_wait_transition() { printf 'WT\n' >> "$TMP/wtcalls"; return 2; }

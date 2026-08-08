@@ -1042,7 +1042,7 @@ event_wait_or_sleep() {
 }
 
 # handle_push_transition: act on a fresh actionable (blocked) transition record
-# the backend returned. Maps the pane back to its window and task, applies the
+# the backend returned. Revalidates its bound window and task, applies the
 # declared-pause exemption (a crewmate waiting on a known external dependency is not
 # a surprise block - absorb it on the poll loop's long pause cadence instead),
 # and otherwise enqueues an immediate `stale` wake and wakes the supervisor. The
@@ -1051,15 +1051,19 @@ event_wait_or_sleep() {
 # machinery already understands it (queued by key=window, so a later poll-path
 # stale for the same pane collapses on drain).
 handle_push_transition() {  # <backend> <session> <record>
-  local backend=$1 session=$2 record=$3 pane_id to window task exact_task lock key h reason
+  local backend=$1 session=$2 record=$3 pane_id to window task generation identity lock key h reason
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
-  window="$session:$pane_id"
-  task=$(window_to_task "$window" "$STATE")
+  task=$(fm_transition_task_id "$record")
+  generation=$(fm_transition_generation_id "$record")
+  window=$(fm_transition_window "$record")
+  identity=$(fm_transition_meta_identity "$record")
+  [ -n "$task" ] && [ -n "$generation" ] && [ "$window" = "$session:$pane_id" ] && [ -n "$identity" ] \
+    || { sleep 1; return 1; }
   lock=$(fm_account_lifecycle_lock_acquire "$STATE" "$task") || { sleep 1; return 1; }
-  exact_task=$(fm_backend_transition_task "$backend" "$STATE" "$window" 2>/dev/null || true)
-  if [ "$exact_task" != "$task" ] || ! migrate_watcher_state "$window" "$task"; then
+  if ! fm_backend_transition_record_matches "$backend" "$STATE" "$session" "$record" \
+    || ! migrate_watcher_state "$window" "$task"; then
     fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
     sleep 1
     return 1

@@ -3319,32 +3319,43 @@ fm_backend_herdr_event_reader_cmd() {
 }
 
 fm_backend_herdr_safe_meta_load() {
-  local meta=$1 contents line backend_count=0 window_count=0
-  contents=$(fm_marker_safe_file_read "$meta") || return 1
-  FM_BACKEND_HERDR_META_BACKEND=
-  FM_BACKEND_HERDR_META_WINDOW=
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      backend=*)
-        backend_count=$((backend_count + 1))
-        FM_BACKEND_HERDR_META_BACKEND=${line#backend=}
-        ;;
-      window=*)
-        window_count=$((window_count + 1))
-        FM_BACKEND_HERDR_META_WINDOW=${line#window=}
-        ;;
-    esac
-  done <<EOF
-$contents
-EOF
-  [ "$backend_count" -le 1 ] && [ "$window_count" -le 1 ] || return 1
-  case "$FM_BACKEND_HERDR_META_BACKEND$FM_BACKEND_HERDR_META_WINDOW" in
-    *$'\t'*|*$'\r'*|*$'\n'*) return 1 ;;
-  esac
+  local meta=$1 snapshot
+  snapshot=$(fm_backend_herdr_control_exec perl -MDigest::SHA=sha256_hex -MFcntl=:mode -e '
+    my ($path) = @ARGV;
+    my @before = lstat($path);
+    exit 1 if !@before || !S_ISREG($before[2]) || S_ISLNK($before[2]);
+    open my $fh, q{<}, $path or exit 1;
+    binmode $fh;
+    my @opened = stat($fh);
+    exit 1 if !@opened || $before[0] != $opened[0] || $before[1] != $opened[1];
+    local $/;
+    my $contents = <$fh>;
+    exit 1 if !defined($contents);
+    my @after = lstat($path);
+    exit 1 if !@after || $opened[0] != $after[0] || $opened[1] != $after[1];
+    my (%values, %counts);
+    for my $line (split /\n/, $contents, -1) {
+      for my $key (qw(backend window generation_id)) {
+        if ($line =~ /^\Q$key\E=(.*)\z/s) {
+          ++$counts{$key};
+          $values{$key} = $1;
+        }
+      }
+    }
+    exit 1 if grep { ($counts{$_} // 0) > 1 } qw(backend window generation_id);
+    exit 1 if grep { ($values{$_} // q{}) =~ /[\t\r\n]/ } qw(backend window generation_id);
+    my $identity = join(q{:}, $opened[0], $opened[1], length($contents), sha256_hex($contents));
+    print join(qq{\t}, map { $values{$_} // q{} } qw(backend window generation_id)), qq{\t}, $identity;
+  ' "$meta") || return 1
+  FM_BACKEND_HERDR_META_BACKEND=$(printf '%s' "$snapshot" | fm_backend_herdr_control_exec cut -f1)
+  FM_BACKEND_HERDR_META_WINDOW=$(printf '%s' "$snapshot" | fm_backend_herdr_control_exec cut -f2)
+  FM_BACKEND_HERDR_META_GENERATION=$(printf '%s' "$snapshot" | fm_backend_herdr_control_exec cut -f3)
+  FM_BACKEND_HERDR_META_IDENTITY=$(printf '%s' "$snapshot" | fm_backend_herdr_control_exec cut -f4)
+  [ -n "$FM_BACKEND_HERDR_META_IDENTITY" ]
 }
 
-fm_backend_herdr_task_for_window() {
-  local state=$1 window=$2 meta task owner= count=0
+fm_backend_herdr_binding_for_window() {
+  local state=$1 window=$2 meta task owner= generation= identity= count=0
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || [ -L "$meta" ] || continue
@@ -3355,11 +3366,32 @@ fm_backend_herdr_task_for_window() {
     fm_backend_herdr_safe_meta_load "$meta" || return 1
     [ "$FM_BACKEND_HERDR_META_BACKEND" = herdr ] || continue
     [ "$FM_BACKEND_HERDR_META_WINDOW" = "$window" ] || continue
+    [ -n "$FM_BACKEND_HERDR_META_GENERATION" ] || return 1
     owner=$task
+    generation=$FM_BACKEND_HERDR_META_GENERATION
+    identity=$FM_BACKEND_HERDR_META_IDENTITY
     count=$((count + 1))
   done
   [ "$count" -eq 1 ] || return 1
-  printf '%s' "$owner"
+  printf '%s\t%s\t%s\t%s' "$owner" "$generation" "$window" "$identity"
+}
+
+fm_backend_herdr_task_for_window() {
+  fm_backend_herdr_binding_for_window "$1" "$2" | fm_backend_herdr_control_exec cut -f1
+}
+
+fm_backend_herdr_binding_matches() {
+  local state=$1 task=$2 generation=$3 window=$4 identity=$5 meta binding
+  case "$task" in ''|.*|-*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  [ -n "$generation" ] && [ -n "$window" ] && [ -n "$identity" ] || return 1
+  meta="$state/$task.meta"
+  fm_backend_herdr_safe_meta_load "$meta" || return 1
+  [ "$FM_BACKEND_HERDR_META_BACKEND" = herdr ] \
+    && [ "$FM_BACKEND_HERDR_META_WINDOW" = "$window" ] \
+    && [ "$FM_BACKEND_HERDR_META_GENERATION" = "$generation" ] \
+    && [ "$FM_BACKEND_HERDR_META_IDENTITY" = "$identity" ] || return 1
+  binding=$(fm_backend_herdr_binding_for_window "$state" "$window") || return 1
+  [ "$binding" = "$task"$'\t'"$generation"$'\t'"$window"$'\t'"$identity" ]
 }
 
 fm_backend_herdr_legacy_task_for_key() {
@@ -3399,13 +3431,39 @@ fm_backend_herdr_lifecycle_lock_owned() {
   [ "$pid" = "$PPID" ] && [ -n "$parent_start" ] && [ "$start" = "$parent_start" ]
 }
 
+fm_backend_herdr_record_binding_matches() {
+  local state=$1 session=$2 record=$3 pane_id task generation window identity
+  fm_transition_binding_complete "$record" || return 1
+  pane_id=$(fm_transition_pane_id "$record")
+  task=$(fm_transition_task_id "$record")
+  generation=$(fm_transition_generation_id "$record")
+  window=$(fm_transition_window "$record")
+  identity=$(fm_transition_meta_identity "$record")
+  [ -n "$pane_id" ] && [ "$window" = "$session:$pane_id" ] || return 1
+  fm_backend_herdr_binding_matches "$state" "$task" "$generation" "$window" "$identity"
+}
+
+fm_backend_herdr_bind_transition_record() {
+  local record=$1 binding=$2 task generation window identity
+  task=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f1)
+  generation=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f2)
+  window=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f3)
+  identity=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f4)
+  [ -n "$task" ] && [ -n "$generation" ] && [ -n "$window" ] && [ -n "$identity" ] || return 1
+  fm_transition_bind "$record" "$task" "$generation" "$window" "$identity"
+}
+
 # fm_backend_herdr_escalation_marker: the per-pane dedupe marker path for a
 # <window> ("<session>:<pane_id>"), under <state_dir>.
 fm_backend_herdr_escalation_marker() {  # <state_dir> <window>
-  local state=$1 window=$2 expected_task=${3:-} task key legacy lossy marker old owner legacy_task rc
+  local state=$1 window=$2 expected_task=${3:-} expected_generation=${4:-} expected_identity=${5:-} task key legacy lossy marker old owner legacy_task rc
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
   task=$(fm_backend_herdr_task_for_window "$state" "$window") || return 1
   [ -z "$expected_task" ] || [ "$task" = "$expected_task" ] || return 1
+  if [ -n "$expected_generation$expected_identity" ]; then
+    [ -n "$expected_task" ] && [ -n "$expected_generation" ] && [ -n "$expected_identity" ] || return 1
+    fm_backend_herdr_binding_matches "$state" "$expected_task" "$expected_generation" "$window" "$expected_identity" || return 1
+  fi
   key=$(fm_marker_identity_key_with_executor "$window" fm_backend_herdr_control_exec) || return 1
   owner=$(fm_marker_identity_owner_path "$state" herdr-transition "$key") || return 1
   fm_marker_identity_owner_claim "$state" herdr-transition "$key" "$window" || return 1
@@ -3434,6 +3492,9 @@ fm_backend_herdr_escalation_marker() {  # <state_dir> <window>
     fm_marker_safe_regular_file "$marker" || return 1
   fi
   fm_marker_safe_file_equals "$owner" "$window" || return 1
+  if [ -n "$expected_generation$expected_identity" ]; then
+    fm_backend_herdr_binding_matches "$state" "$expected_task" "$expected_generation" "$window" "$expected_identity" || return 1
+  fi
   printf '%s' "$marker"
 }
 
@@ -3447,16 +3508,19 @@ fm_backend_herdr_escalation_marker() {  # <state_dir> <window>
 # with no output. <session> reconstructs the exact window
 # ("<session>:<pane_id>") for the marker key.
 fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record>
-  local state=$1 session=$2 record=$3 pane_id to action window task lock marker result=1 output=
+  local state=$1 session=$2 record=$3 pane_id to action window task generation identity lock marker result=1 output=
   pane_id=$(fm_transition_pane_id "$record")
   [ -n "$pane_id" ] || return 1
   to=$(fm_transition_to_status "$record")
   action=$(fm_transition_policy "$to")
-  window="$session:$pane_id"
-  task=$(fm_backend_herdr_task_for_window "$state" "$window") || return 1
+  task=$(fm_transition_task_id "$record")
+  generation=$(fm_transition_generation_id "$record")
+  window=$(fm_transition_window "$record")
+  identity=$(fm_transition_meta_identity "$record")
+  [ "$window" = "$session:$pane_id" ] || return 1
   lock=$(fm_account_lifecycle_lock_acquire "$state" "$task") || return 1
-  if [ "$(fm_backend_herdr_task_for_window "$state" "$window" 2>/dev/null || true)" = "$task" ]; then
-    marker=$(fm_backend_herdr_escalation_marker "$state" "$window" "$task" 2>/dev/null || true)
+  if fm_backend_herdr_binding_matches "$state" "$task" "$generation" "$window" "$identity"; then
+    marker=$(fm_backend_herdr_escalation_marker "$state" "$window" "$task" "$generation" "$identity" 2>/dev/null || true)
     if [ -n "$marker" ] && fm_marker_state_path_safe_or_absent "$marker"; then
       case "$action" in
         actionable)
@@ -3466,7 +3530,8 @@ fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record>
           fi
           ;;
         absorb)
-          fm_backend_herdr_control_exec rm -f "$marker" 2>/dev/null || result=1
+          fm_backend_herdr_binding_matches "$state" "$task" "$generation" "$window" "$identity" \
+            && fm_backend_herdr_control_exec rm -f "$marker" 2>/dev/null || result=1
           ;;
       esac
     fi
@@ -3477,11 +3542,15 @@ fm_backend_herdr_apply_transition() {  # <state_dir> <session> <record>
 }
 
 fm_backend_herdr_commit_transition() {  # <state_dir> <session> <record> [task] [lifecycle-lock]
-  local state=$1 session=$2 record=$3 task=${4:-} inherited=${5:-} pane_id window lock marker result=0 owned=0
+  local state=$1 session=$2 record=$3 expected_task=${4:-} inherited=${5:-} pane_id task generation window identity lock marker result=0 owned=0
   pane_id=$(fm_transition_pane_id "$record")
   [ -n "$pane_id" ] || return 1
-  window="$session:$pane_id"
-  [ -n "$task" ] || task=$(fm_backend_herdr_task_for_window "$state" "$window") || return 1
+  task=$(fm_transition_task_id "$record")
+  generation=$(fm_transition_generation_id "$record")
+  window=$(fm_transition_window "$record")
+  identity=$(fm_transition_meta_identity "$record")
+  [ "$window" = "$session:$pane_id" ] || return 1
+  [ -z "$expected_task" ] || [ "$task" = "$expected_task" ] || return 1
   if [ -n "$inherited" ]; then
     fm_backend_herdr_lifecycle_lock_owned "$state" "$task" "$inherited" || return 1
     lock=$inherited
@@ -3489,19 +3558,24 @@ fm_backend_herdr_commit_transition() {  # <state_dir> <session> <record> [task] 
     lock=$(fm_account_lifecycle_lock_acquire "$state" "$task") || return 1
     owned=1
   fi
-  [ "$(fm_backend_herdr_task_for_window "$state" "$window" 2>/dev/null || true)" = "$task" ] || result=1
+  fm_backend_herdr_binding_matches "$state" "$task" "$generation" "$window" "$identity" || result=1
   if [ "$result" -eq 0 ]; then
-    marker=$(fm_backend_herdr_escalation_marker "$state" "$window" "$task") || result=1
+    marker=$(fm_backend_herdr_escalation_marker "$state" "$window" "$task" "$generation" "$identity") || result=1
   fi
+  [ "$result" -ne 0 ] || fm_backend_herdr_binding_matches "$state" "$task" "$generation" "$window" "$identity" || result=1
   [ "$result" -ne 0 ] || fm_marker_atomic_write "$marker" "$window" || result=1
   [ "$owned" -ne 1 ] || fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || result=1
   return "$result"
 }
 
 fm_backend_herdr_clear_transition() {  # <state_dir> <window> [task] [lifecycle-lock]
-  local state=$1 window=$2 task=${3:-} inherited=${4:-} lock marker key owner result=0 owned=0
+  local state=$1 window=$2 expected_task=${3:-} inherited=${4:-} binding task generation identity lock marker key owner result=0 owned=0
   [ -n "$window" ] || return 0
-  [ -n "$task" ] || task=$(fm_backend_herdr_task_for_window "$state" "$window") || return 1
+  binding=$(fm_backend_herdr_binding_for_window "$state" "$window") || return 1
+  task=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f1)
+  generation=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f2)
+  identity=$(printf '%s' "$binding" | fm_backend_herdr_control_exec cut -f4)
+  [ -z "$expected_task" ] || [ "$task" = "$expected_task" ] || return 1
   if [ -n "$inherited" ]; then
     fm_backend_herdr_lifecycle_lock_owned "$state" "$task" "$inherited" || return 1
     lock=$inherited
@@ -3509,11 +3583,12 @@ fm_backend_herdr_clear_transition() {  # <state_dir> <window> [task] [lifecycle-
     lock=$(fm_account_lifecycle_lock_acquire "$state" "$task") || return 1
     owned=1
   fi
-  [ "$(fm_backend_herdr_task_for_window "$state" "$window" 2>/dev/null || true)" = "$task" ] || result=1
+  fm_backend_herdr_binding_matches "$state" "$task" "$generation" "$window" "$identity" || result=1
   if [ "$result" -eq 0 ]; then
-    marker=$(fm_backend_herdr_escalation_marker "$state" "$window" "$task") || result=1
+    marker=$(fm_backend_herdr_escalation_marker "$state" "$window" "$task" "$generation" "$identity") || result=1
   fi
   [ "$result" -ne 0 ] || fm_marker_state_path_safe_or_absent "$marker" || result=1
+  [ "$result" -ne 0 ] || fm_backend_herdr_binding_matches "$state" "$task" "$generation" "$window" "$identity" || result=1
   [ "$result" -ne 0 ] || fm_backend_herdr_control_exec rm -f "$marker" 2>/dev/null || result=1
   if [ "$result" -eq 0 ]; then
     key=$(fm_marker_identity_key_with_executor "$window" fm_backend_herdr_control_exec) || result=1
@@ -3548,14 +3623,17 @@ fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pa
   [ -n "$sock" ] || return 2
 
   # Map each window to its herdr pane id (strip the leading "<session>:").
-  local w pane_id
+  local w pane_id binding
   local pane_ids=()
+  local pane_bindings=()
   for w in "${windows[@]}"; do
     pane_id=${w#*:}
     if [ -z "$pane_id" ] || [ "$pane_id" = "$w" ]; then
       continue
     fi
+    binding=$(fm_backend_herdr_binding_for_window "$state" "$w" 2>/dev/null) || continue
     pane_ids+=("$pane_id")
+    pane_bindings+=("$binding")
   done
   [ "${#pane_ids[@]}" -gt 0 ] || return 2
 
@@ -3568,7 +3646,7 @@ fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pa
   done < <(fm_backend_herdr_event_reader_cmd)
   [ "${#reader[@]}" -gt 0 ] || return 2
 
-  local fifo_dir fifo reader_pid line ws status agent raw record hit rc=1 reader_rc=0
+  local fifo_dir fifo reader_pid line ws status agent raw record hit i rc=1 reader_rc=0
   fifo_dir=$(fm_backend_herdr_control_exec mktemp -d "${TMPDIR:-/tmp}/fm-herdr-eventwait.XXXXXX") || return 2
   fifo="$fifo_dir/events"
   if ! fm_backend_herdr_control_exec mkfifo "$fifo" 2>/dev/null; then
@@ -3592,19 +3670,29 @@ fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pa
   # newer edges accumulate in the active stream. `working` panes clear their
   # marker here too.
   if [ "$rc" -ne 2 ]; then
-    for w in "${windows[@]}"; do
-      pane_id=${w#*:}
-      if [ -z "$pane_id" ] || [ "$pane_id" = "$w" ]; then
+    i=0
+    while [ "$i" -lt "${#pane_ids[@]}" ]; do
+      pane_id=${pane_ids[$i]}
+      binding=${pane_bindings[$i]}
+      raw=$(fm_backend_herdr_agent_status_raw "$session" "$pane_id")
+      if [ -z "$raw" ]; then
+        i=$((i + 1))
         continue
       fi
-      raw=$(fm_backend_herdr_agent_status_raw "$session" "$pane_id")
-      [ -n "$raw" ] || continue
-      record=$(fm_backend_herdr_normalize_event "$pane_id" "" "$raw" "")
+      record=$(fm_backend_herdr_normalize_event "$pane_id" "" "$raw" "") || {
+        i=$((i + 1))
+        continue
+      }
+      record=$(fm_backend_herdr_bind_transition_record "$record" "$binding") || {
+        i=$((i + 1))
+        continue
+      }
       if hit=$(fm_backend_herdr_apply_transition "$state" "$session" "$record"); then
         printf '%s' "$hit"
         rc=0
         break
       fi
+      i=$((i + 1))
     done
   fi
 
@@ -3622,7 +3710,18 @@ fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pa
     status=$(printf '%s' "$line" | fm_backend_herdr_control_exec cut -f3)
     agent=$(printf '%s' "$line" | fm_backend_herdr_control_exec cut -f4)
     [ -n "$pane_id" ] || continue
+    binding=
+    i=0
+    while [ "$i" -lt "${#pane_ids[@]}" ]; do
+      if [ "${pane_ids[$i]}" = "$pane_id" ]; then
+        binding=${pane_bindings[$i]}
+        break
+      fi
+      i=$((i + 1))
+    done
+    [ -n "$binding" ] || continue
     record=$(fm_backend_herdr_normalize_event "$pane_id" "$ws" "$status" "$agent")
+    record=$(fm_backend_herdr_bind_transition_record "$record" "$binding") || continue
     if hit=$(fm_backend_herdr_apply_transition "$state" "$session" "$record"); then
       printf '%s' "$hit"
       rc=0

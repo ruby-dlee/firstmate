@@ -8,10 +8,11 @@
 #   1. The NORMALIZED TRANSITION RECORD - the ONE shape every backend's event
 #      stream is normalized into before any policy runs. A single TAB-separated
 #      line:
-#          <pane_id>\t<workspace_id>\t<from_status>\t<to_status>\t<agent>
-#      Only `to_status` is authoritative for the policy below; the other fields
-#      are identity/telemetry and MAY be empty when a backend cannot supply
-#      them. `from_status` in particular is empty for backends whose event
+#          <pane_id>\t<workspace_id>\t<from_status>\t<to_status>\t<agent>\t<task_id>\t<generation_id>\t<window>\t<meta_identity>
+#      Only `to_status` is authoritative for the policy below; provider fields
+#      MAY be empty when a backend cannot supply them, while the final four
+#      custody fields must be complete before an observation can mutate state
+#      or wake a task. `from_status` in particular is empty for backends whose event
 #      carries only the new status (herdr's `pane.agent_status_changed` does
 #      not report the previous status, and its stream is edge-triggered, so
 #      each `to_status` IS itself a fresh edge); it exists in the shape for
@@ -33,25 +34,30 @@
 # (the watcher's event-wait splice) for the consumer.
 
 # Field separator for the normalized record. A literal TAB; every field is
-# scrubbed of TAB/newline by the producer so the record is exactly five fields.
+# scrubbed of TAB/newline by the producer so the record is exactly nine fields.
 FM_TRANSITION_FIELD_SEP=$'\t'
 
 # fm_transition_record: THE constructor for a normalized transition record.
 # Both a backend's stream normalizer and its level-reconcile read MUST build
 # records through this one function, so the record's field order and separator
 # have a single owner. Fields are TAB/newline-scrubbed here.
-fm_transition_record() {  # <pane_id> <workspace_id> <from_status> <to_status> <agent>
-  local pane_id ws from to agent
+fm_transition_record() {  # <pane_id> <workspace_id> <from_status> <to_status> <agent> [task] [generation] [window] [meta-identity]
+  local pane_id ws from to agent task generation window meta_identity
   pane_id=$(fm_transition_clean_field "${1:-}")
   ws=$(fm_transition_clean_field "${2:-}")
   from=$(fm_transition_clean_field "${3:-}")
   to=$(fm_transition_clean_field "${4:-}")
   agent=$(fm_transition_clean_field "${5:-}")
-  printf '%s\t%s\t%s\t%s\t%s' "$pane_id" "$ws" "$from" "$to" "$agent"
+  task=$(fm_transition_clean_field "${6:-}")
+  generation=$(fm_transition_clean_field "${7:-}")
+  window=$(fm_transition_clean_field "${8:-}")
+  meta_identity=$(fm_transition_clean_field "${9:-}")
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+    "$pane_id" "$ws" "$from" "$to" "$agent" "$task" "$generation" "$window" "$meta_identity"
 }
 
 # fm_transition_clean_field: collapse any TAB/CR/LF in a field value to spaces
-# so a stray control char can never desync the fixed five-field record.
+# so a stray control char can never desync the fixed nine-field record.
 fm_transition_clean_field() {  # <value>
   printf '%s' "${1:-}" | LC_ALL=C tr '\t\r\n' '   '
 }
@@ -66,6 +72,27 @@ fm_transition_workspace_id() { fm_transition_field "$1" 2; }
 fm_transition_from_status()  { fm_transition_field "$1" 3; }
 fm_transition_to_status()    { fm_transition_field "$1" 4; }
 fm_transition_agent()        { fm_transition_field "$1" 5; }
+fm_transition_task_id()      { fm_transition_field "$1" 6; }
+fm_transition_generation_id() { fm_transition_field "$1" 7; }
+fm_transition_window()       { fm_transition_field "$1" 8; }
+fm_transition_meta_identity() { fm_transition_field "$1" 9; }
+
+fm_transition_bind() {  # <record> <task> <generation> <window> <meta-identity>
+  fm_transition_record \
+    "$(fm_transition_pane_id "$1")" \
+    "$(fm_transition_workspace_id "$1")" \
+    "$(fm_transition_from_status "$1")" \
+    "$(fm_transition_to_status "$1")" \
+    "$(fm_transition_agent "$1")" \
+    "$2" "$3" "$4" "$5"
+}
+
+fm_transition_binding_complete() {
+  [ -n "$(fm_transition_task_id "$1")" ] \
+    && [ -n "$(fm_transition_generation_id "$1")" ] \
+    && [ -n "$(fm_transition_window "$1")" ] \
+    && [ -n "$(fm_transition_meta_identity "$1")" ]
+}
 
 # fm_transition_policy: THE single-owner status -> supervision-action table.
 # Given a normalized `to_status`, print exactly one action token:

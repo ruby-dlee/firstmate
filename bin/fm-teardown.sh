@@ -5784,6 +5784,10 @@ if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then
     echo "error: direct spawn artifact backup is unavailable for $ID; retaining cleanup state" >&2
     exit 1
   }
+  fm_backend_clear_transition "$BACKEND" "$STATE" "$T" "$ID" "$ACCOUNT_DELETE_LOCK" || {
+    echo "error: failed generation transition state could not be cleared for $ID; retaining cleanup state" >&2
+    exit 1
+  }
   direct_spawn_restore_lock=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   if ! fm_account_restore_artifacts "$STATE" "$ID" "$DIRECT_SPAWN_ARTIFACTS" "$TASK_TMP" 1 "$TASK_GENERATION" \
     || ! fm_account_meta_merge_extensions "$META" "$direct_spawn_backup_path" \
@@ -5799,7 +5803,6 @@ if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then
     exit 1
   fi
   fm_account_meta_lock_release "$direct_spawn_restore_lock" || exit 1
-  fm_backend_clear_transition "$BACKEND" "$STATE" "$T" "$ID" "$ACCOUNT_DELETE_LOCK" || true
   [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
   echo "cleaned failed direct spawn for $ID and restored the prior task generation"
   exit 0

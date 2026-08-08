@@ -131,7 +131,7 @@ test_classify_check_and_unknown_escalate() {
 
 test_liveness_verdicts_surface_through_away_classifiers() {
   local verdict dir state fakebin current out
-  for verdict in alive stalled dead unknown; do
+  for verdict in alive dead unknown; do
     dir=$(make_supercase "away-liveness-$verdict")
     state="$dir/state"
     fakebin="$dir/fakebin"
@@ -144,7 +144,7 @@ test_liveness_verdicts_surface_through_away_classifiers() {
       FM_FAKE_CREW_STATE="$current" classify_signal "$state/task.turn-ended" "$state")
     case "$verdict:$out" in
       alive:self\|*) ;;
-      stalled:escalate\|*|dead:escalate\|*|unknown:escalate\|*) ;;
+      dead:escalate\|*|unknown:escalate\|*) ;;
       *) fail "away signal classification mishandled $verdict liveness: $out" ;;
     esac
 
@@ -152,7 +152,7 @@ test_liveness_verdicts_surface_through_away_classifiers() {
       FM_FAKE_CREW_STATE="$current" classify_stale "sess:fm-task" "$state")
     case "$verdict:$out" in
       alive:self\|*) ;;
-      stalled:escalate\|*|dead:escalate\|*|unknown:escalate\|*) ;;
+      dead:escalate\|*|unknown:escalate\|*) ;;
       *) fail "away stale classification mishandled $verdict liveness: $out" ;;
     esac
 
@@ -160,11 +160,11 @@ test_liveness_verdicts_surface_through_away_classifiers() {
       FM_FAKE_CREW_STATE="$current" classify_heartbeat "$state")
     case "$verdict:$out" in
       alive:self\|*) ;;
-      stalled:escalate\|*|dead:escalate\|*|unknown:escalate\|*) ;;
+      dead:escalate\|*|unknown:escalate\|*) ;;
       *) fail "away heartbeat classification mishandled $verdict liveness: $out" ;;
     esac
   done
-  pass "away-mode signal, stale, and heartbeat classifiers preserve alive/stalled/dead/unknown actionability"
+  pass "away-mode signal, stale, and heartbeat classifiers preserve alive/dead/unknown actionability"
 }
 
 test_stale_transient_self_records_marker() {

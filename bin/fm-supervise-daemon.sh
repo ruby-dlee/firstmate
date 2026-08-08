@@ -348,7 +348,7 @@ classify_signal() {  # <reason-after-colon> <state>
           liveness=$(crew_state_liveness_verdict "$current")
           case "$liveness" in
             alive|'') ;;
-            stalled|dead|unknown)
+            dead|unknown)
               liveness_rel=1
               distilled="${distilled}${task} liveness ${liveness}: ${current} | "
               ;;
@@ -393,7 +393,7 @@ classify_stale() {  # <window> <state>
   liveness=$(crew_state_liveness_verdict "$current")
   case "$liveness" in
     alive|'') ;;
-    stalled|dead|unknown)
+    dead|unknown)
       printf 'escalate|%s liveness %s: %s' "$task" "$liveness" "$current"
       return
       ;;
@@ -434,7 +434,7 @@ classify_heartbeat() {  # [state]
     [ -n "$task" ] || continue
     case "$liveness" in
       alive) ;;
-      stalled|dead|unknown) distilled="${distilled}${task} liveness ${liveness}: ${current} | " ;;
+      dead|unknown) distilled="${distilled}${task} liveness ${liveness}: ${current} | " ;;
       *) distilled="${distilled}${task} liveness unknown: ${current} | " ;;
     esac
   done < <(scan_crew_liveness_observations "$state")

@@ -23,11 +23,12 @@ The pause contract is `paused: <reason>; owner=<named owner>; clears=<observable
 The owner may be a person, team, service, or other accountable role, and `clears` must name a fact, event, or time a supervisor can observe rather than a vague intention.
 Only a non-failure declaration carrying both non-placeholder fields earns pause absorption.
 A bare pause verb, a missing owner, or a missing clearing condition is actionable stopped work and receives no marker or pause cadence.
-The normal watcher writes `.paused-<window>` and `.paused-rechecked-<window>` before returning the declaration's initial one-time signal wake, so re-arming cannot lose the state transition.
+The normal watcher writes `.paused-<window>` and clears any stale wedge timing before returning the declaration's initial one-time signal wake, so re-arming cannot lose the state transition.
+Registration proves only the declaration itself, so it never seeds the `.paused-rechecked-<window>` verdict cache; the first stale classification establishes that cache after the keyed open-decision fold has also passed.
 An owned pause is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
 A pause is a statement about the work rather than about the terminal, so it is honoured whether the crewmate's pane is alive, idle, or gone, and whatever its attributed no-mistakes run reports - parked, failed or cancelled, or unreadable.
 The single exception is an actively `working` run-step or busy pane, which supersedes the declaration because the crewmate resumed after making it.
-Absorption is gated on two proofs taken from one immutable read of the crewmate's current durable status stream: an owned-and-clearing declaration carrying no failure vocabulary in its headline, and an empty keyed open/resolved fold, so a pause can never mask a still-unanswered decision.
+Absorption is gated on two proofs taken from one immutable read of the crewmate's current durable status stream: an owned-and-clearing declaration carrying no failure vocabulary in any of its prose-clause headlines, and an empty keyed open/resolved fold, so a pause can never mask a still-unanswered decision.
 The Herdr native blocked-transition edge does not yet honour this invariant, which is a known defect tracked as `herdr-push-transition-pause-gate-h8`: on that edge a lane that owes an unanswered keyed decision can be silently absorbed and go quiet.
 A crewmate with no locatable status stream is refused rather than absorbed, and stopped crewmates without a valid declaration surface immediately.
 Inside `bin/fm-crew-state.sh` itself the same declaration also becomes the reported current state once its attributed run has stopped at a terminal or approval-gate boundary (`done` or `parked`); active, failed, stale, and unknown runs retain run-step precedence there.
@@ -35,7 +36,7 @@ Pause cadence markers remain in force while the latest durable status still decl
 Its initial normal-mode status signal still surfaces through the no-verb path, while away mode self-handles that routine signal and owns the later recheck.
 The bounded recheck includes the named owner and clearing condition, so a supervisor that observes the condition has passed can resume or surface a lane whose declaration still persists.
 Fresh stale panes use the same current-state read before trusting the status log, so an active run or busy pane outranks an old captain-relevant status-log line left behind before validation.
-Heartbeats are benign only when the fleet scan finds neither an unsurfaced captain-relevant status nor a `stalled`, `dead`, or `unknown` command-step liveness observation.
+Heartbeats are benign only when the fleet scan finds neither an unsurfaced captain-relevant status nor a `dead` or `unknown` command-step liveness observation.
 Absorbed wakes advance their suppression markers, log to `state/.watch-triage.log`, and keep the watcher blocking without a queue record or LLM turn.
 At each drain boundary, `fm-wake-drain.sh` first intakes durable Lavish answers, then drains queued wakes and runs the same liveness guard as the supervision scripts, so unreceipted answers recover and a lapsed watcher chain surfaces even on a turn that only drains and handles queued wakes.
 Routine watcher polling, supervision no-ops, elapsed waiting time, and absorbed benign wakes stay silent.
@@ -49,7 +50,8 @@ The most recent recognized ci log marker wins, so checks-green monitoring suppli
 Only when no matching run exists does it fall back to the pane busy-signature and then a status-log event whose verb maps to a recognized run-state; a dead pane without a run reports unknown instead of trusting a stale log.
 Decision-only events such as `resolved` never become current state or leak their prose into the current-state detail.
 In that status-log fallback, a valid external wait reports `paused` with its reason, owner, and clearing condition.
-A readable idle ordinary crewmate with no positive working evidence and no valid pause reports `wedged`, while missing or unreadable evidence remains `unknown`; neither is treated as healthy.
+An idle ordinary crewmate whose last event still claims work in progress, with no positive working evidence and no valid pause, reports `wedged`; decision-only events, unrecognized verbs, and evidence-free silence remain `unknown`.
+Neither state is treated as healthy.
 For herdr, that pane fallback trusts a native `busy` verdict outright, but corroborates native `idle` or unknown verdicts against the rendered busy signature before deciding the crewmate is not working.
 For whole-fleet read-only review, `bin/fm-fleet-snapshot.sh --json` emits schema `fm-fleet-snapshot.v1` from the backlog, task metadata, current crewmate state, endpoint probes, PR/report pointers, scout reports, the bounded landed-work roll-up from registered secondmate homes, and secondmate return-channel guidance.
 `bin/fm-fleet-view.sh` renders that snapshot as Markdown for humans, while `bin/fm-bearings-snapshot.sh` provides the bounded bearings projection, so both views consume one structured contract instead of reparsing raw fleet files.

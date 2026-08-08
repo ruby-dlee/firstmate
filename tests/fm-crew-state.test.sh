@@ -205,7 +205,7 @@ case "${FM_FAKE_LIVENESS_MODE:-}" in
   empty-procs) printf 'liveness: unknown · run: 01RUN · procs:  · grade: unreadable · missing count · doing: bash t.sh (1:00)\n' ;;
   argv-fields) printf 'liveness: unknown · run: 01RUN · procs: 3 · grade: present-unproven · presence established · doing: python -c "procs: x grade: bogus" (1:00)\n' ;;
   nonzero) exit 9 ;;
-  stalled) printf 'liveness: stalled · run: 01RUN · procs: 2 · no persistent process advanced cpu in 30s (best +0.01s)\n' ;;
+  no-progress) printf 'liveness: unknown · run: 01RUN · procs: 2 · grade: present-no-progress · PRESENT BUT NOT PROGRESSING: stable membership and no persistent process advanced cpu in 30s (best +0.01s)\n' ;;
   timeout) sleep 30 ;;
   *) printf 'liveness: alive · run: 01RUN · procs: 1 · persistent process advanced cpu over 30s (best +0.04s)\n' ;;
 esac
@@ -553,11 +553,12 @@ test_quiet_step_probe_failures_are_unknown() {
   assert_contains "$out" "probe unreadable: active step unavailable" "a missing active step explains its unreadable cause"
 
   FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-qu test)"
-  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=stalled \
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=no-progress \
     run_crew_state "$d" feat-qu)
-  assert_contains "$out" "liveness: stalled (2 procs)" "the probe's near-zero CPU verdict remains stalled"
+  assert_contains "$out" "liveness: unknown (grade: present-no-progress; 2 procs" \
+    "the probe's near-zero CPU grade stays an explicit unknown, never a fourth verdict"
   assert_contains "$out" "no persistent process advanced cpu in 30s (best +0.01s)" \
-    "the stalled verdict preserves its CPU-versus-elapsed evidence"
+    "the present-no-progress grade preserves its CPU-versus-elapsed evidence"
 
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=empty \
     run_crew_state "$d" feat-qu)
@@ -1525,7 +1526,7 @@ test_no_run_idle_pane_custom_paused_verb() {
   assert_contains "$out" "vendor maintenance window" "custom pause preserves its reason"
   printf 'paused: default verb no longer selected\n' > "$d/state/feat-custom-pause.status"
   out=$(FM_CLASSIFY_PAUSED_VERB=awaiting run_crew_state "$d" feat-custom-pause)
-  assert_contains "$out" "state: wedged" "custom paused verb leaves the unrecognized default stopped, not paused"
+  assert_contains "$out" "state: unknown" "custom paused verb leaves the unrecognized default a non-state, not paused"
   pass "no run + idle pane honors the configured paused verb"
 }
 
@@ -1612,6 +1613,18 @@ test_no_run_idle_secondmate_resolved_event_not_state() {
   out=$(run_crew_state "$d" mate)
   assert_contains "$out" "state: working" "a real trailing state verb still renders"
   assert_contains "$out" "reconciling routed items" "a real state line still carries its detail"
+  # The invariant is about the EVENT, not the kind: a ship whose last event only
+  # closed a decision has no current-state source either, so it must not be graded
+  # a stopped lane and must not render the resolution prose as what it is doing.
+  fm_write_meta "$d/state/hull.meta" "window=fm:fm-hull" "worktree=$d/wt" "kind=ship"
+  printf 'needs-decision [key=rollback]: merge as-is, or fix the empty-pointer refusal?\n' \
+    > "$d/state/hull.status"
+  printf 'resolved [key=rollback]: option (a) approved - merge this rebase as-is\n' \
+    >> "$d/state/hull.status"
+  out=$(run_crew_state "$d" hull)
+  assert_contains "$out" "state: unknown" "a resolved-then-idle ship is not graded a stopped lane"
+  assert_contains "$out" "source: none" "a resolved event is not a status-log state source for a ship either"
+  assert_not_contains "$out" "merge this rebase as-is" "ship resolution prose must not leak into the detail"
   pass "a trailing resolved: event does not corrupt state render (idle stays idle)"
 }
 

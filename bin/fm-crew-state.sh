@@ -16,7 +16,7 @@
 # stable, parseable, token-tight line firstmate can read every heartbeat:
 #
 #   state: <working|parked|done|stale|blocked|wedged|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
-#   ... · liveness: <alive|stalled|dead|unknown> · step: <name>
+#   ... · liveness: <alive|dead|unknown> · step: <name>
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
@@ -541,9 +541,10 @@ nm_active_step_name() {
 # turnover without paying the 20-second window CPU rates require. Stable process
 # membership falls back to the probe's preserved long-window CPU baseline. The
 # probe owns the CPU-versus-elapsed measurement and its threshold; this consumer
-# accepts exactly four verdicts: alive, stalled, dead, or unknown. A missing,
-# failed, empty, or malformed probe is unknown, never silence and never evidence
-# of health or death.
+# accepts exactly three verdicts: alive, dead, or unknown - presence the probe
+# could not prove is progressing arrives as a graded unknown, not a fourth verdict.
+# A missing, failed, empty, or malformed probe is unknown, never silence and never
+# evidence of health or death.
 nm_step_liveness() {
   local run_id out status=0 verdict procs doing grade detail detail_fields line rest reported_run structured_detail progress
   run_id=$(strip_quotes "$(nm_field id)")
@@ -611,7 +612,7 @@ nm_step_liveness() {
     grade:\ *) grade=${structured_detail#grade: }; grade=${grade%%"$SEP"*} ;;
   esac
   case "$verdict" in
-    alive|stalled|dead|unknown) ;;
+    alive|dead|unknown) ;;
     *) printf 'unknown (probe protocol unreadable: verdict missing or invalid)'; return ;;
   esac
   case "$procs" in
@@ -620,14 +621,11 @@ nm_step_liveness() {
       return
       ;;
   esac
-  # Both positive-presence verdicts carry the same invariant: `stalled` means the
-  # probe watched processes that failed to advance, so a zero count is a protocol
-  # violation there exactly as it is for `alive`.
   case "$verdict" in
-    alive|stalled)
+    alive)
       case "$procs" in
         *[1-9]*) ;;
-        *) printf 'unknown (probe protocol unreadable: %s verdict requires processes)' "$verdict"; return ;;
+        *) printf 'unknown (probe protocol unreadable: alive verdict requires processes)'; return ;;
       esac
       ;;
     dead)
@@ -946,10 +944,7 @@ if [ -n "$LOG_VERB" ]; then
         && emit working status-log "$(status_line_note "$LOG_LINE")"
       emit wedged status-log "stopped without positive working evidence; last event: $(status_line_note "$LOG_LINE")"
       ;;
-    unknown)
-      [ "$KIND" = secondmate ] \
-        || emit wedged status-log "stopped without positive working evidence; last event: $(status_line_note "$LOG_LINE")"
-      ;;
+    unknown) ;;
     *) emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")" ;;
   esac
 fi

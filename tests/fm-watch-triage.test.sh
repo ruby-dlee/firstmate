@@ -290,10 +290,25 @@ test_failure_pause_is_failure_classifier() {
   status_pause_is_failure 'paused: the Shopify webhook failed, waiting for the captain' \
     || fail "a failure word inside the headline did not escalate"
 
-  # (4) The headline bound itself: text after the reason's first colon is detail, not
+  # (4) The headline bound itself: text after a clause's first colon is detail, not
   # headline, so a failure word only in the detail tail does not escalate.
   status_pause_is_failure 'paused: waiting on the vendor window: previous attempt failed; owner=vendor; clears=maintenance window opens' \
     && fail "a failure word in the detail tail (past the first colon) escalated"
+
+  # (4b) The bound is per CLAUSE, not per line: a failure reported in a later prose
+  # clause is still a failure report, so the semicolons the contract fields need
+  # cannot become a place to hide one.
+  status_pause_is_failure 'paused: retrying the upstream fetch; the previous run failed with an i/o timeout; owner=vendor; clears=vendor API returns 200' \
+    || fail "a failure reported in a later prose clause was not detected"
+  status_is_paused 'paused: retrying the upstream fetch; the previous run failed with an i/o timeout; owner=vendor; clears=vendor API returns 200' \
+    && fail "a failure reported in a later prose clause was still absorbed as a declared wait"
+  # ...while the contract fields themselves are structured metadata, not prose: an
+  # observable clearing condition may legitimately name the failure it ends.
+  status_pause_is_failure 'paused: waiting on the vendor window; owner=vendor; clears=the upstream i/o timeout stops' \
+    && fail "failure vocabulary inside a contract field escalated"
+  # A declaration with contract fields but no reason of its own is not a declaration.
+  status_is_paused 'paused: owner=vendor; clears=the vendor window opens' \
+    && fail "a pause with no stated reason earned absorption"
 
   # (5) Both knobs are data. A home can retune the vocabulary and the bound, and the
   # discriminator follows the configurable pause verb rather than the literal.
@@ -349,10 +364,10 @@ test_crew_absorb_class_classifier() {
   FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running) · liveness: alive (2 procs) · step: test'
   [ "$(crew_absorb_class a)" = working ] || fail "alive command-step liveness not classed working"
   crew_has_measured_progress a || fail "alive CPU/process progress was not recognized at the wedge boundary"
-  FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running) · liveness: stalled (2 procs; cpu +0.01s/30s) · step: test'
-  [ "$(crew_state_liveness_verdict "$FM_FAKE_CREW_STATE")" = stalled ] \
-    || fail "the probe's stalled verdict was not preserved"
-  [ "$(crew_absorb_class a)" = none ] || fail "stalled command-step liveness was absorbed as working"
+  FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running) · liveness: unknown (grade: present-no-progress; 2 procs; PRESENT BUT NOT PROGRESSING: stable membership and no persistent process advanced cpu in 30s (best +0.01s)) · step: test'
+  [ "$(crew_state_liveness_verdict "$FM_FAKE_CREW_STATE")" = unknown ] \
+    || fail "the probe's present-no-progress grade was not read as unknown"
+  [ "$(crew_absorb_class a)" = none ] || fail "present-no-progress liveness was absorbed as working"
   ! crew_has_measured_progress a || fail "near-zero CPU progress was treated as measured work"
   FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running) · liveness: dead (0 procs) · step: test'
   [ "$(crew_absorb_class a)" = none ] || fail "dead command-step liveness was absorbed as working"
@@ -799,8 +814,8 @@ test_owned_pause_signal_registers_marker() {
     || fail "the initial owned-pause declaration did not produce its one-time signal wake"
   [ -e "$state/.paused-$key" ] \
     || consequences="${consequences}pause marker absent; "
-  [ -e "$state/.paused-rechecked-$key" ] \
-    || consequences="${consequences}bounded recheck timestamp absent; "
+  [ ! -e "$state/.paused-rechecked-$key" ] \
+    || consequences="${consequences}registration seeded the recheck cache before the open-decision fold ran; "
   [ ! -e "$state/.stale-since-$key" ] \
     || consequences="${consequences}pre-existing stale timer remains; "
   [ ! -e "$state/.wedge-escalations-$key" ] \
@@ -1578,12 +1593,13 @@ test_paused_authoritative_working_preserves_wedge_timer() {
 }
 
 # The step-liveness probe owns the CPU-versus-elapsed threshold and exposes its
-# conclusion as alive (measured CPU/process progress) or stalled (near-zero CPU
-# progress).  At the wedge threshold the watcher must consume that verdict again:
+# conclusion as alive (measured CPU/process progress) or, for near-zero CPU
+# progress, a present-no-progress grade under unknown - never a fourth verdict.
+# At the wedge threshold the watcher must consume that verdict again:
 # pane staleness alone cannot distinguish the measured 2026-08-04 starved run from
 # a hang.
 test_cpu_progress_suppresses_static_pane_wedge() {
-  local dir state fakebin out capture_file statusf window key pane_hash sig pid before after
+  local dir state fakebin out capture_file statusf window key pane_hash sig pid before after waited
   dir=$(make_case cpu-progress-static-pane); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/cpu-progress.status"
   window="test:fm-cpu-progress"
@@ -1607,12 +1623,23 @@ test_cpu_progress_suppresses_static_pane_wedge() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=2 \
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
-  if ! wait_live "$pid" 35; then
-    reap "$pid"; fail "a static pane with measured CPU progress raised a wedge wake: $(cat "$out")"
-  fi
-  after=$(cat "$state/.stale-since-$key" 2>/dev/null || echo 0)
+  # Wait for the observation itself rather than for a fixed slice of wall clock:
+  # under load the watcher can still be building its stable-hash count when a
+  # fixed window expires, which says nothing about the verdict under test.
+  after=0
+  waited=0
+  while [ "$waited" -lt 300 ]; do
+    kill -0 "$pid" 2>/dev/null \
+      || { reap "$pid"; fail "a static pane with measured CPU progress raised a wedge wake: $(cat "$out")"; }
+    after=$(cat "$state/.stale-since-$key" 2>/dev/null || echo 0)
+    [ "$after" -gt "$before" ] && break
+    sleep 0.1
+    waited=$((waited + 1))
+  done
   [ "$after" -gt "$before" ] \
     || { reap "$pid"; fail "measured CPU progress did not refresh the bounded wedge observation"; }
+  kill -0 "$pid" 2>/dev/null \
+    || { reap "$pid"; fail "a static pane with measured CPU progress raised a wedge wake: $(cat "$out")"; }
   [ ! -s "$state/.wake-queue" ] \
     || { reap "$pid"; fail "measured CPU progress enqueued a possible-wedge wake"; }
   reap "$pid"
@@ -1635,9 +1662,10 @@ test_near_zero_cpu_static_pane_still_wedge_escalates() {
   printf '%s' "$pane_hash" > "$state/.stale-$key"
   printf '1\n' > "$state/.count-$key"
   printf '%s\n' $(( $(date +%s) - 500 )) > "$state/.stale-since-$key"
-  # The probe's measured trace-noise floor is +0.01s over 30s = 0.033%; that
-  # remains stalled, not a blanket presence-based working verdict.
-  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating · liveness: stalled (2 procs; cpu +0.01s/30s=0.033%; no persistent cpu progress) · step: test'
+  # The probe's measured trace-noise floor is +0.01s over 30s = 0.033%; presence it
+  # cannot prove is progressing stays a graded unknown, not a blanket presence-based
+  # working verdict.
+  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating · liveness: unknown (grade: present-no-progress; 2 procs; PRESENT BUT NOT PROGRESSING: stable membership and no persistent process advanced cpu in 30s (best +0.01s)) · step: test'
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_STALE_ESCALATE_SECS=2 \
@@ -1873,9 +1901,9 @@ test_heartbeat_backstop_surfaces_unsurfaced_status() {
   pass "heartbeat backstop fail-safe surfaces a captain-relevant status the per-wake path missed"
 }
 
-test_heartbeat_surfaces_stalled_dead_and_unknown_liveness() {
+test_heartbeat_surfaces_dead_and_unknown_liveness() {
   local verdict dir state fakebin out pid
-  for verdict in stalled dead unknown; do
+  for verdict in dead unknown; do
     dir=$(make_case "heartbeat-liveness-$verdict")
     state="$dir/state"
     fakebin="$dir/fakebin"
@@ -1892,7 +1920,7 @@ test_heartbeat_surfaces_stalled_dead_and_unknown_liveness() {
     grep -Fx "heartbeat" "$out" >/dev/null \
       || fail "$verdict command-step liveness did not exit through the heartbeat actionability boundary"
   done
-  pass "heartbeat actionability surfaces stalled, dead, and unknown command-step liveness"
+  pass "heartbeat actionability surfaces both dead and unknown command-step liveness"
 }
 
 # --- beacon stays fresh while absorbing -------------------------------------
@@ -2175,7 +2203,7 @@ if [ "${FM_TEST_FOCUSED:-}" = liveness-verdicts ]; then
   test_crew_is_provably_working_classifier
   test_crew_absorb_class_classifier
   test_signal_crew_provably_working_classifier
-  test_heartbeat_surfaces_stalled_dead_and_unknown_liveness
+  test_heartbeat_surfaces_dead_and_unknown_liveness
   exit 0
 fi
 
@@ -2223,7 +2251,7 @@ test_nonterminal_stale_repairs_missing_or_corrupt_timer
 test_triage_log_size_cap_accepts_spaced_wc_counts
 test_heartbeat_no_change_absorbed
 test_heartbeat_backstop_surfaces_unsurfaced_status
-test_heartbeat_surfaces_stalled_dead_and_unknown_liveness
+test_heartbeat_surfaces_dead_and_unknown_liveness
 test_beacon_stays_fresh_while_absorbing
 test_afk_present_reverts_watcher_to_one_shot
 test_afk_paused_changed_pane_hands_off_plain_stale

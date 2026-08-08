@@ -5552,21 +5552,81 @@ EOF
 
 test_account_lock_deadline_bounds_nested_custody() {
   local case_dir state task lock mutation held start before after elapsed status lock_inode mutation_inode
+  local sequence_state sequence_task sequence_lock sequence_mutation sequence_observed mutation_pid attempts
   . "$ROOT/bin/fm-account-routing-lib.sh"
   case_dir="$TMP_ROOT/account-lock-deadline"
   state="$case_dir/state"
   task=$(printf '%0232d' 0)
   mkdir -p "$state"
 
-  before=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
-    || fail "account lock creation deadline fixture could not read its start time"
+  before=$(fm_account_system_perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+    -e 'printf "%.6f", clock_gettime(CLOCK_MONOTONIC)') \
+    || fail "account lock creation deadline fixture could not read its monotonic start"
   held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task") \
     || fail "zero-budget account lock creation refused an uncontended immediate attempt"
-  after=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
-    || fail "account lock creation deadline fixture could not read its end time"
-  elapsed=$((after - before))
-  [ "$elapsed" -lt 4 ] || fail "uncontended account lock creation exceeded its elapsed bound: ${elapsed}s"
+  after=$(fm_account_system_perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+    -e 'printf "%.6f", clock_gettime(CLOCK_MONOTONIC)') \
+    || fail "account lock creation deadline fixture could not read its monotonic end"
+  elapsed=$(fm_account_system_perl -e 'printf "%.3f", $ARGV[1] - $ARGV[0]' "$before" "$after") \
+    || fail "account lock creation deadline fixture could not calculate monotonic elapsed time"
+  fm_account_system_perl -e 'exit !($ARGV[0] < 8)' "$elapsed" \
+    || fail "uncontended account lock creation exceeded its elapsed bound: ${elapsed}s"
   fm_account_meta_lock_release "$held" || fail "account lock creation deadline fixture could not release custody"
+
+  sequence_state="$case_dir/sequence-state"
+  sequence_task=$(printf '%0232d' 1)
+  mkdir -p "$sequence_state"
+  sequence_lock=$(fm_account_lock_path "$sequence_state" "$sequence_task" account-lifecycle) \
+    || fail "cross-phase deadline fixture could not resolve its bounded lock"
+  sequence_mutation=$(fm_account_lock_identity_mutation_path "$sequence_lock") \
+    || fail "cross-phase deadline fixture could not resolve its mutation boundary"
+  sequence_observed="$case_dir/sequence-mutation-observed"
+  mkdir "$sequence_lock"
+  start=$(fm_account_process_start_time "$$") \
+    || fail "cross-phase deadline fixture could not read its live lock owner"
+  printf '%s\n%s\n' "$$" "$start" > "$sequence_lock/owner"
+  bash -c '
+    . "$1"
+    deadline=$(fm_account_lock_deadline_from_wait 20) || exit 71
+    mutation=$(fm_account_lock_identity_mutation_acquire "$2" "$deadline") || exit 72
+    : > "$3" || exit 73
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_SLEEP_BIN" 6 || exit 74
+    fm_account_lock_identity_mutation_release "$mutation"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$sequence_lock" "$sequence_observed" &
+  mutation_pid=$!
+  attempts=0
+  while [ ! -f "$sequence_observed" ] && [ "$attempts" -lt 400 ]; do
+    attempts=$((attempts + 1))
+    sleep 0.05
+  done
+  [ -f "$sequence_observed" ] || fail "cross-phase deadline fixture did not acquire mutation custody"
+  before=$(fm_account_system_perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+    -e 'printf "%.6f", clock_gettime(CLOCK_MONOTONIC)') \
+    || fail "cross-phase deadline fixture could not read its monotonic start"
+  if FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=8 \
+    fm_account_lifecycle_lock_acquire "$sequence_state" "$sequence_task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  after=$(fm_account_system_perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+    -e 'printf "%.6f", clock_gettime(CLOCK_MONOTONIC)') \
+    || fail "cross-phase deadline fixture could not read its monotonic end"
+  if wait "$mutation_pid"; then :; else fail "cross-phase deadline fixture could not release mutation custody"; fi
+  elapsed=$(fm_account_system_perl -e 'printf "%.3f", $ARGV[1] - $ARGV[0]' "$before" "$after") \
+    || fail "cross-phase deadline fixture could not calculate monotonic elapsed time"
+  [ "$status" -ne 0 ] || fail "cross-phase deadline fixture bypassed a live bounded owner"
+  fm_account_lock_identity_validate "$sequence_lock" \
+    || fail "cross-phase deadline fixture did not publish the formerly absent exact claim"
+  [ "$FM_ACCOUNT_LOCK_IDENTITY_NAME" = account-lifecycle ] \
+    && [ "$FM_ACCOUNT_LOCK_IDENTITY_TASK" = "$sequence_task" ] \
+    || fail "cross-phase deadline fixture published the wrong exact claim"
+  fm_account_system_perl -e 'exit !(($ARGV[0] >= 5.5) && ($ARGV[0] < 12.5))' "$elapsed" \
+    || fail "claim waiting reset the remaining carrier deadline: ${elapsed}s"
+  [ ! -e "$sequence_mutation" ] && [ ! -L "$sequence_mutation" ] \
+    || fail "cross-phase deadline fixture retained mutation custody"
+  fm_account_lifecycle_lock_release "$sequence_lock" \
+    || fail "cross-phase deadline fixture could not release its live bounded owner"
 
   lock=$(fm_account_lock_path "$state" "$task" account-meta) \
     || fail "account lock deadline fixture could not resolve its bounded lock"

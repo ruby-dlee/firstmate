@@ -784,6 +784,13 @@ EOF
   assert_contains "$out" "source: run-step" "the live monitor remains the current-state source"
   assert_not_contains "$out" "state: paused" "missing worktree must not hide an unbounded monitor"
 
+  FM_FAKE_CI_LOGS="all CI checks passed - still monitoring until merged or closed"
+  out=$(run_crew_state "$d" feat-ci-ready-paused-live-monitor)
+  assert_contains "$out" "state: working" "a green-only held monitor stays authoritative"
+  assert_contains "$out" "held PR still monitoring" "the green marker retains the live hold boundary"
+  assert_not_contains "$out" "state: done" "a green marker must not finish a held live monitor"
+  assert_not_contains "$out" "state: paused" "a held live monitor must remain on the wedge path"
+
   FM_FAKE_CI_LOGS=$(cat <<'EOF'
 all CI checks passed - still monitoring until merged or closed
 base branch advanced, re-arming CI monitor timeout

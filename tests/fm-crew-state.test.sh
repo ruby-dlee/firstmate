@@ -21,10 +21,9 @@
 #   (i) kind=scout skips the run lookup                           -> pane/status-log
 #   (j) torn-down worktree / missing meta                         -> unknown/none
 #   (l) a quiet active step carries a real liveness verdict (dead / alive /
-#       unknown) from bin/fm-nm-step-liveness.sh. The ordinary ci path is exempt
-#       because it owns no worktree process, while the green-then-paused orphan
-#       case uses only the probe's distinct missing-worktree observation as
-#       corroboration - the 2026-08-02 false-dead regression pair.
+#       unknown) from bin/fm-nm-step-liveness.sh. The ci path is exempt because
+#       its daemon-owned monitor has no worktree process, so missing-worktree
+#       evidence never overrides a live ci run - the 2026-08-02 false-dead pair.
 #   (k) crew_is_provably_working end-to-end over the REAL helper (not a canned
 #       fake fm-crew-state.sh verdict): cross-branch attribution via the runs
 #       list -> absorbed; genuinely no run anywhere + idle pane -> surfaced.
@@ -737,39 +736,69 @@ test_ci_ready_done_log_beats_monitoring_run() {
   pass "ci-ready status log beats monitoring run"
 }
 
-# A green PR can be deliberately held after the crewmate has returned from the
-# CI-ready point. If the old ci monitor has also lost its worktree, its orphaned
-# `running` row is corroborating record drift rather than positive working
-# evidence. The helper must expose the current declared pause instead of letting
-# that row outrank the pause forever.
-test_ci_ready_pause_beats_orphaned_monitor_record() {
+# A finished lane with no matching run is genuinely idle. Its green report and
+# declared hold therefore fall through to the status log and use pause cadence
+# instead of the wedge timer.
+test_finished_green_pr_pause_without_live_run_is_paused() {
   reset_fakes
   local d out
-  d=$(new_case ci-ready-paused-orphan)
-  make_repo_on_branch "$d/wt" fm/feat-ci-ready-paused-orphan
+  d=$(new_case ci-ready-paused-idle)
+  make_repo_on_branch "$d/wt" fm/feat-ci-ready-paused-idle
   make_fakebin "$d" >/dev/null
-  fm_write_meta "$d/state/feat-ci-ready-paused-orphan.meta" \
-    "window=fm:fm-feat-ci-ready-paused-orphan" "worktree=$d/wt" "kind=ship"
-  cat > "$d/state/feat-ci-ready-paused-orphan.status" <<'EOF'
+  fm_write_meta "$d/state/feat-ci-ready-paused-idle.meta" \
+    "window=fm:fm-feat-ci-ready-paused-idle" "worktree=$d/wt" "kind=ship"
+  cat > "$d/state/feat-ci-ready-paused-idle.status" <<'EOF'
 done: PR https://github.com/o/r/pull/2 checks green
 paused: PR 2 is green and deliberately held pending a decision
 EOF
-  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-ci-ready-paused-orphan)"
-  FM_FAKE_CI_LOGS=""
-  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$d/fakebin/fake-liveness" \
-    FM_FAKE_LIVENESS_MODE=no-worktree run_crew_state "$d" feat-ci-ready-paused-orphan)
-  assert_contains "$out" "state: paused" "green held PR with an orphaned ci record -> paused"
-  assert_contains "$out" "source: status-log" "the declared hold remains the current-state source"
-  assert_contains "$out" "orphaned ci run record has no worktree" \
-    "the paused verdict names the corroborating orphaned record"
-  assert_not_contains "$out" "state: working" "the orphaned ci record must not claim positive work"
-  pass "a green held PR is paused when its lingering ci record has no worktree"
+  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_BUSY=0
+  out=$(run_crew_state "$d" feat-ci-ready-paused-idle)
+  assert_contains "$out" "state: paused" "finished green held PR -> paused"
+  assert_contains "$out" "source: status-log" "the idle lane's declared hold is authoritative"
+  assert_not_contains "$out" "state: working" "a finished lane must not enter the wedge path"
+  pass "a finished green held PR without a live run remains a declared pause"
 }
 
-# The orphan discriminator is deliberately conjunctive. No ready report means
-# there is no proof that the work reached the CI-ready boundary, and a positive
-# process reading means the run really is active. Either one preserves working
-# precedence so the watcher's ordinary wedge timer still applies.
+# A no-mistakes ci step monitors until merge. Holding a green PR removes that
+# terminal condition administratively, so the matching ci run is genuinely live
+# and potentially unbounded even when its worktree is missing or its log is
+# temporarily unreadable. A later base-advance re-arm makes that fact explicit.
+test_ci_hold_does_not_hide_live_monitor() {
+  reset_fakes
+  local d out
+  d=$(new_case ci-ready-paused-live-monitor)
+  make_repo_on_branch "$d/wt" fm/feat-ci-ready-paused-live-monitor
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-ci-ready-paused-live-monitor.meta" \
+    "window=fm:fm-feat-ci-ready-paused-live-monitor" "worktree=$d/wt" "kind=ship"
+  cat > "$d/state/feat-ci-ready-paused-live-monitor.status" <<'EOF'
+done: PR https://github.com/o/r/pull/2 checks green
+paused: PR 2 is green and deliberately held pending a decision
+EOF
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-ci-ready-paused-live-monitor)"
+  FM_FAKE_CI_LOGS=""
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$d/fakebin/fake-liveness" \
+    FM_FAKE_LIVENESS_MODE=no-worktree run_crew_state "$d" feat-ci-ready-paused-live-monitor)
+  assert_contains "$out" "state: working" "an unreadable live ci monitor stays authoritative"
+  assert_contains "$out" "source: run-step" "the live monitor remains the current-state source"
+  assert_not_contains "$out" "state: paused" "missing worktree must not hide an unbounded monitor"
+
+  FM_FAKE_CI_LOGS=$(cat <<'EOF'
+all CI checks passed - still monitoring until merged or closed
+base branch advanced, re-arming CI monitor timeout
+EOF
+)
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$d/fakebin/fake-liveness" \
+    FM_FAKE_LIVENESS_MODE=no-worktree run_crew_state "$d" feat-ci-ready-paused-live-monitor)
+  assert_contains "$out" "state: working" "a re-armed live monitor remains on the wedge path"
+  assert_not_contains "$out" "state: paused" "a declared hold must not suppress re-armed CI"
+  pass "a held PR never hides its live monitor-until-merge run"
+}
+
+# No ready report means there is no proof that the work reached the CI-ready
+# boundary, and a positive process reading independently proves active work.
+# Either one preserves working precedence so the watcher's wedge timer applies.
 test_ci_pause_does_not_hide_a_real_active_run() {
   reset_fakes
   local d out
@@ -1806,7 +1835,8 @@ test_genuine_parked_not_superseded
 test_scalar_gate_parked_not_superseded
 test_gate_block_parked_not_superseded
 test_ci_ready_done_log_beats_monitoring_run
-test_ci_ready_pause_beats_orphaned_monitor_record
+test_finished_green_pr_pause_without_live_run_is_paused
+test_ci_hold_does_not_hide_live_monitor
 test_ci_pause_does_not_hide_a_real_active_run
 test_ci_ready_log_pr_url_does_not_supply_run_identity
 test_ci_monitoring_checks_green_surfaces_done

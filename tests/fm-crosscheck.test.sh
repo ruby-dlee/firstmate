@@ -202,6 +202,7 @@ set -u
 runner=$(basename "$0")
 startup_marker=$(dirname "$0")/$runner-startup-failure
 missing_dependency_marker=$(dirname "$0")/$runner-missing-dependency
+hook_failure_marker=$(dirname "$0")/$runner-hook-failure
 [ ! -f "$startup_marker" ] || {
   echo "MEASURED $runner STARTUP FAILURE" >&2
   exit 1
@@ -224,11 +225,23 @@ esac
 runtime_field='"numRuntimeErrorTestSuites":0,'
 [ "$runner" = jest ] || runtime_field=
 selector=
-if [ "$#" -gt 0 ]; then
-  [ "$#" -eq 2 ] || exit 96
-  [ "$1" = --testNamePattern ] || exit 97
-  selector=$2
-fi
+body_probe=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --setupFilesAfterEnv|--runner)
+      body_probe=$2
+      shift 2
+      ;;
+    --testNamePattern)
+      selector=$2
+      shift 2
+      ;;
+    *) exit 96 ;;
+  esac
+done
+[ -n "$body_probe" ] || exit 97
+body_report=$(sed -n 's|^// crosscheck-body-report=||p' "$body_probe")
+[ -n "$body_report" ] || exit 98
 if [ -f "$missing_dependency_marker" ]; then
   if [ "$runner" = jest ]; then
     printf '%s\n' '{"success":false,"numRuntimeErrorTestSuites":1,"numPassedTests":0,"numFailedTests":0,"testResults":[{"status":"failed","assertionResults":[]}]}'
@@ -255,12 +268,25 @@ if [ "$selector" = "does not exist" ]; then
 JSON
   exit 0
 fi
+if [ -f "$hook_failure_marker" ]; then
+  : > "$body_report"
+  cat <<JSON
+{"success":false,$runtime_field"numPassedTests":0,"numFailedTests":1,"testResults":[{"status":"failed","assertionResults":[{"fullName":"across chats resets state","status":"failed"}]}]}
+JSON
+  exit 1
+fi
 if grep -qx fixed app.txt; then
+  printf '%s\n' \
+    '{"fullName":"within a chat stays stable"}' \
+    '{"fullName":"across chats resets state"}' > "$body_report"
   cat <<JSON
 {"success":true,$runtime_field"numPassedTests":2,"numFailedTests":0,"testResults":[{"status":"passed","assertionResults":[{"fullName":"within a chat stays stable","status":"passed"},{"fullName":"across chats resets state","status":"passed"}]}]}
 JSON
   exit 0
 fi
+printf '%s\n' \
+  '{"fullName":"within a chat stays stable"}' \
+  '{"fullName":"across chats resets state"}' > "$body_report"
 cat <<JSON
 {"success":false,$runtime_field"numPassedTests":1,"numFailedTests":1,"testResults":[{"status":"failed","assertionResults":[{"fullName":"within a chat stays stable","status":"passed"},{"fullName":"across chats resets state","status":"failed"}]}]}
 JSON
@@ -678,9 +704,12 @@ elif scenario in {
     "positional-target",
     "path-dependent",
     "jest-verified-fixed",
+    "jest-real-verified-fixed",
+    "jest-real-hook-failure",
     "jest-no-match",
     "jest-startup",
     "jest-missing-dependency",
+    "jest-hook-failure",
     "vitest-verified-fixed",
     "vitest-no-match",
     "vitest-startup",
@@ -695,9 +724,12 @@ elif scenario in {
         "positional-target",
         "path-dependent",
         "jest-verified-fixed",
+        "jest-real-verified-fixed",
+        "jest-real-hook-failure",
         "jest-no-match",
         "jest-startup",
         "jest-missing-dependency",
+        "jest-hook-failure",
         "vitest-verified-fixed",
         "vitest-no-match",
         "vitest-startup",
@@ -705,7 +737,22 @@ elif scenario in {
         "missing-named-test",
     }:
         patch.parent.mkdir(parents=True, exist_ok=True)
-        patch.write_text("""diff --git a/app.txt b/app.txt
+        if scenario == "jest-real-verified-fixed":
+            patch.write_text("""diff --git a/src/chat-state.js b/src/chat-state.js
+--- a/src/chat-state.js
++++ b/src/chat-state.js
+@@ -5,7 +5,6 @@ function createChatState() {
+   return {
+     next(chatId) {
+       if (chatId !== activeChat) {
+         activeChat = chatId;
+-        sequence = 0;
+       }
+       sequence += 1;
+       return sequence;
+""")
+        else:
+            patch.write_text("""diff --git a/app.txt b/app.txt
 --- a/app.txt
 +++ b/app.txt
 @@ -1 +1 @@
@@ -758,10 +805,13 @@ elif scenario in {
         "positional-target": "tests/vacuous.test.sh",
         "path-dependent": "tests/pathdep.test.sh",
         "missing-named-test": "tests/does-not-exist.test.js::across chats resets state",
+        "jest-real-verified-fixed": "tests/chat-state.test.js::(within a chat stays stable|across chats resets state)",
+        "jest-real-hook-failure": "tests/hook-failure.test.js::selected body",
         "jest-verified-fixed": "tests/regression.test.sh::(within a chat stays stable|across chats resets state)",
         "jest-no-match": "tests/regression.test.sh::does not exist",
         "jest-startup": "tests/regression.test.sh::across chats resets state",
         "jest-missing-dependency": "tests/regression.test.sh::across chats resets state",
+        "jest-hook-failure": "tests/regression.test.sh::across chats resets state",
         "vitest-verified-fixed": "tests/regression.test.sh::(within a chat stays stable|across chats resets state)",
         "vitest-no-match": "tests/regression.test.sh::does not exist",
         "vitest-startup": "tests/regression.test.sh::across chats resets state",
@@ -1024,7 +1074,7 @@ run_case() {
 }
 
 seed_open_ledger() {
-  local case_dir=$1 head=$2
+  local case_dir=$1 head=$2 implementation_path=${3:-app.txt}
   mkdir -p "$case_dir/data/task-x1"
   cat > "$case_dir/data/task-x1/crosscheck-ledger.json" <<JSON
 {
@@ -1037,7 +1087,7 @@ seed_open_ledger() {
     "title": "Prior blocker",
     "severity": "blocking",
     "description": "A durable reproduced blocker.",
-    "citations": [{"path": "app.txt", "line": 1}],
+    "citations": [{"path": "$implementation_path", "line": 1}],
     "history": [{
       "at": "2026-08-02T00:00:00Z",
       "head_sha": "$head",
@@ -2542,6 +2592,142 @@ PY
   pass "Jest and Vitest certify a platform-shaped passing-control/failing-regression mutation proof"
 }
 
+test_real_jest_certifies_platform_shaped_mutation_proof() {
+  local record case_dir base head runtime ledger rc
+  record=$(make_case jest-real-verified-fixed)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  mkdir -p "$case_dir/repo/src"
+  cat > "$case_dir/repo/src/chat-state.js" <<'JS'
+function createChatState() {
+  let activeChat;
+  let sequence = 0;
+  return {
+    next(chatId) {
+      if (chatId !== activeChat) {
+        activeChat = chatId;
+        sequence = 0;
+      }
+      sequence += 1;
+      return sequence;
+    },
+  };
+}
+
+module.exports = { createChatState };
+JS
+  cat > "$case_dir/repo/tests/chat-state.test.js" <<'JS'
+const { createChatState } = require('../src/chat-state.js');
+
+test('within a chat stays stable', () => {
+  const state = createChatState();
+  expect(state.next('chat-a')).toBe(1);
+  expect(state.next('chat-a')).toBe(2);
+});
+
+test('across chats resets state', () => {
+  const state = createChatState();
+  expect(state.next('chat-a')).toBe(1);
+  expect(state.next('chat-b')).toBe(1);
+});
+JS
+  git -C "$case_dir/repo" add src/chat-state.js tests/chat-state.test.js
+  git -C "$case_dir/repo" commit -qm 'add JavaScript regression proof'
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_open_ledger "$case_dir" "$head" src/chat-state.js
+
+  runtime="$TMP_ROOT/jest-29.7.0-runtime"
+  if [ ! -x "$runtime/node_modules/.bin/jest" ]; then
+    npm install --prefix "$runtime" --no-save --no-package-lock --ignore-scripts \
+      jest@29.7.0 >/dev/null \
+      || fail "Jest 29.7.0 runtime installation failed"
+  fi
+  ln -s "$runtime/node_modules/.bin/jest" "$case_dir/pathbin/jest"
+  "$case_dir/pathbin/jest" --version | grep -qx '29.7.0' \
+    || fail "real Jest integration did not resolve Jest 29.7.0"
+
+  run_case "$case_dir" "$base" "$head" jest-real-verified-fixed run \
+    > "$case_dir/out" 2> "$case_dir/err" \
+    || fail "real Jest mutation proof did not clear: $(tr '\n' ' ' < "$case_dir/err")"
+  ledger="$case_dir/data/task-x1/crosscheck-ledger.json"
+  python3 - "$ledger" <<'PY' \
+    || fail "real Jest mutation proof was not durably certified"
+import json
+import sys
+value = json.load(open(sys.argv[1]))
+finding = value["findings"][0]
+proof = finding["history"][-1]["proof"]
+assert finding["lifecycle"] == "verified-fixed", finding["lifecycle"]
+assert proof["test_invocation"] == {"runner": "jest", "arguments": []}
+assert proof["test_path"] == (
+    "tests/chat-state.test.js::"
+    "(within a chat stays stable|across chats resets state)"
+)
+assert proof["baseline_exit"] == 0
+assert proof["mutated_exit"] == 1
+assert proof["mutated_files"] == ["src/chat-state.js"]
+baseline = json.JSONDecoder().raw_decode(proof["baseline_output"])[0]
+mutated = json.JSONDecoder().raw_decode(proof["mutated_output"])[0]
+baseline_status = {
+    assertion["fullName"]: assertion["status"]
+    for suite in baseline["testResults"]
+    for assertion in suite["assertionResults"]
+}
+mutated_status = {
+    assertion["fullName"]: assertion["status"]
+    for suite in mutated["testResults"]
+    for assertion in suite["assertionResults"]
+}
+assert baseline_status == {
+    "within a chat stays stable": "passed",
+    "across chats resets state": "passed",
+}
+assert mutated_status == {
+    "within a chat stays stable": "passed",
+    "across chats resets state": "failed",
+}
+PY
+
+  record=$(make_case jest-real-hook-failure)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/tests/hook-failure.test.js" <<'JS'
+const { readFileSync } = require('node:fs');
+
+beforeEach(() => {
+  if (readFileSync('app.txt', 'utf8').trim() !== 'fixed') {
+    throw new Error('startup hook rejected mutated implementation');
+  }
+});
+
+test('selected body', () => {
+  expect(true).toBe(true);
+});
+JS
+  git -C "$case_dir/repo" add tests/hook-failure.test.js
+  git -C "$case_dir/repo" commit -qm 'add JavaScript hook proof'
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_open_ledger "$case_dir" "$head"
+  ln -s "$runtime/node_modules/.bin/jest" "$case_dir/pathbin/jest"
+  set +e
+  run_case "$case_dir" "$base" "$head" jest-real-hook-failure run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "real Jest beforeEach failure"
+  assert_grep 'NON-EXECUTION' "$case_dir/err" \
+    "a real Jest beforeEach failure was accepted as body execution"
+  assert_grep 'test-body execution evidence' "$case_dir/err" \
+    "a real Jest beforeEach failure did not name the missing body signal"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "a real Jest beforeEach failure cleared the finding"
+  pass "real Jest certifies the platform mutation and refuses hook-only failures"
+}
+
 test_javascript_non_executions_clear_nothing() {
   local runner scenario record case_dir base head rc
   for runner in jest vitest; do
@@ -2572,6 +2758,28 @@ assert value["findings"][0]["lifecycle"] == "open"
         || fail "$runner $scenario cleared a finding without running its test"
     done
   done
+
+  record=$(make_case jest-hook-failure)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  seed_open_ledger "$case_dir" "$head"
+  install_javascript_runner_fake "$case_dir" jest
+  : > "$case_dir/pathbin/jest-hook-failure"
+  set +e
+  run_case "$case_dir" "$base" "$head" jest-hook-failure run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "Jest hook failure without test-body execution"
+  assert_grep 'NON-EXECUTION' "$case_dir/err" \
+    "a failed Jest hook was accepted as test-body execution"
+  assert_grep 'no selected test body starting' "$case_dir/err" \
+    "the failed Jest hook did not name the missing body lifecycle signal"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "a failed Jest hook cleared a finding without running its test body"
 
   record=$(make_case missing-named-test)
   IFS=$'\t' read -r case_dir base head <<< "$record"
@@ -4121,8 +4329,8 @@ case = Path(sys.argv[2])
 checkout = case / "mono"
 path = "apps/web/tests/regression.test.tsx::(within a chat|across chats)"
 expected = {
-    "jest": (["--json", "--runTestsByPath"], "required-zero"),
-    "vitest": (["run", "--reporter=json"], "absent"),
+    "jest": (["--json", "--runTestsByPath"], "required-zero", "--setupFilesAfterEnv", True),
+    "vitest": (["run", "--reporter=json"], "absent", "--runner", False),
 }
 assert set(module.MUTATION_RUNNER_POLICIES) == {"pytest", "jest", "vitest"}
 for runner in ("jest", "vitest"):
@@ -4130,17 +4338,22 @@ for runner in ("jest", "vitest"):
     assert policy.measurement, runner
     assert policy.report_format == "jest-compatible-json", runner
     assert policy.runtime_error_field == expected[runner][1], runner
+    assert policy.body_probe, runner
+    assert policy.absolute_test_path is expected[runner][3], runner
     run = module.test_arguments(
         {"runner": runner, "arguments": []}, path, checkout, "proof"
     )
     assert run.cwd == (checkout / "apps/web").resolve(), run
     assert Path(run.argv[0]).name == runner, run.argv
     assert list(run.argv[1:3]) == expected[runner][0], run.argv
-    assert run.argv[3:] == (
-        "tests/regression.test.tsx",
-        "--testNamePattern",
-        "(within a chat|across chats)",
+    assert Path(run.argv[3]).is_absolute() is expected[runner][3], run.argv
+    assert Path(run.argv[3]).name == "regression.test.tsx", run.argv
+    assert run.argv[4] == expected[runner][2], run.argv
+    assert Path(run.argv[5]).is_file(), run.argv
+    assert run.argv[6:] == (
+        "--testNamePattern", "(within a chat|across chats)"
     ), run.argv
+    assert run.body_report is not None, runner
 
 neutral = case / "neutral"
 neutral.mkdir()
@@ -4360,6 +4573,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_silence_never_closes_prior_finding|\
     test_verified_fix_executes_mutation_proof|\
     test_javascript_runners_certify_platform_shaped_mutation_proofs|\
+    test_real_jest_certifies_platform_shaped_mutation_proof|\
     test_javascript_non_executions_clear_nothing|\
     test_javascript_runner_policy_is_declared_once|\
     test_pytest_runner_resolves_through_a_uv_aware_ladder|\
@@ -4413,6 +4627,14 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = javascript-body-proof ]; then
+  test_javascript_runner_policy_is_declared_once
+  test_javascript_runners_certify_platform_shaped_mutation_proofs
+  test_javascript_non_executions_clear_nothing
+  test_real_jest_certifies_platform_shaped_mutation_proof
+  exit 0
+fi
+
 test_launcher_requires_supported_python
 test_reviewer_policy_profiles_and_independence
 test_openai_backed_reviewer_proves_account_separation
@@ -4443,6 +4665,7 @@ test_new_finding_requires_executed_reproduction
 test_silence_never_closes_prior_finding
 test_verified_fix_executes_mutation_proof
 test_javascript_runners_certify_platform_shaped_mutation_proofs
+test_real_jest_certifies_platform_shaped_mutation_proof
 test_javascript_non_executions_clear_nothing
 test_node_id_selector_clears_a_passing_named_test
 test_absent_runner_is_never_a_test_outcome

@@ -1139,6 +1139,45 @@ test_monitor_has_no_reusable_observer_helpers() {
   pass "ownership monitor has no reusable observer helper PIDs"
 }
 
+test_monitor_startup_cleanup_refuses_reused_pid() {
+  local dir state fakebin out ready proceed captured decoy armpid i status=0
+  dir=$(make_case monitor-startup-reused-pid)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  ready="$dir/monitor.ready"
+  proceed="$dir/monitor.proceed"
+  captured="$dir/monitor.captured"
+  touch "$state/.last-check"
+  sleep 300 &
+  decoy=$!
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_ARM_CONFIRM_TIMEOUT=2 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_EXIT_READY="$ready" FM_WATCH_OWNER_TEST_EXIT_PROCEED="$proceed" \
+    FM_WATCH_OWNER_TEST_MONITOR_CAPTURED="$captured" FM_WATCH_OWNER_TEST_REUSED_MONITOR_PID="$decoy" \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    [ -e "$ready" ] && [ -e "$captured" ] && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$ready" ] && [ -e "$captured" ] \
+    || { kill "$decoy" 2>/dev/null || true; wait "$decoy" 2>/dev/null || true; fail "monitor did not pause after startup identity capture: $(cat "$out")"; }
+  touch "$proceed"
+  wait_for_exit "$armpid" 80 || status=$?
+  [ "$status" -ne 0 ] && [ "$status" -ne 124 ] \
+    || { kill "$decoy" 2>/dev/null || true; wait "$decoy" 2>/dev/null || true; fail "arm did not report forced monitor startup failure: $(cat "$out")"; }
+  is_live_non_zombie "$decoy" \
+    || fail "monitor startup cleanup signalled a reused PID"
+  kill "$decoy" 2>/dev/null || true
+  wait "$decoy" 2>/dev/null || true
+  pass "monitor startup cleanup refuses a reused PID"
+}
+
 test_watcher_self_evicts_on_lock_takeover() {
   local dir state fakebin out pid i lock_pid
   dir=$(make_case self-evict)
@@ -1983,6 +2022,12 @@ if [ "${FM_TEST_FOCUSED:-}" = monitor-observer ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = startup-identities ]; then
+  test_monitor_startup_cleanup_refuses_reused_pid
+  test_anchor_stop_refuses_reused_pid
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = arm-owner-death ]; then
   test_arm_owner_death_reaps_watcher_session
   exit 0
@@ -2030,6 +2075,7 @@ test_anchor_publication_waits_for_complete_identity
 test_monitor_recovers_root_kill_before_anchor_publication
 test_monitor_bounds_steady_state_process_creation
 test_monitor_has_no_reusable_observer_helpers
+test_monitor_startup_cleanup_refuses_reused_pid
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_arm_refuses_live_lock_with_bad_attach_cadence

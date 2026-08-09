@@ -50,6 +50,16 @@ monitor_exit_cleanup() {
 trap monitor_exit_cleanup EXIT
 trap 'exit 143' HUP TERM INT
 
+if [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
+  && [ -n "${FM_WATCH_OWNER_TEST_EXIT_READY:-}" ] \
+  && [ -n "${FM_WATCH_OWNER_TEST_EXIT_PROCEED:-}" ]; then
+  : > "$FM_WATCH_OWNER_TEST_EXIT_READY"
+  while [ ! -e "$FM_WATCH_OWNER_TEST_EXIT_PROCEED" ]; do
+    owner_link_current 1 || exit 1
+  done
+  exit 1
+fi
+
 [ ! -e "$anchor_pending" ] && [ ! -L "$anchor_pending" ] || exit 1
 [ ! -e "$anchor_record" ] && [ ! -L "$anchor_record" ] || exit 1
 printf 'pid=%s\nidentity=%s\n' "$monitor_pid" "$monitor_identity" > "$anchor_pending" || exit 1

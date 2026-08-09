@@ -371,6 +371,8 @@ fi
 # harness-tracked task) tears the watcher down too, and the watcher's eventual
 # wake exit propagates out so the harness re-notifies firstmate.
 child=
+child_identity=
+child_session_identity=
 child_out=
 child_session_verified=false
 owner_link_dir=
@@ -412,8 +414,11 @@ stop_owned_child() {
   while [ "$iteration" -lt 20 ] && fm_pid_alive "$child"; do
     current_session=$(fm_pid_session "$child" 2>/dev/null || true)
     if [ "$current_session" = "$child" ]; then
-      child_session_verified=true
-      break
+      child_session_identity=$(fm_pid_identity "$child" 2>/dev/null || true)
+      if [ -n "$child_session_identity" ]; then
+        child_session_verified=true
+        break
+      fi
     fi
     sleep 0.01
     iteration=$((iteration + 1))
@@ -426,14 +431,14 @@ stop_owned_child() {
     identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
     if [ "$(fm_pid_identity "$child" 2>/dev/null || true)" = "$identity" ]; then
       fm_pid_session_stop "$child" "$child" 30 "$identity" || status=$?
-    elif fm_pid_alive "$child"; then
-      identity=$(fm_pid_identity "$child" 2>/dev/null || true)
-      fm_pid_session_stop "$child" "$child" 30 "$identity" || status=$?
+    elif [ -n "$child_session_identity" ] \
+      && [ "$(fm_pid_identity "$child" 2>/dev/null || true)" = "$child_session_identity" ]; then
+      fm_pid_session_stop "$child" "$child" 30 "$child_session_identity" || status=$?
     else
       status=1
     fi
-  elif fm_pid_alive "$child"; then
-    kill -TERM "$child" 2>/dev/null || true
+  elif [ -n "$child_identity" ] && fm_pid_alive "$child"; then
+    fm_pid_stop_identity "$child" "$child_identity" 30 || status=$?
   fi
   wait "$child" 2>/dev/null || true
   if "$child_session_verified"; then
@@ -571,6 +576,7 @@ owner_link_reader_connected=true
     ' "$WATCH"
 ) >"$child_out" 2>&1 &
 child=$!
+child_identity=$(fm_pid_identity "$child" 2>/dev/null || true)
 owner_link_reader_disconnect
 child_done=0
 

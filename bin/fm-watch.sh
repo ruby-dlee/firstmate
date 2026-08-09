@@ -1178,6 +1178,7 @@ printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
 printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
 watcher_owner_link_pid=
+watcher_owner_link_identity=
 watcher_owner_fifo=${FM_WATCH_ARM_OWNER_FIFO:-}
 watcher_owner_ready=${FM_WATCH_ARM_OWNER_READY:-}
 watcher_owner_failed=${FM_WATCH_ARM_OWNER_FAILED:-}
@@ -1222,6 +1223,11 @@ if [ -n "$watcher_owner_fifo" ]; then
     "$WATCHER_PID" "$watcher_owner_fifo" "$watcher_owner_ready" \
     "$watcher_owner_failed" "$watcher_owner_dir" &
   watcher_owner_link_pid=$!
+  watcher_owner_link_identity=$(fm_pid_identity "$watcher_owner_link_pid" 2>/dev/null || true)
+  if [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
+    && [ -n "${FM_WATCH_OWNER_TEST_MONITOR_CAPTURED:-}" ]; then
+    : > "$FM_WATCH_OWNER_TEST_MONITOR_CAPTURED"
+  fi
   watcher_owner_setup_status=1
   watcher_owner_setup_iteration=0
   while [ "$watcher_owner_setup_iteration" -lt 100 ]; do
@@ -1235,13 +1241,28 @@ if [ -n "$watcher_owner_fifo" ]; then
     watcher_owner_setup_iteration=$((watcher_owner_setup_iteration + 1))
   done
   if [ "$watcher_owner_setup_status" -ne 0 ]; then
-    kill -TERM "$watcher_owner_link_pid" 2>/dev/null || true
-    wait "$watcher_owner_link_pid" 2>/dev/null || true
+    if [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
+      && [ -n "${FM_WATCH_OWNER_TEST_REUSED_MONITOR_PID:-}" ]; then
+      watcher_owner_link_pid=$FM_WATCH_OWNER_TEST_REUSED_MONITOR_PID
+    fi
+    watcher_owner_cleanup_complete=false
+    if fm_watcher_lock_stop_session_anchor \
+      "$STATE" "$WATCHER_PID" "$watcher_owner_link_pid" 30; then
+      watcher_owner_cleanup_complete=true
+    elif [ -n "$watcher_owner_link_identity" ] \
+      && fm_pid_stop_identity "$watcher_owner_link_pid" "$watcher_owner_link_identity" 30; then
+      watcher_owner_cleanup_complete=true
+    elif ! fm_pid_alive "$watcher_owner_link_pid"; then
+      watcher_owner_cleanup_complete=true
+    fi
+    if "$watcher_owner_cleanup_complete"; then
+      wait "$watcher_owner_link_pid" 2>/dev/null || true
+      rm -f "$WATCH_LOCK/process-session" "$WATCH_LOCK/session-anchor" \
+        "$WATCH_LOCK/session-anchor.pending" "$WATCH_LOCK/session-anchor-pid" \
+        "$WATCH_LOCK/session-anchor-identity" 2>/dev/null || true
+      fm_lock_release "$WATCH_LOCK"
+    fi
     echo "watcher: could not establish its arm ownership monitor" >&2
-    rm -f "$WATCH_LOCK/process-session" "$WATCH_LOCK/session-anchor" \
-      "$WATCH_LOCK/session-anchor.pending" "$WATCH_LOCK/session-anchor-pid" \
-      "$WATCH_LOCK/session-anchor-identity" 2>/dev/null || true
-    fm_lock_release "$WATCH_LOCK"
     exit 1
   fi
 fi

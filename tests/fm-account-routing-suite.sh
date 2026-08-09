@@ -6113,10 +6113,14 @@ test_task_owned_account_artifacts_reject_symlink_paths() {
   out=$(run_send "$id" "Delivered without following the steering symlink." 2>&1)
   status=$?
   set -e
-  [ "$status" -ne 0 ] || fail "unconfirmed steering incorrectly exited zero: $out"
+  [ "$status" -ne 0 ] || fail "refused steering incorrectly exited zero: $out"
   [ "$(cat "$CASE_DIR/outside-steering")" = outside ] || fail "managed steering followed a symlinked output file"
-  assert_grep 'Delivered without following the steering symlink' "$original/steering-unconfirmed.md" \
-    "safe unconfirmed steering was not recorded without following the canonical trail symlink"
+  assert_not_grep 'Delivered without following the steering symlink' "$LAUNCH_LOG" \
+    "managed steering typed text after the atomic transport refused it"
+  assert_grep 'not-submitted' "$original/steering-journal.md" \
+    "refused steering did not durably close its pending intent as not submitted"
+  assert_absent "$original/steering-unconfirmed.md" \
+    "a pre-input refusal was misclassified as an unconfirmed submission"
   pass "task-owned lineage, steering, and continuation artifacts reject symlink escapes"
 }
 

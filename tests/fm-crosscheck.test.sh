@@ -3803,22 +3803,88 @@ test_evidence_batch_item_limit_precedes_execution() {
 }
 
 test_evidence_batch_has_aggregate_deadline() {
-  local record case_dir base head rc started elapsed
-  record=$(make_case aggregate-evidence-deadline)
-  IFS=$'\t' read -r case_dir base head <<< "$record"
-  started=$(date +%s)
-  set +e
-  FM_CROSSCHECK_EVIDENCE_TIMEOUT_SECONDS=10 \
-  FM_CROSSCHECK_EVIDENCE_RUN_TIMEOUT_SECONDS=1 \
-    run_case "$case_dir" "$base" "$head" slow-reproduction run \
-      > "$case_dir/out" 2> "$case_dir/err"
-  rc=$?
-  set -e
-  elapsed=$(($(date +%s) - started))
-  expect_code 1 "$rc" "aggregate evidence deadline"
-  [ "$elapsed" -lt 10 ] || fail "aggregate evidence deadline took ${elapsed}s"
-  assert_grep 'timed out' "$case_dir/err" \
-    "aggregate evidence deadline did not block loudly"
+  local case_dir
+  case_dir="$TMP_ROOT/aggregate-evidence-deadline"
+  mkdir -p "$case_dir/.crosscheck/reproductions" "$case_dir/proofs"
+  printf '%s\n' 'receipt BASE HEAD EXECUTION-HOME ACCOUNT-HOME' \
+    > "$case_dir/.crosscheck/reproductions/receipt.txt"
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$case_dir" <<'PY' \
+    || fail "aggregate evidence deadline was not shared across executions"
+import importlib.util
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+clock = [100.0]
+deadlines = []
+module.time.monotonic = lambda: clock[0]
+module.evidence_run_timeout = lambda: 1
+
+def execute_reproduction(_value, _review_dir, label, deadline):
+    deadlines.append(deadline)
+    if len(deadlines) == 1:
+        assert module.evidence_command_timeout(deadline, 10, label) == 1
+        clock[0] = deadline + 0.001
+        return {"executed": True}
+    module.evidence_command_timeout(deadline, 10, label)
+    raise AssertionError("expired aggregate deadline was accepted")
+
+module.execute_reproduction = execute_reproduction
+case_dir = Path(sys.argv[2])
+ledger = {
+    "findings": [{
+        "id": "cc-aaaaaaaaaaaa",
+        "lifecycle": "open",
+        "citations": [],
+        "history": [],
+    }],
+    "runs": [],
+}
+review = {
+    "executed_reproduction": {
+        "receipt_path": ".crosscheck/reproductions/receipt.txt",
+        "receipt_contains": "receipt",
+        "test_path": "tests/example.test.sh",
+        "command": "true",
+        "expected_exit": 0,
+        "output_contains": "ok",
+    },
+    "finding_updates": [{
+        "id": "cc-aaaaaaaaaaaa",
+        "status": "open",
+        "note": "still open",
+        "reproduction": {},
+        "mutation_proof": None,
+        "equivalent_to": None,
+    }],
+    "new_findings": [],
+    "suspicions": [],
+    "summary": "deadline test",
+    "citations": [],
+}
+snapshot = {
+    "base_sha": "BASE",
+    "head_sha": "HEAD",
+    "claims_sha256": "claims",
+}
+config = {
+    "execution_home": "EXECUTION-HOME",
+    "executing_account_home": "ACCOUNT-HOME",
+}
+try:
+    module.apply_review(ledger, review, case_dir, case_dir / "proofs", snapshot, config)
+except module.CrosscheckError as exc:
+    assert str(exc) == (
+        "evidence batch timed out before finding_updates[0].reproduction"
+    )
+else:
+    raise AssertionError("aggregate evidence deadline did not block")
+assert deadlines == [101.0, 101.0]
+PY
   pass "all reviewer evidence shares one bounded execution deadline"
 }
 

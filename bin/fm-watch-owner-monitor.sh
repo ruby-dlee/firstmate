@@ -149,6 +149,7 @@ rm -f "$session_record" "$session_record_pending" "$handoff_request" \
   "$prestart_owner_identity_file" "$owner_dir/pid" "$owner_dir/pid-identity" \
   "$owner_dir/process-session" "$owner_dir/fm-home" "$owner_dir/watcher-path" \
   "$owner_dir/session-stop" "$owner_dir/session-stop.pending" \
+  "$owner_dir/session-stop-complete" \
   "$owner_dir/.session-stop-transaction" "$owner_dir/arm-owner-pid" \
   "$owner_dir/arm-owner-identity" 2>/dev/null || true
 rmdir "$owner_dir" 2>/dev/null || true

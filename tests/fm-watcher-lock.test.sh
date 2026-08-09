@@ -898,6 +898,75 @@ test_arm_owner_death_during_prestart_wedge_reaps_session() {
   pass "post-setsid owner observer reaps a prestart-wedged watcher"
 }
 
+test_prestart_observer_reclaims_interrupted_arm_cleanup() {
+  local dir state fakebin out ready prestart_proceed claim_ready claim_proceed armpid watcher_pid session owner_dir standby_pid standby_identity i members member
+  dir=$(make_case interrupted-prestart-cleanup)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  ready="$dir/prestart.ready"
+  prestart_proceed="$dir/prestart.proceed"
+  claim_ready="$dir/arm-claim.ready"
+  claim_proceed="$dir/arm-claim.proceed"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_WATCH_CPU_POLL=999 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_PRESTART_READY="$ready" \
+    FM_WATCH_OWNER_TEST_PRESTART_PROCEED="$prestart_proceed" \
+    FM_WATCH_OWNER_TEST_ARM_CLAIM_READY="$claim_ready" \
+    FM_WATCH_OWNER_TEST_ARM_CLAIM_PROCEED="$claim_proceed" \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -s "$ready" ]; do
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  watcher_pid=$(cat "$ready" 2>/dev/null || true)
+  case "$watcher_pid" in ''|*[!0-9]*) fail "watcher did not reach interrupted cleanup fixture: $(cat "$out")" ;; esac
+  session=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_session "$2"' _ "$LIB" "$watcher_pid" 2>/dev/null || true)
+  [ "$session" = "$watcher_pid" ] || fail "interrupted cleanup fixture did not own its session"
+  owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch.lock.owner.arm.*' -print -quit)
+  standby_pid=$(cat "$owner_dir/prestart-owner-pid" 2>/dev/null || true)
+  standby_identity=$(cat "$owner_dir/prestart-owner-identity" 2>/dev/null || true)
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity_live "$2" "$3"' \
+    _ "$LIB" "$standby_pid" "$standby_identity" \
+    || fail "prestart standby was not identity-pinned before arm cleanup"
+  kill -TERM "$armpid" 2>/dev/null || fail "could not begin arm prestart cleanup"
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -e "$claim_ready" ]; do
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$claim_ready" ] || fail "arm did not acquire the canonical prestart cleanup claim"
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity_live "$2" "$3"' \
+    _ "$LIB" "$standby_pid" "$standby_identity" \
+    || fail "prestart standby exited while arm cleanup was incomplete"
+  kill -KILL "$armpid" 2>/dev/null || fail "could not interrupt claimed arm cleanup"
+  wait "$armpid" 2>/dev/null || true
+  i=0
+  members=$watcher_pid
+  while [ "$i" -lt 150 ]; do
+    members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' _ "$LIB" "$session" 2>/dev/null || true)
+    [ -z "$members" ] \
+      && [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
+      && [ ! -d "$owner_dir" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -z "$members" ] || {
+    for member in $members; do kill -KILL "$member" 2>/dev/null || true; done
+    fail "standby takeover left interrupted cleanup session members: $members"
+  }
+  [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
+    || fail "standby takeover left the watcher lock"
+  [ ! -d "$owner_dir" ] || fail "standby takeover left the canonical owner directory"
+  pass "prestart standby reclaims an interrupted canonical cleanup"
+}
+
 test_prestart_claim_blocks_lock_publication() {
   local dir state fakebin out ready proceed claim_ready claim_proceed armpid watcher_pid session i members member
   dir=$(make_case prestart-claim-publication)
@@ -2749,6 +2818,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-4 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-5 ]; then
+  test_prestart_observer_reclaims_interrupted_arm_cleanup
+  test_arm_owner_death_during_prestart_wedge_reaps_session
+  test_prestart_claim_blocks_lock_publication
+  exit 0
+fi
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_pid_identity_survives_exec_without_command_text
@@ -2781,6 +2857,7 @@ test_watch_restart_recovers_dead_session_leader
 test_arm_owner_death_reaps_watcher_session
 test_arm_owner_death_before_monitor_start_reaps_session
 test_arm_owner_death_during_prestart_wedge_reaps_session
+test_prestart_observer_reclaims_interrupted_arm_cleanup
 test_prestart_claim_blocks_lock_publication
 test_arm_normal_exit_after_owner_handoff
 test_restart_during_owner_handoff_uses_normal_anchor

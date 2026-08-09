@@ -440,7 +440,8 @@ owner_link_remove() {
     "$owner_link_dir/pid" "$owner_link_dir/pid-identity" \
     "$owner_link_dir/process-session" "$owner_link_dir/fm-home" \
     "$owner_link_dir/watcher-path" "$owner_link_dir/session-stop" \
-    "$owner_link_dir/session-stop.pending" "$owner_link_dir/.session-stop-transaction" \
+    "$owner_link_dir/session-stop.pending" "$owner_link_dir/session-stop-complete" \
+    "$owner_link_dir/.session-stop-transaction" \
     "$owner_link_dir/handoff-request" "$owner_link_dir/handoff-request.pending" \
     "$owner_link_dir/handoff-taken" "$owner_link_dir/handoff-taken.pending" \
     "$owner_link_dir/prestart-owner-pid" "$owner_link_dir/prestart-owner-pid.pending" \
@@ -497,22 +498,53 @@ owner_link_session_proof_matches() {
   fm_session_snapshot "$child" >/dev/null
 }
 
+FM_WATCH_STANDBY_PID=
+FM_WATCH_STANDBY_IDENTITY=
+owner_link_standby_matches() {
+  FM_WATCH_STANDBY_PID=$(cat "$owner_link_dir/prestart-owner-pid" 2>/dev/null || true)
+  FM_WATCH_STANDBY_IDENTITY=$(cat "$owner_link_dir/prestart-owner-identity" 2>/dev/null || true)
+  case "$FM_WATCH_STANDBY_PID" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$FM_WATCH_STANDBY_IDENTITY" ] || return 1
+  fm_pid_identity_live "$FM_WATCH_STANDBY_PID" "$FM_WATCH_STANDBY_IDENTITY" || return 1
+  [ "$(fm_pid_session "$FM_WATCH_STANDBY_PID" 2>/dev/null || true)" = "$child" ]
+}
+
 stop_owned_child() {
-  local status=0 session_status=0
+  local status=0 session_status=0 standby=false iteration=0
   [ -n "$child" ] || return 0
-  owner_link_disconnect
-  owner_link_reader_disconnect
-  if "$child_session_verified" \
+  if owner_link_session_proof_matches && owner_link_standby_matches; then
+    standby=true
+    if fm_session_stop_claim_dir "$owner_link_dir" "$child"; then
+      if [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
+        && [ -n "${FM_WATCH_OWNER_TEST_ARM_CLAIM_READY:-}" ] \
+        && [ -n "${FM_WATCH_OWNER_TEST_ARM_CLAIM_PROCEED:-}" ]; then
+        : > "$FM_WATCH_OWNER_TEST_ARM_CLAIM_READY"
+        while [ ! -e "$FM_WATCH_OWNER_TEST_ARM_CLAIM_PROCEED" ]; do sleep 0.01; done
+      fi
+      fm_session_stop_owned_except "$child" "$FM_WATCH_STANDBY_PID" 30 || status=$?
+      [ "$status" -ne 0 ] || fm_session_stop_claim_complete_dir \
+        "$owner_link_dir" "$child" "$FM_WATCH_STANDBY_PID" || status=$?
+    else
+      status=1
+    fi
+  elif "$child_session_verified" \
     && [ "$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)" = "$child_session_identity" ] \
     && fm_watcher_lock_session_record_matches "$STATE" "$WATCH" "$FM_HOME" "$child"; then
     stop_recorded_watcher "$child" "$child_session_identity" || status=$?
-  elif owner_link_session_proof_matches \
-    && fm_session_stop_claim_dir "$owner_link_dir" "$child"; then
-    fm_session_stop_owned "$child" 30 || status=$?
   else
     status=1
   fi
   [ "$status" -eq 0 ] || return "$status"
+  owner_link_disconnect
+  owner_link_reader_disconnect
+  if "$standby"; then
+    while [ "$iteration" -lt 100 ] \
+      && fm_pid_identity_live "$FM_WATCH_STANDBY_PID" "$FM_WATCH_STANDBY_IDENTITY"; do
+      sleep 0.05
+      iteration=$((iteration + 1))
+    done
+    fm_pid_identity_live "$FM_WATCH_STANDBY_PID" "$FM_WATCH_STANDBY_IDENTITY" && return 1
+  fi
   wait "$child" 2>/dev/null || true
   fm_session_has_live_processes "$child" || session_status=$?
   [ "$session_status" -eq 1 ] || return 1
@@ -763,6 +795,16 @@ owner_link_reader_connected=true
           my $count = sysread($owner, my $byte, 1);
           return !defined $count || $count == 0;
         };
+        my $prestart_identity = $identity_for->($$);
+        exit 125 if !defined $prestart_identity;
+        sysopen my $pid_file, $owner_pid, O_WRONLY | O_CREAT | O_EXCL, 0600
+          or exit 125;
+        print {$pid_file} "$$\n";
+        close $pid_file or exit 125;
+        sysopen my $identity_file, $owner_identity, O_WRONLY | O_CREAT | O_EXCL, 0600
+          or exit 125;
+        print {$identity_file} "$prestart_identity\n";
+        close $identity_file or exit 125;
         my $handoff = 0;
         while (getppid() == $root) {
           my $current_root_parent = $parent_for->($root);
@@ -786,26 +828,12 @@ owner_link_reader_connected=true
           next if !defined $current_monitor_identity
             || $current_monitor_identity ne $monitor_identity;
           next if $owner_lost->();
-          my $prestart_identity = $identity_for->($$);
-          next if !defined $prestart_identity;
-          my $pid_pending = "$owner_pid.pending";
-          my $identity_pending = "$owner_identity.pending";
           my $taken_pending = "$taken.pending";
-          sysopen my $pid_file, $pid_pending, O_WRONLY | O_CREAT | O_EXCL, 0600
-            or next;
-          print {$pid_file} "$$\n";
-          close $pid_file or next;
-          sysopen my $identity_file, $identity_pending, O_WRONLY | O_CREAT | O_EXCL, 0600
-            or next;
-          print {$identity_file} "$prestart_identity\n";
-          close $identity_file or next;
           sysopen my $taken_file, $taken_pending, O_WRONLY | O_CREAT | O_EXCL, 0600
             or next;
           print {$taken_file} $record;
           close $taken_file or next;
           next if $owner_lost->();
-          rename $pid_pending, $owner_pid or next;
-          rename $identity_pending, $owner_identity or next;
           rename $taken_pending, $taken or next;
           $handoff = 1;
           last;

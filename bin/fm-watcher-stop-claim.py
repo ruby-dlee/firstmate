@@ -221,6 +221,7 @@ def acquire(lockdir, boundary, helper, stopper, stopper_identity, kind):
     descriptor = locked_file(lockdir)
     try:
         claim_path = os.path.join(lockdir, "session-stop")
+        complete_path = os.path.join(lockdir, "session-stop-complete")
         try:
             contents = read_regular(claim_path, required=True)
             fields = parse_claim(contents)
@@ -246,10 +247,17 @@ def acquire(lockdir, boundary, helper, stopper, stopper_identity, kind):
             quarantine = "{}.reclaimed.{}".format(claim_path, secrets.token_hex(12))
             os.rename(claim_path, quarantine)
             os.unlink(quarantine)
+        if os.path.lexists(complete_path):
+            if basis(lockdir, boundary, helper, kind) != snapshot:
+                return 1
+            read_regular(complete_path, required=True)
+            os.unlink(complete_path)
         pending_names = [
             name
             for name in os.listdir(lockdir)
-            if name == "session-stop.pending" or name.startswith("session-stop.pending.")
+            if name == "session-stop.pending"
+            or name.startswith("session-stop.pending.")
+            or name.startswith("session-stop-complete.pending.")
         ]
         for pending_name in pending_names:
             if basis(lockdir, boundary, helper, kind) != snapshot:
@@ -325,8 +333,64 @@ def clear(lockdir, boundary, helper, stopper, stopper_identity, claim_id, kind):
             or process_identity_live(helper, stopper) != stopper_identity
         ):
             return 1
+        complete_path = os.path.join(lockdir, "session-stop-complete")
+        if os.path.lexists(complete_path):
+            if read_regular(complete_path, required=True) != read_regular(claim_path, required=True):
+                return 1
+            os.unlink(complete_path)
         os.unlink(claim_path)
         return 0
+    finally:
+        os.close(descriptor)
+
+
+def complete(lockdir, boundary, helper, stopper, stopper_identity, claim_id, kind):
+    descriptor = locked_file(lockdir)
+    try:
+        claim_path = os.path.join(lockdir, "session-stop")
+        claim_contents = read_regular(claim_path, required=True)
+        fields = parse_claim(claim_contents)
+        snapshot = basis(lockdir, boundary, helper, kind)
+        if (
+            fields["session-id"] != boundary
+            or fields["kind"] != kind
+            or fields["claim-id"] != claim_id
+            or fields["stopper-pid"] != str(stopper)
+            or fields["stopper-identity"] != stopper_identity
+            or fields["basis-id"] != basis_id(snapshot)
+            or process_identity_live(helper, stopper) != stopper_identity
+        ):
+            return 1
+        complete_path = os.path.join(lockdir, "session-stop-complete")
+        if os.path.lexists(complete_path):
+            return 0 if read_regular(complete_path, required=True) == claim_contents else 1
+        publish_regular(complete_path, claim_contents)
+        if (
+            read_regular(claim_path, required=True) != claim_contents
+            or read_regular(complete_path, required=True) != claim_contents
+            or basis(lockdir, boundary, helper, kind) != snapshot
+        ):
+            os.unlink(complete_path)
+            return 1
+        return 0
+    finally:
+        os.close(descriptor)
+
+
+def completed(lockdir, boundary, helper, kind):
+    descriptor = locked_file(lockdir)
+    try:
+        claim_contents = read_regular(os.path.join(lockdir, "session-stop"), required=True)
+        fields = parse_claim(claim_contents)
+        snapshot = basis(lockdir, boundary, helper, kind)
+        return 0 if (
+            fields["session-id"] == boundary
+            and fields["kind"] == kind
+            and fields["basis-id"] == basis_id(snapshot)
+            and read_regular(
+                os.path.join(lockdir, "session-stop-complete"), required=True
+            ) == claim_contents
+        ) else 1
     finally:
         os.close(descriptor)
 
@@ -339,8 +403,12 @@ def publish_lock(lockdir, boundary, helper, publish_path):
         if os.path.lexists(claim_path):
             fields = parse_claim(read_regular(claim_path, required=True))
             return 3 if claim_owner_live(fields, helper) else 1
+        if os.path.lexists(os.path.join(lockdir, "session-stop-complete")):
+            return 1
         if any(
-            name == "session-stop.pending" or name.startswith("session-stop.pending.")
+            name == "session-stop.pending"
+            or name.startswith("session-stop.pending.")
+            or name.startswith("session-stop-complete.pending.")
             for name in os.listdir(lockdir)
         ):
             return 1
@@ -406,6 +474,22 @@ def main():
                 sys.argv[7],
                 kind,
             )
+        if action == "complete":
+            if len(sys.argv) != 8 or not sys.argv[5].isdigit() or kind != "session":
+                return 2
+            return complete(
+                lockdir,
+                boundary,
+                helper,
+                int(sys.argv[5]),
+                sys.argv[6],
+                sys.argv[7],
+                kind,
+            )
+        if action == "completed":
+            if len(sys.argv) != 5 or kind != "session":
+                return 2
+            return completed(lockdir, boundary, helper, kind)
         if action == "publish":
             if len(sys.argv) != 6 or kind != "session":
                 return 2

@@ -13,6 +13,7 @@ lockdir="$STATE/.watch.lock"
 observer=${BASHPID:-$$}
 arm_owner=
 arm_owner_identity=
+observer_identity=
 
 case "$root" in ''|*[!0-9]*) exit 2 ;; esac
 [ "$session" = "$root" ] || exit 2
@@ -23,7 +24,17 @@ arm_owner=$(cat "$owner_dir/arm-owner-pid" 2>/dev/null || true)
 arm_owner_identity=$(cat "$owner_dir/arm-owner-identity" 2>/dev/null || true)
 case "$arm_owner" in ''|*[!0-9]*) exit 1 ;; esac
 [ -n "$arm_owner_identity" ] || exit 1
-fm_pid_identity_live "$arm_owner" "$arm_owner_identity" && exit 1
+observer_identity=$(cat "$owner_dir/prestart-owner-identity" 2>/dev/null || true)
+[ "$(cat "$owner_dir/prestart-owner-pid" 2>/dev/null || true)" = "$observer" ] || exit 1
+fm_pid_identity_live "$observer" "$observer_identity" || exit 1
+
+while fm_pid_identity_live "$arm_owner" "$arm_owner_identity"; do
+  if fm_session_stop_claim_completed_dir "$owner_dir" "$session" "$observer"; then
+    exec 8<&-
+    exit 0
+  fi
+  sleep 0.05
+done
 
 status=0
 if [ "$(cat "$owner_dir/pid" 2>/dev/null || true)" = "$session" ] \
@@ -40,6 +51,8 @@ if [ "$(cat "$owner_dir/pid" 2>/dev/null || true)" = "$session" ] \
     while [ ! -e "$FM_WATCH_OWNER_TEST_CLAIM_PROCEED" ]; do sleep 0.01; done
   fi
   fm_session_stop_owned_except "$session" "$observer" 30 || status=$?
+  [ "$status" -ne 0 ] || fm_session_stop_claim_complete_dir \
+    "$owner_dir" "$session" "$observer" || status=$?
 else
   status=1
 fi
@@ -60,7 +73,8 @@ if [ "$status" -eq 0 ]; then
     "$owner_dir/prestart-owner-identity.pending" 2>/dev/null || true
   rm -f "$owner_dir/pid" "$owner_dir/pid-identity" "$owner_dir/process-session" \
     "$owner_dir/fm-home" "$owner_dir/watcher-path" "$owner_dir/session-stop" \
-    "$owner_dir/session-stop.pending" "$owner_dir/.session-stop-transaction" \
+    "$owner_dir/session-stop.pending" "$owner_dir/session-stop-complete" \
+    "$owner_dir/.session-stop-transaction" \
     "$owner_dir/arm-owner-pid" "$owner_dir/arm-owner-identity" 2>/dev/null || true
   rmdir "$owner_dir" 2>/dev/null || true
 fi

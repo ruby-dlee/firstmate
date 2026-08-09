@@ -486,6 +486,27 @@ fm_session_stop_claim_dir() {  # <claim-dir> <session-id>
   fm_stop_claim_dir "$1" "$2" session
 }
 
+fm_session_stop_claim_complete_dir() {  # <claim-dir> <session-id> <excluded-pid>
+  local confined=$1 session=$2 excluded=$3 stopper stopper_identity helper
+  [ -n "$FM_WATCHER_STOP_CLAIM_ID" ] || return 1
+  [ "$FM_WATCHER_STOP_CLAIM_KIND" = session ] || return 1
+  fm_session_wait_quiescent_except "$session" "$excluded" 20 || return 1
+  stopper=${BASHPID:-$$}
+  stopper_identity=$(fm_pid_identity "$stopper") || return 1
+  helper="$FM_WAKE_LIB_DIR/fm-watcher-stop-claim.py"
+  "$helper" complete "$confined" "$session" \
+    "$FM_WAKE_LIB_DIR/fm-process-identity.py" "$stopper" "$stopper_identity" \
+    "$FM_WATCHER_STOP_CLAIM_ID"
+}
+
+fm_session_stop_claim_completed_dir() {  # <claim-dir> <session-id> <excluded-pid>
+  local confined=$1 session=$2 excluded=$3 helper
+  helper="$FM_WAKE_LIB_DIR/fm-watcher-stop-claim.py"
+  "$helper" completed "$confined" "$session" \
+    "$FM_WAKE_LIB_DIR/fm-process-identity.py" || return 1
+  fm_session_wait_quiescent_except "$session" "$excluded" 2
+}
+
 fm_watcher_lock_session_stop_claim() {  # <state> <session-id>
   local state=$1 session=$2 lockdir confined
   lockdir="$state/.watch.lock"
@@ -740,6 +761,7 @@ fm_lock_clean_known_files() {
     "$confined/session-anchor-identity" \
     "$confined/session-stop" \
     "$confined/session-stop.pending" \
+    "$confined/session-stop-complete" \
     "$confined/.session-stop-transaction" \
     "$confined/watcher-path" \
     2>/dev/null || true

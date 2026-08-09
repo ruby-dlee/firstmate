@@ -62,6 +62,12 @@ fm_refuse_if_gate_agent
 fm_watcher_config_load "$CONFIG" || exit 1
 fm_watcher_config_positive_integer FM_WATCH_PROGRESS_GRACE 60
 fm_watcher_config_positive_integer FM_CREW_STATE_READ_TIMEOUT 30
+if [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
+  && [ -n "${FM_WATCH_OWNER_TEST_PRESTART_READY:-}" ] \
+  && [ -n "${FM_WATCH_OWNER_TEST_PRESTART_PROCEED:-}" ]; then
+  printf '%s\n' "${BASHPID:-$$}" > "$FM_WATCH_OWNER_TEST_PRESTART_READY"
+  while [ ! -e "$FM_WATCH_OWNER_TEST_PRESTART_PROCEED" ]; do sleep 0.01; done
+fi
 mkdir -p "$STATE"
 [ -d "$STATE" ] && [ ! -L "$STATE" ] || { echo "error: unsafe watcher state directory: $STATE" >&2; exit 1; }
 

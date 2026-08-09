@@ -575,11 +575,32 @@ owner_link_reader_connected=true
     FM_WATCH_ARM_SESSION_RECORD="$child_session_record" \
     FM_WATCH_ARM_OWNER_FD=8 \
     exec perl -MPOSIX -e '
+      my $cleanup = shift @ARGV;
       my $session = POSIX::setsid();
       exit 126 if !defined $session || $session != $$;
+      my $root = $$;
+      my $observer = fork();
+      exit 125 if !defined $observer;
+      if ($observer == 0) {
+        $SIG{HUP} = "IGNORE";
+        $SIG{INT} = "IGNORE";
+        $SIG{TERM} = "IGNORE";
+        open my $owner, "<&=8" or exit 125;
+        while (getppid() == $root) {
+          my $readable = "";
+          vec($readable, fileno($owner), 1) = 1;
+          my $ready = select($readable, undef, undef, 1);
+          next if !defined $ready || $ready == 0;
+          my $count = sysread($owner, my $byte, 1);
+          last if !defined $count || $count == 0;
+        }
+        close $owner;
+        exec $cleanup, $root, $session, $ENV{FM_WATCH_ARM_OWNER_DIR};
+        exit 125;
+      }
       exec @ARGV;
       exit 127;
-    ' "$WATCH"
+    ' "$SCRIPT_DIR/fm-watch-session-cleanup.sh" "$WATCH"
 ) >"$child_out" 2>&1 &
 child=$!
 child_identity=$(fm_pid_identity "$child" 2>/dev/null || true)

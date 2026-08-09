@@ -154,6 +154,38 @@ test_guard_warnings() {
   pass "guard banner leads when down with pending wakes (re-arm-after-drain) and stays silent when fresh"
 }
 
+test_guard_invalid_config_preserves_advisories() {
+  local dir state config err status
+  dir=$(make_case guard-invalid-config)
+  state="$dir/state"
+  config="$dir/config"
+  err="$dir/guard.err"
+  mkdir -p "$config"
+  {
+    printf 'FM_GUARD_GRACE=999999\n'
+    printf 'FM_WATCH_PROGRESS_GRACE=999999\n'
+    printf 'FM_WATCH_CPU_LIMIT=999\n'
+    printf 'FM_ROOT=%s\n' "$dir/redirected"
+  } > "$config/watcher.env"
+  printf 'project=x\n' > "$state/task.meta"
+  append_wake "$state" heartbeat heartbeat heartbeat || fail "invalid-config guard heartbeat append failed"
+  status=0
+  FM_ROOT_OVERRIDE="$dir" FM_HOME="$dir" FM_STATE_OVERRIDE="$state" \
+    "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || status=$?
+  [ "$status" -eq 0 ] || fail "invalid-config guard violated its advisory-only exit contract"
+  grep -qF 'watcher config variable FM_ROOT is not allowed' "$err" \
+    || fail "invalid-config guard omitted the parser diagnostic: $(cat "$err")"
+  grep -qF 'WATCHER CONFIG INVALID - SUPERVISION DEFAULTS ARE ACTIVE' "$err" \
+    || fail "invalid-config guard omitted its configuration alarm"
+  grep -qF 'using guard grace 300s, progress grace 60s, and CPU limit 80%' "$err" \
+    || fail "invalid-config guard retained partially parsed values: $(cat "$err")"
+  grep -qF 'WATCHER DOWN - SUPERVISION IS OFF' "$err" \
+    || fail "invalid-config guard suppressed watcher health advice"
+  grep -qF 'queued wakes pending - drain them' "$err" \
+    || fail "invalid-config guard suppressed queued-wake advice"
+  pass "invalid watcher config alarms while guard advisories continue with safe defaults"
+}
+
 test_guard_detects_live_watcher_that_missed_cadence() {
   local dir state err sleeper identity
   dir=$(make_case guard-missed-cadence)
@@ -816,6 +848,50 @@ test_arm_owner_death_before_monitor_start_reaps_session() {
   [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
     || fail "pre-monitor arm death left the watcher lock behind"
   pass "inherited ownership channel observes arm death before monitor startup"
+}
+
+test_arm_owner_death_during_prestart_wedge_reaps_session() {
+  local dir state fakebin out ready proceed armpid watcher_pid session i members member
+  dir=$(make_case arm-owner-prestart-wedge)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  ready="$dir/prestart.ready"
+  proceed="$dir/prestart.proceed"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_WATCH_CPU_POLL=999 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_PRESTART_READY="$ready" FM_WATCH_OWNER_TEST_PRESTART_PROCEED="$proceed" \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -s "$ready" ]; do
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  watcher_pid=$(cat "$ready" 2>/dev/null || true)
+  case "$watcher_pid" in ''|*[!0-9]*) fail "watcher did not reach its prestart wedge: $(cat "$out")" ;; esac
+  session=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_session "$2"' _ "$LIB" "$watcher_pid" 2>/dev/null || true)
+  [ "$session" = "$watcher_pid" ] || fail "prestart-wedged watcher did not own its session"
+  kill -KILL "$armpid" 2>/dev/null || fail "could not kill arm during watcher prestart wedge"
+  wait "$armpid" 2>/dev/null || true
+  i=0
+  members=$watcher_pid
+  while [ "$i" -lt 150 ]; do
+    members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' _ "$LIB" "$session" 2>/dev/null || true)
+    [ -z "$members" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -z "$members" ] || {
+    for member in $members; do kill -KILL "$member" 2>/dev/null || true; done
+    fail "arm death during prestart wedge left watcher session members: $members"
+  }
+  [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
+    || fail "arm death during prestart wedge left the watcher lock behind"
+  pass "post-setsid owner observer reaps a prestart-wedged watcher"
 }
 
 test_session_cleanup_requires_stable_quiescence() {
@@ -2075,6 +2151,12 @@ if [ "${FM_TEST_FOCUSED:-}" = session-handshake ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = prestart-config ]; then
+  test_arm_owner_death_during_prestart_wedge_reaps_session
+  test_guard_invalid_config_preserves_advisories
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = arm-owner-death ]; then
   test_arm_owner_death_reaps_watcher_session
   exit 0
@@ -2096,6 +2178,7 @@ test_pid_identity_is_locale_invariant
 test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
+test_guard_invalid_config_preserves_advisories
 test_guard_detects_live_watcher_that_missed_cadence
 test_guard_accepts_identity_matched_active_phase
 test_guard_detects_hot_recorded_watcher_tree
@@ -2114,6 +2197,7 @@ test_watch_restart_reaps_term_resistant_owned_tree
 test_watch_restart_recovers_dead_session_leader
 test_arm_owner_death_reaps_watcher_session
 test_arm_owner_death_before_monitor_start_reaps_session
+test_arm_owner_death_during_prestart_wedge_reaps_session
 test_session_cleanup_requires_stable_quiescence
 test_watch_restart_refuses_reused_session_without_anchor
 test_normal_session_watcher_releases_guard

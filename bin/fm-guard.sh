@@ -24,14 +24,20 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # shellcheck source=bin/fm-watcher-config-lib.sh
 . "$SCRIPT_DIR/fm-watcher-config-lib.sh"
-fm_watcher_config_load "$CONFIG" || exit 1
-GRACE=${FM_GUARD_GRACE:-300}
-PROGRESS_GRACE=${FM_WATCH_PROGRESS_GRACE:-60}
-CPU_LIMIT=${FM_WATCH_CPU_LIMIT:-80}
-fm_watcher_config_positive_integer FM_WATCH_PROGRESS_GRACE 60
-fm_watcher_config_positive_integer FM_WATCH_CPU_LIMIT 80
-PROGRESS_GRACE=$FM_WATCH_PROGRESS_GRACE
-CPU_LIMIT=$FM_WATCH_CPU_LIMIT
+WATCHER_CONFIG_ERROR=
+if fm_watcher_config_load "$CONFIG"; then
+  fm_watcher_config_positive_integer FM_GUARD_GRACE 300
+  fm_watcher_config_positive_integer FM_WATCH_PROGRESS_GRACE 60
+  fm_watcher_config_positive_integer FM_WATCH_CPU_LIMIT 80
+  GRACE=$FM_GUARD_GRACE
+  PROGRESS_GRACE=$FM_WATCH_PROGRESS_GRACE
+  CPU_LIMIT=$FM_WATCH_CPU_LIMIT
+else
+  WATCHER_CONFIG_ERROR="invalid watcher configuration at $CONFIG/watcher.env"
+  GRACE=300
+  PROGRESS_GRACE=60
+  CPU_LIMIT=80
+fi
 queue_pending=false
 READ_ONLY=${FM_GUARD_READ_ONLY:-0}
 case "$READ_ONLY" in 1|true|TRUE|yes|YES) READ_ONLY=1 ;; *) READ_ONLY=0 ;; esac
@@ -68,6 +74,18 @@ if [ -n "$tangle_branch" ]; then
       printf "●  then re-validate '%s' in a proper isolated worktree.\n" "$tangle_branch"
     fi
     printf '●%s\n' "$trule"
+  } >&2
+fi
+
+if [ -n "$WATCHER_CONFIG_ERROR" ]; then
+  config_rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+  {
+    printf '●%s\n' "$config_rule"
+    printf '●  WATCHER CONFIG INVALID - SUPERVISION DEFAULTS ARE ACTIVE\n'
+    printf '●  %s; using guard grace %ss, progress grace %ss, and CPU limit %s%%.\n' \
+      "$WATCHER_CONFIG_ERROR" "$GRACE" "$PROGRESS_GRACE" "$CPU_LIMIT"
+    printf '●  %s\n' "$CONTINUE_LINE"
+    printf '●%s\n' "$config_rule"
   } >&2
 fi
 

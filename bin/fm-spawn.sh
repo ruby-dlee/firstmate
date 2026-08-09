@@ -2652,18 +2652,33 @@ fi
 # Whether a proven pin can be DELIVERED to this launch line is a property of the
 # line, decided once, here. Every templated launch is `[VAR=value ...] <command>
 # ...` by construction, so the launcher can always be inserted ahead of it. A raw
-# launch command is the operator's own shell text, and it qualifies when it names
-# a command word - a plain name or a path - after any leading assignments. A line
-# that opens with a shell construct instead is left exactly as written and simply
-# does not receive the pin. Refusing it would cost a spawn shape that works today
-# and buy nothing: with no manifest-supplied entry on the crewmate PATH, that
+# launch command is the operator's own shell text, and it qualifies only when
+# firstmate can itself resolve its first word to an executable - the same
+# `type -P` lookup the hook pins use, or a slash that needs no lookup at all.
+#
+# The lookup is the whole test rather than a shape test, because inserting the
+# launcher ahead of the line REMOVES the pane shell's own expansion of that word:
+# a shell builtin, an operator alias, or a shell function stops being expanded and
+# becomes an argument the launcher then cannot execute. Anything firstmate cannot
+# resolve is therefore left exactly as the operator wrote it and simply does not
+# receive the pin. Refusing instead would cost a spawn shape that works today and
+# buy nothing: with no manifest-supplied entry on the crewmate PATH, an unpinned
 # line already resolves entirely against firstmate's own order.
 LAUNCH_PIN_DELIVERABLE=1
+LAUNCH_PIN_UNDELIVERABLE_REASON=
 if [ "$RAW_LAUNCH" = 1 ]; then
-  LAUNCH_PIN_DELIVERABLE=0
   case "$RAW_LAUNCH_WORD" in
-    ''|*[!A-Za-z0-9._+/-]*) ;;
-    *) LAUNCH_PIN_DELIVERABLE=1 ;;
+    '')
+      LAUNCH_PIN_DELIVERABLE=0
+      LAUNCH_PIN_UNDELIVERABLE_REASON="it names no command word to hand the launcher"
+      ;;
+    */*) ;;
+    *)
+      if ! spawn_own_path_bin "$RAW_LAUNCH_WORD" >/dev/null; then
+        LAUNCH_PIN_DELIVERABLE=0
+        LAUNCH_PIN_UNDELIVERABLE_REASON="firstmate cannot resolve its first word '$RAW_LAUNCH_WORD' to an executable on its own PATH, so it is a shell builtin, an alias, a function, a shell construct, or absent"
+      fi
+      ;;
   esac
 fi
 
@@ -3302,19 +3317,28 @@ spawn_project_manifest_may_pin() {
 }
 
 # The launch LINE needs no pre-lease vetting: it resolves against firstmate's own
-# PATH by construction. What is vetted here is the one thing a published pin does
-# reach - the turn-end hook firstmate writes for the harness to run from inside
-# the crewmate's session. Deciding it here, before the Treehouse lease and before
+# PATH by construction. What is vetted here is everything a published pin still
+# needs in order to reach the crewmate's session without a manifest-supplied
+# directory deciding anything - the turn-end hook firstmate writes for the harness
+# to run from inside that session, and the launcher that carries the pin into the
+# agent's environment. Deciding both here, before the Treehouse lease and before
 # any install runs, is the difference between a refusal that costs nothing and one
 # that strands a dirty lease the pool then has to skip.
+#
+# Every blocker here is fail-closed: a pin that was proven and cannot be carried
+# safely refuses the spawn, and is never downgraded to an unpinned launch.
 spawn_refuse_unpinnable_launch() {
-  [ -n "$LAUNCH_PIN_REFUSAL" ] || return 0
+  local launcher="$SCRIPT_DIR/fm-launch-pinned.sh" blocker=$LAUNCH_PIN_REFUSAL
   [ "$PROVISION_MODE" != off ] || return 0
   [ "$KIND" != secondmate ] || return 0
   [ "$BACKEND" != orca ] || return 0
+  if [ -z "$blocker" ] && { [ ! -f "$launcher" ] || [ ! -x "$launcher" ]; }; then
+    blocker="the pinned launcher $launcher, which is what carries a proven pin into the agent's environment, is missing or not executable"
+  fi
+  [ -n "$blocker" ] || return 0
   spawn_project_manifest_may_pin || return 0
-  echo "error: refusing to spawn fm-$ID before leasing a worktree: $(basename "$PROJ_ABS")'s provisioning manifest declares path_prepend, which leads the crewmate's session PATH, and $LAUNCH_PIN_REFUSAL" >&2
-  echo "       a manifest-supplied directory must never decide which binary a turn-end hook runs, so those commands are pinned to an absolute path first" >&2
+  echo "error: refusing to spawn fm-$ID before leasing a worktree: $(basename "$PROJ_ABS")'s provisioning manifest declares path_prepend, which leads the crewmate's session PATH, and $blocker" >&2
+  echo "       a proven pin must reach that session without a manifest-supplied directory deciding what firstmate itself runs, so this is refused before the lease rather than after it" >&2
   return 1
 }
 
@@ -4074,12 +4098,14 @@ fi
 spawn_pin_launch_line() {
   local launcher="$SCRIPT_DIR/fm-launch-pinned.sh"
   [ -n "$PROVISION_PATH_PREPEND" ] || return 0
+  # The pre-lease gate refuses on whether a pin MAY be published; this knows one
+  # WAS. It stays fail-closed rather than downgrading to an unpinned launch.
   if [ ! -f "$launcher" ] || [ ! -x "$launcher" ]; then
     echo "error: refusing to launch fm-$ID with a provisioning runtime pin because the pinned launcher $launcher is missing or not executable" >&2
     return 1
   fi
   if [ "$LAUNCH_PIN_DELIVERABLE" != 1 ]; then
-    echo "warning: fm-$ID's raw launch command opens with a shell construct rather than a command word, so its proven runtime pin is not applied to the agent's environment; the project's own tools resolve from the crewmate PATH instead" >&2
+    echo "warning: fm-$ID's proven runtime pin is not applied to the agent's environment because ${LAUNCH_PIN_UNDELIVERABLE_REASON:-firstmate could not resolve its raw launch command to one executable}; the launch line is typed exactly as written and still resolves against firstmate's own PATH, and the project's own tools resolve from the crewmate PATH instead" >&2
     return 0
   fi
   LAUNCH="$(shell_quote "$launcher") $(shell_quote "$PROVISION_PATH_PREPEND") $LAUNCH"

@@ -1226,10 +1226,39 @@ test_spawn_launches_a_raw_command_it_cannot_resolve() {
     --harness 'crewtool-does-not-exist --go')
   expect_code 0 "$?" "a raw launch command firstmate cannot resolve must still spawn: $out"
   launch=$(sent_line_containing "$SEND_LOG" crewtool-does-not-exist)
-  assert_contains "$launch" "$ROOT/bin/fm-launch-pinned.sh" \
-    "it should still receive the pin through the launcher: $launch"
+  assert_not_contains "$launch" "fm-launch-pinned.sh" \
+    "a word firstmate cannot resolve must be typed as written, not handed to the launcher: $launch"
+  assert_contains "$out" "runtime pin is not applied" \
+    "the spawn should say the pin was not delivered: $out"
   assert_present "$HOME_DIR/state/$id.meta" "the spawn should have recorded a live task"
-  pass "a raw launch command firstmate cannot resolve spawns instead of being refused"
+  pass "a raw launch command firstmate cannot resolve spawns unpinned instead of being refused"
+}
+
+# Wrapping a launch line REMOVES the pane shell's own expansion of its first word,
+# so a builtin, an alias, or a shell function stops being expanded and becomes an
+# argument the launcher cannot execute. `exec` is the shipped-bash case: `type -P`
+# cannot resolve it, so wrapping it would spawn successfully, burn the lease and
+# the install, and then die 127 in the pane where nobody is watching.
+test_spawn_leaves_a_shell_builtin_launch_unwrapped() {
+  local rec id out launch
+  id=provision-raw-builtin-pn
+  rec=$(make_spawn_case raw-builtin "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+  fm_fake_exit0 "$FAKEBIN_DIR" crewtool
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" \
+    --harness 'exec crewtool --go')
+  expect_code 0 "$?" "a raw launch command that starts with a shell builtin must still spawn: $out"
+  launch=$(sent_line_containing "$SEND_LOG" crewtool)
+  assert_contains "$launch" "exec crewtool --go" \
+    "a builtin-led launch line must be typed exactly as written: $launch"
+  assert_not_contains "$launch" "fm-launch-pinned.sh" \
+    "wrapping a builtin would strip the shell expansion the line depends on: $launch"
+  assert_contains "$out" "runtime pin is not applied" \
+    "the spawn should say the pin was not delivered: $out"
+  assert_present "$HOME_DIR/state/$id.meta" "the spawn should have recorded a live task"
+  pass "a launch line whose first word only a shell can expand is left unwrapped"
 }
 
 # A raw launch command that opens with a shell construct has no command word to
@@ -1259,6 +1288,57 @@ test_spawn_reports_a_raw_launch_it_cannot_pin() {
 # whether THIS spawn can publish a pin. A manifest whose kinds excludes this
 # task's kind publishes nothing, so the scout below is in the position of a
 # project with no manifest and must spawn.
+# make_launcher_bin <case-dir> <unrunnable|absent>: mirror bin/ with symlinks and
+# break ONLY bin/fm-launch-pinned.sh, so the spawn under test stays the real one
+# and what is broken is the file that carries a proven pin into the session. The
+# unrunnable case COPIES the launcher rather than symlinking it, because chmod
+# follows a symlink and would strip the real script's executable bit.
+make_launcher_bin() {
+  local case_dir=$1 mode=$2 bin entry
+  bin="$case_dir/launcher-$mode-root/bin"
+  mkdir -p "$bin"
+  for entry in "$ROOT"/bin/*; do
+    ln -s "$entry" "$bin/$(basename "$entry")"
+  done
+  rm -f "$bin/fm-launch-pinned.sh"
+  if [ "$mode" = unrunnable ]; then
+    cp "$ROOT/bin/fm-launch-pinned.sh" "$bin/fm-launch-pinned.sh"
+    chmod -x "$bin/fm-launch-pinned.sh"
+  fi
+  printf '%s\n' "$bin"
+}
+
+# A pin that was proven and cannot be carried into the session is a refusal, never
+# a silent downgrade. Whether the launcher is available is knowable from the
+# manifest and the checkout alone, so like the hook pins it is decided before the
+# lease: the sibling refusal costs nothing, while deciding it at launch time would
+# strand a dirty lease the pool then has to skip.
+test_pre_lease_gate_refuses_an_unavailable_pinned_launcher() {
+  local rec id out bin mode
+  for mode in unrunnable absent; do
+    id="provision-launcher-$mode-po"
+    rec=$(make_spawn_case "launcher-$mode" "$id")
+    read_spawn_case "$rec"
+    install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+    bin=$(make_launcher_bin "$CASE_DIR" "$mode")
+
+    out=$(SPAWN_CMD="$bin/fm-spawn.sh" \
+      run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR")
+    expect_code 1 "$?" "an $mode pinned launcher must refuse the spawn: $out"
+    assert_contains "$out" "before leasing a worktree" \
+      "the $mode launcher refusal must happen before the lease: $out"
+    assert_contains "$out" "fm-launch-pinned.sh" \
+      "the $mode launcher refusal must name the launcher: $out"
+    assert_absent "$CASE_DIR/acquired-worktree" \
+      "an $mode launcher refusal must not cost a Treehouse lease"
+    assert_absent "$HOME_DIR/state/$id.provision" \
+      "nothing may be provisioned for a spawn refused up front"
+    assert_absent "$HOME_DIR/state/$id.meta" \
+      "an $mode launcher refusal must not record a live task"
+  done
+  pass "a missing or unrunnable pinned launcher refuses before the lease, never downgrades"
+}
+
 test_pre_lease_hook_pin_gate_honors_kinds() {
   local rec id out quotedir
   id=provision-hookgate-pl
@@ -1615,7 +1695,9 @@ test_a_runtime_pin_decides_nothing_firstmate_names
 test_spawn_pins_the_turn_end_shell_under_a_runtime_pin
 test_spawn_pins_a_raw_launch_command_without_resolving_it
 test_spawn_launches_a_raw_command_it_cannot_resolve
+test_spawn_leaves_a_shell_builtin_launch_unwrapped
 test_spawn_reports_a_raw_launch_it_cannot_pin
+test_pre_lease_gate_refuses_an_unavailable_pinned_launcher
 test_pre_lease_hook_pin_gate_honors_kinds
 test_spawn_fails_closed_when_the_provisioner_cannot_be_run
 test_spawn_fails_closed_when_the_provisioner_is_missing

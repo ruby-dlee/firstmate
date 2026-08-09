@@ -376,7 +376,10 @@ Names and `description` are labels and do not expand, and no value is implicitly
 `path_prepend` directories go ahead of `PATH` for every step, and the manifest-level entries are also handed to `fm-spawn.sh`, which delivers them to the crewmate's session environment.
 That handover only happens for a `ready` verdict.
 Without it, provisioning could build a project under its pinned runtime while the crewmate's shell still resolved a different one, which is precisely the drift that had npm delegating a native build to an unpinned node.
-A `path_prepend` entry must already be a directory and may not contain a space, a single quote, or a colon, because it is composed into a `PATH` a shell will read and a colon is that composition's separator; an entry carrying one would split into two fragments naming no directory at all, so the pin would read as declared and silently not apply.
+Every `path_prepend` entry, at either level, must already be a directory and may not contain a colon.
+A colon is the separator of every `PATH` an entry is composed into, so an entry carrying one would split into two fragments naming no directory at all, and the pin would read as declared while silently not applying.
+Manifest-level entries additionally refuse a space and a single quote, because those entries alone are transported into a `PATH` a shell reads and into the colon-joined argument the launcher below receives.
+Component-level entries reach their steps as `/usr/bin/env` argv, where a space or a quote is carried verbatim and is harmless, so they are not refused there.
 
 Precedence, when both levels declare `path_prepend`: **the more specific declaration wins.**
 A component's own entries lead its steps' `PATH`, and the manifest-level entries follow them as the default for components that declare nothing.
@@ -388,12 +391,15 @@ A pin can carry any command name - a pinned Node prefix is exactly where a globa
 The crewmate `PATH` Firstmate exports therefore carries no manifest-supplied entry at all, and the whole launch line resolves from Firstmate's own resolution order as a property of the line rather than as a list of remembered words.
 The pin is applied instead by `bin/fm-launch-pinned.sh`, which is named by an absolute path, resolves the launch command against that un-pinned `PATH`, and only then exports the pin for the agent and every process it starts.
 So the pin still wins for the project's own tools inside the crewmate's session, which is the whole point of declaring it, and it decides nothing about what Firstmate itself launches.
-Any launch command works under a pin, including a raw launch command whose first word Firstmate cannot resolve; nothing is refused for being unpinnable.
-The one exception is a raw launch command that opens with a shell construct rather than a command word: it still launches and still resolves against Firstmate's own `PATH`, but the pin is not applied to it, and the spawn says so.
+Every launch command still launches under a pin; nothing is refused for being unpinnable.
+A raw launch command receives the pin when Firstmate can resolve its first word to an executable on its own `PATH`, or when that word already carries a path.
+Otherwise the pin is not applied to it: a first word that is a shell builtin, an operator alias, a shell function, a shell construct, or simply absent would stop being expanded by the pane shell once the launcher preceded it, so the line is typed exactly as written instead.
+Such a launch still runs and still resolves against Firstmate's own `PATH`, but the project's own tools inside it resolve from the crewmate `PATH` rather than from the pin, and the spawn says so on stderr.
 
 A harness turn-end hook is not part of the launch line - it is a command Firstmate writes into a file the harness runs from inside the crewmate's session, where the pin is in effect by design - so those commands are pinned in their own right.
 The shell a hook runs, the hook script's own interpreter, and the `touch` that marks the turn are all named by the absolute path Firstmate resolved from its own `PATH`, for every harness that has a hook.
 A spawn that could publish a pin but could not resolve those is refused before a worktree is leased and before any install runs, so the refusal never costs a lease, and it names the command it could not resolve.
+The same pre-lease refusal covers a checkout whose `bin/fm-launch-pinned.sh` is missing or has lost its executable bit, for the same reason: a proven pin that cannot be carried into the session is a refusal and never a silent downgrade to an unpinned launch, and deciding it up front is what keeps that refusal from stranding a dirty lease the pool then has to skip.
 That pre-lease refusal applies only when this spawn could actually publish a pin: a manifest whose `kinds` excludes this task's kind publishes nothing, so a scout on a `"kinds": ["ship"]` project is treated exactly like a project with no manifest, unless `--provision` overrides the kinds gate.
 An unreadable or malformed manifest is treated as one that could pin, so an unreadable file never buys a launch that a readable one would refuse.
 A component's `env` may not set `PATH`; use `path_prepend`, so a manifest cannot route around its own runtime checks.

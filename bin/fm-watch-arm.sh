@@ -147,8 +147,9 @@ stop_recorded_watcher() {  # <root-pid> <root-identity>
   session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
   if [ -n "$session" ]; then
     fm_watcher_lock_session_record_matches "$STATE" "$WATCH" "$FM_HOME" "$session" || return 1
-    anchor=$(cat "$WATCH_LOCK/session-anchor-pid" 2>/dev/null || true)
-    anchor_identity=$(cat "$WATCH_LOCK/session-anchor-identity" 2>/dev/null || true)
+    fm_watcher_lock_session_anchor_read "$STATE" || true
+    anchor=$FM_WATCHER_SESSION_ANCHOR_PID
+    anchor_identity=$FM_WATCHER_SESSION_ANCHOR_IDENTITY
     if fm_session_anchor_matches "$session" "$anchor" "$anchor_identity"; then
       fm_session_stop_owned_with_anchor "$session" "$anchor" "$anchor_identity" 30
       return

@@ -45,6 +45,14 @@ fm_pid_identity() {
   printf '%s\n' "$out" | sed 's/^[[:space:]]*//'
 }
 
+fm_pid_identity_live() {  # <pid> <pid-identity>
+  local pid=$1 identity=$2 state
+  [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "$identity" ] || return 1
+  state=$(LC_ALL=C ps -p "$pid" -o state= 2>/dev/null) || return 1
+  [ -n "$state" ] || return 1
+  case "$state" in *Z*) return 1 ;; esac
+}
+
 fm_pid_session() {  # <pid>
   local pid=$1
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
@@ -303,22 +311,42 @@ fm_watcher_lock_session_record_matches() {  # <state> <watch-path> <home> <sessi
   [ "$(cat "$lockdir/process-session" 2>/dev/null || true)" = "$session" ]
 }
 
-fm_watcher_lock_session_anchor_matches() {  # <state> <session-id>
-  local state=$1 session=$2 lockdir anchor identity
+FM_WATCHER_SESSION_ANCHOR_PID=
+FM_WATCHER_SESSION_ANCHOR_IDENTITY=
+fm_watcher_lock_session_anchor_read() {  # <state>
+  local state=$1 lockdir snapshot anchor identity lines
   lockdir="$state/.watch.lock"
-  anchor=$(cat "$lockdir/session-anchor-pid" 2>/dev/null || true)
-  identity=$(cat "$lockdir/session-anchor-identity" 2>/dev/null || true)
-  fm_session_anchor_matches "$session" "$anchor" "$identity"
+  FM_WATCHER_SESSION_ANCHOR_PID=
+  FM_WATCHER_SESSION_ANCHOR_IDENTITY=
+  if [ -f "$lockdir/session-anchor" ] && [ ! -L "$lockdir/session-anchor" ]; then
+    snapshot=$(cat "$lockdir/session-anchor" 2>/dev/null) || return 1
+    lines=$(printf '%s\n' "$snapshot" | awk 'END { print NR }')
+    [ "$lines" -eq 2 ] || return 1
+    anchor=$(printf '%s\n' "$snapshot" | sed -n '1s/^pid=//p')
+    identity=$(printf '%s\n' "$snapshot" | sed -n '2s/^identity=//p')
+  else
+    anchor=$(cat "$lockdir/session-anchor-pid" 2>/dev/null || true)
+    identity=$(cat "$lockdir/session-anchor-identity" 2>/dev/null || true)
+  fi
+  case "$anchor" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$identity" ] || return 1
+  FM_WATCHER_SESSION_ANCHOR_PID=$anchor
+  FM_WATCHER_SESSION_ANCHOR_IDENTITY=$identity
+}
+
+fm_watcher_lock_session_anchor_matches() {  # <state> <session-id>
+  local state=$1 session=$2
+  fm_watcher_lock_session_anchor_read "$state" || return 1
+  fm_session_anchor_matches \
+    "$session" "$FM_WATCHER_SESSION_ANCHOR_PID" "$FM_WATCHER_SESSION_ANCHOR_IDENTITY"
 }
 
 fm_watcher_lock_stop_session_anchor() {  # <state> <session-id> <expected-anchor-pid> [term-wait-tenths]
-  local state=$1 session=$2 expected_anchor=$3 wait_tenths=${4:-30} lockdir anchor identity
-  lockdir="$state/.watch.lock"
-  anchor=$(cat "$lockdir/session-anchor-pid" 2>/dev/null || true)
-  identity=$(cat "$lockdir/session-anchor-identity" 2>/dev/null || true)
-  [ "$anchor" = "$expected_anchor" ] || return 1
-  fm_session_anchor_matches "$session" "$anchor" "$identity" || return 1
-  fm_pid_stop_identity "$anchor" "$identity" "$wait_tenths"
+  local state=$1 session=$2 expected_anchor=$3 wait_tenths=${4:-30}
+  fm_watcher_lock_session_anchor_matches "$state" "$session" || return 1
+  [ "$FM_WATCHER_SESSION_ANCHOR_PID" = "$expected_anchor" ] || return 1
+  fm_pid_stop_identity \
+    "$FM_WATCHER_SESSION_ANCHOR_PID" "$FM_WATCHER_SESSION_ANCHOR_IDENTITY" "$wait_tenths"
 }
 
 fm_watcher_lock_session_matches_pid() {  # <state> <watch-path> <home> <watcher-pid>
@@ -589,6 +617,8 @@ fm_lock_clean_known_files() {
     "$confined/pid-identity" \
     "$confined/process-group" \
     "$confined/process-session" \
+    "$confined/session-anchor" \
+    "$confined/session-anchor.pending" \
     "$confined/session-anchor-pid" \
     "$confined/session-anchor-identity" \
     "$confined/watcher-path" \

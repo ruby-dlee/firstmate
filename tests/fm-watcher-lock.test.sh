@@ -959,8 +959,7 @@ test_anchor_stop_refuses_reused_pid() {
   session=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_session "$2"' _ "$LIB" "$live") \
     || { kill "$live" 2>/dev/null || true; wait "$live" 2>/dev/null || true; fail "could not read reused anchor session"; }
   mkdir "$state/.watch.lock"
-  printf '%s\n' "$live" > "$state/.watch.lock/session-anchor-pid"
-  printf '%s\n' "stale-$identity" > "$state/.watch.lock/session-anchor-identity"
+  printf 'pid=%s\nidentity=%s\n' "$live" "stale-$identity" > "$state/.watch.lock/session-anchor"
   status=0
   FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_watcher_lock_stop_session_anchor "$2" "$3" "$4" 1' \
     _ "$LIB" "$state" "$session" "$live" || status=$?
@@ -993,8 +992,8 @@ test_anchor_publication_waits_for_complete_identity() {
     i=$((i + 1))
   done
   [ -e "$ready" ] || fail "anchor publication did not reach its partial-record barrier: $(cat "$out")"
-  [ -s "$state/.watch.lock/session-anchor-pid" ] || fail "anchor PID was not published before the barrier"
-  [ ! -e "$state/.watch.lock/session-anchor-identity" ] || fail "anchor identity was published before the partial-record barrier"
+  [ -s "$state/.watch.lock/session-anchor.pending" ] || fail "monitor did not stage its complete anchor record"
+  [ ! -e "$state/.watch.lock/session-anchor" ] || fail "monitor published its anchor before the atomic-publication barrier"
   sleep 0.2
   touch "$proceed"
   i=0
@@ -1009,7 +1008,54 @@ test_anchor_publication_waits_for_complete_identity() {
   is_live_non_zombie "$watcher_pid" || fail "watcher did not survive complete anchor publication"
   kill -TERM "$armpid" 2>/dev/null || true
   wait "$armpid" 2>/dev/null || true
-  pass "ownership monitor waits for complete anchor publication"
+  pass "ownership monitor atomically publishes its complete anchor"
+}
+
+test_monitor_recovers_root_kill_before_anchor_publication() {
+  local dir state fakebin out ready proceed armpid watcher_pid monitor_pid session i members member
+  dir=$(make_case monitor-root-kill-publication)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  ready="$dir/publication.ready"
+  proceed="$dir/publication.proceed"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_PUBLISH_READY="$ready" FM_WATCH_OWNER_TEST_PUBLISH_PROCEED="$proceed" \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+    session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
+    [ -e "$ready" ] && [ -n "$watcher_pid" ] && [ "$session" = "$watcher_pid" ] && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$ready" ] || fail "monitor did not reach its pre-publication barrier: $(cat "$out")"
+  monitor_pid=$(sed -n '1s/^pid=//p' "$state/.watch.lock/session-anchor.pending" 2>/dev/null || true)
+  case "$monitor_pid" in ''|*[!0-9]*) fail "monitor did not stage its self-identified anchor" ;; esac
+  kill -KILL "$watcher_pid" 2>/dev/null || fail "could not kill watcher root before anchor publication"
+  i=0
+  while [ "$i" -lt 50 ] && is_live_non_zombie "$watcher_pid"; do sleep 0.1; i=$((i + 1)); done
+  ! is_live_non_zombie "$watcher_pid" || fail "watcher root survived its pre-publication SIGKILL"
+  i=0
+  while [ "$i" -lt 150 ]; do
+    members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' _ "$LIB" "$session" 2>/dev/null || true)
+    [ -z "$members" ] && [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -z "$members" ] || { for member in $members; do kill -KILL "$member" 2>/dev/null || true; done; fail "root kill before anchor publication stranded session members: $members"; }
+  [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
+    || fail "root kill before anchor publication left the watcher lock behind"
+  ! is_live_non_zombie "$monitor_pid" || { kill -KILL "$monitor_pid" 2>/dev/null || true; fail "root kill before anchor publication stranded the monitor"; }
+  kill -TERM "$armpid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  pass "self-publishing monitor recovers watcher death before publication"
 }
 
 test_watcher_self_evicts_on_lock_takeover() {
@@ -1843,6 +1889,12 @@ if [ "${FM_TEST_FOCUSED:-}" = anchor-races ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = monitor-publication ]; then
+  test_anchor_publication_waits_for_complete_identity
+  test_monitor_recovers_root_kill_before_anchor_publication
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = arm-owner-death ]; then
   test_arm_owner_death_reaps_watcher_session
   exit 0
@@ -1887,6 +1939,7 @@ test_watch_restart_refuses_reused_session_without_anchor
 test_normal_session_watcher_releases_guard
 test_anchor_stop_refuses_reused_pid
 test_anchor_publication_waits_for_complete_identity
+test_monitor_recovers_root_kill_before_anchor_publication
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_arm_refuses_live_lock_with_bad_attach_cadence

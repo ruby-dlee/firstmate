@@ -11,12 +11,19 @@ owner_dir=$3
 watch_path="$SCRIPT_DIR/fm-watch.sh"
 lockdir="$STATE/.watch.lock"
 observer=${BASHPID:-$$}
+arm_owner=
+arm_owner_identity=
 
 case "$root" in ''|*[!0-9]*) exit 2 ;; esac
 [ "$session" = "$root" ] || exit 2
 case "$owner_dir" in "$STATE"/.watch-arm-owner.*) ;; *) exit 2 ;; esac
 [ -d "$owner_dir" ] && [ ! -L "$owner_dir" ] || exit 2
 [ "$(fm_pid_session "$observer" 2>/dev/null || true)" = "$session" ] || exit 1
+arm_owner=$(cat "$owner_dir/arm-owner-pid" 2>/dev/null || true)
+arm_owner_identity=$(cat "$owner_dir/arm-owner-identity" 2>/dev/null || true)
+case "$arm_owner" in ''|*[!0-9]*) exit 1 ;; esac
+[ -n "$arm_owner_identity" ] || exit 1
+fm_pid_identity_live "$arm_owner" "$arm_owner_identity" && exit 1
 
 status=0
 if fm_watcher_lock_session_proof_matches "$STATE" "$watch_path" "$FM_HOME" "$session"; then
@@ -50,7 +57,8 @@ if [ "$status" -eq 0 ]; then
     "$owner_dir/prestart-owner-identity.pending" 2>/dev/null || true
   rm -f "$owner_dir/pid" "$owner_dir/pid-identity" "$owner_dir/process-session" \
     "$owner_dir/fm-home" "$owner_dir/watcher-path" "$owner_dir/session-stop" \
-    "$owner_dir/session-stop.pending" "$owner_dir/.session-stop-transaction" 2>/dev/null || true
+    "$owner_dir/session-stop.pending" "$owner_dir/.session-stop-transaction" \
+    "$owner_dir/arm-owner-pid" "$owner_dir/arm-owner-identity" 2>/dev/null || true
   rmdir "$owner_dir" 2>/dev/null || true
 fi
 exit "$status"

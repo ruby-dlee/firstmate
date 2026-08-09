@@ -132,18 +132,23 @@ recorded_watcher_lock_metadata_matches() {
 }
 
 clear_stale_recorded_watcher_lock() {
-  local lock_session
+  local lock_session lock_group group_status=0
   recorded_watcher_lock_metadata_matches || return 1
   lock_session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
   if [ -n "$lock_session" ]; then
     fm_session_wait_quiescent_except "$lock_session" "" 2 || return 1
+  fi
+  lock_group=$(cat "$WATCH_LOCK/process-group" 2>/dev/null || true)
+  if [ -n "$lock_group" ]; then
+    fm_process_group_has_live_processes "$lock_group" || group_status=$?
+    [ "$group_status" -eq 1 ] || return 1
   fi
   fm_lock_remove_path "$WATCH_LOCK" || return 1
   [ ! -e "$WATCH_LOCK" ] && [ ! -L "$WATCH_LOCK" ]
 }
 
 stop_recorded_watcher() {  # <root-pid> <root-identity>
-  local root=$1 identity=$2 session current_identity anchor anchor_identity status
+  local root=$1 identity=$2 session anchor anchor_identity group status
   session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
   if [ -n "$session" ]; then
     fm_watcher_lock_session_proof_matches "$STATE" "$WATCH" "$FM_HOME" "$session" || return 1
@@ -161,9 +166,23 @@ stop_recorded_watcher() {  # <root-pid> <root-identity>
     fm_watcher_lock_session_stop_claim_clear "$STATE" "$session" >/dev/null 2>&1 || true
     return "$status"
   fi
-  current_identity=$(fm_pid_identity "$root") || return 1
-  [ "$current_identity" = "$identity" ] || return 1
-  fm_pid_tree_stop "$root" 30 "$identity"
+  fm_watcher_lock_legacy_stop_claim "$STATE" "$root" || return 1
+  if [ "${FM_WATCH_LEGACY_CLAIM_TEST_HOOKS:-}" = firstmate-legacy-claim-tests-v1 ] \
+    && [ -n "${FM_WATCH_LEGACY_CLAIM_TEST_READY:-}" ] \
+    && [ -n "${FM_WATCH_LEGACY_CLAIM_TEST_PROCEED:-}" ]; then
+    : > "$FM_WATCH_LEGACY_CLAIM_TEST_READY"
+    while [ ! -e "$FM_WATCH_LEGACY_CLAIM_TEST_PROCEED" ]; do sleep 0.01; done
+  fi
+  group=$(cat "$WATCH_LOCK/process-group" 2>/dev/null || true)
+  [ "$group" = "$root" ] || {
+    fm_watcher_lock_legacy_stop_claim_clear "$STATE" "$root" >/dev/null 2>&1 || true
+    return 1
+  }
+  status=0
+  fm_pid_tree_stop "$root" 30 "$identity" "$group" || status=$?
+  [ "$status" -eq 0 ] && return 0
+  fm_watcher_lock_legacy_stop_claim_clear "$STATE" "$root" >/dev/null 2>&1 || true
+  return "$status"
 }
 
 # A watcher is "healthy" iff the lock names a live process that is genuinely THIS
@@ -330,7 +349,9 @@ if [ "$mode" = restart ]; then
     }
     lock_session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
     current_identity=$(fm_pid_identity "$lock_pid" 2>/dev/null || true)
-    if [ -n "$lock_session" ] || [ "$current_identity" = "$lock_identity" ]; then
+    lock_group=$(cat "$WATCH_LOCK/process-group" 2>/dev/null || true)
+    if [ -n "$lock_session" ] || [ -n "$lock_group" ] \
+      || [ "$current_identity" = "$lock_identity" ]; then
       if ! stop_recorded_watcher "$lock_pid" "$lock_identity"; then
         echo "watcher: FAILED - recorded watcher ownership boundary could not be stopped for restart" >&2
         exit 1
@@ -410,7 +431,9 @@ owner_link_remove() {
     "$owner_link_dir/handoff-taken" "$owner_link_dir/handoff-taken.pending" \
     "$owner_link_dir/prestart-owner-pid" "$owner_link_dir/prestart-owner-pid.pending" \
     "$owner_link_dir/prestart-owner-identity" \
-    "$owner_link_dir/prestart-owner-identity.pending" 2>/dev/null || true
+    "$owner_link_dir/prestart-owner-identity.pending" \
+    "$owner_link_dir/arm-owner-pid" "$owner_link_dir/arm-owner-identity" \
+    2>/dev/null || true
   rmdir "$owner_link_dir" 2>/dev/null || true
   owner_link_dir=
   owner_link_fifo=
@@ -435,6 +458,31 @@ capture_child_session_handshake() {
   child_session_verified=true
 }
 
+owner_link_session_proof_matches() {
+  local root identity current session_record arm_identity
+  [ -n "$owner_link_dir" ] && [ -d "$owner_link_dir" ] && [ ! -L "$owner_link_dir" ] \
+    || return 1
+  root=$(cat "$owner_link_dir/pid" 2>/dev/null || true)
+  identity=$(cat "$owner_link_dir/pid-identity" 2>/dev/null || true)
+  [ "$root" = "$child" ] && [ -n "$identity" ] || return 1
+  [ "$(cat "$owner_link_dir/process-session" 2>/dev/null || true)" = "$child" ] || return 1
+  [ "$(cat "$owner_link_dir/fm-home" 2>/dev/null || true)" = "$FM_HOME" ] || return 1
+  [ "$(cat "$owner_link_dir/watcher-path" 2>/dev/null || true)" = "$WATCH" ] || return 1
+  session_record=$(printf 'pid=%s\nidentity=%s' "$child" "$identity")
+  [ "$(cat "$owner_link_dir/session-root" 2>/dev/null || true)" = "$session_record" ] \
+    || return 1
+  [ "$(cat "$owner_link_dir/arm-owner-pid" 2>/dev/null || true)" = "${BASHPID:-$$}" ] \
+    || return 1
+  arm_identity=$(cat "$owner_link_dir/arm-owner-identity" 2>/dev/null || true)
+  fm_pid_identity_live "${BASHPID:-$$}" "$arm_identity" || return 1
+  current=$(fm_pid_identity "$child" 2>/dev/null || true)
+  if [ -n "$current" ]; then
+    [ "$current" = "$identity" ] || return 1
+    [ "$(fm_pid_session "$child" 2>/dev/null || true)" = "$child" ] || return 1
+  fi
+  fm_session_snapshot "$child" >/dev/null
+}
+
 stop_owned_child() {
   local status=0 session_status=0
   [ -n "$child" ] || return 0
@@ -444,38 +492,36 @@ stop_owned_child() {
     && [ "$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)" = "$child_session_identity" ] \
     && fm_watcher_lock_session_record_matches "$STATE" "$WATCH" "$FM_HOME" "$child"; then
     stop_recorded_watcher "$child" "$child_session_identity" || status=$?
-  elif "$child_session_verified"; then
-    if [ -n "$child_session_identity" ] \
-      && [ "$(fm_pid_identity "$child" 2>/dev/null || true)" = "$child_session_identity" ]; then
-      fm_pid_session_stop "$child" "$child" 30 "$child_session_identity" || status=$?
-    else
-      status=1
-    fi
-  elif [ -n "$child_identity" ] && fm_pid_alive "$child"; then
-    fm_pid_stop_identity "$child" "$child_identity" 30 || status=$?
+  elif owner_link_session_proof_matches \
+    && fm_session_stop_claim_dir "$owner_link_dir" "$child"; then
+    fm_session_stop_owned "$child" 30 || status=$?
+  else
+    status=1
   fi
+  [ "$status" -eq 0 ] || return "$status"
   wait "$child" 2>/dev/null || true
-  if "$child_session_verified"; then
-    fm_session_has_live_processes "$child" || session_status=$?
-    [ "$session_status" -eq 1 ] || status=1
-  fi
+  fm_session_has_live_processes "$child" || session_status=$?
+  [ "$session_status" -eq 1 ] || return 1
   clear_stale_recorded_watcher_lock >/dev/null 2>&1 || true
   owner_link_remove
-  return "$status"
+  return 0
 }
 
 cleanup_child() {
-  stop_owned_child >/dev/null 2>&1 || true
+  if [ -n "$child" ]; then
+    stop_owned_child >/dev/null 2>&1 || return 1
+  else
+    owner_link_remove
+  fi
   owner_link_disconnect
   owner_link_reader_disconnect
-  owner_link_remove
   if [ -n "$child_out" ]; then
     rm -f "$child_out" 2>/dev/null || true
   fi
 }
 
 monitor_started_child() {  # <confirmed-watcher-pid>
-  local watched=$1 hot_samples=0 sample_in=0 age reason rc session_status=0 identity
+  local watched=$1 hot_samples=0 sample_in=0 age reason rc session_status=0 identity cleanup_complete=false
   while fm_pid_alive "$watched" \
     && fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$watched" "$FM_HOME"; do
     age=$(fm_path_age "$BEAT")
@@ -521,6 +567,7 @@ monitor_started_child() {  # <confirmed-watcher-pid>
   owner_link_disconnect
   if "$child_session_verified"; then
     fm_session_has_live_processes "$watched" || session_status=$?
+    [ "$session_status" -eq 1 ] && cleanup_complete=true
   fi
   if "$child_session_verified" && [ "$session_status" -ne 1 ]; then
     reason="stale: watcher pid $watched exited before its owned process session was verified empty"
@@ -531,13 +578,17 @@ monitor_started_child() {  # <confirmed-watcher-pid>
     stop_recorded_watcher "$watched" "$identity" || session_status=$?
     if [ "$session_status" -ne 0 ]; then
       echo "watcher: FAILED - owned watcher process session could not be fully reaped"
+    else
+      cleanup_complete=true
     fi
     rc=1
   fi
-  clear_stale_recorded_watcher_lock >/dev/null 2>&1 || true
-  owner_link_remove
-  print_watch_output "$child_out"
-  rm -f "$child_out" 2>/dev/null || true
+  if "$cleanup_complete"; then
+    clear_stale_recorded_watcher_lock >/dev/null 2>&1 || true
+    owner_link_remove
+    print_watch_output "$child_out"
+    rm -f "$child_out" 2>/dev/null || true
+  fi
   child=
   child_out=
   return "$rc"
@@ -602,8 +653,37 @@ owner_link_reader_connected=true
         $identity =~ s/\n\z//;
         return $identity;
       };
+      my $identity_live_for = sub {
+        my ($pid) = @_;
+        my $helper = $ENV{FM_PROCESS_IDENTITY_BIN};
+        return if !defined $helper || $helper eq "";
+        open my $identity_process, "-|", $helper, "--live", $pid or return;
+        local $/;
+        my $identity = <$identity_process>;
+        close $identity_process or return;
+        return if !defined $identity || $identity eq "";
+        $identity =~ s/\n\z//;
+        return $identity;
+      };
+      my $parent_for = sub {
+        my ($pid) = @_;
+        local $ENV{LC_ALL} = "C";
+        open my $ps, "-|", "ps", "-p", $pid, "-o", "ppid=" or return;
+        local $/;
+        my $parent = <$ps>;
+        close $ps or return;
+        return if !defined $parent;
+        $parent =~ s/^[[:space:]]+//;
+        $parent =~ s/[[:space:]]+\z//;
+        return if $parent !~ /\A[0-9]+\z/;
+        return $parent;
+      };
       my $root_identity = $identity_for->($root);
       exit 125 if !defined $root_identity;
+      my $arm_owner = getppid();
+      exit 125 if !defined $arm_owner || $arm_owner == $root;
+      my $arm_owner_identity = $identity_live_for->($arm_owner);
+      exit 125 if !defined $arm_owner_identity;
       my $owner_dir = $ENV{FM_WATCH_ARM_OWNER_DIR};
       my @proof = (
         ["pid", "$root\n"],
@@ -612,6 +692,8 @@ owner_link_reader_connected=true
         ["fm-home", "$ENV{FM_HOME}\n"],
         ["watcher-path", "$ARGV[0]\n"],
         ["session-root", "pid=$root\nidentity=$root_identity\n"],
+        ["arm-owner-pid", "$arm_owner\n"],
+        ["arm-owner-identity", "$arm_owner_identity\n"],
       );
       for my $item (@proof) {
         my ($name, $contents) = @$item;
@@ -657,6 +739,9 @@ owner_link_reader_connected=true
         };
         my $owner_lost = sub {
           return 1 if getppid() != $root;
+          my $current_root_parent = $parent_for->($root);
+          return 1 if !defined $current_root_parent
+            || $current_root_parent != $arm_owner;
           my $readable = "";
           vec($readable, fileno($owner), 1) = 1;
           my $ready = select($readable, undef, undef, 0);
@@ -666,13 +751,16 @@ owner_link_reader_connected=true
         };
         my $handoff = 0;
         while (getppid() == $root) {
+          my $current_root_parent = $parent_for->($root);
+          last if !defined $current_root_parent
+            || $current_root_parent != $arm_owner;
           my $readable = "";
           vec($readable, fileno($owner), 1) = 1;
           my $ready = select($readable, undef, undef, 0.1);
-          next if !defined $ready || $ready == 0;
-          my $count = sysread($owner, my $byte, 1);
-          last if !defined $count || $count == 0;
-        } continue {
+          if (defined $ready && $ready != 0) {
+            my $count = sysread($owner, my $byte, 1);
+            last if !defined $count || $count == 0;
+          }
           my $record = $read_regular->($request);
           next if !defined $record;
           next if $record !~ /\Apid=([0-9]+)\nidentity=(.+)\n\z/s;
@@ -795,6 +883,7 @@ done
 trap - HUP TERM INT
 echo "watcher: FAILED - no live watcher with a fresh beacon"
 print_watch_output "$child_out"
-cleanup_child
-wait "$child" 2>/dev/null || true
+if cleanup_child; then
+  wait "$child" 2>/dev/null || true
+fi
 exit 1

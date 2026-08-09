@@ -47,7 +47,21 @@ def process_identity(helper, pid):
     return identity or None
 
 
-def basis(lockdir, session, helper):
+def process_identity_live(helper, pid):
+    result = subprocess.run(
+        [helper, "--live", str(pid)],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        universal_newlines=True,
+    )
+    if result.returncode != 0:
+        return None
+    identity = result.stdout.rstrip("\n")
+    return identity or None
+
+
+def session_basis(lockdir, session, helper):
     values = {}
     for name in RECORD_NAMES:
         values[name] = read_regular(
@@ -63,7 +77,83 @@ def basis(lockdir, session, helper):
     if current is not None:
         if current != root_identity or os.getsid(int(root)) != int(session):
             raise RuntimeError("reused session leader")
-    return tuple((name, values[name]) for name in RECORD_NAMES)
+        if process_identity(helper, int(root)) != root_identity:
+            raise RuntimeError("reused session leader")
+    extra_names = ("session-root", "arm-owner-pid", "arm-owner-identity")
+    extras = {
+        name: read_regular(os.path.join(lockdir, name))
+        for name in extra_names
+    }
+    if extras["session-root"]:
+        expected_root = "pid={}\nidentity={}\n".format(root, root_identity)
+        if extras["session-root"] != expected_root:
+            raise RuntimeError("invalid session root proof")
+    if bool(extras["arm-owner-pid"]) != bool(extras["arm-owner-identity"]):
+        raise RuntimeError("incomplete arm owner proof")
+    if extras["arm-owner-pid"] and not extras["arm-owner-pid"].strip().isdigit():
+        raise RuntimeError("invalid arm owner proof")
+    return tuple((name, values[name]) for name in RECORD_NAMES) + tuple(
+        (name, extras[name]) for name in extra_names
+    )
+
+
+def publish_regular(path, contents):
+    pending = "{}.pending.{}".format(path, secrets.token_hex(12))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(pending, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as record:
+            record.write(contents)
+            record.flush()
+            os.fsync(record.fileno())
+        os.link(pending, path)
+    finally:
+        if os.path.exists(pending):
+            os.unlink(pending)
+
+
+def legacy_basis(lockdir, group, helper):
+    names = ("pid", "pid-identity", "fm-home", "watcher-path")
+    values = {
+        name: read_regular(os.path.join(lockdir, name), required=True)
+        for name in names
+    }
+    root = values["pid"].strip()
+    root_identity = values["pid-identity"].rstrip("\n")
+    if not root.isdigit() or root != group or not root_identity:
+        raise RuntimeError("invalid legacy proof")
+    current = process_identity(helper, int(root))
+    if current is not None and current != root_identity:
+        raise RuntimeError("reused legacy root")
+    group_path = os.path.join(lockdir, "process-group")
+    group_record = read_regular(group_path)
+    if not group_record:
+        if process_identity_live(helper, int(root)) != root_identity:
+            raise RuntimeError("missing live legacy root")
+        if os.getpgid(int(root)) != int(group):
+            raise RuntimeError("invalid legacy process group")
+        publish_regular(group_path, "{}\n".format(group))
+        group_record = read_regular(group_path, required=True)
+    if group_record.strip() != group:
+        raise RuntimeError("invalid legacy process group")
+    current = process_identity(helper, int(root))
+    if current is not None:
+        if current != root_identity or os.getpgid(int(root)) != int(group):
+            raise RuntimeError("changed legacy process group")
+        if process_identity(helper, int(root)) != root_identity:
+            raise RuntimeError("reused legacy root")
+    values["process-group"] = group_record
+    return tuple((name, values[name]) for name in names + ("process-group",))
+
+
+def basis(lockdir, boundary, helper, kind):
+    if kind == "session":
+        return session_basis(lockdir, boundary, helper)
+    if kind == "legacy":
+        return legacy_basis(lockdir, boundary, helper)
+    raise RuntimeError("invalid claim kind")
 
 
 def parse_claim(contents):
@@ -83,7 +173,11 @@ def parse_claim(contents):
         "stopper-identity",
         "claim-id",
     }
-    if set(fields) != expected or fields["version"] != "1":
+    if set(fields) == expected:
+        fields["kind"] = "session"
+    elif set(fields) != expected | {"kind"}:
+        raise RuntimeError("malformed claim")
+    if fields["version"] != "1" or fields["kind"] not in ("session", "legacy"):
         raise RuntimeError("malformed claim")
     if not fields["session-id"].isdigit() or not fields["stopper-pid"].isdigit():
         raise RuntimeError("malformed claim")
@@ -104,11 +198,9 @@ def basis_id(snapshot):
     return digest.hexdigest()
 
 
-def claim_live(fields, session, current_basis_id, helper):
-    if fields["session-id"] != session or fields["basis-id"] != current_basis_id:
-        return False
+def claim_owner_live(fields, helper):
     pid = int(fields["stopper-pid"])
-    return process_identity(helper, pid) == fields["stopper-identity"]
+    return process_identity_live(helper, pid) == fields["stopper-identity"]
 
 
 def locked_file(lockdir):
@@ -125,11 +217,9 @@ def locked_file(lockdir):
     return descriptor
 
 
-def acquire(lockdir, session, helper, stopper, stopper_identity):
+def acquire(lockdir, boundary, helper, stopper, stopper_identity, kind):
     descriptor = locked_file(lockdir)
     try:
-        snapshot = basis(lockdir, session, helper)
-        current_basis_id = basis_id(snapshot)
         claim_path = os.path.join(lockdir, "session-stop")
         try:
             contents = read_regular(claim_path, required=True)
@@ -138,38 +228,53 @@ def acquire(lockdir, session, helper, stopper, stopper_identity):
             fields = None
         except RuntimeError:
             fields = None
-        if fields is not None and claim_live(fields, session, current_basis_id, helper):
-            if str(stopper) == fields["stopper-pid"] and stopper_identity == fields["stopper-identity"]:
+        if fields is not None and claim_owner_live(fields, helper):
+            if (
+                fields["session-id"] == boundary
+                and fields["kind"] == kind
+                and str(stopper) == fields["stopper-pid"]
+                and stopper_identity == fields["stopper-identity"]
+            ):
                 print(fields["claim-id"])
                 return 0
             return 3
+        snapshot = basis(lockdir, boundary, helper, kind)
+        current_basis_id = basis_id(snapshot)
         if os.path.lexists(claim_path):
-            if basis(lockdir, session, helper) != snapshot:
+            if basis(lockdir, boundary, helper, kind) != snapshot:
                 return 1
             quarantine = "{}.reclaimed.{}".format(claim_path, secrets.token_hex(12))
             os.rename(claim_path, quarantine)
             os.unlink(quarantine)
-        old_pending = os.path.join(lockdir, "session-stop.pending")
-        if os.path.lexists(old_pending):
-            if basis(lockdir, session, helper) != snapshot:
+        pending_names = [
+            name
+            for name in os.listdir(lockdir)
+            if name == "session-stop.pending" or name.startswith("session-stop.pending.")
+        ]
+        for pending_name in pending_names:
+            if basis(lockdir, boundary, helper, kind) != snapshot:
                 return 1
-            pending_metadata = os.lstat(old_pending)
-            if stat.S_ISLNK(pending_metadata.st_mode) or not stat.S_ISREG(pending_metadata.st_mode):
+            pending_path = os.path.join(lockdir, pending_name)
+            pending_metadata = os.lstat(pending_path)
+            if stat.S_ISLNK(pending_metadata.st_mode) or not stat.S_ISREG(
+                pending_metadata.st_mode
+            ):
                 return 1
-            os.unlink(old_pending)
-        if basis(lockdir, session, helper) != snapshot:
+            os.unlink(pending_path)
+        if basis(lockdir, boundary, helper, kind) != snapshot:
             return 1
-        if process_identity(helper, stopper) != stopper_identity:
+        if process_identity_live(helper, stopper) != stopper_identity:
             return 1
         claim_id = secrets.token_hex(24)
         contents = (
             "version=1\n"
+            "kind={}\n"
             "session-id={}\n"
             "basis-id={}\n"
             "stopper-pid={}\n"
             "stopper-identity={}\n"
             "claim-id={}\n"
-        ).format(session, current_basis_id, stopper, stopper_identity, claim_id)
+        ).format(kind, boundary, current_basis_id, stopper, stopper_identity, claim_id)
         pending = "{}.pending.{}".format(claim_path, claim_id)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
@@ -184,7 +289,7 @@ def acquire(lockdir, session, helper, stopper, stopper_identity):
         finally:
             if os.path.exists(pending):
                 os.unlink(pending)
-        if basis(lockdir, session, helper) != snapshot:
+        if basis(lockdir, boundary, helper, kind) != snapshot:
             os.unlink(claim_path)
             return 1
         print(claim_id)
@@ -193,28 +298,31 @@ def acquire(lockdir, session, helper, stopper, stopper_identity):
         os.close(descriptor)
 
 
-def matches(lockdir, session, helper):
+def matches(lockdir, boundary, helper, kind):
     descriptor = locked_file(lockdir)
     try:
-        current_basis_id = basis_id(basis(lockdir, session, helper))
         fields = parse_claim(read_regular(os.path.join(lockdir, "session-stop"), required=True))
-        return 0 if claim_live(fields, session, current_basis_id, helper) else 1
+        return 0 if (
+            fields["session-id"] == boundary
+            and fields["kind"] == kind
+            and claim_owner_live(fields, helper)
+        ) else 1
     finally:
         os.close(descriptor)
 
 
-def clear(lockdir, session, helper, stopper, stopper_identity, claim_id):
+def clear(lockdir, boundary, helper, stopper, stopper_identity, claim_id, kind):
     descriptor = locked_file(lockdir)
     try:
-        current_basis_id = basis_id(basis(lockdir, session, helper))
         claim_path = os.path.join(lockdir, "session-stop")
         fields = parse_claim(read_regular(claim_path, required=True))
         if (
-            fields["session-id"] != session
-            or fields["basis-id"] != current_basis_id
+            fields["session-id"] != boundary
+            or fields["kind"] != kind
             or fields["claim-id"] != claim_id
             or fields["stopper-pid"] != str(stopper)
             or fields["stopper-identity"] != stopper_identity
+            or process_identity_live(helper, stopper) != stopper_identity
         ):
             return 1
         os.unlink(claim_path)
@@ -226,28 +334,32 @@ def clear(lockdir, session, helper, stopper, stopper_identity, claim_id):
 def main():
     if len(sys.argv) not in (5, 7, 8):
         return 2
-    action, lockdir, session, helper = sys.argv[1:5]
-    if not session.isdigit() or not os.path.isdir(lockdir) or os.path.islink(lockdir):
+    action, lockdir, boundary, helper = sys.argv[1:5]
+    kind = "legacy" if action.endswith("-legacy") else "session"
+    if kind == "legacy":
+        action = action[: -len("-legacy")]
+    if not boundary.isdigit() or not os.path.isdir(lockdir) or os.path.islink(lockdir):
         return 2
     try:
         if action == "acquire":
             if len(sys.argv) != 7 or not sys.argv[5].isdigit():
                 return 2
-            return acquire(lockdir, session, helper, int(sys.argv[5]), sys.argv[6])
+            return acquire(lockdir, boundary, helper, int(sys.argv[5]), sys.argv[6], kind)
         if action == "matches":
             if len(sys.argv) != 5:
                 return 2
-            return matches(lockdir, session, helper)
+            return matches(lockdir, boundary, helper, kind)
         if action == "clear":
             if len(sys.argv) != 8 or not sys.argv[5].isdigit():
                 return 2
             return clear(
                 lockdir,
-                session,
+                boundary,
                 helper,
                 int(sys.argv[5]),
                 sys.argv[6],
                 sys.argv[7],
+                kind,
             )
         return 2
     except (OSError, RuntimeError, ValueError):

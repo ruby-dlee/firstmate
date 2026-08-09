@@ -6,7 +6,7 @@ import platform
 import sys
 
 
-def linux_identity(pid):
+def linux_process(pid):
     with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as boot_file:
         boot_id = boot_file.read().strip()
     with open("/proc/{}/stat".format(pid), encoding="ascii") as stat_file:
@@ -15,7 +15,7 @@ def linux_identity(pid):
     fields = stat[close + 2 :].split()
     if close < 0 or len(fields) < 20:
         raise RuntimeError("invalid proc stat")
-    return "linux:{}:{}".format(boot_id, fields[19])
+    return "linux:{}:{}".format(boot_id, fields[19]), fields[0] != "Z"
 
 
 class ProcBsdInfo(ctypes.Structure):
@@ -45,7 +45,7 @@ class ProcBsdInfo(ctypes.Structure):
     ]
 
 
-def darwin_identity(pid):
+def darwin_process(pid):
     libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
     libproc.proc_pidinfo.argtypes = [
         ctypes.c_int,
@@ -61,26 +61,30 @@ def darwin_identity(pid):
     )
     if size != ctypes.sizeof(info) or info.pbi_pid != pid:
         raise RuntimeError("proc_pidinfo failed")
-    return "darwin:{}:{}".format(info.pbi_start_tvsec, info.pbi_start_tvusec)
+    return (
+        "darwin:{}:{}".format(info.pbi_start_tvsec, info.pbi_start_tvusec),
+        info.pbi_status != 5,
+    )
 
 
 def main():
-    if len(sys.argv) != 2 or not sys.argv[1].isdigit():
+    live_only = len(sys.argv) == 3 and sys.argv[1] == "--live"
+    if (len(sys.argv) != 2 and not live_only) or not sys.argv[-1].isdigit():
         return 2
-    pid = int(sys.argv[1])
+    pid = int(sys.argv[-1])
     if pid <= 0:
         return 2
     system = platform.system()
     try:
         if system == "Linux":
-            identity = linux_identity(pid)
+            identity, live = linux_process(pid)
         elif system == "Darwin":
-            identity = darwin_identity(pid)
+            identity, live = darwin_process(pid)
         else:
             return 1
     except (OSError, RuntimeError, ValueError):
         return 1
-    if not identity or os.getpid() <= 0:
+    if not identity or os.getpid() <= 0 or (live_only and not live):
         return 1
     print(identity)
     return 0

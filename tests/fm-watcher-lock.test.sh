@@ -851,7 +851,7 @@ test_arm_owner_death_before_monitor_start_reaps_session() {
 }
 
 test_arm_owner_death_during_prestart_wedge_reaps_session() {
-  local dir state fakebin out ready proceed armpid watcher_pid session i members member
+  local dir state fakebin out ready proceed armpid watcher_pid session i members member owner_dir claim
   dir=$(make_case arm-owner-prestart-wedge)
   state="$dir/state"
   fakebin="$dir/fakebin"
@@ -886,11 +886,15 @@ test_arm_owner_death_during_prestart_wedge_reaps_session() {
     i=$((i + 1))
   done
   [ -z "$members" ] || {
+    owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch-arm-owner.*' -print -quit)
+    claim=$(cat "$owner_dir/session-stop" 2>/dev/null || true)
     for member in $members; do kill -KILL "$member" 2>/dev/null || true; done
-    fail "arm death during prestart wedge left watcher session members: $members"
+    fail "arm death during prestart wedge left watcher session members: $members; arm=$armpid recorded=$(cat "$owner_dir/arm-owner-pid" 2>/dev/null || true); claim: $claim"
   }
   [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
     || fail "arm death during prestart wedge left the watcher lock behind"
+  [ -z "$(find "$state" -maxdepth 1 -type d -name '.watch-arm-owner.*' -print -quit)" ] \
+    || fail "arm death during prestart wedge left its immutable owner proof behind"
   pass "post-setsid owner observer reaps a prestart-wedged watcher"
 }
 
@@ -2310,9 +2314,15 @@ test_dead_stop_claim_is_reclaimed_exclusively() {
     _ "$LIB" "$state" "$root"; then
     fail "second live cleanup owner acquired the active stop claim"
   fi
+  printf 'pid=%s\nidentity=%s\n' "$root" "$identity" > "$lock/session-anchor"
+  if FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_watcher_lock_session_stop_claim "$2" "$3"' \
+    _ "$LIB" "$state" "$root"; then
+    fail "basis publication displaced a live cleanup owner"
+  fi
   kill -KILL "$claimant" 2>/dev/null || true
   wait "$claimant" 2>/dev/null || true
   printf 'partial\n' > "$lock/session-stop.pending"
+  printf 'partial\n' > "$lock/session-stop.pending.abandoned"
   claim_id=$(FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
     fm_watcher_lock_session_stop_claim "$2" "$3" || exit 1
@@ -2320,9 +2330,72 @@ test_dead_stop_claim_is_reclaimed_exclusively() {
   ' _ "$LIB" "$state" "$root") || fail "dead cleanup owner's claim was not reclaimed"
   [ -n "$claim_id" ] || fail "reclaimed stop claim had no unique id"
   [ ! -e "$lock/session-stop.pending" ] || fail "incomplete stop publication was not reclaimed"
+  [ ! -e "$lock/session-stop.pending.abandoned" ] \
+    || fail "unique incomplete stop publication was not reclaimed"
   kill "$root" 2>/dev/null || true
   wait "$root" 2>/dev/null || true
   pass "stop claims exclude live owners and reclaim dead owners"
+}
+
+test_zombie_stop_claim_is_reclaimed() {
+  local dir state lock root identity holder zombie ready i claim_id
+  dir=$(make_case zombie-stop-claim)
+  state="$dir/state"
+  lock="$state/.watch.lock"
+  ready="$dir/ready"
+  perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "300"' &
+  root=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    [ "$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_session "$2"' _ "$LIB" "$root" 2>/dev/null || true)" = "$root" ] && break
+    sleep 0.01
+    i=$((i + 1))
+  done
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$root") \
+    || fail "could not identify zombie-claim fixture"
+  mkdir "$lock"
+  printf '%s\n' "$root" > "$lock/pid"
+  printf '%s\n' "$identity" > "$lock/pid-identity"
+  printf '%s\n' "$root" > "$lock/process-session"
+  printf '%s\n' "$dir" > "$lock/fm-home"
+  printf '%s\n' "$WATCH" > "$lock/watcher-path"
+  FM_TEST_ZOMBIE_PID="$dir/zombie.pid" FM_TEST_READY="$ready" FM_STATE_OVERRIDE="$state" \
+    FM_TEST_LIB="$LIB" FM_TEST_BOUNDARY="$root" perl -e '
+      my $pid = fork();
+      exit 2 if !defined $pid;
+      if ($pid == 0) {
+        exec "bash", "-c", q{. "$FM_TEST_LIB"; fm_watcher_lock_session_stop_claim "$FM_STATE_OVERRIDE" "$FM_TEST_BOUNDARY" || exit 1; : > "$FM_TEST_READY"};
+        exit 3;
+      }
+      open my $file, ">", $ENV{FM_TEST_ZOMBIE_PID} or exit 4;
+      print {$file} "$pid\n";
+      close $file;
+      sleep 300;
+    ' &
+  holder=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -e "$ready" ]; do sleep 0.01; i=$((i + 1)); done
+  zombie=$(cat "$dir/zombie.pid" 2>/dev/null || true)
+  i=0
+  while [ "$i" -lt 100 ]; do
+    case "$(LC_ALL=C ps -p "$zombie" -o state= 2>/dev/null || true)" in *Z*) break ;; esac
+    sleep 0.01
+    i=$((i + 1))
+  done
+  case "$(LC_ALL=C ps -p "$zombie" -o state= 2>/dev/null || true)" in
+    *Z*) ;;
+    *) fail "stop claimant did not remain as a zombie fixture" ;;
+  esac
+  claim_id=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_watcher_lock_session_stop_claim "$2" "$3" || exit 1
+    printf "%s" "$FM_WATCHER_STOP_CLAIM_ID"
+  ' _ "$LIB" "$state" "$root") || fail "zombie cleanup owner's claim was not reclaimed"
+  [ -n "$claim_id" ] || fail "zombie-reclaimed claim had no unique id"
+  kill -TERM "$holder" "$root" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  wait "$root" 2>/dev/null || true
+  pass "zombie cleanup owners do not retain stop claims"
 }
 
 test_legacy_group_stop_reaps_term_trap_fork() {
@@ -2346,6 +2419,84 @@ test_legacy_group_stop_reaps_term_trap_fork() {
   [ -z "$late_pid" ] || ! is_live_non_zombie "$late_pid" \
     || { kill -KILL "$late_pid" 2>/dev/null || true; fail "TERM-trap fork escaped legacy group cleanup"; }
   pass "durable legacy group cleanup reaps TERM-trap forks"
+}
+
+test_concurrent_legacy_restarts_have_one_cleanup_owner() {
+  local dir state fakebin first_out second_out ready proceed signaled root identity first status i
+  dir=$(make_case concurrent-legacy-restart)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  first_out="$dir/first.out"
+  second_out="$dir/second.out"
+  ready="$dir/claim.ready"
+  proceed="$dir/claim.proceed"
+  signaled="$dir/signaled"
+  FM_TEST_SIGNALED="$signaled" perl -MPOSIX -e '
+    POSIX::setsid();
+    exec "bash", "-c", q{trap '\''echo TERM >> "$FM_TEST_SIGNALED"; exit 0'\'' TERM; while :; do sleep 1; done};
+  ' &
+  root=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    [ "$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_group "$2"' _ "$LIB" "$root" 2>/dev/null || true)" = "$root" ] && break
+    sleep 0.01
+    i=$((i + 1))
+  done
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$root") \
+    || fail "could not identify concurrent legacy-restart fixture"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$root" > "$state/.watch.lock/pid"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_WATCH_LEGACY_CLAIM_TEST_HOOKS=firstmate-legacy-claim-tests-v1 \
+    FM_WATCH_LEGACY_CLAIM_TEST_READY="$ready" \
+    FM_WATCH_LEGACY_CLAIM_TEST_PROCEED="$proceed" \
+    "$WATCH_ARM" --restart > "$first_out" 2>&1 &
+  first=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -e "$ready" ]; do
+    is_live_non_zombie "$first" || break
+    sleep 0.01
+    i=$((i + 1))
+  done
+  [ -e "$ready" ] || {
+    kill -KILL "$first" "$root" 2>/dev/null || true
+    fail "first legacy restart did not acquire its cleanup claim: $(cat "$first_out")"
+  }
+  status=0
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    "$WATCH_ARM" --restart > "$second_out" 2>&1 || status=$?
+  [ "$status" -ne 0 ] || {
+    kill -KILL "$first" "$root" 2>/dev/null || true
+    fail "second legacy restart acquired a live cleanup owner's transaction"
+  }
+  is_live_non_zombie "$root" || fail "contending legacy restart signaled the recorded group"
+  [ ! -e "$signaled" ] || fail "contending legacy restart reached the first signal"
+  touch "$proceed"
+  i=0
+  while [ "$i" -lt 150 ]; do
+    grep -qF 'watcher: started pid=' "$first_out" 2>/dev/null && break
+    is_live_non_zombie "$first" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$first_out" || {
+    kill -KILL "$first" "$root" 2>/dev/null || true
+    fail "cleanup owner did not complete the legacy restart: $(cat "$first_out")"
+  }
+  ! is_live_non_zombie "$root" || {
+    kill -KILL "$first" "$root" 2>/dev/null || true
+    fail "cleanup owner left the legacy group root alive"
+  }
+  [ "$(wc -l < "$signaled" 2>/dev/null || printf '0\n')" -eq 1 ] \
+    || fail "legacy group received signals from more than one cleanup owner"
+  kill -TERM "$first" 2>/dev/null || true
+  wait "$first" 2>/dev/null || true
+  pass "concurrent legacy restarts serialize before their first signal"
 }
 
 test_restart_drains_residual_session_without_live_leaders() {
@@ -2515,12 +2666,22 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-2 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
+  test_dead_stop_claim_is_reclaimed_exclusively
+  test_zombie_stop_claim_is_reclaimed
+  test_concurrent_legacy_restarts_have_one_cleanup_owner
+  test_arm_owner_death_during_prestart_wedge_reaps_session
+  exit 0
+fi
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_pid_identity_survives_exec_without_command_text
 test_watcher_config_rejects_typed_injection
 test_dead_stop_claim_is_reclaimed_exclusively
+test_zombie_stop_claim_is_reclaimed
 test_legacy_group_stop_reaps_term_trap_fork
+test_concurrent_legacy_restarts_have_one_cleanup_owner
 test_restart_drains_residual_session_without_live_leaders
 test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable

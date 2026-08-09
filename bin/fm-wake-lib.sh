@@ -42,12 +42,10 @@ fm_pid_identity() {
 }
 
 fm_pid_identity_live() {  # <pid> <pid-identity>
-  local pid=$1 identity=$2 state
+  local pid=$1 identity=$2 helper="$FM_WAKE_LIB_DIR/fm-process-identity.py"
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  state=$(LC_ALL=C ps -p "$pid" -o state= 2>/dev/null) || return 1
-  state=${state#"${state%%[![:space:]]*}"}
-  case "$state" in *Z*) return 1 ;; esac
-  [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "$identity" ]
+  [ -n "$identity" ] && [ -x "$helper" ] || return 1
+  [ "$("$helper" --live "$pid" 2>/dev/null || true)" = "$identity" ]
 }
 
 fm_pid_group() {  # <pid>
@@ -268,11 +266,25 @@ fm_process_group_has_live_processes() {  # <process-group>
   [ -n "$members" ]
 }
 
-fm_process_group_stop() {  # <root-pid> <root-identity> [term-wait-tenths]
-  local root=$1 identity=$2 wait_tenths=${3:-30} group iteration status empty_streak=0
+fm_process_group_stop() {  # <root-pid> <root-identity> [term-wait-tenths] [process-group]
+  local root=$1 identity=$2 wait_tenths=${3:-30} group=${4:-} current iteration status empty_streak=0
   [ -n "$identity" ] || return 1
-  fm_pid_identity_live "$root" "$identity" || return 1
-  group=$(fm_pid_group "$root") || return 1
+  current=$(fm_pid_identity "$root" 2>/dev/null || true)
+  if [ -n "$current" ]; then
+    [ "$current" = "$identity" ] || return 1
+    if fm_pid_identity_live "$root" "$identity"; then
+      [ -n "$group" ] || group=$(fm_pid_group "$root") || return 1
+      [ "$(fm_pid_group "$root" 2>/dev/null || true)" = "$group" ] || return 1
+    else
+      [ -n "$group" ] || return 1
+    fi
+  else
+    [ -n "$group" ] || return 1
+    status=0
+    fm_process_group_has_live_processes "$group" || status=$?
+    [ "$status" -eq 2 ] && return 1
+    [ "$status" -eq 0 ] || return 0
+  fi
   [ "$group" = "$root" ] || return 1
   kill -TERM -- "-$group" 2>/dev/null || true
   iteration=0
@@ -336,7 +348,7 @@ fm_pid_stop_identity() {  # <pid> <pid-identity> [term-wait-tenths]
 fm_session_anchor_matches() {  # <session-id> <anchor-pid> <anchor-identity>
   local session=$1 anchor=$2 identity=$3
   [ -n "$identity" ] || return 1
-  [ "$(fm_pid_identity "$anchor" 2>/dev/null || true)" = "$identity" ] || return 1
+  fm_pid_identity_live "$anchor" "$identity" || return 1
   [ "$(fm_pid_session "$anchor" 2>/dev/null || true)" = "$session" ]
 }
 
@@ -435,18 +447,43 @@ fm_watcher_lock_session_stop_claim_matches() {  # <state> <session-id>
 }
 
 FM_WATCHER_STOP_CLAIM_ID=
-fm_session_stop_claim_dir() {  # <claim-dir> <session-id>
-  local confined=$1 session=$2 stopper stopper_identity helper claim_id
+FM_WATCHER_STOP_CLAIM_KIND=
+fm_stop_claim_dir() {  # <claim-dir> <boundary-id> <session|legacy>
+  local confined=$1 boundary=$2 kind=$3 stopper stopper_identity helper claim_id action=acquire
   FM_WATCHER_STOP_CLAIM_ID=
+  FM_WATCHER_STOP_CLAIM_KIND=
   [ -d "$confined" ] && [ ! -L "$confined" ] || return 1
+  [ "$kind" = session ] || [ "$kind" = legacy ] || return 1
+  [ "$kind" = session ] || action=acquire-legacy
   stopper=${BASHPID:-$$}
   stopper_identity=$(fm_pid_identity "$stopper") || return 1
   helper="$FM_WAKE_LIB_DIR/fm-watcher-stop-claim.py"
   [ -x "$helper" ] || return 1
-  claim_id=$("$helper" acquire "$confined" "$session" \
+  claim_id=$("$helper" "$action" "$confined" "$boundary" \
     "$FM_WAKE_LIB_DIR/fm-process-identity.py" "$stopper" "$stopper_identity") || return 1
   [ -n "$claim_id" ] || return 1
   FM_WATCHER_STOP_CLAIM_ID=$claim_id
+  FM_WATCHER_STOP_CLAIM_KIND=$kind
+}
+
+fm_stop_claim_clear_dir() {  # <claim-dir> <boundary-id> <session|legacy>
+  local confined=$1 boundary=$2 kind=$3 stopper stopper_identity helper action=clear
+  [ -n "$FM_WATCHER_STOP_CLAIM_ID" ] || return 1
+  [ "$FM_WATCHER_STOP_CLAIM_KIND" = "$kind" ] || return 1
+  [ "$kind" = session ] || [ "$kind" = legacy ] || return 1
+  [ "$kind" = session ] || action=clear-legacy
+  stopper=${BASHPID:-$$}
+  stopper_identity=$(fm_pid_identity "$stopper") || return 1
+  helper="$FM_WAKE_LIB_DIR/fm-watcher-stop-claim.py"
+  "$helper" "$action" "$confined" "$boundary" \
+    "$FM_WAKE_LIB_DIR/fm-process-identity.py" "$stopper" "$stopper_identity" \
+    "$FM_WATCHER_STOP_CLAIM_ID" || return 1
+  FM_WATCHER_STOP_CLAIM_ID=
+  FM_WATCHER_STOP_CLAIM_KIND=
+}
+
+fm_session_stop_claim_dir() {  # <claim-dir> <session-id>
+  fm_stop_claim_dir "$1" "$2" session
 }
 
 fm_watcher_lock_session_stop_claim() {  # <state> <session-id>
@@ -460,21 +497,37 @@ fm_watcher_lock_session_stop_claim() {  # <state> <session-id>
   fm_session_stop_claim_dir "$confined" "$session"
 }
 
-fm_watcher_lock_session_stop_claim_clear() {  # <state> <session-id>
-  local state=$1 session=$2 lockdir confined stopper stopper_identity helper
+fm_watcher_lock_legacy_stop_claim() {  # <state> <process-group>
+  local state=$1 group=$2 lockdir confined
   lockdir="$state/.watch.lock"
-  [ -n "$FM_WATCHER_STOP_CLAIM_ID" ] || return 1
-  stopper=${BASHPID:-$$}
-  stopper_identity=$(fm_pid_identity "$stopper") || return 1
   if [ -L "$lockdir" ]; then
     confined=$(fm_lock_link_owner "$lockdir") || return 1
   else
     confined=$(fm_lock_confined_target "$lockdir" "$lockdir") || return 1
   fi
-  helper="$FM_WAKE_LIB_DIR/fm-watcher-stop-claim.py"
-  "$helper" clear "$confined" "$session" "$FM_WAKE_LIB_DIR/fm-process-identity.py" \
-    "$stopper" "$stopper_identity" "$FM_WATCHER_STOP_CLAIM_ID" || return 1
-  FM_WATCHER_STOP_CLAIM_ID=
+  fm_stop_claim_dir "$confined" "$group" legacy
+}
+
+fm_watcher_lock_session_stop_claim_clear() {  # <state> <session-id>
+  local state=$1 session=$2 lockdir confined
+  lockdir="$state/.watch.lock"
+  if [ -L "$lockdir" ]; then
+    confined=$(fm_lock_link_owner "$lockdir") || return 1
+  else
+    confined=$(fm_lock_confined_target "$lockdir" "$lockdir") || return 1
+  fi
+  fm_stop_claim_clear_dir "$confined" "$session" session
+}
+
+fm_watcher_lock_legacy_stop_claim_clear() {  # <state> <process-group>
+  local state=$1 group=$2 lockdir confined
+  lockdir="$state/.watch.lock"
+  if [ -L "$lockdir" ]; then
+    confined=$(fm_lock_link_owner "$lockdir") || return 1
+  else
+    confined=$(fm_lock_confined_target "$lockdir" "$lockdir") || return 1
+  fi
+  fm_stop_claim_clear_dir "$confined" "$group" legacy
 }
 
 fm_watcher_lock_stop_session_anchor() {  # <state> <session-id> <expected-anchor-pid> [term-wait-tenths]
@@ -666,10 +719,10 @@ EOF
 }
 
 # Stop a legacy root only when it already leads a durable process group.
-fm_pid_tree_stop() {  # <root-pid> [term-wait-tenths] [expected-root-identity]
-  local root=$1 wait_tenths=${2:-30} expected_identity=${3:-}
+fm_pid_tree_stop() {  # <root-pid> [term-wait-tenths] [expected-root-identity] [process-group]
+  local root=$1 wait_tenths=${2:-30} expected_identity=${3:-} group=${4:-}
   [ -n "$expected_identity" ] || return 1
-  fm_process_group_stop "$root" "$expected_identity" "$wait_tenths"
+  fm_process_group_stop "$root" "$expected_identity" "$wait_tenths" "$group"
 }
 
 fm_lock_clean_known_files() {

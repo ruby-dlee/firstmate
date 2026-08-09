@@ -108,9 +108,11 @@ while fm_pid_identity_live "$prestart_owner_pid" "$prestart_owner_identity"; do
   sleep 0.01
   handoff_iteration=$((handoff_iteration + 1))
 done
+fm_watcher_lock_session_stop_claim "$STATE" "$watcher_pid" || exit 1
 mv -f "$anchor_pending" "$anchor_record" || exit 1
 fm_watcher_lock_session_anchor_matches "$STATE" "$watcher_pid" || exit 1
 [ "$FM_WATCHER_SESSION_ANCHOR_PID" = "$monitor_pid" ] || exit 1
+fm_watcher_lock_session_stop_claim_clear "$STATE" "$watcher_pid" || exit 1
 if [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
   && [ -n "${FM_WATCH_OWNER_TEST_HANDOFF_READY:-}" ] \
   && [ -n "${FM_WATCH_OWNER_TEST_HANDOFF_PROCEED:-}" ]; then
@@ -147,6 +149,7 @@ rm -f "$session_record" "$session_record_pending" "$handoff_request" \
   "$prestart_owner_identity_file" "$owner_dir/pid" "$owner_dir/pid-identity" \
   "$owner_dir/process-session" "$owner_dir/fm-home" "$owner_dir/watcher-path" \
   "$owner_dir/session-stop" "$owner_dir/session-stop.pending" \
-  "$owner_dir/.session-stop-transaction" 2>/dev/null || true
+  "$owner_dir/.session-stop-transaction" "$owner_dir/arm-owner-pid" \
+  "$owner_dir/arm-owner-identity" 2>/dev/null || true
 rmdir "$owner_dir" 2>/dev/null || true
 exit "$status"

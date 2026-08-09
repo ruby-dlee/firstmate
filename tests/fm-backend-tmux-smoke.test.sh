@@ -16,13 +16,22 @@ pass() { printf 'ok - %s\n' "$1"; }
 command -v tmux >/dev/null 2>&1 || { echo "skip: tmux not found"; exit 0; }
 REAL_TMUX=$(command -v tmux)
 SOCKET="fm-backend-smoke-$$"
+SOCKET_DIR=
 SHIM_DIR=
 trap cleanup_all EXIT
 
 cleanup_all() {
   "$REAL_TMUX" -L "$SOCKET" kill-server >/dev/null 2>&1 || true
   [ -n "${SHIM_DIR:-}" ] && rm -rf "$SHIM_DIR"
+  [ -n "${SOCKET_DIR:-}" ] && rm -rf "$SOCKET_DIR"
 }
+
+# tmux limits Unix socket paths to roughly 104 bytes on macOS. Keep the real
+# smoke server under a bounded root instead of inheriting a long CI TMPDIR.
+SOCKET_DIR=$(mktemp -d /tmp/fm-tmux-smoke.XXXXXX) \
+  || fail "could not create a private tmux socket directory"
+TMUX_TMPDIR=$SOCKET_DIR
+export TMUX_TMPDIR
 
 # A `tmux` shim on PATH that transparently redirects every call to the private
 # socket, so bin/backends/tmux.sh's bare `tmux ...` invocations never touch the

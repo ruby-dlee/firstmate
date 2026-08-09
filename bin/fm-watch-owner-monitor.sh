@@ -16,6 +16,8 @@ watch_lock="$STATE/.watch.lock"
 monitor_pid=$$
 owner_eof="$owner_dir/eof"
 owner_lost="$owner_dir/lost"
+session_record="$owner_dir/session-root"
+session_record_pending="$owner_dir/session-root.pending"
 anchor_pending="$watch_lock/session-anchor.pending"
 anchor_record="$watch_lock/session-anchor"
 owner_root_poll=5
@@ -97,5 +99,6 @@ if [ "$status" -eq 0 ] \
 fi
 exec 8<&-
 rm -f "$owner_ready" "$owner_failed" "$owner_fifo" "$owner_eof" "$owner_lost" 2>/dev/null || true
+rm -f "$session_record" "$session_record_pending" 2>/dev/null || true
 rmdir "$owner_dir" 2>/dev/null || true
 exit "$status"

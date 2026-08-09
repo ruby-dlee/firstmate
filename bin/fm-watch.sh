@@ -1184,6 +1184,7 @@ watcher_owner_ready=${FM_WATCH_ARM_OWNER_READY:-}
 watcher_owner_failed=${FM_WATCH_ARM_OWNER_FAILED:-}
 watcher_owner_dir=${FM_WATCH_ARM_OWNER_DIR:-}
 watcher_owner_fd=${FM_WATCH_ARM_OWNER_FD:-}
+watcher_session_record=${FM_WATCH_ARM_SESSION_RECORD:-}
 watcher_owner_monitor="$SCRIPT_DIR/fm-watch-owner-monitor.sh"
 if [ "${FM_WATCHER_OWN_SESSION:-0}" = 1 ]; then
   watcher_session=$(fm_pid_session "$WATCHER_PID" 2>/dev/null || true)
@@ -1206,6 +1207,7 @@ if [ -n "$watcher_owner_fifo" ]; then
     && [ "$watcher_owner_fifo" = "$watcher_owner_dir/control" ] \
     && [ "$watcher_owner_ready" = "$watcher_owner_dir/ready" ] \
     && [ "$watcher_owner_failed" = "$watcher_owner_dir/failed" ] \
+    && [ "$watcher_session_record" = "$watcher_owner_dir/session-root" ] \
     && [ -p "$watcher_owner_fifo" ] \
     && [ -x "$watcher_owner_monitor" ] || {
       echo "watcher: invalid arm ownership channel" >&2
@@ -1213,6 +1215,18 @@ if [ -n "$watcher_owner_fifo" ]; then
       fm_lock_release "$WATCH_LOCK"
       exit 1
   }
+  watcher_session_identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
+  [ -n "$watcher_session_identity" ] \
+    && [ ! -e "$watcher_session_record" ] && [ ! -L "$watcher_session_record" ] \
+    && [ ! -e "$watcher_session_record.pending" ] && [ ! -L "$watcher_session_record.pending" ] \
+    && printf 'pid=%s\nidentity=%s\n' \
+      "$WATCHER_PID" "$watcher_session_identity" > "$watcher_session_record.pending" \
+    && mv -f "$watcher_session_record.pending" "$watcher_session_record" || {
+      echo "watcher: could not publish its owned process session identity" >&2
+      rm -f "$WATCH_LOCK/process-session" 2>/dev/null || true
+      fm_lock_release "$WATCH_LOCK"
+      exit 1
+    }
   if [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
     && [ -n "${FM_WATCH_OWNER_TEST_READY:-}" ] \
     && [ -n "${FM_WATCH_OWNER_TEST_PROCEED:-}" ]; then

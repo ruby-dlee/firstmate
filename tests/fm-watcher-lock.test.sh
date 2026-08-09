@@ -1178,6 +1178,48 @@ test_monitor_startup_cleanup_refuses_reused_pid() {
   pass "monitor startup cleanup refuses a reused PID"
 }
 
+test_arm_cleanup_refuses_reused_session_leader() {
+  local dir state fakebin out decoy armpid i status=0 session
+  dir=$(make_case arm-session-handshake-reuse)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  touch "$state/.last-check"
+  perl -MPOSIX -e '
+    my $session = POSIX::setsid();
+    exit 126 if !defined $session || $session != $$;
+    exec "sleep", "300";
+    exit 127;
+  ' &
+  decoy=$!
+  i=0
+  session=
+  while [ "$i" -lt 50 ]; do
+    session=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_session "$2"' _ "$LIB" "$decoy" 2>/dev/null || true)
+    [ "$session" = "$decoy" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$session" = "$decoy" ] \
+    || { kill "$decoy" 2>/dev/null || true; wait "$decoy" 2>/dev/null || true; fail "could not establish reused session-leader fixture"; }
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_ARM_CONFIRM_TIMEOUT=3 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_REUSED_SESSION_PID="$decoy" \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  wait_for_exit "$armpid" 100 || status=$?
+  [ "$status" -ne 0 ] && [ "$status" -ne 124 ] \
+    || { kill "$decoy" 2>/dev/null || true; wait "$decoy" 2>/dev/null || true; fail "arm did not exercise reused-session cleanup: $(cat "$out")"; }
+  is_live_non_zombie "$decoy" \
+    || fail "arm cleanup signalled a reused session leader"
+  [ "$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_session "$2"' _ "$LIB" "$decoy" 2>/dev/null || true)" = "$decoy" ] \
+    || fail "arm cleanup disturbed the reused session boundary"
+  kill "$decoy" 2>/dev/null || true
+  wait "$decoy" 2>/dev/null || true
+  pass "arm cleanup refuses a reused session leader"
+}
+
 test_watcher_self_evicts_on_lock_takeover() {
   local dir state fakebin out pid i lock_pid
   dir=$(make_case self-evict)
@@ -2028,6 +2070,11 @@ if [ "${FM_TEST_FOCUSED:-}" = startup-identities ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = session-handshake ]; then
+  test_arm_cleanup_refuses_reused_session_leader
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = arm-owner-death ]; then
   test_arm_owner_death_reaps_watcher_session
   exit 0
@@ -2076,6 +2123,7 @@ test_monitor_recovers_root_kill_before_anchor_publication
 test_monitor_bounds_steady_state_process_creation
 test_monitor_has_no_reusable_observer_helpers
 test_monitor_startup_cleanup_refuses_reused_pid
+test_arm_cleanup_refuses_reused_session_leader
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_arm_refuses_live_lock_with_bad_attach_cadence

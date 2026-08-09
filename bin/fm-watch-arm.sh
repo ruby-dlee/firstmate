@@ -373,6 +373,7 @@ fi
 child=
 child_identity=
 child_session_identity=
+child_session_record=
 child_out=
 child_session_verified=false
 owner_link_dir=
@@ -398,7 +399,8 @@ owner_link_reader_disconnect() {
 
 owner_link_remove() {
   [ -n "$owner_link_dir" ] || return 0
-  rm -f "$owner_link_ready" "$owner_link_failed" "$owner_link_fifo" 2>/dev/null || true
+  rm -f "$owner_link_ready" "$owner_link_failed" "$owner_link_fifo" \
+    "$owner_link_dir/session-root" "$owner_link_dir/session-root.pending" 2>/dev/null || true
   rmdir "$owner_link_dir" 2>/dev/null || true
   owner_link_dir=
   owner_link_fifo=
@@ -406,32 +408,34 @@ owner_link_remove() {
   owner_link_failed=
 }
 
+capture_child_session_handshake() {
+  local snapshot lines record_pid record_identity
+  "$child_session_verified" && return 0
+  [ -f "$child_session_record" ] && [ ! -L "$child_session_record" ] || return 1
+  snapshot=$(cat "$child_session_record" 2>/dev/null) || return 1
+  lines=$(printf '%s\n' "$snapshot" | awk 'END { print NR }')
+  [ "$lines" -eq 2 ] || return 1
+  record_pid=$(printf '%s\n' "$snapshot" | sed -n '1s/^pid=//p')
+  record_identity=$(printf '%s\n' "$snapshot" | sed -n '2s/^identity=//p')
+  [ "$record_pid" = "$child" ] || return 1
+  [ -n "$record_identity" ] || return 1
+  [ "$(fm_pid_identity "$child" 2>/dev/null || true)" = "$record_identity" ] || return 1
+  [ "$(fm_pid_session "$child" 2>/dev/null || true)" = "$child" ] || return 1
+  child_session_identity=$record_identity
+  child_session_verified=true
+}
+
 stop_owned_child() {
-  local identity status=0 session_status=0 current_session iteration=0
+  local status=0 session_status=0
   [ -n "$child" ] || return 0
   owner_link_disconnect
   owner_link_reader_disconnect
-  while [ "$iteration" -lt 20 ] && fm_pid_alive "$child"; do
-    current_session=$(fm_pid_session "$child" 2>/dev/null || true)
-    if [ "$current_session" = "$child" ]; then
-      child_session_identity=$(fm_pid_identity "$child" 2>/dev/null || true)
-      if [ -n "$child_session_identity" ]; then
-        child_session_verified=true
-        break
-      fi
-    fi
-    sleep 0.01
-    iteration=$((iteration + 1))
-  done
   if "$child_session_verified" \
+    && [ "$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)" = "$child_session_identity" ] \
     && fm_watcher_lock_session_record_matches "$STATE" "$WATCH" "$FM_HOME" "$child"; then
-    identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
-    stop_recorded_watcher "$child" "$identity" || status=$?
+    stop_recorded_watcher "$child" "$child_session_identity" || status=$?
   elif "$child_session_verified"; then
-    identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
-    if [ "$(fm_pid_identity "$child" 2>/dev/null || true)" = "$identity" ]; then
-      fm_pid_session_stop "$child" "$child" 30 "$identity" || status=$?
-    elif [ -n "$child_session_identity" ] \
+    if [ -n "$child_session_identity" ] \
       && [ "$(fm_pid_identity "$child" 2>/dev/null || true)" = "$child_session_identity" ]; then
       fm_pid_session_stop "$child" "$child" 30 "$child_session_identity" || status=$?
     else
@@ -513,7 +517,7 @@ monitor_started_child() {  # <confirmed-watcher-pid>
     queue_watcher_failure "$reason"
     echo "watcher: FAILED - $reason; recovering the owned watcher process session"
     session_status=0
-    identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
+    identity=$child_session_identity
     stop_recorded_watcher "$watched" "$identity" || session_status=$?
     if [ "$session_status" -ne 0 ]; then
       echo "watcher: FAILED - owned watcher process session could not be fully reaped"
@@ -543,6 +547,7 @@ owner_link_dir=$(mktemp -d "$STATE/.watch-arm-owner.XXXXXX") || {
 owner_link_fifo="$owner_link_dir/control"
 owner_link_ready="$owner_link_dir/ready"
 owner_link_failed="$owner_link_dir/failed"
+child_session_record="$owner_link_dir/session-root"
 mkfifo "$owner_link_fifo" || {
   cleanup_child
   echo "watcher: FAILED - could not create arm ownership channel"
@@ -567,6 +572,7 @@ owner_link_reader_connected=true
     FM_WATCH_ARM_OWNER_FIFO="$owner_link_fifo" \
     FM_WATCH_ARM_OWNER_READY="$owner_link_ready" \
     FM_WATCH_ARM_OWNER_FAILED="$owner_link_failed" \
+    FM_WATCH_ARM_SESSION_RECORD="$child_session_record" \
     FM_WATCH_ARM_OWNER_FD=8 \
     exec perl -MPOSIX -e '
       my $session = POSIX::setsid();
@@ -585,9 +591,21 @@ child_done=0
 # until the child gives up. Only then print the honest line.
 deadline=$(( $(date +%s) + CONFIRM_TIMEOUT ))
 while :; do
+  capture_child_session_handshake >/dev/null 2>&1 || true
+  if "$child_session_verified" \
+    && [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
+    && [ -n "${FM_WATCH_OWNER_TEST_REUSED_SESSION_PID:-}" ]; then
+    original_child=$child
+    stop_recorded_watcher "$original_child" "$child_session_identity" >/dev/null 2>&1 || true
+    wait "$original_child" 2>/dev/null || true
+    child=$FM_WATCH_OWNER_TEST_REUSED_SESSION_PID
+    stop_owned_child >/dev/null 2>&1 || true
+    exit 1
+  fi
   if healthy_watcher; then
     if [ "$HEALTHY_PID" = "$child" ]; then
-      if ! fm_watcher_lock_session_matches_pid "$STATE" "$WATCH" "$FM_HOME" "$child"; then
+      if ! "$child_session_verified" \
+        || ! fm_watcher_lock_session_matches_pid "$STATE" "$WATCH" "$FM_HOME" "$child"; then
         echo "watcher: FAILED - started watcher did not establish its owned process session"
         cleanup_child
         exit 1

@@ -46,11 +46,16 @@ fm_pid_identity() {
 }
 
 fm_pid_identity_live() {  # <pid> <pid-identity>
-  local pid=$1 identity=$2 state
-  [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "$identity" ] || return 1
-  state=$(LC_ALL=C ps -p "$pid" -o state= 2>/dev/null) || return 1
-  [ -n "$state" ] || return 1
+  local pid=$1 identity=$2 snapshot state
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  snapshot=$(LC_ALL=C ps -p "$pid" -o state= -o lstart= -o command= 2>/dev/null) || return 1
+  snapshot=${snapshot#"${snapshot%%[![:space:]]*}"}
+  [ -n "$snapshot" ] || return 1
+  state=${snapshot%%[[:space:]]*}
   case "$state" in *Z*) return 1 ;; esac
+  snapshot=${snapshot#"$state"}
+  snapshot=${snapshot#"${snapshot%%[![:space:]]*}"}
+  [ "$snapshot" = "$identity" ]
 }
 
 fm_pid_session() {  # <pid>

@@ -14,12 +14,12 @@ owner_dir=$5
 watch_path="$SCRIPT_DIR/fm-watch.sh"
 watch_lock="$STATE/.watch.lock"
 monitor_pid=$$
-reader_pid=
-observer_pid=
 owner_eof="$owner_dir/eof"
 owner_lost="$owner_dir/lost"
 anchor_pending="$watch_lock/session-anchor.pending"
 anchor_record="$watch_lock/session-anchor"
+owner_root_poll=5
+owner_link_lost=false
 
 case "$watcher_pid" in ''|*[!0-9]*) exit 2 ;; esac
 case "$owner_dir" in "$STATE"/.watch-arm-owner.*) ;; *) exit 2 ;; esac
@@ -33,40 +33,22 @@ watcher_identity=$(cat "$watch_lock/pid-identity" 2>/dev/null || true)
 [ -n "$watcher_identity" ] || exit 1
 monitor_identity=$(fm_pid_identity "$monitor_pid") || exit 1
 
-cleanup_observers() {
-  if [ -n "$reader_pid" ]; then
-    kill -TERM "$reader_pid" 2>/dev/null || true
-    wait "$reader_pid" 2>/dev/null || true
-  fi
-  if [ -n "$observer_pid" ]; then
-    kill -TERM "$observer_pid" 2>/dev/null || true
-    wait "$observer_pid" 2>/dev/null || true
-  fi
-  reader_pid=
-  observer_pid=
+owner_link_current() {
+  local timeout=$1 read_status=0 started=$SECONDS elapsed
+  IFS= read -r -t "$timeout" _ <&8 || read_status=$?
+  [ "$read_status" -ne 0 ] || return 0
+  elapsed=$((SECONDS - started))
+  [ "$elapsed" -ge "$timeout" ] || return 1
+  [ "$PPID" = "$watcher_pid" ] || return 1
+  fm_pid_identity_live "$watcher_pid" "$watcher_identity"
 }
 
 monitor_exit_cleanup() {
-  cleanup_observers
   rm -f "$anchor_pending" "$owner_eof" "$owner_lost" 2>/dev/null || true
 }
 
 trap monitor_exit_cleanup EXIT
 trap 'exit 143' HUP TERM INT
-
-(
-  while IFS= read -r _ <&8; do :; done
-  : > "$owner_eof"
-) &
-reader_pid=$!
-(
-  while [ ! -e "$owner_eof" ]; do
-    fm_pid_identity_live "$watcher_pid" "$watcher_identity" || break
-    sleep 0.05
-  done
-  : > "$owner_lost"
-) &
-observer_pid=$!
 
 [ ! -e "$anchor_pending" ] && [ ! -L "$anchor_pending" ] || exit 1
 [ ! -e "$anchor_record" ] && [ ! -L "$anchor_record" ] || exit 1
@@ -75,8 +57,11 @@ if [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
   && [ -n "${FM_WATCH_OWNER_TEST_PUBLISH_READY:-}" ] \
   && [ -n "${FM_WATCH_OWNER_TEST_PUBLISH_PROCEED:-}" ]; then
   : > "$FM_WATCH_OWNER_TEST_PUBLISH_READY"
-  while [ ! -e "$FM_WATCH_OWNER_TEST_PUBLISH_PROCEED" ] && [ ! -e "$owner_lost" ]; do
-    sleep 0.01
+  while [ ! -e "$FM_WATCH_OWNER_TEST_PUBLISH_PROCEED" ]; do
+    if ! owner_link_current 1; then
+      owner_link_lost=true
+      break
+    fi
   done
 fi
 mv -f "$anchor_pending" "$anchor_record" || exit 1
@@ -84,8 +69,11 @@ fm_watcher_lock_session_anchor_matches "$STATE" "$watcher_pid" || exit 1
 [ "$FM_WATCHER_SESSION_ANCHOR_PID" = "$monitor_pid" ] || exit 1
 printf '%s\n' "$watcher_pid" > "$owner_ready" || exit 1
 
-while [ ! -e "$owner_lost" ]; do sleep 0.05; done
-cleanup_observers
+if ! "$owner_link_lost"; then
+  while owner_link_current "$owner_root_poll"; do :; done
+fi
+: > "$owner_eof" 2>/dev/null || true
+: > "$owner_lost" 2>/dev/null || true
 : > "$owner_failed" 2>/dev/null || true
 status=0
 fm_session_stop_owned_except "$watcher_pid" "$monitor_pid" 30 || status=$?

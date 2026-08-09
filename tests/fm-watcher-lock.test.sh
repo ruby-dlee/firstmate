@@ -787,7 +787,7 @@ test_arm_owner_death_before_monitor_start_reaps_session() {
   proceed="$dir/monitor.proceed"
   touch "$state/.last-check"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
-    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_WATCH_CPU_POLL=999 \
     FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
     FM_WATCH_OWNER_TEST_READY="$ready" FM_WATCH_OWNER_TEST_PROCEED="$proceed" \
     "$WATCH_ARM" > "$out" &
@@ -1056,6 +1056,87 @@ test_monitor_recovers_root_kill_before_anchor_publication() {
   kill -TERM "$armpid" 2>/dev/null || true
   wait "$armpid" 2>/dev/null || true
   pass "self-publishing monitor recovers watcher death before publication"
+}
+
+test_monitor_bounds_steady_state_process_creation() {
+  local dir state fakebin out process_log real_ps real_sleep armpid i count
+  dir=$(make_case monitor-root-check-cadence)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  process_log="$dir/processes"
+  real_ps=$(command -v ps)
+  real_sleep=$(command -v sleep)
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+parent=$("${FM_TEST_REAL_PS:?}" -p "$PPID" -o command= 2>/dev/null || true)
+case "$parent" in *fm-watch-owner-monitor.sh*) printf 'ps\n' >> "${FM_TEST_PROCESS_LOG:?}" ;; esac
+exec "${FM_TEST_REAL_PS:?}" "$@"
+SH
+  cat > "$fakebin/sleep" <<'SH'
+#!/usr/bin/env bash
+parent=$("${FM_TEST_REAL_PS:?}" -p "$PPID" -o command= 2>/dev/null || true)
+case "$parent" in *fm-watch-owner-monitor.sh*) printf 'sleep\n' >> "${FM_TEST_PROCESS_LOG:?}" ;; esac
+exec "${FM_TEST_REAL_SLEEP:?}" "$@"
+SH
+  chmod +x "$fakebin/ps" "$fakebin/sleep"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_TEST_PROCESS_LOG="$process_log" FM_TEST_REAL_PS="$real_ps" FM_TEST_REAL_SLEEP="$real_sleep" \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$out" || fail "ownership monitor did not enter its blocking observation loop: $(cat "$out")"
+  : > "$process_log"
+  sleep 6
+  count=$(wc -l < "$process_log")
+  [ "$count" -le 2 ] || fail "ownership observation spawned $count processes in six seconds"
+  is_live_non_zombie "$armpid" || fail "ownership monitor rejected its live root at the coarse identity check"
+  kill -TERM "$armpid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  pass "ownership monitor bounds steady-state process creation"
+}
+
+test_monitor_has_no_reusable_observer_helpers() {
+  local dir state fakebin out armpid monitor_pid children i
+  dir=$(make_case monitor-no-observer-helpers)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$out" || fail "ownership monitor did not enter its helper-free observation loop: $(cat "$out")"
+  monitor_pid=$(sed -n '1s/^pid=//p' "$state/.watch.lock/session-anchor" 2>/dev/null || true)
+  case "$monitor_pid" in ''|*[!0-9]*) fail "ownership monitor did not publish its PID" ;; esac
+  children=unknown
+  i=0
+  while [ "$i" -lt 3 ]; do
+    children=$(LC_ALL=C ps -axo pid=,ppid= | awk -v parent="$monitor_pid" '$2 == parent { print $1 }')
+    [ -n "$children" ] || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -z "$children" ] || fail "ownership monitor retained signalable observer helpers: $children"
+  kill -TERM "$armpid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  pass "ownership monitor has no reusable observer helper PIDs"
 }
 
 test_watcher_self_evicts_on_lock_takeover() {
@@ -1895,6 +1976,13 @@ if [ "${FM_TEST_FOCUSED:-}" = monitor-publication ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = monitor-observer ]; then
+  test_monitor_bounds_steady_state_process_creation
+  test_monitor_has_no_reusable_observer_helpers
+  test_monitor_recovers_root_kill_before_anchor_publication
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = arm-owner-death ]; then
   test_arm_owner_death_reaps_watcher_session
   exit 0
@@ -1940,6 +2028,8 @@ test_normal_session_watcher_releases_guard
 test_anchor_stop_refuses_reused_pid
 test_anchor_publication_waits_for_complete_identity
 test_monitor_recovers_root_kill_before_anchor_publication
+test_monitor_bounds_steady_state_process_creation
+test_monitor_has_no_reusable_observer_helpers
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_arm_refuses_live_lock_with_bad_attach_cadence

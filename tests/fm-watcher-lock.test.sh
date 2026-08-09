@@ -948,6 +948,70 @@ test_normal_session_watcher_releases_guard() {
   pass "normal session watcher exit excludes its snapshot enumerator"
 }
 
+test_anchor_stop_refuses_reused_pid() {
+  local dir state live identity session status
+  dir=$(make_case anchor-stop-reused-pid)
+  state="$dir/state"
+  sleep 300 &
+  live=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live") \
+    || { kill "$live" 2>/dev/null || true; wait "$live" 2>/dev/null || true; fail "could not identify reused anchor fixture"; }
+  session=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_session "$2"' _ "$LIB" "$live") \
+    || { kill "$live" 2>/dev/null || true; wait "$live" 2>/dev/null || true; fail "could not read reused anchor session"; }
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$live" > "$state/.watch.lock/session-anchor-pid"
+  printf '%s\n' "stale-$identity" > "$state/.watch.lock/session-anchor-identity"
+  status=0
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_watcher_lock_stop_session_anchor "$2" "$3" "$4" 1' \
+    _ "$LIB" "$state" "$session" "$live" || status=$?
+  [ "$status" -ne 0 ] || fail "anchor stop accepted a reused PID identity"
+  is_live_non_zombie "$live" || fail "anchor stop signalled a reused unrelated PID"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "anchor release refuses a reused PID identity"
+}
+
+test_anchor_publication_waits_for_complete_identity() {
+  local dir state fakebin out ready proceed armpid watcher_pid i
+  dir=$(make_case anchor-publication)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  ready="$dir/publication.ready"
+  proceed="$dir/publication.proceed"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_PUBLISH_READY="$ready" FM_WATCH_OWNER_TEST_PUBLISH_PROCEED="$proceed" \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -e "$ready" ]; do
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$ready" ] || fail "anchor publication did not reach its partial-record barrier: $(cat "$out")"
+  [ -s "$state/.watch.lock/session-anchor-pid" ] || fail "anchor PID was not published before the barrier"
+  [ ! -e "$state/.watch.lock/session-anchor-identity" ] || fail "anchor identity was published before the partial-record barrier"
+  sleep 0.2
+  touch "$proceed"
+  i=0
+  while [ "$i" -lt 100 ]; do
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$out" || fail "monitor rejected a partially published anchor record: $(cat "$out")"
+  watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  is_live_non_zombie "$watcher_pid" || fail "watcher did not survive complete anchor publication"
+  kill -TERM "$armpid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  pass "ownership monitor waits for complete anchor publication"
+}
+
 test_watcher_self_evicts_on_lock_takeover() {
   local dir state fakebin out pid i lock_pid
   dir=$(make_case self-evict)
@@ -1773,6 +1837,12 @@ if [ "${FM_TEST_FOCUSED:-}" = ownership-races ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = anchor-races ]; then
+  test_anchor_stop_refuses_reused_pid
+  test_anchor_publication_waits_for_complete_identity
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = arm-owner-death ]; then
   test_arm_owner_death_reaps_watcher_session
   exit 0
@@ -1815,6 +1885,8 @@ test_arm_owner_death_before_monitor_start_reaps_session
 test_session_cleanup_requires_stable_quiescence
 test_watch_restart_refuses_reused_session_without_anchor
 test_normal_session_watcher_releases_guard
+test_anchor_stop_refuses_reused_pid
+test_anchor_publication_waits_for_complete_identity
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_arm_refuses_live_lock_with_bad_attach_cadence

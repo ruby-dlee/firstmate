@@ -311,6 +311,16 @@ fm_watcher_lock_session_anchor_matches() {  # <state> <session-id>
   fm_session_anchor_matches "$session" "$anchor" "$identity"
 }
 
+fm_watcher_lock_stop_session_anchor() {  # <state> <session-id> <expected-anchor-pid> [term-wait-tenths]
+  local state=$1 session=$2 expected_anchor=$3 wait_tenths=${4:-30} lockdir anchor identity
+  lockdir="$state/.watch.lock"
+  anchor=$(cat "$lockdir/session-anchor-pid" 2>/dev/null || true)
+  identity=$(cat "$lockdir/session-anchor-identity" 2>/dev/null || true)
+  [ "$anchor" = "$expected_anchor" ] || return 1
+  fm_session_anchor_matches "$session" "$anchor" "$identity" || return 1
+  fm_pid_stop_identity "$anchor" "$identity" "$wait_tenths"
+}
+
 fm_watcher_lock_session_matches_pid() {  # <state> <watch-path> <home> <watcher-pid>
   local state=$1 watch_path=$2 home=$3 pid=$4 session
   session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)

@@ -268,6 +268,87 @@ SH
   chmod +x "$case_dir/pathbin/pytest" "$case_dir/pathbin/python3"
 }
 
+# Jest 29.7.0 and Vitest 4.1.5 both emit Jest-compatible JSON for the exact
+# gate-owned command shapes declared in fm-crosscheck.py. These doubles model
+# the measured distinction: passed/failed assertion records prove execution,
+# while a no-match run contains skipped-only assertions and a startup failure
+# emits no JSON report at all.
+install_javascript_runner_fake() {
+  local case_dir=$1 runner=$2
+  mkdir -p "$case_dir/pathbin"
+  cat > "$case_dir/pathbin/$runner" <<'SH'
+#!/usr/bin/env bash
+set -u
+runner=$(basename "$0")
+startup_marker=$(dirname "$0")/$runner-startup-failure
+missing_dependency_marker=$(dirname "$0")/$runner-missing-dependency
+[ ! -f "$startup_marker" ] || {
+  echo "MEASURED $runner STARTUP FAILURE" >&2
+  exit 1
+}
+case "$runner" in
+  jest)
+    [ "${1:-}" = --json ] || exit 91
+    [ "${2:-}" = --runTestsByPath ] || exit 92
+    target=${3:-}
+    shift 3 || true
+    ;;
+  vitest)
+    [ "${1:-}" = run ] || exit 93
+    [ "${2:-}" = --reporter=json ] || exit 94
+    target=${3:-}
+    shift 3 || true
+    ;;
+  *) exit 95 ;;
+esac
+runtime_field='"numRuntimeErrorTestSuites":0,'
+[ "$runner" = jest ] || runtime_field=
+selector=
+if [ "$#" -gt 0 ]; then
+  [ "$#" -eq 2 ] || exit 96
+  [ "$1" = --testNamePattern ] || exit 97
+  selector=$2
+fi
+if [ -f "$missing_dependency_marker" ]; then
+  if [ "$runner" = jest ]; then
+    printf '%s\n' '{"success":false,"numRuntimeErrorTestSuites":1,"numPassedTests":0,"numFailedTests":0,"testResults":[{"status":"failed","assertionResults":[]}]}'
+  else
+    printf '%s\n' '{"success":false,"numPassedTests":0,"numFailedTests":0,"testResults":[{"status":"failed","assertionResults":[]}]}'
+  fi
+  exit 1
+fi
+if [ ! -f "$target" ]; then
+  if [ "$runner" = jest ]; then
+    cat <<JSON
+{"success":false,"numRuntimeErrorTestSuites":1,"numPassedTests":0,"numFailedTests":0,"testResults":[{"status":"failed","assertionResults":[]}]}
+JSON
+  else
+    printf '%s\n' '{"success":false,"numPassedTests":0,"numFailedTests":0,"testResults":[]}'
+  fi
+  exit 1
+fi
+if [ "$selector" = "does not exist" ]; then
+  pending=pending
+  [ "$runner" = jest ] || pending=skipped
+  cat <<JSON
+{"success":true,$runtime_field"numPassedTests":0,"numFailedTests":0,"testResults":[{"status":"skipped","assertionResults":[{"fullName":"within a chat stays stable","status":"$pending"},{"fullName":"across chats resets state","status":"$pending"}]}]}
+JSON
+  exit 0
+fi
+if grep -qx fixed app.txt; then
+  cat <<JSON
+{"success":true,$runtime_field"numPassedTests":2,"numFailedTests":0,"testResults":[{"status":"passed","assertionResults":[{"fullName":"within a chat stays stable","status":"passed"},{"fullName":"across chats resets state","status":"passed"}]}]}
+JSON
+  exit 0
+fi
+cat <<JSON
+{"success":false,$runtime_field"numPassedTests":1,"numFailedTests":1,"testResults":[{"status":"failed","assertionResults":[{"fullName":"within a chat stays stable","status":"passed"},{"fullName":"across chats resets state","status":"failed"}]}]}
+JSON
+exit 1
+SH
+  chmod +x "$case_dir/pathbin/$runner"
+}
+
 install_gh_axi_fake() {
   local case_dir=$1
   cat > "$case_dir/fakebin/gh-axi" <<'SH'
@@ -707,6 +788,15 @@ elif scenario in {
     "unclassified-runner",
     "positional-target",
     "path-dependent",
+    "jest-verified-fixed",
+    "jest-no-match",
+    "jest-startup",
+    "jest-missing-dependency",
+    "vitest-verified-fixed",
+    "vitest-no-match",
+    "vitest-startup",
+    "vitest-missing-dependency",
+    "missing-named-test",
 }:
     patch = protocol / "mutations" / "revert.patch"
     if scenario in {
@@ -715,6 +805,15 @@ elif scenario in {
         "unclassified-runner",
         "positional-target",
         "path-dependent",
+        "jest-verified-fixed",
+        "jest-no-match",
+        "jest-startup",
+        "jest-missing-dependency",
+        "vitest-verified-fixed",
+        "vitest-no-match",
+        "vitest-startup",
+        "vitest-missing-dependency",
+        "missing-named-test",
     }:
         patch.parent.mkdir(parents=True, exist_ok=True)
         patch.write_text("""diff --git a/app.txt b/app.txt
@@ -769,14 +868,29 @@ elif scenario in {
         "symlink-forgery": "tests/symlink.test.sh",
         "positional-target": "tests/vacuous.test.sh",
         "path-dependent": "tests/pathdep.test.sh",
+        "missing-named-test": "tests/does-not-exist.test.js::across chats resets state",
+        "jest-verified-fixed": "tests/regression.test.sh::(within a chat stays stable|across chats resets state)",
+        "jest-no-match": "tests/regression.test.sh::does not exist",
+        "jest-startup": "tests/regression.test.sh::across chats resets state",
+        "jest-missing-dependency": "tests/regression.test.sh::across chats resets state",
+        "vitest-verified-fixed": "tests/regression.test.sh::(within a chat stays stable|across chats resets state)",
+        "vitest-no-match": "tests/regression.test.sh::does not exist",
+        "vitest-startup": "tests/regression.test.sh::across chats resets state",
+        "vitest-missing-dependency": "tests/regression.test.sh::across chats resets state",
     }.get(scenario, "tests/regression.test.sh")
+    runner = "pytest"
+    if scenario.startswith("jest-") or scenario == "missing-named-test":
+        runner = "jest"
+    elif scenario.startswith("vitest-"):
+        runner = "vitest"
+    elif scenario == "unclassified-runner":
+        runner = "bash"
     # Only a runner whose non-execution the gate has measured can certify a
     # fix, so every scenario that must reach mutation causality names one.
-    # The pytest double runs a plain `bash <file>` fixture unchanged.
     mutation_proof = {
         "test_path": test_path,
         "test_invocation": {
-            "runner": "bash" if scenario == "unclassified-runner" else "pytest",
+            "runner": runner,
             # A second target whose result, unlike the vacuous named test's,
             # does depend on the mutated implementation.
             "arguments": (
@@ -2954,258 +3068,107 @@ assert proof["mutated_files"] == ["app.txt"]
   pass "verified-fixed requires a passing named test that fails after implementation mutation"
 }
 
-test_typescript_jest_mutation_proof_can_clear() {
-  local record case_dir base head
-  record=$(make_case typescript-jest-clear)
-  IFS=$'\t' read -r case_dir base head <<< "$record"
-  seed_javascript_open_ledger "$case_dir" "$head"
-  run_case "$case_dir" "$base" "$head" verified-fixed-jest run \
-    > "$case_dir/out" 2> "$case_dir/err" \
-    || fail "adequately covered TypeScript mutation did not clear: $(cat "$case_dir/err")"
-  "$CROSSCHECK_PYTHON" - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY' \
-    || fail "Jest mutation proof was not durably certified"
+test_javascript_runners_certify_platform_shaped_mutation_proofs() {
+  local runner record case_dir base head ledger
+  for runner in jest vitest; do
+    record=$(make_case "$runner-verified-fixed")
+    IFS=$'\t' read -r case_dir base head <<< "$record"
+    seed_open_ledger "$case_dir" "$head"
+    install_javascript_runner_fake "$case_dir" "$runner"
+    run_case "$case_dir" "$base" "$head" "$runner-verified-fixed" run \
+      > "$case_dir/out" 2> "$case_dir/err" \
+      || fail "$runner mutation proof did not clear: $(cat "$case_dir/err")"
+    ledger="$case_dir/data/task-x1/crosscheck-ledger.json"
+    python3 - "$ledger" "$runner" <<'PY' \
+      || fail "$runner mutation proof was not durably certified"
 import json
-from pathlib import Path
 import sys
-
-ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-finding = ledger["findings"][0]
+value = json.load(open(sys.argv[1]))
+runner = sys.argv[2]
+finding = value["findings"][0]
 proof = finding["history"][-1]["proof"]
-assert finding["lifecycle"] == "verified-fixed", finding
-assert proof["test_invocation"] == {"runner": "jest", "arguments": []}, proof
-assert proof["mutated_files"] == ["apps/web-app/src/preview.ts"], proof
-assert proof["baseline_exit"] == 0 and proof["mutated_exit"] == 1, proof
-assert '"numTotalTests":1' in proof["baseline_output"], proof
-assert '"numFailedTests":1' in proof["mutated_output"], proof
-assert ledger["runs"][-1]["state"] == "clear", ledger["runs"][-1]
+assert finding["lifecycle"] == "verified-fixed", finding["lifecycle"]
+assert proof["test_invocation"] == {"runner": runner, "arguments": []}
+assert proof["test_path"].endswith(
+    "::(within a chat stays stable|across chats resets state)"
+)
+baseline = json.loads(proof["baseline_output"])
+mutated = json.loads(proof["mutated_output"])
+base_status = {
+    result["fullName"]: result["status"]
+    for suite in baseline["testResults"]
+    for result in suite["assertionResults"]
+}
+mutated_status = {
+    result["fullName"]: result["status"]
+    for suite in mutated["testResults"]
+    for result in suite["assertionResults"]
+}
+assert base_status == {
+    "within a chat stays stable": "passed",
+    "across chats resets state": "passed",
+}, base_status
+assert mutated_status == {
+    "within a chat stays stable": "passed",
+    "across chats resets state": "failed",
+}, mutated_status
 PY
-  pass "a package-governed Jest test can certify a TypeScript mutation"
+  done
+  pass "Jest and Vitest certify a platform-shaped passing-control/failing-regression mutation proof"
 }
 
-test_preexisting_jest_runner_cannot_certify() {
-  local record case_dir base head rc
-  record=$(make_case preexisting-jest-runner)
-  IFS=$'\t' read -r case_dir base head <<< "$record"
-  mkdir -p "$case_dir/repo/apps/web-app/node_modules/.bin"
-  printf '#!/usr/bin/env bash\nprintf '\''%%s\\n'\'' '\''{"numTotalTests":1,"numFailedTests":0}'\''\n' \
-    > "$case_dir/repo/apps/web-app/node_modules/.bin/jest"
-  chmod +x "$case_dir/repo/apps/web-app/node_modules/.bin/jest"
-  git -C "$case_dir/repo" add -f apps/web-app/node_modules/.bin/jest
-  git -C "$case_dir/repo" commit -qm "commit forged Jest runner"
-  head=$(git -C "$case_dir/repo" rev-parse HEAD)
-  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
-  seed_javascript_open_ledger "$case_dir" "$head"
-  set +e
-  run_case "$case_dir" "$base" "$head" verified-fixed-jest run \
-    > "$case_dir/out" 2> "$case_dir/err"
-  rc=$?
-  set -e
-  expect_code 1 "$rc" "preexisting Jest runner"
-  assert_grep 'CROSSCHECK CANNOT-CERTIFY:' "$case_dir/err" \
-    "a preexisting Jest runner was not classified as unavailable proof"
-  assert_grep 'Jest runner preexists lockfile materialization' "$case_dir/err" \
-    "the proof did not reject the committed Jest runner"
-  assert_no_grep 'crosscheck clear' "$case_dir/out" \
-    "a committed Jest-shaped output script certified the mutation"
-  pass "preexisting Jest runners never establish proof provenance"
-}
+test_javascript_non_executions_clear_nothing() {
+  local runner scenario record case_dir base head rc
+  for runner in jest vitest; do
+    for scenario in \
+      "$runner-no-match" "$runner-startup" "$runner-missing-dependency"; do
+      record=$(make_case "$scenario")
+      IFS=$'\t' read -r case_dir base head <<< "$record"
+      seed_open_ledger "$case_dir" "$head"
+      install_javascript_runner_fake "$case_dir" "$runner"
+      if [ "$scenario" = "$runner-startup" ]; then
+        : > "$case_dir/pathbin/$runner-startup-failure"
+      elif [ "$scenario" = "$runner-missing-dependency" ]; then
+        : > "$case_dir/pathbin/$runner-missing-dependency"
+      fi
+      set +e
+      run_case "$case_dir" "$base" "$head" "$scenario" run \
+        > "$case_dir/out" 2> "$case_dir/err"
+      rc=$?
+      set -e
+      expect_code 1 "$rc" "$runner $scenario non-execution"
+      assert_grep 'NON-EXECUTION' "$case_dir/err" \
+        "$runner $scenario was not reported as a non-execution"
+      python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+        || fail "$runner $scenario cleared a finding without running its test"
+    done
+  done
 
-test_local_fake_jest_package_cannot_certify() {
-  local record case_dir base head rc
-  record=$(make_case local-fake-jest-package)
-  IFS=$'\t' read -r case_dir base head <<< "$record"
-  cat > "$case_dir/repo/apps/web-app/package.json" <<'JSON'
-{"scripts":{"test":"jest"},"engines":{"node":"20.x"},"devDependencies":{"jest":"file:fake-jest"}}
-JSON
-  cat > "$case_dir/repo/apps/web-app/package-lock.json" <<'JSON'
-{"name":"crosscheck-fixture","lockfileVersion":3,"packages":{"":{"devDependencies":{"jest":"file:fake-jest"}},"node_modules/jest":{"resolved":"file:fake-jest","link":true},"fake-jest":{"version":"29.7.0"}}}
-JSON
-  git -C "$case_dir/repo" add apps/web-app/package.json apps/web-app/package-lock.json
-  git -C "$case_dir/repo" commit -qm "route Jest to local fake package"
-  head=$(git -C "$case_dir/repo" rev-parse HEAD)
-  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
-  seed_javascript_open_ledger "$case_dir" "$head"
-  set +e
-  run_case "$case_dir" "$base" "$head" verified-fixed-jest run \
-    > "$case_dir/out" 2> "$case_dir/err"
-  rc=$?
-  set -e
-  expect_code 1 "$rc" "local fake Jest package"
-  assert_grep 'CROSSCHECK CANNOT-CERTIFY:' "$case_dir/err" \
-    "a local fake Jest package was not classified as unavailable proof"
-  assert_grep 'local, linked, workspace, Git, or URL source' "$case_dir/err" \
-    "the lockfile provenance check did not reject file: Jest"
-  assert_no_grep 'crosscheck clear' "$case_dir/out" \
-    "a local fake Jest package certified the mutation"
-  pass "local fake Jest packages cannot establish registry provenance"
-}
-
-test_local_transitive_jest_package_cannot_certify() {
-  local record case_dir base head rc
-  record=$(make_case local-transitive-jest-package)
-  IFS=$'\t' read -r case_dir base head <<< "$record"
-  cat > "$case_dir/repo/apps/web-app/package.json" <<'JSON'
-{"scripts":{"test":"jest"},"engines":{"node":"20.x"},"devDependencies":{"jest":"29.7.0","jest-cli":"file:fake-jest-cli"}}
-JSON
-  cat > "$case_dir/repo/apps/web-app/package-lock.json" <<'JSON'
-{"name":"crosscheck-fixture","lockfileVersion":3,"packages":{"":{"devDependencies":{"jest":"29.7.0","jest-cli":"file:fake-jest-cli"}},"node_modules/import-local":{"version":"3.1.0","resolved":"https://registry.npmjs.org/import-local/-/import-local-3.1.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","dev":true},"node_modules/jest":{"version":"29.7.0","resolved":"https://registry.npmjs.org/jest/-/jest-29.7.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","dev":true,"dependencies":{"import-local":"^3.0.2","jest-cli":"^29.7.0"}},"node_modules/jest-cli":{"version":"29.7.0","resolved":"file:fake-jest-cli","link":true,"dev":true}}}
-JSON
-  git -C "$case_dir/repo" add apps/web-app/package.json apps/web-app/package-lock.json
-  git -C "$case_dir/repo" commit -qm "substitute local Jest CLI dependency"
-  head=$(git -C "$case_dir/repo" rev-parse HEAD)
-  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
-  seed_javascript_open_ledger "$case_dir" "$head"
-  set +e
-  run_case "$case_dir" "$base" "$head" verified-fixed-jest run \
-    > "$case_dir/out" 2> "$case_dir/err"
-  rc=$?
-  set -e
-  expect_code 1 "$rc" "local transitive Jest package"
-  assert_grep 'CROSSCHECK CANNOT-CERTIFY:' "$case_dir/err" \
-    "a local transitive Jest package was not unavailable proof"
-  assert_grep 'runtime package jest-cli is a local or linked lock entry' "$case_dir/err" \
-    "the authenticated closure did not reject local jest-cli"
-  assert_no_grep 'crosscheck clear' "$case_dir/out" \
-    "a local transitive Jest package forged mutation certification"
-  pass "local transitive Jest packages cannot enter the authenticated closure"
-}
-
-test_jest_runs_under_declared_node_major() {
-  local record case_dir base head node_home
-  record=$(make_case jest-declared-node-path)
-  IFS=$'\t' read -r case_dir base head <<< "$record"
-  cat > "$case_dir/pathbin/node" <<'SH'
-#!/usr/bin/env bash
-[ "${1:-}" = --version ] || exit 92
-printf 'v18.20.0\n'
-SH
-  chmod +x "$case_dir/pathbin/node"
-  node_home="$case_dir/node-home"
-  install_jest_package_manager_fake "$node_home/.nvm/versions/node/v20.11.0/bin"
-  seed_javascript_open_ledger "$case_dir" "$head"
-  HOME="$node_home" run_case "$case_dir" "$base" "$head" verified-fixed-jest run \
-    > "$case_dir/out" 2> "$case_dir/err" \
-    || fail "Jest lost the selected Node PATH after installation: $(cat "$case_dir/err")"
-  assert_grep 'crosscheck clear' "$case_dir/out" \
-    "declared-major Node did not reach baseline and mutated Jest runs"
-  pass "Jest preserves the selected Node path through both proof runs"
-}
-
-test_inadequate_typescript_jest_coverage_stays_blocking() {
-  local record case_dir base head rc
-  record=$(make_case typescript-jest-inadequate)
-  IFS=$'\t' read -r case_dir base head <<< "$record"
-  seed_javascript_open_ledger "$case_dir" "$head"
-  set +e
-  run_case "$case_dir" "$base" "$head" inadequate-jest run \
-    > "$case_dir/out" 2> "$case_dir/err"
-  rc=$?
-  set -e
-  expect_code 1 "$rc" "inadequate TypeScript Jest coverage"
-  assert_grep 'CROSSCHECK BLOCKING:' "$case_dir/err" \
-    "a passing mutated Jest test was not reported as blocking"
-  "$CROSSCHECK_PYTHON" - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY' \
-    || fail "inadequate Jest coverage did not remain a durable blocker"
-import json
-from pathlib import Path
-import sys
-
-ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-finding = ledger["findings"][0]
-event = finding["history"][-1]
-assert finding["lifecycle"] == "claimed-fixed", finding
-assert event["status"] == "claimed-fixed", event
-assert event["proof"]["mutated_exit"] == 0, event
-assert "named Jest test still passes" in event["note"], event
-assert ledger["runs"][-1]["state"] == "blocking", ledger["runs"][-1]
-PY
-  pass "a TypeScript test that misses the mutation remains blocking"
-}
-
-test_typescript_without_usable_route_is_cannot_certify() {
-  local record case_dir base head rc
-  record=$(make_case typescript-no-route)
-  IFS=$'\t' read -r case_dir base head <<< "$record"
-  cat > "$case_dir/repo/apps/web-app/package.json" <<'JSON'
-{"scripts":{"test":"vitest"},"devDependencies":{"vitest":"2.1.0"}}
-JSON
-  git -C "$case_dir/repo" add apps/web-app/package.json
-  git -C "$case_dir/repo" commit -qm "switch fixture to unsupported test route"
-  head=$(git -C "$case_dir/repo" rev-parse HEAD)
-  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
-  seed_javascript_open_ledger "$case_dir" "$head"
-  set +e
-  run_case "$case_dir" "$base" "$head" no-route-jest run \
-    > "$case_dir/out" 2> "$case_dir/err"
-  rc=$?
-  set -e
-  expect_code 1 "$rc" "TypeScript mutation with no usable certification route"
-  assert_grep 'CROSSCHECK CANNOT-CERTIFY:' "$case_dir/err" \
-    "an unavailable governed route was mislabeled as a review verdict"
-  assert_no_grep 'crosscheck clear' "$case_dir/out" \
-    "a missing TypeScript certification route silently cleared"
-  "$CROSSCHECK_PYTHON" - \
-    "$case_dir/data/task-x1/crosscheck-ledger.json" \
-    "$case_dir/data/task-x1/crosscheck.md" <<'PY' \
-    || fail "cannot-certify outcome was not durable and explicit"
-import json
-from pathlib import Path
-import sys
-
-ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-assert ledger["findings"][0]["lifecycle"] == "open", ledger["findings"][0]
-assert ledger["runs"][-1]["state"] == "cannot-certify", ledger["runs"][-1]
-report = Path(sys.argv[2]).read_text(encoding="utf-8")
-assert "State: **CANNOT-CERTIFY**" in report, report
-assert "no trustworthy mutation-certification route" in report, report
-PY
-  pass "an unavailable language-governed route reports CANNOT-CERTIFY and never clears"
-}
-
-test_python_mutation_proof_is_byte_exact() {
-  local record case_dir base head
-  record=$(make_case python-byte-exact)
+  record=$(make_case missing-named-test)
   IFS=$'\t' read -r case_dir base head <<< "$record"
   seed_open_ledger "$case_dir" "$head"
-  run_case "$case_dir" "$base" "$head" verified-fixed run \
-    > "$case_dir/out" 2> "$case_dir/err" \
-    || fail "existing Python mutation proof changed outcome"
-  "$CROSSCHECK_PYTHON" - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY' \
-    || fail "Python mutation evidence changed bytes"
-import json
-from pathlib import Path
-import re
-import sys
-
-ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-proof = ledger["findings"][0]["history"][-1]["proof"]
-assert proof["baseline_output"] == proof["mutated_output"], proof
-proof["baseline_output"] = re.sub(
-    r"^configfile: .*/pytest[.]ini\n$",
-    "configfile: <gate>/pytest.ini\n",
-    proof["baseline_output"],
-)
-proof["mutated_output"] = re.sub(
-    r"^configfile: .*/pytest[.]ini\n$",
-    "configfile: <gate>/pytest.ini\n",
-    proof["mutated_output"],
-)
-expected = {
-    "test_path": "tests/regression.test.sh",
-    "test_invocation": {"runner": "pytest", "arguments": []},
-    "mutation_patch_sha256": "61164e8bd68046f78edc529f817059d06c9f4fb80ba7ca33dc242ba18634660c",
-    "mutated_files": ["app.txt"],
-    "baseline_exit": 0,
-    "mutated_exit": 1,
-    "baseline_output": "configfile: <gate>/pytest.ini\n",
-    "mutated_output": "configfile: <gate>/pytest.ini\n",
-}
-assert json.dumps(proof, sort_keys=True, separators=(",", ":")) == json.dumps(
-    expected, sort_keys=True, separators=(",", ":")
-), proof
-assert ledger["runs"][-1]["state"] == "clear", ledger["runs"][-1]
-PY
-  pass "Python mutation certification remains byte-for-byte unchanged"
+  install_javascript_runner_fake "$case_dir" jest
+  set +e
+  run_case "$case_dir" "$base" "$head" missing-named-test run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "missing named JavaScript test"
+  assert_grep 'NON-EXECUTION' "$case_dir/err" \
+    "a missing named test was not reported as a non-execution"
+  assert_grep 'does-not-exist.test.js' "$case_dir/err" \
+    "the missing named test was not identified"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "a nonexistent named test cleared a finding"
+  pass "missing tests or dependencies, unmatched selectors, and failed JavaScript startup are non-executions"
 }
 
 test_node_id_selector_clears_a_passing_named_test() {
@@ -3241,12 +3204,20 @@ test_absent_runner_is_never_a_test_outcome() {
   rc=$?
   set -e
   expect_code 1 "$rc" "absent named runner"
+  assert_grep 'NON-EXECUTION' "$case_dir/err" \
+    "an uninstalled runner was not reported as a non-execution"
   assert_grep 'is not installed on PATH' "$case_dir/err" \
     "an uninstalled runner was not named as the reason no test ran"
   if grep -q 'does not pass before mutation' "$case_dir/err"; then
     fail "an uninstalled runner was misreported as a failing test"
   fi
-  pass "an uninstalled runner is named, never reported as a failing test"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "an uninstalled runner cleared a finding"
+  pass "an uninstalled runner is a non-execution and clears nothing"
 }
 
 # A mutated run that never reached the test exits nonzero exactly like one that
@@ -3268,7 +3239,7 @@ test_unclassified_runner_cannot_clear_a_finding() {
     "the refusal did not name the runner whose non-execution is unclassified"
   assert_grep 'no measured non-execution signal' "$case_dir/err" \
     "the refusal did not say why that runner cannot certify a fix"
-  assert_grep 'classify: pytest' "$case_dir/err" \
+  assert_grep 'classify: jest, pytest, vitest' "$case_dir/err" \
     "the refusal did not name the runners the gate can classify"
   python3 -c '
 import json, sys
@@ -4759,11 +4730,72 @@ else:
 
 # The declared name keeps its node-id support; a new runner name would have
 # silently lost it.
-assert "pytest" in module.NODE_ID_RUNNERS
+assert "pytest" in module.SELECTOR_TEST_RUNNERS
 assert "python3" in module.FILE_TEST_RUNNERS
 print("LADDER OK")
 PY
   pass "the pytest runner name resolves through a uv-aware invocation ladder"
+}
+
+test_javascript_runner_policy_is_declared_once() {
+  local case_dir
+  case_dir="$TMP_ROOT/javascript-runner-policy"
+  mkdir -p "$case_dir/mono/apps/web/tests" "$case_dir/bin"
+  printf '{"private":true}\n' > "$case_dir/mono/apps/web/package.json"
+  : > "$case_dir/mono/apps/web/tests/regression.test.tsx"
+  for runner in jest vitest; do
+    printf '#!/bin/bash\nexit 0\n' > "$case_dir/bin/$runner"
+    chmod +x "$case_dir/bin/$runner"
+  done
+
+  PATH="$case_dir/bin:$PATH" "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$case_dir" <<'PY' \
+    || fail "JavaScript mutation-runner policy was not a complete declaration"
+import importlib.util
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules["fm_crosscheck"] = module
+spec.loader.exec_module(module)
+
+case = Path(sys.argv[2])
+checkout = case / "mono"
+path = "apps/web/tests/regression.test.tsx::(within a chat|across chats)"
+expected = {
+    "jest": (["--json", "--runTestsByPath"], "required-zero"),
+    "vitest": (["run", "--reporter=json"], "absent"),
+}
+assert set(module.MUTATION_RUNNER_POLICIES) == {"pytest", "jest", "vitest"}
+for runner in ("jest", "vitest"):
+    policy = module.MUTATION_RUNNER_POLICIES[runner]
+    assert policy.measurement, runner
+    assert policy.report_format == "jest-compatible-json", runner
+    assert policy.runtime_error_field == expected[runner][1], runner
+    run = module.test_arguments(
+        {"runner": runner, "arguments": []}, path, checkout, "proof"
+    )
+    assert run.cwd == (checkout / "apps/web").resolve(), run
+    assert Path(run.argv[0]).name == runner, run.argv
+    assert list(run.argv[1:3]) == expected[runner][0], run.argv
+    assert run.argv[3:] == (
+        "tests/regression.test.tsx",
+        "--testNamePattern",
+        "(within a chat|across chats)",
+    ), run.argv
+
+neutral = case / "neutral"
+neutral.mkdir()
+module.write_neutral_runner_config(neutral)
+assert (neutral / "pytest.ini").read_text() == "[pytest]\n"
+assert (neutral / "jest.config.cjs").is_file()
+assert (neutral / "vitest.config.mjs").is_file()
+assert module.is_test_or_evidence_path("apps/web/jest.config.cjs")
+assert module.is_test_or_evidence_path("apps/web/vitest.config.ts")
+assert module.is_test_or_evidence_path("apps/web/vite.config.ts")
+print("JAVASCRIPT POLICY OK")
+PY
+  pass "Jest and Vitest certification mechanics live in one measured runner-policy registry"
 }
 
 test_claude_execution_home_always_binds_the_keychain() {
@@ -4973,14 +5005,11 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_reading_only_suspicion_is_a_tool_failure|\
     test_new_finding_requires_executed_reproduction|\
     test_silence_never_closes_prior_finding|\
-    test_typescript_jest_mutation_proof_can_clear|\
-    test_preexisting_jest_runner_cannot_certify|\
-    test_local_fake_jest_package_cannot_certify|\
-    test_local_transitive_jest_package_cannot_certify|\
-    test_jest_runs_under_declared_node_major|\
-    test_inadequate_typescript_jest_coverage_stays_blocking|\
-    test_typescript_without_usable_route_is_cannot_certify|\
-    test_python_mutation_proof_is_byte_exact|\
+    test_verified_fix_executes_mutation_proof|\
+    test_javascript_runners_certify_platform_shaped_mutation_proofs|\
+    test_javascript_non_executions_clear_nothing|\
+    test_javascript_runner_policy_is_declared_once|\
+    test_pytest_runner_resolves_through_a_uv_aware_ladder|\
     test_baseline_readable_state_is_destroyed_before_mutation|\
     test_mutation_is_bound_to_cited_non_test_implementation|\
     test_reviewer_output_uses_separate_capture_limit|\
@@ -5028,18 +5057,16 @@ if [ "${FM_TEST_FOCUSED:-}" = review-safety-findings ]; then
   test_legacy_author_admission_is_exact_and_explicit
   test_same_model_review_is_adversarial_and_durable
   test_legacy_author_admission_is_visible_in_prompt_and_evidence
-  test_typescript_jest_mutation_proof_can_clear
-  test_preexisting_jest_runner_cannot_certify
-  test_local_fake_jest_package_cannot_certify
-  test_local_transitive_jest_package_cannot_certify
-  test_jest_runs_under_declared_node_major
-  test_inadequate_typescript_jest_coverage_stays_blocking
+  test_javascript_runner_policy_is_declared_once
+  test_javascript_runners_certify_platform_shaped_mutation_proofs
+  test_javascript_non_executions_clear_nothing
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-jest-runtime-closure ]; then
-  test_typescript_jest_mutation_proof_can_clear
-  test_local_transitive_jest_package_cannot_certify
+  test_javascript_runner_policy_is_declared_once
+  test_javascript_runners_certify_platform_shaped_mutation_proofs
+  test_javascript_non_executions_clear_nothing
   exit 0
 fi
 
@@ -5088,14 +5115,8 @@ test_account_less_known_provider_lane_is_reviewable
 test_new_finding_requires_executed_reproduction
 test_silence_never_closes_prior_finding
 test_verified_fix_executes_mutation_proof
-test_typescript_jest_mutation_proof_can_clear
-test_preexisting_jest_runner_cannot_certify
-test_local_fake_jest_package_cannot_certify
-test_local_transitive_jest_package_cannot_certify
-test_jest_runs_under_declared_node_major
-test_inadequate_typescript_jest_coverage_stays_blocking
-test_typescript_without_usable_route_is_cannot_certify
-test_python_mutation_proof_is_byte_exact
+test_javascript_runners_certify_platform_shaped_mutation_proofs
+test_javascript_non_executions_clear_nothing
 test_node_id_selector_clears_a_passing_named_test
 test_absent_runner_is_never_a_test_outcome
 test_unclassified_runner_cannot_clear_a_finding
@@ -5140,6 +5161,7 @@ test_stopped_reviewer_and_wrong_head_are_unreviewed
 test_completed_reviewer_suspicion_is_blocking
 test_reading_only_suspicion_is_a_tool_failure
 test_pytest_runner_resolves_through_a_uv_aware_ladder
+test_javascript_runner_policy_is_declared_once
 test_claude_execution_home_always_binds_the_keychain
 test_moved_default_branch_stays_reviewable
 test_unavailable_reviewer_fails_over_to_the_next_account

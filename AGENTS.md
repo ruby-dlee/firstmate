@@ -186,7 +186,7 @@ If the digest reported `data/projects.md` as `ABSENT` or disagreeing with what i
 An `ABSENT` `data/captain.md` or `data/secondmates.md` or `data/learnings.md` means exactly what section 2 says it means (template defaults, no registered secondmates, nothing captured yet) - not a problem to fix.
 
 Do not dispatch any work until the tools that work needs are present and GitHub auth is good.
-Use `gh-axi` for all GitHub operations, `chrome-devtools-axi` for all browser operations, and the firstmate-owned `lavish-axi` file protocol for durable captain decisions and annotation boards that must remain answerable asynchronously.
+Use `gh-axi` for all GitHub operations, `chrome-devtools-axi` for browser automation and inspection, and the firstmate-owned `lavish-axi` file protocol for durable captain decisions and annotation boards that must remain answerable asynchronously.
 Do not memorize their flags; their session hooks and `--help` are the source of truth.
 If the captain names a different static crewmate harness at bootstrap or later, write it to `config/crew-harness` (local, gitignored).
 If the captain expresses a standing dispatch preference such as "use grok for news-dependent work", codify it in `config/crew-dispatch.json` instead.

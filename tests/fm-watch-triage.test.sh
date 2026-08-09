@@ -449,9 +449,14 @@ test_crew_absorb_class_classifier() {
 # task it references is provably working; if any crewmate has stopped, or no task can be
 # resolved, it surfaces. Files map to ids by stripping .status / .turn-ended.
 test_signal_crew_provably_working_classifier() {
-  local dir fakebin state
+  local dir fakebin state progress_log
   dir=$(make_case signal-provably-working); fakebin="$dir/fakebin"; state="$dir/state"
+  progress_log="$state/crew-state-progress"
+  record_crew_state_progress() {
+    printf '%s\t%s\n' "$1" "$2" >> "$progress_log"
+  }
   export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+  FM_CREW_STATE_PROGRESS_CALLBACK=record_crew_state_progress
   export FM_FAKE_CREW_STATE_a='state: working · source: run-step · running'
   export FM_FAKE_CREW_STATE_b='state: done · source: run-step · run passed'
   export FM_FAKE_CREW_STATE_c='state: working · source: run-step · running · liveness: dead (0 procs) · step: test'
@@ -470,6 +475,16 @@ test_signal_crew_provably_working_classifier() {
     || fail "a non-signal file resolved to a benign verdict"
   ! signal_crew_provably_working \
     || fail "an empty signal file list was treated as benign"
+  [ "$(grep -c $'^begin\ta$' "$progress_log")" -eq 2 ] \
+    || fail "coalesced signal reads did not publish bounded begin progress for task a"
+  [ "$(grep -c $'^end\ta$' "$progress_log")" -eq 2 ] \
+    || fail "coalesced signal reads did not publish bounded completion progress for task a"
+  crew_is_provably_working a || fail "stale-path working proof changed under shared progress callback"
+  [ "$(grep -c $'^begin\ta$' "$progress_log")" -eq 3 ] \
+    || fail "stale-path state read did not publish bounded begin progress"
+  [ "$(grep -c $'^end\ta$' "$progress_log")" -eq 3 ] \
+    || fail "stale-path state read did not publish bounded completion progress"
+  unset FM_CREW_STATE_PROGRESS_CALLBACK
   unset FM_FAKE_CREW_STATE_a FM_FAKE_CREW_STATE_b FM_FAKE_CREW_STATE_c FM_FAKE_CREW_STATE_d
   pass "signal_crew_provably_working: benign only when every referenced crew is provably working"
 }

@@ -448,18 +448,25 @@ _fm_status_file_sig() {
 # first-sighting stale paths. Heartbeat callers use it only on their backoff
 # cadence.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
-crew_state_line() {  # <id>
-  local line
-  [ -n "$1" ] || return 0
+crew_state_line() {  # <id> [progress-callback]
+  local id=$1 progress=${2:-${FM_CREW_STATE_PROGRESS_CALLBACK:-}} line
+  [ -n "$id" ] || return 0
+  if [ -n "$progress" ] && ! "$progress" begin "$id"; then
+    printf 'state: unknown · source: watcher · liveness: unknown (progress phase unavailable)\n'
+    return 0
+  fi
   if command -v timeout >/dev/null 2>&1; then
-    line=$(timeout --kill-after=1 "$FM_CREW_STATE_READ_TIMEOUT" "$FM_CREW_STATE_BIN" "$1" 2>/dev/null) || true
+    line=$(timeout --kill-after=1 "$FM_CREW_STATE_READ_TIMEOUT" "$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
   elif command -v gtimeout >/dev/null 2>&1; then
-    line=$(gtimeout --kill-after=1 "$FM_CREW_STATE_READ_TIMEOUT" "$FM_CREW_STATE_BIN" "$1" 2>/dev/null) || true
+    line=$(gtimeout --kill-after=1 "$FM_CREW_STATE_READ_TIMEOUT" "$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
   elif command -v perl >/dev/null 2>&1; then
     line=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
-      "$FM_CREW_STATE_READ_TIMEOUT" "$FM_CREW_STATE_BIN" "$1" 2>/dev/null) || true
+      "$FM_CREW_STATE_READ_TIMEOUT" "$FM_CREW_STATE_BIN" "$id" 2>/dev/null) || true
   else
     line=
+  fi
+  if [ -n "$progress" ] && ! "$progress" end "$id"; then
+    line='state: unknown · source: watcher · liveness: unknown (progress completion unavailable)'
   fi
   printf '%s\n' "$line" | head -1
 }
@@ -509,15 +516,7 @@ scan_crew_liveness_observations() {  # <state-dir> [progress-callback]
     [ -n "$kind" ] || kind=ship
     [ "$kind" = ship ] || continue
     task=$(basename "$meta"); task=${task%.meta}
-    if [ -n "$progress" ] && ! "$progress" begin "$task"; then
-      printf '%s\tunknown\tstate: unknown · source: watcher · progress phase unavailable\n' "$task"
-      continue
-    fi
-    line=$(crew_state_line "$task")
-    if [ -n "$progress" ] && ! "$progress" end "$task"; then
-      printf '%s\tunknown\tstate: unknown · source: watcher · progress completion unavailable\n' "$task"
-      continue
-    fi
+    line=$(crew_state_line "$task" "$progress")
     verdict=$(crew_state_liveness_verdict "$line")
     [ -n "$verdict" ] || continue
     printf '%s\t%s\t%s\n' "$task" "$verdict" "$line"

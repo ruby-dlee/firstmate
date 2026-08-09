@@ -621,7 +621,7 @@ These paths need `jq` to build the JSON payload, but they run before token and n
 
 Put home-local watcher environment assignments in the optional, gitignored `config/watcher.env`, or in the corresponding directory selected by `FM_CONFIG_OVERRIDE`.
 The watcher, arm, guard, and turn-end guard load this file through one shared parser before reading cadence or resource settings, so every enforcement owner uses the same values without an inline environment prefix on the protected arm command.
-Use one `FM_*=` assignment per line, with optional matching single or double quotes; blank lines and whole-line comments are accepted, while executable shell syntax and structural path overrides are rejected.
+Use one `FM_*=` assignment per line, with a name consisting only of `FM_` followed by uppercase ASCII letters, digits, or underscores and optional matching single or double quotes; blank lines and whole-line comments are accepted, while executable shell syntax, array syntax, and structural path overrides are rejected.
 For example, `FM_PAUSE_RESURFACE_SECS=7200` changes a declared external wait's normal-watcher recheck cadence to two hours.
 The watcher refuses a symlink or non-regular file at this path.
 Inline assignments on `bin/fm-watch-arm.sh` remain outside the arm hook's blessed command tree; use this file for persistent watcher tuning.
@@ -645,6 +645,9 @@ FM_AGENT_FLEET_BIN=agent-fleet  # test/lab-only Agent Fleet executable override
 FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1  # unmistakable opt-in required for either override; never set in production
 FM_ACCOUNT_CONTROL_TIMEOUT=10  # seconds allowed per ordinary Agent Fleet control-plane command; an explicit value also remains the legacy selection override when the next variable is unset
 FM_ACCOUNT_SELECTION_TIMEOUT=120  # seconds allowed per choose/acquire/recover command; unset falls back to an explicit legacy FM_ACCOUNT_CONTROL_TIMEOUT, then 120
+FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=10  # maximum seconds per task lifecycle lock acquisition
+FM_ACCOUNT_META_LOCK_WAIT_SECONDS=10  # maximum seconds per task metadata lock acquisition
+FM_ACCOUNT_LINEAGE_LOCK_WAIT_SECONDS=10  # maximum seconds per account lineage lock acquisition
 FM_ACCOUNT_SESSION_WAIT_SECONDS=10  # seconds a managed spawn waits for its required SessionStart mapping
 FM_ACCOUNT_SESSION_QUERY_TIMEOUT=5  # seconds allowed per Agent Fleet session-status query
 FM_ACCOUNT_SESSION_SYNC_INTERVAL=60  # watcher cadence for reconciling missing managed provider-session mappings
@@ -708,7 +711,7 @@ FMX_FOLLOWUP_MAX_COUNT=3   # local cap on X-mode completion follow-ups per linke
 FM_LOCK_STALE_AFTER=2   # seconds before dead-pid lock records can be reclaimed; mid-acquire locks keep at least 2s grace
 FM_GUARD_GRACE=300      # broad seconds allowed for the expected wake-and-rearm handoff when no healthy watcher cycle is present
 FM_WATCH_PROGRESS_GRACE=60   # tighter seconds allowed between progress beats while a live watcher lock is held; arm refuses an older holder
-FM_WATCH_AUTO_REAP_TIMEOUT=   # optional total automatic-teardown bound; unset derives from inner command, Treehouse retry, fleet-size, and cleanup bounds, while an undersized value is refused before mutation
+FM_WATCH_AUTO_REAP_TIMEOUT=   # optional total automatic-teardown bound; unset derives from inner command, Treehouse retry, account lock, fleet-size, and cleanup bounds, while an undersized value is refused before mutation
 FM_WATCH_AUTO_REAP_CLEANUP_MARGIN=30   # per-task cleanup margin included in the derived automatic-teardown bound
 FM_WATCH_PHASE_MARGIN=5   # scheduling margin added to each published bounded watcher phase deadline
 FM_ARM_CONFIRM_TIMEOUT=10   # seconds fm-watch-arm waits to confirm a fresh watcher before reporting FAILED

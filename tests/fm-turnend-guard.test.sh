@@ -337,6 +337,19 @@ test_hook_blocks_when_unhealthy_in_primary() {
   pass "fm-turnend-guard: blocks with the exact required reason in the primary when unhealthy"
 }
 
+test_hook_blocks_with_invalid_watcher_config() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-invalid-watcher-config")
+  : > "$dir/state/task1.meta"
+  mkdir -p "$dir/config"
+  printf 'this is not an assignment\n' > "$dir/config/watcher.env"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "invalid watcher config must block a primary turn with work in flight"
+  assert_contains "$out" 'TURN WOULD END BLIND - WATCHER CONFIG IS INVALID' "invalid config block must use the standard supervision alarm"
+  assert_contains "$out" 'Repair' "invalid config block must give a bounded repair instruction"
+  pass "fm-turnend-guard: invalid watcher config blocks the primary with exit 2"
+}
+
 test_hook_blocks_from_fm_home_state() {
   local dir home out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-fm-home")
@@ -571,6 +584,8 @@ test_hook_silent_in_crewmate_worktree() {
   dir="$TMP_ROOT/hook-crew-wt"
   make_crewmate_worktree_dir "$base" "$dir" >/dev/null
   : > "$dir/state/task1.meta"
+  mkdir -p "$dir/config"
+  printf 'this is not an assignment\n' > "$dir/config/watcher.env"
   out=$(run_hook "$dir" false); status=$?
   expect_code 0 "$status" "hook must never block inside a crewmate task worktree"
   [ -z "$out" ] || fail "hook produced output inside a crewmate task worktree: $out"
@@ -970,6 +985,7 @@ test_hook_blocks_with_hot_live_lock_and_fresh_beacon
 test_hook_blocks_with_live_lock_and_missed_cadence
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary
+test_hook_blocks_with_invalid_watcher_config
 test_hook_blocks_from_fm_home_state
 test_hook_x_mode_reason_sources_cadence
 test_hook_ignores_repo_state_when_fm_home_set

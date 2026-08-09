@@ -1158,7 +1158,9 @@ test_arm_allows_bounded_watcher_phases_past_base_cadence() {
     FM_TEST_AUTO_REAP_OUTPUT='bounded auto-reap complete' FM_WATCH_PROGRESS_GRACE=3 \
     FM_TREEHOUSE_RETURN_TIMEOUT=1 FM_TREEHOUSE_RETURN_LOCK_RETRIES=0 \
     FM_CHECKOUT_REFRESH_PROBE_TIMEOUT=1 FM_AUTO_REAP_COMMAND_TIMEOUT=1 \
-    FM_ACCOUNT_CONTROL_TIMEOUT=1 FM_WATCH_AUTO_REAP_CLEANUP_MARGIN=1 \
+    FM_ACCOUNT_CONTROL_TIMEOUT=1 FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 \
+    FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 FM_ACCOUNT_LINEAGE_LOCK_WAIT_SECONDS=0 \
+    FM_WATCH_AUTO_REAP_CLEANUP_MARGIN=1 \
     FM_WATCH_AUTO_REAP_TIMEOUT=60 FM_WATCH_PHASE_MARGIN=1 FM_POLL=1 \
     FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$out" &
   armpid=$!
@@ -1287,13 +1289,24 @@ test_arm_recovers_direct_no_progress_wedge() {
 }
 
 test_auto_reap_bound_tracks_inner_configuration() {
-  local dir state derived out status
+  local dir state derived base lock_bound expected out status
   dir=$(make_case derived-auto-reap-bound)
   state="$dir/state"
   derived=$(FM_STATE_OVERRIDE="$state" FM_TREEHOUSE_RETURN_TIMEOUT=900 bash -c \
     '. "$1"; watcher_auto_reap_timeout task' _ "$WATCH") \
     || fail "could not derive auto-reap bound from Treehouse configuration"
   [ "$derived" -gt 900 ] || fail "derived auto-reap bound did not include Treehouse timeout and cleanup: $derived"
+  base=$(FM_STATE_OVERRIDE="$state" FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 \
+    FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 FM_ACCOUNT_LINEAGE_LOCK_WAIT_SECONDS=0 bash -c \
+    '. "$1"; watcher_auto_reap_timeout task' _ "$WATCH") \
+    || fail "could not derive baseline auto-reap account-lock bound"
+  lock_bound=$(FM_STATE_OVERRIDE="$state" FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=900 \
+    FM_ACCOUNT_META_LOCK_WAIT_SECONDS=800 FM_ACCOUNT_LINEAGE_LOCK_WAIT_SECONDS=700 bash -c \
+    '. "$1"; watcher_auto_reap_timeout task' _ "$WATCH") \
+    || fail "could not derive configured auto-reap account-lock bound"
+  expected=$((2 * 900 + 6 * 800 + 2 * 700))
+  [ $((lock_bound - base)) -eq "$expected" ] \
+    || fail "derived auto-reap bound omitted configured account lock waits: base=$base configured=$lock_bound"
   status=0
   out=$(FM_STATE_OVERRIDE="$state" FM_TREEHOUSE_RETURN_TIMEOUT=900 FM_WATCH_AUTO_REAP_TIMEOUT=600 bash -c \
     '. "$1"; watcher_auto_reap_timeout task' _ "$WATCH" 2>&1) || status=$?
@@ -1303,7 +1316,7 @@ test_auto_reap_bound_tracks_inner_configuration() {
 }
 
 test_watcher_config_parser_is_shared_and_nonexecuting() {
-  local dir config out status marker
+  local dir config out status marker name_marker
   dir=$(make_case watcher-config-parser)
   config="$dir/config"
   marker="$dir/parser-executed"
@@ -1319,6 +1332,13 @@ test_watcher_config_parser_is_shared_and_nonexecuting() {
     _ "$ROOT/bin/fm-watcher-config-lib.sh" "$config" 2>/dev/null || status=$?
   [ "$status" -ne 0 ] || fail "shared watcher config parser accepted executable syntax"
   [ ! -e "$marker" ] || fail "shared watcher config parser executed assignment contents"
+  name_marker="$dir/name-parser-executed"
+  printf 'FM_A[$(touch${IFS}%s)]=value\n' "$name_marker" > "$config/watcher.env"
+  status=0
+  FM_WATCHER_CONFIG_LOADED_PATH= bash -c '. "$1"; fm_watcher_config_load "$2"' \
+    _ "$ROOT/bin/fm-watcher-config-lib.sh" "$config" 2>/dev/null || status=$?
+  [ "$status" -ne 0 ] || fail "shared watcher config parser accepted an array-subscript variable name"
+  [ ! -e "$name_marker" ] || fail "shared watcher config parser executed an array subscript"
   pass "watcher config is parsed once without executing shell syntax"
 }
 

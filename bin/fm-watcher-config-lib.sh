@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 fm_watcher_config_load() {  # <config-dir>
-  local config_dir=$1 path line raw name value first last line_number=0
+  local config_dir=$1 path line raw name suffix value first last line_number=0 LC_ALL=C
   path="$config_dir/watcher.env"
   if [ -n "${FM_WATCHER_CONFIG_LOADED_PATH:-}" ]; then
     [ "$FM_WATCHER_CONFIG_LOADED_PATH" = "$path" ] || {
@@ -37,8 +37,14 @@ fm_watcher_config_load() {  # <config-dir>
         printf 'error: structural variable %s is not allowed in %s\n' "$name" "$path" >&2
         return 1
         ;;
-      FM_[A-Z0-9_]*) ;;
-      *)
+    esac
+    suffix=${name#FM_}
+    if [ "$suffix" = "$name" ]; then
+      printf 'error: invalid watcher config variable at %s:%s\n' "$path" "$line_number" >&2
+      return 1
+    fi
+    case "$suffix" in
+      ''|*[!A-Z0-9_]*)
         printf 'error: invalid watcher config variable at %s:%s\n' "$path" "$line_number" >&2
         return 1
         ;;

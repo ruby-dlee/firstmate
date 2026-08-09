@@ -44,14 +44,6 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # shellcheck source=bin/fm-watcher-config-lib.sh
 . "$SCRIPT_DIR/fm-watcher-config-lib.sh"
-fm_watcher_config_load "$CONFIG" || exit 1
-GRACE=${FM_GUARD_GRACE:-300}
-PROGRESS_GRACE=${FM_WATCH_PROGRESS_GRACE:-60}
-CPU_LIMIT=${FM_WATCH_CPU_LIMIT:-80}
-fm_watcher_config_positive_integer FM_WATCH_PROGRESS_GRACE 60
-fm_watcher_config_positive_integer FM_WATCH_CPU_LIMIT 80
-PROGRESS_GRACE=$FM_WATCH_PROGRESS_GRACE
-CPU_LIMIT=$FM_WATCH_CPU_LIMIT
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 
 # shellcheck source=bin/fm-supervision-lib.sh
@@ -120,6 +112,20 @@ fi
 [ -d "$FM_ROOT/bin" ] || exit 0
 [ -d "$STATE" ] || exit 0
 
+WATCHER_CONFIG_ERROR=
+if fm_watcher_config_load "$CONFIG"; then
+  GRACE=${FM_GUARD_GRACE:-300}
+  fm_watcher_config_positive_integer FM_WATCH_PROGRESS_GRACE 60
+  fm_watcher_config_positive_integer FM_WATCH_CPU_LIMIT 80
+  PROGRESS_GRACE=$FM_WATCH_PROGRESS_GRACE
+  CPU_LIMIT=$FM_WATCH_CPU_LIMIT
+else
+  WATCHER_CONFIG_ERROR="invalid watcher configuration at $CONFIG/watcher.env"
+  GRACE=300
+  PROGRESS_GRACE=60
+  CPU_LIMIT=80
+fi
+
 # --- the actual predicate ----------------------------------------------------
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
@@ -128,7 +134,10 @@ fm_supervision_status "$STATE" "$GRACE"
 [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
 WATCHER_RESOURCE_HOT=0
 WATCHER_PROGRESS_STALE=0
-if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+WATCHER_CONFIG_INVALID=0
+if [ -n "$WATCHER_CONFIG_ERROR" ]; then
+  WATCHER_CONFIG_INVALID=1
+elif fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
   WATCHER_AGE=$(fm_path_age "$STATE/.last-watcher-beat")
   if ! fm_watcher_progress_current "$STATE" "$FM_WATCHER_HEALTHY_PID" "$PROGRESS_GRACE"; then
     WATCHER_PROGRESS_STALE=1
@@ -144,7 +153,9 @@ afk=0
 [ -e "$STATE/.afk" ] && afk=1
 x_mode=0
 [ -f "$CONFIG/x-mode.env" ] && x_mode=1
-if [ "$WATCHER_RESOURCE_HOT" -eq 1 ] || [ "$WATCHER_PROGRESS_STALE" -eq 1 ]; then
+if [ "$WATCHER_CONFIG_INVALID" -eq 1 ]; then
+  REASON="Repair $CONFIG/watcher.env before ending the turn: $WATCHER_CONFIG_ERROR"
+elif [ "$WATCHER_RESOURCE_HOT" -eq 1 ] || [ "$WATCHER_PROGRESS_STALE" -eq 1 ]; then
   REASON='Run bin/fm-watch-arm.sh --restart for home-scoped exact-tree recovery before ending the turn.'
 else
   REASON=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
@@ -153,7 +164,10 @@ fi
 rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 {
   printf '●%s\n' "$rule"
-  if [ "$WATCHER_RESOURCE_HOT" -eq 1 ]; then
+  if [ "$WATCHER_CONFIG_INVALID" -eq 1 ]; then
+    printf '●  TURN WOULD END BLIND - WATCHER CONFIG IS INVALID\n'
+    printf '●  %s task(s) in flight; watcher and arm configuration could not be loaded safely.\n' "$FM_SUP_IN_FLIGHT"
+  elif [ "$WATCHER_RESOURCE_HOT" -eq 1 ]; then
     printf '●  TURN WOULD END WITH WATCHER RUNAWAY\n'
     printf '●  %s task(s) in flight; recorded watcher pid %s and its exact tree are using %s%% CPU across %s processes.\n' \
       "$FM_SUP_IN_FLIGHT" "$FM_WATCHER_HEALTHY_PID" "$FM_WATCHER_TREE_CPU" "$FM_WATCHER_TREE_COUNT"

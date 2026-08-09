@@ -88,6 +88,7 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # shellcheck source=bin/fm-watcher-config-lib.sh
 . "$SCRIPT_DIR/fm-watcher-config-lib.sh"
 fm_watcher_config_load "$CONFIG" || exit 1
+fm_watcher_config_positive_integer FM_CREW_STATE_READ_TIMEOUT 30
 
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 WATCH_LOCK="$STATE/.watch.lock"

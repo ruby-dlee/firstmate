@@ -60,6 +60,8 @@ fm_refuse_if_gate_agent
 # shellcheck source=bin/fm-watcher-config-lib.sh
 . "$SCRIPT_DIR/fm-watcher-config-lib.sh"
 fm_watcher_config_load "$CONFIG" || exit 1
+fm_watcher_config_positive_integer FM_WATCH_PROGRESS_GRACE 60
+fm_watcher_config_positive_integer FM_CREW_STATE_READ_TIMEOUT 30
 mkdir -p "$STATE"
 [ -d "$STATE" ] && [ ! -L "$STATE" ] || { echo "error: unsafe watcher state directory: $STATE" >&2; exit 1; }
 
@@ -712,7 +714,8 @@ watcher_auto_reap_units() {  # <maintenance|task>
 }
 
 watcher_auto_reap_timeout() {  # <maintenance|task>
-  local mode=$1 units tree_timeout retries retry_wait probe_timeout command_timeout control_timeout required configured
+  local mode=$1 units tree_timeout retries retry_wait probe_timeout command_timeout control_timeout
+  local lifecycle_wait meta_wait lineage_wait required configured
   units=$(watcher_auto_reap_units "$mode") || return 1
   tree_timeout=${FM_TREEHOUSE_RETURN_TIMEOUT:-60}
   retries=${FM_TREEHOUSE_RETURN_LOCK_RETRIES:-3}
@@ -720,7 +723,10 @@ watcher_auto_reap_timeout() {  # <maintenance|task>
   probe_timeout=${FM_CHECKOUT_REFRESH_PROBE_TIMEOUT:-15}
   command_timeout=${FM_AUTO_REAP_COMMAND_TIMEOUT:-20}
   control_timeout=${FM_ACCOUNT_CONTROL_TIMEOUT:-10}
-  case "$tree_timeout:$retries:$probe_timeout:$command_timeout:$control_timeout" in
+  lifecycle_wait=${FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS:-10}
+  meta_wait=${FM_ACCOUNT_META_LOCK_WAIT_SECONDS:-10}
+  lineage_wait=${FM_ACCOUNT_LINEAGE_LOCK_WAIT_SECONDS:-10}
+  case "$tree_timeout:$retries:$probe_timeout:$command_timeout:$control_timeout:$lifecycle_wait:$meta_wait:$lineage_wait" in
     *[!0-9:]*|0:*|*::*)
       printf 'auto-reap configuration has an invalid integer bound\n' >&2
       return 1
@@ -732,9 +738,11 @@ watcher_auto_reap_timeout() {  # <maintenance|task>
   }
   required=$(awk -v units="$units" -v tree="$tree_timeout" -v retries="$retries" \
     -v wait="$retry_wait" -v probe="$probe_timeout" -v command="$command_timeout" \
-    -v control="$control_timeout" -v cleanup="$AUTO_REAP_CLEANUP_MARGIN" 'BEGIN {
+    -v control="$control_timeout" -v lifecycle="$lifecycle_wait" -v meta="$meta_wait" \
+    -v lineage="$lineage_wait" -v cleanup="$AUTO_REAP_CLEANUP_MARGIN" 'BEGIN {
       if (wait !~ /^[0-9]+([.][0-9]*)?$|^[.][0-9]+$/) exit 1
-      per_task = (retries + 2) * tree + retries * wait + 10 * probe + 4 * command + 12 * control + 20 + cleanup
+      per_task = (retries + 2) * tree + retries * wait + 10 * probe + 4 * command + 12 * control
+      per_task += 2 * lifecycle + 6 * meta + 2 * lineage + 20 + cleanup
       total = units * per_task
       value = int(total)
       if (value < total) value++
@@ -870,6 +878,7 @@ watcher_crew_state_progress() {  # <begin|end> <task>
     *) return 1 ;;
   esac
 }
+FM_CREW_STATE_PROGRESS_CALLBACK=watcher_crew_state_progress
 
 task_generation_id() {  # <task>
   local task=$1 meta generation

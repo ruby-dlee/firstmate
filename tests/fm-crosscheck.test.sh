@@ -27,7 +27,8 @@ make_case() {
   local name=$1 case_dir repo base head
   case_dir="$TMP_ROOT/$name"
   repo="$case_dir/repo"
-  mkdir -p "$repo/tests" "$case_dir/state" "$case_dir/data" \
+  mkdir -p "$repo/tests" "$repo/apps/web-app/src" \
+    "$repo/apps/web-app/node_modules/.bin" "$case_dir/state" "$case_dir/data" \
     "$case_dir/author-home" "$case_dir/reviewer-home" "$case_dir/pi-home" \
     "$case_dir/fakebin"
   # Real Codex homes always carry tokens.account_id; the independence gate
@@ -52,6 +53,39 @@ make_case() {
   printf '#!/usr/bin/env bash\ngrep -qx fixed app.txt\n' > "$repo/tests/helper.sh"
   printf '#!/usr/bin/env bash\n. tests/helper.sh\n' > "$repo/tests/support.test.sh"
   printf '#!/usr/bin/env bash\ngrep -qx fixed app.txt\n' > "$repo/shared-test.sh"
+  cat > "$repo/apps/web-app/package.json" <<'JSON'
+{"scripts":{"test":"jest"},"devDependencies":{"jest":"29.7.0"}}
+JSON
+  printf 'export const previewScope = "fixed";\n' \
+    > "$repo/apps/web-app/src/preview.ts"
+  printf '// ADEQUATE_PREVIEW_SCOPE_TEST\n' \
+    > "$repo/apps/web-app/src/preview.test.ts"
+  printf '// INADEQUATE_PREVIEW_SCOPE_TEST\n' \
+    > "$repo/apps/web-app/src/preview-inadequate.test.ts"
+  cat > "$repo/apps/web-app/node_modules/.bin/jest" <<'SH'
+#!/usr/bin/env bash
+set -u
+test_path=
+for argument in "$@"; do
+  case "$argument" in
+    --*) ;;
+    *) test_path=$argument ;;
+  esac
+done
+[ -n "$test_path" ] && [ -f "$test_path" ] || exit 4
+status=0
+if ! grep -q 'INADEQUATE_PREVIEW_SCOPE_TEST' "$test_path" \
+  && ! grep -q 'previewScope = "fixed"' src/preview.ts; then
+  status=1
+fi
+if [ "$status" -eq 0 ]; then
+  printf '%s\n' '{"numTotalTests":1,"numFailedTests":0,"success":true}'
+else
+  printf '%s\n' '{"numTotalTests":1,"numFailedTests":1,"success":false}'
+fi
+exit "$status"
+SH
+  chmod +x "$repo/apps/web-app/node_modules/.bin/jest"
   ln -s ../shared-test.sh "$repo/tests/symlink.test.sh"
   printf '#!/usr/bin/env bash\n# def test_app_is_fixed()\ngrep -qx fixed app.txt\n' \
     > "$repo/tests/nodeid.test.sh"
@@ -67,8 +101,11 @@ make_case() {
     "$repo/tests/readable-state.test.sh" "$repo/tests/support.test.sh" \
     "$repo/tests/nodeid.test.sh" "$repo/tests/vacuous.test.sh" \
     "$repo/tests/pathdep.test.sh" "$repo/real-tests/linked.test.sh"
-  git -C "$repo" add app.txt other.txt shared-test.sh tests/regression.test.sh \
-    tests/helper.sh tests/readable-state.test.sh tests/stateful.test.sh \
+  git -C "$repo" add app.txt other.txt shared-test.sh \
+    apps/web-app/package.json apps/web-app/src/preview.ts \
+    apps/web-app/src/preview.test.ts apps/web-app/src/preview-inadequate.test.ts \
+    apps/web-app/node_modules/.bin/jest \
+    tests/regression.test.sh tests/helper.sh tests/readable-state.test.sh tests/stateful.test.sh \
     tests/support.test.sh tests/symlink.test.sh tests/nodeid.test.sh \
     tests/vacuous.test.sh tests/pathdep.test.sh real-tests/linked.test.sh \
     tests/linked
@@ -586,6 +623,37 @@ elif scenario == "new-finding":
         },
     }]
 elif scenario in {
+    "verified-fixed-jest",
+    "inadequate-jest",
+    "no-route-jest",
+}:
+    patch = protocol / "mutations" / "preview-revert.patch"
+    patch.parent.mkdir(parents=True, exist_ok=True)
+    patch.write_text("""diff --git a/apps/web-app/src/preview.ts b/apps/web-app/src/preview.ts
+--- a/apps/web-app/src/preview.ts
++++ b/apps/web-app/src/preview.ts
+@@ -1 +1 @@
+-export const previewScope = \"fixed\";
++export const previewScope = \"broken\";
+""")
+    test_path = (
+        "apps/web-app/src/preview-inadequate.test.ts"
+        if scenario == "inadequate-jest"
+        else "apps/web-app/src/preview.test.ts"
+    )
+    base["finding_updates"] = [{
+        "id": "cc-aaaaaaaaaaaa",
+        "status": "verified-fixed",
+        "note": "The package-governed Jest regression detects a reverted preview fix.",
+        "reproduction": None,
+        "mutation_proof": {
+            "test_path": test_path,
+            "test_invocation": {"runner": "jest", "arguments": []},
+            "mutation_patch_path": ".crosscheck/mutations/preview-revert.patch",
+        },
+        "equivalent_to": None,
+    }]
+elif scenario in {
     "verified-fixed",
     "missing-proof",
     "forged-command",
@@ -929,6 +997,34 @@ seed_open_ledger() {
       "head_sha": "$head",
       "status": "open",
       "note": "Seeded reproduced blocker.",
+      "proof": null
+    }]
+  }],
+  "runs": []
+}
+JSON
+}
+
+seed_javascript_open_ledger() {
+  local case_dir=$1 head=$2
+  mkdir -p "$case_dir/data/task-x1"
+  cat > "$case_dir/data/task-x1/crosscheck-ledger.json" <<JSON
+{
+  "schema": "firstmate.crosscheck-ledger.v2",
+  "task_id": "task-x1",
+  "pull_request": "https://github.com/ruby-dlee/firstmate/pull/72",
+  "findings": [{
+    "id": "cc-aaaaaaaaaaaa",
+    "lifecycle": "open",
+    "title": "Prior TypeScript blocker",
+    "severity": "blocking",
+    "description": "A durable reproduced TypeScript blocker.",
+    "citations": [{"path": "apps/web-app/src/preview.ts", "line": 1}],
+    "history": [{
+      "at": "2026-08-02T00:00:00Z",
+      "head_sha": "$head",
+      "status": "open",
+      "note": "Seeded reproduced TypeScript blocker.",
       "proof": null
     }]
   }],
@@ -2550,6 +2646,151 @@ assert proof["mutated_files"] == ["app.txt"]
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" \
     || fail "mutation proof execution was not durably recorded"
   pass "verified-fixed requires a passing named test that fails after implementation mutation"
+}
+
+test_typescript_jest_mutation_proof_can_clear() {
+  local record case_dir base head
+  record=$(make_case typescript-jest-clear)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  seed_javascript_open_ledger "$case_dir" "$head"
+  run_case "$case_dir" "$base" "$head" verified-fixed-jest run \
+    > "$case_dir/out" 2> "$case_dir/err" \
+    || fail "adequately covered TypeScript mutation did not clear: $(cat "$case_dir/err")"
+  "$CROSSCHECK_PYTHON" - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY' \
+    || fail "Jest mutation proof was not durably certified"
+import json
+from pathlib import Path
+import sys
+
+ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+finding = ledger["findings"][0]
+proof = finding["history"][-1]["proof"]
+assert finding["lifecycle"] == "verified-fixed", finding
+assert proof["test_invocation"] == {"runner": "jest", "arguments": []}, proof
+assert proof["mutated_files"] == ["apps/web-app/src/preview.ts"], proof
+assert proof["baseline_exit"] == 0 and proof["mutated_exit"] == 1, proof
+assert '"numTotalTests":1' in proof["baseline_output"], proof
+assert '"numFailedTests":1' in proof["mutated_output"], proof
+assert ledger["runs"][-1]["state"] == "clear", ledger["runs"][-1]
+PY
+  pass "a package-governed Jest test can certify a TypeScript mutation"
+}
+
+test_inadequate_typescript_jest_coverage_stays_blocking() {
+  local record case_dir base head rc
+  record=$(make_case typescript-jest-inadequate)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  seed_javascript_open_ledger "$case_dir" "$head"
+  set +e
+  run_case "$case_dir" "$base" "$head" inadequate-jest run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "inadequate TypeScript Jest coverage"
+  assert_grep 'CROSSCHECK BLOCKING:' "$case_dir/err" \
+    "a passing mutated Jest test was not reported as blocking"
+  "$CROSSCHECK_PYTHON" - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY' \
+    || fail "inadequate Jest coverage did not remain a durable blocker"
+import json
+from pathlib import Path
+import sys
+
+ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+finding = ledger["findings"][0]
+event = finding["history"][-1]
+assert finding["lifecycle"] == "claimed-fixed", finding
+assert event["status"] == "claimed-fixed", event
+assert event["proof"]["mutated_exit"] == 0, event
+assert "named Jest test still passes" in event["note"], event
+assert ledger["runs"][-1]["state"] == "blocking", ledger["runs"][-1]
+PY
+  pass "a TypeScript test that misses the mutation remains blocking"
+}
+
+test_typescript_without_usable_route_is_cannot_certify() {
+  local record case_dir base head rc
+  record=$(make_case typescript-no-route)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/apps/web-app/package.json" <<'JSON'
+{"scripts":{"test":"vitest"},"devDependencies":{"vitest":"2.1.0"}}
+JSON
+  git -C "$case_dir/repo" add apps/web-app/package.json
+  git -C "$case_dir/repo" commit -qm "switch fixture to unsupported test route"
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_javascript_open_ledger "$case_dir" "$head"
+  set +e
+  run_case "$case_dir" "$base" "$head" no-route-jest run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "TypeScript mutation with no usable certification route"
+  assert_grep 'CROSSCHECK CANNOT-CERTIFY:' "$case_dir/err" \
+    "an unavailable governed route was mislabeled as a review verdict"
+  assert_no_grep 'crosscheck clear' "$case_dir/out" \
+    "a missing TypeScript certification route silently cleared"
+  "$CROSSCHECK_PYTHON" - \
+    "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    "$case_dir/data/task-x1/crosscheck.md" <<'PY' \
+    || fail "cannot-certify outcome was not durable and explicit"
+import json
+from pathlib import Path
+import sys
+
+ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert ledger["findings"][0]["lifecycle"] == "open", ledger["findings"][0]
+assert ledger["runs"][-1]["state"] == "cannot-certify", ledger["runs"][-1]
+report = Path(sys.argv[2]).read_text(encoding="utf-8")
+assert "State: **CANNOT-CERTIFY**" in report, report
+assert "no trustworthy mutation-certification route" in report, report
+PY
+  pass "an unavailable language-governed route reports CANNOT-CERTIFY and never clears"
+}
+
+test_python_mutation_proof_is_byte_exact() {
+  local record case_dir base head
+  record=$(make_case python-byte-exact)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  seed_open_ledger "$case_dir" "$head"
+  run_case "$case_dir" "$base" "$head" verified-fixed run \
+    > "$case_dir/out" 2> "$case_dir/err" \
+    || fail "existing Python mutation proof changed outcome"
+  "$CROSSCHECK_PYTHON" - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY' \
+    || fail "Python mutation evidence changed bytes"
+import json
+from pathlib import Path
+import re
+import sys
+
+ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+proof = ledger["findings"][0]["history"][-1]["proof"]
+assert proof["baseline_output"] == proof["mutated_output"], proof
+proof["baseline_output"] = re.sub(
+    r"^configfile: .*/pytest[.]ini\n$",
+    "configfile: <gate>/pytest.ini\n",
+    proof["baseline_output"],
+)
+proof["mutated_output"] = re.sub(
+    r"^configfile: .*/pytest[.]ini\n$",
+    "configfile: <gate>/pytest.ini\n",
+    proof["mutated_output"],
+)
+expected = {
+    "test_path": "tests/regression.test.sh",
+    "test_invocation": {"runner": "pytest", "arguments": []},
+    "mutation_patch_sha256": "61164e8bd68046f78edc529f817059d06c9f4fb80ba7ca33dc242ba18634660c",
+    "mutated_files": ["app.txt"],
+    "baseline_exit": 0,
+    "mutated_exit": 1,
+    "baseline_output": "configfile: <gate>/pytest.ini\n",
+    "mutated_output": "configfile: <gate>/pytest.ini\n",
+}
+assert json.dumps(proof, sort_keys=True, separators=(",", ":")) == json.dumps(
+    expected, sort_keys=True, separators=(",", ":")
+), proof
+assert ledger["runs"][-1]["state"] == "clear", ledger["runs"][-1]
+PY
+  pass "Python mutation certification remains byte-for-byte unchanged"
 }
 
 test_node_id_selector_clears_a_passing_named_test() {
@@ -4247,6 +4488,10 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_reading_only_suspicion_is_a_tool_failure|\
     test_new_finding_requires_executed_reproduction|\
     test_silence_never_closes_prior_finding|\
+    test_typescript_jest_mutation_proof_can_clear|\
+    test_inadequate_typescript_jest_coverage_stays_blocking|\
+    test_typescript_without_usable_route_is_cannot_certify|\
+    test_python_mutation_proof_is_byte_exact|\
     test_baseline_readable_state_is_destroyed_before_mutation|\
     test_mutation_is_bound_to_cited_non_test_implementation|\
     test_reviewer_output_uses_separate_capture_limit|\
@@ -4328,6 +4573,10 @@ test_account_less_known_provider_lane_is_reviewable
 test_new_finding_requires_executed_reproduction
 test_silence_never_closes_prior_finding
 test_verified_fix_executes_mutation_proof
+test_typescript_jest_mutation_proof_can_clear
+test_inadequate_typescript_jest_coverage_stays_blocking
+test_typescript_without_usable_route_is_cannot_certify
+test_python_mutation_proof_is_byte_exact
 test_node_id_selector_clears_a_passing_named_test
 test_absent_runner_is_never_a_test_outcome
 test_unclassified_runner_cannot_clear_a_finding

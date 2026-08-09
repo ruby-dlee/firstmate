@@ -101,10 +101,9 @@ SHELL_COMMAND_NOT_FOUND_EXIT = 127
 # named test. They are not test outcomes in either direction: they can neither
 # condemn a baseline run nor vindicate a mutated one. Every entry is measured
 # against the runner itself; a guessed status would reinstate exactly the
-# misreading this table exists to prevent, so a runner is absent from it until
-# its non-execution has been observed. A mutation proof may name only a runner
-# listed here, because on any other one the gate cannot tell a test that caught
-# the mutation from a test that never ran.
+# misreading this table exists to prevent, so an exit-status-inferred route is
+# absent until its non-execution has been observed. Jest does not use this table:
+# its separate positive-execution route parses the runner's JSON test counts.
 RUNNER_NON_EXECUTION_EXITS: dict[str, dict[int, str]] = {
     "pytest": {
         2: "collection was interrupted",
@@ -113,6 +112,17 @@ RUNNER_NON_EXECUTION_EXITS: dict[str, dict[int, str]] = {
         5: "no test matched the named selector",
     },
 }
+JAVASCRIPT_IMPLEMENTATION_SUFFIXES = {
+    ".cjs",
+    ".cts",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".mts",
+    ".ts",
+    ".tsx",
+}
+JAVASCRIPT_RUNNERS = {"jest", "vitest"}
 # The classified statuses above are the runner's DEFAULT exit semantics, and
 # ambient variables can rewrite them: pytest documents PYTEST_ADDOPTS as being
 # appended to the command line, so an operator with
@@ -145,6 +155,22 @@ class CrosscheckToolError(CrosscheckError):
 
 class CrosscheckBlockingError(CrosscheckError):
     """Raised when completed review evidence blocks the exact head."""
+
+
+class CrosscheckCertificationError(CrosscheckError):
+    """Raised when no trustworthy mutation-certification route can run."""
+
+
+class CrosscheckCoverageError(CrosscheckError):
+    """Raised when a usable mutation route proves its named test inadequate."""
+
+    def __init__(self, message: str, proof: dict[str, Any]):
+        super().__init__(message)
+        self.proof = proof
+
+
+def cannot_certify(message: str) -> NoReturn:
+    raise CrosscheckCertificationError(message)
 
 
 def utc_now() -> str:
@@ -1233,6 +1259,313 @@ def uv_project_for(checkout: Path, test_path: str) -> Path | None:
         directory = directory.parent
 
 
+def nearest_package_project(checkout: Path, relative_path: str) -> Path | None:
+    """Return the nearest package.json root governing one tracked path."""
+
+    checkout = checkout.resolve()
+    candidate = (checkout / relative_path).resolve()
+    if not candidate.is_relative_to(checkout):
+        return None
+    directory = candidate.parent
+    while True:
+        if (directory / "package.json").is_file():
+            return directory
+        if directory == checkout:
+            return None
+        directory = directory.parent
+
+
+def javascript_mutation_route(
+    review_dir: Path,
+    changed: list[str],
+    test_file: str,
+    runner: str,
+    label: str,
+) -> Path | None:
+    """Select a JavaScript test system from the implementation paths themselves."""
+
+    javascript_paths = [
+        path
+        for path in changed
+        if Path(path).suffix.lower() in JAVASCRIPT_IMPLEMENTATION_SUFFIXES
+    ]
+    if not javascript_paths:
+        return None
+    non_javascript = sorted(set(changed) - set(javascript_paths))
+    if non_javascript:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: one mutation spans JavaScript/TypeScript "
+            "and another implementation system, so no single governed test route "
+            "can certify it: "
+            + ", ".join(non_javascript)
+        )
+    if Path(test_file).suffix.lower() not in JAVASCRIPT_IMPLEMENTATION_SUFFIXES:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: JavaScript/TypeScript implementation must "
+            f"name a tracked JavaScript/TypeScript test, not {test_file}"
+        )
+    governed_paths = [*javascript_paths, test_file]
+    resolved_projects = [
+        nearest_package_project(review_dir, path) for path in governed_paths
+    ]
+    if any(project is None for project in resolved_projects):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: every changed JavaScript/TypeScript path "
+            "and the named test must resolve to a tracked package.json project"
+        )
+    projects = {
+        project.resolve() for project in resolved_projects if project is not None
+    }
+    if len(projects) != 1:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: changed implementation and named test do "
+            "not resolve to one tracked package.json project"
+        )
+    project = next(iter(projects))
+    package_path = project / "package.json"
+    try:
+        package = read_bounded_json(
+            package_path,
+            maximum_bytes=1024 * 1024,
+            maximum_items=4096,
+            maximum_string_bytes=1024 * 1024,
+        )
+    except BoundedIOError as exc:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: package metadata is unreadable at "
+            f"{package_path}: {exc}"
+        )
+    if not isinstance(package, dict):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: package metadata is not an object at "
+            f"{package_path}"
+        )
+    dependencies: dict[str, Any] = {}
+    for field in ("dependencies", "devDependencies"):
+        value = package.get(field)
+        if isinstance(value, dict):
+            dependencies.update(value)
+    scripts = package.get("scripts")
+    test_script = scripts.get("test", "") if isinstance(scripts, dict) else ""
+    declared = {
+        candidate
+        for candidate in JAVASCRIPT_RUNNERS
+        if candidate in dependencies
+        or re.search(rf"(?:^|[ /]){re.escape(candidate)}(?:$|[ ])", str(test_script))
+    }
+    scripted = [
+        candidate
+        for candidate in sorted(declared)
+        if re.search(rf"(?:^|[ /]){re.escape(candidate)}(?:$|[ ])", str(test_script))
+    ]
+    if len(scripted) == 1:
+        governed_runner = scripted[0]
+    elif len(declared) == 1:
+        governed_runner = next(iter(declared))
+    else:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: {package_path} does not declare one "
+            "unambiguous Jest or Vitest test system"
+        )
+    if runner != governed_runner:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: changed JavaScript/TypeScript is governed "
+            f"by {governed_runner}, but the proof named {runner}"
+        )
+    if governed_runner != "jest":
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: {governed_runner} governs the changed "
+            "JavaScript/TypeScript package, but this gate has no positive "
+            f"mutation-execution protocol for {governed_runner}"
+        )
+    return project.relative_to(review_dir.resolve())
+
+
+def declared_node_major(project: Path) -> int | None:
+    try:
+        package = read_bounded_json(
+            project / "package.json",
+            maximum_bytes=1024 * 1024,
+            maximum_items=4096,
+            maximum_string_bytes=1024 * 1024,
+        )
+    except BoundedIOError:
+        return None
+    if not isinstance(package, dict):
+        return None
+    engines = package.get("engines")
+    declaration = engines.get("node") if isinstance(engines, dict) else None
+    if not isinstance(declaration, str):
+        return None
+    match = re.search(r"(?:^|[^0-9])(\d+)(?:\.|x|$)", declaration)
+    return int(match.group(1)) if match is not None else None
+
+
+def node_bin_for_project(project: Path, label: str) -> Path:
+    major = declared_node_major(project)
+    ambient = shutil.which("node")
+    if ambient is not None:
+        version = run_command(
+            [ambient, "--version"],
+            cwd=project,
+            timeout=30,
+            description=f"{label} Node version probe",
+        )
+        match = re.fullmatch(r"v(\d+)\.[0-9]+\.[0-9]+", version.stdout.strip())
+        if version.returncode == 0 and (major is None or (match and int(match.group(1)) == major)):
+            return Path(ambient).resolve().parent
+    if major is None:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: no runnable Node interpreter is on PATH"
+        )
+    candidates: list[tuple[tuple[int, int, int], Path]] = []
+    homes = [
+        Path.home() / ".nvm" / "versions" / "node",
+        Path.home() / ".local" / "share" / "mise" / "installs" / "node",
+        Path.home() / ".volta" / "tools" / "image" / "node",
+    ]
+    for root in homes:
+        if not root.is_dir():
+            continue
+        for candidate in root.iterdir():
+            match = re.fullmatch(rf"v?({major})\.(\d+)\.(\d+)", candidate.name)
+            node = candidate / "bin" / "node"
+            if match is not None and node.is_file() and os.access(node, os.X_OK):
+                candidates.append(
+                    ((int(match.group(1)), int(match.group(2)), int(match.group(3))), node)
+                )
+    if not candidates:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: package requires Node {major}, but no "
+            "matching interpreter exists in the standard version-manager directories"
+        )
+    return max(candidates)[1].resolve().parent
+
+
+def prepare_jest_invocation(
+    checkout: Path,
+    project_relative: Path,
+    test_path: str,
+    label: str,
+    deadline: float,
+) -> tuple[list[str], Path]:
+    project = (checkout / project_relative).resolve()
+    require(project.is_relative_to(checkout.resolve()), f"{label} package escapes checkout")
+    jest = project / "node_modules" / ".bin" / "jest"
+    if not (jest.is_file() and os.access(jest, os.X_OK)):
+        node_bin = node_bin_for_project(project, label)
+        package_manager = ""
+        if (project / "package-lock.json").is_file():
+            package_manager = "npm"
+            manager = node_bin / "npm"
+            arguments = [
+                str(manager),
+                "ci",
+                "--offline",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+            ]
+        elif (project / "pnpm-lock.yaml").is_file():
+            package_manager = "pnpm"
+            resolved = shutil.which("pnpm")
+            manager = Path(resolved) if resolved is not None else Path()
+            arguments = [
+                str(manager),
+                "install",
+                "--offline",
+                "--frozen-lockfile",
+                "--ignore-scripts",
+            ]
+        else:
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: Jest project {project_relative} has "
+                "no package-lock.json or pnpm-lock.yaml for an offline proof install"
+            )
+        if not manager.is_file() or not os.access(manager, os.X_OK):
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: {package_manager} is unavailable for "
+                f"the offline Jest proof in {project_relative}"
+            )
+        environment = proof_environment()
+        environment["PATH"] = str(node_bin) + os.pathsep + environment.get("PATH", "")
+        environment["CI"] = "true"
+        installed = run_sandboxed(
+            arguments,
+            cwd=project,
+            profile_path=checkout / ".crosscheck" / "jest-dependencies.sb",
+            allow_network=False,
+            allow_posix_ipc=False,
+            env=environment,
+            timeout=evidence_command_timeout(
+                deadline, evidence_timeout(), f"{label} Jest dependency install"
+            ),
+            description=f"{label} offline Jest dependency install",
+        )
+        if installed.returncode != 0:
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: {package_manager} could not materialize "
+                "the lockfile-pinned Jest environment offline: "
+                f"{(installed.stdout + installed.stderr).strip()[:1000] or 'no output'}"
+            )
+    if not (jest.is_file() and os.access(jest, os.X_OK)):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: lockfile installation produced no runnable "
+            f"Jest at {jest}"
+        )
+    test_relative = (checkout / test_file_path(test_path, label)).resolve()
+    try:
+        test_argument = test_relative.relative_to(project).as_posix()
+    except ValueError:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: named Jest test is outside its package project"
+        )
+    return (
+        [
+            str(jest),
+            "--runInBand",
+            "--runTestsByPath",
+            "--ci",
+            "--no-cache",
+            "--color=false",
+            "--json",
+            test_argument,
+        ],
+        project,
+    )
+
+
+def jest_execution_summary(
+    result: subprocess.CompletedProcess[str], label: str, phase: str
+) -> tuple[int, int]:
+    try:
+        value = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest {phase} run emitted no valid JSON "
+            f"execution record: {exc}"
+        )
+    if not isinstance(value, dict):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest {phase} execution record is not an object"
+        )
+    total = value.get("numTotalTests")
+    failed = value.get("numFailedTests")
+    if not (
+        isinstance(total, int)
+        and not isinstance(total, bool)
+        and isinstance(failed, int)
+        and not isinstance(failed, bool)
+        and total > 0
+        and 0 <= failed <= total
+    ):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest {phase} run did not prove that any "
+            "named test executed"
+        )
+    return total, failed
+
+
 def runner_probe_timeout() -> int:
     """Bound the per-candidate runner identification probe.
 
@@ -1560,37 +1893,12 @@ def execute_mutation_proof(
 
     proof_id = hashlib.sha256(label.encode()).hexdigest()[:10]
     proof_dir = proof_root / f"proof-{proof_id}"
-    create_proof_checkout(review_dir, proof_dir, head_sha, label, deadline)
 
-    baseline_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
-    # Order is load-bearing: test_arguments must run first so an absent runner is
-    # refused as absent, and a `direct` target as non-executable, rather than as
-    # an unclassified runner. Swapping these two lines changes the refusal a
-    # reviewer sees for a runner that is both absent and unclassified.
-    baseline_argv = test_arguments(invocation, test_path, proof_dir, label)
-    require_classified_runner(invocation["runner"], label)
-    baseline = run_sandboxed(
-        baseline_argv,
-        cwd=proof_dir,
-        profile_path=baseline_profile,
-        allow_network=False,
-        allow_posix_ipc=False,
-        env=proof_environment(),
-        timeout=evidence_command_timeout(
-            deadline, evidence_timeout(), f"{label} baseline test"
-        ),
-        description=f"{label} baseline test",
-    )
-    require_test_execution(baseline, invocation["runner"], label, "baseline")
-    require(
-        baseline.returncode == 0,
-        f"{label} named test does not pass before mutation: it ran and exited "
-        f"{baseline.returncode} in a fresh clone holding tracked files only: "
-        f"{(baseline.stdout + baseline.stderr).strip()[:1000] or 'no output'}",
-    )
-    remove_proof_checkout(proof_dir, label)
+    # Apply once before either proof run so the implementation paths themselves,
+    # not a repository-global setting or the reviewer prompt, select the test
+    # system. This inspection checkout is destroyed before the baseline.
     create_proof_checkout(review_dir, proof_dir, head_sha, label, deadline)
-    applied = run_command(
+    inspected_apply = run_command(
         [
             "git",
             "-C",
@@ -1599,9 +1907,12 @@ def execute_mutation_proof(
             "--whitespace=nowarn",
             str(patch_path),
         ],
-        timeout=evidence_command_timeout(deadline, 60, f"{label} mutation apply"),
+        timeout=evidence_command_timeout(deadline, 60, f"{label} mutation inspection"),
     )
-    require(applied.returncode == 0, f"{label} mutation patch does not apply")
+    require(
+        inspected_apply.returncode == 0,
+        f"{label} mutation patch does not apply",
+    )
     changed = git(
         proof_dir,
         "diff",
@@ -1622,11 +1933,99 @@ def execute_mutation_proof(
         f"{label} mutation changes test or evidence support: "
         + ", ".join(test_support),
     )
+    javascript_project = javascript_mutation_route(
+        review_dir,
+        changed,
+        test_file,
+        invocation["runner"],
+        label,
+    )
+    remove_proof_checkout(proof_dir, label)
 
+    create_proof_checkout(review_dir, proof_dir, head_sha, label, deadline)
+    baseline_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
+    if javascript_project is not None:
+        baseline_argv, baseline_cwd = prepare_jest_invocation(
+            proof_dir,
+            javascript_project,
+            test_path,
+            label,
+            deadline,
+        )
+    else:
+        # Order is load-bearing: test_arguments must run first so an absent
+        # runner is refused as absent, and a `direct` target as non-executable,
+        # rather than as an unclassified runner.
+        baseline_argv = test_arguments(invocation, test_path, proof_dir, label)
+        require_classified_runner(invocation["runner"], label)
+        baseline_cwd = proof_dir
+    baseline = run_sandboxed(
+        baseline_argv,
+        cwd=baseline_cwd,
+        profile_path=baseline_profile,
+        allow_network=False,
+        allow_posix_ipc=False,
+        env=proof_environment(),
+        timeout=evidence_command_timeout(
+            deadline, evidence_timeout(), f"{label} baseline test"
+        ),
+        description=f"{label} baseline test",
+    )
+    require_test_execution(baseline, invocation["runner"], label, "baseline")
+    if javascript_project is not None:
+        _, baseline_failed = jest_execution_summary(
+            baseline, label, "baseline"
+        )
+        require(
+            baseline_failed == 0,
+            f"{label} named Jest test reports failures before mutation",
+        )
+    require(
+        baseline.returncode == 0,
+        f"{label} named test does not pass before mutation: it ran and exited "
+        f"{baseline.returncode} in a fresh clone holding tracked files only: "
+        f"{(baseline.stdout + baseline.stderr).strip()[:1000] or 'no output'}",
+    )
+
+    remove_proof_checkout(proof_dir, label)
+    create_proof_checkout(review_dir, proof_dir, head_sha, label, deadline)
+    applied = run_command(
+        [
+            "git",
+            "-C",
+            str(proof_dir),
+            "apply",
+            "--whitespace=nowarn",
+            str(patch_path),
+        ],
+        timeout=evidence_command_timeout(deadline, 60, f"{label} mutation apply"),
+    )
+    require(applied.returncode == 0, f"{label} mutation patch does not apply")
+    mutated_changed = git(
+        proof_dir,
+        "diff",
+        "--name-only",
+        timeout=evidence_command_timeout(deadline, 60, f"{label} mutated diff"),
+    ).splitlines()
+    require(
+        mutated_changed == changed,
+        f"{label} mutation changed a different path set between proof checkouts",
+    )
+    if javascript_project is not None:
+        mutated_argv, mutated_cwd = prepare_jest_invocation(
+            proof_dir,
+            javascript_project,
+            test_path,
+            label,
+            deadline,
+        )
+    else:
+        mutated_argv = test_arguments(invocation, test_path, proof_dir, label)
+        mutated_cwd = proof_dir
     mutated_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
     mutated = run_sandboxed(
-        test_arguments(invocation, test_path, proof_dir, label),
-        cwd=proof_dir,
+        mutated_argv,
+        cwd=mutated_cwd,
         profile_path=mutated_profile,
         allow_network=False,
         allow_posix_ipc=False,
@@ -1637,8 +2036,7 @@ def execute_mutation_proof(
         description=f"{label} mutated test",
     )
     require_test_execution(mutated, invocation["runner"], label, "mutated")
-    require(mutated.returncode != 0, f"{label} named test still passes after mutation")
-    return {
+    proof = {
         "test_path": test_path,
         "test_invocation": invocation,
         "mutation_patch_sha256": hashlib.sha256(patch_text.encode("utf-8")).hexdigest(),
@@ -1648,6 +2046,17 @@ def execute_mutation_proof(
         "baseline_output": (baseline.stdout + baseline.stderr)[:MAX_CAPTURE],
         "mutated_output": (mutated.stdout + mutated.stderr)[:MAX_CAPTURE],
     }
+    if javascript_project is not None:
+        _, mutated_failed = jest_execution_summary(mutated, label, "mutated")
+        if mutated.returncode == 0 or mutated_failed == 0:
+            raise CrosscheckCoverageError(
+                f"{label} named Jest test still passes after the implementation "
+                "mutation, so the claimed fix remains blocking",
+                proof,
+            )
+        return proof
+    require(mutated.returncode != 0, f"{label} named test still passes after mutation")
+    return proof
 
 
 def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
@@ -1795,7 +2204,7 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
         require_exact_keys(run, run_keys, label)
         require(
             run.get("state")
-            in {"clear", "blocking", "unreviewed", "tool-failure"},
+            in {"clear", "blocking", "cannot-certify", "unreviewed", "tool-failure"},
             f"{label}.state is invalid",
         )
         require_string(run.get("at"), f"{label}.at")
@@ -2380,8 +2789,9 @@ A prior finding is verified-fixed only when you name a tracked test, provide a s
 The mutation may change only implementation paths already cited by that finding.
 The gate appends the named test path to the approved runner invocation, destroys all baseline state, and recreates the same clean checkout path before applying the mutation.
 test_path may be a plain repository path, or a `path::selector` node id when the runner is one of: {', '.join(sorted(NODE_ID_RUNNERS))}.
-The proof checkout is a fresh clone holding tracked files only, so name a runner installed on PATH there; a runner that is absent, or a selector that matches no test, is reported as a non-execution rather than a test result and clears nothing.
-A mutation proof may name only a runner whose non-execution signal the gate has measured, currently: {', '.join(sorted(RUNNER_NON_EXECUTION_EXITS))}. On any other runner the gate cannot tell a test that caught the mutation from one that never ran, so it refuses to certify the fix rather than guess.
+The proof checkout starts as a fresh clone holding tracked files only.
+For Python implementation mutations, keep using pytest; a runner that is absent or a selector that matches no test is reported as a non-execution rather than a test result and clears nothing.
+For JavaScript or TypeScript implementation mutations, use the Jest or Vitest system declared by the nearest package.json that governs both changed implementation and named test. The gate currently has a positive execution protocol for Jest: it materializes lockfile-pinned dependencies offline when needed, runs only the named tracked test, and requires machine-readable evidence that tests actually executed. A package governed by another system, an ambiguous mixed-language mutation, or an unavailable offline environment is reported as CANNOT-CERTIFY and never as CLEAR.
 A mutation proof takes no runner arguments at all: test_invocation.arguments must be empty, and any entry is refused by name. The gate reads the mutated exit status through the runner's default semantics, which a flag can change, and test_path is the only target it validates as tracked, symlink-free, and unreachable by your mutation patch.
 Both proof runs also execute under an environment the gate constructs from a fixed allowlist rather than the one it was launched with, so no ambient variable can alter those exit semantics; name a test that needs nothing beyond PATH, HOME, and the locale.
 The gate also writes a neutral pytest.ini above its own checkouts, so runner configuration from directories above them is inert; configuration tracked inside the repository still applies.
@@ -3154,15 +3564,20 @@ def apply_review(
             )
         if status == "verified-fixed":
             require(mutation is not None, f"{label} needs executed mutation proof")
-            proof = execute_mutation_proof(
-                mutation,
-                review_dir,
-                snapshot_value["head_sha"],
-                proof_root,
-                {citation["path"] for citation in by_id[target]["citations"]},
-                f"{label}.mutation_proof",
-                evidence_deadline,
-            )
+            try:
+                proof = execute_mutation_proof(
+                    mutation,
+                    review_dir,
+                    snapshot_value["head_sha"],
+                    proof_root,
+                    {citation["path"] for citation in by_id[target]["citations"]},
+                    f"{label}.mutation_proof",
+                    evidence_deadline,
+                )
+            except CrosscheckCoverageError as exc:
+                status = "claimed-fixed"
+                proof = exc.proof
+                note = f"{note} Gate coverage result: {exc}"
             require(equivalent_to is None, f"{label}.equivalent_to must be null")
         elif status == "closed-equivalent":
             equivalent = require_string(equivalent_to, f"{label}.equivalent_to")
@@ -3288,8 +3703,8 @@ def append_failed_run(
     state: str,
 ) -> dict[str, Any]:
     require(
-        state in {"tool-failure", "unreviewed"},
-        "failed run state must be tool-failure or unreviewed",
+        state in {"cannot-certify", "tool-failure", "unreviewed"},
+        "failed run state must be cannot-certify, tool-failure, or unreviewed",
     )
     run = {
         "at": utc_now(),
@@ -3360,6 +3775,10 @@ def render_report(ledger: dict[str, Any], run: dict[str, Any]) -> str:
     if run["state"] == "tool-failure":
         lines.append(
             "Environment, metadata, or tooling prevented a reviewer verdict."
+        )
+    elif run["state"] == "cannot-certify":
+        lines.append(
+            "The reviewer completed, but no trustworthy mutation-certification route could run."
         )
     elif run["state"] == "unreviewed":
         lines.append("No valid review exists for this exact head.")
@@ -3703,6 +4122,13 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
         write_ledger(ledger_path, ledger)
         atomic_write(report_path, render_report(ledger, run), mode=0o644)
         raise
+    except CrosscheckCertificationError as exc:
+        run = append_failed_run(
+            ledger, snapshot_value, str(exc), config, "cannot-certify"
+        )
+        write_ledger(ledger_path, ledger)
+        atomic_write(report_path, render_report(ledger, run), mode=0o644)
+        raise
     except CrosscheckError as exc:
         run = append_failed_run(
             ledger, snapshot_value, str(exc), config, "unreviewed"
@@ -3766,6 +4192,11 @@ def verified_crosscheck_head(root: Path, home: Path, task_id: str, url: str) -> 
     if latest["state"] == "blocking":
         blocking_fail(
             "latest exact-head crosscheck attempt is blocking: "
+            f"{latest['summary']}"
+        )
+    if latest["state"] == "cannot-certify":
+        blocking_fail(
+            "latest exact-head crosscheck attempt cannot certify this change: "
             f"{latest['summary']}"
         )
     require(
@@ -3935,6 +4366,9 @@ def main() -> int:
         return 1
     except CrosscheckToolError as exc:
         print(f"CROSSCHECK TOOL-FAILURE: {exc}", file=sys.stderr)
+        return 1
+    except CrosscheckCertificationError as exc:
+        print(f"CROSSCHECK CANNOT-CERTIFY: {exc}", file=sys.stderr)
         return 1
     except CrosscheckError as exc:
         print(f"CROSSCHECK UNREVIEWED: {exc}", file=sys.stderr)

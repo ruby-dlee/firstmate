@@ -154,8 +154,9 @@ A run that used the local same-model relaxation records `reviewer.model_independ
 The readable report renders the same distinction before its summary.
 
 - `tool-failure` means environment, task metadata, reviewer configuration, exact-head fetch, executing-account binding, or required command-execution proof prevented a trustworthy verdict.
+- `cannot-certify` means a reviewer completed but the changed implementation's own test system had no trustworthy mutation-certification route the gate could execute.
 - `unreviewed` means a reviewer ran but no valid exact-head verdict artifact exists.
-- `blocking` means a completed reviewer with successful command-execution evidence declined clearance through a suspicion or admitted finding.
+- `blocking` means a completed reviewer with successful command-execution evidence declined clearance through a suspicion, admitted finding, or a named test that stayed green under its implementation mutation.
 - `clear` means a completed reviewer with successful command-execution evidence earned clearance and no durable blocker remains.
 
 CLI banners preserve the same distinction as `CROSSCHECK TOOL-FAILURE`, `CROSSCHECK UNREVIEWED`, and `CROSSCHECK BLOCKING`.
@@ -181,6 +182,10 @@ That inspection carries its own larger budget so such a state is refused by name
 A `verified-fixed` update must name a tracked test and provide an implementation-only patch under `.crosscheck/mutations/`.
 It supplies an approved test runner plus a structured argument array, never a free-form shell command.
 An approved runner is a NAME, and the gate resolves that name into an invocation rather than assuming a bare binary on `PATH`.
+Before either proof run, the gate applies the mutation in a disposable inspection checkout and selects the certification system from the mutated implementation paths themselves.
+A JavaScript or TypeScript mutation must resolve with its named test to one nearest tracked `package.json`, and that package's test script or dependencies must declare one unambiguous Jest or Vitest system.
+A mixed JavaScript/Python mutation, a test outside the changed package, an ambiguous declaration, or a proof naming a different runner is `CANNOT-CERTIFY`, never `CLEAR`.
+Python mutation behavior remains on its existing pytest route exactly as before.
 This matters because every Python repository in this fleet is uv-managed: a bare `pytest` is routinely absent there, while `uv run pytest` is the invocation that works, and `python3 -m pytest` cannot be expressed in the vocabulary at all because `python3` is a file runner whose command line puts the test path before its arguments.
 `pytest` therefore resolves through `uv run pytest`, then `python3 -m pytest`, then the bare binary.
 Order is load-bearing: inside a uv project a bare `pytest` can exist and resolve against a different environment than the repository uses, so finding it first would run the named test under an interpreter the project never selected.
@@ -200,32 +205,39 @@ The proof checkouts and the review checkout are both children of that root, so t
 This is not free: for a repository carrying no pytest config of its own, rootdir becomes the gate's temporary root instead of the checkout, which widens conftest discovery by that one empty gate-owned directory.
 The reviewed repository's own config still takes precedence, because it sits closer to the named test, and that surface stays deliberately accepted.
 The same rule is not applied when replaying a recorded proof, so a ledger written before it still loads; instead a recorded proof whose invocation carried arguments no longer certifies its finding, which reverts to blocking and can be re-proved in band by a fresh review.
-Crosscheck creates one clean checkout at the exact reviewed head, confirms the named test passes, destroys the entire checkout, recreates the same path from the exact head, applies the patch, and requires the same test to fail.
+Crosscheck destroys the mutation-inspection checkout, creates a clean baseline checkout at the exact reviewed head, confirms the named test passes, destroys that entire checkout, recreates the same path from the exact head, applies the patch, and requires the same test to fail.
 Destroying all readable baseline state before the mutated run prevents a test from manufacturing causality through a predictable sibling checkout.
+For Jest, each clean proof checkout uses the package-local runner.
+When `node_modules` is absent, the gate detects the project's declared Node major, selects a matching interpreter from the standard version-manager directories, and materializes dependencies from `package-lock.json` with `npm ci --offline --ignore-scripts` or from `pnpm-lock.yaml` with `pnpm install --offline --frozen-lockfile --ignore-scripts` inside the no-network proof sandbox.
+A cold dependency cache, missing lockfile, unavailable package manager or Node version, unsupported Vitest route, or missing package-local Jest binary is `CANNOT-CERTIFY` and never a test verdict.
+The gate invokes Jest with its own fixed `--runInBand --runTestsByPath --ci --no-cache --json` protocol and accepts a fix only when the baseline JSON reports at least one executed passing test and the mutated JSON reports at least one executed failing test.
+A Jest test that executes and stays green under the mutation is durably downgraded to `claimed-fixed`, keeping the finding and the run `blocking` instead of turning inadequate coverage into an infrastructure outcome.
 Proof sandboxes also omit shared POSIX IPC and give each run private writable temporary and cache state, while shared host temporary directories remain outside the write policy.
 The named test must be a canonical tracked regular file; symlinks are rejected so a patch cannot mutate the executed target through an unchanged alias.
 Symlink rejection is anchored at the resolved review checkout, so a symlink inside the repository is still refused while a symlinked ancestor above the firstmate home is not mistaken for one.
 `test_path` may also be a `path::selector` node id for a runner that accepts one; every path-shaped check reads the part before `::` while the runner receives the full selector.
 The gate positions the tracked test path itself as the interpreter script or test-framework target; generic command launchers are not approved runners.
 A run that never reached the named test is not a test result in either direction.
-The gate resolves the named runner to an absolute executable before launching, and treats an absent runner, a failed sandbox exec, and a runner-reported non-execution (pytest's usage and no-tests-collected statuses, for instance) as named non-executions.
+The gate resolves the named runner to an absolute executable before launching, and treats an absent runner, a failed sandbox exec, and a runner-reported non-execution as named non-executions.
 That matters in both directions: such a status must not condemn a baseline run, and must not vindicate a mutated one, because a mutation that merely broke collection would otherwise read as a caught regression.
-Because that reading is only safe where the non-execution signal has actually been measured, a mutation proof may name only a runner the gate classifies - `pytest` today - and any other runner is refused by name rather than certified on a status the gate would have to guess at.
-The proof checkout is a fresh clone carrying tracked files only, so a runner that lives solely in an untracked virtualenv is absent there.
+Pytest uses the gate's measured usage and no-tests-collected exit statuses; Jest uses positive machine-readable executed-test counts instead of inferring execution from its exit code.
+Every other runner remains unable to certify until it has its own positive or measured non-execution protocol.
+The proof checkout starts as a fresh clone carrying tracked files only, and any language environment it needs must be reconstructed through the bounded routes above.
 The patch may modify only non-test implementation paths already cited by the durable finding.
 It cannot modify the named test, conventional test trees, fixtures, or Crosscheck evidence support.
 
-### Known limitation: the mutated exit status is an inference, not proof
+### Known Python limitation: the mutated pytest exit status is an inference, not proof
 
-Read the four guards above together and the shape of the real problem is visible.
-The gate concludes "the named test detected the regression" from one fact: the mutated run exited non-zero.
+The Jest route uses positive JSON execution counts and does not share this limitation.
+Read the four Python guards above together and the shape of the remaining problem is visible.
+The pytest route concludes "the named test detected the regression" from one fact: the mutated run exited non-zero.
 That status is not a property of the test alone. It is influenced by reviewer-supplied argv, by the ambient environment, by repository and ancestor configuration, and by the runner's own version, and each of those four channels was closed only after it was found - a positional second target, a collection-error flag, `PYTEST_ADDOPTS`, and an ancestor ini file.
 An installed runner plugin is a known and accepted fifth door.
 Closing channels one at a time is unbounded work with no completion criterion, so the list above should be read as hardening, not as a proof of soundness.
 
 The planned replacement is POSITIVE PROOF OF EXECUTION: requiring the mutated run to demonstrate that the named test actually ran, rather than inferring it from an exit code.
 The leading candidate is a control test - a second tracked test the mutation should not affect, required to PASS while the named test fails - because it needs no per-runner knowledge and no enumeration of the ways a status can be rewritten.
-Until that lands, the exit-status inference remains this gate's weakest link, and the four closed channels do not make it sound.
+Until that lands, the pytest exit-status inference remains this gate's weakest link, and the four closed channels do not make it sound.
 
 ## Refusal and liveness
 
@@ -255,6 +267,7 @@ The two are distinguished by evidence of model work: a Claude result envelope wi
 Recording that as `unreviewed` also manufactured a suspicion in the ledger, which reads like the reviewer raised a concern about the change when it had not started.
 Failure banners quote what the reviewer actually reported - for Claude the envelope's `result`, `subtype`, `terminal_reason`, `api_error_status`, and any permission denials, plus captured stderr - rather than a fixed-length excerpt of the raw envelope, because the sentence that explains a failure sits past the point such an excerpt stops.
 A timeout, or a reviewer that reached the model and then produced a missing, empty, malformed, or wrong-head artifact, records an `unreviewed` attempt and exits nonzero.
+A completed review whose changed implementation has no executable mutation-certification route records `cannot-certify`, names the exact missing route, and exits nonzero without fabricating either a code verdict or a pass.
 An unresolved suspicion comes from a completed reviewer and records a `blocking` attempt instead of being conflated with an invalid review artifact.
 This includes provider refusals that surface only as a stopped or silent agent.
 `bin/fm-crosscheck.sh` refuses earlier than any of these when it cannot resolve a Python 3.11 or newer interpreter for `fm-crosscheck.py`: it prints a `CROSSCHECK UNREVIEWED` banner naming the requested and discovered versions, exits nonzero, and records no ledger run because nothing about the PR was examined.
@@ -297,6 +310,9 @@ The read adapter exposes no merge subcommand; only the gate-refused `fm-crossche
 The installed reviewer invocation was exercised successfully with `--output-schema`, `--output-last-message`, `--model gpt-5.6-sol`, and `model_reasoning_effort="xhigh"` before production code used those flags.
 The installed Claude invocation was exercised successfully with a private `HOME`, selected-account `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `--model claude-opus-5`, `--effort xhigh`, `--dangerously-skip-permissions`, `--tools Bash,Read,Glob,Grep`, `--no-session-persistence`, `--output-format json`, and `--json-schema` before production code used those flags.
 The installed `/usr/bin/sandbox-exec` was also exercised with the generated profile: a write inside the allowed review directory succeeded, while sibling and `/private/tmp` writes failed with `Operation not permitted`.
+On 2026-08-09 the Jest mutation route was exercised at relvino PR 1049 head `5649c234b0f258cde4d62870759e353fade5ff3d` in a fresh exact-head clone.
+The gate selected Node 20.20.2 for the package's `20.x` declaration, used npm 10.8.2 and the tracked package lock to materialize Jest 29.7.0 offline with lifecycle scripts disabled, and ran the fixed `--runInBand --runTestsByPath --ci --no-cache --json` protocol under the no-network sandbox.
+The tracked `V3PreviewPane.test.tsx` reported 33 executed and zero failed tests at baseline; replacing the session key with one shared key reported the same 33 executed tests with two failures, so the result demonstrated positive mutation detection rather than a runner-status inference.
 
 ## Validation evidence boundaries
 
@@ -309,6 +325,9 @@ The retained live runtime proof is the change receipt for this patch; the opt-in
 Its `test_pytest_runner_resolves_through_a_uv_aware_ladder` case is the named regression for runner-name resolution: it pins monorepo uv-project discovery, the skipped uv rung outside a project, the unchanged absent-runner refusal, and pytest's retained node-id support.
 Its `test_account_less_known_provider_lane_is_reviewable` case is the named regression for an account-less Pi lane whose provider-slot identity is unreadable: it requires a cross-provider reviewer to clear it and a same-provider reviewer to remain refused.
 Its `test_same_model_relaxation_requires_proven_separate_account` case provides a readable routed Pi slot and proves that default and explicit-off policy reject the same model, opt-in still rejects the same or unreadable reviewer account, and only a distinct OpenAI account becomes eligible.
+Its `test_typescript_jest_mutation_proof_can_clear` and `test_inadequate_typescript_jest_coverage_stays_blocking` cases prove that package-governed Jest coverage can certify a TypeScript fix while a named Jest test that stays green under mutation keeps the finding blocking.
+Its `test_typescript_without_usable_route_is_cannot_certify` case proves that an unsupported package-governed route writes and reports `CANNOT-CERTIFY` rather than silently clearing or manufacturing a code verdict.
+Its `test_python_mutation_proof_is_byte_exact` case compares the complete normalized Python proof record to the pre-Jest shape so the new language route cannot drift existing pytest evidence.
 Its `test_claude_execution_home_always_binds_the_keychain` case is the named regression for the private-`HOME` Keychain bind, and it fails if the bind is made conditional on `.credentials.json` again.
 Its `test_moved_default_branch_stays_reviewable` case is the named regression for base drift: it advances the fake default branch past the PR's branch point, then requires the run to review against the merge base, record it, and still verify.
 Its `test_unavailable_reviewer_fails_over_to_the_next_account` case covers reviewer failover using the observed zero-turn Claude error envelope, and asserts the ledger records the abandoned attempt with the reason the reviewer reported rather than a truncated envelope.

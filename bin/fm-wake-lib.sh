@@ -74,10 +74,11 @@ print(session)
 ' "$pid"
 }
 
-fm_session_snapshot() {  # <session-id> [excluded-root-pid]
-  local session=$1 excluded=${2:-}
+fm_session_snapshot() {  # <session-id> [excluded-pid] [tree|exact]
+  local session=$1 excluded=${2:-} exclusion_mode=${3:-tree}
   case "$session" in ''|*[!0-9]*) return 1 ;; esac
   case "$excluded" in *[!0-9]*) return 1 ;; esac
+  [ "$exclusion_mode" = tree ] || [ "$exclusion_mode" = exact ] || return 1
   python3 -c '
 import ctypes
 import os
@@ -87,6 +88,7 @@ import time
 
 session = int(sys.argv[1])
 excluded = int(sys.argv[2]) if sys.argv[2] else None
+exclude_tree = sys.argv[3] == "tree"
 enumerator = os.getpid()
 enumerator_caller = os.getppid()
 libc = ctypes.CDLL(None, use_errno=True)
@@ -117,11 +119,11 @@ if (
         time.sleep(0.01)
 
 def in_excluded_tree(pid):
-    if pid == enumerator_caller:
+    if pid == enumerator_caller or (excluded is not None and pid == excluded):
         return True
     seen = set()
     while pid not in seen:
-        if pid == enumerator or (excluded is not None and pid == excluded):
+        if pid == enumerator or (exclude_tree and excluded is not None and pid == excluded):
             return True
         seen.add(pid)
         process = processes.get(pid)
@@ -133,7 +135,7 @@ def in_excluded_tree(pid):
 for pid, (_, state) in processes.items():
     if "Z" not in state and not in_excluded_tree(pid) and libc.getsid(pid) == session:
         print(pid)
-' "$session" "$excluded"
+' "$session" "$excluded" "$exclusion_mode"
 }
 
 fm_session_has_live_processes() {  # <session-id>
@@ -142,9 +144,9 @@ fm_session_has_live_processes() {  # <session-id>
   [ -n "$members" ]
 }
 
-fm_session_has_live_processes_except() {  # <session-id> <excluded-pid>
-  local session=$1 excluded=$2 pid snapshot
-  snapshot=$(fm_session_snapshot "$session" "$excluded") || return 2
+fm_session_has_live_processes_except() {  # <session-id> <excluded-pid> [tree|exact]
+  local session=$1 excluded=$2 exclusion_mode=${3:-tree} pid snapshot
+  snapshot=$(fm_session_snapshot "$session" "$excluded" "$exclusion_mode") || return 2
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     [ "$pid" = "$excluded" ] || return 0
@@ -152,11 +154,11 @@ fm_session_has_live_processes_except() {  # <session-id> <excluded-pid>
   return 1
 }
 
-fm_session_wait_quiescent_except() {  # <session-id> <excluded-pid> [wait-tenths]
-  local session=$1 excluded=$2 wait_tenths=${3:-20} iteration=0 status empty_streak=0
+fm_session_wait_quiescent_except() {  # <session-id> <excluded-pid> [wait-tenths] [tree|exact]
+  local session=$1 excluded=$2 wait_tenths=${3:-20} exclusion_mode=${4:-tree} iteration=0 status empty_streak=0
   while [ "$iteration" -lt "$wait_tenths" ]; do
     status=0
-    fm_session_has_live_processes_except "$session" "$excluded" || status=$?
+    fm_session_has_live_processes_except "$session" "$excluded" "$exclusion_mode" || status=$?
     case "$status" in
       0) empty_streak=0 ;;
       1)
@@ -171,10 +173,10 @@ fm_session_wait_quiescent_except() {  # <session-id> <excluded-pid> [wait-tenths
   return 1
 }
 
-fm_session_signal_members() {  # <signal> <session-id> [excluded-pid]
-  local signal=$1 session=$2 excluded=${3:-} pid identity index snapshot
+fm_session_signal_members() {  # <signal> <session-id> [excluded-pid] [tree|exact]
+  local signal=$1 session=$2 excluded=${3:-} exclusion_mode=${4:-tree} pid identity index snapshot
   local pids=() identities=()
-  snapshot=$(fm_session_snapshot "$session" "$excluded") || return 1
+  snapshot=$(fm_session_snapshot "$session" "$excluded" "$exclusion_mode") || return 1
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     identity=$(fm_pid_identity "$pid") || continue
@@ -190,17 +192,17 @@ fm_session_signal_members() {  # <signal> <session-id> [excluded-pid]
   done
 }
 
-fm_session_stop_owned_except() {  # <session-id> <excluded-pid> [term-wait-tenths]
-  local session=$1 excluded=$2 wait_tenths=${3:-30} iteration status empty_streak=0 excluded_identity=
+fm_session_stop_owned_except() {  # <session-id> <excluded-pid> [term-wait-tenths] [tree|exact]
+  local session=$1 excluded=$2 wait_tenths=${3:-30} exclusion_mode=${4:-tree} iteration status empty_streak=0 excluded_identity=
   if [ -n "$excluded" ]; then
     excluded_identity=$(fm_pid_identity "$excluded") || return 1
     [ "$(fm_pid_session "$excluded" 2>/dev/null || true)" = "$session" ] || return 1
   fi
-  fm_session_signal_members TERM "$session" "$excluded" || return 1
+  fm_session_signal_members TERM "$session" "$excluded" "$exclusion_mode" || return 1
   iteration=0
   while [ "$iteration" -lt "$wait_tenths" ]; do
     status=0
-    fm_session_has_live_processes_except "$session" "$excluded" || status=$?
+    fm_session_has_live_processes_except "$session" "$excluded" "$exclusion_mode" || status=$?
     case "$status" in
       0)
         if [ "$empty_streak" -gt 0 ] && [ -z "$excluded_identity" ]; then
@@ -225,11 +227,11 @@ fm_session_stop_owned_except() {  # <session-id> <excluded-pid> [term-wait-tenth
         [ "$(fm_pid_identity "$excluded" 2>/dev/null || true)" = "$excluded_identity" ] || return 1
         [ "$(fm_pid_session "$excluded" 2>/dev/null || true)" = "$session" ] || return 1
       fi
-      fm_session_signal_members KILL "$session" "$excluded" || return 1
+      fm_session_signal_members KILL "$session" "$excluded" "$exclusion_mode" || return 1
     fi
     sleep 0.1
     status=0
-    fm_session_has_live_processes_except "$session" "$excluded" || status=$?
+    fm_session_has_live_processes_except "$session" "$excluded" "$exclusion_mode" || status=$?
     case "$status" in
       0)
         if [ "$empty_streak" -gt 0 ] && [ -z "$excluded_identity" ]; then
@@ -502,11 +504,11 @@ fm_session_stop_claim_dir() {  # <claim-dir> <session-id>
   fm_stop_claim_dir "$1" "$2" session
 }
 
-fm_session_stop_claim_complete_dir() {  # <claim-dir> <session-id> <excluded-pid>
-  local confined=$1 session=$2 excluded=$3 stopper stopper_identity helper
+fm_session_stop_claim_complete_dir() {  # <claim-dir> <session-id> <excluded-pid> [tree|exact]
+  local confined=$1 session=$2 excluded=$3 exclusion_mode=${4:-tree} stopper stopper_identity helper
   [ -n "$FM_WATCHER_STOP_CLAIM_ID" ] || return 1
   [ "$FM_WATCHER_STOP_CLAIM_KIND" = session ] || return 1
-  fm_session_wait_quiescent_except "$session" "$excluded" 20 || return 1
+  fm_session_wait_quiescent_except "$session" "$excluded" 20 "$exclusion_mode" || return 1
   stopper=${BASHPID:-$$}
   stopper_identity=$(fm_pid_identity "$stopper") || return 1
   helper="$FM_WAKE_LIB_DIR/fm-watcher-stop-claim.py"
@@ -515,12 +517,51 @@ fm_session_stop_claim_complete_dir() {  # <claim-dir> <session-id> <excluded-pid
     "$FM_WATCHER_STOP_CLAIM_ID"
 }
 
-fm_session_stop_claim_completed_dir() {  # <claim-dir> <session-id> <excluded-pid>
-  local confined=$1 session=$2 excluded=$3 helper
+fm_session_stop_claim_completed_dir() {  # <claim-dir> <session-id> <excluded-pid> [tree|exact]
+  local confined=$1 session=$2 excluded=$3 exclusion_mode=${4:-tree} helper
   helper="$FM_WAKE_LIB_DIR/fm-watcher-stop-claim.py"
   "$helper" completed "$confined" "$session" \
     "$FM_WAKE_LIB_DIR/fm-process-identity.py" || return 1
-  fm_session_wait_quiescent_except "$session" "$excluded" 2
+  fm_session_wait_quiescent_except "$session" "$excluded" 2 "$exclusion_mode"
+}
+
+fm_watcher_lock_session_claimed_drain() {  # <state> <watch-path> <home> <session-id> <root-identity> <excluded-pid> <tree|exact> <claim-dir> [term-wait-tenths]
+  local state=$1 watch_path=$2 home=$3 session=$4 root_identity=$5 excluded=$6
+  local exclusion_mode=$7 claim_dir=$8 wait_tenths=${9:-30} lockdir confined expected
+  lockdir="$state/.watch.lock"
+  [ "$exclusion_mode" = tree ] || [ "$exclusion_mode" = exact ] || return 1
+  if [ -L "$lockdir" ]; then
+    confined=$(fm_lock_link_owner "$lockdir") || return 1
+  else
+    confined=$(fm_lock_confined_target "$lockdir" "$lockdir") || return 1
+  fi
+  expected=$(fm_lock_confined_target "$lockdir" "$claim_dir") || return 1
+  [ "$confined" = "$expected" ] || return 1
+  [ -L "$lockdir" ] && fm_lock_points_to_owner "$lockdir" "$expected" || return 1
+  fm_watcher_lock_session_proof_matches "$state" "$watch_path" "$home" "$session" \
+    || return 1
+  [ "$(cat "$confined/pid-identity" 2>/dev/null || true)" = "$root_identity" ] \
+    || return 1
+  fm_watcher_lock_session_stop_claim "$state" "$session" || return 1
+  fm_session_stop_owned_except "$session" "$excluded" "$wait_tenths" "$exclusion_mode" \
+    || return 1
+  [ -L "$lockdir" ] && fm_lock_points_to_owner "$lockdir" "$expected" || return 1
+  fm_watcher_lock_session_proof_matches "$state" "$watch_path" "$home" "$session" \
+    || return 1
+  [ "$(cat "$confined/pid-identity" 2>/dev/null || true)" = "$root_identity" ] \
+    || return 1
+  fm_session_stop_claim_complete_dir "$confined" "$session" "$excluded" "$exclusion_mode" \
+    || return 1
+  [ -L "$lockdir" ] && fm_lock_points_to_owner "$lockdir" "$expected" || return 1
+  fm_watcher_lock_session_proof_matches "$state" "$watch_path" "$home" "$session" \
+    || return 1
+  [ "$(cat "$confined/pid-identity" 2>/dev/null || true)" = "$root_identity" ] \
+    || return 1
+  fm_session_stop_claim_completed_dir "$confined" "$session" "$excluded" "$exclusion_mode" \
+    || return 1
+  [ -L "$lockdir" ] && fm_lock_points_to_owner "$lockdir" "$expected" || return 1
+  fm_watcher_lock_session_proof_matches "$state" "$watch_path" "$home" "$session" \
+    && [ "$(cat "$confined/pid-identity" 2>/dev/null || true)" = "$root_identity" ]
 }
 
 fm_watcher_lock_session_stop_claim() {  # <state> <session-id>

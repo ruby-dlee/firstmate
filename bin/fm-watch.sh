@@ -1273,25 +1273,24 @@ if [ -n "$watcher_owner_fifo" ]; then
   done
   if [ "$watcher_owner_setup_status" -ne 0 ]; then
     if [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
+      && [ -n "${FM_WATCH_OWNER_TEST_SETUP_FAILURE_READY:-}" ] \
+      && [ -n "${FM_WATCH_OWNER_TEST_SETUP_FAILURE_PROCEED:-}" ]; then
+      : > "$FM_WATCH_OWNER_TEST_SETUP_FAILURE_READY"
+      while [ ! -e "$FM_WATCH_OWNER_TEST_SETUP_FAILURE_PROCEED" ]; do sleep 0.01; done
+    fi
+    watcher_owner_wait_pid=$watcher_owner_link_pid
+    if [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
       && [ -n "${FM_WATCH_OWNER_TEST_REUSED_MONITOR_PID:-}" ]; then
       watcher_owner_link_pid=$FM_WATCH_OWNER_TEST_REUSED_MONITOR_PID
     fi
     watcher_owner_cleanup_complete=false
-    watcher_owner_stop_claimed=false
-    if fm_watcher_lock_session_stop_claim "$STATE" "$WATCHER_PID"; then
-      watcher_owner_stop_claimed=true
-    fi
-    if "$watcher_owner_stop_claimed" && fm_watcher_lock_stop_session_anchor \
-      "$STATE" "$WATCHER_PID" "$watcher_owner_link_pid" 30; then
-      watcher_owner_cleanup_complete=true
-    elif "$watcher_owner_stop_claimed" && [ -n "$watcher_owner_link_identity" ] \
-      && fm_pid_stop_identity "$watcher_owner_link_pid" "$watcher_owner_link_identity" 30; then
-      watcher_owner_cleanup_complete=true
-    elif ! fm_pid_alive "$watcher_owner_link_pid"; then
+    if fm_watcher_lock_session_claimed_drain \
+      "$STATE" "$WATCH_PATH" "$FM_HOME" "$WATCHER_PID" \
+      "$watcher_session_identity" "$WATCHER_PID" exact "$watcher_owner_dir" 30; then
       watcher_owner_cleanup_complete=true
     fi
     if "$watcher_owner_cleanup_complete"; then
-      wait "$watcher_owner_link_pid" 2>/dev/null || true
+      wait "$watcher_owner_wait_pid" 2>/dev/null || true
       rm -f "$WATCH_LOCK/process-session" "$WATCH_LOCK/session-anchor" \
         "$WATCH_LOCK/session-anchor.pending" "$WATCH_LOCK/session-anchor-pid" \
         "$WATCH_LOCK/session-anchor-identity" 2>/dev/null || true

@@ -161,6 +161,12 @@ stop_recorded_watcher() {  # <root-pid> <root-identity>
       FM_WATCH_STOP_FAILURE=session-claim
       return 1
     }
+    if [ "${FM_WATCH_SESSION_CLAIM_TEST_HOOKS:-}" = firstmate-session-claim-tests-v1 ] \
+      && [ -n "${FM_WATCH_SESSION_CLAIM_TEST_READY:-}" ] \
+      && [ -n "${FM_WATCH_SESSION_CLAIM_TEST_PROCEED:-}" ]; then
+      : > "$FM_WATCH_SESSION_CLAIM_TEST_READY"
+      while [ ! -e "$FM_WATCH_SESSION_CLAIM_TEST_PROCEED" ]; do sleep 0.01; done
+    fi
     fm_watcher_lock_session_anchor_read "$STATE" || true
     anchor=$FM_WATCHER_SESSION_ANCHOR_PID
     anchor_identity=$FM_WATCHER_SESSION_ANCHOR_IDENTITY

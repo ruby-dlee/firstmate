@@ -15,6 +15,7 @@ RECORD_NAMES = (
     "fm-home",
     "watcher-path",
     "session-anchor",
+    "session-anchor.pending",
     "session-anchor-pid",
     "session-anchor-identity",
 )

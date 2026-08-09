@@ -1817,6 +1817,115 @@ test_monitor_startup_cleanup_refuses_reused_pid() {
   pass "monitor startup cleanup refuses a reused PID"
 }
 
+test_monitor_setup_failure_preserves_live_restart_claim() {
+  local dir state fakebin first_out restart_out publish_ready publish_proceed setup_ready setup_proceed claim_ready claim_proceed first_arm restart_arm old_watcher old_session monitor_pid owner_dir claim_before anchor_before status i new_watcher members member
+  dir=$(make_case monitor-setup-live-restart)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  first_out="$dir/first-arm.out"
+  restart_out="$dir/restart-arm.out"
+  publish_ready="$dir/publish.ready"
+  publish_proceed="$dir/publish.proceed"
+  setup_ready="$dir/setup-failure.ready"
+  setup_proceed="$dir/setup-failure.proceed"
+  claim_ready="$dir/restart-claim.ready"
+  claim_proceed="$dir/restart-claim.proceed"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_ARM_CONFIRM_TIMEOUT=20 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_PUBLISH_READY="$publish_ready" \
+    FM_WATCH_OWNER_TEST_PUBLISH_PROCEED="$publish_proceed" \
+    FM_WATCH_OWNER_TEST_SETUP_FAILURE_READY="$setup_ready" \
+    FM_WATCH_OWNER_TEST_SETUP_FAILURE_PROCEED="$setup_proceed" \
+    "$WATCH_ARM" > "$first_out" &
+  first_arm=$!
+  i=0
+  while [ "$i" -lt 120 ]; do
+    [ -e "$publish_ready" ] && [ -e "$setup_ready" ] && break
+    is_live_non_zombie "$first_arm" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$publish_ready" ] && [ -e "$setup_ready" ] \
+    || fail "watcher did not reach monitor setup failure with a staged anchor: $(cat "$first_out")"
+  old_watcher=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  old_session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
+  monitor_pid=$(sed -n '1s/^pid=//p' "$state/.watch.lock/session-anchor.pending" 2>/dev/null || true)
+  owner_dir=$(readlink "$state/.watch.lock" 2>/dev/null || true)
+  anchor_before=$(cat "$owner_dir/session-anchor.pending" 2>/dev/null || true)
+  case "$old_watcher:$old_session:$monitor_pid" in
+    *[!0-9:]*) fail "monitor setup failure omitted numeric session ownership proof" ;;
+  esac
+  [ -n "$old_watcher" ] && [ "$old_watcher" = "$old_session" ] && [ -n "$monitor_pid" ] \
+    && [ -d "$owner_dir" ] && [ -n "$anchor_before" ] \
+    || fail "monitor setup failure did not retain its staged ownership proof"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_ARM_CONFIRM_TIMEOUT=20 \
+    FM_WATCH_SESSION_CLAIM_TEST_HOOKS=firstmate-session-claim-tests-v1 \
+    FM_WATCH_SESSION_CLAIM_TEST_READY="$claim_ready" \
+    FM_WATCH_SESSION_CLAIM_TEST_PROCEED="$claim_proceed" \
+    "$WATCH_ARM" --restart > "$restart_out" 2>&1 &
+  restart_arm=$!
+  i=0
+  while [ "$i" -lt 120 ] && [ ! -e "$claim_ready" ]; do
+    is_live_non_zombie "$restart_arm" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$claim_ready" ] || {
+    touch "$setup_proceed" "$publish_proceed" "$claim_proceed"
+    kill -KILL "$first_arm" "$restart_arm" "$old_watcher" "$monitor_pid" 2>/dev/null || true
+    fail "restart did not acquire the monitor setup transaction: $(cat "$restart_out")"
+  }
+  claim_before=$(cat "$owner_dir/session-stop" 2>/dev/null || true)
+  [ -n "$claim_before" ] || fail "restart published an empty monitor setup claim"
+  kill -KILL "$monitor_pid" 2>/dev/null || fail "could not terminate the failed ownership monitor"
+  i=0
+  while [ "$i" -lt 50 ] && is_live_non_zombie "$monitor_pid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  ! is_live_non_zombie "$monitor_pid" || fail "failed ownership monitor remained live"
+  touch "$setup_proceed"
+  status=0
+  wait_for_exit "$first_arm" 150 || status=$?
+  [ "$status" -ne 0 ] && [ "$status" -ne 124 ] \
+    || fail "original arm did not fail closed behind the restart transaction: $(cat "$first_out")"
+  is_live_non_zombie "$restart_arm" || fail "watcher setup failure displaced the live restart"
+  [ "$(cat "$owner_dir/session-stop" 2>/dev/null || true)" = "$claim_before" ] \
+    || fail "watcher setup failure replaced or removed the restart claim"
+  [ -L "$state/.watch.lock" ] \
+    && [ "$(readlink "$state/.watch.lock" 2>/dev/null || true)" = "$owner_dir" ] \
+    || fail "watcher setup failure released the restart's canonical lock"
+  [ "$(cat "$owner_dir/process-session" 2>/dev/null || true)" = "$old_session" ] \
+    && [ -s "$owner_dir/pid" ] && [ -s "$owner_dir/pid-identity" ] \
+    && [ -s "$owner_dir/fm-home" ] && [ -s "$owner_dir/watcher-path" ] \
+    && [ "$(cat "$owner_dir/session-anchor.pending" 2>/dev/null || true)" = "$anchor_before" ] \
+    || fail "watcher setup failure discarded session or anchor proof behind the restart"
+  touch "$claim_proceed"
+  i=0
+  while [ "$i" -lt 240 ]; do
+    grep -qF 'watcher: started pid=' "$restart_out" 2>/dev/null && break
+    is_live_non_zombie "$restart_arm" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$restart_out" || {
+    kill -KILL "$restart_arm" 2>/dev/null || true
+    members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' \
+      _ "$LIB" "$old_session" 2>/dev/null || true)
+    for member in $members; do kill -KILL "$member" 2>/dev/null || true; done
+    fail "restart could not reclaim the preserved monitor setup transaction: $(cat "$restart_out")"
+  }
+  new_watcher=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  [ -n "$new_watcher" ] && [ "$new_watcher" != "$old_session" ] \
+    || fail "restart did not replace the failed monitor setup session"
+  kill -TERM "$restart_arm" 2>/dev/null || true
+  wait "$restart_arm" 2>/dev/null || true
+  pass "monitor setup failure preserves a live restart transaction"
+}
+
 test_arm_cleanup_refuses_reused_session_leader() {
   local dir state fakebin out decoy armpid i status=0 session
   dir=$(make_case arm-session-handshake-reuse)
@@ -3134,6 +3243,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-7 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-8 ]; then
+  test_monitor_setup_failure_preserves_live_restart_claim
+  test_monitor_startup_cleanup_refuses_reused_pid
+  exit 0
+fi
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_pid_identity_survives_exec_without_command_text
@@ -3183,6 +3298,7 @@ test_monitor_recovers_root_kill_before_anchor_publication
 test_monitor_bounds_steady_state_process_creation
 test_monitor_has_no_reusable_observer_helpers
 test_monitor_startup_cleanup_refuses_reused_pid
+test_monitor_setup_failure_preserves_live_restart_claim
 test_arm_cleanup_refuses_reused_session_leader
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher

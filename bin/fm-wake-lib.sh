@@ -405,6 +405,22 @@ fm_watcher_lock_session_proof_matches() {  # <state> <watch-path> <home> <sessio
 
 FM_WATCHER_SESSION_ANCHOR_PID=
 FM_WATCHER_SESSION_ANCHOR_IDENTITY=
+FM_WATCHER_PRESTART_OWNER_PID=
+FM_WATCHER_PRESTART_OWNER_IDENTITY=
+fm_watcher_prestart_owner_read() {  # <owner-dir>
+  local owner_dir=$1 snapshot lines
+  FM_WATCHER_PRESTART_OWNER_PID=
+  FM_WATCHER_PRESTART_OWNER_IDENTITY=
+  [ -f "$owner_dir/prestart-owner" ] && [ ! -L "$owner_dir/prestart-owner" ] || return 1
+  snapshot=$(cat "$owner_dir/prestart-owner" 2>/dev/null) || return 1
+  lines=$(printf '%s\n' "$snapshot" | awk 'END { print NR }')
+  [ "$lines" -eq 2 ] || return 1
+  FM_WATCHER_PRESTART_OWNER_PID=$(printf '%s\n' "$snapshot" | sed -n '1s/^pid=//p')
+  FM_WATCHER_PRESTART_OWNER_IDENTITY=$(printf '%s\n' "$snapshot" | sed -n '2s/^identity=//p')
+  case "$FM_WATCHER_PRESTART_OWNER_PID" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$FM_WATCHER_PRESTART_OWNER_IDENTITY" ]
+}
+
 fm_watcher_lock_session_anchor_read() {  # <state>
   local state=$1 lockdir snapshot anchor identity lines
   lockdir="$state/.watch.lock"
@@ -907,7 +923,8 @@ fm_lock_try_create() {
     [ "$publish_status" -ne 0 ] || \
       "$helper" publish "$ownerdir" "${BASHPID:-$$}" \
         "$FM_WAKE_LIB_DIR/fm-process-identity.py" "$lockdir" || publish_status=$?
-    [ "$publish_status" -eq 0 ] || FM_LOCK_PUBLICATION_BLOCKED=1
+    [ "$publish_status" -eq 0 ] || [ "$publish_status" -eq 4 ] \
+      || FM_LOCK_PUBLICATION_BLOCKED=1
   else
     ln -s "$ownerdir" "$lockdir" 2>/dev/null || publish_status=$?
   fi

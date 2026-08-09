@@ -929,8 +929,8 @@ test_prestart_observer_reclaims_interrupted_arm_cleanup() {
   session=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_session "$2"' _ "$LIB" "$watcher_pid" 2>/dev/null || true)
   [ "$session" = "$watcher_pid" ] || fail "interrupted cleanup fixture did not own its session"
   owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch.lock.owner.arm.*' -print -quit)
-  standby_pid=$(cat "$owner_dir/prestart-owner-pid" 2>/dev/null || true)
-  standby_identity=$(cat "$owner_dir/prestart-owner-identity" 2>/dev/null || true)
+  standby_pid=$(sed -n '1s/^pid=//p' "$owner_dir/prestart-owner" 2>/dev/null || true)
+  standby_identity=$(sed -n '2s/^identity=//p' "$owner_dir/prestart-owner" 2>/dev/null || true)
   FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity_live "$2" "$3"' \
     _ "$LIB" "$standby_pid" "$standby_identity" \
     || fail "prestart standby was not identity-pinned before arm cleanup"
@@ -965,6 +965,132 @@ test_prestart_observer_reclaims_interrupted_arm_cleanup() {
     || fail "standby takeover left the watcher lock"
   [ ! -d "$owner_dir" ] || fail "standby takeover left the canonical owner directory"
   pass "prestart standby reclaims an interrupted canonical cleanup"
+}
+
+test_observer_identity_publication_is_atomic_and_acknowledged() {
+  local dir state fakebin out pending_ready pending_proceed watcher_ready armpid observer_pid owner_dir session status i members member
+  dir=$(make_case observer-identity-publication)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  pending_ready="$dir/observer-pending.ready"
+  pending_proceed="$dir/observer-pending.proceed"
+  watcher_ready="$dir/watcher.ready"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_OBSERVER_PENDING_READY="$pending_ready" \
+    FM_WATCH_OWNER_TEST_OBSERVER_PENDING_PROCEED="$pending_proceed" \
+    FM_WATCH_OWNER_TEST_PRESTART_READY="$watcher_ready" \
+    FM_WATCH_OWNER_TEST_PRESTART_PROCEED="$dir/watcher.proceed" \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -s "$pending_ready" ]; do
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  observer_pid=$(cat "$pending_ready" 2>/dev/null || true)
+  case "$observer_pid" in ''|*[!0-9]*) fail "observer did not pause before atomic identity publication: $(cat "$out")" ;; esac
+  owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch.lock.owner.arm.*' -print -quit)
+  session=$(cat "$owner_dir/pid" 2>/dev/null || true)
+  [ ! -e "$owner_dir/prestart-owner" ] && [ ! -L "$owner_dir/prestart-owner" ] \
+    || fail "observer exposed its identity before atomic publication"
+  kill -KILL "$observer_pid" 2>/dev/null || fail "could not interrupt observer identity publication"
+  status=0
+  wait_for_exit "$armpid" 150 || status=$?
+  [ "$status" -ne 0 ] || fail "arm accepted a standby identity that was never acknowledged"
+  [ ! -e "$watcher_ready" ] || fail "watcher executed before standby identity acknowledgement"
+  i=0
+  members=$session
+  while [ "$i" -lt 100 ]; do
+    members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' _ "$LIB" "$session" 2>/dev/null || true)
+    [ -z "$members" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -z "$members" ] || {
+    for member in $members; do kill -KILL "$member" 2>/dev/null || true; done
+    fail "failed standby publication left session members: $members"
+  }
+  [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
+    || fail "failed standby publication exposed a watcher lock"
+  pass "observer identity publishes atomically before acknowledged startup"
+}
+
+test_singleton_loser_terminalizes_its_owner_channel() {
+  local dir state fakebin out1 out2 ready1 ready2 proceed1 proceed2 arm1 arm2 roots winner loser root i attached started members member owner_count
+  dir=$(make_case singleton-owner-channel)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out1="$dir/arm-one.out"
+  out2="$dir/arm-two.out"
+  ready1="$dir/ack-one.ready"
+  ready2="$dir/ack-two.ready"
+  proceed1="$dir/ack-one.proceed"
+  proceed2="$dir/ack-two.proceed"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_ARM_CONFIRM_TIMEOUT=30 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_ACK_READY="$ready1" FM_WATCH_OWNER_TEST_ACK_PROCEED="$proceed1" \
+    "$WATCH_ARM" > "$out1" &
+  arm1=$!
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_ARM_CONFIRM_TIMEOUT=30 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_ACK_READY="$ready2" FM_WATCH_OWNER_TEST_ACK_PROCEED="$proceed2" \
+    "$WATCH_ARM" > "$out2" &
+  arm2=$!
+  i=0
+  while [ "$i" -lt 100 ] && { [ ! -e "$ready1" ] || [ ! -e "$ready2" ]; }; do
+    is_live_non_zombie "$arm1" && is_live_non_zombie "$arm2" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$ready1" ] && [ -e "$ready2" ] \
+    || fail "competing arms did not reach acknowledged startup: $(cat "$out1") $(cat "$out2")"
+  roots=$(find "$state" -maxdepth 1 -type d -name '.watch.lock.owner.arm.*' -exec sh -c 'cat "$1/pid"' _ {} \;)
+  [ "$(printf '%s\n' "$roots" | sed '/^$/d' | wc -l | tr -d '[:space:]')" -eq 2 ] \
+    || fail "competing arms did not establish two pre-lock sessions"
+  touch "$proceed1" "$proceed2"
+  i=0
+  while [ "$i" -lt 400 ]; do
+    started=$(grep -hF 'watcher: started pid=' "$out1" "$out2" 2>/dev/null | wc -l | tr -d '[:space:]')
+    attached=$(grep -hF 'watcher: attached pid=' "$out1" "$out2" 2>/dev/null | wc -l | tr -d '[:space:]')
+    [ "$started" -eq 1 ] && [ "$attached" -eq 1 ] && break
+    is_live_non_zombie "$arm1" && is_live_non_zombie "$arm2" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$started" -eq 1 ] && [ "$attached" -eq 1 ] \
+    || fail "competing arms did not resolve to one starter and one peer attachment: $(cat "$out1") $(cat "$out2")"
+  winner=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  loser=
+  for root in $roots; do
+    [ "$root" = "$winner" ] || loser=$root
+  done
+  case "$loser" in ''|*[!0-9]*) fail "singleton race did not identify the losing session" ;; esac
+  i=0
+  members=$loser
+  while [ "$i" -lt 150 ]; do
+    members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' _ "$LIB" "$loser" 2>/dev/null || true)
+    owner_count=$(find "$state" -maxdepth 1 -type d -name '.watch.lock.owner.arm.*' | wc -l | tr -d '[:space:]')
+    [ -z "$members" ] && [ "$owner_count" -eq 1 ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -z "$members" ] || {
+    for member in $members; do kill -KILL "$member" 2>/dev/null || true; done
+    fail "singleton loser left session members: $members"
+  }
+  [ "$owner_count" -eq 1 ] || fail "singleton loser left a waiting owner channel"
+  kill -TERM "$arm1" "$arm2" 2>/dev/null || true
+  wait "$arm1" 2>/dev/null || true
+  wait "$arm2" 2>/dev/null || true
+  pass "singleton loser terminalizes ownership before peer attachment"
 }
 
 test_prestart_claim_blocks_lock_publication() {
@@ -1065,8 +1191,8 @@ SH
   watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
   session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
   owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch.lock.owner.arm.*' -print | head -1)
-  prestart_pid=$(cat "$owner_dir/prestart-owner-pid" 2>/dev/null || true)
-  prestart_identity=$(cat "$owner_dir/prestart-owner-identity" 2>/dev/null || true)
+  prestart_pid=$(sed -n '1s/^pid=//p' "$owner_dir/prestart-owner" 2>/dev/null || true)
+  prestart_identity=$(sed -n '2s/^identity=//p' "$owner_dir/prestart-owner" 2>/dev/null || true)
   case "$prestart_pid" in ''|*[!0-9]*) fail "owner handoff did not record the prestart observer" ;; esac
   [ -n "$prestart_identity" ] || fail "owner handoff omitted the prestart observer identity"
   ! FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity_live "$2" "$3"' \
@@ -1121,8 +1247,8 @@ test_restart_during_owner_handoff_uses_normal_anchor() {
   [ -e "$ready" ] || fail "normal monitor did not reach its post-handoff restart barrier: $(cat "$first_out")"
   old_session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
   old_owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch.lock.owner.arm.*' -print | head -1)
-  prestart_pid=$(cat "$old_owner_dir/prestart-owner-pid" 2>/dev/null || true)
-  prestart_identity=$(cat "$old_owner_dir/prestart-owner-identity" 2>/dev/null || true)
+  prestart_pid=$(sed -n '1s/^pid=//p' "$old_owner_dir/prestart-owner" 2>/dev/null || true)
+  prestart_identity=$(sed -n '2s/^identity=//p' "$old_owner_dir/prestart-owner" 2>/dev/null || true)
   case "$prestart_pid" in ''|*[!0-9]*) fail "restart handoff did not record its prestart observer" ;; esac
   ! FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity_live "$2" "$3"' \
     _ "$LIB" "$prestart_pid" "$prestart_identity" \
@@ -2825,6 +2951,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-5 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-6 ]; then
+  test_observer_identity_publication_is_atomic_and_acknowledged
+  test_singleton_loser_terminalizes_its_owner_channel
+  test_prestart_observer_reclaims_interrupted_arm_cleanup
+  exit 0
+fi
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_pid_identity_survives_exec_without_command_text
@@ -2858,6 +2991,8 @@ test_arm_owner_death_reaps_watcher_session
 test_arm_owner_death_before_monitor_start_reaps_session
 test_arm_owner_death_during_prestart_wedge_reaps_session
 test_prestart_observer_reclaims_interrupted_arm_cleanup
+test_observer_identity_publication_is_atomic_and_acknowledged
+test_singleton_loser_terminalizes_its_owner_channel
 test_prestart_claim_blocks_lock_publication
 test_arm_normal_exit_after_owner_handoff
 test_restart_during_owner_handoff_uses_normal_anchor

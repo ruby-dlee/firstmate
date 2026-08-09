@@ -24,8 +24,9 @@ arm_owner=$(cat "$owner_dir/arm-owner-pid" 2>/dev/null || true)
 arm_owner_identity=$(cat "$owner_dir/arm-owner-identity" 2>/dev/null || true)
 case "$arm_owner" in ''|*[!0-9]*) exit 1 ;; esac
 [ -n "$arm_owner_identity" ] || exit 1
-observer_identity=$(cat "$owner_dir/prestart-owner-identity" 2>/dev/null || true)
-[ "$(cat "$owner_dir/prestart-owner-pid" 2>/dev/null || true)" = "$observer" ] || exit 1
+fm_watcher_prestart_owner_read "$owner_dir" || exit 1
+[ "$FM_WATCHER_PRESTART_OWNER_PID" = "$observer" ] || exit 1
+observer_identity=$FM_WATCHER_PRESTART_OWNER_IDENTITY
 fm_pid_identity_live "$observer" "$observer_identity" || exit 1
 
 while fm_pid_identity_live "$arm_owner" "$arm_owner_identity"; do
@@ -68,9 +69,9 @@ if [ "$status" -eq 0 ]; then
     "$owner_dir/eof" "$owner_dir/lost" "$owner_dir/session-root" \
     "$owner_dir/session-root.pending" "$owner_dir/handoff-request" \
     "$owner_dir/handoff-request.pending" "$owner_dir/handoff-taken" \
-    "$owner_dir/handoff-taken.pending" "$owner_dir/prestart-owner-pid" \
-    "$owner_dir/prestart-owner-pid.pending" "$owner_dir/prestart-owner-identity" \
-    "$owner_dir/prestart-owner-identity.pending" 2>/dev/null || true
+    "$owner_dir/handoff-taken.pending" "$owner_dir/prestart-owner" \
+    "$owner_dir/prestart-owner.pending" "$owner_dir/prestart-owner-ack" \
+    "$owner_dir/prestart-owner-ack.pending" 2>/dev/null || true
   rm -f "$owner_dir/pid" "$owner_dir/pid-identity" "$owner_dir/process-session" \
     "$owner_dir/fm-home" "$owner_dir/watcher-path" "$owner_dir/session-stop" \
     "$owner_dir/session-stop.pending" "$owner_dir/session-stop-complete" \

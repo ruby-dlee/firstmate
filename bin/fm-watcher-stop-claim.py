@@ -418,10 +418,14 @@ def publish_lock(lockdir, boundary, helper, publish_path):
         if (
             os.path.dirname(publish_path) != os.path.dirname(lockdir)
             or os.path.basename(publish_path) != ".watch.lock"
-            or os.path.lexists(publish_path)
         ):
             return 1
-        os.symlink(lockdir, publish_path)
+        if os.path.lexists(publish_path):
+            return 4
+        try:
+            os.symlink(lockdir, publish_path)
+        except FileExistsError:
+            return 4
         published = True
         if basis(lockdir, boundary, helper, "session") != snapshot:
             os.unlink(publish_path)

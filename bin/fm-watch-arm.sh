@@ -444,9 +444,9 @@ owner_link_remove() {
     "$owner_link_dir/.session-stop-transaction" \
     "$owner_link_dir/handoff-request" "$owner_link_dir/handoff-request.pending" \
     "$owner_link_dir/handoff-taken" "$owner_link_dir/handoff-taken.pending" \
-    "$owner_link_dir/prestart-owner-pid" "$owner_link_dir/prestart-owner-pid.pending" \
-    "$owner_link_dir/prestart-owner-identity" \
-    "$owner_link_dir/prestart-owner-identity.pending" \
+    "$owner_link_dir/prestart-owner" "$owner_link_dir/prestart-owner.pending" \
+    "$owner_link_dir/prestart-owner-ack" \
+    "$owner_link_dir/prestart-owner-ack.pending" \
     "$owner_link_dir/arm-owner-pid" "$owner_link_dir/arm-owner-identity" \
     2>/dev/null || true
   rmdir "$owner_link_dir" 2>/dev/null || true
@@ -501,10 +501,9 @@ owner_link_session_proof_matches() {
 FM_WATCH_STANDBY_PID=
 FM_WATCH_STANDBY_IDENTITY=
 owner_link_standby_matches() {
-  FM_WATCH_STANDBY_PID=$(cat "$owner_link_dir/prestart-owner-pid" 2>/dev/null || true)
-  FM_WATCH_STANDBY_IDENTITY=$(cat "$owner_link_dir/prestart-owner-identity" 2>/dev/null || true)
-  case "$FM_WATCH_STANDBY_PID" in ''|*[!0-9]*) return 1 ;; esac
-  [ -n "$FM_WATCH_STANDBY_IDENTITY" ] || return 1
+  fm_watcher_prestart_owner_read "$owner_link_dir" || return 1
+  FM_WATCH_STANDBY_PID=$FM_WATCHER_PRESTART_OWNER_PID
+  FM_WATCH_STANDBY_IDENTITY=$FM_WATCHER_PRESTART_OWNER_IDENTITY
   fm_pid_identity_live "$FM_WATCH_STANDBY_PID" "$FM_WATCH_STANDBY_IDENTITY" || return 1
   [ "$(fm_pid_session "$FM_WATCH_STANDBY_PID" 2>/dev/null || true)" = "$child" ]
 }
@@ -512,18 +511,26 @@ owner_link_standby_matches() {
 stop_owned_child() {
   local status=0 session_status=0 standby=false iteration=0
   [ -n "$child" ] || return 0
-  if owner_link_session_proof_matches && owner_link_standby_matches; then
-    standby=true
-    if fm_session_stop_claim_dir "$owner_link_dir" "$child"; then
-      if [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
-        && [ -n "${FM_WATCH_OWNER_TEST_ARM_CLAIM_READY:-}" ] \
-        && [ -n "${FM_WATCH_OWNER_TEST_ARM_CLAIM_PROCEED:-}" ]; then
-        : > "$FM_WATCH_OWNER_TEST_ARM_CLAIM_READY"
-        while [ ! -e "$FM_WATCH_OWNER_TEST_ARM_CLAIM_PROCEED" ]; do sleep 0.01; done
+  if owner_link_session_proof_matches; then
+    if owner_link_standby_matches; then
+      standby=true
+      if fm_session_stop_claim_dir "$owner_link_dir" "$child"; then
+        if [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
+          && [ -n "${FM_WATCH_OWNER_TEST_ARM_CLAIM_READY:-}" ] \
+          && [ -n "${FM_WATCH_OWNER_TEST_ARM_CLAIM_PROCEED:-}" ]; then
+          : > "$FM_WATCH_OWNER_TEST_ARM_CLAIM_READY"
+          while [ ! -e "$FM_WATCH_OWNER_TEST_ARM_CLAIM_PROCEED" ]; do sleep 0.01; done
+        fi
+        fm_session_stop_owned_except "$child" "$FM_WATCH_STANDBY_PID" 30 || status=$?
+        [ "$status" -ne 0 ] || fm_session_stop_claim_complete_dir \
+          "$owner_link_dir" "$child" "$FM_WATCH_STANDBY_PID" || status=$?
+      else
+        status=1
       fi
-      fm_session_stop_owned_except "$child" "$FM_WATCH_STANDBY_PID" 30 || status=$?
+    elif fm_session_stop_claim_dir "$owner_link_dir" "$child"; then
+      fm_session_stop_owned "$child" 30 || status=$?
       [ "$status" -ne 0 ] || fm_session_stop_claim_complete_dir \
-        "$owner_link_dir" "$child" "$FM_WATCH_STANDBY_PID" || status=$?
+        "$owner_link_dir" "$child" "" || status=$?
     else
       status=1
     fi
@@ -551,6 +558,33 @@ stop_owned_child() {
   clear_stale_recorded_watcher_lock >/dev/null 2>&1 || true
   owner_link_remove
   return 0
+}
+
+finish_owned_child_channel() {
+  local iteration=0
+  if [ ! -d "$owner_link_dir" ]; then
+    owner_link_disconnect
+    owner_link_reader_disconnect
+    return 0
+  fi
+  if [ "$(cat "$owner_link_ready" 2>/dev/null || true)" = "$child" ]; then
+    owner_link_disconnect
+    owner_link_reader_disconnect
+    while [ "$iteration" -lt 800 ] && [ -d "$owner_link_dir" ]; do
+      sleep 0.05
+      iteration=$((iteration + 1))
+    done
+    if [ ! -d "$owner_link_dir" ]; then
+      owner_link_dir=
+      owner_link_fifo=
+      owner_link_ready=
+      owner_link_failed=
+      return 0
+    fi
+    stop_owned_child
+    return $?
+  fi
+  stop_owned_child
 }
 
 cleanup_child() {
@@ -610,7 +644,7 @@ monitor_started_child() {  # <confirmed-watcher-pid>
   done
   wait "$watched"
   rc=$?
-  owner_link_disconnect
+  finish_owned_child_channel >/dev/null 2>&1 || true
   if "$child_session_verified"; then
     fm_session_has_live_processes "$watched" || session_status=$?
     [ "$session_status" -eq 1 ] && cleanup_complete=true
@@ -724,6 +758,16 @@ owner_link_reader_connected=true
         return if $parent !~ /\A[0-9]+\z/;
         return $parent;
       };
+      my $read_regular = sub {
+        my ($path) = @_;
+        my @metadata = lstat $path;
+        return if !@metadata || -l _ || !-f _;
+        open my $file, "<", $path or return;
+        local $/;
+        my $contents = <$file>;
+        close $file or return;
+        return $contents;
+      };
       my $root_identity = $identity_for->($root);
       exit 125 if !defined $root_identity;
       my $arm_owner = getppid();
@@ -758,8 +802,8 @@ owner_link_reader_connected=true
         my $owner_dir = $ENV{FM_WATCH_ARM_OWNER_DIR};
         my $request = "$owner_dir/handoff-request";
         my $taken = "$owner_dir/handoff-taken";
-        my $owner_pid = "$owner_dir/prestart-owner-pid";
-        my $owner_identity = "$owner_dir/prestart-owner-identity";
+        my $owner_record = "$owner_dir/prestart-owner";
+        my $owner_ack = "$owner_dir/prestart-owner-ack";
         my $group_for = sub {
           my ($pid) = @_;
           local $ENV{LC_ALL} = "C";
@@ -772,16 +816,6 @@ owner_link_reader_connected=true
           $process_group =~ s/[[:space:]]+\z//;
           return if $process_group !~ /\A[0-9]+\z/;
           return $process_group;
-        };
-        my $read_regular = sub {
-          my ($path) = @_;
-          my @metadata = lstat $path;
-          return if !@metadata || -l _ || !-f _;
-          open my $file, "<", $path or return;
-          local $/;
-          my $contents = <$file>;
-          close $file or return;
-          return $contents;
         };
         my $owner_lost = sub {
           return 1 if getppid() != $root;
@@ -797,14 +831,38 @@ owner_link_reader_connected=true
         };
         my $prestart_identity = $identity_for->($$);
         exit 125 if !defined $prestart_identity;
-        sysopen my $pid_file, $owner_pid, O_WRONLY | O_CREAT | O_EXCL, 0600
+        my $prestart_record = "pid=$$\nidentity=$prestart_identity\n";
+        my $owner_pending = "$owner_record.pending";
+        sysopen my $owner_file, $owner_pending, O_WRONLY | O_CREAT | O_EXCL, 0600
           or exit 125;
-        print {$pid_file} "$$\n";
-        close $pid_file or exit 125;
-        sysopen my $identity_file, $owner_identity, O_WRONLY | O_CREAT | O_EXCL, 0600
-          or exit 125;
-        print {$identity_file} "$prestart_identity\n";
-        close $identity_file or exit 125;
+        print {$owner_file} $prestart_record;
+        close $owner_file or exit 125;
+        if (($ENV{FM_WATCH_OWNER_TEST_HOOKS} // "") eq "firstmate-watcher-owner-tests-v1"
+          && defined $ENV{FM_WATCH_OWNER_TEST_OBSERVER_PENDING_READY}
+          && $ENV{FM_WATCH_OWNER_TEST_OBSERVER_PENDING_READY} ne ""
+          && defined $ENV{FM_WATCH_OWNER_TEST_OBSERVER_PENDING_PROCEED}
+          && $ENV{FM_WATCH_OWNER_TEST_OBSERVER_PENDING_PROCEED} ne "") {
+          sysopen my $ready_file, $ENV{FM_WATCH_OWNER_TEST_OBSERVER_PENDING_READY},
+            O_WRONLY | O_CREAT | O_EXCL, 0600 or exit 125;
+          print {$ready_file} "$$\n";
+          close $ready_file or exit 125;
+          while (!-e $ENV{FM_WATCH_OWNER_TEST_OBSERVER_PENDING_PROCEED}) {
+            exit 125 if $owner_lost->();
+            select undef, undef, undef, 0.01;
+          }
+        }
+        rename $owner_pending, $owner_record or exit 125;
+        my $acknowledged = 0;
+        for (1 .. 200) {
+          my $ack = $read_regular->($owner_ack);
+          if (defined $ack && $ack eq $prestart_record) {
+            $acknowledged = 1;
+            last;
+          }
+          exit 125 if $owner_lost->();
+          select undef, undef, undef, 0.01;
+        }
+        exit 125 if !$acknowledged;
         my $handoff = 0;
         while (getppid() == $root) {
           my $current_root_parent = $parent_for->($root);
@@ -843,6 +901,60 @@ owner_link_reader_connected=true
         exec $cleanup, $root, $session, $ENV{FM_WATCH_ARM_OWNER_DIR};
         exit 125;
       }
+      my $owner_record = "$owner_dir/prestart-owner";
+      my $owner_ack = "$owner_dir/prestart-owner-ack";
+      my $prestart_record;
+      my $prestart_identity;
+      for (1 .. 200) {
+        my $record = $read_regular->($owner_record);
+        if (defined $record && $record =~ /\Apid=([0-9]+)\nidentity=(.+)\n\z/s) {
+          my ($record_pid, $record_identity) = ($1, $2);
+          my $current_identity = $identity_live_for->($observer);
+          my $current_parent = $parent_for->($observer);
+          if ($record_pid == $observer
+            && defined $current_identity
+            && $current_identity eq $record_identity
+            && defined $current_parent
+            && $current_parent == $root) {
+            $prestart_record = $record;
+            $prestart_identity = $record_identity;
+            last;
+          }
+        }
+        select undef, undef, undef, 0.01;
+      }
+      exit 125 if !defined $prestart_record;
+      my $ack_pending = "$owner_ack.pending";
+      sysopen my $ack_file, $ack_pending, O_WRONLY | O_CREAT | O_EXCL, 0600
+        or exit 125;
+      print {$ack_file} $prestart_record;
+      close $ack_file or exit 125;
+      rename $ack_pending, $owner_ack or exit 125;
+      my $current_identity = $identity_live_for->($observer);
+      my $current_parent = $parent_for->($observer);
+      exit 125 if !defined $current_identity
+        || $current_identity ne $prestart_identity
+        || !defined $current_parent
+        || $current_parent != $root;
+      if (($ENV{FM_WATCH_OWNER_TEST_HOOKS} // "") eq "firstmate-watcher-owner-tests-v1"
+        && defined $ENV{FM_WATCH_OWNER_TEST_ACK_READY}
+        && $ENV{FM_WATCH_OWNER_TEST_ACK_READY} ne ""
+        && defined $ENV{FM_WATCH_OWNER_TEST_ACK_PROCEED}
+        && $ENV{FM_WATCH_OWNER_TEST_ACK_PROCEED} ne "") {
+        sysopen my $ready_file, $ENV{FM_WATCH_OWNER_TEST_ACK_READY},
+          O_WRONLY | O_CREAT | O_EXCL, 0600 or exit 125;
+        print {$ready_file} "$$\n";
+        close $ready_file or exit 125;
+        while (!-e $ENV{FM_WATCH_OWNER_TEST_ACK_PROCEED}) {
+          select undef, undef, undef, 0.01;
+        }
+      }
+      $current_identity = $identity_live_for->($observer);
+      $current_parent = $parent_for->($observer);
+      exit 125 if !defined $current_identity
+        || $current_identity ne $prestart_identity
+        || !defined $current_parent
+        || $current_parent != $root;
       exec @ARGV;
       exit 127;
     ' "$SCRIPT_DIR/fm-watch-session-cleanup.sh" "$WATCH"
@@ -891,8 +1003,10 @@ while :; do
     if [ "$mode" = arm ]; then
       report_attached
       wait "$child" 2>/dev/null || true
-      owner_link_disconnect
-      owner_link_remove
+      if ! finish_owned_child_channel; then
+        echo "watcher: FAILED - losing watcher session did not reach terminal ownership"
+        exit 1
+      fi
       rm -f "$child_out" 2>/dev/null || true
       child=
       child_out=
@@ -901,8 +1015,10 @@ while :; do
     fi
     report_healthy
     wait "$child" 2>/dev/null || true
-    owner_link_disconnect
-    owner_link_remove
+    if ! finish_owned_child_channel; then
+      echo "watcher: FAILED - losing watcher session did not reach terminal ownership"
+      exit 1
+    fi
     rm -f "$child_out" 2>/dev/null || true
     exit 0
   fi
@@ -911,8 +1027,10 @@ while :; do
     rc=$?
     child_done=1
     if [ "$rc" -eq 0 ] && watch_output_has_wake "$child_out"; then
-      owner_link_disconnect
-      owner_link_remove
+      if ! finish_owned_child_channel; then
+        echo "watcher: FAILED - surfaced watcher session did not reach terminal ownership"
+        exit 1
+      fi
       print_watch_output "$child_out"
       rm -f "$child_out" 2>/dev/null || true
       exit 0

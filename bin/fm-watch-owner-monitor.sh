@@ -23,8 +23,6 @@ anchor_record="$watch_lock/session-anchor"
 handoff_request="$owner_dir/handoff-request"
 handoff_request_pending="$owner_dir/handoff-request.pending"
 handoff_taken="$owner_dir/handoff-taken"
-prestart_owner_pid_file="$owner_dir/prestart-owner-pid"
-prestart_owner_identity_file="$owner_dir/prestart-owner-identity"
 owner_root_poll=5
 owner_link_lost=false
 
@@ -98,10 +96,9 @@ while [ "$handoff_iteration" -lt 300 ]; do
   handoff_iteration=$((handoff_iteration + 1))
 done
 [ "$handoff_iteration" -lt 300 ] || exit 1
-prestart_owner_pid=$(cat "$prestart_owner_pid_file" 2>/dev/null || true)
-prestart_owner_identity=$(cat "$prestart_owner_identity_file" 2>/dev/null || true)
-case "$prestart_owner_pid" in ''|*[!0-9]*) exit 1 ;; esac
-[ -n "$prestart_owner_identity" ] || exit 1
+fm_watcher_prestart_owner_read "$owner_dir" || exit 1
+prestart_owner_pid=$FM_WATCHER_PRESTART_OWNER_PID
+prestart_owner_identity=$FM_WATCHER_PRESTART_OWNER_IDENTITY
 handoff_iteration=0
 while fm_pid_identity_live "$prestart_owner_pid" "$prestart_owner_identity"; do
   [ "$handoff_iteration" -lt 300 ] || exit 1
@@ -145,8 +142,9 @@ fi
 exec 8<&-
 rm -f "$owner_ready" "$owner_failed" "$owner_fifo" "$owner_eof" "$owner_lost" 2>/dev/null || true
 rm -f "$session_record" "$session_record_pending" "$handoff_request" \
-  "$handoff_request_pending" "$handoff_taken" "$prestart_owner_pid_file" \
-  "$prestart_owner_identity_file" "$owner_dir/pid" "$owner_dir/pid-identity" \
+  "$handoff_request_pending" "$handoff_taken" "$owner_dir/prestart-owner" \
+  "$owner_dir/prestart-owner.pending" "$owner_dir/prestart-owner-ack" \
+  "$owner_dir/prestart-owner-ack.pending" "$owner_dir/pid" "$owner_dir/pid-identity" \
   "$owner_dir/process-session" "$owner_dir/fm-home" "$owner_dir/watcher-path" \
   "$owner_dir/session-stop" "$owner_dir/session-stop.pending" \
   "$owner_dir/session-stop-complete" \

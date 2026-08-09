@@ -28,7 +28,7 @@ make_case() {
   case_dir="$TMP_ROOT/$name"
   repo="$case_dir/repo"
   mkdir -p "$repo/tests" "$repo/apps/web-app/src" \
-    "$repo/apps/web-app/node_modules/.bin" "$case_dir/state" "$case_dir/data" \
+    "$case_dir/state" "$case_dir/data" \
     "$case_dir/author-home" "$case_dir/reviewer-home" "$case_dir/pi-home" \
     "$case_dir/fakebin"
   # Real Codex homes always carry tokens.account_id; the independence gate
@@ -54,7 +54,10 @@ make_case() {
   printf '#!/usr/bin/env bash\n. tests/helper.sh\n' > "$repo/tests/support.test.sh"
   printf '#!/usr/bin/env bash\ngrep -qx fixed app.txt\n' > "$repo/shared-test.sh"
   cat > "$repo/apps/web-app/package.json" <<'JSON'
-{"scripts":{"test":"jest"},"devDependencies":{"jest":"29.7.0"}}
+{"scripts":{"test":"jest"},"engines":{"node":"20.x"},"devDependencies":{"jest":"29.7.0"}}
+JSON
+  cat > "$repo/apps/web-app/package-lock.json" <<'JSON'
+{"name":"crosscheck-fixture","lockfileVersion":3,"packages":{"":{"devDependencies":{"jest":"29.7.0"}}}}
 JSON
   printf 'export const previewScope = "fixed";\n' \
     > "$repo/apps/web-app/src/preview.ts"
@@ -62,30 +65,6 @@ JSON
     > "$repo/apps/web-app/src/preview.test.ts"
   printf '// INADEQUATE_PREVIEW_SCOPE_TEST\n' \
     > "$repo/apps/web-app/src/preview-inadequate.test.ts"
-  cat > "$repo/apps/web-app/node_modules/.bin/jest" <<'SH'
-#!/usr/bin/env bash
-set -u
-test_path=
-for argument in "$@"; do
-  case "$argument" in
-    --*) ;;
-    *) test_path=$argument ;;
-  esac
-done
-[ -n "$test_path" ] && [ -f "$test_path" ] || exit 4
-status=0
-if ! grep -q 'INADEQUATE_PREVIEW_SCOPE_TEST' "$test_path" \
-  && ! grep -q 'previewScope = "fixed"' src/preview.ts; then
-  status=1
-fi
-if [ "$status" -eq 0 ]; then
-  printf '%s\n' '{"numTotalTests":1,"numFailedTests":0,"success":true}'
-else
-  printf '%s\n' '{"numTotalTests":1,"numFailedTests":1,"success":false}'
-fi
-exit "$status"
-SH
-  chmod +x "$repo/apps/web-app/node_modules/.bin/jest"
   ln -s ../shared-test.sh "$repo/tests/symlink.test.sh"
   printf '#!/usr/bin/env bash\n# def test_app_is_fixed()\ngrep -qx fixed app.txt\n' \
     > "$repo/tests/nodeid.test.sh"
@@ -102,9 +81,8 @@ SH
     "$repo/tests/nodeid.test.sh" "$repo/tests/vacuous.test.sh" \
     "$repo/tests/pathdep.test.sh" "$repo/real-tests/linked.test.sh"
   git -C "$repo" add app.txt other.txt shared-test.sh \
-    apps/web-app/package.json apps/web-app/src/preview.ts \
+    apps/web-app/package.json apps/web-app/package-lock.json apps/web-app/src/preview.ts \
     apps/web-app/src/preview.test.ts apps/web-app/src/preview-inadequate.test.ts \
-    apps/web-app/node_modules/.bin/jest \
     tests/regression.test.sh tests/helper.sh tests/readable-state.test.sh tests/stateful.test.sh \
     tests/support.test.sh tests/symlink.test.sh tests/nodeid.test.sh \
     tests/vacuous.test.sh tests/pathdep.test.sh real-tests/linked.test.sh \
@@ -137,6 +115,7 @@ EOF
   install_pi_fake "$case_dir"
   install_sandbox_fake "$case_dir"
   install_pytest_fake "$case_dir"
+  install_jest_package_manager_fake "$case_dir/pathbin"
   install_path_helper "$case_dir"
   printf '%s\t%s\t%s\n' "$case_dir" "$base" "$head"
 }
@@ -149,6 +128,48 @@ install_path_helper() {
   printf '#!/usr/bin/env bash\ngrep -qx fixed app.txt\n' \
     > "$case_dir/pathbin/fm-test-helper"
   chmod +x "$case_dir/pathbin/fm-test-helper"
+}
+
+install_jest_package_manager_fake() {
+  local node_bin=$1
+  mkdir -p "$node_bin"
+  cat > "$node_bin/node" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = --version ] || exit 92
+printf 'v20.11.0\n'
+SH
+  cat > "$node_bin/npm" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "${1:-}" = ci ] || exit 93
+mkdir -p node_modules/.bin
+cat > node_modules/.bin/jest <<'JEST'
+#!/usr/bin/env bash
+set -u
+[ "$(node --version)" = v20.11.0 ] || exit 94
+test_path=
+for argument in "$@"; do
+  case "$argument" in
+    --*) ;;
+    *) test_path=$argument ;;
+  esac
+done
+[ -n "$test_path" ] && [ -f "$test_path" ] || exit 4
+status=0
+if ! grep -q 'INADEQUATE_PREVIEW_SCOPE_TEST' "$test_path" \
+  && ! grep -q 'previewScope = "fixed"' src/preview.ts; then
+  status=1
+fi
+if [ "$status" -eq 0 ]; then
+  printf '%s\n' '{"numTotalTests":1,"numFailedTests":0,"success":true}'
+else
+  printf '%s\n' '{"numTotalTests":1,"numFailedTests":1,"success":false}'
+fi
+exit "$status"
+JEST
+chmod +x node_modules/.bin/jest
+SH
+  chmod +x "$node_bin/node" "$node_bin/npm"
 }
 
 # A node-id runner standing in for pytest. It reproduces the three outcomes the
@@ -1288,13 +1309,14 @@ def codex_home(name, account_id):
     return account_home
 
 
-author = pi_home("pi-author", "openai-account-A")
+author = pi_home("pi-author", "openai-account-B")
 aliased = codex_home("codex-same-account", "openai-account-A")
 distinct = codex_home("codex-distinct-account", "openai-account-B")
 opaque = codex_home("codex-unreadable-account", None)
 meta = {
     "harness": "pi",
-    "model": "openai-codex-5/gpt-5.6-sol",
+    "model": "openai-codex-5/gpt-5.5",
+    "author_account_identity": "openai-account-A",
 }
 os.environ["PI_CODING_AGENT_DIR"] = str(author)
 mode_path = home / "config" / "crosscheck-same-model"
@@ -1334,11 +1356,14 @@ expect_refused(distinct, "different model", "same-model-default-off")
 mode_path.write_text("off\n", encoding="utf-8")
 expect_refused(distinct, "different model", "same-model-explicit-off")
 
-# Opting in changes only the model screen. The same upstream account remains
-# refused even through a different harness and a different account-home path.
+meta["model"] = "openai-codex-5/gpt-5.6-sol"
 mode_path.write_text("on\n", encoding="utf-8")
 expect_refused(aliased, "proven-separate account", "same-upstream-account")
 expect_refused(opaque, "proven-separate account", "unreadable-reviewer-account")
+
+recorded_identity = meta.pop("author_account_identity")
+expect_refused(distinct, "readable Pi provider-slot identity", "missing-launch-identity")
+meta["author_account_identity"] = recorded_identity
 
 write_reviewer(distinct)
 selected = module.reviewer_candidates(home, meta)[0]
@@ -2120,9 +2145,13 @@ test_same_model_review_is_adversarial_and_durable() {
     -e '/^account_home=/d' \
     "$case_dir/state/task-x1.meta"
   rm "$case_dir/state/task-x1.meta.bak"
+  printf 'author_account_identity=test-author-account\n' \
+    >> "$case_dir/state/task-x1.meta"
 
-  output=$(PI_CODING_AGENT_DIR="$case_dir/author-home" \
-    run_case "$case_dir" "$base" "$head" clear run) \
+  printf '%s\n' \
+    '{"openai-codex-5":{"type":"oauth","access":"test-access","refresh":"test-refresh","expires":4102444800000,"accountId":"test-reviewer-account"}}' \
+    > "$case_dir/pi-home/auth.json"
+  output=$(PI_CODING_AGENT_DIR="$case_dir/pi-home" run_case "$case_dir" "$base" "$head" clear run) \
     || fail "same-model reviewer on a different account did not complete"
   assert_contains "$output" 'crosscheck clear' \
     "same-model reviewer did not produce a verdict"
@@ -2674,6 +2703,55 @@ assert '"numFailedTests":1' in proof["mutated_output"], proof
 assert ledger["runs"][-1]["state"] == "clear", ledger["runs"][-1]
 PY
   pass "a package-governed Jest test can certify a TypeScript mutation"
+}
+
+test_preexisting_jest_runner_cannot_certify() {
+  local record case_dir base head rc
+  record=$(make_case preexisting-jest-runner)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  mkdir -p "$case_dir/repo/apps/web-app/node_modules/.bin"
+  printf '#!/usr/bin/env bash\nprintf '\''%%s\\n'\'' '\''{"numTotalTests":1,"numFailedTests":0}'\''\n' \
+    > "$case_dir/repo/apps/web-app/node_modules/.bin/jest"
+  chmod +x "$case_dir/repo/apps/web-app/node_modules/.bin/jest"
+  git -C "$case_dir/repo" add -f apps/web-app/node_modules/.bin/jest
+  git -C "$case_dir/repo" commit -qm "commit forged Jest runner"
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_javascript_open_ledger "$case_dir" "$head"
+  set +e
+  run_case "$case_dir" "$base" "$head" verified-fixed-jest run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "preexisting Jest runner"
+  assert_grep 'CROSSCHECK CANNOT-CERTIFY:' "$case_dir/err" \
+    "a preexisting Jest runner was not classified as unavailable proof"
+  assert_grep 'Jest runner preexists lockfile materialization' "$case_dir/err" \
+    "the proof did not reject the committed Jest runner"
+  assert_no_grep 'crosscheck clear' "$case_dir/out" \
+    "a committed Jest-shaped output script certified the mutation"
+  pass "preexisting Jest runners never establish proof provenance"
+}
+
+test_jest_runs_under_declared_node_major() {
+  local record case_dir base head node_home
+  record=$(make_case jest-declared-node-path)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/pathbin/node" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" = --version ] || exit 92
+printf 'v18.20.0\n'
+SH
+  chmod +x "$case_dir/pathbin/node"
+  node_home="$case_dir/node-home"
+  install_jest_package_manager_fake "$node_home/.nvm/versions/node/v20.11.0/bin"
+  seed_javascript_open_ledger "$case_dir" "$head"
+  HOME="$node_home" run_case "$case_dir" "$base" "$head" verified-fixed-jest run \
+    > "$case_dir/out" 2> "$case_dir/err" \
+    || fail "Jest lost the selected Node PATH after installation: $(cat "$case_dir/err")"
+  assert_grep 'crosscheck clear' "$case_dir/out" \
+    "declared-major Node did not reach baseline and mutated Jest runs"
+  pass "Jest preserves the selected Node path through both proof runs"
 }
 
 test_inadequate_typescript_jest_coverage_stays_blocking() {
@@ -4489,6 +4567,8 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_new_finding_requires_executed_reproduction|\
     test_silence_never_closes_prior_finding|\
     test_typescript_jest_mutation_proof_can_clear|\
+    test_preexisting_jest_runner_cannot_certify|\
+    test_jest_runs_under_declared_node_major|\
     test_inadequate_typescript_jest_coverage_stays_blocking|\
     test_typescript_without_usable_route_is_cannot_certify|\
     test_python_mutation_proof_is_byte_exact|\
@@ -4528,6 +4608,18 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
       ;;
     *) fail "unknown focused Crosscheck test: $FM_TEST_CASE" ;;
   esac
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-safety-findings ]; then
+  bash -n "$ROOT/bin/fm-spawn.sh" \
+    || fail "Pi launch identity capture introduced invalid spawn syntax"
+  test_same_model_relaxation_requires_proven_separate_account
+  test_same_model_review_is_adversarial_and_durable
+  test_typescript_jest_mutation_proof_can_clear
+  test_preexisting_jest_runner_cannot_certify
+  test_jest_runs_under_declared_node_major
+  test_inadequate_typescript_jest_coverage_stays_blocking
+  exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
@@ -4574,6 +4666,8 @@ test_new_finding_requires_executed_reproduction
 test_silence_never_closes_prior_finding
 test_verified_fix_executes_mutation_proof
 test_typescript_jest_mutation_proof_can_clear
+test_preexisting_jest_runner_cannot_certify
+test_jest_runs_under_declared_node_major
 test_inadequate_typescript_jest_coverage_stays_blocking
 test_typescript_without_usable_route_is_cannot_certify
 test_python_mutation_proof_is_byte_exact

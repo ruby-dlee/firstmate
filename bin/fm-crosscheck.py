@@ -496,45 +496,6 @@ def model_identity(model: str) -> str:
 PI_OPENAI_PROVIDER_SLOT_RE = re.compile(r"^openai-codex(?:-[1-9][0-9]*)?$")
 
 
-def pi_author_account_identity(model: str, account_home: Path | None) -> str | None:
-    """Resolve the OpenAI account selected by a routed Pi provider slot.
-
-    Pi task metadata records the selected provider slot as the model prefix but
-    does not carry account_home. That slot is the only author credential selector
-    available to an OpenAI reviewer, so an unreadable slot remains unproven.
-    """
-
-    provider_slot, separator, _ = model.partition("/")
-    if separator == "" or PI_OPENAI_PROVIDER_SLOT_RE.fullmatch(provider_slot) is None:
-        return None
-    if account_home is None:
-        configured_home = Path(
-            environment_value(
-                "PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent")
-            )
-        )
-        if not configured_home.is_absolute():
-            return None
-        account_home = configured_home
-    credential_file = account_home / "auth.json"
-    try:
-        credentials = read_bounded_json(
-            credential_file,
-            maximum_bytes=1024 * 1024,
-            maximum_items=256,
-            maximum_string_bytes=1024 * 1024,
-        )
-    except BoundedIOError:
-        return None
-    if not isinstance(credentials, dict):
-        return None
-    credential = credentials.get(provider_slot)
-    identity = credential.get("accountId") if isinstance(credential, dict) else None
-    if isinstance(identity, str) and identity.strip():
-        return identity.strip()
-    return None
-
-
 OPENAI_BACKED_HARNESSES = {
     harness for harness, provider in HARNESS_PROVIDERS.items() if provider == "openai"
 }
@@ -613,8 +574,8 @@ def author_account_identity(
 ) -> str | None:
     """Return the author's upstream account without inventing missing proof."""
 
-    if meta["harness"] == "pi" and "/" in meta["model"]:
-        return pi_author_account_identity(meta["model"], account_home)
+    if meta["harness"] == "pi" and account_home is None:
+        return meta.get("author_account_identity")
     if account_home is None:
         return None
     return account_identity(meta["harness"], account_home)
@@ -875,6 +836,7 @@ def parse_meta(path: Path) -> dict[str, str]:
             "harness",
             "model",
             "account_home",
+            "author_account_identity",
             "account_routing_emergency_bypass",
         }:
             require(
@@ -891,6 +853,21 @@ def parse_meta(path: Path) -> dict[str, str]:
         require(
             result["account_home"] != "",
             f"task metadata at {path} has an empty account_home",
+        )
+    if "author_account_identity" in result:
+        require(
+            result["author_account_identity"] != "",
+            f"task metadata at {path} has an empty author_account_identity",
+        )
+        require(
+            result["harness"] == "pi"
+            and PI_OPENAI_PROVIDER_SLOT_RE.fullmatch(
+                result["model"].partition("/")[0]
+            )
+            is not None
+            and "/" in result["model"],
+            f"task metadata at {path} records author_account_identity without "
+            "a routed Pi OpenAI provider slot",
         )
     if "account_routing_emergency_bypass" in result:
         require(
@@ -1448,66 +1425,96 @@ def prepare_jest_invocation(
     test_path: str,
     label: str,
     deadline: float,
-) -> tuple[list[str], Path]:
+) -> tuple[list[str], Path, dict[str, str]]:
     project = (checkout / project_relative).resolve()
     require(project.is_relative_to(checkout.resolve()), f"{label} package escapes checkout")
     jest = project / "node_modules" / ".bin" / "jest"
-    if not (jest.is_file() and os.access(jest, os.X_OK)):
-        node_bin = node_bin_for_project(project, label)
-        package_manager = ""
-        if (project / "package-lock.json").is_file():
-            package_manager = "npm"
-            manager = node_bin / "npm"
-            arguments = [
-                str(manager),
-                "ci",
-                "--offline",
-                "--ignore-scripts",
-                "--no-audit",
-                "--no-fund",
-            ]
-        elif (project / "pnpm-lock.yaml").is_file():
-            package_manager = "pnpm"
-            resolved = shutil.which("pnpm")
-            manager = Path(resolved) if resolved is not None else Path()
-            arguments = [
-                str(manager),
-                "install",
-                "--offline",
-                "--frozen-lockfile",
-                "--ignore-scripts",
-            ]
-        else:
-            cannot_certify(
-                f"{label} CANNOT-CERTIFY: Jest project {project_relative} has "
-                "no package-lock.json or pnpm-lock.yaml for an offline proof install"
-            )
-        if not manager.is_file() or not os.access(manager, os.X_OK):
-            cannot_certify(
-                f"{label} CANNOT-CERTIFY: {package_manager} is unavailable for "
-                f"the offline Jest proof in {project_relative}"
-            )
-        environment = proof_environment()
-        environment["PATH"] = str(node_bin) + os.pathsep + environment.get("PATH", "")
-        environment["CI"] = "true"
-        installed = run_sandboxed(
-            arguments,
-            cwd=project,
-            profile_path=checkout / ".crosscheck" / "jest-dependencies.sb",
-            allow_network=False,
-            allow_posix_ipc=False,
-            env=environment,
-            timeout=evidence_command_timeout(
-                deadline, evidence_timeout(), f"{label} Jest dependency install"
-            ),
-            description=f"{label} offline Jest dependency install",
+    if os.path.lexists(jest):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest runner preexists lockfile materialization "
+            f"at {jest}"
         )
-        if installed.returncode != 0:
-            cannot_certify(
-                f"{label} CANNOT-CERTIFY: {package_manager} could not materialize "
-                "the lockfile-pinned Jest environment offline: "
-                f"{(installed.stdout + installed.stderr).strip()[:1000] or 'no output'}"
-            )
+    lockfiles = [
+        path
+        for path in (project / "package-lock.json", project / "pnpm-lock.yaml")
+        if path.exists()
+    ]
+    if len(lockfiles) != 1:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest project {project_relative} must have "
+            "one unambiguous package-lock.json or pnpm-lock.yaml"
+        )
+    lockfile = lockfiles[0]
+    try:
+        lock_metadata = lockfile.lstat()
+    except OSError as exc:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: lockfile inspection failed at {lockfile}: {exc}"
+        )
+    if not stat.S_ISREG(lock_metadata.st_mode) or lockfile.is_symlink():
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest lockfile must be a tracked regular "
+            f"non-symlink file at {lockfile}"
+        )
+    lock_relative = lockfile.relative_to(checkout.resolve()).as_posix()
+    tracked = run_command(
+        ["git", "-C", str(checkout), "ls-files", "--error-unmatch", lock_relative],
+        timeout=evidence_command_timeout(deadline, 60, f"{label} lockfile provenance"),
+        description=f"{label} tracked lockfile inspection",
+    )
+    if tracked.returncode != 0:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest lockfile is not tracked at {lock_relative}"
+        )
+    node_bin = node_bin_for_project(project, label)
+    if lockfile.name == "package-lock.json":
+        package_manager = "npm"
+        manager = node_bin / "npm"
+        arguments = [
+            str(manager),
+            "ci",
+            "--offline",
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+        ]
+    else:
+        package_manager = "pnpm"
+        resolved = shutil.which("pnpm")
+        manager = Path(resolved) if resolved is not None else Path()
+        arguments = [
+            str(manager),
+            "install",
+            "--offline",
+            "--frozen-lockfile",
+            "--ignore-scripts",
+        ]
+    if not manager.is_file() or not os.access(manager, os.X_OK):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: {package_manager} is unavailable for "
+            f"the offline Jest proof in {project_relative}"
+        )
+    environment = proof_environment()
+    environment["PATH"] = str(node_bin) + os.pathsep + environment.get("PATH", "")
+    environment["CI"] = "true"
+    installed = run_sandboxed(
+        arguments,
+        cwd=project,
+        profile_path=checkout / ".crosscheck" / "jest-dependencies.sb",
+        allow_network=False,
+        allow_posix_ipc=False,
+        env=environment,
+        timeout=evidence_command_timeout(
+            deadline, evidence_timeout(), f"{label} Jest dependency install"
+        ),
+        description=f"{label} offline Jest dependency install",
+    )
+    if installed.returncode != 0:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: {package_manager} could not materialize "
+            "the lockfile-pinned Jest environment offline: "
+            f"{(installed.stdout + installed.stderr).strip()[:1000] or 'no output'}"
+        )
     if not (jest.is_file() and os.access(jest, os.X_OK)):
         cannot_certify(
             f"{label} CANNOT-CERTIFY: lockfile installation produced no runnable "
@@ -1532,6 +1539,7 @@ def prepare_jest_invocation(
             test_argument,
         ],
         project,
+        environment,
     )
 
 
@@ -1945,7 +1953,7 @@ def execute_mutation_proof(
     create_proof_checkout(review_dir, proof_dir, head_sha, label, deadline)
     baseline_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
     if javascript_project is not None:
-        baseline_argv, baseline_cwd = prepare_jest_invocation(
+        baseline_argv, baseline_cwd, baseline_environment = prepare_jest_invocation(
             proof_dir,
             javascript_project,
             test_path,
@@ -1959,13 +1967,14 @@ def execute_mutation_proof(
         baseline_argv = test_arguments(invocation, test_path, proof_dir, label)
         require_classified_runner(invocation["runner"], label)
         baseline_cwd = proof_dir
+        baseline_environment = proof_environment()
     baseline = run_sandboxed(
         baseline_argv,
         cwd=baseline_cwd,
         profile_path=baseline_profile,
         allow_network=False,
         allow_posix_ipc=False,
-        env=proof_environment(),
+        env=baseline_environment,
         timeout=evidence_command_timeout(
             deadline, evidence_timeout(), f"{label} baseline test"
         ),
@@ -2012,7 +2021,7 @@ def execute_mutation_proof(
         f"{label} mutation changed a different path set between proof checkouts",
     )
     if javascript_project is not None:
-        mutated_argv, mutated_cwd = prepare_jest_invocation(
+        mutated_argv, mutated_cwd, mutated_environment = prepare_jest_invocation(
             proof_dir,
             javascript_project,
             test_path,
@@ -2022,6 +2031,7 @@ def execute_mutation_proof(
     else:
         mutated_argv = test_arguments(invocation, test_path, proof_dir, label)
         mutated_cwd = proof_dir
+        mutated_environment = proof_environment()
     mutated_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
     mutated = run_sandboxed(
         mutated_argv,
@@ -2029,7 +2039,7 @@ def execute_mutation_proof(
         profile_path=mutated_profile,
         allow_network=False,
         allow_posix_ipc=False,
-        env=proof_environment(),
+        env=mutated_environment,
         timeout=evidence_command_timeout(
             deadline, evidence_timeout(), f"{label} mutated test"
         ),
@@ -2506,7 +2516,11 @@ def reviewer_candidates(home: Path, meta: dict[str, str]) -> list[dict[str, str]
                 and author_provider != reviewer_provider
             ):
                 account_is_separate = True
-            elif author_identity is not None and reviewer_provider == author_provider:
+            elif (
+                allow_same_model
+                and author_identity is not None
+                and reviewer_provider == author_provider
+            ):
                 reviewer_identity = account_identity(
                     reviewer["harness"], Path(reviewer["account_home"])
                 )

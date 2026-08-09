@@ -3505,6 +3505,56 @@ finally:
   BRIEF=$CONTINUATION_PACKET
 fi
 
+capture_pi_author_account_identity() {
+  local model=$1 account_dir=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
+  python3 - "$model" "$account_dir" <<'PY'
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+slot, separator, _ = sys.argv[1].partition("/")
+if separator == "" or re.fullmatch(r"openai-codex(?:-[1-9][0-9]*)?", slot) is None:
+    raise SystemExit(1)
+directory = Path(sys.argv[2])
+if not directory.is_absolute():
+    raise SystemExit(1)
+path = directory / "auth.json"
+descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+        raise SystemExit(1)
+    with os.fdopen(descriptor, "rb") as stream:
+        descriptor = -1
+        raw = stream.read(1024 * 1024 + 1)
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+if len(raw) > 1024 * 1024:
+    raise SystemExit(1)
+value = json.loads(raw)
+credential = value.get(slot) if isinstance(value, dict) else None
+identity = credential.get("accountId") if isinstance(credential, dict) else None
+if not isinstance(identity, str) or not identity.strip() or any(
+    character in identity for character in "\0\r\n"
+):
+    raise SystemExit(1)
+sys.stdout.write(identity.strip())
+PY
+}
+
+PI_AUTHOR_ACCOUNT_IDENTITY=
+if [ "$HARNESS" = pi ]; then
+  if [ "$SPAWN_META_PRESENT" = 1 ]; then
+    PI_AUTHOR_ACCOUNT_IDENTITY=$(spawn_preflight_meta_value author_account_identity)
+  else
+    PI_AUTHOR_ACCOUNT_IDENTITY=$(capture_pi_author_account_identity "${MODEL:-default}" 2>/dev/null || true)
+  fi
+fi
+
 # prepare_launch_environment: every step the launch-command construction below
 # The PATH a crewmate's tool commands run with. A harness executes tool commands
 # through a NON-interactive shell, and on this class of host that shell reads only
@@ -4165,6 +4215,7 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
   echo "generation_id=$SPAWN_GENERATION_ID"
+  [ -z "$PI_AUTHOR_ACCOUNT_IDENTITY" ] || echo "author_account_identity=$PI_AUTHOR_ACCOUNT_IDENTITY"
   [ -z "${PROVISION_SUMMARY:-}" ] || echo "provision=$PROVISION_SUMMARY"
   [ "$NO_ACCOUNT_ROUTING" != 1 ] || echo "account_routing_emergency_bypass=1"
   [ -z "$BACKLOG_ROW_EXEMPTION" ] || echo "backlog_row_exemption=$BACKLOG_ROW_EXEMPTION"

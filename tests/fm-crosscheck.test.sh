@@ -1140,6 +1140,123 @@ PY
   pass "all reviewer profiles validate while model and account independence still fail closed"
 }
 
+test_same_model_relaxation_requires_proven_separate_account() {
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$TMP_ROOT" <<'PY' \
+    || fail "same-model relaxation weakened account separation or its safe default"
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+home = Path(sys.argv[2]) / "same-model-relaxation-policy"
+home.mkdir()
+(home / "config").mkdir()
+config_path = home / "reviewer.json"
+os.environ["FM_CROSSCHECK_REVIEWER_CONFIG"] = str(config_path)
+
+
+def pi_home(name, account_id):
+    account_home = home / name
+    account_home.mkdir()
+    (account_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "openai-codex-5": {
+                    "type": "oauth",
+                    "access": "a",
+                    "refresh": "r",
+                    "accountId": account_id,
+                    "expires": 1,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return account_home
+
+
+def codex_home(name, account_id):
+    account_home = home / name
+    account_home.mkdir()
+    if account_id is not None:
+        (account_home / "auth.json").write_text(
+            json.dumps({"tokens": {"account_id": account_id}}),
+            encoding="utf-8",
+        )
+    return account_home
+
+
+author = pi_home("pi-author", "openai-account-A")
+aliased = codex_home("codex-same-account", "openai-account-A")
+distinct = codex_home("codex-distinct-account", "openai-account-B")
+opaque = codex_home("codex-unreadable-account", None)
+meta = {
+    "harness": "pi",
+    "model": "openai-codex-5/gpt-5.6-sol",
+}
+os.environ["PI_CODING_AGENT_DIR"] = str(author)
+mode_path = home / "config" / "crosscheck-same-model"
+
+
+def write_reviewer(account_home):
+    config_path.write_text(
+        json.dumps(
+            {
+                "reviewers": [
+                    {
+                        "harness": "codex",
+                        "model": "gpt-5.6-sol",
+                        "effort": "xhigh",
+                        "account_home": str(account_home),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def expect_refused(account_home, expected, label):
+    write_reviewer(account_home)
+    try:
+        module.reviewer_candidates(home, meta)
+    except module.CrosscheckError as exc:
+        assert expected in str(exc), str(exc)
+        print(f"REFUSED {label}")
+        return
+    raise AssertionError(f"{label} was accepted")
+
+
+# Absent and explicit-off configuration preserve the shipped cross-model rule.
+expect_refused(distinct, "different model", "same-model-default-off")
+mode_path.write_text("off\n", encoding="utf-8")
+expect_refused(distinct, "different model", "same-model-explicit-off")
+
+# Opting in changes only the model screen. The same upstream account remains
+# refused even through a different harness and a different account-home path.
+mode_path.write_text("on\n", encoding="utf-8")
+expect_refused(aliased, "proven-separate account", "same-upstream-account")
+expect_refused(opaque, "proven-separate account", "unreadable-reviewer-account")
+
+write_reviewer(distinct)
+selected = module.reviewer_candidates(home, meta)[0]
+assert selected["account_home"] == str(distinct.resolve()), selected
+assert selected["author_account_identity"] == "openai-account-A", selected
+assert selected["model_independence"] == "same-model", selected
+print("SELECTED same-model-distinct-account")
+
+mode_path.write_text("enabled\n", encoding="utf-8")
+expect_refused(distinct, "must contain exactly 'on' or 'off'", "invalid-mode")
+PY
+  pass "same-model opt-in preserves mandatory executing-account separation"
+}
+
 test_openai_backed_reviewer_proves_account_separation() {
   "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$TMP_ROOT" <<'PY' \
     || fail "OpenAI-backed account separation regressed to a path comparison"
@@ -1887,7 +2004,63 @@ test_clear_review_uses_policy_contract() {
     "PR claims were not delimited as untrusted data"
   assert_grep 'Do not spend this bounded independent-review run repeating the full suite' "$case_dir/prompt.log" \
     "reviewer was not directed toward focused evidence"
+  assert_no_grep 'SAME-MODEL REVIEW' "$case_dir/prompt.log" \
+    "an ordinary cross-model review received the reduced-independence prompt"
   pass "clear review uses the observed policy-grade Codex invocation"
+}
+
+test_same_model_review_is_adversarial_and_durable() {
+  local record case_dir base head output
+  record=$(make_case same-model-adversarial-evidence)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  mkdir -p "$case_dir/home/config"
+  printf 'on\n' > "$case_dir/home/config/crosscheck-same-model"
+  printf '%s\n' \
+    '{"openai-codex-5":{"type":"oauth","access":"test-access","refresh":"test-refresh","expires":4102444800000,"accountId":"test-author-account"}}' \
+    > "$case_dir/author-home/auth.json"
+  sed -i.bak \
+    -e 's/harness=codex/harness=pi/' \
+    -e 's#model=gpt-5.5#model=openai-codex-5/gpt-5.6-sol#' \
+    -e '/^account_home=/d' \
+    "$case_dir/state/task-x1.meta"
+  rm "$case_dir/state/task-x1.meta.bak"
+
+  output=$(PI_CODING_AGENT_DIR="$case_dir/author-home" \
+    run_case "$case_dir" "$base" "$head" clear run) \
+    || fail "same-model reviewer on a different account did not complete"
+  assert_contains "$output" 'crosscheck clear' \
+    "same-model reviewer did not produce a verdict"
+  assert_grep 'SAME-MODEL REVIEW - REDUCED MODEL INDEPENDENCE' \
+    "$case_dir/prompt.log" \
+    "same-model review did not visibly announce reduced model independence"
+  assert_grep "may share the author's blind spots and priors" \
+    "$case_dir/prompt.log" \
+    "same-model review did not name the shared-blind-spot risk"
+  assert_grep 'attack the change adversarially, try to falsify' \
+    "$case_dir/prompt.log" \
+    "same-model review was not directed to falsify the author"
+  assert_grep 'default to reporting a finding when uncertain' \
+    "$case_dir/prompt.log" \
+    "same-model review was not biased toward reporting uncertainty"
+  "$CROSSCHECK_PYTHON" - \
+    "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    "$case_dir/data/task-x1/crosscheck.md" <<'PY' \
+    || fail "same-model evidence did not remain explicit in both durable surfaces"
+import json
+from pathlib import Path
+import sys
+
+ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+run = ledger["runs"][-1]
+assert run["state"] == "clear", run
+assert run["reviewer"]["harness"] == "codex", run["reviewer"]
+assert run["reviewer"]["model"] == "gpt-5.6-sol", run["reviewer"]
+assert run["reviewer"]["model_independence"] == "same-model", run["reviewer"]
+report = Path(sys.argv[2]).read_text(encoding="utf-8")
+assert "Review mode: **SAME-MODEL**" in report, report
+assert "account separation remained mandatory" in report, report
+PY
+  pass "same-model review uses an adversarial prompt and records reduced independence"
 }
 
 test_empty_runtime_overrides_use_home_defaults() {
@@ -4044,6 +4217,7 @@ test_verify_rechecks_live_head_and_claims() {
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
     test_reviewer_policy_profiles_and_independence|\
+    test_same_model_relaxation_requires_proven_separate_account|\
     test_openai_backed_reviewer_proves_account_separation|\
     test_anthropic_backed_reviewer_proves_account_separation|\
     test_unrouted_lane_compares_provider_not_harness|\
@@ -4055,6 +4229,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_pi_reviewer_executes_bound_policy_profile|\
     test_pi_reviewer_failures_are_tool_failures|\
     test_clear_review_uses_policy_contract|\
+    test_same_model_review_is_adversarial_and_durable|\
     test_empty_runtime_overrides_use_home_defaults|\
     test_empty_environment_fallback_is_generic|\
     test_set_runtime_overrides_remain_authoritative|\
@@ -4124,6 +4299,7 @@ fi
 
 test_launcher_requires_supported_python
 test_reviewer_policy_profiles_and_independence
+test_same_model_relaxation_requires_proven_separate_account
 test_openai_backed_reviewer_proves_account_separation
 test_anthropic_backed_reviewer_proves_account_separation
 test_unrouted_lane_compares_provider_not_harness
@@ -4135,6 +4311,7 @@ test_pi_reviewer_pins_sibling_node_before_path
 test_pi_reviewer_executes_bound_policy_profile
 test_pi_reviewer_failures_are_tool_failures
 test_clear_review_uses_policy_contract
+test_same_model_review_is_adversarial_and_durable
 test_empty_runtime_overrides_use_home_defaults
 test_empty_environment_fallback_is_generic
 test_set_runtime_overrides_remain_authoritative

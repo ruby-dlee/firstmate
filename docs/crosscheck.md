@@ -4,8 +4,9 @@ Crosscheck is an independent exact-head finding ledger at the PR merge gate.
 It is not a second implementation of tests, lint, documentation checks, pushing, PR creation, or CI.
 No-mistakes remains the owner of that validation pipeline.
 
-The review portion is intentionally close to "no-mistakes review with a fresh, different model."
+By default, the review portion is intentionally close to "no-mistakes review with a fresh, different model."
 Most of its review-quality value comes from that cross-model independence.
+A home can explicitly accept reduced model independence for a proven-separate reviewer account, but the evidence always identifies that weaker mode.
 The separate mechanism earns its keep only through four contracts that no-mistakes does not currently own: durable finding lifecycle across runs, gate-executed reproduction evidence, gate-executed mutation proof for fixes, and an exact reviewed SHA passed atomically to GitHub at merge.
 If those contracts move into no-mistakes, the separate reviewer runner should be removed rather than defended as a parallel product.
 
@@ -39,8 +40,14 @@ The file is local and gitignored at `config/crosscheck-reviewer.json`.
 }
 ```
 
-Crosscheck resolves each configured account home and keeps every entry whose model differs from the routed author identity recorded in task metadata and whose account is provably not the author's, in configured order.
-It then binds the provider's executing credential selector to that exact path and requires the verdict plus a Bash-created receipt to report the selector and actual private `HOME`.
+Crosscheck resolves each configured account home and keeps every entry that satisfies the home's model policy and whose account is provably not the author's, in configured order.
+Model separation is mandatory by default.
+The optional local `config/crosscheck-same-model` file relaxes only that screen when it contains exactly `on`; an absent file or exactly `off` preserves the default, and any other value or unsafe file shape is refused.
+This setting is local and gitignored, is read fresh for each reviewer selection, and is not inferred from the reviewer roster or environment.
+It does not weaken account separation: the same upstream account and an unreadable identity remain ineligible even when the setting is on.
+A selected same-model reviewer receives a visible reduced-independence prompt that directs it to attack the change adversarially, falsify the author's claims instead of confirming them, and report a finding when uncertain.
+Its ledger reviewer record carries `model_independence: same-model`, and the readable report labels the run `SAME-MODEL` so the reduced independence cannot be mistaken for a cross-model review.
+Crosscheck then binds the provider's executing credential selector to that exact path and requires the verdict plus a Bash-created receipt to report the selector and actual private `HOME`.
 Account separation therefore depends on the executing credential source rather than a configuration label.
 Every reviewer disables reviewed-repository instruction discovery at launch: Codex sets `project_doc_max_bytes=0`, Claude uses `--safe-mode`, and Pi uses `--no-context-files`.
 Pi is launched through the resolved installed executable with `openai-codex/gpt-5.6-sol` at `xhigh`, JSON event output, an ephemeral session, and only the read and Bash-capable review tools.
@@ -57,7 +64,8 @@ A usage-limited reviewer account records a `tool-failure`, never a verdict about
 Failover is limited to faults that prevented a verdict: a launch failure, an unusable credential, a provider that was never reached, or an exhausted account.
 A reviewer that reached the model and then declined clearance, returned no valid artifact, or returned a malformed one ends the run on the spot, because that is the reviewer's own conclusion and a second account must not be used to shop for a friendlier one.
 Each abandoned attempt is recorded as its own `tool-failure` run, so the ledger names every account that was tried and why it was left, and each attempt gets its own pristine exact-head checkout so no reviewer inherits an earlier reviewer's helpers or scratch state.
-Selection therefore makes the gate as available as the roster rather than as available as its first entry, and independence is unchanged: every candidate passed the same model and account separation screen, and `run_reviewer` still re-proves separation against the credential it actually binds.
+Selection therefore makes the gate as available as the roster rather than as available as its first entry.
+Every candidate passed the configured model policy and the mandatory account-separation screen, and `run_reviewer` still re-proves account separation against the credential it actually binds.
 
 One upstream account routinely exists behind several directories at once, so two different `account_home` paths can execute as the same account.
 Codex and Pi both authenticate against OpenAI, and a Claude config home that records no account of its own borrows whatever credential the environment supplies.
@@ -69,14 +77,16 @@ The account is read from `tokens.account_id` for Codex, `openai-codex.accountId`
 A lane that records no `account_home` is an ordinary supported author identity, not an emergency.
 Account routing is off by design for any harness outside Codex and Claude, so a Pi lane structurally cannot record an `account_home`.
 Requiring one, or an `account_routing_emergency_bypass=1` marker in its place, made every Pi-launched lane permanently unmergeable through this gate, and a bypass that has to be set on the majority of lanes is not a gate.
-Such a lane is refused only when its harness maps to no known provider namespace, because then nothing is left to prove separation with.
-For an account-bearing lane a reviewer is proved independent on the executing account; for an account-less lane the equivalent fact is the provider namespace, since an Anthropic account cannot be an OpenAI account and the two model namespaces are disjoint.
-A reviewer on the other supported provider therefore establishes both account-namespace and model separation without inventing an `account_home` for the author, and `account_routing_emergency_bypass=1` remains accepted but is no longer required.
-Model separation compares the model itself, not the recorded string: Pi records `<provider-slot>/<model>`, so `openai-codex-2/gpt-5.6-sol` is the same model as a Codex reviewer's `gpt-5.6-sol` and must never read as separate from it.
-Provider is what that lane compares, not harness: Codex and Pi are both the OpenAI provider, so an unrouted Codex author is reviewable only by Claude, while an unrouted Claude author is reviewable by either Codex or Pi.
-A same-provider reviewer still fails closed for that structurally unrouted task because account independence cannot be proved.
-The accepted profiles are Codex `gpt-5.6-sol` xhigh, Claude `claude-opus-5` xhigh, and Pi `gpt-5.6-sol` xhigh.
-Absent configuration, unavailable credentials, missing model separation, and unprovable account separation all produce `CROSSCHECK TOOL-FAILURE` and a nonzero exit before reviewer launch.
+A different supported provider proves account separation by namespace for any account-less author.
+A Pi author additionally records the exact selected provider slot in its model prefix, and Crosscheck resolves that slot's current `accountId` from `PI_CODING_AGENT_DIR/auth.json` or the default Pi agent directory.
+That identity lets a same-provider reviewer prove it executes as another OpenAI account without inventing an `account_home` for the author.
+A missing directory, malformed auth file, absent slot, or unreadable `accountId` proves nothing and leaves every same-provider reviewer ineligible.
+Other account-less same-provider pairs remain ineligible because no account comparison is available.
+Model identity compares the model itself, not the recorded string: Pi records `<provider-slot>/<model>`, so `openai-codex-2/gpt-5.6-sol` is the same model as a Codex reviewer's `gpt-5.6-sol`.
+That canonical identity is screened out by default and is what marks a selected review as same-model when the explicit relaxation is on.
+Provider is what the namespace fallback compares, not harness: Codex and Pi are both the OpenAI provider, while Anthropic is separate.
+The accepted profiles are Codex `gpt-5.6-sol` xhigh, Claude `claude-opus-5` xhigh, and Pi `gpt-5.6-sol` xhigh; no allowlist change is needed to enable the existing Codex profile.
+Absent reviewer configuration, unavailable credentials, model-policy mismatch, and unprovable account separation all produce `CROSSCHECK TOOL-FAILURE` and a nonzero exit before reviewer launch.
 
 Crosscheck requires Python 3.11 or newer and refuses to run on anything older.
 This is a safety floor rather than a style preference: the bounded-read layer rejects hostile JSON integers by relying on CPython's integer/string conversion limit, which first exists in 3.11, and on an older interpreter that rejection silently stops happening while every banner the gate prints reads exactly the same.
@@ -140,6 +150,8 @@ Silence never closes, supersedes, or deletes a finding.
 A `verified-fixed` lifecycle remains durable, but its proof clears only the exact head on which the gate executed it; a new head requires a fresh mutation proof.
 
 Each run has one outcome class.
+A run that used the local same-model relaxation records `reviewer.model_independence` as `same-model`; older and ordinary cross-model runs omit that field.
+The readable report renders the same distinction before its summary.
 
 - `tool-failure` means environment, task metadata, reviewer configuration, exact-head fetch, executing-account binding, or required command-execution proof prevented a trustworthy verdict.
 - `unreviewed` means a reviewer ran but no valid exact-head verdict artifact exists.
@@ -295,7 +307,8 @@ Its tracked `test_real_claude_sandbox_executes_exact_sha_git_diff` case is an op
 Ordinary CI prints a named skip for this network- and credential-dependent guard instead of substituting fake-only coverage.
 The retained live runtime proof is the change receipt for this patch; the opt-in test is the repeatable regression guard for future environments.
 Its `test_pytest_runner_resolves_through_a_uv_aware_ladder` case is the named regression for runner-name resolution: it pins monorepo uv-project discovery, the skipped uv rung outside a project, the unchanged absent-runner refusal, and pytest's retained node-id support.
-Its `test_account_less_known_provider_lane_is_reviewable` case is the named regression for account-less lanes: it drives a Pi lane with no `account_home` and a slot-qualified model, requires a cross-provider reviewer to clear it, and requires a same-provider reviewer to be refused.
+Its `test_account_less_known_provider_lane_is_reviewable` case is the named regression for an account-less Pi lane whose provider-slot identity is unreadable: it requires a cross-provider reviewer to clear it and a same-provider reviewer to remain refused.
+Its `test_same_model_relaxation_requires_proven_separate_account` case provides a readable routed Pi slot and proves that default and explicit-off policy reject the same model, opt-in still rejects the same or unreadable reviewer account, and only a distinct OpenAI account becomes eligible.
 Its `test_claude_execution_home_always_binds_the_keychain` case is the named regression for the private-`HOME` Keychain bind, and it fails if the bind is made conditional on `.credentials.json` again.
 Its `test_moved_default_branch_stays_reviewable` case is the named regression for base drift: it advances the fake default branch past the PR's branch point, then requires the run to review against the merge base, record it, and still verify.
 Its `test_unavailable_reviewer_fails_over_to_the_next_account` case covers reviewer failover using the observed zero-turn Claude error envelope, and asserts the ledger records the abandoned attempt with the reason the reviewer reported rather than a truncated envelope.

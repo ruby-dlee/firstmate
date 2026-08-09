@@ -49,6 +49,7 @@ MAX_LEDGER_BYTES = 16 * 1024 * 1024
 # output-limit error. Overflow remains a refusal.
 REVIEW_STATUS_MAX_BYTES = 4 * 1024 * 1024
 MAX_REVIEWER_CONFIG_BYTES = 64 * 1024
+MAX_SAME_MODEL_CONFIG_BYTES = 16
 MAX_LEDGER_PROMPT_BYTES = 64_000
 MAX_PROJECTED_FINDINGS = 512
 MAX_PROJECTED_EVENTS = 8
@@ -169,6 +170,43 @@ def environment_value(name: str, default: str) -> str:
 
     value = os.environ.get(name)
     return default if value is None or value == "" else value
+
+
+def same_model_review_enabled(home: Path) -> bool:
+    """Read the home-local same-model relaxation, defaulting safely to off."""
+
+    path = home / "config" / "crosscheck-same-model"
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        metadata = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(metadata.st_mode),
+            f"config/crosscheck-same-model must be a regular non-symlink file at {path}",
+        )
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            raw = handle.read(MAX_SAME_MODEL_CONFIG_BYTES + 1)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        fail(f"config/crosscheck-same-model inspection failed at {path}: {exc}")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    require(
+        len(raw) <= MAX_SAME_MODEL_CONFIG_BYTES,
+        "config/crosscheck-same-model must contain exactly 'on' or 'off'",
+    )
+    try:
+        value = raw.decode("utf-8").strip()
+    except UnicodeError:
+        fail("config/crosscheck-same-model must be valid UTF-8 containing 'on' or 'off'")
+    require(
+        value in {"on", "off"},
+        "config/crosscheck-same-model must contain exactly 'on' or 'off'",
+    )
+    return value == "on"
 
 
 def claude_scoped_keychain_service(account_home: Path) -> str:
@@ -428,6 +466,49 @@ def model_identity(model: str) -> str:
 
     return model.rsplit("/", 1)[-1].strip()
 
+
+PI_OPENAI_PROVIDER_SLOT_RE = re.compile(r"^openai-codex(?:-[1-9][0-9]*)?$")
+
+
+def pi_author_account_identity(model: str, account_home: Path | None) -> str | None:
+    """Resolve the OpenAI account selected by a routed Pi provider slot.
+
+    Pi task metadata records the selected provider slot as the model prefix but
+    does not carry account_home. That slot is the only author credential selector
+    available to an OpenAI reviewer, so an unreadable slot remains unproven.
+    """
+
+    provider_slot, separator, _ = model.partition("/")
+    if separator == "" or PI_OPENAI_PROVIDER_SLOT_RE.fullmatch(provider_slot) is None:
+        return None
+    if account_home is None:
+        configured_home = Path(
+            environment_value(
+                "PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent")
+            )
+        )
+        if not configured_home.is_absolute():
+            return None
+        account_home = configured_home
+    credential_file = account_home / "auth.json"
+    try:
+        credentials = read_bounded_json(
+            credential_file,
+            maximum_bytes=1024 * 1024,
+            maximum_items=256,
+            maximum_string_bytes=1024 * 1024,
+        )
+    except BoundedIOError:
+        return None
+    if not isinstance(credentials, dict):
+        return None
+    credential = credentials.get(provider_slot)
+    identity = credential.get("accountId") if isinstance(credential, dict) else None
+    if isinstance(identity, str) and identity.strip():
+        return identity.strip()
+    return None
+
+
 OPENAI_BACKED_HARNESSES = {
     harness for harness, provider in HARNESS_PROVIDERS.items() if provider == "openai"
 }
@@ -499,6 +580,18 @@ def anthropic_account_identity(account_home: Path) -> str | None:
     if isinstance(identity, str) and identity.strip():
         return identity.strip()
     return None
+
+
+def author_account_identity(
+    meta: dict[str, str], account_home: Path | None
+) -> str | None:
+    """Return the author's upstream account without inventing missing proof."""
+
+    if meta["harness"] == "pi" and "/" in meta["model"]:
+        return pi_author_account_identity(meta["model"], account_home)
+    if account_home is None:
+        return None
+    return account_identity(meta["harness"], account_home)
 
 
 def account_identity(harness: str, account_home: Path) -> str | None:
@@ -1721,6 +1814,11 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
             require(not run["active_blockers"], f"{label} cannot be clear with blockers")
             require(not run["suspicions"], f"{label} cannot be clear with suspicions")
         reviewer = run.get("reviewer")
+        if isinstance(reviewer, dict):
+            require(
+                reviewer.get("model_independence") in {None, "same-model"},
+                f"{label}.reviewer.model_independence is invalid",
+            )
         if isinstance(reviewer, dict) and "execution_proof" in reviewer:
             execution_home = reviewer.get("execution_home")
             require(
@@ -1867,12 +1965,13 @@ def reviewer_candidates(home: Path, meta: dict[str, str]) -> list[dict[str, str]
     A single pick made the gate only as available as one account: a reviewer at
     its usage limit, or one whose provider refused the launch, refused the merge
     for the whole fleet even though other proven-independent accounts were
-    configured and idle. Every entry returned here has already passed the same
-    model and account separation screen, so failing over between them cannot
-    weaken independence, and `run_reviewer` still re-proves separation against
-    the credential it actually binds.
+    configured and idle. Every entry returned here has passed the configured
+    model policy and the mandatory account-separation screen, so failing over
+    between them cannot weaken account independence, and `run_reviewer` still
+    re-proves account separation against the credential it actually binds.
     """
 
+    allow_same_model = same_model_review_enabled(home)
     config_path = Path(
         environment_value(
             "FM_CROSSCHECK_REVIEWER_CONFIG",
@@ -1911,12 +2010,10 @@ def reviewer_candidates(home: Path, meta: dict[str, str]) -> list[dict[str, str]
     #
     # What the identity check is actually for is proving the reviewer is not the
     # author. For an account-bearing lane that is proved on the executing
-    # account. For an account-less lane the equivalent fact is the provider
-    # namespace: an Anthropic account cannot be an OpenAI account, and the two
-    # model namespaces are disjoint, so a cross-provider reviewer establishes
-    # both account and model separation structurally rather than by comparison.
-    # A same-provider reviewer for such a lane stays refused below, because
-    # there is nothing left to prove separation with.
+    # account. For an account-less lane a different provider proves separation
+    # structurally. Pi also records its exact provider slot in model metadata,
+    # so its current account id can prove a same-provider pair; an unreadable
+    # slot remains unproven exactly like an unreadable account_home.
     require(
         author_home_value is not None or meta["harness"] in HARNESS_PROVIDERS,
         "author identity inspection found no account_home and no known provider "
@@ -1956,16 +2053,13 @@ def reviewer_candidates(home: Path, meta: dict[str, str]) -> list[dict[str, str]
                 "account_home": str(account_home.resolve()),
             }
         )
-    author_identity = (
-        account_identity(meta["harness"], author_home)
-        if author_home is not None
-        else None
-    )
+    author_identity = author_account_identity(meta, author_home)
     author_provider_for_pairs = HARNESS_PROVIDERS.get(meta["harness"])
     author_model = model_identity(meta["model"])
     independent: list[dict[str, str]] = []
     for reviewer in validated:
         model_is_separate = model_identity(reviewer["model"]) != author_model
+        model_is_eligible = model_is_separate or allow_same_model
         if author_home is not None:
             account_is_separate = Path(reviewer["account_home"]) != author_home
             if account_is_separate and (
@@ -1990,35 +2084,68 @@ def reviewer_candidates(home: Path, meta: dict[str, str]) -> list[dict[str, str]
                 else:
                     account_is_separate = author_identity != reviewer_identity
         else:
-            # Without an author account_home the only separation available is
-            # the provider namespace, and a different harness is not one: a Pi
-            # reviewer reaches the same OpenAI accounts a Codex author uses. An
-            # unmapped harness on either side proves nothing and stays refused.
+            # Without account_home, a different provider proves separation by
+            # namespace. A Pi lane additionally records its provider slot in
+            # model metadata, so a same-provider reviewer can be compared to
+            # that slot's readable account id. Every other same-provider pair,
+            # and an unreadable Pi slot on either side, remains unproven.
             author_provider = HARNESS_PROVIDERS.get(meta["harness"])
             reviewer_provider = HARNESS_PROVIDERS.get(reviewer["harness"])
-            account_is_separate = (
+            if (
                 author_provider is not None
                 and reviewer_provider is not None
                 and author_provider != reviewer_provider
-            )
-        if model_is_separate and account_is_separate:
+            ):
+                account_is_separate = True
+            elif author_identity is not None and reviewer_provider == author_provider:
+                reviewer_identity = account_identity(
+                    reviewer["harness"], Path(reviewer["account_home"])
+                )
+                account_is_separate = (
+                    reviewer_identity is not None
+                    and reviewer_identity != author_identity
+                )
+            else:
+                account_is_separate = False
+        if model_is_eligible and account_is_separate:
             if author_identity is not None and author_provider_for_pairs == (
                 HARNESS_PROVIDERS.get(reviewer["harness"])
             ):
                 # Carried so the executing credential, not the configured
                 # path, has the final word on account separation.
                 reviewer["author_account_identity"] = author_identity
+            if not model_is_separate:
+                reviewer["model_independence"] = "same-model"
             independent.append(reviewer)
     if independent:
         return independent
     if author_home is not None:
+        required_independence = (
+            "a proven-separate account from the author"
+            if allow_same_model
+            else "both a different model and a proven-separate account from the author"
+        )
         fail(
-            "independence inspection found no configured reviewer with both a "
-            "different model and a proven-separate account from the author "
+            "independence inspection found no configured reviewer with "
+            f"{required_independence} "
             f"(model={meta['model']!r}, account_home={str(author_home)!r}); "
             "a same-provider reviewer must also resolve a different executing "
             "account than the author, because two directories can carry one "
             "upstream account and a home that names no account proves nothing"
+        )
+    if allow_same_model:
+        if author_identity is not None:
+            fail(
+                "independence inspection found no configured reviewer with a "
+                "proven-separate account from the structurally unrouted author "
+                f"(harness={meta['harness']!r}, model={meta['model']!r})"
+            )
+        fail(
+            "independence inspection found no configured reviewer on a different "
+            "provider from the structurally unrouted author "
+            f"(harness={meta['harness']!r}, model={meta['model']!r}); same-provider "
+            "account separation cannot be proved without account_home or a readable "
+            "Pi provider-slot identity"
         )
     fail(
         "independence inspection found no configured reviewer with both a "
@@ -2232,8 +2359,15 @@ def make_prompt(
     config: dict[str, str],
 ) -> str:
     projection = ledger_prompt_projection(ledger, snapshot_value["head_sha"])
+    same_model_warning = ""
+    if config.get("model_independence") == "same-model":
+        same_model_warning = """
+SAME-MODEL REVIEW - REDUCED MODEL INDEPENDENCE:
+You are using the same model as the author and may share the author's blind spots and priors.
+Compensate explicitly: attack the change adversarially, try to falsify the author's claims rather than confirm them, and default to reporting a finding when uncertain.
+"""
     return f"""You are the independent merge-gate reviewer for a pull request.
-Review exact head {snapshot_value['head_sha']} against exact base {snapshot_value['base_sha']}.
+{same_model_warning}Review exact head {snapshot_value['head_sha']} against exact base {snapshot_value['base_sha']}.
 Perform a rigorous release-readiness review of the full diff and the PR's own claims.
 Do not trust the PR description or a previous clean run.
 Do not change tracked files.
@@ -3194,11 +3328,23 @@ def render_report(ledger: dict[str, Any], run: dict[str, Any]) -> str:
         "",
         f"Claims digest: `{run['claims_sha256']}`",
         "",
-        f"Summary: {run['summary']}",
-        "",
-        "## Durable findings",
-        "",
     ]
+    reviewer = run.get("reviewer")
+    if isinstance(reviewer, dict) and reviewer.get("model_independence") == "same-model":
+        lines.extend(
+            [
+                "Review mode: **SAME-MODEL** (reduced model independence; account separation remained mandatory).",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            f"Summary: {run['summary']}",
+            "",
+            "## Durable findings",
+            "",
+        ]
+    )
     if ledger["findings"]:
         for finding in ledger["findings"]:
             lines.append(

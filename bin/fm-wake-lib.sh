@@ -88,6 +88,162 @@ fm_watcher_healthy() {
   return 0
 }
 
+# Enumerate one recorded process tree strictly by numeric pid and parentage.
+# Command text is intentionally absent from both the input and the selection:
+# watcher strings routinely appear in agent briefs and cannot identify a
+# process. Output is deepest-first "<depth> <pid>" for bounded descendant drain
+# and KILL escalation.
+fm_pid_tree_snapshot() {  # <root-pid>
+  local root=$1
+  case "$root" in ''|*[!0-9]*) return 1 ;; esac
+  LC_ALL=C ps -axo pid=,ppid= 2>/dev/null | awk -v root="$root" '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+      count++
+      pid[count] = $1
+      parent[count] = $2
+    }
+    END {
+      depth[root] = 0
+      for (round = 1; round <= count; round++) {
+        changed = 0
+        for (index_value = 1; index_value <= count; index_value++) {
+          current = pid[index_value]
+          if (!(current in depth) && (parent[index_value] in depth)) {
+            depth[current] = depth[parent[index_value]] + 1
+            changed = 1
+          }
+        }
+        if (!changed) break
+      }
+      for (index_value = 1; index_value <= count; index_value++) {
+        current = pid[index_value]
+        if (current in depth) print depth[current], current
+      }
+    }
+  ' | sort -k1,1nr -k2,2nr
+}
+
+FM_WATCHER_TREE_CPU=
+FM_WATCHER_TREE_COUNT=0
+fm_watcher_tree_usage() {  # <recorded-root-pid>
+  local root=$1 result
+  case "$root" in ''|*[!0-9]*) return 1 ;; esac
+  result=$(LC_ALL=C ps -axo pid=,ppid=,%cpu= 2>/dev/null | awk -v root="$root" '
+    $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+([.][0-9]+)?$/ {
+      count++
+      pid[count] = $1
+      parent[count] = $2
+      cpu[count] = $3
+    }
+    END {
+      owned[root] = 1
+      for (round = 1; round <= count; round++) {
+        changed = 0
+        for (index_value = 1; index_value <= count; index_value++) {
+          current = pid[index_value]
+          if (!(current in owned) && (parent[index_value] in owned)) {
+            owned[current] = 1
+            changed = 1
+          }
+        }
+        if (!changed) break
+      }
+      total = 0
+      members = 0
+      for (index_value = 1; index_value <= count; index_value++) {
+        current = pid[index_value]
+        if (current in owned) {
+          total += cpu[index_value]
+          members++
+        }
+      }
+      if (!members) exit 1
+      printf "%.1f\t%d\n", total, members
+    }
+  ') || return 1
+  # shellcheck disable=SC2034 # CPU and count are the caller-facing snapshot globals.
+  IFS=$(printf '\t') read -r FM_WATCHER_TREE_CPU FM_WATCHER_TREE_COUNT <<EOF
+$result
+EOF
+  [ -n "$FM_WATCHER_TREE_CPU" ]
+}
+
+# Stop only a previously validated recorded root and its exact descendants.
+# Every signal target comes from fm_pid_tree_snapshot and is identity-pinned
+# before the first signal, so pid reuse cannot turn recovery into a broad kill.
+fm_pid_tree_stop() {  # <root-pid> [term-wait-tenths] [expected-root-identity]
+  local root=$1 wait_tenths=${2:-30} expected_identity=${3:-}
+  local pid identity index iteration any root_verified
+  local tree_pids=() tree_identities=()
+  while IFS=' ' read -r _depth pid; do
+    [ -n "$pid" ] || continue
+    identity=$(fm_pid_identity "$pid") || continue
+    tree_pids+=("$pid")
+    tree_identities+=("$identity")
+  done < <(fm_pid_tree_snapshot "$root")
+  [ "${#tree_pids[@]}" -gt 0 ] || return 0
+  if [ -n "$expected_identity" ]; then
+    root_verified=0
+    for index in "${!tree_pids[@]}"; do
+      [ "${tree_pids[$index]}" = "$root" ] || continue
+      [ "${tree_identities[$index]}" = "$expected_identity" ] && root_verified=1
+      break
+    done
+    # The recorded process exited or its pid was reused between lock validation
+    # and snapshot. There is no longer an identity-pinned owned tree to signal.
+    [ "$root_verified" -eq 1 ] || return 0
+  fi
+  # Ask the root to stop first so it cannot launch new work as descendants are
+  # drained. Bash may defer TERM while waiting on a child, which is why the
+  # deepest-first descendant pass and the later KILL bound are still required.
+  for index in "${!tree_pids[@]}"; do
+    [ "${tree_pids[$index]}" = "$root" ] || continue
+    [ "$(fm_pid_identity "$root" 2>/dev/null || true)" = "${tree_identities[$index]}" ] || continue
+    kill -TERM "$root" 2>/dev/null || true
+    break
+  done
+  for index in "${!tree_pids[@]}"; do
+    pid=${tree_pids[$index]}
+    [ "$pid" != "$root" ] || continue
+    [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "${tree_identities[$index]}" ] || continue
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  iteration=0
+  while [ "$iteration" -lt "$wait_tenths" ]; do
+    any=0
+    for index in "${!tree_pids[@]}"; do
+      pid=${tree_pids[$index]}
+      if [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "${tree_identities[$index]}" ]; then
+        any=1
+        break
+      fi
+    done
+    [ "$any" -eq 0 ] && return 0
+    sleep 0.1
+    iteration=$((iteration + 1))
+  done
+  for index in "${!tree_pids[@]}"; do
+    pid=${tree_pids[$index]}
+    [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "${tree_identities[$index]}" ] || continue
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  iteration=0
+  while [ "$iteration" -lt 20 ]; do
+    any=0
+    for index in "${!tree_pids[@]}"; do
+      pid=${tree_pids[$index]}
+      if [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "${tree_identities[$index]}" ]; then
+        any=1
+        break
+      fi
+    done
+    [ "$any" -eq 0 ] && return 0
+    sleep 0.1
+    iteration=$((iteration + 1))
+  done
+  return 1
+}
+
 fm_lock_clean_known_files() {
   local lockdir=$1 target=$2 confined
   confined=$(fm_lock_confined_target "$lockdir" "$target") || return 1

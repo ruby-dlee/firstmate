@@ -68,6 +68,7 @@
 80	tests/fm-pi-primary-types.test.sh
 3170	tests/fm-pi-watch-extension.test.sh
 1574	tests/fm-pr-merge.test.sh
+1000	tests/fm-process-tree.test.sh
 802	tests/fm-prompt-exec.test.sh
 261383	tests/fm-report-stack-a.test.sh
 243164	tests/fm-report-stack-b.test.sh
@@ -102,6 +103,7 @@
 180000	tests/fm-watch-pause-absorb.test.sh
 95645	tests/fm-watch-triage.test.sh
 20435	tests/fm-watcher-lock.test.sh
+305000	tests/fm-watcher-runaway.test.sh
 23744	tests/fm-x-mode.test.sh
 250	tests/lavish-repair.test.sh
 6200	tests/lavish.test.sh

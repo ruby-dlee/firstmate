@@ -6,12 +6,14 @@
 # non-default branch, because that means firstmate-on-itself work landed in the
 # primary instead of an isolated worktree.
 # Then, if any task is in flight (a state/<id>.meta exists) and the watcher's
-# liveness beacon (state/.last-watcher-beat, touched every poll cycle) is
+# liveness beacon (state/.last-watcher-beat, touched between bounded phases) is
 # missing or older than FM_GUARD_GRACE seconds, prints a loud, clearly delimited
 # banner so the agent cannot skim past it in the tool output of whatever it was
-# doing - the one channel every harness has. Normal wake handling (watcher
+# doing - the one channel every harness has. A live lock gets the tighter
+# FM_WATCH_PROGRESS_GRACE check, because normal wake-and-rearm handoff grace must
+# not make an already-wedged holder look healthy. Normal wake handling (watcher
 # briefly down between a wake and the next supervision resume) stays inside the
-# grace window and stays silent. Always exits 0: the guard warns, it never
+# broad grace window and stays silent. Always exits 0: the guard warns, it never
 # blocks.
 set -u
 
@@ -21,6 +23,10 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 GRACE=${FM_GUARD_GRACE:-300}
+PROGRESS_GRACE=${FM_WATCH_PROGRESS_GRACE:-60}
+CPU_LIMIT=${FM_WATCH_CPU_LIMIT:-80}
+case "$PROGRESS_GRACE" in ''|*[!0-9]*|0) PROGRESS_GRACE=60 ;; esac
+case "$CPU_LIMIT" in ''|*[!0-9]*|0) CPU_LIMIT=80 ;; esac
 queue_pending=false
 READ_ONLY=${FM_GUARD_READ_ONLY:-0}
 case "$READ_ONLY" in 1|true|TRUE|yes|YES) READ_ONLY=1 ;; *) READ_ONLY=0 ;; esac
@@ -72,9 +78,59 @@ beacon_desc=$FM_SUP_BEACON_DESC
 
 [ -s "$FM_WAKE_QUEUE" ] && queue_pending=true
 
+# Beacon freshness cannot detect a sibling burning a core while the recorded
+# parent remains alive. Inspect only the lock-recorded pid and its descendants;
+# never select by command text, which may merely quote the watcher in a brief.
+watcher_pid=$(cat "$STATE/.watch.lock/pid" 2>/dev/null || true)
+watcher_lock_live=false
+watcher_progress_stale=false
+if fm_watcher_lock_matches_pid "$STATE" "$SCRIPT_DIR/fm-watch.sh" "$watcher_pid" "$FM_HOME"; then
+  watcher_lock_live=true
+  watcher_age=$(fm_path_age "$STATE/.last-watcher-beat")
+  [ "$watcher_age" -ge "$PROGRESS_GRACE" ] && watcher_progress_stale=true
+fi
+if "$watcher_lock_live" \
+  && fm_watcher_tree_usage "$watcher_pid" \
+  && awk -v actual="$FM_WATCHER_TREE_CPU" -v limit="$CPU_LIMIT" 'BEGIN { exit !(actual >= limit) }'; then
+  resource_rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+  {
+    printf '●%s\n' "$resource_rule"
+    printf '●  WATCHER RUNAWAY - SUPERVISION IS CONSUMING A CORE\n'
+    printf '●  Recorded watcher pid %s and its exact descendant tree are using %s%% CPU across %s processes (limit %s%%).\n' \
+      "$watcher_pid" "$FM_WATCHER_TREE_CPU" "$FM_WATCHER_TREE_COUNT" "$CPU_LIMIT"
+    if [ "$READ_ONLY" -eq 1 ]; then
+      printf '●  This read-only session should report the runaway, not repair it.\n'
+    else
+      printf '●  Recover this home with: bin/fm-watch-arm.sh --restart\n'
+    fi
+    printf '●  %s\n' "$CONTINUE_LINE"
+    printf '●%s\n' "$resource_rule"
+  } >&2
+fi
+
+# A live lock is not enough. A normal watcher refreshes between bounded phases;
+# reaching this tighter limit means it stopped making progress even though the
+# broad handoff grace has not expired.
+if "$watcher_progress_stale"; then
+  progress_rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+  {
+    printf '●%s\n' "$progress_rule"
+    printf '●  WATCHER WEDGED - LIVE SUPERVISION MISSED ITS CADENCE\n'
+    printf '●  Recorded watcher pid %s is still alive, but its beacon is %ss old (cadence limit %ss).\n' \
+      "$watcher_pid" "$watcher_age" "$PROGRESS_GRACE"
+    if [ "$READ_ONLY" -eq 1 ]; then
+      printf '●  This read-only session should report the wedge, not repair it.\n'
+    else
+      printf '●  Recover this home with: bin/fm-watch-arm.sh --restart\n'
+    fi
+    printf '●  %s\n' "$CONTINUE_LINE"
+    printf '●%s\n' "$progress_rule"
+  } >&2
+fi
+
 # No fresh watcher with tasks in flight is the dangerous state: emit a prominent,
 # bordered banner FIRST so it reads as an alarm, not a buried stderr line.
-if [ "$watcher_fresh" = false ]; then
+if [ "$watcher_fresh" = false ] && ! "$watcher_progress_stale"; then
   afk=0
   [ -e "$STATE/.afk" ] && afk=1
   queue_arg=0

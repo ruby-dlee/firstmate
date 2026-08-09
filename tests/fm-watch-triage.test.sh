@@ -136,6 +136,37 @@ test_scan_captain_relevant_statuses_classifier() {
   pass "scan_captain_relevant_statuses lists only captain-relevant statuses"
 }
 
+test_large_status_decision_fold_is_linear() {
+  local dir status output runner status_code size
+  dir=$(make_case large-status-fold)
+  status="$dir/state/large.status"
+  output="$dir/open"
+  runner="$dir/run.sh"
+  {
+    printf 'needs-decision [key=alpha]: old choice\n'
+    awk 'BEGIN { payload = ""; for (i = 0; i < 1600; i++) payload = payload "x"; for (line = 0; line < 780; line++) printf "working: %04d %s\\n", line, payload }'
+    printf 'blocked [key=beta]: waiting\n'
+    printf 'resolved [key=alpha]: answered\n'
+    printf 'needs-decision [key=alpha]: final choice\n'
+    printf 'resolved [key=beta]: cleared\n'
+    printf 'paused: external wait\n'
+  } > "$status"
+  size=$(wc -c < "$status" | tr -d '[:space:]')
+  [ "$size" -ge 1200000 ] || fail "large status fixture is too small to reproduce the runaway ($size bytes)"
+  cat > "$runner" <<SH
+#!/usr/bin/env bash
+. '$ROOT/bin/fm-classify-lib.sh'
+status_open_decisions '$status' > '$output'
+SH
+  chmod +x "$runner"
+  status_code=0
+  perl -e 'my ($seconds, @command) = @ARGV; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { exec @command; exit 127 } local $SIG{ALRM} = sub { kill "TERM", $pid; select undef, undef, undef, 0.2; kill "KILL", $pid; waitpid $pid, 0; exit 124 }; alarm $seconds; waitpid $pid, 0; exit($? >> 8)' 5 "$runner" || status_code=$?
+  [ "$status_code" -eq 0 ] || fail "1.2 MB status decision fold exceeded five seconds (status $status_code)"
+  [ "$(cat "$output")" = $'alpha\tneeds-decision\tfinal choice' ] \
+    || fail "large status fold changed keyed open-decision semantics: $(cat "$output")"
+  pass "1.2 MB append-only status decision fold stays linear and preserves reopen ordering"
+}
+
 test_classifier_primitives() {
   local dir state open
   dir=$(make_case classify-primitives); state="$dir/state"
@@ -1944,6 +1975,7 @@ fi
 
 test_signal_reason_is_actionable_classifier
 test_stale_is_terminal_classifier
+test_large_status_decision_fold_is_linear
 test_scan_captain_relevant_statuses_classifier
 test_classifier_primitives
 test_managed_tmux_window_id_reverse_mapping

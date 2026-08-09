@@ -346,9 +346,14 @@ fm_backend_required_tool_available() {  # <backend> <tool>
 # errors) if the file or key is absent. Mirrors the ad hoc `grep '^key=' |
 # tail -1 | cut -d= -f2-` snippet every fm-*.sh script used to repeat inline.
 fm_meta_get() {  # <meta-file> <key>
-  local meta=$1 key=$2
+  local meta=$1 key=$2 line value=
   [ -f "$meta" ] || return 0
-  grep "^$key=" "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$key"=*) value=${line#*=} ;;
+    esac
+  done < "$meta"
+  printf '%s' "$value"
 }
 
 # fm_backend_of_meta: the backend recorded in <meta-file>, defaulting to
@@ -377,6 +382,11 @@ fm_backend_target_of_meta() {  # <meta-file>
 
 fm_backend_meta_for_window() {  # <target> <state-dir>
   local target=$1 state=$2 meta window terminal tmux_window_id
+  if [ "${FM_WINDOW_META_HINT_TARGET:-}" = "$target" ] \
+    && [ -f "${FM_WINDOW_META_HINT_PATH:-}" ]; then
+    printf '%s' "$FM_WINDOW_META_HINT_PATH"
+    return 0
+  fi
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || continue
     window=$(fm_meta_get "$meta" window)

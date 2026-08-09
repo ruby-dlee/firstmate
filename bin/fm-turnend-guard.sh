@@ -43,6 +43,10 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 GRACE=${FM_GUARD_GRACE:-300}
+PROGRESS_GRACE=${FM_WATCH_PROGRESS_GRACE:-60}
+CPU_LIMIT=${FM_WATCH_CPU_LIMIT:-80}
+case "$PROGRESS_GRACE" in ''|*[!0-9]*|0) PROGRESS_GRACE=60 ;; esac
+case "$CPU_LIMIT" in ''|*[!0-9]*|0) CPU_LIMIT=80 ;; esac
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 
 # shellcheck source=bin/fm-supervision-lib.sh
@@ -117,19 +121,45 @@ fi
 
 fm_supervision_status "$STATE" "$GRACE"
 [ "$FM_SUP_IN_FLIGHT" -gt 0 ] || exit 0
-fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" && exit 0
+WATCHER_RESOURCE_HOT=0
+WATCHER_PROGRESS_STALE=0
+if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
+  WATCHER_AGE=$(fm_path_age "$STATE/.last-watcher-beat")
+  if [ "$WATCHER_AGE" -ge "$PROGRESS_GRACE" ]; then
+    WATCHER_PROGRESS_STALE=1
+  elif fm_watcher_tree_usage "$FM_WATCHER_HEALTHY_PID" \
+    && awk -v actual="$FM_WATCHER_TREE_CPU" -v limit="$CPU_LIMIT" 'BEGIN { exit !(actual >= limit) }'; then
+    WATCHER_RESOURCE_HOT=1
+  else
+    exit 0
+  fi
+fi
 
 afk=0
 [ -e "$STATE/.afk" ] && afk=1
 x_mode=0
 [ -f "$CONFIG/x-mode.env" ] && x_mode=1
-REASON=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
-  || printf '%s\n' 'tasks in flight, no live watcher - resume supervision according to the session-start operating block before ending the turn')
+if [ "$WATCHER_RESOURCE_HOT" -eq 1 ] || [ "$WATCHER_PROGRESS_STALE" -eq 1 ]; then
+  REASON='Run bin/fm-watch-arm.sh --restart for home-scoped exact-tree recovery before ending the turn.'
+else
+  REASON=$("$SCRIPT_DIR/fm-supervision-instructions.sh" --afk "$afk" --x-mode "$x_mode" --repair-line 2>/dev/null \
+    || printf '%s\n' 'tasks in flight, no live watcher - resume supervision according to the session-start operating block before ending the turn')
+fi
 rule='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 {
   printf '●%s\n' "$rule"
-  printf '●  TURN WOULD END BLIND - SUPERVISION IS OFF\n'
-  printf '●  %s task(s) in flight, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$FM_SUP_BEACON_DESC"
+  if [ "$WATCHER_RESOURCE_HOT" -eq 1 ]; then
+    printf '●  TURN WOULD END WITH WATCHER RUNAWAY\n'
+    printf '●  %s task(s) in flight; recorded watcher pid %s and its exact tree are using %s%% CPU across %s processes.\n' \
+      "$FM_SUP_IN_FLIGHT" "$FM_WATCHER_HEALTHY_PID" "$FM_WATCHER_TREE_CPU" "$FM_WATCHER_TREE_COUNT"
+  elif [ "$WATCHER_PROGRESS_STALE" -eq 1 ]; then
+    printf '●  TURN WOULD END WITH WEDGED WATCHER\n'
+    printf '●  %s task(s) in flight; recorded watcher pid %s is alive but its beacon is %ss old (cadence limit %ss).\n' \
+      "$FM_SUP_IN_FLIGHT" "$FM_WATCHER_HEALTHY_PID" "$WATCHER_AGE" "$PROGRESS_GRACE"
+  else
+    printf '●  TURN WOULD END BLIND - SUPERVISION IS OFF\n'
+    printf '●  %s task(s) in flight, but no live watcher holds this home lock (last beat: %s).\n' "$FM_SUP_IN_FLIGHT" "$FM_SUP_BEACON_DESC"
+  fi
   printf '●  %s\n' "$REASON"
   printf '●%s\n' "$rule"
 } >&2

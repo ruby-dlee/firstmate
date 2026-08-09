@@ -4,6 +4,9 @@
 # Usage: fm_run_bounded <positive-seconds> <command> [args...]
 # After every call, FM_PROCESS_TREE_CLEANUP_STATUS is verified, unverified, or
 # not-started, while the function return preserves the wrapped command status.
+# The process-group anchor also watches its controller pipe while the command is
+# live and after it is reaped; controller EOF terminates the group, so an
+# interrupted caller cannot accumulate TERM-ignoring Perl anchors under pid 1.
 
 FM_PROCESS_TREE_SETUP_FAILURE_STATUS=126
 FM_PROCESS_TREE_CLEANUP_STATUS=not-started
@@ -193,9 +196,39 @@ fm_run_bounded() {
         exit 127;
       }
       my $waited;
-      do {
-        $waited = waitpid $command, 0;
-      } while ($waited == -1 && $! == EINTR);
+      my $controller_gone = 0;
+      while (1) {
+        $waited = waitpid $command, WNOHANG;
+        last if $waited == $command;
+        if ($waited == -1) {
+          next if $! == EINTR;
+          last;
+        }
+        my $read_set = "";
+        vec($read_set, fileno($finish_read), 1) = 1;
+        my $ready_count = select(my $ready_set = $read_set, undef, undef, 0.1);
+        if ($ready_count > 0) {
+          my $probe = "";
+          my $probe_count = sysread $finish_read, $probe, 1;
+          if (defined $probe_count && $probe_count == 0) {
+            $controller_gone = 1;
+            last;
+          }
+        }
+      }
+      if ($controller_gone) {
+        kill "TERM", -$$;
+        for (1 .. 10) {
+          select undef, undef, undef, 0.1;
+          $waited = waitpid $command, WNOHANG;
+          exit 0 if $waited == $command;
+        }
+        # The anchor ignores TERM so it can clean its group. KILL the complete
+        # anchored group only after the graceful bound; this also removes the
+        # anchor itself when a descendant refuses to stop.
+        kill "KILL", -$$;
+        exit 137;
+      }
       my $command_status = $waited == $command ? shell_status($?) : 127;
       syswrite $status_write, "$command_status\n";
       close $status_write;
@@ -203,7 +236,13 @@ fm_run_bounded() {
         my $finish = "";
         my $finish_count = sysread $finish_read, $finish, 1;
         exit 0 if defined $finish_count && $finish_count == 1 && $finish eq "F";
-        select undef, undef, undef, 1;
+        # The controller owns the only pipe writer. EOF means it was killed
+        # after this anchor had already reaped the wrapped command. Waiting for
+        # a byte that can never arrive formerly left an unkillable-by-TERM Perl
+        # anchor under pid 1 for every interrupted operation.
+        exit 0 if defined $finish_count && $finish_count == 0;
+        next if !defined $finish_count && $! == EINTR;
+        exit $setup_failure if !defined $finish_count;
       }
     }
     close $ready_write;
@@ -262,6 +301,15 @@ fm_run_bounded() {
       last;
     }
     alarm 0;
+    if (my $ready = $ENV{FM_PROCESS_TREE_TEST_CONTROLLER_READY}) {
+      open my $file, ">", $ready or die "cannot write controller-ready test marker";
+      print {$file} "ready\n";
+      close $file;
+      my $proceed = $ENV{FM_PROCESS_TREE_TEST_CONTROLLER_PROCEED} || "";
+      while ($proceed ne "" && !-e $proceed) {
+        select undef, undef, undef, 0.01;
+      }
+    }
     my $command_status;
     $command_status = 0 + $1 if $status_text =~ /^(\d+)\n/;
     my $anchor_state = terminate_owned($anchor, $anchor);

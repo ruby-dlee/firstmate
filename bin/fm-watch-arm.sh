@@ -19,8 +19,9 @@
 #
 # This script forks the watcher as a tracked child, then VERIFIES the outcome
 # before it settles in. It confirms a watcher process is genuinely alive AND the
-# liveness beacon (state/.last-watcher-beat) is fresh within FM_GUARD_GRACE (the
-# single source of truth, shared with fm-watch.sh and fm-guard.sh), and prints
+# liveness beacon (state/.last-watcher-beat) is within the tighter
+# FM_WATCH_PROGRESS_GRACE cadence bound. The broader FM_GUARD_GRACE remains the
+# normal wake-and-rearm handoff allowance when no live lock exists. It prints
 # exactly one unambiguous status line:
 #   watcher: started pid=<N> (beacon fresh)              - it launched one and confirmed it
 #   watcher: attached pid=<N> (beacon <age>s as of <hh:mm:ss>)
@@ -35,9 +36,11 @@
 # It NEVER reports started/attached/healthy off a stale beacon or a dead/reused pid: a
 # stale-beacon or dead-pid holder either self-heals (the fresh child steals the
 # dead lock per the singleton self-eviction/steal path and is confirmed) or this
-# returns a FAILED line. On started it waits the child and propagates the wake
-# reason. On restart-only healthy it exits zero after the duplicate child stands
-# down. On FAILED it exits non-zero so the failure is loud. A live cycle already
+# returns a FAILED line. On started it monitors the exact recorded process tree,
+# waits the child, and propagates the wake reason. Sustained full-core use or a
+# stale progress beacon becomes a durable failure and the owned tree is reaped.
+# On restart-only healthy it exits zero after the duplicate child stands down.
+# On FAILED it exits non-zero so the failure is loud. A live cycle already
 # present means re-arm attaches - do not start a second watcher.
 #
 # `attached` is a claim about the INSTANT it is printed, and this script's output
@@ -66,10 +69,10 @@
 # supervision.
 #
 # --restart: stop ONLY this FM_HOME's watcher (the pid recorded in THIS home's
-# state/.watch.lock) and own a fresh cycle, or report restart-only healthy if a
-# live peer still holds the lock after the duplicate child stands down. It
-# resolves and signals exactly that pid, so it can never touch another home's
-# watcher. NEVER `pkill -f
+# state/.watch.lock) plus descendants proven by numeric parentage, then own a
+# fresh cycle, or report restart-only healthy if a replacement peer wins the
+# race. TERM-resistant owned processes are KILLed after a bound. No process is
+# selected by command text, so another home's watcher cannot be touched. NEVER `pkill -f
 # bin/fm-watch.sh`: that pattern matches every firstmate home's watcher
 # (secondmate homes run the same script) and would kill siblings. Restart never
 # takes the attach path.
@@ -85,12 +88,25 @@ fm_refuse_if_gate_agent
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 WATCH_LOCK="$STATE/.watch.lock"
 BEAT="$STATE/.last-watcher-beat"
-# "Fresh" reuses the guard's threshold so there is one definition of liveness.
-GRACE=${FM_GUARD_GRACE:-300}
+# A normal wake-and-rearm handoff may briefly have no live lock, so guards retain
+# the broad grace. A lock-holding watcher must make progress much more often: an
+# age under 300s was technically "fresh" but let an already-wedged 155s-old
+# watcher be reported as attachable.
+PROGRESS_GRACE=${FM_WATCH_PROGRESS_GRACE:-60}
+case "$PROGRESS_GRACE" in ''|*[!0-9]*|0) PROGRESS_GRACE=60 ;; esac
 # How long to wait for a freshly forked watcher to acquire the lock and beat.
 CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-10}
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
+# Resource monitor for the exact recorded watcher tree. A watcher has no
+# legitimate sustained full-core phase, so three five-second samples over this
+# threshold are loud and end an owned cycle instead of burning silently.
+CPU_LIMIT=${FM_WATCH_CPU_LIMIT:-80}
+CPU_POLL=${FM_WATCH_CPU_POLL:-5}
+CPU_SAMPLES=${FM_WATCH_CPU_SAMPLES:-3}
+case "$CPU_LIMIT" in ''|*[!0-9]*|0) CPU_LIMIT=80 ;; esac
+case "$CPU_POLL" in ''|*[!0-9]*|0) CPU_POLL=5 ;; esac
+case "$CPU_SAMPLES" in ''|*[!0-9]*|0) CPU_SAMPLES=3 ;; esac
 
 clear_stale_recorded_watcher_lock() {
   local lock_home lock_path lock_identity
@@ -105,13 +121,13 @@ clear_stale_recorded_watcher_lock() {
 
 # A watcher is "healthy" iff the lock names a live process that is genuinely THIS
 # home's watcher (the identity match guards against a recycled/reused pid) AND the
-# liveness beacon is fresh within GRACE. Sets HEALTHY_PID on success. This is the
+# liveness beacon is within PROGRESS_GRACE. Sets HEALTHY_PID on success. This is the
 # single honesty gate: a dead pid, a reused pid, or a stale beacon all fail it, so
 # this script can never report a watcher that is not really there.
 HEALTHY_PID=
 healthy_watcher() {
   HEALTHY_PID=
-  fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME" || return 1
+  fm_watcher_healthy "$STATE" "$WATCH" "$PROGRESS_GRACE" "$FM_HOME" || return 1
   HEALTHY_PID=$FM_WATCHER_HEALTHY_PID
 }
 
@@ -135,6 +151,23 @@ report_healthy() {
   local age
   age=$(fm_path_age "$BEAT")
   echo "watcher: healthy pid=$HEALTHY_PID (beacon ${age}s)"
+}
+
+watcher_tree_hot() {  # <root-pid>
+  local root=$1
+  fm_watcher_tree_usage "$root" || return 1
+  awk -v actual="$FM_WATCHER_TREE_CPU" -v limit="$CPU_LIMIT" 'BEGIN { exit !(actual >= limit) }'
+}
+
+resource_reason() {  # <root-pid>
+  local root=$1
+  printf 'stale: watcher pid %s process tree is consuming %s%% CPU across %s processes (limit %s%% for %s consecutive %ss-cadence samples; exact recorded pid and parentage, never command matching)' \
+    "$root" "$FM_WATCHER_TREE_CPU" "$FM_WATCHER_TREE_COUNT" "$CPU_LIMIT" "$CPU_SAMPLES" "$CPU_POLL"
+}
+
+queue_watcher_failure() {  # <reason>
+  local reason=$1
+  fm_wake_append stale watcher-health "$reason" >/dev/null 2>&1 || true
 }
 
 # Terminal line for an attach that has ended: the holder failed the same honesty
@@ -179,7 +212,7 @@ report_attach_interrupted() {
 # surfaced is already durable in state/.wake-queue, and the caller's repair for
 # the terminal line below is to drain that queue and then re-arm.
 attach_and_wait() {
-  local attached_pid=$1
+  local attached_pid=$1 hot_samples=0 next_cpu=0 now reason
   # Being signalled is the other way this arm stops waiting, and it must not be
   # silent either: the harness restarting or tearing down the task would
   # otherwise leave the buffered `attached` line as the final word. No child to
@@ -191,7 +224,23 @@ attach_and_wait() {
     if healthy_watcher; then
       if [ "$HEALTHY_PID" != "$attached_pid" ]; then
         attached_pid=$HEALTHY_PID
+        hot_samples=0
         report_attached
+      fi
+      now=$(date +%s)
+      if [ "$now" -ge "$next_cpu" ]; then
+        next_cpu=$((now + CPU_POLL))
+        if watcher_tree_hot "$attached_pid"; then
+          hot_samples=$((hot_samples + 1))
+          if [ "$hot_samples" -ge "$CPU_SAMPLES" ]; then
+            reason=$(resource_reason "$attached_pid")
+            queue_watcher_failure "$reason"
+            echo "watcher: FAILED - $reason; run bin/fm-watch-arm.sh --restart for home-scoped recovery"
+            exit 1
+          fi
+        else
+          hot_samples=0
+        fi
       fi
       sleep "$ATTACH_POLL"
       continue
@@ -222,21 +271,35 @@ case "${1:-}" in
 esac
 
 if [ "$mode" = restart ]; then
-  # Home-scoped stop: only the watcher pid recorded in THIS home's lock.
+  # Home-scoped stop: only the watcher pid recorded in THIS home's lock and the
+  # descendants proven from that numeric root. TERM-resistant wedges are
+  # escalated to KILL after a bound by fm_pid_tree_stop, which is the supported
+  # alternative to manual pid surgery.
   lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
+  lock_identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
   if fm_pid_alive "$lock_pid"; then
     if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$lock_pid" "$FM_HOME"; then
-      kill -TERM "$lock_pid" 2>/dev/null || true
-      # Wait for it to actually exit before relaunching, so the fresh watcher
-      # either takes a released lock or reclaims a now-dead-pid stale lock instead
-      # of seeing the dying one as a live holder and no-opping.
-      i=0
-      while [ "$i" -lt 50 ] && fm_pid_alive "$lock_pid"; do
-        sleep 0.1
-        i=$((i + 1))
-      done
+      if ! fm_pid_tree_stop "$lock_pid" 30 "$lock_identity"; then
+        echo "watcher: FAILED - recorded watcher tree pid=$lock_pid could not be stopped for restart" >&2
+        exit 1
+      fi
     else
       clear_stale_recorded_watcher_lock
+    fi
+  fi
+fi
+
+# Refuse an already-sick live holder immediately. The broad 300-second handoff
+# allowance is not an attach standard: a 155-second-old beacon was accepted here,
+# then aged to 300 while the same TERM-resistant pid remained wedged.
+if [ "$mode" = arm ]; then
+  recorded_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
+  if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$recorded_pid" "$FM_HOME" \
+    && [ -e "$BEAT" ]; then
+    recorded_age=$(fm_path_age "$BEAT")
+    if [ "$recorded_age" -ge "$PROGRESS_GRACE" ]; then
+      echo "watcher: FAILED - live watcher pid=$recorded_pid missed progress cadence (beacon ${recorded_age}s, limit ${PROGRESS_GRACE}s); run bin/fm-watch-arm.sh --restart"
+      exit 1
     fi
   fi
 fi
@@ -258,11 +321,60 @@ child=
 child_out=
 cleanup_child() {
   if [ -n "$child" ] && fm_pid_alive "$child"; then
-    kill -TERM "$child" 2>/dev/null || true
+    fm_pid_tree_stop "$child" >/dev/null 2>&1 || true
   fi
   if [ -n "$child_out" ]; then
     rm -f "$child_out" 2>/dev/null || true
   fi
+}
+
+monitor_started_child() {  # <confirmed-watcher-pid>
+  local watched=$1 hot_samples=0 sample_in=0 age reason rc
+  while fm_pid_alive "$watched" \
+    && fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$watched" "$FM_HOME"; do
+    age=$(fm_path_age "$BEAT")
+    if [ "$age" -ge "$PROGRESS_GRACE" ]; then
+      reason="stale: watcher pid $watched stopped making supervision progress; beacon age ${age}s reached cadence limit ${PROGRESS_GRACE}s"
+      queue_watcher_failure "$reason"
+      echo "watcher: FAILED - $reason; recovering the owned watcher tree"
+      fm_pid_tree_stop "$watched" >/dev/null 2>&1 || true
+      wait "$watched" 2>/dev/null || true
+      print_watch_output "$child_out"
+      rm -f "$child_out" 2>/dev/null || true
+      child=
+      child_out=
+      return 1
+    fi
+    if [ "$sample_in" -eq 0 ]; then
+      sample_in=$CPU_POLL
+      if watcher_tree_hot "$watched"; then
+        hot_samples=$((hot_samples + 1))
+        if [ "$hot_samples" -ge "$CPU_SAMPLES" ]; then
+          reason=$(resource_reason "$watched")
+          queue_watcher_failure "$reason"
+          echo "watcher: FAILED - $reason; recovering the owned watcher tree"
+          fm_pid_tree_stop "$watched" >/dev/null 2>&1 || true
+          wait "$watched" 2>/dev/null || true
+          print_watch_output "$child_out"
+          rm -f "$child_out" 2>/dev/null || true
+          child=
+          child_out=
+          return 1
+        fi
+      else
+        hot_samples=0
+      fi
+    fi
+    sleep 1
+    sample_in=$((sample_in - 1))
+  done
+  wait "$watched"
+  rc=$?
+  print_watch_output "$child_out"
+  rm -f "$child_out" 2>/dev/null || true
+  child=
+  child_out=
+  return "$rc"
 }
 trap 'cleanup_child; exit 129' HUP
 trap 'cleanup_child; exit 143' TERM INT
@@ -271,7 +383,7 @@ child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   echo "watcher: FAILED - no live watcher with a fresh beacon"
   exit 1
 }
-"$WATCH" >"$child_out" &
+"$WATCH" >"$child_out" 2>&1 &
 child=$!
 child_done=0
 
@@ -283,10 +395,8 @@ while :; do
   if healthy_watcher; then
     if [ "$HEALTHY_PID" = "$child" ]; then
       echo "watcher: started pid=$child (beacon fresh)"
-      wait "$child"
+      monitor_started_child "$child"
       rc=$?
-      print_watch_output "$child_out"
-      rm -f "$child_out" 2>/dev/null || true
       exit "$rc"
     fi
     # Another watcher won the singleton; our child stood down.
@@ -320,6 +430,7 @@ done
 
 trap - HUP TERM INT
 echo "watcher: FAILED - no live watcher with a fresh beacon"
+print_watch_output "$child_out"
 cleanup_child
 wait "$child" 2>/dev/null || true
 exit 1

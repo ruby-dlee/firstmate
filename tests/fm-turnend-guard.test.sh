@@ -249,6 +249,59 @@ test_hook_silent_with_live_lock_and_fresh_beacon() {
   pass "fm-turnend-guard: silent no-op with a live watcher lock and fresh beacon"
 }
 
+test_hook_blocks_with_hot_live_lock_and_fresh_beacon() {
+  local dir pid identity out status i
+  dir=$(make_primary_dir "$TMP_ROOT/hook-live-lock-hot")
+  : > "$dir/state/task1.meta"
+  bash -c 'while :; do :; done' &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify hot watcher holder"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  i=0
+  status=0
+  out=
+  while [ "$i" -lt 30 ]; do
+    out=$(FM_WATCH_CPU_LIMIT=1 run_hook "$dir" false); status=$?
+    [ "$status" -eq 2 ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must block when the exact live watcher tree is consuming a core"
+  assert_contains "$out" 'TURN WOULD END WITH WATCHER RUNAWAY' "hot watcher hook block must name the resource failure"
+  assert_contains "$out" 'bin/fm-watch-arm.sh --restart' "hot watcher hook block must give the supported recovery"
+  pass "fm-turnend-guard: blocks on a hot watcher tree even when the beacon is fresh"
+}
+
+test_hook_blocks_with_live_lock_and_missed_cadence() {
+  local dir pid identity out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-live-lock-missed-cadence")
+  : > "$dir/state/task1.meta"
+  sleep 60 &
+  pid=$!
+  identity=$(watcher_identity "$dir" "$pid") || {
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "could not identify cadence-stale watcher holder"
+  }
+  record_watcher_lock "$dir" "$pid" "$identity"
+  touch "$dir/state/.last-watcher-beat"
+  perl -e '$time = time - 120; utime $time, $time, $ARGV[0]' "$dir/state/.last-watcher-beat"
+  out=$(FM_WATCH_PROGRESS_GRACE=60 run_hook "$dir" false); status=$?
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  expect_code 2 "$status" "hook must block when a live watcher misses its normal progress cadence"
+  assert_contains "$out" 'TURN WOULD END WITH WEDGED WATCHER' "missed-cadence hook block must name the live wedge"
+  assert_contains "$out" 'bin/fm-watch-arm.sh --restart' "missed-cadence hook block must give the supported recovery"
+  pass "fm-turnend-guard: blocks before the broad stale threshold when a live watcher misses cadence"
+}
+
 test_hook_blocks_with_live_lock_and_stale_beacon() {
   local dir pid identity out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-live-lock-stale")
@@ -910,6 +963,8 @@ test_hook_silent_when_no_work_in_flight
 test_hook_blocks_when_fresh_beacon_has_no_live_lock
 test_hook_blocks_when_dead_lock_has_fresh_beacon
 test_hook_silent_with_live_lock_and_fresh_beacon
+test_hook_blocks_with_hot_live_lock_and_fresh_beacon
+test_hook_blocks_with_live_lock_and_missed_cadence
 test_hook_blocks_with_live_lock_and_stale_beacon
 test_hook_blocks_when_unhealthy_in_primary
 test_hook_blocks_from_fm_home_state

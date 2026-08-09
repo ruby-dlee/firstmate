@@ -227,27 +227,19 @@ _fm_decision_key() {  # <status-line> -> key slug, or "default" when no token
     *) printf 'default' ;;
   esac
 }
-# Drop the record for <key> from a newline-terminated "<key>\t<verb>\t<note>" set.
-# Portable (no associative arrays) so the fold runs on bash 3.2 as well as 4+.
-_fm_decision_drop() {  # <open-set> <key>
-  local set=$1 key=$2 line out=''
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case "$line" in
-      "$key"$'\t'*) : ;;
-      *) out="${out}${line}"$'\n' ;;
-    esac
-  done <<EOF
-$set
-EOF
-  printf '%s' "$out"
-}
 # Fold the WHOLE status stream into the set of decisions still open. Prints one
 # TAB-separated "<key>\t<verb>\t<summary>" line per still-open decision, in
 # most-recently-opened-last order; prints nothing when none are open. Pure read of
 # the file, no globals beyond the optional FM_CLASSIFY_RESOLVE_VERB override. This
 # is the durable open-set the fleet snapshot and any point-in-time consumer must use
 # instead of trusting the last status line.
+#
+# Keep this a single linear stream pass. The former Bash implementation rebuilt
+# the complete open-set string through nested command substitutions for every
+# status line. A long-lived secondmate's 1.25 MB append-only status stream drove
+# that quadratic fold at one full CPU while the parent watcher waited and
+# stopped polling. awk's sequence index preserves the same reopen-at-
+# end ordering without copying the accumulated set on every input line.
 status_open_decisions() {  # <status-file>
   local f=$1
   [ -f "$f" ] || return 0
@@ -255,42 +247,85 @@ status_open_decisions() {  # <status-file>
 }
 
 _fm_status_open_decisions_stream() {
-  local line verb key note resolve open='' stripped
+  local resolve
   resolve=${FM_CLASSIFY_RESOLVE_VERB:-$FM_CLASSIFY_RESOLVE_VERB_DEFAULT}
-  while IFS= read -r line || [ -n "$line" ]; do
-    stripped=${line//[[:space:]]/}
-    [ -n "$stripped" ] || continue
-    verb=$(status_line_verb "$line")
-    key=$(_fm_decision_key "$line") || continue
-    case "$verb" in
-      needs-decision|blocked)
-        note=$(status_line_note "$line")
-        open=$(_fm_decision_drop "$open" "$key")
-        [ -n "$open" ] && open="${open}"$'\n'
-        open="${open}${key}"$'\t'"${verb}"$'\t'"${note}"$'\n'
-        ;;
-      "$resolve")
-        open=$(_fm_decision_drop "$open" "$key")
-        [ -n "$open" ] && open="${open}"$'\n'
-        ;;
-    esac
-  done
-  printf '%s' "$open"
+  awk -v resolve="$resolve" '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+    {
+      line = $0
+      blank = line
+      gsub(/[[:space:]]/, "", blank)
+      if (blank == "") next
+
+      prefix = line
+      sub(/:.*/, "", prefix)
+      verb = prefix
+      sub(/\[key=.*/, "", verb)
+      verb = trim(verb)
+
+      key = "default"
+      key_start = index(prefix, "[key=")
+      if (key_start > 0) {
+        key_tail = substr(prefix, key_start + 5)
+        key_end = index(key_tail, "]")
+        if (key_end > 0) {
+          candidate = substr(key_tail, 1, key_end - 1)
+          if (candidate == "" || candidate ~ /[^A-Za-z0-9._-]/) next
+          key = candidate
+        }
+      }
+
+      if (verb == "needs-decision" || verb == "blocked") {
+        colon = index(line, ":")
+        note = colon > 0 ? substr(line, colon + 1) : line
+        sub(/^[[:space:]]+/, "", note)
+        order[key] = ++sequence
+        key_at[sequence] = key
+        open_verb[key] = verb
+        open_note[key] = note
+      } else if (verb == resolve) {
+        delete order[key]
+        delete open_verb[key]
+        delete open_note[key]
+      }
+    }
+    END {
+      for (index_value = 1; index_value <= sequence; index_value++) {
+        key = key_at[index_value]
+        if (order[key] == index_value) {
+          printf "%s\t%s\t%s\n", key, open_verb[key], open_note[key]
+        }
+      }
+    }
+  '
 }
 
 # Resolve a task id from each metadata file's last window=, terminal=, or managed
 # tmux_window_id= target, falling back to the legacy tmux-shaped
 # "<session>:fm-<id>" form when no metadata match is available.
 window_to_task() {
-  local w=$1 state=${2:-${STATE:-${FM_STATE_OVERRIDE:-}}} meta mw mt mi t
+  local w=$1 state=${2:-${STATE:-${FM_STATE_OVERRIDE:-}}} meta line mw mt mi t
+  if [ "${FM_WINDOW_TASK_HINT_TARGET:-}" = "$w" ] && [ -n "${FM_WINDOW_TASK_HINT_ID:-}" ]; then
+    printf '%s' "$FM_WINDOW_TASK_HINT_ID"
+    return 0
+  fi
   if [ -n "$state" ]; then
     for meta in "$state"/*.meta; do
       [ -e "$meta" ] || continue
-      mw=$(grep '^window=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
-      mt=$(grep '^terminal=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
-      mi=$(grep '^tmux_window_id=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+      mw=; mt=; mi=
+      while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+          window=*) mw=${line#window=} ;;
+          terminal=*) mt=${line#terminal=} ;;
+          tmux_window_id=*) mi=${line#tmux_window_id=} ;;
+        esac
+      done < "$meta"
       [ "$mw" = "$w" ] || [ "$mt" = "$w" ] || [ "$mi" = "$w" ] || continue
-      t=$(basename "$meta")
+      t=${meta##*/}
       t=${t%.meta}
       printf '%s' "$t"
       return 0

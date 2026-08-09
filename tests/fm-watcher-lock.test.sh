@@ -154,6 +154,66 @@ test_guard_warnings() {
   pass "guard banner leads when down with pending wakes (re-arm-after-drain) and stays silent when fresh"
 }
 
+test_guard_detects_live_watcher_that_missed_cadence() {
+  local dir state err sleeper identity
+  dir=$(make_case guard-missed-cadence)
+  state="$dir/state"
+  err="$dir/guard.err"
+  sleep 60 &
+  sleeper=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$sleeper") \
+    || fail "could not identify cadence-stale guard fixture"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$sleeper" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  printf 'project=x\n' > "$state/task.meta"
+  touch "$state/.last-watcher-beat"
+  perl -e '$time = time - 120; utime $time, $time, $ARGV[0]' "$state/.last-watcher-beat"
+  FM_ROOT_OVERRIDE="$dir" FM_HOME="$dir" FM_GUARD_GRACE=300 FM_WATCH_PROGRESS_GRACE=60 \
+    "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "cadence-stale guard failed"
+  kill "$sleeper" 2>/dev/null || true
+  wait "$sleeper" 2>/dev/null || true
+  grep -qF 'WATCHER WEDGED - LIVE SUPERVISION MISSED ITS CADENCE' "$err" \
+    || fail "guard stayed silent for a live watcher with a 120-second-old beacon: $(cat "$err")"
+  grep -qF 'bin/fm-watch-arm.sh --restart' "$err" || fail "cadence-stale guard omitted supported recovery"
+  ! grep -qF 'WATCHER DOWN - SUPERVISION IS OFF' "$err" \
+    || fail "guard misreported the live cadence wedge as an absent watcher"
+  pass "guard makes a live watcher loud when it misses cadence before broad stale grace"
+}
+
+test_guard_detects_hot_recorded_watcher_tree() {
+  local dir state err hot identity i
+  dir=$(make_case guard-hot-tree)
+  state="$dir/state"
+  err="$dir/guard.err"
+  bash -c 'while :; do :; done' &
+  hot=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$hot") \
+    || fail "could not identify hot guard fixture"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$hot" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  printf 'project=x\n' > "$state/task.meta"
+  touch "$state/.last-watcher-beat"
+  i=0
+  while [ "$i" -lt 30 ]; do
+    FM_ROOT_OVERRIDE="$dir" FM_HOME="$dir" FM_WATCH_CPU_LIMIT=1 "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "hot-tree guard failed"
+    grep -qF 'WATCHER RUNAWAY - SUPERVISION IS CONSUMING A CORE' "$err" && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'WATCHER RUNAWAY - SUPERVISION IS CONSUMING A CORE' "$err" \
+    || fail "guard stayed silent for a fresh-beacon watcher consuming a core: $(cat "$err")"
+  grep -qF 'bin/fm-watch-arm.sh --restart' "$err" || fail "hot-tree guard omitted the supported recovery command"
+  kill -KILL "$hot" 2>/dev/null || true
+  wait "$hot" 2>/dev/null || true
+  pass "guard makes a fresh-beacon watcher consuming a core loud"
+}
+
 test_lock_single_winner_under_concurrency() {
   local dir state lockdir marker i pids pid wins
   dir=$(make_case lock-concurrency)
@@ -419,6 +479,22 @@ test_lock_paused_mid_acquire_claim_fails_during_steal() {
   pass "paused mid-acquire claimant backs off to active stealer"
 }
 
+test_pid_tree_stop_refuses_mismatched_root_identity() {
+  local dir state live identity
+  dir=$(make_case tree-stop-reused-root)
+  state="$dir/state"
+  sleep 60 &
+  live=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live") \
+    || fail "could not identify tree-stop reuse fixture"
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_tree_stop "$2" 1 "$3"' \
+    _ "$LIB" "$live" "not-$identity" || fail "tree stop errored on a mismatched expected identity"
+  is_live_non_zombie "$live" || fail "tree stop signalled a live pid whose identity did not match the recorded root"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  pass "exact-tree stop refuses a root whose pid identity was reused"
+}
+
 test_watch_restart_rejects_reused_pid() {
   local dir state fakebin out live pid i lock_pid
   dir=$(make_case restart-reused-pid)
@@ -456,32 +532,74 @@ test_watch_restart_rejects_reused_pid() {
   pass "watch restart refuses to signal a reused pid"
 }
 
-test_watch_restart_reports_healthy_peer_without_attaching() {
-  local dir state fakebin out peer identity armpid status
-  dir=$(make_case restart-healthy-peer)
+test_watch_restart_reaps_term_resistant_owned_tree() {
+  local dir state fakebin out peer_file peer child_file child identity armpid i lock_pid root_live child_live
+  dir=$(make_case restart-term-resistant-tree)
   state="$dir/state"
   fakebin="$dir/fakebin"
   out="$dir/restart.out"
-  node -e 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 300000)' &
-  peer=$!
-  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || fail "could not identify peer pid"
+  peer_file="$dir/peer.pid"
+  child_file="$dir/child.pid"
+  node -e '
+    const fs = require("fs");
+    const { spawn } = require("child_process");
+    const rootProgram = `
+      const fs = require("fs");
+      const { spawn } = require("child_process");
+      const child = spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\",()=>{});setTimeout(()=>{},300000)"], { stdio: "ignore" });
+      fs.writeFileSync(process.argv[1], String(child.pid));
+      process.on("SIGTERM", () => {});
+      setTimeout(() => {}, 300000);
+    `;
+    const root = spawn(process.execPath, ["-e", rootProgram, process.argv[2]], { detached: true, stdio: "ignore" });
+    fs.writeFileSync(process.argv[1], String(root.pid));
+    root.unref();
+  ' "$peer_file" "$child_file"
+  peer=$(cat "$peer_file")
+  i=0
+  while [ "$i" -lt 80 ] && [ ! -s "$child_file" ]; do sleep 0.1; i=$((i + 1)); done
+  if [ ! -s "$child_file" ]; then
+    kill -KILL "$peer" 2>/dev/null || true
+    fail "TERM-resistant watcher-tree fixture did not start its child"
+  fi
+  child=$(cat "$child_file")
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || {
+    kill -KILL "$peer" "$child" 2>/dev/null || true
+    fail "could not identify owned restart root"
+  }
   mkdir "$state/.watch.lock"
   printf '%s\n' "$peer" > "$state/.watch.lock/pid"
   printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
   printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
   printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
-  touch "$state/.last-watcher-beat"
-  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_ATTACH_POLL=0.1 "$WATCH_ARM" --restart > "$out" &
+  touch -t 200001010000 "$state/.last-watcher-beat"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" &
   armpid=$!
-  wait_for_exit "$armpid" 80
-  status=$?
-  [ "$status" -eq 0 ] || fail "restart did not exit zero after reporting healthy peer (status $status): $(cat "$out")"
-  grep -qF "watcher: healthy pid=$peer" "$out" || fail "restart did not report the healthy peer: $(cat "$out")"
-  ! grep -qF 'watcher: attached' "$out" || fail "restart attached to a peer watcher instead of preserving restart ownership contract"
-  is_live_non_zombie "$peer" || fail "restart killed a TERM-resistant peer unexpectedly"
-  kill -KILL "$peer" 2>/dev/null || true
-  wait "$peer" 2>/dev/null || true
-  pass "watch restart reports a healthy peer without attaching to it"
+  i=0
+  while [ "$i" -lt 150 ]; do
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if ! grep -qF 'watcher: started pid=' "$out"; then
+    kill -KILL "$armpid" "$peer" "$child" 2>/dev/null || true
+    wait "$armpid" 2>/dev/null || true
+    fail "restart did not replace the wedged watcher tree: $(cat "$out")"
+  fi
+  root_live=0
+  child_live=0
+  is_live_non_zombie "$peer" && root_live=1
+  is_live_non_zombie "$child" && child_live=1
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  if [ "$root_live" -eq 1 ] || [ "$child_live" -eq 1 ]; then
+    kill -KILL "$peer" "$child" 2>/dev/null || true
+  fi
+  kill -TERM "$armpid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  [ "$root_live" -eq 0 ] || fail "restart left the TERM-resistant recorded watcher root alive"
+  [ "$child_live" -eq 0 ] || fail "restart left a TERM-resistant recorded watcher descendant alive"
+  [ -n "$lock_pid" ] && [ "$lock_pid" != "$peer" ] || fail "restart did not install a fresh watcher lock"
+  pass "watch restart reaps a TERM-resistant recorded tree and starts a fresh cycle"
 }
 
 test_watcher_self_evicts_on_lock_takeover() {
@@ -561,6 +679,40 @@ test_arm_attaches_and_waits_for_live_fresh_watcher() {
   [ "$status" -ne 124 ] || fail "attached arm never returned after the seed died"
   [ "$status" -ne 0 ] || fail "attached arm exited zero after the seed died, reading as live supervision"
   pass "arm attaches to a live fresh watcher and exits only when that cycle ends"
+}
+
+test_arm_refuses_live_lock_with_bad_attach_cadence() {
+  local dir state out peer identity status
+  dir=$(make_case arm-refuse-missed-cadence)
+  state="$dir/state"
+  out="$dir/arm.out"
+  sleep 300 &
+  peer=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || {
+    kill "$peer" 2>/dev/null || true
+    wait "$peer" 2>/dev/null || true
+    fail "could not identify cadence-stale attach fixture"
+  }
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$peer" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  touch "$state/.last-watcher-beat"
+  perl -e '$time = time - 120; utime $time, $time, $ARGV[0]' "$state/.last-watcher-beat"
+  status=0
+  FM_HOME="$dir" FM_GUARD_GRACE=300 FM_WATCH_PROGRESS_GRACE=60 FM_ARM_CONFIRM_TIMEOUT=1 \
+    "$WATCH_ARM" > "$out" || status=$?
+  kill "$peer" 2>/dev/null || true
+  wait "$peer" 2>/dev/null || true
+  [ "$status" -ne 0 ] || fail "arm reported a 120-second-old live-lock beacon as healthy"
+  ! grep -qF "watcher: attached pid=$peer" "$out" \
+    || fail "arm attached to a watcher already far outside normal cadence: $(cat "$out")"
+  grep -qF "watcher: FAILED - live watcher pid=$peer missed progress cadence" "$out" \
+    || fail "arm did not fail loudly for the already-sick watcher: $(cat "$out")"
+  grep -qF 'bin/fm-watch-arm.sh --restart' "$out" \
+    || fail "arm did not give the supported recovery for the already-sick watcher"
+  pass "arm refuses to attach to a live watcher already outside progress cadence"
 }
 
 test_arm_attach_end_is_never_a_silent_false_attach() {
@@ -925,6 +1077,48 @@ test_arm_fails_loud_when_no_fresh_watcher_confirmable() {
   pass "arm reports FAILED and exits non-zero when no fresh watcher can be confirmed"
 }
 
+test_arm_detects_and_reaps_sustained_watcher_cpu() {
+  local dir state fakebin out check armpid status i watcher_pid
+  dir=$(make_case arm-resource-runaway)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  check="$state/hot.check.sh"
+  cat > "$check" <<'SH'
+#!/usr/bin/env bash
+while :; do :; done
+SH
+  chmod +x "$check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=0 FM_CHECK_TIMEOUT=30 FM_HEARTBEAT=999999 \
+    FM_WATCH_CPU_LIMIT=20 FM_WATCH_CPU_POLL=1 FM_WATCH_CPU_SAMPLES=2 \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 150 ]; do
+    grep -qF 'SUPERVISION IS CONSUMING' "$out" 2>/dev/null && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  wait_for_exit "$armpid" 100
+  status=$?
+  if [ "$status" -eq 124 ]; then
+    kill -TERM "$armpid" 2>/dev/null || true
+    wait "$armpid" 2>/dev/null || true
+    fail "arm did not stop a sustained full-core watcher tree"
+  fi
+  [ "$status" -ne 0 ] || fail "arm reported success after detecting a sustained full-core watcher tree"
+  grep -qF 'process tree is consuming' "$out" || fail "arm did not name the watcher CPU failure: $(cat "$out")"
+  grep -qF 'exact recorded pid and parentage' "$out" || fail "arm CPU diagnostic did not state its identity boundary"
+  grep "$(printf '\tstale\twatcher-health\t')" "$state/.wake-queue" >/dev/null \
+    || fail "arm did not queue the watcher resource failure durably"
+  watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  [ -z "$watcher_pid" ] || ! is_live_non_zombie "$watcher_pid" \
+    || fail "resource recovery left the recorded watcher alive"
+  pass "arm detects sustained watcher-tree CPU and reaps the owned cycle loudly"
+}
+
 test_pid_identity_is_locale_invariant() {
   # The watcher records its process identity under one locale; arm/guard/turn-end
   # re-read it under the machine's ambient locale. ps's lstart date format follows
@@ -958,11 +1152,18 @@ if [ "${FM_TEST_FOCUSED:-}" = stale-steal-chain ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = restart-term-resistant ]; then
+  test_watch_restart_reaps_term_resistant_owned_tree
+  exit 0
+fi
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
+test_guard_detects_live_watcher_that_missed_cadence
+test_guard_detects_hot_recorded_watcher_tree
 test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
 test_lock_stale_steal_single_winner_under_concurrency
@@ -972,10 +1173,12 @@ test_lock_does_not_steal_live_lock
 test_lock_empty_pid_uses_minimum_grace
 test_lock_late_claim_loses_after_recreate
 test_lock_paused_mid_acquire_claim_fails_during_steal
+test_pid_tree_stop_refuses_mismatched_root_identity
 test_watch_restart_rejects_reused_pid
-test_watch_restart_reports_healthy_peer_without_attaching
+test_watch_restart_reaps_term_resistant_owned_tree
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher
+test_arm_refuses_live_lock_with_bad_attach_cadence
 test_arm_attach_end_is_never_a_silent_false_attach
 test_arm_attach_end_after_peer_wake_preserves_the_wake
 test_arm_starts_and_self_heals
@@ -983,3 +1186,4 @@ test_arm_hup_cleans_child_and_temp_output
 test_arm_propagates_immediate_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_fails_loud_when_no_fresh_watcher_confirmable
+test_arm_detects_and_reaps_sustained_watcher_cpu

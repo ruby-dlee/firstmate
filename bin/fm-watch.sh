@@ -245,7 +245,7 @@ window_kind() {
   local w=$1 meta kind
   meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null || true)
   if [ -n "$meta" ]; then
-    kind=$(grep '^kind=' "$meta" | cut -d= -f2- || true)
+    kind=$(fm_meta_get "$meta" kind)
     [ -n "$kind" ] || kind=ship
     echo "$kind"
     return 0
@@ -257,7 +257,7 @@ window_harness() {
   local w=$1 meta harness
   meta=$(fm_backend_meta_for_window "$w" "$STATE" 2>/dev/null || true)
   if [ -n "$meta" ]; then
-    harness=$(grep '^harness=' "$meta" | tail -1 | cut -d= -f2- || true)
+    harness=$(fm_meta_get "$meta" harness)
     [ -n "$harness" ] && { printf '%s' "$harness"; return 0; }
   fi
   printf 'unknown'
@@ -290,7 +290,7 @@ window_scoped_target() {
   [ -n "$meta" ] && fm_meta_get "$meta" tmux_session_target
 }
 
-recorded_windows() {
+recorded_window_records() {
   local meta w seen=
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
@@ -300,8 +300,15 @@ recorded_windows() {
       *"|$w|"*) continue ;;
     esac
     seen="$seen|$w|"
-    printf '%s\n' "$w"
+    printf '%s\t%s\n' "$w" "$meta"
   done
+}
+
+recorded_windows() {
+  local w _
+  while IFS=$(printf '\t') read -r w _; do
+    [ -n "$w" ] && printf '%s\n' "$w"
+  done < <(recorded_window_records)
 }
 
 # Exit reporting a wake. Consecutive heartbeats with no other wake in between
@@ -706,6 +713,19 @@ safe_marker_path() {  # <path>
   [ ! -L "$marker" ] && { [ ! -e "$marker" ] || [ -f "$marker" ]; }
 }
 
+# Publish progress at each bounded phase, not only once per complete fleet pass.
+# A pass over many live endpoints can legitimately exceed POLL because POLL is
+# the terminal wait budget, not a deadline for all preceding reads. Keeping the
+# beacon current between those reads preserves the intended grace margin while
+# a single wedged read still goes stale and is recovered by fm-watch-arm.
+watcher_beat() {  # <phase>
+  local phase=${1:-progress} trace=${FM_WATCHER_BEAT_TEST_LOG:-}
+  safe_touch_marker_or_log "$STATE/.last-watcher-beat" "watcher beacon" || true
+  if [ -n "$trace" ] && safe_marker_path "$trace"; then
+    printf '%s\t%s\n' "$(date +%s)" "$phase" >> "$trace" 2>/dev/null || true
+  fi
+}
+
 task_generation_id() {  # <task>
   local task=$1 meta generation
   meta="$STATE/$task.meta"
@@ -1021,16 +1041,19 @@ while :; do
   fi
 
   # Liveness beacon for fm-guard.sh: a fresh mtime here means a watcher is
-  # alive. Supervision scripts warn when this goes stale with tasks in flight.
-  safe_touch_marker_or_log "$STATE/.last-watcher-beat" "watcher beacon" || true
+  # making bounded supervision progress. Supervision scripts warn when this goes
+  # stale with tasks in flight.
+  watcher_beat loop-start
 
   prune_reports_if_due
+  watcher_beat report-retention-complete
 
   # A managed provider's SessionStart hook may race the initial spawn return.
   # Reconcile only metas still missing provider_session_id; failures stay
   # silent and retry here, while recovery itself requires the mapping and
   # fails closed.
   sync_account_sessions_if_due
+  watcher_beat account-session-sync-complete
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
   # Time-based via .last-check mtime so the cadence survives watcher restarts.
@@ -1049,7 +1072,9 @@ while :; do
     fi
     for c in "$STATE"/*.check.sh; do
       [ -e "$c" ] || continue
+      watcher_beat task-check-start
       out=$(run_check "$c")
+      watcher_beat task-check-complete
       if [ -n "$out" ]; then
         task=${c##*/}
         task=${task%.check.sh}
@@ -1074,7 +1099,9 @@ while :; do
   # signature for an already-pending file (last write wins below).
   pending=$(scan_signals)
   if [ -n "$pending" ]; then
+    watcher_beat signal-grace-start
     sleep "$SIGNAL_GRACE"
+    watcher_beat signal-grace-complete
     pending=$(printf '%s\n%s' "$pending" "$(scan_signals)")
     files=""
     while IFS=$(printf '\t') read -r sf sig f; do
@@ -1146,9 +1173,16 @@ EOF
   # signature means the crewmate finished, is waiting, or is wedged. Each distinct
   # stale hash is surfaced, absorbed, or timed toward escalation once (.stale-*
   # remembers the hash already classified).
-  while IFS= read -r w; do
+  while IFS=$(printf '\t') read -r w current_meta; do
+    [ -n "$w" ] || continue
+    watcher_beat window-scan-start
+    FM_WINDOW_META_HINT_TARGET=$w
+    FM_WINDOW_META_HINT_PATH=$current_meta
+    FM_WINDOW_TASK_HINT_TARGET=$w
+    FM_WINDOW_TASK_HINT_ID=${current_meta##*/}
+    FM_WINDOW_TASK_HINT_ID=${FM_WINDOW_TASK_HINT_ID%.meta}
     kind=$(window_kind "$w")
-    task=$(window_to_task "$w" "$STATE")
+    task=$FM_WINDOW_TASK_HINT_ID
     key=${w//:/_}
     key=${key//\//_}
     key=${key//./_}
@@ -1344,7 +1378,11 @@ EOF
         [ -e "$pf" ] && clear_pause_tracking "$w"
       fi
     fi
-  done < <(recorded_windows)
+  done < <(recorded_window_records)
+  FM_WINDOW_META_HINT_TARGET=
+  FM_WINDOW_META_HINT_PATH=
+  FM_WINDOW_TASK_HINT_TARGET=
+  FM_WINDOW_TASK_HINT_ID=
 
   # Heartbeat: the watcher runs a bounded fleet-scan at a regular cadence no matter
   # what. Time-based via .last-heartbeat mtime; interval doubles per consecutive
@@ -1381,5 +1419,6 @@ EOF
 
   # Terminal wait: a bounded native-event wait for push-capable homes (herdr),
   # else the blind poll sleep. See event_wait_or_sleep.
+  watcher_beat event-wait-start
   event_wait_or_sleep
 done

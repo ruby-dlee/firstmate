@@ -21,7 +21,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-brief.sh`            | Scaffold ship, scout, secondmate-charter, and Herdr-lab briefs                       |
 | `fm-herdr-lab.sh`        | Provision and guardedly operate an isolated, never-default Herdr lab session         |
 | `fm-ensure-agents-md.sh` | Ensure a project's real `AGENTS.md`, its `CLAUDE.md` symlink, and the canonical self-governance section |
-| `fm-guard.sh`            | Warn on primary-checkout tangles, pending queued wakes, and stale watcher liveness   |
+| `fm-guard.sh`            | Warn on primary-checkout tangles, pending wakes, stale watcher liveness, and runaway watcher CPU |
 | `fm-turnend-guard.sh`    | Shared primary turn-end guard predicate so no turn ends blind (docs/turnend-guard.md) |
 | `fm-turnend-guard-grok.sh` | Grok Stop-hook adapter for the primary turn-end guard                              |
 | `fm-arm-pretool-check.sh` | Stable PreToolUse transport for the watcher-arm command policy (docs/arm-pretool-check.md) |
@@ -53,7 +53,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-review-diff.sh`      | Review a crewmate branch or recorded PR head against the authoritative base          |
 | `fm-marker-lib.sh`       | Shared from-firstmate request marker, detector, and idempotent transformation         |
 | `fm-gate-refuse-lib.sh`  | Shared no-mistakes gate-context refusal for fleet lifecycle entrypoints               |
-| `fm-watch-arm.sh`        | Verified home-scoped watcher arm wrapper with honest status reporting                |
+| `fm-watch-arm.sh`        | Verified home-scoped watcher arm, resource monitor, and exact-tree restart wrapper   |
 | `fm-watch-checkpoint.sh` | Run one bounded foreground watcher checkpoint for Codex-style supervision            |
 | `fm-watch.sh`            | Singleton-safe always-on watcher: absorb benign wakes, queue and exit on actionable ones |
 | `fm-auto-reap.sh`        | Reap proven terminal tasks and aged, owner-dead pre-metadata Treehouse acquisitions  |
@@ -79,7 +79,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-lavish-version-lib.sh` | Shared Lavish store-forward minimum-version compatibility check                    |
 | `fm-lavish-wake.sh`      | Append a durable answer pointer, then attempt proven home-bound visible delivery      |
 | `fm-wake-drain.sh`       | Intake Lavish answers, atomically drain queued wakes, then assert watcher liveness    |
-| `fm-wake-lib.sh`         | Shared durable wake queue, portable locks, and watcher identity/health helpers       |
+| `fm-wake-lib.sh`         | Shared durable wake queue, portable locks, and exact-pid watcher identity/tree helpers |
 | `fm-classify-lib.sh`     | Shared captain-relevant and declared-external-wait wake classification vocabulary    |
 | `fm-transition-lib.sh`   | Shared backend-neutral transition record shape and single-owner status->action policy table |
 | `fm-send.sh`             | Send one verified literal line or supported key through the target's recorded backend |

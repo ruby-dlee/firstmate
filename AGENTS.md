@@ -643,7 +643,7 @@ If the active protocol's arm wrapper reports or attaches to an existing healthy 
 If it reports failure, drain queued wakes first and then repair supervision according to the emitted block.
 **No turn ends blind, holds included.**
 Never end a turn while any task is in flight without the active harness supervision protocol live: a text-only "holding" or "waiting" reply with crewmates live and no live cycle is a bug, and because such a turn runs no supervision script it is exactly the blind gap the script-only guard (`fm-guard.sh`, below) cannot catch, so this discipline must.
-If a forced restart is ever genuinely needed, use `bin/fm-watch-arm.sh --restart`, which signals only this home's recorded watcher and then owns a fresh cycle or reports restart-only `healthy` without attaching if a healthy peer still holds the lock.
+If a forced restart is ever genuinely needed, use `bin/fm-watch-arm.sh --restart`, which stops only this home's identity-matched recorded watcher tree by exact pid and parentage, then owns a fresh cycle or reports restart-only `healthy` without attaching if a healthy peer wins the replacement race.
 Never `pkill -f bin/fm-watch.sh`: that pattern matches every firstmate home's watcher, including secondmate homes that run the same script, so a broad pkill from one home kills sibling homes' watchers.
 Away-mode supervision is provided by the `/afk` skill and its daemon; while `state/.afk` exists, the daemon owns the watcher.
 Waiting on the watcher is intentionally silent.
@@ -693,6 +693,8 @@ The banner is only a supervision warning: the supervision guard itself does not 
 `fm-send` may still refuse at a later target, identity, or Herdr composer safety check, so its continuation banner is not a delivery confirmation.
 If a guard warning says queued wakes are pending, drain them before doing anything else.
 If a guard warning says watcher liveness is stale, drain any queued wakes and then resume the emitted supervision protocol.
+A lock-holding watcher that misses the tighter progress cadence is wedged even while its beacon remains inside the broad handoff grace; the arm refuses to attach to it.
+If the guard says the live watcher missed cadence or its tree is consuming a core, use the home-scoped `bin/fm-watch-arm.sh --restart` recovery rather than manual pid surgery.
 
 `fm-guard.sh` carries a second, independent alarm in the same bordered style: the **worktree-tangle** guard.
 If a crewmate sent to work firstmate-on-itself branches or commits in the primary checkout instead of its own isolated worktree, the primary is stranded on a feature branch (the failure this guards against); the guard names the offending branch and prints the non-destructive restore (`git -C <root> checkout <default>`), so the tangle surfaces on the very next fleet action.

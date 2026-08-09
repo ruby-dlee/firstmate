@@ -533,7 +533,7 @@ test_watch_restart_rejects_reused_pid() {
 }
 
 test_watch_restart_reaps_term_resistant_owned_tree() {
-  local dir state fakebin out peer_file peer child_file child identity armpid i lock_pid root_live child_live
+  local dir state fakebin out peer_file peer child_file child identity armpid i lock_pid root_live child_live root_state root_cpu
   dir=$(make_case restart-term-resistant-tree)
   state="$dir/state"
   fakebin="$dir/fakebin"
@@ -563,6 +563,30 @@ test_watch_restart_reaps_term_resistant_owned_tree() {
     fail "TERM-resistant watcher-tree fixture did not start its child"
   fi
   child=$(cat "$child_file")
+  i=0
+  root_state=
+  root_cpu=100
+  while [ "$i" -lt 50 ]; do
+    read -r root_state root_cpu <<EOF
+$(LC_ALL=C ps -p "$peer" -o state=,%cpu= 2>/dev/null | awk 'NR == 1 { print $1, $2 }')
+EOF
+    case "$root_state" in
+      S*) awk -v cpu="$root_cpu" 'BEGIN { exit !(cpu < 1.0) }' && break ;;
+    esac
+    sleep 0.1
+    i=$((i + 1))
+  done
+  case "$root_state" in
+    S*) ;;
+    *)
+      kill -KILL "$peer" "$child" 2>/dev/null || true
+      fail "watcher-tree root was not sleeping before restart (state $root_state)"
+      ;;
+  esac
+  awk -v cpu="$root_cpu" 'BEGIN { exit !(cpu < 1.0) }' || {
+    kill -KILL "$peer" "$child" 2>/dev/null || true
+    fail "watcher-tree root was not near-zero CPU before restart (${root_cpu}%)"
+  }
   identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || {
     kill -KILL "$peer" "$child" 2>/dev/null || true
     fail "could not identify owned restart root"
@@ -599,7 +623,7 @@ test_watch_restart_reaps_term_resistant_owned_tree() {
   [ "$root_live" -eq 0 ] || fail "restart left the TERM-resistant recorded watcher root alive"
   [ "$child_live" -eq 0 ] || fail "restart left a TERM-resistant recorded watcher descendant alive"
   [ -n "$lock_pid" ] && [ "$lock_pid" != "$peer" ] || fail "restart did not install a fresh watcher lock"
-  pass "watch restart reaps a TERM-resistant recorded tree and starts a fresh cycle"
+  pass "watch restart force-reaps a sleeping near-zero-CPU TERM-resistant recorded tree and starts a fresh cycle"
 }
 
 test_watcher_self_evicts_on_lock_takeover() {
@@ -699,13 +723,13 @@ test_arm_refuses_live_lock_with_bad_attach_cadence() {
   printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
   printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
   touch "$state/.last-watcher-beat"
-  perl -e '$time = time - 120; utime $time, $time, $ARGV[0]' "$state/.last-watcher-beat"
+  perl -e '$time = time - 155; utime $time, $time, $ARGV[0]' "$state/.last-watcher-beat"
   status=0
   FM_HOME="$dir" FM_GUARD_GRACE=300 FM_WATCH_PROGRESS_GRACE=60 FM_ARM_CONFIRM_TIMEOUT=1 \
     "$WATCH_ARM" > "$out" || status=$?
   kill "$peer" 2>/dev/null || true
   wait "$peer" 2>/dev/null || true
-  [ "$status" -ne 0 ] || fail "arm reported a 120-second-old live-lock beacon as healthy"
+  [ "$status" -ne 0 ] || fail "arm reported a 155-second-old live-lock beacon as healthy"
   ! grep -qF "watcher: attached pid=$peer" "$out" \
     || fail "arm attached to a watcher already far outside normal cadence: $(cat "$out")"
   grep -qF "watcher: FAILED - live watcher pid=$peer missed progress cadence" "$out" \

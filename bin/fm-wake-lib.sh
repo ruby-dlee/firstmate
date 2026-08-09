@@ -67,11 +67,15 @@ fm_session_snapshot() {  # <session-id> [excluded-root-pid]
   case "$excluded" in *[!0-9]*) return 1 ;; esac
   python3 -c '
 import ctypes
+import os
 import subprocess
 import sys
+import time
 
 session = int(sys.argv[1])
 excluded = int(sys.argv[2]) if sys.argv[2] else None
+enumerator = os.getpid()
+enumerator_caller = os.getppid()
 libc = ctypes.CDLL(None, use_errno=True)
 result = subprocess.run(
     ["ps", "-axo", "pid=,ppid=,state="],
@@ -86,10 +90,25 @@ for line in result.stdout.splitlines():
         continue
     processes[int(fields[0])] = (int(fields[1]), fields[2])
 
+if (
+    os.environ.get("FM_SESSION_SNAPSHOT_TEST_HOOKS") == "firstmate-session-snapshot-tests-v1"
+    and os.environ.get("FM_SESSION_SNAPSHOT_TEST_ARMED")
+    and os.path.exists(os.environ["FM_SESSION_SNAPSHOT_TEST_ARMED"])
+    and os.environ.get("FM_SESSION_SNAPSHOT_TEST_READY")
+    and os.environ.get("FM_SESSION_SNAPSHOT_TEST_PROCEED")
+    and not os.path.exists(os.environ["FM_SESSION_SNAPSHOT_TEST_READY"])
+):
+    with open(os.environ["FM_SESSION_SNAPSHOT_TEST_READY"], "x", encoding="utf-8"):
+        pass
+    while not os.path.exists(os.environ["FM_SESSION_SNAPSHOT_TEST_PROCEED"]):
+        time.sleep(0.01)
+
 def in_excluded_tree(pid):
+    if pid == enumerator_caller:
+        return True
     seen = set()
-    while excluded is not None and pid not in seen:
-        if pid == excluded:
+    while pid not in seen:
+        if pid == enumerator or (excluded is not None and pid == excluded):
             return True
         seen.add(pid)
         process = processes.get(pid)
@@ -120,6 +139,25 @@ fm_session_has_live_processes_except() {  # <session-id> <excluded-pid>
   return 1
 }
 
+fm_session_wait_quiescent_except() {  # <session-id> <excluded-pid> [wait-tenths]
+  local session=$1 excluded=$2 wait_tenths=${3:-20} iteration=0 status empty_streak=0
+  while [ "$iteration" -lt "$wait_tenths" ]; do
+    status=0
+    fm_session_has_live_processes_except "$session" "$excluded" || status=$?
+    case "$status" in
+      0) empty_streak=0 ;;
+      1)
+        empty_streak=$((empty_streak + 1))
+        [ "$empty_streak" -lt 2 ] || return 0
+        ;;
+      *) return 1 ;;
+    esac
+    sleep 0.1
+    iteration=$((iteration + 1))
+  done
+  return 1
+}
+
 fm_session_signal_members() {  # <signal> <session-id> [excluded-pid]
   local signal=$1 session=$2 excluded=${3:-} pid identity index snapshot
   local pids=() identities=()
@@ -140,23 +178,58 @@ fm_session_signal_members() {  # <signal> <session-id> [excluded-pid]
 }
 
 fm_session_stop_owned_except() {  # <session-id> <excluded-pid> [term-wait-tenths]
-  local session=$1 excluded=$2 wait_tenths=${3:-30} iteration status
+  local session=$1 excluded=$2 wait_tenths=${3:-30} iteration status empty_streak=0 excluded_identity=
+  if [ -n "$excluded" ]; then
+    excluded_identity=$(fm_pid_identity "$excluded") || return 1
+    [ "$(fm_pid_session "$excluded" 2>/dev/null || true)" = "$session" ] || return 1
+  fi
   fm_session_signal_members TERM "$session" "$excluded" || return 1
   iteration=0
   while [ "$iteration" -lt "$wait_tenths" ]; do
     status=0
     fm_session_has_live_processes_except "$session" "$excluded" || status=$?
-    [ "$status" -eq 0 ] || { [ "$status" -eq 1 ] && return 0; return 1; }
+    case "$status" in
+      0)
+        if [ "$empty_streak" -gt 0 ] && [ -z "$excluded_identity" ]; then
+          return 1
+        fi
+        empty_streak=0
+        ;;
+      1)
+        empty_streak=$((empty_streak + 1))
+        [ "$empty_streak" -lt 2 ] || return 0
+        ;;
+      *) return 1 ;;
+    esac
     sleep 0.1
     iteration=$((iteration + 1))
   done
   iteration=0
+  empty_streak=0
   while [ "$iteration" -lt 20 ]; do
-    fm_session_signal_members KILL "$session" "$excluded" || return 1
+    if [ "$empty_streak" -eq 0 ]; then
+      if [ -n "$excluded_identity" ]; then
+        [ "$(fm_pid_identity "$excluded" 2>/dev/null || true)" = "$excluded_identity" ] || return 1
+        [ "$(fm_pid_session "$excluded" 2>/dev/null || true)" = "$session" ] || return 1
+      fi
+      fm_session_signal_members KILL "$session" "$excluded" || return 1
+    fi
     sleep 0.1
     status=0
     fm_session_has_live_processes_except "$session" "$excluded" || status=$?
-    [ "$status" -eq 0 ] || { [ "$status" -eq 1 ] && return 0; return 1; }
+    case "$status" in
+      0)
+        if [ "$empty_streak" -gt 0 ] && [ -z "$excluded_identity" ]; then
+          return 1
+        fi
+        empty_streak=0
+        ;;
+      1)
+        empty_streak=$((empty_streak + 1))
+        [ "$empty_streak" -lt 2 ] || return 0
+        ;;
+      *) return 1 ;;
+    esac
     iteration=$((iteration + 1))
   done
   return 1
@@ -164,6 +237,42 @@ fm_session_stop_owned_except() {  # <session-id> <excluded-pid> [term-wait-tenth
 
 fm_session_stop_owned() {  # <session-id> [term-wait-tenths]
   fm_session_stop_owned_except "$1" "" "${2:-30}"
+}
+
+fm_pid_stop_identity() {  # <pid> <pid-identity> [term-wait-tenths]
+  local pid=$1 identity=$2 wait_tenths=${3:-30} iteration=0
+  [ -n "$identity" ] || return 1
+  [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "$identity" ] || return 1
+  kill -TERM "$pid" 2>/dev/null || true
+  while [ "$iteration" -lt "$wait_tenths" ]; do
+    [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "$identity" ] || return 0
+    sleep 0.1
+    iteration=$((iteration + 1))
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+  iteration=0
+  while [ "$iteration" -lt 20 ]; do
+    [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "$identity" ] || return 0
+    sleep 0.1
+    iteration=$((iteration + 1))
+  done
+  return 1
+}
+
+fm_session_anchor_matches() {  # <session-id> <anchor-pid> <anchor-identity>
+  local session=$1 anchor=$2 identity=$3
+  [ -n "$identity" ] || return 1
+  [ "$(fm_pid_identity "$anchor" 2>/dev/null || true)" = "$identity" ] || return 1
+  [ "$(fm_pid_session "$anchor" 2>/dev/null || true)" = "$session" ]
+}
+
+fm_session_stop_owned_with_anchor() {  # <session-id> <anchor-pid> <anchor-identity> [term-wait-tenths]
+  local session=$1 anchor=$2 identity=$3 wait_tenths=${4:-30}
+  fm_session_anchor_matches "$session" "$anchor" "$identity" || return 1
+  fm_session_stop_owned_except "$session" "$anchor" "$wait_tenths" || return 1
+  fm_session_anchor_matches "$session" "$anchor" "$identity" || return 1
+  fm_pid_stop_identity "$anchor" "$identity" "$wait_tenths" || return 1
+  fm_session_wait_quiescent_except "$session" "" 20
 }
 
 fm_pid_session_stop() {  # <root-pid> <session-id> [term-wait-tenths] [expected-root-identity]
@@ -192,6 +301,14 @@ fm_watcher_lock_session_record_matches() {  # <state> <watch-path> <home> <sessi
   fm_watcher_lock_owner_record_matches "$state" "$watch_path" "$home" "$session" "$identity" \
     || return 1
   [ "$(cat "$lockdir/process-session" 2>/dev/null || true)" = "$session" ]
+}
+
+fm_watcher_lock_session_anchor_matches() {  # <state> <session-id>
+  local state=$1 session=$2 lockdir anchor identity
+  lockdir="$state/.watch.lock"
+  anchor=$(cat "$lockdir/session-anchor-pid" 2>/dev/null || true)
+  identity=$(cat "$lockdir/session-anchor-identity" 2>/dev/null || true)
+  fm_session_anchor_matches "$session" "$anchor" "$identity"
 }
 
 fm_watcher_lock_session_matches_pid() {  # <state> <watch-path> <home> <watcher-pid>
@@ -462,6 +579,8 @@ fm_lock_clean_known_files() {
     "$confined/pid-identity" \
     "$confined/process-group" \
     "$confined/process-session" \
+    "$confined/session-anchor-pid" \
+    "$confined/session-anchor-identity" \
     "$confined/watcher-path" \
     2>/dev/null || true
 }
@@ -669,7 +788,7 @@ fm_lock_process_group_guarded() {
 }
 
 fm_lock_process_session_guarded() {
-  local lockdir=$1 ownerdir guard session members
+  local lockdir=$1 ownerdir guard session
   if [ -L "$lockdir" ]; then
     ownerdir=$(fm_lock_link_owner "$lockdir" 2>/dev/null) || return 1
   elif [ -d "$lockdir" ]; then
@@ -691,8 +810,7 @@ fm_lock_process_session_guarded() {
       ;;
   esac
   FM_LOCK_HELD_PID=$session
-  members=$(fm_session_snapshot "$session") || return 0
-  [ -z "$members" ] || return 0
+  fm_session_wait_quiescent_except "$session" "" 2 || return 0
   if [ -L "$lockdir" ]; then
     fm_lock_points_to_owner "$lockdir" "$ownerdir" || return 0
   elif [ "$ownerdir" != "$lockdir" ]; then

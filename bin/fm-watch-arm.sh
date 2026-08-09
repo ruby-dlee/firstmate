@@ -132,28 +132,31 @@ recorded_watcher_lock_metadata_matches() {
 }
 
 clear_stale_recorded_watcher_lock() {
-  local lock_session session_status=0
+  local lock_session
   recorded_watcher_lock_metadata_matches || return 1
   lock_session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
   if [ -n "$lock_session" ]; then
-    fm_session_has_live_processes "$lock_session" || session_status=$?
-    [ "$session_status" -eq 1 ] || return 1
+    fm_session_wait_quiescent_except "$lock_session" "" 2 || return 1
   fi
   fm_lock_remove_path "$WATCH_LOCK" || return 1
   [ ! -e "$WATCH_LOCK" ] && [ ! -L "$WATCH_LOCK" ]
 }
 
 stop_recorded_watcher() {  # <root-pid> <root-identity>
-  local root=$1 identity=$2 session session_status=0 current_identity
+  local root=$1 identity=$2 session current_identity anchor anchor_identity
   session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
   if [ -n "$session" ]; then
     fm_watcher_lock_session_record_matches "$STATE" "$WATCH" "$FM_HOME" "$session" || return 1
-    fm_session_has_live_processes "$session" || session_status=$?
-    case "$session_status" in
-      0) fm_session_stop_owned "$session" 30 ;;
-      1) return 0 ;;
-      *) return 1 ;;
-    esac
+    anchor=$(cat "$WATCH_LOCK/session-anchor-pid" 2>/dev/null || true)
+    anchor_identity=$(cat "$WATCH_LOCK/session-anchor-identity" 2>/dev/null || true)
+    if fm_session_anchor_matches "$session" "$anchor" "$anchor_identity"; then
+      fm_session_stop_owned_with_anchor "$session" "$anchor" "$anchor_identity" 30
+      return
+    fi
+    current_identity=$(fm_pid_identity "$root" 2>/dev/null || true)
+    [ "$current_identity" = "$identity" ] || return 1
+    [ "$(fm_pid_session "$root" 2>/dev/null || true)" = "$session" ] || return 1
+    fm_pid_session_stop "$root" "$session" 30 "$identity"
     return
   fi
   current_identity=$(fm_pid_identity "$root") || return 1
@@ -374,6 +377,7 @@ owner_link_fifo=
 owner_link_ready=
 owner_link_failed=
 owner_link_connected=false
+owner_link_reader_connected=false
 
 owner_link_disconnect() {
   if "$owner_link_connected"; then
@@ -382,10 +386,16 @@ owner_link_disconnect() {
   fi
 }
 
+owner_link_reader_disconnect() {
+  if "$owner_link_reader_connected"; then
+    exec 8<&-
+    owner_link_reader_connected=false
+  fi
+}
+
 owner_link_remove() {
   [ -n "$owner_link_dir" ] || return 0
-  rm -f "$owner_link_ready" "$owner_link_failed" "$owner_link_dir/monitor-pid" \
-    "$owner_link_fifo" 2>/dev/null || true
+  rm -f "$owner_link_ready" "$owner_link_failed" "$owner_link_fifo" 2>/dev/null || true
   rmdir "$owner_link_dir" 2>/dev/null || true
   owner_link_dir=
   owner_link_fifo=
@@ -397,6 +407,7 @@ stop_owned_child() {
   local identity status=0 session_status=0 current_session iteration=0
   [ -n "$child" ] || return 0
   owner_link_disconnect
+  owner_link_reader_disconnect
   while [ "$iteration" -lt 20 ] && fm_pid_alive "$child"; do
     current_session=$(fm_pid_session "$child" 2>/dev/null || true)
     if [ "$current_session" = "$child" ]; then
@@ -406,7 +417,11 @@ stop_owned_child() {
     sleep 0.01
     iteration=$((iteration + 1))
   done
-  if "$child_session_verified"; then
+  if "$child_session_verified" \
+    && fm_watcher_lock_session_record_matches "$STATE" "$WATCH" "$FM_HOME" "$child"; then
+    identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
+    stop_recorded_watcher "$child" "$identity" || status=$?
+  elif "$child_session_verified"; then
     identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
     if [ "$(fm_pid_identity "$child" 2>/dev/null || true)" = "$identity" ]; then
       fm_pid_session_stop "$child" "$child" 30 "$identity" || status=$?
@@ -414,7 +429,7 @@ stop_owned_child() {
       identity=$(fm_pid_identity "$child" 2>/dev/null || true)
       fm_pid_session_stop "$child" "$child" 30 "$identity" || status=$?
     else
-      fm_session_stop_owned "$child" 30 || status=$?
+      status=1
     fi
   elif fm_pid_alive "$child"; then
     kill -TERM "$child" 2>/dev/null || true
@@ -432,6 +447,7 @@ stop_owned_child() {
 cleanup_child() {
   stop_owned_child >/dev/null 2>&1 || true
   owner_link_disconnect
+  owner_link_reader_disconnect
   owner_link_remove
   if [ -n "$child_out" ]; then
     rm -f "$child_out" 2>/dev/null || true
@@ -439,7 +455,7 @@ cleanup_child() {
 }
 
 monitor_started_child() {  # <confirmed-watcher-pid>
-  local watched=$1 hot_samples=0 sample_in=0 age reason rc session_status=0
+  local watched=$1 hot_samples=0 sample_in=0 age reason rc session_status=0 identity
   while fm_pid_alive "$watched" \
     && fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$watched" "$FM_HOME"; do
     age=$(fm_path_age "$BEAT")
@@ -491,7 +507,8 @@ monitor_started_child() {  # <confirmed-watcher-pid>
     queue_watcher_failure "$reason"
     echo "watcher: FAILED - $reason; recovering the owned watcher process session"
     session_status=0
-    fm_session_stop_owned "$watched" 10 || session_status=$?
+    identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
+    stop_recorded_watcher "$watched" "$identity" || session_status=$?
     if [ "$session_status" -ne 0 ]; then
       echo "watcher: FAILED - owned watcher process session could not be fully reaped"
     fi
@@ -531,6 +548,12 @@ exec 9<> "$owner_link_fifo" || {
   exit 1
 }
 owner_link_connected=true
+exec 8< "$owner_link_fifo" || {
+  cleanup_child
+  echo "watcher: FAILED - could not inherit arm ownership channel"
+  exit 1
+}
+owner_link_reader_connected=true
 (
   exec 9>&-
   FM_WATCHER_OWN_SESSION=1 \
@@ -538,6 +561,7 @@ owner_link_connected=true
     FM_WATCH_ARM_OWNER_FIFO="$owner_link_fifo" \
     FM_WATCH_ARM_OWNER_READY="$owner_link_ready" \
     FM_WATCH_ARM_OWNER_FAILED="$owner_link_failed" \
+    FM_WATCH_ARM_OWNER_FD=8 \
     exec perl -MPOSIX -e '
       my $session = POSIX::setsid();
       exit 126 if !defined $session || $session != $$;
@@ -546,6 +570,7 @@ owner_link_connected=true
     ' "$WATCH"
 ) >"$child_out" 2>&1 &
 child=$!
+owner_link_reader_disconnect
 child_done=0
 
 # Verify the outcome: poll until this child is the confirmed healthy watcher, or

@@ -663,7 +663,7 @@ EOF
 }
 
 test_watch_restart_recovers_dead_session_leader() {
-  local dir state fakebin out peer_file child_file peer child identity armpid i lock_pid members
+  local dir state fakebin out peer_file child_file peer child identity anchor_identity armpid i lock_pid members
   dir=$(make_case restart-dead-session-leader)
   state="$dir/state"
   fakebin="$dir/fakebin"
@@ -699,6 +699,12 @@ test_watch_restart_recovers_dead_session_leader() {
   printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
   printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
   printf '%s\n' "$peer" > "$state/.watch.lock/process-session"
+  anchor_identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$child") || {
+    kill -KILL "$peer" "$child" 2>/dev/null || true
+    fail "could not identify dead-leader session anchor"
+  }
+  printf '%s\n' "$child" > "$state/.watch.lock/session-anchor-pid"
+  printf '%s\n' "$anchor_identity" > "$state/.watch.lock/session-anchor-identity"
   kill -KILL "$peer" 2>/dev/null || true
   i=0
   while [ "$i" -lt 50 ] && is_live_non_zombie "$peer"; do sleep 0.1; i=$((i + 1)); done
@@ -769,6 +775,177 @@ test_arm_owner_death_reaps_watcher_session() {
     fail "arm death left the watcher lock behind: $state_snapshot"
   fi
   pass "arm controller death closes ownership and reaps the watcher session"
+}
+
+test_arm_owner_death_before_monitor_start_reaps_session() {
+  local dir state fakebin out ready proceed armpid watcher_pid session i members
+  dir=$(make_case arm-owner-preconnect)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  ready="$dir/monitor.ready"
+  proceed="$dir/monitor.proceed"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_READY="$ready" FM_WATCH_OWNER_TEST_PROCEED="$proceed" \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+    session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
+    [ -e "$ready" ] && [ -n "$watcher_pid" ] && [ "$session" = "$watcher_pid" ] && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$ready" ] || fail "watcher did not pause before ownership monitor startup: $(cat "$out")"
+  kill -KILL "$armpid" 2>/dev/null || fail "could not kill arm before ownership monitor startup"
+  wait "$armpid" 2>/dev/null || true
+  touch "$proceed"
+  i=0
+  while [ "$i" -lt 120 ]; do
+    members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' _ "$LIB" "$session" 2>/dev/null || true)
+    [ -z "$members" ] && [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -z "$members" ] || { for watcher_pid in $members; do kill -KILL "$watcher_pid" 2>/dev/null || true; done; fail "pre-monitor arm death left watcher session members: $members"; }
+  [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
+    || fail "pre-monitor arm death left the watcher lock behind"
+  pass "inherited ownership channel observes arm death before monitor startup"
+}
+
+test_session_cleanup_requires_stable_quiescence() {
+  local dir state root_file anchor_file late_file armed ready proceed fork_now result_file root anchor late cleanup i identity
+  dir=$(make_case session-stable-quiescence)
+  state="$dir/state"
+  root_file="$dir/root.pid"
+  anchor_file="$dir/anchor.pid"
+  late_file="$dir/late.pid"
+  armed="$dir/snapshot.armed"
+  ready="$dir/snapshot.ready"
+  proceed="$dir/snapshot.proceed"
+  fork_now="$dir/fork.now"
+  result_file="$dir/cleanup.status"
+  node -e '
+    const fs = require("fs");
+    const { spawn } = require("child_process");
+    const rootProgram = `
+      const fs = require("fs");
+      const { spawn } = require("child_process");
+      const anchor = spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\",()=>{});setTimeout(()=>{},300000)"], { stdio: "ignore" });
+      fs.writeFileSync(process.argv[1], String(anchor.pid));
+      process.on("SIGTERM", () => {
+        fs.writeFileSync(process.argv[2], "ready");
+        const timer = setInterval(() => {
+          if (!fs.existsSync(process.argv[3])) return;
+          clearInterval(timer);
+          const late = spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\",()=>{});setTimeout(()=>{},300000)"], { stdio: "ignore" });
+          fs.writeFileSync(process.argv[4], String(late.pid));
+          process.exit(0);
+        }, 5);
+      });
+      setTimeout(() => {}, 300000);
+    `;
+    const root = spawn(process.execPath, ["-e", rootProgram, process.argv[2], process.argv[3], process.argv[4], process.argv[5]], { detached: true, stdio: "ignore" });
+    fs.writeFileSync(process.argv[1], String(root.pid));
+    root.unref();
+  ' "$root_file" "$anchor_file" "$armed" "$fork_now" "$late_file"
+  root=$(cat "$root_file")
+  i=0
+  while [ "$i" -lt 80 ] && [ ! -s "$anchor_file" ]; do sleep 0.1; i=$((i + 1)); done
+  [ -s "$anchor_file" ] || { kill -KILL "$root" 2>/dev/null || true; fail "stable-quiescence fixture did not start its anchor"; }
+  anchor=$(cat "$anchor_file")
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$anchor") \
+    || { kill -KILL "$root" "$anchor" 2>/dev/null || true; fail "could not identify stable-quiescence anchor"; }
+  FM_STATE_OVERRIDE="$state" FM_SESSION_SNAPSHOT_TEST_HOOKS=firstmate-session-snapshot-tests-v1 \
+    FM_SESSION_SNAPSHOT_TEST_ARMED="$armed" FM_SESSION_SNAPSHOT_TEST_READY="$ready" \
+    FM_SESSION_SNAPSHOT_TEST_PROCEED="$proceed" bash -c \
+    '. "$1"; status=0; fm_session_stop_owned_except "$2" "$3" 5 || status=$?; printf "%s\n" "$status" > "$4"' \
+    _ "$LIB" "$root" "$anchor" "$result_file" &
+  cleanup=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -e "$ready" ]; do sleep 0.1; i=$((i + 1)); done
+  [ -e "$ready" ] || { kill -KILL "$cleanup" "$root" "$anchor" 2>/dev/null || true; fail "session snapshot did not reach its deterministic race barrier"; }
+  touch "$fork_now"
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -s "$late_file" ]; do sleep 0.1; i=$((i + 1)); done
+  [ -s "$late_file" ] || { kill -KILL "$cleanup" "$root" "$anchor" 2>/dev/null || true; fail "TERM trap did not spawn its late session child"; }
+  late=$(cat "$late_file")
+  touch "$proceed"
+  wait "$cleanup" 2>/dev/null || true
+  [ "$(cat "$result_file" 2>/dev/null || true)" = 0 ] || { kill -KILL "$anchor" "$late" 2>/dev/null || true; fail "session cleanup did not establish stable quiescence"; }
+  ! is_live_non_zombie "$late" || { kill -KILL "$late" 2>/dev/null || true; fail "session cleanup missed the child created after its first empty snapshot"; }
+  is_live_non_zombie "$anchor" || fail "session cleanup killed its identity-pinned anchor"
+  [ "$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$anchor")" = "$identity" ] \
+    || fail "session cleanup changed its identity-pinned anchor"
+  kill -KILL "$anchor" 2>/dev/null || true
+  pass "session cleanup requires stable quiescence across consecutive snapshots"
+}
+
+test_watch_restart_refuses_reused_session_without_anchor() {
+  local dir state fakebin out peer_file peer current_identity status
+  dir=$(make_case restart-reused-session)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/restart.out"
+  peer_file="$dir/peer.pid"
+  node -e '
+    const fs = require("fs");
+    const { spawn } = require("child_process");
+    const peer = spawn(process.execPath, ["-e", `process.on("SIGTERM",()=>{});setTimeout(()=>{},300000)`], { detached: true, stdio: "ignore" });
+    fs.writeFileSync(process.argv[1], String(peer.pid));
+    peer.unref();
+  ' "$peer_file"
+  peer=$(cat "$peer_file")
+  current_identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") \
+    || { kill -KILL "$peer" 2>/dev/null || true; fail "could not identify reused-session fixture"; }
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$peer" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "stale-$current_identity" > "$state/.watch.lock/pid-identity"
+  printf '%s\n' "$peer" > "$state/.watch.lock/process-session"
+  status=0
+  PATH="$fakebin:$PATH" FM_HOME="$dir" "$WATCH_ARM" --restart > "$out" 2>&1 || status=$?
+  [ "$status" -ne 0 ] || { kill -KILL "$peer" 2>/dev/null || true; fail "restart accepted a reused session without a live identity anchor"; }
+  is_live_non_zombie "$peer" || fail "restart signalled an unrelated reused session"
+  kill -KILL "$peer" 2>/dev/null || true
+  pass "restart refuses reused sessions without a live identity anchor"
+}
+
+test_normal_session_watcher_releases_guard() {
+  local dir state fakebin out watcher_pid i
+  dir=$(make_case normal-session-release)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  touch "$state/.last-check" "$state/.last-account-session-sync" "$state/.last-report-retention"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_WATCHER_OWN_SESSION=1 FM_POLL=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 perl -MPOSIX -e '
+      my $session = POSIX::setsid();
+      exit 126 if !defined $session || $session != $$;
+      exec @ARGV;
+      exit 127;
+    ' "$WATCH" > "$out" 2>&1 &
+  watcher_pid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    [ "$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)" = "$watcher_pid" ] && break
+    is_live_non_zombie "$watcher_pid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)" = "$watcher_pid" ] \
+    || fail "direct session watcher did not establish its guard: $(cat "$out")"
+  kill -TERM "$watcher_pid" 2>/dev/null || fail "could not terminate direct session watcher"
+  wait "$watcher_pid" 2>/dev/null || true
+  [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
+    || fail "normal session watcher exit left a guarded lock"
+  pass "normal session watcher exit excludes its snapshot enumerator"
 }
 
 test_watcher_self_evicts_on_lock_takeover() {
@@ -1587,6 +1764,15 @@ if [ "${FM_TEST_FOCUSED:-}" = ownership-boundary ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = ownership-races ]; then
+  test_arm_owner_death_before_monitor_start_reaps_session
+  test_session_cleanup_requires_stable_quiescence
+  test_watch_restart_refuses_reused_session_without_anchor
+  test_normal_session_watcher_releases_guard
+  test_watch_restart_recovers_dead_session_leader
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = arm-owner-death ]; then
   test_arm_owner_death_reaps_watcher_session
   exit 0
@@ -1625,6 +1811,10 @@ test_watch_restart_rejects_reused_pid
 test_watch_restart_reaps_term_resistant_owned_tree
 test_watch_restart_recovers_dead_session_leader
 test_arm_owner_death_reaps_watcher_session
+test_arm_owner_death_before_monitor_start_reaps_session
+test_session_cleanup_requires_stable_quiescence
+test_watch_restart_refuses_reused_session_without_anchor
+test_normal_session_watcher_releases_guard
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_arm_refuses_live_lock_with_bad_attach_cadence

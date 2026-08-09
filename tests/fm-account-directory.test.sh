@@ -7,6 +7,7 @@ set -u
 
 SELECTOR="$ROOT/bin/fm-account-directory.sh"
 fm_test_tmproot_into TMP_ROOT fm-account-directory-tests
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 ACCOUNT_ROOT="$TMP_ROOT/accounts"
 FAKEBIN=$(fm_fakebin "$TMP_ROOT")
 QUOTA_LOG="$TMP_ROOT/quota.log"

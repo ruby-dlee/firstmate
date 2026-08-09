@@ -3694,24 +3694,28 @@ test_session_sync_cannot_recreate_metadata_after_teardown() {
   pass "session synchronization cannot recreate metadata after teardown"
 }
 
-test_managed_steering_audit_failure_does_not_reclassify_delivery() {
+test_managed_steering_refuses_before_split_transport() {
   local id rec out status
   id=account-steering-audit-z24
   rec=$(make_case steering-audit claude "$id")
   read_case "$rec"
   run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "steering audit precondition spawn failed"
-  mkdir "$HOME_DIR/data/$id/steering.md"
   clear_case_logs
   touch "$CASE_DIR/endpoint-live"
 
-  out=$(run_send "$id" "This delivered steer must not be retried." 2>&1)
+  out=$(run_send "$id" "This refused steer must never reach pane input." 2>&1)
   status=$?
-  [ "$status" -ne 0 ] || fail "unconfirmed steering delivery returned success without a verification receipt: $out"
-  assert_contains "$out" "could not be confirmed" "audit failure overstated delivery truth"
-  assert_grep 'This delivered steer must not be retried' "$LAUNCH_LOG" "steering text was not submitted before confirmation failed"
-  assert_grep 'This delivered steer must not be retried' "$HOME_DIR/data/$id/steering-unconfirmed.md" \
-    "unconfirmed steering was not durably recorded for reconciliation"
-  pass "unconfirmed steering is durably spooled and returns the required hard-stop signal"
+  [ "$status" -ne 0 ] || fail "split steering transport returned success without an atomic receipt: $out"
+  assert_contains "$out" "no atomic agent-session-bound text steering operation" \
+    "managed steering did not name the Gate B transport refusal"
+  assert_contains "$out" "text not sent" "managed steering overstated delivery truth"
+  assert_no_grep 'This refused steer must never reach pane input.' "$LAUNCH_LOG" \
+    "managed steering typed text before obtaining an atomic receipt"
+  assert_grep 'not-submitted' "$HOME_DIR/data/$id/steering-journal.md" \
+    "managed steering did not durably close its pending intent as not submitted"
+  assert_absent "$HOME_DIR/data/$id/steering-unconfirmed.md" \
+    "a pre-input refusal was misclassified as an unconfirmed submission"
+  pass "managed steering records not-submitted and refuses before split pane input"
 }
 
 test_managed_tmux_identity_survives_window_rename() {
@@ -7006,7 +7010,7 @@ if [ "${FM_TEST_FOCUSED:-}" = oversized-continuation ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = steering-audit ]; then
-  run_isolated_test test_managed_steering_audit_failure_does_not_reclassify_delivery
+  run_isolated_test test_managed_steering_refuses_before_split_transport
   exit 0
 fi
 
@@ -7384,7 +7388,7 @@ if [ "${FM_TEST_FOCUSED:-}" = prior-tasktmp-cleanup ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = gate-b-send ]; then
-  run_isolated_test test_managed_steering_audit_failure_does_not_reclassify_delivery
+  run_isolated_test test_managed_steering_refuses_before_split_transport
   exit 0
 fi
 
@@ -7465,7 +7469,7 @@ run_isolated_test test_live_secondmate_recovery_precedes_home_convergence
 run_isolated_test test_secondmate_provider_change_reloads_complete_profile
 run_isolated_test test_continuation_fails_closed_without_original_brief
 run_isolated_test test_session_sync_cannot_recreate_metadata_after_teardown
-run_isolated_test test_managed_steering_audit_failure_does_not_reclassify_delivery
+run_isolated_test test_managed_steering_refuses_before_split_transport
 run_isolated_test test_managed_tmux_identity_survives_window_rename
 run_isolated_test test_native_resume_accepts_regressed_wallclock_when_event_sequence_advances
 run_isolated_test test_session_sync_metadata_publish_failure_is_closed

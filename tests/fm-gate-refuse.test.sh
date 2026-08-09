@@ -16,7 +16,8 @@
 # Each entrypoint is exercised in three scenarios, isolating exactly ONE signal:
 #   - env-marker refuse : neutral cwd + NO_MISTAKES_GATE set      -> exit 3, no mutation
 #   - path-backstop refuse: gate-worktree cwd + marker UNSET      -> exit 3, no mutation
-#   - no-regression      : neutral cwd + marker UNSET             -> succeeds, no gate error
+#   - no-regression      : neutral cwd + marker UNSET             -> reaches the ordinary
+#                          Gate B refusal, not a gate-agent refusal
 # The marker is UNSET explicitly in the no-regression/backstop runs (env -u) and
 # those runs stand in a controlled NON-gate repo, so the suite is hermetic even
 # when it is itself executed inside the real no-mistakes gate (whose process has
@@ -273,8 +274,8 @@ test_spawn_refuses_and_admits() {
 # --- fm-send ----------------------------------------------------------------
 
 # A fake tmux that logs send-keys to FM_TMUX_LOG and reports live endpoints
-# (mirrors tests/fm-send-strict), so a successful send is observable and a
-# refused one leaves an empty log (proving no message was typed).
+# (mirrors tests/fm-send-strict), so every refusal leaves an empty log and
+# proves no message was typed.
 make_send_fakebin() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
@@ -318,7 +319,7 @@ test_send_refuses_and_admits() {
   home="$TMP/send-home"; mkdir -p "$home/state"
   fakebin=$(make_send_fakebin "$TMP/send-fake")
   log="$TMP/send-tmux.log"
-  fm_write_meta "$home/state/lane-ok.meta" "window=sess:fm-lane-ok" "kind=ship" "harness=codex"
+  fm_write_meta "$home/state/lane-ok.meta" "window=sess:fm-lane-ok" "kind=ship" "harness=claude"
 
   # env-marker refuse.
   : > "$log"
@@ -334,14 +335,17 @@ test_send_refuses_and_admits() {
   assert_contains "$out" "$PATH_MSG" "send: path-backstop refusal message"
   [ ! -s "$log" ] || fail "send: refused backstop send still typed to the endpoint"$'\n'"$(cat "$log")"
 
-  # no-regression.
+  # No gate-agent regression: a normal session reaches Gate B's ordinary
+  # fail-closed transport decision, which still refuses tmux before input.
   : > "$log"
   out=$(run_send "$NORMAL_CWD" "$home" "$fakebin" "$log" fm-lane-ok "hello captain"); rc=$?
-  expect_code 0 "$rc" "send: a normal session must still send"
+  expect_code 1 "$rc" "send: a normal session must reach the ordinary Gate B refusal"
   assert_not_contains "$out" "$ENV_MSG" "send: normal send must not print the gate refusal"
   assert_not_contains "$out" "$PATH_MSG" "send: normal send must not print the backstop refusal"
-  assert_contains "$(cat "$log")" "target=sess:fm-lane-ok literal=1 arg=hello captain" "send: normal send should type the text"
-  pass "fm-send: refuses on marker and gate-worktree backstop; a normal steer is unaffected"
+  assert_contains "$out" "no atomic agent-session-bound text steering operation" \
+    "send: normal session did not reach the ordinary Gate B transport refusal"
+  [ ! -s "$log" ] || fail "send: ordinary Gate B refusal still typed to the endpoint"$'\n'"$(cat "$log")"
+  pass "fm-send: gate-agent signals refuse first while a normal session reaches Gate B without pane input"
 }
 
 # --- fm-teardown ------------------------------------------------------------

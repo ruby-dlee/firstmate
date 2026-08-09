@@ -203,6 +203,7 @@ runner=$(basename "$0")
 startup_marker=$(dirname "$0")/$runner-startup-failure
 missing_dependency_marker=$(dirname "$0")/$runner-missing-dependency
 hook_failure_marker=$(dirname "$0")/$runner-hook-failure
+duplicate_name_marker=$(dirname "$0")/$runner-duplicate-name
 [ ! -f "$startup_marker" ] || {
   echo "MEASURED $runner STARTUP FAILURE" >&2
   exit 1
@@ -228,7 +229,7 @@ selector=
 body_probe=
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --setupFilesAfterEnv|--runner)
+    --setupFilesAfterEnv|--config)
       body_probe=$2
       shift 2
       ;;
@@ -283,6 +284,14 @@ if grep -qx fixed app.txt; then
 {"success":true,$runtime_field"numPassedTests":2,"numFailedTests":0,"testResults":[{"status":"passed","assertionResults":[{"fullName":"within a chat stays stable","status":"passed"},{"fullName":"across chats resets state","status":"passed"}]}]}
 JSON
   exit 0
+fi
+if [ -f "$duplicate_name_marker" ]; then
+  printf '%s\n' \
+    '{"fullName":"duplicate regression"}' > "$body_report"
+  cat <<JSON
+{"success":false,$runtime_field"numPassedTests":1,"numFailedTests":1,"testResults":[{"status":"failed","assertionResults":[{"fullName":"duplicate regression","status":"passed"},{"fullName":"duplicate regression","status":"failed"}]}]}
+JSON
+  exit 1
 fi
 printf '%s\n' \
   '{"fullName":"within a chat stays stable"}' \
@@ -710,7 +719,9 @@ elif scenario in {
     "jest-startup",
     "jest-missing-dependency",
     "jest-hook-failure",
+    "jest-duplicate-name",
     "vitest-verified-fixed",
+    "vitest-real-verified-fixed",
     "vitest-no-match",
     "vitest-startup",
     "vitest-missing-dependency",
@@ -730,17 +741,20 @@ elif scenario in {
         "jest-startup",
         "jest-missing-dependency",
         "jest-hook-failure",
+        "jest-duplicate-name",
         "vitest-verified-fixed",
+        "vitest-real-verified-fixed",
         "vitest-no-match",
         "vitest-startup",
         "vitest-missing-dependency",
         "missing-named-test",
     }:
         patch.parent.mkdir(parents=True, exist_ok=True)
-        if scenario == "jest-real-verified-fixed":
-            patch.write_text("""diff --git a/src/chat-state.js b/src/chat-state.js
---- a/src/chat-state.js
-+++ b/src/chat-state.js
+        if scenario in {"jest-real-verified-fixed", "vitest-real-verified-fixed"}:
+            extension = "js" if scenario.startswith("jest-") else "mjs"
+            patch.write_text("""diff --git a/src/chat-state.__EXT__ b/src/chat-state.__EXT__
+--- a/src/chat-state.__EXT__
++++ b/src/chat-state.__EXT__
 @@ -5,7 +5,6 @@ function createChatState() {
    return {
      next(chatId) {
@@ -750,7 +764,7 @@ elif scenario in {
        }
        sequence += 1;
        return sequence;
-""")
+""".replace("__EXT__", extension))
         else:
             patch.write_text("""diff --git a/app.txt b/app.txt
 --- a/app.txt
@@ -812,7 +826,9 @@ elif scenario in {
         "jest-startup": "tests/regression.test.sh::across chats resets state",
         "jest-missing-dependency": "tests/regression.test.sh::across chats resets state",
         "jest-hook-failure": "tests/regression.test.sh::across chats resets state",
+        "jest-duplicate-name": "tests/regression.test.sh::duplicate regression",
         "vitest-verified-fixed": "tests/regression.test.sh::(within a chat stays stable|across chats resets state)",
+        "vitest-real-verified-fixed": "tests/chat-state.test.mjs::(within a chat stays stable|across chats resets state)",
         "vitest-no-match": "tests/regression.test.sh::does not exist",
         "vitest-startup": "tests/regression.test.sh::across chats resets state",
         "vitest-missing-dependency": "tests/regression.test.sh::across chats resets state",
@@ -2728,6 +2744,129 @@ assert value["findings"][0]["lifecycle"] == "open"
   pass "real Jest certifies the platform mutation and refuses hook-only failures"
 }
 
+test_real_vitest_body_probe_certifies_mutation() {
+  local record case_dir base head runtime ledger
+  record=$(make_case vitest-real-verified-fixed)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  mkdir -p "$case_dir/repo/src"
+  cat > "$case_dir/repo/src/chat-state.mjs" <<'JS'
+export function createChatState() {
+  let activeChat;
+  let sequence = 0;
+  return {
+    next(chatId) {
+      if (chatId !== activeChat) {
+        activeChat = chatId;
+        sequence = 0;
+      }
+      sequence += 1;
+      return sequence;
+    },
+  };
+}
+JS
+  cat > "$case_dir/repo/tests/chat-state.test.mjs" <<'JS'
+import { expect, test } from 'vitest';
+import { createChatState } from '../src/chat-state.mjs';
+
+test('within a chat stays stable', () => {
+  const state = createChatState();
+  expect(state.next('chat-a')).toBe(1);
+  expect(state.next('chat-a')).toBe(2);
+});
+
+test('across chats resets state', () => {
+  const state = createChatState();
+  expect(state.next('chat-a')).toBe(1);
+  expect(state.next('chat-b')).toBe(1);
+});
+JS
+  git -C "$case_dir/repo" add src/chat-state.mjs tests/chat-state.test.mjs
+  git -C "$case_dir/repo" commit -qm 'add Vitest regression proof'
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_open_ledger "$case_dir" "$head" src/chat-state.mjs
+
+  runtime="$TMP_ROOT/vitest-4.1.5-runtime"
+  if [ ! -x "$runtime/node_modules/.bin/vitest" ]; then
+    npm install --prefix "$runtime" --no-save --no-package-lock --ignore-scripts \
+      vitest@4.1.5 >/dev/null \
+      || fail "Vitest 4.1.5 runtime installation failed"
+  fi
+  ln -s "$runtime/node_modules/.bin/vitest" "$case_dir/pathbin/vitest"
+  "$case_dir/pathbin/vitest" --version | grep -q '^vitest/4\.1\.5 ' \
+    || fail "real Vitest integration did not resolve Vitest 4.1.5"
+
+  run_case "$case_dir" "$base" "$head" vitest-real-verified-fixed run \
+    > "$case_dir/out" 2> "$case_dir/err" \
+    || fail "real Vitest mutation proof did not clear: $(tr '\n' ' ' < "$case_dir/err")"
+  ledger="$case_dir/data/task-x1/crosscheck-ledger.json"
+  python3 - "$ledger" <<'PY' \
+    || fail "real Vitest mutation proof was not durably certified"
+import json
+import sys
+value = json.load(open(sys.argv[1]))
+finding = value["findings"][0]
+proof = finding["history"][-1]["proof"]
+assert finding["lifecycle"] == "verified-fixed", finding["lifecycle"]
+assert proof["test_invocation"] == {"runner": "vitest", "arguments": []}
+assert proof["test_path"] == (
+    "tests/chat-state.test.mjs::"
+    "(within a chat stays stable|across chats resets state)"
+)
+assert proof["baseline_exit"] == 0
+assert proof["mutated_exit"] == 1
+assert proof["mutated_files"] == ["src/chat-state.mjs"]
+baseline = json.JSONDecoder().raw_decode(proof["baseline_output"])[0]
+mutated = json.JSONDecoder().raw_decode(proof["mutated_output"])[0]
+baseline_status = {
+    assertion["fullName"]: assertion["status"]
+    for suite in baseline["testResults"]
+    for assertion in suite["assertionResults"]
+}
+mutated_status = {
+    assertion["fullName"]: assertion["status"]
+    for suite in mutated["testResults"]
+    for assertion in suite["assertionResults"]
+}
+assert baseline_status == {
+    "within a chat stays stable": "passed",
+    "across chats resets state": "passed",
+}
+assert mutated_status == {
+    "within a chat stays stable": "passed",
+    "across chats resets state": "failed",
+}
+PY
+  pass "real Vitest loads the gate body probe and certifies the mutation"
+}
+
+test_duplicate_javascript_outcome_names_are_nonexecution() {
+  local record case_dir base head rc
+  record=$(make_case jest-duplicate-name)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  seed_open_ledger "$case_dir" "$head"
+  install_javascript_runner_fake "$case_dir" jest
+  : > "$case_dir/pathbin/jest-duplicate-name"
+  set +e
+  run_case "$case_dir" "$base" "$head" jest-duplicate-name run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "duplicate JavaScript outcome names"
+  grep -F -- 'NON-EXECUTION' "$case_dir/err" >/dev/null \
+    || fail "duplicate JavaScript outcomes were accepted as distinct body executions: $(tr '\n' ' ' < "$case_dir/err")"
+  assert_grep 'ambiguous duplicate outcome name' "$case_dir/err" \
+    "the duplicate JavaScript outcome refusal did not name its ambiguity"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "one body marker cleared duplicate same-named outcomes"
+  pass "duplicate JavaScript outcome names are non-executions"
+}
+
 test_javascript_non_executions_clear_nothing() {
   local runner scenario record case_dir base head rc
   for runner in jest vitest; do
@@ -4330,7 +4469,7 @@ checkout = case / "mono"
 path = "apps/web/tests/regression.test.tsx::(within a chat|across chats)"
 expected = {
     "jest": (["--json", "--runTestsByPath"], "required-zero", "--setupFilesAfterEnv", True),
-    "vitest": (["run", "--reporter=json"], "absent", "--runner", False),
+    "vitest": (["run", "--reporter=json"], "absent", "--config", False),
 }
 assert set(module.MUTATION_RUNNER_POLICIES) == {"pytest", "jest", "vitest"}
 for runner in ("jest", "vitest"):
@@ -4350,6 +4489,15 @@ for runner in ("jest", "vitest"):
     assert Path(run.argv[3]).name == "regression.test.tsx", run.argv
     assert run.argv[4] == expected[runner][2], run.argv
     assert Path(run.argv[5]).is_file(), run.argv
+    probe_argument = Path(run.argv[5])
+    probe = probe_argument.read_text()
+    if runner == "vitest":
+        assert probe_argument.name == "vitest-body-probe.config.mjs", probe_argument
+        runner_probe = run.cwd / ".crosscheck" / "vitest-body-probe.mjs"
+        runner_source = runner_probe.read_text()
+        assert str(runner_probe) in probe, probe
+        assert "import { TestRunner } from 'vitest';" in runner_source, runner_source
+        assert "VitestTestRunner" not in runner_source, runner_source
     assert run.argv[6:] == (
         "--testNamePattern", "(within a chat|across chats)"
     ), run.argv
@@ -4574,6 +4722,8 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_verified_fix_executes_mutation_proof|\
     test_javascript_runners_certify_platform_shaped_mutation_proofs|\
     test_real_jest_certifies_platform_shaped_mutation_proof|\
+    test_real_vitest_body_probe_certifies_mutation|\
+    test_duplicate_javascript_outcome_names_are_nonexecution|\
     test_javascript_non_executions_clear_nothing|\
     test_javascript_runner_policy_is_declared_once|\
     test_pytest_runner_resolves_through_a_uv_aware_ladder|\
@@ -4632,6 +4782,14 @@ if [ "${FM_TEST_FOCUSED:-}" = javascript-body-proof ]; then
   test_javascript_runners_certify_platform_shaped_mutation_proofs
   test_javascript_non_executions_clear_nothing
   test_real_jest_certifies_platform_shaped_mutation_proof
+  test_real_vitest_body_probe_certifies_mutation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-4 ]; then
+  test_javascript_runner_policy_is_declared_once
+  test_duplicate_javascript_outcome_names_are_nonexecution
+  test_real_vitest_body_probe_certifies_mutation
   exit 0
 fi
 
@@ -4666,6 +4824,8 @@ test_silence_never_closes_prior_finding
 test_verified_fix_executes_mutation_proof
 test_javascript_runners_certify_platform_shaped_mutation_proofs
 test_real_jest_certifies_platform_shaped_mutation_proof
+test_real_vitest_body_probe_certifies_mutation
+test_duplicate_javascript_outcome_names_are_nonexecution
 test_javascript_non_executions_clear_nothing
 test_node_id_selector_clears_a_passing_named_test
 test_absent_runner_is_never_a_test_outcome

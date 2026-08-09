@@ -205,6 +205,7 @@ Symlink rejection is anchored at the resolved review checkout, so a symlink insi
 The gate resolves the named runner before launch and reports an absent binary, a failed sandbox exec, a missing named test, and every measured runner non-execution explicitly as `NON-EXECUTION`.
 For Jest and Vitest, the gate injects a runner-specific body probe and accepts a passed or failed assertion record only when the probe independently recorded entry into that exact selected test body.
 A failed `beforeAll` or `beforeEach` hook can create a failed assertion record without entering the test function, so it remains `NON-EXECUTION` and clears nothing.
+Duplicate passed or failed full names are ambiguous and remain `NON-EXECUTION`, so one same-named body's marker can never satisfy another outcome.
 That distinction applies to baseline and mutation runs alike because a run that never entered the selected test body can neither condemn the baseline nor vindicate the mutation.
 A runner absent from `MUTATION_RUNNER_POLICIES` is refused even if it is generally approved, because guessing its non-execution signal would allow a forged clearance.
 The patch may modify only non-test implementation paths already cited by the durable finding.
@@ -223,7 +224,7 @@ The JavaScript profile was measured on 2026-08-09 with Jest 29.7.0 and Vitest 4.
 
 ```sh
 jest --json --runTestsByPath /proof/regression.test.js --setupFilesAfterEnv /gate/jest-body-probe.cjs --testNamePattern 'across chats resets state'
-vitest run --reporter=json regression.test.js --runner /gate/vitest-body-probe.mjs --testNamePattern 'across chats resets state'
+vitest run --reporter=json regression.test.js --config /gate/vitest-body-probe.config.mjs --testNamePattern 'across chats resets state'
 ```
 
 The matched baseline exited 0 and recorded one passed selected assertion on both runners.
@@ -233,6 +234,7 @@ A missing target exited 1 with zero assertions, using a Jest runtime-error suite
 A missing imported dependency exited 1 with a failed suite and an empty `assertionResults` array on both runners, with Jest additionally reporting one runtime-error suite.
 A conventional `jest.config.cjs` or `vitest.config.js` that threw during loading exited 1 and emitted no JSON stdout on either runner.
 A failed `beforeAll` or `beforeEach` hook recorded a failed assertion without a matching body-start record and was classified as `NON-EXECUTION`.
+The gate-owned Vitest config fixes the proof root and selects a probe that extends the runtime `TestRunner` export, and its real-runner integration must load both generated modules successfully before Vitest remains eligible for certification.
 Those observed shapes are what the shared `jest-compatible-json` report policy and runner-specific body probes encode; exit status and assertion status are deliberately insufficient on their own.
 
 To add a future runner, add one policy entry carrying its invocation ladder, gate-owned arguments, selector mode, project-root rule, report format, measured non-execution exits, and dated measurement string.

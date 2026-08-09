@@ -70,9 +70,16 @@ make_home() {  # <name>
   printf '%s\n' "$home"
 }
 
+make_ship_worktree() {  # <dir> <branch>
+  mkdir -p "$1"
+  git -C "$1" init -q
+  git -C "$1" symbolic-ref HEAD "refs/heads/$2"
+}
+
 write_fixture() {  # <home>
   local home=$1
-  mkdir -p "$home/projects/alpha-worktree" "$home/projects/scout-worktree" "$home/secondmate-home"
+  make_ship_worktree "$home/projects/alpha-worktree" fm/ship-task
+  mkdir -p "$home/projects/scout-worktree" "$home/secondmate-home"
   cat > "$home/data/backlog.md" <<EOF
 ## In flight
 - [ ] scout-task - Scout Task data/scout-task/report.md (repo: alpha) (kind: scout) (since 2026-07-07)
@@ -234,6 +241,10 @@ test_event_hints_follow_reconciled_current_state() {
     "$home/projects/active-blocked" \
     "$home/projects/stale-decision" \
     "$home/projects/stale-blocked"
+  make_ship_worktree "$home/projects/active-decision" fm/active-decision
+  make_ship_worktree "$home/projects/active-blocked" fm/active-blocked
+  make_ship_worktree "$home/projects/stale-decision" fm/stale-decision
+  make_ship_worktree "$home/projects/stale-blocked" fm/stale-blocked
   fm_write_meta "$home/state/active-decision.meta" \
     "window=firstmate:fm-active-decision" \
     "worktree=$home/projects/active-decision" \

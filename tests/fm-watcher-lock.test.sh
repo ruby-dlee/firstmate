@@ -169,9 +169,11 @@ test_guard_detects_live_watcher_that_missed_cadence() {
   printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
   printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
   printf 'project=x\n' > "$state/task.meta"
+  mkdir -p "$dir/config"
+  printf 'FM_WATCH_PROGRESS_GRACE=60\n' > "$dir/config/watcher.env"
   touch "$state/.last-watcher-beat"
   perl -e '$time = time - 120; utime $time, $time, $ARGV[0]' "$state/.last-watcher-beat"
-  FM_ROOT_OVERRIDE="$dir" FM_HOME="$dir" FM_GUARD_GRACE=300 FM_WATCH_PROGRESS_GRACE=60 \
+  FM_ROOT_OVERRIDE="$dir" FM_HOME="$dir" FM_GUARD_GRACE=300 \
     "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "cadence-stale guard failed"
   kill "$sleeper" 2>/dev/null || true
   wait "$sleeper" 2>/dev/null || true
@@ -722,10 +724,12 @@ test_arm_refuses_live_lock_with_bad_attach_cadence() {
   printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
   printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
   printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  mkdir -p "$dir/config"
+  printf 'FM_WATCH_PROGRESS_GRACE=60\n' > "$dir/config/watcher.env"
   touch "$state/.last-watcher-beat"
   perl -e '$time = time - 155; utime $time, $time, $ARGV[0]' "$state/.last-watcher-beat"
   status=0
-  FM_HOME="$dir" FM_GUARD_GRACE=300 FM_WATCH_PROGRESS_GRACE=60 FM_ARM_CONFIRM_TIMEOUT=1 \
+  FM_HOME="$dir" FM_GUARD_GRACE=300 FM_ARM_CONFIRM_TIMEOUT=1 \
     "$WATCH_ARM" > "$out" || status=$?
   kill "$peer" 2>/dev/null || true
   wait "$peer" 2>/dev/null || true
@@ -1150,9 +1154,12 @@ test_arm_allows_bounded_watcher_phases_past_base_cadence() {
   fakebin="$dir/fakebin"
   out="$dir/arm.out"
   touch "$state/.last-account-session-sync" "$state/.last-report-retention"
-  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_TEST_AUTO_REAP_SLEEP=4 \
-    FM_TEST_AUTO_REAP_OUTPUT='bounded auto-reap complete' FM_WATCH_PROGRESS_GRACE=2 \
-    FM_WATCH_AUTO_REAP_TIMEOUT=10 FM_WATCH_PHASE_MARGIN=1 FM_POLL=1 \
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_TEST_AUTO_REAP_SLEEP=5 \
+    FM_TEST_AUTO_REAP_OUTPUT='bounded auto-reap complete' FM_WATCH_PROGRESS_GRACE=3 \
+    FM_TREEHOUSE_RETURN_TIMEOUT=1 FM_TREEHOUSE_RETURN_LOCK_RETRIES=0 \
+    FM_CHECKOUT_REFRESH_PROBE_TIMEOUT=1 FM_AUTO_REAP_COMMAND_TIMEOUT=1 \
+    FM_ACCOUNT_CONTROL_TIMEOUT=1 FM_WATCH_AUTO_REAP_CLEANUP_MARGIN=1 \
+    FM_WATCH_AUTO_REAP_TIMEOUT=60 FM_WATCH_PHASE_MARGIN=1 FM_POLL=1 \
     FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$out" &
   armpid=$!
   i=0
@@ -1163,7 +1170,7 @@ test_arm_allows_bounded_watcher_phases_past_base_cadence() {
     i=$((i + 1))
   done
   grep -qF 'watcher: started pid=' "$out" || fail "arm did not confirm watcher during bounded auto-reap: $(cat "$out")"
-  sleep 2.5
+  sleep 3.5
   is_live_non_zombie "$armpid" || fail "base cadence killed a watcher inside bounded auto-reap: $(cat "$out")"
   grep -qF 'phase=auto-reap' "$state/.watch.phase" \
     || fail "watcher did not publish its bounded auto-reap phase"
@@ -1200,6 +1207,119 @@ test_arm_allows_bounded_watcher_phases_past_base_cadence() {
   wait "$armpid" 2>/dev/null || true
   [ ! -e "$state/.watch.phase" ] || fail "watcher left its bounded event-wait phase after interruption"
   pass "arm honors bounded auto-reap and FM_POLL phases beyond the base cadence"
+}
+
+test_heartbeat_aggregate_reads_publish_bounded_progress() {
+  local dir state fakebin out trace slow armpid i completed
+  dir=$(make_case arm-aggregate-state-progress)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  trace="$state/beat-trace"
+  slow="$fakebin/slow-crew-state"
+  cat > "$slow" <<'SH'
+#!/usr/bin/env bash
+sleep 1
+printf 'state: working · source: run-step · liveness: alive\n'
+SH
+  chmod +x "$slow"
+  for i in 1 2 3 4; do
+    printf 'kind=ship\n' > "$state/task-$i.meta"
+  done
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_CREW_STATE_BIN="$slow" \
+    FM_CREW_STATE_READ_TIMEOUT=2 FM_WATCH_PROGRESS_GRACE=3 FM_WATCH_PHASE_MARGIN=1 \
+    FM_WATCHER_BEAT_TEST_LOG="$trace" FM_HEARTBEAT=1 FM_HEARTBEAT_MAX=1 \
+    FM_CHECK_INTERVAL=999999 FM_POLL=1 FM_WATCH_CPU_LIMIT=999 "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  completed=0
+  while [ "$i" -lt 100 ]; do
+    completed=$(grep -c $'\tcrew-state-complete$' "$trace" 2>/dev/null || true)
+    [ -n "$completed" ] || completed=0
+    [ "$completed" -ge 3 ] && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ "$completed" -ge 3 ] || fail "aggregate scan did not publish progress between bounded reads: $(cat "$out")"
+  is_live_non_zombie "$armpid" || fail "arm killed a healthy watcher during its aggregate state scan: $(cat "$out")"
+  kill -TERM "$armpid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  pass "aggregate heartbeat reads publish bounded progress between tasks"
+}
+
+test_arm_recovers_direct_no_progress_wedge() {
+  local dir state fakebin out armpid watcher_pid i status
+  dir=$(make_case arm-direct-progress-wedge)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_WATCH_PROGRESS_GRACE=2 FM_WATCH_PHASE_MARGIN=1 \
+    FM_HEARTBEAT=999999 FM_CHECK_INTERVAL=999999 FM_POLL=1 FM_WATCH_CPU_LIMIT=999 \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  watcher_pid=
+  while [ "$i" -lt 80 ]; do
+    watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null && [ -n "$watcher_pid" ] && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -n "$watcher_pid" ] || fail "arm did not start a watcher for direct wedge recovery"
+  kill -STOP "$watcher_pid" 2>/dev/null || fail "could not stop the recorded watcher"
+  wait_for_exit "$armpid" 100
+  status=$?
+  if [ "$status" -eq 124 ]; then
+    kill -CONT "$watcher_pid" 2>/dev/null || true
+    kill -TERM "$armpid" 2>/dev/null || true
+    wait "$armpid" 2>/dev/null || true
+    fail "arm did not recover a watcher that stopped publishing progress"
+  fi
+  wait "$armpid" 2>/dev/null || true
+  [ "$status" -ne 0 ] || fail "arm reported success after direct progress wedge recovery"
+  grep -qF 'stopped making supervision progress' "$out" || fail "arm did not report the direct progress wedge: $(cat "$out")"
+  ! is_live_non_zombie "$watcher_pid" || fail "direct wedge recovery left the recorded watcher alive"
+  pass "arm force-recovers a watcher that stops all progress"
+}
+
+test_auto_reap_bound_tracks_inner_configuration() {
+  local dir state derived out status
+  dir=$(make_case derived-auto-reap-bound)
+  state="$dir/state"
+  derived=$(FM_STATE_OVERRIDE="$state" FM_TREEHOUSE_RETURN_TIMEOUT=900 bash -c \
+    '. "$1"; watcher_auto_reap_timeout task' _ "$WATCH") \
+    || fail "could not derive auto-reap bound from Treehouse configuration"
+  [ "$derived" -gt 900 ] || fail "derived auto-reap bound did not include Treehouse timeout and cleanup: $derived"
+  status=0
+  out=$(FM_STATE_OVERRIDE="$state" FM_TREEHOUSE_RETURN_TIMEOUT=900 FM_WATCH_AUTO_REAP_TIMEOUT=600 bash -c \
+    '. "$1"; watcher_auto_reap_timeout task' _ "$WATCH" 2>&1) || status=$?
+  [ "$status" -ne 0 ] || fail "incompatible explicit auto-reap bound was accepted"
+  grep -qF 'below the derived' <<< "$out" || fail "incompatible auto-reap bound was not diagnosed: $out"
+  pass "auto-reap derives its outer bound from configured teardown limits"
+}
+
+test_watcher_config_parser_is_shared_and_nonexecuting() {
+  local dir config out status marker
+  dir=$(make_case watcher-config-parser)
+  config="$dir/config"
+  marker="$dir/parser-executed"
+  mkdir -p "$config"
+  printf "FM_WATCH_PROGRESS_GRACE=17\nFM_CAPTAIN_RE='done:|checks green'\n" > "$config/watcher.env"
+  out=$(bash -c '. "$1"; fm_watcher_config_load "$2"; printf "%s|%s" "$FM_WATCH_PROGRESS_GRACE" "$FM_CAPTAIN_RE"' \
+    _ "$ROOT/bin/fm-watcher-config-lib.sh" "$config") \
+    || fail "shared watcher config parser rejected valid assignments"
+  [ "$out" = '17|done:|checks green' ] || fail "shared watcher config parser changed valid values: $out"
+  printf 'FM_WATCH_PROGRESS_GRACE=$(touch %s)\n' "$marker" > "$config/watcher.env"
+  status=0
+  FM_WATCHER_CONFIG_LOADED_PATH= bash -c '. "$1"; fm_watcher_config_load "$2"' \
+    _ "$ROOT/bin/fm-watcher-config-lib.sh" "$config" 2>/dev/null || status=$?
+  [ "$status" -ne 0 ] || fail "shared watcher config parser accepted executable syntax"
+  [ ! -e "$marker" ] || fail "shared watcher config parser executed assignment contents"
+  pass "watcher config is parsed once without executing shell syntax"
 }
 
 test_pid_identity_is_locale_invariant() {
@@ -1242,6 +1362,10 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = phase-bounds ]; then
   test_arm_allows_bounded_watcher_phases_past_base_cadence
+  test_heartbeat_aggregate_reads_publish_bounded_progress
+  test_arm_recovers_direct_no_progress_wedge
+  test_auto_reap_bound_tracks_inner_configuration
+  test_watcher_config_parser_is_shared_and_nonexecuting
   exit 0
 fi
 
@@ -1276,3 +1400,7 @@ test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_fails_loud_when_no_fresh_watcher_confirmable
 test_arm_detects_and_reaps_sustained_watcher_cpu
 test_arm_allows_bounded_watcher_phases_past_base_cadence
+test_heartbeat_aggregate_reads_publish_bounded_progress
+test_arm_recovers_direct_no_progress_wedge
+test_auto_reap_bound_tracks_inner_configuration
+test_watcher_config_parser_is_shared_and_nonexecuting

@@ -30,6 +30,10 @@ _FM_CLASSIFY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)"
 # Overridable so tests can stub the run-step/pane verdict without a real worktree
 # or no-mistakes install; absent, it points at the real sibling script.
 FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
+FM_CREW_STATE_READ_TIMEOUT=${FM_CREW_STATE_READ_TIMEOUT:-30}
+case "$FM_CREW_STATE_READ_TIMEOUT" in
+  ''|*[!0-9]*|0) FM_CREW_STATE_READ_TIMEOUT=30 ;;
+esac
 
 # Captain-relevant status verbs. A status line carrying any of these is work
 # firstmate must see. Lines without these verbs are no-verb signals: the watcher
@@ -447,7 +451,16 @@ _fm_status_file_sig() {
 crew_state_line() {  # <id>
   local line
   [ -n "$1" ] || return 0
-  line=$("$FM_CREW_STATE_BIN" "$1" 2>/dev/null) || true
+  if command -v timeout >/dev/null 2>&1; then
+    line=$(timeout --kill-after=1 "$FM_CREW_STATE_READ_TIMEOUT" "$FM_CREW_STATE_BIN" "$1" 2>/dev/null) || true
+  elif command -v gtimeout >/dev/null 2>&1; then
+    line=$(gtimeout --kill-after=1 "$FM_CREW_STATE_READ_TIMEOUT" "$FM_CREW_STATE_BIN" "$1" 2>/dev/null) || true
+  elif command -v perl >/dev/null 2>&1; then
+    line=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
+      "$FM_CREW_STATE_READ_TIMEOUT" "$FM_CREW_STATE_BIN" "$1" 2>/dev/null) || true
+  else
+    line=
+  fi
   printf '%s\n' "$line" | head -1
 }
 
@@ -488,15 +501,23 @@ crew_state_liveness_verdict() {  # <current-state-line>
 # Print task, verdict, and current-state line for each ship carrying a liveness
 # observation. Callers explicitly decide alive/dead/unknown actionability; a
 # line with no observation is omitted so its existing behavior is unchanged.
-scan_crew_liveness_observations() {  # <state-dir>
-  local state=$1 meta task kind line verdict
+scan_crew_liveness_observations() {  # <state-dir> [progress-callback]
+  local state=$1 progress=${2:-} meta task kind line verdict
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || continue
     kind=$(grep '^kind=' "$meta" 2>/dev/null | tail -1 | cut -d= -f2- || true)
     [ -n "$kind" ] || kind=ship
     [ "$kind" = ship ] || continue
     task=$(basename "$meta"); task=${task%.meta}
+    if [ -n "$progress" ] && ! "$progress" begin "$task"; then
+      printf '%s\tunknown\tstate: unknown · source: watcher · progress phase unavailable\n' "$task"
+      continue
+    fi
     line=$(crew_state_line "$task")
+    if [ -n "$progress" ] && ! "$progress" end "$task"; then
+      printf '%s\tunknown\tstate: unknown · source: watcher · progress completion unavailable\n' "$task"
+      continue
+    fi
     verdict=$(crew_state_liveness_verdict "$line")
     [ -n "$verdict" ] || continue
     printf '%s\t%s\t%s\n' "$task" "$verdict" "$line"

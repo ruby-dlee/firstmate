@@ -620,7 +620,8 @@ These paths need `jq` to build the JSON payload, but they run before token and n
 ## Watcher overrides (config/watcher.env)
 
 Put home-local watcher environment assignments in the optional, gitignored `config/watcher.env`, or in the corresponding directory selected by `FM_CONFIG_OVERRIDE`.
-`bin/fm-watch.sh` sources this file before reading its cadence settings, so every arm and foreground checkpoint inherits the same values without an inline environment prefix on the protected arm command.
+The watcher, arm, guard, and turn-end guard load this file through one shared parser before reading cadence or resource settings, so every enforcement owner uses the same values without an inline environment prefix on the protected arm command.
+Use one `FM_*=` assignment per line, with optional matching single or double quotes; blank lines and whole-line comments are accepted, while executable shell syntax and structural path overrides are rejected.
 For example, `FM_PAUSE_RESURFACE_SECS=7200` changes a declared external wait's normal-watcher recheck cadence to two hours.
 The watcher refuses a symlink or non-regular file at this path.
 Inline assignments on `bin/fm-watch-arm.sh` remain outside the arm hook's blessed command tree; use this file for persistent watcher tuning.
@@ -689,6 +690,7 @@ FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
 FM_CODEX_WATCH_CHECKPOINT=180   # seconds per foreground watcher checkpoint in Codex primary supervision
 FM_CREW_STATE_NM_TIMEOUT=10   # seconds allowed per no-mistakes query inside fm-crew-state.sh
 FM_CREW_STATE_GH_TIMEOUT=10   # seconds allowed per GitHub PR-state or remote-currentness query inside fm-crew-state.sh
+FM_CREW_STATE_READ_TIMEOUT=30   # total seconds allowed for one aggregate current-state read
 FM_CREW_STATE_RUNS_LIMIT=200  # recent no-mistakes runs rows scanned when cross-branch attribution falls back from axi status
 FM_CREW_STATE_BIN=bin/fm-crew-state.sh   # test override for the current-state reader used by working/paused watcher triage
 FM_NM_REATTACH_MAX_ATTEMPTS=5   # maximum running-daemon preflight and reattach attempts for fm-no-mistakes-reattach.sh
@@ -706,7 +708,8 @@ FMX_FOLLOWUP_MAX_COUNT=3   # local cap on X-mode completion follow-ups per linke
 FM_LOCK_STALE_AFTER=2   # seconds before dead-pid lock records can be reclaimed; mid-acquire locks keep at least 2s grace
 FM_GUARD_GRACE=300      # broad seconds allowed for the expected wake-and-rearm handoff when no healthy watcher cycle is present
 FM_WATCH_PROGRESS_GRACE=60   # tighter seconds allowed between progress beats while a live watcher lock is held; arm refuses an older holder
-FM_WATCH_AUTO_REAP_TIMEOUT=600   # total seconds allowed for one watcher-triggered automatic teardown pass
+FM_WATCH_AUTO_REAP_TIMEOUT=   # optional total automatic-teardown bound; unset derives from inner command, Treehouse retry, fleet-size, and cleanup bounds, while an undersized value is refused before mutation
+FM_WATCH_AUTO_REAP_CLEANUP_MARGIN=30   # per-task cleanup margin included in the derived automatic-teardown bound
 FM_WATCH_PHASE_MARGIN=5   # scheduling margin added to each published bounded watcher phase deadline
 FM_ARM_CONFIRM_TIMEOUT=10   # seconds fm-watch-arm waits to confirm a fresh watcher before reporting FAILED
 FM_ARM_ATTACH_POLL=0.5  # seconds between checks while fm-watch-arm is attached to an existing healthy watcher cycle

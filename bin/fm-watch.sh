@@ -57,13 +57,9 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 fm_refuse_if_gate_agent
-WATCHER_ENV="$CONFIG/watcher.env"
-if [ -e "$WATCHER_ENV" ] || [ -L "$WATCHER_ENV" ]; then
-  [ -f "$WATCHER_ENV" ] && [ ! -L "$WATCHER_ENV" ] \
-    || { echo "error: unsafe watcher config: $WATCHER_ENV" >&2; exit 1; }
-  # shellcheck disable=SC1090 # The effective home-local watcher config is intentionally dynamic.
-  . "$WATCHER_ENV" || { echo "error: could not source watcher config: $WATCHER_ENV" >&2; exit 1; }
-fi
+# shellcheck source=bin/fm-watcher-config-lib.sh
+. "$SCRIPT_DIR/fm-watcher-config-lib.sh"
+fm_watcher_config_load "$CONFIG" || exit 1
 mkdir -p "$STATE"
 [ -d "$STATE" ] && [ ! -L "$STATE" ] || { echo "error: unsafe watcher state directory: $STATE" >&2; exit 1; }
 
@@ -126,13 +122,13 @@ ACCOUNT_SESSION_SYNC_TIMEOUT=${FM_ACCOUNT_SESSION_SYNC_TIMEOUT:-5}
 ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT=${FM_ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT:-$((ACCOUNT_SESSION_SYNC_TIMEOUT + 3))}
 REPORT_RETENTION_INTERVAL=${FM_REPORT_RETENTION_INTERVAL:-86400}
 REPORT_RETENTION_TIMEOUT=${FM_REPORT_RETENTION_TIMEOUT:-30}
-AUTO_REAP_TIMEOUT=${FM_WATCH_AUTO_REAP_TIMEOUT:-600}
+AUTO_REAP_CLEANUP_MARGIN=${FM_WATCH_AUTO_REAP_CLEANUP_MARGIN:-30}
 PHASE_MARGIN=${FM_WATCH_PHASE_MARGIN:-5}
 REPORT_RETENTION_OWNER_FRESH_SECS=${FM_REPORT_RETENTION_OWNER_FRESH_SECS:-660}
 case "$REPORT_RETENTION_OWNER_FRESH_SECS" in
   ''|*[!0-9]*) REPORT_RETENTION_OWNER_FRESH_SECS=660 ;;
 esac
-case "$AUTO_REAP_TIMEOUT" in ''|*[!0-9]*|0) AUTO_REAP_TIMEOUT=600 ;; esac
+case "$AUTO_REAP_CLEANUP_MARGIN" in ''|*[!0-9]*|0) AUTO_REAP_CLEANUP_MARGIN=30 ;; esac
 case "$PHASE_MARGIN" in ''|*[!0-9]*) PHASE_MARGIN=5 ;; esac
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
@@ -700,13 +696,91 @@ run_check() {
   run_bounded "$CHECK_TIMEOUT" bash "$c" 2>/dev/null || true
 }
 
-run_auto_reap() {
-  local status=0
-  run_bounded "$AUTO_REAP_TIMEOUT" "$FM_ROOT/bin/fm-auto-reap.sh" "$@" 2>&1 || status=$?
+watcher_auto_reap_units() {  # <maintenance|task>
+  local mode=$1 path count=0
+  if [ "$mode" = task ]; then
+    printf '1\n'
+    return 0
+  fi
+  [ "$mode" = maintenance ] || return 1
+  for path in "$STATE"/.worktree-acquire-*.pending "$STATE"/*.meta; do
+    [ -e "$path" ] || continue
+    count=$((count + 1))
+  done
+  [ "$count" -gt 0 ] || count=1
+  printf '%s\n' "$count"
+}
+
+watcher_auto_reap_timeout() {  # <maintenance|task>
+  local mode=$1 units tree_timeout retries retry_wait probe_timeout command_timeout control_timeout required configured
+  units=$(watcher_auto_reap_units "$mode") || return 1
+  tree_timeout=${FM_TREEHOUSE_RETURN_TIMEOUT:-60}
+  retries=${FM_TREEHOUSE_RETURN_LOCK_RETRIES:-3}
+  retry_wait=${FM_TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS:-${FM_STALE_WORKTREE_LOCK_RETRY_WAIT_SECS:-1}}
+  probe_timeout=${FM_CHECKOUT_REFRESH_PROBE_TIMEOUT:-15}
+  command_timeout=${FM_AUTO_REAP_COMMAND_TIMEOUT:-20}
+  control_timeout=${FM_ACCOUNT_CONTROL_TIMEOUT:-10}
+  case "$tree_timeout:$retries:$probe_timeout:$command_timeout:$control_timeout" in
+    *[!0-9:]*|0:*|*::*)
+      printf 'auto-reap configuration has an invalid integer bound\n' >&2
+      return 1
+      ;;
+  esac
+  [ "$probe_timeout" -gt 0 ] && [ "$command_timeout" -gt 0 ] && [ "$control_timeout" -gt 0 ] || {
+    printf 'auto-reap configuration requires positive inner bounds\n' >&2
+    return 1
+  }
+  required=$(awk -v units="$units" -v tree="$tree_timeout" -v retries="$retries" \
+    -v wait="$retry_wait" -v probe="$probe_timeout" -v command="$command_timeout" \
+    -v control="$control_timeout" -v cleanup="$AUTO_REAP_CLEANUP_MARGIN" 'BEGIN {
+      if (wait !~ /^[0-9]+([.][0-9]*)?$|^[.][0-9]+$/) exit 1
+      per_task = (retries + 2) * tree + retries * wait + 10 * probe + 4 * command + 12 * control + 20 + cleanup
+      total = units * per_task
+      value = int(total)
+      if (value < total) value++
+      if (value <= 0) exit 1
+      print value
+    }') || {
+      printf 'auto-reap configuration has an invalid retry wait bound\n' >&2
+      return 1
+    }
+  configured=${FM_WATCH_AUTO_REAP_TIMEOUT:-}
+  if [ -n "$configured" ]; then
+    case "$configured" in ''|*[!0-9]*|0)
+      printf 'FM_WATCH_AUTO_REAP_TIMEOUT must be a positive integer\n' >&2
+      return 1
+      ;;
+    esac
+    [ "$configured" -ge "$required" ] || {
+      printf 'FM_WATCH_AUTO_REAP_TIMEOUT=%s is below the derived %ss bound for %s\n' \
+        "$configured" "$required" "$mode" >&2
+      return 1
+    }
+    printf '%s\n' "$configured"
+    return 0
+  fi
+  printf '%s\n' "$required"
+}
+
+run_auto_reap() {  # <seconds> <maintenance|task> [args...]
+  local timeout_seconds=$1 status=0
+  shift
+  run_bounded "$timeout_seconds" "$FM_ROOT/bin/fm-auto-reap.sh" "$@" 2>&1 || status=$?
   if [ "$status" -eq 124 ]; then
-    printf 'auto-reap exceeded its %ss watcher phase bound\n' "$AUTO_REAP_TIMEOUT"
+    printf 'auto-reap exceeded its %ss watcher phase bound\n' "$timeout_seconds"
   fi
   return "$status"
+}
+
+watcher_run_auto_reap() {  # <maintenance|task> [args...]
+  local mode=$1 timeout_seconds
+  if timeout_seconds=$(watcher_auto_reap_timeout "$mode" 2>&1); then
+    :
+  else
+    printf 'auto-reap refused before mutation: %s\n' "$timeout_seconds"
+    return 2
+  fi
+  watcher_run_phase auto-reap "$timeout_seconds" run_auto_reap "$timeout_seconds" "$@"
 }
 
 safe_touch_marker() {  # <path>
@@ -761,9 +835,16 @@ watcher_phase_begin() {  # <phase> <seconds>
 }
 
 watcher_phase_end() {
+  local phase_file="$STATE/.watch.phase" completion_grace=${FM_WATCH_PROGRESS_GRACE:-60}
+  [ "$(sed -n 's/^pid=//p' "$phase_file" 2>/dev/null || true)" = "${WATCHER_PID:-}" ] || return 0
+  case "$completion_grace" in ''|*[!0-9]*|0) completion_grace=60 ;; esac
+  watcher_phase_begin phase-complete "$completion_grace" || return 1
+  watcher_beat phase-complete
+}
+
+watcher_phase_clear() {
   local phase_file="$STATE/.watch.phase"
   [ "$(sed -n 's/^pid=//p' "$phase_file" 2>/dev/null || true)" = "${WATCHER_PID:-}" ] || return 0
-  watcher_beat phase-complete
   rm -f "$phase_file"
 }
 
@@ -774,6 +855,20 @@ watcher_run_phase() {  # <phase> <seconds> <command> [args...]
   "$@" || status=$?
   watcher_phase_end
   return "$status"
+}
+
+watcher_crew_state_progress() {  # <begin|end> <task>
+  case "$1" in
+    begin)
+      watcher_beat crew-state-start
+      watcher_phase_begin crew-state "$FM_CREW_STATE_READ_TIMEOUT"
+      ;;
+    end)
+      watcher_phase_end
+      watcher_beat crew-state-complete
+      ;;
+    *) return 1 ;;
+  esac
 }
 
 task_generation_id() {  # <task>
@@ -925,7 +1020,7 @@ heartbeat_scan_finds_actionable() {
       dead|unknown) return 0 ;;
       *) return 0 ;;
     esac
-  done < <(scan_crew_liveness_observations "$STATE")
+  done < <(scan_crew_liveness_observations "$STATE" watcher_crew_state_progress)
   return 1
 }
 
@@ -1066,7 +1161,7 @@ if ! fm_lock_try_acquire "$WATCH_LOCK"; then
   fi
   exit 0
 fi
-trap 'watcher_phase_end; fm_lock_release "$WATCH_LOCK"' EXIT
+trap 'watcher_phase_clear; fm_lock_release "$WATCH_LOCK"' EXIT
 # This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
 # ${BASHPID:-$$} from this same main shell). Read directly, never via a command
 # substitution, so it matches the stored holder pid for the self-eviction check.
@@ -1113,7 +1208,7 @@ while :; do
   # never run until the fleet went quiet. Checks are due only every
   # CHECK_INTERVAL, so most cycles skip this block and fall straight through.
   if marker_due "$STATE/.last-check" "$CHECK_INTERVAL" "watcher check"; then
-    auto_reap_out=$(watcher_run_phase auto-reap "$AUTO_REAP_TIMEOUT" run_auto_reap maintenance || true)
+    auto_reap_out=$(watcher_run_auto_reap maintenance || true)
     if [ -n "$auto_reap_out" ]; then
       reason="auto-reap: $auto_reap_out"
       fm_wake_append check auto-reap "$reason" || exit 1
@@ -1129,7 +1224,7 @@ while :; do
         task=${c##*/}
         task=${task%.check.sh}
         if [ "$(printf '%s\n' "$out" | tail -1)" = merged ] && [ -f "$STATE/$task.meta" ]; then
-          auto_reap_out=$(watcher_run_phase auto-reap "$AUTO_REAP_TIMEOUT" run_auto_reap task "$task" pr-merged || true)
+          auto_reap_out=$(watcher_run_auto_reap task "$task" pr-merged || true)
           reason="check: $c: $out; $auto_reap_out"
         else
           reason="check: $c: $out"
@@ -1171,7 +1266,7 @@ EOF
           if [ -f "$STATE/$task.meta" ] \
             && [ "$(fm_meta_get "$STATE/$task.meta" kind)" = scout ] \
             && [ "$(status_line_verb "$(last_status_line "$f")")" = "done" ]; then
-            auto_reap_out=$(watcher_run_phase auto-reap "$AUTO_REAP_TIMEOUT" run_auto_reap task "$task" scout-done || true)
+            auto_reap_out=$(watcher_run_auto_reap task "$task" scout-done || true)
             reason="signal: $f; $auto_reap_out"
             fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
             wake "$reason"

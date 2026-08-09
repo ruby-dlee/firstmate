@@ -84,6 +84,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fm_refuse_if_gate_agent
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+# shellcheck source=bin/fm-watcher-config-lib.sh
+. "$SCRIPT_DIR/fm-watcher-config-lib.sh"
+fm_watcher_config_load "$CONFIG" || exit 1
 
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 WATCH_LOCK="$STATE/.watch.lock"
@@ -93,7 +97,8 @@ BEAT="$STATE/.last-watcher-beat"
 # age under 300s was technically "fresh" but let an already-wedged 155s-old
 # watcher be reported as attachable.
 PROGRESS_GRACE=${FM_WATCH_PROGRESS_GRACE:-60}
-case "$PROGRESS_GRACE" in ''|*[!0-9]*|0) PROGRESS_GRACE=60 ;; esac
+fm_watcher_config_positive_integer FM_WATCH_PROGRESS_GRACE 60
+PROGRESS_GRACE=$FM_WATCH_PROGRESS_GRACE
 # How long to wait for a freshly forked watcher to acquire the lock and beat.
 CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-10}
 # Poll interval while attached to an existing healthy watcher.
@@ -104,9 +109,12 @@ ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
 CPU_LIMIT=${FM_WATCH_CPU_LIMIT:-80}
 CPU_POLL=${FM_WATCH_CPU_POLL:-5}
 CPU_SAMPLES=${FM_WATCH_CPU_SAMPLES:-3}
-case "$CPU_LIMIT" in ''|*[!0-9]*|0) CPU_LIMIT=80 ;; esac
-case "$CPU_POLL" in ''|*[!0-9]*|0) CPU_POLL=5 ;; esac
-case "$CPU_SAMPLES" in ''|*[!0-9]*|0) CPU_SAMPLES=3 ;; esac
+fm_watcher_config_positive_integer FM_WATCH_CPU_LIMIT 80
+fm_watcher_config_positive_integer FM_WATCH_CPU_POLL 5
+fm_watcher_config_positive_integer FM_WATCH_CPU_SAMPLES 3
+CPU_LIMIT=$FM_WATCH_CPU_LIMIT
+CPU_POLL=$FM_WATCH_CPU_POLL
+CPU_SAMPLES=$FM_WATCH_CPU_SAMPLES
 
 clear_stale_recorded_watcher_lock() {
   local lock_home lock_path lock_identity

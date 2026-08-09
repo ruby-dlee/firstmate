@@ -42,11 +42,16 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+# shellcheck source=bin/fm-watcher-config-lib.sh
+. "$SCRIPT_DIR/fm-watcher-config-lib.sh"
+fm_watcher_config_load "$CONFIG" || exit 1
 GRACE=${FM_GUARD_GRACE:-300}
 PROGRESS_GRACE=${FM_WATCH_PROGRESS_GRACE:-60}
 CPU_LIMIT=${FM_WATCH_CPU_LIMIT:-80}
-case "$PROGRESS_GRACE" in ''|*[!0-9]*|0) PROGRESS_GRACE=60 ;; esac
-case "$CPU_LIMIT" in ''|*[!0-9]*|0) CPU_LIMIT=80 ;; esac
+fm_watcher_config_positive_integer FM_WATCH_PROGRESS_GRACE 60
+fm_watcher_config_positive_integer FM_WATCH_CPU_LIMIT 80
+PROGRESS_GRACE=$FM_WATCH_PROGRESS_GRACE
+CPU_LIMIT=$FM_WATCH_CPU_LIMIT
 WATCH="$SCRIPT_DIR/fm-watch.sh"
 
 # shellcheck source=bin/fm-supervision-lib.sh

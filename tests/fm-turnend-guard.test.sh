@@ -92,6 +92,7 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-harness.sh" "$dir/bin/fm-harness.sh"
   cp "$ROOT/bin/fm-supervision-lib.sh" "$dir/bin/fm-supervision-lib.sh"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
+  cp "$ROOT/bin/fm-watcher-config-lib.sh" "$dir/bin/fm-watcher-config-lib.sh"
   mkdir -p "$dir/docs"
   cp -R "$ROOT/docs/supervision-protocols" "$dir/docs/supervision-protocols"
   chmod +x "$dir/bin/fm-turnend-guard.sh" "$dir/bin/fm-turnend-guard-grok.sh" "$dir/bin/fm-supervision-instructions.sh" "$dir/bin/fm-harness.sh"
@@ -291,9 +292,11 @@ test_hook_blocks_with_live_lock_and_missed_cadence() {
     fail "could not identify cadence-stale watcher holder"
   }
   record_watcher_lock "$dir" "$pid" "$identity"
+  mkdir -p "$dir/config"
+  printf 'FM_WATCH_PROGRESS_GRACE=60\n' > "$dir/config/watcher.env"
   touch "$dir/state/.last-watcher-beat"
   perl -e '$time = time - 120; utime $time, $time, $ARGV[0]' "$dir/state/.last-watcher-beat"
-  out=$(FM_WATCH_PROGRESS_GRACE=60 run_hook "$dir" false); status=$?
+  out=$(run_hook "$dir" false); status=$?
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   expect_code 2 "$status" "hook must block when a live watcher misses its normal progress cadence"

@@ -1444,7 +1444,7 @@ test_pr_check_records_remote_head_when_local_lags() {
 }
 
 test_pr_check_lookup_errors_are_loud_and_bounded() {
-  local case_dir rc url head wake wake_size
+  local case_dir rc url head lookup_error lookup_error_size custom_check
   url=https://github.com/example/repo/pull/7
   head=deadbeefcafefeed0000000000000000deadbeef
 
@@ -1467,24 +1467,37 @@ test_pr_check_lookup_errors_are_loud_and_bounded() {
 
   case_dir=$(make_case pr-check-poll-lookup-error)
   write_meta "$case_dir" no-mistakes ship
+  custom_check="$case_dir/state/task-x1.check.sh"
+  cat > "$custom_check" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'custom task check'
+SH
+  chmod +x "$custom_check"
   install_pr_check_lookup_fake "$case_dir"
   FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state" \
   FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \
     "$PR_CHECK" task-x1 "$url" >/dev/null \
-    || fail "PR watcher setup failed before its lookup-error exercise"
+    || fail "PR recording failed before its lookup-error exercise"
   cat > "$case_dir/fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 python3 -c 'import sys; sys.stderr.write("lookup failed " * 200)'
 exit 42
 SH
   chmod +x "$case_dir/fakebin/gh-axi"
-  wake=$(PATH="$case_dir/fakebin:$PATH" bash "$case_dir/state/task-x1.check.sh") \
-    || fail "lookup-error watcher wake exited nonzero"
-  assert_contains "$wake" 'UNREVIEWED: PR state lookup failed' \
+  set +e
+  lookup_error=$(FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state" \
+    PATH="$case_dir/fakebin:$PATH" "$PR_CHECK" task-x1 "$url" 2>&1)
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "later PR head lookup error"
+  assert_contains "$lookup_error" 'UNREVIEWED: PR head lookup failed' \
     "later lookup error remained silent"
-  wake_size=$(printf '%s' "$wake" | wc -c)
-  [ "$wake_size" -le 550 ] || fail "lookup-error watcher wake was unbounded: $wake_size bytes"
-  pass "PR lookup errors block setup and wake later polls loudly within a bound"
+  lookup_error_size=$(printf '%s' "$lookup_error" | wc -c)
+  [ "$lookup_error_size" -le 550 ] \
+    || fail "later lookup error was unbounded: $lookup_error_size bytes"
+  [ "$(bash "$custom_check")" = 'custom task check' ] \
+    || fail "PR recording replaced the task-owned custom check"
+  pass "PR lookup errors stay loud and bounded without replacing task-owned checks"
 }
 
 test_pr_check_without_worktree_still_performs_lookup() {
@@ -1512,43 +1525,30 @@ test_pr_check_without_worktree_still_performs_lookup() {
   pass "PR setup performs its remote lookup even without worktree metadata"
 }
 
-test_closed_pr_wakes_loudly_as_unreviewed() {
-  local case_dir head url wake wake_size
-  case_dir=$(make_case pr-check-closed-pr)
+test_pr_check_preserves_task_owned_check_without_polling() {
+  local case_dir custom_check head url
+  case_dir=$(make_case pr-check-custom-check)
   write_meta "$case_dir" no-mistakes ship
   head=deadbeefcafefeed0000000000000000deadbeef
   url=https://github.com/example/repo/pull/7
+  custom_check="$case_dir/state/task-x1.check.sh"
+  cat > "$custom_check" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'task-owned sentinel'
+SH
+  chmod +x "$custom_check"
   install_pr_check_lookup_fake "$case_dir"
   FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state" \
   FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \
     "$PR_CHECK" task-x1 "$url" >/dev/null \
-    || fail "PR watcher setup failed before closed-state exercise"
-  cat > "$case_dir/fakebin/gh-axi" <<'SH'
-#!/usr/bin/env bash
-[ "$*" = "api /repos/example/repo/pulls/7" ] || exit 97
-printf '%s\n' \
-  'number: 7' \
-  'state: closed' \
-  'merged: false' \
-  'head:' \
-  '  ref: fm/task-x1' \
-  '  sha: deadbeefcafefeed0000000000000000deadbeef' \
-  '  repo:' \
-  '    full_name: example/repo' \
-  'base:' \
-  '  ref: main' \
-  '  sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
-  '  repo:' \
-  '    full_name: example/repo'
-SH
-  chmod +x "$case_dir/fakebin/gh-axi"
-  wake=$(PATH="$case_dir/fakebin:$PATH" bash "$case_dir/state/task-x1.check.sh") \
-    || fail "closed-state watcher wake exited nonzero"
-  assert_contains "$wake" 'UNREVIEWED: PR state is CLOSED' \
-    "closed PR remained silent in the watcher"
-  wake_size=$(printf '%s' "$wake" | wc -c)
-  [ "$wake_size" -le 550 ] || fail "closed-state watcher wake was unbounded: $wake_size bytes"
-  pass "closed PRs wake the watcher loudly as unreviewed"
+    || fail "PR recording failed before custom-check preservation exercise"
+  [ "$(bash "$custom_check")" = 'task-owned sentinel' ] \
+    || fail "PR recording replaced the task-owned custom check"
+  assert_grep "pr=$url" "$case_dir/state/task-x1.meta" \
+    "PR recording omitted the reviewed URL"
+  assert_grep "pr_head=$head" "$case_dir/state/task-x1.meta" \
+    "PR recording omitted the exact reviewed head"
+  pass "PR recording preserves task-owned checks and never installs a merge poll"
 }
 
 test_pr_check_serializes_with_account_session_updates() {
@@ -6574,7 +6574,7 @@ if [ "${FM_TEST_FOCUSED:-}" = crosscheck-pr-lookup ]; then
   test_pr_check_records_remote_head_when_local_lags
   test_pr_check_lookup_errors_are_loud_and_bounded
   test_pr_check_without_worktree_still_performs_lookup
-  test_closed_pr_wakes_loudly_as_unreviewed
+  test_pr_check_preserves_task_owned_check_without_polling
   test_pr_check_serializes_with_account_session_updates
   test_pr_check_rejects_reused_task_generation
   test_pr_check_backfills_legacy_generation_and_records_state
@@ -6584,7 +6584,7 @@ fi
 
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
-    test_pr_check_without_worktree_still_performs_lookup|test_closed_pr_wakes_loudly_as_unreviewed)
+    test_pr_check_without_worktree_still_performs_lookup|test_pr_check_preserves_task_owned_check_without_polling)
       "$FM_TEST_CASE"
       exit 0
       ;;
@@ -6595,7 +6595,7 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-3-pr-check ]; then
   test_pr_check_lookup_errors_are_loud_and_bounded
   test_pr_check_without_worktree_still_performs_lookup
-  test_closed_pr_wakes_loudly_as_unreviewed
+  test_pr_check_preserves_task_owned_check_without_polling
   exit 0
 fi
 
@@ -7065,7 +7065,7 @@ TEARDOWN_FULL_SUITE_CASES=(
   test_persistent_index_lock_exhausts_retries_and_refuses_loudly
   test_empty_retry_wait_uses_default_without_aborting
   test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
-  test_closed_pr_wakes_loudly_as_unreviewed
+  test_pr_check_preserves_task_owned_check_without_polling
   test_pr_check_without_worktree_still_performs_lookup
 )
 

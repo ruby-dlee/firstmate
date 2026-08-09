@@ -1711,13 +1711,14 @@ test_heartbeat_backstop_surfaces_unsurfaced_status() {
   # .hb-surfaced-* marker). This stands in for a per-wake-path miss; the heartbeat
   # fleet-scan backstop must catch it and wake firstmate.
   printf 'done: PR https://example.test/pr/5\n' > "$state/miss.status"
-  sig=$(seen_sig "$state/miss.status"); printf '%s' "$sig" > "$state/.seen-miss_status"
+  sig=$(seen_sig "$state/miss.status")
+  surfaced_key=$(fm_marker_task_key miss)
+  printf '%s' "$sig" > "$state/.seen-status-$surfaced_key"
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=1 "$WATCH" > "$out" &
   pid=$!
   wait_for_exit "$pid" 40 || fail "heartbeat backstop did not surface an unsurfaced captain-relevant status"
   grep -Fx "heartbeat" "$out" >/dev/null || fail "backstop did not exit with a heartbeat wake"
-  surfaced_key=$(fm_marker_task_key miss)
   [ "$(cat "$state/.hb-surfaced-$surfaced_key" 2>/dev/null || true)" = "done: PR https://example.test/pr/5" ] \
     || fail "backstop did not record the status as surfaced (would re-fire next heartbeat)"
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the backstop heartbeat failed"
@@ -2251,6 +2252,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = herdr-transition-custody ]; then
   test_herdr_blocked_transition_enters_pause_absorb_path
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = heartbeat-backstop ]; then
+  test_heartbeat_backstop_surfaces_unsurfaced_status
   exit 0
 fi
 

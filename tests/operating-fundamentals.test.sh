@@ -112,7 +112,7 @@ test_crew_steering_contract_and_trigger() {
   assert_grep "reject preserving a leaky component merely to save development cost or sunk work" "$CREW_SKILL" "crew steering must prefer robustness over development cost or sunk work"
   assert_grep "Reject any quiet reframing of the task into a smaller win" "$CREW_SKILL" "crew steering must reject weakened goals"
   assert_grep "fixed-goal guardrail" "$CREW_SKILL" "crew steering must retain the fixed-goal authority"
-  assert_grep "specific, un-bloated briefs and steers" "$CREW_SKILL" "crew steering must remain direct"
+  assert_grep "specific, un-bloated briefs and intended steers" "$CREW_SKILL" "crew steering must remain direct"
   assert_grep "correct a wrong path before it is built" "$CREW_SKILL" "crew steering must correct wrong paths early"
   assert_grep "concrete result the crewmate must produce" "$CREW_SKILL" "a steer must end with the required result"
   assert_grep "evidence that will prove it" "$CREW_SKILL" "a steer must end with required proof"

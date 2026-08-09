@@ -7125,6 +7125,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-findings ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = codex-runtime-continuation ]; then
+  run_isolated_test test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+  run_isolated_test test_cross_provider_continuation_uses_target_default_pool claude codex
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-19 ]; then
   run_isolated_test test_unsuccessful_lease_mutations_always_reconcile
   run_isolated_test test_unsuccessful_recovery_mutation_is_retried

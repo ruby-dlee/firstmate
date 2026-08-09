@@ -453,7 +453,8 @@ test_concurrent_codex_selection_shares_one_completion_probe() {
   for pid in "${pids[@]}"; do
     wait "$pid" || status=1
   done
-  [ "$status" = 0 ] || fail "one or more concurrent Codex selections failed"
+  [ "$status" = 0 ] \
+    || fail "one or more concurrent Codex selections failed: $(grep -H . "$output_dir"/*.err 2>/dev/null || true)"
   for output in "$output_dir"/*.out; do
     grep -qxF "$ACCOUNT_ROOT/codex/1" "$output" \
       || fail "concurrent Codex selectors disagreed on the only proved account: $(grep -H . "$output_dir"/*.out || true)"
@@ -1632,8 +1633,14 @@ if [ "${FM_TEST_FOCUSED:-}" = probe-publish-time ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = codex-cache-safety ]; then
+  test_codex_completion_proof_is_bound_to_account_directory_identity
   test_codex_completion_probe_refuses_symlinked_cache_root
   test_codex_completion_probe_revalidates_cache_root_identity
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = concurrent-codex-probe ]; then
+  test_concurrent_codex_selection_shares_one_completion_probe
   exit 0
 fi
 

@@ -72,6 +72,7 @@ SUPERVISE_DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
 
 TMP=$(fm_test_tmproot fm-gate-refuse)
 fm_git_identity fmtest fmtest@example.invalid
+fm_test_enable_codex_runtime_publisher "$TMP"
 
 # The env marker's exact stderr fragment (the primary signal).
 ENV_MSG='NO_MISTAKES_GATE set'
@@ -109,9 +110,11 @@ make_normal_repo() {
 
 GATE_WT=$(make_gate_worktree "$TMP/gate")
 NORMAL_CWD=$(make_normal_repo "$TMP/normal-cwd")
-mkdir -p "$GATE_WT/bin" "$NORMAL_CWD/bin"
+mkdir -p "$GATE_WT/bin" "$GATE_WT/tests" "$NORMAL_CWD/bin" "$NORMAL_CWD/tests"
 cp -R "$ROOT/bin/." "$GATE_WT/bin/"
 cp -R "$ROOT/bin/." "$NORMAL_CWD/bin/"
+cp "$ROOT/tests/fm-codex-runtime-test-publisher.mjs" "$GATE_WT/tests/"
+cp "$ROOT/tests/fm-codex-runtime-test-publisher.mjs" "$NORMAL_CWD/tests/"
 GATE_LIB="$GATE_WT/bin/fm-gate-refuse-lib.sh"
 NORMAL_LIB="$NORMAL_CWD/bin/fm-gate-refuse-lib.sh"
 
@@ -233,7 +236,8 @@ run_spawn() {
       "FM_PROJECTS_OVERRIDE=$home/projects" "FM_CONFIG_OVERRIDE=$home/config" \
       "FM_SPAWN_NO_GUARD=1" "FM_FAKE_PANE_PATH=$pane" "TMUX=fake,1,0" \
       "PATH=$fakebin:$PATH" "$@" \
-      "$(guarded_script "$cwd" "$SPAWN")" "$id" "$proj" codex ) 2>&1
+      "$(guarded_script "$cwd" "$SPAWN")" "$id" "$proj" codex \
+      --model gpt-5.6-sol --effort xhigh ) 2>&1
 }
 
 test_spawn_refuses_and_admits() {
@@ -258,7 +262,7 @@ test_spawn_refuses_and_admits() {
 
   # no-regression: neutral cwd, marker UNSET, genuine isolated worktree.
   out=$(run_spawn "$NORMAL_CWD" "$home" spawn-ok "$proj" "$wt" "$fakebin"); rc=$?
-  expect_code 0 "$rc" "spawn: a normal session must still spawn"
+  expect_code 0 "$rc" "spawn: a normal session must still spawn: $out"
   assert_contains "$out" "spawned spawn-ok" "spawn: normal launch should report success"
   assert_not_contains "$out" "$ENV_MSG" "spawn: normal launch must not print the gate refusal"
   assert_not_contains "$out" "$PATH_MSG" "spawn: normal launch must not print the backstop refusal"
@@ -820,6 +824,11 @@ test_no_mistakes_yaml_disables_project_settings() {
   fi
   pass ".no-mistakes.yaml parses and sets disable_project_settings: true (trusted-only gate opt-out)"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = spawn ]; then
+  test_spawn_refuses_and_admits
+  exit 0
+fi
 
 test_helper_env_marker_refuses
 test_helper_empty_env_marker_refuses

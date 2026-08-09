@@ -36,6 +36,7 @@ test_exact_lab_token_admits_only_atomic_herdr_line() {
   expect_code 1 "$rc" "a noncanonical Herdr lab token must refuse"
   [ ! -s "$LOG" ] || fail "a noncanonical lab token reached the atomic adapter"
   out=$(FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 \
+    FM_BACKEND_HERDR_ATOMIC_STEERING_TEST_LAB=firstmate-herdr-atomic-steering-test-lab-v1 \
     fm_backend_send_steering herdr fixture:target 'lab message') || fail "the exact lab token did not reach the atomic adapter"
   [ "$out" = confirmed ] || fail "the exact lab adapter returned '$out', expected confirmed"
   assert_contains "$(cat "$LOG")" $'fixture:target\tlab message' "the lab route did not use the atomic Herdr text-line operation"

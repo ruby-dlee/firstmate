@@ -27,6 +27,9 @@
 # gpt-5.6-sol/xhigh probe under that exact account home.
 # Successful completion is cached for 30 minutes and an unavailable probe for
 # one minute, bounding healthy-account probe cost while keeping failures visible.
+# Each cached verdict is bound to a persistent random generation marker inside
+# that account's isolated cache so filesystem inode reuse cannot transfer proof
+# to a deleted and recreated account directory.
 # A missing, timed-out, refused, or malformed probe makes only that account
 # unavailable; if no account has a current positive completion proof, selection
 # fails closed instead of rotating through unproved capacity.
@@ -663,6 +666,46 @@ probe_cache_directory() {
   printf '%s\n' "$probe_root"
 }
 
+read_codex_account_generation_identity() { # <account-home>
+  local account_home=$1 cache_home marker physical token size
+  cache_home=$account_home/.agent-fleet-quota-cache
+  marker=$cache_home/.firstmate-account-generation
+  physical=$(fm_checkout_physical_path_identity "$account_home" directory) || return 1
+  [ -d "$cache_home" ] && [ ! -L "$cache_home" ] || return 1
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  size=$(wc -c < "$marker" 2>/dev/null | tr -d ' ') || return 1
+  [ "$size" = 33 ] || return 1
+  IFS= read -r token < "$marker" || return 1
+  [ "${#token}" -eq 32 ] || return 1
+  case "$token" in *[!0-9a-f]*) return 1 ;; esac
+  printf '%s:generation:%s\n' "$physical" "$token"
+}
+
+ensure_codex_account_generation_identity() { # <account-home>
+  local account_home=$1 cache_home marker tmp token
+  cache_home=$account_home/.agent-fleet-quota-cache
+  marker=$cache_home/.firstmate-account-generation
+  if [ -e "$cache_home" ] || [ -L "$cache_home" ]; then
+    [ -d "$cache_home" ] && [ ! -L "$cache_home" ] || return 1
+  else
+    mkdir -p "$cache_home" 2>/dev/null || return 1
+  fi
+  if [ ! -e "$marker" ] && [ ! -L "$marker" ]; then
+    tmp=$(mktemp "$cache_home/.firstmate-account-generation.XXXXXX") || return 1
+    token=$(fm_checkout_hash_value "codex-account-generation:$tmp:$$" 32) \
+      || { rm -f "$tmp"; return 1; }
+    printf '%s\n' "$token" > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    if ln "$tmp" "$marker" 2>/dev/null; then
+      rm -f "$tmp"
+    else
+      rm -f "$tmp"
+      [ -e "$marker" ] && [ ! -L "$marker" ] || return 1
+    fi
+  fi
+  read_codex_account_generation_identity "$account_home"
+}
+
 read_codex_probe_cache() { # <cache-file> <now> <account-identity>
   local cache=$1 now=$2 expected_identity=$3 version epoch verdict identity ttl age
   [ -f "$cache" ] && [ ! -L "$cache" ] || return 1
@@ -695,23 +738,34 @@ write_codex_probe_cache() { # <cache-file> <epoch> <verdict> <account-identity>
 
 probe_codex_account() { # <account-home> <codex-command>
   local account_home=$1 codex_bin=$2 probe_root account_name cache now cached published_at
-  local timeout output error status verdict tmp_root cache_home environment_name probe_lock account_identity current_identity
+  local timeout probe_lock_wait output error status verdict tmp_root cache_home environment_name probe_lock account_identity current_identity
   local cache_identity current_cache_identity
   probe_root=$(probe_cache_directory) || return 1
   account_name=${account_home##*/}
   case "$account_name" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; esac
   cache=$probe_root/$account_name.status
-  account_identity=$(fm_checkout_physical_path_identity "$account_home" directory) || return 1
+  account_identity=$(read_codex_account_generation_identity "$account_home" 2>/dev/null || true)
   now=$(probe_now) || return 1
-  if cached=$(read_codex_probe_cache "$cache" "$now" "$account_identity" 2>/dev/null); then
+  if [ -n "$account_identity" ] \
+    && cached=$(read_codex_probe_cache "$cache" "$now" "$account_identity" 2>/dev/null); then
     log "codex account $account_home completion proof cache=$cached"
     printf '%s\n' "$cached"
     return 0
   fi
 
-  probe_lock=$(fm_account_meta_lock_acquire "$probe_root" "codex-probe-$account_name") || return 1
-  account_identity=$(fm_checkout_physical_path_identity "$account_home" directory) \
-    || { fm_account_meta_lock_release "$probe_lock"; return 1; }
+  timeout=$(probe_timeout_seconds) || return 1
+  probe_lock_wait=$((timeout + 10))
+  probe_lock=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS="$probe_lock_wait" \
+    fm_account_meta_lock_acquire "$probe_root" "codex-probe-$account_name") || {
+    log "codex account $account_home unavailable: completion-probe lock could not be acquired"
+    return 1
+  }
+  account_identity=$(ensure_codex_account_generation_identity "$account_home") \
+    || {
+      fm_account_meta_lock_release "$probe_lock" || true
+      log "codex account $account_home unavailable: account generation identity is unsafe or unreadable"
+      return 1
+    }
   now=$(probe_now) || { fm_account_meta_lock_release "$probe_lock"; return 1; }
   if cached=$(read_codex_probe_cache "$cache" "$now" "$account_identity" 2>/dev/null); then
     fm_account_meta_lock_release "$probe_lock" || return 1
@@ -720,17 +774,12 @@ probe_codex_account() { # <account-home> <codex-command>
     return 0
   fi
 
-  timeout=$(probe_timeout_seconds) || { fm_account_meta_lock_release "$probe_lock"; return 1; }
   tmp_root=$(mktemp -d "$probe_root/.probe-$account_name.XXXXXX") \
     || { fm_account_meta_lock_release "$probe_lock"; return 1; }
   output=$tmp_root/last-message
   error=$tmp_root/stderr
   cache_home=$account_home/.agent-fleet-quota-cache
-  if [ -e "$cache_home" ] || [ -L "$cache_home" ]; then
-    [ -d "$cache_home" ] && [ ! -L "$cache_home" ] || cache_home=
-  else
-    mkdir -p "$cache_home" 2>/dev/null || cache_home=
-  fi
+  [ -d "$cache_home" ] && [ ! -L "$cache_home" ] || cache_home=
   if [ -n "$cache_home" ]; then
     cache_identity=$(fm_checkout_physical_path_identity "$cache_home" directory 2>/dev/null || true)
   else
@@ -779,7 +828,7 @@ probe_codex_account() { # <account-home> <codex-command>
     verdict=unavailable
     log "codex account $account_home unavailable: cache directory identity changed during completion probe"
   fi
-  current_identity=$(fm_checkout_physical_path_identity "$account_home" directory 2>/dev/null || true)
+  current_identity=$(read_codex_account_generation_identity "$account_home" 2>/dev/null || true)
   if [ "$current_identity" != "$account_identity" ]; then
     verdict=unavailable
     account_identity=$current_identity

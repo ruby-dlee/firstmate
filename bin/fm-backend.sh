@@ -591,7 +591,8 @@ fm_backend_send_steering() {  # <backend> <target> <text> [expected-label] [reco
       fm_backend_source herdr || return 1
       # Real-Herdr behavior tests have one exact opt-in for pane-run's atomic
       # line primitive. Production never sets it and keeps the refusal below.
-      if fm_backend_herdr_test_lab_enabled; then
+      if fm_backend_herdr_test_lab_enabled \
+        && [ "${FM_BACKEND_HERDR_ATOMIC_STEERING_TEST_LAB:-}" = firstmate-herdr-atomic-steering-test-lab-v1 ]; then
         fm_backend_herdr_send_text_line "$target" "$text" || return 1
         printf 'confirmed'
         return 0

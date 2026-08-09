@@ -170,6 +170,12 @@ fm_test_enable_codex_runtime_publisher() {
   mkdir -p "$root/codex-runtime"
   export CODEX_HOME="$root/codex-runtime"
   export FM_CODEX_RUNTIME_TEST_LAB=firstmate-codex-runtime-test-lab-v1
+  # Large suites deliberately share this isolated synthetic rollout tree.
+  # Keep production scan limits untouched while ensuring late fixture
+  # generations cannot fall outside the test scanner's file/time budget.
+  export FM_CODEX_PROFILE_MAX_FILES=${FM_CODEX_PROFILE_MAX_FILES:-1024}
+  export FM_CODEX_PROFILE_TOTAL_BYTES=${FM_CODEX_PROFILE_TOTAL_BYTES:-134217728}
+  export FM_CODEX_PROFILE_MAX_MILLIS=${FM_CODEX_PROFILE_MAX_MILLIS:-10000}
 }
 
 # --- node capability probe ---------------------------------------------------
@@ -241,9 +247,11 @@ fm_git_init_commit() {
   local dir=$1
   mkdir -p "$dir"
   git -C "$dir" init -q
+  git -C "$dir" config --local user.name 'Firstmate Tests'
+  git -C "$dir" config --local user.email 'tests@example.invalid'
   printf '# %s\n' "$(basename "$dir")" > "$dir/README.md"
   git -C "$dir" add README.md
-  git -C "$dir" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
+  git -C "$dir" commit -qm initial
 }
 
 # fm_git_add_origin <repo> <bare>: clone <repo> bare into <bare> and register it

@@ -1520,7 +1520,13 @@ fm_account_lock_identity_mutation_acquire() {  # <bounded-lock-path> [deadline-e
           [ "$now" -lt "$deadline" ] || return 1
           fm_account_system_exec "$FM_ACCOUNT_SYSTEM_SLEEP_BIN" 0.05 || return 1
           ;;
-        *) return 1 ;;
+        *)
+          # A releasing owner atomically renames the mutation record before
+          # deleting it. A waiter can observe the old path and then classify
+          # after that rename; absence is a completed handoff, not malformed
+          # ownership. Retry only when the exact observed path is now absent.
+          [ ! -e "$mutation" ] && [ ! -L "$mutation" ] || return 1
+          ;;
       esac
       continue
     fi

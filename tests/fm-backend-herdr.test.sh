@@ -2191,11 +2191,8 @@ SH
     FM_BACKEND_HERDR_SERVER_LOCK_STALE_SECONDS=11 FM_TEST_HERDR_DELAY_BEFORE_LAUNCH=12 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" &
   first=$!
-  for _attempt in $(seq 1 1500); do
-    [ -e "$invoked" ] && break
-    sleep 0.01
-  done
-  [ -e "$invoked" ] || { kill -KILL "$first" 2>/dev/null || true; fail "delayed fake server was never launched"; }
+  fm_test_wait_for_file "$invoked" "$first" 0.01 \
+    || { kill -KILL "$first" 2>/dev/null || true; fail "delayed fake server was never launched"; }
   lock=
   for candidate in "$lock_root"/*.lock; do
     [ -f "$candidate" ] || continue

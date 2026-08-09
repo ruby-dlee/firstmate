@@ -6,9 +6,10 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-const [runtimeHome, worktree, model, effort, generation, runtimeStartArg] = process.argv.slice(2);
+const [runtimeHome, worktree, model, effort, generation, runtimeStartArg, expectedSession = "-"] = process.argv.slice(2);
 if (!runtimeHome || !worktree || !model || !effort || !generation
-  || !/^\d+$/.test(runtimeStartArg || "")) {
+  || !/^\d+$/.test(runtimeStartArg || "")
+  || (expectedSession !== "-" && !/^[A-Za-z0-9._:-]+$/.test(expectedSession))) {
   console.error("error: invalid synthetic Codex runtime record request");
   process.exit(1);
 }
@@ -22,7 +23,7 @@ const token = crypto.createHash("sha256")
   .update(`${generation}\0${runtimeStartArg}`)
   .digest("hex")
   .slice(0, 24);
-const session = `test-${token}`;
+const session = expectedSession === "-" ? `test-${token}` : expectedSession;
 const sessionDir = path.join(runtimeHome, "sessions", "test-lab");
 const rollout = path.join(sessionDir, `rollout-${token}.jsonl`);
 fs.mkdirSync(sessionDir, { recursive: true });

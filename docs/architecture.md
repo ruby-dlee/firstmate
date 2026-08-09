@@ -17,7 +17,7 @@ Those actionable wakes are written to a durable local queue (`state/.wake-queue`
 No-verb wakes, such as `working:` notes and bare turn-ended signals, are benign only when `bin/fm-crew-state.sh` reports positive evidence that the crewmate is still working: an actively running no-mistakes step for that crewmate's branch or a backend busy signature.
 A crewmate that declares `paused:` for a known external wait is separately absorbed while idle and re-surfaced only on the longer pause cadence, rather than being treated as a possible wedge.
 A pause is a statement about the work rather than about the terminal, so it is honoured whether the crewmate's pane is alive, idle, or gone, and whatever its attributed no-mistakes run reports - parked, failed or cancelled, or unreadable.
-Positive evidence from an actively `working` run-step or busy pane supersedes the declaration because the crewmate resumed after making it, subject only to the narrow orphaned-CI-record discriminator described below.
+Positive evidence from an actively `working` run-step or busy pane supersedes the declaration because the crewmate resumed after making it.
 Absorption is gated on two proofs taken from one immutable read of the crewmate's current durable status stream: the pause verb carrying no failure vocabulary in its headline, and an empty keyed open/resolved fold, so a pause can never mask a still-unanswered decision.
 The Herdr native blocked-transition edge does not yet honour this invariant, which is a known defect tracked as `herdr-push-transition-pause-gate-h8`: on that edge a lane that owes an unanswered keyed decision can be silently absorbed and go quiet.
 A crewmate with no locatable status stream is refused rather than absorbed, and stopped crewmates without a declared pause surface immediately.
@@ -30,16 +30,15 @@ At each drain boundary, `fm-wake-drain.sh` first intakes durable Lavish answers,
 Routine watcher polling, supervision no-ops, elapsed waiting time, and absorbed benign wakes stay silent.
 A declared external wait trades that silence for one bounded recheck per pause window, so a forgotten pause cannot remain invisible indefinitely.
 Crewmate status files are append-only wake-event logs, not current-state fields.
-`bin/fm-crew-state.sh <id>` is the cheap current-state read for an actionable heartbeat review: it attributes the matching no-mistakes run, active or terminal, to the crewmate's own branch and ordinarily keeps that run-step authoritative even if the pane has closed.
+`bin/fm-crew-state.sh <id>` is the cheap current-state read for an actionable heartbeat review: it attributes the matching no-mistakes run, active or terminal, to the crewmate's own branch and keeps that run-step authoritative even if the pane has closed.
 When a terminal run reports `outcome: passed`, the helper verifies the PR detail through a bounded `gh-axi` query instead of inferring GitHub state from the pipeline outcome.
 An open-PR `passed` or `checks-passed` outcome and a checks-green CI marker are classified by the exact remote-only currentness contract in `bin/fm-crew-state.sh`'s header; only `done` authorizes the PR-ready workflow.
 During no-mistakes' `ci` monitor phase, it also reads the ci step log tail because `axi status` reports both "still waiting on checks" and "checks green, waiting on merge" as `ci,running`.
 The most recent recognized ci log marker wins, so checks-green monitoring supplies the ready claim while a later re-arm, failed-check, or issue marker returns the crewmate to working before remote currentness is considered.
-A narrow exception exposes the current declared pause instead of a lingering `ci,running` row only when a checks-green `done` event is the immediately preceding non-empty status, the ci log is unknown with no newer re-arm or fixing marker, and the bounded liveness observation specifically says the recorded run has no worktree.
-The missing-worktree observation is heuristic corroboration for the adjacent durable events, not a death verdict or authority to abort the run; if an active CI run becomes undiscoverable while those events remain and its ci log is unavailable, the heuristic can misclassify it as paused.
-Positive authoritative work remains on the wedge path, as covered by `test_ci_pause_does_not_hide_a_real_active_run` and `test_paused_authoritative_working_preserves_wedge_timer`.
-This alarm suppression does not repair the no-mistakes lifecycle: the run still lacks a clean terminal state at the CI-ready point and can keep monitoring a held PR after its base moves.
-Only when no matching run exists does it fall back to the pane busy-signature and then a status-log event whose verb maps to a recognized run-state; a dead pane without a run reports unknown instead of trusting a stale log.
+A held green PR whose matching `ci` step still monitors until merge remains `working`, including when the monitor has no worktree or its log is temporarily unreadable.
+The hold has administratively removed that run's terminal condition, so a later base advance can re-arm it indefinitely; suppressing the wake would hide a live unbounded run rather than quiet an idle lane.
+This active-monitor boundary is covered by `test_ci_hold_does_not_hide_live_monitor`, `test_ci_pause_does_not_hide_a_real_active_run`, and `test_paused_authoritative_working_preserves_wedge_timer`.
+Only when no matching live run exists does the helper fall back to the pane busy-signature and then a status-log event whose verb maps to a recognized run-state; a finished idle lane on a held green PR therefore remains a declared pause, while a dead pane without a run reports unknown instead of trusting a stale status log.
 Decision-only events such as `resolved` never become current state or leak their prose into the current-state detail.
 In that status-log fallback, a declared external wait reports the distinct `paused` state with its reason.
 For herdr, that pane fallback trusts a native `busy` verdict outright, but corroborates native `idle` or unknown verdicts against the rendered busy signature before deciding the crewmate is not working.

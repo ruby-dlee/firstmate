@@ -70,6 +70,8 @@ case "${1:-}" in
     case "${1:-}" in
       status)
         shift
+        [ -z "${FM_FAKE_AXI_STATUS_APPEND_STATUS:-}" ] \
+          || printf '%s\n' "$FM_FAKE_AXI_STATUS_APPEND_STATUS" >> "${FM_FAKE_STATUS_FILE:?}"
         if [ "${1:-}" = --run ]; then printf '%s\n' "${FM_FAKE_AXI_STATUS_RUN:-}"
         else printf '%s\n' "${FM_FAKE_AXI_STATUS:-}"; fi ;;
       logs)
@@ -262,10 +264,13 @@ reset_fakes() {
   FM_FAKE_REMOTE_COMMIT_HEAD=abc1234cafebabeabc1234cafebabeabc1234caf
   FM_FAKE_REMOTE_COMMIT_FAIL=0
   FM_FAIL_ON_LOCAL_COMMIT_LOOKUP=0
+  FM_FAKE_AXI_STATUS_APPEND_STATUS=""
+  FM_FAKE_STATUS_FILE=""
   export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_TMUX_MISSING
   export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS
   export FM_FAKE_PR_STATE FM_FAKE_PR_HEAD FM_FAKE_GH_AXI_FAIL
   export FM_FAKE_REMOTE_COMMIT_HEAD FM_FAKE_REMOTE_COMMIT_FAIL FM_FAIL_ON_LOCAL_COMMIT_LOOKUP
+  export FM_FAKE_AXI_STATUS_APPEND_STATUS FM_FAKE_STATUS_FILE
 }
 
 # --- run-object fixtures (TOON, as `no-mistakes axi status` emits) -----------
@@ -801,6 +806,26 @@ EOF
   assert_contains "$out" "state: working" "a re-armed live monitor remains on the wedge path"
   assert_not_contains "$out" "state: paused" "a declared hold must not suppress re-armed CI"
   pass "a held PR never hides its live monitor-until-merge run"
+}
+
+test_ci_hold_appended_during_status_read_stays_working() {
+  reset_fakes
+  local d out
+  d=$(new_case ci-hold-status-race)
+  make_repo_on_branch "$d/wt" fm/feat-ci-hold-status-race
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/feat-ci-hold-status-race.meta" \
+    "window=fm:fm-feat-ci-hold-status-race" "worktree=$d/wt" "kind=ship"
+  printf 'done: PR https://github.com/o/r/pull/2 checks green\n' \
+    > "$d/state/feat-ci-hold-status-race.status"
+  FM_FAKE_AXI_STATUS="$(run_ci_monitoring fm/feat-ci-hold-status-race)"
+  FM_FAKE_CI_LOGS="all CI checks passed - still monitoring until merged or closed"
+  FM_FAKE_AXI_STATUS_APPEND_STATUS="paused: PR 2 became deliberately held during the status read"
+  FM_FAKE_STATUS_FILE="$d/state/feat-ci-hold-status-race.status"
+  out=$(run_crew_state "$d" feat-ci-hold-status-race)
+  assert_contains "$out" "state: working" "a concurrently appended hold keeps the live monitor authoritative"
+  assert_not_contains "$out" "state: done" "a stale pre-query status snapshot cannot finish a newly held monitor"
+  pass "a hold appended during the status query cannot race into paused suppression"
 }
 
 # No ready report means there is no proof that the work reached the CI-ready
@@ -1844,6 +1869,7 @@ test_gate_block_parked_not_superseded
 test_ci_ready_done_log_beats_monitoring_run
 test_finished_green_pr_pause_without_live_run_is_paused
 test_ci_hold_does_not_hide_live_monitor
+test_ci_hold_appended_during_status_read_stays_working
 test_ci_pause_does_not_hide_a_real_active_run
 test_ci_ready_log_pr_url_does_not_supply_run_identity
 test_ci_monitoring_checks_green_surfaces_done

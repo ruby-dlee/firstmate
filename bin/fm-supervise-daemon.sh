@@ -387,7 +387,7 @@ classify_signal() {  # <reason-after-colon> <state>
 # first sight of a non-terminal stale it returns "self" and the caller records a
 # timestamp marker; persistence is escalated by housekeeping's recheck, not here.
 classify_stale() {  # <window> <state>
-  local win=$1 state=$2 task last seen current liveness
+  local win=$1 state=$2 task last seen current liveness pause_class
   task=$(window_to_task "$win" "$state")
   current=$(crew_state_line "$task")
   liveness=$(crew_state_liveness_verdict "$current")
@@ -400,13 +400,11 @@ classify_stale() {  # <window> <state>
   esac
   last=$(last_status_line "$state/$task.status")
   if [ -n "$last" ] && status_is_paused "$last"; then
-    # A DECLARED external-wait pause (fm-classify-lib.sh): an idle pane is EXPECTED,
-    # so this is not a wedge. The caller records a pause marker (long re-surface
-    # cadence in housekeeping) rather than a wedge stale marker. Cheap: reuses the
-    # status line already read, no fm-crew-state.sh call, mirroring the daemon's
-    # existing status-log classification.
-    printf 'pause|paused (awaiting external), rechecked on a long cadence: %s' "$last"
-    return
+    pause_class=$(crew_absorb_class "$task" "$last")
+    if [ "$pause_class" = paused ]; then
+      printf 'pause|paused (awaiting external), rechecked on a long cadence: %s' "$last"
+      return
+    fi
   fi
   if [ -n "$last" ] && status_is_captain_relevant "$last"; then
     # Dedupe against the signal path: if this status was already escalated
@@ -490,32 +488,47 @@ pause_marker_remove() {  # <window> <state>
   rm -f "$state/.subsuper-paused-$key"
 }
 
+clear_pause_markers() {  # <window> <state>
+  local win=$1 state=$2 task key watcher_key
+  task=$(window_to_task "$win" "$state")
+  key=$(_stale_key "$task")
+  watcher_key=$(_stale_key "$win")
+  rm -f "$state/.subsuper-paused-$key" \
+    "$state/.paused-$watcher_key" "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key"
+}
+
 clear_pause_tracking() {  # <window> <state>
   local win=$1 state=$2 task key watcher_key
   task=$(window_to_task "$win" "$state")
   key=$(_stale_key "$task")
   watcher_key=$(_stale_key "$win")
-  rm -f "$state/.subsuper-paused-$key" "$state/.subsuper-stale-$key" \
-    "$state/.paused-$watcher_key" "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key" \
+  clear_pause_markers "$win" "$state"
+  rm -f "$state/.subsuper-stale-$key" \
     "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key"
 }
 
-reconcile_pause_tracking() {  # <window> <state> <last-status-line>
-  local win=$1 state=$2 last=$3 task key marker watcher_key
+reconcile_pause_tracking() {  # <window> <state> <last-status-line> [absorb-class]
+  local win=$1 state=$2 last=$3 class=${4:-} task key marker watcher_key
   task=$(window_to_task "$win" "$state")
   key=$(_stale_key "$task")
   marker="$state/.subsuper-paused-$key"
   watcher_key=$(_stale_key "$win")
   if status_is_paused "$last"; then
-    stale_marker_remove "$win" "$state"
-    pause_marker_record "$win" "$state"
+    [ -n "$class" ] || class=$(crew_absorb_class "$task" "$last")
+    if [ "$class" = paused ]; then
+      stale_marker_remove "$win" "$state"
+      pause_marker_record "$win" "$state"
+    else
+      clear_pause_markers "$win" "$state"
+      stale_marker_record "$win" "$state"
+    fi
   elif [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
     clear_pause_tracking "$win" "$state"
   fi
 }
 
 migrate_watcher_pause_markers() {  # <state>
-  local state=$1 meta win task key last watcher_key
+  local state=$1 meta win task key last watcher_key pause_class
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || continue
     win=$(fm_backend_target_of_meta "$meta")
@@ -525,13 +538,15 @@ migrate_watcher_pause_markers() {  # <state>
     watcher_key=$(_stale_key "$win")
     last=$(last_status_line "$state/$task.status")
     if status_is_paused "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
-      reconcile_pause_tracking "$win" "$state" "$last"
+      pause_class=
+      status_is_paused "$last" && pause_class=$(crew_absorb_class "$task" "$last")
+      reconcile_pause_tracking "$win" "$state" "$last" "$pause_class"
     fi
   done
 }
 
 sync_pause_markers_from_signal() {  # <state> <signal files>
-  local state=$1 paths=$2 f last task win
+  local state=$1 paths=$2 f last task win pause_class
   local -a files
   read -r -a files <<<"$paths"
   for f in "${files[@]}"; do
@@ -541,7 +556,9 @@ sync_pause_markers_from_signal() {  # <state> <signal files>
     task=$(basename "$f"); task=${task%.status}
     win=$(window_for_task "$task" "$state" 2>/dev/null || true)
     [ -n "$win" ] || continue
-    reconcile_pause_tracking "$win" "$state" "$last"
+    pause_class=
+    status_is_paused "$last" && pause_class=$(crew_absorb_class "$task" "$last")
+    reconcile_pause_tracking "$win" "$state" "$last" "$pause_class"
   done
 }
 
@@ -985,7 +1002,7 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  3) heartbeat scan: every HEARTBEAT_SCAN_SECS, grep state/*.status for a
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
-  local state=$1 now due f key task win marker age last max_defer oldest pause_secs
+  local state=$1 now due f key task win marker age last max_defer oldest pause_secs pause_class
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -1036,8 +1053,9 @@ housekeeping() {  # <state>
     task=$(window_to_task "$win" "$state")
     last=$(last_status_line "$state/$task.status")
     if [ -n "$last" ] && status_is_paused "$last"; then
-      reconcile_pause_tracking "$win" "$state" "$last"
-      continue
+      pause_class=$(crew_absorb_class "$task" "$last")
+      reconcile_pause_tracking "$win" "$state" "$last" "$pause_class"
+      [ "$pause_class" = paused ] && continue
     fi
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
     [ "$age" -ge "${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}" ] || continue
@@ -1070,6 +1088,11 @@ housekeeping() {  # <state>
       reconcile_pause_tracking "$win" "$state" "$last"
       continue
     fi
+    pause_class=$(crew_absorb_class "$task" "$last")
+    if [ "$pause_class" != paused ]; then
+      reconcile_pause_tracking "$win" "$state" "$last" "$pause_class"
+      continue
+    fi
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
     [ "$age" -ge "$pause_secs" ] || continue
     stale_window_is_busy "$win" "$state"
@@ -1078,7 +1101,9 @@ housekeeping() {  # <state>
       2) rm -f "$marker" ;;
       *)
         last=$(last_status_line "$state/$task.status")
-        if [ -n "$last" ] && status_is_paused "$last"; then
+        pause_class=
+        [ -n "$last" ] && status_is_paused "$last" && pause_class=$(crew_absorb_class "$task" "$last")
+        if [ "$pause_class" = paused ]; then
           escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
           _now > "$marker"
         else

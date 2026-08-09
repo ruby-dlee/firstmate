@@ -345,12 +345,13 @@ _fm_status_file_for() {  # <id>
 # Fails closed in both directions. An id with no locatable status file cannot be
 # proven either way, so it is refused rather than absorbed: absence of a signal is
 # never evidence of a pause.
-crew_declared_pause_absorbable() {  # <id> [declared-pause-status-line]
-  local id=$1 declared=${2:-} f snapshot current before after
+crew_declared_pause_absorbable() {  # <id> [declared-pause-status-line] [expected-signature]
+  local id=$1 declared=${2:-} expected=${3:-} f snapshot current before after
   f=$(_fm_status_file_for "$id")
   [ -n "$f" ] || return 1
   before=$(_fm_status_file_sig "$f")
   [ -n "$before" ] || return 1
+  [ -z "$expected" ] || [ "$before" = "$expected" ] || return 1
   snapshot=$(cat "$f" 2>/dev/null) || return 1
   current=$(printf '%s\n' "$snapshot" | grep -v '^[[:space:]]*$' | tail -1)
   [ -z "$declared" ] || [ "$declared" = "$current" ] || return 1
@@ -469,9 +470,12 @@ scan_crew_liveness_observations() {  # <state-dir>
 }
 
 crew_absorb_class() {  # <id> [declared-pause-status-line]
-  local id=$1 declared_pause=${2:-} line state src liveness
+  local id=$1 declared_pause=${2:-} line state src liveness status_file sig_before sig_after
   [ -n "$id" ] || { printf 'none'; return; }
+  status_file=$(_fm_status_file_for "$id")
+  sig_before=$(_fm_status_file_sig "$status_file")
   line=$(crew_state_line "$id")
+  sig_after=$(_fm_status_file_sig "$status_file")
   case "$line" in
     state:*)
       state=${line#state: }; state=${state%% *}
@@ -486,7 +490,8 @@ crew_absorb_class() {  # <id> [declared-pause-status-line]
   esac
   # An unreadable verdict falls through here too: it is not evidence against a pause
   # the crewmate durably declared, and it is exactly what a torn-down pane produces.
-  if crew_declared_pause_absorbable "$id" "$declared_pause"; then
+  if [ -n "$sig_before" ] && [ "$sig_before" = "$sig_after" ] \
+    && crew_declared_pause_absorbable "$id" "$declared_pause" "$sig_after"; then
     printf 'paused'
     return
   fi

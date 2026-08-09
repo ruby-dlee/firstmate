@@ -151,8 +151,6 @@ map_log_state() {  # <line>
 
 LOG_LINE=$(log_last_line || true)
 LOG_VERB=$(status_line_verb "$LOG_LINE")
-STATUS_DECLARES_PAUSE=0
-status_is_paused "$LOG_LINE" && STATUS_DECLARES_PAUSE=1
 
 # pane_readable is consulted ONLY in the no-run fallback below. The run-step path
 # stays authoritative regardless of pane liveness - judge by the run-step, not the
@@ -816,7 +814,9 @@ if [ "$HAVE_RUN" = 1 ]; then
           running)
             CI_LOG_STATE=$(nm_ci_checks_state)
             if [ "$CI_LOG_STATE" = green ]; then
-              if [ "$STATUS_DECLARES_PAUSE" = 1 ]; then
+              LOG_LINE=$(log_last_line || true)
+              LOG_VERB=$(status_line_verb "$LOG_LINE")
+              if status_is_paused "$LOG_LINE"; then
                 RUN_DETAIL="checks green: held PR still monitoring for merge/close"
               else
                 RUN_STATE="done"

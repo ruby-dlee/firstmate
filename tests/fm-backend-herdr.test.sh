@@ -3357,11 +3357,11 @@ test_wait_for_working_treats_blocked_as_submit_active() {
 test_send_text_submit_detects_landed_send() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-ok"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  # 1: native agent send (literal, no output)
-  # 2: agent get - pre-Enter baseline is idle
+  # 1: agent get - registered non-Codex identity and pre-Enter idle baseline
+  # 2: native agent send (literal, no output)
   # 3: send-keys enter
   # 4: agent get - agent_status working (a real turn started: submitted)
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/4.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
@@ -3380,7 +3380,7 @@ test_send_text_submit_detects_swallowed_enter() {
   dir="$TMP_ROOT/submit-swallow"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   # Every post-Enter agent-get read still reports idle: the Enter never
   # started a turn (swallowed), so wait_for_working never observes "busy".
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/6.out"
   fb=$(make_herdr_fakebin "$dir")
@@ -3399,11 +3399,11 @@ test_send_text_submit_detects_swallowed_enter() {
 test_send_text_submit_popup_autocomplete_requires_second_enter() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-popup-autocomplete"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  # 1: send-text "/compact"
-  # 2: agent get - pre-Enter baseline is idle
+  # 1: agent get - registered non-Codex identity and pre-Enter idle baseline
+  # 2: agent send "/compact"
   # 3: send-keys enter (#1) - closes the popup, fills the placeholder; no turn starts
   # 4: agent get -> idle (not submitted yet)
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
   # 5: send-keys enter (#2) - actually submits
   # 6: agent get -> working (submitted)
@@ -3420,8 +3420,7 @@ test_send_text_submit_popup_autocomplete_requires_second_enter() {
 test_send_text_submit_confirms_blocked_after_enter() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-blocked"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
-  printf '{"result":{"agent":{"agent_status":"blocked"}}}\n' > "$resp/3.out"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '{"result":{"agent":{"agent_status":"blocked"}}}\n' > "$resp/4.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
@@ -3435,8 +3434,7 @@ test_send_text_submit_confirms_blocked_after_enter() {
 test_send_text_submit_preexisting_working_does_not_false_confirm_swallowed_enter() {
   local dir log resp fb out enter_count read_count
   dir="$TMP_ROOT/submit-preexisting-working-swallow"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/2.out"
-  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/3.out"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"working"}}}\n' > "$resp/1.out"
   printf '  \xe2\x9d\xaf hello captain\n' > "$resp/4.out"
   printf '  \xe2\x9d\xaf hello captain\n' > "$resp/6.out"
   fb=$(make_herdr_fakebin "$dir")
@@ -3450,21 +3448,21 @@ test_send_text_submit_preexisting_working_does_not_false_confirm_swallowed_enter
   pass "fm_backend_herdr_send_text_submit: preexisting working is not accepted as submit proof when the composer still holds the message"
 }
 
-# Regression for the submit-confirmation side of the 2026-07-07 incident:
-# even if a Codex idle composer displays suggestion text, an idle-baseline
-# submit must confirm from native agent-state rather than composer scraping.
-# The pre-injection composer guard has its own faint-suggestion coverage below.
-test_send_text_submit_confirms_despite_codex_idle_tip_composer() {
+# Gate B rejects this historical split submit primitive for Codex because
+# Herdr's native agent send reapplies stored thread settings while pane input
+# cannot bind the following Enter to that exact agent session.
+test_send_text_submit_refuses_codex_without_mutation() {
   local dir log resp fb out
-  dir="$TMP_ROOT/submit-codex-idle-tip"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
-  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/4.out"
+  dir="$TMP_ROOT/submit-codex-refused"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"agent":{"agent":"codex","agent_status":"idle"}}}\n' > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_send_text_submit default:w1:p2 "reply with just OK" 3 0.01 0.01' "$ROOT" )
-  [ "$out" = empty ] || fail "send_text_submit should confirm via agent_status alone even for a harness whose idle composer shows dynamic tip text, got '$out'"
-  [ "$(grep -c $'\x1f''pane'$'\x1f''read' "$log")" -eq 0 ] || fail "send_text_submit must never call 'pane read' - a codex-style dynamic idle-tip composer can never mislead a confirmation path that does not read it"
-  pass "fm_backend_herdr_send_text_submit: confirms submission via native agent-state alone, immune to a codex-style dynamic idle-tip composer that would have misread as 'pending' under the old composer-based confirmation"
+  [ "$out" = send-failed ] || fail "send_text_submit must refuse a registered Codex agent, got '$out'"
+  [ "$(wc -l < "$log" | tr -d ' ')" -eq 1 ] || fail "Codex refusal performed a mutation after the identity probe: $(cat "$log")"
+  assert_contains "$(cat "$log")" $'\x1f''agent'$'\x1f''get'$'\x1f''w1:p2' \
+    "Codex refusal did not bind its decision to the registered agent identity"
+  pass "fm_backend_herdr_send_text_submit: refuses Codex after one identity probe and performs no input mutation"
 }
 
 # Companion regression for the pre-injection empty-box guard itself
@@ -3508,8 +3506,8 @@ test_composer_state_guard_still_refuses_real_pending_text_after_submit_confirmat
 test_send_text_submit_slow_transition_within_one_enter_needs_no_extra_enter() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-slow-transition"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  # 1: send-text  2: baseline idle  3: send-keys enter  4,5: agent get -> idle  6: agent get -> working
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  # 1: registered Claude baseline  2: agent send  3: Enter  4,5: idle  6: working
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/5.out"
   printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/6.out"
@@ -3525,20 +3523,20 @@ test_send_text_submit_slow_transition_within_one_enter_needs_no_extra_enter() {
 test_send_text_submit_send_failed() {
   local dir log resp fb out
   dir="$TMP_ROOT/submit-fail"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  # Native agent send fails, then the recovery/husk pane-send fallback fails.
-  printf '1\n' > "$resp/1.exit"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '1\n' > "$resp/2.exit"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "x" 2 0.01 0.01' "$ROOT" )
   [ "$out" = send-failed ] || fail "send_text_submit should report send-failed when the literal send itself fails, got '$out'"
-  pass "fm_backend_herdr_send_text_submit: reports 'send-failed' when native agent send and the pane-send fallback both error"
+  [ "$(grep -c $'\x1f''pane'$'\x1f''send-text' "$log" || true)" -eq 0 ] || fail "failed native agent send fell back to unbound pane text input"
+  pass "fm_backend_herdr_send_text_submit: reports 'send-failed' when native agent send fails without falling back to pane input"
 }
 
 test_send_text_submit_unknown_on_capture_failure() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-read-fail"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '1\n' > "$resp/4.exit"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
@@ -4836,7 +4834,7 @@ test_send_text_submit_detects_swallowed_enter
 test_send_text_submit_popup_autocomplete_requires_second_enter
 test_send_text_submit_confirms_blocked_after_enter
 test_send_text_submit_preexisting_working_does_not_false_confirm_swallowed_enter
-test_send_text_submit_confirms_despite_codex_idle_tip_composer
+test_send_text_submit_refuses_codex_without_mutation
 test_composer_state_codex_dynamic_idle_tip_reads_empty_when_faint
 test_composer_state_guard_still_refuses_real_pending_text_after_submit_confirmation_change
 test_send_text_submit_slow_transition_within_one_enter_needs_no_extra_enter

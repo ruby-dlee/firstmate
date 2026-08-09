@@ -6,8 +6,8 @@
 # "run a real tmux smoke test (create session, send text + Enter, capture,
 # list, kill)" from data/fm-backend-design-d7/report.md. Every other suite in
 # this repo fakes tmux; this one is the one place that talks to a REAL tmux
-# server, isolated on a short repo-local socket (`-S`) so it never touches the host's
-# actual sessions.
+# server, isolated on a short private socket (`-S`) so it never touches the
+# host's actual sessions.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -18,15 +18,25 @@ pass() { printf 'ok - %s\n' "$1"; }
 
 command -v tmux >/dev/null 2>&1 || { echo "skip: tmux not found"; exit 0; }
 REAL_TMUX=$(command -v tmux)
-SOCKET="./.fm-backend-smoke-$$.sock"
+SOCKET=
+SOCKET_DIR=
 SHIM_DIR=
 trap cleanup_all EXIT
 
 cleanup_all() {
-  "$REAL_TMUX" -S "$SOCKET" kill-server >/dev/null 2>&1 || true
-  rm -f -- "$SOCKET"
+  if [ -n "${SOCKET:-}" ]; then
+    "$REAL_TMUX" -S "$SOCKET" kill-server >/dev/null 2>&1 || true
+    rm -f -- "$SOCKET"
+  fi
   [ -n "${SHIM_DIR:-}" ] && rm -rf "$SHIM_DIR"
+  [ -n "${SOCKET_DIR:-}" ] && rm -rf "$SOCKET_DIR"
 }
+
+# tmux limits Unix socket paths to roughly 104 bytes on macOS. Keep the real
+# smoke server under a bounded root instead of inheriting a long checkout path.
+SOCKET_DIR=$(mktemp -d /tmp/fm-tmux-smoke.XXXXXX) \
+  || fail "could not create a private tmux socket directory"
+SOCKET="$SOCKET_DIR/fm-backend-smoke.sock"
 
 # A `tmux` shim on PATH that transparently redirects every call to the private
 # socket, so bin/backends/tmux.sh's bare `tmux ...` invocations never touch the

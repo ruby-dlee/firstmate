@@ -1714,6 +1714,15 @@ def test_arguments(
     return TestRun(tuple(argv), run_cwd, body_report)
 
 
+def vitest_project_config(run_cwd: Path) -> Path | None:
+    for stem in ("vitest.config", "vite.config"):
+        for suffix in (".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"):
+            candidate = run_cwd / f"{stem}{suffix}"
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def write_javascript_body_probe(
     run_cwd: Path, runner: str, probe_kind: str
 ) -> tuple[Path, Path]:
@@ -1796,13 +1805,28 @@ export default class CrosscheckBodyRunner extends TestRunner {{
 }}
 """
         config_path = protocol / "vitest-body-probe.config.mjs"
-        config_path.write_text(
-            f"""// crosscheck-body-report={report_path}
-export default {{
-  root: {json.dumps(str(run_cwd))},
+        project_config = vitest_project_config(run_cwd)
+        if project_config is None:
+            config_body = f"""export default {{
   test: {{ runner: {json.dumps(str(probe_path))} }},
 }};
-""",
+"""
+        else:
+            config_body = f"""import projectConfig from {json.dumps(project_config.as_uri())};
+
+export default async (environment) => {{
+  const loaded = typeof projectConfig === 'function'
+    ? await projectConfig(environment)
+    : await projectConfig;
+  const config = loaded || {{}};
+  return {{
+    ...config,
+    test: {{ ...(config.test || {{}}), runner: {json.dumps(str(probe_path))} }},
+  }};
+}};
+"""
+        config_path.write_text(
+            f"// crosscheck-body-report={report_path}\n{config_body}",
             encoding="utf-8",
         )
         argument_path = config_path
@@ -1810,6 +1834,85 @@ export default {{
         tool_fail(f"unknown JavaScript body probe {probe_kind!r}")
     probe_path.write_text(source, encoding="utf-8")
     return argument_path, report_path
+
+
+def append_jest_project_setup(
+    run: TestRun,
+    label: str,
+    phase: str,
+    profile_path: Path,
+    deadline: float,
+) -> TestRun:
+    config_result = run_sandboxed(
+        [run.argv[0], "--showConfig", "--json"],
+        cwd=run.cwd,
+        profile_path=profile_path,
+        allow_network=False,
+        allow_posix_ipc=False,
+        env=proof_environment(),
+        timeout=evidence_command_timeout(
+            deadline, evidence_timeout(), f"{label} {phase} Jest configuration"
+        ),
+        description=f"{label} {phase} Jest configuration",
+    )
+    if config_result.returncode != 0:
+        non_execution(
+            label,
+            f"jest project configuration failed during the {phase} run before "
+            f"the selected test body could start: exit {config_result.returncode}: "
+            f"{(config_result.stderr or config_result.stdout).strip()[:500]}",
+        )
+    try:
+        report = json.loads(config_result.stdout)
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        non_execution(
+            label,
+            f"jest did not emit its effective project configuration during the "
+            f"{phase} run ({exc})",
+        )
+    configs = report.get("configs") if isinstance(report, dict) else None
+    if not isinstance(configs, list) or not configs:
+        non_execution(label, f"jest emitted no effective project configuration")
+    argv = list(run.argv)
+    try:
+        target_index = argv.index("--runTestsByPath") + 1
+        target = Path(argv[target_index]).resolve()
+    except (ValueError, IndexError):
+        tool_fail("Jest body probe invocation omitted its absolute test target")
+    matching: list[dict[str, Any]] = []
+    for config in configs:
+        if not isinstance(config, dict) or not isinstance(config.get("rootDir"), str):
+            non_execution(label, "jest emitted a malformed project configuration")
+        try:
+            target.relative_to(Path(config["rootDir"]).resolve())
+        except ValueError:
+            continue
+        matching.append(config)
+    if len(matching) != 1:
+        non_execution(
+            label,
+            f"jest resolved {len(matching)} project configurations for the named "
+            f"test during the {phase} run; probe injection is ambiguous",
+        )
+    configured_setup = matching[0].get("setupFilesAfterEnv")
+    if not isinstance(configured_setup, list) or any(
+        not isinstance(path, str) or not path for path in configured_setup
+    ):
+        non_execution(label, "jest emitted malformed setupFilesAfterEnv configuration")
+    try:
+        setup_index = argv.index("--setupFilesAfterEnv")
+    except ValueError:
+        tool_fail("Jest body probe invocation omitted --setupFilesAfterEnv")
+    if setup_index + 1 >= len(argv):
+        tool_fail("Jest body probe invocation omitted its probe path")
+    probe_path = argv[setup_index + 1]
+    setup_arguments = [
+        argument
+        for path in [*configured_setup, probe_path]
+        for argument in ("--setupFilesAfterEnv", path)
+    ]
+    argv[setup_index : setup_index + 2] = setup_arguments
+    return TestRun(tuple(argv), run.cwd, run.body_report)
 
 
 def read_javascript_body_report(
@@ -2231,6 +2334,14 @@ def execute_mutation_proof(
     # reviewer sees for a runner that is both absent and unclassified.
     baseline_run = test_arguments(invocation, test_path, proof_dir, label)
     require_classified_runner(invocation["runner"], label)
+    if invocation["runner"] == "jest":
+        baseline_run = append_jest_project_setup(
+            baseline_run,
+            label,
+            "baseline",
+            baseline_profile,
+            deadline,
+        )
     baseline = run_sandboxed(
         list(baseline_run.argv),
         cwd=baseline_run.cwd,
@@ -2293,6 +2404,14 @@ def execute_mutation_proof(
 
     mutated_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
     mutated_run = test_arguments(invocation, test_path, proof_dir, label)
+    if invocation["runner"] == "jest":
+        mutated_run = append_jest_project_setup(
+            mutated_run,
+            label,
+            "mutated",
+            mutated_profile,
+            deadline,
+        )
     mutated = run_sandboxed(
         list(mutated_run.argv),
         cwd=mutated_run.cwd,

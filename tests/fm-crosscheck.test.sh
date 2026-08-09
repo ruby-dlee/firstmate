@@ -288,6 +288,11 @@ duplicate_name_marker=$(dirname "$0")/$runner-duplicate-name
   echo "MEASURED $runner STARTUP FAILURE" >&2
   exit 1
 }
+if [ "$runner" = jest ] && [ "${1:-}" = --showConfig ]; then
+  [ "${2:-}" = --json ] || exit 90
+  printf '{"configs":[{"rootDir":"%s","setupFilesAfterEnv":[]}]}' "$PWD"
+  exit 0
+fi
 case "$runner" in
   jest)
     [ "${1:-}" = --json ] || exit 91
@@ -825,6 +830,7 @@ elif scenario in {
     "path-dependent",
     "jest-verified-fixed",
     "jest-real-verified-fixed",
+    "jest-real-config-failure",
     "jest-real-hook-failure",
     "jest-no-match",
     "jest-startup",
@@ -833,6 +839,7 @@ elif scenario in {
     "jest-duplicate-name",
     "vitest-verified-fixed",
     "vitest-real-verified-fixed",
+    "vitest-real-config-failure",
     "vitest-no-match",
     "vitest-startup",
     "vitest-missing-dependency",
@@ -847,6 +854,7 @@ elif scenario in {
         "path-dependent",
         "jest-verified-fixed",
         "jest-real-verified-fixed",
+        "jest-real-config-failure",
         "jest-real-hook-failure",
         "jest-no-match",
         "jest-startup",
@@ -855,6 +863,7 @@ elif scenario in {
         "jest-duplicate-name",
         "vitest-verified-fixed",
         "vitest-real-verified-fixed",
+        "vitest-real-config-failure",
         "vitest-no-match",
         "vitest-startup",
         "vitest-missing-dependency",
@@ -931,6 +940,7 @@ elif scenario in {
         "path-dependent": "tests/pathdep.test.sh",
         "missing-named-test": "tests/does-not-exist.test.js::across chats resets state",
         "jest-real-verified-fixed": "tests/chat-state.test.js::(within a chat stays stable|across chats resets state)",
+        "jest-real-config-failure": "tests/config-failure.test.js::selected body",
         "jest-real-hook-failure": "tests/hook-failure.test.js::selected body",
         "jest-verified-fixed": "tests/regression.test.sh::(within a chat stays stable|across chats resets state)",
         "jest-no-match": "tests/regression.test.sh::does not exist",
@@ -940,6 +950,7 @@ elif scenario in {
         "jest-duplicate-name": "tests/regression.test.sh::duplicate regression",
         "vitest-verified-fixed": "tests/regression.test.sh::(within a chat stays stable|across chats resets state)",
         "vitest-real-verified-fixed": "tests/chat-state.test.mjs::(within a chat stays stable|across chats resets state)",
+        "vitest-real-config-failure": "tests/config-failure.test.mjs::selected body",
         "vitest-no-match": "tests/regression.test.sh::does not exist",
         "vitest-startup": "tests/regression.test.sh::across chats resets state",
         "vitest-missing-dependency": "tests/regression.test.sh::across chats resets state",
@@ -3210,18 +3221,29 @@ JS
 const { createChatState } = require('../src/chat-state.js');
 
 test('within a chat stays stable', () => {
+  expect(globalThis.projectSetupLoaded).toBe(true);
   const state = createChatState();
   expect(state.next('chat-a')).toBe(1);
   expect(state.next('chat-a')).toBe(2);
 });
 
 test('across chats resets state', () => {
+  expect(globalThis.projectSetupLoaded).toBe(true);
   const state = createChatState();
   expect(state.next('chat-a')).toBe(1);
   expect(state.next('chat-b')).toBe(1);
 });
 JS
-  git -C "$case_dir/repo" add src/chat-state.js tests/chat-state.test.js
+  cat > "$case_dir/repo/tests/project-setup.cjs" <<'JS'
+globalThis.projectSetupLoaded = true;
+JS
+  cat > "$case_dir/repo/jest.config.cjs" <<'JS'
+module.exports = {
+  setupFilesAfterEnv: ['<rootDir>/tests/project-setup.cjs'],
+};
+JS
+  git -C "$case_dir/repo" add jest.config.cjs src/chat-state.js \
+    tests/chat-state.test.js tests/project-setup.cjs
   git -C "$case_dir/repo" commit -qm 'add JavaScript regression proof'
   head=$(git -C "$case_dir/repo" rev-parse HEAD)
   git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
@@ -3316,11 +3338,52 @@ value = json.load(open(sys.argv[1]))
 assert value["findings"][0]["lifecycle"] == "open"
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" \
     || fail "a real Jest beforeEach failure cleared the finding"
-  pass "real Jest certifies the platform mutation and refuses hook-only failures"
+
+  record=$(make_case jest-real-config-failure)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/tests/config-failure.test.js" <<'JS'
+test('selected body', () => {
+  expect(true).toBe(true);
+});
+JS
+  cat > "$case_dir/repo/tests/startup-guard.cjs" <<'JS'
+const { readFileSync } = require('node:fs');
+
+if (readFileSync('app.txt', 'utf8').trim() !== 'fixed') {
+  throw new Error('tracked Jest setup rejected mutated implementation');
+}
+JS
+  cat > "$case_dir/repo/jest.config.cjs" <<'JS'
+module.exports = {
+  setupFilesAfterEnv: ['<rootDir>/tests/startup-guard.cjs'],
+};
+JS
+  git -C "$case_dir/repo" add jest.config.cjs tests/config-failure.test.js \
+    tests/startup-guard.cjs
+  git -C "$case_dir/repo" commit -qm 'add tracked Jest startup guard'
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_open_ledger "$case_dir" "$head"
+  ln -s "$runtime/node_modules/.bin/jest" "$case_dir/pathbin/jest"
+  set +e
+  run_case "$case_dir" "$base" "$head" jest-real-config-failure run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "tracked Jest setup failure"
+  assert_grep 'NON-EXECUTION' "$case_dir/err" \
+    "a tracked Jest setup failure was bypassed by probe injection"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "a tracked Jest setup failure cleared the finding"
+  pass "real Jest preserves tracked setup and refuses startup failures"
 }
 
 test_real_vitest_body_probe_certifies_mutation() {
-  local record case_dir base head runtime ledger
+  local record case_dir base head runtime ledger rc
   record=$(make_case vitest-real-verified-fixed)
   IFS=$'\t' read -r case_dir base head <<< "$record"
   mkdir -p "$case_dir/repo/src"
@@ -3342,21 +3405,54 @@ export function createChatState() {
 JS
   cat > "$case_dir/repo/tests/chat-state.test.mjs" <<'JS'
 import { expect, test } from 'vitest';
-import { createChatState } from '../src/chat-state.mjs';
+import { createChatState } from '#chat-state';
+import { projectPluginLoaded } from 'virtual:project-config';
 
 test('within a chat stays stable', () => {
+  expect(globalThis.projectSetupLoaded).toBe(true);
+  expect(projectPluginLoaded).toBe(true);
   const state = createChatState();
   expect(state.next('chat-a')).toBe(1);
   expect(state.next('chat-a')).toBe(2);
 });
 
 test('across chats resets state', () => {
+  expect(globalThis.projectSetupLoaded).toBe(true);
   const state = createChatState();
   expect(state.next('chat-a')).toBe(1);
   expect(state.next('chat-b')).toBe(1);
 });
 JS
-  git -C "$case_dir/repo" add src/chat-state.mjs tests/chat-state.test.mjs
+  cat > "$case_dir/repo/tests/project-setup.mjs" <<'JS'
+globalThis.projectSetupLoaded = true;
+JS
+  cat > "$case_dir/repo/vitest.config.mjs" <<'JS'
+import { fileURLToPath } from 'node:url';
+
+export default {
+  plugins: [{
+    name: 'project-config-proof',
+    resolveId(id) {
+      return id === 'virtual:project-config' ? '\0project-config-proof' : null;
+    },
+    load(id) {
+      return id === '\0project-config-proof'
+        ? 'export const projectPluginLoaded = true;'
+        : null;
+    },
+  }],
+  resolve: {
+    alias: {
+      '#chat-state': fileURLToPath(new URL('./src/chat-state.mjs', import.meta.url)),
+    },
+  },
+  test: {
+    setupFiles: ['./tests/project-setup.mjs'],
+  },
+};
+JS
+  git -C "$case_dir/repo" add src/chat-state.mjs tests/chat-state.test.mjs \
+    tests/project-setup.mjs vitest.config.mjs
   git -C "$case_dir/repo" commit -qm 'add Vitest regression proof'
   head=$(git -C "$case_dir/repo" rev-parse HEAD)
   git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
@@ -3413,7 +3509,52 @@ assert mutated_status == {
     "across chats resets state": "failed",
 }
 PY
-  pass "real Vitest loads the gate body probe and certifies the mutation"
+
+  record=$(make_case vitest-real-config-failure)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/tests/config-failure.test.mjs" <<'JS'
+import { expect, test } from 'vitest';
+
+test('selected body', () => {
+  expect(true).toBe(true);
+});
+JS
+  cat > "$case_dir/repo/tests/startup-guard.mjs" <<'JS'
+import { readFileSync } from 'node:fs';
+
+if (readFileSync('app.txt', 'utf8').trim() !== 'fixed') {
+  throw new Error('tracked Vitest setup rejected mutated implementation');
+}
+JS
+  cat > "$case_dir/repo/vitest.config.mjs" <<'JS'
+export default {
+  test: {
+    setupFiles: ['./tests/startup-guard.mjs'],
+  },
+};
+JS
+  git -C "$case_dir/repo" add tests/config-failure.test.mjs \
+    tests/startup-guard.mjs vitest.config.mjs
+  git -C "$case_dir/repo" commit -qm 'add tracked Vitest startup guard'
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_open_ledger "$case_dir" "$head"
+  ln -s "$runtime/node_modules/.bin/vitest" "$case_dir/pathbin/vitest"
+  set +e
+  run_case "$case_dir" "$base" "$head" vitest-real-config-failure run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "tracked Vitest setup failure"
+  assert_grep 'NON-EXECUTION' "$case_dir/err" \
+    "a tracked Vitest setup failure was bypassed by probe injection"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "a tracked Vitest setup failure cleared the finding"
+  pass "real Vitest preserves tracked config and refuses startup failures"
 }
 
 test_duplicate_javascript_outcome_names_are_nonexecution() {
@@ -5090,6 +5231,9 @@ test_javascript_runner_policy_is_declared_once() {
   mkdir -p "$case_dir/mono/apps/web/tests" "$case_dir/bin"
   printf '{"private":true}\n' > "$case_dir/mono/apps/web/package.json"
   : > "$case_dir/mono/apps/web/tests/regression.test.tsx"
+  : > "$case_dir/mono/apps/web/tests/project-setup.js"
+  printf 'export default {test:{setupFiles:["./tests/project-setup.js"]}};\n' \
+    > "$case_dir/mono/apps/web/vitest.config.mjs"
   for runner in jest vitest; do
     printf '#!/bin/bash\nexit 0\n' > "$case_dir/bin/$runner"
     chmod +x "$case_dir/bin/$runner"
@@ -5098,7 +5242,10 @@ test_javascript_runner_policy_is_declared_once() {
   PATH="$case_dir/bin:$PATH" "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$case_dir" <<'PY' \
     || fail "JavaScript mutation-runner policy was not a complete declaration"
 import importlib.util
+import json
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
@@ -5138,8 +5285,37 @@ for runner in ("jest", "vitest"):
         runner_probe = run.cwd / ".crosscheck" / "vitest-body-probe.mjs"
         runner_source = runner_probe.read_text()
         assert str(runner_probe) in probe, probe
+        assert (run.cwd / "vitest.config.mjs").as_uri() in probe, probe
         assert "import { TestRunner } from 'vitest';" in runner_source, runner_source
         assert "VitestTestRunner" not in runner_source, runner_source
+    else:
+        configured_setup = str(run.cwd / "tests" / "project-setup.js")
+        module.run_sandboxed = lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0],
+            0,
+            json.dumps(
+                {
+                    "configs": [
+                        {
+                            "rootDir": str(run.cwd),
+                            "setupFilesAfterEnv": [configured_setup],
+                        }
+                    ]
+                }
+            ),
+            "",
+        )
+        prepared = module.append_jest_project_setup(
+            run,
+            "proof",
+            "baseline",
+            run.cwd / ".crosscheck" / "proof.sb",
+            time.monotonic() + 60,
+        )
+        setup_index = prepared.argv.index("--setupFilesAfterEnv")
+        assert prepared.argv[setup_index + 1] == configured_setup, prepared.argv
+        assert prepared.argv[setup_index + 2] == "--setupFilesAfterEnv", prepared.argv
+        assert prepared.argv[setup_index + 3] == str(probe_argument), prepared.argv
     assert run.argv[6:] == (
         "--testNamePattern", "(within a chat|across chats)"
     ), run.argv
@@ -5458,6 +5634,13 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-4 ]; then
   test_javascript_runner_policy_is_declared_once
   test_duplicate_javascript_outcome_names_are_nonexecution
+  test_real_vitest_body_probe_certifies_mutation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-5 ]; then
+  test_javascript_runner_policy_is_declared_once
+  test_real_jest_certifies_platform_shaped_mutation_proof
   test_real_vitest_body_probe_certifies_mutation
   exit 0
 fi

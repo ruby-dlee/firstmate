@@ -270,6 +270,8 @@ The named test must be a canonical tracked regular file, and symlinks are reject
 Symlink rejection is anchored at the resolved review checkout, so a symlink inside the repository is refused while a symlinked ancestor above the firstmate home is not mistaken for one.
 The gate resolves the named runner before launch and reports an absent binary, a failed sandbox exec, a missing named test, and every measured runner non-execution explicitly as `NON-EXECUTION`.
 For Jest and Vitest, the gate injects a runner-specific body probe and accepts a passed or failed assertion record only when the probe independently recorded entry into that exact selected test body.
+For Jest, a sandboxed `--showConfig` preflight resolves the selected project's effective `setupFilesAfterEnv`, and the gate appends its probe after every tracked setup entry instead of replacing them.
+For Vitest, the gate-owned config imports the discovered tracked `vitest.config.*` or `vite.config.*`, preserves its plugins, aliases, and test options, and overrides only the custom runner used for body evidence.
 A failed `beforeAll` or `beforeEach` hook can create a failed assertion record without entering the test function, so it remains `NON-EXECUTION` and clears nothing.
 Duplicate passed or failed full names are ambiguous and remain `NON-EXECUTION`, so one same-named body's marker can never satisfy another outcome.
 That distinction applies to baseline and mutation runs alike because a run that never entered the selected test body can neither condemn the baseline nor vindicate the mutation.
@@ -289,7 +291,8 @@ If a runner exposes no signal that distinguishes a failed assertion from failed 
 The JavaScript profile was measured on 2026-08-09 with Jest 29.7.0 and Vitest 4.1.5 using these exact command shapes.
 
 ```sh
-jest --json --runTestsByPath /proof/regression.test.js --setupFilesAfterEnv /gate/jest-body-probe.cjs --testNamePattern 'across chats resets state'
+jest --showConfig --json
+jest --json --runTestsByPath /proof/regression.test.js --setupFilesAfterEnv /proof/tests/project-setup.cjs --setupFilesAfterEnv /gate/jest-body-probe.cjs --testNamePattern 'across chats resets state'
 vitest run --reporter=json regression.test.js --config /gate/vitest-body-probe.config.mjs --testNamePattern 'across chats resets state'
 ```
 
@@ -299,8 +302,9 @@ An unmatched selector exited 0 on both runners, with Jest recording only `pendin
 A missing target exited 1 with zero assertions, using a Jest runtime-error suite and an empty Vitest `testResults` array.
 A missing imported dependency exited 1 with a failed suite and an empty `assertionResults` array on both runners, with Jest additionally reporting one runtime-error suite.
 A conventional `jest.config.cjs` or `vitest.config.js` that threw during loading exited 1 and emitted no JSON stdout on either runner.
+A tracked `setupFilesAfterEnv` or `setupFiles` entry that failed before the body remained active after probe injection and was classified as `NON-EXECUTION`.
 A failed `beforeAll` or `beforeEach` hook recorded a failed assertion without a matching body-start record and was classified as `NON-EXECUTION`.
-The gate-owned Vitest config fixes the proof root and selects a probe that extends the runtime `TestRunner` export, and its real-runner integration must load both generated modules successfully before Vitest remains eligible for certification.
+The gate-owned Vitest config merges the tracked project config and selects a probe that extends the runtime `TestRunner` export, and its real-runner integration must load both generated modules successfully before Vitest remains eligible for certification.
 Those observed shapes are what the shared `jest-compatible-json` report policy and runner-specific body probes encode; exit status and assertion status are deliberately insufficient on their own.
 
 To add a future runner, add one policy entry carrying its invocation ladder, gate-owned arguments, selector mode, project-root rule, report format, measured non-execution exits, and dated measurement string.
@@ -403,6 +407,7 @@ The retained live runtime proof is the change receipt for this patch; the opt-in
 Its `test_pytest_runner_resolves_through_a_uv_aware_ladder` case is the named regression for runner-name resolution: it pins monorepo uv-project discovery, the skipped uv rung outside a project, the unchanged absent-runner refusal, and pytest's retained node-id support.
 Its `test_javascript_runner_policy_is_declared_once` case pins the nearest-package working directory, exact gate-owned Jest and Vitest arguments, selector translation, neutral ancestor configs, and single policy registry.
 Its `test_javascript_runners_certify_platform_shaped_mutation_proofs` case executes end-to-end Jest and Vitest proofs where the control passes in both runs and the regression fails only after mutation.
+Its real Jest and Vitest integration cases retain tracked setup, aliases, and plugins while injecting body evidence, then require a tracked mutation-only startup failure to remain `NON-EXECUTION`.
 Its `test_javascript_non_executions_clear_nothing` case executes the measured unmatched-selector, startup-failure, missing-dependency, and missing-test shapes and requires every one to retain the open finding.
 Its `test_account_less_known_provider_lane_is_reviewable` case is the named regression for account-less lanes: it drives a Pi lane with no `account_home` and a slot-qualified model, requires a cross-provider reviewer to clear it, and requires a same-provider reviewer to be refused.
 Its `test_same_model_relaxation_requires_proven_separate_account` case provides a launch-recorded routed Pi identity and proves that default and explicit-off policy reject same-provider review, opt-in still rejects missing, same, or unreadable account proof, ambient credential drift cannot replace the snapshot, and only a recorded-distinct OpenAI account becomes eligible.

@@ -209,6 +209,43 @@ test_stale_paused_classifies_pause() {
   pass "paused reasons with captain phrases remain pause-classified"
 }
 
+test_held_live_monitor_reaches_away_wedge_escalation() {
+  local dir state fakebin out key win pane
+  dir=$(make_supercase held-live-away-wedge)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  make_fake_crew_state "$fakebin" >/dev/null
+  win="sess:fm-held-live-away-wedge"
+  pane="$dir/pane.txt"
+  fm_write_meta "$state/held-live-away-wedge.meta" "window=$win" "kind=ship"
+  printf 'paused: green PR deliberately held while CI monitors until merge\n' \
+    > "$state/held-live-away-wedge.status"
+  printf 'idle prompt $\n' > "$pane"
+  key=$(printf '%s' "held-live-away-wedge" | tr ':/.' '___')
+
+  out=$(FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · checks green: held PR still monitoring for merge/close' \
+    classify_stale "$win" "$state")
+  case "$out" in self\|*) ;; *) fail "held live monitor did not remain on stale classification: $out" ;; esac
+
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · checks green: held PR still monitoring for merge/close' \
+    handle_wake "signal: $state/held-live-away-wedge.status" "$state"
+  [ ! -e "$state/.subsuper-paused-$key" ] || fail "held live monitor signal created a pause marker"
+  [ -e "$state/.subsuper-stale-$key" ] || fail "held live monitor signal did not start wedge tracking"
+
+  echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
+  echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · checks green: held PR still monitoring for merge/close' \
+    FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
+  [ ! -e "$state/.subsuper-paused-$key" ] || fail "housekeeping retained long-cadence pause tracking for a held live monitor"
+  grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null \
+    || fail "held live monitor did not reach away-mode wedge escalation"
+  pass "away mode keeps a held live CI monitor on the wedge path"
+}
+
 # handle_wake on a paused stale records a pause marker, drops any pre-existing wedge
 # marker (so a working->paused pane is not still wedge-aged), and does NOT escalate
 # on the wake itself - the recheck is housekeeping's job on the long cadence.
@@ -1720,6 +1757,11 @@ if [ "${FM_TEST_FOCUSED:-}" = liveness-verdicts ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = held-live-monitor ]; then
+  test_held_live_monitor_reaches_away_wedge_escalation
+  exit 0
+fi
+
 test_afk_start_refuses_when_flag_cannot_be_written
 test_afk_start_ignores_stale_pidfile_without_lock
 test_afk_start_reclaims_stale_daemon_lock_reused_pid
@@ -1731,6 +1773,7 @@ test_liveness_verdicts_surface_through_away_classifiers
 test_stale_transient_self_records_marker
 test_stale_terminal_escalates
 test_stale_paused_classifies_pause
+test_held_live_monitor_reaches_away_wedge_escalation
 test_handle_wake_paused_records_pause_marker
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking

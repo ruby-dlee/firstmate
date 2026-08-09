@@ -25,6 +25,8 @@ if [ "$FM_WAKE_TEST_ROOT_CREATED" = 1 ]; then
   mkdir -p "$FM_ROOT_OVERRIDE/bin"
   cat > "$FM_ROOT_OVERRIDE/bin/fm-auto-reap.sh" <<'SH'
 #!/usr/bin/env bash
+[ -z "${FM_TEST_AUTO_REAP_SLEEP:-}" ] || sleep "$FM_TEST_AUTO_REAP_SLEEP"
+[ -z "${FM_TEST_AUTO_REAP_OUTPUT:-}" ] || printf '%s\n' "$FM_TEST_AUTO_REAP_OUTPUT"
 exit 0
 SH
   chmod +x "$FM_ROOT_OVERRIDE/bin/fm-auto-reap.sh"

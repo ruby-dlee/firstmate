@@ -33,7 +33,7 @@ A live holder also blocks when its beacon age reaches the tighter `FM_WATCH_PROG
 
 `FM_STATE_OVERRIDE` wins over `FM_HOME/state`, and `FM_HOME` wins over repo-root `state/`.
 `FM_GUARD_GRACE` controls the broad wake-and-rearm handoff window and defaults to 300 seconds.
-`FM_WATCH_PROGRESS_GRACE` controls progress while a live watcher lock is held and defaults to 60 seconds.
+`FM_WATCH_PROGRESS_GRACE` controls progress while a live watcher lock is held and defaults to 60 seconds; an identity-bound bounded phase remains current only until its published deadline.
 If `jq` is missing or hook stdin is empty, the guard fails open and exits 0 because it cannot safely read loop-guard fields.
 
 ## Harness Integrations

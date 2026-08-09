@@ -218,14 +218,16 @@ fm_run_bounded() {
       }
       if ($controller_gone) {
         kill "TERM", -$$;
+        my $command_reaped = 0;
         for (1 .. 10) {
           select undef, undef, undef, 0.1;
-          $waited = waitpid $command, WNOHANG;
-          exit 0 if $waited == $command;
+          if (!$command_reaped) {
+            $waited = waitpid $command, WNOHANG;
+            $command_reaped = 1 if $waited == $command;
+          }
+          my $members = anchored_members($$, $$);
+          exit 0 if $command_reaped && defined $members && !@$members;
         }
-        # The anchor ignores TERM so it can clean its group. KILL the complete
-        # anchored group only after the graceful bound; this also removes the
-        # anchor itself when a descendant refuses to stop.
         kill "KILL", -$$;
         exit 137;
       }
@@ -240,7 +242,18 @@ fm_run_bounded() {
         # after this anchor had already reaped the wrapped command. Waiting for
         # a byte that can never arrive formerly left an unkillable-by-TERM Perl
         # anchor under pid 1 for every interrupted operation.
-        exit 0 if defined $finish_count && $finish_count == 0;
+        if (defined $finish_count && $finish_count == 0) {
+          my $members = anchored_members($$, $$);
+          exit 0 if defined $members && !@$members;
+          kill "TERM", -$$;
+          for (1 .. 10) {
+            select undef, undef, undef, 0.1;
+            $members = anchored_members($$, $$);
+            exit 0 if defined $members && !@$members;
+          }
+          kill "KILL", -$$;
+          exit 137;
+        }
         next if !defined $finish_count && $! == EINTR;
         exit $setup_failure if !defined $finish_count;
       }

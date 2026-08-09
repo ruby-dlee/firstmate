@@ -1143,6 +1143,65 @@ SH
   pass "arm detects sustained watcher-tree CPU and reaps the owned cycle loudly"
 }
 
+test_arm_allows_bounded_watcher_phases_past_base_cadence() {
+  local dir state fakebin out armpid status i
+  dir=$(make_case arm-bounded-auto-reap)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  touch "$state/.last-account-session-sync" "$state/.last-report-retention"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_TEST_AUTO_REAP_SLEEP=4 \
+    FM_TEST_AUTO_REAP_OUTPUT='bounded auto-reap complete' FM_WATCH_PROGRESS_GRACE=2 \
+    FM_WATCH_AUTO_REAP_TIMEOUT=10 FM_WATCH_PHASE_MARGIN=1 FM_POLL=1 \
+    FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$out" || fail "arm did not confirm watcher during bounded auto-reap: $(cat "$out")"
+  sleep 2.5
+  is_live_non_zombie "$armpid" || fail "base cadence killed a watcher inside bounded auto-reap: $(cat "$out")"
+  grep -qF 'phase=auto-reap' "$state/.watch.phase" \
+    || fail "watcher did not publish its bounded auto-reap phase"
+  wait_for_exit "$armpid" 100
+  status=$?
+  [ "$status" -ne 124 ] || fail "bounded auto-reap wake did not finish"
+  wait "$armpid" 2>/dev/null || true
+  [ "$status" -eq 0 ] || fail "bounded auto-reap wake failed: $(cat "$out")"
+  grep -qF 'auto-reap: bounded auto-reap complete' "$out" \
+    || fail "bounded auto-reap wake did not propagate: $(cat "$out")"
+  [ ! -e "$state/.watch.phase" ] || fail "watcher left its bounded phase record after wake exit"
+
+  dir=$(make_case arm-bounded-poll)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  touch "$state/.last-account-session-sync" "$state/.last-report-retention" "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_WATCH_PROGRESS_GRACE=2 FM_WATCH_PHASE_MARGIN=1 \
+    FM_POLL=4 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$out" || fail "arm did not confirm watcher before configured poll"
+  sleep 2.5
+  is_live_non_zombie "$armpid" || fail "base cadence killed a watcher inside configured FM_POLL: $(cat "$out")"
+  grep -qF 'phase=event-wait' "$state/.watch.phase" \
+    || fail "watcher did not publish its bounded event-wait phase"
+  kill -TERM "$armpid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  [ ! -e "$state/.watch.phase" ] || fail "watcher left its bounded event-wait phase after interruption"
+  pass "arm honors bounded auto-reap and FM_POLL phases beyond the base cadence"
+}
+
 test_pid_identity_is_locale_invariant() {
   # The watcher records its process identity under one locale; arm/guard/turn-end
   # re-read it under the machine's ambient locale. ps's lstart date format follows
@@ -1181,6 +1240,11 @@ if [ "${FM_TEST_FOCUSED:-}" = restart-term-resistant ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = phase-bounds ]; then
+  test_arm_allows_bounded_watcher_phases_past_base_cadence
+  exit 0
+fi
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_stale_watch_lock_reclaimed
@@ -1211,3 +1275,4 @@ test_arm_propagates_immediate_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
 test_arm_fails_loud_when_no_fresh_watcher_confirmable
 test_arm_detects_and_reaps_sustained_watcher_cpu
+test_arm_allows_bounded_watcher_phases_past_base_cadence

@@ -87,7 +87,9 @@ watcher_progress_stale=false
 if fm_watcher_lock_matches_pid "$STATE" "$SCRIPT_DIR/fm-watch.sh" "$watcher_pid" "$FM_HOME"; then
   watcher_lock_live=true
   watcher_age=$(fm_path_age "$STATE/.last-watcher-beat")
-  [ "$watcher_age" -ge "$PROGRESS_GRACE" ] && watcher_progress_stale=true
+  if ! fm_watcher_progress_current "$STATE" "$watcher_pid" "$PROGRESS_GRACE"; then
+    watcher_progress_stale=true
+  fi
 fi
 if "$watcher_lock_live" \
   && fm_watcher_tree_usage "$watcher_pid" \

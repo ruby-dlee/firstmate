@@ -109,6 +109,56 @@ test_controller_death_reaps_running_group() {
   pass "controller EOF terminates and reaps a still-running TERM-resistant group"
 }
 
+test_controller_death_reaps_residual_grandchild() {
+  local shell_pid controller anchor command_pid grandchild_file grandchild_pid guard i remaining
+  grandchild_file="$TMP_ROOT/residual-grandchild.pid"
+  guard="$TMP_ROOT/residual-grandchild.guard"
+  FM_PROCESS_TREE_GUARD_FILE="$guard" bash -c '. "$1"; fm_run_bounded 30 perl -e '\''
+    my $path = shift;
+    my $child = fork;
+    die "fork failed" unless defined $child;
+    if (!$child) { $SIG{TERM} = "IGNORE"; sleep 300; exit 0 }
+    open my $file, ">", $path or die "pid file failed";
+    print {$file} "$child\n";
+    close $file;
+    $SIG{TERM} = sub { exit 0 };
+    sleep 300;
+  '\'' "$2"' _ "$LIB" "$grandchild_file" >/dev/null 2>&1 &
+  shell_pid=$!
+  TEST_OWNED_PIDS="$shell_pid"
+  i=0
+  while [ "$i" -lt 100 ]; do
+    anchor=$(cat "$guard" 2>/dev/null || true)
+    controller=$(ps -p "${anchor:-0}" -o ppid= 2>/dev/null | tr -d '[:space:]')
+    command_pid=$(direct_children "${anchor:-0}" | head -1)
+    [ -n "$controller" ] && [ -n "$command_pid" ] && [ -s "$grandchild_file" ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  [ -n "${command_pid:-}" ] && [ -s "$grandchild_file" ] \
+    || fail "residual-grandchild bounded tree did not start"
+  grandchild_pid=$(cat "$grandchild_file")
+  TEST_OWNED_PIDS="$shell_pid $controller $anchor $command_pid $grandchild_pid"
+  kill -KILL "$controller" 2>/dev/null || fail "could not stop residual-grandchild controller"
+  wait "$shell_pid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 100 ]; do
+    remaining=
+    for command_pid in "$anchor" "$grandchild_pid"; do
+      process_is_live_non_zombie "$command_pid" && remaining="$remaining $command_pid"
+    done
+    [ -z "$remaining" ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  if [ -n "$remaining" ]; then
+    for command_pid in $remaining; do kill -KILL "$command_pid" 2>/dev/null || true; done
+    fail "controller death left residual same-group pid(s) alive:$remaining"
+  fi
+  TEST_OWNED_PIDS=
+  pass "controller EOF kills a TERM-resistant grandchild after its direct parent exits"
+}
+
 if [ "${FM_TEST_FOCUSED:-}" = running ]; then
   test_controller_death_reaps_running_group
   exit 0
@@ -116,3 +166,4 @@ fi
 
 test_controller_death_reaps_finished_anchor
 test_controller_death_reaps_running_group
+test_controller_death_reaps_residual_grandchild

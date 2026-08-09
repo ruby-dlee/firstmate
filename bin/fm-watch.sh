@@ -126,10 +126,14 @@ ACCOUNT_SESSION_SYNC_TIMEOUT=${FM_ACCOUNT_SESSION_SYNC_TIMEOUT:-5}
 ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT=${FM_ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT:-$((ACCOUNT_SESSION_SYNC_TIMEOUT + 3))}
 REPORT_RETENTION_INTERVAL=${FM_REPORT_RETENTION_INTERVAL:-86400}
 REPORT_RETENTION_TIMEOUT=${FM_REPORT_RETENTION_TIMEOUT:-30}
+AUTO_REAP_TIMEOUT=${FM_WATCH_AUTO_REAP_TIMEOUT:-600}
+PHASE_MARGIN=${FM_WATCH_PHASE_MARGIN:-5}
 REPORT_RETENTION_OWNER_FRESH_SECS=${FM_REPORT_RETENTION_OWNER_FRESH_SECS:-660}
 case "$REPORT_RETENTION_OWNER_FRESH_SECS" in
   ''|*[!0-9]*) REPORT_RETENTION_OWNER_FRESH_SECS=660 ;;
 esac
+case "$AUTO_REAP_TIMEOUT" in ''|*[!0-9]*|0) AUTO_REAP_TIMEOUT=600 ;; esac
+case "$PHASE_MARGIN" in ''|*[!0-9]*) PHASE_MARGIN=5 ;; esac
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -697,7 +701,12 @@ run_check() {
 }
 
 run_auto_reap() {
-  "$FM_ROOT/bin/fm-auto-reap.sh" "$@" 2>&1
+  local status=0
+  run_bounded "$AUTO_REAP_TIMEOUT" "$FM_ROOT/bin/fm-auto-reap.sh" "$@" 2>&1 || status=$?
+  if [ "$status" -eq 124 ]; then
+    printf 'auto-reap exceeded its %ss watcher phase bound\n' "$AUTO_REAP_TIMEOUT"
+  fi
+  return "$status"
 }
 
 safe_touch_marker() {  # <path>
@@ -724,6 +733,47 @@ watcher_beat() {  # <phase>
   if [ -n "$trace" ] && safe_marker_path "$trace"; then
     printf '%s\t%s\n' "$(date +%s)" "$phase" >> "$trace" 2>/dev/null || true
   fi
+}
+
+watcher_phase_bound() {  # <seconds>
+  awk -v seconds="$1" -v margin="$PHASE_MARGIN" 'BEGIN {
+    if (seconds !~ /^[0-9]+([.][0-9]+)?$/ || seconds <= 0) exit 1
+    value = int(seconds)
+    if (value < seconds) value++
+    print value + margin
+  }'
+}
+
+watcher_phase_begin() {  # <phase> <seconds>
+  local phase=$1 seconds=$2 bound deadline identity tmp phase_file="$STATE/.watch.phase"
+  bound=$(watcher_phase_bound "$seconds") || return 1
+  identity=$(fm_pid_identity "$WATCHER_PID") || return 1
+  deadline=$(( $(date +%s) + bound ))
+  tmp=$(mktemp "$STATE/.watch-phase.XXXXXX") || return 1
+  {
+    printf 'pid=%s\n' "$WATCHER_PID"
+    printf 'phase=%s\n' "$phase"
+    printf 'deadline=%s\n' "$deadline"
+    printf 'pid-identity=%s\n' "$identity"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  safe_marker_path "$phase_file" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$phase_file"
+}
+
+watcher_phase_end() {
+  local phase_file="$STATE/.watch.phase"
+  [ "$(sed -n 's/^pid=//p' "$phase_file" 2>/dev/null || true)" = "${WATCHER_PID:-}" ] || return 0
+  watcher_beat phase-complete
+  rm -f "$phase_file"
+}
+
+watcher_run_phase() {  # <phase> <seconds> <command> [args...]
+  local phase=$1 seconds=$2 status=0
+  shift 2
+  watcher_phase_begin "$phase" "$seconds" || return 1
+  "$@" || status=$?
+  watcher_phase_end
+  return "$status"
 }
 
 task_generation_id() {  # <task>
@@ -1016,7 +1066,7 @@ if ! fm_lock_try_acquire "$WATCH_LOCK"; then
   fi
   exit 0
 fi
-trap 'fm_lock_release "$WATCH_LOCK"' EXIT
+trap 'watcher_phase_end; fm_lock_release "$WATCH_LOCK"' EXIT
 # This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
 # ${BASHPID:-$$} from this same main shell). Read directly, never via a command
 # substitution, so it matches the stored holder pid for the self-eviction check.
@@ -1045,14 +1095,14 @@ while :; do
   # stale with tasks in flight.
   watcher_beat loop-start
 
-  prune_reports_if_due
+  watcher_run_phase report-retention "$REPORT_RETENTION_TIMEOUT" prune_reports_if_due
   watcher_beat report-retention-complete
 
   # A managed provider's SessionStart hook may race the initial spawn return.
   # Reconcile only metas still missing provider_session_id; failures stay
   # silent and retry here, while recovery itself requires the mapping and
   # fails closed.
-  sync_account_sessions_if_due
+  watcher_run_phase account-session-sync "$ACCOUNT_SESSION_SYNC_TOTAL_TIMEOUT" sync_account_sessions_if_due
   watcher_beat account-session-sync-complete
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).
@@ -1063,7 +1113,7 @@ while :; do
   # never run until the fleet went quiet. Checks are due only every
   # CHECK_INTERVAL, so most cycles skip this block and fall straight through.
   if marker_due "$STATE/.last-check" "$CHECK_INTERVAL" "watcher check"; then
-    auto_reap_out=$(run_auto_reap maintenance || true)
+    auto_reap_out=$(watcher_run_phase auto-reap "$AUTO_REAP_TIMEOUT" run_auto_reap maintenance || true)
     if [ -n "$auto_reap_out" ]; then
       reason="auto-reap: $auto_reap_out"
       fm_wake_append check auto-reap "$reason" || exit 1
@@ -1073,13 +1123,13 @@ while :; do
     for c in "$STATE"/*.check.sh; do
       [ -e "$c" ] || continue
       watcher_beat task-check-start
-      out=$(run_check "$c")
+      out=$(watcher_run_phase task-check "$CHECK_TIMEOUT" run_check "$c")
       watcher_beat task-check-complete
       if [ -n "$out" ]; then
         task=${c##*/}
         task=${task%.check.sh}
         if [ "$(printf '%s\n' "$out" | tail -1)" = merged ] && [ -f "$STATE/$task.meta" ]; then
-          auto_reap_out=$(run_auto_reap task "$task" pr-merged || true)
+          auto_reap_out=$(watcher_run_phase auto-reap "$AUTO_REAP_TIMEOUT" run_auto_reap task "$task" pr-merged || true)
           reason="check: $c: $out; $auto_reap_out"
         else
           reason="check: $c: $out"
@@ -1100,7 +1150,7 @@ while :; do
   pending=$(scan_signals)
   if [ -n "$pending" ]; then
     watcher_beat signal-grace-start
-    sleep "$SIGNAL_GRACE"
+    watcher_run_phase signal-grace "$SIGNAL_GRACE" sleep "$SIGNAL_GRACE"
     watcher_beat signal-grace-complete
     pending=$(printf '%s\n%s' "$pending" "$(scan_signals)")
     files=""
@@ -1121,7 +1171,7 @@ EOF
           if [ -f "$STATE/$task.meta" ] \
             && [ "$(fm_meta_get "$STATE/$task.meta" kind)" = scout ] \
             && [ "$(status_line_verb "$(last_status_line "$f")")" = "done" ]; then
-            auto_reap_out=$(run_auto_reap task "$task" scout-done || true)
+            auto_reap_out=$(watcher_run_phase auto-reap "$AUTO_REAP_TIMEOUT" run_auto_reap task "$task" scout-done || true)
             reason="signal: $f; $auto_reap_out"
             fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
             wake "$reason"
@@ -1420,5 +1470,11 @@ EOF
   # Terminal wait: a bounded native-event wait for push-capable homes (herdr),
   # else the blind poll sleep. See event_wait_or_sleep.
   watcher_beat event-wait-start
-  event_wait_or_sleep
+  event_wait_bound=$(awk -v poll="$POLL" 'BEGIN {
+    if (poll !~ /^[0-9]+([.][0-9]+)?$/ || poll <= 0) exit 1
+    value = int(poll * 2)
+    if (value < poll * 2) value++
+    print value
+  }') || event_wait_bound=1
+  watcher_run_phase event-wait "$event_wait_bound" event_wait_or_sleep
 done

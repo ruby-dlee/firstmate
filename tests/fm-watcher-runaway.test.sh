@@ -117,7 +117,7 @@ tree_cpu() {  # <root-pid>
 }
 
 {
-  awk 'BEGIN { payload = ""; for (i = 0; i < 3200; i++) payload = payload "x"; for (line = 0; line < 390; line++) printf "needs-decision [key=k%03d]: %s\\n", line, payload; for (line = 0; line < 390; line++) printf "resolved [key=k%03d]: cleared\\n", line }'
+  awk 'BEGIN { payload = ""; for (i = 0; i < 3200; i++) payload = payload "x"; for (line = 0; line < 390; line++) printf "needs-decision [key=k%03d]: %s\n", line, payload; for (line = 0; line < 390; line++) printf "resolved [key=k%03d]: cleared\n", line }'
   printf 'paused: waiting on a bounded external event\n'
 } > "$STATUS"
 fm_write_meta "$STATE/long-lived.meta" \
@@ -162,6 +162,7 @@ max_members=0
 beat_changes=0
 max_beat_age=0
 last_beat=
+hot_samples=0
 while [ "$elapsed" -lt "$DURATION" ]; do
   is_live_non_zombie "$ARM_PID" || {
     cleanup_owned_tree "$ROOT_PID"
@@ -186,6 +187,14 @@ EOF
     max_cpu=$(awk -v left="$max_cpu" -v right="$cpu" 'BEGIN { print (left > right ? left : right) }')
     cpu_sum=$(awk -v total="$cpu_sum" -v sample="$cpu" 'BEGIN { printf "%.3f", total + sample }')
     cpu_samples=$((cpu_samples + 1))
+    if awk -v actual="$cpu" -v ceiling="$CPU_CEILING" 'BEGIN { exit !(actual >= ceiling) }'; then
+      hot_samples=$((hot_samples + 1))
+      if [ "$hot_samples" -ge 2 ]; then
+        fail "watcher tree sustained ${cpu}% CPU for $hot_samples consecutive ${SAMPLE_INTERVAL}s samples (ceiling ${CPU_CEILING}%)"
+      fi
+    else
+      hot_samples=0
+    fi
   fi
   [ "$members" -le "$max_members" ] || max_members=$members
   sleep_for=$SAMPLE_INTERVAL

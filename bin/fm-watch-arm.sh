@@ -297,7 +297,7 @@ if [ "$mode" = arm ]; then
   if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$recorded_pid" "$FM_HOME" \
     && [ -e "$BEAT" ]; then
     recorded_age=$(fm_path_age "$BEAT")
-    if [ "$recorded_age" -ge "$PROGRESS_GRACE" ]; then
+    if ! fm_watcher_progress_current "$STATE" "$recorded_pid" "$PROGRESS_GRACE"; then
       echo "watcher: FAILED - live watcher pid=$recorded_pid missed progress cadence (beacon ${recorded_age}s, limit ${PROGRESS_GRACE}s); run bin/fm-watch-arm.sh --restart"
       exit 1
     fi
@@ -333,7 +333,7 @@ monitor_started_child() {  # <confirmed-watcher-pid>
   while fm_pid_alive "$watched" \
     && fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$watched" "$FM_HOME"; do
     age=$(fm_path_age "$BEAT")
-    if [ "$age" -ge "$PROGRESS_GRACE" ]; then
+    if ! fm_watcher_progress_current "$STATE" "$watched" "$PROGRESS_GRACE"; then
       reason="stale: watcher pid $watched stopped making supervision progress; beacon age ${age}s reached cadence limit ${PROGRESS_GRACE}s"
       queue_watcher_failure "$reason"
       echo "watcher: FAILED - $reason; recovering the owned watcher tree"

@@ -144,7 +144,7 @@ test_large_status_decision_fold_is_linear() {
   runner="$dir/run.sh"
   {
     printf 'needs-decision [key=alpha]: old choice\n'
-    awk 'BEGIN { payload = ""; for (i = 0; i < 1600; i++) payload = payload "x"; for (line = 0; line < 780; line++) printf "working: %04d %s\\n", line, payload }'
+    awk 'BEGIN { payload = ""; for (i = 0; i < 1600; i++) payload = payload "x"; for (line = 0; line < 780; line++) printf "working: %04d %s\n", line, payload }'
     printf 'blocked [key=beta]: waiting\n'
     printf 'resolved [key=alpha]: answered\n'
     printf 'needs-decision [key=alpha]: final choice\n'
@@ -1970,6 +1970,11 @@ if [ "${FM_TEST_FOCUSED:-}" = liveness-verdicts ]; then
   test_crew_absorb_class_classifier
   test_signal_crew_provably_working_classifier
   test_heartbeat_surfaces_dead_and_unknown_liveness
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = large-status-fold ]; then
+  test_large_status_decision_fold_is_linear
   exit 0
 fi
 

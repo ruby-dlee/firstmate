@@ -125,7 +125,7 @@ WATCHER_RESOURCE_HOT=0
 WATCHER_PROGRESS_STALE=0
 if fm_watcher_healthy "$STATE" "$WATCH" "$GRACE" "$FM_HOME"; then
   WATCHER_AGE=$(fm_path_age "$STATE/.last-watcher-beat")
-  if [ "$WATCHER_AGE" -ge "$PROGRESS_GRACE" ]; then
+  if ! fm_watcher_progress_current "$STATE" "$FM_WATCHER_HEALTHY_PID" "$PROGRESS_GRACE"; then
     WATCHER_PROGRESS_STALE=1
   elif fm_watcher_tree_usage "$FM_WATCHER_HEALTHY_PID" \
     && awk -v actual="$FM_WATCHER_TREE_CPU" -v limit="$CPU_LIMIT" 'BEGIN { exit !(actual >= limit) }'; then

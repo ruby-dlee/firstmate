@@ -73,16 +73,52 @@ fm_watcher_lock_matches_pid() {
 }
 
 FM_WATCHER_HEALTHY_PID=
+FM_WATCHER_ACTIVE_PHASE=
+FM_WATCHER_ACTIVE_PHASE_REMAINING=
+fm_watcher_phase_active() {  # <state> <watcher-pid>
+  local state=$1 pid=$2 phase_file snapshot phase_pid phase_name phase_deadline phase_identity current_identity now
+  FM_WATCHER_ACTIVE_PHASE=
+  FM_WATCHER_ACTIVE_PHASE_REMAINING=
+  phase_file="$state/.watch.phase"
+  [ -f "$phase_file" ] && [ ! -L "$phase_file" ] || return 1
+  snapshot=$(cat "$phase_file" 2>/dev/null) || return 1
+  [ "$(printf '%s\n' "$snapshot" | grep -c '^pid=' || true)" = 1 ] || return 1
+  [ "$(printf '%s\n' "$snapshot" | grep -c '^phase=' || true)" = 1 ] || return 1
+  [ "$(printf '%s\n' "$snapshot" | grep -c '^deadline=' || true)" = 1 ] || return 1
+  [ "$(printf '%s\n' "$snapshot" | grep -c '^pid-identity=' || true)" = 1 ] || return 1
+  phase_pid=$(printf '%s\n' "$snapshot" | sed -n 's/^pid=//p')
+  phase_name=$(printf '%s\n' "$snapshot" | sed -n 's/^phase=//p')
+  phase_deadline=$(printf '%s\n' "$snapshot" | sed -n 's/^deadline=//p')
+  phase_identity=$(printf '%s\n' "$snapshot" | sed -n 's/^pid-identity=//p')
+  [ "$phase_pid" = "$pid" ] || return 1
+  case "$phase_name" in ''|*[!a-z0-9-]*) return 1 ;; esac
+  case "$phase_deadline" in ''|*[!0-9]*) return 1 ;; esac
+  current_identity=$(fm_pid_identity "$pid") || return 1
+  [ "$phase_identity" = "$current_identity" ] || return 1
+  now=$(date +%s)
+  [ "$phase_deadline" -ge "$now" ] || return 1
+  FM_WATCHER_ACTIVE_PHASE=$phase_name
+  FM_WATCHER_ACTIVE_PHASE_REMAINING=$((phase_deadline - now))
+  return 0
+}
+
+fm_watcher_progress_current() {  # <state> <watcher-pid> <grace>
+  local state=$1 pid=$2 grace=$3 age
+  age=$(fm_path_age "$state/.last-watcher-beat")
+  [ "$age" -lt "$grace" ] && return 0
+  fm_watcher_phase_active "$state" "$pid" && return 0
+  age=$(fm_path_age "$state/.last-watcher-beat")
+  [ "$age" -lt "$grace" ]
+}
+
 fm_watcher_healthy() {
-  local state=$1 watch_path=$2 grace=${3:-${FM_GUARD_GRACE:-300}} home=${4:-$FM_HOME} lockdir beat pid age
+  local state=$1 watch_path=$2 grace=${3:-${FM_GUARD_GRACE:-300}} home=${4:-$FM_HOME} lockdir pid
   FM_WATCHER_HEALTHY_PID=
   lockdir="$state/.watch.lock"
-  beat="$state/.last-watcher-beat"
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
   fm_pid_alive "$pid" || return 1
   fm_watcher_lock_matches_pid "$state" "$watch_path" "$pid" "$home" || return 1
-  age=$(fm_path_age "$beat")
-  [ "$age" -lt "$grace" ] || return 1
+  fm_watcher_progress_current "$state" "$pid" "$grace" || return 1
   # shellcheck disable=SC2034 # Read by callers after fm_watcher_healthy returns.
   FM_WATCHER_HEALTHY_PID=$pid
   return 0

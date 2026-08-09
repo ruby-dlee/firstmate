@@ -54,40 +54,125 @@ MAX_PROJECTED_FINDINGS = 512
 MAX_PROJECTED_EVENTS = 8
 MAX_REVIEW_ITEMS = 32
 MAX_EVIDENCE_ITEMS = 32
-TEST_RUNNERS = {
+
+
+class MutationRunnerPolicy:
+    """One measured declaration for a runner allowed to certify a fix."""
+
+    __slots__ = (
+        "invocations",
+        "gate_arguments",
+        "selector_mode",
+        "node_project_cwd",
+        "report_format",
+        "runtime_error_field",
+        "non_execution_exits",
+        "measurement",
+    )
+
+    def __init__(
+        self,
+        *,
+        invocations: tuple[tuple[str, ...], ...],
+        gate_arguments: tuple[str, ...],
+        selector_mode: str,
+        node_project_cwd: bool,
+        report_format: str | None,
+        runtime_error_field: str,
+        non_execution_exits: tuple[tuple[int, str], ...],
+        measurement: str,
+    ) -> None:
+        self.invocations = invocations
+        self.gate_arguments = gate_arguments
+        self.selector_mode = selector_mode
+        self.node_project_cwd = node_project_cwd
+        self.report_format = report_format
+        self.runtime_error_field = runtime_error_field
+        self.non_execution_exits = non_execution_exits
+        self.measurement = measurement
+
+
+class TestRun:
+    """Resolved proof command and the project directory it must run from."""
+
+    __slots__ = ("argv", "cwd")
+
+    def __init__(self, argv: tuple[str, ...], cwd: Path) -> None:
+        self.argv = argv
+        self.cwd = cwd
+
+
+# This registry is the sole declaration point for mutation-proof runners.
+# Adding one requires the measurement procedure in docs/crosscheck.md; an
+# ordinary approved test runner remains unable to certify until it appears
+# here. Gate-owned arguments are part of the measured invocation and reviewer
+# arguments remain forbidden.
+MUTATION_RUNNER_POLICIES = {
+    "pytest": MutationRunnerPolicy(
+        # Order is load-bearing: uv comes first because a bare pytest inside a
+        # uv project can resolve against a different environment. The module
+        # invocation follows, with the bare binary as the final fallback.
+        invocations=(
+            ("uv", "run", "pytest"),
+            ("python3", "-m", "pytest"),
+            ("pytest",),
+        ),
+        gate_arguments=(),
+        selector_mode="native",
+        node_project_cwd=False,
+        report_format=None,
+        runtime_error_field="not-applicable",
+        non_execution_exits=(
+            (2, "collection was interrupted"),
+            (3, "the runner hit an internal error"),
+            (4, "the runner rejected its command line"),
+            (5, "no test matched the named selector"),
+        ),
+        measurement="pytest 9.1.1 on 2026-08-05",
+    ),
+    "jest": MutationRunnerPolicy(
+        invocations=(("jest",),),
+        gate_arguments=("--json", "--runTestsByPath"),
+        selector_mode="test-name-pattern",
+        node_project_cwd=True,
+        report_format="jest-compatible-json",
+        runtime_error_field="required-zero",
+        non_execution_exits=(),
+        measurement="Jest 29.7.0 on 2026-08-09",
+    ),
+    "vitest": MutationRunnerPolicy(
+        invocations=(("vitest",),),
+        gate_arguments=("run", "--reporter=json"),
+        selector_mode="test-name-pattern",
+        node_project_cwd=True,
+        report_format="jest-compatible-json",
+        runtime_error_field="absent",
+        non_execution_exits=(),
+        measurement="Vitest 4.1.5 on 2026-08-09",
+    ),
+}
+GENERAL_TEST_RUNNERS = {
     "bash",
     "bun",
     "direct",
-    "jest",
     "node",
     "php",
-    "pytest",
     "python",
     "python3",
     "rspec",
     "ruby",
     "sh",
-    "vitest",
     "zsh",
 }
-FILE_TEST_RUNNERS = TEST_RUNNERS - {"direct", "jest", "pytest", "rspec", "vitest"}
-# Runners whose command line accepts a `path::selector` node id. Every other
-# approved runner is handed a plain file, so a selector there is a reviewer
-# mistake the gate must name rather than silently drop.
-NODE_ID_RUNNERS = {"pytest"}
-# How an approved runner NAME becomes an argv prefix, when the name alone does
-# not identify a working invocation. Order is load-bearing: uv comes first
-# because inside a uv project a bare `pytest` can exist on PATH and resolve
-# against a different environment than the repository uses, so finding it first
-# would run the named test under an interpreter the project never selected.
-# `python3 -m pytest` follows because it reaches a pytest installed into the
-# interpreter itself, and the bare binary is the last resort.
-RUNNER_INVOCATIONS: dict[str, tuple[tuple[str, ...], ...]] = {
-    "pytest": (
-        ("uv", "run", "pytest"),
-        ("python3", "-m", "pytest"),
-        ("pytest",),
-    ),
+TEST_RUNNERS = GENERAL_TEST_RUNNERS | set(MUTATION_RUNNER_POLICIES)
+FILE_TEST_RUNNERS = GENERAL_TEST_RUNNERS - {"direct", "rspec"}
+SELECTOR_TEST_RUNNERS = {
+    runner
+    for runner, policy in MUTATION_RUNNER_POLICIES.items()
+    if policy.selector_mode in {"native", "test-name-pattern"}
+}
+RUNNER_INVOCATIONS = {
+    runner: policy.invocations for runner, policy in MUTATION_RUNNER_POLICIES.items()
 }
 # sandbox-exec reports a failed execvp of its target with EX_OSERR and this
 # marker. The target never ran, so its exit status says nothing about the test.
@@ -96,23 +181,12 @@ SANDBOX_EXEC_FAILURE_MARKER = "execvp() of "
 # POSIX shells report an unfound command with this status; the command's own
 # exit statuses never reach the gate in that case.
 SHELL_COMMAND_NOT_FOUND_EXIT = 127
-# Exit statuses that mean an approved runner started but never executed the
-# named test. They are not test outcomes in either direction: they can neither
-# condemn a baseline run nor vindicate a mutated one. Every entry is measured
-# against the runner itself; a guessed status would reinstate exactly the
-# misreading this table exists to prevent, so a runner is absent from it until
-# its non-execution has been observed. A mutation proof may name only a runner
-# listed here, because on any other one the gate cannot tell a test that caught
-# the mutation from a test that never ran.
-RUNNER_NON_EXECUTION_EXITS: dict[str, dict[int, str]] = {
-    "pytest": {
-        2: "collection was interrupted",
-        3: "the runner hit an internal error",
-        4: "the runner rejected its command line",
-        5: "no test matched the named selector",
-    },
-}
-# The classified statuses above are the runner's DEFAULT exit semantics, and
+# The classified pytest statuses above are the runner's default exit semantics.
+# Jest and Vitest instead use their measured machine reports: a status is a test
+# outcome only when the report records an executed assertion, and a mutated
+# failure must record a failed assertion. Missing, malformed, empty, skipped-
+# only, and runtime-error reports are non-executions regardless of exit status.
+# The classified semantics are runner-specific, and
 # ambient variables can rewrite them: pytest documents PYTEST_ADDOPTS as being
 # appended to the command line, so an operator with
 # `PYTEST_ADDOPTS=--continue-on-collection-errors` exported turns a mutation
@@ -154,6 +228,12 @@ def utc_now() -> str:
 
 def fail(message: str) -> NoReturn:
     raise CrosscheckError(message)
+
+
+def non_execution(label: str, reason: str) -> NoReturn:
+    """Refuse a proof without letting a tooling failure read as a test result."""
+
+    fail(f"{label} NON-EXECUTION: {reason}")
 
 
 def tool_fail(message: str) -> NoReturn:
@@ -706,29 +786,30 @@ def proof_environment() -> dict[str, str]:
 
 
 def write_neutral_runner_config(root: Path) -> None:
-    """End the runner's upward config search inside a directory the gate owns.
+    """End runner upward config searches inside a directory the gate owns.
 
     pytest's locate_config walks every parent of its target to the filesystem
-    root looking for pytest.ini, tox.ini, setup.cfg or pyproject.toml, and
-    stops at the first one it finds. Operator machine state above this root
-    could therefore set options for every proof run: measured on pytest 9.1.1,
-    an ancestor `addopts = --continue-on-collection-errors` turned a mutation
-    that broke collection from exit 2 into exit 1, which the gate reads as a
-    caught regression. A neutral file here terminates that walk, and it
-    neutralises every ini setting from above, not just addopts.
+    root looking for pytest.ini, tox.ini, setup.cfg or pyproject.toml. Jest also
+    searches upward from its working directory for project configuration.
+    Operator machine state above this root could therefore set options for
+    every proof run. Measured on pytest 9.1.1, an ancestor
+    `addopts = --continue-on-collection-errors` turned a mutation that broke
+    collection from exit 2 into exit 1, which the gate reads as a caught
+    regression. Neutral files here terminate those searches inside the root the
+    gate owns. Vitest's neutral config is written at the same boundary so a
+    future upward search cannot silently widen the accepted surface.
 
     Both the proof checkouts and the review checkout live under this root, so
-    one file covers the mutation proofs and the reproduction re-execution
-    alike; the boundary is the root the gate owns, not any child of it.
-
-    The reviewed repository's own config still wins, because it sits closer to
-    the named test. That surface is deliberately accepted. The measured cost of
-    this file: for a repository carrying no pytest config at all, rootdir
-    becomes this temporary root rather than the checkout, which widens conftest
-    discovery by this one empty gate-owned directory.
+    these files cover mutation proofs and reproduction re-execution alike. The
+    reviewed repository's own closer config still wins; that surface is
+    deliberately accepted. For a repository carrying no pytest config,
+    rootdir becomes this temporary root rather than the checkout, widening
+    conftest discovery by this one empty gate-owned directory.
     """
 
     (root / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (root / "jest.config.cjs").write_text("module.exports = {};\n", encoding="utf-8")
+    (root / "vitest.config.mjs").write_text("export default {};\n", encoding="utf-8")
 
 
 def git(cwd: Path, *arguments: str, timeout: float = 60) -> str:
@@ -963,13 +1044,7 @@ def evidence_command_timeout(
 
 
 def test_file_path(test_path: str, label: str) -> str:
-    """Return the repository file a test selector names.
-
-    A named test may be a plain repository path or a runner node id such as
-    `tests/test_login.py::TestSession::test_expiry`. Only the part before the
-    first `::` is a filesystem path; every path-shaped check works on that part
-    while the caller keeps the full value for the runner command line.
-    """
+    """Return the repository file named before an optional `::` selector."""
 
     file_part = test_path.split("::", 1)[0]
     require(
@@ -979,13 +1054,27 @@ def test_file_path(test_path: str, label: str) -> str:
     return file_part
 
 
-def require_supported_selector(test_path: str, runner: str, label: str) -> None:
+def test_selector(test_path: str, label: str) -> str | None:
+    """Return a nonempty runner selector from the structured test path."""
+
     if "::" not in test_path:
+        return None
+    selector = test_path.split("::", 1)[1]
+    require(
+        bool(selector) and selector == selector.strip(),
+        f"{label}.test_path must name a nonempty selector after `::`",
+    )
+    return selector
+
+
+def require_supported_selector(test_path: str, runner: str, label: str) -> None:
+    selector = test_selector(test_path, label)
+    if selector is None:
         return
     require(
-        runner in NODE_ID_RUNNERS,
-        f"{label}.test_path uses a `::` node id, which {runner} does not accept; "
-        f"approved node-id runners: {', '.join(sorted(NODE_ID_RUNNERS))}",
+        runner in SELECTOR_TEST_RUNNERS,
+        f"{label}.test_path uses a `::` selector, which {runner} does not accept; "
+        f"approved selector runners: {', '.join(sorted(SELECTOR_TEST_RUNNERS))}",
     )
 
 
@@ -1140,6 +1229,35 @@ def uv_project_for(checkout: Path, test_path: str) -> Path | None:
         directory = directory.parent
 
 
+def node_project_for(checkout: Path, test_path: str) -> Path:
+    """Return the nearest tracked-shape Node project governing a named test.
+
+    Jest and Vitest resolve their repository configuration and package-relative
+    imports from the package directory, not necessarily a monorepo root. A
+    package.json symlink is ignored so choosing the working directory cannot be
+    redirected outside the proof checkout. The checkout root is the explicit
+    fallback for repositories without a package manifest.
+    """
+
+    checkout = checkout.resolve()
+    directory = (checkout / test_path).resolve().parent
+    require(
+        directory.is_relative_to(checkout),
+        f"named test resolves outside proof checkout: {test_path}",
+    )
+    while True:
+        manifest = directory / "package.json"
+        try:
+            manifest_mode = manifest.lstat().st_mode
+        except OSError:
+            manifest_mode = 0
+        if stat.S_ISREG(manifest_mode):
+            return directory
+        if directory == checkout:
+            return checkout
+        directory = directory.parent
+
+
 def runner_probe_timeout() -> int:
     """Bound the per-candidate runner identification probe.
 
@@ -1178,6 +1296,13 @@ def resolve_runner(runner: str, label: str, cwd: Path, test_path: str) -> list[s
 
     candidates = RUNNER_INVOCATIONS.get(runner, ((runner,),))
     inspected: list[str] = []
+    policy = MUTATION_RUNNER_POLICIES.get(runner)
+    if policy is not None and policy.node_project_cwd:
+        project = node_project_for(cwd, test_file_path(test_path, label))
+        local_runner = project / "node_modules" / ".bin" / runner
+        if local_runner.is_file() and os.access(local_runner, os.X_OK):
+            return [str(local_runner.resolve())]
+        inspected.append(f"{local_runner} (not an executable project dependency)")
     for position, candidate in enumerate(candidates):
         if candidate[0] == "uv":
             project = uv_project_for(cwd, test_file_path(test_path, label))
@@ -1230,33 +1355,184 @@ def resolve_runner(runner: str, label: str, cwd: Path, test_path: str) -> list[s
     if len(candidates) == 1:
         # A single-invocation runner has one failure mode, and naming it plainly
         # is more useful than reciting a one-entry ladder.
-        fail(
-            f"{label} cannot execute its named test: the {runner} runner is not "
-            "installed on PATH for the proof checkout, so the gate never ran "
-            "the test and must not report a test outcome"
+        non_execution(
+            label,
+            f"the {runner} runner is not installed on PATH or as an executable "
+            "project dependency in the tracked-only proof checkout, so the "
+            "gate never ran the test and must not report a test outcome",
         )
-    fail(
-        f"{label} cannot execute its named test: no usable {runner} invocation "
-        f"is installed on PATH for the proof checkout, so the gate never ran "
-        f"the test and must not report a test outcome. Inspected "
-        f"{'; '.join(inspected)}"
+    non_execution(
+        label,
+        f"no usable {runner} invocation is installed on PATH for the "
+        "tracked-only proof checkout, so the gate never ran the test and must "
+        f"not report a test outcome. Inspected {'; '.join(inspected)}",
     )
 
 
 def test_arguments(
     invocation: dict[str, Any], test_path: str, checkout: Path, label: str
-) -> list[str]:
-    if invocation["runner"] == "direct":
+) -> TestRun:
+    runner_name = invocation["runner"]
+    if runner_name == "direct":
         executable = checkout / test_file_path(test_path, label)
-        require(
-            os.access(executable, os.X_OK),
-            f"tracked named test is not executable: {test_path}",
+        if not os.access(executable, os.X_OK):
+            non_execution(label, f"tracked named test is not executable: {test_path}")
+        return TestRun(tuple([str(executable), *invocation["arguments"]]), checkout)
+
+    runner = resolve_runner(runner_name, label, checkout, test_path)
+    policy = MUTATION_RUNNER_POLICIES.get(runner_name)
+    if policy is None:
+        if runner_name in FILE_TEST_RUNNERS:
+            argv = [*runner, test_path, *invocation["arguments"]]
+        else:
+            argv = [*runner, *invocation["arguments"], test_path]
+        return TestRun(tuple(argv), checkout)
+
+    run_cwd = (
+        node_project_for(checkout, test_file_path(test_path, label))
+        if policy.node_project_cwd
+        else checkout
+    )
+    if policy.selector_mode == "native":
+        target = test_path
+    elif policy.selector_mode in {"none", "test-name-pattern"}:
+        target = str(
+            (checkout / test_file_path(test_path, label)).relative_to(run_cwd)
         )
-        return [str(executable), *invocation["arguments"]]
-    runner = resolve_runner(invocation["runner"], label, checkout, test_path)
-    if invocation["runner"] in FILE_TEST_RUNNERS:
-        return [*runner, test_path, *invocation["arguments"]]
-    return [*runner, *invocation["arguments"], test_path]
+    else:
+        tool_fail(
+            f"mutation-runner policy for {runner_name} has unknown selector mode "
+            f"{policy.selector_mode!r}"
+        )
+    argv = [*runner, *policy.gate_arguments, target]
+    selector = test_selector(test_path, label)
+    if selector is not None and policy.selector_mode == "test-name-pattern":
+        argv.extend(["--testNamePattern", selector])
+    return TestRun(tuple(argv), run_cwd)
+
+
+def require_jest_compatible_execution_report(
+    result: subprocess.CompletedProcess[str], runner: str, label: str, phase: str
+) -> None:
+    """Require Jest/Vitest JSON to prove at least one assertion executed."""
+
+    try:
+        report = json.loads(result.stdout)
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        non_execution(
+            label,
+            f"{runner} could not start or did not emit its measured JSON report "
+            f"during the {phase} run ({exc}); exit {result.returncode}: "
+            f"{result.stderr.strip()[:500] or 'no diagnostic'}",
+        )
+    if not isinstance(report, dict):
+        non_execution(label, f"{runner} emitted a non-object JSON report")
+    test_results = report.get("testResults")
+    if not isinstance(test_results, list):
+        non_execution(label, f"{runner} JSON omitted its testResults array")
+    policy = MUTATION_RUNNER_POLICIES[runner]
+    runtime_errors = report.get("numRuntimeErrorTestSuites")
+    if policy.runtime_error_field == "required-zero":
+        if (
+            not isinstance(runtime_errors, int)
+            or isinstance(runtime_errors, bool)
+            or runtime_errors != 0
+        ):
+            non_execution(
+                label,
+                f"{runner} reported {runtime_errors!r} runtime-error suites "
+                f"during the {phase} run",
+            )
+    elif policy.runtime_error_field == "absent":
+        if "numRuntimeErrorTestSuites" in report:
+            non_execution(
+                label,
+                f"{runner} emitted an unmeasured numRuntimeErrorTestSuites field",
+            )
+    else:
+        tool_fail(
+            f"mutation-runner policy for {runner} has unknown runtime-error "
+            f"contract {policy.runtime_error_field!r}"
+        )
+    report_success = report.get("success")
+    if not isinstance(report_success, bool):
+        non_execution(label, f"{runner} JSON omitted its boolean success field")
+    if report_success != (result.returncode == 0):
+        non_execution(
+            label,
+            f"{runner} JSON success={report_success!r} contradicts exit "
+            f"{result.returncode}",
+        )
+
+    statuses: list[str] = []
+    suite_without_assertion_failure = False
+    for suite in test_results:
+        if not isinstance(suite, dict):
+            non_execution(label, f"{runner} emitted a malformed test result")
+        assertions = suite.get("assertionResults")
+        if not isinstance(assertions, list):
+            non_execution(label, f"{runner} emitted a result without assertions")
+        suite_statuses: list[str] = []
+        for assertion in assertions:
+            if not isinstance(assertion, dict) or not isinstance(
+                assertion.get("status"), str
+            ):
+                non_execution(label, f"{runner} emitted a malformed assertion result")
+            status_value = assertion["status"]
+            if status_value not in {
+                "passed",
+                "failed",
+                "pending",
+                "skipped",
+                "todo",
+                "disabled",
+            }:
+                non_execution(
+                    label,
+                    f"{runner} emitted unmeasured assertion status {status_value!r}",
+                )
+            suite_statuses.append(status_value)
+            statuses.append(status_value)
+        if suite.get("status") == "failed" and "failed" not in suite_statuses:
+            suite_without_assertion_failure = True
+    if suite_without_assertion_failure:
+        non_execution(
+            label,
+            f"{runner} failed a suite before any assertion recorded the failure "
+            f"during the {phase} run",
+        )
+
+    passed = statuses.count("passed")
+    failed_count = statuses.count("failed")
+    for key, measured in (("numPassedTests", passed), ("numFailedTests", failed_count)):
+        reported = report.get(key)
+        if (
+            not isinstance(reported, int)
+            or isinstance(reported, bool)
+            or reported != measured
+        ):
+            non_execution(
+                label,
+                f"{runner} JSON reported inconsistent {key}={reported!r}; "
+                f"measured {measured} assertion results",
+            )
+    if passed + failed_count == 0:
+        non_execution(
+            label,
+            f"{runner} matched no executing assertion during the {phase} run; "
+            "skipped or pending tests are not a test outcome",
+        )
+    if result.returncode != 0 and failed_count == 0:
+        non_execution(
+            label,
+            f"{runner} exited {result.returncode} without a failed assertion "
+            f"during the {phase} run",
+        )
+    if result.returncode == 0 and failed_count != 0:
+        non_execution(
+            label,
+            f"{runner} exited 0 while reporting {failed_count} failed assertions",
+        )
 
 
 def require_test_execution(
@@ -1265,44 +1541,44 @@ def require_test_execution(
     label: str,
     phase: str,
 ) -> None:
-    """Refuse to read a test outcome out of a run that never reached the test.
-
-    A non-run exits nonzero, which would otherwise read as "the baseline fails"
-    and, worse, as "the mutation was caught". Both readings are wrong, so the
-    gate names the non-run instead of scoring it.
-    """
+    """Refuse to read a test outcome out of a run that never reached the test."""
 
     combined = (result.stdout + result.stderr).strip()
     if sandbox_exec_failed(result):
-        fail(
-            f"{label} could not launch its {phase} test run: the sandbox failed "
-            f"to execute {runner}, so no test outcome exists: {combined[:500]}"
+        non_execution(
+            label,
+            f"the sandbox failed to execute {runner} during the {phase} run, "
+            f"so no test outcome exists: {combined[:500]}",
         )
-    reason = RUNNER_NON_EXECUTION_EXITS.get(runner, {}).get(result.returncode)
-    require(
-        reason is None,
-        f"{label} never ran its named test during the {phase} run: {runner} "
-        f"exited {result.returncode} because {reason}, which is not a test "
-        f"outcome: {combined[:500]}",
-    )
+    policy = MUTATION_RUNNER_POLICIES[runner]
+    if policy.report_format == "jest-compatible-json":
+        require_jest_compatible_execution_report(result, runner, label, phase)
+        return
+    if policy.report_format is not None:
+        tool_fail(
+            f"mutation-runner policy for {runner} has unknown report format "
+            f"{policy.report_format!r}"
+        )
+    reason = dict(policy.non_execution_exits).get(result.returncode)
+    if reason is not None:
+        non_execution(
+            label,
+            f"{runner} never ran its named test during the {phase} run: exited "
+            f"{result.returncode} because {reason}, which is not a test outcome: "
+            f"{combined[:500]}",
+        )
 
 
 def require_classified_runner(runner: str, label: str) -> None:
-    """Refuse to certify a fix on a runner whose non-execution is unclassified.
-
-    A mutated run that never reached the named test exits nonzero exactly like
-    one that caught the regression. Telling those apart needs a measured
-    non-execution signal for that specific runner, so a runner the gate has no
-    entry for cannot support a mutation proof at all.
-    """
+    """Refuse a runner without a measured non-execution contract."""
 
     require(
-        runner in RUNNER_NON_EXECUTION_EXITS,
+        runner in MUTATION_RUNNER_POLICIES,
         f"{label} cannot certify a fix through the {runner} runner: the gate "
         f"has no measured non-execution signal for {runner}, so a mutated run "
         "that never reached the named test is indistinguishable there from one "
         "that caught the regression. Runners whose non-execution the gate can "
-        f"classify: {', '.join(sorted(RUNNER_NON_EXECUTION_EXITS))}",
+        f"classify: {', '.join(sorted(MUTATION_RUNNER_POLICIES))}",
     )
 
 
@@ -1313,12 +1589,12 @@ def invocation_is_argument_free(invocation: Any) -> bool:
 def require_argument_free_invocation(invocation: dict[str, Any], label: str) -> None:
     """Refuse a mutation proof that hands the runner anything but its target.
 
-    The classified non-execution signal is a property of the runner's DEFAULT
-    exit semantics, and a supplied argument can change them. Measured on pytest
-    9.1.1, a mutation raising during import of the named test's module exits 2
-    on its own but 1 under `--continue-on-collection-errors`, and 1 has no
-    table entry, so the gate would certify a fix on a test never collected. A
-    positional argument separately adds a second target beyond test_path, the
+    The classified non-execution signal belongs to the exact gate-owned runner
+    invocation, and a reviewer-supplied argument can change it. Measured on
+    pytest 9.1.1, a mutation raising during import of the named test's module
+    exits 2 on its own but 1 under `--continue-on-collection-errors`, and 1 has
+    no table entry, so the gate would certify a fix on a test never collected.
+    A positional argument separately adds a second target beyond test_path, the
     only target the gate checks as tracked, symlink-free, and unreachable by
     the mutation patch. Requiring none closes both without an enumeration of
     runner flags that would go stale.
@@ -1329,8 +1605,8 @@ def require_argument_free_invocation(invocation: dict[str, Any], label: str) -> 
         not arguments,
         f"{label}.arguments must be empty for a mutation proof, but names "
         + ", ".join(repr(argument) for argument in arguments)
-        + ". The gate reads the mutated run's exit status through the runner's "
-        "default exit semantics, which an argument can change: a flag can turn "
+        + ". The gate reads the mutated run through the runner's measured, "
+        "gate-owned invocation, which an argument can change: a flag can turn "
         "a test that was never collected into an ordinary failure, and a "
         "positional argument adds a second target beyond test_path, the only "
         "target the gate validates as tracked, symlink-free, and unreachable "
@@ -1353,7 +1629,10 @@ def validate_named_test(
     try:
         mode = candidate.lstat().st_mode
     except OSError as exc:
-        fail(f"{label}.test_path is unavailable: {exc}")
+        non_execution(
+            label,
+            f"named test {file_path!r} is unavailable in the tracked checkout: {exc}",
+        )
     require(stat.S_ISREG(mode), f"{label}.test_path must be a regular file")
     # Anchor the symlink check at the resolved review root. Comparing against a
     # purely lexical absolute path also rejected symlinks in ancestors the
@@ -1428,7 +1707,9 @@ def is_test_or_evidence_path(path: str) -> bool:
     name = candidate.name.lower()
     return bool(
         re.search(r"(?:^|[._-])(?:test|tests|spec|specs)(?:[._-]|$)", name)
-        or name.startswith(("test_", "spec_"))
+        or name.startswith(
+            ("test_", "spec_", "jest.config.", "vitest.config.", "vite.config.")
+        )
         or name in {"conftest.py", "pytest.ini"}
     )
 
@@ -1474,11 +1755,11 @@ def execute_mutation_proof(
     # refused as absent, and a `direct` target as non-executable, rather than as
     # an unclassified runner. Swapping these two lines changes the refusal a
     # reviewer sees for a runner that is both absent and unclassified.
-    baseline_argv = test_arguments(invocation, test_path, proof_dir, label)
+    baseline_run = test_arguments(invocation, test_path, proof_dir, label)
     require_classified_runner(invocation["runner"], label)
     baseline = run_sandboxed(
-        baseline_argv,
-        cwd=proof_dir,
+        list(baseline_run.argv),
+        cwd=baseline_run.cwd,
         profile_path=baseline_profile,
         allow_network=False,
         allow_posix_ipc=False,
@@ -1531,9 +1812,10 @@ def execute_mutation_proof(
     )
 
     mutated_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
+    mutated_run = test_arguments(invocation, test_path, proof_dir, label)
     mutated = run_sandboxed(
-        test_arguments(invocation, test_path, proof_dir, label),
-        cwd=proof_dir,
+        list(mutated_run.argv),
+        cwd=mutated_run.cwd,
         profile_path=mutated_profile,
         allow_network=False,
         allow_posix_ipc=False,
@@ -2244,13 +2526,13 @@ A new finding is admissible only when you provide a reproduction helper and comm
 The command must name its helper, and its exit code plus a distinctive output marker must reproduce the defect.
 A prior finding is verified-fixed only when you name a tracked test, provide a structured test invocation, and provide a patch under .crosscheck/mutations/ that breaks or reverts cited implementation without changing test or evidence support.
 The mutation may change only implementation paths already cited by that finding.
-The gate appends the named test path to the approved runner invocation, destroys all baseline state, and recreates the same clean checkout path before applying the mutation.
-test_path may be a plain repository path, or a `path::selector` node id when the runner is one of: {', '.join(sorted(NODE_ID_RUNNERS))}.
-The proof checkout is a fresh clone holding tracked files only, so name a runner installed on PATH there; a runner that is absent, or a selector that matches no test, is reported as a non-execution rather than a test result and clears nothing.
-A mutation proof may name only a runner whose non-execution signal the gate has measured, currently: {', '.join(sorted(RUNNER_NON_EXECUTION_EXITS))}. On any other runner the gate cannot tell a test that caught the mutation from one that never ran, so it refuses to certify the fix rather than guess.
-A mutation proof takes no runner arguments at all: test_invocation.arguments must be empty, and any entry is refused by name. The gate reads the mutated exit status through the runner's default semantics, which a flag can change, and test_path is the only target it validates as tracked, symlink-free, and unreachable by your mutation patch.
-Both proof runs also execute under an environment the gate constructs from a fixed allowlist rather than the one it was launched with, so no ambient variable can alter those exit semantics; name a test that needs nothing beyond PATH, HOME, and the locale.
-The gate also writes a neutral pytest.ini above its own checkouts, so runner configuration from directories above them is inert; configuration tracked inside the repository still applies.
+The gate positions the named test in the measured runner invocation, destroys all baseline state, and recreates the same clean checkout path before applying the mutation.
+test_path may be a plain repository path, or `path::selector` when the runner is one of: {', '.join(sorted(SELECTOR_TEST_RUNNERS))}. Pytest receives its native node id; Jest and Vitest receive the part after `::` as a gate-owned test-name pattern.
+The proof checkout is a fresh clone holding tracked files only. A runner or dependency that is absent, a runner that cannot start, or a selector that matches no executing test is reported as NON-EXECUTION rather than a test result and clears nothing.
+A mutation proof may name only a runner whose non-execution contract the gate has measured, currently: {', '.join(sorted(MUTATION_RUNNER_POLICIES))}. On any other runner the gate cannot tell a test that caught the mutation from one that never ran, so it refuses to certify the fix rather than guess.
+A mutation proof takes no reviewer-supplied runner arguments at all: test_invocation.arguments must be empty, and any entry is refused by name. The gate executes only the runner policy's measured arguments, and test_path is the only target it validates as tracked, symlink-free, and unreachable by your mutation patch.
+Both proof runs also execute under an environment the gate constructs from a fixed allowlist rather than the one it was launched with, so no ambient variable can alter those semantics; name a test that needs nothing beyond PATH, HOME, and the locale.
+The gate writes neutral pytest, Jest, and Vitest configuration above its own checkouts, so runner configuration from directories above them is inert; configuration tracked inside the repository still applies.
 The gate will independently run every reproduction and every mutation proof.
 If you cannot reproduce a concern, return it as a suspicion; suspicions block the merge.
 Silence never closes an existing finding.

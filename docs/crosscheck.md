@@ -168,52 +168,84 @@ That inspection carries its own larger budget so such a state is refused by name
 
 A `verified-fixed` update must name a tracked test and provide an implementation-only patch under `.crosscheck/mutations/`.
 It supplies an approved test runner plus a structured argument array, never a free-form shell command.
+Approval as a general test runner is not certification permission: `MUTATION_RUNNER_POLICIES` in `bin/fm-crosscheck.py` is the single declaration point for runners whose non-execution contract has been measured.
+The currently measured certification runners are `pytest`, `jest`, and `vitest`.
+
 An approved runner is a NAME, and the gate resolves that name into an invocation rather than assuming a bare binary on `PATH`.
-This matters because every Python repository in this fleet is uv-managed: a bare `pytest` is routinely absent there, while `uv run pytest` is the invocation that works, and `python3 -m pytest` cannot be expressed in the vocabulary at all because `python3` is a file runner whose command line puts the test path before its arguments.
-`pytest` therefore resolves through `uv run pytest`, then `python3 -m pytest`, then the bare binary.
-Order is load-bearing: inside a uv project a bare `pytest` can exist and resolve against a different environment than the repository uses, so finding it first would run the named test under an interpreter the project never selected.
-The uv rung is offered only when a uv project actually governs the named test, discovered by searching upward from that test to the checkout root, and it is passed to `uv run --project` so a monorepo service directory is selected without moving the working directory the test path is relative to.
-Each rung except the last identifies itself before being trusted; the last is the plain runner name and is accepted on presence, exactly as before, so the ladder can never turn a working setup into a refusal.
-Keeping the declared name is what preserves pytest's `path::selector` node-id support, which a separate runner name for module invocation would have silently dropped.
-That array must be empty for a mutation proof, and any entry is refused by name.
-The classified non-execution signal is a property of the runner's default exit semantics, and a supplied flag can change them: measured on pytest 9.1.1, a mutation raising during import of the named test's module exits 2 on its own but 1 under `--continue-on-collection-errors`, and 1 carries no classification, so the gate would certify a fix on a test that was never collected.
-A positional argument separately adds a second target, and `test_path` is the only target the gate validates as tracked, symlink-free, and unreachable by the mutation patch, so the verdict could come from a file the gate never validated.
-Requiring no arguments closes both without an enumeration of runner flags that would go stale.
-Reviewer-supplied argv is only half of it: both proof runs also execute under an environment the gate constructs from `PROOF_ENVIRONMENT_ALLOWLIST` rather than the one it was launched with, because pytest appends `PYTEST_ADDOPTS` to the command line, so an operator with `--continue-on-collection-errors` exported would reproduce the same bypass on every proof with no reviewer involved.
-That list is an allowlist because it fails closed - a variable that is needed but missing breaks the baseline run, which must exit 0, so the proof is refused where it can be seen, while an unlisted variable on a denylist would sail through silently.
-The constructed environment is applied to the mutation-proof runs and not to reproduction re-execution: a proof's exit status is what decides clear versus not clear, whereas ambient interference with a reproduction can only push it toward refusal, and reproduction commands run through a login shell that re-imports operator profile state regardless.
-Configuration files are the third channel into the same semantics: pytest's `locate_config` walks every parent of its target to the filesystem root and stops at the first `pytest.ini`, `tox.ini`, `setup.cfg`, or `pyproject.toml` it finds, so an operator config above the gate's temporary root would set `addopts` for every proof on the machine.
-Crosscheck writes a neutral empty `[pytest]` `pytest.ini` into that temporary root before anything runs, ending the walk inside a directory the gate owns and neutralising every ini setting from above rather than only `addopts`.
-The proof checkouts and the review checkout are both children of that root, so the one file covers reproduction re-execution as well; the boundary is the root the gate owns, not any child of it.
-This is not free: for a repository carrying no pytest config of its own, rootdir becomes the gate's temporary root instead of the checkout, which widens conftest discovery by that one empty gate-owned directory.
-The reviewed repository's own config still takes precedence, because it sits closer to the named test, and that surface stays deliberately accepted.
-The same rule is not applied when replaying a recorded proof, so a ledger written before it still loads; instead a recorded proof whose invocation carried arguments no longer certifies its finding, which reverts to blocking and can be re-proved in band by a fresh review.
+`pytest` resolves through `uv run pytest`, then `python3 -m pytest`, then the bare binary, preserving the existing uv-aware behavior and native `path::selector` node ids.
+Jest and Vitest run from the nearest package directory found by walking from the named test to the checkout root, so a nested monorepo package loads its own tracked configuration and package-relative imports.
+For those Node runners the gate prefers an executable `node_modules/.bin/<runner>` in that package and then checks `PATH`.
+The proof checkout contains tracked files only, so ordinary untracked `node_modules` dependencies are absent there unless the runner is otherwise available; an absent runner or a runner that starts without its required dependencies is `NON-EXECUTION`, never a pass or silent skip.
+
+`test_path` may be a plain repository path or `path::selector` for a measured selector runner.
+Pytest receives the full native node id.
+Jest and Vitest receive the path before `::` as their sole file target and the part after `::` as a gate-owned `--testNamePattern` value, which can express the paired control and regression selector used by platform-v3's hand proof without admitting reviewer flags.
+The exact gate-owned JavaScript invocations are `jest --json --runTestsByPath <path> [--testNamePattern <selector>]` and `vitest run --reporter=json <path> [--testNamePattern <selector>]`.
+Both machine reports must contain at least one `passed` or `failed` assertion before the run counts as execution, and a nonzero mutated run must contain a failed assertion before it can certify the mutation.
+A missing or malformed report, a runtime-error suite, an empty assertion list, an all-skipped or all-pending selector result, an inconsistent assertion count, a success/exit contradiction, and a nonzero exit with no failed assertion are all `NON-EXECUTION` and clear nothing.
+This report contract is necessary because both measured JavaScript runners exit 0 when a test-name pattern matches no test.
+
+The reviewer-supplied `test_invocation.arguments` array must remain empty for every mutation proof, and any entry is refused by name.
+The classified contract belongs to the exact gate-owned invocation, and a supplied flag can rewrite it: measured on pytest 9.1.1, `--continue-on-collection-errors` turns an import-time non-execution from exit 2 into an ordinary exit 1.
+A positional argument separately adds a second target, while `test_path` is the only target the gate validates as tracked, symlink-free, and unreachable by the mutation patch.
+Requiring no reviewer arguments closes both routes without a runner-specific flag denylist.
+
+Both proof runs execute under an environment constructed from `PROOF_ENVIRONMENT_ALLOWLIST` rather than the caller's environment.
+That list is an allowlist because it fails closed: a missing required variable breaks the baseline, while an unlisted variable on a denylist would silently alter the measured runner contract.
+The constructed environment applies to mutation proofs and not reproduction re-execution, because proof results can clear a finding while ambient interference with a reproduction can only force refusal.
+Crosscheck writes neutral pytest, Jest, and Vitest configuration above the review and proof checkouts, ending upward config discovery inside the gate-owned root while allowing the reviewed repository's closer tracked configuration to win.
+For a repository with no pytest config, the neutral boundary makes the temporary root pytest's rootdir and widens conftest discovery by one empty gate-owned directory.
+A recorded proof whose invocation predates the empty-arguments rule still loads, but no longer clears its finding and can be re-proved in band.
+
 Crosscheck creates one clean checkout at the exact reviewed head, confirms the named test passes, destroys the entire checkout, recreates the same path from the exact head, applies the patch, and requires the same test to fail.
 Destroying all readable baseline state before the mutated run prevents a test from manufacturing causality through a predictable sibling checkout.
-Proof sandboxes also omit shared POSIX IPC and give each run private writable temporary and cache state, while shared host temporary directories remain outside the write policy.
-The named test must be a canonical tracked regular file; symlinks are rejected so a patch cannot mutate the executed target through an unchanged alias.
-Symlink rejection is anchored at the resolved review checkout, so a symlink inside the repository is still refused while a symlinked ancestor above the firstmate home is not mistaken for one.
-`test_path` may also be a `path::selector` node id for a runner that accepts one; every path-shaped check reads the part before `::` while the runner receives the full selector.
-The gate positions the tracked test path itself as the interpreter script or test-framework target; generic command launchers are not approved runners.
-A run that never reached the named test is not a test result in either direction.
-The gate resolves the named runner to an absolute executable before launching, and treats an absent runner, a failed sandbox exec, and a runner-reported non-execution (pytest's usage and no-tests-collected statuses, for instance) as named non-executions.
-That matters in both directions: such a status must not condemn a baseline run, and must not vindicate a mutated one, because a mutation that merely broke collection would otherwise read as a caught regression.
-Because that reading is only safe where the non-execution signal has actually been measured, a mutation proof may name only a runner the gate classifies - `pytest` today - and any other runner is refused by name rather than certified on a status the gate would have to guess at.
-The proof checkout is a fresh clone carrying tracked files only, so a runner that lives solely in an untracked virtualenv is absent there.
+Proof sandboxes omit shared POSIX IPC and give each run private writable temporary and cache state, while shared host temporary directories remain outside the write policy.
+The named test must be a canonical tracked regular file, and symlinks are rejected so a patch cannot mutate the executed target through an unchanged alias.
+Symlink rejection is anchored at the resolved review checkout, so a symlink inside the repository is refused while a symlinked ancestor above the firstmate home is not mistaken for one.
+The gate resolves the named runner before launch and reports an absent binary, a failed sandbox exec, a missing named test, and every measured runner non-execution explicitly as `NON-EXECUTION`.
+That distinction applies to baseline and mutation runs alike because a run that never reached an assertion can neither condemn the baseline nor vindicate the mutation.
+A runner absent from `MUTATION_RUNNER_POLICIES` is refused even if it is generally approved, because guessing its non-execution signal would allow a forged clearance.
 The patch may modify only non-test implementation paths already cited by the durable finding.
-It cannot modify the named test, conventional test trees, fixtures, or Crosscheck evidence support.
+It cannot modify the named test, conventional test trees, fixtures, Jest/Vitest/Vite runner config, or Crosscheck evidence support.
 
-### Known limitation: the mutated exit status is an inference, not proof
+### Adding a mutation-proof runner
 
-Read the four guards above together and the shape of the real problem is visible.
-The gate concludes "the named test detected the regression" from one fact: the mutated run exited non-zero.
-That status is not a property of the test alone. It is influenced by reviewer-supplied argv, by the ambient environment, by repository and ancestor configuration, and by the runner's own version, and each of those four channels was closed only after it was found - a positional second target, a collection-error flag, `PYTEST_ADDOPTS`, and an ancestor ini file.
-An installed runner plugin is a known and accepted fifth door.
-Closing channels one at a time is unbounded work with no completion criterion, so the list above should be read as hardening, not as a proof of soundness.
+Do not add a runner to `MUTATION_RUNNER_POLICIES` until its exact gate-owned invocation has an empirically distinguishable execution signal.
+Use the real runner in a clean scratch package with one mutation-insensitive control test and one mutation-sensitive regression test.
+Run the exact proposed argv with no reviewer arguments for six cases: matched pass, matched assertion failure, unmatched selector, missing target, missing dependency during collection, and conventional tracked configuration that fails at startup.
+Record the runner version, date, exact commands, exit statuses, stdout, and stderr before encoding anything.
+A future version whose output no longer satisfies the declared parser fails closed as `NON-EXECUTION`; do not loosen the parser until that version has been measured through the same matrix.
+If a runner exposes no signal that distinguishes a failed assertion from failed startup or non-collection, it is not eligible for certification.
 
-The planned replacement is POSITIVE PROOF OF EXECUTION: requiring the mutated run to demonstrate that the named test actually ran, rather than inferring it from an exit code.
-The leading candidate is a control test - a second tracked test the mutation should not affect, required to PASS while the named test fails - because it needs no per-runner knowledge and no enumeration of the ways a status can be rewritten.
-Until that lands, the exit-status inference remains this gate's weakest link, and the four closed channels do not make it sound.
+The JavaScript profile was measured on 2026-08-09 with Jest 29.7.0 and Vitest 4.1.5 using these exact command shapes.
+
+```sh
+jest --json --runTestsByPath regression.test.js --testNamePattern 'across chats resets state'
+vitest run --reporter=json regression.test.js --testNamePattern 'across chats resets state'
+```
+
+The matched baseline exited 0 and recorded one passed selected assertion on both runners.
+The assertion mutation exited 1 and recorded one failed selected assertion on both runners.
+An unmatched selector exited 0 on both runners, with Jest recording only `pending` assertions and Vitest recording only `skipped` assertions.
+A missing target exited 1 with zero assertions, using a Jest runtime-error suite and an empty Vitest `testResults` array.
+A missing imported dependency exited 1 with a failed suite and an empty `assertionResults` array on both runners, with Jest additionally reporting one runtime-error suite.
+A conventional `jest.config.cjs` or `vitest.config.js` that threw during loading exited 1 and emitted no JSON stdout on either runner.
+Those observed shapes are what the shared `jest-compatible-json` report policy encodes; exit status alone is deliberately insufficient.
+
+To add a future runner, add one policy entry carrying its invocation ladder, gate-owned arguments, selector mode, project-root rule, report format, measured non-execution exits, and dated measurement string.
+Add a parser only when the runner uses a genuinely new measured report format, and keep that parser selected by the policy rather than branching throughout the gate.
+Add hermetic behavior coverage for every non-execution shape plus an end-to-end baseline-pass/mutation-fail certification before enabling the policy.
+
+### Known limitation: pytest's mutated exit status is still an inference
+
+Jest and Vitest now provide positive assertion-execution evidence through their measured machine reports.
+Pytest still concludes that the named test detected the regression from the mutated nonzero exit after excluding its measured non-execution statuses.
+That status is influenced by reviewer-supplied argv, ambient environment, repository and ancestor configuration, runner version, and installed plugins.
+The positional-target rule, argument refusal, environment allowlist, and neutral ancestor config close known channels, but an installed plugin remains an accepted door and the list is hardening rather than a proof of soundness.
+
+The planned pytest replacement is positive proof of execution rather than exit-code inference.
+The leading candidate remains a control test that the mutation should not affect, required to pass while the named test fails.
+Until that lands, pytest's exit-status inference remains this gate's weakest runner contract.
 
 ## Refusal and liveness
 
@@ -295,6 +327,9 @@ Its tracked `test_real_claude_sandbox_executes_exact_sha_git_diff` case is an op
 Ordinary CI prints a named skip for this network- and credential-dependent guard instead of substituting fake-only coverage.
 The retained live runtime proof is the change receipt for this patch; the opt-in test is the repeatable regression guard for future environments.
 Its `test_pytest_runner_resolves_through_a_uv_aware_ladder` case is the named regression for runner-name resolution: it pins monorepo uv-project discovery, the skipped uv rung outside a project, the unchanged absent-runner refusal, and pytest's retained node-id support.
+Its `test_javascript_runner_policy_is_declared_once` case pins the nearest-package working directory, exact gate-owned Jest and Vitest arguments, selector translation, neutral ancestor configs, and single policy registry.
+Its `test_javascript_runners_certify_platform_shaped_mutation_proofs` case executes end-to-end Jest and Vitest proofs where the control passes in both runs and the regression fails only after mutation.
+Its `test_javascript_non_executions_clear_nothing` case executes the measured unmatched-selector, startup-failure, missing-dependency, and missing-test shapes and requires every one to retain the open finding.
 Its `test_account_less_known_provider_lane_is_reviewable` case is the named regression for account-less lanes: it drives a Pi lane with no `account_home` and a slot-qualified model, requires a cross-provider reviewer to clear it, and requires a same-provider reviewer to be refused.
 Its `test_claude_execution_home_always_binds_the_keychain` case is the named regression for the private-`HOME` Keychain bind, and it fails if the bind is made conditional on `.credentials.json` again.
 Its `test_moved_default_branch_stays_reviewable` case is the named regression for base drift: it advances the fake default branch past the PR's branch point, then requires the run to review against the merge base, record it, and still verify.

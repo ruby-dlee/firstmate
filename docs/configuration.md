@@ -73,7 +73,8 @@ The `config/backend` file is not inherited by secondmate homes.
 
 These settings apply only to the terminal-backed compatibility path used by a harness without a native tracked-background completion notification.
 Native tracked delivery completes the away daemon task and does not resolve or inspect a supervisor pane.
-The compatibility path injects escalation digests into firstmate's own pane independently of where new task endpoints are spawned and currently supports only `tmux` and `herdr` supervisor panes.
+The compatibility path attempts escalation delivery to firstmate's own pane independently of where new task endpoints are spawned, and its target preflight currently supports only `tmux` and `herdr` supervisor panes.
+Both supported backends then fail closed at the shared session-bound text gate, preserve the digest, and surface the max-defer alarm.
 Set `FM_SUPERVISOR_BACKEND=tmux|herdr` and `FM_SUPERVISOR_TARGET=<target>` to override both axes explicitly; for herdr the target is `"<session>:<pane-id>"`.
 Without overrides, backend detection uses `$TMUX_PANE` first, then `HERDR_ENV=1` with `HERDR_PANE_ID`, then falls back to `tmux`.
 That keeps a tmux pane nested inside herdr on the tmux transport, matching the runtime backend's innermost-first rule.
@@ -321,7 +322,7 @@ Bootstrap rejects every configured Codex profile that does not name both exact a
 Recovery re-resolves the current harness plus the Codex axes rather than replaying task metadata; when natural-language dispatch rules are active, it refuses unless the freshly selected concrete harness is passed explicitly.
 Changing an account config does not retroactively repair an already substituted session; the harness-owned runtime record is checked after a new task generation starts and periodically, and a mismatched live session must be relaunched.
 If a selected profile carries an effort value the chosen harness does not accept, `fm-spawn.sh` records the requested `effort=` in task meta for traceability but omits the launch flag, and bootstrap reports the invalid harness/effort pair as a `CREW_DISPATCH` diagnostic when it is visible in the file.
-`quota-balanced` selection is deterministic and implemented by `bin/fm-dispatch-select.sh`, whose header owns the general-window rules, the 20 point stale-clear freshness margin, vendor-availability handling, and the degrade-to-first-element fallbacks; quota trouble never blocks dispatch.
+`quota-balanced` profile selection is deterministic and implemented by `bin/fm-dispatch-select.sh`, whose header owns the general-window rules, the 20 point stale-clear freshness margin, vendor-availability handling, and the degrade-to-first-element fallbacks; provider-level quota trouble does not block that profile choice, but the later Codex account-capacity probe fails closed when no account proves the exact admitted profile.
 Any quota-balanced candidate carrying `account_profile` remains invalid for compatibility, and pool-aware candidates must all carry `account_pool`.
 The winning profile's account field activates the later per-account direct selection; its legacy alias does not pin an account directory.
 When account routing is `enforce`, every quota-balanced candidate must carry `account_pool`; `off` and `observe` retain the legacy poolless `quota-axi` compatibility path.
@@ -758,7 +759,7 @@ FM_BUSY_REGEX='esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'   # busy-pane s
 FM_COMPOSER_IDLE_RE=    # optional empty-composer regex, applied after ghost and border stripping
 FM_COMPOSER_GHOST_LUMA_MAX=128   # fleet-wide: max perceived luminance (0.299R+0.587G+0.114B, 0-255) for a TRUECOLOR foreground to count as de-emphasised ghost/placeholder text and be stripped; dim/faint (SGR 2) is stripped regardless. Assumes a dark terminal theme (bin/fm-composer-lib.sh's fm_composer_strip_ghost, shared by the tmux and herdr composer readers)
 GROK_HOME=              # optional Grok config home for firstmate's global grok turn-end hook; defaults to ~/.grok
-FM_SEND_RETRIES=3       # fm-send Enter-retry attempts after typing the line once
+FM_SEND_RETRIES=3       # legacy adapter Enter-retry attempts; canonical text steering refuses
 FM_SEND_SLEEP=0.4       # legacy adapter submit-loop interval; canonical text steering refuses
 FM_SEND_SETTLE=1        # legacy adapter post-submit delay; canonical text steering refuses
 # sub-supervisor (bin/fm-supervise-daemon.sh); presence-gated via /afk

@@ -31,6 +31,7 @@ Hard rules, in priority order:
    Project `AGENTS.md` maintenance is not another exception: firstmate records not-yet-committed project knowledge in `data/`, and crewmates update project `AGENTS.md` through normal delivery (section 6).
 2. **Never merge a PR without the captain's explicit word.**
    The one standing, captain-authorized relaxation is a project's `yolo` flag (section 7): with `yolo` on, firstmate makes routine approval decisions itself, but anything destructive, irreversible, or security-sensitive still escalates to the captain.
+   This rule governs approval authority; the current structural gates independently make PR merge execution unavailable even after approval or under `yolo`.
 3. **Never tear down a worktree that holds unlanded work.**
    `bin/fm-teardown.sh` enforces this, and `--force` only requests recursive cleanup after every ordinary safety proof succeeds.
    Three ways work counts as "landed": `HEAD` reachable from any remote-tracking branch (a fork counts, so an upstream-contribution PR pushed to a fork satisfies this in any mode); for a normal ship task, its content present in the fetched live default branch, including a strictly corroborated conflict-adjusted PR rewrite whose merge commit is on that branch; for `local-only` ship tasks with no remote, merged into the local default branch.
@@ -289,7 +290,7 @@ Reconcile reality with your records before doing anything else, working from the
    Each secondmate is a firstmate in its own home, so it reconciles only work that is already its own and then idles; it never creates new work during recovery.
 8. The digest already reports whether `state/.afk` is present.
    If it is, load `/afk`, ensure the daemon is running, do not separately arm the watcher because the daemon owns it, and resume away-mode supervision.
-9. Surface only what needs the captain: pending decisions, PRs ready to merge, failures, or needed credentials.
+9. Surface only what needs the captain: pending decisions, PRs ready for review, failures, or needed credentials.
    If there is nothing that needs them, say nothing and resume.
 10. Having already handled the drained wakes from the digest, follow the emitted supervision operating block through the digest's own closing reminder; if the lock was refused or `state/.afk` exists, follow the digest's no-direct-supervision guidance.
 
@@ -425,9 +426,9 @@ If the resolved project is `local-only`, keep the work with the main firstmate e
 If a secondmate's scope fits, attempt one concise instruction from an active firstmate session via `FM_HOME=<this-firstmate-home> bin/fm-send.sh <id> '<work request>'` unless `FM_HOME` is already set to the active firstmate home, and treat the current no-session-bound-route refusal as undelivered instead of claiming the secondmate received it.
 The stable `fm-<id>` label printed by lifecycle commands still works, but exact task ids resolve first through this home's `state/<id>.meta`; pass an explicit backend target containing `:` only when intentionally targeting an endpoint outside this firstmate home.
 `fm-send` is fail-closed: `FM_HOME` must be set, and any target that cannot be resolved through this home's metadata or a well-formed explicit backend target exits non-zero instead of guessing a tmux window.
-A secondmate is itself a firstmate, so a request reaches it in its own chat, which you never read - the return channel that wakes you is its status file.
-So `fm-send` to a task selector whose meta is `kind=secondmate` automatically prepends a from-firstmate marker (`bin/fm-marker-lib.sh`); the secondmate recognizes it and returns its answer via its status file, or via a doc under its home plus a status pointer for a detailed response, never only in chat.
-Expect and read that response on the status/doc path the same way you read any other status signal; do not peek the secondmate's chat for the answer.
+A secondmate is itself a firstmate, so any future admitted request reaches it in its own chat, which you never read; the return channel that wakes you is its status file.
+Such a successful `fm-send` to a task selector whose meta is `kind=secondmate` will prepend a from-firstmate marker (`bin/fm-marker-lib.sh`), after which the secondmate returns its answer via its status file or via a doc under its home plus a status pointer.
+Read that response only after delivery was positively confirmed; the current refusal produces no answer to wait for.
 A captain typing directly into the secondmate's window is unmarked and stays a conversational captain intervention, so do not relay captain-destined chat through this path; the marker is applied only by `fm-send` to a `kind=secondmate` target.
 Do not spawn a direct crewmate for work that belongs to a secondmate scope unless the secondmate is blocked or the captain explicitly redirects it.
 If no secondmate scope fits, proceed in the main firstmate or create a new secondmate with the captain when that domain should become persistent.
@@ -529,12 +530,13 @@ After any merge you perform without asking the captain, post a one-line "merged 
 
 ### Validate
 
-For `no-mistakes`-mode ship tasks, when a crewmate's status says `done`, trigger validation using the crewmate's harness from `state/<id>.meta`.
-Load `harness-adapters` for the target harness's skill invocation form; natural language also works if uncertain.
+For `no-mistakes`-mode ship tasks, when a crewmate's status says `done`, attempt to trigger validation using the crewmate's harness from `state/<id>.meta`.
+Canonical text steering currently refuses before pane input on every backend, so a nonzero session-bound-route verdict means validation was not triggered; retain the lane and report the exact delivery blocker instead of claiming the pipeline started.
+Load `harness-adapters` for the target harness's skill invocation form; natural language is acceptable in an admitted launch or relaunch prompt when the exact form is uncertain.
 
 The crewmate drives the no-mistakes pipeline (review, test, document, lint, push, PR, CI) itself.
 As soon as a PR URL exists, run `bin/fm-crosscheck.sh run <id> <full GitHub PR URL>` independently so its policy-grade review can overlap the remaining no-mistakes work rather than becoming a serialized pipeline step.
-If the PR URL is not visible until no-mistakes returns, run crosscheck immediately at PR ready and do not present the PR as merge-ready until its report is clear.
+If the PR URL is not visible until no-mistakes returns, run crosscheck immediately at PR ready and do not present the PR as admission-clear until its exact-head report is clear.
 The ship brief intentionally does not restate no-mistakes gate mechanics; it points the crewmate to the version-matched SKILL.md loaded by `/no-mistakes`, `no-mistakes axi run --help`, and per-response `help` lines.
 Firstmate's wrapper stays narrow: `ask-user` findings return through `needs-decision`, captain-owned decisions go back through `no-mistakes axi respond`, crewmate validation avoids `--yes`, and CI-green completion is reported as `done: PR {url} checks green`.
 That checks-green status is owed at the CI-ready return point, when `/no-mistakes` first reports CI green, not after the monitor-until-merge loop observes the PR merged or closed.
@@ -548,7 +550,8 @@ So never infer current state from a `tail` of that log; `bin/fm-crew-state.sh` r
 The fields below name the run-step states and outcomes it reads from `no-mistakes axi status`; run that command directly when you want the full gate findings.
 During the `ci` monitor phase, `bin/fm-crew-state.sh` also reads the ci step log tail because `axi status` reports both "still waiting on checks" and "checks green, waiting on merge" as `ci,running`.
 A step that `axi status` renders as `quiet` is NOT evidence that anything died: a step running a configured `commands.*` shell command reports no pid, no round, and no log for its whole duration, which for this repo's test step is routinely hours.
-`bin/fm-crew-state.sh` appends a real liveness verdict there from `bin/fm-nm-step-liveness.sh`, which finds the step's own processes by working directory; the supervision boundary absorbs `alive` but surfaces `dead` and `unknown`, and a run must never be aborted without a `dead` verdict (`docs/postmortems/nm-quiet-test-step.md`).
+`bin/fm-crew-state.sh` appends the legacy diagnostic verdict from `bin/fm-nm-step-liveness.sh`, which finds the step's own processes by working directory; the supervision boundary absorbs only affirmative `alive` evidence and downgrades both legacy `dead` and `unknown` to UNKNOWN.
+That diagnostic never grants cancellation authority; the current exact-run process-window and no-cancellation contract is owned by `docs/structural-gates.md` Gate C, while `docs/postmortems/nm-quiet-test-step.md` remains historical evidence for why process attribution exists.
 
 - `running`/`fixing`/`ci` - the pipeline is working (a fix round, a test, or CI monitoring); `ci` stays working until the ci log's most recent recognized marker says checks passed or no checks are terminally ready, and a later re-arm or issue marker returns it to working.
 - `awaiting_approval`/`fix_review` - the run is parked waiting on the agent, surfaced as a top-level `awaiting_agent: parked <duration>` line right after `status:` in `axi status`.
@@ -563,12 +566,12 @@ A step that `axi status` renders as `quiet` is NOT evidence that anything died: 
 For PR-based ship tasks, the ready signal depends on mode: `no-mistakes` reports `done: PR <url> checks green` after CI is green, while `direct-PR` reports `done: PR <url>` after opening the PR.
 Before treating a no-mistakes ready signal as merge input, confirm `bin/fm-crew-state.sh <id>` reports `state: done`; a status-log PR URL alone is not currentness evidence, and `state: unknown` or `state: stale` with `do not merge` blocks this stage.
 Run `bin/fm-pr-check.sh <id> <PR url>` - it records `pr=` and GitHub's exact `pr_head=` in task meta, never arms a merge, and preserves any task-owned `state/<id>.check.sh`.
-Ensure `bin/fm-crosscheck.sh run <id> <PR url>` has completed for the current head, then read `data/<id>/crosscheck.md`; only a clear exact-head report is merge-ready.
+Ensure `bin/fm-crosscheck.sh run <id> <PR url>` has completed for the current head, then read `data/<id>/crosscheck.md`; a clear exact-head report is necessary for admission but never makes merge execution available.
 Tell the captain: the PR's full URL (always the complete `https://...` link, never a bare `#number` - the captain's terminal makes a full URL clickable), a one-paragraph summary, and, for `no-mistakes`, the risk level it emitted.
 (The check contract, for any custom `state/<id>.check.sh` you write yourself: print one line only when firstmate should wake, print nothing otherwise, and finish before `FM_CHECK_TIMEOUT`.)
 
 If the captain says "merge it", run `bin/fm-pr-merge.sh <id> <full GitHub PR URL>` as the required preflight and report its current atomic-boundary refusal without bypassing it.
-If `yolo=on`, merge a green/approved PR yourself the same way and post the required FYI.
+If `yolo=on`, run the same green/approved PR preflight without asking and report its atomic-boundary refusal; do not post a merged FYI because no merge occurred.
 The helper defaults to `--squash` and accepts merge-method flags such as `-- --merge`, `-- --rebase`, or `-- --method=merge` only to describe the refused future atomic operation.
 It refuses every other merge option, including repository overrides, `--auto`, `--queue`, `--admin`, and `--delete-branch`.
 
@@ -580,7 +583,7 @@ bin/fm-teardown.sh <id>
 
 The watcher normally invokes `bin/fm-auto-reap.sh` as soon as a terminal `done` task's recorded PR is provably merged.
 The approved local-only merge helper and completed-scout signal take the same automatic path.
-Auto-reaping cancels only an exactly attributed no-mistakes run, never guesses cross-branch process ownership, and then calls this ordinary teardown without `--force`.
+Auto-reaping never cancels a no-mistakes run; it retains any active or ambiguously attributed run and calls ordinary teardown without `--force` only after exact terminal run custody is established.
 Persistent secondmates are excluded, and X-mode-linked tasks wait for their required final follow-up.
 An automatic refusal is an actionable wake and retains its metadata, worktree, and acquisition authority; after resolving the reported cause, retry with the ordinary command above.
 The script refuses any worktree state that section 1 keeps protected; treat every refusal as a stop-and-investigate rather than an obstacle.
@@ -629,7 +632,7 @@ Whenever at least one task is in flight, keep exactly one live supervision wait 
 The emitted block is the only per-harness operating recipe in the session context.
 Do not substitute another harness's command shape for it.
 **Always-on wake triage (absorb only when proven benign).**
-`bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crewmates with positive working evidence (a complete exact-run process window with any process sample, or a busy pane read via `bin/fm-crew-state.sh`) unless the separate permission-stall no-progress threshold has expired, a declared `paused:` external wait until its bounded recheck cadence under the proof and precedence contract owned by `docs/architecture.md`, and no-change heartbeats; that owner also records the known defect `herdr-push-transition-pause-gate-h8`, under which the Herdr native edge can silently absorb a lane that owes an unanswered keyed decision and let it go quiet.
+`bin/fm-watch.sh` classifies every wake in bash and absorbs the benign majority without waking you: crewmates with positive working evidence from a complete exact-run process window containing at least one affirmative process sample, a declared `paused:` external wait until its bounded recheck cadence under the proof and precedence contract owned by `docs/architecture.md`, and no-change heartbeats; pane-only busy evidence remains UNKNOWN, and that owner also records the known defect `herdr-push-transition-pause-gate-h8`, under which the Herdr native edge can silently absorb a lane that owes an unanswered keyed decision and let that lane go quiet.
 It never absorbs a crewmate that stopped without that evidence - whatever its stale status log claims - and only an actionable wake is queued durably and ends the supervision wait, so you resume the emitted protocol exactly once per actionable event.
 A `paused:` status is a deliberate external wait, not `blocked:`; its initial signal still surfaces once, and a forgotten pause re-surfaces for a recheck once per window.
 A pause gates starting new work only and never suspends custody of a validation run already in flight, because a gated run parks at its next gate whether or not anyone is watching; this is the in-flight validation-custody boundary.
@@ -677,7 +680,7 @@ On wake, in order of cheapness:
    If the stale reason includes `demand-deep-inspection`, inspect the permission or system-dialog evidence before resuming supervision.
    If the pane is waiting, looping, confused, or unresponsive, load `stuck-crewmate-recovery`.
 4. `check:` a per-task poll fired (usually a merge, or X mode when enabled); act on it.
-5. `heartbeat:` a heartbeat wake now reaches you only when the watcher's bash fleet-scan caught a captain-relevant status the per-wake path missed (no-change heartbeats are absorbed in bash, never surfaced), so treat it as "something turned up" and review the whole fleet: start with `bin/fm-fleet-view.sh` for the structured overview, use `bin/fm-crew-state.sh <id>` only for targeted follow-up, peek panes that look off, check PR-ready tasks for merge, reconcile data/backlog.md, then resume the emitted supervision protocol.
+5. `heartbeat:` a heartbeat wake now reaches you only when the watcher's bash fleet-scan caught a captain-relevant status the per-wake path missed (no-change heartbeats are absorbed in bash, never surfaced), so treat it as "something turned up" and review the whole fleet: start with `bin/fm-fleet-view.sh` for the structured overview, use `bin/fm-crew-state.sh <id>` only for targeted follow-up, peek panes that look off, check PR-ready tasks for exact-head admission and captain review, reconcile data/backlog.md, then resume the emitted supervision protocol.
    Do not report that the fleet is unchanged.
 
 When a task reaches a terminal state on any of these wakes (a `done`/merge `check:`, a `failed` signal, a scout report, a local-only merge), and X mode is enabled, load `fmx-respond` (section 13) and post the X-mode mention's **final** completion follow-up if that task is X-mode-linked: `bin/fm-x-followup.sh --check <id>` then `bin/fm-x-followup.sh <id> --final --text-file <path>`, so the link always clears here regardless of how many of the up-to-three follow-ups were already spent on earlier milestones.

@@ -7,12 +7,13 @@
 # carried their own copy of the "is this composer row empty / pending / not an
 # agent composer" decision, and the copies drifted. The dangerous drift: a BARE
 # shell prompt glyph (`>`, `$`, `%`, `#`) - what a pane shows once its agent has
-# exited to a plain login shell - was treated as an empty, ready-to-inject
-# AGENT composer. The terminal-backed away-mode compatibility injector reads
-# composer-emptiness to decide whether a pane is a safe injection target, so a
-# dead-shell pane misread as "empty" meant an escalation could be typed into (and,
-# worst case, executed by) that shell. Consolidating the one decision here means
-# the safety rule cannot silently drift across adapters again.
+# exited to a plain login shell - was treated as an empty, ready-to-inject AGENT
+# composer. The terminal-backed away-mode compatibility path reads composer-
+# emptiness as a safety preflight before the later Gate B boundary, so a dead-
+# shell pane misread as "empty" historically allowed an escalation to be typed
+# into (and, worst case, executed by) that shell. Gate B now refuses every
+# current backend before input, while this defense remains required for any
+# future admitted route. Consolidating the decision here prevents adapter drift.
 #
 # THE SAFETY RULE this owner enforces: a bare shell prompt glyph is a genuine
 # empty agent composer ONLY when it appears INSIDE a real agent-composer

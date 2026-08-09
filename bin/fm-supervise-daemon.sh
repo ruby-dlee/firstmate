@@ -7,7 +7,8 @@
 # declared-pause rechecks. A native tracked-background launch delivers that
 # escalation by completing this daemon, which lets the harness's own task
 # notification wake the parked LLM. A terminal-backed compatibility launch
-# still delivers through the supervisor pane. This is the
+# attempts the shared session-bound supervisor-pane route, which currently
+# refuses before pane input and preserves the digest. This is the
 # token-efficient replacement for the prior always-inject daemon: routine
 # signal/stale/heartbeat wakes cost zero firstmate context; only done/
 # needs-decision/blocked/failed/persistent-wedge/check-output events and a
@@ -153,8 +154,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 . "$FM_DAEMON_DIR/fm-gate-refuse-lib.sh"
 fm_refuse_if_gate_agent
 
-# Shared tmux pane primitives for supervisor injection (busy/composer detection
-# + verify-retry submit). Sourced at top level so BOTH the executed daemon and
+# Shared tmux pane primitives for supervisor preflight and legacy submit tests.
+# Sourced at top level so BOTH the executed daemon and
 # the unit tests (which source this file for its pure functions) get the
 # corrected composer detection. Stale task rechecks use fm-backend.sh below.
 # shellcheck source=bin/fm-tmux-lib.sh
@@ -184,9 +185,10 @@ fm_refuse_if_gate_agent
 . "$FM_DAEMON_DIR/fm-supervisor-target-lib.sh"
 
 # --- tunables ---------------------------------------------------------------
-# Supervisor backends the compatibility path can inject into today. zellij, orca,
-# and cmux are real backends elsewhere in firstmate (bin/fm-backend.sh) but this
-# compatibility path has no verified composer/busy primitives for them yet - see
+# Supervisor backends whose panes the compatibility path can safely preflight.
+# Both still reach Gate B's no-session-bound-route refusal before input. zellij,
+# orca, and cmux are real backends elsewhere in firstmate (bin/fm-backend.sh) but
+# this path has no verified composer/busy primitives for them yet - see
 # docs/herdr-backend.md and AGENTS.md section 4's
 # harness-verification discipline. Selecting one refuses loudly at startup
 # instead of silently running tmux primitives against a pane that is not a tmux
@@ -731,9 +733,10 @@ escalate_add() {  # <state> <distilled-item>
 # Deliver one batched, single-line digest.
 # Native reap-wake delivery prints one completion reason and asks the main loop
 # to exit cleanly, which completes the harness-tracked background task.
-# Legacy terminal-backed delivery retains the pane injection compatibility path.
-# Returns 0 on successful delivery (or an empty buffer) and non-zero when the
-# buffer must be preserved for retry or catch-up.
+# Legacy terminal-backed delivery retains the pane compatibility attempt, whose
+# current session-bound gate returns nonzero before input. Returns 0 on native
+# delivery (or an empty buffer) and nonzero when the buffer must be preserved for
+# retry or catch-up.
 escalate_flush() {  # <state>
   local state=$1 buf n msg
   buf="$state/.subsuper-escalations"
@@ -1349,15 +1352,16 @@ inject_msg() {  # <message> [state]
     log "inject deferred: supervisor pane busy (agent mid-turn)"
     return 1
   fi
-  #   b) Composer-guard: inject ONLY into a confirmed-empty GENUINE agent
+#   b) Composer preflight: advance ONLY for a confirmed-empty GENUINE agent
   #      composer. The shared classifier (fm_backend_composer_state ->
   #      fm_composer_classify_content, bin/fm-composer-lib.sh) reports 'pending'
   #      for real unsubmitted text (a human's half-typed line, or a swallowed
   #      prior injection) and 'unknown' for a bare dead-shell prompt (the agent
   #      exited to its login shell) or an unreadable pane. Neither is a safe
   #      target - typing the escalation into a shell could execute it - so defer
-  #      on anything that is not affirmatively 'empty'. A deferred escalation
-  #      stays buffered for the next cycle or the catch-up flush.
+  #      on anything that is not affirmatively 'empty'. An empty result still
+  #      reaches the later session-bound steering gate, which currently refuses.
+  #      Every refusal stays buffered for the next cycle or catch-up flush.
   composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
   if [ "$composer" != empty ]; then
     log "inject deferred: supervisor composer not confirmed-empty (state=${composer:-unknown}: pending input, dead-shell prompt, or unreadable pane)"

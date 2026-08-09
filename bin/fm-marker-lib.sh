@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # fm-marker-lib.sh - the from-firstmate request marker.
 #
-# When the MAIN firstmate relays a work request to one of its SECONDMATES,
-# bin/fm-send.sh prepends this marker to the message text. A secondmate is itself
+# When the MAIN firstmate attempts to relay a work request to a SECONDMATE,
+# bin/fm-send.sh prepends this marker before the delivery gate. No current backend
+# passes that gate, so the remaining contract applies only after a future positive
+# session-bound receipt. A secondmate is itself
 # a firstmate running in its own home, so without a marker it treats every
 # incoming fm-send/tmux line as if its captain typed it and answers
 # CONVERSATIONALLY in its own chat. But the main firstmate never reads a

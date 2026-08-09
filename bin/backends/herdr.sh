@@ -2932,8 +2932,9 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
   fm_composer_classify_content "$bordered" "$stripped" "$FM_BACKEND_HERDR_IDLE_RE"
 }
 
-# fm_backend_herdr_send_text_submit: type <text> into <target> once (raw,
-# unsubmitted, via send_literal), then submit with a named Enter key, retried
+# fm_backend_herdr_send_text_submit: retained legacy regression primitive that
+# types <text> into <target> once (raw, unsubmitted, via send_literal), then
+# submits with a named Enter key, retried
 # (Enter only, never retyped) until herdr's NATIVE agent-state (agent get)
 # confirms a real turn started. Verified hazard (herdr-verification-p2.md
 # "slash/$ autocomplete popup"): a `/`- or `$`-prefixed send opens a
@@ -2989,10 +2990,10 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
 #     re-invokes this function from scratch with the same text after seeing
 #     an error, which is a human/escalation decision, not an automatic
 #     retry).
-# Echoes empty|pending|unknown|send-failed, the SAME vocabulary fm-send.sh
-# already branches on for tmux ("empty" means "confirmed submitted" for every
-# backend; how each backend confirms it is an internal decision - herdr's is
-# no longer literally "the composer read empty").
+# Echoes empty|pending|unknown|send-failed for historical compatibility. Gate B
+# leaves no production text-delivery caller for this primitive: fm-send.sh
+# refuses before input because herdr cannot prove an atomic agent-session-bound
+# submit, and none of these verdicts may be claimed as identity-bound delivery.
 fm_backend_herdr_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle> [expected-label]
   local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 expected_label=${6:-} i=0 verdict baseline confirm_sleep agent_json agent raw_status
   fm_backend_herdr_parse_target "$target" || { printf 'unknown'; return 0; }

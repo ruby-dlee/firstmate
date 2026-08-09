@@ -80,11 +80,11 @@ The always-on watcher also uses that library's absorb classification on no-verb 
 The daemon escalates captain-relevant events, plus a bounded recheck for a declared pause that remains idle, as one batched, single-line digest.
 On a native background-notify harness such as Claude, the daemon itself is the tracked background task and completes with an `afk-reap-wake:` reason when a batch becomes due.
 That native completion path never reads or types into the primary pane, and `state/.wake-queue` remains the lossless backlog the woken LLM drains before restarting the away daemon.
-A terminal-backed compatibility path remains for harnesses without a native tracked-background tool and prefixes its injected message with `FM_INJECT_MARK`.
-The compatibility injection path supports tmux and herdr panes, with `FM_SUPERVISOR_BACKEND` and `FM_SUPERVISOR_TARGET` resolved independently from the task-spawn backend.
-Pane existence, busy checks, composer checks, capture, and verified submit on that compatibility path route through `bin/fm-backend.sh`: tmux keeps the same submit core used by the tmux send backend, while herdr uses native busy state, native agent-state submit confirmation on idle baselines, and its ANSI-aware structural composer classifier for pending-input guards and submit fallback.
+A terminal-backed compatibility path remains for harnesses without a native tracked-background tool and prefixes its attempted digest with `FM_INJECT_MARK`.
+Its target preflight supports tmux and Herdr panes, with `FM_SUPERVISOR_BACKEND` and `FM_SUPERVISOR_TARGET` resolved independently from the task-spawn backend.
+Pane existence, busy checks, composer checks, and capture on that compatibility path route through `bin/fm-backend.sh`; the final text operation uses the same session-bound steering boundary as `fm-send.sh` and currently refuses before pane input on both tmux and Herdr.
 Composer-content classification has one shared owner, `bin/fm-composer-lib.sh`, used by tmux, herdr, Orca, and cmux after each adapter performs its own capture and composer-row recognition.
-The compatibility path injects only into an affirmatively `empty` composer, so both `pending` and `unknown` defer and a bare dead-shell prompt cannot receive an escalation; the complete policy is in [Composer-emptiness safety](herdr-backend.md#composer-emptiness-safety-2026-07-10-fleet-wide-across-all-four-backends).
+The compatibility path proceeds past composer preflight only on an affirmative `empty` result, then reaches the current session-bound steering refusal; `pending`, `unknown`, and every no-route result preserve the escalation buffer.
 Unsupported supervisor backends refuse only on the compatibility path because native reap-wake delivery has no supervisor-pane backend.
 Stalled compatibility delivery writes `state/.subsuper-inject-wedged` and attempts a configured backend-independent active alert after `FM_MAX_DEFER_SECS` instead of silently deferring forever.
 Native tracked delivery has no max-defer guard because a due batch completes the task directly without a pane-dependent defer condition.
@@ -162,7 +162,7 @@ Unsupported effort values are still recorded in task meta when passed to `fm-spa
 That keeps spawn launch compatible across claude, codex, grok, pi, and opencode while preserving the requested profile for later audit.
 New ship/scout observe and enforce account routing is backend-neutral and uses the direct profile-directory contract owned by [configuration.md](configuration.md#agent-fleet-account-routing).
 Routing remains default-off and adds no account field or provider environment override until an explicit account flag or observe/enforce policy enables it.
-The direct selector reads Agent Fleet only for pool membership and enabled worker eligibility, excludes disabled, non-worker, and manual-only profiles, requires Claude's fully validated non-secret per-directory Keychain approval marker, then uses fresh Codex quota opportunistically.
+The direct selector reads Agent Fleet only for pool membership and enabled worker eligibility, excludes disabled, non-worker, and manual-only profiles, requires Claude's fully validated non-secret per-directory Keychain approval marker, and admits Codex accounts only after a current exact-profile completion probe.
 If no usable Claude account for crewmates survives eligibility, the launch fails closed before fallback selection.
 Claude can declare a separate last-resort worker pool, consulted only after its primary worker pool is empty; no identity inference participates in either tier.
 It serializes round-robin fallback and exact-score tie-breaking so unavailable usage and concurrent launches cannot collapse onto the stable first account.
@@ -183,7 +183,8 @@ Seeding is transactional: if validation, cloning, initialization, or registry up
 `local-only` projects stay with the main first mate because they merge into the main local checkout instead of a remote-backed PR path.
 The same project may appear in multiple secondmate homes when their scopes differ, such as issue triage versus feature development.
 Secondmates are idle by default: after startup recovery reconciles only work already in their own home, an empty queue waits silently for routed tasks, and they never self-initiate surveys or audits.
-When called with `FM_HOME=<this-firstmate-home>` or when `FM_HOME` is already set to the active firstmate home, metadata-routed `fm-send.sh` requests to a live `kind=secondmate` are prefixed with the from-firstmate marker from `bin/fm-marker-lib.sh`, so the secondmate returns terse answers through status lines and detailed answers through docs plus status pointers instead of replying only in its own chat.
+If a future metadata-routed `fm-send.sh` request to a live `kind=secondmate` receives a positive session-bound delivery receipt, it is prefixed with the from-firstmate marker from `bin/fm-marker-lib.sh`, so the secondmate returns terse answers through status lines and detailed answers through docs plus status pointers instead of replying only in its own chat.
+Current requests refuse before pane input and therefore create no secondmate reply obligation.
 Explicit backend-target sends and direct human typing stay unmarked, so captain intervention in a secondmate pane remains conversational.
 After seeding a secondmate, `fm-backlog-handoff.sh` validates the fleet-specific handoff, then atomically delegates already-judged in-scope queued item moves to `tasks-axi mv` so the domain queue starts in the right place.
 Idle secondmate panes are healthy; teardown is explicit, proves the home identity and landed state before quiescing its endpoint, repeats those checks at the locked removal boundary, and uses `--force` only to recursively retire children that independently pass every safety proof.

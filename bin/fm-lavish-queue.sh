@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Queue one already-durable Lavish answer visibly into the supervisor CLI when a
-# safe terminal-backed target is available.
+# Attempt identity-bound visible delivery of one already-durable Lavish answer.
+# No current backend provides the required atomic session-bound receipt, so the
+# production route refuses without writing a delivery marker; ordinary Lavish
+# intake still recovers the durable answer later.
 #
 # This deliberately uses Firstmate's backend terminal adapters, not Claude Code
 # private state.

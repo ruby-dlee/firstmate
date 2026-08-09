@@ -103,7 +103,7 @@ GitHub reports `base.sha` as the base branch tip observed when the snapshot was 
 Treating it as the reviewed base made two failures routine: an un-rebased PR was refused before launch because the live base was not the checkout's merge base, and a ledger written minutes earlier stopped matching at the merge gate because the branch had moved for reasons unrelated to the PR.
 Both refusals were artifacts of comparing a moving value, not evidence about the change, and a gate that cannot be satisfied is worse than no gate because it trains its operators to route around it.
 The merge base converges instead: the default branch advancing cannot change it unless the branch absorbs commits already reachable from this head, in which case the remaining diff is a subset of what was reviewed and the review stays sound.
-Any change to the PR itself - a new commit, a rebase, a force-push - changes the head SHA, which invalidates the ledger match on its own, so the head remains the pin GitHub's atomic merge enforces.
+Any change to the PR itself - a new commit, a rebase, a force-push - changes the head SHA, which invalidates the ledger match on its own, so the head remains the pin Firstmate's admission preflight verifies.
 Verification therefore matches the live head and the stable claims digest, and checks the execution proof against the merge base the run recorded.
 Each run records both values: `base_sha` is the reviewed merge base, and `base_branch_sha` is the base branch tip GitHub reported at snapshot time, so a ledger shows on its face when the default branch had moved ahead of the review.
 The authoring worktree is not cloned, checked for cleanliness, or required to match the PR head because no verdict about the remote PR may depend on mutable author-lane filesystem state.
@@ -119,8 +119,8 @@ bin/fm-crosscheck.sh verify <task-id> <https://github.com/owner/repo/pull/number
 Verification re-reads the live PR head and complete claims document.
 It requires the latest attempt matching that head and the stable PR number/title/body claims digest to be clear, then prints only the exact reviewed SHA.
 Dynamic check counts in the full `gh-axi` document remain visible to the reviewer but are excluded from the digest so CI completing in parallel does not invalidate an otherwise exact review.
-The merge helper sends that SHA in GitHub's atomic merge request.
-A force-push before verification invalidates the ledger match, while a force-push after verification makes GitHub reject the expected-head merge request.
+The merge helper requires native admission to return that same SHA and then refuses at the unconditional atomic boundary before any GitHub merge request.
+A force-push before verification invalidates the ledger match, while a force-push after verification is caught by the later live-head admission check.
 
 ## Finding lifecycle
 

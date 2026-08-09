@@ -2,7 +2,9 @@
 # Promote a scout task to a ship task in place: the crewmate keeps its window,
 # worktree, and loaded context; only the contract changes. Flips kind= to ship in
 # state/<task-id>.meta so fm-teardown.sh applies the full ship-task teardown protection
-# again. After promoting, send the crewmate its ship instructions via fm-send.sh
+# again. After promoting, attempt the ship instructions via fm-send.sh and stop
+# when the current session-bound delivery gate refuses; never bypass it through
+# a raw split terminal submit. A future accepted route must carry these instructions:
 # (inventory scratch state, reset to a clean default-branch base, carry over only
 # intended fix changes, create branch fm/<task-id>, implement, write the ship
 # completion report, then report done according to the project's delivery mode).

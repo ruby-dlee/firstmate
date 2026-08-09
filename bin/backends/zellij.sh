@@ -530,8 +530,9 @@ fm_backend_zellij_capture() {  # <target> <lines> [expected-label]
   printf '%s' "$out" | tail -n "$lines"
 }
 
-# fm_backend_zellij_send_text_submit: type <text> into <target> once (raw,
-# unsubmitted, via send_literal), then submit with a named Enter key, retried
+# fm_backend_zellij_send_text_submit: retained legacy regression primitive that
+# types <text> into <target> once (raw, unsubmitted, via send_literal), then
+# submits with a named Enter key, retried
 # (Enter only, never retyped) until the pane visibly changes. Unlike herdr's
 # current native agent-state idle-baseline verifier and composer-state
 # fallback, zellij still uses a content-diff strategy because its CLI has no
@@ -541,9 +542,10 @@ fm_backend_zellij_capture() {  # <target> <lines> [expected-label]
 # swallowed (retry); changed means submitted. This content-diff approach is
 # also the load-bearing defense against the
 # unconditional-exit-0 CLI quirk documented in the file header: a truly dead
-# target never shows a change, so it correctly reports pending/unknown rather
-# than a false "sent". Echoes empty|pending|unknown|send-failed, the SAME
-# vocabulary fm-send.sh already branches on for tmux and herdr.
+# target never shows a change, so it reports pending/unknown rather than a false
+# "sent" inside the legacy contract. Gate B leaves no production text-delivery
+# caller: fm-send.sh refuses before input because zellij cannot prove an atomic
+# agent-session-bound submit, and these verdicts cannot prove delivery.
 fm_backend_zellij_send_text_submit() {  # <target> <text> <retries> <enter-sleep> <settle> [expected-label]
   local target=$1 text=$2 retries=$3 sleep_s=$4 settle=$5 expected_label=${6:-} typed after i=0
   fm_backend_zellij_send_literal "$target" "$text" "$expected_label" || { printf 'send-failed'; return 0; }

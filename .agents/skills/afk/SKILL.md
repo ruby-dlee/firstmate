@@ -46,9 +46,10 @@ Routine queue records may be present beside the captain-relevant record because 
 ## Terminal-backed compatibility delivery
 
 A harness without a native tracked-background tool uses `bin/fm-afk-launch.sh start` to create one non-visible tracked terminal.
-That compatibility path passes `FM_SUPERVISOR_TARGET` and `FM_SUPERVISOR_BACKEND` explicitly and delivers through the existing verified pane submit path.
-It retains the busy guard, affirmative-empty composer guard, type-once submit, `FM_MAX_DEFER_SECS` alarm, and `state/.subsuper-inject-wedged` marker.
-The compatibility path prefixes its injected message with `FM_INJECT_MARK`, ASCII unit separator `0x1f`, so firstmate can distinguish it from a real captain message in the shared input channel.
+That compatibility path passes `FM_SUPERVISOR_TARGET` and `FM_SUPERVISOR_BACKEND` explicitly, then attempts the shared agent-session-bound steering boundary.
+No current backend satisfies that boundary, so the digest stays buffered and the max-defer alarm surfaces instead of claiming delivery through a split pane submit.
+It retains the busy and affirmative-empty composer preflights, the legacy type-once submit helper behind the unavailable session-bound gate, `FM_MAX_DEFER_SECS`, and the `state/.subsuper-inject-wedged` marker.
+The compatibility path prefixes its attempted digest with `FM_INJECT_MARK`, ASCII unit separator `0x1f`, so a future successful session-bound route could distinguish it from a real captain message in the shared input channel.
 The marker never appears on native reap-wake delivery because a background-task completion is not a user message.
 
 ## Exit away mode
@@ -62,14 +63,14 @@ No `/back` command is required.
 
 On a real return message, run `bin/fm-afk-launch.sh stop` before clearing any state yourself.
 The launcher stops the daemon while `state/.afk` still exists, closes any exact recorded terminal, and clears `state/.afk` last.
-Native shutdown preserves any buffered escalation for catch-up, while terminal-backed compatibility shutdown may make its final guarded submit while the flag is still present.
+Native shutdown preserves any buffered escalation for catch-up, while terminal-backed compatibility shutdown makes one final guarded delivery attempt while the flag is still present and preserves the buffer when the session-bound route refuses.
 Drain `state/.wake-queue`, summarize any pending `state/.subsuper-escalations`, surface any legacy `state/.subsuper-inject-wedged` marker, and resume the primary harness supervision protocol emitted at session start.
 Bias ambiguous user-message cases toward exit because a present captain beats token savings and a false exit is self-correcting.
 
 ## Approval authority
 
 Away mode changes wake frequency, not approval authority.
-A PR ready for merge, an ask-user finding, a destructive action, an irreversible action, or a security-sensitive choice still requires the same approval it required before away mode.
+A PR ready for captain review, an ask-user finding, a destructive action, an irreversible action, or a security-sensitive choice still requires the same approval it required before away mode; the current structural gate independently keeps PR merge execution unavailable.
 
 ## Classification and batching
 

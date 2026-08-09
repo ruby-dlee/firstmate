@@ -1,8 +1,9 @@
 # Terminal-backed away-mode injection wedge alarm
 
 This alarm belongs only to the terminal-backed compatibility delivery used when a harness has no native tracked-background completion notification.
-That compatibility path buffers escalations and injects them into firstmate's own pane.
-When injection cannot confirm a submit past `FM_MAX_DEFER_SECS` (the pane is genuinely busy or wedged, or its Enter is swallowed), `inject_wedge_alarm` raises a loud, rate-limited alarm so the stall never stays invisible.
+That compatibility path buffers escalations and attempts delivery to firstmate's own pane.
+No current backend supplies the required atomic agent-session-bound submit, so the attempt refuses before pane input and preserves the buffer.
+When delivery remains unconfirmed past `FM_MAX_DEFER_SECS`, `inject_wedge_alarm` raises a loud, rate-limited alarm so the stall never stays invisible.
 Native tracked delivery completes the away daemon task when a batch is due, never inspects a pane, and therefore does not use this alarm.
 
 ## Why an active channel beyond the status-line flash

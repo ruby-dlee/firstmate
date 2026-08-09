@@ -23,9 +23,9 @@
 #          (fm-<id>) whose worktree was fast-forwarded to firstmate's own
 #          current default-branch commit (a purely LOCAL fast-forward, never an
 #          origin fetch) AND whose instruction surface (AGENTS.md, bin/, or
-#          .agents/skills/) actually changed; firstmate nudges each via
-#          bin/fm-send.sh fm-<id> so meta resolves the current backend target
-#          even when the same bootstrap run also respawned the secondmate.
+#          .agents/skills/) actually changed; firstmate attempts each nudge via
+#          bin/fm-send.sh fm-<id> so meta resolves the current backend target,
+#          then treats the present session-bound-route refusal as undelivered.
 #          Already-current or no-instruction-change homes are silently left alone.
 #          The secondmate sweep also propagates declared inheritable local config
 #          into each validated live secondmate home.

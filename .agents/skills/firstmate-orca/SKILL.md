@@ -44,16 +44,16 @@ Do not manually patch metadata to make an externally-created Orca terminal look 
 
 ## Supervision
 
-Use `bin/fm-peek.sh`, `bin/fm-send.sh`, `bin/fm-crew-state.sh`, and `bin/fm-teardown.sh` for routine operation.
-For steer messages, send short lines through `bin/fm-send.sh <id> '...'`; the stable `fm-<id>` alias also works.
-Put long instructions in the task brief or a temporary file and point the crewmate at that file.
+Use `bin/fm-peek.sh`, `bin/fm-crew-state.sh`, and `bin/fm-teardown.sh` for routine operation, and use `bin/fm-send.sh --key` only for supported control keys.
+Canonical text steering through `bin/fm-send.sh` currently refuses because Orca has no atomic agent-session-bound submit; a refusal means the message was not delivered.
+Put long instructions in the launch or relaunch brief; an already-running lane cannot be pointed at a new file until a session-bound steering route exists.
 
 When supervising, treat `state/<id>.meta` as the routing record and Orca's own ids as backend implementation details.
 The stable firstmate alias is `fm-<id>`.
 The recorded `terminal=` and `orca_worktree_id=` fields are what backend helpers use under the hood.
 
-If `fm-send` fails to submit, do not immediately repeat the same long instruction.
-Peek first, then decide whether the target is busy, waiting on a prompt, stuck behind a popup, or genuinely wedged.
+If a text `fm-send` refuses, do not repeat it: the unavailable session-bound route, not target state, is the blocker.
+For a supported control-key failure, peek first, then decide whether the target is busy, waiting on a prompt, stuck behind a popup, or genuinely wedged.
 For harness-specific interrupts or exits, load `harness-adapters`.
 
 ## Recovery
@@ -63,7 +63,7 @@ For a messy Orca-backed task:
 1. Read `state/<id>.meta` and the relevant status tail first.
 2. Confirm the task is actually Orca-backed before using Orca-specific assumptions.
 3. Use the recorded `terminal=`, `orca_worktree_id=`, and `worktree=` as the task identity.
-4. Prefer firstmate helpers for peek, send, state, and teardown.
+4. Prefer firstmate helpers for peek, supported control keys, state, and teardown; do not bypass the canonical text-steering refusal with Orca's raw split submit.
 5. Avoid raw deletion of Orca worktrees or manual branch cleanup.
 6. Stop and inspect if the recorded worktree path, Orca worktree id, or project checkout no longer matches expectations.
 

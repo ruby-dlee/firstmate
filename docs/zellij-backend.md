@@ -100,7 +100,7 @@ Zellij tasks additionally record:
 | Worktree-path discovery | marked active cwd probe + capture-scrape (`fm_backend_zellij_current_path`), NOT `.pane_cwd` | `.pane_cwd` reflects a `cd` run directly in the pane's own top-level shell, but does NOT follow a NESTED SUBSHELL's own `cd` (exactly what `treehouse get` does) - see "Worktree-path discovery: pane_cwd does not track a subshell" below. This directly contradicts the design report's assumption that passive `pane_cwd` polling would be "acceptable for tmux and zellij" (report gap #4 is NOT cleanly resolved as originally framed; the adapter works around it instead). |
 | Send literal (unsubmitted) | `zellij action paste --pane-id <id> -- <text>` | Uses bracketed paste mode, does NOT auto-submit. Verified directly: a marker sent this way sits unexecuted at the prompt until a separate Enter. Behaves like tmux's `send-keys -l` / herdr's `pane send-text`. Chosen over `write-chars` per the design report's recommendation for popup-safety parity with the other backends. The `--` separator keeps option-shaped text such as `--help` literal. |
 | Send key | `zellij action send-keys --pane-id <id> <key>` | Verified names: `"Enter"` (also `"enter"`) works; `"Esc"`/`"esc"` work but `"Escape"`/`"escape"` are REJECTED with "Invalid key"; Ctrl-C must be the SINGLE shell argument `"Ctrl c"` (a two-word key expression as ONE argv entry) - `"C-c"`, `"Ctrl+c"`, and passing `Ctrl`/`c` as two SEPARATE argv words all fail. Resolves report gap #2. |
-| Send + submit, composed | `paste` then `send-keys --pane-id <id> Enter` | Zellij has no single-call atomic "type and submit" primitive (unlike tmux's `send-keys ... Enter` or herdr's `pane run`); `fm_backend_zellij_send_text_line` composes the two calls, which is the only form this adapter has for that operation. |
+| Legacy send + submit helper | `paste` then `send-keys --pane-id <id> Enter` | Zellij has no single-call atomic agent-session-bound submit; the retained helper composes two calls for spawn-time probes and regression tests, while canonical `fm-send.sh` refuses it for steering. |
 | Bounded capture | `zellij action dump-screen --pane-id <id>` for 40 lines or fewer; `zellij action dump-screen --pane-id <id> --full` above that threshold | Works for a background session with NO attached client (resolves report gap #1). No `--lines`-style bound flag exists at all (unlike herdr's buggy small-N `--lines`, there is simply no flag). Routine watcher-sized reads use zellij's viewport-only dump to avoid unbounded scrollback reads; larger explicit peeks request `--full` and trim to the caller's requested line count locally with `tail`. The tradeoff: on a very short terminal viewport, a 40-line routine read can see fewer than 40 lines and miss content above the visible screen. |
 | Busy state | *(no native primitive)* | D5 (`herdr-addendum.md`): zellij has no agent-state API. `fm_backend_busy_state`'s dispatcher (`bin/fm-backend.sh`) falls through to `unknown` for zellij via its wildcard case, exactly like tmux - the watcher's existing pane-hash + regex path is the only busy-state source for this backend. |
 | Agent liveness | `list-panes --json` structural absence proof | `fm_backend_agent_alive` reports `dead` only when the recorded session or pane is absent and otherwise reports `unknown`, so `bin/fm-bootstrap.sh` can recover a structurally gone zellij secondmate endpoint without treating a present pane as proof about its agent process. |
@@ -161,7 +161,7 @@ This means the exit code can **never** be trusted to detect a bad target on this
 2. Output-**shape** validation rejects the "session not found" text fallback structurally: `fm_backend_zellij_create_task` requires `new-tab`'s stdout to parse as a bare integer (the colored session-list text does not), and every `list-panes`/`list-tabs` consumer pipes through `jq`, which fails to parse the plain-text fallback as JSON.
 
 **Accepted residual gaps**: a pane can still die in the brief window between `fm_backend_zellij_target_ready`'s ownership check and the operation's own `zellij action` call.
-That remaining race degrades to "the operation quietly did nothing" - the same class of gap firstmate already tolerates for an unverified send on any backend, caught downstream by `fm-spawn.sh`'s worktree-discovery poll timing out after 60s, `fm_backend_zellij_send_text_submit`'s preflight or content-diff retry loop (which reports `send-failed`, `pending`, or `unknown` rather than a false "sent" for these cases), or the watcher's stale-pane detection eventually noticing a pane that never changes.
+That remaining race degrades to "the operation quietly did nothing" for spawn-time probes and is caught by `fm-spawn.sh`'s worktree-discovery timeout; the legacy submit helper also retains regression-only failure verdicts, but canonical steering refuses before pane input.
 An explicit raw `session:pane` target can also still address a reused pane id if an operator deliberately bypasses firstmate metadata; that path is kept as an escape hatch, not as the normal task routing path.
 
 ## Every pane op needs an EXPLICIT `--pane-id` (un-anticipated finding)
@@ -181,11 +181,10 @@ Unlike herdr (where closing a tab's only root pane also closes the tab), zellij'
 `close-tab-by-id <id>` on a still-LIVE tab (pane running normally) was separately verified to cleanly remove both the pane and the tab in one call, needing no `close-pane` first.
 This is why `fm_backend_zellij_kill` resolves the owning tab id from the pane when possible, accepts teardown's recorded `zellij_tab_id` as a fallback when the pane has already gone, verifies the expected caller-facing `fm-<id>` label through the home-scoped-title or unambiguous legacy-title check when teardown provides it, and calls `close-tab-by-id`, rather than mirroring herdr's simpler "close the pane, the tab follows" contract.
 
-## Composer verification: delta-based
+## Legacy composer verification: delta-based
 
-Zellij's CLI exposes no cursor-row/ANSI-only capture primitive (like tmux's), so `fm_backend_zellij_send_text_submit` still uses a content-diff strategy: capture the pane right after typing (the unsubmitted "typed" baseline), then after each Enter attempt capture again - unchanged means retry, changed means submitted.
-This is now zellij-specific; the herdr adapter moved away from content-diff after the 2026-07-03 grok slash-submit incident and now confirms normal idle-baseline submits through native agent-state, retaining structural composer-state for the terminal-backed compatibility path's affirmative-empty injection guard and submit fallback.
-All implemented submit-verifying backends expose the identical caller-facing verdict vocabulary (`empty`, `pending`, `unknown`, `send-failed`), so `fm-send.sh` needs no Zellij-specific submit-verdict branch.
+Zellij's CLI exposes no cursor-row/ANSI-only capture primitive, so the retained `fm_backend_zellij_send_text_submit` regression helper uses a content-diff strategy: unchanged means retry and changed means submitted.
+That split transport is not production evidence of delivery and canonical `fm-send.sh` refuses it before literal input.
 
 ## Session safety
 
@@ -194,7 +193,7 @@ The realistic risk for this backend is instead a test accidentally reusing (and 
 `tests/zellij-test-safety.sh`'s `zellij_refuse_if_unsafe` guards against both: it refuses an empty name, the literal `"firstmate"` default, or a name not currently listed as active, before `zellij_safe_delete` is allowed to run `delete-session --force`.
 Every real-zellij test in this document and its accompanying test files uses a uniquely-named session (`fm-backend-smoke-$$`, or similar) and this guarded cleanup path exclusively.
 
-## End-to-end verification (spawn -> steer -> peek -> done -> merge -> teardown)
+## Historical end-to-end verification before Gate B
 
 Beyond the fake-CLI unit tests (`tests/fm-backend-zellij.test.sh`) and the real-CLI smoke tests (`tests/fm-backend-zellij-smoke.test.sh`), the full firstmate lifecycle was driven end to end against a real `claude` crewmate through this branch's own scripts, in a scratch `FM_HOME`, a scratch `local-only` git project, and an isolated `FM_ZELLIJ_SESSION` (never the real `firstmate` session name):
 
@@ -202,7 +201,7 @@ Beyond the fake-CLI unit tests (`tests/fm-backend-zellij.test.sh`) and the real-
 2. `FM_HOME=<scratch> FM_ZELLIJ_SESSION=<isolated> bin/fm-peek.sh fm-zellij-e2e-t1` - showed the live claude trust dialog ("Quick safety check: Is this a project you created or one you trust?").
 3. `FM_HOME=<scratch> FM_ZELLIJ_SESSION=<isolated> bin/fm-send.sh fm-zellij-e2e-t1 --key Enter` - accepted the trust dialog.
 4. `FM_HOME=<scratch> FM_ZELLIJ_SESSION=<isolated> bin/fm-peek.sh fm-zellij-e2e-t1` again - showed claude actively working through the brief (verifying isolation, then implementing).
-5. `FM_HOME=<scratch> FM_ZELLIJ_SESSION=<isolated> bin/fm-send.sh fm-zellij-e2e-t1 "captain says: proceed as planned, this is a trivial verification task"` - a plain-text steer while claude was mid-turn, exercising the delta-based send-and-verify path; the send completed without a `pending`/`send-failed` error.
+5. Before Gate B, `fm-send.sh` accepted a plain-text steer through the delta-based helper; this is historical transport evidence and is not an admitted current route.
 6. The crewmate appended `done: ready in branch fm/zellij-e2e-t1` to its status file, and its commit (`add hello.txt`, message `add hello.txt`) was confirmed present on branch `fm/zellij-e2e-t1` in the project's git history, with `hello.txt` containing exactly the expected line.
 7. `bin/fm-teardown.sh zellij-e2e-t1` **REFUSED**, exactly as required: `REFUSED: local-only worktree ... has work not yet merged into main and not on any remote.`
 8. `bin/fm-merge-local.sh zellij-e2e-t1` - fast-forwarded local `main` to the crewmate's commit (`02c9dd2 -> ba41f90`).

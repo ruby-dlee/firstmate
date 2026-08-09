@@ -14,17 +14,18 @@ metadata:
 Steer every crewmate to the same bar the captain holds firstmate to.
 Apply this skill both while writing the initial brief and while live-steering work already in flight.
 Keep each brief or steer proportional: name the outcome, constraint, evidence, and next action, then stop.
+Canonical live text steering currently refuses before pane input because no backend supplies an atomic agent-session-bound submit, so apply the live-steer guidance to the intended instruction and carry it through the next permitted launch or relaunch brief instead of bypassing Gate B or claiming delivery.
 
 ## Apply it in both modes
 
 When writing a brief, make the expected result, authority boundaries, verification, and definition of done unmistakable.
-When live-steering, correct the smallest load-bearing mistake early and require the crewmate to carry the fix through implementation and proof.
+When preparing a live steer, correct the smallest load-bearing mistake early and require the crewmate to carry the fix through implementation and proof once an admitted launch or delivery route carries it.
 In both modes, preserve the captain's actual goal and use the existing owner for detail instead of copying its contract.
 
 ## 1. Demand ownership
 
 Require the crewmate to solve and implement the task: it never stops solely because work is hard or failing, it preserves mandated safety `blocked` stops such as unsafe or non-isolated worktree placement, and it exhausts its capability before following the solve-first escalation bar owned by `AGENTS.md` section 9.
-When a lane reports `paused:` while its run-step is active, apply the in-flight validation-custody boundary from `AGENTS.md` section 8: steer it back to attending and driving the run instead of accepting the pause.
+When a lane reports `paused:` while its run-step is active, apply the in-flight validation-custody boundary from `AGENTS.md` section 8: require it to return to attending and driving the run, using relaunch when the current text-steering gate prevents delivery.
 
 ## 2. Reject vague or optimistic claims
 
@@ -44,7 +45,7 @@ Reject any quiet reframing of the task into a smaller win; prime directive 5 and
 
 ## 6. Be direct and early
 
-Write specific, un-bloated briefs and steers, and correct a wrong path before it is built; `AGENTS.md` section 11 owns the brief contract.
+Write specific, un-bloated briefs and intended steers, and correct a wrong path before it is built; `AGENTS.md` section 11 owns the brief contract.
 
 ## Finish the steer
 

@@ -50,6 +50,7 @@ Launching a supported harness inside it instantiates your first mate - and makes
 - **Optional multi-account routing** - route Claude and Codex crewmates through explicit or pooled [Agent Fleet](tools/agent-fleet/) profiles while preserving sticky recovery and provider-neutral continuation.
 - **Durable completion reports** - every new ship and scout task publishes a detailed, visual, searchable report to one machine-global stack through fail-closed teardown.
 - **Event-driven, zero-token supervision** - a bash watcher sleeps on the fleet and wakes the first mate only when something needs you; verified primary harnesses also get a turn-end backstop that blocks or follows up on a blind stop when work is in flight and supervision is not live.
+- **Fail-closed steering and PR admission** - pane-backed text steering currently refuses because no backend can atomically bind submit to the registered agent session, and PR merge attempts run exact-head admission before refusing at the unavailable atomic merge boundary.
 - **Optional X mode** - opt in with one local `.env` token so firstmate can answer your public `@myfirstmate` mentions, act on normal reversible mention requests through the same lifecycle as chat requests, acknowledge spawned work, and post up to three public-safe completion follow-ups within seven days for genuine milestones and the final outcome without changing non-X behavior; dry-run preview records would-be replies and dismissals locally before go-live.
 - **Guarded by construction** - the first mate is read-only over your projects outside guarded clone refreshes, safe branch pruning, and approved `local-only` fast-forward merges; crewmates make every project change behind your merge approval.
 - **Restart-proof** - all state lives on disk and in the active session backend (tmux by hard default, herdr or cmux when selected or auto-detected, zellij/orca when explicitly selected); kill the session anytime and the next one reconciles, including confirmed-dead secondmate agents, and carries on.
@@ -121,6 +122,9 @@ For Pi, approve the project trust prompt once per clone on first launch so both 
   (fix flaky login test - risk: low - CI green)
 
 > alright merge it
+
+  Merge preflight passed the available exact-head checks, but merge execution is unavailable:
+  no atomic server-and-worktree custody boundary can prevent later queued execution.
 ```
 
 ### More backends
@@ -138,7 +142,7 @@ Setup guides for tmux (the default) and the new-task-capable herdr, zellij, and 
  │ reads projects/ + firstmate routes  │
  │ writes guarded backlog/briefs/state │
  └──┬──────────────┬───────────────┬───┘
-    │ backend sends / status files │
+    │ launch prompts / status files│
     ▼              ▼               ▼
  ┌────────┐   ┌────────┐      ┌────────┐
  │fm-task1│   │fm-task2│  ... │fm-taskN│   tmux windows, herdr/zellij tabs, or cmux workspaces

@@ -15,7 +15,7 @@ A Codex lane can silently run below the required reasoning policy because launch
 - Direct-account selection passes through `bin/fm-account-directory.sh`, which considers only accounts with a current positive completion proof from an isolated real `codex exec` probe and ignores quota telemetry for admission.
 - Positive and negative account proofs have bounded lifetimes, are serialized, and are bound to the physical account-directory identity, so stale or redirected caches cannot authorize routing.
 - Direct-account recovery passes through `bin/fm-spawn.sh --recover-direct-account`, which re-resolves the current harness and Codex policy instead of replaying the recorded model and effort.
-- Steering a managed Codex target passes through `bin/fm-send.sh`, which runs `bin/fm-runtime-profile.sh` before delivering text and refuses when the current generation is not positively verified.
+- Steering a managed Codex target passes through `bin/fm-send.sh`, which runs `bin/fm-runtime-profile.sh` before the delivery gate; a runtime mismatch refuses there, and a verified runtime still reaches Gate B's current no-session-bound-route refusal.
 - Runtime supervision passes through `bin/fm-watch.sh` and `bin/fm-supervise-daemon.sh`, which re-run the exact-generation runtime verifier at bounded intervals and surface a mismatch instead of treating the lane as healthy.
 - `bin/fm-codex-runtime-profile.mjs` reads Codex's own session records and requires the recorded provider session, generation, model, and reasoning effort to match the task metadata and policy.
 - Herdr's Codex pane-input steering route is closed because pane input cannot atomically preserve the registered agent session and Herdr's native send can reapply stored settings.
@@ -49,20 +49,21 @@ A command can be accepted by a backend client without reaching the intended live
 
 - Text delivery through `bin/fm-send.sh` requires target resolution, endpoint identity verification, lifecycle revalidation for managed targets, an atomic agent-session-bound backend confirmation, and a fresh identity-bound target read after submission.
 - No current backend can bind terminal input atomically to the registered agent session, so every production text-steering adapter refuses before pane input instead of falling back to split text-plus-Enter.
-- Key delivery through `bin/fm-send.sh` uses the same managed identity and lifecycle checks and records an explicit delivered or not-delivered event.
+- Control-key delivery through `bin/fm-send.sh` uses the same target resolution and managed lifecycle checks but remains a backend-specific one-shot operation; its zero exit reports only that key call, never delivery of a text instruction.
 - Tmux verification binds the recorded stable window ID and session identity, so a reused window name in another session is not the target.
 - Herdr verification preserves the exact backend target and registered label when metadata exists, and an explicit metadata-free target remains visibly unbound.
 - Secondmate markers and ordinary steering both use the same `fm-send` boundary, so no alternate supervisor send path can claim success from submit alone.
+- Terminal-backed away-mode delivery and `bin/fm-lavish-queue.sh` both call `fm_backend_send_steering`; they preserve their durable buffers or answer records and refuse visible-delivery claims when the current atomic route is unavailable.
 
 ### Trigger, predicate, and failure mode
 
-- Trigger: every `fm-send` text or key request.
-- Predicate: the exact target remains identity-matched, the backend returns `confirmed` from an atomic agent-session-bound submit, and a fresh post-submit read succeeds from that same target.
+- Trigger: every `fm-send` text request; control-key requests take the narrower routed lifecycle path described above.
+- Predicate: for text, the exact target remains identity-matched, the backend returns `confirmed` from an atomic agent-session-bound submit, and a fresh post-submit read succeeds from that same target.
 - Failure mode: an unavailable atomic route, submit failure, pending confirmation, unknown confirmation, malformed verdict, lifecycle drift, identity mismatch, or failed post-submit read exits nonzero and is journaled as not delivered or not submitted.
 
 ### Deterministic evidence
 
-- `tests/fm-send-strict.test.sh` covers successful verified delivery, submit-only false positives, malformed verdicts, identity reuse, lifecycle races, and audit outcomes.
+- `tests/fm-send-strict.test.sh` covers a test-lab atomic receipt plus production no-route refusal, submit-only false positives, malformed verdicts, identity reuse, lifecycle races, and audit outcomes.
 - `tests/fm-send-permission-modal-probe.sh` proves every Herdr composer and modal state remains untouched when no atomic steering route exists.
 
 ## Gate C - Epistemically safe liveness and custody
@@ -74,7 +75,7 @@ Absence of a process sample, a stale status field, or one quiet observation can 
 ### Complete route inventory
 
 - `bin/fm-run-liveness.sh` is the exact run-ID, branch, and head-attributed process owner and emits only `BUSY` from affirmative process evidence or `UNKNOWN` otherwise.
-- `bin/fm-nm-step-liveness.sh` maps affirmative process evidence to `alive` and every absence, timeout, unreadable state, and repeated zero sample to `unknown`.
+- `bin/fm-nm-step-liveness.sh` remains a legacy diagnostic that can render confirmed process absence as `dead`; every production supervision consumer downgrades that vocabulary to UNKNOWN, while `bin/fm-run-liveness.sh` owns the exact-run process window used for absorption.
 - `bin/fm-crew-state.sh` consumes branch-matched run evidence before pane and status evidence and downgrades legacy `dead` vocabulary to unknown.
 - `bin/fm-classify-lib.sh`, `bin/fm-watch.sh`, and `bin/fm-supervise-daemon.sh` absorb a lane only from affirmative run-owned process evidence; pane, status, missing-target, and unreadable observations remain UNKNOWN.
 - Watcher hash, pause, permission, signal, turn-end, surfaced-heartbeat, and daemon state families use bounded SHA-256 task keys with safe exact-identity owner records and migrate legacy state only for one positively verified owner.
@@ -102,7 +103,7 @@ Absence of a process sample, a stale status field, or one quiet observation can 
 ### Deterministic evidence
 
 - `tests/fm-run-liveness.test.sh` covers affirmative BUSY, absence as UNKNOWN, branch blindness, detached work, and host-pressure recording.
-- `tests/fm-nm-step-liveness.test.sh` covers quiet, frozen, vanished, repeated-zero, and working process windows without a dead verdict.
+- `tests/fm-nm-step-liveness.test.sh` preserves the legacy diagnostic vocabulary, while `tests/fm-crew-state.test.sh`, `tests/fm-watch-triage.test.sh`, and `tests/fm-fleet-snapshot-view.test.sh` prove a legacy `dead` result cannot become a production death or cancellation verdict.
 - Focused liveness shards in `tests/fm-watch-triage.test.sh` and `tests/fm-daemon.test.sh` cover status-field and heartbeat non-inference, bounded long-identity custody, adversarial owner rejection, collision-free signal custody, unsafe legacy quarantine, and atomic UNKNOWN retry publication.
 - `tests/fm-backend-herdr.test.sh` proves native transition markers remain collision-free, safely migrate deployed carriers, retain ambiguous ownership, and reject teardown races, buffered edges, and stale owners after window reuse.
 - Focused direct-spawn cases in `tests/fm-account-directory.test.sh` and `tests/fm-teardown-suite.sh` prove both immediate and retained rollback clear failed-generation transition custody before prior metadata restoration.

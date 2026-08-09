@@ -126,8 +126,8 @@ The fake-Orca authority lab is synthetic regression scaffolding, not provider ev
 - retention and cleanup of pathless or malformed-create quarantines, including spawn retry refusal while cleanup remains pending;
 - runtime readiness gating through `orca status --json`;
 - synthetic legacy `fm-spawn.sh --backend orca` metadata creation and harness launch inside the authority lab;
-- `fm-peek.sh`, `fm-send.sh`, and `fm-crew-state.sh` routing through recorded Orca metadata;
-- slash-command popup placeholder handling that requires a second Enter before `fm-send.sh` reports submission;
+- `fm-peek.sh`, control-key `fm-send.sh`, and `fm-crew-state.sh` routing through recorded Orca metadata;
+- legacy slash-command popup placeholder handling in compatibility tests, while canonical text steering refuses before the split submit;
 - scout teardown releasing an Orca worktree through `orca worktree rm`;
 - terminal-state classification for live reads, stale-handle absence on nonzero exit, ambiguous failures, and terminal/worktree identity drift;
 - ship teardown failing closed when the recorded Orca worktree id is missing, cannot resolve to a path, or resolves to a different path than `worktree=`.

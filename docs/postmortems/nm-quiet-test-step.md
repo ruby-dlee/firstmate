@@ -3,6 +3,9 @@
 Four firstmate-repo validation runs were reported dead at the `test` step, and every firstmate PR was declared blocked from validating.
 Three further runs were aborted to escape the same reported condition, the last of them during this investigation.
 
+> Current contract: this document preserves the 2026-08-02 incident evidence and the legacy diagnostic vocabulary.
+> Gate C in [`docs/structural-gates.md`](../structural-gates.md) now owns production liveness and custody: only affirmative exact-run process evidence proves BUSY, every absence is UNKNOWN, and Firstmate has no automatic validation-abort route.
+
 **None of those steps was dead.**
 All of them were executing normally.
 The reported condition was a false negative produced by three independent no-mistakes signals that all read as death for a step running a configured shell command, compounded by a hand check that cannot see the processes it was looking for.
@@ -100,7 +103,7 @@ That reasoning was sound but answered the wrong question: load explains *how muc
 It finds processes by **working directory**, which is the one attribute that reliably identifies them, and separates three outcomes that were previously indistinguishable.
 
 - `alive` - processes present and making measurable progress.
-- `dead` - provably zero processes while the step is recorded running. This is the only verdict that justifies discarding a run.
+- `dead` - the legacy diagnostic's name for two empty process scans; production consumers now downgrade it to UNKNOWN, so it does not justify discarding a run.
 - `unknown` - the answer could not be established. Fail-closed, following the rule `bin/fm-lock-lib.sh` already applies to `lsof`: an unreadable answer is never evidence of absence. Its grade distinguishes `unreadable`, `transition`, `present-unproven`, and `present-no-progress` without making any grade healthy.
 
 `bin/fm-crew-state.sh` calls it automatically with a one-second in-invocation sample whenever the active step renders quiet, so a one-shot heartbeat read can establish process churn without relying on an earlier call.
@@ -114,7 +117,7 @@ state: working · source: run-step · validating (running) · liveness: alive (3
 ```
 
 The verdict is appended as an observation and never overrides the run state, because a step caught momentarily between processes would otherwise be reported dead - recreating the failure in the opposite direction.
-The shared supervision boundary absorbs `alive`, but surfaces both `dead` and `unknown`; an unreadable observation is not evidence of health.
+The shared supervision boundary absorbs affirmative `alive` evidence, but maps both legacy `dead` and `unknown` to UNKNOWN and surfaces them without cancellation authority.
 The `ci` step is exempt: its monitoring runs inside the daemon and owns no worktree process, so a verdict there would always read `dead` and mean nothing.
 
 The unit of work and its age ride along on that line because "alive" alone still leaves hours of runtime unexplained.
@@ -133,7 +136,8 @@ Observed wall times were 2.00s, 1.65s, 1.76s, 1.69s, and 1.66s including the pro
 
 ## Operating rule
 
-**Never abort a run on a reported-quiet step without a `dead` verdict from `bin/fm-nm-step-liveness.sh`.**
+**Never abort a run from a reported-quiet step or any process-absence observation.**
+Use `bin/fm-run-liveness.sh` for the exact-run process window; only its affirmative process sample proves BUSY, while every zero, unreadable, stale, or mismatched result remains UNKNOWN and retains custody.
 Quiet is not evidence.
 For a configured-command step, quiet is the *expected* rendering for the step's entire duration, and for this repo that duration is routinely measured in hours.
 
@@ -148,13 +152,13 @@ Either change alone would have prevented this incident by making a healthy comma
 The smallest correct fix is the pid: it is a single field on a record no-mistakes already writes when it spawns the process, and it makes liveness answerable from `axi status` alone with no process inspection at all.
 
 **Recovery.**
-A step whose process genuinely dies stays `running` forever.
-`axi respond --action fix` refuses because the step is not `awaiting_approval`, `axi run` re-attaches to the same stuck run, and only `abort` escapes - at the cost of the entire run.
+A step whose process genuinely dies can stay `running` forever.
+`axi respond --action fix` refuses because the step is not `awaiting_approval`, and `axi run` re-attaches to the same stuck run.
 That gap is real and was correctly identified; it is simply not what happened on 2026-08-02.
 The smallest correct fix is for the daemon to reap a step whose recorded process is gone and mark it failed, which makes the existing auto-fix path applicable instead of requiring an abort.
 
 Neither can be fixed from this repo: no-mistakes is installed as a compiled binary at `~/.no-mistakes/bin/no-mistakes` with no source available here.
-Until they land, `bin/fm-nm-step-liveness.sh` is the detection firstmate needs, and abort remains the only recovery for a genuinely dead step.
+Until they land, Firstmate retains the lane and reports UNKNOWN rather than converting the tool's missing recovery mechanism into cancellation authority.
 
 ## Separate finding: is a multi-hour test step legitimate or hung?
 
@@ -195,7 +199,7 @@ They are competing for 14 cores, at a load average of 26-31 during this incident
 
 Three separate problems compounded, and only the first is fixed here.
 
-1. **No liveness signal for a configured-command step.** The subject of this postmortem, fixed by `bin/fm-nm-step-liveness.sh`.
+1. **No liveness signal for a configured-command step.** This postmortem introduced the cwd-based legacy diagnostic; Gate C later superseded its absence verdict with the exact-run positive-evidence-only process window.
 2. **The suite was an hour long serially.**
    At incident time, `tests/behavior-test-durations.tsv` summed to 59.2 minutes across 92 scripts, and the gate ran them in one serial loop.
    Tracked separately as `fm-gate-serial-e2e-bottleneck`; deliberately not addressed here.
@@ -203,7 +207,7 @@ Three separate problems compounded, and only the first is fixed here.
 
 A slow step, with no liveness signal, whose slowness is amplified by unbounded parallel runs, is indistinguishable from a hang.
 That combination is what produced four wrong calls in one day, and no single one of the three explains it.
-Fixing the liveness signal does not make a multi-hour gate step operable; it only makes the difference between working and dead observable, so a wrong call is no longer the default outcome.
+Fixing the liveness signal does not make a multi-hour gate step operable; it makes affirmative work observable without turning absence into a death claim, so a wrong destructive call is no longer the default outcome.
 
 ### The dominant mechanism is contention, not a deadlock
 

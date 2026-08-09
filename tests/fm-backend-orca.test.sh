@@ -17,6 +17,7 @@ pass() {
 }
 
 TMP_ROOT=$(fm_test_tmproot fm-backend-orca-tests)
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 
 make_orca_fakebin() {  # <dir> -> echoes fakebin dir
   local fb="$1/fakebin"

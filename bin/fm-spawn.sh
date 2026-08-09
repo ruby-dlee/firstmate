@@ -4368,9 +4368,23 @@ if [ "$BACKEND" != herdr ]; then
 fi
 
 bind_codex_runtime_generation() {
-  local wait_seconds deadline provider identify_out verify_out rc session lock tmp
+  local wait_seconds deadline provider identify_out verify_out rc session lock tmp test_tmp_root
   wait_seconds=${FM_CODEX_RUNTIME_BIND_WAIT_SECONDS:-10}
   case "$wait_seconds" in ''|*[!0-9]*|0) echo "error: invalid Codex runtime bind wait '$wait_seconds'" >&2; return 1 ;; esac
+  if [ "${FM_CODEX_RUNTIME_TEST_LAB:-}" = firstmate-codex-runtime-test-lab-v1 ]; then
+    test_tmp_root=$(cd "${TMPDIR:-/tmp}" && pwd -P) || return 1
+    case "$(cd "$CODEX_RUNTIME_HOME" 2>/dev/null && pwd -P)" in
+      "$test_tmp_root"/*) ;;
+      *) echo "error: Codex runtime test lab requires an isolated runtime home" >&2; return 1 ;;
+    esac
+    case "$(cd "$WT" 2>/dev/null && pwd -P)" in
+      "$test_tmp_root"/*) ;;
+      *) echo "error: Codex runtime test lab requires an isolated worktree" >&2; return 1 ;;
+    esac
+    node "$SCRIPT_DIR/../tests/fm-codex-runtime-test-publisher.mjs" \
+      "$CODEX_RUNTIME_HOME" "$WT" gpt-5.6-sol xhigh \
+      "$SPAWN_GENERATION_ID" "$RUNTIME_STARTED_AT_NS" || return 1
+  fi
   deadline=$(( $(date +%s) + wait_seconds ))
   while :; do
     if [ "$(fm_account_meta_value "$STATE/$ID.meta" generation_id)" != "$SPAWN_GENERATION_ID" ] \

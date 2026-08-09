@@ -41,6 +41,7 @@ set -u
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 fm_git_identity fmtest fmtest@example.com
 TMP_ROOT=$(fm_test_tmproot fm-secondmate-harness)
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 export FM_BACKEND=tmux
 
 # ===========================================================================
@@ -1120,6 +1121,11 @@ test_config_push_exits_nonzero_on_copy_error() {
     "copy error did not emit a stderr diagnostic"
   pass "B14 config-push exits nonzero on real propagation errors"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = crew-unaffected ]; then
+  test_spawn_fallback_chain_and_crew_scout_unaffected
+  exit 0
+fi
 
 test_harness_resolution
 test_secondmate_model_effort_tokens

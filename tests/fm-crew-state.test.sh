@@ -25,11 +25,9 @@
 #       bin/fm-nm-step-liveness.sh, and the ci step is exempted because it owns
 #       no worktree process - the 2026-08-02 false-dead regression pair
 #   (k) crew_is_provably_working end-to-end over the REAL helper (not a canned
-#       fake fm-crew-state.sh verdict): cross-branch attribution via the runs
-#       list -> absorbed; genuinely no run anywhere + idle pane -> surfaced.
-#       This is the direct regression pair for the 2026-07-02 herdr incident,
-#       proving the watcher's own absorb-only-when-provably-working predicate
-#       benefits from the fix in both directions.
+#       fake fm-crew-state.sh verdict): cross-branch attribution without an
+#       exact run id -> surfaced as UNKNOWN; genuinely no run anywhere + idle
+#       pane -> surfaced too. This pins the watcher's fail-closed custody rule.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -1242,9 +1240,11 @@ test_cross_branch_attribution_via_runs_list() {
 EOF
 )"
   local out; out=$(run_crew_state "$d" feat-f)
-  assert_contains "$out" "state: working" "this branch's own run attributed via the runs list"
+  assert_contains "$out" "state: unknown" "runs-list attribution without an exact run id is unknown"
   assert_contains "$out" "source: run-step" "runs-list-resolved run -> run-step source"
-  pass "cross-branch run is attributed via the real runs list"
+  assert_contains "$out" "fm/feat-f at bbbbbbb" "runs-list attribution retains branch and head evidence"
+  assert_contains "$out" "lacks exact current run identity" "runs-list attribution names the missing custody proof"
+  pass "cross-branch runs-list attribution fails closed without exact custody"
 }
 
 # The runs list is newest-first; a branch with an OLDER completed run must not
@@ -1263,8 +1263,9 @@ test_cross_branch_attribution_picks_most_recent_row() {
 EOF
 )"
   local out; out=$(run_crew_state "$d" feat-fq)
-  assert_contains "$out" "state: working" "most recent (running) row wins over an older completed row"
+  assert_contains "$out" "state: unknown" "most recent running row still lacks exact run custody"
   assert_contains "$out" "source: run-step" "most-recent-row resolution -> run-step source"
+  assert_contains "$out" "fm/feat-fq at ccccccc" "most recent branch head wins over an older completed row"
   pass "cross-branch attribution picks the branch's most recent row"
 }
 
@@ -1303,7 +1304,7 @@ EOF
   FM_FAKE_CI_LOGS="CI checks running, waiting for results..."
   local out; out=$(run_crew_state "$d" feat-coarseready)
   assert_contains "$out" "state: unknown" "coarse ready status without run identity -> unknown"
-  assert_contains "$out" "source: status-log" "coarse ready status remains status-log sourced"
+  assert_contains "$out" "source: run-step" "coarse ready status remains runs-list sourced"
   assert_contains "$out" "do not merge" "coarse ready status is merge-safe"
   assert_not_contains "$out" "state: done" "coarse ready status must not authorize done"
   pass "coarse checks-green status without identity fails closed"
@@ -1683,11 +1684,10 @@ test_missing_meta() {
 # (k) crew_is_provably_working end-to-end over the REAL fm-crew-state.sh (not a
 # canned fake verdict, unlike tests/fm-watch-triage.test.sh's classifier
 # coverage). This is the direct regression pair for the 2026-07-02 herdr
-# incident: a validating crewmate whose bare `axi status` answer belongs to
-# another branch must still be absorbed by the watcher via the runs-list
-# fallback (working), while a crewmate with genuinely no run anywhere and an idle
-# pane must still surface (the safety property the fix must never widen away).
-test_provably_working_via_runs_list_fallback() {
+# incident: a runs-list fallback has a branch and head but no exact run id, so
+# it must surface as UNKNOWN rather than authorize watcher absorption. A crew
+# with genuinely no run anywhere and an idle pane must surface as well.
+test_not_provably_working_via_runs_list_fallback() {
   reset_fakes
   local d; d=$(new_case provably-working-crossbranch)
   make_repo_on_branch "$d/wt" fm/feat-provable
@@ -1700,8 +1700,8 @@ test_provably_working_via_runs_list_fallback() {
 EOF
 )"
   PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" crew_is_provably_working feat-provable \
-    || fail "cross-branch attribution via the runs list was not treated as provably working"
-  pass "crew_is_provably_working absorbs a validating crew found only via the runs-list fallback"
+    && fail "cross-branch runs-list evidence without an exact run id was treated as provably working"
+  pass "crew_is_provably_working refuses coarse runs-list custody"
 }
 
 test_not_provably_working_when_stopped() {
@@ -1793,7 +1793,7 @@ test_no_timeout_uses_perl_bound
 test_scout_skips_run_lookup
 test_torn_down_worktree
 test_missing_meta
-test_provably_working_via_runs_list_fallback
+test_not_provably_working_via_runs_list_fallback
 test_not_provably_working_when_stopped
 test_usage_error
 

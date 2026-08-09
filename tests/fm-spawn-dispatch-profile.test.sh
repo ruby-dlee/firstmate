@@ -12,6 +12,7 @@ set -u
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 fm_test_tmproot_into TMP_ROOT fm-spawn-dispatch-profile
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 
 make_spawn_fakebin() {
   local dir=$1 fakebin
@@ -340,6 +341,66 @@ test_codex_threads_model_and_effort() {
   pass "codex receives --model and model_reasoning_effort profile flags"
 }
 
+test_codex_runtime_publisher_is_strictly_test_scoped() {
+  local rec id out status narrow before after
+
+  id=profile-codex-unset-lab-z30
+  rec=$(make_spawn_case profile-codex-unset-lab codex "$id")
+  read_case_record "$rec"
+  before=$(find "$CODEX_HOME/sessions/test-lab" -type f 2>/dev/null | wc -l | tr -d ' ')
+  unset FM_CODEX_RUNTIME_TEST_LAB
+  out=$(FM_CODEX_RUNTIME_BIND_WAIT_SECONDS=1 run_spawn \
+    "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --model gpt-5.6-sol --effort xhigh)
+  status=$?
+  export FM_CODEX_RUNTIME_TEST_LAB=firstmate-codex-runtime-test-lab-v1
+  expect_code 1 "$status" "unset runtime test token must not publish a synthetic rollout"
+  assert_contains "$out" "did not bind and verify an exact provider session" \
+    "unset runtime test token did not leave Codex binding fail-closed"
+  after=$(find "$CODEX_HOME/sessions/test-lab" -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "$before" = "$after" ] || fail "unset runtime test token published a synthetic rollout"
+
+  id=profile-codex-wrong-lab-z31
+  rec=$(make_spawn_case profile-codex-wrong-lab codex "$id")
+  read_case_record "$rec"
+  before=$(find "$CODEX_HOME/sessions/test-lab" -type f 2>/dev/null | wc -l | tr -d ' ')
+  out=$(FM_CODEX_RUNTIME_TEST_LAB=wrong-token FM_CODEX_RUNTIME_BIND_WAIT_SECONDS=1 run_spawn \
+    "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --model gpt-5.6-sol --effort xhigh)
+  status=$?
+  expect_code 1 "$status" "wrong runtime test token must not publish a synthetic rollout"
+  assert_contains "$out" "did not bind and verify an exact provider session" \
+    "wrong runtime test token did not leave Codex binding fail-closed"
+  after=$(find "$CODEX_HOME/sessions/test-lab" -type f 2>/dev/null | wc -l | tr -d ' ')
+  [ "$before" = "$after" ] || fail "wrong runtime test token published a synthetic rollout"
+
+  id=profile-codex-unsafe-home-z32
+  rec=$(make_spawn_case profile-codex-unsafe-home codex "$id")
+  read_case_record "$rec"
+  out=$(CODEX_HOME="$ROOT" run_spawn \
+    "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --model gpt-5.6-sol --effort xhigh)
+  status=$?
+  expect_code 1 "$status" "runtime test publisher must reject a non-temp runtime home"
+  assert_contains "$out" "runtime test lab requires an isolated runtime home" \
+    "runtime test publisher did not reject a non-temp runtime home"
+
+  id=profile-codex-unsafe-worktree-z33
+  rec=$(make_spawn_case profile-codex-unsafe-worktree codex "$id")
+  read_case_record "$rec"
+  narrow="$CASE_DIR/narrow-tmp"
+  mkdir -p "$narrow/codex-runtime"
+  out=$(TMPDIR="$narrow" CODEX_HOME="$narrow/codex-runtime" run_spawn \
+    "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+    "$id" "$PROJ_DIR" --model gpt-5.6-sol --effort xhigh)
+  status=$?
+  expect_code 1 "$status" "runtime test publisher must reject a non-temp worktree"
+  assert_contains "$out" "runtime test lab requires an isolated worktree" \
+    "runtime test publisher did not reject a worktree outside its temp root"
+
+  pass "Codex runtime test publishing requires the exact token and temp isolation"
+}
+
 test_codex_refuses_below_required_profile() {
   local rec id out status
   id=profile-codex-max-z4
@@ -566,6 +627,7 @@ test_active_dispatch_profile_allows_raw_launch_command
 test_claude_threads_model_and_effort
 test_claude_rejects_mismatched_explicit_model
 test_codex_threads_model_and_effort
+test_codex_runtime_publisher_is_strictly_test_scoped
 test_codex_refuses_below_required_profile
 test_grok_threads_model_and_reasoning_effort
 test_grok_omits_invalid_max_reasoning_effort

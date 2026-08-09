@@ -36,6 +36,7 @@ fm_git_identity fmtest fmtest@example.invalid
 . "$ROOT/bin/fm-backend.sh"
 
 fm_test_tmproot_into TMP_ROOT fm-backend-tests
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 
 # fm_backend_detect's cmux fallback (bundle id + process ancestry,
 # docs/cmux-backend.md "Runtime auto-detection") consults uname, lsappinfo,
@@ -1444,6 +1445,11 @@ if [ "${FM_TEST_FOCUSED:-}" = tmux-moved-window ]; then
   test_managed_tmux_target_identity_checks_recorded_session
   test_managed_tmux_target_state_finds_replacement_window
   test_managed_tmux_target_state_resolves_id_after_recorded_session_disappears
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = spawn-symlink-prefix ]; then
+  test_spawn_symlinked_project_prefix_avoids_false_refusal
   exit 0
 fi
 

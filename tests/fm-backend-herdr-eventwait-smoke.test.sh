@@ -71,6 +71,7 @@ cat > "$STATE/evwait1.meta" <<EOF
 window=$TARGET
 backend=herdr
 kind=ship
+generation_id=eventwait-test-generation
 EOF
 
 SOCK=$(fm_backend_herdr_socket_path "$SESSION")

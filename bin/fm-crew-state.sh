@@ -694,6 +694,7 @@ HAVE_RUN=0
 # run-step block below skips the TOON field parsing entirely for this crewmate.
 RUN_SOURCE=full
 COARSE_STATUS=""
+COARSE_HEAD=""
 # Scouts and secondmates never drive a no-mistakes validation of their own
 # worktree, so skip the lookup for them and read state from pane/log directly.
 if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
@@ -712,6 +713,8 @@ if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/n
       coarse_run=$(nm_runs_status_for_branch "$CREW_BRANCH")
       if [ -n "$coarse_run" ]; then
         COARSE_STATUS=${coarse_run%%|*}
+        coarse_rest=${coarse_run#*|}
+        COARSE_HEAD=${coarse_rest%%|*}
         HAVE_RUN=1
         RUN_SOURCE=coarse
       fi
@@ -740,7 +743,10 @@ if [ "$HAVE_RUN" = 1 ]; then
     # surfaced through signal_reason_is_actionable regardless of this
     # coarse-vs-full distinction, so a real gate is never silently missed.
     case "$COARSE_STATUS" in
-      running)   RUN_STATE=working; RUN_DETAIL="validating (background run)" ;;
+      running)
+        RUN_STATE=unknown
+        RUN_DETAIL="running runs-list result for $CREW_BRANCH at ${COARSE_HEAD:-unknown} lacks exact current run identity; do not merge"
+        ;;
       completed)
         RUN_STATE=unknown
         RUN_DETAIL="completed runs-list result lacks exact current run identity; do not merge"

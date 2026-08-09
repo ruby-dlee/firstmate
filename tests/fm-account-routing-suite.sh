@@ -20,6 +20,7 @@ TEARDOWN="$ROOT/bin/fm-teardown.sh"
 SESSION_SYNC="$ROOT/bin/fm-account-session-sync.sh"
 CONTINUATION="$ROOT/bin/fm-account-continuation.sh"
 fm_test_tmproot_into TMP_ROOT fm-account-routing-tests
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 
 assert_not_grep() {
   local pattern=$1 file=$2 label=$3

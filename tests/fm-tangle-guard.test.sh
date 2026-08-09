@@ -22,6 +22,7 @@ set -u
 . "$ROOT/bin/fm-tangle-lib.sh"
 
 fm_test_tmproot_into TMP_ROOT fm-tangle-guard
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 fm_git_identity fmtest fmtest@example.invalid
 
 # A fresh git repo on `main` with one commit. Echoes its path.

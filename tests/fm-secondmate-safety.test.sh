@@ -13,6 +13,7 @@ set -u
 . "$ROOT/bin/fm-checkout-lock-lib.sh"
 
 fm_test_tmproot_into TMP_ROOT fm-secondmate-safety
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 export FM_BACKEND=tmux
 
 make_live_default_firstmate_worktree() {
@@ -2840,6 +2841,11 @@ if [ "${FM_TEST_FOCUSED:-}" = projectless-existing ]; then
   test_home_seed_refuses_projectless_home_with_symlinked_projects
   test_home_seed_refuses_projectless_home_with_non_directory_projects
   test_home_seed_refuses_projectless_home_with_uninspectable_registry
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = projectless-spawn ]; then
+  test_home_seed_no_projects_end_to_end
   exit 0
 fi
 

@@ -161,6 +161,17 @@ fm_test_tmproot_into() {
   printf -v "$target_var" '%s' "$root"
 }
 
+# Fake terminal endpoints do not launch a real Codex process, but Gate A still
+# requires their spawn path to bind and verify one exact runtime generation.
+# Opting in publishes a synthetic rollout inside the fixture's isolated temp
+# tree; fm-spawn validates that isolation before the ordinary verifier reads it.
+fm_test_enable_codex_runtime_publisher() {
+  local root=${1:?usage: fm_test_enable_codex_runtime_publisher <fixture-root>}
+  mkdir -p "$root/codex-runtime"
+  export CODEX_HOME="$root/codex-runtime"
+  export FM_CODEX_RUNTIME_TEST_LAB=firstmate-codex-runtime-test-lab-v1
+}
+
 # --- node capability probe ---------------------------------------------------
 #
 # fm_node_supports_ts_import succeeds when the ambient node can import a .ts

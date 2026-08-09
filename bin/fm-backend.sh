@@ -584,9 +584,21 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
 }
 
 fm_backend_send_steering() {  # <backend> <target> <text> [expected-label] [recorded-scoped-target]
-  local backend=$1
+  local backend=$1 target=${2:-} text=${3:-}
   case "$backend" in
-    tmux|herdr|zellij|orca|cmux)
+    herdr)
+      fm_backend_source herdr || return 1
+      # Real-Herdr behavior tests have one exact opt-in for pane-run's atomic
+      # line primitive. Production never sets it and keeps the refusal below.
+      if fm_backend_herdr_test_lab_enabled; then
+        fm_backend_herdr_send_text_line "$target" "$text" || return 1
+        printf 'confirmed'
+        return 0
+      fi
+      echo "error: backend '$backend' has no atomic agent-session-bound text steering operation" >&2
+      return 1
+      ;;
+    tmux|zellij|orca|cmux)
       echo "error: backend '$backend' has no atomic agent-session-bound text steering operation" >&2
       return 1
       ;;

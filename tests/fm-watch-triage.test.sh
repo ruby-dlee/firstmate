@@ -1168,8 +1168,8 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
   # A DECLARED pause (not captain-relevant), .seen-* primed so the signal scan does
   # not pre-empt the stale path.
   printf 'paused: holding for the upstream tool release\n' > "$statusf"
-  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-held_status"
   key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-status-$key"
   pane_hash=$(hash_text "idle, holding for upstream")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -1198,7 +1198,7 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
   back=$(( $(date +%s) - 500 ))
   if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$statusf"
   else touch -m -d "@$back" "$statusf"; fi
-  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-held_status"
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-status-$key"
   mkdir -p "$dir/config"
   printf 'FM_PAUSE_RESURFACE_SECS=240\n' > "$dir/config/watcher.env"
   : > "$out"

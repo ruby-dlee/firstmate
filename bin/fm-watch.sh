@@ -438,13 +438,19 @@ migrate_watcher_state() {  # <window> <task>
 }
 
 pause_state_needs_observation() {  # <window> <status-line>
-  local win=$1 last=$2 key recheck_file
+  local win=$1 last=$2 key recheck_file statusf sig
   key=$(watcher_state_key "$win") || return 0
   if ! status_is_paused "$last"; then
     return 0
   fi
   recheck_file="$STATE/.paused-rechecked-$key"
-  [ -e "$STATE/.paused-$key" ] && [ "$(watch_age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ] && return 1
+  statusf="$STATE/$(window_to_task "$win" "$STATE").status"
+  sig=$(stat_sig "$statusf")
+  [ -e "$STATE/.paused-$key" ] \
+    && [ "$(watch_age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ] \
+    && [ -n "$sig" ] \
+    && [ "$sig" = "$(cat "$recheck_file" 2>/dev/null || true)" ] \
+    && return 1
   return 0
 }
 

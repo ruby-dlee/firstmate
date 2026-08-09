@@ -256,19 +256,23 @@ case "$out" in
 esac
 pass "real herdr: send_text_line runs a command atomically (pane run) and its output is capturable"
 
-# --- send_literal + send_key(Enter), the two-step launch-command form -------
+# --- production split refusal + explicit atomic test-lab line ----------------
 
-fm_backend_herdr_send_literal "$TARGET" 'echo literal-then-key-captain' \
-  || fail "send_literal failed"
-sleep 0.2
-fm_backend_herdr_send_key "$TARGET" Enter || fail "send_key Enter failed"
+if fm_backend_herdr_send_literal "$TARGET" 'echo split-route-must-refuse' >/dev/null 2>&1; then
+  fail "production send_literal unexpectedly accepted an agent-less pane"
+fi
+steering_verdict=$(FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 \
+  fm_backend_send_steering herdr "$TARGET" 'echo atomic-test-lab-captain') \
+  || fail "atomic test-lab steering failed"
+[ "$steering_verdict" = confirmed ] \
+  || fail "atomic test-lab steering did not return confirmed: $steering_verdict"
 sleep 0.5
-out=$(fm_backend_herdr_capture "$TARGET" 20) || fail "capture failed after send_literal+send_key"
+out=$(fm_backend_herdr_capture "$TARGET" 20) || fail "capture failed after the atomic test-lab line"
 case "$out" in
-  *literal-then-key-captain*) : ;;
-  *) fail "real herdr: send_literal + send_key(Enter) did not submit and echo the line"$'\n'"$out" ;;
+  *atomic-test-lab-captain*) : ;;
+  *) fail "real herdr: the atomic test-lab line did not submit and echo the line"$'\n'"$out" ;;
 esac
-pass "real herdr: send_literal + send_key Enter submit as two separate steps (verified: send-text does NOT auto-submit)"
+pass "real herdr: production split input refuses while explicit test-lab steering confirms atomically"
 
 # --- current_path -------------------------------------------------------------
 
@@ -284,9 +288,11 @@ pass "real herdr: current_path reads the pane's live cwd"
 # --- busy_state on a real claude harness (verified in herdr-verification-p2.md) ---
 
 if [ "${FM_HERDR_SMOKE_REAL_CLAUDE:-0}" = 1 ] && command -v claude >/dev/null 2>&1; then
-  fm_backend_herdr_send_literal "$TARGET" "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions --print 'say the word HERDRSMOKEOK and nothing else'"
-  sleep 0.2
-  fm_backend_herdr_send_key "$TARGET" Enter
+  steering_verdict=$(FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 \
+    fm_backend_send_steering herdr "$TARGET" "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions --print 'say the word HERDRSMOKEOK and nothing else'") \
+    || fail "atomic real-Claude test-lab steering failed"
+  [ "$steering_verdict" = confirmed ] \
+    || fail "atomic real-Claude test-lab steering did not return confirmed: $steering_verdict"
   found_working=0
   for _ in $(seq 1 20); do
     bs=$(fm_backend_herdr_busy_state "$TARGET" 2>/dev/null)

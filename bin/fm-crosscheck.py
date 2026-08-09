@@ -1062,6 +1062,7 @@ def execute_reproduction(
         ),
         allow_network=False,
         allow_posix_ipc=False,
+        env=proof_environment(),
         timeout=evidence_command_timeout(deadline, evidence_timeout(), label),
         description=label,
     )

@@ -13,10 +13,10 @@
 # itself, so neither can be skipped by omission. Use it for every PR merge.
 #
 # The installed gh-axi `pr merge` surface has no expected-head option. This
-# script instead uses the private GitHub merge primitive through
+# script instead uses the private GitHub merge or enqueue primitives through
 # bin/fm-crosscheck.sh, which repeats ledger verification and passes the exact
-# reviewed SHA in the atomic merge request. A force-push between verification
-# and the request makes GitHub reject the merge.
+# reviewed SHA in the atomic request. A force-push between verification and the
+# request makes GitHub reject the merge or enqueue.
 #
 # With no explicit merge method, an active base-branch merge queue is used;
 # otherwise the method defaults to squash. The supported optional arguments are

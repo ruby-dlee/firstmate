@@ -25,6 +25,7 @@ handoff_request_pending="$owner_dir/handoff-request.pending"
 handoff_taken="$owner_dir/handoff-taken"
 owner_root_poll=5
 owner_link_lost=false
+terminal_cleanup_complete=false
 
 case "$watcher_pid" in ''|*[!0-9]*) exit 2 ;; esac
 case "$owner_dir" in "$STATE"/.watch.lock.owner.arm.*) ;; *) exit 2 ;; esac
@@ -49,8 +50,21 @@ owner_link_current() {
 }
 
 monitor_exit_cleanup() {
+  "$terminal_cleanup_complete" || return 0
   rm -f "$anchor_pending" "$handoff_request" "$handoff_request_pending" \
     "$handoff_taken" "$owner_eof" "$owner_lost" 2>/dev/null || true
+}
+
+monitor_final_proof_matches() {
+  [ -L "$watch_lock" ] \
+    && fm_lock_points_to_owner "$watch_lock" "$owner_dir" \
+    && fm_watcher_lock_session_proof_matches \
+      "$STATE" "$watch_path" "$FM_HOME" "$watcher_pid" \
+    && fm_watcher_lock_owner_record_matches \
+      "$STATE" "$watch_path" "$FM_HOME" "$watcher_pid" "$watcher_identity" \
+    && fm_watcher_lock_session_anchor_matches "$STATE" "$watcher_pid" \
+    && [ "$FM_WATCHER_SESSION_ANCHOR_PID" = "$monitor_pid" ] \
+    && [ "$FM_WATCHER_SESSION_ANCHOR_IDENTITY" = "$monitor_identity" ]
 }
 
 trap monitor_exit_cleanup EXIT
@@ -124,31 +138,46 @@ fi
 while fm_watcher_lock_session_stop_claim_matches "$STATE" "$watcher_pid"; do
   sleep 0.1
 done
+if [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
+  && [ -n "${FM_WATCH_OWNER_TEST_TERMINAL_READY:-}" ] \
+  && [ -n "${FM_WATCH_OWNER_TEST_TERMINAL_PROCEED:-}" ]; then
+  : > "$FM_WATCH_OWNER_TEST_TERMINAL_READY"
+  while [ ! -e "$FM_WATCH_OWNER_TEST_TERMINAL_PROCEED" ]; do sleep 0.01; done
+fi
 : > "$owner_eof" 2>/dev/null || true
 : > "$owner_lost" 2>/dev/null || true
 : > "$owner_failed" 2>/dev/null || true
 status=0
-fm_watcher_lock_session_proof_matches "$STATE" "$watch_path" "$FM_HOME" "$watcher_pid" \
-  && fm_watcher_lock_session_stop_claim "$STATE" "$watcher_pid" \
-  && fm_session_stop_owned_except "$watcher_pid" "$monitor_pid" 30 || status=$?
-if [ "$status" -eq 0 ] \
-  && fm_watcher_lock_owner_record_matches \
-    "$STATE" "$watch_path" "$FM_HOME" "$watcher_pid" "$watcher_identity" \
-  && fm_watcher_lock_session_anchor_matches "$STATE" "$watcher_pid" \
-  && [ "$FM_WATCHER_SESSION_ANCHOR_PID" = "$monitor_pid" ]; then
-  rm -f "$watch_lock/process-session" 2>/dev/null || status=1
-  [ "$status" -ne 0 ] || fm_lock_remove_path "$watch_lock" || status=1
+if ! monitor_final_proof_matches; then
+  status=1
+elif ! fm_watcher_lock_session_stop_claim "$STATE" "$watcher_pid"; then
+  status=1
+elif [ "${FM_WATCH_OWNER_TEST_HOOKS:-}" = firstmate-watcher-owner-tests-v1 ] \
+  && [ "${FM_WATCH_OWNER_TEST_FORCE_DRAIN_FAILURE:-}" = 1 ]; then
+  status=1
+else
+  fm_session_stop_owned_except "$watcher_pid" "$monitor_pid" 30 || status=$?
+  [ "$status" -ne 0 ] || monitor_final_proof_matches || status=1
+  [ "$status" -ne 0 ] || fm_session_stop_claim_complete_dir \
+    "$owner_dir" "$watcher_pid" "$monitor_pid" || status=$?
+  [ "$status" -ne 0 ] || monitor_final_proof_matches || status=1
+  [ "$status" -ne 0 ] || fm_session_stop_claim_completed_dir \
+    "$owner_dir" "$watcher_pid" "$monitor_pid" || status=$?
 fi
+[ "$status" -ne 0 ] || fm_lock_remove_path "$watch_lock" || status=1
 exec 8<&-
-rm -f "$owner_ready" "$owner_failed" "$owner_fifo" "$owner_eof" "$owner_lost" 2>/dev/null || true
-rm -f "$session_record" "$session_record_pending" "$handoff_request" \
-  "$handoff_request_pending" "$handoff_taken" "$owner_dir/prestart-owner" \
-  "$owner_dir/prestart-owner.pending" "$owner_dir/prestart-owner-ack" \
-  "$owner_dir/prestart-owner-ack.pending" "$owner_dir/pid" "$owner_dir/pid-identity" \
-  "$owner_dir/process-session" "$owner_dir/fm-home" "$owner_dir/watcher-path" \
-  "$owner_dir/session-stop" "$owner_dir/session-stop.pending" \
-  "$owner_dir/session-stop-complete" \
-  "$owner_dir/.session-stop-transaction" "$owner_dir/arm-owner-pid" \
-  "$owner_dir/arm-owner-identity" 2>/dev/null || true
-rmdir "$owner_dir" 2>/dev/null || true
+if [ "$status" -eq 0 ]; then
+  terminal_cleanup_complete=true
+  rm -f "$owner_ready" "$owner_failed" "$owner_fifo" "$owner_eof" "$owner_lost" 2>/dev/null || true
+  rm -f "$session_record" "$session_record_pending" "$handoff_request" \
+    "$handoff_request_pending" "$handoff_taken" "$owner_dir/prestart-owner" \
+    "$owner_dir/prestart-owner.pending" "$owner_dir/prestart-owner-ack" \
+    "$owner_dir/prestart-owner-ack.pending" "$owner_dir/pid" "$owner_dir/pid-identity" \
+    "$owner_dir/process-session" "$owner_dir/fm-home" "$owner_dir/watcher-path" \
+    "$owner_dir/session-stop" "$owner_dir/session-stop.pending" \
+    "$owner_dir/session-stop-complete" \
+    "$owner_dir/.session-stop-transaction" "$owner_dir/arm-owner-pid" \
+    "$owner_dir/arm-owner-identity" 2>/dev/null || true
+  rmdir "$owner_dir" 2>/dev/null || true
+fi
 exit "$status"

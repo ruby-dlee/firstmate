@@ -809,6 +809,175 @@ test_arm_owner_death_reaps_watcher_session() {
   pass "arm controller death closes ownership and reaps the watcher session"
 }
 
+test_monitor_preserves_competing_cleanup_claim() {
+  local dir state fakebin out terminal_ready terminal_proceed claim_ready claim_proceed armpid watcher_pid session monitor_pid owner_dir claimant claim_before i members member
+  dir=$(make_case monitor-competing-cleanup-claim)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  terminal_ready="$dir/terminal.ready"
+  terminal_proceed="$dir/terminal.proceed"
+  claim_ready="$dir/claim.ready"
+  claim_proceed="$dir/claim.proceed"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_TERMINAL_READY="$terminal_ready" \
+    FM_WATCH_OWNER_TEST_TERMINAL_PROCEED="$terminal_proceed" \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 120 ]; do
+    watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+    session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
+    monitor_pid=$(sed -n '1s/^pid=//p' "$state/.watch.lock/session-anchor" 2>/dev/null || true)
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null \
+      && [ -n "$watcher_pid" ] && [ "$session" = "$watcher_pid" ] \
+      && [ -n "$monitor_pid" ] && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$out" \
+    || fail "arm did not establish the competing-claim fixture: $(cat "$out")"
+  owner_dir=$(readlink "$state/.watch.lock" 2>/dev/null || true)
+  [ -d "$owner_dir" ] && [ ! -L "$owner_dir" ] \
+    || fail "competing-claim fixture did not retain its canonical owner directory"
+  kill -KILL "$armpid" 2>/dev/null || fail "could not terminate the competing-claim arm"
+  wait "$armpid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 120 ] && [ ! -e "$terminal_ready" ]; do
+    is_live_non_zombie "$monitor_pid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$terminal_ready" ] \
+    || fail "monitor did not reach the competing-claim barrier"
+  FM_STATE_OVERRIDE="$state" FM_TEST_CLAIM_READY="$claim_ready" \
+    FM_TEST_CLAIM_PROCEED="$claim_proceed" bash -c '
+      . "$1"
+      fm_watcher_lock_session_stop_claim "$2" "$3" || exit 1
+      : > "$FM_TEST_CLAIM_READY"
+      while [ ! -e "$FM_TEST_CLAIM_PROCEED" ]; do sleep 0.01; done
+    ' _ "$LIB" "$state" "$session" &
+  claimant=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -e "$claim_ready" ]; do
+    is_live_non_zombie "$claimant" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$claim_ready" ] || {
+    touch "$terminal_proceed" "$claim_proceed"
+    kill -KILL "$watcher_pid" "$monitor_pid" "$claimant" 2>/dev/null || true
+    fail "competing cleanup owner did not acquire the canonical claim"
+  }
+  claim_before=$(cat "$owner_dir/session-stop" 2>/dev/null || true)
+  [ -n "$claim_before" ] || fail "competing cleanup claim was empty"
+  touch "$terminal_proceed"
+  i=0
+  while [ "$i" -lt 100 ] && is_live_non_zombie "$monitor_pid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  ! is_live_non_zombie "$monitor_pid" || {
+    touch "$claim_proceed"
+    kill -KILL "$watcher_pid" "$monitor_pid" 2>/dev/null || true
+    fail "monitor did not exit after losing the canonical claim"
+  }
+  is_live_non_zombie "$claimant" || fail "monitor displaced the live cleanup claimant"
+  [ "$(cat "$owner_dir/session-stop" 2>/dev/null || true)" = "$claim_before" ] \
+    || fail "monitor replaced or removed the competing cleanup claim"
+  [ -L "$state/.watch.lock" ] \
+    && [ "$(readlink "$state/.watch.lock" 2>/dev/null || true)" = "$owner_dir" ] \
+    || fail "monitor removed the canonical lock after claim acquisition failed"
+  [ "$(cat "$owner_dir/pid" 2>/dev/null || true)" = "$session" ] \
+    && [ -s "$owner_dir/pid-identity" ] \
+    && [ "$(cat "$owner_dir/process-session" 2>/dev/null || true)" = "$session" ] \
+    && [ -s "$owner_dir/fm-home" ] && [ -s "$owner_dir/watcher-path" ] \
+    && [ -s "$owner_dir/session-root" ] && [ -s "$owner_dir/prestart-owner" ] \
+    && [ -s "$owner_dir/arm-owner-pid" ] && [ -s "$owner_dir/arm-owner-identity" ] \
+    && [ "$(sed -n '1s/^pid=//p' "$owner_dir/session-anchor" 2>/dev/null || true)" = "$monitor_pid" ] \
+    || fail "monitor discarded immutable session proof after claim acquisition failed"
+  is_live_non_zombie "$watcher_pid" \
+    || fail "monitor signalled the watcher without owning its cleanup claim"
+  touch "$claim_proceed"
+  wait "$claimant" 2>/dev/null || true
+  members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' \
+    _ "$LIB" "$session" 2>/dev/null || true)
+  for member in $members; do kill -KILL "$member" 2>/dev/null || true; done
+  pass "monitor preserves a competing canonical cleanup transaction"
+}
+
+test_monitor_preserves_proof_after_failed_drain() {
+  local dir state fakebin out armpid watcher_pid session monitor_pid owner_dir claim i members member
+  dir=$(make_case monitor-failed-drain-proof)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_FORCE_DRAIN_FAILURE=1 \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 120 ]; do
+    watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+    session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
+    monitor_pid=$(sed -n '1s/^pid=//p' "$state/.watch.lock/session-anchor" 2>/dev/null || true)
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null \
+      && [ -n "$watcher_pid" ] && [ "$session" = "$watcher_pid" ] \
+      && [ -n "$monitor_pid" ] && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$out" \
+    || fail "arm did not establish the failed-drain fixture: $(cat "$out")"
+  owner_dir=$(readlink "$state/.watch.lock" 2>/dev/null || true)
+  [ -d "$owner_dir" ] && [ ! -L "$owner_dir" ] \
+    || fail "failed-drain fixture did not retain its canonical owner directory"
+  kill -KILL "$armpid" 2>/dev/null || fail "could not terminate the failed-drain arm"
+  wait "$armpid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 120 ]; do
+    claim=$(cat "$owner_dir/session-stop" 2>/dev/null || true)
+    [ -n "$claim" ] && ! is_live_non_zombie "$monitor_pid" && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -n "$claim" ] || {
+    kill -KILL "$watcher_pid" "$monitor_pid" 2>/dev/null || true
+    fail "failed monitor drain did not preserve its canonical claim"
+  }
+  ! is_live_non_zombie "$monitor_pid" || {
+    kill -KILL "$watcher_pid" "$monitor_pid" 2>/dev/null || true
+    fail "monitor did not exit after its forced drain failure"
+  }
+  [ -L "$state/.watch.lock" ] \
+    && [ "$(readlink "$state/.watch.lock" 2>/dev/null || true)" = "$owner_dir" ] \
+    || fail "monitor removed the canonical lock after drain failure"
+  [ "$(cat "$owner_dir/pid" 2>/dev/null || true)" = "$session" ] \
+    && [ -s "$owner_dir/pid-identity" ] \
+    && [ "$(cat "$owner_dir/process-session" 2>/dev/null || true)" = "$session" ] \
+    && [ -s "$owner_dir/fm-home" ] && [ -s "$owner_dir/watcher-path" ] \
+    && [ -s "$owner_dir/session-root" ] && [ -s "$owner_dir/prestart-owner" ] \
+    && [ -s "$owner_dir/arm-owner-pid" ] && [ -s "$owner_dir/arm-owner-identity" ] \
+    && [ "$(sed -n '1s/^pid=//p' "$owner_dir/session-anchor" 2>/dev/null || true)" = "$monitor_pid" ] \
+    || fail "monitor discarded immutable session proof after drain failure"
+  [ ! -e "$owner_dir/session-stop-complete" ] \
+    || fail "monitor falsely completed a failed drain transaction"
+  is_live_non_zombie "$watcher_pid" \
+    || fail "forced drain failure unexpectedly terminated the watcher"
+  members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' \
+    _ "$LIB" "$session" 2>/dev/null || true)
+  for member in $members; do kill -KILL "$member" 2>/dev/null || true; done
+  pass "monitor preserves canonical proof after drain failure"
+}
+
 test_arm_owner_death_before_monitor_start_reaps_session() {
   local dir state fakebin out ready proceed armpid watcher_pid session i members
   dir=$(make_case arm-owner-preconnect)
@@ -2958,6 +3127,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-6 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-7 ]; then
+  test_monitor_preserves_competing_cleanup_claim
+  test_monitor_preserves_proof_after_failed_drain
+  test_arm_owner_death_reaps_watcher_session
+  exit 0
+fi
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_pid_identity_survives_exec_without_command_text
@@ -2988,6 +3164,8 @@ test_watch_restart_rejects_reused_pid
 test_watch_restart_reaps_term_resistant_owned_tree
 test_watch_restart_recovers_dead_session_leader
 test_arm_owner_death_reaps_watcher_session
+test_monitor_preserves_competing_cleanup_claim
+test_monitor_preserves_proof_after_failed_drain
 test_arm_owner_death_before_monitor_start_reaps_session
 test_arm_owner_death_during_prestart_wedge_reaps_session
 test_prestart_observer_reclaims_interrupted_arm_cleanup

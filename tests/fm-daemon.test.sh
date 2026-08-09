@@ -246,6 +246,72 @@ test_held_live_monitor_reaches_away_wedge_escalation() {
   pass "away mode keeps a held live CI monitor on the wedge path"
 }
 
+test_housekeeping_pause_class_cache() {
+  local dir state fakebin calls now key sig checked class task
+  dir=$(make_supercase pause-class-cache)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  calls="$dir/crew-state.calls"
+  cat > "$fakebin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "${FM_FAKE_CREW_STATE_CALLS:?}"
+printf 'state: unknown · source: none · cache fixture\n'
+SH
+  chmod +x "$fakebin/fm-crew-state.sh"
+  for task in pause-cache-a pause-cache-b; do
+    fm_write_meta "$state/$task.meta" "window=sess:fm-$task" "kind=ship"
+    printf 'paused: awaiting unchanged external state\n' > "$state/$task.status"
+  done
+
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE_CALLS="$calls" housekeeping "$state"
+  [ "$(wc -l < "$calls" | tr -d ' ')" = 2 ] \
+    || fail "housekeeping classified a paused task more than once in one pass"
+
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE_CALLS="$calls" housekeeping "$state"
+  [ "$(wc -l < "$calls" | tr -d ' ')" = 2 ] \
+    || fail "unchanged paused statuses bypassed the bounded classification cache"
+
+  printf 'paused: changed external wait detail\n' > "$state/pause-cache-a.status"
+  key=$(_stale_key pause-cache-b)
+  IFS="$(printf '\t')" read -r sig checked class < "$state/.subsuper-pause-class-$key"
+  now=$(_now)
+  printf '%s\t%s\t%s\n' "$sig" $(( now - STALE_ESCALATE_SECS_DEFAULT - 1 )) "$class" \
+    > "$state/.subsuper-pause-class-$key"
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE_CALLS="$calls" housekeeping "$state"
+  [ "$(grep -c '^pause-cache-a$' "$calls")" = 2 ] \
+    || fail "a changed status signature did not invalidate its cached classification"
+  [ "$(grep -c '^pause-cache-b$' "$calls")" = 2 ] \
+    || fail "an unchanged status was not reclassified on the bounded cadence"
+  pass "housekeeping caches one pause classification per task and invalidates by signature or cadence"
+}
+
+test_housekeeping_delivers_before_pause_classification() {
+  local dir state fakebin order first
+  dir=$(make_supercase pause-class-delivery-order)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  order="$dir/order"
+  cat > "$fakebin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'classify\n' >> "${FM_FAKE_ORDER:?}"
+printf 'state: unknown · source: none · delivery-order fixture\n'
+SH
+  chmod +x "$fakebin/fm-crew-state.sh"
+  fm_write_meta "$state/pause-delivery.meta" "window=sess:fm-pause-delivery" "kind=ship"
+  printf 'paused: awaiting external state\n' > "$state/pause-delivery.status"
+  (
+    escalate_flush() { printf 'flush\n' >> "$order"; }
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_FAKE_ORDER="$order" FM_ESCALATE_BATCH_SECS=0 housekeeping "$state"
+  )
+  first=$(head -1 "$order")
+  [ "$first" = flush ] || fail "pause classification delayed a due escalation flush"
+  pass "housekeeping delivers due wakes before paused-lane classification"
+}
+
 # handle_wake on a paused stale records a pause marker, drops any pre-existing wedge
 # marker (so a working->paused pane is not still wedge-aged), and does NOT escalate
 # on the wake itself - the recheck is housekeeping's job on the long cadence.
@@ -1759,6 +1825,8 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = held-live-monitor ]; then
   test_held_live_monitor_reaches_away_wedge_escalation
+  test_housekeeping_pause_class_cache
+  test_housekeeping_delivers_before_pause_classification
   exit 0
 fi
 
@@ -1774,6 +1842,8 @@ test_stale_transient_self_records_marker
 test_stale_terminal_escalates
 test_stale_paused_classifies_pause
 test_held_live_monitor_reaches_away_wedge_escalation
+test_housekeeping_pause_class_cache
+test_housekeeping_delivers_before_pause_classification
 test_handle_wake_paused_records_pause_marker
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking

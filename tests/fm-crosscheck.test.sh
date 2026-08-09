@@ -57,7 +57,7 @@ make_case() {
 {"scripts":{"test":"jest"},"engines":{"node":"20.x"},"devDependencies":{"jest":"29.7.0"}}
 JSON
   cat > "$repo/apps/web-app/package-lock.json" <<'JSON'
-{"name":"crosscheck-fixture","lockfileVersion":3,"packages":{"":{"devDependencies":{"jest":"29.7.0"}}}}
+{"name":"crosscheck-fixture","lockfileVersion":3,"packages":{"":{"devDependencies":{"jest":"29.7.0"}},"node_modules/jest":{"version":"29.7.0","resolved":"https://registry.npmjs.org/jest/-/jest-29.7.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","dev":true}}}
 JSON
   printf 'export const previewScope = "fixed";\n' \
     > "$repo/apps/web-app/src/preview.ts"
@@ -142,8 +142,11 @@ SH
 #!/usr/bin/env bash
 set -u
 [ "${1:-}" = ci ] || exit 93
-mkdir -p node_modules/.bin
-cat > node_modules/.bin/jest <<'JEST'
+mkdir -p node_modules/.bin node_modules/jest/bin
+cat > node_modules/jest/package.json <<'JSON'
+{"name":"jest","version":"29.7.0","bin":"./bin/jest.js"}
+JSON
+cat > node_modules/jest/bin/jest.js <<'JEST'
 #!/usr/bin/env bash
 set -u
 [ "$(node --version)" = v20.11.0 ] || exit 94
@@ -167,7 +170,8 @@ else
 fi
 exit "$status"
 JEST
-chmod +x node_modules/.bin/jest
+chmod +x node_modules/jest/bin/jest.js
+ln -s ../jest/bin/jest.js node_modules/.bin/jest
 SH
   chmod +x "$node_bin/node" "$node_bin/npm"
 }
@@ -2733,6 +2737,36 @@ test_preexisting_jest_runner_cannot_certify() {
   pass "preexisting Jest runners never establish proof provenance"
 }
 
+test_local_fake_jest_package_cannot_certify() {
+  local record case_dir base head rc
+  record=$(make_case local-fake-jest-package)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/apps/web-app/package.json" <<'JSON'
+{"scripts":{"test":"jest"},"engines":{"node":"20.x"},"devDependencies":{"jest":"file:fake-jest"}}
+JSON
+  cat > "$case_dir/repo/apps/web-app/package-lock.json" <<'JSON'
+{"name":"crosscheck-fixture","lockfileVersion":3,"packages":{"":{"devDependencies":{"jest":"file:fake-jest"}},"node_modules/jest":{"resolved":"file:fake-jest","link":true},"fake-jest":{"version":"29.7.0"}}}
+JSON
+  git -C "$case_dir/repo" add apps/web-app/package.json apps/web-app/package-lock.json
+  git -C "$case_dir/repo" commit -qm "route Jest to local fake package"
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_javascript_open_ledger "$case_dir" "$head"
+  set +e
+  run_case "$case_dir" "$base" "$head" verified-fixed-jest run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "local fake Jest package"
+  assert_grep 'CROSSCHECK CANNOT-CERTIFY:' "$case_dir/err" \
+    "a local fake Jest package was not classified as unavailable proof"
+  assert_grep 'local, linked, workspace, Git, or URL source' "$case_dir/err" \
+    "the lockfile provenance check did not reject file: Jest"
+  assert_no_grep 'crosscheck clear' "$case_dir/out" \
+    "a local fake Jest package certified the mutation"
+  pass "local fake Jest packages cannot establish registry provenance"
+}
+
 test_jest_runs_under_declared_node_major() {
   local record case_dir base head node_home
   record=$(make_case jest-declared-node-path)
@@ -4568,6 +4602,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_silence_never_closes_prior_finding|\
     test_typescript_jest_mutation_proof_can_clear|\
     test_preexisting_jest_runner_cannot_certify|\
+    test_local_fake_jest_package_cannot_certify|\
     test_jest_runs_under_declared_node_major|\
     test_inadequate_typescript_jest_coverage_stays_blocking|\
     test_typescript_without_usable_route_is_cannot_certify|\
@@ -4613,10 +4648,13 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-safety-findings ]; then
   bash -n "$ROOT/bin/fm-spawn.sh" \
     || fail "Pi launch identity capture introduced invalid spawn syntax"
+  FM_TEST_FOCUSED=pi-author-snapshot "$ROOT/tests/fm-spawn-dispatch-profile.test.sh" \
+    || fail "Pi launch identity snapshot regressions failed"
   test_same_model_relaxation_requires_proven_separate_account
   test_same_model_review_is_adversarial_and_durable
   test_typescript_jest_mutation_proof_can_clear
   test_preexisting_jest_runner_cannot_certify
+  test_local_fake_jest_package_cannot_certify
   test_jest_runs_under_declared_node_major
   test_inadequate_typescript_jest_coverage_stays_blocking
   exit 0
@@ -4667,6 +4705,7 @@ test_silence_never_closes_prior_finding
 test_verified_fix_executes_mutation_proof
 test_typescript_jest_mutation_proof_can_clear
 test_preexisting_jest_runner_cannot_certify
+test_local_fake_jest_package_cannot_certify
 test_jest_runs_under_declared_node_major
 test_inadequate_typescript_jest_coverage_stays_blocking
 test_typescript_without_usable_route_is_cannot_certify

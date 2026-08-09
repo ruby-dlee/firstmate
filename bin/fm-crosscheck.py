@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import copy
 import datetime as dt
 import fcntl
@@ -22,6 +24,7 @@ import tempfile
 import time
 from typing import Any, NoReturn
 import unicodedata
+from urllib.parse import urlsplit
 
 
 BIN_DIR = Path(__file__).resolve().parent
@@ -1419,6 +1422,181 @@ def node_bin_for_project(project: Path, label: str) -> Path:
     return max(candidates)[1].resolve().parent
 
 
+def npm_jest_lock_provenance(lockfile: Path, label: str) -> str:
+    try:
+        value = read_bounded_json(
+            lockfile,
+            maximum_bytes=16 * 1024 * 1024,
+            maximum_items=262_144,
+            maximum_string_bytes=1024 * 1024,
+        )
+    except BoundedIOError as exc:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: npm lockfile is unreadable at {lockfile}: {exc}"
+        )
+    if not isinstance(value, dict) or value.get("lockfileVersion") not in {2, 3}:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: npm Jest provenance requires a package-lock "
+            "version 2 or 3 object"
+        )
+    packages = value.get("packages")
+    root = packages.get("") if isinstance(packages, dict) else None
+    entry = packages.get("node_modules/jest") if isinstance(packages, dict) else None
+    if not isinstance(root, dict) or not isinstance(entry, dict):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: package-lock does not bind the root project "
+            "to a materialized node_modules/jest package"
+        )
+    declarations: list[str] = []
+    for field in ("dependencies", "devDependencies", "optionalDependencies"):
+        dependencies = root.get(field)
+        declaration = dependencies.get("jest") if isinstance(dependencies, dict) else None
+        if isinstance(declaration, str):
+            declarations.append(declaration.strip())
+    if len(declarations) != 1 or not declarations[0]:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: package-lock root must declare Jest exactly once"
+        )
+    declaration = declarations[0].lower()
+    forbidden = (
+        "file:",
+        "link:",
+        "workspace:",
+        "git:",
+        "git+",
+        "github:",
+        "http:",
+        "https:",
+        "./",
+        "../",
+        "/",
+    )
+    if declaration.startswith(forbidden) or "github.com" in declaration:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest dependency uses a local, linked, "
+            "workspace, Git, or URL source instead of registry provenance"
+        )
+    if entry.get("link") is True:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: node_modules/jest is a linked lock entry"
+        )
+    version = entry.get("version")
+    resolved = entry.get("resolved")
+    integrity = entry.get("integrity")
+    if not (
+        isinstance(version, str)
+        and re.fullmatch(r"[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z.-]+)?", version)
+        and isinstance(resolved, str)
+        and isinstance(integrity, str)
+    ):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: node_modules/jest lacks a registry version, "
+            "resolved tarball, or integrity"
+        )
+    parsed = urlsplit(resolved)
+    if not (
+        parsed.scheme == "https"
+        and parsed.hostname == "registry.npmjs.org"
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port is None
+        and parsed.query == ""
+        and parsed.fragment == ""
+        and parsed.path == f"/jest/-/jest-{version}.tgz"
+    ):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: node_modules/jest is not resolved from the "
+            "official npm Jest tarball"
+        )
+    algorithm, separator, encoded = integrity.partition("-")
+    try:
+        digest = base64.b64decode(encoded, validate=True) if separator else b""
+    except (binascii.Error, ValueError):
+        digest = b""
+    if algorithm != "sha512" or len(digest) != 64:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: node_modules/jest requires a valid sha512 "
+            "registry integrity"
+        )
+    return version
+
+
+def materialized_jest_runner(project: Path, version: str, label: str) -> Path:
+    package_root = project / "node_modules" / "jest"
+    package_file = package_root / "package.json"
+    runner = project / "node_modules" / ".bin" / "jest"
+    try:
+        package_metadata = package_root.lstat()
+        runner_metadata = runner.lstat()
+    except OSError as exc:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: materialized Jest package or runner is "
+            f"unavailable: {exc}"
+        )
+    if not stat.S_ISDIR(package_metadata.st_mode) or package_root.is_symlink():
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: materialized node_modules/jest is not a "
+            "real package directory"
+        )
+    if not stat.S_ISLNK(runner_metadata.st_mode):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: materialized Jest runner is not the package "
+            "manager symlink to the real CLI"
+        )
+    try:
+        package = read_bounded_json(
+            package_file,
+            maximum_bytes=1024 * 1024,
+            maximum_items=4096,
+            maximum_string_bytes=1024 * 1024,
+        )
+    except BoundedIOError as exc:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: materialized Jest package metadata is "
+            f"unreadable: {exc}"
+        )
+    package_bin = package.get("bin") if isinstance(package, dict) else None
+    if isinstance(package_bin, dict):
+        package_bin = package_bin.get("jest")
+    if not (
+        isinstance(package, dict)
+        and package.get("name") == "jest"
+        and package.get("version") == version
+        and isinstance(package_bin, str)
+    ):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: materialized Jest package identity does not "
+            "match the lockfile"
+        )
+    bin_relative = package_bin.removeprefix("./")
+    if bin_relative != "bin/jest.js":
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: materialized Jest package exposes an "
+            "unexpected CLI"
+        )
+    cli = package_root / "bin" / "jest.js"
+    try:
+        cli_metadata = cli.lstat()
+        resolved_runner = runner.resolve(strict=True)
+        resolved_cli = cli.resolve(strict=True)
+    except OSError as exc:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: materialized Jest CLI cannot be resolved: {exc}"
+        )
+    if not (
+        stat.S_ISREG(cli_metadata.st_mode)
+        and not cli.is_symlink()
+        and os.access(cli, os.X_OK)
+        and resolved_runner == resolved_cli
+        and resolved_cli.is_relative_to(package_root.resolve())
+    ):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest executable is not the real CLI inside "
+            "the lockfile-materialized package tree"
+        )
+    return runner
+
+
 def prepare_jest_invocation(
     checkout: Path,
     project_relative: Path,
@@ -1445,6 +1623,11 @@ def prepare_jest_invocation(
             "one unambiguous package-lock.json or pnpm-lock.yaml"
         )
     lockfile = lockfiles[0]
+    if lockfile.name != "package-lock.json":
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: pnpm-lock.yaml governs Jest, but this gate "
+            "cannot prove official registry package provenance for that format"
+        )
     try:
         lock_metadata = lockfile.lstat()
     except OSError as exc:
@@ -1466,29 +1649,28 @@ def prepare_jest_invocation(
         cannot_certify(
             f"{label} CANNOT-CERTIFY: Jest lockfile is not tracked at {lock_relative}"
         )
+    directory = project
+    while True:
+        if (directory / ".npmrc").exists():
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: project npm configuration can rewrite "
+                f"registry provenance at {directory / '.npmrc'}"
+            )
+        if directory == checkout.resolve():
+            break
+        directory = directory.parent
+    jest_version = npm_jest_lock_provenance(lockfile, label)
     node_bin = node_bin_for_project(project, label)
-    if lockfile.name == "package-lock.json":
-        package_manager = "npm"
-        manager = node_bin / "npm"
-        arguments = [
-            str(manager),
-            "ci",
-            "--offline",
-            "--ignore-scripts",
-            "--no-audit",
-            "--no-fund",
-        ]
-    else:
-        package_manager = "pnpm"
-        resolved = shutil.which("pnpm")
-        manager = Path(resolved) if resolved is not None else Path()
-        arguments = [
-            str(manager),
-            "install",
-            "--offline",
-            "--frozen-lockfile",
-            "--ignore-scripts",
-        ]
+    package_manager = "npm"
+    manager = node_bin / "npm"
+    arguments = [
+        str(manager),
+        "ci",
+        "--offline",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+    ]
     if not manager.is_file() or not os.access(manager, os.X_OK):
         cannot_certify(
             f"{label} CANNOT-CERTIFY: {package_manager} is unavailable for "
@@ -1497,13 +1679,21 @@ def prepare_jest_invocation(
     environment = proof_environment()
     environment["PATH"] = str(node_bin) + os.pathsep + environment.get("PATH", "")
     environment["CI"] = "true"
+    install_environment = environment.copy()
+    npm_user_config = checkout / ".crosscheck" / "empty-user-npmrc"
+    npm_global_config = checkout / ".crosscheck" / "empty-global-npmrc"
+    npm_user_config.parent.mkdir(parents=True, exist_ok=True)
+    npm_user_config.write_text("", encoding="utf-8")
+    npm_global_config.write_text("", encoding="utf-8")
+    install_environment["NPM_CONFIG_USERCONFIG"] = str(npm_user_config)
+    install_environment["NPM_CONFIG_GLOBALCONFIG"] = str(npm_global_config)
     installed = run_sandboxed(
         arguments,
         cwd=project,
         profile_path=checkout / ".crosscheck" / "jest-dependencies.sb",
         allow_network=False,
         allow_posix_ipc=False,
-        env=environment,
+        env=install_environment,
         timeout=evidence_command_timeout(
             deadline, evidence_timeout(), f"{label} Jest dependency install"
         ),
@@ -1515,11 +1705,7 @@ def prepare_jest_invocation(
             "the lockfile-pinned Jest environment offline: "
             f"{(installed.stdout + installed.stderr).strip()[:1000] or 'no output'}"
         )
-    if not (jest.is_file() and os.access(jest, os.X_OK)):
-        cannot_certify(
-            f"{label} CANNOT-CERTIFY: lockfile installation produced no runnable "
-            f"Jest at {jest}"
-        )
+    jest = materialized_jest_runner(project, jest_version, label)
     test_relative = (checkout / test_file_path(test_path, label)).resolve()
     try:
         test_argument = test_relative.relative_to(project).as_posix()

@@ -122,7 +122,9 @@ Codex and Pi authenticate against the same upstream OpenAI accounts, so one acco
 When the author and the reviewer are both OpenAI-backed, selection therefore compares the executing OpenAI account recorded in each credential rather than the configured path, and the bound credential proves it again before launch.
 Pi adds an independent client and a reviewer separate from a Claude author by construction; it does not add capacity, because an OpenAI account at its usage limit is equally unavailable through Codex and through Pi.
 A lane recording no `account_home` is supported rather than exceptional: a different supported provider proves account separation by namespace, while an opted-in Pi author can prove same-provider separation through the exact provider slot recorded in its model metadata and the `author_account_identity` snapshot recorded by `fm-spawn.sh` at initial launch.
-Missing legacy snapshots, unreadable Pi identities, and every account-less same-provider pair while the option is absent or off fail closed; Crosscheck never substitutes the mutable ambient Pi credential at review time.
+The spawn boundary creates a restrictive task-private copy of the selected Pi credential and configuration directory, derives the identity from that copy, and binds the actual Pi command to the same path through `PI_CODING_AGENT_DIR` on every backend.
+Recovery retains the recorded identity only when the newly launch-bound copy proves the same account, so missing legacy snapshots, copy failures, changed accounts, unreadable Pi identities, and every account-less same-provider pair while the option is absent or off fail closed.
+Crosscheck never substitutes the mutable ambient Pi credential at review time.
 Account routing is off by design for harnesses outside Codex and Claude, so this is the normal shape of a Pi lane rather than a misconfiguration.
 An absent or invalid file is an unavailable reviewer and therefore blocks crosscheck and merge.
 See [`crosscheck.md`](crosscheck.md) for the example file, reviewer capture control, evidence rules, and operator flow.

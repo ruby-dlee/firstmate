@@ -2527,7 +2527,7 @@ launch_template() {
         # revisit this if pi ever ships a question tool that can park a secondmate -
         # fm-watch.sh skips stale-pane wakes for kind=secondmate, so a parked
         # secondmate would not trip stale detection.
-        printf '%s' 'pi --approve __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ "$(cat __BRIEF__)"'
+        printf '%s' '__AGENT__ --approve __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ "$(cat __BRIEF__)"'
       else
         # --exclude-tools is a plain denylist over built-in, extension, and custom
         # tool names (pi 0.84.0 filters it as a Set, ignoring names that are not
@@ -2535,7 +2535,7 @@ launch_template() {
         # crewmate's contract is to run autonomously and report through its status
         # file, so a tool that halts the run to ask a question nobody is watching is
         # never the right behavior here.
-        printf '%s' 'pi --approve --exclude-tools ask_question __MODELFLAG____EFFORTFLAG__-e __PIEXT__ "$(cat __BRIEF__)"'
+        printf '%s' '__AGENT__ --approve --exclude-tools ask_question __MODELFLAG____EFFORTFLAG__-e __PIEXT__ "$(cat __BRIEF__)"'
       fi
       ;;
     # grok (Grok Build TUI): a positional prompt starts the supervised interactive
@@ -3505,55 +3505,8 @@ finally:
   BRIEF=$CONTINUATION_PACKET
 fi
 
-capture_pi_author_account_identity() {
-  local model=$1 account_dir=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
-  python3 - "$model" "$account_dir" <<'PY'
-import json
-import os
-from pathlib import Path
-import re
-import stat
-import sys
-
-slot, separator, _ = sys.argv[1].partition("/")
-if separator == "" or re.fullmatch(r"openai-codex(?:-[1-9][0-9]*)?", slot) is None:
-    raise SystemExit(1)
-directory = Path(sys.argv[2])
-if not directory.is_absolute():
-    raise SystemExit(1)
-path = directory / "auth.json"
-descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-try:
-    metadata = os.fstat(descriptor)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
-        raise SystemExit(1)
-    with os.fdopen(descriptor, "rb") as stream:
-        descriptor = -1
-        raw = stream.read(1024 * 1024 + 1)
-finally:
-    if descriptor >= 0:
-        os.close(descriptor)
-if len(raw) > 1024 * 1024:
-    raise SystemExit(1)
-value = json.loads(raw)
-credential = value.get(slot) if isinstance(value, dict) else None
-identity = credential.get("accountId") if isinstance(credential, dict) else None
-if not isinstance(identity, str) or not identity.strip() or any(
-    character in identity for character in "\0\r\n"
-):
-    raise SystemExit(1)
-sys.stdout.write(identity.strip())
-PY
-}
-
 PI_AUTHOR_ACCOUNT_IDENTITY=
-if [ "$HARNESS" = pi ]; then
-  if [ "$SPAWN_META_PRESENT" = 1 ]; then
-    PI_AUTHOR_ACCOUNT_IDENTITY=$(spawn_preflight_meta_value author_account_identity)
-  else
-    PI_AUTHOR_ACCOUNT_IDENTITY=$(capture_pi_author_account_identity "${MODEL:-default}" 2>/dev/null || true)
-  fi
-fi
+PI_AUTHOR_ACCOUNT_HOME=
 
 # prepare_launch_environment: every step the launch-command construction below
 # The PATH a crewmate's tool commands run with. A harness executes tool commands
@@ -3637,6 +3590,28 @@ persist_worktree_acquisition_phases || {
   echo "error: cannot durably record task temp creation for $ID" >&2
   exit 1
 }
+if [ "$HARNESS" = pi ] && [ "$RAW_LAUNCH" != 1 ]; then
+  PI_AUTHOR_SOURCE_HOME=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
+  PI_AUTHOR_ACCOUNT_HOME="$TASK_TMP/pi-author-agent"
+  if PI_CAPTURED_ACCOUNT_IDENTITY=$(
+    "$SCRIPT_DIR/fm-pi-author-snapshot.py" \
+      "${MODEL:-default}" "$PI_AUTHOR_SOURCE_HOME" "$PI_AUTHOR_ACCOUNT_HOME"
+  ); then
+    if [ "$SPAWN_META_PRESENT" = 1 ]; then
+      PI_RECORDED_ACCOUNT_IDENTITY=$(spawn_preflight_meta_value author_account_identity)
+      if [ -n "$PI_RECORDED_ACCOUNT_IDENTITY" ] \
+        && [ "$PI_RECORDED_ACCOUNT_IDENTITY" = "$PI_CAPTURED_ACCOUNT_IDENTITY" ]; then
+        PI_AUTHOR_ACCOUNT_IDENTITY=$PI_CAPTURED_ACCOUNT_IDENTITY
+      fi
+    else
+      PI_AUTHOR_ACCOUNT_IDENTITY=$PI_CAPTURED_ACCOUNT_IDENTITY
+    fi
+  else
+    PI_AUTHOR_ACCOUNT_HOME=
+    PI_AUTHOR_ACCOUNT_IDENTITY=
+    echo "WARNING: Pi author identity could not be bound to a task-private account; same-provider Crosscheck review will remain ineligible for $ID" >&2
+  fi
+fi
 # herdr sets GOTMPDIR natively at agent start. Every other backend exports it into
 # the pane shell just before the launch line, further down. CREW_PATH rides the same
 # two channels for the same reason.
@@ -3825,6 +3800,9 @@ if [ "$RESUME_ACCOUNT" = 1 ]; then
   esac
 fi
 AGENT_COMMAND=$HARNESS
+if [ "$HARNESS" = pi ] && [ -n "$PI_AUTHOR_ACCOUNT_HOME" ]; then
+  AGENT_COMMAND="PI_CODING_AGENT_DIR=$(shell_quote "$PI_AUTHOR_ACCOUNT_HOME") pi"
+fi
 if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ] || [ "$DIRECT_ACCOUNT_SECONDMATE" = 1 ]; then
   # herdr delivers the account directory NATIVELY, as `agent start --env KEY=VALUE`
   # (HERDR_AGENT_ENV below), instead of as a command-scoped shell prefix. Verified

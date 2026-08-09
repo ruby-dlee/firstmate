@@ -298,19 +298,17 @@ Its `test_unavailable_reviewer_fails_over_to_the_next_account` case covers revie
 Its `test_forged_git_diff_mutation_command_is_rejected` case is the named regression that fails if a free-form `git diff --quiet # tests/regression.test.sh` can replace real mutation verification.
 Its `test_baseline_readable_state_is_destroyed_before_mutation` and `test_mutation_is_bound_to_cited_non_test_implementation` cases cover the two mutation-causality bypasses found in the final review round.
 Its `test_mutated_non_execution_cannot_clear_a_finding` case covers the third bypass of that class: a mutation that only broke test collection exits nonzero and previously read as a caught regression, so the gate could certify a fix on a test that never ran.
-Its `test_evidence_capture_runs_on_older_interpreters` case exists because `fm-crosscheck.sh` execs whichever `python3` is first on `PATH`, which is not always the version CI pins.
-A newer-only API on the evidence path therefore surfaces as an uncaught `TypeError` inside evidence capture rather than a gate verdict; the [`firstmate-coding-guidelines`](../.agents/skills/firstmate-coding-guidelines/SKILL.md) skill owns which `stat` form `bin/*.py` must use.
+Its `test_evidence_capture_runs_on_older_interpreters` case statically enforces the repository's portable `stat` idiom and, when a pre-3.10 interpreter is available, exercises the bounded-read and artifact paths under it.
+The production wrapper independently refuses anything below Python 3.11 through `bin/fm-crosscheck-python-lib.sh`; the broader portability check preserves the [`firstmate-coding-guidelines`](../.agents/skills/firstmate-coding-guidelines/SKILL.md) rule for `bin/*.py` without weakening that runtime floor.
 `tests/fm-github-pr.test.sh` includes named cases for fieldless-array grammar, complete timeout-child cleanup, and refusal of the former public merge subcommand.
 The focused PR-check cases in `tests/fm-teardown-suite.sh` and the merge cases in `tests/fm-pr-merge.test.sh` also use observed-shape GitHub fakes.
-Those deterministic suites validate parsing, lifecycle, failure handling, and atomic request construction; they do not claim to exercise live provider availability.
+Those deterministic suites validate parsing, lifecycle, failure handling, exact-head admission, and pre-mutation refusal ordering; they do not claim to exercise live provider availability.
 The real installed-tool exercise is separate and network-dependent: the dated `gh-axi` observations above cover successful documents, while an adapter lookup for an absent PR through installed `gh-axi` must exit nonzero with `GitHub state is unreviewed`.
 
 ## Deliberate limitations
 
-Crosscheck supports immediate `merge`, `squash`, and `rebase` methods plus commit title and body fields.
-It rejects `--auto` because an asynchronous merge would escape the immediate expected-head request.
-It rejects `--delete-branch` because branch deletion is not part of the atomic merge operation.
-Delete a branch only in a later separately authorized action after the merge is confirmed.
+Crosscheck exposes only the read-only `run` and `verify` operations and has no merge primitive.
+`bin/fm-pr-merge.sh`'s header owns its accepted future-operation descriptors and unconditional pre-mutation refusal.
 
 Reviewer-generated commands execute in a non-login shell, so evidence never depends on the operator's shell profile.
 This is not a detail: a login shell runs macOS `path_helper`, which rebuilds `PATH` with `/usr/bin` ahead of everything else, so a bare `python3` in a reproduction resolved to Xcode's Python 3.9 even while the gate itself ran on 3.14.

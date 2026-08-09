@@ -566,9 +566,10 @@ fm_backend_send_key() {  # <backend> <target> <key> [expected-label] [recorded-s
   esac
 }
 
-# fm_backend_send_text_submit: type text once, then submit and verify,
-# retrying only the submission (never retyping). Echoes the verdict
-# (empty|pending|unknown|send-failed for submit-verifying adapters).
+# fm_backend_send_text_submit: retained legacy helper for spawn-time probes and
+# regression tests; canonical steering never calls this split transport.
+# It types text once, then submits and verifies while retrying only the
+# submission, and echoes empty|pending|unknown|send-failed where implemented.
 fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label] [recorded-scoped-target]
   local backend=$1
   shift

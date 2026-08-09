@@ -76,7 +76,7 @@ Absence of a process sample, a stale status field, or one quiet observation can 
 
 - `bin/fm-run-liveness.sh` is the exact run-ID, branch, and head-attributed process owner and emits only `BUSY` from affirmative process evidence or `UNKNOWN` otherwise.
 - `bin/fm-nm-step-liveness.sh` remains a legacy diagnostic that can render confirmed process absence as `dead`; every production supervision consumer downgrades that vocabulary to UNKNOWN, while `bin/fm-run-liveness.sh` owns the exact-run process window used for absorption.
-- `bin/fm-crew-state.sh` consumes branch-matched run evidence before pane and status evidence and downgrades legacy `dead` vocabulary to unknown.
+- `bin/fm-crew-state.sh` consumes branch-matched run evidence before pane and status evidence and exposes the legacy liveness verdict only as a diagnostic that cannot override current run state.
 - `bin/fm-classify-lib.sh`, `bin/fm-watch.sh`, and `bin/fm-supervise-daemon.sh` absorb a lane only from affirmative run-owned process evidence; pane, status, missing-target, and unreadable observations remain UNKNOWN.
 - Watcher hash, pause, permission, signal, turn-end, surfaced-heartbeat, and daemon state families use bounded SHA-256 task keys with safe exact-identity owner records and migrate legacy state only for one positively verified owner.
 - The owner record is claimed without overwrite and revalidated before carrier reads, migration, attribution, or deletion, so a digest collision or forged owner fails closed.

@@ -2683,11 +2683,10 @@ assert value["findings"][0]["lifecycle"] == "open", value["findings"][0]["lifecy
   pass "an allowlist missing something the runner needs refuses at the baseline"
 }
 
-# `Path.stat(follow_symlinks=...)` is Python 3.10+. `fm-crosscheck.sh` execs
-# whichever `python3` is first on PATH, so that form turns an older interpreter
-# into an uncaught TypeError deep inside evidence capture instead of a gate
-# verdict. `os.stat(path, follow_symlinks=...)` is the portable idiom the rest
-# of bin/ already uses.
+# `Path.stat(follow_symlinks=...)` is Python 3.10+. The production wrapper now
+# refuses anything below Python 3.11, but bin/ keeps the portable `os.stat(path,
+# follow_symlinks=...)` idiom repository-wide and this focused probe preserves
+# that contract independently of the gate's runtime floor.
 test_evidence_capture_runs_on_older_interpreters() {
   local offenders older probe
   # Scoped to the two evidence-path modules, where every such receiver is a

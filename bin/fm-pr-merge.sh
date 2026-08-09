@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Merge a task's PR only when one unchanged head passes synchronous five-part
-# admission and a clear independent crosscheck ledger covers that exact head and
-# PR claims, while always recording pr= and the exact live pr_head=.
+# Preflight a task's PR only when one unchanged head passes synchronous
+# five-part admission and a clear independent crosscheck ledger covers that
+# exact head and PR claims, while always recording pr= and the exact live
+# pr_head=.
 #
 # Why this exists: the normal trigger for running fm-pr-check.sh is the crewmate's
 # `done: PR <url> checks green` line, which no-mistakes only emits once its CI
@@ -10,8 +11,9 @@
 # hand-running `gh-axi pr merge` - the common shape of a yolo-authorized merge -
 # can skip the recording step entirely. Teardown then has nothing to look up for
 # a squash-merge-then-delete-branch flow and false-refuses provably landed work.
-# This script makes recording and crosscheck verification part of the merge
-# itself, so neither can be skipped by omission. Use it for every PR merge.
+# This script makes recording and crosscheck verification part of the sole
+# admitted merge-attempt preflight, so neither can be skipped by omission.
+# Use it for every PR merge attempt; it currently never executes one.
 #
 # The script rejects every armed/scheduled mode, synchronously requires a green
 # settled check set, exact-head approvals, content containment, a zero-byte

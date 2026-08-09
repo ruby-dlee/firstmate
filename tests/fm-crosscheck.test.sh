@@ -57,7 +57,7 @@ make_case() {
 {"scripts":{"test":"jest"},"engines":{"node":"20.x"},"devDependencies":{"jest":"29.7.0"}}
 JSON
   cat > "$repo/apps/web-app/package-lock.json" <<'JSON'
-{"name":"crosscheck-fixture","lockfileVersion":3,"packages":{"":{"devDependencies":{"jest":"29.7.0"}},"node_modules/jest":{"version":"29.7.0","resolved":"https://registry.npmjs.org/jest/-/jest-29.7.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","dev":true}}}
+{"name":"crosscheck-fixture","lockfileVersion":3,"packages":{"":{"devDependencies":{"jest":"29.7.0"}},"node_modules/import-local":{"version":"3.1.0","resolved":"https://registry.npmjs.org/import-local/-/import-local-3.1.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","dev":true},"node_modules/jest":{"version":"29.7.0","resolved":"https://registry.npmjs.org/jest/-/jest-29.7.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","dev":true,"dependencies":{"import-local":"^3.0.2","jest-cli":"^29.7.0"}},"node_modules/jest-cli":{"version":"29.7.0","resolved":"https://registry.npmjs.org/jest-cli/-/jest-cli-29.7.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","dev":true}}}
 JSON
   printf 'export const previewScope = "fixed";\n' \
     > "$repo/apps/web-app/src/preview.ts"
@@ -142,9 +142,15 @@ SH
 #!/usr/bin/env bash
 set -u
 [ "${1:-}" = ci ] || exit 93
-mkdir -p node_modules/.bin node_modules/jest/bin
+mkdir -p node_modules/.bin node_modules/import-local node_modules/jest/bin node_modules/jest-cli
 cat > node_modules/jest/package.json <<'JSON'
-{"name":"jest","version":"29.7.0","bin":"./bin/jest.js"}
+{"name":"jest","version":"29.7.0","bin":"./bin/jest.js","dependencies":{"import-local":"^3.0.2","jest-cli":"^29.7.0"}}
+JSON
+cat > node_modules/import-local/package.json <<'JSON'
+{"name":"import-local","version":"3.1.0"}
+JSON
+cat > node_modules/jest-cli/package.json <<'JSON'
+{"name":"jest-cli","version":"29.7.0"}
 JSON
 cat > node_modules/jest/bin/jest.js <<'JEST'
 #!/usr/bin/env bash
@@ -2767,6 +2773,36 @@ JSON
   pass "local fake Jest packages cannot establish registry provenance"
 }
 
+test_local_transitive_jest_package_cannot_certify() {
+  local record case_dir base head rc
+  record=$(make_case local-transitive-jest-package)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/apps/web-app/package.json" <<'JSON'
+{"scripts":{"test":"jest"},"engines":{"node":"20.x"},"devDependencies":{"jest":"29.7.0","jest-cli":"file:fake-jest-cli"}}
+JSON
+  cat > "$case_dir/repo/apps/web-app/package-lock.json" <<'JSON'
+{"name":"crosscheck-fixture","lockfileVersion":3,"packages":{"":{"devDependencies":{"jest":"29.7.0","jest-cli":"file:fake-jest-cli"}},"node_modules/import-local":{"version":"3.1.0","resolved":"https://registry.npmjs.org/import-local/-/import-local-3.1.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","dev":true},"node_modules/jest":{"version":"29.7.0","resolved":"https://registry.npmjs.org/jest/-/jest-29.7.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==","dev":true,"dependencies":{"import-local":"^3.0.2","jest-cli":"^29.7.0"}},"node_modules/jest-cli":{"version":"29.7.0","resolved":"file:fake-jest-cli","link":true,"dev":true}}}
+JSON
+  git -C "$case_dir/repo" add apps/web-app/package.json apps/web-app/package-lock.json
+  git -C "$case_dir/repo" commit -qm "substitute local Jest CLI dependency"
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_javascript_open_ledger "$case_dir" "$head"
+  set +e
+  run_case "$case_dir" "$base" "$head" verified-fixed-jest run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "local transitive Jest package"
+  assert_grep 'CROSSCHECK CANNOT-CERTIFY:' "$case_dir/err" \
+    "a local transitive Jest package was not unavailable proof"
+  assert_grep 'runtime package jest-cli is a local or linked lock entry' "$case_dir/err" \
+    "the authenticated closure did not reject local jest-cli"
+  assert_no_grep 'crosscheck clear' "$case_dir/out" \
+    "a local transitive Jest package forged mutation certification"
+  pass "local transitive Jest packages cannot enter the authenticated closure"
+}
+
 test_jest_runs_under_declared_node_major() {
   local record case_dir base head node_home
   record=$(make_case jest-declared-node-path)
@@ -4603,6 +4639,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_typescript_jest_mutation_proof_can_clear|\
     test_preexisting_jest_runner_cannot_certify|\
     test_local_fake_jest_package_cannot_certify|\
+    test_local_transitive_jest_package_cannot_certify|\
     test_jest_runs_under_declared_node_major|\
     test_inadequate_typescript_jest_coverage_stays_blocking|\
     test_typescript_without_usable_route_is_cannot_certify|\
@@ -4655,8 +4692,15 @@ if [ "${FM_TEST_FOCUSED:-}" = review-safety-findings ]; then
   test_typescript_jest_mutation_proof_can_clear
   test_preexisting_jest_runner_cannot_certify
   test_local_fake_jest_package_cannot_certify
+  test_local_transitive_jest_package_cannot_certify
   test_jest_runs_under_declared_node_major
   test_inadequate_typescript_jest_coverage_stays_blocking
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-jest-runtime-closure ]; then
+  test_typescript_jest_mutation_proof_can_clear
+  test_local_transitive_jest_package_cannot_certify
   exit 0
 fi
 
@@ -4706,6 +4750,7 @@ test_verified_fix_executes_mutation_proof
 test_typescript_jest_mutation_proof_can_clear
 test_preexisting_jest_runner_cannot_certify
 test_local_fake_jest_package_cannot_certify
+test_local_transitive_jest_package_cannot_certify
 test_jest_runs_under_declared_node_major
 test_inadequate_typescript_jest_coverage_stays_blocking
 test_typescript_without_usable_route_is_cannot_certify

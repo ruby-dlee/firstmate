@@ -24,7 +24,7 @@ import tempfile
 import time
 from typing import Any, NoReturn
 import unicodedata
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 
 BIN_DIR = Path(__file__).resolve().parent
@@ -1422,7 +1422,201 @@ def node_bin_for_project(project: Path, label: str) -> Path:
     return max(candidates)[1].resolve().parent
 
 
-def npm_jest_lock_provenance(lockfile: Path, label: str) -> str:
+def npm_lock_package_name(lock_path: str) -> str | None:
+    parts = lock_path.split("/")
+    index = 0
+    package_name: str | None = None
+    while index < len(parts):
+        if parts[index] != "node_modules":
+            return None
+        index += 1
+        if index >= len(parts):
+            return None
+        first = parts[index]
+        index += 1
+        if first.startswith("@"):
+            if index >= len(parts):
+                return None
+            package_name = f"{first}/{parts[index]}"
+            index += 1
+        else:
+            package_name = first
+        if re.fullmatch(
+            r"(?:@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*",
+            package_name,
+        ) is None:
+            return None
+    return package_name
+
+
+def npm_lock_dependency_path(
+    packages: dict[str, Any],
+    package_path: str,
+    dependency: str,
+    label: str,
+    *,
+    required: bool = True,
+) -> str | None:
+    dependency_parts = dependency.split("/")
+    current = package_path
+    candidates: list[str] = []
+    while True:
+        candidates.append("/".join((current, "node_modules", *dependency_parts)))
+        marker = current.rfind("/node_modules/")
+        if marker < 0:
+            candidates.append("/".join(("node_modules", *dependency_parts)))
+            break
+        current = current[:marker]
+    resolved = [candidate for candidate in candidates if candidate in packages]
+    if not resolved:
+        if not required:
+            return None
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest runtime dependency {dependency} from "
+            f"{package_path} has no lockfile package entry"
+        )
+    selected = resolved[0]
+    if npm_lock_package_name(selected) != dependency:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest runtime dependency {dependency} has "
+            f"an ambiguous or noncanonical hoist at {selected}"
+        )
+    return selected
+
+
+def npm_runtime_dependency_fields(
+    package: dict[str, Any], package_path: str, label: str
+) -> tuple[dict[str, str], set[str]]:
+    dependencies: dict[str, str] = {}
+    optional: set[str] = set()
+    for field in ("dependencies", "optionalDependencies", "peerDependencies"):
+        value = package.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: {package_path} has malformed {field} "
+                "in the Jest runtime closure"
+            )
+        for name, declaration in value.items():
+            declaration_lower = declaration.lower() if isinstance(declaration, str) else ""
+            if (
+                not isinstance(name, str)
+                or npm_lock_package_name(f"node_modules/{name}") != name
+                or not isinstance(declaration, str)
+                or not declaration.strip()
+            ):
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: {package_path} has an invalid "
+                    f"Jest runtime dependency declaration in {field}"
+                )
+            if declaration_lower.startswith(
+                (
+                    "file:",
+                    "link:",
+                    "workspace:",
+                    "git:",
+                    "git+",
+                    "github:",
+                    "http:",
+                    "https:",
+                    "./",
+                    "../",
+                    "/",
+                )
+            ) or "github.com" in declaration_lower:
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: {package_path} declares Jest runtime "
+                    f"dependency {name} from a local, linked, workspace, Git, or "
+                    "URL source"
+                )
+            previous = dependencies.get(name)
+            if previous is not None and previous != declaration:
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: {package_path} ambiguously declares "
+                    f"Jest runtime dependency {name}"
+                )
+            dependencies[name] = declaration
+            if field == "optionalDependencies":
+                optional.add(name)
+    peer_metadata = package.get("peerDependenciesMeta")
+    if peer_metadata is not None:
+        if not isinstance(peer_metadata, dict):
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: {package_path} has malformed "
+                "peerDependenciesMeta in the Jest runtime closure"
+            )
+        for name, metadata in peer_metadata.items():
+            if name not in dependencies or not isinstance(metadata, dict):
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: {package_path} has invalid optional "
+                    "peer dependency metadata in the Jest runtime closure"
+                )
+            if metadata.get("optional") is True:
+                optional.add(name)
+    return dependencies, optional
+
+
+def npm_registry_package_version(
+    lock_path: str, entry: dict[str, Any], label: str
+) -> str:
+    package_name = npm_lock_package_name(lock_path)
+    if package_name is None:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest runtime package has a noncanonical or "
+            f"path-escaping lockfile location at {lock_path}"
+        )
+    if entry.get("link") is True:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest runtime package {package_name} is a "
+            f"local or linked lock entry at {lock_path}"
+        )
+    version = entry.get("version")
+    resolved = entry.get("resolved")
+    integrity = entry.get("integrity")
+    if not (
+        isinstance(version, str)
+        and re.fullmatch(r"[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z.-]+)?", version)
+        and isinstance(resolved, str)
+        and isinstance(integrity, str)
+    ):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest runtime package {package_name} lacks "
+            "a registry version, resolved tarball, or integrity"
+        )
+    parsed = urlsplit(resolved)
+    tarball_name = package_name.rsplit("/", 1)[-1]
+    expected_path = f"/{package_name}/-/{tarball_name}-{version}.tgz"
+    if not (
+        parsed.scheme == "https"
+        and parsed.hostname == "registry.npmjs.org"
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port is None
+        and parsed.query == ""
+        and parsed.fragment == ""
+        and unquote(parsed.path).lower() == expected_path.lower()
+    ):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest runtime package {package_name} is not "
+            "resolved from its official npm registry tarball"
+        )
+    algorithm, separator, encoded = integrity.partition("-")
+    try:
+        digest = base64.b64decode(encoded, validate=True) if separator else b""
+    except (binascii.Error, ValueError):
+        digest = b""
+    if algorithm != "sha512" or len(digest) != 64:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Jest runtime package {package_name} requires "
+            "a valid sha512 registry integrity"
+        )
+    return version
+
+
+def npm_jest_lock_provenance(
+    lockfile: Path, label: str
+) -> dict[str, dict[str, Any]]:
     try:
         value = read_bounded_json(
             lockfile,
@@ -1476,92 +1670,159 @@ def npm_jest_lock_provenance(lockfile: Path, label: str) -> str:
             f"{label} CANNOT-CERTIFY: Jest dependency uses a local, linked, "
             "workspace, Git, or URL source instead of registry provenance"
         )
-    if entry.get("link") is True:
-        cannot_certify(
-            f"{label} CANNOT-CERTIFY: node_modules/jest is a linked lock entry"
+    typed_packages = {
+        path: package
+        for path, package in packages.items()
+        if isinstance(path, str) and isinstance(package, dict)
+    }
+    closure: dict[str, dict[str, Any]] = {}
+    pending = ["node_modules/jest"]
+    while pending:
+        lock_path = pending.pop()
+        if lock_path in closure:
+            continue
+        if len(closure) >= 4096:
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: Jest runtime dependency closure exceeds "
+                "the 4096-package safety bound"
+            )
+        lock_entry = typed_packages.get(lock_path)
+        if lock_entry is None:
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: Jest runtime package is missing its "
+                f"lockfile entry at {lock_path}"
+            )
+        npm_registry_package_version(lock_path, lock_entry, label)
+        closure[lock_path] = lock_entry
+        dependencies, optional = npm_runtime_dependency_fields(
+            lock_entry, lock_path, label
         )
-    version = entry.get("version")
-    resolved = entry.get("resolved")
-    integrity = entry.get("integrity")
-    if not (
-        isinstance(version, str)
-        and re.fullmatch(r"[0-9]+[.][0-9]+[.][0-9]+(?:-[0-9A-Za-z.-]+)?", version)
-        and isinstance(resolved, str)
-        and isinstance(integrity, str)
-    ):
-        cannot_certify(
-            f"{label} CANNOT-CERTIFY: node_modules/jest lacks a registry version, "
-            "resolved tarball, or integrity"
-        )
-    parsed = urlsplit(resolved)
-    if not (
-        parsed.scheme == "https"
-        and parsed.hostname == "registry.npmjs.org"
-        and parsed.username is None
-        and parsed.password is None
-        and parsed.port is None
-        and parsed.query == ""
-        and parsed.fragment == ""
-        and parsed.path == f"/jest/-/jest-{version}.tgz"
-    ):
-        cannot_certify(
-            f"{label} CANNOT-CERTIFY: node_modules/jest is not resolved from the "
-            "official npm Jest tarball"
-        )
-    algorithm, separator, encoded = integrity.partition("-")
-    try:
-        digest = base64.b64decode(encoded, validate=True) if separator else b""
-    except (binascii.Error, ValueError):
-        digest = b""
-    if algorithm != "sha512" or len(digest) != 64:
-        cannot_certify(
-            f"{label} CANNOT-CERTIFY: node_modules/jest requires a valid sha512 "
-            "registry integrity"
-        )
-    return version
+        for dependency in sorted(dependencies):
+            dependency_path = npm_lock_dependency_path(
+                typed_packages,
+                lock_path,
+                dependency,
+                label,
+                required=dependency not in optional,
+            )
+            if dependency_path is not None:
+                pending.append(dependency_path)
+    return closure
 
 
-def materialized_jest_runner(project: Path, version: str, label: str) -> Path:
+def materialized_jest_runner(
+    project: Path, closure: dict[str, dict[str, Any]], label: str
+) -> Path:
     package_root = project / "node_modules" / "jest"
-    package_file = package_root / "package.json"
     runner = project / "node_modules" / ".bin" / "jest"
     try:
-        package_metadata = package_root.lstat()
         runner_metadata = runner.lstat()
     except OSError as exc:
         cannot_certify(
-            f"{label} CANNOT-CERTIFY: materialized Jest package or runner is "
-            f"unavailable: {exc}"
-        )
-    if not stat.S_ISDIR(package_metadata.st_mode) or package_root.is_symlink():
-        cannot_certify(
-            f"{label} CANNOT-CERTIFY: materialized node_modules/jest is not a "
-            "real package directory"
+            f"{label} CANNOT-CERTIFY: materialized Jest runner is unavailable: {exc}"
         )
     if not stat.S_ISLNK(runner_metadata.st_mode):
         cannot_certify(
             f"{label} CANNOT-CERTIFY: materialized Jest runner is not the package "
             "manager symlink to the real CLI"
         )
-    try:
-        package = read_bounded_json(
-            package_file,
-            maximum_bytes=1024 * 1024,
-            maximum_items=4096,
-            maximum_string_bytes=1024 * 1024,
-        )
-    except BoundedIOError as exc:
-        cannot_certify(
-            f"{label} CANNOT-CERTIFY: materialized Jest package metadata is "
-            f"unreadable: {exc}"
-        )
+    materialized_packages: dict[str, dict[str, Any]] = {}
+    project_root = project.resolve()
+    node_modules_root = (project / "node_modules").resolve()
+    pending = ["node_modules/jest"]
+    while pending:
+        lock_path = pending.pop()
+        if lock_path in materialized_packages:
+            continue
+        lock_entry = closure[lock_path]
+        package_name = npm_lock_package_name(lock_path)
+        require(package_name is not None, f"{label} invalid closure package path")
+        package_path = project / lock_path
+        package_file = package_path / "package.json"
+        try:
+            package_metadata = package_path.lstat()
+            package_file_metadata = package_file.lstat()
+            resolved_package = package_path.resolve(strict=True)
+        except OSError as exc:
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: Jest runtime package {package_name} is "
+                f"not materialized at {lock_path}: {exc}"
+            )
+        if not (
+            stat.S_ISDIR(package_metadata.st_mode)
+            and not package_path.is_symlink()
+            and stat.S_ISREG(package_file_metadata.st_mode)
+            and not package_file.is_symlink()
+            and resolved_package == package_path
+            and resolved_package.is_relative_to(node_modules_root)
+            and resolved_package.is_relative_to(project_root)
+        ):
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: Jest runtime package {package_name} "
+                f"escapes or is not a real materialized package at {lock_path}"
+            )
+        try:
+            package = read_bounded_json(
+                package_file,
+                maximum_bytes=1024 * 1024,
+                maximum_items=4096,
+                maximum_string_bytes=1024 * 1024,
+            )
+        except BoundedIOError as exc:
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: materialized Jest runtime package "
+                f"metadata is unreadable at {package_file}: {exc}"
+            )
+        version = npm_registry_package_version(lock_path, lock_entry, label)
+        if not (
+            isinstance(package, dict)
+            and package.get("name") == package_name
+            and package.get("version") == version
+        ):
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: materialized Jest runtime package "
+                f"{package_name} does not match its lockfile identity"
+            )
+        for field in (
+            "dependencies",
+            "optionalDependencies",
+            "peerDependencies",
+            "peerDependenciesMeta",
+        ):
+            locked = lock_entry.get(field, {})
+            installed = package.get(field, {})
+            if locked != installed:
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: materialized Jest runtime package "
+                    f"{package_name} has {field} that do not match its lock entry"
+                )
+        materialized_packages[lock_path] = package
+        dependencies, optional = npm_runtime_dependency_fields(package, lock_path, label)
+        for dependency in dependencies:
+            dependency_path = npm_lock_dependency_path(
+                closure,
+                lock_path,
+                dependency,
+                label,
+                required=dependency not in optional,
+            )
+            if dependency_path is None:
+                continue
+            if not os.path.lexists(project / dependency_path):
+                if dependency in optional:
+                    continue
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: required Jest runtime dependency "
+                    f"{dependency} is not materialized at {dependency_path}"
+                )
+            pending.append(dependency_path)
+    package = materialized_packages["node_modules/jest"]
     package_bin = package.get("bin") if isinstance(package, dict) else None
     if isinstance(package_bin, dict):
         package_bin = package_bin.get("jest")
     if not (
         isinstance(package, dict)
         and package.get("name") == "jest"
-        and package.get("version") == version
         and isinstance(package_bin, str)
     ):
         cannot_certify(
@@ -1589,6 +1850,7 @@ def materialized_jest_runner(project: Path, version: str, label: str) -> Path:
         and os.access(cli, os.X_OK)
         and resolved_runner == resolved_cli
         and resolved_cli.is_relative_to(package_root.resolve())
+        and "node_modules/jest" in materialized_packages
     ):
         cannot_certify(
             f"{label} CANNOT-CERTIFY: Jest executable is not the real CLI inside "
@@ -1659,7 +1921,7 @@ def prepare_jest_invocation(
         if directory == checkout.resolve():
             break
         directory = directory.parent
-    jest_version = npm_jest_lock_provenance(lockfile, label)
+    jest_closure = npm_jest_lock_provenance(lockfile, label)
     node_bin = node_bin_for_project(project, label)
     package_manager = "npm"
     manager = node_bin / "npm"
@@ -1705,7 +1967,7 @@ def prepare_jest_invocation(
             "the lockfile-pinned Jest environment offline: "
             f"{(installed.stdout + installed.stderr).strip()[:1000] or 'no output'}"
         )
-    jest = materialized_jest_runner(project, jest_version, label)
+    jest = materialized_jest_runner(project, jest_closure, label)
     test_relative = (checkout / test_file_path(test_path, label)).resolve()
     try:
         test_argument = test_relative.relative_to(project).as_posix()

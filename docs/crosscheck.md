@@ -269,7 +269,9 @@ Proof sandboxes omit shared POSIX IPC and give each run private writable tempora
 The named test must be a canonical tracked regular file, and symlinks are rejected so a patch cannot mutate the executed target through an unchanged alias.
 Symlink rejection is anchored at the resolved review checkout, so a symlink inside the repository is refused while a symlinked ancestor above the firstmate home is not mistaken for one.
 The gate resolves the named runner before launch and reports an absent binary, a failed sandbox exec, a missing named test, and every measured runner non-execution explicitly as `NON-EXECUTION`.
-That distinction applies to baseline and mutation runs alike because a run that never reached an assertion can neither condemn the baseline nor vindicate the mutation.
+For Jest and Vitest, the gate injects a runner-specific body probe and accepts a passed or failed assertion record only when the probe independently recorded entry into that exact selected test body.
+A failed `beforeAll` or `beforeEach` hook can create a failed assertion record without entering the test function, so it remains `NON-EXECUTION` and clears nothing.
+That distinction applies to baseline and mutation runs alike because a run that never entered the selected test body can neither condemn the baseline nor vindicate the mutation.
 A runner absent from `MUTATION_RUNNER_POLICIES` is refused even if it is generally approved, because guessing its non-execution signal would allow a forged clearance.
 The patch may modify only non-test implementation paths already cited by the durable finding.
 It cannot modify the named test, conventional test trees, fixtures, Jest/Vitest/Vite runner config, or Crosscheck evidence support.
@@ -278,33 +280,34 @@ It cannot modify the named test, conventional test trees, fixtures, Jest/Vitest/
 
 Do not add a runner to `MUTATION_RUNNER_POLICIES` until its exact gate-owned invocation has an empirically distinguishable execution signal.
 Use the real runner in a clean scratch package with one mutation-insensitive control test and one mutation-sensitive regression test.
-Run the exact proposed argv with no reviewer arguments for six cases: matched pass, matched assertion failure, unmatched selector, missing target, missing dependency during collection, and conventional tracked configuration that fails at startup.
-Record the runner version, date, exact commands, exit statuses, stdout, and stderr before encoding anything.
+Run the exact proposed argv with no reviewer arguments for seven cases: matched pass, matched assertion failure, unmatched selector, missing target, missing dependency during collection, conventional tracked configuration that fails at startup, and a selected test whose `beforeAll` or `beforeEach` hook fails before its body.
+Record the runner version, date, exact commands, exit statuses, stdout, stderr, and body-probe report before encoding anything.
 A future version whose output no longer satisfies the declared parser fails closed as `NON-EXECUTION`; do not loosen the parser until that version has been measured through the same matrix.
 If a runner exposes no signal that distinguishes a failed assertion from failed startup or non-collection, it is not eligible for certification.
 
 The JavaScript profile was measured on 2026-08-09 with Jest 29.7.0 and Vitest 4.1.5 using these exact command shapes.
 
 ```sh
-jest --json --runTestsByPath regression.test.js --testNamePattern 'across chats resets state'
-vitest run --reporter=json regression.test.js --testNamePattern 'across chats resets state'
+jest --json --runTestsByPath /proof/regression.test.js --setupFilesAfterEnv /gate/jest-body-probe.cjs --testNamePattern 'across chats resets state'
+vitest run --reporter=json regression.test.js --runner /gate/vitest-body-probe.mjs --testNamePattern 'across chats resets state'
 ```
 
 The matched baseline exited 0 and recorded one passed selected assertion on both runners.
-The assertion mutation exited 1 and recorded one failed selected assertion on both runners.
+The assertion mutation exited 1 and recorded one failed selected assertion plus a matching body-start record on both runners.
 An unmatched selector exited 0 on both runners, with Jest recording only `pending` assertions and Vitest recording only `skipped` assertions.
 A missing target exited 1 with zero assertions, using a Jest runtime-error suite and an empty Vitest `testResults` array.
 A missing imported dependency exited 1 with a failed suite and an empty `assertionResults` array on both runners, with Jest additionally reporting one runtime-error suite.
 A conventional `jest.config.cjs` or `vitest.config.js` that threw during loading exited 1 and emitted no JSON stdout on either runner.
-Those observed shapes are what the shared `jest-compatible-json` report policy encodes; exit status alone is deliberately insufficient.
+A failed `beforeAll` or `beforeEach` hook recorded a failed assertion without a matching body-start record and was classified as `NON-EXECUTION`.
+Those observed shapes are what the shared `jest-compatible-json` report policy and runner-specific body probes encode; exit status and assertion status are deliberately insufficient on their own.
 
 To add a future runner, add one policy entry carrying its invocation ladder, gate-owned arguments, selector mode, project-root rule, report format, measured non-execution exits, and dated measurement string.
 Add a parser only when the runner uses a genuinely new measured report format, and keep that parser selected by the policy rather than branching throughout the gate.
-Add hermetic behavior coverage for every non-execution shape plus an end-to-end baseline-pass/mutation-fail certification before enabling the policy.
+Add hermetic behavior coverage for every non-execution shape plus a real-runner end-to-end baseline-pass/control-pass/mutation-only-regression-fail certification before enabling the policy.
 
 ### Known limitation: pytest's mutated exit status is still an inference
 
-Jest and Vitest now provide positive assertion-execution evidence through their measured machine reports.
+Jest and Vitest now provide positive test-body execution evidence through gate-owned lifecycle probes paired with their measured machine reports.
 Pytest still concludes that the named test detected the regression from the mutated nonzero exit after excluding its measured non-execution statuses.
 That status is influenced by reviewer-supplied argv, ambient environment, repository and ancestor configuration, runner version, and installed plugins.
 The positional-target rule, argument refusal, environment allowlist, and neutral ancestor config close known channels, but an installed plugin remains an accepted door and the list is hardening rather than a proof of soundness.

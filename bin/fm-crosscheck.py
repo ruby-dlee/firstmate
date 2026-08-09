@@ -72,8 +72,10 @@ class MutationRunnerPolicy:
         "invocations",
         "gate_arguments",
         "selector_mode",
+        "absolute_test_path",
         "node_project_cwd",
         "report_format",
+        "body_probe",
         "runtime_error_field",
         "non_execution_exits",
         "measurement",
@@ -85,8 +87,10 @@ class MutationRunnerPolicy:
         invocations: tuple[tuple[str, ...], ...],
         gate_arguments: tuple[str, ...],
         selector_mode: str,
+        absolute_test_path: bool,
         node_project_cwd: bool,
         report_format: str | None,
+        body_probe: str | None,
         runtime_error_field: str,
         non_execution_exits: tuple[tuple[int, str], ...],
         measurement: str,
@@ -94,8 +98,10 @@ class MutationRunnerPolicy:
         self.invocations = invocations
         self.gate_arguments = gate_arguments
         self.selector_mode = selector_mode
+        self.absolute_test_path = absolute_test_path
         self.node_project_cwd = node_project_cwd
         self.report_format = report_format
+        self.body_probe = body_probe
         self.runtime_error_field = runtime_error_field
         self.non_execution_exits = non_execution_exits
         self.measurement = measurement
@@ -104,11 +110,14 @@ class MutationRunnerPolicy:
 class TestRun:
     """Resolved proof command and the project directory it must run from."""
 
-    __slots__ = ("argv", "cwd")
+    __slots__ = ("argv", "cwd", "body_report")
 
-    def __init__(self, argv: tuple[str, ...], cwd: Path) -> None:
+    def __init__(
+        self, argv: tuple[str, ...], cwd: Path, body_report: Path | None = None
+    ) -> None:
         self.argv = argv
         self.cwd = cwd
+        self.body_report = body_report
 
 
 # This registry is the sole declaration point for mutation-proof runners.
@@ -128,8 +137,10 @@ MUTATION_RUNNER_POLICIES = {
         ),
         gate_arguments=(),
         selector_mode="native",
+        absolute_test_path=False,
         node_project_cwd=False,
         report_format=None,
+        body_probe=None,
         runtime_error_field="not-applicable",
         non_execution_exits=(
             (2, "collection was interrupted"),
@@ -143,8 +154,10 @@ MUTATION_RUNNER_POLICIES = {
         invocations=(("jest",),),
         gate_arguments=("--json", "--runTestsByPath"),
         selector_mode="test-name-pattern",
+        absolute_test_path=True,
         node_project_cwd=True,
         report_format="jest-compatible-json",
+        body_probe="jest-global-wrapper",
         runtime_error_field="required-zero",
         non_execution_exits=(),
         measurement="Jest 29.7.0 on 2026-08-09",
@@ -153,8 +166,10 @@ MUTATION_RUNNER_POLICIES = {
         invocations=(("vitest",),),
         gate_arguments=("run", "--reporter=json"),
         selector_mode="test-name-pattern",
+        absolute_test_path=False,
         node_project_cwd=True,
         report_format="jest-compatible-json",
+        body_probe="vitest-runner",
         runtime_error_field="absent",
         non_execution_exits=(),
         measurement="Vitest 4.1.5 on 2026-08-09",
@@ -1667,8 +1682,11 @@ def test_arguments(
     if policy.selector_mode == "native":
         target = test_path
     elif policy.selector_mode in {"none", "test-name-pattern"}:
-        target = str(
-            (checkout / test_file_path(test_path, label)).relative_to(run_cwd)
+        candidate = (checkout / test_file_path(test_path, label)).resolve()
+        target = (
+            str(candidate)
+            if policy.absolute_test_path
+            else str(candidate.relative_to(run_cwd))
         )
     else:
         tool_fail(
@@ -1676,16 +1694,161 @@ def test_arguments(
             f"{policy.selector_mode!r}"
         )
     argv = [*runner, *policy.gate_arguments, target]
+    body_report: Path | None = None
+    if policy.body_probe is not None:
+        probe_path, body_report = write_javascript_body_probe(
+            run_cwd, runner_name, policy.body_probe
+        )
+        if policy.body_probe == "jest-global-wrapper":
+            argv.extend(["--setupFilesAfterEnv", str(probe_path)])
+        elif policy.body_probe == "vitest-runner":
+            argv.extend(["--runner", str(probe_path)])
+        else:
+            tool_fail(
+                f"mutation-runner policy for {runner_name} has unknown body probe "
+                f"{policy.body_probe!r}"
+            )
     selector = test_selector(test_path, label)
     if selector is not None and policy.selector_mode == "test-name-pattern":
         argv.extend(["--testNamePattern", selector])
-    return TestRun(tuple(argv), run_cwd)
+    return TestRun(tuple(argv), run_cwd, body_report)
+
+
+def write_javascript_body_probe(
+    run_cwd: Path, runner: str, probe_kind: str
+) -> tuple[Path, Path]:
+    """Write the gate-owned hook that records entry into each selected test body."""
+
+    protocol = run_cwd / ".crosscheck"
+    protocol.mkdir(parents=True, exist_ok=True)
+    report_path = protocol / f"{runner}-body-executions.jsonl"
+    try:
+        report_path.unlink()
+    except FileNotFoundError:
+        pass
+    encoded_report = json.dumps(str(report_path))
+    if probe_kind == "jest-global-wrapper":
+        probe_path = protocol / "jest-body-probe.cjs"
+        source = f"""// crosscheck-body-report={report_path}
+const {{ appendFileSync }} = require('node:fs');
+const reportPath = {encoded_report};
+const proxies = new WeakMap();
+
+function recordBody(declaredName) {{
+  const currentName = globalThis.expect?.getState?.().currentTestName;
+  const fullName = typeof currentName === 'string' && currentName
+    ? currentName
+    : String(declaredName);
+  appendFileSync(reportPath, `${{JSON.stringify({{ fullName }})}}\\n`);
+}}
+
+function wrapRegistration(registration) {{
+  if (typeof registration !== 'function') return registration;
+  const existing = proxies.get(registration);
+  if (existing) return existing;
+  const proxy = new Proxy(registration, {{
+    apply(target, thisArg, argumentsList) {{
+      const next = [...argumentsList];
+      if (typeof next[1] === 'function') {{
+        const declaredName = next[0];
+        const body = next[1];
+        next[1] = function (...bodyArguments) {{
+          recordBody(declaredName);
+          return Reflect.apply(body, this, bodyArguments);
+        }};
+      }}
+      return wrapRegistration(Reflect.apply(target, thisArg, next));
+    }},
+    get(target, property, receiver) {{
+      return wrapRegistration(Reflect.get(target, property, receiver));
+    }},
+  }});
+  proxies.set(registration, proxy);
+  return proxy;
+}}
+
+globalThis.test = wrapRegistration(globalThis.test);
+globalThis.it = wrapRegistration(globalThis.it);
+"""
+    elif probe_kind == "vitest-runner":
+        probe_path = protocol / "vitest-body-probe.mjs"
+        source = f"""// crosscheck-body-report={report_path}
+import {{ appendFileSync }} from 'node:fs';
+import {{ VitestTestRunner }} from 'vitest';
+const reportPath = {encoded_report};
+
+export default class CrosscheckBodyRunner extends VitestTestRunner {{
+  async runTask(test) {{
+    const ancestorTitles = [];
+    let suite = test.suite;
+    while (suite) {{
+      if (suite.name) ancestorTitles.push(suite.name);
+      suite = suite.suite;
+    }}
+    ancestorTitles.reverse();
+    const fullName = [...ancestorTitles, test.name].filter(Boolean).join(' ');
+    appendFileSync(reportPath, `${{JSON.stringify({{ fullName }})}}\\n`);
+    const body = VitestTestRunner.getTestFn(test);
+    if (!body) throw new Error('Test function is not found');
+    await body();
+  }}
+}}
+"""
+    else:
+        tool_fail(f"unknown JavaScript body probe {probe_kind!r}")
+    probe_path.write_text(source, encoding="utf-8")
+    return probe_path, report_path
+
+
+def read_javascript_body_report(
+    path: Path | None, runner: str, label: str, phase: str
+) -> set[str]:
+    if path is None:
+        non_execution(label, f"{runner} has no body-execution report policy")
+    try:
+        payload = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        non_execution(
+            label,
+            f"{runner} recorded no positive test-body execution evidence during "
+            f"the {phase} run: {exc}",
+        )
+    if len(payload.encode("utf-8")) > MAX_CAPTURE:
+        non_execution(label, f"{runner} emitted an oversized test-body report")
+    executions: set[str] = set()
+    for line_number, line in enumerate(payload.splitlines(), start=1):
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            non_execution(
+                label,
+                f"{runner} emitted malformed test-body evidence on line "
+                f"{line_number}: {exc}",
+            )
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"fullName"}
+            or not isinstance(entry.get("fullName"), str)
+            or not entry["fullName"]
+        ):
+            non_execution(label, f"{runner} emitted malformed test-body evidence")
+        executions.add(entry["fullName"])
+    if not executions:
+        non_execution(
+            label,
+            f"{runner} recorded no selected test body starting during the {phase} run",
+        )
+    return executions
 
 
 def require_jest_compatible_execution_report(
-    result: subprocess.CompletedProcess[str], runner: str, label: str, phase: str
+    result: subprocess.CompletedProcess[str],
+    runner: str,
+    label: str,
+    phase: str,
+    body_report: Path | None,
 ) -> None:
-    """Require Jest/Vitest JSON to prove at least one assertion executed."""
+    """Require machine results backed by positive selected-body lifecycle evidence."""
 
     try:
         report = json.loads(result.stdout)
@@ -1736,6 +1899,7 @@ def require_jest_compatible_execution_report(
         )
 
     statuses: list[str] = []
+    outcome_names: set[str] = set()
     suite_without_assertion_failure = False
     for suite in test_results:
         if not isinstance(suite, dict):
@@ -1764,6 +1928,14 @@ def require_jest_compatible_execution_report(
                 )
             suite_statuses.append(status_value)
             statuses.append(status_value)
+            if status_value in {"passed", "failed"}:
+                full_name = assertion.get("fullName")
+                if not isinstance(full_name, str) or not full_name:
+                    non_execution(
+                        label,
+                        f"{runner} emitted an outcome without a full test name",
+                    )
+                outcome_names.add(full_name)
         if suite.get("status") == "failed" and "failed" not in suite_statuses:
             suite_without_assertion_failure = True
     if suite_without_assertion_failure:
@@ -1793,6 +1965,16 @@ def require_jest_compatible_execution_report(
             f"{runner} matched no executing assertion during the {phase} run; "
             "skipped or pending tests are not a test outcome",
         )
+    body_executions = read_javascript_body_report(
+        body_report, runner, label, phase
+    )
+    missing_bodies = sorted(outcome_names - body_executions)
+    if missing_bodies:
+        non_execution(
+            label,
+            f"{runner} reported outcomes for test bodies that never started during "
+            f"the {phase} run: {', '.join(missing_bodies)}",
+        )
     if result.returncode != 0 and failed_count == 0:
         non_execution(
             label,
@@ -1811,6 +1993,7 @@ def require_test_execution(
     runner: str,
     label: str,
     phase: str,
+    body_report: Path | None = None,
 ) -> None:
     """Refuse to read a test outcome out of a run that never reached the test."""
 
@@ -1823,7 +2006,9 @@ def require_test_execution(
         )
     policy = MUTATION_RUNNER_POLICIES[runner]
     if policy.report_format == "jest-compatible-json":
-        require_jest_compatible_execution_report(result, runner, label, phase)
+        require_jest_compatible_execution_report(
+            result, runner, label, phase, body_report
+        )
         return
     if policy.report_format is not None:
         tool_fail(
@@ -2040,7 +2225,13 @@ def execute_mutation_proof(
         ),
         description=f"{label} baseline test",
     )
-    require_test_execution(baseline, invocation["runner"], label, "baseline")
+    require_test_execution(
+        baseline,
+        invocation["runner"],
+        label,
+        "baseline",
+        baseline_run.body_report,
+    )
     require(
         baseline.returncode == 0,
         f"{label} named test does not pass before mutation: it ran and exited "
@@ -2096,7 +2287,13 @@ def execute_mutation_proof(
         ),
         description=f"{label} mutated test",
     )
-    require_test_execution(mutated, invocation["runner"], label, "mutated")
+    require_test_execution(
+        mutated,
+        invocation["runner"],
+        label,
+        "mutated",
+        mutated_run.body_report,
+    )
     require(mutated.returncode != 0, f"{label} named test still passes after mutation")
     return {
         "test_path": test_path,

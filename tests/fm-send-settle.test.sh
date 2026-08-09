@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # fm-send post-submit settle pause (FM_SEND_SETTLE).
 #
-# fm-send's success only proves the composer cleared - the Enter landed and the
-# text was submitted. The harness then takes a beat to spin up the turn before its
+# fm-send's success requires an atomic adapter confirmation and a post-submit
+# identity read. The harness then takes a beat to spin up the turn before its
 # busy footer appears, so an immediate peek after fm-send returns would see the
 # stale idle pane. fm-send therefore pauses FM_SEND_SETTLE seconds (default 1, 0
-# disables) after a successful text submit, so the receiving turn has time to
-# visibly start. These tests pin that behavior hermetically (stubbed tmux + sleep,
-# no real agent):
+# disables) after successful atomic steering, so the receiving turn has time to
+# visibly start. These tests pin that behavior hermetically through the guarded
+# test-lab adapter (stubbed tmux + sleep, no real agent):
 #   1. A successful text send pauses for the FM_SEND_SETTLE value (default 1).
 #   2. FM_SEND_SETTLE=0 produces no pause at all (sleep is never invoked for it).
 #   3. The pause is tunable (FM_SEND_SETTLE=7 pauses 7).
@@ -20,13 +20,16 @@ set -u
 SEND="$ROOT/bin/fm-send.sh"
 
 fm_test_tmproot_into TMP_ROOT fm-send-settle
+STEERING_STUB="$TMP_ROOT/fm-send-steering.sh"
+cat > "$STEERING_STUB" <<'SH'
+#!/usr/bin/env bash
+printf 'confirmed'
+SH
+chmod +x "$STEERING_STUB"
 
-# A fake tmux that lets fm-send's submit path reach a clean "empty" verdict, plus a
-# fake sleep that records every requested duration (one per line) instead of
-# sleeping. send-keys always succeeds; display-message yields a numeric cursor_y;
-# capture-pane returns an empty bordered composer so fm_tmux_composer_state reads
-# "empty" (submit landed) on the first Enter. The sleep log path comes from
-# FM_SLEEP_LOG.
+# A fake tmux verifies endpoint identity and provides the required post-submit
+# read. A fake sleep records every requested duration instead of sleeping. The
+# sleep log path comes from FM_SLEEP_LOG.
 make_stubs() {  # <dir> -> echoes fakebin dir
   local dir=$1 fb="$1/fakebin"
   mkdir -p "$fb"
@@ -64,6 +67,7 @@ run_send() {
   : > "$log"
   env "$@" PATH="$fb:$PATH" \
     FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SLEEP_LOG="$log" \
+    FM_SEND_TEST_HOOKS=firstmate-fm-send-tests-v1 FM_SEND_STEERING_BIN="$STEERING_STUB" \
     "$SEND" "sess:win" "hello captain" 2>/dev/null
 }
 

@@ -315,6 +315,13 @@ async function writeSupervisorLock(fx, target, stateDirectory = join(fx.home, 's
   return holder;
 }
 
+async function stopChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const closed = new Promise((resolveClose) => child.once('close', resolveClose));
+  child.kill();
+  await closed;
+}
+
 async function listeningSockets(pid) {
   try {
     const output = execFileSync(
@@ -1040,9 +1047,7 @@ test('B5 fm-lavish-board executes submit and recovers after immediate browser cl
     );
     assert.equal(await exists(checkPath), false);
   } finally {
-    const closed = new Promise((resolveClose) => holder.once('close', resolveClose));
-    holder.kill();
-    await closed;
+    await stopChild(holder);
   }
 });
 
@@ -1841,9 +1846,7 @@ test('B2 visible queue revalidates the target against the lock holder', async ()
     assert.match(result.stderr, /home-bound supervisor/i);
     assert.equal(await exists(fake.log), false, 'queue wrote into an unowned pane');
   } finally {
-    const closed = new Promise((resolveClose) => holder.once('close', resolveClose));
-    holder.kill();
-    await closed;
+    await stopChild(holder);
   }
 });
 
@@ -1884,9 +1887,7 @@ test('B3 visible queue refuses before split pane input without an atomic receipt
       false,
     );
   } finally {
-    const closed = new Promise((resolveClose) => holder.once('close', resolveClose));
-    holder.kill();
-    await closed;
+    await stopChild(holder);
   }
 });
 

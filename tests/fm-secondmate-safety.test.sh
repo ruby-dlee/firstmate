@@ -62,7 +62,7 @@ write_secondmate_registration() {
 
 
 test_fm_home_parameterization() {
-  local brief fakebin home_one home_two out
+  local brief custom_check custom_digest fakebin home_one home_two out
   home_one="$TMP_ROOT/home one"
   home_two="$TMP_ROOT/home-two"
   fakebin="$TMP_ROOT/fm-home-gh-axi"
@@ -106,13 +106,17 @@ SH
   grep -F ">> '$home_one/state/task-c.status'" "$brief" >/dev/null || fail "secondmate brief did not shell-quote FM_HOME state path"
 
   printf 'project=x\n' > "$home_one/state/task-a.meta"
+  custom_check="$home_one/state/task-a.check.sh"
+  printf '#!/bin/sh\nprintf "custom task check\\n"\n' > "$custom_check"
+  custom_digest=$(cksum < "$custom_check")
   FM_HOME="$home_one" \
   FM_GH_AXI_BIN="$fakebin/gh-axi" \
   FM_TEST_PR_API_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-api.toon" \
   FM_GUARD_GRACE=999999 \
     "$ROOT/bin/fm-pr-check.sh" task-a https://github.com/example/repo/pull/1 >/dev/null 2>/dev/null \
     || fail "fm-pr-check failed under FM_HOME"
-  [ -f "$home_one/state/task-a.check.sh" ] || fail "pr check was not written under FM_HOME/state"
+  [ "$(cksum < "$custom_check")" = "$custom_digest" ] \
+    || fail "fm-pr-check changed the task-owned custom check under FM_HOME/state"
   [ ! -e "$home_two/state/task-a.check.sh" ] || fail "pr check leaked into another home"
   pass "FM_HOME parameterizes data and state paths"
 }

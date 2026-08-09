@@ -7,7 +7,8 @@
 # (bin/fm-marker-lib.sh) when, and only when, the resolved target is a task
 # selector whose meta records kind=secondmate, so the secondmate can recognize
 # the request and route its reply via the status path. These tests pin that
-# behavior hermetically (stubbed tmux, no real agent):
+# behavior hermetically through the guarded atomic steering test adapter (no
+# real agent):
 #   1. Exact-id and stable-label kind=secondmate selectors prepend the marker.
 #   2. Exact-id and stable-label ordinary crewmate selectors stay unmarked.
 #   3. Explicit endpoints stay unmarked, with or without matching local meta.
@@ -24,13 +25,17 @@ set -u
 SEND="$ROOT/bin/fm-send.sh"
 
 fm_test_tmproot_into TMP_ROOT fm-send-marker
+STEERING_STUB="$TMP_ROOT/fm-send-steering.sh"
+cat > "$STEERING_STUB" <<'SH'
+#!/usr/bin/env bash
+printf '%s' "$3" >> "$FM_SEND_LOG"
+printf 'confirmed'
+SH
+chmod +x "$STEERING_STUB"
 
-# A fake tmux that (a) records the literal text of every `send-keys -l` to
-# FM_SEND_LOG and (b) lets fm-send's submit path reach a clean "empty" verdict.
-# display-message yields a numeric cursor_y; capture-pane returns an empty
-# bordered composer so fm_tmux_composer_state reads "empty" (submit landed) on the
-# first Enter. Only the literal (-l) text is logged; Enter retries and --key sends
-# are not, so the log holds exactly what was typed into the composer.
+# A fake tmux verifies endpoint identity and provides the required post-submit
+# read. Text itself is recorded by the atomic test adapter above; production
+# tmux text input remains unavailable.
 make_stubs() {  # <dir> -> echoes fakebin dir
   local dir=$1 fb="$1/fakebin"
   mkdir -p "$fb"
@@ -80,6 +85,7 @@ run_send() {
   : > "$log"
   env PATH="$fb:$PATH" \
     FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_SEND_TEST_HOOKS=firstmate-fm-send-tests-v1 FM_SEND_STEERING_BIN="$STEERING_STUB" \
     "$SEND" "$@" 2>/dev/null
 }
 

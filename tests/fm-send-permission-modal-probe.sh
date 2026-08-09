@@ -40,19 +40,21 @@ send_to_stub() {
 }
 
 stub stub-init composer
-send_to_stub >/dev/null 2>"$TMP_ROOT/composer.err" \
-  || fail "empty-composer control did not submit: $(cat "$TMP_ROOT/composer.err")"
+if send_to_stub >/dev/null 2>"$TMP_ROOT/composer.err"; then
+  fail "production empty-composer path bypassed atomic steering refusal"
+fi
 COMPOSER=$(stub stub-snapshot)
-jq -e --arg message "$MESSAGE" '
+jq -e '
   .approved == false
-  and .turn_started == true
-  and ([.events[] | select(.event == "text" and .value == $message)] | length == 1)
-  and ([.events[] | select(.event == "key" and .value == "enter")] | length == 1)
-  and ([.events[] | select(.event == "turn-started")] | length == 1)
+  and .turn_started == false
+  and .mode == "composer"
+  and .events == []
 ' >/dev/null <<<"$COMPOSER" \
-  || fail "empty-composer control did not receive one text and one submitting Enter: $COMPOSER"
+  || fail "production empty-composer refusal delivered text or a key: $COMPOSER"
+assert_contains "$(cat "$TMP_ROOT/composer.err")" "no atomic agent-session-bound text steering operation" \
+  "empty-composer refusal omitted the atomic steering blocker"
 printf 'composer-events=%s\n' "$COMPOSER"
-pass "permission TUI: empty composer accepts staged text and one submitting Enter"
+pass "permission TUI: production empty composer refuses before text or Enter"
 
 stub stub-init modal
 if send_to_stub >/dev/null 2>"$TMP_ROOT/modal.err"; then
@@ -66,8 +68,8 @@ jq -e '
   and .events == []
 ' >/dev/null <<<"$MODAL" \
   || fail "permission-modal refusal delivered text or a key: $MODAL"
-assert_contains "$(cat "$TMP_ROOT/modal.err")" "could not prove an empty Herdr composer" \
-  "permission-modal refusal did not surface the fail-closed blocker"
+assert_contains "$(cat "$TMP_ROOT/modal.err")" "no atomic agent-session-bound text steering operation" \
+  "permission-modal refusal omitted the atomic steering blocker"
 printf 'modal-events=%s\n' "$MODAL"
 pass "permission TUI: modal refusal sends neither staged text nor Enter"
 
@@ -84,8 +86,8 @@ jq -e '
   and .events == []
 ' >/dev/null <<<"$PENDING" \
   || fail "pending-composer refusal changed the existing input or delivered a key: $PENDING"
-assert_contains "$(cat "$TMP_ROOT/pending.err")" "composer already contains pending input" \
-  "pending-composer refusal did not surface its distinct blocker"
+assert_contains "$(cat "$TMP_ROOT/pending.err")" "no atomic agent-session-bound text steering operation" \
+  "pending-composer refusal omitted the atomic steering blocker"
 printf 'pending-events=%s\n' "$PENDING"
 pass "permission TUI: pending composer refuses without changing input or pressing Enter"
 
@@ -101,8 +103,8 @@ jq -e '
   and .events == []
 ' >/dev/null <<<"$UNREADABLE" \
   || fail "unreadable-composer refusal delivered text or a key: $UNREADABLE"
-assert_contains "$(cat "$TMP_ROOT/unreadable.err")" "could not prove an empty Herdr composer" \
-  "unreadable-composer refusal did not surface the UNKNOWN blocker"
+assert_contains "$(cat "$TMP_ROOT/unreadable.err")" "no atomic agent-session-bound text steering operation" \
+  "unreadable-composer refusal omitted the atomic steering blocker"
 printf 'unreadable-events=%s\n' "$UNREADABLE"
 pass "permission TUI: unreadable composer refuses without staging text or pressing Enter"
 
@@ -118,7 +120,7 @@ jq -e '
   and .events == []
 ' >/dev/null <<<"$MALFORMED" \
   || fail "malformed-composer refusal delivered text or a key: $MALFORMED"
-assert_contains "$(cat "$TMP_ROOT/malformed.err")" "could not prove an empty Herdr composer" \
-  "malformed-composer refusal did not surface the UNKNOWN blocker"
+assert_contains "$(cat "$TMP_ROOT/malformed.err")" "no atomic agent-session-bound text steering operation" \
+  "malformed-composer refusal omitted the atomic steering blocker"
 printf 'malformed-events=%s\n' "$MALFORMED"
 pass "permission TUI: malformed composer refuses without staging text or pressing Enter"

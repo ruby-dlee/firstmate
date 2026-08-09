@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# fm-send pre-submit popup-settle selection (the codex `$<skill>` fix).
+# fm-send atomic-steering popup-settle selection (the codex `$<skill>` fix).
 #
 # Some TUIs open a completion popup when the composer's first character triggers
 # it: codex (and others) for a leading `/` slash command, and codex specifically
 # for a leading `$<skill>` invocation (e.g. `$no-mistakes`). Submitting before the
-# popup settles lets it swallow the Enter, so the line never submits. fm-send
-# absorbs this by pausing `settle` seconds AFTER typing and BEFORE the (retried)
-# Enter - the first sleep fm_tmux_submit_core makes. These tests pin the
-# settle-SELECTION matrix hermetically (stubbed tmux + sleep, no real agent):
+# popup settles lets it swallow the Enter, so an eventual admitted atomic
+# steering adapter needs the selected settle value. These tests pin that
+# selection matrix through the guarded test-lab adapter (no real agent):
 #
 #   /...            -> 1.2  (universal; `/` only starts a command, never plain text)
 #   $... to codex   -> 1.2  (scoped: codex opens a `$<skill>` popup)
@@ -16,13 +15,8 @@
 #                            -> non-codex safe default)
 #   plain text      -> 0.3  (fast path)
 #
-# The popup-settle is the FIRST sleep recorded: fm_tmux_submit_core types the text,
-# then `sleep "$settle"`, then the Enter-retry loop (sleep 0.4 each) and finally
-# fm-send's own post-submit FM_SEND_SETTLE pause. So tail-vs-head matters: this
-# suite asserts on the HEAD sleep, distinct from fm-send-settle.test.sh which pins
-# the TAIL (post-submit) pause. The retried Enter in fm_tmux_submit_core remains the
-# real safety net; this settle is only the optimization that lets the popup clear so
-# the first Enter lands.
+# The adapter records its sixth argument, the selected settle value. Production
+# pane input remains unavailable and is covered separately as a fail-closed route.
 #
 # Every case below passes a LITERAL `$<skill>` / `$price` message in single quotes
 # on purpose - the whole point is to send an unexpanded `$...` line to the agent -
@@ -37,10 +31,21 @@ set -u
 SEND="$ROOT/bin/fm-send.sh"
 
 fm_test_tmproot_into TMP_ROOT fm-send-popup-settle
+RUNTIME_PROFILE_STUB="$TMP_ROOT/fm-runtime-profile.sh"
+cat > "$RUNTIME_PROFILE_STUB" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod +x "$RUNTIME_PROFILE_STUB"
+STEERING_STUB="$TMP_ROOT/fm-send-steering.sh"
+cat > "$STEERING_STUB" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$6" >> "$FM_SLEEP_LOG"
+printf 'confirmed'
+SH
+chmod +x "$STEERING_STUB"
 
-# Same stub shape as fm-send-settle.test.sh: a fake tmux that drives the submit
-# path to a clean "empty" verdict on the first Enter, and a fake sleep that records
-# every requested duration (one per line) into FM_SLEEP_LOG instead of sleeping.
+# The fake tmux verifies endpoint identity and provides the post-submit read.
 make_stubs() {  # <dir> -> echoes fakebin dir
   local dir=$1 fb="$1/fakebin"
   mkdir -p "$fb"
@@ -106,6 +111,9 @@ first_settle() {  # <expected> <label> <harness|--explicit> <message> [selector-
   : > "$log"
   env FM_SEND_SETTLE=0 PATH="$fb:$PATH" \
     FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SLEEP_LOG="$log" \
+    FM_SEND_TEST_HOOKS=firstmate-fm-send-tests-v1 \
+    FM_SEND_RUNTIME_PROFILE_BIN="$RUNTIME_PROFILE_STUB" \
+    FM_SEND_STEERING_BIN="$STEERING_STUB" \
     "$SEND" "$target" "$msg" 2>/dev/null; rc=$?
   expect_code 0 "$rc" "$label: send should succeed"
   first=$(head -1 "$log")

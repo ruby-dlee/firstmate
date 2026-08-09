@@ -539,17 +539,18 @@ Firstmate's wrapper stays narrow: `ask-user` findings return through `needs-deci
 That checks-green status is owed at the CI-ready return point, when `/no-mistakes` first reports CI green, not after the monitor-until-merge loop observes the PR merged or closed.
 Use chat for yes/no decisions; use the durable `lavish-axi` decision flow when there are multiple findings or options to triage.
 
-Judge a validating crewmate by the run's step status, never by whether its shell is still running.
-Read its current state with `bin/fm-crew-state.sh <id>`: a deterministic, token-tight one-line read that takes the matching no-mistakes run-step as the source of truth and reconciles it against the crewmate's `state/<id>.status` log.
-Because the run-step is authoritative before pane liveness, a crewmate whose window closed after or during validation can still report `done` or `working` from its run; a missing pane becomes `unknown` only when no matching run exists.
+Judge a validating crewmate with `bin/fm-crew-state.sh`, never by whether its shell is still running.
+Read its current state with `bin/fm-crew-state.sh <id>`: a deterministic, token-tight one-line read that ordinarily takes the matching no-mistakes run-step as the source of truth and reconciles it against the crewmate's `state/<id>.status` log.
+Because the run-step is ordinarily authoritative before pane liveness, a crewmate whose window closed after or during validation can still report `done` or `working` from its run; the narrow orphaned-CI-record exception and its safety boundary are owned by `docs/architecture.md` and the helper's header.
 That log is an append-only wake-*event* log, not a current-state field, and it goes stale the moment a resolved gate lets the run resume: after you answer a `needs-decision`/`blocked` and the crewmate silently resumes (responds to the gate, the pipeline fixes, it re-validates), the log's last line still reads `needs-decision`/`blocked` while the run-step has moved on.
 So never infer current state from a `tail` of that log; `bin/fm-crew-state.sh` reports the live run-step state and explicitly flags the stale log line superseded, where a raw `tail` would mislead you into re-escalating settled work.
 The fields below name the run-step states and outcomes it reads from `no-mistakes axi status`; run that command directly when you want the full gate findings.
 During the `ci` monitor phase, `bin/fm-crew-state.sh` also reads the ci step log tail because `axi status` reports both "still waiting on checks" and "checks green, waiting on merge" as `ci,running`.
+Its missing-worktree observation is only heuristic corroboration for that narrow orphaned-record exception, never a death verdict or authority to abort a run.
 A step that `axi status` renders as `quiet` is NOT evidence that anything died: a step running a configured `commands.*` shell command reports no pid, no round, and no log for its whole duration, which for this repo's test step is routinely hours.
 `bin/fm-crew-state.sh` appends a real liveness verdict there from `bin/fm-nm-step-liveness.sh`, which finds the step's own processes by working directory; the supervision boundary absorbs `alive` but surfaces `dead` and `unknown`, and a run must never be aborted without a `dead` verdict (`docs/postmortems/nm-quiet-test-step.md`).
 
-- `running`/`fixing`/`ci` - the pipeline is working (a fix round, a test, or CI monitoring); `ci` stays working until the ci log's most recent recognized marker says checks passed or no checks are terminally ready, and a later re-arm or issue marker returns it to working.
+- `running`/`fixing`/`ci` - the pipeline is ordinarily working (a fix round, a test, or CI monitoring); `ci` stays working until the ci log's most recent recognized marker says checks passed or no checks are terminally ready, and a later re-arm or issue marker returns it to working, subject to the orphaned-record exception above.
 - `awaiting_approval`/`fix_review` - the run is parked waiting on the agent, surfaced as a top-level `awaiting_agent: parked <duration>` line right after `status:` in `axi status`.
   Section 8's in-flight validation-custody boundary and `crew-steering` own the correction when the crewmate has stepped away.
 - `outcome: passed` or `checks-passed` - an open PR reports `done` only when the remote-currentness contract owned by `bin/fm-crew-state.sh`'s header succeeds; `unknown` or `stale` always means `do not merge`.
@@ -667,7 +668,7 @@ On wake, in order of cheapness:
 
 1. Read the reason line and drain queued wake records with `bin/fm-wake-drain.sh`.
 2. `signal:` read the listed status files first; a wake lists every signal that landed within the coalescing grace window (e.g. a status write plus the same turn's turn-end marker), and each is ~30 tokens and usually sufficient.
-   A status line is the wake *event*, not the crewmate's current state; when you need the live state - especially to confirm a `needs-decision`/`blocked`/`paused` status is still real and not already resolved-and-resumed - read it with `bin/fm-crew-state.sh <id>`, which reconciles the authoritative run-step over the possibly-stale log line, and never `tail` the status log as the current-state source.
+   A status line is the wake *event*, not the crewmate's current state; when you need the live state - especially to confirm a `needs-decision`/`blocked`/`paused` status is still real and not already resolved-and-resumed - read it with `bin/fm-crew-state.sh <id>`, which reconciles the ordinarily authoritative run-step against the possibly-stale log line, and never `tail` the status log as the current-state source.
 3. `stale:` the crewmate stopped without reporting, a recognized mid-run permission prompt is waiting, or a busy pane exceeded the possible system-dialog no-progress threshold.
    If the reason includes `permission-prompt detected` or `permission/system-dialog suspected`, load `stuck-crewmate-recovery` before taking any ordinary recovery action and follow its permission-blocked branch.
    Otherwise peek the pane (`bin/fm-peek.sh <window>`) to diagnose.

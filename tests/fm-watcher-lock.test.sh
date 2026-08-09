@@ -886,16 +886,84 @@ test_arm_owner_death_during_prestart_wedge_reaps_session() {
     i=$((i + 1))
   done
   [ -z "$members" ] || {
-    owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch-arm-owner.*' -print -quit)
+    owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch.lock.owner.arm.*' -print -quit)
     claim=$(cat "$owner_dir/session-stop" 2>/dev/null || true)
     for member in $members; do kill -KILL "$member" 2>/dev/null || true; done
     fail "arm death during prestart wedge left watcher session members: $members; arm=$armpid recorded=$(cat "$owner_dir/arm-owner-pid" 2>/dev/null || true); claim: $claim"
   }
   [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
     || fail "arm death during prestart wedge left the watcher lock behind"
-  [ -z "$(find "$state" -maxdepth 1 -type d -name '.watch-arm-owner.*' -print -quit)" ] \
+  [ -z "$(find "$state" -maxdepth 1 -type d -name '.watch.lock.owner.arm.*' -print -quit)" ] \
     || fail "arm death during prestart wedge left its immutable owner proof behind"
   pass "post-setsid owner observer reaps a prestart-wedged watcher"
+}
+
+test_prestart_claim_blocks_lock_publication() {
+  local dir state fakebin out ready proceed claim_ready claim_proceed armpid watcher_pid session i members member
+  dir=$(make_case prestart-claim-publication)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  ready="$dir/prestart.ready"
+  proceed="$dir/prestart.proceed"
+  claim_ready="$dir/claim.ready"
+  claim_proceed="$dir/claim.proceed"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_WATCH_CPU_POLL=999 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_PRESTART_READY="$ready" \
+    FM_WATCH_OWNER_TEST_PRESTART_PROCEED="$proceed" \
+    FM_WATCH_OWNER_TEST_CLAIM_READY="$claim_ready" \
+    FM_WATCH_OWNER_TEST_CLAIM_PROCEED="$claim_proceed" \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -s "$ready" ]; do
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  watcher_pid=$(cat "$ready" 2>/dev/null || true)
+  case "$watcher_pid" in ''|*[!0-9]*) fail "watcher did not reach the lock-publication race: $(cat "$out")" ;; esac
+  session=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_session "$2"' _ "$LIB" "$watcher_pid" 2>/dev/null || true)
+  [ "$session" = "$watcher_pid" ] || fail "lock-publication fixture did not own its session"
+  kill -KILL "$armpid" 2>/dev/null || fail "could not kill arm before lock publication"
+  wait "$armpid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -e "$claim_ready" ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$claim_ready" ] || fail "prestart cleanup did not acquire its canonical claim"
+  touch "$proceed"
+  i=0
+  while [ "$i" -lt 100 ] && is_live_non_zombie "$watcher_pid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  ! is_live_non_zombie "$watcher_pid" || {
+    touch "$claim_proceed"
+    fail "watcher stayed live after canonical claim blocked lock publication"
+  }
+  [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] || {
+    touch "$claim_proceed"
+    fail "watcher published an independent lock under a live prestart claim"
+  }
+  touch "$claim_proceed"
+  i=0
+  members=$watcher_pid
+  while [ "$i" -lt 100 ]; do
+    members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' _ "$LIB" "$session" 2>/dev/null || true)
+    [ -z "$members" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -z "$members" ] || {
+    for member in $members; do kill -KILL "$member" 2>/dev/null || true; done
+    fail "canonical prestart cleanup left session members: $members"
+  }
+  pass "prestart claims exclude lock publication in one namespace"
 }
 
 test_arm_normal_exit_after_owner_handoff() {
@@ -927,7 +995,7 @@ SH
     || fail "arm did not complete owner handoff before normal-exit test: $(cat "$out")"
   watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
   session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
-  owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch-arm-owner.*' -print | head -1)
+  owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch.lock.owner.arm.*' -print | head -1)
   prestart_pid=$(cat "$owner_dir/prestart-owner-pid" 2>/dev/null || true)
   prestart_identity=$(cat "$owner_dir/prestart-owner-identity" 2>/dev/null || true)
   case "$prestart_pid" in ''|*[!0-9]*) fail "owner handoff did not record the prestart observer" ;; esac
@@ -983,7 +1051,7 @@ test_restart_during_owner_handoff_uses_normal_anchor() {
   done
   [ -e "$ready" ] || fail "normal monitor did not reach its post-handoff restart barrier: $(cat "$first_out")"
   old_session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
-  old_owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch-arm-owner.*' -print | head -1)
+  old_owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch.lock.owner.arm.*' -print | head -1)
   prestart_pid=$(cat "$old_owner_dir/prestart-owner-pid" 2>/dev/null || true)
   prestart_identity=$(cat "$old_owner_dir/prestart-owner-identity" 2>/dev/null || true)
   case "$prestart_pid" in ''|*[!0-9]*) fail "restart handoff did not record its prestart observer" ;; esac
@@ -2674,6 +2742,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-4 ]; then
+  test_prestart_claim_blocks_lock_publication
+  test_arm_owner_death_during_prestart_wedge_reaps_session
+  test_restart_during_owner_handoff_uses_normal_anchor
+  exit 0
+fi
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
 test_pid_identity_survives_exec_without_command_text
@@ -2706,6 +2781,7 @@ test_watch_restart_recovers_dead_session_leader
 test_arm_owner_death_reaps_watcher_session
 test_arm_owner_death_before_monitor_start_reaps_session
 test_arm_owner_death_during_prestart_wedge_reaps_session
+test_prestart_claim_blocks_lock_publication
 test_arm_normal_exit_after_owner_handoff
 test_restart_during_owner_handoff_uses_normal_anchor
 test_session_cleanup_requires_stable_quiescence

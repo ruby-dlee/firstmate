@@ -29,7 +29,7 @@ owner_root_poll=5
 owner_link_lost=false
 
 case "$watcher_pid" in ''|*[!0-9]*) exit 2 ;; esac
-case "$owner_dir" in "$STATE"/.watch-arm-owner.*) ;; *) exit 2 ;; esac
+case "$owner_dir" in "$STATE"/.watch.lock.owner.arm.*) ;; *) exit 2 ;; esac
 [ -d "$owner_dir" ] && [ ! -L "$owner_dir" ] || exit 2
 [ "$owner_fifo" = "$owner_dir/control" ] && [ -p "$owner_fifo" ] || exit 2
 [ "$owner_ready" = "$owner_dir/ready" ] || exit 2

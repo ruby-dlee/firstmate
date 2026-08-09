@@ -832,45 +832,65 @@ fm_lock_claim_blocked_by_steal() {
 }
 
 fm_lock_claim() {
-  local lockdir=$1 ownerdir=$2 allowed_steal_owner=${3:-} mypid back
+  local lockdir=$1 ownerdir=$2 allowed_steal_owner=${3:-} preserve_owner=${4:-false} mypid back
   mypid=${BASHPID:-$$}
   if ! { printf '%s\n' "$mypid" > "$ownerdir/pid"; } 2>/dev/null; then
-    fm_lock_discard_owner "$lockdir" "$ownerdir"
+    "$preserve_owner" || fm_lock_discard_owner "$lockdir" "$ownerdir"
     return 1
   fi
   back=$(cat "$ownerdir/pid" 2>/dev/null || true)
   if [ "$back" != "$mypid" ]; then
-    fm_lock_discard_owner "$lockdir" "$ownerdir"
+    "$preserve_owner" || fm_lock_discard_owner "$lockdir" "$ownerdir"
     return 1
   fi
   if ! fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
-    fm_lock_discard_owner "$lockdir" "$ownerdir"
+    "$preserve_owner" || fm_lock_discard_owner "$lockdir" "$ownerdir"
     return 1
   fi
   if fm_lock_claim_blocked_by_steal "$lockdir" "$allowed_steal_owner"; then
     if fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
       rm -f "$lockdir" 2>/dev/null || true
     fi
-    fm_lock_discard_owner "$lockdir" "$ownerdir"
+    "$preserve_owner" || fm_lock_discard_owner "$lockdir" "$ownerdir"
     return 1
   fi
   return 0
 }
 
+FM_LOCK_PUBLICATION_BLOCKED=0
 fm_lock_try_create() {
-  local lockdir=$1 allowed_steal_owner=${2:-} ownerdir
+  local lockdir=$1 allowed_steal_owner=${2:-} preferred_owner=${3:-} ownerdir preserve_owner=false helper publish_status=0
   FM_LOCK_OWNER_DIR=
-  ownerdir=$(fm_lock_owner_dir "$lockdir") || return 1
+  if [ -n "$preferred_owner" ]; then
+    ownerdir=$(fm_lock_confined_target "$lockdir" "$preferred_owner") || return 1
+    preserve_owner=true
+  else
+    ownerdir=$(fm_lock_owner_dir "$lockdir") || return 1
+  fi
   if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
-    fm_lock_discard_owner "$lockdir" "$ownerdir"
+    "$preserve_owner" || fm_lock_discard_owner "$lockdir" "$ownerdir"
     return 1
   fi
-  if ! fm_lock_prepare_owner "$ownerdir"; then
-    fm_lock_discard_owner "$lockdir" "$ownerdir"
-    return 1
+  if "$preserve_owner"; then
+    [ "$(cat "$ownerdir/pid" 2>/dev/null || true)" = "${BASHPID:-$$}" ] || return 1
+  else
+    if ! fm_lock_prepare_owner "$ownerdir"; then
+      fm_lock_discard_owner "$lockdir" "$ownerdir"
+      return 1
+    fi
   fi
-  if ln -s "$ownerdir" "$lockdir" 2>/dev/null && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
-    if fm_lock_claim "$lockdir" "$ownerdir" "$allowed_steal_owner"; then
+  if "$preserve_owner"; then
+    helper="$FM_WAKE_LIB_DIR/fm-watcher-stop-claim.py"
+    [ -x "$helper" ] || publish_status=1
+    [ "$publish_status" -ne 0 ] || \
+      "$helper" publish "$ownerdir" "${BASHPID:-$$}" \
+        "$FM_WAKE_LIB_DIR/fm-process-identity.py" "$lockdir" || publish_status=$?
+    [ "$publish_status" -eq 0 ] || FM_LOCK_PUBLICATION_BLOCKED=1
+  else
+    ln -s "$ownerdir" "$lockdir" 2>/dev/null || publish_status=$?
+  fi
+  if [ "$publish_status" -eq 0 ] && fm_lock_points_to_owner "$lockdir" "$ownerdir"; then
+    if fm_lock_claim "$lockdir" "$ownerdir" "$allowed_steal_owner" "$preserve_owner"; then
       FM_LOCK_OWNER_DIR=$ownerdir
       return 0
     fi
@@ -880,7 +900,7 @@ fm_lock_try_create() {
   else
     fm_lock_remove_stray_owner_link "$lockdir" "$ownerdir"
   fi
-  fm_lock_discard_owner "$lockdir" "$ownerdir"
+  "$preserve_owner" || fm_lock_discard_owner "$lockdir" "$ownerdir"
   return 1
 }
 
@@ -1001,13 +1021,15 @@ fm_lock_recheck_stale_owner() {
 }
 
 fm_lock_try_acquire() {
-  local lockdir=$1 steal_depth=${2:-0} pid steal cur rc steal_owner primary_owner
+  local lockdir=$1 steal_depth=${2:-0} preferred_owner=${3:-} pid steal cur rc steal_owner primary_owner
   FM_LOCK_HELD_PID=
   FM_LOCK_OWNER_DIR=
+  [ "$steal_depth" -ne 0 ] || FM_LOCK_PUBLICATION_BLOCKED=0
 
-  if fm_lock_try_create "$lockdir"; then
+  if fm_lock_try_create "$lockdir" "" "$preferred_owner"; then
     return 0
   fi
+  [ "$FM_LOCK_PUBLICATION_BLOCKED" -eq 0 ] || return 1
 
   if fm_lock_process_session_guarded "$lockdir" || fm_lock_process_group_guarded "$lockdir"; then
     return 1
@@ -1073,7 +1095,7 @@ fm_lock_try_acquire() {
 
   fm_lock_remove_path "$lockdir" || true
   rc=1
-  if fm_lock_try_create "$lockdir" "$steal_owner"; then
+  if fm_lock_try_create "$lockdir" "$steal_owner" "$preferred_owner"; then
     rc=0
   fi
   if [ "$rc" -ne 0 ]; then

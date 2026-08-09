@@ -331,8 +331,53 @@ def clear(lockdir, boundary, helper, stopper, stopper_identity, claim_id, kind):
         os.close(descriptor)
 
 
+def publish_lock(lockdir, boundary, helper, publish_path):
+    descriptor = locked_file(lockdir)
+    published = False
+    try:
+        claim_path = os.path.join(lockdir, "session-stop")
+        if os.path.lexists(claim_path):
+            fields = parse_claim(read_regular(claim_path, required=True))
+            return 3 if claim_owner_live(fields, helper) else 1
+        if any(
+            name == "session-stop.pending" or name.startswith("session-stop.pending.")
+            for name in os.listdir(lockdir)
+        ):
+            return 1
+        snapshot = basis(lockdir, boundary, helper, "session")
+        lockdir = os.path.abspath(lockdir)
+        publish_path = os.path.abspath(publish_path)
+        if (
+            os.path.dirname(publish_path) != os.path.dirname(lockdir)
+            or os.path.basename(publish_path) != ".watch.lock"
+            or os.path.lexists(publish_path)
+        ):
+            return 1
+        os.symlink(lockdir, publish_path)
+        published = True
+        if basis(lockdir, boundary, helper, "session") != snapshot:
+            os.unlink(publish_path)
+            published = False
+            return 1
+        if not os.path.islink(publish_path) or os.readlink(publish_path) != lockdir:
+            os.unlink(publish_path)
+            published = False
+            return 1
+        return 0
+    except Exception:
+        if published:
+            try:
+                if os.path.islink(publish_path) and os.readlink(publish_path) == lockdir:
+                    os.unlink(publish_path)
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(descriptor)
+
+
 def main():
-    if len(sys.argv) not in (5, 7, 8):
+    if len(sys.argv) not in (5, 6, 7, 8):
         return 2
     action, lockdir, boundary, helper = sys.argv[1:5]
     kind = "legacy" if action.endswith("-legacy") else "session"
@@ -361,6 +406,10 @@ def main():
                 sys.argv[7],
                 kind,
             )
+        if action == "publish":
+            if len(sys.argv) != 6 or kind != "session":
+                return 2
+            return publish_lock(lockdir, boundary, helper, sys.argv[5])
         return 2
     except (OSError, RuntimeError, ValueError):
         return 1

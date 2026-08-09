@@ -147,12 +147,20 @@ clear_stale_recorded_watcher_lock() {
   [ ! -e "$WATCH_LOCK" ] && [ ! -L "$WATCH_LOCK" ]
 }
 
+FM_WATCH_STOP_FAILURE=
 stop_recorded_watcher() {  # <root-pid> <root-identity>
   local root=$1 identity=$2 session anchor anchor_identity group status
+  FM_WATCH_STOP_FAILURE=
   session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
   if [ -n "$session" ]; then
-    fm_watcher_lock_session_proof_matches "$STATE" "$WATCH" "$FM_HOME" "$session" || return 1
-    fm_watcher_lock_session_stop_claim "$STATE" "$session" || return 1
+    fm_watcher_lock_session_proof_matches "$STATE" "$WATCH" "$FM_HOME" "$session" || {
+      FM_WATCH_STOP_FAILURE=session-proof
+      return 1
+    }
+    fm_watcher_lock_session_stop_claim "$STATE" "$session" || {
+      FM_WATCH_STOP_FAILURE=session-claim
+      return 1
+    }
     fm_watcher_lock_session_anchor_read "$STATE" || true
     anchor=$FM_WATCHER_SESSION_ANCHOR_PID
     anchor_identity=$FM_WATCHER_SESSION_ANCHOR_IDENTITY
@@ -163,10 +171,14 @@ stop_recorded_watcher() {  # <root-pid> <root-identity>
       fm_session_stop_owned "$session" 30 || status=$?
     fi
     [ "$status" -eq 0 ] && return 0
+    FM_WATCH_STOP_FAILURE=session-drain
     fm_watcher_lock_session_stop_claim_clear "$STATE" "$session" >/dev/null 2>&1 || true
     return "$status"
   fi
-  fm_watcher_lock_legacy_stop_claim "$STATE" "$root" || return 1
+  fm_watcher_lock_legacy_stop_claim "$STATE" "$root" || {
+    FM_WATCH_STOP_FAILURE=legacy-claim
+    return 1
+  }
   if [ "${FM_WATCH_LEGACY_CLAIM_TEST_HOOKS:-}" = firstmate-legacy-claim-tests-v1 ] \
     && [ -n "${FM_WATCH_LEGACY_CLAIM_TEST_READY:-}" ] \
     && [ -n "${FM_WATCH_LEGACY_CLAIM_TEST_PROCEED:-}" ]; then
@@ -175,12 +187,14 @@ stop_recorded_watcher() {  # <root-pid> <root-identity>
   fi
   group=$(cat "$WATCH_LOCK/process-group" 2>/dev/null || true)
   [ "$group" = "$root" ] || {
+    FM_WATCH_STOP_FAILURE=legacy-proof
     fm_watcher_lock_legacy_stop_claim_clear "$STATE" "$root" >/dev/null 2>&1 || true
     return 1
   }
   status=0
   fm_pid_tree_stop "$root" 30 "$identity" "$group" || status=$?
   [ "$status" -eq 0 ] && return 0
+  FM_WATCH_STOP_FAILURE=legacy-drain
   fm_watcher_lock_legacy_stop_claim_clear "$STATE" "$root" >/dev/null 2>&1 || true
   return "$status"
 }
@@ -353,7 +367,7 @@ if [ "$mode" = restart ]; then
     if [ -n "$lock_session" ] || [ -n "$lock_group" ] \
       || [ "$current_identity" = "$lock_identity" ]; then
       if ! stop_recorded_watcher "$lock_pid" "$lock_identity"; then
-        echo "watcher: FAILED - recorded watcher ownership boundary could not be stopped for restart" >&2
+        echo "watcher: FAILED - recorded watcher ownership boundary could not be stopped for restart (${FM_WATCH_STOP_FAILURE:-unknown})" >&2
         exit 1
       fi
     fi
@@ -600,7 +614,7 @@ child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   echo "watcher: FAILED - no live watcher with a fresh beacon"
   exit 1
 }
-owner_link_dir=$(mktemp -d "$STATE/.watch-arm-owner.XXXXXX") || {
+owner_link_dir=$(mktemp -d "$STATE/.watch.lock.owner.arm.XXXXXX") || {
   rm -f "$child_out"
   echo "watcher: FAILED - could not create arm ownership channel"
   exit 1
@@ -830,9 +844,9 @@ while :; do
     if [ "$HEALTHY_PID" = "$child" ]; then
       if ! "$child_session_verified" \
         || ! fm_watcher_lock_session_matches_pid "$STATE" "$WATCH" "$FM_HOME" "$child"; then
-        echo "watcher: FAILED - started watcher did not establish its owned process session"
-        cleanup_child
-        exit 1
+        [ "$(date +%s)" -ge "$deadline" ] && break
+        sleep 0.05
+        continue
       fi
       if [ "$(cat "$owner_link_ready" 2>/dev/null || true)" != "$child" ]; then
         [ "$(date +%s)" -ge "$deadline" ] && break

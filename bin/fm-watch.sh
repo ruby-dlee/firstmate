@@ -1158,7 +1158,20 @@ if [ "${BASH_SOURCE[0]}" != "$0" ]; then
   return 0
 fi
 
-if ! fm_lock_try_acquire "$WATCH_LOCK"; then
+WATCHER_PID=${BASHPID:-$$}
+watcher_owner_dir=${FM_WATCH_ARM_OWNER_DIR:-}
+watcher_lock_owner_dir=
+if [ "${FM_WATCHER_OWN_SESSION:-0}" = 1 ]; then
+  case "$watcher_owner_dir" in
+    "$STATE"/.watch.lock.owner.arm.*) watcher_lock_owner_dir=$watcher_owner_dir ;;
+    *) echo "watcher: invalid canonical arm ownership directory" >&2; exit 1 ;;
+  esac
+fi
+if ! fm_lock_try_acquire "$WATCH_LOCK" 0 "$watcher_lock_owner_dir"; then
+  if [ "$FM_LOCK_PUBLICATION_BLOCKED" -ne 0 ]; then
+    echo "watcher: canonical arm cleanup transaction blocked lock publication" >&2
+    exit 1
+  fi
   BEAT="$STATE/.last-watcher-beat"
   if [ -n "${FM_LOCK_HELD_PID:-}" ]; then
     if [ -e "$BEAT" ]; then
@@ -1180,7 +1193,6 @@ fi
 # This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
 # ${BASHPID:-$$} from this same main shell). Read directly, never via a command
 # substitution, so it matches the stored holder pid for the self-eviction check.
-WATCHER_PID=${BASHPID:-$$}
 printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
 printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
@@ -1189,7 +1201,6 @@ watcher_owner_link_identity=
 watcher_owner_fifo=${FM_WATCH_ARM_OWNER_FIFO:-}
 watcher_owner_ready=${FM_WATCH_ARM_OWNER_READY:-}
 watcher_owner_failed=${FM_WATCH_ARM_OWNER_FAILED:-}
-watcher_owner_dir=${FM_WATCH_ARM_OWNER_DIR:-}
 watcher_owner_fd=${FM_WATCH_ARM_OWNER_FD:-}
 watcher_session_record=${FM_WATCH_ARM_SESSION_RECORD:-}
 watcher_owner_monitor="$SCRIPT_DIR/fm-watch-owner-monitor.sh"
@@ -1207,7 +1218,7 @@ fi
 
 if [ -n "$watcher_owner_fifo" ]; then
   [ "${FM_WATCHER_OWN_SESSION:-0}" = 1 ] || watcher_owner_fifo=
-  case "$watcher_owner_dir" in "$STATE"/.watch-arm-owner.*) ;; *) watcher_owner_dir= ;; esac
+  case "$watcher_owner_dir" in "$STATE"/.watch.lock.owner.arm.*) ;; *) watcher_owner_dir= ;; esac
   [ -n "$watcher_owner_fifo" ] && [ -n "$watcher_owner_dir" ] \
     && [ "$watcher_owner_fd" = 8 ] \
     && [ -d "$watcher_owner_dir" ] && [ ! -L "$watcher_owner_dir" ] \

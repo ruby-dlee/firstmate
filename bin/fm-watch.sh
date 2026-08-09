@@ -1177,6 +1177,12 @@ WATCHER_PID=${BASHPID:-$$}
 printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
 printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
+watcher_owner_link_pid=
+watcher_owner_fifo=${FM_WATCH_ARM_OWNER_FIFO:-}
+watcher_owner_ready=${FM_WATCH_ARM_OWNER_READY:-}
+watcher_owner_failed=${FM_WATCH_ARM_OWNER_FAILED:-}
+watcher_owner_dir=${FM_WATCH_ARM_OWNER_DIR:-}
+watcher_owner_monitor_pid_file=
 if [ "${FM_WATCHER_OWN_SESSION:-0}" = 1 ]; then
   watcher_session=$(fm_pid_session "$WATCHER_PID" 2>/dev/null || true)
   if [ "$watcher_session" != "$WATCHER_PID" ] \
@@ -1189,8 +1195,68 @@ if [ "${FM_WATCHER_OWN_SESSION:-0}" = 1 ]; then
   fi
 fi
 
+watcher_owner_link_monitor() {
+  local session=$1 monitor_pid lock_identity status=0 iteration=0
+  exec 8< "$watcher_owner_fifo" || exit 1
+  while [ "$iteration" -lt 100 ] && [ ! -s "$watcher_owner_monitor_pid_file" ]; do
+    sleep 0.01
+    iteration=$((iteration + 1))
+  done
+  monitor_pid=$(cat "$watcher_owner_monitor_pid_file" 2>/dev/null || true)
+  case "$monitor_pid" in ''|*[!0-9]*) exit 1 ;; esac
+  [ "$(fm_pid_session "$monitor_pid" 2>/dev/null || true)" = "$session" ] || exit 1
+  fm_watcher_lock_session_record_matches "$STATE" "$WATCH_PATH" "$FM_HOME" "$session" || exit 1
+  lock_identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
+  printf '%s\n' "$session" > "$watcher_owner_ready" || exit 1
+  while IFS= read -r _ <&8; do :; done
+  : > "$watcher_owner_failed" 2>/dev/null || true
+  fm_session_stop_owned_except "$session" "$monitor_pid" 30 || status=$?
+  if [ "$status" -eq 0 ] \
+    && fm_watcher_lock_owner_record_matches \
+      "$STATE" "$WATCH_PATH" "$FM_HOME" "$session" "$lock_identity"; then
+    rm -f "$WATCH_LOCK/process-session" 2>/dev/null || status=1
+    [ "$status" -ne 0 ] || fm_lock_remove_path "$WATCH_LOCK" || status=1
+  fi
+  exec 8<&-
+  rm -f "$watcher_owner_ready" "$watcher_owner_failed" "$watcher_owner_monitor_pid_file" \
+    "$watcher_owner_fifo" 2>/dev/null || true
+  rmdir "$watcher_owner_dir" 2>/dev/null || true
+  exit "$status"
+}
+
+if [ -n "$watcher_owner_fifo" ]; then
+  [ "${FM_WATCHER_OWN_SESSION:-0}" = 1 ] || watcher_owner_fifo=
+  case "$watcher_owner_dir" in "$STATE"/.watch-arm-owner.*) ;; *) watcher_owner_dir= ;; esac
+  watcher_owner_monitor_pid_file="$watcher_owner_dir/monitor-pid"
+  [ -n "$watcher_owner_fifo" ] && [ -n "$watcher_owner_dir" ] \
+    && [ -d "$watcher_owner_dir" ] && [ ! -L "$watcher_owner_dir" ] \
+    && [ "$watcher_owner_fifo" = "$watcher_owner_dir/control" ] \
+    && [ "$watcher_owner_ready" = "$watcher_owner_dir/ready" ] \
+    && [ "$watcher_owner_failed" = "$watcher_owner_dir/failed" ] \
+    && [ -p "$watcher_owner_fifo" ] || {
+      echo "watcher: invalid arm ownership channel" >&2
+      rm -f "$WATCH_LOCK/process-session" 2>/dev/null || true
+      fm_lock_release "$WATCH_LOCK"
+      exit 1
+  }
+  watcher_owner_link_monitor "$WATCHER_PID" &
+  watcher_owner_link_pid=$!
+  printf '%s\n' "$watcher_owner_link_pid" > "$watcher_owner_monitor_pid_file" || {
+    kill -TERM "$watcher_owner_link_pid" 2>/dev/null || true
+    wait "$watcher_owner_link_pid" 2>/dev/null || true
+    echo "watcher: could not establish its arm ownership monitor" >&2
+    rm -f "$WATCH_LOCK/process-session" 2>/dev/null || true
+    fm_lock_release "$WATCH_LOCK"
+    exit 1
+  }
+fi
+
 watcher_release_lock() {
   watcher_phase_clear
+  if [ -n "$watcher_owner_link_pid" ] && [ ! -e "$watcher_owner_failed" ]; then
+    kill -TERM "$watcher_owner_link_pid" 2>/dev/null || true
+    wait "$watcher_owner_link_pid" 2>/dev/null || true
+  fi
   if [ "${FM_WATCHER_OWN_SESSION:-0}" = 1 ]; then
     fm_watcher_session_guard_release "$WATCH_LOCK" "$WATCHER_PID" || return 0
   fi

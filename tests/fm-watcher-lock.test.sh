@@ -521,8 +521,10 @@ test_pid_tree_stop_refuses_mismatched_root_identity() {
   live=$!
   identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live") \
     || fail "could not identify tree-stop reuse fixture"
-  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_tree_stop "$2" 1 "$3"' \
-    _ "$LIB" "$live" "not-$identity" || fail "tree stop errored on a mismatched expected identity"
+  if FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_tree_stop "$2" 1 "$3"' \
+    _ "$LIB" "$live" "not-$identity"; then
+    fail "tree stop accepted a mismatched expected identity"
+  fi
   is_live_non_zombie "$live" || fail "tree stop signalled a live pid whose identity did not match the recorded root"
   kill "$live" 2>/dev/null || true
   wait "$live" 2>/dev/null || true
@@ -630,7 +632,6 @@ EOF
   printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
   printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
   printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
-  printf '%s\n' "$peer" > "$state/.watch.lock/process-session"
   touch -t 200001010000 "$state/.last-watcher-beat"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" &
   armpid=$!
@@ -658,7 +659,116 @@ EOF
   [ "$root_live" -eq 0 ] || fail "restart left the TERM-resistant recorded watcher root alive"
   [ "$child_live" -eq 0 ] || fail "restart left a TERM-resistant recorded watcher descendant alive"
   [ -n "$lock_pid" ] && [ "$lock_pid" != "$peer" ] || fail "restart did not install a fresh watcher lock"
-  pass "watch restart force-reaps a sleeping near-zero-CPU TERM-resistant recorded tree and starts a fresh cycle"
+  pass "watch restart migrates a pre-session watcher through identity-pinned tree cleanup"
+}
+
+test_watch_restart_recovers_dead_session_leader() {
+  local dir state fakebin out peer_file child_file peer child identity armpid i lock_pid members
+  dir=$(make_case restart-dead-session-leader)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/restart.out"
+  peer_file="$dir/peer.pid"
+  child_file="$dir/child.pid"
+  node -e '
+    const fs = require("fs");
+    const { spawn } = require("child_process");
+    const rootProgram = `
+      const fs = require("fs");
+      const { spawn } = require("child_process");
+      const child = spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\",()=>{});setTimeout(()=>{},300000)"], { stdio: "ignore" });
+      fs.writeFileSync(process.argv[1], String(child.pid));
+      setTimeout(() => {}, 300000);
+    `;
+    const root = spawn(process.execPath, ["-e", rootProgram, process.argv[2]], { detached: true, stdio: "ignore" });
+    fs.writeFileSync(process.argv[1], String(root.pid));
+    root.unref();
+  ' "$peer_file" "$child_file"
+  peer=$(cat "$peer_file")
+  i=0
+  while [ "$i" -lt 80 ] && [ ! -s "$child_file" ]; do sleep 0.1; i=$((i + 1)); done
+  [ -s "$child_file" ] || { kill -KILL "$peer" 2>/dev/null || true; fail "dead-leader fixture did not start"; }
+  child=$(cat "$child_file")
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || {
+    kill -KILL "$peer" "$child" 2>/dev/null || true
+    fail "could not identify dead-leader fixture"
+  }
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$peer" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  printf '%s\n' "$peer" > "$state/.watch.lock/process-session"
+  kill -KILL "$peer" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 50 ] && is_live_non_zombie "$peer"; do sleep 0.1; i=$((i + 1)); done
+  ! is_live_non_zombie "$peer" || { kill -KILL "$child" 2>/dev/null || true; fail "session leader did not die"; }
+  is_live_non_zombie "$child" || fail "dead-leader fixture lost its surviving session child"
+  [ "$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_session "$2"' _ "$LIB" "$child")" = "$peer" ] || {
+    kill -KILL "$child" 2>/dev/null || true
+    fail "surviving child left the recorded session"
+  }
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 150 ]; do
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$out" || {
+    kill -KILL "$armpid" "$child" 2>/dev/null || true
+    wait "$armpid" 2>/dev/null || true
+    fail "restart did not recover the dead session leader: $(cat "$out")"
+  }
+  ! is_live_non_zombie "$child" || { kill -KILL "$child" 2>/dev/null || true; fail "restart left the dead leader's session child alive"; }
+  members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' _ "$LIB" "$peer") \
+    || fail "could not verify the drained dead-leader session"
+  [ -z "$members" ] || fail "restart left recorded session members: $members"
+  lock_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  [ -n "$lock_pid" ] && [ "$lock_pid" != "$peer" ] || fail "restart did not replace the dead leader lock"
+  kill -TERM "$armpid" 2>/dev/null || true
+  wait "$armpid" 2>/dev/null || true
+  pass "watch restart drains a verified session after its leader dies"
+}
+
+test_arm_owner_death_reaps_watcher_session() {
+  local dir state fakebin out armpid watcher_pid session i members state_snapshot
+  dir=$(make_case arm-owner-death)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+    session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null \
+      && [ -n "$watcher_pid" ] && [ "$session" = "$watcher_pid" ] && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$out" || fail "arm did not establish its watcher before owner-death test: $(cat "$out")"
+  kill -KILL "$armpid" 2>/dev/null || fail "could not kill the tracked arm"
+  wait "$armpid" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 120 ]; do
+    members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' _ "$LIB" "$session" 2>/dev/null || true)
+    [ -z "$members" ] && [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -z "$members" ] || { for watcher_pid in $members; do kill -KILL "$watcher_pid" 2>/dev/null || true; done; fail "arm death left watcher session members: $members"; }
+  if [ -e "$state/.watch.lock" ] || [ -L "$state/.watch.lock" ]; then
+    state_snapshot=$(find "$state" -maxdepth 3 -print 2>/dev/null | sort)
+    fail "arm death left the watcher lock behind: $state_snapshot"
+  fi
+  pass "arm controller death closes ownership and reaps the watcher session"
 }
 
 test_watcher_self_evicts_on_lock_takeover() {
@@ -1470,6 +1580,18 @@ if [ "${FM_TEST_FOCUSED:-}" = restart-term-resistant ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = ownership-boundary ]; then
+  test_watch_restart_reaps_term_resistant_owned_tree
+  test_watch_restart_recovers_dead_session_leader
+  test_arm_owner_death_reaps_watcher_session
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = arm-owner-death ]; then
+  test_arm_owner_death_reaps_watcher_session
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = phase-bounds ]; then
   test_guard_accepts_identity_matched_active_phase
   test_arm_allows_bounded_watcher_phases_past_base_cadence
@@ -1501,6 +1623,8 @@ test_lock_paused_mid_acquire_claim_fails_during_steal
 test_pid_tree_stop_refuses_mismatched_root_identity
 test_watch_restart_rejects_reused_pid
 test_watch_restart_reaps_term_resistant_owned_tree
+test_watch_restart_recovers_dead_session_leader
+test_arm_owner_death_reaps_watcher_session
 test_watcher_self_evicts_on_lock_takeover
 test_arm_attaches_and_waits_for_live_fresh_watcher
 test_arm_refuses_live_lock_with_bad_attach_cadence

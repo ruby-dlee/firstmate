@@ -119,28 +119,46 @@ CPU_LIMIT=$FM_WATCH_CPU_LIMIT
 CPU_POLL=$FM_WATCH_CPU_POLL
 CPU_SAMPLES=$FM_WATCH_CPU_SAMPLES
 
-clear_stale_recorded_watcher_lock() {
-  local lock_home lock_path lock_identity lock_session session_status=0
+recorded_watcher_lock_metadata_matches() {
+  local lock_home lock_path lock_pid lock_identity
   lock_home=$(cat "$WATCH_LOCK/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$WATCH_LOCK/watcher-path" 2>/dev/null || true)
+  lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
   lock_identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
-  [ "$lock_home" = "$FM_HOME" ] || return 0
-  [ "$lock_path" = "$WATCH" ] || return 0
-  [ -n "$lock_identity" ] || return 0
+  [ "$lock_home" = "$FM_HOME" ] || return 1
+  [ "$lock_path" = "$WATCH" ] || return 1
+  case "$lock_pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$lock_identity" ]
+}
+
+clear_stale_recorded_watcher_lock() {
+  local lock_session session_status=0
+  recorded_watcher_lock_metadata_matches || return 1
   lock_session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
   if [ -n "$lock_session" ]; then
     fm_session_has_live_processes "$lock_session" || session_status=$?
     [ "$session_status" -eq 1 ] || return 1
   fi
-  fm_lock_remove_path "$WATCH_LOCK" || true
+  fm_lock_remove_path "$WATCH_LOCK" || return 1
+  [ ! -e "$WATCH_LOCK" ] && [ ! -L "$WATCH_LOCK" ]
 }
 
 stop_recorded_watcher() {  # <root-pid> <root-identity>
-  local root=$1 identity=$2 session
+  local root=$1 identity=$2 session session_status=0 current_identity
   session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
-  [ "$session" = "$root" ] || return 1
-  [ "$(fm_pid_session "$root" 2>/dev/null || true)" = "$session" ] || return 1
-  fm_pid_session_stop "$root" "$session" 30 "$identity"
+  if [ -n "$session" ]; then
+    fm_watcher_lock_session_record_matches "$STATE" "$WATCH" "$FM_HOME" "$session" || return 1
+    fm_session_has_live_processes "$session" || session_status=$?
+    case "$session_status" in
+      0) fm_session_stop_owned "$session" 30 ;;
+      1) return 0 ;;
+      *) return 1 ;;
+    esac
+    return
+  fi
+  current_identity=$(fm_pid_identity "$root") || return 1
+  [ "$current_identity" = "$identity" ] || return 1
+  fm_pid_tree_stop "$root" 30 "$identity"
 }
 
 # A watcher is "healthy" iff the lock names a live process that is genuinely THIS
@@ -300,19 +318,23 @@ if [ "$mode" = restart ]; then
   # after a bound, which is the supported alternative to manual pid surgery.
   lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
   lock_identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
-  if fm_pid_alive "$lock_pid"; then
-    if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$lock_pid" "$FM_HOME"; then
+  if [ -e "$WATCH_LOCK" ] || [ -L "$WATCH_LOCK" ]; then
+    recorded_watcher_lock_metadata_matches || {
+      echo "watcher: FAILED - recorded watcher lock ownership metadata is invalid" >&2
+      exit 1
+    }
+    lock_session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
+    current_identity=$(fm_pid_identity "$lock_pid" 2>/dev/null || true)
+    if [ -n "$lock_session" ] || [ "$current_identity" = "$lock_identity" ]; then
       if ! stop_recorded_watcher "$lock_pid" "$lock_identity"; then
-        echo "watcher: FAILED - recorded watcher tree pid=$lock_pid could not be stopped for restart" >&2
+        echo "watcher: FAILED - recorded watcher ownership boundary could not be stopped for restart" >&2
         exit 1
       fi
-      clear_stale_recorded_watcher_lock || {
-        echo "watcher: FAILED - recorded watcher ownership boundary remains live after restart cleanup" >&2
-        exit 1
-      }
-    else
-      clear_stale_recorded_watcher_lock
     fi
+    clear_stale_recorded_watcher_lock || {
+      echo "watcher: FAILED - recorded watcher ownership boundary remains live after restart cleanup" >&2
+      exit 1
+    }
   fi
 fi
 
@@ -347,9 +369,34 @@ fi
 child=
 child_out=
 child_session_verified=false
+owner_link_dir=
+owner_link_fifo=
+owner_link_ready=
+owner_link_failed=
+owner_link_connected=false
+
+owner_link_disconnect() {
+  if "$owner_link_connected"; then
+    exec 9>&-
+    owner_link_connected=false
+  fi
+}
+
+owner_link_remove() {
+  [ -n "$owner_link_dir" ] || return 0
+  rm -f "$owner_link_ready" "$owner_link_failed" "$owner_link_dir/monitor-pid" \
+    "$owner_link_fifo" 2>/dev/null || true
+  rmdir "$owner_link_dir" 2>/dev/null || true
+  owner_link_dir=
+  owner_link_fifo=
+  owner_link_ready=
+  owner_link_failed=
+}
+
 stop_owned_child() {
   local identity status=0 session_status=0 current_session iteration=0
   [ -n "$child" ] || return 0
+  owner_link_disconnect
   while [ "$iteration" -lt 20 ] && fm_pid_alive "$child"; do
     current_session=$(fm_pid_session "$child" 2>/dev/null || true)
     if [ "$current_session" = "$child" ]; then
@@ -378,11 +425,14 @@ stop_owned_child() {
     [ "$session_status" -eq 1 ] || status=1
   fi
   clear_stale_recorded_watcher_lock >/dev/null 2>&1 || true
+  owner_link_remove
   return "$status"
 }
 
 cleanup_child() {
   stop_owned_child >/dev/null 2>&1 || true
+  owner_link_disconnect
+  owner_link_remove
   if [ -n "$child_out" ]; then
     rm -f "$child_out" 2>/dev/null || true
   fi
@@ -432,6 +482,7 @@ monitor_started_child() {  # <confirmed-watcher-pid>
   done
   wait "$watched"
   rc=$?
+  owner_link_disconnect
   if "$child_session_verified"; then
     fm_session_has_live_processes "$watched" || session_status=$?
   fi
@@ -447,6 +498,7 @@ monitor_started_child() {  # <confirmed-watcher-pid>
     rc=1
   fi
   clear_stale_recorded_watcher_lock >/dev/null 2>&1 || true
+  owner_link_remove
   print_watch_output "$child_out"
   rm -f "$child_out" 2>/dev/null || true
   child=
@@ -460,12 +512,39 @@ child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   echo "watcher: FAILED - no live watcher with a fresh beacon"
   exit 1
 }
-FM_WATCHER_OWN_SESSION=1 perl -MPOSIX -e '
-  my $session = POSIX::setsid();
-  exit 126 if !defined $session || $session != $$;
-  exec @ARGV;
-  exit 127;
-' "$WATCH" >"$child_out" 2>&1 &
+owner_link_dir=$(mktemp -d "$STATE/.watch-arm-owner.XXXXXX") || {
+  rm -f "$child_out"
+  echo "watcher: FAILED - could not create arm ownership channel"
+  exit 1
+}
+owner_link_fifo="$owner_link_dir/control"
+owner_link_ready="$owner_link_dir/ready"
+owner_link_failed="$owner_link_dir/failed"
+mkfifo "$owner_link_fifo" || {
+  cleanup_child
+  echo "watcher: FAILED - could not create arm ownership channel"
+  exit 1
+}
+exec 9<> "$owner_link_fifo" || {
+  cleanup_child
+  echo "watcher: FAILED - could not open arm ownership channel"
+  exit 1
+}
+owner_link_connected=true
+(
+  exec 9>&-
+  FM_WATCHER_OWN_SESSION=1 \
+    FM_WATCH_ARM_OWNER_DIR="$owner_link_dir" \
+    FM_WATCH_ARM_OWNER_FIFO="$owner_link_fifo" \
+    FM_WATCH_ARM_OWNER_READY="$owner_link_ready" \
+    FM_WATCH_ARM_OWNER_FAILED="$owner_link_failed" \
+    exec perl -MPOSIX -e '
+      my $session = POSIX::setsid();
+      exit 126 if !defined $session || $session != $$;
+      exec @ARGV;
+      exit 127;
+    ' "$WATCH"
+) >"$child_out" 2>&1 &
 child=$!
 child_done=0
 
@@ -476,10 +555,15 @@ deadline=$(( $(date +%s) + CONFIRM_TIMEOUT ))
 while :; do
   if healthy_watcher; then
     if [ "$HEALTHY_PID" = "$child" ]; then
-      if ! fm_watcher_lock_session_matches_pid "$STATE" "$child"; then
+      if ! fm_watcher_lock_session_matches_pid "$STATE" "$WATCH" "$FM_HOME" "$child"; then
         echo "watcher: FAILED - started watcher did not establish its owned process session"
         cleanup_child
         exit 1
+      fi
+      if [ "$(cat "$owner_link_ready" 2>/dev/null || true)" != "$child" ]; then
+        [ "$(date +%s)" -ge "$deadline" ] && break
+        sleep 0.05
+        continue
       fi
       child_session_verified=true
       echo "watcher: started pid=$child (beacon fresh)"
@@ -491,6 +575,8 @@ while :; do
     if [ "$mode" = arm ]; then
       report_attached
       wait "$child" 2>/dev/null || true
+      owner_link_disconnect
+      owner_link_remove
       rm -f "$child_out" 2>/dev/null || true
       child=
       child_out=
@@ -499,6 +585,8 @@ while :; do
     fi
     report_healthy
     wait "$child" 2>/dev/null || true
+    owner_link_disconnect
+    owner_link_remove
     rm -f "$child_out" 2>/dev/null || true
     exit 0
   fi
@@ -507,6 +595,8 @@ while :; do
     rc=$?
     child_done=1
     if [ "$rc" -eq 0 ] && watch_output_has_wake "$child_out"; then
+      owner_link_disconnect
+      owner_link_remove
       print_watch_output "$child_out"
       rm -f "$child_out" 2>/dev/null || true
       exit 0

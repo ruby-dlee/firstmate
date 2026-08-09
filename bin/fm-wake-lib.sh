@@ -61,30 +61,47 @@ print(session)
 ' "$pid"
 }
 
-fm_session_snapshot() {  # <session-id>
-  local session=$1
+fm_session_snapshot() {  # <session-id> [excluded-root-pid]
+  local session=$1 excluded=${2:-}
   case "$session" in ''|*[!0-9]*) return 1 ;; esac
+  case "$excluded" in *[!0-9]*) return 1 ;; esac
   python3 -c '
 import ctypes
 import subprocess
 import sys
 
 session = int(sys.argv[1])
+excluded = int(sys.argv[2]) if sys.argv[2] else None
 libc = ctypes.CDLL(None, use_errno=True)
 result = subprocess.run(
-    ["ps", "-axo", "pid=,state="],
+    ["ps", "-axo", "pid=,ppid=,state="],
     check=True,
     stdout=subprocess.PIPE,
     universal_newlines=True,
 )
+processes = {}
 for line in result.stdout.splitlines():
     fields = line.split()
-    if len(fields) != 2 or not fields[0].isdigit() or "Z" in fields[1]:
+    if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
         continue
-    pid = int(fields[0])
-    if libc.getsid(pid) == session:
+    processes[int(fields[0])] = (int(fields[1]), fields[2])
+
+def in_excluded_tree(pid):
+    seen = set()
+    while excluded is not None and pid not in seen:
+        if pid == excluded:
+            return True
+        seen.add(pid)
+        process = processes.get(pid)
+        if process is None:
+            break
+        pid = process[0]
+    return False
+
+for pid, (_, state) in processes.items():
+    if "Z" not in state and not in_excluded_tree(pid) and libc.getsid(pid) == session:
         print(pid)
-' "$session"
+' "$session" "$excluded"
 }
 
 fm_session_has_live_processes() {  # <session-id>
@@ -93,10 +110,20 @@ fm_session_has_live_processes() {  # <session-id>
   [ -n "$members" ]
 }
 
-fm_session_signal_members() {  # <signal> <session-id>
-  local signal=$1 session=$2 pid identity index snapshot
+fm_session_has_live_processes_except() {  # <session-id> <excluded-pid>
+  local session=$1 excluded=$2 pid snapshot
+  snapshot=$(fm_session_snapshot "$session" "$excluded") || return 2
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    [ "$pid" = "$excluded" ] || return 0
+  done <<< "$snapshot"
+  return 1
+}
+
+fm_session_signal_members() {  # <signal> <session-id> [excluded-pid]
+  local signal=$1 session=$2 excluded=${3:-} pid identity index snapshot
   local pids=() identities=()
-  snapshot=$(fm_session_snapshot "$session") || return 1
+  snapshot=$(fm_session_snapshot "$session" "$excluded") || return 1
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     identity=$(fm_pid_identity "$pid") || continue
@@ -105,33 +132,38 @@ fm_session_signal_members() {  # <signal> <session-id>
   done <<< "$snapshot"
   for index in "${!pids[@]}"; do
     pid=${pids[$index]}
+    [ "$pid" != "$excluded" ] || continue
     [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "${identities[$index]}" ] || continue
     [ "$(fm_pid_session "$pid" 2>/dev/null || true)" = "$session" ] || continue
     kill "-$signal" "$pid" 2>/dev/null || true
   done
 }
 
-fm_session_stop_owned() {  # <session-id> [term-wait-tenths]
-  local session=$1 wait_tenths=${2:-30} iteration status
-  fm_session_signal_members TERM "$session" || return 1
+fm_session_stop_owned_except() {  # <session-id> <excluded-pid> [term-wait-tenths]
+  local session=$1 excluded=$2 wait_tenths=${3:-30} iteration status
+  fm_session_signal_members TERM "$session" "$excluded" || return 1
   iteration=0
   while [ "$iteration" -lt "$wait_tenths" ]; do
     status=0
-    fm_session_has_live_processes "$session" || status=$?
+    fm_session_has_live_processes_except "$session" "$excluded" || status=$?
     [ "$status" -eq 0 ] || { [ "$status" -eq 1 ] && return 0; return 1; }
     sleep 0.1
     iteration=$((iteration + 1))
   done
   iteration=0
   while [ "$iteration" -lt 20 ]; do
-    fm_session_signal_members KILL "$session" || return 1
+    fm_session_signal_members KILL "$session" "$excluded" || return 1
     sleep 0.1
     status=0
-    fm_session_has_live_processes "$session" || status=$?
+    fm_session_has_live_processes_except "$session" "$excluded" || status=$?
     [ "$status" -eq 0 ] || { [ "$status" -eq 1 ] && return 0; return 1; }
     iteration=$((iteration + 1))
   done
   return 1
+}
+
+fm_session_stop_owned() {  # <session-id> [term-wait-tenths]
+  fm_session_stop_owned_except "$1" "" "${2:-30}"
 }
 
 fm_pid_session_stop() {  # <root-pid> <session-id> [term-wait-tenths] [expected-root-identity]
@@ -143,10 +175,30 @@ fm_pid_session_stop() {  # <root-pid> <session-id> [term-wait-tenths] [expected-
   fm_session_stop_owned "$session" "$wait_tenths"
 }
 
-fm_watcher_lock_session_matches_pid() {  # <state> <watcher-pid>
-  local state=$1 pid=$2 session
+fm_watcher_lock_owner_record_matches() {  # <state> <watch-path> <home> <pid> <pid-identity>
+  local state=$1 watch_path=$2 home=$3 expected_pid=$4 expected_identity=$5 lockdir
+  lockdir="$state/.watch.lock"
+  [ -n "$expected_identity" ] || return 1
+  [ "$(cat "$lockdir/pid" 2>/dev/null || true)" = "$expected_pid" ] || return 1
+  [ "$(cat "$lockdir/pid-identity" 2>/dev/null || true)" = "$expected_identity" ] || return 1
+  [ "$(cat "$lockdir/fm-home" 2>/dev/null || true)" = "$home" ] || return 1
+  [ "$(cat "$lockdir/watcher-path" 2>/dev/null || true)" = "$watch_path" ]
+}
+
+fm_watcher_lock_session_record_matches() {  # <state> <watch-path> <home> <session-id>
+  local state=$1 watch_path=$2 home=$3 session=$4 lockdir identity
+  lockdir="$state/.watch.lock"
+  identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
+  fm_watcher_lock_owner_record_matches "$state" "$watch_path" "$home" "$session" "$identity" \
+    || return 1
+  [ "$(cat "$lockdir/process-session" 2>/dev/null || true)" = "$session" ]
+}
+
+fm_watcher_lock_session_matches_pid() {  # <state> <watch-path> <home> <watcher-pid>
+  local state=$1 watch_path=$2 home=$3 pid=$4 session
   session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
   [ "$session" = "$pid" ] || return 1
+  fm_watcher_lock_session_record_matches "$state" "$watch_path" "$home" "$session" || return 1
   [ "$(fm_pid_session "$pid" 2>/dev/null || true)" = "$session" ]
 }
 
@@ -335,7 +387,10 @@ fm_pid_tree_stop() {  # <root-pid> [term-wait-tenths] [expected-root-identity]
     tree_pids+=("$pid")
     tree_identities+=("$identity")
   done < <(fm_pid_tree_snapshot "$root")
-  [ "${#tree_pids[@]}" -gt 0 ] || return 0
+  if [ "${#tree_pids[@]}" -eq 0 ]; then
+    [ -z "$expected_identity" ] && return 0
+    return 1
+  fi
   if [ -n "$expected_identity" ]; then
     root_verified=0
     for index in "${!tree_pids[@]}"; do
@@ -345,7 +400,7 @@ fm_pid_tree_stop() {  # <root-pid> [term-wait-tenths] [expected-root-identity]
     done
     # The recorded process exited or its pid was reused between lock validation
     # and snapshot. There is no longer an identity-pinned owned tree to signal.
-    [ "$root_verified" -eq 1 ] || return 0
+    [ "$root_verified" -eq 1 ] || return 1
   fi
   # Ask the root to stop first so it cannot launch new work as descendants are
   # drained. Bash may defer TERM while waiting on a child, which is why the

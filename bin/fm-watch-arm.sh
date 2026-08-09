@@ -143,7 +143,7 @@ clear_stale_recorded_watcher_lock() {
 }
 
 stop_recorded_watcher() {  # <root-pid> <root-identity>
-  local root=$1 identity=$2 session current_identity anchor anchor_identity
+  local root=$1 identity=$2 session current_identity anchor anchor_identity status
   session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
   if [ -n "$session" ]; then
     fm_watcher_lock_session_record_matches "$STATE" "$WATCH" "$FM_HOME" "$session" || return 1
@@ -151,8 +151,12 @@ stop_recorded_watcher() {  # <root-pid> <root-identity>
     anchor=$FM_WATCHER_SESSION_ANCHOR_PID
     anchor_identity=$FM_WATCHER_SESSION_ANCHOR_IDENTITY
     if fm_session_anchor_matches "$session" "$anchor" "$anchor_identity"; then
-      fm_session_stop_owned_with_anchor "$session" "$anchor" "$anchor_identity" 30
-      return
+      fm_watcher_lock_session_stop_claim "$STATE" "$session" || return 1
+      status=0
+      fm_session_stop_owned_with_anchor "$session" "$anchor" "$anchor_identity" 30 || status=$?
+      [ "$status" -ne 0 ] || return 0
+      fm_watcher_lock_session_stop_claim_clear "$STATE" "$session" >/dev/null 2>&1 || true
+      return "$status"
     fi
     current_identity=$(fm_pid_identity "$root" 2>/dev/null || true)
     [ "$current_identity" = "$identity" ] || return 1
@@ -400,7 +404,12 @@ owner_link_reader_disconnect() {
 owner_link_remove() {
   [ -n "$owner_link_dir" ] || return 0
   rm -f "$owner_link_ready" "$owner_link_failed" "$owner_link_fifo" \
-    "$owner_link_dir/session-root" "$owner_link_dir/session-root.pending" 2>/dev/null || true
+    "$owner_link_dir/session-root" "$owner_link_dir/session-root.pending" \
+    "$owner_link_dir/handoff-request" "$owner_link_dir/handoff-request.pending" \
+    "$owner_link_dir/handoff-taken" "$owner_link_dir/handoff-taken.pending" \
+    "$owner_link_dir/prestart-owner-pid" "$owner_link_dir/prestart-owner-pid.pending" \
+    "$owner_link_dir/prestart-owner-identity" \
+    "$owner_link_dir/prestart-owner-identity.pending" 2>/dev/null || true
   rmdir "$owner_link_dir" 2>/dev/null || true
   owner_link_dir=
   owner_link_fifo=
@@ -574,7 +583,7 @@ owner_link_reader_connected=true
     FM_WATCH_ARM_OWNER_FAILED="$owner_link_failed" \
     FM_WATCH_ARM_SESSION_RECORD="$child_session_record" \
     FM_WATCH_ARM_OWNER_FD=8 \
-    exec perl -MPOSIX -e '
+    exec perl -MFcntl=:DEFAULT -MPOSIX -e '
       my $cleanup = shift @ARGV;
       my $session = POSIX::setsid();
       exit 126 if !defined $session || $session != $$;
@@ -586,15 +595,102 @@ owner_link_reader_connected=true
         $SIG{INT} = "IGNORE";
         $SIG{TERM} = "IGNORE";
         open my $owner, "<&=8" or exit 125;
+        my $owner_dir = $ENV{FM_WATCH_ARM_OWNER_DIR};
+        my $request = "$owner_dir/handoff-request";
+        my $taken = "$owner_dir/handoff-taken";
+        my $owner_pid = "$owner_dir/prestart-owner-pid";
+        my $owner_identity = "$owner_dir/prestart-owner-identity";
+        my $identity_for = sub {
+          my ($pid) = @_;
+          local $ENV{LC_ALL} = "C";
+          open my $ps, "-|", "ps", "-p", $pid, "-o", "lstart=", "-o", "command="
+            or return;
+          local $/;
+          my $identity = <$ps>;
+          close $ps or return;
+          return if !defined $identity || $identity eq "";
+          $identity =~ s/^[[:space:]]+//mg;
+          $identity =~ s/\n\z//;
+          return $identity;
+        };
+        my $group_for = sub {
+          my ($pid) = @_;
+          local $ENV{LC_ALL} = "C";
+          open my $ps, "-|", "ps", "-p", $pid, "-o", "pgid=" or return;
+          local $/;
+          my $process_group = <$ps>;
+          close $ps or return;
+          return if !defined $process_group;
+          $process_group =~ s/^[[:space:]]+//;
+          $process_group =~ s/[[:space:]]+\z//;
+          return if $process_group !~ /\A[0-9]+\z/;
+          return $process_group;
+        };
+        my $read_regular = sub {
+          my ($path) = @_;
+          my @metadata = lstat $path;
+          return if !@metadata || -l _ || !-f _;
+          open my $file, "<", $path or return;
+          local $/;
+          my $contents = <$file>;
+          close $file or return;
+          return $contents;
+        };
+        my $owner_lost = sub {
+          return 1 if getppid() != $root;
+          my $readable = "";
+          vec($readable, fileno($owner), 1) = 1;
+          my $ready = select($readable, undef, undef, 0);
+          return 0 if !defined $ready || $ready == 0;
+          my $count = sysread($owner, my $byte, 1);
+          return !defined $count || $count == 0;
+        };
+        my $handoff = 0;
         while (getppid() == $root) {
           my $readable = "";
           vec($readable, fileno($owner), 1) = 1;
-          my $ready = select($readable, undef, undef, 1);
+          my $ready = select($readable, undef, undef, 0.1);
           next if !defined $ready || $ready == 0;
           my $count = sysread($owner, my $byte, 1);
           last if !defined $count || $count == 0;
+        } continue {
+          my $record = $read_regular->($request);
+          next if !defined $record;
+          next if $record !~ /\Apid=([0-9]+)\nidentity=(.+)\n\z/s;
+          my ($monitor, $monitor_identity) = ($1, $2);
+          next if $monitor == $root;
+          my $monitor_group = $group_for->($monitor);
+          next if !defined $monitor_group || $monitor_group != $session;
+          my $current_monitor_identity = $identity_for->($monitor);
+          next if !defined $current_monitor_identity
+            || $current_monitor_identity ne $monitor_identity;
+          next if $owner_lost->();
+          my $prestart_identity = $identity_for->($$);
+          next if !defined $prestart_identity;
+          my $pid_pending = "$owner_pid.pending";
+          my $identity_pending = "$owner_identity.pending";
+          my $taken_pending = "$taken.pending";
+          sysopen my $pid_file, $pid_pending, O_WRONLY | O_CREAT | O_EXCL, 0600
+            or next;
+          print {$pid_file} "$$\n";
+          close $pid_file or next;
+          sysopen my $identity_file, $identity_pending, O_WRONLY | O_CREAT | O_EXCL, 0600
+            or next;
+          print {$identity_file} "$prestart_identity\n";
+          close $identity_file or next;
+          sysopen my $taken_file, $taken_pending, O_WRONLY | O_CREAT | O_EXCL, 0600
+            or next;
+          print {$taken_file} $record;
+          close $taken_file or next;
+          next if $owner_lost->();
+          rename $pid_pending, $owner_pid or next;
+          rename $identity_pending, $owner_identity or next;
+          rename $taken_pending, $taken or next;
+          $handoff = 1;
+          last;
         }
         close $owner;
+        exit 0 if $handoff;
         exec $cleanup, $root, $session, $ENV{FM_WATCH_ARM_OWNER_DIR};
         exit 125;
       }

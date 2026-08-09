@@ -894,6 +894,133 @@ test_arm_owner_death_during_prestart_wedge_reaps_session() {
   pass "post-setsid owner observer reaps a prestart-wedged watcher"
 }
 
+test_arm_normal_exit_after_owner_handoff() {
+  local dir state fakebin out trigger check_file armpid watcher_pid session owner_dir prestart_pid prestart_identity status i members member
+  dir=$(make_case arm-normal-owner-handoff)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  trigger="$dir/wake.trigger"
+  check_file="$state/task.check.sh"
+  cat > "$check_file" <<'SH'
+#!/usr/bin/env bash
+[ -e "${FM_TEST_WAKE_TRIGGER:?}" ] || exit 0
+printf 'merged: https://example.test/pr/17\n'
+SH
+  chmod +x "$check_file"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_TEST_WAKE_TRIGGER="$trigger" FM_POLL=1 \
+    FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 120 ]; do
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$out" \
+    || fail "arm did not complete owner handoff before normal-exit test: $(cat "$out")"
+  watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
+  owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch-arm-owner.*' -print | head -1)
+  prestart_pid=$(cat "$owner_dir/prestart-owner-pid" 2>/dev/null || true)
+  prestart_identity=$(cat "$owner_dir/prestart-owner-identity" 2>/dev/null || true)
+  case "$prestart_pid" in ''|*[!0-9]*) fail "owner handoff did not record the prestart observer" ;; esac
+  [ -n "$prestart_identity" ] || fail "owner handoff omitted the prestart observer identity"
+  ! FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity_live "$2" "$3"' \
+    _ "$LIB" "$prestart_pid" "$prestart_identity" \
+    || fail "prestart observer remained live after normal monitor readiness"
+  touch "$trigger"
+  wait_for_exit "$armpid" 150
+  status=$?
+  [ "$status" -eq 0 ] || fail "normal watcher wake failed after owner handoff: $(cat "$out")"
+  grep -qF 'check:' "$out" || fail "normal watcher wake was not propagated after handoff"
+  ! grep -qF 'exited before its owned process session was verified empty' "$out" \
+    || fail "normal watcher exit falsely reported a live handed-off observer: $(cat "$out")"
+  i=0
+  members=$watcher_pid
+  while [ "$i" -lt 100 ]; do
+    members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' _ "$LIB" "$session" 2>/dev/null || true)
+    [ -z "$members" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -z "$members" ] || {
+    for member in $members; do kill -KILL "$member" 2>/dev/null || true; done
+    fail "normal watcher exit left handed-off session members: $members"
+  }
+  [ ! -e "$state/.watch.lock" ] && [ ! -L "$state/.watch.lock" ] \
+    || fail "normal watcher exit left its session guard after handoff"
+  pass "normal watcher exit follows a single-owner monitor handoff"
+}
+
+test_restart_during_owner_handoff_uses_normal_anchor() {
+  local dir state fakebin first_out restart_out ready proceed first_arm restart_arm old_session old_owner_dir prestart_pid prestart_identity new_pid i members member
+  dir=$(make_case restart-owner-handoff)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  first_out="$dir/first-arm.out"
+  restart_out="$dir/restart-arm.out"
+  ready="$dir/handoff.ready"
+  proceed="$dir/handoff.proceed"
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
+    FM_WATCH_OWNER_TEST_HANDOFF_READY="$ready" FM_WATCH_OWNER_TEST_HANDOFF_PROCEED="$proceed" \
+    "$WATCH_ARM" > "$first_out" &
+  first_arm=$!
+  i=0
+  while [ "$i" -lt 120 ] && [ ! -e "$ready" ]; do
+    is_live_non_zombie "$first_arm" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$ready" ] || fail "normal monitor did not reach its post-handoff restart barrier: $(cat "$first_out")"
+  old_session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
+  old_owner_dir=$(find "$state" -maxdepth 1 -type d -name '.watch-arm-owner.*' -print | head -1)
+  prestart_pid=$(cat "$old_owner_dir/prestart-owner-pid" 2>/dev/null || true)
+  prestart_identity=$(cat "$old_owner_dir/prestart-owner-identity" 2>/dev/null || true)
+  case "$prestart_pid" in ''|*[!0-9]*) fail "restart handoff did not record its prestart observer" ;; esac
+  ! FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity_live "$2" "$3"' \
+    _ "$LIB" "$prestart_pid" "$prestart_identity" \
+    || fail "restart reached the normal anchor while the prestart observer still owned cleanup"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 "$WATCH_ARM" --restart > "$restart_out" 2>&1 &
+  restart_arm=$!
+  i=0
+  while [ "$i" -lt 180 ]; do
+    grep -qF 'watcher: started pid=' "$restart_out" 2>/dev/null && break
+    is_live_non_zombie "$restart_arm" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$restart_out" \
+    || fail "restart did not cross the completed owner handoff: $(cat "$restart_out")"
+  ! grep -qF 'ownership boundary could not be stopped' "$restart_out" \
+    || fail "restart raced the relinquished prestart observer: $(cat "$restart_out")"
+  new_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+  [ -n "$new_pid" ] && [ "$new_pid" != "$old_session" ] \
+    || fail "restart did not replace the handed-off watcher session"
+  i=0
+  members=$old_session
+  while [ "$i" -lt 100 ]; do
+    members=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' _ "$LIB" "$old_session" 2>/dev/null || true)
+    [ -z "$members" ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -z "$members" ] || {
+    for member in $members; do kill -KILL "$member" 2>/dev/null || true; done
+    fail "restart handoff left old session members: $members"
+  }
+  kill -TERM "$restart_arm" "$first_arm" 2>/dev/null || true
+  wait "$restart_arm" 2>/dev/null || true
+  wait "$first_arm" 2>/dev/null || true
+  pass "restart uses the normal anchor only after prestart ownership ends"
+}
+
 test_session_cleanup_requires_stable_quiescence() {
   local dir state root_file anchor_file late_file armed ready proceed fork_now result_file root anchor late cleanup i identity
   dir=$(make_case session-stable-quiescence)
@@ -2157,6 +2284,12 @@ if [ "${FM_TEST_FOCUSED:-}" = prestart-config ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = owner-handoff ]; then
+  test_arm_normal_exit_after_owner_handoff
+  test_restart_during_owner_handoff_uses_normal_anchor
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = arm-owner-death ]; then
   test_arm_owner_death_reaps_watcher_session
   exit 0
@@ -2198,6 +2331,8 @@ test_watch_restart_recovers_dead_session_leader
 test_arm_owner_death_reaps_watcher_session
 test_arm_owner_death_before_monitor_start_reaps_session
 test_arm_owner_death_during_prestart_wedge_reaps_session
+test_arm_normal_exit_after_owner_handoff
+test_restart_during_owner_handoff_uses_normal_anchor
 test_session_cleanup_requires_stable_quiescence
 test_watch_restart_refuses_reused_session_without_anchor
 test_normal_session_watcher_releases_guard

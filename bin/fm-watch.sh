@@ -1288,8 +1288,13 @@ if [ -n "$watcher_owner_fifo" ]; then
 fi
 
 watcher_release_lock() {
-  local anchor_stopped=false
+  local anchor_stopped=false external_stop=false
   watcher_phase_clear
+  if [ "${FM_WATCHER_OWN_SESSION:-0}" = 1 ] \
+    && fm_watcher_lock_session_stop_claim_matches "$STATE" "$WATCHER_PID"; then
+    external_stop=true
+  fi
+  "$external_stop" && return 0
   if [ -n "$watcher_owner_link_pid" ] && [ ! -e "$watcher_owner_failed" ]; then
     if fm_watcher_lock_stop_session_anchor \
       "$STATE" "$WATCHER_PID" "$watcher_owner_link_pid" 30; then

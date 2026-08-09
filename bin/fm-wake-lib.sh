@@ -346,6 +346,56 @@ fm_watcher_lock_session_anchor_matches() {  # <state> <session-id>
     "$session" "$FM_WATCHER_SESSION_ANCHOR_PID" "$FM_WATCHER_SESSION_ANCHOR_IDENTITY"
 }
 
+fm_watcher_lock_session_stop_claim_matches() {  # <state> <session-id>
+  local state=$1 session=$2 lockdir snapshot lines anchor anchor_identity stopper stopper_identity
+  lockdir="$state/.watch.lock"
+  [ -f "$lockdir/session-stop" ] && [ ! -L "$lockdir/session-stop" ] || return 1
+  snapshot=$(cat "$lockdir/session-stop" 2>/dev/null) || return 1
+  lines=$(printf '%s\n' "$snapshot" | awk 'END { print NR }')
+  [ "$lines" -eq 4 ] || return 1
+  anchor=$(printf '%s\n' "$snapshot" | sed -n '1s/^anchor-pid=//p')
+  anchor_identity=$(printf '%s\n' "$snapshot" | sed -n '2s/^anchor-identity=//p')
+  stopper=$(printf '%s\n' "$snapshot" | sed -n '3s/^stopper-pid=//p')
+  stopper_identity=$(printf '%s\n' "$snapshot" | sed -n '4s/^stopper-identity=//p')
+  case "$anchor" in ''|*[!0-9]*) return 1 ;; esac
+  case "$stopper" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$anchor_identity" ] && [ -n "$stopper_identity" ] || return 1
+  fm_watcher_lock_session_anchor_matches "$state" "$session" || return 1
+  [ "$FM_WATCHER_SESSION_ANCHOR_PID" = "$anchor" ] \
+    && [ "$FM_WATCHER_SESSION_ANCHOR_IDENTITY" = "$anchor_identity" ] \
+    && fm_pid_identity_live "$stopper" "$stopper_identity"
+}
+
+fm_watcher_lock_session_stop_claim() {  # <state> <session-id>
+  local state=$1 session=$2 lockdir stopper stopper_identity
+  lockdir="$state/.watch.lock"
+  stopper=${BASHPID:-$$}
+  stopper_identity=$(fm_pid_identity "$stopper") || return 1
+  fm_watcher_lock_session_anchor_matches "$state" "$session" || return 1
+  [ ! -e "$lockdir/session-stop" ] && [ ! -L "$lockdir/session-stop" ] \
+    && [ ! -e "$lockdir/session-stop.pending" ] \
+    && [ ! -L "$lockdir/session-stop.pending" ] || return 1
+  ( set -C; : > "$lockdir/session-stop.pending" ) 2>/dev/null || return 1
+  if ! printf 'anchor-pid=%s\nanchor-identity=%s\nstopper-pid=%s\nstopper-identity=%s\n' \
+    "$FM_WATCHER_SESSION_ANCHOR_PID" "$FM_WATCHER_SESSION_ANCHOR_IDENTITY" \
+    "$stopper" "$stopper_identity" > "$lockdir/session-stop.pending"; then
+    rm -f "$lockdir/session-stop.pending"
+    return 1
+  fi
+  mv -f "$lockdir/session-stop.pending" "$lockdir/session-stop" || {
+    rm -f "$lockdir/session-stop.pending"
+    return 1
+  }
+  fm_watcher_lock_session_stop_claim_matches "$state" "$session"
+}
+
+fm_watcher_lock_session_stop_claim_clear() {  # <state> <session-id>
+  local state=$1 session=$2 lockdir
+  lockdir="$state/.watch.lock"
+  fm_watcher_lock_session_stop_claim_matches "$state" "$session" || return 1
+  rm -f "$lockdir/session-stop" "$lockdir/session-stop.pending"
+}
+
 fm_watcher_lock_stop_session_anchor() {  # <state> <session-id> <expected-anchor-pid> [term-wait-tenths]
   local state=$1 session=$2 expected_anchor=$3 wait_tenths=${4:-30}
   fm_watcher_lock_session_anchor_matches "$state" "$session" || return 1
@@ -626,6 +676,8 @@ fm_lock_clean_known_files() {
     "$confined/session-anchor.pending" \
     "$confined/session-anchor-pid" \
     "$confined/session-anchor-identity" \
+    "$confined/session-stop" \
+    "$confined/session-stop.pending" \
     "$confined/watcher-path" \
     2>/dev/null || true
 }

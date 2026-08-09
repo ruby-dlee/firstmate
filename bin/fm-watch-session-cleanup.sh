@@ -32,7 +32,11 @@ if [ "$status" -eq 0 ]; then
   exec 8<&-
   rm -f "$owner_dir/ready" "$owner_dir/failed" "$owner_dir/control" \
     "$owner_dir/eof" "$owner_dir/lost" "$owner_dir/session-root" \
-    "$owner_dir/session-root.pending" 2>/dev/null || true
+    "$owner_dir/session-root.pending" "$owner_dir/handoff-request" \
+    "$owner_dir/handoff-request.pending" "$owner_dir/handoff-taken" \
+    "$owner_dir/handoff-taken.pending" "$owner_dir/prestart-owner-pid" \
+    "$owner_dir/prestart-owner-pid.pending" "$owner_dir/prestart-owner-identity" \
+    "$owner_dir/prestart-owner-identity.pending" 2>/dev/null || true
   rmdir "$owner_dir" 2>/dev/null || true
 fi
 exit "$status"

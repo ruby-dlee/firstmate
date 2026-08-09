@@ -1760,6 +1760,8 @@ test_inject_msg_herdr_pane_gone_defers() {
   afk_enter "$state"
   (
     fm_backend_target_exists() { return 1; }
+    # Intentional negative-assertion stub that must never be called.
+    # shellcheck disable=SC2329
     fm_backend_busy_state() { fail "busy_state should not be consulted once the pane-exists check already failed"; }
     fm_backend_send_text_submit() { fail "send_text_submit should not run when the pane does not exist"; }
     if FM_SUPERVISOR_BACKEND=herdr FM_SUPERVISOR_TARGET="default:w1:gone" inject_msg "hello" "$state"; then

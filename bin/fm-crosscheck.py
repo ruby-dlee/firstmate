@@ -1696,13 +1696,13 @@ def test_arguments(
     argv = [*runner, *policy.gate_arguments, target]
     body_report: Path | None = None
     if policy.body_probe is not None:
-        probe_path, body_report = write_javascript_body_probe(
+        probe_argument, body_report = write_javascript_body_probe(
             run_cwd, runner_name, policy.body_probe
         )
         if policy.body_probe == "jest-global-wrapper":
-            argv.extend(["--setupFilesAfterEnv", str(probe_path)])
+            argv.extend(["--setupFilesAfterEnv", str(probe_argument)])
         elif policy.body_probe == "vitest-runner":
-            argv.extend(["--runner", str(probe_path)])
+            argv.extend(["--config", str(probe_argument)])
         else:
             tool_fail(
                 f"mutation-runner policy for {runner_name} has unknown body probe "
@@ -1729,6 +1729,7 @@ def write_javascript_body_probe(
     encoded_report = json.dumps(str(report_path))
     if probe_kind == "jest-global-wrapper":
         probe_path = protocol / "jest-body-probe.cjs"
+        argument_path = probe_path
         source = f"""// crosscheck-body-report={report_path}
 const {{ appendFileSync }} = require('node:fs');
 const reportPath = {encoded_report};
@@ -1774,10 +1775,10 @@ globalThis.it = wrapRegistration(globalThis.it);
         probe_path = protocol / "vitest-body-probe.mjs"
         source = f"""// crosscheck-body-report={report_path}
 import {{ appendFileSync }} from 'node:fs';
-import {{ VitestTestRunner }} from 'vitest';
+import {{ TestRunner }} from 'vitest';
 const reportPath = {encoded_report};
 
-export default class CrosscheckBodyRunner extends VitestTestRunner {{
+export default class CrosscheckBodyRunner extends TestRunner {{
   async runTask(test) {{
     const ancestorTitles = [];
     let suite = test.suite;
@@ -1788,16 +1789,27 @@ export default class CrosscheckBodyRunner extends VitestTestRunner {{
     ancestorTitles.reverse();
     const fullName = [...ancestorTitles, test.name].filter(Boolean).join(' ');
     appendFileSync(reportPath, `${{JSON.stringify({{ fullName }})}}\\n`);
-    const body = VitestTestRunner.getTestFn(test);
+    const body = TestRunner.getTestFn(test);
     if (!body) throw new Error('Test function is not found');
     await body();
   }}
 }}
 """
+        config_path = protocol / "vitest-body-probe.config.mjs"
+        config_path.write_text(
+            f"""// crosscheck-body-report={report_path}
+export default {{
+  root: {json.dumps(str(run_cwd))},
+  test: {{ runner: {json.dumps(str(probe_path))} }},
+}};
+""",
+            encoding="utf-8",
+        )
+        argument_path = config_path
     else:
         tool_fail(f"unknown JavaScript body probe {probe_kind!r}")
     probe_path.write_text(source, encoding="utf-8")
-    return probe_path, report_path
+    return argument_path, report_path
 
 
 def read_javascript_body_report(
@@ -1934,6 +1946,12 @@ def require_jest_compatible_execution_report(
                     non_execution(
                         label,
                         f"{runner} emitted an outcome without a full test name",
+                    )
+                if full_name in outcome_names:
+                    non_execution(
+                        label,
+                        f"{runner} emitted ambiguous duplicate outcome name "
+                        f"{full_name!r} during the {phase} run",
                     )
                 outcome_names.add(full_name)
         if suite.get("status") == "failed" and "failed" not in suite_statuses:

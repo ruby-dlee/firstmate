@@ -2032,7 +2032,7 @@ SH
   i=0
   completed=0
   while [ "$i" -lt 100 ]; do
-    completed=$(grep -c $'\tcrew-state-complete$' "$trace" 2>/dev/null || true)
+    completed=$(grep -c $'\tcrew-classification-complete$' "$trace" 2>/dev/null || true)
     [ -n "$completed" ] || completed=0
     [ "$completed" -ge 3 ] && break
     is_live_non_zombie "$armpid" || break
@@ -2188,7 +2188,7 @@ test_watcher_config_parser_is_shared_and_nonexecuting() {
   status=0
   FM_HOME="$dir" "$WATCH_ARM" > "$arm_out" 2>&1 || status=$?
   [ "$status" -ne 0 ] || fail "arm accepted a zero attach poll cadence"
-  grep -qF 'FM_ARM_ATTACH_POLL must be a positive decimal' "$arm_out" \
+  grep -qF 'invalid value for watcher config variable FM_ARM_ATTACH_POLL' "$arm_out" \
     || fail "arm did not diagnose its invalid attach poll cadence: $(cat "$arm_out")"
   [ ! -e "$dir/state/.watch.lock" ] || fail "arm entered watcher startup before validating attach cadence"
   pass "watcher config is parsed once without executing shell syntax"
@@ -2215,6 +2215,203 @@ test_pid_identity_is_locale_invariant() {
   [ "$via_lc_all" = "$baseline" ] || fail "fm_pid_identity varied with exported LC_ALL (got '$via_lc_all', want '$baseline')"
   [ "$via_lc_time" = "$baseline" ] || fail "fm_pid_identity varied with exported LC_TIME (got '$via_lc_time', want '$baseline')"
   pass "fm_pid_identity is locale-invariant across LC_ALL/LC_TIME"
+}
+
+test_pid_identity_survives_exec_without_command_text() {
+  local dir state ready proceed live before after i
+  dir=$(make_case kernel-start-identity)
+  state="$dir/state"
+  ready="$dir/ready"
+  proceed="$dir/proceed"
+  FM_TEST_READY="$ready" FM_TEST_PROCEED="$proceed" bash -c '
+    : > "$FM_TEST_READY"
+    while [ ! -e "$FM_TEST_PROCEED" ]; do sleep 0.01; done
+    exec sleep 300
+  ' &
+  live=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -e "$ready" ]; do sleep 0.01; i=$((i + 1)); done
+  before=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live") \
+    || fail "could not read pre-exec kernel identity"
+  touch "$proceed"
+  i=0
+  while [ "$i" -lt 100 ]; do
+    [ "$(LC_ALL=C ps -p "$live" -o comm= 2>/dev/null | tr -d '[:space:]')" = sleep ] && break
+    sleep 0.01
+    i=$((i + 1))
+  done
+  after=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$live") \
+    || fail "could not read post-exec kernel identity"
+  kill "$live" 2>/dev/null || true
+  wait "$live" 2>/dev/null || true
+  [ "$before" = "$after" ] || fail "process identity changed across exec"
+  case "$before" in linux:*:*|darwin:*:*) ;; *) fail "process identity was not kernel-start based: $before" ;; esac
+  pass "process identity is command-independent across exec"
+}
+
+test_watcher_config_rejects_typed_injection() {
+  local dir config marker status
+  dir=$(make_case watcher-config-schema)
+  config="$dir/config"
+  marker="$dir/arithmetic-executed"
+  mkdir -p "$config"
+  printf 'FM_HEARTBEAT=1+$((1))\n' > "$config/watcher.env"
+  status=0
+  FM_WATCHER_CONFIG_LOADED_PATH= bash -c '. "$1"; fm_watcher_config_load "$2"' \
+    _ "$ROOT/bin/fm-watcher-config-lib.sh" "$config" 2>/dev/null || status=$?
+  [ "$status" -ne 0 ] || fail "typed watcher config accepted arithmetic syntax"
+  printf 'FM_HEARTBEAT=$(touch%s%s)\n' '${IFS}' "$marker" > "$config/watcher.env"
+  status=0
+  FM_WATCHER_CONFIG_LOADED_PATH= bash -c '. "$1"; fm_watcher_config_load "$2"' \
+    _ "$ROOT/bin/fm-watcher-config-lib.sh" "$config" 2>/dev/null || status=$?
+  [ "$status" -ne 0 ] || fail "typed watcher config accepted command syntax"
+  [ ! -e "$marker" ] || fail "typed watcher config executed rejected syntax"
+  printf "FM_BUSY_REGEX='['\n" > "$config/watcher.env"
+  status=0
+  FM_WATCHER_CONFIG_LOADED_PATH= bash -c '. "$1"; fm_watcher_config_load "$2"' \
+    _ "$ROOT/bin/fm-watcher-config-lib.sh" "$config" 2>/dev/null || status=$?
+  [ "$status" -ne 0 ] || fail "typed watcher config accepted an invalid regex"
+  pass "watcher config validates typed values before export"
+}
+
+test_dead_stop_claim_is_reclaimed_exclusively() {
+  local dir state lock root identity claimant ready i claim_id
+  dir=$(make_case dead-stop-claim)
+  state="$dir/state"
+  lock="$state/.watch.lock"
+  ready="$dir/ready"
+  perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "300"' &
+  root=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    [ "$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_session "$2"' _ "$LIB" "$root" 2>/dev/null || true)" = "$root" ] && break
+    sleep 0.01
+    i=$((i + 1))
+  done
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$root") \
+    || fail "could not identify stop-claim fixture"
+  mkdir "$lock"
+  printf '%s\n' "$root" > "$lock/pid"
+  printf '%s\n' "$identity" > "$lock/pid-identity"
+  printf '%s\n' "$root" > "$lock/process-session"
+  printf '%s\n' "$dir" > "$lock/fm-home"
+  printf '%s\n' "$WATCH" > "$lock/watcher-path"
+  FM_STATE_OVERRIDE="$state" FM_TEST_READY="$ready" bash -c '
+    . "$1"
+    fm_watcher_lock_session_stop_claim "$2" "$3" || exit 1
+    : > "$FM_TEST_READY"
+    sleep 300
+  ' _ "$LIB" "$state" "$root" &
+  claimant=$!
+  i=0
+  while [ "$i" -lt 100 ] && [ ! -e "$ready" ]; do sleep 0.01; i=$((i + 1)); done
+  [ -e "$ready" ] || fail "first cleanup owner did not publish its stop claim"
+  if FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_watcher_lock_session_stop_claim "$2" "$3"' \
+    _ "$LIB" "$state" "$root"; then
+    fail "second live cleanup owner acquired the active stop claim"
+  fi
+  kill -KILL "$claimant" 2>/dev/null || true
+  wait "$claimant" 2>/dev/null || true
+  printf 'partial\n' > "$lock/session-stop.pending"
+  claim_id=$(FM_STATE_OVERRIDE="$state" bash -c '
+    . "$1"
+    fm_watcher_lock_session_stop_claim "$2" "$3" || exit 1
+    printf "%s" "$FM_WATCHER_STOP_CLAIM_ID"
+  ' _ "$LIB" "$state" "$root") || fail "dead cleanup owner's claim was not reclaimed"
+  [ -n "$claim_id" ] || fail "reclaimed stop claim had no unique id"
+  [ ! -e "$lock/session-stop.pending" ] || fail "incomplete stop publication was not reclaimed"
+  kill "$root" 2>/dev/null || true
+  wait "$root" 2>/dev/null || true
+  pass "stop claims exclude live owners and reclaim dead owners"
+}
+
+test_legacy_group_stop_reaps_term_trap_fork() {
+  local dir state late root identity i late_pid
+  dir=$(make_case legacy-group-term-fork)
+  state="$dir/state"
+  late="$dir/late.pid"
+  FM_TEST_LATE="$late" perl -MPOSIX -e '
+    POSIX::setsid();
+    exec "bash", "-c", q{trap '\''sleep 300 & echo $! > "$FM_TEST_LATE"'\'' TERM; while :; do sleep 1; done};
+  ' &
+  root=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$root") \
+    || fail "could not identify legacy group fixture"
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_tree_stop "$2" 10 "$3"' \
+    _ "$LIB" "$root" "$identity" || fail "durable legacy process group was not drained"
+  i=0
+  while [ "$i" -lt 50 ] && [ ! -s "$late" ]; do sleep 0.01; i=$((i + 1)); done
+  late_pid=$(cat "$late" 2>/dev/null || true)
+  ! is_live_non_zombie "$root" || fail "legacy process-group root survived cleanup"
+  [ -z "$late_pid" ] || ! is_live_non_zombie "$late_pid" \
+    || { kill -KILL "$late_pid" 2>/dev/null || true; fail "TERM-trap fork escaped legacy group cleanup"; }
+  pass "durable legacy group cleanup reaps TERM-trap forks"
+}
+
+test_restart_drains_residual_session_without_live_leaders() {
+  local dir state fakebin out root_file members_file root anchor residual identity anchor_identity arm i
+  dir=$(make_case residual-session-proof)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/restart.out"
+  root_file="$dir/root.pid"
+  members_file="$dir/members"
+  node -e '
+    const fs = require("fs");
+    const { spawn } = require("child_process");
+    const program = `
+      const fs = require("fs");
+      const { spawn } = require("child_process");
+      const a = spawn(process.execPath, ["-e", "setTimeout(()=>{},300000)"], { stdio: "ignore" });
+      const b = spawn(process.execPath, ["-e", "process.on('\''SIGTERM'\'',()=>{});setTimeout(()=>{},300000)"], { stdio: "ignore" });
+      fs.writeFileSync(process.argv[1], a.pid + "\\n" + b.pid + "\\n");
+      setTimeout(() => {}, 300000);
+    `;
+    const root = spawn(process.execPath, ["-e", program, process.argv[2]], { detached: true, stdio: "ignore" });
+    fs.writeFileSync(process.argv[1], String(root.pid));
+    root.unref();
+  ' "$root_file" "$members_file"
+  root=$(cat "$root_file")
+  i=0
+  while [ "$i" -lt 100 ]; do
+    [ -f "$members_file" ] && [ "$(wc -l < "$members_file")" -ge 2 ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+  anchor=$(sed -n '1p' "$members_file")
+  residual=$(sed -n '2p' "$members_file")
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$root") \
+    || fail "could not identify residual-session leader"
+  anchor_identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$anchor") \
+    || fail "could not identify residual-session anchor"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$root" > "$state/.watch.lock/pid"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  printf '%s\n' "$root" > "$state/.watch.lock/process-session"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf 'pid=%s\nidentity=%s\n' "$anchor" "$anchor_identity" > "$state/.watch.lock/session-anchor"
+  kill -KILL "$root" "$anchor" 2>/dev/null || true
+  i=0
+  while [ "$i" -lt 50 ] && { is_live_non_zombie "$root" || is_live_non_zombie "$anchor"; }; do sleep 0.05; i=$((i + 1)); done
+  is_live_non_zombie "$residual" || fail "residual-session member did not survive both leaders"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" &
+  arm=$!
+  i=0
+  while [ "$i" -lt 150 ]; do
+    grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
+    is_live_non_zombie "$arm" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF 'watcher: started pid=' "$out" \
+    || { kill -KILL "$arm" "$residual" 2>/dev/null || true; fail "restart could not drain a residual proven session: $(cat "$out")"; }
+  ! is_live_non_zombie "$residual" \
+    || { kill -KILL "$residual" 2>/dev/null || true; fail "restart left a residual proven session member alive"; }
+  kill -TERM "$arm" 2>/dev/null || true
+  wait "$arm" 2>/dev/null || true
+  pass "restart drains residual sessions after both leaders die"
 }
 
 if [ "${FM_TEST_FOCUSED:-}" = self-evict ]; then
@@ -2306,8 +2503,25 @@ if [ "${FM_TEST_FOCUSED:-}" = phase-bounds ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-round-2 ]; then
+  test_pid_identity_survives_exec_without_command_text
+  test_watcher_config_rejects_typed_injection
+  test_dead_stop_claim_is_reclaimed_exclusively
+  test_legacy_group_stop_reaps_term_trap_fork
+  test_restart_drains_residual_session_without_live_leaders
+  test_watch_restart_recovers_dead_session_leader
+  test_monitor_recovers_root_kill_before_anchor_publication
+  test_heartbeat_aggregate_reads_publish_bounded_progress
+  exit 0
+fi
+
 test_singleton_start
 test_pid_identity_is_locale_invariant
+test_pid_identity_survives_exec_without_command_text
+test_watcher_config_rejects_typed_injection
+test_dead_stop_claim_is_reclaimed_exclusively
+test_legacy_group_stop_reaps_term_trap_fork
+test_restart_drains_residual_session_without_live_leaders
 test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings

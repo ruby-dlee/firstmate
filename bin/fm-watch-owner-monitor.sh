@@ -129,7 +129,9 @@ done
 : > "$owner_lost" 2>/dev/null || true
 : > "$owner_failed" 2>/dev/null || true
 status=0
-fm_session_stop_owned_except "$watcher_pid" "$monitor_pid" 30 || status=$?
+fm_watcher_lock_session_proof_matches "$STATE" "$watch_path" "$FM_HOME" "$watcher_pid" \
+  && fm_watcher_lock_session_stop_claim "$STATE" "$watcher_pid" \
+  && fm_session_stop_owned_except "$watcher_pid" "$monitor_pid" 30 || status=$?
 if [ "$status" -eq 0 ] \
   && fm_watcher_lock_owner_record_matches \
     "$STATE" "$watch_path" "$FM_HOME" "$watcher_pid" "$watcher_identity" \
@@ -142,6 +144,9 @@ exec 8<&-
 rm -f "$owner_ready" "$owner_failed" "$owner_fifo" "$owner_eof" "$owner_lost" 2>/dev/null || true
 rm -f "$session_record" "$session_record_pending" "$handoff_request" \
   "$handoff_request_pending" "$handoff_taken" "$prestart_owner_pid_file" \
-  "$prestart_owner_identity_file" 2>/dev/null || true
+  "$prestart_owner_identity_file" "$owner_dir/pid" "$owner_dir/pid-identity" \
+  "$owner_dir/process-session" "$owner_dir/fm-home" "$owner_dir/watcher-path" \
+  "$owner_dir/session-stop" "$owner_dir/session-stop.pending" \
+  "$owner_dir/.session-stop-transaction" 2>/dev/null || true
 rmdir "$owner_dir" 2>/dev/null || true
 exit "$status"

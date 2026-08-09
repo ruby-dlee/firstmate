@@ -21,6 +21,57 @@ fm_watcher_config_variable_allowed() {  # <name>
   return 1
 }
 
+fm_watcher_config_value_valid() {  # <name> <value>
+  local name=$1 value=$2 status
+  case "$name" in
+    FM_BUSY_REGEX|FM_CAPTAIN_RE)
+      [ -n "$value" ] && [ "${#value}" -le 4096 ] || return 1
+      printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]' && return 1
+      printf '' | LC_ALL=C grep -E "$value" >/dev/null 2>&1
+      status=$?
+      [ "$status" -ne 2 ]
+      ;;
+    FM_CLASSIFY_PAUSED_VERB)
+      [ -n "$value" ] && [ "${#value}" -le 64 ] || return 1
+      case "$value" in *[!A-Za-z0-9_-]*|[0-9_-]*) return 1 ;; esac
+      ;;
+    FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS|FM_ACCOUNT_LINEAGE_LOCK_WAIT_SECONDS|FM_ACCOUNT_META_LOCK_WAIT_SECONDS|FM_CHECK_INTERVAL|FM_SIGNAL_GRACE|FM_TREEHOUSE_RETURN_LOCK_RETRIES|FM_WATCH_PHASE_MARGIN)
+      case "$value" in ''|*[!0-9]*|??????????*) return 1 ;; esac
+      ;;
+    FM_STALE_WORKTREE_LOCK_RETRY_WAIT_SECS)
+      [ -z "$value" ] && return 0
+      case "$value" in
+        *[!0-9.]*|*.*.*) return 1 ;;
+      esac
+      printf '%s' "$value" | LC_ALL=C grep -Eq '^([0-9]+([.][0-9]*)?|[.][0-9]+)$'
+      ;;
+    FM_TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS)
+      case "$value" in
+        ''|*[!0-9.]*|*.*.*) return 1 ;;
+      esac
+      printf '%s' "$value" | LC_ALL=C grep -Eq '^([0-9]+([.][0-9]*)?|[.][0-9]+)$'
+      ;;
+    FM_ARM_ATTACH_POLL)
+      case "$value" in
+        ''|*[!0-9.]*|*.*.*) return 1 ;;
+      esac
+      awk -v value="$value" 'BEGIN {
+        valid = value ~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/
+        exit !(valid && value > 0)
+      }'
+      ;;
+    FM_WATCH_AUTO_REAP_TIMEOUT)
+      [ -z "$value" ] && return 0
+      case "$value" in ''|*[!0-9]*|0|??????????*) return 1 ;; esac
+      case "$value" in *[1-9]*) ;; *) return 1 ;; esac
+      ;;
+    *)
+      case "$value" in ''|*[!0-9]*|0|??????????*) return 1 ;; esac
+      case "$value" in *[1-9]*) ;; *) return 1 ;; esac
+      ;;
+  esac
+}
+
 fm_watcher_config_load() {  # <config-dir>
   local config_dir=$1 path line raw name suffix value first last line_number=0 LC_ALL=C
   path="$config_dir/watcher.env"
@@ -88,6 +139,11 @@ fm_watcher_config_load() {  # <config-dir>
         esac
       fi
     fi
+    fm_watcher_config_value_valid "$name" "$value" || {
+      printf 'error: invalid value for watcher config variable %s at %s:%s\n' \
+        "$name" "$path" "$line_number" >&2
+      return 1
+    }
     printf -v "$name" '%s' "$value"
     export "$name"
   done < "$path"

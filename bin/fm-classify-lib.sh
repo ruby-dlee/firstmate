@@ -524,9 +524,14 @@ scan_crew_liveness_observations() {  # <state-dir> [progress-callback]
 }
 
 crew_absorb_class() {  # <id> [declared-pause-status-line]
-  local id=$1 declared_pause=${2:-} line state src liveness
+  local id=$1 declared_pause=${2:-} progress=${3:-${FM_CREW_STATE_PROGRESS_CALLBACK:-}}
+  local line state src liveness result=none
   [ -n "$id" ] || { printf 'none'; return; }
-  line=$(crew_state_line "$id")
+  if [ -n "$progress" ] && ! "$progress" begin "$id"; then
+    printf 'none'
+    return
+  fi
+  line=$(crew_state_line "$id" "")
   case "$line" in
     state:*)
       state=${line#state: }; state=${state%% *}
@@ -534,18 +539,21 @@ crew_absorb_class() {  # <id> [declared-pause-status-line]
       if [ "$state" = working ]; then
         liveness=$(crew_state_liveness_verdict "$line")
         case "$src:$liveness" in
-          run-step:alive|run-step:|pane:alive|pane:) printf 'working'; return ;;
+          run-step:alive|run-step:|pane:alive|pane:) result=working ;;
         esac
       fi
       ;;
   esac
   # An unreadable verdict falls through here too: it is not evidence against a pause
   # the crewmate durably declared, and it is exactly what a torn-down pane produces.
-  if crew_declared_pause_absorbable "$id" "$declared_pause"; then
-    printf 'paused'
-    return
+  if [ "$result" != working ] \
+    && crew_declared_pause_absorbable "$id" "$declared_pause"; then
+    result=paused
   fi
-  printf 'none'
+  if [ -n "$progress" ] && ! "$progress" end "$id"; then
+    result=none
+  fi
+  printf '%s' "$result"
 }
 
 # 0 if crewmate <id> shows POSITIVE evidence it is still working (crew_absorb_class
@@ -624,14 +632,19 @@ stale_is_terminal() {  # <window> <state>
 # catch-all backstop for a captain-relevant status the per-wake path might miss.
 # No dedup is applied here: each consumer dedupes against its own seen-state (the
 # daemon against .subsuper-seen-status-*, the watcher against .seen-* signatures).
-scan_captain_relevant_statuses() {  # <state>
-  local state=$1 f last task
+scan_captain_relevant_statuses() {  # <state> [progress-callback]
+  local state=$1 progress=${2:-} f last task
   for f in "$state"/*.status; do
     [ -e "$f" ] || continue
-    last=$(last_status_line "$f")
-    status_is_captain_relevant "$last" || continue
     task=$(basename "$f"); task="${task%.status}"
-    printf '%s\t%s\t%s\n' "$f" "$task" "$last"
+    if [ -n "$progress" ] && ! "$progress" begin "$task"; then
+      continue
+    fi
+    last=$(last_status_line "$f")
+    if status_is_captain_relevant "$last"; then
+      printf '%s\t%s\t%s\n' "$f" "$task" "$last"
+    fi
+    [ -z "$progress" ] || "$progress" end "$task" || return 1
   done
   return 0
 }

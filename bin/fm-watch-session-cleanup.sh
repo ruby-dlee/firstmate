@@ -19,7 +19,18 @@ case "$owner_dir" in "$STATE"/.watch-arm-owner.*) ;; *) exit 2 ;; esac
 [ "$(fm_pid_session "$observer" 2>/dev/null || true)" = "$session" ] || exit 1
 
 status=0
-fm_session_stop_owned_except "$session" "$observer" 30 || status=$?
+if fm_watcher_lock_session_proof_matches "$STATE" "$watch_path" "$FM_HOME" "$session"; then
+  fm_watcher_lock_session_stop_claim "$STATE" "$session" \
+    && fm_session_stop_owned_except "$session" "$observer" 30 || status=$?
+elif [ "$(cat "$owner_dir/pid" 2>/dev/null || true)" = "$session" ] \
+  && [ "$(cat "$owner_dir/process-session" 2>/dev/null || true)" = "$session" ] \
+  && [ "$(cat "$owner_dir/fm-home" 2>/dev/null || true)" = "$FM_HOME" ] \
+  && [ "$(cat "$owner_dir/watcher-path" 2>/dev/null || true)" = "$watch_path" ]; then
+  fm_session_stop_claim_dir "$owner_dir" "$session" \
+    && fm_session_stop_owned_except "$session" "$observer" 30 || status=$?
+else
+  status=1
+fi
 if [ "$status" -eq 0 ] \
   && [ "$(cat "$lockdir/pid" 2>/dev/null || true)" = "$session" ] \
   && [ "$(cat "$lockdir/process-session" 2>/dev/null || true)" = "$session" ] \
@@ -37,6 +48,9 @@ if [ "$status" -eq 0 ]; then
     "$owner_dir/handoff-taken.pending" "$owner_dir/prestart-owner-pid" \
     "$owner_dir/prestart-owner-pid.pending" "$owner_dir/prestart-owner-identity" \
     "$owner_dir/prestart-owner-identity.pending" 2>/dev/null || true
+  rm -f "$owner_dir/pid" "$owner_dir/pid-identity" "$owner_dir/process-session" \
+    "$owner_dir/fm-home" "$owner_dir/watcher-path" "$owner_dir/session-stop" \
+    "$owner_dir/session-stop.pending" "$owner_dir/.session-stop-transaction" 2>/dev/null || true
   rmdir "$owner_dir" 2>/dev/null || true
 fi
 exit "$status"

@@ -146,23 +146,20 @@ stop_recorded_watcher() {  # <root-pid> <root-identity>
   local root=$1 identity=$2 session current_identity anchor anchor_identity status
   session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
   if [ -n "$session" ]; then
-    fm_watcher_lock_session_record_matches "$STATE" "$WATCH" "$FM_HOME" "$session" || return 1
+    fm_watcher_lock_session_proof_matches "$STATE" "$WATCH" "$FM_HOME" "$session" || return 1
+    fm_watcher_lock_session_stop_claim "$STATE" "$session" || return 1
     fm_watcher_lock_session_anchor_read "$STATE" || true
     anchor=$FM_WATCHER_SESSION_ANCHOR_PID
     anchor_identity=$FM_WATCHER_SESSION_ANCHOR_IDENTITY
+    status=0
     if fm_session_anchor_matches "$session" "$anchor" "$anchor_identity"; then
-      fm_watcher_lock_session_stop_claim "$STATE" "$session" || return 1
-      status=0
       fm_session_stop_owned_with_anchor "$session" "$anchor" "$anchor_identity" 30 || status=$?
-      [ "$status" -ne 0 ] || return 0
-      fm_watcher_lock_session_stop_claim_clear "$STATE" "$session" >/dev/null 2>&1 || true
-      return "$status"
+    else
+      fm_session_stop_owned "$session" 30 || status=$?
     fi
-    current_identity=$(fm_pid_identity "$root" 2>/dev/null || true)
-    [ "$current_identity" = "$identity" ] || return 1
-    [ "$(fm_pid_session "$root" 2>/dev/null || true)" = "$session" ] || return 1
-    fm_pid_session_stop "$root" "$session" 30 "$identity"
-    return
+    [ "$status" -eq 0 ] && return 0
+    fm_watcher_lock_session_stop_claim_clear "$STATE" "$session" >/dev/null 2>&1 || true
+    return "$status"
   fi
   current_identity=$(fm_pid_identity "$root") || return 1
   [ "$current_identity" = "$identity" ] || return 1
@@ -405,6 +402,10 @@ owner_link_remove() {
   [ -n "$owner_link_dir" ] || return 0
   rm -f "$owner_link_ready" "$owner_link_failed" "$owner_link_fifo" \
     "$owner_link_dir/session-root" "$owner_link_dir/session-root.pending" \
+    "$owner_link_dir/pid" "$owner_link_dir/pid-identity" \
+    "$owner_link_dir/process-session" "$owner_link_dir/fm-home" \
+    "$owner_link_dir/watcher-path" "$owner_link_dir/session-stop" \
+    "$owner_link_dir/session-stop.pending" "$owner_link_dir/.session-stop-transaction" \
     "$owner_link_dir/handoff-request" "$owner_link_dir/handoff-request.pending" \
     "$owner_link_dir/handoff-taken" "$owner_link_dir/handoff-taken.pending" \
     "$owner_link_dir/prestart-owner-pid" "$owner_link_dir/prestart-owner-pid.pending" \
@@ -583,11 +584,42 @@ owner_link_reader_connected=true
     FM_WATCH_ARM_OWNER_FAILED="$owner_link_failed" \
     FM_WATCH_ARM_SESSION_RECORD="$child_session_record" \
     FM_WATCH_ARM_OWNER_FD=8 \
+    FM_PROCESS_IDENTITY_BIN="$SCRIPT_DIR/fm-process-identity.py" \
     exec perl -MFcntl=:DEFAULT -MPOSIX -e '
       my $cleanup = shift @ARGV;
       my $session = POSIX::setsid();
       exit 126 if !defined $session || $session != $$;
       my $root = $$;
+      my $identity_for = sub {
+        my ($pid) = @_;
+        my $helper = $ENV{FM_PROCESS_IDENTITY_BIN};
+        return if !defined $helper || $helper eq "";
+        open my $identity_process, "-|", $helper, $pid or return;
+        local $/;
+        my $identity = <$identity_process>;
+        close $identity_process or return;
+        return if !defined $identity || $identity eq "";
+        $identity =~ s/\n\z//;
+        return $identity;
+      };
+      my $root_identity = $identity_for->($root);
+      exit 125 if !defined $root_identity;
+      my $owner_dir = $ENV{FM_WATCH_ARM_OWNER_DIR};
+      my @proof = (
+        ["pid", "$root\n"],
+        ["pid-identity", "$root_identity\n"],
+        ["process-session", "$session\n"],
+        ["fm-home", "$ENV{FM_HOME}\n"],
+        ["watcher-path", "$ARGV[0]\n"],
+        ["session-root", "pid=$root\nidentity=$root_identity\n"],
+      );
+      for my $item (@proof) {
+        my ($name, $contents) = @$item;
+        sysopen my $record, "$owner_dir/$name", O_WRONLY | O_CREAT | O_EXCL, 0600
+          or exit 125;
+        print {$record} $contents;
+        close $record or exit 125;
+      }
       my $observer = fork();
       exit 125 if !defined $observer;
       if ($observer == 0) {
@@ -600,19 +632,6 @@ owner_link_reader_connected=true
         my $taken = "$owner_dir/handoff-taken";
         my $owner_pid = "$owner_dir/prestart-owner-pid";
         my $owner_identity = "$owner_dir/prestart-owner-identity";
-        my $identity_for = sub {
-          my ($pid) = @_;
-          local $ENV{LC_ALL} = "C";
-          open my $ps, "-|", "ps", "-p", $pid, "-o", "lstart=", "-o", "command="
-            or return;
-          local $/;
-          my $identity = <$ps>;
-          close $ps or return;
-          return if !defined $identity || $identity eq "";
-          $identity =~ s/^[[:space:]]+//mg;
-          $identity =~ s/\n\z//;
-          return $identity;
-        };
         my $group_for = sub {
           my ($pid) = @_;
           local $ENV{LC_ALL} = "C";

@@ -874,12 +874,13 @@ watcher_run_phase() {  # <phase> <seconds> <command> [args...]
 watcher_crew_state_progress() {  # <begin|end> <task>
   case "$1" in
     begin)
-      watcher_beat crew-state-start
-      watcher_phase_begin crew-state "$FM_CREW_STATE_READ_TIMEOUT"
+      watcher_beat crew-classification-start
+      watcher_phase_begin crew-classification \
+        "$((FM_CREW_STATE_READ_TIMEOUT + FM_WATCH_PROGRESS_GRACE))"
       ;;
     end)
       watcher_phase_end
-      watcher_beat crew-state-complete
+      watcher_beat crew-classification-complete
       ;;
     *) return 1 ;;
   esac
@@ -1012,7 +1013,7 @@ mark_all_captain_relevant_surfaced() {
   while IFS=$(printf '\t') read -r f task last; do
     [ -n "$f" ] || continue
     printf '%s' "$last" > "$(_hb_surfaced_path "$task")"
-  done < <(scan_captain_relevant_statuses "$STATE")
+  done < <(scan_captain_relevant_statuses "$STATE" watcher_crew_state_progress)
 }
 
 # Heartbeat fleet-scan (the always-on twin of the daemon's catch-all). Status
@@ -1027,7 +1028,7 @@ heartbeat_scan_finds_actionable() {
     surfaced=$(cat "$(_hb_surfaced_path "$task")" 2>/dev/null || true)
     [ "$surfaced" = "$last" ] && continue
     return 0
-  done < <(scan_captain_relevant_statuses "$STATE")
+  done < <(scan_captain_relevant_statuses "$STATE" watcher_crew_state_progress)
   while IFS=$(printf '\t') read -r task verdict _; do
     [ -n "$task" ] || continue
     case "$verdict" in
@@ -1222,12 +1223,11 @@ if [ -n "$watcher_owner_fifo" ]; then
       exit 1
   }
   watcher_session_identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
+  watcher_session_snapshot=$(printf 'pid=%s\nidentity=%s' \
+    "$WATCHER_PID" "$watcher_session_identity")
   [ -n "$watcher_session_identity" ] \
-    && [ ! -e "$watcher_session_record" ] && [ ! -L "$watcher_session_record" ] \
-    && [ ! -e "$watcher_session_record.pending" ] && [ ! -L "$watcher_session_record.pending" ] \
-    && printf 'pid=%s\nidentity=%s\n' \
-      "$WATCHER_PID" "$watcher_session_identity" > "$watcher_session_record.pending" \
-    && mv -f "$watcher_session_record.pending" "$watcher_session_record" || {
+    && [ ! -L "$watcher_session_record" ] \
+    && [ "$(cat "$watcher_session_record" 2>/dev/null || true)" = "$watcher_session_snapshot" ] || {
       echo "watcher: could not publish its owned process session identity" >&2
       rm -f "$WATCH_LOCK/process-session" 2>/dev/null || true
       fm_lock_release "$WATCH_LOCK"
@@ -1266,10 +1266,14 @@ if [ -n "$watcher_owner_fifo" ]; then
       watcher_owner_link_pid=$FM_WATCH_OWNER_TEST_REUSED_MONITOR_PID
     fi
     watcher_owner_cleanup_complete=false
-    if fm_watcher_lock_stop_session_anchor \
+    watcher_owner_stop_claimed=false
+    if fm_watcher_lock_session_stop_claim "$STATE" "$WATCHER_PID"; then
+      watcher_owner_stop_claimed=true
+    fi
+    if "$watcher_owner_stop_claimed" && fm_watcher_lock_stop_session_anchor \
       "$STATE" "$WATCHER_PID" "$watcher_owner_link_pid" 30; then
       watcher_owner_cleanup_complete=true
-    elif [ -n "$watcher_owner_link_identity" ] \
+    elif "$watcher_owner_stop_claimed" && [ -n "$watcher_owner_link_identity" ] \
       && fm_pid_stop_identity "$watcher_owner_link_pid" "$watcher_owner_link_identity" 30; then
       watcher_owner_cleanup_complete=true
     elif ! fm_pid_alive "$watcher_owner_link_pid"; then
@@ -1288,7 +1292,7 @@ if [ -n "$watcher_owner_fifo" ]; then
 fi
 
 watcher_release_lock() {
-  local anchor_stopped=false external_stop=false
+  local anchor_stopped=false external_stop=false stop_claimed=false
   watcher_phase_clear
   if [ "${FM_WATCHER_OWN_SESSION:-0}" = 1 ] \
     && fm_watcher_lock_session_stop_claim_matches "$STATE" "$WATCHER_PID"; then
@@ -1296,7 +1300,10 @@ watcher_release_lock() {
   fi
   "$external_stop" && return 0
   if [ -n "$watcher_owner_link_pid" ] && [ ! -e "$watcher_owner_failed" ]; then
-    if fm_watcher_lock_stop_session_anchor \
+    if fm_watcher_lock_session_stop_claim "$STATE" "$WATCHER_PID"; then
+      stop_claimed=true
+    fi
+    if "$stop_claimed" && fm_watcher_lock_stop_session_anchor \
       "$STATE" "$WATCHER_PID" "$watcher_owner_link_pid" 30; then
       anchor_stopped=true
     fi

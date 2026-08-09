@@ -33,29 +33,31 @@ fm_pid_alive() {
 }
 
 fm_pid_identity() {
-  local pid=$1 out
+  local pid=$1 helper="$FM_WAKE_LIB_DIR/fm-process-identity.py"
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  # Pin LC_ALL=C so lstart's date format is locale-invariant: the identity is
-  # written under one locale but re-read under the machine's ambient locale, which
-  # would otherwise mismatch on a non-C locale (e.g. ko_KR) and reject a live watcher.
-  out=$(LC_ALL=C ps -p "$pid" -o lstart= -o command= 2>/dev/null) || return 1
-  [ -n "$out" ] || return 1
-  printf '%s\n' "$out" | sed 's/^[[:space:]]*//'
+  [ -x "$helper" ] || return 1
+  "$helper" "$pid" 2>/dev/null
 }
 
 fm_pid_identity_live() {  # <pid> <pid-identity>
-  local pid=$1 identity=$2 snapshot state
+  local pid=$1 identity=$2 state
   case "$pid" in ''|*[!0-9]*) return 1 ;; esac
-  snapshot=$(LC_ALL=C ps -p "$pid" -o state= -o lstart= -o command= 2>/dev/null) || return 1
-  snapshot=${snapshot#"${snapshot%%[![:space:]]*}"}
-  [ -n "$snapshot" ] || return 1
-  state=${snapshot%%[[:space:]]*}
+  state=$(LC_ALL=C ps -p "$pid" -o state= 2>/dev/null) || return 1
+  state=${state#"${state%%[![:space:]]*}"}
   case "$state" in *Z*) return 1 ;; esac
-  snapshot=${snapshot#"$state"}
-  snapshot=${snapshot#"${snapshot%%[![:space:]]*}"}
-  [ "$snapshot" = "$identity" ]
+  [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "$identity" ]
+}
+
+fm_pid_group() {  # <pid>
+  local pid=$1 group
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  group=$(LC_ALL=C ps -p "$pid" -o pgid= 2>/dev/null) || return 1
+  group=${group#"${group%%[![:space:]]*}"}
+  group=${group%"${group##*[![:space:]]}"}
+  case "$group" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$group"
 }
 
 fm_pid_session() {  # <pid>
@@ -252,6 +254,65 @@ fm_session_stop_owned() {  # <session-id> [term-wait-tenths]
   fm_session_stop_owned_except "$1" "" "${2:-30}"
 }
 
+fm_process_group_snapshot() {  # <process-group>
+  local group=$1
+  case "$group" in ''|*[!0-9]*) return 1 ;; esac
+  LC_ALL=C ps -axo pid=,pgid=,state= 2>/dev/null | awk -v group="$group" '
+    $1 ~ /^[0-9]+$/ && $2 == group && $3 !~ /Z/ { print $1 }
+  '
+}
+
+fm_process_group_has_live_processes() {  # <process-group>
+  local members
+  members=$(fm_process_group_snapshot "$1") || return 2
+  [ -n "$members" ]
+}
+
+fm_process_group_stop() {  # <root-pid> <root-identity> [term-wait-tenths]
+  local root=$1 identity=$2 wait_tenths=${3:-30} group iteration status empty_streak=0
+  [ -n "$identity" ] || return 1
+  fm_pid_identity_live "$root" "$identity" || return 1
+  group=$(fm_pid_group "$root") || return 1
+  [ "$group" = "$root" ] || return 1
+  kill -TERM -- "-$group" 2>/dev/null || true
+  iteration=0
+  while [ "$iteration" -lt "$wait_tenths" ]; do
+    status=0
+    fm_process_group_has_live_processes "$group" || status=$?
+    case "$status" in
+      0) empty_streak=0 ;;
+      1)
+        empty_streak=$((empty_streak + 1))
+        [ "$empty_streak" -lt 2 ] || return 0
+        ;;
+      *) return 1 ;;
+    esac
+    sleep 0.1
+    iteration=$((iteration + 1))
+  done
+  status=0
+  fm_process_group_has_live_processes "$group" || status=$?
+  [ "$status" -eq 0 ] || return 1
+  kill -KILL -- "-$group" 2>/dev/null || true
+  iteration=0
+  empty_streak=0
+  while [ "$iteration" -lt 20 ]; do
+    status=0
+    fm_process_group_has_live_processes "$group" || status=$?
+    case "$status" in
+      0) empty_streak=0 ;;
+      1)
+        empty_streak=$((empty_streak + 1))
+        [ "$empty_streak" -lt 2 ] || return 0
+        ;;
+      *) return 1 ;;
+    esac
+    sleep 0.1
+    iteration=$((iteration + 1))
+  done
+  return 1
+}
+
 fm_pid_stop_identity() {  # <pid> <pid-identity> [term-wait-tenths]
   local pid=$1 identity=$2 wait_tenths=${3:-30} iteration=0
   [ -n "$identity" ] || return 1
@@ -316,6 +377,20 @@ fm_watcher_lock_session_record_matches() {  # <state> <watch-path> <home> <sessi
   [ "$(cat "$lockdir/process-session" 2>/dev/null || true)" = "$session" ]
 }
 
+fm_watcher_lock_session_proof_matches() {  # <state> <watch-path> <home> <session-id>
+  local state=$1 watch_path=$2 home=$3 session=$4 lockdir identity current
+  lockdir="$state/.watch.lock"
+  fm_watcher_lock_session_record_matches "$state" "$watch_path" "$home" "$session" \
+    || return 1
+  identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
+  current=$(fm_pid_identity "$session" 2>/dev/null || true)
+  if [ -n "$current" ]; then
+    [ "$current" = "$identity" ] || return 1
+    [ "$(fm_pid_session "$session" 2>/dev/null || true)" = "$session" ] || return 1
+  fi
+  fm_session_snapshot "$session" >/dev/null
+}
+
 FM_WATCHER_SESSION_ANCHOR_PID=
 FM_WATCHER_SESSION_ANCHOR_IDENTITY=
 fm_watcher_lock_session_anchor_read() {  # <state>
@@ -347,53 +422,59 @@ fm_watcher_lock_session_anchor_matches() {  # <state> <session-id>
 }
 
 fm_watcher_lock_session_stop_claim_matches() {  # <state> <session-id>
-  local state=$1 session=$2 lockdir snapshot lines anchor anchor_identity stopper stopper_identity
+  local state=$1 session=$2 lockdir confined helper
   lockdir="$state/.watch.lock"
-  [ -f "$lockdir/session-stop" ] && [ ! -L "$lockdir/session-stop" ] || return 1
-  snapshot=$(cat "$lockdir/session-stop" 2>/dev/null) || return 1
-  lines=$(printf '%s\n' "$snapshot" | awk 'END { print NR }')
-  [ "$lines" -eq 4 ] || return 1
-  anchor=$(printf '%s\n' "$snapshot" | sed -n '1s/^anchor-pid=//p')
-  anchor_identity=$(printf '%s\n' "$snapshot" | sed -n '2s/^anchor-identity=//p')
-  stopper=$(printf '%s\n' "$snapshot" | sed -n '3s/^stopper-pid=//p')
-  stopper_identity=$(printf '%s\n' "$snapshot" | sed -n '4s/^stopper-identity=//p')
-  case "$anchor" in ''|*[!0-9]*) return 1 ;; esac
-  case "$stopper" in ''|*[!0-9]*) return 1 ;; esac
-  [ -n "$anchor_identity" ] && [ -n "$stopper_identity" ] || return 1
-  fm_watcher_lock_session_anchor_matches "$state" "$session" || return 1
-  [ "$FM_WATCHER_SESSION_ANCHOR_PID" = "$anchor" ] \
-    && [ "$FM_WATCHER_SESSION_ANCHOR_IDENTITY" = "$anchor_identity" ] \
-    && fm_pid_identity_live "$stopper" "$stopper_identity"
+  if [ -L "$lockdir" ]; then
+    confined=$(fm_lock_link_owner "$lockdir") || return 1
+  else
+    confined=$(fm_lock_confined_target "$lockdir" "$lockdir") || return 1
+  fi
+  helper="$FM_WAKE_LIB_DIR/fm-watcher-stop-claim.py"
+  [ -x "$helper" ] || return 1
+  "$helper" matches "$confined" "$session" "$FM_WAKE_LIB_DIR/fm-process-identity.py"
+}
+
+FM_WATCHER_STOP_CLAIM_ID=
+fm_session_stop_claim_dir() {  # <claim-dir> <session-id>
+  local confined=$1 session=$2 stopper stopper_identity helper claim_id
+  FM_WATCHER_STOP_CLAIM_ID=
+  [ -d "$confined" ] && [ ! -L "$confined" ] || return 1
+  stopper=${BASHPID:-$$}
+  stopper_identity=$(fm_pid_identity "$stopper") || return 1
+  helper="$FM_WAKE_LIB_DIR/fm-watcher-stop-claim.py"
+  [ -x "$helper" ] || return 1
+  claim_id=$("$helper" acquire "$confined" "$session" \
+    "$FM_WAKE_LIB_DIR/fm-process-identity.py" "$stopper" "$stopper_identity") || return 1
+  [ -n "$claim_id" ] || return 1
+  FM_WATCHER_STOP_CLAIM_ID=$claim_id
 }
 
 fm_watcher_lock_session_stop_claim() {  # <state> <session-id>
-  local state=$1 session=$2 lockdir stopper stopper_identity
+  local state=$1 session=$2 lockdir confined
   lockdir="$state/.watch.lock"
-  stopper=${BASHPID:-$$}
-  stopper_identity=$(fm_pid_identity "$stopper") || return 1
-  fm_watcher_lock_session_anchor_matches "$state" "$session" || return 1
-  [ ! -e "$lockdir/session-stop" ] && [ ! -L "$lockdir/session-stop" ] \
-    && [ ! -e "$lockdir/session-stop.pending" ] \
-    && [ ! -L "$lockdir/session-stop.pending" ] || return 1
-  ( set -C; : > "$lockdir/session-stop.pending" ) 2>/dev/null || return 1
-  if ! printf 'anchor-pid=%s\nanchor-identity=%s\nstopper-pid=%s\nstopper-identity=%s\n' \
-    "$FM_WATCHER_SESSION_ANCHOR_PID" "$FM_WATCHER_SESSION_ANCHOR_IDENTITY" \
-    "$stopper" "$stopper_identity" > "$lockdir/session-stop.pending"; then
-    rm -f "$lockdir/session-stop.pending"
-    return 1
+  if [ -L "$lockdir" ]; then
+    confined=$(fm_lock_link_owner "$lockdir") || return 1
+  else
+    confined=$(fm_lock_confined_target "$lockdir" "$lockdir") || return 1
   fi
-  mv -f "$lockdir/session-stop.pending" "$lockdir/session-stop" || {
-    rm -f "$lockdir/session-stop.pending"
-    return 1
-  }
-  fm_watcher_lock_session_stop_claim_matches "$state" "$session"
+  fm_session_stop_claim_dir "$confined" "$session"
 }
 
 fm_watcher_lock_session_stop_claim_clear() {  # <state> <session-id>
-  local state=$1 session=$2 lockdir
+  local state=$1 session=$2 lockdir confined stopper stopper_identity helper
   lockdir="$state/.watch.lock"
-  fm_watcher_lock_session_stop_claim_matches "$state" "$session" || return 1
-  rm -f "$lockdir/session-stop" "$lockdir/session-stop.pending"
+  [ -n "$FM_WATCHER_STOP_CLAIM_ID" ] || return 1
+  stopper=${BASHPID:-$$}
+  stopper_identity=$(fm_pid_identity "$stopper") || return 1
+  if [ -L "$lockdir" ]; then
+    confined=$(fm_lock_link_owner "$lockdir") || return 1
+  else
+    confined=$(fm_lock_confined_target "$lockdir" "$lockdir") || return 1
+  fi
+  helper="$FM_WAKE_LIB_DIR/fm-watcher-stop-claim.py"
+  "$helper" clear "$confined" "$session" "$FM_WAKE_LIB_DIR/fm-process-identity.py" \
+    "$stopper" "$stopper_identity" "$FM_WATCHER_STOP_CLAIM_ID" || return 1
+  FM_WATCHER_STOP_CLAIM_ID=
 }
 
 fm_watcher_lock_stop_session_anchor() {  # <state> <session-id> <expected-anchor-pid> [term-wait-tenths]
@@ -584,83 +665,11 @@ EOF
   [ -n "$FM_WATCHER_TREE_CPU" ]
 }
 
-# Stop only a previously validated recorded root and its exact descendants.
-# Every signal target comes from fm_pid_tree_snapshot and is identity-pinned
-# before the first signal, so pid reuse cannot turn recovery into a broad kill.
+# Stop a legacy root only when it already leads a durable process group.
 fm_pid_tree_stop() {  # <root-pid> [term-wait-tenths] [expected-root-identity]
   local root=$1 wait_tenths=${2:-30} expected_identity=${3:-}
-  local pid identity index iteration any root_verified
-  local tree_pids=() tree_identities=()
-  while IFS=' ' read -r _depth pid; do
-    [ -n "$pid" ] || continue
-    identity=$(fm_pid_identity "$pid") || continue
-    tree_pids+=("$pid")
-    tree_identities+=("$identity")
-  done < <(fm_pid_tree_snapshot "$root")
-  if [ "${#tree_pids[@]}" -eq 0 ]; then
-    [ -z "$expected_identity" ] && return 0
-    return 1
-  fi
-  if [ -n "$expected_identity" ]; then
-    root_verified=0
-    for index in "${!tree_pids[@]}"; do
-      [ "${tree_pids[$index]}" = "$root" ] || continue
-      [ "${tree_identities[$index]}" = "$expected_identity" ] && root_verified=1
-      break
-    done
-    # The recorded process exited or its pid was reused between lock validation
-    # and snapshot. There is no longer an identity-pinned owned tree to signal.
-    [ "$root_verified" -eq 1 ] || return 1
-  fi
-  # Ask the root to stop first so it cannot launch new work as descendants are
-  # drained. Bash may defer TERM while waiting on a child, which is why the
-  # deepest-first descendant pass and the later KILL bound are still required.
-  for index in "${!tree_pids[@]}"; do
-    [ "${tree_pids[$index]}" = "$root" ] || continue
-    [ "$(fm_pid_identity "$root" 2>/dev/null || true)" = "${tree_identities[$index]}" ] || continue
-    kill -TERM "$root" 2>/dev/null || true
-    break
-  done
-  for index in "${!tree_pids[@]}"; do
-    pid=${tree_pids[$index]}
-    [ "$pid" != "$root" ] || continue
-    [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "${tree_identities[$index]}" ] || continue
-    kill -TERM "$pid" 2>/dev/null || true
-  done
-  iteration=0
-  while [ "$iteration" -lt "$wait_tenths" ]; do
-    any=0
-    for index in "${!tree_pids[@]}"; do
-      pid=${tree_pids[$index]}
-      if [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "${tree_identities[$index]}" ]; then
-        any=1
-        break
-      fi
-    done
-    [ "$any" -eq 0 ] && return 0
-    sleep 0.1
-    iteration=$((iteration + 1))
-  done
-  for index in "${!tree_pids[@]}"; do
-    pid=${tree_pids[$index]}
-    [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "${tree_identities[$index]}" ] || continue
-    kill -KILL "$pid" 2>/dev/null || true
-  done
-  iteration=0
-  while [ "$iteration" -lt 20 ]; do
-    any=0
-    for index in "${!tree_pids[@]}"; do
-      pid=${tree_pids[$index]}
-      if [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "${tree_identities[$index]}" ]; then
-        any=1
-        break
-      fi
-    done
-    [ "$any" -eq 0 ] && return 0
-    sleep 0.1
-    iteration=$((iteration + 1))
-  done
-  return 1
+  [ -n "$expected_identity" ] || return 1
+  fm_process_group_stop "$root" "$expected_identity" "$wait_tenths"
 }
 
 fm_lock_clean_known_files() {
@@ -678,6 +687,7 @@ fm_lock_clean_known_files() {
     "$confined/session-anchor-identity" \
     "$confined/session-stop" \
     "$confined/session-stop.pending" \
+    "$confined/.session-stop-transaction" \
     "$confined/watcher-path" \
     2>/dev/null || true
 }

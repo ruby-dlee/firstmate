@@ -1170,7 +1170,6 @@ if ! fm_lock_try_acquire "$WATCH_LOCK"; then
   fi
   exit 0
 fi
-trap 'watcher_phase_clear; fm_lock_release "$WATCH_LOCK"' EXIT
 # This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
 # ${BASHPID:-$$} from this same main shell). Read directly, never via a command
 # substitution, so it matches the stored holder pid for the self-eviction check.
@@ -1178,6 +1177,26 @@ WATCHER_PID=${BASHPID:-$$}
 printf '%s\n' "$FM_HOME" > "$WATCH_LOCK/fm-home" || true
 printf '%s\n' "$WATCH_PATH" > "$WATCH_LOCK/watcher-path" || true
 fm_pid_identity "$WATCHER_PID" > "$WATCH_LOCK/pid-identity" 2>/dev/null || true
+if [ "${FM_WATCHER_OWN_SESSION:-0}" = 1 ]; then
+  watcher_session=$(fm_pid_session "$WATCHER_PID" 2>/dev/null || true)
+  if [ "$watcher_session" != "$WATCHER_PID" ] \
+    || ! printf '%s\n' "$watcher_session" > "$WATCH_LOCK/process-session" \
+    || [ "$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)" != "$watcher_session" ]; then
+    echo "watcher: could not establish its owned process session" >&2
+    rm -f "$WATCH_LOCK/process-session" 2>/dev/null || true
+    fm_lock_release "$WATCH_LOCK"
+    exit 1
+  fi
+fi
+
+watcher_release_lock() {
+  watcher_phase_clear
+  if [ "${FM_WATCHER_OWN_SESSION:-0}" = 1 ]; then
+    fm_watcher_session_guard_release "$WATCH_LOCK" "$WATCHER_PID" || return 0
+  fi
+  fm_lock_release "$WATCH_LOCK"
+}
+trap watcher_release_lock EXIT
 
 if ! safe_marker_path "$STATE/.last-heartbeat" || [ ! -e "$STATE/.last-heartbeat" ]; then
   safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true

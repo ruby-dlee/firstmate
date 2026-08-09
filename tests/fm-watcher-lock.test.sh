@@ -185,6 +185,38 @@ test_guard_detects_live_watcher_that_missed_cadence() {
   pass "guard makes a live watcher loud when it misses cadence before broad stale grace"
 }
 
+test_guard_accepts_identity_matched_active_phase() {
+  local dir state err sleeper identity deadline
+  dir=$(make_case guard-active-phase)
+  state="$dir/state"
+  err="$dir/guard.err"
+  sleep 60 &
+  sleeper=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$sleeper") \
+    || fail "could not identify active-phase guard fixture"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$sleeper" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  printf 'project=x\n' > "$state/task.meta"
+  touch "$state/.last-watcher-beat"
+  perl -e '$time = time - 120; utime $time, $time, $ARGV[0]' "$state/.last-watcher-beat"
+  deadline=$(( $(date +%s) + 60 ))
+  {
+    printf 'pid=%s\n' "$sleeper"
+    printf 'phase=task-check\n'
+    printf 'deadline=%s\n' "$deadline"
+    printf 'pid-identity=%s\n' "$identity"
+  } > "$state/.watch.phase"
+  FM_ROOT_OVERRIDE="$dir" FM_HOME="$dir" FM_GUARD_GRACE=1 FM_WATCH_PROGRESS_GRACE=1 \
+    "$ROOT/bin/fm-guard.sh" 2> "$err" >/dev/null || fail "active-phase guard failed"
+  kill "$sleeper" 2>/dev/null || true
+  wait "$sleeper" 2>/dev/null || true
+  [ ! -s "$err" ] || fail "guard warned during an identity-matched active phase: $(cat "$err")"
+  pass "guard treats an identity-matched bounded phase as current progress"
+}
+
 test_guard_detects_hot_recorded_watcher_tree() {
   local dir state err hot identity i
   dir=$(make_case guard-hot-tree)
@@ -598,6 +630,7 @@ EOF
   printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
   printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
   printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  printf '%s\n' "$peer" > "$state/.watch.lock/process-session"
   touch -t 200001010000 "$state/.last-watcher-beat"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" &
   armpid=$!
@@ -1288,6 +1321,48 @@ test_arm_recovers_direct_no_progress_wedge() {
   pass "arm force-recovers a watcher that stops all progress"
 }
 
+test_arm_reaps_term_trap_children_from_owned_session() {
+  local dir state fakebin out ready spawned armpid watcher_pid session child_pid i
+  dir=$(make_case arm-owned-session)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/arm.out"
+  ready="$dir/helper.ready"
+  spawned="$dir/helper-child.pid"
+  cat > "$state/session.check.sh" <<SH
+#!/usr/bin/env bash
+trap 'perl -MPOSIX -e '\''POSIX::setpgrp(0, 0); \$SIG{TERM} = "IGNORE"; sleep 300'\'' & printf "%s\\n" \$! > "$spawned"; exit 0' TERM
+touch "$ready"
+while :; do sleep 1; done
+SH
+  chmod +x "$state/session.check.sh"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_CHECK_INTERVAL=0 FM_CHECK_TIMEOUT=300 \
+    FM_HEARTBEAT=999999 FM_POLL=1 FM_WATCH_CPU_LIMIT=999 "$WATCH_ARM" > "$out" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 100 ]; do
+    watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
+    session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
+    [ -e "$ready" ] && [ -n "$watcher_pid" ] && [ "$session" = "$watcher_pid" ] \
+      && grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$ready" ] || fail "watcher helper did not enter its TERM-trap fixture"
+  [ "$session" = "$watcher_pid" ] || fail "arm-launched watcher did not record an owned process session"
+  kill -HUP "$armpid" 2>/dev/null || fail "could not interrupt owned-session arm"
+  wait "$armpid" 2>/dev/null || true
+  [ -s "$spawned" ] || fail "watcher helper TERM trap did not spawn its cleanup child"
+  child_pid=$(cat "$spawned")
+  ! is_live_non_zombie "$watcher_pid" || fail "owned-session cleanup left the watcher root alive"
+  ! is_live_non_zombie "$child_pid" || fail "owned-session cleanup missed the TERM-trap child"
+  session=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_session_snapshot "$2"' _ "$LIB" "$watcher_pid") \
+    || fail "could not verify the cleaned watcher session"
+  [ -z "$session" ] || fail "owned-session cleanup left live session members: $session"
+  pass "arm cleanup reaps TERM-trap children across watcher process groups"
+}
+
 test_auto_reap_bound_tracks_inner_configuration() {
   local dir state derived base lock_bound expected out status
   dir=$(make_case derived-auto-reap-bound)
@@ -1316,7 +1391,7 @@ test_auto_reap_bound_tracks_inner_configuration() {
 }
 
 test_watcher_config_parser_is_shared_and_nonexecuting() {
-  local dir config out status marker name_marker
+  local dir config out status marker name_marker structural arm_out
   dir=$(make_case watcher-config-parser)
   config="$dir/config"
   marker="$dir/parser-executed"
@@ -1339,6 +1414,21 @@ test_watcher_config_parser_is_shared_and_nonexecuting() {
     _ "$ROOT/bin/fm-watcher-config-lib.sh" "$config" 2>/dev/null || status=$?
   [ "$status" -ne 0 ] || fail "shared watcher config parser accepted an array-subscript variable name"
   [ ! -e "$name_marker" ] || fail "shared watcher config parser executed an array subscript"
+  for structural in FM_ROOT FM_WAKE_QUEUE FM_WAKE_QUEUE_LOCK FM_UNKNOWN_WATCHER_SETTING; do
+    printf '%s=%s\n' "$structural" "$dir/redirected" > "$config/watcher.env"
+    status=0
+    FM_WATCHER_CONFIG_LOADED_PATH= bash -c '. "$1"; fm_watcher_config_load "$2"' \
+      _ "$ROOT/bin/fm-watcher-config-lib.sh" "$config" 2>/dev/null || status=$?
+    [ "$status" -ne 0 ] || fail "shared watcher config parser accepted non-allowlisted $structural"
+  done
+  printf 'FM_ARM_ATTACH_POLL=0\n' > "$config/watcher.env"
+  arm_out="$dir/arm.out"
+  status=0
+  FM_HOME="$dir" "$WATCH_ARM" > "$arm_out" 2>&1 || status=$?
+  [ "$status" -ne 0 ] || fail "arm accepted a zero attach poll cadence"
+  grep -qF 'FM_ARM_ATTACH_POLL must be a positive decimal' "$arm_out" \
+    || fail "arm did not diagnose its invalid attach poll cadence: $(cat "$arm_out")"
+  [ ! -e "$dir/state/.watch.lock" ] || fail "arm entered watcher startup before validating attach cadence"
   pass "watcher config is parsed once without executing shell syntax"
 }
 
@@ -1381,9 +1471,11 @@ if [ "${FM_TEST_FOCUSED:-}" = restart-term-resistant ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = phase-bounds ]; then
+  test_guard_accepts_identity_matched_active_phase
   test_arm_allows_bounded_watcher_phases_past_base_cadence
   test_heartbeat_aggregate_reads_publish_bounded_progress
   test_arm_recovers_direct_no_progress_wedge
+  test_arm_reaps_term_trap_children_from_owned_session
   test_auto_reap_bound_tracks_inner_configuration
   test_watcher_config_parser_is_shared_and_nonexecuting
   exit 0
@@ -1395,6 +1487,7 @@ test_stale_watch_lock_reclaimed
 test_live_stale_watch_lock_is_actionable
 test_guard_warnings
 test_guard_detects_live_watcher_that_missed_cadence
+test_guard_accepts_identity_matched_active_phase
 test_guard_detects_hot_recorded_watcher_tree
 test_lock_single_winner_under_concurrency
 test_lock_steals_dead_pid_lock
@@ -1422,5 +1515,6 @@ test_arm_detects_and_reaps_sustained_watcher_cpu
 test_arm_allows_bounded_watcher_phases_past_base_cadence
 test_heartbeat_aggregate_reads_publish_bounded_progress
 test_arm_recovers_direct_no_progress_wedge
+test_arm_reaps_term_trap_children_from_owned_session
 test_auto_reap_bound_tracks_inner_configuration
 test_watcher_config_parser_is_shared_and_nonexecuting

@@ -69,10 +69,10 @@
 # supervision.
 #
 # --restart: stop ONLY this FM_HOME's watcher (the pid recorded in THIS home's
-# state/.watch.lock) plus descendants proven by numeric parentage, then own a
-# fresh cycle, or report restart-only healthy if a replacement peer wins the
-# race. TERM-resistant owned processes are KILLed after a bound. No process is
-# selected by command text, so another home's watcher cannot be touched. NEVER `pkill -f
+# state/.watch.lock) and its launch-time process session, then own a fresh cycle,
+# or report restart-only healthy if a replacement peer wins the race.
+# TERM-resistant owned processes are KILLed after a bound. No process is selected
+# by command text, so another home's watcher cannot be touched. NEVER `pkill -f
 # bin/fm-watch.sh`: that pattern matches every firstmate home's watcher
 # (secondmate homes run the same script) and would kill siblings. Restart never
 # takes the attach path.
@@ -104,6 +104,8 @@ PROGRESS_GRACE=$FM_WATCH_PROGRESS_GRACE
 CONFIRM_TIMEOUT=${FM_ARM_CONFIRM_TIMEOUT:-10}
 # Poll interval while attached to an existing healthy watcher.
 ATTACH_POLL=${FM_ARM_ATTACH_POLL:-0.5}
+fm_watcher_config_positive_decimal FM_ARM_ATTACH_POLL 0.5 || exit 1
+ATTACH_POLL=$FM_ARM_ATTACH_POLL
 # Resource monitor for the exact recorded watcher tree. A watcher has no
 # legitimate sustained full-core phase, so three five-second samples over this
 # threshold are loud and end an owned cycle instead of burning silently.
@@ -118,14 +120,27 @@ CPU_POLL=$FM_WATCH_CPU_POLL
 CPU_SAMPLES=$FM_WATCH_CPU_SAMPLES
 
 clear_stale_recorded_watcher_lock() {
-  local lock_home lock_path lock_identity
+  local lock_home lock_path lock_identity lock_session session_status=0
   lock_home=$(cat "$WATCH_LOCK/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$WATCH_LOCK/watcher-path" 2>/dev/null || true)
   lock_identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
   [ "$lock_home" = "$FM_HOME" ] || return 0
   [ "$lock_path" = "$WATCH" ] || return 0
   [ -n "$lock_identity" ] || return 0
+  lock_session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
+  if [ -n "$lock_session" ]; then
+    fm_session_has_live_processes "$lock_session" || session_status=$?
+    [ "$session_status" -eq 1 ] || return 1
+  fi
   fm_lock_remove_path "$WATCH_LOCK" || true
+}
+
+stop_recorded_watcher() {  # <root-pid> <root-identity>
+  local root=$1 identity=$2 session
+  session=$(cat "$WATCH_LOCK/process-session" 2>/dev/null || true)
+  [ "$session" = "$root" ] || return 1
+  [ "$(fm_pid_session "$root" 2>/dev/null || true)" = "$session" ] || return 1
+  fm_pid_session_stop "$root" "$session" 30 "$identity"
 }
 
 # A watcher is "healthy" iff the lock names a live process that is genuinely THIS
@@ -280,18 +295,21 @@ case "${1:-}" in
 esac
 
 if [ "$mode" = restart ]; then
-  # Home-scoped stop: only the watcher pid recorded in THIS home's lock and the
-  # descendants proven from that numeric root. TERM-resistant wedges are
-  # escalated to KILL after a bound by fm_pid_tree_stop, which is the supported
-  # alternative to manual pid surgery.
+  # Home-scoped stop: only the watcher pid recorded in THIS home's lock and its
+  # recorded ownership boundary. TERM-resistant wedges are escalated to KILL
+  # after a bound, which is the supported alternative to manual pid surgery.
   lock_pid=$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)
   lock_identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
   if fm_pid_alive "$lock_pid"; then
     if fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$lock_pid" "$FM_HOME"; then
-      if ! fm_pid_tree_stop "$lock_pid" 30 "$lock_identity"; then
+      if ! stop_recorded_watcher "$lock_pid" "$lock_identity"; then
         echo "watcher: FAILED - recorded watcher tree pid=$lock_pid could not be stopped for restart" >&2
         exit 1
       fi
+      clear_stale_recorded_watcher_lock || {
+        echo "watcher: FAILED - recorded watcher ownership boundary remains live after restart cleanup" >&2
+        exit 1
+      }
     else
       clear_stale_recorded_watcher_lock
     fi
@@ -328,17 +346,50 @@ fi
 # wake exit propagates out so the harness re-notifies firstmate.
 child=
 child_out=
-cleanup_child() {
-  if [ -n "$child" ] && fm_pid_alive "$child"; then
-    fm_pid_tree_stop "$child" >/dev/null 2>&1 || true
+child_session_verified=false
+stop_owned_child() {
+  local identity status=0 session_status=0 current_session iteration=0
+  [ -n "$child" ] || return 0
+  while [ "$iteration" -lt 20 ] && fm_pid_alive "$child"; do
+    current_session=$(fm_pid_session "$child" 2>/dev/null || true)
+    if [ "$current_session" = "$child" ]; then
+      child_session_verified=true
+      break
+    fi
+    sleep 0.01
+    iteration=$((iteration + 1))
+  done
+  if "$child_session_verified"; then
+    identity=$(cat "$WATCH_LOCK/pid-identity" 2>/dev/null || true)
+    if [ "$(fm_pid_identity "$child" 2>/dev/null || true)" = "$identity" ]; then
+      fm_pid_session_stop "$child" "$child" 30 "$identity" || status=$?
+    elif fm_pid_alive "$child"; then
+      identity=$(fm_pid_identity "$child" 2>/dev/null || true)
+      fm_pid_session_stop "$child" "$child" 30 "$identity" || status=$?
+    else
+      fm_session_stop_owned "$child" 30 || status=$?
+    fi
+  elif fm_pid_alive "$child"; then
+    kill -TERM "$child" 2>/dev/null || true
   fi
+  wait "$child" 2>/dev/null || true
+  if "$child_session_verified"; then
+    fm_session_has_live_processes "$child" || session_status=$?
+    [ "$session_status" -eq 1 ] || status=1
+  fi
+  clear_stale_recorded_watcher_lock >/dev/null 2>&1 || true
+  return "$status"
+}
+
+cleanup_child() {
+  stop_owned_child >/dev/null 2>&1 || true
   if [ -n "$child_out" ]; then
     rm -f "$child_out" 2>/dev/null || true
   fi
 }
 
 monitor_started_child() {  # <confirmed-watcher-pid>
-  local watched=$1 hot_samples=0 sample_in=0 age reason rc
+  local watched=$1 hot_samples=0 sample_in=0 age reason rc session_status=0
   while fm_pid_alive "$watched" \
     && fm_watcher_lock_matches_pid "$STATE" "$WATCH" "$watched" "$FM_HOME"; do
     age=$(fm_path_age "$BEAT")
@@ -346,8 +397,9 @@ monitor_started_child() {  # <confirmed-watcher-pid>
       reason="stale: watcher pid $watched stopped making supervision progress; beacon age ${age}s reached cadence limit ${PROGRESS_GRACE}s"
       queue_watcher_failure "$reason"
       echo "watcher: FAILED - $reason; recovering the owned watcher tree"
-      fm_pid_tree_stop "$watched" >/dev/null 2>&1 || true
-      wait "$watched" 2>/dev/null || true
+      if ! stop_owned_child; then
+        echo "watcher: FAILED - owned watcher process session could not be fully reaped"
+      fi
       print_watch_output "$child_out"
       rm -f "$child_out" 2>/dev/null || true
       child=
@@ -362,8 +414,9 @@ monitor_started_child() {  # <confirmed-watcher-pid>
           reason=$(resource_reason "$watched")
           queue_watcher_failure "$reason"
           echo "watcher: FAILED - $reason; recovering the owned watcher tree"
-          fm_pid_tree_stop "$watched" >/dev/null 2>&1 || true
-          wait "$watched" 2>/dev/null || true
+          if ! stop_owned_child; then
+            echo "watcher: FAILED - owned watcher process session could not be fully reaped"
+          fi
           print_watch_output "$child_out"
           rm -f "$child_out" 2>/dev/null || true
           child=
@@ -379,6 +432,21 @@ monitor_started_child() {  # <confirmed-watcher-pid>
   done
   wait "$watched"
   rc=$?
+  if "$child_session_verified"; then
+    fm_session_has_live_processes "$watched" || session_status=$?
+  fi
+  if "$child_session_verified" && [ "$session_status" -ne 1 ]; then
+    reason="stale: watcher pid $watched exited before its owned process session was verified empty"
+    queue_watcher_failure "$reason"
+    echo "watcher: FAILED - $reason; recovering the owned watcher process session"
+    session_status=0
+    fm_session_stop_owned "$watched" 10 || session_status=$?
+    if [ "$session_status" -ne 0 ]; then
+      echo "watcher: FAILED - owned watcher process session could not be fully reaped"
+    fi
+    rc=1
+  fi
+  clear_stale_recorded_watcher_lock >/dev/null 2>&1 || true
   print_watch_output "$child_out"
   rm -f "$child_out" 2>/dev/null || true
   child=
@@ -392,7 +460,12 @@ child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   echo "watcher: FAILED - no live watcher with a fresh beacon"
   exit 1
 }
-"$WATCH" >"$child_out" 2>&1 &
+FM_WATCHER_OWN_SESSION=1 perl -MPOSIX -e '
+  my $session = POSIX::setsid();
+  exit 126 if !defined $session || $session != $$;
+  exec @ARGV;
+  exit 127;
+' "$WATCH" >"$child_out" 2>&1 &
 child=$!
 child_done=0
 
@@ -403,6 +476,12 @@ deadline=$(( $(date +%s) + CONFIRM_TIMEOUT ))
 while :; do
   if healthy_watcher; then
     if [ "$HEALTHY_PID" = "$child" ]; then
+      if ! fm_watcher_lock_session_matches_pid "$STATE" "$child"; then
+        echo "watcher: FAILED - started watcher did not establish its owned process session"
+        cleanup_child
+        exit 1
+      fi
+      child_session_verified=true
       echo "watcher: started pid=$child (beacon fresh)"
       monitor_started_child "$child"
       rc=$?

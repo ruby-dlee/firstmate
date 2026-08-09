@@ -45,6 +45,124 @@ fm_pid_identity() {
   printf '%s\n' "$out" | sed 's/^[[:space:]]*//'
 }
 
+fm_pid_session() {  # <pid>
+  local pid=$1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  python3 -c '
+import ctypes
+import sys
+
+pid = int(sys.argv[1])
+libc = ctypes.CDLL(None, use_errno=True)
+session = libc.getsid(pid)
+if session < 0:
+    raise SystemExit(1)
+print(session)
+' "$pid"
+}
+
+fm_session_snapshot() {  # <session-id>
+  local session=$1
+  case "$session" in ''|*[!0-9]*) return 1 ;; esac
+  python3 -c '
+import ctypes
+import subprocess
+import sys
+
+session = int(sys.argv[1])
+libc = ctypes.CDLL(None, use_errno=True)
+result = subprocess.run(
+    ["ps", "-axo", "pid=,state="],
+    check=True,
+    stdout=subprocess.PIPE,
+    universal_newlines=True,
+)
+for line in result.stdout.splitlines():
+    fields = line.split()
+    if len(fields) != 2 or not fields[0].isdigit() or "Z" in fields[1]:
+        continue
+    pid = int(fields[0])
+    if libc.getsid(pid) == session:
+        print(pid)
+' "$session"
+}
+
+fm_session_has_live_processes() {  # <session-id>
+  local members
+  members=$(fm_session_snapshot "$1") || return 2
+  [ -n "$members" ]
+}
+
+fm_session_signal_members() {  # <signal> <session-id>
+  local signal=$1 session=$2 pid identity index snapshot
+  local pids=() identities=()
+  snapshot=$(fm_session_snapshot "$session") || return 1
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    identity=$(fm_pid_identity "$pid") || continue
+    pids+=("$pid")
+    identities+=("$identity")
+  done <<< "$snapshot"
+  for index in "${!pids[@]}"; do
+    pid=${pids[$index]}
+    [ "$(fm_pid_identity "$pid" 2>/dev/null || true)" = "${identities[$index]}" ] || continue
+    [ "$(fm_pid_session "$pid" 2>/dev/null || true)" = "$session" ] || continue
+    kill "-$signal" "$pid" 2>/dev/null || true
+  done
+}
+
+fm_session_stop_owned() {  # <session-id> [term-wait-tenths]
+  local session=$1 wait_tenths=${2:-30} iteration status
+  fm_session_signal_members TERM "$session" || return 1
+  iteration=0
+  while [ "$iteration" -lt "$wait_tenths" ]; do
+    status=0
+    fm_session_has_live_processes "$session" || status=$?
+    [ "$status" -eq 0 ] || { [ "$status" -eq 1 ] && return 0; return 1; }
+    sleep 0.1
+    iteration=$((iteration + 1))
+  done
+  iteration=0
+  while [ "$iteration" -lt 20 ]; do
+    fm_session_signal_members KILL "$session" || return 1
+    sleep 0.1
+    status=0
+    fm_session_has_live_processes "$session" || status=$?
+    [ "$status" -eq 0 ] || { [ "$status" -eq 1 ] && return 0; return 1; }
+    iteration=$((iteration + 1))
+  done
+  return 1
+}
+
+fm_pid_session_stop() {  # <root-pid> <session-id> [term-wait-tenths] [expected-root-identity]
+  local root=$1 session=$2 wait_tenths=${3:-30} expected_identity=${4:-} current_identity
+  [ "$session" = "$root" ] || return 1
+  current_identity=$(fm_pid_identity "$root") || return 1
+  [ -z "$expected_identity" ] || [ "$current_identity" = "$expected_identity" ] || return 1
+  [ "$(fm_pid_session "$root" 2>/dev/null || true)" = "$session" ] || return 1
+  fm_session_stop_owned "$session" "$wait_tenths"
+}
+
+fm_watcher_lock_session_matches_pid() {  # <state> <watcher-pid>
+  local state=$1 pid=$2 session
+  session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
+  [ "$session" = "$pid" ] || return 1
+  [ "$(fm_pid_session "$pid" 2>/dev/null || true)" = "$session" ]
+}
+
+fm_watcher_session_guard_release() {  # <lockdir> <watcher-pid>
+  local lockdir=$1 pid=$2 session member snapshot
+  session=$(cat "$lockdir/process-session" 2>/dev/null || true)
+  [ "$session" = "$pid" ] || return 1
+  [ "$(fm_pid_session "$pid" 2>/dev/null || true)" = "$session" ] || return 1
+  snapshot=$(fm_session_snapshot "$session") || return 1
+  while IFS= read -r member; do
+    [ -z "$member" ] || [ "$member" = "$pid" ] || return 1
+  done <<< "$snapshot"
+  [ "$(cat "$lockdir/process-session" 2>/dev/null || true)" = "$session" ] || return 1
+  rm -f "$lockdir/process-session"
+}
+
 fm_path_mtime() {
   if [ "$(uname)" = Darwin ]; then
     stat -f %m "$1" 2>/dev/null
@@ -288,6 +406,7 @@ fm_lock_clean_known_files() {
     "$confined/fm-home" \
     "$confined/pid-identity" \
     "$confined/process-group" \
+    "$confined/process-session" \
     "$confined/watcher-path" \
     2>/dev/null || true
 }
@@ -494,6 +613,42 @@ fm_lock_process_group_guarded() {
   return 1
 }
 
+fm_lock_process_session_guarded() {
+  local lockdir=$1 ownerdir guard session members
+  if [ -L "$lockdir" ]; then
+    ownerdir=$(fm_lock_link_owner "$lockdir" 2>/dev/null) || return 1
+  elif [ -d "$lockdir" ]; then
+    ownerdir=$lockdir
+  else
+    return 1
+  fi
+  guard="$ownerdir/process-session"
+  [ -e "$guard" ] || [ -L "$guard" ] || return 1
+  [ -f "$guard" ] && [ ! -L "$guard" ] || {
+    FM_LOCK_HELD_PID=unknown
+    return 0
+  }
+  session=$(cat "$guard" 2>/dev/null || true)
+  case "$session" in
+    ''|*[!0-9]*)
+      FM_LOCK_HELD_PID=unknown
+      return 0
+      ;;
+  esac
+  FM_LOCK_HELD_PID=$session
+  members=$(fm_session_snapshot "$session") || return 0
+  [ -z "$members" ] || return 0
+  if [ -L "$lockdir" ]; then
+    fm_lock_points_to_owner "$lockdir" "$ownerdir" || return 0
+  elif [ "$ownerdir" != "$lockdir" ]; then
+    return 0
+  fi
+  [ "$(cat "$guard" 2>/dev/null || true)" = "$session" ] || return 0
+  rm -f "$guard" 2>/dev/null || return 0
+  FM_LOCK_HELD_PID=
+  return 1
+}
+
 fm_lock_recheck_stale_owner() {
   local lockdir=$1 expected_owner=$2 expected_pid=$3 actual_pid
   if [ -n "$expected_owner" ]; then
@@ -521,7 +676,7 @@ fm_lock_try_acquire() {
     return 0
   fi
 
-  if fm_lock_process_group_guarded "$lockdir"; then
+  if fm_lock_process_session_guarded "$lockdir" || fm_lock_process_group_guarded "$lockdir"; then
     return 1
   fi
 
@@ -611,6 +766,7 @@ fm_lock_release() {
     ownerdir=$(fm_lock_link_owner "$lockdir" 2>/dev/null || true)
     [ -n "$ownerdir" ] || return 0
     { [ ! -e "$ownerdir/process-group" ] && [ ! -L "$ownerdir/process-group" ]; } || return 0
+    { [ ! -e "$ownerdir/process-session" ] && [ ! -L "$ownerdir/process-session" ]; } || return 0
     pid=$(cat "$ownerdir/pid" 2>/dev/null || true)
     [ "$pid" = "$current" ] || return 0
     fm_lock_points_to_owner "$lockdir" "$ownerdir" || return 0
@@ -619,6 +775,7 @@ fm_lock_release() {
     return 0
   fi
   { [ ! -e "$lockdir/process-group" ] && [ ! -L "$lockdir/process-group" ]; } || return 0
+  { [ ! -e "$lockdir/process-session" ] && [ ! -L "$lockdir/process-session" ]; } || return 0
   pid=$(cat "$lockdir/pid" 2>/dev/null || true)
   [ "$pid" = "$current" ] || return 0
   fm_lock_clean_known_files "$lockdir" "$lockdir" || return 0

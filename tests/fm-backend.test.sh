@@ -750,7 +750,7 @@ test_managed_tmux_target_identity_checks_recorded_session() {
   ! grep -Eq '^(capture-pane|send-keys) ' "$log" \
     || fail "session-mismatched managed tmux activity reached the reused or name-based target"
 
-  fake_session=recorded-session
+  fake_session='recorded-session'
   fm_backend_target_exists tmux @77 fm-intended-task recorded-session:fm-intended-task \
     || fail "the recorded tmux session identity did not pass existence validation"
   fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-intended-task >/dev/null \

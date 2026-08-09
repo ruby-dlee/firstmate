@@ -821,6 +821,7 @@ fm_account_lock_identity_value() {  # <name> <task>
 fm_account_lock_key() {  # <name> <task>
   local identity digest
   identity=$(fm_account_lock_identity_value "$1" "$2") || return 1
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   digest=$(printf '%s' "$identity" | fm_account_system_perl -MDigest::SHA=sha256_hex -e \
     'local $/; my $value = <STDIN>; exit 1 if !defined($value); print sha256_hex($value)') || return 1
   [ "${#digest}" -eq 64 ] || return 1
@@ -844,6 +845,7 @@ fm_account_lock_legacy_path() {  # <state-dir> <task> <name>
 }
 
 fm_account_lock_safe_file_equals() {
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   fm_account_system_perl -MFcntl=:mode -e '
     my ($path, $expected) = @ARGV;
     my @before = lstat($path);
@@ -882,6 +884,7 @@ fm_account_lock_identity_validate() {  # <bounded-lock-path>
   leaf=${lock##*/}
   key=${leaf#"$FM_ACCOUNT_LOCK_PATH_PREFIX"}
   owner="$state/$FM_ACCOUNT_LOCK_IDENTITY_PREFIX$key"
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   identity=$(fm_account_system_perl -MFcntl=:mode -MDigest::SHA=sha256_hex -e '
     my ($path, $key) = @ARGV;
     my @before = lstat($path);
@@ -1057,6 +1060,7 @@ fm_account_lock_safe_owner_read() {  # <lock-path>
   FM_ACCOUNT_LOCK_SAFE_OWNER_START=
   FM_ACCOUNT_LOCK_SAFE_CARRIER_IDENTITY=
   FM_ACCOUNT_LOCK_SAFE_OWNER_IDENTITY=
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   identity=$(fm_account_system_perl -MFcntl=:mode -e '
     my ($lock) = @ARGV;
     my @carrier = lstat($lock);
@@ -1132,8 +1136,10 @@ fm_account_lock_reclaim_owner_classify() {  # <lock-path>
 fm_account_lock_identity_matches_pinned() {  # <lock> <claim> <value> <fs-identity> <inode> <pin>
   local lock=$1 claim=$2 value=$3 fs_identity=$4 inode=$5 pin=$6
   if [ -z "$claim" ]; then
-    ! fm_account_lock_is_bounded "$lock"
-    return
+    if fm_account_lock_is_bounded "$lock"; then
+      return 1
+    fi
+    return 0
   fi
   fm_account_lock_identity_validate "$lock" || return 1
   [ "$FM_ACCOUNT_LOCK_IDENTITY_FILE" = "$claim" ] \
@@ -1217,11 +1223,11 @@ fm_account_lock_exact_reclaim_under_identity_mutation() {  # <lock-path> <mutati
       fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
       return 1
     }
-    [ "$pinned_identity_inode" = "$identity_inode" ] \
-      && fm_account_lock_safe_file_equals "$generation/identity" "$identity_value" || {
+    if [ "$pinned_identity_inode" != "$identity_inode" ] \
+      || ! fm_account_lock_safe_file_equals "$generation/identity" "$identity_value"; then
         fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
         return 1
-      }
+    fi
   fi
   key=$(fm_account_lock_artifact_key "$lock") || {
     fm_account_system_exec "$FM_ACCOUNT_SYSTEM_RM_BIN" -rf "$generation"
@@ -2546,13 +2552,13 @@ fm_account_profile_home() {  # <provider> <profile>
   fm_account_validate_contract "$binary" || return 1
   json=$(fm_account_run_control "$binary" --format json profile list) || return 1
   home=$(printf '%s\n' "$json" | fm_account_system_exec "$FM_ACCOUNT_SYSTEM_JQ_BIN" -er \
-    --arg provider "$provider" --arg profile "$profile" '
+    --arg provider "$provider" --arg profile "$profile" "
       [.profiles[]
-        | select(.provider == $provider and .id == $profile)
+        | select(.provider == \$provider and .id == \$profile)
         | .home
-        | select(type == "string" and startswith("/"))]
-      | if length == 1 then .[0] else error("profile home is not unique") end
-    ' 2>/dev/null) || return 1
+        | select(type == \"string\" and startswith(\"/\"))]
+      | if length == 1 then .[0] else error(\"profile home is not unique\") end
+    " 2>/dev/null) || return 1
   [ -d "$home" ] && [ ! -L "$home" ] || return 1
   physical=$(cd "$home" 2>/dev/null && pwd -P) || return 1
   [ "$physical" = "$home" ] || return 1

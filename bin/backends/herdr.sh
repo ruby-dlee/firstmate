@@ -3323,6 +3323,7 @@ fm_backend_herdr_event_reader_cmd() {
 
 fm_backend_herdr_safe_meta_load() {
   local meta=$1 snapshot
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   snapshot=$(fm_backend_herdr_control_exec perl -MDigest::SHA=sha256_hex -MFcntl=:mode -e '
     my ($path) = @ARGV;
     my @before = lstat($path);
@@ -3358,7 +3359,7 @@ fm_backend_herdr_safe_meta_load() {
 }
 
 fm_backend_herdr_binding_for_window() {
-  local state=$1 window=$2 allow_legacy=${3:-} meta task owner= generation= identity= count=0
+  local state=$1 window=$2 allow_legacy=${3:-} meta task owner='' generation='' identity='' count=0
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || [ -L "$meta" ] || continue
@@ -3398,7 +3399,7 @@ fm_backend_herdr_binding_matches() {
 }
 
 fm_backend_herdr_legacy_task_for_key() {
-  local state=$1 legacy=$2 meta task owner= count=0
+  local state=$1 legacy=$2 meta task owner='' count=0
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || [ -L "$meta" ] || continue
@@ -3446,7 +3447,7 @@ fm_backend_herdr_meta_identity_inode() {
   device=${identity%%:*}
   rest=${identity#*:}
   inode=${rest%%:*}
-  case "$device:$inode" in ''|*[!0-9:]*) return 1 ;; esac
+  case "$device:$inode" in *[!0-9:]*) return 1 ;; esac
   [ -n "$device" ] && [ -n "$inode" ] || return 1
   printf '%s:%s' "$device" "$inode"
 }

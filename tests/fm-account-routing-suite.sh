@@ -5507,7 +5507,7 @@ EOF
       assert_absent "$held" "maximum lifecycle inherited handoff did not release child custody"
     fi
   done
-  legacy_task=legacy-handoff-task
+  legacy_task='legacy-handoff-task'
   legacy=$(fm_account_lock_legacy_path "$state" "$legacy_task" account-lifecycle) \
     || fail "legacy lifecycle handoff fixture lost its raw path"
   start=$(fm_account_process_start_time "$$") || fail "legacy lifecycle handoff fixture could not read parent identity"
@@ -5568,8 +5568,10 @@ test_account_lock_deadline_bounds_nested_custody() {
   after=$(fm_account_system_perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
     -e 'printf "%.6f", clock_gettime(CLOCK_MONOTONIC)') \
     || fail "account lock creation deadline fixture could not read its monotonic end"
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   elapsed=$(fm_account_system_perl -e 'printf "%.3f", $ARGV[1] - $ARGV[0]' "$before" "$after") \
     || fail "account lock creation deadline fixture could not calculate monotonic elapsed time"
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   fm_account_system_perl -e 'exit !($ARGV[0] < 4)' "$elapsed" \
     || fail "uncontended account lock creation exceeded its elapsed bound: ${elapsed}s"
   fm_account_meta_lock_release "$held" || fail "account lock creation deadline fixture could not release custody"
@@ -5614,6 +5616,7 @@ test_account_lock_deadline_bounds_nested_custody() {
     -e 'printf "%.6f", clock_gettime(CLOCK_MONOTONIC)') \
     || fail "cross-phase deadline fixture could not read its monotonic end"
   if wait "$mutation_pid"; then :; else fail "cross-phase deadline fixture could not release mutation custody"; fi
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   elapsed=$(fm_account_system_perl -e 'printf "%.3f", $ARGV[1] - $ARGV[0]' "$before" "$after") \
     || fail "cross-phase deadline fixture could not calculate monotonic elapsed time"
   [ "$status" -ne 0 ] || fail "cross-phase deadline fixture bypassed a live bounded owner"
@@ -5622,6 +5625,7 @@ test_account_lock_deadline_bounds_nested_custody() {
   [ "$FM_ACCOUNT_LOCK_IDENTITY_NAME" = account-lifecycle ] \
     && [ "$FM_ACCOUNT_LOCK_IDENTITY_TASK" = "$sequence_task" ] \
     || fail "cross-phase deadline fixture published the wrong exact claim"
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   fm_account_system_perl -e 'exit !(($ARGV[0] >= 7.5) && ($ARGV[0] < 17))' "$elapsed" \
     || fail "claim waiting reset the remaining carrier deadline: ${elapsed}s"
   [ ! -e "$sequence_mutation" ] && [ ! -L "$sequence_mutation" ] \
@@ -5763,7 +5767,7 @@ test_bounded_account_lock_reclaim_requires_exact_dead_owner() {
   . "$ROOT/bin/fm-account-routing-lib.sh"
   case_dir="$TMP_ROOT/bounded-account-lock-reclaim"
   state="$case_dir/state"
-  task=bounded-reclaim-task
+  task='bounded-reclaim-task'
   mkdir -p "$state"
   lock=$(fm_account_lock_identity_claim "$state" "$task" account-meta) \
     || fail "bounded reclaim fixture could not resolve its exact lock"

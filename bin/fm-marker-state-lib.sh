@@ -17,6 +17,7 @@ _fm_marker_system_exec() {
 fm_marker_identity_key_with_executor() {
   local identity=$1 executor=$2 digest
   case "$identity" in ''|*$'\n'*) return 1 ;; esac
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   digest=$(LC_ALL=C printf '%s' "$identity" | "$executor" perl -MDigest::SHA=sha256_hex -e 'local $/; my $value = <STDIN>; exit 1 if !defined($value); print sha256_hex($value)') || return 1
   [ "${#digest}" -eq 64 ] || return 1
   case "$digest" in *[!0-9a-f]*) return 1 ;; esac
@@ -54,6 +55,7 @@ fm_marker_task_from_legacy_key() {
   case "$key" in v2-*) hex=${key#v2-} ;; *) return 1 ;; esac
   case "$hex" in ''|*[!0-9a-f]*) return 1 ;; esac
   [ $(( ${#hex} % 2 )) -eq 0 ] || return 1
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   task=$(printf '%s' "$hex" | _fm_marker_system_exec perl -e '
     my $hex = <STDIN>;
     exit 1 if !defined($hex) || $hex !~ /\A[0-9a-f]+\z/ || length($hex) % 2;
@@ -91,6 +93,7 @@ fm_marker_owner_path() {
 }
 
 fm_marker_safe_regular_file() {
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   _fm_marker_system_exec perl -MFcntl=:mode -e '
     my ($path) = @ARGV;
     my @before = lstat($path);
@@ -102,6 +105,7 @@ fm_marker_safe_regular_file() {
 }
 
 fm_marker_safe_file_read() {
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   _fm_marker_system_exec perl -MFcntl=:mode -e '
     my ($path) = @ARGV;
     my @before = lstat($path);
@@ -175,6 +179,7 @@ fm_marker_state_path_safe_or_absent() {
 }
 
 fm_marker_rename_exact() {
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
   _fm_marker_system_exec perl -e 'exit(rename($ARGV[0], $ARGV[1]) ? 0 : 1)' "$1" "$2"
 }
 
@@ -204,7 +209,7 @@ fm_marker_atomic_write() {
 }
 
 fm_marker_legacy_owner() {
-  local state=$1 key=$2 meta task owner= count=0
+  local state=$1 key=$2 meta task owner='' count=0
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
   for meta in "$state"/*.meta; do
     [ -e "$meta" ] || continue
@@ -234,7 +239,7 @@ fm_marker_task_for_key() {
 }
 
 fm_marker_legacy_window_owner() {
-  local state=$1 key=$2 meta task target owner= count=0
+  local state=$1 key=$2 meta task target owner='' count=0
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
   type fm_backend_target_of_meta >/dev/null 2>&1 || return 1
   for meta in "$state"/*.meta; do
@@ -260,7 +265,7 @@ fm_marker_signal_legacy_key() {
 }
 
 fm_marker_signal_legacy_owner() {
-  local state=$1 key=$2 kind=$3 meta task owner= count=0
+  local state=$1 key=$2 kind=$3 meta task owner='' count=0
   case "$kind" in status|turn-ended) ;; *) return 1 ;; esac
   [ -d "$state" ] && [ ! -L "$state" ] || return 1
   for meta in "$state"/*.meta; do

@@ -1111,7 +1111,6 @@ handle_push_transition() {  # <backend> <session> <record>
     fm_account_meta_lock_release "$meta_lock" >/dev/null 2>&1 || true
     fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
     wake "$reason"
-    return 1
   }
   mark_surfaced "$STATE/$task.status"
   fm_account_meta_lock_release "$meta_lock" || exit 1

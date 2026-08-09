@@ -122,8 +122,8 @@ fm_pr_require_server_admission_rule "$OWNER" "$REPO" "$PR_BASE_REF" "$TMP_DIR/po
 }
 
 snapshot_checks() {
-  local prefix=$1 check_page=1 check_total= check_enumerated=0 page_total check_page_count check_unique
-  local check_id check_doc check_name check_app check_status conclusion status_page=1 status_total= status_enumerated=0
+  local prefix=$1 check_page=1 check_total='' check_enumerated=0 page_total check_page_count check_unique
+  local check_id check_doc check_name check_app check_status conclusion status_page=1 status_total='' status_enumerated=0
   local STATUS_DOC status_page_count status_unique status_id status_context status_state
   local passed=0 failed=0 skipped=0 pending=0 total
   : > "$prefix-check-ids"
@@ -339,12 +339,12 @@ git -C "$WORKTREE" status --porcelain=v1 --untracked-files=all > "$TMP_DIR/final
 }
 snapshot_checks "$TMP_DIR/final" || exit 1
 snapshot_reviews "$TMP_DIR/final" "$TMP_DIR/policy-final" || exit 1
-cmp -s "$TMP_DIR/initial-check-runs" "$TMP_DIR/final-check-runs" \
-  && cmp -s "$TMP_DIR/initial-statuses" "$TMP_DIR/final-statuses" \
-  && cmp -s "$TMP_DIR/initial-reviews" "$TMP_DIR/final-reviews" || {
+if ! cmp -s "$TMP_DIR/initial-check-runs" "$TMP_DIR/final-check-runs" \
+  || ! cmp -s "$TMP_DIR/initial-statuses" "$TMP_DIR/final-statuses" \
+  || ! cmp -s "$TMP_DIR/initial-reviews" "$TMP_DIR/final-reviews"; then
     echo "error: exact-head check or review evidence changed during admission" >&2
     exit 1
-  }
+fi
 require_protected_checks "$TMP_DIR/policy-final" "$TMP_DIR/final-check-runs" "$TMP_DIR/final-statuses" || exit 1
 read_pr || { echo "error: PR moved after server policy verification" >&2; exit 1; }
 [ "$PR_HEAD" = "$FIRST_HEAD" ] && [ "$PR_BASE" = "$FIRST_BASE" ] \

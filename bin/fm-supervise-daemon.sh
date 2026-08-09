@@ -501,7 +501,7 @@ marker_record_owned() {
 marker_refresh_owned() {
   local state=$1 task=$2 kind=$3 marker=$4 lock key owner result=0
   lock=$(fm_account_lifecycle_lock_acquire "$state" "$task") || return 1
-  key=${marker##*.subsuper-$kind-}
+  key=${marker##*.subsuper-"$kind"-}
   owner=$(fm_marker_task_for_key "$state" "$key" 2>/dev/null || true)
   if [ ! -e "$marker" ]; then
     result=0

@@ -801,6 +801,8 @@ elif scenario in {
     "vitest-real-ambient-node-options",
     "vitest-real-primitive-forgery",
     "vitest-real-native-env-semantics",
+    "vitest-real-hook-body-replacement",
+    "vitest-real-fork-identity",
     "vitest-real-class-plugin-failure",
     "vitest-no-match",
     "vitest-startup",
@@ -840,6 +842,8 @@ elif scenario in {
         "vitest-real-ambient-node-options",
         "vitest-real-primitive-forgery",
         "vitest-real-native-env-semantics",
+        "vitest-real-hook-body-replacement",
+        "vitest-real-fork-identity",
         "vitest-real-class-plugin-failure",
         "vitest-no-match",
         "vitest-startup",
@@ -942,6 +946,8 @@ elif scenario in {
         "vitest-real-ambient-node-options": "tests/ambient-node-options.test.mjs::selected body",
         "vitest-real-primitive-forgery": "tests/primitive-forgery.test.mjs::selected body",
         "vitest-real-native-env-semantics": "tests/native-env-semantics.test.mjs::selected body",
+        "vitest-real-hook-body-replacement": "tests/hook-body-replacement.test.mjs::selected body",
+        "vitest-real-fork-identity": "tests/fork-identity.test.mjs::selected body",
         "vitest-real-class-plugin-failure": "tests/class-plugin.test.mjs::selected body",
         "vitest-no-match": "tests/regression.test.sh::does not exist",
         "vitest-startup": "tests/regression.test.sh::across chats resets state",
@@ -3873,6 +3879,101 @@ assert proof["mutated_exit"] == 1
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" \
     || fail "Vitest did not preserve native process.env coercion"
 
+  record=$(make_case vitest-real-hook-body-replacement)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/tests/hook-body-replacement.test.mjs" <<'JS'
+import { beforeEach, expect, test } from 'vitest';
+import { getCurrentTest, setFn } from '@vitest/runner';
+import { readFileSync } from 'node:fs';
+
+beforeEach(() => {
+  if (readFileSync('app.txt', 'utf8').trim() === 'fixed') return;
+  setFn(getCurrentTest(), () => {
+    throw new Error('project replaced the selected Vitest body');
+  });
+});
+
+test('selected body', () => {
+  expect(readFileSync('app.txt', 'utf8').trim()).toBe('fixed');
+});
+JS
+  git -C "$case_dir/repo" add tests/hook-body-replacement.test.mjs
+  git -C "$case_dir/repo" commit -qm 'add Vitest hook body replacement'
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_open_ledger "$case_dir" "$head"
+  ln -s "$runtime/node_modules/.bin/vitest" "$case_dir/pathbin/vitest"
+  set +e
+  run_case "$case_dir" "$base" "$head" vitest-real-hook-body-replacement run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "Vitest hook body replacement"
+  assert_grep 'NON-EXECUTION' "$case_dir/err" \
+    "a hook-replaced Vitest body produced accepted execution evidence"
+  assert_grep 'no selected test body starting' "$case_dir/err" \
+    "the Vitest body identity check did not fail closed"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "a hook-replaced Vitest body cleared the finding"
+
+  record=$(make_case vitest-real-fork-identity)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/tests/fork-identity.test.mjs" <<'JS'
+import { expect, test } from 'vitest';
+import { readFileSync } from 'node:fs';
+
+const gateChangedFork = __CROSSCHECK_CHANGED_FORK__;
+
+test('selected body', () => {
+  if (!gateChangedFork) {
+    throw new Error('native Vitest baseline rejects this mutation proof');
+  }
+  expect(readFileSync('app.txt', 'utf8').trim()).toBe('fixed');
+});
+JS
+  cat > "$case_dir/repo/vitest.config.mjs" <<'JS'
+import * as childProcess from 'node:child_process';
+import { fork } from 'node:child_process';
+
+const gateChangedFork = fork.name !== 'fork' || childProcess.fork !== fork;
+
+export default {
+  plugins: [{
+    name: 'fork-identity-semantics',
+    transform(code, id) {
+      if (!id.split('?')[0].endsWith('/tests/fork-identity.test.mjs')) {
+        return null;
+      }
+      return code.replace('__CROSSCHECK_CHANGED_FORK__', String(gateChangedFork));
+    },
+  }],
+};
+JS
+  git -C "$case_dir/repo" add tests/fork-identity.test.mjs vitest.config.mjs
+  git -C "$case_dir/repo" commit -qm 'add native Vitest fork identity semantics'
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_open_ledger "$case_dir" "$head"
+  ln -s "$runtime/node_modules/.bin/vitest" "$case_dir/pathbin/vitest"
+  set +e
+  run_case "$case_dir" "$base" "$head" vitest-real-fork-identity run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "native Vitest fork identity"
+  assert_grep 'named test does not pass before mutation' "$case_dir/err" \
+    "the gate exposed a replacement child_process.fork to project code"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "gate-only fork semantics cleared the finding"
+
   record=$(make_case vitest-real-class-plugin-failure)
   IFS=$'\t' read -r case_dir base head <<< "$record"
   cat > "$case_dir/repo/tests/class-plugin.test.mjs" <<'JS'
@@ -5541,7 +5642,7 @@ test_javascript_runner_policy_is_declared_once() {
     "$case_dir/runtime/node_modules/jest-runner/build" \
     "$case_dir/runtime/node_modules/jest-circus/build" \
     "$case_dir/runtime/node_modules/jest-runtime/build" \
-    "$case_dir/runtime/node_modules/vitest/dist"
+    "$case_dir/runtime/node_modules/vitest/dist/chunks"
   for path in \
     jest-environment-node/build/index.js \
     jest-runner/build/index.js \
@@ -5564,6 +5665,14 @@ test_javascript_runner_policy_is_declared_once() {
   printf '#!/bin/bash\nexit 0\n' > "$case_dir/runtime/node_modules/jest/bin/jest.js"
   printf '#!/bin/bash\nexit 0\n' > "$case_dir/runtime/node_modules/vitest/vitest.mjs"
   : > "$case_dir/runtime/node_modules/vitest/dist/index.js"
+  cat > "$case_dir/runtime/node_modules/vitest/dist/chunks/cli-api.Cjt90eJu.js" <<'JS'
+import { fork } from 'node:child_process';
+class ForksPoolWorker {
+  start() {
+    return fork(this.entrypoint, [], {});
+  }
+}
+JS
   printf '{"name":"vitest","version":"4.1.5"}\n' \
     > "$case_dir/runtime/node_modules/vitest/package.json"
   chmod +x "$case_dir/runtime/node_modules/jest/bin/jest.js" \
@@ -5574,6 +5683,7 @@ test_javascript_runner_policy_is_declared_once() {
   PATH="$case_dir/bin:$PATH" "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$case_dir" <<'PY' \
     || fail "JavaScript mutation-runner policy was not a complete declaration"
 import importlib.util
+import hashlib
 import json
 import subprocess
 import sys
@@ -5587,6 +5697,20 @@ spec.loader.exec_module(module)
 
 case = Path(sys.argv[2])
 checkout = case / "mono"
+declared_vitest_digests = dict(
+    module.MUTATION_RUNNER_POLICIES["vitest"].source_digests
+)
+assert declared_vitest_digests["forkLauncher"] == (
+    "d991d80584acd5fc622aefce5f907feff6c531059165a05d75c66e3ed8697d79"
+)
+fake_launcher = (
+    case
+    / "runtime/node_modules/vitest/dist/chunks/cli-api.Cjt90eJu.js"
+)
+module.MUTATION_RUNNER_POLICIES["vitest"].source_digests = ((
+    "forkLauncher",
+    hashlib.sha256(fake_launcher.read_bytes()).hexdigest(),
+),)
 path = "apps/web/tests/regression.test.tsx::(within a chat|across chats)"
 expected = {
     "jest": (["--json", "--runInBand", "--runTestsByPath"], "required-zero", None, True, "29.7.0"),
@@ -5637,11 +5761,19 @@ for runner in ("jest", "vitest"):
         launch_preload = probe_argument.with_name("vitest-launch-preload.cjs")
         assert launch_preload.is_file()
         launch_source = launch_preload.read_text()
-        assert "checkedFork" in launch_source
-        assert "expectedWorkerPath" in launch_source
-        assert "if (!isWorker)" in launch_source
+        loader_source = probe_argument.with_name("vitest-launch-loader.mjs").read_text()
+        child_process_source = probe_argument.with_name("vitest-child-process.mjs").read_text()
+        assert "register(loaderUrl)" in launch_source
+        assert "childProcess.fork" not in launch_source
+        assert "syncBuiltinESMExports" not in launch_source
+        assert fake_launcher.as_uri() in loader_source
+        assert "context.parentURL === launcherUrl" in loader_source
+        assert "export function fork" in child_process_source
+        assert "expectedWorkerPath" in child_process_source
         assert "Object.freeze(CrosscheckBodyRunner.prototype)" in runner_source
         assert "writeEvent('PRELOAD')" in runner_source
+        assert "async onBeforeRunTask(test)" in runner_source
+        assert "getRegisteredBody(test) !== body" in runner_source
         assert "VitestTestRunner" not in runner_source, runner_source
         assert dict(run.environment) == {
             "NODE_OPTIONS": f"--require={launch_preload}",
@@ -6060,6 +6192,12 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_javascript_runner_policy_is_declared_once
   test_real_jest_certifies_platform_shaped_mutation_proof
+  test_real_vitest_body_probe_certifies_mutation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-11 ]; then
+  test_javascript_runner_policy_is_declared_once
   test_real_vitest_body_probe_certifies_mutation
   exit 0
 fi

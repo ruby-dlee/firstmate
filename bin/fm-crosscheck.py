@@ -191,7 +191,12 @@ MUTATION_RUNNER_POLICIES = {
         runtime_error_field="absent",
         non_execution_exits=(),
         runtime_version="4.1.5",
-        source_digests=(),
+        source_digests=(
+            (
+                "forkLauncher",
+                "d991d80584acd5fc622aefce5f907feff6c531059165a05d75c66e3ed8697d79",
+            ),
+        ),
         measurement="Vitest 4.1.5 on 2026-08-09",
     ),
 }
@@ -1491,7 +1496,11 @@ def test_arguments(
                     "vitest does not match its measured runtime boundary",
                 )
         probe_argument = write_javascript_body_probe(
-            run_cwd, checkout, policy.body_probe, Path(runner[0]).resolve()
+            run_cwd,
+            checkout,
+            policy.body_probe,
+            Path(runner[0]).resolve(),
+            label,
         )
         body_evidence = True
         if policy.body_probe == "vitest-runner":
@@ -1532,8 +1541,28 @@ def vitest_project_config(run_cwd: Path) -> Path | None:
     return None
 
 
+def vitest_fork_launcher(runner_path: Path, label: str) -> Path:
+    launcher = runner_path.parent / "dist" / "chunks" / "cli-api.Cjt90eJu.js"
+    expected = dict(MUTATION_RUNNER_POLICIES["vitest"].source_digests).get(
+        "forkLauncher"
+    )
+    try:
+        if launcher.is_symlink() or not launcher.is_file():
+            raise OSError("launcher is not a regular package file")
+        source = launcher.read_bytes()
+    except OSError as exc:
+        non_execution(label, f"vitest fork launcher is unavailable: {exc}")
+    if expected is None or hashlib.sha256(source).hexdigest() != expected:
+        non_execution(label, "vitest fork launcher does not match its measured source")
+    return launcher
+
+
 def write_javascript_body_probe(
-    run_cwd: Path, checkout: Path, probe_kind: str, runner_path: Path
+    run_cwd: Path,
+    checkout: Path,
+    probe_kind: str,
+    runner_path: Path,
+    label: str,
 ) -> Path:
     """Write the gate-owned hook that records entry into each selected test body."""
 
@@ -1568,6 +1597,10 @@ const safeJsonStringify = JSON.stringify;
 const authorized = new WeakSet();
 const isAuthorized = WeakSet.prototype.has.bind(authorized);
 const authorize = WeakSet.prototype.add.bind(authorized);
+const registeredBodies = new WeakMap();
+const hasRegisteredBody = WeakMap.prototype.has.bind(registeredBodies);
+const getRegisteredBody = WeakMap.prototype.get.bind(registeredBodies);
+const setRegisteredBody = WeakMap.prototype.set.bind(registeredBodies);
 const getTestFn = TestRunner.getTestFn.bind(TestRunner);
 let constructed = false;
 
@@ -1590,6 +1623,17 @@ export default class CrosscheckBodyRunner extends TestRunner {
     writeEvent('START');
   }
 
+  async onBeforeRunTask(test) {
+    if (!isAuthorized(this)) throw new Error('Unauthorized Crosscheck body runner');
+    if (hasRegisteredBody(test)) {
+      throw new Error('Crosscheck Vitest body was registered twice');
+    }
+    const body = getTestFn(test);
+    if (!body) throw new Error('Test function is not found');
+    setRegisteredBody(test, body);
+    if (super.onBeforeRunTask) await super.onBeforeRunTask(test);
+  }
+
   async runTask(test) {
     if (!isAuthorized(this)) throw new Error('Unauthorized Crosscheck body runner');
     const ancestorTitles = [];
@@ -1603,7 +1647,9 @@ export default class CrosscheckBodyRunner extends TestRunner {
     const namedTitles = safeApply(safeArrayFilter, ancestorTitles, [safeBoolean]);
     const fullName = safeApply(safeArrayJoin, namedTitles, [' ']);
     const body = getTestFn(test);
-    if (!body) throw new Error('Test function is not found');
+    if (!hasRegisteredBody(test) || getRegisteredBody(test) !== body) {
+      throw new Error('Crosscheck Vitest body identity changed before execution');
+    }
     const serialized = safeApply(safeJsonStringify, safeJson, [{ fullName }]);
     const encoded = safeApply(safeBufferFrom, safeBuffer, [serialized, 'utf8']);
     const payload = safeApply(safeBufferToString, encoded, ['base64']);
@@ -1618,8 +1664,11 @@ Object.freeze(CrosscheckBodyRunner.prototype);
         )
         config_path = protocol / "vitest-body-probe.config.mjs"
         launch_preload_path = protocol / "vitest-launch-preload.cjs"
+        loader_path = protocol / "vitest-launch-loader.mjs"
+        child_process_path = protocol / "vitest-child-process.mjs"
         launch_node_options = f"--require={launch_preload_path}"
         vitest_worker_path = runner_path.parent / "dist" / "workers" / "forks.js"
+        fork_launcher_path = vitest_fork_launcher(runner_path, label)
         project_config = vitest_project_config(run_cwd)
         if project_config is None:
             project_loader = "const config = {};"
@@ -1631,17 +1680,16 @@ Object.freeze(CrosscheckBodyRunner.prototype);
     : await projectConfig;
   const config = loaded || {{}};"""
         launch_preload_source = f"""'use strict';
-const childProcess = require('node:child_process');
-const {{ syncBuiltinESMExports }} = require('node:module');
+const {{ register }} = require('node:module');
+const {{ pathToFileURL }} = require('node:url');
+const {{ isMainThread }} = require('node:worker_threads');
 const safeApply = Reflect.apply;
-const safeDefineProperty = Object.defineProperty;
 const safeOwnKeys = Reflect.ownKeys;
-const safeArrayIsArray = Array.isArray;
 const safeString = String;
 const safeToUpperCase = String.prototype.toUpperCase;
 const expectedNodeOptions = {json.dumps(launch_node_options)};
-const expectedWorkerPath = {json.dumps(str(vitest_worker_path))};
 const expectedRunnerPath = {json.dumps(str(probe_path))};
+const loaderUrl = pathToFileURL({json.dumps(str(loader_path))}).href;
 
 function nodeOptionsKeys(environment) {{
   if (!environment || typeof environment !== 'object') {{
@@ -1664,21 +1712,56 @@ function requireGateNodeOptions(environment) {{
   }}
 }}
 
-requireGateNodeOptions(process.env);
-for (const key of nodeOptionsKeys(process.env)) delete process.env[key];
-const originalFork = childProcess.fork;
-let isWorker = false;
-for (let index = 0; index + 1 < process.execArgv.length; index += 1) {{
-  if (process.execArgv[index] === '--import'
-      && process.execArgv[index + 1] === expectedRunnerPath) {{
-    isWorker = true;
+if (isMainThread) {{
+  requireGateNodeOptions(process.env);
+  for (const key of nodeOptionsKeys(process.env)) delete process.env[key];
+  let isWorker = false;
+  for (let index = 0; index + 1 < process.execArgv.length; index += 1) {{
+    if (process.execArgv[index] === '--import'
+        && process.execArgv[index + 1] === expectedRunnerPath) {{
+      isWorker = true;
+    }}
   }}
+  if (!isWorker) register(loaderUrl);
+}}
+"""
+        loader_source = f"""const launcherUrl = {json.dumps(fork_launcher_path.as_uri())};
+const childProcessUrl = {json.dumps(child_process_path.as_uri())};
+
+export async function resolve(specifier, context, nextResolve) {{
+  if (specifier === 'node:child_process' && context.parentURL === launcherUrl) {{
+    return {{ shortCircuit: true, url: childProcessUrl }};
+  }}
+  return nextResolve(specifier, context);
+}}
+"""
+        child_process_source = f"""import * as childProcess from 'node:child_process';
+const safeApply = Reflect.apply;
+const safeArrayIsArray = Array.isArray;
+const safeOwnKeys = Reflect.ownKeys;
+const safeToUpperCase = String.prototype.toUpperCase;
+const nativeFork = childProcess.fork;
+const expectedNodeOptions = {json.dumps(launch_node_options)};
+const expectedWorkerPath = {json.dumps(str(vitest_worker_path))};
+
+function nodeOptionsKeys(environment) {{
+  if (!environment || typeof environment !== 'object') {{
+    throw new Error('Crosscheck could not authenticate the Vitest worker environment');
+  }}
+  const keys = [];
+  for (const key of safeOwnKeys(environment)) {{
+    if (typeof key === 'string'
+        && safeApply(safeToUpperCase, key, []) === 'NODE_OPTIONS') {{
+      keys[keys.length] = key;
+    }}
+  }}
+  return keys;
 }}
 
-function checkedFork(modulePath, args, options) {{
+export function fork(modulePath, args, options) {{
   const resolvedOptions = safeArrayIsArray(args) ? options : args;
   if (modulePath !== expectedWorkerPath) {{
-    return safeApply(originalFork, childProcess, arguments);
+    return safeApply(nativeFork, childProcess, arguments);
   }}
   const environment = resolvedOptions?.env || process.env;
   if (nodeOptionsKeys(environment).length) {{
@@ -1691,18 +1774,10 @@ function checkedFork(modulePath, args, options) {{
   const forwarded = safeArrayIsArray(args)
     ? [modulePath, args, workerOptions]
     : [modulePath, workerOptions];
-  return safeApply(originalFork, childProcess, forwarded);
+  return safeApply(nativeFork, childProcess, forwarded);
 }}
 
-if (!isWorker) {{
-  safeDefineProperty(childProcess, 'fork', {{
-    configurable: false,
-    enumerable: true,
-    writable: false,
-    value: checkedFork,
-  }});
-  syncBuiltinESMExports();
-}}
+export * from 'node:child_process';
 """
         config_body = f"""const runnerPath = {json.dumps(str(probe_path))};
 const safeApply = Reflect.apply;
@@ -1971,6 +2046,8 @@ export default async (environment) => {{
 """
         config_path.write_text(config_body, encoding="utf-8")
         launch_preload_path.write_text(launch_preload_source, encoding="utf-8")
+        loader_path.write_text(loader_source, encoding="utf-8")
+        child_process_path.write_text(child_process_source, encoding="utf-8")
         probe_path.write_text(source, encoding="utf-8")
         (package_dir / "package.json").write_text(
             '{"name":"crosscheck-vitest-body-runner","type":"module"}\n',

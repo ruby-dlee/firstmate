@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import binascii
 import copy
 import datetime as dt
 import fcntl
@@ -110,14 +109,14 @@ class MutationRunnerPolicy:
 class TestRun:
     """Resolved proof command and the project directory it must run from."""
 
-    __slots__ = ("argv", "cwd", "body_report")
+    __slots__ = ("argv", "cwd", "body_evidence")
 
     def __init__(
-        self, argv: tuple[str, ...], cwd: Path, body_report: Path | None = None
+        self, argv: tuple[str, ...], cwd: Path, body_evidence: bool = False
     ) -> None:
         self.argv = argv
         self.cwd = cwd
-        self.body_report = body_report
+        self.body_evidence = body_evidence
 
 
 # This registry is the sole declaration point for mutation-proof runners.
@@ -1694,11 +1693,12 @@ def test_arguments(
             f"{policy.selector_mode!r}"
         )
     argv = [*runner, *policy.gate_arguments, target]
-    body_report: Path | None = None
+    body_evidence = False
     if policy.body_probe is not None:
-        probe_argument, body_report = write_javascript_body_probe(
+        probe_argument = write_javascript_body_probe(
             run_cwd, runner_name, policy.body_probe
         )
+        body_evidence = True
         if policy.body_probe == "jest-global-wrapper":
             argv.extend(["--setupFilesAfterEnv", str(probe_argument)])
         elif policy.body_probe == "vitest-runner":
@@ -1711,7 +1711,7 @@ def test_arguments(
     selector = test_selector(test_path, label)
     if selector is not None and policy.selector_mode == "test-name-pattern":
         argv.extend(["--testNamePattern", selector])
-    return TestRun(tuple(argv), run_cwd, body_report)
+    return TestRun(tuple(argv), run_cwd, body_evidence)
 
 
 def vitest_project_config(run_cwd: Path) -> Path | None:
@@ -1725,84 +1725,119 @@ def vitest_project_config(run_cwd: Path) -> Path | None:
 
 def write_javascript_body_probe(
     run_cwd: Path, runner: str, probe_kind: str
-) -> tuple[Path, Path]:
+) -> Path:
     """Write the gate-owned hook that records entry into each selected test body."""
 
     protocol = run_cwd / ".crosscheck"
     protocol.mkdir(parents=True, exist_ok=True)
-    report_path = protocol / f"{runner}-body-executions.jsonl"
-    try:
-        report_path.unlink()
-    except FileNotFoundError:
-        pass
-    encoded_report = json.dumps(str(report_path))
     if probe_kind == "jest-global-wrapper":
         probe_path = protocol / "jest-body-probe.cjs"
         argument_path = probe_path
-        source = f"""// crosscheck-body-report={report_path}
-const {{ appendFileSync }} = require('node:fs');
-const reportPath = {encoded_report};
+        channel_path = protocol / "jest-body-channel.cjs"
+        channel_path.write_text(
+            """const { randomBytes } = require('node:crypto');
+const { writeSync } = require('node:fs');
+const nonce = randomBytes(32).toString('hex');
+const prefix = 'CROSSCHECK-AUTH-BODY';
 const proxies = new WeakMap();
+let installed = false;
 
-function recordBody(declaredName) {{
+function writeEvent(kind, payload) {
+  const suffix = payload ? ` ${payload}` : '';
+  writeSync(2, `${prefix} ${kind} ${nonce}${suffix}\\n`);
+}
+
+writeEvent('START');
+
+function recordBody(declaredName) {
   const currentName = globalThis.expect?.getState?.().currentTestName;
   const fullName = typeof currentName === 'string' && currentName
     ? currentName
     : String(declaredName);
-  appendFileSync(reportPath, `${{JSON.stringify({{ fullName }})}}\\n`);
-}}
+  const payload = Buffer.from(JSON.stringify({ fullName }), 'utf8').toString('base64');
+  writeEvent('EVENT', payload);
+}
 
-function wrapRegistration(registration) {{
+function wrapRegistration(registration) {
   if (typeof registration !== 'function') return registration;
   const existing = proxies.get(registration);
   if (existing) return existing;
-  const proxy = new Proxy(registration, {{
-    apply(target, thisArg, argumentsList) {{
+  const proxy = new Proxy(registration, {
+    apply(target, thisArg, argumentsList) {
       const next = [...argumentsList];
-      if (typeof next[1] === 'function') {{
+      if (typeof next[1] === 'function') {
         const declaredName = next[0];
         const body = next[1];
-        next[1] = function (...bodyArguments) {{
+        next[1] = function (...bodyArguments) {
           recordBody(declaredName);
           return Reflect.apply(body, this, bodyArguments);
-        }};
-      }}
+        };
+      }
       return wrapRegistration(Reflect.apply(target, thisArg, next));
-    }},
-    get(target, property, receiver) {{
+    },
+    get(target, property, receiver) {
       return wrapRegistration(Reflect.get(target, property, receiver));
-    }},
-  }});
+    },
+  });
   proxies.set(registration, proxy);
   return proxy;
-}}
+}
 
-globalThis.test = wrapRegistration(globalThis.test);
-globalThis.it = wrapRegistration(globalThis.it);
-"""
+function install() {
+  if (installed) return;
+  installed = true;
+  globalThis.test = wrapRegistration(globalThis.test);
+  globalThis.it = wrapRegistration(globalThis.it);
+}
+
+module.exports = { install };
+""",
+            encoding="utf-8",
+        )
+        source = f"require({json.dumps(str(channel_path))}).install();\n"
     elif probe_kind == "vitest-runner":
         probe_path = protocol / "vitest-body-probe.mjs"
-        source = f"""// crosscheck-body-report={report_path}
-import {{ appendFileSync }} from 'node:fs';
-import {{ TestRunner }} from 'vitest';
-const reportPath = {encoded_report};
+        source = """import { randomBytes } from 'node:crypto';
+import { writeSync } from 'node:fs';
+import { TestRunner } from 'vitest';
+const nonce = randomBytes(32).toString('hex');
+const prefix = 'CROSSCHECK-AUTH-BODY';
+const authorized = new WeakSet();
+const isAuthorized = WeakSet.prototype.has.bind(authorized);
+let constructed = false;
 
-export default class CrosscheckBodyRunner extends TestRunner {{
-  async runTask(test) {{
+function writeEvent(kind, payload) {
+  const suffix = payload ? ` ${payload}` : '';
+  writeSync(2, `${prefix} ${kind} ${nonce}${suffix}\\n`);
+}
+
+writeEvent('START');
+
+export default class CrosscheckBodyRunner extends TestRunner {
+  constructor(config) {
+    super(config);
+    if (constructed) throw new Error('Crosscheck body runner was instantiated twice');
+    constructed = true;
+    authorized.add(this);
+  }
+
+  async runTask(test) {
+    if (!isAuthorized(this)) throw new Error('Unauthorized Crosscheck body runner');
     const ancestorTitles = [];
     let suite = test.suite;
-    while (suite) {{
+    while (suite) {
       if (suite.name) ancestorTitles.push(suite.name);
       suite = suite.suite;
-    }}
+    }
     ancestorTitles.reverse();
     const fullName = [...ancestorTitles, test.name].filter(Boolean).join(' ');
-    appendFileSync(reportPath, `${{JSON.stringify({{ fullName }})}}\\n`);
     const body = TestRunner.getTestFn(test);
     if (!body) throw new Error('Test function is not found');
+    const payload = Buffer.from(JSON.stringify({ fullName }), 'utf8').toString('base64');
+    writeEvent('EVENT', payload);
     await body();
-  }}
-}}
+  }
+}
 """
         config_path = protocol / "vitest-body-probe.config.mjs"
         project_config = vitest_project_config(run_cwd)
@@ -1825,15 +1860,12 @@ export default async (environment) => {{
   }};
 }};
 """
-        config_path.write_text(
-            f"// crosscheck-body-report={report_path}\n{config_body}",
-            encoding="utf-8",
-        )
+        config_path.write_text(config_body, encoding="utf-8")
         argument_path = config_path
     else:
         tool_fail(f"unknown JavaScript body probe {probe_kind!r}")
     probe_path.write_text(source, encoding="utf-8")
-    return argument_path, report_path
+    return argument_path
 
 
 def append_jest_project_setup(
@@ -1906,39 +1938,65 @@ def append_jest_project_setup(
     if setup_index + 1 >= len(argv):
         tool_fail("Jest body probe invocation omitted its probe path")
     probe_path = argv[setup_index + 1]
+    channel_path = str(Path(probe_path).with_name("jest-body-channel.cjs"))
     setup_arguments = [
         argument
-        for path in [*configured_setup, probe_path]
+        for path in [channel_path, *configured_setup, probe_path]
         for argument in ("--setupFilesAfterEnv", path)
     ]
     argv[setup_index : setup_index + 2] = setup_arguments
-    return TestRun(tuple(argv), run.cwd, run.body_report)
+    return TestRun(tuple(argv), run.cwd, run.body_evidence)
 
 
 def read_javascript_body_report(
-    path: Path | None, runner: str, label: str, phase: str
+    stderr: str, body_evidence: bool, runner: str, label: str, phase: str
 ) -> set[str]:
-    if path is None:
+    if not body_evidence:
         non_execution(label, f"{runner} has no body-execution report policy")
-    try:
-        payload = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
+    prefix = "CROSSCHECK-AUTH-BODY "
+    channel_lines = [line for line in stderr.split("\n") if line.startswith(prefix)]
+    if not channel_lines:
         non_execution(
             label,
             f"{runner} recorded no positive test-body execution evidence during "
-            f"the {phase} run: {exc}",
+            f"the {phase} run",
         )
-    if len(payload.encode("utf-8")) > MAX_CAPTURE:
-        non_execution(label, f"{runner} emitted an oversized test-body report")
+    starts: list[str] = []
+    events: list[tuple[str, str]] = []
+    for line in channel_lines:
+        start_match = re.fullmatch(
+            r"CROSSCHECK-AUTH-BODY START ([0-9a-f]{64})", line
+        )
+        if start_match:
+            starts.append(start_match.group(1))
+            continue
+        event_match = re.fullmatch(
+            r"CROSSCHECK-AUTH-BODY EVENT ([0-9a-f]{64}) "
+            r"([A-Za-z0-9+/]+={0,2})",
+            line,
+        )
+        if event_match:
+            events.append((event_match.group(1), event_match.group(2)))
+            continue
+        non_execution(label, f"{runner} emitted malformed test-body evidence")
+    if len(starts) != 1:
+        non_execution(
+            label,
+            f"{runner} emitted {len(starts)} authenticated body-channel starts "
+            f"during the {phase} run",
+        )
+    nonce = starts[0]
     executions: set[str] = set()
-    for line_number, line in enumerate(payload.splitlines(), start=1):
+    for event_nonce, payload in events:
+        if event_nonce != nonce:
+            non_execution(label, f"{runner} emitted unauthenticated test-body evidence")
         try:
-            entry = json.loads(line)
-        except (json.JSONDecodeError, UnicodeError) as exc:
+            decoded = base64.b64decode(payload, validate=True).decode("utf-8")
+            entry = json.loads(decoded)
+        except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
             non_execution(
                 label,
-                f"{runner} emitted malformed test-body evidence on line "
-                f"{line_number}: {exc}",
+                f"{runner} emitted malformed test-body evidence: {exc}",
             )
         if (
             not isinstance(entry, dict)
@@ -1961,7 +2019,7 @@ def require_jest_compatible_execution_report(
     runner: str,
     label: str,
     phase: str,
-    body_report: Path | None,
+    body_evidence: bool,
 ) -> None:
     """Require machine results backed by positive selected-body lifecycle evidence."""
 
@@ -2087,7 +2145,7 @@ def require_jest_compatible_execution_report(
             "skipped or pending tests are not a test outcome",
         )
     body_executions = read_javascript_body_report(
-        body_report, runner, label, phase
+        result.stderr, body_evidence, runner, label, phase
     )
     missing_bodies = sorted(outcome_names - body_executions)
     if missing_bodies:
@@ -2114,7 +2172,7 @@ def require_test_execution(
     runner: str,
     label: str,
     phase: str,
-    body_report: Path | None = None,
+    body_evidence: bool = False,
 ) -> None:
     """Refuse to read a test outcome out of a run that never reached the test."""
 
@@ -2128,7 +2186,7 @@ def require_test_execution(
     policy = MUTATION_RUNNER_POLICIES[runner]
     if policy.report_format == "jest-compatible-json":
         require_jest_compatible_execution_report(
-            result, runner, label, phase, body_report
+            result, runner, label, phase, body_evidence
         )
         return
     if policy.report_format is not None:
@@ -2359,7 +2417,7 @@ def execute_mutation_proof(
         invocation["runner"],
         label,
         "baseline",
-        baseline_run.body_report,
+        baseline_run.body_evidence,
     )
     require(
         baseline.returncode == 0,
@@ -2429,7 +2487,7 @@ def execute_mutation_proof(
         invocation["runner"],
         label,
         "mutated",
-        mutated_run.body_report,
+        mutated_run.body_evidence,
     )
     require(mutated.returncode != 0, f"{label} named test still passes after mutation")
     return {

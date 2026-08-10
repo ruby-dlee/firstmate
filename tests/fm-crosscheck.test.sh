@@ -246,8 +246,15 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 [ -n "$body_probe" ] || exit 97
-body_report=$(sed -n 's|^// crosscheck-body-report=||p' "$body_probe")
-[ -n "$body_report" ] || exit 98
+body_nonce=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+body_start() {
+  printf 'CROSSCHECK-AUTH-BODY START %s\n' "$body_nonce" >&2
+}
+body_event() {
+  payload=$(printf '{"fullName":"%s"}' "$1" | base64 | tr -d '\n')
+  printf 'CROSSCHECK-AUTH-BODY EVENT %s %s\n' "$body_nonce" "$payload" >&2
+}
+body_start
 if [ -f "$missing_dependency_marker" ]; then
   if [ "$runner" = jest ]; then
     printf '%s\n' '{"success":false,"numRuntimeErrorTestSuites":1,"numPassedTests":0,"numFailedTests":0,"testResults":[{"status":"failed","assertionResults":[]}]}'
@@ -275,32 +282,28 @@ JSON
   exit 0
 fi
 if [ -f "$hook_failure_marker" ]; then
-  : > "$body_report"
   cat <<JSON
 {"success":false,$runtime_field"numPassedTests":0,"numFailedTests":1,"testResults":[{"status":"failed","assertionResults":[{"fullName":"across chats resets state","status":"failed"}]}]}
 JSON
   exit 1
 fi
 if grep -qx fixed app.txt; then
-  printf '%s\n' \
-    '{"fullName":"within a chat stays stable"}' \
-    '{"fullName":"across chats resets state"}' > "$body_report"
+  body_event "within a chat stays stable"
+  body_event "across chats resets state"
   cat <<JSON
 {"success":true,$runtime_field"numPassedTests":2,"numFailedTests":0,"testResults":[{"status":"passed","assertionResults":[{"fullName":"within a chat stays stable","status":"passed"},{"fullName":"across chats resets state","status":"passed"}]}]}
 JSON
   exit 0
 fi
 if [ -f "$duplicate_name_marker" ]; then
-  printf '%s\n' \
-    '{"fullName":"duplicate regression"}' > "$body_report"
+  body_event "duplicate regression"
   cat <<JSON
 {"success":false,$runtime_field"numPassedTests":1,"numFailedTests":1,"testResults":[{"status":"failed","assertionResults":[{"fullName":"duplicate regression","status":"passed"},{"fullName":"duplicate regression","status":"failed"}]}]}
 JSON
   exit 1
 fi
-printf '%s\n' \
-  '{"fullName":"within a chat stays stable"}' \
-  '{"fullName":"across chats resets state"}' > "$body_report"
+body_event "within a chat stays stable"
+body_event "across chats resets state"
 cat <<JSON
 {"success":false,$runtime_field"numPassedTests":1,"numFailedTests":1,"testResults":[{"status":"failed","assertionResults":[{"fullName":"within a chat stays stable","status":"passed"},{"fullName":"across chats resets state","status":"failed"}]}]}
 JSON
@@ -2729,10 +2732,15 @@ PY
   record=$(make_case jest-real-hook-failure)
   IFS=$'\t' read -r case_dir base head <<< "$record"
   cat > "$case_dir/repo/tests/hook-failure.test.js" <<'JS'
-const { readFileSync } = require('node:fs');
+const { mkdirSync, readFileSync, writeFileSync } = require('node:fs');
 
 beforeEach(() => {
   if (readFileSync('app.txt', 'utf8').trim() !== 'fixed') {
+    mkdirSync('.crosscheck', { recursive: true });
+    writeFileSync(
+      '.crosscheck/jest-body-executions.jsonl',
+      '{"fullName":"selected body"}\n',
+    );
     throw new Error('startup hook rejected mutated implementation');
   }
 });
@@ -2755,8 +2763,8 @@ JS
   expect_code 1 "$rc" "real Jest beforeEach failure"
   assert_grep 'NON-EXECUTION' "$case_dir/err" \
     "a real Jest beforeEach failure was accepted as body execution"
-  assert_grep 'test-body execution evidence' "$case_dir/err" \
-    "a real Jest beforeEach failure did not name the missing body signal"
+  assert_grep 'no selected test body starting' "$case_dir/err" \
+    "a forged project-writable marker replaced authenticated body evidence"
   python3 -c '
 import json, sys
 value = json.load(open(sys.argv[1]))
@@ -2804,7 +2812,7 @@ value = json.load(open(sys.argv[1]))
 assert value["findings"][0]["lifecycle"] == "open"
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" \
     || fail "a tracked Jest setup failure cleared the finding"
-  pass "real Jest preserves tracked setup and refuses startup failures"
+  pass "real Jest authenticates body execution and preserves tracked startup"
 }
 
 test_real_vitest_body_probe_certifies_mutation() {
@@ -4671,13 +4679,16 @@ for runner in ("jest", "vitest"):
             time.monotonic() + 60,
         )
         setup_index = prepared.argv.index("--setupFilesAfterEnv")
-        assert prepared.argv[setup_index + 1] == configured_setup, prepared.argv
+        channel = str(run.cwd / ".crosscheck" / "jest-body-channel.cjs")
+        assert prepared.argv[setup_index + 1] == channel, prepared.argv
         assert prepared.argv[setup_index + 2] == "--setupFilesAfterEnv", prepared.argv
-        assert prepared.argv[setup_index + 3] == str(probe_argument), prepared.argv
+        assert prepared.argv[setup_index + 3] == configured_setup, prepared.argv
+        assert prepared.argv[setup_index + 4] == "--setupFilesAfterEnv", prepared.argv
+        assert prepared.argv[setup_index + 5] == str(probe_argument), prepared.argv
     assert run.argv[6:] == (
         "--testNamePattern", "(within a chat|across chats)"
     ), run.argv
-    assert run.body_report is not None, runner
+    assert run.body_evidence, runner
 
 neutral = case / "neutral"
 neutral.mkdir()

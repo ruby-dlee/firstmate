@@ -3091,8 +3091,8 @@ test_composer_state_unknown_when_no_composer_row_found() {
 # override any stale bordered row above it and stay unknown.
 
 make_pi_rule() {
-  local rule
-  printf -v rule '%*s' 185 ''
+  local rule width=${1:-185}
+  printf -v rule '%*s' "$width" ''
   printf '%s' "${rule// /─}"
 }
 
@@ -3120,6 +3120,19 @@ test_composer_state_pi_separator_editor_with_text_is_pending() {
   pass "fm_backend_herdr_composer_state: a real-pi separator-only editor with typed text reads pending"
 }
 
+test_composer_state_pi_resized_editor_is_empty() {
+  local dir log resp fb out rule padding
+  dir="$TMP_ROOT/composer-pi-resized"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  rule=$(make_pi_rule 80)
+  printf -v padding '%*s' 79 ''
+  printf '%s\n\x1b[7m \x1b[0m%s\n%s\n/project\nfooter\n' "$rule" "$padding" "$rule" > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = empty ] || fail "a full-width pi editor should read empty after resize, got '$out'"
+  pass "fm_backend_herdr_composer_state: a resized full-width pi editor reads empty"
+}
+
 test_composer_state_pi_styled_glyphs_are_pending() {
   local dir log resp fb out rule idx=1
   dir="$TMP_ROOT/composer-pi-styled"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -3136,14 +3149,16 @@ test_composer_state_pi_styled_glyphs_are_pending() {
 }
 
 test_composer_state_pi_short_rules_are_unknown() {
-  local dir log resp fb out rule
+  local dir log resp fb out rule padding
   dir="$TMP_ROOT/composer-pi-short-rule"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  printf '%s\n\x1b[7m \x1b[0m\n%s\n/project\nfooter\n' "$rule" "$rule" > "$resp/1.out"
+  rule='────────'
+  printf -v padding '%*s' 184 ''
+  printf '│ ❯ stale decorative box │\n%s\n\x1b[7m \x1b[0m%s\n%s\n/project\nfooter\n' "$rule" "$padding" "$rule" > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
-  [ "$out" = unknown ] || fail "short separator rules are not pi's verified full-width shape and should read unknown, got '$out'"
-  pass "fm_backend_herdr_composer_state: short separator rules stay fail-closed unknown"
+  [ "$out" = unknown ] || fail "short separator rules must invalidate a stale composer match and read unknown, got '$out'"
+  pass "fm_backend_herdr_composer_state: short separator boundaries invalidate stale matches"
 }
 
 test_composer_state_pi_non_cursor_reverse_video_is_unknown() {
@@ -3190,7 +3205,7 @@ test_composer_state_pi_separator_pair_without_cursor_is_unknown() {
 test_composer_state_pi_modal_overrides_stale_bordered_row() {
   local dir log resp fb out rule
   dir="$TMP_ROOT/composer-pi-modal"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  rule=$(make_pi_rule)
+  rule=$(make_pi_rule 80)
   printf '│ ❯ stale decorative box │\n%s\n  Select a model\n\n  → openai/gpt-5.6-sol\n    anthropic/claude-opus-5\n\n  enter select  esc cancel\n%s\n/project\nfooter\n' "$rule" "$rule" > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
@@ -4395,6 +4410,7 @@ test_wait_transition_clean_timeout_returns_1() {
 if [ "${FM_TEST_FOCUSED:-}" = composer-pi ]; then
   test_composer_state_pi_separator_editor_is_empty
   test_composer_state_pi_separator_editor_with_text_is_pending
+  test_composer_state_pi_resized_editor_is_empty
   test_composer_state_pi_styled_glyphs_are_pending
   test_composer_state_pi_short_rules_are_unknown
   test_composer_state_pi_non_cursor_reverse_video_is_unknown
@@ -4579,6 +4595,7 @@ test_composer_state_unknown_on_capture_failure
 test_composer_state_unknown_when_no_composer_row_found
 test_composer_state_pi_separator_editor_is_empty
 test_composer_state_pi_separator_editor_with_text_is_pending
+test_composer_state_pi_resized_editor_is_empty
 test_composer_state_pi_styled_glyphs_are_pending
 test_composer_state_pi_short_rules_are_unknown
 test_composer_state_pi_non_cursor_reverse_video_is_unknown

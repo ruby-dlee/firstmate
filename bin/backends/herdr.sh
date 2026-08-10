@@ -2828,7 +2828,7 @@ fm_backend_herdr_strip_ansi() {  # <text>
 #              no-agent shell fallback prompt (`>`, `$`, `%`, or `#`) falls
 #              through to `unknown` instead of being misread as delivered.
 #   pi       - an UNBORDERED editor (verified real pi 0.84.0 under herdr 0.7.3):
-#              two equal 185-column rules made only of U+2500 BOX DRAWINGS LIGHT
+#              two equal full-width rules made only of U+2500 BOX DRAWINGS LIGHT
 #              HORIZONTAL, with exactly one content row between them. Pi draws
 #              neither side borders nor a prompt glyph. The raw ANSI content
 #              row must contain exactly one `SGR-7 space SGR-0` cursor cell. This
@@ -2874,11 +2874,17 @@ fm_backend_herdr_is_bare_prompt_row() {  # <plain-trimmed-row>
 }
 
 fm_backend_herdr_is_pi_rule_row() {  # <plain-trimmed-row>
-  local rule=$1 LC_ALL=C
-  # The verified Pi pane was 185 columns wide, so its full-width DynamicBorder
-  # is exactly 185 UTF-8 U+2500 glyphs (555 bytes).
+  local rule=$1 pane_width=$2 rule_width
+  rule_width=$(printf '%s' "$rule" | fm_backend_herdr_control_jq -Rr 'length') || return 1
   case "$1" in
-    '─'*) [ "${#rule}" -eq 555 ] && [ -z "${rule//─/}" ] ;;
+    '─'*) [ "$rule_width" -eq "$pane_width" ] && [ -z "${rule//─/}" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+fm_backend_herdr_is_pi_boundary_row() {  # <plain-trimmed-row>
+  case "$1" in
+    '─'*) [ -z "${1//─/}" ] ;;
     *) return 1 ;;
   esac
 }
@@ -2900,10 +2906,15 @@ fm_backend_herdr_pi_plain_content() {  # <raw-ansi-row>
 }
 
 fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
-  local target=$1 cap line plain trimmed found=0 shape="" raw_match="" container=0 stripped
+  local target=$1 cap plain_cap pane_width line plain trimmed found=0 shape="" raw_match="" container=0 stripped
   local pi_rule="" pi_rows=0 pi_middle_raw="" pi_middle_trimmed="" last_trimmed=""
   cap=$(fm_backend_herdr_capture_ansi "$target" "$FM_BACKEND_HERDR_COMPOSER_LINES" 2>/dev/null \
     || fm_backend_herdr_capture "$target" "$FM_BACKEND_HERDR_COMPOSER_LINES") || { printf 'unknown'; return 0; }
+  plain_cap=$(fm_backend_herdr_strip_ansi "$cap")
+  pane_width=$(printf '%s' "$plain_cap" | fm_backend_herdr_control_jq -Rsr \
+    'split("\n") | map((if endswith("\r") then .[0:-1] else . end) | length) | max // 0' 2>/dev/null) \
+    || { printf 'unknown'; return 0; }
+  [ "$pane_width" -gt 0 ] || { printf 'unknown'; return 0; }
   # Structural scan: locate the bottom-most composer row and remember its RAW
   # (styled) bytes. Shape detection runs on the plain row (fm_backend_herdr_strip_ansi
   # keeps ghost text so the border/prompt glyph is still visible); the raw row is
@@ -2918,29 +2929,34 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
     # (or an otherwise ambiguous shape) and deliberately invalidates an older
     # bordered/bare match. Claude's verified rule/❯/rule composer remains owned
     # by the bare branch and is not invalidated here.
-    if fm_backend_herdr_is_pi_rule_row "$trimmed"; then
-      if [ -n "$pi_rule" ] && [ "$pi_rule" = "$trimmed" ]; then
-        if [ "$pi_rows" -eq 1 ] && fm_backend_herdr_pi_plain_content "$pi_middle_raw" >/dev/null; then
-          shape=pi
-          raw_match=$pi_middle_raw
-          found=1
-        elif [ "$pi_rows" -eq 1 ] && fm_backend_herdr_is_bare_prompt_row "$pi_middle_trimmed"; then
-          :
-        else
+    if fm_backend_herdr_is_pi_boundary_row "$trimmed"; then
+      if fm_backend_herdr_is_pi_rule_row "$trimmed" "$pane_width"; then
+        if [ -n "$pi_rule" ] && [ "$pi_rule" = "$trimmed" ]; then
+          if [ "$pi_rows" -eq 1 ] && fm_backend_herdr_pi_plain_content "$pi_middle_raw" >/dev/null; then
+            shape=pi
+            raw_match=$pi_middle_raw
+            found=1
+          elif [ "$pi_rows" -eq 1 ] && fm_backend_herdr_is_bare_prompt_row "$pi_middle_trimmed"; then
+            :
+          else
+            shape=pi-unknown
+            raw_match=""
+            found=0
+          fi
+        elif ! fm_backend_herdr_is_bare_prompt_row "$last_trimmed"; then
           shape=pi-unknown
           raw_match=""
           found=0
         fi
-      elif ! fm_backend_herdr_is_bare_prompt_row "$last_trimmed"; then
-        # This can be a replacement UI's closing rule whose opening rule fell
-        # outside the bounded capture. It cannot authorize input and must still
-        # invalidate stale composer-like rows above it. A bare Claude/Codex row
-        # immediately above keeps its established classifier result.
-        shape=pi-unknown
-        raw_match=""
-        found=0
+        pi_rule=$trimmed
+      else
+        pi_rule=""
+        if ! fm_backend_herdr_is_bare_prompt_row "$last_trimmed"; then
+          shape=pi-unknown
+          raw_match=""
+          found=0
+        fi
       fi
-      pi_rule=$trimmed
       pi_rows=0
       pi_middle_raw=""
       pi_middle_trimmed=""

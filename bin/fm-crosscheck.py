@@ -70,6 +70,8 @@ class MutationRunnerPolicy:
         "body_probe",
         "runtime_error_field",
         "non_execution_exits",
+        "runtime_version",
+        "source_digests",
         "measurement",
     )
 
@@ -85,6 +87,8 @@ class MutationRunnerPolicy:
         body_probe: str | None,
         runtime_error_field: str,
         non_execution_exits: tuple[tuple[int, str], ...],
+        runtime_version: str | None,
+        source_digests: tuple[tuple[str, str], ...],
         measurement: str,
     ) -> None:
         self.invocations = invocations
@@ -96,6 +100,8 @@ class MutationRunnerPolicy:
         self.body_probe = body_probe
         self.runtime_error_field = runtime_error_field
         self.non_execution_exits = non_execution_exits
+        self.runtime_version = runtime_version
+        self.source_digests = source_digests
         self.measurement = measurement
 
 
@@ -147,11 +153,13 @@ MUTATION_RUNNER_POLICIES = {
             (4, "the runner rejected its command line"),
             (5, "no test matched the named selector"),
         ),
+        runtime_version=None,
+        source_digests=(),
         measurement="pytest 9.1.1 on 2026-08-05",
     ),
     "jest": MutationRunnerPolicy(
         invocations=(("jest",),),
-        gate_arguments=("--json", "--runTestsByPath"),
+        gate_arguments=("--json", "--runInBand", "--runTestsByPath"),
         selector_mode="test-name-pattern",
         absolute_test_path=True,
         node_project_cwd=True,
@@ -159,6 +167,13 @@ MUTATION_RUNNER_POLICIES = {
         body_probe="jest-global-wrapper",
         runtime_error_field="required-zero",
         non_execution_exits=(),
+        runtime_version="29.7.0",
+        source_digests=(
+            (
+                "circusRun",
+                "e0ba3e46a59b751d7cc4ab5b6c00f27baa54d35b326c5dbc14404eb725fa8477",
+            ),
+        ),
         measurement="Jest 29.7.0 on 2026-08-09",
     ),
     "vitest": MutationRunnerPolicy(
@@ -171,6 +186,8 @@ MUTATION_RUNNER_POLICIES = {
         body_probe="vitest-runner",
         runtime_error_field="absent",
         non_execution_exits=(),
+        runtime_version="4.1.5",
+        source_digests=(),
         measurement="Vitest 4.1.5 on 2026-08-09",
     ),
 }
@@ -1453,6 +1470,22 @@ def test_arguments(
                     "vitest resolved its privileged runtime from the "
                     "project-controlled proof checkout",
                 )
+            manifest_path = resolved_runner.parent / "package.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                non_execution(label, f"vitest runtime metadata is unavailable: {exc}")
+            if (
+                not isinstance(manifest, dict)
+                or manifest.get("name") != "vitest"
+                or manifest.get("version") != policy.runtime_version
+                or resolved_runner != resolved_runner.parent / "vitest.mjs"
+                or not (resolved_runner.parent / "dist" / "index.js").is_file()
+            ):
+                non_execution(
+                    label,
+                    "vitest does not match its measured runtime boundary",
+                )
         probe_argument = write_javascript_body_probe(
             run_cwd, checkout, policy.body_probe, Path(runner[0]).resolve()
         )
@@ -1471,13 +1504,6 @@ def test_arguments(
                     "vitest named test selects an unmeasured custom environment",
                 )
             argv.extend(["--config", str(probe_argument)])
-            preload = (
-                probe_argument.parent
-                / "node_modules"
-                / "crosscheck-vitest-body-runner"
-                / "index.mjs"
-            )
-            environment = (("NODE_OPTIONS", f"--import={json.dumps(str(preload))}"),)
         elif policy.body_probe != "jest-global-wrapper":
             tool_fail(
                 f"mutation-runner policy for {runner_name} has unknown body probe "
@@ -1509,37 +1535,8 @@ def write_javascript_body_probe(
     protocol.mkdir(parents=True, exist_ok=True)
     if probe_kind == "jest-global-wrapper":
         preload_path = protocol / "jest-body-preload.cjs"
-        argument_path = protocol / "jest-body-environment.cjs"
-        preload_path.write_text(
-            """const { randomBytes } = require('node:crypto');
-const { writeSync } = require('node:fs');
-const nonce = randomBytes(32).toString('hex');
-const prefix = 'CROSSCHECK-AUTH-BODY';
-let owner;
-
-function writeEvent(kind, payload) {
-  const suffix = payload ? ` ${payload}` : '';
-  writeSync(2, `${prefix} ${kind} ${nonce}${suffix}\\n`);
-}
-
-function claim(candidate) {
-  if (owner) throw new Error('Crosscheck body channel was claimed twice');
-  owner = candidate;
-  writeEvent('START');
-}
-
-function record(candidate, fullName) {
-  if (!owner || candidate !== owner) {
-    throw new Error('Unauthorized Crosscheck body event');
-  }
-  const payload = Buffer.from(JSON.stringify({ fullName }), 'utf8').toString('base64');
-  writeEvent('EVENT', payload);
-}
-
-module.exports = Object.freeze({ claim, record });
-""",
-            encoding="utf-8",
-        )
+        preload_path.write_text("", encoding="utf-8")
+        argument_path = preload_path
     elif probe_kind == "vitest-runner":
         package_dir = protocol / "node_modules" / "crosscheck-vitest-body-runner"
         package_dir.mkdir(parents=True, exist_ok=True)
@@ -1560,6 +1557,8 @@ function writeEvent(kind, payload) {
   const suffix = payload ? ` ${payload}` : '';
   writeSync(2, `${prefix} ${kind} ${nonce}${suffix}\\n`);
 }
+
+writeEvent('PRELOAD');
 
 export default class CrosscheckBodyRunner extends TestRunner {
   constructor(config) {
@@ -1610,13 +1609,30 @@ Object.freeze(CrosscheckBodyRunner.prototype);
 
 export default async (environment) => {{
   {project_loader}
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {{
+    throw new Error('Crosscheck cannot authenticate an unmeasured Vitest project shape');
+  }}
   const test = config.test || {{}};
+  if (typeof test !== 'object' || Array.isArray(test)) {{
+    throw new Error('Crosscheck cannot authenticate an unmeasured Vitest test shape');
+  }}
   const configuredEnvironment = test.environment || 'node';
+  const configuredEnv = test.env || {{}};
+  const hasNodeOptions = Object.keys(configuredEnv)
+    .some(key => key.toUpperCase() === 'NODE_OPTIONS');
+  const hasConfigEntries = value => Array.isArray(value)
+    ? value.length > 0
+    : Boolean(value && typeof value === 'object' && Object.keys(value).length);
   if (configuredEnvironment !== 'node'
-      || test.environmentMatchGlobs
-      || test.projects
+      || hasConfigEntries(test.environmentMatchGlobs)
+      || hasConfigEntries(test.projects)
       || test.browser?.enabled
-      || (test.pool && !['forks', 'threads'].includes(test.pool))
+      || (test.pool && test.pool !== 'forks')
+      || hasConfigEntries(test.poolOptions)
+      || hasConfigEntries(test.poolMatchGlobs)
+      || (test.execArgv && test.execArgv.length)
+      || hasNodeOptions
+      || (config.define && Object.keys(config.define).length)
       || test.runner) {{
     throw new Error('Crosscheck cannot authenticate an unmeasured Vitest runtime boundary');
   }}
@@ -1633,13 +1649,51 @@ export default async (environment) => {{
       }};
     }}
     if (hook && typeof hook.handler === 'function') {{
-      return Object.freeze({{
-        ...hook,
-        handler: function(...args) {{
+      const descriptors = Object.getOwnPropertyDescriptors(hook);
+      delete descriptors.handler;
+      const protectedHook = Object.create(Object.getPrototypeOf(hook), descriptors);
+      Object.defineProperty(protectedHook, 'handler', {{
+        configurable: false,
+        enumerable: Object.prototype.propertyIsEnumerable.call(hook, 'handler'),
+        writable: false,
+        value: function(...args) {{
           if (block(args)) return null;
           return hook.handler.apply(this, args);
         }},
       }});
+      return protectedHook;
+    }}
+    return hook;
+  }};
+  const protectConfigFunction = handler => function(...args) {{
+    const beforeDefine = args[0]?.define;
+    const beforeFingerprint = JSON.stringify(beforeDefine || {{}});
+    const validate = returned => {{
+      if (args[0]?.define !== beforeDefine
+          || JSON.stringify(args[0]?.define || {{}}) !== beforeFingerprint
+          || hasConfigEntries(returned?.define)) {{
+        throw new Error('Crosscheck rejected a project-controlled Vitest define');
+      }}
+      return returned;
+    }};
+    const returned = handler.apply(this, args);
+    return returned && typeof returned.then === 'function'
+      ? Promise.resolve(returned).then(validate)
+      : validate(returned);
+  }};
+  const protectConfigHook = hook => {{
+    if (typeof hook === 'function') return protectConfigFunction(hook);
+    if (hook && typeof hook.handler === 'function') {{
+      const descriptors = Object.getOwnPropertyDescriptors(hook);
+      delete descriptors.handler;
+      const protectedHook = Object.create(Object.getPrototypeOf(hook), descriptors);
+      Object.defineProperty(protectedHook, 'handler', {{
+        configurable: false,
+        enumerable: Object.prototype.propertyIsEnumerable.call(hook, 'handler'),
+        writable: false,
+        value: protectConfigFunction(hook.handler),
+      }});
+      return protectedHook;
     }}
     return hook;
   }};
@@ -1649,12 +1703,31 @@ export default async (environment) => {{
       return Promise.resolve(plugin).then(protectPlugin);
     }}
     if (!plugin || typeof plugin !== 'object') return plugin;
-    return Object.freeze({{
-      ...plugin,
-      resolveId: protectHook(plugin.resolveId, args => isRunnerId(args[0])),
-      load: protectHook(plugin.load, args => isRunnerId(args[0])),
-      transform: protectHook(plugin.transform, args => isRunnerId(args[1])),
+    const descriptors = Object.getOwnPropertyDescriptors(plugin);
+    delete descriptors.config;
+    delete descriptors.resolveId;
+    delete descriptors.load;
+    delete descriptors.transform;
+    const protectedPlugin = Object.create(Object.getPrototypeOf(plugin), descriptors);
+    for (const [name, hook, block] of [
+      ['resolveId', plugin.resolveId, args => isRunnerId(args[0])],
+      ['load', plugin.load, args => isRunnerId(args[0])],
+      ['transform', plugin.transform, args => isRunnerId(args[1])],
+    ]) {{
+      Object.defineProperty(protectedPlugin, name, {{
+        configurable: false,
+        enumerable: Object.prototype.propertyIsEnumerable.call(plugin, name),
+        writable: false,
+        value: protectHook(hook, block),
+      }});
+    }}
+    Object.defineProperty(protectedPlugin, 'config', {{
+      configurable: false,
+      enumerable: Object.prototype.propertyIsEnumerable.call(plugin, 'config'),
+      writable: false,
+      value: protectConfigHook(plugin.config),
     }});
+    return protectedPlugin;
   }};
   const protectedPlugins = plugins.map(protectPlugin);
   const guard = Object.freeze({{
@@ -1662,14 +1735,26 @@ export default async (environment) => {{
     enforce: 'pre',
     configResolved(resolved) {{
       const resolvedTest = resolved.test;
-      const resolvedPool = resolvedTest?.pool || 'forks';
-      if (!resolvedTest
-          || resolvedTest.environment !== 'node'
-          || !['forks', 'threads'].includes(resolvedPool)
-          || resolvedTest.environmentMatchGlobs
-          || resolvedTest.projects
-          || resolvedTest.browser?.enabled) {{
-        throw new Error('Crosscheck Vitest runtime boundary changed after resolution');
+      const violations = [
+        [!resolvedTest, 'test'],
+        [resolvedTest?.environment !== 'node', 'environment'],
+        [resolvedTest?.pool !== 'forks', 'pool'],
+        [hasConfigEntries(resolvedTest?.environmentMatchGlobs), 'environmentMatchGlobs'],
+        [hasConfigEntries(resolvedTest?.projects), 'projects'],
+        [resolvedTest?.browser?.enabled, 'browser'],
+        [hasConfigEntries(resolvedTest?.poolOptions), 'poolOptions'],
+        [hasConfigEntries(resolvedTest?.poolMatchGlobs), 'poolMatchGlobs'],
+        [!Array.isArray(resolvedTest?.execArgv), 'execArgv-type'],
+        [resolvedTest?.execArgv?.length !== 2, 'execArgv-length'],
+        [resolvedTest?.execArgv?.[0] !== '--import', 'execArgv-option'],
+        [resolvedTest?.execArgv?.[1] !== runnerPath, 'execArgv-path'],
+        [Object.keys(resolvedTest?.env || {{}})
+          .some(key => key.toUpperCase() === 'NODE_OPTIONS'), 'env'],
+      ].filter(([failed]) => failed).map(([, name]) => name);
+      if (violations.length) {{
+        throw new Error(
+          `Crosscheck Vitest runtime boundary changed after resolution: ${{violations.join(', ')}}`,
+        );
       }}
       const lock = (key, value) => Object.defineProperty(resolvedTest, key, {{
           configurable: false,
@@ -1679,10 +1764,19 @@ export default async (environment) => {{
         }});
       lock('runner', runnerPath);
       lock('environment', 'node');
-      lock('pool', resolvedPool);
+      lock('pool', 'forks');
+      lock('execArgv', Object.freeze(['--import', runnerPath]));
+      lock('env', Object.freeze({{ ...(resolvedTest.env || {{}}) }}));
       lock('environmentMatchGlobs', undefined);
       lock('projects', undefined);
+      lock('poolMatchGlobs', undefined);
       lock('browser', Object.freeze({{ ...(resolvedTest.browser || {{}}), enabled: false }}));
+      Object.defineProperty(resolved, 'define', {{
+        configurable: false,
+        enumerable: true,
+        writable: false,
+        value: Object.freeze({{ ...(resolved.define || {{}}) }}),
+      }});
       Object.freeze(resolved.plugins);
       Object.defineProperty(resolved, 'plugins', {{
         configurable: false,
@@ -1694,8 +1788,16 @@ export default async (environment) => {{
   }});
   return {{
     ...config,
+    define: {{}},
     plugins: [guard, ...protectedPlugins],
-    test: {{ ...test, environment: 'node', runner: runnerPath }},
+    test: {{
+      ...test,
+      environment: 'node',
+      env: {{ ...configuredEnv }},
+      execArgv: ['--import', runnerPath],
+      pool: 'forks',
+      runner: runnerPath,
+    }},
   }};
 }};
 """
@@ -1719,7 +1821,14 @@ def proof_checkout_root(path: Path) -> Path:
     return resolved
 
 
-def jest_runtime_root(run: TestRun, label: str) -> tuple[Path, Path]:
+def resolve_jest_runtime_graph(
+    run: TestRun,
+    environment_package: str,
+    label: str,
+    phase: str,
+    profile_path: Path,
+    deadline: float,
+) -> tuple[Path, dict[str, Path]]:
     checkout = proof_checkout_root(run.cwd)
     executable = Path(run.argv[0]).resolve()
     try:
@@ -1732,50 +1841,121 @@ def jest_runtime_root(run: TestRun, label: str) -> tuple[Path, Path]:
             "jest resolved its privileged runtime from the project-controlled "
             "proof checkout",
         )
-    roots = [parent for parent in executable.parents if parent.name == "node_modules"]
-    if not roots:
+    node = shutil.which("node", path=proof_environment().get("PATH"))
+    if node is None:
         non_execution(
             label,
-            "jest executable is not anchored to a measured node_modules runtime",
+            "node is unavailable for the Jest runtime-graph preflight",
         )
-    return checkout, roots[-1]
+    if run.body_probe is None:
+        tool_fail("Jest body probe did not allocate its runner-owned preload")
+    resolver_path = run.body_probe.with_name("jest-runtime-graph.cjs")
+    resolver_path.write_text(
+        """const { createRequire } = require('node:module');
+const { dirname } = require('node:path');
+const { readFileSync, realpathSync } = require('node:fs');
 
+const executable = realpathSync(process.argv[2]);
+const environmentPackage = process.argv[3];
+const requireFromJest = createRequire(executable);
 
-def require_jest_runtime_component(
-    value: Any,
-    key: str,
-    suffixes: tuple[str, ...],
-    checkout: Path,
-    runtime_root: Path,
-    label: str,
-) -> Path:
-    if not isinstance(value, str) or not value:
-        non_execution(label, f"jest emitted no resolved {key}")
-    resolved = Path(value).resolve()
-    try:
-        resolved.relative_to(checkout)
-    except ValueError:
-        pass
-    else:
+function packageVersion(entry, expectedName) {
+  let current = dirname(entry);
+  while (true) {
+    const manifest = `${current}/package.json`;
+    try {
+      const value = JSON.parse(readFileSync(manifest, 'utf8'));
+      if (value.name === expectedName) return value.version;
+    } catch {}
+    const parent = dirname(current);
+    if (parent === current) throw new Error(`package metadata absent for ${expectedName}`);
+    current = parent;
+  }
+}
+
+function resolveEntry(specifier, packageName) {
+  const path = realpathSync(requireFromJest.resolve(specifier));
+  return { path, version: packageVersion(path, packageName) };
+}
+
+const testRunner = resolveEntry('jest-circus/runner', 'jest-circus');
+const graph = {
+  executable: { path: executable, version: packageVersion(executable, 'jest') },
+  runner: resolveEntry('jest-runner', 'jest-runner'),
+  testRunner,
+  testEnvironment: resolveEntry(environmentPackage, environmentPackage),
+  runtime: resolveEntry('jest-runtime', 'jest-runtime'),
+  circusRun: {
+    path: realpathSync(createRequire(testRunner.path).resolve('./build/run.js')),
+    version: testRunner.version,
+  },
+};
+process.stdout.write(JSON.stringify(graph));
+""",
+        encoding="utf-8",
+    )
+    result = run_sandboxed(
+        [node, str(resolver_path), str(executable), environment_package],
+        cwd=run.cwd,
+        profile_path=profile_path,
+        allow_network=False,
+        allow_posix_ipc=False,
+        env=proof_environment(),
+        timeout=evidence_command_timeout(
+            deadline, evidence_timeout(), f"{label} {phase} Jest runtime graph"
+        ),
+        description=f"{label} {phase} Jest runtime graph",
+    )
+    if result.returncode != 0:
         non_execution(
             label,
-            f"jest uses a project-controlled {key} that cannot authenticate body events",
+            "jest could not resolve its privileged components through the exact "
+            f"executable package graph: {(result.stderr or result.stdout).strip()[:500]}",
         )
     try:
-        resolved.relative_to(runtime_root)
-    except ValueError:
+        report = json.loads(result.stdout)
+    except (json.JSONDecodeError, UnicodeError) as exc:
         non_execution(
             label,
-            f"jest uses a {key} outside its measured runtime installation",
+            f"jest emitted a malformed runtime graph: {exc}",
         )
-    if not resolved.is_file() or not any(
-        resolved.as_posix().endswith(suffix) for suffix in suffixes
-    ):
-        non_execution(
-            label,
-            f"jest uses an unmeasured {key} that cannot authenticate body events",
-        )
-    return resolved
+    expected_keys = {
+        "executable",
+        "runner",
+        "testRunner",
+        "testEnvironment",
+        "runtime",
+        "circusRun",
+    }
+    expected_version = MUTATION_RUNNER_POLICIES["jest"].runtime_version
+    if not isinstance(report, dict) or set(report) != expected_keys:
+        non_execution(label, "jest emitted an incomplete runtime graph")
+    paths: dict[str, Path] = {}
+    for key in expected_keys:
+        entry = report.get(key)
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"path", "version"}
+            or entry.get("version") != expected_version
+            or not isinstance(entry.get("path"), str)
+        ):
+            non_execution(label, f"jest runtime graph has an unmeasured {key}")
+        resolved = Path(entry["path"]).resolve()
+        try:
+            resolved.relative_to(checkout)
+        except ValueError:
+            pass
+        else:
+            non_execution(
+                label,
+                f"jest resolved project-controlled {key} code from the proof checkout",
+            )
+        if not resolved.is_file():
+            non_execution(label, f"jest runtime graph {key} is not a file")
+        paths[key] = resolved
+    if paths["executable"] != executable:
+        non_execution(label, "jest runtime graph did not bind the invoked executable")
+    return checkout, paths
 
 
 def prepare_jest_body_evidence(
@@ -1837,25 +2017,50 @@ def prepare_jest_body_evidence(
             f"test during the {phase} run; probe injection is ambiguous",
         )
     config = matching[0]
-    checkout, runtime_root = jest_runtime_root(run, label)
-    resolved_environment = require_jest_runtime_component(
-        config.get("testEnvironment"),
-        "test environment",
-        (
-            "/node_modules/jest-environment-node/build/index.js",
-            "/node_modules/jest-environment-jsdom/build/index.js",
-        ),
-        checkout,
-        runtime_root,
-        label,
-    )
-    for key, suffix in (
-        ("runner", "/node_modules/jest-runner/build/index.js"),
-        ("testRunner", "/node_modules/jest-circus/runner.js"),
+    environment_path = config.get("testEnvironment")
+    if not isinstance(environment_path, str) or not environment_path:
+        non_execution(label, "jest emitted no resolved test environment")
+    environment_text = Path(environment_path).resolve().as_posix()
+    if environment_text.endswith(
+        "/node_modules/jest-environment-node/build/index.js"
     ):
-        require_jest_runtime_component(
-            config.get(key), key, (suffix,), checkout, runtime_root, label
+        environment_package = "jest-environment-node"
+    elif environment_text.endswith(
+        "/node_modules/jest-environment-jsdom/build/index.js"
+    ):
+        environment_package = "jest-environment-jsdom"
+    else:
+        non_execution(
+            label,
+            "jest uses an unmeasured test environment before the body boundary",
         )
+    checkout, runtime_graph = resolve_jest_runtime_graph(
+        run,
+        environment_package,
+        label,
+        phase,
+        profile_path,
+        deadline,
+    )
+    for key in ("runner", "testRunner", "testEnvironment"):
+        value = config.get(key)
+        if not isinstance(value, str):
+            non_execution(label, f"jest emitted no resolved {key}")
+        effective = Path(value).resolve()
+        try:
+            effective.relative_to(checkout)
+        except ValueError:
+            pass
+        else:
+            non_execution(
+                label,
+                f"jest uses a project-controlled {key} before the body boundary",
+            )
+        if effective != runtime_graph[key]:
+            non_execution(
+                label,
+                f"jest effective {key} does not belong to its exact runtime graph",
+            )
     resolver = config.get("resolver")
     if resolver is not None and resolver != "":
         non_execution(
@@ -1863,14 +2068,13 @@ def prepare_jest_body_evidence(
             "jest uses a project-controlled resolver before the body-evidence boundary",
         )
     runtime = config.get("runtime")
-    if runtime:
-        require_jest_runtime_component(
-            runtime,
-            "runtime",
-            ("/node_modules/jest-runtime/build/index.js",),
-            checkout,
-            runtime_root,
+    if runtime and (
+        not isinstance(runtime, str)
+        or Path(runtime).resolve() != runtime_graph["runtime"]
+    ):
+        non_execution(
             label,
+            "jest effective runtime does not belong to its exact package graph",
         )
     try:
         source = target.read_text(encoding="utf-8")
@@ -1881,20 +2085,41 @@ def prepare_jest_body_evidence(
             label,
             "jest named test overrides the authenticated test environment in a docblock",
         )
-    transform_ignores = config.get("transformIgnorePatterns")
-    if not isinstance(transform_ignores, list) or any(
-        not isinstance(pattern, str) or not pattern for pattern in transform_ignores
-    ):
-        non_execution(label, "jest emitted malformed transformIgnorePatterns")
     if run.body_probe is None:
-        tool_fail("Jest body probe did not allocate its runner-owned environment")
-    gate_environment = run.body_probe
-    preload_path = gate_environment.with_name("jest-body-preload.cjs")
-    gate_environment.write_text(
-        f"""const loaded = require({json.dumps(str(resolved_environment))});
-const ProjectEnvironment = loaded.TestEnvironment || loaded.default || loaded;
-const channel = require({json.dumps(str(preload_path))});
-let constructed = false;
+        tool_fail("Jest body probe did not allocate its runner-owned preload")
+    preload_path = run.body_probe
+    wrapper_dir = (
+        preload_path.parent / "node_modules" / "crosscheck-jest-body-runner"
+    )
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    wrapper_path = wrapper_dir / "index.cjs"
+    wrapper_source = (
+        f"module.exports = require({json.dumps(str(runtime_graph['testRunner']))});\n"
+    )
+    wrapper_path.write_text(wrapper_source, encoding="utf-8")
+    wrapper_digest = hashlib.sha256(wrapper_source.encode()).hexdigest()
+    circus_digest = dict(
+        MUTATION_RUNNER_POLICIES["jest"].source_digests
+    )["circusRun"]
+    preload_path.write_text(
+        f"""const {{ createHash, randomBytes }} = require('node:crypto');
+const {{ readFileSync, writeSync }} = require('node:fs');
+const {{ Buffer }} = require('node:buffer');
+const {{ dirname }} = require('node:path');
+const Module = require('node:module');
+const runPath = {json.dumps(str(runtime_graph["circusRun"]))};
+const runnerPath = {json.dumps(str(runtime_graph["testRunner"]))};
+const wrapperPath = {json.dumps(str(wrapper_path))};
+const nonce = randomBytes(32).toString('hex');
+const prefix = 'CROSSCHECK-AUTH-BODY';
+const recorded = new WeakSet();
+const wasRecorded = WeakSet.prototype.has.bind(recorded);
+const markRecorded = WeakSet.prototype.add.bind(recorded);
+
+function writeEvent(kind, payload) {{
+  const suffix = payload ? ` ${{payload}}` : '';
+  writeSync(2, `${{prefix}} ${{kind}} ${{nonce}}${{suffix}}\\n`);
+}}
 
 function fullName(test) {{
   const names = [test.name];
@@ -1906,41 +2131,138 @@ function fullName(test) {{
   return names.filter(Boolean).join(' ');
 }}
 
-module.exports = class CrosscheckEnvironment extends ProjectEnvironment {{
-  constructor(...args) {{
-    super(...args);
-    if (constructed) throw new Error('Crosscheck Jest environment was instantiated twice');
-    constructed = true;
-    channel.claim(this);
-    const parentHandler = typeof this.handleTestEvent === 'function'
-      ? this.handleTestEvent.bind(this)
-      : null;
-    Object.defineProperty(this, 'handleTestEvent', {{
+function record(test) {{
+  if (wasRecorded(test)) return;
+  markRecorded(test);
+  const payload = Buffer.from(
+    JSON.stringify({{ fullName: fullName(test) }}),
+    'utf8',
+  ).toString('base64');
+  writeEvent('EVENT', payload);
+}}
+
+function seal(module, filename) {{
+  Object.freeze(module.exports);
+  Object.defineProperty(module, 'exports', {{
+    configurable: false,
+    enumerable: true,
+    writable: false,
+    value: module.exports,
+  }});
+  if (Module._cache[filename] === module) {{
+    Object.defineProperty(Module._cache, filename, {{
       configurable: false,
-      enumerable: false,
+      enumerable: true,
       writable: false,
-      value: async (event, state) => {{
-        if (parentHandler) await parentHandler(event, state);
-        if (event.name === 'test_fn_success' || event.name === 'test_fn_failure') {{
-          channel.record(this, fullName(event.test));
-        }}
-      }},
+      value: module,
     }});
   }}
-}};
+}}
+
+function patchRunSource(source, slot) {{
+  const digest = createHash('sha256').update(source).digest('hex');
+  if (digest !== {json.dumps(circus_digest)}) {{
+    throw new Error('Crosscheck Jest body module does not match measured Circus');
+  }}
+  const normal = "  try {{\\n    await (0, _utils.callAsyncCircusFn)(test, testContext, {{";
+  const concurrent = "      const testFn = test.fn;\\n      const promise = mutex(() =>\\n        testNameStorage.run((0, _utils.getTestID)(test), testFn)\\n      );";
+  if (source.split(normal).length !== 2 || source.split(concurrent).length !== 2) {{
+    throw new Error('Crosscheck Jest body boundary does not match measured Circus');
+  }}
+  source = `"use strict";\\nconst __crosscheckRecord = globalThis[${{JSON.stringify(slot)}}];\\ndelete globalThis[${{JSON.stringify(slot)}}];\\n${{source}}`;
+  source = source.replace(
+    normal,
+    "  const __crosscheckBody = test.fn;\\n  test.fn = function(...args) {{\\n    __crosscheckRecord(test);\\n    return __crosscheckBody.apply(this, args);\\n  }};\\n  try {{\\n    await (0, _utils.callAsyncCircusFn)(test, testContext, {{",
+  );
+  return source.replace(
+    concurrent,
+    "      const __crosscheckBody = test.fn;\\n      const testFn = (...args) => {{\\n        __crosscheckRecord(test);\\n        return __crosscheckBody(...args);\\n      }};\\n      const promise = mutex(() =>\\n        testNameStorage.run((0, _utils.getTestID)(test), testFn)\\n      );",
+  );
+}}
+
+const originalCompile = Module.prototype._compile;
+function compileTrusted(filename, source) {{
+  const prepared = new Module(filename, module);
+  prepared.filename = filename;
+  prepared.paths = Module._nodeModulePaths(dirname(filename));
+  Module._cache[filename] = prepared;
+  try {{
+    originalCompile.call(prepared, source, filename);
+    prepared.loaded = true;
+  }} catch (error) {{
+    delete Module._cache[filename];
+    throw error;
+  }}
+  seal(prepared, filename);
+  return prepared;
+}}
+
+const wrapperSource = readFileSync(wrapperPath, 'utf8');
+if (createHash('sha256').update(wrapperSource).digest('hex') !== {json.dumps(wrapper_digest)}) {{
+  throw new Error('Crosscheck Jest runner wrapper does not match its gate source');
+}}
+let invoked = false;
+async function invokeRunner(canonical, args) {{
+  if (invoked) throw new Error('Crosscheck Jest runner was invoked twice');
+  invoked = true;
+  const environment = args[2];
+  const runtime = args[3];
+  if (!environment?.global || !runtime || typeof runtime.readFile !== 'function') {{
+    throw new Error('Crosscheck Jest runner received an unmeasured runtime');
+  }}
+  const originalReadFile = runtime.readFile.bind(runtime);
+  const vmSlot = `__crosscheck_${{randomBytes(32).toString('hex')}}`;
+  environment.global[vmSlot] = record;
+  Object.defineProperty(runtime, 'readFile', {{
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: function(filename, ...args) {{
+      if (filename === runPath) {{
+        return patchRunSource(readFileSync(runPath, 'utf8'), vmSlot);
+      }}
+      return originalReadFile(filename, ...args);
+    }},
+  }});
+  writeEvent('START');
+  return canonical(...args);
+}}
+const gateSlot = `__crosscheck_${{randomBytes(32).toString('hex')}}`;
+globalThis[gateSlot] = invokeRunner;
+const trustedWrapperSource = `const __crosscheckGate = globalThis[${{JSON.stringify(gateSlot)}}];\\ndelete globalThis[${{JSON.stringify(gateSlot)}}];\\n${{wrapperSource.replace(
+  'module.exports = require(',
+  'const __crosscheckCanonical = require(',
+)}}module.exports = (...args) => __crosscheckGate(__crosscheckCanonical, args);\\n`;
+compileTrusted(wrapperPath, trustedWrapperSource);
+const runnerModule = Module._cache[runnerPath];
+if (!runnerModule) throw new Error('Crosscheck Jest runner did not load canonically');
+seal(runnerModule, runnerPath);
+Object.defineProperty(Module.prototype, '_compile', {{
+  configurable: false,
+  enumerable: false,
+  writable: false,
+  value: originalCompile,
+}});
 """,
         encoding="utf-8",
     )
-    argv.extend(["--env", str(gate_environment)])
-    for pattern in [*transform_ignores, re.escape(str(gate_environment.parent))]:
-        argv.extend(["--transformIgnorePatterns", pattern])
-    node_options = f"--require={json.dumps(str(preload_path))}"
+    node = shutil.which("node", path=proof_environment().get("PATH"))
+    if node is None:
+        non_execution(label, "node is unavailable for the Jest body preload")
     return TestRun(
-        tuple(argv),
+        tuple(
+            [
+                str(Path(node).resolve()),
+                f"--require={preload_path}",
+                *argv,
+                "--testRunner",
+                str(wrapper_path),
+            ]
+        ),
         run.cwd,
         run.body_evidence,
-        gate_environment,
-        (("NODE_OPTIONS", node_options),),
+        preload_path,
+        (),
     )
 
 
@@ -1958,8 +2280,15 @@ def read_javascript_body_report(
             f"the {phase} run",
         )
     starts: list[str] = []
+    preloads: list[str] = []
     events: list[tuple[str, str]] = []
     for line in channel_lines:
+        preload_match = re.fullmatch(
+            r"CROSSCHECK-AUTH-BODY PRELOAD ([0-9a-f]{64})", line
+        )
+        if preload_match:
+            preloads.append(preload_match.group(1))
+            continue
         start_match = re.fullmatch(
             r"CROSSCHECK-AUTH-BODY START ([0-9a-f]{64})", line
         )
@@ -1982,6 +2311,13 @@ def read_javascript_body_report(
             f"during the {phase} run",
         )
     nonce = starts[0]
+    if runner == "vitest" and preloads != [nonce]:
+        non_execution(
+            label,
+            "vitest did not attest its body channel at the worker preload boundary",
+        )
+    if runner != "vitest" and preloads:
+        non_execution(label, f"{runner} emitted an unexpected body-channel preload")
     executions: set[str] = set()
     for event_nonce, payload in events:
         if event_nonce != nonce:

@@ -205,12 +205,15 @@ Symlink rejection is anchored at the resolved review checkout, so a symlink insi
 The gate resolves the named runner before launch and reports an absent binary, a failed sandbox exec, a missing named test, and every measured runner non-execution explicitly as `NON-EXECUTION`.
 For Jest and Vitest, the gate accepts a passed or failed assertion record only when an authenticated runner-owned stderr channel recorded entry into that exact selected test body.
 The channel creates a random nonce outside the project-writable checkout, emits body events from a closure unavailable to project code, and treats missing, duplicate, malformed, or mismatched channel records as `NON-EXECUTION`; project-writable marker files are never evidence.
-For Jest, a sandboxed `--showConfig` preflight resolves the selected project and replaces only a measured Node or jsdom environment with a gate-owned subclass that records Circus `test_fn_success` and `test_fn_failure` events after the body was actually invoked.
-The Jest executable, environment, runner, test framework, and runtime must resolve beneath the same external `node_modules` installation, and none may resolve inside the proof checkout.
-The Jest channel is preloaded before configuration, environments, transforms, and `setupFiles`, while tracked setup remains untouched; custom resolvers and per-file environment overrides fail closed when the same boundary cannot be established.
-For Vitest, the gate-owned config imports the discovered tracked `vitest.config.*` or `vite.config.*`, preserves its plugins, aliases, setup, and ordinary test options, and locks the body runner during resolved configuration.
-Node preloads that runner package before any environment setup, and its location beneath a gate-owned external `node_modules` directory keeps it on Node's native import path instead of the tracked Vite transform pipeline.
-Custom runners, browser mode, projects, unmeasured pools, custom environments, and per-file environment overrides fail closed when that ordering cannot be guaranteed.
+For Jest, a sandboxed `--showConfig` preflight resolves the selected project without replacing its tracked environment or setup.
+The Jest executable, environment, runner, test framework, runtime, and measured Circus body module must resolve through the exact Jest 29.7.0 executable package graph, the body module must match its measured SHA-256 digest, and none may resolve inside the proof checkout.
+The Jest channel is pinned in Node's `execArgv` before configuration, environments, transforms, and `setupFiles`, and the measured run stays in that preloaded process before a digest-checked gate wrapper loads the exact canonical runner and interposes the canonical Circus source as Jest imports it into the test VM.
+That interposed source records immediately inside the actual test-function wrapper rather than trusting publicly dispatchable lifecycle events.
+Custom resolvers, sibling runtime copies, project-local suffix spoofs, and per-file environment overrides fail closed when that boundary cannot be established.
+For Vitest, the executable and runtime export must match the measured external Vitest 4.1.5 package, while the gate-owned config imports the discovered tracked `vitest.config.*` or `vite.config.*`, preserves its plugins, aliases, setup, and ordinary test options, and locks the body runner during resolved configuration.
+Every Vitest worker imports that runner package through the gate-pinned `test.execArgv` before worker initialization, and its location beneath a gate-owned external `node_modules` directory keeps it on Node's native import path instead of the tracked Vite transform pipeline.
+The gate retains each tracked plugin's prototype and property descriptors while interposing only runner-loading hooks, so class-based and non-enumerable startup hooks keep their project semantics.
+Custom runners, browser mode, projects, threads, custom pools, project worker arguments, serialized defines, `test.env.NODE_OPTIONS`, custom environments, and per-file environment overrides fail closed when that ordering cannot be attested.
 A failed `beforeAll` or `beforeEach` hook can create a failed assertion record without entering the test function, so it remains `NON-EXECUTION` and clears nothing.
 Duplicate passed or failed full names are ambiguous and remain `NON-EXECUTION`, so one same-named body's marker can never satisfy another outcome.
 That distinction applies to baseline and mutation runs alike because a run that never entered the selected test body can neither condemn the baseline nor vindicate the mutation.
@@ -231,8 +234,8 @@ The JavaScript profile was measured on 2026-08-09 with Jest 29.7.0 and Vitest 4.
 
 ```sh
 jest --showConfig --json
-NODE_OPTIONS='--require="/gate/jest-body-preload.cjs"' jest --json --runTestsByPath /proof/regression.test.js --env /gate/jest-body-environment.cjs --transformIgnorePatterns /gate --testNamePattern 'across chats resets state'
-NODE_OPTIONS='--import="/gate/node_modules/crosscheck-vitest-body-runner/index.mjs"' vitest run --reporter=json regression.test.js --config /gate/vitest-body-probe.config.mjs --testNamePattern 'across chats resets state'
+node --require=/gate/jest-body-preload.cjs /runtime/node_modules/jest/bin/jest.js --json --runInBand --runTestsByPath /proof/regression.test.js --testNamePattern 'across chats resets state' --testRunner /gate/node_modules/crosscheck-jest-body-runner/index.cjs
+vitest run --reporter=json regression.test.js --config /gate/vitest-body-probe.config.mjs --testNamePattern 'across chats resets state'
 ```
 
 The matched baseline exited 0 and recorded one passed selected assertion on both runners.
@@ -242,13 +245,13 @@ A missing target exited 1 with zero assertions, using a Jest runtime-error suite
 A missing imported dependency exited 1 with a failed suite and an empty `assertionResults` array on both runners, with Jest additionally reporting one runtime-error suite.
 A conventional `jest.config.cjs` or `vitest.config.js` that threw during loading exited 1 and emitted no JSON stdout on either runner.
 A tracked `setupFilesAfterEnv` or `setupFiles` entry that failed before the body remained active after probe injection and was classified as `NON-EXECUTION`.
-A failed `beforeAll` or `beforeEach` hook recorded a failed assertion without a matching authenticated body event and was classified as `NON-EXECUTION`, even when an earlier tracked `setupFiles` entry wrapped `fs.writeSync` and the hook also forged the former predictable marker file.
+A failed `beforeAll` or `beforeEach` hook recorded a failed assertion without a matching authenticated body event and was classified as `NON-EXECUTION`, even when an earlier tracked `setupFiles` entry wrapped `fs.writeSync`, the hook forged the former predictable marker file, or project code dispatched a native Circus `test_fn_failure` event.
 The gate-owned Vitest config merges the tracked project config and selects a natively imported probe that extends the runtime `TestRunner` export.
-A tracked Vitest plugin cannot transform that external runner, cannot replace its frozen resolved-config binding, and a custom environment cannot run before its nonce and captured runtime functions are initialized.
-A transform forgery, resolved-config mutation, custom-environment forgery, or second runner construction is classified as `NON-EXECUTION`.
+A tracked Vitest plugin cannot transform that external runner, cannot replace its frozen resolved-config binding, and retains prototype-defined startup hooks after protection.
+A transform forgery, resolved-config mutation, custom-environment forgery, unattested worker configuration, dropped class-plugin hook, or second runner construction is classified as `NON-EXECUTION`.
 Those observed shapes are what the shared `jest-compatible-json` report policy and runner-specific body probes encode; exit status and assertion status are deliberately insufficient on their own.
 
-To add a future runner, add one policy entry carrying its invocation ladder, gate-owned arguments, selector mode, project-root rule, report format, measured non-execution exits, and dated measurement string.
+To add a future runner, add one policy entry carrying its invocation ladder, gate-owned arguments, selector mode, project-root rule, report format, runtime version and source digests, measured non-execution exits, and dated measurement string.
 Add a parser only when the runner uses a genuinely new measured report format, and keep that parser selected by the policy rather than branching throughout the gate.
 Add hermetic behavior coverage for every non-execution shape plus a real-runner end-to-end baseline-pass/control-pass/mutation-only-regression-fail certification before enabling the policy.
 
@@ -345,7 +348,7 @@ The retained live runtime proof is the change receipt for this patch; the opt-in
 Its `test_pytest_runner_resolves_through_a_uv_aware_ladder` case is the named regression for runner-name resolution: it pins monorepo uv-project discovery, the skipped uv rung outside a project, the unchanged absent-runner refusal, and pytest's retained node-id support.
 Its `test_javascript_runner_policy_is_declared_once` case pins the nearest-package working directory, exact gate-owned Jest and Vitest arguments, selector translation, neutral ancestor configs, and single policy registry.
 Its `test_javascript_runners_certify_platform_shaped_mutation_proofs` case executes end-to-end Jest and Vitest proofs where the control passes in both runs and the regression fails only after mutation.
-Its real Jest and Vitest integration cases retain tracked setup, aliases, and plugins while injecting body evidence, then require tracked mutation-only startup failures, an early Jest channel-capture attempt, a project-local Jest runtime spoof, and Vitest transform, resolved-config, and custom-environment forgeries to remain `NON-EXECUTION`.
+Its real Jest and Vitest integration cases retain tracked setup, aliases, and plugins while injecting body evidence, then require tracked mutation-only startup failures, an early Jest channel-capture attempt, forged Circus dispatch, project-local and sibling Jest runtime spoofs, Vitest transform and resolved-config mutations, unattested workers, custom environments, and class-plugin startup failures to remain `NON-EXECUTION`.
 Its `test_javascript_non_executions_clear_nothing` case executes the measured unmatched-selector, startup-failure, missing-dependency, and missing-test shapes and requires every one to retain the open finding.
 Its `test_account_less_known_provider_lane_is_reviewable` case is the named regression for account-less lanes: it drives a Pi lane with no `account_home` and a slot-qualified model, requires a cross-provider reviewer to clear it, and requires a same-provider reviewer to be refused.
 Its `test_claude_execution_home_always_binds_the_keychain` case is the named regression for the private-`HOME` Keychain bind, and it fails if the bind is made conditional on `.credentials.json` again.

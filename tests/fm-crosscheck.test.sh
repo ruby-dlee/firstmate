@@ -914,6 +914,7 @@ elif scenario in {
     "vitest-real-native-env-semantics",
     "vitest-real-hook-body-replacement",
     "vitest-real-fork-identity",
+    "vitest-real-spawn-forgery",
     "vitest-real-class-plugin-failure",
     "vitest-no-match",
     "vitest-startup",
@@ -955,6 +956,7 @@ elif scenario in {
         "vitest-real-native-env-semantics",
         "vitest-real-hook-body-replacement",
         "vitest-real-fork-identity",
+        "vitest-real-spawn-forgery",
         "vitest-real-class-plugin-failure",
         "vitest-no-match",
         "vitest-startup",
@@ -1059,6 +1061,7 @@ elif scenario in {
         "vitest-real-native-env-semantics": "tests/native-env-semantics.test.mjs::selected body",
         "vitest-real-hook-body-replacement": "tests/hook-body-replacement.test.mjs::selected body",
         "vitest-real-fork-identity": "tests/fork-identity.test.mjs::selected body",
+        "vitest-real-spawn-forgery": "tests/spawn-forgery.test.mjs::selected body",
         "vitest-real-class-plugin-failure": "tests/class-plugin.test.mjs::selected body",
         "vitest-no-match": "tests/regression.test.sh::does not exist",
         "vitest-startup": "tests/regression.test.sh::across chats resets state",
@@ -4549,6 +4552,87 @@ assert value["findings"][0]["lifecycle"] == "open"
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" \
     || fail "gate-only fork semantics cleared the finding"
 
+  record=$(make_case vitest-real-spawn-forgery)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/tests/spawn-forgery.test.mjs" <<'JS'
+import { beforeEach, expect, test } from 'vitest';
+import { readFileSync } from 'node:fs';
+
+beforeEach(() => {
+  if (readFileSync('app.txt', 'utf8').trim() !== 'fixed') {
+    globalThis.projectForgeBodyEvent?.('selected body');
+    throw new Error('spawn forgery failed before the body');
+  }
+});
+
+test('selected body', () => {
+  expect(true).toBe(true);
+});
+JS
+  cat > "$case_dir/repo/tests/spawn-forgery-preload.cjs" <<'JS'
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const { syncBuiltinESMExports } = require('node:module');
+
+const ownOption = `--require=${__filename}`;
+process.env.NODE_OPTIONS = process.env.NODE_OPTIONS.replace(`${ownOption} `, '');
+crypto.randomBytes = () => Buffer.alloc(32, 7);
+const originalWrite = fs.writeSync;
+fs.writeSync = function (fd, value, ...args) {
+  return Reflect.apply(originalWrite, fs, [fd, value, ...args]);
+};
+syncBuiltinESMExports();
+
+globalThis.projectForgeBodyEvent = (fullName) => {
+  const payload = Buffer.from(JSON.stringify({ fullName }), 'utf8').toString('base64');
+  Reflect.apply(originalWrite, fs, [
+    2,
+    `CROSSCHECK-AUTH-BODY EVENT ${'07'.repeat(32)} ${payload}\n`,
+  ]);
+};
+JS
+  cat > "$case_dir/repo/vitest.config.mjs" <<'JS'
+import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
+import { ChildProcess } from 'node:child_process';
+
+if (readFileSync('app.txt', 'utf8').trim() !== 'fixed') {
+  const attacker = fileURLToPath(
+    new URL('./tests/spawn-forgery-preload.cjs', import.meta.url),
+  );
+  const nativeSpawn = ChildProcess.prototype.spawn;
+  ChildProcess.prototype.spawn = function (options) {
+    const index = options.envPairs.findIndex(value => value.startsWith('NODE_OPTIONS='));
+    const expected = options.envPairs[index].slice('NODE_OPTIONS='.length);
+    options.envPairs[index] = `NODE_OPTIONS=--require=${attacker} ${expected}`;
+    return Reflect.apply(nativeSpawn, this, [options]);
+  };
+}
+
+export default {};
+JS
+  git -C "$case_dir/repo" add tests/spawn-forgery.test.mjs \
+    tests/spawn-forgery-preload.cjs vitest.config.mjs
+  git -C "$case_dir/repo" commit -qm 'add Vitest native spawn forgery'
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_open_ledger "$case_dir" "$head"
+  ln -s "$runtime/node_modules/.bin/vitest" "$case_dir/pathbin/vitest"
+  set +e
+  run_case "$case_dir" "$base" "$head" vitest-real-spawn-forgery run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "Vitest native spawn forgery"
+  assert_grep 'NON-EXECUTION' "$case_dir/err" \
+    "project-patched native spawn forged Vitest body evidence"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "a project-patched native spawn cleared the finding"
+
   record=$(make_case vitest-real-class-plugin-failure)
   IFS=$'\t' read -r case_dir base head <<< "$record"
   cat > "$case_dir/repo/tests/class-plugin.test.mjs" <<'JS'
@@ -6321,6 +6405,8 @@ JS
     "$case_dir/runtime/node_modules/vitest/vitest.mjs"
   ln -s "$case_dir/runtime/node_modules/jest/bin/jest.js" "$case_dir/bin/jest"
   ln -s "$case_dir/runtime/node_modules/vitest/vitest.mjs" "$case_dir/bin/vitest"
+  printf '#!/bin/bash\nprintf "v20.6.0\\n"\n' > "$case_dir/bin/node"
+  chmod +x "$case_dir/bin/node"
 
   PATH="$case_dir/bin:$PATH" "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$case_dir" <<'PY' \
     || fail "JavaScript mutation-runner policy was not a complete declaration"
@@ -6367,6 +6453,11 @@ for runner in ("jest", "vitest"):
     assert policy.body_probe, runner
     assert policy.absolute_test_path is expected[runner][3], runner
     assert policy.runtime_version == expected[runner][4], runner
+    assert policy.minimum_node_version == (
+        (20, 6, 0) if runner == "vitest" else None
+    ), runner
+    if runner == "vitest":
+        assert "Node 20.20.2" in policy.measurement, policy.measurement
     if runner == "jest":
         assert dict(policy.source_digests)["circusRun"]
         assert dict(policy.source_digests)["circusUtils"]
@@ -6400,25 +6491,28 @@ for runner in ("jest", "vitest"):
         assert "pool: 'forks'" in probe
         assert "crosscheck-worker-environment-boundary" in probe
         assert "Object.defineProperty(process, 'env'" not in probe
-        launch_preload = probe_argument.with_name("vitest-launch-preload.cjs")
+        launch_preload = probe_argument.with_name("vitest-launch-preload.mjs")
         assert launch_preload.is_file()
         launch_source = launch_preload.read_text()
         loader_source = probe_argument.with_name("vitest-launch-loader.mjs").read_text()
         child_process_source = probe_argument.with_name("vitest-child-process.mjs").read_text()
         assert "register(loaderUrl)" in launch_source
+        assert "await import(childProcessUrl)" in launch_source
         assert "childProcess.fork" not in launch_source
         assert "syncBuiltinESMExports" not in launch_source
         assert fake_launcher.as_uri() in loader_source
         assert "context.parentURL === launcherUrl" in loader_source
         assert "export function fork" in child_process_source
         assert "expectedWorkerPath" in child_process_source
+        assert "requireNativeSpawn()" in child_process_source
+        assert "nativeChildProcessPrototype" in child_process_source
         assert "Object.freeze(CrosscheckBodyRunner.prototype)" in runner_source
         assert "writeEvent('PRELOAD')" in runner_source
         assert "async onBeforeRunTask(test)" in runner_source
         assert "getRegisteredBody(test) !== body" in runner_source
         assert "VitestTestRunner" not in runner_source, runner_source
         assert dict(run.environment) == {
-            "NODE_OPTIONS": f"--require={launch_preload}",
+            "NODE_OPTIONS": f"--import={launch_preload}",
         }
         assert run.argv[6:] == (
             "--testNamePattern", "(within a chat|across chats)"
@@ -6505,6 +6599,21 @@ for runner in ("jest", "vitest"):
         assert Path(prepared.argv[2]).resolve() == Path(run.argv[0]).resolve()
         assert dict(prepared.environment) == {}
     assert run.body_evidence, runner
+
+node = case / "bin" / "node"
+node.write_text('#!/bin/bash\nprintf "v20.5.0\\n"\n')
+try:
+    module.test_arguments(
+        {"runner": "vitest", "arguments": []}, path, checkout, "old-node-proof"
+    )
+except module.CrosscheckError as exc:
+    assert "NON-EXECUTION" in str(exc), exc
+    assert "requires Node >=20.6.0, found 20.5.0" in str(exc), exc
+else:
+    raise AssertionError("Vitest accepted Node below the measured loader boundary")
+
+node.write_text('#!/bin/bash\nprintf "v20.6.0\\n"\n')
+assert module.require_node_runtime("minimum-node-proof", (20, 6, 0)) == (20, 6, 0)
 
 neutral = case / "neutral"
 neutral.mkdir()
@@ -6866,6 +6975,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-11 ]; then
+  test_javascript_runner_policy_is_declared_once
+  test_real_vitest_body_probe_certifies_mutation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-12 ]; then
   test_javascript_runner_policy_is_declared_once
   test_real_vitest_body_probe_certifies_mutation
   exit 0

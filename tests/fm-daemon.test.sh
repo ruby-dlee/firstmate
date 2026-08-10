@@ -402,6 +402,53 @@ test_pause_refresh_cleanup_rejects_stale_generation() {
   pass "pause refresh cleanup never signals a stale generation"
 }
 
+test_stale_pause_refresh_preserves_current_cache() {
+  local dir state task last sig cache marker tmp entered release worker i
+  dir=$(make_supercase pause-refresh-preserve-current-cache)
+  state="$dir/state"
+  task=pause-refresh-preserve-cache
+  last='paused: awaiting generation handoff'
+  cache="$state/.subsuper-pause-class-$task"
+  marker="$state/.subsuper-pause-refresh-$task"
+  tmp="${cache}.tmp.stale-generation"
+  entered="$dir/entered"
+  release="$dir/release"
+  printf '%s\n' "$last" > "$state/$task.status"
+  sig=$(_fm_status_file_sig "$state/$task.status")
+  printf 'previous-daemon-generation\n' > "$state/.subsuper-pause-refresh-generation"
+  mkdir "$marker"
+  printf 'previous-daemon-generation\n' > "$marker/generation"
+  : > "$marker/owned"
+  printf 'stale worker output\n' > "$tmp"
+  (
+    crew_absorb_class() {
+      : > "$entered"
+      while [ ! -e "$release" ]; do sleep 0.01; done
+      printf 'paused'
+    }
+    pause_class_refresh_worker "$state" "$task" "$last" "$(_now)" "$sig" \
+      "$cache" "$marker" "$tmp" previous-daemon-generation
+  ) &
+  worker=$!
+  for i in {1..100}; do
+    [ -e "$entered" ] && break
+    sleep 0.01
+  done
+  if [ ! -e "$entered" ]; then
+    : > "$release"
+    wait "$worker" 2>/dev/null || true
+    fail "stale refresh fixture did not reach generation handoff"
+  fi
+  printf 'current-daemon-generation\n' > "$state/.subsuper-pause-refresh-generation"
+  printf 'current-cache\t123\tworking\n' > "$cache"
+  : > "$release"
+  wait "$worker" || fail "stale refresh worker failed during generation handoff"
+  [ "$(cat "$cache")" = "$(printf 'current-cache\t123\tworking')" ] \
+    || fail "stale refresh worker deleted or replaced the current generation cache"
+  [ ! -e "$tmp" ] || fail "stale refresh worker retained its generation-unique temporary artifact"
+  pass "stale pause refresh preserves the current generation cache"
+}
+
 test_pause_refresh_cleanup_rejects_identity_mismatch() {
   local dir state marker victim pgid monitor_was_on=0
   dir=$(make_supercase pause-refresh-identity-mismatch)
@@ -2033,6 +2080,7 @@ if [ "${FM_TEST_FOCUSED:-}" = held-live-monitor ]; then
   test_housekeeping_pause_class_cache
   test_housekeeping_bounds_cold_pause_refreshes
   test_pause_refresh_cleanup_rejects_stale_generation
+  test_stale_pause_refresh_preserves_current_cache
   test_pause_refresh_cleanup_rejects_identity_mismatch
   test_pause_refresh_cleanup_stops_owned_process_group
   test_housekeeping_delivers_before_pause_classification
@@ -2054,6 +2102,7 @@ test_held_live_monitor_reaches_away_wedge_escalation
 test_housekeeping_pause_class_cache
 test_housekeeping_bounds_cold_pause_refreshes
 test_pause_refresh_cleanup_rejects_stale_generation
+test_stale_pause_refresh_preserves_current_cache
 test_pause_refresh_cleanup_rejects_identity_mismatch
 test_pause_refresh_cleanup_stops_owned_process_group
 test_housekeeping_delivers_before_pause_classification

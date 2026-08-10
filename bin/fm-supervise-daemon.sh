@@ -639,7 +639,7 @@ pause_class_refresh_worker() {
     && [ -n "$sig" ] && [ "$sig" = "$after" ] && [ "$last" = "$current" ]; then
     printf '%s\t%s\t%s\n' "$sig" "$now" "$class" > "$tmp" && mv -f "$tmp" "$cache"
   else
-    rm -f "$cache" "$tmp"
+    rm -f "$tmp"
   fi
   rm -f "$tmp"
   : > "$marker/done" 2>/dev/null || true

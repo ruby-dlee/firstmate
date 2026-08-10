@@ -56,6 +56,8 @@ MAX_SAME_MODEL_CONFIG_BYTES = 16
 MAX_LEGACY_AUTHOR_ADMISSION_CONFIG_BYTES = 64 * 1024
 MAX_LEGACY_AUTHOR_ADMISSIONS = 128
 LEGACY_AUTHOR_ADMISSION_MODE = "unproven-legacy-admission"
+PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH = "launch-bound-v1"
+LEGACY_AUTHOR_PROVENANCE = "pre-snapshot-pi"
 MAX_LEDGER_PROMPT_BYTES = 64_000
 MAX_PROJECTED_FINDINGS = 512
 MAX_PROJECTED_EVENTS = 8
@@ -287,6 +289,7 @@ def legacy_author_admission(
         "author_harness",
         "author_model",
         "approved_at",
+        "legacy_author_provenance",
         "replacement_unavailable",
         "replacement_unavailable_reason",
         "admit_unproven_author_account",
@@ -336,6 +339,10 @@ def legacy_author_admission(
         except ValueError:
             fail(f"{label}.approved_at must be an exact UTC timestamp like 2026-08-10T12:00:00Z")
         require(
+            admission.get("legacy_author_provenance") == LEGACY_AUTHOR_PROVENANCE,
+            f"{label}.legacy_author_provenance must equal {LEGACY_AUTHOR_PROVENANCE}",
+        )
+        require(
             admission.get("replacement_unavailable") is True,
             f"{label}.replacement_unavailable must equal true",
         )
@@ -377,7 +384,8 @@ def legacy_author_admission(
     require(
         meta.get("harness") == "pi"
         and "account_home" not in meta
-        and "author_account_identity" not in meta,
+        and "author_account_identity" not in meta
+        and "author_identity_snapshot_epoch" not in meta,
         "legacy author admission applies only to a pre-snapshot account-less Pi lane; "
         "it cannot downgrade a modern or routed author identity",
     )
@@ -397,6 +405,7 @@ def legacy_author_admission(
         "legacy_replacement_unavailable_reason": admission[
             "replacement_unavailable_reason"
         ],
+        "legacy_author_provenance": admission["legacy_author_provenance"],
         "legacy_author_harness": admission["author_harness"],
         "legacy_author_model": admission["author_model"],
     }
@@ -1004,6 +1013,7 @@ def parse_meta(path: Path) -> dict[str, str]:
             "model",
             "account_home",
             "author_account_identity",
+            "author_identity_snapshot_epoch",
             "account_routing_emergency_bypass",
         }:
             require(
@@ -1035,6 +1045,13 @@ def parse_meta(path: Path) -> dict[str, str]:
             and "/" in result["model"],
             f"task metadata at {path} records author_account_identity without "
             "a routed Pi OpenAI provider slot",
+        )
+    if "author_identity_snapshot_epoch" in result:
+        require(
+            result["author_identity_snapshot_epoch"]
+            == PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH
+            and result["harness"] == "pi",
+            f"task metadata at {path} has an invalid author identity snapshot epoch",
         )
     if "account_routing_emergency_bypass" in result:
         require(
@@ -2861,6 +2878,7 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
                 "legacy_admission_approved_at",
                 "legacy_replacement_unavailable",
                 "legacy_replacement_unavailable_reason",
+                "legacy_author_provenance",
                 "legacy_author_harness",
                 "legacy_author_model",
                 "reviewer_account_identity_sha256",
@@ -2888,6 +2906,11 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
                 require(
                     reviewer["legacy_author_harness"] == "pi",
                     f"{label}.reviewer.legacy_author_harness must equal pi",
+                )
+                require(
+                    reviewer["legacy_author_provenance"]
+                    == LEGACY_AUTHOR_PROVENANCE,
+                    f"{label}.reviewer.legacy_author_provenance is invalid",
                 )
                 provider_slot, separator, _model = reviewer[
                     "legacy_author_model"
@@ -3073,6 +3096,7 @@ def reviewer_candidates(
             "legacy_admission_approved_at",
             "legacy_replacement_unavailable",
             "legacy_replacement_unavailable_reason",
+            "legacy_author_provenance",
             "legacy_author_harness",
             "legacy_author_model",
         }
@@ -3085,6 +3109,9 @@ def reviewer_candidates(
             and meta.get("harness") == "pi"
             and "account_home" not in meta
             and "author_account_identity" not in meta
+            and "author_identity_snapshot_epoch" not in meta
+            and legacy_admission.get("legacy_author_provenance")
+            == LEGACY_AUTHOR_PROVENANCE
             and legacy_admission.get("legacy_author_harness") == meta.get("harness")
             and legacy_admission.get("legacy_author_model") == meta.get("model"),
             "legacy author admission cannot downgrade or mismatch task author metadata",
@@ -4534,6 +4561,16 @@ def render_report(ledger: dict[str, Any], run: dict[str, Any]) -> str:
                 f"Admission digest: `{reviewer['legacy_admission_sha256']}`",
                 "",
                 f"Admission approved at: `{reviewer['legacy_admission_approved_at']}`",
+                "",
+                "Historical author provenance: "
+                f"`{reviewer['legacy_author_provenance']}`",
+                "",
+                f"Historical author harness: `{reviewer['legacy_author_harness']}`",
+                "",
+                f"Historical author model: `{reviewer['legacy_author_model']}`",
+                "",
+                "Reviewer account identity digest: "
+                f"`{reviewer['reviewer_account_identity_sha256']}`",
                 "",
                 "Replacement unavailable: "
                 f"{reviewer['legacy_replacement_unavailable_reason']}",

@@ -1479,6 +1479,7 @@ entry = {
     "author_harness": "pi",
     "author_model": meta["model"],
     "approved_at": "2026-08-10T12:00:00Z",
+    "legacy_author_provenance": "pre-snapshot-pi",
     "replacement_unavailable": True,
     "replacement_unavailable_reason": "PR branch is not writable by this fleet; exact-head replacement cannot be published.",
     "admit_unproven_author_account": True,
@@ -1510,12 +1511,30 @@ except module.CrosscheckError as exc:
     assert "cannot downgrade a modern or routed author identity" in str(exc), str(exc)
 else:
     raise AssertionError("legacy admission replaced a modern author snapshot")
+
+modern_failed_snapshot_meta = dict(
+    meta, author_identity_snapshot_epoch="launch-bound-v1"
+)
+try:
+    module.legacy_author_admission(
+        home, task_id, url, head, modern_failed_snapshot_meta
+    )
+except module.CrosscheckError as exc:
+    assert "cannot downgrade a modern or routed author identity" in str(exc), str(exc)
+else:
+    raise AssertionError("legacy admission replaced a modern failed snapshot")
 try:
     module.reviewer_candidates(home, modern_meta, admission)
 except module.CrosscheckError as exc:
     assert "cannot downgrade or mismatch" in str(exc), str(exc)
 else:
     raise AssertionError("direct legacy admission bypassed modern same-account refusal")
+try:
+    module.reviewer_candidates(home, modern_failed_snapshot_meta, admission)
+except module.CrosscheckError as exc:
+    assert "cannot downgrade or mismatch" in str(exc), str(exc)
+else:
+    raise AssertionError("direct legacy admission bypassed the modern snapshot epoch")
 
 # Even an admitted lane needs a readable, launch-bound reviewer account.
 (reviewer_home / "auth.json").write_text("{}\n", encoding="utf-8")
@@ -2376,7 +2395,7 @@ test_legacy_author_admission_is_visible_in_prompt_and_evidence() {
     "$case_dir/state/task-x1.meta"
   rm "$case_dir/state/task-x1.meta.bak"
   cat > "$case_dir/home/config/crosscheck-legacy-author-admissions.json" <<EOF
-{"admissions":[{"task_id":"task-x1","pull_request":"$PR_URL","head_sha":"$head","author_harness":"pi","author_model":"openai-codex-5/gpt-5.6-sol","approved_at":"2026-08-10T12:00:00Z","replacement_unavailable":true,"replacement_unavailable_reason":"PR branch is not writable by this fleet; exact-head replacement cannot be published.","admit_unproven_author_account":true}]}
+{"admissions":[{"task_id":"task-x1","pull_request":"$PR_URL","head_sha":"$head","author_harness":"pi","author_model":"openai-codex-5/gpt-5.6-sol","approved_at":"2026-08-10T12:00:00Z","legacy_author_provenance":"pre-snapshot-pi","replacement_unavailable":true,"replacement_unavailable_reason":"PR branch is not writable by this fleet; exact-head replacement cannot be published.","admit_unproven_author_account":true}]}
 EOF
 
   output=$(run_case "$case_dir" "$base" "$head" clear run) \
@@ -2413,6 +2432,7 @@ assert run["state"] == "clear", run
 assert reviewer["author_account_independence"] == "unproven-legacy-admission", reviewer
 assert reviewer["legacy_author_harness"] == "pi", reviewer
 assert reviewer["legacy_author_model"] == "openai-codex-5/gpt-5.6-sol", reviewer
+assert reviewer["legacy_author_provenance"] == "pre-snapshot-pi", reviewer
 assert reviewer["legacy_admission_approved_at"] == "2026-08-10T12:00:00Z", reviewer
 assert reviewer["legacy_replacement_unavailable"] == "true", reviewer
 assert "PR branch is not writable" in reviewer[
@@ -2426,6 +2446,10 @@ report = Path(sys.argv[2]).read_text(encoding="utf-8")
 assert "Review mode: **LEGACY AUTHOR ACCOUNT UNPROVEN**" in report, report
 assert "the reviewer may share the author's upstream account" in report, report
 assert "Replacement unavailable: PR branch is not writable" in report, report
+assert "Historical author provenance: `pre-snapshot-pi`" in report, report
+assert "Historical author harness: `pi`" in report, report
+assert "Historical author model: `openai-codex-5/gpt-5.6-sol`" in report, report
+assert f"Reviewer account identity digest: `{reviewer['reviewer_account_identity_sha256']}`" in report, report
 assert "account separation remained mandatory" not in report, report
 assert "author-account independence is also unproven" in report, report
 PY

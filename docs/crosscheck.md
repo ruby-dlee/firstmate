@@ -60,7 +60,7 @@ The old lane or worktree being gone is not by itself a reason for admission when
 It is local, gitignored, read fresh at reviewer preflight, and absent means no admission.
 There is no global on switch.
 Each entry admits exactly one task, canonical PR URL, and live head SHA, and must repeat the Pi harness and provider-slot-prefixed model recorded in task metadata.
-It also requires an exact UTC approval time, literal `replacement_unavailable: true`, one printable-line `replacement_unavailable_reason`, and literal `admit_unproven_author_account: true` acknowledgement.
+It also requires an exact UTC approval time, literal `legacy_author_provenance: pre-snapshot-pi`, literal `replacement_unavailable: true`, one printable-line `replacement_unavailable_reason`, and literal `admit_unproven_author_account: true` acknowledgement.
 The whole file is validated and unsafe shapes fail closed.
 
 ```json
@@ -73,6 +73,7 @@ The whole file is validated and unsafe shapes fail closed.
       "author_harness": "pi",
       "author_model": "openai-codex-5/gpt-5.6-sol",
       "approved_at": "2026-08-10T12:00:00Z",
+      "legacy_author_provenance": "pre-snapshot-pi",
       "replacement_unavailable": true,
       "replacement_unavailable_reason": "PR branch is not writable by this fleet; exact-head replacement cannot be published.",
       "admit_unproven_author_account": true
@@ -81,14 +82,15 @@ The whole file is validated and unsafe shapes fail closed.
 }
 ```
 
-A matching entry is accepted only when task metadata still names an account-less Pi lane with no `author_account_identity`.
+A matching entry is accepted only when task metadata still names an account-less Pi lane with no `author_account_identity` and no modern `author_identity_snapshot_epoch` marker.
+Every Pi launch and recovery under snapshot-aware code records `author_identity_snapshot_epoch: launch-bound-v1` even when credential capture fails or the recovered account changes, while the admission contributes the positive `pre-snapshot-pi` provenance assertion.
 It cannot downgrade routed work or a modern Pi snapshot, and a head change requires an explicitly renewed entry.
 The rule never populates metadata and never derives the old author from today's mutable provider-slot credential.
 It requires the selected reviewer to expose a readable executing account, hashes that identity at selection, and rechecks the hash against the launch-bound credential immediately before review.
 That binds who reviewed without pretending that reviewer differs from the unknowable historical author.
 The prompt says plainly that the reviewer may use the author's upstream account, removes the ordinary claim that the reviewer is account-independent, and demands disconfirming evidence.
-The ledger records `author_account_independence: unproven-legacy-admission`, the admission digest, approval time, replacement-unavailable attestation and reason, historical harness/model, and reviewer-account digest.
-The readable report labels `LEGACY AUTHOR ACCOUNT UNPROVEN` and repeats the admission digest, time, and replacement-unavailable reason.
+The ledger records `author_account_independence: unproven-legacy-admission`, the admission digest, approval time, pre-snapshot provenance, replacement-unavailable attestation and reason, historical harness/model, and reviewer-account digest.
+The readable report labels `LEGACY AUTHOR ACCOUNT UNPROVEN` and repeats the admission digest, time, provenance, historical harness/model, reviewer identity digest, and replacement-unavailable reason.
 When the same-model option also applies, both warnings and both evidence labels remain visible.
 
 Crosscheck then binds the provider's executing credential selector to that exact path and requires the verdict plus a Bash-created receipt to report the selector and actual private `HOME`.

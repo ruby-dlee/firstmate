@@ -110,7 +110,7 @@ The optional local, gitignored `config/crosscheck-same-model` file contains exac
 `on` relaxes model separation only; proven upstream-account separation remains mandatory, and same-account or unreadable identities stay refused.
 Invalid values and unsafe file shapes fail closed.
 The optional local, gitignored `config/crosscheck-legacy-author-admissions.json` file is a last resort for one exact PR head from a pre-snapshot account-less Pi lane that genuinely cannot be replaced under a new bound author lane.
-It requires an explicit replacement-unavailable attestation, never claims that the historical author account is known or separate from the reviewer, has no global switch, cannot replace modern identity metadata, and defaults to no admissions when absent.
+It requires explicit pre-snapshot provenance and replacement-unavailable attestations, never claims that the historical author account is known or separate from the reviewer, has no global switch, cannot replace modern identity metadata or the snapshot-era launch marker, and defaults to no admissions when absent.
 Its exact schema, reviewer binding, prompt warning, and durable evidence label are owned by [`crosscheck.md`](crosscheck.md).
 The accepted policy profiles are Codex `gpt-5.6-sol` at `xhigh` effort, Claude `claude-opus-5` at `xhigh` effort, and Pi `gpt-5.6-sol` at `xhigh` effort.
 Every `account_home` must be an existing absolute directory.

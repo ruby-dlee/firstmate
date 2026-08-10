@@ -1361,6 +1361,17 @@ def expect_refused(account_home, expected, label):
     raise AssertionError(f"{label} was accepted")
 
 
+def expect_refused_exact(account_home, expected, label):
+    write_reviewer(account_home)
+    try:
+        module.reviewer_candidates(home, meta)
+    except module.CrosscheckError as exc:
+        assert str(exc) == expected, str(exc)
+        print(f"REFUSED {label}")
+        return
+    raise AssertionError(f"{label} was accepted")
+
+
 # Absent and explicit-off configuration preserve the shipped cross-model rule.
 expect_refused(distinct, "different model", "same-model-default-off")
 mode_path.write_text("off\n", encoding="utf-8")
@@ -1372,7 +1383,14 @@ expect_refused(aliased, "proven-separate account", "same-upstream-account")
 expect_refused(opaque, "proven-separate account", "unreadable-reviewer-account")
 
 recorded_identity = meta.pop("author_account_identity")
-expect_refused(distinct, "readable Pi provider-slot identity", "missing-launch-identity")
+expect_refused_exact(
+    distinct,
+    "AUTHOR IDENTITY UNKNOWABLE: same-model review for a structurally unrouted "
+    "Pi author requires launch-bound author_account_identity metadata; this "
+    "missing launch-bound metadata is an author-proof failure, not a "
+    "reviewer-roster failure",
+    "missing-launch-identity",
+)
 meta["author_account_identity"] = recorded_identity
 
 write_reviewer(distinct)
@@ -4696,6 +4714,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_reviewer_execution_home_drift_fails_closed|\
     test_unrouted_author_uses_cross_provider_independence|\
     test_unrouted_author_without_account_proof_fails_closed|\
+    test_account_less_known_provider_lane_is_reviewable|\
     test_missing_author_identity_is_a_named_tool_failure|\
     test_launcher_requires_supported_python|\
     test_completed_reviewer_suspicion_is_blocking|\

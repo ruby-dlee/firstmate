@@ -2991,6 +2991,18 @@ def reviewer_candidates(home: Path, meta: dict[str, str]) -> list[dict[str, str]
             independent.append(reviewer)
     if independent:
         return independent
+    if (
+        allow_same_model
+        and meta["harness"] == "pi"
+        and author_home is None
+        and author_identity is None
+    ):
+        fail(
+            "AUTHOR IDENTITY UNKNOWABLE: same-model review for a structurally "
+            "unrouted Pi author requires launch-bound author_account_identity "
+            "metadata; this missing launch-bound metadata is an author-proof "
+            "failure, not a reviewer-roster failure"
+        )
     if author_home is not None:
         required_independence = (
             "a proven-separate account from the author"

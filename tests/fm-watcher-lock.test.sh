@@ -576,7 +576,8 @@ test_watch_restart_rejects_reused_pid() {
   printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
   printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
   printf '%s\n' "stale watcher identity" > "$state/.watch.lock/pid-identity"
-  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" &
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 \
+    FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=30 "$WATCH_ARM" --restart > "$out" &
   pid=$!
   # The honest arm forks the fresh watcher as a tracked child and waits on it, so
   # the lock now names that child, not the arm invocation. The property is the
@@ -821,7 +822,7 @@ test_monitor_preserves_competing_cleanup_claim() {
   claim_proceed="$dir/claim.proceed"
   touch "$state/.last-check"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
-    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_ARM_CONFIRM_TIMEOUT=30 \
     FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
     FM_WATCH_OWNER_TEST_TERMINAL_READY="$terminal_ready" \
     FM_WATCH_OWNER_TEST_TERMINAL_PROCEED="$terminal_proceed" \
@@ -918,7 +919,7 @@ test_monitor_preserves_proof_after_failed_drain() {
   out="$dir/arm.out"
   touch "$state/.last-check"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
-    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_ARM_CONFIRM_TIMEOUT=30 \
     FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
     FM_WATCH_OWNER_TEST_FORCE_DRAIN_FAILURE=1 \
     "$WATCH_ARM" > "$out" &
@@ -1346,10 +1347,10 @@ SH
   chmod +x "$check_file"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_TEST_WAKE_TRIGGER="$trigger" FM_POLL=1 \
     FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
-    "$WATCH_ARM" > "$out" &
+    FM_ARM_CONFIRM_TIMEOUT=30 "$WATCH_ARM" > "$out" &
   armpid=$!
   i=0
-  while [ "$i" -lt 120 ]; do
+  while [ "$i" -lt 300 ]; do
     grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
     is_live_non_zombie "$armpid" || break
     sleep 0.1
@@ -1402,13 +1403,13 @@ test_restart_during_owner_handoff_uses_normal_anchor() {
   proceed="$dir/handoff.proceed"
   touch "$state/.last-check"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
-    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_ARM_CONFIRM_TIMEOUT=30 \
     FM_WATCH_OWNER_TEST_HOOKS=firstmate-watcher-owner-tests-v1 \
     FM_WATCH_OWNER_TEST_HANDOFF_READY="$ready" FM_WATCH_OWNER_TEST_HANDOFF_PROCEED="$proceed" \
     "$WATCH_ARM" > "$first_out" &
   first_arm=$!
   i=0
-  while [ "$i" -lt 120 ] && [ ! -e "$ready" ]; do
+  while [ "$i" -lt 300 ] && [ ! -e "$ready" ]; do
     is_live_non_zombie "$first_arm" || break
     sleep 0.1
     i=$((i + 1))
@@ -1423,10 +1424,11 @@ test_restart_during_owner_handoff_uses_normal_anchor() {
     _ "$LIB" "$prestart_pid" "$prestart_identity" \
     || fail "restart reached the normal anchor while the prestart observer still owned cleanup"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
-    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 "$WATCH_ARM" --restart > "$restart_out" 2>&1 &
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_ARM_CONFIRM_TIMEOUT=30 \
+    "$WATCH_ARM" --restart > "$restart_out" 2>&1 &
   restart_arm=$!
   i=0
-  while [ "$i" -lt 180 ]; do
+  while [ "$i" -lt 300 ]; do
     grep -qF 'watcher: started pid=' "$restart_out" 2>/dev/null && break
     is_live_non_zombie "$restart_arm" || break
     sleep 0.1
@@ -2502,10 +2504,11 @@ test_arm_allows_bounded_watcher_phases_past_base_cadence() {
     FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 FM_ACCOUNT_LINEAGE_LOCK_WAIT_SECONDS=0 \
     FM_WATCH_AUTO_REAP_CLEANUP_MARGIN=1 \
     FM_WATCH_AUTO_REAP_TIMEOUT=60 FM_WATCH_PHASE_MARGIN=1 FM_POLL=1 \
-    FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$out" &
+    FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_HEARTBEAT=999999 \
+    FM_ARM_CONFIRM_TIMEOUT=30 "$WATCH_ARM" > "$out" &
   armpid=$!
   i=0
-  while [ "$i" -lt 80 ]; do
+  while [ "$i" -lt 300 ]; do
     grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
     is_live_non_zombie "$armpid" || break
     sleep 0.1
@@ -2531,10 +2534,11 @@ test_arm_allows_bounded_watcher_phases_past_base_cadence() {
   out="$dir/arm.out"
   touch "$state/.last-account-session-sync" "$state/.last-report-retention" "$state/.last-check"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_WATCH_PROGRESS_GRACE=2 FM_WATCH_PHASE_MARGIN=1 \
-    FM_POLL=4 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" > "$out" &
+    FM_POLL=4 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    FM_ARM_CONFIRM_TIMEOUT=30 "$WATCH_ARM" > "$out" &
   armpid=$!
   i=0
-  while [ "$i" -lt 80 ]; do
+  while [ "$i" -lt 300 ]; do
     grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
     is_live_non_zombie "$armpid" || break
     sleep 0.1
@@ -2600,11 +2604,11 @@ test_arm_recovers_direct_no_progress_wedge() {
   touch "$state/.last-check"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_WATCH_PROGRESS_GRACE=2 FM_WATCH_PHASE_MARGIN=1 \
     FM_HEARTBEAT=999999 FM_CHECK_INTERVAL=999999 FM_POLL=1 FM_WATCH_CPU_LIMIT=999 \
-    "$WATCH_ARM" > "$out" &
+    FM_ARM_CONFIRM_TIMEOUT=30 "$WATCH_ARM" > "$out" &
   armpid=$!
   i=0
   watcher_pid=
-  while [ "$i" -lt 80 ]; do
+  while [ "$i" -lt 300 ]; do
     watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
     grep -qF 'watcher: started pid=' "$out" 2>/dev/null && [ -n "$watcher_pid" ] && break
     is_live_non_zombie "$armpid" || break
@@ -2612,6 +2616,8 @@ test_arm_recovers_direct_no_progress_wedge() {
     i=$((i + 1))
   done
   [ -n "$watcher_pid" ] || fail "arm did not start a watcher for direct wedge recovery"
+  grep -qF 'watcher: started pid=' "$out" 2>/dev/null \
+    || fail "arm did not confirm the watcher before direct wedge recovery: $(cat "$out")"
   kill -STOP "$watcher_pid" 2>/dev/null || fail "could not stop the recorded watcher"
   wait_for_exit "$armpid" 100
   status=$?
@@ -2643,22 +2649,34 @@ touch "$ready"
 while :; do sleep 1; done
 SH
   chmod +x "$state/session.check.sh"
-  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_CHECK_INTERVAL=0 FM_CHECK_TIMEOUT=300 \
-    FM_HEARTBEAT=999999 FM_POLL=1 FM_WATCH_CPU_LIMIT=999 "$WATCH_ARM" > "$out" &
+  touch "$state/.last-check"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_CHECK_INTERVAL=60 FM_CHECK_TIMEOUT=300 \
+    FM_HEARTBEAT=999999 FM_POLL=1 FM_WATCH_CPU_LIMIT=999 FM_ARM_CONFIRM_TIMEOUT=30 \
+    "$WATCH_ARM" > "$out" &
   armpid=$!
   i=0
   while [ "$i" -lt 100 ]; do
     watcher_pid=$(cat "$state/.watch.lock/pid" 2>/dev/null || true)
     session=$(cat "$state/.watch.lock/process-session" 2>/dev/null || true)
-    [ -e "$ready" ] && [ -n "$watcher_pid" ] && [ "$session" = "$watcher_pid" ] \
+    [ -n "$watcher_pid" ] && [ "$session" = "$watcher_pid" ] \
       && grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
     is_live_non_zombie "$armpid" || break
     sleep 0.1
     i=$((i + 1))
   done
-  [ -e "$ready" ] || fail "watcher helper did not enter its TERM-trap fixture"
   [ "$session" = "$watcher_pid" ] || fail "arm-launched watcher did not record an owned process session"
-  kill -HUP "$armpid" 2>/dev/null || fail "could not interrupt owned-session arm"
+  grep -qF 'watcher: started pid=' "$out" 2>/dev/null \
+    || fail "arm did not confirm the watcher before its TERM-trap fixture: $(cat "$out")"
+  touch -t 200001010000 "$state/.last-check"
+  i=0
+  while [ "$i" -lt 100 ]; do
+    [ -e "$ready" ] && break
+    is_live_non_zombie "$armpid" || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -e "$ready" ] || fail "watcher helper did not enter its TERM-trap fixture: $(cat "$out")"
+  kill -HUP "$armpid" 2>/dev/null || fail "could not interrupt owned-session arm: $(cat "$out")"
   wait "$armpid" 2>/dev/null || true
   [ -s "$spawned" ] || fail "watcher helper TERM trap did not spawn its cleanup child"
   child_pid=$(cat "$spawned")
@@ -2991,7 +3009,7 @@ test_concurrent_legacy_restarts_have_one_cleanup_owner() {
   printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
   printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=1 FM_CHECK_INTERVAL=999999 \
-    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 \
+    FM_HEARTBEAT=999999 FM_WATCH_CPU_LIMIT=999 FM_ARM_CONFIRM_TIMEOUT=30 \
     FM_WATCH_LEGACY_CLAIM_TEST_HOOKS=firstmate-legacy-claim-tests-v1 \
     FM_WATCH_LEGACY_CLAIM_TEST_READY="$ready" \
     FM_WATCH_LEGACY_CLAIM_TEST_PROCEED="$proceed" \
@@ -3041,7 +3059,7 @@ test_concurrent_legacy_restarts_have_one_cleanup_owner() {
 }
 
 test_restart_drains_residual_session_without_live_leaders() {
-  local dir state fakebin out root_file members_file root anchor residual identity anchor_identity arm i
+  local dir state fakebin out root_file members_file root anchor residual identity anchor_identity arm i limit
   dir=$(make_case residual-session-proof)
   state="$dir/state"
   fakebin="$dir/fakebin"
@@ -3088,10 +3106,12 @@ test_restart_drains_residual_session_without_live_leaders() {
   while [ "$i" -lt 50 ] && { is_live_non_zombie "$root" || is_live_non_zombie "$anchor"; }; do sleep 0.05; i=$((i + 1)); done
   is_live_non_zombie "$residual" || fail "residual-session member did not survive both leaders"
   PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 \
-    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH_ARM" --restart > "$out" &
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=30 \
+    "$WATCH_ARM" --restart > "$out" &
   arm=$!
+  limit=$(fm_test_liveness_iterations 150 0.1)
   i=0
-  while [ "$i" -lt 150 ]; do
+  while [ "$i" -lt "$limit" ]; do
     grep -qF 'watcher: started pid=' "$out" 2>/dev/null && break
     is_live_non_zombie "$arm" || break
     sleep 0.1
@@ -3118,6 +3138,16 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = restart-term-resistant ]; then
   test_watch_restart_reaps_term_resistant_owned_tree
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = restart-reused-pid ]; then
+  test_watch_restart_rejects_reused_pid
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = residual-session ]; then
+  test_restart_drains_residual_session_without_live_leaders
   exit 0
 fi
 
@@ -3192,6 +3222,16 @@ if [ "${FM_TEST_FOCUSED:-}" = phase-bounds ]; then
   test_arm_reaps_term_trap_children_from_owned_session
   test_auto_reap_bound_tracks_inner_configuration
   test_watcher_config_parser_is_shared_and_nonexecuting
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = term-trap-session ]; then
+  test_arm_reaps_term_trap_children_from_owned_session
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = direct-wedge ]; then
+  test_arm_recovers_direct_no_progress_wedge
   exit 0
 fi
 

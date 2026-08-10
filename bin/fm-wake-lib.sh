@@ -652,7 +652,7 @@ fm_path_age() {
 }
 
 fm_watcher_lock_matches_pid() {
-  local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity current_identity
+  local state=$1 watch_path=$2 pid=$3 home=${4:-$FM_HOME} lockdir lock_home lock_path lock_identity
   lockdir="$state/.watch.lock"
   lock_home=$(cat "$lockdir/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$lockdir/watcher-path" 2>/dev/null || true)
@@ -660,8 +660,7 @@ fm_watcher_lock_matches_pid() {
   [ "$lock_home" = "$home" ] || return 1
   [ "$lock_path" = "$watch_path" ] || return 1
   [ -n "$lock_identity" ] || return 1
-  current_identity=$(fm_pid_identity "$pid") || return 1
-  [ "$current_identity" = "$lock_identity" ]
+  fm_pid_identity_live "$pid" "$lock_identity"
 }
 
 FM_WATCHER_HEALTHY_PID=
@@ -700,7 +699,9 @@ fm_watcher_progress_current() {  # <state> <watcher-pid> <grace>
   [ "$age" -lt "$grace" ] && return 0
   fm_watcher_phase_active "$state" "$pid" && return 0
   age=$(fm_path_age "$state/.last-watcher-beat")
-  [ "$age" -lt "$grace" ]
+  [ "$age" -lt "$grace" ] && return 0
+  # Recheck the phase after the beacon so a concurrent phase transition cannot look like a wedge.
+  fm_watcher_phase_active "$state" "$pid"
 }
 
 fm_watcher_healthy() {

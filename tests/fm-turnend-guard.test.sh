@@ -92,6 +92,7 @@ install_guard_scripts() {
   cp "$ROOT/bin/fm-harness.sh" "$dir/bin/fm-harness.sh"
   cp "$ROOT/bin/fm-supervision-lib.sh" "$dir/bin/fm-supervision-lib.sh"
   cp "$ROOT/bin/fm-wake-lib.sh" "$dir/bin/fm-wake-lib.sh"
+  cp "$ROOT/bin/fm-process-identity.py" "$dir/bin/fm-process-identity.py"
   cp "$ROOT/bin/fm-watcher-config-lib.sh" "$dir/bin/fm-watcher-config-lib.sh"
   mkdir -p "$dir/docs"
   cp -R "$ROOT/docs/supervision-protocols" "$dir/docs/supervision-protocols"

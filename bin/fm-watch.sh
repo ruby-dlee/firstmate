@@ -1309,6 +1309,13 @@ watcher_release_lock() {
     external_stop=true
   fi
   "$external_stop" && return 0
+  # A confirmed normal anchor owns session cleanup after the watcher exits.
+  if [ -n "$watcher_owner_link_pid" ] && [ ! -e "$watcher_owner_failed" ] \
+    && [ "$(cat "$watcher_owner_ready" 2>/dev/null || true)" = "$WATCHER_PID" ] \
+    && fm_watcher_lock_session_anchor_matches "$STATE" "$WATCHER_PID" \
+    && [ "$FM_WATCHER_SESSION_ANCHOR_PID" = "$watcher_owner_link_pid" ]; then
+    return 0
+  fi
   if [ -n "$watcher_owner_link_pid" ] && [ ! -e "$watcher_owner_failed" ]; then
     if fm_watcher_lock_session_stop_claim "$STATE" "$WATCHER_PID"; then
       stop_claimed=true

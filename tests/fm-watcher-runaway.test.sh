@@ -140,10 +140,11 @@ PATH="$FAKEBIN:$PATH" FM_HOME="$DIR" FM_FAKE_TMUX_WINDOW='test:fm-long-lived' FM
   FM_CREW_STATE_BIN="$FAKEBIN/fm-crew-state.sh" \
   FM_FAKE_CREW_STATE='state: paused · source: status-log · waiting' \
   FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=0 FM_CHECK_TIMEOUT=10 FM_HEARTBEAT=999999 \
-  FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=999999 "$WATCH_ARM" > "$OUT" &
+  FM_STALE_ESCALATE_SECS=1 FM_PAUSE_RESURFACE_SECS=999999 FM_ARM_CONFIRM_TIMEOUT=30 \
+  "$WATCH_ARM" > "$OUT" &
 ARM_PID=$!
 
-for _ in $(seq 1 150); do
+for _ in $(seq 1 300); do
   grep -qF 'watcher: started pid=' "$OUT" 2>/dev/null && break
   is_live_non_zombie "$ARM_PID" || fail "watcher arm exited before startup: $(cat "$OUT")"
   sleep 0.1

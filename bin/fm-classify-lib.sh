@@ -449,7 +449,12 @@ _fm_status_file_sig() {
 # cadence.
 # FM_CREW_STATE_BIN lets tests stub the verdict.
 crew_state_line() {  # <id> [progress-callback]
-  local id=$1 progress=${2:-${FM_CREW_STATE_PROGRESS_CALLBACK:-}} line
+  local id=$1 progress line
+  if [ "$#" -ge 2 ]; then
+    progress=$2
+  else
+    progress=${FM_CREW_STATE_PROGRESS_CALLBACK:-}
+  fi
   [ -n "$id" ] || return 0
   if [ -n "$progress" ] && ! "$progress" begin "$id"; then
     printf 'state: unknown · source: watcher · liveness: unknown (progress phase unavailable)\n'

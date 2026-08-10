@@ -173,6 +173,10 @@ MUTATION_RUNNER_POLICIES = {
                 "circusRun",
                 "e0ba3e46a59b751d7cc4ab5b6c00f27baa54d35b326c5dbc14404eb725fa8477",
             ),
+            (
+                "circusUtils",
+                "52b9ee6ae1b3bea12be70fdbcf2e8865b1f327b955d76cc560b0cfb22e61e70f",
+            ),
         ),
         measurement="Jest 29.7.0 on 2026-08-09",
     ),
@@ -1607,6 +1611,44 @@ Object.freeze(CrosscheckBodyRunner.prototype);
   const config = loaded || {{}};"""
         config_body = f"""const runnerPath = {json.dumps(str(probe_path))};
 
+const nodeOptionsKeys = value => Object.keys(value)
+  .filter(key => key.toUpperCase() === 'NODE_OPTIONS');
+
+const rejectAmbientNodeOptions = () => {{
+  if (nodeOptionsKeys(process.env).length) {{
+    throw new Error('Crosscheck rejected project-controlled ambient NODE_OPTIONS');
+  }}
+}};
+
+const secureAmbientEnvironment = () => {{
+  rejectAmbientNodeOptions();
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'env');
+  if (!descriptor?.configurable) {{
+    throw new Error('Crosscheck could not secure the Vitest worker environment');
+  }}
+  const environment = {{ ...process.env }};
+  const protectedEnvironment = new Proxy(environment, {{
+    set(target, key, value) {{
+      if (String(key).toUpperCase() === 'NODE_OPTIONS') {{
+        throw new Error('Crosscheck rejected project-controlled ambient NODE_OPTIONS');
+      }}
+      return Reflect.set(target, key, value);
+    }},
+    defineProperty(target, key, value) {{
+      if (String(key).toUpperCase() === 'NODE_OPTIONS') {{
+        throw new Error('Crosscheck rejected project-controlled ambient NODE_OPTIONS');
+      }}
+      return Reflect.defineProperty(target, key, value);
+    }},
+  }});
+  Object.defineProperty(process, 'env', {{
+    configurable: false,
+    enumerable: descriptor.enumerable,
+    writable: false,
+    value: protectedEnvironment,
+  }});
+}};
+
 export default async (environment) => {{
   {project_loader}
   if (!config || typeof config !== 'object' || Array.isArray(config)) {{
@@ -1618,6 +1660,7 @@ export default async (environment) => {{
   }}
   const configuredEnvironment = test.environment || 'node';
   const configuredEnv = test.env || {{}};
+  rejectAmbientNodeOptions();
   const hasNodeOptions = Object.keys(configuredEnv)
     .some(key => key.toUpperCase() === 'NODE_OPTIONS');
   const hasConfigEntries = value => Array.isArray(value)
@@ -1786,10 +1829,20 @@ export default async (environment) => {{
       }});
     }},
   }});
+  const environmentGuard = Object.freeze({{
+    name: 'crosscheck-worker-environment-boundary',
+    enforce: 'post',
+    configResolved: Object.freeze({{
+      order: 'post',
+      handler() {{
+        secureAmbientEnvironment();
+      }},
+    }}),
+  }});
   return {{
     ...config,
     define: {{}},
-    plugins: [guard, ...protectedPlugins],
+    plugins: [guard, ...protectedPlugins, environmentGuard],
     test: {{
       ...test,
       environment: 'node',
@@ -1889,6 +1942,10 @@ const graph = {
     path: realpathSync(createRequire(testRunner.path).resolve('./build/run.js')),
     version: testRunner.version,
   },
+  circusUtils: {
+    path: realpathSync(createRequire(testRunner.path).resolve('./build/utils.js')),
+    version: testRunner.version,
+  },
 };
 process.stdout.write(JSON.stringify(graph));
 """,
@@ -1926,6 +1983,7 @@ process.stdout.write(JSON.stringify(graph));
         "testEnvironment",
         "runtime",
         "circusRun",
+        "circusUtils",
     }
     expected_version = MUTATION_RUNNER_POLICIES["jest"].runtime_version
     if not isinstance(report, dict) or set(report) != expected_keys:
@@ -2098,9 +2156,7 @@ def prepare_jest_body_evidence(
     )
     wrapper_path.write_text(wrapper_source, encoding="utf-8")
     wrapper_digest = hashlib.sha256(wrapper_source.encode()).hexdigest()
-    circus_digest = dict(
-        MUTATION_RUNNER_POLICIES["jest"].source_digests
-    )["circusRun"]
+    circus_digests = dict(MUTATION_RUNNER_POLICIES["jest"].source_digests)
     preload_path.write_text(
         f"""const {{ createHash, randomBytes }} = require('node:crypto');
 const {{ readFileSync, writeSync }} = require('node:fs');
@@ -2108,10 +2164,12 @@ const {{ Buffer }} = require('node:buffer');
 const {{ dirname }} = require('node:path');
 const Module = require('node:module');
 const runPath = {json.dumps(str(runtime_graph["circusRun"]))};
+const utilsPath = {json.dumps(str(runtime_graph["circusUtils"]))};
 const runnerPath = {json.dumps(str(runtime_graph["testRunner"]))};
 const wrapperPath = {json.dumps(str(wrapper_path))};
 const nonce = randomBytes(32).toString('hex');
 const prefix = 'CROSSCHECK-AUTH-BODY';
+const safeApply = Reflect.apply;
 const recorded = new WeakSet();
 const wasRecorded = WeakSet.prototype.has.bind(recorded);
 const markRecorded = WeakSet.prototype.add.bind(recorded);
@@ -2159,24 +2217,47 @@ function seal(module, filename) {{
   }}
 }}
 
-function patchRunSource(source, slot) {{
+function patchUtilsSource(source, slot) {{
   const digest = createHash('sha256').update(source).digest('hex');
-  if (digest !== {json.dumps(circus_digest)}) {{
-    throw new Error('Crosscheck Jest body module does not match measured Circus');
+  if (digest !== {json.dumps(circus_digests["circusUtils"])}) {{
+    throw new Error('Crosscheck Jest invocation module does not match measured Circus');
   }}
-  const normal = "  try {{\\n    await (0, _utils.callAsyncCircusFn)(test, testContext, {{";
-  const concurrent = "      const testFn = test.fn;\\n      const promise = mutex(() =>\\n        testNameStorage.run((0, _utils.getTestID)(test), testFn)\\n      );";
-  if (source.split(normal).length !== 2 || source.split(concurrent).length !== 2) {{
-    throw new Error('Crosscheck Jest body boundary does not match measured Circus');
+  const callbackCall = '      returnedValue = fn.call(testContext, done);';
+  const generatorCall = '      returnedValue = _co.default.wrap(fn).call({{}});';
+  const ordinaryCall = '        returnedValue = fn.call(testContext);';
+  if (source.split(callbackCall).length !== 2
+      || source.split(generatorCall).length !== 2
+      || source.split(ordinaryCall).length !== 2) {{
+    throw new Error('Crosscheck Jest invocation boundary does not match measured Circus');
   }}
-  source = `"use strict";\\nconst __crosscheckRecord = globalThis[${{JSON.stringify(slot)}}];\\ndelete globalThis[${{JSON.stringify(slot)}}];\\n${{source}}`;
+  source = `"use strict";\\nconst __crosscheckInvoke = globalThis[${{JSON.stringify(slot)}}];\\ndelete globalThis[${{JSON.stringify(slot)}}];\\n${{source}}`;
   source = source.replace(
-    normal,
-    "  const __crosscheckBody = test.fn;\\n  test.fn = function(...args) {{\\n    __crosscheckRecord(test);\\n    return __crosscheckBody.apply(this, args);\\n  }};\\n  try {{\\n    await (0, _utils.callAsyncCircusFn)(test, testContext, {{",
+    callbackCall,
+    '      returnedValue = __crosscheckInvoke(testOrHook, isHook, fn, testContext, [done]);',
+  );
+  source = source.replace(
+    generatorCall,
+    "      const __crosscheckGenerator = _co.default.wrap(fn);\\n      returnedValue = __crosscheckInvoke(testOrHook, isHook, __crosscheckGenerator, {{}}, []);",
   );
   return source.replace(
+    ordinaryCall,
+    '        returnedValue = __crosscheckInvoke(testOrHook, isHook, fn, testContext, []);',
+  );
+}}
+
+function patchRunSource(source, slot) {{
+  const digest = createHash('sha256').update(source).digest('hex');
+  if (digest !== {json.dumps(circus_digests["circusRun"])}) {{
+    throw new Error('Crosscheck Jest run module does not match measured Circus');
+  }}
+  const concurrent = "      const testFn = test.fn;\\n      const promise = mutex(() =>\\n        testNameStorage.run((0, _utils.getTestID)(test), testFn)\\n      );";
+  if (source.split(concurrent).length !== 2) {{
+    throw new Error('Crosscheck Jest concurrent boundary does not match measured Circus');
+  }}
+  source = `"use strict";\\nconst __crosscheckInvoke = globalThis[${{JSON.stringify(slot)}}];\\ndelete globalThis[${{JSON.stringify(slot)}}];\\n${{source}}`;
+  return source.replace(
     concurrent,
-    "      const __crosscheckBody = test.fn;\\n      const testFn = (...args) => {{\\n        __crosscheckRecord(test);\\n        return __crosscheckBody(...args);\\n      }};\\n      const promise = mutex(() =>\\n        testNameStorage.run((0, _utils.getTestID)(test), testFn)\\n      );",
+    "      const testFn = test.fn;\\n      const promise = mutex(() =>\\n        testNameStorage.run(\\n          (0, _utils.getTestID)(test),\\n          () => __crosscheckInvoke(test, false, testFn, undefined, [])\\n        )\\n      );",
   );
 }}
 
@@ -2202,6 +2283,11 @@ if (createHash('sha256').update(wrapperSource).digest('hex') !== {json.dumps(wra
   throw new Error('Crosscheck Jest runner wrapper does not match its gate source');
 }}
 let invoked = false;
+function invokeBody(testOrHook, isHook, body, context, args) {{
+  if (!isHook) record(testOrHook);
+  return safeApply(body, context, args);
+}}
+
 async function invokeRunner(canonical, args) {{
   if (invoked) throw new Error('Crosscheck Jest runner was invoked twice');
   invoked = true;
@@ -2211,15 +2297,20 @@ async function invokeRunner(canonical, args) {{
     throw new Error('Crosscheck Jest runner received an unmeasured runtime');
   }}
   const originalReadFile = runtime.readFile.bind(runtime);
-  const vmSlot = `__crosscheck_${{randomBytes(32).toString('hex')}}`;
-  environment.global[vmSlot] = record;
+  const runSlot = `__crosscheck_${{randomBytes(32).toString('hex')}}`;
+  const utilsSlot = `__crosscheck_${{randomBytes(32).toString('hex')}}`;
+  environment.global[runSlot] = invokeBody;
+  environment.global[utilsSlot] = invokeBody;
   Object.defineProperty(runtime, 'readFile', {{
     configurable: false,
     enumerable: false,
     writable: false,
     value: function(filename, ...args) {{
       if (filename === runPath) {{
-        return patchRunSource(readFileSync(runPath, 'utf8'), vmSlot);
+        return patchRunSource(readFileSync(runPath, 'utf8'), runSlot);
+      }}
+      if (filename === utilsPath) {{
+        return patchUtilsSource(readFileSync(utilsPath, 'utf8'), utilsSlot);
       }}
       return originalReadFile(filename, ...args);
     }},

@@ -253,7 +253,17 @@ for selector in "${targets[@]}"; do
 done
 exit "$status"
 SH
-  chmod +x "$case_dir/pathbin/pytest"
+  cat > "$case_dir/pathbin/python3" <<SH
+#!/usr/bin/env bash
+# Keep this fixture on the plain-pytest rung even when the developer machine's
+# ambient Python happens to have pytest installed, without breaking reviewer
+# doubles that invoke Python for their own protocol work.
+if [ "\${1:-}" = -m ] && [ "\${2:-}" = pytest ]; then
+  exit 1
+fi
+exec "$CROSSCHECK_PYTHON" "\$@"
+SH
+  chmod +x "$case_dir/pathbin/pytest" "$case_dir/pathbin/python3"
 }
 
 install_gh_axi_fake() {
@@ -4469,7 +4479,8 @@ test_pytest_runner_resolves_through_a_uv_aware_ladder() {
   : > "$case_dir/mono/README.md"
   : > "$case_dir/plain/tests/test_thing.py"
   printf '#!/bin/bash\nexit 0\n' > "$case_dir/bin/pytest"
-  chmod +x "$case_dir/bin/pytest"
+  printf '#!/bin/bash\nexit 1\n' > "$case_dir/bin/python3"
+  chmod +x "$case_dir/bin/pytest" "$case_dir/bin/python3"
 
   PATH="$case_dir/bin:$PATH" "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$case_dir" <<'PY' \
     || fail "the pytest runner ladder did not resolve as specified"

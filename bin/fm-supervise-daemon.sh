@@ -151,6 +151,9 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 . "$FM_DAEMON_DIR/fm-gate-refuse-lib.sh"
 fm_refuse_if_gate_agent
 
+# shellcheck source=bin/fm-process-identity-lib.sh
+. "$FM_DAEMON_DIR/fm-process-identity-lib.sh"
+
 # Shared tmux pane primitives for supervisor injection (busy/composer detection
 # + verify-retry submit). Sourced at top level so BOTH the executed daemon and
 # the unit tests (which source this file for its pure functions) get the
@@ -188,6 +191,9 @@ FM_REAP_WAKE_PENDING=0
 INJECT_SKIP_DEFAULT="heartbeat"
 STALE_ESCALATE_SECS_DEFAULT=240
 PAUSE_CLASS_REFRESH_CONCURRENCY=4
+PAUSE_CLASS_REFRESH_GENERATION=
+PAUSE_CLASS_REFRESH_OWNED_PID=
+PAUSE_CLASS_REFRESH_OWNED_PGID=
 HOUSEKEEPING_PAUSE_CLASS_RESULT=
 ESCALATE_BATCH_SECS_DEFAULT=90
 HEARTBEAT_SCAN_SECS_DEFAULT=300
@@ -510,77 +516,241 @@ clear_pause_tracking() {  # <window> <state>
     "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key"
 }
 
-pause_class_refresh_reap() {  # <state>
-  local state=$1 marker done pid
+pause_class_refresh_marker_remove() {
+  local marker=$1
+  if [ -d "$marker" ] && [ ! -L "$marker" ]; then
+    rm -f "$marker/generation" "$marker/pid" "$marker/pgid" \
+      "$marker/pid-identity" "$marker/ready" "$marker/owned" "$marker/done"
+    rmdir "$marker" 2>/dev/null || true
+  else
+    rm -f "$marker"
+  fi
+  rm -f "${marker}.done"
+}
+
+pause_class_refresh_generation_publish() {
+  local state=$1 generation=$2 file tmp marker
+  file="$state/.subsuper-pause-refresh-generation"
+  tmp="${file}.tmp.${BASHPID:-$$}.$RANDOM"
+  printf '%s\n' "$generation" > "$tmp" || return 1
+  mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
   for marker in "$state"/.subsuper-pause-refresh-*; do
     [ -e "$marker" ] || continue
-    case "$marker" in
-      *.done)
-        [ -e "${marker%.done}" ] || rm -f "$marker"
-        continue
-        ;;
-    esac
-    done="${marker}.done"
-    pid=$(cat "$marker" 2>/dev/null || true)
-    if [ -e "$done" ]; then
-      wait "$pid" 2>/dev/null || true
-      rm -f "$marker" "$done"
+    case "$marker" in *.tmp.*|*-generation) continue ;; esac
+    pause_class_refresh_marker_remove "$marker"
+  done
+}
+
+pause_class_refresh_generation_start() {
+  local state=$1
+  PAUSE_CLASS_REFRESH_GENERATION="${BASHPID:-$$}:$(_now):$RANDOM:$RANDOM"
+  pause_class_refresh_generation_publish "$state" "$PAUSE_CLASS_REFRESH_GENERATION"
+}
+
+pause_class_refresh_generation_ensure() {
+  local state=$1 file recorded
+  file="$state/.subsuper-pause-refresh-generation"
+  recorded=$(cat "$file" 2>/dev/null || true)
+  if [ -n "$PAUSE_CLASS_REFRESH_GENERATION" ] \
+    && [ "$recorded" = "$PAUSE_CLASS_REFRESH_GENERATION" ]; then
+    return 0
+  fi
+  if [ -z "$PAUSE_CLASS_REFRESH_GENERATION" ]; then
+    PAUSE_CLASS_REFRESH_GENERATION="${BASHPID:-$$}:$(_now):$RANDOM:$RANDOM"
+  fi
+  pause_class_refresh_generation_publish "$state" "$PAUSE_CLASS_REFRESH_GENERATION"
+}
+
+pause_class_refresh_process_group() {
+  local pid=$1 pgid
+  pgid=$(ps -p "$pid" -o pgid= 2>/dev/null | tr -d '[:space:]') || return 1
+  case "$pgid" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$pgid"
+}
+
+pause_class_refresh_marker_owned() {
+  local state=$1 marker=$2 generation pid pgid identity current current_pgid
+  PAUSE_CLASS_REFRESH_OWNED_PID=
+  PAUSE_CLASS_REFRESH_OWNED_PGID=
+  [ -d "$marker" ] && [ ! -L "$marker" ] || return 1
+  generation=$(cat "$marker/generation" 2>/dev/null || true)
+  [ -n "$PAUSE_CLASS_REFRESH_GENERATION" ] \
+    && [ "$generation" = "$PAUSE_CLASS_REFRESH_GENERATION" ] \
+    && [ "$(cat "$state/.subsuper-pause-refresh-generation" 2>/dev/null || true)" = "$generation" ] \
+    || return 1
+  pid=$(cat "$marker/pid" 2>/dev/null || true)
+  pgid=$(cat "$marker/pgid" 2>/dev/null || true)
+  case "$pid:$pgid" in *[!0-9:]*) return 1 ;; esac
+  [ -n "$pid" ] && [ "$pid" = "$pgid" ] || return 1
+  identity=$(cat "$marker/pid-identity" 2>/dev/null || true)
+  [ -n "$identity" ] || return 1
+  current=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
+  [ "$current" = "$identity" ] || return 1
+  current_pgid=$(pause_class_refresh_process_group "$pid") || return 1
+  [ "$current_pgid" = "$pgid" ] || return 1
+  PAUSE_CLASS_REFRESH_OWNED_PID=$pid
+  PAUSE_CLASS_REFRESH_OWNED_PGID=$pgid
+}
+
+pause_class_refresh_group_live() {
+  local pgid=$1
+  ps -axo pgid=,stat= 2>/dev/null \
+    | awk -v pgid="$pgid" '$1 == pgid && $2 !~ /^Z/ { found = 1 } END { exit !found }'
+}
+
+pause_class_refresh_group_stop() {
+  local state=$1 marker=$2 pid pgid i
+  pause_class_refresh_marker_owned "$state" "$marker" || return 1
+  pid=$PAUSE_CLASS_REFRESH_OWNED_PID
+  pgid=$PAUSE_CLASS_REFRESH_OWNED_PGID
+  kill -TERM "-$pgid" 2>/dev/null || true
+  for i in {1..10}; do
+    pause_class_refresh_group_live "$pgid" || break
+    sleep 0.05
+  done
+  if pause_class_refresh_group_live "$pgid"; then
+    kill -KILL "-$pgid" 2>/dev/null || true
+    for i in {1..20}; do
+      pause_class_refresh_group_live "$pgid" || break
+      sleep 0.05
+    done
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
+pause_class_refresh_worker() {
+  local state=$1 task=$2 last=$3 now=$4 sig=$5 cache=$6 marker=$7 tmp=$8 generation=$9
+  local class after current recorded marker_generation cancelled=0 i
+  set +m 2>/dev/null || true
+  trap 'cancelled=1' TERM INT
+  : > "$marker/ready"
+  for i in {1..500}; do
+    [ -e "$marker/owned" ] && break
+    sleep 0.01
+  done
+  [ -e "$marker/owned" ] || return 1
+  class=$(crew_absorb_class "$task" "$last")
+  after=$(_fm_status_file_sig "$state/$task.status")
+  current=$(last_status_line "$state/$task.status")
+  recorded=$(cat "$state/.subsuper-pause-refresh-generation" 2>/dev/null || true)
+  marker_generation=$(cat "$marker/generation" 2>/dev/null || true)
+  if [ "$cancelled" -eq 0 ] && [ "$generation" = "$recorded" ] \
+    && [ "$generation" = "$marker_generation" ] \
+    && [ -n "$sig" ] && [ "$sig" = "$after" ] && [ "$last" = "$current" ]; then
+    printf '%s\t%s\t%s\n' "$sig" "$now" "$class" > "$tmp" && mv -f "$tmp" "$cache"
+  else
+    rm -f "$cache" "$tmp"
+  fi
+  rm -f "$tmp"
+  : > "$marker/done" 2>/dev/null || true
+}
+
+pause_class_refresh_reap() {
+  local state=$1 marker generation pid
+  for marker in "$state"/.subsuper-pause-refresh-*; do
+    [ -e "$marker" ] || continue
+    case "$marker" in *.tmp.*|*-generation) continue ;; esac
+    if [ ! -d "$marker" ] || [ -L "$marker" ]; then
+      pause_class_refresh_marker_remove "$marker"
       continue
     fi
-    case "$pid" in
-      ''|*[!0-9]*) rm -f "$marker" ;;
-      *) kill -0 "$pid" 2>/dev/null || rm -f "$marker" ;;
-    esac
+    generation=$(cat "$marker/generation" 2>/dev/null || true)
+    if [ -z "$PAUSE_CLASS_REFRESH_GENERATION" ] \
+      || [ "$generation" != "$PAUSE_CLASS_REFRESH_GENERATION" ] \
+      || [ "$(cat "$state/.subsuper-pause-refresh-generation" 2>/dev/null || true)" != "$generation" ]; then
+      pause_class_refresh_marker_remove "$marker"
+      continue
+    fi
+    pid=$(cat "$marker/pid" 2>/dev/null || true)
+    if [ -e "$marker/done" ]; then
+      wait "$pid" 2>/dev/null || true
+      pause_class_refresh_marker_remove "$marker"
+      continue
+    fi
+    pause_class_refresh_marker_owned "$state" "$marker" \
+      || pause_class_refresh_marker_remove "$marker"
   done
 }
 
 pause_class_refresh_start() {  # <state> <task> <last-status-line> <now> <status-signature>
-  local state=$1 task=$2 last=$3 now=$4 sig=$5 key cache marker done tmp active=0 f pid
+  local state=$1 task=$2 last=$3 now=$4 sig=$5 key cache marker tmp active=0 f pid pgid identity i monitor_was_on=0
   key=$(_stale_key "$task")
   cache="$state/.subsuper-pause-class-$key"
   marker="$state/.subsuper-pause-refresh-$key"
-  done="${marker}.done"
+  pause_class_refresh_generation_ensure "$state" || return 1
   pause_class_refresh_reap "$state"
   [ ! -e "$marker" ] || return 0
   for f in "$state"/.subsuper-pause-refresh-*; do
     [ -e "$f" ] || continue
-    case "$f" in *.done) continue ;; esac
+    case "$f" in *.tmp.*|*-generation) continue ;; esac
     active=$((active + 1))
   done
   [ "$active" -lt "$PAUSE_CLASS_REFRESH_CONCURRENCY" ] || return 0
-  rm -f "$done"
+  mkdir "$marker" || return 1
+  printf '%s\n' "$PAUSE_CLASS_REFRESH_GENERATION" > "$marker/generation" || {
+    pause_class_refresh_marker_remove "$marker"
+    return 1
+  }
   tmp="${cache}.tmp.$$.$RANDOM"
-  (
-    local class after current
-    class=$(crew_absorb_class "$task" "$last")
-    after=$(_fm_status_file_sig "$state/$task.status")
-    current=$(last_status_line "$state/$task.status")
-    if [ -n "$sig" ] && [ "$sig" = "$after" ] && [ "$last" = "$current" ]; then
-      printf '%s\t%s\t%s\n' "$sig" "$now" "$class" > "$tmp" && mv -f "$tmp" "$cache"
-    else
-      rm -f "$cache" "$tmp"
-    fi
-    : > "$done"
-  ) </dev/null >/dev/null 2>&1 &
+  case $- in *m*) monitor_was_on=1 ;; esac
+  set -m 2>/dev/null || {
+    pause_class_refresh_marker_remove "$marker"
+    return 1
+  }
+  pause_class_refresh_worker "$state" "$task" "$last" "$now" "$sig" \
+    "$cache" "$marker" "$tmp" "$PAUSE_CLASS_REFRESH_GENERATION" \
+    </dev/null >/dev/null 2>&1 &
   pid=$!
-  printf '%s\n' "$pid" > "$marker"
+  [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true
+  for i in {1..100}; do
+    [ -e "$marker/ready" ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.01
+  done
+  if [ ! -e "$marker/ready" ]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    pause_class_refresh_marker_remove "$marker"
+    rm -f "$tmp"
+    return 1
+  fi
+  pgid=$(pause_class_refresh_process_group "$pid" 2>/dev/null || true)
+  identity=$(fm_pid_identity "$pid" 2>/dev/null || true)
+  if [ "$pgid" != "$pid" ] || [ -z "$identity" ]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    pause_class_refresh_marker_remove "$marker"
+    rm -f "$tmp"
+    return 1
+  fi
+  printf '%s\n' "$pid" > "$marker/pid" \
+    && printf '%s\n' "$pgid" > "$marker/pgid" \
+    && printf '%s\n' "$identity" > "$marker/pid-identity" \
+    && : > "$marker/owned" || {
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      pause_class_refresh_marker_remove "$marker"
+      rm -f "$tmp"
+      return 1
+    }
 }
 
 pause_class_refresh_stop_all() {  # <state>
-  local state=$1 marker pid
+  local state=$1 marker generation_file recorded
+  generation_file="$state/.subsuper-pause-refresh-generation"
   for marker in "$state"/.subsuper-pause-refresh-*; do
     [ -e "$marker" ] || continue
-    case "$marker" in *.done) continue ;; esac
-    pid=$(cat "$marker" 2>/dev/null || true)
-    case "$pid" in
-      ''|*[!0-9]*) ;;
-      *)
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-        ;;
-    esac
+    case "$marker" in *.tmp.*|*-generation) continue ;; esac
+    pause_class_refresh_group_stop "$state" "$marker" || true
+    pause_class_refresh_marker_remove "$marker"
   done
-  rm -f "$state"/.subsuper-pause-refresh-* "$state"/.subsuper-pause-class-*.tmp.*
+  rm -f "$state"/.subsuper-pause-class-*.tmp.*
+  recorded=$(cat "$generation_file" 2>/dev/null || true)
+  if [ -n "$PAUSE_CLASS_REFRESH_GENERATION" ] \
+    && [ "$recorded" = "$PAUSE_CLASS_REFRESH_GENERATION" ]; then
+    rm -f "$generation_file"
+  fi
+  PAUSE_CLASS_REFRESH_GENERATION=
 }
 
 housekeeping_pause_class() {  # <state> <task> <last-status-line> <now>
@@ -1591,6 +1761,12 @@ fm_super_main() {
     fi
   fi
 
+  pause_class_refresh_generation_start "$STATE" || {
+    echo "error: cannot initialize pause refresh ownership" >&2
+    fm_lock_release "$LOCK" 2>/dev/null || true
+    rm -f "$PIDFILE" 2>/dev/null || true
+    exit 1
+  }
   local afk_status="off"
   afk_active "$STATE" && afk_status="on"
   log "daemon starting (pid $$); delivery=$DELIVERY; target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"

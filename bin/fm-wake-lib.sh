@@ -3,6 +3,8 @@
 
 FM_WAKE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_WAKE_DEFAULT_ROOT="$(cd "$FM_WAKE_LIB_DIR/.." && pwd)"
+# shellcheck source=bin/fm-process-identity-lib.sh
+. "$FM_WAKE_LIB_DIR/fm-process-identity-lib.sh"
 FM_ROOT="${FM_ROOT_OVERRIDE:-${FM_ROOT:-$FM_WAKE_DEFAULT_ROOT}}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-${STATE:-$FM_HOME/state}}"
@@ -22,27 +24,6 @@ fm_wake_safe_file_destination() {
 
 fm_current_pid() {
   printf '%s\n' "${BASHPID:-$$}"
-}
-
-fm_pid_alive() {
-  local pid=$1
-  case "$pid" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  kill -0 "$pid" 2>/dev/null
-}
-
-fm_pid_identity() {
-  local pid=$1 out
-  case "$pid" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  # Pin LC_ALL=C so lstart's date format is locale-invariant: the identity is
-  # written under one locale but re-read under the machine's ambient locale, which
-  # would otherwise mismatch on a non-C locale (e.g. ko_KR) and reject a live watcher.
-  out=$(LC_ALL=C ps -p "$pid" -o lstart= -o command= 2>/dev/null) || return 1
-  [ -n "$out" ] || return 1
-  printf '%s\n' "$out" | sed 's/^[[:space:]]*//'
 }
 
 fm_path_mtime() {

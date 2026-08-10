@@ -24,10 +24,17 @@ if [ -z "${FM_TEST_DAEMON_SOURCED:-}" ]; then
 fi
 
 wait_for_pause_refreshes() {
-  local state=$1 i
+  local state=$1 i marker active
   for i in {1..100}; do
     pause_class_refresh_reap "$state"
-    compgen -G "$state/.subsuper-pause-refresh-*" >/dev/null || return 0
+    active=0
+    for marker in "$state"/.subsuper-pause-refresh-*; do
+      [ -e "$marker" ] || continue
+      case "$marker" in *.tmp.*|*-generation) continue ;; esac
+      active=1
+      break
+    done
+    [ "$active" -eq 0 ] && return 0
     sleep 0.05
   done
   fail "pause classification refresh did not finish"
@@ -333,7 +340,7 @@ SH
     fm_write_meta "$state/$task.meta" "window=sess:fm-$task" "kind=ship"
     printf 'paused: awaiting cold external state\n' > "$state/$task.status"
   done
-  ( sleep 15; : > "$timed_out"; : > "$release" ) &
+  ( sleep 30; : > "$timed_out"; : > "$release" ) &
   watchdog=$!
   FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_FAKE_REFRESH_STARTS="$starts" FM_FAKE_REFRESH_RELEASE="$release" housekeeping "$state"
@@ -360,6 +367,117 @@ SH
   wait_for_pause_refreshes "$state"
   pause_class_refresh_stop_all "$state"
   pass "housekeeping bounds cold pause refreshes without blocking"
+}
+
+test_pause_refresh_cleanup_rejects_stale_generation() {
+  local dir state marker victim pgid identity monitor_was_on=0
+  dir=$(make_supercase pause-refresh-stale-generation)
+  state="$dir/state"
+  pause_class_refresh_generation_start "$state"
+  case $- in *m*) monitor_was_on=1 ;; esac
+  set -m
+  sleep 30 &
+  victim=$!
+  [ "$monitor_was_on" -eq 1 ] || set +m
+  pgid=$(pause_class_refresh_process_group "$victim")
+  identity=$(fm_pid_identity "$victim")
+  [ "$pgid" = "$victim" ] || {
+    kill "$victim" 2>/dev/null || true
+    wait "$victim" 2>/dev/null || true
+    fail "stale-generation fixture did not enter a distinct process group"
+  }
+  marker="$state/.subsuper-pause-refresh-stale-generation"
+  mkdir "$marker"
+  printf 'previous-daemon-generation\n' > "$marker/generation"
+  printf '%s\n' "$victim" > "$marker/pid"
+  printf '%s\n' "$pgid" > "$marker/pgid"
+  printf '%s\n' "$identity" > "$marker/pid-identity"
+  : > "$marker/owned"
+  pause_class_refresh_stop_all "$state"
+  if ! is_live_non_zombie "$victim"; then
+    fail "stale refresh generation authorized signaling its recorded PID"
+  fi
+  kill -TERM "-$pgid" 2>/dev/null || true
+  wait "$victim" 2>/dev/null || true
+  pass "pause refresh cleanup never signals a stale generation"
+}
+
+test_pause_refresh_cleanup_rejects_identity_mismatch() {
+  local dir state marker victim pgid monitor_was_on=0
+  dir=$(make_supercase pause-refresh-identity-mismatch)
+  state="$dir/state"
+  pause_class_refresh_generation_start "$state"
+  case $- in *m*) monitor_was_on=1 ;; esac
+  set -m
+  sleep 30 &
+  victim=$!
+  [ "$monitor_was_on" -eq 1 ] || set +m
+  pgid=$(pause_class_refresh_process_group "$victim")
+  [ "$pgid" = "$victim" ] || {
+    kill "$victim" 2>/dev/null || true
+    wait "$victim" 2>/dev/null || true
+    fail "identity-mismatch fixture did not enter a distinct process group"
+  }
+  marker="$state/.subsuper-pause-refresh-identity-mismatch"
+  mkdir "$marker"
+  printf '%s\n' "$PAUSE_CLASS_REFRESH_GENERATION" > "$marker/generation"
+  printf '%s\n' "$victim" > "$marker/pid"
+  printf '%s\n' "$pgid" > "$marker/pgid"
+  printf 'reused-pid-identity\n' > "$marker/pid-identity"
+  : > "$marker/owned"
+  pause_class_refresh_stop_all "$state"
+  if ! is_live_non_zombie "$victim"; then
+    fail "mismatched refresh identity authorized signaling its recorded PID"
+  fi
+  kill -TERM "-$pgid" 2>/dev/null || true
+  wait "$victim" 2>/dev/null || true
+  pass "pause refresh cleanup rejects a reused PID identity"
+}
+
+test_pause_refresh_cleanup_stops_owned_process_group() {
+  local dir state fakebin child_file task last marker child pid pgid identity i
+  dir=$(make_supercase pause-refresh-owned-group)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  child_file="$dir/refresh-child"
+  task=pause-refresh-owned
+  cat > "$fakebin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+sleep 30 &
+printf '%s\n' "$!" > "${FM_FAKE_REFRESH_CHILD:?}"
+wait
+SH
+  chmod +x "$fakebin/fm-crew-state.sh"
+  fm_write_meta "$state/$task.meta" "window=sess:fm-$task" "kind=ship"
+  last='paused: awaiting owned refresh cleanup'
+  printf '%s\n' "$last" > "$state/$task.status"
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_REFRESH_CHILD="$child_file" housekeeping_pause_class "$state" "$task" "$last" "$(_now)"
+  [ "$HOUSEKEEPING_PAUSE_CLASS_RESULT" = pending ] \
+    || fail "owned refresh fixture did not start asynchronously"
+  marker="$state/.subsuper-pause-refresh-$task"
+  for i in {1..100}; do
+    [ -s "$child_file" ] && [ -e "$marker/owned" ] && break
+    sleep 0.05
+  done
+  [ -s "$child_file" ] && [ -e "$marker/owned" ] \
+    || fail "owned refresh fixture did not publish its process group"
+  child=$(cat "$child_file")
+  pid=$(cat "$marker/pid")
+  pgid=$(cat "$marker/pgid")
+  identity=$(cat "$marker/pid-identity")
+  [ "$pid" = "$pgid" ] || fail "owned refresh worker was not its process-group leader"
+  [ "$(pause_class_refresh_process_group "$child")" = "$pgid" ] \
+    || fail "owned refresh descendant escaped the worker process group"
+  [ "$(fm_pid_identity "$pid")" = "$identity" ] \
+    || fail "owned refresh marker did not preserve the worker identity"
+  pause_class_refresh_stop_all "$state"
+  if is_live_non_zombie "$child"; then
+    kill -TERM "$child" 2>/dev/null || true
+    fail "owned refresh cleanup left its descendant running"
+  fi
+  [ ! -e "$marker" ] || fail "owned refresh cleanup retained its marker"
+  pass "pause refresh cleanup terminates only its verified process group"
 }
 
 test_housekeeping_delivers_before_pause_classification() {
@@ -1914,6 +2032,9 @@ if [ "${FM_TEST_FOCUSED:-}" = held-live-monitor ]; then
   test_held_live_monitor_reaches_away_wedge_escalation
   test_housekeeping_pause_class_cache
   test_housekeeping_bounds_cold_pause_refreshes
+  test_pause_refresh_cleanup_rejects_stale_generation
+  test_pause_refresh_cleanup_rejects_identity_mismatch
+  test_pause_refresh_cleanup_stops_owned_process_group
   test_housekeeping_delivers_before_pause_classification
   exit 0
 fi
@@ -1932,6 +2053,9 @@ test_stale_paused_classifies_pause
 test_held_live_monitor_reaches_away_wedge_escalation
 test_housekeeping_pause_class_cache
 test_housekeeping_bounds_cold_pause_refreshes
+test_pause_refresh_cleanup_rejects_stale_generation
+test_pause_refresh_cleanup_rejects_identity_mismatch
+test_pause_refresh_cleanup_stops_owned_process_group
 test_housekeeping_delivers_before_pause_classification
 test_handle_wake_paused_records_pause_marker
 test_handle_wake_paused_signal_records_pause_marker

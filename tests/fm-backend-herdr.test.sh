@@ -3082,6 +3082,103 @@ test_composer_state_unknown_when_no_composer_row_found() {
   pass "fm_backend_herdr_composer_state: reports unknown for bare shell prompts with no composer row"
 }
 
+# --- composer_state: pi separator-only editor rows ---------------------------
+# Captured from a real pi 0.84.0 pane under herdr 0.7.3. Pi's Editor has no
+# side border and no prompt glyph: two equal full-width U+2500 rules surround
+# one padded content row, whose raw ANSI carries the Editor's SGR-7 fake cursor.
+# The classifier requires all three structural facts. Replacement UI uses the
+# same DynamicBorder primitive but has multiple interior rows, so it must
+# override any stale bordered row above it and stay unknown.
+
+test_composer_state_pi_separator_editor_is_empty() {
+  local dir log resp fb out rule
+  dir="$TMP_ROOT/composer-pi-empty"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  rule='────────────────────────────────────────────────────────────'
+  printf '\x1b[0m\x1b[38;2;209;131;232m%s\x1b[0m\r\n\x1b[0m\x1b[7m \x1b[0m                                                           \r\n\x1b[0m\x1b[38;2;209;131;232m%s\x1b[0m\r\n/project (fm/task)\r\n↑1k ↓2k 1%%/100k model\n' "$rule" "$rule" > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = empty ] || fail "a real-pi separator/cursor editor with a blank content row should read empty, got '$out'"
+  pass "fm_backend_herdr_composer_state: a real-pi separator-only editor with a blank content row reads empty"
+}
+
+test_composer_state_pi_separator_editor_with_text_is_pending() {
+  local dir log resp fb out rule
+  dir="$TMP_ROOT/composer-pi-pending"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  rule='────────────────────────────────────────────────────────────'
+  printf '\x1b[0m\x1b[38;2;209;131;232m%s\x1b[0m\r\nPI_PENDING_C8\x1b[7m \x1b[0m                                             \r\n\x1b[0m\x1b[38;2;209;131;232m%s\x1b[0m\r\n/project (fm/task)\r\n↑1k ↓2k 1%%/100k model\n' "$rule" "$rule" > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = pending ] || fail "real text in a real-pi separator/cursor editor should read pending, got '$out'"
+  pass "fm_backend_herdr_composer_state: a real-pi separator-only editor with typed text reads pending"
+}
+
+test_composer_state_pi_prompt_like_text_is_pending() {
+  local dir log resp fb out rule content idx=1
+  dir="$TMP_ROOT/composer-pi-prompt-like"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  rule='────────────────────────────────────────────────────────────'
+  for content in '>' '$' '%' '#' '❯' '›'; do
+    printf '%s\n%s\x1b[7m \x1b[0m\n%s\n/project\nfooter\n' "$rule" "$content" "$rule" > "$resp/$idx.out"
+    idx=$((idx + 1))
+  done
+  fb=$(make_herdr_fakebin "$dir")
+  for content in '>' '$' '%' '#' '❯' '›'; do
+    out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+      bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+    [ "$out" = pending ] || fail "pi has no prompt glyph, so typed '$content' must read pending, got '$out'"
+  done
+  pass "fm_backend_herdr_composer_state: pi treats agent- and shell-prompt-like glyphs as pending text"
+}
+
+test_composer_state_pi_separator_pair_without_cursor_is_unknown() {
+  local dir log resp fb out rule
+  dir="$TMP_ROOT/composer-pi-no-cursor"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  rule='────────────────────────────────────────────────────────────'
+  printf '%s\n                                                            \n%s\n/project\nfooter\n' "$rule" "$rule" > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = unknown ] || fail "a cursorless separator pair is not proven to be pi's live Editor and should read unknown, got '$out'"
+  pass "fm_backend_herdr_composer_state: a cursorless separator pair stays fail-closed unknown"
+}
+
+test_composer_state_pi_modal_overrides_stale_bordered_row() {
+  local dir log resp fb out rule
+  dir="$TMP_ROOT/composer-pi-modal"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  rule='────────────────────────────────────────────────────────────'
+  printf '│ ❯ stale decorative box │\n%s\n  Select a model\n\n  → openai/gpt-5.6-sol\n    anthropic/claude-opus-5\n\n  enter select  esc cancel\n%s\n/project\nfooter\n' "$rule" "$rule" > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = unknown ] || fail "pi replacement UI must override a stale bordered row and read unknown, got '$out'"
+  pass "fm_backend_herdr_composer_state: pi modal/replacement UI overrides stale matches and stays unknown"
+}
+
+test_composer_state_pi_modal_closing_rule_without_top_is_unknown() {
+  local dir log resp fb out rule
+  dir="$TMP_ROOT/composer-pi-modal-bottom-only"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  rule='────────────────────────────────────────────────────────────'
+  printf '│ ❯ stale decorative box │\n  modal content whose opening rule is above the capture\n  → selected option\n  enter select  esc cancel\n%s\n/project\nfooter\n' "$rule" > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = unknown ] || fail "a modal closing rule must invalidate stale rows even when its opening rule is outside the capture, got '$out'"
+  pass "fm_backend_herdr_composer_state: a modal closing rule without its opening rule still stays unknown"
+}
+
+test_composer_state_pi_multiline_editor_is_unknown() {
+  local dir log resp fb out rule
+  dir="$TMP_ROOT/composer-pi-multiline"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  rule='────────────────────────────────────────────────────────────'
+  printf '%s\nfirst pending line\nsecond pending line\x1b[7m \x1b[0m\n%s\n/project\nfooter\n' "$rule" "$rule" > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = unknown ] || fail "a multi-line pi editor is non-empty but outside the exact safe shape and should read unknown, got '$out'"
+  pass "fm_backend_herdr_composer_state: multi-line pi input stays fail-closed unknown"
+}
+
 # --- composer_state: unbordered (bare) composer rows -------------------------
 # Regression coverage for the away-mode redelivery-loop incident
 # (docs/herdr-backend.md "Incident (2026-07-07)"): real claude and codex
@@ -4251,6 +4348,24 @@ test_wait_transition_clean_timeout_returns_1() {
 # shellcheck source=bin/fm-backend.sh
 . "$ROOT/bin/fm-backend.sh"
 
+if [ "${FM_TEST_FOCUSED:-}" = composer-pi ]; then
+  test_composer_state_pi_separator_editor_is_empty
+  test_composer_state_pi_separator_editor_with_text_is_pending
+  test_composer_state_pi_prompt_like_text_is_pending
+  test_composer_state_pi_separator_pair_without_cursor_is_unknown
+  test_composer_state_pi_modal_overrides_stale_bordered_row
+  test_composer_state_pi_modal_closing_rule_without_top_is_unknown
+  test_composer_state_pi_multiline_editor_is_unknown
+  test_composer_state_unknown_on_capture_failure
+  test_composer_state_unknown_when_no_composer_row_found
+  test_composer_state_claude_unbordered_prompt_is_empty
+  test_composer_state_claude_unbordered_prompt_is_pending
+  test_composer_state_codex_bare_prompt_glyph_is_empty
+  test_composer_state_codex_faint_suggestion_is_empty
+  test_composer_state_codex_non_faint_same_text_is_pending
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = readsteer-native-cutover ]; then
   test_readsteer_native_server_does_not_require_legacy_certificate
   test_readsteer_legacy_lab_still_requires_certificate
@@ -4415,6 +4530,13 @@ test_composer_state_real_text_is_pending
 test_composer_state_popup_placeholder_fill_is_pending
 test_composer_state_unknown_on_capture_failure
 test_composer_state_unknown_when_no_composer_row_found
+test_composer_state_pi_separator_editor_is_empty
+test_composer_state_pi_separator_editor_with_text_is_pending
+test_composer_state_pi_prompt_like_text_is_pending
+test_composer_state_pi_separator_pair_without_cursor_is_unknown
+test_composer_state_pi_modal_overrides_stale_bordered_row
+test_composer_state_pi_modal_closing_rule_without_top_is_unknown
+test_composer_state_pi_multiline_editor_is_unknown
 test_composer_state_claude_unbordered_prompt_is_empty
 test_composer_state_claude_unbordered_prompt_is_pending
 test_composer_state_bare_prompt_below_stale_bordered_banner_wins

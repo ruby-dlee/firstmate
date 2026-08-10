@@ -41,6 +41,7 @@ set -u
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 fm_git_identity fmtest fmtest@example.com
 TMP_ROOT=$(fm_test_tmproot fm-secondmate-harness)
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 export FM_BACKEND=tmux
 
 # ===========================================================================
@@ -663,15 +664,13 @@ test_spawn_explicit_harness_does_not_inherit_secondmate_harness_tokens() {
 
   meta="$w/home/state/sm.meta"
   [ "$(meta_field "$meta" harness)" = codex ] || fail "explicit-harness-no-tokens: meta harness not codex"
-  [ "$(meta_field "$meta" model)" = default ] || fail "explicit-harness-no-tokens: meta model should stay default"
-  [ "$(meta_field "$meta" effort)" = default ] || fail "explicit-harness-no-tokens: meta effort should stay default"
+  [ "$(meta_field "$meta" model)" = gpt-5.6-sol ] || fail "explicit-harness-no-tokens: meta model should resolve to the Codex floor"
+  [ "$(meta_field "$meta" effort)" = xhigh ] || fail "explicit-harness-no-tokens: meta effort should resolve to the Codex floor"
   launch=$(cat "$launchlog")
-  assert_contains "$launch" "codex --dangerously-bypass-approvals-and-sandbox" \
+  assert_contains "$launch" "codex --model 'gpt-5.6-sol' -c 'model_reasoning_effort=\"xhigh\"' --dangerously-bypass-approvals-and-sandbox" \
     "explicit-harness-no-tokens: launch did not use codex"
-  assert_not_contains "$launch" "--model" "explicit-harness-no-tokens: launch must not carry a --model flag"
-  assert_not_contains "$launch" "model_reasoning_effort" \
-    "explicit-harness-no-tokens: launch must not carry a codex effort flag"
-  pass "C7 spawn: an explicit --harness starts with clean model/effort defaults"
+  assert_not_contains "$launch" "--model 'opus'" "explicit-harness-no-tokens: launch leaked secondmate config model"
+  pass "C7 spawn: an explicit Codex harness resolves to the admitted runtime floor"
 }
 
 test_spawn_explicit_harness_uses_explicit_profile_axes() {
@@ -683,14 +682,14 @@ test_spawn_explicit_harness_uses_explicit_profile_axes() {
   printf 'claude opus high\n' > "$w/home/config/secondmate-harness"
   make_seeded_home "$sm" sm
 
-  spawn_secondmate_capture "$w" sm "$sm" "$launchlog" --harness codex --model gpt-5.5 --effort xhigh >/dev/null 2>&1
+  spawn_secondmate_capture "$w" sm "$sm" "$launchlog" --harness codex --model gpt-5.6-sol --effort xhigh >/dev/null 2>&1
 
   meta="$w/home/state/sm.meta"
   [ "$(meta_field "$meta" harness)" = codex ] || fail "explicit-harness-explicit-axes: meta harness not codex"
-  [ "$(meta_field "$meta" model)" = gpt-5.5 ] || fail "explicit-harness-explicit-axes: meta model did not use explicit value"
+  [ "$(meta_field "$meta" model)" = gpt-5.6-sol ] || fail "explicit-harness-explicit-axes: meta model did not use explicit value"
   [ "$(meta_field "$meta" effort)" = xhigh ] || fail "explicit-harness-explicit-axes: meta effort did not use explicit value"
   launch=$(cat "$launchlog")
-  assert_contains "$launch" "--model 'gpt-5.5'" \
+  assert_contains "$launch" "--model 'gpt-5.6-sol'" \
     "explicit-harness-explicit-axes: launch did not use the explicit --model"
   assert_contains "$launch" "-c 'model_reasoning_effort=\"xhigh\"'" \
     "explicit-harness-explicit-axes: launch did not use the explicit --effort"
@@ -719,8 +718,8 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
   meta="$w/home/state/sm.meta"
   [ "$(meta_field "$meta" harness)" = codex ] \
     || fail "fallback: secondmate harness did not fall back to crew-harness codex"
-  [ "$(meta_field "$meta" model)" = default ] || fail "fallback: meta model should stay default with no tokens anywhere"
-  [ "$(meta_field "$meta" effort)" = default ] || fail "fallback: meta effort should stay default with no tokens anywhere"
+  [ "$(meta_field "$meta" model)" = gpt-5.6-sol ] || fail "fallback: Codex model did not resolve to the admitted floor"
+  [ "$(meta_field "$meta" effort)" = xhigh ] || fail "fallback: Codex effort did not resolve to the admitted floor"
 
   # Crewmate/scout launch: same crew-harness config, no --secondmate. Must resolve
   # the crewmate harness and record no model/effort - this codepath must never read
@@ -755,12 +754,12 @@ test_spawn_fallback_chain_and_crew_scout_unaffected() {
   meta="$home/state/$id.meta"
   [ "$(meta_field "$meta" kind)" = ship ] || fail "crew-unaffected: expected an ordinary ship task"
   [ "$(meta_field "$meta" harness)" = codex ] || fail "crew-unaffected: crew harness resolution changed"
-  [ "$(meta_field "$meta" model)" = default ] || fail "crew-unaffected: crew task must not invent a model"
-  [ "$(meta_field "$meta" effort)" = default ] || fail "crew-unaffected: crew task must not invent an effort"
+  [ "$(meta_field "$meta" model)" = gpt-5.6-sol ] || fail "crew-unaffected: Codex model did not resolve to the admitted floor"
+  [ "$(meta_field "$meta" effort)" = xhigh ] || fail "crew-unaffected: Codex effort did not resolve to the admitted floor"
   launch=$(cat "$launchlog")
-  assert_not_contains "$launch" "--model" "crew-unaffected: crew launch must not carry a --model flag"
-  assert_not_contains "$launch" "--effort" "crew-unaffected: crew launch must not carry an --effort flag"
-  pass "C9 spawn: the harness fallback chain still resolves with no tokens; crew/scout launches are unaffected by this feature"
+  assert_contains "$launch" "--model 'gpt-5.6-sol'" "crew-unaffected: crew Codex launch omitted its model floor"
+  assert_contains "$launch" 'model_reasoning_effort="xhigh"' "crew-unaffected: crew Codex launch omitted its effort floor"
+  pass "C9 spawn: the harness fallback chain resolves Codex to the admitted profile"
 }
 
 # ===========================================================================
@@ -1122,6 +1121,11 @@ test_config_push_exits_nonzero_on_copy_error() {
     "copy error did not emit a stderr diagnostic"
   pass "B14 config-push exits nonzero on real propagation errors"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = crew-unaffected ]; then
+  test_spawn_fallback_chain_and_crew_scout_unaffected
+  exit 0
+fi
 
 test_harness_resolution
 test_secondmate_model_effort_tokens

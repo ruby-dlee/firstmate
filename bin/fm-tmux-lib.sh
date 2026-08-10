@@ -2,9 +2,10 @@
 # fm-tmux-lib.sh — shared tmux pane primitives for firstmate.
 #
 # ONE source of truth for: busy detection, composer-empty (pending-input)
-# detection, and a verify-and-retry-Enter submit. Sourced by both the terminal-
-# backed away-mode compatibility path and bin/fm-send.sh so composer/submit logic
-# cannot drift between the two.
+# detection, and the retained legacy verify-and-retry-Enter primitive. Gate B
+# makes that primitive unavailable to production text delivery: bin/fm-send.sh
+# refuses every current backend before pane input, and the terminal-backed
+# away-mode compatibility path must treat any attempted use as undelivered.
 #
 # Why this exists (incident afk-invx-i5): the daemon's old composer check only
 # recognized a BARE prompt glyph ("> ") as an empty composer. claude draws its
@@ -62,8 +63,9 @@ fm_tmux_strip_ghost() { fm_composer_strip_ghost; }
 
 # fm_tmux_composer_state: classify the cursor/composer line of <target> as
 #   empty   - no pending input (blank, a busy footer, an empty agent composer, or
-#             only de-emphasised ghost/placeholder text). Safe to inject; also the positive
-#             acknowledgement that a submit landed.
+#             only de-emphasised ghost/placeholder text). This is a legacy
+#             composer observation, not Gate B authorization to inject text or
+#             evidence that identity-bound delivery succeeded.
 #   pending - real, unsubmitted text on the cursor line (a human mid-typing, or a
 #             previous injection whose Enter was swallowed). Defer / retry.
 #   unknown - the pane could not be read (tmux error), OR the cursor line is a

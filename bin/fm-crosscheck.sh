@@ -4,14 +4,11 @@
 # Usage:
 #   fm-crosscheck.sh run <task-id> <full GitHub PR URL>
 #   fm-crosscheck.sh verify <task-id> <full GitHub PR URL>
-#   fm-crosscheck.sh merge <task-id> <full GitHub PR URL> <reviewed SHA> <method>
 #
 # `run` is intentionally independent of no-mistakes so both reviews can be in
 # flight together once a PR exists. `verify` is the merge-gate operation: it
 # re-reads live GitHub state, requires the latest attempt for that exact head
 # and claims document to be clear, and prints only the reviewed SHA.
-# `merge` repeats that verification and is the sole entrypoint to the private
-# exact-SHA GitHub merge primitive.
 #
 # The interpreter floor and the reason for it are owned by
 # bin/fm-crosscheck-python-lib.sh.
@@ -26,5 +23,10 @@ fm_refuse_if_gate_agent
 # shellcheck source=bin/fm-crosscheck-python-lib.sh
 . "$SCRIPT_DIR/fm-crosscheck-python-lib.sh"
 CROSSCHECK_PYTHON="$(fm_crosscheck_resolve_python)"
+
+case "${1:-}" in
+  run|verify) ;;
+  *) echo "error: fm-crosscheck supports only run and verify" >&2; exit 2 ;;
+esac
 
 exec "$CROSSCHECK_PYTHON" "$SCRIPT_DIR/fm-crosscheck.py" "$@"

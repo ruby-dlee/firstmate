@@ -103,7 +103,7 @@ GitHub reports `base.sha` as the base branch tip observed when the snapshot was 
 Treating it as the reviewed base made two failures routine: an un-rebased PR was refused before launch because the live base was not the checkout's merge base, and a ledger written minutes earlier stopped matching at the merge gate because the branch had moved for reasons unrelated to the PR.
 Both refusals were artifacts of comparing a moving value, not evidence about the change, and a gate that cannot be satisfied is worse than no gate because it trains its operators to route around it.
 The merge base converges instead: the default branch advancing cannot change it unless the branch absorbs commits already reachable from this head, in which case the remaining diff is a subset of what was reviewed and the review stays sound.
-Any change to the PR itself - a new commit, a rebase, a force-push - changes the head SHA, which invalidates the ledger match on its own, so the head remains the pin GitHub's atomic merge enforces.
+Any change to the PR itself - a new commit, a rebase, a force-push - changes the head SHA, which invalidates the ledger match on its own, so the head remains the pin Firstmate's admission preflight verifies.
 Verification therefore matches the live head and the stable claims digest, and checks the execution proof against the merge base the run recorded.
 Each run records both values: `base_sha` is the reviewed merge base, and `base_branch_sha` is the base branch tip GitHub reported at snapshot time, so a ledger shows on its face when the default branch had moved ahead of the review.
 The authoring worktree is not cloned, checked for cleanliness, or required to match the PR head because no verdict about the remote PR may depend on mutable author-lane filesystem state.
@@ -119,8 +119,8 @@ bin/fm-crosscheck.sh verify <task-id> <https://github.com/owner/repo/pull/number
 Verification re-reads the live PR head and complete claims document.
 It requires the latest attempt matching that head and the stable PR number/title/body claims digest to be clear, then prints only the exact reviewed SHA.
 Dynamic check counts in the full `gh-axi` document remain visible to the reviewer but are excluded from the digest so CI completing in parallel does not invalidate an otherwise exact review.
-The merge helper sends that SHA in GitHub's atomic merge request.
-A force-push before verification invalidates the ledger match, while a force-push after verification makes GitHub reject the expected-head merge request.
+The merge helper requires native admission to return that same SHA and then refuses at the unconditional atomic boundary before any GitHub merge request.
+A force-push before verification invalidates the ledger match, while a force-push after verification is caught by the later live-head admission check.
 
 ## Finding lifecycle
 
@@ -269,9 +269,6 @@ The production adapter therefore uses these exact forms.
 ```sh
 gh-axi api /repos/<owner>/<repo>/pulls/<number>
 gh-axi pr view <number> --repo <owner>/<repo> --full
-gh-axi api PUT /repos/<owner>/<repo>/pulls/<number>/merge \
-  --field sha=<reviewed-40-hex-sha> \
-  --field merge_method=<merge|squash|rebase>
 ```
 
 The checked-in TOON fixtures under `tests/fixtures/gh-axi-v0.1.25-*.toon` are reduced from those observed documents.
@@ -279,8 +276,7 @@ Every GitHub fake rejects command forms outside this surface.
 The `labels[1]{id,name,color,default,description}:` table in the PR API fixture was observed from installed `gh-axi 0.1.25` with `gh-axi api /repos/lance-format/lance/pulls/8166` on 2026-08-03.
 The 2026-08-04 recheck used `gh-axi api /repos/ruby-dlee/firstmate/pulls/72` and observed head `c9cbe79154013efcec9aa478f1476d0eff6c63df`, base `68f014697d0eea733a4e7c0294becff4e76c7bcf`, and `merged: true` in the installed TOON shape.
 It also confirmed from `gh-axi pr view --help` that view still accepts only `--comments`, `--reviews`, and `--full`, while `gh-axi api --help` still accepts `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, and `HEAD` with repeated `--field` values.
-The merge form with optional `commit_title` and `commit_message` fields was separately exercised against an already-merged PR and returned the observed successful no-op response.
-The read adapter exposes no merge subcommand; only the gate-refused `fm-crosscheck.sh merge` boundary can reach its private exact-SHA merge primitive, and that boundary freshly verifies the ledger before issuing the request.
+The read adapter exports no merge primitive, and `fm-crosscheck.sh` accepts only `run` and `verify`.
 
 The installed reviewer invocation was exercised successfully with `--output-schema`, `--output-last-message`, `--model gpt-5.6-sol`, and `model_reasoning_effort="xhigh"` before production code used those flags.
 The installed Claude invocation was exercised successfully with a private `HOME`, selected-account `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `--model claude-opus-5`, `--effort xhigh`, `--dangerously-skip-permissions`, `--tools Bash,Read,Glob,Grep`, `--no-session-persistence`, `--output-format json`, and `--json-schema` before production code used those flags.
@@ -302,19 +298,17 @@ Its `test_unavailable_reviewer_fails_over_to_the_next_account` case covers revie
 Its `test_forged_git_diff_mutation_command_is_rejected` case is the named regression that fails if a free-form `git diff --quiet # tests/regression.test.sh` can replace real mutation verification.
 Its `test_baseline_readable_state_is_destroyed_before_mutation` and `test_mutation_is_bound_to_cited_non_test_implementation` cases cover the two mutation-causality bypasses found in the final review round.
 Its `test_mutated_non_execution_cannot_clear_a_finding` case covers the third bypass of that class: a mutation that only broke test collection exits nonzero and previously read as a caught regression, so the gate could certify a fix on a test that never ran.
-Its `test_evidence_capture_runs_on_older_interpreters` case exists because `fm-crosscheck.sh` execs whichever `python3` is first on `PATH`, which is not always the version CI pins.
-A newer-only API on the evidence path therefore surfaces as an uncaught `TypeError` inside evidence capture rather than a gate verdict; the [`firstmate-coding-guidelines`](../.agents/skills/firstmate-coding-guidelines/SKILL.md) skill owns which `stat` form `bin/*.py` must use.
+Its `test_evidence_capture_runs_on_older_interpreters` case statically enforces the repository's portable `stat` idiom and, when a pre-3.10 interpreter is available, exercises the bounded-read and artifact paths under it.
+The production wrapper independently refuses anything below Python 3.11 through `bin/fm-crosscheck-python-lib.sh`; the broader portability check preserves the [`firstmate-coding-guidelines`](../.agents/skills/firstmate-coding-guidelines/SKILL.md) rule for `bin/*.py` without weakening that runtime floor.
 `tests/fm-github-pr.test.sh` includes named cases for fieldless-array grammar, complete timeout-child cleanup, and refusal of the former public merge subcommand.
 The focused PR-check cases in `tests/fm-teardown-suite.sh` and the merge cases in `tests/fm-pr-merge.test.sh` also use observed-shape GitHub fakes.
-Those deterministic suites validate parsing, lifecycle, failure handling, and atomic request construction; they do not claim to exercise live provider availability.
+Those deterministic suites validate parsing, lifecycle, failure handling, exact-head admission, and pre-mutation refusal ordering; they do not claim to exercise live provider availability.
 The real installed-tool exercise is separate and network-dependent: the dated `gh-axi` observations above cover successful documents, while an adapter lookup for an absent PR through installed `gh-axi` must exit nonzero with `GitHub state is unreviewed`.
 
 ## Deliberate limitations
 
-Crosscheck supports immediate `merge`, `squash`, and `rebase` methods plus commit title and body fields.
-It rejects `--auto` because an asynchronous merge would escape the immediate expected-head request.
-It rejects `--delete-branch` because branch deletion is not part of the atomic merge operation.
-Delete a branch only in a later separately authorized action after the merge is confirmed.
+Crosscheck exposes only the read-only `run` and `verify` operations and has no merge primitive.
+`bin/fm-pr-merge.sh`'s header owns its accepted future-operation descriptors and unconditional pre-mutation refusal.
 
 Reviewer-generated commands execute in a non-login shell, so evidence never depends on the operator's shell profile.
 This is not a detail: a login shell runs macOS `path_helper`, which rebuilds `PATH` with `/usr/bin` ahead of everything else, so a bare `python3` in a reproduction resolved to Xcode's Python 3.9 even while the gate itself ran on 3.14.

@@ -17,11 +17,14 @@ command -v tmux >/dev/null 2>&1 || { echo "skip: tmux not found"; exit 0; }
 REAL_TMUX=$(command -v tmux)
 SOCKET="fm-backend-smoke-$$"
 SHIM_DIR=
+TMUX_TEST_TMPDIR=$(mktemp -d /tmp/fm-backend-tmux.XXXXXX) || exit 1
+export TMUX_TMPDIR="$TMUX_TEST_TMPDIR"
 trap cleanup_all EXIT
 
 cleanup_all() {
   "$REAL_TMUX" -L "$SOCKET" kill-server >/dev/null 2>&1 || true
   [ -n "${SHIM_DIR:-}" ] && rm -rf "$SHIM_DIR"
+  [ -n "${TMUX_TEST_TMPDIR:-}" ] && rm -rf "$TMUX_TEST_TMPDIR"
 }
 
 # A `tmux` shim on PATH that transparently redirects every call to the private

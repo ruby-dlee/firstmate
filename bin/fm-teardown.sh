@@ -155,6 +155,8 @@ CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
 fm_refuse_if_gate_agent
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
+# shellcheck source=bin/fm-marker-state-lib.sh
+. "$SCRIPT_DIR/fm-marker-state-lib.sh"
 # shellcheck source=bin/fm-treehouse-lib.sh
 . "$SCRIPT_DIR/fm-treehouse-lib.sh"
 FM_LOCK_LOG_PREFIX=teardown
@@ -267,8 +269,29 @@ if [ "$PRELOCK_KIND" = secondmate ]; then
   }
   TEARDOWN_ACCOUNT_LOCKS+=("$SECONDMATE_HOME_LIFECYCLE_LOCK")
 fi
-ACCOUNT_DELETE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
-TEARDOWN_ACCOUNT_LOCKS+=("$ACCOUNT_DELETE_LOCK")
+if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
+  inherited_delete_identity=
+  if fm_account_lock_matches "$STATE" "$ID" account-lifecycle "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD"; then
+    inherited_delete_identity=$(fm_account_lifecycle_lock_identity "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" 2>/dev/null) || inherited_delete_identity=
+  fi
+  case "$inherited_delete_identity" in
+    *$'\n'*)
+      inherited_delete_pid=${inherited_delete_identity%%$'\n'*}
+      inherited_delete_start=${inherited_delete_identity#*$'\n'}
+      ;;
+    *) echo "error: invalid inherited account lifecycle lock for teardown $ID" >&2; exit 1 ;;
+  esac
+  current_parent_start=$(fm_account_process_start_time "$PPID" 2>/dev/null || true)
+  if [ "$inherited_delete_pid" != "$PPID" ] || [ -z "$current_parent_start" ] \
+    || [ "$inherited_delete_start" != "$current_parent_start" ]; then
+    echo "error: inherited account lifecycle lock is not owned by teardown parent for $ID" >&2
+    exit 1
+  fi
+  ACCOUNT_DELETE_LOCK=$FM_ACCOUNT_LIFECYCLE_LOCK_HELD
+else
+  ACCOUNT_DELETE_LOCK=$(fm_account_lifecycle_lock_acquire "$STATE" "$ID") || exit 1
+  TEARDOWN_ACCOUNT_LOCKS+=("$ACCOUNT_DELETE_LOCK")
+fi
 require_safe_task_metadata || { echo "error: task metadata changed while teardown waited for $ID" >&2; exit 1; }
 if managed_account_meta "$META"; then
   MANAGED_ACCOUNT=1
@@ -5154,6 +5177,7 @@ EOF
       fi
     fi
     remove_grok_turnend_auth "$sub_state" "$child_id"
+    fm_marker_cleanup_owned "$sub_state" "$child_id" || return 1
     rm -f "$sub_state/$child_id.status" "$sub_state/$child_id.turn-ended" "$sub_state/$child_id.check.sh" "$sub_state/$child_id.meta" "$sub_state/$child_id.pi-ext.ts" "$sub_state/$child_id.grok-turnend-token" "$sub_state/$child_id.provision.log"
     [ -z "$child_account_lock" ] || fm_account_lifecycle_lock_release "$child_account_lock" >/dev/null 2>&1 || true
   done <<EOF
@@ -5287,8 +5311,9 @@ if [ "$ORCA_CLEANUP_PENDING" = 1 ]; then
   pending_orca_endpoint_absent || exit 1
   fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" remove_pending_orca_worktree_locked || exit 1
   remove_grok_turnend_auth "$STATE" "$ID"
-  fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
+  fm_backend_clear_transition "$BACKEND" "$STATE" "$T" "$ID" "$ACCOUNT_DELETE_LOCK" || true
   safe_remove_task_tmp "$TASK_TMP" || exit 1
+  fm_marker_cleanup_owned "$STATE" "$ID" || exit 1
   rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log"
   [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
   ACCOUNT_DELETE_LOCK=
@@ -5758,6 +5783,10 @@ if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then
     echo "error: direct spawn artifact backup is unavailable for $ID; retaining cleanup state" >&2
     exit 1
   }
+  fm_backend_clear_transition "$BACKEND" "$STATE" "$T" "$ID" "$ACCOUNT_DELETE_LOCK" || {
+    echo "error: failed generation transition state could not be cleared for $ID; retaining cleanup state" >&2
+    exit 1
+  }
   direct_spawn_restore_lock=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
   if ! fm_account_restore_artifacts "$STATE" "$ID" "$DIRECT_SPAWN_ARTIFACTS" "$TASK_TMP" 1 "$TASK_GENERATION" \
     || ! fm_account_meta_merge_extensions "$META" "$direct_spawn_backup_path" \
@@ -5773,7 +5802,6 @@ if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then
     exit 1
   fi
   fm_account_meta_lock_release "$direct_spawn_restore_lock" || exit 1
-  fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
   [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
   echo "cleaned failed direct spawn for $ID and restored the prior task generation"
   exit 0
@@ -5814,10 +5842,14 @@ EOF
   PREPARED_REGISTRY_LOCK=
 fi
 remove_grok_turnend_auth "$STATE" "$ID"
-fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
+fm_backend_clear_transition "$BACKEND" "$STATE" "$T" "$ID" "$ACCOUNT_DELETE_LOCK" || {
+  echo "error: transition state custody could not be cleared for $ID" >&2
+  exit 1
+}
 # Remove the exact recorded per-generation task temp root, including gotmp.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -z "$TASK_TMP" ] || safe_remove_task_tmp "$TASK_TMP" || exit 1
+fm_marker_cleanup_owned "$STATE" "$ID" || exit 1
 rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log"
 [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then

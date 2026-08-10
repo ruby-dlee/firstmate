@@ -8,7 +8,6 @@ import copy
 import datetime as dt
 import fcntl
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -1063,6 +1062,7 @@ def execute_reproduction(
         ),
         allow_network=False,
         allow_posix_ipc=False,
+        env=proof_environment(),
         timeout=evidence_command_timeout(deadline, evidence_timeout(), label),
         description=label,
     )
@@ -3660,49 +3660,6 @@ def verify_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
     return 0
 
 
-def load_github_adapter(root: Path) -> Any:
-    path = root / "bin" / "fm-github-pr.py"
-    spec = importlib.util.spec_from_file_location("firstmate_github_pr_adapter", path)
-    require(spec is not None and spec.loader is not None, "GitHub adapter is unavailable")
-    module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except (ImportError, OSError, SyntaxError) as exc:
-        fail(f"GitHub adapter could not load: {exc}")
-    require(callable(getattr(module, "merge_exact", None)), "GitHub merge primitive is unavailable")
-    return module
-
-
-def merge_crosschecked(
-    root: Path,
-    home: Path,
-    task_id: str,
-    url: str,
-    expected_sha: str,
-    method: str,
-    title: str | None,
-    body: str | None,
-) -> int:
-    require(
-        os.environ.get("FM_GATE_REFUSE_BYPASS") == "1"
-        or "NO_MISTAKES_GATE" not in os.environ,
-        "no-mistakes gate agent must not invoke the merge primitive",
-    )
-    require(SHA_RE.fullmatch(expected_sha) is not None, "expected merge head must be one 40-hex SHA")
-    reviewed_head = verified_crosscheck_head(root, home, task_id, url)
-    require(
-        reviewed_head == expected_sha,
-        "caller-provided merge head does not match the freshly verified Crosscheck head",
-    )
-    adapter = load_github_adapter(root)
-    try:
-        result = adapter.merge_exact(url, reviewed_head, method, title, body)
-    except adapter.GitHubContractError as exc:
-        fail(f"atomic GitHub merge failed closed: {exc}")
-    print(json.dumps(result, sort_keys=True))
-    return 0
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -3710,13 +3667,6 @@ def build_parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(name)
         command.add_argument("task_id")
         command.add_argument("pr_url")
-    merge = subparsers.add_parser("merge")
-    merge.add_argument("task_id")
-    merge.add_argument("pr_url")
-    merge.add_argument("expected_sha")
-    merge.add_argument("method", choices=("merge", "squash", "rebase"))
-    merge.add_argument("--title")
-    merge.add_argument("--body")
     return parser
 
 
@@ -3774,16 +3724,7 @@ def main() -> int:
                 return run_crosscheck(root, home, args.task_id, args.pr_url)
             if args.command == "verify":
                 return verify_crosscheck(root, home, args.task_id, args.pr_url)
-            return merge_crosschecked(
-                root,
-                home,
-                args.task_id,
-                args.pr_url,
-                args.expected_sha,
-                args.method,
-                args.title,
-                args.body,
-            )
+            raise AssertionError(f"unhandled command {args.command}")
     except CrosscheckBlockingError as exc:
         print(f"CROSSCHECK BLOCKING: {exc}", file=sys.stderr)
         return 1

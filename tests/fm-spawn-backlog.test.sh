@@ -7,6 +7,7 @@ set -u
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-backlog)
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 
 make_spawn_fakebin() {
   local dir=$1 fakebin
@@ -266,6 +267,14 @@ test_batch_checks_each_pair_and_continues() {
   [ -f "$HOME_DIR/state/$present_id.meta" ] || fail "tracked batch pair did not write metadata"
   pass "batch dispatch checks every pair and continues after a backlog refusal"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = spawn-success ]; then
+  test_rows_in_manual_backlog_allow_ship_and_scout
+  test_bounded_exemption_is_validated_and_recorded
+  test_tasks_axi_read_is_pinned_to_home_backlog
+  test_batch_checks_each_pair_and_continues
+  exit 0
+fi
 
 test_new_ship_without_row_is_refused_with_fix
 test_rows_in_manual_backlog_allow_ship_and_scout

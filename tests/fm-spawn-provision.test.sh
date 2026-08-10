@@ -14,6 +14,9 @@ set -u
 LIB="$ROOT/bin/fm-provision-lib.sh"
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-provision)
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
+export FM_TEST_REAL_NODE
+FM_TEST_REAL_NODE=$(command -v node)
 
 # --- fixtures ---------------------------------------------------------------
 
@@ -171,9 +174,9 @@ SH
 #!/usr/bin/env bash
 set -u
 case "${1:-}" in
-  -p|--print) printf '%s' "${FM_TEST_NODE_VERSION:-20.20.2}" ;;
+  -p|--print) printf '%s' "${FM_TEST_NODE_VERSION:-20.20.2}"; exit 0 ;;
 esac
-exit 0
+exec "${FM_TEST_REAL_NODE:?}" "$@"
 SH
   chmod +x "$fakebin/uv" "$fakebin/npm" "$fakebin/pnpm" "$fakebin/node"
   printf '%s\n' "$fakebin"
@@ -1943,6 +1946,14 @@ test_spawn_into_an_undeclared_project_is_unchanged() {
   assert_grep 'provision=none' "$HOME_DIR/state/$id.meta" "a no-op provisioning was not recorded"
   pass "a project declaring no recognized manifest spawns exactly as before"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = spawn-boundary ]; then
+  test_spawn_provisions_the_worktree_before_creating_the_endpoint
+  test_spawn_over_the_component_budget_still_launches
+  test_the_lane_can_read_what_provisioning_skipped
+  test_spawn_into_an_undeclared_project_is_unchanged
+  exit 0
+fi
 
 test_worktree_declaring_nothing_is_a_clean_noop
 test_first_spawn_installs_and_second_reuses_the_cache

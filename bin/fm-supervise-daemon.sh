@@ -7,7 +7,8 @@
 # declared-pause rechecks. A native tracked-background launch delivers that
 # escalation by completing this daemon, which lets the harness's own task
 # notification wake the parked LLM. A terminal-backed compatibility launch
-# still delivers through the supervisor pane. This is the
+# attempts the shared session-bound supervisor-pane route, which currently
+# refuses before pane input and preserves the digest. This is the
 # token-efficient replacement for the prior always-inject daemon: routine
 # signal/stale/heartbeat wakes cost zero firstmate context; only done/
 # needs-decision/blocked/failed/persistent-wedge/check-output events and a
@@ -40,10 +41,11 @@
 #     reason.
 #   - Fail-safe-to-escalate: any wake the classifier cannot confidently mark
 #     routine is escalated.
-#   - Bounded wedge latency: a stale pane without a declared external wait is
-#     escalated only after it has been idle for STALE_ESCALATE_SECS
-#     (configurable), rechecked once. A wedged crewmate is therefore detected
-#     within STALE_ESCALATE_SECS + a tick, never lost. A declared pause instead
+#   - Evidence-gated wedge latency: a stale pane without a declared external
+#     wait is rechecked after the larger of STALE_ESCALATE_SECS and one quarter
+#     of this repository's recent median test duration. A recorded running step
+#     remains absorbable only after a positive run-owned process sample; an
+#     all-zero complete window surfaces UNKNOWN rather than death. A declared pause instead
 #     gets its own longer PAUSE_RESURFACE_SECS recheck, never a wedge escalation.
 #     Crewmates are autonomous, so a delayed stale response does not stall a
 #     healthy crewmate's own progress.
@@ -87,8 +89,9 @@
 #                                   disables. Use sparingly: it overrides the
 #                                   captain-relevant escalation for matching
 #                                   kinds.
-#          FM_STALE_ESCALATE_SECS   idle seconds before a stale pane escalates
-#                                   as a possible wedge (default 240)
+#          FM_STALE_ESCALATE_SECS   minimum idle seconds before a stale pane is
+#                                   process-window rechecked (default 240; a
+#                                   repository test-duration baseline can raise it)
 #          FM_PAUSE_RESURFACE_SECS  idle seconds before a declared external wait
 #                                   re-surfaces as a recheck (default 3600)
 #          FM_ESCALATE_BATCH_SECS   buffer window for batched escalation
@@ -151,8 +154,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 . "$FM_DAEMON_DIR/fm-gate-refuse-lib.sh"
 fm_refuse_if_gate_agent
 
-# Shared tmux pane primitives for supervisor injection (busy/composer detection
-# + verify-retry submit). Sourced at top level so BOTH the executed daemon and
+# Shared tmux pane primitives for supervisor preflight and legacy submit tests.
+# Sourced at top level so BOTH the executed daemon and
 # the unit tests (which source this file for its pure functions) get the
 # corrected composer detection. Stale task rechecks use fm-backend.sh below.
 # shellcheck source=bin/fm-tmux-lib.sh
@@ -160,6 +163,12 @@ fm_refuse_if_gate_agent
 
 # shellcheck source=bin/fm-backend.sh
 . "$FM_DAEMON_DIR/fm-backend.sh"
+
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$FM_DAEMON_DIR/fm-account-routing-lib.sh"
+
+# shellcheck source=bin/fm-marker-state-lib.sh
+. "$FM_DAEMON_DIR/fm-marker-state-lib.sh"
 
 # Shared wake classifier (last_status_line, status_is_captain_relevant,
 # window_to_task, scan_captain_relevant_statuses). The SAME library backs the
@@ -176,9 +185,10 @@ fm_refuse_if_gate_agent
 . "$FM_DAEMON_DIR/fm-supervisor-target-lib.sh"
 
 # --- tunables ---------------------------------------------------------------
-# Supervisor backends the compatibility path can inject into today. zellij, orca,
-# and cmux are real backends elsewhere in firstmate (bin/fm-backend.sh) but this
-# compatibility path has no verified composer/busy primitives for them yet - see
+# Supervisor backends whose panes the compatibility path can safely preflight.
+# Both still reach Gate B's no-session-bound-route refusal before input. zellij,
+# orca, and cmux are real backends elsewhere in firstmate (bin/fm-backend.sh) but
+# this path has no verified composer/busy primitives for them yet - see
 # docs/herdr-backend.md and AGENTS.md section 4's
 # harness-verification discipline. Selecting one refuses loudly at startup
 # instead of silently running tmux primitives against a pane that is not a tmux
@@ -204,8 +214,6 @@ WEDGE_ALARM_NOTIFIER_PID=
 # bin/fm-tmux-lib.sh (FM_TMUX_BUSY_REGEX_DEFAULT / fm_tmux_composer_state);
 # FM_BUSY_REGEX still overrides the fallback busy set here, as before.
 INJECT_FAIL_SLEEP_DEFAULT=30
-INJECT_CONFIRM_RETRIES_DEFAULT=3
-INJECT_CONFIRM_SLEEP_DEFAULT=0.5
 CRASH_THRESHOLD_DEFAULT=10
 CRASH_WINDOW_DEFAULT=60
 CRASH_BACKOFF_DEFAULT=60
@@ -330,32 +338,9 @@ _collapse_newlines() {  # <text>
 
 classify_signal() {  # <reason-after-colon> <state>
   local reason=$1 state=$2 f last distilled="" rel="" all_seen=1 task seen
-  local current liveness liveness_rel="" liveness_seen=""
   for f in $reason; do
     [ -e "$f" ] || continue
     last=$(last_status_line "$f")
-    case "$f" in
-      *.status) task=$(basename "$f"); task=${task%.status} ;;
-      *.turn-ended) task=$(basename "$f"); task=${task%.turn-ended} ;;
-      *) task= ;;
-    esac
-    if [ -n "$task" ]; then
-      case " $liveness_seen " in
-        *" $task "*) ;;
-        *)
-          liveness_seen="$liveness_seen $task"
-          current=$(crew_state_line "$task")
-          liveness=$(crew_state_liveness_verdict "$current")
-          case "$liveness" in
-            alive|'') ;;
-            dead|unknown)
-              liveness_rel=1
-              distilled="${distilled}${task} liveness ${liveness}: ${current} | "
-              ;;
-          esac
-          ;;
-      esac
-    fi
     [ -n "$last" ] || continue
     distilled="${distilled}$(basename "$f"): ${last} | "
     status_is_captain_relevant "$last" || continue
@@ -365,14 +350,12 @@ classify_signal() {  # <reason-after-colon> <state>
     # single source of truth shared between the per-wake signal path and the
     # heartbeat scan. all_seen stays 1 only if EVERY relevant file was seen.
     task=$(basename "$f"); task="${task%.status}"
-    seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
+    seen=$(_seen_status_path "$state" "$task") || { all_seen=0; continue; }
     [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ] || all_seen=0
   done
   # strip a trailing " | " separator so the distilled line is clean
   distilled="${distilled% | }"
-  if [ -n "$liveness_rel" ]; then
-    printf 'escalate|%s' "$distilled"
-  elif [ -z "$rel" ]; then
+  if [ -z "$rel" ]; then
     printf 'self|routine signal: %s' "$distilled"
   elif [ "$all_seen" = "1" ]; then
     # Every relevant status was already escalated by the catch-all scan;
@@ -387,17 +370,8 @@ classify_signal() {  # <reason-after-colon> <state>
 # first sight of a non-terminal stale it returns "self" and the caller records a
 # timestamp marker; persistence is escalated by housekeeping's recheck, not here.
 classify_stale() {  # <window> <state>
-  local win=$1 state=$2 task last seen current liveness
+  local win=$1 state=$2 task last seen
   task=$(window_to_task "$win" "$state")
-  current=$(crew_state_line "$task")
-  liveness=$(crew_state_liveness_verdict "$current")
-  case "$liveness" in
-    alive|'') ;;
-    dead|unknown)
-      printf 'escalate|%s liveness %s: %s' "$task" "$liveness" "$current"
-      return
-      ;;
-  esac
   last=$(last_status_line "$state/$task.status")
   if [ -n "$last" ] && status_is_paused "$last"; then
     # A DECLARED external-wait pause (fm-classify-lib.sh): an idle pane is EXPECTED,
@@ -411,7 +385,10 @@ classify_stale() {  # <window> <state>
   if [ -n "$last" ] && status_is_captain_relevant "$last"; then
     # Dedupe against the signal path: if this status was already escalated
     # (seen marker matches), self-handle to avoid a duplicate in the digest.
-    seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
+    seen=$(_seen_status_path "$state" "$task") || {
+      printf 'escalate|stale + terminal status with UNKNOWN marker custody: %s' "$last"
+      return
+    }
     if [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ]; then
       printf 'self|stale + terminal (already escalated by signal): %s' "$last"
       return
@@ -429,21 +406,7 @@ classify_check() {  # <full reason>  — check scripts print only when firstmate
 }
 
 classify_heartbeat() {  # [state]
-  local state=${1:-$(_state_root)} task liveness current distilled=""
-  while IFS=$(printf '\t') read -r task liveness current; do
-    [ -n "$task" ] || continue
-    case "$liveness" in
-      alive) ;;
-      dead|unknown) distilled="${distilled}${task} liveness ${liveness}: ${current} | " ;;
-      *) distilled="${distilled}${task} liveness unknown: ${current} | " ;;
-    esac
-  done < <(scan_crew_liveness_observations "$state")
-  distilled=${distilled% | }
-  if [ -n "$distilled" ]; then
-    printf 'escalate|%s' "$distilled"
-  else
-    printf 'self|heartbeat (no dead or unknown command-step liveness observation)'
-  fi
+  printf 'self|heartbeat (process absence is never an away-mode verdict)'
 }
 
 # Anything unrecognized is escalated (fail-safe).
@@ -457,19 +420,131 @@ classify_unknown() {  # <reason>
 # Seen:     state/.subsuper-seen-status-<task>  last status line the scan
 #           escalated, so the catch-all does not re-fire the same terminal.
 
-_stale_key() { printf '%s' "$1" | tr ':/.' '___'; }
+_task_marker_key() {
+  if [ "$#" -ge 2 ]; then
+    fm_marker_task_key_for_state "$2" "$1"
+  else
+    fm_marker_task_key "$1"
+  fi
+}
+
+_seen_status_path() {
+  local state=$1 task=$2 key rc
+  key=$(fm_marker_migrate_task_state "$state" "$task" subsuper-seen-status)
+  rc=$?
+  [ -n "$key" ] || return 1
+  case "$rc" in 0|2) ;; *) return "$rc" ;; esac
+  printf '%s/.subsuper-seen-status-%s' "$state" "$key"
+}
+
+_watcher_marker_key() {
+  local state=$1 win=$2 task=$3 rc
+  fm_marker_migrate_watcher_state "$state" "$task" "$win" >/dev/null 2>&1
+  rc=$?
+  case "$rc" in 0|2) ;; *) return "$rc" ;; esac
+  fm_marker_task_key_for_state "$state" "$task"
+}
+
+marker_unknown_retry_path() {
+  local state=$1 kind=$2 key=$3 retry_key
+  retry_key=$(fm_marker_identity_key "$kind:$key") || return 1
+  printf '%s/.subsuper-unknown-retry-%s' "$state" "$retry_key"
+}
+
+marker_unknown_retry_clear() {
+  local retry
+  retry=$(marker_unknown_retry_path "$1" "$2" "$3") || return 1
+  if ! fm_marker_state_path_safe_or_absent "$retry"; then
+    fm_marker_quarantine_unsafe "$retry" >/dev/null || return 1
+  fi
+  rm -f "$retry"
+}
+
+marker_unknown_escalate() {
+  local state=$1 kind=$2 key=$3 cadence=$4 item=$5 retry token buf
+  retry=$(marker_unknown_retry_path "$state" "$kind" "$key") || return 1
+  if ! fm_marker_state_path_safe_or_absent "$retry"; then
+    fm_marker_quarantine_unsafe "$retry" >/dev/null || return 1
+  fi
+  fm_marker_state_path_safe_or_absent "$retry" || return 1
+  [ "$(_file_age "$retry")" -ge "$cadence" ] || return 0
+  token="[unknown-marker=$kind:$key]"
+  buf="$state/.subsuper-escalations"
+  grep -Fq -- "$token" "$buf" 2>/dev/null || escalate_add "$state" "$item $token"
+  fm_marker_atomic_write "$retry" "$(_now)"
+}
+
+marker_meta_is_safe() {
+  [ -f "$1/$2.meta" ] && [ ! -L "$1/$2.meta" ]
+}
+
+marker_record_owned() {
+  local state=$1 task=$2 kind=$3 win=$4 lock marker target result=0
+  lock=$(fm_account_lifecycle_lock_acquire "$state" "$task") || return 1
+  if ! marker_meta_is_safe "$state" "$task"; then
+    result=1
+  else
+    target=$(fm_backend_target_of_meta "$state/$task.meta")
+    if [ -z "$target" ] || [ "$target" != "$win" ]; then
+      result=1
+    else
+      marker=$(fm_marker_migrate_owned_kind "$state" "$task" "$kind") || result=1
+      if [ "$result" -eq 0 ] && [ ! -e "$marker" ]; then
+        _now > "$marker" || result=1
+      fi
+    fi
+  fi
+  fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || result=1
+  return "$result"
+}
+
+marker_refresh_owned() {
+  local state=$1 task=$2 kind=$3 marker=$4 lock key owner result=0
+  lock=$(fm_account_lifecycle_lock_acquire "$state" "$task") || return 1
+  key=${marker##*.subsuper-"$kind"-}
+  owner=$(fm_marker_task_for_key "$state" "$key" 2>/dev/null || true)
+  if [ ! -e "$marker" ]; then
+    result=0
+  elif [ "$owner" != "$task" ] || ! marker_meta_is_safe "$state" "$task"; then
+    result=1
+  else
+    _now > "$marker" || result=1
+  fi
+  fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || result=1
+  return "$result"
+}
+
+marker_remove_owned() {
+  local state=$1 task=$2 kind=$3 lock result=0
+  lock=$(fm_account_lifecycle_lock_acquire "$state" "$task") || return 1
+  fm_marker_remove_owned_kind "$state" "$task" "$kind" || result=1
+  fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || result=1
+  return "$result"
+}
+
+marker_migrate_owned() {
+  local state=$1 task=$2 kind=$3 lock marker result=0
+  lock=$(fm_account_lifecycle_lock_acquire "$state" "$task") || return 1
+  if marker_meta_is_safe "$state" "$task"; then
+    marker=$(fm_marker_migrate_owned_kind "$state" "$task" "$kind") || result=1
+  else
+    result=1
+  fi
+  fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || result=1
+  [ "$result" -eq 0 ] || return 1
+  printf '%s' "$marker"
+}
 
 stale_marker_record() {  # <window> <state>  — create if absent
-  local win=$1 state=$2 key marker
-  key=$(_stale_key "$(window_to_task "$win" "$state")")
-  marker="$state/.subsuper-stale-$key"
-  [ -e "$marker" ] || _now > "$marker"
+  local win=$1 state=$2 task
+  task=$(window_to_task "$win" "$state")
+  marker_record_owned "$state" "$task" stale "$win"
 }
 
 stale_marker_remove() {  # <window> <state>
-  local win=$1 state=$2 key
-  key=$(_stale_key "$(window_to_task "$win" "$state")")
-  rm -f "$state/.subsuper-stale-$key"
+  local win=$1 state=$2 task
+  task=$(window_to_task "$win" "$state")
+  marker_remove_owned "$state" "$task" stale
 }
 
 # Pause marker: state/.subsuper-paused-<key> holds the epoch a declared pause was
@@ -478,24 +553,24 @@ stale_marker_remove() {  # <window> <state>
 # create-if-absent so the timestamp is stable across a churny idle pane (many
 # distinct stale hashes map to one marker), keeping the cadence hash-immune.
 pause_marker_record() {  # <window> <state> - create if absent
-  local win=$1 state=$2 key marker
-  key=$(_stale_key "$(window_to_task "$win" "$state")")
-  marker="$state/.subsuper-paused-$key"
-  [ -e "$marker" ] || _now > "$marker"
+  local win=$1 state=$2 task
+  task=$(window_to_task "$win" "$state")
+  marker_record_owned "$state" "$task" paused "$win"
 }
 
 pause_marker_remove() {  # <window> <state>
-  local win=$1 state=$2 key
-  key=$(_stale_key "$(window_to_task "$win" "$state")")
-  rm -f "$state/.subsuper-paused-$key"
+  local win=$1 state=$2 task
+  task=$(window_to_task "$win" "$state")
+  marker_remove_owned "$state" "$task" paused
 }
 
 clear_pause_tracking() {  # <window> <state>
-  local win=$1 state=$2 task key watcher_key
+  local win=$1 state=$2 task watcher_key
   task=$(window_to_task "$win" "$state")
-  key=$(_stale_key "$task")
-  watcher_key=$(_stale_key "$win")
-  rm -f "$state/.subsuper-paused-$key" "$state/.subsuper-stale-$key" \
+  watcher_key=$(_watcher_marker_key "$state" "$win" "$task") || return 1
+  marker_remove_owned "$state" "$task" paused || true
+  marker_remove_owned "$state" "$task" stale || true
+  rm -f \
     "$state/.paused-$watcher_key" "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key" \
     "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key"
 }
@@ -503,9 +578,9 @@ clear_pause_tracking() {  # <window> <state>
 reconcile_pause_tracking() {  # <window> <state> <last-status-line>
   local win=$1 state=$2 last=$3 task key marker watcher_key
   task=$(window_to_task "$win" "$state")
-  key=$(_stale_key "$task")
+  key=$(_task_marker_key "$task" "$state")
   marker="$state/.subsuper-paused-$key"
-  watcher_key=$(_stale_key "$win")
+  watcher_key=$(_watcher_marker_key "$state" "$win" "$task") || return 1
   if status_is_paused "$last"; then
     stale_marker_remove "$win" "$state"
     pause_marker_record "$win" "$state"
@@ -521,8 +596,8 @@ migrate_watcher_pause_markers() {  # <state>
     win=$(fm_backend_target_of_meta "$meta")
     [ -n "$win" ] || continue
     task=$(basename "$meta"); task=${task%.meta}
-    key=$(_stale_key "$task")
-    watcher_key=$(_stale_key "$win")
+    key=$(_task_marker_key "$task" "$state")
+    watcher_key=$(_watcher_marker_key "$state" "$win" "$task") || continue
     last=$(last_status_line "$state/$task.status")
     if status_is_paused "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
       reconcile_pause_tracking "$win" "$state" "$last"
@@ -550,8 +625,9 @@ sync_pause_markers_from_signal() {  # <state> <signal files>
 # the .subsuper-seen-status-<task> dedup state: called from both the per-wake
 # escalate path and the catch-all scan.
 mark_status_seen() {  # <state> <task> <last-line>
-  local state=$1 task=$2 line=$3
-  printf '%s' "$line" > "$state/.subsuper-seen-status-$(_stale_key "$task")"
+  local state=$1 task=$2 line=$3 seen
+  seen=$(_seen_status_path "$state" "$task") || return 1
+  fm_marker_atomic_write "$seen" "$line"
 }
 
 # Mark every captain-relevant status line a per-wake classification escalated as
@@ -657,9 +733,10 @@ escalate_add() {  # <state> <distilled-item>
 # Deliver one batched, single-line digest.
 # Native reap-wake delivery prints one completion reason and asks the main loop
 # to exit cleanly, which completes the harness-tracked background task.
-# Legacy terminal-backed delivery retains the pane injection compatibility path.
-# Returns 0 on successful delivery (or an empty buffer) and non-zero when the
-# buffer must be preserved for retry or catch-up.
+# Legacy terminal-backed delivery retains the pane compatibility attempt, whose
+# current session-bound gate returns nonzero before input. Returns 0 on native
+# delivery (or an empty buffer) and nonzero when the buffer must be preserved for
+# retry or catch-up.
 escalate_flush() {  # <state>
   local state=$1 buf n msg
   buf="$state/.subsuper-escalations"
@@ -977,15 +1054,25 @@ _oldest_line_age() {  # <buf> -> seconds since the oldest buffered item first ar
 #  1b) max-defer escape: if the buffer is STILL undelivered past MAX_DEFER_SECS,
 #     attempt one normal delivery; if it cannot confirm, raise the wedge alarm.
 #     Never silently defer forever.
-#  2) stale recheck: for each pending stale marker past STALE_ESCALATE_SECS,
-#     re-peek the pane; still idle -> escalate (wedge); resumed -> clear marker.
+#  2) stale recheck: for each pending stale marker past its repository-derived
+#     cadence, re-peek the pane and repeat the run-owned process window. Any
+#     positive process sample resets the timer; an all-zero complete window (or no
+#     positive working evidence for a stopped task) surfaces UNKNOWN.
 #  2b) pause re-surface: for each declared-pause marker past PAUSE_RESURFACE_SECS,
-#     re-peek; busy/gone -> clear; still idle + still paused -> escalate a recheck
-#     digest and reset the window (repeating bounded re-surface, never a wedge).
+#     re-peek; exact run liveness clears, pane-only evidence remains UNKNOWN,
+#     and a still-declared pause escalates a recheck digest and resets the window.
 #  3) heartbeat scan: every HEARTBEAT_SCAN_SECS, grep state/*.status for a
 #     captain-relevant line the per-wake classifier missed and escalate it.
 housekeeping() {  # <state>
-  local state=$1 now due f key task win marker age last max_defer oldest pause_secs
+  local state=$1 now due f key legacy_key task win marker age last max_defer oldest pause_secs i
+  local cache baseline threshold class evidence observations observation capture capture_rc
+  local -a stale_markers=()
+  local -a stale_tasks=()
+  local -a stale_windows=()
+  local -a stale_ages=()
+  local -a stale_caches=()
+  local -a stale_thresholds=()
+  local -a stale_captures=()
   now=$(_now)
   migrate_watcher_pause_markers "$state"
 
@@ -1026,45 +1113,136 @@ housekeeping() {  # <state>
   for marker in "$state"/.subsuper-stale-*; do
     [ -e "$marker" ] || continue
     key="${marker##*.subsuper-stale-}"
-    # Reconstruct the backend target from metadata, with the live tmux list as the
-    # legacy fallback for old markers that predate meta lookup.
-    win=$(window_for_task "$key" "$state" 2>/dev/null || true)
-    if [ -z "$win" ]; then
-      # Window gone (task torn down): drop the marker, nothing to escalate.
-      rm -f "$marker"; continue
+    legacy_key=$key
+    task=$(fm_marker_task_for_key "$state" "$key" 2>/dev/null || true)
+    if [ -n "$task" ] && [ "$key" != "$(fm_marker_task_key_for_state "$state" "$task" 2>/dev/null || true)" ]; then
+      marker=$(marker_migrate_owned "$state" "$task" stale 2>/dev/null || true)
+      if [ -n "$marker" ]; then
+        key=${marker##*.subsuper-stale-}
+        marker_unknown_retry_clear "$state" stale "$legacy_key" 2>/dev/null || true
+      else
+        task=
+      fi
     fi
-    task=$(window_to_task "$win" "$state")
+    if [ -n "$task" ]; then win=$(window_for_task "$task" "$state" 2>/dev/null || true); else win=; fi
+    if [ -z "$win" ]; then
+      age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
+      threshold=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}
+      if [ "$age" -ge "$threshold" ]; then
+        marker_unknown_escalate "$state" stale "$key" "$threshold" \
+          "stale endpoint attribution UNKNOWN after ${age}s; backend target or metadata is unreadable: task-key=$key" || true
+      fi
+      continue
+    fi
+    marker_unknown_retry_clear "$state" stale "$key" 2>/dev/null || true
     last=$(last_status_line "$state/$task.status")
     if [ -n "$last" ] && status_is_paused "$last"; then
       reconcile_pause_tracking "$win" "$state" "$last"
       continue
     fi
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
-    [ "$age" -ge "${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}" ] || continue
+    cache="$state/.run-liveness-$task"
+    baseline=$(sed -n 's/.*repo_test_baseline=\([0-9][0-9]*\)s.*/\1/p' "$cache" 2>/dev/null | tail -1)
+    threshold=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}
+    case "$baseline" in
+      ''|*[!0-9]*) ;;
+      *)
+        due=$((baseline / 4))
+        [ "$due" -gt "$threshold" ] && threshold=$due
+        ;;
+    esac
+    [ "$age" -ge "$threshold" ] || continue
     stale_window_is_busy "$win" "$state"
     case "$?" in
-      0) rm -f "$marker" ;;
-      2) rm -f "$marker" ;;
-      *) escalate_add "$state" "stale persisted ${age}s (possible wedge): $win"
-         stale_marker_remove "$win" "$state" ;;
+      2)
+        stale_markers+=("$marker")
+        stale_tasks+=("$task")
+        stale_windows+=("$win")
+        stale_ages+=("$age")
+        stale_caches+=("$cache")
+        stale_thresholds+=("$threshold")
+        stale_captures+=(unreadable)
+        ;;
+      *)
+        stale_markers+=("$marker")
+        stale_tasks+=("$task")
+        stale_windows+=("$win")
+        stale_ages+=("$age")
+        stale_caches+=("$cache")
+        stale_thresholds+=("$threshold")
+        stale_captures+=(readable)
+        ;;
+    esac
+  done
+  observations=
+  if [ "${#stale_tasks[@]}" -gt 0 ]; then
+    observations=$(crew_absorb_observations_bounded "$state" "${stale_tasks[@]}") || observations=
+  fi
+  for ((i = 0; i < ${#stale_tasks[@]}; i++)); do
+    marker=${stale_markers[$i]}
+    task=${stale_tasks[$i]}
+    win=${stale_windows[$i]}
+    age=${stale_ages[$i]}
+    cache=${stale_caches[$i]}
+    threshold=${stale_thresholds[$i]}
+    capture=${stale_captures[$i]}
+    observation=$(crew_absorb_observation_from_batch "$observations" "$task") || observation=unknown
+    class=$(crew_absorb_class_from_observation "$observation")
+    evidence=$(cat "$cache" 2>/dev/null || echo "no process-window evidence")
+    case "$class" in
+      working)
+        if marker_refresh_owned "$state" "$task" stale "$marker" 2>/dev/null; then
+          log "self-handle: stale process window remained alive for $win ($evidence; next repository-derived cadence ${threshold}s)"
+        else
+          escalate_add "$state" "stale marker lifecycle UNKNOWN after ${age}s; retained without a BUSY claim: $win"
+        fi
+        ;;
+      paused)
+        stale_marker_remove "$win" "$state"
+        pause_marker_record "$win" "$state"
+        ;;
+      *)
+        escalate_add "$state" "stale process-window liveness UNKNOWN after ${age}s; no death proof: $win ($evidence)"
+        if [ "$capture" = unreadable ]; then
+          marker_refresh_owned "$state" "$task" stale "$marker" 2>/dev/null || true
+        else
+          stale_marker_remove "$win" "$state" || true
+        fi
+        ;;
     esac
   done
 
   # (2b) pause re-surface recheck. A DECLARED external-wait pause idles by design,
   # so it is rechecked on a much longer cadence than a wedge (PAUSE_RESURFACE_SECS)
   # and never escalated as one - but it MUST re-surface, so a forgotten pause cannot
-  # rot invisibly. Past the window: busy (resumed) or gone -> drop; still idle and
-  # still declaring the pause -> escalate a recheck digest and reset the marker so
-  # the window repeats.
+  # rot invisibly. Past the window, only affirmative run-owned process evidence
+  # proves a resume; unreadable and pane-only observations remain UNKNOWN, while a
+  # still-declared pause escalates a recheck digest and resets its marker.
   pause_secs=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
   for marker in "$state"/.subsuper-paused-*; do
     [ -e "$marker" ] || continue
     key="${marker##*.subsuper-paused-}"
-    win=$(window_for_task "$key" "$state" 2>/dev/null || true)
-    if [ -z "$win" ]; then
-      rm -f "$marker"; continue
+    legacy_key=$key
+    task=$(fm_marker_task_for_key "$state" "$key" 2>/dev/null || true)
+    if [ -n "$task" ] && [ "$key" != "$(fm_marker_task_key_for_state "$state" "$task" 2>/dev/null || true)" ]; then
+      marker=$(marker_migrate_owned "$state" "$task" paused 2>/dev/null || true)
+      if [ -n "$marker" ]; then
+        key=${marker##*.subsuper-paused-}
+        marker_unknown_retry_clear "$state" paused "$legacy_key" 2>/dev/null || true
+      else
+        task=
+      fi
     fi
-    task=$(window_to_task "$win" "$state")
+    if [ -n "$task" ]; then win=$(window_for_task "$task" "$state" 2>/dev/null || true); else win=; fi
+    if [ -z "$win" ]; then
+      age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
+      if [ "$age" -ge "$pause_secs" ]; then
+        marker_unknown_escalate "$state" paused "$key" "$pause_secs" \
+          "paused endpoint attribution UNKNOWN after ${age}s; backend target or metadata is unreadable: task-key=$key" || true
+      fi
+      continue
+    fi
+    marker_unknown_retry_clear "$state" paused "$key" 2>/dev/null || true
     last=$(last_status_line "$state/$task.status")
     if [ -z "$last" ] || ! status_is_paused "$last"; then
       reconcile_pause_tracking "$win" "$state" "$last"
@@ -1073,18 +1251,28 @@ housekeeping() {  # <state>
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
     [ "$age" -ge "$pause_secs" ] || continue
     stale_window_is_busy "$win" "$state"
-    case "$?" in
-      0) rm -f "$marker" ;;
-      2) rm -f "$marker" ;;
-      *)
+    capture_rc=$?
+    if [ "$capture_rc" -eq 2 ]; then
+      class=unknown
+    else
+      class=$(crew_absorb_class "$task" "$last")
+    fi
+    case "$class" in
+      working) marker_remove_owned "$state" "$task" paused 2>/dev/null || true ;;
+      unknown)
+        escalate_add "$state" "paused ${age}s with pane liveness UNKNOWN; recheck whether the external wait still holds: $win"
+        marker_refresh_owned "$state" "$task" paused "$marker" 2>/dev/null || true
+        ;;
+      paused)
         last=$(last_status_line "$state/$task.status")
         if [ -n "$last" ] && status_is_paused "$last"; then
           escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
-          _now > "$marker"
+          marker_refresh_owned "$state" "$task" paused "$marker" 2>/dev/null || true
         else
-          rm -f "$marker"
+          marker_remove_owned "$state" "$task" paused 2>/dev/null || true
         fi
         ;;
+      *) reconcile_pause_tracking "$win" "$state" "$last" ;;
     esac
   done
 
@@ -1097,7 +1285,7 @@ housekeeping() {  # <state>
     local seen
     while IFS="$(printf '\t')" read -r f task last; do
       [ -n "$f" ] || continue
-      seen="$state/.subsuper-seen-status-$(_stale_key "$task")"
+      seen=$(_seen_status_path "$state" "$task") || continue
       [ "$(cat "$seen" 2>/dev/null || true)" = "$last" ] && continue
       escalate_add "$state" "$(basename "$f"): $last (catch-all scan)"
       mark_status_seen "$state" "$task" "$last"
@@ -1106,20 +1294,15 @@ housekeeping() {  # <state>
 }
 
 # Find a recorded or live window target whose task id matches the marker key.
-window_for_task() {  # <task-key> [state]
-  local key=$1 state=${2:-$(_state_root)} meta task w t
-  for meta in "$state"/*.meta; do
-    [ -e "$meta" ] || continue
-    task=$(basename "$meta"); task=${task%.meta}
-    [ "$(_stale_key "$task")" = "$key" ] || continue
-    w=$(fm_backend_target_of_meta "$meta")
-    [ -n "$w" ] && { printf '%s' "$w"; return 0; }
-  done
-  for w in $(tmux list-windows -a -F '#{session_name}:#{window_name}' 2>/dev/null | grep ':fm-' || true); do
-    t=$(window_to_task "$w" "$state")
-    [ "$(_stale_key "$t")" = "$key" ] && { printf '%s' "$w"; return 0; }
-  done
-  return 1
+window_for_task() {  # <task> [state]
+  local task=$1 state=${2:-$(_state_root)} meta w
+  case "$task" in ''|.*|-*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  meta="$state/$task.meta"
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+  w=$(fm_backend_target_of_meta "$meta")
+  [ -n "$w" ] || return 1
+  [ "$(window_to_task "$w" "$state")" = "$task" ] || return 1
+  printf '%s' "$w"
 }
 
 # --- injection --------------------------------------------------------------
@@ -1169,34 +1352,25 @@ inject_msg() {  # <message> [state]
     log "inject deferred: supervisor pane busy (agent mid-turn)"
     return 1
   fi
-  #   b) Composer-guard: inject ONLY into a confirmed-empty GENUINE agent
+#   b) Composer preflight: advance ONLY for a confirmed-empty GENUINE agent
   #      composer. The shared classifier (fm_backend_composer_state ->
   #      fm_composer_classify_content, bin/fm-composer-lib.sh) reports 'pending'
   #      for real unsubmitted text (a human's half-typed line, or a swallowed
   #      prior injection) and 'unknown' for a bare dead-shell prompt (the agent
   #      exited to its login shell) or an unreadable pane. Neither is a safe
   #      target - typing the escalation into a shell could execute it - so defer
-  #      on anything that is not affirmatively 'empty'. A deferred escalation
-  #      stays buffered for the next cycle or the catch-up flush.
+  #      on anything that is not affirmatively 'empty'. An empty result still
+  #      reaches the later session-bound steering gate, which currently refuses.
+  #      Every refusal stays buffered for the next cycle or catch-up flush.
   composer=$(fm_backend_composer_state "$backend" "$target" 2>/dev/null)
   if [ "$composer" != empty ]; then
     log "inject deferred: supervisor composer not confirmed-empty (state=${composer:-unknown}: pending input, dead-shell prompt, or unreadable pane)"
     return 1
   fi
-  # (4) Type the digest ONCE, then submit with Enter (retry Enter only, never
-  # retype) via the shared submit primitive. Success = the backend confirms
-  # submit. An unconfirmed/unknown pane does NOT count as delivered, so the
-  # buffer is preserved (strict) rather than cleared.
-  # Dispatches through fm_backend_send_text_submit (bin/fm-backend.sh): for
-  # backend=tmux this calls fm_backend_tmux_send_text_submit, a verbatim
-  # re-export of fm_tmux_submit_core - byte-identical to calling it directly.
-  retries=${FM_INJECT_CONFIRM_RETRIES:-$INJECT_CONFIRM_RETRIES_DEFAULT}
-  sleep_s=${FM_INJECT_CONFIRM_SLEEP:-$INJECT_CONFIRM_SLEEP_DEFAULT}
-  verdict=$(fm_backend_send_text_submit "$backend" "$target" "$msg" "$retries" "$sleep_s" "$sleep_s")
-  if [ "$verdict" = empty ]; then
-    return 0  # Backend confirmed the submit.
+  if fm_backend_send_steering "$backend" "$target" "$msg"; then
+    return 0
   fi
-  log "inject failed: submit unconfirmed after $retries retries (verdict=$verdict, text may be in composer)"
+  log "inject deferred: no atomic agent-session-bound $backend steering route"
   return 1
 }
 

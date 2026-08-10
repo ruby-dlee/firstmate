@@ -566,9 +566,10 @@ fm_backend_send_key() {  # <backend> <target> <key> [expected-label] [recorded-s
   esac
 }
 
-# fm_backend_send_text_submit: type text once, then submit and verify,
-# retrying only the submission (never retyping). Echoes the verdict
-# (empty|pending|unknown|send-failed for submit-verifying adapters).
+# fm_backend_send_text_submit: retained legacy helper for spawn-time probes and
+# regression tests; canonical steering never calls this split transport.
+# It types text once, then submits and verifies while retrying only the
+# submission, and echoes empty|pending|unknown|send-failed where implemented.
 fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sleep> <settle> [expected-label] [recorded-scoped-target]
   local backend=$1
   shift
@@ -580,6 +581,30 @@ fm_backend_send_text_submit() {  # <backend> <target> <text> <retries> <enter-sl
     orca) fm_backend_orca_send_text_submit "$@" ;;
     cmux) fm_backend_cmux_send_text_submit "$@" ;;
     *) echo "error: no send-text implementation for backend '$backend'" >&2; return 1 ;;
+  esac
+}
+
+fm_backend_send_steering() {  # <backend> <target> <text> [expected-label] [recorded-scoped-target]
+  local backend=$1 target=${2:-} text=${3:-}
+  case "$backend" in
+    herdr)
+      fm_backend_source herdr || return 1
+      # Real-Herdr behavior tests have one exact opt-in for pane-run's atomic
+      # line primitive. Production never sets it and keeps the refusal below.
+      if fm_backend_herdr_test_lab_enabled \
+        && [ "${FM_BACKEND_HERDR_ATOMIC_STEERING_TEST_LAB:-}" = firstmate-herdr-atomic-steering-test-lab-v1 ]; then
+        fm_backend_herdr_send_text_line "$target" "$text" || return 1
+        printf 'confirmed'
+        return 0
+      fi
+      echo "error: backend '$backend' has no atomic agent-session-bound text steering operation" >&2
+      return 1
+      ;;
+    tmux|zellij|orca|cmux)
+      echo "error: backend '$backend' has no atomic agent-session-bound text steering operation" >&2
+      return 1
+      ;;
+    *) echo "error: no steering implementation for backend '$backend'" >&2; return 1 ;;
   esac
 }
 
@@ -1125,7 +1150,7 @@ fm_backend_wait_transition() {  # <backend> <session> <timeout_secs> <state_dir>
   esac
 }
 
-fm_backend_commit_transition() {  # <backend> <state_dir> <session> <record>
+fm_backend_commit_transition() {  # <backend> <state_dir> <session> <record> [task] [lifecycle-lock] [metadata-lock]
   local backend=$1
   shift
   fm_backend_has_push "$backend" || return 1
@@ -1136,7 +1161,29 @@ fm_backend_commit_transition() {  # <backend> <state_dir> <session> <record>
   esac
 }
 
-fm_backend_clear_transition() {  # <backend> <state_dir> <window>
+fm_backend_transition_task() {  # <backend> <state_dir> <window>
+  local backend=$1
+  shift
+  fm_backend_has_push "$backend" || return 1
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    herdr) fm_backend_herdr_task_for_window "$@" ;;
+    *) return 1 ;;
+  esac
+}
+
+fm_backend_transition_record_matches() {  # <backend> <state_dir> <session> <record>
+  local backend=$1
+  shift
+  fm_backend_has_push "$backend" || return 1
+  fm_backend_source "$backend" || return 1
+  case "$backend" in
+    herdr) fm_backend_herdr_record_binding_matches "$@" ;;
+    *) return 1 ;;
+  esac
+}
+
+fm_backend_clear_transition() {  # <backend> <state_dir> <window> [task] [lifecycle-lock] [metadata-lock]
   local backend=$1
   shift
   fm_backend_has_push "$backend" || return 0

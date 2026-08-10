@@ -161,6 +161,23 @@ fm_test_tmproot_into() {
   printf -v "$target_var" '%s' "$root"
 }
 
+# Fake terminal endpoints do not launch a real Codex process, but Gate A still
+# requires their spawn path to bind and verify one exact runtime generation.
+# Opting in publishes a synthetic rollout inside the fixture's isolated temp
+# tree; fm-spawn validates that isolation before the ordinary verifier reads it.
+fm_test_enable_codex_runtime_publisher() {
+  local root=${1:?usage: fm_test_enable_codex_runtime_publisher <fixture-root>}
+  mkdir -p "$root/codex-runtime"
+  export CODEX_HOME="$root/codex-runtime"
+  export FM_CODEX_RUNTIME_TEST_LAB=firstmate-codex-runtime-test-lab-v1
+  # Large suites deliberately share this isolated synthetic rollout tree.
+  # Keep production scan limits untouched while ensuring late fixture
+  # generations cannot fall outside the test scanner's file/time budget.
+  export FM_CODEX_PROFILE_MAX_FILES=${FM_CODEX_PROFILE_MAX_FILES:-1024}
+  export FM_CODEX_PROFILE_TOTAL_BYTES=${FM_CODEX_PROFILE_TOTAL_BYTES:-134217728}
+  export FM_CODEX_PROFILE_MAX_MILLIS=${FM_CODEX_PROFILE_MAX_MILLIS:-10000}
+}
+
 # --- node capability probe ---------------------------------------------------
 #
 # fm_node_supports_ts_import succeeds when the ambient node can import a .ts
@@ -230,9 +247,11 @@ fm_git_init_commit() {
   local dir=$1
   mkdir -p "$dir"
   git -C "$dir" init -q
+  git -C "$dir" config --local user.name 'Firstmate Tests'
+  git -C "$dir" config --local user.email 'tests@example.invalid'
   printf '# %s\n' "$(basename "$dir")" > "$dir/README.md"
   git -C "$dir" add README.md
-  git -C "$dir" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
+  git -C "$dir" commit -qm initial
 }
 
 # fm_git_add_origin <repo> <bare>: clone <repo> bare into <bare> and register it
@@ -321,6 +340,17 @@ assert_no_grep() {
 # assert_absent <path> <msg>: path must not exist.
 assert_absent() {
   [ ! -e "$1" ] || fail "$2"
+}
+
+fm_test_assert_account_lock_absent() {
+  local state=$1 task=$2 name=$3 label=$4 bounded legacy legacy_leaf
+  bounded=$(fm_account_lock_path "$state" "$task" "$name") || fail "could not resolve $label bounded lock"
+  legacy=$(fm_account_lock_legacy_path "$state" "$task" "$name") || fail "could not resolve $label raw compatibility lock"
+  [ ! -e "$bounded" ] && [ ! -L "$bounded" ] || fail "$label"
+  legacy_leaf=${legacy##*/}
+  if [ "${#legacy_leaf}" -le 255 ]; then
+    [ ! -e "$legacy" ] && [ ! -L "$legacy" ] || fail "$label (raw compatibility fence)"
+  fi
 }
 
 # assert_present <path> <msg>: path must exist.

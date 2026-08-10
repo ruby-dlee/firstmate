@@ -363,6 +363,9 @@ KIND_SET=0
 HARNESS_ARG=
 MODEL=
 EFFORT=
+SECONDMATE_CONFIG_PROFILE=0
+CODEX_RUNTIME_HOME=
+RUNTIME_STARTED_AT_NS=
 BACKEND_ARG=
 ACCOUNT_POOL=
 ACCOUNT_PROFILE=
@@ -457,11 +460,10 @@ if [ $((RESUME_ACCOUNT + CONTINUE_ACCOUNT + DIRECT_ACCOUNT_RECOVERY)) -gt 1 ]; t
   exit 1
 fi
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
-  if [ "$KIND_SET" = 1 ] || [ "$HARNESS_SET" = 1 ] || [ "$MODEL_SET" = 1 ] \
-    || [ "$EFFORT_SET" = 1 ] || [ "$BACKEND_SET" = 1 ] \
+  if [ "$KIND_SET" = 1 ] || [ "$BACKEND_SET" = 1 ] \
     || [ "$ACCOUNT_POOL_SET" = 1 ] || [ "$ACCOUNT_PROFILE_SET" = 1 ] \
     || [ "$NO_ACCOUNT_ROUTING" = 1 ] || [ "$BACKLOG_ROW_EXEMPTION_SET" = 1 ]; then
-    echo "error: --recover-direct-account accepts only a task id; task context comes from metadata" >&2
+    echo "error: --recover-direct-account accepts a task id plus current-policy --harness/--model/--effort only; task and backend context come from metadata" >&2
     exit 1
   fi
 fi
@@ -873,9 +875,8 @@ if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
   [ "${#POS[@]}" -ge 1 ] || { echo "error: inherited account lifecycle lock requires a task id" >&2; exit 1; }
   inherited_lock_id=${POS[0]}
   case "$inherited_lock_id" in *=*) echo "error: inherited account lifecycle lock does not support batch syntax" >&2; exit 1 ;; esac
-  expected_lifecycle_lock="$STATE/.account-lifecycle-$inherited_lock_id.lock"
   inherited_lock_identity=
-  if [ "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" = "$expected_lifecycle_lock" ]; then
+  if fm_account_lock_matches "$STATE" "$inherited_lock_id" account-lifecycle "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD"; then
     inherited_lock_identity=$(fm_account_lifecycle_lock_identity "$FM_ACCOUNT_LIFECYCLE_LOCK_HELD" 2>/dev/null) || inherited_lock_identity=
   fi
   case "$inherited_lock_identity" in
@@ -893,24 +894,11 @@ if [ -n "${FM_ACCOUNT_LIFECYCLE_LOCK_HELD:-}" ]; then
     exit 1
   fi
   LIFECYCLE_LOCK=$FM_ACCOUNT_LIFECYCLE_LOCK_HELD
-  if [ ! -f "$LIFECYCLE_LOCK" ] || [ -L "$LIFECYCLE_LOCK" ]; then
+  if { [ ! -f "$LIFECYCLE_LOCK" ] && [ ! -d "$LIFECYCLE_LOCK" ]; } || [ -L "$LIFECYCLE_LOCK" ]; then
     echo "error: inherited account lifecycle lock for $inherited_lock_id cannot transfer ownership" >&2
     exit 1
   fi
-  lifecycle_handoff_start=$(fm_account_process_start_time "$$") || {
-    echo "error: cannot record inherited account lifecycle lock handoff for $inherited_lock_id" >&2
-    exit 1
-  }
-  lifecycle_handoff_tmp=$(mktemp "$STATE/.account-lifecycle-$inherited_lock_id.handoff.XXXXXX") || exit 1
-  if ! printf '%s\n%s\n' "$$" "$lifecycle_handoff_start" > "$lifecycle_handoff_tmp"; then
-    rm -f "$lifecycle_handoff_tmp"
-    exit 1
-  fi
-  current_lock_identity=$(fm_account_lifecycle_lock_identity "$LIFECYCLE_LOCK" 2>/dev/null || true)
-  if [ "$current_lock_identity" != "$inherited_lock_identity" ] \
-    || [ ! -f "$LIFECYCLE_LOCK" ] || [ -L "$LIFECYCLE_LOCK" ] \
-    || ! mv "$lifecycle_handoff_tmp" "$LIFECYCLE_LOCK"; then
-    rm -f "$lifecycle_handoff_tmp"
+  if ! fm_account_lifecycle_lock_handoff "$LIFECYCLE_LOCK" "$inherited_lock_identity"; then
     echo "error: inherited account lifecycle lock was lost before ownership handoff for $inherited_lock_id" >&2
     exit 1
   fi
@@ -1803,7 +1791,7 @@ spawn_restore_unmanaged_state() {
 }
 
 spawn_abort_cleanup() {
-  local status=$? endpoint_state endpoint_gone=1 account_clean=1 state_clean=1 worktree_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name release_status orca_cleanup_failed=0 orca_boundary_token=
+  local status=$? endpoint_state endpoint_gone=1 account_clean=1 state_clean=1 worktree_clean=1 transition_clean=1 rollback_lock='' rollback_tmp restored_existing_meta=0 artifact_backup_name release_status orca_cleanup_failed=0 orca_boundary_token=
   trap - EXIT
   # This is an EXIT trap whose job is to attempt every independent cleanup
   # action and then return the original spawn status. The parent script runs
@@ -1958,14 +1946,20 @@ spawn_abort_cleanup() {
   fi
   if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${DIRECT_ACCOUNT_ROUTING:-0}" = 1 ] \
     && [ "${DIRECT_ACCOUNT_RECOVERY:-0}" != 1 ] && [ "$endpoint_gone" = 1 ]; then
-    if [ "$WORKTREE_CREATED" = 1 ] && [ -n "${WT:-}" ] && [ -d "$WT" ]; then
+    if [ "${ENDPOINT_CREATED:-0}" = 1 ] && [ "$META_INSTALLED" = 1 ] \
+      && ! fm_backend_clear_transition "${BACKEND:-tmux}" "$STATE" "${T:-}" "$ID" "$LIFECYCLE_LOCK"; then
+      transition_clean=0
+      worktree_clean=0
+      echo "warning: retained failed direct spawn state for ${ID:-unknown} because transition cleanup is unverified" >&2
+    fi
+    if [ "$transition_clean" = 1 ] && [ "$WORKTREE_CREATED" = 1 ] && [ -n "${WT:-}" ] && [ -d "$WT" ]; then
       spawn_return_created_worktree || worktree_clean=0
       [ "$worktree_clean" = 1 ] || echo "warning: failed to return direct spawn worktree for ${ID:-unknown}; retaining cleanup metadata" >&2
     fi
     if [ -z "$rollback_lock" ]; then
       rollback_lock=$(fm_account_meta_lock_acquire "$STATE" "${ID:-unknown}" 2>/dev/null) || rollback_lock=
     fi
-    if [ -n "$rollback_lock" ] && [ "$worktree_clean" = 1 ]; then
+    if [ -n "$rollback_lock" ] && [ "$worktree_clean" = 1 ] && [ "$transition_clean" = 1 ]; then
       if [ -n "$META_BACKUP" ] && [ -f "$META_BACKUP" ]; then
         artifact_backup_name=${EXISTING_ARTIFACT_BACKUP##*/}
         if fm_account_restore_artifacts "$STATE" "$ID" "$artifact_backup_name" "${TASK_TMP:-$SPAWN_TASK_TMP}" 1 "$SPAWN_GENERATION_ID" \
@@ -2358,12 +2352,19 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     RECORDED_META_WORKTREE_GIT_HEAD=$RECORDED_WORKTREE_GIT_HEAD
     RECORDED_META_WORKTREE_GIT_SETUP_REF=$RECORDED_WORKTREE_GIT_SETUP_REF
     RECORDED_META_WORKTREE_GIT_SETUP_HEAD=$RECORDED_WORKTREE_GIT_SETUP_HEAD
-    HARNESS_ARG=$RECORDED_HARNESS
+    if [ -f "$CONFIG/crew-dispatch.json" ]; then
+      [ "$HARNESS_SET" = 1 ] || {
+        echo "error: direct recovery must pass the harness freshly selected from current config/crew-dispatch.json; recorded harness '$RECORDED_HARNESS' will not be replayed" >&2
+        exit 1
+      }
+    elif [ "$HARNESS_SET" = 0 ]; then
+      HARNESS_ARG=$("$FM_ROOT/bin/fm-harness.sh" crew) || exit 1
+    fi
+    case "$HARNESS_ARG" in
+      claude|codex) ;;
+      *) echo "error: current direct recovery policy selected unsupported harness '$HARNESS_ARG'" >&2; exit 1 ;;
+    esac
     HARNESS_SET=1
-    MODEL=$RECORDED_MODEL
-    EFFORT=$RECORDED_EFFORT
-    [ "$MODEL" = default ] && MODEL=
-    [ "$EFFORT" = default ] && EFFORT=
     ARG3=$HARNESS_ARG
     DIRECT_ACCOUNT_RESPAWN=1
     PROJ=$RECORDED_PROJECT
@@ -2377,12 +2378,26 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     [ -n "$RECORDED_ATTEMPT" ] || RECORDED_ATTEMPT=legacy
     [ -n "$RECORDED_PROFILE" ] || { echo "error: managed recovery metadata has no account_profile for $ID" >&2; exit 1; }
     [ -n "$RECORDED_POOL" ] || { echo "error: managed recovery metadata has no account_pool for $ID" >&2; exit 1; }
+    if [ "$KIND" = secondmate ]; then
+      if [ "$HARNESS_SET" != 1 ]; then
+        HARNESS_ARG=$("$FM_ROOT/bin/fm-harness.sh" secondmate) || exit 1
+        SECONDMATE_CONFIG_PROFILE=1
+      fi
+    elif [ -f "$CONFIG/crew-dispatch.json" ]; then
+      [ "$HARNESS_SET" = 1 ] || {
+        echo "error: account recovery must pass the harness freshly selected from current config/crew-dispatch.json; recorded harness '$RECORDED_HARNESS' will not be replayed" >&2
+        exit 1
+      }
+    elif [ "$HARNESS_SET" = 0 ]; then
+      HARNESS_ARG=$("$FM_ROOT/bin/fm-harness.sh" crew) || exit 1
+    fi
+    case "$HARNESS_ARG" in claude|codex) ;; *) echo "error: current account recovery policy selected unsupported harness '$HARNESS_ARG'" >&2; exit 1 ;; esac
     if [ "$RESUME_ACCOUNT" = 1 ]; then
       FM_ACCOUNT_LIFECYCLE_LOCK_HELD="$LIFECYCLE_LOCK" "$SCRIPT_DIR/fm-account-session-sync.sh" "$ID" --require >/dev/null || exit 1
       RECORDED_SESSION=$(fm_meta_get "$RESUME_META" provider_session_id)
       [ -n "$RECORDED_SESSION" ] || { echo "error: managed recovery metadata has no provider_session_id for $ID" >&2; exit 1; }
-      if [ "$HARNESS_SET" = 1 ] && [ "$HARNESS_ARG" != "$RECORDED_HARNESS" ]; then
-        echo "error: --resume-account harness override '$HARNESS_ARG' does not match recorded harness '$RECORDED_HARNESS'" >&2
+      if [ "$HARNESS_ARG" != "$RECORDED_HARNESS" ]; then
+        echo "error: --resume-account cannot retain provider session identity because current harness policy '$HARNESS_ARG' differs from recorded harness '$RECORDED_HARNESS'; use continuation with an explicitly resolved profile" >&2
         exit 1
       fi
       if [ "$ACCOUNT_POOL_SET" = 1 ] && [ "$ACCOUNT_POOL" != "$RECORDED_POOL" ]; then
@@ -2401,7 +2416,6 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       ACCOUNT_TASK=$RECORDED_ACCOUNT_TASK
       ACCOUNT_ATTEMPT=$RECORDED_ATTEMPT
     else
-      [ "$HARNESS_SET" = 1 ] || HARNESS_ARG=$RECORDED_HARNESS
       if [ "$ACCOUNT_POOL_SET" = 0 ] && [ "$ACCOUNT_PROFILE_SET" = 0 ]; then
         if [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; then
           ACCOUNT_POOL=$RECORDED_POOL
@@ -2422,7 +2436,8 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     fi
     HARNESS_SET=1
     ARG3=$HARNESS_ARG
-    if [ "$RESUME_ACCOUNT" = 1 ] || [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; then
+    if { [ "$RESUME_ACCOUNT" = 1 ] || [ "$HARNESS_ARG" = "$RECORDED_HARNESS" ]; } \
+      && [ "$SECONDMATE_CONFIG_PROFILE" != 1 ]; then
       [ "$MODEL_SET" = 1 ] || MODEL=$(fm_meta_get "$RESUME_META" model)
       [ "$EFFORT_SET" = 1 ] || EFFORT=$(fm_meta_get "$RESUME_META" effort)
     fi
@@ -2569,6 +2584,7 @@ case "$ARG3" in
     # The launch_template lookup below is the unverified-adapter guard for both
     # kinds: a harness with no template aborts the spawn.
     if [ "$KIND" = secondmate ]; then
+      SECONDMATE_CONFIG_PROFILE=1
       HARNESS=$("$FM_ROOT/bin/fm-harness.sh" secondmate)
       harness_src='config/secondmate-harness (falling back to config/crew-harness)'
     else
@@ -2593,7 +2609,7 @@ esac
 # the harness itself came from the secondmate config fallback chain. Resolving
 # here on every spawn makes the pin durable across respawns. Precedence: explicit
 # --model/--effort flags still win over the file's tokens.
-if [ "$KIND" = secondmate ] && [ -z "$ARG3" ]; then
+if [ "$KIND" = secondmate ] && [ "$SECONDMATE_CONFIG_PROFILE" = 1 ]; then
   if [ "$MODEL_SET" -eq 0 ]; then
     SM_MODEL=$("$SCRIPT_DIR/fm-harness.sh" secondmate-model)
     [ -z "$SM_MODEL" ] || MODEL=$SM_MODEL
@@ -2622,6 +2638,38 @@ if [ "$KIND" != secondmate ] && [ "$HARNESS" = claude ]; then
     echo "error: Claude crew/scout model '$MODEL' does not match the installed Opus 5 anchor '$CLAUDE_CREW_MODEL'" >&2
     exit 1
   }
+fi
+
+# Codex has one fail-closed fleet profile.
+# Unknown or future model names are not ordered optimistically; they must be
+# admitted here deliberately before they can count as at least the required
+# gpt-5.6-sol/xhigh profile.
+# Recovery re-resolves these axes from this current policy instead of replaying
+# model= and effort= from task metadata.
+if [ "$HARNESS" = codex ]; then
+  [ "$RAW_LAUNCH" != 1 ] || {
+    echo "error: Codex launch does not accept raw commands because the required runtime profile cannot be proved" >&2
+    exit 1
+  }
+  if [ "$RECOVERY_ACCOUNT" = 1 ]; then
+    if [ "$MODEL_SET" = 1 ] && [ "$MODEL" != gpt-5.6-sol ]; then
+      echo "error: current Codex recovery policy requires model=gpt-5.6-sol (got explicit model=${MODEL:-default})" >&2
+      exit 1
+    fi
+    if [ "$EFFORT_SET" = 1 ] && [ "$EFFORT" != xhigh ]; then
+      echo "error: current Codex recovery policy requires effort=xhigh (got explicit effort=${EFFORT:-default})" >&2
+      exit 1
+    fi
+    MODEL=gpt-5.6-sol
+    EFFORT=xhigh
+  else
+    [ -n "$MODEL" ] || MODEL=gpt-5.6-sol
+    [ -n "$EFFORT" ] || EFFORT=xhigh
+  fi
+  if [ "$MODEL" != gpt-5.6-sol ] || [ "$EFFORT" != xhigh ]; then
+    echo "error: Codex launch requires the admitted runtime profile model=gpt-5.6-sol effort=xhigh (got model=${MODEL:-default} effort=${EFFORT:-default})" >&2
+    exit 1
+  fi
 fi
 
 ACCOUNT_EXPLICIT=0
@@ -3089,6 +3137,12 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
       exit 1
       ;;
   esac
+fi
+if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] && [ "$BACKEND" = herdr ]; then
+  fm_backend_clear_transition "$BACKEND" "$STATE" "$RECORDED_TARGET" "$ID" "$LIFECYCLE_LOCK" || {
+    echo "error: recorded Herdr transition state could not be cleared before direct recovery for $ID" >&2
+    exit 1
+  }
 fi
 
 if [ "$KIND" = secondmate ]; then
@@ -3742,6 +3796,26 @@ if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
     }
   fi
 fi
+if [ "$HARNESS" = codex ]; then
+  if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
+    CODEX_RUNTIME_HOME=$(fm_account_profile_home codex "$ACCOUNT_PROFILE") || {
+      echo "error: selected Codex profile '$ACCOUNT_PROFILE' has no unique authoritative runtime home" >&2
+      exit 1
+    }
+  elif [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
+    CODEX_RUNTIME_HOME=$DIRECT_ACCOUNT_HOME
+  else
+    CODEX_RUNTIME_HOME=${CODEX_HOME:-$HOME/.codex}
+  fi
+  case "$CODEX_RUNTIME_HOME" in
+    /*) ;;
+    *) echo "error: Codex runtime home is not absolute: $CODEX_RUNTIME_HOME" >&2; exit 1 ;;
+  esac
+  [ ! -L "$CODEX_RUNTIME_HOME" ] || {
+    echo "error: Codex runtime home is redirected: $CODEX_RUNTIME_HOME" >&2
+    exit 1
+  }
+fi
 }
 
 # build_launch_command: resolve LAUNCH (the full harness launch command) and its
@@ -3858,6 +3932,9 @@ W="fm-$ID"
 if [ "$BACKEND" = herdr ]; then
   prepare_launch_environment
   build_launch_command
+  if [ "$HARNESS" = codex ]; then
+    RUNTIME_STARTED_AT_NS=$(python3 -c 'import time; print(time.time_ns())') || exit 1
+  fi
 fi
 SPAWN_CWD=${WT:-$PROJ_ABS}
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
@@ -4107,6 +4184,9 @@ fi
 
 if [ "$BACKEND" != herdr ]; then
   prepare_launch_environment
+  if [ "$HARNESS" = codex ]; then
+    RUNTIME_STARTED_AT_NS=$(python3 -c 'import time; print(time.time_ns())') || exit 1
+  fi
 fi
 
 META_WINDOW=$T
@@ -4165,6 +4245,8 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
   echo "generation_id=$SPAWN_GENERATION_ID"
+  [ "$HARNESS" != codex ] || echo "runtime_home=$CODEX_RUNTIME_HOME"
+  [ "$HARNESS" != codex ] || echo "runtime_started_at_ns=$RUNTIME_STARTED_AT_NS"
   [ -z "${PROVISION_SUMMARY:-}" ] || echo "provision=$PROVISION_SUMMARY"
   [ "$NO_ACCOUNT_ROUTING" != 1 ] || echo "account_routing_emergency_bypass=1"
   [ -z "$BACKLOG_ROW_EXEMPTION" ] || echo "backlog_row_exemption=$BACKLOG_ROW_EXEMPTION"
@@ -4285,6 +4367,90 @@ if [ "$BACKEND" != herdr ]; then
   spawn_send_key "$T" Enter
 fi
 
+bind_codex_runtime_generation() {
+  local wait_seconds deadline provider identify_out verify_out rc session lock tmp test_tmp_root test_provider
+  wait_seconds=${FM_CODEX_RUNTIME_BIND_WAIT_SECONDS:-10}
+  case "$wait_seconds" in ''|*[!0-9]*|0) echo "error: invalid Codex runtime bind wait '$wait_seconds'" >&2; return 1 ;; esac
+  if [ "${FM_CODEX_RUNTIME_TEST_LAB:-}" = firstmate-codex-runtime-test-lab-v1 ]; then
+    test_tmp_root=$(cd "${TMPDIR:-/tmp}" && pwd -P) || return 1
+    case "$(cd "$CODEX_RUNTIME_HOME" 2>/dev/null && pwd -P)" in
+      "$test_tmp_root"/*) ;;
+      *) echo "error: Codex runtime test lab requires an isolated runtime home" >&2; return 1 ;;
+    esac
+    case "$(cd "$WT" 2>/dev/null && pwd -P)" in
+      "$test_tmp_root"/*) ;;
+      *) echo "error: Codex runtime test lab requires an isolated worktree" >&2; return 1 ;;
+    esac
+    test_provider=$(fm_account_meta_value "$STATE/$ID.meta" provider_session_id)
+    [ -n "$test_provider" ] || test_provider=-
+    node "$SCRIPT_DIR/../tests/fm-codex-runtime-test-publisher.mjs" \
+      "$CODEX_RUNTIME_HOME" "$WT" gpt-5.6-sol xhigh \
+      "$SPAWN_GENERATION_ID" "$RUNTIME_STARTED_AT_NS" "$test_provider" || return 1
+  fi
+  deadline=$(( $(date +%s) + wait_seconds ))
+  while :; do
+    if [ "$(fm_account_meta_value "$STATE/$ID.meta" generation_id)" != "$SPAWN_GENERATION_ID" ] \
+      || [ "$(fm_account_meta_value "$STATE/$ID.meta" runtime_started_at_ns)" != "$RUNTIME_STARTED_AT_NS" ]; then
+      echo "error: Codex task generation changed during provider-session binding for $ID" >&2
+      return 1
+    fi
+    provider=$(fm_account_meta_value "$STATE/$ID.meta" provider_session_id)
+    if [ -z "$provider" ]; then
+      if identify_out=$(node "$SCRIPT_DIR/fm-codex-runtime-profile.mjs" \
+        "$CODEX_RUNTIME_HOME" "$WT" gpt-5.6-sol xhigh - "$RUNTIME_STARTED_AT_NS" 2>&1); then
+        session=${identify_out#verified: session=}
+        session=${session%% *}
+        case "$session" in ''|*[!A-Za-z0-9._:-]*) echo "error: Codex returned an unsafe provider session identity" >&2; return 1 ;; esac
+        lock=$(fm_account_meta_lock_acquire "$STATE" "$ID") || return 1
+        if [ "$(fm_account_meta_value "$STATE/$ID.meta" generation_id)" != "$SPAWN_GENERATION_ID" ] \
+          || [ "$(fm_account_meta_value "$STATE/$ID.meta" runtime_started_at_ns)" != "$RUNTIME_STARTED_AT_NS" ]; then
+          fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+          echo "error: Codex task generation changed before provider-session binding for $ID" >&2
+          return 1
+        fi
+        tmp=$(mktemp "$STATE/.$ID.meta.runtime-bind.XXXXXX") || {
+          fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+          return 1
+        }
+        if ! awk -F= '$1 != "provider_session_id" { print }' "$STATE/$ID.meta" > "$tmp" \
+          || ! printf 'provider_session_id=%s\n' "$session" >> "$tmp" \
+          || ! fm_account_safe_file_destination "$STATE/$ID.meta" \
+          || ! mv "$tmp" "$STATE/$ID.meta"; then
+          rm -f "$tmp"
+          fm_account_meta_lock_release "$lock" >/dev/null 2>&1 || true
+          echo "error: could not bind Codex provider session to generation $SPAWN_GENERATION_ID" >&2
+          return 1
+        fi
+        fm_account_meta_lock_release "$lock" || return 1
+      else
+        rc=$?
+        [ "$rc" -ne 1 ] || { printf '%s\n' "$identify_out" >&2; return 1; }
+      fi
+    fi
+    if [ -n "$(fm_account_meta_value "$STATE/$ID.meta" provider_session_id)" ]; then
+      if verify_out=$("$SCRIPT_DIR/fm-runtime-profile.sh" "$ID" 2>&1); then
+        if [ "$(fm_account_meta_value "$STATE/$ID.meta" generation_id)" = "$SPAWN_GENERATION_ID" ] \
+          && [ "$(fm_account_meta_value "$STATE/$ID.meta" runtime_started_at_ns)" = "$RUNTIME_STARTED_AT_NS" ] \
+          && [ "$(fm_account_meta_value "$STATE/$ID.meta" provider_session_id)" = "${provider:-$session}" ]; then
+          return 0
+        fi
+        echo "error: Codex task generation changed after runtime verification for $ID" >&2
+        return 1
+      else
+        rc=$?
+        [ "$rc" -ne 1 ] || { printf '%s\n' "$verify_out" >&2; return 1; }
+      fi
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || {
+      echo "error: Codex generation $SPAWN_GENERATION_ID did not bind and verify an exact provider session" >&2
+      [ -z "${identify_out:-}" ] || printf 'last identify result: %.500s\n' "$identify_out" >&2
+      [ -z "${verify_out:-}" ] || printf 'last verification result: %.500s\n' "$verify_out" >&2
+      return 1
+    }
+    sleep 0.1
+  done
+}
+
 if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
   session_sync_args=("$ID" --wait "${FM_ACCOUNT_SESSION_WAIT_SECONDS:-10}" --require)
   if [ "$RESUME_ACCOUNT" = 1 ]; then
@@ -4306,6 +4472,7 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     echo "error: managed provider launch for $ID did not bind a fresh SessionStart mapping" >&2
     exit 1
   fi
+  [ "$HARNESS" != codex ] || bind_codex_runtime_generation || exit 1
   [ -z "$ACCOUNT_NATIVE_LAUNCH_DIR" ] || rm -rf "$ACCOUNT_NATIVE_LAUNCH_DIR" || exit 1
   ACCOUNT_NATIVE_LAUNCH_DIR=
   ACCOUNT_NATIVE_LAUNCH_GO=
@@ -4336,6 +4503,8 @@ if [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ]; then
     fi
   fi
 fi
+[ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || [ "$HARNESS" != codex ] \
+  || bind_codex_runtime_generation || exit 1
 [ "$ACCOUNT_EFFECTIVE_MODE" = enforce ] || ACCOUNT_SPAWN_COMMITTED=1
 if [ -n "$EXISTING_TASK_TMP" ] && [ "$EXISTING_TASK_TMP" != "$TASK_TMP" ]; then
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1

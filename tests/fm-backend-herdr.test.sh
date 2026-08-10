@@ -2191,11 +2191,8 @@ SH
     FM_BACKEND_HERDR_SERVER_LOCK_STALE_SECONDS=11 FM_TEST_HERDR_DELAY_BEFORE_LAUNCH=12 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_ensure fmtest' "$ROOT" &
   first=$!
-  for _attempt in $(seq 1 1500); do
-    [ -e "$invoked" ] && break
-    sleep 0.01
-  done
-  [ -e "$invoked" ] || { kill -KILL "$first" 2>/dev/null || true; fail "delayed fake server was never launched"; }
+  fm_test_wait_for_file "$invoked" "$first" 0.01 \
+    || { kill -KILL "$first" 2>/dev/null || true; fail "delayed fake server was never launched"; }
   lock=
   for candidate in "$lock_root"/*.lock; do
     [ -f "$candidate" ] || continue
@@ -3294,7 +3291,7 @@ test_wait_for_working_samples_budget_endpoint_without_final_sleep() {
 test_send_text_submit_applies_herdr_minimum_confirm_budget() {
   local dir log resp fb out sleep_log sleeps
   dir="$TMP_ROOT/submit-min-budget"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; sleep_log="$dir/sleeps"; : > "$log"; : > "$sleep_log"
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/5.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/6.out"
@@ -3360,11 +3357,11 @@ test_wait_for_working_treats_blocked_as_submit_active() {
 test_send_text_submit_detects_landed_send() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-ok"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  # 1: native agent send (literal, no output)
-  # 2: agent get - pre-Enter baseline is idle
+  # 1: agent get - registered non-Codex identity and pre-Enter idle baseline
+  # 2: native agent send (literal, no output)
   # 3: send-keys enter
   # 4: agent get - agent_status working (a real turn started: submitted)
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/4.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
@@ -3383,7 +3380,7 @@ test_send_text_submit_detects_swallowed_enter() {
   dir="$TMP_ROOT/submit-swallow"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
   # Every post-Enter agent-get read still reports idle: the Enter never
   # started a turn (swallowed), so wait_for_working never observes "busy".
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/6.out"
   fb=$(make_herdr_fakebin "$dir")
@@ -3402,11 +3399,11 @@ test_send_text_submit_detects_swallowed_enter() {
 test_send_text_submit_popup_autocomplete_requires_second_enter() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-popup-autocomplete"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  # 1: send-text "/compact"
-  # 2: agent get - pre-Enter baseline is idle
+  # 1: agent get - registered non-Codex identity and pre-Enter idle baseline
+  # 2: agent send "/compact"
   # 3: send-keys enter (#1) - closes the popup, fills the placeholder; no turn starts
   # 4: agent get -> idle (not submitted yet)
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
   # 5: send-keys enter (#2) - actually submits
   # 6: agent get -> working (submitted)
@@ -3423,8 +3420,7 @@ test_send_text_submit_popup_autocomplete_requires_second_enter() {
 test_send_text_submit_confirms_blocked_after_enter() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-blocked"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
-  printf '{"result":{"agent":{"agent_status":"blocked"}}}\n' > "$resp/3.out"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '{"result":{"agent":{"agent_status":"blocked"}}}\n' > "$resp/4.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
@@ -3438,8 +3434,7 @@ test_send_text_submit_confirms_blocked_after_enter() {
 test_send_text_submit_preexisting_working_does_not_false_confirm_swallowed_enter() {
   local dir log resp fb out enter_count read_count
   dir="$TMP_ROOT/submit-preexisting-working-swallow"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/2.out"
-  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/3.out"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"working"}}}\n' > "$resp/1.out"
   printf '  \xe2\x9d\xaf hello captain\n' > "$resp/4.out"
   printf '  \xe2\x9d\xaf hello captain\n' > "$resp/6.out"
   fb=$(make_herdr_fakebin "$dir")
@@ -3453,21 +3448,21 @@ test_send_text_submit_preexisting_working_does_not_false_confirm_swallowed_enter
   pass "fm_backend_herdr_send_text_submit: preexisting working is not accepted as submit proof when the composer still holds the message"
 }
 
-# Regression for the submit-confirmation side of the 2026-07-07 incident:
-# even if a Codex idle composer displays suggestion text, an idle-baseline
-# submit must confirm from native agent-state rather than composer scraping.
-# The pre-injection composer guard has its own faint-suggestion coverage below.
-test_send_text_submit_confirms_despite_codex_idle_tip_composer() {
+# Gate B rejects this historical split submit primitive for Codex because
+# Herdr's native agent send reapplies stored thread settings while pane input
+# cannot bind the following Enter to that exact agent session.
+test_send_text_submit_refuses_codex_without_mutation() {
   local dir log resp fb out
-  dir="$TMP_ROOT/submit-codex-idle-tip"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
-  printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/4.out"
+  dir="$TMP_ROOT/submit-codex-refused"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '{"result":{"agent":{"agent":"codex","agent_status":"idle"}}}\n' > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_send_text_submit default:w1:p2 "reply with just OK" 3 0.01 0.01' "$ROOT" )
-  [ "$out" = empty ] || fail "send_text_submit should confirm via agent_status alone even for a harness whose idle composer shows dynamic tip text, got '$out'"
-  [ "$(grep -c $'\x1f''pane'$'\x1f''read' "$log")" -eq 0 ] || fail "send_text_submit must never call 'pane read' - a codex-style dynamic idle-tip composer can never mislead a confirmation path that does not read it"
-  pass "fm_backend_herdr_send_text_submit: confirms submission via native agent-state alone, immune to a codex-style dynamic idle-tip composer that would have misread as 'pending' under the old composer-based confirmation"
+  [ "$out" = send-failed ] || fail "send_text_submit must refuse a registered Codex agent, got '$out'"
+  [ "$(wc -l < "$log" | tr -d ' ')" -eq 1 ] || fail "Codex refusal performed a mutation after the identity probe: $(cat "$log")"
+  assert_contains "$(cat "$log")" $'\x1f''agent'$'\x1f''get'$'\x1f''w1:p2' \
+    "Codex refusal did not bind its decision to the registered agent identity"
+  pass "fm_backend_herdr_send_text_submit: refuses Codex after one identity probe and performs no input mutation"
 }
 
 # Companion regression for the pre-injection empty-box guard itself
@@ -3511,8 +3506,8 @@ test_composer_state_guard_still_refuses_real_pending_text_after_submit_confirmat
 test_send_text_submit_slow_transition_within_one_enter_needs_no_extra_enter() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-slow-transition"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  # 1: send-text  2: baseline idle  3: send-keys enter  4,5: agent get -> idle  6: agent get -> working
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  # 1: registered Claude baseline  2: agent send  3: Enter  4,5: idle  6: working
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/4.out"
   printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/5.out"
   printf '{"result":{"agent":{"agent_status":"working"}}}\n' > "$resp/6.out"
@@ -3528,20 +3523,20 @@ test_send_text_submit_slow_transition_within_one_enter_needs_no_extra_enter() {
 test_send_text_submit_send_failed() {
   local dir log resp fb out
   dir="$TMP_ROOT/submit-fail"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  # Native agent send fails, then the recovery/husk pane-send fallback fails.
-  printf '1\n' > "$resp/1.exit"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '1\n' > "$resp/2.exit"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_send_text_submit default:w1:p2 "x" 2 0.01 0.01' "$ROOT" )
   [ "$out" = send-failed ] || fail "send_text_submit should report send-failed when the literal send itself fails, got '$out'"
-  pass "fm_backend_herdr_send_text_submit: reports 'send-failed' when native agent send and the pane-send fallback both error"
+  [ "$(grep -c $'\x1f''pane'$'\x1f''send-text' "$log" || true)" -eq 0 ] || fail "failed native agent send fell back to unbound pane text input"
+  pass "fm_backend_herdr_send_text_submit: reports 'send-failed' when native agent send fails without falling back to pane input"
 }
 
 test_send_text_submit_unknown_on_capture_failure() {
   local dir log resp fb out enter_count
   dir="$TMP_ROOT/submit-read-fail"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  printf '{"result":{"agent":{"agent_status":"idle"}}}\n' > "$resp/2.out"
+  printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n' > "$resp/1.out"
   printf '1\n' > "$resp/4.exit"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" FM_BACKEND_HERDR_SUBMIT_POLLS=1 \
@@ -4034,19 +4029,195 @@ test_normalize_event_leaves_from_empty() {
   pass "fm_backend_herdr_normalize_event routes through the shared record with an empty from_status"
 }
 
-test_escalation_marker_keys_like_watcher() {
-  local m
-  m=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_escalation_marker /st default:wG:pQ' "$ROOT")
-  [ "$m" = "/st/.herdr-escalated-default_wG_pQ" ] \
-    || fail "escalation marker key must match the watcher's tr ':/.' '___' scheme, got '$m'"
-  pass "fm_backend_herdr_escalation_marker keys the dedupe marker exactly like the watcher's .stale-<key>"
+herdr_escalation_marker_path() {
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_escalation_marker "$1" "$2"' "$ROOT" "$1" "$2"
+}
+
+write_herdr_transition_meta() {
+  fm_write_meta "$1/$2.meta" "window=$3" "backend=herdr" "kind=ship" "generation_id=generation-$2"
+}
+
+bind_herdr_transition() {
+  bash -c '
+    . "$0/bin/backends/herdr.sh"
+    binding=$(fm_backend_herdr_binding_for_window "$1" "$2:$3") || exit 1
+    fm_backend_herdr_bind_transition_record "$4" "$binding"
+  ' "$ROOT" "$1" "$2" "$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_pane_id "$1"' "$ROOT" "$3")" "$3"
+}
+
+test_escalation_marker_keys_are_collision_free() {
+  local m dotted underscored dir state legacy old
+  dir="$TMP_ROOT/escalation-marker-identity"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
+  write_herdr_transition_meta "$state" lane-dot default:lane.a
+  write_herdr_transition_meta "$state" lane-under default:lane_a
+  m=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  [ "$m" = "$state/.herdr-escalated-v3-04338efa3648e18b33e36e474752ba667ef492615b96e5d6577485dcb31891a5" ] \
+    || fail "escalation marker did not encode the exact window identity, got '$m'"
+  dotted=$(herdr_escalation_marker_path "$state" default:lane.a)
+  underscored=$(herdr_escalation_marker_path "$state" default:lane_a)
+  [ "$dotted" != "$underscored" ] || fail "distinct Herdr window identities shared an escalation marker"
+  dir="$TMP_ROOT/escalation-marker-v2"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
+  legacy=$(printf '%s' default:wG:pQ | od -An -tx1 | tr -d ' \n')
+  old="$state/.herdr-escalated-v2-$legacy"
+  printf 'handled\n' > "$old"
+  m=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  [ -e "$m" ] || fail "bounded Herdr key did not retain its v2 dedupe state"
+  [ ! -e "$old" ] || fail "Herdr v2 dedupe state remained after bounded migration"
+  pass "fm_backend_herdr_escalation_marker is collision-free for exact window identities"
+}
+
+test_escalation_marker_migrates_uniquely_owned_pre_v2_state() {
+  local dir state old marker
+  dir="$TMP_ROOT/escalation-marker-pre-v2"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-dot default:lane.a
+  old="$state/.herdr-escalated-default_lane_a"
+  printf 'handled\n' > "$old"
+  marker=$(herdr_escalation_marker_path "$state" default:lane.a)
+  [ -e "$marker" ] || fail "uniquely owned pre-v2 Herdr state did not migrate"
+  [ ! -e "$old" ] || fail "uniquely owned pre-v2 Herdr state remained after migration"
+  pass "Herdr transition state migrates uniquely owned pre-v2 carriers"
+}
+
+test_escalation_marker_retains_ambiguous_pre_v2_state() {
+  local dir state old key marker rc
+  dir="$TMP_ROOT/escalation-marker-pre-v2-ambiguous"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-dot default:lane.a
+  write_herdr_transition_meta "$state" lane-under default:lane_a
+  old="$state/.herdr-escalated-default_lane_a"
+  printf 'handled\n' > "$old"
+  key=$(bash -c '. "$0/bin/fm-marker-state-lib.sh"; fm_marker_identity_key "$1"' "$ROOT" default:lane.a)
+  marker="$state/.herdr-escalated-$key"
+  herdr_escalation_marker_path "$state" default:lane.a >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "ambiguous pre-v2 Herdr state was attributed to one sibling"
+  [ -e "$old" ] || fail "ambiguous pre-v2 Herdr state was not retained visibly"
+  [ ! -e "$marker" ] || fail "ambiguous pre-v2 Herdr state created an exact suppressor"
+  pass "ambiguous pre-v2 Herdr transition state remains fail-closed and visible"
+}
+
+test_escalation_marker_quarantines_unsafe_pre_v2_state() {
+  local dir state old marker sentinel rc
+  dir="$TMP_ROOT/escalation-marker-pre-v2-unsafe"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-dot default:lane.a
+  old="$state/.herdr-escalated-default_lane_a"
+  sentinel="$dir/sentinel"
+  printf 'preserve-me\n' > "$sentinel"
+  ln -s "$sentinel" "$old"
+  marker=$(bash -c '. "$0/bin/fm-marker-state-lib.sh"; printf "%s/.herdr-escalated-%s" "$1" "$(fm_marker_identity_key "$2")"' \
+    "$ROOT" "$state" default:lane.a)
+  herdr_escalation_marker_path "$state" default:lane.a >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] || fail "unsafe pre-v2 Herdr state authorized exact attribution"
+  [ "$(cat "$sentinel")" = preserve-me ] || fail "unsafe pre-v2 Herdr migration followed its symlink"
+  [ ! -L "$old" ] || fail "unsafe pre-v2 Herdr state was not quarantined"
+  [ ! -e "$marker" ] || fail "unsafe pre-v2 Herdr state created an exact suppressor"
+  find "$state" -path '*/carrier' -type l -print -quit | grep . >/dev/null \
+    || fail "unsafe pre-v2 Herdr state was not retained visibly in quarantine"
+  pass "unsafe pre-v2 Herdr transition state is quarantined without attribution"
+}
+
+test_escalation_marker_rejects_adversarial_owner_substitution() {
+  local dir state rec key owner marker out rc
+  dir="$TMP_ROOT/escalation-owner-substitution"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
+  rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  rec=$(bind_herdr_transition "$state" default "$rec")
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec"
+  key=${marker##*escalated-}
+  owner="$state/.marker-owner-herdr-transition-$key"
+  printf '%s' default:wG:pR > "$owner"
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec"); rc=$?
+  [ "$rc" = 1 ] && [ -z "$out" ] || fail "substituted Herdr ownership authorized a blocked transition"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec" \
+    && fail "substituted Herdr ownership authorized a marker commit"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2"' "$ROOT" "$state" default:wG:pQ \
+    && fail "substituted Herdr ownership authorized marker deletion"
+  [ -e "$marker" ] || fail "failed Herdr ownership validation deleted the marker"
+  pass "Herdr transition markers reject adversarial exact-owner substitution"
+}
+
+test_escalation_marker_refuses_symlink_carriers() {
+  local dir state rec marker sentinel out rc
+  dir="$TMP_ROOT/escalation-marker-symlink"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
+  rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  rec=$(bind_herdr_transition "$state" default "$rec")
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  sentinel="$dir/sentinel"
+  printf 'preserve-me\n' > "$sentinel"
+  ln -s "$sentinel" "$marker"
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec"); rc=$?
+  [ "$rc" = 1 ] && [ -z "$out" ] || fail "symlink Herdr marker authorized a blocked transition"
+  [ "$(cat "$sentinel")" = preserve-me ] || fail "Herdr marker read followed its symlink"
+  [ ! -L "$marker" ] || fail "unsafe Herdr marker was not quarantined"
+  ln -s "$sentinel" "$marker"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec" \
+    && fail "symlink Herdr marker authorized a commit"
+  [ "$(cat "$sentinel")" = preserve-me ] || fail "Herdr marker commit followed its symlink"
+  [ ! -L "$marker" ] || fail "unsafe Herdr commit marker was not quarantined"
+  ln -s "$sentinel" "$marker"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2"' "$ROOT" "$state" default:wG:pQ \
+    && fail "symlink Herdr marker authorized a clear"
+  [ "$(cat "$sentinel")" = preserve-me ] || fail "Herdr marker clear followed its symlink"
+  [ ! -L "$marker" ] || fail "unsafe Herdr clear marker was not quarantined"
+  pass "Herdr transition markers quarantine symlinks without following targets"
+}
+
+test_transition_commit_refuses_teardown_and_window_reuse_races() {
+  local dir state rec new_rec marker ready release observed holder commit_pid
+  dir="$TMP_ROOT/escalation-marker-lifecycle"; state="$dir/state"; mkdir -p "$state"
+  ready="$dir/holder.ready"; release="$dir/holder.release"; observed="$dir/commit.waiting"
+  write_herdr_transition_meta "$state" lane-old default:wG:pQ
+  rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  rec=$(bind_herdr_transition "$state" default "$rec")
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3" "$4"' \
+    "$ROOT" "$state" default "$rec" lane-old || fail "lifecycle setup commit failed"
+  (
+    . "$ROOT/bin/backends/herdr.sh"
+    lock=$(fm_account_lifecycle_lock_acquire "$state" lane-old) || exit 1
+    : > "$ready"
+    while [ ! -e "$release" ]; do sleep 0.02; done
+    fm_backend_herdr_clear_transition "$state" default:wG:pQ lane-old "$lock" || exit 1
+    rm -f "$state/lane-old.meta"
+    fm_account_lifecycle_lock_release "$lock"
+  ) &
+  holder=$!
+  fm_test_wait_for_file "$ready" "$holder" || fail "teardown race holder did not acquire lifecycle custody"
+  FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_ACCOUNT_LOCK_WAIT_TEST_OBSERVED="$observed" \
+    FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=5 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3" "$4"' \
+      "$ROOT" "$state" default "$rec" lane-old >/dev/null 2>&1 &
+  commit_pid=$!
+  fm_test_wait_for_file "$observed" "$commit_pid" || fail "racing commit did not wait on lifecycle custody"
+  : > "$release"
+  wait "$holder" || fail "teardown race holder failed"
+  if wait "$commit_pid"; then
+    fail "commit recreated transition state after teardown removed metadata"
+  fi
+  [ ! -e "$marker" ] || fail "post-teardown commit recreated the retired marker"
+  write_herdr_transition_meta "$state" lane-new default:wG:pQ
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3" "$4"' \
+    "$ROOT" "$state" default "$rec" lane-old >/dev/null 2>&1 \
+    && fail "retired task committed against a reassigned Herdr window"
+  new_rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  new_rec=$(bind_herdr_transition "$state" default "$new_rec")
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3" "$4"' \
+    "$ROOT" "$state" default "$new_rec" lane-new || fail "reassigned Herdr window rejected its exact current task"
+  [ -e "$marker" ] || fail "exact current task did not commit the reassigned window marker"
+  pass "Herdr commits refuse post-teardown recreation and stale window reuse"
 }
 
 test_apply_transition_blocked_requires_commit_to_dedupe() {
   local dir state rec out rc marker
   dir="$TMP_ROOT/apply-blocked"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
   rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
-  marker="$state/.herdr-escalated-default_wG_pQ"
+  rec=$(bind_herdr_transition "$state" default "$rec")
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec"); rc=$?
   [ "$rc" = 0 ] || fail "a fresh blocked edge must return 0 (actionable), got $rc"
   case "$out" in *blocked*) : ;; *) fail "apply_transition should print the record on a fresh actionable edge, got '$out'" ;; esac
@@ -4063,9 +4234,12 @@ test_apply_transition_blocked_requires_commit_to_dedupe() {
 test_apply_transition_working_clears_marker() {
   local dir state blocked working marker rc
   dir="$TMP_ROOT/apply-working"; state="$dir/state"; mkdir -p "$state"
-  marker="$state/.herdr-escalated-default_wG_pQ"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   blocked=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
   working=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" working claude' "$ROOT")
+  blocked=$(bind_herdr_transition "$state" default "$blocked")
+  working=$(bind_herdr_transition "$state" default "$working")
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$blocked"
   [ -e "$marker" ] || fail "setup: committed blocked edge should have set the marker"
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$working"; rc=$?
@@ -4077,10 +4251,192 @@ test_apply_transition_working_clears_marker() {
   pass "fm_backend_herdr_apply_transition: a working edge clears the marker so the next ->blocked re-escalates"
 }
 
+test_buffered_transition_refuses_reassigned_window() {
+  local dir state old_blocked old_working new_blocked marker out rc
+  dir="$TMP_ROOT/apply-buffered-reuse"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-old default:wG:pQ
+  old_blocked=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  old_working=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" working claude' "$ROOT")
+  old_blocked=$(bind_herdr_transition "$state" default "$old_blocked")
+  old_working=$(bind_herdr_transition "$state" default "$old_working")
+  rm -f "$state/lane-old.meta"
+  write_herdr_transition_meta "$state" lane-new default:wG:pQ
+  new_blocked=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  new_blocked=$(bind_herdr_transition "$state" default "$new_blocked")
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" default "$new_blocked" || fail "replacement generation marker setup failed"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" default "$old_working" >/dev/null; rc=$?
+  [ "$rc" = 1 ] || fail "buffered working edge from the retired generation did not become UNKNOWN"
+  [ -e "$marker" ] || fail "buffered working edge cleared the replacement generation marker"
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" default "$old_blocked"); rc=$?
+  [ "$rc" = 1 ] && [ -z "$out" ] || fail "buffered blocked edge rebound to the replacement generation"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" default "$old_blocked" >/dev/null 2>&1 \
+    && fail "retired generation transition committed against the replacement owner"
+  [ -e "$marker" ] || fail "retired generation commit altered the replacement marker"
+  pass "buffered Herdr edges cannot clear, wake, or commit after window reassignment"
+}
+
+test_transition_refuses_replaced_metadata_identity() {
+  local dir state rec replacement out rc
+  dir="$TMP_ROOT/apply-metadata-replacement"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
+  rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  rec=$(bind_herdr_transition "$state" default "$rec")
+  replacement="$state/.lane-q.meta.replacement"
+  cp "$state/lane-q.meta" "$replacement"
+  mv "$replacement" "$state/lane-q.meta"
+  out=$(bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" default "$rec"); rc=$?
+  [ "$rc" = 1 ] && [ -z "$out" ] || fail "replaced metadata identity retained a buffered transition"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" default "$rec" >/dev/null 2>&1 \
+    && fail "replaced metadata identity authorized a buffered commit"
+  pass "Herdr transition custody includes the safe metadata file identity"
+}
+
+test_transition_commit_serializes_metadata_replacement() {
+  local dir state rec marker observed ready release holder commit_pid
+  dir="$TMP_ROOT/transition-metadata-lock"; state="$dir/state"; mkdir -p "$state"
+  observed="$dir/commit.waiting"; ready="$dir/writer.ready"; release="$dir/writer.release"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
+  rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" blocked claude' "$ROOT")
+  rec=$(bind_herdr_transition "$state" default "$rec")
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
+  (
+    . "$ROOT/bin/fm-account-routing-lib.sh"
+    lock=$(fm_account_meta_lock_acquire "$state" lane-q) || exit 1
+    : > "$ready"
+    while [ ! -e "$release" ]; do sleep 0.02; done
+    replacement="$state/.lane-q.meta.replacement"
+    cp "$state/lane-q.meta" "$replacement"
+    printf 'replacement=1\n' >> "$replacement"
+    mv "$replacement" "$state/lane-q.meta"
+    fm_account_meta_lock_release "$lock"
+  ) &
+  holder=$!
+  fm_test_wait_for_file "$ready" "$holder" || fail "metadata replacement fixture could not acquire custody"
+  FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_ACCOUNT_LOCK_WAIT_TEST_OBSERVED="$observed" \
+    FM_ACCOUNT_META_LOCK_WAIT_SECONDS=5 \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_commit_transition "$1" "$2" "$3" "$4"' \
+      "$ROOT" "$state" default "$rec" lane-q >/dev/null 2>&1 &
+  commit_pid=$!
+  fm_test_wait_for_file "$observed" "$commit_pid" || fail "transition commit did not wait for metadata custody"
+  : > "$release"
+  wait "$holder" || fail "metadata replacement fixture could not publish under custody"
+  if wait "$commit_pid"; then
+    fail "transition commit accepted metadata replaced under its shared lock boundary"
+  fi
+  [ ! -e "$marker" ] || fail "stale transition committed after metadata replacement"
+  pass "Herdr transition commits serialize and revalidate metadata replacement"
+}
+
+test_clear_transition_migrates_legacy_generation() {
+  local form dir state window key marker owner generation
+  window=default:wG:pQ
+  for form in absent empty; do
+    dir="$TMP_ROOT/clear-transition-legacy-generation-$form"; state="$dir/state"; mkdir -p "$state"
+    if [ "$form" = empty ]; then
+      fm_write_meta "$state/lane-q.meta" "window=$window" "backend=herdr" "kind=ship" "generation_id="
+    else
+      fm_write_meta "$state/lane-q.meta" "window=$window" "backend=herdr" "kind=ship"
+    fi
+    key=$(bash -c '. "$0/bin/fm-marker-state-lib.sh"; fm_marker_identity_key "$1"' "$ROOT" "$window")
+    marker="$state/.herdr-escalated-$key"
+    owner="$state/.marker-owner-herdr-transition-$key"
+    printf '%s' "$window" > "$marker"
+    printf '%s' "$window" > "$owner"
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2" "$3"' \
+      "$ROOT" "$state" "$window" lane-q || fail "$form legacy generation teardown clear was refused"
+    generation=$(sed -n 's/^generation_id=//p' "$state/lane-q.meta")
+    case "$generation" in legacy-a???????????????) ;; *) fail "$form legacy generation was not migrated exactly: $generation" ;; esac
+    [ "$(grep -c '^generation_id=' "$state/lane-q.meta")" -eq 1 ] || fail "$form legacy migration did not publish exactly one generation identity"
+    [ ! -e "$marker" ] && [ ! -e "$owner" ] || fail "$form legacy generation clear retained transition custody"
+    [ -z "$(find "$state" \( -name '.lane-q.meta.generation*' -o -name '.herdr-generation-*' \) -print -quit)" ] || fail "$form legacy migration retained a publication transient"
+  done
+  pass "Herdr teardown migrates absent and empty legacy generation identities"
+}
+
+test_clear_transition_migrates_maximum_legacy_identity_with_bounded_artifacts() {
+  local dir state window task meta generation templates candidate_template backup_template
+  local template artifact quarantine max_inode_key meta_leaf
+  window=default:wG:pQ
+  task=$(printf '%0232d' 0)
+  [ "${#task}" -eq 232 ] || fail "maximum legacy identity fixture has the wrong length"
+  templates=$(bash -c '. "$0/bin/backends/herdr.sh"; printf "%s\t%s" "$FM_BACKEND_HERDR_GENERATION_CANDIDATE_TEMPLATE" "$FM_BACKEND_HERDR_GENERATION_BACKUP_TEMPLATE"' "$ROOT")
+  candidate_template=${templates%%$'\t'*}
+  backup_template=${templates#*$'\t'}
+  max_inode_key=18446744073709551615_18446744073709551615
+  for template in "$candidate_template" "$backup_template"; do
+    artifact=${template%XXXXXX}ABCDEF
+    quarantine="$artifact.quarantine.$max_inode_key"
+    [ "${#artifact}" -le 255 ] || fail "legacy migration artifact exceeds the filesystem component budget: $artifact"
+    [ "${#quarantine}" -le 255 ] || fail "legacy migration cleanup artifact exceeds the filesystem component budget: $quarantine"
+    case "$artifact" in *"$task"*) fail "legacy migration artifact embeds the durable task identity" ;; esac
+  done
+  meta_leaf="$task.meta"
+  [ "${#meta_leaf}" -le 255 ] || fail "maximum legacy metadata basename exceeds the filesystem component budget"
+  dir="$TMP_ROOT/clear-transition-maximum-legacy-identity"; state="$dir/state"; mkdir -p "$state"
+  meta="$state/$task.meta"
+  fm_write_meta "$meta" "window=$window" "backend=herdr" "kind=ship" "generation_id="
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" "$window" "$task" || fail "maximum-length legacy generation teardown clear was refused"
+  generation=$(sed -n 's/^generation_id=//p' "$meta")
+  case "$generation" in legacy-a???????????????) ;; *) fail "maximum legacy generation was not migrated exactly: $generation" ;; esac
+  [ "$(grep -c '^generation_id=' "$meta")" -eq 1 ] || fail "maximum legacy migration did not publish exactly one generation identity"
+  [ -z "$(find "$state" -name '.herdr-generation-*' -print -quit)" ] || fail "maximum legacy migration retained a fixed-width artifact generation"
+  pass "Herdr teardown migrates maximum legacy identities within fixed artifact budgets"
+}
+
+test_clear_transition_legacy_refusals_preserve_metadata() {
+  local form dir state window meta before
+  window=default:wG:pQ
+  for form in duplicate invalid wrong-owner; do
+    dir="$TMP_ROOT/clear-transition-legacy-refusal-$form"; state="$dir/state"; mkdir -p "$state"
+    meta="$state/lane-q.meta"; before="$dir/before.meta"
+    case "$form" in
+      duplicate)
+        fm_write_meta "$meta" "window=$window" "backend=herdr" "kind=ship" "generation_id=" "generation_id="
+        ;;
+      invalid)
+        fm_write_meta "$meta" "window=$window" "backend=herdr" "kind=ship" $'generation_id=bad\tvalue'
+        ;;
+      wrong-owner)
+        fm_write_meta "$meta" "window=$window" "backend=herdr" "kind=ship" "generation_id="
+        ;;
+    esac
+    cp "$meta" "$before"
+    if [ "$form" = wrong-owner ]; then
+      bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2" "$3"' \
+        "$ROOT" "$state" "$window" other >/dev/null 2>&1 \
+        && fail "wrong-owner legacy generation unexpectedly cleared"
+    else
+      bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2" "$3"' \
+        "$ROOT" "$state" "$window" lane-q >/dev/null 2>&1 \
+        && fail "$form legacy generation unexpectedly cleared"
+    fi
+    cmp -s "$before" "$meta" || fail "$form legacy refusal changed metadata bytes"
+  done
+  dir="$TMP_ROOT/clear-transition-existing-legacy-generation"; state="$dir/state"; mkdir -p "$state"
+  meta="$state/lane-q.meta"; before="$dir/before.meta"
+  fm_write_meta "$meta" "window=$window" "backend=herdr" "kind=ship" "generation_id=legacy-existing"
+  cp "$meta" "$before"
+  bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2" "$3"' \
+    "$ROOT" "$state" "$window" lane-q || fail "existing nonempty legacy generation could not clear"
+  cmp -s "$before" "$meta" || fail "existing nonempty legacy generation was unnecessarily rewritten"
+  pass "Herdr legacy refusals preserve bytes and valid generations remain stable"
+}
+
 test_clear_transition_removes_task_marker() {
   local dir state marker
   dir="$TMP_ROOT/clear-transition"; state="$dir/state"; mkdir -p "$state"
-  marker="$state/.herdr-escalated-default_wG_pQ"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   : > "$marker"
   bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_clear_transition "$1" "$2"' "$ROOT" "$state" default:wG:pQ
   [ ! -e "$marker" ] || fail "clear_transition must remove the marker owned by a torn-down pane"
@@ -4090,10 +4446,12 @@ test_clear_transition_removes_task_marker() {
 test_apply_transition_defer_and_fallback_are_noops() {
   local dir state marker rc s
   dir="$TMP_ROOT/apply-defer"; state="$dir/state"; mkdir -p "$state"
-  marker="$state/.herdr-escalated-default_wG_pQ"
+  write_herdr_transition_meta "$state" lane-q default:wG:pQ
+  marker=$(herdr_escalation_marker_path "$state" default:wG:pQ)
   for s in idle "done" unknown ""; do
     local rec
     rec=$(bash -c '. "$0/bin/fm-transition-lib.sh"; fm_transition_record wG:pQ wG "" "$1" claude' "$ROOT" "$s")
+    rec=$(bind_herdr_transition "$state" default "$rec")
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_apply_transition "$1" "$2" "$3"' "$ROOT" "$state" default "$rec"; rc=$?
     [ "$rc" = 1 ] || fail "defer/fallback status '$s' must return 1 (no fast action), got $rc"
     [ ! -e "$marker" ] || fail "defer/fallback status '$s' must not touch the escalation marker"
@@ -4111,6 +4469,7 @@ test_wait_transition_no_panes_returns_2() {
 test_wait_transition_not_capable_returns_2() {
   local dir state fb rc
   dir="$TMP_ROOT/wt-incapable"; state="$dir/state"; mkdir -p "$state"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   rc=$(PATH="$fb:$PATH" FM_BACKEND_HERDR_EVENTS_FORCE=0 \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_wait_transition sess 1 "$1" sess:wG:pQ; echo $?' "$ROOT" "$state" | tail -1)
@@ -4121,10 +4480,11 @@ test_wait_transition_not_capable_returns_2() {
 test_wait_transition_reconcile_blocked_returns_record() {
   local dir state agent temp fb reader lines out rc marker
   dir="$TMP_ROOT/wt-reconcile"; state="$dir/state"; agent="$dir/agents"; temp="$dir/temp"; mkdir -p "$state" "$agent" "$temp"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" blocked
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"; : > "$lines"
-  marker="$state/.herdr-escalated-sess_wG_pQ"
+  marker=$(herdr_escalation_marker_path "$state" sess:wG:pQ)
   out=$(PATH="$fb:$PATH" TMPDIR="$temp" FM_BACKEND_HERDR_EVENTS_FORCE=1 FM_FAKE_SESSION_NAME=sess FM_FAKE_SOCKET="$dir/x.sock" FM_FAKE_AGENT_DIR="$agent" \
     FM_BACKEND_HERDR_EVENT_READER="$reader" FM_FAKE_READER_LINES="$lines" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_wait_transition sess 1 "$1" sess:wG:pQ' "$ROOT" "$state"); rc=$?
@@ -4138,6 +4498,7 @@ test_wait_transition_reconcile_blocked_returns_record() {
 test_wait_transition_subscribes_before_reconcile() {
   local dir state agent fb reader lines ready rc
   dir="$TMP_ROOT/wt-subscribe-first"; state="$dir/state"; agent="$dir/agents"; mkdir -p "$state" "$agent"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" idle
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"; ready="$dir/subscribed"; : > "$lines"
@@ -4149,12 +4510,14 @@ test_wait_transition_subscribes_before_reconcile() {
 }
 
 test_wait_transition_reconcile_dedupes_when_marked() {
-  local dir state agent fb rc
+  local dir state agent fb rc marker
   dir="$TMP_ROOT/wt-reconcile-dedupe"; state="$dir/state"; agent="$dir/agents"; mkdir -p "$state" "$agent"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" blocked
   # Pre-mark: this blocked was already escalated.
-  : > "$state/.herdr-escalated-sess_wG_pQ"
+  marker=$(herdr_escalation_marker_path "$state" sess:wG:pQ)
+  : > "$marker"
   # No stream events, reader exits 0 -> a clean timeout (rc 1), NOT a re-fire.
   local reader lines
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"; : > "$lines"
@@ -4168,11 +4531,12 @@ test_wait_transition_reconcile_dedupes_when_marked() {
 test_wait_transition_stream_blocked_returns_record() {
   local dir state agent fb reader lines out rc marker
   dir="$TMP_ROOT/wt-stream-blocked"; state="$dir/state"; agent="$dir/agents"; mkdir -p "$state" "$agent"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" idle   # reconcile sees idle -> proceeds to stream
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"
   printf 'wG:pQ\t\tblocked\tclaude\n' > "$lines"
-  marker="$state/.herdr-escalated-sess_wG_pQ"
+  marker=$(herdr_escalation_marker_path "$state" sess:wG:pQ)
   out=$(PATH="$fb:$PATH" FM_BACKEND_HERDR_EVENTS_FORCE=1 FM_FAKE_SESSION_NAME=sess FM_FAKE_SOCKET="$dir/x.sock" FM_FAKE_AGENT_DIR="$agent" \
     FM_BACKEND_HERDR_EVENT_READER="$reader" FM_FAKE_READER_LINES="$lines" \
     bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_wait_transition sess 2 "$1" sess:wG:pQ' "$ROOT" "$state"); rc=$?
@@ -4185,11 +4549,12 @@ test_wait_transition_stream_blocked_returns_record() {
 test_wait_transition_stream_absorb_clears_then_timeout() {
   local dir state agent fb reader lines rc marker
   dir="$TMP_ROOT/wt-stream-absorb"; state="$dir/state"; agent="$dir/agents"; mkdir -p "$state" "$agent"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" idle
-  : > "$state/.herdr-escalated-sess_wG_pQ"   # previously escalated
+  marker=$(herdr_escalation_marker_path "$state" sess:wG:pQ)
+  : > "$marker"   # previously escalated
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"
-  marker="$state/.herdr-escalated-sess_wG_pQ"
   # Stream a working edge (absorb) then an idle edge (defer). Neither is a fresh
   # actionable edge, so the wait ends as a clean timeout (rc 1) and the marker
   # is cleared by the working edge.
@@ -4205,6 +4570,7 @@ test_wait_transition_stream_absorb_clears_then_timeout() {
 test_wait_transition_reader_failure_returns_2() {
   local dir state agent temp fb reader lines rc
   dir="$TMP_ROOT/wt-reader-fail"; state="$dir/state"; agent="$dir/agents"; temp="$dir/temp"; mkdir -p "$state" "$agent" "$temp"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" idle
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"; : > "$lines"
@@ -4219,6 +4585,7 @@ test_wait_transition_reader_failure_returns_2() {
 test_wait_transition_bad_ack_returns_2_and_cleans_up() {
   local dir state agent temp fb reader lines result rc fd_open
   dir="$TMP_ROOT/wt-bad-ack"; state="$dir/state"; agent="$dir/agents"; temp="$dir/temp"; mkdir -p "$state" "$agent" "$temp"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" idle
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"; : > "$lines"
@@ -4235,6 +4602,7 @@ test_wait_transition_bad_ack_returns_2_and_cleans_up() {
 test_wait_transition_clean_timeout_returns_1() {
   local dir state agent temp fb reader lines result rc fd_open
   dir="$TMP_ROOT/wt-timeout"; state="$dir/state"; agent="$dir/agents"; temp="$dir/temp"; mkdir -p "$state" "$agent" "$temp"
+  write_herdr_transition_meta "$state" lane-q sess:wG:pQ
   fb=$(make_herdr_eventfake "$dir")
   set_fake_agent "$agent" "wG:pQ" idle
   reader=$(make_fake_reader "$dir"); lines="$dir/lines"; : > "$lines"   # no events, reader exits 0
@@ -4338,6 +4706,35 @@ if [ "${FM_TEST_FOCUSED:-}" = workspace-prune ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = transition-marker-identity ]; then
+  test_escalation_marker_keys_are_collision_free
+  test_escalation_marker_migrates_uniquely_owned_pre_v2_state
+  test_escalation_marker_retains_ambiguous_pre_v2_state
+  test_escalation_marker_quarantines_unsafe_pre_v2_state
+  test_escalation_marker_rejects_adversarial_owner_substitution
+  test_escalation_marker_refuses_symlink_carriers
+  test_transition_commit_refuses_teardown_and_window_reuse_races
+  test_apply_transition_blocked_requires_commit_to_dedupe
+  test_apply_transition_working_clears_marker
+  test_buffered_transition_refuses_reassigned_window
+  test_transition_refuses_replaced_metadata_identity
+  test_transition_commit_serializes_metadata_replacement
+  test_clear_transition_migrates_legacy_generation
+  test_clear_transition_legacy_refusals_preserve_metadata
+  test_clear_transition_removes_task_marker
+  test_apply_transition_defer_and_fallback_are_noops
+  test_wait_transition_reconcile_dedupes_when_marked
+  test_wait_transition_stream_absorb_clears_then_timeout
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = legacy-generation-migration ]; then
+  test_clear_transition_migrates_legacy_generation
+  test_clear_transition_migrates_maximum_legacy_identity_with_bounded_artifacts
+  test_clear_transition_legacy_refusals_preserve_metadata
+  exit 0
+fi
+
 test_version_check_accepts_current_protocol
 test_version_check_refuses_old_protocol
 test_version_check_refuses_missing_herdr
@@ -4437,7 +4834,7 @@ test_send_text_submit_detects_swallowed_enter
 test_send_text_submit_popup_autocomplete_requires_second_enter
 test_send_text_submit_confirms_blocked_after_enter
 test_send_text_submit_preexisting_working_does_not_false_confirm_swallowed_enter
-test_send_text_submit_confirms_despite_codex_idle_tip_composer
+test_send_text_submit_refuses_codex_without_mutation
 test_composer_state_codex_dynamic_idle_tip_reads_empty_when_faint
 test_composer_state_guard_still_refuses_real_pending_text_after_submit_confirmation_change
 test_send_text_submit_slow_transition_within_one_enter_needs_no_extra_enter
@@ -4449,9 +4846,21 @@ test_dispatch_composer_state_routes_by_backend
 test_scripts_route_explicit_target_through_meta_backend
 test_events_capable_consumes_schema_without_broken_pipe
 test_normalize_event_leaves_from_empty
-test_escalation_marker_keys_like_watcher
+test_escalation_marker_keys_are_collision_free
+test_escalation_marker_migrates_uniquely_owned_pre_v2_state
+test_escalation_marker_retains_ambiguous_pre_v2_state
+test_escalation_marker_quarantines_unsafe_pre_v2_state
+test_escalation_marker_rejects_adversarial_owner_substitution
+test_escalation_marker_refuses_symlink_carriers
+test_transition_commit_refuses_teardown_and_window_reuse_races
 test_apply_transition_blocked_requires_commit_to_dedupe
 test_apply_transition_working_clears_marker
+test_buffered_transition_refuses_reassigned_window
+test_transition_refuses_replaced_metadata_identity
+test_transition_commit_serializes_metadata_replacement
+test_clear_transition_migrates_legacy_generation
+test_clear_transition_migrates_maximum_legacy_identity_with_bounded_artifacts
+test_clear_transition_legacy_refusals_preserve_metadata
 test_clear_transition_removes_task_marker
 test_apply_transition_defer_and_fallback_are_noops
 test_wait_transition_no_panes_returns_2

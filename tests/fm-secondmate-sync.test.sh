@@ -400,7 +400,7 @@ case "\$cmd \$sub" in
     if [ "\$arg" = "${stale#*:}" ]; then
       printf '{"error":{"code":"agent_not_found","message":"gone"}}\n' >&2
     elif [ "\$arg" = "${fresh#*:}" ]; then
-      printf '{"result":{"agent":{"agent_status":"idle"}}}\n'
+      printf '{"result":{"agent":{"agent":"claude","agent_status":"idle"}}}\n'
     else
       printf '{"error":{"code":"agent_not_found","message":"gone"}}\n' >&2
     fi

@@ -11,11 +11,9 @@
 # socket), herdr already supports named-session isolation via --session, so no
 # PATH redirection is needed for the happy path - the daemon is simply pointed
 # at FM_SUPERVISOR_BACKEND=herdr, FM_SUPERVISOR_TARGET="<session>:<pane-id>",
-# and HERDR_SESSION="<the isolated session>". A thin herdr SHIM is still used,
-# but only to simulate a swallowed Enter (Scenario B) - herdr's real CLI has no
-# built-in way to drop a keystroke, so the shim intercepts exactly one
-# `pane send-keys <pane> enter` call and forwards everything else to the real
-# binary untouched.
+# and HERDR_SESSION="<the isolated session>". A thin herdr SHIM is still used
+# as a Scenario B tripwire: it would consume one split Enter, while the atomic
+# steering route must bypass it and leave the marker untouched.
 #
 # The "supervisor pane" is a tiny deterministic bash loop (not a real harness
 # binary): it draws a bordered composer row ("│ > <buf> │") that exercises the
@@ -227,6 +225,10 @@ exec "$REAL_HERDR" "\$@"
 SHIM
 chmod +x "$HERDR_SHIM_DIR/herdr"
 
+herdr_lab_send_literal() { # <text>; fixture setup only, never production steering
+  fm_herdr_lab_cli "$SESSION" pane send-text "$PANE_ID" "$1" >/dev/null 2>&1
+}
+
 wait_daemon_started() {
   local label=${1:-daemon} start_line=${2:-0} i=0 new_log
   while [ "$i" -lt 30 ]; do
@@ -311,7 +313,7 @@ reset_state() {
 
 selfcheck_pane_input_pending() {
   local check_text="selfcheck-marker-12345"
-  fm_backend_herdr_send_literal "$SUPERVISOR_TARGET" "$check_text" \
+  herdr_lab_send_literal "$check_text" \
     || fail "selfcheck: could not send literal text to the scratch pane"
   sleep 0.5
   if PATH="$HERDR_SHIM_DIR:$PATH" pane_input_pending "$SUPERVISOR_TARGET" herdr; then
@@ -334,7 +336,7 @@ test_scenario_a() {
   afk_enter "$STATE_DIR"
   start_daemon
 
-  fm_backend_herdr_send_literal "$SUPERVISOR_TARGET" "human draft text"
+  herdr_lab_send_literal "human draft text"
   sleep 0.5
 
   echo "done: PR https://example.test/pr/100" > "$STATE_DIR/fake-c1.status"
@@ -379,7 +381,7 @@ test_scenario_a() {
   pass "real herdr Scenario A: partial input defers injection; digest arrives clean after idle"
 }
 
-# --- Scenario B: swallowed-Enter --------------------------------------------
+# --- Scenario B: atomic steering bypasses split Enter ------------------------
 
 test_scenario_b() {
   reset_state
@@ -415,9 +417,11 @@ test_scenario_b() {
   user_count=$(grep -c $'\tuser$' "$LOG_FILE" || true)
   [ "$user_count" -eq 0 ] \
     || fail "Scenario B: expected 0 user lines, got $user_count (spurious Enter submitted an empty line?)"
+  [ -f "$STATE_DIR/.swallow-enter" ] \
+    || fail "Scenario B: atomic steering unexpectedly traversed the split Enter shim"
 
   stop_daemon
-  pass "real herdr Scenario B: swallowed Enter (via the herdr shim) produces exactly one clean digest"
+  pass "real herdr Scenario B: atomic steering bypasses split Enter and produces one clean digest"
 }
 
 # --- Scenario C: normal digest -----------------------------------------------
@@ -475,7 +479,7 @@ test_scenario_d_max_defer() {
   [ ! -f "$STATE_DIR/.supervise-daemon.log" ] || log_start=$(wc -l < "$STATE_DIR/.supervise-daemon.log")
   # Persistent-pending composer: type real text and never submit it, so every
   # composer read is genuinely "pending" against the real herdr binary.
-  fm_backend_herdr_send_literal "$SUPERVISOR_TARGET" "stuck-in-the-box"
+  herdr_lab_send_literal "stuck-in-the-box"
   sleep 0.5
 
   PATH="$HERDR_SHIM_DIR:$PATH" \

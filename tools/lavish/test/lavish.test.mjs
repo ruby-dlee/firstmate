@@ -159,35 +159,33 @@ function annotationPayload(fx, manifest, overrides = {}) {
 }
 
 function processGroupMembers(pgid) {
-  let output;
-  try {
-    // Filter in ps so a large process table cannot overflow execFileSync's default 1 MiB maxBuffer.
-    output = execFileSync(
-      'ps',
-      ['-o', 'pid=,pgid=,command=', '-g', String(pgid)],
-      {
-        encoding: 'utf8',
-        maxBuffer: 8 * 1024 * 1024,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    );
-  } catch (error) {
-    if (
-      error.status === 1
-      && error.signal === null
-      && error.stdout === ''
-      && error.stderr === ''
-    ) {
-      return [];
-    }
-    throw error;
-  }
-  return output
+  const output = execFileSync('ps', ['-axo', 'pid=,pgid='], {
+    encoding: 'utf8',
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  const pids = output
     .trim()
     .split('\n')
-    .map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/))
+    .map((line) => line.trim().match(/^(\d+)\s+(\d+)$/))
     .filter((match) => match !== null && Number(match[2]) === pgid)
-    .map((match) => ({ pid: Number(match[1]), command: match[3] }));
+    .map((match) => Number(match[1]));
+
+  return pids.flatMap((pid) => {
+    let details;
+    try {
+      details = execFileSync(
+        'ps',
+        ['-p', String(pid), '-o', 'pid=,pgid=,command='],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+      );
+    } catch (error) {
+      if (error.status === 1) return [];
+      throw error;
+    }
+    const match = details.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+    if (match === null || Number(match[2]) !== pgid) return [];
+    return [{ pid: Number(match[1]), command: match[3] }];
+  });
 }
 
 function processDescendants(rootPid) {
@@ -315,6 +313,13 @@ async function writeSupervisorLock(fx, target, stateDirectory = join(fx.home, 's
     `${holder.pid}\n${started}\nhome=${canonicalHome}\nbackend=tmux\ntarget=${target}\n`,
   );
   return holder;
+}
+
+async function stopChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const closed = new Promise((resolveClose) => child.once('close', resolveClose));
+  child.kill();
+  await closed;
 }
 
 async function listeningSockets(pid) {
@@ -808,8 +813,8 @@ test('ordinary wake drain consumes the answer before draining its pointer', asyn
     },
   });
   assert.equal(drained.code, 0, drained.stderr);
-  assert.match(drained.stdout, /LAVISH_INTAKE:/);
-  assert.match(drained.stdout, /release-choice,consumed/);
+  assert.match(drained.stderr, /LAVISH_INTAKE:/);
+  assert.match(drained.stderr, /release-choice,consumed/);
   assert.match(drained.stdout, /\tsignal\tlavish:release-choice\tdecision-answer:/);
   assert.equal(
     await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')),
@@ -1019,7 +1024,8 @@ test('B5 fm-lavish-board executes submit and recovers after immediate browser cl
     });
     assert.equal(checked.code, 0, checked.stderr);
     assert.match(checked.stdout, new RegExp(`lavish-submit: ${id}`));
-    assert.match(checked.stdout, /lavish-delivery: prompt queued/);
+    assert.match(checked.stdout, /lavish-delivery: prompt not queued/);
+    assert.match(checked.stdout, /no identity-bound atomic prompt receipt/);
     assert.equal(
       await exists(join(fx.home, 'data/decisions', id, 'answer.toon')),
       true,
@@ -1034,16 +1040,14 @@ test('B5 fm-lavish-board executes submit and recovers after immediate browser cl
       true,
     );
     assert.equal(await exists(join(fx.home, 'data/replies/release-choice.toon')), true);
-    assert.match(await readFile(fake.log, 'utf8'), /-t home:0 /);
+    assert.equal(await exists(fake.log), false, 'Lavish wake typed into the supervisor pane');
     assert.equal(
       await exists(join(effectiveState, 'lavish-deliveries', `${id}.digest`)),
-      true,
+      false,
     );
     assert.equal(await exists(checkPath), false);
   } finally {
-    const closed = new Promise((resolveClose) => holder.once('close', resolveClose));
-    holder.kill();
-    await closed;
+    await stopChild(holder);
   }
 });
 
@@ -1842,13 +1846,11 @@ test('B2 visible queue revalidates the target against the lock holder', async ()
     assert.match(result.stderr, /home-bound supervisor/i);
     assert.equal(await exists(fake.log), false, 'queue wrote into an unowned pane');
   } finally {
-    const closed = new Promise((resolveClose) => holder.once('close', resolveClose));
-    holder.kill();
-    await closed;
+    await stopChild(holder);
   }
 });
 
-test('B3 visible queue uses the manifest destination and home-bound target', async () => {
+test('B3 visible queue refuses before split pane input without an atomic receipt', async () => {
   const fx = await fixture('queue-destination');
   const id = await createRequest(fx);
   const payloadPath = join(fx.root, 'payload.json');
@@ -1878,14 +1880,14 @@ test('B3 visible queue uses the manifest destination and home-bound target', asy
       },
     );
     assert.equal(result.code, 0, result.stderr);
-    const log = await readFile(fake.log, 'utf8');
-    assert.match(log, /-t home:0 /);
-    assert.match(log, /ingested at data\/replies\/release-choice\.toon/);
-    assert.doesNotMatch(log, /data\/lavish-answers\/release-choice\.json/);
+    assert.match(result.stdout, /wake queued/);
+    assert.equal(await exists(fake.log), false, 'queue used split text-plus-Enter delivery');
+    assert.equal(
+      await exists(join(fx.home, 'state/lavish-deliveries', `${id}.digest`)),
+      false,
+    );
   } finally {
-    const closed = new Promise((resolveClose) => holder.once('close', resolveClose));
-    holder.kill();
-    await closed;
+    await stopChild(holder);
   }
 });
 

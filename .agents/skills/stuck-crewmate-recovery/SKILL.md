@@ -50,8 +50,9 @@ Handle permission evidence before the ordinary recovery ladder because approving
 For a non-permission stall, escalate in order:
 
 1. Peek the pane.
-2. If the crewmate is waiting on a question its brief already answers, answer in one line via `FM_HOME=<this-firstmate-home> bin/fm-send.sh` from an active firstmate session unless `FM_HOME` is already set to the active firstmate home.
-3. If the crewmate is confused or looping, interrupt with the adapter's interrupt key, then redirect with one corrective line.
+2. If the crewmate is waiting on a question its brief already answers, attempt one line via `FM_HOME=<this-firstmate-home> bin/fm-send.sh` from an active firstmate session unless `FM_HOME` is already set to the active firstmate home.
+   The current session-bound text gate refuses before pane input on every backend, so treat that result as undelivered and continue the recovery ladder without bypassing it through raw terminal input.
+3. If the crewmate is confused or looping, interrupt with the adapter's interrupt key, then attempt one corrective line only if a future session-bound text route returns a positive receipt; under the current refusal, proceed to a brief-backed relaunch.
    For example, for a single-Escape adapter: `FM_HOME=<this-firstmate-home> bin/fm-send.sh <window> --key Escape`.
 4. If the crewmate is genuinely wedged after redirection, exit the agent with the adapter's exit command and relaunch with the same brief plus a `progress so far` note appended to it.
    Genuine wedging means looping, unresponsive, repeating the same obstacle, or truly dead.

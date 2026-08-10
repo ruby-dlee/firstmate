@@ -29,6 +29,7 @@ set -u
 
 fm_git_identity fmtest fmtest@example.invalid
 fm_test_tmproot_into TMP_ROOT fm-secondmate-lifecycle
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 export FM_BACKEND=tmux
 
 # Seeding proves a home against its source repo's DEFAULT-branch tip, so pointing
@@ -47,8 +48,16 @@ SUB_ABS=
 FAKEBIN=
 LOG="$TMP_ROOT/tmux.log"
 PANE="$TMP_ROOT/pane.txt"
+STEERING_STUB="$TMP_ROOT/fm-send-steering.sh"
 ALPHA_ORIGIN=
 BETA_ORIGIN=
+
+cat > "$STEERING_STUB" <<'SH'
+#!/usr/bin/env bash
+printf 'atomic-steer %s %s -> confirmed\n' "$2" "$3" >> "$FM_FAKE_TMUX_LOG"
+printf 'confirmed'
+SH
+chmod +x "$STEERING_STUB"
 
 # --- shared world + seed ----------------------------------------------------
 setup_world() {
@@ -164,15 +173,19 @@ phase_send() {
   # window returned by list-windows.
   PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_WINDOW="other-session:fm-design" \
     FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
+    FM_SEND_SETTLE=0 FM_SEND_TEST_HOOKS=firstmate-fm-send-tests-v1 \
+    FM_SEND_STEERING_BIN="$STEERING_STUB" \
     "$ROOT/bin/fm-send.sh" fm-design 'route this work' >/dev/null 2>&1 \
     || fail "fm-send failed for a bare firstmate window with home metadata"
   # design is a kind=secondmate target, so the request is prefixed with the
   # from-firstmate marker (bin/fm-marker-lib.sh): the send targets the meta window
   # AND carries the marker label, and the original payload still follows it.
-  assert_grep 'send-keys -t firstmate:fm-design -l [fm-from-firstmate]' "$LOG" "send did not use the window recorded in this home's meta, or did not mark the secondmate request"
+  assert_grep 'atomic-steer firstmate:fm-design [fm-from-firstmate]' "$LOG" "atomic steering did not use the window recorded in this home's meta, or did not mark the secondmate request"
   assert_grep 'route this work' "$LOG" "the original request text did not survive the marker"
-  assert_no_grep 'send-keys -t other-session:fm-design' "$LOG" "send targeted a foreign same-named window"
-  pass "send: a bare fm-<id> secondmate routes to the meta window with the from-firstmate marker"
+  assert_no_grep 'atomic-steer other-session:fm-design' "$LOG" "send targeted a foreign same-named window"
+  assert_no_grep 'send-keys' "$LOG" "atomic steering fell back to split text input"
+  assert_no_grep ' Enter' "$LOG" "atomic steering fell back to a separate Enter"
+  pass "send: a bare fm-<id> secondmate routes atomically with the from-firstmate marker"
 }
 
 phase_handoff() {

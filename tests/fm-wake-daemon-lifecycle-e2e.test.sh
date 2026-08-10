@@ -8,7 +8,7 @@
 #   housekeeping catch-all scan -> NO duplicate digest
 #   buffered digest flushes to the supervisor pane as exactly ONE submission
 #   stale working-pane: transient (self + marker) -> persistent (escalates once,
-#     clears its marker) -> resumed/busy (clears without escalating)
+#     clears its marker) -> pane-only busy evidence (UNKNOWN and escalated)
 #
 # This proves the operator-visible routing/queueing/dedupe behavior through real
 # fm-watch.sh runs plus the daemon's own functions. The captain-relevant
@@ -90,33 +90,34 @@ test_routine_then_terminal_after_restart() {
   [ "$(wc -l < "$state/.subsuper-escalations" | tr -d ' ')" -eq 1 ] \
     || fail "catch-all scan duplicated the already-buffered digest"
 
-  # With afk active, the buffered digest flushes to the supervisor pane as ONE
-  # submission (one typed line + one Enter), then the buffer clears.
+  # With afk active, the buffered digest flushes as ONE native reap wake, then
+  # the buffer clears.
   local sent
   sent="$dir/sent.log"; : > "$sent"
-  : > "$dir/pane.txt"
   afk_enter "$state"
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_PANE_ALIVE=1 FM_FAKE_TMUX_SENT="$sent" \
-    FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" \
+  FM_AFK_DELIVERY=reap-wake FM_ESCALATE_BATCH_SECS=0 escalate_flush "$state" > "$sent" \
     || fail "escalate_flush failed for the buffered digest"
-  [ "$(grep -c '\[ENTER\]' "$sent")" -eq 1 ] || fail "buffered digest was not submitted exactly once"
+  [ "$(grep -c '^afk-reap-wake:' "$sent")" -eq 1 ] || fail "buffered digest did not emit exactly one reap wake"
   [ ! -s "$state/.subsuper-escalations" ] || fail "buffer not cleared after a successful flush"
-  pass "lifecycle: routine self-handles, terminal survives a watcher restart, buffers once, no dup, injects once"
+  pass "lifecycle: routine self-handles, terminal survives a watcher restart, buffers once, no dup, wakes once"
 }
 
 # --- Phase 2: stale working-pane transient -> persistent -> resumed ----------
 test_stale_pane_transient_persistent_resume() {
   local dir state fakebin win key
+  FM_REAP_WAKE_PENDING=0
   dir=$(make_supercase wd-stale)
   state="$dir/state"
   fakebin="$dir/fakebin"
   win="sess:fm-stale-w2"
-  key=$(printf '%s' "stale-w2" | tr ':/.' '___')
+  fm_write_meta "$state/stale-w2.meta" "window=$win" "kind=ship"
+  key=$(_task_marker_key stale-w2 "$state")
   printf 'working: compiling\n' > "$state/stale-w2.status"
 
   # Transient: first stale observation self-handles and records a marker.
   stale_marker_record "$win" "$state"
-  case "$(FM_STATE_OVERRIDE="$state" classify_stale "$win" "$state")" in
+  case "$(FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+      FM_RUN_LIVENESS_BIN="$fakebin/fm-run-liveness.sh" classify_stale "$win" "$state")" in
     self\|*) : ;;
     *) fail "transient stale did not self-handle" ;;
   esac
@@ -128,21 +129,22 @@ test_stale_pane_transient_persistent_resume() {
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
   : > "$state/.subsuper-escalations" 2>/dev/null || true
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_RUN_LIVENESS_BIN="$fakebin/fm-run-liveness.sh" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
   [ -s "$state/.subsuper-escalations" ] || fail "persistent stale did not escalate"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "stale marker not cleared after escalation"
 
-  # Resumed: a fresh transient marker but the pane is now busy -> housekeeping
-  # clears the marker without escalating.
+  # A pane-only busy footer is not process evidence, so it remains UNKNOWN.
   stale_marker_record "$win" "$state"
   echo $(( $(date +%s) - 500 )) > "$state/.subsuper-stale-$key"
   printf 'Working...\n' > "$dir/pane.txt"
   : > "$state/.subsuper-escalations"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$dir/pane.txt" \
-    FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
-  [ ! -e "$state/.subsuper-stale-$key" ] || fail "resumed stale marker was not cleared"
-  [ ! -s "$state/.subsuper-escalations" ] || fail "resumed (busy) stale was escalated"
-  pass "lifecycle: stale pane transient self-handles, persistent escalates once and clears, resumed clears quietly"
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_RUN_LIVENESS_BIN="$fakebin/fm-run-liveness.sh" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
+  [ ! -e "$state/.subsuper-stale-$key" ] || fail "pane-only UNKNOWN marker was not cleared after escalation"
+  [ -s "$state/.subsuper-escalations" ] || fail "pane-only busy evidence did not escalate as UNKNOWN"
+  pass "lifecycle: transient stale tracks and process-unproved persistence escalates UNKNOWN"
 }
 
 test_routine_then_terminal_after_restart

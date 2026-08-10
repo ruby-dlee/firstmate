@@ -7,9 +7,11 @@ set -u
 
 SELECTOR="$ROOT/bin/fm-account-directory.sh"
 fm_test_tmproot_into TMP_ROOT fm-account-directory-tests
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 ACCOUNT_ROOT="$TMP_ROOT/accounts"
 FAKEBIN=$(fm_fakebin "$TMP_ROOT")
 QUOTA_LOG="$TMP_ROOT/quota.log"
+CODEX_LOG="$TMP_ROOT/codex.log"
 HERDR_LOG="$TMP_ROOT/herdr.log"
 TREEHOUSE_LOG="$TMP_ROOT/treehouse.log"
 ROTATION_STATE="$TMP_ROOT/rotation-state"
@@ -51,6 +53,37 @@ cat <<JSON
 JSON
 SH
 chmod +x "$FAKEBIN/quota-axi"
+
+cat > "$FAKEBIN/codex" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "${1:-}" = exec ] || exit 64
+account=${CODEX_HOME##*/}
+output=
+args=$*
+previous=
+for argument in "$@"; do
+  if [ "$previous" = --output-last-message ]; then output=$argument; fi
+  previous=$argument
+done
+[ -n "$output" ] || exit 65
+case "$args" in
+  *"--ephemeral"*"--ignore-user-config"*"--ignore-rules"*"--model gpt-5.6-sol"*"model_reasoning_effort=\"xhigh\""*) ;;
+  *) exit 66 ;;
+esac
+printf '%s\t%s\n' "$CODEX_HOME" "$args" >> "$FM_FAKE_CODEX_LOG"
+remaining=$(cat "$CODEX_HOME/test-remaining")
+if [ -n "${FM_FAKE_CODEX_CACHE_RACE_HOOK:-}" ]; then
+  "$FM_FAKE_CODEX_CACHE_RACE_HOOK"
+fi
+case "$remaining" in
+  hang) sleep 30; exit 0 ;;
+  none) exit 1 ;;
+  malformed) printf 'WRONG\n' > "$output"; exit 0 ;;
+  *) printf 'FIRSTMATE_CODEX_ACCOUNT_PROBE_OK\n' > "$output"; exit 0 ;;
+esac
+SH
+chmod +x "$FAKEBIN/codex"
 
 cat > "$FAKEBIN/herdr" <<'SH'
 #!/usr/bin/env bash
@@ -126,8 +159,10 @@ run_selector() {
     FM_ACCOUNT_DIRECTORY_STATE_ROOT="$ROTATION_STATE" \
     FM_ACCOUNT_DIRECTORY_AGENT_FLEET="$FAKEBIN/profile-agent-fleet" \
     FM_ACCOUNT_DIRECTORY_QUOTA_AXI="$FAKEBIN/quota-axi" \
+    FM_ACCOUNT_DIRECTORY_CODEX="$FAKEBIN/codex" \
     FM_ACCOUNT_DIRECTORY_HERDR="$FAKEBIN/herdr" \
-    FM_FAKE_QUOTA_LOG="$QUOTA_LOG" FM_FAKE_HERDR_LOG="$HERDR_LOG" \
+    FM_FAKE_QUOTA_LOG="$QUOTA_LOG" FM_FAKE_CODEX_LOG="$CODEX_LOG" \
+    FM_FAKE_HERDR_LOG="$HERDR_LOG" \
     "$SELECTOR" "$@"
 }
 
@@ -143,6 +178,7 @@ reset_accounts() {
   rm -rf "$ROTATION_STATE"
   mkdir -p "$ACCOUNT_ROOT/codex" "$ACCOUNT_ROOT/claude"
   : > "$QUOTA_LOG"
+  : > "$CODEX_LOG"
   : > "$HERDR_LOG"
 }
 
@@ -261,125 +297,172 @@ SH
   pass "missing system openat binding fails once at selector setup"
 }
 
-test_codex_picks_highest_fresh_minimum_and_skips_no_window() {
+test_codex_requires_exact_completion_proof() {
   local out err
   reset_accounts
-  set_remaining 1 80,40
+  set_remaining 1 none
   set_remaining 2 none
   set_remaining 3 90,75
   out=$(QUOTA_AXI_HOSTILE=1 AGENT_FLEET_HOSTILE=1 XDG_CONFIG_HOME=/hostile \
     run_selector select codex 2>"$TMP_ROOT/codex-select.err")
   err=$(cat "$TMP_ROOT/codex-select.err")
-  [ "$out" = "$ACCOUNT_ROOT/codex/3" ] || fail "Codex did not choose the account with the highest minimum remaining usage: $out"
-  assert_contains "$err" "codex account $ACCOUNT_ROOT/codex/2 skipped: no freshly readable usage window" \
-    "Codex no-window account was not visibly skipped"
-  assert_contains "$err" "selected codex account $ACCOUNT_ROOT/codex/3 with fresh remaining score=75" \
-    "Codex selection did not report its fresh score"
-  [ "$(wc -l < "$QUOTA_LOG" | tr -d ' ')" = 3 ] || fail "Codex selection did not read every discovered account"
-  pass "Codex selects the highest fresh general-window minimum and skips only unreadable accounts"
+  [ "$out" = "$ACCOUNT_ROOT/codex/3" ] || fail "Codex routed an account without a completion proof: $out"
+  assert_contains "$err" "codex account $ACCOUNT_ROOT/codex/2 unavailable: codex exec refused or failed" \
+    "Codex refusal was not visible"
+  assert_contains "$err" "selected codex account $ACCOUNT_ROOT/codex/3 from 1 accounts with current completion proof" \
+    "Codex selection did not name its positive proof set"
+  [ "$(wc -l < "$CODEX_LOG" | tr -d ' ')" = 3 ] || fail "Codex selection did not probe every discovered account"
+  [ ! -s "$QUOTA_LOG" ] || fail "contested quota telemetry still participated in Codex routing"
+  pass "Codex routes only accounts with exact sol/xhigh completion proof and ignores quota telemetry"
 }
 
-test_codex_rechecks_health_on_every_selection() {
+test_codex_completion_proof_cache_is_bounded() {
   local first second calls
   reset_accounts
   set_remaining 1 30,20
   set_remaining 2 none
-  first=$(run_selector select codex 2>"$TMP_ROOT/recheck-first.err")
+  first=$(FM_ACCOUNT_DIRECTORY_PROBE_NOW=100 run_selector select codex 2>"$TMP_ROOT/recheck-first.err")
   [ "$first" = "$ACCOUNT_ROOT/codex/1" ] || fail "initial Codex selection ignored the only healthy account"
 
   set_remaining 2 100,100
-  second=$(run_selector select codex 2>"$TMP_ROOT/recheck-second.err")
+  second=$(FM_ACCOUNT_DIRECTORY_PROBE_NOW=2000 run_selector select codex 2>"$TMP_ROOT/recheck-second.err")
   [ "$second" = "$ACCOUNT_ROOT/codex/2" ] || fail "freshly re-authenticated Codex account stayed cached as unhealthy"
-  calls=$(grep -c "^$ACCOUNT_ROOT/codex/2"$'\t' "$QUOTA_LOG" || true)
+  calls=$(grep -c "^$ACCOUNT_ROOT/codex/2"$'\t' "$CODEX_LOG" || true)
   [ "$calls" = 2 ] || fail "Codex account health was not re-read on both selections"
-  pass "Codex health is read fresh at selection time so a newly authenticated account is immediately eligible"
+  pass "Codex completion proofs expire on a bounded clock and are refreshed from codex itself"
 }
 
-test_codex_rotates_when_no_account_has_a_fresh_window() {
-  local out expected
+test_failed_probe_cache_starts_when_verdict_is_published() {
+  local clock cache out status
+  reset_accounts
+  set_remaining 1 none
+  clock="$TMP_ROOT/probe-publish-clock"
+  printf '100\n100\n160\n' > "$clock"
+  if out=$(FM_ACCOUNT_DIRECTORY_PROBE_NOW_SEQUENCE_FILE="$clock" run_selector select codex 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "unavailable account unexpectedly selected"
+  cache="$ROTATION_STATE/codex-probes/1.status"
+  [ "$(cut -f2 "$cache")" = 160 ] || fail "failed probe cache was timestamped before the verdict"
+  pass "failed completion-proof TTL starts when its verdict is published"
+}
+
+test_codex_completion_proof_is_bound_to_account_directory_identity() {
+  local out status calls
+  reset_accounts
+  set_remaining 1 100,100
+  FM_ACCOUNT_DIRECTORY_PROBE_NOW=100 run_selector select codex >/dev/null 2>"$TMP_ROOT/identity-first.err" \
+    || fail "initial account identity could not be proved"
+  rm -rf "$ACCOUNT_ROOT/codex/1"
+  set_remaining 1 none
+  if out=$(FM_ACCOUNT_DIRECTORY_PROBE_NOW=101 run_selector select codex 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "replacement account directory inherited a prior positive completion proof"
+  assert_contains "$out" "no Codex account produced a current completion proof" \
+    "replacement account refusal did not reach the ground-truth predicate"
+  calls=$(grep -c "^$ACCOUNT_ROOT/codex/1"$'\t' "$CODEX_LOG" || true)
+  [ "$calls" = 2 ] || fail "replacement account directory was not re-probed under its new physical identity"
+  pass "Codex completion proof cache is bound to the account directory's physical identity"
+}
+
+test_codex_completion_probe_refuses_symlinked_cache_root() {
+  local account outside out status
+  reset_accounts
+  account="$ACCOUNT_ROOT/codex/1"
+  outside="$TMP_ROOT/outside-codex-cache"
+  mkdir -p "$account" "$outside"
+  printf '100,100\n' > "$account/test-remaining"
+  ln -s "$outside" "$account/.agent-fleet-quota-cache"
+  if out=$(run_selector select codex 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "Codex completion probe accepted a symlinked cache root"
+  [ ! -s "$CODEX_LOG" ] || fail "Codex ran with a symlinked XDG cache root"
+  [ -z "$(find "$outside" -mindepth 1 -print -quit)" ] \
+    || fail "Codex completion probe wrote through the symlinked cache root"
+  assert_contains "$out" "no Codex account produced a current completion proof" \
+    "symlinked cache refusal did not fail closed at account selection"
+  pass "Codex completion probe refuses a symlinked account cache root"
+}
+
+test_codex_completion_probe_revalidates_cache_root_identity() {
+  local account cache hook out status
+  reset_accounts
+  set_remaining 1 100,100
+  account="$ACCOUNT_ROOT/codex/1"
+  cache="$account/.agent-fleet-quota-cache"
+  hook="$TMP_ROOT/replace-codex-cache"
+  cat > "$hook" <<SH
+#!/usr/bin/env bash
+set -u
+mv "$cache" "$cache.replaced"
+mkdir "$cache"
+SH
+  chmod +x "$hook"
+  if out=$(FM_FAKE_CODEX_CACHE_RACE_HOOK="$hook" run_selector select codex 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "Codex completion probe accepted a replaced cache root"
+  assert_contains "$out" "cache directory identity changed during completion probe" \
+    "cache-root replacement was not detected after Codex returned"
+  assert_contains "$out" "no Codex account produced a current completion proof" \
+    "cache-root replacement retained a positive completion proof"
+  pass "Codex completion probe revalidates its account cache root identity"
+}
+
+test_codex_refuses_when_no_account_completes_probe() {
+  local out status
   reset_accounts
   set_remaining 1 none
   set_remaining 2 none
-  out=$({
-    run_selector select codex
-    run_selector select codex
-    run_selector select codex
-    run_selector select codex
-  } 2>"$TMP_ROOT/codex-unavailable.err")
-  expected=$(printf '%s\n' \
-    "$ACCOUNT_ROOT/codex/1" "$ACCOUNT_ROOT/codex/2" \
-    "$ACCOUNT_ROOT/codex/1" "$ACCOUNT_ROOT/codex/2")
-  [ "$out" = "$expected" ] || fail "Codex unavailable-usage fallback did not rotate: $out"
-  assert_contains "$(cat "$TMP_ROOT/codex-unavailable.err")" "CODEX USAGE UNAVAILABLE" \
-    "Codex unavailable-usage fallback did not identify the degraded signal"
-  assert_contains "$(cat "$TMP_ROOT/codex-unavailable.err")" \
-    "round-robin selection across 2 unknown-usage codex-crew accounts" \
-    "Codex unavailable-usage fallback did not report its rotation"
-  pass "Codex rotates eligible accounts when every quota signal is unavailable"
+  if out=$(run_selector select codex 2>&1); then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "Codex selector rotated through accounts without positive capacity proof"
+  assert_contains "$out" "no Codex account produced a current completion proof" \
+    "zero-proof refusal was not explicit"
+  assert_contains "$out" "refusing to route from contested quota telemetry, pane state, or run liveness" \
+    "zero-proof refusal did not name the rejected proxies"
+  pass "Codex fails closed when no account completes the ground-truth probe"
 }
 
-# An account whose readable window is at or below its own registered
-# reserve_percent is spent, and must lose to an account that still has headroom.
-# Rotating into a spent account is the same outage as piling onto one account; it
-# just fails in a different place.
-test_codex_skips_accounts_at_or_below_their_reserve() {
-  local out err
-  reset_accounts
-  set_remaining 1 10,10
-  set_remaining 2 80,80
-  printf '15\n' > "$ACCOUNT_ROOT/codex/1/test-reserve"
-  printf '15\n' > "$ACCOUNT_ROOT/codex/2/test-reserve"
-  out=$({
-    run_selector select codex
-    run_selector select codex
-    run_selector select codex
-  } 2>"$TMP_ROOT/codex-reserve.err")
-  err=$(cat "$TMP_ROOT/codex-reserve.err")
-  case "$out" in
-    *"$ACCOUNT_ROOT/codex/1"*)
-      fail "Codex chose an account at or below its reserve: $out"
-      ;;
-  esac
-  [ "$out" = "$(printf '%s\n' "$ACCOUNT_ROOT/codex/2" "$ACCOUNT_ROOT/codex/2" "$ACCOUNT_ROOT/codex/2")" ] \
-    || fail "Codex did not keep every selection on the account with headroom: $out"
-  assert_contains "$err" "EXHAUSTED" \
-    "Codex reserve exclusion did not report the exhausted account"
-  pass "Codex excludes accounts at or below their registered reserve"
-}
-
-# The floor must not be able to block dispatch. When every account is spent there
-# is nothing better to pick, so selection spreads the damage rather than failing.
-test_codex_still_selects_when_every_account_is_exhausted() {
-  local out err
-  reset_accounts
-  set_remaining 1 5,5
-  set_remaining 2 5,5
-  printf '15\n' > "$ACCOUNT_ROOT/codex/1/test-reserve"
-  printf '15\n' > "$ACCOUNT_ROOT/codex/2/test-reserve"
-  out=$({
-    run_selector select codex
-    run_selector select codex
-  } 2>"$TMP_ROOT/codex-all-exhausted.err")
-  err=$(cat "$TMP_ROOT/codex-all-exhausted.err")
-  [ "$out" = "$(printf '%s\n' "$ACCOUNT_ROOT/codex/1" "$ACCOUNT_ROOT/codex/2")" ] \
-    || fail "all-exhausted Codex selection did not rotate rather than block: $out"
-  assert_contains "$err" "CODEX ALL ACCOUNTS EXHAUSTED" \
-    "all-exhausted Codex selection did not report the condition"
-  pass "Codex still selects, by rotation, when every account is exhausted"
-}
-
-test_codex_timeout_skips_wedged_account() {
+test_codex_timeout_skips_unproved_account() {
   local out err
   reset_accounts
   set_remaining 1 hang
   set_remaining 2 90,85
-  out=$(FM_ACCOUNT_DIRECTORY_QUOTA_TIMEOUT_SECONDS=1 \
+  out=$(FM_ACCOUNT_DIRECTORY_PROBE_TIMEOUT_SECONDS=1 \
     run_selector select codex 2>"$TMP_ROOT/codex-timeout.err")
   err=$(cat "$TMP_ROOT/codex-timeout.err")
   [ "$out" = "$ACCOUNT_ROOT/codex/2" ] || fail "wedged Codex account prevented selection of a later healthy account: $out"
-  assert_contains "$err" "codex account $ACCOUNT_ROOT/codex/1 skipped: quota read timed out after 1s" \
-    "Codex timeout was not classified as an unreadable account"
-  pass "Codex bounds each usage read and continues to later healthy accounts"
+  assert_contains "$err" "codex account $ACCOUNT_ROOT/codex/1 unavailable: completion probe timed out after 1s" \
+    "Codex timeout was not classified as an unproved account"
+  pass "Codex bounds each completion probe and continues to a positively proved account"
+}
+
+test_concurrent_codex_selection_shares_one_completion_probe() {
+  local output_dir i status calls pid
+  local -a pids=()
+  reset_accounts
+  set_remaining 1 100,100
+  output_dir="$TMP_ROOT/concurrent-codex"
+  mkdir -p "$output_dir"
+  status=0
+  for i in 1 2 3 4 5 6 7 8; do
+    run_selector select codex > "$output_dir/$i.out" 2> "$output_dir/$i.err" &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || status=1
+  done
+  [ "$status" = 0 ] \
+    || fail "one or more concurrent Codex selections failed: $(grep -H . "$output_dir"/*.err 2>/dev/null || true)"
+  for output in "$output_dir"/*.out; do
+    grep -qxF "$ACCOUNT_ROOT/codex/1" "$output" \
+      || fail "concurrent Codex selectors disagreed on the only proved account: $(grep -H . "$output_dir"/*.out || true)"
+  done
+  calls=$(wc -l < "$CODEX_LOG" | tr -d ' ')
+  [ "$calls" = 1 ] || fail "concurrent selectors spent $calls healthy-account probes instead of sharing one proof"
+  pass "concurrent Codex selection serializes ground-truth probing and shares the bounded cache"
 }
 
 test_claude_rotates_eligible_accounts_without_treating_usage_as_health() {
@@ -479,7 +562,7 @@ test_claude_uses_only_explicit_last_resort_after_primary_exhaustion() {
   pass "Claude consults an explicitly declared last-resort tier only after no primary crew account remains"
 }
 
-test_codex_rotates_accounts_tied_for_best_fresh_score() {
+test_codex_rotates_accounts_with_current_completion_proof() {
   local out expected
   reset_accounts
   set_remaining 1 98,98
@@ -495,14 +578,14 @@ test_codex_rotates_accounts_tied_for_best_fresh_score() {
     run_selector select codex
   } 2>"$TMP_ROOT/codex-tie.err")
   expected=$(printf '%s\n' \
-    "$ACCOUNT_ROOT/codex/3" "$ACCOUNT_ROOT/codex/4" \
+    "$ACCOUNT_ROOT/codex/1" "$ACCOUNT_ROOT/codex/2" \
     "$ACCOUNT_ROOT/codex/3" "$ACCOUNT_ROOT/codex/4")
-  [ "$out" = "$expected" ] || fail "Codex best-score ties concentrated instead of rotating: $out"
+  [ "$out" = "$expected" ] || fail "Codex proved-account rotation concentrated instead of rotating: $out"
   assert_not_contains "$out" "$ACCOUNT_ROOT/codex/5" \
     "Codex tie rotation selected an account reserved to the manual-only pool"
-  assert_contains "$(cat "$TMP_ROOT/codex-tie.err")" "round-robin among 2 tied accounts" \
-    "Codex tie rotation did not report its deterministic tie-break"
-  pass "Codex preserves fresh usage scoring and round-robins accounts tied for the best score"
+  assert_contains "$(cat "$TMP_ROOT/codex-tie.err")" "completion proof cache=usable" \
+    "Codex rotation did not reuse its bounded positive proof cache"
+  pass "Codex round-robins every account with a current positive completion proof"
 }
 
 test_default_root_uses_passwd_home_not_ambient_home() {
@@ -642,8 +725,10 @@ run_direct_spawn() {
     FM_ACCOUNT_DIRECTORY_STATE_ROOT="$ROTATION_STATE" \
     FM_ACCOUNT_DIRECTORY_AGENT_FLEET="$FAKEBIN/profile-agent-fleet" \
     FM_ACCOUNT_DIRECTORY_QUOTA_AXI="$FAKEBIN/quota-axi" \
+    FM_ACCOUNT_DIRECTORY_CODEX="$FAKEBIN/codex" \
     FM_ACCOUNT_DIRECTORY_HERDR="$FAKEBIN/herdr" \
-    FM_FAKE_QUOTA_LOG="$QUOTA_LOG" FM_FAKE_HERDR_LOG="$HERDR_LOG" \
+    FM_FAKE_QUOTA_LOG="$QUOTA_LOG" FM_FAKE_CODEX_LOG="$CODEX_LOG" \
+    FM_FAKE_HERDR_LOG="$HERDR_LOG" \
     FM_AGENT_FLEET_BIN="$FAKEBIN/forbidden-agent-fleet" \
     FM_FAKE_AGENT_FLEET_LOG="$TMP_ROOT/agent-fleet.log" \
     "$ROOT/bin/fm-spawn.sh" "$@"
@@ -702,7 +787,7 @@ test_spawn_uses_direct_codex_home_without_agent_fleet() {
   local record id out launch meta
   reset_accounts
   : > "$TMP_ROOT/agent-fleet.log"
-  set_remaining 1 30,20
+  set_remaining 1 none
   set_remaining 2 100,95
   id=direct-codex-z1
   record=$(make_spawn_case direct-codex codex "$id")
@@ -843,6 +928,66 @@ test_direct_claude_recovery_resolves_legacy_default_to_anchor() {
   pass "direct Claude recovery preserves explicit models and upgrades a legacy default to the Opus 5 anchor"
 }
 
+test_direct_codex_recovery_reresolves_current_profile() {
+  local record id meta meta_tmp launch
+  reset_accounts
+  set_remaining 1 90,85
+  id=codex-recovery-profile-z2
+  record=$(make_spawn_case codex-recovery-profile codex "$id")
+  read_spawn_case "$record"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool codex-crew >/dev/null 2>&1
+  meta=$SPAWN_HOME/state/$id.meta
+  meta_tmp=$(mktemp "$SPAWN_HOME/state/.codex-recovery-profile.XXXXXX")
+  awk '
+    /^model=/ { print "model=gpt-5.6-luna"; next }
+    /^effort=/ { print "effort=medium"; next }
+    { print }
+  ' "$meta" > "$meta_tmp"
+  mv "$meta_tmp" "$meta"
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account >/dev/null 2>&1
+  launch=$(cat "$SPAWN_LAUNCH_LOG")
+  assert_contains "$launch" "--model 'gpt-5.6-sol'" \
+    "direct Codex recovery replayed a stale model"
+  assert_contains "$launch" 'model_reasoning_effort="xhigh"' \
+    "direct Codex recovery replayed stale effort"
+  assert_grep 'model=gpt-5.6-sol' "$meta" \
+    "direct Codex recovery metadata omitted the current model"
+  assert_grep 'effort=xhigh' "$meta" \
+    "direct Codex recovery metadata omitted current effort"
+  pass "direct Codex recovery re-resolves sol/xhigh instead of replaying metadata"
+}
+
+test_direct_recovery_reresolves_current_static_harness() {
+  local record id meta launch
+  reset_accounts
+  set_remaining 1 90,85
+  mkdir -p "$ACCOUNT_ROOT/claude/1"
+  mark_claude_keychain_ready 1
+  id=direct-recovery-harness-z2
+  record=$(make_spawn_case direct-recovery-harness codex "$id")
+  read_spawn_case "$record"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" "$SPAWN_PROJECT" --account-pool codex-crew >/dev/null 2>&1
+  meta=$SPAWN_HOME/state/$id.meta
+  printf '%s\n' claude > "$SPAWN_HOME/config/crew-harness"
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+
+  run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account >/dev/null 2>&1
+  launch=$(cat "$SPAWN_LAUNCH_LOG")
+  assert_contains "$launch" "CLAUDE_CONFIG_DIR='$ACCOUNT_ROOT/claude/1' claude" \
+    "direct recovery replayed its recorded Codex harness instead of current static policy"
+  assert_grep 'harness=claude' "$meta" "direct recovery did not record the freshly resolved harness"
+  assert_grep 'model=claude-opus-5' "$meta" "direct recovery did not resolve the current Claude model anchor"
+  pass "direct recovery re-resolves the current static harness instead of replaying metadata"
+}
+
 test_observe_spawn_uses_direct_directory_without_agent_fleet() {
   local record id out launch meta
   reset_accounts
@@ -902,7 +1047,7 @@ test_direct_spawn_and_recovery_support_detached_worktree() {
 }
 
 test_direct_recovery_preserves_recorded_task_context() {
-  local record id out meta launch project_name generation recorded_project recorded_worktree meta_tmp
+  local record id out meta launch project_name generation recorded_project recorded_worktree meta_tmp refusal rc
   reset_accounts
   : > "$TMP_ROOT/agent-fleet.log"
   set_remaining 1 95,90
@@ -912,7 +1057,7 @@ test_direct_recovery_preserves_recorded_task_context() {
   read_spawn_case "$record"
 
   run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
-    "$id" "$SPAWN_PROJECT" --harness codex --model gpt-recorded --effort high \
+    "$id" "$SPAWN_PROJECT" --harness codex --model gpt-5.6-sol --effort xhigh \
     --account-pool legacy-codex-pool --scout >/dev/null 2>&1
   meta=$SPAWN_HOME/state/$id.meta
   generation=$(sed -n 's/^generation_id=//p' "$meta")
@@ -934,17 +1079,22 @@ test_direct_recovery_preserves_recorded_task_context() {
   rm -f "$SPAWN_HOME/state/.fake-endpoint"
   printf '# Backlog\n\n## In flight\n\n## Queued\n\n## Done\n' > "$SPAWN_HOME/data/backlog.md"
 
+  if refusal=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+    "$id" --recover-direct-account 2>&1); then rc=0; else rc=$?; fi
+  [ "$rc" -ne 0 ] || fail "direct recovery replayed its recorded harness while dispatch policy required a fresh selection"
+  assert_contains "$refusal" "must pass the harness freshly selected from current config/crew-dispatch.json" \
+    "direct recovery did not explain its current-policy harness requirement"
   out=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
-    "$id" --recover-direct-account 2>&1)
+    "$id" --recover-direct-account --harness codex --model gpt-5.6-sol --effort xhigh 2>&1)
   launch=$(cat "$SPAWN_LAUNCH_LOG")
   assert_contains "$out" "selected direct codex account home $ACCOUNT_ROOT/codex/2" \
     "direct recovery did not select a fresh account directory"
   assert_contains "$launch" "CODEX_HOME='$ACCOUNT_ROOT/codex/2' codex" \
     "direct recovery did not launch with the freshly selected account"
-  assert_contains "$launch" "--model 'gpt-recorded'" \
-    "direct recovery did not preserve the recorded model"
-  assert_contains "$launch" "model_reasoning_effort=\"high\"" \
-    "direct recovery did not preserve the recorded effort"
+  assert_contains "$launch" "--model 'gpt-5.6-sol'" \
+    "direct recovery did not apply the current Codex model policy"
+  assert_contains "$launch" "model_reasoning_effort=\"xhigh\"" \
+    "direct recovery did not apply the current Codex effort policy"
   assert_not_contains "$launch" "treehouse get" \
     "direct recovery reconstructed or replaced the recorded worktree"
   assert_grep "kind=scout" "$meta" "direct recovery did not preserve scout kind"
@@ -954,8 +1104,8 @@ test_direct_recovery_preserves_recorded_task_context() {
   assert_grep "worktree_git_dir_identity=" "$meta" "direct recovery dropped the worktree Git-dir identity"
   assert_grep "worktree_git_ref=refs/heads/" "$meta" "direct recovery dropped the worktree branch identity"
   assert_grep "harness=codex" "$meta" "direct recovery changed the recorded harness"
-  assert_grep "model=gpt-recorded" "$meta" "direct recovery changed the recorded model"
-  assert_grep "effort=high" "$meta" "direct recovery changed the recorded effort"
+  assert_grep "model=gpt-5.6-sol" "$meta" "direct recovery omitted the current Codex model"
+  assert_grep "effort=xhigh" "$meta" "direct recovery omitted the current Codex effort"
   assert_grep "mode=direct-PR" "$meta" "direct recovery re-resolved the recorded delivery mode"
   assert_grep "yolo=on" "$meta" "direct recovery re-resolved the recorded yolo setting"
   assert_grep "report_required=1" "$meta" "direct recovery dropped the report requirement"
@@ -966,7 +1116,7 @@ test_direct_recovery_preserves_recorded_task_context() {
     fail "direct recovery fixture unexpectedly retained its historical backlog row"
   fi
   [ ! -s "$TMP_ROOT/agent-fleet.log" ] || fail "direct recovery invoked Agent Fleet"
-  pass "direct recovery preserves recorded task context while refreshing account selection"
+  pass "direct recovery preserves task identity while refreshing account selection and current Codex policy"
 }
 
 test_direct_recovery_rejects_secondmate_metadata() {
@@ -1018,6 +1168,8 @@ test_direct_recovery_rejects_worktree_from_another_project() {
   mv "$meta_tmp" "$meta"
   rm -f "$SPAWN_HOME/state/.fake-endpoint"
   : > "$QUOTA_LOG"
+  : > "$CODEX_LOG"
+  rm -rf "$ROTATION_STATE/codex-probes"
   : > "$HERDR_LOG"
   recorded_git_dir=$(sed -n 's/^worktree_git_dir=//p' "$meta")
 
@@ -1174,6 +1326,8 @@ test_direct_recovery_rechecks_identity_after_account_prepare() {
     "$id" "$SPAWN_PROJECT" --account-pool legacy-codex-pool >/dev/null 2>&1
   rm -f "$SPAWN_HOME/state/.fake-endpoint"
   : > "$QUOTA_LOG"
+  : > "$CODEX_LOG"
+  rm -rf "$ROTATION_STATE/codex-probes"
   : > "$HERDR_LOG"
 
   if out=$(FM_FAKE_HERDR_DRIFT_WORKTREE="$SPAWN_WORKTREE" \
@@ -1187,13 +1341,14 @@ test_direct_recovery_rechecks_identity_after_account_prepare() {
   assert_contains "$out" "changed branch identity" \
     "post-prepare identity drift refusal was not actionable"
   [ ! -e "$SPAWN_HOME/state/.fake-endpoint" ] || fail "post-prepare identity drift created a replacement endpoint"
-  [ -s "$QUOTA_LOG" ] || fail "post-prepare identity test did not reach fresh quota selection"
+  [ -s "$CODEX_LOG" ] || fail "post-prepare identity test did not reach a Codex completion probe"
+  [ ! -s "$QUOTA_LOG" ] || fail "post-prepare identity test routed from contested quota telemetry"
   [ -s "$HERDR_LOG" ] || fail "post-prepare identity test did not reach Herdr installation"
   pass "direct recovery rechecks exact identity immediately before endpoint creation"
 }
 
 test_direct_recovery_tracks_retained_replacement_endpoint() {
-  local record id meta out status backup_name artifacts_name retry launch
+  local record id meta out status backup_name artifacts_name retry launch retry_home
   reset_accounts
   : > "$TMP_ROOT/agent-fleet.log"
   set_remaining 1 90,85
@@ -1231,10 +1386,12 @@ test_direct_recovery_tracks_retained_replacement_endpoint() {
   retry=$(run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
     "$id" --recover-direct-account 2>&1)
   launch=$(cat "$SPAWN_LAUNCH_LOG")
+  retry_home=$(sed -n 's/^account_home=//p' "$meta")
   assert_contains "$retry" "cleaned retained direct recovery endpoint for $id" \
     "direct recovery did not reconcile the retained replacement endpoint"
-  assert_contains "$launch" "CODEX_HOME='$ACCOUNT_ROOT/codex/2' codex" \
-    "direct recovery did not launch after reconciling the retained endpoint"
+  [ -n "$retry_home" ] || fail "successful retry did not record its newly selected account home"
+  assert_contains "$launch" "CODEX_HOME='$retry_home' codex --model 'gpt-5.6-sol'" \
+    "direct recovery did not relaunch from newly resolved account and profile policy after reconciling the retained endpoint"
   if grep -q '^direct_recovery_' "$meta"; then fail "successful retry left direct recovery markers in metadata"; fi
   [ ! -e "$SPAWN_HOME/state/$backup_name" ] || fail "successful retry left the retained metadata backup"
   [ ! -e "$SPAWN_HOME/state/$artifacts_name" ] || fail "successful retry left the retained artifact backup"
@@ -1317,6 +1474,46 @@ test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup() {
   pass "failed new direct spawn removes its endpoint and returns its exactly owned lease without force"
 }
 
+test_failed_direct_spawn_clears_transition_before_metadata_restore() {
+  python3 - "$ROOT/bin/fm-spawn.sh" <<'PY'
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+start = text.index('&& [ "${DIRECT_ACCOUNT_RECOVERY:-0}" != 1 ] && [ "$endpoint_gone" = 1 ]; then')
+end = text.index('if [ "$ACCOUNT_SPAWN_COMMITTED" != 1 ] && [ "${ACCOUNT_EFFECTIVE_MODE:-off}" = enforce ]', start)
+block = text[start:end]
+clear = block.index('fm_backend_clear_transition "${BACKEND:-tmux}" "$STATE" "${T:-}" "$ID" "$LIFECYCLE_LOCK"')
+restore = block.index('fm_account_restore_artifacts "$STATE" "$ID"')
+if clear >= restore:
+    raise SystemExit("transition cleanup follows metadata restore")
+if '[ "$META_INSTALLED" = 1 ]' not in block:
+    raise SystemExit("transition cleanup is not bound to an installed failed generation")
+if 'transition_clean=0' not in block or '[ "$transition_clean" = 1 ]' not in block:
+    raise SystemExit("transition cleanup failure does not retain failed-generation state")
+PY
+  pass "immediate direct-spawn rollback clears transition custody before metadata restore"
+}
+
+test_direct_recovery_clears_old_herdr_transition_before_replacement() {
+  python3 - "$ROOT/bin/fm-spawn.sh" <<'PY'
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+start = text.index('if [ "$RECOVERY_ACCOUNT" = 1 ]; then\n  RECORDED_TARGET=')
+install = text.index('META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1', start)
+block = text[start:install]
+clear = block.index('fm_backend_clear_transition "$BACKEND" "$STATE" "$RECORDED_TARGET" "$ID" "$LIFECYCLE_LOCK"')
+absence = block.index('case "$RECOVERY_ENDPOINT_STATE" in')
+if clear <= absence:
+    raise SystemExit("direct recovery clears before endpoint absence is proved")
+if '[ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] && [ "$BACKEND" = herdr ]' not in block:
+    raise SystemExit("direct recovery transition clear is not restricted to the Herdr route")
+PY
+  pass "direct recovery clears old Herdr transition custody before replacement"
+}
+
 test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails() {
   local record id out status meta
   reset_accounts
@@ -1393,6 +1590,7 @@ test_routing_off_keeps_default_provider_launch() {
   assert_not_contains "$launch" "CODEX_HOME=" "routing-off launch unexpectedly selected an account directory"
   if grep -q '^account_home=' "$meta"; then fail "routing-off metadata unexpectedly recorded an account home"; fi
   [ ! -s "$QUOTA_LOG" ] || fail "routing-off spawn read per-account quota"
+  [ ! -s "$CODEX_LOG" ] || fail "routing-off spawn ran an account completion probe"
   [ ! -s "$HERDR_LOG" ] || fail "routing-off spawn ran the Herdr profile installer"
   [ ! -s "$TMP_ROOT/agent-fleet.log" ] || fail "routing-off spawn invoked Agent Fleet"
   pass "routing off preserves the provider's default identity and performs no account selection"
@@ -1407,11 +1605,19 @@ if [ "${FM_TEST_FOCUSED:-}" = account-directory-trust ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = direct-spawn-transition-custody ]; then
+  test_failed_direct_spawn_clears_transition_before_metadata_restore
+  test_direct_recovery_clears_old_herdr_transition_before_replacement
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = direct-recovery-lifecycle ]; then
   test_direct_spawn_and_recovery_support_detached_worktree
   test_direct_recovery_preserves_recorded_task_context
   test_direct_recovery_rejects_secondmate_metadata
   test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
+  test_failed_direct_spawn_clears_transition_before_metadata_restore
+  test_direct_recovery_clears_old_herdr_transition_before_replacement
   test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
   test_failed_new_direct_spawn_never_records_an_uncreated_endpoint
   exit 0
@@ -1422,20 +1628,40 @@ if [ "${FM_TEST_FOCUSED:-}" = treehouse-per-home ]; then
   exit 0
 fi
 
-test_codex_picks_highest_fresh_minimum_and_skips_no_window
+if [ "${FM_TEST_FOCUSED:-}" = probe-publish-time ]; then
+  test_failed_probe_cache_starts_when_verdict_is_published
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = codex-cache-safety ]; then
+  test_codex_completion_proof_is_bound_to_account_directory_identity
+  test_codex_completion_probe_refuses_symlinked_cache_root
+  test_codex_completion_probe_revalidates_cache_root_identity
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = concurrent-codex-probe ]; then
+  test_concurrent_codex_selection_shares_one_completion_probe
+  exit 0
+fi
+
+test_codex_requires_exact_completion_proof
 test_profile_eligibility_requires_enabled_worker
 test_claude_approval_marker_contract
 test_openat_binding_failure_is_a_setup_error
-test_codex_rechecks_health_on_every_selection
-test_codex_rotates_when_no_account_has_a_fresh_window
-test_codex_skips_accounts_at_or_below_their_reserve
-test_codex_still_selects_when_every_account_is_exhausted
-test_codex_timeout_skips_wedged_account
+test_codex_completion_proof_cache_is_bounded
+test_failed_probe_cache_starts_when_verdict_is_published
+test_codex_completion_proof_is_bound_to_account_directory_identity
+test_codex_completion_probe_refuses_symlinked_cache_root
+test_codex_completion_probe_revalidates_cache_root_identity
+test_codex_refuses_when_no_account_completes_probe
+test_codex_timeout_skips_unproved_account
+test_concurrent_codex_selection_shares_one_completion_probe
 test_claude_rotates_eligible_accounts_without_treating_usage_as_health
 test_concurrent_claude_selections_spread_without_usage
 test_claude_fails_closed_when_no_usable_crew_account_exists
 test_claude_uses_only_explicit_last_resort_after_primary_exhaustion
-test_codex_rotates_accounts_tied_for_best_fresh_score
+test_codex_rotates_accounts_with_current_completion_proof
 test_default_root_uses_passwd_home_not_ambient_home
 test_prepare_installs_and_verifies_per_account_herdr_hooks
 test_main_home_ship_and_scout_use_managed_treehouse_source
@@ -1443,6 +1669,8 @@ test_spawn_uses_direct_codex_home_without_agent_fleet
 test_spawn_uses_direct_claude_fallback_and_hook
 test_claude_spawn_rejects_mismatched_explicit_model
 test_direct_claude_recovery_resolves_legacy_default_to_anchor
+test_direct_codex_recovery_reresolves_current_profile
+test_direct_recovery_reresolves_current_static_harness
 test_observe_spawn_uses_direct_directory_without_agent_fleet
 test_direct_spawn_and_recovery_support_detached_worktree
 test_direct_recovery_preserves_recorded_task_context
@@ -1454,6 +1682,8 @@ test_direct_recovery_rechecks_identity_after_account_prepare
 test_direct_recovery_tracks_retained_replacement_endpoint
 test_new_direct_spawn_tracks_retained_endpoint_and_worktree
 test_failed_new_direct_spawn_returns_worktree_after_endpoint_cleanup
+test_failed_direct_spawn_clears_transition_before_metadata_restore
+test_direct_recovery_clears_old_herdr_transition_before_replacement
 test_failed_new_direct_spawn_retains_cleanup_when_worktree_return_fails
 test_failed_new_direct_spawn_never_records_an_uncreated_endpoint
 test_routing_off_keeps_default_provider_launch

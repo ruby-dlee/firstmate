@@ -36,6 +36,7 @@ fm_git_identity fmtest fmtest@example.invalid
 . "$ROOT/bin/fm-backend.sh"
 
 fm_test_tmproot_into TMP_ROOT fm-backend-tests
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 
 # fm_backend_detect's cmux fallback (bundle id + process ancestry,
 # docs/cmux-backend.md "Runtime auto-detection") consults uname, lsappinfo,
@@ -749,7 +750,7 @@ test_managed_tmux_target_identity_checks_recorded_session() {
   ! grep -Eq '^(capture-pane|send-keys) ' "$log" \
     || fail "session-mismatched managed tmux activity reached the reused or name-based target"
 
-  fake_session=recorded-session
+  fake_session='recorded-session'
   fm_backend_target_exists tmux @77 fm-intended-task recorded-session:fm-intended-task \
     || fail "the recorded tmux session identity did not pass existence validation"
   fm_backend_capture tmux @77 10 fm-intended-task recorded-session:fm-intended-task >/dev/null \
@@ -919,34 +920,33 @@ test_send_conformance_old_vs_new() {
     || fail "fm-send --key: tmux command log differs old vs new"$'\n'"$(cat "$TMP_ROOT/send-diff-key.txt")"
   assert_contains "$(cat "$log_new")" $'\x1f''Escape' "fm-send --key did not send the named key"
 
-  # Case 2: plain text (0.3s settle, no popup).
+  # Case 2: production plain text refuses because tmux has no atomic
+  # agent-session-bound steering operation. Target resolution may read the
+  # endpoint, but the refusal must happen before any pane input.
   run_send_case "$old_bin" "$fb" "$log_old" "$home" -- "sess:win" hello captain
   rc_old=$?
   run_send_case "$ROOT" "$fb" "$log_new" "$home" -- "sess:win" hello captain
   rc_new=$?
-  expect_code "$rc_old" "$rc_new" "fm-send plain text: old vs new exit code"
-  strip_send_preflight "$log_old" > "$filtered_old"
+  expect_code 0 "$rc_old" "legacy fm-send plain text control"
+  [ "$rc_new" -ne 0 ] || fail "production fm-send plain text should refuse without atomic steering"
   strip_send_preflight "$log_new" > "$filtered_new"
-  diff -u "$filtered_old" "$filtered_new" > "$TMP_ROOT/send-diff-plain.txt" 2>&1 \
-    || fail "fm-send plain text: tmux command log differs old vs new"$'\n'"$(cat "$TMP_ROOT/send-diff-plain.txt")"
-  assert_contains "$(cat "$log_new")" $'\x1f''send-keys'$'\x1f''-t'$'\x1f''sess:win'$'\x1f''-l'$'\x1f''hello captain' \
-    "fm-send did not send the literal text with send-keys -l"
-  assert_contains "$(cat "$log_new")" $'\x1f''Enter' "fm-send did not submit with Enter"
+  [ ! -s "$filtered_new" ] \
+    || fail "production fm-send plain text touched pane input before refusal"$'\n'"$(cat "$filtered_new")"
 
-  # Case 3: a slash command still opens the popup-settle path (verified
-  # elsewhere in tests/fm-send-popup-settle.test.sh) and still ends in the
-  # same tmux command shape: send-keys -l, then a retried Enter.
+  # Case 3: slash commands are subject to the same production refusal. Popup
+  # settle selection remains covered through the explicit atomic test adapter
+  # in tests/fm-send-popup-settle.test.sh.
   run_send_case "$old_bin" "$fb" "$log_old" "$home" -- "sess:win" /some-skill
   rc_old=$?
   run_send_case "$ROOT" "$fb" "$log_new" "$home" -- "sess:win" /some-skill
   rc_new=$?
-  expect_code "$rc_old" "$rc_new" "fm-send /skill: old vs new exit code"
-  strip_send_preflight "$log_old" > "$filtered_old"
+  expect_code 0 "$rc_old" "legacy fm-send /skill control"
+  [ "$rc_new" -ne 0 ] || fail "production fm-send /skill should refuse without atomic steering"
   strip_send_preflight "$log_new" > "$filtered_new"
-  diff -u "$filtered_old" "$filtered_new" > "$TMP_ROOT/send-diff-slash.txt" 2>&1 \
-    || fail "fm-send /skill: tmux command log differs old vs new"$'\n'"$(cat "$TMP_ROOT/send-diff-slash.txt")"
+  [ ! -s "$filtered_new" ] \
+    || fail "production fm-send /skill touched pane input before refusal"$'\n'"$(cat "$filtered_new")"
 
-  pass "fm-send.sh: explicit tmux targets are verified, while --key/plain/slash send command shape stays old-compatible"
+  pass "fm-send.sh: keys stay compatible while production text refuses before pane input"
 }
 
 # --- old vs new: fm-peek.sh --------------------------------------------------
@@ -1445,6 +1445,11 @@ if [ "${FM_TEST_FOCUSED:-}" = tmux-moved-window ]; then
   test_managed_tmux_target_identity_checks_recorded_session
   test_managed_tmux_target_state_finds_replacement_window
   test_managed_tmux_target_state_resolves_id_after_recorded_session_disappears
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = spawn-symlink-prefix ]; then
+  test_spawn_symlinked_project_prefix_avoids_false_refusal
   exit 0
 fi
 

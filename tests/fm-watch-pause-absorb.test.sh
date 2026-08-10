@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/fm-watch-pause-absorb.test.sh - a DECLARED pause must be honoured on its
-# own evidence, independent of what the crewmate's terminal or its attributed
-# no-mistakes run happens to be doing.
+# own evidence unless affirmative run-owned process evidence proves that the
+# crewmate resumed after declaring it.
 #
 # The 2026-08-03 incident this suite pins down: lane priors-882-rebase-c8 declared
 # `paused: work complete and verified; waiting on the merge of PR 882` with its one
@@ -39,6 +39,8 @@ set -u
 
 # shellcheck source=tests/wake-helpers.sh
 . "$(dirname "${BASH_SOURCE[0]}")/wake-helpers.sh"
+# shellcheck source=bin/fm-marker-state-lib.sh
+. "$ROOT/bin/fm-marker-state-lib.sh"
 # shellcheck source=bin/fm-classify-lib.sh
 . "$ROOT/bin/fm-classify-lib.sh"
 
@@ -91,7 +93,7 @@ run_pause_case() {  # <case-name> <status-stream> <crew-state-verdict>
   printf 'window=%s\nkind=ship\n' "$window" > "$state/$name.meta"
   printf '%s' "$stream" > "$state/$name.status"
   sig=$(seen_sig "$state/$name.status"); printf '%s' "$sig" > "$state/.seen-${name}_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
+  key=$(fm_marker_task_key "$(window_to_task "$window" "$state")")
   pane_hash=$(hash_text "idle at the composer")
   printf '%s' "$pane_hash" > "$state/.hash-$key"
   printf '1\n' > "$state/.count-$key"
@@ -201,7 +203,9 @@ paused: work complete and verified; waiting on the merge of PR 882 by the main f
 test_crew_absorb_class_pause_matrix() {
   local dir state fakebin
   dir=$(make_case absorb-pause-matrix); state="$dir/state"; fakebin="$dir/fakebin"
-  export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_FAKE_CREW_STATE FM_STATE_OVERRIDE="$state"
+  export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_RUN_LIVENESS_BIN="$fakebin/fm-run-liveness.sh" \
+    FM_FAKE_CREW_STATE FM_STATE_OVERRIDE="$state"
 
   local paused='paused: waiting on the merge of PR 882'
   printf '%s\n' "$paused" > "$state/a.status"
@@ -220,14 +224,13 @@ test_crew_absorb_class_pause_matrix() {
     crew_is_paused a || fail "crew_is_paused disagreed with the class for verdict [$v]"
   done
 
-  # A crewmate that appended a pause and then STARTED working is working, not paused:
-  # active work supersedes the stale declaration. This precedence is unchanged.
+  # A crewmate that appended a pause and then STARTED a proved run is working, not paused.
   FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
   [ "$(crew_absorb_class a "$paused")" = working ] \
     || fail "an active run-step did not outrank a stale pause declaration"
   FM_FAKE_CREW_STATE='state: working · source: pane · harness busy'
-  [ "$(crew_absorb_class a "$paused")" = working ] \
-    || fail "a busy pane did not outrank a stale pause declaration"
+  [ "$(crew_absorb_class a "$paused")" = unknown ] \
+    || fail "pane-only evidence did not remain unknown over a stale pause declaration"
 
   # The pause must be read from the durable stream even when no caller passes it,
   # so the two call sites in bin/fm-watch.sh cannot disagree.
@@ -264,7 +267,7 @@ test_crew_absorb_class_pause_matrix() {
   [ "$(crew_absorb_class a)" = none ] || fail "a lane with no pause was absorbed"
   [ "$(crew_absorb_class "")" = none ] || fail "empty id not classed none"
 
-  unset FM_FAKE_CREW_STATE FM_STATE_OVERRIDE
+  unset FM_CREW_STATE_BIN FM_RUN_LIVENESS_BIN FM_FAKE_CREW_STATE FM_STATE_OVERRIDE
   pass "crew_absorb_class: a declared pause outranks every verdict but working, and an open decision blocks it"
 }
 
@@ -304,6 +307,12 @@ test_pause_moving_during_pipeline_read_refused() {
     || fail "a pause invalidated during the crew-state read wrote .paused-<key>"
   pass "a pause invalidated during pipeline-state validation fails closed"
 }
+
+if [ "${FM_TEST_FOCUSED:-}" = watcher-state-key ]; then
+  test_live_idle_paused_pane_absorbed
+  test_paused_with_open_decision_surfaced
+  exit 0
+fi
 
 test_live_idle_paused_pane_absorbed
 test_dead_paused_pane_absorbed

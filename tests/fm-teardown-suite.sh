@@ -1444,7 +1444,7 @@ test_pr_check_records_remote_head_when_local_lags() {
 }
 
 test_pr_check_lookup_errors_are_loud_and_bounded() {
-  local case_dir rc url head wake wake_size
+  local case_dir rc url head lookup_error lookup_error_size custom_check
   url=https://github.com/example/repo/pull/7
   head=deadbeefcafefeed0000000000000000deadbeef
 
@@ -1467,24 +1467,37 @@ test_pr_check_lookup_errors_are_loud_and_bounded() {
 
   case_dir=$(make_case pr-check-poll-lookup-error)
   write_meta "$case_dir" no-mistakes ship
+  custom_check="$case_dir/state/task-x1.check.sh"
+  cat > "$custom_check" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'custom task check'
+SH
+  chmod +x "$custom_check"
   install_pr_check_lookup_fake "$case_dir"
   FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state" \
   FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \
     "$PR_CHECK" task-x1 "$url" >/dev/null \
-    || fail "PR watcher setup failed before its lookup-error exercise"
+    || fail "PR recording failed before its lookup-error exercise"
   cat > "$case_dir/fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
 python3 -c 'import sys; sys.stderr.write("lookup failed " * 200)'
 exit 42
 SH
   chmod +x "$case_dir/fakebin/gh-axi"
-  wake=$(PATH="$case_dir/fakebin:$PATH" bash "$case_dir/state/task-x1.check.sh") \
-    || fail "lookup-error watcher wake exited nonzero"
-  assert_contains "$wake" 'UNREVIEWED: PR state lookup failed' \
+  set +e
+  lookup_error=$(FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state" \
+    PATH="$case_dir/fakebin:$PATH" "$PR_CHECK" task-x1 "$url" 2>&1)
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "later PR head lookup error"
+  assert_contains "$lookup_error" 'UNREVIEWED: PR head lookup failed' \
     "later lookup error remained silent"
-  wake_size=$(printf '%s' "$wake" | wc -c)
-  [ "$wake_size" -le 550 ] || fail "lookup-error watcher wake was unbounded: $wake_size bytes"
-  pass "PR lookup errors block setup and wake later polls loudly within a bound"
+  lookup_error_size=$(printf '%s' "$lookup_error" | wc -c)
+  [ "$lookup_error_size" -le 550 ] \
+    || fail "later lookup error was unbounded: $lookup_error_size bytes"
+  [ "$(bash "$custom_check")" = 'custom task check' ] \
+    || fail "PR recording replaced the task-owned custom check"
+  pass "PR lookup errors stay loud and bounded without replacing task-owned checks"
 }
 
 test_pr_check_without_worktree_still_performs_lookup() {
@@ -1512,43 +1525,30 @@ test_pr_check_without_worktree_still_performs_lookup() {
   pass "PR setup performs its remote lookup even without worktree metadata"
 }
 
-test_closed_pr_wakes_loudly_as_unreviewed() {
-  local case_dir head url wake wake_size
-  case_dir=$(make_case pr-check-closed-pr)
+test_pr_check_preserves_task_owned_check_without_polling() {
+  local case_dir custom_check head url
+  case_dir=$(make_case pr-check-custom-check)
   write_meta "$case_dir" no-mistakes ship
   head=deadbeefcafefeed0000000000000000deadbeef
   url=https://github.com/example/repo/pull/7
+  custom_check="$case_dir/state/task-x1.check.sh"
+  cat > "$custom_check" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'task-owned sentinel'
+SH
+  chmod +x "$custom_check"
   install_pr_check_lookup_fake "$case_dir"
   FM_ROOT_OVERRIDE="$ROOT" FM_STATE_OVERRIDE="$case_dir/state" \
   FM_TEST_PR_HEAD="$head" PATH="$case_dir/fakebin:$PATH" \
     "$PR_CHECK" task-x1 "$url" >/dev/null \
-    || fail "PR watcher setup failed before closed-state exercise"
-  cat > "$case_dir/fakebin/gh-axi" <<'SH'
-#!/usr/bin/env bash
-[ "$*" = "api /repos/example/repo/pulls/7" ] || exit 97
-printf '%s\n' \
-  'number: 7' \
-  'state: closed' \
-  'merged: false' \
-  'head:' \
-  '  ref: fm/task-x1' \
-  '  sha: deadbeefcafefeed0000000000000000deadbeef' \
-  '  repo:' \
-  '    full_name: example/repo' \
-  'base:' \
-  '  ref: main' \
-  '  sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
-  '  repo:' \
-  '    full_name: example/repo'
-SH
-  chmod +x "$case_dir/fakebin/gh-axi"
-  wake=$(PATH="$case_dir/fakebin:$PATH" bash "$case_dir/state/task-x1.check.sh") \
-    || fail "closed-state watcher wake exited nonzero"
-  assert_contains "$wake" 'UNREVIEWED: PR state is CLOSED' \
-    "closed PR remained silent in the watcher"
-  wake_size=$(printf '%s' "$wake" | wc -c)
-  [ "$wake_size" -le 550 ] || fail "closed-state watcher wake was unbounded: $wake_size bytes"
-  pass "closed PRs wake the watcher loudly as unreviewed"
+    || fail "PR recording failed before custom-check preservation exercise"
+  [ "$(bash "$custom_check")" = 'task-owned sentinel' ] \
+    || fail "PR recording replaced the task-owned custom check"
+  assert_grep "pr=$url" "$case_dir/state/task-x1.meta" \
+    "PR recording omitted the reviewed URL"
+  assert_grep "pr_head=$head" "$case_dir/state/task-x1.meta" \
+    "PR recording omitted the exact reviewed head"
+  pass "PR recording preserves task-owned checks and never installs a merge poll"
 }
 
 test_pr_check_serializes_with_account_session_updates() {
@@ -1647,7 +1647,7 @@ test_pr_check_backfills_legacy_generation_and_records_state() {
   expect_code 1 "$count" "successful legacy PR generation backfill count"
   assert_grep "pr=$url" "$meta" "successful legacy PR check did not record the PR URL"
   assert_grep "pr_head=$head" "$meta" "successful legacy PR check did not record the PR head"
-  assert_present "$state/task-x1.check.sh" "successful legacy PR check did not arm the merge poll"
+  assert_absent "$state/task-x1.check.sh" "successful legacy PR check armed a merge poll"
   pass "fm-pr-check upgrades legacy task metadata without breaking PR handling"
 }
 
@@ -4431,6 +4431,8 @@ SH
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" \
     || fail "herdr-marker-cleanup: forced teardown failed: $(cat "$case_dir/stderr")"
   [ ! -e "$marker" ] || fail "herdr-marker-cleanup: teardown left the pane's escalation marker behind"
+  [ -z "$(find "$case_dir/state" -maxdepth 1 \( -name '.herdr-escalated-*' -o -name '.marker-owner-herdr-transition-*' \) -print -quit)" ] \
+    || fail "herdr-marker-cleanup: teardown left migrated transition custody behind"
   pass "herdr teardown removes pane-owned escalation dedupe state"
 }
 
@@ -5336,6 +5338,64 @@ SH
   assert_present "$case_dir/wt/.git" "retained direct-spawn teardown recycled the worktree without endpoint proof"
   assert_present "$case_dir/state/task-x1.meta" "retained direct-spawn teardown erased cleanup metadata without endpoint proof"
   pass "retained direct-spawn teardown requires confirmed endpoint quiescence"
+}
+
+test_retained_direct_spawn_clears_failed_generation_before_restore() {
+  local case_dir state meta backup_name artifacts_name key marker owner
+  case_dir=$(make_case retained-direct-spawn-transition-restore)
+  state="$case_dir/state"
+  meta="$state/task-x1.meta"
+  backup_name=.task-x1.meta.rollback.transition1
+  artifacts_name=.task-x1.artifacts.rollback.transition1
+  fm_write_meta "$state/$backup_name" \
+    'window=default:wOld:pOld' \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    'kind=ship' \
+    'mode=local-only' \
+    'backend=herdr' \
+    'generation_id=generation-prior'
+  mkdir -p "$state/$artifacts_name"
+  fm_write_meta "$meta" \
+    'window=default:wG:pQ' \
+    "worktree=$case_dir/wt" \
+    "project=$case_dir/project" \
+    'kind=ship' \
+    'mode=local-only' \
+    'backend=herdr' \
+    'generation_id=generation-failed' \
+    'account_home=/tmp/direct-account-home' \
+    'direct_spawn_cleanup=pending' \
+    "direct_spawn_backup=$backup_name" \
+    "direct_spawn_artifacts=$artifacts_name" \
+    'rollback_pending=1'
+  cat > "$case_dir/fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  'session list --json') printf '{"sessions":[]}\n' ;;
+esac
+exit 0
+SH
+  chmod +x "$case_dir/fakebin/herdr"
+  key=$(bash -c '. "$0/bin/fm-marker-state-lib.sh"; fm_marker_identity_key "$1"' "$ROOT" default:wG:pQ)
+  marker="$state/.herdr-escalated-$key"
+  owner="$state/.marker-owner-herdr-transition-$key"
+  printf '%s' default:wG:pQ > "$marker"
+  printf '%s' default:wG:pQ > "$owner"
+
+  run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "retained direct-spawn transition cleanup failed: $(cat "$case_dir/stderr")"
+  assert_grep 'cleaned failed direct spawn for task-x1 and restored the prior task generation' "$case_dir/stdout" \
+    "retained direct-spawn cleanup missed its restoration boundary: $(cat "$case_dir/stdout")"
+  assert_present "$meta" "retained direct-spawn cleanup removed restored task metadata"
+  grep -Fx 'window=default:wOld:pOld' "$meta" >/dev/null \
+    || fail "retained direct-spawn cleanup did not restore the prior window: $(cat "$meta")"
+  grep -Fx 'generation_id=generation-prior' "$meta" >/dev/null \
+    || fail "retained direct-spawn cleanup did not restore the prior generation"
+  assert_absent "$marker" "retained direct-spawn cleanup orphaned the failed generation marker"
+  assert_absent "$owner" "retained direct-spawn cleanup orphaned the failed generation owner"
+  assert_absent "$state/$artifacts_name" "retained direct-spawn cleanup left its artifact backup"
+  pass "retained direct-spawn cleanup clears failed transition custody before metadata restore"
 }
 
 test_missing_ship_worktree_retains_endpoint_and_metadata() {
@@ -6514,7 +6574,7 @@ if [ "${FM_TEST_FOCUSED:-}" = crosscheck-pr-lookup ]; then
   test_pr_check_records_remote_head_when_local_lags
   test_pr_check_lookup_errors_are_loud_and_bounded
   test_pr_check_without_worktree_still_performs_lookup
-  test_closed_pr_wakes_loudly_as_unreviewed
+  test_pr_check_preserves_task_owned_check_without_polling
   test_pr_check_serializes_with_account_session_updates
   test_pr_check_rejects_reused_task_generation
   test_pr_check_backfills_legacy_generation_and_records_state
@@ -6524,7 +6584,7 @@ fi
 
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
-    test_pr_check_without_worktree_still_performs_lookup|test_closed_pr_wakes_loudly_as_unreviewed)
+    test_pr_check_without_worktree_still_performs_lookup|test_pr_check_preserves_task_owned_check_without_polling)
       "$FM_TEST_CASE"
       exit 0
       ;;
@@ -6535,12 +6595,18 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-3-pr-check ]; then
   test_pr_check_lookup_errors_are_loud_and_bounded
   test_pr_check_without_worktree_still_performs_lookup
-  test_closed_pr_wakes_loudly_as_unreviewed
+  test_pr_check_preserves_task_owned_check_without_polling
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = direct-spawn-transition-custody ]; then
+  test_retained_direct_spawn_clears_failed_generation_before_restore
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = direct-spawn-cleanup ]; then
   test_retained_direct_spawn_requires_confirmed_endpoint_quiescence
+  test_retained_direct_spawn_clears_failed_generation_before_restore
   test_never_created_direct_spawn_endpoint_is_not_quiesced
   exit 0
 fi
@@ -6608,6 +6674,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = nested-repository ]; then
   test_secondmate_retirement_recurses_into_ignored_nested_repositories
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = directory-symlink ]; then
+  test_secondmate_retirement_accounts_for_directory_symlinks
   exit 0
 fi
 
@@ -6923,6 +6994,7 @@ TEARDOWN_FULL_SUITE_CASES=(
   test_secondmate_missing_treehouse_child_is_retained
   test_secondmate_registry_home_drift_blocks_removal
   test_retained_direct_spawn_requires_confirmed_endpoint_quiescence
+  test_retained_direct_spawn_clears_failed_generation_before_restore
   test_missing_ship_worktree_retains_endpoint_and_metadata
   test_never_created_direct_spawn_endpoint_is_not_quiesced
   test_never_created_scout_without_report_cleans_bookkeeping
@@ -6993,7 +7065,7 @@ TEARDOWN_FULL_SUITE_CASES=(
   test_persistent_index_lock_exhausts_retries_and_refuses_loudly
   test_empty_retry_wait_uses_default_without_aborting
   test_fractional_legacy_retry_wait_refuses_without_arithmetic_error
-  test_closed_pr_wakes_loudly_as_unreviewed
+  test_pr_check_preserves_task_owned_check_without_polling
   test_pr_check_without_worktree_still_performs_lookup
 )
 

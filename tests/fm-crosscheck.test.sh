@@ -2683,11 +2683,10 @@ assert value["findings"][0]["lifecycle"] == "open", value["findings"][0]["lifecy
   pass "an allowlist missing something the runner needs refuses at the baseline"
 }
 
-# `Path.stat(follow_symlinks=...)` is Python 3.10+. `fm-crosscheck.sh` execs
-# whichever `python3` is first on PATH, so that form turns an older interpreter
-# into an uncaught TypeError deep inside evidence capture instead of a gate
-# verdict. `os.stat(path, follow_symlinks=...)` is the portable idiom the rest
-# of bin/ already uses.
+# `Path.stat(follow_symlinks=...)` is Python 3.10+. The production wrapper now
+# refuses anything below Python 3.11, but bin/ keeps the portable `os.stat(path,
+# follow_symlinks=...)` idiom repository-wide and this focused probe preserves
+# that contract independently of the gate's runtime floor.
 test_evidence_capture_runs_on_older_interpreters() {
   local offenders older probe
   # Scoped to the two evidence-path modules, where every such receiver is a
@@ -3784,11 +3783,13 @@ SH
   env -u FM_CROSSCHECK_PYTHON \
     PATH="$fakebin:/usr/bin:/bin" \
     FM_TEST_CROSSCHECK_LAUNCH_MARKER="$marker" \
-    "$launcher" --help > "$case_dir/modern.out" 2> "$case_dir/modern.err" \
+    "$launcher" run --help > "$case_dir/modern.out" 2> "$case_dir/modern.err" \
     || fail "the launcher rejected a discoverable Python 3.11 interpreter: $(cat "$case_dir/modern.err")"
   [ "$(sed -n '1p' "$marker")" = "$ROOT/bin/fm-crosscheck.py" ] \
     || fail "the launcher did not execute fm-crosscheck.py with the supported interpreter"
-  [ "$(sed -n '2p' "$marker")" = --help ] \
+  [ "$(sed -n '2p' "$marker")" = run ] \
+    || fail "the launcher did not preserve the supported Crosscheck command"
+  [ "$(sed -n '3p' "$marker")" = --help ] \
     || fail "the launcher did not preserve crosscheck arguments"
 
   modern=
@@ -3801,7 +3802,7 @@ SH
     fi
   done
   [ -n "$modern" ] || fail "the Crosscheck test environment has no Python 3.11 or newer"
-  FM_CROSSCHECK_PYTHON="$modern" "$launcher" --help \
+  FM_CROSSCHECK_PYTHON="$modern" "$launcher" run --help \
     > "$case_dir/real-modern.out" 2> "$case_dir/real-modern.err" \
     || fail "the launcher rejected the real conforming interpreter: $(cat "$case_dir/real-modern.err")"
   assert_grep 'usage: fm-crosscheck.py' "$case_dir/real-modern.out" \

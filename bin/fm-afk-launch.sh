@@ -16,7 +16,8 @@
 #
 # Correct compatibility-targeting: a terminal-backed daemon would discover its
 # own pane, so this captures the captain pane first and passes it in as
-# FM_SUPERVISOR_TARGET/FM_SUPERVISOR_BACKEND for legacy injection delivery.
+# FM_SUPERVISOR_TARGET/FM_SUPERVISOR_BACKEND for the legacy delivery attempt;
+# Gate B still refuses that attempt before pane input.
 # Native tracked launches use task completion and never inspect a pane.
 #
 # Usage:
@@ -33,8 +34,9 @@
 #                              state/.afk is still present, wait for it, close the
 #                              recorded terminal by exact id, then clear
 #                              state/.afk last. Native delivery preserves its
-#                              buffer for catch-up; compatibility injection may
-#                              perform its final guarded flush during cleanup.
+#                              buffer for catch-up; compatibility delivery makes
+#                              one final guarded attempt and preserves the buffer
+#                              when Gate B refuses.
 #   fm-afk-launch.sh reconcile Close a recorded-but-dead daemon terminal by exact
 #                              id and drop the record (recovery after a crash).
 #
@@ -1228,8 +1230,9 @@ fm_afk_launch_stop_locked() {
     return 1
   fi
   # (1) SIGTERM the daemon while state/.afk is still present.
-  # Terminal-backed compatibility delivery may make its final guarded flush in
-  # cleanup, while native reap-wake preserves the buffer for firstmate's catch-up.
+  # Terminal-backed compatibility delivery makes its final guarded attempt in
+  # cleanup and preserves the buffer on Gate B refusal; native reap-wake also
+  # preserves the buffer for firstmate's catch-up.
   pid=""
   pid_identity=""
   if daemon_lock_held_by_live_daemon; then

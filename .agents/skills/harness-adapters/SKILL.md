@@ -104,14 +104,15 @@ This preserves launch success instead of passing a known-bad value.
 
 ## no-mistakes skill invocation
 
-Send the validation skill using the target harness's skill invocation form.
+These forms describe what must eventually reach the target harness.
+Canonical `fm-send` text steering currently refuses before pane input on every backend because none supplies an atomic agent-session-bound submit, so never claim an invocation landed from these forms alone.
 Natural language is acceptable if uncertain.
 
 - claude: `/<skill>`, for example `/no-mistakes`.
 - codex: `$<skill>`, for example `$no-mistakes`; `/<skill>` is claude-only and codex rejects it as "Unrecognized command".
 - opencode: no separate verified skill invocation beyond normal slash-command behavior; use natural language if the exact skill command is uncertain.
 - pi: no separate verified skill invocation beyond normal command behavior; use natural language if the exact skill command is uncertain.
-- grok: `/<skill>`, for example `/no-mistakes` (same form as claude). Verified end to end: grok discovers the user-level `no-mistakes` skill, `/no-mistakes` invokes it, and grok drives a real `no-mistakes axi run`. Like codex's `$`/`/` popups, typing `/<skill>` opens grok's slash-autocomplete, so a too-fast Enter selects the popup entry instead of sending, and for an argument-taking command (like `/no-mistakes`'s optional task-first argument) that first Enter only expands the popup selection into an argument-hint placeholder rather than submitting - a genuine second Enter is required (see the grok section below for the 2026-07-03 incident and fix). `fm_tmux_submit_core`'s retried Enter (used by `fm-send` on the tmux backend) already handles this correctly by reading the cursor row; the herdr backend needed a dedicated fix (`fm_backend_herdr_composer_state`, docs/herdr-backend.md) because its prior delta-based verification false-positived on that same popup-close content change.
+- grok: `/<skill>`, for example `/no-mistakes` (same form as claude). Historical end-to-end verification proved grok discovers the user-level skill and drives a real run, while the legacy split-submit helpers required a genuine second Enter after autocomplete; those helpers remain regression evidence, not an admitted production steering route.
 
 ## claude (VERIFIED)
 
@@ -151,16 +152,13 @@ Claude Code's primary watcher protocol is the lowest-friction path: run `bin/fm-
 | Fact | Value |
 |---|---|
 | Busy-pane signature | `esc to interrupt` (shown as `• Working (Xs • esc to interrupt)`) |
-| Exit command | `/quit` (slash popup needs about 1 second between text and Enter; `fm-send` handles it) |
+| Exit command | `/quit` (slash popup needs about 1 second between text and Enter when entered directly; canonical `fm-send` text steering refuses) |
 | Interrupt | single Escape |
 | Skill invocation | `$<skill>` (e.g. `$no-mistakes`); `/<skill>` is claude-only and codex rejects it as "Unrecognized command" |
 | Protected mid-run grant shapes | One of `Would you like to run the following command?`, `Would you like to grant these permissions?`, `Would you like to make the following edits?`, or `Do you want to approve network access to "<host>"?`, together with its title-specific choices and `Press enter to confirm or esc to cancel`; or `Do you trust the contents of this directory?` together with `Yes, continue` and `No, quit`. |
 
-A `$<skill>` invocation opens a `$`-autocomplete (skill) popup, the same hazard as the `/` slash popup: submitting too fast lets the popup swallow the Enter, so the invocation never lands.
-`fm-send` handles it the same way it handles `/` - it gives the popup a longer settle (1.2s) between typing and the first Enter, with the target backend's submit retry as the safety net - but the `$` settle is scoped to `harness=codex`, read from the target metadata for exact task ids or legacy `fm-<id>` labels.
-That scope matters because, unlike `/`, a leading `$` commonly starts ordinary text (`$5/month`, `$HOME`), so a universal `$` rule would needlessly slow plain steers to claude/opencode/pi; only a codex target receiving a `$...` message gets the popup-settle.
-An explicit `session:window` target has no meta, so its harness is unknown and treated as non-codex (the safe fast-path default).
-This is why the validation trigger (`$no-mistakes`) to a codex crewmate now lands on the first Enter instead of biting the popup.
+A `$<skill>` invocation opens a `$`-autocomplete popup, so direct manual entry must allow it to settle before Enter.
+The legacy adapter retained a Codex-scoped 1.2 second settle and retry behavior for regression tests, but canonical `fm-send` refuses before invoking that split text-plus-Enter path.
 
 Directory trust dialog on first run per repo root: "Do you trust the contents of this directory?"
 Accept with Enter only during the spawn-time peek before the brief starts processing.
@@ -190,7 +188,7 @@ The checkpoint is deliberately foreground and bounded so Codex regains control r
 No trust dialog.
 Opencode can auto-upgrade itself in the background and the running TUI can exit mid-task, observed live from 1.15.7 to 1.17.3.
 If a pane shows the exit banner, relaunch with `--continue` to resume the session.
-`--prompt` does not auto-submit alongside `--continue`, so send the next instruction via `fm-send` once the TUI is up.
+`--prompt` does not auto-submit alongside `--continue`, and canonical text steering cannot supply the next instruction until a session-bound route exists; treat relaunch as blocked rather than claiming a follow-up landed.
 
 **Primary-session guard fact (verified 2026-07-08, OpenCode 1.17.6).**
 The firstmate PRIMARY's own `.opencode/plugins/fm-primary-turnend-guard.js` listens for `session.idle`.
@@ -240,7 +238,7 @@ For Grok's supported reasoning-effort values and omission behavior, see the [lau
 | Busy-pane signature | `Ctrl+c:cancel` (the mid-turn cancel hint in grok's keybind bar, shown iff a turn is running; the spinner line is a braille glyph + `<status>… N.Ns` + `[stop]`, e.g. `⠹ Thinking… 1.1s … [stop]`). Idle keybind bar shows only `Shift+Tab:mode │ Ctrl+.:shortcuts`. The ASCII `Ctrl+c:cancel` is the busy regex (avoids locale fragility of matching braille). |
 | Exit command | `Ctrl+Q` double-press within 1000ms (it is a confirmed destructive action). Prints `Resume this session with: grok --resume <session-id>`. `Ctrl+D` is the quit key in VS Code family terminals. NOT `/exit` and NOT `Ctrl+C`. |
 | Interrupt | single `Ctrl+C` (cancels the current turn; the footer shows `Ctrl+c:cancel` mid-turn). `Esc` only moves focus to the scrollback, it does NOT interrupt. |
-| Skill invocation | `/<skill>` (e.g. `/no-mistakes`), same as claude. Opens a slash-autocomplete popup, so a too-fast Enter selects the popup entry instead of sending. For an argument-taking command that first Enter does not submit at all - it expands the selection into an argument-hint placeholder in the composer (e.g. `/compact` -> `/compact compaction instructions`, live-verified), leaving real text still sitting there unsubmitted; a genuine second Enter is required. `fm-send`'s retried Enter lands it on BOTH backends, but only because each backend's own submit-verification correctly recognizes that placeholder-filled text as still-pending - see the incident below. |
+| Skill invocation | `/<skill>` (e.g. `/no-mistakes`), same as claude. Direct manual entry must account for the slash-autocomplete placeholder; the historical split-submit helpers needed a genuine second Enter, but canonical `fm-send` refuses that route. |
 | Autonomy | `--always-approve` (footer shows `· always-approve`); auto-approves every tool execution, verified to run fully unattended. `--permission-mode bypassPermissions` is the stronger equivalent. |
 | Env marker | `GROK_AGENT=1`, set for child/tool processes. grok does NOT set `CLAUDECODE` despite Claude compatibility, so the marker is unambiguous. |
 | Resume | `grok --resume <session-id>` (id printed on exit) or `grok -c` / `--continue` (most recent for the cwd); `--fork-session` branches a new session id. |

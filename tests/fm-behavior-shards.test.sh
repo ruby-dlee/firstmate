@@ -37,8 +37,8 @@ test_checked_in_plan_is_complete_balanced_and_deterministic() {
     || fail "planned shard union did not equal tests/*.test.sh"
   [ "$(cut -f3 "$plan_a" | LC_ALL=C sort | uniq -d | wc -l | tr -d ' ')" -eq 0 ] \
     || fail "a test was assigned to more than one shard"
-  [ "$(awk -F '\t' '{ load[$1] += $2 } END { max=0; for (s in load) if (load[s] > max) max=load[s]; print max }' "$plan_a")" -le 675000 ] \
-    || fail "duration-balanced plan exceeds the measured single-test floor"
+  [ "$(awk -F '\t' '{ load[$1] += $2 } END { max=0; for (s in load) if (load[s] > max) max=load[s]; print max }' "$plan_a")" -le 750000 ] \
+    || fail "duration-balanced plan exceeds the 12.5-minute execution budget"
   pass "checked-in LPT plan is deterministic, complete, disjoint, and duration-balanced"
 }
 
@@ -227,6 +227,19 @@ test_ci_wires_matrix_isolation_timeout_and_union_verification() {
   pass "CI wires eight named isolated shards, a tight timeout, and executed-union verification"
 }
 
+test_account_routing_partition_uses_four_distinct_wrappers() {
+  local index partition suffix wrapper
+  for partition in 1:a 2:b 3:c 4:d; do
+    index=${partition%%:*}
+    suffix=${partition#*:}
+    wrapper="$ROOT/tests/fm-account-routing-$suffix.test.sh"
+    [ -x "$wrapper" ] || fail "account-routing partition $index is missing or not executable"
+    assert_grep "FM_TEST_PART_INDEX=$index FM_TEST_PART_TOTAL=4" "$wrapper" \
+      "account-routing partition $index does not select its unique quarter"
+  done
+  pass "account-routing wrappers select four distinct quarters of the complete suite"
+}
+
 test_teardown_partition_preserves_every_full_suite_case() {
   local tmp definitions listed focused expected_focused wrapper_a wrapper_b
   tmp=$(fm_test_tmproot fm-teardown-partition)
@@ -244,8 +257,8 @@ test_teardown_partition_preserves_every_full_suite_case() {
     in_cases && /^\)$/ { exit }
     in_cases && $1 ~ /^test_[A-Za-z0-9_]+$/ { print $1 }
   ' "$TEARDOWN_SUITE" > "$listed"
-  [ "$(wc -l < "$listed" | tr -d ' ')" -eq 143 ] \
-    || fail "teardown partition does not retain all 143 normal-run cases"
+  [ "$(wc -l < "$listed" | tr -d ' ')" -eq 144 ] \
+    || fail "teardown partition does not retain all 144 normal-run cases"
   [ "$(LC_ALL=C sort "$listed" | uniq -d | wc -l | tr -d ' ')" -eq 0 ] \
     || fail "teardown partition lists a normal-run case more than once"
   comm -13 "$definitions" <(LC_ALL=C sort "$listed") > "$tmp/undefined.txt"
@@ -261,15 +274,15 @@ test_teardown_partition_preserves_every_full_suite_case() {
     || fail "teardown partition dropped or absorbed a focused-only case"
   [ "$(awk 'NR % 2 == 1 { count++ } END { print count + 0 }' "$listed")" -eq 72 ] \
     || fail "teardown partition A does not own exactly 72 cases"
-  [ "$(awk 'NR % 2 == 0 { count++ } END { print count + 0 }' "$listed")" -eq 71 ] \
-    || fail "teardown partition B does not own exactly 71 cases"
+  [ "$(awk 'NR % 2 == 0 { count++ } END { print count + 0 }' "$listed")" -eq 72 ] \
+    || fail "teardown partition B does not own exactly 72 cases"
   assert_grep 'FM_TEST_PART_INDEX=1 FM_TEST_PART_TOTAL=2' "$wrapper_a" \
     "teardown wrapper A does not select partition 1/2"
   assert_grep 'FM_TEST_PART_INDEX=2 FM_TEST_PART_TOTAL=2' "$wrapper_b" \
     "teardown wrapper B does not select partition 2/2"
   [ ! -e "$ROOT/tests/fm-teardown.test.sh" ] \
     || fail "the unsplit teardown test remains in the behavior inventory"
-  pass "teardown wrappers preserve all 143 normal cases and three focused-only cases"
+  pass "teardown wrappers preserve all 144 normal cases and three focused-only cases"
 }
 
 test_checked_in_plan_is_complete_balanced_and_deterministic
@@ -278,4 +291,5 @@ test_runner_executes_every_assigned_test_and_records_failures
 test_record_refreshes_complete_fixture_timings
 test_post_run_guard_requires_the_exact_executed_union
 test_ci_wires_matrix_isolation_timeout_and_union_verification
+test_account_routing_partition_uses_four_distinct_wrappers
 test_teardown_partition_preserves_every_full_suite_case

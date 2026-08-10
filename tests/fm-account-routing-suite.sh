@@ -11,12 +11,16 @@ export FM_ORCA_TEST_AUTHORITY_CAPABILITIES=verified-v1
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$ROOT/bin/fm-account-routing-lib.sh"
+
 SPAWN="$ROOT/bin/fm-spawn.sh"
 SEND="$ROOT/bin/fm-send.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 SESSION_SYNC="$ROOT/bin/fm-account-session-sync.sh"
 CONTINUATION="$ROOT/bin/fm-account-continuation.sh"
 fm_test_tmproot_into TMP_ROOT fm-account-routing-tests
+fm_test_enable_codex_runtime_publisher "$TMP_ROOT"
 
 assert_not_grep() {
   local pattern=$1 file=$2 label=$3
@@ -337,9 +341,10 @@ for arg in "$@"; do
 done
 case "$*" in
   '--format json profile list')
-    root=${FM_ACCOUNT_DIRECTORY_ROOT:?}
-    printf '{"profiles":[{"provider":"%s","home":"%s/%s/account-1","pools":["%s-crew"],"enabled":true,"safety_policy":"worker"}]}\n' \
-      "$provider" "$root" "$provider" "$provider"
+    root=${FM_ACCOUNT_DIRECTORY_ROOT:-__FM_FAKE_FIXTURE_DIR__/accounts}
+    mkdir -p "$root/$provider/account-1"
+    printf '{"profiles":[{"id":"%s","provider":"%s","home":"%s/%s/account-1","pools":["%s-crew"],"enabled":true,"safety_policy":"worker"}]}\n' \
+      "$profile" "$provider" "$root" "$provider" "$provider"
     ;;
   '--format json contract')
     [ -z "${FM_FAKE_AF_CONTRACT_SLEEP:-}" ] || sleep "$FM_FAKE_AF_CONTRACT_SLEEP"
@@ -518,6 +523,10 @@ read_case() {
   IFS='|' read -r CASE_DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
 $1
 EOF
+  # Keep synthetic Gate A rollouts inside the isolated case that owns them.
+  CODEX_HOME="$CASE_DIR/codex-runtime"
+  mkdir -p "$CODEX_HOME"
+  export CODEX_HOME
   AF_LOG="$CASE_DIR/agent-fleet.log"
   TMUX_LOG="$CASE_DIR/tmux.log"
   TREEHOUSE_LOG="$CASE_DIR/treehouse.log"
@@ -1846,7 +1855,8 @@ test_session_sync_bounds_agent_fleet_queries() {
     "session timeout allowed the blocking query to complete"
   assert_not_grep '^provider_session_id=' "$HOME_DIR/state/$id.meta" \
     "session query timeout published a result from the terminated command"
-  assert_absent "$HOME_DIR/state/.account-meta-$id.lock" "timed-out session query retained the metadata lock"
+  fm_test_assert_account_lock_absent "$HOME_DIR/state" "$id" account-meta \
+    "timed-out session query retained the metadata lock"
   [ -n "$out" ] || true
   pass "session synchronization bounds every Agent Fleet query"
 }
@@ -2032,7 +2042,8 @@ test_session_sync_all_signals_terminate_worker_groups() {
   done
   child_state=$(ps -p "$child_pid" -o stat= 2>/dev/null | tr -d '[:space:]')
   case "$child_state" in ''|Z*) ;; *) fail "sync sweep left its Agent Fleet descendant running (state $child_state)" ;; esac
-  assert_absent "$HOME_DIR/state/.account-meta-session-sync-all.lock" "signaled sync sweep retained its sweep lock"
+  fm_test_assert_account_lock_absent "$HOME_DIR/state" session-sync-all account-meta \
+    "signaled sync sweep retained its sweep lock"
   pass "sync-all signals terminate and reap complete worker groups"
 }
 
@@ -3201,17 +3212,19 @@ test_enforced_orca_is_rejected_before_owned_resource_creation() {
 }
 
 test_cross_profile_continuation_for_harness() {
-  local harness=$1 old_profile=$2 new_profile=$3 provider=$4 id rec old_task new_task new_attempt packet canonical out status launch source_model
+  local harness=$1 old_profile=$2 new_profile=$3 provider=$4 id rec old_task new_task new_attempt packet canonical out status launch source_model source_effort
   id="account-continue-$harness-z21"
   rec=$(make_case "continue-$harness" "$harness" "$id")
   read_case "$rec"
   if [ "$harness" = claude ]; then
     source_model=claude-opus-5
+    source_effort=high
   else
-    source_model="$harness-source-model"
+    source_model=gpt-5.6-sol
+    source_effort=xhigh
   fi
   out=$(FM_FAKE_AF_PROVIDER="$provider" FM_FAKE_AF_PROFILE="$old_profile" FM_FAKE_AF_POOL="$harness-crew" \
-    run_spawn "$id" "$PROJ_DIR" --account-pool "$harness-crew" --model "$source_model" --effort high)
+    run_spawn "$id" "$PROJ_DIR" --account-pool "$harness-crew" --model "$source_model" --effort "$source_effort")
   status=$?
   [ "$status" -eq 0 ] || fail "$harness initial managed spawn failed: $out"
   old_task=$(meta_account_task "$id")
@@ -3301,7 +3314,7 @@ PY
   assert_not_contains "$launch" 'replacement launch generation' \
     "$harness launch consumed replacement bytes from its generation pathname"
   assert_contains "$launch" "$source_model" "$harness same-provider continuation lost its inherited model"
-  assert_regex '^effort=high$' "$HOME_DIR/state/$id.meta" "$harness same-provider continuation lost its inherited effort"
+  assert_regex "^effort=$source_effort$" "$HOME_DIR/state/$id.meta" "$harness same-provider continuation lost its inherited effort"
   assert_grep "lease release --task $old_task --force" "$AF_LOG" "$harness continuation did not release its predecessor after binding"
   assert_grep "session remove --task $old_task" "$AF_LOG" "$harness continuation did not remove its predecessor mapping"
   assert_grep "agent_fleet_task=$new_task" "$HOME_DIR/data/$id/account-attempts.md" "$harness continuation lineage lost the new attempt"
@@ -3309,22 +3322,26 @@ PY
 }
 
 test_cross_provider_continuation_uses_target_default_pool() {
-  local source=$1 target=$2 id rec old_task out status source_model target_model launch
+  local source=$1 target=$2 id rec old_task out status source_model source_effort target_model target_effort launch
   id="account-continue-$source-to-$target-z21a"
   rec=$(make_case "continue-$source-to-$target" "$source" "$id")
   read_case "$rec"
   if [ "$source" = claude ]; then
     source_model=claude-opus-5
+    source_effort=high
   else
-    source_model="$source-source-model"
+    source_model=gpt-5.6-sol
+    source_effort=xhigh
   fi
   if [ "$target" = claude ]; then
     target_model=claude-opus-5
+    target_effort=default
   else
-    target_model=default
+    target_model=gpt-5.6-sol
+    target_effort=xhigh
   fi
   out=$(FM_FAKE_AF_PROVIDER="$source" FM_FAKE_AF_PROFILE="$source-2" FM_FAKE_AF_POOL="$source-crew" \
-    run_spawn "$id" "$PROJ_DIR" --account-pool "$source-crew" --model "$source_model" --effort high)
+    run_spawn "$id" "$PROJ_DIR" --account-pool "$source-crew" --model "$source_model" --effort "$source_effort")
   status=$?
   [ "$status" -eq 0 ] || fail "$source initial managed spawn failed: $out"
   old_task=$(meta_account_task "$id")
@@ -3342,7 +3359,7 @@ test_cross_provider_continuation_uses_target_default_pool() {
   launch=$(cat "$LAUNCH_LOG")
   assert_not_contains "$launch" "$source_model" "$source-to-$target continuation inherited the source provider's model"
   assert_regex "^model=$target_model$" "$HOME_DIR/state/$id.meta" "$source-to-$target continuation did not resolve the target model"
-  assert_regex '^effort=default$' "$HOME_DIR/state/$id.meta" "$source-to-$target continuation did not restore the target effort default"
+  assert_regex "^effort=$target_effort$" "$HOME_DIR/state/$id.meta" "$source-to-$target continuation did not resolve target effort policy"
   assert_grep "predecessor=$old_task" "$HOME_DIR/data/$id/account-attempts.md" \
     "$source-to-$target continuation lost predecessor lineage"
   pass "$source-to-$target continuation resolves the target provider pool"
@@ -3568,6 +3585,37 @@ test_live_secondmate_recovery_precedes_home_convergence() {
   pass "managed secondmate recovery validates liveness before home convergence"
 }
 
+test_secondmate_provider_change_reloads_complete_profile() {
+  local id rec sm out status launch
+  id=account-secondmate-profile-recovery-z21f
+  rec=$(make_case secondmate-profile-recovery codex)
+  read_case "$rec"
+  sm="$CASE_DIR/secondmate-home"
+  make_seeded_secondmate_home "$sm" "$id"
+  printf 'enforce\n' > "$HOME_DIR/config/account-routing-mode"
+  out=$(FM_FAKE_AF_PROVIDER=codex FM_FAKE_AF_PROFILE=codex-2 FM_FAKE_AF_POOL=codex-crew \
+    run_spawn "$id" "$sm" --secondmate --account-pool codex-crew)
+  status=$?
+  [ "$status" -eq 0 ] || fail "secondmate profile recovery precondition failed: $out"
+  assert_grep "runtime_home=$FAKEBIN_DIR/accounts/codex/account-1" "$HOME_DIR/state/$id.meta" \
+    "managed Codex secondmate did not persist its Agent Fleet runtime home"
+  rm -f "$CASE_DIR/endpoint-live"
+  printf 'claude claude-opus-5 high\n' > "$HOME_DIR/config/secondmate-harness"
+  clear_case_logs
+
+  out=$(FM_FAKE_AF_PROVIDER=claude FM_FAKE_AF_PROFILE=claude-3 FM_FAKE_AF_POOL=explicit \
+    run_spawn "$id" --continue-account --account-profile claude-3)
+  status=$?
+  [ "$status" -eq 0 ] || fail "secondmate provider-change recovery failed: $out"
+  assert_grep 'harness=claude' "$HOME_DIR/state/$id.meta" "secondmate recovery retained the old provider"
+  assert_grep 'model=claude-opus-5' "$HOME_DIR/state/$id.meta" "secondmate recovery lost the current model pin"
+  assert_grep 'effort=high' "$HOME_DIR/state/$id.meta" "secondmate recovery lost the current effort pin"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" 'claude-opus-5' "secondmate recovery launched target-provider defaults"
+  assert_contains "$launch" '--effort' "secondmate recovery omitted the current effort pin"
+  pass "secondmate recovery reloads the current provider, model, and effort profile"
+}
+
 test_continuation_fails_closed_without_original_brief() {
   local id rec out status
   id=account-continue-nobrief-z22
@@ -3645,28 +3693,33 @@ test_session_sync_cannot_recreate_metadata_after_teardown() {
   expect_code 0 "$teardown_rc" "session sync race teardown should succeed while holding the metadata lock"
   [ "$sync_rc" -ne 0 ] || fail "late SessionStart sync unexpectedly succeeded after teardown"
   assert_absent "$HOME_DIR/state/$id.meta" "late SessionStart sync recreated metadata after teardown"
-  assert_absent "$HOME_DIR/state/.account-meta-$id.lock" "session sync race left the metadata lock behind"
+  fm_test_assert_account_lock_absent "$HOME_DIR/state" "$id" account-meta \
+    "session sync race left the metadata lock behind"
   pass "session synchronization cannot recreate metadata after teardown"
 }
 
-test_managed_steering_audit_failure_does_not_reclassify_delivery() {
+test_managed_steering_refuses_before_split_transport() {
   local id rec out status
   id=account-steering-audit-z24
   rec=$(make_case steering-audit claude "$id")
   read_case "$rec"
   run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "steering audit precondition spawn failed"
-  mkdir "$HOME_DIR/data/$id/steering.md"
   clear_case_logs
   touch "$CASE_DIR/endpoint-live"
 
-  out=$(run_send "$id" "This delivered steer must not be retried." 2>&1)
+  out=$(run_send "$id" "This refused steer must never reach pane input." 2>&1)
   status=$?
-  [ "$status" -eq 0 ] || fail "unconfirmed steering delivery returned an unsafe retry signal: $out"
-  assert_contains "$out" "could not be confirmed" "audit failure warning overstated delivery truth"
-  assert_grep 'This delivered steer must not be retried' "$LAUNCH_LOG" "steering text was not submitted before confirmation failed"
-  assert_grep 'This delivered steer must not be retried' "$HOME_DIR/data/$id/steering-unconfirmed.md" \
-    "unconfirmed steering was not durably recorded for reconciliation"
-  pass "unconfirmed steering is durably spooled without returning a retry signal"
+  [ "$status" -ne 0 ] || fail "split steering transport returned success without an atomic receipt: $out"
+  assert_contains "$out" "no atomic agent-session-bound text steering operation" \
+    "managed steering did not name the Gate B transport refusal"
+  assert_contains "$out" "text not sent" "managed steering overstated delivery truth"
+  assert_no_grep 'This refused steer must never reach pane input.' "$LAUNCH_LOG" \
+    "managed steering typed text before obtaining an atomic receipt"
+  assert_grep 'not-submitted' "$HOME_DIR/data/$id/steering-journal.md" \
+    "managed steering did not durably close its pending intent as not submitted"
+  assert_absent "$HOME_DIR/data/$id/steering-unconfirmed.md" \
+    "a pre-input refusal was misclassified as an unconfirmed submission"
+  pass "managed steering records not-submitted and refuses before split pane input"
 }
 
 test_managed_tmux_identity_survives_window_rename() {
@@ -5195,11 +5248,12 @@ test_continuation_rejects_metadata_ancestor_swap() {
   pass "continuation pins metadata ancestors before parsing task identity"
 }
 
-test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
+test_account_metadata_lock_serializes_exact_owners_without_overlap() {
   local case_dir state lock workers pids pid rc owner_lines
   case_dir="$TMP_ROOT/account-lock"
   state="$case_dir/state"
-  lock="$state/.account-meta-lock-task.lock"
+  mkdir -p "$state"
+  lock=$(fm_account_lock_identity_claim "$state" lock-task account-meta) || fail "could not resolve bounded metadata lock"
   mkdir -p "$lock"
 
   set +e
@@ -5208,21 +5262,16 @@ test_account_metadata_lock_reclaims_orphans_without_overlapping_owners() {
     > "$case_dir/young-stdout" 2> "$case_dir/young-stderr"
   rc=$?
   set -e
-  [ "$rc" -ne 0 ] || fail "young ownerless metadata lock was reclaimed before its grace"
-  assert_present "$lock" "young ownerless metadata lock was deleted"
-  assert_present "$lock/.ownerless-since" "ownerless metadata lock did not persist its grace baseline"
-
-  printf '946684800\n' > "$lock/.ownerless-since"
-  touch -t 200001010000 "$lock"
-  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
-    bash -c '. "$1"; held=$(fm_account_meta_lock_acquire "$2" lock-task) || exit; fm_account_meta_lock_release "$held"' \
-    _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" || fail "old ownerless metadata lock was not reclaimed"
+  [ "$rc" -ne 0 ] || fail "ownerless bounded metadata lock was reclaimed without exact ownership"
+  assert_present "$lock" "ownerless bounded metadata lock was deleted"
+  assert_absent "$lock/.ownerless-since" "ownerless metadata lock was assigned speculative age evidence"
+  rm -rf "$lock"
 
   owner_lines=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 bash -c '
     . "$1"
     held=$(fm_account_meta_lock_acquire "$2" lock-task)
-    [ -f "$held" ] || exit 71
-    wc -l < "$held" | tr -d "[:space:]"
+    [ -d "$held" ] && [ -f "$held/owner" ] || exit 71
+    wc -l < "$held/owner" | tr -d "[:space:]"
     fm_account_meta_lock_release "$held"
   ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$state") || fail "metadata lock ownership was not atomically published"
   [ "$owner_lines" -eq 2 ] || fail "published metadata lock did not contain complete ownership"
@@ -5239,13 +5288,19 @@ set -eu
 state=$2
 critical=$3
 overlap=$4
-held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=5 fm_account_meta_lock_acquire "$state" lock-task)
+held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=30 fm_account_meta_lock_acquire "$state" lock-task) || {
+  printf 'worker %s failed to acquire metadata lock\n' "$$" >&2
+  exit 81
+}
 if ! mkdir "$critical" 2>/dev/null; then
   printf 'overlap\n' >> "$overlap"
 fi
 sleep 0.05
 rmdir "$critical" 2>/dev/null || true
-fm_account_meta_lock_release "$held"
+fm_account_meta_lock_release "$held" || {
+  printf 'worker %s failed to release metadata lock\n' "$$" >&2
+  exit 82
+}
 SH
   chmod +x "$workers"
   pids=
@@ -5271,11 +5326,17 @@ SH
   mkdir -p "$lock/.reclaiming"
   printf '1\nstale-reclaimer\n' > "$lock/.reclaiming/owner"
   touch -t 200001010000 "$lock" "$lock/.reclaiming"
-  FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 \
     bash -c '. "$1"; held=$(fm_account_meta_lock_acquire "$2" lock-task) || exit $?; fm_account_meta_lock_release "$held"' \
-    _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" || fail "abandoned metadata reclaim owner blocked acquisition"
-  assert_absent "$lock" "metadata lock retained an abandoned reclaim owner"
-  pass "metadata locks reclaim abandoned directories without deleting new owners"
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" >/dev/null 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  [ "$rc" -ne 0 ] || fail "ownerless bounded lock trusted an abandoned nested reclaim owner"
+  assert_present "$lock" "ownerless bounded lock deleted ambiguous nested reclaim state"
+  rm -rf "$lock"
+  pass "metadata locks preserve ambiguous carriers and serialize exact owners"
 }
 
 test_account_locks_never_reclaim_on_indeterminate_process_probe() {
@@ -5312,9 +5373,9 @@ SH
     fi
     held=$($acquire "$state" "indeterminate-$kind") \
       || fail "could not acquire $kind lock fixture"
-    owner_pid=$(sed -n '1p' "$held")
+    owner_pid=$(sed -n '1p' "$held/owner")
     inode_before=$(fm_account_path_inode "$held")
-    owner_before=$(cat "$held")
+    owner_before=$(cat "$held/owner")
     if FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
       FM_TEST_ACCOUNT_PS_BIN="$fake_ps" FM_TEST_ACCOUNT_PS_TARGET="$owner_pid" \
       FM_TEST_ACCOUNT_PS_ENV_LOG="$ps_env_log" \
@@ -5336,7 +5397,7 @@ SH
     fi
     [ "$status" -ne 0 ] || fail "$kind lock was stolen after an indeterminate process probe"
     inode_after=$(fm_account_path_inode "$held")
-    owner_after=$(cat "$held")
+    owner_after=$(cat "$held/owner")
     [ "$inode_after" = "$inode_before" ] && [ "$owner_after" = "$owner_before" ] \
       || fail "$kind lock identity changed after an indeterminate process probe"
     fm_account_meta_lock_release "$held" || fail "could not release preserved $kind lock"
@@ -5345,6 +5406,302 @@ SH
   [ "$(sort -u "$ps_env_log")" = '|||' ] \
     || fail "process probes inherited loader or language startup injection: $(cat "$ps_env_log")"
   pass "metadata and lifecycle locks preserve live owners when pinned ps is indeterminate"
+}
+
+test_account_locks_support_maximum_task_identity() {
+  local case_dir state task kind name acquire lock legacy legacy_leaf lock_leaf held templates template artifact
+  local digest identity_owner identity_before identity_saved sentinel start parent_identity status transient legacy_task legacy_contender
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  case_dir="$TMP_ROOT/account-lock-maximum-task"
+  state="$case_dir/state"
+  task=$(printf '%0232d' 0)
+  mkdir -p "$state"
+  [ "${#task}" -eq 232 ] || fail "maximum account-lock identity fixture has the wrong length"
+  digest=$(printf '%064d' 0)
+  templates="$FM_ACCOUNT_LOCK_OWNER_TEMPLATE
+$FM_ACCOUNT_LOCK_IDENTITY_TEMPLATE
+$FM_ACCOUNT_LOCK_IDENTITY_PREFIX$digest
+$FM_ACCOUNT_LOCK_IDENTITY_MUTATION_PREFIX$digest
+$FM_ACCOUNT_LOCK_IDENTITY_MUTATION_PREFIX$digest.candidate.XXXXXX
+$FM_ACCOUNT_LOCK_PATH_PREFIX$digest
+$FM_ACCOUNT_LOCK_GENERATION_TEMPLATE
+$FM_ACCOUNT_LOCK_RECLAIM_TEMPLATE
+$FM_ACCOUNT_LOCK_RELEASE_TEMPLATE
+$FM_ACCOUNT_LOCK_HANDOFF_TEMPLATE
+$FM_ACCOUNT_LOCK_COMPAT_TEMPLATE
+$FM_ACCOUNT_LOCK_RECLAIMING_PREFIX$digest
+$FM_ACCOUNT_LOCK_RECLAIMING_PREFIX$digest.candidate.XXXXXX
+$FM_ACCOUNT_LOCK_RECLAIMING_PREFIX$digest.stale.XXXXXX
+.reclaiming.candidate.XXXXXX
+.reclaiming.stale.XXXXXX
+.ownerless-since.XXXXXX"
+  while IFS= read -r template; do
+    [ -n "$template" ] || continue
+    artifact=${template%XXXXXX}ABCDEF
+    [ "${#artifact}" -le 255 ] || fail "account lock artifact exceeds the filesystem component budget: $artifact"
+    case "$artifact" in *"$task"*) fail "account lock artifact embeds the durable task identity" ;; esac
+  done <<EOF
+$templates
+EOF
+  for kind in meta lifecycle; do
+    case "$kind" in
+      meta) name=account-meta; acquire=fm_account_meta_lock_acquire ;;
+      lifecycle) name=account-lifecycle; acquire=fm_account_lifecycle_lock_acquire ;;
+    esac
+    lock=$(fm_account_lock_path "$state" "$task" "$name") || fail "maximum $kind lock path was unavailable"
+    legacy=$(fm_account_lock_legacy_path "$state" "$task" "$name") || fail "maximum $kind legacy path was unavailable"
+    lock_leaf=${lock##*/}
+    legacy_leaf=${legacy##*/}
+    [ "${#lock_leaf}" -le 255 ] || fail "maximum $kind lock exceeds the filesystem component budget"
+    held=$($acquire "$state" "$task") || fail "ordinary maximum $kind lock acquisition failed"
+    [ "$held" = "$lock" ] || fail "maximum $kind lock returned the wrong custody path"
+    [ -d "$held" ] && [ ! -L "$held" ] || fail "maximum $kind lock was not a safe bounded directory"
+    fm_account_lock_matches "$state" "$task" "$name" "$held" || fail "maximum $kind lock lost exact task ownership"
+    if [ "${#legacy_leaf}" -le 255 ]; then
+      [ -f "$legacy" ] && [ ! -L "$legacy" ] || fail "maximum $kind bounded custody did not hold its raw compatibility fence"
+      [ "$(fm_account_path_inode "$legacy")" = "$(fm_account_path_inode "$held/owner")" ] \
+        || fail "maximum $kind raw compatibility fence did not share exact ownership"
+      legacy_contender="$case_dir/$kind-legacy-contender"
+      printf '1\nlegacy-contender\n' > "$legacy_contender"
+      if ln "$legacy_contender" "$legacy" 2>/dev/null; then
+        fail "maximum $kind bounded custody admitted a simultaneous raw owner"
+      fi
+      rm -f "$legacy_contender"
+    fi
+    fm_account_meta_lock_release "$held" || fail "ordinary maximum $kind lock release failed"
+    assert_absent "$legacy" "maximum $kind release retained its raw compatibility fence"
+    if [ "${#legacy_leaf}" -le 255 ]; then
+      start=$(fm_account_process_start_time "$$") || fail "maximum $kind legacy fixture could not read its process identity"
+      printf '%s\n%s\n' "$$" "$start" > "$legacy"
+      if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=0 \
+        bash -c '. "$1"; "$2" "$3" "$4"' _ "$ROOT/bin/fm-account-routing-lib.sh" "$acquire" "$state" "$task" \
+        >/dev/null 2>&1; then
+        fail "maximum $kind acquisition bypassed a live exact legacy owner"
+      fi
+      fm_account_meta_lock_release "$legacy" || fail "maximum $kind live legacy owner could not release custody"
+      printf '1\nstale-owner\n' > "$legacy"
+      touch -t 200001010000 "$legacy"
+      held=$(FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
+        FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=2 \
+        $acquire "$state" "$task") || fail "maximum $kind legacy file-owner migration failed"
+      [ "$held" = "$lock" ] || fail "maximum $kind legacy migration did not enter bounded custody"
+      [ "$(fm_account_path_inode "$legacy")" = "$(fm_account_path_inode "$held/owner")" ] \
+        || fail "maximum $kind migration did not retain an exact raw compatibility fence"
+      fm_account_meta_lock_release "$held" || fail "maximum $kind release after legacy migration failed"
+      assert_absent "$legacy" "maximum $kind release after migration retained the raw compatibility fence"
+    fi
+    mkdir -p "$lock"
+    printf '1\nstale-owner\n' > "$lock/owner"
+    touch -t 200001010000 "$lock" "$lock/owner"
+    held=$(FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 \
+      FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=2 \
+      $acquire "$state" "$task") || fail "maximum $kind directory-owner reclaim failed"
+    fm_account_meta_lock_release "$held" || fail "maximum $kind lock release after directory-owner reclaim failed"
+    mkdir -p "$lock"
+    start=$(fm_account_process_start_time "$$") || fail "maximum $kind release fixture could not read its process identity"
+    printf '%s\n%s\n' "$$" "$start" > "$lock/owner"
+    fm_account_meta_lock_release "$lock" || fail "maximum $kind directory release failed"
+    assert_absent "$lock" "maximum $kind route retained its durable lock"
+    if [ "$kind" = lifecycle ]; then
+      [ "${#legacy_leaf}" -gt 255 ] || fail "maximum lifecycle fixture did not cross the raw lock filename limit"
+      held=$($acquire "$state" "$task") || fail "maximum lifecycle handoff could not acquire parent custody"
+      parent_identity=$(fm_account_lifecycle_lock_identity "$held") || fail "maximum lifecycle handoff could not read parent custody"
+      FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 bash -c '
+        . "$1"
+        fm_account_lifecycle_lock_handoff "$2" "$3" || exit 1
+        fm_account_lifecycle_lock_release "$2"
+      ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$held" "$parent_identity" \
+        || fail "maximum lifecycle inherited handoff failed"
+      assert_absent "$held" "maximum lifecycle inherited handoff did not release child custody"
+    fi
+  done
+  legacy_task='legacy-handoff-task'
+  legacy=$(fm_account_lock_legacy_path "$state" "$legacy_task" account-lifecycle) \
+    || fail "legacy lifecycle handoff fixture lost its raw path"
+  start=$(fm_account_process_start_time "$$") || fail "legacy lifecycle handoff fixture could not read parent identity"
+  printf '%s\n%s\n' "$$" "$start" > "$legacy"
+  parent_identity=$(fm_account_lifecycle_lock_identity "$legacy") \
+    || fail "legacy lifecycle handoff fixture could not read parent custody"
+  bash -c '
+    . "$1"
+    fm_account_lifecycle_lock_handoff "$2" "$3" || exit 1
+    fm_account_lifecycle_lock_release "$2"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$legacy" "$parent_identity" \
+    || fail "legacy raw lifecycle handoff compatibility failed"
+  assert_absent "$legacy" "legacy raw lifecycle handoff retained custody"
+  lock=$(fm_account_lock_path "$state" "$task" account-meta) || fail "maximum identity substitution fixture lost its lock path"
+  digest=${lock##*/}
+  digest=${digest#"$FM_ACCOUNT_LOCK_PATH_PREFIX"}
+  identity_owner="$state/$FM_ACCOUNT_LOCK_IDENTITY_PREFIX$digest"
+  identity_before=$(cat "$identity_owner")
+  printf 'name=account-meta\ntask=other-task' > "$identity_owner"
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "maximum lock accepted a substituted exact-owner record"
+  [ "$(cat "$identity_owner")" = $'name=account-meta\ntask=other-task' ] \
+    || fail "maximum lock rewrote an adversarial exact-owner record"
+  printf '%s' "$identity_before" > "$identity_owner"
+  identity_saved="$case_dir/identity.saved"
+  sentinel="$case_dir/identity.sentinel"
+  printf 'preserve-me\n' > "$sentinel"
+  mv "$identity_owner" "$identity_saved"
+  ln -s "$sentinel" "$identity_owner"
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "maximum lock followed a symlinked exact-owner record"
+  [ "$(cat "$sentinel")" = preserve-me ] || fail "maximum lock changed a symlinked exact-owner target"
+  [ -L "$identity_owner" ] || fail "maximum lock replaced a symlinked exact-owner record"
+  rm "$identity_owner"
+  mv "$identity_saved" "$identity_owner"
+  transient=$(find "$state" -maxdepth 1 \( -name '.account-lock-owner.*' -o -name '.account-lock-identity.*' \
+    -o -name '.account-lock-generation.*' -o -name '.account-lock-reclaim.*' \
+    -o -name '.account-lock-release.*' -o -name '.account-lock-handoff.*' -o -name '.account-lock-compat.*' \
+    -o -name "$FM_ACCOUNT_LOCK_PATH_PREFIX*" \) -print -quit)
+  [ -z "$transient" ] || fail "maximum account lock route retained a transient custody artifact: $transient"
+  pass "account locks preserve maximum task identities across acquire, reclaim, and release"
+}
+
+test_account_lock_deadline_bounds_nested_custody() {
+  local case_dir state task lock mutation held start before after elapsed status lock_inode mutation_inode
+  local sequence_state sequence_task sequence_lock sequence_mutation sequence_observed mutation_pid attempts
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  case_dir="$TMP_ROOT/account-lock-deadline"
+  state="$case_dir/state"
+  task=$(printf '%0232d' 0)
+  mkdir -p "$state"
+
+  before=$(fm_account_system_perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+    -e 'printf "%.6f", clock_gettime(CLOCK_MONOTONIC)') \
+    || fail "account lock creation deadline fixture could not read its monotonic start"
+  held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task") \
+    || fail "zero-budget account lock creation refused an uncontended immediate attempt"
+  after=$(fm_account_system_perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+    -e 'printf "%.6f", clock_gettime(CLOCK_MONOTONIC)') \
+    || fail "account lock creation deadline fixture could not read its monotonic end"
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
+  elapsed=$(fm_account_system_perl -e 'printf "%.3f", $ARGV[1] - $ARGV[0]' "$before" "$after") \
+    || fail "account lock creation deadline fixture could not calculate monotonic elapsed time"
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
+  fm_account_system_perl -e 'exit !($ARGV[0] < 4)' "$elapsed" \
+    || fail "uncontended account lock creation exceeded its elapsed bound: ${elapsed}s"
+  fm_account_meta_lock_release "$held" || fail "account lock creation deadline fixture could not release custody"
+
+  sequence_state="$case_dir/sequence-state"
+  sequence_task=$(printf '%0232d' 1)
+  mkdir -p "$sequence_state"
+  sequence_lock=$(fm_account_lock_path "$sequence_state" "$sequence_task" account-lifecycle) \
+    || fail "cross-phase deadline fixture could not resolve its bounded lock"
+  sequence_mutation=$(fm_account_lock_identity_mutation_path "$sequence_lock") \
+    || fail "cross-phase deadline fixture could not resolve its mutation boundary"
+  sequence_observed="$case_dir/sequence-mutation-observed"
+  mkdir "$sequence_lock"
+  start=$(fm_account_process_start_time "$$") \
+    || fail "cross-phase deadline fixture could not read its live lock owner"
+  printf '%s\n%s\n' "$$" "$start" > "$sequence_lock/owner"
+  bash -c '
+    . "$1"
+    deadline=$(fm_account_lock_deadline_from_wait 20) || exit 71
+    mutation=$(fm_account_lock_identity_mutation_acquire "$2" "$deadline") || exit 72
+    : > "$3" || exit 73
+    fm_account_system_exec "$FM_ACCOUNT_SYSTEM_SLEEP_BIN" 8 || exit 74
+    fm_account_lock_identity_mutation_release "$mutation"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$sequence_lock" "$sequence_observed" &
+  mutation_pid=$!
+  attempts=0
+  while [ ! -f "$sequence_observed" ] && [ "$attempts" -lt 400 ]; do
+    attempts=$((attempts + 1))
+    sleep 0.05
+  done
+  [ -f "$sequence_observed" ] || fail "cross-phase deadline fixture did not acquire mutation custody"
+  before=$(fm_account_system_perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+    -e 'printf "%.6f", clock_gettime(CLOCK_MONOTONIC)') \
+    || fail "cross-phase deadline fixture could not read its monotonic start"
+  if FM_ACCOUNT_LIFECYCLE_LOCK_WAIT_SECONDS=12 \
+    fm_account_lifecycle_lock_acquire "$sequence_state" "$sequence_task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  after=$(fm_account_system_perl -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+    -e 'printf "%.6f", clock_gettime(CLOCK_MONOTONIC)') \
+    || fail "cross-phase deadline fixture could not read its monotonic end"
+  if wait "$mutation_pid"; then :; else fail "cross-phase deadline fixture could not release mutation custody"; fi
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
+  elapsed=$(fm_account_system_perl -e 'printf "%.3f", $ARGV[1] - $ARGV[0]' "$before" "$after") \
+    || fail "cross-phase deadline fixture could not calculate monotonic elapsed time"
+  [ "$status" -ne 0 ] || fail "cross-phase deadline fixture bypassed a live bounded owner"
+  fm_account_lock_identity_validate "$sequence_lock" \
+    || fail "cross-phase deadline fixture did not publish the formerly absent exact claim"
+  [ "$FM_ACCOUNT_LOCK_IDENTITY_NAME" = account-lifecycle ] \
+    && [ "$FM_ACCOUNT_LOCK_IDENTITY_TASK" = "$sequence_task" ] \
+    || fail "cross-phase deadline fixture published the wrong exact claim"
+  # shellcheck disable=SC2016 # The single-quoted Perl program must preserve Perl's variables.
+  fm_account_system_perl -e 'exit !(($ARGV[0] >= 7.5) && ($ARGV[0] < 17))' "$elapsed" \
+    || fail "claim waiting reset the remaining carrier deadline: ${elapsed}s"
+  [ ! -e "$sequence_mutation" ] && [ ! -L "$sequence_mutation" ] \
+    || fail "cross-phase deadline fixture retained mutation custody"
+  fm_account_lifecycle_lock_release "$sequence_lock" \
+    || fail "cross-phase deadline fixture could not release its live bounded owner"
+
+  lock=$(fm_account_lock_path "$state" "$task" account-meta) \
+    || fail "account lock deadline fixture could not resolve its bounded lock"
+  mutation=$(fm_account_lock_identity_mutation_path "$lock") \
+    || fail "account lock deadline fixture could not resolve its mutation boundary"
+  mkdir "$lock"
+  printf '1\nstale-owner\n' > "$lock/owner"
+  start=$(fm_account_process_start_time "$$") \
+    || fail "account lock deadline fixture could not read its live owner identity"
+  printf '%s\n%s\n' "$$" "$start" > "$mutation"
+  lock_inode=$(fm_account_path_inode "$lock") || fail "account lock deadline fixture could not pin its lock"
+  mutation_inode=$(fm_account_path_inode "$mutation") \
+    || fail "account lock deadline fixture could not pin its mutation boundary"
+  before=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "zero-budget account lock fixture could not read its start time"
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  after=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "zero-budget account lock fixture could not read its end time"
+  elapsed=$((after - before))
+  [ "$status" -ne 0 ] || fail "zero-budget account lock acquisition bypassed live mutation custody"
+  [ "$elapsed" -lt 4 ] || fail "zero-budget account lock acquisition incurred a nested wait: ${elapsed}s"
+  [ "$(fm_account_path_inode "$lock")" = "$lock_inode" ] \
+    || fail "zero-budget account lock acquisition changed dead lock state behind live mutation custody"
+  [ "$(fm_account_path_inode "$mutation")" = "$mutation_inode" ] \
+    || fail "zero-budget account lock acquisition changed live mutation custody"
+
+  before=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "live-mutation account lock fixture could not read its start time"
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  after=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "live-mutation account lock fixture could not read its end time"
+  elapsed=$((after - before))
+  [ "$status" -ne 0 ] || fail "bounded account lock acquisition bypassed live mutation custody"
+  [ "$elapsed" -lt 4 ] || fail "live mutation custody reset the account lock deadline: ${elapsed}s"
+  [ "$(fm_account_path_inode "$lock")" = "$lock_inode" ] \
+    || fail "bounded account lock acquisition changed lock state after its shared deadline"
+  [ "$(fm_account_path_inode "$mutation")" = "$mutation_inode" ] \
+    || fail "bounded account lock acquisition changed live mutation state after its shared deadline"
+
+  rm "$mutation"
+  printf '1\nstale-owner\n' > "$mutation"
+  before=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "dead-mutation account lock fixture could not read its start time"
+  held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task") \
+    || fail "zero-budget account lock acquisition refused immediate exact dead-owner reclaim"
+  after=$(fm_account_system_exec "$FM_ACCOUNT_SYSTEM_DATE_BIN" +%s) \
+    || fail "dead-mutation account lock fixture could not read its end time"
+  elapsed=$((after - before))
+  [ "$elapsed" -lt 15 ] || fail "dead mutation reclaim exceeded the account lock elapsed bound: ${elapsed}s"
+  [ ! -e "$mutation" ] && [ ! -L "$mutation" ] \
+    || fail "dead mutation reclaim retained obsolete mutation custody"
+  fm_account_meta_lock_release "$held" || fail "dead-mutation account lock fixture could not release custody"
+  rm -rf "$case_dir"
+  pass "account lock deadlines bound creation, mutation waits, and reclaim"
 }
 
 test_ownerless_lock_marker_rejects_symlink_clobber() {
@@ -5382,12 +5739,17 @@ test_account_lock_owner_controls_reject_symlinks() {
   printf '999999\nstale-owner\n' > "$outside"
   ln -s "$outside" "$lock/owner"
   touch -t 200001010000 "$lock"
-  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 bash -c '
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 FM_ACCOUNT_META_LOCK_ORPHAN_GRACE_SECONDS=0 bash -c '
     . "$1"
-    held=$(fm_account_meta_lock_acquire "$2" task) || exit 1
+    held=$(fm_account_meta_lock_acquire "$2" lock-task) || exit 1
     fm_account_meta_lock_release "$held"
-  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" \
-    || fail "symlinked stale owner blocked metadata-lock recovery"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh" "$state" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "metadata-lock recovery deleted an ambiguously owned raw lock"
+  [ -d "$lock" ] && [ -L "$lock/owner" ] || fail "metadata-lock recovery changed an ambiguously owned raw lock"
   [ "$(cat "$outside")" = $'999999\nstale-owner' ] || fail "metadata-lock recovery followed a symlinked owner"
 
   rm -rf "$lock"
@@ -5404,6 +5766,200 @@ test_account_lock_owner_controls_reject_symlinks() {
   [ "$(cat "$outside")" = $'999999\nstale-owner' ] || fail "metadata-lock release changed a symlink target"
   rm -rf "$case_dir"
   pass "account lock owner controls reject symlinks by call-site semantics"
+}
+
+test_bounded_account_lock_reclaim_requires_exact_dead_owner() {
+  local case_dir state task lock held start outside status before_inode after_inode
+  local identity_claim identity_key identity_value identity_saved identity_outside identity_mv
+  local delete_observed delete_release reclaim_pid attempts mutation
+  . "$ROOT/bin/fm-account-routing-lib.sh"
+  case_dir="$TMP_ROOT/bounded-account-lock-reclaim"
+  state="$case_dir/state"
+  task='bounded-reclaim-task'
+  mkdir -p "$state"
+  lock=$(fm_account_lock_identity_claim "$state" "$task" account-meta) \
+    || fail "bounded reclaim fixture could not resolve its exact lock"
+
+  mkdir "$lock"
+  start=$(fm_account_process_start_time "$$") || fail "bounded live-owner fixture could not read its identity"
+  printf '%s\n%s\n' "$$" "$start" > "$lock/owner"
+  before_inode=$(fm_account_path_inode "$lock")
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim displaced a live exact owner"
+  after_inode=$(fm_account_path_inode "$lock")
+  [ "$after_inode" = "$before_inode" ] || fail "bounded reclaim changed a live owner carrier"
+
+  printf '1\nstale-owner\n' > "$lock/owner"
+  held=$(FM_ACCOUNT_META_LOCK_WAIT_SECONDS=2 fm_account_meta_lock_acquire "$state" "$task") \
+    || fail "bounded reclaim refused an exact proven-dead owner"
+  fm_account_meta_lock_release "$held" || fail "bounded dead-owner fixture could not release replacement custody"
+
+  mkdir "$lock"
+  printf 'malformed-owner\n' > "$lock/owner"
+  before_inode=$(fm_account_path_inode "$lock")
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim accepted a malformed owner"
+  [ "$(fm_account_path_inode "$lock")" = "$before_inode" ] \
+    || fail "bounded reclaim deleted a malformed owner carrier"
+  [ "$(cat "$lock/owner")" = malformed-owner ] || fail "bounded reclaim changed a malformed owner"
+
+  printf '1\nstale-owner\n' > "$lock/owner"
+  chmod 000 "$lock/owner"
+  before_inode=$(fm_account_path_inode "$lock")
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim accepted an unreadable owner"
+  [ "$(fm_account_path_inode "$lock")" = "$before_inode" ] \
+    || fail "bounded reclaim deleted an unreadable owner carrier"
+  chmod 600 "$lock/owner"
+
+  rm -rf "$lock"
+  mkdir "$lock"
+  outside="$case_dir/outside-owner"
+  printf '1\nstale-owner\n' > "$outside"
+  ln -s "$outside" "$lock/owner"
+  before_inode=$(fm_account_path_inode "$lock")
+  if FM_ACCOUNT_META_LOCK_WAIT_SECONDS=0 fm_account_meta_lock_acquire "$state" "$task" >/dev/null 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim accepted a symlinked owner"
+  [ "$(fm_account_path_inode "$lock")" = "$before_inode" ] && [ -L "$lock/owner" ] \
+    || fail "bounded reclaim changed a symlinked owner carrier"
+  [ "$(cat "$outside")" = $'1\nstale-owner' ] || fail "bounded reclaim followed a symlinked owner"
+
+  rm -rf "$lock"
+  mkdir "$lock"
+  printf '1\nstale-owner\n' > "$lock/owner"
+  if LOCK="$lock" bash -c '
+    . "$1"
+    fm_account_reclaim_guard_acquire() {
+      local replacement_start
+      replacement_start=$(fm_account_process_start_time "$$") || return 1
+      printf "%s\n%s\n" "$$" "$replacement_start" > "$LOCK/owner.replacement"
+      mv "$LOCK/owner.replacement" "$LOCK/owner"
+    }
+    fm_account_reclaim_guard_release() { return 0; }
+    fm_account_lock_exact_reclaim "$LOCK"
+  ' _ "$ROOT/bin/fm-account-routing-lib.sh"; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim accepted an owner replacement during reclamation"
+  [ -d "$lock" ] && [ ! -L "$lock" ] || fail "bounded reclaim deleted a replacement owner carrier"
+  [ "$(sed -n '1p' "$lock/owner")" != 1 ] || fail "bounded reclaim did not install the replacement race fixture"
+
+  rm -rf "$lock"
+  mkdir "$lock"
+  printf '1\nstale-owner\n' > "$lock/owner"
+  identity_key=${lock##*/}
+  identity_key=${identity_key#"$FM_ACCOUNT_LOCK_PATH_PREFIX"}
+  identity_claim="$state/$FM_ACCOUNT_LOCK_IDENTITY_PREFIX$identity_key"
+  identity_value=$(fm_account_lock_identity_value account-meta "$task") \
+    || fail "bounded identity-race fixture could not render its exact claim"
+  identity_mv="$case_dir/identity-race-mv"
+  cat > "$identity_mv" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" = "${FM_TEST_IDENTITY_RACE_LOCK:?}" ]; then
+  case "${FM_TEST_IDENTITY_RACE_MODE:?}" in
+    malformed)
+      printf 'malformed-identity\n' > "$FM_TEST_IDENTITY_RACE_CLAIM.replacement"
+      /bin/mv "$FM_TEST_IDENTITY_RACE_CLAIM.replacement" "$FM_TEST_IDENTITY_RACE_CLAIM"
+      ;;
+    symlink)
+      /bin/mv "$FM_TEST_IDENTITY_RACE_CLAIM" "$FM_TEST_IDENTITY_RACE_SAVED"
+      /bin/ln -s "$FM_TEST_IDENTITY_RACE_OUTSIDE" "$FM_TEST_IDENTITY_RACE_CLAIM"
+      ;;
+    *) exit 91 ;;
+  esac
+fi
+exec /bin/mv "$@"
+SH
+  chmod +x "$identity_mv"
+  if FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_TEST_ACCOUNT_MV_BIN="$identity_mv" FM_TEST_IDENTITY_RACE_LOCK="$lock" \
+    FM_TEST_IDENTITY_RACE_CLAIM="$identity_claim" FM_TEST_IDENTITY_RACE_MODE=malformed \
+    bash -c '. "$1"; fm_account_lock_exact_reclaim "$FM_TEST_IDENTITY_RACE_LOCK"' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh"; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim accepted a malformed task-identity replacement"
+  [ -d "$lock" ] && [ ! -L "$lock" ] || fail "bounded reclaim deleted the lock after task-identity substitution"
+  [ "$(cat "$identity_claim")" = malformed-identity ] \
+    || fail "bounded reclaim changed a substituted malformed task-identity claim"
+
+  printf '%s' "$identity_value" > "$identity_claim.replacement"
+  mv "$identity_claim.replacement" "$identity_claim"
+  identity_saved="$case_dir/identity.saved"
+  identity_outside="$case_dir/identity.outside"
+  printf 'outside-identity\n' > "$identity_outside"
+  if FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_TEST_ACCOUNT_MV_BIN="$identity_mv" FM_TEST_IDENTITY_RACE_LOCK="$lock" \
+    FM_TEST_IDENTITY_RACE_CLAIM="$identity_claim" FM_TEST_IDENTITY_RACE_MODE=symlink \
+    FM_TEST_IDENTITY_RACE_SAVED="$identity_saved" FM_TEST_IDENTITY_RACE_OUTSIDE="$identity_outside" \
+    bash -c '. "$1"; fm_account_lock_exact_reclaim "$FM_TEST_IDENTITY_RACE_LOCK"' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh"; then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim accepted a symlinked task-identity replacement"
+  [ -d "$lock" ] && [ ! -L "$lock" ] || fail "bounded reclaim deleted the lock after task-identity symlinking"
+  [ -L "$identity_claim" ] || fail "bounded reclaim replaced a substituted task-identity symlink"
+  [ "$(cat "$identity_outside")" = outside-identity ] || fail "bounded reclaim changed a task-identity symlink target"
+  [ "$(cat "$identity_saved")" = "$identity_value" ] || fail "bounded reclaim changed the pinned task-identity generation"
+  rm "$identity_claim"
+  mv "$identity_saved" "$identity_claim"
+  before_inode=$(fm_account_path_inode "$lock") \
+    || fail "bounded final-delete race fixture could not pin the lock carrier"
+  delete_observed="$case_dir/delete.observed"
+  delete_release="$case_dir/delete.release"
+  FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_ACCOUNT_IDENTITY_DELETE_TEST_OBSERVED="$delete_observed" \
+    FM_ACCOUNT_IDENTITY_DELETE_TEST_RELEASE="$delete_release" \
+    bash -c '. "$1"; fm_account_lock_exact_reclaim "$2"' \
+    _ "$ROOT/bin/fm-account-routing-lib.sh" "$lock" &
+  reclaim_pid=$!
+  attempts=0
+  while [ ! -f "$delete_observed" ] && [ "$attempts" -lt 200 ]; do
+    attempts=$((attempts + 1))
+    sleep 0.05
+  done
+  [ -f "$delete_observed" ] || fail "bounded final-delete race did not reach its synchronization boundary"
+  mutation=$(fm_account_lock_identity_mutation_path "$lock") \
+    || fail "bounded final-delete race could not resolve its mutation boundary"
+  [ -f "$mutation" ] && [ ! -L "$mutation" ] \
+    || fail "bounded final-delete race released its mutation boundary before deletion"
+  printf 'malformed-after-post-move\n' > "$identity_claim.replacement"
+  mv "$identity_claim.replacement" "$identity_claim"
+  : > "$delete_release"
+  if wait "$reclaim_pid"; then status=0; else status=$?; fi
+  [ "$status" -ne 0 ] || fail "bounded reclaim deleted after post-move task-identity substitution"
+  [ -d "$lock" ] && [ ! -L "$lock" ] \
+    || fail "bounded reclaim discarded lock state after final task-identity substitution"
+  [ "$(fm_account_path_inode "$lock")" = "$before_inode" ] \
+    || fail "bounded reclaim replaced lock state after final task-identity substitution"
+  [ "$(cat "$identity_claim")" = malformed-after-post-move ] \
+    || fail "bounded reclaim changed the final substituted task-identity claim"
+  [ ! -e "$mutation" ] && [ ! -L "$mutation" ] \
+    || fail "bounded final-delete race retained its mutation boundary"
+  rm -rf "$case_dir"
+  pass "bounded account locks reclaim only exact proven-dead owners"
 }
 
 test_linux_stat_selection_avoids_filesystem_stat_output() {
@@ -5557,12 +6113,18 @@ test_task_owned_account_artifacts_reject_symlink_paths() {
   printf 'outside\n' > "$CASE_DIR/outside-steering"
   ln -s "$CASE_DIR/outside-steering" "$original/steering.md"
   touch "$CASE_DIR/endpoint-live"
+  set +e
   out=$(run_send "$id" "Delivered without following the steering symlink." 2>&1)
   status=$?
-  [ "$status" -eq 0 ] || fail "symlinked steering file changed delivery truth: $out"
+  set -e
+  [ "$status" -ne 0 ] || fail "refused steering incorrectly exited zero: $out"
   [ "$(cat "$CASE_DIR/outside-steering")" = outside ] || fail "managed steering followed a symlinked output file"
-  assert_grep 'Delivered without following the steering symlink' "$original/steering-unconfirmed.md" \
-    "safe unconfirmed steering was not recorded without following the canonical trail symlink"
+  assert_not_grep 'Delivered without following the steering symlink' "$LAUNCH_LOG" \
+    "managed steering typed text after the atomic transport refused it"
+  assert_grep 'not-submitted' "$original/steering-journal.md" \
+    "refused steering did not durably close its pending intent as not submitted"
+  assert_absent "$original/steering-unconfirmed.md" \
+    "a pre-input refusal was misclassified as an unconfirmed submission"
   pass "task-owned lineage, steering, and continuation artifacts reject symlink escapes"
 }
 
@@ -5609,7 +6171,8 @@ test_account_lineage_rejects_parent_swap_during_transaction() {
     || fail "account-lineage transaction wrote through a raced task parent"
   [ "$(cat "$moved/account-attempts.md")" = "$before" ] \
     || fail "failed account-lineage transaction changed the pinned original file"
-  assert_absent "$data/.account-lineage-$id.lock" "failed account-lineage transaction retained its serialization lock"
+  fm_test_assert_account_lock_absent "$data" "$id" account-lineage \
+    "failed account-lineage transaction retained its serialization lock"
   pass "account lineage rejects parent swaps during pinned atomic persistence"
 }
 
@@ -6455,7 +7018,7 @@ if [ "${FM_TEST_FOCUSED:-}" = oversized-continuation ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = steering-audit ]; then
-  run_isolated_test test_managed_steering_audit_failure_does_not_reclassify_delivery
+  run_isolated_test test_managed_steering_refuses_before_split_transport
   exit 0
 fi
 
@@ -6466,6 +7029,11 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = concurrent-continuation ]; then
   run_isolated_test test_concurrent_continuations_serialize_before_mutation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = secondmate-profile-recovery ]; then
+  run_isolated_test test_secondmate_provider_change_reloads_complete_profile
   exit 0
 fi
 
@@ -6552,10 +7120,26 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = account-lock-compatibility ]; then
+  run_isolated_test test_account_metadata_lock_serializes_exact_owners_without_overlap
+  run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
+  run_isolated_test test_account_locks_support_maximum_task_identity
+  run_isolated_test test_account_lock_deadline_bounds_nested_custody
+  run_isolated_test test_account_lock_owner_controls_reject_symlinks
+  run_isolated_test test_bounded_account_lock_reclaim_requires_exact_dead_owner
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-findings ]; then
   run_isolated_test test_completion_contract_upgrade_is_contained_nonfollowing_and_atomic
   run_isolated_test test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
   run_isolated_test test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = codex-runtime-continuation ]; then
+  run_isolated_test test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+  run_isolated_test test_cross_provider_continuation_uses_target_default_pool claude codex
   exit 0
 fi
 
@@ -6745,8 +7329,18 @@ if [ "${FM_TEST_FOCUSED:-}" = session-workspace ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = account-locks ]; then
-  run_isolated_test test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
+  run_isolated_test test_managed_recovery_accepts_inherited_lifecycle_lock
+  run_isolated_test test_account_metadata_lock_serializes_exact_owners_without_overlap
   run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
+  run_isolated_test test_account_locks_support_maximum_task_identity
+  run_isolated_test test_ownerless_lock_marker_rejects_symlink_clobber
+  run_isolated_test test_account_lock_owner_controls_reject_symlinks
+  run_isolated_test test_stale_reclaim_guard_is_owned_before_lock_removal
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = account-lock-maximum ]; then
+  run_isolated_test test_account_locks_support_maximum_task_identity
   exit 0
 fi
 
@@ -6798,6 +7392,11 @@ if [ "${FM_TEST_FOCUSED:-}" = prior-tasktmp-cleanup ]; then
   run_isolated_test test_task_tmp_removal_pins_ancestors_during_swap
   run_isolated_test test_task_tmp_partial_removal_fails_closed
   run_isolated_test test_agent_fleet_task_keys_are_namespaced_by_home_and_attempt
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = gate-b-send ]; then
+  run_isolated_test test_managed_steering_refuses_before_split_transport
   exit 0
 fi
 
@@ -6875,9 +7474,10 @@ run_isolated_test test_predecessor_cleanup_failure_preserves_replacement_for_ret
 run_isolated_test test_failed_continuation_cleanup_restores_predecessor_for_retry
 run_isolated_test test_concurrent_continuations_serialize_before_mutation
 run_isolated_test test_live_secondmate_recovery_precedes_home_convergence
+run_isolated_test test_secondmate_provider_change_reloads_complete_profile
 run_isolated_test test_continuation_fails_closed_without_original_brief
 run_isolated_test test_session_sync_cannot_recreate_metadata_after_teardown
-run_isolated_test test_managed_steering_audit_failure_does_not_reclassify_delivery
+run_isolated_test test_managed_steering_refuses_before_split_transport
 run_isolated_test test_managed_tmux_identity_survives_window_rename
 run_isolated_test test_native_resume_accepts_regressed_wallclock_when_event_sequence_advances
 run_isolated_test test_session_sync_metadata_publish_failure_is_closed
@@ -6903,10 +7503,13 @@ run_isolated_test test_continuation_rollback_preserves_concurrent_packet_replace
 run_isolated_test test_continuation_rejects_load_bearing_source_replacement_during_open
 run_isolated_test test_continuation_rejects_task_source_ancestor_swap
 run_isolated_test test_continuation_rejects_metadata_ancestor_swap
-run_isolated_test test_account_metadata_lock_reclaims_orphans_without_overlapping_owners
+run_isolated_test test_account_metadata_lock_serializes_exact_owners_without_overlap
 run_isolated_test test_account_locks_never_reclaim_on_indeterminate_process_probe
+run_isolated_test test_account_locks_support_maximum_task_identity
+run_isolated_test test_account_lock_deadline_bounds_nested_custody
 run_isolated_test test_ownerless_lock_marker_rejects_symlink_clobber
 run_isolated_test test_account_lock_owner_controls_reject_symlinks
+run_isolated_test test_bounded_account_lock_reclaim_requires_exact_dead_owner
 run_isolated_test test_linux_stat_selection_avoids_filesystem_stat_output
 run_isolated_test test_darwin_stat_mode_preserves_special_permission_bits
 run_isolated_test test_stale_reclaim_guard_is_owned_before_lock_removal

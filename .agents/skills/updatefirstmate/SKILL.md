@@ -54,13 +54,14 @@ This touches only the firstmate repo and its own worktrees, never anything under
    **Read `AGENTS.md` now** (CLAUDE.md is a symlink to it) to refresh your operating instructions before doing anything else, so you are acting on the new instructions rather than the stale ones you were started with.
    When it printed `reread-firstmate: no`, nothing changed for you - skip the re-read.
 
-3. **Nudge each updated live secondmate.**
-   For every target listed on the `nudge-secondmates:` line (do nothing when it says `none`), send a one-line re-read nudge so that secondmate picks up its new instructions too:
+3. **Attempt to nudge each updated live secondmate.**
+   For every target listed on the `nudge-secondmates:` line (do nothing when it says `none`), attempt a one-line re-read nudge:
    ```sh
    FM_HOME=<this-firstmate-home> bin/fm-send.sh <id> 'firstmate was updated to the latest - please re-read your AGENTS.md to pick up the new instructions.'
    ```
    Include `FM_HOME=<this-firstmate-home>` unless `FM_HOME` is already set to the active firstmate home.
-   This is a gentle steer, not an interruption: the secondmate already got a safe tracked-files fast-forward, and the nudge never forces, tears down, or discards its work.
+   Canonical text steering currently refuses before pane input, so report that refusal as undelivered and do not claim the secondmate re-read its instructions.
+   The attempted nudge never forces, tears down, or discards work; the tracked-files fast-forward has already landed safely.
    A secondmate that was skipped, already current, or has no live metadata is not on the list and needs no nudge.
 
 4. **Report to the captain in plain outcomes.**

@@ -14,6 +14,9 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# shellcheck source=bin/fm-account-routing-lib.sh
+. "$ROOT/bin/fm-account-routing-lib.sh"
+
 fm_test_tmproot_into TMP_ROOT fm-brief
 
 # The script itself must always parse. This is the direct regression test for
@@ -240,8 +243,8 @@ test_promote_locks_lifecycle_before_metadata_and_rechecks_kind() {
   fi
   assert_grep 'kind=ship' "$meta" "promotion overwrote the serialized task generation"
   assert_grep 'not a scout task' "$home/promote.err" "promotion kind recheck failure was unclear"
-  assert_absent "$state/.account-lifecycle-$id.lock" "promotion left the lifecycle lock behind"
-  assert_absent "$state/.account-meta-$id.lock" "promotion left the metadata lock behind"
+  fm_test_assert_account_lock_absent "$state" "$id" account-lifecycle "promotion left the lifecycle lock behind"
+  fm_test_assert_account_lock_absent "$state" "$id" account-meta "promotion left the metadata lock behind"
   pass "fm-promote.sh: locks lifecycle before metadata and rechecks task kind"
 }
 
@@ -260,8 +263,8 @@ test_promote_refuses_pending_rollback_cleanup() {
   [ "$status" -ne 0 ] || fail "promotion accepted pending rollback cleanup"
   assert_contains "$out" "rollback cleanup is pending" "pending rollback promotion refusal was unclear"
   assert_grep 'kind=scout' "$meta" "pending rollback promotion changed the task kind"
-  assert_absent "$state/.account-lifecycle-$id.lock" "failed promotion left the lifecycle lock behind"
-  assert_absent "$state/.account-meta-$id.lock" "failed promotion left the metadata lock behind"
+  fm_test_assert_account_lock_absent "$state" "$id" account-lifecycle "failed promotion left the lifecycle lock behind"
+  fm_test_assert_account_lock_absent "$state" "$id" account-meta "failed promotion left the metadata lock behind"
   pass "fm-promote.sh: refuses promotion while rollback cleanup is pending"
 }
 
@@ -290,7 +293,7 @@ test_promote_releases_lifecycle_when_metadata_lock_fails() {
   status=$?
   [ "$status" -ne 0 ] || fail "promotion succeeded despite metadata lock acquisition failure"
   assert_contains "$out" "timed out waiting for account metadata lock" "metadata lock failure was unclear"
-  assert_absent "$state/.account-lifecycle-$id.lock" "metadata lock failure leaked the lifecycle lock"
+  fm_test_assert_account_lock_absent "$state" "$id" account-lifecycle "metadata lock failure leaked the lifecycle lock"
   assert_grep 'kind=scout' "$meta" "metadata lock failure changed the task kind"
   touch "$release"
   wait "$holder" || fail "promotion metadata lock holder failed"

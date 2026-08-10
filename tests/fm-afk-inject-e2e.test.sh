@@ -1,19 +1,11 @@
 #!/usr/bin/env bash
 # tests/fm-afk-inject-e2e.test.sh - private-socket end-to-end test for the afk
-# daemon's injection path. It covers three operator-visible injection contracts:
+# daemon's production refusal path for a pane-backed tmux supervisor.
 #
-#   Scenario A (human-partial-input): a partial line is typed into the
-#     supervisor pane with NO Enter, then an escalation fires. The daemon must
-#     DEFER (not merge the digest into the human's text). After the pane goes
-#     idle, the digest arrives as a separate, clean submission.
-#
-#   Scenario B (swallowed-Enter): the first Enter the daemon sends is dropped.
-#     The daemon must retry Enter (NOT retype the digest) and deliver exactly
-#     ONE clean submission: no concatenation, no duplicate.
-#
-#   Scenario C (normal digest): no human input and no swallowed Enter.
-#     A captain-relevant status must deliver exactly ONE sentinel-prefixed,
-#     single-line digest with no duplicate or spurious user submission.
+# A captain-relevant status must remain buffered because tmux has no atomic
+# agent-session-bound steering operation. No text or Enter may reach the pane.
+# The submit-ACK retry mechanics remain covered by fm-daemon.test.sh's explicit
+# function-level test adapter; this real-pane suite exercises production wiring.
 #
 # Isolation: all test tmux runs on a dedicated socket (tmux -L afk-e2e-<pid>).
 # A tmux shim first on PATH redirects the daemon's bare `tmux` calls to the
@@ -41,6 +33,8 @@ command -v tmux >/dev/null 2>&1 || { echo "skip: tmux not found"; exit 0; }
 
 REAL_TMUX=$(command -v tmux)
 SOCKET="afk-e2e-$$"
+TMUX_TEST_TMPDIR=$(mktemp -d /tmp/fm-afk-tmux.XXXXXX) || exit 1
+export TMUX_TMPDIR="$TMUX_TEST_TMPDIR"
 STATE_DIR=
 TMUX_SHIM_DIR=
 LOG_FILE=
@@ -62,6 +56,7 @@ cleanup_all() {
   fi
   rm -rf "${TMUX_SHIM_DIR:-}" 2>/dev/null || true
   rm -rf "${STATE_DIR:-}" 2>/dev/null || true
+  rm -rf "${TMUX_TEST_TMPDIR:-}" 2>/dev/null || true
 }
 trap cleanup_all EXIT
 
@@ -275,56 +270,14 @@ test_scenario_a() {
   # Wait for the watcher to detect the change and the daemon to attempt inject.
   sleep 6
 
-  # Assert: the digest was NOT injected while the pane had pending input.
-  if grep -q 'Supervisor escalate' "$LOG_FILE"; then
-    fail "Scenario A: daemon injected while pane had pending input (merged with human text?)"
-  fi
-
-  # Assert: no merged line (human text + digest) was submitted.
-  if grep -q 'human draft text.*Supervisor escalate' "$LOG_FILE" 2>/dev/null || \
-     grep -q 'Supervisor escalate.*human draft text' "$LOG_FILE" 2>/dev/null; then
-    fail "Scenario A: human text and digest were merged into one line"
-  fi
-
-  # Now submit the human's text (Enter). The pane goes idle.
-  "$REAL_TMUX" -L "$SOCKET" send-keys -t "$SUPERVISOR_PANE" Enter
-  sleep 0.5
-
-  # Wait for the daemon to retry injection (housekeeping tick = 1s).
-  sleep 6
-
-  # Assert: human text was submitted alone (as a user message).
-  grep -q 'human draft text' "$LOG_FILE" \
-    || fail "Scenario A: human text not in log after submit"
-
-  # Assert: digest arrived after the pane went idle.
-  grep -q 'Supervisor escalate' "$LOG_FILE" \
-    || fail "Scenario A: digest not injected after pane went idle"
-
-  # Assert: human text and digest are on SEPARATE lines (never merged).
-  if grep -q 'human draft text.*Supervisor escalate' "$LOG_FILE" || \
-     grep -q 'Supervisor escalate.*human draft text' "$LOG_FILE"; then
-    fail "Scenario A: human text and digest merged into one line (after idle)"
-  fi
-
-  # Assert: the human text line is classified as "user", not "injection".
-  local human_line
-  human_line=$(grep 'human draft text' "$LOG_FILE" | head -1)
-  case "$human_line" in
-    *user) ;;  # correct
-    *) fail "Scenario A: human text misclassified (expected user): $human_line" ;;
-  esac
-
-  # Assert: the digest line is classified as "injection".
-  local digest_line
-  digest_line=$(grep 'Supervisor escalate' "$LOG_FILE" | head -1)
-  case "$digest_line" in
-    *injection) ;;  # correct
-    *) fail "Scenario A: digest misclassified (expected injection): $digest_line" ;;
-  esac
-
+  [ ! -s "$LOG_FILE" ] || fail "Scenario A: pending draft was submitted or merged"
+  [ -s "$STATE_DIR/.subsuper-escalations" ] || fail "Scenario A: refusal lost the buffered escalation"
+  PATH="$TMUX_SHIM_DIR:$PATH" pane_input_pending "$SUPERVISOR_PANE" \
+    || fail "Scenario A: refusal changed the captain's pending draft"
   stop_daemon
-  pass "Scenario A: partial input defers injection; digest arrives clean after idle"
+  "$REAL_TMUX" -L "$SOCKET" send-keys -t "$SUPERVISOR_PANE" Enter
+  sleep 0.3
+  pass "Scenario A: pending human input stays untouched and escalation stays buffered"
 }
 
 # --- Scenario B: swallowed-Enter --------------------------------------------
@@ -341,48 +294,16 @@ test_scenario_b() {
   # Write a captain-relevant status to trigger a real escalation.
   echo "done: PR https://example.test/pr/200" > "$STATE_DIR/fake-c1.status"
 
-  # Wait for the daemon to process the escalation and attempt inject (with the
-  # swallowed Enter, the retry path fires).
+  # Production refuses before any pane input, so the shim's marker must remain.
   sleep 8
-
-  # Assert: exactly ONE digest in the log (no duplicate, no loss).
-  local digest_count
-  digest_count=$(grep -c 'Supervisor escalate' "$LOG_FILE" || true)
-  [ "$digest_count" -eq 1 ] \
-    || fail "Scenario B: expected exactly 1 digest, got $digest_count (duplicate or lost)"
-
-  # Assert: the digest is not concatenated with itself (two markers in one line).
-  if grep -q "$(printf '\x1f').*$(printf '\x1f')" "$LOG_FILE"; then
-    fail "Scenario B: digest concatenated with itself (two sentinel markers in one line)"
-  fi
-
-  # Assert: the digest line is classified as "injection" and starts with the
-  # sentinel marker (hex starts with 1f).
-  local digest_line digest_hex
-  digest_line=$(grep 'Supervisor escalate' "$LOG_FILE" | head -1)
-  digest_hex=$(printf '%s' "$digest_line" | cut -f1)
-  case "$digest_hex" in
-    1f*) ;;  # correct: starts with the sentinel marker byte
-    *) fail "Scenario B: digest does not start with sentinel marker (hex: $digest_hex)" ;;
-  esac
-
-  # Assert: exactly ONE user-message line was submitted (no spurious empty lines
-  # from extra Enters). The log should have exactly 1 injection line and 0 user
-  # lines.
-  local user_count
-  user_count=$(grep -c $'\tuser$' "$LOG_FILE" || true)
-  [ "$user_count" -eq 0 ] \
-    || fail "Scenario B: expected 0 user lines, got $user_count (spurious Enter submitted empty line?)"
-
+  [ -e "$STATE_DIR/.swallow-enter" ] || fail "Scenario B: production refusal sent Enter"
+  [ ! -s "$LOG_FILE" ] || fail "Scenario B: production refusal submitted pane input"
+  [ -s "$STATE_DIR/.subsuper-escalations" ] || fail "Scenario B: refusal lost the buffered escalation"
   stop_daemon
-  pass "Scenario B: swallowed Enter produces exactly one clean digest"
+  pass "Scenario B: refusal never reaches the swallowed-Enter shim and preserves the buffer"
 }
 
-# --- Scenario C: normal status, single clean digest -------------------------
-# No human input, no swallowed Enter: a captain-relevant status must produce
-# exactly ONE sentinel-prefixed, single-line digest, submitted once. This owns
-# the marker + single-line + no-duplicate operator contract that the deleted
-# fake-tmux units used to assert via internal send-keys counts.
+# --- Scenario C: idle-pane production refusal -------------------------------
 
 test_scenario_c() {
   reset_state
@@ -390,45 +311,18 @@ test_scenario_c() {
   start_daemon
 
   echo "done: PR https://example.test/pr/300" > "$STATE_DIR/fake-c1.status"
-  sleep 6
-
-  # Exactly one digest line in the submitted log (no duplicate, no loss).
-  local digest_count
-  digest_count=$(grep -c 'Supervisor escalate' "$LOG_FILE" || true)
-  [ "$digest_count" -eq 1 ] \
-    || fail "Scenario C: expected exactly 1 digest, got $digest_count"
-
-  # Not concatenated with itself (two sentinel markers in one line).
-  if grep -q "$(printf '\x1f').*$(printf '\x1f')" "$LOG_FILE"; then
-    fail "Scenario C: digest concatenated with itself (two sentinel markers in one line)"
+  sleep 8
+  [ ! -s "$LOG_FILE" ] || fail "Scenario C: production refusal submitted pane input"
+  if PATH="$TMUX_SHIM_DIR:$PATH" pane_input_pending "$SUPERVISOR_PANE"; then
+    fail "Scenario C: production refusal left text pending in the idle pane"
   fi
-
-  # The digest is classified as an injection and starts with the sentinel byte.
-  local digest_line digest_hex
-  digest_line=$(grep 'Supervisor escalate' "$LOG_FILE" | head -1)
-  case "$digest_line" in
-    *injection) ;;
-    *) fail "Scenario C: digest misclassified (expected injection): $digest_line" ;;
-  esac
-  digest_hex=$(printf '%s' "$digest_line" | cut -f1)
-  case "$digest_hex" in
-    1f*) ;;
-    *) fail "Scenario C: digest does not start with sentinel marker (hex: $digest_hex)" ;;
-  esac
-
-  # The digest was submitted as ONE line (a multi-line digest would log >1 line),
-  # and no spurious user-classified lines were submitted.
-  local user_count
-  user_count=$(grep -c $'\tuser$' "$LOG_FILE" || true)
-  [ "$user_count" -eq 0 ] \
-    || fail "Scenario C: expected 0 user lines, got $user_count (spurious submission?)"
-
+  [ -s "$STATE_DIR/.subsuper-escalations" ] || fail "Scenario C: refusal lost the buffered escalation"
+  grep -q 'no atomic agent-session-bound tmux steering route' "$STATE_DIR/.supervise-daemon.log" \
+    || fail "Scenario C: production refusal was not recorded"
   stop_daemon
-  pass "Scenario C: a normal captain status injects exactly one clean single-line sentinel digest"
+  pass "Scenario C: idle-pane refusal buffers escalation with zero submission"
 }
 
 test_scenario_a
 test_scenario_b
 test_scenario_c
-
-echo "all e2e injection tests passed"

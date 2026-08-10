@@ -53,7 +53,7 @@ tmux select-window -t <session-name>:fm-<id> # jump to one, or use ctrl-b <n>
 
 Use the current tmux session name when firstmate was launched inside tmux; use `firstmate` only for the detached outside-tmux path.
 Typing directly into an attached window is authoritative direct intervention - the first mate treats it the same as any other captain instruction and reconciles at the next heartbeat.
-You do not need to attach at all for routine supervision: from an active firstmate session, the first mate reads crewmate windows itself with `bin/fm-peek.sh fm-<id>` (a bounded, read-only capture) and steers a crewmate with `FM_HOME=<this-firstmate-home> bin/fm-send.sh fm-<id> "<text>"` unless `FM_HOME` is already set to the active firstmate home.
+You do not need to attach at all for routine supervision: from an active firstmate session, the first mate reads crewmate windows itself with `bin/fm-peek.sh fm-<id>` (a bounded, read-only capture), while canonical text steering currently refuses because tmux has no atomic agent-session-bound submit.
 
 ## Verifying it works
 
@@ -75,7 +75,7 @@ A secondmate agent that exits leaves its pane alive as a bare idle shell, which 
 It reads tmux's own `#{pane_current_command}`, which reports the pane's live foreground process name - already resolved by tmux from the pty's controlling process group, not something this adapter derives itself.
 
 Agent liveness and composer safety are separate checks.
-During terminal-backed away-mode compatibility delivery, `fm_tmux_composer_state` sends a bare shell glyph on an unbordered row to the shared composer classifier as `unknown`, and the daemon injects only into an affirmatively `empty` composer; see [Composer-emptiness safety](herdr-backend.md#composer-emptiness-safety-2026-07-10-fleet-wide-across-all-four-backends).
+During terminal-backed away-mode compatibility delivery, `fm_tmux_composer_state` sends a bare shell glyph on an unbordered row to the shared composer classifier as `unknown`; only an affirmatively `empty` result passes preflight, after which the current session-bound steering gate still refuses before pane input.
 
 Verified empirically with real tmux 3.6a on macOS (Darwin 25.5.0), 2026-07-07:
 

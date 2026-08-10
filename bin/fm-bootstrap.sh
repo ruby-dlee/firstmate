@@ -23,9 +23,9 @@
 #          (fm-<id>) whose worktree was fast-forwarded to firstmate's own
 #          current default-branch commit (a purely LOCAL fast-forward, never an
 #          origin fetch) AND whose instruction surface (AGENTS.md, bin/, or
-#          .agents/skills/) actually changed; firstmate nudges each via
-#          bin/fm-send.sh fm-<id> so meta resolves the current backend target
-#          even when the same bootstrap run also respawned the secondmate.
+#          .agents/skills/) actually changed; firstmate attempts each nudge via
+#          bin/fm-send.sh fm-<id> so meta resolves the current backend target,
+#          then treats the present session-bound-route refusal as undelivered.
 #          Already-current or no-instruction-change homes are silently left alone.
 #          The secondmate sweep also propagates declared inheritable local config
 #          into each validated live secondmate home.
@@ -815,6 +815,12 @@ crew_dispatch_validate() {
       | map(select(. as $p | effort_ok($p.h; $p.e) | not))
       | map("\(.h):\(.e)")
       | unique;
+    def bad_codex_profiles:
+      ([(.rules // [])[]? | use_profiles(.use?)[]?]
+        + (if (.default? | type) == "object" then [.default] else [] end))
+      | map(select(.harness == "codex"))
+      | map(select(.model != "gpt-5.6-sol" or .effort != "xhigh"))
+      | length;
     if type != "object" then "top-level value must be an object"
     elif has("rules") and (.rules | type) != "array" then "rules must be an array"
     elif [(.rules // [])[]? | select(type != "object")] | length > 0 then "each rule must be an object"
@@ -846,6 +852,7 @@ crew_dispatch_validate() {
         | unique) as $bad_harnesses
       | if ($bad_harnesses | length) > 0 then "unverified harness: " + ($bad_harnesses | join(", "))
         elif (bad_efforts | length) > 0 then "invalid effort: " + (bad_efforts | join(", "))
+        elif bad_codex_profiles > 0 then "codex profiles require model=gpt-5.6-sol effort=xhigh"
         else empty
         end
     end

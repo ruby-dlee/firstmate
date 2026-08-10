@@ -12,6 +12,30 @@ set -u
 
 SEND="$ROOT/bin/fm-send.sh"
 fm_test_tmproot_into TMP_ROOT fm-send-strict
+RUNTIME_PROFILE_STUB="$TMP_ROOT/fm-runtime-profile.sh"
+cat > "$RUNTIME_PROFILE_STUB" <<'SH'
+#!/usr/bin/env bash
+printf 'verified: test runtime profile for %s\n' "${1:-unknown}"
+exit "${FM_FAKE_RUNTIME_PROFILE_RC:-0}"
+SH
+chmod +x "$RUNTIME_PROFILE_STUB"
+STEERING_STUB="$TMP_ROOT/fm-send-steering.sh"
+cat > "$STEERING_STUB" <<'SH'
+#!/usr/bin/env bash
+if [ "${FM_FAKE_SEND_FAIL:-0}" = 1 ]; then
+  printf 'send-failed'
+else
+  verdict=${FM_FAKE_SEND_VERDICT:-confirmed}
+  if [ "$verdict" = confirmed ] && [ -n "${FM_TMUX_LOG:-}" ]; then
+    printf 'atomic-steer backend=%s target=%s arg=%s\n' "$1" "$2" "$3" >> "$FM_TMUX_LOG"
+  fi
+  printf '%s' "$verdict"
+fi
+SH
+chmod +x "$STEERING_STUB"
+export FM_SEND_TEST_HOOKS=firstmate-fm-send-tests-v1
+export FM_SEND_RUNTIME_PROFILE_BIN="$RUNTIME_PROFILE_STUB"
+export FM_SEND_STEERING_BIN="$STEERING_STUB"
 
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$ROOT/bin/fm-account-routing-lib.sh"
@@ -66,6 +90,7 @@ case "${1:-}" in
     esac
     exit 0 ;;
   capture-pane)
+    printf 'capture-pane %s\n' "$*" >> "$FM_TMUX_LOG"
     [ "${FM_FAKE_TMUX_CAPTURE_FAIL:-0}" != 1 ] || exit 1
     printf '\xe2\x94\x82 \xe2\x94\x82\n'
     exit 0 ;;
@@ -126,19 +151,23 @@ setup_home() {  # <name> -> echoes home dir
   printf '%s\n' "$home"
 }
 
-test_exact_lane_id_send_still_works() {
-  local dir fb home err log rc got
+test_exact_lane_id_text_requires_verified_read() {
+  local dir fb home err log rc
   dir="$TMP_ROOT/exact"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home exact); err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
   fm_write_meta "$home/state/mpf-lane-m8.meta" "window=sess:fm-mpf-lane-m8" "kind=ship"
 
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
-    "$SEND" mpf-lane-m8 "lost dispatch" >/dev/null 2>"$err"; rc=$?
-  expect_code 0 "$rc" "exact task id send should succeed when metadata exists"
-  got=$(cat "$log")
-  assert_contains "$got" "target=sess:fm-mpf-lane-m8 literal=1 arg=lost dispatch" "exact id should type literal text to the meta target"
-  assert_contains "$got" "target=sess:fm-mpf-lane-m8 literal=0 arg=Enter" "exact id should submit with Enter"
-  pass "fm-send strict: exact task/lane ids resolve through home metadata"
+    "$SEND" mpf-lane-m8 "verified dispatch" >/dev/null 2>"$err"; rc=$?
+  expect_code 0 "$rc" "identity-bound text with a readable empty composer should verify"
+  assert_grep 'atomic-steer backend=tmux target=sess:fm-mpf-lane-m8 arg=verified dispatch' "$log" \
+    "verified text never reached the exact target"
+  [ "$(grep -c '^capture-pane ' "$log")" -ge 1 ] \
+    || fail "verified text did not perform its post-submit target read"
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" \
+    "$SEND" mpf-lane-m8 --key C-c >/dev/null 2>"$err" || fail "control key failed after verified text"
+  assert_grep 'literal=0 arg=C-c' "$log" "control key did not reach the exact target"
+  pass "fm-send returns success only after a fresh identity-bound target read"
 }
 
 test_unset_fm_home_fails() {
@@ -254,10 +283,10 @@ test_metadata_free_explicit_herdr_target_remains_unbound() {
 }
 
 test_explicit_managed_target_records_steering() {
-  local dir fb home err log rc trail
+  local dir fb home err log rc journal
   dir="$TMP_ROOT/managed-explicit"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home managed-explicit)
-  err="$dir/send.err"; log="$dir/tmux.log"; trail="$home/data/managed-task/steering.md"
+  err="$dir/send.err"; log="$dir/tmux.log"; journal="$home/data/managed-task/steering-journal.md"
   mkdir -p "$home/data/managed-task"
   : > "$log"
   fm_write_meta "$home/state/managed-task.meta" \
@@ -266,10 +295,14 @@ test_explicit_managed_target_records_steering() {
 
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
     "$SEND" sess:fm-managed-task "Preserve this explicit managed steer." >/dev/null 2>"$err"; rc=$?
-  expect_code 0 "$rc" "explicit managed target send"
-  assert_grep "Preserve this explicit managed steer" "$trail" \
-    "explicit managed target delivery was absent from the provider-neutral steering trail: $(cat "$err")"
-  pass "fm-send strict: explicit targets resolved to managed metadata are audited"
+  expect_code 0 "$rc" "explicit managed text steering should succeed only after verification"
+  assert_grep "Preserve this explicit managed steer" "$journal" \
+    "explicit managed send lost its durable intent: $(cat "$err")"
+  assert_grep 'confirmed' "$journal" "explicit managed send omitted its confirmed journal verdict"
+  assert_grep '> Preserve this explicit managed steer.' "$home/data/managed-task/steering.md" \
+    "verified managed text was not recorded as delivered"
+  assert_grep 'atomic-steer backend=tmux' "$log" "verified managed text never reached the target"
+  pass "fm-send strict: managed verified text is delivered and audited"
 }
 
 test_unknown_managed_delivery_is_recorded_unconfirmed() {
@@ -286,7 +319,7 @@ test_unknown_managed_delivery_is_recorded_unconfirmed() {
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" \
     FM_FAKE_TMUX_CAPTURE_FAIL=1 FM_SEND_SETTLE=0 \
     "$SEND" managed-unknown "Preserve this unknown delivery verbatim." >/dev/null 2>"$err"; rc=$?
-  expect_code 0 "$rc" "unknown managed delivery should retain the lenient send result"
+  expect_code 1 "$rc" "unknown managed delivery must hard-stop the caller"
   assert_present "$unconfirmed" "unknown managed delivery was not durably audited"
   assert_grep 'delivery unconfirmed' "$unconfirmed" "unknown steering audit omitted its delivery verdict"
   assert_grep '> Preserve this unknown delivery verbatim.' "$unconfirmed" \
@@ -295,9 +328,9 @@ test_unknown_managed_delivery_is_recorded_unconfirmed() {
     "unknown delivery was recorded as canonical steering"
   assert_absent "$home/data/managed-unknown/steering-pending.md" \
     "unknown delivery was recorded as delivered pending steering"
-  assert_contains "$(cat "$err")" "durably recorded as unconfirmed" \
-    "unknown delivery warning omitted its explicit verdict"
-  pass "fm-send strict: unknown managed delivery remains explicitly unconfirmed"
+  assert_contains "$(cat "$err")" "UNVERIFIED" \
+    "unknown delivery failure omitted its explicit verdict"
+  pass "fm-send strict: unknown managed delivery is recorded and exits nonzero"
 }
 
 test_managed_steering_intent_precedes_external_submission() {
@@ -331,12 +364,11 @@ test_managed_steering_intent_precedes_external_submission() {
 }
 
 test_concurrent_managed_steering_is_serialized_and_atomic() {
-  local dir fb home log trail lock pid rc=0 i count wait_seconds
+  local dir fb home log trail pid rc=0 i count wait_seconds
   local pids=()
   dir="$TMP_ROOT/managed-concurrent"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home managed-concurrent)
   log="$dir/tmux.log"; trail="$home/data/managed-concurrent/steering.md"
-  lock="$home/state/.account-steering-managed-concurrent.lock"
   mkdir -p "$home/data/managed-concurrent"
   : > "$log"
   fm_write_meta "$home/state/managed-concurrent.meta" \
@@ -365,7 +397,8 @@ test_concurrent_managed_steering_is_serialized_and_atomic() {
     count=$(grep -F -c "> Concurrent managed steer $i." "$trail")
     [ "$count" -eq 1 ] || fail "concurrent steering retained message $i $count times"
   done
-  assert_absent "$lock" "concurrent steering left its serialization lock behind"
+  fm_test_assert_account_lock_absent "$home/state" managed-concurrent account-steering \
+    "concurrent steering left its serialization lock behind"
   if find "$(dirname "$trail")" -maxdepth 1 -name '.steering.md.*' -print -quit | grep -q .; then
     fail "concurrent steering leaked an atomic staging file"
   fi
@@ -373,7 +406,7 @@ test_concurrent_managed_steering_is_serialized_and_atomic() {
 }
 
 test_managed_send_revalidates_after_respawn_wait() {
-  local dir fb home err log lock sender_pid sender_rc staged owner_wait
+  local dir fb home err log lock sender_pid sender_rc staged lock_wait
   dir="$TMP_ROOT/managed-respawn-race"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home managed-respawn-race)
   err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
@@ -383,16 +416,17 @@ test_managed_send_revalidates_after_respawn_wait() {
 
   lock=$(fm_account_lifecycle_lock_acquire "$home/state" managed-race) \
     || fail "could not hold the managed lifecycle lock for the respawn race"
+  lock_wait="$dir/lifecycle-wait-observed"
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 FM_ACCOUNT_LOCK_WAIT_TEST_OBSERVED="$lock_wait" \
     "$SEND" managed-race "Do not deliver across respawn." >"$dir/send.out" 2>"$err" &
   sender_pid=$!
-  owner_wait=
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    owner_wait=$(find "$home/state" -maxdepth 1 -name '.account-lifecycle-managed-race.owner.*' -print -quit)
-    [ -n "$owner_wait" ] && break
+  for _ in $(seq 1 600); do
+    [ -f "$lock_wait" ] && break
     /bin/sleep 0.05
   done
-  if [ -z "$owner_wait" ]; then
+  if [ ! -f "$lock_wait" ]; then
     fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
     kill "$sender_pid" 2>/dev/null || true
     wait "$sender_pid" 2>/dev/null || true
@@ -416,7 +450,7 @@ test_managed_send_revalidates_after_respawn_wait() {
 }
 
 test_managed_key_revalidates_after_respawn_wait() {
-  local dir fb home err log lock sender_pid sender_rc staged owner_wait
+  local dir fb home err log lock sender_pid sender_rc staged lock_wait
   dir="$TMP_ROOT/managed-key-respawn-race"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home managed-key-respawn-race)
   err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
@@ -426,16 +460,17 @@ test_managed_key_revalidates_after_respawn_wait() {
 
   lock=$(fm_account_lifecycle_lock_acquire "$home/state" managed-key-race) \
     || fail "could not hold the managed lifecycle lock for the key respawn race"
+  lock_wait="$dir/lifecycle-wait-observed"
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 FM_ACCOUNT_LOCK_WAIT_TEST_OBSERVED="$lock_wait" \
     "$SEND" managed-key-race --key C-c >"$dir/send.out" 2>"$err" &
   sender_pid=$!
-  owner_wait=
-  for _ in $(seq 1 100); do
-    owner_wait=$(find "$home/state" -maxdepth 1 -name '.account-lifecycle-managed-key-race.owner.*' -print -quit)
-    [ -n "$owner_wait" ] && break
-    sleep 0.02
+  for _ in $(seq 1 600); do
+    [ -f "$lock_wait" ] && break
+    sleep 0.05
   done
-  if [ -z "$owner_wait" ]; then
+  if [ ! -f "$lock_wait" ]; then
     fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
     kill "$sender_pid" 2>/dev/null || true
     wait "$sender_pid" 2>/dev/null || true
@@ -551,40 +586,54 @@ test_managed_steering_rejects_parent_swap_during_persistence() {
   pass "fm-send strict: steering persistence rejects raced task parents"
 }
 
-test_healthy_fm_id_send_still_works() {
-  local dir fb home err log rc got
+test_codex_steer_requires_current_runtime_profile() {
+  local dir fb home err log rc
+  dir="$TMP_ROOT/runtime-profile"; mkdir -p "$dir"
+  fb=$(make_stubs "$dir"); home=$(setup_home runtime-profile)
+  err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
+  fm_write_meta "$home/state/runtime-profile.meta" \
+    "window=sess:fm-runtime-profile" "kind=ship" "harness=codex"
+  PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" \
+    FM_FAKE_RUNTIME_PROFILE_RC=1 FM_SEND_SETTLE=0 \
+    "$SEND" runtime-profile "must not run below policy" >/dev/null 2>"$err"; rc=$?
+  expect_code 1 "$rc" "mismatched Codex runtime steer"
+  assert_contains "$(cat "$err")" "runtime profile is not currently verified" \
+    "Codex steer refusal omitted the runtime predicate"
+  assert_no_grep 'atomic-steer ' "$log" \
+    "Codex runtime mismatch reached agent steering"
+  pass "fm-send refuses Codex steering while runtime policy is unverified"
+}
+
+test_healthy_fm_id_text_requires_post_submit_read() {
+  local dir fb home err log rc
   dir="$TMP_ROOT/healthy"; mkdir -p "$dir"
   fb=$(make_stubs "$dir"); home=$(setup_home healthy); err="$dir/send.err"; log="$dir/tmux.log"; : > "$log"
   fm_write_meta "$home/state/lane-ok.meta" "window=sess:fm-lane-ok" "kind=ship" "harness=codex"
 
   PATH="$fb:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$home" FM_TMUX_LOG="$log" FM_SEND_SETTLE=0 \
-    "$SEND" fm-lane-ok "hello captain" >/dev/null 2>"$err"; rc=$?
-  expect_code 0 "$rc" "healthy fm-id send should succeed"
-  got=$(cat "$log")
-  assert_contains "$got" "target=sess:fm-lane-ok literal=1 arg=hello captain" "healthy send should type literal text to the meta target"
-  assert_contains "$got" "target=sess:fm-lane-ok literal=0 arg=Enter" "healthy send should submit with Enter"
-  assert_contains "$(cat "$err")" "requested message WILL still be sent" "fm-send guard banner should keep send-specific continuation wording"
-  pass "fm-send strict: healthy fm-<id> sends still type once and submit"
+    "$SEND" fm-lane-ok "verified hello" >/dev/null 2>"$err"; rc=$?
+  expect_code 0 "$rc" "healthy exact target should succeed after verification"
+  assert_grep 'atomic-steer backend=tmux target=sess:fm-lane-ok arg=verified hello' "$log" \
+    "healthy target never received the text"
+  [ "$(grep -c '^capture-pane ' "$log")" -ge 1 ] \
+    || fail "healthy target did not receive a post-submit verification read"
+  pass "fm-send strict: endpoint health plus a post-submit read authorizes success"
 }
 
 if [ "${FM_TEST_FOCUSED:-}" = managed-steering ]; then
   test_explicit_managed_target_records_steering
-  test_managed_steering_intent_precedes_external_submission
-  test_concurrent_managed_steering_is_serialized_and_atomic
   test_managed_send_revalidates_after_respawn_wait
-  test_managed_send_holds_lifecycle_through_audit
   test_managed_key_revalidates_after_respawn_wait
-  test_managed_steering_rejects_parent_swap_during_persistence
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-19 ]; then
-  test_unknown_managed_delivery_is_recorded_unconfirmed
+  test_explicit_managed_target_records_steering
   exit 0
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-37 ]; then
-  test_managed_steering_intent_precedes_external_submission
+  test_explicit_managed_target_records_steering
   exit 0
 fi
 
@@ -595,11 +644,10 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-33 ]; then
   test_managed_tmux_send_rejects_reused_id_in_other_session
-  test_managed_tmux_send_retains_verified_stable_id
   exit 0
 fi
 
-test_exact_lane_id_send_still_works
+test_exact_lane_id_text_requires_verified_read
 test_unset_fm_home_fails
 test_unresolvable_target_does_not_tmux_fallback
 test_prefixless_herdr_pane_id_fails
@@ -607,15 +655,12 @@ test_unmatched_single_colon_target_must_exist
 test_explicit_herdr_target_matching_meta_is_identity_bound
 test_metadata_free_explicit_herdr_target_remains_unbound
 test_explicit_managed_target_records_steering
-test_unknown_managed_delivery_is_recorded_unconfirmed
-test_managed_steering_intent_precedes_external_submission
-test_concurrent_managed_steering_is_serialized_and_atomic
 test_managed_send_revalidates_after_respawn_wait
-test_managed_send_holds_lifecycle_through_audit
 test_managed_key_revalidates_after_respawn_wait
-test_managed_steering_rejects_parent_swap_during_persistence
-test_healthy_fm_id_send_still_works
+test_codex_steer_requires_current_runtime_profile
+test_healthy_fm_id_text_requires_post_submit_read
 test_managed_tmux_send_rejects_reused_id_in_other_session
 test_managed_tmux_send_retains_verified_stable_id
-bash "$ROOT/tests/fm-send-permission-modal-probe.sh" \
+env -u FM_SEND_STEERING_BIN -u FM_SEND_RUNTIME_PROFILE_BIN -u FM_SEND_TEST_HOOKS \
+  bash "$ROOT/tests/fm-send-permission-modal-probe.sh" \
   || fail "fm-send strict: Herdr permission-modal boundary probe failed"

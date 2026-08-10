@@ -467,7 +467,7 @@ The classifier recognizes three shapes in one forward scan, with the bottom-most
 - **Bare** - the trimmed row starts with the verified agent prompt glyph `❯` for Claude or `›` for Codex.
 - **Pi separator-only** - two equal rules fill the current captured pane width with U+2500 `─`, surround exactly one content row, and that raw ANSI content row contains exactly one Pi Editor fake-cursor cell encoded as `SGR-7 space SGR-0`.
 
-Herdr does not expose pane columns in `pane get`, so the classifier derives the current width from the longest ANSI-stripped physical row in the bounded pane capture.
+Herdr 0.7.3 does not expose pane columns in `pane get`, so the classifier derives the current width from the terminal display width of the longest ANSI-stripped physical row in the bounded pane capture.
 The Pi shape has no side border and no prompt glyph.
 A matching rule pair with more than one interior row or without the fake cursor is replacement UI or otherwise ambiguous, so it invalidates stale bordered/bare matches above it and reports `unknown`.
 Because Pi has no prompt glyph or ghost content, its promptless shared-classifier mode removes only the exact cursor cell and treats every remaining visible glyph as `pending`, including dim or dark-styled text and text equal to `❯`, `›`, `>`, `$`, `%`, or `#`; only a blank row is `empty`.

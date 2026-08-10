@@ -2873,9 +2873,38 @@ fm_backend_herdr_is_bare_prompt_row() {  # <plain-trimmed-row>
   esac
 }
 
+fm_backend_herdr_display_columns() {
+  fm_backend_herdr_control_perl -MEncode=decode,FB_CROAK -e '
+    local $/;
+    my $bytes = <STDIN>;
+    $bytes = "" unless defined $bytes;
+    my $text;
+    eval { $text = decode("UTF-8", $bytes, FB_CROAK) };
+    exit 1 if $@;
+    my $max = 0;
+    for my $line (split /\n/, $text, -1) {
+      $line =~ s/\r\z//;
+      my $width = 0;
+      for my $cluster ($line =~ /\X/g) {
+        if ($cluster eq "\t") {
+          $width += 8 - ($width % 8);
+        } elsif ($cluster =~ /\p{Emoji_Presentation}|\p{Regional_Indicator}|\x{20E3}|\x{FE0F}/) {
+          $width += 2;
+        } elsif ($cluster =~ /\p{East_Asian_Width=Wide}|\p{East_Asian_Width=Fullwidth}/) {
+          $width += 2;
+        } elsif ($cluster !~ /\A[\p{Mn}\p{Me}\p{Cf}\p{Cc}]*\z/) {
+          $width += 1;
+        }
+      }
+      $max = $width if $width > $max;
+    }
+    print $max;
+  '
+}
+
 fm_backend_herdr_is_pi_rule_row() {  # <plain-trimmed-row>
   local rule=$1 pane_width=$2 rule_width
-  rule_width=$(printf '%s' "$rule" | fm_backend_herdr_control_jq -Rr 'length') || return 1
+  rule_width=$(printf '%s' "$rule" | fm_backend_herdr_display_columns) || return 1
   case "$1" in
     '─'*) [ "$rule_width" -eq "$pane_width" ] && [ -z "${rule//─/}" ] ;;
     *) return 1 ;;
@@ -2911,8 +2940,7 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
   cap=$(fm_backend_herdr_capture_ansi "$target" "$FM_BACKEND_HERDR_COMPOSER_LINES" 2>/dev/null \
     || fm_backend_herdr_capture "$target" "$FM_BACKEND_HERDR_COMPOSER_LINES") || { printf 'unknown'; return 0; }
   plain_cap=$(fm_backend_herdr_strip_ansi "$cap")
-  pane_width=$(printf '%s' "$plain_cap" | fm_backend_herdr_control_jq -Rsr \
-    'split("\n") | map((if endswith("\r") then .[0:-1] else . end) | length) | max // 0' 2>/dev/null) \
+  pane_width=$(printf '%s' "$plain_cap" | fm_backend_herdr_display_columns 2>/dev/null) \
     || { printf 'unknown'; return 0; }
   [ "$pane_width" -gt 0 ] || { printf 'unknown'; return 0; }
   # Structural scan: locate the bottom-most composer row and remember its RAW

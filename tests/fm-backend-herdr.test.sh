@@ -3133,6 +3133,31 @@ test_composer_state_pi_resized_editor_is_empty() {
   pass "fm_backend_herdr_composer_state: a resized full-width pi editor reads empty"
 }
 
+test_composer_state_pi_multicodepoint_glyphs_are_pending() {
+  local dir log resp fb out rule content padding
+  dir="$TMP_ROOT/composer-pi-multicodepoint"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  rule=$(make_pi_rule 80)
+  content=$'👨‍👩‍👧‍👦e\xcc\x81'
+  printf -v padding '%*s' 76 ''
+  printf '%s\n%s\x1b[7m \x1b[0m%s\n%s\n/project\nfooter\n' "$rule" "$content" "$padding" "$rule" > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = pending ] || fail "multi-codepoint visible pi input should read pending, got '$out'"
+  pass "fm_backend_herdr_composer_state: multi-codepoint pi glyphs read pending"
+}
+
+test_composer_state_invalid_utf8_is_unknown() {
+  local dir log resp fb out
+  dir="$TMP_ROOT/composer-invalid-utf8"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '│ ❯ stale decorative box │\n\xff\n' > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = unknown ] || fail "invalid UTF-8 must keep composer classification unknown, got '$out'"
+  pass "fm_backend_herdr_composer_state: invalid UTF-8 stays fail-closed unknown"
+}
+
 test_composer_state_pi_styled_glyphs_are_pending() {
   local dir log resp fb out rule idx=1
   dir="$TMP_ROOT/composer-pi-styled"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
@@ -4411,6 +4436,8 @@ if [ "${FM_TEST_FOCUSED:-}" = composer-pi ]; then
   test_composer_state_pi_separator_editor_is_empty
   test_composer_state_pi_separator_editor_with_text_is_pending
   test_composer_state_pi_resized_editor_is_empty
+  test_composer_state_pi_multicodepoint_glyphs_are_pending
+  test_composer_state_invalid_utf8_is_unknown
   test_composer_state_pi_styled_glyphs_are_pending
   test_composer_state_pi_short_rules_are_unknown
   test_composer_state_pi_non_cursor_reverse_video_is_unknown
@@ -4596,6 +4623,8 @@ test_composer_state_unknown_when_no_composer_row_found
 test_composer_state_pi_separator_editor_is_empty
 test_composer_state_pi_separator_editor_with_text_is_pending
 test_composer_state_pi_resized_editor_is_empty
+test_composer_state_pi_multicodepoint_glyphs_are_pending
+test_composer_state_invalid_utf8_is_unknown
 test_composer_state_pi_styled_glyphs_are_pending
 test_composer_state_pi_short_rules_are_unknown
 test_composer_state_pi_non_cursor_reverse_video_is_unknown

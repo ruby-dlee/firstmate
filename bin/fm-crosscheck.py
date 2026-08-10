@@ -109,14 +109,21 @@ class MutationRunnerPolicy:
 class TestRun:
     """Resolved proof command and the project directory it must run from."""
 
-    __slots__ = ("argv", "cwd", "body_evidence")
+    __slots__ = ("argv", "cwd", "body_evidence", "body_probe", "environment")
 
     def __init__(
-        self, argv: tuple[str, ...], cwd: Path, body_evidence: bool = False
+        self,
+        argv: tuple[str, ...],
+        cwd: Path,
+        body_evidence: bool = False,
+        body_probe: Path | None = None,
+        environment: tuple[tuple[str, str], ...] = (),
     ) -> None:
         self.argv = argv
         self.cwd = cwd
         self.body_evidence = body_evidence
+        self.body_probe = body_probe
+        self.environment = environment
 
 
 # This registry is the sole declaration point for mutation-proof runners.
@@ -1045,6 +1052,12 @@ def proof_environment() -> dict[str, str]:
     }
 
 
+def proof_run_environment(run: TestRun) -> dict[str, str]:
+    environment = proof_environment()
+    environment.update(dict(run.environment))
+    return environment
+
+
 def write_neutral_runner_config(root: Path) -> None:
     """End runner upward config searches inside a directory the gate owns.
 
@@ -1694,16 +1707,15 @@ def test_arguments(
         )
     argv = [*runner, *policy.gate_arguments, target]
     body_evidence = False
+    probe_argument: Path | None = None
     if policy.body_probe is not None:
         probe_argument = write_javascript_body_probe(
-            run_cwd, runner_name, policy.body_probe
+            run_cwd, checkout, policy.body_probe
         )
         body_evidence = True
-        if policy.body_probe == "jest-global-wrapper":
-            argv.extend(["--setupFilesAfterEnv", str(probe_argument)])
-        elif policy.body_probe == "vitest-runner":
+        if policy.body_probe == "vitest-runner":
             argv.extend(["--config", str(probe_argument)])
-        else:
+        elif policy.body_probe != "jest-global-wrapper":
             tool_fail(
                 f"mutation-runner policy for {runner_name} has unknown body probe "
                 f"{policy.body_probe!r}"
@@ -1711,7 +1723,7 @@ def test_arguments(
     selector = test_selector(test_path, label)
     if selector is not None and policy.selector_mode == "test-name-pattern":
         argv.extend(["--testNamePattern", selector])
-    return TestRun(tuple(argv), run_cwd, body_evidence)
+    return TestRun(tuple(argv), run_cwd, body_evidence, probe_argument)
 
 
 def vitest_project_config(run_cwd: Path) -> Path | None:
@@ -1724,77 +1736,45 @@ def vitest_project_config(run_cwd: Path) -> Path | None:
 
 
 def write_javascript_body_probe(
-    run_cwd: Path, runner: str, probe_kind: str
+    run_cwd: Path, checkout: Path, probe_kind: str
 ) -> Path:
     """Write the gate-owned hook that records entry into each selected test body."""
 
-    protocol = run_cwd / ".crosscheck"
+    protocol = checkout.parent / f".crosscheck-runner-{checkout.name}"
     protocol.mkdir(parents=True, exist_ok=True)
     if probe_kind == "jest-global-wrapper":
-        probe_path = protocol / "jest-body-probe.cjs"
-        argument_path = probe_path
-        channel_path = protocol / "jest-body-channel.cjs"
-        channel_path.write_text(
+        preload_path = protocol / "jest-body-preload.cjs"
+        argument_path = protocol / "jest-body-environment.cjs"
+        preload_path.write_text(
             """const { randomBytes } = require('node:crypto');
 const { writeSync } = require('node:fs');
 const nonce = randomBytes(32).toString('hex');
 const prefix = 'CROSSCHECK-AUTH-BODY';
-const proxies = new WeakMap();
-let installed = false;
+let owner;
 
 function writeEvent(kind, payload) {
   const suffix = payload ? ` ${payload}` : '';
   writeSync(2, `${prefix} ${kind} ${nonce}${suffix}\\n`);
 }
 
-writeEvent('START');
+function claim(candidate) {
+  if (owner) throw new Error('Crosscheck body channel was claimed twice');
+  owner = candidate;
+  writeEvent('START');
+}
 
-function recordBody(declaredName) {
-  const currentName = globalThis.expect?.getState?.().currentTestName;
-  const fullName = typeof currentName === 'string' && currentName
-    ? currentName
-    : String(declaredName);
+function record(candidate, fullName) {
+  if (!owner || candidate !== owner) {
+    throw new Error('Unauthorized Crosscheck body event');
+  }
   const payload = Buffer.from(JSON.stringify({ fullName }), 'utf8').toString('base64');
   writeEvent('EVENT', payload);
 }
 
-function wrapRegistration(registration) {
-  if (typeof registration !== 'function') return registration;
-  const existing = proxies.get(registration);
-  if (existing) return existing;
-  const proxy = new Proxy(registration, {
-    apply(target, thisArg, argumentsList) {
-      const next = [...argumentsList];
-      if (typeof next[1] === 'function') {
-        const declaredName = next[0];
-        const body = next[1];
-        next[1] = function (...bodyArguments) {
-          recordBody(declaredName);
-          return Reflect.apply(body, this, bodyArguments);
-        };
-      }
-      return wrapRegistration(Reflect.apply(target, thisArg, next));
-    },
-    get(target, property, receiver) {
-      return wrapRegistration(Reflect.get(target, property, receiver));
-    },
-  });
-  proxies.set(registration, proxy);
-  return proxy;
-}
-
-function install() {
-  if (installed) return;
-  installed = true;
-  globalThis.test = wrapRegistration(globalThis.test);
-  globalThis.it = wrapRegistration(globalThis.it);
-}
-
-module.exports = { install };
+module.exports = Object.freeze({ claim, record });
 """,
             encoding="utf-8",
         )
-        source = f"require({json.dumps(str(channel_path))}).install();\n"
     elif probe_kind == "vitest-runner":
         probe_path = protocol / "vitest-body-probe.mjs"
         source = """import { randomBytes } from 'node:crypto';
@@ -1841,34 +1821,62 @@ export default class CrosscheckBodyRunner extends TestRunner {
 """
         config_path = protocol / "vitest-body-probe.config.mjs"
         project_config = vitest_project_config(run_cwd)
+        runner_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
         if project_config is None:
-            config_body = f"""export default {{
-  test: {{ runner: {json.dumps(str(probe_path))} }},
-}};
-"""
+            project_loader = "const config = {};"
         else:
-            config_body = f"""import projectConfig from {json.dumps(project_config.as_uri())};
-
-export default async (environment) => {{
+            project_loader = f"""const projectModule = await import({json.dumps(project_config.as_uri())});
+  const projectConfig = projectModule.default;
   const loaded = typeof projectConfig === 'function'
     ? await projectConfig(environment)
     : await projectConfig;
-  const config = loaded || {{}};
+  const config = loaded || {{}};"""
+        config_body = f"""import {{ createHash, randomBytes }} from 'node:crypto';
+import {{ writeSync }} from 'node:fs';
+const nonce = randomBytes(32).toString('hex');
+const prefix = 'CROSSCHECK-AUTH-SOURCE';
+const runnerPath = {json.dumps(str(probe_path))};
+const runnerDigest = {json.dumps(runner_digest)};
+let verified = false;
+
+writeSync(2, `${{prefix}} START ${{nonce}}\\n`);
+
+const verifier = {{
+  name: 'crosscheck-runner-integrity',
+  enforce: 'post',
+  transform(code, id) {{
+    if (id.split('?')[0] !== runnerPath) return null;
+    const digest = createHash('sha256').update(code).digest('hex');
+    if (digest !== runnerDigest || verified) {{
+      throw new Error('Crosscheck Vitest runner failed source verification');
+    }}
+    verified = true;
+    writeSync(2, `${{prefix}} VERIFIED ${{nonce}}\\n`);
+    return null;
+  }},
+}};
+
+export default async (environment) => {{
+  {project_loader}
+  const plugins = Array.isArray(config.plugins)
+    ? config.plugins
+    : config.plugins ? [config.plugins] : [];
   return {{
     ...config,
+    plugins: [...plugins, verifier],
     test: {{ ...(config.test || {{}}), runner: {json.dumps(str(probe_path))} }},
   }};
 }};
 """
         config_path.write_text(config_body, encoding="utf-8")
+        probe_path.write_text(source, encoding="utf-8")
         argument_path = config_path
     else:
         tool_fail(f"unknown JavaScript body probe {probe_kind!r}")
-    probe_path.write_text(source, encoding="utf-8")
     return argument_path
 
 
-def append_jest_project_setup(
+def prepare_jest_body_evidence(
     run: TestRun,
     label: str,
     phase: str,
@@ -1926,26 +1934,125 @@ def append_jest_project_setup(
             f"jest resolved {len(matching)} project configurations for the named "
             f"test during the {phase} run; probe injection is ambiguous",
         )
-    configured_setup = matching[0].get("setupFilesAfterEnv")
-    if not isinstance(configured_setup, list) or any(
-        not isinstance(path, str) or not path for path in configured_setup
-    ):
-        non_execution(label, "jest emitted malformed setupFilesAfterEnv configuration")
+    config = matching[0]
+    environment_path = config.get("testEnvironment")
+    if not isinstance(environment_path, str) or not environment_path:
+        non_execution(label, "jest emitted no resolved test environment")
+    resolved_environment = Path(environment_path).resolve()
     try:
-        setup_index = argv.index("--setupFilesAfterEnv")
+        resolved_environment.relative_to(run.cwd.resolve())
     except ValueError:
-        tool_fail("Jest body probe invocation omitted --setupFilesAfterEnv")
-    if setup_index + 1 >= len(argv):
-        tool_fail("Jest body probe invocation omitted its probe path")
-    probe_path = argv[setup_index + 1]
-    channel_path = str(Path(probe_path).with_name("jest-body-channel.cjs"))
-    setup_arguments = [
-        argument
-        for path in [channel_path, *configured_setup, probe_path]
-        for argument in ("--setupFilesAfterEnv", path)
-    ]
-    argv[setup_index : setup_index + 2] = setup_arguments
-    return TestRun(tuple(argv), run.cwd, run.body_evidence)
+        pass
+    else:
+        non_execution(
+            label,
+            "jest uses a project-controlled test environment that cannot host "
+            "runner-owned body evidence",
+        )
+    environment_text = resolved_environment.as_posix()
+    if not any(
+        f"/node_modules/{package}/build/index.js" in environment_text
+        for package in ("jest-environment-node", "jest-environment-jsdom")
+    ):
+        non_execution(
+            label,
+            "jest uses an unmeasured test environment that cannot host "
+            "runner-owned body evidence",
+        )
+    for key, suffix in (
+        ("runner", "/node_modules/jest-runner/build/index.js"),
+        ("testRunner", "/node_modules/jest-circus/runner.js"),
+    ):
+        value = config.get(key)
+        if not isinstance(value, str) or suffix not in Path(value).resolve().as_posix():
+            non_execution(
+                label,
+                f"jest uses an unmeasured {key} that cannot authenticate body events",
+            )
+    resolver = config.get("resolver")
+    if resolver is not None and resolver != "":
+        non_execution(
+            label,
+            "jest uses a project-controlled resolver before the body-evidence boundary",
+        )
+    runtime = config.get("runtime")
+    if runtime and "/node_modules/jest-runtime/build/index.js" not in Path(
+        runtime
+    ).resolve().as_posix():
+        non_execution(
+            label,
+            "jest uses a project-controlled runtime before the body-evidence boundary",
+        )
+    try:
+        source = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        non_execution(label, f"jest could not inspect its named test: {exc}")
+    if re.search(r"@jest-environment(?:\s|$)", source):
+        non_execution(
+            label,
+            "jest named test overrides the authenticated test environment in a docblock",
+        )
+    transform_ignores = config.get("transformIgnorePatterns")
+    if not isinstance(transform_ignores, list) or any(
+        not isinstance(pattern, str) or not pattern for pattern in transform_ignores
+    ):
+        non_execution(label, "jest emitted malformed transformIgnorePatterns")
+    if run.body_probe is None:
+        tool_fail("Jest body probe did not allocate its runner-owned environment")
+    gate_environment = run.body_probe
+    preload_path = gate_environment.with_name("jest-body-preload.cjs")
+    gate_environment.write_text(
+        f"""const loaded = require({json.dumps(str(resolved_environment))});
+const ProjectEnvironment = loaded.TestEnvironment || loaded.default || loaded;
+const channel = require({json.dumps(str(preload_path))});
+let constructed = false;
+
+function fullName(test) {{
+  const names = [test.name];
+  let parent = test.parent;
+  while (parent && parent.parent) {{
+    if (parent.name) names.unshift(parent.name);
+    parent = parent.parent;
+  }}
+  return names.filter(Boolean).join(' ');
+}}
+
+module.exports = class CrosscheckEnvironment extends ProjectEnvironment {{
+  constructor(...args) {{
+    super(...args);
+    if (constructed) throw new Error('Crosscheck Jest environment was instantiated twice');
+    constructed = true;
+    channel.claim(this);
+    const parentHandler = typeof this.handleTestEvent === 'function'
+      ? this.handleTestEvent.bind(this)
+      : null;
+    Object.defineProperty(this, 'handleTestEvent', {{
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: async (event, state) => {{
+        if (parentHandler) await parentHandler(event, state);
+        if (event.name === 'test_fn_success' || event.name === 'test_fn_failure') {{
+          channel.record(this, fullName(event.test));
+        }}
+      }},
+    }});
+  }}
+}};
+""",
+        encoding="utf-8",
+    )
+    argv.extend(["--env", str(gate_environment)])
+    for pattern in [*transform_ignores, re.escape(str(gate_environment.parent))]:
+        argv.extend(["--transformIgnorePatterns", pattern])
+    node_options = f"--require={json.dumps(str(preload_path))}"
+    return TestRun(
+        tuple(argv),
+        run.cwd,
+        run.body_evidence,
+        gate_environment,
+        (("NODE_OPTIONS", node_options),),
+    )
 
 
 def read_javascript_body_report(
@@ -2014,6 +2121,36 @@ def read_javascript_body_report(
     return executions
 
 
+def require_javascript_source_verification(
+    stderr: str, runner: str, label: str, phase: str
+) -> None:
+    if runner != "vitest":
+        return
+    prefix = "CROSSCHECK-AUTH-SOURCE "
+    lines = [line for line in stderr.split("\n") if line.startswith(prefix)]
+    starts: list[str] = []
+    verified: list[str] = []
+    for line in lines:
+        start_match = re.fullmatch(
+            r"CROSSCHECK-AUTH-SOURCE START ([0-9a-f]{64})", line
+        )
+        verified_match = re.fullmatch(
+            r"CROSSCHECK-AUTH-SOURCE VERIFIED ([0-9a-f]{64})", line
+        )
+        if start_match:
+            starts.append(start_match.group(1))
+        elif verified_match:
+            verified.append(verified_match.group(1))
+        else:
+            non_execution(label, "vitest emitted malformed runner-source evidence")
+    if len(starts) != 1 or len(verified) != 1 or starts != verified:
+        non_execution(
+            label,
+            "vitest did not authenticate its gate-owned runner after project "
+            f"transforms during the {phase} run",
+        )
+
+
 def require_jest_compatible_execution_report(
     result: subprocess.CompletedProcess[str],
     runner: str,
@@ -2022,6 +2159,8 @@ def require_jest_compatible_execution_report(
     body_evidence: bool,
 ) -> None:
     """Require machine results backed by positive selected-body lifecycle evidence."""
+
+    require_javascript_source_verification(result.stderr, runner, label, phase)
 
     try:
         report = json.loads(result.stdout)
@@ -2393,7 +2532,7 @@ def execute_mutation_proof(
     baseline_run = test_arguments(invocation, test_path, proof_dir, label)
     require_classified_runner(invocation["runner"], label)
     if invocation["runner"] == "jest":
-        baseline_run = append_jest_project_setup(
+        baseline_run = prepare_jest_body_evidence(
             baseline_run,
             label,
             "baseline",
@@ -2406,7 +2545,7 @@ def execute_mutation_proof(
         profile_path=baseline_profile,
         allow_network=False,
         allow_posix_ipc=False,
-        env=proof_environment(),
+        env=proof_run_environment(baseline_run),
         timeout=evidence_command_timeout(
             deadline, evidence_timeout(), f"{label} baseline test"
         ),
@@ -2463,7 +2602,7 @@ def execute_mutation_proof(
     mutated_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
     mutated_run = test_arguments(invocation, test_path, proof_dir, label)
     if invocation["runner"] == "jest":
-        mutated_run = append_jest_project_setup(
+        mutated_run = prepare_jest_body_evidence(
             mutated_run,
             label,
             "mutated",
@@ -2476,7 +2615,7 @@ def execute_mutation_proof(
         profile_path=mutated_profile,
         allow_network=False,
         allow_posix_ipc=False,
-        env=proof_environment(),
+        env=proof_run_environment(mutated_run),
         timeout=evidence_command_timeout(
             deadline, evidence_timeout(), f"{label} mutated test"
         ),

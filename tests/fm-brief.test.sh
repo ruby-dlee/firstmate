@@ -446,13 +446,15 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
     assert_grep "States: working, needs-decision, blocked, awaiting, done, failed." "$brief" \
       "$kind brief did not render the configured pause verb in its states list"
     # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
-    assert_grep 'Use `awaiting: {why}`' "$brief" \
+    assert_grep 'Use `awaiting: {reason}; owner={named owner}; clears={observable condition}`' "$brief" \
       "$kind brief did not instruct the configured pause status"
     # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
-    assert_no_grep '`paused: {why}`' "$brief" \
+    assert_no_grep '`paused: {reason}; owner={named owner}; clears={observable condition}`' "$brief" \
       "$kind brief still instructs the default paused status"
     assert_grep 'or a blocker clears' "$brief" \
       "$kind brief did not require durable resolution when a blocker clears"
+    assert_no_grep 'run={current run id}' "$brief" \
+      "$kind brief still claimed a run id could make a pause override run state"
   done
   pass "fm-brief.sh: custom pause verb renders in every scaffold"
 }

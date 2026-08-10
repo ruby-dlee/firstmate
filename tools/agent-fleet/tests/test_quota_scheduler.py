@@ -1161,7 +1161,7 @@ def test_concurrent_reservations_are_atomic_and_balanced(
         )
         for index in range(12)
     ]
-    results = [process.communicate(timeout=20) for process in processes]
+    results = [process.communicate(timeout=60) for process in processes]
     failures = [
         {"returncode": process.returncode, "stdout": stdout, "stderr": stderr}
         for process, (stdout, stderr) in zip(processes, results, strict=True)

@@ -70,8 +70,16 @@ case "${1:-}" in
     case "${1:-}" in
       status)
         shift
-        if [ "${1:-}" = --run ]; then printf '%s\n' "${FM_FAKE_AXI_STATUS_RUN:-}"
-        else printf '%s\n' "${FM_FAKE_AXI_STATUS:-}"; fi ;;
+        if [ "${1:-}" = --run ]; then
+          printf '%s\n' "${FM_FAKE_AXI_STATUS_RUN:-}"
+        else
+          case "${FM_FAKE_AXI_STATUS_MODE:-ok}" in
+            fail) exit 9 ;;
+            signal) kill -TERM "$$" ;;
+            timeout) sleep 30 ;;
+          esac
+          printf '%s\n' "${FM_FAKE_AXI_STATUS:-}"
+        fi ;;
       logs)
         printf '%s\n' "${FM_FAKE_CI_LOGS:-}" ;;
     esac
@@ -205,8 +213,9 @@ case "${FM_FAKE_LIVENESS_MODE:-}" in
   empty-procs) printf 'liveness: unknown · run: 01RUN · procs:  · grade: unreadable · missing count · doing: bash t.sh (1:00)\n' ;;
   argv-fields) printf 'liveness: unknown · run: 01RUN · procs: 3 · grade: present-unproven · presence established · doing: python -c "procs: x grade: bogus" (1:00)\n' ;;
   nonzero) exit 9 ;;
+  no-progress) printf 'liveness: unknown · run: 01RUN · procs: 2 · grade: present-no-progress · PRESENT BUT NOT PROGRESSING: stable membership and no persistent process advanced cpu in 30s (best +0.01s)\n' ;;
   timeout) sleep 30 ;;
-  *) printf 'liveness: alive · run: 01RUN · procs: 1 · processes present\n' ;;
+  *) printf 'liveness: alive · run: 01RUN · procs: 1 · persistent process advanced cpu over 30s (best +0.04s)\n' ;;
 esac
 SH
   chmod +x "$fb/no-mistakes" "$fb/tmux" "$fb/gh-axi" "$fb/git" "$fb/herdr" "$fb/fake-liveness"
@@ -247,6 +256,7 @@ new_case() {  # <name> -> echoes case dir with an empty state/
 # command-substitution assignment (SC2155).
 reset_fakes() {
   FM_FAKE_AXI_STATUS=""
+  FM_FAKE_AXI_STATUS_MODE=ok
   FM_FAKE_AXI_STATUS_RUN=""
   FM_FAKE_RUNS_LIST=""
   FM_FAKE_BUSY=0
@@ -261,7 +271,7 @@ reset_fakes() {
   FM_FAKE_REMOTE_COMMIT_HEAD=abc1234cafebabeabc1234cafebabeabc1234caf
   FM_FAKE_REMOTE_COMMIT_FAIL=0
   FM_FAIL_ON_LOCAL_COMMIT_LOOKUP=0
-  export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_TMUX_MISSING
+  export FM_FAKE_AXI_STATUS FM_FAKE_AXI_STATUS_MODE FM_FAKE_AXI_STATUS_RUN FM_FAKE_RUNS_LIST FM_FAKE_BUSY FM_FAKE_TMUX_MISSING
   export FM_FAKE_HERDR_BUSY FM_FAKE_HERDR_MISSING FM_FAKE_HERDR_AGENT_STATUS FM_FAKE_CI_LOGS
   export FM_FAKE_PR_STATE FM_FAKE_PR_HEAD FM_FAKE_GH_AXI_FAIL
   export FM_FAKE_REMOTE_COMMIT_HEAD FM_FAKE_REMOTE_COMMIT_FAIL FM_FAIL_ON_LOCAL_COMMIT_LOOKUP
@@ -552,6 +562,13 @@ test_quiet_step_probe_failures_are_unknown() {
   assert_contains "$out" "probe unreadable: active step unavailable" "a missing active step explains its unreadable cause"
 
   FM_FAKE_AXI_STATUS="$(run_running_quiet_step fm/feat-qu test)"
+  out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=no-progress \
+    run_crew_state "$d" feat-qu)
+  assert_contains "$out" "liveness: unknown (grade: present-no-progress; 2 procs" \
+    "the probe's near-zero CPU grade stays an explicit unknown, never a fourth verdict"
+  assert_contains "$out" "no persistent process advanced cpu in 30s (best +0.01s)" \
+    "the present-no-progress grade preserves its CPU-versus-elapsed evidence"
+
   out=$(FM_CREW_STATE_NM_LIVENESS_BIN="$probe" FM_FAKE_LIVENESS_MODE=empty \
     run_crew_state "$d" feat-qu)
   assert_contains "$out" "liveness: unknown" "an empty probe result is visibly unknown"
@@ -717,6 +734,39 @@ test_gate_block_parked_not_superseded() {
   assert_contains "$out" "1 finding(s)" "gate block wait includes finding count"
   assert_not_contains "$out" "superseded" "gate block wait not flagged stale"
   pass "gate block parked run is not flagged superseded"
+}
+
+test_matching_run_state_overrides_pause() {
+  reset_fakes
+  local d out pause
+  d=$(new_case run-pause-chronology)
+  make_repo_on_branch "$d/wt" fm/run-pause-chronology
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/run-pause-chronology.meta" \
+    "window=fm:fm-run-pause-chronology" "worktree=$d/wt" "kind=ship"
+  pause='paused: awaiting release; owner=release team; clears=release artifact is published'
+
+  FM_FAKE_AXI_STATUS="$(run_passed fm/run-pause-chronology)"
+  printf '%s; run=01RUN\n' "$pause" > "$d/state/run-pause-chronology.status"
+  out=$(run_crew_state "$d" run-pause-chronology)
+  assert_contains "$out" "state: done" "a completed run hid behind a matching-run pause"
+
+  FM_FAKE_AXI_STATUS="$(run_parked fm/run-pause-chronology)"
+  out=$(run_crew_state "$d" run-pause-chronology)
+  assert_contains "$out" "state: parked" "a parked run hid behind a matching-run pause"
+
+  FM_FAKE_AXI_STATUS="$(run_running fm/run-pause-chronology)"
+  out=$(run_crew_state "$d" run-pause-chronology)
+  assert_contains "$out" "state: working" "an active run hid behind its associated pause"
+
+  FM_FAKE_AXI_STATUS="$(run_failed fm/run-pause-chronology)"
+  out=$(run_crew_state "$d" run-pause-chronology)
+  assert_contains "$out" "state: failed" "a failed run hid behind its associated pause"
+
+  FM_FAKE_AXI_STATUS="$(run_completed_without_outcome fm/run-pause-chronology)"
+  out=$(run_crew_state "$d" run-pause-chronology)
+  assert_contains "$out" "state: unknown" "an unknown run hid behind its associated pause"
+  pass "every matching run state remains authoritative over a pause declaration"
 }
 
 test_ci_ready_done_log_beats_monitoring_run() {
@@ -1463,8 +1513,8 @@ test_skipped_run_lookup_rejects_checks_green_log() {
   FM_FAKE_BUSY=0
   local out; out=$(run_crew_state "$d" feat-detached-ready)
   assert_contains "$out" "state: unknown" "skipped run lookup with ready log -> unknown"
-  assert_contains "$out" "currentness is unavailable" "skipped lookup names missing currentness"
-  assert_contains "$out" "do not merge" "skipped lookup is merge-safe"
+  assert_contains "$out" "no-mistakes run lookup unavailable for this lane" "skipped lookup names missing currentness"
+  assert_not_contains "$out" "state: paused" "skipped lookup must not authorize a pause"
   assert_not_contains "$out" "state: done" "skipped lookup must not authorize done"
   pass "skipped run lookup rejects a stale checks-green log"
 }
@@ -1493,7 +1543,7 @@ test_no_run_idle_pane_paused() {
   make_repo_on_branch "$d/wt" fm/feat-pause
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-pause.meta" "window=fm:fm-feat-pause" "worktree=$d/wt" "kind=ship"
-  printf 'paused: holding for the upstream tool release\n' > "$d/state/feat-pause.status"
+  printf 'paused: holding for the upstream tool release; owner=tool maintainer; clears=release artifact is published\n' > "$d/state/feat-pause.status"
   FM_FAKE_AXI_STATUS=""
   FM_FAKE_BUSY=0
   local out; out=$(run_crew_state "$d" feat-pause)
@@ -1503,13 +1553,83 @@ test_no_run_idle_pane_paused() {
   pass "no run + idle pane on a paused: status reports state: paused with its reason"
 }
 
+test_unreadable_run_lookup_rejects_pause() {
+  reset_fakes
+  local d out
+  d=$(new_case unreadable-run-paused)
+  make_repo_on_branch "$d/wt" fm/unreadable-run-paused
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/unreadable-run-paused.meta" \
+    "window=fm:fm-unreadable-run-paused" "worktree=$d/wt" "kind=ship"
+  printf 'paused: awaiting release; owner=release team; clears=release artifact is published\n' \
+    > "$d/state/unreadable-run-paused.status"
+  FM_FAKE_AXI_STATUS='not a run status response'
+  FM_FAKE_BUSY=0
+  out=$(run_crew_state "$d" unreadable-run-paused)
+  assert_contains "$out" "state: unknown" "malformed run lookup -> unknown"
+  assert_contains "$out" "run lookup unavailable" "malformed run lookup names the unavailable proof"
+  assert_not_contains "$out" "state: paused" "malformed run lookup trusted a stale pause"
+
+  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_AXI_STATUS_MODE=fail
+  out=$(run_crew_state "$d" unreadable-run-paused)
+  assert_contains "$out" "state: unknown" "failed run lookup -> unknown"
+  assert_not_contains "$out" "state: paused" "failed run lookup trusted a stale pause"
+
+  FM_FAKE_AXI_STATUS_MODE=ok
+  FM_FAKE_AXI_STATUS="$(run_running fm/some-other)"
+  FM_FAKE_RUNS_LIST='not a runs-list row'
+  out=$(run_crew_state "$d" unreadable-run-paused)
+  assert_contains "$out" "state: unknown" "malformed runs-list fallback -> unknown"
+  assert_not_contains "$out" "state: paused" "malformed runs-list fallback trusted a stale pause"
+  pass "unreadable run discovery cannot authorize a status-log pause"
+}
+
+test_timed_out_run_lookup_rejects_pause() {
+  reset_fakes
+  local d out
+  d=$(new_case timed-out-run-paused)
+  make_repo_on_branch "$d/wt" fm/timed-out-run-paused
+  make_fakebin "$d" >/dev/null
+  fm_write_meta "$d/state/timed-out-run-paused.meta" \
+    "window=fm:fm-timed-out-run-paused" "worktree=$d/wt" "kind=ship"
+  printf 'paused: awaiting release; owner=release team; clears=release artifact is published\n' \
+    > "$d/state/timed-out-run-paused.status"
+  FM_FAKE_AXI_STATUS_MODE=timeout
+  FM_FAKE_BUSY=0
+  out=$(FM_CREW_STATE_NM_TIMEOUT=1 run_crew_state "$d" timed-out-run-paused)
+  assert_contains "$out" "state: unknown" "timed-out run lookup -> unknown"
+  assert_contains "$out" "run lookup unavailable" "timed-out run lookup names the unavailable proof"
+  assert_not_contains "$out" "state: paused" "timed-out run lookup trusted a stale pause"
+  pass "timed-out run discovery cannot authorize a status-log pause"
+}
+
+test_signaled_run_lookup_rejects_pause() {
+  reset_fakes
+  local d out toolbin
+  d=$(new_case signaled-run-paused)
+  make_repo_on_branch "$d/wt" fm/signaled-run-paused
+  make_fakebin "$d" >/dev/null
+  toolbin=$(make_no_timeout_toolbin "$d")
+  fm_write_meta "$d/state/signaled-run-paused.meta" \
+    "window=fm:fm-signaled-run-paused" "worktree=$d/wt" "kind=ship"
+  printf 'paused: awaiting release; owner=release team; clears=release artifact is published\n' \
+    > "$d/state/signaled-run-paused.status"
+  FM_FAKE_AXI_STATUS_MODE=signal
+  out=$(PATH="$d/fakebin:$toolbin" FM_STATE_OVERRIDE="$d/state" "$CREW_STATE" signaled-run-paused)
+  assert_contains "$out" "state: unknown" "signaled run lookup -> unknown"
+  assert_contains "$out" "run lookup unavailable" "signaled run lookup names the unavailable proof"
+  assert_not_contains "$out" "state: paused" "signaled run lookup trusted a stale pause"
+  pass "signaled run discovery cannot authorize a status-log pause"
+}
+
 test_no_run_idle_pane_custom_paused_verb() {
   reset_fakes
   local d; d=$(new_case custom-paused)
   make_repo_on_branch "$d/wt" fm/feat-custom-pause
   make_fakebin "$d" >/dev/null
   fm_write_meta "$d/state/feat-custom-pause.meta" "window=fm:fm-feat-custom-pause" "worktree=$d/wt" "kind=ship"
-  printf 'awaiting: vendor maintenance window\n' > "$d/state/feat-custom-pause.status"
+  printf 'awaiting: vendor maintenance window; owner=vendor; clears=maintenance window closes\n' > "$d/state/feat-custom-pause.status"
   FM_FAKE_AXI_STATUS=""
   FM_FAKE_BUSY=0
   local out; out=$(FM_CLASSIFY_PAUSED_VERB=awaiting run_crew_state "$d" feat-custom-pause)
@@ -1518,8 +1638,60 @@ test_no_run_idle_pane_custom_paused_verb() {
   assert_contains "$out" "vendor maintenance window" "custom pause preserves its reason"
   printf 'paused: default verb no longer selected\n' > "$d/state/feat-custom-pause.status"
   out=$(FM_CLASSIFY_PAUSED_VERB=awaiting run_crew_state "$d" feat-custom-pause)
-  assert_contains "$out" "state: unknown" "custom paused verb replaces the default"
+  assert_contains "$out" "state: unknown" "custom paused verb leaves the unrecognized default a non-state, not paused"
   pass "no run + idle pane honors the configured paused verb"
+}
+
+# The supervisor-facing reader must preserve three separate outcomes: a readable
+# stopped lane without positive work evidence is wedged, an auditable declaration
+# is paused, and a lane with no readable evidence remains unknown.  In particular,
+# silence must never inherit paused health from the pause vocabulary.
+test_supervisor_read_separates_paused_wedged_unknown() {
+  reset_fakes
+  local wedged paused silent wedged_out paused_out silent_out correct=0
+
+  wedged=$(new_case supervisor-wedged)
+  make_repo_on_branch "$wedged/wt" fm/supervisor-wedged
+  make_fakebin "$wedged" >/dev/null
+  fm_write_meta "$wedged/state/supervisor-wedged.meta" \
+    "window=fm:fm-supervisor-wedged" "worktree=$wedged/wt" "kind=ship"
+  printf 'working: implementation was in progress\n' > "$wedged/state/supervisor-wedged.status"
+  FM_FAKE_AXI_STATUS=""
+  FM_FAKE_RUNS_LIST=""
+  FM_FAKE_BUSY=0
+  wedged_out=$(run_crew_state "$wedged" supervisor-wedged)
+  case "$wedged_out" in
+    *"state: wedged"*) case "$wedged_out" in *"state: paused"*) ;; *) correct=$((correct + 1)) ;; esac ;;
+  esac
+
+  paused=$(new_case supervisor-paused)
+  make_repo_on_branch "$paused/wt" fm/supervisor-paused
+  make_fakebin "$paused" >/dev/null
+  fm_write_meta "$paused/state/supervisor-paused.meta" \
+    "window=fm:fm-supervisor-paused" "worktree=$paused/wt" "kind=ship"
+  printf 'paused: validation hold; owner=supervisor; clears=supervisor lifts the hold after host load recovers\n' \
+    > "$paused/state/supervisor-paused.status"
+  paused_out=$(run_crew_state "$paused" supervisor-paused)
+  case "$paused_out" in
+    *"state: paused"*"owner=supervisor"*"clears=supervisor lifts the hold after host load recovers"*)
+      correct=$((correct + 1))
+      ;;
+  esac
+
+  silent=$(new_case supervisor-silent)
+  make_fakebin "$silent" >/dev/null
+  silent_out=$(run_crew_state "$silent" supervisor-silent)
+  export FM_CREW_STATE_BIN="$silent/fakebin/fm-crew-state.sh"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · no metadata'
+  case "$silent_out:$(crew_absorb_class supervisor-silent)" in
+    *"state: unknown"*:none) case "$silent_out" in *"state: paused"*) ;; *) correct=$((correct + 1)) ;; esac ;;
+  esac
+  unset FM_FAKE_CREW_STATE
+  export FM_CREW_STATE_BIN="$CREW_STATE"
+
+  [ "$correct" -eq 3 ] \
+    || fail "$correct of 3 supervisor states were distinct: wedged=[$wedged_out] paused=[$paused_out] silent=[$silent_out]"
+  pass "supervisor read keeps wedged, owned pause, and unknown silence distinct"
 }
 
 # A trailing keyed resolved: event is a decision-CLOSING event, not a run-state
@@ -1553,6 +1725,18 @@ test_no_run_idle_secondmate_resolved_event_not_state() {
   out=$(run_crew_state "$d" mate)
   assert_contains "$out" "state: working" "a real trailing state verb still renders"
   assert_contains "$out" "reconciling routed items" "a real state line still carries its detail"
+  # The invariant is about the EVENT, not the kind: a ship whose last event only
+  # closed a decision has no current-state source either, so it must not be graded
+  # a stopped lane and must not render the resolution prose as what it is doing.
+  fm_write_meta "$d/state/hull.meta" "window=fm:fm-hull" "worktree=$d/wt" "kind=ship"
+  printf 'needs-decision [key=rollback]: merge as-is, or fix the empty-pointer refusal?\n' \
+    > "$d/state/hull.status"
+  printf 'resolved [key=rollback]: option (a) approved - merge this rebase as-is\n' \
+    >> "$d/state/hull.status"
+  out=$(run_crew_state "$d" hull)
+  assert_contains "$out" "state: unknown" "a resolved-then-idle ship is not graded a stopped lane"
+  assert_contains "$out" "source: none" "a resolved event is not a status-log state source for a ship either"
+  assert_not_contains "$out" "merge this rebase as-is" "ship resolution prose must not leak into the detail"
   pass "a trailing resolved: event does not corrupt state render (idle stays idle)"
 }
 
@@ -1630,8 +1814,8 @@ SH
   start=$SECONDS
   out=$(FM_FAKE_NM_CALLS="$calls_file" PATH="$d/fakebin:$toolbin" FM_STATE_OVERRIDE="$d/state" FM_CREW_STATE_NM_TIMEOUT=1 "$CREW_STATE" feat-timeout)
   elapsed=$((SECONDS - start))
-  assert_contains "$out" "state: working" "timed-out no-mistakes falls back to pane"
-  assert_contains "$out" "source: pane" "timed-out no-mistakes -> pane source"
+  assert_contains "$out" "state: unknown" "timed-out no-mistakes remains unknown"
+  assert_contains "$out" "run lookup unavailable" "timed-out no-mistakes names the unavailable proof"
   [ "$elapsed" -lt 5 ] || fail "perl timeout did not bound no-mistakes calls (elapsed ${elapsed}s)"
   calls=$(awk 'END { print NR + 0 }' "$calls_file" 2>/dev/null || echo 0)
   [ "$calls" -eq 1 ] || fail "empty no-mistakes status triggered extra lookups ($calls calls)"
@@ -1699,7 +1883,9 @@ test_provably_working_via_runs_list_fallback() {
   running    fm/feat-provable bbbbbbb  2026-07-02 22:05
 EOF
 )"
-  PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" crew_is_provably_working feat-provable \
+  PATH="$d/fakebin:$PATH" FM_STATE_OVERRIDE="$d/state" \
+    FM_CREW_STATE_NM_LIVENESS_BIN="$d/fakebin/fake-liveness" \
+    crew_is_provably_working feat-provable \
     || fail "cross-branch attribution via the runs list was not treated as provably working"
   pass "crew_is_provably_working absorbs a validating crew found only via the runs-list fallback"
 }
@@ -1733,6 +1919,32 @@ test_usage_error() {
   pass "usage error exits 2"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = supervision-states ]; then
+  test_supervisor_read_separates_paused_wedged_unknown
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = state-consumer-regressions ]; then
+  test_matching_run_state_overrides_pause
+  test_supervisor_read_separates_paused_wedged_unknown
+  test_no_run_idle_secondmate_resolved_event_not_state
+  test_provably_working_via_runs_list_fallback
+  test_not_provably_working_when_stopped
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = run-discovery ]; then
+  test_matching_run_state_overrides_pause
+  test_cross_branch_attribution_via_runs_list
+  test_other_branch_run_ignored
+  test_no_run_idle_pane_paused
+  test_unreadable_run_lookup_rejects_pause
+  test_timed_out_run_lookup_rejects_pause
+  test_signaled_run_lookup_rejects_pause
+  test_no_timeout_uses_perl_bound
+  exit 0
+fi
+
 test_active_run_is_authoritative
 test_quiet_step_reports_dead_liveness
 test_quiet_step_reports_alive_liveness
@@ -1743,6 +1955,7 @@ test_stale_blocked_superseded
 test_genuine_parked_not_superseded
 test_scalar_gate_parked_not_superseded
 test_gate_block_parked_not_superseded
+test_matching_run_state_overrides_pause
 test_ci_ready_done_log_beats_monitoring_run
 test_ci_ready_log_pr_url_does_not_supply_run_identity
 test_ci_monitoring_checks_green_surfaces_done
@@ -1784,7 +1997,11 @@ test_empty_run_lookup_rejects_checks_green_log
 test_skipped_run_lookup_rejects_checks_green_log
 test_no_run_idle_pane_uses_keyed_log
 test_no_run_idle_pane_paused
+test_unreadable_run_lookup_rejects_pause
+test_timed_out_run_lookup_rejects_pause
+test_signaled_run_lookup_rejects_pause
 test_no_run_idle_pane_custom_paused_verb
+test_supervisor_read_separates_paused_wedged_unknown
 test_no_run_idle_secondmate_resolved_event_not_state
 test_dead_window_ignores_stale_status_log
 test_dead_window_still_reports_terminal_run_step

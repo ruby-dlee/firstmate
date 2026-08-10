@@ -15,14 +15,14 @@
 # and log reads plus fixed mapping logic, no heuristics and no LLM. Output is one
 # stable, parseable, token-tight line firstmate can read every heartbeat:
 #
-#   state: <working|parked|done|stale|blocked|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
+#   state: <working|parked|done|stale|blocked|wedged|paused|failed|unknown> · source: <run-step|pane|status-log|none> · <detail>
 #   ... · liveness: <alive|dead|unknown> · step: <name>
 #
 # Logic, in order:
 #   1. Resolve worktree + backend target + kind from state/<id>.meta.
 #   2. Matching no-mistakes run for this crewmate's branch, active or terminal
 #      (from `axi status`, or the coarse `no-mistakes runs` fallback)?
-#      The run-step is AUTHORITATIVE for active, parked, and failed states:
+#      The run-step is AUTHORITATIVE for every matching run state:
 #      running/fixing -> working, ci -> working, awaiting_approval/fix_review ->
 #      parked (with gate findings), and failed/cancelled -> failed. A PR-ready
 #      passed/checks-passed claim becomes done only after GitHub resolves the
@@ -39,10 +39,10 @@
 #      the run-step shows the run moved on, the log is deterministically stale and
 #      is flagged superseded. A genuinely parked run plus a needs-decision log
 #      agree, and are reported as parked.
-#   4. No run for this crewmate (pre-validation, or kind=scout): fall back to the
-#      recorded backend's pane busy state, then the status log's last line only
-#      when its verb maps to a recognized run-state. Decision-only events such as
-#      `resolved` never become current state or detail.
+#   4. Only an affirmatively absent run (pre-validation, or kind=scout) permits
+#      fallback to the recorded backend's pane busy state, then the status log's
+#      last line when its verb maps to a recognized run-state. An unreadable run
+#      lookup reports unknown; decision-only events never become current state.
 #   5. Missing meta or torn-down worktree: report unknown · none. If no run is
 #      attributed to this crewmate, a dead endpoint also reports unknown · none rather
 #      than trusting a stale status log.
@@ -121,7 +121,7 @@ log_last_line() {
 }
 # Map a status-log verb onto a canonical state for the fallback path. `paused` is
 # the deliberate-external-wait verb (fm-classify-lib.sh's FM_CLASSIFY_PAUSED_VERB):
-# a crewmate with no active run and an idle pane that declared a known external wait
+# a crewmate with no active run and an idle pane that declared a valid owned-and-clearing wait
 # reports `paused` distinctly, so a supervisor reading this sees a declared pause
 # and its reason rather than a wedge-suspect idle. A line that uses the pause verb to
 # report a FAILURE is not a pause (fm-classify-lib.sh's status_pause_is_failure); it
@@ -216,19 +216,28 @@ strip_quotes() {
   trim "$s"
 }
 
-# Bounded no-mistakes call in the worktree; stdout only, never fails the script.
+# Bounded no-mistakes call in the worktree.
 HAVE_TIMEOUT=none
 if command -v timeout >/dev/null 2>&1; then HAVE_TIMEOUT=timeout
 elif command -v gtimeout >/dev/null 2>&1; then HAVE_TIMEOUT=gtimeout
 elif command -v perl >/dev/null 2>&1; then HAVE_TIMEOUT=perl
 fi
-nm_run() {  # <args...>
+nm_run_capture() {  # <output-variable> <args...>
+  local output_var=$1 _nm_captured _nm_status
+  shift
   case "$HAVE_TIMEOUT" in
-    timeout)  ( cd "$WT" && timeout "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true ;;
-    gtimeout) ( cd "$WT" && gtimeout "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true ;;
-    perl)     ( cd "$WT" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$NM_TIMEOUT" no-mistakes "$@" ) 2>/dev/null || true ;;
-    *)        true ;;
+    timeout)  _nm_captured=$(cd "$WT" && timeout "$NM_TIMEOUT" no-mistakes "$@" 2>/dev/null); _nm_status=$? ;;
+    gtimeout) _nm_captured=$(cd "$WT" && gtimeout "$NM_TIMEOUT" no-mistakes "$@" 2>/dev/null); _nm_status=$? ;;
+    perl)     _nm_captured=$(cd "$WT" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' "$NM_TIMEOUT" no-mistakes "$@" 2>/dev/null); _nm_status=$? ;;
+    *)        _nm_captured=; _nm_status=127 ;;
   esac
+  printf -v "$output_var" '%s' "$_nm_captured"
+  return "$_nm_status"
+}
+nm_run() {  # <args...>
+  local captured=
+  nm_run_capture captured "$@" || true
+  printf '%s' "$captured"
 }
 
 # Bounded, read-only GitHub query in the worktree; stdout only, never fails the
@@ -237,7 +246,7 @@ gh_axi_run() {  # <args...>
   case "$HAVE_TIMEOUT" in
     timeout)  ( cd "$WT" && timeout "$GH_TIMEOUT" gh-axi "$@" ) 2>/dev/null || true ;;
     gtimeout) ( cd "$WT" && gtimeout "$GH_TIMEOUT" gh-axi "$@" ) 2>/dev/null || true ;;
-    perl)     ( cd "$WT" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' "$GH_TIMEOUT" gh-axi "$@" ) 2>/dev/null || true ;;
+    perl)     ( cd "$WT" && perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' "$GH_TIMEOUT" gh-axi "$@" ) 2>/dev/null || true ;;
     *)        true ;;
   esac
 }
@@ -408,11 +417,10 @@ verify_ready_head_or_emit() {  # <run-id> <validated-head> <pr-url>
 # both runs validate the same commit and the live PR-head comparison therefore
 # cannot distinguish them.
 verify_no_newer_active_run_or_emit() {  # <branch>
-  local branch=$1 newest newest_status newest_rest newest_head
-  newest=$(nm_runs_status_for_branch "$branch")
-  if [ -z "$newest" ]; then
-    emit unknown run-step "PR-ready run-step could not verify the newest branch run; do not merge"
-  fi
+  local branch=$1 newest newest_status newest_rest newest_head status
+  newest=$(nm_runs_status_for_branch "$branch") || status=$?
+  [ "${status:-0}" -eq 0 ] \
+    || emit unknown run-step "PR-ready run-step could not verify the newest branch run; do not merge"
   newest_status=${newest%%|*}
   newest_rest=${newest#*|}
   newest_head=${newest_rest%%|*}
@@ -539,12 +547,14 @@ nm_active_step_name() {
 # One-line liveness verdict for the active step's own processes. A one-second
 # in-invocation membership sample lets this one-shot caller establish child
 # turnover without paying the 20-second window CPU rates require. Stable process
-# membership falls back to the probe's preserved long-window CPU baseline. This
-# consumer accepts exactly three verdicts: alive, dead, or unknown. A missing,
-# failed, empty, or malformed probe is unknown, never silence and never evidence
-# of health or death.
+# membership falls back to the probe's preserved long-window CPU baseline. The
+# probe owns the CPU-versus-elapsed measurement and its threshold; this consumer
+# accepts exactly three verdicts: alive, dead, or unknown - presence the probe
+# could not prove is progressing arrives as a graded unknown, not a fourth verdict.
+# A missing, failed, empty, or malformed probe is unknown, never silence and never
+# evidence of health or death.
 nm_step_liveness() {
-  local run_id out status=0 verdict procs doing grade detail detail_fields line rest reported_run structured_detail
+  local run_id out status=0 verdict procs doing grade detail detail_fields line rest reported_run structured_detail progress
   run_id=$(strip_quotes "$(nm_field id)")
   [ -n "$run_id" ] || { printf 'unknown (probe unreadable: run id unavailable)'; return; }
   [ -x "$NM_LIVENESS_BIN" ] || { printf 'unknown (probe unreadable: executable unavailable)'; return; }
@@ -555,7 +565,7 @@ nm_step_liveness() {
     # with neither timeout nor gtimeout - the ordinary macOS default, including
     # this one - fell through to an UNBOUNDED probe call, so a slow lsof or
     # process scan could block the supervision read for as long as it took.
-    perl)     out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; exit($? >> 8)' \
+    perl)     out=$(perl -e 'my $t = shift; my $pid = fork; die "fork failed" unless defined $pid; if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 } local $SIG{ALRM} = sub { kill "TERM", -$pid; select undef, undef, undef, 0.2; kill "KILL", -$pid; exit 124 }; alarm $t; waitpid $pid, 0; my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : $status >> 8)' \
                   "$NM_TIMEOUT" "$NM_LIVENESS_BIN" "$run_id" --sample 1 2>/dev/null) || status=$? ;;
     *)        printf 'unknown (probe unreadable: no bounded runner available)'; return ;;
   esac
@@ -638,6 +648,7 @@ nm_step_liveness() {
   doing=${out##*doing: }
   [ "$doing" = "$out" ] && doing=""
   line="$verdict ($procs procs)"
+  progress=""
   if [ "$verdict" = unknown ]; then
     case "$grade" in
       unreadable|present-unproven|present-no-progress|transition) ;;
@@ -649,29 +660,36 @@ nm_step_liveness() {
       "$detail_fields"|grade:*) detail="probe reported unknown" ;;
     esac
     line="unknown (grade: $grade; $procs procs; $detail)"
+  else
+    # A decided verdict keeps the probe's own CPU-versus-elapsed evidence, which
+    # is what separates measured work from a process set sitting at the near-zero
+    # floor. `doing:` is already excluded: structured_detail comes from the
+    # prefix before it, so truncated argv can never be read as progress.
+    progress=$structured_detail
   fi
+  [ -n "$progress" ] && line="$line; $progress"
   [ -n "$doing" ] && line="$line on $doing"
   printf '%s' "$line"
 }
 
 nm_runs_status_for_branch() {  # <branch>
-  local branch=$1 out row st rest br head pr field
-  out=$(nm_run runs --limit "$FM_CREW_STATE_RUNS_LIMIT")
-  [ -n "$out" ] || return 0
+  local branch=$1 out row st br head pr field
+  nm_run_capture out runs --limit "$FM_CREW_STATE_RUNS_LIMIT" || return 2
+  [ -n "$out" ] || return 1
   while IFS= read -r row; do
     row=$(trim "$row")
     [ -n "$row" ] || continue
-    st=${row%% *}
-    rest=${row#* }
-    rest=$(trim "$rest")
-    br=${rest%% *}
+    # shellcheck disable=SC2086 # Intentional whitespace tokenization of CLI output.
+    set -- $row
+    [ "$#" -ge 4 ] || return 2
+    st=$1
+    br=$2
+    head=$3
+    case "$st" in running|completed|failed|cancelled) ;; *) return 2 ;; esac
     if [ "$br" = "$branch" ]; then
       # The human-oriented runs row is whitespace-delimited and always starts
       # with status, branch, and short head. Preserve the optional PR URL so a
       # coarse branch match can still verify a checks-green status-log event.
-      # shellcheck disable=SC2086 # Intentional whitespace tokenization of CLI output.
-      set -- $row
-      head=${3:-}
       pr=
       for field in "$@"; do
         case "$field" in https://github.com/*/*/pull/[0-9]*) pr=$field ;; esac
@@ -680,7 +698,20 @@ nm_runs_status_for_branch() {  # <branch>
       return 0
     fi
   done <<< "$out"
-  return 0
+  return 1
+}
+
+nm_status_output_valid() {
+  local id branch status
+  printf '%s\n' "$RUN_OUT" | grep -q '^run:$' || return 1
+  id=$(strip_quotes "$(nm_field id)")
+  branch=$(strip_quotes "$(nm_field branch)")
+  status=$(strip_quotes "$(nm_field status)")
+  [ -n "$id" ] && [ -n "$branch" ] || return 1
+  case "$status" in
+    running|fixing|ci|awaiting_approval|fix_review|completed|failed|cancelled) return 0 ;;
+  esac
+  return 1
 }
 
 # CREW_BRANCH is empty at detached HEAD (a just-spawned crewmate, or a scout's
@@ -688,6 +719,7 @@ nm_runs_status_for_branch() {  # <branch>
 CREW_BRANCH=$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
 
 HAVE_RUN=0
+RUN_DISCOVERY=unknown
 # RUN_SOURCE distinguishes the two ways HAVE_RUN=1 can happen: "full" means
 # $RUN_OUT is real `axi status` TOON with step/gate detail; "coarse" means only
 # a bare status word came back from the runs-list fallback above, so the
@@ -696,25 +728,32 @@ RUN_SOURCE=full
 COARSE_STATUS=""
 # Scouts and secondmates never drive a no-mistakes validation of their own
 # worktree, so skip the lookup for them and read state from pane/log directly.
-if [ "$KIND" = ship ] && [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
-  RUN_OUT=$(nm_run axi status)
-  if [ -n "$RUN_OUT" ]; then
-    run_branch=$(strip_quotes "$(nm_field branch)")
-    if [ -n "$run_branch" ] && [ "$run_branch" = "$CREW_BRANCH" ]; then
-      HAVE_RUN=1
-    else
-      # The active-or-most-recent run is for another branch (the CLI is alive
-      # and answered; only the attribution missed) - try the coarse fallback.
-      # Deliberately nested inside `[ -n "$RUN_OUT" ]`: an empty/timed-out
-      # primary call means the CLI itself did not respond, so retrying it
-      # immediately with a second bounded call would just double the wait
-      # for no better answer.
-      coarse_run=$(nm_runs_status_for_branch "$CREW_BRANCH")
-      if [ -n "$coarse_run" ]; then
-        COARSE_STATUS=${coarse_run%%|*}
+if [ "$KIND" != ship ]; then
+  RUN_DISCOVERY=absent
+elif [ -n "$CREW_BRANCH" ] && command -v no-mistakes >/dev/null 2>&1; then
+  if nm_run_capture RUN_OUT axi status; then
+    if [ -z "$RUN_OUT" ]; then
+      RUN_DISCOVERY=absent
+    elif nm_status_output_valid; then
+      run_branch=$(strip_quotes "$(nm_field branch)")
+      if [ "$run_branch" = "$CREW_BRANCH" ]; then
         HAVE_RUN=1
-        RUN_SOURCE=coarse
+        RUN_DISCOVERY=found
+      else
+        if coarse_run=$(nm_runs_status_for_branch "$CREW_BRANCH"); then
+          COARSE_STATUS=${coarse_run%%|*}
+          HAVE_RUN=1
+          RUN_DISCOVERY=found
+          RUN_SOURCE=coarse
+        else
+          case "$?" in
+            1) RUN_DISCOVERY=absent ;;
+            *) RUN_DISCOVERY=unknown ;;
+          esac
+        fi
       fi
+    else
+      RUN_DISCOVERY=unknown
     fi
   fi
 fi
@@ -892,6 +931,8 @@ fi
 # liveness, so a finished-but-pane-closed crewmate never reaches here. Down here there
 # is no run to consult, so a dead/unreadable target means the crewmate is gone: report
 # unknown rather than trusting a possibly-stale status log as the current state.
+[ "$RUN_DISCOVERY" = absent ] \
+  || emit unknown none "no-mistakes run lookup unavailable for ${CREW_BRANCH:-this lane}"
 [ -n "$BACKEND_TARGET" ] || emit unknown none "no backend target recorded"
 pane_readable "$BACKEND_TARGET" || emit unknown none "backend target gone: $BACKEND_TARGET"
 
@@ -917,9 +958,16 @@ fi
 # `unknown` verdict as the "not a state" test needs no second verb list here.
 if [ -n "$LOG_VERB" ]; then
   LOG_STATE=$(map_log_state "$LOG_LINE")
-  if [ "$LOG_STATE" != unknown ]; then
-    emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")"
-  fi
+  case "$LOG_STATE" in
+    working)
+      [ "$KIND" = secondmate ] \
+        && emit working status-log "$(status_line_note "$LOG_LINE")"
+      emit wedged status-log "stopped without positive working evidence; last event: $(status_line_note "$LOG_LINE")"
+      ;;
+    unknown) ;;
+    *) emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")" ;;
+  esac
 fi
 
-emit unknown none "no current-state source available"
+[ "$KIND" = secondmate ] && emit unknown none "idle secondmate with no current-state event"
+emit unknown none "idle lane with no current-state event"

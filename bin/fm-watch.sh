@@ -168,7 +168,7 @@ PERMISSION_STALL_ESCALATE_SECS=${FM_PERMISSION_STALL_ESCALATE_SECS:-900}
 case "$PERMISSION_STALL_ESCALATE_SECS" in
   ''|*[!0-9]*|0) PERMISSION_STALL_ESCALATE_SECS=900 ;;
 esac
-# A crewmate that DECLARED a pause (paused: <reason>, fm-classify-lib.sh) is idling on
+# A crewmate that declared an owned-and-clearing pause (fm-classify-lib.sh) is idling on
 # a known external wait, so its stale pane is absorbed rather than wedge-escalated;
 # it re-surfaces once for a recheck every PAUSE_RESURFACE_SECS - far longer than the
 # wedge threshold, but finite so a forgotten pause cannot rot invisibly.
@@ -339,13 +339,14 @@ FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 # Repeat-poll wedge-timer bookkeeping for an already-classified stale hash
 # absorbed as provably-working - repairs a missing/corrupt timer (self-heals a
 # watcher restart between recording the hash and recording the timer), or
-# escalates once STALE_ESCALATE_SECS have elapsed. Never re-reads the crewmate
-# state (the costly check already ran once, at classification time). Shared by
+# escalates once STALE_ESCALATE_SECS have elapsed. At that boundary it re-reads
+# only the measured-progress verdict so a starved process accumulating CPU is not
+# called wedged from pane staleness alone. Shared by
 # both places a hash can be absorbed this way: the plain non-terminal path,
 # and the stale_is_terminal-overridden path (a captain-relevant status-log
 # line that an active run/busy pane outranked).
 wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason task
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -355,6 +356,12 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
     *)
       age=$(( $(date +%s) - since ))
       if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
+        task=$(window_to_task "$win" "$STATE")
+        if crew_has_measured_progress "$task"; then
+          date +%s > "$since_file"
+          triage_log "absorbed stale (measured worktree CPU/process progress at wedge threshold): $win"
+          return
+        fi
         n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
         echo "$n" > "$escalation_file"
         reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
@@ -369,7 +376,7 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
   esac
 }
 
-# Absorb a stale pane whose crewmate is in a DECLARED external-wait pause (paused:),
+# Absorb a stale pane whose crewmate is in a valid owned-and-clearing external wait,
 # and re-surface it once every PAUSE_RESURFACE_SECS for a recheck so it cannot rot
 # invisibly. Called on any stale poll once the crewmate is known paused (first sight,
 # after crew_absorb_class; and repeat sights, gated by the .paused-<key> flag), so
@@ -380,19 +387,22 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
 # re-surface epoch so, once past the window, it fires once per window rather than
 # every poll. Advances the stale suppressor to <hash> and flags the key paused.
 handle_paused_stale() {  # <window> <task> <hash>
-  local win=$1 task=$2 h=$3 key statusf mtime age rf rf_age reason
+  local win=$1 task=$2 h=$3 key statusf last owner clears mtime age rf rf_age reason
   key=$(printf '%s' "$win" | tr ':/.' '___')
   printf '%s' "$h" > "$STATE/.stale-$key"
-  : > "$STATE/.paused-$key"
-  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
   statusf="$STATE/$task.status"
+  last=$(last_status_line "$statusf")
+  printf '%s\n' "$last" > "$STATE/.paused-$key"
+  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
   mtime=$(stat_mtime "$statusf")
   case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
   age=$(( $(date +%s) - mtime ))
   rf="$STATE/.paused-resurfaced-$key"
   rf_age=$(age_of "$rf")   # 999999 when no prior re-surface
   if [ "$age" -ge "$PAUSE_RESURFACE_SECS" ] && [ "$rf_age" -ge "$PAUSE_RESURFACE_SECS" ]; then
-    reason="stale: $win (paused ${age}s, awaiting external - declared pause, rechecked on a long cadence not a wedge; confirm the wait still holds)"
+    owner=$(status_pause_owner "$last")
+    clears=$(status_pause_clearing_condition "$last")
+    reason="stale: $win (paused ${age}s, owner=$owner, clears=$clears - bounded pause recheck, not a wedge; if the clearing condition now holds, resume or surface the still-paused lane)"
     fm_wake_append stale "$win" "$reason" || exit 1
     wake "$reason" "$rf"
   fi
@@ -416,6 +426,46 @@ clear_pause_tracking() {  # <window>
   rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
 }
 
+# Register a valid pause declaration as soon as its status signal is observed.
+# The initial signal still surfaces once, but marker creation must happen before
+# that return; otherwise a freshly re-armed watcher loses the declaration and
+# repeatedly enters stale handling. Registration proves only the pause CONTRACT
+# (the line itself), never the keyed open-decision fold, so it deliberately does not
+# write the .paused-rechecked-<key> proof signature. Any stale signature from an
+# earlier declaration is dropped, leaving the first stale classification to establish
+# a fresh one.
+register_pause_declaration() {  # <window> <status-line>
+  local win=$1 last=$2 key
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  printf '%s\n' "$last" > "$STATE/.paused-$key"
+  rm -f "$STATE/.paused-rechecked-$key" "$STATE/.paused-resurfaced-$key" \
+    "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+}
+
+# Watcher-local signal-path reconciliation. Named apart from the away-mode daemon's
+# own sync_pause_markers_from_signal (bin/fm-supervise-daemon.sh), which takes a
+# different argument shape: both files are routinely sourced for their pure
+# functions, and a shared name would silently redefine one of them.
+register_pause_markers_from_signal() {  # <space-separated signal paths>
+  local paths=$1 f task meta win last key
+  for f in $paths; do
+    case "$f" in "$STATE"/*.status) ;; *) continue ;; esac
+    [ -e "$f" ] || continue
+    task=${f##*/}; task=${task%.status}
+    meta="$STATE/$task.meta"
+    [ -f "$meta" ] || continue
+    win=$(fm_backend_target_of_meta "$meta")
+    [ -n "$win" ] || continue
+    last=$(last_status_line "$f")
+    if status_is_paused "$last"; then
+      register_pause_declaration "$win" "$last"
+    else
+      key=$(printf '%s' "$win" | tr ':/.' '___')
+      [ -e "$STATE/.paused-$key" ] && clear_pause_tracking "$win"
+    fi
+  done
+}
+
 pause_state_class() {  # <window> <task>
   local win=$1 task=$2 key last recheck_file statusf sig class
   key=${win//:/_}
@@ -429,22 +479,7 @@ pause_state_class() {  # <window> <task>
     crew_absorb_class "$task"
     return
   fi
-  # Cached verdict: skip the costly authoritative re-read (an fm-crew-state.sh call
-  # plus the keyed open/resolved fold) while a recent recheck still stands AND the
-  # status stream it was taken from is byte-identical. Both halves of the pause proof
-  # are pure functions of that stream, so an unchanged signature means the earlier
-  # verdict is still exactly as true - while any append, including one that OPENS a
-  # decision after the pause flag was written, invalidates the cache and forces a
-  # fresh proof rather than riding out the age window behind a stale `paused`.
-  # The recheck marker carries the signature as its content; callers read only its
-  # mtime for the age bound, and a marker left by an older watcher simply mismatches
-  # and re-proves.
   sig=$(stat_sig "$statusf")
-  if [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ] \
-     && [ -n "$sig" ] && [ "$sig" = "$(cat "$recheck_file" 2>/dev/null || true)" ]; then
-    printf 'paused'
-    return
-  fi
   class=$(crew_absorb_class "$task" "$last")
   case "$class" in
     paused)
@@ -946,16 +981,14 @@ event_wait_or_sleep() {
 # machinery already understands it (queued by key=window, so a later poll-path
 # stale for the same pane collapses on drain).
 handle_push_transition() {  # <backend> <session> <record>
-  local backend=$1 session=$2 record=$3 pane_id to window task key h reason
+  local backend=$1 session=$2 record=$3 pane_id to window task key h reason last
   pane_id=$(fm_transition_pane_id "$record")
   to=$(fm_transition_to_status "$record")
   [ -n "$pane_id" ] || { sleep 1; return; }
   window="$session:$pane_id"
   task=$(window_to_task "$window" "$STATE")
-  if status_is_paused "$(last_status_line "$STATE/$task.status")"; then
-    # The durable status is the trusted gate on this native edge. Commit the
-    # handled transition, then enter the shared pause path so it owns the marker
-    # and bounded re-surface cadence even when no auxiliary crew-state read exists.
+  last=$(last_status_line "$STATE/$task.status")
+  if status_is_paused "$last" && [ "$(pause_state_class "$window" "$task")" = paused ]; then
     key=$(printf '%s' "$window" | tr ':/.' '___')
     h=$(cat "$STATE/.hash-$key" 2>/dev/null || true)
     fm_backend_commit_transition "$backend" "$STATE" "$session" "$record" || exit 1
@@ -1084,6 +1117,7 @@ while :; do
 $pending
 EOF
     reason="signal:$files"
+    register_pause_markers_from_signal "$files"
     # A scout's terminal done event is its automatic reaping trigger. Ship work
     # waits for the separate merged-PR or approved local-merge authority.
     for f in $files; do
@@ -1279,7 +1313,7 @@ EOF
           #   - working: an actively-running pipeline legitimately sits on a static
           #     pane (e.g. waiting on CI), so absorb and start the wedge timer so a
           #     genuinely frozen run still escalates past STALE_ESCALATE_SECS;
-          #   - paused: the crewmate DECLARED an external wait (paused:), so absorb on the
+          #   - paused: the crewmate declared an owned-and-clearing wait, so absorb on the
           #     long PAUSE_RESURFACE_SECS recheck cadence instead of wedge-escalating;
           #   - none: no running pipeline, idle pane, no busy signature, no declared
           #     pause - the crewmate has STOPPED. Surface immediately so firstmate peeks
@@ -1288,7 +1322,7 @@ EOF
           #     wait out the timer.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             task=$(window_to_task "$w" "$STATE")
-            case "$(crew_absorb_class "$task")" in
+            case "$(crew_absorb_class "$task" "$last")" in
               working)
                 clear_pause_tracking "$w"
                 printf '%s' "$h" > "$sf"

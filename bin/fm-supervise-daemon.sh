@@ -520,7 +520,7 @@ pause_class_refresh_marker_remove() {
   local marker=$1
   if [ -d "$marker" ] && [ ! -L "$marker" ]; then
     rm -f "$marker/generation" "$marker/pid" "$marker/pgid" \
-      "$marker/pid-identity" "$marker/ready" "$marker/owned" "$marker/done"
+      "$marker/pid-identity" "$marker/owned" "$marker/done"
     rmdir "$marker" 2>/dev/null || true
   else
     rm -f "$marker"
@@ -623,7 +623,6 @@ pause_class_refresh_worker() {
   local class after current recorded marker_generation cancelled=0 i
   set +m 2>/dev/null || true
   trap 'cancelled=1' TERM INT
-  : > "$marker/ready"
   for i in {1..500}; do
     [ -e "$marker/owned" ] && break
     sleep 0.01
@@ -673,7 +672,7 @@ pause_class_refresh_reap() {
 }
 
 pause_class_refresh_start() {  # <state> <task> <last-status-line> <now> <status-signature>
-  local state=$1 task=$2 last=$3 now=$4 sig=$5 key cache marker tmp active=0 f pid pgid identity i monitor_was_on=0
+  local state=$1 task=$2 last=$3 now=$4 sig=$5 key cache marker tmp active=0 f pid pgid identity monitor_was_on=0
   key=$(_stale_key "$task")
   cache="$state/.subsuper-pause-class-$key"
   marker="$state/.subsuper-pause-refresh-$key"
@@ -702,18 +701,6 @@ pause_class_refresh_start() {  # <state> <task> <last-status-line> <now> <status
     </dev/null >/dev/null 2>&1 &
   pid=$!
   [ "$monitor_was_on" -eq 1 ] || set +m 2>/dev/null || true
-  for i in {1..100}; do
-    [ -e "$marker/ready" ] && break
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 0.01
-  done
-  if [ ! -e "$marker/ready" ]; then
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-    pause_class_refresh_marker_remove "$marker"
-    rm -f "$tmp"
-    return 1
-  fi
   pgid=$(pause_class_refresh_process_group "$pid" 2>/dev/null || true)
   identity=$(fm_pid_identity "$pid" 2>/dev/null || true)
   if [ "$pgid" != "$pid" ] || [ -z "$identity" ]; then

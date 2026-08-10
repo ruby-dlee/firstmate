@@ -432,7 +432,7 @@ clear_pause_tracking() {  # <window>
 }
 
 pause_state_class() {  # <window> <task>
-  local win=$1 task=$2 key last recheck_file statusf sig class
+  local win=$1 task=$2 key last recheck_file statusf sig
   key=${win//:/_}
   key=${key//\//_}
   key=${key//./_}
@@ -441,45 +441,47 @@ pause_state_class() {  # <window> <task>
   recheck_file="$STATE/.paused-rechecked-$key"
   if ! status_is_paused "$last"; then
     rm -f "$recheck_file"
-    crew_absorb_class "$task"
+    printf 'none'
     return
   fi
   # Cached verdict: skip the costly keyed open/resolved fold while a recent recheck
   # still stands AND the status stream it was taken from is byte-identical. The
-  # durable pause proof is a pure function of that stream, but active-working evidence
-  # is consulted afresh because a run can start without appending status. Any append,
-  # including one that OPENS a decision after the pause flag was written, invalidates
-  # the cache and forces a fresh proof rather than riding out the age window.
+  # durable pause proof is a pure function of that stream. Any append, including one
+  # that OPENS a decision after the pause flag was written, invalidates the cache and
+  # forces a fresh proof rather than riding out the age window.
   # The recheck marker carries the signature as its content; callers read only its
   # mtime for the age bound, and a marker left by an older watcher simply mismatches
   # and re-proves.
   sig=$(stat_sig "$statusf")
   if [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ] \
      && [ -n "$sig" ] && [ "$sig" = "$(cat "$recheck_file" 2>/dev/null || true)" ]; then
-    if crew_has_active_working_evidence "$task"; then
-      printf 'working'
-      return
-    fi
-    if [ "$sig" = "$(stat_sig "$statusf")" ]; then
-      printf 'paused'
-      return
-    fi
-    rm -f "$recheck_file"
+    printf 'paused'
+    return
   fi
-  class=$(crew_absorb_class "$task" "$last")
-  case "$class" in
-    paused)
-      sig=$(stat_sig "$statusf")
-      if [ -z "$sig" ] || ! crew_declared_pause_absorbable "$task" "$last" \
-         || [ "$sig" != "$(stat_sig "$statusf")" ]; then
-        class=none
-        rm -f "$recheck_file"
-      else
-        printf '%s' "$sig" > "$recheck_file"
-      fi
-      ;;
-    *) rm -f "$recheck_file" ;;
-  esac
+  sig=$(stat_sig "$statusf")
+  if [ -n "$sig" ] && crew_declared_pause_absorbable "$task" "$last" \
+     && [ "$sig" = "$(stat_sig "$statusf")" ]; then
+    printf '%s' "$sig" > "$recheck_file"
+    printf 'paused'
+    return
+  fi
+  rm -f "$recheck_file"
+  printf 'none'
+}
+
+pause_absorb_class() {  # <window> <task>
+  local class statusf sig
+  statusf="$STATE/$2.status"
+  sig=$(stat_sig "$statusf")
+  class=$(pause_state_class "$1" "$2")
+  if [ "$class" = paused ] && crew_has_active_working_evidence "$2"; then
+    printf 'working'
+    return
+  fi
+  if [ "$class" = paused ] && { [ -z "$sig" ] || [ "$sig" != "$(stat_sig "$statusf")" ]; }; then
+    printf 'none'
+    return
+  fi
   printf '%s' "$class"
 }
 
@@ -490,7 +492,7 @@ pause_state_class() {  # <window> <task>
 # fleet from making a registered pause permanently invisible. Away mode is excluded
 # because its daemon owns pause tracking and rechecks.
 reconcile_declared_pauses() {
-  local w task key last class was_registered
+  local w task key last class absorb_class was_registered
   afk_present && return 0
   while IFS= read -r w; do
     task=$(window_to_task "$w" "$STATE")
@@ -508,9 +510,14 @@ reconcile_declared_pauses() {
         register_declared_pause "$w"
         [ "$was_registered" = 1 ] \
           || triage_log "registered declared pause before exit-capable wake scans: $w"
-        recheck_declared_pause "$w" "$task"
+        absorb_class=$(pause_absorb_class "$w" "$task")
+        case "$absorb_class" in
+          paused) recheck_declared_pause "$w" "$task" ;;
+          working) ;;
+          none) clear_pause_tracking "$w" ;;
+          *) clear_pause_tracking "$w" ;;
+        esac
         ;;
-      working) clear_pause_state "$w" ;;
       none) clear_pause_tracking "$w" ;;
       *) clear_pause_tracking "$w" ;;
     esac
@@ -1233,14 +1240,12 @@ EOF
     # without ever creating .paused-<key>. Authoritative working state still
     # outranks a stale paused log and falls through to ordinary stale handling.
     if ! afk_present && [ "$window_busy" != 1 ] && status_is_paused "$last"; then
-      case "$(pause_state_class "$w" "$task")" in
+      case "$(pause_absorb_class "$w" "$task")" in
         paused)
           handle_paused_stale "$w" "$task" "$h"
           continue
           ;;
-        working)
-          clear_pause_state "$w"
-          ;;
+        working) ;;
         none)
           clear_pause_tracking "$w"
           ;;
@@ -1282,9 +1287,10 @@ EOF
         # The pane is idle/stale at hash $h. Triage decides whether this wakes
         # firstmate. Detection itself is unchanged from above.
         if [ "$kind" = secondmate ]; then
-          case "$(pause_state_class "$w" "$task")" in
+          case "$(pause_absorb_class "$w" "$task")" in
             paused) handle_paused_stale "$w" "$task" "$h" ;;
-            working|none) clear_pause_tracking "$w" ;;
+            working) ;;
+            none) clear_pause_tracking "$w" ;;
             *)      clear_pause_tracking "$w" ;;
           esac
         elif afk_present; then
@@ -1350,7 +1356,7 @@ EOF
             task=$(window_to_task "$w" "$STATE")
             case "$(crew_absorb_class "$task")" in
               working)
-                clear_pause_tracking "$w"
+                status_is_paused "$last" || clear_pause_tracking "$w"
                 printf '%s' "$h" > "$sf"
                 date +%s > "$ssf"
                 triage_log "absorbed non-terminal stale (provably working): $w"
@@ -1368,10 +1374,9 @@ EOF
           else
             task=$(window_to_task "$w" "$STATE")
             if [ -e "$pf" ] || status_is_paused "$(last_status_line "$STATE/$task.status")"; then
-              case "$(pause_state_class "$w" "$task")" in
+              case "$(pause_absorb_class "$w" "$task")" in
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
-                working) clear_pause_state "$w"
-                         printf '%s' "$h" > "$sf"
+                working) printf '%s' "$h" > "$sf"
                          wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
                 none)    surface_nonterminal_stale "$w" "$h" ;;
@@ -1385,7 +1390,7 @@ EOF
       else
         # Pane busy or not yet stably stale: reset pending escalation bookkeeping.
         rm -f "$ssf" "$ewf"
-        if [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! status_is_paused "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; }; then
+        if [ -e "$pf" ] && ! status_is_paused "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; then
           clear_pause_tracking "$w"
         fi
       fi
@@ -1395,13 +1400,15 @@ EOF
       rm -f "$ssf" "$ewf"
       task=$(window_to_task "$w" "$STATE")
       if ! afk_present && status_is_paused "$(last_status_line "$STATE/$task.status")" && [ "$window_busy" != 1 ]; then
-        case "$(pause_state_class "$w" "$task")" in
+        case "$(pause_absorb_class "$w" "$task")" in
           paused) handle_paused_stale "$w" "$task" "$h" ;;
-          working|none) clear_pause_tracking "$w" ;;
+          working) ;;
+          none) clear_pause_tracking "$w" ;;
           *)      clear_pause_tracking "$w" ;;
         esac
       else
-        [ -e "$pf" ] && clear_pause_tracking "$w"
+        [ -e "$pf" ] && ! status_is_paused "$(last_status_line "$STATE/$task.status")" \
+          && clear_pause_tracking "$w"
       fi
     fi
   done < <(recorded_windows)

@@ -324,6 +324,7 @@ test_busy_fleet_registers_pause_before_actionable_signal_exit() {
   printf 'paused: awaiting external PR review and green rollout\n' > "$state/z-paused.status"
 
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)' \
     FM_PAUSE_RESURFACE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=0 \
     FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
   pid=$!
@@ -335,6 +336,8 @@ test_busy_fleet_registers_pause_before_actionable_signal_exit() {
     || fail "actionable sibling signal exited before the declared pause was registered"
   [ -e "$state/.paused-rechecked-$pause_key" ] \
     || fail "busy-fleet pause registration did not retain its authoritative proof"
+  [ ! -e "$state/.paused-resurfaced-$pause_key" ] \
+    || fail "active work was pause-rechecked while registering the declaration"
   [ ! -e "$state/.stale-since-$pause_key" ] \
     || fail "registered pause retained the shorter wedge timer"
   pass "busy fleet: a declared pause is registered before an actionable sibling signal exits the watcher"
@@ -429,8 +432,8 @@ test_cached_pause_does_not_outrank_new_active_run() {
     || { reap "$pid"; fail "cached pause surfaced after the lane started active work: $(cat "$out")"; }
   reap "$pid"
 
-  [ ! -e "$state/.paused-$key" ] \
-    || fail "active work did not retire the cached pause registration"
+  [ -e "$state/.paused-$key" ] \
+    || fail "active work erased the independently proven pause registration"
   [ ! -e "$state/.paused-resurfaced-$key" ] \
     || fail "active work emitted the due pause recheck"
   [ ! -s "$state/.wake-queue" ] \

@@ -3090,10 +3090,16 @@ test_composer_state_unknown_when_no_composer_row_found() {
 # same DynamicBorder primitive but has multiple interior rows, so it must
 # override any stale bordered row above it and stay unknown.
 
+make_pi_rule() {
+  local rule
+  printf -v rule '%*s' 185 ''
+  printf '%s' "${rule// /─}"
+}
+
 test_composer_state_pi_separator_editor_is_empty() {
   local dir log resp fb out rule
   dir="$TMP_ROOT/composer-pi-empty"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  rule='────────────────────────────────────────────────────────────'
+  rule=$(make_pi_rule)
   printf '\x1b[0m\x1b[38;2;209;131;232m%s\x1b[0m\r\n\x1b[0m\x1b[7m \x1b[0m                                                           \r\n\x1b[0m\x1b[38;2;209;131;232m%s\x1b[0m\r\n/project (fm/task)\r\n↑1k ↓2k 1%%/100k model\n' "$rule" "$rule" > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
@@ -3105,7 +3111,7 @@ test_composer_state_pi_separator_editor_is_empty() {
 test_composer_state_pi_separator_editor_with_text_is_pending() {
   local dir log resp fb out rule
   dir="$TMP_ROOT/composer-pi-pending"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  rule='────────────────────────────────────────────────────────────'
+  rule=$(make_pi_rule)
   printf '\x1b[0m\x1b[38;2;209;131;232m%s\x1b[0m\r\nPI_PENDING_C8\x1b[7m \x1b[0m                                             \r\n\x1b[0m\x1b[38;2;209;131;232m%s\x1b[0m\r\n/project (fm/task)\r\n↑1k ↓2k 1%%/100k model\n' "$rule" "$rule" > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
@@ -3114,10 +3120,48 @@ test_composer_state_pi_separator_editor_with_text_is_pending() {
   pass "fm_backend_herdr_composer_state: a real-pi separator-only editor with typed text reads pending"
 }
 
+test_composer_state_pi_styled_glyphs_are_pending() {
+  local dir log resp fb out rule idx=1
+  dir="$TMP_ROOT/composer-pi-styled"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  rule=$(make_pi_rule)
+  printf '%s\n\x1b[2mX\x1b[0m\x1b[7m \x1b[0m\n%s\n/project\nfooter\n' "$rule" "$rule" > "$resp/$idx.out"; idx=$((idx + 1))
+  printf '%s\n\x1b[38;2;1;2;3mY\x1b[0m\x1b[7m \x1b[0m\n%s\n/project\nfooter\n' "$rule" "$rule" > "$resp/$idx.out"
+  fb=$(make_herdr_fakebin "$dir")
+  for idx in 1 2; do
+    out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+      bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+    [ "$out" = pending ] || fail "styled visible pi content must read pending, got '$out' for fixture $idx"
+  done
+  pass "fm_backend_herdr_composer_state: pi preserves dim and dark styled input as pending"
+}
+
+test_composer_state_pi_short_rules_are_unknown() {
+  local dir log resp fb out rule
+  dir="$TMP_ROOT/composer-pi-short-rule"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  printf '%s\n\x1b[7m \x1b[0m\n%s\n/project\nfooter\n' "$rule" "$rule" > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = unknown ] || fail "short separator rules are not pi's verified full-width shape and should read unknown, got '$out'"
+  pass "fm_backend_herdr_composer_state: short separator rules stay fail-closed unknown"
+}
+
+test_composer_state_pi_non_cursor_reverse_video_is_unknown() {
+  local dir log resp fb out rule
+  dir="$TMP_ROOT/composer-pi-fake-cursor"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
+  rule=$(make_pi_rule)
+  printf '%s\n\x1b[7m modal\x1b[0m\n%s\n/project\nfooter\n' "$rule" "$rule" > "$resp/1.out"
+  fb=$(make_herdr_fakebin "$dir")
+  out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_server_reachable_for_readsteer() { return 0; }; fm_backend_herdr_composer_state default:w1:p2' "$ROOT" )
+  [ "$out" = unknown ] || fail "a generic reverse-video run is not pi's fake cursor cell and should read unknown, got '$out'"
+  pass "fm_backend_herdr_composer_state: generic reverse video stays fail-closed unknown"
+}
+
 test_composer_state_pi_prompt_like_text_is_pending() {
   local dir log resp fb out rule content idx=1
   dir="$TMP_ROOT/composer-pi-prompt-like"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  rule='────────────────────────────────────────────────────────────'
+  rule=$(make_pi_rule)
   for content in '>' '$' '%' '#' '❯' '›'; do
     printf '%s\n%s\x1b[7m \x1b[0m\n%s\n/project\nfooter\n' "$rule" "$content" "$rule" > "$resp/$idx.out"
     idx=$((idx + 1))
@@ -3134,7 +3178,7 @@ test_composer_state_pi_prompt_like_text_is_pending() {
 test_composer_state_pi_separator_pair_without_cursor_is_unknown() {
   local dir log resp fb out rule
   dir="$TMP_ROOT/composer-pi-no-cursor"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  rule='────────────────────────────────────────────────────────────'
+  rule=$(make_pi_rule)
   printf '%s\n                                                            \n%s\n/project\nfooter\n' "$rule" "$rule" > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
@@ -3146,7 +3190,7 @@ test_composer_state_pi_separator_pair_without_cursor_is_unknown() {
 test_composer_state_pi_modal_overrides_stale_bordered_row() {
   local dir log resp fb out rule
   dir="$TMP_ROOT/composer-pi-modal"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  rule='────────────────────────────────────────────────────────────'
+  rule=$(make_pi_rule)
   printf '│ ❯ stale decorative box │\n%s\n  Select a model\n\n  → openai/gpt-5.6-sol\n    anthropic/claude-opus-5\n\n  enter select  esc cancel\n%s\n/project\nfooter\n' "$rule" "$rule" > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
@@ -3158,7 +3202,7 @@ test_composer_state_pi_modal_overrides_stale_bordered_row() {
 test_composer_state_pi_modal_closing_rule_without_top_is_unknown() {
   local dir log resp fb out rule
   dir="$TMP_ROOT/composer-pi-modal-bottom-only"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  rule='────────────────────────────────────────────────────────────'
+  rule=$(make_pi_rule)
   printf '│ ❯ stale decorative box │\n  modal content whose opening rule is above the capture\n  → selected option\n  enter select  esc cancel\n%s\n/project\nfooter\n' "$rule" > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
@@ -3170,7 +3214,7 @@ test_composer_state_pi_modal_closing_rule_without_top_is_unknown() {
 test_composer_state_pi_multiline_editor_is_unknown() {
   local dir log resp fb out rule
   dir="$TMP_ROOT/composer-pi-multiline"; mkdir -p "$dir/responses"; log="$dir/log"; resp="$dir/responses"; : > "$log"
-  rule='────────────────────────────────────────────────────────────'
+  rule=$(make_pi_rule)
   printf '%s\nfirst pending line\nsecond pending line\x1b[7m \x1b[0m\n%s\n/project\nfooter\n' "$rule" "$rule" > "$resp/1.out"
   fb=$(make_herdr_fakebin "$dir")
   out=$( PATH="$fb:$PATH" FM_HERDR_LOG="$log" FM_HERDR_RESPONSES="$resp" \
@@ -4351,6 +4395,9 @@ test_wait_transition_clean_timeout_returns_1() {
 if [ "${FM_TEST_FOCUSED:-}" = composer-pi ]; then
   test_composer_state_pi_separator_editor_is_empty
   test_composer_state_pi_separator_editor_with_text_is_pending
+  test_composer_state_pi_styled_glyphs_are_pending
+  test_composer_state_pi_short_rules_are_unknown
+  test_composer_state_pi_non_cursor_reverse_video_is_unknown
   test_composer_state_pi_prompt_like_text_is_pending
   test_composer_state_pi_separator_pair_without_cursor_is_unknown
   test_composer_state_pi_modal_overrides_stale_bordered_row
@@ -4532,6 +4579,9 @@ test_composer_state_unknown_on_capture_failure
 test_composer_state_unknown_when_no_composer_row_found
 test_composer_state_pi_separator_editor_is_empty
 test_composer_state_pi_separator_editor_with_text_is_pending
+test_composer_state_pi_styled_glyphs_are_pending
+test_composer_state_pi_short_rules_are_unknown
+test_composer_state_pi_non_cursor_reverse_video_is_unknown
 test_composer_state_pi_prompt_like_text_is_pending
 test_composer_state_pi_separator_pair_without_cursor_is_unknown
 test_composer_state_pi_modal_overrides_stale_bordered_row

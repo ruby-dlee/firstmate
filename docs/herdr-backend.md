@@ -465,14 +465,14 @@ The classifier recognizes three shapes in one forward scan, with the bottom-most
 
 - **Bordered** - the trimmed row starts and ends with the same `│`, `┃`, or ASCII `|` border glyph.
 - **Bare** - the trimmed row starts with the verified agent prompt glyph `❯` for Claude or `›` for Codex.
-- **Pi separator-only** - two equal full-width rules made only of U+2500 `─` surround exactly one content row, and that raw ANSI content row contains Pi Editor's exact SGR-7 fake-cursor sequence.
+- **Pi separator-only** - two equal 185-column rules made only of U+2500 `─` surround exactly one content row, and that raw ANSI content row contains exactly one Pi Editor fake-cursor cell encoded as `SGR-7 space SGR-0`.
 
 The Pi shape has no side border and no prompt glyph.
 A matching rule pair with more than one interior row or without the fake cursor is replacement UI or otherwise ambiguous, so it invalidates stale bordered/bare matches above it and reports `unknown`.
-Because Pi has no prompt glyph, its promptless shared-classifier mode treats every non-empty row as `pending`, including text equal to `❯`, `›`, `>`, `$`, `%`, or `#`; only a blank row is `empty`.
+Because Pi has no prompt glyph or ghost content, its promptless shared-classifier mode removes only the exact cursor cell and treats every remaining visible glyph as `pending`, including dim or dark-styled text and text equal to `❯`, `›`, `>`, `$`, `%`, or `#`; only a blank row is `empty`.
 Plain-capture fallback cannot prove Pi's cursor and stays `unknown`.
 Multi-line or scrolled Pi editor content also stays `unknown`, which is conservative because it cannot be an empty composer.
-When ANSI capture is available, the classifier keeps the raw styled row long enough to route it through the shared `fm_composer_strip_ghost` extractor before classification.
+When ANSI capture is available, bordered and bare rows use the shared `fm_composer_strip_ghost` extractor, while Pi rows use plain visible content after cursor-cell removal.
 The 2026-07-10 incident below records the supported dim/faint and dark-TRUECOLOR ghost/placeholder styling.
 That classifier is still the terminal-backed away-mode compatibility path's affirmative-empty pre-injection guard and the conservative fallback when `fm_backend_herdr_send_text_submit` cannot use an idle/done native agent-state baseline.
 Normal idle-baseline submit confirmation now uses herdr's native agent-state instead; see "Native agent-state submit confirmation" for the current submit path.

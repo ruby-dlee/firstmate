@@ -369,22 +369,24 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
   esac
 }
 
-# Absorb a stale pane whose crewmate is in a DECLARED external-wait pause (paused:),
-# and re-surface it once every PAUSE_RESURFACE_SECS for a recheck so it cannot rot
-# invisibly. Called on any stale poll once the crewmate is known paused (first sight,
-# after crew_absorb_class; and repeat sights, gated by the .paused-<key> flag), so
-# it must be cheap: it NEVER re-reads the crewmate state. The re-surface age is anchored
-# on the pause's own STATUS-FILE mtime, not a per-hash marker, so a churny idle pane
-# (a ticking clock, a token counter) cannot keep resetting the cadence the way a
-# hash-tied timer would. A .paused-resurfaced-<key> throttle marker records the last
-# re-surface epoch so, once past the window, it fires once per window rather than
-# every poll. Advances the stale suppressor to <hash> and flags the key paused.
-handle_paused_stale() {  # <window> <task> <hash>
-  local win=$1 task=$2 h=$3 key statusf mtime age rf rf_age reason
+# Register a proven DECLARED external-wait pause independently of pane staleness.
+# This marker has to exist before any exit-capable wake classification: a busy fleet
+# can otherwise keep returning from wake() before the later pane sweep ever reaches
+# the paused lane. Registration also retires the shorter wedge cadence immediately.
+register_declared_pause() {  # <window>
+  local win=$1 key
   key=$(printf '%s' "$win" | tr ':/.' '___')
-  printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+}
+
+# Re-surface a registered pause once every PAUSE_RESURFACE_SECS so it cannot rot
+# invisibly. The age is anchored on the pause's own STATUS-FILE mtime, not a pane
+# hash, so terminal churn cannot reset the cadence. A .paused-resurfaced-<key>
+# throttle marker makes the wake fire once per window rather than every poll.
+recheck_declared_pause() {  # <window> <task>
+  local win=$1 task=$2 key statusf mtime age rf rf_age reason
+  key=$(printf '%s' "$win" | tr ':/.' '___')
   statusf="$STATE/$task.status"
   mtime=$(stat_mtime "$statusf")
   case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
@@ -396,6 +398,19 @@ handle_paused_stale() {  # <window> <task> <hash>
     fm_wake_append stale "$win" "$reason" || exit 1
     wake "$reason" "$rf"
   fi
+}
+
+# Absorb a stale pane whose crewmate is in a proven pause. This remains the owner
+# of the pane-hash suppressor, while pause registration and cadence are pane-neutral.
+handle_paused_stale() {  # <window> <task> <hash>
+  local win=$1 task=$2 h=$3 key mtime age
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  printf '%s' "$h" > "$STATE/.stale-$key"
+  register_declared_pause "$win"
+  recheck_declared_pause "$win" "$task"
+  mtime=$(stat_mtime "$STATE/$task.status")
+  case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
+  age=$(( $(date +%s) - mtime ))
   triage_log "absorbed stale (paused, awaiting external, age ${age}s): $win"
 }
 
@@ -460,6 +475,40 @@ pause_state_class() {  # <window> <task>
     *) rm -f "$recheck_file" ;;
   esac
   printf '%s' "$class"
+}
+
+# Reconcile declared pauses before this cycle reaches any block that may call
+# wake() and exit. This is deliberately separate from the pane sweep: checks and
+# signals precede that sweep, so a chatty sibling used to starve pause registration
+# indefinitely. The same pre-wake pass owns the bounded recheck, which keeps a busy
+# fleet from making a registered pause permanently invisible. Away mode is excluded
+# because its daemon owns pause tracking and rechecks.
+reconcile_declared_pauses() {
+  local w task key last class was_registered
+  afk_present && return 0
+  while IFS= read -r w; do
+    task=$(window_to_task "$w" "$STATE")
+    key=$(printf '%s' "$w" | tr ':/.' '___')
+    last=$(last_status_line "$STATE/$task.status")
+    if ! status_is_paused "$last"; then
+      [ -e "$STATE/.paused-$key" ] && clear_pause_tracking "$w"
+      continue
+    fi
+    class=$(pause_state_class "$w" "$task")
+    case "$class" in
+      paused)
+        was_registered=1
+        [ -e "$STATE/.paused-$key" ] || was_registered=0
+        register_declared_pause "$w"
+        [ "$was_registered" = 1 ] \
+          || triage_log "registered declared pause before exit-capable wake scans: $w"
+        recheck_declared_pause "$w" "$task"
+        ;;
+      working) clear_pause_state "$w" ;;
+      none) clear_pause_tracking "$w" ;;
+      *) clear_pause_tracking "$w" ;;
+    esac
+  done < <(recorded_windows)
 }
 
 # Surface a stopped stale pane immediately. Pause cadence markers belong to the
@@ -1023,6 +1072,11 @@ while :; do
   # Liveness beacon for fm-guard.sh: a fresh mtime here means a watcher is
   # alive. Supervision scripts warn when this goes stale with tasks in flight.
   safe_touch_marker_or_log "$STATE/.last-watcher-beat" "watcher beacon" || true
+
+  # Pause state is durable work state, not a pane-state side effect. Reconcile it
+  # before maintenance checks and signals can wake-and-exit this process, otherwise
+  # a busy fleet can starve both initial registration and the bounded recheck.
+  reconcile_declared_pauses
 
   prune_reports_if_due
 

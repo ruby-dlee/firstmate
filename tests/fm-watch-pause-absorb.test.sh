@@ -307,10 +307,93 @@ test_pause_moving_during_pipeline_read_refused() {
   pass "a pause invalidated during pipeline-state validation fails closed"
 }
 
+# A busy fleet can present one changed blocked status before a sibling's changed
+# paused status in the same signal scan. The actionable status makes wake() exit,
+# so pause registration must happen in the pre-wake reconciliation phase rather
+# than waiting for the later pane sweep.
+test_busy_fleet_registers_pause_before_actionable_signal_exit() {
+  local dir state fakebin out action_window pause_window pause_key pid
+  dir=$(make_case busy-fleet-pause-registration); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  action_window="default:wA:pAA"
+  pause_window="default:wF:pGY"
+  pause_key=$(printf '%s' "$pause_window" | tr ':/.' '___')
+  printf 'window=%s\nkind=ship\n' "$action_window" > "$state/a-action.meta"
+  printf 'blocked: needs supervisor attention\n' > "$state/a-action.status"
+  printf 'window=%s\nkind=ship\n' "$pause_window" > "$state/z-paused.meta"
+  printf 'paused: awaiting external PR review and green rollout\n' > "$state/z-paused.status"
+
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=999999 FM_POLL=1 FM_SIGNAL_GRACE=0 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "watcher did not surface the actionable busy-fleet signal"; }
+
+  grep -F "signal:" "$out" >/dev/null \
+    || fail "busy-fleet fixture did not exit through the signal path: $(cat "$out")"
+  [ -e "$state/.paused-$pause_key" ] \
+    || fail "actionable sibling signal exited before the declared pause was registered"
+  [ -e "$state/.paused-rechecked-$pause_key" ] \
+    || fail "busy-fleet pause registration did not retain its authoritative proof"
+  [ ! -e "$state/.stale-since-$pause_key" ] \
+    || fail "registered pause retained the shorter wedge timer"
+  pass "busy fleet: a declared pause is registered before an actionable sibling signal exits the watcher"
+}
+
+# Registration must not become permanent suppression. Start from the busy-fleet
+# shape above, age the declared pause past its configured window, and leave another
+# actionable sibling signal pending. The pre-wake phase must surface the pause on
+# its bounded cadence instead of letting the sibling starve rechecks indefinitely.
+test_busy_fleet_registered_pause_still_resurfaces() {
+  local dir state fakebin out action_window pause_window pause_key statusf sig back pid
+  dir=$(make_case busy-fleet-pause-resurface); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  action_window="default:wA:pAB"
+  pause_window="default:wF:pGZ"
+  pause_key=$(printf '%s' "$pause_window" | tr ':/.' '___')
+  statusf="$state/z-paused.status"
+  printf 'window=%s\nkind=ship\n' "$action_window" > "$state/a-action.meta"
+  printf 'blocked: fresh sibling wake must not starve pause cadence\n' > "$state/a-action.status"
+  printf 'window=%s\nkind=ship\n' "$pause_window" > "$state/z-paused.meta"
+  printf 'paused: awaiting external PR review and green rollout\n' > "$statusf"
+  back=$(( $(date +%s) - 10 ))
+  if [ "$(uname)" = Darwin ]; then
+    touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$statusf"
+  else
+    touch -m -d "@$back" "$statusf"
+  fi
+  sig=$(seen_sig "$statusf")
+  : > "$state/.paused-$pause_key"
+  printf '%s' "$sig" > "$state/.paused-rechecked-$pause_key"
+  printf '%s' "$sig" > "$state/.seen-z-paused_status"
+
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_PAUSE_RESURFACE_SECS=2 FM_POLL=1 FM_SIGNAL_GRACE=0 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || { reap "$pid"; fail "registered pause did not re-surface on its bounded cadence"; }
+
+  grep -F "stale: $pause_window" "$out" >/dev/null \
+    || fail "bounded pause recheck was starved by the actionable sibling: $(cat "$out")"
+  grep -F "awaiting external" "$out" >/dev/null \
+    || fail "bounded recheck was not identified as a declared external wait"
+  grep -F "possible wedge" "$out" >/dev/null \
+    && fail "bounded pause recheck was mislabeled as a possible wedge"
+  [ -e "$state/.paused-$pause_key" ] \
+    || fail "bounded recheck removed the durable pause registration"
+  [ -e "$state/.paused-resurfaced-$pause_key" ] \
+    || fail "bounded recheck did not persist its throttle marker"
+  [ ! -e "$state/.stale-since-$pause_key" ] \
+    || fail "bounded pause recheck started the wedge timer"
+  pass "busy fleet: a registered pause still re-surfaces on its bounded long cadence"
+}
+
 test_live_idle_paused_pane_absorbed
 test_dead_paused_pane_absorbed
 test_paused_with_open_decision_surfaced
 test_paused_with_closed_decision_absorbed
 test_cached_pause_verdict_reproven_when_stream_changes
 test_pause_moving_during_pipeline_read_refused
+test_busy_fleet_registers_pause_before_actionable_signal_exit
+test_busy_fleet_registered_pause_still_resurfaces
 test_crew_absorb_class_pause_matrix

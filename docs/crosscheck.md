@@ -83,7 +83,9 @@ The whole file is validated and unsafe shapes fail closed.
 ```
 
 A matching entry is accepted only when task metadata still names an account-less Pi lane with no `author_account_identity` and no modern `author_identity_snapshot_epoch` marker.
-Every Pi launch and recovery under snapshot-aware code records `author_identity_snapshot_epoch: launch-bound-v1` even when credential capture fails or the recovered account changes, while the admission contributes the positive `pre-snapshot-pi` provenance assertion.
+Every new Pi launch under snapshot-aware code records `author_identity_snapshot_epoch: launch-bound-v1` even when credential capture fails.
+Recovery preserves that marker only when the prior metadata already carried it, including after a later capture failure or account change, and never mints it for a legacy lane.
+The admission contributes the positive `pre-snapshot-pi` provenance assertion.
 It cannot downgrade routed work or a modern Pi snapshot, and a head change requires an explicitly renewed entry.
 The rule never populates metadata and never derives the old author from today's mutable provider-slot credential.
 It requires the selected reviewer to expose a readable executing account, hashes that identity at selection, and rechecks the hash against the launch-bound credential immediately before review.

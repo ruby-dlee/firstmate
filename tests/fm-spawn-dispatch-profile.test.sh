@@ -608,6 +608,19 @@ PY
   assert_contains "$launch" "PI_CODING_AGENT_DIR='$private' pi --approve" \
     "Pi account-change recovery launched outside its private snapshot"
 
+  sed -i.bak '/^author_identity_snapshot_epoch=/d' "$meta"
+  rm "$meta.bak"
+  : > "$absent_marker"
+  out=$(FM_FAKE_ENDPOINT_ABSENT_ONCE="$absent_marker" PI_CODING_AGENT_DIR="$source" \
+    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
+      "$id" "$PROJ_DIR" --model openai-codex-5/gpt-5.6-sol --effort xhigh)
+  status=$?
+  expect_code 0 "$status" "legacy Pi recovery should not mint snapshot provenance: $out"
+  assert_no_grep 'author_account_identity=' "$meta" \
+    "legacy Pi recovery treated current credentials as historical identity"
+  assert_no_grep 'author_identity_snapshot_epoch=' "$meta" \
+    "legacy Pi recovery minted a modern snapshot-era marker"
+
   failed_id=profile-pi-author-snapshot-failed-z24
   rec=$(make_spawn_case profile-pi-author-snapshot-failed pi "$failed_id")
   read_case_record "$rec"
@@ -623,7 +636,7 @@ PY
     "a failed Pi snapshot invented an author identity"
   assert_grep 'author_identity_snapshot_epoch=launch-bound-v1' "$meta" \
     "a failed modern Pi snapshot lost the snapshot-era marker"
-  pass "Pi launches and recoveries bind one private author identity"
+  pass "Pi snapshot epochs distinguish new launches from legacy recovery"
 }
 
 test_batch_forwards_shared_profile_flags() {

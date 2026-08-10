@@ -3592,7 +3592,14 @@ persist_worktree_acquisition_phases || {
   exit 1
 }
 if [ "$HARNESS" = pi ]; then
-  PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=launch-bound-v1
+  if [ "$SPAWN_META_PRESENT" = 1 ]; then
+    PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=$(spawn_preflight_meta_value author_identity_snapshot_epoch)
+    [ -z "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" ] \
+      || [ "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" = launch-bound-v1 ] \
+      || { echo "error: Pi recovery metadata has an invalid author identity snapshot epoch for $ID" >&2; exit 1; }
+  else
+    PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=launch-bound-v1
+  fi
 fi
 if [ "$HARNESS" = pi ] && [ "$RAW_LAUNCH" != 1 ]; then
   PI_AUTHOR_SOURCE_HOME=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}

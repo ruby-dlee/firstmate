@@ -784,6 +784,8 @@ elif scenario in {
     "jest-real-sibling-runtime",
     "jest-real-apply-integrity",
     "jest-real-callback-semantics",
+    "jest-real-hook-body-replacement",
+    "jest-real-generator-body",
     "jest-no-match",
     "jest-startup",
     "jest-missing-dependency",
@@ -797,6 +799,8 @@ elif scenario in {
     "vitest-real-custom-environment",
     "vitest-real-worker-forgery",
     "vitest-real-ambient-node-options",
+    "vitest-real-primitive-forgery",
+    "vitest-real-native-env-semantics",
     "vitest-real-class-plugin-failure",
     "vitest-no-match",
     "vitest-startup",
@@ -819,6 +823,8 @@ elif scenario in {
         "jest-real-sibling-runtime",
         "jest-real-apply-integrity",
         "jest-real-callback-semantics",
+        "jest-real-hook-body-replacement",
+        "jest-real-generator-body",
         "jest-no-match",
         "jest-startup",
         "jest-missing-dependency",
@@ -832,6 +838,8 @@ elif scenario in {
         "vitest-real-custom-environment",
         "vitest-real-worker-forgery",
         "vitest-real-ambient-node-options",
+        "vitest-real-primitive-forgery",
+        "vitest-real-native-env-semantics",
         "vitest-real-class-plugin-failure",
         "vitest-no-match",
         "vitest-startup",
@@ -916,6 +924,8 @@ elif scenario in {
         "jest-real-sibling-runtime": "tests/sibling-runtime.test.js::selected body",
         "jest-real-apply-integrity": "tests/apply-integrity.test.js::selected body",
         "jest-real-callback-semantics": "tests/callback-semantics.test.js::selected body",
+        "jest-real-hook-body-replacement": "tests/hook-body-replacement.test.js::selected body",
+        "jest-real-generator-body": "tests/generator-body.test.js::selected body",
         "jest-verified-fixed": "tests/regression.test.sh::(within a chat stays stable|across chats resets state)",
         "jest-no-match": "tests/regression.test.sh::does not exist",
         "jest-startup": "tests/regression.test.sh::across chats resets state",
@@ -930,6 +940,8 @@ elif scenario in {
         "vitest-real-custom-environment": "tests/custom-environment.test.mjs::selected body",
         "vitest-real-worker-forgery": "tests/worker-forgery.test.mjs::selected body",
         "vitest-real-ambient-node-options": "tests/ambient-node-options.test.mjs::selected body",
+        "vitest-real-primitive-forgery": "tests/primitive-forgery.test.mjs::selected body",
+        "vitest-real-native-env-semantics": "tests/native-env-semantics.test.mjs::selected body",
         "vitest-real-class-plugin-failure": "tests/class-plugin.test.mjs::selected body",
         "vitest-no-match": "tests/regression.test.sh::does not exist",
         "vitest-startup": "tests/regression.test.sh::across chats resets state",
@@ -3136,6 +3148,91 @@ assert proof["baseline_exit"] == 0
 assert proof["mutated_exit"] == 1
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" \
     || fail "Jest did not preserve callback test semantics"
+
+  record=$(make_case jest-real-hook-body-replacement)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/tests/hook-body-replacement.test.js" <<'JS'
+const { readFileSync } = require('node:fs');
+const Module = require('node:module');
+
+beforeEach(() => {
+  if (readFileSync('app.txt', 'utf8').trim() === 'fixed') return;
+  const stateModule = Object.values(Module._cache).find(module => (
+    module.filename.endsWith('/jest-circus/build/state.js')
+  ));
+  const state = stateModule.exports.getState();
+  state.currentlyRunningTest.fn = class ProjectReplacement {};
+});
+
+test('selected body', () => {
+  expect(readFileSync('app.txt', 'utf8').trim()).toBe('fixed');
+});
+JS
+  git -C "$case_dir/repo" add tests/hook-body-replacement.test.js
+  git -C "$case_dir/repo" commit -qm 'add Jest hook body replacement'
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_open_ledger "$case_dir" "$head"
+  ln -s "$runtime/node_modules/.bin/jest" "$case_dir/pathbin/jest"
+  set +e
+  run_case "$case_dir" "$base" "$head" jest-real-hook-body-replacement run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "Jest hook body replacement"
+  assert_grep 'NON-EXECUTION' "$case_dir/err" \
+    "a hook-replaced Jest body produced accepted execution evidence"
+  assert_grep 'no selected test body starting' "$case_dir/err" \
+    "the Jest body identity check did not fail closed"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "a hook-replaced Jest body cleared the finding"
+
+  record=$(make_case jest-real-generator-body)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/tests/generator-body.test.js" <<'JS'
+const { readFileSync } = require('node:fs');
+
+function* selectedBody() {
+  expect(readFileSync('app.txt', 'utf8').trim()).toBe('fixed');
+}
+
+beforeEach(() => {
+  selectedBody.apply = () => {
+    if (readFileSync('app.txt', 'utf8').trim() !== 'fixed') {
+      throw new Error('project-controlled generator apply rejected the mutation');
+    }
+    return (function* () {})();
+  };
+});
+
+test('selected body', selectedBody);
+JS
+  git -C "$case_dir/repo" add tests/generator-body.test.js
+  git -C "$case_dir/repo" commit -qm 'add Jest generator body proof'
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_open_ledger "$case_dir" "$head"
+  ln -s "$runtime/node_modules/.bin/jest" "$case_dir/pathbin/jest"
+  set +e
+  run_case "$case_dir" "$base" "$head" jest-real-generator-body run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "Jest generator body"
+  assert_grep 'NON-EXECUTION' "$case_dir/err" \
+    "a Jest generator produced unauthenticated body evidence"
+  assert_grep 'no selected test body starting' "$case_dir/err" \
+    "the Jest generator boundary emitted before body advancement"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "a Jest generator cleared the finding"
   pass "real Jest binds body entry to its canonical runtime"
 }
 
@@ -3641,6 +3738,140 @@ value = json.load(open(sys.argv[1]))
 assert value["findings"][0]["lifecycle"] == "open"
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" \
     || fail "ambient NODE_OPTIONS cleared the finding"
+
+  record=$(make_case vitest-real-primitive-forgery)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/tests/primitive-forgery.test.mjs" <<'JS'
+import { beforeEach, expect, test } from 'vitest';
+import { readFileSync } from 'node:fs';
+
+beforeEach(() => {
+  if (readFileSync('app.txt', 'utf8').trim() !== 'fixed') {
+    globalThis.projectForgeBodyEvent?.('selected body');
+    throw new Error('primitive forgery failed before the body');
+  }
+});
+
+test('selected body', () => {
+  expect(true).toBe(true);
+});
+JS
+  cat > "$case_dir/repo/tests/primitive-preload.cjs" <<'JS'
+const fs = require('node:fs');
+const { syncBuiltinESMExports } = require('node:module');
+const originalWrite = fs.writeSync;
+let nonce;
+
+fs.writeSync = function (fd, value, ...args) {
+  const match = String(value).match(
+    /CROSSCHECK-AUTH-BODY (?:PRELOAD|START) ([0-9a-f]{64})/,
+  );
+  if (match) nonce = match[1];
+  return Reflect.apply(originalWrite, fs, [fd, value, ...args]);
+};
+syncBuiltinESMExports();
+
+globalThis.projectForgeBodyEvent = (fullName) => {
+  if (!nonce) return;
+  const payload = Buffer.from(JSON.stringify({ fullName }), 'utf8').toString('base64');
+  Reflect.apply(originalWrite, fs, [
+    2,
+    `CROSSCHECK-AUTH-BODY EVENT ${nonce} ${payload}\n`,
+  ]);
+};
+JS
+  cat > "$case_dir/repo/vitest.config.mjs" <<'JS'
+import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
+
+const nativeDefineProperty = Object.defineProperty;
+Object.defineProperty = function (target, key, descriptor) {
+  if (target === process && key === 'env') {
+    if (readFileSync('app.txt', 'utf8').trim() !== 'fixed') {
+      const preload = fileURLToPath(
+        new URL('./tests/primitive-preload.cjs', import.meta.url),
+      );
+      process.env.NODE_OPTIONS = `--require=${preload}`;
+    }
+    return target;
+  }
+  return Reflect.apply(nativeDefineProperty, Object, [target, key, descriptor]);
+};
+
+export default {};
+JS
+  git -C "$case_dir/repo" add tests/primitive-forgery.test.mjs \
+    tests/primitive-preload.cjs vitest.config.mjs
+  git -C "$case_dir/repo" commit -qm 'add Vitest primitive forgery'
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_open_ledger "$case_dir" "$head"
+  ln -s "$runtime/node_modules/.bin/vitest" "$case_dir/pathbin/vitest"
+  set +e
+  run_case "$case_dir" "$base" "$head" vitest-real-primitive-forgery run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "Vitest primitive forgery"
+  assert_grep 'NON-EXECUTION' "$case_dir/err" \
+    "project-replaced primitives forged Vitest body evidence"
+  assert_grep 'no selected test body starting' "$case_dir/err" \
+    "the external Vitest launch boundary accepted primitive forgery"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "project-replaced primitives cleared the finding"
+
+  record=$(make_case vitest-real-native-env-semantics)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/tests/native-env-semantics.test.mjs" <<'JS'
+import { expect, test } from 'vitest';
+import { readFileSync } from 'node:fs';
+
+const observedType = '__CROSSCHECK_NATIVE_ENV_TYPE__';
+
+test('selected body', () => {
+  expect(observedType).toBe('string');
+  expect(readFileSync('app.txt', 'utf8').trim()).toBe('fixed');
+});
+JS
+  cat > "$case_dir/repo/vitest.config.mjs" <<'JS'
+export default {
+  plugins: [{
+    name: 'native-environment-semantics',
+    transform(code, id) {
+      if (!id.split('?')[0].endsWith('/tests/native-env-semantics.test.mjs')) {
+        return null;
+      }
+      process.env.CROSSCHECK_NATIVE_ENV_TYPE = 7;
+      return code.replace(
+        '__CROSSCHECK_NATIVE_ENV_TYPE__',
+        typeof process.env.CROSSCHECK_NATIVE_ENV_TYPE,
+      );
+    },
+  }],
+};
+JS
+  git -C "$case_dir/repo" add tests/native-env-semantics.test.mjs vitest.config.mjs
+  git -C "$case_dir/repo" commit -qm 'add native Vitest environment semantics'
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_open_ledger "$case_dir" "$head"
+  ln -s "$runtime/node_modules/.bin/vitest" "$case_dir/pathbin/vitest"
+  run_case "$case_dir" "$base" "$head" vitest-real-native-env-semantics run \
+    > "$case_dir/out" 2> "$case_dir/err" \
+    || fail "Vitest native environment semantics changed: $(tr '\n' ' ' < "$case_dir/err")"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+proof = value["findings"][0]["history"][-1]["proof"]
+assert value["findings"][0]["lifecycle"] == "verified-fixed"
+assert proof["baseline_exit"] == 0
+assert proof["mutated_exit"] == 1
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "Vitest did not preserve native process.env coercion"
 
   record=$(make_case vitest-real-class-plugin-failure)
   IFS=$'\t' read -r case_dir base head <<< "$record"
@@ -5398,15 +5629,23 @@ for runner in ("jest", "vitest"):
         assert str(runner_probe) in probe, probe
         assert (run.cwd / "vitest.config.mjs").as_uri() in probe, probe
         assert "crosscheck-runner-boundary" in probe, probe
-        assert "Object.create(Object.getPrototypeOf(plugin), descriptors)" in probe
+        assert "safeCreate(safeGetPrototypeOf(plugin), descriptors)" in probe
         assert "execArgv: ['--import', runnerPath]" in probe
         assert "pool: 'forks'" in probe
         assert "crosscheck-worker-environment-boundary" in probe
-        assert "Object.defineProperty(process, 'env'" in probe
+        assert "Object.defineProperty(process, 'env'" not in probe
+        launch_preload = probe_argument.with_name("vitest-launch-preload.cjs")
+        assert launch_preload.is_file()
+        launch_source = launch_preload.read_text()
+        assert "checkedFork" in launch_source
+        assert "expectedWorkerPath" in launch_source
+        assert "if (!isWorker)" in launch_source
         assert "Object.freeze(CrosscheckBodyRunner.prototype)" in runner_source
         assert "writeEvent('PRELOAD')" in runner_source
         assert "VitestTestRunner" not in runner_source, runner_source
-        assert dict(run.environment) == {}
+        assert dict(run.environment) == {
+            "NODE_OPTIONS": f"--require={launch_preload}",
+        }
         assert run.argv[6:] == (
             "--testNamePattern", "(within a chat|across chats)"
         ), run.argv
@@ -5482,6 +5721,8 @@ for runner in ("jest", "vitest"):
         assert str(runtime / "jest-circus/build/utils.js") in preload
         assert str(wrapper) in preload
         assert "safeApply(body, context, args)" in preload
+        assert "getRegisteredBody(testOrHook) !== body" in preload
+        assert "cannot authenticate Jest generator body execution" in preload
         assert "test.fn = function" not in preload
         assert "__crosscheckBody.apply" not in preload
         assert "test_fn_success" not in preload
@@ -5810,6 +6051,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-8 ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-9 ]; then
+  test_javascript_runner_policy_is_declared_once
+  test_real_jest_certifies_platform_shaped_mutation_proof
+  test_real_vitest_body_probe_certifies_mutation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-10 ]; then
   test_javascript_runner_policy_is_declared_once
   test_real_jest_certifies_platform_shaped_mutation_proof
   test_real_vitest_body_probe_certifies_mutation

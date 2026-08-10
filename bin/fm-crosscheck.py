@@ -1507,6 +1507,8 @@ def test_arguments(
                     label,
                     "vitest named test selects an unmeasured custom environment",
                 )
+            launch_preload = probe_argument.with_name("vitest-launch-preload.cjs")
+            environment = (("NODE_OPTIONS", f"--require={launch_preload}"),)
             argv.extend(["--config", str(probe_argument)])
         elif policy.body_probe != "jest-global-wrapper":
             tool_fail(
@@ -1552,8 +1554,20 @@ import { Buffer } from 'node:buffer';
 import { TestRunner } from __CROSSCHECK_VITEST_RUNTIME__;
 const nonce = randomBytes(32).toString('hex');
 const prefix = 'CROSSCHECK-AUTH-BODY';
+const safeApply = Reflect.apply;
+const safeArrayFilter = Array.prototype.filter;
+const safeArrayJoin = Array.prototype.join;
+const safeArrayPush = Array.prototype.push;
+const safeArrayReverse = Array.prototype.reverse;
+const safeBoolean = Boolean;
+const safeBuffer = Buffer;
+const safeBufferFrom = Buffer.from;
+const safeBufferToString = Buffer.prototype.toString;
+const safeJson = JSON;
+const safeJsonStringify = JSON.stringify;
 const authorized = new WeakSet();
 const isAuthorized = WeakSet.prototype.has.bind(authorized);
+const authorize = WeakSet.prototype.add.bind(authorized);
 const getTestFn = TestRunner.getTestFn.bind(TestRunner);
 let constructed = false;
 
@@ -1572,7 +1586,7 @@ export default class CrosscheckBodyRunner extends TestRunner {
       throw new Error('Crosscheck body runner was instantiated twice');
     }
     constructed = true;
-    authorized.add(this);
+    authorize(this);
     writeEvent('START');
   }
 
@@ -1581,14 +1595,18 @@ export default class CrosscheckBodyRunner extends TestRunner {
     const ancestorTitles = [];
     let suite = test.suite;
     while (suite) {
-      if (suite.name) ancestorTitles.push(suite.name);
+      if (suite.name) safeApply(safeArrayPush, ancestorTitles, [suite.name]);
       suite = suite.suite;
     }
-    ancestorTitles.reverse();
-    const fullName = [...ancestorTitles, test.name].filter(Boolean).join(' ');
+    safeApply(safeArrayReverse, ancestorTitles, []);
+    safeApply(safeArrayPush, ancestorTitles, [test.name]);
+    const namedTitles = safeApply(safeArrayFilter, ancestorTitles, [safeBoolean]);
+    const fullName = safeApply(safeArrayJoin, namedTitles, [' ']);
     const body = getTestFn(test);
     if (!body) throw new Error('Test function is not found');
-    const payload = Buffer.from(JSON.stringify({ fullName }), 'utf8').toString('base64');
+    const serialized = safeApply(safeJsonStringify, safeJson, [{ fullName }]);
+    const encoded = safeApply(safeBufferFrom, safeBuffer, [serialized, 'utf8']);
+    const payload = safeApply(safeBufferToString, encoded, ['base64']);
     writeEvent('EVENT', payload);
     await body();
   }
@@ -1599,6 +1617,9 @@ Object.freeze(CrosscheckBodyRunner.prototype);
             "__CROSSCHECK_VITEST_RUNTIME__", json.dumps(vitest_runtime.as_uri())
         )
         config_path = protocol / "vitest-body-probe.config.mjs"
+        launch_preload_path = protocol / "vitest-launch-preload.cjs"
+        launch_node_options = f"--require={launch_preload_path}"
+        vitest_worker_path = runner_path.parent / "dist" / "workers" / "forks.js"
         project_config = vitest_project_config(run_cwd)
         if project_config is None:
             project_loader = "const config = {};"
@@ -1609,63 +1630,140 @@ Object.freeze(CrosscheckBodyRunner.prototype);
     ? await projectConfig(environment)
     : await projectConfig;
   const config = loaded || {{}};"""
-        config_body = f"""const runnerPath = {json.dumps(str(probe_path))};
+        launch_preload_source = f"""'use strict';
+const childProcess = require('node:child_process');
+const {{ syncBuiltinESMExports }} = require('node:module');
+const safeApply = Reflect.apply;
+const safeDefineProperty = Object.defineProperty;
+const safeOwnKeys = Reflect.ownKeys;
+const safeArrayIsArray = Array.isArray;
+const safeString = String;
+const safeToUpperCase = String.prototype.toUpperCase;
+const expectedNodeOptions = {json.dumps(launch_node_options)};
+const expectedWorkerPath = {json.dumps(str(vitest_worker_path))};
+const expectedRunnerPath = {json.dumps(str(probe_path))};
 
-const nodeOptionsKeys = value => Object.keys(value)
-  .filter(key => key.toUpperCase() === 'NODE_OPTIONS');
+function nodeOptionsKeys(environment) {{
+  if (!environment || typeof environment !== 'object') {{
+    throw new Error('Crosscheck could not authenticate the Vitest worker environment');
+  }}
+  const keys = [];
+  for (const key of safeOwnKeys(environment)) {{
+    if (typeof key === 'string'
+        && safeApply(safeToUpperCase, key, []) === 'NODE_OPTIONS') {{
+      keys[keys.length] = key;
+    }}
+  }}
+  return keys;
+}}
+
+function requireGateNodeOptions(environment) {{
+  const keys = nodeOptionsKeys(environment);
+  if (keys.length !== 1 || safeString(environment[keys[0]]) !== expectedNodeOptions) {{
+    throw new Error('Crosscheck rejected project-controlled ambient NODE_OPTIONS');
+  }}
+}}
+
+requireGateNodeOptions(process.env);
+for (const key of nodeOptionsKeys(process.env)) delete process.env[key];
+const originalFork = childProcess.fork;
+let isWorker = false;
+for (let index = 0; index + 1 < process.execArgv.length; index += 1) {{
+  if (process.execArgv[index] === '--import'
+      && process.execArgv[index + 1] === expectedRunnerPath) {{
+    isWorker = true;
+  }}
+}}
+
+function checkedFork(modulePath, args, options) {{
+  const resolvedOptions = safeArrayIsArray(args) ? options : args;
+  if (modulePath !== expectedWorkerPath) {{
+    return safeApply(originalFork, childProcess, arguments);
+  }}
+  const environment = resolvedOptions?.env || process.env;
+  if (nodeOptionsKeys(environment).length) {{
+    throw new Error('Crosscheck rejected project-controlled ambient NODE_OPTIONS');
+  }}
+  const workerOptions = {{
+    ...(resolvedOptions || {{}}),
+    env: {{ ...environment, NODE_OPTIONS: expectedNodeOptions }},
+  }};
+  const forwarded = safeArrayIsArray(args)
+    ? [modulePath, args, workerOptions]
+    : [modulePath, workerOptions];
+  return safeApply(originalFork, childProcess, forwarded);
+}}
+
+if (!isWorker) {{
+  safeDefineProperty(childProcess, 'fork', {{
+    configurable: false,
+    enumerable: true,
+    writable: false,
+    value: checkedFork,
+  }});
+  syncBuiltinESMExports();
+}}
+"""
+        config_body = f"""const runnerPath = {json.dumps(str(probe_path))};
+const safeApply = Reflect.apply;
+const safeArrayIsArray = Array.isArray;
+const safeArrayFilter = Array.prototype.filter;
+const safeArrayMap = Array.prototype.map;
+const safeBoolean = Boolean;
+const safeCreate = Object.create;
+const safeDefineProperty = Object.defineProperty;
+const safeFreeze = Object.freeze;
+const safeGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+const safeGetPrototypeOf = Object.getPrototypeOf;
+const safeObjectKeys = Object.keys;
+const safePropertyIsEnumerableMethod = Object.prototype.propertyIsEnumerable;
+const safePropertyIsEnumerable = (value, key) => safeApply(
+  safePropertyIsEnumerableMethod,
+  value,
+  [key],
+);
+const safeJson = JSON;
+const safeJsonStringify = JSON.stringify;
+const safePromise = Promise;
+const safePromiseResolveMethod = Promise.resolve;
+const safePromiseResolve = value => safeApply(
+  safePromiseResolveMethod,
+  safePromise,
+  [value],
+);
+const safePromiseThen = Promise.prototype.then;
+const safeThen = (value, handler) => safeApply(safePromiseThen, value, [handler]);
+const safeSplit = String.prototype.split;
+const safeStringify = value => safeApply(safeJsonStringify, safeJson, [value]);
+const safeToUpperCase = String.prototype.toUpperCase;
+
+const nodeOptionsKeys = value => safeApply(safeArrayFilter, safeObjectKeys(value), [
+  key => safeApply(safeToUpperCase, key, []) === 'NODE_OPTIONS',
+]);
 
 const rejectAmbientNodeOptions = () => {{
-  if (nodeOptionsKeys(process.env).length) {{
+  const keys = nodeOptionsKeys(process.env);
+  if (keys.length) {{
     throw new Error('Crosscheck rejected project-controlled ambient NODE_OPTIONS');
   }}
 }};
 
-const secureAmbientEnvironment = () => {{
-  rejectAmbientNodeOptions();
-  const descriptor = Object.getOwnPropertyDescriptor(process, 'env');
-  if (!descriptor?.configurable) {{
-    throw new Error('Crosscheck could not secure the Vitest worker environment');
-  }}
-  const environment = {{ ...process.env }};
-  const protectedEnvironment = new Proxy(environment, {{
-    set(target, key, value) {{
-      if (String(key).toUpperCase() === 'NODE_OPTIONS') {{
-        throw new Error('Crosscheck rejected project-controlled ambient NODE_OPTIONS');
-      }}
-      return Reflect.set(target, key, value);
-    }},
-    defineProperty(target, key, value) {{
-      if (String(key).toUpperCase() === 'NODE_OPTIONS') {{
-        throw new Error('Crosscheck rejected project-controlled ambient NODE_OPTIONS');
-      }}
-      return Reflect.defineProperty(target, key, value);
-    }},
-  }});
-  Object.defineProperty(process, 'env', {{
-    configurable: false,
-    enumerable: descriptor.enumerable,
-    writable: false,
-    value: protectedEnvironment,
-  }});
-}};
-
 export default async (environment) => {{
   {project_loader}
-  if (!config || typeof config !== 'object' || Array.isArray(config)) {{
+  if (!config || typeof config !== 'object' || safeArrayIsArray(config)) {{
     throw new Error('Crosscheck cannot authenticate an unmeasured Vitest project shape');
   }}
   const test = config.test || {{}};
-  if (typeof test !== 'object' || Array.isArray(test)) {{
+  if (typeof test !== 'object' || safeArrayIsArray(test)) {{
     throw new Error('Crosscheck cannot authenticate an unmeasured Vitest test shape');
   }}
   const configuredEnvironment = test.environment || 'node';
   const configuredEnv = test.env || {{}};
   rejectAmbientNodeOptions();
-  const hasNodeOptions = Object.keys(configuredEnv)
-    .some(key => key.toUpperCase() === 'NODE_OPTIONS');
-  const hasConfigEntries = value => Array.isArray(value)
+  const hasNodeOptions = nodeOptionsKeys(configuredEnv).length > 0;
+  const hasConfigEntries = value => safeArrayIsArray(value)
     ? value.length > 0
-    : Boolean(value && typeof value === 'object' && Object.keys(value).length);
+    : safeBoolean(value && typeof value === 'object' && safeObjectKeys(value).length);
   if (configuredEnvironment !== 'node'
       || hasConfigEntries(test.environmentMatchGlobs)
       || hasConfigEntries(test.projects)
@@ -1675,33 +1773,33 @@ export default async (environment) => {{
       || hasConfigEntries(test.poolMatchGlobs)
       || (test.execArgv && test.execArgv.length)
       || hasNodeOptions
-      || (config.define && Object.keys(config.define).length)
+      || (config.define && safeObjectKeys(config.define).length)
       || test.runner) {{
     throw new Error('Crosscheck cannot authenticate an unmeasured Vitest runtime boundary');
   }}
-  const plugins = Array.isArray(config.plugins)
+  const plugins = safeArrayIsArray(config.plugins)
     ? config.plugins
     : config.plugins ? [config.plugins] : [];
   const isRunnerId = id => typeof id === 'string'
-    && id.split('?')[0] === runnerPath;
+    && safeApply(safeSplit, id, ['?'])[0] === runnerPath;
   const protectHook = (hook, block) => {{
     if (typeof hook === 'function') {{
       return function(...args) {{
         if (block(args)) return null;
-        return hook.apply(this, args);
+        return safeApply(hook, this, args);
       }};
     }}
     if (hook && typeof hook.handler === 'function') {{
-      const descriptors = Object.getOwnPropertyDescriptors(hook);
+      const descriptors = safeGetOwnPropertyDescriptors(hook);
       delete descriptors.handler;
-      const protectedHook = Object.create(Object.getPrototypeOf(hook), descriptors);
-      Object.defineProperty(protectedHook, 'handler', {{
+      const protectedHook = safeCreate(safeGetPrototypeOf(hook), descriptors);
+      safeDefineProperty(protectedHook, 'handler', {{
         configurable: false,
-        enumerable: Object.prototype.propertyIsEnumerable.call(hook, 'handler'),
+        enumerable: safePropertyIsEnumerable(hook, 'handler'),
         writable: false,
         value: function(...args) {{
           if (block(args)) return null;
-          return hook.handler.apply(this, args);
+          return safeApply(hook.handler, this, args);
         }},
       }});
       return protectedHook;
@@ -1710,29 +1808,29 @@ export default async (environment) => {{
   }};
   const protectConfigFunction = handler => function(...args) {{
     const beforeDefine = args[0]?.define;
-    const beforeFingerprint = JSON.stringify(beforeDefine || {{}});
+    const beforeFingerprint = safeStringify(beforeDefine || {{}});
     const validate = returned => {{
       if (args[0]?.define !== beforeDefine
-          || JSON.stringify(args[0]?.define || {{}}) !== beforeFingerprint
+          || safeStringify(args[0]?.define || {{}}) !== beforeFingerprint
           || hasConfigEntries(returned?.define)) {{
         throw new Error('Crosscheck rejected a project-controlled Vitest define');
       }}
       return returned;
     }};
-    const returned = handler.apply(this, args);
+    const returned = safeApply(handler, this, args);
     return returned && typeof returned.then === 'function'
-      ? Promise.resolve(returned).then(validate)
+      ? safeThen(safePromiseResolve(returned), validate)
       : validate(returned);
   }};
   const protectConfigHook = hook => {{
     if (typeof hook === 'function') return protectConfigFunction(hook);
     if (hook && typeof hook.handler === 'function') {{
-      const descriptors = Object.getOwnPropertyDescriptors(hook);
+      const descriptors = safeGetOwnPropertyDescriptors(hook);
       delete descriptors.handler;
-      const protectedHook = Object.create(Object.getPrototypeOf(hook), descriptors);
-      Object.defineProperty(protectedHook, 'handler', {{
+      const protectedHook = safeCreate(safeGetPrototypeOf(hook), descriptors);
+      safeDefineProperty(protectedHook, 'handler', {{
         configurable: false,
-        enumerable: Object.prototype.propertyIsEnumerable.call(hook, 'handler'),
+        enumerable: safePropertyIsEnumerable(hook, 'handler'),
         writable: false,
         value: protectConfigFunction(hook.handler),
       }});
@@ -1741,39 +1839,46 @@ export default async (environment) => {{
     return hook;
   }};
   const protectPlugin = plugin => {{
-    if (Array.isArray(plugin)) return plugin.map(protectPlugin);
+    if (safeArrayIsArray(plugin)) {{
+      return safeApply(safeArrayMap, plugin, [protectPlugin]);
+    }}
     if (plugin && typeof plugin.then === 'function') {{
-      return Promise.resolve(plugin).then(protectPlugin);
+      return safeThen(safePromiseResolve(plugin), protectPlugin);
     }}
     if (!plugin || typeof plugin !== 'object') return plugin;
-    const descriptors = Object.getOwnPropertyDescriptors(plugin);
+    const descriptors = safeGetOwnPropertyDescriptors(plugin);
     delete descriptors.config;
     delete descriptors.resolveId;
     delete descriptors.load;
     delete descriptors.transform;
-    const protectedPlugin = Object.create(Object.getPrototypeOf(plugin), descriptors);
-    for (const [name, hook, block] of [
+    const protectedPlugin = safeCreate(safeGetPrototypeOf(plugin), descriptors);
+    const runnerHooks = [
       ['resolveId', plugin.resolveId, args => isRunnerId(args[0])],
       ['load', plugin.load, args => isRunnerId(args[0])],
       ['transform', plugin.transform, args => isRunnerId(args[1])],
-    ]) {{
-      Object.defineProperty(protectedPlugin, name, {{
+    ];
+    for (let index = 0; index < runnerHooks.length; index += 1) {{
+      const entry = runnerHooks[index];
+      const name = entry[0];
+      const hook = entry[1];
+      const block = entry[2];
+      safeDefineProperty(protectedPlugin, name, {{
         configurable: false,
-        enumerable: Object.prototype.propertyIsEnumerable.call(plugin, name),
+        enumerable: safePropertyIsEnumerable(plugin, name),
         writable: false,
         value: protectHook(hook, block),
       }});
     }}
-    Object.defineProperty(protectedPlugin, 'config', {{
+    safeDefineProperty(protectedPlugin, 'config', {{
       configurable: false,
-      enumerable: Object.prototype.propertyIsEnumerable.call(plugin, 'config'),
+      enumerable: safePropertyIsEnumerable(plugin, 'config'),
       writable: false,
       value: protectConfigHook(plugin.config),
     }});
     return protectedPlugin;
   }};
-  const protectedPlugins = plugins.map(protectPlugin);
-  const guard = Object.freeze({{
+  const protectedPlugins = safeApply(safeArrayMap, plugins, [protectPlugin]);
+  const guard = safeFreeze({{
     name: 'crosscheck-runner-boundary',
     enforce: 'pre',
     configResolved(resolved) {{
@@ -1787,19 +1892,24 @@ export default async (environment) => {{
         [resolvedTest?.browser?.enabled, 'browser'],
         [hasConfigEntries(resolvedTest?.poolOptions), 'poolOptions'],
         [hasConfigEntries(resolvedTest?.poolMatchGlobs), 'poolMatchGlobs'],
-        [!Array.isArray(resolvedTest?.execArgv), 'execArgv-type'],
+        [!safeArrayIsArray(resolvedTest?.execArgv), 'execArgv-type'],
         [resolvedTest?.execArgv?.length !== 2, 'execArgv-length'],
         [resolvedTest?.execArgv?.[0] !== '--import', 'execArgv-option'],
         [resolvedTest?.execArgv?.[1] !== runnerPath, 'execArgv-path'],
-        [Object.keys(resolvedTest?.env || {{}})
-          .some(key => key.toUpperCase() === 'NODE_OPTIONS'), 'env'],
-      ].filter(([failed]) => failed).map(([, name]) => name);
-      if (violations.length) {{
+        [nodeOptionsKeys(resolvedTest?.env || {{}}).length > 0, 'env'],
+      ];
+      const failedEntries = safeApply(safeArrayFilter, violations, [
+        entry => entry[0],
+      ]);
+      const violationNames = safeApply(safeArrayMap, failedEntries, [
+        entry => entry[1],
+      ]);
+      if (violationNames.length) {{
         throw new Error(
-          `Crosscheck Vitest runtime boundary changed after resolution: ${{violations.join(', ')}}`,
+          `Crosscheck Vitest runtime boundary changed after resolution: ${{violationNames}}`,
         );
       }}
-      const lock = (key, value) => Object.defineProperty(resolvedTest, key, {{
+      const lock = (key, value) => safeDefineProperty(resolvedTest, key, {{
           configurable: false,
           enumerable: true,
           writable: false,
@@ -1808,20 +1918,20 @@ export default async (environment) => {{
       lock('runner', runnerPath);
       lock('environment', 'node');
       lock('pool', 'forks');
-      lock('execArgv', Object.freeze(['--import', runnerPath]));
-      lock('env', Object.freeze({{ ...(resolvedTest.env || {{}}) }}));
+      lock('execArgv', safeFreeze(['--import', runnerPath]));
+      lock('env', safeFreeze({{ ...(resolvedTest.env || {{}}) }}));
       lock('environmentMatchGlobs', undefined);
       lock('projects', undefined);
       lock('poolMatchGlobs', undefined);
-      lock('browser', Object.freeze({{ ...(resolvedTest.browser || {{}}), enabled: false }}));
-      Object.defineProperty(resolved, 'define', {{
+      lock('browser', safeFreeze({{ ...(resolvedTest.browser || {{}}), enabled: false }}));
+      safeDefineProperty(resolved, 'define', {{
         configurable: false,
         enumerable: true,
         writable: false,
-        value: Object.freeze({{ ...(resolved.define || {{}}) }}),
+        value: safeFreeze({{ ...(resolved.define || {{}}) }}),
       }});
-      Object.freeze(resolved.plugins);
-      Object.defineProperty(resolved, 'plugins', {{
+      safeFreeze(resolved.plugins);
+      safeDefineProperty(resolved, 'plugins', {{
         configurable: false,
         enumerable: true,
         writable: false,
@@ -1829,20 +1939,25 @@ export default async (environment) => {{
       }});
     }},
   }});
-  const environmentGuard = Object.freeze({{
+  const environmentGuard = safeFreeze({{
     name: 'crosscheck-worker-environment-boundary',
     enforce: 'post',
-    configResolved: Object.freeze({{
+    configResolved: safeFreeze({{
       order: 'post',
       handler() {{
-        secureAmbientEnvironment();
+        rejectAmbientNodeOptions();
       }},
     }}),
   }});
+  const finalPlugins = [guard];
+  for (let index = 0; index < protectedPlugins.length; index += 1) {{
+    finalPlugins[finalPlugins.length] = protectedPlugins[index];
+  }}
+  finalPlugins[finalPlugins.length] = environmentGuard;
   return {{
     ...config,
     define: {{}},
-    plugins: [guard, ...protectedPlugins, environmentGuard],
+    plugins: finalPlugins,
     test: {{
       ...test,
       environment: 'node',
@@ -1855,6 +1970,7 @@ export default async (environment) => {{
 }};
 """
         config_path.write_text(config_body, encoding="utf-8")
+        launch_preload_path.write_text(launch_preload_source, encoding="utf-8")
         probe_path.write_text(source, encoding="utf-8")
         (package_dir / "package.json").write_text(
             '{"name":"crosscheck-vitest-body-runner","type":"module"}\n',
@@ -2170,9 +2286,15 @@ const wrapperPath = {json.dumps(str(wrapper_path))};
 const nonce = randomBytes(32).toString('hex');
 const prefix = 'CROSSCHECK-AUTH-BODY';
 const safeApply = Reflect.apply;
+const safeArrayIsArray = Array.isArray;
+const safeObjectToString = Object.prototype.toString;
 const recorded = new WeakSet();
 const wasRecorded = WeakSet.prototype.has.bind(recorded);
 const markRecorded = WeakSet.prototype.add.bind(recorded);
+const registeredBodies = new WeakMap();
+const hasRegisteredBody = WeakMap.prototype.has.bind(registeredBodies);
+const getRegisteredBody = WeakMap.prototype.get.bind(registeredBodies);
+const setRegisteredBody = WeakMap.prototype.set.bind(registeredBodies);
 
 function writeEvent(kind, payload) {{
   const suffix = payload ? ` ${{payload}}` : '';
@@ -2230,14 +2352,14 @@ function patchUtilsSource(source, slot) {{
       || source.split(ordinaryCall).length !== 2) {{
     throw new Error('Crosscheck Jest invocation boundary does not match measured Circus');
   }}
-  source = `"use strict";\\nconst __crosscheckInvoke = globalThis[${{JSON.stringify(slot)}}];\\ndelete globalThis[${{JSON.stringify(slot)}}];\\n${{source}}`;
+  source = `"use strict";\\nconst __crosscheckBridge = globalThis[${{JSON.stringify(slot)}}];\\nconst __crosscheckInvoke = __crosscheckBridge.invoke;\\ndelete globalThis[${{JSON.stringify(slot)}}];\\n${{source}}`;
   source = source.replace(
     callbackCall,
     '      returnedValue = __crosscheckInvoke(testOrHook, isHook, fn, testContext, [done]);',
   );
   source = source.replace(
     generatorCall,
-    "      const __crosscheckGenerator = _co.default.wrap(fn);\\n      returnedValue = __crosscheckInvoke(testOrHook, isHook, __crosscheckGenerator, {{}}, []);",
+    "      if (!isHook) {{\\n        reject(new Error('Crosscheck cannot authenticate Jest generator body execution'));\\n        return;\\n      }}\\n      returnedValue = _co.default.wrap(fn).call({{}});",
   );
   return source.replace(
     ordinaryCall,
@@ -2251,10 +2373,15 @@ function patchRunSource(source, slot) {{
     throw new Error('Crosscheck Jest run module does not match measured Circus');
   }}
   const concurrent = "      const testFn = test.fn;\\n      const promise = mutex(() =>\\n        testNameStorage.run((0, _utils.getTestID)(test), testFn)\\n      );";
-  if (source.split(concurrent).length !== 2) {{
+  const root = "  const {{rootDescribeBlock, seed, randomize}} = (0, _state.getState)();";
+  if (source.split(concurrent).length !== 2 || source.split(root).length !== 2) {{
     throw new Error('Crosscheck Jest concurrent boundary does not match measured Circus');
   }}
-  source = `"use strict";\\nconst __crosscheckInvoke = globalThis[${{JSON.stringify(slot)}}];\\ndelete globalThis[${{JSON.stringify(slot)}}];\\n${{source}}`;
+  source = `"use strict";\\nconst __crosscheckBridge = globalThis[${{JSON.stringify(slot)}}];\\nconst __crosscheckInvoke = __crosscheckBridge.invoke;\\nconst __crosscheckCapture = __crosscheckBridge.capture;\\ndelete globalThis[${{JSON.stringify(slot)}}];\\n${{source}}`;
+  source = source.replace(
+    root,
+    "  const {{rootDescribeBlock, seed, randomize}} = (0, _state.getState)();\\n  __crosscheckCapture(rootDescribeBlock);",
+  );
   return source.replace(
     concurrent,
     "      const testFn = test.fn;\\n      const promise = mutex(() =>\\n        testNameStorage.run(\\n          (0, _utils.getTestID)(test),\\n          () => __crosscheckInvoke(test, false, testFn, undefined, [])\\n        )\\n      );",
@@ -2283,8 +2410,34 @@ if (createHash('sha256').update(wrapperSource).digest('hex') !== {json.dumps(wra
   throw new Error('Crosscheck Jest runner wrapper does not match its gate source');
 }}
 let invoked = false;
+function captureBodies(block) {{
+  if (!safeArrayIsArray(block.children)) {{
+    throw new Error('Crosscheck Jest body registry is malformed');
+  }}
+  for (let index = 0; index < block.children.length; index += 1) {{
+    const child = block.children[index];
+    if (child.type === 'test') {{
+      if (hasRegisteredBody(child)) {{
+        throw new Error('Crosscheck Jest body was registered twice');
+      }}
+      setRegisteredBody(child, child.fn);
+    }} else if (child.type === 'describeBlock') {{
+      captureBodies(child);
+    }}
+  }}
+}}
+
 function invokeBody(testOrHook, isHook, body, context, args) {{
-  if (!isHook) record(testOrHook);
+  if (!isHook) {{
+    if (!hasRegisteredBody(testOrHook)
+        || getRegisteredBody(testOrHook) !== body) {{
+      throw new Error('Crosscheck Jest body identity changed before execution');
+    }}
+    if (safeApply(safeObjectToString, body, []) === '[object GeneratorFunction]') {{
+      throw new Error('Crosscheck cannot authenticate Jest generator body execution');
+    }}
+    record(testOrHook);
+  }}
   return safeApply(body, context, args);
 }}
 
@@ -2299,8 +2452,9 @@ async function invokeRunner(canonical, args) {{
   const originalReadFile = runtime.readFile.bind(runtime);
   const runSlot = `__crosscheck_${{randomBytes(32).toString('hex')}}`;
   const utilsSlot = `__crosscheck_${{randomBytes(32).toString('hex')}}`;
-  environment.global[runSlot] = invokeBody;
-  environment.global[utilsSlot] = invokeBody;
+  const bridge = Object.freeze({{ capture: captureBodies, invoke: invokeBody }});
+  environment.global[runSlot] = bridge;
+  environment.global[utilsSlot] = bridge;
   Object.defineProperty(runtime, 'readFile', {{
     configurable: false,
     enumerable: false,

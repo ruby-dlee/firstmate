@@ -2874,6 +2874,7 @@ fm_backend_herdr_is_bare_prompt_row() {  # <plain-trimmed-row>
 }
 
 fm_backend_herdr_display_columns() {
+  # shellcheck disable=SC2016 # The single-quoted payload is Perl, not shell.
   fm_backend_herdr_control_perl -MEncode=decode,FB_CROAK -e '
     local $/;
     my $bytes = <STDIN>;

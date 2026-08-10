@@ -71,6 +71,7 @@ class MutationRunnerPolicy:
         "runtime_error_field",
         "non_execution_exits",
         "runtime_version",
+        "minimum_node_version",
         "source_digests",
         "measurement",
     )
@@ -88,6 +89,7 @@ class MutationRunnerPolicy:
         runtime_error_field: str,
         non_execution_exits: tuple[tuple[int, str], ...],
         runtime_version: str | None,
+        minimum_node_version: tuple[int, int, int] | None,
         source_digests: tuple[tuple[str, str], ...],
         measurement: str,
     ) -> None:
@@ -101,6 +103,7 @@ class MutationRunnerPolicy:
         self.runtime_error_field = runtime_error_field
         self.non_execution_exits = non_execution_exits
         self.runtime_version = runtime_version
+        self.minimum_node_version = minimum_node_version
         self.source_digests = source_digests
         self.measurement = measurement
 
@@ -154,6 +157,7 @@ MUTATION_RUNNER_POLICIES = {
             (5, "no test matched the named selector"),
         ),
         runtime_version=None,
+        minimum_node_version=None,
         source_digests=(),
         measurement="pytest 9.1.1 on 2026-08-05",
     ),
@@ -168,6 +172,7 @@ MUTATION_RUNNER_POLICIES = {
         runtime_error_field="required-zero",
         non_execution_exits=(),
         runtime_version="29.7.0",
+        minimum_node_version=None,
         source_digests=(
             (
                 "circusRun",
@@ -191,13 +196,14 @@ MUTATION_RUNNER_POLICIES = {
         runtime_error_field="absent",
         non_execution_exits=(),
         runtime_version="4.1.5",
+        minimum_node_version=(20, 6, 0),
         source_digests=(
             (
                 "forkLauncher",
                 "d991d80584acd5fc622aefce5f907feff6c531059165a05d75c66e3ed8697d79",
             ),
         ),
-        measurement="Vitest 4.1.5 on 2026-08-09",
+        measurement="Vitest 4.1.5 on Node 20.20.2 on 2026-08-10",
     ),
 }
 GENERAL_TEST_RUNNERS = {
@@ -1424,6 +1430,46 @@ def resolve_runner(runner: str, label: str, cwd: Path, test_path: str) -> list[s
     )
 
 
+def require_node_runtime(
+    label: str, minimum: tuple[int, int, int]
+) -> tuple[int, int, int]:
+    environment = proof_environment()
+    path = environment.get("PATH")
+    node = shutil.which("node", path=path) if path else None
+    required = ".".join(str(part) for part in minimum)
+    if node is None:
+        non_execution(
+            label,
+            f"the measured runner requires Node >={required}, but node is absent",
+        )
+    try:
+        completed = subprocess.run(
+            [node, "--version"],
+            capture_output=True,
+            check=False,
+            env=environment,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        non_execution(label, f"the Node runtime version is unavailable: {exc}")
+    output = (completed.stdout or completed.stderr).strip()
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", output)
+    if completed.returncode != 0 or match is None:
+        non_execution(
+            label,
+            "the Node runtime did not report a usable semantic version",
+        )
+    version = tuple(int(part) for part in match.groups())
+    if version < minimum:
+        found = ".".join(str(part) for part in version)
+        non_execution(
+            label,
+            f"the measured runner requires Node >={required}, found {found}",
+        )
+    return version
+
+
 def test_arguments(
     invocation: dict[str, Any], test_path: str, checkout: Path, label: str
 ) -> TestRun:
@@ -1448,6 +1494,8 @@ def test_arguments(
         if policy.node_project_cwd
         else checkout
     )
+    if policy.minimum_node_version is not None:
+        require_node_runtime(label, policy.minimum_node_version)
     if policy.selector_mode == "native":
         target = test_path
     elif policy.selector_mode in {"none", "test-name-pattern"}:
@@ -1516,8 +1564,8 @@ def test_arguments(
                     label,
                     "vitest named test selects an unmeasured custom environment",
                 )
-            launch_preload = probe_argument.with_name("vitest-launch-preload.cjs")
-            environment = (("NODE_OPTIONS", f"--require={launch_preload}"),)
+            launch_preload = probe_argument.with_name("vitest-launch-preload.mjs")
+            environment = (("NODE_OPTIONS", f"--import={launch_preload}"),)
             argv.extend(["--config", str(probe_argument)])
         elif policy.body_probe != "jest-global-wrapper":
             tool_fail(
@@ -1663,10 +1711,10 @@ Object.freeze(CrosscheckBodyRunner.prototype);
             "__CROSSCHECK_VITEST_RUNTIME__", json.dumps(vitest_runtime.as_uri())
         )
         config_path = protocol / "vitest-body-probe.config.mjs"
-        launch_preload_path = protocol / "vitest-launch-preload.cjs"
+        launch_preload_path = protocol / "vitest-launch-preload.mjs"
         loader_path = protocol / "vitest-launch-loader.mjs"
         child_process_path = protocol / "vitest-child-process.mjs"
-        launch_node_options = f"--require={launch_preload_path}"
+        launch_node_options = f"--import={launch_preload_path}"
         vitest_worker_path = runner_path.parent / "dist" / "workers" / "forks.js"
         fork_launcher_path = vitest_fork_launcher(runner_path, label)
         project_config = vitest_project_config(run_cwd)
@@ -1679,10 +1727,9 @@ Object.freeze(CrosscheckBodyRunner.prototype);
     ? await projectConfig(environment)
     : await projectConfig;
   const config = loaded || {{}};"""
-        launch_preload_source = f"""'use strict';
-const {{ register }} = require('node:module');
-const {{ pathToFileURL }} = require('node:url');
-const {{ isMainThread }} = require('node:worker_threads');
+        launch_preload_source = f"""import {{ register }} from 'node:module';
+import {{ pathToFileURL }} from 'node:url';
+import {{ isMainThread }} from 'node:worker_threads';
 const safeApply = Reflect.apply;
 const safeOwnKeys = Reflect.ownKeys;
 const safeString = String;
@@ -1690,6 +1737,7 @@ const safeToUpperCase = String.prototype.toUpperCase;
 const expectedNodeOptions = {json.dumps(launch_node_options)};
 const expectedRunnerPath = {json.dumps(str(probe_path))};
 const loaderUrl = pathToFileURL({json.dumps(str(loader_path))}).href;
+const childProcessUrl = pathToFileURL({json.dumps(str(child_process_path))}).href;
 
 function nodeOptionsKeys(environment) {{
   if (!environment || typeof environment !== 'object') {{
@@ -1722,7 +1770,10 @@ if (isMainThread) {{
       isWorker = true;
     }}
   }}
-  if (!isWorker) register(loaderUrl);
+  if (!isWorker) {{
+    register(loaderUrl);
+    await import(childProcessUrl);
+  }}
 }}
 """
         loader_source = f"""const launcherUrl = {json.dumps(fork_launcher_path.as_uri())};
@@ -1738,11 +1789,37 @@ export async function resolve(specifier, context, nextResolve) {{
         child_process_source = f"""import * as childProcess from 'node:child_process';
 const safeApply = Reflect.apply;
 const safeArrayIsArray = Array.isArray;
+const safeArraySlice = Array.prototype.slice;
+const safeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
 const safeOwnKeys = Reflect.ownKeys;
 const safeToUpperCase = String.prototype.toUpperCase;
 const nativeFork = childProcess.fork;
+const nativeChildProcessPrototype = childProcess.ChildProcess.prototype;
+const nativeSpawn = nativeChildProcessPrototype.spawn;
+const nativeSpawnDescriptor = safeApply(
+  safeGetOwnPropertyDescriptor,
+  Object,
+  [nativeChildProcessPrototype, 'spawn'],
+);
 const expectedNodeOptions = {json.dumps(launch_node_options)};
 const expectedWorkerPath = {json.dumps(str(vitest_worker_path))};
+
+function requireNativeSpawn() {{
+  const descriptor = safeApply(
+    safeGetOwnPropertyDescriptor,
+    Object,
+    [nativeChildProcessPrototype, 'spawn'],
+  );
+  if (!descriptor
+      || descriptor.value !== nativeSpawn
+      || descriptor.configurable !== nativeSpawnDescriptor.configurable
+      || descriptor.enumerable !== nativeSpawnDescriptor.enumerable
+      || descriptor.writable !== nativeSpawnDescriptor.writable) {{
+    throw new Error(
+      'Crosscheck rejected project-mutated ChildProcess.prototype.spawn',
+    );
+  }}
+}}
 
 function nodeOptionsKeys(environment) {{
   if (!environment || typeof environment !== 'object') {{
@@ -1761,6 +1838,7 @@ function nodeOptionsKeys(environment) {{
 export function fork(modulePath, args, options) {{
   const resolvedOptions = safeArrayIsArray(args) ? options : args;
   if (modulePath !== expectedWorkerPath) {{
+    requireNativeSpawn();
     return safeApply(nativeFork, childProcess, arguments);
   }}
   const environment = resolvedOptions?.env || process.env;
@@ -1771,9 +1849,13 @@ export function fork(modulePath, args, options) {{
     ...(resolvedOptions || {{}}),
     env: {{ ...environment, NODE_OPTIONS: expectedNodeOptions }},
   }};
+  const workerArguments = safeArrayIsArray(args)
+    ? safeApply(safeArraySlice, args, [])
+    : undefined;
   const forwarded = safeArrayIsArray(args)
-    ? [modulePath, args, workerOptions]
+    ? [modulePath, workerArguments, workerOptions]
     : [modulePath, workerOptions];
+  requireNativeSpawn();
   return safeApply(nativeFork, childProcess, forwarded);
 }}
 

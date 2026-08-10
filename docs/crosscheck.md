@@ -214,8 +214,10 @@ Custom resolvers, sibling runtime copies, project-local suffix spoofs, and per-f
 For Vitest, the executable and runtime export must match the measured external Vitest 4.1.5 package, while the gate-owned config imports the discovered tracked `vitest.config.*` or `vite.config.*`, preserves its plugins, aliases, setup, and ordinary test options, and locks the body runner during resolved configuration.
 Every Vitest worker imports that runner package through the gate-pinned `test.execArgv` before worker initialization, and its location beneath a gate-owned external `node_modules` directory keeps it on Node's native import path instead of the tracked Vite transform pipeline.
 The runner captures each registered function in `onBeforeRunTask` before project hooks, requires identical identity at `runTask`, and emits no body event when `setFn` or another hook replaces it.
-The Vitest parent starts with a gate-owned `NODE_OPTIONS` preload that registers a loader before tracked configuration and removes the preload from the native environment before project code runs.
+The Vitest parent starts with a gate-owned `NODE_OPTIONS` preload that registers the loader, instantiates the spawn-attesting facade in that loader's module graph, and removes the preload from the native environment before project code runs.
+The measured Vitest loader boundary requires Node 20.6.0 or newer, and an absent, unreadable, or older Node runtime is a named `NON-EXECUTION` that clears nothing.
 That loader redirects only the digest-pinned Vitest fork launcher's private `node:child_process` import to a gate facade, so the exact worker launch rejects project-provided options and injects the gate preload while every project-visible child-process export keeps its native object, name, identity, and descriptors.
+Immediately before dispatch, the facade attests the captured native `ChildProcess.prototype.spawn` identity after all project-provided options are copied, so a tracked configuration cannot reorder worker preloads through the transitive spawn call.
 The final gate plugin rechecks that tracked configuration and plugin resolution left no ambient `NODE_OPTIONS`, while Node's native string-coercing `process.env` object remains unchanged.
 The gate retains each tracked plugin's prototype and property descriptors while interposing only runner-loading hooks, so class-based and non-enumerable startup hooks keep their project semantics.
 Custom runners, browser mode, projects, threads, custom pools, project worker arguments, serialized defines, ambient or `test.env.NODE_OPTIONS`, custom environments, and per-file environment overrides fail closed when that ordering cannot be attested.
@@ -231,16 +233,19 @@ It cannot modify the named test, conventional test trees, fixtures, Jest/Vitest/
 Do not add a runner to `MUTATION_RUNNER_POLICIES` until its exact gate-owned invocation has an empirically distinguishable execution signal.
 Use the real runner in a clean scratch package with one mutation-insensitive control test and one mutation-sensitive regression test.
 Run the exact proposed argv with no reviewer arguments for seven cases: matched pass, matched assertion failure, unmatched selector, missing target, missing dependency during collection, conventional tracked configuration that fails at startup, and a selected test whose `beforeAll` or `beforeEach` hook fails before its body.
-Record the runner version, date, exact commands, exit statuses, stdout, stderr, authenticated channel start and body events, and attempted project-writable forgeries before encoding anything.
+Record the runner and Node versions, date, exact commands, exit statuses, stdout, stderr, authenticated channel start and body events, and attempted project-writable forgeries before encoding anything.
+When the runner boundary uses a Node API introduced after the runner's own engine minimum, run the matrix on the last version without that API and the first version with it, then encode the latter as an explicit minimum runtime.
 A future version whose output no longer satisfies the declared parser fails closed as `NON-EXECUTION`; do not loosen the parser until that version has been measured through the same matrix.
 If a runner exposes no signal that distinguishes a failed assertion from failed startup or non-collection, it is not eligible for certification.
 
-The JavaScript profile was measured on 2026-08-09 with Jest 29.7.0 and Vitest 4.1.5 using these exact command shapes.
+The JavaScript profile was measured on 2026-08-09 with Jest 29.7.0 and on 2026-08-10 with Vitest 4.1.5 on Node 20.20.2 using these exact command shapes.
+The Vitest loader boundary was also measured on Node 20.5.1 and 20.6.0: Node 20.5.1 cannot import the gate preload because `node:module` does not export `register`, while Node 20.6.0 loads it and reaches the runner.
+Crosscheck therefore rejects Node 20.5.1 and older before proof execution and accepts Node 20.6.0 and newer at this boundary.
 
 ```sh
 jest --showConfig --json
 node --require=/gate/jest-body-preload.cjs /runtime/node_modules/jest/bin/jest.js --json --runInBand --runTestsByPath /proof/regression.test.js --testNamePattern 'across chats resets state' --testRunner /gate/node_modules/crosscheck-jest-body-runner/index.cjs
-NODE_OPTIONS=--require=/gate/vitest-launch-preload.cjs vitest run --reporter=json regression.test.js --config /gate/vitest-body-probe.config.mjs --testNamePattern 'across chats resets state'
+NODE_OPTIONS=--import=/gate/vitest-launch-preload.mjs vitest run --reporter=json regression.test.js --config /gate/vitest-body-probe.config.mjs --testNamePattern 'across chats resets state'
 ```
 
 The matched baseline exited 0 and recorded one passed selected assertion on both runners.

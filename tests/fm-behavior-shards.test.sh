@@ -227,6 +227,19 @@ test_ci_wires_matrix_isolation_timeout_and_union_verification() {
   pass "CI wires eight named isolated shards, a tight timeout, and executed-union verification"
 }
 
+test_account_routing_partition_uses_four_distinct_wrappers() {
+  local index partition suffix wrapper
+  for partition in 1:a 2:b 3:c 4:d; do
+    index=${partition%%:*}
+    suffix=${partition#*:}
+    wrapper="$ROOT/tests/fm-account-routing-$suffix.test.sh"
+    [ -x "$wrapper" ] || fail "account-routing partition $index is missing or not executable"
+    assert_grep "FM_TEST_PART_INDEX=$index FM_TEST_PART_TOTAL=4" "$wrapper" \
+      "account-routing partition $index does not select its unique quarter"
+  done
+  pass "account-routing wrappers select four distinct quarters of the complete suite"
+}
+
 test_teardown_partition_preserves_every_full_suite_case() {
   local tmp definitions listed focused expected_focused wrapper_a wrapper_b
   tmp=$(fm_test_tmproot fm-teardown-partition)
@@ -278,4 +291,5 @@ test_runner_executes_every_assigned_test_and_records_failures
 test_record_refreshes_complete_fixture_timings
 test_post_run_guard_requires_the_exact_executed_union
 test_ci_wires_matrix_isolation_timeout_and_union_verification
+test_account_routing_partition_uses_four_distinct_wrappers
 test_teardown_partition_preserves_every_full_suite_case

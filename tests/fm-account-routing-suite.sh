@@ -523,6 +523,10 @@ read_case() {
   IFS='|' read -r CASE_DIR HOME_DIR PROJ_DIR WT_DIR FAKEBIN_DIR <<EOF
 $1
 EOF
+  # Keep synthetic Gate A rollouts inside the isolated case that owns them.
+  CODEX_HOME="$CASE_DIR/codex-runtime"
+  mkdir -p "$CODEX_HOME"
+  export CODEX_HOME
   AF_LOG="$CASE_DIR/agent-fleet.log"
   TMUX_LOG="$CASE_DIR/tmux.log"
   TREEHOUSE_LOG="$CASE_DIR/treehouse.log"

@@ -23,6 +23,16 @@ if [ -z "${FM_TEST_DAEMON_SOURCED:-}" ]; then
   . "$DAEMON"
 fi
 
+wait_for_pause_refreshes() {
+  local state=$1 i
+  for i in {1..100}; do
+    pause_class_refresh_reap "$state"
+    compgen -G "$state/.subsuper-pause-refresh-*" >/dev/null || return 0
+    sleep 0.05
+  done
+  fail "pause classification refresh did not finish"
+}
+
 fm_test_tmproot_into TMP_ROOT fm-daemon-tests
 
 test_afk_start_refuses_when_flag_cannot_be_written() {
@@ -240,6 +250,11 @@ test_held_live_monitor_reaches_away_wedge_escalation() {
     FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_FAKE_CREW_STATE='state: working · source: run-step · checks green: held PR still monitoring for merge/close' \
     FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
+  wait_for_pause_refreshes "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_CREW_STATE='state: working · source: run-step · checks green: held PR still monitoring for merge/close' \
+    FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
   [ ! -e "$state/.subsuper-paused-$key" ] || fail "housekeeping retained long-cadence pause tracking for a held live monitor"
   grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null \
     || fail "held live monitor did not reach away-mode wedge escalation"
@@ -247,11 +262,12 @@ test_held_live_monitor_reaches_away_wedge_escalation() {
 }
 
 test_housekeeping_pause_class_cache() {
-  local dir state fakebin calls now key sig checked class task
+  local dir state fakebin calls now key sig checked class task count i
   dir=$(make_supercase pause-class-cache)
   state="$dir/state"
   fakebin="$dir/fakebin"
   calls="$dir/crew-state.calls"
+  : > "$calls"
   cat > "$fakebin/fm-crew-state.sh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$1" >> "${FM_FAKE_CREW_STATE_CALLS:?}"
@@ -265,8 +281,12 @@ SH
 
   FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_FAKE_CREW_STATE_CALLS="$calls" housekeeping "$state"
-  [ "$(wc -l < "$calls" | tr -d ' ')" = 2 ] \
-    || fail "housekeeping classified a paused task more than once in one pass"
+  for i in {1..100}; do
+    count=$(wc -l < "$calls" 2>/dev/null | tr -d ' ' || true)
+    [ "$count" = 2 ] && break
+    sleep 0.05
+  done
+  [ "$count" = 2 ] || fail "housekeeping did not start one refresh per paused task"
 
   FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_FAKE_CREW_STATE_CALLS="$calls" housekeeping "$state"
@@ -281,11 +301,65 @@ SH
     > "$state/.subsuper-pause-class-$key"
   FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
     FM_FAKE_CREW_STATE_CALLS="$calls" housekeeping "$state"
+  for i in {1..100}; do
+    count=$(wc -l < "$calls" 2>/dev/null | tr -d ' ' || true)
+    [ "$count" = 4 ] && break
+    sleep 0.05
+  done
   [ "$(grep -c '^pause-cache-a$' "$calls")" = 2 ] \
     || fail "a changed status signature did not invalidate its cached classification"
   [ "$(grep -c '^pause-cache-b$' "$calls")" = 2 ] \
     || fail "an unchanged status was not reclassified on the bounded cadence"
   pass "housekeeping caches one pause classification per task and invalidates by signature or cadence"
+}
+
+test_housekeeping_bounds_cold_pause_refreshes() {
+  local dir state fakebin starts release timed_out watchdog task count i
+  dir=$(make_supercase bounded-pause-refresh)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  starts="$dir/starts"
+  release="$dir/release"
+  timed_out="$dir/timed-out"
+  : > "$starts"
+  cat > "$fakebin/fm-crew-state.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "${FM_FAKE_REFRESH_STARTS:?}"
+while [ ! -e "${FM_FAKE_REFRESH_RELEASE:?}" ]; do sleep 0.05; done
+printf 'state: unknown · source: none · bounded-refresh fixture\n'
+SH
+  chmod +x "$fakebin/fm-crew-state.sh"
+  for task in pause-cold-a pause-cold-b pause-cold-c pause-cold-d pause-cold-e pause-cold-f; do
+    fm_write_meta "$state/$task.meta" "window=sess:fm-$task" "kind=ship"
+    printf 'paused: awaiting cold external state\n' > "$state/$task.status"
+  done
+  ( sleep 15; : > "$timed_out"; : > "$release" ) &
+  watchdog=$!
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_REFRESH_STARTS="$starts" FM_FAKE_REFRESH_RELEASE="$release" housekeeping "$state"
+  kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  for i in {1..100}; do
+    count=$(wc -l < "$starts" | tr -d ' ')
+    [ "$count" = "$PAUSE_CLASS_REFRESH_CONCURRENCY" ] && break
+    sleep 0.05
+  done
+  : > "$release"
+  [ ! -e "$timed_out" ] || fail "cold pause refreshes blocked the housekeeping pass"
+  [ "$count" = "$PAUSE_CLASS_REFRESH_CONCURRENCY" ] \
+    || fail "cold pause refresh concurrency was not bounded at $PAUSE_CLASS_REFRESH_CONCURRENCY"
+  wait_for_pause_refreshes "$state"
+  FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_FAKE_REFRESH_STARTS="$starts" FM_FAKE_REFRESH_RELEASE="$release" housekeeping "$state"
+  for i in {1..100}; do
+    count=$(wc -l < "$starts" | tr -d ' ')
+    [ "$count" = 6 ] && break
+    sleep 0.05
+  done
+  [ "$count" = 6 ] || fail "deferred cold pause refreshes were not scheduled on the next pass"
+  wait_for_pause_refreshes "$state"
+  pause_class_refresh_stop_all "$state"
+  pass "housekeeping bounds cold pause refreshes without blocking"
 }
 
 test_housekeeping_delivers_before_pause_classification() {
@@ -381,6 +455,8 @@ test_housekeeping_migrates_watcher_pause_marker() {
   key=$(printf '%s' "$win" | tr '.:/' '___')
   : > "$state/.paused-$key"
   FM_STATE_OVERRIDE="$state" housekeeping "$state"
+  wait_for_pause_refreshes "$state"
+  FM_STATE_OVERRIDE="$state" housekeeping "$state"
   key=$(printf '%s' "held-w10-migrate" | tr '.:/' '___')
   [ -e "$state/.subsuper-paused-$key" ] || fail "watcher pause marker was not migrated into daemon tracking"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "watcher pause migration left a wedge marker behind"
@@ -414,6 +490,8 @@ test_housekeeping_seeds_pause_marker_from_status() {
   printf 'paused: awaiting the upstream release\n' > "$state/held-w10-seed.status"
   key=$(printf '%s' "held-w10-seed" | tr '.:/' '___')
   FM_STATE_OVERRIDE="$state" housekeeping "$state"
+  wait_for_pause_refreshes "$state"
+  FM_STATE_OVERRIDE="$state" housekeeping "$state"
   [ -e "$state/.subsuper-paused-$key" ] || fail "paused status did not seed daemon pause tracking"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "paused status seeded wedge tracking"
   pass "housekeeping seeds pause tracking from status without a watcher marker"
@@ -431,6 +509,9 @@ test_housekeeping_paused_resurfaces_and_resets() {
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w11" | tr ':/.' '___')
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
+  wait_for_pause_refreshes "$state"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
   grep -F "awaiting external" "$state/.subsuper-escalations" >/dev/null 2>&1 || fail "declared pause was not re-surfaced as an awaiting-external recheck"
@@ -452,6 +533,9 @@ test_housekeeping_paused_resumed_cleared() {
   printf 'Working...\n' > "$pane"
   key=$(printf '%s' "held-w12" | tr ':/.' '___')
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
+  wait_for_pause_refreshes "$state"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
   [ -e "$state/.subsuper-paused-$key" ] && fail "resumed (busy) pause marker was not cleared"
@@ -486,6 +570,9 @@ test_housekeeping_stale_marker_transitions_to_pause() {
   printf 'idle prompt $\n' > "$pane"
   key=$(printf '%s' "held-w14" | tr ':/.' '___')
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-stale-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
+  wait_for_pause_refreshes "$state"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
   [ -e "$state/.subsuper-paused-$key" ] || fail "existing stale marker did not move to paused state"
@@ -1826,6 +1913,7 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = held-live-monitor ]; then
   test_held_live_monitor_reaches_away_wedge_escalation
   test_housekeeping_pause_class_cache
+  test_housekeeping_bounds_cold_pause_refreshes
   test_housekeeping_delivers_before_pause_classification
   exit 0
 fi
@@ -1843,6 +1931,7 @@ test_stale_terminal_escalates
 test_stale_paused_classifies_pause
 test_held_live_monitor_reaches_away_wedge_escalation
 test_housekeeping_pause_class_cache
+test_housekeeping_bounds_cold_pause_refreshes
 test_housekeeping_delivers_before_pause_classification
 test_handle_wake_paused_records_pause_marker
 test_handle_wake_paused_signal_records_pause_marker

@@ -187,6 +187,8 @@ FM_SUPERVISOR_SUPPORTED_BACKENDS="tmux herdr"
 FM_REAP_WAKE_PENDING=0
 INJECT_SKIP_DEFAULT="heartbeat"
 STALE_ESCALATE_SECS_DEFAULT=240
+PAUSE_CLASS_REFRESH_CONCURRENCY=4
+HOUSEKEEPING_PAUSE_CLASS_RESULT=
 ESCALATE_BATCH_SECS_DEFAULT=90
 HEARTBEAT_SCAN_SECS_DEFAULT=300
 HOUSEKEEPING_TICK_DEFAULT=15
@@ -508,8 +510,81 @@ clear_pause_tracking() {  # <window> <state>
     "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key"
 }
 
+pause_class_refresh_reap() {  # <state>
+  local state=$1 marker done pid
+  for marker in "$state"/.subsuper-pause-refresh-*; do
+    [ -e "$marker" ] || continue
+    case "$marker" in
+      *.done)
+        [ -e "${marker%.done}" ] || rm -f "$marker"
+        continue
+        ;;
+    esac
+    done="${marker}.done"
+    pid=$(cat "$marker" 2>/dev/null || true)
+    if [ -e "$done" ]; then
+      wait "$pid" 2>/dev/null || true
+      rm -f "$marker" "$done"
+      continue
+    fi
+    case "$pid" in
+      ''|*[!0-9]*) rm -f "$marker" ;;
+      *) kill -0 "$pid" 2>/dev/null || rm -f "$marker" ;;
+    esac
+  done
+}
+
+pause_class_refresh_start() {  # <state> <task> <last-status-line> <now> <status-signature>
+  local state=$1 task=$2 last=$3 now=$4 sig=$5 key cache marker done tmp active=0 f pid
+  key=$(_stale_key "$task")
+  cache="$state/.subsuper-pause-class-$key"
+  marker="$state/.subsuper-pause-refresh-$key"
+  done="${marker}.done"
+  pause_class_refresh_reap "$state"
+  [ ! -e "$marker" ] || return 0
+  for f in "$state"/.subsuper-pause-refresh-*; do
+    [ -e "$f" ] || continue
+    case "$f" in *.done) continue ;; esac
+    active=$((active + 1))
+  done
+  [ "$active" -lt "$PAUSE_CLASS_REFRESH_CONCURRENCY" ] || return 0
+  rm -f "$done"
+  tmp="${cache}.tmp.$$.$RANDOM"
+  (
+    local class after current
+    class=$(crew_absorb_class "$task" "$last")
+    after=$(_fm_status_file_sig "$state/$task.status")
+    current=$(last_status_line "$state/$task.status")
+    if [ -n "$sig" ] && [ "$sig" = "$after" ] && [ "$last" = "$current" ]; then
+      printf '%s\t%s\t%s\n' "$sig" "$now" "$class" > "$tmp" && mv -f "$tmp" "$cache"
+    else
+      rm -f "$cache" "$tmp"
+    fi
+    : > "$done"
+  ) </dev/null >/dev/null 2>&1 &
+  pid=$!
+  printf '%s\n' "$pid" > "$marker"
+}
+
+pause_class_refresh_stop_all() {  # <state>
+  local state=$1 marker pid
+  for marker in "$state"/.subsuper-pause-refresh-*; do
+    [ -e "$marker" ] || continue
+    case "$marker" in *.done) continue ;; esac
+    pid=$(cat "$marker" 2>/dev/null || true)
+    case "$pid" in
+      ''|*[!0-9]*) ;;
+      *)
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        ;;
+    esac
+  done
+  rm -f "$state"/.subsuper-pause-refresh-* "$state"/.subsuper-pause-class-*.tmp.*
+}
+
 housekeeping_pause_class() {  # <state> <task> <last-status-line> <now>
-  local state=$1 task=$2 last=$3 now=$4 key cache statusf sig cached_sig checked class cadence after current
+  local state=$1 task=$2 last=$3 now=$4 key cache statusf sig cached_sig checked class cadence
   key=$(_stale_key "$task")
   cache="$state/.subsuper-pause-class-$key"
   statusf="$state/$task.status"
@@ -530,21 +605,15 @@ housekeeping_pause_class() {  # <state> <task> <last-status-line> <now>
           working|paused|none)
             [ "$checked" -gt "$now" ] \
               || [ $(( now - checked )) -ge "$cadence" ] \
-              || { printf '%s' "$class"; return; }
+              || { HOUSEKEEPING_PAUSE_CLASS_RESULT=$class; return; }
             ;;
         esac
         ;;
     esac
   fi
-  class=$(crew_absorb_class "$task" "$last")
-  after=$(_fm_status_file_sig "$statusf")
-  current=$(last_status_line "$statusf")
-  if [ -n "$sig" ] && [ "$sig" = "$after" ] && [ "$last" = "$current" ]; then
-    printf '%s\t%s\t%s\n' "$sig" "$now" "$class" > "$cache"
-  else
-    rm -f "$cache"
-  fi
-  printf '%s' "$class"
+  rm -f "$cache"
+  pause_class_refresh_start "$state" "$task" "$last" "$now" "$sig"
+  HOUSEKEEPING_PAUSE_CLASS_RESULT=pending
 }
 
 reconcile_pause_tracking() {  # <window> <state> <last-status-line> [absorb-class]
@@ -558,6 +627,8 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line> [absorb-clas
     if [ "$class" = paused ]; then
       stale_marker_remove "$win" "$state"
       pause_marker_record "$win" "$state"
+    elif [ "$class" = pending ]; then
+      stale_marker_record "$win" "$state"
     else
       clear_pause_markers "$win" "$state"
       stale_marker_record "$win" "$state"
@@ -579,7 +650,10 @@ migrate_watcher_pause_markers() {  # <state> <now>
     last=$(last_status_line "$state/$task.status")
     if status_is_paused "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
       pause_class=
-      status_is_paused "$last" && pause_class=$(housekeeping_pause_class "$state" "$task" "$last" "$now")
+      if status_is_paused "$last"; then
+        housekeeping_pause_class "$state" "$task" "$last" "$now"
+        pause_class=$HOUSEKEEPING_PAUSE_CLASS_RESULT
+      fi
       reconcile_pause_tracking "$win" "$state" "$last" "$pause_class"
     fi
   done
@@ -1092,9 +1166,10 @@ housekeeping() {  # <state>
     task=$(window_to_task "$win" "$state")
     last=$(last_status_line "$state/$task.status")
     if [ -n "$last" ] && status_is_paused "$last"; then
-      pause_class=$(housekeeping_pause_class "$state" "$task" "$last" "$now")
+      housekeeping_pause_class "$state" "$task" "$last" "$now"
+      pause_class=$HOUSEKEEPING_PAUSE_CLASS_RESULT
       reconcile_pause_tracking "$win" "$state" "$last" "$pause_class"
-      [ "$pause_class" = paused ] && continue
+      case "$pause_class" in paused|pending) continue ;; esac
     fi
     age=$(( now - $(cat "$marker" 2>/dev/null || echo "$now") ))
     [ "$age" -ge "${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}" ] || continue
@@ -1127,8 +1202,12 @@ housekeeping() {  # <state>
       reconcile_pause_tracking "$win" "$state" "$last"
       continue
     fi
-    pause_class=$(housekeeping_pause_class "$state" "$task" "$last" "$now")
-    if [ "$pause_class" != paused ]; then
+    housekeeping_pause_class "$state" "$task" "$last" "$now"
+    pause_class=$HOUSEKEEPING_PAUSE_CLASS_RESULT
+    if [ "$pause_class" = pending ]; then
+      reconcile_pause_tracking "$win" "$state" "$last" "$pause_class"
+      continue
+    elif [ "$pause_class" != paused ]; then
       reconcile_pause_tracking "$win" "$state" "$last" "$pause_class"
       continue
     fi
@@ -1141,8 +1220,10 @@ housekeeping() {  # <state>
       *)
         last=$(last_status_line "$state/$task.status")
         pause_class=
-        [ -n "$last" ] && status_is_paused "$last" \
-          && pause_class=$(housekeeping_pause_class "$state" "$task" "$last" "$now")
+        if [ -n "$last" ] && status_is_paused "$last"; then
+          housekeeping_pause_class "$state" "$task" "$last" "$now"
+          pause_class=$HOUSEKEEPING_PAUSE_CLASS_RESULT
+        fi
         if [ "$pause_class" = paused ]; then
           escalate_add "$state" "paused ${age}s (awaiting external, recheck whether the wait still holds): $win"
           _now > "$marker"
@@ -1513,8 +1594,6 @@ fm_super_main() {
   local afk_status="off"
   afk_active "$STATE" && afk_status="on"
   log "daemon starting (pid $$); delivery=$DELIVERY; target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
-  migrate_watcher_pause_markers "$STATE" "$(_now)"
-
   # --- shutdown: compatibility flush or native preserve, reap child, unlock -
   local WATCHER_PID="" CUR_TMP=""
   cleanup() {
@@ -1530,6 +1609,7 @@ fm_super_main() {
     if [ -n "${CUR_TMP:-}" ]; then
       rm -f "$CUR_TMP" 2>/dev/null || true
     fi
+    pause_class_refresh_stop_all "$STATE"
     fm_lock_release "$LOCK" 2>/dev/null || true
     rm -f "$PIDFILE" 2>/dev/null || true
     [ "$DELIVERY" != reap-wake ] || rm -f "$STATE/.afk-native-process" 2>/dev/null || true
@@ -1563,6 +1643,10 @@ fm_super_main() {
     "$WATCH" >"$CUR_TMP" 2>>"$WATCH_ERR" &
     WATCHER_PID=$!
   }
+
+  if start_watcher; then
+    migrate_watcher_pause_markers "$STATE" "$(_now)"
+  fi
 
   local rc reason
   while true; do

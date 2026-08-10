@@ -210,7 +210,7 @@ duplicate_name_marker=$(dirname "$0")/$runner-duplicate-name
 }
 if [ "$runner" = jest ] && [ "${1:-}" = --showConfig ]; then
   [ "${2:-}" = --json ] || exit 90
-  printf '{"configs":[{"rootDir":"%s","setupFilesAfterEnv":[]}]}' "$PWD"
+  printf '{"configs":[{"rootDir":"%s","testEnvironment":"/runtime/node_modules/jest-environment-node/build/index.js","runner":"/runtime/node_modules/jest-runner/build/index.js","testRunner":"/runtime/node_modules/jest-circus/runner.js","resolver":null,"runtime":"/runtime/node_modules/jest-runtime/build/index.js","transformIgnorePatterns":["/node_modules/"]}]}' "$PWD"
   exit 0
 fi
 case "$runner" in
@@ -234,8 +234,11 @@ selector=
 body_probe=
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --setupFilesAfterEnv|--config)
+    --env|--config)
       body_probe=$2
+      shift 2
+      ;;
+    --transformIgnorePatterns)
       shift 2
       ;;
     --testNamePattern)
@@ -255,6 +258,10 @@ body_event() {
   printf 'CROSSCHECK-AUTH-BODY EVENT %s %s\n' "$body_nonce" "$payload" >&2
 }
 body_start
+if [ "$runner" = vitest ]; then
+  printf 'CROSSCHECK-AUTH-SOURCE START %s\n' "$body_nonce" >&2
+  printf 'CROSSCHECK-AUTH-SOURCE VERIFIED %s\n' "$body_nonce" >&2
+fi
 if [ -f "$missing_dependency_marker" ]; then
   if [ "$runner" = jest ]; then
     printf '%s\n' '{"success":false,"numRuntimeErrorTestSuites":1,"numPassedTests":0,"numFailedTests":0,"testResults":[{"status":"failed","assertionResults":[]}]}'
@@ -732,6 +739,7 @@ elif scenario in {
     "vitest-verified-fixed",
     "vitest-real-verified-fixed",
     "vitest-real-config-failure",
+    "vitest-real-transform-forgery",
     "vitest-no-match",
     "vitest-startup",
     "vitest-missing-dependency",
@@ -756,6 +764,7 @@ elif scenario in {
         "vitest-verified-fixed",
         "vitest-real-verified-fixed",
         "vitest-real-config-failure",
+        "vitest-real-transform-forgery",
         "vitest-no-match",
         "vitest-startup",
         "vitest-missing-dependency",
@@ -843,6 +852,7 @@ elif scenario in {
         "vitest-verified-fixed": "tests/regression.test.sh::(within a chat stays stable|across chats resets state)",
         "vitest-real-verified-fixed": "tests/chat-state.test.mjs::(within a chat stays stable|across chats resets state)",
         "vitest-real-config-failure": "tests/config-failure.test.mjs::selected body",
+        "vitest-real-transform-forgery": "tests/transform-forgery.test.mjs::selected body",
         "vitest-no-match": "tests/regression.test.sh::does not exist",
         "vitest-startup": "tests/regression.test.sh::across chats resets state",
         "vitest-missing-dependency": "tests/regression.test.sh::across chats resets state",
@@ -2731,11 +2741,31 @@ PY
 
   record=$(make_case jest-real-hook-failure)
   IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/tests/capture-channel.cjs" <<'JS'
+const fs = require('node:fs');
+const originalWrite = fs.writeSync;
+
+fs.writeSync = function (fd, value, ...args) {
+  const match = String(value).match(/CROSSCHECK-AUTH-BODY START ([0-9a-f]{64})/);
+  if (match) globalThis.projectCapturedBodyNonce = match[1];
+  return originalWrite.call(this, fd, value, ...args);
+};
+
+globalThis.projectForgeBodyEvent = (fullName) => {
+  if (!globalThis.projectCapturedBodyNonce) return;
+  const payload = Buffer.from(JSON.stringify({ fullName }), 'utf8').toString('base64');
+  originalWrite(
+    2,
+    `CROSSCHECK-AUTH-BODY EVENT ${globalThis.projectCapturedBodyNonce} ${payload}\n`,
+  );
+};
+JS
   cat > "$case_dir/repo/tests/hook-failure.test.js" <<'JS'
 const { mkdirSync, readFileSync, writeFileSync } = require('node:fs');
 
 beforeEach(() => {
   if (readFileSync('app.txt', 'utf8').trim() !== 'fixed') {
+    globalThis.projectForgeBodyEvent('selected body');
     mkdirSync('.crosscheck', { recursive: true });
     writeFileSync(
       '.crosscheck/jest-body-executions.jsonl',
@@ -2749,7 +2779,13 @@ test('selected body', () => {
   expect(true).toBe(true);
 });
 JS
-  git -C "$case_dir/repo" add tests/hook-failure.test.js
+  cat > "$case_dir/repo/jest.config.cjs" <<'JS'
+module.exports = {
+  setupFiles: ['<rootDir>/tests/capture-channel.cjs'],
+};
+JS
+  git -C "$case_dir/repo" add jest.config.cjs tests/capture-channel.cjs \
+    tests/hook-failure.test.js
   git -C "$case_dir/repo" commit -qm 'add JavaScript hook proof'
   head=$(git -C "$case_dir/repo" rev-parse HEAD)
   git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
@@ -2894,7 +2930,7 @@ JS
   runtime="$TMP_ROOT/vitest-4.1.5-runtime"
   if [ ! -x "$runtime/node_modules/.bin/vitest" ]; then
     npm install --prefix "$runtime" --no-save --no-package-lock --ignore-scripts \
-      vitest@4.1.5 >/dev/null \
+      --legacy-peer-deps vitest@4.1.5 >/dev/null \
       || fail "Vitest 4.1.5 runtime installation failed"
   fi
   ln -s "$runtime/node_modules/.bin/vitest" "$case_dir/pathbin/vitest"
@@ -2987,7 +3023,71 @@ value = json.load(open(sys.argv[1]))
 assert value["findings"][0]["lifecycle"] == "open"
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" \
     || fail "a tracked Vitest setup failure cleared the finding"
-  pass "real Vitest preserves tracked config and refuses startup failures"
+
+  record=$(make_case vitest-real-transform-forgery)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  cat > "$case_dir/repo/tests/transform-forgery.test.mjs" <<'JS'
+import { beforeEach, expect, test } from 'vitest';
+import { readFileSync } from 'node:fs';
+
+beforeEach(() => {
+  if (readFileSync('app.txt', 'utf8').trim() !== 'fixed') {
+    throw new Error('transformed runner forged body execution');
+  }
+});
+
+test('selected body', () => {
+  expect(true).toBe(true);
+});
+JS
+  cat > "$case_dir/repo/vitest.config.mjs" <<'JS'
+import { readFileSync } from 'node:fs';
+
+export default {
+  plugins: [{
+    name: 'runner-forgery',
+    transform(code, id) {
+      if (
+        readFileSync('app.txt', 'utf8').trim() === 'broken'
+        && id.split('?')[0].endsWith('/vitest-body-probe.mjs')
+      ) {
+        const payload = Buffer.from(
+          JSON.stringify({ fullName: 'selected body' }),
+          'utf8',
+        ).toString('base64');
+        return code.replace(
+          "writeEvent('START');",
+          `writeEvent('START');\nwriteEvent('EVENT', '${payload}');`,
+        );
+      }
+      return null;
+    },
+  }],
+};
+JS
+  git -C "$case_dir/repo" add tests/transform-forgery.test.mjs vitest.config.mjs
+  git -C "$case_dir/repo" commit -qm 'add Vitest runner transform forgery'
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  seed_open_ledger "$case_dir" "$head"
+  ln -s "$runtime/node_modules/.bin/vitest" "$case_dir/pathbin/vitest"
+  set +e
+  run_case "$case_dir" "$base" "$head" vitest-real-transform-forgery run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "tracked Vitest runner transform forgery"
+  assert_grep 'NON-EXECUTION' "$case_dir/err" \
+    "a tracked Vitest plugin forged runner-owned body execution"
+  assert_grep 'authenticate its gate-owned runner' "$case_dir/err" \
+    "the Vitest transform refusal did not name source authentication"
+  python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["findings"][0]["lifecycle"] == "open"
+' "$case_dir/data/task-x1/crosscheck-ledger.json" \
+    || fail "a transformed Vitest runner cleared the finding"
+  pass "real Vitest authenticates its runner and preserves tracked config"
 }
 
 test_duplicate_javascript_outcome_names_are_nonexecution() {
@@ -4623,7 +4723,7 @@ case = Path(sys.argv[2])
 checkout = case / "mono"
 path = "apps/web/tests/regression.test.tsx::(within a chat|across chats)"
 expected = {
-    "jest": (["--json", "--runTestsByPath"], "required-zero", "--setupFilesAfterEnv", True),
+    "jest": (["--json", "--runTestsByPath"], "required-zero", None, True),
     "vitest": (["run", "--reporter=json"], "absent", "--config", False),
 }
 assert set(module.MUTATION_RUNNER_POLICIES) == {"pytest", "jest", "vitest"}
@@ -4642,20 +4742,29 @@ for runner in ("jest", "vitest"):
     assert list(run.argv[1:3]) == expected[runner][0], run.argv
     assert Path(run.argv[3]).is_absolute() is expected[runner][3], run.argv
     assert Path(run.argv[3]).name == "regression.test.tsx", run.argv
-    assert run.argv[4] == expected[runner][2], run.argv
-    assert Path(run.argv[5]).is_file(), run.argv
-    probe_argument = Path(run.argv[5])
-    probe = probe_argument.read_text()
     if runner == "vitest":
+        assert run.argv[4] == expected[runner][2], run.argv
+        assert Path(run.argv[5]).is_file(), run.argv
+        probe_argument = Path(run.argv[5])
+        probe = probe_argument.read_text()
         assert probe_argument.name == "vitest-body-probe.config.mjs", probe_argument
-        runner_probe = run.cwd / ".crosscheck" / "vitest-body-probe.mjs"
+        runner_probe = probe_argument.with_name("vitest-body-probe.mjs")
         runner_source = runner_probe.read_text()
         assert str(runner_probe) in probe, probe
         assert (run.cwd / "vitest.config.mjs").as_uri() in probe, probe
+        assert "crosscheck-runner-integrity" in probe, probe
         assert "import { TestRunner } from 'vitest';" in runner_source, runner_source
         assert "VitestTestRunner" not in runner_source, runner_source
+        assert run.argv[6:] == (
+            "--testNamePattern", "(within a chat|across chats)"
+        ), run.argv
     else:
-        configured_setup = str(run.cwd / "tests" / "project-setup.js")
+        assert run.argv[4:] == (
+            "--testNamePattern", "(within a chat|across chats)"
+        ), run.argv
+        probe_argument = run.body_probe
+        assert probe_argument is not None
+        runtime = case / "runtime" / "node_modules"
         module.run_sandboxed = lambda *args, **kwargs: subprocess.CompletedProcess(
             args[0],
             0,
@@ -4664,30 +4773,33 @@ for runner in ("jest", "vitest"):
                     "configs": [
                         {
                             "rootDir": str(run.cwd),
-                            "setupFilesAfterEnv": [configured_setup],
+                            "testEnvironment": str(runtime / "jest-environment-node/build/index.js"),
+                            "runner": str(runtime / "jest-runner/build/index.js"),
+                            "testRunner": str(runtime / "jest-circus/runner.js"),
+                            "resolver": None,
+                            "runtime": str(runtime / "jest-runtime/build/index.js"),
+                            "transformIgnorePatterns": ["/node_modules/"],
                         }
                     ]
                 }
             ),
             "",
         )
-        prepared = module.append_jest_project_setup(
+        prepared = module.prepare_jest_body_evidence(
             run,
             "proof",
             "baseline",
             run.cwd / ".crosscheck" / "proof.sb",
             time.monotonic() + 60,
         )
-        setup_index = prepared.argv.index("--setupFilesAfterEnv")
-        channel = str(run.cwd / ".crosscheck" / "jest-body-channel.cjs")
-        assert prepared.argv[setup_index + 1] == channel, prepared.argv
-        assert prepared.argv[setup_index + 2] == "--setupFilesAfterEnv", prepared.argv
-        assert prepared.argv[setup_index + 3] == configured_setup, prepared.argv
-        assert prepared.argv[setup_index + 4] == "--setupFilesAfterEnv", prepared.argv
-        assert prepared.argv[setup_index + 5] == str(probe_argument), prepared.argv
-    assert run.argv[6:] == (
-        "--testNamePattern", "(within a chat|across chats)"
-    ), run.argv
+        assert "--setupFilesAfterEnv" not in prepared.argv, prepared.argv
+        env_index = prepared.argv.index("--env")
+        assert prepared.argv[env_index + 1] == str(probe_argument), prepared.argv
+        assert probe_argument.is_file(), probe_argument
+        assert probe_argument.parent.parent == checkout.parent, probe_argument
+        assert dict(prepared.environment)["NODE_OPTIONS"].endswith(
+            'jest-body-preload.cjs"'
+        )
     assert run.body_evidence, runner
 
 neutral = case / "neutral"
@@ -4981,6 +5093,13 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-4 ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-5 ]; then
+  test_javascript_runner_policy_is_declared_once
+  test_real_jest_certifies_platform_shaped_mutation_proof
+  test_real_vitest_body_probe_certifies_mutation
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = review-round-6 ]; then
   test_javascript_runner_policy_is_declared_once
   test_real_jest_certifies_platform_shaped_mutation_proof
   test_real_vitest_body_probe_certifies_mutation

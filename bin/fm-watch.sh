@@ -444,21 +444,27 @@ pause_state_class() {  # <window> <task>
     crew_absorb_class "$task"
     return
   fi
-  # Cached verdict: skip the costly authoritative re-read (an fm-crew-state.sh call
-  # plus the keyed open/resolved fold) while a recent recheck still stands AND the
-  # status stream it was taken from is byte-identical. Both halves of the pause proof
-  # are pure functions of that stream, so an unchanged signature means the earlier
-  # verdict is still exactly as true - while any append, including one that OPENS a
-  # decision after the pause flag was written, invalidates the cache and forces a
-  # fresh proof rather than riding out the age window behind a stale `paused`.
+  # Cached verdict: skip the costly keyed open/resolved fold while a recent recheck
+  # still stands AND the status stream it was taken from is byte-identical. The
+  # durable pause proof is a pure function of that stream, but active-working evidence
+  # is consulted afresh because a run can start without appending status. Any append,
+  # including one that OPENS a decision after the pause flag was written, invalidates
+  # the cache and forces a fresh proof rather than riding out the age window.
   # The recheck marker carries the signature as its content; callers read only its
   # mtime for the age bound, and a marker left by an older watcher simply mismatches
   # and re-proves.
   sig=$(stat_sig "$statusf")
   if [ -e "$STATE/.paused-$key" ] && [ "$(age_of "$recheck_file")" -lt "$STALE_ESCALATE_SECS" ] \
      && [ -n "$sig" ] && [ "$sig" = "$(cat "$recheck_file" 2>/dev/null || true)" ]; then
-    printf 'paused'
-    return
+    if crew_has_active_working_evidence "$task"; then
+      printf 'working'
+      return
+    fi
+    if [ "$sig" = "$(stat_sig "$statusf")" ]; then
+      printf 'paused'
+      return
+    fi
+    rm -f "$recheck_file"
   fi
   class=$(crew_absorb_class "$task" "$last")
   case "$class" in

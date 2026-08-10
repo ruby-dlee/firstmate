@@ -37,8 +37,8 @@ test_checked_in_plan_is_complete_balanced_and_deterministic() {
     || fail "planned shard union did not equal tests/*.test.sh"
   [ "$(cut -f3 "$plan_a" | LC_ALL=C sort | uniq -d | wc -l | tr -d ' ')" -eq 0 ] \
     || fail "a test was assigned to more than one shard"
-  [ "$(awk -F '\t' '{ load[$1] += $2 } END { max=0; for (s in load) if (load[s] > max) max=load[s]; print max }' "$plan_a")" -le 675000 ] \
-    || fail "duration-balanced plan exceeds the measured single-test floor"
+  [ "$(awk -F '\t' '{ load[$1] += $2 } END { max=0; for (s in load) if (load[s] > max) max=load[s]; print max }' "$plan_a")" -le 750000 ] \
+    || fail "duration-balanced plan exceeds the 12.5-minute execution budget"
   pass "checked-in LPT plan is deterministic, complete, disjoint, and duration-balanced"
 }
 

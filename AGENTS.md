@@ -187,7 +187,7 @@ If the digest reported `data/projects.md` as `ABSENT` or disagreeing with what i
 An `ABSENT` `data/captain.md` or `data/secondmates.md` or `data/learnings.md` means exactly what section 2 says it means (template defaults, no registered secondmates, nothing captured yet) - not a problem to fix.
 
 Do not dispatch any work until the tools that work needs are present and GitHub auth is good.
-Use `gh-axi` for all GitHub operations, `chrome-devtools-axi` for all browser operations, and the firstmate-owned `lavish-axi` file protocol for durable captain decisions and annotation boards that must remain answerable asynchronously.
+Use `gh-axi` for all GitHub operations, `chrome-devtools-axi` for browser automation and inspection, and the firstmate-owned `lavish-axi` file protocol for durable captain decisions and annotation boards that must remain answerable asynchronously.
 Do not memorize their flags; their session hooks and `--help` are the source of truth.
 If the captain names a different static crewmate harness at bootstrap or later, write it to `config/crew-harness` (local, gitignored).
 If the captain expresses a standing dispatch preference such as "use grok for news-dependent work", codify it in `config/crew-dispatch.json` instead.
@@ -870,7 +870,7 @@ These skills are not captain-invocable; they are conditional operating reference
 - `firstmate-coding-guidelines` - load before changing firstmate's shared, tracked material, as defined by section 1's list, whether editing directly or briefing a crewmate for a firstmate-repo task.
 - `memory-hygiene` - load before writing, rewriting, pruning, deduplicating, or otherwise leaning `data/captain.md` or `data/learnings.md`.
 - `lavish-decisions` - load before creating, repairing, or presenting a multi-option captain choice, and before asking the captain to comment on material without choosing anything.
-- `lavish-repair` - load when a self-contained Lavish board fails preflight, browser launch, interaction, submission pickup, or collection, and before touching its state artifacts or isolated Chrome session.
+- `lavish-repair` - load when a self-contained Lavish board fails preflight, default-browser open, interaction, answer download, or bounded intake, and before touching a generated board or downloaded-answer artifact.
 - `eks-usage` - load before running `kubectl` or Amazon EKS commands, on an EKS IAM, authenticator, TLS, or connectivity error, or whenever the active cluster or context is uncertain.
 
 ## 14. X mode

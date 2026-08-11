@@ -11,7 +11,6 @@ import {
   readdir,
   rm,
   symlink,
-  stat,
   utimes,
   writeFile,
 } from 'node:fs/promises';
@@ -32,7 +31,6 @@ const BOARD_ADAPTER = join(REPO_ROOT, 'bin/fm-lavish-board.sh');
 const WAKE_ADAPTER = join(REPO_ROOT, 'bin/fm-lavish-wake.sh');
 const QUEUE_ADAPTER = join(REPO_ROOT, 'bin/fm-lavish-queue.sh');
 const WAKE_DRAIN = join(REPO_ROOT, 'bin/fm-wake-drain.sh');
-const FAKE_BROWSER = join(PACKAGE_ROOT, 'test-support/fake-browser.mjs');
 const ONE_PIXEL_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
   'base64',
@@ -223,24 +221,31 @@ function processDescendants(rootPid) {
   return processes.filter((processInfo) => descendants.has(processInfo.pid));
 }
 
-function executeBoardSubmission(html, { storageFailure = false, fill = undefined } = {}) {
+async function executeBoardSubmission(html, { downloadFailure = false, fill = undefined } = {}) {
   const { window, document } = parseHTML(html);
-  const storage = new Map();
-  Object.defineProperty(window, 'localStorage', {
-    configurable: true,
-    value: {
-      getItem(key) {
-        return storage.get(key) ?? null;
-      },
-      setItem(key, value) {
-        if (storageFailure) throw new Error('durable browser storage unavailable');
-        storage.set(key, String(value));
-      },
-    },
-  });
+  const blobs = new Map();
+  const downloads = [];
+  const originalCreateElement = document.createElement.bind(document);
+  document.createElement = (name, options) => {
+    const element = originalCreateElement(name, options);
+    if (String(name).toLowerCase() === 'a') {
+      element.click = () => {
+        if (downloadFailure) throw new Error('browser download unavailable');
+        downloads.push({
+          filename: element.download,
+          blob: blobs.get(element.href),
+        });
+      };
+    }
+    return element;
+  };
   window.Blob = globalThis.Blob;
   window.URL = {
-    createObjectURL: () => 'blob:lavish-test',
+    createObjectURL: (blob) => {
+      const url = `blob:lavish-test-${blobs.size + 1}`;
+      blobs.set(url, blob);
+      return url;
+    },
     revokeObjectURL: () => {},
   };
   window.scrollTo = () => {};
@@ -259,7 +264,16 @@ function executeBoardSubmission(html, { storageFailure = false, fill = undefined
   }
   document.querySelector('#review-button').click();
   document.querySelector('#submit-button').click();
-  return { document, storage };
+  const downloaded = await Promise.all(downloads.map(async (download) => ({
+    filename: download.filename,
+    text: await download.blob.text(),
+  })));
+  const backup = document.querySelector('#submitted-payload').value;
+  return {
+    document,
+    downloaded,
+    payload: backup === '' ? undefined : JSON.parse(backup),
+  };
 }
 
 async function fakeTmux(fx) {
@@ -595,6 +609,19 @@ function browserPayload(fx, manifest, overrides = {}) {
   };
 }
 
+function browserDownloadName(manifest, collisionIndex = 0) {
+  const digest = manifest.request_sha256.slice('sha256:'.length);
+  const suffix = collisionIndex === 0 ? '' : ` (${collisionIndex})`;
+  return `lavish-answer-${manifest.decision_id}-${digest}${suffix}.json`;
+}
+
+function landingAuthority(sequence, submittedAt) {
+  return {
+    id: `00000000-0000-4000-8000-${String(sequence).padStart(12, '0')}`,
+    submitted_at: submittedAt,
+  };
+}
+
 async function answer(fx, id, {
   choice = 1,
   note = '',
@@ -911,223 +938,144 @@ test('board renders the manifest, annotations, Markdown context, visuals, and su
   assert.ok(payloadBackup);
   assert.equal(payloadBackup.hasAttribute('readonly'), true);
   const script = document.querySelector('script').textContent;
-  assert.match(script, /window\.__lavishPayload = payload/);
   assert.match(script, /new Blob\(\[payloadJson\]/);
   assert.match(script, /URL\.createObjectURL\(blob\)/);
   assert.match(script, /anchor\.download = downloadFilename/);
   assert.match(script, /anchor\.click\(\)/);
   assert.match(script, /submittedPayload\.value = payloadJson/);
-  assert.match(script, /document\.title = SUBMIT_MARKER/);
-  assert.match(script, /LAVISH-SUBMIT v2/);
+  assert.doesNotMatch(script, /localStorage|__lavish|LAVISH-SUBMIT|SUBMIT_MARKER/);
+  assert.equal(document.querySelector('#submit-button').textContent, 'Download answer');
+  assert.match(document.querySelector('#confirmation').textContent, /Tell firstmate/);
 });
 
-test('B1 board submit persists the payload before showing durable confirmation', async () => {
-  const fx = await fixture('board-durable-submit');
+test('B1 board submit downloads the payload before showing its manual handoff', async () => {
+  const fx = await fixture('board-download-submit');
   const id = await createRequest(fx);
   const output = join(fx.root, 'board.html');
   const result = await runCli(['board', id, '--out', output], { home: fx.home });
   assert.equal(result.code, 0, result.stderr);
 
-  const submitted = executeBoardSubmission(await readFile(output, 'utf8'));
-  assert.equal(submitted.storage.size, 1, 'submit did not persist a browser record');
-  const durableRecord = JSON.parse([...submitted.storage.values()][0]);
-  assert.equal(durableRecord.marker, 'LAVISH-SUBMIT v2');
-  assert.equal(durableRecord.payload.decision_id, id);
-  assert.equal(durableRecord.payload.home_marker, resolve(fx.home));
+  const submitted = await executeBoardSubmission(await readFile(output, 'utf8'));
+  assert.equal(submitted.downloaded.length, 1, 'submit did not start one answer download');
+  assert.equal(submitted.downloaded[0].filename, browserDownloadName(await manifestFor(fx, id)));
+  assert.deepEqual(JSON.parse(submitted.downloaded[0].text), submitted.payload);
+  assert.equal(submitted.payload.decision_id, id);
+  assert.equal(submitted.payload.home_marker, resolve(fx.home));
+  assert.match(submitted.payload.landing.id, /^[0-9a-f-]{36}$/);
+  assert.equal(
+    new Date(submitted.payload.landing.submitted_at).toISOString(),
+    submitted.payload.landing.submitted_at,
+  );
   const confirmation = submitted.document.querySelector('#confirmation');
   assert.equal(confirmation.hidden, false);
-  assert.match(confirmation.textContent, /durably saved/i);
+  assert.match(confirmation.textContent, /Answer downloaded/);
+  assert.match(confirmation.textContent, /Tell firstmate/);
 
-  const rejected = executeBoardSubmission(await readFile(output, 'utf8'), {
-    storageFailure: true,
+  const rejected = await executeBoardSubmission(await readFile(output, 'utf8'), {
+    downloadFailure: true,
   });
   assert.equal(
     rejected.document.querySelector('#confirmation').hidden,
     true,
-    'a failed durable write still showed success',
+    'a failed download still showed success',
   );
   assert.equal(rejected.document.querySelector('#submit-button').disabled, false);
-  assert.equal(rejected.storage.size, 0);
+  assert.equal(rejected.downloaded.length, 0);
+  assert.equal(rejected.document.querySelector('#payload-backup').hidden, false);
+  assert.match(rejected.document.querySelector('#submit-error').textContent, /manual payload backup/);
 });
 
-test('B5 fm-lavish-board executes submit and recovers after immediate browser close', async () => {
-  const fx = await fixture('board-shell-e2e');
+test('B5 fm-lavish-board exits after opening and intake recovers the downloaded answer', async () => {
+  const fx = await fixture('board-shell-download');
   const id = await createRequest(fx);
   const downloads = join(fx.root, 'Downloads');
-  const fakeBin = join(fx.root, 'browser-bin');
-  const fakeState = join(fx.root, 'fake-browser-state.json');
   const effectiveState = join(fx.root, 'effective-state');
+  const opener = join(fx.root, 'open-board');
+  const openerLog = join(fx.root, 'open-board.log');
   await mkdir(downloads);
-  await mkdir(fakeBin);
-  const chrome = join(fakeBin, 'chrome-devtools-axi');
   await writeFile(
-    chrome,
-    `#!/bin/sh\nexec '${process.execPath}' '${FAKE_BROWSER}' "$@"\n`,
+    opener,
+    `#!/bin/sh\nprintf '%s\\n' "$#" "$1" > '${openerLog}'\n`,
   );
-  await chmod(chrome, 0o700);
-  const fake = await fakeTmux(fx);
-  const holder = await writeSupervisorLock(fx, 'home:0', effectiveState);
+  await chmod(opener, 0o700);
   const environment = {
-    PATH: `${fake.bin}:${fakeBin}:${process.env.PATH}`,
     FM_LAVISH_BIN: CLI,
-    FM_LAVISH_QUEUE_DISABLE: '0',
+    FM_LAVISH_OPEN_COMMAND: opener,
     FM_STATE_OVERRIDE: effectiveState,
-    LAVISH_FAKE_CHROME_STATE: fakeState,
-    LAVISH_FAKE_TMUX_PANE_PID: String(holder.pid),
-    LAVISH_WAKE_COMMAND: WAKE_ADAPTER,
-  };
-
-  try {
-    const opened = await runExecutable(
-      BOARD_ADAPTER,
-      [id, '--home', fx.home, '--downloads', downloads],
-      { env: environment },
-    );
-    assert.equal(opened.code, 0, opened.stderr);
-    const checkPath = join(effectiveState, `lavish-board-${id}.check.sh`);
-    assert.equal(await exists(checkPath), true);
-    assert.equal(
-      await exists(join(fx.home, 'state', `lavish-board-${id}.check.sh`)),
-      false,
-    );
-    const openedAtMatch = (await readFile(checkPath, 'utf8')).match(/--opened-at ([0-9]+)/);
-    assert.ok(openedAtMatch);
-    const openedAt = Number(openedAtMatch[1]);
-    const manifest = await manifestFor(fx, id);
-    const staleDownload = join(downloads, `lavish-answer-${id}.json`);
-    await writeFile(
-      staleDownload,
-      `${JSON.stringify(browserPayload(fx, manifest, {
-        answers: [{
-          key: 'rollout',
-          value: 'green',
-          question_note: 'Stale answer from the prior board.',
-          option_comments: {},
-        }],
-      }))}\n`,
-    );
-    const staleTime = new Date(openedAt + 500);
-    await utimes(staleDownload, staleTime, staleTime);
-    const staleInfo = await stat(staleDownload);
-    assert.ok(staleInfo.mtimeMs > openedAt);
-
-    const stopped = await runExecutable(chrome, ['stop'], { env: environment });
-    assert.equal(stopped.code, 0, stopped.stderr);
-    const checked = await runExecutable(checkPath, [], {
-      env: environment,
-      unsetEnv: ['FM_STATE_OVERRIDE'],
-    });
-    assert.equal(checked.code, 0, checked.stderr);
-    assert.match(checked.stdout, new RegExp(`lavish-submit: ${id}`));
-    assert.match(checked.stdout, /lavish-delivery: prompt queued/);
-    assert.equal(
-      await exists(join(fx.home, 'data/decisions', id, 'answer.toon')),
-      true,
-    );
-    const stored = decode(
-      await readFile(join(fx.home, 'data/decisions', id, 'answer.toon'), 'utf8'),
-      { strict: true },
-    );
-    assert.equal(stored.answers[0].value, 'blue');
-    assert.equal(
-      await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')),
-      true,
-    );
-    assert.equal(await exists(join(fx.home, 'data/replies/release-choice.toon')), true);
-    assert.match(await readFile(fake.log, 'utf8'), /-t home:0 /);
-    assert.equal(
-      await exists(join(effectiveState, 'lavish-deliveries', `${id}.digest`)),
-      true,
-    );
-    assert.equal(await exists(checkPath), false);
-  } finally {
-    const closed = new Promise((resolveClose) => holder.once('close', resolveClose));
-    holder.kill();
-    await closed;
-  }
-});
-
-test('B5 watcher check leaves a live unsubmitted board open and pending', async () => {
-  const fx = await fixture('board-live-pending');
-  const id = await createRequest(fx);
-  const downloads = join(fx.root, 'Downloads');
-  const fakeBin = join(fx.root, 'browser-bin');
-  const fakeState = join(fx.root, 'fake-browser-state.json');
-  await mkdir(downloads);
-  await mkdir(fakeBin);
-  const chrome = join(fakeBin, 'chrome-devtools-axi');
-  await writeFile(
-    chrome,
-    `#!/bin/sh\nexec '${process.execPath}' '${FAKE_BROWSER}' "$@"\n`,
-  );
-  await chmod(chrome, 0o700);
-  const environment = {
-    PATH: `${fakeBin}:${process.env.PATH}`,
-    FM_LAVISH_BIN: CLI,
-    LAVISH_FAKE_CHROME_STATE: fakeState,
-    LAVISH_FAKE_CHROME_AUTO_SUBMIT: '0',
     LAVISH_WAKE_COMMAND: WAKE_ADAPTER,
   };
 
   const opened = await runExecutable(
     BOARD_ADAPTER,
-    [id, '--home', fx.home, '--downloads', downloads],
+    [id, '--home', fx.home],
     { env: environment },
   );
   assert.equal(opened.code, 0, opened.stderr);
-  const checkPath = join(fx.home, 'state', `lavish-board-${id}.check.sh`);
-  const checked = await runExecutable(checkPath, [], { env: environment });
-  assert.equal(checked.code, 0, checked.stderr);
-  const browserState = JSON.parse(await readFile(fakeState, 'utf8'));
-  assert.equal(browserState.open, true);
-  assert.equal(Object.keys(browserState.storage).length, 0);
-  assert.equal(
-    await exists(join(fx.home, 'data/decisions', id, 'answer.toon')),
-    false,
-  );
-  assert.equal(await exists(checkPath), true);
+  assert.match(opened.stdout, /Opened Lavish board release-choice in the default browser/);
+  assert.match(opened.stdout, /tell firstmate it is ready/);
+
+  const openerLines = (await readFile(openerLog, 'utf8')).trimEnd().split('\n');
+  assert.equal(openerLines[0], '1');
+  const htmlPath = openerLines[1];
+  assert.equal(htmlPath.endsWith(`/effective-state/lavish-board-${id}.html`), true);
+  assert.equal(await exists(htmlPath), true);
+  assert.equal(await exists(join(effectiveState, `lavish-board-${id}.check.sh`)), false);
+  assert.equal(await exists(join(effectiveState, `lavish-board-${id}.payload.json`)), false);
+  assert.equal(await exists(join(effectiveState, `lavish-board-${id}.chrome-profile`)), false);
+
+  const adapterSource = await readFile(BOARD_ADAPTER, 'utf8');
+  assert.doesNotMatch(adapterSource, /chrome-devtools-axi|LAVISH-SUBMIT|--session|--opened-at/);
+  assert.doesNotMatch(adapterSource, /check\.sh|chrome-profile|Armed submission check/);
+  assert.doesNotMatch(adapterSource, /xdg-open/);
+
+  const submitted = await executeBoardSubmission(await readFile(htmlPath, 'utf8'));
+  assert.equal(submitted.downloaded.length, 1);
+  const downloadPath = join(downloads, submitted.downloaded[0].filename);
+  await writeFile(downloadPath, submitted.downloaded[0].text);
+
+  const intake = await runCli(['intake'], {
+    home: submitted.payload.home_marker,
+    env: {
+      FM_STATE_OVERRIDE: effectiveState,
+      LAVISH_DOWNLOADS_DIR: downloads,
+    },
+  });
+  assert.equal(intake.code, 0, intake.stderr);
+  assert.match(intake.stdout, new RegExp(`${id},payload-collected`));
+  assert.match(intake.stdout, new RegExp(`${id},consumed`));
+  assert.equal(await exists(join(fx.home, 'data/decisions', id, 'answer.toon')), true);
+  assert.equal(await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')), true);
+  assert.equal(await exists(join(fx.home, 'data/replies/release-choice.toon')), true);
 });
 
-test('watcher check fails closed when its download location becomes unreadable', async () => {
-  const fx = await fixture('board-unreadable-downloads');
+test('fm-lavish-board fails closed with the manual path on unsupported hosts', async () => {
+  const fx = await fixture('board-shell-unsupported-host');
   const id = await createRequest(fx);
-  const downloads = join(fx.root, 'Downloads');
-  const fakeBin = join(fx.root, 'browser-bin');
-  const fakeState = join(fx.root, 'fake-browser-state.json');
-  await mkdir(downloads);
+  const effectiveState = join(fx.root, 'effective-state');
+  const fakeBin = join(fx.root, 'fake-bin');
   await mkdir(fakeBin);
-  const chrome = join(fakeBin, 'chrome-devtools-axi');
-  await writeFile(
-    chrome,
-    `#!/bin/sh\nexec '${process.execPath}' '${FAKE_BROWSER}' "$@"\n`,
-  );
-  await chmod(chrome, 0o700);
-  const environment = {
-    PATH: `${fakeBin}:${process.env.PATH}`,
-    FM_LAVISH_BIN: CLI,
-    LAVISH_FAKE_CHROME_STATE: fakeState,
-    LAVISH_FAKE_CHROME_AUTO_SUBMIT: '0',
-    LAVISH_WAKE_COMMAND: WAKE_ADAPTER,
-  };
+  await writeFile(join(fakeBin, 'uname'), '#!/bin/sh\nprintf "Linux\\n"\n');
+  await chmod(join(fakeBin, 'uname'), 0o700);
 
   const opened = await runExecutable(
     BOARD_ADAPTER,
-    [id, '--home', fx.home, '--downloads', downloads],
-    { env: environment },
+    [id, '--home', fx.home],
+    {
+      env: {
+        FM_LAVISH_BIN: CLI,
+        FM_STATE_OVERRIDE: effectiveState,
+        PATH: `${fakeBin}:${dirname(process.execPath)}:/usr/bin:/bin`,
+      },
+      unsetEnv: ['FM_LAVISH_OPEN_COMMAND'],
+    },
   );
-  assert.equal(opened.code, 0, opened.stderr);
-  const checkPath = join(fx.home, 'state', `lavish-board-${id}.check.sh`);
-  await rm(downloads, { recursive: true });
-  await writeFile(downloads, 'not a directory\n');
-
-  const checked = await runExecutable(checkPath, [], { env: environment });
-  assert.equal(checked.code, 2, checked.stderr);
-  assert.match(checked.stderr, /unsafe or missing downloads directory/);
-  assert.equal(
-    await exists(join(fx.home, 'data/decisions', id, 'answer.toon')),
-    false,
-  );
-  assert.equal(await exists(checkPath), true);
+  const htmlPath = join(effectiveState, `lavish-board-${id}.html`);
+  assert.equal(opened.code, 2);
+  assert.match(opened.stdout, /Board written:/);
+  assert.doesNotMatch(opened.stdout, /Opened Lavish board/);
+  assert.match(opened.stderr, /automatic default-browser handoff is unsupported/);
+  assert.match(opened.stderr, new RegExp(`lavish-board-${id}\\.html`));
+  assert.equal(await exists(htmlPath), true);
 });
 
 test('board renders a conventional visuals directory on an existing manifest', async () => {
@@ -1304,12 +1252,12 @@ test('annotation board refuses to submit an entirely empty batch', async () => {
   );
 
   // One comment is enough; the rest may stay blank.
-  const submitted = executeBoardSubmission(html, {
+  const submitted = await executeBoardSubmission(html, {
     fill: (page) => {
       page.querySelectorAll('textarea[data-item-note]')[1].value = 'Only this one matters.';
     },
   });
-  const payload = JSON.parse([...submitted.storage.values()][0]).payload;
+  const payload = submitted.payload;
   assert.deepEqual(payload.annotations, [
     { key: 'welcome-timing', note: '' },
     { key: 'quiet-hours', note: 'Only this one matters.' },
@@ -1437,21 +1385,18 @@ test('an annotation manifest refuses a decision-shaped answer', async () => {
   assert.match(shown.stderr, /answer\.annotations must be an array/);
 });
 
-test('fm-lavish-board opens and collects an annotation board end to end', async () => {
+test('fm-lavish-board download reaches intake for an annotation board end to end', async () => {
   const fx = await annotationFixture('annotation-board-shell');
   const id = await createAnnotation(fx);
   const downloads = join(fx.root, 'Downloads');
-  const fakeBin = join(fx.root, 'browser-bin');
-  const fakeState = join(fx.root, 'fake-browser-state.json');
+  const opener = join(fx.root, 'open-board');
+  const openerLog = join(fx.root, 'open-board.log');
   await mkdir(downloads);
-  await mkdir(fakeBin);
-  const chrome = join(fakeBin, 'chrome-devtools-axi');
-  await writeFile(chrome, `#!/bin/sh\nexec '${process.execPath}' '${FAKE_BROWSER}' "$@"\n`);
-  await chmod(chrome, 0o700);
+  await writeFile(opener, `#!/bin/sh\nprintf '%s\\n' "$1" > '${openerLog}'\n`);
+  await chmod(opener, 0o700);
   const environment = {
-    PATH: `${fakeBin}:${process.env.PATH}`,
     FM_LAVISH_BIN: CLI,
-    LAVISH_FAKE_CHROME_STATE: fakeState,
+    FM_LAVISH_OPEN_COMMAND: opener,
     LAVISH_WAKE_COMMAND: WAKE_ADAPTER,
   };
 
@@ -1459,24 +1404,34 @@ test('fm-lavish-board opens and collects an annotation board end to end', async 
   // no radio on it.
   const opened = await runExecutable(
     BOARD_ADAPTER,
-    [id, '--home', fx.home, '--downloads', downloads],
+    [id, '--home', fx.home],
     { env: environment },
   );
   assert.equal(opened.code, 0, opened.stderr);
-  const checkPath = join(fx.home, 'state', `lavish-board-${id}.check.sh`);
-  assert.equal(await exists(checkPath), true);
+  const htmlPath = (await readFile(openerLog, 'utf8')).trim();
+  const submitted = await executeBoardSubmission(await readFile(htmlPath, 'utf8'), {
+    fill: (page) => {
+      page.querySelector('textarea[data-item-note]').value = 'Downloaded board comment.';
+    },
+  });
+  assert.equal(submitted.downloaded.length, 1);
+  await writeFile(
+    join(downloads, submitted.downloaded[0].filename),
+    submitted.downloaded[0].text,
+  );
 
-  const stopped = await runExecutable(chrome, ['stop'], { env: environment });
-  assert.equal(stopped.code, 0, stopped.stderr);
-  const checked = await runExecutable(checkPath, [], { env: environment });
-  assert.equal(checked.code, 0, checked.stderr);
-  assert.match(checked.stdout, new RegExp(`lavish-submit: ${id}`));
-
+  const intake = await runCli(['intake'], {
+    home: submitted.payload.home_marker,
+    env: { LAVISH_DOWNLOADS_DIR: downloads },
+  });
+  assert.equal(intake.code, 0, intake.stderr);
+  assert.match(intake.stdout, new RegExp(`${id},payload-collected`));
+  assert.match(intake.stdout, new RegExp(`${id},consumed`));
   const stored = decode(
     await readFile(join(fx.home, 'data/decisions', id, 'answer.toon'), 'utf8'),
     { strict: true },
   );
-  assert.equal(stored.annotations[0].note, 'Fake browser comment.');
+  assert.equal(stored.annotations[0].note, 'Downloaded board comment.');
   assert.equal(await exists(join(fx.home, 'data/replies/welcome-review.toon')), true);
 });
 
@@ -1527,6 +1482,219 @@ test('intake recovers a browser download payload without manual copy', async () 
   });
   assert.equal(again.code, 0, again.stderr);
   assert.equal(again.stdout, '');
+});
+
+test('intake uses payload-bound authority for numbered download collisions', async () => {
+  const fx = await fixture('download-numbered-collision');
+  const id = await createRequest(fx);
+  const manifest = await manifestFor(fx, id);
+  const downloads = join(fx.root, 'Downloads');
+  await mkdir(downloads);
+  await writeFile(
+    join(downloads, browserDownloadName(manifest)),
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      landing: landingAuthority(1, '2026-08-08T12:00:00.000Z'),
+    }))}\n`,
+  );
+  await writeFile(
+    join(downloads, browserDownloadName(manifest, 1)),
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      answers: [{
+        key: 'rollout',
+        value: 'green',
+        question_note: 'This later download is authoritative.',
+        option_comments: {},
+      }],
+      landing: landingAuthority(2, '2026-08-08T12:01:00.000Z'),
+    }))}\n`,
+  );
+
+  const intake = await runCli(['intake'], {
+    home: fx.home,
+    env: { LAVISH_DOWNLOADS_DIR: downloads },
+  });
+  assert.equal(intake.code, 0, intake.stderr);
+  assert.match(intake.stdout, /release-choice,payload-collected/);
+  const stored = decode(
+    await readFile(join(fx.home, 'data/decisions', id, 'answer.toon'), 'utf8'),
+    { strict: true },
+  );
+  assert.equal(stored.answers[0].value, 'green');
+
+  const again = await runCli(['intake'], {
+    home: fx.home,
+    env: { LAVISH_DOWNLOADS_DIR: downloads },
+  });
+  assert.equal(again.code, 0, again.stderr);
+  assert.equal(again.stdout, '');
+});
+
+test('intake refuses cross-directory disagreements without payload authority', async () => {
+  const fx = await fixture('download-equal-collision');
+  const id = await createRequest(fx);
+  const manifest = await manifestFor(fx, id);
+  const downloads = join(fx.root, 'Downloads');
+  await mkdir(downloads);
+  await mkdir(join(fx.home, 'state'), { recursive: true });
+  await writeFile(
+    join(downloads, browserDownloadName(manifest)),
+    `${JSON.stringify(browserPayload(fx, manifest))}\n`,
+  );
+  await writeFile(
+    join(fx.home, 'state', browserDownloadName(manifest)),
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      answers: [{
+        key: 'rollout',
+        value: 'green',
+        question_note: '',
+        option_comments: {},
+      }],
+    }))}\n`,
+  );
+
+  const intake = await runCli(['intake'], {
+    home: fx.home,
+    env: { LAVISH_DOWNLOADS_DIR: downloads },
+  });
+  assert.equal(intake.code, 6, intake.stderr);
+  assert.match(intake.stdout, /payload-conflict/);
+  assert.match(intake.stdout, /landing payloads disagree without payload authority/);
+  assert.equal(await exists(join(fx.home, 'data/decisions', id, 'answer.toon')), false);
+  assert.equal(await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')), false);
+});
+
+test('intake ignores cross-directory filename rank when payload authority is newer', async () => {
+  const fx = await fixture('download-cross-directory-authority');
+  const id = await createRequest(fx);
+  const manifest = await manifestFor(fx, id);
+  const downloads = join(fx.root, 'Downloads');
+  await mkdir(downloads);
+  await mkdir(join(fx.home, 'state'), { recursive: true });
+  await writeFile(
+    join(downloads, browserDownloadName(manifest)),
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      landing: landingAuthority(2, '2026-08-08T12:01:00.000Z'),
+    }))}\n`,
+  );
+  await writeFile(
+    join(fx.home, 'state', browserDownloadName(manifest, 1)),
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      answers: [{
+        key: 'rollout',
+        value: 'green',
+        question_note: 'Stale answer with a higher directory-local suffix.',
+        option_comments: {},
+      }],
+      landing: landingAuthority(1, '2026-08-08T12:00:00.000Z'),
+    }))}\n`,
+  );
+
+  const intake = await runCli(['intake'], {
+    home: fx.home,
+    env: { LAVISH_DOWNLOADS_DIR: downloads },
+  });
+  assert.equal(intake.code, 0, intake.stderr);
+  assert.match(intake.stdout, /release-choice,payload-collected/);
+  const stored = decode(
+    await readFile(join(fx.home, 'data/decisions', id, 'answer.toon'), 'utf8'),
+    { strict: true },
+  );
+  assert.equal(stored.answers[0].value, 'blue');
+});
+
+test('intake refuses tied payload authority when answer content differs', async () => {
+  const fx = await fixture('download-tied-authority');
+  const id = await createRequest(fx);
+  const manifest = await manifestFor(fx, id);
+  const downloads = join(fx.root, 'Downloads');
+  await mkdir(downloads);
+  await mkdir(join(fx.home, 'state'), { recursive: true });
+  await writeFile(
+    join(downloads, browserDownloadName(manifest)),
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      landing: landingAuthority(1, '2026-08-08T12:00:00.000Z'),
+    }))}\n`,
+  );
+  await writeFile(
+    join(fx.home, 'state', browserDownloadName(manifest)),
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      answers: [{
+        key: 'rollout',
+        value: 'green',
+        question_note: '',
+        option_comments: {},
+      }],
+      landing: landingAuthority(2, '2026-08-08T12:00:00.000Z'),
+    }))}\n`,
+  );
+
+  const intake = await runCli(['intake'], {
+    home: fx.home,
+    env: { LAVISH_DOWNLOADS_DIR: downloads },
+  });
+  assert.equal(intake.code, 6, intake.stderr);
+  assert.match(intake.stdout, /equally authoritative landing payloads disagree/);
+  assert.equal(await exists(join(fx.home, 'data/decisions', id, 'answer.toon')), false);
+});
+
+test('intake refuses landing authority without a home marker', async () => {
+  const fx = await fixture('download-unbound-authority');
+  const id = await createRequest(fx);
+  const manifest = await manifestFor(fx, id);
+  const downloads = join(fx.root, 'Downloads');
+  const unbound = browserPayload(fx, manifest, {
+    answers: [{
+      key: 'rollout',
+      value: 'green',
+      question_note: 'This unbound answer must never outrank the home-bound answer.',
+      option_comments: {},
+    }],
+    landing: landingAuthority(2, '2026-08-08T12:01:00.000Z'),
+  });
+  delete unbound.home_marker;
+  await mkdir(downloads);
+  await writeFile(
+    join(downloads, browserDownloadName(manifest)),
+    `${JSON.stringify(browserPayload(fx, manifest, {
+      landing: landingAuthority(1, '2026-08-08T12:00:00.000Z'),
+    }))}\n`,
+  );
+  await writeFile(
+    join(downloads, browserDownloadName(manifest, 1)),
+    `${JSON.stringify(unbound)}\n`,
+  );
+
+  const intake = await runCli(['intake'], {
+    home: fx.home,
+    env: { LAVISH_DOWNLOADS_DIR: downloads },
+  });
+  assert.equal(intake.code, 6, intake.stderr);
+  assert.match(intake.stdout, /payload_missing_home/);
+  assert.equal(await exists(join(fx.home, 'data/decisions', id, 'answer.toon')), false);
+  assert.equal(await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')), false);
+});
+
+test('intake refuses a request-bound filename for another question set', async () => {
+  const fx = await fixture('download-filename-request-mismatch');
+  const id = await createRequest(fx);
+  const manifest = await manifestFor(fx, id);
+  const downloads = join(fx.root, 'Downloads');
+  const wrongDigest = '0'.repeat(64);
+  await mkdir(downloads);
+  await writeFile(
+    join(downloads, `lavish-answer-${id}-${wrongDigest}.json`),
+    `${JSON.stringify(browserPayload(fx, manifest))}\n`,
+  );
+
+  const intake = await runCli(['intake'], {
+    home: fx.home,
+    env: { LAVISH_DOWNLOADS_DIR: downloads },
+  });
+  assert.equal(intake.code, 6, intake.stderr);
+  assert.match(intake.stdout, /payload_stale_request/);
+  assert.match(intake.stdout, /filename request digest does not match/);
+  assert.equal(await exists(join(fx.home, 'data/decisions', id, 'answer.toon')), false);
+  assert.equal(await exists(join(fx.home, 'data/decisions', id, 'receipt.toon')), false);
 });
 
 test('intake ignores a home-bound download in unrelated homes', async () => {
@@ -1740,6 +1908,12 @@ test('collect fails closed with named errors for count, key, option, and request
     {
       name: 'payload_wrong_home',
       payload: browserPayload(fx, manifest, { home_marker: resolve(fx.root, 'other-home') }),
+    },
+    {
+      name: 'payload_invalid_landing',
+      payload: browserPayload(fx, manifest, {
+        landing: landingAuthority(1, '2026-08-08T12:00:00Z'),
+      }),
     },
   ];
   for (const failure of cases) {

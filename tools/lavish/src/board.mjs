@@ -1,10 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import MarkdownIt from 'markdown-it';
 import { ANNOTATION_MODE, ANSWER_SCHEMA_VERSION } from './protocol.mjs';
-
-export const SUBMIT_MARKER = `LAVISH-SUBMIT v${ANSWER_SCHEMA_VERSION}`;
 
 const markdown = new MarkdownIt({
   html: false,
@@ -267,8 +266,8 @@ textarea:focus { outline: 2px solid var(--border-focus); outline-offset: 1px; bo
 }
 
 // The two modes differ only in what a payload carries, what the review step
-// lists, and what makes a batch complete. Everything after review - durable
-// persistence, download, confirmation - is deliberately one shared path.
+// lists, and what makes a batch complete. Everything after review - download,
+// manual backup, and confirmation - is deliberately one shared path.
 function annotationScriptParts() {
   return {
     buildEntries: `annotations: MANIFEST.items.map((item) => ({
@@ -288,8 +287,8 @@ function annotationScriptParts() {
       addReviewLine(item, annotation.note);
       reviewList.append(item);
     }`,
-    // Answer files are write-once, so an empty submit would burn the board
-    // without telling firstmate anything.
+    // Answer files are write-once after intake, so an empty download would burn
+    // that one accepted batch without telling firstmate anything.
     incompleteCheck: `const payload = buildPayload();
     const empty = payload.annotations.every((annotation) => annotation.note.trim() === '')
       && payload.note.trim() === '';
@@ -360,6 +359,7 @@ function boardScript(decision) {
       decision_id: decision.id,
       home_marker: decision.home,
       request_sha256: decision.manifest.request_sha256,
+      landing_id: randomUUID(),
       items: decision.manifest.items.map((item) => ({
         key: item.key,
         title: item.title,
@@ -369,6 +369,7 @@ function boardScript(decision) {
       decision_id: decision.id,
       home_marker: decision.home,
       request_sha256: decision.manifest.request_sha256,
+      landing_id: randomUUID(),
       questions: decision.manifest.questions.map((question) => ({
         key: question.key,
         prompt: question.prompt,
@@ -379,7 +380,6 @@ function boardScript(decision) {
   return `(() => {
   'use strict';
   const MANIFEST = ${scriptJson(clientManifest)};
-  const SUBMIT_MARKER = ${scriptJson(SUBMIT_MARKER)};
   const form = document.querySelector('#decision-form');
   const review = document.querySelector('#review-step');
   const reviewList = document.querySelector('#review-list');
@@ -388,17 +388,17 @@ function boardScript(decision) {
   const payloadBackup = document.querySelector('#payload-backup');
   const submittedPayload = document.querySelector('#submitted-payload');
   const submitError = document.querySelector('#submit-error');
-  const downloadFilename = 'lavish-answer-' + MANIFEST.decision_id + '.json';
-  const storageKey = 'lavish-submit:' + MANIFEST.home_marker + ':' + MANIFEST.decision_id + ':' + MANIFEST.request_sha256;
-  window.__lavishPayload = null;
-  window.__lavishStorageKey = storageKey;
+  const requestDigest = MANIFEST.request_sha256.slice('sha256:'.length);
+  const downloadFilename = 'lavish-answer-' + MANIFEST.decision_id + '-'
+    + requestDigest + '.json';
 
-  function buildPayload() {
+  function buildPayload(landing) {
     return {
       schema_version: ${ANSWER_SCHEMA_VERSION},
       decision_id: MANIFEST.decision_id,
       home_marker: MANIFEST.home_marker,
       request_sha256: MANIFEST.request_sha256,
+      ...(landing === undefined ? {} : { landing }),
       ${parts.buildEntries}
       note: overallNote.value,
     };
@@ -438,14 +438,6 @@ function boardScript(decision) {
     window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
   }
 
-  function persistPayload(payload) {
-    const durableRecord = JSON.stringify({ marker: SUBMIT_MARKER, payload });
-    localStorage.setItem(storageKey, durableRecord);
-    if (localStorage.getItem(storageKey) !== durableRecord) {
-      throw new Error('durable browser storage verification failed');
-    }
-  }
-
   document.querySelector('#review-button').addEventListener('click', () => {
     ${parts.incompleteCheck}
     formError.hidden = true;
@@ -462,28 +454,22 @@ function boardScript(decision) {
   });
 
   document.querySelector('#submit-button').addEventListener('click', (event) => {
-    const payload = buildPayload();
+    const payload = buildPayload({
+      id: MANIFEST.landing_id,
+      submitted_at: new Date().toISOString(),
+    });
     const payloadJson = JSON.stringify(payload, null, 2) + '\\n';
     submitError.hidden = true;
-    try {
-      persistPayload(payload);
-    } catch {
-      submittedPayload.value = payloadJson;
-      payloadBackup.hidden = false;
-      submitError.textContent = 'Could not durably save this answer. Keep this board open and try again.';
-      submitError.hidden = false;
-      return;
-    }
-    window.__lavishPayload = payload;
     submittedPayload.value = payloadJson;
     payloadBackup.hidden = false;
-    document.title = SUBMIT_MARKER;
-    event.currentTarget.disabled = true;
     try {
       downloadPayload(payloadJson);
     } catch {
-      // The verified browser-profile record remains authoritative.
+      submitError.textContent = 'Could not download this answer. Save the manual payload backup in Downloads, then tell firstmate.';
+      submitError.hidden = false;
+      return;
     }
+    event.currentTarget.disabled = true;
     document.querySelector('#confirmation').hidden = false;
   });
 })();`;
@@ -506,12 +492,12 @@ export async function renderBoard(decision) {
   const title = escapeHtml(decision.manifest.title);
   const kindLabel = annotation ? 'Lavish annotation' : 'Lavish decision';
   const subtitle = annotation
-    ? 'Comment on any item, add an overall note, then submit one complete batch.'
-    : 'Review the full context, annotate any option or question, then submit one complete batch.';
+    ? 'Comment on any item, add an overall note, then save one complete batch.'
+    : 'Review every choice, annotate any option or question, then save one complete batch.';
   const reviewButtonLabel = annotation ? 'Review comments' : 'Review answers';
   const reviewTitle = annotation
-    ? 'Submit these comments?'
-    : 'Submit this complete answer batch?';
+    ? 'Save these comments?'
+    : 'Save this complete answer batch?';
   return `<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
@@ -542,16 +528,16 @@ export async function renderBoard(decision) {
       <p class="eyebrow">Final review</p>
       <h2 id="review-title">${reviewTitle}</h2>
       <div id="review-list" class="review-list"></div>
-      <p id="confirmation" class="confirmation" role="status" hidden>Answer durably saved in this board's local profile. Firstmate will validate and confirm receipt.</p>
+      <p id="confirmation" class="confirmation" role="status" hidden>Answer downloaded. Tell firstmate you answered it, then close this tab. Firstmate will validate the saved file on the next ordinary intake.</p>
       <p id="submit-error" class="form-error" role="alert" hidden></p>
       <section id="payload-backup" class="payload-backup" aria-labelledby="payload-backup-title" hidden>
         <h3 id="payload-backup-title">Manual payload backup</h3>
-        <p>If the browser blocked the download, copy and save this complete JSON payload.</p>
+        <p>If the browser blocked the download, save this complete JSON payload in Downloads as <code>lavish-answer-${escapeHtml(decision.id)}-${escapeHtml(decision.manifest.request_sha256.slice('sha256:'.length))}.json</code>, then tell firstmate.</p>
         <textarea id="submitted-payload" rows="14" readonly spellcheck="false" aria-label="Submitted payload JSON"></textarea>
       </section>
       <div class="actions">
         <button id="back-button" class="button" type="button">Back</button>
-        <button id="submit-button" class="button primary" type="button">Submit to firstmate</button>
+        <button id="submit-button" class="button primary" type="button">Download answer</button>
       </div>
     </section>
   </main>

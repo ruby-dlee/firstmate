@@ -57,15 +57,15 @@ Do not pad an item to satisfy a wrapper it does not have.
    ```
 
    For a self-contained browser board, run `bin/fm-lavish-board.sh <decision-id> --home <resolved-absolute-home>` as documented in `tools/lavish/README.md`.
-   Only a successful exit authorizes reporting the board open because the helper checks its answering machinery before it arms pickup or opens Chrome.
-   Then tell the captain the named decision board is open.
+   Only a successful exit authorizes reporting the board open because the helper checks its download and manual-backup machinery before handing the file to the operating system's default browser.
+   Then tell the captain the named decision board is open and ask them to tell firstmate after saving the answer.
    Do not surface or invent a session URL.
 
 The surfaced command is for the captain's shell, not firstmate's environment.
 It must retain the emitted `--home` argument and resolved absolute home path even when firstmate has `FM_HOME` exported.
 Never shorten the command or reconstruct it from a placeholder.
 Always carrying the explicit home is slightly noisier than asking the captain to export `FM_HOME`, but it makes every decision independently runnable and avoids a hidden setup dependency.
-The browser wrapper must receive that same explicit resolved home so its dedicated profile and recovery check stay bound to the decision's fleet home.
+The browser wrapper must receive that same explicit resolved home so the downloaded payload's `home_marker` stays bound to the decision's fleet home.
 
 Do not edit `request.md` or `manifest.toon` after surfacing the decision.
 Their digest and ordered question or item set are the immutable contract.
@@ -73,9 +73,11 @@ Their digest and ordered question or item set are the immutable contract.
 ## Consume
 
 Firstmate's ordinary wake drain and session start invoke Lavish intake.
+When the captain says a browser board is answered, run one bounded `lavish-axi intake --home <resolved-absolute-home>` immediately rather than waiting for an automated submission prompt; the board intentionally has none.
+The downloaded payload is the landing record until intake validates it into `answer.toon`.
 The answer file is authoritative; the wake record is only a pointer.
 Visible prompt delivery is redundant; `tools/lavish/README.md` owns its home-bound routing and manifest-destination contract.
-If that proof is unavailable, accept the fail-closed refusal and rely on the durable wake path rather than targeting ambient terminal state or asking the captain to submit again.
+If that proof is unavailable, accept the fail-closed refusal and rely on the durable answer path rather than targeting ambient terminal state or asking the captain to answer again.
 
 When a destination appears:
 
@@ -89,9 +91,9 @@ When a destination appears:
 
 Never start a server, create or share a session URL, poll, long-poll, register a filesystem watcher, schedule a timer sweep, or launch a resident server or listener process for Lavish decision capture.
 Do not use upstream `serve`, `poll`, browser, layout-audit, or session-lifecycle commands.
-The sole browser exception is `bin/fm-lavish-board.sh`, which opens a decision-specific profile and arms one ordinary bounded recovery check around the authoritative file protocol.
-Only that helper arms the pickup path; a hand-authored page is not a fallback because its answers cannot reach firstmate.
+The sole browser exception is `bin/fm-lavish-board.sh`, which invokes the operating system's default browser opener and exits without a dedicated profile, automation session, or submission check.
+Only that helper-generated page binds the downloaded answer to the immutable request and fleet home; a hand-authored page is not a fallback because its answers cannot enter the validated intake path.
 
-Every core Lavish command must finish its bounded local file operation and exit.
+Every core Lavish command and the board wrapper must finish its bounded local operation and exit.
 If `lavish answer` reports `answer saved; wake not queued`, do not ask the captain to answer again.
 The next ordinary intake scan recovers the durable unreceipted answer.

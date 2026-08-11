@@ -4,7 +4,7 @@ Lavish is firstmate's durable decision inbox.
 It stores complete requests and answers under `$FM_HOME/data/decisions/`, and its authoritative store-and-forward operations are bounded local commands.
 
 The core file protocol has no server, URL, listener, long poll, idle timeout, or resident process.
-The optional Firstmate board wrapper opens a bounded dedicated Chrome profile and arms one ordinary watcher check; the durable request and answer files remain authoritative.
+The optional Firstmate board wrapper renders a self-contained file, hands it to the operating system's default browser, and exits without owning a browser process, automation session, or submission check.
 An unanswered request remains answerable until the files are deliberately removed.
 
 ## Human commands
@@ -32,14 +32,17 @@ It then queues a redundant wake pointer and exits without waiting for firstmate.
 If wake enqueueing fails, the durable answer remains authoritative.
 The command prints `answer saved; wake not queued`, exits nonzero, and the next ordinary intake scan recovers it.
 
-`bin/fm-lavish-board.sh` owns the dedicated Chrome-profile launch, fail-closed answerability preflight, and bounded pickup integration around the generated file.
-`bin/fm-lavish-board.sh` renders the same immutable request into self-contained HTML and opens it with a decision-specific Chrome profile below the effective state root (`FM_STATE_OVERRIDE` or `$FM_HOME/state`).
-The board form refuses to submit nothing, because `answer.toon` is write-once: a decision board requires a choice on every question, and an annotation board requires at least one item comment or the overall note.
+`bin/fm-lavish-board.sh` owns the operating-system browser open and the fail-closed answerability preflight around the generated file.
+It renders the same immutable request into self-contained HTML below the effective state root (`FM_STATE_OVERRIDE` or `$FM_HOME/state`), invokes the default browser opener, and exits as soon as the opener returns.
+It creates no dedicated browser profile, Chrome DevTools process, automation session, armed submission check, watcher, or listener.
+The board form refuses to save nothing, because the eventual `answer.toon` is write-once: a decision board requires a choice on every question, and an annotation board requires at least one item comment or the overall note.
 That guard is the rendered form's alone; `collect` stays permissive, so a hand-recovered payload is never refused for it.
-Submit first writes and reads back a browser-profile record, then shows a confirmation describing that durable record; the optional browser download is not treated as confirmed delivery.
-Both records carry the resolved absolute Firstmate home as `home_marker`, so a shared Downloads directory cannot route one home's answer into another home.
-The armed check recovers the record from the same profile even after the visible browser closes, validates it through `lavish-axi collect`, and runs intake.
-After an answer is committed, the Firstmate wake adapter appends the durable wake pointer and may attempt visible prompt delivery only when the session lock proves a live supervisor route belongs to the same canonical `FM_HOME`.
+Saving downloads one schema-version-2 JSON payload named `lavish-answer-<decision-id>-<request-digest>.json` and exposes the same bytes as a manual backup.
+The payload carries the resolved absolute Firstmate home as `home_marker`, so a shared Downloads directory cannot route one home's answer into another home.
+The board does not claim to notify firstmate automatically.
+The captain tells firstmate after answering, and the next bounded `lavish-axi intake` scan finds the downloaded payload, validates it against the immutable manifest, commits `answer.toon`, writes the declared destination, and then writes `receipt.toon`.
+The normal Downloads directory is scanned by default; a fleet whose browser saves elsewhere declares that directory through `LAVISH_DOWNLOADS_DIR` for intake.
+After the answer is committed, the Firstmate wake adapter appends the durable wake pointer and may attempt visible prompt delivery only when the session lock proves a live supervisor route belongs to the same canonical `FM_HOME`.
 It never falls back to ambient terminal state, and a visible prompt names the manifest's declared destination rather than assuming a conventional path.
 If visible delivery is refused, the durable answer and wake pointer remain authoritative.
 Read that script's header or `--help` output for its current mechanics; the [`lavish-decisions` skill](../../.agents/skills/lavish-decisions/SKILL.md) owns when to invoke it and when to use the terminal fallback.
@@ -125,9 +128,11 @@ An existing matching destination or receipt is an idempotent success.
 A conflicting destination fails closed.
 New manifests declare `destination_format`; `.json` destinations receive the schema-version-2 browser payload, while other destinations receive the authoritative TOON answer.
 Field-less protocol-1 manifests infer that same contract from the destination extension, so a `.json` destination never receives TOON bytes.
-Payload recovery scans the effective state root plus configured download locations as one batch.
+Payload recovery scans configured download locations plus the effective state root's legacy landing files as one batch.
 An unreadable configured location fails the batch before any candidate is committed or any intake result is published.
 New payloads route by `home_marker`; legacy unmarked downloads remain recoverable only in a home whose immutable decision id and request digest match.
+Request-bound browser filenames isolate each immutable question set.
+Schema-version-2 board payloads carry a unique landing id and canonical submission timestamp; intake uses that validated payload metadata across every scanned directory and refuses disagreements when payload authority is absent or tied.
 
 All commands require either `FM_HOME` or an explicit `--home <path>` and never guess a fleet home.
 Firstmate's internal commands use `FM_HOME`; captain-facing commands carry the resolved absolute `--home` path.
@@ -163,7 +168,8 @@ TOON's strict decoder validates every encoded array count before Lavish applies 
 - schema version `2` treats omitted annotations as empty; present question notes, item notes, and the overall note must be strings, option comments must map declared option values to strings, and explicit `null` is invalid for any annotation field
 - annotation answers are schema version `2` only, because annotations did not exist in version `1`
 
-Schema-version-2 browser and JSON-destination payloads also carry the resolved absolute `home_marker` used for fail-closed cross-home routing.
+Schema-version-2 browser payloads also carry the resolved absolute `home_marker` used for fail-closed cross-home routing plus landing metadata used only to authorize one candidate when downloads collide; landing metadata is invalid without that home marker.
+JSON-destination payloads carry the same `home_marker` but omit transport-only landing metadata after collection.
 
 `receipt.toon` contains:
 

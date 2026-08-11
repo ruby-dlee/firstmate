@@ -598,6 +598,40 @@ function payloadError(name, message) {
   throw new LavishError(`${name}: ${message}`, 2);
 }
 
+function validatePayloadLanding(raw) {
+  if (raw.landing === undefined) return undefined;
+  if (
+    raw.landing === null
+    || typeof raw.landing !== 'object'
+    || Array.isArray(raw.landing)
+  ) {
+    payloadError('payload_invalid_landing', 'landing authority must be an object');
+  }
+  if (
+    typeof raw.landing.id !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+      raw.landing.id,
+    )
+  ) {
+    payloadError('payload_invalid_landing', 'landing id must be a lowercase UUIDv4');
+  }
+  if (typeof raw.landing.submitted_at !== 'string') {
+    payloadError('payload_invalid_landing', 'landing submitted_at must be a timestamp');
+  }
+  const submittedAtMs = Date.parse(raw.landing.submitted_at);
+  if (
+    !Number.isFinite(submittedAtMs)
+    || new Date(submittedAtMs).toISOString() !== raw.landing.submitted_at
+  ) {
+    payloadError('payload_invalid_landing', 'landing submitted_at must be canonical UTC');
+  }
+  return {
+    id: raw.landing.id,
+    submittedAt: raw.landing.submitted_at,
+    submittedAtMs,
+  };
+}
+
 export function validateCollectPayload(raw, manifest, {
   expectedHomeMarker = undefined,
   allowMissingHomeMarker = false,
@@ -617,8 +651,9 @@ export function validateCollectPayload(raw, manifest, {
   if (raw.request_sha256 !== manifest.request_sha256) {
     payloadError('payload_stale_request', 'request hash does not match manifest');
   }
+  const landing = validatePayloadLanding(raw);
   if (raw.home_marker === undefined) {
-    if (expectedHomeMarker !== undefined && !allowMissingHomeMarker) {
+    if (landing !== undefined || (expectedHomeMarker !== undefined && !allowMissingHomeMarker)) {
       payloadError('payload_missing_home', 'home marker is required');
     }
   } else {
@@ -634,7 +669,7 @@ export function validateCollectPayload(raw, manifest, {
     }
   }
   if (manifest.mode === ANNOTATION_MODE) {
-    return validateAnnotationPayload(raw, manifest);
+    return { ...validateAnnotationPayload(raw, manifest), landing };
   }
   if (!Array.isArray(raw.answers)) {
     payloadError('payload_count_mismatch', 'answers must be an array');
@@ -734,6 +769,7 @@ export function validateCollectPayload(raw, manifest, {
   return {
     entries: manifest.questions.map((question) => answersByKey.get(question.key)),
     note: requirePayloadNote(raw),
+    landing,
   };
 }
 

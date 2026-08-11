@@ -36,7 +36,7 @@ import {
 import { renderBoard } from './board.mjs';
 import { migrateLegacy } from './migration.mjs';
 
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 const PROGRAM = basename(process.argv[1] ?? 'lavish-axi');
 const SOURCE_WAKE_ADAPTER = fileURLToPath(
   new URL('../../../bin/fm-lavish-wake.sh', import.meta.url),
@@ -333,11 +333,18 @@ function sameBatch(answer, batch) {
   );
 }
 
-function landingCandidateId(name) {
+function landingCandidate(name) {
   let match = name.match(/^lavish-board-([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)\.payload\.json$/);
-  if (match !== null) return match[1];
+  if (match !== null) return { id: match[1] };
+  match = name.match(/^lavish-answer-([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)-([a-f0-9]{64})(?: \([0-9]+\))?\.json$/);
+  if (match !== null) {
+    return {
+      id: match[1],
+      requestSha256: `sha256:${match[2]}`,
+    };
+  }
   match = name.match(/^lavish-answer-([a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)(?: \([0-9]+\))?\.json$/);
-  if (match !== null) return match[1];
+  if (match !== null) return { id: match[1] };
   return undefined;
 }
 
@@ -381,30 +388,29 @@ async function discoverLandingCandidates(home) {
       continue;
     }
     for (const entry of entries) {
-      const id = landingCandidateId(entry.name);
-      if (id === undefined) continue;
+      const landing = landingCandidate(entry.name);
+      if (landing === undefined) continue;
       let path = join(directory.path, entry.name);
       try {
-        validateDecisionId(id);
+        validateDecisionId(landing.id);
         path = resolve(path);
         const info = await lstat(path);
         if (!info.isFile() || info.isSymbolicLink()) {
           errors.push({
-            id,
+            id: landing.id,
             path,
             error: 'payload_unsafe_file: candidate is not a regular file',
           });
           continue;
         }
-        candidates.push({ id, path, mtimeMs: info.mtimeMs });
+        candidates.push({ ...landing, path });
       } catch (error) {
-        errors.push({ id, path, error: `payload_scan_error: ${error.message}` });
+        errors.push({ id: landing.id, path, error: `payload_scan_error: ${error.message}` });
       }
     }
   }
   candidates.sort((left, right) => (
     left.id.localeCompare(right.id)
-    || (right.mtimeMs ?? 0) - (left.mtimeMs ?? 0)
     || left.path.localeCompare(right.path)
   ));
   return { candidates, errors };
@@ -507,10 +513,21 @@ async function recoverLandingPayloads(home) {
       }
     }
 
-    let selected;
+    const validatedCandidates = [];
     for (const routed of routedCandidates) {
       const { candidate, payload, legacy } = routed;
       if (legacy && payload.request_sha256 !== decision.manifest.request_sha256) continue;
+      if (
+        candidate.requestSha256 !== undefined
+        && candidate.requestSha256 !== decision.manifest.request_sha256
+      ) {
+        errors.push({
+          id,
+          status: 'payload-invalid',
+          detail: `${candidate.path}: payload_stale_request: filename request digest does not match the immutable manifest`,
+        });
+        continue;
+      }
       let batch;
       try {
         batch = validateCollectPayload(payload, decision.manifest, {
@@ -521,33 +538,45 @@ async function recoverLandingPayloads(home) {
         errors.push({ id, status: 'payload-invalid', detail: `${candidate.path}: ${error.message}` });
         continue;
       }
-      if (existingAnswer !== undefined) {
-        if (sameBatch(existingAnswer, batch)) {
-          continue;
-        } else {
-          errors.push({
-            id,
-            status: 'payload-conflict',
-            detail: `${candidate.path}: decision already has different answer content`,
-          });
-        }
-        continue;
-      }
-      if (selected !== undefined && !sameBatch(
+      validatedCandidates.push({ candidate, batch });
+    }
+
+    const payloadBound = validatedCandidates.filter((entry) => entry.batch.landing !== undefined);
+    const latestSubmittedAt = payloadBound.reduce(
+      (latest, entry) => Math.max(latest, entry.batch.landing.submittedAtMs),
+      Number.NEGATIVE_INFINITY,
+    );
+    const authorizedCandidates = payloadBound.length > 0
+      ? payloadBound.filter((entry) => entry.batch.landing.submittedAtMs === latestSubmittedAt)
+      : validatedCandidates;
+    const selected = authorizedCandidates[0];
+    for (const contender of authorizedCandidates.slice(1)) {
+      if (!sameBatch(
         { answers: selected.batch.entries, note: selected.batch.note },
-        batch,
+        contender.batch,
       )) {
         errors.push({
           id,
           status: 'payload-conflict',
-          detail: `${candidate.path}: multiple landing payloads disagree`,
+          detail: payloadBound.length > 0
+            ? `${contender.candidate.path}: equally authoritative landing payloads disagree`
+            : `${contender.candidate.path}: landing payloads disagree without payload authority`,
         });
-        continue;
       }
-      selected ??= { candidate, batch };
     }
 
-    if (existingAnswer === undefined && selected !== undefined) plans.push({ id, decision, selected });
+    if (selected === undefined) continue;
+    if (existingAnswer !== undefined) {
+      if (!sameBatch(existingAnswer, selected.batch)) {
+        errors.push({
+          id,
+          status: 'payload-conflict',
+          detail: `${selected.candidate.path}: decision already has different answer content`,
+        });
+      }
+      continue;
+    }
+    plans.push({ id, decision, selected });
   }
 
   if (errors.length > 0) {

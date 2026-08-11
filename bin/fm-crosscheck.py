@@ -1485,6 +1485,50 @@ def seed_private_uv_cache(source: Path, destination: Path, label: str) -> dict[s
                     f"{label} CANNOT-CERTIFY: Python dependency cache seed contains "
                     f"a non-file entry at {entry.path}"
                 )
+    file_count = 0
+    total_bytes = 0
+    destination_root = destination.resolve(strict=True)
+    pending_destinations = [destination_root]
+    while pending_destinations:
+        directory = pending_destinations.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: private Python cache seed cannot be "
+                f"audited at {directory}: {exc}"
+            )
+        for entry in entries:
+            entry_path = Path(entry.path)
+            try:
+                metadata = os.stat(entry_path, follow_symlinks=False)
+                resolved_entry = entry_path.resolve(strict=True)
+                resolved_entry.relative_to(destination_root)
+            except (OSError, ValueError) as exc:
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: private Python cache seed entry "
+                    f"escapes or cannot be audited at {entry_path}: {exc}"
+                )
+            file_count += 1
+            total_bytes += metadata.st_size
+            if file_count > maximum_files or total_bytes > maximum_bytes:
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: private Python cache seed exceeds "
+                    f"its bound after copying ({file_count} entries, {total_bytes} "
+                    f"bytes; limits {maximum_files} and {maximum_bytes})"
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                pending_destinations.append(entry_path)
+            elif not stat.S_ISREG(metadata.st_mode):
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: private Python cache seed contains "
+                    f"a non-file entry after copying at {entry_path}"
+                )
+            elif metadata.st_nlink != 1:
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: private Python cache seed contains "
+                    f"shared hard-linked state at {entry_path}"
+                )
     return {"files": file_count, "bytes": total_bytes}
 
 

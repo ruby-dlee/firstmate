@@ -246,7 +246,7 @@ It cannot modify the named test, conventional test trees, fixtures, or Crosschec
 Three designs were evaluated for the no-network Python proof boundary.
 
 1. Seed each review's private uv cache by copying from an already-resolved cache before dependency preparation.
-   This is the implemented design because it keeps all shared cache state read-only, bounds the copy by configured byte and entry limits, rejects special files and links escaping the source, and lets native `uv sync --locked --offline` select the exact lock closure from the private seed.
+   This is the implemented design because it keeps all shared cache state read-only, audits the completed copy against configured byte and entry limits, rejects symlinks, special files, escaping entries, and shared hard links, and lets native `uv sync --locked --offline` select the exact lock closure from the private seed.
    The seed may contain unrelated resolved artifacts, but neither dependency preparation nor proof execution can mutate or execute against the shared source, and proof execution cannot read either cache.
 2. Materialize a lock-backed virtualenv directly from the shared cache before proof execution, with copied package files and direct private-interpreter execution.
    This was rejected because uv may take cache locks or otherwise mutate its cache even in offline mode, leaving baseline, mutation, or concurrent reviews sharing writable dependency state.

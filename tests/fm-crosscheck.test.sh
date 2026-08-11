@@ -3215,6 +3215,35 @@ test_locked_python_dependency_preparation_clears_end_to_end() {
   [ -x "$sandbox_bin" ] \
     || fail "installed sandbox-exec is unavailable for the Python preparation proof"
   prepare_locked_python_fixture "$case_dir" "$uv_bin"
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$case_dir" <<'PY' \
+    || fail "private cache completion audit accepted raced copied state"
+import importlib.util
+import os
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+root = Path(sys.argv[2]) / "cache-race-audit"
+source = root / "source"
+destination = root / "destination"
+source.mkdir(parents=True)
+(source / "artifact").write_bytes(b"seed")
+os.environ["FM_CROSSCHECK_PYTHON_CACHE_MAX_BYTES"] = str(1024 * 1024)
+
+def raced_copy(_source, target, **_kwargs):
+    Path(target).write_bytes(b"x" * (1024 * 1024 + 1))
+
+module.shutil.copyfile = raced_copy
+try:
+    module.seed_private_uv_cache(source, destination, "cache-race")
+except module.CrosscheckCertificationError as exc:
+    assert "exceeds its bound after copying" in str(exc), exc
+else:
+    raise AssertionError("completed oversized cache seed was accepted")
+PY
   git -C "$case_dir/repo" add pyproject.toml uv.lock tests/test_private_dependency.py
   git -C "$case_dir/repo" commit -qm "add locked Python proof fixture"
   head=$(git -C "$case_dir/repo" rev-parse HEAD)

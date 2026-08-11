@@ -3089,6 +3089,18 @@ def reviewer_candidates(
     the exact readable reviewer identity selected here before launch.
     """
 
+    require(
+        not (
+            meta.get("harness") == "pi"
+            and meta.get("author_identity_snapshot_epoch")
+            == PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH
+            and "author_account_identity" not in meta
+        ),
+        "AUTHOR IDENTITY CAPTURE FAILED: modern Pi task metadata records the "
+        "launch-bound identity snapshot epoch without author_account_identity; "
+        "failed modern capture is inadmissible",
+    )
+
     if legacy_admission is not None:
         expected_admission_keys = {
             "author_account_independence",

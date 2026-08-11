@@ -1524,6 +1524,13 @@ except module.CrosscheckError as exc:
 else:
     raise AssertionError("legacy admission replaced a modern failed snapshot")
 try:
+    module.reviewer_candidates(home, modern_failed_snapshot_meta)
+except module.CrosscheckError as exc:
+    assert "AUTHOR IDENTITY CAPTURE FAILED" in str(exc), str(exc)
+    assert "failed modern capture is inadmissible" in str(exc), str(exc)
+else:
+    raise AssertionError("cross-provider review admitted a failed modern snapshot")
+try:
     module.reviewer_candidates(home, modern_meta, admission)
 except module.CrosscheckError as exc:
     assert "cannot downgrade or mismatch" in str(exc), str(exc)
@@ -1532,7 +1539,7 @@ else:
 try:
     module.reviewer_candidates(home, modern_failed_snapshot_meta, admission)
 except module.CrosscheckError as exc:
-    assert "cannot downgrade or mismatch" in str(exc), str(exc)
+    assert "AUTHOR IDENTITY CAPTURE FAILED" in str(exc), str(exc)
 else:
     raise AssertionError("direct legacy admission bypassed the modern snapshot epoch")
 

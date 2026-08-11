@@ -492,7 +492,7 @@ pause_absorb_class() {  # <window> <task>
 # fleet from making a registered pause permanently invisible. Away mode is excluded
 # because its daemon owns pause tracking and rechecks.
 reconcile_declared_pauses() {
-  local w task key last class absorb_class was_registered
+  local w task key last class was_registered
   afk_present && return 0
   while IFS= read -r w; do
     task=$(window_to_task "$w" "$STATE")
@@ -507,16 +507,17 @@ reconcile_declared_pauses() {
       paused)
         was_registered=1
         [ -e "$STATE/.paused-$key" ] || was_registered=0
+        if { [ "$was_registered" = 1 ] || [ -e "$STATE/.stale-since-$key" ]; } \
+           && [ "$(pause_absorb_class "$w" "$task")" = working ]; then
+          if [ -e "$STATE/.stale-$key" ] || [ -e "$STATE/.stale-since-$key" ]; then
+            clear_pause_state "$w"
+          fi
+          continue
+        fi
         register_declared_pause "$w"
         [ "$was_registered" = 1 ] \
           || triage_log "registered declared pause before exit-capable wake scans: $w"
-        absorb_class=$(pause_absorb_class "$w" "$task")
-        case "$absorb_class" in
-          paused) recheck_declared_pause "$w" "$task" ;;
-          working) ;;
-          none) clear_pause_tracking "$w" ;;
-          *) clear_pause_tracking "$w" ;;
-        esac
+        recheck_declared_pause "$w" "$task"
         ;;
       none) clear_pause_tracking "$w" ;;
       *) clear_pause_tracking "$w" ;;

@@ -17,7 +17,7 @@ No billable deployment was performed while producing this code.
 ## Current capacity evidence
 
 Live evidence was refreshed on 2026-08-11 without recording private scope identifiers.
-The seven authorized namespaces are registered.
+The ten provider namespaces required by the wrapper's live gate are registered.
 East US Total Regional vCPU quota was granted at 128 through ordinary self-service quota.
 The reviewed Dasv6 sizes are unrestricted in zones 1, 2, and 3, provide the required 2 vCPU/8 GiB and 4 vCPU/16 GiB x64 shapes, support Gen2 Trusted Launch, accelerated networking, Premium IO, and encryption at host, and have compatible zonal Premium SSD v2 capacity.
 The ordinary self-service `standardDav6Family` increase to 96 failed with `QuotaNotAvailableForResource`, leaving a family limit of 10.
@@ -40,8 +40,9 @@ The subscription deployment creates the East US resource group and a nested incr
 Mandatory tags identify workload, environment, cleanup ownership, deployment generation, immediate-acceptance activation, cost targets, and capacity reservations.
 The stable deployment generation, role, worker slot, VM, identity, and retained-disk tags are the integration seam for exact home, session, workspace, pane, VM, task, and generation binding.
 
-The always-on supervisor is trusted control-plane capacity.
-Persistent secondmates stay on that control plane and request elastic task workers.
+The optional supervisor in the `commissioning` and `full` profiles is trusted control-plane capacity.
+The default `foundation` profile creates no supervisor, and Firstmate and its persistent secondmates remain local.
+If a later profile activates the supervisor, persistent cloud secondmates stay on that control plane and request elastic task workers.
 A general worker hosts exactly one task-scoped crewmate plus minimal lifecycle supervision.
 A worker never hosts a secondmate, another supervisor, or a nested team.
 Worker OS capacity is disposable, while its LUKS2 task-state and provider-account disks detach and remain retained on VM deletion.
@@ -274,6 +275,7 @@ bin/fm-azure-pilot.sh recovery
 ```
 
 The recovery objective is a clean IaC rebuild, private re-enrollment, retained-disk adoption, and blob point-in-time restore in two hours, with the newest durable point no older than 15 minutes.
+Supervisor recovery applies only after an explicitly selected non-foundation profile creates one; the foundation profile keeps Firstmate local.
 The current Mac stays unchanged and reachable for 30 days after accepted cutover as rollback and Apple-only compatibility capacity.
 
 Full destruction is deliberately difficult and requires proof that state was exported, provider sessions were revoked, and retained disks may be deleted:

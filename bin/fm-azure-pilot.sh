@@ -379,7 +379,9 @@ PY
       [ "$family_limit" -ge "$REQUIRED_AUTHOR_FAMILY_VCPUS" ] || refuse "homogeneous full profile requires a 96-vCPU Dasv6 family limit"
     fi
   done < <(jq -r 'keys[]' <<<"$requirements")
-  if [ "$CAPACITY_PROFILE" = foundation ]; then
+  if [ "$COMMAND" = worker-create ]; then
+    [ "$worker_count" -eq 1 ] || refuse "worker-create must validate exactly one requested author worker"
+  elif [ "$CAPACITY_PROFILE" = foundation ]; then
     [ "$worker_count" -eq 0 ] || refuse "foundation profile must create zero author workers"
   elif [ "$CAPACITY_PROFILE" = commissioning ]; then
     [ "$declared_author_vcpus" -eq 10 ] || refuse "commissioning profile must declare exactly 10 author vCPUs"
@@ -751,9 +753,9 @@ run_worker_create() {
     refuse "worker slots above 2 require the explicitly selected full capacity profile"
   fi
   require_landed_code
-  live_gates
   WORKER_SLOTS_JSON=$(printf '[%s]' "$SLOT")
   WORKER_SKUS_JSON=$(jq -cn --arg sku "$(sku_for_slot "$SLOT")" '[$sku]')
+  live_gates
   make_parameters_file
   trap cleanup_parameters EXIT HUP INT TERM
   az deployment sub create \

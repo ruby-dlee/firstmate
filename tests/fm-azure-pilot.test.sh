@@ -182,6 +182,30 @@ PY
   pass "destroy cleanup order quiesces compute and protects retained state before group deletion"
 }
 
+run_worker_create_plan_gate_check() {
+  python3 - "$SCRIPT" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+worker_create = text.split("run_worker_create() {", 1)[1].split("\n}\n\nrun_worker_deallocate", 1)[0]
+steps = [
+    'WORKER_SLOTS_JSON=$(printf',
+    'WORKER_SKUS_JSON=$(jq',
+    'live_gates',
+    'make_parameters_file',
+    'az deployment sub create',
+]
+positions = [worker_create.index(step) for step in steps]
+assert positions == sorted(positions), positions
+
+quota_gate = text.split("quota_gate() {", 1)[1].split("\n}\n\nname_gate", 1)[0]
+assert '[ "$COMMAND" = worker-create ]' in quota_gate
+assert 'worker_count" -eq 1' in quota_gate
+PY
+  pass "worker-create validates its exact single-worker plan before deployment"
+}
+
 run_documentation_contract_checks() {
   assert_grep 'https://portal.azure.com' "$DOC" "portal-only quota fallback URL is missing"
   assert_grep 'InvalidSupportPlan' "$DOC" "support API blocker is missing"
@@ -199,6 +223,7 @@ pass "fm-azure-pilot local-validate executes"
 run_static_template_checks
 run_explicit_mutation_gate_checks
 run_safe_cleanup_order_check
+run_worker_create_plan_gate_check
 run_documentation_contract_checks
 
 echo "# fm-azure-pilot.test.sh: all assertions passed"

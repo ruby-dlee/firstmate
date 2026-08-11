@@ -12,7 +12,7 @@
 #
 # Required environment for cloud commands:
 #   FM_AZURE_TENANT_ID FM_AZURE_SUBSCRIPTION_ID FM_AZURE_ADMIN_EMAIL
-#   FM_AZURE_ADMIN_USERNAME FM_AZURE_ADMIN_SSH_PUBLIC_KEY FM_AZURE_OWNER_TAG
+#   FM_AZURE_ADMIN_USERNAME FM_AZURE_OWNER_TAG
 #   FM_AZURE_NAMING_PREFIX FM_AZURE_STORAGE_NAME FM_AZURE_KEY_VAULT_NAME
 #   FM_AZURE_DEPLOYMENT_GENERATION FM_AZURE_BUDGET_START_DATE
 # Optional:
@@ -87,7 +87,6 @@ require_cloud_environment() {
     FM_AZURE_SUBSCRIPTION_ID \
     FM_AZURE_ADMIN_EMAIL \
     FM_AZURE_ADMIN_USERNAME \
-    FM_AZURE_ADMIN_SSH_PUBLIC_KEY \
     FM_AZURE_OWNER_TAG \
     FM_AZURE_NAMING_PREFIX \
     FM_AZURE_STORAGE_NAME \
@@ -125,6 +124,7 @@ require_cloud_environment() {
   WORKER_SNAPSHOT_DIGEST=${FM_AZURE_WORKER_SNAPSHOT_DIGEST:-unbound}
   WORKER_COST_ATTRIBUTION=${FM_AZURE_WORKER_COST_ATTRIBUTION:-author}
   PROTECT_DURABLE_STATE=${FM_AZURE_PROTECT_DURABLE_STATE:-0}
+  INCREMENTAL_WORKER_DEPLOY=0
   RESOURCE_GROUP=${FM_AZURE_RESOURCE_GROUP:-rg-firstmate-pilot-eastus-001}
   REGION=eastus
   REQUIRED_REGIONAL_VCPUS=128
@@ -142,7 +142,7 @@ require_cloud_environment() {
   [[ "$FM_AZURE_KEY_VAULT_NAME" =~ ^[a-zA-Z][a-zA-Z0-9-]{1,22}[a-zA-Z0-9]$ ]] || refuse "Key Vault name does not satisfy the reviewed syntax"
   [[ "$FM_AZURE_DEPLOYMENT_GENERATION" =~ ^[a-zA-Z0-9-]{1,32}$ ]] || refuse "deployment generation contains unsupported characters"
   [[ "$FM_AZURE_BUDGET_START_DATE" =~ ^[0-9]{4}-[0-9]{2}-01$ ]] || refuse "budget start must be the first day of a month (YYYY-MM-01)"
-  case "$CAPACITY_PROFILE" in foundation|commissioning|full) ;; *) refuse "capacity profile must be commissioning or full" ;; esac
+  case "$CAPACITY_PROFILE" in foundation|commissioning|full) ;; *) refuse "capacity profile must be foundation, commissioning, or full" ;; esac
   case "$AUTHOR_CAPACITY_MODE" in mixed-current|homogeneous-dasv6) ;; *) refuse "author capacity mode must be mixed-current or homogeneous-dasv6" ;; esac
   case "$RUNNER_VALIDATION_SKU" in Standard_E8as_v6|Standard_E8s_v6) ;; *) refuse "runner validation SKU is not reviewed" ;; esac
   for binding in "$WORKER_HOME_BINDING" "$WORKER_TASK_BINDING" "$WORKER_INVOCATION_BINDING" "$WORKER_COST_ATTRIBUTION"; do
@@ -234,9 +234,9 @@ text = path.read_text(encoding="utf-8").lower()
 
 required_parameters = {
     "tenantId", "subscriptionId", "administratorNotificationEmail",
-    "adminUsername", "adminSshPublicKey", "ownerTag", "deploymentGeneration",
+    "adminUsername", "ownerTag", "deploymentGeneration",
     "namingPrefix", "storageAccountName", "keyVaultName", "capacityProfile",
-    "authorCapacityMode", "vmFamily", "workerSkus", "runnerValidationSku",
+    "authorCapacityMode", "vmFamily", "workerSkus", "incrementalWorkerDeploy", "runnerValidationSku",
     "workerHomeBinding", "workerTaskBinding", "workerInvocationBinding",
     "workerSnapshotDigest", "workerCostAttribution", "requiredRegionalFreeVcpus", "requiredAuthorFamilyFreeVcpus",
     "reservedLandingVcpus", "workerSlots", "commissioningBudgetCeilingUsd",
@@ -265,7 +265,7 @@ if data["parameters"]["steadyStateBudgetTargetUsd"].get("defaultValue") != 1000:
     raise SystemExit("steady-state budget target changed")
 if data["parameters"]["workerHourPlanningThreshold"].get("defaultValue") != 3500:
     raise SystemExit("worker-hour planning threshold changed")
-for forbidden in ("customdata", "publicipaddressconfiguration", "0.0.0.0/0", "allowblobpublicaccess\": true", "allowsharedkeyaccess\": true"):
+for forbidden in ("customdata", "publicipaddressconfiguration", "0.0.0.0/0", "authorized_keys", "allowblobpublicaccess\": true", "allowsharedkeyaccess\": true"):
     if forbidden in text:
         raise SystemExit(f"forbidden template content: {forbidden}")
 print("local validation: template JSON and fixed safety inputs are valid")
@@ -495,7 +495,6 @@ live_gates() {
   require_tool az
   require_tool jq
   require_tool python3
-  require_cloud_environment
   local_validate
   scope_gate
   provider_gate
@@ -507,9 +506,9 @@ live_gates() {
 }
 
 make_parameters_file() {
-  PARAMS_FILE=$(mktemp "${TMPDIR:-/tmp}/fm-azure-pilot-params.XXXXXX.json")
+  PARAMS_FILE=$(mktemp "${TMPDIR:-/tmp}/fm-azure-pilot-params.XXXXXX")
   chmod 600 "$PARAMS_FILE"
-  export WORKER_SLOTS_JSON WORKER_SKUS_JSON
+  export WORKER_SLOTS_JSON WORKER_SKUS_JSON INCREMENTAL_WORKER_DEPLOY
   python3 - "$PARAMS_FILE" <<'PY'
 import json
 import os
@@ -520,7 +519,6 @@ values = {
     "subscriptionId": os.environ["FM_AZURE_SUBSCRIPTION_ID"],
     "administratorNotificationEmail": os.environ["FM_AZURE_ADMIN_EMAIL"],
     "adminUsername": os.environ["FM_AZURE_ADMIN_USERNAME"],
-    "adminSshPublicKey": os.environ["FM_AZURE_ADMIN_SSH_PUBLIC_KEY"],
     "ownerTag": os.environ["FM_AZURE_OWNER_TAG"],
     "deploymentGeneration": os.environ["FM_AZURE_DEPLOYMENT_GENERATION"],
     "capacityProfile": os.environ.get("FM_AZURE_CAPACITY_PROFILE", "foundation"),
@@ -536,6 +534,7 @@ values = {
     "reservedLandingVcpus": 62,
     "workerSlots": json.loads(os.environ["WORKER_SLOTS_JSON"]),
     "workerSkus": json.loads(os.environ["WORKER_SKUS_JSON"]),
+    "incrementalWorkerDeploy": os.environ.get("INCREMENTAL_WORKER_DEPLOY", "0") == "1",
     "commissioningBudgetCeilingUsd": 1500,
     "steadyStateBudgetTargetUsd": int(os.environ.get("FM_AZURE_STEADY_STATE_BUDGET_TARGET_USD", "1000")),
     "workerHourPlanningThreshold": int(os.environ.get("FM_AZURE_WORKER_HOUR_PLANNING_THRESHOLD", "3500")),
@@ -611,6 +610,7 @@ require_landed_code() {
 }
 
 run_validate() {
+  require_cloud_environment
   live_gates
   make_parameters_file
   trap cleanup_parameters EXIT HUP INT TERM
@@ -627,9 +627,10 @@ run_validate() {
 
 run_preview() {
   local preview_file
+  require_cloud_environment
   live_gates
   make_parameters_file
-  preview_file=$(mktemp "${TMPDIR:-/tmp}/fm-azure-pilot-preview.XXXXXX.json")
+  preview_file=$(mktemp "${TMPDIR:-/tmp}/fm-azure-pilot-preview.XXXXXX")
   chmod 600 "$preview_file"
   trap 'rm -f "${preview_file:-}"; cleanup_parameters' EXIT HUP INT TERM
   az deployment sub what-if \
@@ -755,6 +756,7 @@ run_worker_create() {
   require_landed_code
   WORKER_SLOTS_JSON=$(printf '[%s]' "$SLOT")
   WORKER_SKUS_JSON=$(jq -cn --arg sku "$(sku_for_slot "$SLOT")" '[$sku]')
+  INCREMENTAL_WORKER_DEPLOY=1
   live_gates
   make_parameters_file
   trap cleanup_parameters EXIT HUP INT TERM
@@ -811,7 +813,7 @@ run_worker_delete() {
 }
 
 run_destroy() {
-  local vm disk
+  local vm disk vm_inventory disk_inventory
   require_tool az
   require_cloud_environment
   require_exact_confirmation --confirm-destroy "$@"
@@ -825,11 +827,24 @@ run_destroy() {
     refuse "full destroy retains encrypted task/account disks by default; pass both retained-disk deletion flags only after their contents are no longer needed"
   fi
 
+  vm_inventory=$(az vm list \
+    --subscription "$FM_AZURE_SUBSCRIPTION_ID" \
+    --resource-group "$RESOURCE_GROUP" \
+    --query '[].name' \
+    --output tsv \
+    --only-show-errors) || refuse "VM inventory failed; destroy did not mutate resources"
+  disk_inventory=$(az disk list \
+    --subscription "$FM_AZURE_SUBSCRIPTION_ID" \
+    --resource-group "$RESOURCE_GROUP" \
+    --query "[?tags.'disk-purpose'=='provider-account' || tags.'disk-purpose'=='task-state'].name" \
+    --output tsv \
+    --only-show-errors) || refuse "retained-disk inventory failed; destroy did not mutate resources"
+
   while IFS= read -r vm; do
     [ -n "$vm" ] || continue
     az vm deallocate --subscription "$FM_AZURE_SUBSCRIPTION_ID" --resource-group "$RESOURCE_GROUP" --name "$vm" --output none --only-show-errors
     az vm delete --subscription "$FM_AZURE_SUBSCRIPTION_ID" --resource-group "$RESOURCE_GROUP" --name "$vm" --yes --output none --only-show-errors
-  done < <(az vm list --subscription "$FM_AZURE_SUBSCRIPTION_ID" --resource-group "$RESOURCE_GROUP" --query '[].name' --output tsv --only-show-errors)
+  done <<<"$vm_inventory"
 
   az lock delete --subscription "$FM_AZURE_SUBSCRIPTION_ID" --resource-group "$RESOURCE_GROUP" --resource-type Microsoft.Storage/storageAccounts --resource-name "$FM_AZURE_STORAGE_NAME" --name state-storage-lock --output none --only-show-errors 2>/dev/null || true
   az lock delete --subscription "$FM_AZURE_SUBSCRIPTION_ID" --resource-group "$RESOURCE_GROUP" --resource-type Microsoft.KeyVault/vaults --resource-name "$FM_AZURE_KEY_VAULT_NAME" --name key-vault-lock --output none --only-show-errors 2>/dev/null || true
@@ -837,12 +852,7 @@ run_destroy() {
   while IFS= read -r disk; do
     [ -n "$disk" ] || continue
     az disk delete --subscription "$FM_AZURE_SUBSCRIPTION_ID" --resource-group "$RESOURCE_GROUP" --name "$disk" --yes --output none --only-show-errors
-  done < <(az disk list \
-    --subscription "$FM_AZURE_SUBSCRIPTION_ID" \
-    --resource-group "$RESOURCE_GROUP" \
-    --query "[?tags.'disk-purpose'=='provider-account' || tags.'disk-purpose'=='task-state'].name" \
-    --output tsv \
-    --only-show-errors)
+  done <<<"$disk_inventory"
 
   az group delete \
     --subscription "$FM_AZURE_SUBSCRIPTION_ID" \

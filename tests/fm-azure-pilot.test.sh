@@ -28,6 +28,9 @@ assert data["parameters"]["authorCapacityMode"]["defaultValue"] == "mixed-curren
 assert data["parameters"]["vmFamily"]["defaultValue"] == "Dasv6"
 assert data["parameters"]["workerSlots"]["defaultValue"] == []
 assert data["parameters"]["workerSkus"]["defaultValue"] == []
+assert data["parameters"]["incrementalWorkerDeploy"]["defaultValue"] is False
+assert "incrementalWorkerDeploy" in data["variables"]["capacityMatches"]
+assert "equals(length(parameters('workerSlots')), 1)" in data["variables"]["capacityMatches"]
 assert data["parameters"]["requiredRegionalFreeVcpus"]["defaultValue"] == 128
 assert data["parameters"]["requiredAuthorFamilyFreeVcpus"]["defaultValue"] == 96
 assert data["parameters"]["reservedLandingVcpus"]["defaultValue"] == 62
@@ -39,6 +42,7 @@ assert data["parameters"]["runnerValidationSku"]["defaultValue"] == "Standard_E8
 assert "defaultValue" not in json.dumps(data["parameters"]["tenantId"])
 assert "defaultValue" not in json.dumps(data["parameters"]["subscriptionId"])
 assert "defaultValue" not in json.dumps(data["parameters"]["administratorNotificationEmail"])
+assert "adminSshPublicKey" not in data["parameters"]
 assert not re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
 assert "stfm7c799deus01" not in lower
 assert "kv-fm-7c799d-eus" not in lower
@@ -78,7 +82,9 @@ for vm in vms:
     assert security["uefiSettings"]["secureBootEnabled"] is True
     assert security["uefiSettings"]["vTpmEnabled"] is True
     assert security["encryptionAtHost"] is True
-    assert "customData" not in vm["properties"].get("osProfile", {})
+    os_profile = vm["properties"].get("osProfile", {})
+    assert "customData" not in os_profile
+    assert "ssh" not in os_profile["linuxConfiguration"]
     for disk in vm["properties"]["storageProfile"]["dataDisks"]:
         assert disk["deleteOption"] == "Detach"
 
@@ -92,6 +98,28 @@ for marker in ("one-task-scoped-crewmate", "secondmate-placement", "home-binding
 for marker in ("snet-validation", "snet-validation-shards", "snet-policy-review", "snet-crosscheck-tools", "snet-networkless-verifier", "validation-evidence", "validation-shards", "crosscheck-evidence", "networkless-verifier"):
     assert marker in text
 assert all("validation" not in vm["name"].lower() and "review" not in vm["name"].lower() and "browser" not in vm["name"].lower() for vm in vms)
+
+vnet = next(resource for resource in resources if resource["type"] == "Microsoft.Network/virtualNetworks")
+verifier_subnet = next(subnet for subnet in vnet["properties"]["subnets"] if subnet["name"] == "snet-networkless-verifier")
+assert "verifierNsgName" in verifier_subnet["properties"]["networkSecurityGroup"]["id"]
+assert "natGateway" not in verifier_subnet["properties"]
+assert verifier_subnet["properties"]["defaultOutboundAccess"] is False
+verifier_nsg = next(resource for resource in nsgs if "verifierNsgName" in resource["name"])
+verifier_rules = verifier_nsg["properties"]["securityRules"]
+assert any(rule["name"] == "deny-all-outbound" and rule["properties"]["direction"] == "Outbound" and rule["properties"]["access"] == "Deny" and rule["properties"]["destinationAddressPrefix"] == "*" for rule in verifier_rules)
+
+alerts = [resource for resource in resources if resource["type"] == "Microsoft.Insights/scheduledQueryRules"]
+worker_alert = next(alert for alert in alerts if "worker-heartbeat" in alert["name"])
+worker_criterion = worker_alert["properties"]["criteria"]["allOf"][0]
+assert "workerCount" in worker_alert["condition"]
+assert worker_criterion["operator"] == "LessThan"
+assert "workerCount" in worker_criterion["threshold"]
+assert "ago(" not in worker_criterion["query"]
+sync_alert = next(alert for alert in alerts if "sync-age" in alert["name"])
+sync_criterion = sync_alert["properties"]["criteria"]["allOf"][0]
+assert sync_criterion["query"] == "FMStateSync_CL"
+assert sync_criterion["operator"] == "LessThan"
+assert sync_criterion["threshold"] == 1
 PY
   then
     fail "Azure template static invariants failed"
@@ -121,7 +149,6 @@ SH
       FM_AZURE_SUBSCRIPTION_ID="$sub" \
       FM_AZURE_ADMIN_EMAIL=private-notification \
       FM_AZURE_ADMIN_USERNAME=privateadmin \
-      FM_AZURE_ADMIN_SSH_PUBLIC_KEY=private-public-key \
       FM_AZURE_OWNER_TAG=owner \
       FM_AZURE_NAMING_PREFIX=fmtest \
       FM_AZURE_STORAGE_NAME=fmteststorage0001 \
@@ -182,28 +209,144 @@ PY
   pass "destroy cleanup order quiesces compute and protects retained state before group deletion"
 }
 
-run_worker_create_plan_gate_check() {
-  python3 - "$SCRIPT" <<'PY'
+write_sourceable_script() {
+  python3 - "$SCRIPT" "$1" <<'PY'
 from pathlib import Path
 import sys
 
 text = Path(sys.argv[1]).read_text(encoding="utf-8")
-worker_create = text.split("run_worker_create() {", 1)[1].split("\n}\n\nrun_worker_deallocate", 1)[0]
-steps = [
-    'WORKER_SLOTS_JSON=$(printf',
-    'WORKER_SKUS_JSON=$(jq',
-    'live_gates',
-    'make_parameters_file',
-    'az deployment sub create',
-]
-positions = [worker_create.index(step) for step in steps]
-assert positions == sorted(positions), positions
-
-quota_gate = text.split("quota_gate() {", 1)[1].split("\n}\n\nname_gate", 1)[0]
-assert '[ "$COMMAND" = worker-create ]' in quota_gate
-assert 'worker_count" -eq 1' in quota_gate
+assert "XXXXXX.json" not in text
+marker = '\ncase "$COMMAND" in\n'
+assert marker in text
+Path(sys.argv[2]).write_text(text.split(marker, 1)[0] + "\n", encoding="utf-8")
 PY
-  pass "worker-create validates its exact single-worker plan before deployment"
+}
+
+run_worker_create_plan_gate_check() {
+  local sourceable output status
+  sourceable=$(mktemp)
+  write_sourceable_script "$sourceable"
+  set +e
+  # Assignments below intentionally stay inside the isolated runtime-test subshell.
+  # shellcheck disable=SC2030
+  output=$(
+    (
+      set --
+      # shellcheck source=bin/fm-azure-pilot.sh
+      . "$sourceable"
+      export FM_AZURE_TENANT_ID FM_AZURE_SUBSCRIPTION_ID FM_AZURE_ADMIN_EMAIL
+      export FM_AZURE_ADMIN_USERNAME FM_AZURE_OWNER_TAG FM_AZURE_NAMING_PREFIX
+      export FM_AZURE_STORAGE_NAME FM_AZURE_KEY_VAULT_NAME FM_AZURE_DEPLOYMENT_GENERATION
+      export FM_AZURE_BUDGET_START_DATE FM_AZURE_CAPACITY_PROFILE FM_AZURE_AUTHOR_CAPACITY_MODE
+      FM_AZURE_TENANT_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+      FM_AZURE_SUBSCRIPTION_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+      FM_AZURE_ADMIN_EMAIL=private-notification
+      FM_AZURE_ADMIN_USERNAME=privateadmin
+      FM_AZURE_OWNER_TAG=owner
+      FM_AZURE_NAMING_PREFIX=fmtest
+      FM_AZURE_STORAGE_NAME=fmteststorage0001
+      FM_AZURE_KEY_VAULT_NAME=fm-test-vault-001
+      FM_AZURE_DEPLOYMENT_GENERATION=test-generation
+      FM_AZURE_BUDGET_START_DATE=2026-08-01
+      FM_AZURE_CAPACITY_PROFILE=foundation
+      FM_AZURE_AUTHOR_CAPACITY_MODE=mixed-current
+      require_cloud_environment
+      [ "$WORKER_SLOTS_JSON" = '[]' ]
+      [ "$WORKER_SKUS_JSON" = '[]' ]
+      WORKER_SLOTS_JSON='[3]'
+      WORKER_SKUS_JSON='["Standard_D4as_v7"]'
+      INCREMENTAL_WORKER_DEPLOY=1
+      require_tool() { :; }
+      local_validate() { :; }
+      scope_gate() { :; }
+      provider_gate() { :; }
+      sku_gate() {
+        [ "$WORKER_SKUS_JSON" = '["Standard_D4as_v7"]' ]
+      }
+      quota_gate() {
+        [ "$WORKER_SLOTS_JSON" = '[3]' ]
+      }
+      name_gate() { :; }
+      cost_gate() {
+        [ "$INCREMENTAL_WORKER_DEPLOY" -eq 1 ]
+      }
+      live_gates >/dev/null
+      make_parameters_file
+      python3 - "$PARAMS_FILE" <<'PY'
+import json
+import sys
+
+parameters = json.load(open(sys.argv[1], encoding="utf-8"))["parameters"]
+assert parameters["workerSlots"]["value"] == [3]
+assert parameters["workerSkus"]["value"] == ["Standard_D4as_v7"]
+assert parameters["incrementalWorkerDeploy"]["value"] is True
+assert "adminSshPublicKey" not in parameters
+PY
+      cleanup_parameters
+    ) 2>&1
+  )
+  status=$?
+  set -e
+  rm -f "$sourceable"
+  [ "$status" -eq 0 ] || fail "worker-create singleton plan was reset or rejected: $output"
+  pass "worker-create executes live gates and parameters with its exact singleton plan"
+}
+
+run_destroy_inventory_failure_checks() {
+  local sourceable mode call_log calls output status
+  sourceable=$(mktemp)
+  write_sourceable_script "$sourceable"
+  for mode in vm disk; do
+    call_log=$(mktemp)
+    set +e
+    output=$(
+      (
+        set --
+        # shellcheck source=bin/fm-azure-pilot.sh
+        . "$sourceable"
+        require_tool() { :; }
+        require_cloud_environment() {
+          FM_AZURE_SUBSCRIPTION_ID=private-subscription
+          RESOURCE_GROUP=private-resource-group
+          FM_AZURE_STORAGE_NAME=private-storage
+          FM_AZURE_KEY_VAULT_NAME=private-vault
+        }
+        require_exact_confirmation() {
+          STATE_EXPORT_CONFIRMED=1
+          PROVIDER_SESSIONS_REVOKED=1
+          DELETE_RETAINED_DISKS=1
+          CONFIRM_DELETE_RETAINED_DISKS=1
+        }
+        scope_gate() { :; }
+        az() {
+          printf '%s\n' "$*" >>"$call_log"
+          if [ "$1 $2 $mode" = "vm list vm" ]; then
+            return 42
+          fi
+          if [ "$1 $2 $mode" = "disk list disk" ]; then
+            return 43
+          fi
+          if [ "$1 $2" = "vm list" ]; then
+            printf 'worker-one\n'
+          elif [ "$1 $2" = "disk list" ]; then
+            printf 'disk-one\n'
+          fi
+        }
+        run_destroy
+      ) 2>&1
+    )
+    status=$?
+    set -e
+    calls=$(<"$call_log")
+    rm -f "$call_log"
+    [ "$status" -eq 2 ] || fail "destroy did not refuse a failed $mode inventory (status $status): $output"
+    assert_not_contains "$calls" "vm deallocate" "destroy mutated compute after a failed $mode inventory"
+    assert_not_contains "$calls" "lock delete" "destroy removed locks after a failed $mode inventory"
+    assert_not_contains "$calls" "disk delete" "destroy deleted disks after a failed $mode inventory"
+    assert_not_contains "$calls" "group delete" "destroy deleted the resource group after a failed $mode inventory"
+  done
+  rm -f "$sourceable"
+  pass "destroy preflights VM and retained-disk inventories before every mutation"
 }
 
 run_documentation_contract_checks() {
@@ -224,6 +367,7 @@ run_static_template_checks
 run_explicit_mutation_gate_checks
 run_safe_cleanup_order_check
 run_worker_create_plan_gate_check
+run_destroy_inventory_failure_checks
 run_documentation_contract_checks
 
 echo "# fm-azure-pilot.test.sh: all assertions passed"

@@ -26,12 +26,6 @@
         "description": "Local VM administrator name."
       }
     },
-    "adminSshPublicKey": {
-      "type": "secureString",
-      "metadata": {
-        "description": "SSH public key used only over the private overlay."
-      }
-    },
     "ownerTag": {
       "type": "string",
       "minLength": 1,
@@ -149,6 +143,13 @@
         "description": "Exact reviewed SKU for each worker slot; the scheduler must reject any incompatible or undersized value."
       }
     },
+    "incrementalWorkerDeploy": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Set only by the guarded worker-create command to admit exactly one requested worker without changing the profile-wide capacity contract."
+      }
+    },
     "commissioningBudgetCeilingUsd": {
       "type": "int",
       "defaultValue": 1500,
@@ -258,7 +259,7 @@
   },
   "variables": {
     "scopeMatches": "[and(equals(parameters('subscriptionId'), subscription().subscriptionId), equals(parameters('tenantId'), tenant().tenantId))]",
-    "capacityMatches": "[and(equals(length(parameters('workerSlots')), length(parameters('workerSkus'))), or(and(equals(parameters('capacityProfile'), 'foundation'), equals(length(parameters('workerSlots')), 0)), and(equals(parameters('capacityProfile'), 'commissioning'), equals(length(parameters('workerSlots')), 2)), and(equals(parameters('capacityProfile'), 'full'), equals(length(parameters('workerSlots')), 16))))]",
+    "capacityMatches": "[and(equals(length(parameters('workerSlots')), length(parameters('workerSkus'))), or(and(parameters('incrementalWorkerDeploy'), equals(length(parameters('workerSlots')), 1)), and(not(parameters('incrementalWorkerDeploy')), or(and(equals(parameters('capacityProfile'), 'foundation'), equals(length(parameters('workerSlots')), 0)), and(equals(parameters('capacityProfile'), 'commissioning'), equals(length(parameters('workerSlots')), 2)), and(equals(parameters('capacityProfile'), 'full'), equals(length(parameters('workerSlots')), 16))))))]",
     "safeResourceGroupName": "[if(and(variables('scopeMatches'), variables('capacityMatches')), parameters('resourceGroupName'), 'INVALID/SCOPE-OR-CAPACITY')]",
     "commonTags": {
       "workload": "firstmate",
@@ -321,9 +322,6 @@
           "adminUsername": {
             "value": "[parameters('adminUsername')]"
           },
-          "adminSshPublicKey": {
-            "value": "[parameters('adminSshPublicKey')]"
-          },
           "deploymentGeneration": {
             "value": "[parameters('deploymentGeneration')]"
           },
@@ -341,6 +339,9 @@
           },
           "workerSkus": {
             "value": "[parameters('workerSkus')]"
+          },
+          "incrementalWorkerDeploy": {
+            "value": "[parameters('incrementalWorkerDeploy')]"
           },
           "workerHourPlanningThreshold": {
             "value": "[parameters('workerHourPlanningThreshold')]"
@@ -398,9 +399,6 @@
             "adminUsername": {
               "type": "secureString"
             },
-            "adminSshPublicKey": {
-              "type": "secureString"
-            },
             "deploymentGeneration": {
               "type": "string"
             },
@@ -418,6 +416,9 @@
             },
             "workerSkus": {
               "type": "array"
+            },
+            "incrementalWorkerDeploy": {
+              "type": "bool"
             },
             "workerHourPlanningThreshold": {
               "type": "int"
@@ -464,6 +465,7 @@
             "supervisorNsgName": "[format('nsg-{0}-supervisor', parameters('namingPrefix'))]",
             "workerNsgName": "[format('nsg-{0}-workers', parameters('namingPrefix'))]",
             "elasticNsgName": "[format('nsg-{0}-elastic-isolated', parameters('namingPrefix'))]",
+            "verifierNsgName": "[format('nsg-{0}-networkless-verifier', parameters('namingPrefix'))]",
             "validationIdentityName": "[format('id-{0}-validation', parameters('namingPrefix'))]",
             "reviewIdentityName": "[format('id-{0}-policy-review', parameters('namingPrefix'))]",
             "browserIdentityName": "[format('id-{0}-crosscheck-tools', parameters('namingPrefix'))]",
@@ -601,6 +603,43 @@
               }
             },
             {
+              "type": "Microsoft.Network/networkSecurityGroups",
+              "apiVersion": "2023-09-01",
+              "name": "[variables('verifierNsgName')]",
+              "location": "[parameters('region')]",
+              "tags": "[union(parameters('commonTags'), createObject('capacity-class', 'networkless-verifier-scale-to-zero'))]",
+              "properties": {
+                "securityRules": [
+                  {
+                    "name": "deny-all-inbound",
+                    "properties": {
+                      "priority": 100,
+                      "access": "Deny",
+                      "direction": "Inbound",
+                      "protocol": "*",
+                      "sourcePortRange": "*",
+                      "destinationPortRange": "*",
+                      "sourceAddressPrefix": "*",
+                      "destinationAddressPrefix": "*"
+                    }
+                  },
+                  {
+                    "name": "deny-all-outbound",
+                    "properties": {
+                      "priority": 110,
+                      "access": "Deny",
+                      "direction": "Outbound",
+                      "protocol": "*",
+                      "sourcePortRange": "*",
+                      "destinationPortRange": "*",
+                      "sourceAddressPrefix": "*",
+                      "destinationAddressPrefix": "*"
+                    }
+                  }
+                ]
+              }
+            },
+            {
               "type": "Microsoft.Network/publicIPAddresses",
               "apiVersion": "2023-09-01",
               "name": "[variables('natPublicIpName')]",
@@ -646,7 +685,8 @@
                 "[resourceId('Microsoft.Network/natGateways', variables('natName'))]",
                 "[resourceId('Microsoft.Network/networkSecurityGroups', variables('supervisorNsgName'))]",
                 "[resourceId('Microsoft.Network/networkSecurityGroups', variables('workerNsgName'))]",
-                "[resourceId('Microsoft.Network/networkSecurityGroups', variables('elasticNsgName'))]"
+                "[resourceId('Microsoft.Network/networkSecurityGroups', variables('elasticNsgName'))]",
+                "[resourceId('Microsoft.Network/networkSecurityGroups', variables('verifierNsgName'))]"
               ],
               "properties": {
                 "addressSpace": {
@@ -745,7 +785,7 @@
                     "properties": {
                       "addressPrefix": "10.42.8.0/24",
                       "networkSecurityGroup": {
-                        "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('elasticNsgName'))]"
+                        "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('verifierNsgName'))]"
                       },
                       "privateEndpointNetworkPolicies": "Enabled",
                       "defaultOutboundAccess": false
@@ -1302,15 +1342,7 @@
                   "adminUsername": "[parameters('adminUsername')]",
                   "linuxConfiguration": {
                     "disablePasswordAuthentication": true,
-                    "provisionVMAgent": true,
-                    "ssh": {
-                      "publicKeys": [
-                        {
-                          "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
-                          "keyData": "[parameters('adminSshPublicKey')]"
-                        }
-                      ]
-                    }
+                    "provisionVMAgent": true
                   }
                 },
                 "storageProfile": {
@@ -1410,15 +1442,7 @@
                   "adminUsername": "[parameters('adminUsername')]",
                   "linuxConfiguration": {
                     "disablePasswordAuthentication": true,
-                    "provisionVMAgent": true,
-                    "ssh": {
-                      "publicKeys": [
-                        {
-                          "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
-                          "keyData": "[parameters('adminSshPublicKey')]"
-                        }
-                      ]
-                    }
+                    "provisionVMAgent": true
                   }
                 },
                 "storageProfile": {
@@ -1658,6 +1682,7 @@
               }
             },
             {
+              "condition": "[greater(variables('workerCount'), 0)]",
               "type": "Microsoft.Insights/scheduledQueryRules",
               "apiVersion": "2023-12-01",
               "name": "[format('alert-{0}-worker-heartbeat', parameters('namingPrefix'))]",
@@ -1679,10 +1704,10 @@
                 "criteria": {
                   "allOf": [
                     {
-                      "query": "[format('Heartbeat | where Computer startswith ''wkr-{0}-'' | summarize LastHeartbeat=max(TimeGenerated) by Computer | where LastHeartbeat < ago(10m)', parameters('namingPrefix'))]",
+                      "query": "[format('Heartbeat | where Computer startswith ''wkr-{0}-'' | summarize LastHeartbeat=max(TimeGenerated) by Computer', parameters('namingPrefix'))]",
                       "timeAggregation": "Count",
-                      "operator": "GreaterThan",
-                      "threshold": 0,
+                      "operator": "LessThan",
+                      "threshold": "[variables('workerCount')]",
                       "failingPeriods": {
                         "numberOfEvaluationPeriods": 1,
                         "minFailingPeriodsToAlert": 1
@@ -1720,10 +1745,10 @@
                 "criteria": {
                   "allOf": [
                     {
-                      "query": "FMStateSync_CL | summarize Latest=max(TimeGenerated) by Node_s | where Latest < ago(15m)",
+                      "query": "FMStateSync_CL",
                       "timeAggregation": "Count",
-                      "operator": "GreaterThan",
-                      "threshold": 0,
+                      "operator": "LessThan",
+                      "threshold": 1,
                       "failingPeriods": {
                         "numberOfEvaluationPeriods": 1,
                         "minFailingPeriodsToAlert": 1

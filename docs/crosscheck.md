@@ -190,8 +190,8 @@ A JavaScript or TypeScript mutation must resolve with its named test to one near
 A mixed JavaScript/Python mutation, a test outside the changed package, an ambiguous declaration, or a proof naming a different runner is `CANNOT-CERTIFY`, never `CLEAR`.
 A pytest proof with a tracked `.py` or `.pyi` test or mutation takes the lock-backed Python route.
 Crosscheck locates the uv project governing the named test and its nearest workspace `uv.lock`, requires both `pyproject.toml` and `uv.lock` to be tracked regular non-symlink exact-head inputs, and records their SHA-256 digests in the proof.
-Before each baseline or mutated proof execution, a separate no-network preparation sandbox runs installed uv with `sync --locked --offline --no-python-downloads --no-managed-python --link-mode copy` into `.crosscheck/python-env` in that proof checkout.
-Preparation alone can read and take uv's normal cache locks in an already-resolved cache source; proof execution receives no path to that cache and its sandbox explicitly denies cache reads.
+Before each baseline or mutated proof execution, Crosscheck makes a bounded file copy of an already-resolved uv cache into that proof checkout, then a separate no-network preparation sandbox runs installed uv with `sync --locked --offline --no-python-downloads --no-managed-python --link-mode copy` into `.crosscheck/python-env`.
+Preparation can write only the private cache seed; the shared source remains outside its writable policy, and proof execution explicitly denies reads from both caches.
 The environment audit bounds bytes and entry count, rejects dependency hard links and unexpected symlinks, requires `include-system-site-packages = false`, requires a non-managed interpreter outside isolated operator or reviewer state, and executes an isolated-mode inspection before accepting it.
 The proof then invokes that environment's Python directly as `python -I -m pytest`, with a private `HOME`, no ambient Python variables, no network, and read denials for the preparation cache, selected reviewer environment, ambient `VIRTUAL_ENV`, `PYTHONHOME`, and `PYTHONPATH` roots.
 The same lock digest, project digest, uv version, and bounded environment measurement must result in the independently recreated baseline and mutated checkouts.
@@ -245,18 +245,17 @@ It cannot modify the named test, conventional test trees, fixtures, or Crosschec
 
 Three designs were evaluated for the no-network Python proof boundary.
 
-1. Seed each review's private uv cache by copying from an already-resolved cache before proof execution.
-   This would keep the operator cache outside execution, but uv exposes no lock-closure export for its internal cache layout.
-   Copying the whole cache is not bounded by the reviewed lock, is often multi-gigabyte, and preserves stale unrelated entries whose provenance the gate would then need to re-establish.
-   It was rejected rather than disguising an opaque whole-cache copy as a lock-scoped seed.
-2. Materialize a lock-backed virtualenv before proof execution, with copied package files and direct private-interpreter execution.
-   This is the implemented design because `uv sync --locked --offline` is the resolver's native assertion that the tracked lock and project still agree, `--link-mode copy` ends dependency-state sharing, and `python -I -m pytest` removes uv and its source cache from the verdict boundary.
+1. Seed each review's private uv cache by copying from an already-resolved cache before dependency preparation.
+   This is the implemented design because it keeps all shared cache state read-only, bounds the copy by configured byte and entry limits, rejects special files and links escaping the source, and lets native `uv sync --locked --offline` select the exact lock closure from the private seed.
+   The seed may contain unrelated resolved artifacts, but neither dependency preparation nor proof execution can mutate or execute against the shared source, and proof execution cannot read either cache.
+2. Materialize a lock-backed virtualenv directly from the shared cache before proof execution, with copied package files and direct private-interpreter execution.
+   This was rejected because uv may take cache locks or otherwise mutate its cache even in offline mode, leaving baseline, mutation, or concurrent reviews sharing writable dependency state.
    A separate no-network preparation sandbox confines writes, and the stricter proof sandbox denies every preparation and ambient Python root named above.
 3. Export a content-addressed wheelhouse from the lock, verify it independently, then install from only that wheelhouse.
    This could preserve isolation more completely if every lock source had an authenticated wheel artifact, but current uv locks can contain source distributions, direct URLs, and workspace packages whose conversion requires build execution and creates a second dependency graph to authenticate.
    It was rejected for now because an incomplete wheelhouse route would silently narrow supported lock sources, while a complete one would duplicate uv's resolver and build provenance rather than strengthen this bounded fix.
 
-The implemented virtualenv route fails closed instead of trying the generic runner ladder when a tracked Python test has no usable lock-backed environment.
+The implemented private-seed and virtualenv route fails closed instead of trying the generic runner ladder when a tracked Python test has no usable lock-backed environment.
 Its durable `dependency_preparation` record makes the project path, lock path and digest, project digest, uv version, and environment bounds visible without persisting the operator cache path.
 
 ### Known Python limitation: the mutated pytest exit status is an inference, not proof

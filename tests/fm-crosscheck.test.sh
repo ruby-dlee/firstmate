@@ -3109,6 +3109,7 @@ ambient_python.mkdir(parents=True, exist_ok=True)
     "    raise AssertionError(f'sandbox exposed {path}')\n"
     "\n"
     f"denied_read({str(source_marker)!r})\n"
+    "denied_read('.crosscheck/python-cache/operator-cache-secret')\n"
     f"denied_read({str(reviewer_marker)!r})\n"
     f"denied_read({str(virtualenv_marker)!r})\n"
     "try:\n"
@@ -3285,6 +3286,8 @@ assert preparation["mode"] == "uv-sync-locked-offline-private-venv", preparation
 assert preparation["lockfile"] == "uv.lock", preparation
 assert len(preparation["lock_sha256"]) == 64, preparation
 assert preparation["environment_bytes"] > 2 * 1024 * 1024, preparation
+assert preparation["cache_seed_bytes"] > 0, preparation
+assert preparation["cache_seed_files"] > 0, preparation
 PY
 
   export FM_TEST_PYTHON_UV_BIN=$uv_bin

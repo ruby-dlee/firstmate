@@ -1356,7 +1356,9 @@ def resolve_uv_binary(label: str) -> Path:
     return candidate.resolve()
 
 
-def resolve_uv_cache_source(uv: Path, label: str, deadline: float) -> Path:
+def resolve_uv_cache_source(
+    uv: Path, label: str, deadline: float, inspection_root: Path
+) -> Path:
     """Resolve the already-populated cache used only by dependency preparation."""
 
     explicit = os.environ.get("FM_CROSSCHECK_UV_CACHE_SOURCE", "").strip()
@@ -1365,8 +1367,13 @@ def resolve_uv_cache_source(uv: Path, label: str, deadline: float) -> Path:
     else:
         environment = proof_environment()
         environment["PATH"] = isolated_tool_path()
-        inspected = run_command(
+        inspection_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        inspected = run_sandboxed(
             [str(uv), "cache", "dir", "--no-config"],
+            cwd=inspection_root,
+            profile_path=inspection_root / "uv-cache-source.sb",
+            allow_network=False,
+            allow_posix_ipc=False,
             env=environment,
             timeout=evidence_command_timeout(
                 deadline, 30, f"{label} uv cache source inspection"
@@ -1400,6 +1407,87 @@ def resolve_uv_cache_source(uv: Path, label: str, deadline: float) -> Path:
     return resolved
 
 
+def seed_private_uv_cache(source: Path, destination: Path, label: str) -> dict[str, int]:
+    """Copy a bounded cache seed without retaining shared writable state."""
+
+    maximum_bytes = private_python_environment_limit(
+        "FM_CROSSCHECK_PYTHON_CACHE_MAX_BYTES",
+        DEFAULT_PRIVATE_PYTHON_ENV_BYTES,
+        1024 * 1024,
+        8 * 1024 * 1024 * 1024,
+    )
+    maximum_files = private_python_environment_limit(
+        "FM_CROSSCHECK_PYTHON_CACHE_MAX_FILES",
+        DEFAULT_PRIVATE_PYTHON_ENV_FILES,
+        100,
+        1_000_000,
+    )
+    if os.path.lexists(destination):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: private Python cache seed preexists at "
+            f"{destination}"
+        )
+    destination.mkdir(parents=True, mode=0o700)
+    pending = [(source, destination)]
+    file_count = 0
+    total_bytes = 0
+    while pending:
+        source_directory, destination_directory = pending.pop()
+        try:
+            entries = list(os.scandir(source_directory))
+        except OSError as exc:
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: Python dependency cache seed cannot "
+                f"be inspected at {source_directory}: {exc}"
+            )
+        for entry in entries:
+            try:
+                metadata = os.stat(entry.path, follow_symlinks=False)
+            except OSError as exc:
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: Python dependency cache seed entry "
+                    f"cannot be inspected at {entry.path}: {exc}"
+                )
+            source_entry = Path(entry.path)
+            if stat.S_ISLNK(metadata.st_mode):
+                try:
+                    source_entry = source_entry.resolve(strict=True)
+                    source_entry.relative_to(source)
+                    metadata = os.stat(source_entry, follow_symlinks=False)
+                except (OSError, ValueError) as exc:
+                    cannot_certify(
+                        f"{label} CANNOT-CERTIFY: Python dependency cache seed "
+                        f"contains an escaping or unusable link at {entry.path}: {exc}"
+                    )
+            file_count += 1
+            total_bytes += metadata.st_size
+            if file_count > maximum_files or total_bytes > maximum_bytes:
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: Python dependency cache seed exceeds "
+                    f"its bound ({file_count} entries, {total_bytes} bytes; limits "
+                    f"{maximum_files} and {maximum_bytes})"
+                )
+            target = destination_directory / entry.name
+            if stat.S_ISDIR(metadata.st_mode):
+                target.mkdir(mode=metadata.st_mode & 0o777)
+                pending.append((source_entry, target))
+            elif stat.S_ISREG(metadata.st_mode):
+                try:
+                    shutil.copyfile(source_entry, target, follow_symlinks=False)
+                    os.chmod(target, metadata.st_mode & 0o777)
+                except OSError as exc:
+                    cannot_certify(
+                        f"{label} CANNOT-CERTIFY: Python dependency cache seed "
+                        f"cannot be copied from {entry.path}: {exc}"
+                    )
+            else:
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: Python dependency cache seed contains "
+                    f"a non-file entry at {entry.path}"
+                )
+    return {"files": file_count, "bytes": total_bytes}
+
+
 def python_isolation_roots(additional: tuple[Path, ...]) -> tuple[Path, ...]:
     """Collect ambient dependency and reviewer roots hidden from proof execution."""
 
@@ -1426,6 +1514,7 @@ def audit_private_python_environment(
     *,
     sensitive_roots: tuple[Path, ...],
     label: str,
+    checkout_root: Path,
 ) -> dict[str, int]:
     """Bound and validate a copied virtualenv before it enters the proof sandbox."""
 
@@ -1548,7 +1637,7 @@ def audit_private_python_environment(
             + isolated_tool_path(),
         }
     )
-    inspection = run_command(
+    inspection = run_sandboxed(
         [
             str(python),
             "-I",
@@ -1556,6 +1645,11 @@ def audit_private_python_environment(
             "import json,site,sys; print(json.dumps({"
             "'prefix':sys.prefix,'user':site.ENABLE_USER_SITE,'path':sys.path}))",
         ],
+        cwd=checkout_root,
+        profile_path=checkout_root / ".crosscheck" / "python-audit.sb",
+        allow_network=False,
+        allow_posix_ipc=False,
+        denied_read_roots=sensitive_roots,
         env=runtime_environment,
         timeout=30,
         description=f"{label} private Python environment inspection",
@@ -1626,14 +1720,16 @@ def prepare_python_invocation(
         checkout, lockfile, MAX_PYTHON_LOCK_BYTES, label
     )
     uv = resolve_uv_binary(label)
-    source_cache = resolve_uv_cache_source(uv, label, deadline)
     checkout_root = checkout.resolve()
+    private_root = checkout_root / ".crosscheck"
+    source_cache = resolve_uv_cache_source(
+        uv, label, deadline, private_root / "cache-inspection"
+    )
     if source_cache == checkout_root or source_cache.is_relative_to(checkout_root):
         cannot_certify(
             f"{label} CANNOT-CERTIFY: Python dependency cache source must remain "
             "outside the proof checkout"
         )
-    private_root = checkout_root / ".crosscheck"
     environment_root = private_root / "python-env"
     if os.path.lexists(environment_root):
         cannot_certify(
@@ -1642,7 +1738,11 @@ def prepare_python_invocation(
         )
     private_home = private_root / "python-home"
     private_home.mkdir(parents=True, mode=0o700, exist_ok=True)
-    proof_roots = python_isolation_roots((source_cache, *isolation_roots))
+    private_cache = private_root / "python-cache"
+    cache_size = seed_private_uv_cache(source_cache, private_cache, label)
+    proof_roots = python_isolation_roots(
+        (source_cache, private_cache, *isolation_roots)
+    )
     for root in proof_roots:
         if checkout_root == root or checkout_root.is_relative_to(root):
             cannot_certify(
@@ -1654,14 +1754,16 @@ def prepare_python_invocation(
         {
             "PATH": isolated_tool_path(),
             "HOME": str(private_home),
-            "UV_CACHE_DIR": str(source_cache),
+            "UV_CACHE_DIR": str(private_cache),
             "UV_PROJECT_ENVIRONMENT": str(environment_root),
             "UV_OFFLINE": "1",
             "UV_PYTHON_DOWNLOADS": "never",
             "UV_LINK_MODE": "copy",
         }
     )
-    prep_denied = tuple(root for root in proof_roots if root != source_cache)
+    prep_denied = tuple(
+        root for root in proof_roots if root not in (private_cache,)
+    )
     prepared = run_sandboxed(
         [
             str(uv),
@@ -1681,7 +1783,7 @@ def prepare_python_invocation(
         profile_path=private_root / "python-dependencies.sb",
         allow_network=False,
         allow_posix_ipc=False,
-        additional_writable_roots=(source_cache,),
+        additional_writable_roots=(private_cache,),
         denied_read_roots=prep_denied,
         env=preparation_environment,
         timeout=evidence_command_timeout(
@@ -1699,9 +1801,15 @@ def prepare_python_invocation(
         environment_root,
         sensitive_roots=proof_roots,
         label=label,
+        checkout_root=checkout_root,
     )
-    version = run_command(
+    version = run_sandboxed(
         [str(uv), "--version"],
+        cwd=checkout_root,
+        profile_path=private_root / "uv-version.sb",
+        allow_network=False,
+        allow_posix_ipc=False,
+        denied_read_roots=prep_denied,
         env=preparation_environment,
         timeout=30,
         description=f"{label} uv version inspection",
@@ -1730,6 +1838,8 @@ def prepare_python_invocation(
         "uv": version.stdout.strip(),
         "environment_files": environment_size["files"],
         "environment_bytes": environment_size["bytes"],
+        "cache_seed_files": cache_size["files"],
+        "cache_seed_bytes": cache_size["bytes"],
     }
     return (
         [

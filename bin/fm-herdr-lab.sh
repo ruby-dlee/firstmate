@@ -512,14 +512,16 @@ fm_herdr_lab_teardown() { # <session>
 }
 
 fm_herdr_lab_name() { # <label>
-  local label=${1:-lab}
+  local label=${1:-lab} pid_suffix random_suffix
   label=$(printf '%s' "$label" | tr -cd 'a-zA-Z0-9_-' | sed 's/^[^a-zA-Z0-9]*//; s/-*$//')
   [ -n "$label" ] || label=lab
   # Herdr nests the name below sessions/<name>/herdr.sock. Keep the readable
   # component bounded so macOS's 104-byte Unix-socket path limit is not spent
-  # by a long test filename; PID plus RANDOM retain per-run uniqueness.
+  # by a long test filename; bounded PID plus RANDOM retain per-run uniqueness.
   label=${label:0:24}
-  printf 'fm-lab-%s-%s-%s\n' "$label" "$$" "$RANDOM"
+  pid_suffix=$(( $$ % 1000000 ))
+  random_suffix=$(( RANDOM % 10000 ))
+  printf 'fm-lab-%s-%s-%s\n' "$label" "$pid_suffix" "$random_suffix"
 }
 
 fm_herdr_lab_usage() {

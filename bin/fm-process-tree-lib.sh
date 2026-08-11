@@ -2,6 +2,8 @@
 # Shared bounded command runner for operations whose descendants must be
 # terminated and reaped before the caller releases lifecycle or Git locks.
 # Usage: fm_run_bounded <positive-seconds> <command> [args...]
+# The inline supervisor samples its direct caller's liveness throughout the
+# bound and removes every owned temporary channel itself if that caller dies.
 # After every call, FM_PROCESS_TREE_CLEANUP_STATUS is verified, unverified, or
 # not-started, while the function return preserves the wrapped command status.
 
@@ -26,7 +28,7 @@ fm_process_tree_emit_snapshot() {
 }
 
 fm_run_bounded() {
-  local seconds=$1 result_file stdout_file stderr_file result status cleanup
+  local seconds=$1 result_file stdout_file stderr_file owner_output_file result status cleanup
   shift
   FM_PROCESS_TREE_CLEANUP_STATUS=not-started
   command -v perl >/dev/null 2>&1 || {
@@ -47,8 +49,13 @@ fm_run_bounded() {
     echo "error: cannot create bounded process-tree diagnostic channel" >&2
     return "$FM_PROCESS_TREE_SETUP_FAILURE_STATUS"
   }
+  owner_output_file=${FM_PROCESS_TREE_OWNER_OUTPUT_FILE:-}
   # shellcheck disable=SC2016
-  if FM_PROCESS_TREE_RESULT_FILE=$result_file perl -MPOSIX=:sys_wait_h -MErrno=EINTR -e '
+  if FM_PROCESS_TREE_RESULT_FILE=$result_file \
+    FM_PROCESS_TREE_STDOUT_FILE=$stdout_file \
+    FM_PROCESS_TREE_STDERR_FILE=$stderr_file \
+    FM_PROCESS_TREE_OWNER_OUTPUT_FILE=$owner_output_file \
+    perl -MPOSIX=:sys_wait_h -MErrno=EINTR -MTime::HiRes=time,ualarm -e '
     sub record_cleanup {
       my ($state) = @_;
       my $path = $ENV{FM_PROCESS_TREE_RESULT_FILE} || return;
@@ -147,12 +154,45 @@ fm_run_bounded() {
     }
     my $setup_failure = shift;
     my $timeout = shift;
+    # The shell normally reaps this foreground supervisor and removes its
+    # channels. The END guard owns the untrappable parent-loss fallback.
+    my $supervisor_pid = $$;
+    my $owner_pid = getppid();
+    my $owner_lost = 0;
+    my @owner_cleanup_files = grep { defined $_ && length $_ } map {
+      $ENV{$_}
+    } qw(
+      FM_PROCESS_TREE_RESULT_FILE
+      FM_PROCESS_TREE_STDOUT_FILE
+      FM_PROCESS_TREE_STDERR_FILE
+      FM_PROCESS_TREE_OWNER_OUTPUT_FILE
+    );
+    END {
+      if ($$ == $supervisor_pid && ($owner_lost || getppid() != $owner_pid)) {
+        unlink @owner_cleanup_files;
+      }
+    }
+    my $deadline = time() + $timeout;
     my $requested_status = 0;
-    local $SIG{ALRM} = sub { $requested_status ||= 124 };
+    my $pulse;
+    $pulse = sub {
+      if (getppid() != $owner_pid) {
+        $owner_lost = 1;
+        $requested_status ||= 143;
+        return;
+      }
+      if (time() >= $deadline) {
+        $requested_status ||= 124;
+        return;
+      }
+      ualarm(100_000);
+    };
+    local $SIG{ALRM} = $pulse;
     local $SIG{HUP} = sub { $requested_status ||= 129 };
     local $SIG{INT} = sub { $requested_status ||= 130 };
     local $SIG{QUIT} = sub { $requested_status ||= 131 };
     local $SIG{TERM} = sub { $requested_status ||= 143 };
+    ualarm(100_000);
     pipe my $ready_read, my $ready_write or die "ready pipe failed";
     pipe my $start_read, my $start_write or die "start pipe failed";
     pipe my $status_read, my $status_write or die "status pipe failed";
@@ -188,7 +228,12 @@ fm_run_bounded() {
         $SIG{INT} = "DEFAULT";
         $SIG{QUIT} = "DEFAULT";
         $SIG{TERM} = "DEFAULT";
-        delete $ENV{FM_PROCESS_TREE_RESULT_FILE};
+        delete @ENV{qw(
+          FM_PROCESS_TREE_RESULT_FILE
+          FM_PROCESS_TREE_STDOUT_FILE
+          FM_PROCESS_TREE_STDERR_FILE
+          FM_PROCESS_TREE_OWNER_OUTPUT_FILE
+        )};
         exec @ARGV;
         exit 127;
       }
@@ -248,7 +293,6 @@ fm_run_bounded() {
       print STDERR "error: cannot start bounded command under its process-group anchor\n";
       exit $setup_failure;
     }
-    alarm $timeout;
     my $status_text = "";
     while (!$requested_status && $status_text !~ /\n/) {
       my $chunk = "";
@@ -261,7 +305,6 @@ fm_run_bounded() {
       next if !defined $count && $! == EINTR;
       last;
     }
-    alarm 0;
     my $command_status;
     $command_status = 0 + $1 if $status_text =~ /^(\d+)\n/;
     my $anchor_state = terminate_owned($anchor, $anchor);
@@ -320,9 +363,11 @@ fm_run_bounded_capture() {
     return "$FM_PROCESS_TREE_SETUP_FAILURE_STATUS"
   }
   if [ "$combine" -eq 1 ]; then
-    if fm_run_bounded "$@" >"$output_file" 2>&1; then status=0; else status=$?; fi
+    if FM_PROCESS_TREE_OWNER_OUTPUT_FILE=$output_file \
+      fm_run_bounded "$@" >"$output_file" 2>&1; then status=0; else status=$?; fi
   else
-    if fm_run_bounded "$@" >"$output_file"; then status=0; else status=$?; fi
+    if FM_PROCESS_TREE_OWNER_OUTPUT_FILE=$output_file \
+      fm_run_bounded "$@" >"$output_file"; then status=0; else status=$?; fi
   fi
   output=$(cat "$output_file")
   rm -f "$output_file"

@@ -5,6 +5,8 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 HELPER=${FM_BOUNDED_IO_HELPER:-"$ROOT/bin/fm_bounded_io.py"}
+# shellcheck source=bin/fm-process-tree-lib.sh
+. "$ROOT/bin/fm-process-tree-lib.sh"
 
 # This module's hostile-JSON defense relies on CPython's integer/string
 # conversion limit, which first exists in 3.11, so it is only supported on
@@ -14,7 +16,19 @@ HELPER=${FM_BOUNDED_IO_HELPER:-"$ROOT/bin/fm_bounded_io.py"}
 . "$ROOT/bin/fm-crosscheck-python-lib.sh"
 PYTHON="$(fm_crosscheck_resolve_python)"
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+ACTIVE_CALLER=
+ACTIVE_SUPERVISOR=
+ACTIVE_COMMAND=
+
+cleanup() {
+  local process_id
+  for process_id in "$ACTIVE_SUPERVISOR" "$ACTIVE_COMMAND" "$ACTIVE_CALLER"; do
+    [ -n "$process_id" ] || continue
+    kill -TERM "$process_id" 2>/dev/null || true
+  done
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 
 fail() {
   echo "FAIL: $*" >&2
@@ -291,6 +305,191 @@ assert not unsafe, unsafe
 PY
 }
 
+test_shell_bounded_runner_reaps_and_removes_artifacts() {
+  local fixture case_root temp_dir status started supervisor output value
+  fixture="$TMP/process-tree-caller.sh"
+  cat > "$fixture" <<'SH'
+#!/usr/bin/env bash
+set -u
+root=$1
+temp_dir=$2
+command_pid_file=$3
+mode=$4
+# shellcheck source=bin/fm-process-tree-lib.sh
+. "$root/bin/fm-process-tree-lib.sh"
+captured=
+status=0
+if [ "$mode" = parent-loss ]; then
+  TMPDIR=$temp_dir fm_run_bounded_capture captured 20 sh -c '
+    printf "%s\n" "$$" > "$1"
+    sleep 20
+  ' sh "$command_pid_file" || status=$?
+else
+  TMPDIR=$temp_dir fm_run_bounded 20 sh -c '
+    printf "%s\n" "$$" > "$1"
+    sleep 20
+  ' sh "$command_pid_file" || status=$?
+fi
+printf '%s\n' "$status" > "$temp_dir/caller.status"
+exit "$status"
+SH
+  chmod +x "$fixture"
+  case_root="$TMP/process-tree-lifecycle"
+  mkdir -p "$case_root"
+
+  find_perl_child() {
+    ps -axo pid=,ppid=,comm= | awk -v owner="$1" '
+      $2 == owner && $3 ~ /(^|\/)perl$/ { print $1; exit }
+    '
+  }
+
+  wait_for_file() {
+    local path=$1 count=0
+    while [ ! -s "$path" ] && [ "$count" -lt 200 ]; do
+      sleep 0.01
+      count=$((count + 1))
+    done
+    [ -s "$path" ] || fail "bounded-runner fixture did not create $path"
+  }
+
+  wait_for_exit() {
+    local process_id=$1 label=$2 count=0
+    while kill -0 "$process_id" 2>/dev/null && [ "$count" -lt 600 ]; do
+      sleep 0.01
+      count=$((count + 1))
+    done
+    ! kill -0 "$process_id" 2>/dev/null \
+      || fail "$label remained alive as process $process_id"
+  }
+
+  assert_no_process_tree_artifacts() {
+    local path=$1
+    [ "$(find "$path" -type f -name 'fm-process-tree-*' | wc -l | tr -d ' ')" -eq 0 ] \
+      || fail "bounded runner left temporary artifacts under $path"
+  }
+
+  cat > "$case_root/record-supervisor.sh" <<'SH'
+#!/usr/bin/env bash
+anchor=$(ps -o ppid= -p "$$" | tr -d ' ')
+supervisor=$(ps -o ppid= -p "$anchor" | tr -d ' ')
+printf '%s\n' "$supervisor" >> "$1"
+SH
+  chmod +x "$case_root/record-supervisor.sh"
+
+  temp_dir="$case_root/completion"
+  mkdir -p "$temp_dir"
+  output="$temp_dir/supervisors"
+  TMPDIR=$temp_dir fm_run_bounded 2 "$case_root/record-supervisor.sh" "$output" \
+    >/dev/null 2>&1 || fail "successful bounded command failed"
+  [ "$FM_PROCESS_TREE_CLEANUP_STATUS" = verified ] \
+    || fail "successful bounded command did not verify cleanup"
+  supervisor=$(cat "$output")
+  wait_for_exit "$supervisor" "successful bounded supervisor"
+  assert_no_process_tree_artifacts "$temp_dir"
+
+  temp_dir="$case_root/failure"
+  mkdir -p "$temp_dir"
+  output="$temp_dir/supervisors"
+  status=0
+  TMPDIR=$temp_dir fm_run_bounded 2 bash -c \
+    "'$case_root/record-supervisor.sh' '$output'; exit 17" \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 17 ] || fail "bounded command failure status changed to $status"
+  [ "$FM_PROCESS_TREE_CLEANUP_STATUS" = verified ] \
+    || fail "failed bounded command did not verify cleanup"
+  supervisor=$(cat "$output")
+  wait_for_exit "$supervisor" "failed bounded supervisor"
+  assert_no_process_tree_artifacts "$temp_dir"
+
+  temp_dir="$case_root/timeout"
+  mkdir -p "$temp_dir"
+  output="$temp_dir/supervisors"
+  status=0
+  started=$($PYTHON -c 'import time; print(time.monotonic())')
+  TMPDIR=$temp_dir fm_run_bounded 1 bash -c \
+    "'$case_root/record-supervisor.sh' '$output'; sleep 20" \
+    >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 124 ] || fail "bounded timeout status changed to $status"
+  value=$($PYTHON -c 'import sys,time; print(time.monotonic()-float(sys.argv[1]))' "$started")
+  "$PYTHON" -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) < 5 else 1)' "$value" \
+    || fail "bounded supervisor outlived its timeout and cleanup allowance: ${value}s"
+  [ "$FM_PROCESS_TREE_CLEANUP_STATUS" = verified ] \
+    || fail "timed-out bounded command did not verify cleanup"
+  supervisor=$(cat "$output")
+  wait_for_exit "$supervisor" "timed-out bounded supervisor"
+  assert_no_process_tree_artifacts "$temp_dir"
+
+  temp_dir="$case_root/signal"
+  mkdir -p "$temp_dir"
+  "$fixture" "$ROOT" "$temp_dir" "$temp_dir/command.pid" signal \
+    >"$case_root/signal.out" 2>"$case_root/signal.err" &
+  ACTIVE_CALLER=$!
+  wait_for_file "$temp_dir/command.pid"
+  ACTIVE_COMMAND=$(cat "$temp_dir/command.pid")
+  supervisor=
+  for _ in $(seq 1 200); do
+    supervisor=$(find_perl_child "$ACTIVE_CALLER")
+    [ -n "$supervisor" ] && break
+    sleep 0.01
+  done
+  [ -n "$supervisor" ] || fail "signal fixture did not expose its Perl supervisor"
+  ACTIVE_SUPERVISOR=$supervisor
+  kill -TERM "$ACTIVE_SUPERVISOR"
+  status=0
+  wait "$ACTIVE_CALLER" || status=$?
+  [ "$status" -eq 143 ] || fail "signaled bounded caller returned $status instead of 143"
+  wait_for_exit "$ACTIVE_SUPERVISOR" "signaled bounded supervisor"
+  wait_for_exit "$ACTIVE_COMMAND" "signaled bounded command"
+  ACTIVE_CALLER=
+  ACTIVE_SUPERVISOR=
+  ACTIVE_COMMAND=
+  assert_no_process_tree_artifacts "$temp_dir"
+
+  temp_dir="$case_root/parent-loss"
+  mkdir -p "$temp_dir"
+  "$fixture" "$ROOT" "$temp_dir" "$temp_dir/command.pid" parent-loss \
+    >"$case_root/parent-loss.out" 2>"$case_root/parent-loss.err" &
+  ACTIVE_CALLER=$!
+  wait_for_file "$temp_dir/command.pid"
+  ACTIVE_COMMAND=$(cat "$temp_dir/command.pid")
+  supervisor=
+  for _ in $(seq 1 200); do
+    supervisor=$(find_perl_child "$ACTIVE_CALLER")
+    [ -n "$supervisor" ] && break
+    sleep 0.01
+  done
+  [ -n "$supervisor" ] || fail "parent-loss fixture did not expose its Perl supervisor"
+  ACTIVE_SUPERVISOR=$supervisor
+  kill -KILL "$ACTIVE_CALLER"
+  wait "$ACTIVE_CALLER" 2>/dev/null || true
+  ACTIVE_CALLER=
+  wait_for_exit "$ACTIVE_SUPERVISOR" "parent-loss bounded supervisor"
+  wait_for_exit "$ACTIVE_COMMAND" "parent-loss bounded command"
+  ACTIVE_SUPERVISOR=
+  ACTIVE_COMMAND=
+  assert_no_process_tree_artifacts "$temp_dir"
+
+  temp_dir="$case_root/repeated"
+  mkdir -p "$temp_dir"
+  output="$temp_dir/supervisors"
+  for iteration in $(seq 1 12); do
+    captured=
+    TMPDIR=$temp_dir fm_run_bounded_capture captured 2 bash -c \
+      "'$case_root/record-supervisor.sh' '$output'; printf 'run-%s' '$iteration'" \
+      || fail "repeated bounded capture $iteration failed"
+    [ "$captured" = "run-$iteration" ] \
+      || fail "repeated bounded capture $iteration returned malformed output"
+    [ "$FM_PROCESS_TREE_CLEANUP_STATUS" = verified ] \
+      || fail "repeated bounded capture $iteration did not verify cleanup"
+  done
+  [ "$(sort -u "$output" | wc -l | tr -d ' ')" -eq 12 ] \
+    || fail "repeated bounded invocations did not use distinct supervisors"
+  while IFS= read -r supervisor; do
+    wait_for_exit "$supervisor" "repeated bounded supervisor"
+  done < "$output"
+  assert_no_process_tree_artifacts "$temp_dir"
+}
+
 test_process_census_enforces_item_and_time_bounds() {
   "$PYTHON" - "$HELPER" <<'PY'
 import errno
@@ -338,6 +537,91 @@ except OSError as error:
     assert error.errno == errno.ETIMEDOUT, error
 else:
     raise AssertionError("process census deadline was not enforced during traversal")
+PY
+}
+
+test_partial_inventory_is_not_verified_empty() {
+  "$PYTHON" - "$HELPER" <<'PY'
+import importlib.util
+import sys
+import time
+
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("fm_bounded_io", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.os.getpid = lambda: 10
+module.os.getpgrp = lambda: 10
+module.os.getuid = lambda: 501
+old_process = (1, 1)
+ownership_started = (5, 0)
+module._darwin_process_table = lambda budget: {
+    20: (1, 20, 501, old_process),
+}
+argument_reads = []
+module._darwin_process_arguments = lambda process_id, budget: argument_reads.append(
+    process_id
+)
+verified_empty = module._darwin_owned_processes(
+    99,
+    "current-token",
+    {},
+    ownership_started,
+    module._ProcessCensusBudget(time.monotonic() + 1, maximum_argument_bytes=8),
+)
+assert verified_empty.complete, verified_empty
+assert verified_empty.processes == {}, verified_empty
+assert not verified_empty.gap, verified_empty
+assert not argument_reads, argument_reads
+
+current_process = (6, 0)
+module._darwin_process_table = lambda budget: {
+    21: (1, 21, 501, current_process),
+}
+
+
+def oversized_arguments(process_id, budget):
+    budget.consume_argument_bytes(9)
+    return b""
+
+
+module._darwin_process_arguments = oversized_arguments
+partial = module._darwin_owned_processes(
+    99,
+    "current-token",
+    {},
+    ownership_started,
+    module._ProcessCensusBudget(time.monotonic() + 1, maximum_argument_bytes=8),
+)
+assert not partial.complete, partial
+assert partial.processes == {}, partial
+assert "marker inventory stopped before process 21" in partial.gap, partial.gap
+assert "arguments inventory is oversized" in partial.gap, partial.gap
+
+signals = []
+module._reap_supervisor_children = lambda command_id, status: 0
+module._supervisor_owned_processes = lambda *args: module._OwnedProcessInventory(
+    {77: (7, 7)},
+    False,
+    "bounded marker scan omitted candidates",
+)
+module._signal_owned_processes = lambda *args: signals.append(args)
+status, verified, detail = module._supervisor_cleanup(
+    77,
+    "current-token",
+    time.monotonic() + 1,
+    0.1,
+    0,
+    {77: (7, 7)},
+    ownership_started,
+)
+assert status == 0, status
+assert not verified, verified
+assert "inventory is partial" in detail, detail
+assert "capability gap" in detail, detail
+assert "77" in detail, detail
+assert not signals, signals
 PY
 }
 
@@ -660,7 +944,9 @@ run_case() {
     selector-order) test_selector_failure_precedes_spawn ;;
     spawn-guard) test_input_validation_precedes_spawn ;;
     identity-signal) test_identity_bound_signaling_avoids_reused_pids ;;
+    shell-runner) test_shell_bounded_runner_reaps_and_removes_artifacts ;;
     census-bounds) test_process_census_enforces_item_and_time_bounds ;;
+    census-partial) test_partial_inventory_is_not_verified_empty ;;
     linux-census-stream) test_linux_child_inventory_streams_with_bounds ;;
     darwin-census-prune) test_darwin_descendant_refresh_prunes_stale_entries ;;
     partial-input) test_partial_input_writes_do_not_copy_remainder ;;
@@ -677,8 +963,8 @@ if [ "$#" -gt 0 ]; then
   run_case "$1"
 else
   for case_name in output-limit final-wait residual-group detached-tree \
-    batch-deadline selector-order spawn-guard identity-signal census-bounds \
-    linux-census-stream darwin-census-prune partial-input artifact \
+    batch-deadline selector-order spawn-guard identity-signal shell-runner \
+    census-bounds census-partial linux-census-stream darwin-census-prune partial-input artifact \
     artifact-open-race decoded-strings hostile-json batch-items; do
     run_case "$case_name"
   done

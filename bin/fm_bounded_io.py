@@ -785,7 +785,7 @@ def _request_anchor_abort(process: subprocess.Popen[bytes]) -> None:
     if not _anchor_group_is_owned(process):
         return
     try:
-        os.kill(process.pid, signal.SIGTERM)
+        os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
 

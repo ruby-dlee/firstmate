@@ -697,6 +697,7 @@ def write_sandbox_profile(
     allow_posix_ipc: bool = True,
     additional_writable_roots: tuple[Path, ...] = (),
     denied_read_roots: tuple[Path, ...] = (),
+    denied_write_roots: tuple[Path, ...] = (),
 ) -> None:
     rules = [
         "(version 1)",
@@ -719,6 +720,9 @@ def write_sandbox_profile(
     for writable_path in writable_paths:
         rules.append(f"  (subpath {json.dumps(str(writable_path))})")
     rules.extend(['  (literal "/dev/null"))', ""])
+    denied_write_paths = dict.fromkeys(root.resolve() for root in denied_write_roots)
+    for denied_path in denied_write_paths:
+        rules.append(f"(deny file-write* (subpath {json.dumps(str(denied_path))}))")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(rules), encoding="utf-8")
 
@@ -732,6 +736,7 @@ def run_sandboxed(
     allow_posix_ipc: bool = True,
     additional_writable_roots: tuple[Path, ...] = (),
     denied_read_roots: tuple[Path, ...] = (),
+    denied_write_roots: tuple[Path, ...] = (),
     env: dict[str, str] | None = None,
     timeout: float = 60,
     input_text: str | None = None,
@@ -745,6 +750,7 @@ def run_sandboxed(
         allow_posix_ipc=allow_posix_ipc,
         additional_writable_roots=additional_writable_roots,
         denied_read_roots=denied_read_roots,
+        denied_write_roots=denied_write_roots,
     )
     environment = (os.environ if env is None else env).copy()
     private_tmp = cwd / ".crosscheck" / "tmp"
@@ -1742,7 +1748,14 @@ def prepare_python_invocation(
     label: str,
     deadline: float,
     isolation_roots: tuple[Path, ...],
-) -> tuple[list[str], Path, dict[str, str], tuple[Path, ...], dict[str, Any]]:
+) -> tuple[
+    list[str],
+    Path,
+    dict[str, str],
+    tuple[Path, ...],
+    tuple[Path, ...],
+    dict[str, Any],
+]:
     """Materialize one lock-backed private environment before proof execution."""
 
     project = uv_project_for(checkout, test_file_path(test_path, label))
@@ -1896,6 +1909,7 @@ def prepare_python_invocation(
         checkout_root,
         runtime_environment,
         proof_roots,
+        (*proof_roots, environment_root),
         provenance,
     )
 
@@ -3064,6 +3078,7 @@ def execute_mutation_proof(
     baseline_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
     python_preparation: dict[str, Any] | None = None
     baseline_denied_roots: tuple[Path, ...] = ()
+    baseline_denied_write_roots: tuple[Path, ...] = ()
     python_route = (
         javascript_project is None
         and invocation["runner"] == "pytest"
@@ -3086,6 +3101,7 @@ def execute_mutation_proof(
             baseline_cwd,
             baseline_environment,
             baseline_denied_roots,
+            baseline_denied_write_roots,
             python_preparation,
         ) = prepare_python_invocation(
             proof_dir,
@@ -3110,6 +3126,7 @@ def execute_mutation_proof(
         allow_network=False,
         allow_posix_ipc=False,
         denied_read_roots=baseline_denied_roots,
+        denied_write_roots=baseline_denied_write_roots,
         env=baseline_environment,
         timeout=evidence_command_timeout(
             deadline, evidence_timeout(), f"{label} baseline test"
@@ -3157,6 +3174,7 @@ def execute_mutation_proof(
         f"{label} mutation changed a different path set between proof checkouts",
     )
     mutated_denied_roots: tuple[Path, ...] = ()
+    mutated_denied_write_roots: tuple[Path, ...] = ()
     mutated_python_preparation: dict[str, Any] | None = None
     if javascript_project is not None:
         mutated_argv, mutated_cwd, mutated_environment = prepare_jest_invocation(
@@ -3172,6 +3190,7 @@ def execute_mutation_proof(
             mutated_cwd,
             mutated_environment,
             mutated_denied_roots,
+            mutated_denied_write_roots,
             mutated_python_preparation,
         ) = prepare_python_invocation(
             proof_dir,
@@ -3197,6 +3216,7 @@ def execute_mutation_proof(
         allow_network=False,
         allow_posix_ipc=False,
         denied_read_roots=mutated_denied_roots,
+        denied_write_roots=mutated_denied_write_roots,
         env=mutated_environment,
         timeout=evidence_command_timeout(
             deadline, evidence_timeout(), f"{label} mutated test"

@@ -53,6 +53,27 @@ assert "spot" not in lower
 nested = next(resource for resource in data["resources"] if resource["type"] == "Microsoft.Resources/deployments")
 resources = nested["properties"]["template"]["resources"]
 
+supervisor_condition = "[and(not(parameters('incrementalWorkerDeploy')), not(equals(parameters('capacityProfile'), 'foundation')))]"
+supervisor_resource_names = {
+    "[variables('supervisorIdentityName')]",
+    "[variables('supervisorAccountDiskName')]",
+    "[variables('supervisorTaskDiskName')]",
+    "[variables('supervisorNicName')]",
+    "[variables('supervisorVmName')]",
+    "[format('{0}/AzureMonitorLinuxAgent', variables('supervisorVmName'))]",
+    "[format('alert-{0}-supervisor-heartbeat', parameters('namingPrefix'))]",
+    "[format('{0}/default/supervisor-state/Microsoft.Authorization/{1}', parameters('storageAccountName'), guid(resourceGroup().id, 'supervisor-state-writer'))]",
+    "[format('{0}/default/artifacts/Microsoft.Authorization/{1}', parameters('storageAccountName'), guid(resourceGroup().id, 'artifact-writer'))]",
+}
+supervisor_resources = [
+    resource for resource in resources
+    if resource.get("name") in supervisor_resource_names
+    or resource.get("scope") == "[format('Microsoft.Compute/virtualMachines/{0}', variables('supervisorVmName'))]"
+]
+assert len(supervisor_resources) == 10
+for resource in supervisor_resources:
+    assert resource.get("condition") == supervisor_condition, (resource["type"], resource["name"])
+
 nics = [resource for resource in resources if resource["type"] == "Microsoft.Network/networkInterfaces"]
 assert nics
 for nic in nics:
@@ -327,9 +348,9 @@ run_destroy_inventory_failure_checks() {
             return 43
           fi
           if [ "$1 $2" = "vm list" ]; then
-            printf 'worker-one\n'
+            printf '[{"name":"worker-one","osDisk":"worker-one-os"}]\n'
           elif [ "$1 $2" = "disk list" ]; then
-            printf 'disk-one\n'
+            printf '[{"name":"worker-one-os","purpose":null},{"name":"disk-one","purpose":"task-state"}]\n'
           fi
         }
         run_destroy
@@ -347,6 +368,54 @@ run_destroy_inventory_failure_checks() {
   done
   rm -f "$sourceable"
   pass "destroy preflights VM and retained-disk inventories before every mutation"
+}
+
+run_destroy_unknown_disk_check() {
+  local sourceable call_log calls output status
+  sourceable=$(mktemp)
+  call_log=$(mktemp)
+  write_sourceable_script "$sourceable"
+  set +e
+  output=$(
+    (
+      set --
+      # shellcheck source=bin/fm-azure-pilot.sh
+      . "$sourceable"
+      require_tool() { :; }
+      require_cloud_environment() {
+        FM_AZURE_SUBSCRIPTION_ID=private-subscription
+        RESOURCE_GROUP=private-resource-group
+        FM_AZURE_STORAGE_NAME=private-storage
+        FM_AZURE_KEY_VAULT_NAME=private-vault
+      }
+      require_exact_confirmation() {
+        STATE_EXPORT_CONFIRMED=1
+        PROVIDER_SESSIONS_REVOKED=1
+        DELETE_RETAINED_DISKS=1
+        CONFIRM_DELETE_RETAINED_DISKS=1
+      }
+      scope_gate() { :; }
+      az() {
+        printf '%s\n' "$*" >>"$call_log"
+        if [ "$1 $2" = "vm list" ]; then
+          printf '[{"name":"worker-one","osDisk":"worker-one-os"}]\n'
+        elif [ "$1 $2" = "disk list" ]; then
+          printf '[{"name":"worker-one-os","purpose":null},{"name":"unexpected","purpose":null}]\n'
+        fi
+      }
+      run_destroy
+    ) 2>&1
+  )
+  status=$?
+  set -e
+  calls=$(<"$call_log")
+  rm -f "$sourceable" "$call_log"
+  [ "$status" -eq 2 ] || fail "destroy did not refuse an unexpected disk (status $status): $output"
+  assert_not_contains "$calls" "vm deallocate" "destroy mutated compute after an unexpected disk"
+  assert_not_contains "$calls" "lock delete" "destroy removed locks after an unexpected disk"
+  assert_not_contains "$calls" "disk delete" "destroy deleted disks after an unexpected disk"
+  assert_not_contains "$calls" "group delete" "destroy deleted the resource group after an unexpected disk"
+  pass "destroy refuses an unexpected disk before every mutation"
 }
 
 run_documentation_contract_checks() {
@@ -368,6 +437,7 @@ run_explicit_mutation_gate_checks
 run_safe_cleanup_order_check
 run_worker_create_plan_gate_check
 run_destroy_inventory_failure_checks
+run_destroy_unknown_disk_check
 run_documentation_contract_checks
 
 echo "# fm-azure-pilot.test.sh: all assertions passed"

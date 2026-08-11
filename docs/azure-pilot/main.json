@@ -1100,7 +1100,7 @@
               }
             },
             {
-              "condition": "[not(equals(parameters('capacityProfile'), 'foundation'))]",
+              "condition": "[and(not(parameters('incrementalWorkerDeploy')), not(equals(parameters('capacityProfile'), 'foundation')))]",
               "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
               "apiVersion": "2023-01-31",
               "name": "[variables('supervisorIdentityName')]",
@@ -1155,7 +1155,7 @@
               "tags": "[union(parameters('commonTags'), createObject('firstmate-role', 'worker', 'selected-sku', parameters('workerSkus')[copyIndex()], 'resource-class', 'author-4vcpu-16gib-trustedlaunch', 'agent-capacity', 'one-task-scoped-crewmate', 'nested-team', 'forbidden'))]"
             },
             {
-              "condition": "[not(equals(parameters('capacityProfile'), 'foundation'))]",
+              "condition": "[and(not(parameters('incrementalWorkerDeploy')), not(equals(parameters('capacityProfile'), 'foundation')))]",
               "type": "Microsoft.Compute/disks",
               "apiVersion": "2023-10-02",
               "name": "[variables('supervisorAccountDiskName')]",
@@ -1179,7 +1179,7 @@
               }
             },
             {
-              "condition": "[not(equals(parameters('capacityProfile'), 'foundation'))]",
+              "condition": "[and(not(parameters('incrementalWorkerDeploy')), not(equals(parameters('capacityProfile'), 'foundation')))]",
               "type": "Microsoft.Compute/disks",
               "apiVersion": "2023-10-02",
               "name": "[variables('supervisorTaskDiskName')]",
@@ -1253,7 +1253,7 @@
               }
             },
             {
-              "condition": "[not(equals(parameters('capacityProfile'), 'foundation'))]",
+              "condition": "[and(not(parameters('incrementalWorkerDeploy')), not(equals(parameters('capacityProfile'), 'foundation')))]",
               "type": "Microsoft.Network/networkInterfaces",
               "apiVersion": "2023-09-01",
               "name": "[variables('supervisorNicName')]",
@@ -1306,7 +1306,7 @@
               }
             },
             {
-              "condition": "[not(equals(parameters('capacityProfile'), 'foundation'))]",
+              "condition": "[and(not(parameters('incrementalWorkerDeploy')), not(equals(parameters('capacityProfile'), 'foundation')))]",
               "type": "Microsoft.Compute/virtualMachines",
               "apiVersion": "2024-03-01",
               "name": "[variables('supervisorVmName')]",
@@ -1573,7 +1573,7 @@
               }
             },
             {
-              "condition": "[not(equals(parameters('capacityProfile'), 'foundation'))]",
+              "condition": "[and(not(parameters('incrementalWorkerDeploy')), not(equals(parameters('capacityProfile'), 'foundation')))]",
               "type": "Microsoft.Compute/virtualMachines/extensions",
               "apiVersion": "2024-03-01",
               "name": "[format('{0}/AzureMonitorLinuxAgent', variables('supervisorVmName'))]",
@@ -1610,7 +1610,7 @@
               }
             },
             {
-              "condition": "[not(equals(parameters('capacityProfile'), 'foundation'))]",
+              "condition": "[and(not(parameters('incrementalWorkerDeploy')), not(equals(parameters('capacityProfile'), 'foundation')))]",
               "type": "Microsoft.Insights/dataCollectionRuleAssociations",
               "apiVersion": "2023-03-11",
               "scope": "[format('Microsoft.Compute/virtualMachines/{0}', variables('supervisorVmName'))]",
@@ -1641,7 +1641,7 @@
               }
             },
             {
-              "condition": "[not(equals(parameters('capacityProfile'), 'foundation'))]",
+              "condition": "[and(not(parameters('incrementalWorkerDeploy')), not(equals(parameters('capacityProfile'), 'foundation')))]",
               "type": "Microsoft.Insights/scheduledQueryRules",
               "apiVersion": "2023-12-01",
               "name": "[format('alert-{0}-supervisor-heartbeat', parameters('namingPrefix'))]",
@@ -1844,7 +1844,7 @@
               }
             },
             {
-              "condition": "[not(equals(parameters('capacityProfile'), 'foundation'))]",
+              "condition": "[and(not(parameters('incrementalWorkerDeploy')), not(equals(parameters('capacityProfile'), 'foundation')))]",
               "type": "Microsoft.Storage/storageAccounts/blobServices/containers/providers/roleAssignments",
               "apiVersion": "2022-04-01",
               "name": "[format('{0}/default/supervisor-state/Microsoft.Authorization/{1}', parameters('storageAccountName'), guid(resourceGroup().id, 'supervisor-state-writer'))]",
@@ -1859,7 +1859,7 @@
               }
             },
             {
-              "condition": "[not(equals(parameters('capacityProfile'), 'foundation'))]",
+              "condition": "[and(not(parameters('incrementalWorkerDeploy')), not(equals(parameters('capacityProfile'), 'foundation')))]",
               "type": "Microsoft.Storage/storageAccounts/blobServices/containers/providers/roleAssignments",
               "apiVersion": "2022-04-01",
               "name": "[format('{0}/default/artifacts/Microsoft.Authorization/{1}', parameters('storageAccountName'), guid(resourceGroup().id, 'artifact-writer'))]",

@@ -813,7 +813,7 @@ run_worker_delete() {
 }
 
 run_destroy() {
-  local vm disk vm_inventory disk_inventory
+  local vm disk vm_inventory disk_inventory classified_inventory vm_names retained_disks
   require_tool az
   require_cloud_environment
   require_exact_confirmation --confirm-destroy "$@"
@@ -830,21 +830,66 @@ run_destroy() {
   vm_inventory=$(az vm list \
     --subscription "$FM_AZURE_SUBSCRIPTION_ID" \
     --resource-group "$RESOURCE_GROUP" \
-    --query '[].name' \
-    --output tsv \
+    --query '[].{name:name,osDisk:storageProfile.osDisk.name}' \
+    --output json \
     --only-show-errors) || refuse "VM inventory failed; destroy did not mutate resources"
   disk_inventory=$(az disk list \
     --subscription "$FM_AZURE_SUBSCRIPTION_ID" \
     --resource-group "$RESOURCE_GROUP" \
-    --query "[?tags.'disk-purpose'=='provider-account' || tags.'disk-purpose'=='task-state'].name" \
-    --output tsv \
+    --query '[].{name:name,purpose:tags."disk-purpose"}' \
+    --output json \
     --only-show-errors) || refuse "retained-disk inventory failed; destroy did not mutate resources"
+
+  classified_inventory=$(python3 - "$vm_inventory" "$disk_inventory" <<'PY'
+import json
+import sys
+
+try:
+    vms = json.loads(sys.argv[1])
+    disks = json.loads(sys.argv[2])
+    if not isinstance(vms, list) or not isinstance(disks, list):
+        raise ValueError("inventories must be arrays")
+    vm_names = []
+    os_disks = set()
+    for vm in vms:
+        name = vm.get("name") if isinstance(vm, dict) else None
+        os_disk = vm.get("osDisk") if isinstance(vm, dict) else None
+        if not isinstance(name, str) or not name or not isinstance(os_disk, str) or not os_disk:
+            raise ValueError("VM inventory entry is incomplete")
+        vm_names.append(name)
+        os_disks.add(os_disk)
+    if len(vm_names) != len(set(vm_names)) or len(os_disks) != len(vms):
+        raise ValueError("VM inventory contains duplicates")
+    disk_names = set()
+    retained = []
+    for disk in disks:
+        name = disk.get("name") if isinstance(disk, dict) else None
+        purpose = disk.get("purpose") if isinstance(disk, dict) else None
+        if not isinstance(name, str) or not name or name in disk_names:
+            raise ValueError("disk inventory entry is incomplete or duplicated")
+        disk_names.add(name)
+        if name in os_disks:
+            continue
+        if purpose not in ("provider-account", "task-state"):
+            raise ValueError(f"disk {name!r} is not an inventoried VM OS disk or authorized retained disk")
+        retained.append(name)
+    if not os_disks.issubset(disk_names):
+        raise ValueError("an inventoried VM OS disk is missing from the disk inventory")
+except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(1)
+
+print(json.dumps({"vmNames": vm_names, "retainedDisks": retained}, separators=(",", ":")))
+PY
+  ) || refuse "resource inventory classification failed; destroy did not mutate resources"
+  vm_names=$(jq -r '.vmNames[]?' <<<"$classified_inventory") || refuse "classified VM inventory is unreadable; destroy did not mutate resources"
+  retained_disks=$(jq -r '.retainedDisks[]?' <<<"$classified_inventory") || refuse "classified retained-disk inventory is unreadable; destroy did not mutate resources"
 
   while IFS= read -r vm; do
     [ -n "$vm" ] || continue
     az vm deallocate --subscription "$FM_AZURE_SUBSCRIPTION_ID" --resource-group "$RESOURCE_GROUP" --name "$vm" --output none --only-show-errors
     az vm delete --subscription "$FM_AZURE_SUBSCRIPTION_ID" --resource-group "$RESOURCE_GROUP" --name "$vm" --yes --output none --only-show-errors
-  done <<<"$vm_inventory"
+  done <<<"$vm_names"
 
   az lock delete --subscription "$FM_AZURE_SUBSCRIPTION_ID" --resource-group "$RESOURCE_GROUP" --resource-type Microsoft.Storage/storageAccounts --resource-name "$FM_AZURE_STORAGE_NAME" --name state-storage-lock --output none --only-show-errors 2>/dev/null || true
   az lock delete --subscription "$FM_AZURE_SUBSCRIPTION_ID" --resource-group "$RESOURCE_GROUP" --resource-type Microsoft.KeyVault/vaults --resource-name "$FM_AZURE_KEY_VAULT_NAME" --name key-vault-lock --output none --only-show-errors 2>/dev/null || true
@@ -852,7 +897,7 @@ run_destroy() {
   while IFS= read -r disk; do
     [ -n "$disk" ] || continue
     az disk delete --subscription "$FM_AZURE_SUBSCRIPTION_ID" --resource-group "$RESOURCE_GROUP" --name "$disk" --yes --output none --only-show-errors
-  done <<<"$disk_inventory"
+  done <<<"$retained_disks"
 
   az group delete \
     --subscription "$FM_AZURE_SUBSCRIPTION_ID" \

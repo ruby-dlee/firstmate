@@ -113,7 +113,7 @@ for command_name in basename chmod dirname find grep mkdir mktemp python3 rm; do
   ln -s "$(command -v "$command_name")" "$no_herdr_bin/$command_name"
 done
 status=0
-PATH="$no_herdr_bin" "$ROOT/tests/run.sh" "$probe_test" \
+FM_TEST_SKIP_HERDR=0 PATH="$no_herdr_bin" "$ROOT/tests/run.sh" "$probe_test" \
   >"$TMP_ROOT/missing-herdr.out" 2>"$TMP_ROOT/missing-herdr.err" || status=$?
 expect_code 1 "$status" "undeclared non-Herdr fallback"
 assert_contains "$(cat "$TMP_ROOT/missing-herdr.err")" "use --skip-herdr explicitly" \

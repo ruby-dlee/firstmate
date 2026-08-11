@@ -188,13 +188,16 @@ An approved runner is a NAME, and the gate resolves that name into an invocation
 Before either proof run, the gate applies the mutation in a disposable inspection checkout and selects the certification system from the mutated implementation paths themselves.
 A JavaScript or TypeScript mutation must resolve with its named test to one nearest tracked `package.json`, and that package's test script or dependencies must declare one unambiguous Jest or Vitest system.
 A mixed JavaScript/Python mutation, a test outside the changed package, an ambiguous declaration, or a proof naming a different runner is `CANNOT-CERTIFY`, never `CLEAR`.
-Python mutation behavior remains on its existing pytest route exactly as before.
-This matters because every Python repository in this fleet is uv-managed: a bare `pytest` is routinely absent there, while `uv run pytest` is the invocation that works, and `python3 -m pytest` cannot be expressed in the vocabulary at all because `python3` is a file runner whose command line puts the test path before its arguments.
-`pytest` therefore resolves through `uv run pytest`, then `python3 -m pytest`, then the bare binary.
-Order is load-bearing: inside a uv project a bare `pytest` can exist and resolve against a different environment than the repository uses, so finding it first would run the named test under an interpreter the project never selected.
-The uv rung is offered only when a uv project actually governs the named test, discovered by searching upward from that test to the checkout root, and it is passed to `uv run --project` so a monorepo service directory is selected without moving the working directory the test path is relative to.
-Each rung except the last identifies itself before being trusted; the last is the plain runner name and is accepted on presence, exactly as before, so the ladder can never turn a working setup into a refusal.
-Keeping the declared name is what preserves pytest's `path::selector` node-id support, which a separate runner name for module invocation would have silently dropped.
+A pytest proof with a tracked `.py` or `.pyi` test or mutation takes the lock-backed Python route.
+Crosscheck locates the uv project governing the named test and its nearest workspace `uv.lock`, requires both `pyproject.toml` and `uv.lock` to be tracked regular non-symlink exact-head inputs, and records their SHA-256 digests in the proof.
+Before each baseline or mutated proof execution, a separate no-network preparation sandbox runs installed uv with `sync --locked --offline --no-python-downloads --no-managed-python --link-mode copy` into `.crosscheck/python-env` in that proof checkout.
+Preparation alone can read and take uv's normal cache locks in an already-resolved cache source; proof execution receives no path to that cache and its sandbox explicitly denies cache reads.
+The environment audit bounds bytes and entry count, rejects dependency hard links and unexpected symlinks, requires `include-system-site-packages = false`, requires a non-managed interpreter outside isolated operator or reviewer state, and executes an isolated-mode inspection before accepting it.
+The proof then invokes that environment's Python directly as `python -I -m pytest`, with a private `HOME`, no ambient Python variables, no network, and read denials for the preparation cache, selected reviewer environment, ambient `VIRTUAL_ENV`, `PYTHONHOME`, and `PYTHONPATH` roots.
+The same lock digest, project digest, uv version, and bounded environment measurement must result in the independently recreated baseline and mutated checkouts.
+A missing, malformed, stale, oversized, preexisting, shared, or offline-unresolvable private environment is `CANNOT-CERTIFY`, never a baseline or mutation verdict.
+Non-Python fixtures and legacy runner shapes continue through the generic resolution ladder: pytest resolves through `uv run pytest`, then `python3 -m pytest`, then the bare binary.
+That generic ladder retains pytest node-id support, but it is not the dependency-certification route for a tracked Python test.
 That array must be empty for a mutation proof, and any entry is refused by name.
 The classified non-execution signal is a property of the runner's default exit semantics, and a supplied flag can change them: measured on pytest 9.1.1, a mutation raising during import of the named test's module exits 2 on its own but 1 under `--continue-on-collection-errors`, and 1 carries no classification, so the gate would certify a fix on a test that was never collected.
 A positional argument separately adds a second target, and `test_path` is the only target the gate validates as tracked, symlink-free, and unreachable by the mutation patch, so the verdict could come from a file the gate never validated.
@@ -223,6 +226,7 @@ A cold dependency cache, missing or ambiguous lockfile, preexisting runner, unav
 The gate invokes Jest with its own fixed `--runInBand --runTestsByPath --ci --no-cache --json` protocol and accepts a fix only when the baseline JSON reports at least one executed passing test and the mutated JSON reports at least one executed failing test.
 A Jest test that executes and stays green under the mutation is durably downgraded to `claimed-fixed`, keeping the finding and the run `blocking` instead of turning inadequate coverage into an infrastructure outcome.
 Proof sandboxes also omit shared POSIX IPC and give each run private writable temporary and cache state, while shared host temporary directories remain outside the write policy.
+For lock-backed Python proofs, the proof profile additionally denies reads from dependency-preparation and ambient Python roots, and `HOME` points at proof-private state rather than the operator or reviewer home.
 The named test must be a canonical tracked regular file; symlinks are rejected so a patch cannot mutate the executed target through an unchanged alias.
 Symlink rejection is anchored at the resolved review checkout, so a symlink inside the repository is still refused while a symlinked ancestor above the firstmate home is not mistaken for one.
 `test_path` may also be a `path::selector` node id for a runner that accepts one; every path-shaped check reads the part before `::` while the runner receives the full selector.
@@ -233,16 +237,35 @@ That matters in both directions: such a status must not condemn a baseline run, 
 Pytest uses the gate's measured usage and no-tests-collected exit statuses; Jest uses positive machine-readable executed-test counts instead of inferring execution from its exit code.
 Every other runner remains unable to certify until it has its own positive or measured non-execution protocol.
 The proof checkout starts as a fresh clone carrying tracked files only, and any language environment it needs must be reconstructed through the bounded routes above.
+The dependency-preparation sandbox and the test-execution sandbox are separate boundaries: preparation may materialize only into the private checkout from exact lock inputs, while execution receives only that copied environment and cannot reach the resolved cache source.
 The patch may modify only non-test implementation paths already cited by the durable finding.
 It cannot modify the named test, conventional test trees, fixtures, or Crosscheck evidence support.
+
+### Python dependency-preparation design evaluation
+
+Three designs were evaluated for the no-network Python proof boundary.
+
+1. Seed each review's private uv cache by copying from an already-resolved cache before proof execution.
+   This would keep the operator cache outside execution, but uv exposes no lock-closure export for its internal cache layout.
+   Copying the whole cache is not bounded by the reviewed lock, is often multi-gigabyte, and preserves stale unrelated entries whose provenance the gate would then need to re-establish.
+   It was rejected rather than disguising an opaque whole-cache copy as a lock-scoped seed.
+2. Materialize a lock-backed virtualenv before proof execution, with copied package files and direct private-interpreter execution.
+   This is the implemented design because `uv sync --locked --offline` is the resolver's native assertion that the tracked lock and project still agree, `--link-mode copy` ends dependency-state sharing, and `python -I -m pytest` removes uv and its source cache from the verdict boundary.
+   A separate no-network preparation sandbox confines writes, and the stricter proof sandbox denies every preparation and ambient Python root named above.
+3. Export a content-addressed wheelhouse from the lock, verify it independently, then install from only that wheelhouse.
+   This could preserve isolation more completely if every lock source had an authenticated wheel artifact, but current uv locks can contain source distributions, direct URLs, and workspace packages whose conversion requires build execution and creates a second dependency graph to authenticate.
+   It was rejected for now because an incomplete wheelhouse route would silently narrow supported lock sources, while a complete one would duplicate uv's resolver and build provenance rather than strengthen this bounded fix.
+
+The implemented virtualenv route fails closed instead of trying the generic runner ladder when a tracked Python test has no usable lock-backed environment.
+Its durable `dependency_preparation` record makes the project path, lock path and digest, project digest, uv version, and environment bounds visible without persisting the operator cache path.
 
 ### Known Python limitation: the mutated pytest exit status is an inference, not proof
 
 The Jest route uses positive JSON execution counts and does not share this limitation.
 Read the four Python guards above together and the shape of the remaining problem is visible.
 The pytest route concludes "the named test detected the regression" from one fact: the mutated run exited non-zero.
-That status is not a property of the test alone. It is influenced by reviewer-supplied argv, by the ambient environment, by repository and ancestor configuration, and by the runner's own version, and each of those four channels was closed only after it was found - a positional second target, a collection-error flag, `PYTEST_ADDOPTS`, and an ancestor ini file.
-An installed runner plugin is a known and accepted fifth door.
+That status is not a property of the test alone. It is influenced by reviewer-supplied argv, by the ambient environment, by repository configuration, and by the lock-pinned runner and plugins.
+The argument rule, constructed environment, neutral ancestor config, and private lock-backed environment close the known ambient channels, but a repository's own pytest configuration or locked plugin can still rewrite execution semantics.
 Closing channels one at a time is unbounded work with no completion criterion, so the list above should be read as hardening, not as a proof of soundness.
 
 The planned replacement is POSITIVE PROOF OF EXECUTION: requiring the mutated run to demonstrate that the named test actually ran, rather than inferring it from an exit code.
@@ -320,6 +343,11 @@ The read adapter exposes no merge subcommand; only the gate-refused `fm-crossche
 The installed reviewer invocation was exercised successfully with `--output-schema`, `--output-last-message`, `--model gpt-5.6-sol`, and `model_reasoning_effort="xhigh"` before production code used those flags.
 The installed Claude invocation was exercised successfully with a private `HOME`, selected-account `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `--model claude-opus-5`, `--effort xhigh`, `--dangerously-skip-permissions`, `--tools Bash,Read,Glob,Grep`, `--no-session-persistence`, `--output-format json`, and `--json-schema` before production code used those flags.
 The installed `/usr/bin/sandbox-exec` was also exercised with the generated profile: a write inside the allowed review directory succeeded, while sibling and `/private/tmp` writes failed with `Operation not permitted`.
+On 2026-08-11 the production Crosscheck run path was exercised end to end on exact finding `cc-aaaaaaaaaaaa` with a tracked Python test, tracked `pyproject.toml` and `uv.lock`, installed uv 0.9.10, and installed `/usr/bin/sandbox-exec`.
+A local package registry first populated a bounded resolved cache and was then removed.
+The pre-fix `uv run` shape, under a fresh private `XDG_CACHE_HOME`, `--offline`, and the installed no-network profile, failed to download the locked pytest wheel and emitted no `LOCKED-NAMED-CONTROL-RAN` marker.
+The fixed path prepared independent copied virtualenvs from the same exact lock, denied the cache, reviewer home, ambient virtualenv, ambient `PYTHONPATH`, and a socket connection during proof execution, then recorded baseline exit 0, mutated exit 1, the control marker in both outputs, lifecycle `verified-fixed`, and run state `clear`.
+The same production-path case removed the lock, made it stale, malformed it, lowered the environment-size bound below the resolved payload, and supplied an empty cache; every attempt recorded `cannot-certify` while leaving the exact finding open.
 On 2026-08-09 the Jest mutation route was exercised at relvino PR 1049 head `5649c234b0f258cde4d62870759e353fade5ff3d` in a fresh exact-head clone.
 The gate selected Node 20.20.2 for the package's `20.x` declaration, used npm 10.8.2 and the tracked package lock to materialize Jest 29.7.0 offline with lifecycle scripts disabled, and ran the fixed `--runInBand --runTestsByPath --ci --no-cache --json` protocol under the no-network sandbox.
 The tracked `V3PreviewPane.test.tsx` reported 33 executed and zero failed tests at baseline; replacing the session key with one shared key reported the same 33 executed tests with two failures, so the result demonstrated positive mutation detection rather than a runner-status inference.
@@ -340,7 +368,9 @@ Its `test_preexisting_jest_runner_cannot_certify` case proves that a committed J
 Its `test_local_transitive_jest_package_cannot_certify` case keeps top-level Jest registry-authenticated while substituting a local `jest-cli`, and proves that every transitive runtime package must remain inside the authenticated closure.
 Its `test_jest_runs_under_declared_node_major` case proves the selected Node path governs installation and both proof executions.
 Its `test_typescript_without_usable_route_is_cannot_certify` case proves that an unsupported package-governed route writes and reports `CANNOT-CERTIFY` rather than silently clearing or manufacturing a code verdict.
-Its `test_python_mutation_proof_is_byte_exact` case compares the complete normalized Python proof record to the pre-Jest shape so the new language route cannot drift existing pytest evidence.
+Its `test_python_mutation_proof_is_byte_exact` case compares the complete normalized generic pytest proof record to the pre-Jest shape so the language routing cannot drift legacy evidence.
+Its `test_locked_python_dependency_preparation_clears_end_to_end` case uses the production run path, installed uv, installed sandbox, a stopped local package registry, and observed-shape GitHub and reviewer doubles.
+It reproduces the fresh-cache collection failure before the named control, reaches `verified-fixed` through a private lock-backed environment, proves the execution sandbox denies network and preparation or ambient Python state, and proves missing, stale, malformed, oversized, and empty-cache inputs remain `cannot-certify`.
 Its `test_claude_execution_home_always_binds_the_keychain` case is the named regression for the private-`HOME` Keychain bind, and it fails if the bind is made conditional on `.credentials.json` again.
 Its `test_moved_default_branch_stays_reviewable` case is the named regression for base drift: it advances the fake default branch past the PR's branch point, then requires the run to review against the merge base, record it, and still verify.
 Its `test_unavailable_reviewer_fails_over_to_the_next_account` case covers reviewer failover using the observed zero-turn Claude error envelope, and asserts the ledger records the abandoned attempt with the reason the reviewer reported rather than a truncated envelope.

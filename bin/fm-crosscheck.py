@@ -58,6 +58,10 @@ MAX_PROJECTED_FINDINGS = 512
 MAX_PROJECTED_EVENTS = 8
 MAX_REVIEW_ITEMS = 32
 MAX_EVIDENCE_ITEMS = 32
+MAX_PYTHON_PROJECT_BYTES = 1024 * 1024
+MAX_PYTHON_LOCK_BYTES = 16 * 1024 * 1024
+DEFAULT_PRIVATE_PYTHON_ENV_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_PRIVATE_PYTHON_ENV_FILES = 250_000
 TEST_RUNNERS = {
     "bash",
     "bun",
@@ -692,6 +696,7 @@ def write_sandbox_profile(
     allow_network: bool,
     allow_posix_ipc: bool = True,
     additional_writable_roots: tuple[Path, ...] = (),
+    denied_read_roots: tuple[Path, ...] = (),
 ) -> None:
     rules = [
         "(version 1)",
@@ -699,6 +704,9 @@ def write_sandbox_profile(
         "(allow process*)",
         "(allow file-read*)",
     ]
+    denied_paths = dict.fromkeys(root.resolve() for root in denied_read_roots)
+    for denied_path in denied_paths:
+        rules.append(f"(deny file-read* (subpath {json.dumps(str(denied_path))}))")
     if allow_network:
         rules.append("(allow network*)")
     rules.extend(["(allow sysctl-read)", "(allow mach-lookup)"])
@@ -723,6 +731,7 @@ def run_sandboxed(
     allow_network: bool,
     allow_posix_ipc: bool = True,
     additional_writable_roots: tuple[Path, ...] = (),
+    denied_read_roots: tuple[Path, ...] = (),
     env: dict[str, str] | None = None,
     timeout: float = 60,
     input_text: str | None = None,
@@ -735,6 +744,7 @@ def run_sandboxed(
         allow_network=allow_network,
         allow_posix_ipc=allow_posix_ipc,
         additional_writable_roots=additional_writable_roots,
+        denied_read_roots=denied_read_roots,
     )
     environment = (os.environ if env is None else env).copy()
     private_tmp = cwd / ".crosscheck" / "tmp"
@@ -786,6 +796,20 @@ def proof_environment() -> dict[str, str]:
         for name in PROOF_ENVIRONMENT_ALLOWLIST
         if name in os.environ
     }
+
+
+def isolated_tool_path() -> str:
+    """Return the system-only tool path used for dependency preparation."""
+
+    return os.pathsep.join(
+        dict.fromkeys(
+            [
+                "/usr/local/bin",
+                "/opt/homebrew/bin",
+                *os.defpath.split(os.pathsep),
+            ]
+        )
+    )
 
 
 def write_neutral_runner_config(root: Path) -> None:
@@ -1238,6 +1262,488 @@ def uv_project_for(checkout: Path, test_path: str) -> Path | None:
         if directory == checkout:
             return None
         directory = directory.parent
+
+
+def uv_lock_for(checkout: Path, project: Path) -> Path | None:
+    """Return the lock governing a uv project, including a workspace parent."""
+
+    checkout = checkout.resolve()
+    directory = project.resolve()
+    while directory.is_relative_to(checkout):
+        lockfile = directory / "uv.lock"
+        if lockfile.is_file():
+            return lockfile
+        if directory == checkout:
+            return None
+        directory = directory.parent
+    return None
+
+
+def private_python_environment_limit(
+    name: str, default: int, minimum: int, maximum: int
+) -> int:
+    raw = environment_value(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        tool_fail(f"{name} must be an integer")
+    if not minimum <= value <= maximum:
+        tool_fail(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def tracked_python_input(
+    checkout: Path, path: Path, maximum_bytes: int, label: str
+) -> str:
+    """Validate one exact-head Python environment input and return its digest."""
+
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Python dependency input is unavailable at "
+            f"{path}: {exc}"
+        )
+    if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Python dependency input must be a regular "
+            f"non-symlink file at {path}"
+        )
+    if metadata.st_size > maximum_bytes:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Python dependency input exceeds the "
+            f"{maximum_bytes}-byte bound at {path}"
+        )
+    checkout_root = checkout.resolve()
+    try:
+        relative = path.resolve().relative_to(checkout_root).as_posix()
+    except ValueError:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Python dependency input escapes the proof "
+            f"checkout at {path}"
+        )
+    tracked = run_command(
+        ["git", "-C", str(checkout_root), "ls-files", "--error-unmatch", relative],
+        timeout=60,
+        description=f"{label} tracked Python dependency input inspection",
+    )
+    if tracked.returncode != 0:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Python dependency input is not tracked at "
+            f"{relative}"
+        )
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Python dependency input could not be read "
+            f"at {path}: {exc}"
+        )
+
+
+def resolve_uv_binary(label: str) -> Path:
+    requested = environment_value("FM_CROSSCHECK_UV_BIN", "uv")
+    if "/" in requested:
+        candidate = Path(requested)
+    else:
+        resolved = shutil.which(requested)
+        candidate = Path(resolved) if resolved is not None else Path(requested)
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: no runnable lock-backed uv dependency "
+            f"preparer exists at FM_CROSSCHECK_UV_BIN={requested!r}"
+        )
+    return candidate.resolve()
+
+
+def resolve_uv_cache_source(uv: Path, label: str, deadline: float) -> Path:
+    """Resolve the already-populated cache used only by dependency preparation."""
+
+    explicit = os.environ.get("FM_CROSSCHECK_UV_CACHE_SOURCE", "").strip()
+    if explicit:
+        source = Path(explicit).expanduser()
+    else:
+        environment = proof_environment()
+        environment["PATH"] = isolated_tool_path()
+        inspected = run_command(
+            [str(uv), "cache", "dir", "--no-config"],
+            env=environment,
+            timeout=evidence_command_timeout(
+                deadline, 30, f"{label} uv cache source inspection"
+            ),
+            description=f"{label} uv cache source inspection",
+        )
+        lines = [line.strip() for line in inspected.stdout.splitlines() if line.strip()]
+        if inspected.returncode != 0 or len(lines) != 1:
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: uv did not identify one dependency "
+                f"cache source: {(inspected.stderr or inspected.stdout).strip()[:500]}"
+            )
+        source = Path(lines[0])
+    if not source.is_absolute():
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Python dependency cache source must be absolute"
+        )
+    try:
+        metadata = os.stat(source, follow_symlinks=False)
+        resolved = source.resolve(strict=True)
+    except OSError as exc:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Python dependency cache source is "
+            f"unavailable at {source}: {exc}"
+        )
+    if not stat.S_ISDIR(metadata.st_mode) or source.is_symlink() or resolved != source:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Python dependency cache source must be a "
+            f"canonical non-symlink directory at {source}"
+        )
+    return resolved
+
+
+def python_isolation_roots(additional: tuple[Path, ...]) -> tuple[Path, ...]:
+    """Collect ambient dependency and reviewer roots hidden from proof execution."""
+
+    candidates = list(additional)
+    for variable in ("VIRTUAL_ENV", "PYTHONHOME"):
+        value = os.environ.get(variable, "")
+        if value:
+            candidates.append(Path(value).expanduser())
+    for value in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if value:
+            candidates.append(Path(value).expanduser())
+    roots: dict[Path, None] = {}
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        roots[resolved] = None
+    return tuple(roots)
+
+
+def audit_private_python_environment(
+    environment_root: Path,
+    *,
+    sensitive_roots: tuple[Path, ...],
+    label: str,
+) -> dict[str, int]:
+    """Bound and validate a copied virtualenv before it enters the proof sandbox."""
+
+    maximum_bytes = private_python_environment_limit(
+        "FM_CROSSCHECK_PYTHON_ENV_MAX_BYTES",
+        DEFAULT_PRIVATE_PYTHON_ENV_BYTES,
+        1024 * 1024,
+        8 * 1024 * 1024 * 1024,
+    )
+    maximum_files = private_python_environment_limit(
+        "FM_CROSSCHECK_PYTHON_ENV_MAX_FILES",
+        DEFAULT_PRIVATE_PYTHON_ENV_FILES,
+        100,
+        1_000_000,
+    )
+    try:
+        root_metadata = os.stat(environment_root, follow_symlinks=False)
+    except OSError as exc:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: private Python environment is unavailable "
+            f"at {environment_root}: {exc}"
+        )
+    if not stat.S_ISDIR(root_metadata.st_mode) or environment_root.is_symlink():
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: private Python environment is not a real "
+            f"directory at {environment_root}"
+        )
+    file_count = 0
+    total_bytes = 0
+    symlinks: list[Path] = []
+    pending = [environment_root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: private Python environment cannot be "
+                f"inspected at {directory}: {exc}"
+            )
+        for entry in entries:
+            try:
+                metadata = os.stat(entry.path, follow_symlinks=False)
+            except OSError as exc:
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: private Python environment entry "
+                    f"cannot be inspected at {entry.path}: {exc}"
+                )
+            file_count += 1
+            total_bytes += metadata.st_size
+            if file_count > maximum_files or total_bytes > maximum_bytes:
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: private Python environment exceeds "
+                    f"its bound ({file_count} entries, {total_bytes} bytes; limits "
+                    f"{maximum_files} and {maximum_bytes})"
+                )
+            entry_path = Path(entry.path)
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append(entry_path)
+            elif stat.S_ISLNK(metadata.st_mode):
+                symlinks.append(entry_path)
+            elif not stat.S_ISREG(metadata.st_mode):
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: private Python environment contains "
+                    f"a non-file entry at {entry_path}"
+                )
+            elif metadata.st_nlink != 1:
+                cannot_certify(
+                    f"{label} CANNOT-CERTIFY: private Python environment contains "
+                    f"shared hard-linked dependency state at {entry_path}"
+                )
+    allowed_python_link = re.compile(r"python(?:3(?:[.][0-9]+)?)?$")
+    for link in symlinks:
+        if link.parent != environment_root / "bin" or not allowed_python_link.fullmatch(
+            link.name
+        ):
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: private Python environment contains an "
+                f"unexpected dependency symlink at {link}"
+            )
+    python = environment_root / "bin" / "python"
+    try:
+        resolved_python = python.resolve(strict=True)
+        python_metadata = os.stat(resolved_python, follow_symlinks=False)
+    except OSError as exc:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: private Python interpreter is unavailable: {exc}"
+        )
+    if not stat.S_ISREG(python_metadata.st_mode) or not os.access(resolved_python, os.X_OK):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: private Python interpreter is not executable"
+        )
+    for root in sensitive_roots:
+        if resolved_python == root or resolved_python.is_relative_to(root):
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: private Python interpreter resolves "
+                f"through isolated operator or reviewer state at {root}"
+            )
+    configuration = environment_root / "pyvenv.cfg"
+    try:
+        config_text = configuration.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: private Python environment metadata is "
+            f"unreadable: {exc}"
+        )
+    if re.search(
+        r"(?im)^include-system-site-packages\s*=\s*false\s*$", config_text
+    ) is None:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: private Python environment does not disable "
+            "system site packages"
+        )
+    runtime_environment = proof_environment()
+    runtime_environment.update(
+        {
+            "HOME": str(environment_root.parent / "python-home"),
+            "PATH": str(environment_root / "bin")
+            + os.pathsep
+            + isolated_tool_path(),
+        }
+    )
+    inspection = run_command(
+        [
+            str(python),
+            "-I",
+            "-c",
+            "import json,site,sys; print(json.dumps({"
+            "'prefix':sys.prefix,'user':site.ENABLE_USER_SITE,'path':sys.path}))",
+        ],
+        env=runtime_environment,
+        timeout=30,
+        description=f"{label} private Python environment inspection",
+    )
+    try:
+        inspected = json.loads(inspection.stdout)
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        inspected = None
+    if inspection.returncode != 0 or not isinstance(inspected, dict):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: private Python environment did not execute "
+            f"in isolated mode: {(inspection.stderr or inspection.stdout).strip()[:500]}"
+        )
+    if Path(str(inspected.get("prefix", ""))).resolve() != environment_root.resolve():
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: prepared Python did not bind its private "
+            "virtualenv prefix"
+        )
+    paths = inspected.get("path")
+    if inspected.get("user") is not False or not isinstance(paths, list):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: prepared Python retained ambient user state"
+        )
+    leaked = []
+    for value in paths:
+        if not isinstance(value, str) or "site-packages" not in value:
+            continue
+        try:
+            candidate = Path(value).resolve()
+        except OSError:
+            leaked.append(value)
+            continue
+        if not candidate.is_relative_to(environment_root.resolve()):
+            leaked.append(value)
+    if leaked:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: prepared Python exposes ambient dependency "
+            "paths: " + ", ".join(leaked)
+        )
+    return {"files": file_count, "bytes": total_bytes}
+
+
+def prepare_python_invocation(
+    checkout: Path,
+    test_path: str,
+    label: str,
+    deadline: float,
+    isolation_roots: tuple[Path, ...],
+) -> tuple[list[str], Path, dict[str, str], tuple[Path, ...], dict[str, Any]]:
+    """Materialize one lock-backed private environment before proof execution."""
+
+    project = uv_project_for(checkout, test_file_path(test_path, label))
+    if project is None:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: named Python test has no governing uv project"
+        )
+    lockfile = uv_lock_for(checkout, project)
+    if lockfile is None:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: uv project governing the named Python test "
+            "has no uv.lock"
+        )
+    project_file = project / "pyproject.toml"
+    project_digest = tracked_python_input(
+        checkout, project_file, MAX_PYTHON_PROJECT_BYTES, label
+    )
+    lock_digest = tracked_python_input(
+        checkout, lockfile, MAX_PYTHON_LOCK_BYTES, label
+    )
+    uv = resolve_uv_binary(label)
+    source_cache = resolve_uv_cache_source(uv, label, deadline)
+    checkout_root = checkout.resolve()
+    if source_cache == checkout_root or source_cache.is_relative_to(checkout_root):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: Python dependency cache source must remain "
+            "outside the proof checkout"
+        )
+    private_root = checkout_root / ".crosscheck"
+    environment_root = private_root / "python-env"
+    if os.path.lexists(environment_root):
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: private Python environment preexists "
+            f"lock-backed preparation at {environment_root}"
+        )
+    private_home = private_root / "python-home"
+    private_home.mkdir(parents=True, mode=0o700, exist_ok=True)
+    proof_roots = python_isolation_roots((source_cache, *isolation_roots))
+    for root in proof_roots:
+        if checkout_root == root or checkout_root.is_relative_to(root):
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: isolated operator or reviewer path "
+                f"overlaps the proof checkout at {root}"
+            )
+    preparation_environment = proof_environment()
+    preparation_environment.update(
+        {
+            "PATH": isolated_tool_path(),
+            "HOME": str(private_home),
+            "UV_CACHE_DIR": str(source_cache),
+            "UV_PROJECT_ENVIRONMENT": str(environment_root),
+            "UV_OFFLINE": "1",
+            "UV_PYTHON_DOWNLOADS": "never",
+            "UV_LINK_MODE": "copy",
+        }
+    )
+    prep_denied = tuple(root for root in proof_roots if root != source_cache)
+    prepared = run_sandboxed(
+        [
+            str(uv),
+            "sync",
+            "--project",
+            str(project),
+            "--locked",
+            "--offline",
+            "--no-python-downloads",
+            "--no-managed-python",
+            "--link-mode",
+            "copy",
+            "--no-config",
+            "--no-progress",
+        ],
+        cwd=checkout_root,
+        profile_path=private_root / "python-dependencies.sb",
+        allow_network=False,
+        allow_posix_ipc=False,
+        additional_writable_roots=(source_cache,),
+        denied_read_roots=prep_denied,
+        env=preparation_environment,
+        timeout=evidence_command_timeout(
+            deadline, evidence_timeout(), f"{label} Python dependency preparation"
+        ),
+        description=f"{label} lock-backed offline Python dependency preparation",
+    )
+    if prepared.returncode != 0:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: uv could not create the private locked "
+            "Python environment offline: "
+            f"{(prepared.stdout + prepared.stderr).strip()[:1000] or 'no output'}"
+        )
+    environment_size = audit_private_python_environment(
+        environment_root,
+        sensitive_roots=proof_roots,
+        label=label,
+    )
+    version = run_command(
+        [str(uv), "--version"],
+        env=preparation_environment,
+        timeout=30,
+        description=f"{label} uv version inspection",
+    )
+    if version.returncode != 0 or not version.stdout.strip():
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: uv version provenance is unavailable"
+        )
+    runtime_environment = proof_environment()
+    runtime_environment.update(
+        {
+            "HOME": str(private_home),
+            "PATH": str(environment_root / "bin")
+            + os.pathsep
+            + isolated_tool_path(),
+        }
+    )
+    relative_project = project.relative_to(checkout_root).as_posix() or "."
+    relative_lock = lockfile.relative_to(checkout_root).as_posix()
+    provenance: dict[str, Any] = {
+        "mode": "uv-sync-locked-offline-private-venv",
+        "project": relative_project,
+        "pyproject_sha256": project_digest,
+        "lockfile": relative_lock,
+        "lock_sha256": lock_digest,
+        "uv": version.stdout.strip(),
+        "environment_files": environment_size["files"],
+        "environment_bytes": environment_size["bytes"],
+    }
+    return (
+        [
+            str(environment_root / "bin" / "python"),
+            "-I",
+            "-m",
+            "pytest",
+            test_path,
+        ],
+        checkout_root,
+        runtime_environment,
+        proof_roots,
+        provenance,
+    )
 
 
 def nearest_package_project(checkout: Path, relative_path: str) -> Path | None:
@@ -2324,6 +2830,7 @@ def execute_mutation_proof(
     implementation_paths: set[str],
     label: str,
     deadline: float,
+    isolation_roots: tuple[Path, ...] = (),
 ) -> dict[str, Any]:
     require(isinstance(value, dict), f"{label} must be an object")
     require_exact_keys(
@@ -2401,6 +2908,16 @@ def execute_mutation_proof(
 
     create_proof_checkout(review_dir, proof_dir, head_sha, label, deadline)
     baseline_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
+    python_preparation: dict[str, Any] | None = None
+    baseline_denied_roots: tuple[Path, ...] = ()
+    python_route = (
+        javascript_project is None
+        and invocation["runner"] == "pytest"
+        and (
+            Path(test_file).suffix.lower() in {".py", ".pyi"}
+            or any(Path(path).suffix.lower() in {".py", ".pyi"} for path in changed)
+        )
+    )
     if javascript_project is not None:
         baseline_argv, baseline_cwd, baseline_environment = prepare_jest_invocation(
             proof_dir,
@@ -2409,6 +2926,21 @@ def execute_mutation_proof(
             label,
             deadline,
         )
+    elif python_route:
+        (
+            baseline_argv,
+            baseline_cwd,
+            baseline_environment,
+            baseline_denied_roots,
+            python_preparation,
+        ) = prepare_python_invocation(
+            proof_dir,
+            test_path,
+            label,
+            deadline,
+            isolation_roots,
+        )
+        require_classified_runner(invocation["runner"], label)
     else:
         # Order is load-bearing: test_arguments must run first so an absent
         # runner is refused as absent, and a `direct` target as non-executable,
@@ -2423,6 +2955,7 @@ def execute_mutation_proof(
         profile_path=baseline_profile,
         allow_network=False,
         allow_posix_ipc=False,
+        denied_read_roots=baseline_denied_roots,
         env=baseline_environment,
         timeout=evidence_command_timeout(
             deadline, evidence_timeout(), f"{label} baseline test"
@@ -2469,6 +3002,8 @@ def execute_mutation_proof(
         mutated_changed == changed,
         f"{label} mutation changed a different path set between proof checkouts",
     )
+    mutated_denied_roots: tuple[Path, ...] = ()
+    mutated_python_preparation: dict[str, Any] | None = None
     if javascript_project is not None:
         mutated_argv, mutated_cwd, mutated_environment = prepare_jest_invocation(
             proof_dir,
@@ -2476,6 +3011,25 @@ def execute_mutation_proof(
             test_path,
             label,
             deadline,
+        )
+    elif python_route:
+        (
+            mutated_argv,
+            mutated_cwd,
+            mutated_environment,
+            mutated_denied_roots,
+            mutated_python_preparation,
+        ) = prepare_python_invocation(
+            proof_dir,
+            test_path,
+            label,
+            deadline,
+            isolation_roots,
+        )
+        require(
+            python_preparation == mutated_python_preparation,
+            f"{label} Python dependency preparation changed between exact-head "
+            "proof checkouts",
         )
     else:
         mutated_argv = test_arguments(invocation, test_path, proof_dir, label)
@@ -2488,6 +3042,7 @@ def execute_mutation_proof(
         profile_path=mutated_profile,
         allow_network=False,
         allow_posix_ipc=False,
+        denied_read_roots=mutated_denied_roots,
         env=mutated_environment,
         timeout=evidence_command_timeout(
             deadline, evidence_timeout(), f"{label} mutated test"
@@ -2505,6 +3060,8 @@ def execute_mutation_proof(
         "baseline_output": (baseline.stdout + baseline.stderr)[:MAX_CAPTURE],
         "mutated_output": (mutated.stdout + mutated.stderr)[:MAX_CAPTURE],
     }
+    if python_preparation is not None:
+        proof["dependency_preparation"] = python_preparation
     if javascript_project is not None:
         _, mutated_failed = jest_execution_summary(mutated, label, "mutated")
         if mutated.returncode == 0 or mutated_failed == 0:
@@ -3267,6 +3824,7 @@ test_path may be a plain repository path, or a `path::selector` node id when the
 The proof checkout starts as a fresh clone holding tracked files only.
 For Python implementation mutations, keep using pytest; a runner that is absent or a selector that matches no test is reported as a non-execution rather than a test result and clears nothing.
 For JavaScript or TypeScript implementation mutations, use the Jest or Vitest system declared by the nearest package.json that governs both changed implementation and named test. The gate currently has a positive execution protocol for Jest: it materializes lockfile-pinned dependencies offline when needed, runs only the named tracked test, and requires machine-readable evidence that tests actually executed. A package governed by another system, an ambiguous mixed-language mutation, or an unavailable offline environment is reported as CANNOT-CERTIFY and never as CLEAR.
+For a tracked Python test, name pytest and the test path from its uv project. The gate requires tracked exact-head pyproject.toml and uv.lock inputs, prepares a copied private virtualenv offline before each proof execution, and reports an unavailable or inconsistent locked environment as CANNOT-CERTIFY rather than a test outcome.
 A mutation proof takes no runner arguments at all: test_invocation.arguments must be empty, and any entry is refused by name. The gate reads the mutated exit status through the runner's default semantics, which a flag can change, and test_path is the only target it validates as tracked, symlink-free, and unreachable by your mutation patch.
 Both proof runs also execute under an environment the gate constructs from a fixed allowlist rather than the one it was launched with, so no ambient variable can alter those exit semantics; name a test that needs nothing beyond PATH, HOME, and the locale.
 The gate also writes a neutral pytest.ini above its own checkouts, so runner configuration from directories above them is inert; configuration tracked inside the repository still applies.
@@ -4048,6 +4606,10 @@ def apply_review(
                     {citation["path"] for citation in by_id[target]["citations"]},
                     f"{label}.mutation_proof",
                     evidence_deadline,
+                    (
+                        Path(config["execution_home"]),
+                        Path(config["executing_account_home"]),
+                    ),
                 )
             except CrosscheckCoverageError as exc:
                 status = "claimed-fixed"

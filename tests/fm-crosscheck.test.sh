@@ -705,6 +705,7 @@ elif scenario in {
     "unclassified-runner",
     "positional-target",
     "path-dependent",
+    "verified-fixed-python-lock",
 }:
     patch = protocol / "mutations" / "revert.patch"
     if scenario in {
@@ -713,6 +714,7 @@ elif scenario in {
         "unclassified-runner",
         "positional-target",
         "path-dependent",
+        "verified-fixed-python-lock",
     }:
         patch.parent.mkdir(parents=True, exist_ok=True)
         patch.write_text("""diff --git a/app.txt b/app.txt
@@ -767,6 +769,7 @@ elif scenario in {
         "symlink-forgery": "tests/symlink.test.sh",
         "positional-target": "tests/vacuous.test.sh",
         "path-dependent": "tests/pathdep.test.sh",
+        "verified-fixed-python-lock": "tests/test_private_dependency.py",
     }.get(scenario, "tests/regression.test.sh")
     # Only a runner whose non-execution the gate has measured can certify a
     # fix, so every scenario that must reach mutation causality names one.
@@ -995,7 +998,7 @@ run_case() {
   FM_CROSSCHECK_CODEX_BIN="$case_dir/fakebin/codex" \
   FM_CROSSCHECK_CLAUDE_BIN="$case_dir/fakebin/claude" \
   FM_CROSSCHECK_PI_BIN="${FM_TEST_PI_BIN-$case_dir/fakebin/pi}" \
-  FM_CROSSCHECK_SANDBOX_BIN="$case_dir/fakebin/sandbox-exec" \
+  FM_CROSSCHECK_SANDBOX_BIN="${FM_TEST_SANDBOX_BIN-$case_dir/fakebin/sandbox-exec}" \
   FM_CROSSCHECK_FETCH_REMOTE="${FM_TEST_FETCH_REMOTE-$case_dir/repo}" \
   FM_CROSSCHECK_REVIEWER_CONFIG="$case_dir/reviewer.json" \
   FM_TEST_GH_LOG="$case_dir/gh.log" \
@@ -2969,6 +2972,367 @@ PY
   pass "Python mutation certification remains byte-for-byte unchanged"
 }
 
+prepare_locked_python_fixture() {
+  local case_dir=$1 uv_bin=$2
+  "$CROSSCHECK_PYTHON" - "$case_dir" "$uv_bin" <<'PY'
+import base64
+import hashlib
+import http.server
+import os
+from pathlib import Path
+import shutil
+import socketserver
+import subprocess
+import sys
+import threading
+import zipfile
+
+case = Path(sys.argv[1]).resolve()
+uv = Path(sys.argv[2]).resolve()
+repo = case / "repo"
+web = case / "python-registry"
+cache = case / "python-source-cache"
+packages = web / "packages"
+
+
+def build_wheel(name, version, files):
+    normalized = name.replace("-", "_")
+    wheel = packages / f"{normalized}-{version}-py3-none-any.whl"
+    wheel.parent.mkdir(parents=True, exist_ok=True)
+    dist_info = f"{normalized}-{version}.dist-info"
+    contents = dict(files)
+    contents[f"{dist_info}/METADATA"] = (
+        "Metadata-Version: 2.1\n"
+        f"Name: {name}\n"
+        f"Version: {version}\n"
+    )
+    contents[f"{dist_info}/WHEEL"] = (
+        "Wheel-Version: 1.0\n"
+        "Generator: crosscheck-test\n"
+        "Root-Is-Purelib: true\n"
+        "Tag: py3-none-any\n"
+    )
+    records = []
+    for path, content in contents.items():
+        raw = content if isinstance(content, bytes) else content.encode("utf-8")
+        digest = base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).rstrip(b"=")
+        records.append(f"{path},sha256={digest.decode()},{len(raw)}")
+    records.append(f"{dist_info}/RECORD,,")
+    contents[f"{dist_info}/RECORD"] = "\n".join(records) + "\n"
+    with zipfile.ZipFile(wheel, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path, content in contents.items():
+            archive.writestr(path, content)
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    index = web / "simple" / name
+    index.mkdir(parents=True, exist_ok=True)
+    (index / "index.html").write_text(
+        f'<a href="../../packages/{wheel.name}#sha256={digest}">{wheel.name}</a>\n',
+        encoding="utf-8",
+    )
+
+
+build_wheel(
+    "locked-control",
+    "1.0.0",
+    {
+        "locked_control.py": 'VALUE = "private-locked-dependency"\n',
+        "locked_control_payload.bin": b"p" * (2 * 1024 * 1024),
+    },
+)
+build_wheel(
+    "pytest",
+    "1.0.0",
+    {
+        "pytest/__init__.py": '__version__ = "1.0.0"\n',
+        "pytest/__main__.py": (
+            "import runpy, sys\n"
+            "try:\n"
+            "    runpy.run_path(sys.argv[-1], run_name='__main__')\n"
+            "except AssertionError as exc:\n"
+            "    print(f'test failed: {exc}', file=sys.stderr)\n"
+            "    raise SystemExit(1)\n"
+            "except Exception as exc:\n"
+            "    print(f'collection failed: {exc}', file=sys.stderr)\n"
+            "    raise SystemExit(2)\n"
+        ),
+    },
+)
+
+
+class QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, _format, *_arguments):
+        pass
+
+
+handler = lambda *args, **kwargs: QuietHandler(  # noqa: E731
+    *args, directory=str(web), **kwargs
+)
+server = socketserver.TCPServer(("127.0.0.1", 0), handler)
+thread = threading.Thread(target=server.serve_forever)
+thread.start()
+port = server.server_address[1]
+source_marker = cache / "operator-cache-secret"
+reviewer_marker = case / "reviewer-home" / "reviewer-secret"
+virtualenv_marker = case / "operator-venv" / "operator-venv-secret"
+ambient_python = case / "ambient-python"
+for marker in (reviewer_marker, virtualenv_marker):
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("must stay private\n", encoding="utf-8")
+ambient_python.mkdir(parents=True, exist_ok=True)
+(ambient_python / "ambient_leak.py").write_text("LEAKED = True\n", encoding="utf-8")
+(repo / "pyproject.toml").write_text(
+    "[project]\n"
+    'name = "crosscheck-private-python-proof"\n'
+    'version = "0.0.0"\n'
+    'requires-python = ">=3.11"\n'
+    'dependencies = ["locked-control==1.0.0"]\n'
+    "[dependency-groups]\n"
+    'dev = ["pytest==1.0.0"]\n'
+    "[[tool.uv.index]]\n"
+    'name = "crosscheck-fixture"\n'
+    f'url = "http://127.0.0.1:{port}/simple"\n'
+    "default = true\n",
+    encoding="utf-8",
+)
+(repo / "tests" / "test_private_dependency.py").write_text(
+    "import errno\n"
+    "import os\n"
+    "from pathlib import Path\n"
+    "import socket\n"
+    "from locked_control import VALUE\n"
+    "\n"
+    "def denied_read(path):\n"
+    "    try:\n"
+    "        Path(path).read_text(encoding='utf-8')\n"
+    "    except PermissionError:\n"
+    "        return\n"
+    "    raise AssertionError(f'sandbox exposed {path}')\n"
+    "\n"
+    f"denied_read({str(source_marker)!r})\n"
+    f"denied_read({str(reviewer_marker)!r})\n"
+    f"denied_read({str(virtualenv_marker)!r})\n"
+    "try:\n"
+    "    import ambient_leak  # noqa: F401\n"
+    "except ModuleNotFoundError:\n"
+    "    pass\n"
+    "else:\n"
+    "    raise AssertionError('ambient PYTHONPATH dependency leaked')\n"
+    "assert '.crosscheck/python-home' in str(Path(os.environ['HOME']))\n"
+    "probe = socket.socket()\n"
+    "try:\n"
+    f"    probe.connect(('127.0.0.1', {port}))\n"
+    "except OSError as exc:\n"
+    "    assert exc.errno == errno.EPERM, f'network was not sandbox-denied: {exc}'\n"
+    "else:\n"
+    "    raise AssertionError('proof sandbox allowed network')\n"
+    "finally:\n"
+    "    probe.close()\n"
+    "assert VALUE == 'private-locked-dependency'\n"
+    "print('LOCKED-NAMED-CONTROL-RAN')\n"
+    "assert Path('app.txt').read_text(encoding='utf-8').strip() == 'fixed'\n",
+    encoding="utf-8",
+)
+try:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "UV_CACHE_DIR": str(cache),
+            "UV_PROJECT_ENVIRONMENT": str(repo / ".python-seed"),
+        }
+    )
+    subprocess.run(
+        [str(uv), "lock", "--no-managed-python", "--no-progress"],
+        cwd=repo,
+        env=environment,
+        check=True,
+    )
+    subprocess.run(
+        [
+            str(uv),
+            "sync",
+            "--locked",
+            "--no-managed-python",
+            "--link-mode",
+            "copy",
+            "--no-progress",
+        ],
+        cwd=repo,
+        env=environment,
+        check=True,
+    )
+finally:
+    server.shutdown()
+    thread.join()
+    server.server_close()
+shutil.rmtree(repo / ".python-seed")
+shutil.rmtree(web)
+source_marker.write_text("must stay private\n", encoding="utf-8")
+PY
+}
+
+assert_python_preparation_cannot_certify() {
+  local case_dir=$1 base=$2 head=$3 description=$4 rc
+  seed_open_ledger "$case_dir" "$head"
+  set +e
+  FM_CROSSCHECK_UV_CACHE_SOURCE="${FM_TEST_PYTHON_CACHE_SOURCE-$case_dir/python-source-cache}" \
+    FM_CROSSCHECK_UV_BIN="$FM_TEST_PYTHON_UV_BIN" \
+    FM_TEST_SANDBOX_BIN="$FM_TEST_PYTHON_SANDBOX_BIN" \
+    VIRTUAL_ENV="$case_dir/operator-venv" \
+    PYTHONPATH="$case_dir/ambient-python" \
+    run_case "$case_dir" "$base" "$head" verified-fixed-python-lock run \
+      > "$case_dir/failure.out" 2> "$case_dir/failure.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "$description"
+  assert_grep 'CROSSCHECK CANNOT-CERTIFY:' "$case_dir/failure.err" \
+    "$description was not reported as unavailable proof"
+  assert_no_grep 'crosscheck clear' "$case_dir/failure.out" \
+    "$description silently cleared the finding"
+  "$CROSSCHECK_PYTHON" - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY' \
+    || fail "$description did not preserve the durable finding"
+import json
+from pathlib import Path
+import sys
+
+ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert ledger["findings"][0]["lifecycle"] == "open", ledger["findings"][0]
+assert ledger["runs"][-1]["state"] == "cannot-certify", ledger["runs"][-1]
+PY
+}
+
+# Reproduces the production failure first: a fresh private XDG cache under a
+# no-network profile cannot collect the named control from a lock alone. The
+# full run then proves that dependency preparation is separate, private, and
+# exact-head bound, and that malformed inputs never fall back to ambient state.
+test_locked_python_dependency_preparation_clears_end_to_end() {
+  local record case_dir base head good_head uv_bin sandbox_bin profile rc
+  record=$(make_case locked-python-dependencies)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  uv_bin=$(command -v uv || true)
+  sandbox_bin=${FM_TEST_INSTALLED_SANDBOX_BIN:-/usr/bin/sandbox-exec}
+  [ -x "$uv_bin" ] || fail "installed uv is unavailable for the Python preparation proof"
+  [ -x "$sandbox_bin" ] \
+    || fail "installed sandbox-exec is unavailable for the Python preparation proof"
+  prepare_locked_python_fixture "$case_dir" "$uv_bin"
+  git -C "$case_dir/repo" add pyproject.toml uv.lock tests/test_private_dependency.py
+  git -C "$case_dir/repo" commit -qm "add locked Python proof fixture"
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  good_head=$head
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+
+  mkdir -p "$case_dir/repo/.crosscheck/pre-fix-home"
+  profile="$case_dir/repo/.crosscheck/pre-fix-private-cache.sb"
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$profile" "$case_dir/repo" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+module.write_sandbox_profile(
+    Path(sys.argv[2]),
+    Path(sys.argv[3]),
+    allow_network=False,
+    allow_posix_ipc=False,
+)
+PY
+  set +e
+  (
+    cd "$case_dir/repo" || exit 1
+    HOME="$case_dir/repo/.crosscheck/pre-fix-home" \
+    XDG_CACHE_HOME="$case_dir/repo/.crosscheck/pre-fix-cache" \
+    UV_PROJECT_ENVIRONMENT="$case_dir/repo/.crosscheck/pre-fix-env" \
+      "$sandbox_bin" -f "$profile" "$uv_bin" run \
+        --locked --offline --no-python-downloads --no-managed-python --no-config \
+        pytest tests/test_private_dependency.py
+  ) > "$case_dir/pre-fix.out" 2> "$case_dir/pre-fix.err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "fresh-cache no-network pre-fix path unexpectedly collected"
+  assert_grep "wasn't found in the cache" "$case_dir/pre-fix.err" \
+    "pre-fix failure did not identify the fresh private cache: $(cat "$case_dir/pre-fix.err")"
+  assert_no_grep 'LOCKED-NAMED-CONTROL-RAN' "$case_dir/pre-fix.out" \
+    "pre-fix collection unexpectedly reached the named control"
+  rm -rf "$case_dir/repo/.crosscheck"
+
+  seed_open_ledger "$case_dir" "$head"
+  FM_CROSSCHECK_UV_CACHE_SOURCE="$case_dir/python-source-cache" \
+    FM_CROSSCHECK_UV_BIN="$uv_bin" \
+    FM_TEST_SANDBOX_BIN="$sandbox_bin" \
+    VIRTUAL_ENV="$case_dir/operator-venv" \
+    PYTHONPATH="$case_dir/ambient-python" \
+    run_case "$case_dir" "$base" "$head" verified-fixed-python-lock run \
+      > "$case_dir/out" 2> "$case_dir/err" \
+    || fail "locked private Python proof did not clear: $(cat "$case_dir/err")"
+  "$CROSSCHECK_PYTHON" - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY' \
+    || fail "production Crosscheck path did not durably verify the Python finding"
+import json
+from pathlib import Path
+import sys
+
+ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+finding = ledger["findings"][0]
+proof = finding["history"][-1]["proof"]
+preparation = proof["dependency_preparation"]
+assert finding["lifecycle"] == "verified-fixed", finding
+assert ledger["runs"][-1]["state"] == "clear", ledger["runs"][-1]
+assert proof["baseline_exit"] == 0 and proof["mutated_exit"] == 1, proof
+assert "LOCKED-NAMED-CONTROL-RAN" in proof["baseline_output"], proof
+assert "LOCKED-NAMED-CONTROL-RAN" in proof["mutated_output"], proof
+assert preparation["mode"] == "uv-sync-locked-offline-private-venv", preparation
+assert preparation["lockfile"] == "uv.lock", preparation
+assert len(preparation["lock_sha256"]) == 64, preparation
+assert preparation["environment_bytes"] > 2 * 1024 * 1024, preparation
+PY
+
+  export FM_TEST_PYTHON_UV_BIN=$uv_bin
+  export FM_TEST_PYTHON_SANDBOX_BIN=$sandbox_bin
+
+  git -C "$case_dir/repo" rm -q uv.lock
+  git -C "$case_dir/repo" commit -qm "remove Python lock"
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  assert_python_preparation_cannot_certify \
+    "$case_dir" "$base" "$head" "missing Python lock"
+
+  git -C "$case_dir/repo" checkout "$good_head" -- uv.lock pyproject.toml
+  printf '\n# stale-lock-change\n[project.optional-dependencies]\nstale = ["locked-control==2.0.0"]\n' \
+    >> "$case_dir/repo/pyproject.toml"
+  git -C "$case_dir/repo" add uv.lock pyproject.toml
+  git -C "$case_dir/repo" commit -qm "make Python lock stale"
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  assert_python_preparation_cannot_certify \
+    "$case_dir" "$base" "$head" "stale Python lock"
+
+  git -C "$case_dir/repo" checkout "$good_head" -- uv.lock pyproject.toml
+  printf 'not a uv lock\n' > "$case_dir/repo/uv.lock"
+  git -C "$case_dir/repo" add uv.lock pyproject.toml
+  git -C "$case_dir/repo" commit -qm "malform Python lock"
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  assert_python_preparation_cannot_certify \
+    "$case_dir" "$base" "$head" "malformed Python lock"
+
+  git -C "$case_dir/repo" checkout "$good_head" -- uv.lock pyproject.toml
+  git -C "$case_dir/repo" commit -qm "restore Python lock"
+  head=$(git -C "$case_dir/repo" rev-parse HEAD)
+  git -C "$case_dir/repo" update-ref refs/pull/72/head "$head"
+  FM_CROSSCHECK_PYTHON_ENV_MAX_BYTES=1048576 \
+    assert_python_preparation_cannot_certify \
+      "$case_dir" "$base" "$head" "oversized private Python environment"
+
+  mkdir -p "$case_dir/empty-python-cache"
+  FM_TEST_PYTHON_CACHE_SOURCE="$case_dir/empty-python-cache" \
+    assert_python_preparation_cannot_certify \
+      "$case_dir" "$base" "$head" "unusable empty Python cache"
+
+  unset FM_TEST_PYTHON_UV_BIN FM_TEST_PYTHON_SANDBOX_BIN
+  pass "locked Python dependencies prepare privately and reach verified-fixed end to end"
+}
+
 test_node_id_selector_clears_a_passing_named_test() {
   local record case_dir base head
   record=$(make_case node-id-proof)
@@ -4740,6 +5104,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_inadequate_typescript_jest_coverage_stays_blocking|\
     test_typescript_without_usable_route_is_cannot_certify|\
     test_python_mutation_proof_is_byte_exact|\
+    test_locked_python_dependency_preparation_clears_end_to_end|\
     test_baseline_readable_state_is_destroyed_before_mutation|\
     test_mutation_is_bound_to_cited_non_test_implementation|\
     test_reviewer_output_uses_separate_capture_limit|\
@@ -4800,6 +5165,11 @@ if [ "${FM_TEST_FOCUSED:-}" = review-jest-runtime-closure ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = review-python-dependencies ]; then
+  test_locked_python_dependency_preparation_clears_end_to_end
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
   test_verified_fix_executes_mutation_proof
   test_baseline_readable_state_is_destroyed_before_mutation
@@ -4851,6 +5221,7 @@ test_jest_runs_under_declared_node_major
 test_inadequate_typescript_jest_coverage_stays_blocking
 test_typescript_without_usable_route_is_cannot_certify
 test_python_mutation_proof_is_byte_exact
+test_locked_python_dependency_preparation_clears_end_to_end
 test_node_id_selector_clears_a_passing_named_test
 test_absent_runner_is_never_a_test_outcome
 test_unclassified_runner_cannot_clear_a_finding

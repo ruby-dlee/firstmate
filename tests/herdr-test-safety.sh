@@ -15,7 +15,8 @@ HERDR_TEST_SAFETY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$HERDR_TEST_SAFETY_DIR/bin/fm-herdr-lab.sh"
 
 herdr_test_runner_lab() { # <session>
-  [ "${FM_TEST_HERDR_CAPABILITY:-}" = herdr-lab ] \
+  { [ "${FM_TEST_HERDR_CAPABILITY:-}" = herdr-lab ] \
+    || [ "${FM_TEST_HERDR_CAPABILITY:-}" = herdr-mixed ]; } \
     && [ -n "${FM_TEST_HERDR_LAB_SESSION:-}" ] \
     && [ "$1" = "$FM_TEST_HERDR_LAB_SESSION" ]
 }

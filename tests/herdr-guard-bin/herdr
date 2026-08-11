@@ -13,6 +13,7 @@ original_path=${FM_TEST_ORIGINAL_PATH:-}
   || { echo "test admission refused: Herdr runtime identity is incomplete" >&2; exit 97; }
 python3 "$root/tests/test-seal.py" admit "$test_script" >/dev/null
 [ "${FM_TEST_HERDR_CAPABILITY:-}" = herdr-lab ] \
+  || [ "${FM_TEST_HERDR_CAPABILITY:-}" = herdr-mixed ] \
   || { echo "test admission refused: hermetic test attempted real Herdr" >&2; exit 97; }
 case "$session" in fm-lab-?*) ;; *) echo "test admission refused: invalid owned Herdr lab" >&2; exit 97 ;; esac
 [ "${HERDR_SESSION:-}" = "$session" ] \

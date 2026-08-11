@@ -80,6 +80,7 @@ run_admitted() {
   FM_TEST_REPO_ROOT="$ROOT" \
   FM_TEST_CURRENT_TEST="$test_script" \
   FM_TEST_HERDR_CAPABILITY="$capability" \
+  FM_TEST_SKIP_HERDR="$skip_herdr" \
     python3 "$RUN_ONE" bash "$test_script"
 }
 
@@ -137,9 +138,13 @@ for requested in "$@"; do
     hermetic)
       run_admitted "$test_script" "$capability" || result=1
       ;;
-    herdr-lab)
+    herdr-lab|herdr-mixed)
       if [ "$skip_herdr" -eq 1 ]; then
-        printf 'skip: %s declares real Herdr lifecycle; --skip-herdr selected\n' "${test_script#"$ROOT/"}"
+        if [ "$capability" = herdr-mixed ]; then
+          run_admitted "$test_script" "$capability" || result=1
+        else
+          printf 'skip: %s declares real Herdr lifecycle; --skip-herdr selected\n' "${test_script#"$ROOT/"}"
+        fi
       elif [ -z "$real_herdr" ] || ! command -v jq >/dev/null 2>&1; then
         printf 'test admission refused: %s declares real Herdr lifecycle, but herdr and jq are not both available; use --skip-herdr explicitly\n' \
           "${test_script#"$ROOT/"}" >&2

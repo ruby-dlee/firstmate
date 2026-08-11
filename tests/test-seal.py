@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TEST_DIR = ROOT / "tests"
 REGISTRY = TEST_DIR / "test-capabilities.tsv"
 ENTRY_MARKER = '. "$(dirname "$0")/test-entry.sh"'
-CAPABILITIES = {"hermetic", "herdr-lab"}
+CAPABILITIES = {"hermetic", "herdr-lab", "herdr-mixed"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 COMMAND_SUBSTITUTION = re.compile(
     r"\$\(\s*(?:(?:command|exec)\s+)?(?:[^\s;|&()]+/)?herdr\s+"
@@ -224,7 +224,9 @@ def admit(path: Path, capability: str) -> None:
         fail("recorded test runner is not an ancestor of this process")
     if os.environ.get("FM_TEST_HERDR_CAPABILITY") != capability:
         fail("runtime lifecycle capability differs from the registry")
-    if capability == "herdr-lab":
+    if capability in {"herdr-lab", "herdr-mixed"} and os.environ.get(
+        "FM_TEST_SKIP_HERDR", "0"
+    ) != "1":
         session = os.environ.get("FM_TEST_HERDR_LAB_SESSION", "")
         if not re.fullmatch(r"fm-lab-[A-Za-z0-9][A-Za-z0-9_-]*", session):
             fail("real-Herdr test has no valid runner-owned lab session")

@@ -5,7 +5,7 @@ fm-account-routing-a.test.sh	hermetic
 fm-account-routing-b.test.sh	hermetic
 fm-afk-inject-e2e.test.sh	hermetic
 fm-afk-inject-herdr-e2e.test.sh	herdr-lab
-fm-afk-launch.test.sh	herdr-lab
+fm-afk-launch.test.sh	herdr-mixed
 fm-afk-reap-wake-e2e.test.sh	hermetic
 fm-arm-pretool-check.test.sh	hermetic
 fm-auto-reap-herdr-e2e.test.sh	herdr-lab
@@ -22,6 +22,7 @@ fm-backend-herdr-workspace-per-home-e2e.test.sh	herdr-lab
 fm-backend-herdr.test.sh	hermetic
 fm-backend-orca.test.sh	hermetic
 fm-backend-tmux-smoke.test.sh	hermetic
+fm-backend-tmux-target-exists.test.sh	hermetic
 fm-backend-zellij-smoke.test.sh	hermetic
 fm-backend-zellij.test.sh	hermetic
 fm-backend.test.sh	hermetic

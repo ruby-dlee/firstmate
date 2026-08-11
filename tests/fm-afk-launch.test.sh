@@ -2176,7 +2176,11 @@ unit_afk_bounded_copy_rejects_source_generation_swap
 unit_afk_control_reads_are_nonblocking_and_generation_pinned
 unit_flag_write_failure_aborts
 unit_flag_staging_does_not_follow_predictable_symlink
-e2e_herdr
+if [ "${FM_TEST_SKIP_HERDR:-0}" = 1 ]; then
+  pass "herdr topology: explicit non-Herdr mode omits real lifecycle coverage"
+else
+  e2e_herdr
+fi
 e2e_tmux
 
 [ "$FAILED" -eq 0 ] || exit 1

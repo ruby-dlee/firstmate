@@ -508,9 +508,13 @@ reconcile_declared_pauses() {
         was_registered=1
         [ -e "$STATE/.paused-$key" ] || was_registered=0
         if { [ "$was_registered" = 1 ] || [ -e "$STATE/.stale-since-$key" ]; } \
-           && [ "$(pause_absorb_class "$w" "$task")" = working ]; then
-          if [ -e "$STATE/.stale-$key" ] || [ -e "$STATE/.stale-since-$key" ]; then
-            clear_pause_state "$w"
+           && crew_has_active_working_evidence "$task"; then
+          # Active work outranks pause absorption, but the durable declaration
+          # remains registered while ordinary stale handling owns wedge tracking.
+          if [ -e "$STATE/.stale-$key" ]; then
+            wedge_timer_check "$w" "$STATE/.stale-since-$key" \
+              "non-terminal stale (provably working after a declared pause)" \
+              "$STATE/.wedge-escalations-$key"
           fi
           continue
         fi

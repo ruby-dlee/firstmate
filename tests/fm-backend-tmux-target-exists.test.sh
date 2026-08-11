@@ -32,6 +32,7 @@ command -v tmux >/dev/null 2>&1 || { echo "skip: tmux not found"; exit 0; }
 REAL_TMUX=$(command -v tmux)
 SOCKET="./.fm-target-exists-$$.sock"
 SHIM_DIR=
+TMUX_CALL_LOG=
 
 cleanup_all() {
   "$REAL_TMUX" -S "$SOCKET" kill-server >/dev/null 2>&1 || true
@@ -43,8 +44,11 @@ trap cleanup_all EXIT
 # A `tmux` shim on PATH redirecting every call to the private socket, so the
 # adapter's bare `tmux ...` invocations never touch the host's real sessions.
 SHIM_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-target-exists.XXXXXX")
+TMUX_CALL_LOG="$SHIM_DIR/tmux.calls"
+export TMUX_CALL_LOG
 cat > "$SHIM_DIR/tmux" <<SH
 #!/usr/bin/env bash
+printf '%s\n' "\$*" >> "\${TMUX_CALL_LOG:?}"
 exec "$REAL_TMUX" -S "$SOCKET" "\$@"
 SH
 chmod +x "$SHIM_DIR/tmux"
@@ -147,6 +151,23 @@ tmux kill-window -t "$SESSION:=${LIVE}-suffix" || fail "could not remove the nea
 pass "identity guard: session:window targets resolve exactly, never by prefix or fnmatch pattern"
 
 # --- fm_backend_target_exists / fm_backend_target_state, both directions -----
+
+: > "$TMUX_CALL_LOG"
+[ "$(bexists "$SESSION:$LIVE" "$LIVE" "$SESSION:$LIVE")" = yes ] \
+  || fail "fm_backend_target_exists reported a LIVE recorded target as gone"
+[ "$(wc -l < "$TMUX_CALL_LOG" | tr -d ' ')" -eq 1 ] \
+  || fail "expected-label session:window existence should take exactly one tmux invocation"
+grep -qF "has-session -t =$SESSION:=$LIVE" "$TMUX_CALL_LOG" \
+  || fail "expected-label session:window existence did not use the exact identity proof"
+
+: > "$TMUX_CALL_LOG"
+[ "$(bexists "$LIVE_ID" "$LIVE" "$SESSION:$LIVE")" = yes ] \
+  || fail "fm_backend_target_exists reported a LIVE recorded @window-id as gone"
+[ "$(grep -c '^has-session ' "$TMUX_CALL_LOG")" -eq 1 ] \
+  || fail "expected-label @window-id existence repeated its has-session proof"
+[ "$(wc -l < "$TMUX_CALL_LOG" | tr -d ' ')" -eq 3 ] \
+  || fail "expected-label @window-id identity should use one existence proof and two identity reads"
+pass "fm_backend_target_exists: expected-label checks do not repeat the tmux existence proof"
 
 [ "$(bexists "$SESSION:$LIVE" "$LIVE" "$SESSION:$LIVE")" = yes ] \
   || fail "fm_backend_target_exists reported a LIVE recorded target as gone"

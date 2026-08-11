@@ -28,6 +28,7 @@ make_case() {
   case_dir="$TMP_ROOT/$name"
   repo="$case_dir/repo"
   mkdir -p "$repo/tests" "$repo/apps/web-app/src" \
+    "$repo/.crosscheck/reproductions" \
     "$case_dir/state" "$case_dir/data" \
     "$case_dir/author-home" "$case_dir/reviewer-home" "$case_dir/pi-home" \
     "$case_dir/fakebin"
@@ -45,6 +46,8 @@ make_case() {
   git -C "$repo" init -q -b main
   printf 'base\n' > "$repo/app.txt"
   printf 'base\n' > "$repo/other.txt"
+  cp "$ROOT/.crosscheck/reproductions/verify-repository-lineage.sh" \
+    "$repo/.crosscheck/reproductions/verify-repository-lineage.sh"
   printf '#!/usr/bin/env bash\ngrep -qx fixed app.txt\n' > "$repo/tests/regression.test.sh"
   printf '#!/usr/bin/env bash\n[ ! -e .stateful-proof-marker ] || exit 19\ntouch .stateful-proof-marker\ngrep -qx fixed app.txt\n' \
     > "$repo/tests/stateful.test.sh"
@@ -81,6 +84,7 @@ JSON
     "$repo/tests/nodeid.test.sh" "$repo/tests/vacuous.test.sh" \
     "$repo/tests/pathdep.test.sh" "$repo/real-tests/linked.test.sh"
   git -C "$repo" add app.txt other.txt shared-test.sh \
+    .crosscheck/reproductions/verify-repository-lineage.sh \
     apps/web-app/package.json apps/web-app/package-lock.json apps/web-app/src/preview.ts \
     apps/web-app/src/preview.test.ts apps/web-app/src/preview-inadequate.test.ts \
     tests/regression.test.sh tests/helper.sh tests/readable-state.test.sh tests/stateful.test.sh \
@@ -691,6 +695,29 @@ elif scenario in {
             "test_path": test_path,
             "test_invocation": {"runner": "jest", "arguments": []},
             "mutation_patch_path": ".crosscheck/mutations/preview-revert.patch",
+        },
+        "equivalent_to": None,
+    }]
+elif scenario in {"repository-shape", "repository-shape-code-escape"}:
+    patch = protocol / "mutations" / "repository-shape.patch"
+    patch.parent.mkdir(parents=True, exist_ok=True)
+    patch.write_text("""diff --git a/app.txt b/app.txt
+--- a/app.txt
++++ b/app.txt
+@@ -1 +1 @@
+-fixed
++shape-mutated
+""")
+    base["finding_updates"] = [{
+        "id": "cc-aaaaaaaaaaaa",
+        "status": "verified-fixed",
+        "note": "The exact head has the externally asserted parent and tree.",
+        "reproduction": None,
+        "mutation_proof": {
+            "proof_kind": "repository-shape",
+            "test_path": ".crosscheck/reproductions/verify-repository-lineage.sh",
+            "test_invocation": {"runner": "bash", "arguments": []},
+            "mutation_patch_path": ".crosscheck/mutations/repository-shape.patch",
         },
         "equivalent_to": None,
     }]
@@ -2692,6 +2719,93 @@ assert value["runs"][-1]["active_blockers"] == ["cc-aaaaaaaaaaaa"]
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" \
     || fail "silent review changed or dropped the prior blocker"
   pass "silence from a later run never closes an old finding"
+}
+
+test_tracked_repository_lineage_helper_marks_match_and_mismatch() {
+  local record case_dir base head tree rc
+  record=$(make_case repository-lineage-helper)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  tree=$(git -C "$case_dir/repo" rev-parse "${head}^{tree}")
+  git -C "$case_dir/repo" checkout -q --detach "$head"
+  (
+    cd "$case_dir/repo" || exit 1
+    .crosscheck/reproductions/verify-repository-lineage.sh "$base" "$tree"
+  ) > "$case_dir/helper.out" 2> "$case_dir/helper.err" \
+    || fail "tracked lineage helper rejected the conforming exact head"
+  assert_grep 'CROSSCHECK_REPOSITORY_SHAPE_MATCH' "$case_dir/helper.out" \
+    "tracked lineage helper emitted no success marker"
+  set +e
+  (
+    cd "$case_dir/repo" || exit 1
+    .crosscheck/reproductions/verify-repository-lineage.sh \
+      "$base" 0000000000000000000000000000000000000000
+  ) > "$case_dir/mismatch.out" 2> "$case_dir/mismatch.err"
+  rc=$?
+  set -e
+  expect_code 86 "$rc" "tracked lineage helper tree mismatch"
+  assert_grep 'CROSSCHECK_REPOSITORY_SHAPE_MISMATCH' "$case_dir/mismatch.err" \
+    "tracked lineage helper emitted no distinctive mismatch marker"
+  pass "the tracked lineage helper accepts gate inputs and marks exact mismatches"
+}
+
+test_repository_shape_finding_executes_mutation_proof() {
+  local record case_dir base head tree
+  record=$(make_case repository-shape-proof)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  tree=$(git -C "$case_dir/repo" rev-parse "${head}^{tree}")
+  seed_open_ledger "$case_dir" "$head"
+  run_case "$case_dir" "$base" "$head" repository-shape run \
+    --repository-shape-input "cc-aaaaaaaaaaaa:${base}:${tree}" \
+    > "$case_dir/out" 2> "$case_dir/err" \
+    || fail "repository-shape mutation proof did not clear: $(cat "$case_dir/err")"
+  "$CROSSCHECK_PYTHON" - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY' \
+    || fail "repository-shape mutation proof was not durably recorded"
+import json
+from pathlib import Path
+import sys
+
+ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+finding = ledger["findings"][0]
+proof = finding["history"][-1]["proof"]
+assert finding["lifecycle"] == "verified-fixed", finding
+assert proof["proof_kind"] == "repository-shape", proof
+assert proof["test_path"] == ".crosscheck/reproductions/verify-repository-lineage.sh", proof
+assert proof["baseline_exit"] == 0, proof
+assert proof["tree_mutated_exit"] == 86, proof
+assert proof["parent_mutated_exit"] == 86, proof
+assert proof["mutated_files"] == ["app.txt"], proof
+assert "CROSSCHECK_REPOSITORY_SHAPE_MATCH" in proof["baseline_output"], proof
+assert "CROSSCHECK_REPOSITORY_SHAPE_MISMATCH" in proof["tree_mutated_output"], proof
+assert "CROSSCHECK_REPOSITORY_SHAPE_MISMATCH" in proof["parent_mutated_output"], proof
+assert ledger["runs"][-1]["state"] == "clear", ledger["runs"][-1]
+PY
+  pass "a repository-shape finding clears through an executed canonical mutation proof"
+}
+
+test_code_finding_cannot_select_repository_shape_route() {
+  local record case_dir base head rc
+  record=$(make_case repository-shape-code-escape)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  seed_open_ledger "$case_dir" "$head"
+  set +e
+  run_case "$case_dir" "$base" "$head" repository-shape-code-escape run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "code finding repository-shape escape"
+  assert_grep 'reviewer assertion alone cannot select this route for a code finding' \
+    "$case_dir/err" "reviewer-only repository-shape proof was not refused"
+  "$CROSSCHECK_PYTHON" - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY' \
+    || fail "reviewer-only repository-shape attempt changed the durable code finding"
+import json
+from pathlib import Path
+import sys
+
+ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert ledger["findings"][0]["lifecycle"] == "open", ledger["findings"][0]
+assert ledger["runs"][-1]["state"] == "unreviewed", ledger["runs"][-1]
+PY
+  pass "a code finding cannot replace its own tracked test with the lineage helper"
 }
 
 test_verified_fix_executes_mutation_proof() {
@@ -4732,6 +4846,9 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_reading_only_suspicion_is_a_tool_failure|\
     test_new_finding_requires_executed_reproduction|\
     test_silence_never_closes_prior_finding|\
+    test_tracked_repository_lineage_helper_marks_match_and_mismatch|\
+    test_repository_shape_finding_executes_mutation_proof|\
+    test_code_finding_cannot_select_repository_shape_route|\
     test_typescript_jest_mutation_proof_can_clear|\
     test_preexisting_jest_runner_cannot_certify|\
     test_local_fake_jest_package_cannot_certify|\
@@ -4842,6 +4959,9 @@ test_missing_author_identity_is_a_named_tool_failure
 test_account_less_known_provider_lane_is_reviewable
 test_new_finding_requires_executed_reproduction
 test_silence_never_closes_prior_finding
+test_tracked_repository_lineage_helper_marks_match_and_mismatch
+test_repository_shape_finding_executes_mutation_proof
+test_code_finding_cannot_select_repository_shape_route
 test_verified_fix_executes_mutation_proof
 test_typescript_jest_mutation_proof_can_clear
 test_preexisting_jest_runner_cannot_certify

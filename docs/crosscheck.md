@@ -106,6 +106,14 @@ The reviewer is a real policy-grade agent invocation and normally takes minutes,
 bin/fm-crosscheck.sh run <task-id> <https://github.com/owner/repo/pull/number>
 ```
 
+A repository-shape finding uses an explicit finding-scoped gate input on the later run that attempts to verify it.
+The input is repeatable when a head has more than one eligible finding.
+
+```sh
+bin/fm-crosscheck.sh run <task-id> <https://github.com/owner/repo/pull/number> \
+  --repository-shape-input <finding-id>:<expected-parent-sha>:<expected-tree-sha>
+```
+
 The run writes `data/<task-id>/crosscheck-ledger.json` and the readable `data/<task-id>/crosscheck.md` report.
 The run exits zero only when the exact head has a complete review, the reviewer supplied a successfully gate-reexecuted exact-base/exact-head reproduction, the durable ledger has no active blocker, and the reviewer returned no unreproduced suspicion.
 It fetches `refs/pull/<number>/head` from the base repository into a disposable Git checkout and requires that ref to resolve to the exact live API head SHA before reviewer launch.
@@ -145,7 +153,7 @@ Findings have exactly four lifecycle values.
 
 - `open` means an executed reproduction admitted the defect and it remains a blocker.
 - `claimed-fixed` records a reviewer's claim but remains a blocker.
-- `verified-fixed` requires a tracked named test that passes on the exact head and fails after a supplied implementation mutation is applied.
+- `verified-fixed` requires an executed exact-head mutation proof through either the finding's tracked named code test or the narrowly qualified canonical repository-shape helper described below.
 - `closed-equivalent` requires a direct reference to another currently `verified-fixed` finding.
 
 A later review that omits a finding leaves its lifecycle unchanged.
@@ -186,6 +194,23 @@ A `verified-fixed` update must name a tracked test and provide an implementation
 It supplies an approved test runner plus a structured argument array, never a free-form shell command.
 An approved runner is a NAME, and the gate resolves that name into an invocation rather than assuming a bare binary on `PATH`.
 Before either proof run, the gate applies the mutation in a disposable inspection checkout and selects the certification system from the mutated implementation paths themselves.
+
+The only alternate test route is for a repository-shape finding whose entire claim is that the deliverable commit has exactly one specific parent SHA and one specific tree SHA.
+A code-behavior defect, test failure, content-level invariant, generated-file defect, or any mixed shape-and-behavior claim does not qualify.
+The gate caller must explicitly authorize the route for one already-durable finding with `--repository-shape-input <finding-id>:<expected-parent-sha>:<expected-tree-sha>`.
+The reviewer artifact cannot activate the route by assertion, and an input for one finding cannot authorize another finding.
+The reviewer sets `mutation_proof.proof_kind` to `repository-shape`, names exactly `.crosscheck/reproductions/verify-repository-lineage.sh`, uses the `bash` runner with no arguments, and still supplies an implementation-only patch confined to the finding's cited non-test paths.
+The expected SHAs stay outside the helper and the reviewer-controlled runner arguments.
+The gate supplies both values to the helper from its finding-scoped input and records them in the executed proof.
+The helper must be tracked at the reviewed head, regular and symlink-free, and byte-identical to the helper installed with the gate.
+It exits zero with `CROSSCHECK_REPOSITORY_SHAPE_MATCH` only when raw `HEAD` has exactly the supplied parent and tree, and exits 86 with `CROSSCHECK_REPOSITORY_SHAPE_MISMATCH` otherwise.
+The gate first requires that helper to pass in a fresh exact-head checkout.
+It then applies the supplied implementation patch, writes the changed index as a synthetic commit with the expected parent, and requires the same helper bytes to report the tree mismatch.
+Finally it writes a separate synthetic commit with the expected tree and a different parent and requires the helper to report that parent mismatch too.
+All three executions run without network in separate disposable proof states, so a description or a precomputed hash cannot substitute for the executed baseline and two mutations.
+This remains a `verified-fixed` proof rather than a new lifecycle, and it clears only the exact head recorded in the proof.
+
+The ordinary code route below is unchanged.
 A JavaScript or TypeScript mutation must resolve with its named test to one nearest tracked `package.json`, and that package's test script or dependencies must declare one unambiguous Jest or Vitest system.
 A mixed JavaScript/Python mutation, a test outside the changed package, an ambiguous declaration, or a proof naming a different runner is `CANNOT-CERTIFY`, never `CLEAR`.
 Python mutation behavior remains on its existing pytest route exactly as before.
@@ -341,6 +366,8 @@ Its `test_local_transitive_jest_package_cannot_certify` case keeps top-level Jes
 Its `test_jest_runs_under_declared_node_major` case proves the selected Node path governs installation and both proof executions.
 Its `test_typescript_without_usable_route_is_cannot_certify` case proves that an unsupported package-governed route writes and reports `CANNOT-CERTIFY` rather than silently clearing or manufacturing a code verdict.
 Its `test_python_mutation_proof_is_byte_exact` case compares the complete normalized Python proof record to the pre-Jest shape so the new language route cannot drift existing pytest evidence.
+Its `test_repository_shape_finding_executes_mutation_proof` case runs the tracked canonical helper on the exact head, an implementation-mutated synthetic tree, and a parent-mutated synthetic commit, then requires the resulting `verified-fixed` proof to record all three executions.
+Its `test_code_finding_cannot_select_repository_shape_route` case proves that a reviewer artifact alone cannot route an ordinary code finding through the canonical lineage helper instead of that finding's own tracked test.
 Its `test_claude_execution_home_always_binds_the_keychain` case is the named regression for the private-`HOME` Keychain bind, and it fails if the bind is made conditional on `.credentials.json` again.
 Its `test_moved_default_branch_stays_reviewable` case is the named regression for base drift: it advances the fake default branch past the PR's branch point, then requires the run to review against the merge base, record it, and still verify.
 Its `test_unavailable_reviewer_fails_over_to_the_next_account` case covers reviewer failover using the observed zero-turn Claude error envelope, and asserts the ledger records the abandoned attempt with the reason the reviewer reported rather than a truncated envelope.

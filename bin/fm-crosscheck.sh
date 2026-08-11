@@ -2,7 +2,7 @@
 # Run or verify the independent exact-head crosscheck ledger for a task PR.
 #
 # Usage:
-#   fm-crosscheck.sh run <task-id> <full GitHub PR URL>
+#   fm-crosscheck.sh run <task-id> <full GitHub PR URL> [--repository-shape-input <finding-id>:<parent-sha>:<tree-sha>]...
 #   fm-crosscheck.sh verify <task-id> <full GitHub PR URL>
 #   fm-crosscheck.sh merge <task-id> <full GitHub PR URL> <reviewed SHA> <method>
 #

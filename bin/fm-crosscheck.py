@@ -79,6 +79,10 @@ FILE_TEST_RUNNERS = TEST_RUNNERS - {"direct", "jest", "pytest", "rspec", "vitest
 # approved runner is handed a plain file, so a selector there is a reviewer
 # mistake the gate must name rather than silently drop.
 NODE_ID_RUNNERS = {"pytest"}
+REPOSITORY_SHAPE_HELPER = ".crosscheck/reproductions/verify-repository-lineage.sh"
+REPOSITORY_SHAPE_MATCH_MARKER = "CROSSCHECK_REPOSITORY_SHAPE_MATCH"
+REPOSITORY_SHAPE_MISMATCH_MARKER = "CROSSCHECK_REPOSITORY_SHAPE_MISMATCH"
+REPOSITORY_SHAPE_MISMATCH_EXIT = 86
 # How an approved runner NAME becomes an argv prefix, when the name alone does
 # not identify a working invocation. Order is load-bearing: uv comes first
 # because inside a uv project a bare `pytest` can exist on PATH and resolve
@@ -199,6 +203,45 @@ def environment_value(name: str, default: str) -> str:
 
     value = os.environ.get(name)
     return default if value is None or value == "" else value
+
+
+def parse_repository_shape_inputs(values: list[str]) -> dict[str, dict[str, str]]:
+    """Parse explicit finding-scoped parent/tree assertions from the gate caller.
+
+    The reviewer cannot activate this route from its verdict artifact.
+    A caller must scope each expected shape to one durable finding ID, which
+    keeps the canonical lineage helper from becoming a generic substitute for
+    a code finding's own tracked regression test.
+    """
+
+    parsed: dict[str, dict[str, str]] = {}
+    for index, value in enumerate(values):
+        parts = value.split(":")
+        if len(parts) != 3:
+            tool_fail(
+                "--repository-shape-input must be "
+                "FINDING_ID:EXPECTED_PARENT_SHA:EXPECTED_TREE_SHA"
+            )
+        finding, expected_parent, expected_tree = parts
+        if FINDING_ID_RE.fullmatch(finding) is None:
+            tool_fail(
+                f"--repository-shape-input[{index}] has invalid finding ID {finding!r}"
+            )
+        for label, sha in (
+            ("expected parent", expected_parent),
+            ("expected tree", expected_tree),
+        ):
+            if SHA_RE.fullmatch(sha) is None:
+                tool_fail(
+                    f"--repository-shape-input[{index}] {label} must be one 40-hex SHA"
+                )
+        if finding in parsed:
+            tool_fail(f"--repository-shape-input repeats finding {finding}")
+        parsed[finding] = {
+            "expected_parent_sha": expected_parent,
+            "expected_tree_sha": expected_tree,
+        }
+    return parsed
 
 
 def same_model_review_enabled(home: Path) -> bool:
@@ -2316,27 +2359,18 @@ def is_test_or_evidence_path(path: str) -> bool:
     )
 
 
-def execute_mutation_proof(
-    value: Any,
+def inspect_implementation_mutation(
+    value: dict[str, Any],
     review_dir: Path,
     head_sha: str,
-    proof_root: Path,
+    proof_dir: Path,
+    test_file: str,
     implementation_paths: set[str],
     label: str,
     deadline: float,
-) -> dict[str, Any]:
-    require(isinstance(value, dict), f"{label} must be an object")
-    require_exact_keys(
-        value, {"test_path", "test_invocation", "mutation_patch_path"}, label
-    )
-    test_path = require_string(value.get("test_path"), f"{label}.test_path")
-    test_file = test_file_path(test_path, label)
-    validate_named_test(review_dir, test_path, label, deadline)
-    invocation = validate_test_invocation(
-        value.get("test_invocation"), f"{label}.test_invocation"
-    )
-    require_supported_selector(test_path, invocation["runner"], label)
-    require_argument_free_invocation(invocation, f"{label}.test_invocation")
+) -> tuple[Path, str, list[str]]:
+    """Validate one reviewer patch as a cited implementation-only mutation."""
+
     patch_relative = require_string(
         value.get("mutation_patch_path"), f"{label}.mutation_patch_path"
     )
@@ -2348,12 +2382,6 @@ def execute_mutation_proof(
         f"{label} must mutate implementation, not its named test",
     )
 
-    proof_id = hashlib.sha256(label.encode()).hexdigest()[:10]
-    proof_dir = proof_root / f"proof-{proof_id}"
-
-    # Apply once before either proof run so the implementation paths themselves,
-    # not a repository-global setting or the reviewer prompt, select the test
-    # system. This inspection checkout is destroyed before the baseline.
     create_proof_checkout(review_dir, proof_dir, head_sha, label, deadline)
     inspected_apply = run_command(
         [
@@ -2390,6 +2418,74 @@ def execute_mutation_proof(
         f"{label} mutation changes test or evidence support: "
         + ", ".join(test_support),
     )
+    remove_proof_checkout(proof_dir, label)
+    return patch_path, patch_text, changed
+
+
+def execute_mutation_proof(
+    value: Any,
+    review_dir: Path,
+    head_sha: str,
+    proof_root: Path,
+    implementation_paths: set[str],
+    label: str,
+    deadline: float,
+    root: Path,
+    repository_shape_input: dict[str, str] | None,
+) -> dict[str, Any]:
+    require(isinstance(value, dict), f"{label} must be an object")
+    proof_kind = value.get("proof_kind")
+    if proof_kind is not None:
+        require(proof_kind == "repository-shape", f"{label}.proof_kind is invalid")
+        require_exact_keys(
+            value,
+            {"proof_kind", "test_path", "test_invocation", "mutation_patch_path"},
+            label,
+        )
+        require(
+            repository_shape_input is not None,
+            f"{label} repository-shape route was not authorized by a finding-scoped "
+            "--repository-shape-input from the gate caller; reviewer assertion alone "
+            "cannot select this route for a code finding",
+        )
+        return execute_repository_shape_proof(
+            value,
+            review_dir,
+            head_sha,
+            proof_root,
+            implementation_paths,
+            label,
+            deadline,
+            root,
+            repository_shape_input,
+        )
+    require_exact_keys(
+        value, {"test_path", "test_invocation", "mutation_patch_path"}, label
+    )
+    test_path = require_string(value.get("test_path"), f"{label}.test_path")
+    test_file = test_file_path(test_path, label)
+    validate_named_test(review_dir, test_path, label, deadline)
+    invocation = validate_test_invocation(
+        value.get("test_invocation"), f"{label}.test_invocation"
+    )
+    require_supported_selector(test_path, invocation["runner"], label)
+    require_argument_free_invocation(invocation, f"{label}.test_invocation")
+    proof_id = hashlib.sha256(label.encode()).hexdigest()[:10]
+    proof_dir = proof_root / f"proof-{proof_id}"
+
+    # Apply once before either proof run so the implementation paths themselves,
+    # not a repository-global setting or the reviewer prompt, select the test
+    # system. This inspection checkout is destroyed before the baseline.
+    patch_path, patch_text, changed = inspect_implementation_mutation(
+        value,
+        review_dir,
+        head_sha,
+        proof_dir,
+        test_file,
+        implementation_paths,
+        label,
+        deadline,
+    )
     javascript_project = javascript_mutation_route(
         review_dir,
         changed,
@@ -2397,7 +2493,6 @@ def execute_mutation_proof(
         invocation["runner"],
         label,
     )
-    remove_proof_checkout(proof_dir, label)
 
     create_proof_checkout(review_dir, proof_dir, head_sha, label, deadline)
     baseline_profile = proof_dir / ".crosscheck" / "mutation-proof.sb"
@@ -2518,6 +2613,288 @@ def execute_mutation_proof(
     return proof
 
 
+def require_canonical_repository_shape_helper(
+    root: Path,
+    review_dir: Path,
+    test_path: str,
+    label: str,
+    deadline: float,
+) -> None:
+    require(
+        test_path == REPOSITORY_SHAPE_HELPER,
+        f"{label}.test_path must name the canonical tracked lineage helper "
+        f"{REPOSITORY_SHAPE_HELPER}",
+    )
+    validate_named_test(review_dir, test_path, label, deadline)
+    reviewed_helper = safe_artifact(
+        review_dir, test_path, ".crosscheck/reproductions/"
+    )
+    trusted_helper = root / REPOSITORY_SHAPE_HELPER
+    try:
+        trusted_mode = trusted_helper.lstat().st_mode
+        trusted_size = os.stat(trusted_helper, follow_symlinks=False).st_size
+    except OSError as exc:
+        fail(f"{label} canonical gate helper is unavailable at {trusted_helper}: {exc}")
+    require(
+        stat.S_ISREG(trusted_mode) and not trusted_helper.is_symlink(),
+        f"{label} canonical gate helper must be a regular non-symlink file",
+    )
+    require(
+        trusted_size <= MAX_CAPTURE,
+        f"{label} canonical gate helper exceeds {MAX_CAPTURE} bytes",
+    )
+    try:
+        reviewed_bytes = reviewed_helper.read_bytes()
+        trusted_bytes = trusted_helper.read_bytes()
+    except OSError as exc:
+        fail(f"{label} canonical lineage helper comparison failed: {exc}")
+    require(
+        reviewed_bytes == trusted_bytes,
+        f"{label}.test_path differs from the gate's canonical tracked lineage helper",
+    )
+
+
+def create_synthetic_shape_commit(
+    checkout: Path,
+    tree_sha: str,
+    parent_sha: str,
+    label: str,
+    deadline: float,
+) -> str:
+    environment = proof_environment()
+    environment.update(
+        {
+            "GIT_AUTHOR_NAME": "Crosscheck shape mutation",
+            "GIT_AUTHOR_EMAIL": "crosscheck-shape@invalid",
+            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00Z",
+            "GIT_COMMITTER_NAME": "Crosscheck shape mutation",
+            "GIT_COMMITTER_EMAIL": "crosscheck-shape@invalid",
+            "GIT_COMMITTER_DATE": "2000-01-01T00:00:00Z",
+        }
+    )
+    created = run_command(
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "commit-tree",
+            tree_sha,
+            "-p",
+            parent_sha,
+        ],
+        env=environment,
+        input_text="Crosscheck synthetic repository-shape mutation\n",
+        timeout=evidence_command_timeout(deadline, 60, f"{label} synthetic commit"),
+    )
+    commit_sha = created.stdout.strip()
+    require(
+        created.returncode == 0 and SHA_RE.fullmatch(commit_sha) is not None,
+        f"{label} could not construct its synthetic repository-shape mutation: "
+        f"{(created.stderr or created.stdout).strip()[:500] or 'no diagnostic'}",
+    )
+    reset = run_command(
+        ["git", "-C", str(checkout), "reset", "--hard", "--quiet", commit_sha],
+        timeout=evidence_command_timeout(deadline, 60, f"{label} synthetic checkout"),
+    )
+    require(reset.returncode == 0, f"{label} could not check out its synthetic mutation")
+    return commit_sha
+
+
+def run_repository_shape_helper(
+    checkout: Path,
+    expected_parent_sha: str,
+    expected_tree_sha: str,
+    label: str,
+    phase: str,
+    deadline: float,
+) -> subprocess.CompletedProcess[str]:
+    return run_sandboxed(
+        [
+            "/bin/bash",
+            REPOSITORY_SHAPE_HELPER,
+            expected_parent_sha,
+            expected_tree_sha,
+        ],
+        cwd=checkout,
+        profile_path=checkout / ".crosscheck" / f"repository-shape-{phase}.sb",
+        allow_network=False,
+        allow_posix_ipc=False,
+        env=proof_environment(),
+        timeout=evidence_command_timeout(
+            deadline, evidence_timeout(), f"{label} {phase} lineage test"
+        ),
+        description=f"{label} {phase} lineage test",
+    )
+
+
+def execute_repository_shape_proof(
+    value: dict[str, Any],
+    review_dir: Path,
+    head_sha: str,
+    proof_root: Path,
+    implementation_paths: set[str],
+    label: str,
+    deadline: float,
+    root: Path,
+    repository_shape_input: dict[str, str],
+) -> dict[str, Any]:
+    """Certify one explicitly authorized commit-parent/tree finding.
+
+    The helper and its invocation are fixed by the gate.
+    Only the finding-scoped expected object IDs come from the external gate
+    input, and an implementation patch is committed into a synthetic head so
+    the same tracked helper must positively detect the changed tree.
+    A second synthetic head proves the parent half of the assertion as well.
+    """
+
+    test_path = require_string(value.get("test_path"), f"{label}.test_path")
+    invocation = validate_test_invocation(
+        value.get("test_invocation"), f"{label}.test_invocation"
+    )
+    require(
+        invocation == {"runner": "bash", "arguments": []},
+        f"{label}.test_invocation must be the gate-owned bash invocation with no arguments",
+    )
+    require_canonical_repository_shape_helper(
+        root, review_dir, test_path, label, deadline
+    )
+    expected_parent_sha = repository_shape_input["expected_parent_sha"]
+    expected_tree_sha = repository_shape_input["expected_tree_sha"]
+
+    proof_id = hashlib.sha256(label.encode()).hexdigest()[:10]
+    proof_dir = proof_root / f"proof-{proof_id}"
+    patch_path, patch_text, changed = inspect_implementation_mutation(
+        value,
+        review_dir,
+        head_sha,
+        proof_dir,
+        test_path,
+        implementation_paths,
+        label,
+        deadline,
+    )
+
+    create_proof_checkout(review_dir, proof_dir, head_sha, label, deadline)
+    baseline = run_repository_shape_helper(
+        proof_dir,
+        expected_parent_sha,
+        expected_tree_sha,
+        label,
+        "baseline",
+        deadline,
+    )
+    baseline_output = baseline.stdout + baseline.stderr
+    require(
+        baseline.returncode == 0
+        and REPOSITORY_SHAPE_MATCH_MARKER in baseline_output,
+        f"{label} canonical lineage helper did not confirm the gate-supplied "
+        "parent/tree on the exact head: "
+        f"{baseline_output.strip()[:1000] or 'no output'}",
+    )
+    remove_proof_checkout(proof_dir, label)
+
+    create_proof_checkout(review_dir, proof_dir, head_sha, label, deadline)
+    applied = run_command(
+        [
+            "git",
+            "-C",
+            str(proof_dir),
+            "apply",
+            "--index",
+            "--whitespace=nowarn",
+            str(patch_path),
+        ],
+        timeout=evidence_command_timeout(deadline, 60, f"{label} tree mutation apply"),
+    )
+    require(applied.returncode == 0, f"{label} mutation patch does not apply")
+    staged_changed = git(
+        proof_dir,
+        "diff",
+        "--cached",
+        "--name-only",
+        timeout=evidence_command_timeout(deadline, 60, f"{label} staged mutation diff"),
+    ).splitlines()
+    require(
+        staged_changed == changed,
+        f"{label} mutation changed a different path set in its synthetic tree",
+    )
+    mutated_tree_sha = git(
+        proof_dir,
+        "write-tree",
+        timeout=evidence_command_timeout(deadline, 60, f"{label} mutated tree"),
+    )
+    require(
+        SHA_RE.fullmatch(mutated_tree_sha) is not None
+        and mutated_tree_sha != expected_tree_sha,
+        f"{label} implementation mutation did not produce a distinct Git tree",
+    )
+    create_synthetic_shape_commit(
+        proof_dir,
+        mutated_tree_sha,
+        expected_parent_sha,
+        label,
+        deadline,
+    )
+    tree_mutated = run_repository_shape_helper(
+        proof_dir,
+        expected_parent_sha,
+        expected_tree_sha,
+        label,
+        "tree-mutated",
+        deadline,
+    )
+    tree_mutated_output = tree_mutated.stdout + tree_mutated.stderr
+    require(
+        tree_mutated.returncode == REPOSITORY_SHAPE_MISMATCH_EXIT
+        and REPOSITORY_SHAPE_MISMATCH_MARKER in tree_mutated_output,
+        f"{label} canonical lineage helper did not positively detect the "
+        "implementation-mutated tree: "
+        f"{tree_mutated_output.strip()[:1000] or 'no output'}",
+    )
+    remove_proof_checkout(proof_dir, label)
+
+    create_proof_checkout(review_dir, proof_dir, head_sha, label, deadline)
+    create_synthetic_shape_commit(
+        proof_dir,
+        expected_tree_sha,
+        head_sha,
+        label,
+        deadline,
+    )
+    parent_mutated = run_repository_shape_helper(
+        proof_dir,
+        expected_parent_sha,
+        expected_tree_sha,
+        label,
+        "parent-mutated",
+        deadline,
+    )
+    parent_mutated_output = parent_mutated.stdout + parent_mutated.stderr
+    require(
+        parent_mutated.returncode == REPOSITORY_SHAPE_MISMATCH_EXIT
+        and REPOSITORY_SHAPE_MISMATCH_MARKER in parent_mutated_output,
+        f"{label} canonical lineage helper did not positively detect the "
+        "synthetic parent mutation: "
+        f"{parent_mutated_output.strip()[:1000] or 'no output'}",
+    )
+
+    return {
+        "proof_kind": "repository-shape",
+        "test_path": test_path,
+        "test_invocation": invocation,
+        "mutation_patch_sha256": hashlib.sha256(patch_text.encode("utf-8")).hexdigest(),
+        "mutated_files": changed,
+        "expected_parent_sha": expected_parent_sha,
+        "expected_tree_sha": expected_tree_sha,
+        "baseline_exit": baseline.returncode,
+        "tree_mutated_exit": tree_mutated.returncode,
+        "parent_mutated_exit": parent_mutated.returncode,
+        "baseline_output": baseline_output[:MAX_CAPTURE],
+        "tree_mutated_output": tree_mutated_output[:MAX_CAPTURE],
+        "parent_mutated_output": parent_mutated_output[:MAX_CAPTURE],
+    }
+
+
 def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
     require(isinstance(value, dict), "existing findings ledger must be an object")
     require_exact_keys(value, {"schema", "task_id", "pull_request", "findings", "runs"}, "ledger")
@@ -2576,28 +2953,94 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
             proof = event.get("proof")
             if event_status == "verified-fixed":
                 require(isinstance(proof, dict), f"{event_label}.proof must be an object")
-                required_proof = {
-                    "test_path",
-                    "test_invocation",
-                    "mutation_patch_sha256",
-                    "mutated_files",
-                    "baseline_exit",
-                    "mutated_exit",
-                    "baseline_output",
-                    "mutated_output",
-                }
+                if proof.get("proof_kind") == "repository-shape":
+                    required_proof = {
+                        "proof_kind",
+                        "test_path",
+                        "test_invocation",
+                        "mutation_patch_sha256",
+                        "mutated_files",
+                        "expected_parent_sha",
+                        "expected_tree_sha",
+                        "baseline_exit",
+                        "tree_mutated_exit",
+                        "parent_mutated_exit",
+                        "baseline_output",
+                        "tree_mutated_output",
+                        "parent_mutated_output",
+                    }
+                else:
+                    required_proof = {
+                        "test_path",
+                        "test_invocation",
+                        "mutation_patch_sha256",
+                        "mutated_files",
+                        "baseline_exit",
+                        "mutated_exit",
+                        "baseline_output",
+                        "mutated_output",
+                    }
                 require_exact_keys(proof, required_proof, f"{event_label}.proof")
-                require_string(proof.get("test_path"), f"{event_label}.proof.test_path")
-                validate_test_invocation(
+                test_path = require_string(
+                    proof.get("test_path"), f"{event_label}.proof.test_path"
+                )
+                invocation = validate_test_invocation(
                     proof.get("test_invocation"),
                     f"{event_label}.proof.test_invocation",
                 )
                 require(proof.get("baseline_exit") == 0, f"{event_label}.proof baseline did not pass")
-                require(
-                    isinstance(proof.get("mutated_exit"), int)
-                    and proof["mutated_exit"] != 0,
-                    f"{event_label}.proof mutation did not fail",
-                )
+                if proof.get("proof_kind") == "repository-shape":
+                    require(
+                        test_path == REPOSITORY_SHAPE_HELPER
+                        and invocation == {"runner": "bash", "arguments": []},
+                        f"{event_label}.proof is not anchored to the canonical lineage helper",
+                    )
+                    for key in ("expected_parent_sha", "expected_tree_sha"):
+                        sha = proof.get(key)
+                        require(
+                            isinstance(sha, str) and SHA_RE.fullmatch(sha) is not None,
+                            f"{event_label}.proof.{key} is invalid",
+                        )
+                    for key in ("tree_mutated_exit", "parent_mutated_exit"):
+                        require(
+                            proof.get(key) == REPOSITORY_SHAPE_MISMATCH_EXIT,
+                            f"{event_label}.proof {key} did not report the canonical mismatch",
+                        )
+                    for key in (
+                        "baseline_output",
+                        "tree_mutated_output",
+                        "parent_mutated_output",
+                    ):
+                        output = require_string(
+                            proof.get(key),
+                            f"{event_label}.proof.{key}",
+                            allow_empty=True,
+                        )
+                        marker = (
+                            REPOSITORY_SHAPE_MATCH_MARKER
+                            if key == "baseline_output"
+                            else REPOSITORY_SHAPE_MISMATCH_MARKER
+                        )
+                        require(
+                            marker in output,
+                            f"{event_label}.proof.{key} lacks {marker}",
+                        )
+                else:
+                    require(
+                        isinstance(proof.get("mutated_exit"), int)
+                        and proof["mutated_exit"] != 0,
+                        f"{event_label}.proof mutation did not fail",
+                    )
+                    require_string(
+                        proof.get("baseline_output"),
+                        f"{event_label}.proof.baseline_output",
+                        allow_empty=True,
+                    )
+                    require_string(
+                        proof.get("mutated_output"),
+                        f"{event_label}.proof.mutated_output",
+                        allow_empty=True,
+                    )
                 require(
                     isinstance(proof.get("mutation_patch_sha256"), str)
                     and re.fullmatch(r"[0-9a-f]{64}", proof["mutation_patch_sha256"])
@@ -2614,16 +3057,6 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
                         mutated_file,
                         f"{event_label}.proof.mutated_files[{file_index}]",
                     )
-                require_string(
-                    proof.get("baseline_output"),
-                    f"{event_label}.proof.baseline_output",
-                    allow_empty=True,
-                )
-                require_string(
-                    proof.get("mutated_output"),
-                    f"{event_label}.proof.mutated_output",
-                    allow_empty=True,
-                )
             elif event_status == "closed-equivalent":
                 require(
                     isinstance(proof, dict)
@@ -3071,28 +3504,44 @@ def review_output_schema(
             "receipt_contains": {"type": "string", "minLength": 1},
         }
     )
-    mutation = {
+    mutation_properties = {
+        "test_path": {"type": "string"},
+        "test_invocation": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["runner", "arguments"],
+            "properties": {
+                "runner": {"enum": sorted(TEST_RUNNERS)},
+                "arguments": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {"type": "string"},
+                },
+            },
+        },
+        "mutation_patch_path": {"type": "string"},
+    }
+    implementation_mutation = {
         "type": "object",
         "additionalProperties": False,
         "required": ["test_path", "test_invocation", "mutation_patch_path"],
+        "properties": mutation_properties,
+    }
+    repository_shape_mutation = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "proof_kind",
+            "test_path",
+            "test_invocation",
+            "mutation_patch_path",
+        ],
         "properties": {
-            "test_path": {"type": "string"},
-            "test_invocation": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["runner", "arguments"],
-                "properties": {
-                    "runner": {"enum": sorted(TEST_RUNNERS)},
-                    "arguments": {
-                        "type": "array",
-                        "maxItems": 64,
-                        "items": {"type": "string"},
-                    },
-                },
-            },
-            "mutation_patch_path": {"type": "string"},
+            **mutation_properties,
+            "proof_kind": {"const": "repository-shape"},
         },
     }
+    mutation = {"anyOf": [implementation_mutation, repository_shape_mutation]}
     nullable_reproduction = {"anyOf": [reproduction, {"type": "null"}]}
     nullable_mutation = {"anyOf": [mutation, {"type": "null"}]}
     nullable_string = {"anyOf": [{"type": "string"}, {"type": "null"}]}
@@ -3241,6 +3690,7 @@ def make_prompt(
     snapshot_value: dict[str, Any],
     ledger: dict[str, Any],
     config: dict[str, str],
+    repository_shape_inputs: dict[str, dict[str, str]],
 ) -> str:
     projection = ledger_prompt_projection(ledger, snapshot_value["head_sha"])
     same_model_warning = ""
@@ -3249,6 +3699,18 @@ def make_prompt(
 SAME-MODEL REVIEW - REDUCED MODEL INDEPENDENCE:
 You are using the same model as the author and may share the author's blind spots and priors.
 Compensate explicitly: attack the change adversarially, try to falsify the author's claims rather than confirm them, and default to reporting a finding when uncertain.
+"""
+    repository_shape_route = """
+No repository-shape route was authorized for this run.
+A reviewer verdict cannot activate that route by setting proof_kind; every code-behavior finding still needs its own tracked named test.
+"""
+    if repository_shape_inputs:
+        repository_shape_route = f"""
+The gate caller explicitly authorized the canonical repository-shape route only for these finding-scoped inputs:
+{json.dumps(repository_shape_inputs, indent=2, sort_keys=True)}
+For one of those findings only, you may set mutation_proof.proof_kind to repository-shape, name exactly {REPOSITORY_SHAPE_HELPER} as test_path, use the bash runner with no arguments, and supply an implementation-only mutation patch as usual.
+Do not copy the expected SHAs into the helper or runner arguments; the gate supplies them and independently requires the unchanged canonical helper to pass on the exact head, fail on the implementation-mutated tree, and fail on a separately parent-mutated synthetic head.
+This route applies only when the finding's entire claim is exact single-parent and tree identity; a code-behavior defect remains ineligible even if the same commit also has the expected shape.
 """
     return f"""You are the independent merge-gate reviewer for a pull request.
 {same_model_warning}Review exact head {snapshot_value['head_sha']} against exact base {snapshot_value['base_sha']}.
@@ -3260,8 +3722,9 @@ Write mutation patches only under .crosscheck/mutations/.
 
 A new finding is admissible only when you provide a reproduction helper and command that you actually ran.
 The command must name its helper, and its exit code plus a distinctive output marker must reproduce the defect.
-A prior finding is verified-fixed only when you name a tracked test, provide a structured test invocation, and provide a patch under .crosscheck/mutations/ that breaks or reverts cited implementation without changing test or evidence support.
+A prior code-behavior finding is verified-fixed only when you name its tracked test, provide a structured test invocation, and provide a patch under .crosscheck/mutations/ that breaks or reverts cited implementation without changing test or evidence support.
 The mutation may change only implementation paths already cited by that finding.
+{repository_shape_route}
 The gate appends the named test path to the approved runner invocation, destroys all baseline state, and recreates the same clean checkout path before applying the mutation.
 test_path may be a plain repository path, or a `path::selector` node id when the runner is one of: {', '.join(sorted(NODE_ID_RUNNERS))}.
 The proof checkout starts as a fresh clone holding tracked files only.
@@ -3570,6 +4033,7 @@ def run_reviewer(
     ledger: dict[str, Any],
     config: dict[str, str],
     author_account_identity: str,
+    repository_shape_inputs: dict[str, dict[str, str]],
 ) -> Any:
     pi_command = (
         pi_reviewer_command()
@@ -3577,7 +4041,8 @@ def run_reviewer(
         else None
     )
     protocol_dir = review_dir / ".crosscheck"
-    protocol_dir.mkdir(mode=0o700)
+    protocol_dir.mkdir(mode=0o700, exist_ok=True)
+    protocol_dir.chmod(0o700)
     environment = os.environ.copy()
     for provider_variable in (
         "CODEX_HOME",
@@ -3643,7 +4108,9 @@ def run_reviewer(
     output_path = protocol_dir / "review-result.json"
     schema_path.write_text(json.dumps(schema_value, indent=2) + "\n", encoding="utf-8")
     environment["HOME"] = config["execution_home"]
-    prompt = make_prompt(snapshot_value, ledger, config)
+    prompt = make_prompt(
+        snapshot_value, ledger, config, repository_shape_inputs
+    )
     if config["harness"] == "codex":
         codex = reviewer_binary("FM_CROSSCHECK_CODEX_BIN", "codex", "Codex reviewer")
         environment["CODEX_HOME"] = config["account_home"]
@@ -3959,7 +4426,13 @@ def apply_review(
     proof_root: Path,
     snapshot_value: dict[str, Any],
     config: dict[str, str],
+    root: Path | None = None,
+    repository_shape_inputs: dict[str, dict[str, str]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if root is None:
+        root = BIN_DIR.parent
+    if repository_shape_inputs is None:
+        repository_shape_inputs = {}
     now = utc_now()
     working_ledger = copy.deepcopy(ledger)
     by_id = {finding["id"]: finding for finding in working_ledger["findings"]}
@@ -4048,6 +4521,8 @@ def apply_review(
                     {citation["path"] for citation in by_id[target]["citations"]},
                     f"{label}.mutation_proof",
                     evidence_deadline,
+                    root,
+                    repository_shape_inputs.get(target),
                 )
             except CrosscheckCoverageError as exc:
                 status = "claimed-fixed"
@@ -4467,7 +4942,13 @@ def write_ledger(path: Path, ledger: dict[str, Any]) -> None:
     atomic_write(path, encoded)
 
 
-def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
+def run_crosscheck(
+    root: Path,
+    home: Path,
+    task_id: str,
+    url: str,
+    repository_shape_inputs: dict[str, dict[str, str]],
+) -> int:
     state = Path(environment_value("FM_STATE_OVERRIDE", str(home / "state")))
     data = Path(environment_value("FM_DATA_OVERRIDE", str(home / "data")))
     try:
@@ -4493,6 +4974,13 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
         except OSError:
             pass
         tool_fail(reason)
+    finding_ids = {finding["id"] for finding in ledger["findings"]}
+    unknown_shape_inputs = sorted(set(repository_shape_inputs) - finding_ids)
+    if unknown_shape_inputs:
+        tool_fail(
+            "repository-shape gate input names unknown durable finding(s): "
+            + ", ".join(unknown_shape_inputs)
+        )
     config: dict[str, str] | None = None
     author_account_identity = ""
 
@@ -4556,6 +5044,7 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
                         ledger,
                         config,
                         author_account_identity,
+                        repository_shape_inputs,
                     )
                 except CrosscheckToolError as exc:
                     if not remaining:
@@ -4585,7 +5074,14 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
                     config,
                 )
                 ledger, run = apply_review(
-                    ledger, review, review_dir, temp_root, snapshot_value, config
+                    ledger,
+                    review,
+                    review_dir,
+                    temp_root,
+                    snapshot_value,
+                    config,
+                    root,
+                    repository_shape_inputs,
                 )
                 assert_review_checkout_intact(review_dir, snapshot_value["head_sha"])
                 break
@@ -4762,6 +5258,17 @@ def build_parser() -> argparse.ArgumentParser:
         command = subparsers.add_parser(name)
         command.add_argument("task_id")
         command.add_argument("pr_url")
+        if name == "run":
+            command.add_argument(
+                "--repository-shape-input",
+                action="append",
+                default=[],
+                metavar="FINDING_ID:PARENT_SHA:TREE_SHA",
+                help=(
+                    "authorize the canonical parent/tree proof for one existing "
+                    "repository-shape finding; repeat for additional findings"
+                ),
+            )
     merge = subparsers.add_parser("merge")
     merge.add_argument("task_id")
     merge.add_argument("pr_url")
@@ -4823,7 +5330,16 @@ def main() -> int:
             except BlockingIOError:
                 tool_fail("another crosscheck operation already owns this task")
             if args.command == "run":
-                return run_crosscheck(root, home, args.task_id, args.pr_url)
+                repository_shape_inputs = parse_repository_shape_inputs(
+                    args.repository_shape_input
+                )
+                return run_crosscheck(
+                    root,
+                    home,
+                    args.task_id,
+                    args.pr_url,
+                    repository_shape_inputs,
+                )
             if args.command == "verify":
                 return verify_crosscheck(root, home, args.task_id, args.pr_url)
             return merge_crosschecked(

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/fm-backend-tmux-target-exists.test.sh - both-direction existence and
 # identity pins for the tmux backend, against a REAL tmux server isolated on a
-# short repo-local socket (`-S`), like tests/fm-backend-tmux-smoke.test.sh. A faked tmux
+# private socket (`-L`), like tests/fm-backend-tmux-smoke.test.sh. A faked tmux
 # cannot cover this: the defect these tests pin was a behavior of tmux itself.
 #
 # The defect: `tmux display-message -p -t <session>:<window>` is not an
@@ -21,19 +21,17 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT" || exit 1
 
 fail() { printf 'not ok - %s\n' "$1" >&2; cleanup_all; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
 command -v tmux >/dev/null 2>&1 || { echo "skip: tmux not found"; exit 0; }
 REAL_TMUX=$(command -v tmux)
-SOCKET="./.fm-target-exists-$$.sock"
+SOCKET="fm-target-exists-$$"
 SHIM_DIR=
 
 cleanup_all() {
-  "$REAL_TMUX" -S "$SOCKET" kill-server >/dev/null 2>&1 || true
-  rm -f -- "$SOCKET"
+  "$REAL_TMUX" -L "$SOCKET" kill-server >/dev/null 2>&1 || true
   [ -n "${SHIM_DIR:-}" ] && rm -rf "$SHIM_DIR"
 }
 trap cleanup_all EXIT
@@ -43,7 +41,7 @@ trap cleanup_all EXIT
 SHIM_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-target-exists.XXXXXX")
 cat > "$SHIM_DIR/tmux" <<SH
 #!/usr/bin/env bash
-exec "$REAL_TMUX" -S "$SOCKET" "\$@"
+exec "$REAL_TMUX" -L "$SOCKET" "\$@"
 SH
 chmod +x "$SHIM_DIR/tmux"
 PATH="$SHIM_DIR:$PATH"

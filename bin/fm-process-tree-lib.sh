@@ -27,9 +27,10 @@ fm_process_tree_emit_snapshot() {
   ' "$path" "$size"
 }
 
-fm_run_bounded() {
+_fm_run_bounded_owned() {
   local seconds=$1 result_file stdout_file stderr_file owner_output_file result status cleanup
-  shift
+  owner_output_file=$2
+  shift 2
   FM_PROCESS_TREE_CLEANUP_STATUS=not-started
   command -v perl >/dev/null 2>&1 || {
     echo "error: perl is required for bounded process-tree control" >&2
@@ -49,7 +50,6 @@ fm_run_bounded() {
     echo "error: cannot create bounded process-tree diagnostic channel" >&2
     return "$FM_PROCESS_TREE_SETUP_FAILURE_STATUS"
   }
-  owner_output_file=${FM_PROCESS_TREE_OWNER_OUTPUT_FILE:-}
   # shellcheck disable=SC2016
   if FM_PROCESS_TREE_RESULT_FILE=$result_file \
     FM_PROCESS_TREE_STDOUT_FILE=$stdout_file \
@@ -350,6 +350,10 @@ fm_run_bounded() {
   return "$status"
 }
 
+fm_run_bounded() {
+  _fm_run_bounded_owned "$1" "" "${@:2}"
+}
+
 fm_run_bounded_capture() {
   local combine=0 output_name output_file output status
   if [ "${1:-}" = "--combine-stderr" ]; then
@@ -363,11 +367,11 @@ fm_run_bounded_capture() {
     return "$FM_PROCESS_TREE_SETUP_FAILURE_STATUS"
   }
   if [ "$combine" -eq 1 ]; then
-    if FM_PROCESS_TREE_OWNER_OUTPUT_FILE=$output_file \
-      fm_run_bounded "$@" >"$output_file" 2>&1; then status=0; else status=$?; fi
+    if _fm_run_bounded_owned "$1" "$output_file" "${@:2}" \
+      >"$output_file" 2>&1; then status=0; else status=$?; fi
   else
-    if FM_PROCESS_TREE_OWNER_OUTPUT_FILE=$output_file \
-      fm_run_bounded "$@" >"$output_file"; then status=0; else status=$?; fi
+    if _fm_run_bounded_owned "$1" "$output_file" "${@:2}" \
+      >"$output_file"; then status=0; else status=$?; fi
   fi
   output=$(cat "$output_file")
   rm -f "$output_file"

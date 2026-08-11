@@ -315,12 +315,19 @@ root=$1
 temp_dir=$2
 command_pid_file=$3
 mode=$4
+unrelated_file=${5:-}
 # shellcheck source=bin/fm-process-tree-lib.sh
 . "$root/bin/fm-process-tree-lib.sh"
 captured=
 status=0
 if [ "$mode" = parent-loss ]; then
   TMPDIR=$temp_dir fm_run_bounded_capture captured 20 sh -c '
+    printf "%s\n" "$$" > "$1"
+    sleep 20
+  ' sh "$command_pid_file" || status=$?
+elif [ "$mode" = ambient-parent-loss ]; then
+  export FM_PROCESS_TREE_OWNER_OUTPUT_FILE=$unrelated_file
+  TMPDIR=$temp_dir fm_run_bounded 20 sh -c '
     printf "%s\n" "$$" > "$1"
     sleep 20
   ' sh "$command_pid_file" || status=$?
@@ -467,6 +474,34 @@ SH
   wait_for_exit "$ACTIVE_COMMAND" "parent-loss bounded command"
   ACTIVE_SUPERVISOR=
   ACTIVE_COMMAND=
+  assert_no_process_tree_artifacts "$temp_dir"
+
+  temp_dir="$case_root/ambient-parent-loss"
+  mkdir -p "$temp_dir"
+  output="$temp_dir/unrelated"
+  printf '%s\n' preserved > "$output"
+  "$fixture" "$ROOT" "$temp_dir" "$temp_dir/command.pid" ambient-parent-loss "$output" \
+    >"$case_root/ambient-parent-loss.out" 2>"$case_root/ambient-parent-loss.err" &
+  ACTIVE_CALLER=$!
+  wait_for_file "$temp_dir/command.pid"
+  ACTIVE_COMMAND=$(cat "$temp_dir/command.pid")
+  supervisor=
+  for _ in $(seq 1 200); do
+    supervisor=$(find_perl_child "$ACTIVE_CALLER")
+    [ -n "$supervisor" ] && break
+    sleep 0.01
+  done
+  [ -n "$supervisor" ] || fail "ambient parent-loss fixture did not expose its Perl supervisor"
+  ACTIVE_SUPERVISOR=$supervisor
+  kill -KILL "$ACTIVE_CALLER"
+  wait "$ACTIVE_CALLER" 2>/dev/null || true
+  ACTIVE_CALLER=
+  wait_for_exit "$ACTIVE_SUPERVISOR" "ambient parent-loss bounded supervisor"
+  wait_for_exit "$ACTIVE_COMMAND" "ambient parent-loss bounded command"
+  ACTIVE_SUPERVISOR=
+  ACTIVE_COMMAND=
+  [ "$(cat "$output")" = preserved ] \
+    || fail "ambient ownership injection removed or changed an unrelated file"
   assert_no_process_tree_artifacts "$temp_dir"
 
   temp_dir="$case_root/repeated"

@@ -131,6 +131,11 @@ It is marked cleanup-verified only after exact compute absence, and is deleted o
 Cost Management 429 responses use a bounded fail-closed retry and honor Azure's QPU, Consumption, or standard retry guidance.
 Only a previously successful response bound to the exact subscription, resource group, endpoint, and body digest, carrying an authoritative server date and younger than four hours, may cover a retry interval beyond the bounded deadline; stale, mismatched, malformed, or absent cache data refuses admission.
 
+`FM_AZURE_RUNNER_COST_ADMISSION_MODE` defaults to `strict`, which always requires the authoritative actual-plus-forecast gate above.
+The explicit `commissioning-bounded` mode is limited to one approved commissioning runner and additionally requires `--confirm-cost-admission-mode commissioning-bounded`, `FM_AZURE_RUNNER_MAX_CONCURRENCY=1`, and `FM_AZURE_RUNNER_BUDGET_LIMIT_USD=1500`.
+It intentionally does not query or claim cumulative actual or forecast spend. Instead, it verifies the exact `$1,500` Monthly resource-group Budget and all eight configured alerts, the exact 29-resource private foundation with zero foreign resource, zero other active runner queue record, zero runner compute, and zero outstanding reservation before reserving the complete itemized 24-hour maximum in a mode-tagged durable management reservation.
+The normal strict gate remains mandatory for parallel or later routine operation.
+
 The normal budget limit is the active $1,000 target.
 An operator may select the commissioning ceiling of $1,500 through `FM_AZURE_RUNNER_BUDGET_LIMIT_USD=1500` only during the approved commissioning window.
 Admission emits separate first-hour and first-day bounds itemized as VM compute, OS-disk capacity, NAT Gateway, public IP, private endpoints, private DNS, monitoring, boot diagnostics, storage capacity, storage operations, control operations, provisioning/control interval, NAT data processing, Internet egress, trusted bootstrap traffic, the conservative $210 foundation reserve, and zero repository-command egress.
@@ -215,6 +220,22 @@ Run one heavy command directly after landed deployment and explicit approval:
 bin/fm-azure-runner.sh run \
   --confirm-run \
   --confirm-subscription "$FM_AZURE_SUBSCRIPTION_ID" \
+  --task "$FM_AZURE_RUNNER_TASK" \
+  --generation "$FM_AZURE_RUNNER_GENERATION" \
+  --resource-class behavior-heavy \
+  -- bin/fm-azure-runner-command.sh bash -c 'tests/run.sh --skip-herdr'
+```
+
+For the explicitly approved single commissioning run only:
+
+```sh
+export FM_AZURE_RUNNER_COST_ADMISSION_MODE=commissioning-bounded
+export FM_AZURE_RUNNER_MAX_CONCURRENCY=1
+export FM_AZURE_RUNNER_BUDGET_LIMIT_USD=1500
+bin/fm-azure-runner.sh run \
+  --confirm-run \
+  --confirm-subscription "$FM_AZURE_SUBSCRIPTION_ID" \
+  --confirm-cost-admission-mode commissioning-bounded \
   --task "$FM_AZURE_RUNNER_TASK" \
   --generation "$FM_AZURE_RUNNER_GENERATION" \
   --resource-class behavior-heavy \

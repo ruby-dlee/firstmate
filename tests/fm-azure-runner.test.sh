@@ -33,6 +33,21 @@ runner() {
     FM_AZURE_DEPLOYMENT_GENERATION=gen-one FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID="$PE_GUID" "$RUNNER" "$@"
 }
 
+environment_mode_defaults() {
+  local home
+  home=$(mktemp -d)
+  env FM_HOME="$home" FM_AZURE_TENANT_ID="$TENANT" FM_AZURE_SUBSCRIPTION_ID="$SUB" \
+    FM_AZURE_NAMING_PREFIX=fmtest FM_AZURE_STORAGE_NAME=fmteststorage0001 FM_AZURE_OWNER_TAG=owner \
+    FM_AZURE_DEPLOYMENT_GENERATION=gen-one FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID="$PE_GUID" \
+    python3 - "$HOST" <<'PY'
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+assert m.environment()["cost_admission_mode"]=="strict"
+PY
+  rm -rf "$home"
+  pass "normal environment defaults to strict without commissioning evidence or confirmation variables"
+}
+
 static_private_controller_contract() {
   python3 - "$TEMPLATE" "$HOST" "$GUEST" <<'PY' || fail "private controller static contract failed"
 import json, pathlib, sys
@@ -227,7 +242,7 @@ try: m.require_zero_effective_rbac(env,"principal","unreadable")
 except m.RunnerError: pass
 else: raise AssertionError("unreadable effective RBAC accepted")
 reservation_id="/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-prefix-rsv-aaaaaaaaaaaa"
-identity={"id":reservation_id,"location":"eastus","etag":"E","properties":{"principalId":"p"},"tags":{"workload":"firstmate","firstmate-role":"runner-cost-reservation","deployment-generation":"gen","cleanup-owner":"owner","invocation-binding":"azr-aaaaaaaaaaaa","fence-digest":"a"*64,"lineage-root":"azr-aaaaaaaaaaaa","parent-invocation":"none","amount-microusd":"1","reserved-at":"2026-01-01T00:00:00Z","compute-deadline":"2026-01-02T00:00:00Z","cleanup-verified-at":"none","reservation-principal":"p"}}
+identity={"id":reservation_id,"location":"eastus","etag":"E","properties":{"principalId":"p"},"tags":{"workload":"firstmate","firstmate-role":"runner-cost-reservation","deployment-generation":"gen","cleanup-owner":"owner","invocation-binding":"azr-aaaaaaaaaaaa","fence-digest":"a"*64,"lineage-root":"azr-aaaaaaaaaaaa","parent-invocation":"none","amount-microusd":"1","cost-admission-mode":"strict","reserved-at":"2026-01-01T00:00:00Z","compute-deadline":"2026-01-02T00:00:00Z","cleanup-verified-at":"none","reservation-principal":"p"}}
 env.update({"deployment_generation":"gen","owner":"owner"})
 calls=[]
 def reservation_az(_env,args,**kwargs):
@@ -279,12 +294,82 @@ PY
   pass "Cost Management retry is bounded, honors both Azure guidance headers, and only permits a short exact authoritative cache"
 }
 
+commissioning_admission_unit() {
+  python3 - "$HOST" <<'PY' || fail "commissioning admission adversaries failed"
+import importlib.util, pathlib, tempfile, sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+env={"subscription":"sub","resource_group":"rg","prefix":"prefix","max_concurrency":1,"budget_limit":1500,"cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE,"state_dir":pathlib.Path(tempfile.mkdtemp()),"azure_operation_count":0}
+state={"schema":m.SCHEMA,"invocation":"azr-aaaaaaaaaaaa","request":{"fence":"sha256:"+"a"*64,"lineage_root_invocation":"azr-aaaaaaaaaaaa","cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE,"compute_deallocation_deadline":"2026-01-02T00:00:00Z"}}
+limits=dict(m.RESOURCE_CLASSES["behavior-heavy"]); limits.update({"sku":"Standard_D4as_v6","sku_family":"standardDav6Family"})
+seen=[]
+m.cost_query=lambda *_a,**_k: (_ for _ in ()).throw(AssertionError("commissioning queried Cost Management"))
+real_commissioning_budget=m.exact_commissioning_budget
+m.exact_commissioning_budget=lambda _env:seen.append("budget") or {"id":"budget","etag":"E"}
+m.commissioning_inventory_gate=lambda _env,_state:seen.append("inventory")
+m.list_management_reservations=lambda _env:[]
+m.retail_rate=lambda _env,_sku:0.10
+cost=m.commissioning_cost_gate(env,state,limits)
+assert seen==["budget","inventory"] and cost["actual"] is None and cost["forecast"] is None
+assert cost["cost_admission_mode"]==m.COMMISSIONING_COST_ADMISSION_MODE
+assert cost["max_increment"]==cost["first_day"]["total"] and cost["max_billable_lifetime_hours"]==24
+tags=m.reservation_tags({**env,"deployment_generation":"gen","owner":"owner"},state,cost["max_increment"],"2026-01-01T00:00:00Z")
+assert tags["cost-admission-mode"]==m.COMMISSIONING_COST_ADMISSION_MODE
+# The live Budget contract is exact: $1500 Monthly RG filter and all eight alerts.
+notifications={}
+for prefix,kind in (("Actual","Actual"),("Forecast","Forecasted")):
+    for label,threshold in (("750",50),("1000",66.67),("1250",83.33),("1500",100)):
+        notifications[prefix+label]={"enabled":True,"operator":"GreaterThanOrEqualTo","threshold":threshold,"thresholdType":kind,"contactEmails":["operator@example.invalid"]}
+budget={"id":"/subscriptions/sub/providers/Microsoft.Consumption/budgets/bud-prefix-monthly","name":"bud-prefix-monthly","type":"Microsoft.Consumption/budgets","eTag":"E","properties":{"category":"Cost","amount":1500,"timeGrain":"Monthly","filter":{"dimensions":{"name":"ResourceGroupName","operator":"In","values":["rg"]}},"notifications":notifications}}
+m.az_command=lambda *_a,**_k:(budget,0,"")
+m.exact_commissioning_budget=real_commissioning_budget
+assert m.exact_commissioning_budget(env)["etag"]=="E"
+notifications["Actual750"]["enabled"]=False
+try: m.exact_commissioning_budget(env)
+except m.RunnerError: pass
+else: raise AssertionError("commissioning accepted a disabled budget alert")
+notifications["Actual750"]["enabled"]=True
+for change,text in (({"max_concurrency":2},"concurrency 1"),({"budget_limit":1000},"$1500")):
+    changed=dict(env); changed.update(change)
+    try: m.commissioning_cost_gate(changed,state,limits)
+    except m.RunnerError as exc: assert text in str(exc)
+    else: raise AssertionError("invalid commissioning policy accepted")
+m.list_management_reservations=lambda _env:[{}]
+try: m.commissioning_cost_gate(env,state,limits)
+except m.RunnerError as exc: assert "zero outstanding" in str(exc)
+else: raise AssertionError("commissioning accepted an outstanding reservation")
+# Default strict mode calls actual and forecast and propagates an unavailable forecast.
+strict_env=dict(env,cost_admission_mode=m.STRICT_COST_ADMISSION_MODE,budget_limit=1000,max_concurrency=4)
+calls=[]
+def cost_query(_env,forecast=False,**_kwargs):
+    calls.append(forecast)
+    if forecast: raise m.RunnerError("429")
+    return 0.0
+m.cost_query=cost_query
+try: m.budget_gate(strict_env,limits)
+except m.RunnerError: pass
+else: raise AssertionError("strict admission bypassed unavailable Cost Management")
+assert calls==[False,True]
+# Dispatch requires exact explicit confirmation only for commissioning mode.
+minimal={"invocation":"azr-aaaaaaaaaaaa","parent_invocation":None,"request":{"fence":"sha256:"+"a"*64,"lineage_root_invocation":"azr-aaaaaaaaaaaa","cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE}}
+try: m.dispatch_prepared(env,minimal,"sub",None)
+except m.RunnerError as exc: assert "--confirm-cost-admission-mode" in str(exc)
+else: raise AssertionError("commissioning ran without exact confirmation")
+minimal["request"]["cost_admission_mode"]=m.STRICT_COST_ADMISSION_MODE
+try: m.dispatch_prepared(strict_env,minimal,"sub",m.COMMISSIONING_COST_ADMISSION_MODE)
+except m.RunnerError as exc: assert "accepted only" in str(exc)
+else: raise AssertionError("strict mode accepted commissioning confirmation")
+PY
+  pass "strict remains authoritative while explicit commissioning is single-concurrency, alert-budgeted, itemized, and reservation-bound"
+}
+
 static_private_controller_contract
+environment_mode_defaults
 prepare_contract
 executor_credential_adversary
 linux_systemd_drop_integration
 management_fencing_unit
 effective_rbac_adversaries
 cost_retry_unit
+commissioning_admission_unit
 
 echo "# fm-azure-runner.test.sh: all assertions passed"

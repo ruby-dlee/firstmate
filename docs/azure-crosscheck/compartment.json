@@ -59,9 +59,6 @@
       "type": "int",
       "minValue": 1,
       "maxValue": 65535
-    },
-    "githubMetadataHost": {
-      "type": "string"
     }
   },
   "resources": [

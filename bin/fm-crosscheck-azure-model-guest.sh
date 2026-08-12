@@ -2,10 +2,10 @@
 # Trusted root-side Azure Crosscheck model-compartment payload.
 #
 # This compartment receives exactly one reviewer credential and no repository.
-# Every repository read/grep/diff/evidence command is delegated to a fresh
-# identity-less `crosscheck-tool` Azure runner invocation through the fixed
-# model-image tool bridge. The accepted evidence is replayed by that bridge in
-# another new runner invocation before it publishes a verdict.
+# The model receives one bounded static exact-head review packet and has no
+# repository or command tools. Reviewer-supplied evidence is returned as data;
+# the host controller executes and replays it later in fresh credentialless
+# `crosscheck-tool` Azure runner invocations.
 set -euo pipefail
 umask 077
 
@@ -31,8 +31,8 @@ rm -rf "$BASE"
 install -d -m 0700 -o root -g root "$BASE"
 INPUT=$BASE/request.json
 CREDENTIAL=$BASE/credential.tar.gz
-curl --fail --silent --show-error --output "$INPUT" "$INPUT_URL"
-curl --fail --silent --show-error --output "$CREDENTIAL" "$CREDENTIAL_URL"
+curl --fail --silent --show-error --max-filesize 2097152 --output "$INPUT" "$INPUT_URL"
+curl --fail --silent --show-error --max-filesize 131072 --output "$CREDENTIAL" "$CREDENTIAL_URL"
 unset INPUT_URL CREDENTIAL_URL
 
 python3 - "$INPUT" "$REVIEW_GENERATION" "$GUEST_DIGEST" <<'PY'
@@ -62,13 +62,10 @@ if value.get("tool_protocol", {}).get("network_bytes") != 0:
     raise SystemExit("model guest: repository tool contract is not networkless")
 PY
 
-# The pinned image owns the reviewer CLI closure and a local unprivileged tool
-# client. The controller never accepts a mutable bridge endpoint: exactly one
-# systemd socket, installed from the reviewed image, speaks the bounded RPC.
-# The server owns fresh tool/verifier Azure runners and returns only output and
-# compartment identities. The model process can never invoke Azure itself.
-BRIDGE_CLIENT=/usr/local/libexec/fm-crosscheck-tool-client
-[ -x "$BRIDGE_CLIENT" ] || { echo "model guest: pinned tool client is absent" >&2; exit 125; }
+# The pinned image owns only the reviewer CLI closure needed in this
+# credentialed compartment. No Azure CLI, repository helper, shell tool, tool
+# socket, container client, or generic command interface is exposed to the
+# reviewer process.
 command -v jq >/dev/null 2>&1 || { echo "model guest: jq is absent from pinned image" >&2; exit 125; }
 
 HARNESS=$(jq -r '.reviewer.harness' "$INPUT")
@@ -82,33 +79,65 @@ jq -c '.review_schema' "$INPUT" >"$SCHEMA"
 ACCOUNT=$BASE/account
 HOME_DIR=$BASE/home
 install -d -m 0700 -o root -g root "$ACCOUNT" "$HOME_DIR"
-python3 - "$CREDENTIAL" "$ACCOUNT" <<'PY'
+python3 - "$CREDENTIAL" "$ACCOUNT" "$INPUT" <<'PY'
+import hashlib
+import json
 import pathlib
 import sys
 import tarfile
 
 source = pathlib.Path(sys.argv[1])
 destination = pathlib.Path(sys.argv[2])
+request = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
+reviewer = request["reviewer"]
+identity = request["identity"]
+if "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest() != identity["credential_archive_digest"]:
+    raise SystemExit("model guest: credential archive digest mismatch")
+expected_name = "auth.json" if reviewer["harness"] in {"codex", "pi"} else ".credentials.json"
 with tarfile.open(source, "r:gz") as archive:
     members = archive.getmembers()
     names = {member.name for member in members}
-    if "manifest.json" not in names or len(names) != 2:
+    if names != {"manifest.json", expected_name} or len(members) != 2:
         raise SystemExit("model guest: credential archive shape mismatch")
     for member in members:
         if not member.isfile() or member.issym() or member.islnk() or member.isdev() or member.size > 64 * 1024:
             raise SystemExit("model guest: unsafe credential archive member")
-    archive.extractall(destination, members=members)
+    manifest_bytes = archive.extractfile("manifest.json").read()
+    credential_bytes = archive.extractfile(expected_name).read()
+manifest = json.loads(manifest_bytes)
+expected = {
+    "schema": request["schema"],
+    "review_generation": request["identity"]["review_generation"],
+    "harness": reviewer["harness"],
+    "model": reviewer["model"],
+    "effort": reviewer["effort"],
+    "credential_name": expected_name,
+    "credential_digest": "sha256:" + hashlib.sha256(credential_bytes).hexdigest(),
+}
+if manifest != expected or manifest["credential_digest"] != identity["credential_digest"]:
+    raise SystemExit("model guest: credential manifest identity mismatch")
+if reviewer["harness"] in {"codex", "pi"}:
+    credential = json.loads(credential_bytes)
+    if reviewer["harness"] == "codex":
+        tokens = credential.get("tokens") if isinstance(credential, dict) else None
+        account = tokens.get("account_id") if isinstance(tokens, dict) else None
+    else:
+        entry = credential.get("openai-codex") if isinstance(credential, dict) else None
+        account = entry.get("accountId") if isinstance(entry, dict) else None
+    if not isinstance(account, str) or "sha256:" + hashlib.sha256(account.encode()).hexdigest() != identity["reviewer_account_digest"]:
+        raise SystemExit("model guest: credential executing account mismatch")
+path = destination / expected_name
+path.write_bytes(credential_bytes)
+path.chmod(0o600)
 PY
+rm -f "$CREDENTIAL"
 rm -f "$CREDENTIAL"
 
 export HOME="$HOME_DIR"
 export TMPDIR="$BASE/tmp"
 export XDG_CACHE_HOME="$BASE/cache"
 install -d -m 0700 -o root -g root "$TMPDIR" "$XDG_CACHE_HOME"
-export FM_CROSSCHECK_AZURE_TOOL_BRIDGE="$BRIDGE_CLIENT"
 export FM_CROSSCHECK_REVIEW_GENERATION="$REVIEW_GENERATION"
-export FM_CROSSCHECK_REQUEST="$INPUT"
-export FM_CROSSCHECK_REQUEST_ROOT="$BASE"
 unset AZURE_CONFIG_DIR ARM_CLIENT_ID ARM_CLIENT_SECRET AZURE_CLIENT_ID AZURE_CLIENT_SECRET SSH_AUTH_SOCK DOCKER_HOST
 
 RESULT=$BASE/reviewer-result.json
@@ -116,7 +145,8 @@ case "$HARNESS" in
   codex)
     export CODEX_HOME="$ACCOUNT"
     codex exec -C "$BASE" --sandbox read-only --ephemeral --strict-config \
-      --ignore-user-config --ignore-rules \
+      --ignore-user-config --ignore-rules --skip-git-repo-check \
+      --disable shell_tool --disable unified_exec --disable code_mode_host \
       -c project_doc_max_bytes=0 --model "$MODEL" \
       -c "model_reasoning_effort=\"$EFFORT\"" \
       --color never --output-schema "$SCHEMA" --output-last-message "$RESULT" - <"$PROMPT"
@@ -125,7 +155,8 @@ case "$HARNESS" in
     export CLAUDE_CONFIG_DIR="$ACCOUNT"
     export CLAUDE_SECURESTORAGE_CONFIG_DIR="$ACCOUNT"
     claude -p --safe-mode --model "$MODEL" --effort "$EFFORT" \
-      --dangerously-skip-permissions --tools Read --no-session-persistence \
+      --dangerously-skip-permissions --tools "" --no-session-persistence \
+      --disable-slash-commands --strict-mcp-config --mcp-config '{}' \
       --output-format json --json-schema "$(<"$SCHEMA")" "$(<"$PROMPT")" >"$BASE/claude-envelope.json"
     jq -e '.is_error == false and .subtype == "success" and .terminal_reason == "completed" and (.structured_output|type == "object")' "$BASE/claude-envelope.json" >/dev/null
     jq -c '.structured_output' "$BASE/claude-envelope.json" >"$RESULT"
@@ -133,7 +164,7 @@ case "$HARNESS" in
   pi)
     export PI_CODING_AGENT_DIR="$ACCOUNT"
     pi --mode json --provider openai-codex --model "$MODEL" --thinking "$EFFORT" \
-      --tools read --no-session --no-extensions --no-skills --no-prompt-templates \
+      --no-tools --no-session --no-extensions --no-skills --no-prompt-templates \
       --no-themes --no-context-files --no-approve "$(<"$PROMPT")" >"$BASE/pi-events.jsonl"
     python3 - "$BASE/pi-events.jsonl" "$RESULT" <<'PY'
 import json
@@ -169,45 +200,31 @@ PY
 esac
 
 [ -s "$RESULT" ] || { echo "model guest: reviewer produced no verdict" >&2; exit 125; }
-# The trusted bridge server must independently replay every accepted helper in
-# another fresh networkless VM and emit exact tool/verifier identities before
-# publication. The unprivileged client only writes one bounded RPC and reads one
-# bounded reply; it has no Azure credential or socket other than this endpoint.
-BRIDGE_RESULT=$BASE/bridge-result.json
-"$BRIDGE_CLIENT" finalize --request "$INPUT" --verdict "$RESULT" --output "$BRIDGE_RESULT"
+rm -rf "$ACCOUNT"
+[ ! -e "$ACCOUNT" ] && [ ! -e "$CREDENTIAL" ] || { echo "model guest: reviewer credential cleanup failed" >&2; exit 125; }
 
-python3 - "$INPUT" "$RESULT" "$BRIDGE_RESULT" "$BASE/output.json" "$VM_RESOURCE_ID" "$VM_INSTANCE_ID" <<'PY'
-import hashlib
+python3 - "$INPUT" "$RESULT" "$BASE/output.json" "$VM_RESOURCE_ID" "$VM_INSTANCE_ID" <<'PY'
 import json
 import pathlib
 import sys
 
 request = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-verdict = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
-bridge = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
+review = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 identity = request["identity"]
-for label in ("tool_identity", "verifier_identity"):
-    value = bridge.get(label)
-    if not isinstance(value, dict):
-        raise SystemExit("model guest: bridge omitted " + label)
-    if value.get("review_generation") != identity["review_generation"]:
-        raise SystemExit("model guest: bridge generation mismatch")
-    if value.get("network_bytes") != 0 or value.get("credential_present") is not False:
-        raise SystemExit("model guest: bridge did not prove networkless credentialless execution")
-evidence_files = bridge.get("evidence_files")
-if not isinstance(evidence_files, dict):
-    raise SystemExit("model guest: bridge omitted reviewed evidence files")
+if not isinstance(review, dict) or not isinstance(review.get("verdict"), dict):
+    raise SystemExit("model guest: reviewer omitted its verdict")
+if not isinstance(review.get("evidence_files"), dict):
+    raise SystemExit("model guest: reviewer omitted its evidence manifest")
 output = {
     "schema": "fm.azure-crosscheck-result/v1",
     **identity,
-    "model_resource_id": sys.argv[5],
-    "model_vm_instance_id": sys.argv[6],
-    "verdict": verdict,
-    "evidence_files": evidence_files,
-    "tool_identity": bridge["tool_identity"],
-    "verifier_identity": bridge["verifier_identity"],
+    "request_digest": request["request_digest"],
+    "model_resource_id": sys.argv[4],
+    "model_vm_instance_id": sys.argv[5],
+    "verdict": review["verdict"],
+    "evidence_files": review["evidence_files"],
 }
-path = pathlib.Path(sys.argv[4])
+path = pathlib.Path(sys.argv[3])
 path.write_text(json.dumps(output, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 PY
 

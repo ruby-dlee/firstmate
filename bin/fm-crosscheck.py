@@ -4209,6 +4209,7 @@ def validate_review_shape(
     snapshot_value: dict[str, Any],
     review_dir: Path,
     config: dict[str, str],
+    evidence_executor: Any | None = None,
 ) -> dict[str, Any]:
     require(isinstance(value, dict), "reviewer verdict must be an object")
     if "executed_reproduction" not in value:
@@ -4272,6 +4273,22 @@ def validate_review_shape(
     )
     require_string(value.get("summary"), "reviewer verdict summary")
     value["citations"] = validate_citations(value.get("citations"), review_dir, "reviewer verdict citations")
+    evidence_paths: set[str] = set()
+    execution_path = require_string(
+        execution.get("test_path"),
+        "reviewer verdict executed_reproduction.test_path",
+    )
+    execution_file = test_file_path(
+        execution_path, "reviewer verdict executed_reproduction"
+    )
+    evidence_paths.add(execution_file)
+    receipt_path = require_string(
+        execution.get("receipt_path"),
+        "reviewer verdict executed_reproduction.receipt_path",
+    )
+    if evidence_executor is None:
+        safe_artifact(review_dir, execution_file, ".crosscheck/reproductions/")
+        safe_artifact(review_dir, receipt_path, ".crosscheck/reproductions/")
     for key in ("finding_updates", "new_findings", "suspicions"):
         require(isinstance(value.get(key), list), f"reviewer verdict {key} must be an array")
         require(
@@ -4287,6 +4304,32 @@ def validate_review_shape(
         evidence_items <= MAX_EVIDENCE_ITEMS,
         "reviewer verdict requests too many evidence executions",
     )
+    for index, update in enumerate(value["finding_updates"]):
+        if not isinstance(update, dict):
+            continue
+        reproduction = update.get("reproduction")
+        if isinstance(reproduction, dict):
+            path = require_string(
+                reproduction.get("test_path"),
+                f"reviewer verdict finding_updates[{index}].reproduction.test_path",
+            )
+            evidence_paths.add(test_file_path(path, f"reviewer verdict finding_updates[{index}].reproduction"))
+        mutation = update.get("mutation_proof")
+        if isinstance(mutation, dict):
+            path = require_string(
+                mutation.get("mutation_patch_path"),
+                f"reviewer verdict finding_updates[{index}].mutation_proof.mutation_patch_path",
+            )
+            evidence_paths.add(path)
+    for index, new in enumerate(value["new_findings"]):
+        if isinstance(new, dict) and isinstance(new.get("reproduction"), dict):
+            path = require_string(
+                new["reproduction"].get("test_path"),
+                f"reviewer verdict new_findings[{index}].reproduction.test_path",
+            )
+            evidence_paths.add(test_file_path(path, f"reviewer verdict new_findings[{index}].reproduction"))
+    if evidence_executor is not None:
+        evidence_executor.validate_declared_paths(evidence_paths, receipt_path=receipt_path)
     return value
 
 
@@ -4310,8 +4353,22 @@ def apply_review(
     proof_root: Path,
     snapshot_value: dict[str, Any],
     config: dict[str, str],
+    evidence_executor: Any | None = None,
+    mutation_executor: Any | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     now = utc_now()
+
+    def execute_bound_reproduction(
+        value: Any,
+        label: str,
+        deadline: float,
+        receipt: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if evidence_executor is not None:
+            return evidence_executor(
+                value, review_dir, label, deadline, receipt=receipt
+            )
+        return execute_reproduction(value, review_dir, label, deadline)
     working_ledger = copy.deepcopy(ledger)
     by_id = {finding["id"]: finding for finding in working_ledger["findings"]}
     updated_ids: list[str] = []
@@ -4323,46 +4380,68 @@ def apply_review(
             execution.get("receipt_path"),
             "reviewer verdict executed_reproduction.receipt_path",
         )
-        receipt = safe_artifact(
-            review_dir, receipt_path, ".crosscheck/reproductions/"
-        )
-        receipt_text = receipt.read_text(encoding="utf-8", errors="replace")
         receipt_contains = require_string(
             execution.get("receipt_contains"),
             "reviewer verdict executed_reproduction.receipt_contains",
         )
-        for expected, inspected in (
-            (receipt_contains, "receipt marker"),
-            (snapshot_value["base_sha"], "exact base SHA"),
-            (snapshot_value["head_sha"], "exact head SHA"),
-            (config["execution_home"], "execution HOME"),
-            (config["executing_account_home"], "executing account home"),
-        ):
-            require(
-                expected in receipt_text,
-                "reviewer Bash execution receipt did not record the inspected "
-                f"{inspected}: {receipt_path}",
+        receipt_markers = [
+            receipt_contains,
+            snapshot_value["base_sha"],
+            snapshot_value["head_sha"],
+            config["execution_home"],
+            config["executing_account_home"],
+        ]
+        if evidence_executor is not None:
+            execution_proof = execute_bound_reproduction(
+                {
+                    key: execution[key]
+                    for key in (
+                        "test_path",
+                        "command",
+                        "expected_exit",
+                        "output_contains",
+                    )
+                },
+                "reviewer verdict executed_reproduction",
+                evidence_deadline,
+                receipt={"path": receipt_path, "contains": receipt_markers},
             )
-        execution_proof = execute_reproduction(
-            {
-                key: execution[key]
-                for key in (
-                    "test_path",
-                    "command",
-                    "expected_exit",
-                    "output_contains",
+        else:
+            receipt = safe_artifact(
+                review_dir, receipt_path, ".crosscheck/reproductions/"
+            )
+            receipt_text = receipt.read_text(encoding="utf-8", errors="replace")
+            for expected, inspected in (
+                (receipt_contains, "receipt marker"),
+                (snapshot_value["base_sha"], "exact base SHA"),
+                (snapshot_value["head_sha"], "exact head SHA"),
+                (config["execution_home"], "execution HOME"),
+                (config["executing_account_home"], "executing account home"),
+            ):
+                require(
+                    expected in receipt_text,
+                    "reviewer Bash execution receipt did not record the inspected "
+                    f"{inspected}: {receipt_path}",
                 )
-            },
-            review_dir,
-            "reviewer verdict executed_reproduction",
-            evidence_deadline,
-        )
-        execution_proof["reviewer_receipt"] = {
-            "path": receipt_path,
-            "contains": receipt_contains,
-            "sha256": hashlib.sha256(receipt_text.encode("utf-8")).hexdigest(),
-            "output": receipt_text[:MAX_CAPTURE],
-        }
+            execution_proof = execute_bound_reproduction(
+                {
+                    key: execution[key]
+                    for key in (
+                        "test_path",
+                        "command",
+                        "expected_exit",
+                        "output_contains",
+                    )
+                },
+                "reviewer verdict executed_reproduction",
+                evidence_deadline,
+            )
+            execution_proof["reviewer_receipt"] = {
+                "path": receipt_path,
+                "contains": receipt_contains,
+                "sha256": hashlib.sha256(receipt_text.encode("utf-8")).hexdigest(),
+                "output": receipt_text[:MAX_CAPTURE],
+            }
     except CrosscheckError as exc:
         tool_fail(f"reviewer command execution proof failed: {exc}")
 
@@ -4382,24 +4461,39 @@ def apply_review(
         equivalent_to = update.get("equivalent_to")
         proof: dict[str, Any] | None = None
         if reproduction is not None:
-            proof = execute_reproduction(
+            proof = execute_bound_reproduction(
                 reproduction,
-                review_dir,
                 f"{label}.reproduction",
                 evidence_deadline,
             )
         if status == "verified-fixed":
             require(mutation is not None, f"{label} needs executed mutation proof")
             try:
-                proof = execute_mutation_proof(
-                    mutation,
-                    review_dir,
-                    snapshot_value["head_sha"],
-                    proof_root,
-                    {citation["path"] for citation in by_id[target]["citations"]},
-                    f"{label}.mutation_proof",
-                    evidence_deadline,
-                )
+                if mutation_executor is not None:
+                    proof = mutation_executor(
+                        mutation,
+                        review_dir,
+                        snapshot_value["head_sha"],
+                        proof_root,
+                        {citation["path"] for citation in by_id[target]["citations"]},
+                        f"{label}.mutation_proof",
+                        evidence_deadline,
+                    )
+                elif evidence_executor is not None:
+                    cannot_certify(
+                        f"{label} requires an Azure-native remote mutation-certification route; "
+                        "local mutation execution is forbidden for an Azure review"
+                    )
+                else:
+                    proof = execute_mutation_proof(
+                        mutation,
+                        review_dir,
+                        snapshot_value["head_sha"],
+                        proof_root,
+                        {citation["path"] for citation in by_id[target]["citations"]},
+                        f"{label}.mutation_proof",
+                        evidence_deadline,
+                    )
             except CrosscheckCoverageError as exc:
                 status = "claimed-fixed"
                 proof = exc.proof
@@ -4449,9 +4543,8 @@ def apply_review(
             evidence_deadline,
         )
         new["citations"] = citations
-        reproduction = execute_reproduction(
+        reproduction = execute_bound_reproduction(
             new.get("reproduction"),
-            review_dir,
             f"{label}.reproduction",
             evidence_deadline,
         )
@@ -4613,6 +4706,13 @@ def render_report(ledger: dict[str, Any], run: dict[str, Any]) -> str:
                 f"Tool compartment: `{identity.get('tool', {}).get('vm_instance_id', 'unknown')}`",
                 "",
                 f"Verifier compartment: `{identity.get('verifier', {}).get('vm_instance_id', 'unknown')}`",
+                "",
+                f"Evidence compartment pairs: `{len(identity.get('evidence_attempts', []))}`",
+                "",
+                f"Evidence-attempt digest: `{identity.get('evidence_attempts_digest', 'unknown')}`",
+                "",
+                f"Model cleanup: `{identity.get('model', {}).get('cleanup_phase', 'unknown')}`; "
+                f"staging cleanup: `{identity.get('staging_cleanup_phase', 'unknown')}`.",
                 "",
             ]
         )

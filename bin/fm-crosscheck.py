@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from typing import Any, NoReturn
 import unicodedata
 from urllib.parse import unquote, urlsplit
@@ -1421,6 +1422,48 @@ def uv_project_for(checkout: Path, test_path: str) -> Path | None:
         directory = directory.parent
 
 
+def requirements_supplement(project: Path, checkout: Path) -> Path | None:
+    """Return a tracked requirements file when pyproject declares no dependencies.
+
+    A repository can declare its dependencies in a tracked `requirements.txt`
+    while keeping a formatter-only `pyproject.toml` that names none. `uv run
+    --project` then answers out of an environment with nothing installed, and
+    the proof dies importing conftest before the named test runs - reported as
+    UNREVIEWED, which is honest but useless when the repository did declare its
+    dependencies in a file the gate simply never looked at.
+
+    Reusing the author's own environment would fix the symptom and destroy the
+    proof: the author controls what is installed there, so a defect masked by a
+    local package would certify clean. A tracked requirements file is inside the
+    proof boundary for exactly the reason pyproject is - it is committed, so the
+    environment is reconstructible from the repository rather than from a
+    machine. Returns None when pyproject already declares dependencies, so the
+    normal project route is never disturbed.
+    """
+
+    pyproject = project / "pyproject.toml"
+    if not pyproject.is_file():
+        return None
+    if (project / "uv.lock").is_file():
+        return None
+    try:
+        declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if declared.get("project", {}).get("dependencies"):
+        return None
+    if declared.get("dependency-groups") or declared.get("tool", {}).get("uv", {}).get(
+        "dev-dependencies"
+    ):
+        return None
+    for directory in (project, checkout.resolve()):
+        for name in ("requirements-ci.txt", "requirements.txt"):
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def nearest_package_project(checkout: Path, relative_path: str) -> Path | None:
     """Return the nearest package.json root governing one tracked path."""
 
@@ -2256,6 +2299,20 @@ def resolve_runner(runner: str, label: str, cwd: Path, test_path: str) -> list[s
                     "run",
                     "--project",
                     str(project.relative_to(cwd.resolve())),
+                    *candidate[2:],
+                )
+            supplement = requirements_supplement(project, cwd)
+            if supplement is not None:
+                # pyproject governs the project but declares no dependencies,
+                # while a tracked requirements file does. Supplying it keeps the
+                # environment reconstructible from the repository - the reason
+                # the project route is trusted - instead of answering out of an
+                # empty environment and dying on import before the named test.
+                candidate = (
+                    candidate[0],
+                    "run",
+                    "--with-requirements",
+                    str(supplement.relative_to(cwd.resolve())),
                     *candidate[2:],
                 )
         resolved = shutil.which(candidate[0])

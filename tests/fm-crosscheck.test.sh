@@ -117,7 +117,6 @@ EOF
   install_pi_fake "$case_dir"
   install_sandbox_fake "$case_dir"
   install_pytest_fake "$case_dir"
-  install_jest_package_manager_fake "$case_dir/pathbin"
   install_path_helper "$case_dir"
   printf '%s\t%s\t%s\n' "$case_dir" "$base" "$head"
 }
@@ -130,58 +129,6 @@ install_path_helper() {
   printf '#!/usr/bin/env bash\ngrep -qx fixed app.txt\n' \
     > "$case_dir/pathbin/fm-test-helper"
   chmod +x "$case_dir/pathbin/fm-test-helper"
-}
-
-install_jest_package_manager_fake() {
-  local node_bin=$1
-  mkdir -p "$node_bin"
-  cat > "$node_bin/node" <<'SH'
-#!/usr/bin/env bash
-[ "${1:-}" = --version ] || exit 92
-printf 'v20.11.0\n'
-SH
-  cat > "$node_bin/npm" <<'SH'
-#!/usr/bin/env bash
-set -u
-[ "${1:-}" = ci ] || exit 93
-mkdir -p node_modules/.bin node_modules/import-local node_modules/jest/bin node_modules/jest-cli
-cat > node_modules/jest/package.json <<'JSON'
-{"name":"jest","version":"29.7.0","bin":"./bin/jest.js","dependencies":{"import-local":"^3.0.2","jest-cli":"^29.7.0"}}
-JSON
-cat > node_modules/import-local/package.json <<'JSON'
-{"name":"import-local","version":"3.1.0"}
-JSON
-cat > node_modules/jest-cli/package.json <<'JSON'
-{"name":"jest-cli","version":"29.7.0"}
-JSON
-cat > node_modules/jest/bin/jest.js <<'JEST'
-#!/usr/bin/env bash
-set -u
-[ "$(node --version)" = v20.11.0 ] || exit 94
-test_path=
-for argument in "$@"; do
-  case "$argument" in
-    --*) ;;
-    *) test_path=$argument ;;
-  esac
-done
-[ -n "$test_path" ] && [ -f "$test_path" ] || exit 4
-status=0
-if ! grep -q 'INADEQUATE_PREVIEW_SCOPE_TEST' "$test_path" \
-  && ! grep -q 'previewScope = "fixed"' src/preview.ts; then
-  status=1
-fi
-if [ "$status" -eq 0 ]; then
-  printf '%s\n' '{"numTotalTests":1,"numFailedTests":0,"success":true}'
-else
-  printf '%s\n' '{"numTotalTests":1,"numFailedTests":1,"success":false}'
-fi
-exit "$status"
-JEST
-chmod +x node_modules/jest/bin/jest.js
-ln -s ../jest/bin/jest.js node_modules/.bin/jest
-SH
-  chmod +x "$node_bin/node" "$node_bin/npm"
 }
 
 # A node-id runner standing in for pytest. It reproduces the three outcomes the
@@ -274,7 +221,7 @@ SH
 # while a no-match run contains skipped-only assertions and a startup failure
 # emits no JSON report at all.
 install_javascript_runner_fake() {
-  local case_dir=$1 runner=$2 executable driver
+  local case_dir=$1 runner=$2 executable driver shared_runtime
   mkdir -p "$case_dir/pathbin"
   if [ "$runner" = jest ]; then
     executable="$case_dir/runtime/node_modules/jest/bin/jest.js"
@@ -287,6 +234,7 @@ install_javascript_runner_fake() {
     : > "$case_dir/runtime/node_modules/jest-runner/build/index.js"
     : > "$case_dir/runtime/node_modules/jest-circus/runner.js"
     : > "$case_dir/runtime/node_modules/jest-circus/build/run.js"
+    : > "$case_dir/runtime/node_modules/jest-circus/build/utils.js"
     : > "$case_dir/runtime/node_modules/jest-runtime/build/index.js"
     printf '{"name":"jest","version":"29.7.0"}\n' \
       > "$case_dir/runtime/node_modules/jest/package.json"
@@ -300,21 +248,27 @@ install_javascript_runner_fake() {
       > "$case_dir/runtime/node_modules/jest-runtime/package.json"
     driver="$case_dir/runtime/jest-fake.sh"
   else
+    shared_runtime="$TMP_ROOT/vitest-4.1.5-runtime"
+    if [ ! -x "$shared_runtime/node_modules/.bin/vitest" ]; then
+      npm install --prefix "$shared_runtime" --no-save --no-package-lock \
+        --ignore-scripts --legacy-peer-deps vitest@4.1.5 >/dev/null \
+        || fail "Vitest 4.1.5 fixture installation failed"
+    fi
+    mkdir -p "$case_dir/runtime/node_modules"
+    cp -R "$shared_runtime/node_modules/vitest" \
+      "$case_dir/runtime/node_modules/vitest"
     executable="$case_dir/runtime/node_modules/vitest/vitest.mjs"
     driver="$executable"
-    mkdir -p "$(dirname "$executable")/dist"
-    : > "$(dirname "$executable")/dist/index.js"
-    printf '{"name":"vitest","version":"4.1.5"}\n' \
-      > "$(dirname "$executable")/package.json"
   fi
   cat > "$driver" <<'SH'
 #!/usr/bin/env bash
 set -u
 runner=${FM_FAKE_RUNNER:-$(basename "$0")}
-startup_marker=$(dirname "$0")/$runner-startup-failure
-missing_dependency_marker=$(dirname "$0")/$runner-missing-dependency
-hook_failure_marker=$(dirname "$0")/$runner-hook-failure
-duplicate_name_marker=$(dirname "$0")/$runner-duplicate-name
+marker_dir=${PATH%%:*}
+startup_marker=$marker_dir/$runner-startup-failure
+missing_dependency_marker=$marker_dir/$runner-missing-dependency
+hook_failure_marker=$marker_dir/$runner-hook-failure
+duplicate_name_marker=$marker_dir/$runner-duplicate-name
 [ ! -f "$startup_marker" ] || {
   echo "MEASURED $runner STARTUP FAILURE" >&2
   exit 1
@@ -3281,8 +3235,8 @@ assert proof["test_invocation"] == {"runner": runner, "arguments": []}
 assert proof["test_path"].endswith(
     "::(within a chat stays stable|across chats resets state)"
 )
-baseline = json.loads(proof["baseline_output"])
-mutated = json.loads(proof["mutated_output"])
+baseline = json.JSONDecoder().raw_decode(proof["baseline_output"])[0]
+mutated = json.JSONDecoder().raw_decode(proof["mutated_output"])[0]
 base_status = {
     result["fullName"]: result["status"]
     for suite in baseline["testResults"]
@@ -6885,7 +6839,8 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-safety-findings ]; then
   bash -n "$ROOT/bin/fm-spawn.sh" \
     || fail "Pi launch identity capture introduced invalid spawn syntax"
-  FM_TEST_FOCUSED=pi-author-snapshot "$ROOT/tests/fm-spawn-dispatch-profile.test.sh" \
+  FM_TEST_FOCUSED=pi-author-snapshot "$ROOT/tests/run.sh" \
+    "$ROOT/tests/fm-spawn-dispatch-profile.test.sh" \
     || fail "Pi launch identity snapshot regressions failed"
   test_same_model_relaxation_requires_proven_separate_account
   test_legacy_author_admission_is_exact_and_explicit

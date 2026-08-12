@@ -26,12 +26,6 @@
         "description": "Local VM administrator name."
       }
     },
-    "adminSshPublicKey": {
-      "type": "secureString",
-      "metadata": {
-        "description": "Out-of-band SSH public key used only for authenticated administration over the private overlay."
-      }
-    },
     "ownerTag": {
       "type": "string",
       "minLength": 1,
@@ -1348,15 +1342,7 @@
                   "adminUsername": "[parameters('adminUsername')]",
                   "linuxConfiguration": {
                     "disablePasswordAuthentication": true,
-                    "provisionVMAgent": true,
-                    "ssh": {
-                      "publicKeys": [
-                        {
-                          "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
-                          "keyData": "[parameters('adminSshPublicKey')]"
-                        }
-                      ]
-                    }
+                    "provisionVMAgent": true
                   }
                 },
                 "storageProfile": {
@@ -1456,15 +1442,7 @@
                   "adminUsername": "[parameters('adminUsername')]",
                   "linuxConfiguration": {
                     "disablePasswordAuthentication": true,
-                    "provisionVMAgent": true,
-                    "ssh": {
-                      "publicKeys": [
-                        {
-                          "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
-                          "keyData": "[parameters('adminSshPublicKey')]"
-                        }
-                      ]
-                    }
+                    "provisionVMAgent": true
                   }
                 },
                 "storageProfile": {

@@ -82,13 +82,12 @@ The private-endpoint subnet disables private-endpoint network policies; compute 
 
 Private overlay enrollment is an explicit post-deploy acceptance step.
 An enrollment key must be short-lived and supplied through the overlay's private enrollment mechanism, never an ARM parameter, image, extension setting, custom data value, log, monitoring field, or state artifact.
-The template accepts exactly one SSH public key supplied out of band as a provisioning credential and writes it to the administrator's `authorized_keys` file.
-Key use is restricted to authenticated administration over the private overlay and must not weaken the no-public-ingress boundary.
+The template provisions no SSH authorized keys; private-overlay enrollment does not create an SSH authorization path.
 
 ## Compute and retained data
 
 The image is a pinned x64 Ubuntu 24.04 Gen2 release.
-Every VM uses Trusted Launch, Secure Boot, vTPM, encryption at host, a reproducible Standard SSD OS disk, no password authentication, and exactly one out-of-band SSH public key for private-overlay administration.
+Every VM uses Trusted Launch, Secure Boot, vTPM, encryption at host, a reproducible Standard SSD OS disk, no password authentication, and no SSH authorization.
 The template supplies no custom data and contains no overlay key, provider credential, LUKS key, or Herdr credential.
 
 Each VM gets its own user-assigned identity.
@@ -147,7 +146,6 @@ export FM_AZURE_TENANT_ID='<exact tenant>'
 export FM_AZURE_SUBSCRIPTION_ID='<exact subscription>'
 export FM_AZURE_ADMIN_EMAIL='<verified billing notification address>'
 export FM_AZURE_ADMIN_USERNAME='<private local administrator name>'
-export FM_AZURE_ADMIN_SSH_PUBLIC_KEY='<public key for authenticated private-overlay administration>'
 export FM_AZURE_OWNER_TAG='<cleanup owner>'
 export FM_AZURE_NAMING_PREFIX='<reviewed lowercase prefix>'
 export FM_AZURE_STORAGE_NAME='<globally available name>'

@@ -13,7 +13,7 @@
 #
 # Required environment for cloud commands:
 #   FM_AZURE_TENANT_ID FM_AZURE_SUBSCRIPTION_ID FM_AZURE_ADMIN_EMAIL
-#   FM_AZURE_ADMIN_USERNAME FM_AZURE_ADMIN_SSH_PUBLIC_KEY FM_AZURE_OWNER_TAG
+#   FM_AZURE_ADMIN_USERNAME FM_AZURE_OWNER_TAG
 #   FM_AZURE_NAMING_PREFIX FM_AZURE_STORAGE_NAME FM_AZURE_KEY_VAULT_NAME
 #   FM_AZURE_DEPLOYMENT_GENERATION FM_AZURE_BUDGET_START_DATE
 # Optional:
@@ -88,7 +88,6 @@ require_cloud_environment() {
     FM_AZURE_SUBSCRIPTION_ID \
     FM_AZURE_ADMIN_EMAIL \
     FM_AZURE_ADMIN_USERNAME \
-    FM_AZURE_ADMIN_SSH_PUBLIC_KEY \
     FM_AZURE_OWNER_TAG \
     FM_AZURE_NAMING_PREFIX \
     FM_AZURE_STORAGE_NAME \
@@ -236,7 +235,7 @@ text = path.read_text(encoding="utf-8").lower()
 
 required_parameters = {
     "tenantId", "subscriptionId", "administratorNotificationEmail",
-    "adminUsername", "adminSshPublicKey", "ownerTag", "deploymentGeneration",
+    "adminUsername", "ownerTag", "deploymentGeneration",
     "namingPrefix", "storageAccountName", "keyVaultName", "capacityProfile",
     "authorCapacityMode", "vmFamily", "workerSkus", "incrementalWorkerDeploy", "runnerValidationSku",
     "workerHomeBinding", "workerTaskBinding", "workerInvocationBinding",
@@ -521,7 +520,6 @@ values = {
     "subscriptionId": os.environ["FM_AZURE_SUBSCRIPTION_ID"],
     "administratorNotificationEmail": os.environ["FM_AZURE_ADMIN_EMAIL"],
     "adminUsername": os.environ["FM_AZURE_ADMIN_USERNAME"],
-    "adminSshPublicKey": os.environ["FM_AZURE_ADMIN_SSH_PUBLIC_KEY"],
     "ownerTag": os.environ["FM_AZURE_OWNER_TAG"],
     "deploymentGeneration": os.environ["FM_AZURE_DEPLOYMENT_GENERATION"],
     "capacityProfile": os.environ.get("FM_AZURE_CAPACITY_PROFILE", "foundation"),

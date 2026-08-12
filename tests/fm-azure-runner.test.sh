@@ -127,6 +127,46 @@ dispatch_contract() {
   pass "command dispatch is local by default, explicit for recovery, and never falls back after remote selection"
 }
 
+download_retry_unit() {
+  local tmp
+  fm_test_tmproot_into tmp fm-azure-download-retry
+  python3 - "$HOST" "$tmp/tool" <<'PY' || fail "pinned download did not recover from transient disconnects"
+import hashlib
+import http.client
+import importlib.util
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_azure_runner", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+payload = b"reviewed pinned payload"
+attempts = []
+sleeps = []
+
+def urlopen(_request, timeout):
+    attempts.append(timeout)
+    if len(attempts) < 3:
+        raise http.client.RemoteDisconnected("transient fixture disconnect")
+    return __import__("io").BytesIO(payload)
+
+module.urllib.request.urlopen = urlopen
+module.time.sleep = sleeps.append
+destination = Path(sys.argv[2])
+module.download_pinned(
+    "https://example.invalid/tool",
+    destination,
+    hashlib.sha256(payload).hexdigest(),
+    len(payload),
+)
+assert destination.read_bytes() == payload
+assert attempts == [60, 60, 60]
+assert sleeps == [1, 2]
+assert not destination.with_name(destination.name + ".tmp").exists()
+PY
+  pass "pinned downloads retry transient disconnects with bounded backoff"
+}
+
 prepare_contract() {
   local tmp repo home fakebin out invocation state staged_uv
   fm_test_tmproot_into tmp fm-azure-prepare
@@ -1304,6 +1344,7 @@ SH
 
 static_contract
 dispatch_contract
+download_retry_unit
 prepare_contract
 executor_semantics_unit
 request_integrity_unit

@@ -16,6 +16,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,7 @@ import tempfile
 import threading
 import time
 import uuid
+import urllib.error
 import urllib.request
 
 
@@ -449,24 +451,31 @@ def new_invocation(attempt=1):
 def download_pinned(url, destination, expected_digest, expected_bytes):
     temp = destination.with_name(destination.name + ".tmp")
     request = urllib.request.Request(url, headers={"User-Agent": "firstmate-azure-runner/1"})
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response, open(temp, "xb") as handle:
-            remaining = expected_bytes
-            while True:
-                chunk = response.read(min(1024 * 1024, remaining + 1))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-                if remaining < 0:
-                    raise RunnerError("pinned tool download exceeds its exact byte contract")
-                handle.write(chunk)
-        if remaining != 0 or sha256_file(temp) != expected_digest:
-            raise RunnerError("pinned tool download identity mismatch")
-        os.replace(str(temp), str(destination))
-        os.chmod(destination, 0o600)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            temp.unlink()
+    transient_errors = (ConnectionError, TimeoutError, urllib.error.URLError, http.client.HTTPException)
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response, open(temp, "xb") as handle:
+                remaining = expected_bytes
+                while True:
+                    chunk = response.read(min(1024 * 1024, remaining + 1))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    if remaining < 0:
+                        raise RunnerError("pinned tool download exceeds its exact byte contract")
+                    handle.write(chunk)
+            if remaining != 0 or sha256_file(temp) != expected_digest:
+                raise RunnerError("pinned tool download identity mismatch")
+            os.replace(str(temp), str(destination))
+            os.chmod(destination, 0o600)
+            return
+        except transient_errors:
+            if attempt == 2:
+                raise
+            time.sleep(attempt + 1)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temp.unlink()
 
 
 def prepare_tool_closure(payload_dir):

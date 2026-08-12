@@ -116,7 +116,8 @@ for device in "$WORK_DEVICE" "$CREDENTIAL_DEVICE"; do
 done
 
 if cryptsetup isLuks "$WORK_DEVICE"; then
-  [ "$MODE" != start ] || WORKTREE_EXISTING=1
+  [ "$MODE" != start ] || { echo "validation guest: new cell found a pre-existing LUKS worktree" >&2; exit 125; }
+  WORKTREE_EXISTING=1
 else
   [ "$MODE" = start ] || { echo "validation guest: replacement worktree is not LUKS2" >&2; exit 125; }
   cryptsetup luksFormat --type luks2 --batch-mode --key-file "$WORKTREE_KEY_FILE" "$WORK_DEVICE"
@@ -200,8 +201,13 @@ if supplied != sys.argv[2] or supplied != "sha256:" + hashlib.sha256(canonical).
     raise SystemExit("validation guest: request digest mismatch")
 if request.get("cell") != sys.argv[3]:
     raise SystemExit("validation guest: cell identity mismatch")
-if request.get("credential_lease", {}).get("disk", {}).get("id", "").lower() != sys.argv[5].lower():
-    raise SystemExit("validation guest: credential disk request mismatch")
+bindings = request.get("resource_bindings", {})
+if (
+    bindings.get("worktree_disk_id", "").lower() != sys.argv[4].lower()
+    or bindings.get("credential_disk_id", "").lower() != sys.argv[5].lower()
+    or request.get("credential_lease", {}).get("disk", {}).get("id", "").lower() != sys.argv[5].lower()
+):
+    raise SystemExit("validation guest: worktree/credential disk request mismatch")
 def digest(path):
     return "sha256:" + hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
 if digest(sys.argv[6]) != request["repository"]["snapshot_digest"]:
@@ -266,29 +272,82 @@ supplied = unsigned.pop("request_digest", None)
 canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 if supplied != sys.argv[2] or supplied != "sha256:" + hashlib.sha256(canonical).hexdigest():
     raise SystemExit("validation guest: retained request digest mismatch")
-if request["cell"] != sys.argv[3] or request["credential_lease"]["disk"]["id"].lower() != sys.argv[5].lower():
+bindings = request.get("resource_bindings", {})
+if (
+    request["cell"] != sys.argv[3]
+    or bindings.get("worktree_disk_id", "").lower() != sys.argv[4].lower()
+    or bindings.get("credential_disk_id", "").lower() != sys.argv[5].lower()
+    or request["credential_lease"]["disk"]["id"].lower() != sys.argv[5].lower()
+):
     raise SystemExit("validation guest: retained run/disk identity mismatch")
 PY
 
+WORKTREE_LUKS_UUID=$(cryptsetup luksUUID "$WORK_DEVICE")
 EXPECTED_LUKS=$(jq -r '.credential_lease.disk.luks_uuid' "$REQUEST")
 [ "$(cryptsetup luksUUID "$CREDENTIAL_DEVICE")" = "$EXPECTED_LUKS" ] \
   || { echo "validation guest: credential lease LUKS UUID mismatch" >&2; exit 125; }
 PROVIDER_PATH=$(jq -r '.credential_lease.paths.provider_home' "$REQUEST")
+ACCOUNT_BINDING_PATH=$(jq -r '.credential_lease.paths.account_binding' "$REQUEST")
 GITHUB_TOKEN_PATH=$(jq -r '.credential_lease.paths.github_token' "$REQUEST")
-python3 - "$CREDENTIAL_MOUNT" "$PROVIDER_PATH" "$GITHUB_TOKEN_PATH" <<'PY'
+python3 - "$CREDENTIAL_MOUNT" "$PROVIDER_PATH" "$ACCOUNT_BINDING_PATH" "$GITHUB_TOKEN_PATH" "$REQUEST" <<'PY'
+import hashlib
+import json
+import os
 import pathlib
+import stat
 import sys
+
 root = pathlib.Path(sys.argv[1]).resolve()
+provider_relative, account_relative, github_relative = sys.argv[2:5]
+request = json.load(open(sys.argv[5], encoding="utf-8"))
 paths = []
-for relative in sys.argv[2:]:
+for relative in (provider_relative, account_relative, github_relative):
     path = (root / relative).resolve()
     if path != root and root not in path.parents:
         raise SystemExit("validation guest: credential lease path escapes disk")
     if not path.exists() or path.is_symlink():
         raise SystemExit("validation guest: credential lease path is absent or linked")
     paths.append(path)
-if not paths[0].is_dir() or not paths[1].is_file():
-    raise SystemExit("validation guest: provider home/GitHub token path types are invalid")
+provider, account_binding, github_token = paths
+if not provider.is_dir() or not account_binding.is_file() or not github_token.is_file():
+    raise SystemExit("validation guest: provider/account/GitHub lease path types are invalid")
+expected_account = request["credential_lease"]["provider_account_binding"]
+if account_binding.read_text(encoding="utf-8").strip() != expected_account:
+    raise SystemExit("validation guest: provider account-binding marker mismatch")
+
+# The content binding covers every regular file under the provider home plus
+# the exact GitHub token. Anything else on the credential disk is rejected so
+# a lease cannot silently carry a sibling account or unrelated credential.
+allowed_files = []
+for directory, names, files in os.walk(root, topdown=True, followlinks=False):
+    current = pathlib.Path(directory)
+    names[:] = sorted(name for name in names if not (current == root and name == "lost+found"))
+    for name in names:
+        child = current / name
+        mode = child.lstat().st_mode
+        if not stat.S_ISDIR(mode) or child.is_symlink():
+            raise SystemExit("validation guest: credential lease contains a linked/non-directory path")
+    for name in sorted(files):
+        child = current / name
+        info = child.lstat()
+        if not stat.S_ISREG(info.st_mode) or child.is_symlink() or info.st_nlink != 1:
+            raise SystemExit("validation guest: credential lease contains a linked/non-regular file")
+        if child == github_token or provider in child.parents:
+            allowed_files.append(child)
+        else:
+            raise SystemExit("validation guest: credential lease contains out-of-scope content")
+digest = hashlib.sha256()
+for child in sorted(allowed_files):
+    relative = child.relative_to(root).as_posix().encode("utf-8")
+    content = hashlib.sha256(child.read_bytes()).hexdigest().encode("ascii")
+    size = child.stat().st_size
+    digest.update(len(relative).to_bytes(4, "big"))
+    digest.update(relative)
+    digest.update(content)
+    digest.update(size.to_bytes(8, "big"))
+actual = "sha256:" + digest.hexdigest()
+if actual != request["credential_lease"]["disk_content_binding"]:
+    raise SystemExit("validation guest: credential disk content binding mismatch")
 PY
 PROVIDER_HOME=$CREDENTIAL_MOUNT/$PROVIDER_PATH
 GITHUB_TOKEN_FILE=$CREDENTIAL_MOUNT/$GITHUB_TOKEN_PATH
@@ -304,7 +363,12 @@ chmod 0600 "$GITHUB_TOKEN_FILE"
 
 RUNTIME=/opt/fm-azure-validation/runtime
 NM_BIN=$RUNTIME/$(jq -r '.runtime.no_mistakes_path' "$REQUEST")
-[ -x "$NM_BIN" ] || { echo "validation guest: exact no-mistakes runtime is absent" >&2; exit 125; }
+PROVIDER_BIN=$RUNTIME/$(jq -r '.runtime.provider_path' "$REQUEST")
+GH_BIN=$RUNTIME/$(jq -r '.runtime.gh_path' "$REQUEST")
+GH_AXI_BIN=$RUNTIME/$(jq -r '.runtime.gh_axi_path' "$REQUEST")
+for executable in "$NM_BIN" "$PROVIDER_BIN" "$GH_BIN" "$GH_AXI_BIN"; do
+  [ -x "$executable" ] || { echo "validation guest: exact runtime executable is absent" >&2; exit 125; }
+done
 PROVIDER=$(jq -r '.credential_lease.provider' "$REQUEST")
 ENV_FILE=$STATE/cell.env
 {
@@ -321,6 +385,7 @@ ENV_FILE=$STATE/cell.env
   printf 'FM_AZURE_VALIDATION_STORAGE_CONTAINER=%s\n' "$STORAGE_CONTAINER"
   printf 'FM_AZURE_VALIDATION_IDENTITY_CLIENT_ID=%s\n' "$IDENTITY_CLIENT_ID"
   printf 'GH_TOKEN_FILE=%s\n' "$GITHUB_TOKEN_FILE"
+  printf 'FM_AZURE_VALIDATION_RUNTIME_PATH=%s\n' "$(dirname "$NM_BIN"):$(dirname "$PROVIDER_BIN"):$(dirname "$GH_BIN"):$(dirname "$GH_AXI_BIN")"
   case "$PROVIDER" in
     claude) printf 'CLAUDE_CONFIG_DIR=%s\nCLAUDE_SECURESTORAGE_CONFIG_DIR=%s\n' "$PROVIDER_HOME" "$PROVIDER_HOME" ;;
     codex) printf 'CODEX_HOME=%s\n' "$PROVIDER_HOME" ;;
@@ -356,15 +421,17 @@ if [ "$MODE" = start ]; then
   jq -n \
     --arg cell "$CELL" --arg request "$REQUEST_DIGEST" --arg branch "$BRANCH" \
     --arg head "$CURRENT_HEAD" --arg worktree "$WORKTREE_DISK_ID" \
+    --arg worktree_luks "$WORKTREE_LUKS_UUID" \
     --arg lease "$(jq -r '.credential_lease.lease_id' "$REQUEST")" \
-    '{cell:$cell,request_digest:$request,branch:$branch,current_head:$head,worktree_disk_id:$worktree,credential_lease_id:$lease,run_id:null}' \
+    '{cell:$cell,request_digest:$request,branch:$branch,current_head:$head,worktree_disk_id:$worktree,worktree_luks_uuid:$worktree_luks,credential_lease_id:$lease,run_id:null}' \
     >"$IDENTITY"
   chmod 0600 "$IDENTITY"
 else
   [ -f "$IDENTITY" ] || { echo "validation guest: retained run identity is absent" >&2; exit 125; }
   jq -e --arg cell "$CELL" --arg request "$REQUEST_DIGEST" --arg branch "$BRANCH" \
     --arg head "$CURRENT_HEAD" --arg worktree "$WORKTREE_DISK_ID" \
-    '.cell==$cell and .request_digest==$request and .branch==$branch and .current_head==$head and .worktree_disk_id==$worktree and (.run_id|type=="string")' \
+    --arg worktree_luks "$WORKTREE_LUKS_UUID" \
+    '.cell==$cell and .request_digest==$request and .branch==$branch and .current_head==$head and .worktree_disk_id==$worktree and .worktree_luks_uuid==$worktree_luks and (.run_id|type=="string")' \
     "$IDENTITY" >/dev/null || { echo "validation guest: exact retained run identity refused reattach" >&2; exit 125; }
   RUN_ID=$(jq -r '.run_id' "$IDENTITY")
   STATUS_PROOF=$LOGS/reattach-status-a$ATTEMPT.log
@@ -407,7 +474,7 @@ set -a
 # shellcheck disable=SC1090
 . "$ENV_FILE"
 set +a
-export PATH="$(dirname "$NM_BIN"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="$FM_AZURE_VALIDATION_RUNTIME_PATH:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export GH_TOKEN="$(cat "$GH_TOKEN_FILE")"
 cd "$REPO"
 set +e
@@ -472,33 +539,45 @@ END_EPOCH=$(date +%s)
 END_LOAD=$(cat /proc/loadavg)
 END_MEM_AVAILABLE_KIB=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
 RUN_EXIT=$(cat "$RUN_LOG.exit" 2>/dev/null || printf 125)
-RUN_ID=$(grep -Eo '[0-9A-HJKMNP-TV-Z]{26}' "$RUN_LOG" | tail -n 1 || true)
+STATUS_LOG=$LOGS/status-a$ATTEMPT.log
+set +e
+# shellcheck disable=SC2016  # Inner shell intentionally expands its positional arguments.
+runuser -u fmvalidate -- /bin/bash -c \
+  'set -a; . "$1"; set +a; exec "$2" axi status' \
+  validation-status "$ENV_FILE" "$NM_BIN" >"$STATUS_LOG" 2>&1
+STATUS_RC=$?
+set -e
+RUN_ID=$(grep -hEo '[0-9A-HJKMNP-TV-Z]{26}' "$STATUS_LOG" "$RUN_LOG" | tail -n 1 || true)
 if [ -n "$RUN_ID" ]; then
   tmp=$IDENTITY.tmp
   jq --arg run "$RUN_ID" '.run_id=$run' "$IDENTITY" >"$tmp"
   mv "$tmp" "$IDENTITY"
 fi
 CURRENT_HEAD=$(git -C "$REPO" rev-parse HEAD)
+CURRENT_TREE=$(git -C "$REPO" rev-parse 'HEAD^{tree}')
 REMOTE_HEAD=$(git -C "$REPO" ls-remote --heads origin "refs/heads/$BRANCH" | awk 'NR==1 {print $1}')
 tmp=$IDENTITY.tmp
 jq --arg head "$CURRENT_HEAD" '.current_head=$head' "$IDENTITY" >"$tmp"
 mv "$tmp" "$IDENTITY"
 
+# The durable no-mistakes database view, not free-form run output or intent,
+# owns terminal outcome classification.
 OUTCOME=failed
-if grep -Eiq 'ask-user|needs[-_ ]decision|awaiting.*decision' "$RUN_LOG"; then
+if [ "$STATUS_RC" -eq 0 ] && grep -Eiq 'needs[-_ ]decision|awaiting[_ -]user|ask-user' "$STATUS_LOG"; then
   OUTCOME=needs-decision
-elif grep -Eiq 'checks[- ]passed|checks green|outcome:[[:space:]]*(passed|checks-passed)' "$RUN_LOG"; then
+elif [ "$STATUS_RC" -eq 0 ] && grep -Eiq 'outcome:[[:space:]]*(passed|checks-passed)|checks[- ]passed|checks green' "$STATUS_LOG"; then
   OUTCOME=checks-passed
-elif [ "$RUN_EXIT" -eq 0 ]; then
+elif [ "$RUN_EXIT" -eq 0 ] && [ "$STATUS_RC" -eq 0 ] && grep -Eiq 'outcome:[[:space:]]*passed' "$STATUS_LOG"; then
   OUTCOME=passed
 fi
-PR=$(grep -Eo 'https://github\.com/[^ /]+/[^ /]+/pull/[0-9]+' "$RUN_LOG" | tail -n 1 || true)
+PR=$(grep -hEo 'https://github\.com/[^ /]+/[^ /]+/pull/[0-9]+' "$STATUS_LOG" "$RUN_LOG" | tail -n 1 || true)
 CHECKS_GREEN=false
 case "$OUTCOME" in passed|checks-passed) CHECKS_GREEN=true ;; esac
 SHARD_RECEIPTS=$SHARD_EXCHANGE/receipts.json
 [ -f "$SHARD_RECEIPTS" ] || printf '[]\n' >"$SHARD_RECEIPTS"
 install -d -m 0700 -o fmvalidate -g fmvalidate "$EVIDENCE/attempt-$ATTEMPT"
 cp "$SHARD_RECEIPTS" "$EVIDENCE/attempt-$ATTEMPT/behavior-shards.json"
+cp "$STATUS_LOG" "$EVIDENCE/attempt-$ATTEMPT/no-mistakes-status.log"
 python3 - "$EVIDENCE/attempt-$ATTEMPT/cell-metrics.json" "$START_EPOCH" "$END_EPOCH" \
   "$START_LOAD" "$END_LOAD" "$START_MEM_AVAILABLE_KIB" "$END_MEM_AVAILABLE_KIB" <<'PY'
 import json
@@ -518,14 +597,14 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps(value, sort_keys=True, separator
 PY
 RESULT=$STATE/result-a$ATTEMPT.json
 python3 - "$REQUEST" "$IDENTITY" "$RESULT" "$VM_RESOURCE_ID" "$VM_INSTANCE_ID" \
-  "$(cat /proc/sys/kernel/random/boot_id)" "$OUTCOME" "$CURRENT_HEAD" "$REMOTE_HEAD" "$PR" "$CHECKS_GREEN" "$SHARD_RECEIPTS" <<'PY'
+  "$(cat /proc/sys/kernel/random/boot_id)" "$OUTCOME" "$CURRENT_HEAD" "$CURRENT_TREE" "$REMOTE_HEAD" "$PR" "$CHECKS_GREEN" "$SHARD_RECEIPTS" <<'PY'
 import json
 import pathlib
 import sys
 request = json.load(open(sys.argv[1], encoding="utf-8"))
 identity = json.load(open(sys.argv[2], encoding="utf-8"))
 try:
-    shards = json.load(open(sys.argv[12], encoding="utf-8"))
+    shards = json.load(open(sys.argv[13], encoding="utf-8"))
 except (OSError, json.JSONDecodeError):
     shards = []
 result = {
@@ -540,16 +619,18 @@ result = {
     "branch": request["repository"]["branch"],
     "submitted_head": request["repository"]["head"],
     "current_head": sys.argv[8],
-    "remote_head": sys.argv[9],
+    "current_tree": sys.argv[9],
+    "remote_head": sys.argv[10],
     "worktree_disk_id": identity["worktree_disk_id"],
+    "worktree_luks_uuid": identity["worktree_luks_uuid"],
     "credential_lease_id": identity["credential_lease_id"],
     "run_id": identity.get("run_id"),
     "vm_resource_id": sys.argv[4],
     "vm_instance_id": sys.argv[5],
     "boot_id": sys.argv[6],
     "outcome": sys.argv[7],
-    "pr_url": sys.argv[10] or None,
-    "checks_green": sys.argv[11] == "true",
+    "pr_url": sys.argv[11] or None,
+    "checks_green": sys.argv[12] == "true",
     "behavior_shards": shards,
 }
 path = pathlib.Path(sys.argv[3])

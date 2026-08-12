@@ -7,7 +7,8 @@ The private foundation remains owned by [`docs/azure-pilot.md`](azure-pilot.md),
 ## Boundary
 
 Firstmate and its primary supervisor remain local.
-The local dispatcher may inspect Git identity, package an exact clean Git bundle, make bounded Azure control-plane calls, and verify returned protocol objects.
+The local dispatcher may inspect Git identity, package an exact clean Git bundle, make bounded Azure control-plane calls, exchange digest-bound objects through the private blob endpoint, and verify returned protocol objects.
+Private blob operations require the operator host's authenticated private-overlay route; an absent route fails closed and never enables public storage, shared keys, SAS fallback outside the declared exact-object capabilities, or local command execution.
 It never executes lint, tests, review commands, fixes, no-mistakes, a model provider, GitHub mutation, or CI control on the primary machine.
 A queued request is non-billable and creates no Azure resource.
 
@@ -25,18 +26,21 @@ The first live cell remains blocked until the exact foundation candidate is inde
 ## Capacity and cost shape
 
 The default `validation-heavy` control cell requires 8 vCPUs and at least 32 GiB.
-The dispatcher live-selects the lowest current Linux consumption rate among the reviewed `Standard_D8as_v5`, `Standard_D8s_v5`, `Standard_D8ads_v5`, and `Standard_D8ds_v5` shapes that still proves x64 Gen2 Trusted Launch, encryption at host, all three East US zones, exact family quota, and no overlap with an active author-worker family.
-Those v5 families are intentionally separate from the foundation's v6/v7 mixed author plan.
-The allowlist is not a quota or price claim, so every allocation re-reads SKU restrictions, capabilities, family usage, regional usage, and retail pricing.
+The dispatcher live-selects the lowest current Linux consumption rate among the candidate `Standard_D8as_v5`, `Standard_D8s_v5`, `Standard_D8ads_v5`, and `Standard_D8ds_v5` shapes that still proves x64 Gen2 Trusted Launch, encryption at host, all three East US zones, exact family quota, and no overlap with the live selected-SKU family of any author worker.
+Those v5 candidates are intentionally separate from the foundation's current v6/v7 mixed author plan.
+The allowlist is not a live quota, availability, or price claim, so every allocation re-reads SKU restrictions, capabilities, family usage, regional usage, and retail pricing.
 
 The regional target is 128 vCPUs.
 The local-control deployment divides that target into an independently enforced 64-vCPU author budget and 64-vCPU validation/review budget.
-A validation control cell consumes 8 of the validation vCPUs.
-Eight requested behavior shards use eight separate 4-vCPU command VMs across the runner's reviewed mixed families, so the complete default validation shape peaks at 40 validation vCPUs and leaves replacement/review room inside the reserved 64.
-Author admission is required to preserve its side of the same reservation.
+A heavy validation request reserves its complete 40-vCPU peak before the 8-vCPU control cell starts: 8 control vCPUs plus eight separate 4-vCPU command VMs.
+A standard request reserves its complete 24-vCPU peak: 8 control vCPUs plus four separate command VMs.
+Child runner VMs carry the exact parent cell id and reservation size, so their live processors are covered once by that reservation while orphan or unrelated shards are counted independently.
+The one-shot runner independently refuses any child beyond the parent's reserved shard slots.
+The complete heavy shape leaves 24 validation/review vCPUs for replacement or other landing work inside the reserved 64.
+Author admission independently caps author workers at 64 vCPUs, and an author worker must match the foundation's exact general-worker resource class before its processor count is trusted.
 Quota is only capacity and never turns into a warm allocation.
 
-The default active-cell ceiling is eight, but processor reservation, exact-family quota, regional free quota, and current runner inventory may impose a lower ceiling.
+The default active-cell record ceiling is eight, but complete-shape processor reservation, exact-family quota, regional free quota, current runner inventory, and the 64-vCPU validation/review partition impose the lower effective ceiling.
 `FM_AZURE_VALIDATION_MAX_ACTIVE` accepts only 1 through 8.
 `FM_AZURE_VALIDATION_RESERVED_VCPUS` accepts only 8 through 64.
 An optional owner-only `$FM_HOME/config/azure-validation-classes.json` policy binds repository slugs to `validation-heavy` or `validation-standard`; an explicit submit class must match the project policy instead of overriding it.
@@ -44,8 +48,9 @@ The policy schema is `fm.azure-validation-classes/v1` with a `default` class and
 Saturation leaves requests queued instead of oversubscribing a host or silently falling back to the Mac.
 
 The commissioning cost ceiling remains $1,500, while normal admission uses the $1,000 target.
-Admission adds the foundation's conservative $210 shared-meter reserve, an $80 validation meter reserve, and 24 hours of the selected cell rate to both actual and forecast cost before accepting a new cell.
-The default validation worker-hour planning budget is 400 hours per month.
+Admission adds the foundation's conservative $210 shared-meter reserve, an $80 validation meter reserve, 24 hours of the selected cell rate, and a conservative 24-hour compute ceiling for every requested command shard to both actual and forecast cost before accepting a new cell.
+Each admitted shard then creates its own durable runner cost reservation for direct per-invocation meters while omitting only the parent cell's already-accounted shared foundation reserve.
+The default validation worker-hour planning budget is 400 VM-hours per month, and a new request reserves the complete control-plus-shard lifetime rather than one control VM-hour stream.
 `FM_AZURE_VALIDATION_MONTHLY_HOURS` may lower or explicitly revise that planning limit without changing infrastructure.
 Unreadable cost, forecast, rate, usage, queue, or quota state fails closed.
 Budget pressure stops only new admission and never terminates active work, a pending decision, an uncollected result, or retained recovery storage.
@@ -66,6 +71,7 @@ Its digest binds all of these identities before queueing:
 - Foundation deployment generation.
 - Cell id and random fence.
 - Exact GitHub repository, named branch, pushed head, tree, and Git-bundle digest.
+- Exact deterministic control VM, encrypted worktree disk, credential disk, cell identity, and private-container resource bindings.
 - Captain intent passed unchanged to no-mistakes.
 - Resource class, resource limits, and requested shard count.
 - Secret-free credential lease descriptor and its digest.
@@ -73,9 +79,11 @@ Its digest binds all of these identities before queueing:
 - Trusted guest and shard-bridge digests.
 
 Azure tags repeat the non-secret home, task, generation, validation, cell, fence, branch, head, worktree, credential-lease, SKU-family, processor-reservation, and cost-attribution bindings.
-The host records every resource id, ETag, VM instance id, identity client/principal id, and guest boot id before accepting a result or deleting anything.
+The host records every resource id, ETag, VM instance id, NIC `resourceGuid`, disk `uniqueId`, identity client/principal id, and guest boot id before accepting a result or deleting anything.
+ETags guard the current mutation, while stable VM/NIC/disk identities remain authoritative across legitimate attach, detach, and power-state ETag changes.
 The guest independently re-reads IMDS and requires the exact VM instance plus worktree and credential disk ids before unlocking either disk.
 The credential disk's recorded LUKS UUID is checked after unlock.
+The newly created worktree LUKS UUID is retained in the durable run identity, re-proved on every response or replacement, and repeated in every result.
 
 A result schema `fm.azure-validation-result/v1` repeats the home, task, task generation, validation generation, cell, fence, branch, submitted head, current head, remote head, worktree disk, credential lease, no-mistakes run, VM, instance, and boot identities.
 A passed result additionally requires a full PR URL, CI-green marker, exact remote-current head, and the complete independent behavior-shard receipt set.
@@ -90,7 +98,7 @@ The LUKS unlock value is read from an owner-only local file and supplied only as
 The host state stores no unlock value or unlock-file path.
 
 The secret-free lease descriptor uses schema `fm.azure-credential-lease/v1` and must itself be mode 0600.
-It binds exactly one task and generation, provider adapter, provider-account identity hash, credential-disk content hash, disk id, ETag, LUKS UUID, zone, expiry, provider-home relative path, GitHub-token relative path, and GitHub authority.
+It binds exactly one task and generation, provider adapter, provider-account identity hash, credential-disk content hash, disk id, ETag, LUKS UUID, zone, expiry, provider-home relative path, account-binding marker path, GitHub-token relative path, and GitHub authority.
 The descriptor rejects keys named like tokens, secrets, passwords, private keys, credentials, or authorization values.
 
 The GitHub authority must declare exactly one repository and exactly these operations:
@@ -123,6 +131,7 @@ A descriptor has this secret-free shape:
   },
   "paths": {
     "provider_home": "provider",
+    "account_binding": "provider/.firstmate-account-binding",
     "github_token": "github/token"
   },
   "github_authority": {
@@ -134,7 +143,10 @@ A descriptor has this secret-free shape:
 }
 ```
 
-The provider home and GitHub token path must be distinct, bounded disk-relative paths.
+The provider home, account marker, and GitHub token path must be distinct, bounded disk-relative paths, with the marker inside the provider home.
+The marker contains only the exact non-secret `provider_account_binding` value.
+After LUKS unlock, the guest rejects links, non-regular files, hard links, and every file outside the provider home plus exact GitHub token.
+It recomputes `disk_content_binding` as SHA-256 over the sorted regular-file inventory, framing each credential-root-relative path, file-content SHA-256, and size; this proves the exact task-owned provider/GitHub content without recording credential bytes.
 The disk must be detached and carry the exact `credential-lease` tag before admission.
 A shared account disk, attached disk, expired lease, broad GitHub declaration, unreadable account binding, or wrong task/generation fails before VM creation.
 
@@ -142,7 +154,8 @@ A shared account disk, attached disk, expired lease, broad GitHub declaration, u
 
 The cell image is pinned Ubuntu 24.04, but no ambient installed provider or no-mistakes version is trusted.
 Submission requires a credential-free `runtime.tar.gz` with a `runtime.json` manifest using schema `fm.azure-validation-runtime/v1`.
-The manifest binds the exact provider, no-mistakes semantic version, no-mistakes executable path, and SHA-256 digest of every regular runtime file.
+The manifest binds the exact provider, no-mistakes semantic version, no-mistakes executable path, provider executable path, `gh` path, `gh-axi` path, and SHA-256 digest of every regular runtime file.
+Every declared executable must carry the expected basename and executable mode.
 The bundle rejects links, devices, escaping paths, files over 512 MiB, total size over 1 GiB, and credential-like paths such as provider homes, GitHub config, auth files, credentials, tokens, secrets, cookies, or Keychain material.
 The guest re-verifies the complete file inventory and every digest before execution.
 
@@ -154,9 +167,12 @@ A minimal manifest shape is:
   "provider": "codex",
   "no_mistakes_version": "1.41.2",
   "no_mistakes_path": "bin/no-mistakes",
+  "provider_path": "bin/codex",
+  "gh_path": "bin/gh",
+  "gh_axi_path": "bin/gh-axi",
   "files": [
     {"path": "bin/no-mistakes", "digest": "sha256:<64 hex>"},
-    {"path": "bin/provider", "digest": "sha256:<64 hex>"},
+    {"path": "bin/codex", "digest": "sha256:<64 hex>"},
     {"path": "bin/gh", "digest": "sha256:<64 hex>"},
     {"path": "bin/gh-axi", "digest": "sha256:<64 hex>"}
   ]
@@ -169,6 +185,7 @@ Credential renewal or login is never performed by the dispatcher.
 ## Cell process and storage isolation
 
 The cell template has no public IP, password, SSH key, inbound listener, load balancer, or public storage path.
+It installs both a guest shutdown timer and an independently inventoried Azure-native `ComputeVmShutdownTask`; cleanup retains that schedule until exact VM absence and detached disposable capacity are proven.
 It uses the foundation's private `snet-validation` subnet, isolated NSG, NAT egress, Trusted Launch, Secure Boot, vTPM, encryption at host, a disposable OS disk, a retained worktree disk, and an externally leased credential disk.
 The VM receives one user-assigned identity created for that cell.
 That identity and the exact local operator receive Blob Data Contributor only on the cell's unique private container.
@@ -188,6 +205,7 @@ Stopping or losing one VM cannot stop a peer cell, shard VM, local supervisor, a
 The trusted default-branch `.no-mistakes.yaml` preserves the ordinary local commands outside a validation cell.
 Inside a cell it invokes only the root-owned shard bridge for lint and tests.
 A worktree branch cannot replace that absolute bridge path.
+The bridge parses duration inventory and returned manifests as data and reproduces the existing deterministic LPT planning/completeness contract internally; it never executes a worktree verifier while provider or GitHub credentials are mounted.
 
 For behavior parallelism, the bridge creates one exact clean Git bundle and eight `fm.azure-validation-shard/v1` requests.
 Each request binds the cell, round, shard index/count, branch, current head, tree, bundle, fixed command, command digest, and declared manifest artifact.
@@ -196,11 +214,15 @@ The local dispatcher downloads only that credential-free bundle, materializes a 
 It does not run the command locally.
 
 The dispatcher rotates the eight requests across the runner's eight reviewed mixed 4-vCPU families and sets the runner concurrency ceiling to eight.
+Each request uses the runner's exact private-parent snapshot mode, so a pipeline-owned fix commit can run before the no-mistakes push step without executing locally or prematurely mutating the remote task branch.
+The one-ref Git bundle, current source ref/head/tree, digest, size, and private input blob are all bound to the parent cell and command request, while the runner independently re-proves the public trusted default base.
+A new child starts through `runner run` with an explicit invocation, confirmation, source ref, private bundle, and parent-cell reservation; only an already recorded child uses `runner resume`, so a missing VM cannot turn a prepared record into duplicate execution.
 The one-shot runner still re-proves live family quota, regional quota, rate, budget, private network, image, command bounds, and global admission under its own contract.
 Every shard therefore receives a separate VM, OS disk, process namespace, port space, lock space, temp root, terminal-server space, boot id, and VM instance id.
 
-The dispatcher returns one `fm.azure-validation-shard-result/v1` object per request.
-The in-cell bridge verifies every request/head/command identity, requires a distinct VM instance and boot for every shard, reconstructs the eight executed manifests, and runs only the existing completeness verifier in the control cell.
+The dispatcher downloads each runner's digest-bound private archive over the private endpoint, matches it to the bounded control-plane result, and returns one `fm.azure-validation-shard-result/v1` object per request.
+The response repeats exact request, source head/tree, command, invocation, VM, boot, artifact digest/size, duration, and cost identity.
+The in-cell bridge verifies every request/head/command/artifact identity, requires a distinct invocation, VM instance, and boot for every shard, reconstructs the eight executed manifests, and applies the trusted data-only completeness verifier in the control cell.
 No behavior test process runs in the credentialed cell or on the Mac.
 A missing, duplicate, failed, wrong-head, wrong-command, reused-boot, or reused-VM shard fails the no-mistakes test step with exact failure attribution.
 
@@ -209,12 +231,12 @@ Repository command children receive no provider home, GitHub token, cell identit
 
 ## Queue and admission
 
-`submit` proves a clean named branch whose exact head is already present at `origin`, validates the lease/runtime boundaries, creates a Git bundle, and writes one atomic mode-0600 queue record under `$FM_HOME/state/azure-validation`.
-It does not contact Azure or run a repository command.
+`submit` proves a clean named branch whose exact head is already present at `origin`, validates the lease/runtime boundaries, binds deterministic resource ids from the exact configured subscription/resource-group/naming prefix, creates a Git bundle, and writes one atomic mode-0600 queue record under `$FM_HOME/state/azure-validation`.
+It requires those identity values but does not contact Azure or run a repository command.
 The default local queue depth bound is 128.
 
 `dispatch` requires `--confirm-dispatch` and an exact subscription confirmation.
-Before creating capacity it proves the tenant/subscription, private foundation, credential disk, selected SKU, family quota, 128-vCPU regional target, regional free quota, separate author/validation processor budgets, queue depth, active-cell count, worker-hour budget, actual cost, forecast cost, and current retail rate.
+Before creating capacity it proves the tenant/subscription, current-main private foundation owner/generation/storage/VNet/subnet contract, credential disk, selected SKU, author-worker family separation, family quota, 128-vCPU regional target, complete-shape regional free quota, separate author/validation processor budgets, queue depth, active-cell count, worker-hour budget, actual cost, forecast cost, and current retail rate.
 A renewable blob lease in `validation-shards/validation-cells/admission.lock` serializes count-and-create admission across Firstmate homes.
 The lease is rechecked immediately before the cell starts.
 
@@ -259,7 +281,8 @@ bin/fm-azure-validation.sh dispatch \
   --confirm-subscription "$FM_AZURE_SUBSCRIPTION_ID"
 ```
 
-Drive pending shard requests without executing them locally, then observe and collect:
+Drive pending shard requests without executing them locally, then observe and collect.
+The long child-VM wait owns a separate shard-driver lock and never holds the cell-state lock, so status, observation, and ask-user response access stay bounded while shards run:
 
 ```sh
 bin/fm-azure-validation.sh drive --cell '<azv-id>' --wait-seconds 60
@@ -308,7 +331,8 @@ bin/fm-azure-validation.sh replace \
   --confirm-subscription "$FM_AZURE_SUBSCRIPTION_ID"
 ```
 
-If a run fails or its result is ambiguous, remove only its exact disposable compute while retaining the encrypted worktree, lease, private container, and evidence for diagnosis:
+If a run fails or its result is ambiguous, remove only its exact disposable compute while retaining the encrypted worktree, lease, private container, and evidence for diagnosis.
+The retained transition is published only after both durable disks are present, stably identical, and detached from the removed VM:
 
 ```sh
 bin/fm-azure-validation.sh retain-failure \
@@ -325,17 +349,21 @@ No command names or deletes a resource group, subnet, foundation identity, anoth
 Successful close occurs only after complete result/report/evidence collection, CI-green proof, exact remote-current head proof, and explicit head confirmation.
 It removes resources in this exact scope and order:
 
-1. The cell's attributed validation Managed Run Command.
+1. Every recorded validation Managed Run Command plus the guest safety Run Command.
 2. The exact cell VM.
 3. The exact NIC.
 4. The disposable OS disk.
-5. The exact encrypted worktree disk.
-6. The two direct role assignments on the cell's private container after proving their exact principal inventory.
-7. The exact private container.
-8. The exact cell identity.
-9. Local transient payloads after the durable result is retained.
+5. The Azure-native shutdown schedule, only after exact VM/NIC/OS-disk absence.
+6. The credential disk is proved detached with the same stable disk identity and is returned to its exact lease.
+7. The exact encrypted worktree disk.
+8. The two exact Blob Data Contributor role assignments on the cell's private container after proving their complete principal and role inventory.
+9. The exact private container.
+10. The exact cell identity.
+11. Local transient payloads after the durable result is retained.
 
 The credential disk is detached and returned to the lease owner only after that exact close.
+Before role or container mutation, close persists the exact container ETag and two role-assignment ids.
+A retry accepts only the remaining subset of that plan, so a crash between role removal, container removal, and identity removal resumes idempotently instead of requiring deleted authority to reappear.
 A missing ETag, changed instance, foreign tag, foreign principal, extra role assignment, partial delete, unreadable absence, wrong head, failed run, pending decision, or incomplete result changes the state to retained cleanup and stops.
 
 ## Acceptance after foundation approval

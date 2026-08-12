@@ -140,7 +140,8 @@ One Dasv6 supervisor plus two continuous Dasv6 workers is about $332/month for V
 The full mixed plan's average worker rate is about $0.218/hour, making the 3,500-hour planning arithmetic, supervisor, NAT/outbound IP, and conservative $210 reserve about $1,077/month.
 Sixteen mixed workers plus the supervisor and NAT/outbound IP running continuously is about $2,653/month before disks, validation/review/browser capacity, Log Analytics, blob capacity and operations, network transfer, taxes, discounts, or credits.
 The separate one-shot validation seam defaults to `Standard_D4as_v6` (4 vCPUs/16 GiB), so two immediate shards fit inside the existing 10-vCPU Dasv6 allowance.
-The no-mistakes validation control cell defaults near 8 vCPUs/32 GiB and live-selects an affordable reviewed v5 family separate from the v6/v7 author plan, while requested behavior parallelism fans into mixed-family identity-less command VMs under the independent 64-vCPU validation reservation described in [`docs/azure-validation.md`](azure-validation.md).
+The no-mistakes validation control cell defaults near 8 vCPUs/32 GiB and live-selects an affordable candidate v5 family only after proving current availability, capability, quota, price, and separation from the v6/v7 author plan.
+Requested behavior parallelism fans into mixed-family identity-less command VMs under the complete-shape 64-vCPU validation reservation described in [`docs/azure-validation.md`](azure-validation.md).
 East US homogeneous-family increases are unavailable on this sponsorship subscription, so the runner never waits for 96 homogeneous family vCPUs and may instead select one of the foundation's reviewed mixed-family shapes only after proving that exact family's current free quota and retail rate.
 Quota is capacity, not permission to spend; actual and forecast billing telemetry is authoritative.
 Credits remain unverified and are never assumed.

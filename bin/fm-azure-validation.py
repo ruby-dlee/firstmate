@@ -43,6 +43,8 @@ SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
 RESOURCE_ID = re.compile(r"^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Compute/disks/[^/]+$", re.I)
 PR_URL = re.compile(r"^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$")
+NM_RUN_ID = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
+RUNNER_INVOCATION = re.compile(r"^azr-[a-z0-9]{12}(?:-a[2-9][0-9]*)?$")
 LOCAL_TIMEOUT = 300
 REGIONAL_TARGET_VCPUS = 128
 VALIDATION_RESERVED_VCPUS = 64
@@ -53,6 +55,7 @@ BUDGET_CEILING_USD = 1500.0
 MAX_CELL_LIFETIME_HOURS = 24
 FOUNDATION_METER_RESERVE_USD = 210.0
 VALIDATION_METER_RESERVE_USD = 80.0
+BLOB_DATA_CONTRIBUTOR_ROLE = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
 
 # Validation deliberately uses v5 quota families rather than the v6/v7 mixed
 # author plan. Live SKU, family, quota, and retail evidence is re-read before
@@ -99,6 +102,8 @@ RESOURCE_API = {
     "disk": "2023-10-02",
     "run-command": "2024-03-01",
     "identity": "2023-01-31",
+    "ttl-schedule": "2018-09-15",
+    "container": "2023-05-01",
 }
 RUNNER_SHARD_SKUS = (
     "Standard_D4as_v6", "Standard_D4as_v7", "Standard_D4s_v6",
@@ -220,7 +225,7 @@ def environment(require_cloud=False):
     required = (
         "FM_AZURE_TENANT_ID", "FM_AZURE_SUBSCRIPTION_ID", "FM_AZURE_NAMING_PREFIX",
         "FM_AZURE_STORAGE_NAME", "FM_AZURE_DEPLOYMENT_GENERATION",
-        "FM_AZURE_RUNNER_OPERATOR_OBJECT_ID",
+        "FM_AZURE_OWNER_TAG", "FM_AZURE_RUNNER_OPERATOR_OBJECT_ID",
     )
     missing = [name for name in required if not os.environ.get(name)]
     if missing:
@@ -249,6 +254,7 @@ def environment(require_cloud=False):
             "FM_AZURE_RESOURCE_GROUP", "rg-firstmate-pilot-eastus-001"
         ),
         "operator_object_id": os.environ["FM_AZURE_RUNNER_OPERATOR_OBJECT_ID"],
+        "owner": require_id("Azure cleanup owner", os.environ["FM_AZURE_OWNER_TAG"]),
         "vnet": "vnet-{}-eus".format(prefix),
         "subnet": "snet-validation",
     })
@@ -372,15 +378,24 @@ def reject_secret_keys(value, path="lease"):
 
 
 def load_credential_lease(path, task, generation, repo_slug):
-    source = Path(path).resolve()
+    source_arg = Path(path)
+    source = source_arg.resolve()
     try:
+        if source_arg.is_symlink() or not source.is_file():
+            raise ValidationError("credential lease descriptor must be a regular non-link file")
         mode = source.stat().st_mode & 0o777
         value = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValidationError("credential lease descriptor is unreadable: {}".format(exc))
+    reject_secret_keys(value)
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "lease_id", "task", "task_generation", "provider",
+        "provider_account_binding", "disk_content_binding", "disk", "paths",
+        "github_authority", "expires_at",
+    }:
+        raise ValidationError("credential lease descriptor field inventory is not exact")
     if mode & 0o077:
         raise ValidationError("credential lease descriptor must not be group/world accessible")
-    reject_secret_keys(value)
     expected = {
         "schema": LEASE_SCHEMA,
         "task": task,
@@ -393,6 +408,8 @@ def load_credential_lease(path, task, generation, repo_slug):
     require_sha256("provider account binding", value.get("provider_account_binding"))
     require_sha256("credential disk content binding", value.get("disk_content_binding"))
     disk = value.get("disk") or {}
+    if not isinstance(disk, dict) or set(disk) != {"id", "etag", "luks_uuid", "zone"}:
+        raise ValidationError("credential lease disk field inventory is not exact")
     if not RESOURCE_ID.match(str(disk.get("id", ""))):
         raise ValidationError("credential lease disk id is malformed")
     if not disk.get("etag") or not UUID.match(str(disk.get("luks_uuid", ""))):
@@ -400,6 +417,8 @@ def load_credential_lease(path, task, generation, repo_slug):
     if str(disk.get("zone")) not in ("1", "2", "3"):
         raise ValidationError("credential lease disk zone must be 1, 2, or 3")
     github = value.get("github_authority") or {}
+    if not isinstance(github, dict) or set(github) != {"kind", "repository", "permissions"}:
+        raise ValidationError("GitHub authority field inventory is not exact")
     if github.get("repository") != repo_slug:
         raise ValidationError("GitHub authority is not scoped to the exact repository")
     permissions = set(github.get("permissions") or [])
@@ -415,12 +434,17 @@ def load_credential_lease(path, task, generation, repo_slug):
     if provider not in ("claude", "codex", "pi", "opencode", "grok"):
         raise ValidationError("credential lease provider is not a verified Firstmate adapter")
     paths = value.get("paths") or {}
-    for key in ("provider_home", "github_token"):
+    if not isinstance(paths, dict) or set(paths) != {"provider_home", "account_binding", "github_token"}:
+        raise ValidationError("credential lease path field inventory is not exact")
+    for key in ("provider_home", "account_binding", "github_token"):
         relative = paths.get(key)
         if not isinstance(relative, str) or not relative or relative.startswith("/") or ".." in relative.split("/"):
             raise ValidationError("credential lease {} must be a bounded disk-relative path".format(key))
-    if paths["provider_home"] == paths["github_token"]:
-        raise ValidationError("provider and GitHub lease paths must remain distinct")
+    if len(set(paths.values())) != len(paths):
+        raise ValidationError("provider, account-binding, and GitHub lease paths must remain distinct")
+    provider_prefix = paths["provider_home"].rstrip("/") + "/"
+    if not paths["account_binding"].startswith(provider_prefix):
+        raise ValidationError("provider account-binding marker must live inside the exact provider home")
     return value, sha256_file(source)
 
 
@@ -434,8 +458,10 @@ def validate_runtime_bundle(path, provider):
         with tarfile.open(source, "r:gz") as archive:
             members = archive.getmembers()
             names = [member.name for member in members]
-            if "runtime.json" not in names:
-                raise ValidationError("runtime bundle has no runtime.json manifest")
+            if len(members) > 10000 or sum(member.size for member in members) > 2 * 1024**3:
+                raise ValidationError("runtime bundle exceeds the bounded member/decompressed inventory")
+            if names.count("runtime.json") != 1 or len(names) != len(set(names)):
+                raise ValidationError("runtime bundle has no unique runtime.json/member inventory")
             for member in members:
                 lowered = member.name.lower().strip("./")
                 parts = set(lowered.split("/"))
@@ -459,14 +485,48 @@ def validate_runtime_bundle(path, provider):
     if not isinstance(declared, list) or not declared:
         raise ValidationError("runtime manifest file inventory is empty")
     declared_paths = set()
+    records_by_path = {}
     for record in declared:
         if not isinstance(record, dict) or not isinstance(record.get("path"), str):
             raise ValidationError("runtime manifest file record is malformed")
+        relative = record["path"]
+        if (
+            not relative or relative.startswith("/") or ".." in relative.split("/")
+            or relative in declared_paths
+        ):
+            raise ValidationError("runtime manifest file path is unsafe or duplicated")
         require_sha256("runtime file digest", record.get("digest"))
-        declared_paths.add(record["path"])
-    archive_files = {member.name for member in members if member.isfile() and member.name != "runtime.json"}
-    if archive_files != declared_paths:
+        declared_paths.add(relative)
+        records_by_path[relative] = record
+    archive_files = {member.name: member for member in members if member.isfile() and member.name != "runtime.json"}
+    if set(archive_files) != declared_paths:
         raise ValidationError("runtime manifest does not exactly inventory the bundle")
+    with tarfile.open(source, "r:gz") as archive:
+        for relative, record in records_by_path.items():
+            handle = archive.extractfile(relative)
+            if handle is None:
+                raise ValidationError("runtime manifest member is not a regular file")
+            digest = hashlib.sha256()
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+            if "sha256:" + digest.hexdigest() != record["digest"]:
+                raise ValidationError("runtime bundle file digest mismatch: {}".format(relative))
+    required_executables = {
+        "no_mistakes_path": "no-mistakes",
+        "provider_path": provider,
+        "gh_path": "gh",
+        "gh_axi_path": "gh-axi",
+    }
+    for field, basename in required_executables.items():
+        relative = manifest.get(field)
+        member = archive_files.get(relative)
+        if (
+            not isinstance(relative, str)
+            or Path(relative).name != basename
+            or member is None
+            or member.mode & 0o111 == 0
+        ):
+            raise ValidationError("runtime {} exact executable is absent or not executable".format(field))
     return manifest, sha256_file(source)
 
 
@@ -588,8 +648,12 @@ def submit(env, args):
         )
         runtime, runtime_digest = validate_runtime_bundle(args.runtime_bundle, lease["provider"])
         cell = new_cell()
+        token = cell.split("-", 1)[1]
+        resources = resource_names(env, token, lease)
+        shard_container = "fmval" + token
         fence = sha256_bytes(os.urandom(32))
         limits = dict(RESOURCE_CLASSES[resource_class])
+        limits["reserved_vcpus"] = limits["vcpus"] + limits["behavior_shards"] * 4
         request = {
             "schema": SCHEMA,
             "cell": cell,
@@ -600,6 +664,13 @@ def submit(env, args):
             "deployment_generation": deployment_generation,
             "fence": fence,
             "intent": intent,
+            "resource_bindings": {
+                "vm_id": resources["vm_id"],
+                "worktree_disk_id": resources["worktree_disk_id"],
+                "credential_disk_id": resources["credential_disk_id"],
+                "identity_id": resources["identity_id"],
+                "shard_container": shard_container,
+            },
             "repository": {
                 "slug": repo_slug,
                 "branch": branch,
@@ -621,7 +692,6 @@ def submit(env, args):
             },
             "created_at": iso_utc(),
         }
-        token = cell.split("-", 1)[1]
         staging_prefix = "validation-cells/{}/{}/{}/{}/{}".format(
             env["home_binding"].split(":", 1)[1][:16], task, generation,
             validation_generation, cell,
@@ -635,7 +705,7 @@ def submit(env, args):
             "request": request,
             "attempt": 1,
             "staging": {
-                "container": "fmval" + token,
+                "container": shard_container,
                 "input_blob": "control/input.tar.gz",
                 "result_blob": "control/result.tar.gz",
                 "evidence_prefix": "control/evidence",
@@ -643,7 +713,7 @@ def submit(env, args):
                 "admission_blob": "validation-cells/admission.lock",
                 "lineage_prefix": staging_prefix,
             },
-            "resources": resource_names(env, token, lease),
+            "resources": resources,
             "events": [{"at": iso_utc(), "phase": "preparing", "note": "queue identity reserved"}],
         }
         ensure_dirs(env)
@@ -662,9 +732,13 @@ def submit(env, args):
 
 
 def resource_names(env, token, lease):
-    prefix = os.environ.get("FM_AZURE_NAMING_PREFIX", "pending")
-    sub = os.environ.get("FM_AZURE_SUBSCRIPTION_ID", "pending")
+    prefix = os.environ.get("FM_AZURE_NAMING_PREFIX", "")
+    sub = os.environ.get("FM_AZURE_SUBSCRIPTION_ID", "")
     group = os.environ.get("FM_AZURE_RESOURCE_GROUP", "rg-firstmate-pilot-eastus-001")
+    if not re.match(r"^[a-z0-9]{3,12}$", prefix) or not UUID.match(sub):
+        raise ValidationError("submit requires exact naming-prefix and subscription identity without contacting Azure")
+    if not re.match(r"^[A-Za-z0-9._()\-]{1,90}$", group):
+        raise ValidationError("Azure resource group name is malformed")
     base = "/subscriptions/{}/resourceGroups/{}/providers".format(sub, group)
     vm = "vm-{}-val-{}".format(prefix, token)
     nic = "nic-{}-val-{}".format(prefix, token)
@@ -685,16 +759,20 @@ def resource_names(env, token, lease):
         "os_disk_id": base + "/Microsoft.Compute/disks/" + os_disk,
         "worktree_disk_id": base + "/Microsoft.Compute/disks/" + worktree,
         "run_command_name": "validate-a1",
+        "run_commands": [],
+        "safety_run_command_id": base + "/Microsoft.Compute/virtualMachines/{}/runCommands/safety-shutdown".format(vm),
+        "ttl_schedule_name": "shutdown-{}".format(vm),
+        "ttl_schedule_id": base + "/Microsoft.DevTestLab/schedules/shutdown-{}".format(vm),
         "identities": {},
     }
 
 
-def az_command(env, args, check=True, parse_json=True):
+def az_command(env, args, check=True, parse_json=True, timeout=LOCAL_TIMEOUT):
     command = [os.environ.get("FM_AZURE_CLI", "az")] + list(args)
     command += ["--subscription", env["subscription"], "--only-show-errors"]
     if parse_json and "--output" not in command and "-o" not in command:
         command += ["--output", "json"]
-    result = run(command, check=check)
+    result = run(command, check=check, timeout=timeout)
     if not parse_json:
         return result.stdout.strip(), result.returncode, (result.stderr or "").strip()
     if result.returncode != 0:
@@ -731,11 +809,20 @@ def foundation_gate(env):
         "--name", env["storage"],
     ])
     tags = storage.get("tags") or {}
+    network = storage.get("networkRuleSet") or storage.get("networkAcls") or {}
     if (
         storage.get("location") != "eastus"
+        or storage.get("kind") != "StorageV2"
+        or (storage.get("sku") or {}).get("name") != "Standard_ZRS"
         or storage.get("publicNetworkAccess") != "Disabled"
         or storage.get("allowSharedKeyAccess") is not False
         or storage.get("allowBlobPublicAccess") is not False
+        or storage.get("defaultToOAuthAuthentication") is not True
+        or storage.get("minimumTlsVersion") != "TLS1_2"
+        or network.get("defaultAction") != "Deny"
+        or network.get("bypass") != "None"
+        or tags.get("workload") != "firstmate"
+        or tags.get("cleanup-owner") != env["owner"]
         or tags.get("deployment-generation") != env["deployment_generation"]
     ):
         raise ValidationError("foundation storage/private identity is not exact")
@@ -743,15 +830,28 @@ def foundation_gate(env):
         "network", "vnet", "show", "--resource-group", env["resource_group"],
         "--name", env["vnet"],
     ])
+    vnet_tags = vnet.get("tags") or {}
+    if (
+        vnet.get("location") != "eastus"
+        or (vnet.get("addressSpace") or {}).get("addressPrefixes") != ["10.42.0.0/16"]
+        or vnet_tags.get("workload") != "firstmate"
+        or vnet_tags.get("cleanup-owner") != env["owner"]
+        or vnet_tags.get("deployment-generation") != env["deployment_generation"]
+    ):
+        raise ValidationError("foundation VNet owner/generation/address identity is not exact")
     matches = [item for item in vnet.get("subnets", []) if item.get("name") == env["subnet"]]
     if len(matches) != 1:
         raise ValidationError("private validation-cell subnet is absent or ambiguous")
     subnet = matches[0]
     nsg = str((subnet.get("networkSecurityGroup") or {}).get("id", "")).lower()
-    if not nsg.endswith("/nsg-{}-elastic-isolated".format(env["prefix"]).lower()):
-        raise ValidationError("validation-cell subnet is not attached to the isolated NSG")
-    if not (subnet.get("natGateway") or {}).get("id"):
-        raise ValidationError("validation-cell subnet has no reviewed outbound NAT")
+    nat = str((subnet.get("natGateway") or {}).get("id", "")).lower()
+    if (
+        subnet.get("addressPrefix") != "10.42.4.0/24"
+        or not nsg.endswith("/nsg-{}-elastic-isolated".format(env["prefix"]).lower())
+        or not nat.endswith("/nat-{}-eus".format(env["prefix"]).lower())
+        or subnet.get("privateEndpointNetworkPolicies") != "Enabled"
+    ):
+        raise ValidationError("validation-cell subnet private NSG/NAT/address contract is not exact")
 
 
 def active_inventory(env):
@@ -764,6 +864,12 @@ def active_inventory(env):
         role = tags.get("firstmate-role")
         if role not in ("validation-cell", "validation-shard", "worker", "supervisor"):
             continue
+        if (
+            tags.get("workload") != "firstmate"
+            or tags.get("deployment-generation") != env["deployment_generation"]
+            or tags.get("cleanup-owner") != env["owner"]
+        ):
+            raise ValidationError("active Firstmate VM has foreign owner or deployment-generation tags")
         if "deallocated" in str(vm.get("powerState", "")).lower():
             continue
         defaults = {"validation-shard": 4, "worker": 4, "supervisor": 2, "validation-cell": 0}
@@ -773,9 +879,13 @@ def active_inventory(env):
             raise ValidationError("active Firstmate VM has malformed reserved-vcpus tag")
         if vcpus <= 0:
             raise ValidationError("active Firstmate VM lacks a positive processor reservation")
+        if role == "worker" and tags.get("resource-class") != "author-4vcpu-16gib-trustedlaunch":
+            raise ValidationError("active author worker differs from the general worker resource contract")
         records.append({
             "id": vm.get("id"), "role": role, "vcpus": vcpus,
             "family": tags.get("sku-family"), "cell": tags.get("validation-cell"),
+            "selected_sku": tags.get("selected-sku"),
+            "capacity_parent": tags.get("capacity-parent"),
         })
     return records
 
@@ -797,9 +907,22 @@ def sku_candidates(env, required_vcpus, required_memory, inventory):
         "vm", "list-skus", "--location", "eastus", "--resource-type", "virtualMachines", "--all",
     ])
     usage = usage_map(env)
-    author_families = {item["family"].lower() for item in inventory if item["role"] == "worker" and item.get("family")}
     candidates = []
     by_name = {item.get("name"): item for item in skus}
+    author_families = {
+        item["family"].lower()
+        for item in inventory
+        if item["role"] == "worker" and item.get("family")
+    }
+    for record in inventory:
+        if record["role"] != "worker" or not record.get("selected_sku"):
+            continue
+        sku_record = by_name.get(record["selected_sku"]) or {}
+        capabilities = {entry.get("name"): entry.get("value") for entry in sku_record.get("capabilities", [])}
+        family = str(sku_record.get("family") or capabilities.get("Family") or "")
+        if not family:
+            raise ValidationError("active author worker SKU family is unreadable")
+        author_families.add(family.lower())
     requested = os.environ.get("FM_AZURE_VALIDATION_SKU")
     names = (requested,) if requested else VALIDATION_SKUS
     for name in names:
@@ -915,9 +1038,18 @@ def consumed_hours(env):
 
 def admission_decision(policy, inventory, quota, actual, forecast, rate, used_hours, request):
     active_cells = [item for item in inventory if item["role"] == "validation-cell"]
-    active_validation_vcpus = sum(item["vcpus"] for item in inventory if item["role"] in ("validation-cell", "validation-shard"))
-    active_author_vcpus = sum(item["vcpus"] for item in inventory if item["role"] in ("worker", "supervisor"))
-    requested = int(request["limits"]["vcpus"])
+    active_cell_ids = {item.get("cell") for item in active_cells if item.get("cell")}
+    active_validation_vcpus = sum(item["vcpus"] for item in active_cells)
+    active_validation_vcpus += sum(
+        item["vcpus"]
+        for item in inventory
+        if item["role"] == "validation-shard" and item.get("capacity_parent") not in active_cell_ids
+    )
+    active_author_vcpus = sum(item["vcpus"] for item in inventory if item["role"] == "worker")
+    cell_vcpus = int(request["limits"]["vcpus"])
+    requested = int(request["limits"].get(
+        "reserved_vcpus", cell_vcpus + int(request["limits"].get("behavior_shards", 0)) * 4
+    ))
     if len(active_cells) >= policy["max_active"]:
         return False, "active validation-cell ceiling reached"
     if active_validation_vcpus + requested > policy["validation_reserved_vcpus"]:
@@ -928,14 +1060,17 @@ def admission_decision(policy, inventory, quota, actual, forecast, rate, used_ho
     if regional["limit"] < REGIONAL_TARGET_VCPUS:
         return False, "regional quota target is below 128 vCPUs"
     if regional["limit"] - regional["used"] < requested:
-        return False, "live regional free quota cannot admit the cell"
+        return False, "live regional free quota cannot reserve the complete cell and shard shape"
     family = quota.get(request["sku_family"].lower()) or {"limit": 0, "used": 0}
-    if family["limit"] - family["used"] < requested:
+    if family["limit"] - family["used"] < cell_vcpus:
         return False, "selected validation family has insufficient free quota"
-    worst_hours = used_hours + MAX_CELL_LIFETIME_HOURS
+    shard_count = int(request["limits"].get("behavior_shards", 0))
+    worst_hours = used_hours + MAX_CELL_LIFETIME_HOURS * (1 + shard_count)
     if worst_hours > policy["monthly_hours"]:
         return False, "monthly validation worker-hour budget is saturated"
-    increment = FOUNDATION_METER_RESERVE_USD + VALIDATION_METER_RESERVE_USD + rate * MAX_CELL_LIFETIME_HOURS
+    cell_compute = rate * MAX_CELL_LIFETIME_HOURS
+    shard_compute = 0.25 * shard_count * MAX_CELL_LIFETIME_HOURS
+    increment = FOUNDATION_METER_RESERVE_USD + VALIDATION_METER_RESERVE_USD + cell_compute + shard_compute
     if max(actual + increment, forecast + increment) >= policy["budget_limit"]:
         return False, "actual/forecast cost pressure stops new admission"
     return True, "admitted"
@@ -1015,6 +1150,8 @@ class CloudAdmissionLease:
         self.failed = threading.Event()
         self.stop = threading.Event()
         self.thread = None
+        self.expiry_lock = threading.Lock()
+        self.expires_at = 0.0
 
     def lease_args(self, action):
         args = [
@@ -1044,8 +1181,12 @@ class CloudAdmissionLease:
             if not exists.get("exists"):
                 raise ValidationError("global validation admission lock could not be created or proven")
         for _ in range(7):
-            _, rc, _ = az_command(self.env, self.lease_args("acquire"), check=False)
+            _, rc, _ = az_command(
+                self.env, self.lease_args("acquire"), check=False, timeout=10
+            )
             if rc == 0:
+                with self.expiry_lock:
+                    self.expires_at = time.monotonic() + 60
                 break
             time.sleep(10)
         else:
@@ -1054,22 +1195,44 @@ class CloudAdmissionLease:
         self.thread.start()
         return self
 
+    def renew_once(self):
+        try:
+            _, rc, _ = az_command(
+                self.env, self.lease_args("renew"), check=False, timeout=10
+            )
+            if rc != 0:
+                raise ValidationError("global validation admission renewal was refused")
+            with self.expiry_lock:
+                self.expires_at = time.monotonic() + 60
+        except Exception:
+            self.failed.set()
+            raise
+
     def renew(self):
         while not self.stop.wait(25):
-            _, rc, _ = az_command(self.env, self.lease_args("renew"), check=False)
-            if rc != 0:
-                self.failed.set()
+            try:
+                self.renew_once()
+            except Exception:
                 return
 
     def assert_held(self):
-        if self.failed.is_set():
+        with self.expiry_lock:
+            safely_live = time.monotonic() < self.expires_at - 15
+        if self.failed.is_set() or not safely_live:
+            self.failed.set()
             raise ValidationError("global validation admission lease was lost before cell start")
+
+    def renew_and_assert(self):
+        if self.failed.is_set():
+            self.assert_held()
+        self.renew_once()
+        self.assert_held()
 
     def __exit__(self, exc_type, exc, traceback):
         self.stop.set()
         if self.thread:
             self.thread.join(timeout=2)
-        az_command(self.env, self.lease_args("release"), check=False)
+        az_command(self.env, self.lease_args("release"), check=False, timeout=10)
 
 
 def read_resource(env, resource_id, kind):
@@ -1086,12 +1249,46 @@ def read_resource(env, resource_id, kind):
 
 
 def immutable_identity(resource, kind):
-    identity = {"id": str(resource.get("id", "")).lower(), "etag": resource.get("etag")}
+    properties = resource.get("properties", resource)
+    identity = {"id": str(resource.get("id", "")).lower(), "etag": resource.get("etag") or properties.get("etag")}
     if kind == "vm":
-        identity["instance_id"] = resource.get("properties", {}).get("vmId") or resource.get("vmId")
-    if not identity["id"] or not identity["etag"] or (kind == "vm" and not identity.get("instance_id")):
+        identity["instance_id"] = properties.get("vmId") or resource.get("vmId")
+    elif kind == "nic":
+        identity["resource_guid"] = properties.get("resourceGuid")
+    elif kind == "disk":
+        identity["unique_id"] = properties.get("uniqueId")
+    elif kind == "identity":
+        identity["client_id"] = properties.get("clientId")
+        identity["principal_id"] = properties.get("principalId")
+    stable_keys = {
+        "vm": ("instance_id",),
+        "nic": ("resource_guid",),
+        "disk": ("unique_id",),
+        "identity": ("client_id", "principal_id"),
+        "run-command": (),
+        "ttl-schedule": (),
+    }
+    if (
+        not identity["id"]
+        or not identity["etag"]
+        or any(not identity.get(key) for key in stable_keys.get(kind, ()))
+    ):
         raise ValidationError("{} immutable identity is incomplete".format(kind))
     return identity
+
+
+def same_stable_identity(recorded, live, kind):
+    keys = {
+        "vm": ("id", "instance_id"),
+        "nic": ("id", "resource_guid"),
+        "disk": ("id", "unique_id"),
+        "identity": ("id", "client_id", "principal_id"),
+        "run-command": ("id",),
+        "ttl-schedule": ("id",),
+    }.get(kind, ("id",))
+    return bool(recorded) and all(
+        recorded.get(key) and recorded.get(key) == live.get(key) for key in keys
+    )
 
 
 def expected_tags(state, selected):
@@ -1101,6 +1298,7 @@ def expected_tags(state, selected):
         "firstmate-role": "validation-cell",
         "lifecycle": "elastic-scale-to-zero",
         "deployment-generation": request["deployment_generation"],
+        "cleanup-owner": selected["owner"],
         "home-binding": request["home_binding"],
         "task-binding": request["task"],
         "task-generation": request["task_generation"],
@@ -1114,7 +1312,7 @@ def expected_tags(state, selected):
         "resource-class": request["resource_class"],
         "selected-sku": selected["sku"],
         "sku-family": selected["family"],
-        "reserved-vcpus": str(request["limits"]["vcpus"]),
+        "reserved-vcpus": str(request["limits"]["reserved_vcpus"]),
         "behavior-shards": str(request["limits"]["behavior_shards"]),
         "cost-attribution": "validation-review",
     }
@@ -1126,7 +1324,8 @@ def deployment_parameters(env, state, selected, replacement=False):
     subnet_id = "/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Network/virtualNetworks/{}/subnets/{}".format(
         env["subscription"], env["resource_group"], env["vnet"], env["subnet"]
     )
-    expiry = iso_utc(now_utc() + dt.timedelta(hours=MAX_CELL_LIFETIME_HOURS))
+    expiry_value = now_utc() + dt.timedelta(hours=MAX_CELL_LIFETIME_HOURS - 1)
+    expiry = iso_utc(expiry_value)
     return {
         "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
         "contentVersion": "1.0.0.0",
@@ -1148,6 +1347,7 @@ def deployment_parameters(env, state, selected, replacement=False):
             "vmSize": {"value": selected["sku"]},
             "worktreeDiskGiB": {"value": request["limits"]["worktree_gib"]},
             "expiryUtc": {"value": expiry},
+            "expiryTimeOfDay": {"value": expiry_value.strftime("%H%M")},
             "tags": {"value": expected_tags(state, selected)},
         },
     }
@@ -1155,6 +1355,11 @@ def deployment_parameters(env, state, selected, replacement=False):
 
 def verify_credential_disk(env, state):
     expected = state["request"]["credential_lease"]["disk"]
+    expected_prefix = "/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Compute/disks/".format(
+        env["subscription"], env["resource_group"]
+    )
+    if not expected["id"].lower().startswith(expected_prefix.lower()):
+        raise ValidationError("credential lease disk is outside the exact subscription/resource group")
     exists, disk = read_resource(env, expected["id"], "disk")
     if not exists:
         raise ValidationError("exact credential lease disk is absent")
@@ -1169,10 +1374,14 @@ def verify_credential_disk(env, state):
 
 def adopt_resources(env, state):
     resources = state["resources"]
+    request = state["request"]
     identities = {}
-    for kind, resource_id in (
-        ("vm", resources["vm_id"]), ("nic", resources["nic_id"]),
-        ("disk", resources["os_disk_id"]),
+    for kind, resource_id, identity_key in (
+        ("vm", resources["vm_id"], "vm"),
+        ("nic", resources["nic_id"], "nic"),
+        ("disk", resources["os_disk_id"], "disk"),
+        ("run-command", resources["safety_run_command_id"], "run-command-safety"),
+        ("ttl-schedule", resources["ttl_schedule_id"], "ttl-schedule"),
     ):
         exists, resource = read_resource(env, resource_id, kind)
         if not exists:
@@ -1180,7 +1389,7 @@ def adopt_resources(env, state):
         tags = resource.get("tags") or {}
         if tags.get("validation-cell") != state["cell"] or tags.get("fence") != state["request"]["fence"]:
             raise ValidationError("created {} has foreign validation identity".format(kind))
-        identities[kind] = immutable_identity(resource, kind)
+        identities[identity_key] = immutable_identity(resource, kind)
     exists, identity_resource = read_resource(env, resources["identity_id"], "identity")
     if not exists:
         raise ValidationError("cell-scoped storage identity is absent after deployment")
@@ -1189,6 +1398,23 @@ def adopt_resources(env, state):
     principal_id = identity_resource.get("properties", {}).get("principalId") or identity_resource.get("principalId")
     if not UUID.match(str(client_id)) or not UUID.match(str(principal_id)):
         raise ValidationError("cell-scoped storage identity lacks immutable client/principal ids")
+    container_scope = "/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Storage/storageAccounts/{}/blobServices/default/containers/{}".format(
+        env["subscription"], env["resource_group"], env["storage"], state["staging"]["container"]
+    )
+    assignments, _, _ = az_command(env, [
+        "role", "assignment", "list", "--assignee-object-id", principal_id,
+        "--all", "--include-inherited", "--include-groups",
+    ])
+    expected_role = "/subscriptions/{}/providers/Microsoft.Authorization/roleDefinitions/{}".format(
+        env["subscription"], BLOB_DATA_CONTRIBUTOR_ROLE
+    )
+    if (
+        not isinstance(assignments, list) or len(assignments) != 1
+        or str(assignments[0].get("principalId", "")).lower() != str(principal_id).lower()
+        or str(assignments[0].get("scope", "")).lower() != container_scope.lower()
+        or str(assignments[0].get("roleDefinitionId", "")).lower() != expected_role.lower()
+    ):
+        raise ValidationError("cell identity effective RBAC exceeds its exact private container")
     identities["identity"] = identity
     resources["identity_client_id"] = client_id
     resources["identity_principal_id"] = principal_id
@@ -1199,6 +1425,13 @@ def adopt_resources(env, state):
     if tags.get("validation-cell") != state["cell"] or tags.get("fence") != state["request"]["fence"]:
         raise ValidationError("durable worktree disk identity is foreign")
     identities["worktree"] = immutable_identity(worktree, "disk")
+    credential_exists, credential = read_resource(env, resources["credential_disk_id"], "disk")
+    if not credential_exists:
+        raise ValidationError("credential lease disk disappeared during cell creation")
+    managed_by = credential.get("managedBy") or credential.get("properties", {}).get("managedBy")
+    if str(managed_by or "").lower() != resources["vm_id"].lower():
+        raise ValidationError("credential lease disk is not attached only to the exact cell VM")
+    identities["credential"] = immutable_identity(credential, "disk")
     resources["identities"] = identities
     resources["vm_instance_id"] = identities["vm"]["instance_id"]
     save_state(env, state)
@@ -1249,9 +1482,16 @@ def create_run_command(env, state, mode, input_url=None, output_url=None, respon
     for name in ("FM_AZURE_VALIDATION_WORKTREE_KEY_FILE", "FM_AZURE_VALIDATION_CREDENTIAL_KEY_FILE"):
         _, secret = ensure_secret_file(name)
         protected.append({"name": name.lower(), "value": secret.decode("utf-8").rstrip("\n")})
+    selected = {
+        "sku": state["allocation"]["sku"],
+        "family": state["allocation"]["sku_family"],
+        "owner": env["owner"],
+    }
+    run_tags = expected_tags(state, selected)
+    run_tags["attempt"] = str(attempt)
     body_value = {
         "location": "eastus",
-        "tags": {"validation-cell": state["cell"], "fence": state["request"]["fence"], "attempt": str(attempt)},
+        "tags": run_tags,
         "properties": {
             "source": {"script": GUEST.read_text(encoding="utf-8")},
             "parameters": arguments,
@@ -1270,8 +1510,18 @@ def create_run_command(env, state, mode, input_url=None, output_url=None, respon
         ])
     finally:
         body.unlink(missing_ok=True)
+    exists, run_command = read_resource(env, run_id, "run-command")
+    if not exists:
+        raise ValidationError("created validation Run Command disappeared before identity adoption")
+    tags = run_command.get("tags") or {}
+    if tags.get("validation-cell") != state["cell"] or tags.get("fence") != state["request"]["fence"]:
+        raise ValidationError("created validation Run Command has foreign identity")
     resources["run_command_name"] = name
     resources["run_command_id"] = run_id
+    resources.setdefault("run_commands", []).append({
+        "id": run_id,
+        "identity": immutable_identity(run_command, "run-command"),
+    })
     save_state(env, state)
 
 
@@ -1292,7 +1542,20 @@ def dispatch(env, args):
         state = candidates[0]
         if state["request"]["deployment_generation"] != env["deployment_generation"]:
             raise ValidationError("queued request deployment generation differs from the live foundation")
-        state["resources"] = resource_names(env, state["cell"].split("-", 1)[1], state["request"]["credential_lease"])
+        live_resources = resource_names(
+            env, state["cell"].split("-", 1)[1], state["request"]["credential_lease"]
+        )
+        expected_bindings = state["request"].get("resource_bindings") or {}
+        actual_bindings = {
+            "vm_id": live_resources["vm_id"],
+            "worktree_disk_id": live_resources["worktree_disk_id"],
+            "credential_disk_id": live_resources["credential_disk_id"],
+            "identity_id": live_resources["identity_id"],
+            "shard_container": state["staging"]["container"],
+        }
+        if expected_bindings != actual_bindings:
+            raise ValidationError("queued run resource bindings differ from the exact live foundation scope")
+        state["resources"] = live_resources
         save_state(env, state)
         scope_gate(env)
         foundation_gate(env)
@@ -1302,6 +1565,7 @@ def dispatch(env, args):
             inventory = active_inventory(env)
             limits = state["request"]["limits"]
             selected = sku_candidates(env, limits["vcpus"], limits["memory_gib"], inventory)[0]
+            selected["owner"] = env["owner"]
             allocation_request = dict(state["request"])
             allocation_request["sku"] = selected["sku"]
             allocation_request["sku_family"] = selected["family"]
@@ -1321,6 +1585,7 @@ def dispatch(env, args):
                 "used_worker_hours": consumed_hours(env), "reason": reason,
             }
             transition(env, state, "starting", "live quota, cost, queue, and reserved-processor gates admitted")
+            admission_lease.renew_and_assert()
             create_cell(env, state, selected)
             admission_lease.assert_held()
         storage_upload_after_role(
@@ -1422,22 +1687,79 @@ def verify_result_identity(state, result):
     for key, wanted in expected.items():
         if result.get(key) != wanted:
             raise ValidationError("validation result identity mismatch: {}".format(key))
+    worktree_luks_uuid = result.get("worktree_luks_uuid")
+    if not isinstance(worktree_luks_uuid, str) or not UUID.match(worktree_luks_uuid):
+        raise ValidationError("validation result worktree LUKS identity is malformed")
+    if state.get("worktree_luks_uuid") and state["worktree_luks_uuid"] != worktree_luks_uuid:
+        raise ValidationError("validation result worktree LUKS identity changed")
     head = result.get("current_head")
-    if not isinstance(head, str) or not HEX_OBJECT.match(head):
-        raise ValidationError("validation result current head is malformed")
+    tree = result.get("current_tree")
+    if (
+        not isinstance(head, str) or not HEX_OBJECT.match(head)
+        or not isinstance(tree, str) or not HEX_OBJECT.match(tree)
+    ):
+        raise ValidationError("validation result current head/tree is malformed")
+    run_id = result.get("run_id")
+    if not isinstance(run_id, str) or not NM_RUN_ID.match(run_id):
+        raise ValidationError("validation result lacks the exact no-mistakes run id")
     if result.get("outcome") in ("passed", "checks-passed"):
-        if not result.get("checks_green") or not PR_URL.match(str(result.get("pr_url", ""))):
-            raise ValidationError("successful result lacks CI-green PR proof")
+        expected_pr_prefix = "https://github.com/{}/pull/".format(state["request"]["repository"]["slug"])
+        if (
+            not result.get("checks_green")
+            or not PR_URL.match(str(result.get("pr_url", "")))
+            or not str(result.get("pr_url", "")).startswith(expected_pr_prefix)
+        ):
+            raise ValidationError("successful result lacks repository-scoped CI-green PR proof")
         if result.get("remote_head") != head:
             raise ValidationError("successful result is not current with the exact remote head")
         shard_receipts = result.get("behavior_shards")
         expected_shards = state["request"]["limits"]["behavior_shards"]
         if not isinstance(shard_receipts, list) or len(shard_receipts) != expected_shards:
             raise ValidationError("successful result lacks the complete behavior-shard receipt set")
-        boots = {item.get("boot_id") for item in shard_receipts if isinstance(item, dict)}
-        machines = {item.get("vm_instance_id") for item in shard_receipts if isinstance(item, dict)}
-        if len(boots) != expected_shards or len(machines) != expected_shards:
-            raise ValidationError("behavior shards did not prove independent Azure machines")
+        expected_indexes = set(range(1, expected_shards + 1))
+        indexes = set()
+        boots = set()
+        machines = set()
+        invocations = set()
+        rounds = set()
+        for item in shard_receipts:
+            if not isinstance(item, dict):
+                raise ValidationError("behavior shard receipt is malformed")
+            if (
+                item.get("kind") != "behavior"
+                or item.get("shard_count") != expected_shards
+                or item.get("head") != head
+                or item.get("tree") != tree
+                or not SHA256.match(str(item.get("request_digest", "")))
+                or not SHA256.match(str(item.get("command_digest", "")))
+                or not RUNNER_INVOCATION.match(str(item.get("invocation", "")))
+                or not item.get("boot_id")
+                or not item.get("vm_instance_id")
+            ):
+                raise ValidationError("behavior shard receipt identity is incomplete or stale")
+            artifact = item.get("artifact")
+            if (
+                not isinstance(artifact, dict)
+                or artifact.get("path") != "results/executed-{}.tsv".format(item.get("shard"))
+                or not SHA256.match(str(artifact.get("digest", "")))
+                or not isinstance(artifact.get("bytes"), int)
+                or artifact.get("bytes") < 0
+            ):
+                raise ValidationError("behavior shard receipt artifact identity is invalid")
+            indexes.add(item.get("shard"))
+            boots.add(item["boot_id"])
+            machines.add(item["vm_instance_id"])
+            invocations.add(item["invocation"])
+            rounds.add(item.get("round"))
+        if (
+            indexes != expected_indexes
+            or len(boots) != expected_shards
+            or len(machines) != expected_shards
+            or len(invocations) != expected_shards
+            or len(rounds) != 1
+            or None in rounds
+        ):
+            raise ValidationError("behavior shards did not prove one complete round on independent Azure machines")
     return True
 
 
@@ -1472,6 +1794,7 @@ def collect(env, args):
             raise
         state["result"] = result
         state["result_path"] = str(result_root)
+        state["worktree_luks_uuid"] = result["worktree_luks_uuid"]
         if result.get("run_id"):
             state["run_id"] = result["run_id"]
         phase = "needs-decision" if result["outcome"] == "needs-decision" else "collected"
@@ -1491,7 +1814,12 @@ def respond(env, args):
         if not response.strip() or len(response.encode("utf-8")) > 64 * 1024:
             raise ValidationError("response must contain 1-65536 bytes")
         exists, vm = read_resource(env, state["resources"]["vm_id"], "vm")
-        if not exists or immutable_identity(vm, "vm") != state["resources"]["identities"]["vm"]:
+        if (
+            not exists
+            or not same_stable_identity(
+                state["resources"]["identities"]["vm"], immutable_identity(vm, "vm"), "vm"
+            )
+        ):
             raise ValidationError("exact cell VM identity is absent or changed; response retained")
         state["attempt"] += 1
         output_url = blob_sas(
@@ -1507,7 +1835,7 @@ def replacement_allowed(state, vm_presence, worktree_identity, remote_head):
     if vm_presence != "absent-proven":
         return False, "old VM absence is not proven"
     expected = state.get("resources", {}).get("identities", {}).get("worktree")
-    if not expected or worktree_identity != expected:
+    if not same_stable_identity(expected, worktree_identity, "disk"):
         return False, "durable worktree identity changed"
     if remote_head != state["request"]["repository"]["head"] and state.get("run_id") is None:
         return False, "remote head changed before an exact run id was recorded"
@@ -1523,7 +1851,9 @@ def replace(env, args):
         state = load_state(env, args.cell)
         exists, vm = read_resource(env, state["resources"]["vm_id"], "vm")
         if exists:
-            if immutable_identity(vm, "vm") == state["resources"]["identities"]["vm"]:
+            if same_stable_identity(
+                state["resources"]["identities"]["vm"], immutable_identity(vm, "vm"), "vm"
+            ):
                 raise ValidationError("old exact VM still exists; duplicate replacement is forbidden")
             raise ValidationError("foreign VM occupies the recorded identity")
         work_exists, worktree = read_resource(env, state["resources"]["worktree_disk_id"], "disk")
@@ -1534,6 +1864,18 @@ def replace(env, args):
         allowed, reason = replacement_allowed(state, "absent-proven", immutable_identity(worktree, "disk"), remote_head)
         if not allowed:
             raise ValidationError(reason)
+        # Prove and remove the old attempt's exact disposable remnants before
+        # their names leave authoritative state. Durable worktree, identity,
+        # private container, and credential lease are retained.
+        cleanup_compute(env, state)
+        worktree_identity = wait_exact_disk_detached(
+            env, state["resources"]["worktree_disk_id"],
+            state["resources"]["identities"]["worktree"], "validation worktree",
+        )
+        wait_exact_disk_detached(
+            env, state["resources"]["credential_disk_id"],
+            state["resources"]["identities"]["credential"], "credential lease",
+        )
         state["attempt"] += 1
         token = state["cell"].split("-", 1)[1] + "a{}".format(state["attempt"])
         old_resources = state["resources"]
@@ -1545,10 +1887,14 @@ def replace(env, args):
         for key in ("identity_name", "identity_id", "identity_client_id", "identity_principal_id"):
             state["resources"][key] = old_resources[key]
         state["resources"]["identities"] = {
-            "worktree": immutable_identity(worktree, "disk"),
+            "worktree": worktree_identity,
             "identity": old_resources["identities"]["identity"],
         }
-        selected = {"sku": state["allocation"]["sku"], "family": state["allocation"]["sku_family"]}
+        selected = {
+            "sku": state["allocation"]["sku"],
+            "family": state["allocation"]["sku_family"],
+            "owner": env["owner"],
+        }
         transition(env, state, "reattaching", "old VM absence and exact durable identity proved")
         create_cell(env, state, selected, replacement=True)
         output_url = blob_sas(
@@ -1560,20 +1906,21 @@ def replace(env, args):
     print("AZURE VALIDATION REPLACED cell={} attempt={}".format(state["cell"], state["attempt"]))
 
 
-def verify_cleanup_resource(state, resource, kind):
+def verify_cleanup_resource(state, resource, kind, recorded_key=None):
     tags = resource.get("tags") or {}
+    label = recorded_key or kind
     if tags.get("validation-cell") != state["cell"] or tags.get("fence") != state["request"]["fence"]:
-        raise ValidationError("{} cleanup identity is foreign".format(kind))
-    recorded = state["resources"].get("identities", {}).get(kind)
-    if recorded and immutable_identity(resource, kind) != recorded:
-        raise ValidationError("{} immutable identity changed; cleanup retained".format(kind))
+        raise ValidationError("{} cleanup identity is foreign".format(label))
+    recorded = state["resources"].get("identities", {}).get(label)
+    if recorded and not same_stable_identity(recorded, immutable_identity(resource, kind), kind):
+        raise ValidationError("{} immutable identity changed; cleanup retained".format(label))
 
 
 def delete_resource(env, state, resource_id, kind, recorded_key=None):
     exists, resource = read_resource(env, resource_id, kind)
     if not exists:
         return
-    verify_cleanup_resource(state, resource, recorded_key or kind)
+    verify_cleanup_resource(state, resource, kind, recorded_key)
     identity = immutable_identity(resource, kind)
     body = {"If-Match": identity["etag"]}
     header = write_private_json(env, ".delete-header-", body)
@@ -1587,58 +1934,159 @@ def delete_resource(env, state, resource_id, kind, recorded_key=None):
         header.unlink(missing_ok=True)
     if rc != 0:
         raise ValidationError("exact {} deletion failed: {}".format(kind, stderr))
-    remains, _ = read_resource(env, resource_id, kind)
-    if remains:
-        raise ValidationError("exact {} remains after delete".format(kind))
+    for _ in range(60):
+        remains, _ = read_resource(env, resource_id, kind)
+        if not remains:
+            return
+        time.sleep(5)
+    raise ValidationError("exact {} remains after bounded delete reconciliation".format(kind))
+
+
+def delete_run_command(env, state, run_id, recorded):
+    exists, run_command = read_resource(env, run_id, "run-command")
+    if not exists:
+        return
+    tags = run_command.get("tags") or {}
+    live = immutable_identity(run_command, "run-command")
+    if (
+        tags.get("validation-cell") != state["cell"]
+        or tags.get("fence") != state["request"]["fence"]
+        or not same_stable_identity(recorded, live, "run-command")
+    ):
+        raise ValidationError("run-command cleanup identity is foreign")
+    _, rc, stderr = az_command(env, [
+        "rest", "--method", "delete",
+        "--url", "https://management.azure.com{}?api-version={}".format(run_id, RESOURCE_API["run-command"]),
+        "--headers", "If-Match={}".format(live["etag"]),
+    ], check=False)
+    if rc != 0:
+        raise ValidationError("exact run-command delete failed: {}".format(stderr))
+    for _ in range(60):
+        remains, _ = read_resource(env, run_id, "run-command")
+        if not remains:
+            return
+        time.sleep(5)
+    raise ValidationError("exact run-command remains after bounded delete reconciliation")
 
 
 def cleanup_compute(env, state):
-    run_id = state["resources"].get("run_command_id")
-    if run_id:
-        exists, run_command = read_resource(env, run_id, "run-command")
-        if exists:
-            tags = run_command.get("tags") or {}
-            if tags.get("validation-cell") != state["cell"] or tags.get("fence") != state["request"]["fence"]:
-                raise ValidationError("run-command cleanup identity is foreign")
-            identity = immutable_identity(run_command, "run-command")
-            _, rc, stderr = az_command(env, [
-                "rest", "--method", "delete",
-                "--url", "https://management.azure.com{}?api-version={}".format(run_id, RESOURCE_API["run-command"]),
-                "--headers", "If-Match={}".format(identity["etag"]),
-            ], check=False)
-            if rc != 0:
-                raise ValidationError("exact run-command delete failed: {}".format(stderr))
+    resources = state["resources"]
+    for record in resources.get("run_commands", []):
+        delete_run_command(env, state, record["id"], record["identity"])
+    safety_identity = resources.get("identities", {}).get("run-command-safety")
+    if safety_identity:
+        delete_run_command(env, state, resources["safety_run_command_id"], safety_identity)
     delete_resource(env, state, state["resources"]["vm_id"], "vm")
     delete_resource(env, state, state["resources"]["nic_id"], "nic")
     delete_resource(env, state, state["resources"]["os_disk_id"], "disk")
+    delete_resource(env, state, state["resources"]["ttl_schedule_id"], "ttl-schedule")
+
+
+def wait_exact_disk_detached(env, disk_id, recorded, label):
+    for _ in range(60):
+        exists, disk = read_resource(env, disk_id, "disk")
+        if not exists:
+            raise ValidationError("{} disk disappeared during detach reconciliation".format(label))
+        live = immutable_identity(disk, "disk")
+        if not same_stable_identity(recorded, live, "disk"):
+            raise ValidationError("{} disk stable identity changed".format(label))
+        managed_by = disk.get("managedBy") or disk.get("properties", {}).get("managedBy")
+        if not managed_by:
+            return live
+        time.sleep(5)
+    raise ValidationError("{} disk did not detach after bounded reconciliation".format(label))
 
 
 def delete_cell_storage_scope(env, state):
     scope = "/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Storage/storageAccounts/{}/blobServices/default/containers/{}".format(
         env["subscription"], env["resource_group"], env["storage"], state["staging"]["container"]
     )
+    plan = state.get("storage_cleanup")
+    container_exists, container = read_resource(env, scope, "container")
     assignments, _, _ = az_command(env, ["role", "assignment", "list", "--scope", scope, "--all"])
     direct = [item for item in assignments if str(item.get("scope", "")).lower() == scope.lower()]
     expected_principals = {env["operator_object_id"].lower(), state["resources"]["identity_principal_id"].lower()}
-    principals = {str(item.get("principalId", "")).lower() for item in direct}
-    if principals != expected_principals or any(not item.get("id") for item in direct):
-        raise ValidationError("cell container role inventory is foreign or incomplete")
+    expected_role = "/subscriptions/{}/providers/Microsoft.Authorization/roleDefinitions/{}".format(
+        env["subscription"], BLOB_DATA_CONTRIBUTOR_ROLE
+    )
+    if plan is None:
+        if not container_exists:
+            raise ValidationError("cell private container disappeared before cleanup was planned")
+        properties = container.get("properties", container)
+        container_etag = container.get("etag") or properties.get("etag")
+        principals = {str(item.get("principalId", "")).lower() for item in direct}
+        if (
+            properties.get("publicAccess") not in (None, "None")
+            or not container_etag
+            or len(direct) != 2
+            or principals != expected_principals
+            or any(
+                not item.get("id")
+                or str(item.get("roleDefinitionId", "")).lower() != expected_role.lower()
+                for item in direct
+            )
+        ):
+            raise ValidationError("cell container/role cleanup inventory is foreign or incomplete")
+        plan = {
+            "scope": scope,
+            "container_etag": container_etag,
+            "role_ids": sorted(item["id"] for item in direct),
+            "roles_absent": False,
+            "container_absent": False,
+        }
+        state["storage_cleanup"] = plan
+        save_state(env, state)
+    if plan.get("scope") != scope or not plan.get("container_etag") or len(plan.get("role_ids", [])) != 2:
+        raise ValidationError("stored cell-container cleanup plan is corrupt")
+    planned_ids = set(plan["role_ids"])
+    current_ids = {item.get("id") for item in direct}
+    if (
+        not current_ids.issubset(planned_ids)
+        or any(
+            str(item.get("principalId", "")).lower() not in expected_principals
+            or str(item.get("roleDefinitionId", "")).lower() != expected_role.lower()
+            for item in direct
+        )
+    ):
+        raise ValidationError("cell role cleanup inventory changed or gained foreign authority")
     for item in direct:
         _, rc, stderr = az_command(env, ["role", "assignment", "delete", "--ids", item["id"]], check=False)
         if rc != 0:
             raise ValidationError("exact cell role assignment deletion failed: {}".format(stderr))
-    _, rc, stderr = az_command(env, [
-        "storage", "container", "delete", "--auth-mode", "login", "--account-name", env["storage"],
-        "--name", state["staging"]["container"],
-    ], check=False)
-    if rc != 0:
-        raise ValidationError("exact cell container deletion failed: {}".format(stderr))
-    exists, _, _ = az_command(env, [
-        "storage", "container", "exists", "--auth-mode", "login", "--account-name", env["storage"],
-        "--name", state["staging"]["container"],
-    ])
-    if exists.get("exists"):
-        raise ValidationError("cell container remains after exact deletion")
+    for _ in range(60):
+        remaining, _, _ = az_command(env, ["role", "assignment", "list", "--scope", scope, "--all"])
+        current = [item for item in remaining if str(item.get("scope", "")).lower() == scope.lower()]
+        if not current:
+            break
+        if not {item.get("id") for item in current}.issubset(planned_ids):
+            raise ValidationError("foreign role assignment appeared during cleanup")
+        time.sleep(5)
+    else:
+        raise ValidationError("cell role assignments remain after bounded deletion reconciliation")
+    plan["roles_absent"] = True
+    save_state(env, state)
+    container_exists, container = read_resource(env, scope, "container")
+    if container_exists:
+        properties = container.get("properties", container)
+        live_etag = container.get("etag") or properties.get("etag")
+        if live_etag != plan["container_etag"] or properties.get("publicAccess") not in (None, "None"):
+            raise ValidationError("cell private container changed after cleanup planning")
+        _, rc, stderr = az_command(env, [
+            "rest", "--method", "delete",
+            "--url", "https://management.azure.com{}?api-version={}".format(scope, RESOURCE_API["container"]),
+            "--headers", "If-Match={}".format(live_etag),
+        ], check=False)
+        if rc != 0:
+            raise ValidationError("exact cell container deletion failed: {}".format(stderr))
+    for _ in range(60):
+        remains, _ = read_resource(env, scope, "container")
+        if not remains:
+            break
+        time.sleep(5)
+    else:
+        raise ValidationError("cell container remains after bounded exact deletion")
+    plan["container_absent"] = True
+    save_state(env, state)
     delete_resource(env, state, state["resources"]["identity_id"], "identity")
 
 
@@ -1647,8 +2095,8 @@ def close(env, args):
         raise ValidationError("close requires --confirm-close and the exact subscription")
     with lock(env, require_cell(args.cell)):
         state = load_state(env, args.cell)
-        if state["phase"] != "collected":
-            raise ValidationError("only an exact collected terminal result may close")
+        if state["phase"] not in ("collected", "cleanup-retained"):
+            raise ValidationError("only an exact collected terminal result or its retained cleanup may close")
         result = state.get("result") or {}
         if result.get("outcome") not in ("passed", "checks-passed"):
             raise ValidationError("failed or unfinished validation retains durable storage")
@@ -1659,6 +2107,10 @@ def close(env, args):
             raise ValidationError("remote branch is not current with the exact validated head")
         try:
             cleanup_compute(env, state)
+            wait_exact_disk_detached(
+                env, state["resources"]["credential_disk_id"],
+                state["resources"]["identities"]["credential"], "credential lease",
+            )
             # Worktree deletion is authorized only after result/evidence collection,
             # current remote proof, CI green, and exact head confirmation.
             delete_resource(env, state, state["resources"]["worktree_disk_id"], "disk", recorded_key="worktree")
@@ -1680,6 +2132,14 @@ def fail_retain(env, args):
         if state["phase"] not in ("failed-retained", "result-published", "needs-decision", "running"):
             raise ValidationError("cell phase does not own retainable failure capacity")
         cleanup_compute(env, state)
+        state["resources"]["identities"]["worktree"] = wait_exact_disk_detached(
+            env, state["resources"]["worktree_disk_id"],
+            state["resources"]["identities"]["worktree"], "validation worktree",
+        )
+        state["resources"]["identities"]["credential"] = wait_exact_disk_detached(
+            env, state["resources"]["credential_disk_id"],
+            state["resources"]["identities"]["credential"], "credential lease",
+        )
         transition(env, state, "failed-retained", "exact disposable compute removed; worktree and credential lease retained")
     print("AZURE VALIDATION RETAINED cell={} compute=zero worktree=retained".format(state["cell"]))
 
@@ -1710,16 +2170,22 @@ def validate_shard_request(state, request, bundle_path, blob):
     supplied = unsigned.pop("request_digest", None)
     if supplied != sha256_bytes(canonical_bytes(unsigned)):
         raise ValidationError("shard request digest mismatch")
-    expected = {
-        "cell": state["cell"],
-        "head": request.get("repository", {}).get("head"),
-    }
-    if request.get("cell") != expected["cell"]:
+    repository = request.get("repository") or {}
+    expected_repository = state["request"]["repository"]
+    if request.get("cell") != state["cell"]:
         raise ValidationError("shard request belongs to another cell")
-    if request.get("repository", {}).get("snapshot_digest") != sha256_file(bundle_path):
+    if (
+        repository.get("slug") != expected_repository["slug"]
+        or repository.get("branch") != expected_repository["branch"]
+    ):
+        raise ValidationError("shard request repository/branch differs from the exact validation run")
+    if repository.get("snapshot_digest") != sha256_file(bundle_path):
         raise ValidationError("shard request bundle digest mismatch")
-    if not HEX_OBJECT.match(str(request.get("repository", {}).get("head", ""))):
-        raise ValidationError("shard request head is malformed")
+    if (
+        not HEX_OBJECT.match(str(repository.get("head", "")))
+        or not HEX_OBJECT.match(str(repository.get("tree", "")))
+    ):
+        raise ValidationError("shard request head/tree is malformed")
     match = re.match(r"^shards/(round-[a-z0-9]{12})/request-([1-8])\.tar\.gz$", blob)
     if not match or request.get("round") != match.group(1) or int(request.get("shard", 0)) != int(match.group(2)):
         raise ValidationError("shard request blob identity is malformed")
@@ -1741,8 +2207,12 @@ def validate_shard_request(state, request, bundle_path, blob):
         if command != exact or request.get("artifacts") != ["results/executed-{}.tsv".format(shard)]:
             raise ValidationError("behavior shard command differs from the sealed planner route")
     elif kind == "lint":
-        if count != 1 or shard != 1 or request.get("artifacts") != []:
-            raise ValidationError("lint shard shape is malformed")
+        exact = [
+            "bin/fm-azure-runner-command.sh", "bash", "-c",
+            "bin/fm-lint.sh && uv run --directory tools/agent-fleet --locked ruff check .",
+        ]
+        if count != 1 or shard != 1 or request.get("artifacts") != [] or command != exact:
+            raise ValidationError("lint shard differs from the trusted default-branch command")
     else:
         raise ValidationError("shard kind is unsupported")
     return supplied
@@ -1758,7 +2228,15 @@ def prepare_shard_runner(env, state, blob, request, extracted, sku):
     key = request["request_digest"]
     existing = state.setdefault("shard_runs", {}).get(key)
     if existing:
-        if existing.get("blob") != blob or existing.get("sku") != sku:
+        expected = {
+            "blob": blob,
+            "sku": sku,
+            "round": request["round"],
+            "shard": request["shard"],
+            "head": request["repository"]["head"],
+            "command_digest": request["command_digest"],
+        }
+        if any(existing.get(name) != value for name, value in expected.items()):
             raise ValidationError("recorded shard runner identity differs from the exact request")
         return existing
     repo = extracted / "repo"
@@ -1769,26 +2247,26 @@ def prepare_shard_runner(env, state, blob, request, extracted, sku):
         raise ValidationError("materialized shard head mismatch")
     if git(repo, "rev-parse", "HEAD^{tree}").stdout.strip() != request["repository"]["tree"]:
         raise ValidationError("materialized shard tree mismatch")
-    runner = ROOT / "bin" / "fm-azure-runner.sh"
-    command = [
-        str(runner), "prepare", "--repo", str(repo),
-        "--task", "{}-s{}".format(state["cell"], request["shard"]),
-        "--generation", request["round"],
-        "--resource-class", request["resource_class"],
-    ]
-    for artifact in request.get("artifacts", []):
-        command += ["--artifact", artifact]
-    command += ["--"] + request["command"]["argv"]
-    process_env = os.environ.copy()
-    process_env["FM_AZURE_RUNNER_SKU"] = sku
-    process_env["FM_AZURE_RUNNER_MAX_CONCURRENCY"] = "8"
-    output = run(command, env=process_env)
-    match = re.search(r"prepared: invocation=(azr-[a-z0-9]{12}(?:-a[2-9][0-9]*)?)", output.stdout)
-    if not match:
-        raise ValidationError("Azure runner prepare returned no exact invocation identity")
+    public_remote = "https://github.com/{}.git".format(request["repository"]["slug"])
+    git(repo, "remote", "set-url", "origin", public_remote)
+    invocation = "azr-" + uuid.uuid4().hex[:12]
     record = {
-        "blob": blob, "request_digest": key, "invocation": match.group(1),
-        "sku": sku, "round": request["round"], "shard": request["shard"],
+        "blob": blob,
+        "request_digest": key,
+        "invocation": invocation,
+        "sku": sku,
+        "round": request["round"],
+        "shard": request["shard"],
+        "head": request["repository"]["head"],
+        "command_digest": request["command_digest"],
+        "repo": str(repo),
+        "snapshot_bundle": str(git_bundle),
+        "source_ref": "refs/heads/" + request["repository"]["branch"],
+        "task": "{}-s{}".format(state["cell"], request["shard"]),
+        "generation": request["round"],
+        "resource_class": request["resource_class"],
+        "artifacts": list(request.get("artifacts", [])),
+        "command": list(request["command"]["argv"]),
         "response_uploaded": False,
     }
     state["shard_runs"][key] = record
@@ -1796,22 +2274,42 @@ def prepare_shard_runner(env, state, blob, request, extracted, sku):
     return record
 
 
-def run_shard_invocations(env, records):
+def run_shard_invocations(env, state, records):
     processes = []
     runner = ROOT / "bin" / "fm-azure-runner.sh"
     for record in records:
         runner_state = runner_state_dir(env) / (record["invocation"] + ".json")
+        operation = [str(runner), "resume", "--invocation", record["invocation"]]
         if runner_state.is_file():
-            with contextlib.suppress(OSError, json.JSONDecodeError):
+            try:
                 value = json.loads(runner_state.read_text(encoding="utf-8"))
-                if value.get("phase") == "complete":
-                    continue
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValidationError("recorded shard runner state is unreadable: {}".format(exc))
+            if value.get("phase") == "complete":
+                continue
+        else:
+            operation = [
+                str(runner), "run", "--confirm-run",
+                "--confirm-subscription", env["subscription"],
+                "--repo", record["repo"],
+                "--task", record["task"],
+                "--generation", record["generation"],
+                "--invocation", record["invocation"],
+                "--resource-class", record["resource_class"],
+                "--capacity-parent", state["cell"],
+                "--capacity-reservation-vcpus", str(state["request"]["limits"]["reserved_vcpus"]),
+                "--source-ref", record["source_ref"],
+                "--private-snapshot-bundle", record["snapshot_bundle"],
+            ]
+            for artifact in record["artifacts"]:
+                operation += ["--artifact", artifact]
+            operation += ["--"] + record["command"]
         process_env = os.environ.copy()
         process_env["FM_AZURE_RUNNER_SKU"] = record["sku"]
         process_env["FM_AZURE_RUNNER_MAX_CONCURRENCY"] = "8"
         process = subprocess.Popen(
-            [str(runner), "resume", "--invocation", record["invocation"]],
-            env=process_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            operation, env=process_env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         processes.append((record, process))
     failures = []
@@ -1819,13 +2317,32 @@ def run_shard_invocations(env, records):
         stdout, stderr = process.communicate()
         record["runner_stdout_tail"] = stdout[-2000:]
         record["runner_stderr_tail"] = stderr[-2000:]
-        if process.returncode not in range(0, 126):
+        if process.returncode == 125 or process.returncode < 0:
             failures.append("{} rc={}".format(record["invocation"], process.returncode))
     if failures:
         raise ValidationError("one or more shard transports retained ambiguous state: " + ", ".join(failures))
 
 
+def extract_runner_archive(path, destination):
+    with tarfile.open(path, "r:gz") as archive:
+        members = archive.getmembers()
+        for member in members:
+            if not (
+                member.name in ("result.json", "stdout.log", "stderr.log", "artifacts")
+                or member.name.startswith("artifacts/")
+            ):
+                raise ValidationError("runner result archive contains an undeclared path")
+            if (
+                member.issym() or member.islnk() or member.isdev()
+                or member.name.startswith("/") or ".." in member.name.split("/")
+                or member.size > 256 * 1024**2
+            ):
+                raise ValidationError("runner result archive contains an unsafe member")
+        archive.extractall(str(destination), members=members)
+
+
 def package_shard_response(env, state, request, record, destination):
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = runner_state_dir(env) / (record["invocation"] + ".json")
     try:
         runner_state = json.loads(path.read_text(encoding="utf-8"))
@@ -1835,34 +2352,71 @@ def package_shard_response(env, state, request, record, destination):
         raise ValidationError("shard runner has not reached safe collected cleanup")
     runner_result = runner_state.get("result") or {}
     runner_request = runner_state.get("request") or {}
-    if runner_request.get("repository", {}).get("commit") != request["repository"]["head"]:
-        raise ValidationError("shard runner executed the wrong head")
-    if runner_request.get("command_digest") != request["command_digest"]:
-        raise ValidationError("shard runner executed the wrong command")
+    repository = runner_request.get("repository") or {}
+    if (
+        repository.get("source_mode") != "private-parent-bundle"
+        or repository.get("commit") != request["repository"]["head"]
+        or repository.get("tree") != request["repository"]["tree"]
+        or repository.get("source_ref") != "refs/heads/" + request["repository"]["branch"]
+        or repository.get("source_head") != request["repository"]["head"]
+    ):
+        raise ValidationError("shard runner executed the wrong public branch head/tree")
+    if (
+        runner_request.get("command_digest") != request["command_digest"]
+        or runner_request.get("capacity_parent") != state["cell"]
+        or runner_request.get("capacity_reservation_vcpus") != state["request"]["limits"]["reserved_vcpus"]
+    ):
+        raise ValidationError("shard runner executed the wrong command or capacity parent")
+    private_archive = destination / "runner-result.tar.gz"
+    storage_download(
+        env, runner_state["staging"]["output_blob"], private_archive,
+        container=CONTAINER,
+    )
+    if sha256_file(private_archive) != runner_state.get("result_digest"):
+        raise ValidationError("shard runner private archive digest differs from collected control state")
+    extracted = destination / "runner-result"
+    extracted.mkdir(mode=0o700)
+    extract_runner_archive(private_archive, extracted)
+    try:
+        archive_result = json.loads((extracted / "result.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValidationError("shard runner private result is unreadable: {}".format(exc))
+    if archive_result != runner_result:
+        raise ValidationError("shard runner private/control-plane result identities differ")
+    artifact_records = runner_result.get("artifacts")
+    artifacts = request.get("artifacts", [])
+    if not isinstance(artifact_records, list) or len(artifact_records) != len(artifacts):
+        raise ValidationError("shard runner artifact manifest differs from the request")
+    artifact_record = artifact_records[0] if artifact_records else None
+    if artifact_record is not None and artifact_record.get("path") != artifacts[0]:
+        raise ValidationError("shard runner returned the wrong manifest artifact")
     result = {
         "schema": "fm.azure-validation-shard-result/v1",
-        "cell": state["cell"], "round": request["round"],
+        "cell": state["cell"], "round": request["round"], "kind": request["kind"],
         "shard": request["shard"], "shard_count": request["shard_count"],
         "head": request["repository"]["head"], "tree": request["repository"]["tree"],
         "request_digest": request["request_digest"], "command_digest": request["command_digest"],
         "invocation": record["invocation"], "vm_instance_id": runner_result.get("vm_instance_id"),
         "boot_id": runner_result.get("boot_id"), "exit_code": runner_result.get("exit_code"),
+        "artifact": artifact_record,
         "duration_seconds": runner_result.get("duration_seconds"),
         "cost_usd": round(float(runner_state.get("cost", {}).get("hourly_rate", 0.0)) * float(runner_result.get("duration_seconds", 0.0)) / 3600.0, 6),
     }
     response_root = destination / "response"
     response_root.mkdir(mode=0o700)
     (response_root / "result.json").write_bytes(canonical_bytes(result) + b"\n")
-    result_path = Path(runner_state["result_path"]) / "extracted"
     for name in ("stdout.log", "stderr.log"):
-        source = result_path / name
+        source = extracted / name
         if source.is_file():
             shutil.copyfile(str(source), str(response_root / name))
-    artifacts = request.get("artifacts", [])
-    if artifacts:
-        source = result_path / "artifacts" / artifacts[0]
-        if not source.is_file():
-            raise ValidationError("shard runner returned no declared manifest artifact")
+    if artifact_record is not None:
+        source = extracted / "artifacts" / artifacts[0]
+        if (
+            not source.is_file() or source.is_symlink()
+            or source.stat().st_size != artifact_record.get("bytes")
+            or sha256_file(source) != artifact_record.get("digest")
+        ):
+            raise ValidationError("shard runner returned a mismatched manifest artifact")
         shutil.copyfile(str(source), str(response_root / "executed.tsv"))
     archive = destination / "response.tar.gz"
     with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT) as output:
@@ -1878,52 +2432,73 @@ def package_shard_response(env, state, request, record, destination):
 
 def drive(env, args):
     deadline = time.monotonic() + args.wait_seconds
-    while True:
-        with lock(env, require_cell(args.cell)):
-            state = load_state(env, args.cell)
-            if state["phase"] not in ("running", "responding", "reattaching", "needs-decision"):
-                print_status(state)
-                return
-            names = list_cell_blobs(env, state)
-            requests = [name for name in names if re.match(r"^shards/round-[a-z0-9]{12}/request-[1-8]\.tar\.gz$", name)]
-            pending = []
-            work_root = env["state_dir"] / "shards" / state["cell"]
-            work_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            for index, blob in enumerate(sorted(requests)):
-                response_blob = blob.replace("/request-", "/response-")
-                if response_blob in names:
-                    continue
-                blob_key = sha256_bytes(blob.encode("utf-8")).split(":", 1)[1][:16]
-                request_root = work_root / blob_key
-                if request_root.exists():
-                    shutil.rmtree(request_root)
-                request_root.mkdir(mode=0o700)
-                archive = request_root / "request.tar.gz"
-                storage_download(env, blob, archive, container=state["staging"]["container"])
-                extracted = request_root / "extracted"
-                extracted.mkdir(mode=0o700)
-                extract_shard_request(archive, extracted)
-                request = json.loads((extracted / "request.json").read_text(encoding="utf-8"))
-                validate_shard_request(state, request, extracted / "snapshot.bundle", blob)
-                sku = RUNNER_SHARD_SKUS[(int(request["shard"]) - 1) % len(RUNNER_SHARD_SKUS)]
-                record = prepare_shard_runner(env, state, blob, request, extracted, sku)
-                pending.append((request, record, request_root, response_blob))
+    cell = require_cell(args.cell)
+    # The shard-driver lock serializes duplicate drivers without holding the
+    # cell-state lock across hours of Azure execution. Observe/status/respond
+    # therefore retain bounded access while independent command VMs are busy.
+    with lock(env, cell + "-shards"):
+        while True:
+            with lock(env, cell):
+                state = load_state(env, cell)
+                if state["phase"] not in ("running", "responding", "reattaching", "needs-decision"):
+                    print_status(state)
+                    return
+                names = list_cell_blobs(env, state)
+                requests = [name for name in names if re.match(r"^shards/round-[a-z0-9]{12}/request-[1-8]\.tar\.gz$", name)]
+                pending = []
+                work_root = env["state_dir"] / "shards" / state["cell"]
+                work_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                for blob in sorted(requests):
+                    response_blob = blob.replace("/request-", "/response-")
+                    if response_blob in names:
+                        continue
+                    blob_key = sha256_bytes(blob.encode("utf-8")).split(":", 1)[1][:16]
+                    request_root = work_root / blob_key
+                    if request_root.exists():
+                        shutil.rmtree(request_root)
+                    request_root.mkdir(mode=0o700)
+                    archive = request_root / "request.tar.gz"
+                    storage_download(env, blob, archive, container=state["staging"]["container"])
+                    extracted = request_root / "extracted"
+                    extracted.mkdir(mode=0o700)
+                    extract_shard_request(archive, extracted)
+                    request = json.loads((extracted / "request.json").read_text(encoding="utf-8"))
+                    validate_shard_request(state, request, extracted / "snapshot.bundle", blob)
+                    sku = RUNNER_SHARD_SKUS[(int(request["shard"]) - 1) % len(RUNNER_SHARD_SKUS)]
+                    record = prepare_shard_runner(env, state, blob, request, extracted, sku)
+                    pending.append((request, record, request_root, response_blob))
             if pending:
-                run_shard_invocations(env, [item[1] for item in pending])
+                run_shard_invocations(env, state, [item[1] for item in pending])
+                with lock(env, cell):
+                    live = load_state(env, cell)
+                    if live["request_digest"] != state["request_digest"]:
+                        raise ValidationError("cell identity changed while shard VMs were running")
+                    for _request, record, _root, _blob in pending:
+                        live_record = live.get("shard_runs", {}).get(record["request_digest"])
+                        if not live_record or live_record.get("invocation") != record["invocation"]:
+                            raise ValidationError("shard invocation identity changed while running")
+                        live_record.update({
+                            "runner_stdout_tail": record.get("runner_stdout_tail", ""),
+                            "runner_stderr_tail": record.get("runner_stderr_tail", ""),
+                        })
+                    save_state(env, live)
                 for request, record, request_root, response_blob in pending:
-                    archive = package_shard_response(env, state, request, record, request_root)
+                    archive = package_shard_response(env, live, request, record, request_root)
                     storage_upload(
                         env, archive, response_blob, overwrite=False,
-                        container=state["staging"]["container"],
+                        container=live["staging"]["container"],
                     )
-                    record["response_uploaded"] = True
-                save_state(env, state)
-                print("AZURE VALIDATION SHARDS DISPATCHED cell={} count={}".format(state["cell"], len(pending)))
+                with lock(env, cell):
+                    live = load_state(env, cell)
+                    for _request, record, _root, _blob in pending:
+                        live["shard_runs"][record["request_digest"]]["response_uploaded"] = True
+                    save_state(env, live)
+                print("AZURE VALIDATION SHARDS DISPATCHED cell={} count={}".format(cell, len(pending)))
                 return
-        if time.monotonic() >= deadline:
-            print("AZURE VALIDATION SHARDS WAITING cell={} pending=0".format(args.cell))
-            return
-        time.sleep(5)
+            if time.monotonic() >= deadline:
+                print("AZURE VALIDATION SHARDS WAITING cell={} pending=0".format(cell))
+                return
+            time.sleep(5)
 
 
 def queue(env):

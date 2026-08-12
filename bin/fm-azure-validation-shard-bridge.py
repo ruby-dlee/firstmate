@@ -30,6 +30,7 @@ import uuid
 SCHEMA = "fm.azure-validation-shard/v1"
 RESULT_SCHEMA = "fm.azure-validation-shard-result/v1"
 SAFE_CELL = re.compile(r"^azv-[a-z0-9]{12}$")
+SAFE_PUBLIC_REMOTE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?$")
 SHA = re.compile(r"^[0-9a-f]{40,64}$")
 MAX_ARCHIVE = 1024**3
 MAX_WAIT_SECONDS = 4 * 3600
@@ -142,9 +143,12 @@ def repository_identity(repo):
     branch = run(["git", "-C", str(repo), "symbolic-ref", "--short", "HEAD"]).stdout.strip()
     head = run(["git", "-C", str(repo), "rev-parse", "HEAD"]).stdout.strip()
     tree = run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"]).stdout.strip()
-    if not SHA.match(head) or not SHA.match(tree):
-        raise BridgeError("cell repository identity is malformed")
-    return repo, branch, head, tree
+    remote = run(["git", "-C", str(repo), "remote", "get-url", "origin"]).stdout.strip()
+    remote_match = SAFE_PUBLIC_REMOTE.match(remote)
+    if not SHA.match(head) or not SHA.match(tree) or not remote_match or "@" in remote:
+        raise BridgeError("cell repository identity or credential-free public origin is malformed")
+    slug = "{}/{}".format(remote_match.group(1), remote_match.group(2))
+    return repo, branch, head, tree, slug
 
 
 def make_archive(environment, repo, request, bundle, destination):
@@ -168,12 +172,15 @@ def make_archive(environment, repo, request, bundle, destination):
 
 
 def submit_requests(environment, kind, count, command):
-    repo, branch, head, tree = repository_identity(Path.cwd())
+    repo, branch, head, tree, slug = repository_identity(Path.cwd())
     round_id = "round-" + uuid.uuid4().hex[:12]
     round_dir = environment["exchange"] / round_id
     round_dir.mkdir(mode=0o700)
     bundle = round_dir / "snapshot.bundle"
-    run(["git", "-C", str(repo), "bundle", "create", str(bundle), "HEAD"])
+    run([
+        "git", "-C", str(repo), "bundle", "create", str(bundle),
+        "refs/heads/" + branch,
+    ])
     run(["git", "bundle", "verify", str(bundle)])
     snapshot_digest = digest_file(bundle)
     requests = []
@@ -198,7 +205,13 @@ def submit_requests(environment, kind, count, command):
             "kind": kind,
             "shard": shard,
             "shard_count": count,
-            "repository": {"branch": branch, "head": head, "tree": tree, "snapshot_digest": snapshot_digest},
+            "repository": {
+                "slug": slug,
+                "branch": branch,
+                "head": head,
+                "tree": tree,
+                "snapshot_digest": snapshot_digest,
+            },
             "command": {"argv": argv},
             "command_digest": digest_bytes(canonical({"argv": argv})),
             "resource_class": resource_class,
@@ -247,6 +260,7 @@ def wait_responses(environment, round_id, round_dir, requests):
                 "schema": RESULT_SCHEMA,
                 "cell": environment["cell"],
                 "round": round_id,
+                "kind": request["kind"],
                 "shard": shard,
                 "shard_count": request["shard_count"],
                 "head": request["repository"]["head"],
@@ -259,8 +273,21 @@ def wait_responses(environment, round_id, round_dir, requests):
                     raise BridgeError("shard {} response identity mismatch: {}".format(shard, key))
             if result.get("exit_code") != 0:
                 raise BridgeError("shard {} failed with exit {}".format(shard, result.get("exit_code")))
-            if not result.get("boot_id") or not result.get("vm_instance_id"):
-                raise BridgeError("shard {} lacks independent machine identity".format(shard))
+            if not result.get("boot_id") or not result.get("vm_instance_id") or not result.get("invocation"):
+                raise BridgeError("shard {} lacks independent run/machine identity".format(shard))
+            artifact = result.get("artifact")
+            if request["artifacts"]:
+                returned = extracted / "executed.tsv"
+                if (
+                    not isinstance(artifact, dict)
+                    or artifact.get("path") != request["artifacts"][0]
+                    or not returned.is_file()
+                    or artifact.get("bytes") != returned.stat().st_size
+                    or artifact.get("digest") != digest_file(returned)
+                ):
+                    raise BridgeError("shard {} returned a mismatched behavior manifest".format(shard))
+            elif artifact is not None:
+                raise BridgeError("lint shard returned an undeclared artifact")
             results[shard] = {"result": result, "directory": extracted}
             del pending[shard]
         if pending:
@@ -274,6 +301,73 @@ def wait_responses(environment, round_id, round_dir, requests):
     return results
 
 
+def trusted_behavior_plan(repo, count):
+    inventory = sorted(
+        path.relative_to(repo).as_posix()
+        for path in (repo / "tests").glob("*.test.sh")
+        if path.is_file() and not path.is_symlink()
+    )
+    duration_path = repo / "tests" / "behavior-test-durations.tsv"
+    try:
+        lines = duration_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise BridgeError("behavior duration inventory is unreadable: {}".format(exc))
+    durations = {}
+    for line_number, line in enumerate(lines, 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        fields = line.split("\t")
+        if (
+            len(fields) != 2 or not fields[0].isdigit() or int(fields[0]) <= 0
+            or not re.match(r"^tests/[A-Za-z0-9._-]+\.test\.sh$", fields[1])
+            or fields[1] in durations
+        ):
+            raise BridgeError("behavior duration row {} is invalid or duplicated".format(line_number))
+        durations[fields[1]] = int(fields[0])
+    if sorted(durations) != inventory:
+        raise BridgeError("behavior duration inventory differs from exact tests/*.test.sh")
+    loads = [0] * count
+    plan = {}
+    for path, duration in sorted(durations.items(), key=lambda item: (-item[1], item[0])):
+        shard = min(range(count), key=lambda index: (loads[index], index))
+        plan.setdefault(shard + 1, []).append(path)
+        loads[shard] += duration
+    return plan
+
+
+def trusted_verify_manifests(repo, manifest_dir, count):
+    expected_files = {"executed-{}.tsv".format(shard) for shard in range(1, count + 1)}
+    actual_files = {path.name for path in manifest_dir.iterdir() if path.is_file()}
+    if actual_files != expected_files:
+        raise BridgeError("behavior manifest file inventory is incomplete or foreign")
+    expected = trusted_behavior_plan(repo, count)
+    observed = {}
+    failures = []
+    for shard in range(1, count + 1):
+        path = manifest_dir / "executed-{}.tsv".format(shard)
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise BridgeError("behavior manifest {} is unreadable: {}".format(shard, exc))
+        if not lines:
+            raise BridgeError("behavior manifest {} is empty".format(shard))
+        for line_number, line in enumerate(lines, 1):
+            fields = line.split("\t")
+            if (
+                len(fields) != 4 or fields[0] != str(shard)
+                or not re.match(r"^tests/[A-Za-z0-9._-]+\.test\.sh$", fields[1])
+                or not fields[2].isdigit() or not fields[3].isdigit()
+            ):
+                raise BridgeError("behavior manifest {} row {} is malformed".format(shard, line_number))
+            observed.setdefault(shard, []).append(fields[1])
+            if int(fields[2]) != 0:
+                failures.append((shard, fields[1], int(fields[2])))
+    if any(sorted(observed.get(shard, [])) != sorted(expected.get(shard, [])) for shard in range(1, count + 1)):
+        raise BridgeError("executed shard union differs from the complete deterministic plan")
+    if failures:
+        raise BridgeError("one or more behavior manifests report failed tests: {}".format(failures))
+
+
 def verify_behavior(environment, round_dir, results, count):
     manifest_dir = round_dir / "manifests"
     manifest_dir.mkdir(mode=0o700)
@@ -285,13 +379,22 @@ def verify_behavior(environment, round_dir, results, count):
         shutil.copyfile(str(source), str(manifest_dir / "executed-{}.tsv".format(shard)))
         result = results[shard]["result"]
         receipts.append({
+            "round": result["round"],
+            "kind": result["kind"],
             "shard": shard,
+            "shard_count": result["shard_count"],
+            "head": result["head"],
+            "tree": result["tree"],
+            "request_digest": result["request_digest"],
+            "command_digest": result["command_digest"],
+            "invocation": result["invocation"],
             "vm_instance_id": result["vm_instance_id"],
             "boot_id": result["boot_id"],
+            "artifact": result["artifact"],
             "duration_seconds": result.get("duration_seconds"),
             "cost_usd": result.get("cost_usd"),
         })
-    run(["bin/fm-behavior-shards.sh", "--verify", str(count), str(manifest_dir)], cwd=Path.cwd())
+    trusted_verify_manifests(Path.cwd().resolve(), manifest_dir, count)
     receipt_path = environment["exchange"] / "receipts.json"
     receipt_path.write_bytes(canonical(receipts) + b"\n")
     os.chmod(receipt_path, 0o600)

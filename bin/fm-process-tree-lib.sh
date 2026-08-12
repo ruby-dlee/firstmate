@@ -200,6 +200,8 @@ _fm_run_bounded_owned() {
     my $anchor = fork;
     die "anchor fork failed" unless defined $anchor;
     if (!$anchor) {
+      ualarm(0);
+      $SIG{ALRM} = "DEFAULT";
       close $ready_read;
       close $start_write;
       close $status_read;
@@ -222,6 +224,8 @@ _fm_run_bounded_owned() {
       my $command = fork;
       exit $setup_failure unless defined $command;
       if (!$command) {
+        ualarm(0);
+        $SIG{ALRM} = "DEFAULT";
         close $status_write;
         close $finish_read;
         $SIG{HUP} = "DEFAULT";

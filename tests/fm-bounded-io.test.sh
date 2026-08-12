@@ -394,6 +394,17 @@ SH
   wait_for_exit "$supervisor" "successful bounded supervisor"
   assert_no_process_tree_artifacts "$temp_dir"
 
+  temp_dir="$case_root/alarm-isolation"
+  mkdir -p "$temp_dir"
+  TMPDIR=$temp_dir fm_run_bounded 2 perl -MTime::HiRes=time -e '
+    my $started = time();
+    select undef, undef, undef, 0.45;
+    exit(time() - $started >= 0.4 ? 0 : 1);
+  ' >/dev/null 2>&1 || fail "wrapped command inherited the supervisor alarm pulse"
+  [ "$FM_PROCESS_TREE_CLEANUP_STATUS" = verified ] \
+    || fail "alarm-isolation command did not verify cleanup"
+  assert_no_process_tree_artifacts "$temp_dir"
+
   temp_dir="$case_root/failure"
   mkdir -p "$temp_dir"
   output="$temp_dir/supervisors"

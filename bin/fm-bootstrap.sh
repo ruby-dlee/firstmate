@@ -16,6 +16,7 @@
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: fm-<id>...",
 #                 "REPORT_RETENTION: unavailable: <reason>",
+#                 "PROCESS_TREE_HEALTH: leaked-supervisors=<n> ...",
 #                 "TREEHOUSE_CAPACITY: LOW pool=<path> available=<n> ...",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: <outcome>",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
@@ -129,6 +130,38 @@ report_retention_ensure() {
   if ! out=$("$SCRIPT_DIR/fm-report-retention.sh" ensure 2>&1); then
     [ -n "$out" ] || out="persistent owner did not start"
     echo "REPORT_RETENTION: unavailable: ${out%%$'\n'*}"
+  fi
+}
+
+process_tree_health_check() {
+  local out token leaked='' bytes='' complete='' health_candidates='' gap='' reason
+  if ! out=$(fm_process_tree_health_report 2>&1); then
+    reason=${out%%$'\n'*}
+    [ -n "$reason" ] || reason="bounded census failed"
+    echo "PROCESS_TREE_HEALTH: unavailable reason=$reason"
+    return 0
+  fi
+  for token in $out; do
+    case "$token" in
+      leaked_supervisors=*) leaked=${token#*=} ;;
+      parentless_argv_bytes=*) bytes=${token#*=} ;;
+      census_complete=*) complete=${token#*=} ;;
+      reaper_candidates=*) health_candidates=${token#*=} ;;
+      gap=*) gap=${token#*=} ;;
+    esac
+  done
+  case "$leaked:$bytes:$complete:$health_candidates" in
+    :*|*::*|*:|*[!0-9:]*)
+      echo "PROCESS_TREE_HEALTH: unavailable reason=malformed-bounded-census"
+      return 0
+      ;;
+  esac
+  [ "$complete" -eq 1 ] || {
+    echo "PROCESS_TREE_HEALTH: leaked-supervisors-at-least=$leaked parentless-argv-census-bytes-at-least=$bytes census-complete=no reaper-candidates-at-least=$health_candidates gap=${gap:-unknown}"
+    return 0
+  }
+  if [ "$leaked" -gt 0 ] || [ "$bytes" -ge 2097152 ]; then
+    echo "PROCESS_TREE_HEALTH: leaked-supervisors=$leaked parentless-argv-census-bytes=$bytes census-complete=yes reaper-candidates=$health_candidates; read-only diagnosis: bin/fm-process-tree-health.py report; captain-authorized repair: bin/fm-process-tree-health.py reap --apply"
   fi
 }
 
@@ -955,6 +988,7 @@ account_routing_dependency_preflight
 if ! fm_backlog_backend_manual "$CONFIG" && fm_tasks_axi_compatible; then
   echo "TASKS_AXI: available"
 fi
+process_tree_health_check
 checkout_refresh_ensure
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   report_retention_ensure

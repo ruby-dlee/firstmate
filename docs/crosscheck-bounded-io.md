@@ -15,6 +15,7 @@ Artifact opens are nonblocking and no-follow, and the opened descriptor must rem
 Review and evidence batches share a deadline and item counter rather than multiplying a per-item timeout by repository-controlled array length.
 
 These controls close a recurring fleet failure class: a nominal limit does not provide a bound when an alternate byte channel, descendant process, or repeated item can bypass it.
+If the process-argument census itself reports oversized, inspect [`process-tree-supervisors.md`](process-tree-supervisors.md) before blaming the census caller; Firstmate's legacy shell-runner anchors previously filled the same parentless inventory and made the visible `gh-axi` failure name the victim rather than the cause.
 The defects were found by deeper review of the pre-fix branch; they were not caused by the preceding eight-finding fix round.
 That is good news about those fixes, but it also records unusually high defect density in the original Crosscheck review surface.
 

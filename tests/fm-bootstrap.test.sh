@@ -25,6 +25,21 @@ export FM_ORCA_TEST_AUTHORITY_CAPABILITIES=verified-v1
 
 BASE_PATH=${FM_TEST_BASE_PATH:-/usr/bin:/bin:/usr/sbin:/sbin}
 fm_test_tmproot_into TMP_ROOT fm-bootstrap-tests
+PROCESS_TREE_HEALTH_HELPER="$TMP_ROOT/process-tree-health-helper"
+cat > "$PROCESS_TREE_HEALTH_HELPER" <<'SH'
+#!/usr/bin/env bash
+[ -z "${FM_FAKE_PROCESS_TREE_HEALTH_LOG:-}" ] \
+  || printf '%s\n' "$*" >> "$FM_FAKE_PROCESS_TREE_HEALTH_LOG"
+[ "${1:-}" = report ] || exit 90
+printf 'leaked_supervisors=%s parentless_argv_bytes=%s census_complete=%s reaper_candidates=%s gap=%s\n' \
+  "${FM_FAKE_PROCESS_TREE_LEAKED:-0}" \
+  "${FM_FAKE_PROCESS_TREE_ARGV_BYTES:-1024}" \
+  "${FM_FAKE_PROCESS_TREE_COMPLETE:-1}" \
+  "${FM_FAKE_PROCESS_TREE_CANDIDATES:-0}" \
+  "${FM_FAKE_PROCESS_TREE_GAP:-none}"
+SH
+chmod +x "$PROCESS_TREE_HEALTH_HELPER"
+export FM_PROCESS_TREE_HEALTH_HELPER="$PROCESS_TREE_HEALTH_HELPER"
 export FM_BACKEND_CMUX_BUNDLE_BIN="$TMP_ROOT/no-bundled-cmux"
 export FM_TREEHOUSE_ROOT="$TMP_ROOT/treehouse-pools"
 mkdir -p "$FM_TREEHOUSE_ROOT"
@@ -1053,6 +1068,37 @@ SH
   pass "bootstrap requires the annotation-aware Lavish fork"
 }
 
+test_bootstrap_surfaces_process_tree_pressure_read_only() {
+  local case_dir fakebin out log
+  case_dir="$TMP_ROOT/process-tree-health"
+  mkdir -p "$case_dir/home/config"
+  printf '%s\n' manual > "$case_dir/home/config/backlog-backend"
+  fakebin=$(make_fake_toolchain "$case_dir")
+  log="$case_dir/health.log"
+
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" \
+    FM_ROOT_OVERRIDE="$case_dir/home" FM_BOOTSTRAP_DETECT_ONLY=1 \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_PROCESS_TREE_HEALTH_LOG="$log" \
+    FM_FAKE_PROCESS_TREE_LEAKED=3 FM_FAKE_PROCESS_TREE_ARGV_BYTES=3145728 \
+    FM_FAKE_PROCESS_TREE_CANDIDATES=2 "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" \
+    "PROCESS_TREE_HEALTH: leaked-supervisors=3 parentless-argv-census-bytes=3145728 census-complete=yes reaper-candidates=2" \
+    "bootstrap hid Firstmate supervisor pressure behind the downstream argv failure"
+  [ "$(cat "$log")" = report ] \
+    || fail "bootstrap ran a destructive process-tree action instead of the read-only report"
+
+  out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$case_dir/home" \
+    FM_ROOT_OVERRIDE="$case_dir/home" FM_BOOTSTRAP_DETECT_ONLY=1 \
+    FM_FAKE_TREEHOUSE_LEASE_HELP=1 FM_FAKE_PROCESS_TREE_COMPLETE=0 \
+    FM_FAKE_PROCESS_TREE_LEAKED=1 FM_FAKE_PROCESS_TREE_ARGV_BYTES=16777216 \
+    FM_FAKE_PROCESS_TREE_CANDIDATES=1 FM_FAKE_PROCESS_TREE_GAP=argument-byte-limit \
+    "$ROOT/bin/fm-bootstrap.sh")
+  assert_contains "$out" \
+    "PROCESS_TREE_HEALTH: leaked-supervisors-at-least=1 parentless-argv-census-bytes-at-least=16777216 census-complete=no" \
+    "bootstrap accepted a partial parentless argument census as complete"
+  pass "bootstrap names Firstmate process-tree pressure without reaping it"
+}
+
 test_bootstrap_surfaces_low_treehouse_capacity_read_only() {
   local case_dir fakebin pool out
   case_dir="$TMP_ROOT/treehouse-capacity"
@@ -1129,6 +1175,11 @@ if [ "${FM_TEST_FOCUSED:-}" = treehouse-capacity ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = process-tree-health ]; then
+  test_bootstrap_surfaces_process_tree_pressure_read_only
+  exit 0
+fi
+
 test_bootstrap_reporting
 test_no_mistakes_min_version
 test_git_is_required_with_supported_install_instruction
@@ -1154,4 +1205,5 @@ test_agent_fleet_install_requires_manual_release
 test_invalid_account_routing_policy_is_reported
 test_enforced_dispatch_validation_rejects_poolless_quota_rules
 test_lavish_requires_store_forward_fork
+test_bootstrap_surfaces_process_tree_pressure_read_only
 test_bootstrap_surfaces_low_treehouse_capacity_read_only

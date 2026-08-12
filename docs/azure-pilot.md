@@ -83,8 +83,6 @@ Storage and Key Vault disable public network access and use blob/vault private e
 The blob endpoint uses the deterministic `nic-<prefix>-pe-blob` network-interface name.
 The foundation deployment outputs both that exact NIC resource ID and its Azure `resourceGuid`.
 After the reviewed apply, the operator independently accepts that GUID into private configuration as `FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID`.
-For one-time commissioning admission, the operator also retains the original Succeeded deployment `correlationId`, canonical `templateHash`, and earliest authoritative creation timestamp across every reviewed foundation resource as `FM_AZURE_FOUNDATION_CORRELATION_ID`, `FM_AZURE_FOUNDATION_TEMPLATE_HASH`, and `FM_AZURE_FOUNDATION_STARTED_AT`.
-These values are independent acceptance inputs; never derive them from the mutable same-name deployment during admission.
 The runner proves the live NIC and deployment output both equal that independently retained value, plus the endpoint's forward reference, the NIC's reverse endpoint relation, its exact private subnet configuration, its tags/generation, and absence of any VM relation at every foundation gate.
 The private-endpoint subnet disables private-endpoint network policies; compute subnets do not.
 

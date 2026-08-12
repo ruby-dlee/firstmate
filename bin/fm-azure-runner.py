@@ -20,7 +20,6 @@ import email.utils
 import fcntl
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -89,24 +88,6 @@ RESOURCE_API_VERSIONS = {
     "disk": "2023-10-02",
     "run-command": "2024-03-01",
     "ttl-schedule": "2018-09-15",
-}
-BOOTSTRAP_RESOURCE_API_VERSIONS = {
-    "microsoft.insights/actiongroups": "2023-01-01",
-    "microsoft.insights/datacollectionrules": "2023-03-11",
-    "microsoft.insights/metricalerts": "2018-03-01",
-    "microsoft.insights/scheduledqueryrules": "2023-12-01",
-    "microsoft.keyvault/vaults": "2023-07-01",
-    "microsoft.managedidentity/userassignedidentities": "2023-01-31",
-    "microsoft.network/natgateways": "2023-09-01",
-    "microsoft.network/networkinterfaces": "2023-09-01",
-    "microsoft.network/networksecuritygroups": "2023-09-01",
-    "microsoft.network/privateendpoints": "2023-09-01",
-    "microsoft.network/privatednszones": "2020-06-01",
-    "microsoft.network/privatednszones/virtualnetworklinks": "2020-06-01",
-    "microsoft.network/publicipaddresses": "2023-09-01",
-    "microsoft.network/virtualnetworks": "2023-09-01",
-    "microsoft.operationalinsights/workspaces": "2023-09-01",
-    "microsoft.storage/storageaccounts": "2023-05-01",
 }
 
 RESOURCE_CLASSES = {
@@ -302,9 +283,6 @@ def environment():
         "FM_AZURE_OWNER_TAG",
         "FM_AZURE_DEPLOYMENT_GENERATION",
         "FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID",
-        "FM_AZURE_FOUNDATION_CORRELATION_ID",
-        "FM_AZURE_FOUNDATION_TEMPLATE_HASH",
-        "FM_AZURE_FOUNDATION_STARTED_AT",
     ]
     missing = [name for name in required if not os.environ.get(name)]
     if missing:
@@ -324,20 +302,6 @@ def environment():
     blob_private_endpoint_nic_resource_guid = os.environ["FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID"]
     if not re.match(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", blob_private_endpoint_nic_resource_guid):
         raise RunnerError("FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID must be the explicitly accepted Azure resourceGuid")
-    foundation_correlation_id = os.environ["FM_AZURE_FOUNDATION_CORRELATION_ID"].lower()
-    if not re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", foundation_correlation_id):
-        raise RunnerError("FM_AZURE_FOUNDATION_CORRELATION_ID must be the independently accepted deployment correlationId")
-    foundation_template_hash = os.environ["FM_AZURE_FOUNDATION_TEMPLATE_HASH"]
-    if not re.match(r"^[0-9]+$", foundation_template_hash):
-        raise RunnerError("FM_AZURE_FOUNDATION_TEMPLATE_HASH must be the independently accepted ARM templateHash")
-    try:
-        foundation_started_at = dt.datetime.fromisoformat(
-            os.environ["FM_AZURE_FOUNDATION_STARTED_AT"].replace("Z", "+00:00")
-        )
-    except (AttributeError, ValueError):
-        raise RunnerError("FM_AZURE_FOUNDATION_STARTED_AT must be the independently accepted earliest creation time")
-    if foundation_started_at.tzinfo is None or foundation_started_at > now_utc():
-        raise RunnerError("FM_AZURE_FOUNDATION_STARTED_AT must be an authoritative past UTC timestamp")
     resource_group = os.environ.get("FM_AZURE_RESOURCE_GROUP", "rg-firstmate-pilot-eastus-001")
     max_concurrency = int(os.environ.get("FM_AZURE_RUNNER_MAX_CONCURRENCY", "4"))
     if max_concurrency < 1 or max_concurrency > 8:
@@ -370,9 +334,6 @@ def environment():
         "blob_private_endpoint": "pe-{}-blob".format(prefix),
         "blob_private_endpoint_nic": "nic-{}-pe-blob".format(prefix),
         "blob_private_endpoint_nic_resource_guid": blob_private_endpoint_nic_resource_guid.lower(),
-        "foundation_correlation_id": foundation_correlation_id,
-        "foundation_template_hash": foundation_template_hash,
-        "foundation_started_at": iso_utc(foundation_started_at),
         "blob_private_dns_zone": "privatelink.blob.core.windows.net",
     }
 
@@ -926,8 +887,8 @@ def foundation_gate(env):
     allowed_control_metadata = {
         "schema", "deploymentgeneration", "lockowner", "lockfence", "lockexpiry",
         "bootstrapadmission", "bootstrapinvocation", "bootstrapfence", "bootstrapat",
-        "bootstrapdeployment", "bootstrapcorrelation", "bootstraptemplatehash", "bootstrapbudgetid",
-        "bootstrapbudgetetag", "bootstrapbudgetspendmicrousd", "bootstrapfoundationstartedat",
+        "bootstrapcorrelation", "bootstraptemplatehash", "bootstrapbudgetid", "bootstrapbudgetetag",
+        "bootstrapbudgetspendmicrousd", "bootstrapfoundationstartedat",
     }
     if (
         str(control_container.get("id", "")).lower() != runner_control_id(env).lower()
@@ -935,7 +896,7 @@ def foundation_gate(env):
         or control_metadata.get("schema") != "fm-azure-runner-control-v1"
         or control_metadata.get("deploymentgeneration") != env["deployment_generation"]
         or not set(control_metadata).issubset(allowed_control_metadata)
-        or not bootstrap_marker_metadata_is_exact(env, control_metadata)
+        or not bootstrap_marker_metadata_is_exact(control_metadata)
         or not (control_container.get("etag") or control_container.get("properties", {}).get("etag"))
     ):
         raise RunnerError("runner control container identity/ETag contract is not exact")
@@ -1459,77 +1420,39 @@ def runner_control_id(env):
     ).format(env["subscription"], env["resource_group"], env["control_storage"], CONTROL_CONTAINER)
 
 
-def expected_bootstrap_budget_id(env):
-    return "/subscriptions/{}/providers/Microsoft.Consumption/budgets/bud-{}-monthly".format(
-        env["subscription"], env["prefix"]
-    )
-
-
-def bootstrap_marker_metadata_is_exact(
-    env, metadata, deployment=None, budget=None, foundation_started_at=None, invocation_state=None,
-):
+def bootstrap_marker_metadata_is_exact(metadata):
     fields = (
         "bootstrapadmission", "bootstrapinvocation", "bootstrapfence", "bootstrapat",
-        "bootstrapdeployment", "bootstrapcorrelation", "bootstraptemplatehash", "bootstrapbudgetid",
-        "bootstrapbudgetetag", "bootstrapbudgetspendmicrousd", "bootstrapfoundationstartedat",
+        "bootstrapcorrelation", "bootstraptemplatehash", "bootstrapbudgetid", "bootstrapbudgetetag",
+        "bootstrapbudgetspendmicrousd", "bootstrapfoundationstartedat",
     )
     present = [field for field in fields if field in metadata]
     if not present:
         return True
     if len(present) != len(fields):
         return False
-    if any(not isinstance(metadata[field], str) for field in fields):
-        return False
     try:
         marked_at = dt.datetime.fromisoformat(metadata["bootstrapat"].replace("Z", "+00:00"))
-        marked_foundation_started_at = dt.datetime.fromisoformat(
+        foundation_started_at = dt.datetime.fromisoformat(
             metadata["bootstrapfoundationstartedat"].replace("Z", "+00:00")
         )
     except (AttributeError, ValueError):
         return False
-    invocation = metadata["bootstrapinvocation"]
-    fence = metadata["bootstrapfence"]
-    try:
-        deployment = deployment or exact_bootstrap_deployment(env, require_fresh=False)
-        budget = budget or exact_bootstrap_budget(env)
-        foundation_started_at = foundation_started_at or dt.datetime.fromisoformat(
-            env["foundation_started_at"].replace("Z", "+00:00")
-        )
-        durable_state = load_state(env, invocation)
-    except (RunnerError, KeyError, OSError, json.JSONDecodeError):
-        return False
-    if invocation_state is not None and (
-        invocation_state.get("invocation") != durable_state.get("invocation")
-        or (invocation_state.get("request") or {}).get("fence")
-        != (durable_state.get("request") or {}).get("fence")
-    ):
-        return False
-    invocation_state = durable_state
-    request = invocation_state.get("request") or {}
-    expected_deployment_name = "fm-azure-pilot-{}".format(env["deployment_generation"])
     return (
         metadata["bootstrapadmission"] == "consumed"
-        and bool(SAFE_INVOCATION.match(invocation))
-        and bool(re.match(r"^[0-9a-f]{64}$", fence))
+        and bool(SAFE_INVOCATION.match(metadata["bootstrapinvocation"]))
+        and bool(re.match(r"^[0-9a-f]{64}$", metadata["bootstrapfence"]))
         and marked_at.tzinfo is not None
-        and marked_at <= now_utc()
-        and marked_foundation_started_at.tzinfo is not None
-        and iso_utc(foundation_started_at) == metadata["bootstrapfoundationstartedat"]
-        and marked_foundation_started_at <= marked_at
-        and metadata["bootstrapdeployment"] == expected_deployment_name == deployment["name"]
-        and metadata["bootstrapcorrelation"] == env["foundation_correlation_id"] == deployment["correlation_id"]
-        and metadata["bootstraptemplatehash"] == env["foundation_template_hash"] == deployment["template_hash"]
-        and metadata["bootstrapbudgetid"].lower() == expected_bootstrap_budget_id(env).lower() == budget["id"].lower()
-        and metadata["bootstrapbudgetetag"] == budget["etag"]
+        and bool(re.match(r"^[0-9a-fA-F-]{36}$", metadata["bootstrapcorrelation"]))
+        and bool(re.match(r"^[0-9]+$", str(metadata["bootstraptemplatehash"])))
+        and metadata["bootstrapbudgetid"].startswith("/subscriptions/")
+        and bool(metadata["bootstrapbudgetetag"])
         and metadata["bootstrapbudgetspendmicrousd"].isdigit()
-        and invocation_state.get("schema") == SCHEMA
-        and invocation_state.get("invocation") == invocation
-        and request.get("fence") == "sha256:" + fence
-        and request.get("deployment_generation") == env["deployment_generation"]
+        and foundation_started_at.tzinfo is not None
     )
 
 
-def exact_bootstrap_deployment(env, require_fresh=True):
+def exact_bootstrap_deployment(env):
     name = "fm-azure-pilot-{}".format(env["deployment_generation"])
     deployment, _, _ = az_command(env, ["deployment", "sub", "show", "--name", name])
     properties = deployment.get("properties", deployment)
@@ -1540,7 +1463,7 @@ def exact_bootstrap_deployment(env, require_fresh=True):
     except (KeyError, AttributeError, ValueError):
         raise RunnerError("bootstrap foundation deployment timestamp is unreadable")
     age_seconds = (now_utc() - deployed_at).total_seconds()
-    correlation = str(properties.get("correlationId", ""))
+    correlation = properties.get("correlationId", "")
     template_hash = str(properties.get("templateHash", ""))
     exact_parameters = {
         "tenantId": env["tenant"],
@@ -1554,9 +1477,10 @@ def exact_bootstrap_deployment(env, require_fresh=True):
     if (
         deployment.get("name") != name
         or properties.get("provisioningState") != "Succeeded"
-        or (require_fresh and (age_seconds < 0 or age_seconds > BOOTSTRAP_ADMISSION_MAX_AGE_SECONDS))
-        or correlation.lower() != env["foundation_correlation_id"]
-        or template_hash != env["foundation_template_hash"]
+        or age_seconds < 0
+        or age_seconds > BOOTSTRAP_ADMISSION_MAX_AGE_SECONDS
+        or not re.match(r"^[0-9a-fA-F-]{36}$", correlation)
+        or not re.match(r"^[0-9]+$", template_hash)
         or any((parameters.get(key) or {}).get("value") != value for key, value in exact_parameters.items())
         or (outputs.get("capacityProfile") or {}).get("value") != "foundation"
         or (outputs.get("region") or {}).get("value") != "eastus"
@@ -1572,34 +1496,6 @@ def exact_bootstrap_deployment(env, require_fresh=True):
         "template_hash": template_hash,
         "key_vault_name": (parameters.get("keyVaultName") or {}).get("value"),
     }
-
-
-def authoritative_bootstrap_resource_creation(env, item):
-    resource_type = str(item.get("type", "")).lower()
-    resource_id = str(item.get("id", ""))
-    api_version = BOOTSTRAP_RESOURCE_API_VERSIONS.get(resource_type)
-    if not resource_id or not api_version:
-        raise RunnerError("bootstrap foundation resource identity/API version is not exact")
-    exact, _, _ = az_command(env, [
-        "resource", "show", "--ids", resource_id, "--api-version", api_version,
-    ])
-    if (
-        str(exact.get("id", "")).lower() != resource_id.lower()
-        or str(exact.get("type", "")).lower() != resource_type
-        ):
-        raise RunnerError("bootstrap foundation exact resource reread changed identity")
-    if resource_type != "microsoft.network/privatednszones/virtualnetworklinks":
-        verify_foundation_tags(env, exact, "bootstrap inventory resource")
-    raw = (exact.get("systemData") or {}).get("createdAt") or exact.get("createdTime")
-    if not raw:
-        raise RunnerError("bootstrap foundation resource lacks authoritative creation evidence")
-    try:
-        created = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except (AttributeError, ValueError):
-        raise RunnerError("bootstrap foundation resource creation time is malformed")
-    if created.tzinfo is None or created > now_utc():
-        raise RunnerError("bootstrap foundation resource creation time is not exact")
-    return created
 
 
 def exact_bootstrap_inventory(env, deployment):
@@ -1649,18 +1545,31 @@ def exact_bootstrap_inventory(env, deployment):
     actual = {(str(item.get("type", "")).lower(), item.get("name")) for item in resources}
     if actual != expected:
         raise RunnerError("bootstrap foundation inventory contains a missing, foreign, or unreviewed resource")
-    creation_times = [authoritative_bootstrap_resource_creation(env, item) for item in resources]
-    if len(creation_times) != len(expected):
-        raise RunnerError("bootstrap foundation creation evidence is incomplete")
-    earliest = min(creation_times)
-    if iso_utc(earliest) != env["foundation_started_at"]:
-        raise RunnerError("bootstrap foundation earliest creation evidence changed from independently accepted state")
-    return earliest
+    untagged_types = {"microsoft.network/privatednszones/virtualnetworklinks"}
+    for item in resources:
+        if str(item.get("type", "")).lower() not in untagged_types:
+            verify_foundation_tags(env, item, "bootstrap inventory resource")
+    creation_times = []
+    for item in resources:
+        raw = (item.get("systemData") or {}).get("createdAt") or item.get("createdTime")
+        if raw:
+            try:
+                created = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except (AttributeError, ValueError):
+                raise RunnerError("bootstrap foundation resource creation time is malformed")
+            if created.tzinfo is None or created > now_utc():
+                raise RunnerError("bootstrap foundation resource creation time is not exact")
+            creation_times.append(created)
+    if not creation_times:
+        raise RunnerError("bootstrap foundation has no authoritative resource creation evidence")
+    return min(creation_times)
 
 
 def exact_bootstrap_budget(env):
     budget_name = "bud-{}-monthly".format(env["prefix"])
-    budget_id = expected_bootstrap_budget_id(env)
+    budget_id = "/subscriptions/{}/providers/Microsoft.Consumption/budgets/{}".format(
+        env["subscription"], budget_name
+    )
     budget, _, _ = az_command(env, [
         "rest", "--method", "get", "--url",
         "https://management.azure.com{}?api-version=2024-08-01".format(budget_id),
@@ -1684,7 +1593,6 @@ def exact_bootstrap_budget(env):
         or properties.get("timeGrain") != "Monthly"
         or properties.get("filter") != exact_filter
         or current.get("unit") != "USD"
-        or not math.isfinite(current_spend)
         or current_spend < 0
         or not (budget.get("eTag") or budget.get("etag"))
     ):
@@ -1704,7 +1612,8 @@ def bootstrap_admission_cost(env, state, lease, limits, unavailable):
     foundation_gate(env)
     deployment = exact_bootstrap_deployment(env)
     foundation_started_at = exact_bootstrap_inventory(env, deployment)
-    assert_bootstrap_zero_runner_state(env, state)
+    if active_runner_vms(env):
+        raise RunnerError("bootstrap admission requires zero active runner VMs")
     if list_management_reservations(env):
         raise RunnerError("bootstrap admission requires zero outstanding cost reservations")
     budget = exact_bootstrap_budget(env)
@@ -1730,20 +1639,26 @@ def bootstrap_admission_cost(env, state, lease, limits, unavailable):
     pressure = cost_lower_bound + first_day["total"]
     if pressure >= env["budget_limit"]:
         raise RunnerError("one-time bootstrap conservative cost pressure exceeds the commissioning ceiling")
-    marker = {
+    metadata, etag = lease._read()
+    if metadata.get("bootstrapadmission"):
+        raise RunnerError("one-time bootstrap admission was already consumed")
+    metadata.update({
         "bootstrapadmission": "consumed",
         "bootstrapinvocation": state["invocation"],
         "bootstrapfence": state["request"]["fence"].split(":", 1)[1],
         "bootstrapat": iso_utc(),
-        "bootstrapdeployment": deployment["name"],
         "bootstrapcorrelation": deployment["correlation_id"],
         "bootstraptemplatehash": deployment["template_hash"],
         "bootstrapbudgetid": budget["id"],
         "bootstrapbudgetetag": budget["etag"],
         "bootstrapbudgetspendmicrousd": str(int(round(budget["current_spend"] * 1_000_000))),
         "bootstrapfoundationstartedat": iso_utc(foundation_started_at),
-    }
-    lease.consume_bootstrap_marker(marker, deployment, budget, foundation_started_at, state)
+    })
+    if not bootstrap_marker_metadata_is_exact(metadata):
+        raise RunnerError("one-time bootstrap marker is not structurally exact")
+    lease.etag = lease._cas(etag, metadata)
+    lease._record_success()
+    lease.assert_held()
     return {
         "actual": budget["current_spend"],
         "forecast": None,
@@ -1964,60 +1879,6 @@ def active_runner_vms(env):
     return active
 
 
-def assert_bootstrap_zero_runner_state(env, state):
-    vms, _, _ = az_command(env, ["vm", "list", "--resource-group", env["resource_group"], "--show-details"])
-    if vms:
-        raise RunnerError("bootstrap admission requires exact absence of every runner VM, including deallocated VMs")
-    resources, _, _ = az_command(env, ["resource", "list", "--resource-group", env["resource_group"]])
-    forbidden_types = {
-        "microsoft.compute/disks",
-        "microsoft.compute/virtualmachines",
-        "microsoft.compute/virtualmachines/runcommands",
-        "microsoft.devtestlab/schedules",
-    }
-    runner_nic_prefix = "nic-{}-run-".format(env["prefix"])
-    for resource in resources:
-        resource_type = str(resource.get("type", "")).lower()
-        name = str(resource.get("name", ""))
-        tags = resource.get("tags") or {}
-        if (
-            resource_type in forbidden_types
-            or (resource_type == "microsoft.network/networkinterfaces" and name.startswith(runner_nic_prefix))
-            or tags.get("firstmate-role") == "validation-shard"
-            or tags.get("invocation-binding")
-        ):
-            raise RunnerError("bootstrap admission requires zero runner VM/NIC/disk/run-command/schedule resources")
-    run_commands, _, _ = az_command(env, [
-        "resource", "list", "--resource-group", env["resource_group"],
-        "--resource-type", "Microsoft.Compute/virtualMachines/runCommands",
-    ])
-    if run_commands:
-        raise RunnerError("bootstrap admission requires zero retained runner Run Commands")
-    deployments, _, _ = az_command(env, [
-        "deployment", "group", "list", "--resource-group", env["resource_group"],
-    ])
-    for deployment in deployments:
-        if str(deployment.get("name", "")).startswith("fm-run-"):
-            state_name = (deployment.get("properties") or {}).get("provisioningState", "")
-            if state_name not in {"Succeeded", "Failed", "Canceled"}:
-                raise RunnerError("bootstrap admission requires zero active cloud runner deployment records")
-    ensure_state_dirs(env)
-    for path in sorted(env["state_dir"].glob("azr-*.json")):
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RunnerError("bootstrap local invocation queue is unreadable: {}".format(exc))
-        invocation = record.get("invocation")
-        if record.get("schema") != SCHEMA or not isinstance(invocation, str) or path != state_path(env, invocation):
-            raise RunnerError("bootstrap local invocation queue identity is not exact")
-        if invocation == state["invocation"]:
-            if (record.get("request") or {}).get("fence") != state["request"]["fence"]:
-                raise RunnerError("bootstrap current local invocation/fence changed")
-            continue
-        if record.get("phase") not in {"complete", "absent-fenced"}:
-            raise RunnerError("bootstrap admission requires zero other active local invocation records")
-
-
 
 class ManagementAdmissionLease:
     """Single management-resource CAS owner for admission and reservations."""
@@ -2042,8 +1903,8 @@ class ManagementAdmissionLease:
         allowed = {
             "schema", "deploymentgeneration", "lockowner", "lockfence", "lockexpiry",
             "bootstrapadmission", "bootstrapinvocation", "bootstrapfence", "bootstrapat",
-            "bootstrapdeployment", "bootstrapcorrelation", "bootstraptemplatehash", "bootstrapbudgetid",
-            "bootstrapbudgetetag", "bootstrapbudgetspendmicrousd", "bootstrapfoundationstartedat",
+            "bootstrapcorrelation", "bootstraptemplatehash", "bootstrapbudgetid", "bootstrapbudgetetag",
+            "bootstrapbudgetspendmicrousd", "bootstrapfoundationstartedat",
         }
         owner = metadata.get("lockowner", "")
         fence = metadata.get("lockfence", "")
@@ -2052,7 +1913,7 @@ class ManagementAdmissionLease:
             metadata.get("schema") != "fm-azure-runner-control-v1"
             or metadata.get("deploymentgeneration") != self.env["deployment_generation"]
             or not set(metadata).issubset(allowed)
-            or not bootstrap_marker_metadata_is_exact(self.env, metadata)
+            or not bootstrap_marker_metadata_is_exact(metadata)
             or bool(owner) != bool(fence) or bool(owner) != bool(expiry)
             or (fence and not re.match(r"^[0-9a-f]{64}$", fence))
             or (owner and not SAFE_INVOCATION.match(owner))
@@ -2136,34 +1997,6 @@ class ManagementAdmissionLease:
                     raise RunnerError("runner management lease owner/fence/ETag changed")
                 metadata["lockexpiry"] = iso_utc(now_utc() + dt.timedelta(seconds=LEASE_DURATION_SECONDS))
                 self.etag = self._cas(etag, metadata)
-                self._record_success()
-        except Exception:
-            self.failed.set()
-            raise
-        self.assert_held()
-
-    def consume_bootstrap_marker(self, marker, deployment, budget, foundation_started_at, invocation_state):
-        try:
-            with self.renew_lock:
-                self.assert_held()
-                metadata, etag = self._read()
-                if (
-                    metadata.get("lockowner") != self.state["invocation"]
-                    or metadata.get("lockfence") != self.fence
-                    or etag != self.etag
-                ):
-                    raise RunnerError("runner management lease owner/fence/ETag changed before bootstrap marker")
-                if metadata.get("bootstrapadmission"):
-                    raise RunnerError("one-time bootstrap admission was already consumed")
-                updated = dict(metadata)
-                updated["lockexpiry"] = iso_utc(now_utc() + dt.timedelta(seconds=LEASE_DURATION_SECONDS))
-                updated.update(marker)
-                if not bootstrap_marker_metadata_is_exact(
-                    self.env, updated, deployment, budget, foundation_started_at, invocation_state,
-                ):
-                    raise RunnerError("one-time bootstrap marker is not exactly bound")
-                retained_etag = self.etag
-                self.etag = self._cas(retained_etag, updated)
                 self._record_success()
         except Exception:
             self.failed.set()

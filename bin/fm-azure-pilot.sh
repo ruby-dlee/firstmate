@@ -13,12 +13,12 @@
 #
 # Required environment for cloud commands:
 #   FM_AZURE_TENANT_ID FM_AZURE_SUBSCRIPTION_ID FM_AZURE_ADMIN_EMAIL
-#   FM_AZURE_ADMIN_USERNAME FM_AZURE_OWNER_TAG
+#   FM_AZURE_ADMIN_USERNAME FM_AZURE_ADMIN_SSH_PUBLIC_KEY FM_AZURE_OWNER_TAG
 #   FM_AZURE_NAMING_PREFIX FM_AZURE_STORAGE_NAME FM_AZURE_KEY_VAULT_NAME
 #   FM_AZURE_DEPLOYMENT_GENERATION FM_AZURE_BUDGET_START_DATE
 # Optional:
 #   FM_AZURE_CAPACITY_PROFILE=foundation|full|commissioning (default foundation)
-#   FM_AZURE_AUTHOR_CAPACITY_MODE=mixed-current|homogeneous-dasv6
+#   FM_AZURE_AUTHOR_CAPACITY_MODE=mixed-current (the only production contract)
 #   FM_AZURE_VM_FAMILY=Dasv6|Dasv5       (default Dasv6 supervisor)
 #   FM_AZURE_WORKER_SLOTS=1,...,16       (profile/mode default)
 #   FM_AZURE_WORKER_SKUS=<matching comma-separated reviewed SKUs>
@@ -88,6 +88,7 @@ require_cloud_environment() {
     FM_AZURE_SUBSCRIPTION_ID \
     FM_AZURE_ADMIN_EMAIL \
     FM_AZURE_ADMIN_USERNAME \
+    FM_AZURE_ADMIN_SSH_PUBLIC_KEY \
     FM_AZURE_OWNER_TAG \
     FM_AZURE_NAMING_PREFIX \
     FM_AZURE_STORAGE_NAME \
@@ -129,7 +130,6 @@ require_cloud_environment() {
   RESOURCE_GROUP=${FM_AZURE_RESOURCE_GROUP:-rg-firstmate-pilot-eastus-001}
   REGION=eastus
   REQUIRED_REGIONAL_VCPUS=128
-  REQUIRED_AUTHOR_FAMILY_VCPUS=96
   RESERVED_LANDING_VCPUS=62
   COMMISSIONING_BUDGET_CEILING_USD=1500
   STEADY_STATE_BUDGET_TARGET_USD=${FM_AZURE_STEADY_STATE_BUDGET_TARGET_USD:-1000}
@@ -144,7 +144,7 @@ require_cloud_environment() {
   [[ "$FM_AZURE_DEPLOYMENT_GENERATION" =~ ^[a-zA-Z0-9-]{1,32}$ ]] || refuse "deployment generation contains unsupported characters"
   [[ "$FM_AZURE_BUDGET_START_DATE" =~ ^[0-9]{4}-[0-9]{2}-01$ ]] || refuse "budget start must be the first day of a month (YYYY-MM-01)"
   case "$CAPACITY_PROFILE" in foundation|commissioning|full) ;; *) refuse "capacity profile must be foundation, commissioning, or full" ;; esac
-  case "$AUTHOR_CAPACITY_MODE" in mixed-current|homogeneous-dasv6) ;; *) refuse "author capacity mode must be mixed-current or homogeneous-dasv6" ;; esac
+  [ "$AUTHOR_CAPACITY_MODE" = mixed-current ] || refuse "author capacity mode must be mixed-current; homogeneous Dav6 capacity is not available"
   case "$RUNNER_VALIDATION_SKU" in Standard_E8as_v6|Standard_E8s_v6) ;; *) refuse "runner validation SKU is not reviewed" ;; esac
   for binding in "$WORKER_HOME_BINDING" "$WORKER_TASK_BINDING" "$WORKER_INVOCATION_BINDING" "$WORKER_COST_ATTRIBUTION"; do
     [[ "$binding" =~ ^[a-zA-Z0-9._:-]{1,64}$ ]] || refuse "worker binding tags must use 1-64 bounded identifier characters"
@@ -206,7 +206,7 @@ if profile == "commissioning" and (slots != [1, 2] or skus != ["Standard_D4as_v6
     raise SystemExit(1)
 if mode == "mixed-current" and any(expected[slot] != sku for slot, sku in zip(slots, skus)):
     raise SystemExit(1)
-if mode == "homogeneous-dasv6" and any(sku != "Standard_D4as_v6" for sku in skus):
+if mode != "mixed-current":
     raise SystemExit(1)
 PY
   if [ "$AUTHOR_CAPACITY_MODE" = mixed-current ] && [ "$VM_FAMILY" != Dasv6 ]; then
@@ -235,11 +235,11 @@ text = path.read_text(encoding="utf-8").lower()
 
 required_parameters = {
     "tenantId", "subscriptionId", "administratorNotificationEmail",
-    "adminUsername", "ownerTag", "deploymentGeneration",
+    "adminUsername", "adminSshPublicKey", "ownerTag", "deploymentGeneration",
     "namingPrefix", "storageAccountName", "keyVaultName", "capacityProfile",
     "authorCapacityMode", "vmFamily", "workerSkus", "incrementalWorkerDeploy", "runnerValidationSku",
     "workerHomeBinding", "workerTaskBinding", "workerInvocationBinding",
-    "workerSnapshotDigest", "workerCostAttribution", "requiredRegionalFreeVcpus", "requiredAuthorFamilyFreeVcpus",
+    "workerSnapshotDigest", "workerCostAttribution", "requiredRegionalFreeVcpus",
     "reservedLandingVcpus", "workerSlots", "commissioningBudgetCeilingUsd",
     "steadyStateBudgetTargetUsd", "workerHourPlanningThreshold",
 }
@@ -256,8 +256,6 @@ if data["parameters"]["vmFamily"].get("defaultValue") != "Dasv6":
     raise SystemExit("Dasv6 must be the production default")
 if data["parameters"]["requiredRegionalFreeVcpus"].get("defaultValue") != 128:
     raise SystemExit("128-vCPU regional gate changed")
-if data["parameters"]["requiredAuthorFamilyFreeVcpus"].get("defaultValue") != 96:
-    raise SystemExit("96-vCPU author-family gate changed")
 if data["parameters"]["reservedLandingVcpus"].get("defaultValue") != 62:
     raise SystemExit("landing-capacity reserve changed")
 if data["parameters"]["commissioningBudgetCeilingUsd"].get("defaultValue") != 1500:
@@ -376,9 +374,6 @@ PY
     family_limit=$(jq -r --arg family "$family" '[.[] | select((.name.value | ascii_downcase) == ($family | ascii_downcase))][0].limit // 0 | tonumber' <<<"$usage")
     family_free=$(jq -r --arg family "$family" '[.[] | select((.name.value | ascii_downcase) == ($family | ascii_downcase))][0] | (((.limit // 0) | tonumber) - ((.currentValue // 0) | tonumber))' <<<"$usage")
     [ "$family_free" -ge "$required" ] || refuse "selected capacity pool lacks its required free family vCPUs"
-    if [ "$CAPACITY_PROFILE" = full ] && [ "$AUTHOR_CAPACITY_MODE" = homogeneous-dasv6 ] && [ "$family" = standardDav6Family ]; then
-      [ "$family_limit" -ge "$REQUIRED_AUTHOR_FAMILY_VCPUS" ] || refuse "homogeneous full profile requires a 96-vCPU Dasv6 family limit"
-    fi
   done < <(jq -r 'keys[]' <<<"$requirements")
   if [ "$COMMAND" = worker-create ]; then
     [ "$worker_count" -eq 1 ] || refuse "worker-create must validate exactly one requested author worker"
@@ -520,6 +515,7 @@ values = {
     "subscriptionId": os.environ["FM_AZURE_SUBSCRIPTION_ID"],
     "administratorNotificationEmail": os.environ["FM_AZURE_ADMIN_EMAIL"],
     "adminUsername": os.environ["FM_AZURE_ADMIN_USERNAME"],
+    "adminSshPublicKey": os.environ["FM_AZURE_ADMIN_SSH_PUBLIC_KEY"],
     "ownerTag": os.environ["FM_AZURE_OWNER_TAG"],
     "deploymentGeneration": os.environ["FM_AZURE_DEPLOYMENT_GENERATION"],
     "capacityProfile": os.environ.get("FM_AZURE_CAPACITY_PROFILE", "foundation"),
@@ -531,7 +527,6 @@ values = {
     "region": "eastus",
     "vmFamily": os.environ.get("FM_AZURE_VM_FAMILY", "Dasv6"),
     "requiredRegionalFreeVcpus": 128,
-    "requiredAuthorFamilyFreeVcpus": 96,
     "reservedLandingVcpus": 62,
     "workerSlots": json.loads(os.environ["WORKER_SLOTS_JSON"]),
     "workerSkus": json.loads(os.environ["WORKER_SKUS_JSON"]),
@@ -727,7 +722,7 @@ validate_slot() {
 }
 
 sku_for_slot() {
-  if [ "$AUTHOR_CAPACITY_MODE" = homogeneous-dasv6 ] || [ "$CAPACITY_PROFILE" = commissioning ]; then
+  if [ "$CAPACITY_PROFILE" = commissioning ]; then
     printf 'Standard_D4as_v6\n'
     return 0
   fi

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Read-only detection sweep for merge-inadmissible modern Pi task metadata.
+# Read-only detection sweep for modern Pi author-identity metadata gaps.
 # Usage: fm-author-identity-sweep.sh
-# Prints one actionable line per ship/scout whose metadata records the immutable
+# Prints one diagnostic line per ship/scout whose metadata records the immutable
 # launch-bound-v1 epoch without exactly one non-empty author_account_identity:
-#   AUTHOR_IDENTITY_CAPTURE_FAILED: <id>: modern Pi task metadata ...
-# Silence means no matching task record was found.
+#   AUTHOR_IDENTITY_CAPTURE_GAP: <id>: modern Pi task metadata ...
+# This gap is informational: structural reviewer independence means it must not
+# block spawn, review, or merge. Silence means no matching record was found.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,6 +45,6 @@ for meta in "$STATE"/*.meta; do
   ' "$meta"; then
     id=${meta##*/}
     id=${id%.meta}
-    printf 'AUTHOR_IDENTITY_CAPTURE_FAILED: %s: modern Pi task metadata records launch-bound-v1 without exactly one non-empty author_account_identity; stop or replace this lane before validation\n' "$id"
+    printf 'AUTHOR_IDENTITY_CAPTURE_GAP: %s: modern Pi task metadata records launch-bound-v1 without exactly one non-empty author_account_identity; informational only, review independence is structural\n' "$id"
   fi
 done

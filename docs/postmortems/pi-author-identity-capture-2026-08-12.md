@@ -1,17 +1,21 @@
-# Pi author identity capture failure, 2026-08-12
+# Pi author identity capture gap, 2026-08-12
 
 ## Outcome
 
 The exact intermittent capture cause was not established.
-The evidence does not prove host load caused either failed capture.
-The spawn defect was established independently: `bin/fm-spawn.sh` converted every snapshot error into a warning, wrote `author_identity_snapshot_epoch=launch-bound-v1` without `author_account_identity`, and launched an author identity state that `bin/fm-crosscheck.py` deliberately rejects.
+The evidence does not prove host load caused either capture gap.
+
+The original task treated the gap as fatal because Crosscheck rejected modern Pi metadata that recorded `author_identity_snapshot_epoch=launch-bound-v1` without `author_account_identity`.
+The captain subsequently removed author identity from merge admissibility.
+Reviewer independence is structural through the separate reviewer account pool and different model, so a missing identity record must not block spawn, review, validation, or merge.
+The fail-closed spawn refusal built during the first implementation round was deliberately removed before shipping on that direction.
 
 ## Direct evidence
 
 The live metadata for `winback-promo-verify-schedule-w3` and `winback-cut-to-three-k4` contained `author_identity_snapshot_epoch=launch-bound-v1` without `author_account_identity`.
 The live metadata for `crosscheck-coverage-policy-unsatisfiable` contained the same epoch plus a non-empty identity.
 The task-private Pi snapshot currently retained for each of those three tasks had a readable OAuth identity in the provider slot named by its recorded model.
-The two failed tasks had been relaunched, so those retained successful snapshots do not prove that the original launch capture succeeded.
+The two tasks with gaps had been relaunched, so those retained successful snapshots do not prove that the original launch capture succeeded.
 They do prove that the same task and provider-slot shapes can be captured successfully on a later attempt.
 
 The inspection used the following read-only command against each task's recorded `tasktmp` and model slot.
@@ -48,7 +52,7 @@ PY
 ```
 
 It reported `True True True` for all three retained snapshots.
-The exact sweep command below reported four current failed-modern-capture task records, including both named bad examples.
+The exact sweep command below reported four current modern Pi metadata gaps, including both named examples.
 
 ```sh
 FM_HOME=/Users/dongkeun/firstmate-home \
@@ -61,18 +65,20 @@ bin/fm-author-identity-sweep.sh
 `bin/fm-pi-author-snapshot.py` has no timeout.
 Host load therefore cannot directly trigger a capture timeout in this implementation.
 The snapshot traverses mutable Pi configuration and rejects a source file whose device, inode, or size changes while copied.
-High load could widen that race window, but no original launch stderr or structured failure record survived to show that either failed launch took this branch.
+High load could widen that race window, but no original launch stderr or structured failure record survived to show that either affected launch took this branch.
 The helper can also fail for permanent reasons such as a missing provider slot, unreadable or malformed `auth.json`, an unsafe filesystem entry, a file or tree size bound, or an ordinary filesystem error.
 No available artifact distinguishes those branches for the two incidents.
 
 ## Remediation
 
-Pi ship and scout author capture now runs before endpoint creation on every backend.
-A new modern Pi task must produce both the immutable epoch and a non-empty account identity, or spawn refuses and rolls back the task temp, metadata, and Treehouse lease.
-Modern recovery also refuses a missing recorded identity or an account mismatch because a later credential cannot prove who authored the earlier work.
-Legacy recovery keeps its absent epoch and cannot mint launch provenance retrospectively.
+`bin/fm-author-identity-sweep.sh` reports modern Pi ship/scout metadata with the epoch and no non-empty identity.
+`bin/fm-bootstrap.sh` runs the read-only sweep at session start.
+The diagnostic is explicitly informational and records capture reliability without stopping healthy work.
+
+The companion task `crosscheck-drop-author-identity-requirement` owns removal of author identity from Crosscheck and the non-fatal spawn warning.
+This task intentionally does not edit `bin/fm-crosscheck.py`, `bin/fm-spawn.sh`, or their shared capture regression after the captain's reversal, avoiding a conflicting implementation of the same policy.
 
 No automatic retry was added.
 Without the original failure classification, retrying every failure would mask permanent model, credential, and filesystem defects as transient load.
-The refusal preserves the helper's specific stderr so a future occurrence identifies its actual branch immediately.
-A future bounded retry should be limited to a measured transient class, such as a proved source-change race, rather than applied to every identity failure.
+The existing snapshot helper writes its specific failure to stderr, so a future occurrence can identify its actual branch.
+A future bounded retry should be limited to a measured transient class, such as a proved source-change race, rather than applied to every identity gap.

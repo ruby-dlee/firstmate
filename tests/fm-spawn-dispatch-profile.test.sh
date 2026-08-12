@@ -21,7 +21,6 @@ make_spawn_fakebin() {
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
-[ -z "${FM_FAKE_TMUX_LOG:-}" ] || printf '%s\n' "$*" >> "$FM_FAKE_TMUX_LOG"
 case "$*" in
   *"#{pane_current_path}"*)
     if [ -s "${FM_FAKE_TREEHOUSE_CURRENT:-}" ]; then
@@ -110,29 +109,9 @@ with open(state_path, "w", encoding="utf-8") as stream:
     json.dump(state, stream)
 PY
     printf '%s\n' "$target" > "${FM_FAKE_TREEHOUSE_CURRENT:?}"
-    [ -z "${FM_FAKE_TREEHOUSE_LEASE_MARKER:-}" ] || : > "$FM_FAKE_TREEHOUSE_LEASE_MARKER"
     printf '%s\n' "$target"
     ;;
-  return)
-    python3 - "${FM_FAKE_TREEHOUSE_POOL:?}/treehouse-state.json" "$PWD" <<'PY'
-import json
-import os
-import sys
-
-state_path, target = sys.argv[1:]
-target = os.path.realpath(target)
-with open(state_path, encoding="utf-8") as stream:
-    state = json.load(stream)
-for entry in state.get("worktrees", []):
-    if isinstance(entry, dict) and os.path.realpath(entry.get("path", "")) == target:
-        entry["leased"] = False
-        entry.pop("lease_holder", None)
-with open(state_path, "w", encoding="utf-8") as stream:
-    json.dump(state, stream)
-PY
-    [ -z "${FM_FAKE_TREEHOUSE_LEASE_MARKER:-}" ] || rm -f "$FM_FAKE_TREEHOUSE_LEASE_MARKER"
-    exit 0
-    ;;
+  return) exit 0 ;;
   *) exit 0 ;;
 esac
 SH
@@ -197,7 +176,6 @@ run_spawn() {
   shift 4
   case_dir=${home%/home}
   : > "$launchlog"
-  : > "$case_dir/tmux.log"
   FM_ROOT_OVERRIDE="${FM_TEST_ROOT_OVERRIDE:-}" FM_HOME="$home" \
     FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
     FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
@@ -205,9 +183,8 @@ run_spawn() {
     FM_TREEHOUSE_ROOT="$case_dir/treehouse-root" \
     FM_FAKE_TREEHOUSE_POOL="$case_dir/treehouse-root/profile" \
     FM_FAKE_TREEHOUSE_CURRENT="$case_dir/acquired-worktree" \
-    FM_FAKE_TREEHOUSE_LEASE_MARKER="$case_dir/worktree-leased" \
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$wt" TMUX="fake,1,0" \
-    FM_FAKE_TREEHOUSE_WORKTREE="$wt" FM_FAKE_TMUX_LOG="$case_dir/tmux.log" \
+    FM_FAKE_TREEHOUSE_WORKTREE="$wt" \
     FM_FAKE_LAUNCH_LOG="$launchlog" GROK_HOME="$home/grok-home" PATH="$fakebin:$PATH" \
     "$SPAWN" "$@" 2>&1
 }
@@ -477,69 +454,57 @@ test_opencode_threads_model_and_ignores_effort_axis() {
 }
 
 test_pi_omits_invalid_max_effort() {
-  local rec id source out status launch model
+  local rec id out status launch
   id=profile-pi-z8
   rec=$(make_spawn_case profile-pi pi "$id")
   read_case_record "$rec"
-  source="$CASE_DIR/pi-source"
-  model=openai-codex-5/gpt-5.6-sol
-  make_pi_account_source "$source" account-A
 
-  out=$(PI_CODING_AGENT_DIR="$source" \
-    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
-      "$id" "$PROJ_DIR" --model "$model" --effort max)
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model sonnet --effort max)
   status=$?
   expect_code 0 "$status" "pi spawn with max effort should not pass an invalid flag"
-  assert_meta_profile "$HOME_DIR/state/$id.meta" pi "$model" max
+  assert_meta_profile "$HOME_DIR/state/$id.meta" pi sonnet max
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "pi --approve --exclude-tools ask_question --model '$model' -e" \
+  assert_contains "$launch" "pi --approve --exclude-tools ask_question --model 'sonnet' -e" \
     "pi launch did not thread model after the autonomy flags"
   assert_not_contains "$launch" "--thinking" "pi launch must omit --thinking max because the CLI rejects it"
-  pass "pi threads a launch-bound model and omits unsupported max effort"
+  pass "pi threads model and omits unsupported max effort"
 }
 
 # A pi crewmate/scout must never sit parked on pi's project-trust dialog or on a
 # question tool nobody is watching. Both flags precede the model/effort
-# placeholders, so the rendered line has to stay well-formed with effort present
-# and absent. The absent-effort case is the one a naive insertion breaks with a
-# stray double space, so it is asserted as an exact prefix.
+# placeholders, so the rendered line has to stay well-formed in BOTH directions:
+# with the placeholders expanded and with them empty. The empty case is the one a
+# naive insertion breaks (a stray double space, or --exclude-tools separated from
+# its ask_question value), so it is asserted as an exact prefix.
 test_pi_crewmate_carries_autonomy_flags() {
-  local rec id source out status launch model
+  local rec id out status launch
   id=profile-pi-approve-z20
   rec=$(make_spawn_case profile-pi-approve pi "$id")
   read_case_record "$rec"
-  source="$CASE_DIR/pi-source"
-  model=openai-codex-5/gpt-5.6-sol
-  make_pi_account_source "$source" account-A
 
   # With model and effort set: the flags lead, then --model/--thinking, then -e.
-  out=$(PI_CODING_AGENT_DIR="$source" \
-    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
-      "$id" "$PROJ_DIR" --model "$model" --effort high)
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model sonnet --effort high)
   status=$?
   expect_code 0 "$status" "pi spawn with model and effort should succeed: $out"
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "pi --approve --exclude-tools ask_question --model '$model' --thinking 'high' -e" \
+  assert_contains "$launch" "pi --approve --exclude-tools ask_question --model 'sonnet' --thinking 'high' -e" \
     "pi launch with model/effort did not render the autonomy flags ahead of the profile flags"
 
-  # Without effort, its placeholder expands to nothing while the required
-  # launch-bound model remains, so the transition to -e must stay well-formed.
-  id=profile-pi-approve-no-effort-z21
-  rec=$(make_spawn_case profile-pi-approve-no-effort pi "$id")
+  # Without model or effort: both placeholders expand to nothing, so --approve and
+  # --exclude-tools ask_question must sit flush against -e with single spaces.
+  id=profile-pi-approve-bare-z21
+  rec=$(make_spawn_case profile-pi-approve-bare pi "$id")
   read_case_record "$rec"
-  source="$CASE_DIR/pi-source"
-  make_pi_account_source "$source" account-A
-  out=$(PI_CODING_AGENT_DIR="$source" \
-    run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
-      "$id" "$PROJ_DIR" --model "$model")
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
   status=$?
-  expect_code 0 "$status" "pi spawn without effort should succeed: $out"
+  expect_code 0 "$status" "pi spawn without model or effort should succeed: $out"
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "pi --approve --exclude-tools ask_question --model '$model' -e" \
-    "pi launch without effort did not render well-formed autonomy and model flags"
-  assert_not_contains "$launch" "--thinking" "pi launch without effort must not carry --thinking"
-  assert_not_contains "$launch" "  " "pi launch without effort must not contain a doubled space from an empty placeholder"
-  pass "pi crewmate launches carry autonomy flags with required author-bound models"
+  assert_contains "$launch" "pi --approve --exclude-tools ask_question -e" \
+    "pi launch without model/effort did not render well-formed autonomy flags"
+  assert_not_contains "$launch" "--model" "bare pi launch must not carry a --model flag"
+  assert_not_contains "$launch" "--thinking" "bare pi launch must not carry a --thinking flag"
+  assert_not_contains "$launch" "  " "bare pi launch must not contain a doubled space from an empty placeholder"
+  pass "pi crewmate launches carry --approve and --exclude-tools ask_question, with and without profile flags"
 }
 
 # A pi SECONDMATE gets --approve for the same trust-dialog reason, but keeps its
@@ -547,13 +512,11 @@ test_pi_crewmate_carries_autonomy_flags() {
 # directly. This asserts the split deliberately, so flipping either half is a
 # visible decision rather than a silent drift.
 test_pi_secondmate_approves_without_excluding_tools() {
-  local rec id sm source pi_source out status launch
+  local rec id sm source out status launch
   id=profile-pi-secondmate-z22
   rec=$(make_spawn_case profile-pi-secondmate pi "$id")
   read_case_record "$rec"
-  printf 'pi openai-codex-5/gpt-5.6-sol\n' > "$HOME_DIR/config/secondmate-harness"
-  pi_source="$CASE_DIR/pi-source"
-  make_pi_account_source "$pi_source" account-A
+  printf 'pi\n' > "$HOME_DIR/config/secondmate-harness"
   source="$CASE_DIR/upstream-source"
   sm="$CASE_DIR/secondmate-home"
   make_upstream_source "$source"
@@ -561,21 +524,21 @@ test_pi_secondmate_approves_without_excluding_tools() {
   printf -- '- %s - pi secondmate flags test (home: %s; scope: test; projects: ; added 2026-08-07)\n' \
     "$id" "$(cd "$sm" && pwd -P)" > "$HOME_DIR/data/secondmates.md"
 
-  out=$(FM_TEST_ROOT_OVERRIDE="$source" PI_CODING_AGENT_DIR="$pi_source" \
+  out=$(FM_TEST_ROOT_OVERRIDE="$source" \
     run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$sm" --secondmate)
   status=$?
   expect_code 0 "$status" "pi secondmate spawn should succeed: $out"
   assert_contains "$out" "spawned $id harness=pi kind=secondmate" "secondmate did not launch on pi"
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "pi --approve --model 'openai-codex-5/gpt-5.6-sol' -e" \
-    "pi secondmate launch did not carry --approve and its configured model ahead of the extensions"
+  assert_contains "$launch" "pi --approve -e" \
+    "pi secondmate launch did not carry --approve ahead of its extensions"
   assert_not_contains "$launch" "--exclude-tools" \
     "pi secondmate launch must keep its question tool; --exclude-tools is crewmate-only"
   pass "pi secondmate launches carry --approve but deliberately keep ask_question"
 }
 
 test_pi_author_account_snapshot_binds_launch_and_recovery() {
-  local rec id source out status launch meta tasktmp private count absent_marker failed_id lease_marker
+  local rec id source out status launch meta tasktmp private count absent_marker failed_id
   id=profile-pi-author-snapshot-z23
   rec=$(make_spawn_case profile-pi-author-snapshot pi "$id")
   read_case_record "$rec"
@@ -595,8 +558,6 @@ test_pi_author_account_snapshot_binds_launch_and_recovery() {
     "Pi launch did not bind the task-private author account"
   assert_grep 'author_account_identity=account-A' "$meta" \
     "Pi launch did not record the identity derived from its private snapshot"
-  grep -Eq '^author_account_identity=.+$' "$meta" \
-    || fail "Pi launch recorded an empty author identity"
   assert_grep 'author_identity_snapshot_epoch=launch-bound-v1' "$meta" \
     "Pi launch did not record the immutable snapshot-era marker"
   python3 - "$private" account-A <<'PY' \
@@ -638,16 +599,16 @@ PY
     run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
       "$id" "$PROJ_DIR" --model openai-codex-5/gpt-5.6-sol --effort xhigh)
   status=$?
-  expect_code 1 "$status" "Pi account-change recovery must fail closed"
-  assert_contains "$out" "Pi recovery account identity does not match the launch-bound author_account_identity" \
-    "Pi account-change recovery did not name its author-proof refusal"
-  assert_grep 'author_account_identity=account-A' "$meta" \
-    "Pi account-change refusal did not restore the original author identity"
+  expect_code 0 "$status" "Pi account-change recovery should remain cross-provider-only: $out"
+  assert_no_grep 'author_account_identity=' "$meta" \
+    "a task spanning two Pi accounts retained same-provider eligibility"
   assert_grep 'author_identity_snapshot_epoch=launch-bound-v1' "$meta" \
-    "Pi account-change refusal did not restore the modern snapshot-era marker"
-  [ ! -s "$LAUNCH_LOG" ] || fail "Pi account-change refusal launched the harness"
-  ! grep -q '^new-window ' "$CASE_DIR/tmux.log" \
-    || fail "Pi account-change refusal created an endpoint"
+    "Pi account-change recovery lost the modern snapshot-era marker"
+  tasktmp=$(sed -n 's/^tasktmp=//p' "$meta")
+  private="$tasktmp/pi-author-agent"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "PI_CODING_AGENT_DIR='$private' pi --approve" \
+    "Pi account-change recovery launched outside its private snapshot"
 
   sed -i.bak '/^author_identity_snapshot_epoch=/d' "$meta"
   rm "$meta.bak"
@@ -671,27 +632,13 @@ PY
     run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
       "$failed_id" "$PROJ_DIR" --model openai-codex-5/gpt-5.6-sol --effort xhigh)
   status=$?
-  expect_code 1 "$status" "Pi failed-snapshot spawn must be refused"
-  assert_contains "$out" "Pi launch-bound author identity capture failed for $failed_id; refusing before endpoint creation" \
-    "Pi failed-snapshot refusal did not name the author-proof reason"
+  expect_code 0 "$status" "Pi failed-snapshot spawn should remain cross-provider-only: $out"
   meta="$HOME_DIR/state/$failed_id.meta"
-  assert_absent "$meta" "Pi failed-snapshot refusal left partial task metadata"
-  [ ! -s "$LAUNCH_LOG" ] || fail "Pi failed-snapshot refusal launched the harness"
-  ! grep -q '^new-window ' "$CASE_DIR/tmux.log" \
-    || fail "Pi failed-snapshot refusal created an endpoint"
-  lease_marker="$CASE_DIR/worktree-leased"
-  assert_absent "$lease_marker" "Pi failed-snapshot refusal retained its workspace lease"
-  assert_no_grep '"leased": true' "$CASE_DIR/treehouse-root/profile/treehouse-state.json" \
-    "Pi failed-snapshot refusal left the workspace state leased"
-  assert_absent "$HOME_DIR/state/.worktree-acquire-$failed_id.pending" \
-    "Pi failed-snapshot refusal left a partial acquisition record"
-  if find "$HOME_DIR/state" -maxdepth 1 -name "*$failed_id*" -print -quit 2>/dev/null | grep -q .; then
-    fail "Pi failed-snapshot refusal left a partial task state artifact"
-  fi
-  if find "$HOME_DIR/state/.task-tmp" -maxdepth 1 -name "fm-$failed_id-*" -print -quit 2>/dev/null | grep -q .; then
-    fail "Pi failed-snapshot refusal left its task temp record"
-  fi
-  pass "Pi author capture succeeds with both proof fields and fails closed without endpoint, lease, or task record"
+  assert_no_grep 'author_account_identity=' "$meta" \
+    "a failed Pi snapshot invented an author identity"
+  assert_grep 'author_identity_snapshot_epoch=launch-bound-v1' "$meta" \
+    "a failed modern Pi snapshot lost the snapshot-era marker"
+  pass "Pi snapshot epochs distinguish new launches from legacy recovery"
 }
 
 test_batch_forwards_shared_profile_flags() {

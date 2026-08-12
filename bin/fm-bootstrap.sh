@@ -17,7 +17,7 @@
 #                 "NUDGE_SECONDMATES: fm-<id>...",
 #                 "REPORT_RETENTION: unavailable: <reason>",
 #                 "TREEHOUSE_CAPACITY: LOW pool=<path> available=<n> ...",
-#                 "AUTHOR_IDENTITY_CAPTURE_FAILED: <id>: <reason>",
+#                 "AUTHOR_IDENTITY_CAPTURE_GAP: <id>: <reason>",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: <outcome>",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
 #          A NUDGE_SECONDMATES line lists the RUNNING secondmate task selectors

@@ -470,7 +470,8 @@ The crewmate `PATH` Firstmate exports therefore carries no manifest-supplied ent
 The pin is applied instead by `bin/fm-launch-pinned.sh`, which is named by an absolute path, resolves the launch command against that un-pinned `PATH`, and only then exports the pin for the agent and every process it starts.
 So the pin still wins for the project's own tools inside the crewmate's session, which is the whole point of declaring it, and it decides nothing about what Firstmate itself launches.
 A raw launch command receives a published pin only when Firstmate can resolve its first word to an executable on its own `PATH`, or verify a slash-containing first word as an executable path before endpoint creation.
-When an applicable manifest may publish `path_prepend`, a raw first word that is a shell builtin, an operator alias, a shell function, a shell construct, an unresolved name, or a non-executable path is refused before a worktree is leased because wrapping it would change its shell semantics or fail after endpoint creation.
+When an applicable explicit manifest makes raw-launch undeliverability knowable up front, a shell builtin, operator alias, shell function, shell construct, unresolved name, or non-executable absolute path is refused before a worktree is leased.
+Relative raw paths require the acquired worktree, and declaration-driven runtime pins are known only after provisioning, so the shared definitive check refuses those combinations after provisioning and before endpoint creation or task metadata installation.
 When no pin can be published, raw launch behavior is unchanged and the line is typed exactly as supplied.
 
 A harness turn-end hook is not part of the launch line - it is a command Firstmate writes into a file the harness runs from inside the crewmate's session, where the pin is in effect by design - so those commands are pinned in their own right.

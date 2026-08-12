@@ -70,6 +70,7 @@ test_ci_invokes_the_owner() {
 
 test_nomistakes_invokes_the_owner() {
   assert_grep 'else exec bin/fm-azure-runner-dispatch.sh lint -- bin/fm-azure-runner-command.sh' "$NM" "no-mistakes commands.lint must preserve the local/default dispatch owner"
+  # shellcheck disable=SC2016  # The literal gate command must preserve runtime expansion.
   assert_grep 'exec "$FM_AZURE_VALIDATION_SHARD_BRIDGE" lint -- bin/fm-azure-runner-command.sh' "$NM" "Azure validation must move lint to the credential-free shard bridge"
   [ "$(grep -Fc "bin/fm-lint.sh && uv run --directory tools/agent-fleet --locked ruff check ." "$NM")" -eq 1 ] || fail "no-mistakes lint must preserve one exact shell/Agent Fleet command"
   assert_grep 'exec "$@"' "$ROOT/bin/fm-azure-runner-dispatch.sh" "Azure dispatch must preserve local execution as the default"

@@ -2935,7 +2935,18 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
                     not legacy_fields.intersection(reviewer),
                     f"{label}.reviewer carries legacy admission evidence without its mode",
                 )
-        if isinstance(reviewer, dict) and "execution_proof" in reviewer:
+        if (
+            isinstance(reviewer, dict)
+            and reviewer.get("execution_mode") == "azure-compartment-v1"
+        ):
+            load_azure_crosscheck_adapter(
+                Path(__file__).resolve().parent.parent
+            ).validate_azure_reviewer_record(reviewer, run, label)
+        if (
+            isinstance(reviewer, dict)
+            and "execution_proof" in reviewer
+            and reviewer.get("execution_mode") != "azure-compartment-v1"
+        ):
             execution_home = reviewer.get("execution_home")
             require(
                 isinstance(execution_home, str)
@@ -4589,6 +4600,22 @@ def render_report(ledger: dict[str, Any], run: dict[str, Any]) -> str:
                 "",
             ]
         )
+    if isinstance(reviewer, dict) and reviewer.get("execution_mode") == "azure-compartment-v1":
+        identity = reviewer.get("azure_identity") or {}
+        lines.extend(
+            [
+                "Execution mode: **AZURE ISOLATED COMPARTMENTS**.",
+                "",
+                f"Review generation: `{identity.get('review_generation', 'unknown')}`",
+                "",
+                f"Model compartment: `{identity.get('model', {}).get('vm_instance_id', 'unknown')}`",
+                "",
+                f"Tool compartment: `{identity.get('tool', {}).get('vm_instance_id', 'unknown')}`",
+                "",
+                f"Verifier compartment: `{identity.get('verifier', {}).get('vm_instance_id', 'unknown')}`",
+                "",
+            ]
+        )
     if isinstance(reviewer, dict) and reviewer.get("model_independence") == "same-model":
         account_note = (
             "author-account independence is also unproven under the legacy admission"
@@ -4843,6 +4870,8 @@ def write_ledger(path: Path, ledger: dict[str, Any]) -> None:
 
 def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
     state = Path(environment_value("FM_STATE_OVERRIDE", str(home / "state")))
+    azure_adapter = load_azure_crosscheck_adapter(root)
+    use_azure = azure_adapter.azure_review_enabled(home)
     data = Path(environment_value("FM_DATA_OVERRIDE", str(home / "data")))
     try:
         meta = parse_meta(state / f"{task_id}.meta")
@@ -4927,13 +4956,28 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
                 except CrosscheckError as exc:
                     tool_fail(f"review checkout preflight failed: {exc}")
                 try:
-                    raw_review = run_reviewer(
-                        review_dir,
-                        snapshot_value,
-                        ledger,
-                        config,
-                        author_account_identity,
-                    )
+                    if use_azure:
+                        ledger, run = azure_adapter.run_azure_review(
+                            core=sys.modules[__name__],
+                            root=root,
+                            home=home,
+                            task_id=task_id,
+                            pr_url=url,
+                            review_dir=review_dir,
+                            proof_root=temp_root,
+                            snapshot_value=snapshot_value,
+                            ledger=ledger,
+                            config=config,
+                            author_account_identity=author_account_identity,
+                        )
+                    else:
+                        raw_review = run_reviewer(
+                            review_dir,
+                            snapshot_value,
+                            ledger,
+                            config,
+                            author_account_identity,
+                        )
                 except CrosscheckToolError as exc:
                     if not remaining:
                         raise
@@ -4955,6 +4999,8 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
                     )
                     continue
                 assert_review_checkout_intact(review_dir, snapshot_value["head_sha"])
+                if use_azure:
+                    break
                 review = validate_review_shape(
                     raw_review,
                     snapshot_value,
@@ -5057,16 +5103,25 @@ def verified_crosscheck_head(root: Path, home: Path, task_id: str, url: str) -> 
         f"{latest['state']}",
     )
     reviewer = latest.get("reviewer")
-    require(
+    azure_execution = (
         isinstance(reviewer, dict)
-        and reviewer.get("executing_account_home") == reviewer.get("account_home")
-        and isinstance(reviewer.get("execution_home"), str)
-        and Path(reviewer["execution_home"]).is_absolute()
-        and bool(reviewer.get("credential_source"))
-        and bool(reviewer.get("credential_identifier")),
-        "no valid review exists for the exact head; reviewer execution identity "
-        "was not credential-bound to its selected account home",
+        and reviewer.get("execution_mode") == "azure-compartment-v1"
     )
+    if azure_execution:
+        load_azure_crosscheck_adapter(root).verify_azure_reviewer_record(
+            reviewer, latest, snapshot_value
+        )
+    else:
+        require(
+            isinstance(reviewer, dict)
+            and reviewer.get("executing_account_home") == reviewer.get("account_home")
+            and isinstance(reviewer.get("execution_home"), str)
+            and Path(reviewer["execution_home"]).is_absolute()
+            and bool(reviewer.get("credential_source"))
+            and bool(reviewer.get("credential_identifier")),
+            "no valid review exists for the exact head; reviewer execution identity "
+            "was not credential-bound to its selected account home",
+        )
     execution_proof = reviewer.get("execution_proof")
     require(
         isinstance(execution_proof, dict)
@@ -5087,6 +5142,27 @@ def verified_crosscheck_head(root: Path, home: Path, task_id: str, url: str) -> 
 def verify_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
     print(verified_crosscheck_head(root, home, task_id, url))
     return 0
+
+
+def load_azure_crosscheck_adapter(root: Path) -> Any:
+    """Load the dedicated Azure review/ledger adapter without weakening local review."""
+
+    path = root / "bin" / "fm-crosscheck-azure.py"
+    spec = importlib.util.spec_from_file_location("firstmate_crosscheck_azure_adapter", path)
+    require(spec is not None and spec.loader is not None, "Azure Crosscheck adapter is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except (ImportError, OSError, SyntaxError) as exc:
+        fail(f"Azure Crosscheck adapter could not load: {exc}")
+    for name in (
+        "azure_review_enabled",
+        "run_azure_review",
+        "validate_azure_reviewer_record",
+        "verify_azure_reviewer_record",
+    ):
+        require(callable(getattr(module, name, None)), f"Azure Crosscheck adapter lacks {name}")
+    return module
 
 
 def load_github_adapter(root: Path) -> Any:

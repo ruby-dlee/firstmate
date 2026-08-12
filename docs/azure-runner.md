@@ -133,10 +133,10 @@ Only a previously successful response bound to the exact subscription, resource 
 
 A newly created resource group can lack enough Azure training data for the forecast API even though the commissioning foundation is exact.
 One invocation may use a one-time commissioning bootstrap only when the ordinary actual-plus-forecast gate fails with a specifically classified no-cache 429 or exact empty-training forecast response.
-Under the existing ETag-fenced admission lease, it re-proves the fresh Succeeded foundation deployment and reviewed correlation/template outputs, the exact complete resource-group inventory with no foreign resource, zero compute, zero reservations, and the exact `$1,500` Monthly resource-group budget.
+Under the existing ETag-fenced admission lease, it re-proves the fresh Succeeded foundation deployment against independently retained correlation/template values, the exact complete resource-group inventory with authoritative creation evidence for every expected resource, zero VM/NIC/disk/Run Command/schedule/active deployment/other local invocation, zero reservations, and the exact `$1,500` Monthly resource-group budget.
 The Budget API's last-evaluated `currentSpend` is only a lower bound, never called current or forecast telemetry.
 Admission pressure is `max(Budget currentSpend, the itemized foundation ceiling since the earliest authoritative resource creation time) + one complete 24-hour runner increment`, including all operation and network reserves, and must remain below `$1,500`.
-Before the reservation is created, the controller atomically writes an immutable consumed marker into the control container metadata with the invocation/fence, deployment correlation/template hash, exact budget ID/ETag/spend, and foundation start evidence.
+Before the reservation is created, the lease owner atomically renews and writes an immutable consumed marker in the same `If-Match` update of the control container lock document. The marker binds the durable invocation/fence, exact deployment name and independently retained correlation/template hash, exact subscription budget ID/ETag/spend, and independently retained foundation start evidence. A stale owner cannot adopt a successor's ETag, and every later marker read revalidates those bindings.
 If any later step fails, that marker remains consumed.
 Every subsequent invocation requires the normal authoritative actual-plus-forecast gate; an unavailable cost pair can never consume bootstrap again.
 
@@ -202,8 +202,9 @@ The foundation creates the exact `id-<prefix>-validation-shards` UAMI and grants
 It also creates the private, zero-data admission-control account and management container.
 The operator host uses Azure management APIs only and needs no storage private-endpoint route.
 The command has no identity or network; the trusted wrapper alone retains VNet/PE/IMDS reachability for verified result publication.
-After the reviewed foundation apply and before the first runner admission, the operator must independently read and accept the exact deterministic blob private-endpoint NIC `resourceGuid`, then persist it as `FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID` in the private operator configuration.
+After the reviewed foundation apply and before the first runner admission, the operator must independently read and accept the exact deterministic blob private-endpoint NIC `resourceGuid`, the original Succeeded deployment `correlationId` and canonical `templateHash`, and the earliest authoritative `systemData.createdAt` across every reviewed foundation resource. Persist them as `FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID`, `FM_AZURE_FOUNDATION_CORRELATION_ID`, `FM_AZURE_FOUNDATION_TEMPLATE_HASH`, and `FM_AZURE_FOUNDATION_STARTED_AT` in the private operator configuration.
 Every foundation gate compares the live NIC and the mutable deployment output to that independent accepted value, so a same-name NIC replacement plus same-name deployment rerun cannot authorize itself.
+Bootstrap admission additionally compares the current same-name deployment to the independently retained correlation and template hash, exact-rereads every expected resource with its reviewed API version, and requires authoritative creation evidence for every resource. A same-name redeployment, missing timestamp, foreign resource, or changed earliest start refuses before the marker.
 
 Use Azure CLI only.
 Do not install an extension, change the ambient subscription default, enable storage public networking, enable shared keys, add a public IP, or weaken the subnet NSG for this runner.
@@ -213,6 +214,9 @@ Set the foundation variables from [`docs/azure-pilot.md`](azure-pilot.md), inclu
 ```sh
 export FM_AZURE_RUNNER_OPERATOR_OBJECT_ID='<exact signed-in Entra object id>'
 export FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID='<independently accepted blob endpoint NIC resourceGuid>'
+export FM_AZURE_FOUNDATION_CORRELATION_ID='<independently accepted original deployment correlationId>'
+export FM_AZURE_FOUNDATION_TEMPLATE_HASH='<independently accepted original ARM templateHash>'
+export FM_AZURE_FOUNDATION_STARTED_AT='<independently accepted earliest foundation creation timestamp>'
 export FM_AZURE_RUNNER_TASK='<task or validation-run id>'
 export FM_AZURE_RUNNER_GENERATION='<task or validation-run generation>'
 export FM_AZURE_RUNNER_CONFIRM_SUBSCRIPTION="$FM_AZURE_SUBSCRIPTION_ID"

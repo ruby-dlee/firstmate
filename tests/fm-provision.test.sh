@@ -1209,6 +1209,23 @@ test_spawn_pins_a_resolvable_raw_launch_command() {
   assert_contains "$launch" "--go" "the rest of the raw launch command must be untouched: $launch"
   assert_not_contains "$launch" "$CASE_DIR/pinned-bin/crewtool" \
     "the manifest's pinned directory must not name the launched binary: $launch"
+
+  id=provision-raw-path-pin-pl
+  rec=$(make_spawn_case raw-path-pin "$id")
+  read_spawn_case "$rec"
+  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+  printf '#!/bin/sh\nexit 0\n' > "$PROJ_DIR/crewtool"
+  chmod +x "$PROJ_DIR/crewtool"
+  git -C "$PROJ_DIR" add crewtool
+  git -C "$PROJ_DIR" -c user.name=t -c user.email=t@example.invalid commit -qm crewtool
+  git -C "$WT_DIR" checkout --quiet --detach "$(git -C "$PROJ_DIR" rev-parse HEAD)"
+
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" \
+    --harness './crewtool --go')
+  expect_code 0 "$?" "a raw executable path should receive the runtime pin: $out"
+  launch=$(sent_line_containing "$SEND_LOG" crewtool)
+  assert_contains "$launch" "$ROOT/bin/fm-launch-pinned.sh" \
+    "a raw executable path should receive the pin through the launcher: $launch"
   pass "a raw launch command resolves before its child session receives the pin"
 }
 
@@ -1262,6 +1279,7 @@ alias|crew_alias --go
 function|crew_function --go
 construct|( crewtool --go )
 unresolved|crewtool-does-not-exist --go
+missing-path|/missing/crewtool --go
 EOF
   pass "unpinnable raw launches fail closed before endpoint creation"
 }

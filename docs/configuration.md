@@ -469,10 +469,9 @@ A pin can carry any command name - a pinned Node prefix is exactly where a globa
 The crewmate `PATH` Firstmate exports therefore carries no manifest-supplied entry at all, and the whole launch line resolves from Firstmate's own resolution order as a property of the line rather than as a list of remembered words.
 The pin is applied instead by `bin/fm-launch-pinned.sh`, which is named by an absolute path, resolves the launch command against that un-pinned `PATH`, and only then exports the pin for the agent and every process it starts.
 So the pin still wins for the project's own tools inside the crewmate's session, which is the whole point of declaring it, and it decides nothing about what Firstmate itself launches.
-Every launch command still launches under a pin; nothing is refused for being unpinnable.
-A raw launch command receives the pin when Firstmate can resolve its first word to an executable on its own `PATH`, or when that word already carries a path.
-Otherwise the pin is not applied to it: a first word that is a shell builtin, an operator alias, a shell function, a shell construct, or simply absent would stop being expanded by the pane shell once the launcher preceded it, so the line is typed exactly as written instead.
-Such a launch still runs and still resolves against Firstmate's own `PATH`, but the project's own tools inside it resolve from the crewmate `PATH` rather than from the pin, and the spawn says so on stderr.
+A raw launch command receives a published pin only when Firstmate can resolve its first word to an executable on its own `PATH`, or verify a slash-containing first word as an executable path before endpoint creation.
+When an applicable manifest may publish `path_prepend`, a raw first word that is a shell builtin, an operator alias, a shell function, a shell construct, an unresolved name, or a non-executable path is refused before a worktree is leased because wrapping it would change its shell semantics or fail after endpoint creation.
+When no pin can be published, raw launch behavior is unchanged and the line is typed exactly as supplied.
 
 A harness turn-end hook is not part of the launch line - it is a command Firstmate writes into a file the harness runs from inside the crewmate's session, where the pin is in effect by design - so those commands are pinned in their own right.
 The shell a hook runs, the hook script's own interpreter, and the `touch` that marks the turn are all named by the absolute path Firstmate resolved from its own `PATH`, for every harness that has a hook.

@@ -2701,7 +2701,8 @@ fi
 # ...` by construction, so the launcher can always be inserted ahead of it. A raw
 # launch command is the operator's own shell text, and it qualifies only when
 # firstmate can itself resolve its first word to an executable - the same
-# `type -P` lookup the hook pins use, or a slash that needs no lookup at all.
+# `type -P` lookup the hook pins use, or an executable path checked before the
+# endpoint is created.
 #
 # The lookup is the whole test rather than a shape test, because inserting the
 # launcher ahead of the line REMOVES the pane shell's own expansion of that word:
@@ -2727,6 +2728,15 @@ if [ "$RAW_LAUNCH" = 1 ]; then
       ;;
   esac
 fi
+
+spawn_raw_launch_path_executable() {
+  local target=$RAW_LAUNCH_WORD
+  case "$target" in
+    /*) ;;
+    *) target="$PROJ_ABS/$target" ;;
+  esac
+  [ -f "$target" ] && [ -x "$target" ]
+}
 
 # config/secondmate-harness may carry optional model/effort tokens alongside the
 # harness ("<harness> [<model>] [<effort>]"). They apply only when this is a
@@ -3412,6 +3422,15 @@ spawn_refuse_unpinnable_launch() {
   fi
   if [ -z "$blocker" ] && [ "$LAUNCH_PIN_DELIVERABLE" != 1 ]; then
     blocker="its raw launch command cannot safely receive the pin because ${LAUNCH_PIN_UNDELIVERABLE_REASON:-firstmate could not resolve it to one executable}"
+  fi
+  if [ -z "$blocker" ] && [ "$RAW_LAUNCH" = 1 ]; then
+    case "$RAW_LAUNCH_WORD" in
+      */*)
+        if ! spawn_raw_launch_path_executable; then
+          blocker="its raw launch command cannot safely receive the pin because firstmate cannot resolve its first word '$RAW_LAUNCH_WORD' to an executable path before endpoint creation"
+        fi
+        ;;
+    esac
   fi
   [ -n "$blocker" ] || return 0
   spawn_project_manifest_may_pin || return 0
@@ -4360,6 +4379,14 @@ spawn_pin_launch_line() {
     echo "error: refusing to launch fm-$ID with a proven runtime pin because ${LAUNCH_PIN_UNDELIVERABLE_REASON:-firstmate could not resolve its raw launch command to one executable}" >&2
     return 1
   fi
+  case "$RAW_LAUNCH:$RAW_LAUNCH_WORD" in
+    1:*/*)
+      if ! spawn_raw_launch_path_executable; then
+        echo "error: refusing to launch fm-$ID with a proven runtime pin because firstmate cannot resolve its raw launch command to an executable path" >&2
+        return 1
+      fi
+      ;;
+  esac
   LAUNCH="$(shell_quote "$launcher") $(shell_quote "$session_path_prepend") $LAUNCH"
   return 0
 }

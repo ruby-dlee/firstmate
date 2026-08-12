@@ -3,7 +3,7 @@
 # Spawn a direct report: a new crewmate in a treehouse worktree, an eligible
 # pre-cutover Orca direct recovery with empirically verified provider authority,
 # or a secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] [--no-provision] [--backlog-row-exemption <test-fixture|tracking-backend-repair>] [--scout]
+# Usage: fm-spawn.sh <task-id> <project-dir> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] [--backlog-row-exemption <test-fixture|tracking-backend-repair>] [--provision|--no-provision] [--scout]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--account-pool <pool>] [--account-profile <profile>] [--no-account-routing] --secondmate
 #        fm-spawn.sh <task-id> --recover-direct-account
 #        fm-spawn.sh <task-id> (--resume-account|--continue-account) [--harness <claude|codex>] [--account-pool <pool>] [--account-profile <profile>]
@@ -73,6 +73,23 @@
 #   Agent Fleet selection input for secondmate agents when routing is enabled. A
 #   secondmate's own crewmates use inherited crewmate dispatch/routing policy, not
 #   this setting.
+#   --provision forces worktree provisioning for this spawn, including a kind an
+#   explicit manifest excludes, and rebuilds instead of reusing matching
+#   fingerprints; --no-provision skips it entirely. Both apply to every pair of a
+#   batch. Without either, declaration-driven provisioning runs for every newly
+#   leased non-Orca ship/scout worktree unless a config/provision/<project>.json
+#   manifest overrides it with project-specific checks and policy.
+#   fm-provision-lib.sh owns the automatic detection and capability-gap contract;
+#   fm-provision.sh owns the explicit manifest readiness contract and exit codes.
+#   This script hands either engine's proven runtime pin to the crewmate SESSION
+#   environment through bin/fm-launch-pinned.sh. No project-selected pin joins
+#   the PATH that resolves the launch line, so no project directory can decide
+#   which harness, wrapper, interpreter, shell, or hook command Firstmate runs.
+#   An explicit manifest policy is read BEFORE its run; a resolved block aborts a
+#   verdict-less death and every non-ready result, and an unreadable policy also
+#   resolves to block. The explicit-manifest path re-proves the leased worktree
+#   returnable after running arbitrary declared steps; the automatic path refuses
+#   every install or report path not already ignored before it writes.
 #   --resume-account and --continue-account are legacy recovery paths only for
 #   existing account_profile metadata. They retain the sealed Agent Fleet
 #   session/lease behavior needed to recover those already-managed generations;
@@ -151,7 +168,7 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
-  sed -n '2,78p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,96p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -159,6 +176,10 @@ case "${1:-}" in
 esac
 
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+# Immutable command-resolution seed. Provisioning may temporarily lead PATH with
+# a project runtime while it installs dependencies; no later Firstmate launch or
+# hook resolution may inherit that project-selected order.
+FIRSTMATE_LAUNCH_PATH=$PATH
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
@@ -373,6 +394,10 @@ BACKLOG_ROW_EXEMPTION_SET=0
 RESUME_ACCOUNT=0
 CONTINUE_ACCOUNT=0
 DIRECT_ACCOUNT_RECOVERY=0
+PROVISION_MODE=auto
+PROVISION_PATH_PREPEND=
+PROVISION_MANIFEST=
+PROVISION_POLICY=
 CONTINUATION_LAUNCH_DIR=
 CONTINUATION_PROMPT_FILE=
 CONTINUATION_PROMPT_DIR_ID=
@@ -420,7 +445,8 @@ for a in "$@"; do
     --account-profile) want_value=account-profile ;;
     --account-profile=*) ACCOUNT_PROFILE=${a#--account-profile=}; ACCOUNT_PROFILE_SET=1 ;;
     --no-account-routing) NO_ACCOUNT_ROUTING=1 ;;
-    --no-provision) NO_PROVISION=1 ;;
+    --provision) NO_PROVISION=0; PROVISION_MODE=force ;;
+    --no-provision) NO_PROVISION=1; PROVISION_MODE=off ;;
     --backlog-row-exemption) want_value='backlog-row-exemption' ;;
     --backlog-row-exemption=*) BACKLOG_ROW_EXEMPTION=${a#--backlog-row-exemption=}; BACKLOG_ROW_EXEMPTION_SET=1 ;;
     --resume-account) RESUME_ACCOUNT=1 ;;
@@ -2136,8 +2162,11 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$ACCOUNT_POOL" ] || shared_args+=(--account-pool "$ACCOUNT_POOL")
   [ -z "$ACCOUNT_PROFILE" ] || shared_args+=(--account-profile "$ACCOUNT_PROFILE")
   [ "$NO_ACCOUNT_ROUTING" = 0 ] || shared_args+=(--no-account-routing)
-  [ "$NO_PROVISION" = 0 ] || shared_args+=(--no-provision)
   [ -z "$BACKLOG_ROW_EXEMPTION" ] || shared_args+=(--backlog-row-exemption "$BACKLOG_ROW_EXEMPTION")
+  case "$PROVISION_MODE" in
+    force) shared_args+=(--provision) ;;
+    off) shared_args+=(--no-provision) ;;
+  esac
   if [ "$RECOVERY_ACCOUNT" = 1 ]; then
     echo "error: batch dispatch does not support account recovery; recover tasks individually" >&2
     exit 1
@@ -2503,10 +2532,10 @@ launch_template() {
       if [ "$kind" = secondmate ]; then
         printf '%s' '__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(cat __BRIEF__)"'
       else
-        printf '%s' '__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(cat __BRIEF__)"'
+        printf '%s' '__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"__BASHBIN__\",\"-c\",\"__TOUCHBIN__ __TURNEND__\"]" "$(cat __BRIEF__)"'
       fi
       ;;
-    opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(cat __BRIEF__)"' ;;
+    opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' __AGENT__ __MODELFLAG__--prompt "$(cat __BRIEF__)"' ;;
     # pi: --approve ("Trust project-local files for this run") is what keeps an
     # unattended pi agent off the project-trust dialog. Pi has no permission system,
     # but it DOES gate every not-yet-trusted directory behind that dialog on first
@@ -2545,9 +2574,49 @@ launch_template() {
     # --dangerously-skip-permissions. grok's turn-end signal does NOT ride the
     # launch command - it is a Stop-event hook installed below (global hook +
     # per-task pointer), so the template is identical for ship/scout/secondmate.
-    grok) printf '%s' 'grok --always-approve __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
+    grok) printf '%s' '__AGENT__ --always-approve __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"' ;;
     *) return 1 ;;
   esac
+}
+
+# spawn_own_path_bin <name>: the absolute executable <name> resolves to on
+# FIRSTMATE's own PATH. `type -P` is a PATH lookup only, so a shell function or
+# alias of the same name cannot answer for the binary.
+spawn_own_path_bin() {
+  local found
+  found=$(type -P "$1" 2>/dev/null || true)
+  case "$found" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  [ -x "$found" ] || return 1
+  printf '%s' "$found"
+}
+
+# spawn_raw_launch_word <command>: the command word of a raw launch command -
+# the first token that is not a leading VAR=value assignment. Returns non-zero
+# when the line names no command word at all.
+RAW_LAUNCH_WORD=
+spawn_raw_launch_word() {
+  local rest=$1 lead token
+  RAW_LAUNCH_WORD=
+  while [ -n "$rest" ]; do
+    lead=${rest%%[![:space:]]*}
+    if [ -n "$lead" ]; then
+      rest=${rest#"$lead"}
+      continue
+    fi
+    token=${rest%%[[:space:]]*}
+    case "$token" in
+      [A-Za-z_]*=*)
+        rest=${rest#"$token"}
+        continue
+        ;;
+    esac
+    RAW_LAUNCH_WORD=$token
+    return 0
+  done
+  return 1
 }
 
 case "$ARG3" in
@@ -2555,9 +2624,9 @@ case "$ARG3" in
     LAUNCH=$ARG3
     RAW_LAUNCH=1
     HARNESS=""
-    for word in $LAUNCH; do
-      case "$word" in [A-Za-z_]*=*) continue ;; *) HARNESS=$(basename "$word"); break ;; esac
-    done
+    if spawn_raw_launch_word "$LAUNCH"; then
+      HARNESS=$(basename "$RAW_LAUNCH_WORD")
+    fi
     ;;
   '')
     # No explicit harness: resolve from config. A secondmate AGENT launches on the
@@ -2586,6 +2655,79 @@ case "$ARG3" in
     LAUNCH=$(launch_template "$HARNESS" "$KIND") || { echo "error: unknown harness '$HARNESS'; pass a raw launch command to use an unverified adapter" >&2; exit 1; }
     ;;
 esac
+
+# A provisioning manifest may declare a runtime directory that has to lead the
+# PATH the crewmate's own tools resolve against. Nothing firstmate NAMES may be
+# decided by that directory, and the way that is guaranteed here is structural
+# rather than word-by-word: the crewmate PATH this spawn exports carries no
+# manifest-supplied entry at all (crew_tool_path below), so the whole launch line
+# resolves from firstmate's own resolution order whatever words it contains, and
+# the pin is applied by bin/fm-launch-pinned.sh AFTER that resolution, to the
+# environment the agent and its children inherit. A launch line therefore needs
+# no per-word pinning, and a raw launch command needs no vetting to be launchable.
+#
+# WHAT THAT DOES NOT COVER, and why these two lookups remain: a harness turn-end
+# hook is not part of the launch line. It is a command firstmate writes into a
+# file the harness executes from INSIDE the crewmate's session, where the pin is
+# in effect by design. Those commands - the shell a hook runs and the `touch`
+# that marks the turn - are firstmate's, not the project's, so they are resolved
+# here, on firstmate's own PATH, before any manifest value exists.
+#
+# LAUNCH_PIN_REFUSAL records which one could not be resolved, so the pre-lease
+# gate reports what actually happened rather than asserting the outcome of a
+# lookup that may never have run.
+BASH_BIN=
+TOUCH_BIN=
+LAUNCH_PIN_REFUSAL=
+BASH_BIN=$(spawn_own_path_bin bash) || BASH_BIN=
+TOUCH_BIN=$(spawn_own_path_bin touch) || TOUCH_BIN=
+# Both paths are embedded in JSON strings inside double-quoted shell words
+# (codex's notify hook, claude's Stop hook), so a path carrying a quote or a
+# backslash cannot be transported there even though it exists.
+case "$BASH_BIN" in
+  *[\"\\\']*) BASH_BIN= ;;
+esac
+case "$TOUCH_BIN" in
+  *[\"\\\']*) TOUCH_BIN= ;;
+esac
+if [ -z "$BASH_BIN" ]; then
+  LAUNCH_PIN_REFUSAL="bash, which a harness turn-end hook runs inside the crewmate's session, did not resolve on firstmate's own PATH to a path a hook file can carry"
+elif [ -z "$TOUCH_BIN" ]; then
+  LAUNCH_PIN_REFUSAL="touch, which every harness turn-end hook runs inside the crewmate's session, did not resolve on firstmate's own PATH to a path a hook file can carry"
+fi
+
+# Whether a proven pin can be DELIVERED to this launch line is a property of the
+# line, decided once, here. Every templated launch is `[VAR=value ...] <command>
+# ...` by construction, so the launcher can always be inserted ahead of it. A raw
+# launch command is the operator's own shell text, and it qualifies only when
+# firstmate can itself resolve its first word to an executable - the same
+# `type -P` lookup the hook pins use, or a slash that needs no lookup at all.
+#
+# The lookup is the whole test rather than a shape test, because inserting the
+# launcher ahead of the line REMOVES the pane shell's own expansion of that word:
+# a shell builtin, an operator alias, or a shell function stops being expanded and
+# becomes an argument the launcher then cannot execute. Anything firstmate cannot
+# resolve is therefore left exactly as the operator wrote it and simply does not
+# receive the pin. Refusing instead would cost a spawn shape that works today and
+# buy nothing: with no manifest-supplied entry on the crewmate PATH, an unpinned
+# line already resolves entirely against firstmate's own order.
+LAUNCH_PIN_DELIVERABLE=1
+LAUNCH_PIN_UNDELIVERABLE_REASON=
+if [ "$RAW_LAUNCH" = 1 ]; then
+  case "$RAW_LAUNCH_WORD" in
+    '')
+      LAUNCH_PIN_DELIVERABLE=0
+      LAUNCH_PIN_UNDELIVERABLE_REASON="it names no command word to hand the launcher"
+      ;;
+    */*) ;;
+    *)
+      if ! spawn_own_path_bin "$RAW_LAUNCH_WORD" >/dev/null; then
+        LAUNCH_PIN_DELIVERABLE=0
+        LAUNCH_PIN_UNDELIVERABLE_REASON="firstmate cannot resolve its first word '$RAW_LAUNCH_WORD' to an executable on its own PATH, so it is a shell builtin, an alias, a function, a shell construct, or absent"
+      fi
+      ;;
+  esac
+fi
 
 # config/secondmate-harness may carry optional model/effort tokens alongside the
 # harness ("<harness> [<model>] [<effort>]"). They apply only when this is a
@@ -3183,6 +3325,101 @@ fi
 PROJ_ABS_REAL=$(cd "$PROJ_ABS" 2>/dev/null && pwd -P) || PROJ_ABS_REAL="$PROJ_ABS"
 PROJ_ABS=$PROJ_ABS_REAL
 
+# Whether this project can publish a runtime pin is knowable from its manifest
+# alone, and so is whether every command firstmate will name in the launch line
+# resolved. Deciding both HERE - before the Treehouse lease and before any
+# install runs - is the difference between a refusal that costs nothing and one
+# that strands a dirty lease the pool then has to skip. The manifest read is the
+# same one the provisioner would do, and it is answered without the provisioner
+# so a broken provisioner cannot make an opted-in project look untouched.
+# fm-provision owns where a project's manifest lives, so the path is asked of it
+# rather than rebuilt here. --manifest-path is a pure path computation with no
+# side effects, and it is asked through the interpreter rather than through the
+# provisioner's exec bit on purpose: a provisioner that lost that bit must look
+# like a broken provisioner, which the resolved policy then governs, and never
+# like a project that never opted in. Running the provisioner still requires the
+# bit.
+#
+# spawn_provision_manifest_derived is the same derivation fm-provision.sh's
+# manifest_for_project applies, kept here as a FALLBACK for the one question the
+# provisioner cannot answer: where the manifest is when the provisioner itself is
+# gone. Without it a missing file is indistinguishable from a project that never
+# opted in, and an opted-in project would fail OPEN under block for the file's
+# absence rather than for anything about the project. Keep it in step with
+# manifest_for_project; docs/configuration.md owns the location.
+spawn_provision_manifest_derived() {
+  local name
+  name=$(basename "$PROJ_ABS") || return 1
+  [ -n "$name" ] || return 1
+  printf '%s/provision/%s.json\n' "$CONFIG" "$name"
+}
+
+spawn_provision_manifest_path() {
+  local path=''
+  if [ -f "$SCRIPT_DIR/fm-provision.sh" ]; then
+    path=$("${BASH:-bash}" "$SCRIPT_DIR/fm-provision.sh" --manifest-path "$PROJ_ABS" 2>/dev/null) || path=
+  fi
+  [ -n "$path" ] || path=$(spawn_provision_manifest_derived) || return 1
+  [ -n "$path" ] || return 1
+  printf '%s\n' "$path"
+}
+
+# Whether THIS spawn can publish a pin, not merely whether the project ever
+# could. A manifest's kinds gate is the provisioner's own skip rule, and a skipped
+# run publishes nothing, so a scout on a `"kinds": ["ship"]` project is in exactly
+# the position of a project with no manifest and must not inherit a refusal it can
+# never trigger. --provision overrides that gate in the provisioner, so it
+# overrides it here too. An unreadable or malformed manifest - including a kinds
+# field that is not an array of strings - is treated as one that could pin, so an
+# unreadable file never buys a launch a readable one would refuse.
+spawn_project_manifest_may_pin() {
+  local manifest kinds
+  manifest=$(spawn_provision_manifest_path) || return 1
+  [ -n "$manifest" ] && [ -f "$manifest" ] || return 1
+  jq -e . "$manifest" >/dev/null 2>&1 || return 0
+  if ! jq -e '(.path_prepend | if type == "array" then (length > 0) else . != null end)' \
+    "$manifest" >/dev/null 2>&1; then
+    return 1
+  fi
+  [ "$PROVISION_MODE" != force ] || return 0
+  kinds=$(jq -r '(.kinds // ["ship"])
+      | if type == "array" and (all(type == "string")) then join(" ") else "" end' \
+    "$manifest" 2>/dev/null) || kinds=
+  [ -n "$kinds" ] || return 0
+  case " $kinds " in
+    *" $KIND "*) return 0 ;;
+  esac
+  return 1
+}
+
+# The launch LINE needs no pre-lease vetting: it resolves against firstmate's own
+# PATH by construction. What is vetted here is everything a published pin still
+# needs in order to reach the crewmate's session without a manifest-supplied
+# directory deciding anything - the turn-end hook firstmate writes for the harness
+# to run from inside that session, and the launcher that carries the pin into the
+# agent's environment. Deciding both here, before the Treehouse lease and before
+# any install runs, is the difference between a refusal that costs nothing and one
+# that strands a dirty lease the pool then has to skip.
+#
+# Every blocker here is fail-closed: a pin that was proven and cannot be carried
+# safely refuses the spawn, and is never downgraded to an unpinned launch.
+spawn_refuse_unpinnable_launch() {
+  local launcher="$SCRIPT_DIR/fm-launch-pinned.sh" blocker=$LAUNCH_PIN_REFUSAL
+  [ "$PROVISION_MODE" != off ] || return 0
+  [ "$KIND" != secondmate ] || return 0
+  [ "$BACKEND" != orca ] || return 0
+  if [ -z "$blocker" ] && { [ ! -f "$launcher" ] || [ ! -x "$launcher" ]; }; then
+    blocker="the pinned launcher $launcher, which is what carries a proven pin into the agent's environment, is missing or not executable"
+  fi
+  [ -n "$blocker" ] || return 0
+  spawn_project_manifest_may_pin || return 0
+  echo "error: refusing to spawn fm-$ID before leasing a worktree: $(basename "$PROJ_ABS")'s provisioning manifest declares path_prepend, which leads the crewmate's session PATH, and $blocker" >&2
+  echo "       a proven pin must reach that session without a manifest-supplied directory deciding what firstmate itself runs, so this is refused before the lease rather than after it" >&2
+  return 1
+}
+
+spawn_refuse_unpinnable_launch || exit 1
+
 real_path_or_raw() {  # <path>
   local path=$1 real
   if real=$(cd "$path" 2>/dev/null && pwd -P); then
@@ -3322,8 +3559,9 @@ fm_provision_register_exclude() {
 # rollback is about to delete would be pointing at nothing.
 PROVISION_SUMMARY=
 PROVISION_PATH_PREFIX=
+AUTO_PROVISION_RAN=0
 spawn_provision_worktree() {
-  local mode
+  local mode manifest='' provision_invocation_path=$PATH
   # Before either opt-out, because an opted-out lease is the one that would
   # otherwise read the previous task's report as a description of its own
   # worktree - the more provisioning does here, the louder its absence must be.
@@ -3340,10 +3578,18 @@ spawn_provision_worktree() {
     echo "error: config/worktree-provision must contain exactly 'on' or 'off'" >&2
     return 1
   }
-  if [ "$mode" = off ]; then
+  if [ "$mode" = off ] && [ "$PROVISION_MODE" != force ]; then
+    PROVISION_MODE=off
     PROVISION_SUMMARY=off
     return 0
   fi
+  manifest=$(spawn_provision_manifest_path 2>/dev/null) || manifest=
+  if [ -n "$manifest" ] && [ -f "$manifest" ]; then
+    PROVISION_SUMMARY=manifest:pending
+    return 0
+  fi
+  rm -f "$STATE/$ID.provision" "$STATE/$ID.provision.log" || return 1
+  AUTO_PROVISION_RAN=1
   PROVISION_LOG="$STATE/$ID.provision.log"
   if [ -e "$PROVISION_LOG" ] || [ -L "$PROVISION_LOG" ]; then
     ORIGINAL_PROVISION_LOG_PRESENT=1
@@ -3351,12 +3597,16 @@ spawn_provision_worktree() {
     ORIGINAL_PROVISION_LOG_PRESENT=0
   fi
   if ! fm_provision_worktree "$WT" "$STATE/provision-cache" "$PROVISION_LOG" "$DATA/$ID/brief.md"; then
+    PATH=$provision_invocation_path
+    export PATH
     if [ -s "$PROVISION_LOG" ]; then
       echo "error: last 40 lines of the provisioning log for $ID (not retained past this refused spawn):" >&2
       tail -n 40 "$PROVISION_LOG" >&2
     fi
     return 1
   fi
+  PATH=$provision_invocation_path
+  export PATH
   PROVISION_SUMMARY=$FM_PROVISION_SUMMARY
   PROVISION_PATH_PREFIX=$FM_PROVISION_PATH_PREFIX
   return 0
@@ -3424,6 +3674,274 @@ if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$RECOVERY_ACCOUNT" 
   WORKTREE_RETAIN_ON_ABORT=0
   spawn_provision_worktree || exit 1
 fi
+
+# Worktree provisioning. A Treehouse lease carries no gitignored environment, so
+# without this a crewmate cannot run the project's own checks and has to borrow
+# evidence from a second agent in a different worktree. This is the one seam
+# where the worktree is proven isolated and clean and no agent is running in it
+# yet, so it is the only place the environment can be built without either
+# racing an agent or dirtying the tree an agent is about to branch from.
+#
+# fm-provision.sh owns everything project-specific through a per-project
+# manifest; this call stays project-agnostic. After prior evidence is retired,
+# the engine's no-manifest path is one file test and does no environment work.
+# fm-provision.sh's header owns the readiness contract and the exit codes. Prior
+# evidence is retired before every attempt because an unverified readiness claim
+# is more harmful than a lost diagnostic. Only status=ready publishes readiness.
+#
+# A failure follows the manifest's on_failure policy, and the policy resolved
+# from the manifest BEFORE the run is consulted on every path that could still
+# launch an agent, because resolving a policy is not the same as honoring it.
+# A resolved block aborts whatever arrives: a verdict-less death - signal death,
+# a usage error, a gate refusal, any exit nobody anticipated - and equally an
+# exit 3 that did carry a verdict, so the two scripts cannot silently disagree
+# about what block means. Exit 3 with a verdict continues only under a resolved
+# warn, which is the documented non-ready path and stays exactly as it was.
+# Rewrite the brief's delimited provisioning section through the repo's pinned
+# task-file transaction, the same primitive every other brief mutator uses. It
+# pins the task directory by fd and identity, refuses symlinks, stages in the
+# brief's own directory, preserves the brief's mode, and detects concurrent
+# modification - none of which a mktemp-and-mv across STATE and DATA can do.
+# An empty replacement section retires the section instead of rewriting it.
+spawn_brief_provision_section() {  # <section-text>
+  [ -n "${BRIEF:-}" ] && [ -f "$BRIEF" ] || return 1
+  [ "$BRIEF" = "$DATA/$ID/brief.md" ] || return 1
+  FM_FILE_TRANSACTION_LIB="$SCRIPT_DIR/fm-file-transaction.cjs" \
+    FM_PROVISION_BRIEF_SECTION="$1" \
+    node - "$DATA" "$ID" brief.md <<'JS'
+const { pinnedTaskFileTransaction } = require(process.env.FM_FILE_TRANSACTION_LIB);
+
+const [dataDir, taskId, fileName] = process.argv.slice(2);
+const BEGIN = '<!-- fm-provision:begin -->';
+const END = '<!-- fm-provision:end -->';
+const section = process.env.FM_PROVISION_BRIEF_SECTION || '';
+
+// Both delimiters and everything between them are dropped, along with the blank
+// lines that separated the section from the body, so writing and retiring are
+// BYTE-idempotent: neither copies nor whitespace accumulate across respawns.
+function bodyWithoutSection(text) {
+  const lines = text.split('\n');
+  const kept = [];
+  let skip = false;
+  for (const line of lines) {
+    if (line === BEGIN) skip = true;
+    if (!skip) kept.push(line);
+    if (line === END) skip = false;
+  }
+  while (kept.length && kept[kept.length - 1] === '') kept.pop();
+  return kept.length ? `${kept.join('\n')}\n` : '';
+}
+
+function rewrite(text) {
+  const body = bodyWithoutSection(text);
+  if (!section) return Buffer.from(body);
+  const separated = section.startsWith('\n') ? section : `\n${section}`;
+  const terminated = separated.endsWith('\n') ? separated : `${separated}\n`;
+  return Buffer.from(body ? `${body}${terminated}` : terminated.replace(/^\n+/, ''));
+}
+
+try {
+  pinnedTaskFileTransaction(dataDir, taskId, fileName, (content) =>
+    rewrite(content.toString('utf8')));
+} catch (error) {
+  console.error(`error: provisioning brief transaction failed for ${taskId}/${fileName}: ${error.message}`);
+  process.exitCode = 1;
+}
+JS
+}
+
+spawn_retire_provision_evidence() {  # <preserve-auto-log:0|1>
+  local preserve_auto_log=${1:-0} grep_status=0
+  PROVISION_PATH_PREPEND=
+  rm -f "$STATE/$ID.provision" || return 1
+  [ "$preserve_auto_log" = 1 ] || rm -f "$STATE/$ID.provision.log" || return 1
+  [ -n "${BRIEF:-}" ] && [ -f "$BRIEF" ] || return 0
+  grep -q '^<!-- fm-provision:begin -->$' "$BRIEF" 2>/dev/null || grep_status=$?
+  case "$grep_status" in
+    1) return 0 ;;
+    0) ;;
+    *) return 1 ;;
+  esac
+  spawn_brief_provision_section '' || return 1
+}
+
+# Resolve the manifest and its failure policy BEFORE fm-provision runs, so a
+# provisioner that dies without a verdict can never leave the policy unknown.
+# Returns non-zero when there is nothing to provision. fm-provision owns where a
+# project's manifest lives, so the path is asked of it rather than rebuilt here;
+# the absent-manifest default stays exactly one file-existence check away from
+# skipping, which is what leaves every non-opted-in project untouched.
+# spawn_provision_manifest_path, which answers where this project's manifest
+# lives, is defined with the pre-lease pin gate further up, because that gate is
+# the earliest caller.
+spawn_resolve_provision_policy() {
+  local raw
+  PROVISION_MANIFEST=
+  PROVISION_POLICY=
+  PROVISION_MANIFEST=$(spawn_provision_manifest_path) || PROVISION_MANIFEST=
+  if [ -z "$PROVISION_MANIFEST" ]; then
+    echo "warning: skipping worktree provisioning for $ID because no manifest path could be resolved for $PROJ_ABS" >&2
+    return 1
+  fi
+  [ -f "$PROVISION_MANIFEST" ] || return 1
+  # An unreadable or unrecognized policy is exactly the ambiguity that must not
+  # fail open, so it resolves to block rather than to the warn default.
+  raw=$(jq -r '.on_failure // "warn"' "$PROVISION_MANIFEST" 2>/dev/null) || raw=
+  case "$raw" in
+    warn|block) PROVISION_POLICY=$raw ;;
+    *) PROVISION_POLICY=block ;;
+  esac
+  return 0
+}
+
+# Provisioning runs manifest-declared steps inside the lease, so the cleanliness
+# proven before the run is no longer proof. Re-prove it with the SAME predicate
+# the return path will later apply. This does not save the lease - residue is
+# still residue, so a refused spawn still leaves it dirty, retained rather than
+# returned, and skipped by pool preflight until someone attends to it. What it
+# buys is that no agent starts on a base that is no longer proven, and that the
+# residue is named at dispatch by the manifest step that caused it instead of
+# surfacing later as an unexplained shrinking pool. Only a worktree this spawn
+# leased and proved clean is re-proven; a recorded recovery worktree was never
+# proven clean here and carries the crewmate's own in-progress state.
+spawn_provisioned_worktree_still_returnable() {
+  [ "$WORKTREE_CREATED" = 1 ] || return 0
+  [ -n "$WORKTREE_EXPECTED_TIP" ] || return 0
+  "$SCRIPT_DIR/fm-checkout-refresh.sh" verify-returnable \
+    "$WT" "${PROJ_ABS_REAL:-$PROJ_ABS}" "$WORKTREE_EXPECTED_TIP"
+}
+
+# Make a failure firstmate itself concluded durable in the same place and shape
+# fm-provision's own verdict would have been, so a provisioner that died before
+# writing anything still leaves a diagnosable record.
+spawn_record_provision_failure() {  # <verdict-or-empty> <reason>
+  local verdict=$1 reason=$2 record=''
+  if [ -n "$verdict" ]; then
+    record=$(printf '%s' "$verdict" | jq -c --arg reason "$reason" --arg policy "$PROVISION_POLICY" \
+      '. + {status:"failed",reason:$reason,policy:$policy,path_prepend:""}' 2>/dev/null) || record=
+  fi
+  if [ -z "$record" ]; then
+    record=$(jq -c -n --arg reason "$reason" --arg policy "$PROVISION_POLICY" \
+      --arg manifest "$PROVISION_MANIFEST" --arg task "$ID" --arg worktree "$WT" \
+      '{schema:"fm-provision.v1",status:"failed",reason:$reason,policy:$policy,worktree:$worktree,manifest:$manifest,task:$task,log:"",path_prepend:"",components:[]}' \
+      2>/dev/null) || record=
+  fi
+  [ -n "$record" ] || record='{"schema":"fm-provision.v1","status":"failed","reason":"provisioning died without emitting a verdict","path_prepend":"","components":[]}'
+  printf '%s\n' "$record" > "$STATE/$ID.provision" 2>/dev/null || true
+  printf '%s' "$record"
+}
+
+provision_worktree() {
+  local status=0 verdict='' verdict_status='' reason='' banner_state='' residue=0 verdict_decides=0
+  spawn_retire_provision_evidence "$AUTO_PROVISION_RAN" || {
+    echo "error: could not retire stale provisioning evidence for $ID" >&2
+    return 1
+  }
+  [ "$PROVISION_MODE" != off ] || return 0
+  [ "$KIND" != secondmate ] || return 0
+  [ "$BACKEND" != orca ] || return 0
+  [ -n "${WT:-}" ] && [ -d "$WT" ] || return 0
+  spawn_resolve_provision_policy || return 0
+  # Checked AFTER the policy is known, and treated as a failure the policy
+  # governs. An opted-in project that cannot run its provisioner has exactly the
+  # unproven worktree its on_failure setting is about; skipping here instead
+  # would launch every crewmate unprovisioned with no banner and no durable
+  # verdict, including under block. The WT guard above is different in kind: it
+  # is a precondition for there being anything to provision at all.
+  if [ -x "$SCRIPT_DIR/fm-provision.sh" ]; then
+    local provision_args=(--task "$ID" --kind "$KIND")
+    [ "$PROVISION_MODE" != force ] || provision_args+=(--force)
+    verdict=$("$SCRIPT_DIR/fm-provision.sh" "$PROJ_ABS" "$WT" "${provision_args[@]}") || status=$?
+    if [ -n "$verdict" ]; then
+      verdict_status=$(printf '%s' "$verdict" | jq -r '.status // ""' 2>/dev/null || true)
+    fi
+    if [ "$status" -eq 0 ] && [ "$verdict_status" = skipped ]; then
+      PROVISION_SUMMARY=none
+      return 0
+    fi
+    spawn_provisioned_worktree_still_returnable || residue=1
+    if [ "$status" -eq 0 ] && [ "$verdict_status" = ready ] && [ "$residue" -eq 0 ]; then
+      PROVISION_PATH_PREPEND=$(printf '%s' "$verdict" | jq -r '.path_prepend // ""' 2>/dev/null || true)
+      PROVISION_SUMMARY=manifest:ready
+      spawn_brief_provision_note "$verdict" ready
+      return 0
+    fi
+  elif [ -e "$SCRIPT_DIR/fm-provision.sh" ]; then
+    status=126
+    reason="the provisioner $SCRIPT_DIR/fm-provision.sh is not executable, so this project's declared environment could not be built or proven"
+  else
+    status=127
+    reason="the provisioner $SCRIPT_DIR/fm-provision.sh is missing, so this project's declared environment could not be built or proven"
+  fi
+  PROVISION_PATH_PREPEND=
+  [ -n "$reason" ] || reason=$(printf '%s' "$verdict" | jq -r '.reason // ""' 2>/dev/null || true)
+  if [ "$residue" -eq 0 ] && [ -n "$verdict_status" ]; then
+    if [ "$status" -eq 4 ]; then
+      banner_state=aborting
+      verdict_decides=1
+    elif [ "$status" -eq 3 ] && [ "$PROVISION_POLICY" != block ]; then
+      banner_state=continuing
+      verdict_decides=1
+    fi
+  fi
+  if [ "$verdict_decides" -eq 0 ]; then
+    if [ "$residue" -eq 1 ]; then
+      reason="${reason:+$reason; }provisioning left $WT no longer provably clean, isolated, and at its expected detached tip, so it is not a safe base for this task"
+    elif [ -z "$reason" ] && [ -n "$verdict_status" ]; then
+      reason="provisioning exited $status with unrecognized status '$verdict_status'"
+    fi
+    [ -n "$reason" ] || reason="provisioning died without emitting a verdict (exit $status)"
+    verdict=$(spawn_record_provision_failure "$verdict" "$reason")
+    if [ "$PROVISION_POLICY" = block ]; then banner_state=aborting; else banner_state=continuing; fi
+  fi
+  [ -n "$reason" ] || reason="provisioning failed without a readable reason (exit $status)"
+  PROVISION_SUMMARY=manifest:failed
+  echo "################################################################" >&2
+  echo "# fm-spawn: WORKTREE PROVISIONING FAILED for fm-$ID ($banner_state)" >&2
+  echo "#   $reason" >&2
+  echo "#   log: $STATE/$ID.provision.log" >&2
+  echo "#   verdict: $STATE/$ID.provision" >&2
+  if [ "$banner_state" = aborting ]; then
+    echo "#   This project declares on_failure=block, so no agent is launched." >&2
+    echo "################################################################" >&2
+    return 1
+  fi
+  echo "#   The crewmate is launched anyway and told it cannot validate locally." >&2
+  echo "#   It must report blocked rather than substitute borrowed evidence." >&2
+  echo "################################################################" >&2
+  spawn_brief_provision_note "$verdict" failed
+  return 0
+}
+
+# The crewmate learns the readiness verdict where it actually reads: its brief.
+# The section is delimited and rewritten in place, so a recovery respawn refreshes
+# it rather than stacking copies.
+spawn_brief_provision_note() {
+  local verdict=$1 state=$2 section
+  [ -n "${BRIEF:-}" ] && [ -f "$BRIEF" ] || return 0
+  section=$({
+    printf '\n<!-- fm-provision:begin -->\n'
+    printf '\n# Environment readiness\n\n'
+    if [ "$state" = ready ]; then
+      printf 'This worktree was provisioned before you started, so you can run this project'"'"'s own checks here.\n'
+      printf 'Component status: %s\n' \
+        "$(printf '%s' "$verdict" | jq -r '[.components[]? | .name + "=" + .result] | join(", ")' 2>/dev/null)"
+      printf 'Use the environments in place rather than building your own; report what you actually ran.\n'
+    else
+      printf '**Provisioning this worktree FAILED, so the project'"'"'s local checks may not run here.**\n\n'
+      printf 'Reason: %s\n\n' "$(printf '%s' "$verdict" | jq -r '.reason // "unknown"' 2>/dev/null)"
+      printf 'Full log: %s\n\n' "$STATE/$ID.provision.log"
+      printf 'Do the work, but do NOT report validation you did not perform.\n'
+      printf 'If you cannot run the checks, append a blocked status naming what failed, and stop.\n'
+    fi
+    printf '\n<!-- fm-provision:end -->\n'
+  })
+  spawn_brief_provision_section "$section" \
+    || echo "warning: could not record the provisioning readiness note in $BRIEF for $ID" >&2
+  return 0
+}
+
+provision_worktree || exit 1
 
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
@@ -3525,21 +4043,17 @@ PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=
 # reach. The standard locations are appended for the case where firstmate itself was
 # launched with a thin PATH; missing directories and duplicates are dropped.
 #
-# PROVISION_PATH_PREFIX leads when provisioning pinned a runtime the project
-# declares (e.g. a .nvmrc Node): the crewmate must validate on the SAME runtime
-# its dependencies were installed against, or native modules load against the
-# wrong ABI and the lane cannot run its own checks even though node_modules is
-# present (data/v3-env-repair-e3/report.md, 2026-08-05). That prefix holds
-# EXACTLY node, npm, npx, and corepack (fm_provision_node_path_prefix), never a
-# version-manager bin directory - such a directory also holds every globally
-# npm-installed CLI for that Node, including the harnesses launched below, so
-# leading with it would repoint `claude` or `codex` at whichever copy sits under
-# the pinned runtime. The invariant above therefore still holds for every
-# command except the Node toolchain the pin exists to fix.
+# No project-selected runtime path is part of this seed, on either the
+# exported-PATH or HERDR_AGENT_ENV channel. This PATH is what the pane shell
+# holds while it evaluates firstmate's typed launch line, so putting either an
+# explicit manifest path_prepend or an auto-detected Node pin here would let the
+# project decide which binary a bare harness, wrapper, or interpreter word means.
+# Both pins are applied by bin/fm-launch-pinned.sh only after the launch command
+# has resolved, so the project's tools inside the session still see them first.
 crew_tool_path() {
   local seed dir out='' brew=/opt/homebrew
   [ -d "$brew" ] || brew=/usr/local
-  seed="${PROVISION_PATH_PREFIX:+$PROVISION_PATH_PREFIX:}$PATH:$HOME/.local/bin:$brew/bin:$brew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  seed="$FIRSTMATE_LAUNCH_PATH:$HOME/.local/bin:$brew/bin:$brew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
   local IFS=:
   for dir in $seed; do
     [ -n "$dir" ] || continue
@@ -3639,13 +4153,36 @@ mkdir -p "$STATE"
 fm_account_real_directory "$STATE" || { echo "error: unsafe state directory at $STATE" >&2; exit 1; }
 STATE_REAL=$(cd "$STATE" && pwd -P)
 TURNEND="$STATE_REAL/$ID.turn-ended"
+# Every command named in a turn-end hook is firstmate's, not the project's, and
+# every one of them runs from INSIDE the crewmate's session, where a published
+# provisioning pin leads PATH by design. So each is named by the absolute path
+# firstmate resolved on its own PATH before any manifest value existed. This is
+# the one channel the structural launch-line fix does not cover, because a hook
+# is not part of the launch line.
+#
+# The bare forms below are the historic ones and are reachable only when no pin
+# was published, where nothing outside firstmate's own resolution order is in
+# play. A spawn that DID publish one refuses here rather than writing a hook a
+# manifest directory could answer for; the pre-lease gate already refused the
+# same spawn before it cost a lease, so this is the fail-closed proof at the
+# point of use, not the primary check.
+if [ -n "$PROVISION_PATH_PREPEND" ] && { [ -z "$BASH_BIN" ] || [ -z "$TOUCH_BIN" ]; }; then
+  hook_pin_refusal=$LAUNCH_PIN_REFUSAL
+  [ -n "$hook_pin_refusal" ] || hook_pin_refusal="a command it names did not resolve on firstmate's own PATH"
+  echo "error: refusing to write fm-$ID's turn-end hook under a provisioning runtime pin because $hook_pin_refusal" >&2
+  exit 1
+fi
+HOOK_SHEBANG="#!${BASH_BIN:-/usr/bin/env bash}"
+HOOK_BASH_WORD=bash
+[ -z "$BASH_BIN" ] || HOOK_BASH_WORD=$(shell_quote "$BASH_BIN")
+HOOK_TOUCH=${TOUCH_BIN:-touch}
 if [ "$KIND" != secondmate ]; then
   case "$HARNESS" in
     claude*)
       if [ "$ACCOUNT_EFFECTIVE_MODE" != enforce ]; then
         mkdir -p "$WT/.claude"
         cat > "$WT/.claude/settings.local.json" <<EOF
-{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"touch '$TURNEND'"}]}]}}
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"$(json_escape "$HOOK_TOUCH") '$TURNEND'"}]}]}}
 EOF
         exclude_path '.claude/settings.local.json' \
           || echo "warning: could not exclude .claude/settings.local.json from git's view" >&2
@@ -3656,7 +4193,7 @@ EOF
       cat > "$WT/.opencode/plugins/fm-turn-end.js" <<EOF
 export const FmTurnEnd = async ({ \$ }) => ({
   event: async ({ event }) => {
-    if (event.type === "session.idle") await \$\`touch $TURNEND\`
+    if (event.type === "session.idle") await \$\`$HOOK_TOUCH $TURNEND\`
   },
 })
 EOF
@@ -3674,7 +4211,7 @@ EOF
 // every turn boundary so an idle crewmate is surfaced, not just at shutdown.
 import { execFile } from "node:child_process";
 export default function (pi: any) {
-  pi.on("turn_end", () => execFile("touch", ["$TURNEND"]));
+  pi.on("turn_end", () => execFile("$HOOK_TOUCH", ["$TURNEND"]));
 }
 EOF
       ;;
@@ -3706,9 +4243,16 @@ EOF
       printf '%s\n' "$TURNEND" > "$auth_file"
       printf '%s\n' "${auth_file##*/}" > "$STATE/$ID.grok-turnend-token"
       sq_grok_auth_dir=$(shell_quote "$GROK_AUTH_DIR")
+      # The hook script runs inside the crewmate's session, so its own
+      # interpreter and every command it names are absolute: the shebang cannot
+      # go through `env bash`, and reading the token and marking the turn cannot
+      # go through a bare `cat` or `touch`. `set -u` plus a fixed PATH is what
+      # makes that hold for the script as a whole rather than per line.
       cat > "$GROK_HOOKS_DIR/fm-turn-end.sh" <<EOF
-#!/usr/bin/env bash
+$HOOK_SHEBANG
 set -u
+PATH=/usr/bin:/bin
+export PATH
 auth_dir=$sq_grok_auth_dir
 workspace=\${GROK_WORKSPACE_ROOT:-}
 [ -n "\$workspace" ] || exit 0
@@ -3721,11 +4265,11 @@ case "\$token" in fm.????????????) : ;; *) exit 0 ;; esac
 case "\$token" in *[!A-Za-z0-9._-]*) exit 0 ;; esac
 t=\$(cat "\$auth_dir/\$token" 2>/dev/null) || exit 0
 case "\$t" in /*.turn-ended) : ;; *) exit 0 ;; esac
-touch "\$t" 2>/dev/null || true
+$HOOK_TOUCH "\$t" 2>/dev/null || true
 exit 0
 EOF
       chmod +x "$GROK_HOOKS_DIR/fm-turn-end.sh"
-      hook_command=$(json_escape "bash $(shell_quote "$GROK_HOOKS_DIR/fm-turn-end.sh")")
+      hook_command=$(json_escape "$HOOK_BASH_WORD $(shell_quote "$GROK_HOOKS_DIR/fm-turn-end.sh")")
       printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"%s"}]}]}}\n' "$hook_command" > "$GROK_HOOKS_DIR/fm-turn-end.json"
       printf 'token=%s\n' "${auth_file##*/}" > "$WT/.fm-grok-turnend"
       exclude_path '.fm-grok-turnend' \
@@ -3780,6 +4324,44 @@ if [ "$DIRECT_ACCOUNT_ROUTING" = 1 ]; then
 fi
 }
 
+# spawn_pin_launch_line: hand a proven runtime pin to the AGENT's environment
+# without it ever reaching the PATH that resolves this line.
+#
+# bin/fm-launch-pinned.sh is named by an absolute path, consumes the line's own
+# leading VAR=value prefix, resolves the command word against the un-pinned
+# crewmate PATH it inherits, and only then exports the pin for the agent and
+# every child it starts. So the project's tools still resolve the manifest's
+# runtime first, and no word of the launch line can be answered by it.
+#
+# This wraps the AGENT's own command rather than whatever ends up outermost, on
+# purpose: the secondmate `env` prefix and the continuation `python3` wrapper are
+# applied after this, which leaves them resolving from firstmate's own PATH too,
+# and leaves their target already absolute by the time the pin exists. Wrapping
+# the outermost command instead would put the pin ahead of PATH before those
+# wrappers resolved what they run, which is the wrapper-target hole again.
+spawn_pin_launch_line() {
+  local launcher="$SCRIPT_DIR/fm-launch-pinned.sh" session_path_prepend=
+  if [ -n "$PROVISION_PATH_PREPEND" ]; then
+    session_path_prepend=$PROVISION_PATH_PREPEND
+  fi
+  if [ -n "$PROVISION_PATH_PREFIX" ]; then
+    session_path_prepend="${session_path_prepend:+$session_path_prepend:}$PROVISION_PATH_PREFIX"
+  fi
+  [ -n "$session_path_prepend" ] || return 0
+  # The pre-lease gate refuses on whether a pin MAY be published; this knows one
+  # WAS. It stays fail-closed rather than downgrading to an unpinned launch.
+  if [ ! -f "$launcher" ] || [ ! -x "$launcher" ]; then
+    echo "error: refusing to launch fm-$ID with a provisioning runtime pin because the pinned launcher $launcher is missing or not executable" >&2
+    return 1
+  fi
+  if [ "$LAUNCH_PIN_DELIVERABLE" != 1 ]; then
+    echo "warning: fm-$ID's proven runtime pin is not applied to the agent's environment because ${LAUNCH_PIN_UNDELIVERABLE_REASON:-firstmate could not resolve its raw launch command to one executable}; the launch line is typed exactly as written and still resolves against firstmate's own PATH, and the project's own tools resolve from the crewmate PATH instead" >&2
+    return 0
+  fi
+  LAUNCH="$(shell_quote "$launcher") $(shell_quote "$session_path_prepend") $LAUNCH"
+  return 0
+}
+
 # build_launch_command: resolve LAUNCH (the full harness launch command) and its
 # placeholders. Body unchanged and not re-indented, for the same reasons as
 # prepare_launch_environment above.
@@ -3806,10 +4388,12 @@ if [ "$RESUME_ACCOUNT" = 1 ]; then
   case "$HARNESS:$KIND" in
     claude:*) LAUNCH='CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false __AGENT__ --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__' ;;
     codex:secondmate) LAUNCH='__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox' ;;
-    codex:*) LAUNCH='__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]"' ;;
+    codex:*) LAUNCH='__AGENT__ __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"__BASHBIN__\",\"-c\",\"__TOUCHBIN__ __TURNEND__\"]"' ;;
     *) echo "error: managed recovery supports only claude and codex" >&2; exit 1 ;;
   esac
 fi
+BASH_WORD=${BASH_BIN:-bash}
+TOUCH_WORD=${TOUCH_BIN:-touch}
 AGENT_COMMAND=$HARNESS
 if [ "$HARNESS" = pi ] && [ -n "$PI_AUTHOR_ACCOUNT_HOME" ]; then
   AGENT_COMMAND="PI_CODING_AGENT_DIR=$(shell_quote "$PI_AUTHOR_ACCOUNT_HOME") pi"
@@ -3878,6 +4462,9 @@ LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
 LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}
 LAUNCH=${LAUNCH//__PITURNEND__/$sq_piturnend}
 LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
+LAUNCH=${LAUNCH//__BASHBIN__/$BASH_WORD}
+LAUNCH=${LAUNCH//__TOUCHBIN__/$TOUCH_WORD}
+spawn_pin_launch_line || exit 1
 if [ "$KIND" = secondmate ]; then
   sq_home=$(shell_quote "$PROJ_ABS")
   LAUNCH="env -u FM_ROOT_OVERRIDE -u FM_STATE_OVERRIDE -u FM_DATA_OVERRIDE -u FM_PROJECTS_OVERRIDE -u FM_CONFIG_OVERRIDE FM_HOME=$sq_home $LAUNCH"

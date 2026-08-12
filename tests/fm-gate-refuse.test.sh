@@ -65,6 +65,7 @@ REPORT_STACK="$ROOT/bin/fm-report-stack.mjs"
 TASK_FILE_APPEND="$ROOT/bin/fm-task-file-append.mjs"
 BRIEF="$ROOT/bin/fm-brief.sh"
 ENSURE_AGENTS="$ROOT/bin/fm-ensure-agents-md.sh"
+PROVISION="$ROOT/bin/fm-provision.sh"
 LOCK="$ROOT/bin/fm-lock.sh"
 REVIEW_DIFF="$ROOT/bin/fm-review-diff.sh"
 SUPERVISE_DAEMON="$ROOT/bin/fm-supervise-daemon.sh"
@@ -223,7 +224,7 @@ SH
 # run_spawn <cwd> <home> <id> <proj> <pane> <fakebin> [ASSIGN...] -> combined output
 run_spawn() {
   local cwd=$1 home=$2 id=$3 proj=$4 pane=$5 fakebin=$6; shift 6
-  mkdir -p "$home/data/$id"
+  mkdir -p "$home/data/$id" "$home/treehouse-pools"
   printf 'brief\n' > "$home/data/$id/brief.md"
   printf '# Backlog\n\n## In flight\n- [ ] %s - gate refusal test (repo: %s)\n\n## Queued\n\n## Done\n' \
     "$id" "$(basename "$proj")" > "$home/data/backlog.md"
@@ -231,6 +232,7 @@ run_spawn() {
       "FM_ROOT_OVERRIDE=" "FM_HOME=$home" \
       "FM_STATE_OVERRIDE=$home/state" "FM_DATA_OVERRIDE=$home/data" \
       "FM_PROJECTS_OVERRIDE=$home/projects" "FM_CONFIG_OVERRIDE=$home/config" \
+      "FM_TREEHOUSE_ROOT=$home/treehouse-pools" \
       "FM_SPAWN_NO_GUARD=1" "FM_FAKE_PANE_PATH=$pane" "TMUX=fake,1,0" \
       "PATH=$fakebin:$PATH" "$@" \
       "$(guarded_script "$cwd" "$SPAWN")" "$id" "$proj" codex ) 2>&1
@@ -258,7 +260,7 @@ test_spawn_refuses_and_admits() {
 
   # no-regression: neutral cwd, marker UNSET, genuine isolated worktree.
   out=$(run_spawn "$NORMAL_CWD" "$home" spawn-ok "$proj" "$wt" "$fakebin"); rc=$?
-  expect_code 0 "$rc" "spawn: a normal session must still spawn"
+  expect_code 0 "$rc" "spawn: a normal session must still spawn: $out"
   assert_contains "$out" "spawned spawn-ok" "spawn: normal launch should report success"
   assert_not_contains "$out" "$ENV_MSG" "spawn: normal launch must not print the gate refusal"
   assert_not_contains "$out" "$PATH_MSG" "spawn: normal launch must not print the backstop refusal"
@@ -677,7 +679,7 @@ test_extended_mutating_entrypoints_refuse_gate_context() {
   stack="$TMP/extended-report-stack"
   mkdir -p "$home/state" "$home/data" "$home/projects"
 
-  for name in crosscheck fleet-sync x-reply x-dismiss x-followup x-link x-poll watch watch-arm watch-checkpoint wake-drain brief ensure-agents lock review-diff supervise-daemon worker-lifecycle worker-capacity-reserve worker-capacity-release; do
+  for name in crosscheck fleet-sync x-reply x-dismiss x-followup x-link x-poll watch watch-arm watch-checkpoint wake-drain brief ensure-agents provision lock review-diff supervise-daemon worker-lifecycle worker-capacity-reserve worker-capacity-release; do
     case "$name" in
       crosscheck) script=$(guarded_script "$NORMAL_CWD" "$CROSSCHECK"); set -- run task-x https://github.com/example/repo/pull/9 ;;
       fleet-sync) script=$(guarded_script "$NORMAL_CWD" "$FLEET_SYNC"); set -- --help ;;
@@ -692,6 +694,7 @@ test_extended_mutating_entrypoints_refuse_gate_context() {
       wake-drain) script=$(guarded_script "$NORMAL_CWD" "$WAKE_DRAIN"); set -- ;;
       brief) script=$(guarded_script "$NORMAL_CWD" "$BRIEF"); set -- task-x ship project-x objective ;;
       ensure-agents) script=$(guarded_script "$NORMAL_CWD" "$ENSURE_AGENTS"); set -- "$home" ;;
+      provision) script=$(guarded_script "$NORMAL_CWD" "$PROVISION"); set -- "$home" "$home" ;;
       lock) script=$(guarded_script "$NORMAL_CWD" "$LOCK"); set -- ;;
       review-diff) script=$(guarded_script "$NORMAL_CWD" "$REVIEW_DIFF"); set -- task-x ;;
       supervise-daemon) script=$(guarded_script "$NORMAL_CWD" "$SUPERVISE_DAEMON"); set -- ;;

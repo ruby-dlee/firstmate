@@ -87,6 +87,7 @@ config/checkout-refresh  optional extra checkout and shallow scan-root directive
 config/worktree-provision  task-worktree dependency provisioning switch; LOCAL, gitignored; absent or "on" provisions each acquired worktree's declared project dependencies before launch, "off" disables it for this home; see docs/configuration.md "Worktree provisioning"
 config/secondmate-harness  PRIMARY launch `<harness> [<model>] [<effort>]`; LOCAL, gitignored, fallback config/crew-harness then firstmate, not inherited (section 4)
 config/account-routing-mode  `off|observe|enforce`; direct account directories for new observe/enforce launches, legacy recovery for existing managed metadata; LOCAL, gitignored, default off, inherited (docs/configuration.md "Agent Fleet account routing")
+config/provision/<project>.json  optional per-project worktree provisioning manifest that overrides declaration-driven detection for that project; LOCAL, gitignored; absent uses the declaration-driven provisioner; see docs/configuration.md "Worktree provisioning"
 config/secondmate-account-pool  optional Agent Fleet pool the PRIMARY uses for SECONDMATE launches when routing is enabled; LOCAL, gitignored; selection-only and NOT inherited
 Direct account-directory launch covers ship/scout crewmates and secondmate launches; a secondmate binds only the selected account, never the ship/scout worktree-identity contract.
 config/backlog-backend  backlog backend override; LOCAL, gitignored; absent or "tasks-axi" = default tasks-axi backend, "manual" = force routine backlog updates to hand-editing; inherited by secondmate homes (section 10)
@@ -398,11 +399,12 @@ bin/fm-spawn.sh <id> --resume-account             # sticky legacy managed recove
 bin/fm-spawn.sh <id> --continue-account           # fresh legacy managed session from verified task-owned continuation state
 bin/fm-spawn.sh <id> projects/<repo> --backend <tmux|herdr|zellij|cmux>   # explicit new-task runtime backend (docs/configuration.md "Runtime backend")
 bin/fm-spawn.sh <id> projects/<repo> --scout     # scout task; records kind=scout in meta
+bin/fm-spawn.sh <id> projects/<repo> --provision|--no-provision   # force or skip worktree provisioning for this spawn
 bin/fm-spawn.sh <id> [<firstmate-home>] --secondmate   # launch a persistent secondmate in its home
 bin/fm-spawn.sh <id1>=projects/<repo1> <id2>=projects/<repo2> [--scout]   # batch: one call, several tasks
 ```
 
-Batch dispatch spawns each `id=repo` pair through the same single-task path, with shared `--scout`, `--harness`, `--model`, `--effort`, `--backend`, `--account-pool`, `--account-profile`, and `--no-account-routing` flags applying to all; one failed pair does not stop the rest, and the batch exits non-zero.
+Batch dispatch spawns each `id=repo` pair through the same single-task path, with shared `--scout`, `--harness`, `--model`, `--effort`, `--backend`, `--account-pool`, `--account-profile`, `--no-account-routing`, and `--provision`/`--no-provision` flags applying to all; one failed pair does not stop the rest, and the batch exits non-zero.
 When `config/crew-dispatch.json` exists, include an explicit resolved harness for every crewmate or scout spawn or batch after consulting the dispatch rules (section 4).
 `bin/fm-spawn.sh`'s header owns harness and runtime-backend resolution, spawn-capable backends and `codex-app` rejection, launch templates, delivery-mode resolution, recorded meta fields, and turn-end hooks.
 A backend spawn refusal - a missing dependency, an unauthenticated socket, or a version gate - must be surfaced to the captain as a blocker; never silently retry the spawn on a different backend to work around it.
@@ -414,6 +416,7 @@ An unignored install directory is a pre-installer FAILURE; an unignored `.fm-pro
 A successful non-zero `uv pip check` NOTE records `<manager>:<dir>=installed+<note>` or `<manager>:<dir>=cached+<note>`; `inconsistent-dependency-metadata` means the check found inconsistency, while `unverified-dependency-metadata` means it did not run and must never be phrased as a finding.
 Never convert a capability limit into a spawn refusal: route it through `fm_provision_gap`; `docs/configuration.md` "Worktree provisioning" points operators to the exhaustive header-owned set instead of owning a synchronized copy.
 A provisioning refusal is a blocker to surface, not something to work around by retrying with `--no-provision`: launching anyway produces a lane that cannot prove its own work.
+An optional `config/provision/<project>.json` overrides declaration-driven detection for one project with explicit runtime checks, probes, and failure policy; `bin/fm-provision.sh` owns its readiness and exit contracts, and `docs/configuration.md` "Worktree provisioning" owns the schema and precedence.
 For `kind=secondmate`, it launches in the registered or explicit firstmate home with the charter brief as the launch prompt, after the guarded home sync and inheritable-config propagation owned by `secondmate-provisioning`.
 Project worktrees start at detached HEAD on a clean default branch; ship briefs tell the crewmate to create its branch, while scout briefs keep the worktree scratch.
 For a genuinely new ship or scout task, `bin/fm-spawn.sh` asserts an In flight or Queued backlog row before endpoint creation.

@@ -1933,6 +1933,49 @@ test_an_unreadable_provisioning_setting_refuses_the_spawn() {
   pass "an unparseable provisioning setting refuses rather than silently disabling the gate"
 }
 
+# An automatically detected Node pin has the same launch-resolution boundary as
+# an explicit manifest pin: it belongs to the agent session only, never to the
+# pane PATH that resolves Firstmate's launch line.
+test_auto_runtime_pin_is_delivered_after_launch_resolution() {
+  local record id out status nvm_bin prefix export_line launch_line
+  id=provision-spawn-p13
+  record=$(make_spawn_case spawn-auto-pin js "$id")
+  read_spawn_case "$record"
+  printf '20\n' > "$PROJECT_DIR/web/.nvmrc"
+  git -C "$PROJECT_DIR" add web/.nvmrc
+  git -C "$PROJECT_DIR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm 'pin node runtime'
+  git -C "$WORKTREE_DIR" reset --hard -q "$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+
+  nvm_bin="$CASE_DIR/nvm/versions/node/v20.20.2/bin"
+  mkdir -p "$nvm_bin"
+  cat > "$nvm_bin/node" <<'SH'
+#!/usr/bin/env bash
+printf '20.20.2'
+SH
+  chmod +x "$nvm_bin/node"
+  cp "$FAKEBIN_DIR/npm" "$nvm_bin/npm"
+
+  out=$(FM_TEST_NODE_VERSION=23.8.0 NVM_DIR="$CASE_DIR/nvm" FNM_DIR="$CASE_DIR/no-fnm" \
+    VOLTA_HOME="$CASE_DIR/no-volta" run_spawn \
+    "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR")
+  status=$?
+  expect_code 0 "$status" "an automatically pinned spawn should succeed: $out"
+  prefix=$(find "$HOME_DIR/state/provision-cache/node-toolchain" -mindepth 1 -maxdepth 1 -type d -print | head -1)
+  [ -n "$prefix" ] || fail "the automatically detected Node pin published no session prefix: $out"
+  export_line=$(grep 'LAUNCH send-keys.*export PATH=' "$CASE_DIR/install.log" | head -1)
+  launch_line=$(grep 'LAUNCH send-keys.*fm-launch-pinned.sh' "$CASE_DIR/install.log" | head -1)
+  assert_not_contains "$export_line" "$prefix" \
+    "the automatic runtime pin reached the pane PATH that resolves Firstmate's launch line"
+  assert_not_contains "$export_line" "$nvm_bin" \
+    "the project-selected runtime directory reached Firstmate's launch PATH"
+  assert_contains "$launch_line" "$ROOT/bin/fm-launch-pinned.sh" \
+    "the automatic runtime pin was not delivered through the post-resolution launcher"
+  assert_contains "$launch_line" "$prefix" \
+    "the post-resolution launcher did not receive the proven automatic runtime pin"
+  pass "an automatic runtime pin reaches the agent session only after the launch command resolves"
+}
+
 test_spawn_into_an_undeclared_project_is_unchanged() {
   local record id out status
   id=provision-spawn-p6
@@ -2001,6 +2044,7 @@ test_spawn_refuses_before_install_when_the_project_does_not_ignore_the_install_d
 test_provisioning_can_be_opted_out_per_spawn_and_per_home
 test_a_stale_lane_report_never_survives_into_the_next_lease
 test_an_unreadable_provisioning_setting_refuses_the_spawn
+test_auto_runtime_pin_is_delivered_after_launch_resolution
 test_spawn_into_an_undeclared_project_is_unchanged
 
 echo "# all fm-spawn-provision tests passed"

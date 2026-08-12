@@ -4,9 +4,8 @@ Crosscheck is an independent exact-head finding ledger at the PR merge gate.
 It is not a second implementation of tests, lint, documentation checks, pushing, PR creation, or CI.
 No-mistakes remains the owner of that validation pipeline.
 
-By default, the review portion is intentionally close to "no-mistakes review with a fresh, different model."
+The review portion is intentionally close to "no-mistakes review with a fresh, different model."
 Most of its review-quality value comes from that cross-model independence.
-A home can explicitly accept reduced model independence for a proven-separate reviewer account, but the evidence always identifies that weaker mode.
 The separate mechanism earns its keep only through four contracts that no-mistakes does not currently own: durable finding lifecycle across runs, gate-executed reproduction evidence, gate-executed mutation proof for fixes, and an exact reviewed SHA passed atomically to GitHub at merge.
 If those contracts move into no-mistakes, the separate reviewer runner should be removed rather than defended as a parallel product.
 
@@ -29,75 +28,18 @@ The file is local and gitignored at `config/crosscheck-reviewer.json`.
       "model": "claude-opus-5",
       "effort": "xhigh",
       "account_home": "/absolute/path/to/an/independent/claude/home"
-    },
-    {
-      "harness": "pi",
-      "model": "gpt-5.6-sol",
-      "effort": "xhigh",
-      "account_home": "/absolute/path/to/an/independent/pi/home"
     }
   ]
 }
 ```
 
-Crosscheck resolves each configured account home and keeps every entry that satisfies the home's model policy and whose account is provably not the author's, in configured order.
-Model separation is mandatory by default.
-The optional local `config/crosscheck-same-model` file relaxes only that screen when it contains exactly `on`; an absent file or exactly `off` preserves the default, and any other value or unsafe file shape is refused.
-This setting is local and gitignored, is read fresh for each reviewer selection, and is not inferred from the reviewer roster or environment.
-It does not weaken account separation: the same upstream account and an unreadable identity remain ineligible even when the setting is on.
-A selected same-model reviewer receives a visible reduced-independence prompt that directs it to attack the change adversarially, falsify the author's claims instead of confirming them, and report a finding when uncertain.
-Its ledger reviewer record carries `model_independence: same-model`, and the readable report labels the run `SAME-MODEL` so the reduced independence cannot be mistaken for a cross-model review.
-Crosscheck then binds the provider's executing credential selector to that exact path and requires the verdict plus a Bash-created receipt to report the selector and actual private `HOME`.
+Crosscheck resolves each configured account home and selects the first whose account home and model both differ from the routed author identity recorded in task metadata.
+It then binds the provider's executing credential selector to that exact path and requires the verdict plus a Bash-created receipt to report the selector and actual private `HOME`.
 Account separation therefore depends on the executing credential source rather than a configuration label.
-Every reviewer disables reviewed-repository instruction discovery at launch: Codex sets `project_doc_max_bytes=0`, Claude uses `--safe-mode`, and Pi uses `--no-context-files`.
-Pi is launched through the resolved installed executable with `openai-codex/gpt-5.6-sol` at `xhigh`, JSON event output, an ephemeral session, and only the read and Bash-capable review tools.
-For the installed npm entrypoint, Crosscheck also resolves Pi's sibling Node runtime before launch instead of allowing the reviewer environment's `PATH` to substitute another interpreter.
-That pin recognizes every `env`-based Node shebang, including `#!/usr/bin/env -S node --flag`, and preserves the flags; an `env` shebang naming no interpreter fails closed rather than silently falling back to `PATH`.
-Its event stream must contain at least one completed turn, end with a successful `stop` assistant turn, and complete the agent before Crosscheck accepts that terminal turn's JSON verdict.
-Pi credential provisioning is a captain-owned prerequisite: the selected `account_home` must contain a usable `openai-codex` OAuth entry in `auth.json`, and Firstmate does not create or copy that credential.
-Because Pi selects only the default `openai-codex` slot and reviewer launches disable extension discovery, a Pi reviewer home holds exactly one account; a multi-slot Pi home reviews as its default slot, not as whichever slot has capacity.
-
-Pi is a third client, not extra capacity.
-It authenticates against the same upstream OpenAI accounts the Codex reviewer uses, so a Codex account at its usage limit is equally unavailable through Pi, and a Pi reviewer does not route around an exhausted Codex account.
-What Pi adds is an independent client path and a reviewer that is separate from a Claude author by construction.
-A usage-limited reviewer account records a `tool-failure`, never a verdict about code, and Crosscheck then advances to the next independent entry rather than refusing the merge.
-Failover is limited to faults that prevented a verdict: a launch failure, an unusable credential, a provider that was never reached, or an exhausted account.
-A reviewer that reached the model and then declined clearance, returned no valid artifact, or returned a malformed one ends the run on the spot, because that is the reviewer's own conclusion and a second account must not be used to shop for a friendlier one.
-Each abandoned attempt is recorded as its own `tool-failure` run, so the ledger names every account that was tried and why it was left, and each attempt gets its own pristine exact-head checkout so no reviewer inherits an earlier reviewer's helpers or scratch state.
-Selection therefore makes the gate as available as the roster rather than as available as its first entry.
-Every candidate passed the configured model policy and the mandatory account-separation screen, and `run_reviewer` still re-proves account separation against the credential it actually binds.
-
-One upstream account routinely exists behind several directories at once, so two different `account_home` paths can execute as the same account.
-Codex and Pi both authenticate against OpenAI, and a Claude config home that records no account of its own borrows whatever credential the environment supplies.
-Path inequality therefore cannot establish account separation on either provider.
-When the author and the reviewer resolve to the same provider, Crosscheck compares the account each home executes as and refuses a reviewer that resolves to the author's account, an unreadable identity on either side, or a credential such as an API key that names no account at all.
-An identity that cannot be resolved is never separation, and the refusal happens at selection so a genuinely provable reviewer later in the list can still be chosen.
-The account is read from `tokens.account_id` for Codex, `openai-codex.accountId` for Pi, and `oauthAccount.accountUuid` in `.claude.json` for Claude; `bin/fm-crosscheck.py`'s `account_identity` keys that resolution on the provider so a new client on an existing provider cannot reopen the hole.
-`run_reviewer` repeats the comparison against the credential it actually binds, and that launch-time check is the authoritative one.
-A lane that records no `account_home` is an ordinary supported author identity, not an emergency.
-Account routing is off by design for any harness outside Codex and Claude, so a Pi lane structurally cannot record an `account_home`.
-Requiring one, or an `account_routing_emergency_bypass=1` marker in its place, made every Pi-launched lane permanently unmergeable through this gate, and a bypass that has to be set on the majority of lanes is not a gate.
-A different supported provider proves account separation by namespace for any account-less author.
-A Pi author additionally records the exact selected provider slot in its model prefix, and `fm-spawn.sh` copies the selected Pi credential and configuration directory into restrictive task-private storage before launch.
-It derives the slot's `accountId` from that private copy, records it in task metadata, and binds the actual Pi launch to the same directory through `PI_CODING_AGENT_DIR` on every spawn backend.
-Same-provider eligibility requires that launch-bound recorded identity and never re-reads ambient Pi credentials as author proof; legacy or otherwise missing snapshots fail closed.
-Recovery takes a new private copy and preserves eligibility only when its identity matches the previously recorded identity exactly, while a changed account drops the recorded field instead of migrating the task's author identity.
-That identity lets a same-provider reviewer prove it executes as another OpenAI account without inventing an `account_home` for the author.
-A missing directory, unsafe or failed copy, malformed auth file, absent slot, or unreadable `accountId` proves nothing and leaves every same-provider reviewer ineligible.
-Other account-less same-provider pairs remain ineligible because no account comparison is available.
-Model identity compares the model itself, not the recorded string: Pi records `<provider-slot>/<model>`, so `openai-codex-2/gpt-5.6-sol` is the same model as a Codex reviewer's `gpt-5.6-sol`.
-That canonical identity is screened out by default and is what marks a selected review as same-model when the explicit relaxation is on.
-Provider is what the namespace fallback compares, not harness: Codex and Pi are both the OpenAI provider, while Anthropic is separate.
-The accepted profiles are Codex `gpt-5.6-sol` xhigh, Claude `claude-opus-5` xhigh, and Pi `gpt-5.6-sol` xhigh; no allowlist change is needed to enable the existing Codex profile.
-Absent reviewer configuration, unavailable credentials, model-policy mismatch, and unprovable account separation all produce `CROSSCHECK TOOL-FAILURE` and a nonzero exit before reviewer launch.
-
-Crosscheck requires Python 3.11 or newer and refuses to run on anything older.
-This is a safety floor rather than a style preference: the bounded-read layer rejects hostile JSON integers by relying on CPython's integer/string conversion limit, which first exists in 3.11, and on an older interpreter that rejection silently stops happening while every banner the gate prints reads exactly the same.
-Stock macOS `python3` is 3.9, so `bin/fm-crosscheck.sh` resolves a supported sibling interpreter instead of assuming `python3` qualifies, and `bin/fm-crosscheck.py` enforces the same minimum itself so a direct invocation cannot bypass it.
-`bin/fm-crosscheck-python-lib.sh` owns that resolution for both the wrapper and the behavior tests; `FM_CROSSCHECK_PYTHON` selects an explicit interpreter and `FM_CROSSCHECK_MIN_PYTHON` overrides the minimum.
-A `FM_CROSSCHECK_MIN_PYTHON` that is not `<major>.<minor>` is refused rather than parsed into a lower floor, because a bare `3` would otherwise silently admit Python 3.3.
-An explicitly configured `FM_CROSSCHECK_PYTHON` that is missing or below the floor refuses by name rather than falling through to some other interpreter, so a typo or a stale path cannot silently unpin the gate.
-CI pins a single modern interpreter and therefore cannot observe this class of defect on its own, which is why the floor is asserted at runtime rather than assumed from the CI matrix.
+For a task explicitly marked `account_routing_emergency_bypass=1`, a reviewer on the other supported provider establishes both account-namespace and model separation without inventing an `account_home` for the author.
+A same-provider reviewer still fails closed for that structurally unrouted task because account independence cannot be proved.
+The accepted profiles are Codex `gpt-5.6-sol` xhigh and Claude `claude-opus-5` xhigh.
+Absent configuration, unavailable credentials, missing model separation, and unprovable account separation all produce `CROSSCHECK TOOL-FAILURE` and a nonzero exit before reviewer launch.
 
 Start crosscheck as soon as a PR URL exists so it can overlap no-mistakes' remaining CI work.
 The reviewer is a real policy-grade agent invocation and normally takes minutes, so Crosscheck is not a fast local check.
@@ -109,16 +51,6 @@ bin/fm-crosscheck.sh run <task-id> <https://github.com/owner/repo/pull/number>
 The run writes `data/<task-id>/crosscheck-ledger.json` and the readable `data/<task-id>/crosscheck.md` report.
 The run exits zero only when the exact head has a complete review, the reviewer supplied a successfully gate-reexecuted exact-base/exact-head reproduction, the durable ledger has no active blocker, and the reviewer returned no unreproduced suspicion.
 It fetches `refs/pull/<number>/head` from the base repository into a disposable Git checkout and requires that ref to resolve to the exact live API head SHA before reviewer launch.
-
-The reviewed base is the merge base of that head and the live base branch, resolved in the review checkout, and it is the base every downstream consumer uses: the reviewer prompt, the verdict-level execution proof, the ledger run, and verification.
-It is deliberately not GitHub's `base.sha`.
-GitHub reports `base.sha` as the base branch tip observed when the snapshot was taken, so on an active default branch it is usually not an ancestor of the PR head and it changes whenever anything else merges.
-Treating it as the reviewed base made two failures routine: an un-rebased PR was refused before launch because the live base was not the checkout's merge base, and a ledger written minutes earlier stopped matching at the merge gate because the branch had moved for reasons unrelated to the PR.
-Both refusals were artifacts of comparing a moving value, not evidence about the change, and a gate that cannot be satisfied is worse than no gate because it trains its operators to route around it.
-The merge base converges instead: the default branch advancing cannot change it unless the branch absorbs commits already reachable from this head, in which case the remaining diff is a subset of what was reviewed and the review stays sound.
-Any change to the PR itself - a new commit, a rebase, a force-push - changes the head SHA, which invalidates the ledger match on its own, so the head remains the pin GitHub's atomic merge enforces.
-Verification therefore matches the live head and the stable claims digest, and checks the execution proof against the merge base the run recorded.
-Each run records both values: `base_sha` is the reviewed merge base, and `base_branch_sha` is the base branch tip GitHub reported at snapshot time, so a ledger shows on its face when the default branch had moved ahead of the review.
 The authoring worktree is not cloned, checked for cleanliness, or required to match the PR head because no verdict about the remote PR may depend on mutable author-lane filesystem state.
 An empty `FM_STATE_OVERRIDE` falls back to the home state directory, so task metadata, the shared per-task lock, and the disposable review checkout cannot split across callers' current working directories.
 
@@ -129,8 +61,8 @@ Do not call the verification form as a substitute for running a reviewer.
 bin/fm-crosscheck.sh verify <task-id> <https://github.com/owner/repo/pull/number>
 ```
 
-Verification re-reads the live PR head and complete claims document.
-It requires the latest attempt matching that head and the stable PR number/title/body claims digest to be clear, then prints only the exact reviewed SHA.
+Verification re-reads the live PR head, base, and complete claims document.
+It requires the latest attempt matching that head, base, and the stable PR number/title/body claims digest to be clear, then prints only the exact reviewed SHA.
 Dynamic check counts in the full `gh-axi` document remain visible to the reviewer but are excluded from the digest so CI completing in parallel does not invalidate an otherwise exact review.
 The merge helper sends that SHA in GitHub's atomic expected-head merge or enqueue request.
 A force-push before verification invalidates the ledger match, while a force-push after verification makes GitHub reject the expected-head merge or enqueue request.
@@ -153,13 +85,10 @@ Silence never closes, supersedes, or deletes a finding.
 A `verified-fixed` lifecycle remains durable, but its proof clears only the exact head on which the gate executed it; a new head requires a fresh mutation proof.
 
 Each run has one outcome class.
-A run that used the local same-model relaxation records `reviewer.model_independence` as `same-model`; older and ordinary cross-model runs omit that field.
-The readable report renders the same distinction before its summary.
 
 - `tool-failure` means environment, task metadata, reviewer configuration, exact-head fetch, executing-account binding, or required command-execution proof prevented a trustworthy verdict.
-- `cannot-certify` means a reviewer completed but the changed implementation's own test system had no trustworthy mutation-certification route the gate could execute.
 - `unreviewed` means a reviewer ran but no valid exact-head verdict artifact exists.
-- `blocking` means a completed reviewer with successful command-execution evidence declined clearance through a suspicion, admitted finding, or a named test that stayed green under its implementation mutation.
+- `blocking` means a completed reviewer with successful command-execution evidence declined clearance through a suspicion or admitted finding.
 - `clear` means a completed reviewer with successful command-execution evidence earned clearance and no durable blocker remains.
 
 CLI banners preserve the same distinction as `CROSSCHECK TOOL-FAILURE`, `CROSSCHECK UNREVIEWED`, and `CROSSCHECK BLOCKING`.
@@ -184,17 +113,6 @@ That inspection carries its own larger budget so such a state is refused by name
 
 A `verified-fixed` update must name a tracked test and provide an implementation-only patch under `.crosscheck/mutations/`.
 It supplies an approved test runner plus a structured argument array, never a free-form shell command.
-An approved runner is a NAME, and the gate resolves that name into an invocation rather than assuming a bare binary on `PATH`.
-Before either proof run, the gate applies the mutation in a disposable inspection checkout and selects the certification system from the mutated implementation paths themselves.
-A JavaScript or TypeScript mutation must resolve with its named test to one nearest tracked `package.json`, and that package's test script or dependencies must declare one unambiguous Jest or Vitest system.
-A mixed JavaScript/Python mutation, a test outside the changed package, an ambiguous declaration, or a proof naming a different runner is `CANNOT-CERTIFY`, never `CLEAR`.
-Python mutation behavior remains on its existing pytest route exactly as before.
-This matters because every Python repository in this fleet is uv-managed: a bare `pytest` is routinely absent there, while `uv run pytest` is the invocation that works, and `python3 -m pytest` cannot be expressed in the vocabulary at all because `python3` is a file runner whose command line puts the test path before its arguments.
-`pytest` therefore resolves through `uv run pytest`, then `python3 -m pytest`, then the bare binary.
-Order is load-bearing: inside a uv project a bare `pytest` can exist and resolve against a different environment than the repository uses, so finding it first would run the named test under an interpreter the project never selected.
-The uv rung is offered only when a uv project actually governs the named test, discovered by searching upward from that test to the checkout root, and it is passed to `uv run --project` so a monorepo service directory is selected without moving the working directory the test path is relative to.
-Each rung except the last identifies itself before being trusted; the last is the plain runner name and is accepted on presence, exactly as before, so the ladder can never turn a working setup into a refusal.
-Keeping the declared name is what preserves pytest's `path::selector` node-id support, which a separate runner name for module invocation would have silently dropped.
 That array must be empty for a mutation proof, and any entry is refused by name.
 The classified non-execution signal is a property of the runner's default exit semantics, and a supplied flag can change them: measured on pytest 9.1.1, a mutation raising during import of the named test's module exits 2 on its own but 1 under `--continue-on-collection-errors`, and 1 carries no classification, so the gate would certify a fix on a test that was never collected.
 A positional argument separately adds a second target, and `test_path` is the only target the gate validates as tracked, symlink-free, and unreachable by the mutation patch, so the verdict could come from a file the gate never validated.
@@ -208,46 +126,32 @@ The proof checkouts and the review checkout are both children of that root, so t
 This is not free: for a repository carrying no pytest config of its own, rootdir becomes the gate's temporary root instead of the checkout, which widens conftest discovery by that one empty gate-owned directory.
 The reviewed repository's own config still takes precedence, because it sits closer to the named test, and that surface stays deliberately accepted.
 The same rule is not applied when replaying a recorded proof, so a ledger written before it still loads; instead a recorded proof whose invocation carried arguments no longer certifies its finding, which reverts to blocking and can be re-proved in band by a fresh review.
-Crosscheck destroys the mutation-inspection checkout, creates a clean baseline checkout at the exact reviewed head, confirms the named test passes, destroys that entire checkout, recreates the same path from the exact head, applies the patch, and requires the same test to fail.
+Crosscheck creates one clean checkout at the exact reviewed head, confirms the named test passes, destroys the entire checkout, recreates the same path from the exact head, applies the patch, and requires the same test to fail.
 Destroying all readable baseline state before the mutated run prevents a test from manufacturing causality through a predictable sibling checkout.
-For Jest, each clean proof checkout must begin without a package-local runner; a tracked or otherwise preexisting `node_modules/.bin/jest` is refused rather than accepted as provenance.
-The gate requires exactly one tracked package lock whose root declares Jest and whose `node_modules/jest` entry binds a semantic version to the official npm registry tarball with valid sha512 integrity.
-Starting from that entry, it resolves every dependency, optional dependency, and peer dependency through the lockfile's exact nested and hoisted `node_modules` paths and authenticates the complete reachable runtime closure before installation.
-Every closure entry must occupy a canonical package path and bind its own name and semantic version to its exact official npm registry tarball with valid sha512 integrity.
-Local, linked, workspace, Git, URL, custom-registry, missing-integrity, project-npm-configured, and currently pnpm-governed Jest routes are explicit `CANNOT-CERTIFY` outcomes.
-The gate detects the project's declared Node major, selects a matching interpreter from the standard version-manager directories, and materializes dependencies afresh from that `package-lock.json` with `npm ci --offline --ignore-scripts` inside the no-network proof sandbox and empty gate-owned npm user and global configuration.
-After installation, it requires every closure package to be a real non-symlink directory inside the package tree whose package name, version, and runtime dependency declarations match its authenticated lock entry.
-It also requires `node_modules/.bin/jest` to resolve to the executable `bin/jest.js` inside the authenticated materialized Jest package.
-The selected Node path remains bound through dependency installation and the baseline and mutated Jest runs.
-A cold dependency cache, missing or ambiguous lockfile, preexisting runner, unavailable package manager or Node version, unsupported Vitest route, or invalid materialized Jest package or binary is `CANNOT-CERTIFY` and never a test verdict.
-The gate invokes Jest with its own fixed `--runInBand --runTestsByPath --ci --no-cache --json` protocol and accepts a fix only when the baseline JSON reports at least one executed passing test and the mutated JSON reports at least one executed failing test.
-A Jest test that executes and stays green under the mutation is durably downgraded to `claimed-fixed`, keeping the finding and the run `blocking` instead of turning inadequate coverage into an infrastructure outcome.
 Proof sandboxes also omit shared POSIX IPC and give each run private writable temporary and cache state, while shared host temporary directories remain outside the write policy.
 The named test must be a canonical tracked regular file; symlinks are rejected so a patch cannot mutate the executed target through an unchanged alias.
 Symlink rejection is anchored at the resolved review checkout, so a symlink inside the repository is still refused while a symlinked ancestor above the firstmate home is not mistaken for one.
 `test_path` may also be a `path::selector` node id for a runner that accepts one; every path-shaped check reads the part before `::` while the runner receives the full selector.
 The gate positions the tracked test path itself as the interpreter script or test-framework target; generic command launchers are not approved runners.
 A run that never reached the named test is not a test result in either direction.
-The gate resolves the named runner to an absolute executable before launching, and treats an absent runner, a failed sandbox exec, and a runner-reported non-execution as named non-executions.
+The gate resolves the named runner to an absolute executable before launching, and treats an absent runner, a failed sandbox exec, and a runner-reported non-execution (pytest's usage and no-tests-collected statuses, for instance) as named non-executions.
 That matters in both directions: such a status must not condemn a baseline run, and must not vindicate a mutated one, because a mutation that merely broke collection would otherwise read as a caught regression.
-Pytest uses the gate's measured usage and no-tests-collected exit statuses; Jest uses positive machine-readable executed-test counts instead of inferring execution from its exit code.
-Every other runner remains unable to certify until it has its own positive or measured non-execution protocol.
-The proof checkout starts as a fresh clone carrying tracked files only, and any language environment it needs must be reconstructed through the bounded routes above.
+Because that reading is only safe where the non-execution signal has actually been measured, a mutation proof may name only a runner the gate classifies - `pytest` today - and any other runner is refused by name rather than certified on a status the gate would have to guess at.
+The proof checkout is a fresh clone carrying tracked files only, so a runner that lives solely in an untracked virtualenv is absent there.
 The patch may modify only non-test implementation paths already cited by the durable finding.
 It cannot modify the named test, conventional test trees, fixtures, or Crosscheck evidence support.
 
-### Known Python limitation: the mutated pytest exit status is an inference, not proof
+### Known limitation: the mutated exit status is an inference, not proof
 
-The Jest route uses positive JSON execution counts and does not share this limitation.
-Read the four Python guards above together and the shape of the remaining problem is visible.
-The pytest route concludes "the named test detected the regression" from one fact: the mutated run exited non-zero.
+Read the four guards above together and the shape of the real problem is visible.
+The gate concludes "the named test detected the regression" from one fact: the mutated run exited non-zero.
 That status is not a property of the test alone. It is influenced by reviewer-supplied argv, by the ambient environment, by repository and ancestor configuration, and by the runner's own version, and each of those four channels was closed only after it was found - a positional second target, a collection-error flag, `PYTEST_ADDOPTS`, and an ancestor ini file.
 An installed runner plugin is a known and accepted fifth door.
 Closing channels one at a time is unbounded work with no completion criterion, so the list above should be read as hardening, not as a proof of soundness.
 
 The planned replacement is POSITIVE PROOF OF EXECUTION: requiring the mutated run to demonstrate that the named test actually ran, rather than inferring it from an exit code.
 The leading candidate is a control test - a second tracked test the mutation should not affect, required to PASS while the named test fails - because it needs no per-runner knowledge and no enumeration of the ways a status can be rewritten.
-Until that lands, the pytest exit-status inference remains this gate's weakest link, and the four closed channels do not make it sound.
+Until that lands, the exit-status inference remains this gate's weakest link, and the four closed channels do not make it sound.
 
 ## Refusal and liveness
 
@@ -259,12 +163,8 @@ Finding prose, reproduction output, test output, and lifecycle notes remain dura
 The Codex path pins `gpt-5.6-sol`, xhigh reasoning, noninteractive approval, an independent `CODEX_HOME`, the same account-bound `HOME`, and the exact review checkout.
 The Claude path pins `claude-opus-5`, xhigh effort, the installed unattended `--dangerously-skip-permissions` mode, a Bash-required bounded tool list, no session persistence, an independent `CLAUDE_CONFIG_DIR`, the same `CLAUDE_SECURESTORAGE_CONFIG_DIR`, a disposable private `HOME`, and structured JSON output.
 That private `HOME` maps `.claude` and `.claude.json` to the selected reviewer account directory, so Claude's hard-coded `~/.claude/session-env` writes land in per-account state rather than shared operator state.
-It also maps the current user's Keychain directory, derives Claude's exact scoped service from the selected account directory, and verifies the non-secret service metadata before reviewer launch.
-That mapping is unconditional on macOS, not a fallback for accounts that lack an OAuth file.
-macOS resolves a Keychain search through `$HOME/Library/Keychains`, so under a private `HOME` an unmapped Keychain is simply unreachable, and a real account directory routinely holds both a live scoped Keychain item and a stale `.credentials.json` left beside it.
-Mapping the Keychain only when `.credentials.json` was absent therefore sent every such reviewer to the stale file, where it failed with `Failed to authenticate: OAuth session expired and could not be refreshed` in one turn, with no tokens and no API time, while the same account worked normally outside the gate.
-The scoped Keychain item is preferred when it exists, because it is the credential the launched reviewer actually executes as; a regular non-symlink `.credentials.json` remains the recorded source only when no scoped item is present.
-This is a binding inside the reviewer's own private `HOME`, not a sandbox grant: the generated profile is unchanged, and reads of the operator's Keychain directory were already permitted by it.
+For a Keychain-backed account, it maps only the current user's Keychain directory needed for secure-storage discovery, derives Claude's exact scoped service from the selected account directory, and verifies the non-secret service metadata before reviewer launch.
+An OAuth-file-backed account instead requires a regular non-symlink `.credentials.json` in the selected account directory.
 Because Claude's unattended mode disables its own permission prompts, Crosscheck places the process under the installed macOS `sandbox-exec` contract: reads, process execution, and provider network access remain available, while writes are limited to the disposable review checkout, the selected per-account reviewer directory, and `/dev/null`.
 The profile never grants the ambient operator `~/.claude` tree or its session scratch subtree.
 Claude's Bash engine otherwise creates workspace scratch under shared `/tmp/claude-<uid>` independently of ordinary `TMPDIR`.
@@ -272,12 +172,7 @@ Crosscheck sets the supported `CLAUDE_CODE_TMPDIR` to a private directory inside
 It does not grant write access to the author worktree or the wider filesystem.
 An unavailable reviewer binary, sandbox, author-identity proof, executing-account binding, verdict-level execution proof, or exact remote PR head records a `tool-failure` attempt when the live head is already known, and otherwise emits the same tool-failure class without fabricating a ledger run.
 A ledger that cannot be read is the one stop that cannot record itself: appending a run to a file that failed to parse would risk destroying the durable findings it still holds, so the ledger is left exactly as it is and only the readable `crosscheck.md` report is rewritten, naming the parse failure so the cause is on disk rather than only in the exit status of a run nobody kept.
-A reviewer that never reached its provider is also a `tool-failure` rather than an `unreviewed` attempt, and is the case that fails over.
-The two are distinguished by evidence of model work: a Claude result envelope with no API duration, no token usage, and no per-model usage, or a Codex exit that wrote no result artifact at all, means the account never spoke and the gate learned nothing about the code.
-Recording that as `unreviewed` also manufactured a suspicion in the ledger, which reads like the reviewer raised a concern about the change when it had not started.
-Failure banners quote what the reviewer actually reported - for Claude the envelope's `result`, `subtype`, `terminal_reason`, `api_error_status`, and any permission denials, plus captured stderr - rather than a fixed-length excerpt of the raw envelope, because the sentence that explains a failure sits past the point such an excerpt stops.
-A timeout, or a reviewer that reached the model and then produced a missing, empty, malformed, or wrong-head artifact, records an `unreviewed` attempt and exits nonzero.
-A completed review whose changed implementation has no executable mutation-certification route records `cannot-certify`, names the exact missing route, and exits nonzero without fabricating either a code verdict or a pass.
+A nonzero reviewer exit, timeout, missing artifact, empty artifact, malformed artifact, or wrong-head artifact records an `unreviewed` attempt and exits nonzero.
 An unresolved suspicion comes from a completed reviewer and records a `blocking` attempt instead of being conflated with an invalid review artifact.
 This includes provider refusals that surface only as a stopped or silent agent.
 `bin/fm-crosscheck.sh` refuses earlier than any of these when it cannot resolve a Python 3.11 or newer interpreter for `fm-crosscheck.py`: it prints a `CROSSCHECK UNREVIEWED` banner naming the requested and discovered versions, exits nonzero, and records no ledger run because nothing about the PR was examined.
@@ -320,9 +215,6 @@ The read adapter exposes no merge subcommand; only the gate-refused `fm-crossche
 The installed reviewer invocation was exercised successfully with `--output-schema`, `--output-last-message`, `--model gpt-5.6-sol`, and `model_reasoning_effort="xhigh"` before production code used those flags.
 The installed Claude invocation was exercised successfully with a private `HOME`, selected-account `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `--model claude-opus-5`, `--effort xhigh`, `--dangerously-skip-permissions`, `--tools Bash,Read,Glob,Grep`, `--no-session-persistence`, `--output-format json`, and `--json-schema` before production code used those flags.
 The installed `/usr/bin/sandbox-exec` was also exercised with the generated profile: a write inside the allowed review directory succeeded, while sibling and `/private/tmp` writes failed with `Operation not permitted`.
-On 2026-08-09 the Jest mutation route was exercised at relvino PR 1049 head `5649c234b0f258cde4d62870759e353fade5ff3d` in a fresh exact-head clone.
-The gate selected Node 20.20.2 for the package's `20.x` declaration, used npm 10.8.2 and the tracked package lock to materialize Jest 29.7.0 offline with lifecycle scripts disabled, and ran the fixed `--runInBand --runTestsByPath --ci --no-cache --json` protocol under the no-network sandbox.
-The tracked `V3PreviewPane.test.tsx` reported 33 executed and zero failed tests at baseline; replacing the session key with one shared key reported the same 33 executed tests with two failures, so the result demonstrated positive mutation detection rather than a runner-status inference.
 
 ## Validation evidence boundaries
 
@@ -332,18 +224,6 @@ Its `test_installed_sandbox_denies_shared_private_tmp` case is the exception: it
 Its tracked `test_real_claude_sandbox_executes_exact_sha_git_diff` case is an opt-in real-runtime guard: with `FM_TEST_REAL_CLAUDE_SANDBOX_GIT_DIFF=1` and `FM_TEST_REAL_CLAUDE_CONFIG_DIR` set to a credentialed independent Claude home, it creates the same private execution `HOME`, verifies the selected OAuth-file or scoped-Keychain source, launches installed Claude under the generated installed sandbox, requires Bash to execute `git diff` between two real exact SHAs, checks the selected config paths and isolated `CLAUDE_CODE_TMPDIR`, and rejects any profile grant for the ambient operator `~/.claude/session-env`.
 Ordinary CI prints a named skip for this network- and credential-dependent guard instead of substituting fake-only coverage.
 The retained live runtime proof is the change receipt for this patch; the opt-in test is the repeatable regression guard for future environments.
-Its `test_pytest_runner_resolves_through_a_uv_aware_ladder` case is the named regression for runner-name resolution: it pins monorepo uv-project discovery, the skipped uv rung outside a project, the unchanged absent-runner refusal, and pytest's retained node-id support.
-Its `test_account_less_known_provider_lane_is_reviewable` case is the named regression for an account-less Pi lane whose provider-slot identity is unreadable: it requires a cross-provider reviewer to clear it and a same-provider reviewer to remain refused.
-Its `test_same_model_relaxation_requires_proven_separate_account` case provides a launch-recorded routed Pi identity and proves that default and explicit-off policy reject same-provider review, opt-in still rejects missing, same, or unreadable account proof, ambient credential drift cannot replace the snapshot, and only a recorded-distinct OpenAI account becomes eligible.
-Its `test_typescript_jest_mutation_proof_can_clear` and `test_inadequate_typescript_jest_coverage_stays_blocking` cases prove that package-governed Jest coverage can certify a TypeScript fix while a named Jest test that stays green under mutation keeps the finding blocking.
-Its `test_preexisting_jest_runner_cannot_certify` case proves that a committed Jest-shaped output script is refused before package-manager materialization, and `test_local_fake_jest_package_cannot_certify` proves a lockfile-routed local fake package cannot substitute for official registry provenance.
-Its `test_local_transitive_jest_package_cannot_certify` case keeps top-level Jest registry-authenticated while substituting a local `jest-cli`, and proves that every transitive runtime package must remain inside the authenticated closure.
-Its `test_jest_runs_under_declared_node_major` case proves the selected Node path governs installation and both proof executions.
-Its `test_typescript_without_usable_route_is_cannot_certify` case proves that an unsupported package-governed route writes and reports `CANNOT-CERTIFY` rather than silently clearing or manufacturing a code verdict.
-Its `test_python_mutation_proof_is_byte_exact` case compares the complete normalized Python proof record to the pre-Jest shape so the new language route cannot drift existing pytest evidence.
-Its `test_claude_execution_home_always_binds_the_keychain` case is the named regression for the private-`HOME` Keychain bind, and it fails if the bind is made conditional on `.credentials.json` again.
-Its `test_moved_default_branch_stays_reviewable` case is the named regression for base drift: it advances the fake default branch past the PR's branch point, then requires the run to review against the merge base, record it, and still verify.
-Its `test_unavailable_reviewer_fails_over_to_the_next_account` case covers reviewer failover using the observed zero-turn Claude error envelope, and asserts the ledger records the abandoned attempt with the reason the reviewer reported rather than a truncated envelope.
 Its `test_forged_git_diff_mutation_command_is_rejected` case is the named regression that fails if a free-form `git diff --quiet # tests/regression.test.sh` can replace real mutation verification.
 Its `test_baseline_readable_state_is_destroyed_before_mutation` and `test_mutation_is_bound_to_cited_non_test_implementation` cases cover the two mutation-causality bypasses found in the final review round.
 Its `test_mutated_non_execution_cannot_clear_a_finding` case covers the third bypass of that class: a mutation that only broke test collection exits nonzero and previously read as a caught regression, so the gate could certify a fix on a test that never ran.
@@ -360,11 +240,6 @@ Crosscheck supports immediate `merge`, `squash`, and `rebase` methods plus commi
 It rejects `--auto` because an asynchronous merge would escape the immediate expected-head request.
 It rejects `--delete-branch` because branch deletion is not part of the atomic merge or enqueue operation.
 Delete a branch only in a later separately authorized action after the merge is confirmed.
-
-Reviewer-generated commands execute in a non-login shell, so evidence never depends on the operator's shell profile.
-This is not a detail: a login shell runs macOS `path_helper`, which rebuilds `PATH` with `/usr/bin` ahead of everything else, so a bare `python3` in a reproduction resolved to Xcode's Python 3.9 even while the gate itself ran on 3.14.
-Any reproduction against a repository requiring 3.10 or newer then died on an unrelated `ImportError`, and because a failed new-finding reproduction voids the run, a complete review with real findings was recorded as `unreviewed`.
-Approved mutation-proof runners are resolved from the gate's own `PATH` and were never affected.
 
 Reviewer-generated commands execute in disposable exact-head clones with bounded timeouts.
 Codex uses its installed workspace-write sandbox, and Claude uses the explicit macOS profile described above.

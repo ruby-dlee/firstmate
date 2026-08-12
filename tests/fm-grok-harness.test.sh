@@ -34,7 +34,7 @@ case "$*" in
     ;;
 esac
 case "${1:-}" in
-  has-session|display-message)
+  display-message)
     case " $* " in
       *" -t "*) [ -f "${FM_FAKE_ENDPOINT_FILE:?}" ] || exit 1 ;;
     esac

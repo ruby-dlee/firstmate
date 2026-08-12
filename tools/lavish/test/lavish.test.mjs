@@ -271,12 +271,6 @@ async function fakeTmux(fx) {
     tmux,
     `#!/bin/sh
 case "$1" in
-  # This fixture models a LIVE supervisor pane - display-message and
-  # capture-pane both answer for it - and firstmate proves endpoint existence
-  # with has-session (display-message exits 0 even for a window that is gone,
-  # so its status carries no existence information). Without this arm the
-  # catch-all failure below would report the live supervisor as not live.
-  has-session) exit 0 ;;
   display-message)
     case "$*" in
       *pane_pid*) printf '%s\\n' "\${LAVISH_FAKE_TMUX_PANE_PID:?}" ;;
@@ -886,10 +880,7 @@ test('board renders the manifest, annotations, Markdown context, visuals, and su
   const html = await readFile(output, 'utf8');
   const { document } = parseHTML(html);
   assert.equal(document.documentElement.dataset.theme, 'dark');
-  // The request is stored and digest-bound but never rendered: a context
-  // block above the questions restates what the questions say and displaces
-  // the decisions themselves.
-  assert.equal(document.querySelector('[data-request-context]'), null);
+  assert.equal(document.querySelector('[data-request-context] h1').textContent, 'Release choice');
   const questionNodes = [...document.querySelectorAll('[data-question-key].question')];
   assert.equal(questionNodes.length, 2);
   for (const [index, question] of (await manifestFor(fx, id)).questions.entries()) {
@@ -1279,9 +1270,10 @@ test('annotation board gives one comment box per item and offers no choices', as
   assert.ok(document.querySelector('#overall-note'));
   assert.ok(document.querySelector('#submit-button'));
   // The checking scaffolding is stored but must never be shown to the captain.
-  // The whole context block is now unrendered, which satisfies that outright.
-  assert.equal(document.querySelector('[data-request-context]'), null);
-  assert.doesNotMatch(document.body.textContent, /fm-captain-item/);
+  assert.doesNotMatch(
+    document.querySelector('[data-request-context]').textContent,
+    /fm-captain-item/,
+  );
 });
 
 test('annotation board refuses to submit an entirely empty batch', async () => {

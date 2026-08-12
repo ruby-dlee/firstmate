@@ -85,7 +85,7 @@ SH
 #!/usr/bin/env bash
 set -u
 case "${1:-}" in
-  has-session|display-message)
+  display-message)
     [ "${FM_FAKE_TMUX_MISSING:-0}" = 1 ] && exit 1
     printf '%%1\n' ;;
   capture-pane)

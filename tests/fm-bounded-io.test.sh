@@ -3,14 +3,6 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 HELPER=${FM_BOUNDED_IO_HELPER:-"$ROOT/bin/fm_bounded_io.py"}
-
-# This module's hostile-JSON defense relies on CPython's integer/string
-# conversion limit, which first exists in 3.11, so it is only supported on
-# an interpreter meeting that floor. Resolve through the same owner the
-# crosscheck gate uses rather than trusting a stock-macOS `python3`.
-# shellcheck source=bin/fm-crosscheck-python-lib.sh
-. "$ROOT/bin/fm-crosscheck-python-lib.sh"
-PYTHON="$(fm_crosscheck_resolve_python)"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -28,8 +20,8 @@ assert_contains() {
 
 test_output_limit_terminates_noisy_process() {
   output="$TMP/output-limit"
-  if "$PYTHON" "$HELPER" run --timeout 5 --max-output-bytes 1024 -- \
-    "$PYTHON" -c 'import sys; sys.stdout.write("x" * 4096)' >"$output" 2>&1; then
+  if python3 "$HELPER" run --timeout 5 --max-output-bytes 1024 -- \
+    python3 -c 'import sys; sys.stdout.write("x" * 4096)' >"$output" 2>&1; then
     fail "noisy process crossed the aggregate output ceiling"
   fi
   value=$(cat "$output")
@@ -72,15 +64,15 @@ PY
 }
 
 test_final_wait_keeps_original_deadline() {
-  started=$("$PYTHON" -c 'import time; print(time.monotonic())')
+  started=$(python3 -c 'import time; print(time.monotonic())')
   output="$TMP/final-wait"
-  if "$PYTHON" "$HELPER" run --timeout 0.25 --max-output-bytes 1024 -- \
-    "$PYTHON" -c 'import os,time; os.close(1); os.close(2); time.sleep(1.5)' \
+  if python3 "$HELPER" run --timeout 0.25 --max-output-bytes 1024 -- \
+    python3 -c 'import os,time; os.close(1); os.close(2); time.sleep(1.5)' \
     >"$output" 2>&1; then
     fail "closed output pipes escaped the command deadline"
   fi
-  elapsed=$("$PYTHON" -c 'import sys,time; print(time.monotonic()-float(sys.argv[1]))' "$started")
-  "$PYTHON" -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) < 1.25 else 1)' "$elapsed" \
+  elapsed=$(python3 -c 'import sys,time; print(time.monotonic()-float(sys.argv[1]))' "$started")
+  python3 -c 'import sys; raise SystemExit(0 if float(sys.argv[1]) < 1.25 else 1)' "$elapsed" \
     || fail "final wait exceeded the original deadline: ${elapsed}s"
   assert_contains "$(cat "$output")" "timed out after 0.25 seconds" \
     "final-wait timeout was not loud"
@@ -113,8 +105,8 @@ PY
 
 test_success_reaps_residual_process_group() {
   pid_file="$TMP/residual-pid"
-  "$PYTHON" "$HELPER" run --timeout 2 --max-output-bytes 1024 -- \
-    "$PYTHON" -c 'import subprocess,sys; child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(3)"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); print(child.pid)' \
+  python3 "$HELPER" run --timeout 2 --max-output-bytes 1024 -- \
+    python3 -c 'import subprocess,sys; child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(3)"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); print(child.pid)' \
     >"$pid_file"
   child_pid=$(cat "$pid_file")
   case "$child_pid" in ''|*[!0-9]*) fail "residual child PID was malformed" ;; esac
@@ -125,8 +117,8 @@ test_success_reaps_residual_process_group() {
 
 test_tracked_detached_descendant_is_cleaned() {
   pid_file="$TMP/detached-pid"
-  "$PYTHON" "$HELPER" run --timeout 2 --max-output-bytes 1024 -- \
-    "$PYTHON" -c 'import subprocess,sys; child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,close_fds=True); print(child.pid)' \
+  python3 "$HELPER" run --timeout 2 --max-output-bytes 1024 -- \
+    python3 -c 'import subprocess,sys; child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,close_fds=True); print(child.pid)' \
     >"$pid_file"
   child_pid=$(cat "$pid_file")
   case "$child_pid" in ''|*[!0-9]*) fail "detached child PID was malformed" ;; esac
@@ -137,7 +129,7 @@ test_tracked_detached_descendant_is_cleaned() {
 }
 
 test_batch_deadline_remains_absolute() {
-  "$PYTHON" - "$HELPER" <<'PY'
+  python3 - "$HELPER" <<'PY'
 import importlib.util
 import sys
 import time
@@ -167,7 +159,7 @@ PY
 }
 
 test_selector_failure_precedes_spawn() {
-  "$PYTHON" - "$HELPER" <<'PY'
+  python3 - "$HELPER" <<'PY'
 import importlib.util
 import sys
 
@@ -205,7 +197,7 @@ PY
 }
 
 test_input_validation_precedes_spawn() {
-  "$PYTHON" - "$HELPER" <<'PY'
+  python3 - "$HELPER" <<'PY'
 import importlib.util
 import sys
 
@@ -239,7 +231,7 @@ PY
 }
 
 test_identity_bound_signaling_avoids_reused_pids() {
-  "$PYTHON" - "$HELPER" <<'PY'
+  python3 - "$HELPER" <<'PY'
 import errno
 import importlib.util
 import signal
@@ -290,7 +282,7 @@ PY
 }
 
 test_process_census_enforces_item_and_time_bounds() {
-  "$PYTHON" - "$HELPER" <<'PY'
+  python3 - "$HELPER" <<'PY'
 import errno
 import importlib.util
 import sys
@@ -340,7 +332,7 @@ PY
 }
 
 test_linux_child_inventory_streams_with_bounds() {
-  "$PYTHON" - "$HELPER" <<'PY'
+  python3 - "$HELPER" <<'PY'
 import errno
 import importlib.util
 import sys
@@ -387,7 +379,7 @@ PY
 }
 
 test_darwin_descendant_refresh_prunes_stale_entries() {
-  "$PYTHON" - "$HELPER" <<'PY'
+  python3 - "$HELPER" <<'PY'
 import errno
 import importlib.util
 import sys
@@ -429,7 +421,7 @@ PY
 }
 
 test_partial_input_writes_do_not_copy_remainder() {
-  "$PYTHON" - "$HELPER" <<'PY'
+  python3 - "$HELPER" <<'PY'
 import importlib.util
 import sys
 
@@ -464,15 +456,15 @@ PY
 
 test_json_artifact_is_bounded_and_regular() {
   artifact="$TMP/verdict.json"
-  "$PYTHON" -c 'import json,sys; open(sys.argv[1],"w").write(json.dumps({"padding":"x"*4096}))' "$artifact"
+  python3 -c 'import json,sys; open(sys.argv[1],"w").write(json.dumps({"padding":"x"*4096}))' "$artifact"
   output="$TMP/artifact-output"
-  if "$PYTHON" "$HELPER" json --max-bytes 1024 "$artifact" >"$output" 2>&1; then
+  if python3 "$HELPER" json --max-bytes 1024 "$artifact" >"$output" 2>&1; then
     fail "oversized structured artifact bypassed its byte ceiling"
   fi
   assert_contains "$(cat "$output")" "exceeds 1024 bytes" \
     "oversized artifact failure was not loud"
   ln -s "$artifact" "$TMP/verdict-link.json"
-  if "$PYTHON" "$HELPER" json --max-bytes 8192 "$TMP/verdict-link.json" \
+  if python3 "$HELPER" json --max-bytes 8192 "$TMP/verdict-link.json" \
     >"$output" 2>&1; then
     fail "symlinked structured artifact was accepted"
   fi
@@ -482,7 +474,7 @@ test_json_artifact_is_bounded_and_regular() {
 
 test_concurrent_artifact_replacements_are_rejected() {
   artifact="$TMP/concurrent-verdict.json"
-  "$PYTHON" - "$HELPER" "$artifact" <<'PY'
+  python3 - "$HELPER" "$artifact" <<'PY'
 import importlib.util
 import os
 from pathlib import Path
@@ -564,9 +556,9 @@ PY
 
 test_json_decoded_strings_are_bounded() {
   artifact="$TMP/strings.json"
-  "$PYTHON" -c 'import json,sys; open(sys.argv[1],"w").write(json.dumps({"padding":"x"*512}))' "$artifact"
+  python3 -c 'import json,sys; open(sys.argv[1],"w").write(json.dumps({"padding":"x"*512}))' "$artifact"
   output="$TMP/structure-output"
-  if "$PYTHON" "$HELPER" json --max-bytes 2048 --max-string-bytes 128 "$artifact" \
+  if python3 "$HELPER" json --max-bytes 2048 --max-string-bytes 128 "$artifact" \
     >"$output" 2>&1; then
     fail "decoded strings bypassed their aggregate ceiling"
   fi
@@ -575,7 +567,7 @@ test_json_decoded_strings_are_bounded() {
 }
 
 test_hostile_json_failures_are_normalized() {
-  "$PYTHON" - "$HELPER" "$TMP" <<'PY'
+  python3 - "$HELPER" "$TMP" <<'PY'
 import importlib.util
 from pathlib import Path
 import sys
@@ -628,7 +620,7 @@ PY
 }
 
 test_batch_item_count_is_bounded() {
-  "$PYTHON" - "$HELPER" <<'PY'
+  python3 - "$HELPER" <<'PY'
 import importlib.util
 import sys
 

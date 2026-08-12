@@ -260,7 +260,7 @@ case "${1:-}" in
       prev=$arg
     done
     ;;
-  has-session|display-message)
+  display-message)
     target=
     prev=
     for arg in "$@"; do
@@ -286,7 +286,7 @@ add_dead_tmux_fake() {  # <fakebin-dir>
   cat > "$fb/tmux" <<'SH'
 #!/usr/bin/env bash
 case "${1:-}" in
-  has-session|display-message) exit 1 ;;
+  display-message) exit 1 ;;
 esac
 exit 0
 SH

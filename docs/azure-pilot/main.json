@@ -26,12 +26,6 @@
         "description": "Local VM administrator name."
       }
     },
-    "adminSshPublicKey": {
-      "type": "secureString",
-      "metadata": {
-        "description": "Out-of-band public key for authenticated SSH only over the private overlay; no public SSH path is created."
-      }
-    },
     "runnerOperatorPrincipalId": {
       "type": "string",
       "metadata": {
@@ -343,9 +337,6 @@
           "adminUsername": {
             "value": "[parameters('adminUsername')]"
           },
-          "adminSshPublicKey": {
-            "value": "[parameters('adminSshPublicKey')]"
-          },
           "runnerOperatorPrincipalId": {
             "value": "[parameters('runnerOperatorPrincipalId')]"
           },
@@ -424,9 +415,6 @@
               "type": "secureString"
             },
             "adminUsername": {
-              "type": "secureString"
-            },
-            "adminSshPublicKey": {
               "type": "secureString"
             },
             "runnerOperatorPrincipalId": {
@@ -1378,15 +1366,7 @@
                   "adminUsername": "[parameters('adminUsername')]",
                   "linuxConfiguration": {
                     "disablePasswordAuthentication": true,
-                    "provisionVMAgent": true,
-                    "ssh": {
-                      "publicKeys": [
-                        {
-                          "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
-                          "keyData": "[parameters('adminSshPublicKey')]"
-                        }
-                      ]
-                    }
+                    "provisionVMAgent": true
                   }
                 },
                 "storageProfile": {
@@ -1486,15 +1466,7 @@
                   "adminUsername": "[parameters('adminUsername')]",
                   "linuxConfiguration": {
                     "disablePasswordAuthentication": true,
-                    "provisionVMAgent": true,
-                    "ssh": {
-                      "publicKeys": [
-                        {
-                          "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
-                          "keyData": "[parameters('adminSshPublicKey')]"
-                        }
-                      ]
-                    }
+                    "provisionVMAgent": true
                   }
                 },
                 "storageProfile": {

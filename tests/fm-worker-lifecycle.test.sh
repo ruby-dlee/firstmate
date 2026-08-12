@@ -1,0 +1,664 @@
+#!/usr/bin/env bash
+# shellcheck source=tests/test-entry.sh
+. "$(dirname "$0")/test-entry.sh"
+# Hermetic queue, budget, fencing, reset, recovery, and classification coverage
+# for the provider-neutral elastic worker lifecycle and Azure adapter contract.
+set -u
+
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+CONTROLLER="$ROOT/bin/fm-worker-lifecycle.py"
+WRAPPER="$ROOT/bin/fm-worker-lifecycle.sh"
+AZURE="$ROOT/bin/fm-azure-worker-provider.py"
+DOC="$ROOT/docs/azure-workers.md"
+SUB=11111111-1111-4111-8111-111111111111
+
+static_contract() {
+  python3 - "$CONTROLLER" "$AZURE" "$DOC" <<'PY' || fail "elastic worker static contract failed"
+from pathlib import Path
+import sys
+
+controller = Path(sys.argv[1]).read_text(encoding="utf-8")
+azure = Path(sys.argv[2]).read_text(encoding="utf-8")
+doc = Path(sys.argv[3]).read_text(encoding="utf-8")
+for marker in (
+    '"assigned", "clean-warm", "deallocated", "orphaned-safe-to-delete", "retained-for-investigation"',
+    "REGIONAL_LANDING_RESERVE_VCPUS = 62", "MAX_WORKERS = 16",
+    'FM_AZURE_WORKER_WARM_IDLE currently must remain zero', "pending_action",
+    "endpoint_receipt", "landed_work_receipt", "account_release_receipt",
+):
+    assert marker in controller, marker
+for marker in (
+    "run_pilot_create", "conditional_delete", "If-Match=", "reuse_retained",
+    "same-name foreign", "/usr/local/libexec/fm-worker-supervisor",
+    "worker NIC has a public IP relation", "VM cloud identity set is not exactly one slot identity",
+):
+    assert marker in azure, marker
+for marker in (
+    "sixteen author workers", "$1,500", "3,500 aggregate worker-hours",
+    "downloaded self-contained form artifact", "returns through a file",
+    "Every acceptance leg needs a positive control", "warm-idle target is zero",
+):
+    assert marker in doc, marker
+assert "hosted form service" in doc and "force-delete" in doc
+PY
+  pass "provider seam, Azure identity fencing, cost boundary, Lavish contract, and acceptance controls are documented"
+}
+
+classification_and_admission_matrix() {
+  python3 - "$CONTROLLER" <<'PY' || fail "classification/admission matrix failed"
+import copy
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("lifecycle", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+env = {
+    "max_workers": 16, "planning_hours": 3500.0, "policy_phase": "commissioning",
+    "commissioning_ceiling_usd": 1500.0, "steady_target_usd": 1000.0,
+    "admission_hours": 24.0, "cooldown_seconds": 300, "warm_idle": 0,
+}
+state = {
+    "queue": {}, "workers": {}, "completed_worker_seconds": 0.0,
+    "cleanup_refusals": [], "next_assignment": 1,
+}
+item = {
+    "schema": module.REQUEST_SCHEMA, "task": "task-one", "task_generation": "task-gen",
+    "repository_generation": "repo-gen", "home_binding": "1" * 64,
+    "account_binding": "2" * 64, "worktree_binding": "3" * 64,
+    "repository_binding": "4" * 64, "owner_kind": "primary", "role": "author",
+    "eligible": True, "discretionary": True, "status": "queued", "enqueued_at": "2026-01-01T00:00:00Z",
+}
+module.verify_request(item)
+worker = module.create_worker_record(
+    dict(env, deployment_generation="dep", owner="owner"), state, 1, item, 10.0
+)
+tags = module.expected_tags(worker)
+resources = {}
+for kind in module.REQUIRED_RESOURCE_KINDS:
+    resources[kind] = {
+        "id": "/slot/1/" + kind, "immutable_id": "immutable-" + kind,
+        "tags": dict(tags),
+    }
+resources["vm"]["power_state"] = "VM running"
+resources["nic"]["attached_to"] = resources["vm"]["id"]
+for kind in ("os-disk", "task-disk", "account-disk"):
+    resources[kind]["attached_to"] = resources["vm"]["id"]
+cloud = {"slot": 1, "resources": resources}
+worker["resources"] = {kind: module.resource_identity(value) for kind, value in resources.items()}
+worker["cloud_instance_id"] = resources["vm"]["immutable_id"]
+worker["phase"] = "assigned"
+worker["assigned_at"] = "2026-01-01T00:00:00Z"
+
+assert module.classify_worker(worker, cloud)[0] == "assigned"
+warm = copy.deepcopy(worker)
+warm["bindings"]["task"] = "unbound"
+warm_tags = module.expected_tags(warm)
+for value in cloud["resources"].values():
+    value["tags"] = dict(warm_tags)
+assert module.classify_worker(warm, cloud)[0] == "clean-warm"
+for value in cloud["resources"].values():
+    value["tags"] = dict(tags)
+released = copy.deepcopy(worker)
+released["release_proof"] = {"proof_digest": "5" * 64}
+released["cooldown_started_at"] = "2026-01-01T00:00:00Z"
+deallocated = copy.deepcopy(cloud)
+deallocated["resources"]["vm"]["power_state"] = "VM deallocated"
+assert module.classify_worker(released, deallocated)[0] == "deallocated"
+residual = copy.deepcopy(cloud)
+for kind in ("vm", "nic", "os-disk"):
+    residual["resources"].pop(kind)
+released["phase"] = "compute-removed"
+assert module.classify_worker(released, residual)[0] == "orphaned-safe-to-delete"
+assert module.classify_worker(worker, residual)[0] == "retained-for-investigation"
+foreign = copy.deepcopy(cloud)
+foreign["resources"]["task-disk"]["immutable_id"] = "foreign"
+assert module.classify_worker(worker, foreign)[0] == "retained-for-investigation"
+assert module.classify_worker(worker, None)[0] == "retained-for-investigation"
+
+metrics = {
+    "actual_usd": 100.0, "forecast_usd": 200.0,
+    "regional_limit_vcpus": 128, "regional_used_vcpus": 2,
+    "family_free_vcpus": {family: 100 for _, family in module.SKU_PLAN.values()},
+    "sku_hourly_usd": {sku: 0.25 for sku, _ in module.SKU_PLAN.values()},
+}
+inventory = {"metrics": metrics, "workers": [], "conflicts": []}
+assert module.admission_result(env, state, inventory, 1, item)[0] is True
+for field in ("actual_usd", "forecast_usd"):
+    changed = copy.deepcopy(inventory)
+    changed["metrics"][field] = None
+    assert module.admission_result(env, state, changed, 1, item)[0] is False
+changed = copy.deepcopy(inventory)
+changed["metrics"]["regional_used_vcpus"] = 63
+assert module.admission_result(env, state, changed, 1, item)[0] is False
+changed = copy.deepcopy(inventory)
+changed["metrics"]["family_free_vcpus"][module.SKU_PLAN[1][1]] = 3
+assert module.admission_result(env, state, changed, 1, item)[0] is False
+changed = copy.deepcopy(inventory)
+changed["metrics"]["forecast_usd"] = 1499.0
+assert module.admission_result(env, state, changed, 1, item)[0] is False
+required = dict(item, discretionary=False)
+assert module.admission_result(env, state, changed, 1, required)[0] is True
+
+# Sixteen distinct queued tasks produce a sixteen-worker desired burst, while
+# the seventeenth remains demand rather than becoming a seventeenth VM.
+for index in range(17):
+    queued = dict(item)
+    queued.update({
+        "task": "task-{}".format(index), "task_generation": "gen-{}".format(index),
+        "account_binding": format(index + 10, "064x"),
+        "worktree_binding": format(index + 100, "064x"),
+    })
+    state["queue"][module.request_key(queued["task"], queued["task_generation"])] = queued
+assert module.desired_count(env, state, inventory) == 16
+budgeted = copy.deepcopy(inventory)
+budgeted["metrics"]["actual_usd"] = 1499.0
+budgeted["metrics"]["forecast_usd"] = 1499.0
+assert module.desired_count(env, state, budgeted) == 0
+
+# Duplicate account and worktree ownership refuse independently.
+existing = next(iter(state["queue"].values()))
+try:
+    module.ensure_unique_bindings(state, dict(
+        item, task="other", account_binding=existing["account_binding"], worktree_binding="9" * 64
+    ))
+except module.LifecycleError as exc:
+    assert "provider-account" in str(exc)
+else:
+    raise AssertionError("shared account lease was accepted")
+try:
+    module.ensure_unique_bindings(state, dict(
+        item, task="other", account_binding="9" * 64, worktree_binding=existing["worktree_binding"]
+    ))
+except module.LifecycleError as exc:
+    assert "worktree" in str(exc)
+else:
+    raise AssertionError("shared writable worktree was accepted")
+PY
+  pass "all reconciliation classes and quota, cost, shared-account, shared-worktree refusal controls distinguish unsafe state"
+}
+
+azure_provider_refusal_matrix() {
+  python3 - "$AZURE" <<'PY' || fail "Azure provider refusal matrix failed"
+import copy
+import hashlib
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("azure_provider", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+controller = {
+    "subscription": "11111111-1111-4111-8111-111111111111",
+    "resource_group": "rg", "deployment_generation": "dep", "owner": "owner", "prefix": "fmtest",
+}
+action = {
+    "type": "deallocate", "slot": 1, "sku": "Standard_D4as_v6",
+    "sku_family": "standardDav6Family", "cloud_generation": 1,
+    "deployment_generation": "dep", "owner": "owner", "cloud_instance_id": "vm-instance",
+    "bindings": {
+        "home_binding": "1" * 64, "task": "task", "task_generation": "task-gen",
+        "assignment_generation": "asg-00000001", "account_binding": "2" * 64,
+        "worktree_binding": "3" * 64, "repository_binding": "4" * 64,
+        "repository_generation": "repo-gen",
+    },
+}
+tags = module.action_tags(controller, action)
+resources = {}
+for kind in module.REQUIRED_RESOURCE_KINDS:
+    resources[kind] = {
+        "id": "/resource/" + kind, "immutable_id": "immutable-" + kind,
+        "etag": "etag-" + kind, "tags": dict(tags),
+    }
+resources["vm"]["power_state"] = "VM running"
+resources["nic"]["attached_to"] = resources["vm"]["id"]
+for kind in ("os-disk", "task-disk", "account-disk"):
+    resources[kind]["attached_to"] = resources["vm"]["id"]
+action["resources"] = {
+    kind: {"id": value["id"], "immutable_id": value["immutable_id"]}
+    for kind, value in resources.items()
+}
+worker = {"slot": 1, "resources": resources}
+module.recorded_exact(action, worker)
+for kind in module.REQUIRED_RESOURCE_KINDS:
+    changed = copy.deepcopy(worker)
+    changed["resources"][kind]["immutable_id"] = "foreign"
+    try:
+        module.recorded_exact(action, changed)
+    except module.ProviderError:
+        pass
+    else:
+        raise AssertionError("foreign {} immutable identity accepted".format(kind))
+for key in tags:
+    changed = copy.deepcopy(worker)
+    changed["resources"]["task-disk"]["tags"][key] = "foreign"
+    try:
+        module.recorded_exact(action, changed)
+    except module.ProviderError:
+        pass
+    else:
+        raise AssertionError("foreign task-disk tag accepted: {}".format(key))
+
+# Public IP relations are rejected while a private NIC is accepted.
+nic = {
+    "id": "/nic", "etag": "etag", "tags": tags,
+    "properties": {"resourceGuid": "guid", "ipConfigurations": [{"properties": {}}]},
+}
+module.resource_record("nic", nic)
+public = copy.deepcopy(nic)
+public["properties"]["ipConfigurations"][0]["properties"]["publicIPAddress"] = {"id": "/public"}
+try:
+    module.resource_record("nic", public)
+except module.ProviderError as exc:
+    assert "public IP" in str(exc)
+else:
+    raise AssertionError("public worker NIC relation accepted")
+
+# Ordinary resources require conditional ETags; exact role assignments use
+# their principal/role immutable pair because Azure may omit an ETag there.
+calls = []
+module.az = lambda controller_arg, args, check=False: calls.append(args) or ({}, 0, "")
+try:
+    module.conditional_delete(controller, "task-disk", {"id": "/disk", "etag": None})
+except module.ProviderError as exc:
+    assert "ETag" in str(exc)
+else:
+    raise AssertionError("unfenced task-disk deletion accepted")
+module.conditional_delete(controller, "role-assignment", {"id": "/role", "etag": None})
+assert calls[-1][0:3] == ["rest", "--method", "delete"] and "--headers" not in calls[-1]
+
+# Mutation idempotency rejects any changed action under a stale key.
+unsigned = dict(action)
+unsigned["type"] = "steer"
+unsigned["request_digest"] = "5" * 64
+unsigned["idempotency_key"] = hashlib.sha256(module.canonical_bytes(unsigned)).hexdigest()
+tampered = dict(unsigned)
+tampered["request_digest"] = "6" * 64
+try:
+    module.mutate(controller, tampered)
+except module.ProviderError as exc:
+    assert "idempotency" in str(exc)
+else:
+    raise AssertionError("tampered provider action accepted")
+PY
+  pass "Azure provider rejects every foreign immutable/tag identity, public NIC relation, unfenced disk delete, and stale action key"
+}
+
+write_fixture_provider() {
+  cat >"$1" <<'PY'
+#!/usr/bin/env python3
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+
+path = Path(os.environ["FIXTURE_STATE"])
+request = json.load(sys.stdin)
+controller = request["controller"]
+if path.exists():
+    state = json.loads(path.read_text())
+else:
+    state = {
+        "workers": {}, "seen": {}, "calls": [],
+        "metrics": {"actual_usd": 100.0, "forecast_usd": 150.0},
+    }
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+def tags(action):
+    bindings = action["bindings"]
+    return {
+        "workload": "firstmate", "firstmate-role": "worker",
+        "deployment-generation": action["deployment_generation"], "cleanup-owner": action["owner"],
+        "worker-slot": str(action["slot"]), "home-binding": bindings["home_binding"],
+        "task-binding": bindings["task"], "task-generation": bindings["task_generation"],
+        "assignment-generation": bindings["assignment_generation"],
+        "account-binding": bindings["account_binding"], "worktree-binding": bindings["worktree_binding"],
+        "repository-binding": bindings["repository_binding"],
+        "repository-generation": bindings["repository_generation"],
+        "agent-capacity": "one-task-scoped-crewmate", "nested-team": "forbidden",
+        "secondmate-placement": "forbidden", "browser-profile": "forbidden",
+    }
+
+def resource(action, kind, serial=None):
+    serial = serial or "{}-{}".format(action["cloud_generation"], action["idempotency_key"][:8])
+    value = {
+        "id": "/fixture/slot/{}/{}".format(action["slot"], kind),
+        "immutable_id": "{}-{}".format(kind, serial), "etag": "etag-{}".format(serial),
+        "tags": tags(action),
+    }
+    return value
+
+def complete_worker(action, retained=None):
+    resources = dict(retained or {})
+    for kind in ("vm", "nic", "os-disk", "task-disk", "account-disk", "identity", "role-assignment", "state-container"):
+        if kind not in resources:
+            resources[kind] = resource(action, kind)
+    resources["vm"]["power_state"] = "VM running"
+    resources["nic"]["attached_to"] = resources["vm"]["id"]
+    for kind in ("os-disk", "task-disk", "account-disk"):
+        resources[kind]["attached_to"] = resources["vm"]["id"]
+    return {"slot": action["slot"], "resources": resources}
+
+def save():
+    path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
+
+if request["operation"] == "mutate":
+    action = request["action"]
+    key = action["idempotency_key"]
+    state["calls"].append({"type": action["type"], "slot": action["slot"], "key": key})
+    if key in state["seen"]:
+        result = state["seen"][key]
+    else:
+        slot = str(action["slot"])
+        kind = action["type"]
+        if kind == "create":
+            assert slot not in state["workers"]
+            worker = complete_worker(action)
+            state["workers"][slot] = worker
+            result = {"idempotency_key": key, "action": kind, "worker": worker}
+        elif kind == "resume":
+            old = state["workers"][slot]["resources"]
+            retained = {name: old[name] for name in ("task-disk", "account-disk", "identity", "role-assignment", "state-container")}
+            worker = complete_worker(action, retained=retained)
+            state["workers"][slot] = worker
+            result = {"idempotency_key": key, "action": kind, "worker": worker}
+        elif kind == "deallocate":
+            worker = state["workers"][slot]
+            worker["resources"]["vm"]["power_state"] = "VM deallocated"
+            result = {"idempotency_key": key, "action": kind, "worker": worker}
+        elif kind == "delete-compute":
+            worker = state["workers"][slot]
+            for name in ("vm", "nic", "os-disk"):
+                worker["resources"].pop(name, None)
+            for name in ("task-disk", "account-disk"):
+                worker["resources"][name]["attached_to"] = None
+            result = {"idempotency_key": key, "action": kind, "worker": worker}
+        elif kind == "reset":
+            state["workers"].pop(slot)
+            result = {"idempotency_key": key, "action": kind}
+        elif kind == "steer":
+            result = {"idempotency_key": key, "action": kind, "worker": state["workers"][slot]}
+        else:
+            raise AssertionError(kind)
+        state["seen"][key] = result
+    save()
+else:
+    active = sum(
+        1 for worker in state["workers"].values()
+        if "vm" in worker["resources"] and "deallocated" not in worker["resources"]["vm"].get("power_state", "").lower()
+    )
+    metrics = {
+        "actual_usd": state["metrics"]["actual_usd"],
+        "forecast_usd": state["metrics"]["forecast_usd"],
+        "regional_limit_vcpus": 128, "regional_used_vcpus": 2 + 4 * active,
+        "family_free_vcpus": {}, "sku_hourly_usd": {},
+    }
+    plan = {
+        1:("Standard_D4as_v6","standardDav6Family"),2:("Standard_D4as_v6","standardDav6Family"),
+        3:("Standard_D4as_v7","StandardDasv7Family"),4:("Standard_D4as_v7","StandardDasv7Family"),
+        5:("Standard_D4s_v6","StandardDsv6Family"),6:("Standard_D4s_v6","StandardDsv6Family"),
+        7:("Standard_D4ads_v7","StandardDadsv7Family"),8:("Standard_D4ads_v7","StandardDadsv7Family"),
+        9:("Standard_D4ads_v6","standardDadv6Family"),10:("Standard_D4ads_v6","standardDadv6Family"),
+        11:("Standard_E4as_v7","StandardEasv7Family"),12:("Standard_E4as_v7","StandardEasv7Family"),
+        13:("Standard_E4as_v6","standardEav6Family"),14:("Standard_E4as_v6","standardEav6Family"),
+        15:("Standard_D4ds_v6","StandardDdsv6Family"),16:("Standard_D4ds_v6","StandardDdsv6Family"),
+    }
+    for sku, family in plan.values():
+        metrics["family_free_vcpus"][family] = 100
+        metrics["sku_hourly_usd"][sku] = 0.25
+    inventory = {
+        "schema": "fm.worker-provider-inventory/v1", "observed_at": "2026-01-01T00:00:00Z",
+        "workers": [state["workers"][key] for key in sorted(state["workers"], key=int)],
+        "conflicts": [], "metrics": metrics,
+    }
+    result = inventory
+
+response = {
+    "schema": "fm.worker-provider-response/v1", "operation": request["operation"],
+    "controller": controller,
+}
+response["result" if request["operation"] == "mutate" else "inventory"] = result
+print(json.dumps(response, sort_keys=True, separators=(",", ":")))
+PY
+  chmod +x "$1"
+}
+
+end_to_end_lifecycle() {
+  local tmp provider fixture home envfile
+  fm_test_tmproot_into tmp fm-worker-lifecycle
+  provider="$tmp/provider.py"
+  fixture="$tmp/provider-state.json"
+  home="$tmp/home"
+  mkdir -p "$home"
+  write_fixture_provider "$provider"
+  envfile="$tmp/env"
+  cat >"$envfile" <<EOF
+FM_HOME=$home
+FM_AZURE_SUBSCRIPTION_ID=$SUB
+FM_AZURE_DEPLOYMENT_GENERATION=dep-one
+FM_AZURE_OWNER_TAG=owner
+FM_AZURE_NAMING_PREFIX=fmtest
+FM_AZURE_WORKER_IDLE_COOLDOWN_SECONDS=0
+FM_WORKER_PROVIDER_COMMAND=python3 $provider
+FIXTURE_STATE=$fixture
+EOF
+
+  python3 - "$CONTROLLER" "$WRAPPER" "$envfile" "$fixture" <<'PY' || fail "end-to-end lifecycle exercise failed"
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+controller_path, wrapper, envfile, fixture_path = sys.argv[1:]
+env = os.environ.copy()
+for line in Path(envfile).read_text().splitlines():
+    key, value = line.split("=", 1)
+    env[key] = value
+
+def run(*args, check=True):
+    result = subprocess.run([wrapper] + list(args), env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and result.returncode != 0:
+        raise AssertionError("{} failed: {}".format(args, result.stderr))
+    return result
+
+def binding(number):
+    return format(number, "064x")
+
+def request(number):
+    run(
+        "request", "--task", "task-{}".format(number), "--task-generation", "gen-{}".format(number),
+        "--home-binding", binding(1000 + number), "--account-binding", binding(2000 + number),
+        "--worktree-binding", binding(3000 + number), "--repository-binding", binding(4000 + number),
+        "--repository-generation", "repo-{}".format(number), "--owner-kind", "primary", "--eligible",
+    )
+
+def controller_state():
+    return json.loads((Path(env["FM_HOME"]) / "state/azure-workers/controller.json").read_text())
+
+def fixture_state():
+    return json.loads(Path(fixture_path).read_text())
+
+def release(number):
+    state = controller_state()
+    item = state["queue"]["task-{}@gen-{}".format(number, number)]
+    worker = state["workers"][str(item["slot"])]
+    proof = {
+        "schema": "fm.worker-release/v1", "home_binding": worker["bindings"]["home_binding"],
+        "task": "task-{}".format(number), "task_generation": "gen-{}".format(number),
+        "assignment_generation": worker["assignment_generation"],
+        "account_binding": worker["bindings"]["account_binding"],
+        "worktree_binding": worker["bindings"]["worktree_binding"],
+        "repository_binding": worker["bindings"]["repository_binding"],
+        "repository_generation": worker["bindings"]["repository_generation"],
+        "cloud_instance_id": worker["cloud_instance_id"], "resources": worker["resources"],
+        "endpoint_receipt": binding(5000 + number), "report_receipt": binding(6000 + number),
+        "landed_work_receipt": binding(7000 + number), "account_release_receipt": binding(8000 + number),
+        "cleanup_receipt": binding(9000 + number),
+    }
+    canonical = json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()
+    proof["proof_digest"] = hashlib.sha256(canonical).hexdigest()
+    path = Path(env["FM_HOME"]) / "proof-{}.json".format(number)
+    path.write_text(json.dumps(proof, sort_keys=True, separators=(",", ":")))
+    run("release", "--task", proof["task"], "--task-generation", proof["task_generation"], "--proof-file", str(path))
+
+# Start from zero and reach four parallel unique assignments.
+status = json.loads(run("status", "--json").stdout)
+assert status["queue_depth"] == 0 and status["desired_active_workers"] == 0
+for number in range(1, 5):
+    request(number)
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+state = controller_state()
+fixture = fixture_state()
+assert len(state["workers"]) == 4 and len(fixture["workers"]) == 4
+assert len({worker["bindings"]["account_binding"] for worker in state["workers"].values()}) == 4
+assert len({worker["bindings"]["worktree_binding"] for worker in state["workers"].values()}) == 4
+old_slot = state["queue"]["task-1@gen-1"]["slot"]
+old_task_disk = state["workers"][str(old_slot)]["resources"]["task-disk"]["immutable_id"]
+old_assignment = state["workers"][str(old_slot)]["assignment_generation"]
+
+# A waiting task can use the slot only after deallocate, disposable deletion,
+# complete reset, and a new assignment generation.
+release(1)
+request(5)
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+state = controller_state()
+fixture = fixture_state()
+new_item = state["queue"]["task-5@gen-5"]
+assert new_item["slot"] == old_slot
+new_worker = state["workers"][str(old_slot)]
+assert new_worker["assignment_generation"] != old_assignment
+assert new_worker["resources"]["task-disk"]["immutable_id"] != old_task_disk
+actions = [entry["type"] for entry in fixture["calls"]]
+sequence = actions[-4:]
+assert sequence == ["deallocate", "delete-compute", "reset", "create"], sequence
+
+# Drain every active task and prove queue/compute/disposable capacity reach zero.
+for number in (2, 3, 4, 5):
+    release(number)
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+state = controller_state()
+fixture = fixture_state()
+assert not state["workers"] and not fixture["workers"]
+status = json.loads(run("status", "--live", "--json").stdout)
+assert status["queue_depth"] == 0 and status["desired_active_workers"] == 0 and status["actual_active_workers"] == 0
+
+# A missing VM is retained, never treated as safe or complete, and resumes only
+# with the exact repository/task generation while keeping both dirty disks.
+request(6)
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+state = controller_state()
+slot = state["queue"]["task-6@gen-6"]["slot"]
+old_task = state["workers"][str(slot)]["resources"]["task-disk"]["immutable_id"]
+old_account = state["workers"][str(slot)]["resources"]["account-disk"]["immutable_id"]
+fixture = fixture_state()
+for kind in ("vm", "nic", "os-disk"):
+    fixture["workers"][str(slot)]["resources"].pop(kind)
+Path(fixture_path).write_text(json.dumps(fixture, sort_keys=True, separators=(",", ":")))
+status = json.loads(run("status", "--live", "--json").stdout)
+assert status["classification_counts"]["retained-for-investigation"] == 1
+wrong = run(
+    "resume", "--task", "task-6", "--task-generation", "gen-6", "--repository-binding", binding(9999),
+    "--confirm-resume", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"], check=False,
+)
+assert wrong.returncode == 2 and "repository/task generation" in wrong.stderr
+run(
+    "resume", "--task", "task-6", "--task-generation", "gen-6", "--repository-binding", binding(4006),
+    "--confirm-resume", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"],
+)
+state = controller_state()
+worker = state["workers"][str(slot)]
+assert worker["resources"]["task-disk"]["immutable_id"] == old_task
+assert worker["resources"]["account-disk"]["immutable_id"] == old_account
+assert worker["cloud_generation"] == 2
+
+# Cost pressure blocks a new discretionary launch but does not terminate the
+# resumed active task.
+request(7)
+fixture = fixture_state()
+fixture["metrics"] = {"actual_usd": 1499.0, "forecast_usd": 1499.0}
+Path(fixture_path).write_text(json.dumps(fixture, sort_keys=True, separators=(",", ":")))
+result = json.loads(run("reconcile", "--json").stdout)
+assert result["actions"][0]["type"] == "admission-refused"
+assert result["status"]["actual_active_workers"] == 1
+assert len(fixture_state()["workers"]) == 1
+PY
+  pass "operator flow scales out, resets before reuse, drains to zero, resumes dirty disks, and stops budgeted admission without killing work"
+}
+
+restart_idempotency() {
+  local tmp provider fixture home
+  fm_test_tmproot_into tmp fm-worker-restart
+  provider="$tmp/provider.py"
+  fixture="$tmp/provider-state.json"
+  home="$tmp/home"
+  mkdir -p "$home"
+  write_fixture_provider "$provider"
+  env \
+    FM_HOME="$home" \
+    FM_AZURE_SUBSCRIPTION_ID="$SUB" \
+    FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
+    FM_AZURE_OWNER_TAG=owner \
+    FM_AZURE_NAMING_PREFIX=fmtest \
+    FM_AZURE_WORKER_IDLE_COOLDOWN_SECONDS=0 \
+    FM_WORKER_PROVIDER_COMMAND="python3 $provider" \
+    FIXTURE_STATE="$fixture" \
+    python3 - "$CONTROLLER" <<'PY' || fail "restart idempotency fixture failed"
+import json
+import os
+from pathlib import Path
+import sys
+
+import importlib.util
+spec = importlib.util.spec_from_file_location("lifecycle_restart", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+env = module.environment()
+item = {
+    "schema": module.REQUEST_SCHEMA, "task": "restart-task", "task_generation": "restart-gen",
+    "repository_generation": "repo-gen", "home_binding": "1" * 64,
+    "account_binding": "2" * 64, "worktree_binding": "3" * 64,
+    "repository_binding": "4" * 64, "owner_kind": "primary", "role": "author",
+    "eligible": True, "discretionary": True, "status": "queued", "enqueued_at": module.iso_utc(),
+}
+with module.controller_lock(env):
+    state = module.load_state(env)
+    state["queue"][module.request_key(item["task"], item["task_generation"])] = item
+    inventory = module.provider_call(env, "inventory")["inventory"]
+    action = module.next_reconcile_action(env, state, inventory)
+    state["pending_action"] = action
+    module.save_state(env, state)
+    # The provider completed, but the controller process is modeled as dying
+    # before it durably applied the response.
+    module.provider_call(env, "mutate", action)
+
+with module.controller_lock(env):
+    restarted = module.load_state(env)
+    assert restarted["pending_action"]["idempotency_key"] == action["idempotency_key"]
+    assert module.replay_pending(env, restarted) is True
+    assert restarted["pending_action"] is None
+    assert len(restarted["workers"]) == 1
+fixture = json.loads(Path(os.environ["FIXTURE_STATE"]).read_text())
+matching = [call for call in fixture["calls"] if call["key"] == action["idempotency_key"]]
+assert len(matching) == 2
+assert len(fixture["seen"]) == 1 and len(fixture["workers"]) == 1
+PY
+  pass "restart replays one exact idempotency key without duplicating assignment"
+}
+
+static_contract
+classification_and_admission_matrix
+azure_provider_refusal_matrix
+end_to_end_lifecycle
+restart_idempotency
+
+echo "# fm-worker-lifecycle.test.sh: all assertions passed"

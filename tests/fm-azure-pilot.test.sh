@@ -50,8 +50,7 @@ assert "defaultValue" not in data["parameters"]["runnerOperatorPrincipalId"]
 assert "defaultValue" not in json.dumps(data["parameters"]["tenantId"])
 assert "defaultValue" not in json.dumps(data["parameters"]["subscriptionId"])
 assert "defaultValue" not in json.dumps(data["parameters"]["administratorNotificationEmail"])
-assert data["parameters"]["adminSshPublicKey"]["type"] == "secureString"
-assert "defaultValue" not in data["parameters"]["adminSshPublicKey"]
+assert "adminSshPublicKey" not in data["parameters"]
 assert not re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
 assert "stfm7c799deus01" not in lower
 assert "kv-fm-7c799d-eus" not in lower
@@ -127,10 +126,7 @@ for vm in vms:
     assert "customData" not in os_profile
     linux = os_profile["linuxConfiguration"]
     assert linux["disablePasswordAuthentication"] is True
-    public_keys = linux["ssh"]["publicKeys"]
-    assert len(public_keys) == 1
-    assert public_keys[0]["path"] == "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]"
-    assert public_keys[0]["keyData"] == "[parameters('adminSshPublicKey')]"
+    assert "ssh" not in linux
     for disk in vm["properties"]["storageProfile"]["dataDisks"]:
         assert disk["deleteOption"] == "Detach"
 
@@ -204,7 +200,6 @@ SH
       FM_AZURE_SUBSCRIPTION_ID="$sub" \
       FM_AZURE_ADMIN_EMAIL=private-notification \
       FM_AZURE_ADMIN_USERNAME=privateadmin \
-      FM_AZURE_ADMIN_SSH_PUBLIC_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestOnlyPrivateOverlayKey' \
       FM_AZURE_RUNNER_OPERATOR_OBJECT_ID="$tenant" \
       FM_AZURE_OWNER_TAG=owner \
       FM_AZURE_NAMING_PREFIX=fmtest \
@@ -292,7 +287,7 @@ run_worker_create_plan_gate_check() {
       # shellcheck source=bin/fm-azure-pilot.sh
       . "$sourceable"
       export FM_AZURE_TENANT_ID FM_AZURE_SUBSCRIPTION_ID FM_AZURE_ADMIN_EMAIL
-      export FM_AZURE_ADMIN_USERNAME FM_AZURE_ADMIN_SSH_PUBLIC_KEY FM_AZURE_RUNNER_OPERATOR_OBJECT_ID
+      export FM_AZURE_ADMIN_USERNAME FM_AZURE_RUNNER_OPERATOR_OBJECT_ID
       export FM_AZURE_OWNER_TAG FM_AZURE_NAMING_PREFIX
       export FM_AZURE_STORAGE_NAME FM_AZURE_KEY_VAULT_NAME FM_AZURE_DEPLOYMENT_GENERATION
       export FM_AZURE_BUDGET_START_DATE FM_AZURE_CAPACITY_PROFILE FM_AZURE_AUTHOR_CAPACITY_MODE
@@ -300,7 +295,6 @@ run_worker_create_plan_gate_check() {
       FM_AZURE_SUBSCRIPTION_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
       FM_AZURE_ADMIN_EMAIL=private-notification
       FM_AZURE_ADMIN_USERNAME=privateadmin
-      FM_AZURE_ADMIN_SSH_PUBLIC_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestOnlyPrivateOverlayKey'
       FM_AZURE_RUNNER_OPERATOR_OBJECT_ID=$FM_AZURE_TENANT_ID
       FM_AZURE_OWNER_TAG=owner
       FM_AZURE_NAMING_PREFIX=fmtest
@@ -340,7 +334,7 @@ parameters = json.load(open(sys.argv[1], encoding="utf-8"))["parameters"]
 assert parameters["workerSlots"]["value"] == [3]
 assert parameters["workerSkus"]["value"] == ["Standard_D4as_v7"]
 assert parameters["incrementalWorkerDeploy"]["value"] is True
-assert parameters["adminSshPublicKey"]["value"].startswith("ssh-ed25519 ")
+assert "adminSshPublicKey" not in parameters
 PY
       cleanup_parameters
     ) 2>&1
@@ -583,14 +577,13 @@ run_capacity_contract_checks() {
       # shellcheck source=bin/fm-azure-pilot.sh
       . "$sourceable"
       export FM_AZURE_TENANT_ID FM_AZURE_SUBSCRIPTION_ID FM_AZURE_ADMIN_EMAIL
-      export FM_AZURE_ADMIN_USERNAME FM_AZURE_ADMIN_SSH_PUBLIC_KEY FM_AZURE_RUNNER_OPERATOR_OBJECT_ID
+      export FM_AZURE_ADMIN_USERNAME FM_AZURE_RUNNER_OPERATOR_OBJECT_ID
       export FM_AZURE_OWNER_TAG FM_AZURE_NAMING_PREFIX FM_AZURE_STORAGE_NAME FM_AZURE_KEY_VAULT_NAME
       export FM_AZURE_DEPLOYMENT_GENERATION FM_AZURE_BUDGET_START_DATE
       FM_AZURE_TENANT_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
       FM_AZURE_SUBSCRIPTION_ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
       FM_AZURE_ADMIN_EMAIL=private-notification
       FM_AZURE_ADMIN_USERNAME=privateadmin
-      FM_AZURE_ADMIN_SSH_PUBLIC_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestOnlyPrivateOverlayKey'
       FM_AZURE_RUNNER_OPERATOR_OBJECT_ID=$FM_AZURE_TENANT_ID
       FM_AZURE_OWNER_TAG=owner
       FM_AZURE_NAMING_PREFIX=fmtest

@@ -88,8 +88,7 @@ The private-endpoint subnet disables private-endpoint network policies; compute 
 
 Private overlay enrollment is an explicit post-deploy acceptance step.
 An enrollment key must be short-lived and supplied through the overlay's private enrollment mechanism, never an ARM parameter, image, extension setting, custom data value, log, monitoring field, or state artifact.
-The template accepts one out-of-band SSH public key as a secure provisioning parameter and installs it for authenticated administration only over the private overlay.
-No public IP, inbound NAT, public listener, or NSG allow rule exposes SSH to the Internet.
+The template provisions no SSH authorized keys; private-overlay enrollment does not create an SSH authorization path.
 
 ## Compute and retained data
 
@@ -154,7 +153,6 @@ export FM_AZURE_TENANT_ID='<exact tenant>'
 export FM_AZURE_SUBSCRIPTION_ID='<exact subscription>'
 export FM_AZURE_ADMIN_EMAIL='<verified billing notification address>'
 export FM_AZURE_ADMIN_USERNAME='<private local administrator name>'
-export FM_AZURE_ADMIN_SSH_PUBLIC_KEY='<public key for private-overlay SSH authentication>'
 export FM_AZURE_RUNNER_OPERATOR_OBJECT_ID='<exact signed-in Entra object id>'
 export FM_AZURE_OWNER_TAG='<cleanup owner>'
 export FM_AZURE_NAMING_PREFIX='<reviewed lowercase prefix>'

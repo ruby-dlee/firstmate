@@ -19,7 +19,7 @@
 # Optional bounded policy:
 #   FM_AZURE_RESOURCE_GROUP=rg-firstmate-pilot-eastus-001
 #   FM_AZURE_RUNNER_STATE_DIR=$FM_HOME/state/azure-runner
-#   FM_AZURE_RUNNER_MAX_CONCURRENCY=4            (1..8; live family quota still gates)
+#   FM_AZURE_RUNNER_MAX_CONCURRENCY=4            (1..16; live family quota still gates)
 #   FM_AZURE_RUNNER_BUDGET_LIMIT_USD=1000        (1000 or 1500)
 #   FM_AZURE_RUNNER_COST_ADMISSION_MODE=strict   (or commissioning-bounded with exact flag)
 #   FM_AZURE_RUNNER_SKU=Standard_D4as_v6         (reviewed 4-vCPU current-family SKU)

@@ -116,7 +116,7 @@ Every invocation receives a separate VM, so two admitted shards run concurrently
 
 Immediately before reservation and again immediately before VM creation, the controller proves the exact subscription/resource-group IDs and owner/generation tags for the named foundation storage account, zero-data admission-control account/container and ETag, controller UAMI and its sole exact effective container role including inherited/group expansion, VNet and address space, validation and private-endpoint subnets, complete NSG rule set, NAT and bound Standard public IP, blob private endpoint and endpoint NIC, named approved blob connection, private-DNS zone, VNet link, zone group/config names, and private-access properties.
 It also proves current SKU capabilities and restrictions, current East US regional and selected-family free vCPU quota, month-to-date actual cost, forecast cost, current retail rate, and active runner count.
-The software cap is four active runner VMs and may be configured only from one through eight, while live regional and per-family free-vCPU gates can impose a lower effective cap.
+The software cap is four active runner VMs by default and may be configured from one through 16, while live regional and per-family free-vCPU gates can impose a lower effective cap.
 The current Dasv6 allowance admits two default 4-vCPU runners and refuses a third.
 The separate `st<prefix>ctl01` account has public networking, shared keys, and public blobs disabled and stores no payload data.
 Its `runner-control` container is used only as a management resource: an ETag plus `If-Match` CAS fences lock owner, invocation fence, and expiry metadata.
@@ -132,9 +132,10 @@ Cost Management 429 responses use a bounded fail-closed retry and honor Azure's 
 Only a previously successful response bound to the exact subscription, resource group, endpoint, and body digest, carrying an authoritative server date and younger than four hours, may cover a retry interval beyond the bounded deadline; stale, mismatched, malformed, or absent cache data refuses admission.
 
 `FM_AZURE_RUNNER_COST_ADMISSION_MODE` defaults to `strict`, which always requires the authoritative actual-plus-forecast gate above.
-The explicit `commissioning-bounded` mode is limited to one approved commissioning runner and additionally requires `--confirm-cost-admission-mode commissioning-bounded`, `FM_AZURE_RUNNER_MAX_CONCURRENCY=1`, and `FM_AZURE_RUNNER_BUDGET_LIMIT_USD=1500`.
-It intentionally does not query or claim cumulative actual or forecast spend. Instead, it verifies the exact `$1,500` Monthly resource-group Budget and all eight configured alerts, the exact 29-resource private foundation with zero foreign resource, zero other active runner queue record, zero runner compute, and zero outstanding reservation before reserving the complete itemized 24-hour maximum in a mode-tagged durable management reservation.
-The normal strict gate remains mandatory for parallel or later routine operation.
+The explicit `commissioning-bounded` mode additionally requires `--confirm-cost-admission-mode commissioning-bounded`, an operator-selected concurrency from one through 16, and `FM_AZURE_RUNNER_BUDGET_LIMIT_USD=1500`.
+It intentionally does not query, compare, or claim cumulative actual or forecast spend. Instead, it verifies the exact `$1,500` Monthly resource-group Budget and all eight configured alerts case-insensitively, the exact 29-resource private foundation plus only exact invocation-owned disposable resources, and exact active-VM and durable-reservation inventories.
+Under the ARM CAS admission lease, every invocation gets a finite positive complete itemized 24-hour maximum in a mode-tagged zero-RBAC reservation. The controller sums and records existing exact reservation amounts, refuses duplicate or foreign reservations, refuses a seventeenth occupied slot at a configured cap of 16, and reruns exact regional/family quota immediately before VM creation.
+The normal strict gate remains mandatory whenever the operator has not explicitly selected commissioning mode.
 
 The normal budget limit is the active $1,000 target.
 An operator may select the commissioning ceiling of $1,500 through `FM_AZURE_RUNNER_BUDGET_LIMIT_USD=1500` only during the approved commissioning window.
@@ -226,11 +227,11 @@ bin/fm-azure-runner.sh run \
   -- bin/fm-azure-runner-command.sh bash -c 'tests/run.sh --skip-herdr'
 ```
 
-For the explicitly approved single commissioning run only:
+For an explicitly approved commissioning window (keep the first live smoke to one runner before scaling the configured pool):
 
 ```sh
 export FM_AZURE_RUNNER_COST_ADMISSION_MODE=commissioning-bounded
-export FM_AZURE_RUNNER_MAX_CONCURRENCY=1
+export FM_AZURE_RUNNER_MAX_CONCURRENCY=16
 export FM_AZURE_RUNNER_BUDGET_LIMIT_USD=1500
 bin/fm-azure-runner.sh run \
   --confirm-run \

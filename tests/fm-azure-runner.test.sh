@@ -40,9 +40,14 @@ environment_mode_defaults() {
     FM_AZURE_NAMING_PREFIX=fmtest FM_AZURE_STORAGE_NAME=fmteststorage0001 FM_AZURE_OWNER_TAG=owner \
     FM_AZURE_DEPLOYMENT_GENERATION=gen-one FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID="$PE_GUID" \
     python3 - "$HOST" <<'PY'
-import importlib.util,sys
+import importlib.util,os,sys
 spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 assert m.environment()["cost_admission_mode"]=="strict"
+os.environ["FM_AZURE_RUNNER_MAX_CONCURRENCY"]="16"; assert m.environment()["max_concurrency"]==16
+os.environ["FM_AZURE_RUNNER_MAX_CONCURRENCY"]="17"
+try: m.environment()
+except m.RunnerError: pass
+else: raise AssertionError("environment accepted concurrency above 16")
 PY
   rm -rf "$home"
   pass "normal environment defaults to strict without commissioning evidence or confirmation variables"
@@ -218,8 +223,21 @@ assert b.failed.is_set()
 try: b.assert_held()
 except m.RunnerError: pass
 else: raise AssertionError("failed renewal was forgotten")
+# Eight contenders may read one free ETag, but exactly one stale snapshot can win the ARM CAS.
+metadata.clear(); metadata.update({"schema":"fm-azure-runner-control-v1","deploymentgeneration":"gen","lockowner":"","lockfence":"","lockexpiry":""}); etag[0]="E200"
+contenders=[]
+for i in range(8):
+    invocation="azr-{:012x}".format(i+1); fence=("{:x}".format(i+1))*64
+    contender=m.ManagementAdmissionLease(env,{"invocation":invocation,"request":{"fence":"sha256:"+fence}})
+    snapshot,snapshot_etag=contender._read(); snapshot.update({"lockowner":invocation,"lockfence":fence,"lockexpiry":m.iso_utc(m.now_utc()+dt.timedelta(seconds=60))})
+    contenders.append((contender,snapshot_etag,snapshot))
+winners=[]
+for contender,snapshot_etag,snapshot in contenders:
+    try: contender._cas(snapshot_etag,snapshot); winners.append(contender.state["invocation"])
+    except m.RunnerError: pass
+assert len(winners)==1 and metadata["lockowner"]==winners[0]
 PY
-  pass "management ETag CAS rejects stale successor clobber and a hung renewal permanently closes admission"
+  pass "management ETag CAS rejects stale successor clobber, admits one of eight interleaved writers, and fails hung renewal sticky"
 }
 
 effective_rbac_adversaries() {
@@ -296,17 +314,18 @@ PY
 
 commissioning_admission_unit() {
   python3 - "$HOST" <<'PY' || fail "commissioning admission adversaries failed"
-import importlib.util, pathlib, tempfile, sys
+import importlib.util, math, pathlib, tempfile, sys
 spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-env={"subscription":"sub","resource_group":"rg","prefix":"prefix","max_concurrency":1,"budget_limit":1500,"cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE,"state_dir":pathlib.Path(tempfile.mkdtemp()),"azure_operation_count":0}
+env={"subscription":"sub","resource_group":"rg","prefix":"prefix","max_concurrency":16,"budget_limit":1500,"cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE,"state_dir":pathlib.Path(tempfile.mkdtemp()),"azure_operation_count":0}
 state={"schema":m.SCHEMA,"invocation":"azr-aaaaaaaaaaaa","request":{"fence":"sha256:"+"a"*64,"lineage_root_invocation":"azr-aaaaaaaaaaaa","cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE,"compute_deallocation_deadline":"2026-01-02T00:00:00Z"}}
 limits=dict(m.RESOURCE_CLASSES["behavior-heavy"]); limits.update({"sku":"Standard_D4as_v6","sku_family":"standardDav6Family"})
 seen=[]
 m.cost_query=lambda *_a,**_k: (_ for _ in ()).throw(AssertionError("commissioning queried Cost Management"))
 real_commissioning_budget=m.exact_commissioning_budget
 m.exact_commissioning_budget=lambda _env:seen.append("budget") or {"id":"budget","etag":"E"}
-m.commissioning_inventory_gate=lambda _env,_state:seen.append("inventory")
+m.commissioning_inventory_gate=lambda _env,_state:seen.append("inventory") or set()
 m.list_management_reservations=lambda _env:[]
+m.active_runner_vms=lambda _env:[]
 m.retail_rate=lambda _env,_sku:0.10
 cost=m.commissioning_cost_gate(env,state,limits)
 assert seen==["budget","inventory"] and cost["actual"] is None and cost["forecast"] is None
@@ -318,25 +337,39 @@ assert tags["cost-admission-mode"]==m.COMMISSIONING_COST_ADMISSION_MODE
 notifications={}
 for prefix,kind in (("Actual","Actual"),("Forecast","Forecasted")):
     for label,threshold in (("750",50),("1000",66.67),("1250",83.33),("1500",100)):
-        notifications[prefix+label]={"enabled":True,"operator":"GreaterThanOrEqualTo","threshold":threshold,"thresholdType":kind,"contactEmails":["operator@example.invalid"]}
+        notifications[(prefix+label).lower()]={"enabled":True,"operator":"GreaterThanOrEqualTo","threshold":threshold,"thresholdType":kind,"contactEmails":["operator@example.invalid"]}
 budget={"id":"/subscriptions/sub/providers/Microsoft.Consumption/budgets/bud-prefix-monthly","name":"bud-prefix-monthly","type":"Microsoft.Consumption/budgets","eTag":"E","properties":{"category":"Cost","amount":1500,"timeGrain":"Monthly","filter":{"dimensions":{"name":"ResourceGroupName","operator":"In","values":["rg"]}},"notifications":notifications}}
 m.az_command=lambda *_a,**_k:(budget,0,"")
 m.exact_commissioning_budget=real_commissioning_budget
 assert m.exact_commissioning_budget(env)["etag"]=="E"
-notifications["Actual750"]["enabled"]=False
+notifications["actual750"]["enabled"]=False
 try: m.exact_commissioning_budget(env)
 except m.RunnerError: pass
 else: raise AssertionError("commissioning accepted a disabled budget alert")
-notifications["Actual750"]["enabled"]=True
-for change,text in (({"max_concurrency":2},"concurrency 1"),({"budget_limit":1000},"$1500")):
+notifications["actual750"]["enabled"]=True
+m.exact_commissioning_budget=lambda _env:{"id":"budget","etag":"E"}
+for change,text in (({"max_concurrency":17},"1..16"),({"budget_limit":1000},"$1500")):
     changed=dict(env); changed.update(change)
     try: m.commissioning_cost_gate(changed,state,limits)
     except m.RunnerError as exc: assert text in str(exc)
     else: raise AssertionError("invalid commissioning policy accepted")
-m.list_management_reservations=lambda _env:[{}]
-try: m.commissioning_cost_gate(env,state,limits)
-except m.RunnerError as exc: assert "zero outstanding" in str(exc)
-else: raise AssertionError("commissioning accepted an outstanding reservation")
+# Fifteen exact reservations allow the sixteenth invocation; after its reservation the same invocation remains admitted, but a seventeenth refuses.
+def make_reservation(invocation):
+    record={"schema":m.SCHEMA,"invocation":invocation,"phase":"cost-reserved","cost":{"max_billable_lifetime_hours":24,"max_increment":cost["max_increment"]},"request":{"fence":"sha256:"+"c"*64}}
+    m.save_state(env,record,create=True)
+    return {"id":"/reservations/"+invocation,"invocation-binding":invocation,"amount_usd":cost["max_increment"]}
+reservations=[make_reservation("azr-{:012x}".format(i)) for i in range(1,16)]
+m.list_management_reservations=lambda _env:list(reservations)
+m.commissioning_inventory_gate=lambda _env,_state:{item["id"].lower() for item in reservations}
+sixteenth=m.commissioning_cost_gate(env,state,limits)
+assert sixteenth["reserved_invocations"]==15 and math.isclose(sixteenth["outstanding_reservations"],15*cost["max_increment"])
+state["cost"]={"max_billable_lifetime_hours":24,"max_increment":cost["max_increment"]}; m.save_state(env,state,create=True)
+current={"id":"/reservations/"+state["invocation"],"invocation-binding":state["invocation"],"amount_usd":cost["max_increment"]}; reservations.append(current)
+assert m.commissioning_cost_gate(env,state,limits)["reserved_invocations"]==16
+seventeenth={"schema":m.SCHEMA,"invocation":"azr-bbbbbbbbbbbb","request":{"fence":"sha256:"+"b"*64,"cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE}}
+try: m.commissioning_cost_gate(env,seventeenth,limits)
+except m.RunnerError as exc: assert "concurrency limit (16)" in str(exc)
+else: raise AssertionError("seventeenth commissioning runner was admitted")
 # Default strict mode calls actual and forecast and propagates an unavailable forecast.
 strict_env=dict(env,cost_admission_mode=m.STRICT_COST_ADMISSION_MODE,budget_limit=1000,max_concurrency=4)
 calls=[]
@@ -359,7 +392,7 @@ try: m.dispatch_prepared(strict_env,minimal,"sub",m.COMMISSIONING_COST_ADMISSION
 except m.RunnerError as exc: assert "accepted only" in str(exc)
 else: raise AssertionError("strict mode accepted commissioning confirmation")
 PY
-  pass "strict remains authoritative while explicit commissioning is single-concurrency, alert-budgeted, itemized, and reservation-bound"
+  pass "strict remains authoritative while commissioning admits the sixteenth, refuses the seventeenth, and records itemized reservations"
 }
 
 static_private_controller_contract

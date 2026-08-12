@@ -297,8 +297,8 @@ def environment():
         raise RunnerError("FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID must be the explicitly accepted Azure resourceGuid")
     resource_group = os.environ.get("FM_AZURE_RESOURCE_GROUP", "rg-firstmate-pilot-eastus-001")
     max_concurrency = int(os.environ.get("FM_AZURE_RUNNER_MAX_CONCURRENCY", "4"))
-    if max_concurrency < 1 or max_concurrency > 8:
-        raise RunnerError("FM_AZURE_RUNNER_MAX_CONCURRENCY must be between 1 and 8")
+    if max_concurrency < 1 or max_concurrency > 16:
+        raise RunnerError("FM_AZURE_RUNNER_MAX_CONCURRENCY must be between 1 and 16")
     budget_limit = int(os.environ.get("FM_AZURE_RUNNER_BUDGET_LIMIT_USD", "1000"))
     if budget_limit not in (1000, 1500):
         raise RunnerError("FM_AZURE_RUNNER_BUDGET_LIMIT_USD must be 1000 or 1500")
@@ -1410,12 +1410,14 @@ def exact_commissioning_budget(env):
         }
     }
     expected_notifications = {
-        "Actual750": (50, "Actual"), "Actual1000": (66.67, "Actual"),
-        "Actual1250": (83.33, "Actual"), "Actual1500": (100, "Actual"),
-        "Forecast750": (50, "Forecasted"), "Forecast1000": (66.67, "Forecasted"),
-        "Forecast1250": (83.33, "Forecasted"), "Forecast1500": (100, "Forecasted"),
+        "actual750": (50, "Actual"), "actual1000": (66.67, "Actual"),
+        "actual1250": (83.33, "Actual"), "actual1500": (100, "Actual"),
+        "forecast750": (50, "Forecasted"), "forecast1000": (66.67, "Forecasted"),
+        "forecast1250": (83.33, "Forecasted"), "forecast1500": (100, "Forecasted"),
     }
-    notifications = properties.get("notifications") or {}
+    notifications = {
+        str(name).lower(): value for name, value in (properties.get("notifications") or {}).items()
+    }
     notifications_exact = set(notifications) == set(expected_notifications)
     if notifications_exact:
         for name, (threshold, threshold_type) in expected_notifications.items():
@@ -1495,7 +1497,18 @@ def commissioning_inventory_gate(env, state):
         ("microsoft.managedidentity/userassignedidentities", "id-{}-{}".format(env["prefix"], suffix))
         for suffix in ("validation", "policy-review", "crosscheck-tools", "validation-shards", "networkless-verifier")
     )
-    actual = {(str(item.get("type", "")).lower(), item.get("name")) for item in resources}
+    disposable = []
+    reservation_resources = []
+    foundation_resources = []
+    for item in resources:
+        role = (item.get("tags") or {}).get("firstmate-role")
+        if role == "validation-shard":
+            disposable.append(item)
+        elif role == "runner-cost-reservation":
+            reservation_resources.append(item)
+        else:
+            foundation_resources.append(item)
+    actual = {(str(item.get("type", "")).lower(), item.get("name")) for item in foundation_resources}
     if actual != expected:
         raise RunnerError("commissioning requires the exact 29-resource foundation and zero foreign resources")
     ensure_state_dirs(env)
@@ -1506,23 +1519,78 @@ def commissioning_inventory_gate(env, state):
             raise RunnerError("commissioning local queue is unreadable: {}".format(exc))
         if record.get("invocation") == state["invocation"]:
             continue
-        if record.get("reservation_recorded") or record.get("phase") in {
-            "admission-checked", "cost-reserved", "vm-created", "command-created", "command-finished",
-            "result-collected", "cleanup-retained", "compute-removed",
-        }:
-            raise RunnerError("commissioning requires zero other active runner queue records")
+    for item in disposable:
+        invocation = (item.get("tags") or {}).get("invocation-binding", "")
+        if not SAFE_INVOCATION.match(invocation):
+            raise RunnerError("commissioning disposable resource invocation is malformed")
+        invocation_state = load_state(env, invocation)
+        verify_resource_tags(env, invocation_state, item, "commissioning disposable resource")
+        resource_id = str(item.get("id", "")).lower()
+        planned = invocation_state.get("resources") or {}
+        allowed_ids = {
+            str(planned.get("vm_id", "")).lower(), str(planned.get("nic_id", "")).lower(),
+            str(planned.get("os_disk_id", "")).lower(), str(planned.get("ttl_schedule_id", "")).lower(),
+            str(planned.get("vm_id", "") + "/runCommands/execute").lower(),
+            str(planned.get("vm_id", "") + "/runCommands/safety-shutdown").lower(),
+        }
+        if resource_id not in allowed_ids:
+            raise RunnerError("commissioning disposable resource is outside its exact invocation plan")
+    for item in reservation_resources:
+        tags = item.get("tags") or {}
+        invocation = tags.get("invocation-binding", "")
+        if (
+            not SAFE_INVOCATION.match(invocation)
+            or str(item.get("id", "")).lower() != reservation_id(env, invocation).lower()
+            or tags.get("workload") != "firstmate"
+            or tags.get("deployment-generation") != env["deployment_generation"]
+            or tags.get("cleanup-owner") != env["owner"]
+        ):
+            raise RunnerError("commissioning reservation resource is not exact")
+    return {str(item.get("id", "")).lower() for item in reservation_resources}
 
 
 def commissioning_cost_gate(env, state, limits):
-    if env["max_concurrency"] != 1 or env["budget_limit"] != 1500:
-        raise RunnerError("commissioning-bounded requires max concurrency 1 and the exact $1500 alert budget")
+    if not 1 <= env["max_concurrency"] <= 16 or env["budget_limit"] != 1500:
+        raise RunnerError("commissioning-bounded requires configured concurrency 1..16 and the exact $1500 alert budget")
     exact_commissioning_budget(env)
-    commissioning_inventory_gate(env, state)
-    if list_management_reservations(env):
-        raise RunnerError("commissioning-bounded requires zero outstanding reservations")
+    inventory_reservation_ids = commissioning_inventory_gate(env, state)
     rate = retail_rate(env, limits["sku"])
     first_hour = itemized_cost_bound(rate, 1, limits)
     first_day = itemized_cost_bound(rate, MAX_BILLABLE_LIFETIME_HOURS, limits)
+    if not 0 < first_day["total"] < float("inf"):
+        raise RunnerError("commissioning-bounded full 24-hour itemized maximum is not finite and positive")
+    reservations = list_management_reservations(env)
+    if {str(item["id"]).lower() for item in reservations} != inventory_reservation_ids:
+        raise RunnerError("commissioning reservation inventory differs across exact ARM boundaries")
+    reservation_invocations = set()
+    reserved_total = 0.0
+    for reservation in reservations:
+        invocation = reservation["invocation-binding"]
+        if invocation in reservation_invocations:
+            raise RunnerError("commissioning reservation invocation is duplicated")
+        reservation_state = load_state(env, invocation)
+        recorded_cost = reservation_state.get("cost") or {}
+        if (
+            recorded_cost.get("max_billable_lifetime_hours") != MAX_BILLABLE_LIFETIME_HOURS
+            or float(recorded_cost.get("max_increment", -1)) != reservation["amount_usd"]
+            or not reservation["amount_usd"] > 0
+        ):
+            raise RunnerError("commissioning reservation is not bound to an exact full 24-hour maximum")
+        reservation_invocations.add(invocation)
+        reserved_total += reservation["amount_usd"]
+    active = active_runner_vms(env)
+    active_invocations = set()
+    for vm in active:
+        invocation = (vm.get("tags") or {}).get("invocation-binding", "")
+        if not SAFE_INVOCATION.match(invocation) or invocation in active_invocations:
+            raise RunnerError("commissioning active VM invocation inventory is ambiguous")
+        if invocation not in reservation_invocations:
+            raise RunnerError("commissioning active VM has no exact durable full-day reservation")
+        active_invocations.add(invocation)
+    current_reserved = state["invocation"] in reservation_invocations
+    occupied = len(reservation_invocations)
+    if occupied > env["max_concurrency"] or (not current_reserved and occupied >= env["max_concurrency"]):
+        raise RunnerError("commissioning runner queue is at its bounded concurrency limit ({})".format(env["max_concurrency"]))
     return {
         "actual": None,
         "forecast": None,
@@ -1532,7 +1600,9 @@ def commissioning_cost_gate(env, state, limits):
         "max_network_bytes": limits["network_bytes"],
         "max_billable_lifetime_hours": MAX_BILLABLE_LIFETIME_HOURS,
         "max_increment": first_day["total"],
-        "outstanding_reservations": 0.0,
+        "outstanding_reservations": reserved_total,
+        "reserved_invocations": occupied,
+        "active_runner_vms": len(active_invocations),
         "admission_pressure": None,
         "cost_admission_mode": COMMISSIONING_COST_ADMISSION_MODE,
     }
@@ -1681,8 +1751,6 @@ def reserve_budget_management(env, state, lease, limits, admitted_cost=None):
         )
     outstanding = sum(item["amount_usd"] for item in reservations)
     if admitted_cost is not None:
-        if outstanding:
-            raise RunnerError("commissioning-bounded requires zero outstanding reservations")
         cost = admitted_cost
     else:
         cost = budget_gate(env, limits, outstanding_reservations=outstanding)
@@ -2481,6 +2549,9 @@ def dispatch_prepared(env, state, confirm_subscription, confirm_cost_admission_m
                 "durable worst-case cost reserved under the admission lease",
                 cost=cost, reservation_recorded=True,
             )
+            if mode == COMMISSIONING_COST_ADMISSION_MODE:
+                commissioning_cost_gate(env, state, limits)
+                sku_quota_gate(env, limits)
             foundation_gate(env)
             reprove_public_request(state)
             verify_all_reservation_rbac_zero(env)

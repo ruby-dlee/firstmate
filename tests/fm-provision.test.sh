@@ -1284,6 +1284,31 @@ EOF
   pass "unpinnable raw launches fail closed before endpoint creation"
 }
 
+test_post_provision_gate_uses_the_leased_worktree_for_relative_raw_paths() {
+  local label rec id out
+  for label in primary-only missing; do
+    id="provision-raw-relative-${label}-pm"
+    rec=$(make_spawn_case "raw-relative-$label" "$id")
+    read_spawn_case "$rec"
+    install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+    if [ "$label" = primary-only ]; then
+      printf '#!/bin/sh\nexit 0\n' > "$PROJ_DIR/crewtool"
+      chmod +x "$PROJ_DIR/crewtool"
+    fi
+
+    out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" \
+      --harness './crewtool --go')
+    expect_code 1 "$?" "a relative raw path $label in the lease must be refused: $out"
+    assert_contains "$out" "refusing to create fm-$id's endpoint" \
+      "a relative raw path $label must fail at the post-provision endpoint gate: $out"
+    assert_no_grep 'LAUNCH' "$SEND_LOG" \
+      "a relative raw path $label created an endpoint"
+    assert_absent "$HOME_DIR/state/$id.meta" \
+      "a relative raw path $label installed task metadata"
+  done
+  pass "relative raw paths are validated in the leased worktree before endpoints"
+}
+
 # The pre-lease gate exists so a refusal never costs a lease, and it must key on
 # whether THIS spawn can publish a pin. A manifest whose kinds excludes this
 # task's kind publishes nothing, so the scout below is in the position of a
@@ -1696,6 +1721,7 @@ test_spawn_pins_the_turn_end_shell_under_a_runtime_pin
 test_spawn_pins_a_resolvable_raw_launch_command
 test_spawn_preserves_an_unpinned_raw_launch_command
 test_pre_lease_gate_refuses_unpinnable_raw_launches
+test_post_provision_gate_uses_the_leased_worktree_for_relative_raw_paths
 test_pre_lease_gate_refuses_an_unavailable_pinned_launcher
 test_pre_lease_hook_pin_gate_honors_kinds
 test_spawn_fails_closed_when_the_provisioner_cannot_be_run

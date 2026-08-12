@@ -1976,6 +1976,35 @@ SH
   pass "an automatic runtime pin reaches the agent session only after the launch command resolves"
 }
 
+test_auto_runtime_pin_refuses_an_unresolvable_raw_launch_before_endpoint() {
+  local record id out status nvm_bin
+  id=provision-spawn-auto-raw-p14
+  record=$(make_spawn_case spawn-auto-raw js "$id")
+  read_spawn_case "$record"
+  printf '20\n' > "$PROJECT_DIR/web/.nvmrc"
+  git -C "$PROJECT_DIR" add web/.nvmrc
+  git -C "$PROJECT_DIR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm 'pin node runtime'
+  git -C "$WORKTREE_DIR" reset --hard -q "$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+  nvm_bin="$CASE_DIR/nvm/versions/node/v20.20.2/bin"
+  mkdir -p "$nvm_bin"
+  printf '#!/usr/bin/env bash\nprintf 20.20.2\n' > "$nvm_bin/node"
+  chmod +x "$nvm_bin/node"
+  cp "$FAKEBIN_DIR/npm" "$nvm_bin/npm"
+
+  out=$(FM_TEST_NODE_VERSION=23.8.0 NVM_DIR="$CASE_DIR/nvm" FNM_DIR="$CASE_DIR/no-fnm" \
+    VOLTA_HOME="$CASE_DIR/no-volta" run_spawn \
+    "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR" \
+    --harness 'missing-crewtool --go')
+  status=$?
+  expect_code 1 "$status" "an automatic pin must refuse an unresolved raw launch: $out"
+  assert_contains "$out" "refusing to create fm-$id's endpoint" \
+    "an automatic pin did not reach the shared pre-endpoint raw-launch gate: $out"
+  assert_no_grep 'LAUNCH' "$CASE_DIR/install.log" "an automatic pin refusal created an endpoint"
+  assert_absent "$HOME_DIR/state/$id.meta" "an automatic pin refusal installed task metadata"
+  pass "automatic pins refuse unresolved raw launches before endpoint creation"
+}
+
 test_spawn_into_an_undeclared_project_is_unchanged() {
   local record id out status
   id=provision-spawn-p6
@@ -2045,6 +2074,7 @@ test_provisioning_can_be_opted_out_per_spawn_and_per_home
 test_a_stale_lane_report_never_survives_into_the_next_lease
 test_an_unreadable_provisioning_setting_refuses_the_spawn
 test_auto_runtime_pin_is_delivered_after_launch_resolution
+test_auto_runtime_pin_refuses_an_unresolvable_raw_launch_before_endpoint
 test_spawn_into_an_undeclared_project_is_unchanged
 
 echo "# all fm-spawn-provision tests passed"

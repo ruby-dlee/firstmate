@@ -2733,7 +2733,7 @@ spawn_raw_launch_path_executable() {
   local target=$RAW_LAUNCH_WORD
   case "$target" in
     /*) ;;
-    *) target="$PROJ_ABS/$target" ;;
+    *) target="$WT/$target" ;;
   esac
   [ -f "$target" ] && [ -x "$target" ]
 }
@@ -3425,8 +3425,8 @@ spawn_refuse_unpinnable_launch() {
   fi
   if [ -z "$blocker" ] && [ "$RAW_LAUNCH" = 1 ]; then
     case "$RAW_LAUNCH_WORD" in
-      */*)
-        if ! spawn_raw_launch_path_executable; then
+      /*)
+        if [ ! -f "$RAW_LAUNCH_WORD" ] || [ ! -x "$RAW_LAUNCH_WORD" ]; then
           blocker="its raw launch command cannot safely receive the pin because firstmate cannot resolve its first word '$RAW_LAUNCH_WORD' to an executable path before endpoint creation"
         fi
         ;;
@@ -3963,6 +3963,28 @@ spawn_brief_provision_note() {
 }
 
 provision_worktree || exit 1
+
+spawn_validate_published_pin_launch() {
+  local session_path_prepend=$PROVISION_PATH_PREPEND
+  [ -z "$PROVISION_PATH_PREFIX" ] \
+    || session_path_prepend="${session_path_prepend:+$session_path_prepend:}$PROVISION_PATH_PREFIX"
+  [ -n "$session_path_prepend" ] || return 0
+  [ "$RAW_LAUNCH" = 1 ] || return 0
+  if [ "$LAUNCH_PIN_DELIVERABLE" != 1 ]; then
+    echo "error: refusing to create fm-$ID's endpoint with a proven runtime pin because ${LAUNCH_PIN_UNDELIVERABLE_REASON:-firstmate could not resolve its raw launch command to one executable}" >&2
+    return 1
+  fi
+  case "$RAW_LAUNCH_WORD" in
+    */*)
+      if ! spawn_raw_launch_path_executable; then
+        echo "error: refusing to create fm-$ID's endpoint with a proven runtime pin because firstmate cannot resolve its raw launch first word '$RAW_LAUNCH_WORD' to an executable in the leased worktree" >&2
+        return 1
+      fi
+      ;;
+  esac
+}
+
+spawn_validate_published_pin_launch || exit 1
 
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
   META_WRITE_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1

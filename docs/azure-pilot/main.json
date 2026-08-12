@@ -32,6 +32,12 @@
         "description": "Out-of-band public key for authenticated SSH only over the private overlay; no public SSH path is created."
       }
     },
+    "runnerOperatorPrincipalId": {
+      "type": "string",
+      "metadata": {
+        "description": "Exact Entra object ID allowed to stage validation-shard objects and mint user-delegation SAS values bounded by that data scope."
+      }
+    },
     "ownerTag": {
       "type": "string",
       "minLength": 1,
@@ -340,6 +346,9 @@
           "adminSshPublicKey": {
             "value": "[parameters('adminSshPublicKey')]"
           },
+          "runnerOperatorPrincipalId": {
+            "value": "[parameters('runnerOperatorPrincipalId')]"
+          },
           "deploymentGeneration": {
             "value": "[parameters('deploymentGeneration')]"
           },
@@ -419,6 +428,9 @@
             },
             "adminSshPublicKey": {
               "type": "secureString"
+            },
+            "runnerOperatorPrincipalId": {
+              "type": "string"
             },
             "deploymentGeneration": {
               "type": "string"
@@ -502,6 +514,7 @@
             "blobPrivateDnsZone": "privatelink.blob.core.windows.net",
             "vaultPrivateDnsZone": "privatelink.vaultcore.azure.net",
             "blobDataContributorRoleId": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
+            "blobDelegatorRoleId": "db58b8e5-c6ad-4a2a-8342-4190687cbf4a",
             "workerCount": "[length(parameters('workerSlots'))]"
           },
           "resources": [
@@ -1878,6 +1891,30 @@
                     "actionGroupId": "[resourceId('Microsoft.Insights/actionGroups', variables('actionGroupName'))]"
                   }
                 ]
+              }
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/providers/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "name": "[format('{0}/Microsoft.Authorization/{1}', parameters('storageAccountName'), guid(resourceGroup().id, parameters('runnerOperatorPrincipalId'), 'runner-user-delegation'))]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]"
+              ],
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('blobDelegatorRoleId'))]",
+                "principalId": "[parameters('runnerOperatorPrincipalId')]"
+              }
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/blobServices/containers/providers/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "name": "[format('{0}/default/validation-shards/Microsoft.Authorization/{1}', parameters('storageAccountName'), guid(resourceGroup().id, parameters('runnerOperatorPrincipalId'), 'runner-validation-shards'))]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', parameters('storageAccountName'), 'default', 'validation-shards')]"
+              ],
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('blobDataContributorRoleId'))]",
+                "principalId": "[parameters('runnerOperatorPrincipalId')]"
               }
             },
             {

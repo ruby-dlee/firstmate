@@ -151,6 +151,7 @@ export FM_AZURE_SUBSCRIPTION_ID='<exact subscription>'
 export FM_AZURE_ADMIN_EMAIL='<verified billing notification address>'
 export FM_AZURE_ADMIN_USERNAME='<private local administrator name>'
 export FM_AZURE_ADMIN_SSH_PUBLIC_KEY='<public key for private-overlay SSH authentication>'
+export FM_AZURE_RUNNER_OPERATOR_OBJECT_ID='<exact signed-in Entra object id>'
 export FM_AZURE_OWNER_TAG='<cleanup owner>'
 export FM_AZURE_NAMING_PREFIX='<reviewed lowercase prefix>'
 export FM_AZURE_STORAGE_NAME='<globally available name>'
@@ -230,12 +231,11 @@ bin/fm-azure-pilot.sh worker-delete \
 Worker deletion removes disposable VM/NIC/OS capacity and retains both encrypted data disks.
 A later worker may adopt those disks only after exact slot, VM, task, home, and generation recovery proof.
 
-The urgent one-shot runner follow-up uses separate identity-less invocation VMs rather than author-worker slots or retained provider/task disks.
-Its reviewed validation SKU seam is `FM_AZURE_RUNNER_VALIDATION_SKU`, defaulting to the live-verified 4-vCPU/16-GiB `Standard_D4as_v6` and accepting the foundation's reviewed mixed-family alternatives.
-Before creating that VM, the separate runner implementation must prove the selected runner family's current free quota and current retail rate.
-Private staging uses the worker's own non-public state container and container-scoped identity; untrusted repository commands receive no control-plane home, broad storage role, sibling container role, reviewer identity, or deployment credential.
-The infrastructure seam owns only private staging scope, exact tags, disposable compute, retained disks, and create/status/deallocate/delete controls.
-The queued `azure-burst-relief-y7` work owns snapshot upload, command/result protocol, no-mistakes command integration, fencing, command sandboxing, and cleanup.
+The urgent one-shot runner is specified by [`docs/azure-runner.md`](azure-runner.md) and implemented by `bin/fm-azure-runner.sh`.
+It creates identity-less invocation VMs in `snet-validation-shards` rather than reusing author-worker slots or retained provider/task disks.
+The foundation grants the exact `FM_AZURE_RUNNER_OPERATOR_OBJECT_ID` delegation-key authority at storage-account scope and blob data access only on `validation-shards`; the invocation VM receives only short-lived exact-object capabilities in protected bootstrap parameters.
+Its reviewed validation SKU seam defaults to the live-verified 4-vCPU/16-GiB `Standard_D4as_v6`, accepts the foundation's reviewed mixed-family alternatives, and re-proves that selected family's quota, SKU capability, budget, forecast, and retail rate before every invocation.
+The runner owns snapshot upload, command/result protocol, no-mistakes command integration, fencing, sandboxing, restart-safe collection, and exact cleanup.
 The intended first real use is parallel heavy test, lint, and behavior commands while the local primary remains responsive.
 
 The queued fleet lifecycle implementation owns budget/forecast admission, zero-warm-idle scheduling, landing-capacity reservation, provider-session revocation, and application health; it must preserve the role topology above.

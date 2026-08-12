@@ -13,7 +13,8 @@
 #
 # Required environment for cloud commands:
 #   FM_AZURE_TENANT_ID FM_AZURE_SUBSCRIPTION_ID FM_AZURE_ADMIN_EMAIL
-#   FM_AZURE_ADMIN_USERNAME FM_AZURE_ADMIN_SSH_PUBLIC_KEY FM_AZURE_OWNER_TAG
+#   FM_AZURE_ADMIN_USERNAME FM_AZURE_ADMIN_SSH_PUBLIC_KEY
+#   FM_AZURE_RUNNER_OPERATOR_OBJECT_ID FM_AZURE_OWNER_TAG
 #   FM_AZURE_NAMING_PREFIX FM_AZURE_STORAGE_NAME FM_AZURE_KEY_VAULT_NAME
 #   FM_AZURE_DEPLOYMENT_GENERATION FM_AZURE_BUDGET_START_DATE
 # Optional:
@@ -117,6 +118,7 @@ require_cloud_environment() {
     FM_AZURE_ADMIN_EMAIL \
     FM_AZURE_ADMIN_USERNAME \
     FM_AZURE_ADMIN_SSH_PUBLIC_KEY \
+    FM_AZURE_RUNNER_OPERATOR_OBJECT_ID \
     FM_AZURE_OWNER_TAG \
     FM_AZURE_NAMING_PREFIX \
     FM_AZURE_STORAGE_NAME \
@@ -171,6 +173,7 @@ require_cloud_environment() {
 
   [[ "$FM_AZURE_TENANT_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || refuse "tenant input is not a UUID"
   [[ "$FM_AZURE_SUBSCRIPTION_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || refuse "subscription input is not a UUID"
+  [[ "$FM_AZURE_RUNNER_OPERATOR_OBJECT_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || refuse "runner operator object input is not a UUID"
   [[ "$FM_AZURE_NAMING_PREFIX" =~ ^[a-z0-9]{3,12}$ ]] || refuse "naming prefix must be 3-12 lowercase alphanumeric characters"
   [[ "$FM_AZURE_STORAGE_NAME" =~ ^[a-z0-9]{3,24}$ ]] || refuse "storage name must be 3-24 lowercase alphanumeric characters"
   [[ "$FM_AZURE_KEY_VAULT_NAME" =~ ^[a-zA-Z][a-zA-Z0-9-]{1,22}[a-zA-Z0-9]$ ]] || refuse "Key Vault name does not satisfy the reviewed syntax"
@@ -272,7 +275,7 @@ text = path.read_text(encoding="utf-8").lower()
 
 required_parameters = {
     "tenantId", "subscriptionId", "administratorNotificationEmail",
-    "adminUsername", "adminSshPublicKey", "ownerTag", "deploymentGeneration",
+    "adminUsername", "adminSshPublicKey", "runnerOperatorPrincipalId", "ownerTag", "deploymentGeneration",
     "namingPrefix", "storageAccountName", "keyVaultName", "capacityProfile",
     "authorCapacityMode", "vmFamily", "workerSkus", "incrementalWorkerDeploy", "runnerValidationSku",
     "workerHomeBinding", "workerTaskBinding", "workerInvocationBinding",
@@ -351,7 +354,7 @@ sku_gate() {
     --all \
     --output json \
     --only-show-errors)
-  selected=$(jq -cn --arg supervisor "$SUPERVISOR_SKU" --arg runner "$RUNNER_VALIDATION_SKU" --argjson workers "$WORKER_SKUS_JSON" '$workers + [$supervisor, $runner] | unique')
+  selected=$(jq -cn --arg supervisor "$SUPERVISOR_SKU" --arg runner "$RUNNER_VALIDATION_SKU" --argjson workers "$WORKER_SKUS_JSON" '$workers + (if $runner == $supervisor or ($workers | index($runner)) != null then [] else [$runner] end) + [$supervisor] | unique')
   jq -e \
     --arg supervisor "$SUPERVISOR_SKU" \
     --arg runner "$RUNNER_VALIDATION_SKU" \
@@ -560,6 +563,7 @@ values = {
     "administratorNotificationEmail": os.environ["FM_AZURE_ADMIN_EMAIL"],
     "adminUsername": os.environ["FM_AZURE_ADMIN_USERNAME"],
     "adminSshPublicKey": os.environ["FM_AZURE_ADMIN_SSH_PUBLIC_KEY"],
+    "runnerOperatorPrincipalId": os.environ["FM_AZURE_RUNNER_OPERATOR_OBJECT_ID"],
     "ownerTag": os.environ["FM_AZURE_OWNER_TAG"],
     "deploymentGeneration": os.environ["FM_AZURE_DEPLOYMENT_GENERATION"],
     "capacityProfile": os.environ.get("FM_AZURE_CAPACITY_PROFILE", "foundation"),

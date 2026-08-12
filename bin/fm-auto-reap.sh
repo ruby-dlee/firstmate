@@ -72,6 +72,20 @@ single_meta_value() {  # <file> <key>
   printf '%s\n' "$values"
 }
 
+single_meta_value_allow_empty() {  # <file> <key>
+  local file=$1 key=$2
+  awk -v key="$key" '
+    index($0, key "=") == 1 {
+      count++
+      value = substr($0, length(key) + 2)
+    }
+    END {
+      if (count != 1) exit 1
+      print value
+    }
+  ' "$file"
+}
+
 status_last_verb() {  # <task>
   local last
   last=$(grep -v '^[[:space:]]*$' "$STATE/$1.status" 2>/dev/null | tail -1)
@@ -435,7 +449,11 @@ recover_acquisition() {  # <record>
     refuse "created task temp phase has an unsafe root; retained stale acquisition"
     return 0
   fi
-  recorded_worktree=$(sed -n 's/^worktree=//p' "$record" | tail -1)
+  recorded_worktree=$(single_meta_value_allow_empty "$record" worktree) || {
+    fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
+    refuse "acquisition record must contain exactly one worktree field"
+    return 0
+  }
   if [ -n "$recorded_worktree" ]; then
     worktree=$(fm_checkout_trusted_dir "$recorded_worktree" 2>/dev/null || true)
     [ -n "$worktree" ] && fm_treehouse_require_task_lease "$worktree" "$holder" >/dev/null 2>&1 || worktree=

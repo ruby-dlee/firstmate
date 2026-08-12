@@ -380,6 +380,35 @@ PY
   pass "a never-acquired spawn record is cleared after pool-directed holder absence proof"
 }
 
+test_pre_acquisition_record_requires_one_empty_worktree_field() {
+  local fixture project worktree record out rc id
+  reset_logs
+  fixture=$(make_treehouse_fixture pre-acquisition-shape-seed "$HOME_DIR/.treehouse")
+  project=${fixture%%$'\t'*}
+  worktree=${fixture#*$'\t'}
+
+  for id in missing-worktree duplicate-worktree; do
+    write_dead_acquisition "$id" "$project" "" direct
+    record="$HOME_DIR/state/.worktree-acquire-$id.pending"
+    if [ "$id" = missing-worktree ]; then
+      sed -i.bak '/^worktree=/d' "$record"
+    else
+      printf 'worktree=\n' >> "$record"
+    fi
+    rm -f "$record.bak"
+    out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
+    expect_code 0 "$rc" "$id maintenance"
+    assert_contains "$out" "must contain exactly one worktree field" \
+      "$id record did not report malformed worktree authority"
+    [ -f "$record" ] || fail "$id record was cleared by pre-acquisition absence proof"
+    [ ! -e "$HOME_DIR/state/$id.meta" ] || fail "$id record invented cleanup metadata"
+    [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "$id record invoked teardown"
+    rm -f "$record"
+  done
+  [ -d "$worktree" ] || fail "malformed records changed an unrelated pool worktree"
+  pass "pre-acquisition recovery requires exactly one empty worktree field"
+}
+
 test_real_worktree_with_held_lease_still_refuses() {
   local fixture project worktree record state out rc id=held-lease-refusal
   reset_logs
@@ -707,6 +736,7 @@ test_scout_skip_requires_detached_head_and_complete_metadata
 test_x_link_and_teardown_refusal_remain_visible
 test_dead_acquisition_recovers_but_live_owner_is_untouched
 test_pre_acquisition_record_without_worktree_is_cleared
+test_pre_acquisition_record_requires_one_empty_worktree_field
 test_real_worktree_with_held_lease_still_refuses
 test_pre_acquisition_corrupt_pool_state_stays_distinct
 test_dirty_stranded_worktree_is_retained_by_real_teardown

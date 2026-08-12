@@ -123,6 +123,15 @@
 #   only a worktree whose repository identity, cleanliness, and expected detached
 #   tip are re-proven before and after owned hook cleanup, with the return held
 #   under the common checkout mutation lock.
+#   A non-raw Pi ship/scout additionally snapshots its launch-bound account before
+#   endpoint creation. A new launch records both author_identity_snapshot_epoch=
+#   launch-bound-v1 and a non-empty author_account_identity. Snapshot failure,
+#   unreadable identity, modern recovery without the recorded identity, or a
+#   modern recovery account mismatch refuses the spawn and uses the same rollback
+#   path, because Crosscheck deliberately rejects every modern Pi task missing
+#   that author proof. Legacy recovery without the epoch remains legacy and never
+#   mints provenance it did not have at launch. Raw Pi ship/scout launches are
+#   refused because their account binding cannot be proved.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -3508,6 +3517,104 @@ fi
 PI_AUTHOR_ACCOUNT_IDENTITY=
 PI_AUTHOR_ACCOUNT_HOME=
 PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=
+PI_AUTHOR_IDENTITY_PREPARED=0
+TASK_TMP_PREPARED=0
+
+prepare_task_tmp() {
+  [ "$TASK_TMP_PREPARED" != 1 ] || return 0
+  TASK_TMP=$SPAWN_TASK_TMP
+  if spawn_test_lab_enabled && [ "${FM_TEST_TASKTMP_CREATE_FAIL:-0}" = 1 ]; then
+    echo "error: test-only task temp creation failure for $ID" >&2
+    return 1
+  fi
+  mkdir -p "$TASK_TMP/gotmp" || return 1
+  WORKTREE_ACQUIRE_TASKTMP_PHASE=created
+  persist_worktree_acquisition_phases || {
+    echo "error: cannot durably record task temp creation for $ID" >&2
+    return 1
+  }
+  TASK_TMP_PREPARED=1
+}
+
+prepare_pi_author_identity() {
+  local capture_status=0
+  [ "$PI_AUTHOR_IDENTITY_PREPARED" != 1 ] || return 0
+  [ "$HARNESS" = pi ] || {
+    PI_AUTHOR_IDENTITY_PREPARED=1
+    return 0
+  }
+  if [ "$SPAWN_META_PRESENT" = 1 ]; then
+    PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=$(spawn_preflight_meta_value author_identity_snapshot_epoch)
+    [ -z "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" ] \
+      || [ "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" = launch-bound-v1 ] \
+      || {
+        echo "error: Pi recovery metadata has an invalid author identity snapshot epoch for $ID" >&2
+        return 1
+      }
+  else
+    PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=launch-bound-v1
+  fi
+  if [ "$RAW_LAUNCH" = 1 ]; then
+    if [ "$KIND" != secondmate ] && [ "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" = launch-bound-v1 ]; then
+      echo "error: Pi launch-bound author identity capture is unavailable for raw launch commands; refusing $ID before endpoint creation" >&2
+      return 1
+    fi
+    PI_AUTHOR_IDENTITY_PREPARED=1
+    return 0
+  fi
+
+  prepare_task_tmp || return 1
+  PI_AUTHOR_SOURCE_HOME=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
+  PI_AUTHOR_ACCOUNT_HOME="$TASK_TMP/pi-author-agent"
+  if PI_CAPTURED_ACCOUNT_IDENTITY=$(
+    "$SCRIPT_DIR/fm-pi-author-snapshot.py" \
+      "${MODEL:-default}" "$PI_AUTHOR_SOURCE_HOME" "$PI_AUTHOR_ACCOUNT_HOME"
+  ); then
+    case "$PI_CAPTURED_ACCOUNT_IDENTITY" in
+      ''|*$'\n'*|*$'\r'*) capture_status=1 ;;
+    esac
+  else
+    capture_status=$?
+  fi
+  if [ "$capture_status" -ne 0 ]; then
+    PI_AUTHOR_ACCOUNT_HOME=
+    PI_AUTHOR_ACCOUNT_IDENTITY=
+    if [ "$KIND" != secondmate ] && [ "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" = launch-bound-v1 ]; then
+      echo "error: Pi launch-bound author identity capture failed for $ID; refusing before endpoint creation because the lane could never pass Crosscheck" >&2
+      return 1
+    fi
+    echo "WARNING: Pi author identity could not be bound to a task-private account for secondmate $ID; continuing because secondmates do not author merge-gated lanes" >&2
+    PI_AUTHOR_IDENTITY_PREPARED=1
+    return 0
+  fi
+
+  if [ "$SPAWN_META_PRESENT" = 1 ]; then
+    PI_RECORDED_ACCOUNT_IDENTITY=$(spawn_preflight_meta_value author_account_identity)
+    if [ "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" = launch-bound-v1 ]; then
+      if [ -z "$PI_RECORDED_ACCOUNT_IDENTITY" ]; then
+        if [ "$KIND" != secondmate ]; then
+          echo "error: modern Pi recovery metadata for $ID has no launch-bound author_account_identity; refusing before endpoint creation because the original author cannot be proved" >&2
+          return 1
+        fi
+      elif [ "$PI_RECORDED_ACCOUNT_IDENTITY" != "$PI_CAPTURED_ACCOUNT_IDENTITY" ]; then
+        if [ "$KIND" != secondmate ]; then
+          echo "error: Pi recovery account identity does not match the launch-bound author_account_identity for $ID; refusing before endpoint creation" >&2
+          return 1
+        fi
+      else
+        PI_AUTHOR_ACCOUNT_IDENTITY=$PI_CAPTURED_ACCOUNT_IDENTITY
+      fi
+    fi
+  else
+    PI_AUTHOR_ACCOUNT_IDENTITY=$PI_CAPTURED_ACCOUNT_IDENTITY
+  fi
+  if [ "$KIND" != secondmate ] && [ "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" = launch-bound-v1 ] \
+    && [ -z "$PI_AUTHOR_ACCOUNT_IDENTITY" ]; then
+    echo "error: Pi launch-bound author identity capture produced no admissible author_account_identity for $ID; refusing before endpoint creation" >&2
+    return 1
+  fi
+  PI_AUTHOR_IDENTITY_PREPARED=1
+}
 
 # prepare_launch_environment: every step the launch-command construction below
 # The PATH a crewmate's tool commands run with. A harness executes tool commands
@@ -3580,49 +3687,8 @@ fi
 # later, and teardown removes only this recorded generation. GOTMPDIR (not TMPDIR)
 # is the targeted knob: TMPDIR is too broad (affects every program's temp, not
 # just Go's).
-TASK_TMP=$SPAWN_TASK_TMP
-if spawn_test_lab_enabled && [ "${FM_TEST_TASKTMP_CREATE_FAIL:-0}" = 1 ]; then
-  echo "error: test-only task temp creation failure for $ID" >&2
-  exit 1
-fi
-mkdir -p "$TASK_TMP/gotmp"
-WORKTREE_ACQUIRE_TASKTMP_PHASE=created
-persist_worktree_acquisition_phases || {
-  echo "error: cannot durably record task temp creation for $ID" >&2
-  exit 1
-}
-if [ "$HARNESS" = pi ]; then
-  if [ "$SPAWN_META_PRESENT" = 1 ]; then
-    PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=$(spawn_preflight_meta_value author_identity_snapshot_epoch)
-    [ -z "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" ] \
-      || [ "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" = launch-bound-v1 ] \
-      || { echo "error: Pi recovery metadata has an invalid author identity snapshot epoch for $ID" >&2; exit 1; }
-  else
-    PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=launch-bound-v1
-  fi
-fi
-if [ "$HARNESS" = pi ] && [ "$RAW_LAUNCH" != 1 ]; then
-  PI_AUTHOR_SOURCE_HOME=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
-  PI_AUTHOR_ACCOUNT_HOME="$TASK_TMP/pi-author-agent"
-  if PI_CAPTURED_ACCOUNT_IDENTITY=$(
-    "$SCRIPT_DIR/fm-pi-author-snapshot.py" \
-      "${MODEL:-default}" "$PI_AUTHOR_SOURCE_HOME" "$PI_AUTHOR_ACCOUNT_HOME"
-  ); then
-    if [ "$SPAWN_META_PRESENT" = 1 ]; then
-      PI_RECORDED_ACCOUNT_IDENTITY=$(spawn_preflight_meta_value author_account_identity)
-      if [ -n "$PI_RECORDED_ACCOUNT_IDENTITY" ] \
-        && [ "$PI_RECORDED_ACCOUNT_IDENTITY" = "$PI_CAPTURED_ACCOUNT_IDENTITY" ]; then
-        PI_AUTHOR_ACCOUNT_IDENTITY=$PI_CAPTURED_ACCOUNT_IDENTITY
-      fi
-    else
-      PI_AUTHOR_ACCOUNT_IDENTITY=$PI_CAPTURED_ACCOUNT_IDENTITY
-    fi
-  else
-    PI_AUTHOR_ACCOUNT_HOME=
-    PI_AUTHOR_ACCOUNT_IDENTITY=
-    echo "WARNING: Pi author identity could not be bound to a task-private account; same-provider Crosscheck review will remain ineligible for $ID" >&2
-  fi
-fi
+prepare_task_tmp || exit 1
+prepare_pi_author_identity || exit 1
 # herdr sets GOTMPDIR natively at agent start. Every other backend exports it into
 # the pane shell just before the launch line, further down. CREW_PATH rides the same
 # two channels for the same reason.
@@ -3887,6 +3953,12 @@ if [ "$CONTINUE_ACCOUNT" = 1 ]; then
   LAUNCH="$(shell_quote python3) $(shell_quote "$SCRIPT_DIR/fm-prompt-exec.py") $(shell_quote "$CONTINUATION_PROMPT_FILE") $(shell_quote "$CONTINUATION_PROMPT_DIR_ID") $(shell_quote "$CONTINUATION_PROMPT_FILE_ID") $(shell_quote "$CONTINUATION_PROMPT_CONTENT_ID") $(shell_quote "$continuation_launch_command")"
 fi
 }
+
+# Pi author proof is a pre-endpoint gate on every backend. Herdr already calls
+# prepare_launch_environment before its native endpoint creation, but tmux,
+# zellij, and cmux historically prepared only afterwards. Running this narrow
+# preparation now keeps their endpoint count at zero when author capture fails.
+[ "$HARNESS" != pi ] || prepare_pi_author_identity || exit 1
 
 W="fm-$ID"
 # herdr launches natively: `herdr agent start ... -- <argv>` creates the pane AND

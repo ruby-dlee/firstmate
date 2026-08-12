@@ -49,6 +49,8 @@ The same supervision loop continuously reaps terminal task resources through `bi
 A merged PR check, an approved local-only merge, or a completed scout delegates to ordinary `bin/fm-teardown.sh`, so endpoint removal, report publication, kind-specific worktree safety, landed-work proof, and Treehouse return keep one fail-closed authority.
 On the watcher's periodic check cadence, `bin/fm-auto-reap.sh maintenance` delegates terminal PR lanes to `bin/fm-terminal-pr-sweep.sh` across the active home and every validated registered secondmate home.
 The sweep live-checks CI and GitHub mergeability, invokes only `bin/fm-pr-merge.sh` for `yolo=on`, surfaces `yolo=off` to the captain, confirms merged state, and then invokes ordinary teardown without `--force`.
+It checks merged state before CI or merge gating, so a lane whose PR landed days earlier goes straight to ordinary reaping.
+When Crosscheck returns `AUTHOR IDENTITY UNKNOWABLE`, the sweep reports the lane as `unmergeable-as-authored` and requires takeover under a newly launch-bound author lane that publishes a replacement commit to the existing PR branch; it never adds an admission or bypasses the gate.
 An ordinary teardown blocked by the report stack's live publication holder exits with retryable status 75; the sweep retains the lane, retries on a later cadence, and deduplicates the unchanged wake.
 After GitHub confirms the merge, the sweep retires the lane's now-obsolete per-task PR check so that retryable teardown contention cannot recreate a wake loop.
 Its dry-run mode performs no locks, marker writes, merges, or teardowns.

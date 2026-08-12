@@ -40,7 +40,7 @@ if [ -f "$FM_TEST_REMOTE_STATE/$number.merged" ]; then
   exit 0
 fi
 case "$number" in
-  1|2|4|6|7|8) printf 'READY %s\n' "$head" ;;
+  1|2|4|6|7|8|10) printf 'READY %s\n' "$head" ;;
   3) printf 'RED %s\n' "$head" ;;
   5|9) printf 'MERGED %s\n' "$head" ;;
   *) printf 'UNKNOWN %s\n' "$head" ;;
@@ -54,6 +54,10 @@ id=$1
 url=$2
 if [ "$id" = blocking-yolo ]; then
   printf 'CROSSCHECK BLOCKING: fixture blocker\n' >&2
+  exit 1
+fi
+if [ "$id" = unreviewable-yolo ]; then
+  printf 'CROSSCHECK TOOL-FAILURE: AUTHOR IDENTITY UNKNOWABLE: launch-bound author proof is absent\n' >&2
   exit 1
 fi
 number=${url##*/}
@@ -105,6 +109,9 @@ write_task "$SECONDARY" secondmate-yolo on 6
 write_task "$SECONDARY" secondmate-captain off 7
 write_task "$UNREGISTERED" unregistered-yolo on 8
 write_task "$PRIMARY" retry-lock on 9
+write_task "$PRIMARY" unreviewable-yolo on 10
+printf 'author_account_identity=0\n' \
+  >> "$PRIMARY/state/unreviewable-yolo.meta"
 printf '#!/usr/bin/env bash\nprintf "merged\\n"\n' \
   > "$PRIMARY/state/retry-lock.check.sh"
 chmod +x "$PRIMARY/state/retry-lock.check.sh"
@@ -183,6 +190,11 @@ test_live_sweep_merges_only_yolo_and_reaps_confirmed_merges() {
     'blocked: primary blocking-yolo https://github.com/acme/repo/pull/4' \
     "blocking Crosscheck refusal was not reported"
   assert_contains "$output" \
+    'unmergeable-as-authored: primary unreviewable-yolo https://github.com/acme/repo/pull/10' \
+    "unprovable author identity was not classified distinctly"
+  assert_contains "$output" 're-authoring takeover is required' \
+    "unprovable author identity did not name re-authoring takeover"
+  assert_contains "$output" \
     'retry: primary retry-lock https://github.com/acme/repo/pull/9' \
     "retryable report-lock contention was not reported"
 
@@ -190,6 +202,8 @@ test_live_sweep_merges_only_yolo_and_reaps_confirmed_merges() {
     "ready yolo PR did not use fm-pr-merge.sh"
   assert_contains "$merge_log" 'blocking-yolo https://github.com/acme/repo/pull/4' \
     "blocking PR never reached the existing gate"
+  assert_contains "$merge_log" 'unreviewable-yolo https://github.com/acme/repo/pull/10' \
+    "unprovable author identity never reached the existing gate"
   assert_contains "$merge_log" 'secondmate-yolo https://github.com/acme/repo/pull/6' \
     "registered secondmate PR did not use the merge gate"
   assert_not_contains "$merge_log" 'ready-captain' \
@@ -205,6 +219,8 @@ test_live_sweep_merges_only_yolo_and_reaps_confirmed_merges() {
     "report_required=0 lane did not reach ordinary teardown"
   assert_not_contains "$teardown_log" 'blocking-yolo' \
     "blocking Crosscheck was reaped"
+  assert_not_contains "$teardown_log" 'unreviewable-yolo' \
+    "unmergeable-as-authored lane was reaped"
   assert_not_contains "$teardown_log" 'ready-captain' \
     "captain-owned PR was reaped before merge"
   assert_not_contains "$teardown_log" '--force' \
@@ -221,6 +237,8 @@ test_live_sweep_merges_only_yolo_and_reaps_confirmed_merges() {
     "red lane was removed"
   assert_present "$PRIMARY/state/blocking-yolo.meta" \
     "blocking Crosscheck lane was removed"
+  assert_present "$PRIMARY/state/unreviewable-yolo.meta" \
+    "unmergeable-as-authored lane was removed"
   assert_present "$PRIMARY/state/retry-lock.meta" \
     "retryable report-lock contention removed its lane"
   assert_absent "$PRIMARY/state/retry-lock.check.sh" \
@@ -229,14 +247,18 @@ test_live_sweep_merges_only_yolo_and_reaps_confirmed_merges() {
 }
 
 test_unchanged_reports_are_deduplicated_while_retries_continue() {
-  local before after retry_before retry_after output
+  local before after unreviewable_before unreviewable_after retry_before retry_after output
   before=$(grep -c 'blocking-yolo' "$MERGE_LOG" || true)
+  unreviewable_before=$(grep -c 'unreviewable-yolo' "$MERGE_LOG" || true)
   retry_before=$(grep -c 'retry-lock' "$TEARDOWN_LOG" || true)
   output=$(run_sweep) || fail "repeat terminal PR sweep failed"
   after=$(grep -c 'blocking-yolo' "$MERGE_LOG" || true)
+  unreviewable_after=$(grep -c 'unreviewable-yolo' "$MERGE_LOG" || true)
   retry_after=$(grep -c 'retry-lock' "$TEARDOWN_LOG" || true)
   [ "$after" -eq $((before + 1)) ] \
     || fail "blocking merge gate was not retried"
+  [ "$unreviewable_after" -eq $((unreviewable_before + 1)) ] \
+    || fail "unmergeable-as-authored gate was not retried"
   [ "$retry_after" -eq $((retry_before + 1)) ] \
     || fail "retryable teardown was not retried"
   [ -z "$output" ] \

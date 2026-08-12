@@ -10,6 +10,9 @@
 # exact-head Crosscheck, draft, and atomic merge-or-enqueue gates.
 # For yolo=off, the sweep reports the merge-ready PR for the captain and does not
 # invoke any merge command.
+# A gate refusal containing AUTHOR IDENTITY UNKNOWABLE is reported as
+# unmergeable-as-authored with re-authoring takeover as the required action;
+# the sweep never adds an admission or routes around Crosscheck.
 # Red, pending, draft, closed, unmergeable, and unreviewed PRs are never merged.
 #
 # The periodic path deduplicates unchanged reports while continuing to retry
@@ -267,6 +270,11 @@ process_candidate() {  # <label> <home> <state> <data> <meta>
       fi
       if ! merge_output=$(scoped_command "$home" "$state" "$data" "$PR_MERGE" "$task" "$url" 2>&1); then
         post_detail=$(diagnostic_line "$merge_output")
+        if [[ "$merge_output" == *"AUTHOR IDENTITY UNKNOWABLE"* ]]; then
+          emit_once "$state" "$task" "unmergeable-as-authored|$url|$PR_HEAD" \
+            "unmergeable-as-authored: $label $task $url (Crosscheck cannot prove the author identity; re-authoring takeover is required under a newly launch-bound author lane, with a replacement commit published to the existing PR branch)"
+          return 0
+        fi
         emit_once "$state" "$task" "merge-refused|$url|$PR_HEAD" \
           "blocked: $label $task $url (fm-pr-merge.sh refused: ${post_detail:-no diagnostic})"
         return 0

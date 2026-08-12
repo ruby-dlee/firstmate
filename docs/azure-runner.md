@@ -131,15 +131,6 @@ It is marked cleanup-verified only after exact compute absence, and is deleted o
 Cost Management 429 responses use a bounded fail-closed retry and honor Azure's QPU, Consumption, or standard retry guidance.
 Only a previously successful response bound to the exact subscription, resource group, endpoint, and body digest, carrying an authoritative server date and younger than four hours, may cover a retry interval beyond the bounded deadline; stale, mismatched, malformed, or absent cache data refuses admission.
 
-A newly created resource group can lack enough Azure training data for the forecast API even though the commissioning foundation is exact.
-One invocation may use a one-time commissioning bootstrap only when the ordinary actual-plus-forecast gate fails with a specifically classified no-cache 429 or exact empty-training forecast response.
-Under the existing ETag-fenced admission lease, it re-proves the fresh Succeeded foundation deployment and reviewed correlation/template outputs, the exact complete resource-group inventory with no foreign resource, zero compute, zero reservations, and the exact `$1,500` Monthly resource-group budget.
-The Budget API's last-evaluated `currentSpend` is only a lower bound, never called current or forecast telemetry.
-Admission pressure is `max(Budget currentSpend, the itemized foundation ceiling since the earliest authoritative resource creation time) + one complete 24-hour runner increment`, including all operation and network reserves, and must remain below `$1,500`.
-Before the reservation is created, the controller atomically writes an immutable consumed marker into the control container metadata with the invocation/fence, deployment correlation/template hash, exact budget ID/ETag/spend, and foundation start evidence.
-If any later step fails, that marker remains consumed.
-Every subsequent invocation requires the normal authoritative actual-plus-forecast gate; an unavailable cost pair can never consume bootstrap again.
-
 The normal budget limit is the active $1,000 target.
 An operator may select the commissioning ceiling of $1,500 through `FM_AZURE_RUNNER_BUDGET_LIMIT_USD=1500` only during the approved commissioning window.
 Admission emits separate first-hour and first-day bounds itemized as VM compute, OS-disk capacity, NAT Gateway, public IP, private endpoints, private DNS, monitoring, boot diagnostics, storage capacity, storage operations, control operations, provisioning/control interval, NAT data processing, Internet egress, trusted bootstrap traffic, the conservative $210 foundation reserve, and zero repository-command egress.

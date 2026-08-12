@@ -57,7 +57,6 @@ assert "protectedParameters" not in host
 assert "generate-sas" not in host
 assert "controller_identity_client_id" in host
 assert "If-Match=" in host and "runner-cost-reservation" in host
-assert "bootstrapadmission" in host and "BOOTSTRAP_ADMISSION_MAX_AGE_SECONDS" in host
 assert host.index("lease.renew_and_assert()", host.index("def dispatch_prepared")) < host.index("create_vm(env, state)", host.index("def dispatch_prepared"))
 cleanup=host[host.index("def cleanup(env, state):"):host.index("def dispatch_prepared")]
 assert cleanup.index('"run-command-execute"') < cleanup.index('if "vm" in by_key') < cleanup.index('"ttl-schedule" in by_key')
@@ -179,7 +178,7 @@ import datetime as dt, importlib.util, sys
 spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 env={"subscription":"sub","resource_group":"rg","control_storage":"stctl","deployment_generation":"gen","state_dir":__import__('pathlib').Path('/tmp'),"azure_operation_count":0}
 state={"invocation":"azr-aaaaaaaaaaaa","request":{"fence":"sha256:"+"a"*64}}
-metadata={"schema":"fm-azure-runner-control-v1","deploymentgeneration":"gen","lockowner":"","lockfence":"","lockexpiry":"","bootstrapadmission":"consumed","bootstrapinvocation":"azr-cccccccccccc","bootstrapfence":"c"*64,"bootstrapat":"2026-08-12T00:00:00Z","bootstrapcorrelation":"11111111-1111-4111-8111-111111111111","bootstraptemplatehash":"123","bootstrapbudgetid":"/subscriptions/sub/providers/Microsoft.Consumption/budgets/bud-prefix-monthly","bootstrapbudgetetag":"E","bootstrapbudgetspendmicrousd":"0","bootstrapfoundationstartedat":"2026-08-12T00:00:00Z"}; etag=['E1']
+metadata={"schema":"fm-azure-runner-control-v1","deploymentgeneration":"gen","lockowner":"","lockfence":"","lockexpiry":""}; etag=['E1']
 def az(_env,args,**kwargs):
     if args[:2]==["resource","show"]: return {"etag":etag[0],"properties":{"metadata":dict(metadata)}},0,""
     if args[:2]==["rest","--method"]:
@@ -189,7 +188,6 @@ def az(_env,args,**kwargs):
     raise AssertionError(args)
 m.az_command=az; m.time.sleep=lambda _:None
 a=m.ManagementAdmissionLease(env,state); a.__enter__()
-assert metadata["bootstrapinvocation"]=="azr-cccccccccccc"
 metadata.update({"lockowner":"azr-bbbbbbbbbbbb","lockfence":"b"*64,"lockexpiry":m.iso_utc(m.now_utc()+dt.timedelta(seconds=60))}); etag[0]="E99"
 try: a.renew_and_assert()
 except m.RunnerError: pass
@@ -277,116 +275,8 @@ body=m.canonical_bytes({"type":"Usage"}); digest="sha256:"+m.sha256_bytes(body);
 assert m.load_cost_cache(env,key,"query",digest) is not None
 assert m.load_cost_cache(env,key,"forecast",digest) is None
 assert m.COST_RETRY_DEADLINE_SECONDS==900 and m.COST_CACHE_MAX_AGE_SECONDS==14400
-# Only the exact new-scope forecast failure is bootstrap-classified.
-empty=urllib.error.HTTPError("https://management.azure.com/x",424,"failed dependency",email.message.Message(),io.BytesIO(b'{"error":{"code":"FailedDependency","message":"Can\\u0027t do forecast - cost training data is empty"}}'))
-m.urllib.request.urlopen=lambda *_a,**_k: (_ for _ in ()).throw(empty)
-try: m.cost_http_query(env,"forecast","https://management.azure.com/x",{"type":"Usage"})
-except m.CostAdmissionUnavailable as exc: assert exc.reason=="forecast-empty-training"
-else: raise AssertionError("empty-training forecast failure was not classified")
-other=urllib.error.HTTPError("https://management.azure.com/x",424,"failed dependency",email.message.Message(),io.BytesIO(b'{"error":{"code":"FailedDependency","message":"other"}}'))
-m.urllib.request.urlopen=lambda *_a,**_k: (_ for _ in ()).throw(other)
-try: m.cost_http_query(env,"forecast","https://management.azure.com/x",{"type":"Usage"})
-except m.RunnerError as exc: assert not isinstance(exc,m.CostAdmissionUnavailable)
-else: raise AssertionError("non-specific Cost Management error entered bootstrap")
 PY
   pass "Cost Management retry is bounded, honors both Azure guidance headers, and only permits a short exact authoritative cache"
-}
-
-bootstrap_admission_adversaries() {
-  python3 - "$HOST" <<'PY' || fail "bootstrap admission adversaries failed"
-import datetime as dt, importlib.util, sys
-spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-env={"subscription":"sub","resource_group":"rg","control_storage":"stctl","deployment_generation":"gen","prefix":"prefix","owner":"owner","budget_limit":1500,"blob_private_endpoint_nic":"nic-prefix-pe-blob","blob_private_endpoint":"pe-prefix-blob","vnet":"vnet-prefix-eus","storage":"storage","tenant":"tenant","blob_private_endpoint_nic_resource_guid":"33333333-3333-4333-8333-333333333333"}
-state={"invocation":"azr-aaaaaaaaaaaa","request":{"fence":"sha256:"+"a"*64}}
-limits=dict(m.RESOURCE_CLASSES["behavior-heavy"]); limits.update({"sku":"Standard_D4as_v6","sku_family":"standardDav6Family"})
-deployment={"name":"fm-azure-pilot-gen","deployed_at":m.now_utc()-dt.timedelta(hours=1),"age_seconds":3600,"correlation_id":"11111111-1111-4111-8111-111111111111","template_hash":"123","key_vault_name":"kv"}
-base={"schema":"fm-azure-runner-control-v1","deploymentgeneration":"gen","lockowner":state["invocation"],"lockfence":"a"*64,"lockexpiry":m.iso_utc(m.now_utc()+dt.timedelta(seconds=60))}
-class Lease:
-    def __init__(self,metadata): self.metadata=metadata; self.etag="E1"; self.expires_at=0
-    def _read(self): return dict(self.metadata),self.etag
-    def _cas(self,_etag,new): self.metadata.clear(); self.metadata.update(new); self.etag="E2"; return self.etag
-    def _record_success(self): self.expires_at=1
-    def assert_held(self): pass
-m.foundation_gate=lambda _env:None
-real_deployment=m.exact_bootstrap_deployment
-m.exact_bootstrap_deployment=lambda _env:dict(deployment)
-m.exact_bootstrap_inventory=lambda _env,_deployment:deployment["deployed_at"]
-m.active_runner_vms=lambda _env:[]
-m.list_management_reservations=lambda _env:[]
-real_budget=m.exact_bootstrap_budget
-m.exact_bootstrap_budget=lambda _env:{"id":"/subscriptions/sub/providers/Microsoft.Consumption/budgets/bud-prefix-monthly","etag":"E","current_spend":0.0}
-m.retail_rate=lambda _env,_sku:0.10
-lease=Lease(dict(base)); unavailable=m.CostAdmissionUnavailable("forecast-empty-training","empty")
-cost=m.bootstrap_admission_cost(env,state,lease,limits,unavailable)
-assert cost["bootstrap_admission"] is True and cost["forecast"] is None and cost["admission_pressure"]<1500
-assert cost["cost_lower_bound"]==max(cost["budget_current_spend"],cost["foundation_bound"])
-assert lease.metadata["bootstrapadmission"]=="consumed" and lease.metadata["bootstrapinvocation"]==state["invocation"]
-for field in ("bootstrapfence","bootstrapcorrelation","bootstraptemplatehash","bootstrapbudgetid","bootstrapbudgetetag","bootstrapbudgetspendmicrousd","bootstrapfoundationstartedat"):
-    assert lease.metadata[field]
-# The retained ARM marker makes every later bootstrap attempt refuse, including a concurrent stale contender.
-try: m.bootstrap_admission_cost(env,state,lease,limits,unavailable)
-except m.RunnerError as exc: assert "already consumed" in str(exc)
-else: raise AssertionError("second bootstrap marker won")
-# Old or foreign foundation, inventory drift, a VM, a reservation, and over-ceiling pressure all refuse before another marker.
-def refuses(change,text):
-    lease=Lease(dict(base)); restore=change()
-    try: m.bootstrap_admission_cost(env,state,lease,limits,unavailable)
-    except m.RunnerError as exc: assert text in str(exc),str(exc)
-    else: raise AssertionError(text+" accepted")
-    finally: restore()
-def replace(name,value):
-    old=getattr(m,name); setattr(m,name,value); return lambda:setattr(m,name,old)
-refuses(lambda:replace("exact_bootstrap_deployment",lambda _env: (_ for _ in ()).throw(m.RunnerError("deployment old/foreign"))),"old/foreign")
-refuses(lambda:replace("exact_bootstrap_inventory",lambda *_: (_ for _ in ()).throw(m.RunnerError("foreign resource"))),"foreign resource")
-refuses(lambda:replace("exact_bootstrap_inventory",lambda *_:m.now_utc()-dt.timedelta(hours=73)),"outside the allowed window")
-refuses(lambda:replace("active_runner_vms",lambda _env:[{}]),"zero active")
-refuses(lambda:replace("list_management_reservations",lambda _env:[{}]),"zero outstanding")
-refuses(lambda:replace("exact_bootstrap_budget",lambda _env:{"id":"/subscriptions/sub/providers/Microsoft.Consumption/budgets/bud-prefix-monthly","etag":"E","current_spend":1499.0}),"exceeds")
-try: m.bootstrap_admission_cost(env,state,Lease(dict(base)),limits,m.CostAdmissionUnavailable("other","other"))
-except m.RunnerError as exc: assert "not eligible" in str(exc)
-else: raise AssertionError("non-specific failure entered bootstrap")
-# Budget identity, amount, currency, grain, filter, currentSpend, and ETag are all mandatory.
-m.exact_bootstrap_budget=real_budget
-budget={"id":"/subscriptions/sub/providers/Microsoft.Consumption/budgets/bud-prefix-monthly","name":"bud-prefix-monthly","type":"Microsoft.Consumption/budgets","eTag":"E","properties":{"amount":1500.0,"timeGrain":"Monthly","filter":{"dimensions":{"name":"ResourceGroupName","operator":"In","values":["rg"]}},"currentSpend":{"amount":0,"unit":"USD"}}}
-m.az_command=lambda *_a,**_k:(budget,0,"")
-assert m.exact_bootstrap_budget(env)["current_spend"]==0
-for field,value in (("amount",1000),("timeGrain","Annually"),("filter",{}),("currentSpend",{"amount":0,"unit":"EUR"})):
-    old=budget["properties"][field]; budget["properties"][field]=value
-    try: m.exact_bootstrap_budget(env)
-    except m.RunnerError: pass
-    else: raise AssertionError("wrong budget "+field+" accepted")
-    budget["properties"][field]=old
-budget.pop("eTag")
-try: m.exact_bootstrap_budget(env)
-except m.RunnerError: pass
-else: raise AssertionError("budget without ETag accepted")
-# Succeeded/fresh/correlation/template/output and reviewed main parameters are direct deployment gates.
-m.exact_bootstrap_deployment=real_deployment
-now=m.now_utc()
-parameters={k:{"value":v} for k,v in {"tenantId":"tenant","subscriptionId":"sub","deploymentGeneration":"gen","namingPrefix":"prefix","resourceGroupName":"rg","storageAccountName":"storage","capacityProfile":"foundation","keyVaultName":"kv"}.items()}
-deployment_doc={"name":"fm-azure-pilot-gen","properties":{"provisioningState":"Succeeded","timestamp":now.isoformat().replace("+00:00","Z"),"correlationId":"11111111-1111-4111-8111-111111111111","templateHash":"123","parameters":parameters,"outputs":{"capacityProfile":{"value":"foundation"},"region":{"value":"eastus"},"blobPrivateEndpointNicResourceGuid":{"value":env["blob_private_endpoint_nic_resource_guid"]}}}}
-m.az_command=lambda *_a,**_k:(deployment_doc,0,"")
-assert m.exact_bootstrap_deployment(env)["template_hash"]=="123"
-for field,value in (("provisioningState","Failed"),("correlationId","foreign"),("templateHash","foreign")):
-    old=deployment_doc["properties"][field]; deployment_doc["properties"][field]=value
-    try: m.exact_bootstrap_deployment(env)
-    except m.RunnerError: pass
-    else: raise AssertionError("wrong deployment "+field+" accepted")
-    deployment_doc["properties"][field]=old
-old=parameters["storageAccountName"]["value"]; parameters["storageAccountName"]["value"]="foreign"
-try: m.exact_bootstrap_deployment(env)
-except m.RunnerError: pass
-else: raise AssertionError("foreign deployment parameter accepted")
-parameters["storageAccountName"]["value"]=old
-deployment_doc["properties"]["timestamp"]=(now-dt.timedelta(hours=73)).isoformat().replace("+00:00","Z")
-try: m.exact_bootstrap_deployment(env)
-except m.RunnerError: pass
-else: raise AssertionError("old foundation deployment accepted")
-# Partial or malformed markers are never accepted by either gate or lease.
-assert m.bootstrap_marker_metadata_is_exact({})
-assert not m.bootstrap_marker_metadata_is_exact({"bootstrapadmission":"consumed"})
-PY
-  pass "one-shot bootstrap is exact, conservative, CAS-marked, and refuses old/foreign/budget/VM/reservation/concurrency/error adversaries"
 }
 
 static_private_controller_contract
@@ -396,6 +286,5 @@ linux_systemd_drop_integration
 management_fencing_unit
 effective_rbac_adversaries
 cost_retry_unit
-bootstrap_admission_adversaries
 
 echo "# fm-azure-runner.test.sh: all assertions passed"

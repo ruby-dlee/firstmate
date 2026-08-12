@@ -449,7 +449,16 @@ recover_acquisition() {  # <record>
       find_status=$?
     fi
     if [ "$find_status" -eq 2 ]; then
-      if fm_treehouse_prove_task_lease_absent "$recorded_worktree" "$holder" >/dev/null 2>&1; then
+      if [ -z "$recorded_worktree" ] && [ "$endpoint_phase" = not-created ] \
+        && [ "$tasktmp_phase" = not-created ]; then
+        if fm_treehouse_prove_project_task_lease_absent \
+            "$project" "$holder" "$home_real/.treehouse" >/dev/null 2>&1; then
+          absence_status=0
+        else
+          absence_status=$?
+        fi
+      elif fm_treehouse_prove_task_lease_absent \
+          "$recorded_worktree" "$holder" >/dev/null 2>&1; then
         absence_status=0
       else
         absence_status=$?

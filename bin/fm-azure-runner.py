@@ -50,6 +50,7 @@ LOCAL_COMMAND_TIMEOUT_SECONDS = 300
 COST_QUERY_TIMEOUT_SECONDS = 60
 COST_RETRY_DEADLINE_SECONDS = 900
 COST_CACHE_MAX_AGE_SECONDS = 4 * 60 * 60
+BOOTSTRAP_ADMISSION_MAX_AGE_SECONDS = 72 * 60 * 60
 LEASE_DURATION_SECONDS = 60
 LEASE_RENEW_TIMEOUT_SECONDS = 10
 LEASE_SAFETY_MARGIN_SECONDS = 15
@@ -137,6 +138,14 @@ SKU_MEMORY_GIB = {sku: 16 for sku in SKU_FAMILY}
 
 class RunnerError(RuntimeError):
     pass
+
+
+class CostAdmissionUnavailable(RunnerError):
+    """The authoritative actual/forecast pair is unavailable for a classified bootstrap reason."""
+
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
 
 
 def canonical_bytes(value):
@@ -875,13 +884,19 @@ def foundation_gate(env):
         "resource", "show", "--ids", runner_control_id(env), "--api-version", "2023-05-01",
     ])
     control_metadata = control_container.get("properties", {}).get("metadata") or {}
-    allowed_control_metadata = {"schema", "deploymentgeneration", "lockowner", "lockfence", "lockexpiry"}
+    allowed_control_metadata = {
+        "schema", "deploymentgeneration", "lockowner", "lockfence", "lockexpiry",
+        "bootstrapadmission", "bootstrapinvocation", "bootstrapfence", "bootstrapat",
+        "bootstrapcorrelation", "bootstraptemplatehash", "bootstrapbudgetid", "bootstrapbudgetetag",
+        "bootstrapbudgetspendmicrousd", "bootstrapfoundationstartedat",
+    }
     if (
         str(control_container.get("id", "")).lower() != runner_control_id(env).lower()
         or control_container.get("properties", {}).get("publicAccess") != "None"
         or control_metadata.get("schema") != "fm-azure-runner-control-v1"
         or control_metadata.get("deploymentgeneration") != env["deployment_generation"]
         or not set(control_metadata).issubset(allowed_control_metadata)
+        or not bootstrap_marker_metadata_is_exact(control_metadata)
         or not (control_container.get("etag") or control_container.get("properties", {}).get("etag"))
     ):
         raise RunnerError("runner control container identity/ETag contract is not exact")
@@ -1272,6 +1287,16 @@ def cost_http_query(env, endpoint, url, body):
                 save_cost_cache(env, cache_key, endpoint, body_digest, server_date, result)
                 return result
         except urllib.error.HTTPError as exc:
+            if exc.code == 424 and endpoint == "forecast":
+                try:
+                    error = json.loads(exc.read().decode("utf-8")).get("error", {})
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    error = {}
+                if error.get("code") == "FailedDependency" and error.get("message") == "Can't do forecast - cost training data is empty":
+                    raise CostAdmissionUnavailable(
+                        "forecast-empty-training",
+                        "Cost Management forecast is unavailable because exact-scope cost training data is empty",
+                    )
             if exc.code != 429:
                 raise RunnerError("Cost Management {} failed with HTTP {}".format(endpoint, exc.code))
             cached = load_cost_cache(env, cache_key, endpoint, body_digest)
@@ -1283,8 +1308,9 @@ def cost_http_query(env, endpoint, url, body):
             if cached is not None:
                 return cached
             detail = "missing server retry guidance" if wait_seconds is None else "server retry exceeds bounded deadline"
-            raise RunnerError(
-                "Cost Management {} remained throttled with no exact authoritative cache ({})".format(endpoint, detail)
+            raise CostAdmissionUnavailable(
+                "{}-throttled-no-cache".format(endpoint),
+                "Cost Management {} remained throttled with no exact authoritative cache ({})".format(endpoint, detail),
             )
         except urllib.error.URLError as exc:
             raise RunnerError("Cost Management {} transport failed closed: {}".format(endpoint, exc.reason))
@@ -1394,6 +1420,269 @@ def runner_control_id(env):
     ).format(env["subscription"], env["resource_group"], env["control_storage"], CONTROL_CONTAINER)
 
 
+def bootstrap_marker_metadata_is_exact(metadata):
+    fields = (
+        "bootstrapadmission", "bootstrapinvocation", "bootstrapfence", "bootstrapat",
+        "bootstrapcorrelation", "bootstraptemplatehash", "bootstrapbudgetid", "bootstrapbudgetetag",
+        "bootstrapbudgetspendmicrousd", "bootstrapfoundationstartedat",
+    )
+    present = [field for field in fields if field in metadata]
+    if not present:
+        return True
+    if len(present) != len(fields):
+        return False
+    try:
+        marked_at = dt.datetime.fromisoformat(metadata["bootstrapat"].replace("Z", "+00:00"))
+        foundation_started_at = dt.datetime.fromisoformat(
+            metadata["bootstrapfoundationstartedat"].replace("Z", "+00:00")
+        )
+    except (AttributeError, ValueError):
+        return False
+    return (
+        metadata["bootstrapadmission"] == "consumed"
+        and bool(SAFE_INVOCATION.match(metadata["bootstrapinvocation"]))
+        and bool(re.match(r"^[0-9a-f]{64}$", metadata["bootstrapfence"]))
+        and marked_at.tzinfo is not None
+        and bool(re.match(r"^[0-9a-fA-F-]{36}$", metadata["bootstrapcorrelation"]))
+        and bool(re.match(r"^[0-9]+$", str(metadata["bootstraptemplatehash"])))
+        and metadata["bootstrapbudgetid"].startswith("/subscriptions/")
+        and bool(metadata["bootstrapbudgetetag"])
+        and metadata["bootstrapbudgetspendmicrousd"].isdigit()
+        and foundation_started_at.tzinfo is not None
+    )
+
+
+def exact_bootstrap_deployment(env):
+    name = "fm-azure-pilot-{}".format(env["deployment_generation"])
+    deployment, _, _ = az_command(env, ["deployment", "sub", "show", "--name", name])
+    properties = deployment.get("properties", deployment)
+    parameters = properties.get("parameters") or {}
+    outputs = properties.get("outputs") or {}
+    try:
+        deployed_at = dt.datetime.fromisoformat(properties["timestamp"].replace("Z", "+00:00"))
+    except (KeyError, AttributeError, ValueError):
+        raise RunnerError("bootstrap foundation deployment timestamp is unreadable")
+    age_seconds = (now_utc() - deployed_at).total_seconds()
+    correlation = properties.get("correlationId", "")
+    template_hash = str(properties.get("templateHash", ""))
+    exact_parameters = {
+        "tenantId": env["tenant"],
+        "subscriptionId": env["subscription"],
+        "deploymentGeneration": env["deployment_generation"],
+        "namingPrefix": env["prefix"],
+        "resourceGroupName": env["resource_group"],
+        "storageAccountName": env["storage"],
+        "capacityProfile": "foundation",
+    }
+    if (
+        deployment.get("name") != name
+        or properties.get("provisioningState") != "Succeeded"
+        or age_seconds < 0
+        or age_seconds > BOOTSTRAP_ADMISSION_MAX_AGE_SECONDS
+        or not re.match(r"^[0-9a-fA-F-]{36}$", correlation)
+        or not re.match(r"^[0-9]+$", template_hash)
+        or any((parameters.get(key) or {}).get("value") != value for key, value in exact_parameters.items())
+        or (outputs.get("capacityProfile") or {}).get("value") != "foundation"
+        or (outputs.get("region") or {}).get("value") != "eastus"
+        or str((outputs.get("blobPrivateEndpointNicResourceGuid") or {}).get("value", "")).lower()
+        != env["blob_private_endpoint_nic_resource_guid"]
+    ):
+        raise RunnerError("bootstrap foundation deployment correlation/template outputs are not exact and fresh")
+    return {
+        "name": name,
+        "deployed_at": deployed_at,
+        "age_seconds": age_seconds,
+        "correlation_id": correlation.lower(),
+        "template_hash": template_hash,
+        "key_vault_name": (parameters.get("keyVaultName") or {}).get("value"),
+    }
+
+
+def exact_bootstrap_inventory(env, deployment):
+    resources, _, _ = az_command(env, ["resource", "list", "--resource-group", env["resource_group"]])
+    vault_endpoint_name = "pe-{}-vault".format(env["prefix"])
+    vault_endpoint_id = exact_id(env, "Microsoft.Network", "privateEndpoints", vault_endpoint_name)
+    vault_endpoint, _, _ = az_command(env, [
+        "resource", "show", "--ids", vault_endpoint_id, "--api-version", "2023-09-01",
+    ])
+    verify_foundation_tags(env, vault_endpoint, "vault private endpoint")
+    vault_nics = vault_endpoint.get("properties", {}).get("networkInterfaces", [])
+    if len(vault_nics) != 1:
+        raise RunnerError("bootstrap vault private-endpoint NIC inventory is ambiguous")
+    vault_nic_name = str(vault_nics[0].get("id", "")).rsplit("/", 1)[-1]
+    expected = {
+        ("microsoft.insights/actiongroups", "ag-{}-ops".format(env["prefix"])),
+        ("microsoft.insights/datacollectionrules", "dcr-{}-linux".format(env["prefix"])),
+        ("microsoft.insights/metricalerts", "alert-{}-storage-availability".format(env["prefix"])),
+        ("microsoft.insights/scheduledqueryrules", "alert-{}-disk-usage".format(env["prefix"])),
+        ("microsoft.insights/scheduledqueryrules", "alert-{}-sync-age".format(env["prefix"])),
+        ("microsoft.keyvault/vaults", deployment["key_vault_name"]),
+        ("microsoft.operationalinsights/workspaces", "log-{}-eus".format(env["prefix"])),
+        ("microsoft.network/natgateways", "nat-{}-eus".format(env["prefix"])),
+        ("microsoft.network/networkinterfaces", env["blob_private_endpoint_nic"]),
+        ("microsoft.network/networkinterfaces", vault_nic_name),
+        ("microsoft.network/networksecuritygroups", "nsg-{}-elastic-isolated".format(env["prefix"])),
+        ("microsoft.network/networksecuritygroups", "nsg-{}-networkless-verifier".format(env["prefix"])),
+        ("microsoft.network/networksecuritygroups", "nsg-{}-supervisor".format(env["prefix"])),
+        ("microsoft.network/networksecuritygroups", "nsg-{}-workers".format(env["prefix"])),
+        ("microsoft.network/privateendpoints", env["blob_private_endpoint"]),
+        ("microsoft.network/privateendpoints", vault_endpoint_name),
+        ("microsoft.network/publicipaddresses", "pip-{}-nat-eus".format(env["prefix"])),
+        ("microsoft.network/virtualnetworks", env["vnet"]),
+        ("microsoft.network/privatednszones", "privatelink.blob.core.windows.net"),
+        ("microsoft.network/privatednszones", "privatelink.vaultcore.azure.net"),
+        ("microsoft.network/privatednszones/virtualnetworklinks", "privatelink.blob.core.windows.net/firstmate-vnet"),
+        ("microsoft.network/privatednszones/virtualnetworklinks", "privatelink.vaultcore.azure.net/firstmate-vnet"),
+        ("microsoft.storage/storageaccounts", env["storage"]),
+        ("microsoft.storage/storageaccounts", env["control_storage"]),
+    }
+    expected.update(
+        ("microsoft.managedidentity/userassignedidentities", "id-{}-{}".format(env["prefix"], suffix))
+        for suffix in (
+            "validation", "policy-review", "crosscheck-tools", "validation-shards", "networkless-verifier",
+        )
+    )
+    actual = {(str(item.get("type", "")).lower(), item.get("name")) for item in resources}
+    if actual != expected:
+        raise RunnerError("bootstrap foundation inventory contains a missing, foreign, or unreviewed resource")
+    untagged_types = {"microsoft.network/privatednszones/virtualnetworklinks"}
+    for item in resources:
+        if str(item.get("type", "")).lower() not in untagged_types:
+            verify_foundation_tags(env, item, "bootstrap inventory resource")
+    creation_times = []
+    for item in resources:
+        raw = (item.get("systemData") or {}).get("createdAt") or item.get("createdTime")
+        if raw:
+            try:
+                created = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except (AttributeError, ValueError):
+                raise RunnerError("bootstrap foundation resource creation time is malformed")
+            if created.tzinfo is None or created > now_utc():
+                raise RunnerError("bootstrap foundation resource creation time is not exact")
+            creation_times.append(created)
+    if not creation_times:
+        raise RunnerError("bootstrap foundation has no authoritative resource creation evidence")
+    return min(creation_times)
+
+
+def exact_bootstrap_budget(env):
+    budget_name = "bud-{}-monthly".format(env["prefix"])
+    budget_id = "/subscriptions/{}/providers/Microsoft.Consumption/budgets/{}".format(
+        env["subscription"], budget_name
+    )
+    budget, _, _ = az_command(env, [
+        "rest", "--method", "get", "--url",
+        "https://management.azure.com{}?api-version=2024-08-01".format(budget_id),
+    ])
+    properties = budget.get("properties", budget)
+    current = properties.get("currentSpend") or {}
+    exact_filter = {
+        "dimensions": {
+            "name": "ResourceGroupName", "operator": "In", "values": [env["resource_group"]],
+        }
+    }
+    try:
+        current_spend = float(current["amount"])
+    except (KeyError, TypeError, ValueError):
+        raise RunnerError("bootstrap budget currentSpend is unreadable")
+    if (
+        str(budget.get("id", "")).lower() != budget_id.lower()
+        or budget.get("name") != budget_name
+        or budget.get("type") != "Microsoft.Consumption/budgets"
+        or float(properties.get("amount", -1)) != 1500.0
+        or properties.get("timeGrain") != "Monthly"
+        or properties.get("filter") != exact_filter
+        or current.get("unit") != "USD"
+        or current_spend < 0
+        or not (budget.get("eTag") or budget.get("etag"))
+    ):
+        raise RunnerError("bootstrap budget identity/amount/currency/timeGrain/filter is not exact")
+    return {
+        "id": budget_id,
+        "etag": budget.get("eTag") or budget.get("etag"),
+        "current_spend": current_spend,
+    }
+
+
+def bootstrap_admission_cost(env, state, lease, limits, unavailable):
+    if unavailable.reason not in {
+        "query-throttled-no-cache", "forecast-throttled-no-cache", "forecast-empty-training",
+    }:
+        raise RunnerError("cost failure is not eligible for one-time bootstrap admission")
+    foundation_gate(env)
+    deployment = exact_bootstrap_deployment(env)
+    foundation_started_at = exact_bootstrap_inventory(env, deployment)
+    if active_runner_vms(env):
+        raise RunnerError("bootstrap admission requires zero active runner VMs")
+    if list_management_reservations(env):
+        raise RunnerError("bootstrap admission requires zero outstanding cost reservations")
+    budget = exact_bootstrap_budget(env)
+    rate = retail_rate(env, limits["sku"])
+    first_hour = itemized_cost_bound(rate, 1, limits)
+    first_day = itemized_cost_bound(rate, MAX_BILLABLE_LIFETIME_HOURS, limits)
+    elapsed_hours = (now_utc() - foundation_started_at).total_seconds() / 3600.0
+    if elapsed_hours < 0 or elapsed_hours * 3600 > BOOTSTRAP_ADMISSION_MAX_AGE_SECONDS:
+        raise RunnerError("bootstrap foundation earliest creation evidence is outside the allowed window")
+    foundation_categories = {
+        "nat_gateway": METER_RATE_CEILINGS_USD["nat_gateway"] * elapsed_hours,
+        "public_ip": METER_RATE_CEILINGS_USD["public_ip"] * elapsed_hours,
+        "private_endpoints": METER_RATE_CEILINGS_USD["private_endpoints"] * elapsed_hours,
+        "private_dns": METER_RATE_CEILINGS_USD["private_dns"] * elapsed_hours,
+        "monitoring": METER_RATE_CEILINGS_USD["monitoring"] * elapsed_hours,
+        "storage_capacity": METER_RATE_CEILINGS_USD["storage_capacity"] * elapsed_hours,
+        "storage_operations": STORAGE_OPERATION_RESERVE_USD,
+        "control_operations": CONTROL_OPERATION_RESERVE_USD,
+        "foundation_shared_meter_reserve": FOUNDATION_SHARED_METER_RESERVE_USD,
+    }
+    foundation_bound = sum(foundation_categories.values())
+    cost_lower_bound = max(budget["current_spend"], foundation_bound)
+    pressure = cost_lower_bound + first_day["total"]
+    if pressure >= env["budget_limit"]:
+        raise RunnerError("one-time bootstrap conservative cost pressure exceeds the commissioning ceiling")
+    metadata, etag = lease._read()
+    if metadata.get("bootstrapadmission"):
+        raise RunnerError("one-time bootstrap admission was already consumed")
+    metadata.update({
+        "bootstrapadmission": "consumed",
+        "bootstrapinvocation": state["invocation"],
+        "bootstrapfence": state["request"]["fence"].split(":", 1)[1],
+        "bootstrapat": iso_utc(),
+        "bootstrapcorrelation": deployment["correlation_id"],
+        "bootstraptemplatehash": deployment["template_hash"],
+        "bootstrapbudgetid": budget["id"],
+        "bootstrapbudgetetag": budget["etag"],
+        "bootstrapbudgetspendmicrousd": str(int(round(budget["current_spend"] * 1_000_000))),
+        "bootstrapfoundationstartedat": iso_utc(foundation_started_at),
+    })
+    if not bootstrap_marker_metadata_is_exact(metadata):
+        raise RunnerError("one-time bootstrap marker is not structurally exact")
+    lease.etag = lease._cas(etag, metadata)
+    lease._record_success()
+    lease.assert_held()
+    return {
+        "actual": budget["current_spend"],
+        "forecast": None,
+        "hourly_rate": rate,
+        "first_hour": first_hour,
+        "first_day": first_day,
+        "max_network_bytes": limits["network_bytes"],
+        "max_billable_lifetime_hours": MAX_BILLABLE_LIFETIME_HOURS,
+        "max_increment": first_day["total"],
+        "outstanding_reservations": 0.0,
+        "admission_pressure": pressure,
+        "bootstrap_admission": True,
+        "bootstrap_reason": unavailable.reason,
+        "foundation_elapsed_hours": elapsed_hours,
+        "foundation_categories": foundation_categories,
+        "foundation_bound": foundation_bound,
+        "budget_current_spend": budget["current_spend"],
+        "cost_lower_bound": cost_lower_bound,
+        "foundation_started_at": iso_utc(foundation_started_at),
+        "deployment_correlation": deployment["correlation_id"],
+        "deployment_template_hash": deployment["template_hash"],
+    }
+
+
 def reservation_name(env, invocation):
     return "id-{}-rsv-{}".format(env["prefix"], require_invocation(invocation).split("-")[1])
 
@@ -1499,7 +1788,7 @@ def reconcile_management_reservations(env, reservations):
     return retained
 
 
-def reserve_budget_management(env, state, lease, limits):
+def reserve_budget_management(env, state, lease, limits, admitted_cost=None):
     lease.assert_held()
     reservations = reconcile_management_reservations(env, list_management_reservations(env))
     existing = [item for item in reservations if item["invocation-binding"] == state["invocation"]]
@@ -1514,7 +1803,12 @@ def reserve_budget_management(env, state, lease, limits):
             env, limits, outstanding_reservations=sum(item["amount_usd"] for item in reservations if item["id"] != existing[0]["id"])
         )
     outstanding = sum(item["amount_usd"] for item in reservations)
-    cost = budget_gate(env, limits, outstanding_reservations=outstanding)
+    if admitted_cost is not None:
+        if outstanding != 0:
+            raise RunnerError("one-time bootstrap reservation requires zero outstanding reservations")
+        cost = admitted_cost
+    else:
+        cost = budget_gate(env, limits, outstanding_reservations=outstanding)
     tags = reservation_tags(env, state, cost["max_increment"], iso_utc())
     az_command(env, [
         "identity", "create", "--resource-group", env["resource_group"], "--name", reservation_name(env, state["invocation"]),
@@ -1606,7 +1900,12 @@ class ManagementAdmissionLease:
             "resource", "show", "--ids", runner_control_id(self.env), "--api-version", "2023-05-01",
         ], timeout_seconds=LEASE_RENEW_TIMEOUT_SECONDS)
         metadata = resource.get("properties", {}).get("metadata") or {}
-        allowed = {"schema", "deploymentgeneration", "lockowner", "lockfence", "lockexpiry"}
+        allowed = {
+            "schema", "deploymentgeneration", "lockowner", "lockfence", "lockexpiry",
+            "bootstrapadmission", "bootstrapinvocation", "bootstrapfence", "bootstrapat",
+            "bootstrapcorrelation", "bootstraptemplatehash", "bootstrapbudgetid", "bootstrapbudgetetag",
+            "bootstrapbudgetspendmicrousd", "bootstrapfoundationstartedat",
+        }
         owner = metadata.get("lockowner", "")
         fence = metadata.get("lockfence", "")
         expiry = metadata.get("lockexpiry", "")
@@ -1614,6 +1913,7 @@ class ManagementAdmissionLease:
             metadata.get("schema") != "fm-azure-runner-control-v1"
             or metadata.get("deploymentgeneration") != self.env["deployment_generation"]
             or not set(metadata).issubset(allowed)
+            or not bootstrap_marker_metadata_is_exact(metadata)
             or bool(owner) != bool(fence) or bool(owner) != bool(expiry)
             or (fence and not re.match(r"^[0-9a-f]{64}$", fence))
             or (owner and not SAFE_INVOCATION.match(owner))
@@ -1656,13 +1956,12 @@ class ManagementAdmissionLease:
             if busy:
                 time.sleep(10)
                 continue
-            updated = {
-                "schema": "fm-azure-runner-control-v1",
-                "deploymentgeneration": self.env["deployment_generation"],
+            updated = dict(metadata)
+            updated.update({
                 "lockowner": self.state["invocation"],
                 "lockfence": self.fence,
                 "lockexpiry": iso_utc(now_utc() + dt.timedelta(seconds=LEASE_DURATION_SECONDS)),
-            }
+            })
             try:
                 self.etag = self._cas(etag, updated)
             except RunnerError:
@@ -2264,23 +2563,38 @@ def dispatch_prepared(env, state, confirm_subscription):
         scope_gate(env)
         limits = state["request"]["limits"]
         sku_quota_gate(env, limits)
-        cost = budget_gate(env, limits)
+        unavailable = None
+        try:
+            cost = budget_gate(env, limits)
+        except CostAdmissionUnavailable as exc:
+            unavailable = exc
+            cost = None
         foundation_gate(env)
-        transition(env, state, "admission-checked", "scope, quota, SKU, budget, and exact foundation gates passed", cost=cost)
+        if cost is not None:
+            transition(env, state, "admission-checked", "scope, quota, SKU, budget, and exact foundation gates passed", cost=cost)
         with ManagementAdmissionLease(env, state) as lease:
             foundation_gate(env)
             sku_quota_gate(env, limits)
             active = active_runner_vms(env)
             if len(active) >= env["max_concurrency"]:
                 raise RunnerError("runner queue is at its bounded concurrency limit ({})".format(env["max_concurrency"]))
-            cost = reserve_budget_management(env, state, lease, limits)
+            reprove_public_request(state)
+            if unavailable is not None:
+                cost = bootstrap_admission_cost(env, state, lease, limits, unavailable)
+                transition(
+                    env, state, "admission-checked",
+                    "one-time commissioning bootstrap admitted under exact ARM marker and conservative bound",
+                    cost=cost,
+                )
+            cost = reserve_budget_management(
+                env, state, lease, limits, admitted_cost=cost if unavailable is not None else None,
+            )
             transition(
                 env, state, "cost-reserved",
                 "durable worst-case cost reserved under the admission lease",
                 cost=cost, reservation_recorded=True,
             )
             foundation_gate(env)
-            reprove_public_request(state)
             verify_all_reservation_rbac_zero(env)
             lease.renew_and_assert()
             create_vm(env, state)

@@ -1188,10 +1188,9 @@ test_spawn_pins_the_turn_end_shell_under_a_runtime_pin() {
   pass "a turn-end hook that rides the launch line names both its shell and its touch absolutely"
 }
 
-# The raw launch command is the documented unverified-adapter escape hatch. It
-# spawns under a pin without firstmate resolving a single word of it, because the
-# PATH it resolves against carries nothing the manifest supplied.
-test_spawn_pins_a_raw_launch_command_without_resolving_it() {
+# The raw launch command is the documented unverified-adapter escape hatch. Its
+# executable resolves on Firstmate's PATH before the pin reaches the child.
+test_spawn_pins_a_resolvable_raw_launch_command() {
   local rec id out launch
   id=provision-raw-pin-pf
   rec=$(make_spawn_case raw-pin "$id")
@@ -1210,80 +1209,61 @@ test_spawn_pins_a_raw_launch_command_without_resolving_it() {
   assert_contains "$launch" "--go" "the rest of the raw launch command must be untouched: $launch"
   assert_not_contains "$launch" "$CASE_DIR/pinned-bin/crewtool" \
     "the manifest's pinned directory must not name the launched binary: $launch"
-  pass "a raw launch command receives the pin without firstmate resolving its words"
+  pass "a raw launch command resolves before its child session receives the pin"
 }
 
-# A raw launch command firstmate cannot resolve is no longer a refusal. There is
-# nothing left to refuse: the line resolves against firstmate's own PATH whatever
-# it names, so an unresolvable word fails exactly as it would with no manifest at
-# all - in the pane, at launch, not by costing a lease up front.
-test_spawn_launches_a_raw_command_it_cannot_resolve() {
-  local rec id out launch
-  id=provision-raw-unpinnable-pg
-  rec=$(make_spawn_case raw-unpinnable "$id")
+test_spawn_preserves_an_unpinned_raw_launch_command() {
+  local rec id out launch command
+  id=provision-raw-unpinned-pj
+  command='exec crewtool --go'
+  rec=$(make_spawn_case raw-unpinned "$id")
   read_spawn_case "$rec"
-  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
-
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" \
-    --harness 'crewtool-does-not-exist --go')
-  expect_code 0 "$?" "a raw launch command firstmate cannot resolve must still spawn: $out"
-  launch=$(sent_line_containing "$SEND_LOG" crewtool-does-not-exist)
-  assert_not_contains "$launch" "fm-launch-pinned.sh" \
-    "a word firstmate cannot resolve must be typed as written, not handed to the launcher: $launch"
-  assert_contains "$out" "runtime pin is not applied" \
-    "the spawn should say the pin was not delivered: $out"
-  assert_present "$HOME_DIR/state/$id.meta" "the spawn should have recorded a live task"
-  pass "a raw launch command firstmate cannot resolve spawns unpinned instead of being refused"
-}
-
-# Wrapping a launch line REMOVES the pane shell's own expansion of its first word,
-# so a builtin, an alias, or a shell function stops being expanded and becomes an
-# argument the launcher cannot execute. `exec` is the shipped-bash case: `type -P`
-# cannot resolve it, so wrapping it would spawn successfully, burn the lease and
-# the install, and then die 127 in the pane where nobody is watching.
-test_spawn_leaves_a_shell_builtin_launch_unwrapped() {
-  local rec id out launch
-  id=provision-raw-builtin-pn
-  rec=$(make_spawn_case raw-builtin "$id")
-  read_spawn_case "$rec"
-  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
   fm_fake_exit0 "$FAKEBIN_DIR" crewtool
 
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" \
-    --harness 'exec crewtool --go')
-  expect_code 0 "$?" "a raw launch command that starts with a shell builtin must still spawn: $out"
+    --no-provision --harness "$command")
+  expect_code 0 "$?" "an unpinned raw launch command must still spawn: $out"
   launch=$(sent_line_containing "$SEND_LOG" crewtool)
-  assert_contains "$launch" "exec crewtool --go" \
-    "a builtin-led launch line must be typed exactly as written: $launch"
+  assert_contains "$launch" "$command" \
+    "an unpinned raw launch command must remain byte-for-byte within the launch line: $launch"
   assert_not_contains "$launch" "fm-launch-pinned.sh" \
-    "wrapping a builtin would strip the shell expansion the line depends on: $launch"
-  assert_contains "$out" "runtime pin is not applied" \
-    "the spawn should say the pin was not delivered: $out"
-  assert_present "$HOME_DIR/state/$id.meta" "the spawn should have recorded a live task"
-  pass "a launch line whose first word only a shell can expand is left unwrapped"
+    "an unpinned raw launch command must not gain the session launcher: $launch"
+  pass "an unpinned raw launch command remains unchanged"
 }
 
-# A raw launch command that opens with a shell construct has no command word to
-# hand the launcher, so the pin is not applied to it. It still launches and still
-# resolves against firstmate's own PATH, and the spawn says what it did not do
-# rather than leaving the operator to infer a pin that is not there.
-test_spawn_reports_a_raw_launch_it_cannot_pin() {
-  local rec id out launch
-  id=provision-raw-construct-pk
-  rec=$(make_spawn_case raw-construct "$id")
-  read_spawn_case "$rec"
-  install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
-  fm_fake_exit0 "$FAKEBIN_DIR" crewtool
+# A raw line whose first word only the pane shell can interpret cannot be wrapped
+# without changing its semantics. Every such line must fail closed before the
+# endpoint or provisioning state exists when its manifest may publish a pin.
+test_pre_lease_gate_refuses_unpinnable_raw_launches() {
+  local label command rec id out
+  while IFS='|' read -r label command; do
+    id="provision-raw-${label}-pk"
+    rec=$(make_spawn_case "raw-$label" "$id")
+    read_spawn_case "$rec"
+    install_spawn_manifest "$HOME_DIR" "$CASE_DIR"
+    fm_fake_exit0 "$FAKEBIN_DIR" crewtool
 
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" \
-    --harness '( crewtool --go )')
-  expect_code 0 "$?" "a raw launch command that opens with a shell construct must still spawn: $out"
-  assert_contains "$out" "runtime pin is not applied" \
-    "the spawn should say the pin was not delivered: $out"
-  launch=$(sent_line_containing "$SEND_LOG" crewtool)
-  assert_not_contains "$launch" "fm-launch-pinned.sh" \
-    "a line with no command word must be typed exactly as written: $launch"
-  pass "a raw launch command with no command word launches unpinned and says so"
+    out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$SEND_LOG" "$id" "$PROJ_DIR" \
+      --harness "$command")
+    expect_code 1 "$?" "a pinned raw $label launch must fail closed: $out"
+    assert_contains "$out" "before leasing a worktree" \
+      "a pinned raw $label launch must be refused before endpoint creation: $out"
+    assert_contains "$out" "cannot safely receive the pin" \
+      "a pinned raw $label refusal must explain the session-pin boundary: $out"
+    assert_absent "$CASE_DIR/acquired-worktree" \
+      "a pinned raw $label refusal must not acquire an endpoint"
+    assert_absent "$HOME_DIR/state/$id.provision" \
+      "a pinned raw $label refusal must not run provisioning"
+    assert_absent "$HOME_DIR/state/$id.meta" \
+      "a pinned raw $label refusal must not record a live task"
+  done <<'EOF'
+builtin|exec crewtool --go
+alias|crew_alias --go
+function|crew_function --go
+construct|( crewtool --go )
+unresolved|crewtool-does-not-exist --go
+EOF
+  pass "unpinnable raw launches fail closed before endpoint creation"
 }
 
 # The pre-lease gate exists so a refusal never costs a lease, and it must key on
@@ -1695,10 +1675,9 @@ test_pinned_launcher_resolves_before_it_pins
 test_spawn_delivers_the_proven_runtime_to_the_crewmate_session
 test_a_runtime_pin_decides_nothing_firstmate_names
 test_spawn_pins_the_turn_end_shell_under_a_runtime_pin
-test_spawn_pins_a_raw_launch_command_without_resolving_it
-test_spawn_launches_a_raw_command_it_cannot_resolve
-test_spawn_leaves_a_shell_builtin_launch_unwrapped
-test_spawn_reports_a_raw_launch_it_cannot_pin
+test_spawn_pins_a_resolvable_raw_launch_command
+test_spawn_preserves_an_unpinned_raw_launch_command
+test_pre_lease_gate_refuses_unpinnable_raw_launches
 test_pre_lease_gate_refuses_an_unavailable_pinned_launcher
 test_pre_lease_hook_pin_gate_honors_kinds
 test_spawn_fails_closed_when_the_provisioner_cannot_be_run

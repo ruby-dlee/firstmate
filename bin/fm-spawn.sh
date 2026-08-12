@@ -2707,10 +2707,9 @@ fi
 # launcher ahead of the line REMOVES the pane shell's own expansion of that word:
 # a shell builtin, an operator alias, or a shell function stops being expanded and
 # becomes an argument the launcher then cannot execute. Anything firstmate cannot
-# resolve is therefore left exactly as the operator wrote it and simply does not
-# receive the pin. Refusing instead would cost a spawn shape that works today and
-# buy nothing: with no manifest-supplied entry on the crewmate PATH, an unpinned
-# line already resolves entirely against firstmate's own order.
+# resolve therefore cannot safely receive a project pin without changing the raw
+# line's shell semantics. A manifest that may publish such a pin is refused before
+# endpoint creation; without a pin, the raw line remains exactly as written.
 LAUNCH_PIN_DELIVERABLE=1
 LAUNCH_PIN_UNDELIVERABLE_REASON=
 if [ "$RAW_LAUNCH" = 1 ]; then
@@ -3410,6 +3409,9 @@ spawn_refuse_unpinnable_launch() {
   [ "$BACKEND" != orca ] || return 0
   if [ -z "$blocker" ] && { [ ! -f "$launcher" ] || [ ! -x "$launcher" ]; }; then
     blocker="the pinned launcher $launcher, which is what carries a proven pin into the agent's environment, is missing or not executable"
+  fi
+  if [ -z "$blocker" ] && [ "$LAUNCH_PIN_DELIVERABLE" != 1 ]; then
+    blocker="its raw launch command cannot safely receive the pin because ${LAUNCH_PIN_UNDELIVERABLE_REASON:-firstmate could not resolve it to one executable}"
   fi
   [ -n "$blocker" ] || return 0
   spawn_project_manifest_may_pin || return 0
@@ -4355,8 +4357,8 @@ spawn_pin_launch_line() {
     return 1
   fi
   if [ "$LAUNCH_PIN_DELIVERABLE" != 1 ]; then
-    echo "warning: fm-$ID's proven runtime pin is not applied to the agent's environment because ${LAUNCH_PIN_UNDELIVERABLE_REASON:-firstmate could not resolve its raw launch command to one executable}; the launch line is typed exactly as written and still resolves against firstmate's own PATH, and the project's own tools resolve from the crewmate PATH instead" >&2
-    return 0
+    echo "error: refusing to launch fm-$ID with a proven runtime pin because ${LAUNCH_PIN_UNDELIVERABLE_REASON:-firstmate could not resolve its raw launch command to one executable}" >&2
+    return 1
   fi
   LAUNCH="$(shell_quote "$launcher") $(shell_quote "$session_path_prepend") $LAUNCH"
   return 0

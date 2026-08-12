@@ -60,7 +60,7 @@ No validation, reviewer, tool, or verifier VM is created by this template.
 Those pools must scale to zero and may not mount a control home.
 The policy reviewer identity is separate from the browser/tool identity so the follow-up can preserve a credentialed-reviewer and uncredentialed-tool boundary.
 The template does not claim that moving a shared singleton daemon into Azure solves contention.
-A follow-up owns isolated per-run or small-cell daemon, database, cache, process, credential, and lifecycle behavior.
+The isolated per-run daemon, database, cache, process, credential, worktree, and lifecycle behavior is owned by [`docs/azure-validation.md`](azure-validation.md).
 
 The live 128-vCPU regional limit can cover a 2-vCPU supervisor, sixteen 4-vCPU mixed-family author workers, and a 62-vCPU landing reserve.
 That headroom is reserved for isolated validation, Crosscheck, browser, replacement, recovery, and ancillary capacity.
@@ -140,6 +140,7 @@ One Dasv6 supervisor plus two continuous Dasv6 workers is about $332/month for V
 The full mixed plan's average worker rate is about $0.218/hour, making the 3,500-hour planning arithmetic, supervisor, NAT/outbound IP, and conservative $210 reserve about $1,077/month.
 Sixteen mixed workers plus the supervisor and NAT/outbound IP running continuously is about $2,653/month before disks, validation/review/browser capacity, Log Analytics, blob capacity and operations, network transfer, taxes, discounts, or credits.
 The separate one-shot validation seam defaults to `Standard_D4as_v6` (4 vCPUs/16 GiB), so two immediate shards fit inside the existing 10-vCPU Dasv6 allowance.
+The no-mistakes validation control cell defaults near 8 vCPUs/32 GiB and live-selects an affordable reviewed v5 family separate from the v6/v7 author plan, while requested behavior parallelism fans into mixed-family identity-less command VMs under the independent 64-vCPU validation reservation described in [`docs/azure-validation.md`](azure-validation.md).
 East US homogeneous-family increases are unavailable on this sponsorship subscription, so the runner never waits for 96 homogeneous family vCPUs and may instead select one of the foundation's reviewed mixed-family shapes only after proving that exact family's current free quota and retail rate.
 Quota is capacity, not permission to spend; actual and forecast billing telemetry is authoritative.
 Credits remain unverified and are never assumed.
@@ -245,6 +246,7 @@ The runner owns snapshot upload, command/result protocol, no-mistakes command in
 The intended first real use is parallel heavy test, lint, and behavior commands while the local primary remains responsive.
 
 The queued fleet lifecycle implementation is specified in [`docs/azure-workers.md`](azure-workers.md) and owns budget/forecast admission, zero-warm-idle scheduling, landing-capacity reservation, provider-session revocation, and application health while preserving the role topology above.
+The no-mistakes path is the dispatcher and elastic cell implementation in [`docs/azure-validation.md`](azure-validation.md), which reserves its complete specialized shape through that same shared allocator.
 
 ## Acceptance and immediate use
 
@@ -271,9 +273,9 @@ Already-running local work finishes locally and is never migrated in place.
 
 ## Herdr boundary
 
-Herdr is the required primary cloud terminal/session interface.
-tmux exists only as a recovery fallback.
-Cloud-default acceptance is blocked on a real end-to-end Herdr proof after infrastructure exists.
+Herdr is the required primary cloud terminal/session interface for a later remote interactive supervisor and author fleet.
+tmux exists only as a recovery fallback for that topology.
+The standalone Azure validation plane uses private control-plane and command interfaces while Firstmate remains local, so its acceptance and Mac-relief eligibility do not wait for remote Herdr.
 
 The template exposes empty Herdr release, artifact URI, and integrity-pin seams but installs nothing from them.
 They remain empty until the independent Linux and remote topology evidence establishes a supported pinned artifact, network, authentication, and endpoint contract.

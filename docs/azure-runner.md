@@ -9,7 +9,8 @@ The runner offloads one uncredentialed repository command to one disposable priv
 It is suitable for review-independent test, lint, documentation checks, behavior suites, and Crosscheck evidence commands whose complete dependency closure is available in the exact repository snapshot or the selected runner image.
 It does not run Firstmate, an author agent, a model reviewer, a browser, a no-mistakes coordinator, a fixer, branch mutation, push, CI control, or merge authority.
 It does not make uncredentialed execution alone a complete Azure no-mistakes or policy-grade Crosscheck environment.
-Those credentialed control and reviewer compartments remain separate follow-ups and consume this substrate through its snapshot, request, result, identity, and cleanup contract.
+The credentialed no-mistakes control compartment is implemented by [`docs/azure-validation.md`](azure-validation.md) and consumes this substrate through its snapshot, request, result, identity, and cleanup contract.
+The policy reviewer compartment remains separate.
 
 The tracked no-mistakes command entries call the dispatch wrapper.
 The wrapper executes locally by default.
@@ -112,7 +113,8 @@ This distinction prevents remote failure from becoming a pass.
 
 There is no queue daemon and no warm runner compute.
 An empty local queue means zero runner VMs.
-Every invocation receives a separate VM, so two admitted shards run concurrently without sharing process, memory, disk, temp, or task state.
+Every invocation receives a separate VM, so admitted shards run concurrently without sharing process, memory, disk, temp, ports, locks, terminal servers, or task state.
+The validation-cell dispatcher may request up to eight mixed-family invocations for the long behavior suite, while each invocation still passes this runner's own global admission, exact-family quota, cost, identity, and cleanup gates.
 
 Immediately before reservation and again immediately before VM creation, the controller proves the exact subscription/resource-group IDs and owner/generation tags for the named foundation storage account, zero-data admission-control account/container and ETag, controller UAMI and its sole exact effective container role including inherited/group expansion, VNet and address space, validation and private-endpoint subnets, complete NSG rule set, NAT and bound Standard public IP, blob private endpoint and endpoint NIC, named approved blob connection, private-DNS zone, VNet link, zone group/config names, and private-access properties.
 It also proves current SKU capabilities and restrictions, current East US regional and selected-family free vCPU quota, month-to-date actual cost, forecast cost, the exact unambiguous Linux on-demand Consumption retail meter (never Spot, Low Priority, Windows, dev/test, reservation, or savings pricing), and active runner count.

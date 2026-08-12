@@ -952,7 +952,10 @@ test_forced_secondmate_teardown_kills_zellij_children_with_child_home_tag() {
   fixture_remote="$dir/source-remote.git"
   git init -q --bare "$fixture_remote"
   git -C "$fixture_remote" symbolic-ref HEAD refs/heads/main
-  source_default_tip=$(git -C "$ROOT" rev-parse refs/remotes/origin/main)
+  # The fixture's private origin must start at the exact commit this checkout is
+  # testing. Using a possibly stale remote-tracking main makes an unrelated live
+  # upstream advance look like a secondmate freshness failure.
+  source_default_tip=$(git -C "$ROOT" rev-parse HEAD)
   git -C "$ROOT" push -q "$fixture_remote" "$source_default_tip":refs/heads/main
   git clone -q --no-local --depth 1 --single-branch --branch main "$fixture_remote" "$home"
   # The source checkout stands in for FM_ROOT so the landed-state proof's live

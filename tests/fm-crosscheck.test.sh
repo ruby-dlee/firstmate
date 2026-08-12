@@ -253,6 +253,12 @@ status=0
 for selector in "${targets[@]}"; do
   bash "${selector%%::*}" || status=1
 done
+if [ "$status" -ne 0 ]; then
+  # Real pytest 9.1.1 supplies this final count summary for exit 1. The fake
+  # runner keeps all unrelated gate tests hermetic but must preserve the output
+  # contract the production outcome interpreter now requires.
+  printf '1 failed in 0.01s\n'
+fi
 exit "$status"
 SH
   cat > "$case_dir/pathbin/python3" <<SH
@@ -3179,14 +3185,13 @@ import sys
 
 ledger = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 proof = ledger["findings"][0]["history"][-1]["proof"]
-assert proof["baseline_output"] == proof["mutated_output"], proof
 proof["baseline_output"] = re.sub(
-    r"^configfile: .*/pytest[.]ini\n$",
+    r"^configfile: .*/pytest[.]ini\n",
     "configfile: <gate>/pytest.ini\n",
     proof["baseline_output"],
 )
 proof["mutated_output"] = re.sub(
-    r"^configfile: .*/pytest[.]ini\n$",
+    r"^configfile: .*/pytest[.]ini\n",
     "configfile: <gate>/pytest.ini\n",
     proof["mutated_output"],
 )
@@ -3198,7 +3203,7 @@ expected = {
     "baseline_exit": 0,
     "mutated_exit": 1,
     "baseline_output": "configfile: <gate>/pytest.ini\n",
-    "mutated_output": "configfile: <gate>/pytest.ini\n",
+    "mutated_output": "configfile: <gate>/pytest.ini\n1 failed in 0.01s\n",
 }
 assert json.dumps(proof, sort_keys=True, separators=(",", ":")) == json.dumps(
     expected, sort_keys=True, separators=(",", ":")
@@ -3206,6 +3211,247 @@ assert json.dumps(proof, sort_keys=True, separators=(",", ":")) == json.dumps(
 assert ledger["runs"][-1]["state"] == "clear", ledger["runs"][-1]
 PY
   pass "Python mutation certification remains byte-for-byte unchanged"
+}
+
+test_real_pytest_coverage_policy_outcomes_fail_closed() {
+  # These are real pytest 9.1.1 runs, not the shell runner double used by the
+  # wider Crosscheck fixture. A tiny plugin applies the same post-test policy
+  # shape measured from pytest-cov 7.0.0: it increments testsfailed, emits the
+  # exact `FAIL Required test coverage ... not reached. Total coverage: ...`
+  # marker, and leaves pytest itself to report the authoritative test counts.
+  local case_dir pytest_bin rc
+  case_dir="$TMP_ROOT/real-pytest-coverage-policy"
+  pytest_bin="$ROOT/tools/agent-fleet/.venv/bin/pytest"
+  [ -x "$pytest_bin" ] \
+    || fail "the locked Agent Fleet pytest environment was not provisioned"
+  [ "$("$pytest_bin" --version)" = "pytest 9.1.1" ] \
+    || fail "the real coverage-policy regression is not running on pytest 9.1.1"
+  mkdir -p "$case_dir/tests"
+  cat > "$case_dir/conftest.py" <<'PY'
+import pytest
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtestloop(session):
+    result = yield
+    terminal = session.config.pluginmanager.getplugin("terminalreporter")
+    terminal.write(
+        "\nERROR: Coverage failure: total of 50 is less than fail-under=100\n"
+    )
+    session.testsfailed += 1
+    return result
+
+
+def pytest_terminal_summary(terminalreporter):
+    terminalreporter.write(
+        "FAIL Required test coverage of 100% not reached. "
+        "Total coverage: 50.00%\n"
+    )
+PY
+  cat > "$case_dir/tests/test_policy.py" <<'PY'
+def test_pass():
+    assert True
+
+
+def test_fail():
+    assert False
+PY
+
+  printf '[pytest]\naddopts = -q\n' > "$case_dir/pytest.ini"
+  for run in baseline-coverage-only mutation-coverage-only; do
+    set +e
+    (cd "$case_dir" && "$pytest_bin" tests/test_policy.py::test_pass) \
+      > "$case_dir/$run.out" 2> "$case_dir/$run.err"
+    rc=$?
+    set -e
+    expect_code 1 "$rc" "$run real pytest policy run"
+    printf '%s\n' "$rc" > "$case_dir/$run.rc"
+  done
+  set +e
+  (cd "$case_dir" && "$pytest_bin" tests/test_policy.py::test_fail) \
+    > "$case_dir/baseline-test-failure.out" \
+    2> "$case_dir/baseline-test-failure.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "genuinely failing real pytest run"
+  printf '%s\n' "$rc" > "$case_dir/baseline-test-failure.rc"
+
+  # pytest 9.1.1 suppresses its final count summary at -qq. The policy marker
+  # remains visible, which proves that the interpreter refuses rather than
+  # inferring a pass from the coverage line alone.
+  printf '[pytest]\naddopts = -qq\n' > "$case_dir/pytest.ini"
+  set +e
+  (cd "$case_dir" && "$pytest_bin" tests/test_policy.py::test_pass) \
+    > "$case_dir/unparseable.out" 2> "$case_dir/unparseable.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "unparseable real pytest policy run"
+  printf '%s\n' "$rc" > "$case_dir/unparseable.rc"
+
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$case_dir" "$pytest_bin" <<'PY' \
+    || fail "real pytest coverage-policy outcomes were not interpreted safely"
+import importlib.util
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules["fm_crosscheck"] = module
+spec.loader.exec_module(module)
+root = Path(sys.argv[2])
+
+
+def result(name):
+    return subprocess.CompletedProcess(
+        ["pytest"],
+        int((root / f"{name}.rc").read_text(encoding="utf-8")),
+        (root / f"{name}.out").read_text(encoding="utf-8"),
+        (root / f"{name}.err").read_text(encoding="utf-8"),
+    )
+
+
+baseline = result("baseline-coverage-only")
+assert "1 passed in " in baseline.stdout, baseline.stdout
+assert module.pytest_run_passed(baseline, "proof", "baseline") is True
+
+failed = result("baseline-test-failure")
+assert "1 failed in " in failed.stdout, failed.stdout
+assert module.pytest_run_passed(failed, "proof", "baseline") is False
+
+mutated = result("mutation-coverage-only")
+assert module.pytest_run_passed(mutated, "proof", "mutated") is True
+
+try:
+    module.pytest_run_passed(result("unparseable"), "proof", "baseline")
+except module.CrosscheckCertificationError as exc:
+    assert "did not provide parseable pytest 9.1.1 test counts" in str(exc), str(exc)
+else:
+    raise AssertionError("unparseable pytest output was inferred as an outcome")
+
+# Exercise the complete mutation-proof interpreter on four repositories. The
+# runner is real pytest 9.1.1; only the post-test policy is the local measured-
+# shape plugin above, so no mocked runner can decide any outcome.
+pytest_bin = Path(sys.argv[3]).resolve()
+proof_bin = root / "proof-bin"
+proof_bin.mkdir()
+(proof_bin / "pytest").symlink_to(pytest_bin)
+(proof_bin / "python3").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+(proof_bin / "sandbox").write_text(
+    "#!/bin/sh\n[ \"$1\" = -f ] || exit 97\nshift 2\nexec \"$@\"\n",
+    encoding="utf-8",
+)
+for executable in (proof_bin / "python3", proof_bin / "sandbox"):
+    executable.chmod(0o755)
+os.environ["PATH"] = f"{proof_bin}:/usr/bin:/bin"
+os.environ["HOME"] = str(root / "proof-home")
+os.environ["FM_CROSSCHECK_SANDBOX_BIN"] = str(proof_bin / "sandbox")
+Path(os.environ["HOME"]).mkdir()
+
+
+def make_repository(name, assertion, quiet="-q"):
+    repository = root / name
+    (repository / "tests").mkdir(parents=True)
+    (repository / "app.py").write_text(
+        "def fixed():\n    return True\n", encoding="utf-8"
+    )
+    (repository / "tests" / "test_app.py").write_text(
+        "from app import fixed\n\n\ndef test_fix():\n    " + assertion + "\n",
+        encoding="utf-8",
+    )
+    (repository / "conftest.py").write_text(
+        (root / "conftest.py").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (repository / "pytest.ini").write_text(
+        f"[pytest]\naddopts = {quiet}\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repository, check=True)
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=coverage-test",
+            "-c",
+            "user.email=coverage-test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    mutation = repository / ".crosscheck" / "mutations" / "revert.patch"
+    mutation.parent.mkdir(parents=True)
+    mutation.write_text(
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def fixed():\n"
+        "-    return True\n"
+        "+    return False\n",
+        encoding="utf-8",
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return repository, head
+
+
+def execute(name, assertion, quiet="-q"):
+    repository, head = make_repository(name, assertion, quiet)
+    proof_root = root / f"{name}-proofs"
+    proof_root.mkdir()
+    return module.execute_mutation_proof(
+        {
+            "test_path": "tests/test_app.py::test_fix",
+            "test_invocation": {"runner": "pytest", "arguments": []},
+            "mutation_patch_path": ".crosscheck/mutations/revert.patch",
+        },
+        repository,
+        head,
+        proof_root,
+        {"app.py"},
+        name,
+        time.monotonic() + 120,
+    )
+
+
+caught = execute("coverage-baseline-real-failing-mutation", "assert fixed() is True")
+assert caught["baseline_exit"] == 1 and "1 passed in " in caught["baseline_output"]
+assert caught["mutated_exit"] == 1 and "1 failed in " in caught["mutated_output"]
+
+try:
+    execute("coverage-only-mutation", "assert True")
+except module.CrosscheckCoverageError as exc:
+    assert exc.proof["baseline_exit"] == 1, exc.proof
+    assert exc.proof["mutated_exit"] == 1, exc.proof
+    assert "1 passed in " in exc.proof["mutated_output"], exc.proof
+else:
+    raise AssertionError("a coverage-only mutated failure certified the fix")
+
+try:
+    execute("genuine-baseline-failure", "assert fixed() is False")
+except module.CrosscheckError as exc:
+    assert "does not pass before mutation" in str(exc), str(exc)
+else:
+    raise AssertionError("a genuinely failing baseline was accepted")
+
+try:
+    execute("unparseable-baseline", "assert fixed() is True", quiet="-qq")
+except module.CrosscheckCertificationError as exc:
+    assert "did not provide parseable pytest 9.1.1 test counts" in str(exc), str(exc)
+else:
+    raise AssertionError("unparseable real pytest output was inferred as a pass")
+PY
+  pass "real pytest counts distinguish coverage policy from test failure in both proof halves"
 }
 
 test_node_id_selector_clears_a_passing_named_test() {
@@ -4766,6 +5012,124 @@ PY
   pass "the pytest runner name resolves through a uv-aware invocation ladder"
 }
 
+test_pytest_requirements_supplement_is_reconstructible_and_narrow() {
+  local case_dir
+  case_dir="$TMP_ROOT/pytest-requirements-supplement"
+  mkdir -p "$case_dir/fakebin" "$case_dir/empty/tests" \
+    "$case_dir/dependencies/tests" "$case_dir/locked/tests" \
+    "$case_dir/grouped/tests" "$case_dir/uv-dev/tests" \
+    "$case_dir/normal/services/api/tests"
+  cat > "$case_dir/fakebin/uv" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "$FM_TEST_UV_LOG"
+case " $* " in
+  *" --version "*) printf 'pytest 9.1.1\n'; exit 0 ;;
+  *) exit 97 ;;
+esac
+SH
+  printf '#!/bin/sh\nexit 88\n' > "$case_dir/fakebin/python3"
+  printf '#!/bin/sh\nexit 0\n' > "$case_dir/fakebin/pytest"
+  chmod +x "$case_dir/fakebin/uv" "$case_dir/fakebin/python3" \
+    "$case_dir/fakebin/pytest"
+
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" "$case_dir" <<'PY' \
+    || fail "requirements supplements changed the pytest runner route unsafely"
+import importlib.util
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+sys.modules["fm_crosscheck"] = module
+spec.loader.exec_module(module)
+root = Path(sys.argv[2])
+os.environ["PATH"] = f"{root / 'fakebin'}:/usr/bin:/bin"
+os.environ["FM_TEST_UV_LOG"] = str(root / "uv.log")
+
+
+def write(project, pyproject, *, requirement=True, lock=False):
+    (project / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    (project / "tests" / "test_thing.py").write_text("def test_thing(): pass\n", encoding="utf-8")
+    if requirement:
+        (project / "requirements-ci.txt").write_text("pytest==9.1.1\n", encoding="utf-8")
+        (project / "requirements.txt").write_text("pytest==8.3.4\n", encoding="utf-8")
+    if lock:
+        (project / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=project, check=True)
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+
+
+empty = root / "empty"
+write(empty, "[tool.ruff]\nline-length = 100\n")
+supplement = module.requirements_supplement(empty, empty)
+assert supplement == empty / "requirements-ci.txt", supplement
+assert subprocess.run(
+    ["git", "ls-files", "--error-unmatch", "requirements-ci.txt"],
+    cwd=empty,
+    capture_output=True,
+).returncode == 0
+argv = module.resolve_runner("pytest", "proof", empty, "tests/test_thing.py")
+assert argv == [
+    str((root / "fakebin" / "uv").resolve()),
+    "run",
+    "--with-requirements",
+    "requirements-ci.txt",
+    "pytest",
+], argv
+# A working ambient pytest is deliberately present on PATH. Selecting uv with
+# the tracked supplement proves the gate did not answer from that environment.
+assert Path(argv[0]).name == "uv" and Path(argv[0]).parent == root / "fakebin", argv
+
+without_requirements = root / "without-requirements"
+(without_requirements / "tests").mkdir(parents=True)
+(without_requirements / "pyproject.toml").write_text("[tool.ruff]\n", encoding="utf-8")
+assert module.requirements_supplement(without_requirements, without_requirements) is None
+
+untracked = root / "untracked"
+(untracked / "tests").mkdir(parents=True)
+(untracked / "pyproject.toml").write_text("[tool.ruff]\n", encoding="utf-8")
+(untracked / "requirements.txt").write_text("pytest==9.1.1\n", encoding="utf-8")
+subprocess.run(["git", "init", "-q", "-b", "main"], cwd=untracked, check=True)
+subprocess.run(["git", "add", "pyproject.toml"], cwd=untracked, check=True)
+assert module.requirements_supplement(untracked, untracked) is None
+
+with_dependencies = root / "dependencies"
+write(with_dependencies, '[project]\nname = "fixture"\ndependencies = ["pytest"]\n')
+assert module.requirements_supplement(with_dependencies, with_dependencies) is None
+assert module.resolve_runner(
+    "pytest", "proof", with_dependencies, "tests/test_thing.py"
+) == [str((root / "fakebin" / "uv").resolve()), "run", "pytest"]
+
+locked = root / "locked"
+write(locked, "[tool.ruff]\n", lock=True)
+assert module.requirements_supplement(locked, locked) is None
+
+with_group = root / "grouped"
+write(with_group, '[dependency-groups]\ndev = ["pytest"]\n')
+assert module.requirements_supplement(with_group, with_group) is None
+
+with_uv_dev = root / "uv-dev"
+write(with_uv_dev, '[tool.uv]\ndev-dependencies = ["pytest"]\n')
+assert module.requirements_supplement(with_uv_dev, with_uv_dev) is None
+
+checkout = root / "normal"
+project = checkout / "services" / "api"
+write(project, '[project]\nname = "api"\ndependencies = ["pytest"]\n')
+assert module.resolve_runner(
+    "pytest", "proof", checkout, "services/api/tests/test_thing.py"
+) == [
+    str((root / "fakebin" / "uv").resolve()),
+    "run",
+    "--project",
+    "services/api",
+    "pytest",
+]
+PY
+  pass "requirements supplements activate only for reconstructible empty pyprojects"
+}
+
 test_claude_execution_home_always_binds_the_keychain() {
   # The reviewer runs under a private HOME, and macOS resolves a Keychain
   # search through $HOME/Library/Keychains. Binding that directory only when
@@ -4981,6 +5345,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_inadequate_typescript_jest_coverage_stays_blocking|\
     test_typescript_without_usable_route_is_cannot_certify|\
     test_python_mutation_proof_is_byte_exact|\
+    test_real_pytest_coverage_policy_outcomes_fail_closed|\
     test_baseline_readable_state_is_destroyed_before_mutation|\
     test_mutation_is_bound_to_cited_non_test_implementation|\
     test_reviewer_output_uses_separate_capture_limit|\
@@ -5011,7 +5376,8 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_tampered_review_checkout_is_still_detected|\
     test_bulky_unauthorized_scratch_is_named_not_truncated|\
     test_evidence_capture_runs_on_older_interpreters|\
-    test_evidence_batch_has_aggregate_deadline)
+    test_evidence_batch_has_aggregate_deadline|\
+    test_pytest_requirements_supplement_is_reconstructible_and_narrow)
       "$FM_TEST_CASE"
       exit 0
       ;;
@@ -5096,6 +5462,7 @@ test_jest_runs_under_declared_node_major
 test_inadequate_typescript_jest_coverage_stays_blocking
 test_typescript_without_usable_route_is_cannot_certify
 test_python_mutation_proof_is_byte_exact
+test_real_pytest_coverage_policy_outcomes_fail_closed
 test_node_id_selector_clears_a_passing_named_test
 test_absent_runner_is_never_a_test_outcome
 test_unclassified_runner_cannot_clear_a_finding
@@ -5140,6 +5507,7 @@ test_stopped_reviewer_and_wrong_head_are_unreviewed
 test_completed_reviewer_suspicion_is_blocking
 test_reading_only_suspicion_is_a_tool_failure
 test_pytest_runner_resolves_through_a_uv_aware_ladder
+test_pytest_requirements_supplement_is_reconstructible_and_narrow
 test_claude_execution_home_always_binds_the_keychain
 test_moved_default_branch_stays_reviewable
 test_unavailable_reviewer_fails_over_to_the_next_account

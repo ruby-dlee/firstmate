@@ -26,6 +26,11 @@ from typing import Any, NoReturn
 import unicodedata
 from urllib.parse import unquote, urlsplit
 
+if sys.version_info[:2] >= (3, 11):
+    import tomllib
+else:  # The direct-entry floor emits the intentional diagnostic on older Python.
+    tomllib = None
+
 
 BIN_DIR = Path(__file__).resolve().parent
 if str(BIN_DIR) not in sys.path:
@@ -120,6 +125,32 @@ RUNNER_NON_EXECUTION_EXITS: dict[str, dict[int, str]] = {
         5: "no test matched the named selector",
     },
 }
+# Measured on pytest 9.1.1 with pytest-cov 7.0.0. A selected passing test under
+# `--cov-fail-under=100` emitted the exact policy marker
+# `FAIL Required test coverage of 100% not reached. Total coverage: 75.00%`,
+# followed by pytest's own final `1 passed in 0.03s` summary, and exited 1.
+# The same policy marker accompanied `1 failed in 0.02s` when the test failed.
+# Separator-wrapped summaries at normal verbosity and bare summaries under `-q`
+# carry the same stats text; `-qq` suppresses that summary, so it is deliberately
+# unparseable and must remain a refusal instead of becoming an inferred pass.
+PYTEST_COVERAGE_FAILURE_RE = re.compile(
+    r"^FAIL Required test coverage of [0-9]+(?:[.][0-9]+)?% not reached[.] "
+    r"Total coverage: [0-9]+(?:[.][0-9]+)?%$"
+)
+PYTEST_SUMMARY_STAT_PATTERN = (
+    r"[0-9]+ (?:failed|passed|skipped|deselected|xfailed|xpassed|warnings?|"
+    r"errors?|subtests? (?:passed|failed|skipped))"
+)
+PYTEST_SUMMARY_LINE_RE = re.compile(
+    rf"^(?:=+\s+)?(?P<stats>{PYTEST_SUMMARY_STAT_PATTERN}"
+    rf"(?:, {PYTEST_SUMMARY_STAT_PATTERN})*) in [0-9]+[.][0-9]{{2}}s"
+    r"(?: [(][^()\r\n]+[)])?(?:\s+=+)?$"
+)
+PYTEST_SUMMARY_STAT_RE = re.compile(
+    r"^(?P<count>[0-9]+) (?P<kind>failed|passed|skipped|deselected|xfailed|"
+    r"xpassed|warnings?|errors?|subtests? (?:passed|failed|skipped))$"
+)
+ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
 JAVASCRIPT_IMPLEMENTATION_SUFFIXES = {
     ".cjs",
     ".cts",
@@ -1421,6 +1452,69 @@ def uv_project_for(checkout: Path, test_path: str) -> Path | None:
         directory = directory.parent
 
 
+def requirements_supplement(project: Path, checkout: Path) -> Path | None:
+    """Return a tracked requirements file when pyproject declares no dependencies.
+
+    A repository can declare its dependencies in a tracked `requirements.txt`
+    while keeping a formatter-only `pyproject.toml` that names none. `uv run
+    --project` then answers out of an environment with nothing installed, and
+    the proof dies importing conftest before the named test runs - reported as
+    UNREVIEWED, which is honest but useless when the repository did declare its
+    dependencies in a file the gate simply never looked at.
+
+    Reusing the author's own environment would fix the symptom and destroy the
+    proof: the author controls what is installed there, so a defect masked by a
+    local package would certify clean. A tracked requirements file is inside the
+    proof boundary for exactly the reason pyproject is - it is committed, so the
+    environment is reconstructible from the repository rather than from a
+    machine. Returns None when pyproject already declares dependencies, so the
+    normal project route is never disturbed.
+    """
+
+    pyproject = project / "pyproject.toml"
+    if not pyproject.is_file():
+        return None
+    if (project / "uv.lock").is_file():
+        return None
+    try:
+        declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if declared.get("project", {}).get("dependencies"):
+        return None
+    if declared.get("dependency-groups") or declared.get("tool", {}).get("uv", {}).get(
+        "dev-dependencies"
+    ):
+        return None
+    checkout = checkout.resolve()
+    for directory in (project, checkout):
+        for name in ("requirements-ci.txt", "requirements.txt"):
+            candidate = directory / name
+            try:
+                relative = candidate.relative_to(checkout)
+                mode = candidate.lstat().st_mode
+            except (OSError, ValueError):
+                continue
+            if not stat.S_ISREG(mode):
+                continue
+            tracked = run_command(
+                [
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "ls-files",
+                    "--error-unmatch",
+                    "--",
+                    relative.as_posix(),
+                ],
+                timeout=10,
+                description="pytest requirements supplement tracking inspection",
+            )
+            if tracked.returncode == 0:
+                return candidate
+    return None
+
+
 def nearest_package_project(checkout: Path, relative_path: str) -> Path | None:
     """Return the nearest package.json root governing one tracked path."""
 
@@ -2258,6 +2352,20 @@ def resolve_runner(runner: str, label: str, cwd: Path, test_path: str) -> list[s
                     str(project.relative_to(cwd.resolve())),
                     *candidate[2:],
                 )
+            supplement = requirements_supplement(project, cwd)
+            if supplement is not None:
+                # pyproject governs the project but declares no dependencies,
+                # while a tracked requirements file does. Supplying it keeps the
+                # environment reconstructible from the repository - the reason
+                # the project route is trusted - instead of answering out of an
+                # empty environment and dying on import before the named test.
+                candidate = (
+                    candidate[0],
+                    "run",
+                    "--with-requirements",
+                    str(supplement.relative_to(cwd.resolve())),
+                    *candidate[2:],
+                )
         resolved = shutil.which(candidate[0])
         if resolved is None:
             inspected.append(f"{' '.join(candidate)} (not on PATH)")
@@ -2349,6 +2457,78 @@ def require_test_execution(
         f"exited {result.returncode} because {reason}, which is not a test "
         f"outcome: {combined[:500]}",
     )
+
+
+def pytest_run_passed(
+    result: subprocess.CompletedProcess[str], label: str, phase: str
+) -> bool:
+    """Interpret pytest's own summary when exit 1 may be coverage policy.
+
+    Exit 0 keeps pytest's measured passing meaning. Exit 1 is accepted as a
+    passing run only when pytest reports at least one passed test, no selected
+    non-passing outcomes, and pytest-cov reports its exact failed-policy marker.
+    Every other exit keeps the caller's existing classification.
+    """
+
+    if result.returncode != 1:
+        return result.returncode == 0
+
+    output = ANSI_SGR_RE.sub("", result.stdout)
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    summary = PYTEST_SUMMARY_LINE_RE.fullmatch(lines[-1]) if lines else None
+    if summary is None:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: pytest {phase} exited 1 but its final "
+            "summary did not provide parseable pytest 9.1.1 test counts"
+        )
+
+    counts: dict[str, int] = {}
+    for part in summary.group("stats").split(", "):
+        match = PYTEST_SUMMARY_STAT_RE.fullmatch(part)
+        if match is None:
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: pytest {phase} emitted an unrecognized "
+                f"summary statistic: {part}"
+            )
+        kind = match.group("kind")
+        if kind in counts:
+            cannot_certify(
+                f"{label} CANNOT-CERTIFY: pytest {phase} repeated summary "
+                f"statistic {kind}"
+            )
+        counts[kind] = int(match.group("count"))
+
+    failures = sum(
+        counts.get(kind, 0)
+        for kind in ("failed", "error", "errors", "subtest failed", "subtests failed")
+    )
+    if failures:
+        return False
+
+    passed = sum(
+        counts.get(kind, 0)
+        for kind in ("passed", "subtest passed", "subtests passed")
+    )
+    nonpassing = sum(
+        counts.get(kind, 0)
+        for kind in (
+            "skipped",
+            "xfailed",
+            "xpassed",
+            "subtest skipped",
+            "subtests skipped",
+        )
+    )
+    coverage_markers = [
+        line for line in lines if PYTEST_COVERAGE_FAILURE_RE.fullmatch(line)
+    ]
+    if passed <= 0 or nonpassing or len(coverage_markers) != 1:
+        cannot_certify(
+            f"{label} CANNOT-CERTIFY: pytest {phase} exited 1 without uniquely "
+            "proving that at least one selected test passed, every selected "
+            "test passed, and only the measured coverage policy failed"
+        )
+    return True
 
 
 def require_classified_runner(runner: str, label: str) -> None:
@@ -2615,12 +2795,17 @@ def execute_mutation_proof(
         _, baseline_failed = jest_execution_summary(
             baseline, label, "baseline"
         )
+        baseline_passed = baseline_failed == 0
         require(
-            baseline_failed == 0,
+            baseline_passed,
             f"{label} named Jest test reports failures before mutation",
         )
+    elif invocation["runner"] == "pytest":
+        baseline_passed = pytest_run_passed(baseline, label, "baseline")
+    else:
+        baseline_passed = baseline.returncode == 0
     require(
-        baseline.returncode == 0,
+        baseline_passed,
         f"{label} named test does not pass before mutation: it ran and exited "
         f"{baseline.returncode} in a fresh clone holding tracked files only: "
         f"{(baseline.stdout + baseline.stderr).strip()[:1000] or 'no output'}",
@@ -2692,6 +2877,18 @@ def execute_mutation_proof(
             raise CrosscheckCoverageError(
                 f"{label} named Jest test still passes after the implementation "
                 "mutation, so the claimed fix remains blocking",
+                proof,
+            )
+        return proof
+    if invocation["runner"] == "pytest":
+        require(
+            mutated.returncode != 0,
+            f"{label} named test still passes after mutation",
+        )
+        if pytest_run_passed(mutated, label, "mutated"):
+            raise CrosscheckCoverageError(
+                f"{label} named test still passes after mutation, so the claimed "
+                "fix remains blocking",
                 proof,
             )
         return proof

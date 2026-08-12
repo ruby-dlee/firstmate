@@ -7,9 +7,11 @@
 # teardown without --force.
 #
 # `maintenance` recovers pre-metadata Treehouse acquisitions left by a crashed
-# spawn. A record is eligible only after an age threshold and exact PID/start-time
-# death proof. Recovery installs fail-closed cleanup metadata, then invokes the
-# same ordinary teardown proof. Every refusal stays on disk and is printed.
+# spawn, reaps completed scouts, then delegates terminal PR handling across this
+# and registered secondmate homes to fm-terminal-pr-sweep.sh. A stranded record
+# is eligible only after an age threshold and exact PID/start-time death proof.
+# Recovery installs fail-closed cleanup metadata, then invokes the same ordinary
+# teardown proof. Every refusal stays on disk and is printed.
 # Usage: fm-auto-reap.sh task <id> <pr-merged|scout-done|local-merged>
 #        fm-auto-reap.sh maintenance
 set -eu
@@ -534,14 +536,14 @@ recover_acquisition() {  # <record>
 }
 
 maintenance() {
-  local record meta id kind mode probe_status
+  local record meta id kind mode terminal_sweep
   for record in "$STATE"/.worktree-acquire-*.pending; do
     [ -e "$record" ] || continue
     recover_acquisition "$record"
   done
-  # Backstop terminal events even when a task-specific check or turn-end signal
-  # was missed while no watcher was running. An ordinary open PR is expected and
-  # stays silent; once GitHub proves merged, every subsequent refusal is surfaced.
+  # Backstop completed scouts even when their turn-end signal was missed while
+  # no watcher was running. Terminal PR lanes are owned below by the cross-home
+  # sweep so report-exempt Crosscheck bindings and green yolo PRs use one path.
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     id=${meta##*/}
@@ -560,19 +562,13 @@ maintenance() {
         # The approved merge action calls auto-reap synchronously. Do not probe
         # an unapproved local branch as if it were a terminal merge.
         ;;
-      ship:*)
-        [ -n "$(meta_value "$meta" pr)" ] || continue
-        AUTO_REAP_ID=$id
-        if pr_is_merged "$meta" >/dev/null 2>&1; then
-          probe_status=0
-        else
-          probe_status=$?
-        fi
-        [ "$probe_status" -eq 0 ] || continue
-        AUTO_REAP_PR_VERIFIED=1 reap_task "$id" pr-merged
-        ;;
+      ship:*) ;;
     esac
   done
+  terminal_sweep=$(auto_reap_tool FM_AUTO_REAP_TERMINAL_PR_SWEEP_BIN \
+    fm-terminal-pr-sweep.sh 2>/dev/null || true)
+  [ -n "$terminal_sweep" ] || terminal_sweep="$SCRIPT_DIR/fm-terminal-pr-sweep.sh"
+  "$terminal_sweep"
 }
 
 case "${1:-}" in

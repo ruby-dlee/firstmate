@@ -58,6 +58,14 @@ ROOT_ARRAY_HEADER_RE = re.compile(
     r"^\[(?:0|[1-9][0-9]*)\](?:\{[A-Za-z_][A-Za-z0-9_]*"
     r"(?:,[A-Za-z_][A-Za-z0-9_]*)*\})?:$"
 )
+CHECKS_SUMMARY_RE = re.compile(
+    r"^(?P<passed>0|[1-9][0-9]*) passed, "
+    r"(?P<failed>0|[1-9][0-9]*) failed, "
+    r"(?:(?P<skipped>0|[1-9][0-9]*) skipped, )?"
+    r"(?:(?P<pending>0|[1-9][0-9]*) pending, )?"
+    r"(?P<total>0|[1-9][0-9]*) total$"
+)
+NO_CHECKS_SUMMARY = "0 passed, 0 failed — this PR has no CI checks configured"
 
 
 class GitHubContractError(RuntimeError):
@@ -261,11 +269,13 @@ def _validate_array_subtree(
     else:
         while index < len(lines) and lines[index][1] > depth:
             item_line, item_depth, content = lines[index]
-            if item_depth != depth + 1 or not content.startswith("- "):
+            if item_depth != depth + 1:
                 raise GitHubContractError(
                     f"malformed gh-axi TOON scalar array item at line {item_line}"
                 )
-            scalar = content[2:]
+            # gh-axi's observed TOON encoder uses both dash-prefixed scalar
+            # arrays and bare indented strings, including its help[] footer.
+            scalar = content[2:] if content.startswith("- ") else content
             _parse_scalar(scalar, item_line)
             items += 1
             index += 1
@@ -384,6 +394,8 @@ def fetch_pr_api(url: str) -> dict[str, Any]:
     state = _required(values, "state")
     merged = _required(values, "merged")
     draft = values.get(("draft",))
+    mergeable = values.get(("mergeable",))
+    mergeable_state = values.get(("mergeable_state",))
     head_sha = _required(values, "head", "sha")
     head_ref = _required(values, "head", "ref")
     head_repo = _required(values, "head", "repo", "full_name")
@@ -403,6 +415,12 @@ def fetch_pr_api(url: str) -> dict[str, Any]:
         raise GitHubContractError("gh-axi returned invalid PR state fields")
     if draft is not None and not isinstance(draft, bool):
         raise GitHubContractError("gh-axi returned an invalid draft field")
+    if mergeable is not None and not isinstance(mergeable, bool):
+        raise GitHubContractError("gh-axi returned an invalid mergeable field")
+    if mergeable_state is not None and (
+        not isinstance(mergeable_state, str) or not mergeable_state
+    ):
+        raise GitHubContractError("gh-axi returned an invalid mergeable_state field")
     if not isinstance(head_sha, str) or SHA_RE.fullmatch(head_sha) is None:
         raise GitHubContractError("gh-axi returned an invalid head.sha")
     if not isinstance(base_sha, str) or SHA_RE.fullmatch(base_sha) is None:
@@ -424,6 +442,10 @@ def fetch_pr_api(url: str) -> dict[str, Any]:
         "state": state,
         "merged": merged,
         "draft": draft,
+        "mergeable": mergeable,
+        "mergeable_state": mergeable_state,
+        "mergeability_present": ("mergeable",) in values
+        and ("mergeable_state",) in values,
         "head_sha": head_sha,
         "head_ref": head_ref,
         "head_repo": head_repo,
@@ -432,6 +454,69 @@ def fetch_pr_api(url: str) -> dict[str, Any]:
         "base_repo": base_repo,
         "api_document": raw,
     }
+
+
+def fetch_checks(url: str) -> dict[str, Any]:
+    owner, repo, number = parse_pr_url(url)
+    raw = run_gh_axi(
+        ["pr", "checks", str(number), "--repo", f"{owner}/{repo}"]
+    )
+    values = parse_toon_mapping(raw)
+    summary = values.get(("summary",))
+    no_checks = values.get(("checks",))
+    if summary is None and no_checks == NO_CHECKS_SUMMARY:
+        return {
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "pending": 0,
+            "total": 0,
+            "document": raw,
+        }
+    if not isinstance(summary, str):
+        raise GitHubContractError("gh-axi checks summary is missing or invalid")
+    match = CHECKS_SUMMARY_RE.fullmatch(summary)
+    if match is None:
+        raise GitHubContractError("gh-axi returned an invalid checks summary")
+    passed = int(match.group("passed"))
+    failed = int(match.group("failed"))
+    skipped = int(match.group("skipped") or "0")
+    pending = int(match.group("pending") or "0")
+    total = int(match.group("total"))
+    if passed + failed + skipped + pending != total:
+        raise GitHubContractError("gh-axi checks summary counts are inconsistent")
+    return {
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "pending": pending,
+        "total": total,
+        "document": raw,
+    }
+
+
+def merge_readiness(url: str) -> tuple[str, str]:
+    state = fetch_pr_api(url)
+    head_sha = state["head_sha"]
+    if state["merged"]:
+        return "MERGED", head_sha
+    if state["state"] != "open":
+        return "CLOSED", head_sha
+    if state["draft"] is True:
+        return "DRAFT", head_sha
+    if state["draft"] is not False:
+        return "UNKNOWN", head_sha
+
+    checks = fetch_checks(url)
+    if checks["failed"] > 0:
+        return "RED", head_sha
+    if checks["pending"] > 0:
+        return "PENDING", head_sha
+    if not state["mergeability_present"] or state["mergeable"] is None:
+        return "UNKNOWN", head_sha
+    if state["mergeable"] is not True:
+        return "BLOCKED", head_sha
+    return "READY", head_sha
 
 
 def fetch_claims(url: str) -> tuple[str, dict[str, Any]]:
@@ -671,7 +756,7 @@ def merge_exact(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("snapshot", "head", "state"):
+    for name in ("snapshot", "head", "state", "merge-readiness"):
         command = subparsers.add_parser(name)
         command.add_argument("pr_url")
     return parser
@@ -687,6 +772,9 @@ def main() -> int:
         elif args.command == "state":
             state = fetch_pr_api(args.pr_url)
             print("MERGED" if state["merged"] else str(state["state"]).upper())
+        elif args.command == "merge-readiness":
+            readiness, head_sha = merge_readiness(args.pr_url)
+            print(f"{readiness} {head_sha}")
         else:
             raise AssertionError(f"unhandled command {args.command}")
     except GitHubContractError as exc:

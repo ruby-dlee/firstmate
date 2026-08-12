@@ -28,10 +28,14 @@ Within a real required section, meaningful fenced transcript or literal-code lin
 Fence delimiters never count as body content, and heading-like lines inside a fence never satisfy a required section heading.
 
 For `report_required` tasks, `fm-teardown.sh` first quiesces the endpoint and confirms it gone while failing closed on an alive or unknown state, then runs non-destructive safety validation including the Orca path match and worktree checks, reconciles rollback state, and publishes before releasing an account lease or removing a worktree.
+Teardown waits five seconds by default, accepts only a 1-to-30-second `FM_TEARDOWN_REPORT_LOCK_WAIT_MS` override, and exits with retryable status 75 when the machine-global publication lock remains held.
+That timeout reports a verified live holder's PID and elapsed process time from `ps -p <pid> -o etime=`, never infers age from the lock directory mtime, and never steals or kills the holder.
+Periodic reaping retains the task and retries on a later sweep while suppressing duplicate unchanged wakes.
 A safety refusal after quiescence preserves all work and metadata but leaves the crewmate endpoint stopped.
 If a required heading is absent or lacks substantive content, publication names every missing or empty section, identifies the exact report source to edit, and gives the publish and teardown retry commands.
 Publication failure leaves the prior durable entry unchanged and stops teardown before destructive cleanup, preserving the task for repair and retry.
 Tasks that were already in flight at cutover lack the marker and retain the earlier teardown contract.
+An explicit `report_required=0` marker has the same not-gated teardown meaning and is used by report-exempt task bindings.
 `--force` does not bypass completion-report publication or any work-retention proof.
 Retiring a persistent secondmate is also not a completion; ordinary tasks completed inside its home publish to the same machine-global stack.
 

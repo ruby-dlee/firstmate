@@ -57,9 +57,13 @@
 # Scout tasks (kind=scout in meta) carve non-ignored untracked paths out of that
 # check: their worktree is declared scratch and the report at
 # data/<task-id>/report.md is the work product.
-# A pre-cutover scout proceeds once that report exists; a task carrying
-# report_required=1 must satisfy the shared completion and publication contract
-# owned by docs/report-stack.md before teardown discards the scratch worktree.
+# A pre-cutover scout proceeds once that report exists; report_required=0 is an
+# explicit not-gated marker, while report_required=1 must satisfy the shared
+# completion and publication contract owned by docs/report-stack.md before
+# teardown discards the scratch worktree.
+# Report publication waits 5 seconds by default and at most 30 seconds for the
+# global lock. A live-holder timeout exits 75 with a retry diagnostic; teardown
+# never steals or kills that holder.
 # Orca tasks use the same safety checks, then close the recorded terminal, prove
 # the handle stale, and remove the recorded worktree under its checkout lock;
 # teardown never substitutes the shared window alias for a missing terminal.
@@ -166,6 +170,18 @@ case "$TEARDOWN_UPSTREAM_TIMEOUT" in
     exit 2
     ;;
 esac
+TEARDOWN_REPORT_LOCK_WAIT_MS=${FM_TEARDOWN_REPORT_LOCK_WAIT_MS:-5000}
+case "$TEARDOWN_REPORT_LOCK_WAIT_MS" in
+  ''|*[!0-9]*)
+    echo "error: FM_TEARDOWN_REPORT_LOCK_WAIT_MS must be an integer from 1000 through 30000" >&2
+    exit 2
+    ;;
+esac
+if [ "$TEARDOWN_REPORT_LOCK_WAIT_MS" -lt 1000 ] \
+  || [ "$TEARDOWN_REPORT_LOCK_WAIT_MS" -gt 30000 ]; then
+  echo "error: FM_TEARDOWN_REPORT_LOCK_WAIT_MS must be an integer from 1000 through 30000" >&2
+  exit 2
+fi
 [ "$#" -ge 1 ] || {
   echo "usage: fm-teardown.sh <task-id> [--force] [--preserve-scratch] [--reap-dead]" >&2
   exit 2
@@ -447,11 +463,13 @@ if [ "$BACKEND" = orca ] && [ "$REPORT_REQUIRED_COUNT" -ne 0 ]; then
   echo "error: invalid report_required metadata for legacy Orca task $ID; the marker must be absent" >&2
   exit 1
 elif [ "$REPORT_REQUIRED_COUNT" -gt 0 ]; then
-  if [ "$REPORT_REQUIRED_COUNT" -ne 1 ] || [ "$(fm_meta_get "$META" report_required)" != 1 ]; then
+  REPORT_REQUIRED_VALUE=$(fm_meta_get "$META" report_required)
+  if [ "$REPORT_REQUIRED_COUNT" -ne 1 ] \
+    || { [ "$REPORT_REQUIRED_VALUE" != 0 ] && [ "$REPORT_REQUIRED_VALUE" != 1 ]; }; then
     echo "error: invalid report_required metadata for $ID; refusing teardown" >&2
     exit 1
   fi
-  if [ "$KIND" != secondmate ]; then
+  if [ "$REPORT_REQUIRED_VALUE" = 1 ] && [ "$KIND" != secondmate ]; then
     REPORT_GATED=1
   fi
 fi
@@ -5384,7 +5402,8 @@ publish_completion_report_if_required() {
     reconcile_managed_account_rollback "$META" "$ID" "$DATA" || return $?
   fi
   FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
-    "$SCRIPT_DIR/fm-report-stack.mjs" publish "$ID" || return 1
+    FM_REPORT_LOCK_WAIT_MS="$TEARDOWN_REPORT_LOCK_WAIT_MS" \
+    "$SCRIPT_DIR/fm-report-stack.mjs" publish "$ID" || return $?
   REPORT_PUBLISHED=1
 }
 

@@ -1097,6 +1097,7 @@ test_squash_merged_branch_deleted_allows() {
   local case_dir rc pr_head merge_commit
   case_dir=$(make_case squash-merged)
   write_meta "$case_dir" no-mistakes ship
+  printf 'report_required=0\n' >> "$case_dir/state/task-x1.meta"
   # Real branch content that is NOT pushed as its original commit: a squash merge
   # rewrote it into a different commit on main and auto-deleted the head branch, so
   # HEAD is unreachable from every remote-tracking branch.
@@ -1114,7 +1115,7 @@ test_squash_merged_branch_deleted_allows() {
 
   expect_code 0 "$rc" "squash-merged: teardown should succeed when the PR is merged"
   ! grep -q REFUSED "$case_dir/stderr" || fail "squash-merged: teardown printed a REFUSED line"
-  pass "squash-merged + deleted-branch worktree (PR merged) is torn down (the fix)"
+  pass "report-exempt squash-merged + deleted-branch worktree is torn down"
 }
 
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head() {
@@ -2693,7 +2694,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as stream:
 PY
 }
 
-test_treehouse_reaper_translates_only_safety_status() {
+test_treehouse_reaper_translates_safety_and_retryable_statuses() {
   local case_dir rc
   case_dir=$(make_case reaper-dedicated-safety-status)
   mkdir -p "$case_dir/home"
@@ -2713,7 +2714,28 @@ SH
   assert_grep 'retained task=task-x1 reason=teardown-refused status=77' \
     "$case_dir/stdout" \
     "dedicated safety status omitted retained output"
-  pass "reaper translates only the dedicated safety-refusal status"
+
+  cat > "$case_dir/fake-teardown" <<'SH'
+#!/usr/bin/env bash
+[ "${FM_TEARDOWN_REPORT_LOCK_WAIT_MS:-}" -le 30000 ] || exit 91
+echo 'error: report stack lock timeout: retry, lock held by 4242 for 03:45' >&2
+exit 75
+SH
+  chmod +x "$case_dir/fake-teardown"
+  set +e
+  FM_TREEHOUSE_REAP_REPORT_WAIT_SECONDS=600 \
+  FM_TREEHOUSE_REAP_TEARDOWN="$case_dir/fake-teardown" \
+    run_treehouse_reaper_status_fixture "$case_dir" reap task-x1 \
+      > "$case_dir/retry-stdout" 2> "$case_dir/retry-stderr"
+  rc=$?
+  set -e
+  expect_code 0 "$rc" "retryable report-lock timeout should remain retained"
+  assert_grep 'retained task=task-x1 reason=report-lock-busy retry=next-sweep' \
+    "$case_dir/retry-stdout" \
+    "retryable report-lock timeout was not scheduled for a later sweep"
+  assert_grep 'lock held by 4242 for 03:45' "$case_dir/retry-stderr" \
+    "retryable report-lock holder diagnostic was lost"
+  pass "reaper retains dedicated safety and retryable lock statuses without operational failure"
 }
 
 test_treehouse_reaper_executable_failures_remain_nonzero() {
@@ -5189,11 +5211,104 @@ test_teardown_removes_safe_tasktmp_and_accepts_absence() {
   pass "teardown removes its exact task temp root and accepts metadata without tasktmp"
 }
 
-test_teardown_rejects_malformed_report_requirement() {
+test_teardown_report_requirement_matrix() {
+  local case_dir rc started_at started_epoch elapsed
+  case_dir=$(make_case report-required-absent)
+  write_meta "$case_dir" local-only ship
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "absent report marker was not accepted: $(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "absent report marker left task metadata"
+
+  case_dir=$(make_case report-required-zero)
+  write_meta "$case_dir" local-only ship
+  printf 'report_required=0\n' >> "$case_dir/state/task-x1.meta"
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "explicit not-gated report marker was not accepted: $(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "report_required=0 left task metadata"
+
+  case_dir=$(make_case report-required-one-unsatisfied)
+  write_meta "$case_dir" local-only ship
+  printf 'report_required=1\n' >> "$case_dir/state/task-x1.meta"
+  mkdir -p "$case_dir/data/task-x1"
+  printf '# Task\n\nExercise the missing report gate.\n' \
+    > "$case_dir/data/task-x1/brief.md"
+  printf 'done: report missing\n' > "$case_dir/state/task-x1.status"
+  set +e
+  FM_REPORT_STACK_ROOT="$case_dir/report-stack" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "unsatisfied report_required=1 teardown"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "unsatisfied report_required=1 removed task metadata"
+  assert_grep 'required completion report is missing' "$case_dir/stderr" \
+    "unsatisfied report_required=1 did not enforce publication: $(cat "$case_dir/stderr")"
+
+  case_dir=$(make_case report-required-one-satisfied)
+  write_meta "$case_dir" local-only ship
+  printf 'report_required=1\n' >> "$case_dir/state/task-x1.meta"
+  mkdir -p "$case_dir/data/task-x1"
+  printf '# Task\n\nExercise the report gate.\n' \
+    > "$case_dir/data/task-x1/brief.md"
+  printf '# Completion\n\n## Summary\n\nReady.\n\n## What changed\n\nTest fixture.\n\n## Verification\n\nTeardown exercised.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nPublished report.\n\n## Follow-ups\n\nNone.\n' \
+    > "$case_dir/data/task-x1/completion.md"
+  printf 'done: report ready\n' > "$case_dir/state/task-x1.status"
+  FM_REPORT_STACK_ROOT="$case_dir/report-stack" \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr" \
+    || fail "satisfied report_required=1 was refused: $(cat "$case_dir/stderr")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "satisfied report_required=1 left task metadata"
+  assert_present "$case_dir/report-stack/index.html" \
+    "satisfied report_required=1 did not publish"
+
+  case_dir=$(make_case report-required-lock-timeout)
+  write_meta "$case_dir" local-only ship
+  printf 'report_required=1\n' >> "$case_dir/state/task-x1.meta"
+  mkdir -p "$case_dir/data/task-x1" "$case_dir/report-stack/.publish.lock"
+  printf '# Task\n\nExercise bounded report-lock contention.\n' \
+    > "$case_dir/data/task-x1/brief.md"
+  printf '# Completion\n\n## Summary\n\nReady.\n\n## What changed\n\nTest fixture.\n\n## Verification\n\nTeardown exercised.\n\n## Visual evidence\n\nNone.\n\n## Artifacts\n\nPublished report.\n\n## Follow-ups\n\nNone.\n' \
+    > "$case_dir/data/task-x1/completion.md"
+  printf 'done: report ready\n' > "$case_dir/state/task-x1.status"
+  started_at=$(LC_ALL=C ps -p $$ -o lstart= | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/[[:space:]][[:space:]]*/ /g')
+  printf '{"pid":%s,"startedAt":"%s","token":"live-test-holder"}\n' \
+    "$$" "$started_at" > "$case_dir/report-stack/.publish.lock/owner"
+  started_epoch=$(date +%s)
+  set +e
+  FM_REPORT_STACK_ROOT="$case_dir/report-stack" \
+  FM_TEARDOWN_REPORT_LOCK_WAIT_MS=1000 \
+    run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+  elapsed=$(( $(date +%s) - started_epoch ))
+  expect_code 75 "$rc" "live report-lock holder teardown timeout"
+  [ "$elapsed" -lt 10 ] || fail "report-lock timeout exceeded its bounded wait: ${elapsed}s"
+  assert_grep "report stack lock timeout: retry, lock held by $$ for" \
+    "$case_dir/stderr" \
+    "report-lock timeout omitted its retryable live-holder diagnostic"
+  assert_present "$case_dir/state/task-x1.meta" \
+    "report-lock timeout removed task metadata"
+  [ -d "$case_dir/report-stack/.publish.lock" ] \
+    || fail "report-lock timeout stole the live holder's lock"
+  set +e
+  FM_TEARDOWN_REPORT_LOCK_WAIT_MS=30001 \
+    run_teardown "$case_dir" > "$case_dir/invalid-wait-stdout" 2> "$case_dir/invalid-wait-stderr"
+  rc=$?
+  set -e
+  expect_code 2 "$rc" "unbounded teardown report-lock wait"
+  assert_grep 'must be an integer from 1000 through 30000' \
+    "$case_dir/invalid-wait-stderr" \
+    "unbounded report-lock wait did not fail before teardown"
+  pass "teardown distinguishes report requirements and bounds live report-lock contention"
+}
+
+test_teardown_rejects_invalid_report_requirement() {
   local case_dir rc
   case_dir=$(make_case malformed-report-required)
   write_meta "$case_dir" local-only ship
-  printf 'report_required=0\n' >> "$case_dir/state/task-x1.meta"
+  printf 'report_required=2\n' >> "$case_dir/state/task-x1.meta"
   set +e
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
@@ -5205,14 +5320,14 @@ test_teardown_rejects_malformed_report_requirement() {
 
   case_dir=$(make_case duplicate-report-required)
   write_meta "$case_dir" local-only ship
-  printf 'report_required=1\nreport_required=1\n' >> "$case_dir/state/task-x1.meta"
+  printf 'report_required=0\nreport_required=1\n' >> "$case_dir/state/task-x1.meta"
   set +e
   run_teardown "$case_dir" --force > "$case_dir/stdout" 2> "$case_dir/stderr"
   rc=$?
   set -e
   expect_code 1 "$rc" "duplicate report_required teardown exit"
   assert_present "$case_dir/state/task-x1.meta" "duplicate report_required metadata was destructively bypassed"
-  pass "teardown treats only one exact report_required marker as valid"
+  pass "teardown rejects duplicate and non-boolean report_required metadata"
 }
 
 write_secondmate_meta() {
@@ -6508,7 +6623,9 @@ if [ "${FM_TEST_FOCUSED:-}" = non-linked-index-lock ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = review-round-34-report-required ]; then
-  test_teardown_rejects_malformed_report_requirement
+  test_teardown_report_requirement_matrix
+  test_teardown_rejects_invalid_report_requirement
+  test_squash_merged_branch_deleted_allows
   exit 0
 fi
 
@@ -6754,7 +6871,7 @@ if [ "${FM_TEST_FOCUSED:-}" = review-reaper-status ]; then
   test_dead_reap_rechecks_open_pr_at_locked_return
   test_treehouse_reaper_safe_refusals_exit_success
   test_treehouse_reaper_operational_failure_exits_nonzero
-  test_treehouse_reaper_translates_only_safety_status
+  test_treehouse_reaper_translates_safety_and_retryable_statuses
   test_treehouse_reaper_executable_failures_remain_nonzero
   test_dead_reap_leaf_helper_failures_remain_operational
   test_dead_reap_authority_statuses_are_distinct
@@ -6927,7 +7044,8 @@ TEARDOWN_FULL_SUITE_CASES=(
   test_teardown_refuses_tasktmp_bound_to_different_generation
   test_teardown_refuses_unknown_tasktmp_classification
   test_teardown_removes_safe_tasktmp_and_accepts_absence
-  test_teardown_rejects_malformed_report_requirement
+  test_teardown_report_requirement_matrix
+  test_teardown_rejects_invalid_report_requirement
   test_secondmate_state_enumeration_fails_closed
   test_secondmate_missing_treehouse_child_is_retained
   test_secondmate_registry_home_drift_blocks_removal
@@ -6979,7 +7097,7 @@ TEARDOWN_FULL_SUITE_CASES=(
   test_dead_reap_rechecks_endpoint_after_local_proofs
   test_treehouse_reaper_safe_refusals_exit_success
   test_treehouse_reaper_operational_failure_exits_nonzero
-  test_treehouse_reaper_translates_only_safety_status
+  test_treehouse_reaper_translates_safety_and_retryable_statuses
   test_treehouse_reaper_executable_failures_remain_nonzero
   test_dead_reap_leaf_helper_failures_remain_operational
   test_dead_reap_authority_statuses_are_distinct

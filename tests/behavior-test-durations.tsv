@@ -92,6 +92,7 @@
 500	tests/fm-supervision-events.test.sh
 95	tests/fm-supervision-instructions.test.sh
 10408	tests/fm-tangle-guard.test.sh
+4100	tests/fm-terminal-pr-sweep.test.sh
 321224	tests/fm-teardown-a.test.sh
 321224	tests/fm-teardown-b.test.sh
 600	tests/fm-transition-lib.test.sh

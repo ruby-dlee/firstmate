@@ -18,8 +18,9 @@
 // default is $XDG_DATA_HOME/firstmate/report-stack; otherwise it is
 // ~/.local/share/firstmate/report-stack. FM_HOME, FM_STATE_OVERRIDE, and
 // FM_DATA_OVERRIDE select the task source like the rest of Firstmate.
-// FM_REPORT_LOCK_WAIT_MS may extend lock contention waits from the 60-second
+// FM_REPORT_LOCK_WAIT_MS may tune lock contention waits from the 60-second
 // default up to 15 minutes for explicit conservative maintenance flows.
+// Timeout exits 75 and identifies a live holder with ps-reported elapsed time.
 
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -71,9 +72,9 @@ const pythonRuntime = process.env.FM_REPORT_PYTHON || "python3";
 const reportLockCandidatePattern = /^\.publish\.lock\.candidate\.(\d+)\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 const reportLockCandidateOrphanPattern = /^\.publish\.lock\.candidate-orphan\.(\d+)\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 
-function fail(message) {
+function fail(message, status = 1) {
   console.error(`error: ${message}`);
-  process.exit(1);
+  process.exit(status);
 }
 
 function gitCommonDirectory(checkout) {
@@ -211,6 +212,19 @@ function processStartIdentity(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return "";
   try {
     return execFileSync("ps", ["-p", String(pid), "-o", "lstart="], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C" },
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim().replace(/\s+/g, " ");
+  } catch {
+    return "";
+  }
+}
+
+function processElapsed(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return "";
+  try {
+    return execFileSync("ps", ["-p", String(pid), "-o", "etime="], {
       encoding: "utf8",
       env: { ...process.env, LC_ALL: "C" },
       stdio: ["ignore", "pipe", "ignore"],
@@ -709,6 +723,30 @@ function indexPage(rows, policy) {
 </main></body></html>`;
 }
 
+function reportLockTimeout(lock, reclaimGuard) {
+  const controls = [
+    [path.join(lock, "owner"), "report lock owner", false],
+    [reclaimGuard, "report lock reclaim guard", true],
+  ];
+  for (const [control, label, requireToken] of controls) {
+    const state = reportPublicationOwnerState(control, label, requireToken);
+    if (state.kind !== "identified" || reportPublicationOwnerLiveness(state) !== "live") continue;
+    const elapsed = processElapsed(state.owner.pid);
+    const error = new Error(
+      `report stack lock timeout: retry, lock held by ${state.owner.pid} `
+      + `for ${elapsed || "unknown elapsed"} at ${path.join(configuredStackRoot, ".publish.lock")}`,
+    );
+    error.exitCode = 75;
+    return error;
+  }
+  const error = new Error(
+    `report stack lock timeout: retry, lock holder is unverified at `
+    + path.join(configuredStackRoot, ".publish.lock"),
+  );
+  error.exitCode = 75;
+  return error;
+}
+
 function acquireLock() {
   fs.mkdirSync(configuredStackRoot, { recursive: true, mode: 0o700 });
   const pinnedStackRoot = pinnedDirectory(configuredStackRoot, undefined, "report stack root");
@@ -1049,7 +1087,7 @@ function acquireLock() {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
     }
   }
-  throw new Error(`report stack is busy at ${lock}`);
+  throw reportLockTimeout(lock, reclaimGuard);
 }
 
 let lastPruneStatus = { pruned: 0, pending: false };
@@ -1989,5 +2027,5 @@ try {
     fail(`unknown command: ${command}`);
   }
 } catch (error) {
-  fail(error.message);
+  fail(error.message, error.exitCode === 75 ? 75 : 1);
 }

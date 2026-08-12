@@ -47,7 +47,12 @@ The script header owns the exact JSON schema.
 Optional X mode rides the same check path: the locked session-start bootstrap step drops a local `state/x-watch.check.sh` shim only after the user opts in with `FMX_PAIRING_TOKEN`, and non-X homes keep the default watcher behavior.
 The same supervision loop continuously reaps terminal task resources through `bin/fm-auto-reap.sh`.
 A merged PR check, an approved local-only merge, or a completed scout delegates to ordinary `bin/fm-teardown.sh`, so endpoint removal, report publication, kind-specific worktree safety, landed-work proof, and Treehouse return keep one fail-closed authority.
-Before that teardown, an exactly attributed active no-mistakes run is canceled by run ID; a cross-branch run whose exact ID is unavailable is retained rather than guessed.
+On the watcher's periodic check cadence, `bin/fm-auto-reap.sh maintenance` delegates terminal PR lanes to `bin/fm-terminal-pr-sweep.sh` across the active home and every validated registered secondmate home.
+The sweep live-checks CI and GitHub mergeability, invokes only `bin/fm-pr-merge.sh` for `yolo=on`, surfaces `yolo=off` to the captain, confirms merged state, and then invokes ordinary teardown without `--force`.
+An ordinary teardown blocked by the report stack's live publication holder exits with retryable status 75; the sweep retains the lane, retries on a later cadence, and deduplicates the unchanged wake.
+After GitHub confirms the merge, the sweep retires the lane's now-obsolete per-task PR check so that retryable teardown contention cannot recreate a wake loop.
+Its dry-run mode performs no locks, marker writes, merges, or teardowns.
+The task-triggered auto-reap path cancels an exactly attributed active no-mistakes run by run ID before teardown; a cross-branch run whose exact ID is unavailable is retained rather than guessed.
 X-mode-linked tasks wait for their final follow-up, and persistent secondmates are never auto-reaped.
 Every spawn writes an owner-stamped Treehouse acquisition record before leasing a slot and removes it once task metadata takes authority.
 The watcher recovers a stranded pre-metadata lease only after the record exceeds `FM_AUTO_REAP_STALE_SECS` and the recorded PID plus process start time proves dead or reused, then installs cleanup metadata and runs the same ordinary teardown proof.
@@ -140,6 +145,7 @@ For tasks created after the report-stack cutover, both reports follow the same c
 ## Durable completion reports
 
 Every post-cutover ship and scout task records `report_required=1`, produces a standalone completion report with optional visual artifacts, and publishes it before account lease release or worktree removal.
+Crosscheck task bindings may carry `report_required=0` as an explicit not-gated marker, while an absent marker retains the legacy not-gated meaning.
 The resulting machine-global stack is independent of Firstmate homes and Claude or Codex account profiles, so account recovery, cross-provider continuation, and home retirement do not strand the completion record.
 Publication is idempotent, fail-closed, and searchable; [report-stack.md](report-stack.md) owns the report schema, stored entry, teardown ordering, compatibility path, and browsing commands.
 

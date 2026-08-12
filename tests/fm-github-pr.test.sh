@@ -39,12 +39,29 @@ case "$*" in
   "api /repos/ruby-dlee/firstmate/pulls/72")
     case "${FM_TEST_API_MODE:-ok}" in
       ok) cat "$FM_TEST_API_FIXTURE" ;;
+      ready)
+        cat "$FM_TEST_API_FIXTURE"
+        printf '%s\n' 'mergeable: true' 'mergeable_state: clean'
+        ;;
+      blocked)
+        cat "$FM_TEST_API_FIXTURE"
+        printf '%s\n' 'mergeable: false' 'mergeable_state: dirty'
+        ;;
+      unknown)
+        cat "$FM_TEST_API_FIXTURE"
+        printf '%s\n' 'mergeable: null' 'mergeable_state: unknown'
+        ;;
+      merged)
+        sed -e 's/^state: open$/state: closed/' -e 's/^merged: false$/merged: true/' \
+          "$FM_TEST_API_FIXTURE"
+        printf '%s\n' 'mergeable: null' 'mergeable_state: unknown'
+        ;;
       error) exit 42 ;;
       malformed) sed '/^  sha:/d' "$FM_TEST_API_FIXTURE" ;;
       malformed-array) sed 's/labels\[1\]/labels[2]/' "$FM_TEST_API_FIXTURE" ;;
       malformed-fieldless-array)
         sed \
-          -e 's/^labels\[1\]{.*}:$/labels[1]:/' \
+          -e 's/^labels\[1\]{.*}:$/labels[2]:/' \
           -e 's/^  4307347680,bug,d73a4a,true,.*$/  bogus/' \
           "$FM_TEST_API_FIXTURE"
         ;;
@@ -55,6 +72,48 @@ case "$*" in
         sleep 30
         ;;
       boolean-number) sed 's/^number: 72$/number: true/' "$FM_TEST_API_FIXTURE" ;;
+      *) exit 98 ;;
+    esac
+    ;;
+  "pr checks 72 --repo ruby-dlee/firstmate")
+    case "${FM_TEST_CHECKS_MODE:-green}" in
+      green)
+        printf '%s\n' \
+          'summary: "1 passed, 0 failed, 1 skipped, 2 total"' \
+          'checks[2]{name,conclusion}:' \
+          '  lint,pass' \
+          '  optional,skip' \
+          'help[2]:' \
+          '  Run `gh-axi pr view 72` to see PR details' \
+          '  Run `gh-axi pr merge 72` to merge when ready'
+        ;;
+      none)
+        printf '%s\n' \
+          'checks: "0 passed, 0 failed — this PR has no CI checks configured"' \
+          'help[1]:' \
+          '  Run `gh-axi pr view 72` to see PR details'
+        ;;
+      red)
+        printf '%s\n' \
+          'summary: "1 passed, 1 failed, 2 total"' \
+          'checks[2]{name,conclusion}:' \
+          '  lint,pass' \
+          '  test,fail'
+        ;;
+      pending)
+        printf '%s\n' \
+          'summary: "1 passed, 0 failed, 1 pending, 2 total"' \
+          'checks[2]{name,conclusion}:' \
+          '  lint,pass' \
+          '  test,pending'
+        ;;
+      malformed)
+        printf '%s\n' \
+          'summary: "3 passed, 0 failed, 2 total"' \
+          'checks[2]{name,conclusion}:' \
+          '  lint,pass' \
+          '  test,pass'
+        ;;
       *) exit 98 ;;
     esac
     ;;
@@ -237,9 +296,9 @@ test_malformed_array_subtrees_fail_closed() {
   done
   assert_grep 'declares 2 rows, found 1' "$TMP_ROOT/malformed-array.err" \
     "ignored TOON table rows were not strictly validated"
-  assert_grep 'malformed gh-axi TOON scalar array item' \
+  assert_grep 'declares 2 items, found 1' \
     "$TMP_ROOT/malformed-fieldless-array.err" \
-    "fieldless TOON array accepted a row without the required list marker"
+    "fieldless TOON array accepted an inconsistent declared count"
   pass "unrelated TOON arrays are grammar-, count-, and row-validated before isolation"
 }
 
@@ -281,12 +340,66 @@ test_boolean_pr_numbers_fail_closed() {
   pass "boolean PR numbers fail closed in API and claims documents"
 }
 
+test_merge_readiness_is_live_and_fail_closed() {
+  local output rc
+  : > "$FM_TEST_GH_AXI_LOG"
+  output=$(FM_TEST_API_MODE=ready FM_TEST_CHECKS_MODE=green \
+    "$ADAPTER" merge-readiness "$PR_URL") \
+    || fail "green mergeable PR was not ready"
+  [ "$output" = "READY c9cbe79154013efcec9aa478f1476d0eff6c63df" ] \
+    || fail "green mergeable PR returned unexpected readiness: $output"
+
+  output=$(FM_TEST_API_MODE=ready FM_TEST_CHECKS_MODE=none \
+    "$ADAPTER" merge-readiness "$PR_URL") \
+    || fail "terminal PR with no configured checks was not ready"
+  assert_contains "$output" "READY " "no-check PR readiness"
+
+  output=$(FM_TEST_API_MODE=ready FM_TEST_CHECKS_MODE=red \
+    "$ADAPTER" merge-readiness "$PR_URL") \
+    || fail "red PR readiness lookup failed instead of classifying"
+  assert_contains "$output" "RED " "red PR was not classified red"
+
+  output=$(FM_TEST_API_MODE=ready FM_TEST_CHECKS_MODE=pending \
+    "$ADAPTER" merge-readiness "$PR_URL") \
+    || fail "pending PR readiness lookup failed instead of classifying"
+  assert_contains "$output" "PENDING " "pending PR was not classified pending"
+
+  output=$(FM_TEST_API_MODE=blocked FM_TEST_CHECKS_MODE=green \
+    "$ADAPTER" merge-readiness "$PR_URL") \
+    || fail "conflicted PR readiness lookup failed instead of classifying"
+  assert_contains "$output" "BLOCKED " "conflicted PR was not classified blocked"
+
+  output=$(FM_TEST_API_MODE=unknown FM_TEST_CHECKS_MODE=green \
+    "$ADAPTER" merge-readiness "$PR_URL") \
+    || fail "unknown mergeability lookup failed instead of classifying"
+  assert_contains "$output" "UNKNOWN " "unknown mergeability was not fail-closed"
+
+  : > "$FM_TEST_GH_AXI_LOG"
+  output=$(FM_TEST_API_MODE=merged "$ADAPTER" merge-readiness "$PR_URL") \
+    || fail "merged PR readiness lookup failed"
+  assert_contains "$output" "MERGED " "merged PR was not classified merged"
+  assert_no_grep '^pr checks ' "$FM_TEST_GH_AXI_LOG" \
+    "merged PR needlessly queried current checks before teardown"
+
+  set +e
+  FM_TEST_API_MODE=ready FM_TEST_CHECKS_MODE=malformed \
+    "$ADAPTER" merge-readiness "$PR_URL" \
+    > "$TMP_ROOT/readiness-malformed.out" 2> "$TMP_ROOT/readiness-malformed.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "inconsistent checks summary"
+  assert_grep 'checks summary counts are inconsistent' \
+    "$TMP_ROOT/readiness-malformed.err" \
+    "inconsistent checks summary did not fail closed"
+  pass "merge readiness requires live green checks and positive GitHub mergeability"
+}
+
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
     test_malformed_array_subtrees_fail_closed|test_boolean_pr_numbers_fail_closed|\
     test_timeout_reaps_gh_axi_children|test_public_merge_subcommand_is_unavailable|\
     test_merge_outcomes_distinguish_merged_from_enqueued|\
-    test_draft_refusal_is_fail_closed)
+    test_draft_refusal_is_fail_closed|test_merge_readiness_is_live_and_fail_closed)
       "$FM_TEST_CASE"
       exit 0
       ;;
@@ -302,6 +415,7 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-3 ]; then
   test_public_merge_subcommand_is_unavailable
   test_merge_outcomes_distinguish_merged_from_enqueued
   test_draft_refusal_is_fail_closed
+  test_merge_readiness_is_live_and_fail_closed
   exit 0
 fi
 
@@ -313,3 +427,4 @@ test_boolean_pr_numbers_fail_closed
 test_timeout_reaps_gh_axi_children
 test_merge_outcomes_distinguish_merged_from_enqueued
 test_draft_refusal_is_fail_closed
+test_merge_readiness_is_live_and_fail_closed

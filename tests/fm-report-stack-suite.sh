@@ -2150,6 +2150,44 @@ test_lock_control_files_are_bounded_and_nonfollowing() {
   pass "report lock control reads are bounded, nonfollowing, and recoverable"
 }
 
+test_live_report_lock_timeout_is_bounded_and_retryable() {
+  local fakebin output rc started_epoch elapsed real_ps
+  fakebin="$TMP_ROOT/report-lock-timeout-fakebin"
+  real_ps=$(command -v ps)
+  mkdir -p "$fakebin" "$STACK/.publish.lock"
+  cat > "$fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *'-o lstart='*) printf 'fixture-process-start\n' ;;
+  *'-o etime='*) printf '42:17\n' ;;
+  *) exec "$FM_TEST_REAL_PS" "$@" ;;
+esac
+SH
+  chmod +x "$fakebin/ps"
+  printf '{"pid":%s,"startedAt":"fixture-process-start","token":"live-holder"}\n' \
+    "$$" > "$STACK/.publish.lock/owner"
+  touch -t 200001010000 "$STACK/.publish.lock" "$STACK/.publish.lock/owner"
+
+  started_epoch=$(date +%s)
+  set +e
+  output=$(PATH="$fakebin:$PATH" FM_TEST_REAL_PS="$real_ps" \
+    FM_REPORT_LOCK_WAIT_MS=1000 run_stack render 2>&1)
+  rc=$?
+  set -e
+  elapsed=$(( $(date +%s) - started_epoch ))
+
+  expect_code 75 "$rc" "live report-lock timeout"
+  [ "$elapsed" -lt 10 ] || fail "report-lock wait was not bounded: ${elapsed}s"
+  assert_contains "$output" \
+    "report stack lock timeout: retry, lock held by $$ for 42:17" \
+    "report-lock timeout did not use the ps elapsed value"
+  [ -d "$STACK/.publish.lock" ] \
+    || fail "report-lock timeout stole the live holder's lock"
+  kill -0 $$ 2>/dev/null || fail "report-lock timeout killed its live holder"
+  rm -rf "$STACK/.publish.lock"
+  pass "live report-lock contention times out retryably without lock stealing"
+}
+
 test_namespace_cutover_waiter_pins_entries_after_lock_acquisition() {
   local id=report-cutover-waiter-k2b stack entry owner_ready owner_proceed waiter_ready waiter_proceed owner_out waiter_out
   local owner_pid waiter_pid owner_status waiter_status state
@@ -4120,6 +4158,11 @@ if [ "${FM_TEST_FOCUSED:-}" = report-lock-handshakes ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = report-lock-timeout ]; then
+  test_live_report_lock_timeout_is_bounded_and_retryable
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-27 ]; then
   test_retention_batches_make_interruption_safe_progress
   test_persistent_retention_owner_prunes_without_tasks_or_watcher
@@ -4404,6 +4447,7 @@ run_partitioned_test test_abandoned_reclaim_marker_is_recovered
 run_partitioned_test test_abandoned_reclaim_directory_is_recovered
 run_partitioned_test test_publish_lock_directory_symlink_fails_closed
 run_partitioned_test test_lock_control_files_are_bounded_and_nonfollowing
+run_partitioned_test test_live_report_lock_timeout_is_bounded_and_retryable
 run_partitioned_test test_namespace_cutover_waiter_pins_entries_after_lock_acquisition
 run_partitioned_test test_post_rename_lock_setup_failure_releases_owned_lock
 run_partitioned_test test_publication_lock_release_failures_are_observable

@@ -61,20 +61,28 @@ fi
 rm -f "$FM_STATE_OVERRIDE/$id.meta"
 printf 'teardown complete for %s\n' "$id"
 SH
-chmod +x "$FAKEBIN/gh-axi" "$FAKEBIN/no-mistakes" "$FAKEBIN/fm-teardown.sh"
+cat > "$FAKEBIN/fm-terminal-pr-sweep.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FM_FAKE_TERMINAL_SWEEP_LOG"
+SH
+chmod +x "$FAKEBIN/gh-axi" "$FAKEBIN/no-mistakes" "$FAKEBIN/fm-teardown.sh" \
+  "$FAKEBIN/fm-terminal-pr-sweep.sh"
 
 export FM_AUTO_REAP_TEST_HOOKS=firstmate-auto-reap-tests-v1
 export FM_AUTO_REAP_GH_AXI_BIN="$FAKEBIN/gh-axi"
 export FM_AUTO_REAP_NO_MISTAKES_BIN="$FAKEBIN/no-mistakes"
 export FM_AUTO_REAP_TEARDOWN_BIN="$FAKEBIN/fm-teardown.sh"
+export FM_AUTO_REAP_TERMINAL_PR_SWEEP_BIN="$FAKEBIN/fm-terminal-pr-sweep.sh"
 export FM_FAKE_NM_LOG="$TMP/no-mistakes.log"
 export FM_FAKE_TEARDOWN_LOG="$TMP/teardown.log"
+export FM_FAKE_TERMINAL_SWEEP_LOG="$TMP/terminal-sweep.log"
 export FM_HOME="$HOME_DIR"
 export FM_STATE_OVERRIDE="$HOME_DIR/state"
 
 reset_logs() {
   : > "$FM_FAKE_NM_LOG"
   : > "$FM_FAKE_TEARDOWN_LOG"
+  : > "$FM_FAKE_TERMINAL_SWEEP_LOG"
   FM_FAKE_PR_STATE=merged
   FM_FAKE_NM_STATUS=
   FM_FAKE_NM_RUNS=
@@ -83,6 +91,17 @@ reset_logs() {
   FM_FAKE_TEARDOWN_ASSERT_HERDR=0
   export FM_FAKE_PR_STATE FM_FAKE_NM_STATUS FM_FAKE_NM_RUNS
   export FM_FAKE_TEARDOWN_STATUS FM_FAKE_TEARDOWN_ASSERT_ORPHAN FM_FAKE_TEARDOWN_ASSERT_HERDR
+}
+
+test_maintenance_delegates_terminal_prs_to_cross_home_sweep() {
+  local out rc
+  reset_logs
+  out=$("$AUTO_REAP" maintenance 2>&1); rc=$?
+  expect_code 0 "$rc" "terminal PR maintenance delegation"
+  [ -z "$out" ] || fail "silent terminal PR sweep produced maintenance output: $out"
+  [ "$(wc -l < "$FM_FAKE_TERMINAL_SWEEP_LOG" | tr -d ' ')" -eq 1 ] \
+    || fail "maintenance did not invoke exactly one terminal PR sweep"
+  pass "auto-reap maintenance periodically invokes the cross-home terminal PR sweep"
 }
 
 make_task() {  # <id> <mode>
@@ -633,6 +652,7 @@ test_cross_branch_active_run_refuses_without_guessing_id
 test_detached_scout_skips_run_attribution_but_surfaces_teardown_refusal
 test_scout_skip_requires_detached_head_and_complete_metadata
 test_x_link_and_teardown_refusal_remain_visible
+test_maintenance_delegates_terminal_prs_to_cross_home_sweep
 test_dead_acquisition_recovers_but_live_owner_is_untouched
 test_dirty_stranded_worktree_is_retained_by_real_teardown
 test_unregistered_treehouse_lease_retains_acquisition_authority

@@ -20,6 +20,8 @@
 # That teardown mode proves the endpoint absent without killing it, applies the
 # ordinary landed-work proof, refuses any uncommitted work, repeats the proofs
 # under the checkout lock, and uses non-forcing `treehouse return`.
+# Report-lock timeout status 75 is retained for a later sweep, not promoted to
+# an operational failure, and the configured wait is capped at 30 seconds.
 # A missing proof is a retained lease, never an invitation to force cleanup.
 set -u
 
@@ -30,6 +32,7 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 MANAGED_TREEHOUSE_ROOT="$FM_HOME/.treehouse"
 TREEHOUSE_ROOT="${FM_TREEHOUSE_ROOT:-$HOME/.treehouse}"
 TEARDOWN="${FM_TREEHOUSE_REAP_TEARDOWN:-$SCRIPT_DIR/fm-teardown.sh}"
+TEARDOWN_RETRYABLE=75
 TEARDOWN_REAP_SAFETY_REFUSAL=77
 
 # shellcheck source=bin/fm-gate-refuse-lib.sh
@@ -431,14 +434,14 @@ EOF
       return 0
       ;;
   esac
-  report_wait_seconds=${FM_TREEHOUSE_REAP_REPORT_WAIT_SECONDS:-600}
+  report_wait_seconds=${FM_TREEHOUSE_REAP_REPORT_WAIT_SECONDS:-5}
   case "$report_wait_seconds" in
-    ''|*[!0-9]*|0) report_wait_seconds=600 ;;
+    ''|*[!0-9]*|0) report_wait_seconds=5 ;;
   esac
-  [ "$report_wait_seconds" -le 900 ] || report_wait_seconds=900
+  [ "$report_wait_seconds" -le 30 ] || report_wait_seconds=30
   report_wait_ms=$((report_wait_seconds * 1000))
   if out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
-      FM_REPORT_LOCK_WAIT_MS="$report_wait_ms" \
+      FM_TEARDOWN_REPORT_LOCK_WAIT_MS="$report_wait_ms" \
       "$TEARDOWN" "$id" --reap-dead 2>&1); then
     status=0
   else
@@ -447,6 +450,10 @@ EOF
   if [ "$status" -ne 0 ]; then
     echo "TREEHOUSE_REAP: retained task=$id reason=teardown-refused status=$status"
     [ -z "$out" ] || printf '%s\n' "$out" >&2
+    if [ "$status" -eq "$TEARDOWN_RETRYABLE" ]; then
+      echo "TREEHOUSE_REAP: retained task=$id reason=report-lock-busy retry=next-sweep"
+      return 0
+    fi
     [ "$status" -eq "$TEARDOWN_REAP_SAFETY_REFUSAL" ] && return 0
     echo "TREEHOUSE_REAP: operational-error task=$id reason=teardown-failed status=$status" >&2
     return 1

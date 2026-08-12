@@ -8,6 +8,7 @@
 # worktrees for the trusted project and refuses zero or multiple matches.
 # Absence proof always scans authoritative pool state because a Treehouse lease
 # can survive after its worktree registration disappears.
+# Real Treehouse available entries may omit `leased`; absence means unleased.
 
 fm_treehouse_state_for_worktree() {  # <worktree>
   local worktree=$1 slot pool state

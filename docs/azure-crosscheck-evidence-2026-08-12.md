@@ -2,15 +2,16 @@
 
 ## Scope
 
-This evidence covers only the pre-deployment emergency implementation checkpoint for the Azure Crosscheck adapter.
+This evidence covers the resumed pre-deployment implementation checkpoint for the Azure Crosscheck adapter.
 It does not claim a live Azure review, policy-grade acceptance, or cloud-default readiness.
-Azure mutation remained prohibited because the exact foundation/runner candidate was still under repair.
+Azure mutation remained prohibited because the released foundation is only partially deployed with zero VMs and has not been reported safe for reconciliation.
 
-## Exact base
+## Exact integration base
 
-The branch was created directly at remote candidate `06de6bf8e762c72485b1fd59cc729eb7dfd0eb11` after proving `origin/fm/azure-release-integration-k7` resolved to that object.
-The stacked branch is `fm/azure-crosscheck-isolation-v3`.
-Before push, the branch must be rebased onto the next exact repaired `origin/fm/azure-release-integration-k7` head reported by Firstmate.
+PR 129 has merged, so the stacked integration branch is no longer the base.
+Immediately before rebase, `origin/main` resolved to `b5c1b75df6aff6965242058bfdcda3925f90d96f`, PR 130's fetched head and `origin/fm/azure-crosscheck-isolation-v3` both resolved to `4f67fc2c691f1f33b50004e6e1f92cc488ad126a`, and the existing implementation was rebased onto that released main commit.
+PR 130 must now target `main`.
+Remote PR head and branch state remain authoritative before every later rebase or push.
 
 ## Implementation proof
 
@@ -26,31 +27,37 @@ The change keeps Crosscheck-specific execution, compartment, ledger-adapter, doc
 - `docs/azure-crosscheck/compartment.json`
 - `tests/fm-crosscheck-azure.test.sh`
 
-The existing `bin/fm-crosscheck.py` integration is narrow: it selects the adapter, lets the adapter return an ordinary v2 ledger run, validates the Azure identity extension on load and verify, and renders the compartment identity in the readable report.
-The existing finding lifecycle, exact live head/claims check, independent reviewer selection, executing account/model policy, report, and expected-head merge gate remain in their owner.
+The existing `bin/fm-crosscheck.py` integration remains narrow.
+It selects the adapter, lets the adapter return an ordinary v2 ledger run, validates the Azure identity extension on load and verify, and renders the compartment identity in the readable report.
+The existing finding lifecycle, exact live head and claims check, independent reviewer selection, report, and expected-head merge gate remain in their owner.
 
-The Azure adapter consumes the emergency runner's exact snapshot, request, identity, networkless execution, result, admission, and cleanup contracts.
-It does not alter runner or foundation files.
+The resumed implementation binds review generation to the executing upstream reviewer account identity instead of the account-home path.
+It re-proves same-provider author separation before credential staging, conditionally removes exact model resources and staging objects by ETag, refuses ambiguous reads as absence, includes the safety Run Command in cleanup, and proves absence after deletion.
+Tool invocations now carry the trusted adapter implementation inline rather than assuming the reviewed repository contains Firstmate's Crosscheck helpers.
+The exact diff places revisions before Git's path separator, the runner receives no phantom `.crosscheck` artifact declaration, and oversized regular-file reads fail instead of becoming truncated review input.
 
-## Focused commands
+The released Azure runner on `main` is now the integration contract.
+Its exact environment also requires `FM_AZURE_OWNER_TAG` and the independently accepted `FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID`; the operator documentation names both.
 
-The following checks are the permitted local checkpoint set:
+## Focused commands and outcomes
+
+The resumed checkpoint ran only the permitted focused checks:
 
 ```text
+bash tests/fm-crosscheck-azure.test.sh
 python3 -m py_compile bin/fm-crosscheck.py bin/fm-crosscheck-azure*.py
 bash -n bin/fm-crosscheck-azure-model-guest.sh
 python3 -m json.tool docs/azure-crosscheck/compartment.json
-shellcheck bin/fm-crosscheck-azure-model-guest.sh
-tests/run.sh tests/fm-crosscheck-azure.test.sh
 git diff --check
 ```
 
-The exact outputs and final stacked commit will be refreshed before draft PR publication.
-No no-mistakes command or complete repository suite belongs in this checkpoint.
+The focused Crosscheck suite passed its named static-boundary, explicit-selection, exact-identity, account-binding, ambiguous-cleanup, allow-listed bridge, symlink denial, oversized-output denial, networkless replay, and documented-acceptance cases.
+The compile, Bash syntax, ARM JSON parse, and diff checks passed.
+No no-mistakes command, full repository suite, shared validation-daemon operation, Azure apply, VM creation, cloud cleanup, PR merge, or default-branch push was performed.
 
 ## Live acceptance still owed
 
-Live acceptance is blocked until Firstmate reports that the repaired exact foundation/runner candidate returned GO and the foundation apply was accepted.
-The complete required real PR, two-concurrent-review, fault-isolation, malicious-probe, networkless-replay, force-push-invalidation, merge-gate, zero-residue, Mac-responsiveness, and cost sequence is in `docs/azure-crosscheck.md`.
-
-Until that sequence passes on Azure Linux, the implementation is a reviewed deployment candidate rather than a usable policy-grade service.
+Live acceptance remains blocked until Firstmate reports the corrected released foundation safe for the exact reconciliation or invocation.
+The complete required real PR, two-concurrent-review, fault-isolation, malicious-probe with positive controls, networkless replay, force-push invalidation, merge-gate, zero-residue, Mac-responsiveness, and cost sequence is in `docs/azure-crosscheck.md`.
+The controller-to-model bounded tool transport and exact clean source staging must be proven in that path without granting broad Azure authority to the credentialed model compartment or copying the repository into it.
+Until every leg passes on Azure Linux, the implementation is a deployment candidate rather than a usable policy-grade service.

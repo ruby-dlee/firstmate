@@ -38,6 +38,7 @@ Every attempt binds these values into one canonical review generation:
 - Model, tool, and verifier resource IDs, immutable VM instance IDs, and boot IDs.
 
 The exact review generation is carried in Azure tags, staged object prefixes, the model result, both command-runner requests, both returned compartment identities, the v2 reviewer record, and the readable report.
+The reviewer-account component hashes the upstream account identity read from the exact credential, never the account-home path, because two paths may execute as one account and one path may drift to another account.
 Missing or mismatched identity is a tool failure.
 The merge gate revalidates the Azure identity record in addition to its existing live head, claims, durable findings, reviewer, and evidence proof checks.
 
@@ -124,15 +125,17 @@ The durable v2 per-task lock and ledger remain home-local and keep one writer pe
 
 Cleanup starts only after a complete digest-bound result and exact compartment identities are retained.
 The controller re-reads tags and ETags before conditional deletion.
-It deletes only the attempt's Managed Run Command, model VM, NIC, OS disk, exact staged request, exact staged credential, and exact staged result.
+It deletes only the attempt's review and safety Managed Run Commands, model VM, NIC, OS disk, exact staged request, exact staged credential, and exact staged result.
+Every conditional deletion is followed by an exact absence proof, and an authorization, transport, or inventory error remains ambiguity rather than being treated as absence.
 The reused Azure runner independently performs the same identity-pinned cleanup for tool and verifier invocations.
 Foreign, missing, replaced, unreadable, or partially deleted resources retain state and fail closed.
 No resource group, subnet, shared storage account, foundation resource, sibling prefix, author VM, validation run, browser, supervisor, or another review can be deleted.
 
 ## Operator setup
 
-First apply and accept the exact Azure foundation and disposable runner candidate separately.
-Then build a pinned model image containing the tracked model guest, tool client, root bridge service, exact reviewer CLIs, and no ambient credential.
+The Azure foundation and disposable runner are now released on `main`, but the current foundation deployment is only partial, has zero VMs, and is not accepted for review reconciliation.
+Do not apply or reconcile any Azure resource until Firstmate explicitly reports the corrected released foundation safe for that exact operation.
+After that authorization, accept the released foundation and runner contracts, then build a pinned model image containing the tracked model guest, tool client, root bridge service, exact reviewer CLIs, and no ambient credential.
 Record the exact image resource ID.
 
 The home-local configuration is optional and gitignored:
@@ -148,7 +151,7 @@ The home-local configuration is optional and gitignored:
 }
 ```
 
-The required environment is the accepted foundation's existing `FM_AZURE_TENANT_ID`, `FM_AZURE_SUBSCRIPTION_ID`, `FM_AZURE_NAMING_PREFIX`, `FM_AZURE_STORAGE_NAME`, and `FM_AZURE_DEPLOYMENT_GENERATION`, plus the exact image through the config or `FM_CROSSCHECK_AZURE_MODEL_IMAGE_ID`.
+The required environment is the accepted foundation's existing `FM_HOME`, `FM_AZURE_TENANT_ID`, `FM_AZURE_SUBSCRIPTION_ID`, `FM_AZURE_NAMING_PREFIX`, `FM_AZURE_STORAGE_NAME`, `FM_AZURE_OWNER_TAG`, `FM_AZURE_DEPLOYMENT_GENERATION`, and independently accepted `FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID`, plus the exact image through the config or `FM_CROSSCHECK_AZURE_MODEL_IMAGE_ID`.
 The standard Crosscheck reviewer roster remains `config/crosscheck-reviewer.json` and keeps its existing account/model policy.
 
 After acceptance, the operator flow remains unchanged:
@@ -205,4 +208,5 @@ It does not provide remote terminal visibility.
 A later Herdr proxy may display a review, but authoritative liveness and cleanup remain the exact Azure review/VM/boot identities.
 
 The tracked image build and live network policy must be deployed and evidenced before real acceptance.
+The controller-to-model tool transport and its exact clean source staging must also be exercised end to end; a model-resident bridge may not gain broad Azure authority or receive the repository as a shortcut.
 The adapter deliberately refuses to infer that an arbitrary Ubuntu image contains a reviewer or tool closure.

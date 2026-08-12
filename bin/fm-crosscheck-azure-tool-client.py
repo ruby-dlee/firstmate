@@ -13,7 +13,16 @@ import stat
 SOCKET = Path("/run/fm-crosscheck/tool-bridge.sock")
 MAX_REQUEST = 2 * 1024 * 1024
 MAX_RESPONSE = 2 * 1024 * 1024
-ALLOWED_OPERATIONS = {"read", "grep", "find", "ls", "git-diff", "bash-evidence", "finalize"}
+ALLOWED_OPERATIONS = {
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "git-diff",
+    "bash-evidence",
+    "write-mutation",
+    "finalize",
+}
 
 
 def contained_regular(path: Path, root: Path) -> Path:

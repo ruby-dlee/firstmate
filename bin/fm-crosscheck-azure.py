@@ -17,7 +17,6 @@ See docs/azure-crosscheck.md for the operator and acceptance contract.
 from __future__ import annotations
 
 import base64
-import contextlib
 import hashlib
 import importlib.util
 import json
@@ -292,6 +291,7 @@ def review_identity(
     snapshot_value: dict[str, Any],
     config: dict[str, str],
     ledger: dict[str, Any],
+    reviewer_account_identity: str,
 ) -> dict[str, str]:
     claims = snapshot_value["claims_sha256"]
     ledger_digest = digest_bytes(canonical_bytes(ledger))
@@ -307,7 +307,7 @@ def review_identity(
         "reviewer_model": config["model"],
         "reviewer_effort": config["effort"],
         "reviewer_account_digest": digest_bytes(
-            str(Path(config["account_home"]).resolve()).encode("utf-8")
+            reviewer_account_identity.encode("utf-8")
         ),
         "ledger_digest": ledger_digest,
     }
@@ -316,7 +316,9 @@ def review_identity(
     return author
 
 
-def inspect_reviewer_credential(core: Any, config: dict[str, str]) -> tuple[Path, str, str]:
+def inspect_reviewer_credential(
+    core: Any, config: dict[str, str]
+) -> tuple[Path, str, str, str]:
     account_home = Path(config["account_home"]).resolve()
     if config["harness"] == "codex":
         source, identifier = core.inspect_codex_credential(account_home)
@@ -333,7 +335,12 @@ def inspect_reviewer_credential(core: Any, config: dict[str, str]) -> tuple[Path
         source, identifier = "oauth-file", str(credential)
     if not credential.is_file() or credential.is_symlink():
         raise AzureCrosscheckError("reviewer credential must be a regular non-symlink file")
-    return credential, source, identifier
+    account_identity = core.account_identity(config["harness"], account_home)
+    if not isinstance(account_identity, str) or not account_identity:
+        raise AzureCrosscheckError(
+            "Azure reviewer credential exposes no executing account identity"
+        )
+    return credential, source, identifier, account_identity
 
 
 def create_credential_archive(
@@ -655,22 +662,28 @@ def verify_compartment_tags(resource: dict[str, Any], expected: dict[str, str], 
             raise AzureCrosscheckError(f"live {label} cleanup tag mismatch: {key}")
 
 
+def azure_resource_absent(detail: str) -> bool:
+    lowered = detail.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "resourcenotfound",
+            "resource not found",
+            "could not be found",
+            "was not found",
+        )
+    )
+
+
 def delete_exact_resource(
     config: dict[str, Any], resource_id: str, api_version: str, expected_tags: dict[str, str], label: str
 ) -> None:
     url = "https://management.azure.com" + resource_id + "?api-version=" + api_version
     resource, rc, detail = az(config, ["rest", "--method", "get", "--url", url], check=False)
     if rc != 0:
-        listing, list_rc, list_detail = az(
-            config,
-            ["resource", "list", "--resource-group", config["resource_group"]],
-            check=False,
-        )
-        if list_rc != 0:
-            raise AzureCrosscheckError(f"{label} absence is ambiguous: {detail}; {list_detail}")
-        if any(str(item.get("id", "")).lower() == resource_id.lower() for item in listing):
-            raise AzureCrosscheckError(f"{label} exact read failed while inventory still contains it")
-        return
+        if azure_resource_absent(detail):
+            return
+        raise AzureCrosscheckError(f"{label} absence is ambiguous: {detail}")
     verify_compartment_tags(resource, expected_tags, label)
     etag = resource.get("etag")
     if not isinstance(etag, str) or not etag:
@@ -690,12 +703,116 @@ def delete_exact_resource(
     )
     if delete_rc != 0:
         raise AzureCrosscheckError(f"conditional exact {label} deletion failed: {delete_detail}")
+    deadline = time.monotonic() + MAX_AZURE_CALL_SECONDS
+    while time.monotonic() < deadline:
+        _value, verify_rc, verify_detail = az(
+            config, ["rest", "--method", "get", "--url", url], check=False
+        )
+        if verify_rc != 0 and azure_resource_absent(verify_detail):
+            return
+        if verify_rc != 0:
+            raise AzureCrosscheckError(
+                f"exact {label} absence is ambiguous after deletion: {verify_detail}"
+            )
+        time.sleep(5)
+    raise AzureCrosscheckError(f"exact {label} absence was not proven after deletion")
+
+
+def delete_exact_blob(config: dict[str, Any], blob: str) -> None:
+    exists, rc, detail = az(
+        config,
+        [
+            "storage",
+            "blob",
+            "exists",
+            "--auth-mode",
+            "login",
+            "--account-name",
+            config["storage"],
+            "--container-name",
+            STAGING_CONTAINER,
+            "--name",
+            blob,
+        ],
+        check=False,
+    )
+    if rc != 0:
+        raise AzureCrosscheckError(f"staging absence is ambiguous for {blob}: {detail}")
+    if exists.get("exists") is False:
+        return
+    value, rc, detail = az(
+        config,
+        [
+            "storage",
+            "blob",
+            "show",
+            "--auth-mode",
+            "login",
+            "--account-name",
+            config["storage"],
+            "--container-name",
+            STAGING_CONTAINER,
+            "--name",
+            blob,
+        ],
+        check=False,
+    )
+    if rc != 0:
+        raise AzureCrosscheckError(f"staging identity is unreadable for {blob}: {detail}")
+    etag = value.get("etag") or (value.get("properties") or {}).get("etag")
+    if not isinstance(etag, str) or not etag:
+        raise AzureCrosscheckError(f"staging object lacks ETag cleanup identity: {blob}")
+    _value, rc, detail = az(
+        config,
+        [
+            "storage",
+            "blob",
+            "delete",
+            "--auth-mode",
+            "login",
+            "--account-name",
+            config["storage"],
+            "--container-name",
+            STAGING_CONTAINER,
+            "--name",
+            blob,
+            "--if-match",
+            etag,
+            "--delete-snapshots",
+            "include",
+        ],
+        check=False,
+    )
+    if rc != 0:
+        raise AzureCrosscheckError(f"conditional staging deletion failed for {blob}: {detail}")
+    value, rc, detail = az(
+        config,
+        [
+            "storage",
+            "blob",
+            "exists",
+            "--auth-mode",
+            "login",
+            "--account-name",
+            config["storage"],
+            "--container-name",
+            STAGING_CONTAINER,
+            "--name",
+            blob,
+        ],
+        check=False,
+    )
+    if rc != 0 or value.get("exists") is not False:
+        raise AzureCrosscheckError(f"staging absence was not proven after deletion: {blob}: {detail}")
 
 
 def cleanup_model_vm(config: dict[str, Any], resources: dict[str, Any], identity: dict[str, str]) -> None:
+    del identity
     tags = resources["tags"]
+    safety_run_command = resources["vm_id"] + "/runCommands/safety-shutdown"
     for resource_id, api_version, label in (
-        (resources.get("run_command_id"), "2024-03-01", "model run-command"),
+        (resources.get("run_command_id"), "2024-03-01", "model review run-command"),
+        (safety_run_command, "2024-03-01", "model safety run-command"),
         (resources["vm_id"], "2024-03-01", "model VM"),
         (
             f"/subscriptions/{config['subscription']}/resourceGroups/{config['resource_group']}"
@@ -793,19 +910,11 @@ def run_azure_review(
     config: dict[str, str],
     author_account_identity: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    del author_account_identity, root
+    del root
     azure = runtime_config(home)
     verify_scope_and_foundation(azure)
     if active_review_vms(azure) >= azure["max_concurrency"]:
         raise core.CrosscheckToolError("Azure review admission reached its independent concurrency cap")
-    identity = review_identity(
-        home=home,
-        task_id=task_id,
-        pr_url=pr_url,
-        snapshot_value=snapshot_value,
-        config=config,
-        ledger=ledger,
-    )
     config["account_selector"] = {
         "codex": "CODEX_HOME",
         "claude": "CLAUDE_CONFIG_DIR",
@@ -816,7 +925,33 @@ def run_azure_review(
     # The reviewer schema/report bind this stable compartment path while the
     # account digest and VM identity prove which credential executed there.
     config["execution_home"] = "/var/lib/fm-crosscheck-model/home"
-    credential, source, identifier = inspect_reviewer_credential(core, config)
+    credential, source, identifier, reviewer_account_identity = inspect_reviewer_credential(
+        core, config
+    )
+    if author_account_identity and reviewer_account_identity == author_account_identity:
+        raise core.CrosscheckToolError(
+            "Azure reviewer executing account is the same upstream account as the author"
+        )
+    if config.get("author_account_independence") == core.LEGACY_AUTHOR_ADMISSION_MODE:
+        reviewer_digest = hashlib.sha256(
+            reviewer_account_identity.encode("utf-8")
+        ).hexdigest()
+        if reviewer_digest != config.get("reviewer_account_identity_sha256"):
+            raise core.CrosscheckToolError(
+                "Azure legacy-admitted reviewer account changed after selection"
+            )
+    config["reviewer_account_identity_sha256"] = hashlib.sha256(
+        reviewer_account_identity.encode("utf-8")
+    ).hexdigest()
+    identity = review_identity(
+        home=home,
+        task_id=task_id,
+        pr_url=pr_url,
+        snapshot_value=snapshot_value,
+        config=config,
+        ledger=ledger,
+        reviewer_account_identity=reviewer_account_identity,
+    )
     config["credential_source"] = source
     config["credential_identifier"] = identifier
     schema = core.review_output_schema(config["executing_account_home"], config["execution_home"])
@@ -955,30 +1090,25 @@ def run_azure_review(
                     cleanup_model_vm(azure, resources, identity)
                 except Exception as exc:
                     cleanup_error = exc
-            for blob in uploaded | {staged["output_blob"]}:
-                with contextlib.suppress(Exception):
-                    az(
-                        azure,
-                        [
-                            "storage",
-                            "blob",
-                            "delete",
-                            "--auth-mode",
-                            "login",
-                            "--account-name",
-                            azure["storage"],
-                            "--container-name",
-                            STAGING_CONTAINER,
-                            "--name",
-                            blob,
-                            "--delete-snapshots",
-                            "include",
-                        ],
-                        check=False,
-                    )
-            if cleanup_error is not None and sys.exc_info()[0] is None:
+            blob_cleanup_errors: list[str] = []
+            for blob in sorted(uploaded | {staged["output_blob"]}):
+                try:
+                    delete_exact_blob(azure, blob)
+                except Exception as exc:
+                    blob_cleanup_errors.append(f"{blob}: {exc}")
+            if cleanup_error is not None or blob_cleanup_errors:
+                detail = "; ".join(
+                    [
+                        *(
+                            [f"compute: {cleanup_error}"]
+                            if cleanup_error is not None
+                            else []
+                        ),
+                        *blob_cleanup_errors,
+                    ]
+                )
                 raise core.CrosscheckToolError(
-                    f"Azure model compartment cleanup is ambiguous: {cleanup_error}"
+                    f"Azure model compartment cleanup is ambiguous: {detail}"
                 )
 
 
@@ -1021,10 +1151,10 @@ def validate_azure_reviewer_record(
         raise RuntimeError(f"{label}.reviewer Azure harness identity mismatches")
     if identity["reviewer_model"] != reviewer.get("model"):
         raise RuntimeError(f"{label}.reviewer Azure model identity mismatches")
-    expected_account_digest = digest_bytes(
-        str(Path(reviewer.get("account_home", "")).resolve()).encode("utf-8")
-    )
-    if identity["reviewer_account_digest"] != expected_account_digest:
+    account_digest = reviewer.get("reviewer_account_identity_sha256")
+    if not isinstance(account_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", account_digest):
+        raise RuntimeError(f"{label}.reviewer Azure executing account digest is missing")
+    if identity["reviewer_account_digest"] != "sha256:" + account_digest:
         raise RuntimeError(f"{label}.reviewer Azure account identity mismatches")
     model = require_identity_record(identity.get("model"), f"{label}.reviewer.azure_identity.model")
     tool = require_identity_record(identity.get("tool"), f"{label}.reviewer.azure_identity.tool")

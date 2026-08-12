@@ -32,6 +32,8 @@ ALLOWED_OPERATIONS = {"read", "grep", "find", "ls", "git-diff", "bash-evidence",
 SAFE_PATH = re.compile(r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$))[A-Za-z0-9._/+@:-]{1,240}$")
 ROOT = Path(__file__).resolve().parent.parent
 RUNNER = ROOT / "bin" / "fm-azure-runner.py"
+TOOL_COMMAND = ROOT / "bin" / "fm-crosscheck-azure-tool-command.py"
+REPLAY_COMMAND = ROOT / "bin" / "fm-crosscheck-azure-replay.py"
 
 
 class BridgeError(RuntimeError):
@@ -86,6 +88,10 @@ def validate_request(value: Any) -> dict[str, Any]:
     return value
 
 
+def trusted_python_command(source: Path, *arguments: str) -> list[str]:
+    return ["python3", "-c", source.read_text(encoding="utf-8"), *arguments]
+
+
 def operation_command(value: dict[str, Any]) -> list[str]:
     operation = value["operation"]
     arguments = value["arguments"]
@@ -98,13 +104,15 @@ def operation_command(value: dict[str, Any]) -> list[str]:
         limit = arguments[2] if len(arguments) == 3 else "400"
         if not offset.isdigit() or not limit.isdigit() or int(limit) > 2000:
             raise BridgeError("read offset/limit is invalid")
-        return ["python3", "bin/fm-crosscheck-azure-tool-command.py", "read", arguments[0], offset, limit]
+        return trusted_python_command(
+            TOOL_COMMAND, "read", arguments[0], offset, limit
+        )
     if operation == "grep":
         if not 1 <= len(arguments) <= 8:
             raise BridgeError("grep requires one pattern and optional roots")
         if any(item != "." and not SAFE_PATH.fullmatch(item) for item in arguments[1:]):
             raise BridgeError("grep repository root is invalid")
-        return ["python3", "bin/fm-crosscheck-azure-tool-command.py", operation, *arguments]
+        return trusted_python_command(TOOL_COMMAND, operation, *arguments)
     if operation == "find":
         if len(arguments) > 2:
             raise BridgeError("find accepts one root and optional bounded depth")
@@ -112,27 +120,46 @@ def operation_command(value: dict[str, Any]) -> list[str]:
             raise BridgeError("find repository root is invalid")
         if len(arguments) == 2 and not arguments[1].isdigit():
             raise BridgeError("find depth is invalid")
-        return ["python3", "bin/fm-crosscheck-azure-tool-command.py", operation, *arguments]
+        return trusted_python_command(TOOL_COMMAND, operation, *arguments)
     if operation == "ls":
         if len(arguments) > 1 or (
             arguments and arguments[0] != "." and not SAFE_PATH.fullmatch(arguments[0])
         ):
             raise BridgeError("ls repository root is invalid")
-        return ["python3", "bin/fm-crosscheck-azure-tool-command.py", operation, *arguments]
+        return trusted_python_command(TOOL_COMMAND, operation, *arguments)
     if operation == "git-diff":
         if arguments not in ([], [base, head]):
             raise BridgeError("git-diff may name only the bound base and head")
-        return ["git", "diff", "--no-ext-diff", "--no-renames", "--", base, head]
+        return [
+            "git",
+            "diff",
+            "--no-ext-diff",
+            "--no-renames",
+            base,
+            head,
+            "--",
+        ]
     if operation == "bash-evidence":
         if len(arguments) != 2 or not SAFE_PATH.fullmatch(arguments[0]) or not arguments[0].startswith(".crosscheck/reproductions/"):
             raise BridgeError("bash-evidence requires one reproduction helper path and base64 body")
         evidence = decode_artifact(arguments[1], "evidence helper")
         save_review_artifact(value["review_generation"], arguments[0], evidence)
-        encoded = base64.b64encode(canonical(review_artifacts(value["review_generation"]))).decode("ascii")
-        return [
-            "python3", "bin/fm-crosscheck-azure-replay.py", "--mode", "capture",
-            "--evidence-json", encoded, "--", "bash", "--noprofile", "--norc", arguments[0], "--next-command",
-        ]
+        encoded = base64.b64encode(
+            canonical(review_artifacts(value["review_generation"]))
+        ).decode("ascii")
+        return trusted_python_command(
+            REPLAY_COMMAND,
+            "--mode",
+            "capture",
+            "--evidence-json",
+            encoded,
+            "--",
+            "bash",
+            "--noprofile",
+            "--norc",
+            arguments[0],
+            "--next-command",
+        )
     if operation == "write-mutation":
         if len(arguments) != 2 or not SAFE_PATH.fullmatch(arguments[0]) or not arguments[0].startswith(".crosscheck/mutations/"):
             raise BridgeError("write-mutation requires one mutation path and base64 body")
@@ -205,12 +232,11 @@ def prepare_exact_snapshot(runner: Any, request: dict[str, Any], task_suffix: st
             generation,
             "--resource-class",
             "crosscheck-tool",
-            "--artifact",
-            ".crosscheck",
             "--",
             *command,
         ]
     )
+    runner.normalize_command(arguments)
     state = runner.prepare(runner.environment(), arguments)
     return state, arguments
 
@@ -280,10 +306,15 @@ def finalize(value: dict[str, Any]) -> dict[str, Any]:
         runner,
         request,
         "tool",
-        [
-            "python3", "bin/fm-crosscheck-azure-replay.py", "--mode", "capture",
-            "--evidence-json", encoded_artifacts, "--", *flattened,
-        ],
+        trusted_python_command(
+            REPLAY_COMMAND,
+            "--mode",
+            "capture",
+            "--evidence-json",
+            encoded_artifacts,
+            "--",
+            *flattened,
+        ),
     )
     if tool_exit != 0:
         raise BridgeError("tool compartment evidence execution failed")
@@ -291,10 +322,15 @@ def finalize(value: dict[str, Any]) -> dict[str, Any]:
         runner,
         request,
         "verifier",
-        [
-            "python3", "bin/fm-crosscheck-azure-replay.py", "--mode", "verify",
-            "--evidence-json", encoded_artifacts, "--", *flattened,
-        ],
+        trusted_python_command(
+            REPLAY_COMMAND,
+            "--mode",
+            "verify",
+            "--evidence-json",
+            encoded_artifacts,
+            "--",
+            *flattened,
+        ),
     )
     if verifier_exit != 0:
         raise BridgeError("independent verifier replay failed")

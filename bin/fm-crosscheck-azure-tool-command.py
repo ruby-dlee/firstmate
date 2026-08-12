@@ -50,13 +50,17 @@ def main() -> int:
         limit = int(args.arguments[2])
         if not 1 <= offset or not 1 <= limit <= 2000 or not path.is_file():
             raise SystemExit("tool command: read range or file is invalid")
+        captured = bytearray()
         with path.open("rb") as handle:
             for number, line in enumerate(handle, start=1):
                 if number < offset:
                     continue
                 if number >= offset + limit:
                     break
-                sys.stdout.buffer.write(line)
+                captured.extend(line)
+                if len(captured) > MAX_CAPTURE:
+                    raise SystemExit("tool command: output exceeded byte bound")
+        sys.stdout.buffer.write(captured)
         return 0
     if args.operation == "grep":
         if not 1 <= len(args.arguments) <= 8:

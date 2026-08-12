@@ -136,6 +136,7 @@ base = {
     "harness": "pi",
     "model": "gpt-5.6-sol",
     "account_home": "/independent/pi",
+    "reviewer_account_identity_sha256": "2" * 64,
     "azure_identity": {
         "home_binding": "sha256:" + "1" * 64,
         "task_id": "task-one",
@@ -145,7 +146,7 @@ base = {
         "claims_sha256": "c" * 64,
         "reviewer_harness": "pi",
         "reviewer_model": "gpt-5.6-sol",
-        "reviewer_account_digest": module.digest_bytes(b"/independent/pi"),
+        "reviewer_account_digest": "sha256:" + "2" * 64,
         "review_generation": "e" * 24,
         "ledger_digest": "sha256:" + "f" * 64,
         "request_digest": "sha256:" + "0" * 64,
@@ -187,6 +188,53 @@ PY
   pass "wrong head, stale endpoint, shared VM, network, credential, and generation outcomes fail closed"
 }
 
+account_and_cleanup_identity_unit() {
+  python3 - "$ADAPTER" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("azure_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+common = {
+    "home": Path("/home/firstmate"),
+    "task_id": "review-one",
+    "pr_url": "https://github.com/example/repo/pull/1",
+    "snapshot_value": {
+        "head_sha": "a" * 40,
+        "base_sha": "b" * 40,
+        "base_branch_sha": "c" * 40,
+        "claims_sha256": "d" * 64,
+    },
+    "config": {
+        "harness": "pi",
+        "model": "gpt-5.6-sol",
+        "effort": "xhigh",
+        "account_home": "/same/path",
+    },
+    "ledger": {"schema": "firstmate.crosscheck-ledger.v2", "findings": [], "runs": []},
+}
+first = module.review_identity(**common, reviewer_account_identity="account-one")
+second = module.review_identity(**common, reviewer_account_identity="account-two")
+assert first["reviewer_account_digest"] != second["reviewer_account_digest"]
+assert first["review_generation"] != second["review_generation"]
+
+original = module.az
+module.az = lambda *_args, **_kwargs: (None, 1, "AuthorizationFailed")
+try:
+    module.delete_exact_resource({}, "/resource", "1", {}, "fixture")
+except module.AzureCrosscheckError as exc:
+    assert "ambiguous" in str(exc)
+else:
+    raise AssertionError("an unreadable resource became cleanup absence")
+module.az = lambda *_args, **_kwargs: (None, 1, "ResourceNotFound")
+module.delete_exact_resource({}, "/resource", "1", {}, "fixture")
+module.az = original
+PY
+  pass "review generation binds the executing account and ambiguous cleanup never becomes absence"
+}
+
 bridge_security_unit() {
   python3 - "$BRIDGE" <<'PY'
 import importlib.util
@@ -213,7 +261,16 @@ base = {
     "verdict": None,
 }
 module.validate_request(base)
-assert module.operation_command(base) == ["git", "diff", "--no-ext-diff", "--no-renames", "--", "c" * 40, "b" * 40]
+assert module.operation_command(base) == [
+    "git", "diff", "--no-ext-diff", "--no-renames", "c" * 40, "b" * 40, "--"
+]
+read_command = copy.deepcopy(base)
+read_command["operation"] = "read"
+read_command["arguments"] = ["README.md"]
+read_argv = module.operation_command(read_command)
+assert read_argv[:2] == ["python3", "-c"]
+assert "fm-crosscheck-azure-tool-command.py" not in read_argv
+assert "Allow-listed repository inspection command" in read_argv[2]
 for update, expected in (
     ({"operation": "shell"}, "allow-listed"),
     ({"review_generation": "wrong"}, "generation"),
@@ -244,6 +301,37 @@ for malicious in (
         raise AssertionError("malicious evidence path did not fail: " + repr(malicious))
 PY
   pass "bridge rejects shell, identity drift, oversized items, traversal, absolute paths, and symlink-shaped escape"
+}
+
+tool_command_security_unit() {
+  local tmp
+  fm_test_tmproot_into tmp fm-crosscheck-azure-tool-command
+  printf 'allowed counterpart\n' >"$tmp/allowed.txt"
+  (
+    cd "$tmp" || exit
+    "$COMMAND" read allowed.txt 1 10
+  ) >"$tmp/allowed.out"
+  assert_grep 'allowed counterpart' "$tmp/allowed.out" "allowed regular-file positive control was not observable"
+  ln -s allowed.txt "$tmp/linked.txt"
+  if (
+    cd "$tmp" || exit
+    "$COMMAND" read linked.txt 1 10
+  ) >"$tmp/linked.out" 2>&1; then
+    fail "symlink file became an allowed read"
+  fi
+  python3 - "$tmp/oversized.txt" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_bytes(b"x" * (8 * 1024 * 1024 + 1) + b"\n")
+PY
+  if (
+    cd "$tmp" || exit
+    "$COMMAND" read oversized.txt 1 1
+  ) >"$tmp/oversized.out" 2>&1; then
+    fail "oversized regular-file output became an allowed read"
+  fi
+  assert_grep 'output exceeded byte bound' "$tmp/oversized.out" "oversized output refusal was not named"
+  pass "tool VM file reads have observable positive control and deny symlinks and oversized output"
 }
 
 replay_positive_and_failure_unit() {
@@ -314,7 +402,9 @@ documented_acceptance_contract() {
 static_contract
 adapter_mode_unit
 identity_outcome_unit
+account_and_cleanup_identity_unit
 bridge_security_unit
+tool_command_security_unit
 replay_positive_and_failure_unit
 documented_acceptance_contract
 printf 'Azure Crosscheck tests passed.\n'

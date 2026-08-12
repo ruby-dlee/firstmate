@@ -5,10 +5,11 @@
 # This wrapper never registers providers, requests quota, changes the ambient
 # Azure CLI default, installs tools, or prints private deployment parameters.
 # Every Azure subscription operation carries the exact selected subscription.
-# Applying is permitted only from a clean commit reachable from origin's default
-# branch, after live scope/provider/SKU/quota/name/cost gates pass. The ordinary
-# default and every command except apply, worker-create, worker-deallocate,
-# worker-delete, and destroy are read-only.
+# Apply and worker lifecycle mutations are permitted only from a clean commit
+# reachable from origin's default branch. Apply and worker-create additionally
+# require the live scope/provider/SKU/quota/name/cost gates. The ordinary default
+# and every command except apply, worker-create, worker-deallocate, worker-delete,
+# and destroy are read-only.
 #
 # Required environment for cloud commands:
 #   FM_AZURE_TENANT_ID FM_AZURE_SUBSCRIPTION_ID FM_AZURE_ADMIN_EMAIL
@@ -34,7 +35,7 @@
 #   fm-azure-pilot.sh worker-create --slot <1..16> --confirm-create --confirm-subscription <exact-id>
 #   fm-azure-pilot.sh worker-deallocate --slot <1..16> --confirm-deallocate --confirm-subscription <exact-id>
 #   fm-azure-pilot.sh worker-delete --slot <1..16> --task-state-preserved --confirm-delete --confirm-subscription <exact-id>
-#   fm-azure-pilot.sh destroy --confirm-destroy --state-export-confirmed --provider-sessions-revoked --confirm-subscription <exact-id> [--delete-retained-disks --confirm-delete-retained-disks]
+#   fm-azure-pilot.sh destroy --confirm-destroy --state-export-confirmed --provider-sessions-revoked --confirm-subscription <exact-id> --delete-retained-disks --confirm-delete-retained-disks
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
@@ -63,10 +64,10 @@ State-changing (never run by default):
   worker-deallocate --slot <1..16> --confirm-deallocate --confirm-subscription <exact-id>
   worker-delete --slot <1..16> --task-state-preserved --confirm-delete --confirm-subscription <exact-id>
   destroy --confirm-destroy --state-export-confirmed --provider-sessions-revoked \
-    --confirm-subscription <exact-id> [--delete-retained-disks --confirm-delete-retained-disks]
+    --confirm-subscription <exact-id> --delete-retained-disks --confirm-delete-retained-disks
 
 Cloud commands read private values only from the environment documented in the
-script header. They never print those values. Apply and worker-create additionally
+script header. They never print those values. Apply and every worker mutation
 require a clean tracked revision reachable from origin's default branch.
 USAGE
 }

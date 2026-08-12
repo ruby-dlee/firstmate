@@ -7,7 +7,8 @@ This document owns the reviewed Azure pilot architecture and operator contract.
 
 The deployment is infrastructure for a private, elastic Firstmate fleet in East US.
 No cloud resource may be created from a feature branch, a local edit, or a preview.
-`apply` and `worker-create` require a clean commit already reachable from the remote default branch, an exact subscription confirmation, an explicit mutation flag, and every live gate.
+`apply` and every worker mutation require a clean commit already reachable from the remote default branch, an exact subscription confirmation, and an explicit mutation flag.
+`apply` and `worker-create` additionally require every live gate.
 The initial cloud deployment is a separate follow-up operation after review, landing, and explicit approval.
 
 The default command, local validation, Azure validation, preview, status, and recovery guidance are read-only.
@@ -70,7 +71,8 @@ A later validation/review pool must prove its own live family quota rather than 
 ## Network and private administration
 
 VM NICs have private addresses only and no public-IP configuration.
-The VM subnets use Standard NAT Gateway with one Standard static outbound public IP.
+Every outbound-capable VM subnet uses Standard NAT Gateway with one Standard static outbound public IP.
+The networkless-verifier subnet has no NAT attachment or other outbound path.
 There is no inbound NAT, load balancer, Bastion, SSH authorization, public mosh, or public Herdr rule.
 NSGs explicitly deny Internet inbound.
 The elastic validation, policy-review, and browser subnets also deny cross-compartment VNet inbound by default.
@@ -280,7 +282,8 @@ The recovery objective is a clean IaC rebuild, private re-enrollment, retained-d
 Supervisor recovery applies only after an explicitly selected non-foundation profile creates one; the foundation profile keeps Firstmate local.
 The current Mac stays unchanged and reachable for 30 days after accepted cutover as rollback and Apple-only compatibility capacity.
 
-Full destruction is deliberately difficult and requires proof that state was exported, provider sessions were revoked, and retained disks may be deleted:
+Full destruction is deliberately difficult and requires proof that state was exported, provider sessions were revoked, and retained disks may be deleted.
+Both retained-disk deletion flags are mandatory because resource-group deletion cannot retain disks inside the group:
 
 ```sh
 bin/fm-azure-pilot.sh destroy \

@@ -31,7 +31,8 @@ for marker in (
     "REGIONAL_ADMISSION_CEILING_VCPUS = 128", "AUTHOR_PLAN_VCPUS = MAX_WORKERS * VCPUS_PER_WORKER",
     "SPECIALIZED_SHAPE_VCPUS = 40", "SHARED_HEADROOM_VCPUS = 22", "MAX_WORKERS = 16",
     'FM_AZURE_WORKER_WARM_IDLE currently must remain zero', "pending_action",
-    "capacity-reserve", "capacity-release", "merged_specialized_reservations",
+    "capacity-reserve", "capacity-reserve-shape", "capacity-release", "merged_specialized_reservations",
+    "REVIEWED_CONTROL_SKU_FAMILY", "command_capacity_reserve_shape",
     "fm.worker-authority/v1", "authority-receipt", "fm.worker-execution/v1",
 ):
     assert marker in controller, marker
@@ -1017,6 +1018,189 @@ PY
   pass "specialized CLI durably reserves, queues exact-family excess, and releases only exact fenced capacity"
 }
 
+shared_shape_cli() {
+  local tmp provider fixture home fence out state_file
+  fm_test_tmproot_into tmp fm-shared-shape
+  provider="$tmp/provider.py"
+  fixture="$tmp/provider-state.json"
+  home="$tmp/home"
+  mkdir -p "$home"
+  write_fixture_provider "$provider"
+  fence=$(printf shape-fence | shasum -a 256 | awk '{print $1}')
+  state_file="$home/state/azure-workers/controller.json"
+  run_shape() {
+    env \
+      FM_HOME="$home" \
+      FM_AZURE_SUBSCRIPTION_ID="$SUB" \
+      FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
+      FM_AZURE_OWNER_TAG=owner \
+      FM_AZURE_NAMING_PREFIX=fmtest \
+      FM_WORKER_PROVIDER_COMMAND="python3 $provider" \
+      FIXTURE_STATE="$fixture" \
+      "$WRAPPER" "$@"
+  }
+
+  # A complete shape beyond the 40-vCPU specialized envelope refuses before
+  # any durable write.
+  if run_shape capacity-reserve-shape \
+      --shape-id shape-oversized --fence-binding "$fence" \
+      --constituent "reservation-id=azr-ovc000000001,role=validation,sku=Standard_D8as_v6,sku-family=standardDav6Family,vcpus=8,amount-usd=25" \
+      --constituent "reservation-id=azr-ovc000000002,role=validation,sku=Standard_D8as_v7,sku-family=StandardDasv7Family,vcpus=8,amount-usd=25" \
+      --constituent "reservation-id=azr-ovc000000003,role=validation,sku=Standard_D8s_v6,sku-family=StandardDsv6Family,vcpus=8,amount-usd=25" \
+      --constituent "reservation-id=azr-ovc000000004,role=validation,sku=Standard_D8ads_v7,sku-family=StandardDadsv7Family,vcpus=8,amount-usd=25" \
+      --constituent "reservation-id=azr-ovc000000005,role=validation,sku=Standard_D8ds_v6,sku-family=StandardDdsv6Family,vcpus=8,amount-usd=25" \
+      --constituent "reservation-id=azr-ovc000000006,role=validation,sku=Standard_D4as_v6,sku-family=standardDav6Family,vcpus=4,amount-usd=25" \
+      --confirm-subscription "$SUB" >/dev/null 2>&1; then
+    fail "44-vCPU shape bypassed the 40-vCPU specialized envelope"
+  fi
+
+  # An unreviewed eight-vCPU control SKU refuses.
+  if run_shape capacity-reserve-shape \
+      --shape-id shape-unreviewed --fence-binding "$fence" \
+      --constituent "reservation-id=azr-bad000000001,role=validation,sku=Standard_D8as_v5,sku-family=standardDASv5Family,vcpus=8,amount-usd=25" \
+      --confirm-subscription "$SUB" >/dev/null 2>&1; then
+    fail "unreviewed eight-vCPU control SKU was accepted"
+  fi
+
+  # All-or-nothing: one constituent overbooks its exact 10-vCPU family, so the
+  # complete shape stays queued even though the second constituent fits alone.
+  out=$(run_shape capacity-reserve-shape \
+    --shape-id shape-conflict --fence-binding "$fence" \
+    --constituent "reservation-id=azr-cfa000000001,role=validation,sku=Standard_D4as_v7,sku-family=StandardDasv7Family,vcpus=4,amount-usd=25" \
+    --constituent "reservation-id=azr-cfa000000002,role=validation,sku=Standard_D4as_v7,sku-family=StandardDasv7Family,vcpus=4,amount-usd=25" \
+    --constituent "reservation-id=azr-cfa000000003,role=validation,sku=Standard_D4as_v7,sku-family=StandardDasv7Family,vcpus=4,amount-usd=25" \
+    --constituent "reservation-id=azr-cfb000000001,role=validation,sku=Standard_D4ads_v6,sku-family=standardDadv6Family,vcpus=4,amount-usd=25" \
+    --confirm-subscription "$SUB")
+  python3 - "$out" <<'PY' || fail "family-conflicting shape was not atomically queued"
+import json
+import sys
+value = json.loads(sys.argv[1])
+assert value["status"] == "queued" and "family" in value["reason"]
+assert all(item["status"] == "queued" for item in value["constituents"])
+PY
+  # Positive control: the fitting constituent's family genuinely had room, so
+  # the refusal above was the atomic shape gate rather than family pressure.
+  out=$(run_shape capacity-reserve \
+    --reservation-id azr-posctl000001 --fence-binding "$fence" \
+    --role validation --sku Standard_D4ads_v6 --sku-family standardDadv6Family \
+    --vcpus 4 --amount-usd 25 --confirm-subscription "$SUB")
+  python3 - "$out" <<'PY' || fail "positive-control single reservation did not admit"
+import json
+import sys
+assert json.loads(sys.argv[1])["status"] == "reserved"
+PY
+  run_shape capacity-release \
+    --reservation-id azr-posctl000001 --fence-binding "$fence" \
+    --cleanup-receipt "$(printf posctl-cleanup | shasum -a 256 | awk '{print $1}')" \
+    --confirm-subscription "$SUB" >/dev/null
+
+  # The complete validation-heavy shape admits atomically: one reviewed
+  # eight-vCPU control cell plus eight four-vCPU shards across exact families.
+  shape_args=(
+    --shape-id shape-accept --fence-binding "$fence"
+    --constituent "reservation-id=azr-ctl000000001,role=validation,sku=Standard_D8as_v6,sku-family=standardDav6Family,vcpus=8,amount-usd=50"
+    --constituent "reservation-id=azr-shd000000001,role=validation,sku=Standard_D4as_v7,sku-family=StandardDasv7Family,vcpus=4,amount-usd=25"
+    --constituent "reservation-id=azr-shd000000002,role=validation,sku=Standard_D4as_v7,sku-family=StandardDasv7Family,vcpus=4,amount-usd=25"
+    --constituent "reservation-id=azr-shd000000003,role=validation,sku=Standard_D4s_v6,sku-family=StandardDsv6Family,vcpus=4,amount-usd=25"
+    --constituent "reservation-id=azr-shd000000004,role=validation,sku=Standard_D4s_v6,sku-family=StandardDsv6Family,vcpus=4,amount-usd=25"
+    --constituent "reservation-id=azr-shd000000005,role=validation,sku=Standard_D4ads_v7,sku-family=StandardDadsv7Family,vcpus=4,amount-usd=25"
+    --constituent "reservation-id=azr-shd000000006,role=validation,sku=Standard_D4ads_v7,sku-family=StandardDadsv7Family,vcpus=4,amount-usd=25"
+    --constituent "reservation-id=azr-shd000000007,role=validation,sku=Standard_E4as_v6,sku-family=standardEav6Family,vcpus=4,amount-usd=25"
+    --constituent "reservation-id=azr-shd000000008,role=validation,sku=Standard_E4as_v6,sku-family=standardEav6Family,vcpus=4,amount-usd=25"
+    --confirm-subscription "$SUB"
+  )
+  out=$(run_shape capacity-reserve-shape "${shape_args[@]}")
+  python3 - "$out" <<'PY' || fail "complete 40-vCPU shape did not admit atomically"
+import json
+import sys
+value = json.loads(sys.argv[1])
+assert value["status"] == "reserved"
+assert len(value["constituents"]) == 9
+assert all(item["status"] == "reserved" for item in value["constituents"])
+assert sum(item["vcpus"] for item in value["constituents"]) == 40
+PY
+  python3 - "$state_file" <<'PY' || fail "shape constituents were not durable"
+import json
+import sys
+state = json.load(open(sys.argv[1]))
+control = state["capacity_reservations"]["azr-ctl000000001"]
+assert control["status"] == "reserved" and control["vcpus"] == 8
+assert control["shape_id"] == "shape-accept"
+assert state["capacity_reservations"]["azr-shd000000008"]["status"] == "reserved"
+PY
+
+  # Repeating the exact shape is idempotent and never demotes reserved
+  # constituents.
+  out=$(run_shape capacity-reserve-shape "${shape_args[@]}")
+  python3 - "$out" <<'PY' || fail "exact shape retry was not idempotent"
+import json
+import sys
+value = json.loads(sys.argv[1])
+assert value["status"] == "reserved"
+assert all(item["status"] == "reserved" for item in value["constituents"])
+PY
+
+  # Child lineage: a runner re-admitting one exact constituent id must stay
+  # reserved without double-counting the shape's own capacity.
+  out=$(run_shape capacity-reserve \
+    --reservation-id azr-shd000000001 --fence-binding "$fence" \
+    --role validation --sku Standard_D4as_v7 --sku-family StandardDasv7Family \
+    --vcpus 4 --amount-usd 25 --confirm-subscription "$SUB")
+  python3 - "$out" <<'PY' || fail "child re-admission of a shape constituent failed"
+import json
+import sys
+assert json.loads(sys.argv[1])["status"] == "reserved"
+PY
+
+  # A changed identity for an existing constituent refuses.
+  if run_shape capacity-reserve-shape \
+      --shape-id shape-accept --fence-binding "$fence" \
+      --constituent "reservation-id=azr-ctl000000001,role=review,sku=Standard_D8as_v6,sku-family=standardDav6Family,vcpus=8,amount-usd=50" \
+      --confirm-subscription "$SUB" >/dev/null 2>&1; then
+    fail "conflicting shape constituent identity was accepted"
+  fi
+
+  # Budget pressure queues an additional shape without touching reserved work.
+  python3 - "$fixture" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+if path.exists():
+    state = json.loads(path.read_text())
+else:
+    state = {"workers": {}, "seen": {}, "calls": []}
+state["metrics"] = {"actual_usd": 1499.0, "forecast_usd": 1499.0}
+path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")))
+PY
+  release_receipt=$(printf shape-cleanup | shasum -a 256 | awk '{print $1}')
+  run_shape capacity-release \
+    --reservation-id azr-shd000000008 --fence-binding "$fence" \
+    --cleanup-receipt "$release_receipt" --confirm-subscription "$SUB" >/dev/null
+  out=$(run_shape capacity-reserve-shape \
+    --shape-id shape-budget --fence-binding "$fence" \
+    --constituent "reservation-id=azr-bgt000000001,role=review,sku=Standard_E4as_v6,sku-family=standardEav6Family,vcpus=4,amount-usd=25" \
+    --confirm-subscription "$SUB")
+  python3 - "$out" "$state_file" <<'PY' || fail "budget pressure did not queue the new shape"
+import json
+import sys
+value = json.loads(sys.argv[1])
+assert value["status"] == "queued" and "limit" in value["reason"]
+state = json.load(open(sys.argv[2]))
+assert state["capacity_reservations"]["azr-ctl000000001"]["status"] == "reserved"
+assert state["capacity_reservations"]["azr-shd000000008"]["status"] == "released"
+PY
+
+  # A released constituent identity can never re-enter a shape.
+  if run_shape capacity-reserve-shape \
+      --shape-id shape-reuse --fence-binding "$fence" \
+      --constituent "reservation-id=azr-shd000000008,role=validation,sku=Standard_E4as_v6,sku-family=standardEav6Family,vcpus=4,amount-usd=25" \
+      --confirm-subscription "$SUB" >/dev/null 2>&1; then
+    fail "released constituent identity was reused in a new shape"
+  fi
+  pass "complete specialized shapes admit atomically, queue on family or budget pressure, and never demote or reuse exact reservations"
+}
+
 restart_idempotency() {
   local tmp provider fixture home
   fm_test_tmproot_into tmp fm-worker-restart
@@ -1082,6 +1266,7 @@ classification_and_admission_matrix
 azure_provider_refusal_matrix
 end_to_end_lifecycle
 shared_specialized_cli
+shared_shape_cli
 restart_idempotency
 
 echo "# fm-worker-lifecycle.test.sh: all assertions passed"

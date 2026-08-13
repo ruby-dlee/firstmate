@@ -28,6 +28,7 @@
 #   fm-worker-lifecycle.sh request <exact identity flags> --eligible
 #   fm-worker-lifecycle.sh reconcile [--apply --confirm-subscription <uuid>]
 #   fm-worker-lifecycle.sh capacity-reserve <exact specialized reservation flags>
+#   fm-worker-lifecycle.sh capacity-reserve-shape <exact complete-shape constituents>
 #   fm-worker-lifecycle.sh capacity-release <exact fence and cleanup receipt>
 #   fm-worker-lifecycle.sh execute <exact assignment flags> -- <argv...>
 #   fm-worker-lifecycle.sh authority-receipt <exact assignment flags> --output <json>
@@ -44,7 +45,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 
 case "${1:-}" in
-  request|release|resume|steer|execute|authority-receipt|capacity-reserve|capacity-release)
+  request|release|resume|steer|execute|authority-receipt|capacity-reserve|capacity-reserve-shape|capacity-release)
     fm_refuse_if_gate_agent
     exec python3 "$SCRIPT_DIR/fm-worker-lifecycle.py" "$@"
     ;;

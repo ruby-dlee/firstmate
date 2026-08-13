@@ -38,6 +38,7 @@ EXECUTION_RESULT_SCHEMA = "fm.worker-execution-result/v1"
 RELEASE_SCHEMA = "fm.worker-release/v2"
 AUTHORITY_SCHEMA = "fm.worker-authority/v1"
 CAPACITY_RESERVATION_SCHEMA = "fm.capacity-reservation/v1"
+SPECIALIZED_WORKLOAD_ROLES = ("validation", "review", "browser", "networkless-verifier", "crosscheck")
 PROVIDER_REQUEST_SCHEMA = "fm.worker-provider-request/v1"
 PROVIDER_RESPONSE_SCHEMA = "fm.worker-provider-response/v1"
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
@@ -70,6 +71,18 @@ REVIEWED_SKU_FAMILY = {
     "Standard_D4ads_v6": "standardDadv6Family",
     "Standard_E4as_v7": "StandardEasv7Family",
     "Standard_E4as_v6": "standardEav6Family",
+}
+REVIEWED_CONTROL_SKU_FAMILY = {
+    "Standard_D8as_v6": "standardDav6Family",
+    "Standard_D8as_v7": "StandardDasv7Family",
+    "Standard_D8s_v6": "StandardDsv6Family",
+    "Standard_D8ads_v7": "StandardDadsv7Family",
+    "Standard_D8ds_v6": "StandardDdsv6Family",
+    "Standard_D8s_v7": "StandardDsv7Family",
+    "Standard_D8ds_v7": "StandardDdsv7Family",
+    "Standard_D8ads_v6": "standardDadv6Family",
+    "Standard_E8as_v7": "StandardEasv7Family",
+    "Standard_E8as_v6": "standardEav6Family",
 }
 SKU_PLAN = {
     1: ("Standard_D4as_v6", "standardDav6Family"),
@@ -295,16 +308,21 @@ def verify_state(env, state):
     if len(state["capacity_reservations"]) > 256:
         raise LifecycleError("shared capacity reservation history exceeds its durable bound")
     for reservation_id, reservation in state["capacity_reservations"].items():
+        if not isinstance(reservation, dict):
+            raise LifecycleError("durable specialized capacity reservation is malformed")
+        if reservation.get("vcpus") == 4:
+            reviewed_family = REVIEWED_SKU_FAMILY.get(reservation.get("sku"))
+        elif reservation.get("vcpus") == 8:
+            reviewed_family = REVIEWED_CONTROL_SKU_FAMILY.get(reservation.get("sku"))
+        else:
+            reviewed_family = None
         if (
-            not isinstance(reservation, dict)
-            or reservation_id != reservation.get("reservation_id")
+            reservation_id != reservation.get("reservation_id")
             or reservation.get("schema") != CAPACITY_RESERVATION_SCHEMA
             or reservation.get("role") != "specialized"
             or reservation.get("status") not in ("queued", "reserved", "released")
-            or reservation.get("sku") not in REVIEWED_SKU_FAMILY
-            or str(reservation.get("sku_family", "")).lower()
-            != REVIEWED_SKU_FAMILY[reservation["sku"]].lower()
-            or reservation.get("vcpus") != 4
+            or reviewed_family is None
+            or str(reservation.get("sku_family", "")).lower() != reviewed_family.lower()
             or isinstance(reservation.get("amount_usd"), bool)
             or not isinstance(reservation.get("amount_usd"), (int, float))
             or not math.isfinite(float(reservation["amount_usd"]))
@@ -313,6 +331,8 @@ def verify_state(env, state):
             raise LifecycleError("durable specialized capacity reservation is malformed")
         require_id("capacity reservation id", reservation_id)
         require_binding("capacity reservation fence", reservation.get("fence_binding"))
+        if "shape_id" in reservation:
+            require_id("capacity shape id", reservation.get("shape_id"))
     if state.get("pending_action") is not None and not isinstance(state["pending_action"], dict):
         raise LifecycleError("pending provider action is malformed")
 
@@ -642,14 +662,23 @@ def active_count(state, inventory):
     return count
 
 
+def ignored_reservation_ids(ignore_reservation_id):
+    if ignore_reservation_id is None:
+        return frozenset()
+    if isinstance(ignore_reservation_id, str):
+        return frozenset((ignore_reservation_id,))
+    return frozenset(ignore_reservation_id)
+
+
 def merged_specialized_reservations(state, inventory, ignore_reservation_id=None):
+    ignored = ignored_reservation_ids(ignore_reservation_id)
     merged = {}
     for reservation in inventory.get("capacity_reservations", []):
-        if reservation["reservation_id"] == ignore_reservation_id:
+        if reservation["reservation_id"] in ignored:
             continue
         merged[reservation["reservation_id"]] = dict(reservation)
     for reservation_id, local in state.get("capacity_reservations", {}).items():
-        if reservation_id == ignore_reservation_id or local.get("status") != "reserved":
+        if reservation_id in ignored or local.get("status") != "reserved":
             continue
         current = merged.get(reservation_id)
         identity_fields = ("role", "sku", "sku_family", "vcpus", "amount_usd")
@@ -1411,15 +1440,26 @@ def parser():
     capacity = sub.add_parser("capacity-reserve", help="queue and admit one specialized Azure reservation")
     capacity.add_argument("--reservation-id", required=True)
     capacity.add_argument("--fence-binding", required=True)
-    capacity.add_argument("--role", choices=(
-        "validation", "review", "browser", "networkless-verifier", "crosscheck"
-    ), required=True)
+    capacity.add_argument("--role", choices=SPECIALIZED_WORKLOAD_ROLES, required=True)
     capacity.add_argument("--sku", required=True)
     capacity.add_argument("--sku-family", required=True)
     capacity.add_argument("--vcpus", type=int, required=True)
     capacity.add_argument("--amount-usd", type=float, required=True)
     capacity.add_argument("--required", action="store_true")
     capacity.add_argument("--confirm-subscription", required=True)
+
+    shape = sub.add_parser(
+        "capacity-reserve-shape",
+        help="atomically queue and admit one complete specialized shape of exact constituents",
+    )
+    shape.add_argument("--shape-id", required=True)
+    shape.add_argument("--fence-binding", required=True)
+    shape.add_argument(
+        "--constituent", action="append", required=True, metavar="SPEC",
+        help="reservation-id=...,role=...,sku=...,sku-family=...,vcpus=...,amount-usd=...",
+    )
+    shape.add_argument("--required", action="store_true")
+    shape.add_argument("--confirm-subscription", required=True)
 
     capacity_release = sub.add_parser(
         "capacity-release", help="release one exact specialized reservation after zero-compute proof"
@@ -1611,27 +1651,35 @@ def command_reconcile(env, args):
         print_status(status, False)
 
 
-def specialized_reservation_from_args(args):
-    reservation_id = require_id("capacity reservation id", args.reservation_id)
-    fence = require_binding("capacity reservation fence", args.fence_binding)
-    canonical_family = REVIEWED_SKU_FAMILY.get(args.sku)
-    if canonical_family is None or canonical_family.lower() != args.sku_family.lower():
-        raise LifecycleError("specialized reservation SKU and exact family are not reviewed together")
-    if args.vcpus != 4:
-        raise LifecycleError("specialized reservation must use the reviewed four-vCPU shape")
-    if not math.isfinite(args.amount_usd) or args.amount_usd <= 0:
+def specialized_reservation_item(
+    reservation_id, fence_binding, workload_role, sku, sku_family, vcpus,
+    amount_usd, discretionary, shape_id=None,
+):
+    reservation_id = require_id("capacity reservation id", reservation_id)
+    fence = require_binding("capacity reservation fence", fence_binding)
+    if vcpus == 4:
+        canonical_family = REVIEWED_SKU_FAMILY.get(sku)
+    elif vcpus == 8:
+        canonical_family = REVIEWED_CONTROL_SKU_FAMILY.get(sku)
+    else:
+        canonical_family = None
+    if canonical_family is None or canonical_family.lower() != sku_family.lower():
+        raise LifecycleError(
+            "specialized reservation SKU, exact family, and reviewed four- or eight-vCPU shape must match together"
+        )
+    if not math.isfinite(amount_usd) or amount_usd <= 0:
         raise LifecycleError("specialized reservation cost must be finite and positive")
-    return {
+    item = {
         "schema": CAPACITY_RESERVATION_SCHEMA,
         "reservation_id": reservation_id,
         "fence_binding": fence,
         "role": "specialized",
-        "workload_role": args.role,
-        "sku": args.sku,
+        "workload_role": workload_role,
+        "sku": sku,
         "sku_family": canonical_family,
-        "vcpus": args.vcpus,
-        "amount_usd": round(args.amount_usd, 6),
-        "discretionary": not args.required,
+        "vcpus": vcpus,
+        "amount_usd": round(amount_usd, 6),
+        "discretionary": discretionary,
         "status": "queued",
         "queued_at": iso_utc(),
         "reserved_at": None,
@@ -1639,6 +1687,16 @@ def specialized_reservation_from_args(args):
         "cleanup_receipt": None,
         "last_refusal": None,
     }
+    if shape_id is not None:
+        item["shape_id"] = shape_id
+    return item
+
+
+def specialized_reservation_from_args(args):
+    return specialized_reservation_item(
+        args.reservation_id, args.fence_binding, args.role, args.sku,
+        args.sku_family, args.vcpus, args.amount_usd, not args.required,
+    )
 
 
 def command_capacity_reserve(env, args):
@@ -1690,6 +1748,132 @@ def command_capacity_reserve(env, args):
         "reservation_id": reservation_id,
         "status": candidate["status"],
         "reason": "" if admitted else reason,
+        "actual_usd": actual,
+        "forecast_usd": forecast,
+        "admission_limit_usd": budget_limit(env),
+    }, sort_keys=True, separators=(",", ":")))
+
+
+def parse_shape_constituent(spec):
+    fields = {}
+    for part in spec.split(","):
+        if "=" not in part:
+            raise LifecycleError("shape constituent entries must be key=value pairs")
+        key, value = part.split("=", 1)
+        fields[key.strip()] = value.strip()
+    required = {"reservation-id", "role", "sku", "sku-family", "vcpus", "amount-usd"}
+    missing = sorted(required - set(fields))
+    extra = sorted(set(fields) - required)
+    if missing or extra:
+        raise LifecycleError(
+            "shape constituent fields are not exact (missing: {}; unexpected: {})".format(
+                ",".join(missing) or "none", ",".join(extra) or "none"
+            )
+        )
+    if fields["role"] not in SPECIALIZED_WORKLOAD_ROLES:
+        raise LifecycleError("shape constituent role is not a reviewed specialized workload role")
+    try:
+        fields["vcpus"] = int(fields["vcpus"])
+        fields["amount-usd"] = float(fields["amount-usd"])
+    except ValueError:
+        raise LifecycleError("shape constituent vcpus and amount-usd must be numeric")
+    return fields
+
+
+def command_capacity_reserve_shape(env, args):
+    if args.confirm_subscription != env["subscription"]:
+        raise LifecycleError("--confirm-subscription must exactly match FM_AZURE_SUBSCRIPTION_ID")
+    shape_id = require_id("capacity shape id", args.shape_id)
+    constituents = []
+    seen_ids = set()
+    for spec in args.constituent:
+        fields = parse_shape_constituent(spec)
+        candidate = specialized_reservation_item(
+            fields["reservation-id"], args.fence_binding, fields["role"],
+            fields["sku"], fields["sku-family"], fields["vcpus"],
+            fields["amount-usd"], not args.required, shape_id=shape_id,
+        )
+        if candidate["reservation_id"] in seen_ids:
+            raise LifecycleError("shape constituent reservation ids must be distinct")
+        seen_ids.add(candidate["reservation_id"])
+        constituents.append(candidate)
+    if not constituents:
+        raise LifecycleError("a capacity shape needs at least one constituent")
+    if sum(item["vcpus"] for item in constituents) > SPECIALIZED_SHAPE_VCPUS:
+        raise LifecycleError("complete shape exceeds the shared 40-vCPU specialized envelope")
+    identity_fields = (
+        "schema", "reservation_id", "fence_binding", "role", "workload_role", "sku",
+        "sku_family", "vcpus", "amount_usd", "discretionary", "shape_id",
+    )
+    with controller_lock(env):
+        state = load_state(env)
+        entries = []
+        for candidate in constituents:
+            existing = state["capacity_reservations"].get(candidate["reservation_id"])
+            if existing is not None:
+                if any(existing.get(field) != candidate.get(field) for field in identity_fields):
+                    raise LifecycleError("capacity shape constituent already has a different exact identity")
+                if existing.get("status") == "released":
+                    raise LifecycleError("released capacity reservation identity cannot be reused")
+                entries.append(existing)
+            else:
+                state["capacity_reservations"][candidate["reservation_id"]] = candidate
+                entries.append(candidate)
+        save_state(env, state)
+        pending = [entry for entry in entries if entry.get("status") != "reserved"]
+        actual = None
+        forecast = None
+        reason = ""
+        admitted = True
+        if pending:
+            pending_ids = frozenset(entry["reservation_id"] for entry in pending)
+            try:
+                inventory = provider_call(env, "inventory")["inventory"]
+                state["last_metrics"] = metrics_from_inventory(inventory)
+                actual = inventory["metrics"].get("actual_usd")
+                forecast = inventory["metrics"].get("forecast_usd")
+                provisional = []
+                for entry in pending:
+                    admitted, reason = capacity_admission(
+                        env, state, inventory, entry, provisional,
+                        ignore_reservation_id=pending_ids,
+                    )
+                    if not admitted:
+                        break
+                    provisional.append(entry)
+            except LifecycleError as exc:
+                admitted, reason = False, str(exc)
+            now = iso_utc()
+            if admitted:
+                for entry in pending:
+                    entry["status"] = "reserved"
+                    entry["reserved_at"] = entry.get("reserved_at") or now
+                    entry["last_refusal"] = None
+            else:
+                # All-or-nothing: constituents that are not yet reserved stay queued;
+                # already reserved constituents are never demoted by a shape retry.
+                for entry in pending:
+                    entry["status"] = "queued"
+                    entry["last_refusal"] = {"at": now, "reason": reason[:500]}
+        save_state(env, state)
+        shape_status = "reserved" if all(
+            entry.get("status") == "reserved" for entry in entries
+        ) else "queued"
+    print(json.dumps({
+        "shape_id": shape_id,
+        "status": shape_status,
+        "reason": "" if shape_status == "reserved" else reason,
+        "constituents": [
+            {
+                "reservation_id": entry["reservation_id"],
+                "status": entry["status"],
+                "sku": entry["sku"],
+                "sku_family": entry["sku_family"],
+                "vcpus": entry["vcpus"],
+                "amount_usd": entry["amount_usd"],
+            }
+            for entry in entries
+        ],
         "actual_usd": actual,
         "forecast_usd": forecast,
         "admission_limit_usd": budget_limit(env),
@@ -1948,6 +2132,8 @@ def main(argv=None):
         command_request(env, args)
     elif args.command == "capacity-reserve":
         command_capacity_reserve(env, args)
+    elif args.command == "capacity-reserve-shape":
+        command_capacity_reserve_shape(env, args)
     elif args.command == "capacity-release":
         command_capacity_release(env, args)
     elif args.command == "execute":

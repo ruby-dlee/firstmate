@@ -53,10 +53,14 @@ It does not bypass unreadable cost or quota evidence, identity checks, the sixte
 
 ## Desired capacity and admission
 
-The same durable allocator also owns specialized reservations through `capacity-reserve` and `capacity-release`.
+The same durable allocator also owns specialized reservations through `capacity-reserve`, `capacity-reserve-shape`, and `capacity-release`.
 Every caller uses the canonical Firstmate control home and its one shared state directory; `FM_AZURE_SHARED_CAPACITY_STATE_DIR` may relocate that directory only for an explicitly configured installation and must be identical for all callers.
-A validation, review, browser, networkless-verifier, or Crosscheck caller submits one exact reservation ID and fence binding, reviewed SKU/family pair, four-vCPU shape, and finite worst-case cost before creating compute.
+A validation, review, browser, networkless-verifier, or Crosscheck caller submits one exact reservation ID and fence binding, a reviewed SKU/family pair, the reviewed four-vCPU worker shape or reviewed eight-vCPU control shape, and finite worst-case cost before creating compute.
 Admission returns `reserved` or leaves the request durably `queued`; callers must not create compute for a queued reservation.
+A consumer that needs a complete multi-machine specialized shape, such as one eight-vCPU control cell plus eight four-vCPU shards, reserves it atomically through `capacity-reserve-shape` with every exact constituent reservation ID, workload role, SKU, family, vCPU count, and cost named in one call.
+Shape admission is all-or-nothing under one lock and one inventory read: if any constituent fails regional, exact-family, specialized-envelope, or budget admission, no new constituent is reserved and the complete shape stays durably queued with the exact refusal.
+A shape retry never demotes constituents that are already reserved, and each constituent then behaves as one ordinary shared reservation: a child runner re-admits the same reservation ID idempotently to prove lineage without double-counting, and `capacity-release` frees each constituent only with its exact fence and zero-compute cleanup receipt.
+The complete shape total may never exceed the shared 40-vCPU specialized envelope, and no shape or constituent bypasses cumulative actual/forecast admission in commissioning mode.
 The existing disposable runner invokes this path before its Azure management reservation and VM creation, then releases the shared reservation only after exact VM/NIC/OS-disk absence.
 Restarting either controller is idempotent under the same reservation ID and fence, while a changed identity refuses.
 

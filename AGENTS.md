@@ -242,7 +242,8 @@ An explicit per-spawn harness still overrides either kind, and every secondmate 
 
 Per-task mechanics live in `bin/fm-spawn.sh`, the primary-session turn-end guard lives in `docs/turnend-guard.md`, and supervision knowledge lives in `harness-adapters`.
 **Never dispatch a crewmate or secondmate on an unverified adapter.**
-Validate every selected harness against the verified list above; if a dispatch rule, default, `config/crew-harness`, or `config/secondmate-harness` names an unverified one, ignore it, note or tell the captain when it affects dispatch, and fall back through the remaining precedence to your own harness.
+Validate every selected harness against the verified list above; if a dispatch rule or default names an unverified one, ignore it, fall back through the remaining precedence, and note the problem when it affects dispatch.
+If `config/crew-harness` or `config/secondmate-harness` names an unverified one, tell the captain and fall back to your own harness until it is verified.
 If the captain asks for a new harness, load `harness-adapters`, verify it empirically with a trivial supervised task, then commit the script and knowledge changes.
 Load `harness-adapters` before any spawn, recovery, trust-dialog handling, harness-specific skill invocation, interrupt, exit, resume, or adapter verification.
 

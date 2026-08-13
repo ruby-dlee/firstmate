@@ -47,7 +47,6 @@ NM_RUN_ID = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
 RUNNER_INVOCATION = re.compile(r"^azr-[a-z0-9]{12}(?:-a[2-9][0-9]*)?$")
 LOCAL_TIMEOUT = 300
 REGIONAL_ADMISSION_CEILING_VCPUS = 128
-MONTHLY_VALIDATION_HOURS = 400.0
 BUDGET_TARGET_USD = 1000.0
 BUDGET_CEILING_USD = 1500.0
 MAX_CELL_LIFETIME_HOURS = 24
@@ -55,14 +54,17 @@ FOUNDATION_METER_RESERVE_USD = 210.0
 VALIDATION_METER_RESERVE_USD = 80.0
 BLOB_DATA_CONTRIBUTOR_ROLE = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
 
-# Validation deliberately uses v5 quota families rather than the v6/v7 mixed
-# author plan. Live SKU, family, quota, and retail evidence is re-read before
-# every allocation; this list is an allowlist, not a capacity claim.
+# Control cells use the allocator's reviewed eight-vCPU control lane inside
+# the same unrestricted v6 families as the fleet; the old v5 candidates are
+# NotAvailableForSubscription in East US and their family collides with the
+# pilot supervisor. Live SKU, capability, and retail evidence is re-read
+# before every allocation; family and regional capacity are adjudicated only
+# by the shared allocator's atomic shape admission.
 VALIDATION_SKUS = (
-    "Standard_D8as_v5",
-    "Standard_D8s_v5",
-    "Standard_D8ads_v5",
-    "Standard_D8ds_v5",
+    "Standard_D8as_v6",
+    "Standard_D8s_v6",
+    "Standard_D8ads_v6",
+    "Standard_D8ds_v6",
 )
 
 RESOURCE_CLASSES = {
@@ -211,9 +213,6 @@ def environment(require_cloud=False):
         "state_dir": state_dir,
         "queue_limit": bounded_int("FM_AZURE_VALIDATION_QUEUE_LIMIT", 128, 1, 1000),
         "max_active": bounded_int("FM_AZURE_VALIDATION_MAX_ACTIVE", 8, 1, 8),
-        "monthly_hours": bounded_float(
-            "FM_AZURE_VALIDATION_MONTHLY_HOURS", MONTHLY_VALIDATION_HOURS, 1.0, 10000.0
-        ),
         "budget_limit": bounded_float(
             "FM_AZURE_VALIDATION_BUDGET_LIMIT_USD", BUDGET_TARGET_USD,
             BUDGET_TARGET_USD, BUDGET_CEILING_USD,
@@ -803,6 +802,18 @@ def scope_gate(env):
 
 
 def foundation_gate(env):
+    # The released runner owns the exact private-foundation contract: the
+    # complete 29-resource inventory, controller-UAMI classification, private
+    # endpoints, DNS, NAT, NSGs, and zero-RBAC reservation identities. The
+    # validation dispatcher consumes that released proof instead of keeping a
+    # partial parallel one, then re-proves only its own cell subnet below.
+    runner = runner_module()
+    try:
+        runner_env = runner.environment()
+        runner.scope_gate(runner_env)
+        runner.foundation_gate(runner_env)
+    except runner.RunnerError as exc:
+        raise ValidationError("released foundation contract refused: {}".format(exc))
     storage, _, _ = az_command(env, [
         "storage", "account", "show", "--resource-group", env["resource_group"],
         "--name", env["storage"],
@@ -853,75 +864,20 @@ def foundation_gate(env):
         raise ValidationError("validation-cell subnet private NSG/NAT/address contract is not exact")
 
 
-def active_inventory(env):
-    vms, _, _ = az_command(env, [
-        "vm", "list", "--resource-group", env["resource_group"], "--show-details",
-    ])
-    records = []
-    for vm in vms:
-        tags = vm.get("tags") or {}
-        role = tags.get("firstmate-role")
-        if role not in ("validation-cell", "validation-shard", "worker", "supervisor"):
-            continue
-        if (
-            tags.get("workload") != "firstmate"
-            or tags.get("deployment-generation") != env["deployment_generation"]
-            or tags.get("cleanup-owner") != env["owner"]
-        ):
-            raise ValidationError("active Firstmate VM has foreign owner or deployment-generation tags")
-        if "deallocated" in str(vm.get("powerState", "")).lower():
-            continue
-        defaults = {"validation-shard": 4, "worker": 4, "supervisor": 2, "validation-cell": 0}
-        try:
-            vcpus = int(tags.get("reserved-vcpus", str(defaults[role])))
-        except ValueError:
-            raise ValidationError("active Firstmate VM has malformed reserved-vcpus tag")
-        if vcpus <= 0:
-            raise ValidationError("active Firstmate VM lacks a positive processor reservation")
-        if role == "worker" and tags.get("resource-class") != "author-4vcpu-16gib-trustedlaunch":
-            raise ValidationError("active author worker differs from the general worker resource contract")
-        records.append({
-            "id": vm.get("id"), "role": role, "vcpus": vcpus,
-            "family": tags.get("sku-family"), "cell": tags.get("validation-cell"),
-            "selected_sku": tags.get("selected-sku"),
-            "capacity_parent": tags.get("capacity-parent"),
-        })
-    return records
 
 
-def usage_map(env):
-    usage, _, _ = az_command(env, ["vm", "list-usage", "--location", "eastus"])
-    values = {}
-    for item in usage:
-        name = str((item.get("name") or {}).get("value", "")).lower()
-        values[name] = {
-            "limit": int(item.get("limit", 0)),
-            "used": int(item.get("currentValue", 0)),
-        }
-    return values
+def sku_candidates(env, required_vcpus, required_memory):
+    """Select a reviewed, live-capable control SKU.
 
-
-def sku_candidates(env, required_vcpus, required_memory, inventory):
+    Selection proves only existence, restriction-freedom, capability, zonal
+    coverage, and rate; every capacity and family-headroom decision belongs to
+    the released shared allocator's atomic shape admission.
+    """
     skus, _, _ = az_command(env, [
         "vm", "list-skus", "--location", "eastus", "--resource-type", "virtualMachines", "--all",
     ])
-    usage = usage_map(env)
     candidates = []
     by_name = {item.get("name"): item for item in skus}
-    author_families = {
-        item["family"].lower()
-        for item in inventory
-        if item["role"] == "worker" and item.get("family")
-    }
-    for record in inventory:
-        if record["role"] != "worker" or not record.get("selected_sku"):
-            continue
-        sku_record = by_name.get(record["selected_sku"]) or {}
-        capabilities = {entry.get("name"): entry.get("value") for entry in sku_record.get("capabilities", [])}
-        family = str(sku_record.get("family") or capabilities.get("Family") or "")
-        if not family:
-            raise ValidationError("active author worker SKU family is unreadable")
-        author_families.add(family.lower())
     requested = os.environ.get("FM_AZURE_VALIDATION_SKU")
     names = (requested,) if requested else VALIDATION_SKUS
     for name in names:
@@ -932,7 +888,7 @@ def sku_candidates(env, required_vcpus, required_memory, inventory):
             continue
         capabilities = {entry.get("name"): entry.get("value") for entry in item.get("capabilities", [])}
         family = str(item.get("family") or capabilities.get("Family") or "")
-        if not family or family.lower() in author_families:
+        if not family:
             continue
         try:
             vcpus = int(capabilities.get("vCPUsAvailable", capabilities.get("vCPUs", "0")))
@@ -949,15 +905,137 @@ def sku_candidates(env, required_vcpus, required_memory, inventory):
             or not {"1", "2", "3"}.issubset(zones)
         ):
             continue
-        family_usage = usage.get(family.lower(), {"limit": 0, "used": 0})
-        free = family_usage["limit"] - family_usage["used"]
-        if free < required_vcpus:
-            continue
         rate = retail_rate(env, name)
-        candidates.append({"sku": name, "family": family, "vcpus": vcpus, "memory_gib": memory, "family_free": free, "rate": rate})
+        candidates.append({"sku": name, "family": family, "vcpus": vcpus, "memory_gib": memory, "rate": rate})
     if not candidates:
-        raise ValidationError("no reviewed validation family has separate live 8-vCPU/32-GiB quota headroom")
+        raise ValidationError("no reviewed validation control SKU is live, unrestricted, and capability-complete")
     return sorted(candidates, key=lambda item: (item["rate"], item["sku"]))
+
+
+_RUNNER_MODULE = None
+
+
+def runner_module():
+    global _RUNNER_MODULE
+    if _RUNNER_MODULE is None:
+        spec = importlib.util.spec_from_file_location(
+            "azure_runner_module", str(ROOT / "bin" / "fm-azure-runner.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _RUNNER_MODULE = module
+    return _RUNNER_MODULE
+
+
+def lifecycle_command(env, arguments):
+    command_env = os.environ.copy()
+    command_env["FM_HOME"] = str(ROOT)
+    executable = os.environ.get(
+        "FM_AZURE_VALIDATION_LIFECYCLE", str(ROOT / "bin" / "fm-worker-lifecycle.sh")
+    )
+    result = run([executable] + arguments, check=False, env=command_env)
+    return result
+
+
+def compose_shard_plan(selected_family, shards, rate_lookup):
+    """Compose the exact shard constituents beside one selected control family.
+
+    Pure beside the injected rate lookup: shards avoid the control family so
+    the complete shape fits exact 10-vCPU families, ids are distinct so child
+    runners re-admit their own constituent, and every amount is a cushioned
+    worst-case bound at or above the child's exact first-day cost.
+    """
+    runner = runner_module()
+    shard_skus = [
+        sku for sku in RUNNER_SHARD_SKUS
+        if runner.SKU_FAMILY[sku].lower() != str(selected_family).lower()
+    ]
+    if not shard_skus:
+        raise ValidationError("no reviewed shard family remains beside the selected control family")
+    plan = []
+    for shard in range(1, int(shards) + 1):
+        sku = shard_skus[(shard - 1) % len(shard_skus)]
+        plan.append({
+            "shard": shard,
+            "invocation": "azr-" + uuid.uuid4().hex[:12],
+            "sku": sku,
+            "sku_family": runner.SKU_FAMILY[sku],
+            "amount_usd": round(float(rate_lookup(sku)) * 24.0 * 1.5 + 5.0, 6),
+        })
+    return plan
+
+
+def shared_shape_reserve(env, state, selected):
+    """Atomically reserve the complete control-plus-shards specialized shape.
+
+    The released whole-fleet allocator is the single capacity authority: the
+    complete maximum shape (one reviewed eight-vCPU control cell plus one
+    four-vCPU constituent per behavior shard) is admitted all-or-nothing with
+    exact constituent SKU, family, vCPU, and cushioned worst-case cost
+    identities. Child runners later re-admit their exact pre-reserved
+    constituent ids idempotently, so live shards are never double-counted.
+    """
+    request = state["request"]
+    limits = request["limits"]
+    fence = request["fence"].split(":", 1)[-1]
+    shards = int(limits["behavior_shards"])
+    runner = runner_module()
+    admission = state.get("admission") or {}
+    shard_plan = admission.get("shard_plan")
+    if not shard_plan:
+        shard_plan = compose_shard_plan(
+            selected["family"], shards, lambda sku: retail_rate(env, sku)
+        )
+    control_amount = round(selected["rate"] * 24.0 * 1.5 + 5.0, 6)
+    arguments = [
+        "capacity-reserve-shape",
+        "--shape-id", state["cell"],
+        "--fence-binding", fence,
+        "--confirm-subscription", env["subscription"],
+        "--constituent",
+        "reservation-id={},role=validation,sku={},sku-family={},vcpus=8,amount-usd={}".format(
+            state["cell"], selected["sku"], selected["family"], control_amount
+        ),
+    ]
+    for entry in shard_plan:
+        arguments += [
+            "--constituent",
+            "reservation-id={},role=validation,sku={},sku-family={},vcpus=4,amount-usd={}".format(
+                entry["invocation"], entry["sku"], entry["sku_family"], entry["amount_usd"]
+            ),
+        ]
+    result = lifecycle_command(env, arguments)
+    if result.returncode != 0:
+        raise ValidationError("shared allocator shape reservation failed: {}".format(
+            (result.stderr or result.stdout or "").strip()[-500:]
+        ))
+    try:
+        shape = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        raise ValidationError("shared allocator returned a malformed shape reservation")
+    if shape.get("shape_id") != state["cell"] or shape.get("status") not in ("reserved", "queued"):
+        raise ValidationError("shared allocator returned a shape with the wrong identity")
+    shape["shard_plan"] = shard_plan
+    shape["control_amount_usd"] = control_amount
+    return shape
+
+
+def release_shape_constituent(env, state, reservation_id, evidence):
+    receipt = hashlib.sha256(json.dumps(
+        {"cell": state["cell"], "reservation": reservation_id, "evidence": evidence},
+        sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    result = lifecycle_command(env, [
+        "capacity-release",
+        "--reservation-id", reservation_id,
+        "--fence-binding", state["request"]["fence"].split(":", 1)[-1],
+        "--cleanup-receipt", receipt,
+        "--confirm-subscription", env["subscription"],
+    ])
+    if result.returncode != 0:
+        raise ValidationError("shared capacity release refused for {}: {}".format(
+            reservation_id, (result.stderr or result.stdout or "").strip()[-400:]
+        ))
 
 
 def retail_rate(env, sku):
@@ -981,114 +1059,8 @@ def retail_rate(env, sku):
     return min(rates)
 
 
-def cost_query(env, forecast=False):
-    endpoint = "forecast" if forecast else "query"
-    url = "https://management.azure.com/subscriptions/{}/providers/Microsoft.CostManagement/{}?api-version=2023-11-01".format(
-        env["subscription"], endpoint
-    )
-    body = {
-        "type": "Usage",
-        "timeframe": "MonthToDate",
-        "dataset": {
-            "granularity": "None",
-            "aggregation": {"totalCost": {"name": "PreTaxCost", "function": "Sum"}},
-            "filter": {"dimensions": {"name": "ResourceGroupName", "operator": "In", "values": [env["resource_group"]]}},
-        },
-    }
-    if forecast:
-        today = now_utc().date()
-        start = today.replace(day=1)
-        end = start.replace(year=start.year + 1, month=1) if start.month == 12 else start.replace(month=start.month + 1)
-        body["timeframe"] = "Custom"
-        body["timePeriod"] = {
-            "from": start.isoformat() + "T00:00:00Z",
-            "to": end.isoformat() + "T00:00:00Z",
-        }
-    path = write_private_json(env, ".cost-", body)
-    try:
-        result, _, _ = az_command(env, ["rest", "--method", "post", "--url", url, "--body", "@" + str(path)])
-    finally:
-        path.unlink(missing_ok=True)
-    properties = result.get("properties", result)
-    rows = properties.get("rows", [])
-    if not rows:
-        return 0.0
-    names = [column.get("name") for column in properties.get("columns", [])]
-    index = names.index("PreTaxCost") if "PreTaxCost" in names else 0
-    try:
-        return float(rows[0][index])
-    except (IndexError, TypeError, ValueError):
-        raise ValidationError("Azure cost response has no readable PreTaxCost")
 
 
-def consumed_hours(env):
-    total = 0.0
-    month = now_utc().strftime("%Y-%m")
-    for path in env["state_dir"].glob("azv-*.json"):
-        with contextlib.suppress(OSError, json.JSONDecodeError, TypeError, ValueError):
-            state = json.loads(path.read_text(encoding="utf-8"))
-            if str(state.get("started_at", "")).startswith(month):
-                total += float(state.get("billable_seconds", 0)) / 3600.0
-                if state.get("phase") in ("starting", "running", "needs-decision", "reattaching"):
-                    started = parse_utc(state["started_at"], "start")
-                    total += max(0.0, (now_utc() - started).total_seconds() / 3600.0)
-    return total
-
-
-def shared_capacity_demand(inventory, request):
-    active_cells = [item for item in inventory if item["role"] == "validation-cell"]
-    active_cell_ids = {item.get("cell") for item in active_cells if item.get("cell")}
-    review_vcpus = sum(item["vcpus"] for item in active_cells)
-    review_vcpus += sum(
-        item["vcpus"]
-        for item in inventory
-        if item["role"] == "validation-shard" and item.get("capacity_parent") not in active_cell_ids
-    )
-    author_vcpus = sum(item["vcpus"] for item in inventory if item["role"] == "worker")
-    supervisor_vcpus = sum(item["vcpus"] for item in inventory if item["role"] == "supervisor")
-    cell_vcpus = int(request["limits"]["vcpus"])
-    requested_vcpus = int(request["limits"].get(
-        "reserved_vcpus", cell_vcpus + int(request["limits"].get("behavior_shards", 0)) * 4
-    ))
-    active_vcpus = author_vcpus + review_vcpus + supervisor_vcpus
-    return {
-        "ceiling_vcpus": REGIONAL_ADMISSION_CEILING_VCPUS,
-        "author_vcpus": author_vcpus,
-        "review_vcpus": review_vcpus,
-        "supervisor_vcpus": supervisor_vcpus,
-        "requested_review_vcpus": requested_vcpus,
-        "active_vcpus": active_vcpus,
-        "post_admission_vcpus": active_vcpus + requested_vcpus,
-    }
-
-
-def admission_decision(policy, inventory, quota, actual, forecast, rate, used_hours, request):
-    active_cells = [item for item in inventory if item["role"] == "validation-cell"]
-    demand = shared_capacity_demand(inventory, request)
-    cell_vcpus = int(request["limits"]["vcpus"])
-    requested = demand["requested_review_vcpus"]
-    if len(active_cells) >= policy["max_active"]:
-        return False, "active validation-cell ceiling reached"
-    if demand["post_admission_vcpus"] > REGIONAL_ADMISSION_CEILING_VCPUS:
-        return False, "shared East US 128-vCPU author/review admission ceiling is saturated"
-    regional = quota.get("cores") or {"limit": 0, "used": 0}
-    if regional["limit"] < REGIONAL_ADMISSION_CEILING_VCPUS:
-        return False, "live regional quota is below the shared East US 128-vCPU admission ceiling"
-    if regional["limit"] - regional["used"] < requested:
-        return False, "live regional free quota cannot reserve the complete cell and shard shape"
-    family = quota.get(request["sku_family"].lower()) or {"limit": 0, "used": 0}
-    if family["limit"] - family["used"] < cell_vcpus:
-        return False, "selected validation family has insufficient free quota"
-    shard_count = int(request["limits"].get("behavior_shards", 0))
-    worst_hours = used_hours + MAX_CELL_LIFETIME_HOURS * (1 + shard_count)
-    if worst_hours > policy["monthly_hours"]:
-        return False, "monthly validation worker-hour budget is saturated"
-    cell_compute = rate * MAX_CELL_LIFETIME_HOURS
-    shard_compute = 0.25 * shard_count * MAX_CELL_LIFETIME_HOURS
-    increment = FOUNDATION_METER_RESERVE_USD + VALIDATION_METER_RESERVE_USD + cell_compute + shard_compute
-    if max(actual + increment, forecast + increment) >= policy["budget_limit"]:
-        return False, "actual/forecast cost pressure stops new admission"
-    return True, "admitted"
 
 
 def ensure_secret_file(name):
@@ -1577,30 +1549,27 @@ def dispatch(env, args):
         with CloudAdmissionLease(env, state) as admission_lease:
             foundation_gate(env)
             verify_credential_disk(env, state)
-            inventory = active_inventory(env)
             limits = state["request"]["limits"]
-            selected = sku_candidates(env, limits["vcpus"], limits["memory_gib"], inventory)[0]
+            selected = sku_candidates(env, limits["vcpus"], limits["memory_gib"])[0]
             selected["owner"] = env["owner"]
-            allocation_request = dict(state["request"])
-            allocation_request["sku"] = selected["sku"]
-            allocation_request["sku_family"] = selected["family"]
-            quota = usage_map(env)
-            actual = cost_query(env, False)
-            forecast = cost_query(env, True)
-            admitted, reason = admission_decision(
-                env, inventory, quota, actual, forecast, selected["rate"], consumed_hours(env), allocation_request
-            )
-            if not admitted:
-                print("AZURE VALIDATION QUEUED cell={} reason={}".format(state["cell"], reason))
+            shape = shared_shape_reserve(env, state, selected)
+            if shape["status"] != "reserved":
+                state.setdefault("admission", {})["shard_plan"] = shape["shard_plan"]
+                state["admission"]["last_refusal"] = {"at": iso_utc(), "reason": shape.get("reason", "")[:400]}
+                save_state(env, state)
+                print("AZURE VALIDATION QUEUED cell={} reason={}".format(state["cell"], shape.get("reason", "")))
                 return
             state["allocation"] = {"sku": selected["sku"], "sku_family": selected["family"]}
             state["admission"] = {
                 "at": iso_utc(), "sku": selected["sku"], "sku_family": selected["family"],
-                "hourly_rate": selected["rate"], "actual_cost": actual, "forecast_cost": forecast,
-                "used_worker_hours": consumed_hours(env), "reason": reason,
-                "shared_capacity": shared_capacity_demand(inventory, allocation_request),
+                "hourly_rate": selected["rate"],
+                "actual_usd": shape.get("actual_usd"), "forecast_usd": shape.get("forecast_usd"),
+                "admission_limit_usd": shape.get("admission_limit_usd"),
+                "shape_id": state["cell"], "capacity_fence": state["request"]["fence"].split(":", 1)[-1],
+                "control_amount_usd": shape["control_amount_usd"],
+                "shard_plan": shape["shard_plan"],
             }
-            transition(env, state, "starting", "live quota, cost, queue, and shared author/review demand gates admitted")
+            transition(env, state, "starting", "shared allocator atomically reserved the complete specialized shape")
             admission_lease.renew_and_assert()
             create_cell(env, state, selected)
             admission_lease.assert_held()
@@ -2131,6 +2100,20 @@ def close(env, args):
             # current remote proof, CI green, and exact head confirmation.
             delete_resource(env, state, state["resources"]["worktree_disk_id"], "disk", recorded_key="worktree")
             delete_cell_storage_scope(env, state)
+            # Return the shared shape capacity: the control constituent after
+            # proven compute absence, plus any pre-reserved shard constituent
+            # whose child runner never started. Dispatched children release
+            # their own constituents through the runner's cleanup path.
+            admission = state.get("admission") or {}
+            if admission.get("shape_id"):
+                release_shape_constituent(env, state, state["cell"], "control-compute-absent")
+                dispatched = {
+                    record.get("invocation")
+                    for record in (state.get("shard_runs") or {}).values()
+                }
+                for entry in admission.get("shard_plan", []):
+                    if entry["invocation"] not in dispatched:
+                        release_shape_constituent(env, state, entry["invocation"], "shard-never-dispatched")
         except ValidationError as exc:
             transition(env, state, "cleanup-retained", "exact close was partial or ambiguous: {}".format(str(exc)[:300]))
             raise
@@ -2240,13 +2223,23 @@ def runner_state_dir(env):
     )).resolve()
 
 
-def prepare_shard_runner(env, state, blob, request, extracted, sku):
+def shard_plan_entry(state, shard):
+    plan = (state.get("admission") or {}).get("shard_plan") or []
+    for entry in plan:
+        if entry.get("shard") == shard:
+            return entry
+    raise ValidationError("shard {} has no pre-reserved shape constituent".format(shard))
+
+
+def prepare_shard_runner(env, state, blob, request, extracted, plan):
+    sku = plan["sku"]
     key = request["request_digest"]
     existing = state.setdefault("shard_runs", {}).get(key)
     if existing:
         expected = {
             "blob": blob,
             "sku": sku,
+            "invocation": plan["invocation"],
             "round": request["round"],
             "shard": request["shard"],
             "head": request["repository"]["head"],
@@ -2265,7 +2258,7 @@ def prepare_shard_runner(env, state, blob, request, extracted, sku):
         raise ValidationError("materialized shard tree mismatch")
     public_remote = "https://github.com/{}.git".format(request["repository"]["slug"])
     git(repo, "remote", "set-url", "origin", public_remote)
-    invocation = "azr-" + uuid.uuid4().hex[:12]
+    invocation = plan["invocation"]
     record = {
         "blob": blob,
         "request_digest": key,
@@ -2314,6 +2307,7 @@ def run_shard_invocations(env, state, records):
                 "--resource-class", record["resource_class"],
                 "--capacity-parent", state["cell"],
                 "--capacity-reservation-vcpus", str(state["request"]["limits"]["reserved_vcpus"]),
+                "--capacity-fence", state["request"]["fence"].split(":", 1)[-1],
                 "--source-ref", record["source_ref"],
                 "--private-snapshot-bundle", record["snapshot_bundle"],
             ]
@@ -2480,8 +2474,8 @@ def drive(env, args):
                     extract_shard_request(archive, extracted)
                     request = json.loads((extracted / "request.json").read_text(encoding="utf-8"))
                     validate_shard_request(state, request, extracted / "snapshot.bundle", blob)
-                    sku = RUNNER_SHARD_SKUS[(int(request["shard"]) - 1) % len(RUNNER_SHARD_SKUS)]
-                    record = prepare_shard_runner(env, state, blob, request, extracted, sku)
+                    plan = shard_plan_entry(state, int(request["shard"]))
+                    record = prepare_shard_runner(env, state, blob, request, extracted, plan)
                     pending.append((request, record, request_root, response_blob))
             if pending:
                 run_shard_invocations(env, state, [item[1] for item in pending])
@@ -2560,12 +2554,17 @@ def status(env, args):
 def pure_check(args):
     value = json.loads(Path(args.fixture).read_text(encoding="utf-8"))
     operation = value.get("operation")
-    if operation == "admission":
-        allowed, reason = admission_decision(
-            value["policy"], value["inventory"], value["quota"], value["actual"],
-            value["forecast"], value["rate"], value["used_hours"], value["request"],
+    if operation == "shape-plan":
+        rates = value.get("rates") or {}
+        plan = compose_shard_plan(
+            value["selected_family"], value["behavior_shards"],
+            lambda sku: rates[sku],
         )
-        print(json.dumps({"allowed": allowed, "reason": reason}, sort_keys=True))
+        print(json.dumps({
+            "plan": plan,
+            "total_vcpus": 8 + 4 * len(plan),
+            "distinct_invocations": len({entry["invocation"] for entry in plan}),
+        }, sort_keys=True))
         return
     if operation == "result-identity":
         verify_result_identity(value["state"], value["result"])

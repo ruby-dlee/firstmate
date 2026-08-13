@@ -66,10 +66,10 @@
     "vmSize": {
       "type": "string",
       "allowedValues": [
-        "Standard_D8as_v5",
-        "Standard_D8s_v5",
-        "Standard_D8ads_v5",
-        "Standard_D8ds_v5"
+        "Standard_D8as_v6",
+        "Standard_D8s_v6",
+        "Standard_D8ads_v6",
+        "Standard_D8ds_v6"
       ]
     },
     "worktreeDiskGiB": {

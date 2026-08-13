@@ -110,17 +110,19 @@ assert schedule["properties"]["status"]=="Enabled"
 assert work["properties"]["networkAccessPolicy"]=="DenyAll"
 assert work["properties"]["publicNetworkAccess"]=="Disabled"
 assert template["parameters"]["vmSize"]["allowedValues"]==[
-    "Standard_D8as_v5","Standard_D8s_v5","Standard_D8ads_v5","Standard_D8ds_v5"
+    "Standard_D8as_v6","Standard_D8s_v6","Standard_D8ads_v6","Standard_D8ds_v6"
 ]
 assert identity["tags"].find("one-validation-container")!=-1
 host=Path(sys.argv[2]).read_text()
 guest=Path(sys.argv[3]).read_text()
 bridge=Path(sys.argv[4]).read_text()
 nm=Path(sys.argv[5]).read_text()
-for value in ("REGIONAL_ADMISSION_CEILING_VCPUS = 128","MONTHLY_VALIDATION_HOURS = 400.0","shared_capacity_demand","capacity_parent","reserved_vcpus","bin/fm-lint.sh && uv run --directory tools/agent-fleet --locked ruff check ."):
+for value in ("capacity-reserve-shape","compose_shard_plan","shared_shape_reserve","release_shape_constituent","capacity_parent","reserved_vcpus","--capacity-fence","bin/fm-lint.sh && uv run --directory tools/agent-fleet --locked ruff check ."):
     assert value in host
 assert "VALIDATION_RESERVED_VCPUS =" not in host
 assert "AUTHOR_RESERVED_VCPUS" not in host
+assert "def admission_decision" not in host
+assert "def shared_capacity_demand" not in host
 for value in ("MemoryMax","MemorySwapMax=0","TasksMax","CPUQuota=700%","PrivateTmp=yes","ProtectSystem=strict","CapabilityBoundingSet=","cryptsetup luksUUID","provider account-binding marker mismatch","credential disk content binding mismatch","FM_AZURE_VALIDATION_RUNTIME_PATH","axi status"):
     assert value in guest
 for value in ("fm.azure-validation-shard/v1","storage_token","vm_instance_id","boot_id","trusted_verify_manifests"):
@@ -283,70 +285,77 @@ PY
 admission_contract() {
   local tmp fixture out
   fm_test_tmproot_into tmp fm-azure-validation-admission
-  fixture="$tmp/admission.json"
+  fixture="$tmp/shape-plan.json"
   python3 - "$fixture" <<'PY'
 import json,sys
-request={"limits":{"vcpus":8,"behavior_shards":8,"reserved_vcpus":40},"sku_family":"standarddasv5family"}
-value={
- "operation":"admission",
- "policy":{"max_active":8,"monthly_hours":400.0,"budget_limit":1000.0},
- "inventory":[],
- "quota":{"cores":{"limit":128,"used":0},"standarddasv5family":{"limit":64,"used":0}},
- "actual":100.0,"forecast":200.0,"rate":0.35,"used_hours":10.0,"request":request,
+rates={
+ "Standard_D4as_v6":0.35,"Standard_D4as_v7":0.36,"Standard_D4s_v6":0.37,
+ "Standard_D4ads_v7":0.38,"Standard_D4ds_v6":0.39,"Standard_D4s_v7":0.40,
+ "Standard_D4ds_v7":0.41,"Standard_D4ads_v6":0.42,
 }
+value={"operation":"shape-plan","selected_family":"standardDav6Family","behavior_shards":8,"rates":rates}
 json.dump(value,open(sys.argv[1],"w"))
 PY
-  out=$(python3 "$HOST" pure-check --fixture "$fixture") || fail "positive admission fixture failed"
-  assert_contains "$out" '"allowed": true' "healthy admission did not pass"
-  python3 - "$fixture" <<'PY'
+  out=$(python3 "$HOST" pure-check --fixture "$fixture") || fail "shape plan fixture failed"
+  python3 - "$out" <<'PY' || fail "shape plan did not compose the exact allocator constituents"
 import json,sys
-p=sys.argv[1]; value=json.load(open(p)); value["inventory"]=[{"role":"validation-cell","vcpus":8} for _ in range(8)]; json.dump(value,open(p,"w"))
+value=json.loads(sys.argv[1])
+plan=value["plan"]
+assert value["total_vcpus"]==40
+assert value["distinct_invocations"]==8
+# The control family never hosts a shard: 8 + 4 would exceed its exact
+# 10-vCPU family allowance, so shards spread across the other families.
+assert all(entry["sku_family"].lower()!="standarddav6family" for entry in plan)
+assert all(entry["amount_usd"]>0 for entry in plan)
+assert [entry["shard"] for entry in plan]==list(range(1,9))
 PY
-  out=$(python3 "$HOST" pure-check --fixture "$fixture") || fail "saturation fixture command failed"
-  assert_contains "$out" '"allowed": false' "saturation was admitted"
-  assert_contains "$out" "active validation-cell ceiling" "saturation refusal did not preserve queue reason"
-  python3 - "$fixture" <<'PY'
-import json,sys
-p=sys.argv[1]; value=json.load(open(p)); value["inventory"]=[]; value["forecast"]=999.0; json.dump(value,open(p,"w"))
-PY
-  out=$(python3 "$HOST" pure-check --fixture "$fixture") || fail "cost-pressure fixture command failed"
-  assert_contains "$out" '"allowed": false' "cost pressure was admitted"
-  assert_contains "$out" "cost pressure stops new admission" "cost refusal did not name new admission only"
-  python3 - "$HOST" <<'PY' || fail "focused reservation/admission matrix failed"
-import importlib.util,sys
+  # The shared allocator is the only capacity authority: the dispatcher hands
+  # it the complete shape and honors reserved/queued verbatim, and its own
+  # parallel admission arithmetic is gone.
+  python3 - "$HOST" <<'PY' || fail "shape reservation authority is not the shared allocator"
+import importlib.util,json,os,sys,tempfile
 spec=importlib.util.spec_from_file_location("validation",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-policy={"max_active":8,"monthly_hours":400.0,"budget_limit":1000.0}
-quota={"cores":{"limit":128,"used":0},"family":{"limit":64,"used":0}}
-request={"limits":{"vcpus":8,"behavior_shards":8,"reserved_vcpus":40},"sku_family":"family"}
-def decide(inventory=None,q=None,hours=10,actual=100,forecast=200):
- return m.admission_decision(policy,inventory or [],q or quota,actual,forecast,.35,hours,request)
-supervisor={"role":"supervisor","vcpus":2}
-workers=[{"role":"worker","vcpus":4} for _ in range(16)]
-assert decide(workers+[supervisor])[0] is True
-# There is no fixed 64-vCPU author or validation partition: admission follows
-# current shared demand until the next complete shape would cross 128.
-assert decide([{"role":"worker","vcpus":4} for _ in range(21)]+[supervisor])[0] is True
-assert decide([{"role":"worker","vcpus":4} for _ in range(22)]+[supervisor])==(False,"shared East US 128-vCPU author/review admission ceiling is saturated")
-cell={"role":"validation-cell","vcpus":40,"cell":"azv-parent"}
-cell2={"role":"validation-cell","vcpus":40,"cell":"azv-parent2"}
-cell3={"role":"validation-cell","vcpus":40,"cell":"azv-parent3"}
-covered={"role":"validation-shard","vcpus":4,"capacity_parent":"azv-parent"}
-standalone={"role":"validation-shard","vcpus":4,"capacity_parent":"none"}
-assert m.shared_capacity_demand([cell,covered],request)["review_vcpus"]==40
-assert m.shared_capacity_demand([cell,standalone],request)["review_vcpus"]==44
-assert decide([cell,cell2])[0] is True
-assert decide([cell,cell2,cell3])==(False,"shared East US 128-vCPU author/review admission ceiling is saturated")
-small={"limits":{"vcpus":8,"behavior_shards":4,"reserved_vcpus":24},"sku_family":"family"}
-assert m.admission_decision(policy,[cell,covered],quota,100,200,.35,10,small)[0] is True
-assert decide(hours=200)==(False,"monthly validation worker-hour budget is saturated")
-regional_low={"cores":{"limit":127,"used":0},"family":{"limit":64,"used":0}}
-assert decide(q=regional_low)==(False,"live regional quota is below the shared East US 128-vCPU admission ceiling")
-regional={"cores":{"limit":128,"used":89},"family":{"limit":64,"used":0}}
-assert decide(q=regional)==(False,"live regional free quota cannot reserve the complete cell and shard shape")
-family={"cores":{"limit":128,"used":0},"family":{"limit":64,"used":57}}
-assert decide(q=family)==(False,"selected validation family has insufficient free quota")
+for name in ("admission_decision","shared_capacity_demand","usage_map","consumed_hours","cost_query","active_inventory"):
+    assert not hasattr(m,name), name+" still exists as a parallel capacity authority"
+stub_dir=tempfile.mkdtemp()
+stub=os.path.join(stub_dir,"lifecycle-stub.sh")
+capture=os.path.join(stub_dir,"arguments.txt")
+open(stub,"w").write("#!/bin/sh\nprintf '%s\\n' \"$@\" > "+capture+"\ncat "+os.path.join(stub_dir,"reply.json")+"\n")
+os.chmod(stub,0o755)
+reply={"shape_id":"azv-abcdefabcdef","status":"queued","reason":"complete shape exceeds free family capacity","constituents":[],"actual_usd":10.0,"forecast_usd":20.0,"admission_limit_usd":1500.0}
+open(os.path.join(stub_dir,"reply.json"),"w").write(json.dumps(reply))
+os.environ["FM_AZURE_VALIDATION_LIFECYCLE"]=stub
+env={"subscription":"5f0f9efb-723c-4bd8-a2e2-ba13625ea014"}
+plan=[{"shard":i,"invocation":"azr-%012d"%i,"sku":"Standard_D4as_v7","sku_family":"StandardDasv7Family","amount_usd":25.0} for i in range(1,9)]
+state={"cell":"azv-abcdefabcdef","request":{"fence":"f"*64,"limits":{"behavior_shards":8}},"admission":{"shard_plan":plan}}
+selected={"sku":"Standard_D8as_v6","family":"standardDav6Family","rate":0.7}
+shape=m.shared_shape_reserve(env,state,selected)
+assert shape["status"]=="queued" and "family" in shape["reason"]
+arguments=open(capture).read().splitlines()
+assert arguments[0]=="capacity-reserve-shape"
+constituents=[arguments[i+1] for i,a in enumerate(arguments) if a=="--constituent"]
+assert len(constituents)==9
+assert sum("vcpus=8" in c for c in constituents)==1
+assert sum("vcpus=4" in c for c in constituents)==8
+assert any("reservation-id=azv-abcdefabcdef" in c for c in constituents)
+assert all("role=validation" in c for c in constituents)
+# A reserved reply is honored verbatim and carries the plan for child lineage.
+reply["status"]="reserved"; reply["reason"]=""
+open(os.path.join(stub_dir,"reply.json"),"w").write(json.dumps(reply))
+shape=m.shared_shape_reserve(env,state,selected)
+assert shape["status"]=="reserved" and shape["shard_plan"]==plan
+# A wrong shape identity from the allocator fails closed.
+reply["shape_id"]="azv-000000000000"
+open(os.path.join(stub_dir,"reply.json"),"w").write(json.dumps(reply))
+try:
+    m.shared_shape_reserve(env,state,selected)
+except m.ValidationError as exc:
+    assert "wrong identity" in str(exc)
+else:
+    raise AssertionError("foreign shape identity was accepted")
+del os.environ["FM_AZURE_VALIDATION_LIFECYCLE"]
 PY
-  pass "queue shares the 128-vCPU author/review ceiling without a fixed pool and still gates worker-hours, live quota, and cost"
+  pass "the released shared allocator atomically admits or queues the complete 40-vCPU shape and no parallel authority remains"
 }
 
 identity_and_recovery_contract() {
@@ -456,7 +465,7 @@ while current in parents: current=parents[current]; ancestors.append(current)
 with_sources=[ast.dump(node.items[0].context_expr) for node in ancestors if isinstance(node,ast.With)]
 assert len(with_sources)==1 and "shards" in with_sources[0]
 root=pathlib.Path(tempfile.mkdtemp()); home=root/"home"; state_dir=home/"state"/"azure-validation"; runner_dir=home/"state"/"azure-runner"
-env={"home":home,"state_dir":state_dir,"subscription":"sub"}; state={"schema":m.SCHEMA,"cell":"azv-aaaaaaaaaaaa","request":{"task":"task","repository":{"head":"a"*40},"limits":{"reserved_vcpus":40}},"shard_runs":{}}
+env={"home":home,"state_dir":state_dir,"subscription":"sub"}; state={"schema":m.SCHEMA,"cell":"azv-aaaaaaaaaaaa","request":{"task":"task","fence":"sha256:"+"f"*64,"repository":{"head":"a"*40},"limits":{"reserved_vcpus":40}},"shard_runs":{}}
 m.ensure_dirs(env)
 repo=root/"repo"; repo.mkdir()
 record={"invocation":"azr-aaaaaaaaaaaa","sku":"Standard_D4as_v6","repo":str(repo),"snapshot_bundle":str(root/"snapshot.bundle"),"task":"azv-aaaaaaaaaaaa-s1","generation":"round-aaaaaaaaaaaa","resource_class":"behavior-heavy","source_ref":"refs/heads/fm/task","artifacts":["results/executed-1.tsv"],"command":["true"]}
@@ -469,6 +478,7 @@ m.subprocess.Popen=Process
 m.run_shard_invocations(env,state,[record])
 argv=calls.pop()
 assert argv[1:3]==["run","--confirm-run"] and "--source-ref" in argv and "--private-snapshot-bundle" in argv and "--capacity-parent" in argv and argv[argv.index("--capacity-reservation-vcpus")+1]=="40"
+assert argv[argv.index("--capacity-fence")+1]=="f"*64
 runner_dir.mkdir(parents=True); (runner_dir/(record["invocation"]+".json")).write_text(json.dumps({"phase":"running"}))
 m.run_shard_invocations(env,state,[record]); assert calls.pop()[1:3]==["resume","--invocation"]
 # A collected runner archive is re-read from the private container and every

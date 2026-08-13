@@ -21,24 +21,23 @@ Remote Herdr is not part of this path.
 Later Herdr proxy tabs may display state, but validation submission, ask-user responses, recovery, evidence collection, and cleanup use Azure Resource Manager, Managed Run Command, and the private storage endpoint.
 
 No Azure resource was created while implementing this feature.
-The first live cell remains blocked until the exact foundation candidate is independently accepted, applied, and the stacked validation change is reviewed and explicitly approved for the exact subscription.
+Live Azure acceptance of these cells remains unperformed; it happens later from released public main under separate explicit billable authorization.
+The released private foundation, its PR 136 inventory correction, and the released whole-fleet allocator are the integration base, and the dispatcher consumes the released runner's exact foundation/controller-identity contract rather than a partial parallel proof.
 
 ## Capacity and cost shape
 
 The default `validation-heavy` control cell requires 8 vCPUs and at least 32 GiB.
-The dispatcher live-selects the lowest current Linux consumption rate among the candidate `Standard_D8as_v5`, `Standard_D8s_v5`, `Standard_D8ads_v5`, and `Standard_D8ds_v5` shapes that still proves x64 Gen2 Trusted Launch, encryption at host, all three East US zones, exact family quota, and no overlap with the live selected-SKU family of any author worker.
-Those v5 candidates are intentionally separate from the foundation's current v6/v7 mixed author plan.
-The allowlist is not a live quota, availability, or price claim, so every allocation re-reads SKU restrictions, capabilities, family usage, regional usage, and retail pricing.
+The dispatcher live-selects the lowest current Linux consumption rate among the reviewed eight-vCPU control candidates `Standard_D8as_v6`, `Standard_D8s_v6`, `Standard_D8ads_v6`, and `Standard_D8ds_v6` that still proves x64 Gen2 Trusted Launch, encryption at host, and all three East US zones.
+The old v5 candidates are `NotAvailableForSubscription` in East US and their family collides with the pilot supervisor, so they are no longer allowed.
+The allowlist is not a live quota, availability, or price claim; selection proves capability and rate, while every capacity decision belongs to the shared allocator.
 
-The shared East US admission ceiling is 128 vCPUs.
+The released whole-fleet allocator in [Elastic task workers](azure-workers.md) is the single capacity authority under the shared East US 128-vCPU admission ceiling with its 64-vCPU author plan, 40-vCPU specialized envelope, and 22-vCPU shared headroom.
 There is no fixed 64-vCPU validation pool, no independent validation allocation, and no quota increase in this design.
-Author workers, the supervisor, validation/review reservations, and a candidate request all draw from the same live ceiling; whichever demand is active leaves the remainder for the other work.
-A heavy validation request reserves its complete 40-vCPU peak before the 8-vCPU control cell starts: 8 control vCPUs plus eight separate 4-vCPU command VMs.
-A standard request reserves its complete 24-vCPU peak: 8 control vCPUs plus four separate command VMs.
-Child runner VMs carry the exact parent cell id and reservation size, so their live processors are covered once by that reservation while orphan or unrelated shards are counted independently.
+A heavy validation request reserves its complete 40-vCPU peak atomically through one `capacity-reserve-shape` call before the 8-vCPU control cell starts: one reviewed eight-vCPU control constituent plus eight separate four-vCPU shard constituents with exact SKU, family, and cushioned worst-case cost identities.
+Shard constituents never use the selected control family, so the complete shape fits the exact 10-vCPU families.
+If any constituent fails regional, exact-family, specialized-envelope, or budget admission, no constituent is reserved and the complete request stays durably queued with the exact refusal.
+Child runner VMs re-admit their exact pre-reserved constituent ids idempotently through the same allocator, so their live processors are covered once without double-counting, and each child's exact first-day cost bound may re-admit at or below its cushioned constituent amount.
 The one-shot runner independently refuses any child beyond the parent's reserved shard slots.
-For example, a heavy request alongside sixteen 4-vCPU author workers and the 2-vCPU supervisor accounts for 106 vCPUs; another heavy request queues because its complete shape would cross 128.
-When author demand is lower, review demand may consume more than 64 vCPUs, provided every complete shape remains at or below the same shared ceiling and every live quota gate passes.
 An author worker must match the foundation's exact general-worker resource class before its processor count is trusted.
 Quota is only a live upper bound and never turns into a warm allocation.
 
@@ -49,11 +48,9 @@ An optional owner-only `$FM_HOME/config/azure-validation-classes.json` policy bi
 The policy schema is `fm.azure-validation-classes/v1` with a `default` class and a `projects` object keyed by `owner/repository`.
 Saturation leaves requests queued instead of oversubscribing a host or silently falling back to the Mac.
 
-The commissioning cost ceiling remains $1,500, while normal admission uses the $1,000 target.
-Admission adds the foundation's conservative $210 shared-meter reserve, an $80 validation meter reserve, 24 hours of the selected cell rate, and a conservative 24-hour compute ceiling for every requested command shard to both actual and forecast cost before accepting a new cell.
-Each admitted shard then creates its own durable runner cost reservation for direct per-invocation meters while omitting only the parent cell's already-accounted shared foundation reserve.
-The default validation worker-hour planning budget is 400 VM-hours per month, and a new request reserves the complete control-plus-shard lifetime rather than one control VM-hour stream.
-`FM_AZURE_VALIDATION_MONTHLY_HOURS` may lower or explicitly revise that planning limit without changing infrastructure.
+The commissioning cost ceiling remains $1,500, while normal admission uses the $1,000 target; both are enforced by the shared allocator's cumulative actual-plus-forecast-plus-reservations admission, not by a validation-local cost model.
+Every shape constituent carries a cushioned 24-hour worst-case amount, and each admitted shard's runner then proves its own exact first-day bound against that constituent while omitting only the parent cell's already-accounted shared foundation reserve.
+A new request reserves the complete control-plus-shard lifetime rather than one control VM-hour stream; the retired validation-local worker-hour planning budget has no successor because the shared allocator's budget admission owns cost pressure.
 Unreadable cost, forecast, rate, usage, queue, or quota state fails closed.
 Budget pressure stops only new admission and never terminates active work, a pending decision, an uncollected result, or retained recovery storage.
 
@@ -215,7 +212,7 @@ The fixed behavior command is the existing sealed `bin/fm-behavior-shards.sh --r
 The local dispatcher downloads only that credential-free bundle, materializes a temporary Git checkout, and prepares one existing Azure runner invocation per shard.
 It does not run the command locally.
 
-The dispatcher rotates the eight requests across the runner's eight reviewed mixed 4-vCPU families and sets the runner concurrency ceiling to eight.
+The dispatcher assigns each shard the exact SKU and pre-reserved constituent id from the admitted shape plan, avoiding the control cell's family, and sets the runner concurrency ceiling to eight.
 Each request uses the runner's exact private-parent snapshot mode, so a pipeline-owned fix commit can run before the no-mistakes push step without executing locally or prematurely mutating the remote task branch.
 The one-ref Git bundle, current source ref/head/tree, digest, size, and private input blob are all bound to the parent cell and command request, while the runner independently re-proves the public trusted default base.
 A new child starts through `runner run` with an explicit invocation, confirmation, source ref, private bundle, and parent-cell reservation; only an already recorded child uses `runner resume`, so a missing VM cannot turn a prepared record into duplicate execution.
@@ -238,8 +235,8 @@ It requires those identity values but does not contact Azure or run a repository
 The default local queue depth bound is 128.
 
 `dispatch` requires `--confirm-dispatch` and an exact subscription confirmation.
-Before creating capacity it proves the tenant/subscription, current-main private foundation owner/generation/storage/VNet/subnet contract, credential disk, selected SKU, author-worker family separation, family quota, shared East US 128-vCPU admission ceiling, complete-shape regional free quota, current author/supervisor/review demand, queue depth, active-cell count, worker-hour budget, actual cost, forecast cost, and current retail rate.
-A renewable blob lease in `validation-shards/validation-cells/admission.lock` serializes count-and-create admission across Firstmate homes.
+Before creating capacity it proves the tenant/subscription, the released runner's exact private foundation and controller-identity contract, its own cell subnet, the credential disk, and a live-capable reviewed control SKU, then hands the complete shape to the released shared allocator, whose atomic admission owns the shared East US 128-vCPU admission ceiling, exact-family arithmetic, the 40-vCPU specialized envelope, and cumulative actual/forecast budget pressure.
+A renewable blob lease in `validation-shards/validation-cells/admission.lock` still serializes count-and-create dispatch across Firstmate homes; it is a mutual-exclusion lock only, never a capacity authority.
 The lease is rechecked immediately before the cell starts.
 
 A saturated request remains `queued`.
@@ -368,10 +365,10 @@ Before role or container mutation, close persists the exact container ETag and t
 A retry accepts only the remaining subset of that plan, so a crash between role removal, container removal, and identity removal resumes idempotently instead of requiring deleted authority to reappear.
 A missing ETag, changed instance, foreign tag, foreign principal, extra role assignment, partial delete, unreadable absence, wrong head, failed run, pending decision, or incomplete result changes the state to retained cleanup and stops.
 
-## Acceptance after foundation approval
+## Live acceptance
 
-Focused fake-cloud and static tests do not claim real Azure usability.
-After the exact foundation is accepted and this stack is explicitly approved, the first live acceptance must record all of these results:
+Focused fake-cloud and static tests do not claim real Azure usability, and no live acceptance of these cells has been performed.
+After this stack is released to public main and the operator has explicit billable authorization, the first live acceptance must run from that released main and record all of these results:
 
 1. Record Mac wall time, CPU, memory, swap, process count, and interactive latency before admission.
 2. Queue more work than the configured processor/concurrency limit and prove saturation remains queued with no oversubscription.
@@ -382,7 +379,7 @@ After the exact foundation is accepted and this stack is explicitly approved, th
 7. Kill one exact cell VM and prove peer cells, all shard VMs, the local supervisor, and an unrelated local task remain healthy.
 8. Replace the killed cell and prove exact no-mistakes run reattach from the retained database and worktree.
 9. Submit wrong head, run id, request digest, worktree disk, credential disk, VM instance, boot id, and shard receipt fixtures and prove every one refuses.
-10. Drive actual-cost, forecast-cost, worker-hour, active-cell, shared author/review demand, regional-quota, and family-quota saturation and prove each blocks only new admission; prove review demand may exceed 64 vCPUs when author demand is low but the next complete shape always queues before 128.
+10. Drive actual-cost, forecast-cost, active-cell, shared author/review demand, regional-quota, and family-quota saturation and prove each blocks only new admission; prove review demand may exceed 64 vCPUs when author demand is low but the next complete shape always queues before 128.
 11. Prove no credential byte appears in snapshots, runtime bundles, input/result archives, state JSON, tags, ARM parameter files, logs, reports, shard VMs, or uncredentialed process environments.
 12. Prove one cell cannot read or write a sibling container, disk, credential lease, home, or VM.
 13. Prove a failed shard is attributed to its exact VM/boot/request and is never replayed locally.

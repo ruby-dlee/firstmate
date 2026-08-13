@@ -328,6 +328,12 @@ def require_identifier(label, value):
     return value
 
 
+def require_capacity_fence(value):
+    if not re.fullmatch(r"[0-9a-f]{64}", str(value)):
+        raise RunnerError("capacity fence must be 64 lowercase hex characters")
+    return value
+
+
 def require_invocation(value):
     if not SAFE_INVOCATION.match(value):
         raise RunnerError("invocation id is malformed")
@@ -795,6 +801,10 @@ def prepare(env, args, parent_state=None):
             if args.capacity_parent else None
         ),
         "capacity_reservation_vcpus": args.capacity_reservation_vcpus,
+        "capacity_fence": (
+            require_capacity_fence(args.capacity_fence)
+            if getattr(args, "capacity_fence", None) else None
+        ),
         "deployment_generation": env["deployment_generation"],
         "cost_admission_mode": env["cost_admission_mode"],
         "cell_ordinal": env["cell_ordinal"],
@@ -2013,7 +2023,7 @@ def shared_capacity_environment(env):
 def shared_capacity_reserve(env, state, cost):
     request = state["request"]
     limits = request["limits"]
-    fence = request["fence"].split(":", 1)[1]
+    fence = request.get("capacity_fence") or request["fence"].split(":", 1)[1]
     command = [
         sys.executable, str(WORKER_LIFECYCLE), "capacity-reserve",
         "--reservation-id", state["invocation"],
@@ -2066,7 +2076,7 @@ def shared_capacity_release(env, state):
     reservation = state.get("shared_capacity_reservation")
     if not reservation or reservation.get("status") == "released":
         return
-    fence = state["request"]["fence"].split(":", 1)[1]
+    fence = state["request"].get("capacity_fence") or state["request"]["fence"].split(":", 1)[1]
     receipt = sha256_bytes(canonical_bytes({
         "invocation": state["invocation"],
         "fence": state["request"]["fence"],
@@ -3365,6 +3375,10 @@ def add_request_arguments(parser, require_command=True):
         help="exact parent cell whose processor reservation already covers this invocation",
     )
     parser.add_argument("--capacity-reservation-vcpus", type=int)
+    parser.add_argument(
+        "--capacity-fence",
+        help="exact parent shape fence so this invocation re-admits its pre-reserved constituent",
+    )
     parser.add_argument("--wall-seconds", type=int)
     parser.add_argument(
         "--source-ref",

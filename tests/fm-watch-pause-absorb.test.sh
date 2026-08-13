@@ -85,7 +85,7 @@ wait_live() {
 PRESEED_PAUSED=0
 run_pause_case() {  # <case-name> <status-stream> <crew-state-verdict>
   local name=$1 stream=$2 verdict=$3
-  local dir state fakebin out capture window key pane_hash sig pid limit i=0
+  local dir state fakebin out capture window key pane_hash sig pid
   dir=$(make_case "$name"); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture="$dir/pane.txt"
   window="test:fm-$name"
@@ -110,22 +110,8 @@ run_pause_case() {  # <case-name> <status-stream> <crew-state-verdict>
     FM_POLL=1 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
     "$WATCH" > "$out" &
   pid=$!
-  TRIAGE=
-  limit=$(fm_test_liveness_iterations 300 0.1)
-  while [ "$i" -lt "$limit" ]; do
-    if [ -s "$state/.wake-queue" ] || ! is_live_non_zombie "$pid"; then
-      TRIAGE=surfaced
-      break
-    fi
-    if [ -e "$state/.stale-$key" ]; then
-      TRIAGE=absorbed
-      break
-    fi
-    sleep 0.1
-    i=$((i + 1))
-  done
+  if wait_live "$pid" 30; then TRIAGE=absorbed; else TRIAGE=surfaced; fi
   reap "$pid"
-  [ -n "$TRIAGE" ] || fail "watcher produced no durable triage outcome for $name"
 
   # Cross-check the outcome against the durable artifacts triage leaves behind, so a
   # case can never pass on liveness timing alone.

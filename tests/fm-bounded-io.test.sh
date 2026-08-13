@@ -396,6 +396,7 @@ SH
 
   temp_dir="$case_root/alarm-isolation"
   mkdir -p "$temp_dir"
+  # shellcheck disable=SC2016
   TMPDIR=$temp_dir fm_run_bounded 2 perl -MTime::HiRes=time -e '
     my $started = time();
     select undef, undef, undef, 0.45;

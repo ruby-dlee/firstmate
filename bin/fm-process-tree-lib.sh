@@ -165,8 +165,18 @@ _fm_run_bounded_owned() {
       FM_PROCESS_TREE_RESULT_FILE
       FM_PROCESS_TREE_STDOUT_FILE
       FM_PROCESS_TREE_STDERR_FILE
-      FM_PROCESS_TREE_OWNER_OUTPUT_FILE
     );
+    my $owner_output_file = $ENV{FM_PROCESS_TREE_OWNER_OUTPUT_FILE};
+    if (defined $owner_output_file && length $owner_output_file) {
+      if (open my $owner_output, "<", $owner_output_file) {
+        my $output_path = <$owner_output>;
+        close $owner_output;
+        chomp $output_path if defined $output_path;
+        push @owner_cleanup_files, $output_path
+          if defined $output_path && length $output_path;
+      }
+      push @owner_cleanup_files, $owner_output_file;
+    }
     END {
       if ($$ == $supervisor_pid && ($owner_lost || getppid() != $owner_pid)) {
         unlink @owner_cleanup_files;
@@ -359,7 +369,7 @@ fm_run_bounded() {
 }
 
 fm_run_bounded_capture() {
-  local combine=0 output_name output_file output status
+  local combine=0 output_name output_file owner_output_file output status
   if [ "${1:-}" = "--combine-stderr" ]; then
     combine=1
     shift
@@ -370,15 +380,25 @@ fm_run_bounded_capture() {
     FM_PROCESS_TREE_CLEANUP_STATUS=not-started
     return "$FM_PROCESS_TREE_SETUP_FAILURE_STATUS"
   }
+  owner_output_file=$(mktemp "${TMPDIR:-/tmp}/fm-process-tree-owned-output.XXXXXX") || {
+    rm -f "$output_file"
+    FM_PROCESS_TREE_CLEANUP_STATUS=not-started
+    return "$FM_PROCESS_TREE_SETUP_FAILURE_STATUS"
+  }
+  printf '%s\n' "$output_file" > "$owner_output_file" || {
+    rm -f "$output_file" "$owner_output_file"
+    FM_PROCESS_TREE_CLEANUP_STATUS=not-started
+    return "$FM_PROCESS_TREE_SETUP_FAILURE_STATUS"
+  }
   if [ "$combine" -eq 1 ]; then
-    if _fm_run_bounded_owned "$1" "$output_file" "${@:2}" \
+    if _fm_run_bounded_owned "$1" "$owner_output_file" "${@:2}" \
       >"$output_file" 2>&1; then status=0; else status=$?; fi
   else
-    if _fm_run_bounded_owned "$1" "$output_file" "${@:2}" \
+    if _fm_run_bounded_owned "$1" "$owner_output_file" "${@:2}" \
       >"$output_file"; then status=0; else status=$?; fi
   fi
   output=$(cat "$output_file")
-  rm -f "$output_file"
+  rm -f "$output_file" "$owner_output_file"
   printf -v "$output_name" '%s' "$output"
   return "$status"
 }

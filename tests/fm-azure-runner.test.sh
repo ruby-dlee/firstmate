@@ -312,6 +312,34 @@ PY
   pass "Cost Management retry is bounded, honors both Azure guidance headers, and only permits a short exact authoritative cache"
 }
 
+retail_rate_unit() {
+  python3 - "$HOST" <<'PY'
+import copy, importlib.util, sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+env={"azure_operation_count":0}
+on_demand={"currencyCode":"USD","tierMinimumUnits":0,"retailPrice":0.182,"unitPrice":0.182,"armRegionName":"eastus","armSkuName":"Standard_D4as_v6","productName":"Virtual Machines Dasv6 Series","skuName":"D4as v6","meterName":"D4as v6","serviceName":"Virtual Machines","serviceFamily":"Compute","unitOfMeasure":"1 Hour","type":"Consumption","isPrimaryMeterRegion":True}
+low_priority={**on_demand,"retailPrice":0.0363,"unitPrice":0.0363,"meterName":"D4as v6 Low Priority"}
+spot={**on_demand,"retailPrice":0.041,"unitPrice":0.041,"meterName":"D4as v6 Spot"}
+windows={**on_demand,"retailPrice":0.31,"unitPrice":0.31,"productName":"Virtual Machines Dasv6 Series Windows"}
+dev_test={**on_demand,"retailPrice":0.15,"unitPrice":0.15,"productName":"Virtual Machines Dasv6 Series Dev/Test"}
+reservation={**on_demand,"retailPrice":0.09,"unitPrice":0.09,"type":"Reservation","reservationTerm":"1 Year"}
+savings={**on_demand,"retailPrice":0.08,"unitPrice":0.08,"productName":"Virtual Machines Dasv6 Series Savings Plan"}
+rows=[low_priority,spot,windows,dev_test,reservation,savings,on_demand]
+m.az_command=lambda *_a,**_k:({"Items":copy.deepcopy(rows)},0,"")
+assert m.retail_rate(env,"Standard_D4as_v6")==0.182
+m.az_command=lambda *_a,**_k:({"Items":[copy.deepcopy(low_priority)]},0,"")
+try: m.retail_rate(env,"Standard_D4as_v6")
+except m.RunnerError as exc: assert "on-demand" in str(exc) and "unreadable" in str(exc)
+else: raise AssertionError("Low Priority meter was accepted as on-demand")
+ambiguous={**on_demand,"retailPrice":0.183,"unitPrice":0.183,"meterId":"different-current-meter"}
+m.az_command=lambda *_a,**_k:({"Items":[copy.deepcopy(on_demand),ambiguous]},0,"")
+try: m.retail_rate(env,"Standard_D4as_v6")
+except m.RunnerError as exc: assert "ambiguous" in str(exc)
+else: raise AssertionError("distinct eligible on-demand prices were minimized instead of refused")
+PY
+  pass "retail pricing selects exact Linux on-demand consumption and refuses Low Priority or ambiguity"
+}
+
 commissioning_admission_unit() {
   python3 - "$HOST" <<'PY' || fail "commissioning admission adversaries failed"
 import importlib.util, math, pathlib, tempfile, sys
@@ -403,6 +431,7 @@ linux_systemd_drop_integration
 management_fencing_unit
 effective_rbac_adversaries
 cost_retry_unit
+retail_rate_unit
 commissioning_admission_unit
 
 echo "# fm-azure-runner.test.sh: all assertions passed"

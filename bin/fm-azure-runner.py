@@ -20,6 +20,7 @@ import email.utils
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -1304,16 +1305,50 @@ def retail_rate(env, sku):
         "armRegionName%20eq%20%27eastus%27%20and%20armSkuName%20eq%20%27{}%27%20and%20priceType%20eq%20%27Consumption%27"
     ).format(escaped)
     result, _, _ = az_command(env, ["rest", "--method", "get", "--url", url, "--skip-authorization-header"])
-    prices = []
-    for item in result.get("Items", []):
-        product = str(item.get("productName", "")).lower()
-        meter = str(item.get("meterName", "")).lower()
-        if item.get("unitOfMeasure") == "1 Hour" and "windows" not in product and "spot" not in meter:
-            with contextlib.suppress(TypeError, ValueError):
-                prices.append(float(item["retailPrice"]))
+    items = result.get("Items")
+    sku_shape = re.fullmatch(r"Standard_D\d+([a-z]+)_v(\d+)", sku)
+    if not isinstance(items, list) or sku_shape is None:
+        raise RunnerError("current runner retail rate response is unreadable")
+    expected_meter = sku.removeprefix("Standard_").replace("_", " ")
+    expected_product = "Virtual Machines D{}v{} Series".format(sku_shape.group(1), sku_shape.group(2))
+    excluded_offers = ("spot", "low priority", "low-priority", "windows", "dev/test", "dev test", "reservation", "savings")
+    prices = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        offer = " ".join(str(item.get(field, "")) for field in (
+            "productName", "meterName", "skuName", "type", "priceType", "reservationTerm",
+        )).casefold()
+        if any(excluded in offer for excluded in excluded_offers):
+            continue
+        if (
+            str(item.get("armRegionName", "")).casefold() != "eastus"
+            or item.get("armSkuName") != sku
+            or str(item.get("serviceName", "")).casefold() != "virtual machines"
+            or str(item.get("serviceFamily", "")).casefold() != "compute"
+            or str(item.get("type", "")).casefold() != "consumption"
+            or item.get("unitOfMeasure") != "1 Hour"
+            or str(item.get("currencyCode", "")).upper() != "USD"
+            or str(item.get("productName", "")).casefold() != expected_product.casefold()
+            or str(item.get("skuName", "")).casefold() != expected_meter.casefold()
+            or str(item.get("meterName", "")).casefold() != expected_meter.casefold()
+            or item.get("isPrimaryMeterRegion") is not True
+        ):
+            continue
+        try:
+            price = float(item["retailPrice"])
+            unit_price = float(item["unitPrice"])
+            tier_minimum = float(item["tierMinimumUnits"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(price) or price <= 0 or price != unit_price or tier_minimum != 0:
+            continue
+        prices.add(price)
     if not prices:
-        raise RunnerError("current runner retail rate is unreadable")
-    return min(prices)
+        raise RunnerError("exact Linux on-demand consumption retail rate is unreadable")
+    if len(prices) != 1:
+        raise RunnerError("exact Linux on-demand consumption retail rate is ambiguous")
+    return prices.pop()
 
 
 def itemized_cost_bound(rate, hours, limits):

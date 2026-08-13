@@ -211,7 +211,10 @@ def dispatch_once(
     state, _arguments, env = prepare_exact_snapshot(
         runner, request, suffix, command, wall_seconds
     )
-    exit_code = runner.dispatch_prepared(env, state, env["subscription"])
+    exit_code = runner.dispatch_prepared(
+        env, state, env["subscription"],
+        confirm_cost_admission_mode=state["request"].get("cost_admission_mode"),
+    )
     if state.get("phase") != "complete":
         raise BridgeError("Azure runner did not prove complete exact cleanup")
     result = state.get("result")

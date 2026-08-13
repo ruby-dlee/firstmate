@@ -114,9 +114,9 @@ It creates no role assignment, provider registration, public path, support ticke
 
 There is no warm review compute and no review queue daemon.
 Zero waiting reviews means zero model, tool, or verifier VMs.
-The software cap defaults to four active model compartments and can be configured from one through eight.
-Regional and exact-family quota can impose a lower cap.
-Review admission is separate from author, no-mistakes, browser, and supervisor capacity.
+Review capacity is owned by the released whole-fleet allocator in [Elastic task workers](azure-workers.md): every model compartment reserves one exact SKU/family/cost constituent through `capacity-reserve` before compute and releases it only after proven compute absence, tool and verifier invocations reserve through the released runner's own shared-allocator bridge, and review demand shares the 40-vCPU specialized envelope with no-mistakes validation under the single 128-vCPU East US ceiling.
+A queued shared reservation refuses the review rather than creating capacity, and the local software cap (default four active model compartments, configurable one through eight) remains only a concurrency safety bound, never a capacity authority.
+Regional and exact-family quota can impose a lower effective ceiling.
 
 Two admitted reviews have distinct review generations, staged object prefixes, model VMs, tool invocations, verifier invocations, process trees, scratch, credentials, and cleanup authorization.
 They do not share a database or writable account disk.
@@ -132,10 +132,11 @@ No resource group, subnet, shared storage account, foundation resource, sibling 
 
 ## Operator setup
 
-The Azure foundation and disposable runner are now released on `main`, but the current foundation deployment is only partial, has zero VMs, and is not accepted for review reconciliation.
-Do not apply or reconcile any Azure resource until Firstmate explicitly reports the corrected released foundation safe for that exact operation.
-After that authorization, accept the released foundation and runner contracts, then build a pinned model image containing the tracked model guest, exact reviewer CLIs, and no ambient credential or general-purpose tool service.
-Record the exact image resource ID.
+The complete retained 29-resource private foundation, its controller-identity inventory correction, and the shared whole-fleet allocator are released on `main` with zero VMs; live Azure Crosscheck acceptance remains unperformed and happens later from released public main under separate explicit billable and security-sensitive authorization.
+The pinned model image and the role-specific network policy are tracked declarations at [`docs/azure-crosscheck/model-image.json`](azure-crosscheck/model-image.json) and [`docs/azure-crosscheck/network-policy.json`](azure-crosscheck/network-policy.json), owned by the bounded command [`bin/fm-crosscheck-azure-image.sh`](../bin/fm-crosscheck-azure-image.sh).
+The image pins the exact marketplace base version, the single supported reviewer CLI by URL/size/SHA-256, and the tracked model guest by SHA-256, and disables every command, MCP, extension, skill, and session surface; the policy allows model egress only to Azure-provided DNS and the exact provider endpoint, denies instance metadata and the virtual network, and keeps tool/verifier repository execution networkless.
+Plan legs are read-only; `image-build` and `policy-apply` are billable/security-sensitive, refuse without their exact confirmation flags and subscription, and run only from a clean checkout landed on public main.
+Record the exact built image resource ID before any live review.
 
 The home-local configuration is optional and gitignored:
 

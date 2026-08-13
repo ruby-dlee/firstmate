@@ -550,11 +550,98 @@ documented_acceptance_contract() {
   pass "operator documentation enumerates malicious, concurrency, fault, force-push, and cloud-default acceptance"
 }
 
+shared_capacity_unit() {
+  python3 - "$ROOT/bin/fm-crosscheck-azure.py" <<'PY' || fail "shared model capacity binding failed"
+import importlib.util,json,os,sys,tempfile,types
+spec=importlib.util.spec_from_file_location("azure_adapter",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+stub_dir=tempfile.mkdtemp()
+stub=os.path.join(stub_dir,"lifecycle-stub.sh"); capture=os.path.join(stub_dir,"arguments.txt")
+open(stub,"w").write("#!/bin/sh\nprintf '%s\\n' \"$@\" > "+capture+"\ncat "+os.path.join(stub_dir,"reply.json")+"\n")
+os.chmod(stub,0o755)
+os.environ["FM_CROSSCHECK_AZURE_LIFECYCLE"]=stub
+runner=types.SimpleNamespace(
+    SKU_FAMILY={"Standard_D4as_v6":"standardDav6Family"},
+    SKU_VCPUS={"Standard_D4as_v6":4},
+    retail_rate=lambda _env,_sku:0.2,
+    environment=lambda:{},
+)
+config={"subscription":"5f0f9efb-723c-4bd8-a2e2-ba13625ea014","reviewer_sku":"Standard_D4as_v6"}
+identity={"review_generation":"abcdefabcdefabcdefabcdef"}
+reservation_id="ccm-abcdefabcdef"
+reply={"reservation_id":reservation_id,"status":"queued","reason":"specialized envelope is saturated"}
+open(os.path.join(stub_dir,"reply.json"),"w").write(json.dumps(reply))
+try: m.reserve_model_capacity(config,identity,runner)
+except m.AzureCrosscheckError as exc: assert "queued the model compartment" in str(exc)
+else: raise AssertionError("queued reservation was treated as reserved")
+reply["status"]="reserved"
+open(os.path.join(stub_dir,"reply.json"),"w").write(json.dumps(reply))
+value=m.reserve_model_capacity(config,identity,runner)
+assert value["reservation_id"]==reservation_id and value["sku"]=="Standard_D4as_v6"
+arguments=open(capture).read().splitlines()
+assert arguments[0]=="capacity-reserve" and "--role" in arguments
+assert arguments[arguments.index("--role")+1]=="crosscheck"
+assert arguments[arguments.index("--vcpus")+1]=="4"
+reply["reservation_id"]="ccm-000000000000"
+open(os.path.join(stub_dir,"reply.json"),"w").write(json.dumps(reply))
+try: m.reserve_model_capacity(config,identity,runner)
+except m.AzureCrosscheckError as exc: assert "wrong identity" in str(exc)
+else: raise AssertionError("foreign reservation identity accepted")
+m.release_model_capacity(config,value)
+release_arguments=open(capture).read().splitlines()
+assert release_arguments[0]=="capacity-release"
+assert release_arguments[release_arguments.index("--reservation-id")+1]==reservation_id
+del os.environ["FM_CROSSCHECK_AZURE_LIFECYCLE"]
+PY
+  pass "the model compartment reserves and releases exact shared allocator capacity and honors queued refusals"
+}
+
+image_and_policy_contract() {
+  local params
+  python3 - "$ROOT/docs/azure-crosscheck/model-image.json" "$ROOT/docs/azure-crosscheck/network-policy.json" <<'PY' || fail "image/policy declarations are not exact"
+import json,sys
+image=json.load(open(sys.argv[1]))
+policy=json.load(open(sys.argv[2]))
+parameters=image["parameters"]
+assert "ubuntuExactVersion" in parameters and "defaultValue" not in parameters["ubuntuExactVersion"]
+for name in ("reviewerCliUrl","reviewerCliSha256","reviewerCliBytes","modelGuestSha256","modelGuestBase64"):
+    assert name in parameters, name
+inline="\n".join(image["resources"][0]["properties"]["customize"][0]["inline"])
+for marker in ("mcp=disabled","skills=disabled","extensions=disabled","sessions=disabled","sha256sum -c"):
+    assert marker in inline, marker
+assert image["resources"][0]["properties"]["distribute"][0]["type"]=="ManagedImage"
+rules={rule["name"]:rule["properties"] for rule in policy["resources"][0]["properties"]["securityRules"]}
+assert rules["deny-all-inbound"]["access"]=="Deny" and rules["deny-all-inbound"]["direction"]=="Inbound"
+assert rules["deny-metadata-outbound"]["destinationAddressPrefix"]=="169.254.169.254/32"
+assert rules["deny-metadata-outbound"]["priority"]<rules["allow-azure-dns-outbound"]["priority"]
+assert rules["allow-azure-dns-outbound"]["destinationAddressPrefix"]=="168.63.129.16/32"
+assert rules["allow-provider-endpoint-outbound"]["access"]=="Allow"
+assert rules["deny-vnet-outbound"]["destinationAddressPrefix"]=="VirtualNetwork"
+assert rules["deny-all-outbound"]["priority"]==4096
+allows=[name for name,rule in rules.items() if rule["access"]=="Allow"]
+assert sorted(allows)==["allow-azure-dns-outbound","allow-provider-endpoint-outbound"]
+PY
+  params=$(mktemp)
+  printf '{"parameters":{}}\n' >"$params"
+  if "$ROOT/bin/fm-crosscheck-azure-image.sh" image-build --subscription s --resource-group g --parameters "$params" >/dev/null 2>&1; then
+    fail "image-build ran without --confirm-build"
+  fi
+  if "$ROOT/bin/fm-crosscheck-azure-image.sh" policy-apply --subscription s --resource-group g --parameters "$params" >/dev/null 2>&1; then
+    fail "policy-apply ran without --confirm-apply"
+  fi
+  if "$ROOT/bin/fm-crosscheck-azure-image.sh" image-build --subscription s --resource-group g --parameters "$params" --confirm-build --confirm-subscription other >/dev/null 2>&1; then
+    fail "image-build accepted a mismatched subscription confirmation"
+  fi
+  rm -f "$params"
+  pass "image and network-policy mutations are declaration-owned and refuse without exact confirmations"
+}
+
 static_contract
 adapter_mode_unit
 identity_outcome_unit
 account_and_cleanup_identity_unit
 bridge_security_unit
 replay_positive_and_failure_unit
+shared_capacity_unit
+image_and_policy_contract
 documented_acceptance_contract
 printf 'Azure Crosscheck tests passed.\n'

@@ -231,8 +231,12 @@ def runtime_config(home: Path) -> dict[str, Any]:
             "Azure Crosscheck requires exact FM_CROSSCHECK_AZURE_MODEL_IMAGE_ID"
         )
     runner = load_runner()
-    if reviewer_sku not in runner.SKU_FAMILY:
-        raise AzureCrosscheckError("Azure Crosscheck reviewer SKU is not reviewed")
+    template = json.loads(
+        (ROOT / "docs" / "azure-crosscheck" / "compartment.json").read_text(encoding="utf-8")
+    )
+    template_skus = template["parameters"]["vmSize"]["allowedValues"]
+    if reviewer_sku not in runner.SKU_FAMILY or reviewer_sku not in template_skus:
+        raise AzureCrosscheckError("Azure Crosscheck reviewer SKU is not reviewed for the model compartment")
     return {
         "tenant": os.environ["FM_AZURE_TENANT_ID"],
         "subscription": subscription,
@@ -527,6 +531,90 @@ def active_review_vms(config: dict[str, Any]) -> int:
         and "deallocated" not in str(vm.get("powerState", "")).lower()
     )
 
+
+
+def shared_capacity_command(arguments: list[str]) -> "subprocess.CompletedProcess[str]":
+    command_env = os.environ.copy()
+    command_env["FM_HOME"] = str(ROOT)
+    executable = os.environ.get(
+        "FM_CROSSCHECK_AZURE_LIFECYCLE", str(ROOT / "bin" / "fm-worker-lifecycle.sh")
+    )
+    return subprocess.run(
+        [executable] + arguments, capture_output=True, text=True,
+        env=command_env, timeout=300, check=False,
+    )
+
+
+def reserve_model_capacity(config: dict[str, Any], identity: dict[str, Any], runner: Any) -> dict[str, Any]:
+    """Reserve the credentialed model compartment through the shared allocator.
+
+    The released whole-fleet allocator is the single capacity authority for
+    review demand; the local concurrency bound is only a safety cap. The model
+    compartment holds one exact reservation with a cushioned worst-case amount
+    until its compute absence is proved.
+    """
+    fence = hashlib.sha256(os.urandom(32)).hexdigest()
+    reservation_id = "ccm-" + identity["review_generation"][:12]
+    sku = config["reviewer_sku"]
+    family = runner.SKU_FAMILY[sku]
+    rate = runner.retail_rate(runner.environment(), sku)
+    amount = round(float(rate) * 24.0 * 1.5 + 5.0, 6)
+    result = shared_capacity_command([
+        "capacity-reserve",
+        "--reservation-id", reservation_id,
+        "--fence-binding", fence,
+        "--role", "crosscheck",
+        "--sku", sku,
+        "--sku-family", family,
+        "--vcpus", str(runner.SKU_VCPUS[sku]),
+        "--amount-usd", str(amount),
+        "--confirm-subscription", config["subscription"],
+    ])
+    if result.returncode != 0:
+        raise AzureCrosscheckError(
+            "shared allocator refused the model reservation: "
+            + (result.stderr or result.stdout or "").strip()[-400:]
+        )
+    try:
+        reservation = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise AzureCrosscheckError("shared allocator returned a malformed model reservation") from exc
+    if (
+        reservation.get("reservation_id") != reservation_id
+        or reservation.get("status") not in ("reserved", "queued")
+    ):
+        raise AzureCrosscheckError("shared allocator returned a model reservation with the wrong identity")
+    if reservation["status"] != "reserved":
+        raise AzureCrosscheckError(
+            "shared allocator queued the model compartment: "
+            + str(reservation.get("reason") or "capacity unavailable")[:300]
+        )
+    return {
+        "reservation_id": reservation_id,
+        "fence": fence,
+        "sku": sku,
+        "sku_family": family,
+        "amount_usd": amount,
+    }
+
+
+def release_model_capacity(config: dict[str, Any], reservation: dict[str, Any]) -> None:
+    receipt = hashlib.sha256(json.dumps(
+        {"reservation": reservation["reservation_id"], "evidence": "model-compute-absent"},
+        sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    result = shared_capacity_command([
+        "capacity-release",
+        "--reservation-id", reservation["reservation_id"],
+        "--fence-binding", reservation["fence"],
+        "--cleanup-receipt", receipt,
+        "--confirm-subscription", config["subscription"],
+    ])
+    if result.returncode != 0:
+        raise AzureCrosscheckError(
+            "shared capacity release refused for the model compartment: "
+            + (result.stderr or result.stdout or "").strip()[-400:]
+        )
 
 def provision_model_vm(
     config: dict[str, Any], identity: dict[str, str], staged: dict[str, str]
@@ -1154,9 +1242,9 @@ def run_azure_review(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     del root
     azure = runtime_config(home)
-    verify_scope_and_foundation(azure)
+    runner = verify_scope_and_foundation(azure)
     if active_review_vms(azure) >= azure["max_concurrency"]:
-        raise core.CrosscheckToolError("Azure review admission reached its independent concurrency cap")
+        raise core.CrosscheckToolError("Azure review admission reached its local model concurrency safety cap")
     config["account_selector"] = {
         "codex": "CODEX_HOME",
         "claude": "CLAUDE_CONFIG_DIR",
@@ -1251,6 +1339,7 @@ def run_azure_review(
         resources: dict[str, Any] | None = None
         cleanup_error: Exception | None = None
         ledger_identity: dict[str, Any] | None = None
+        model_capacity = reserve_model_capacity(azure, identity, runner)
         try:
             upload_blob(azure, input_path, staged["input_blob"])
             uploaded.add(staged["input_blob"])
@@ -1282,6 +1371,10 @@ def run_azure_review(
                 "result_digest": result_digest,
                 "deployment_generation": azure["deployment_generation"],
                 "image_id": azure["model_image_id"],
+                "capacity_reservation": model_capacity["reservation_id"],
+                "capacity_fence_digest": "sha256:" + hashlib.sha256(
+                    model_capacity["fence"].encode("utf-8")
+                ).hexdigest(),
             }
             bridge = load_tool_bridge()
             evidence_files = bridge.validate_evidence_files(
@@ -1371,6 +1464,11 @@ def run_azure_review(
             if resources is not None:
                 try:
                     cleanup_model_vm(azure, resources, identity)
+                except Exception as exc:
+                    cleanup_error = exc
+            if cleanup_error is None:
+                try:
+                    release_model_capacity(azure, model_capacity)
                 except Exception as exc:
                     cleanup_error = exc
             blob_cleanup_errors: list[str] = []

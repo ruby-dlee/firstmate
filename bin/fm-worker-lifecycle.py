@@ -17,6 +17,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -33,6 +34,7 @@ AZURE_PROVIDER = ROOT / "bin" / "fm-azure-worker-provider.py"
 STATE_SCHEMA = "fm.worker-lifecycle/v1"
 REQUEST_SCHEMA = "fm.worker-request/v1"
 RELEASE_SCHEMA = "fm.worker-release/v1"
+CAPACITY_RESERVATION_SCHEMA = "fm.capacity-reservation/v1"
 PROVIDER_REQUEST_SCHEMA = "fm.worker-provider-request/v1"
 PROVIDER_RESPONSE_SCHEMA = "fm.worker-provider-response/v1"
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
@@ -52,6 +54,18 @@ REQUIRED_RESOURCE_KINDS = (
     "vm", "nic", "os-disk", "task-disk", "account-disk", "identity",
     "role-assignment", "state-container",
 )
+REVIEWED_SKU_FAMILY = {
+    "Standard_D4as_v6": "standardDav6Family",
+    "Standard_D4as_v7": "StandardDasv7Family",
+    "Standard_D4s_v6": "StandardDsv6Family",
+    "Standard_D4ads_v7": "StandardDadsv7Family",
+    "Standard_D4ds_v6": "StandardDdsv6Family",
+    "Standard_D4s_v7": "StandardDsv7Family",
+    "Standard_D4ds_v7": "StandardDdsv7Family",
+    "Standard_D4ads_v6": "standardDadv6Family",
+    "Standard_E4as_v7": "StandardEasv7Family",
+    "Standard_E4as_v6": "standardEav6Family",
+}
 SKU_PLAN = {
     1: ("Standard_D4as_v6", "standardDav6Family"),
     2: ("Standard_D4as_v6", "standardDav6Family"),
@@ -250,6 +264,7 @@ def empty_state(env):
         "next_assignment": 1,
         "queue": {},
         "workers": {},
+        "capacity_reservations": {},
         "completed_worker_seconds": 0.0,
         "pending_action": None,
         "cleanup_refusals": [],
@@ -264,8 +279,33 @@ def verify_state(env, state):
     ):
         if state.get(field) != expected[field]:
             raise LifecycleError("lifecycle state {} binding is not exact".format(field))
-    if not isinstance(state.get("queue"), dict) or not isinstance(state.get("workers"), dict):
-        raise LifecycleError("lifecycle queue or worker inventory is malformed")
+    if (
+        not isinstance(state.get("queue"), dict)
+        or not isinstance(state.get("workers"), dict)
+        or not isinstance(state.get("capacity_reservations"), dict)
+    ):
+        raise LifecycleError("lifecycle queue, worker, or shared capacity inventory is malformed")
+    if len(state["capacity_reservations"]) > 256:
+        raise LifecycleError("shared capacity reservation history exceeds its durable bound")
+    for reservation_id, reservation in state["capacity_reservations"].items():
+        if (
+            not isinstance(reservation, dict)
+            or reservation_id != reservation.get("reservation_id")
+            or reservation.get("schema") != CAPACITY_RESERVATION_SCHEMA
+            or reservation.get("role") != "specialized"
+            or reservation.get("status") not in ("queued", "reserved", "released")
+            or reservation.get("sku") not in REVIEWED_SKU_FAMILY
+            or str(reservation.get("sku_family", "")).lower()
+            != REVIEWED_SKU_FAMILY[reservation["sku"]].lower()
+            or reservation.get("vcpus") != 4
+            or isinstance(reservation.get("amount_usd"), bool)
+            or not isinstance(reservation.get("amount_usd"), (int, float))
+            or not math.isfinite(float(reservation["amount_usd"]))
+            or reservation["amount_usd"] <= 0
+        ):
+            raise LifecycleError("durable specialized capacity reservation is malformed")
+        require_id("capacity reservation id", reservation_id)
+        require_binding("capacity reservation fence", reservation.get("fence_binding"))
     if state.get("pending_action") is not None and not isinstance(state["pending_action"], dict):
         raise LifecycleError("pending provider action is malformed")
 
@@ -277,6 +317,7 @@ def load_state(env):
         if "is absent" not in str(exc):
             raise
         state = empty_state(env)
+    state.setdefault("capacity_reservations", {})
     verify_state(env, state)
     return state
 
@@ -396,6 +437,29 @@ def verify_inventory(inventory):
             resource_ids.add(resource_id.lower())
     if not isinstance(inventory.get("conflicts", []), list):
         raise LifecycleError("provider conflict inventory is malformed")
+    capacity_reservations = inventory.get("capacity_reservations", [])
+    if not isinstance(capacity_reservations, list) or len(capacity_reservations) > 64:
+        raise LifecycleError("provider capacity reservation inventory is malformed or unbounded")
+    seen_reservations = set()
+    for reservation in capacity_reservations:
+        reservation_id = reservation.get("reservation_id") if isinstance(reservation, dict) else None
+        if (
+            not isinstance(reservation_id, str)
+            or not SAFE_ID.match(reservation_id)
+            or reservation_id in seen_reservations
+            or reservation.get("role") != "specialized"
+            or reservation.get("sku") not in REVIEWED_SKU_FAMILY
+            or str(reservation.get("sku_family", "")).lower()
+            != REVIEWED_SKU_FAMILY[reservation["sku"]].lower()
+            or reservation.get("vcpus") != 4
+            or isinstance(reservation.get("amount_usd"), bool)
+            or not isinstance(reservation.get("amount_usd"), (int, float))
+            or not math.isfinite(float(reservation["amount_usd"]))
+            or reservation["amount_usd"] <= 0
+            or not isinstance(reservation.get("active"), bool)
+        ):
+            raise LifecycleError("provider capacity reservation identity is not exact")
+        seen_reservations.add(reservation_id)
 
 
 def bindings_for_item(item, assignment_generation):
@@ -529,7 +593,11 @@ def metrics_from_inventory(inventory):
         "regional_limit_vcpus": metrics.get("regional_limit_vcpus"),
         "regional_used_vcpus": metrics.get("regional_used_vcpus"),
         "specialized_active_vcpus": metrics.get("specialized_active_vcpus"),
+        "specialized_active_by_family": metrics.get("specialized_active_by_family"),
+        "family_limit_vcpus": metrics.get("family_limit_vcpus"),
+        "family_used_vcpus": metrics.get("family_used_vcpus"),
         "family_free_vcpus": metrics.get("family_free_vcpus"),
+        "capacity_reservations": inventory.get("capacity_reservations", []),
         "sku_hourly_usd": metrics.get("sku_hourly_usd"),
         "observed_at": inventory.get("observed_at"),
     }
@@ -545,70 +613,10 @@ def worker_seconds(state, now=None):
     return total
 
 
-def outstanding_reservations(state):
-    return sum(
-        float(worker.get("reservation_usd", 0.0))
-        for worker in state["workers"].values()
-        if not worker.get("released_at")
-    )
-
-
 def budget_limit(env):
     if env["policy_phase"] == "commissioning":
         return env["commissioning_ceiling_usd"]
     return env["steady_target_usd"]
-
-
-def admission_result(env, state, inventory, slot, item=None, extra_reservations=0.0):
-    metrics = inventory["metrics"]
-    actual = metrics.get("actual_usd")
-    forecast = metrics.get("forecast_usd")
-    regional_limit = metrics.get("regional_limit_vcpus")
-    regional_used = metrics.get("regional_used_vcpus")
-    specialized_active = metrics.get("specialized_active_vcpus")
-    family_free = metrics.get("family_free_vcpus")
-    rates = metrics.get("sku_hourly_usd")
-    if not isinstance(actual, (int, float)) or not isinstance(forecast, (int, float)):
-        return False, "actual or forecast spend is unreadable", 0.0
-    if not isinstance(regional_limit, int) or not isinstance(regional_used, int):
-        return False, "shared East US regional quota is unreadable", 0.0
-    if regional_limit < REGIONAL_ADMISSION_CEILING_VCPUS:
-        return False, "shared East US regional quota is below the reviewed 128-vCPU ceiling", 0.0
-    if not isinstance(specialized_active, int) or specialized_active < 0:
-        return False, "active specialized Azure capacity is unreadable", 0.0
-    sku, family = SKU_PLAN[slot]
-    if not isinstance(family_free, dict) or not isinstance(family_free.get(family), int):
-        return False, "exact selected-family quota is unreadable", 0.0
-    if not isinstance(rates, dict) or not isinstance(rates.get(sku), (int, float)):
-        return False, "selected worker retail rate is unreadable", 0.0
-    shared_ceiling_free = REGIONAL_ADMISSION_CEILING_VCPUS - regional_used
-    specialized_remaining = max(0, SPECIALIZED_SHAPE_VCPUS - specialized_active)
-    required_reserve = specialized_remaining + SHARED_HEADROOM_VCPUS
-    if shared_ceiling_free < VCPUS_PER_WORKER or shared_ceiling_free - VCPUS_PER_WORKER < required_reserve:
-        return False, "combined author and specialized demand would consume the shared East US reserve", 0.0
-    if family_free[family] < VCPUS_PER_WORKER:
-        return False, "exact selected-family free vCPU quota is insufficient", 0.0
-    # The reservation covers the configurable expected author interval plus a
-    # conservative retained-disk/control allowance. It supplements lagging Cost
-    # Management telemetry and is released only after exact lifecycle cleanup.
-    increment = round(float(rates[sku]) * env["admission_hours"] + 2.0, 6)
-    pressure = (
-        max(float(actual), float(forecast))
-        + outstanding_reservations(state)
-        + float(extra_reservations)
-        + increment
-    )
-    limit = budget_limit(env)
-    if pressure >= limit and (item is None or item.get("discretionary", True)):
-        return False, "budget actual/forecast plus durable reservations reaches the active policy limit", increment
-    return True, "", increment
-
-
-def queued_items(state):
-    return sorted(
-        [item for item in state["queue"].values() if item.get("status") == "queued" and item.get("eligible")],
-        key=lambda item: (item.get("enqueued_at", ""), item["task"], item["task_generation"]),
-    )
 
 
 def active_count(state, inventory):
@@ -623,52 +631,214 @@ def active_count(state, inventory):
     return count
 
 
+def merged_specialized_reservations(state, inventory, ignore_reservation_id=None):
+    merged = {}
+    for reservation in inventory.get("capacity_reservations", []):
+        if reservation["reservation_id"] == ignore_reservation_id:
+            continue
+        merged[reservation["reservation_id"]] = dict(reservation)
+    for reservation_id, local in state.get("capacity_reservations", {}).items():
+        if reservation_id == ignore_reservation_id or local.get("status") != "reserved":
+            continue
+        current = merged.get(reservation_id)
+        identity_fields = ("role", "sku", "sku_family", "vcpus", "amount_usd")
+        if current is not None and any(current.get(field) != local.get(field) for field in identity_fields):
+            raise LifecycleError("local and provider specialized reservation identity differs")
+        if current is None:
+            current = {field: local[field] for field in identity_fields}
+            current.update({"reservation_id": reservation_id, "active": False})
+            merged[reservation_id] = current
+    return merged
+
+
+def capacity_commitments(state, inventory, provisional=(), ignore_reservation_id=None):
+    metrics = inventory["metrics"]
+    regional_limit = metrics.get("regional_limit_vcpus")
+    regional_used = metrics.get("regional_used_vcpus")
+    family_limit = metrics.get("family_limit_vcpus")
+    family_used = metrics.get("family_used_vcpus")
+    if not isinstance(regional_limit, int) or not isinstance(regional_used, int):
+        raise LifecycleError("shared East US regional quota is unreadable")
+    if regional_limit < REGIONAL_ADMISSION_CEILING_VCPUS:
+        raise LifecycleError("shared East US regional quota is below the reviewed 128-vCPU ceiling")
+    if not isinstance(family_limit, dict) or not isinstance(family_used, dict):
+        raise LifecycleError("exact selected-family quota inventory is unreadable")
+
+    cloud = inventory_by_slot(inventory)
+    active_by_family = {}
+    pending_by_family = {}
+    active_total = 0
+    pending_total = 0
+    specialized_committed = 0
+    for slot, current in cloud.items():
+        vm = (current.get("resources") or {}).get("vm")
+        if vm is None or "deallocated" in str(vm.get("power_state", "")).lower():
+            continue
+        family = SKU_PLAN[slot][1]
+        active_by_family[family] = active_by_family.get(family, 0) + VCPUS_PER_WORKER
+        active_total += VCPUS_PER_WORKER
+    for worker in state["workers"].values():
+        if worker.get("released_at") or worker["slot"] in cloud and (cloud[worker["slot"]].get("resources") or {}).get("vm"):
+            continue
+        family = worker["sku_family"]
+        pending_by_family[family] = pending_by_family.get(family, 0) + VCPUS_PER_WORKER
+        pending_total += VCPUS_PER_WORKER
+
+    specialized = merged_specialized_reservations(
+        state, inventory, ignore_reservation_id=ignore_reservation_id
+    )
+    for reservation in specialized.values():
+        family = reservation["sku_family"]
+        vcpus = reservation["vcpus"]
+        specialized_committed += vcpus
+        if reservation["active"]:
+            active_by_family[family] = active_by_family.get(family, 0) + vcpus
+            active_total += vcpus
+        else:
+            pending_by_family[family] = pending_by_family.get(family, 0) + vcpus
+            pending_total += vcpus
+    for reservation in provisional:
+        family = reservation["sku_family"]
+        vcpus = reservation["vcpus"]
+        pending_by_family[family] = pending_by_family.get(family, 0) + vcpus
+        pending_total += vcpus
+        if reservation["role"] == "specialized":
+            specialized_committed += vcpus
+
+    family_committed = {}
+    for family in set(family_limit) | set(active_by_family) | set(pending_by_family):
+        observed = family_used.get(family)
+        limit = family_limit.get(family)
+        if not isinstance(observed, int) or not isinstance(limit, int):
+            raise LifecycleError("exact selected-family observed usage or limit is unreadable")
+        family_committed[family] = max(observed, active_by_family.get(family, 0)) + pending_by_family.get(family, 0)
+    return {
+        "regional_limit": regional_limit,
+        "regional_committed": max(regional_used, active_total) + pending_total,
+        "family_limit": family_limit,
+        "family_committed": family_committed,
+        "specialized_committed": specialized_committed,
+        "specialized_reservations": specialized,
+    }
+
+
+def outstanding_cost_reservations(
+    state, inventory, provisional=(), ignore_reservation_id=None
+):
+    author = sum(
+        float(worker.get("reservation_usd", 0.0))
+        for worker in state["workers"].values()
+        if not worker.get("released_at")
+    )
+    specialized = sum(
+        float(reservation["amount_usd"])
+        for reservation in merged_specialized_reservations(
+            state, inventory, ignore_reservation_id=ignore_reservation_id
+        ).values()
+    )
+    projected = sum(float(reservation["amount_usd"]) for reservation in provisional)
+    return author + specialized + projected
+
+
+def capacity_admission(
+    env, state, inventory, candidate, provisional=(), ignore_reservation_id=None
+):
+    metrics = inventory["metrics"]
+    actual = metrics.get("actual_usd")
+    forecast = metrics.get("forecast_usd")
+    if not isinstance(actual, (int, float)) or not isinstance(forecast, (int, float)):
+        return False, "shared actual or forecast spend is unreadable"
+    try:
+        commitments = capacity_commitments(
+            state, inventory, provisional, ignore_reservation_id=ignore_reservation_id
+        )
+    except LifecycleError as exc:
+        return False, str(exc)
+    family = candidate["sku_family"]
+    vcpus = candidate["vcpus"]
+    family_limit = commitments["family_limit"].get(family)
+    family_committed = commitments["family_committed"].get(family)
+    if not isinstance(family_limit, int) or not isinstance(family_committed, int):
+        return False, "exact selected-family observed-plus-reserved capacity is unreadable"
+    if family_committed + vcpus > family_limit:
+        return False, "exact selected-family observed-plus-reserved capacity is exhausted"
+    specialized_after = commitments["specialized_committed"]
+    if candidate["role"] == "specialized":
+        specialized_after += vcpus
+        if specialized_after > SPECIALIZED_SHAPE_VCPUS:
+            return False, "specialized observed-plus-reserved demand exceeds its shared 40-vCPU shape"
+    reserve_remaining = max(0, SPECIALIZED_SHAPE_VCPUS - specialized_after)
+    if (
+        commitments["regional_committed"] + vcpus + reserve_remaining + SHARED_HEADROOM_VCPUS
+        > REGIONAL_ADMISSION_CEILING_VCPUS
+    ):
+        return False, "combined observed-plus-reserved demand would consume the shared East US ceiling"
+    pressure = (
+        max(float(actual), float(forecast))
+        + outstanding_cost_reservations(
+            state, inventory, provisional, ignore_reservation_id=ignore_reservation_id
+        )
+        + float(candidate["amount_usd"])
+    )
+    if pressure >= budget_limit(env) and candidate.get("discretionary", True):
+        return False, "shared actual/forecast spend plus durable reservations reaches the active policy limit"
+    return True, ""
+
+
+def admission_result(env, state, inventory, slot, item=None, provisional=()):
+    sku, family = SKU_PLAN[slot]
+    rates = inventory["metrics"].get("sku_hourly_usd")
+    if not isinstance(rates, dict) or not isinstance(rates.get(sku), (int, float)):
+        return False, "selected worker retail rate is unreadable", 0.0
+    increment = round(float(rates[sku]) * env["admission_hours"] + 2.0, 6)
+    candidate = {
+        "reservation_id": "author-slot-{}".format(slot),
+        "role": "author",
+        "sku": sku,
+        "sku_family": family,
+        "vcpus": VCPUS_PER_WORKER,
+        "amount_usd": increment,
+        "discretionary": item is None or item.get("discretionary", True),
+    }
+    admitted, reason = capacity_admission(env, state, inventory, candidate, provisional)
+    return admitted, reason, increment
+
+
+def queued_items(state):
+    return sorted(
+        [item for item in state["queue"].values() if item.get("status") == "queued" and item.get("eligible")],
+        key=lambda item: (item.get("enqueued_at", ""), item["task"], item["task_generation"]),
+    )
+
+
 def desired_count(env, state, inventory):
     total_work = sum(
         1 for item in state["queue"].values()
         if item.get("status") in ("queued", "assigning", "assigned") and item.get("eligible")
     )
     actual = active_count(state, inventory)
-    quota_capacity = 0
-    metrics = inventory["metrics"]
-    if (
-        isinstance(metrics.get("regional_limit_vcpus"), int)
-        and metrics["regional_limit_vcpus"] >= REGIONAL_ADMISSION_CEILING_VCPUS
-        and isinstance(metrics.get("regional_used_vcpus"), int)
-        and isinstance(metrics.get("specialized_active_vcpus"), int)
-    ):
-        shared_ceiling_free = REGIONAL_ADMISSION_CEILING_VCPUS - metrics["regional_used_vcpus"]
-        specialized_remaining = max(
-            0, SPECIALIZED_SHAPE_VCPUS - metrics["specialized_active_vcpus"]
-        )
-        required_reserve = specialized_remaining + SHARED_HEADROOM_VCPUS
-        quota_capacity = actual + max(
-            0, (shared_ceiling_free - required_reserve) // VCPUS_PER_WORKER
-        )
-    budget_capacity = actual
     waiting = queued_items(state)
-    projected_reservations = 0.0
-    projected_family_vcpus = {}
-    if waiting:
-        for slot in range(1, env["max_workers"] + 1):
-            if str(slot) in state["workers"]:
-                continue
-            family = SKU_PLAN[slot][1]
-            family_free = (metrics.get("family_free_vcpus") or {}).get(family)
-            used = projected_family_vcpus.get(family, 0)
-            if not isinstance(family_free, int) or family_free - used < VCPUS_PER_WORKER:
-                continue
-            admitted, _, increment = admission_result(
-                env, state, inventory, slot, waiting[0], extra_reservations=projected_reservations
-            )
-            if admitted:
-                budget_capacity += 1
-                projected_reservations += increment
-                projected_family_vcpus[family] = used + VCPUS_PER_WORKER
-    desired = min(
-        total_work, env["max_workers"], max(actual, quota_capacity), max(actual, budget_capacity)
-    )
-    return max(actual, desired)
+    provisional = []
+    for slot in range(1, env["max_workers"] + 1):
+        if len(provisional) >= len(waiting) or str(slot) in state["workers"]:
+            continue
+        item = waiting[len(provisional)]
+        admitted, _, increment = admission_result(
+            env, state, inventory, slot, item, provisional=provisional
+        )
+        if not admitted:
+            continue
+        sku, family = SKU_PLAN[slot]
+        provisional.append({
+            "reservation_id": "projected-author-slot-{}".format(slot),
+            "role": "author",
+            "sku": sku,
+            "sku_family": family,
+            "vcpus": VCPUS_PER_WORKER,
+            "amount_usd": increment,
+            "discretionary": item.get("discretionary", True),
+        })
+    return max(actual, min(total_work, env["max_workers"], actual + len(provisional)))
 
 
 def action_id(action):
@@ -1047,6 +1217,25 @@ def status_projection(env, state, inventory=None):
             retained_disks += sum(
                 1 for kind in ("task-disk", "account-disk") if kind in worker.get("resources", {})
             )
+    local_capacity = list(state.get("capacity_reservations", {}).values())
+    specialized_queued = sum(1 for item in local_capacity if item.get("status") == "queued")
+    specialized_reserved = sum(1 for item in local_capacity if item.get("status") == "reserved")
+    specialized_reserved_vcpus = sum(
+        item.get("vcpus", 0) for item in local_capacity if item.get("status") == "reserved"
+    )
+    regional_committed = None
+    family_committed = {}
+    if inventory is not None:
+        try:
+            commitments = capacity_commitments(state, inventory)
+            regional_committed = commitments["regional_committed"]
+            family_committed = commitments["family_committed"]
+            specialized_reserved = len(commitments["specialized_reservations"])
+            specialized_reserved_vcpus = sum(
+                item["vcpus"] for item in commitments["specialized_reservations"].values()
+            )
+        except LifecycleError:
+            pass
     hours = worker_seconds(state) / 3600.0
     return {
         "schema": "fm.worker-status/v1",
@@ -1070,6 +1259,11 @@ def status_projection(env, state, inventory=None):
         "author_plan_vcpus": AUTHOR_PLAN_VCPUS,
         "specialized_shape_vcpus": SPECIALIZED_SHAPE_VCPUS,
         "specialized_active_vcpus": metrics.get("specialized_active_vcpus"),
+        "specialized_queued_reservations": specialized_queued,
+        "specialized_reserved_reservations": specialized_reserved,
+        "specialized_reserved_vcpus": specialized_reserved_vcpus,
+        "regional_observed_plus_reserved_vcpus": regional_committed,
+        "family_observed_plus_reserved_vcpus": family_committed,
         "shared_headroom_vcpus": SHARED_HEADROOM_VCPUS,
         "idle_cooldown_seconds": env["cooldown_seconds"],
         "warm_idle_target": env["warm_idle"],
@@ -1097,10 +1291,14 @@ def print_status(status, json_output):
         status["active_admission_limit_usd"], status["planning_target_usd"],
         status["commissioning_ceiling_usd"],
     ))
-    print("regional-capacity: used={}/{} author-plan={} specialized={}/{} shared-headroom={}".format(
-        status["regional_observed_used_vcpus"], status["regional_admission_ceiling_vcpus"],
-        status["author_plan_vcpus"], status["specialized_active_vcpus"],
+    print("regional-capacity: used={} committed={}/{} author-plan={} specialized-active={} specialized-reserved={}/{} shared-headroom={}".format(
+        status["regional_observed_used_vcpus"], status["regional_observed_plus_reserved_vcpus"],
+        status["regional_admission_ceiling_vcpus"], status["author_plan_vcpus"],
+        status["specialized_active_vcpus"], status["specialized_reserved_vcpus"],
         status["specialized_shape_vcpus"], status["shared_headroom_vcpus"],
+    ))
+    print("specialized-queue: queued={} reserved={}".format(
+        status["specialized_queued_reservations"], status["specialized_reserved_reservations"],
     ))
     print("idle: cooldown={}s warm={} retained-disks={} cleanup-refusals={}".format(
         status["idle_cooldown_seconds"], status["warm_idle_target"],
@@ -1131,6 +1329,27 @@ def parser():
     proof = sub.add_parser("proof-template", help="print the exact release-receipt skeleton")
     proof.add_argument("--task", required=True)
     proof.add_argument("--task-generation", required=True)
+
+    capacity = sub.add_parser("capacity-reserve", help="queue and admit one specialized Azure reservation")
+    capacity.add_argument("--reservation-id", required=True)
+    capacity.add_argument("--fence-binding", required=True)
+    capacity.add_argument("--role", choices=(
+        "validation", "review", "browser", "networkless-verifier", "crosscheck"
+    ), required=True)
+    capacity.add_argument("--sku", required=True)
+    capacity.add_argument("--sku-family", required=True)
+    capacity.add_argument("--vcpus", type=int, required=True)
+    capacity.add_argument("--amount-usd", type=float, required=True)
+    capacity.add_argument("--required", action="store_true")
+    capacity.add_argument("--confirm-subscription", required=True)
+
+    capacity_release = sub.add_parser(
+        "capacity-release", help="release one exact specialized reservation after zero-compute proof"
+    )
+    capacity_release.add_argument("--reservation-id", required=True)
+    capacity_release.add_argument("--fence-binding", required=True)
+    capacity_release.add_argument("--cleanup-receipt", required=True)
+    capacity_release.add_argument("--confirm-subscription", required=True)
 
     release = sub.add_parser("release", help="accept exact ordinary lifecycle proofs")
     release.add_argument("--task", required=True)
@@ -1228,6 +1447,118 @@ def command_reconcile(env, args):
                     (action.get("bindings") or {}).get("assignment_generation", "n/a"),
                 ))
         print_status(status, False)
+
+
+def specialized_reservation_from_args(args):
+    reservation_id = require_id("capacity reservation id", args.reservation_id)
+    fence = require_binding("capacity reservation fence", args.fence_binding)
+    canonical_family = REVIEWED_SKU_FAMILY.get(args.sku)
+    if canonical_family is None or canonical_family.lower() != args.sku_family.lower():
+        raise LifecycleError("specialized reservation SKU and exact family are not reviewed together")
+    if args.vcpus != 4:
+        raise LifecycleError("specialized reservation must use the reviewed four-vCPU shape")
+    if not math.isfinite(args.amount_usd) or args.amount_usd <= 0:
+        raise LifecycleError("specialized reservation cost must be finite and positive")
+    return {
+        "schema": CAPACITY_RESERVATION_SCHEMA,
+        "reservation_id": reservation_id,
+        "fence_binding": fence,
+        "role": "specialized",
+        "workload_role": args.role,
+        "sku": args.sku,
+        "sku_family": canonical_family,
+        "vcpus": args.vcpus,
+        "amount_usd": round(args.amount_usd, 6),
+        "discretionary": not args.required,
+        "status": "queued",
+        "queued_at": iso_utc(),
+        "reserved_at": None,
+        "released_at": None,
+        "cleanup_receipt": None,
+        "last_refusal": None,
+    }
+
+
+def command_capacity_reserve(env, args):
+    if args.confirm_subscription != env["subscription"]:
+        raise LifecycleError("--confirm-subscription must exactly match FM_AZURE_SUBSCRIPTION_ID")
+    candidate = specialized_reservation_from_args(args)
+    reservation_id = candidate["reservation_id"]
+    with controller_lock(env):
+        state = load_state(env)
+        existing = state["capacity_reservations"].get(reservation_id)
+        readmission_id = None
+        identity_fields = (
+            "schema", "reservation_id", "fence_binding", "role", "workload_role", "sku",
+            "sku_family", "vcpus", "amount_usd", "discretionary",
+        )
+        if existing is not None:
+            if any(existing.get(field) != candidate.get(field) for field in identity_fields):
+                raise LifecycleError("capacity reservation id already has a different exact identity")
+            if existing.get("status") == "released":
+                raise LifecycleError("released capacity reservation identity cannot be reused")
+            if existing.get("status") == "reserved":
+                readmission_id = reservation_id
+            candidate = existing
+        else:
+            state["capacity_reservations"][reservation_id] = candidate
+            save_state(env, state)
+        actual = None
+        forecast = None
+        try:
+            inventory = provider_call(env, "inventory")["inventory"]
+            state["last_metrics"] = metrics_from_inventory(inventory)
+            actual = inventory["metrics"].get("actual_usd")
+            forecast = inventory["metrics"].get("forecast_usd")
+            admitted, reason = capacity_admission(
+                env, state, inventory, candidate,
+                ignore_reservation_id=readmission_id,
+            )
+        except LifecycleError as exc:
+            admitted, reason = False, str(exc)
+        if admitted:
+            candidate["status"] = "reserved"
+            candidate["reserved_at"] = candidate.get("reserved_at") or iso_utc()
+            candidate["last_refusal"] = None
+        else:
+            candidate["status"] = "queued"
+            candidate["last_refusal"] = {"at": iso_utc(), "reason": reason[:500]}
+        save_state(env, state)
+    print(json.dumps({
+        "reservation_id": reservation_id,
+        "status": candidate["status"],
+        "reason": "" if admitted else reason,
+        "actual_usd": actual,
+        "forecast_usd": forecast,
+        "admission_limit_usd": budget_limit(env),
+    }, sort_keys=True, separators=(",", ":")))
+
+
+def command_capacity_release(env, args):
+    if args.confirm_subscription != env["subscription"]:
+        raise LifecycleError("--confirm-subscription must exactly match FM_AZURE_SUBSCRIPTION_ID")
+    reservation_id = require_id("capacity reservation id", args.reservation_id)
+    fence = require_binding("capacity reservation fence", args.fence_binding)
+    receipt = require_binding("capacity cleanup receipt", args.cleanup_receipt)
+    with controller_lock(env):
+        state = load_state(env)
+        reservation = state["capacity_reservations"].get(reservation_id)
+        if reservation is None:
+            raise LifecycleError("capacity release has no exact durable reservation")
+        if reservation.get("fence_binding") != fence:
+            raise LifecycleError("capacity release fence binding is not exact")
+        if reservation.get("status") == "released":
+            if reservation.get("cleanup_receipt") != receipt:
+                raise LifecycleError("capacity reservation already has a different cleanup receipt")
+            print("capacity reservation already released with exact zero-compute proof")
+            return
+        if reservation.get("status") not in ("queued", "reserved"):
+            raise LifecycleError("capacity reservation status is not releasable")
+        reservation["status"] = "released"
+        reservation["released_at"] = iso_utc()
+        reservation["cleanup_receipt"] = receipt
+        save_state(env, state)
+    print("specialized capacity reservation released after exact zero-compute proof")
 
 
 def command_release(env, args):
@@ -1371,6 +1702,10 @@ def main(argv=None):
     env = environment()
     if args.command == "request":
         command_request(env, args)
+    elif args.command == "capacity-reserve":
+        command_capacity_reserve(env, args)
+    elif args.command == "capacity-release":
+        command_capacity_release(env, args)
     elif args.command == "reconcile":
         command_reconcile(env, args)
     elif args.command == "proof-template":

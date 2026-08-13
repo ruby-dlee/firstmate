@@ -677,7 +677,7 @@ test_extended_mutating_entrypoints_refuse_gate_context() {
   stack="$TMP/extended-report-stack"
   mkdir -p "$home/state" "$home/data" "$home/projects"
 
-  for name in crosscheck fleet-sync x-reply x-dismiss x-followup x-link x-poll watch watch-arm watch-checkpoint wake-drain brief ensure-agents lock review-diff supervise-daemon worker-lifecycle; do
+  for name in crosscheck fleet-sync x-reply x-dismiss x-followup x-link x-poll watch watch-arm watch-checkpoint wake-drain brief ensure-agents lock review-diff supervise-daemon worker-lifecycle worker-capacity-reserve worker-capacity-release; do
     case "$name" in
       crosscheck) script=$(guarded_script "$NORMAL_CWD" "$CROSSCHECK"); set -- run task-x https://github.com/example/repo/pull/9 ;;
       fleet-sync) script=$(guarded_script "$NORMAL_CWD" "$FLEET_SYNC"); set -- --help ;;
@@ -696,6 +696,8 @@ test_extended_mutating_entrypoints_refuse_gate_context() {
       review-diff) script=$(guarded_script "$NORMAL_CWD" "$REVIEW_DIFF"); set -- task-x ;;
       supervise-daemon) script=$(guarded_script "$NORMAL_CWD" "$SUPERVISE_DAEMON"); set -- ;;
       worker-lifecycle) script=$(guarded_script "$NORMAL_CWD" "$WORKER_LIFECYCLE"); set -- reconcile --apply ;;
+      worker-capacity-reserve) script=$(guarded_script "$NORMAL_CWD" "$WORKER_LIFECYCLE"); set -- capacity-reserve ;;
+      worker-capacity-release) script=$(guarded_script "$NORMAL_CWD" "$WORKER_LIFECYCLE"); set -- capacity-release ;;
     esac
     out=$(cd "$NORMAL_CWD" && env -u FM_GATE_REFUSE_BYPASS NO_MISTAKES_GATE=1 \
       FM_HOME="$home" FM_ROOT_OVERRIDE="$NORMAL_CWD" FM_STATE_OVERRIDE="$home/state" \

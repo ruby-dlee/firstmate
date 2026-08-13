@@ -58,32 +58,67 @@ It does not bypass unreadable cost or quota evidence, identity checks, the sixte
 
 ## Desired capacity and admission
 
+The same durable allocator also owns specialized reservations through `capacity-reserve` and `capacity-release`.
+Every caller uses the canonical Firstmate control home and its one shared state directory; `FM_AZURE_SHARED_CAPACITY_STATE_DIR` may relocate that directory only for an explicitly configured installation and must be identical for all callers.
+A validation, review, browser, networkless-verifier, or Crosscheck caller submits one exact reservation ID and fence binding, reviewed SKU/family pair, four-vCPU shape, and finite worst-case cost before creating compute.
+Admission returns `reserved` or leaves the request durably `queued`; callers must not create compute for a queued reservation.
+The existing disposable runner invokes this path before its Azure management reservation and VM creation, then releases the shared reservation only after exact VM/NIC/OS-disk absence.
+Restarting either controller is idempotent under the same reservation ID and fence, while a changed identity refuses.
+
 The controller computes desired active capacity from all eligible queued and assigned work, current exact assignments, the sixteen-worker software cap, one shared East US regional ceiling, live exact-family quota, actual and forecast spend, and durable per-assignment cost reservations.
 Quota is only capacity and never creates demand.
 The reviewed shared ceiling is 128 regional vCPUs, with zero VM vCPUs used at the latest foundation evidence boundary.
 The author plan uses 64 vCPUs across sixteen 4-vCPU workers drawn from eight unrestricted families whose reviewed allowance is 10 vCPUs each.
 The same 128-vCPU ceiling reserves the existing 40-vCPU specialized validation shape plus 22 vCPUs of shared landing, replacement, recovery, browser, and control-plane headroom.
 A future 2-vCPU supervisor is ordinary observed regional usage, so 64 author + 40 specialized + 22 shared headroom + 2 supervisor equals the 128-vCPU ceiling.
-Active specialized VMs consume their portion of the reserved 40-vCPU shape instead of being counted against a fictional separate quota, while any unused part stays reserved for their queued demand.
+Active specialized VMs and their durable pending runner reservations consume the same 40-vCPU specialized shape instead of being counted against a fictional separate quota, while any unused part stays reserved for queued specialized demand.
+For the region and every exact family, admission uses `max(Azure observed usage, exact active fleet vCPUs) + exact reservations without active compute + candidate`; this closes both Azure telemetry lag and duplicate active/reserved counting.
+An active specialized VM without one exact reservation, a reservation with foreign ownership, a duplicate invocation, an unknown SKU/family, or unreadable family usage/limit fails the shared inventory closed.
 Unrelated or control-plane VM usage is also included by Azure's regional usage value.
 Combined author and specialized demand beyond the shared 128-vCPU ceiling remains queued, as does demand beyond budget.
 The live 10-vCPU Dav6 family limit admits only its two reviewed author slots and is not treated as a requirement for homogeneous Dav6=96 capacity.
 Every later mixed-family slot proves its own exact current family allowance.
 No capacity reservation creates an always-on worker pool, and queue-empty still drives general worker compute to zero.
 
-Commissioning uses 3,500 aggregate worker-hours and $1,000 as planning and warning thresholds.
+Commissioning uses 3,500 aggregate author worker-hours and $1,000 as planning and warning thresholds; shared actual/forecast cost admission covers all workloads regardless of that author-hour counter.
 The thresholds do not terminate work or erase demand.
-New discretionary author launches stop before the greater of actual or forecast spend plus durable outstanding reservations and the new assignment reservation reaches $1,500.
-Each reservation uses the selected SKU's live retail rate, the configurable expected author interval, and a conservative retained-disk/control allowance.
+New discretionary author and specialized launches stop before the greater of actual or forecast spend plus all durable author and specialized reservations and the candidate reservation reaches $1,500.
+An author reservation uses the selected SKU's live retail rate, the configurable expected author interval, and a conservative retained-disk/control allowance.
+A specialized reservation uses the runner's exact finite 24-hour itemized maximum.
+The runner's commissioning path no longer bypasses cumulative actual or forecast admission; its exact `$1,500` Azure Budget remains a prerequisite and the allocator additionally requires readable shared Cost Management actual and forecast values.
 Cost Management, family quota, regional quota, and retail rates must all be readable before a new launch.
 Actual and forecast cost queries cover the complete shared resource group, including author, validation, review, browser, recovery, networking, storage, and monitoring spend rather than granting specialized work a separate budget.
-Lagging billing telemetry cannot admit concurrent author work twice because local outstanding reservations are added before each action, while each specialized substrate keeps its own durable reservation inside that same actual/forecast boundary.
+Lagging billing telemetry cannot admit concurrent work twice because both local author assignments and disposable-runner management reservations are merged into the same actual/forecast admission pressure.
+Provider reservations are cross-checked against any local reservation with the same ID; conflicting SKU, family, vCPU, or amount bindings refuse rather than double-count or guess.
 
 After stabilization, set `FM_AZURE_WORKER_POLICY_PHASE=steady` and tune `FM_AZURE_WORKER_STEADY_TARGET_USD` toward $1,000.
 That changes the admission limit without changing resource identity or lifecycle design.
 The commissioning ceiling must remain exactly $1,500.
 Budget pressure never deallocates, deletes, duplicates, or terminates active or unlanded work.
-It blocks new discretionary author capacity and allows only ordinary idle cleanup.
+It blocks new discretionary author and specialized capacity and allows only ordinary idle cleanup.
+
+Example specialized reservation flow (the disposable runner performs this automatically):
+
+```sh
+bin/fm-worker-lifecycle.sh capacity-reserve \
+  --reservation-id '<invocation-id>' \
+  --fence-binding '<64-lowercase-hex>' \
+  --role validation \
+  --sku Standard_D4as_v7 \
+  --sku-family StandardDasv7Family \
+  --vcpus 4 \
+  --amount-usd '<finite-worst-case-cost>' \
+  --confirm-subscription "$FM_AZURE_SUBSCRIPTION_ID"
+
+bin/fm-worker-lifecycle.sh capacity-release \
+  --reservation-id '<invocation-id>' \
+  --fence-binding '<same-64-lowercase-hex>' \
+  --cleanup-receipt '<64-lowercase-hex-zero-compute-proof>' \
+  --confirm-subscription "$FM_AZURE_SUBSCRIPTION_ID"
+```
+
+`capacity-release` never deletes cloud state.
+It records that the specialized owner has already proved exact compute absence; ambiguity leaves the reservation consuming capacity and budget.
 
 ## Assignment and isolation
 
@@ -173,7 +208,7 @@ A provider error preserves the pending action and records a bounded cleanup refu
 The next controller process replays that exact action before considering new work.
 
 `status` is local and bounded by default, while `status --live` refreshes Azure and cost evidence.
-The output includes queue and eligible depths, desired and actual active workers, all five classification counts, assignment generations, worker-hours and warning threshold, actual and forecast spend, active policy phase and limit, the 128-vCPU regional ceiling and observed usage, the 64-vCPU author plan, active and reserved specialized capacity, 22-vCPU shared headroom, cooldown, warm target, retained-disk count, and the last ten cleanup refusals.
+The output includes author and specialized queue depths, desired and actual active workers, all five classification counts, assignment generations, worker-hours and warning threshold, actual and forecast spend, active policy phase and limit, the 128-vCPU regional ceiling plus observed and observed-plus-reserved usage, exact-family observed-plus-reserved commitments, the 64-vCPU author plan, active and reserved specialized capacity, 22-vCPU shared headroom, cooldown, warm target, retained-disk count, and the last ten cleanup refusals.
 It omits subscription IDs, resource IDs, account identities, account digests, worktree digests, private addresses, credentials, and secrets.
 
 ## Operator policy and overrides

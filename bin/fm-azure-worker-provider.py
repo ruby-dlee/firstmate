@@ -28,8 +28,10 @@ LANDED_FILES = (
     "bin/fm-azure-worker-provider.py",
     "bin/fm-worker-lifecycle.py",
     "bin/fm-worker-lifecycle.sh",
+    "bin/fm-azure-runner.py",
     "bin/fm-azure-pilot.sh",
     "docs/azure-pilot/main.json",
+    "docs/azure-runner.md",
     "docs/azure-workers.md",
 )
 REQUEST_SCHEMA = "fm.worker-provider-request/v1"
@@ -50,17 +52,31 @@ SPECIALIZED_ROLES = {
     "validation-shard", "validation-cell", "policy-review", "browser-tool",
     "networkless-verifier", "crosscheck-tool",
 }
-SKU_VCPUS = {
-    "Standard_D2as_v6": 2,
-    "Standard_D4as_v6": 4,
-    "Standard_D4as_v7": 4,
-    "Standard_D4s_v6": 4,
-    "Standard_D4ads_v7": 4,
-    "Standard_D4ads_v6": 4,
-    "Standard_E4as_v7": 4,
-    "Standard_E4as_v6": 4,
-    "Standard_D4ds_v6": 4,
+SAFE_INVOCATION = re.compile(r"^azr-[0-9a-f]{12}(?:-a[2-9][0-9]*)?$")
+RUNNER_COMMISSIONING_SKU_POOL = (
+    "Standard_D4as_v7",
+    "Standard_D4as_v6",
+    "Standard_D4s_v6",
+    "Standard_D4ads_v7",
+    "Standard_D4ads_v6",
+    "Standard_E4as_v7",
+    "Standard_E4as_v6",
+    "Standard_D4ds_v6",
+)
+REVIEWED_SKU_FAMILY = {
+    "Standard_D4as_v6": "standardDav6Family",
+    "Standard_D4as_v7": "StandardDasv7Family",
+    "Standard_D4s_v6": "StandardDsv6Family",
+    "Standard_D4ads_v7": "StandardDadsv7Family",
+    "Standard_D4ds_v6": "StandardDdsv6Family",
+    "Standard_D4s_v7": "StandardDsv7Family",
+    "Standard_D4ds_v7": "StandardDdsv7Family",
+    "Standard_D4ads_v6": "standardDadv6Family",
+    "Standard_E4as_v7": "StandardEasv7Family",
+    "Standard_E4as_v6": "standardEav6Family",
 }
+SKU_VCPUS = {sku: 4 for sku in REVIEWED_SKU_FAMILY}
+SKU_VCPUS["Standard_D2as_v6"] = 2
 SKU_PLAN = {
     1: ("Standard_D4as_v6", "standardDav6Family"),
     2: ("Standard_D4as_v6", "standardDav6Family"),
@@ -356,30 +372,126 @@ def retail_rate(sku):
     return min(prices) if prices else None
 
 
-def specialized_active_vcpus(controller, vms):
-    total = 0
+def specialized_capacity_inventory(controller, vms, identities):
+    active = {}
+    active_by_family = {}
     for vm in vms:
         tags = vm.get("tags") or {}
         if tags.get("firstmate-role") not in SPECIALIZED_ROLES:
             continue
+        invocation = tags.get("invocation-binding", "")
+        # The permanent validation-shards controller identity shares the role
+        # tag but has no invocation binding and is not disposable capacity.
+        if not invocation:
+            continue
         if not is_exact_fleet(controller, tags):
-            return None
+            raise ProviderError("specialized VM has foreign owner or deployment generation")
+        sku = tags.get("selected-sku") or (vm.get("hardwareProfile") or {}).get("vmSize")
+        family = tags.get("sku-family")
+        if (
+            not SAFE_INVOCATION.match(invocation)
+            or sku not in SKU_VCPUS
+            or family is None
+            or family.lower() != REVIEWED_SKU_FAMILY.get(sku, "").lower()
+        ):
+            raise ProviderError("specialized VM capacity identity is malformed")
         power = str(vm.get("powerState") or vm.get("power_state") or "unknown").lower()
         if "deallocated" in power:
             continue
-        sku = tags.get("selected-sku") or (vm.get("hardwareProfile") or {}).get("vmSize")
-        vcpus = SKU_VCPUS.get(sku)
-        if vcpus is None:
-            return None
-        total += vcpus
-    return total
+        if invocation in active:
+            raise ProviderError("specialized VM invocation is duplicated")
+        active[invocation] = {"sku": sku, "sku_family": family, "vcpus": SKU_VCPUS[sku]}
+        active_by_family[family] = active_by_family.get(family, 0) + SKU_VCPUS[sku]
+
+    reservations = []
+    seen = set()
+    for identity in identities:
+        tags = identity.get("tags") or {}
+        if tags.get("firstmate-role") != "runner-cost-reservation":
+            continue
+        if not is_exact_fleet(controller, tags):
+            raise ProviderError("runner reservation has foreign owner or deployment generation")
+        invocation = tags.get("invocation-binding", "")
+        sku = tags.get("selected-sku", "")
+        family = tags.get("sku-family", "")
+        mode = tags.get("cost-admission-mode")
+        ordinal_text = tags.get("cell-ordinal", "")
+        principal = (identity.get("properties") or {}).get("principalId") or identity.get("principalId")
+        expected_name = "id-{}-rsv-{}".format(
+            controller["prefix"], invocation.split("-")[1] if SAFE_INVOCATION.match(invocation) else "invalid"
+        )
+        expected_id = exact_id(
+            controller, "Microsoft.ManagedIdentity", "userAssignedIdentities", expected_name
+        )
+        try:
+            amount_microusd = int(tags.get("amount-microusd", ""))
+        except (TypeError, ValueError):
+            amount_microusd = 0
+        exact_slot = ordinal_text == "none" and mode == "strict"
+        if mode == "commissioning-bounded":
+            try:
+                ordinal = int(ordinal_text)
+            except (TypeError, ValueError):
+                ordinal = 0
+            exact_slot = (
+                1 <= ordinal <= 16
+                and sku == RUNNER_COMMISSIONING_SKU_POOL[(ordinal - 1) // 2]
+            )
+        cleanup = tags.get("cleanup-verified-at", "")
+        cleanup_complete = cleanup != "none"
+        if cleanup_complete:
+            try:
+                dt.datetime.fromisoformat(cleanup.replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                raise ProviderError("runner reservation cleanup marker is malformed")
+        if (
+            not SAFE_INVOCATION.match(invocation)
+            or invocation in seen
+            or identity.get("location") != "eastus"
+            or str(identity.get("id", "")).lower() != expected_id.lower()
+            or sku not in SKU_VCPUS
+            or REVIEWED_SKU_FAMILY.get(sku, "").lower() != family.lower()
+            or mode not in ("strict", "commissioning-bounded")
+            or not exact_slot
+            or amount_microusd <= 0
+            or cleanup == ""
+            or not re.fullmatch(r"[0-9a-f]{64}", tags.get("fence-digest", ""))
+            or not tags.get("reserved-at")
+            or not tags.get("compute-deadline")
+            or not principal
+            or tags.get("reservation-principal") != principal
+        ):
+            raise ProviderError("runner reservation capacity identity is not exact")
+        seen.add(invocation)
+        if cleanup_complete:
+            if invocation in active:
+                raise ProviderError("cleaned runner reservation still owns active compute")
+            continue
+        reservations.append({
+            "reservation_id": invocation,
+            "role": "specialized",
+            "sku": sku,
+            "sku_family": family,
+            "vcpus": SKU_VCPUS[sku],
+            "amount_usd": amount_microusd / 1_000_000,
+            "active": invocation in active,
+        })
+    missing = sorted(set(active) - seen)
+    if missing:
+        raise ProviderError("active specialized VM has no exact durable reservation")
+    return reservations, active_by_family
 
 
-def metrics(controller, vms):
+def metrics(controller, vms, capacity_reservations, specialized_active_by_family):
     usage, rc, _ = az(controller, ["vm", "list-usage", "--location", "eastus"], check=False)
     regional_limit = None
     regional_used = None
     family_free = {}
+    family_limit = {}
+    family_used = {}
+    wanted_families = set(REVIEWED_SKU_FAMILY.values()) | {
+        reservation["sku_family"] for reservation in capacity_reservations
+    }
     if rc == 0 and isinstance(usage, list):
         for item in usage:
             name = str((item.get("name") or {}).get("value", ""))
@@ -391,15 +503,20 @@ def metrics(controller, vms):
             if name.lower() == "cores":
                 regional_limit = limit
                 regional_used = used
-            for _, family in SKU_PLAN.values():
+            for family in wanted_families:
                 if name.lower() == family.lower():
+                    family_limit[family] = limit
+                    family_used[family] = used
                     family_free[family] = limit - used
     return {
         "actual_usd": cost_query(controller, False),
         "forecast_usd": cost_query(controller, True),
         "regional_limit_vcpus": regional_limit,
         "regional_used_vcpus": regional_used,
-        "specialized_active_vcpus": specialized_active_vcpus(controller, vms),
+        "specialized_active_vcpus": sum(specialized_active_by_family.values()),
+        "specialized_active_by_family": specialized_active_by_family,
+        "family_limit_vcpus": family_limit,
+        "family_used_vcpus": family_used,
         "family_free_vcpus": family_free,
         "sku_hourly_usd": {sku: retail_rate(sku) for sku, _ in sorted(set(SKU_PLAN.values()))},
     }
@@ -533,17 +650,26 @@ def inventory(controller, include_metrics=True):
         if nic and nic.get("attached_to") and vm and nic["attached_to"].lower() != vm["id"].lower():
             conflicts.append({"kind": "nic", "slot": slot, "reason": "NIC is attached to another VM"})
 
+    capacity_reservations, specialized_active_by_family = specialized_capacity_inventory(
+        controller, vms, identities
+    )
     result = {
         "schema": INVENTORY_SCHEMA,
         "observed_at": iso_utc(),
         "workers": [workers[slot] for slot in sorted(workers)],
+        "capacity_reservations": capacity_reservations,
         "conflicts": conflicts,
-        "metrics": metrics(controller, vms) if include_metrics else {
+        "metrics": metrics(
+            controller, vms, capacity_reservations, specialized_active_by_family
+        ) if include_metrics else {
             "actual_usd": None,
             "forecast_usd": None,
             "regional_limit_vcpus": None,
             "regional_used_vcpus": None,
             "specialized_active_vcpus": None,
+            "specialized_active_by_family": {},
+            "family_limit_vcpus": {},
+            "family_used_vcpus": {},
             "family_free_vcpus": {},
             "sku_hourly_usd": {},
         },

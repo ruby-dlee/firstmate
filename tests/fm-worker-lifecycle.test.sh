@@ -27,6 +27,7 @@ for marker in (
     "REGIONAL_ADMISSION_CEILING_VCPUS = 128", "AUTHOR_PLAN_VCPUS = MAX_WORKERS * VCPUS_PER_WORKER",
     "SPECIALIZED_SHAPE_VCPUS = 40", "SHARED_HEADROOM_VCPUS = 22", "MAX_WORKERS = 16",
     'FM_AZURE_WORKER_WARM_IDLE currently must remain zero', "pending_action",
+    "capacity-reserve", "capacity-release", "merged_specialized_reservations",
     "endpoint_receipt", "landed_work_receipt", "account_release_receipt",
 ):
     assert marker in controller, marker
@@ -37,9 +38,11 @@ for marker in (
 ):
     assert marker in azure, marker
 for marker in (
-    "sixteen 4-vCPU workers", "$1,500", "3,500 aggregate worker-hours",
+    "sixteen 4-vCPU workers", "$1,500", "3,500 aggregate author worker-hours",
     "downloaded self-contained form artifact", "returns through a file",
     "Combined author and specialized demand beyond the shared 128-vCPU ceiling remains queued",
+    "max(Azure observed usage, exact active fleet vCPUs)",
+    "commissioning path no longer bypasses cumulative actual or forecast admission",
     "No capacity reservation creates an always-on worker pool",
     "Every acceptance leg needs a positive control", "warm-idle target is zero",
 ):
@@ -126,10 +129,13 @@ metrics = {
     "actual_usd": 100.0, "forecast_usd": 200.0,
     "regional_limit_vcpus": 128, "regional_used_vcpus": 2,
     "specialized_active_vcpus": 0,
+    "specialized_active_by_family": {},
+    "family_limit_vcpus": {family: 10 for _, family in module.SKU_PLAN.values()},
+    "family_used_vcpus": {family: 0 for _, family in module.SKU_PLAN.values()},
     "family_free_vcpus": {family: 10 for _, family in module.SKU_PLAN.values()},
     "sku_hourly_usd": {sku: 0.25 for sku, _ in module.SKU_PLAN.values()},
 }
-inventory = {"metrics": metrics, "workers": [], "conflicts": []}
+inventory = {"metrics": metrics, "workers": [], "capacity_reservations": [], "conflicts": []}
 assert module.admission_result(env, state, inventory, 1, item)[0] is True
 for field in ("actual_usd", "forecast_usd"):
     changed = copy.deepcopy(inventory)
@@ -139,15 +145,29 @@ changed = copy.deepcopy(inventory)
 changed["metrics"]["regional_limit_vcpus"] = 127
 assert module.admission_result(env, state, changed, 1, item)[0] is False
 changed = copy.deepcopy(inventory)
-changed["metrics"]["specialized_active_vcpus"] = None
+changed["metrics"]["family_used_vcpus"] = None
 assert module.admission_result(env, state, changed, 1, item)[0] is False
+active_specialized = []
+specialized_families = [
+    family for _, family in module.SKU_PLAN.values() if family != module.SKU_PLAN[1][1]
+]
+for index in range(10):
+    family = specialized_families[index % len(specialized_families)]
+    sku = next(sku for sku, candidate_family in module.REVIEWED_SKU_FAMILY.items() if candidate_family == family)
+    active_specialized.append({
+        "reservation_id": "azr-{:012x}".format(index + 1), "role": "specialized",
+        "sku": sku, "sku_family": family, "vcpus": 4,
+        "amount_usd": 1.0, "active": True,
+    })
 changed = copy.deepcopy(inventory)
+changed["capacity_reservations"] = active_specialized
 changed["metrics"].update({"regional_used_vcpus": 102, "specialized_active_vcpus": 40})
 assert module.admission_result(env, state, changed, 1, item)[0] is True
 changed["metrics"]["regional_used_vcpus"] = 106
 assert module.admission_result(env, state, changed, 1, item)[0] is False
 changed = copy.deepcopy(inventory)
-changed["metrics"]["family_free_vcpus"][module.SKU_PLAN[1][1]] = 3
+family = module.SKU_PLAN[1][1]
+changed["metrics"]["family_used_vcpus"][family] = 8
 assert module.admission_result(env, state, changed, 1, item)[0] is False
 changed = copy.deepcopy(inventory)
 changed["metrics"]["forecast_usd"] = 1499.0
@@ -167,12 +187,52 @@ for index in range(17):
     state["queue"][module.request_key(queued["task"], queued["task_generation"])] = queued
 assert module.desired_count(env, state, inventory) == 16
 specialized = copy.deepcopy(inventory)
+specialized["capacity_reservations"] = active_specialized
+for reservation in active_specialized:
+    family = reservation["sku_family"]
+    specialized["metrics"]["family_used_vcpus"][family] = min(
+        8, specialized["metrics"]["family_used_vcpus"].get(family, 0) + 4
+    )
 specialized["metrics"].update({"regional_used_vcpus": 42, "specialized_active_vcpus": 40})
-assert module.desired_count(env, state, specialized) == 16
+assert module.desired_count(env, state, specialized) < 16
 budgeted = copy.deepcopy(inventory)
 budgeted["metrics"]["actual_usd"] = 1499.0
 budgeted["metrics"]["forecast_usd"] = 1499.0
 assert module.desired_count(env, state, budgeted) == 0
+
+# One pending disposable-runner reservation consumes exact family, regional,
+# specialized-shape, and shared actual/forecast budget in the same admission.
+pending_runner = {
+    "reservation_id": "azr-ffffffffffff", "role": "specialized",
+    "sku": "Standard_D4as_v6", "sku_family": "standardDav6Family",
+    "vcpus": 4, "amount_usd": 50.0, "active": False,
+}
+with_runner = copy.deepcopy(inventory)
+with_runner["capacity_reservations"] = [pending_runner]
+commitments = module.capacity_commitments(state, with_runner)
+assert commitments["regional_committed"] == 6
+assert commitments["family_committed"]["standardDav6Family"] == 4
+assert commitments["specialized_committed"] == 4
+assert module.outstanding_cost_reservations(state, with_runner) == 50.0
+family_full = copy.deepcopy(with_runner)
+family_full["metrics"]["family_used_vcpus"]["standardDav6Family"] = 8
+assert module.admission_result(env, state, family_full, 1, item)[0] is False
+budget_full = copy.deepcopy(with_runner)
+budget_full["metrics"]["forecast_usd"] = 1450.0
+assert module.admission_result(env, state, budget_full, 1, item)[0] is False
+conflicting_local = copy.deepcopy(state)
+conflicting_local["capacity_reservations"] = {
+    "azr-ffffffffffff": {
+        "status": "reserved", "role": "specialized", "sku": "Standard_D4as_v7",
+        "sku_family": "StandardDasv7Family", "vcpus": 4, "amount_usd": 50.0,
+    }
+}
+try:
+    module.merged_specialized_reservations(conflicting_local, with_runner)
+except module.LifecycleError as exc:
+    assert "differs" in str(exc)
+else:
+    raise AssertionError("conflicting local/provider runner reservation was accepted")
 
 # Duplicate account and worktree ownership refuse independently.
 existing = next(iter(state["queue"].values()))
@@ -257,23 +317,53 @@ for key in tags:
     else:
         raise AssertionError("foreign task-disk tag accepted: {}".format(key))
 
-# Specialized validation demand consumes the same observed regional ceiling;
-# deallocated capacity is zero and unknown/foreign capacity fails closed.
+# Specialized validation demand and its durable reservation are exact shared
+# capacity inputs; active-without-reservation and foreign reservation identities fail closed.
+invocation = "azr-000000000001"
 specialized_tags = {
     "workload": "firstmate", "deployment-generation": "dep", "cleanup-owner": "owner",
-    "firstmate-role": "validation-shard", "selected-sku": "Standard_D4as_v6",
+    "firstmate-role": "validation-shard", "invocation-binding": invocation,
+    "selected-sku": "Standard_D4as_v6", "sku-family": "standardDav6Family",
 }
-specialized_vm = {"tags": specialized_tags, "powerState": "VM running"}
-assert module.specialized_active_vcpus(controller, [specialized_vm]) == 4
-deallocated_vm = copy.deepcopy(specialized_vm)
-deallocated_vm["powerState"] = "VM deallocated"
-assert module.specialized_active_vcpus(controller, [deallocated_vm]) == 0
-unknown_vm = copy.deepcopy(specialized_vm)
-unknown_vm["tags"]["selected-sku"] = "Standard_Unknown"
-assert module.specialized_active_vcpus(controller, [unknown_vm]) is None
-foreign_vm = copy.deepcopy(specialized_vm)
-foreign_vm["tags"]["cleanup-owner"] = "foreign"
-assert module.specialized_active_vcpus(controller, [foreign_vm]) is None
+specialized_vm = {
+    "tags": specialized_tags, "powerState": "VM running",
+    "hardwareProfile": {"vmSize": "Standard_D4as_v6"},
+}
+reservation_name = "id-fmtest-rsv-000000000001"
+reservation_id = module.exact_id(
+    controller, "Microsoft.ManagedIdentity", "userAssignedIdentities", reservation_name
+)
+reservation_tags = {
+    "workload": "firstmate", "deployment-generation": "dep", "cleanup-owner": "owner",
+    "firstmate-role": "runner-cost-reservation", "invocation-binding": invocation,
+    "selected-sku": "Standard_D4as_v6", "sku-family": "standardDav6Family",
+    "cost-admission-mode": "commissioning-bounded", "cell-ordinal": "3",
+    "amount-microusd": "1000000", "cleanup-verified-at": "none",
+    "fence-digest": "a" * 64, "reserved-at": "2026-01-01T00:00:00Z",
+    "compute-deadline": "2026-01-02T00:00:00Z", "reservation-principal": "principal",
+}
+reservation = {
+    "id": reservation_id, "location": "eastus",
+    "properties": {"principalId": "principal"}, "tags": reservation_tags,
+}
+capacity, active_family = module.specialized_capacity_inventory(
+    controller, [specialized_vm], [reservation]
+)
+assert capacity[0]["active"] is True and active_family["standardDav6Family"] == 4
+try:
+    module.specialized_capacity_inventory(controller, [specialized_vm], [])
+except module.ProviderError as exc:
+    assert "no exact durable reservation" in str(exc)
+else:
+    raise AssertionError("active specialized VM without reservation was accepted")
+foreign = copy.deepcopy(reservation)
+foreign["tags"]["cleanup-owner"] = "foreign"
+try:
+    module.specialized_capacity_inventory(controller, [], [foreign])
+except module.ProviderError as exc:
+    assert "foreign" in str(exc)
+else:
+    raise AssertionError("foreign specialized reservation was accepted")
 
 # Public IP relations are rejected while a private NIC is accepted.
 nic = {
@@ -317,7 +407,7 @@ except module.ProviderError as exc:
 else:
     raise AssertionError("tampered provider action accepted")
 PY
-  pass "Azure provider rejects every foreign immutable/tag identity, public NIC relation, unfenced disk delete, and stale action key"
+  pass "Azure provider rejects foreign worker identities, malformed runner reservations, public NICs, unfenced deletes, and stale action keys"
 }
 
 write_fixture_provider() {
@@ -430,7 +520,8 @@ else:
         "actual_usd": state["metrics"]["actual_usd"],
         "forecast_usd": state["metrics"]["forecast_usd"],
         "regional_limit_vcpus": 128, "regional_used_vcpus": 2 + 4 * active,
-        "specialized_active_vcpus": 0,
+        "specialized_active_vcpus": 0, "specialized_active_by_family": {},
+        "family_limit_vcpus": {}, "family_used_vcpus": {},
         "family_free_vcpus": {}, "sku_hourly_usd": {},
     }
     plan = {
@@ -444,12 +535,14 @@ else:
         15:("Standard_D4ds_v6","StandardDdsv6Family"),16:("Standard_D4ds_v6","StandardDdsv6Family"),
     }
     for sku, family in plan.values():
-        metrics["family_free_vcpus"][family] = 100
+        metrics["family_limit_vcpus"][family] = 10
+        metrics["family_used_vcpus"][family] = 0
+        metrics["family_free_vcpus"][family] = 10
         metrics["sku_hourly_usd"][sku] = 0.25
     inventory = {
         "schema": "fm.worker-provider-inventory/v1", "observed_at": "2026-01-01T00:00:00Z",
         "workers": [state["workers"][key] for key in sorted(state["workers"], key=int)],
-        "conflicts": [], "metrics": metrics,
+        "capacity_reservations": [], "conflicts": [], "metrics": metrics,
     }
     result = inventory
 
@@ -520,7 +613,10 @@ def controller_state():
     return json.loads((Path(env["FM_HOME"]) / "state/azure-workers/controller.json").read_text())
 
 def fixture_state():
-    return json.loads(Path(fixture_path).read_text())
+    path = Path(fixture_path)
+    if not path.exists():
+        return {"workers": {}, "seen": {}, "calls": [], "metrics": {}}
+    return json.loads(path.read_text())
 
 def release(number):
     state = controller_state()
@@ -633,6 +729,148 @@ PY
   pass "operator flow scales out, resets before reuse, drains to zero, resumes dirty disks, and stops budgeted admission without killing work"
 }
 
+shared_specialized_cli() {
+  local tmp provider fixture home fence receipt out state_file
+  fm_test_tmproot_into tmp fm-shared-specialized
+  provider="$tmp/provider.py"
+  fixture="$tmp/provider-state.json"
+  home="$tmp/home"
+  mkdir -p "$home"
+  write_fixture_provider "$provider"
+  fence=$(printf reservation-fence | shasum -a 256 | awk '{print $1}')
+  receipt=$(printf cleanup-proof | shasum -a 256 | awk '{print $1}')
+  out=$(env \
+    FM_HOME="$home" \
+    FM_AZURE_SUBSCRIPTION_ID="$SUB" \
+    FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
+    FM_AZURE_OWNER_TAG=owner \
+    FM_AZURE_NAMING_PREFIX=fmtest \
+    FM_WORKER_PROVIDER_COMMAND="python3 $provider" \
+    FIXTURE_STATE="$fixture" \
+    "$WRAPPER" capacity-reserve \
+      --reservation-id azr-123456789abc \
+      --fence-binding "$fence" \
+      --role validation \
+      --sku Standard_D4as_v7 \
+      --sku-family StandardDasv7Family \
+      --vcpus 4 \
+      --amount-usd 25 \
+      --confirm-subscription "$SUB")
+  python3 - "$out" <<'PY' || fail "specialized capacity reservation did not admit"
+import json
+import sys
+value = json.loads(sys.argv[1])
+assert value["status"] == "reserved"
+assert value["actual_usd"] == 100.0 and value["forecast_usd"] == 150.0
+PY
+  state_file="$home/state/azure-workers/controller.json"
+  # Repeating the same exact reservation must re-run current telemetry/capacity
+  # admission without counting itself twice or silently trusting stale success.
+  repeat=$(env \
+    FM_HOME="$home" \
+    FM_AZURE_SUBSCRIPTION_ID="$SUB" \
+    FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
+    FM_AZURE_OWNER_TAG=owner \
+    FM_AZURE_NAMING_PREFIX=fmtest \
+    FM_WORKER_PROVIDER_COMMAND="python3 $provider" \
+    FIXTURE_STATE="$fixture" \
+    "$WRAPPER" capacity-reserve \
+      --reservation-id azr-123456789abc \
+      --fence-binding "$fence" \
+      --role validation \
+      --sku Standard_D4as_v7 \
+      --sku-family StandardDasv7Family \
+      --vcpus 4 \
+      --amount-usd 25 \
+      --confirm-subscription "$SUB")
+  python3 - "$repeat" <<'PY' || fail "exact specialized reservation retry was not idempotent"
+import json
+import sys
+assert json.loads(sys.argv[1])["status"] == "reserved"
+PY
+  python3 - "$state_file" <<'PY' || fail "specialized capacity reservation was not durable"
+import json
+import sys
+state = json.load(open(sys.argv[1]))
+item = state["capacity_reservations"]["azr-123456789abc"]
+assert item["status"] == "reserved" and item["sku_family"] == "StandardDasv7Family"
+PY
+
+  # A second exact-family reservation stays queued when observed plus reserved
+  # would exceed the 10-vCPU family limit.
+  out=$(env \
+    FM_HOME="$home" \
+    FM_AZURE_SUBSCRIPTION_ID="$SUB" \
+    FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
+    FM_AZURE_OWNER_TAG=owner \
+    FM_AZURE_NAMING_PREFIX=fmtest \
+    FM_WORKER_PROVIDER_COMMAND="python3 $provider" \
+    FIXTURE_STATE="$fixture" \
+    "$WRAPPER" capacity-reserve \
+      --reservation-id azr-abcdef123456 \
+      --fence-binding "$(printf second-fence | shasum -a 256 | awk '{print $1}')" \
+      --role review \
+      --sku Standard_D4as_v7 \
+      --sku-family StandardDasv7Family \
+      --vcpus 4 \
+      --amount-usd 25 \
+      --confirm-subscription "$SUB")
+  python3 - "$out" <<'PY' || fail "shared specialized refusal result malformed"
+import json
+import sys
+value = json.loads(sys.argv[1])
+# The fixture has 10 free and one prior 4-vCPU local reservation, so this exact
+# second request still fits. A third proves the observed-plus-reserved refusal.
+assert value["status"] == "reserved"
+PY
+  out=$(env \
+    FM_HOME="$home" \
+    FM_AZURE_SUBSCRIPTION_ID="$SUB" \
+    FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
+    FM_AZURE_OWNER_TAG=owner \
+    FM_AZURE_NAMING_PREFIX=fmtest \
+    FM_WORKER_PROVIDER_COMMAND="python3 $provider" \
+    FIXTURE_STATE="$fixture" \
+    "$WRAPPER" capacity-reserve \
+      --reservation-id azr-fedcba654321 \
+      --fence-binding "$(printf third-fence | shasum -a 256 | awk '{print $1}')" \
+      --role browser \
+      --sku Standard_D4as_v7 \
+      --sku-family StandardDasv7Family \
+      --vcpus 4 \
+      --amount-usd 25 \
+      --confirm-subscription "$SUB")
+  python3 - "$out" <<'PY' || fail "shared specialized family refusal did not queue"
+import json
+import sys
+value = json.loads(sys.argv[1])
+assert value["status"] == "queued" and "family" in value["reason"]
+PY
+
+  env \
+    FM_HOME="$home" \
+    FM_AZURE_SUBSCRIPTION_ID="$SUB" \
+    FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
+    FM_AZURE_OWNER_TAG=owner \
+    FM_AZURE_NAMING_PREFIX=fmtest \
+    FM_WORKER_PROVIDER_COMMAND="python3 $provider" \
+    FIXTURE_STATE="$fixture" \
+    "$WRAPPER" capacity-release \
+      --reservation-id azr-123456789abc \
+      --fence-binding "$fence" \
+      --cleanup-receipt "$receipt" \
+      --confirm-subscription "$SUB" >/dev/null
+  python3 - "$state_file" <<'PY' || fail "specialized capacity release was not fenced"
+import json
+import sys
+state = json.load(open(sys.argv[1]))
+assert state["capacity_reservations"]["azr-123456789abc"]["status"] == "released"
+assert state["capacity_reservations"]["azr-abcdef123456"]["status"] == "reserved"
+assert state["capacity_reservations"]["azr-fedcba654321"]["status"] == "queued"
+PY
+  pass "specialized CLI durably reserves, queues exact-family excess, and releases only exact fenced capacity"
+}
+
 restart_idempotency() {
   local tmp provider fixture home
   fm_test_tmproot_into tmp fm-worker-restart
@@ -697,6 +935,7 @@ static_contract
 classification_and_admission_matrix
 azure_provider_refusal_matrix
 end_to_end_lifecycle
+shared_specialized_cli
 restart_idempotency
 
 echo "# fm-worker-lifecycle.test.sh: all assertions passed"

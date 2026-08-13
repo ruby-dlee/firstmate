@@ -11,6 +11,7 @@ import contextlib
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -28,6 +29,7 @@ LANDED_FILES = (
     "bin/fm-azure-worker-provider.py",
     "bin/fm-worker-lifecycle.py",
     "bin/fm-worker-lifecycle.sh",
+    "bin/fm-worker-supervisor.py",
     "bin/fm-azure-runner.py",
     "bin/fm-azure-pilot.sh",
     "docs/azure-pilot/main.json",
@@ -47,6 +49,10 @@ RESOURCE_API = {
     "account-disk": "2023-10-02",
     "identity": "2023-01-31",
     "role-assignment": "2022-04-01",
+    "monitor-extension": "2024-03-01",
+    "bootstrap-command": "2024-03-01",
+    "task-command": "2024-03-01",
+    "ttl-schedule": "2018-09-15",
 }
 SPECIALIZED_ROLES = {
     "validation-shard", "validation-cell", "policy-review", "browser-tool",
@@ -97,7 +103,9 @@ SKU_PLAN = {
 }
 REQUIRED_RESOURCE_KINDS = (
     "vm", "nic", "os-disk", "task-disk", "account-disk", "identity",
-    "role-assignment", "state-container",
+    "role-assignment", "state-container", "monitor-extension", "bootstrap-command",
+    "task-command", "ttl-schedule", "global-reservation", "staging-request",
+    "staging-result",
 )
 
 
@@ -181,6 +189,13 @@ def expected_names(controller, slot):
         "account-disk": "disk-{}-wkr-{}-account".format(prefix, token),
         "identity": "id-{}-wkr-{}".format(prefix, token),
         "state-container": "worker-state-{}".format(token),
+        "monitor-extension": "AzureMonitorLinuxAgent",
+        "bootstrap-command": "bootstrap",
+        "task-command": "execute",
+        "ttl-schedule": "shutdown-computevm-{}-wkr-{}".format(prefix, token),
+        "global-reservation": "reservation.json",
+        "staging-request": "request.json",
+        "staging-result": "result.json",
     }
 
 
@@ -236,6 +251,10 @@ def immutable_id(kind, value):
         return "{}|{}".format(principal, role) if principal and role else None
     if kind == "state-container":
         return value.get("etag") or properties.get("etag") or value.get("version")
+    if kind in ("monitor-extension", "bootstrap-command", "task-command", "ttl-schedule"):
+        return value.get("etag") or properties.get("provisioningState") or value.get("provisioningState")
+    if kind in ("global-reservation", "staging-request", "staging-result"):
+        return value.get("etag") or properties.get("etag") or value.get("version")
     return None
 
 
@@ -262,6 +281,16 @@ def resource_record(kind, value, power_state=None, tags_override=None):
                 raise ProviderError("worker NIC has a public IP relation")
     if kind in ("os-disk", "task-disk", "account-disk"):
         record["attached_to"] = value.get("managedBy") or properties.get("managedBy")
+    if kind in ("monitor-extension", "bootstrap-command", "task-command"):
+        record["attached_to"] = properties.get("virtualMachineId") or value.get("attached_to")
+        record["provisioning_state"] = properties.get("provisioningState") or value.get("provisioningState")
+    if kind == "ttl-schedule":
+        record["attached_to"] = properties.get("targetResourceId") or value.get("attached_to")
+        record["status"] = properties.get("status") or value.get("status")
+        record["deadline"] = properties.get("dailyRecurrence", {}).get("time") or value.get("deadline")
+    if kind in ("global-reservation", "staging-request", "staging-result"):
+        record["digest"] = properties.get("contentDigest") or value.get("digest")
+        record["length"] = properties.get("contentLength") or value.get("length")
     return record
 
 
@@ -270,6 +299,34 @@ def list_json(controller, args):
     if rc != 0 or not isinstance(value, list):
         raise ProviderError("Azure inventory call failed or was malformed: {}".format(stderr))
     return value
+
+
+def blob_record(controller, storage, container, name, kind, required=False):
+    value, rc, stderr = az(controller, [
+        "storage", "blob", "show", "--auth-mode", "login", "--account-name", storage,
+        "--container-name", container, "--name", name,
+    ], check=False)
+    if rc != 0:
+        if required:
+            raise ProviderError("exact {} blob is unreadable or absent: {}".format(kind, stderr))
+        return None
+    properties = value.get("properties", value) if isinstance(value, dict) else {}
+    metadata = metadata_to_tags((value or {}).get("metadata") or properties.get("metadata") or {})
+    digest = metadata.get("content-digest") or properties.get("contentDigest")
+    length = properties.get("contentLength")
+    if length is None:
+        length = (value or {}).get("contentLength")
+    etag = (value or {}).get("etag") or properties.get("etag")
+    if not etag or not re.fullmatch(r"[0-9a-f]{64}", str(digest or "")):
+        raise ProviderError("exact {} blob identity is incomplete".format(kind))
+    blob_id = (
+        exact_id(controller, "Microsoft.Storage", "storageAccounts", storage)
+        + "/blobServices/default/containers/{}/blobs/{}".format(container, name)
+    )
+    return resource_record(kind, {
+        "id": blob_id, "etag": etag, "metadata": metadata,
+        "properties": {"etag": etag, "contentDigest": digest, "contentLength": length},
+    }, tags_override=metadata)
 
 
 def is_exact_fleet(controller, tags):
@@ -361,15 +418,49 @@ def retail_rate(sku):
             data = json.load(response)
     except Exception:
         return None
-    prices = []
+    sku_shape = re.fullmatch(r"Standard_([DE])\d+([a-z]+)_v(\d+)", sku)
+    if not isinstance(data, dict) or sku_shape is None:
+        return None
+    expected_meter = sku.removeprefix("Standard_").replace("_", " ")
+    expected_product = "Virtual Machines {}{}v{} Series".format(
+        sku_shape.group(1), sku_shape.group(2), sku_shape.group(3)
+    )
+    excluded = (
+        "spot", "low priority", "low-priority", "windows", "dev/test", "dev test",
+        "reservation", "savings",
+    )
+    prices = set()
     for item in data.get("Items", []):
-        product = str(item.get("productName", "")).lower()
-        meter = str(item.get("meterName", "")).lower()
-        if item.get("unitOfMeasure") != "1 Hour" or "windows" in product or "spot" in meter:
+        if not isinstance(item, dict):
             continue
-        with contextlib.suppress(TypeError, ValueError):
-            prices.append(float(item["retailPrice"]))
-    return min(prices) if prices else None
+        offer = " ".join(str(item.get(field, "")) for field in (
+            "productName", "meterName", "skuName", "type", "priceType", "reservationTerm",
+        )).casefold()
+        if any(token in offer for token in excluded):
+            continue
+        if (
+            str(item.get("armRegionName", "")).casefold() != "eastus"
+            or item.get("armSkuName") != sku
+            or str(item.get("serviceName", "")).casefold() != "virtual machines"
+            or str(item.get("serviceFamily", "")).casefold() != "compute"
+            or str(item.get("type", "")).casefold() != "consumption"
+            or item.get("unitOfMeasure") != "1 Hour"
+            or str(item.get("currencyCode", "")).upper() != "USD"
+            or str(item.get("productName", "")).casefold() != expected_product.casefold()
+            or str(item.get("skuName", "")).casefold() != expected_meter.casefold()
+            or str(item.get("meterName", "")).casefold() != expected_meter.casefold()
+            or item.get("isPrimaryMeterRegion") is not True
+        ):
+            continue
+        try:
+            price = float(item["retailPrice"])
+            unit_price = float(item["unitPrice"])
+            tier = float(item["tierMinimumUnits"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(price) and price > 0 and price == unit_price and tier == 0:
+            prices.add(price)
+    return prices.pop() if len(prices) == 1 else None
 
 
 def specialized_capacity_inventory(controller, vms, identities):
@@ -534,7 +625,22 @@ def inventory(controller, include_metrics=True):
     nics = list_json(controller, ["network", "nic", "list", "--resource-group", controller["resource_group"]])
     disks = list_json(controller, ["disk", "list", "--resource-group", controller["resource_group"]])
     identities = list_json(controller, ["identity", "list", "--resource-group", controller["resource_group"]])
-    roles = list_json(controller, ["role", "assignment", "list", "--resource-group", controller["resource_group"], "--all"])
+    extensions = list_json(controller, [
+        "resource", "list", "--resource-group", controller["resource_group"],
+        "--resource-type", "Microsoft.Compute/virtualMachines/extensions",
+    ])
+    run_commands = list_json(controller, [
+        "resource", "list", "--resource-group", controller["resource_group"],
+        "--resource-type", "Microsoft.Compute/virtualMachines/runCommands",
+    ])
+    schedules = list_json(controller, [
+        "resource", "list", "--resource-group", controller["resource_group"],
+        "--resource-type", "Microsoft.DevTestLab/schedules",
+    ])
+    roles = list_json(controller, [
+        "role", "assignment", "list", "--all",
+        "--query", "[?contains(scope, '/resourceGroups/{}/')]".format(controller["resource_group"]),
+    ])
     containers = list_json(controller, [
         "storage", "container", "list", "--auth-mode", "login",
         "--account-name", os.environ.get("FM_AZURE_STORAGE_NAME", ""),
@@ -586,6 +692,7 @@ def inventory(controller, include_metrics=True):
                 identity_principals[slot] = principal
 
     storage = os.environ.get("FM_AZURE_STORAGE_NAME", "")
+    control_storage = "st{}ctl01".format(controller["prefix"])
     container_by_slot = {}
     for container in containers:
         match = re.match(r"^worker-state-([0-9]{2})$", str(container.get("name")))
@@ -604,6 +711,66 @@ def inventory(controller, include_metrics=True):
         )
         container_by_slot[slot] = container_value
         add("state-container", container_value, slot, tags_override=metadata)
+        blob_prefix = "worker/{:02d}/".format(slot)
+        reservation = blob_record(
+            controller, control_storage, "runner-control", blob_prefix + "reservation.json",
+            "global-reservation", required=slot in workers,
+        )
+        request_blob = blob_record(
+            controller, storage, container["name"], "request.json", "staging-request",
+            required=slot in workers,
+        )
+        result_blob = blob_record(
+            controller, storage, container["name"], "result.json", "staging-result",
+            required=False,
+        )
+        for kind, blob in (
+            ("global-reservation", reservation), ("staging-request", request_blob),
+            ("staging-result", result_blob),
+        ):
+            if blob is not None:
+                add(kind, blob, slot, tags_override=blob.get("tags") or metadata)
+
+    for extension in extensions:
+        slot = slot_from_name(extension.get("name"), r"^vm-{}-wkr-".format(prefix))
+        if slot is None or not str(extension.get("name", "")).endswith("/AzureMonitorLinuxAgent"):
+            continue
+        vm_id = exact_id(
+            controller, "Microsoft.Compute", "virtualMachines",
+            expected_names(controller, slot)["vm"],
+        )
+        value = dict(extension)
+        value["attached_to"] = vm_id
+        value["properties"] = dict(value.get("properties") or {})
+        value["properties"]["virtualMachineId"] = vm_id
+        add("monitor-extension", value, slot)
+    for command in run_commands:
+        slot = slot_from_name(command.get("name"), r"^vm-{}-wkr-".format(prefix))
+        if slot is None:
+            continue
+        child = str(command.get("name", "")).rsplit("/", 1)[-1]
+        kind = {"bootstrap": "bootstrap-command", "execute": "task-command"}.get(child)
+        if kind is None:
+            conflicts.append({"kind": "run-command", "slot": slot, "reason": "undeclared worker Run Command child"})
+            continue
+        value = dict(command)
+        value["attached_to"] = exact_id(
+            controller, "Microsoft.Compute", "virtualMachines",
+            expected_names(controller, slot)["vm"],
+        )
+        value["properties"] = dict(value.get("properties") or {})
+        value["properties"]["virtualMachineId"] = value["attached_to"]
+        add(kind, value, slot)
+    for schedule in schedules:
+        slot = slot_from_name(schedule.get("name"), r"^shutdown-computevm-{}-wkr-".format(prefix))
+        if slot is not None:
+            value = dict(schedule)
+            value["properties"] = dict(value.get("properties") or {})
+            value["properties"].setdefault("targetResourceId", exact_id(
+                controller, "Microsoft.Compute", "virtualMachines",
+                expected_names(controller, slot)["vm"],
+            ))
+            add("ttl-schedule", value, slot)
 
     for role in roles:
         scope = str(role.get("scope") or "")
@@ -709,7 +876,10 @@ def recorded_exact(
             if kind not in skip_immutable and current.get("immutable_id") != prior.get("immutable_id"):
                 raise ProviderError("{} immutable identity differs from the recorded assignment".format(kind))
         for key, value in tags.items():
-            if kind in ("role-assignment", "state-container") and key not in current.get("tags", {}):
+            if kind in (
+                "role-assignment", "state-container", "global-reservation",
+                "staging-request", "staging-result",
+            ) and key not in current.get("tags", {}):
                 continue
             actual = current.get("tags", {}).get(key)
             if (
@@ -720,6 +890,28 @@ def recorded_exact(
                 continue
             if actual != value:
                 raise ProviderError("{} exact task/account/worktree tag differs: {}".format(kind, key))
+    vm_id = (resources.get("vm") or {}).get("id")
+    for kind in ("monitor-extension", "bootstrap-command", "task-command", "ttl-schedule"):
+        child = resources.get(kind)
+        if child is not None and str(child.get("attached_to", "")).lower() != str(vm_id or "").lower():
+            raise ProviderError("{} is not bound to the exact worker VM".format(kind))
+    for kind in ("global-reservation", "staging-request", "staging-result"):
+        blob = resources.get(kind)
+        if blob is not None and (
+            not re.fullmatch(r"[0-9a-f]{64}", str(blob.get("digest") or ""))
+            or not isinstance(blob.get("length"), int)
+            or blob["length"] < 0
+        ):
+            raise ProviderError("{} digest/length identity is incomplete".format(kind))
+    ttl = resources.get("ttl-schedule")
+    if ttl is not None and (
+        str(ttl.get("status", "")).lower() != "enabled" or not ttl.get("deadline")
+    ):
+        raise ProviderError("worker TTL schedule is disabled or has no exact deadline")
+    for kind in ("bootstrap-command", "task-command", "monitor-extension"):
+        child = resources.get(kind)
+        if child is not None and str(child.get("provisioning_state", "")).lower() != "succeeded":
+            raise ProviderError("{} provisioning state is not succeeded".format(kind))
     return resources
 
 
@@ -756,7 +948,136 @@ def mark_cleanup_container(controller, action, key, value):
     )
 
 
+def upload_json_blob(controller, account, container, name, value, tags):
+    payload = canonical_bytes(value) + b"\n"
+    digest = hashlib.sha256(payload).hexdigest()
+    fd, path = tempfile.mkstemp(prefix="fm-worker-blob-", suffix=".json")
+    os.chmod(path, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+        metadata = dict(tags_to_metadata(tags))
+        metadata["content_digest"] = digest
+        _, rc, stderr = az(controller, [
+            "storage", "blob", "upload", "--auth-mode", "login", "--account-name", account,
+            "--container-name", container, "--name", name, "--file", path,
+            "--overwrite", "false", "--metadata",
+        ] + ["{}={}".format(key, value) for key, value in sorted(metadata.items())], check=False)
+        if rc != 0:
+            raise ProviderError("exact worker staging upload failed: {}".format(stderr))
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            Path(path).unlink()
+    return digest
+
+
+def bootstrap_script(action):
+    supervisor = (ROOT / "bin" / "fm-worker-supervisor.py").read_bytes()
+    supervisor_digest = hashlib.sha256(supervisor).hexdigest()
+    encoded = supervisor.hex()
+    bindings = action["bindings"]
+    script = """set -eu
+umask 077
+install -d -m 0755 /usr/local/libexec
+python3 - <<'PY'
+from pathlib import Path
+payload=bytes.fromhex('{encoded}')
+path=Path('/usr/local/libexec/fm-worker-supervisor')
+path.write_bytes(payload)
+path.chmod(0o755)
+PY
+printf '%s  %s\n' '{digest}' /usr/local/libexec/fm-worker-supervisor | sha256sum -c -
+install -d -m 0700 /var/lib/firstmate-worker
+cat > /var/lib/firstmate-worker/assignment.json <<'JSON'
+{assignment}
+JSON
+""".format(
+        encoded=encoded, digest=supervisor_digest,
+        assignment=json.dumps({
+            "home_binding": bindings["home_binding"], "task": bindings["task"],
+            "task_generation": bindings["task_generation"],
+            "assignment_generation": bindings["assignment_generation"],
+            "account_binding": bindings["account_binding"],
+            "worktree_binding": bindings["worktree_binding"],
+            "repository_binding": bindings["repository_binding"],
+            "repository_generation": bindings["repository_generation"],
+            "supervisor_sha256": supervisor_digest,
+        }, sort_keys=True, separators=(",", ":")),
+    )
+    return script, supervisor_digest
+
+
+def create_lifecycle_children(controller, action):
+    names = expected_names(controller, action["slot"])
+    vm_name = names["vm"]
+    tags = action_tags(controller, action)
+    script, supervisor_digest = bootstrap_script(action)
+    _, rc, stderr = az(controller, [
+        "vm", "run-command", "create", "--resource-group", controller["resource_group"],
+        "--vm-name", vm_name, "--name", names["bootstrap-command"],
+        "--script", script, "--async-execution", "false", "--tags",
+    ] + ["{}={}".format(key, value) for key, value in sorted(tags.items())], check=False)
+    if rc != 0:
+        raise ProviderError("pinned worker supervisor bootstrap failed: {}".format(stderr))
+    execute_stub = "test -x /usr/local/libexec/fm-worker-supervisor && test -f /var/lib/firstmate-worker/request.json"
+    _, rc, stderr = az(controller, [
+        "vm", "run-command", "create", "--resource-group", controller["resource_group"],
+        "--vm-name", vm_name, "--name", names["task-command"],
+        "--script", execute_stub, "--async-execution", "true", "--tags",
+    ] + ["{}={}".format(key, value) for key, value in sorted(tags.items())], check=False)
+    if rc != 0:
+        raise ProviderError("exact worker task Run Command creation failed: {}".format(stderr))
+    deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=6)).replace(second=0, microsecond=0)
+    _, rc, stderr = az(controller, [
+        "resource", "create", "--resource-group", controller["resource_group"],
+        "--resource-type", "Microsoft.DevTestLab/schedules", "--api-version", "2018-09-15",
+        "--name", names["ttl-schedule"], "--location", "eastus", "--properties", json.dumps({
+            "status": "Enabled", "taskType": "ComputeVmShutdownTask",
+            "dailyRecurrence": {"time": deadline.strftime("%H%M")},
+            "timeZoneId": "UTC", "targetResourceId": exact_id(
+                controller, "Microsoft.Compute", "virtualMachines", vm_name
+            ),
+        }, separators=(",", ":")), "--tags",
+    ] + ["{}={}".format(key, value) for key, value in sorted(tags.items())], check=False)
+    if rc != 0:
+        raise ProviderError("exact worker TTL schedule creation failed: {}".format(stderr))
+    reservation = {
+        "schema": "fm.worker-global-reservation/v1", "slot": action["slot"],
+        "assignment_generation": action["bindings"]["assignment_generation"],
+        "sku": action["sku"], "sku_family": action["sku_family"],
+        "reservation_usd": action.get("reservation_usd"), "supervisor_sha256": supervisor_digest,
+        "ttl_deadline": deadline.isoformat().replace("+00:00", "Z"),
+    }
+    upload_json_blob(
+        controller, "st{}ctl01".format(controller["prefix"]), "runner-control",
+        "worker/{:02d}/reservation.json".format(action["slot"]), reservation, tags,
+    )
+    assignment = {
+        "schema": "fm.worker-staging-request/v1", "status": "assigned",
+        "slot": action["slot"], "bindings": action["bindings"],
+        "supervisor_sha256": supervisor_digest,
+    }
+    upload_json_blob(
+        controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
+        names["staging-request"], assignment, tags,
+    )
+    pending_result = {
+        "schema": "fm.worker-staging-result/v1", "status": "pending",
+        "assignment_generation": action["bindings"]["assignment_generation"],
+    }
+    upload_json_blob(
+        controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
+        names["staging-result"], pending_result, tags,
+    )
+
+
 def run_pilot_create(controller, action):
+    if action.get("shared_admission_digest") != hashlib.sha256(canonical_bytes({
+        "slot": action["slot"], "sku": action["sku"], "sku_family": action["sku_family"],
+        "assignment_generation": action["bindings"]["assignment_generation"],
+        "reservation_usd": action.get("reservation_usd"),
+    })).hexdigest():
+        raise ProviderError("singleton deployment lacks exact shared allocator admission proof")
     env = os.environ.copy()
     env.update({
         "FM_AZURE_CAPACITY_PROFILE": "full",
@@ -785,7 +1106,10 @@ def converge_create_tags(controller, action):
         raise ProviderError("worker deployment completed without exact slot resources")
     tags = action_tags(controller, action)
     for kind, resource in worker["resources"].items():
-        if kind in ("role-assignment", "state-container"):
+        if kind in (
+            "role-assignment", "state-container", "global-reservation",
+            "staging-request", "staging-result",
+        ):
             continue
         tag_resource(controller, resource["id"], tags)
     tag_container(controller, expected_names(controller, action["slot"])["state-container"], tags)
@@ -833,6 +1157,7 @@ def create_or_resume(controller, action):
     elif reuse:
         raise ProviderError("dirty-task resume found no exact retained capacity")
     run_pilot_create(controller, action)
+    create_lifecycle_children(controller, action)
     return converge_create_tags(controller, action)
 
 
@@ -897,37 +1222,52 @@ def mutate_delete_compute(controller, action):
         )
         worker = worker_by_slot(inventory(controller, include_metrics=False), action["slot"])
     resources = recorded_exact(
-        action, worker, allow_missing=("vm", "nic", "os-disk"),
+        action, worker, allow_missing=(
+            "vm", "nic", "os-disk", "monitor-extension", "bootstrap-command", "task-command",
+        ),
         skip_immutable=("state-container",),
     )
-    vm = resources.get("vm")
-    if vm is not None:
-        if "deallocated" not in str(vm.get("power_state", "")).lower():
-            raise ProviderError("compute deletion requires the exact deallocated worker")
-        conditional_delete(controller, "vm", vm)
-        wait_absent(controller, vm["id"])
     worker = worker_by_slot(inventory(controller, include_metrics=False), action["slot"])
     if worker is None:
         raise ProviderError("VM deletion also lost exact retained task/account capacity")
     remaining = worker.get("resources") or {}
-    for kind in ("nic", "os-disk"):
+    for kind in (
+        "task-command", "bootstrap-command", "monitor-extension", "vm", "nic", "os-disk",
+    ):
         resource = remaining.get(kind)
         if resource is None:
             continue
-        if resource.get("attached_to"):
-            raise ProviderError("{} did not detach from the deleted worker VM".format(kind))
-        prior = action["resources"].get(kind)
-        if prior is None or resource["id"] != prior["id"] or resource["immutable_id"] != prior["immutable_id"]:
-            raise ProviderError("detached {} immutable identity changed".format(kind))
+        if kind == "vm":
+            if "deallocated" not in str(resource.get("power_state", "")).lower():
+                raise ProviderError("compute deletion requires the exact deallocated worker")
+            conditional_delete(controller, kind, resource)
+            wait_absent(controller, resource["id"])
+            continue
+        if kind in ("nic", "os-disk"):
+            if resource.get("attached_to"):
+                raise ProviderError("{} did not detach from the deleted worker VM".format(kind))
+            prior = action["resources"].get(kind)
+            if prior is None or resource["id"] != prior["id"] or resource["immutable_id"] != prior["immutable_id"]:
+                raise ProviderError("detached {} immutable identity changed".format(kind))
         conditional_delete(controller, kind, resource)
     final = worker_by_slot(inventory(controller, include_metrics=False), action["slot"])
     if final is None:
         raise ProviderError("compute cleanup lost retained task/account ownership")
     final_resources = final.get("resources") or {}
-    if any(kind in final_resources for kind in ("vm", "nic", "os-disk")):
-        raise ProviderError("disposable VM/NIC/OS capacity remains after exact cleanup")
+    compute_kinds = (
+        "vm", "nic", "os-disk", "monitor-extension", "bootstrap-command", "task-command",
+    )
+    if any(kind in final_resources for kind in compute_kinds):
+        raise ProviderError("disposable VM/NIC/OS/child capacity remains after exact cleanup")
+    ttl = final_resources.get("ttl-schedule")
+    if ttl is None:
+        raise ProviderError("TTL disappeared before exact VM absence and detach cleanup were proved")
+    conditional_delete(controller, "ttl-schedule", ttl)
+    final = worker_by_slot(inventory(controller, include_metrics=False), action["slot"])
+    if final is None:
+        raise ProviderError("TTL cleanup lost retained task/account ownership")
     recorded_exact(
-        action, final, allow_missing=("vm", "nic", "os-disk"),
+        action, final, allow_missing=compute_kinds + ("ttl-schedule",),
         skip_immutable=("state-container",),
     )
     return final
@@ -948,8 +1288,12 @@ def mutate_reset(controller, action):
         and cleanup_marker(container, "release-proof", action["release_proof_digest"])
     )
     if not marked:
-        resources = recorded_exact(action, worker, allow_missing=("vm", "nic", "os-disk"))
-        if any(kind in resources for kind in ("vm", "nic", "os-disk")):
+        disposable = (
+            "vm", "nic", "os-disk", "monitor-extension", "bootstrap-command", "task-command",
+            "ttl-schedule",
+        )
+        resources = recorded_exact(action, worker, allow_missing=disposable)
+        if any(kind in resources for kind in disposable):
             raise ProviderError("reset refuses while disposable compute still exists")
         mark_cleanup_container(
             controller, action, "reset-action", action["idempotency_key"]
@@ -959,15 +1303,36 @@ def mutate_reset(controller, action):
     resources = recorded_exact(
         action, worker, allow_missing=allow_missing, skip_immutable=("state-container",)
     )
-    if any(kind in resources for kind in ("vm", "nic", "os-disk")):
-        raise ProviderError("reset refuses while disposable compute still exists")
-    for kind in ("role-assignment", "identity", "account-disk", "task-disk"):
+    if any(kind in resources for kind in (
+        "vm", "nic", "os-disk", "monitor-extension", "bootstrap-command", "task-command",
+        "ttl-schedule",
+    )):
+        raise ProviderError("reset refuses while disposable compute or children still exist")
+    for kind in (
+        "staging-result", "staging-request", "global-reservation", "role-assignment",
+        "identity", "account-disk", "task-disk",
+    ):
         resource = resources.get(kind)
         if resource is None:
             continue
         if kind in ("account-disk", "task-disk") and resource.get("attached_to"):
             raise ProviderError("retained {} is still attached".format(kind))
-        conditional_delete(controller, kind, resource)
+        if kind in ("staging-result", "staging-request", "global-reservation"):
+            account = "st{}ctl01".format(controller["prefix"]) if kind == "global-reservation" else os.environ.get("FM_AZURE_STORAGE_NAME", "")
+            container_name = "runner-control" if kind == "global-reservation" else expected_names(controller, action["slot"])["state-container"]
+            blob_name = (
+                "worker/{:02d}/reservation.json".format(action["slot"])
+                if kind == "global-reservation" else expected_names(controller, action["slot"])[kind]
+            )
+            _, rc, stderr = az(controller, [
+                "storage", "blob", "delete", "--auth-mode", "login", "--account-name", account,
+                "--container-name", container_name, "--name", blob_name,
+                "--if-match", resource["etag"],
+            ], check=False)
+            if rc != 0:
+                raise ProviderError("conditional {} blob deletion failed: {}".format(kind, stderr))
+        else:
+            conditional_delete(controller, kind, resource)
     refreshed = worker_by_slot(inventory(controller, include_metrics=False), action["slot"])
     if refreshed is None:
         raise ProviderError("cleanup marker container disappeared before exact reset completed")
@@ -990,6 +1355,70 @@ def mutate_reset(controller, action):
     if worker_by_slot(final, action["slot"]) is not None:
         raise ProviderError("released worker capacity remains after exact reset")
     return None
+
+
+def mutate_execute(controller, action):
+    snapshot = inventory(controller, include_metrics=False)
+    worker = worker_by_slot(snapshot, action["slot"])
+    resources = recorded_exact(action, worker)
+    if "deallocated" in str(resources["vm"].get("power_state", "")).lower():
+        raise ProviderError("execute refuses deallocated worker compute")
+    request = action.get("request")
+    if not isinstance(request, dict) or request.get("request_digest") != action.get("request_digest"):
+        raise ProviderError("execution request identity is not exact")
+    names = expected_names(controller, action["slot"])
+    tags = action_tags(controller, action)
+    upload_json_blob(
+        controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
+        names["staging-request"], request, tags,
+    )
+    request_json = json.dumps(request, sort_keys=True, separators=(",", ":"))
+    bindings = action["bindings"]
+    script = """set -eu
+umask 077
+install -d -m 0700 /var/lib/firstmate-worker
+cat > /var/lib/firstmate-worker/request.json <<'JSON'
+{request}
+JSON
+export FM_WORKER_HOME_BINDING='{home}' FM_WORKER_TASK='{task}' FM_WORKER_TASK_GENERATION='{task_generation}'
+export FM_WORKER_ASSIGNMENT_GENERATION='{assignment}' FM_WORKER_ACCOUNT_BINDING='{account}'
+export FM_WORKER_WORKTREE_BINDING='{worktree}' FM_WORKER_REPOSITORY_BINDING='{repository}'
+export FM_WORKER_REPOSITORY_GENERATION='{repository_generation}' FM_WORKER_CLOUD_INSTANCE_ID='{cloud}'
+export FM_WORKER_WORKTREE=/mnt/task FM_WORKER_ACCOUNT_HOME=/mnt/account
+/usr/local/libexec/fm-worker-supervisor execute --request /var/lib/firstmate-worker/request.json --result /var/lib/firstmate-worker/result.json
+cat /var/lib/firstmate-worker/result.json
+""".format(
+        request=request_json, home=bindings["home_binding"], task=bindings["task"],
+        task_generation=bindings["task_generation"], assignment=bindings["assignment_generation"],
+        account=bindings["account_binding"], worktree=bindings["worktree_binding"],
+        repository=bindings["repository_binding"], repository_generation=bindings["repository_generation"],
+        cloud=action["cloud_instance_id"],
+    )
+    output, rc, stderr = az(controller, [
+        "vm", "run-command", "update", "--resource-group", controller["resource_group"],
+        "--vm-name", names["vm"], "--name", names["task-command"],
+        "--script", script, "--async-execution", "false",
+    ], check=False)
+    if rc != 0:
+        raise ProviderError("exact private worker execution failed: {}".format(stderr))
+    message = json.dumps(output)
+    matches = re.findall(r"\{[^{}]*\"result_digest\"[^{}]*\}", message)
+    if not matches:
+        raise ProviderError("private worker execution returned no exact result")
+    try:
+        execution = json.loads(matches[-1])
+    except json.JSONDecodeError as exc:
+        raise ProviderError("private worker result is malformed: {}".format(exc))
+    supplied = execution.get("result_digest")
+    unsigned = dict(execution)
+    unsigned.pop("result_digest", None)
+    if supplied != hashlib.sha256(canonical_bytes(unsigned)).hexdigest():
+        raise ProviderError("private worker result digest is not exact")
+    upload_json_blob(
+        controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
+        names["staging-result"], execution, tags,
+    )
+    return worker_by_slot(inventory(controller, include_metrics=False), action["slot"]), execution
 
 
 def mutate_steer(controller, action):
@@ -1023,7 +1452,7 @@ def mutate(controller, action):
     if not isinstance(action, dict):
         raise ProviderError("provider mutation action is malformed")
     action_type = action.get("type")
-    if action_type not in ("create", "resume", "deallocate", "delete-compute", "reset", "steer"):
+    if action_type not in ("create", "resume", "deallocate", "delete-compute", "reset", "execute", "steer"):
         raise ProviderError("unsupported provider mutation action")
     if action.get("deployment_generation") != controller["deployment_generation"] or action.get("owner") != controller["owner"]:
         raise ProviderError("provider mutation owner or deployment generation is not exact")
@@ -1045,6 +1474,8 @@ def mutate(controller, action):
         worker = mutate_delete_compute(controller, action)
     elif action_type == "reset":
         worker = mutate_reset(controller, action)
+    elif action_type == "execute":
+        worker, execution = mutate_execute(controller, action)
     else:
         worker = mutate_steer(controller, action)
     result = {
@@ -1053,6 +1484,8 @@ def mutate(controller, action):
     }
     if worker is not None:
         result["worker"] = worker
+    if action_type == "execute":
+        result["execution"] = execution
     return result
 
 

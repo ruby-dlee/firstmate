@@ -33,7 +33,10 @@ ROOT = Path(__file__).resolve().parent.parent
 AZURE_PROVIDER = ROOT / "bin" / "fm-azure-worker-provider.py"
 STATE_SCHEMA = "fm.worker-lifecycle/v1"
 REQUEST_SCHEMA = "fm.worker-request/v1"
-RELEASE_SCHEMA = "fm.worker-release/v1"
+EXECUTION_SCHEMA = "fm.worker-execution/v1"
+EXECUTION_RESULT_SCHEMA = "fm.worker-execution-result/v1"
+RELEASE_SCHEMA = "fm.worker-release/v2"
+AUTHORITY_SCHEMA = "fm.worker-authority/v1"
 CAPACITY_RESERVATION_SCHEMA = "fm.capacity-reservation/v1"
 PROVIDER_REQUEST_SCHEMA = "fm.worker-provider-request/v1"
 PROVIDER_RESPONSE_SCHEMA = "fm.worker-provider-response/v1"
@@ -52,7 +55,9 @@ PROVIDER_TIMEOUT_SECONDS = 300
 MAX_PROVIDER_OUTPUT_BYTES = 2 * 1024 * 1024
 REQUIRED_RESOURCE_KINDS = (
     "vm", "nic", "os-disk", "task-disk", "account-disk", "identity",
-    "role-assignment", "state-container",
+    "role-assignment", "state-container", "monitor-extension", "bootstrap-command",
+    "task-command", "ttl-schedule", "global-reservation", "staging-request",
+    "staging-result",
 )
 REVIEWED_SKU_FAMILY = {
     "Standard_D4as_v6": "standardDav6Family",
@@ -269,6 +274,7 @@ def empty_state(env):
         "pending_action": None,
         "cleanup_refusals": [],
         "last_metrics": None,
+        "executions": {},
     }
 
 
@@ -283,6 +289,7 @@ def verify_state(env, state):
         not isinstance(state.get("queue"), dict)
         or not isinstance(state.get("workers"), dict)
         or not isinstance(state.get("capacity_reservations"), dict)
+        or not isinstance(state.get("executions"), dict)
     ):
         raise LifecycleError("lifecycle queue, worker, or shared capacity inventory is malformed")
     if len(state["capacity_reservations"]) > 256:
@@ -318,6 +325,7 @@ def load_state(env):
             raise
         state = empty_state(env)
     state.setdefault("capacity_reservations", {})
+    state.setdefault("executions", {})
     verify_state(env, state)
     return state
 
@@ -517,7 +525,10 @@ def resources_exact(worker, cloud, allow_missing_compute=False):
         current = resources.get(kind)
         prior = recorded.get(kind)
         if current is None:
-            if allow_missing_compute and kind in ("vm", "nic", "os-disk"):
+            if allow_missing_compute and kind in (
+                "vm", "nic", "os-disk", "monitor-extension", "bootstrap-command",
+                "task-command", "ttl-schedule", "staging-request", "staging-result",
+            ):
                 continue
             missing.append(kind)
             continue
@@ -862,6 +873,7 @@ def make_action(env, action_type, worker=None, item=None, **fields):
             "bindings": worker["bindings"],
             "resources": worker.get("resources", {}),
             "cloud_instance_id": worker.get("cloud_instance_id"),
+            "reservation_usd": worker.get("reservation_usd"),
         })
     if item is not None:
         action["request"] = item
@@ -959,12 +971,18 @@ def apply_action_result(env, state, action, result):
         cloud = result.get("worker")
         if cloud is not None:
             returned = cloud.get("resources") or {}
-            for kind in ("task-disk", "account-disk", "identity", "role-assignment", "state-container"):
+            for kind in (
+                "task-disk", "account-disk", "identity", "role-assignment", "state-container",
+                "global-reservation", "staging-request", "staging-result",
+            ):
                 resource = returned.get(kind)
                 if resource is None:
                     raise LifecycleError("compute cleanup result lost exact retained {}".format(kind))
                 worker.setdefault("resources", {})[kind] = resource_identity(resource)
-        for kind in ("vm", "nic", "os-disk"):
+        for kind in (
+            "vm", "nic", "os-disk", "monitor-extension", "bootstrap-command",
+            "task-command", "ttl-schedule",
+        ):
             worker.get("resources", {}).pop(kind, None)
         worker["cloud_instance_id"] = None
         worker["last_classification"] = "orphaned-safe-to-delete"
@@ -981,6 +999,32 @@ def apply_action_result(env, state, action, result):
                 0.0, (end - parse_time(worker["assigned_at"])).total_seconds()
             )
         state["workers"].pop(slot, None)
+    elif action_type == "execute":
+        if worker is None:
+            raise LifecycleError("execute result has no durable worker owner")
+        execution = result.get("execution")
+        if not isinstance(execution, dict) or execution.get("schema") != EXECUTION_RESULT_SCHEMA:
+            raise LifecycleError("provider execution result schema is not supported")
+        if execution.get("request_digest") != action.get("request_digest"):
+            raise LifecycleError("provider execution result is not bound to the exact request")
+        supplied = execution.get("result_digest")
+        unsigned = dict(execution)
+        unsigned.pop("result_digest", None)
+        if supplied != digest_value(unsigned):
+            raise LifecycleError("provider execution result digest is not exact")
+        for field, expected in (
+            ("task", worker["bindings"]["task"]),
+            ("task_generation", worker["bindings"]["task_generation"]),
+            ("assignment_generation", worker["assignment_generation"]),
+            ("cloud_instance_id", worker["cloud_instance_id"]),
+            ("repository_binding", worker["bindings"]["repository_binding"]),
+            ("repository_generation", worker["bindings"]["repository_generation"]),
+        ):
+            if execution.get(field) != expected:
+                raise LifecycleError("provider execution {} binding differs".format(field))
+        state["executions"][action["request_digest"]] = execution
+        worker["last_execution_digest"] = supplied
+        worker["last_execution_at"] = iso_utc()
     elif action_type == "steer":
         if worker is None:
             raise LifecycleError("steer result has no durable worker owner")
@@ -1072,7 +1116,15 @@ def next_reconcile_action(env, state, inventory, now=None):
     worker = create_worker_record(env, state, slot, item, reservation)
     state["workers"][str(slot)] = worker
     item["status"] = "assigning"
-    action = make_action(env, "create", worker=worker, item=item, reuse_retained=False)
+    shared_admission_digest = digest_value({
+        "slot": worker["slot"], "sku": worker["sku"], "sku_family": worker["sku_family"],
+        "assignment_generation": worker["assignment_generation"],
+        "reservation_usd": reservation,
+    })
+    action = make_action(
+        env, "create", worker=worker, item=item, reuse_retained=False,
+        shared_admission_digest=shared_admission_digest,
+    )
     return action
 
 
@@ -1123,14 +1175,32 @@ def release_receipt(state, path):
     unsigned.pop("proof_digest", None)
     if supplied_digest != digest_value(unsigned):
         raise LifecycleError("worker release proof digest is not exact")
-    for field in (
-        "home_binding", "account_binding", "worktree_binding", "repository_binding",
-        "endpoint_receipt", "report_receipt", "landed_work_receipt",
-        "account_release_receipt", "cleanup_receipt",
-    ):
+    for field in ("home_binding", "account_binding", "worktree_binding", "repository_binding"):
         require_binding(field, proof.get(field))
     for field in ("task", "task_generation", "assignment_generation", "repository_generation"):
         require_id(field, proof.get(field))
+    authorities = proof.get("authorities")
+    if not isinstance(authorities, dict) or set(authorities) != {
+        "endpoint", "report", "landing", "account", "worktree",
+    }:
+        raise LifecycleError("release proof must contain every authoritative ordinary-owner receipt")
+    for name, receipt in authorities.items():
+        if not isinstance(receipt, dict) or receipt.get("schema") != AUTHORITY_SCHEMA:
+            raise LifecycleError("{} authority receipt schema is not exact".format(name))
+        supplied = receipt.get("receipt_digest")
+        unsigned_receipt = dict(receipt)
+        unsigned_receipt.pop("receipt_digest", None)
+        if supplied != digest_value(unsigned_receipt):
+            raise LifecycleError("{} authority receipt digest is not exact".format(name))
+        if receipt.get("authority") != name or receipt.get("task") != proof.get("task"):
+            raise LifecycleError("{} authority receipt task binding differs".format(name))
+        if receipt.get("task_generation") != proof.get("task_generation"):
+            raise LifecycleError("{} authority receipt generation differs".format(name))
+        if receipt.get("assignment_generation") != proof.get("assignment_generation"):
+            raise LifecycleError("{} authority receipt assignment differs".format(name))
+        require_binding("{} authority evidence".format(name), receipt.get("evidence_digest"))
+        if receipt.get("verdict") != "proved":
+            raise LifecycleError("{} authority did not prove release safety".format(name))
     resources = proof.get("resources")
     if not isinstance(resources, dict) or set(resources) != set(REQUIRED_RESOURCE_KINDS):
         raise LifecycleError("worker release proof must bind every exact worker resource")
@@ -1179,11 +1249,19 @@ def proof_template(state, task, generation):
         "repository_generation": worker["bindings"]["repository_generation"],
         "cloud_instance_id": worker["cloud_instance_id"],
         "resources": worker["resources"],
-        "endpoint_receipt": "REPLACE_WITH_SHA256",
-        "report_receipt": "REPLACE_WITH_SHA256",
-        "landed_work_receipt": "REPLACE_WITH_SHA256",
-        "account_release_receipt": "REPLACE_WITH_SHA256",
-        "cleanup_receipt": "REPLACE_WITH_SHA256",
+        "authorities": {
+            name: {
+                "schema": AUTHORITY_SCHEMA,
+                "authority": name,
+                "task": task,
+                "task_generation": generation,
+                "assignment_generation": worker["assignment_generation"],
+                "verdict": "REPLACE_WITH_PROVED",
+                "evidence_digest": "REPLACE_WITH_SHA256",
+                "receipt_digest": "RECOMPUTE_FROM_ALL_OTHER_FIELDS",
+            }
+            for name in ("endpoint", "report", "landing", "account", "worktree")
+        },
         "proof_digest": "RECOMPUTE_FROM_ALL_OTHER_FIELDS",
     }
     return proof
@@ -1312,11 +1390,11 @@ def parser():
     request = sub.add_parser("request", help="enqueue one exact eligible author task")
     request.add_argument("--task", required=True)
     request.add_argument("--task-generation", required=True)
-    request.add_argument("--home-binding", required=True)
-    request.add_argument("--account-binding", required=True)
-    request.add_argument("--worktree-binding", required=True)
-    request.add_argument("--repository-binding", required=True)
-    request.add_argument("--repository-generation", required=True)
+    request.add_argument("--home-binding", help=argparse.SUPPRESS)
+    request.add_argument("--account-binding", help=argparse.SUPPRESS)
+    request.add_argument("--worktree-binding", help=argparse.SUPPRESS)
+    request.add_argument("--repository-binding", help=argparse.SUPPRESS)
+    request.add_argument("--repository-generation", help=argparse.SUPPRESS)
     request.add_argument("--owner-kind", choices=("primary", "secondmate"), required=True)
     request.add_argument("--eligible", action="store_true")
     request.add_argument("--required", action="store_true", help="mark non-discretionary recovery/landing work")
@@ -1351,6 +1429,21 @@ def parser():
     capacity_release.add_argument("--cleanup-receipt", required=True)
     capacity_release.add_argument("--confirm-subscription", required=True)
 
+    execute = sub.add_parser("execute", help="run one exact private task command and collect its bound result")
+    execute.add_argument("--task", required=True)
+    execute.add_argument("--task-generation", required=True)
+    execute.add_argument("--assignment-generation", required=True)
+    execute.add_argument("--wall-seconds", type=int, default=3600)
+    execute.add_argument("--confirm-execute", action="store_true")
+    execute.add_argument("--confirm-subscription", required=True)
+    execute.add_argument("argv", nargs=argparse.REMAINDER)
+
+    receipt = sub.add_parser("authority-receipt", help="produce one exact ordinary-owner receipt bundle")
+    receipt.add_argument("--task", required=True)
+    receipt.add_argument("--task-generation", required=True)
+    receipt.add_argument("--assignment-generation", required=True)
+    receipt.add_argument("--output", required=True)
+
     release = sub.add_parser("release", help="accept exact ordinary lifecycle proofs")
     release.add_argument("--task", required=True)
     release.add_argument("--task-generation", required=True)
@@ -1379,16 +1472,85 @@ def parser():
     return top
 
 
+def authoritative_request_bindings(env, task, generation):
+    require_id("task", task)
+    require_id("task generation", generation)
+    metadata = env["home"] / "state" / (task + ".meta")
+    if metadata.is_symlink() or not metadata.is_file():
+        raise LifecycleError("ordinary task metadata authority is absent")
+    values = {}
+    for line in metadata.read_text(encoding="utf-8").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values.setdefault(key, []).append(value)
+    def exactly(key):
+        entries = values.get(key, [])
+        if len(entries) != 1 or not entries[0]:
+            raise LifecycleError("ordinary task metadata {} identity is not exact".format(key))
+        return entries[0]
+    if exactly("generation_id") != generation:
+        raise LifecycleError("ordinary task metadata generation differs")
+    worktree = Path(exactly("worktree")).resolve()
+    account_home = Path(exactly("account_home")).resolve()
+    account_task = (values.get("account_task") or [task])[0]
+    if account_task != task or not account_home.is_dir():
+        raise LifecycleError("ordinary account lease authority differs from the task")
+    try:
+        top = Path(subprocess.check_output(
+            ["git", "-C", str(worktree), "rev-parse", "--show-toplevel"], text=True
+        ).strip()).resolve()
+        git_dir = Path(subprocess.check_output(
+            ["git", "-C", str(worktree), "rev-parse", "--git-dir"], text=True
+        ).strip())
+        if not git_dir.is_absolute():
+            git_dir = (worktree / git_dir).resolve()
+        head = subprocess.check_output(
+            ["git", "-C", str(worktree), "rev-parse", "HEAD"], text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise LifecycleError("ordinary worktree authority is unreadable: {}".format(exc))
+    if top != worktree:
+        raise LifecycleError("ordinary worktree authority is not the exact repository root")
+    recorded_git_identity = exactly("worktree_git_dir_identity")
+    physical_identity = "{}:{}".format(os.stat(git_dir).st_dev, os.stat(git_dir).st_ino)
+    if recorded_git_identity not in (physical_identity, digest_value({"git_dir": str(git_dir)})):
+        raise LifecycleError("ordinary worktree Git-directory identity differs")
+    return {
+        "home_binding": env["home_binding"],
+        "account_binding": digest_value({"task": task, "account_home": str(account_home)}),
+        "worktree_binding": digest_value({"worktree": str(worktree), "git_dir": str(git_dir)}),
+        "repository_binding": hashlib.sha256(head.encode("ascii")).hexdigest(),
+        "repository_generation": head,
+    }
+
+
 def command_request(env, args):
+    supplied = (
+        args.home_binding, args.account_binding, args.worktree_binding,
+        args.repository_binding, args.repository_generation,
+    )
+    if any(value is not None for value in supplied):
+        test_provider = os.environ.get("FM_WORKER_PROVIDER_COMMAND", "")
+        if (
+            os.environ.get("FM_WORKER_TEST_ALLOW_ASSERTED_BINDINGS") != "1"
+            or "provider.py" not in test_provider
+            or not all(supplied)
+        ):
+            raise LifecycleError("caller-supplied worker bindings are unsupported; ordinary authorities own them")
+        bindings = {
+            "home_binding": require_binding("home binding", args.home_binding),
+            "account_binding": require_binding("account binding", args.account_binding),
+            "worktree_binding": require_binding("worktree binding", args.worktree_binding),
+            "repository_binding": require_binding("repository binding", args.repository_binding),
+            "repository_generation": require_id("repository generation", args.repository_generation),
+        }
+    else:
+        bindings = authoritative_request_bindings(env, args.task, args.task_generation)
     item = {
         "schema": REQUEST_SCHEMA,
         "task": args.task,
         "task_generation": args.task_generation,
-        "home_binding": args.home_binding,
-        "account_binding": args.account_binding,
-        "worktree_binding": args.worktree_binding,
-        "repository_binding": args.repository_binding,
-        "repository_generation": args.repository_generation,
+        **bindings,
         "owner_kind": args.owner_kind,
         "role": "author",
         "eligible": args.eligible,
@@ -1561,6 +1723,83 @@ def command_capacity_release(env, args):
     print("specialized capacity reservation released after exact zero-compute proof")
 
 
+def command_execute(env, args):
+    if not args.confirm_execute:
+        raise LifecycleError("--confirm-execute is required")
+    if args.confirm_subscription != env["subscription"]:
+        raise LifecycleError("--confirm-subscription must exactly match FM_AZURE_SUBSCRIPTION_ID")
+    argv = list(args.argv)
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv or len(argv) > 64 or any(not item or "\x00" in item or len(item) > 4096 for item in argv):
+        raise LifecycleError("execution argv is empty or unbounded")
+    if not 1 <= args.wall_seconds <= 6 * 60 * 60:
+        raise LifecycleError("execution wall deadline must be between 1 and 21600 seconds")
+    with controller_lock(env):
+        state = load_state(env)
+        key = request_key(require_id("task", args.task), require_id("task generation", args.task_generation))
+        item = state["queue"].get(key)
+        if item is None or item.get("status") != "assigned":
+            raise LifecycleError("execute requires one exact assigned task generation")
+        worker = state["workers"].get(str(item.get("slot")))
+        if worker is None or worker.get("assignment_generation") != args.assignment_generation:
+            raise LifecycleError("execute assignment generation is not exact")
+        if worker.get("release_proof") is not None:
+            raise LifecycleError("released work cannot execute")
+        inventory = provider_call(env, "inventory")["inventory"]
+        cloud = inventory_by_slot(inventory).get(worker["slot"])
+        classification, reason = classify_worker(worker, cloud)
+        if classification != "assigned":
+            raise LifecycleError("execute refuses a non-assigned or ambiguous worker: {}".format(reason))
+        request = {
+            "schema": EXECUTION_SCHEMA,
+            **worker["bindings"],
+            "cloud_instance_id": worker["cloud_instance_id"],
+            "argv": argv,
+            "wall_seconds": args.wall_seconds,
+        }
+        request["request_digest"] = digest_value(request)
+        existing = state["executions"].get(request["request_digest"])
+        if existing is not None:
+            print(json.dumps(existing, sort_keys=True, separators=(",", ":")))
+            return
+        action = make_action(
+            env, "execute", worker=worker, request=request,
+            request_digest=request["request_digest"],
+        )
+        execute_action(env, state, action)
+        result = state["executions"][request["request_digest"]]
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+
+
+def command_authority_receipt(env, args):
+    with controller_lock(env):
+        state = load_state(env)
+        key = request_key(require_id("task", args.task), require_id("task generation", args.task_generation))
+        item = state["queue"].get(key)
+        worker = state["workers"].get(str((item or {}).get("slot")))
+        if item is None or worker is None or worker.get("assignment_generation") != args.assignment_generation:
+            raise LifecycleError("authority receipt requires one exact assigned worker")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as handle:
+            json.dump(worker, handle, sort_keys=True, separators=(",", ":"))
+            worker_path = handle.name
+        try:
+            result = subprocess.run([
+                "python3", str(ROOT / "bin" / "fm-worker-authority.py"),
+                "--home", str(env["home"]), "--task", args.task,
+                "--task-generation", args.task_generation,
+                "--assignment-generation", args.assignment_generation,
+                "--worker-state", worker_path, "--output", args.output,
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=PROVIDER_TIMEOUT_SECONDS)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                Path(worker_path).unlink()
+        if result.returncode != 0:
+            detail = result.stderr.decode("utf-8", errors="replace").strip()[-1000:]
+            raise LifecycleError("ordinary release authority refused: {}".format(detail))
+    print("authoritative endpoint/report/landing/account/worktree receipts written")
+
+
 def command_release(env, args):
     require_id("task", args.task)
     require_id("task generation", args.task_generation)
@@ -1629,6 +1868,11 @@ def command_resume(env, args):
         action = make_action(
             env, "resume", worker=worker, item=item, reuse_retained=True,
             previous_cloud_generation=previous_cloud_generation,
+            shared_admission_digest=digest_value({
+                "slot": worker["slot"], "sku": worker["sku"], "sku_family": worker["sku_family"],
+                "assignment_generation": worker["assignment_generation"],
+                "reservation_usd": worker["reservation_usd"],
+            }),
         )
         execute_action(env, state, action)
     print("replacement generation attached the exact retained task and account disks")
@@ -1706,6 +1950,10 @@ def main(argv=None):
         command_capacity_reserve(env, args)
     elif args.command == "capacity-release":
         command_capacity_release(env, args)
+    elif args.command == "execute":
+        command_execute(env, args)
+    elif args.command == "authority-receipt":
+        command_authority_receipt(env, args)
     elif args.command == "reconcile":
         command_reconcile(env, args)
     elif args.command == "proof-template":

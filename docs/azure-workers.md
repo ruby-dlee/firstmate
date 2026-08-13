@@ -18,17 +18,19 @@ The default adapter reconciles Azure through the installed Azure CLI and the lan
 An alternate provider must preserve the same exact identities, classifications, mutation fencing, and refusal behavior rather than translating them into best-effort names.
 
 This implementation does not change Herdr lifecycle behavior.
-A later accepted guest image supplies `/usr/local/libexec/fm-worker-supervisor`, which is the only target of the digest-bound `steer` operation.
-The controller never treats a successful VM allocation alone as proof that a cloud terminal interface is accepted.
+The Azure adapter installs the exact committed `bin/fm-worker-supervisor.py` bytes through the named immutable `bootstrap` Managed Run Command, verifies their SHA-256 digest, and exposes only one bounded `execute` protocol plus digest-only `steer`.
+The supervisor runs one argv without a shell, under exact task/home/account/worktree/repository/cloud environment bindings, emits one digest-bound bounded result, and has no Firstmate, secondmate, browser, nested-team, public endpoint, or child-worker API.
+The controller never treats VM allocation or bootstrap alone as a successful task result.
 
 No Azure apply or billable acceptance is authorized by this document.
-The first live reconcile remains blocked until the corrected private foundation, this implementation, private data-plane reachability, guest supervisor, and exact subscription are independently accepted and the operator explicitly authorizes billable reconciliation.
+The first live reconcile remains blocked until the corrected private foundation, this implementation, private data-plane reachability, fresh actual and forecast telemetry, exact subscription, and all live read-only inventories are independently accepted and the operator explicitly authorizes billable reconciliation.
 
 ## Queue request
 
 `request` adds one exact task generation to the durable queue under `$FM_HOME/state/azure-workers/controller.json`.
 The state file and lock are owner-only, atomically replaced, directory-synced, and bound to the canonical home, subscription hash, deployment generation, cleanup owner, and naming prefix.
-A request carries the task and task generation, owner kind, exact repository generation, and lowercase SHA-256 bindings for its home, provider-account lease, writable worktree, and repository.
+The caller supplies only task, task generation, owner kind, and eligibility; the controller reads the ordinary task metadata, canonical account home/task owner, exact worktree root, physical Git-directory identity, and HEAD to derive the home, provider-account, writable-worktree, repository, and repository-generation bindings.
+Caller-supplied bindings are unsupported outside the hermetic test backstop.
 Raw provider-account identity never appears in bounded status or Azure tags.
 The account binding must be a high-entropy digest produced by the account lease owner, not a digest of a guessable profile name.
 
@@ -38,17 +40,10 @@ The same task generation and exact identity is idempotent, while a changed ident
 An assigned request stays in the queue until its ordinary release proof is accepted and every exact cloud resource is safely reset.
 Therefore a truly empty queue also means there is no active task worker and desired worker compute is zero.
 
-Example with intentionally opaque bindings:
-
 ```sh
 bin/fm-worker-lifecycle.sh request \
   --task '<task-id>' \
   --task-generation '<task-generation>' \
-  --home-binding '<64-lowercase-hex>' \
-  --account-binding '<64-lowercase-hex>' \
-  --worktree-binding '<64-lowercase-hex>' \
-  --repository-binding '<64-lowercase-hex>' \
-  --repository-generation '<repository-generation>' \
   --owner-kind primary \
   --eligible
 ```
@@ -123,8 +118,10 @@ It records that the specialized owner has already proved exact compute absence; 
 ## Assignment and isolation
 
 A new assignment chooses one free reviewed slot and durably records its assignment generation before the provider mutation.
+The singleton pilot create also receives and re-verifies a canonical shared-admission digest over slot, SKU/family, assignment generation, and cost reservation, so it cannot be invoked as a separate allocator path.
 The provider creates or claims one VM generation, one slot user-assigned identity, one provider-account disk, one task/worktree disk, one exact container role, and one private state container.
-The VM, NIC, OS disk, account disk, task disk, identity, role, and container are all recorded by complete resource ID and immutable provider identity.
+The complete assignment identity also includes the Azure Monitor extension, named `bootstrap` and `execute` Managed Run Commands, enabled VM-targeted TTL schedule with deadline, zero-RBAC global reservation blob, private request blob, and private result blob.
+All fifteen resource kinds are recorded by complete resource ID and immutable provider identity or ETag; missing or extra Run Commands, a disabled/retargeted TTL, absent staging/result digest, or ambiguous reservation refuses the assignment.
 Every taggable resource is additionally bound to deployment owner, slot, home, task, task generation, assignment generation, cloud generation, account digest, worktree digest, repository digest, and repository generation.
 The container carries the equivalent exact metadata.
 
@@ -143,14 +140,15 @@ A visible VM with another task or assignment binding refuses instead of being ad
 
 The controller never infers safe deletion from a terminal chat line, a missing VM, elapsed time, or budget pressure.
 The ordinary Firstmate owners first remove the endpoint, publish the report, prove landed work, release the provider account, and complete their normal cleanup checks.
-They then produce an `fm.worker-release/v1` receipt that binds five independent receipt digests plus the exact home, task, task generation, assignment generation, cloud instance, account, worktree, repository, and every resource identity.
-`proof-template` prints the current exact skeleton, but its placeholders are deliberately invalid.
-The proof owner computes `proof_digest` over every other canonical field after replacing all placeholders.
+`authority-receipt` invokes `bin/fm-worker-authority.py`, which reads the ordinary task metadata, endpoint backend oracle, completion-report contract, Git landing graph, account task/home binding, and clean exact worktree root rather than accepting operator-entered digests.
+It produces an `fm.worker-release/v2` bundle with five independently canonical `fm.worker-authority/v1` receipts for endpoint absence, report validity, landed work, account ownership, and writable-worktree cleanliness, plus the exact home, task, generations, cloud instance, account, worktree, repository, and every resource identity.
+`proof-template` remains diagnostic only: its placeholders are deliberately invalid and hand-filling them is unsupported.
 A missing, stale, malformed, or conflicting receipt retains everything.
 
 After an exact release receipt, reconcile deallocates the VM promptly.
 Azure deallocation stops compute billing but not disks, NICs, public foundation meters, monitoring, or storage operations.
-With no compatible waiting task, the controller leaves compute deallocated for the short bounded cooldown, then conditionally deletes the VM, NIC, and OS disk and resets the exact released account disk, task disk, identity, role, and container.
+After deallocation it deletes the named execute and bootstrap Run Commands and monitor extension before the VM, then proves VM absence and disk/NIC detach before deleting NIC and OS disk; the TTL remains enabled until those proofs complete and is deleted last among compute children.
+Reset then conditionally deletes the result, request, global reservation, released account disk, task disk, identity, role, and container.
 The default cooldown is 300 seconds and may be configured from zero through 1,800 seconds.
 The default and currently required warm-idle target is zero.
 
@@ -182,8 +180,11 @@ Resume requires the old VM, NIC, and OS disk to be absent; both exact retained d
 It increments only the cloud generation, creates fresh VM/NIC/OS capacity, reattaches the same task-owned retained disks, and keeps the assignment generation fenced.
 Any mismatch retains the slot for investigation.
 
+`execute` accepts exact task, task generation, assignment generation, bounded wall time, explicit subscription/execute confirmations, and argv after `--`.
+It uploads a canonical request privately, invokes only the named execute Run Command and pinned supervisor, verifies the returned task/assignment/cloud/repository/result digest, stores the private result identity, and replays the same result idempotently without a second execution.
 `steer` accepts only a lowercase SHA-256 request digest plus exact task, task generation, assignment generation, and subscription confirmation.
 The Azure adapter re-verifies the full live assignment before invoking the minimal guest supervisor with those non-secret bindings.
+Its read-only inventory uses Azure CLI 2.88-compatible role-assignment syntax (`--all` without `--resource-group`), requires private Entra blob reads for reservation/request/result identities, and uses one unambiguous primary Linux on-demand USD Consumption meter while excluding Spot, Low Priority, Windows, dev/test, reservation, and savings offers.
 It never forwards arbitrary shell text, provider credentials, or a hosted control endpoint.
 
 ## Reconcile and bounded status
@@ -233,8 +234,8 @@ A decision that uses Lavish stays on trusted control-plane capacity and may requ
 
 ## Isolated Azure acceptance
 
-Hermetic tests exercise the state machine and provider protocol without Azure mutation or cost.
-Real usability remains unclaimed until the corrected reviewed foundation and guest supervisor are released, private reachability works, and an operator explicitly authorizes this billable exercise.
+Hermetic tests exercise the complete zero-to-zero state/provider path and the pinned guest protocol without Azure mutation or cost.
+Real usability remains unclaimed until the corrected reviewed foundation and this lifecycle are landed, private management and blob reads work, actual and forecast telemetry are fresh, and an operator explicitly authorizes this billable exercise.
 Run `bin/fm-worker-lifecycle.sh acceptance-plan` for the concise checklist.
 
 The complete acceptance must record all of these outcomes:
@@ -242,12 +243,12 @@ The complete acceptance must record all of these outcomes:
 1. Start from zero and run at least three representative tasks in parallel on three distinct VMs, account bindings, and task disks.
 2. Finish one task while another compatible task waits and prove that deallocate, VM/NIC/OS deletion, released account/task/identity/container reset, and a new assignment generation occur before the waiting task starts.
 3. Drain every request and prove desired and active worker compute reach zero after cooldown.
-4. Prove every disposable worker VM, NIC, and OS disk is absent, while only explicitly retained ambiguous disks remain.
+4. Prove every disposable VM, NIC, OS disk, extension, Run Command, TTL, staging request/result, and active global reservation is absent, while only explicitly retained ambiguous unfinished disks remain.
 5. Delete one deliberately unfinished worker VM and prove the old exact task disk survives, a normal request cannot claim its slot, and explicit exact-generation resume reattaches it to fresh VM/NIC/OS capacity.
 6. Restart the controller after a submitted create, deallocate, delete, and reset and prove each idempotency key produces one transition and no duplicate assignment.
 7. Force actual and separately forecast budget pressure and prove new discretionary launches stop while existing active and unlanded work remains untouched.
 8. Prove every VM has no public IP or public ingress and cannot see another task's credential disk, worktree disk, browser state, process, socket, cache, provider lease, or cloud identity.
-9. Record bounded status and actual cost evidence before, during, and after the exercise.
+9. Execute one representative private command through the pinned supervisor, collect its exact result, close the real endpoint, validate/publish the report, prove landing, account release, and clean worktree through `authority-receipt`, then record bounded status plus actual and forecast cost evidence before, during, and after the exercise.
 
 Every acceptance leg needs a positive control that proves the check detects the unsafe state.
 Positive controls include a planted public-IP relation, a foreign immutable ID, a stale task generation, a duplicated account digest, a duplicated worktree digest, a deliberately retained dirty disk, a repeated provider action, a forecast above policy, and planted cross-task files, processes, sockets, browser data, cloud identities, or credentials.

@@ -11,32 +11,43 @@ set -u
 CONTROLLER="$ROOT/bin/fm-worker-lifecycle.py"
 WRAPPER="$ROOT/bin/fm-worker-lifecycle.sh"
 AZURE="$ROOT/bin/fm-azure-worker-provider.py"
+SUPERVISOR="$ROOT/bin/fm-worker-supervisor.py"
+AUTHORITY="$ROOT/bin/fm-worker-authority.py"
 DOC="$ROOT/docs/azure-workers.md"
 SUB=11111111-1111-4111-8111-111111111111
 
 static_contract() {
-  python3 - "$CONTROLLER" "$AZURE" "$DOC" <<'PY' || fail "elastic worker static contract failed"
+  python3 - "$CONTROLLER" "$AZURE" "$SUPERVISOR" "$AUTHORITY" "$DOC" <<'PY' || fail "elastic worker static contract failed"
 from pathlib import Path
 import sys
 
 controller = Path(sys.argv[1]).read_text(encoding="utf-8")
 azure = Path(sys.argv[2]).read_text(encoding="utf-8")
-doc = Path(sys.argv[3]).read_text(encoding="utf-8")
+supervisor = Path(sys.argv[3]).read_text(encoding="utf-8")
+authority = Path(sys.argv[4]).read_text(encoding="utf-8")
+doc = Path(sys.argv[5]).read_text(encoding="utf-8")
 for marker in (
     '"assigned", "clean-warm", "deallocated", "orphaned-safe-to-delete", "retained-for-investigation"',
     "REGIONAL_ADMISSION_CEILING_VCPUS = 128", "AUTHOR_PLAN_VCPUS = MAX_WORKERS * VCPUS_PER_WORKER",
     "SPECIALIZED_SHAPE_VCPUS = 40", "SHARED_HEADROOM_VCPUS = 22", "MAX_WORKERS = 16",
     'FM_AZURE_WORKER_WARM_IDLE currently must remain zero', "pending_action",
     "capacity-reserve", "capacity-release", "merged_specialized_reservations",
-    "endpoint_receipt", "landed_work_receipt", "account_release_receipt",
+    "fm.worker-authority/v1", "authority-receipt", "fm.worker-execution/v1",
 ):
     assert marker in controller, marker
 for marker in (
     "run_pilot_create", "conditional_delete", "If-Match=", "reuse_retained",
-    "same-name foreign", "/usr/local/libexec/fm-worker-supervisor",
+    '"role", "assignment", "list", "--all"',
+    "same-name foreign", "/usr/local/libexec/fm-worker-supervisor", "create_lifecycle_children",
+    '"bootstrap-command"', '"task-command"', '"ttl-schedule"', '"global-reservation"',
+    '"staging-request"', '"staging-result"',
     "worker NIC has a public IP relation", "VM cloud identity set is not exactly one slot identity",
 ):
     assert marker in azure, marker
+for marker in ("fm.worker-execution/v1", "request_digest", "subprocess.run", "MAX_OUTPUT_BYTES"):
+    assert marker in supervisor, marker
+for marker in ("endpoint_evidence", "report_evidence", "landing_evidence", "account_evidence", "worktree_evidence"):
+    assert marker in authority, marker
 for marker in (
     "sixteen 4-vCPU workers", "$1,500", "3,500 aggregate author worker-hours",
     "downloaded self-contained form artifact", "returns through a file",
@@ -261,6 +272,7 @@ azure_provider_refusal_matrix() {
 import copy
 import hashlib
 import importlib.util
+import json
 import sys
 
 spec = importlib.util.spec_from_file_location("azure_provider", sys.argv[1])
@@ -292,12 +304,44 @@ resources["vm"]["power_state"] = "VM running"
 resources["nic"]["attached_to"] = resources["vm"]["id"]
 for kind in ("os-disk", "task-disk", "account-disk"):
     resources[kind]["attached_to"] = resources["vm"]["id"]
+for kind in ("monitor-extension", "bootstrap-command", "task-command", "ttl-schedule"):
+    resources[kind]["attached_to"] = resources["vm"]["id"]
+for kind in ("monitor-extension", "bootstrap-command", "task-command"):
+    resources[kind]["provisioning_state"] = "Succeeded"
+resources["ttl-schedule"].update({"status": "Enabled", "deadline": "2300"})
+for kind in ("global-reservation", "staging-request", "staging-result"):
+    resources[kind].update({"digest": "f" * 64, "length": 1})
 action["resources"] = {
     kind: {"id": value["id"], "immutable_id": value["immutable_id"]}
     for kind, value in resources.items()
 }
 worker = {"slot": 1, "resources": resources}
 module.recorded_exact(action, worker)
+for child in ("monitor-extension", "bootstrap-command", "task-command", "ttl-schedule"):
+    changed = copy.deepcopy(worker)
+    changed["resources"][child]["attached_to"] = "/foreign-vm"
+    try:
+        module.recorded_exact(action, changed)
+    except module.ProviderError as exc:
+        assert "exact worker VM" in str(exc)
+    else:
+        raise AssertionError("foreign {} target accepted".format(child))
+changed = copy.deepcopy(worker)
+changed["resources"]["ttl-schedule"]["status"] = "Disabled"
+try:
+    module.recorded_exact(action, changed)
+except module.ProviderError as exc:
+    assert "TTL" in str(exc)
+else:
+    raise AssertionError("disabled TTL schedule accepted")
+changed = copy.deepcopy(worker)
+changed["resources"].pop("task-command")
+try:
+    module.recorded_exact(action, changed)
+except module.ProviderError as exc:
+    assert "task-command" in str(exc)
+else:
+    raise AssertionError("missing task Run Command accepted")
 for kind in module.REQUIRED_RESOURCE_KINDS:
     changed = copy.deepcopy(worker)
     changed["resources"][kind]["immutable_id"] = "foreign"
@@ -365,6 +409,31 @@ except module.ProviderError as exc:
 else:
     raise AssertionError("foreign specialized reservation was accepted")
 
+# Retail admission accepts one exact Linux on-demand primary meter and rejects
+# Spot/Low Priority/Windows plus ambiguous eligible prices.
+class PriceResponse:
+    def __init__(self, value): self.value = value
+    def __enter__(self): return self
+    def __exit__(self, *_args): return False
+    def read(self): return json.dumps(self.value).encode()
+    def __iter__(self): return iter(())
+def meter(price=0.25, **changes):
+    value = {
+        "armRegionName": "eastus", "armSkuName": "Standard_D4as_v6",
+        "serviceName": "Virtual Machines", "serviceFamily": "Compute",
+        "type": "Consumption", "unitOfMeasure": "1 Hour", "currencyCode": "USD",
+        "productName": "Virtual Machines Dasv6 Series", "skuName": "D4as v6",
+        "meterName": "D4as v6", "isPrimaryMeterRegion": True,
+        "retailPrice": price, "unitPrice": price, "tierMinimumUnits": 0,
+    }
+    value.update(changes); return value
+module.urllib.request.urlopen = lambda *_a, **_k: PriceResponse({"Items": [meter()]})
+assert module.retail_rate("Standard_D4as_v6") == 0.25
+module.urllib.request.urlopen = lambda *_a, **_k: PriceResponse({"Items": [meter(), meter(0.30)]})
+assert module.retail_rate("Standard_D4as_v6") is None
+module.urllib.request.urlopen = lambda *_a, **_k: PriceResponse({"Items": [meter(productName="Virtual Machines Dasv6 Series Spot")]})
+assert module.retail_rate("Standard_D4as_v6") is None
+
 # Public IP relations are rejected while a private NIC is accepted.
 nic = {
     "id": "/nic", "etag": "etag", "tags": tags,
@@ -393,11 +462,27 @@ else:
 module.conditional_delete(controller, "role-assignment", {"id": "/role", "etag": None})
 assert calls[-1][0:3] == ["rest", "--method", "delete"] and "--headers" not in calls[-1]
 
+# Compute cleanup order deletes command children before VM and keeps TTL until
+# VM absence plus NIC/disk detach are independently proven.
+source = open(sys.argv[1], encoding="utf-8").read()
+cleanup = source[source.index("def mutate_delete_compute"):source.index("def mutate_reset")]
+assert cleanup.index('"task-command", "bootstrap-command", "monitor-extension", "vm"') < cleanup.index('conditional_delete(controller, "ttl-schedule", ttl)')
+assert cleanup.index('wait_absent(controller, resource["id"])') < cleanup.index('conditional_delete(controller, "ttl-schedule", ttl)')
+
 # Mutation idempotency rejects any changed action under a stale key.
 unsigned = dict(action)
 unsigned["type"] = "steer"
 unsigned["request_digest"] = "5" * 64
 unsigned["idempotency_key"] = hashlib.sha256(module.canonical_bytes(unsigned)).hexdigest()
+tampered_create = dict(action)
+tampered_create.update({"type": "create", "shared_admission_digest": "0" * 64})
+try:
+    module.run_pilot_create(controller, tampered_create)
+except module.ProviderError as exc:
+    assert "shared allocator" in str(exc)
+else:
+    raise AssertionError("singleton create accepted a forged shared-admission proof")
+
 tampered = dict(unsigned)
 tampered["request_digest"] = "6" * 64
 try:
@@ -459,13 +544,24 @@ def resource(action, kind, serial=None):
 
 def complete_worker(action, retained=None):
     resources = dict(retained or {})
-    for kind in ("vm", "nic", "os-disk", "task-disk", "account-disk", "identity", "role-assignment", "state-container"):
+    for kind in (
+        "vm", "nic", "os-disk", "task-disk", "account-disk", "identity", "role-assignment",
+        "state-container", "monitor-extension", "bootstrap-command", "task-command", "ttl-schedule",
+        "global-reservation", "staging-request", "staging-result",
+    ):
         if kind not in resources:
             resources[kind] = resource(action, kind)
     resources["vm"]["power_state"] = "VM running"
     resources["nic"]["attached_to"] = resources["vm"]["id"]
     for kind in ("os-disk", "task-disk", "account-disk"):
         resources[kind]["attached_to"] = resources["vm"]["id"]
+    for kind in ("monitor-extension", "bootstrap-command", "task-command", "ttl-schedule"):
+        resources[kind]["attached_to"] = resources["vm"]["id"]
+    for kind in ("monitor-extension", "bootstrap-command", "task-command"):
+        resources[kind]["provisioning_state"] = "Succeeded"
+    resources["ttl-schedule"].update({"status": "Enabled", "deadline": "2300"})
+    for kind in ("global-reservation", "staging-request", "staging-result"):
+        resources[kind].update({"digest": "f" * 64, "length": 1})
     return {"slot": action["slot"], "resources": resources}
 
 def save():
@@ -487,7 +583,10 @@ if request["operation"] == "mutate":
             result = {"idempotency_key": key, "action": kind, "worker": worker}
         elif kind == "resume":
             old = state["workers"][slot]["resources"]
-            retained = {name: old[name] for name in ("task-disk", "account-disk", "identity", "role-assignment", "state-container")}
+            retained = {name: old[name] for name in (
+                "task-disk", "account-disk", "identity", "role-assignment", "state-container",
+                "global-reservation", "staging-request", "staging-result",
+            )}
             worker = complete_worker(action, retained=retained)
             state["workers"][slot] = worker
             result = {"idempotency_key": key, "action": kind, "worker": worker}
@@ -497,7 +596,10 @@ if request["operation"] == "mutate":
             result = {"idempotency_key": key, "action": kind, "worker": worker}
         elif kind == "delete-compute":
             worker = state["workers"][slot]
-            for name in ("vm", "nic", "os-disk"):
+            for name in (
+                "vm", "nic", "os-disk", "monitor-extension", "bootstrap-command",
+                "task-command", "ttl-schedule",
+            ):
                 worker["resources"].pop(name, None)
             for name in ("task-disk", "account-disk"):
                 worker["resources"][name]["attached_to"] = None
@@ -505,6 +607,22 @@ if request["operation"] == "mutate":
         elif kind == "reset":
             state["workers"].pop(slot)
             result = {"idempotency_key": key, "action": kind}
+        elif kind == "execute":
+            request_value = action["request"]
+            execution = {
+                "schema": "fm.worker-execution-result/v1",
+                "request_digest": action["request_digest"],
+                "task": request_value["task"], "task_generation": request_value["task_generation"],
+                "assignment_generation": request_value["assignment_generation"],
+                "cloud_instance_id": action["cloud_instance_id"],
+                "repository_binding": request_value["repository_binding"],
+                "repository_generation": request_value["repository_generation"],
+                "exit_code": 0, "timed_out": False,
+                "stdout_sha256": "a" * 64, "stderr_sha256": "b" * 64,
+                "stdout_truncated": False, "stderr_truncated": False,
+            }
+            execution["result_digest"] = hashlib.sha256(canonical(execution)).hexdigest()
+            result = {"idempotency_key": key, "action": kind, "worker": state["workers"][slot], "execution": execution}
         elif kind == "steer":
             result = {"idempotency_key": key, "action": kind, "worker": state["workers"][slot]}
         else:
@@ -574,6 +692,7 @@ FM_AZURE_NAMING_PREFIX=fmtest
 FM_AZURE_WORKER_IDLE_COOLDOWN_SECONDS=0
 FM_WORKER_PROVIDER_COMMAND=python3 $provider
 FIXTURE_STATE=$fixture
+FM_WORKER_TEST_ALLOW_ASSERTED_BINDINGS=1
 EOF
 
   python3 - "$CONTROLLER" "$WRAPPER" "$envfile" "$fixture" <<'PY' || fail "end-to-end lifecycle exercise failed"
@@ -623,7 +742,7 @@ def release(number):
     item = state["queue"]["task-{}@gen-{}".format(number, number)]
     worker = state["workers"][str(item["slot"])]
     proof = {
-        "schema": "fm.worker-release/v1", "home_binding": worker["bindings"]["home_binding"],
+        "schema": "fm.worker-release/v2", "home_binding": worker["bindings"]["home_binding"],
         "task": "task-{}".format(number), "task_generation": "gen-{}".format(number),
         "assignment_generation": worker["assignment_generation"],
         "account_binding": worker["bindings"]["account_binding"],
@@ -631,10 +750,19 @@ def release(number):
         "repository_binding": worker["bindings"]["repository_binding"],
         "repository_generation": worker["bindings"]["repository_generation"],
         "cloud_instance_id": worker["cloud_instance_id"], "resources": worker["resources"],
-        "endpoint_receipt": binding(5000 + number), "report_receipt": binding(6000 + number),
-        "landed_work_receipt": binding(7000 + number), "account_release_receipt": binding(8000 + number),
-        "cleanup_receipt": binding(9000 + number),
+        "authorities": {},
     }
+    for offset, authority in enumerate(("endpoint", "report", "landing", "account", "worktree"), 5):
+        receipt = {
+            "schema": "fm.worker-authority/v1", "authority": authority,
+            "task": proof["task"], "task_generation": proof["task_generation"],
+            "assignment_generation": proof["assignment_generation"], "verdict": "proved",
+            "evidence_digest": binding(offset * 1000 + number),
+        }
+        receipt["receipt_digest"] = hashlib.sha256(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        proof["authorities"][authority] = receipt
     canonical = json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()
     proof["proof_digest"] = hashlib.sha256(canonical).hexdigest()
     path = Path(env["FM_HOME"]) / "proof-{}.json".format(number)
@@ -659,6 +787,24 @@ assert len({worker["bindings"]["worktree_binding"] for worker in state["workers"
 old_slot = state["queue"]["task-1@gen-1"]["slot"]
 old_task_disk = state["workers"][str(old_slot)]["resources"]["task-disk"]["immutable_id"]
 old_assignment = state["workers"][str(old_slot)]["assignment_generation"]
+
+# The private one-task execution path returns an exact result and replays the
+# same request from durable state without a second provider execution.
+execution = json.loads(run(
+    "execute", "--task", "task-1", "--task-generation", "gen-1",
+    "--assignment-generation", old_assignment, "--wall-seconds", "60",
+    "--confirm-execute", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"],
+    "--", "/usr/bin/true",
+).stdout)
+assert execution["schema"] == "fm.worker-execution-result/v1" and execution["exit_code"] == 0
+call_count = len(fixture_state()["calls"])
+repeat = json.loads(run(
+    "execute", "--task", "task-1", "--task-generation", "gen-1",
+    "--assignment-generation", old_assignment, "--wall-seconds", "60",
+    "--confirm-execute", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"],
+    "--", "/usr/bin/true",
+).stdout)
+assert repeat == execution and len(fixture_state()["calls"]) == call_count
 
 # A waiting task can use the slot only after deallocate, disposable deletion,
 # complete reset, and a new assignment generation.
@@ -726,7 +872,7 @@ assert result["actions"][0]["type"] == "admission-refused"
 assert result["status"]["actual_active_workers"] == 1
 assert len(fixture_state()["workers"]) == 1
 PY
-  pass "operator flow scales out, resets before reuse, drains to zero, resumes dirty disks, and stops budgeted admission without killing work"
+  pass "zero-to-zero flow executes privately, replays idempotently, resets before reuse, resumes dirty disks, and preserves active work under budget refusal"
 }
 
 shared_specialized_cli() {

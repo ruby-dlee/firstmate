@@ -23,6 +23,7 @@
 #   FM_AZURE_RUNNER_BUDGET_LIMIT_USD=1000        (1000 or 1500)
 #   FM_AZURE_RUNNER_COST_ADMISSION_MODE=strict   (or commissioning-bounded with exact flag)
 #   FM_AZURE_RUNNER_SKU=Standard_D4as_v6         (reviewed 4-vCPU current-family SKU)
+#   FM_AZURE_RUNNER_CELL_ORDINAL=1               (commissioning only; exact shared slot 1..16)
 #
 # Usage:
 #   fm-azure-runner.sh prepare --task <id> --generation <id> \

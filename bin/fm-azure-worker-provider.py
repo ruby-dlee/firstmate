@@ -1048,6 +1048,34 @@ install -d -m 0700 /var/lib/firstmate-worker
 cat > /var/lib/firstmate-worker/assignment.json <<'JSON'
 {assignment}
 JSON
+prepare_disk() {{
+  lun="$1"
+  target="$2"
+  device=""
+  attempts=0
+  while [ "$attempts" -lt 30 ]; do
+    device=$(readlink -f "/dev/disk/azure/scsi1/lun$lun" 2>/dev/null || true)
+    if [ -n "$device" ] && [ -b "$device" ]; then
+      break
+    fi
+    attempts=$((attempts + 1))
+    sleep 2
+  done
+  if [ -z "$device" ] || [ ! -b "$device" ]; then
+    echo "worker data disk lun $lun is absent" >&2
+    exit 71
+  fi
+  if ! blkid "$device" >/dev/null 2>&1; then
+    mkfs.ext4 -q -L "fm-lun$lun" "$device"
+  fi
+  install -d -m 0700 "$target"
+  if ! mountpoint -q "$target"; then
+    mount -o noatime,nodev,nosuid "$device" "$target"
+  fi
+  chmod 0700 "$target"
+}}
+prepare_disk 0 /mnt/account
+prepare_disk 1 /mnt/task
 """.format(
         encoded=encoded, digest=supervisor_digest,
         assignment=json.dumps({

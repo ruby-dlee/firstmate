@@ -236,7 +236,27 @@ def main():
         raise SupervisorError("only one-task execute is supported")
     request = read_request(args.request)
     worktree = verify_environment(request)
+    # One request digest executes at most once on this guest: a controller
+    # replay after a transport loss re-emits the recorded result instead of
+    # running the task command a second time.
+    executed_dir = Path(
+        os.environ.get("FM_WORKER_EXECUTED_DIR", "/var/lib/firstmate-worker/executed")
+    )
+    marker = executed_dir / (request["request_digest"] + ".json")
+    if marker.is_file():
+        try:
+            recorded = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SupervisorError("recorded execution replay evidence is unreadable: {}".format(exc))
+        unsigned = dict(recorded)
+        supplied = unsigned.pop("result_digest", None)
+        if supplied != digest(unsigned) or recorded.get("request_digest") != request["request_digest"]:
+            raise SupervisorError("recorded execution replay evidence is not exact")
+        write_atomic(args.result, recorded)
+        print(json.dumps({"result_digest": recorded["result_digest"]}, separators=(",", ":")))
+        return
     result = execute(request, worktree)
+    write_atomic(marker, result)
     write_atomic(args.result, result)
     print(json.dumps({"result_digest": result["result_digest"]}, separators=(",", ":")))
 

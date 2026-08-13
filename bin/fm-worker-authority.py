@@ -112,11 +112,18 @@ def worktree_evidence(task, values):
     return "{}\0{}\0{}".format(worktree, common.resolve(), git(worktree, "rev-parse", "HEAD")).encode(), worktree
 
 
-def landing_evidence(worktree):
+def landing_evidence(worktree, repository_generation):
     # Only the canonical origin remote proves landing; a scratch or fork
     # remote-tracking ref must not count, and an unpushed local default
-    # branch is not landed work.
+    # branch is not landed work. The landed head must also descend from the
+    # assignment's exact starting repository generation, so a receipt can
+    # never be minted from an unrelated worktree lineage.
     head = git(worktree, "rev-parse", "HEAD")
+    lineage = subprocess.run(
+        ["git", "-C", str(worktree), "merge-base", "--is-ancestor", repository_generation, head]
+    )
+    if lineage.returncode != 0:
+        raise AuthorityError("landing authority head does not descend from the assignment repository generation")
     git(
         worktree, "fetch", "--quiet", "--no-tags", "--prune", "origin",
         "+refs/heads/*:refs/remotes/origin/*",
@@ -127,7 +134,7 @@ def landing_evidence(worktree):
             continue
         result = subprocess.run(["git", "-C", str(worktree), "merge-base", "--is-ancestor", head, ref])
         if result.returncode == 0:
-            return "{}\0{}".format(head, ref).encode()
+            return "{}\0{}\0{}".format(head, ref, repository_generation).encode()
     raise AuthorityError("landing authority did not prove committed work reachable from the origin remote")
 
 
@@ -184,7 +191,10 @@ def main():
     authorities = {
         "endpoint": receipt("endpoint", args.task, generation, args.assignment_generation, endpoint_evidence(home, args.task, values)),
         "report": receipt("report", args.task, generation, args.assignment_generation, report_evidence(home, args.task)),
-        "landing": receipt("landing", args.task, generation, args.assignment_generation, landing_evidence(worktree)),
+        "landing": receipt(
+            "landing", args.task, generation, args.assignment_generation,
+            landing_evidence(worktree, worker["bindings"]["repository_generation"]),
+        ),
         "account": receipt("account", args.task, generation, args.assignment_generation, account_evidence(values, args.task, home)),
         "worktree": receipt("worktree", args.task, generation, args.assignment_generation, worktree_info),
     }

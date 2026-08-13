@@ -42,6 +42,7 @@ for marker in (
     "run_pilot_create", "conditional_delete", "If-Match=", "reuse_retained",
     '"role", "assignment", "list", "--all"',
     "same-name foreign", "/usr/local/libexec/fm-worker-supervisor", "create_lifecycle_children",
+    "prepare_disk 0 /mnt/account", "prepare_disk 1 /mnt/task", "blkid",
     '"bootstrap-command"', '"task-command"', '"ttl-schedule"', '"global-reservation"',
     '"staging-request"', '"staging-result"',
     "worker NIC has a public IP relation", "VM cloud identity set is not exactly one slot identity",
@@ -1348,7 +1349,14 @@ from pathlib import Path
 spec = importlib.util.spec_from_file_location("worker_authority", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-assert b"refs/remotes/origin/main" in module.landing_evidence(Path(sys.argv[2]))
+head = module.git(Path(sys.argv[2]), "rev-parse", "HEAD")
+assert b"refs/remotes/origin/main" in module.landing_evidence(Path(sys.argv[2]), head)
+try:
+    module.landing_evidence(Path(sys.argv[2]), "0" * 40)
+except module.AuthorityError as exc:
+    assert "descend" in str(exc)
+else:
+    raise AssertionError("landing accepted a foreign repository generation lineage")
 PY
   git -C "$seed" push --quiet origin --delete main
   if python3 - "$AUTHORITY" "$checkout" <<'PY'
@@ -1358,7 +1366,8 @@ from pathlib import Path
 spec = importlib.util.spec_from_file_location("worker_authority", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-module.landing_evidence(Path(sys.argv[2]))
+head = module.git(Path(sys.argv[2]), "rev-parse", "HEAD")
+module.landing_evidence(Path(sys.argv[2]), head)
 PY
   then
     fail "stale origin tracking ref still proved landing after remote deletion"

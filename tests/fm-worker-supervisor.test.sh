@@ -35,6 +35,7 @@ PY
     FM_WORKER_ACCOUNT_BINDING="$account_binding" FM_WORKER_WORKTREE_BINDING="$worktree_binding" \
     FM_WORKER_REPOSITORY_BINDING="$repo_binding" FM_WORKER_REPOSITORY_GENERATION="$repo_gen" \
     FM_WORKER_CLOUD_INSTANCE_ID="$cloud" FM_WORKER_WORKTREE="$work" FM_WORKER_ACCOUNT_HOME="$account" \
+    FM_WORKER_EXECUTED_DIR="$tmp/executed" \
     "$SUPERVISOR" execute --request "$request" --result "$result" >/dev/null \
     || fail "minimal guest supervisor rejected an exact request"
   python3 - "$request" "$result" <<'PY' || fail "minimal guest supervisor result was not exact"
@@ -56,10 +57,51 @@ PY
       FM_WORKER_WORKTREE_BINDING="$worktree_binding" FM_WORKER_REPOSITORY_BINDING="$repo_binding" \
       FM_WORKER_REPOSITORY_GENERATION="$repo_gen" FM_WORKER_CLOUD_INSTANCE_ID="$cloud" \
       FM_WORKER_WORKTREE="$work" FM_WORKER_ACCOUNT_HOME="$account" \
+      FM_WORKER_EXECUTED_DIR="$tmp/executed" \
       "$SUPERVISOR" execute --request "$request" --result "$result" >/dev/null 2>&1; then
     fail "minimal guest supervisor accepted a request changed after digest binding"
   fi
   pass "pinned guest supervisor executes one exact command and rejects changed request or assignment identity"
+}
+
+run_supervisor_replay_controls() {
+  local tmp work account request result home account_binding worktree_binding repo_binding counter
+  fm_test_tmproot_into tmp fm-worker-supervisor-replay
+  work="$tmp/work"
+  account="$tmp/account"
+  counter="$tmp/side-effect-count"
+  mkdir -p "$work" "$account"
+  home=$(printf home | shasum -a 256 | awk '{print $1}')
+  account_binding=$(printf account | shasum -a 256 | awk '{print $1}')
+  worktree_binding=$(printf worktree | shasum -a 256 | awk '{print $1}')
+  repo_binding=$(printf repo | shasum -a 256 | awk '{print $1}')
+  request="$tmp/request.json"
+  result="$tmp/result.json"
+  python3 - "$request" "$home" "$account_binding" "$worktree_binding" "$repo_binding" "$counter" <<'PY'
+import hashlib,json,sys
+path,home,account,worktree,repo,counter=sys.argv[1:]
+value={"schema":"fm.worker-execution/v1","home_binding":home,"task":"task-one","task_generation":"task-gen","assignment_generation":"asg-00000001","account_binding":account,"worktree_binding":worktree,"repository_binding":repo,"repository_generation":"repo-gen","cloud_instance_id":"vm-instance","argv":["/bin/sh","-c","echo x >> {}".format(counter)],"wall_seconds":60}
+value["request_digest"]=hashlib.sha256(json.dumps(value,sort_keys=True,separators=(",", ":")).encode()).hexdigest()
+json.dump(value,open(path,"w"),sort_keys=True,separators=(",", ":"))
+PY
+  for _ in 1 2; do
+    env FM_WORKER_HOME_BINDING="$home" FM_WORKER_TASK=task-one \
+      FM_WORKER_TASK_GENERATION=task-gen FM_WORKER_ASSIGNMENT_GENERATION=asg-00000001 \
+      FM_WORKER_ACCOUNT_BINDING="$account_binding" FM_WORKER_WORKTREE_BINDING="$worktree_binding" \
+      FM_WORKER_REPOSITORY_BINDING="$repo_binding" FM_WORKER_REPOSITORY_GENERATION=repo-gen \
+      FM_WORKER_CLOUD_INSTANCE_ID=vm-instance FM_WORKER_WORKTREE="$work" FM_WORKER_ACCOUNT_HOME="$account" \
+      FM_WORKER_EXECUTED_DIR="$tmp/executed" \
+      "$SUPERVISOR" execute --request "$request" --result "$result" >/dev/null \
+      || fail "guest supervisor refused an exact replayable request"
+  done
+  test "$(wc -l < "$counter" | tr -d ' ')" = 1 \
+    || fail "guest supervisor re-ran the task command on an exact replay"
+  python3 - "$result" <<'PY' || fail "replayed result lost its exact digest binding"
+import hashlib,json,sys
+result=json.load(open(sys.argv[1])); supplied=result.pop("result_digest")
+assert supplied==hashlib.sha256(json.dumps(result,sort_keys=True,separators=(",", ":")).encode()).hexdigest()
+PY
+  pass "guest supervisor executes one request digest at most once and replays the recorded result"
 }
 
 run_supervisor_steer_controls() {
@@ -98,5 +140,6 @@ PY
 }
 
 run_supervisor_controls
+run_supervisor_replay_controls
 run_supervisor_steer_controls
 echo "# fm-worker-supervisor.test.sh: all assertions passed"

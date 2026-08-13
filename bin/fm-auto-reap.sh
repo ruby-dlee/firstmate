@@ -451,7 +451,7 @@ recover_acquisition() {  # <record>
   fi
   recorded_worktree=$(single_meta_value_allow_empty "$record" worktree) || {
     fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
-    refuse "acquisition record must contain exactly one worktree field"
+    refuse "acquisition record must contain exactly one worktree field" || true
     return 0
   }
   if [ -n "$recorded_worktree" ]; then
@@ -597,7 +597,7 @@ maintenance() {
         fi
         [ "$probe_status" -eq 0 ] || continue
         AUTO_REAP_PR_VERIFIED=1 reap_task "$id" pr-merged
-        ;;
+      ;;
     esac
   done
 }

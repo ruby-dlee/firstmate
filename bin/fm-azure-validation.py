@@ -46,9 +46,7 @@ PR_URL = re.compile(r"^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$")
 NM_RUN_ID = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
 RUNNER_INVOCATION = re.compile(r"^azr-[a-z0-9]{12}(?:-a[2-9][0-9]*)?$")
 LOCAL_TIMEOUT = 300
-REGIONAL_TARGET_VCPUS = 128
-VALIDATION_RESERVED_VCPUS = 64
-AUTHOR_RESERVED_VCPUS = 64
+REGIONAL_ADMISSION_CEILING_VCPUS = 128
 MONTHLY_VALIDATION_HOURS = 400.0
 BUDGET_TARGET_USD = 1000.0
 BUDGET_CEILING_USD = 1500.0
@@ -203,15 +201,16 @@ def environment(require_cloud=False):
     state_dir = Path(os.environ.get(
         "FM_AZURE_VALIDATION_STATE_DIR", str(home / "state" / "azure-validation")
     )).resolve()
+    if "FM_AZURE_VALIDATION_RESERVED_VCPUS" in os.environ:
+        raise ValidationError(
+            "FM_AZURE_VALIDATION_RESERVED_VCPUS is obsolete; author and review demand share the fixed East US 128-vCPU admission ceiling"
+        )
     env = {
         "home": home,
         "home_binding": sha256_bytes(str(home).encode("utf-8")),
         "state_dir": state_dir,
         "queue_limit": bounded_int("FM_AZURE_VALIDATION_QUEUE_LIMIT", 128, 1, 1000),
         "max_active": bounded_int("FM_AZURE_VALIDATION_MAX_ACTIVE", 8, 1, 8),
-        "validation_reserved_vcpus": bounded_int(
-            "FM_AZURE_VALIDATION_RESERVED_VCPUS", VALIDATION_RESERVED_VCPUS, 8, 64
-        ),
         "monthly_hours": bounded_float(
             "FM_AZURE_VALIDATION_MONTHLY_HOURS", MONTHLY_VALIDATION_HOURS, 1.0, 10000.0
         ),
@@ -1036,29 +1035,45 @@ def consumed_hours(env):
     return total
 
 
-def admission_decision(policy, inventory, quota, actual, forecast, rate, used_hours, request):
+def shared_capacity_demand(inventory, request):
     active_cells = [item for item in inventory if item["role"] == "validation-cell"]
     active_cell_ids = {item.get("cell") for item in active_cells if item.get("cell")}
-    active_validation_vcpus = sum(item["vcpus"] for item in active_cells)
-    active_validation_vcpus += sum(
+    review_vcpus = sum(item["vcpus"] for item in active_cells)
+    review_vcpus += sum(
         item["vcpus"]
         for item in inventory
         if item["role"] == "validation-shard" and item.get("capacity_parent") not in active_cell_ids
     )
-    active_author_vcpus = sum(item["vcpus"] for item in inventory if item["role"] == "worker")
+    author_vcpus = sum(item["vcpus"] for item in inventory if item["role"] == "worker")
+    supervisor_vcpus = sum(item["vcpus"] for item in inventory if item["role"] == "supervisor")
     cell_vcpus = int(request["limits"]["vcpus"])
-    requested = int(request["limits"].get(
+    requested_vcpus = int(request["limits"].get(
         "reserved_vcpus", cell_vcpus + int(request["limits"].get("behavior_shards", 0)) * 4
     ))
+    active_vcpus = author_vcpus + review_vcpus + supervisor_vcpus
+    return {
+        "ceiling_vcpus": REGIONAL_ADMISSION_CEILING_VCPUS,
+        "author_vcpus": author_vcpus,
+        "review_vcpus": review_vcpus,
+        "supervisor_vcpus": supervisor_vcpus,
+        "requested_review_vcpus": requested_vcpus,
+        "active_vcpus": active_vcpus,
+        "post_admission_vcpus": active_vcpus + requested_vcpus,
+    }
+
+
+def admission_decision(policy, inventory, quota, actual, forecast, rate, used_hours, request):
+    active_cells = [item for item in inventory if item["role"] == "validation-cell"]
+    demand = shared_capacity_demand(inventory, request)
+    cell_vcpus = int(request["limits"]["vcpus"])
+    requested = demand["requested_review_vcpus"]
     if len(active_cells) >= policy["max_active"]:
         return False, "active validation-cell ceiling reached"
-    if active_validation_vcpus + requested > policy["validation_reserved_vcpus"]:
-        return False, "reserved validation processor budget is saturated"
-    if active_author_vcpus > AUTHOR_RESERVED_VCPUS:
-        return False, "author allocations exceeded their independent 64-vCPU budget"
+    if demand["post_admission_vcpus"] > REGIONAL_ADMISSION_CEILING_VCPUS:
+        return False, "shared East US 128-vCPU author/review admission ceiling is saturated"
     regional = quota.get("cores") or {"limit": 0, "used": 0}
-    if regional["limit"] < REGIONAL_TARGET_VCPUS:
-        return False, "regional quota target is below 128 vCPUs"
+    if regional["limit"] < REGIONAL_ADMISSION_CEILING_VCPUS:
+        return False, "live regional quota is below the shared East US 128-vCPU admission ceiling"
     if regional["limit"] - regional["used"] < requested:
         return False, "live regional free quota cannot reserve the complete cell and shard shape"
     family = quota.get(request["sku_family"].lower()) or {"limit": 0, "used": 0}
@@ -1583,8 +1598,9 @@ def dispatch(env, args):
                 "at": iso_utc(), "sku": selected["sku"], "sku_family": selected["family"],
                 "hourly_rate": selected["rate"], "actual_cost": actual, "forecast_cost": forecast,
                 "used_worker_hours": consumed_hours(env), "reason": reason,
+                "shared_capacity": shared_capacity_demand(inventory, allocation_request),
             }
-            transition(env, state, "starting", "live quota, cost, queue, and reserved-processor gates admitted")
+            transition(env, state, "starting", "live quota, cost, queue, and shared author/review demand gates admitted")
             admission_lease.renew_and_assert()
             create_cell(env, state, selected)
             admission_lease.assert_held()

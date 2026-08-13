@@ -30,19 +30,21 @@ The dispatcher live-selects the lowest current Linux consumption rate among the 
 Those v5 candidates are intentionally separate from the foundation's current v6/v7 mixed author plan.
 The allowlist is not a live quota, availability, or price claim, so every allocation re-reads SKU restrictions, capabilities, family usage, regional usage, and retail pricing.
 
-The regional target is 128 vCPUs.
-The local-control deployment divides that target into an independently enforced 64-vCPU author budget and 64-vCPU validation/review budget.
+The shared East US admission ceiling is 128 vCPUs.
+There is no fixed 64-vCPU validation pool, no independent validation allocation, and no quota increase in this design.
+Author workers, the supervisor, validation/review reservations, and a candidate request all draw from the same live ceiling; whichever demand is active leaves the remainder for the other work.
 A heavy validation request reserves its complete 40-vCPU peak before the 8-vCPU control cell starts: 8 control vCPUs plus eight separate 4-vCPU command VMs.
 A standard request reserves its complete 24-vCPU peak: 8 control vCPUs plus four separate command VMs.
 Child runner VMs carry the exact parent cell id and reservation size, so their live processors are covered once by that reservation while orphan or unrelated shards are counted independently.
 The one-shot runner independently refuses any child beyond the parent's reserved shard slots.
-The complete heavy shape leaves 24 validation/review vCPUs for replacement or other landing work inside the reserved 64.
-Author admission independently caps author workers at 64 vCPUs, and an author worker must match the foundation's exact general-worker resource class before its processor count is trusted.
-Quota is only capacity and never turns into a warm allocation.
+For example, a heavy request alongside sixteen 4-vCPU author workers and the 2-vCPU supervisor accounts for 106 vCPUs; another heavy request queues because its complete shape would cross 128.
+When author demand is lower, review demand may consume more than 64 vCPUs, provided every complete shape remains at or below the same shared ceiling and every live quota gate passes.
+An author worker must match the foundation's exact general-worker resource class before its processor count is trusted.
+Quota is only a live upper bound and never turns into a warm allocation.
 
-The default active-cell record ceiling is eight, but complete-shape processor reservation, exact-family quota, regional free quota, current runner inventory, and the 64-vCPU validation/review partition impose the lower effective ceiling.
+The default active-cell record ceiling is eight, but complete-shape processor reservation, exact-family quota, regional free quota, shared author/review demand, and current runner inventory impose the lower effective ceiling.
 `FM_AZURE_VALIDATION_MAX_ACTIVE` accepts only 1 through 8.
-`FM_AZURE_VALIDATION_RESERVED_VCPUS` accepts only 8 through 64.
+The obsolete `FM_AZURE_VALIDATION_RESERVED_VCPUS` fixed-pool setting is rejected rather than silently reviving a separate partition.
 An optional owner-only `$FM_HOME/config/azure-validation-classes.json` policy binds repository slugs to `validation-heavy` or `validation-standard`; an explicit submit class must match the project policy instead of overriding it.
 The policy schema is `fm.azure-validation-classes/v1` with a `default` class and a `projects` object keyed by `owner/repository`.
 Saturation leaves requests queued instead of oversubscribing a host or silently falling back to the Mac.
@@ -236,7 +238,7 @@ It requires those identity values but does not contact Azure or run a repository
 The default local queue depth bound is 128.
 
 `dispatch` requires `--confirm-dispatch` and an exact subscription confirmation.
-Before creating capacity it proves the tenant/subscription, current-main private foundation owner/generation/storage/VNet/subnet contract, credential disk, selected SKU, author-worker family separation, family quota, 128-vCPU regional target, complete-shape regional free quota, separate author/validation processor budgets, queue depth, active-cell count, worker-hour budget, actual cost, forecast cost, and current retail rate.
+Before creating capacity it proves the tenant/subscription, current-main private foundation owner/generation/storage/VNet/subnet contract, credential disk, selected SKU, author-worker family separation, family quota, shared East US 128-vCPU admission ceiling, complete-shape regional free quota, current author/supervisor/review demand, queue depth, active-cell count, worker-hour budget, actual cost, forecast cost, and current retail rate.
 A renewable blob lease in `validation-shards/validation-cells/admission.lock` serializes count-and-create admission across Firstmate homes.
 The lease is rechecked immediately before the cell starts.
 
@@ -380,7 +382,7 @@ After the exact foundation is accepted and this stack is explicitly approved, th
 7. Kill one exact cell VM and prove peer cells, all shard VMs, the local supervisor, and an unrelated local task remain healthy.
 8. Replace the killed cell and prove exact no-mistakes run reattach from the retained database and worktree.
 9. Submit wrong head, run id, request digest, worktree disk, credential disk, VM instance, boot id, and shard receipt fixtures and prove every one refuses.
-10. Drive actual-cost, forecast-cost, worker-hour, active-cell, processor-reserve, regional-quota, and family-quota saturation and prove each blocks only new admission.
+10. Drive actual-cost, forecast-cost, worker-hour, active-cell, shared author/review demand, regional-quota, and family-quota saturation and prove each blocks only new admission; prove review demand may exceed 64 vCPUs when author demand is low but the next complete shape always queues before 128.
 11. Prove no credential byte appears in snapshots, runtime bundles, input/result archives, state JSON, tags, ARM parameter files, logs, reports, shard VMs, or uncredentialed process environments.
 12. Prove one cell cannot read or write a sibling container, disk, credential lease, home, or VM.
 13. Prove a failed shard is attributed to its exact VM/boot/request and is never replayed locally.

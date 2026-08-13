@@ -57,7 +57,7 @@ The fallback `commissioning` profile declares only slots 1 and 2.
 Dedicated private subnets, managed identities, and non-public evidence containers reserve separate boundaries for no-mistakes credentialed control cells, uncredentialed validation shards, Crosscheck credentialed reviewer/model cells, Crosscheck uncredentialed tool cells, and fresh networkless verifier cells.
 The verifier subnet has no NAT attachment, disables default outbound access, and uses its own NSG with explicit deny-all inbound and outbound rules, including VNet and private-endpoint destinations.
 No validation, reviewer, tool, or verifier VM is created by this template.
-Those pools must scale to zero and may not mount a control home.
+Those workload classes must scale to zero and may not mount a control home; subnet and identity separation never implies pre-provisioned compute.
 The policy reviewer identity is separate from the browser/tool identity so the follow-up can preserve a credentialed-reviewer and uncredentialed-tool boundary.
 The template does not claim that moving a shared singleton daemon into Azure solves contention.
 The isolated per-run daemon, database, cache, process, credential, worktree, and lifecycle behavior is owned by [`docs/azure-validation.md`](azure-validation.md).
@@ -68,7 +68,7 @@ Author admission must stop before consuming the capacity needed to review and la
 Homogeneous full mode retains the hard 96-vCPU Dasv6 family gate and is currently unavailable because its live family limit is 10.
 Mixed full mode instead proves enough free quota in every exact selected family for its assigned two-worker slice while still requiring all 128 regional vCPUs and the 62-vCPU landing reserve.
 SKU and quota eligibility are not a capacity reservation, so every allocation still requires a fresh live gate.
-A later validation/review pool must prove its own live family quota rather than borrowing an assumption from the author pools.
+Every later validation/review request must prove its selected family's live quota rather than borrowing an assumption from author capacity.
 
 ## Network and private administration
 
@@ -141,7 +141,7 @@ The full mixed plan's average worker rate is about $0.218/hour, making the 3,500
 Sixteen mixed workers plus the supervisor and NAT/outbound IP running continuously is about $2,653/month before disks, validation/review/browser capacity, Log Analytics, blob capacity and operations, network transfer, taxes, discounts, or credits.
 The separate one-shot validation seam defaults to `Standard_D4as_v6` (4 vCPUs/16 GiB), so two immediate shards fit inside the existing 10-vCPU Dasv6 allowance.
 The no-mistakes validation control cell defaults near 8 vCPUs/32 GiB and live-selects an affordable candidate v5 family only after proving current availability, capability, quota, price, and separation from the v6/v7 author plan.
-Requested behavior parallelism fans into mixed-family identity-less command VMs under the complete-shape 64-vCPU validation reservation described in [`docs/azure-validation.md`](azure-validation.md).
+Requested behavior parallelism fans into mixed-family identity-less command VMs only after the complete 40-vCPU heavy shape fits current author/review demand under the shared East US 128-vCPU admission ceiling described in [`docs/azure-validation.md`](azure-validation.md).
 East US homogeneous-family increases are unavailable on this sponsorship subscription, so the runner never waits for 96 homogeneous family vCPUs and may instead select one of the foundation's reviewed mixed-family shapes only after proving that exact family's current free quota and retail rate.
 Quota is capacity, not permission to spend; actual and forecast billing telemetry is authoritative.
 Credits remain unverified and are never assumed.

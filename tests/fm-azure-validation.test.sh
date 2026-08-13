@@ -117,8 +117,10 @@ host=Path(sys.argv[2]).read_text()
 guest=Path(sys.argv[3]).read_text()
 bridge=Path(sys.argv[4]).read_text()
 nm=Path(sys.argv[5]).read_text()
-for value in ("REGIONAL_TARGET_VCPUS = 128","VALIDATION_RESERVED_VCPUS = 64","AUTHOR_RESERVED_VCPUS = 64","MONTHLY_VALIDATION_HOURS = 400.0","capacity_parent","reserved_vcpus","bin/fm-lint.sh && uv run --directory tools/agent-fleet --locked ruff check ."):
+for value in ("REGIONAL_ADMISSION_CEILING_VCPUS = 128","MONTHLY_VALIDATION_HOURS = 400.0","shared_capacity_demand","capacity_parent","reserved_vcpus","bin/fm-lint.sh && uv run --directory tools/agent-fleet --locked ruff check ."):
     assert value in host
+assert "VALIDATION_RESERVED_VCPUS =" not in host
+assert "AUTHOR_RESERVED_VCPUS" not in host
 for value in ("MemoryMax","MemorySwapMax=0","TasksMax","CPUQuota=700%","PrivateTmp=yes","ProtectSystem=strict","CapabilityBoundingSet=","cryptsetup luksUUID","provider account-binding marker mismatch","credential disk content binding mismatch","FM_AZURE_VALIDATION_RUNTIME_PATH","axi status"):
     assert value in guest
 for value in ("fm.azure-validation-shard/v1","storage_token","vm_instance_id","boot_id","trusted_verify_manifests"):
@@ -189,6 +191,10 @@ with tarfile.open(state["input_path"],"r:gz") as archive:
 PY
   out=$(PATH="$tmp/fakebin:$PATH" validation "$home" queue) || fail "queue read failed: $out"
   assert_contains "$out" "cell=$cell phase=queued" "queue did not report the exact cell"
+  rc=0
+  out=$(FM_AZURE_VALIDATION_RESERVED_VCPUS=64 PATH="$tmp/fakebin:$PATH" validation "$home" queue 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "obsolete fixed validation-pool configuration was accepted"
+  assert_contains "$out" "author and review demand share the fixed East US 128-vCPU admission ceiling" "obsolete pool refusal did not name the shared ceiling"
   printf 'dirty\n' >"$repo/untracked"
   rc=0
   PATH="$tmp/fakebin:$PATH" validation "$home" submit \
@@ -283,7 +289,7 @@ import json,sys
 request={"limits":{"vcpus":8,"behavior_shards":8,"reserved_vcpus":40},"sku_family":"standarddasv5family"}
 value={
  "operation":"admission",
- "policy":{"max_active":8,"validation_reserved_vcpus":64,"monthly_hours":400.0,"budget_limit":1000.0},
+ "policy":{"max_active":8,"monthly_hours":400.0,"budget_limit":1000.0},
  "inventory":[],
  "quota":{"cores":{"limit":128,"used":0},"standarddasv5family":{"limit":64,"used":0}},
  "actual":100.0,"forecast":200.0,"rate":0.35,"used_hours":10.0,"request":request,
@@ -309,27 +315,38 @@ PY
   python3 - "$HOST" <<'PY' || fail "focused reservation/admission matrix failed"
 import importlib.util,sys
 spec=importlib.util.spec_from_file_location("validation",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-policy={"max_active":8,"validation_reserved_vcpus":64,"monthly_hours":400.0,"budget_limit":1000.0}
+policy={"max_active":8,"monthly_hours":400.0,"budget_limit":1000.0}
 quota={"cores":{"limit":128,"used":0},"family":{"limit":64,"used":0}}
 request={"limits":{"vcpus":8,"behavior_shards":8,"reserved_vcpus":40},"sku_family":"family"}
 def decide(inventory=None,q=None,hours=10,actual=100,forecast=200):
  return m.admission_decision(policy,inventory or [],q or quota,actual,forecast,.35,hours,request)
+supervisor={"role":"supervisor","vcpus":2}
 workers=[{"role":"worker","vcpus":4} for _ in range(16)]
-assert decide(workers)[0] is True
-assert decide(workers+[{"role":"worker","vcpus":4}])==(False,"author allocations exceeded their independent 64-vCPU budget")
+assert decide(workers+[supervisor])[0] is True
+# There is no fixed 64-vCPU author or validation partition: admission follows
+# current shared demand until the next complete shape would cross 128.
+assert decide([{"role":"worker","vcpus":4} for _ in range(21)]+[supervisor])[0] is True
+assert decide([{"role":"worker","vcpus":4} for _ in range(22)]+[supervisor])==(False,"shared East US 128-vCPU author/review admission ceiling is saturated")
 cell={"role":"validation-cell","vcpus":40,"cell":"azv-parent"}
+cell2={"role":"validation-cell","vcpus":40,"cell":"azv-parent2"}
+cell3={"role":"validation-cell","vcpus":40,"cell":"azv-parent3"}
 covered={"role":"validation-shard","vcpus":4,"capacity_parent":"azv-parent"}
 standalone={"role":"validation-shard","vcpus":4,"capacity_parent":"none"}
+assert m.shared_capacity_demand([cell,covered],request)["review_vcpus"]==40
+assert m.shared_capacity_demand([cell,standalone],request)["review_vcpus"]==44
+assert decide([cell,cell2])[0] is True
+assert decide([cell,cell2,cell3])==(False,"shared East US 128-vCPU author/review admission ceiling is saturated")
 small={"limits":{"vcpus":8,"behavior_shards":4,"reserved_vcpus":24},"sku_family":"family"}
 assert m.admission_decision(policy,[cell,covered],quota,100,200,.35,10,small)[0] is True
-assert m.admission_decision(policy,[cell,standalone],quota,100,200,.35,10,small)[0] is False
 assert decide(hours=200)==(False,"monthly validation worker-hour budget is saturated")
+regional_low={"cores":{"limit":127,"used":0},"family":{"limit":64,"used":0}}
+assert decide(q=regional_low)==(False,"live regional quota is below the shared East US 128-vCPU admission ceiling")
 regional={"cores":{"limit":128,"used":89},"family":{"limit":64,"used":0}}
 assert decide(q=regional)==(False,"live regional free quota cannot reserve the complete cell and shard shape")
 family={"cores":{"limit":128,"used":0},"family":{"limit":64,"used":57}}
 assert decide(q=family)==(False,"selected validation family has insufficient free quota")
 PY
-  pass "queue, independent author/validation reservations, worker-hours, quota, and cost saturate without oversubscription"
+  pass "queue shares the 128-vCPU author/review ceiling without a fixed pool and still gates worker-hours, live quota, and cost"
 }
 
 identity_and_recovery_contract() {
@@ -508,6 +525,8 @@ operator_documentation_contract() {
   for text in \
     'queue depth' \
     'worker-hour' \
+    'There is no fixed 64-vCPU validation pool' \
+    'shared East US 128-vCPU admission ceiling' \
     'No behavior test process runs in the credentialed cell or on the Mac.' \
     'No Azure resource was created while implementing this feature.' \
     'Run a real no-mistakes pipeline through review, test' \

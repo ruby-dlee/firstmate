@@ -3594,9 +3594,9 @@ persist_worktree_acquisition_phases || {
 if [ "$HARNESS" = pi ]; then
   if [ "$SPAWN_META_PRESENT" = 1 ]; then
     PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=$(spawn_preflight_meta_value author_identity_snapshot_epoch)
-    [ -z "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" ] \
-      || [ "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" = launch-bound-v1 ] \
-      || { echo "error: Pi recovery metadata has an invalid author identity snapshot epoch for $ID" >&2; exit 1; }
+    if [ "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" != launch-bound-v1 ]; then
+      PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=
+    fi
   else
     PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=launch-bound-v1
   fi
@@ -3620,7 +3620,7 @@ if [ "$HARNESS" = pi ] && [ "$RAW_LAUNCH" != 1 ]; then
   else
     PI_AUTHOR_ACCOUNT_HOME=
     PI_AUTHOR_ACCOUNT_IDENTITY=
-    echo "WARNING: Pi author identity could not be bound to a task-private account; same-provider Crosscheck review will remain ineligible for $ID" >&2
+    echo "WARNING: Pi task-private account capture failed; launching $ID without the captured account snapshot" >&2
   fi
 fi
 # herdr sets GOTMPDIR natively at agent start. Every other backend exports it into

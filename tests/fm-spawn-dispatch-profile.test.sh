@@ -610,18 +610,18 @@ PY
   assert_contains "$launch" "PI_CODING_AGENT_DIR='$private' pi --approve" \
     "Pi account-change recovery launched outside its private snapshot"
 
-  sed -i.bak '/^author_identity_snapshot_epoch=/d' "$meta"
+  sed -i.bak 's/^author_identity_snapshot_epoch=.*/author_identity_snapshot_epoch=invalid/' "$meta"
   rm "$meta.bak"
   : > "$absent_marker"
   out=$(FM_FAKE_ENDPOINT_ABSENT_ONCE="$absent_marker" PI_CODING_AGENT_DIR="$source" \
     run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
       "$id" "$PROJ_DIR" --model openai-codex-5/gpt-5.6-sol --effort xhigh)
   status=$?
-  expect_code 0 "$status" "legacy Pi recovery should not mint snapshot provenance: $out"
+  expect_code 0 "$status" "invalid Pi identity metadata must not refuse recovery: $out"
   assert_no_grep 'author_account_identity=' "$meta" \
-    "legacy Pi recovery treated current credentials as historical identity"
+    "Pi recovery with invalid identity metadata adopted a new author identity"
   assert_no_grep 'author_identity_snapshot_epoch=' "$meta" \
-    "legacy Pi recovery minted a modern snapshot-era marker"
+    "Pi recovery with invalid identity metadata minted a snapshot-era marker"
 
   failed_id=profile-pi-author-snapshot-failed-z24
   rec=$(make_spawn_case profile-pi-author-snapshot-failed pi "$failed_id")
@@ -632,13 +632,16 @@ PY
     run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
       "$failed_id" "$PROJ_DIR" --model openai-codex-5/gpt-5.6-sol --effort xhigh)
   status=$?
-  expect_code 0 "$status" "Pi failed-snapshot spawn should remain cross-provider-only: $out"
+  expect_code 0 "$status" "Pi identity-capture failure must not refuse the spawn: $out"
+  assert_contains "$out" \
+    "WARNING: Pi task-private account capture failed; launching $failed_id without the captured account snapshot" \
+    "Pi identity-capture failure did not use the nonfatal launch path"
   meta="$HOME_DIR/state/$failed_id.meta"
   assert_no_grep 'author_account_identity=' "$meta" \
     "a failed Pi snapshot invented an author identity"
   assert_grep 'author_identity_snapshot_epoch=launch-bound-v1' "$meta" \
     "a failed modern Pi snapshot lost the snapshot-era marker"
-  pass "Pi snapshot epochs distinguish new launches from legacy recovery"
+  pass "Pi identity capture remains nonfatal while successful snapshots stay bound"
 }
 
 test_batch_forwards_shared_profile_flags() {

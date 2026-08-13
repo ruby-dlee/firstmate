@@ -153,6 +153,20 @@ def execute(request, worktree):
         stderr = exc.stderr or b""
     stdout, stdout_truncated = bounded(stdout)
     stderr, stderr_truncated = bounded(stderr)
+    # Persist the exact digested streams on the retained task disk so the
+    # bounded result's stream digests stay verifiable after the VM is gone.
+    logs_dir = worktree / ".fm-worker"
+    try:
+        logs_dir.mkdir(mode=0o700, exist_ok=True)
+        for suffix, data in (("stdout", stdout), ("stderr", stderr)):
+            stream_path = logs_dir / "{}-{}.log".format(request["assignment_generation"], suffix)
+            fd = os.open(str(stream_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+    except OSError as exc:
+        raise SupervisorError("guest stream evidence could not be persisted: {}".format(exc))
     result = {
         "schema": RESULT_SCHEMA,
         "request_digest": request["request_digest"],
@@ -174,13 +188,51 @@ def execute(request, worktree):
     return result
 
 
+def steer_ack(args):
+    assignment_path = Path(
+        os.environ.get("FM_WORKER_ASSIGNMENT_PATH", "/var/lib/firstmate-worker/assignment.json")
+    )
+    try:
+        assignment = json.loads(assignment_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SupervisorError("guest assignment record is unreadable: {}".format(exc))
+    expected = {
+        "home_binding": args.home_binding,
+        "task": args.task,
+        "task_generation": args.task_generation,
+        "assignment_generation": args.assignment_generation,
+    }
+    for field, value in sorted(expected.items()):
+        if assignment.get(field) != value:
+            raise SupervisorError("steer {} binding differs from the guest assignment".format(field))
+    if not HEX.match(str(args.request_digest)):
+        raise SupervisorError("steer request digest is malformed")
+    ack = {
+        "schema": "fm.worker-steer-ack/v1",
+        "assignment_generation": args.assignment_generation,
+        "request_digest": args.request_digest,
+    }
+    ack["ack_digest"] = digest(ack)
+    print("FM-WORKER-STEER-ACK:" + json.dumps(ack, sort_keys=True, separators=(",", ":")))
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("execute", nargs="?")
-    parser.add_argument("--request", required=True)
-    parser.add_argument("--result", required=True)
+    sub = parser.add_subparsers(dest="mode", required=True)
+    exe = sub.add_parser("execute")
+    exe.add_argument("--request", required=True)
+    exe.add_argument("--result", required=True)
+    steer = sub.add_parser("steer")
+    steer.add_argument("--home-binding", required=True)
+    steer.add_argument("--task", required=True)
+    steer.add_argument("--task-generation", required=True)
+    steer.add_argument("--assignment-generation", required=True)
+    steer.add_argument("--request-digest", required=True)
     args = parser.parse_args()
-    if args.execute != "execute":
+    if args.mode == "steer":
+        steer_ack(args)
+        return
+    if args.mode != "execute":
         raise SupervisorError("only one-task execute is supported")
     request = read_request(args.request)
     worktree = verify_environment(request)

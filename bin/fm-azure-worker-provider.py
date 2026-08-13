@@ -81,8 +81,23 @@ REVIEWED_SKU_FAMILY = {
     "Standard_E4as_v7": "StandardEasv7Family",
     "Standard_E4as_v6": "standardEav6Family",
 }
+REVIEWED_CONTROL_SKU_FAMILY = {
+    "Standard_D8as_v6": "standardDav6Family",
+    "Standard_D8as_v7": "StandardDasv7Family",
+    "Standard_D8s_v6": "StandardDsv6Family",
+    "Standard_D8ads_v7": "StandardDadsv7Family",
+    "Standard_D8ds_v6": "StandardDdsv6Family",
+    "Standard_D8s_v7": "StandardDsv7Family",
+    "Standard_D8ds_v7": "StandardDdsv7Family",
+    "Standard_D8ads_v6": "standardDadv6Family",
+    "Standard_E8as_v7": "StandardEasv7Family",
+    "Standard_E8as_v6": "standardEav6Family",
+}
 SKU_VCPUS = {sku: 4 for sku in REVIEWED_SKU_FAMILY}
+SKU_VCPUS.update({sku: 8 for sku in REVIEWED_CONTROL_SKU_FAMILY})
 SKU_VCPUS["Standard_D2as_v6"] = 2
+REVIEWED_SPECIALIZED_SKU_FAMILY = dict(REVIEWED_SKU_FAMILY)
+REVIEWED_SPECIALIZED_SKU_FAMILY.update(REVIEWED_CONTROL_SKU_FAMILY)
 SKU_PLAN = {
     1: ("Standard_D4as_v6", "standardDav6Family"),
     2: ("Standard_D4as_v6", "standardDav6Family"),
@@ -192,7 +207,7 @@ def expected_names(controller, slot):
         "monitor-extension": "AzureMonitorLinuxAgent",
         "bootstrap-command": "bootstrap",
         "task-command": "execute",
-        "ttl-schedule": "shutdown-computevm-{}-wkr-{}".format(prefix, token),
+        "ttl-schedule": "shutdown-computevm-vm-{}-wkr-{}".format(prefix, token),
         "global-reservation": "reservation.json",
         "staging-request": "request.json",
         "staging-result": "result.json",
@@ -294,6 +309,16 @@ def resource_record(kind, value, power_state=None, tags_override=None):
     return record
 
 
+def show_full(controller, resource_id, api_version=None):
+    args = ["resource", "show", "--ids", resource_id]
+    if api_version:
+        args += ["--api-version", api_version]
+    value, rc, stderr = az(controller, args, check=False)
+    if rc != 0 or not isinstance(value, dict):
+        raise ProviderError("Azure child inventory read failed or was malformed: {}".format(stderr))
+    return value
+
+
 def list_json(controller, args):
     value, rc, stderr = az(controller, args, check=False)
     if rc != 0 or not isinstance(value, list):
@@ -338,7 +363,7 @@ def is_exact_fleet(controller, tags):
 
 
 def slot_from_name(name, pattern):
-    match = re.match(pattern + r"([0-9]{2})(?:-|$)", str(name))
+    match = re.match(pattern + r"([0-9]{2})(?:[-/]|$)", str(name))
     if not match:
         return None
     slot = int(match.group(1))
@@ -483,7 +508,7 @@ def specialized_capacity_inventory(controller, vms, identities):
             not SAFE_INVOCATION.match(invocation)
             or sku not in SKU_VCPUS
             or family is None
-            or family.lower() != REVIEWED_SKU_FAMILY.get(sku, "").lower()
+            or family.lower() != REVIEWED_SPECIALIZED_SKU_FAMILY.get(sku, "").lower()
         ):
             raise ProviderError("specialized VM capacity identity is malformed")
         power = str(vm.get("powerState") or vm.get("power_state") or "unknown").lower()
@@ -541,7 +566,7 @@ def specialized_capacity_inventory(controller, vms, identities):
             or identity.get("location") != "eastus"
             or str(identity.get("id", "")).lower() != expected_id.lower()
             or sku not in SKU_VCPUS
-            or REVIEWED_SKU_FAMILY.get(sku, "").lower() != family.lower()
+            or REVIEWED_SPECIALIZED_SKU_FAMILY.get(sku, "").lower() != family.lower()
             or mode not in ("strict", "commissioning-bounded")
             or not exact_slot
             or amount_microusd <= 0
@@ -637,12 +662,15 @@ def inventory(controller, include_metrics=True):
         "resource", "list", "--resource-group", controller["resource_group"],
         "--resource-type", "Microsoft.DevTestLab/schedules",
     ])
-    roles = list_json(controller, [
-        "role", "assignment", "list", "--all",
-        "--query", "[?contains(scope, '/resourceGroups/{}/')]".format(controller["resource_group"]),
-    ])
+    # Scope casing varies across ARM responses, so filter client-side rather
+    # than with a case-sensitive JMESPath query.
+    scope_marker = "/resourcegroups/{}/".format(controller["resource_group"]).lower()
+    roles = [
+        role for role in list_json(controller, ["role", "assignment", "list", "--all"])
+        if scope_marker in str(role.get("scope") or "").lower()
+    ]
     containers = list_json(controller, [
-        "storage", "container", "list", "--auth-mode", "login",
+        "storage", "container", "list", "--auth-mode", "login", "--include-metadata",
         "--account-name", os.environ.get("FM_AZURE_STORAGE_NAME", ""),
     ])
 
@@ -739,7 +767,9 @@ def inventory(controller, include_metrics=True):
             controller, "Microsoft.Compute", "virtualMachines",
             expected_names(controller, slot)["vm"],
         )
-        value = dict(extension)
+        # The generic resource listing omits properties and etag; only the full
+        # object carries an immutable child identity.
+        value = show_full(controller, extension["id"])
         value["attached_to"] = vm_id
         value["properties"] = dict(value.get("properties") or {})
         value["properties"]["virtualMachineId"] = vm_id
@@ -753,7 +783,7 @@ def inventory(controller, include_metrics=True):
         if kind is None:
             conflicts.append({"kind": "run-command", "slot": slot, "reason": "undeclared worker Run Command child"})
             continue
-        value = dict(command)
+        value = show_full(controller, command["id"])
         value["attached_to"] = exact_id(
             controller, "Microsoft.Compute", "virtualMachines",
             expected_names(controller, slot)["vm"],
@@ -762,9 +792,9 @@ def inventory(controller, include_metrics=True):
         value["properties"]["virtualMachineId"] = value["attached_to"]
         add(kind, value, slot)
     for schedule in schedules:
-        slot = slot_from_name(schedule.get("name"), r"^shutdown-computevm-{}-wkr-".format(prefix))
+        slot = slot_from_name(schedule.get("name"), r"^shutdown-computevm-vm-{}-wkr-".format(prefix))
         if slot is not None:
-            value = dict(schedule)
+            value = show_full(controller, schedule["id"], api_version="2018-09-15")
             value["properties"] = dict(value.get("properties") or {})
             value["properties"].setdefault("targetResourceId", exact_id(
                 controller, "Microsoft.Compute", "virtualMachines",
@@ -948,7 +978,7 @@ def mark_cleanup_container(controller, action, key, value):
     )
 
 
-def upload_json_blob(controller, account, container, name, value, tags):
+def upload_json_blob(controller, account, container, name, value, tags, overwrite=False):
     payload = canonical_bytes(value) + b"\n"
     digest = hashlib.sha256(payload).hexdigest()
     fd, path = tempfile.mkstemp(prefix="fm-worker-blob-", suffix=".json")
@@ -961,7 +991,7 @@ def upload_json_blob(controller, account, container, name, value, tags):
         _, rc, stderr = az(controller, [
             "storage", "blob", "upload", "--auth-mode", "login", "--account-name", account,
             "--container-name", container, "--name", name, "--file", path,
-            "--overwrite", "false", "--metadata",
+            "--overwrite", "true" if overwrite else "false", "--metadata",
         ] + ["{}={}".format(key, value) for key, value in sorted(metadata.items())], check=False)
         if rc != 0:
             raise ProviderError("exact worker staging upload failed: {}".format(stderr))
@@ -969,6 +999,33 @@ def upload_json_blob(controller, account, container, name, value, tags):
         with contextlib.suppress(FileNotFoundError):
             Path(path).unlink()
     return digest
+
+
+def run_command_instance_view(controller, vm_name, command_name):
+    value, rc, stderr = az(controller, [
+        "vm", "run-command", "show", "--resource-group", controller["resource_group"],
+        "--vm-name", vm_name, "--name", command_name, "--instance-view",
+    ], check=False)
+    if rc != 0 or not isinstance(value, dict):
+        raise ProviderError("worker Run Command instance view is unreadable: {}".format(stderr))
+    view = value.get("instanceView") or {}
+    if not isinstance(view, dict):
+        raise ProviderError("worker Run Command instance view is malformed")
+    return view
+
+
+def marker_payload(text, marker):
+    payloads = [
+        line[len(marker):].strip()
+        for line in str(text).splitlines()
+        if line.strip().startswith(marker)
+    ]
+    if not payloads:
+        return None
+    try:
+        return json.loads(payloads[-1])
+    except json.JSONDecodeError as exc:
+        raise ProviderError("guest marker payload is malformed: {}".format(exc))
 
 
 def bootstrap_script(action):
@@ -1019,6 +1076,13 @@ def create_lifecycle_children(controller, action):
     ] + ["{}={}".format(key, value) for key, value in sorted(tags.items())], check=False)
     if rc != 0:
         raise ProviderError("pinned worker supervisor bootstrap failed: {}".format(stderr))
+    # A managed Run Command reports create success even when the guest script
+    # exits nonzero; only the instance view proves the bootstrap ran clean.
+    view = run_command_instance_view(controller, vm_name, names["bootstrap-command"])
+    if view.get("executionState") != "Succeeded" or view.get("exitCode") not in (0, None):
+        raise ProviderError("pinned worker supervisor bootstrap failed in the guest: state={} exit={} error={}".format(
+            view.get("executionState"), view.get("exitCode"), str(view.get("error", ""))[:500]
+        ))
     execute_stub = "test -x /usr/local/libexec/fm-worker-supervisor && test -f /var/lib/firstmate-worker/request.json"
     _, rc, stderr = az(controller, [
         "vm", "run-command", "create", "--resource-group", controller["resource_group"],
@@ -1028,17 +1092,24 @@ def create_lifecycle_children(controller, action):
     if rc != 0:
         raise ProviderError("exact worker task Run Command creation failed: {}".format(stderr))
     deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=6)).replace(second=0, microsecond=0)
-    _, rc, stderr = az(controller, [
-        "resource", "create", "--resource-group", controller["resource_group"],
-        "--resource-type", "Microsoft.DevTestLab/schedules", "--api-version", "2018-09-15",
-        "--name", names["ttl-schedule"], "--location", "eastus", "--properties", json.dumps({
+    # `az resource create` has no --tags flag; a full object carries location,
+    # tags, and properties together.
+    ttl_object = json.dumps({
+        "location": "eastus",
+        "tags": tags,
+        "properties": {
             "status": "Enabled", "taskType": "ComputeVmShutdownTask",
             "dailyRecurrence": {"time": deadline.strftime("%H%M")},
             "timeZoneId": "UTC", "targetResourceId": exact_id(
                 controller, "Microsoft.Compute", "virtualMachines", vm_name
             ),
-        }, separators=(",", ":")), "--tags",
-    ] + ["{}={}".format(key, value) for key, value in sorted(tags.items())], check=False)
+        },
+    }, separators=(",", ":"))
+    _, rc, stderr = az(controller, [
+        "resource", "create", "--resource-group", controller["resource_group"],
+        "--resource-type", "Microsoft.DevTestLab/schedules", "--api-version", "2018-09-15",
+        "--name", names["ttl-schedule"], "--is-full-object", "--properties", ttl_object,
+    ], check=False)
     if rc != 0:
         raise ProviderError("exact worker TTL schedule creation failed: {}".format(stderr))
     reservation = {
@@ -1242,6 +1313,12 @@ def mutate_delete_compute(controller, action):
                 raise ProviderError("compute deletion requires the exact deallocated worker")
             conditional_delete(controller, kind, resource)
             wait_absent(controller, resource["id"])
+            # NIC/disk attach relations only clear once the VM is gone, so the
+            # detach proof below must read a fresh snapshot.
+            refreshed = worker_by_slot(inventory(controller, include_metrics=False), action["slot"])
+            if refreshed is None:
+                raise ProviderError("VM deletion also lost exact retained task/account capacity")
+            remaining = refreshed.get("resources") or {}
             continue
         if kind in ("nic", "os-disk"):
             if resource.get("attached_to"):
@@ -1370,7 +1447,7 @@ def mutate_execute(controller, action):
     tags = action_tags(controller, action)
     upload_json_blob(
         controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
-        names["staging-request"], request, tags,
+        names["staging-request"], request, tags, overwrite=True,
     )
     request_json = json.dumps(request, sort_keys=True, separators=(",", ":"))
     bindings = action["bindings"]
@@ -1386,7 +1463,7 @@ export FM_WORKER_WORKTREE_BINDING='{worktree}' FM_WORKER_REPOSITORY_BINDING='{re
 export FM_WORKER_REPOSITORY_GENERATION='{repository_generation}' FM_WORKER_CLOUD_INSTANCE_ID='{cloud}'
 export FM_WORKER_WORKTREE=/mnt/task FM_WORKER_ACCOUNT_HOME=/mnt/account
 /usr/local/libexec/fm-worker-supervisor execute --request /var/lib/firstmate-worker/request.json --result /var/lib/firstmate-worker/result.json
-cat /var/lib/firstmate-worker/result.json
+printf 'FM-WORKER-RESULT:%s\\n' "$(cat /var/lib/firstmate-worker/result.json)"
 """.format(
         request=request_json, home=bindings["home_binding"], task=bindings["task"],
         task_generation=bindings["task_generation"], assignment=bindings["assignment_generation"],
@@ -1394,21 +1471,25 @@ cat /var/lib/firstmate-worker/result.json
         repository=bindings["repository_binding"], repository_generation=bindings["repository_generation"],
         cloud=action["cloud_instance_id"],
     )
-    output, rc, stderr = az(controller, [
+    _, rc, stderr = az(controller, [
         "vm", "run-command", "update", "--resource-group", controller["resource_group"],
         "--vm-name", names["vm"], "--name", names["task-command"],
         "--script", script, "--async-execution", "false",
     ], check=False)
     if rc != 0:
         raise ProviderError("exact private worker execution failed: {}".format(stderr))
-    message = json.dumps(output)
-    matches = re.findall(r"\{[^{}]*\"result_digest\"[^{}]*\}", message)
-    if not matches:
+    # The update response body has no instance view; only the explicit
+    # instance-view read returns the guest's marker-framed result line.
+    view = run_command_instance_view(controller, names["vm"], names["task-command"])
+    if view.get("executionState") != "Succeeded":
+        raise ProviderError("private worker execution did not complete in the guest: state={} error={}".format(
+            view.get("executionState"), str(view.get("error", ""))[:500]
+        ))
+    execution = marker_payload(
+        "{}\n{}".format(view.get("output", ""), view.get("error", "")), "FM-WORKER-RESULT:"
+    )
+    if execution is None:
         raise ProviderError("private worker execution returned no exact result")
-    try:
-        execution = json.loads(matches[-1])
-    except json.JSONDecodeError as exc:
-        raise ProviderError("private worker result is malformed: {}".format(exc))
     supplied = execution.get("result_digest")
     unsigned = dict(execution)
     unsigned.pop("result_digest", None)
@@ -1416,7 +1497,7 @@ cat /var/lib/firstmate-worker/result.json
         raise ProviderError("private worker result digest is not exact")
     upload_json_blob(
         controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
-        names["staging-result"], execution, tags,
+        names["staging-result"], execution, tags, overwrite=True,
     )
     return worker_by_slot(inventory(controller, include_metrics=False), action["slot"]), execution
 
@@ -1438,13 +1519,27 @@ exec \"$supervisor\" steer --home-binding '{}' --task '{}' --task-generation '{}
         bindings["home_binding"], bindings["task"], bindings["task_generation"],
         bindings["assignment_generation"], digest,
     )
-    _, rc, stderr = az(controller, [
+    output, rc, stderr = az(controller, [
         "vm", "run-command", "invoke", "--resource-group", controller["resource_group"],
         "--name", expected_names(controller, action["slot"])["vm"],
         "--command-id", "RunShellScript", "--scripts", script,
     ], check=False)
     if rc != 0:
         raise ProviderError("exact guest-supervisor steer failed: {}".format(stderr))
+    # RunShellScript never propagates the guest exit code, so only the
+    # supervisor's digest-bound acknowledgement proves the steer landed.
+    messages = "\n".join(
+        str(item.get("message", ""))
+        for item in (output.get("value") or [])
+        if isinstance(item, dict)
+    ) if isinstance(output, dict) else ""
+    ack = marker_payload(messages, "FM-WORKER-STEER-ACK:")
+    if (
+        ack is None
+        or ack.get("request_digest") != digest
+        or ack.get("assignment_generation") != bindings["assignment_generation"]
+    ):
+        raise ProviderError("guest supervisor did not acknowledge the exact steer request")
     return worker_by_slot(inventory(controller, include_metrics=False), action["slot"])
 
 

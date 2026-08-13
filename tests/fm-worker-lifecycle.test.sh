@@ -410,6 +410,58 @@ except module.ProviderError as exc:
 else:
     raise AssertionError("foreign specialized reservation was accepted")
 
+# Azure child resources list as parent/child names; the slot parser must
+# accept them, and generic four-vCPU-only validation must not reject the
+# reviewed eight-vCPU control lane.
+assert module.slot_from_name("vm-fmtest-wkr-01/AzureMonitorLinuxAgent", r"^vm-fmtest-wkr-") == 1
+assert module.slot_from_name("vm-fmtest-wkr-07/execute", r"^vm-fmtest-wkr-") == 7
+assert module.slot_from_name("vm-fmtest-wkr-1x", r"^vm-fmtest-wkr-") is None
+control_invocation = "azr-000000000002"
+control_vm = {
+    "tags": {
+        "workload": "firstmate", "deployment-generation": "dep", "cleanup-owner": "owner",
+        "firstmate-role": "validation-cell", "invocation-binding": control_invocation,
+        "selected-sku": "Standard_D8as_v6", "sku-family": "standardDav6Family",
+    },
+    "powerState": "VM running", "hardwareProfile": {"vmSize": "Standard_D8as_v6"},
+}
+control_reservation = copy.deepcopy(reservation)
+control_reservation["id"] = module.exact_id(
+    controller, "Microsoft.ManagedIdentity", "userAssignedIdentities", "id-fmtest-rsv-000000000002"
+)
+control_reservation["tags"] = dict(control_reservation["tags"])
+control_reservation["tags"].update({
+    "invocation-binding": control_invocation,
+    "selected-sku": "Standard_D8as_v6", "sku-family": "standardDav6Family",
+    "cost-admission-mode": "strict", "cell-ordinal": "none",
+})
+capacity, active_family = module.specialized_capacity_inventory(
+    controller, [control_vm], [control_reservation]
+)
+assert capacity[0]["vcpus"] == 8 and active_family["standardDav6Family"] == 8
+unreviewed_control = copy.deepcopy(control_vm)
+unreviewed_control["tags"]["selected-sku"] = "Standard_D8as_v5"
+unreviewed_control["hardwareProfile"]["vmSize"] = "Standard_D8as_v5"
+try:
+    module.specialized_capacity_inventory(controller, [unreviewed_control], [])
+except module.ProviderError as exc:
+    assert "malformed" in str(exc)
+else:
+    raise AssertionError("unreviewed eight-vCPU control SKU was accepted")
+
+# Guest marker framing: only marker lines parse, the last one wins, and a
+# malformed payload fails closed.
+assert module.marker_payload("noise\nFM-X:{}\n", "FM-WORKER-RESULT:") is None
+assert module.marker_payload(
+    'junk\nFM-WORKER-RESULT:{"a":1}\nFM-WORKER-RESULT:{"a":2}\ntail', "FM-WORKER-RESULT:"
+) == {"a": 2}
+try:
+    module.marker_payload("FM-WORKER-RESULT:{broken", "FM-WORKER-RESULT:")
+except module.ProviderError as exc:
+    assert "malformed" in str(exc)
+else:
+    raise AssertionError("malformed guest marker payload was accepted")
+
 # Retail admission accepts one exact Linux on-demand primary meter and rejects
 # Spot/Low Priority/Windows plus ambiguous eligible prices.
 class PriceResponse:

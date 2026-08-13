@@ -62,5 +62,41 @@ PY
   pass "pinned guest supervisor executes one exact command and rejects changed request or assignment identity"
 }
 
+run_supervisor_steer_controls() {
+  local tmp assignment_file digest ack home
+  fm_test_tmproot_into tmp fm-worker-supervisor-steer
+  assignment_file="$tmp/assignment.json"
+  home=$(printf home | shasum -a 256 | awk '{print $1}')
+  digest=$(printf steer-request | shasum -a 256 | awk '{print $1}')
+  python3 - "$assignment_file" "$home" <<'PY'
+import json,sys
+json.dump({
+    "home_binding": sys.argv[2], "task": "task-one", "task_generation": "task-gen",
+    "assignment_generation": "asg-00000001", "account_binding": "x", "worktree_binding": "y",
+    "repository_binding": "z", "repository_generation": "repo-gen", "supervisor_sha256": "s",
+}, open(sys.argv[1], "w"), sort_keys=True, separators=(",", ":"))
+PY
+  ack=$(env FM_WORKER_ASSIGNMENT_PATH="$assignment_file" "$SUPERVISOR" steer \
+    --home-binding "$home" --task task-one --task-generation task-gen \
+    --assignment-generation asg-00000001 --request-digest "$digest") \
+    || fail "guest supervisor refused an exact steer request"
+  python3 - "$ack" "$digest" <<'PY' || fail "guest steer acknowledgement was not exact"
+import json,sys
+line=sys.argv[1].strip()
+assert line.startswith("FM-WORKER-STEER-ACK:")
+value=json.loads(line[len("FM-WORKER-STEER-ACK:"):])
+assert value["schema"]=="fm.worker-steer-ack/v1"
+assert value["request_digest"]==sys.argv[2]
+assert value["assignment_generation"]=="asg-00000001"
+PY
+  if env FM_WORKER_ASSIGNMENT_PATH="$assignment_file" "$SUPERVISOR" steer \
+      --home-binding "$home" --task task-two --task-generation task-gen \
+      --assignment-generation asg-00000001 --request-digest "$digest" >/dev/null 2>&1; then
+    fail "guest supervisor acknowledged a steer for a foreign task binding"
+  fi
+  pass "guest supervisor acknowledges only exact digest-bound steer requests"
+}
+
 run_supervisor_controls
+run_supervisor_steer_controls
 echo "# fm-worker-supervisor.test.sh: all assertions passed"

@@ -113,23 +113,18 @@ def worktree_evidence(task, values):
 
 
 def landing_evidence(worktree):
+    # Only the canonical origin remote proves landing; a scratch or fork
+    # remote-tracking ref must not count, and an unpushed local default
+    # branch is not landed work.
     head = git(worktree, "rev-parse", "HEAD")
-    refs = git(worktree, "for-each-ref", "--format=%(refname)", "refs/remotes").splitlines()
+    refs = git(worktree, "for-each-ref", "--format=%(refname)", "refs/remotes/origin").splitlines()
     for ref in refs:
+        if ref == "refs/remotes/origin/HEAD":
+            continue
         result = subprocess.run(["git", "-C", str(worktree), "merge-base", "--is-ancestor", head, ref])
         if result.returncode == 0:
             return "{}\0{}".format(head, ref).encode()
-    branch = git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD")
-    default = "main"
-    origin_head = subprocess.run(
-        ["git", "-C", str(worktree), "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
-        text=True, stdout=subprocess.PIPE,
-    )
-    if origin_head.returncode == 0:
-        default = origin_head.stdout.strip().rsplit("/", 1)[-1]
-    if branch == default:
-        return "{}\0local-default:{}".format(head, default).encode()
-    raise AuthorityError("landing authority did not prove committed work reachable from a remote or local default")
+    raise AuthorityError("landing authority did not prove committed work reachable from the origin remote")
 
 
 def account_evidence(values, task, home):

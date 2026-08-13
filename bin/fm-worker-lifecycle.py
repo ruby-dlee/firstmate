@@ -305,7 +305,11 @@ def verify_state(env, state):
         or not isinstance(state.get("executions"), dict)
     ):
         raise LifecycleError("lifecycle queue, worker, or shared capacity inventory is malformed")
-    if len(state["capacity_reservations"]) > 256:
+    live_reservations = sum(
+        1 for item in state["capacity_reservations"].values()
+        if isinstance(item, dict) and item.get("status") != "released"
+    )
+    if live_reservations > 256:
         raise LifecycleError("shared capacity reservation history exceeds its durable bound")
     for reservation_id, reservation in state["capacity_reservations"].items():
         if not isinstance(reservation, dict):
@@ -471,15 +475,19 @@ def verify_inventory(inventory):
     seen_reservations = set()
     for reservation in capacity_reservations:
         reservation_id = reservation.get("reservation_id") if isinstance(reservation, dict) else None
+        if isinstance(reservation, dict) and reservation.get("vcpus") == 4:
+            reviewed_family = REVIEWED_SKU_FAMILY.get(reservation.get("sku"))
+        elif isinstance(reservation, dict) and reservation.get("vcpus") == 8:
+            reviewed_family = REVIEWED_CONTROL_SKU_FAMILY.get(reservation.get("sku"))
+        else:
+            reviewed_family = None
         if (
             not isinstance(reservation_id, str)
             or not SAFE_ID.match(reservation_id)
             or reservation_id in seen_reservations
             or reservation.get("role") != "specialized"
-            or reservation.get("sku") not in REVIEWED_SKU_FAMILY
-            or str(reservation.get("sku_family", "")).lower()
-            != REVIEWED_SKU_FAMILY[reservation["sku"]].lower()
-            or reservation.get("vcpus") != 4
+            or reviewed_family is None
+            or str(reservation.get("sku_family", "")).lower() != reviewed_family.lower()
             or isinstance(reservation.get("amount_usd"), bool)
             or not isinstance(reservation.get("amount_usd"), (int, float))
             or not math.isfinite(float(reservation["amount_usd"]))
@@ -682,7 +690,14 @@ def merged_specialized_reservations(state, inventory, ignore_reservation_id=None
             continue
         current = merged.get(reservation_id)
         identity_fields = ("role", "sku", "sku_family", "vcpus", "amount_usd")
-        if current is not None and any(current.get(field) != local.get(field) for field in identity_fields):
+        if current is not None and (
+            any(current.get(field) != local.get(field) for field in ("role", "sku", "vcpus"))
+            or str(current.get("sku_family", "")).lower() != str(local.get("sku_family", "")).lower()
+            or not math.isclose(
+                float(current.get("amount_usd", -1.0)), float(local.get("amount_usd", -2.0)),
+                rel_tol=0.0, abs_tol=1e-6,
+            )
+        ):
             raise LifecycleError("local and provider specialized reservation identity differs")
         if current is None:
             current = {field: local[field] for field in identity_fields}
@@ -1741,7 +1756,11 @@ def command_capacity_reserve(env, args):
             candidate["reserved_at"] = candidate.get("reserved_at") or iso_utc()
             candidate["last_refusal"] = None
         else:
-            candidate["status"] = "queued"
+            # A reserved constituent of an atomically admitted shape keeps its
+            # commitment: a child's lineage re-admission may observe transient
+            # pressure, but its capacity is already counted and held.
+            if not (readmission_id and candidate.get("shape_id")):
+                candidate["status"] = "queued"
             candidate["last_refusal"] = {"at": iso_utc(), "reason": reason[:500]}
         save_state(env, state)
     print(json.dumps({
@@ -1903,6 +1922,18 @@ def command_capacity_release(env, args):
         reservation["status"] = "released"
         reservation["released_at"] = iso_utc()
         reservation["cleanup_receipt"] = receipt
+        # Bound durable history without ever locking the controller out: keep
+        # the newest 128 released records and drop older ones. Live queued and
+        # reserved reservations are never pruned.
+        released = sorted(
+            (
+                (item.get("released_at") or "", key)
+                for key, item in state["capacity_reservations"].items()
+                if isinstance(item, dict) and item.get("status") == "released"
+            ),
+        )
+        for _, stale_key in released[:-128]:
+            del state["capacity_reservations"][stale_key]
         save_state(env, state)
     print("specialized capacity reservation released after exact zero-compute proof")
 

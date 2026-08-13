@@ -594,9 +594,12 @@ PY
     run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
       "$id" "$PROJ_DIR" --model openai-codex-5/gpt-5.6-sol --effort xhigh)
   status=$?
-  expect_code 0 "$status" "Pi account-change recovery should remain cross-provider-only: $out"
-  assert_no_grep 'author_account_identity=' "$meta" \
-    "a task spanning two Pi accounts retained same-provider eligibility"
+  expect_code 0 "$status" "Pi account-change recovery should record its current account: $out"
+  count=$(grep -c '^author_account_identity=' "$meta" || true)
+  [ "$count" -eq 1 ] \
+    || fail "Pi account-change recovery did not record exactly one current identity"
+  assert_grep 'author_account_identity=account-B' "$meta" \
+    "Pi account-change recovery did not replace the previous account identity"
   tasktmp=$(sed -n 's/^tasktmp=//p' "$meta")
   private="$tasktmp/pi-author-agent"
   launch=$(cat "$LAUNCH_LOG")

@@ -3507,7 +3507,6 @@ fi
 
 PI_AUTHOR_ACCOUNT_IDENTITY=
 PI_AUTHOR_ACCOUNT_HOME=
-PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=
 
 # prepare_launch_environment: every step the launch-command construction below
 # The PATH a crewmate's tool commands run with. A harness executes tool commands
@@ -3598,15 +3597,7 @@ if [ "$HARNESS" = pi ] && [ "$RAW_LAUNCH" != 1 ]; then
     "$SCRIPT_DIR/fm-pi-author-snapshot.py" \
       "${MODEL:-default}" "$PI_AUTHOR_SOURCE_HOME" "$PI_AUTHOR_ACCOUNT_HOME"
   ); then
-    if [ "$SPAWN_META_PRESENT" = 1 ]; then
-      PI_RECORDED_ACCOUNT_IDENTITY=$(spawn_preflight_meta_value author_account_identity)
-      if [ -n "$PI_RECORDED_ACCOUNT_IDENTITY" ] \
-        && [ "$PI_RECORDED_ACCOUNT_IDENTITY" = "$PI_CAPTURED_ACCOUNT_IDENTITY" ]; then
-        PI_AUTHOR_ACCOUNT_IDENTITY=$PI_CAPTURED_ACCOUNT_IDENTITY
-      fi
-    else
-      PI_AUTHOR_ACCOUNT_IDENTITY=$PI_CAPTURED_ACCOUNT_IDENTITY
-    fi
+    PI_AUTHOR_ACCOUNT_IDENTITY=$PI_CAPTURED_ACCOUNT_IDENTITY
   else
     PI_AUTHOR_ACCOUNT_HOME=
     PI_AUTHOR_ACCOUNT_IDENTITY=

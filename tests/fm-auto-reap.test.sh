@@ -396,6 +396,7 @@ test_pre_acquisition_record_requires_one_empty_worktree_field() {
       printf 'worktree=\n' >> "$record"
     fi
     rm -f "$record.bak"
+    touch -t 202001010000 "$record"
     out=$(FM_AUTO_REAP_STALE_SECS=1 "$AUTO_REAP" maintenance 2>&1); rc=$?
     expect_code 0 "$rc" "$id maintenance"
     assert_contains "$out" "must contain exactly one worktree field" \

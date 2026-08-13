@@ -40,7 +40,11 @@ HEX_BINDING = re.compile(r"^[0-9a-f]{64}$")
 UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 MAX_WORKERS = 16
 VCPUS_PER_WORKER = 4
-REGIONAL_LANDING_RESERVE_VCPUS = 62
+REGIONAL_ADMISSION_CEILING_VCPUS = 128
+AUTHOR_PLAN_VCPUS = MAX_WORKERS * VCPUS_PER_WORKER
+SPECIALIZED_SHAPE_VCPUS = 40
+SHARED_HEADROOM_VCPUS = 22
+REGIONAL_NON_AUTHOR_RESERVE_VCPUS = SPECIALIZED_SHAPE_VCPUS + SHARED_HEADROOM_VCPUS
 DEFAULT_COOLDOWN_SECONDS = 300
 PROVIDER_TIMEOUT_SECONDS = 300
 MAX_PROVIDER_OUTPUT_BYTES = 2 * 1024 * 1024
@@ -524,6 +528,7 @@ def metrics_from_inventory(inventory):
         "forecast_usd": metrics.get("forecast_usd"),
         "regional_limit_vcpus": metrics.get("regional_limit_vcpus"),
         "regional_used_vcpus": metrics.get("regional_used_vcpus"),
+        "specialized_active_vcpus": metrics.get("specialized_active_vcpus"),
         "family_free_vcpus": metrics.get("family_free_vcpus"),
         "sku_hourly_usd": metrics.get("sku_hourly_usd"),
         "observed_at": inventory.get("observed_at"),
@@ -560,20 +565,27 @@ def admission_result(env, state, inventory, slot, item=None, extra_reservations=
     forecast = metrics.get("forecast_usd")
     regional_limit = metrics.get("regional_limit_vcpus")
     regional_used = metrics.get("regional_used_vcpus")
+    specialized_active = metrics.get("specialized_active_vcpus")
     family_free = metrics.get("family_free_vcpus")
     rates = metrics.get("sku_hourly_usd")
     if not isinstance(actual, (int, float)) or not isinstance(forecast, (int, float)):
         return False, "actual or forecast spend is unreadable", 0.0
     if not isinstance(regional_limit, int) or not isinstance(regional_used, int):
-        return False, "regional quota is unreadable", 0.0
+        return False, "shared East US regional quota is unreadable", 0.0
+    if regional_limit < REGIONAL_ADMISSION_CEILING_VCPUS:
+        return False, "shared East US regional quota is below the reviewed 128-vCPU ceiling", 0.0
+    if not isinstance(specialized_active, int) or specialized_active < 0:
+        return False, "active specialized Azure capacity is unreadable", 0.0
     sku, family = SKU_PLAN[slot]
     if not isinstance(family_free, dict) or not isinstance(family_free.get(family), int):
         return False, "exact selected-family quota is unreadable", 0.0
     if not isinstance(rates, dict) or not isinstance(rates.get(sku), (int, float)):
         return False, "selected worker retail rate is unreadable", 0.0
-    regional_free = regional_limit - regional_used
-    if regional_free < VCPUS_PER_WORKER or regional_free - VCPUS_PER_WORKER < REGIONAL_LANDING_RESERVE_VCPUS:
-        return False, "regional landing-capacity reserve would be consumed", 0.0
+    shared_ceiling_free = REGIONAL_ADMISSION_CEILING_VCPUS - regional_used
+    specialized_remaining = max(0, SPECIALIZED_SHAPE_VCPUS - specialized_active)
+    required_reserve = specialized_remaining + SHARED_HEADROOM_VCPUS
+    if shared_ceiling_free < VCPUS_PER_WORKER or shared_ceiling_free - VCPUS_PER_WORKER < required_reserve:
+        return False, "combined author and specialized demand would consume the shared East US reserve", 0.0
     if family_free[family] < VCPUS_PER_WORKER:
         return False, "exact selected-family free vCPU quota is insufficient", 0.0
     # The reservation covers the configurable expected author interval plus a
@@ -619,9 +631,20 @@ def desired_count(env, state, inventory):
     actual = active_count(state, inventory)
     quota_capacity = 0
     metrics = inventory["metrics"]
-    if isinstance(metrics.get("regional_limit_vcpus"), int) and isinstance(metrics.get("regional_used_vcpus"), int):
-        regional_free = metrics["regional_limit_vcpus"] - metrics["regional_used_vcpus"]
-        quota_capacity = actual + max(0, (regional_free - REGIONAL_LANDING_RESERVE_VCPUS) // VCPUS_PER_WORKER)
+    if (
+        isinstance(metrics.get("regional_limit_vcpus"), int)
+        and metrics["regional_limit_vcpus"] >= REGIONAL_ADMISSION_CEILING_VCPUS
+        and isinstance(metrics.get("regional_used_vcpus"), int)
+        and isinstance(metrics.get("specialized_active_vcpus"), int)
+    ):
+        shared_ceiling_free = REGIONAL_ADMISSION_CEILING_VCPUS - metrics["regional_used_vcpus"]
+        specialized_remaining = max(
+            0, SPECIALIZED_SHAPE_VCPUS - metrics["specialized_active_vcpus"]
+        )
+        required_reserve = specialized_remaining + SHARED_HEADROOM_VCPUS
+        quota_capacity = actual + max(
+            0, (shared_ceiling_free - required_reserve) // VCPUS_PER_WORKER
+        )
     budget_capacity = actual
     waiting = queued_items(state)
     projected_reservations = 0.0
@@ -1042,6 +1065,12 @@ def status_projection(env, state, inventory=None):
         "active_admission_limit_usd": budget_limit(env),
         "planning_target_usd": env["steady_target_usd"],
         "commissioning_ceiling_usd": env["commissioning_ceiling_usd"],
+        "regional_admission_ceiling_vcpus": REGIONAL_ADMISSION_CEILING_VCPUS,
+        "regional_observed_used_vcpus": metrics.get("regional_used_vcpus"),
+        "author_plan_vcpus": AUTHOR_PLAN_VCPUS,
+        "specialized_shape_vcpus": SPECIALIZED_SHAPE_VCPUS,
+        "specialized_active_vcpus": metrics.get("specialized_active_vcpus"),
+        "shared_headroom_vcpus": SHARED_HEADROOM_VCPUS,
         "idle_cooldown_seconds": env["cooldown_seconds"],
         "warm_idle_target": env["warm_idle"],
         "retained_disks": retained_disks,
@@ -1067,6 +1096,11 @@ def print_status(status, json_output):
         status["actual_spend_usd"], status["forecast_spend_usd"], status["policy_phase"],
         status["active_admission_limit_usd"], status["planning_target_usd"],
         status["commissioning_ceiling_usd"],
+    ))
+    print("regional-capacity: used={}/{} author-plan={} specialized={}/{} shared-headroom={}".format(
+        status["regional_observed_used_vcpus"], status["regional_admission_ceiling_vcpus"],
+        status["author_plan_vcpus"], status["specialized_active_vcpus"],
+        status["specialized_shape_vcpus"], status["shared_headroom_vcpus"],
     ))
     print("idle: cooldown={}s warm={} retained-disks={} cleanup-refusals={}".format(
         status["idle_cooldown_seconds"], status["warm_idle_target"],

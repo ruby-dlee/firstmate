@@ -46,6 +46,21 @@ RESOURCE_API = {
     "identity": "2023-01-31",
     "role-assignment": "2022-04-01",
 }
+SPECIALIZED_ROLES = {
+    "validation-shard", "validation-cell", "policy-review", "browser-tool",
+    "networkless-verifier", "crosscheck-tool",
+}
+SKU_VCPUS = {
+    "Standard_D2as_v6": 2,
+    "Standard_D4as_v6": 4,
+    "Standard_D4as_v7": 4,
+    "Standard_D4s_v6": 4,
+    "Standard_D4ads_v7": 4,
+    "Standard_D4ads_v6": 4,
+    "Standard_E4as_v7": 4,
+    "Standard_E4as_v6": 4,
+    "Standard_D4ds_v6": 4,
+}
 SKU_PLAN = {
     1: ("Standard_D4as_v6", "standardDav6Family"),
     2: ("Standard_D4as_v6", "standardDav6Family"),
@@ -341,7 +356,26 @@ def retail_rate(sku):
     return min(prices) if prices else None
 
 
-def metrics(controller):
+def specialized_active_vcpus(controller, vms):
+    total = 0
+    for vm in vms:
+        tags = vm.get("tags") or {}
+        if tags.get("firstmate-role") not in SPECIALIZED_ROLES:
+            continue
+        if not is_exact_fleet(controller, tags):
+            return None
+        power = str(vm.get("powerState") or vm.get("power_state") or "unknown").lower()
+        if "deallocated" in power:
+            continue
+        sku = tags.get("selected-sku") or (vm.get("hardwareProfile") or {}).get("vmSize")
+        vcpus = SKU_VCPUS.get(sku)
+        if vcpus is None:
+            return None
+        total += vcpus
+    return total
+
+
+def metrics(controller, vms):
     usage, rc, _ = az(controller, ["vm", "list-usage", "--location", "eastus"], check=False)
     regional_limit = None
     regional_used = None
@@ -365,6 +399,7 @@ def metrics(controller):
         "forecast_usd": cost_query(controller, True),
         "regional_limit_vcpus": regional_limit,
         "regional_used_vcpus": regional_used,
+        "specialized_active_vcpus": specialized_active_vcpus(controller, vms),
         "family_free_vcpus": family_free,
         "sku_hourly_usd": {sku: retail_rate(sku) for sku, _ in sorted(set(SKU_PLAN.values()))},
     }
@@ -503,11 +538,12 @@ def inventory(controller, include_metrics=True):
         "observed_at": iso_utc(),
         "workers": [workers[slot] for slot in sorted(workers)],
         "conflicts": conflicts,
-        "metrics": metrics(controller) if include_metrics else {
+        "metrics": metrics(controller, vms) if include_metrics else {
             "actual_usd": None,
             "forecast_usd": None,
             "regional_limit_vcpus": None,
             "regional_used_vcpus": None,
+            "specialized_active_vcpus": None,
             "family_free_vcpus": {},
             "sku_hourly_usd": {},
         },

@@ -58,18 +58,26 @@ It does not bypass unreadable cost or quota evidence, identity checks, the sixte
 
 ## Desired capacity and admission
 
-The controller computes desired active capacity from all eligible queued and assigned work, current exact assignments, the sixteen-worker software cap, live regional and exact-family quota, the 62-vCPU landing reserve, actual and forecast spend, and durable per-assignment cost reservations.
+The controller computes desired active capacity from all eligible queued and assigned work, current exact assignments, the sixteen-worker software cap, one shared East US regional ceiling, live exact-family quota, actual and forecast spend, and durable per-assignment cost reservations.
 Quota is only capacity and never creates demand.
-Every author worker uses one reviewed mixed-plan 4-vCPU slot, so the live 128-vCPU regional limit can support sixteen author workers plus a 2-vCPU supervisor while retaining 62 vCPUs for isolated landing and recovery work.
-The live 10-vCPU Dav6 family limit admits only its two reviewed slots and is not treated as a requirement for homogeneous Dav6=96 capacity.
+The reviewed shared ceiling is 128 regional vCPUs, with zero VM vCPUs used at the latest foundation evidence boundary.
+The author plan uses 64 vCPUs across sixteen 4-vCPU workers drawn from eight unrestricted families whose reviewed allowance is 10 vCPUs each.
+The same 128-vCPU ceiling reserves the existing 40-vCPU specialized validation shape plus 22 vCPUs of shared landing, replacement, recovery, browser, and control-plane headroom.
+A future 2-vCPU supervisor is ordinary observed regional usage, so 64 author + 40 specialized + 22 shared headroom + 2 supervisor equals the 128-vCPU ceiling.
+Active specialized VMs consume their portion of the reserved 40-vCPU shape instead of being counted against a fictional separate quota, while any unused part stays reserved for their queued demand.
+Unrelated or control-plane VM usage is also included by Azure's regional usage value.
+Combined author and specialized demand beyond the shared 128-vCPU ceiling remains queued, as does demand beyond budget.
+The live 10-vCPU Dav6 family limit admits only its two reviewed author slots and is not treated as a requirement for homogeneous Dav6=96 capacity.
 Every later mixed-family slot proves its own exact current family allowance.
+No capacity reservation creates an always-on worker pool, and queue-empty still drives general worker compute to zero.
 
 Commissioning uses 3,500 aggregate worker-hours and $1,000 as planning and warning thresholds.
 The thresholds do not terminate work or erase demand.
 New discretionary author launches stop before the greater of actual or forecast spend plus durable outstanding reservations and the new assignment reservation reaches $1,500.
 Each reservation uses the selected SKU's live retail rate, the configurable expected author interval, and a conservative retained-disk/control allowance.
 Cost Management, family quota, regional quota, and retail rates must all be readable before a new launch.
-Lagging billing telemetry cannot admit concurrent work twice because local outstanding reservations are added before each action.
+Actual and forecast cost queries cover the complete shared resource group, including author, validation, review, browser, recovery, networking, storage, and monitoring spend rather than granting specialized work a separate budget.
+Lagging billing telemetry cannot admit concurrent author work twice because local outstanding reservations are added before each action, while each specialized substrate keeps its own durable reservation inside that same actual/forecast boundary.
 
 After stabilization, set `FM_AZURE_WORKER_POLICY_PHASE=steady` and tune `FM_AZURE_WORKER_STEADY_TARGET_USD` toward $1,000.
 That changes the admission limit without changing resource identity or lifecycle design.
@@ -165,7 +173,7 @@ A provider error preserves the pending action and records a bounded cleanup refu
 The next controller process replays that exact action before considering new work.
 
 `status` is local and bounded by default, while `status --live` refreshes Azure and cost evidence.
-The output includes queue and eligible depths, desired and actual active workers, all five classification counts, assignment generations, worker-hours and warning threshold, actual and forecast spend, active policy phase and limit, cooldown, warm target, retained-disk count, and the last ten cleanup refusals.
+The output includes queue and eligible depths, desired and actual active workers, all five classification counts, assignment generations, worker-hours and warning threshold, actual and forecast spend, active policy phase and limit, the 128-vCPU regional ceiling and observed usage, the 64-vCPU author plan, active and reserved specialized capacity, 22-vCPU shared headroom, cooldown, warm target, retained-disk count, and the last ten cleanup refusals.
 It omits subscription IDs, resource IDs, account identities, account digests, worktree digests, private addresses, credentials, and secrets.
 
 ## Operator policy and overrides

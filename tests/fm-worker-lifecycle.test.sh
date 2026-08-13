@@ -24,7 +24,8 @@ azure = Path(sys.argv[2]).read_text(encoding="utf-8")
 doc = Path(sys.argv[3]).read_text(encoding="utf-8")
 for marker in (
     '"assigned", "clean-warm", "deallocated", "orphaned-safe-to-delete", "retained-for-investigation"',
-    "REGIONAL_LANDING_RESERVE_VCPUS = 62", "MAX_WORKERS = 16",
+    "REGIONAL_ADMISSION_CEILING_VCPUS = 128", "AUTHOR_PLAN_VCPUS = MAX_WORKERS * VCPUS_PER_WORKER",
+    "SPECIALIZED_SHAPE_VCPUS = 40", "SHARED_HEADROOM_VCPUS = 22", "MAX_WORKERS = 16",
     'FM_AZURE_WORKER_WARM_IDLE currently must remain zero', "pending_action",
     "endpoint_receipt", "landed_work_receipt", "account_release_receipt",
 ):
@@ -36,8 +37,10 @@ for marker in (
 ):
     assert marker in azure, marker
 for marker in (
-    "sixteen author workers", "$1,500", "3,500 aggregate worker-hours",
+    "sixteen 4-vCPU workers", "$1,500", "3,500 aggregate worker-hours",
     "downloaded self-contained form artifact", "returns through a file",
+    "Combined author and specialized demand beyond the shared 128-vCPU ceiling remains queued",
+    "No capacity reservation creates an always-on worker pool",
     "Every acceptance leg needs a positive control", "warm-idle target is zero",
 ):
     assert marker in doc, marker
@@ -122,7 +125,8 @@ assert module.classify_worker(worker, None)[0] == "retained-for-investigation"
 metrics = {
     "actual_usd": 100.0, "forecast_usd": 200.0,
     "regional_limit_vcpus": 128, "regional_used_vcpus": 2,
-    "family_free_vcpus": {family: 100 for _, family in module.SKU_PLAN.values()},
+    "specialized_active_vcpus": 0,
+    "family_free_vcpus": {family: 10 for _, family in module.SKU_PLAN.values()},
     "sku_hourly_usd": {sku: 0.25 for sku, _ in module.SKU_PLAN.values()},
 }
 inventory = {"metrics": metrics, "workers": [], "conflicts": []}
@@ -132,7 +136,15 @@ for field in ("actual_usd", "forecast_usd"):
     changed["metrics"][field] = None
     assert module.admission_result(env, state, changed, 1, item)[0] is False
 changed = copy.deepcopy(inventory)
-changed["metrics"]["regional_used_vcpus"] = 63
+changed["metrics"]["regional_limit_vcpus"] = 127
+assert module.admission_result(env, state, changed, 1, item)[0] is False
+changed = copy.deepcopy(inventory)
+changed["metrics"]["specialized_active_vcpus"] = None
+assert module.admission_result(env, state, changed, 1, item)[0] is False
+changed = copy.deepcopy(inventory)
+changed["metrics"].update({"regional_used_vcpus": 102, "specialized_active_vcpus": 40})
+assert module.admission_result(env, state, changed, 1, item)[0] is True
+changed["metrics"]["regional_used_vcpus"] = 106
 assert module.admission_result(env, state, changed, 1, item)[0] is False
 changed = copy.deepcopy(inventory)
 changed["metrics"]["family_free_vcpus"][module.SKU_PLAN[1][1]] = 3
@@ -154,6 +166,9 @@ for index in range(17):
     })
     state["queue"][module.request_key(queued["task"], queued["task_generation"])] = queued
 assert module.desired_count(env, state, inventory) == 16
+specialized = copy.deepcopy(inventory)
+specialized["metrics"].update({"regional_used_vcpus": 42, "specialized_active_vcpus": 40})
+assert module.desired_count(env, state, specialized) == 16
 budgeted = copy.deepcopy(inventory)
 budgeted["metrics"]["actual_usd"] = 1499.0
 budgeted["metrics"]["forecast_usd"] = 1499.0
@@ -241,6 +256,24 @@ for key in tags:
         pass
     else:
         raise AssertionError("foreign task-disk tag accepted: {}".format(key))
+
+# Specialized validation demand consumes the same observed regional ceiling;
+# deallocated capacity is zero and unknown/foreign capacity fails closed.
+specialized_tags = {
+    "workload": "firstmate", "deployment-generation": "dep", "cleanup-owner": "owner",
+    "firstmate-role": "validation-shard", "selected-sku": "Standard_D4as_v6",
+}
+specialized_vm = {"tags": specialized_tags, "powerState": "VM running"}
+assert module.specialized_active_vcpus(controller, [specialized_vm]) == 4
+deallocated_vm = copy.deepcopy(specialized_vm)
+deallocated_vm["powerState"] = "VM deallocated"
+assert module.specialized_active_vcpus(controller, [deallocated_vm]) == 0
+unknown_vm = copy.deepcopy(specialized_vm)
+unknown_vm["tags"]["selected-sku"] = "Standard_Unknown"
+assert module.specialized_active_vcpus(controller, [unknown_vm]) is None
+foreign_vm = copy.deepcopy(specialized_vm)
+foreign_vm["tags"]["cleanup-owner"] = "foreign"
+assert module.specialized_active_vcpus(controller, [foreign_vm]) is None
 
 # Public IP relations are rejected while a private NIC is accepted.
 nic = {
@@ -397,6 +430,7 @@ else:
         "actual_usd": state["metrics"]["actual_usd"],
         "forecast_usd": state["metrics"]["forecast_usd"],
         "regional_limit_vcpus": 128, "regional_used_vcpus": 2 + 4 * active,
+        "specialized_active_vcpus": 0,
         "family_free_vcpus": {}, "sku_hourly_usd": {},
     }
     plan = {
@@ -514,6 +548,10 @@ def release(number):
 # Start from zero and reach four parallel unique assignments.
 status = json.loads(run("status", "--json").stdout)
 assert status["queue_depth"] == 0 and status["desired_active_workers"] == 0
+assert status["regional_admission_ceiling_vcpus"] == 128
+assert status["author_plan_vcpus"] == 64
+assert status["specialized_shape_vcpus"] == 40
+assert status["shared_headroom_vcpus"] == 22
 for number in range(1, 5):
     request(number)
 run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])

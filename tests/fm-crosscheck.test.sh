@@ -1225,7 +1225,6 @@ opaque = codex_home("codex-unreadable-account", None)
 meta = {
     "harness": "pi",
     "model": "openai-codex-5/gpt-5.6-sol",
-    "author_identity_snapshot_epoch": "launch-bound-v1",
 }
 os.environ["PI_CODING_AGENT_DIR"] = str(author)
 mode_path = home / "config" / "crosscheck-same-model"
@@ -1657,9 +1656,6 @@ test_missing_author_identity_reaches_normal_verdict() {
     -e '/^account_home=/d' \
     "$case_dir/state/task-x1.meta"
   rm "$case_dir/state/task-x1.meta.bak"
-  printf 'author_identity_snapshot_epoch=launch-bound-v1\n' \
-    >> "$case_dir/state/task-x1.meta"
-
   run_case "$case_dir" "$base" "$head" clear run \
     > "$case_dir/out" 2> "$case_dir/err" \
     || fail "metadata without author_account_identity did not reach a normal verdict"

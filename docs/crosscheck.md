@@ -302,7 +302,7 @@ The versioned fixtures it uses were observed from installed `gh-axi 0.1.25`.
 Most of `tests/fm-crosscheck.test.sh` is hermetic coverage using observed-shape GitHub, Codex, Pi, and sandbox fakes.
 Its `test_installed_sandbox_denies_shared_private_tmp` case is the exception: it invokes the real installed `/usr/bin/sandbox-exec` and verifies the generated proof profile denies shared host temporary state.
 Its `test_pytest_runner_resolves_through_a_uv_aware_ladder` case is the named regression for runner-name resolution: it pins monorepo uv-project discovery, the skipped uv rung outside a project, the unchanged absent-runner refusal, and pytest's retained node-id support.
-Its `test_missing_author_identity_reaches_normal_verdict` case is the named regression for a modern Pi lane carrying the snapshot epoch but no captured author identity: the review reaches an ordinary clear verdict without an identity warning or downgrade.
+Its `test_missing_author_identity_reaches_normal_verdict` case is the named regression for a Pi lane without a captured account identity: the review reaches an ordinary clear verdict without an identity warning or downgrade.
 Its `test_claude_reviewer_is_never_selected` case proves the separate standing rule that Claude is not an accepted reviewer profile and never launches.
 Its `test_same_model_relaxation_does_not_require_author_identity` case proves the explicit model-policy relaxation does not revive an author-account precondition.
 `tests/fm-spawn-dispatch-profile.test.sh` separately proves a failed Pi identity capture remains nonfatal and the lane still launches.

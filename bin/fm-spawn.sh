@@ -3591,16 +3591,6 @@ persist_worktree_acquisition_phases || {
   echo "error: cannot durably record task temp creation for $ID" >&2
   exit 1
 }
-if [ "$HARNESS" = pi ]; then
-  if [ "$SPAWN_META_PRESENT" = 1 ]; then
-    PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=$(spawn_preflight_meta_value author_identity_snapshot_epoch)
-    if [ "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" != launch-bound-v1 ]; then
-      PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=
-    fi
-  else
-    PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH=launch-bound-v1
-  fi
-fi
 if [ "$HARNESS" = pi ] && [ "$RAW_LAUNCH" != 1 ]; then
   PI_AUTHOR_SOURCE_HOME=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
   PI_AUTHOR_ACCOUNT_HOME="$TASK_TMP/pi-author-agent"
@@ -4205,7 +4195,6 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "effort=${EFFORT:-default}"
   echo "generation_id=$SPAWN_GENERATION_ID"
   [ -z "$PI_AUTHOR_ACCOUNT_IDENTITY" ] || echo "author_account_identity=$PI_AUTHOR_ACCOUNT_IDENTITY"
-  [ -z "$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH" ] || echo "author_identity_snapshot_epoch=$PI_AUTHOR_IDENTITY_SNAPSHOT_EPOCH"
   [ -z "${PROVISION_SUMMARY:-}" ] || echo "provision=$PROVISION_SUMMARY"
   [ "$NO_ACCOUNT_ROUTING" != 1 ] || echo "account_routing_emergency_bypass=1"
   [ -z "$BACKLOG_ROW_EXEMPTION" ] || echo "backlog_row_exemption=$BACKLOG_ROW_EXEMPTION"

@@ -1473,7 +1473,6 @@ def parser():
         "--constituent", action="append", required=True, metavar="SPEC",
         help="reservation-id=...,role=...,sku=...,sku-family=...,vcpus=...,amount-usd=...",
     )
-    shape.add_argument("--required", action="store_true")
     shape.add_argument("--confirm-subscription", required=True)
 
     capacity_release = sub.add_parser(
@@ -1810,7 +1809,7 @@ def command_capacity_reserve_shape(env, args):
         candidate = specialized_reservation_item(
             fields["reservation-id"], args.fence_binding, fields["role"],
             fields["sku"], fields["sku-family"], fields["vcpus"],
-            fields["amount-usd"], not args.required, shape_id=shape_id,
+            fields["amount-usd"], True, shape_id=shape_id,
         )
         if candidate["reservation_id"] in seen_ids:
             raise LifecycleError("shape constituent reservation ids must be distinct")
@@ -1919,6 +1918,12 @@ def command_capacity_release(env, args):
             return
         if reservation.get("status") not in ("queued", "reserved"):
             raise LifecycleError("capacity reservation status is not releasable")
+        inventory = provider_call(env, "inventory")["inventory"]
+        if any(
+            item.get("reservation_id") == reservation_id and item.get("active") is True
+            for item in inventory["capacity_reservations"]
+        ):
+            raise LifecycleError("capacity release did not prove provider-observed compute absence")
         reservation["status"] = "released"
         reservation["released_at"] = iso_utc()
         reservation["cleanup_receipt"] = receipt

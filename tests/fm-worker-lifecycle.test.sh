@@ -36,6 +36,8 @@ for marker in (
     "fm.worker-authority/v1", "authority-receipt", "fm.worker-execution/v1",
 ):
     assert marker in controller, marker
+assert 'shape.add_argument("--required"' not in controller
+assert '"fetch", "--quiet", "--no-tags", "--prune", "origin"' in authority
 for marker in (
     "run_pilot_create", "conditional_delete", "If-Match=", "reuse_retained",
     '"role", "assignment", "list", "--all"',
@@ -713,7 +715,7 @@ else:
     inventory = {
         "schema": "fm.worker-provider-inventory/v1", "observed_at": "2026-01-01T00:00:00Z",
         "workers": [state["workers"][key] for key in sorted(state["workers"], key=int)],
-        "capacity_reservations": [], "conflicts": [], "metrics": metrics,
+        "capacity_reservations": state.get("capacity_reservations", []), "conflicts": [], "metrics": metrics,
     }
     result = inventory
 
@@ -1146,6 +1148,68 @@ PY
     --cleanup-receipt "$(printf posctl-cleanup | shasum -a 256 | awk '{print $1}')" \
     --confirm-subscription "$SUB" >/dev/null
 
+  python3 - "$fixture" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+state = json.loads(path.read_text()) if path.exists() else {
+    "workers": {}, "seen": {}, "calls": [],
+    "metrics": {"actual_usd": 100.0, "forecast_usd": 200.0},
+}
+state["capacity_reservations"] = [{
+    "reservation_id": "azr-cfa000000001", "role": "specialized",
+    "sku": "Standard_D4as_v7", "sku_family": "StandardDasv7Family",
+    "vcpus": 4, "amount_usd": 25, "active": True,
+}]
+path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")))
+PY
+  if run_shape capacity-release \
+      --reservation-id azr-cfa000000001 --fence-binding "$fence" \
+      --cleanup-receipt "$(printf live-cleanup | shasum -a 256 | awk '{print $1}')" \
+      --confirm-subscription "$SUB" >/dev/null 2>&1; then
+    fail "provider-observed live specialized compute was released"
+  fi
+  python3 - "$fixture" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+state = json.loads(path.read_text())
+state["capacity_reservations"][0]["active"] = False
+path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")))
+PY
+  run_shape capacity-release \
+    --reservation-id azr-cfa000000001 --fence-binding "$fence" \
+    --cleanup-receipt "$(printf absent-cleanup | shasum -a 256 | awk '{print $1}')" \
+    --confirm-subscription "$SUB" >/dev/null
+  python3 - "$fixture" <<'PY'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+state = json.loads(path.read_text())
+state["capacity_reservations"] = "unreadable"
+path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")))
+PY
+  if run_shape capacity-release \
+      --reservation-id azr-cfb000000001 --fence-binding "$fence" \
+      --cleanup-receipt "$(printf unreadable-cleanup | shasum -a 256 | awk '{print $1}')" \
+      --confirm-subscription "$SUB" >/dev/null 2>&1; then
+    fail "unreadable provider inventory allowed specialized release"
+  fi
+  python3 - "$state_file" "$fixture" <<'PY' || fail "failed release changed durable reservation state"
+import json
+import sys
+from pathlib import Path
+controller = json.loads(Path(sys.argv[1]).read_text())
+assert controller["capacity_reservations"]["azr-cfb000000001"]["status"] == "queued"
+path = Path(sys.argv[2])
+state = json.loads(path.read_text())
+state["capacity_reservations"] = []
+path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")))
+PY
+
   # The complete validation-heavy shape admits atomically: one reviewed
   # eight-vCPU control cell plus eight four-vCPU shards across exact families.
   shape_args=(
@@ -1242,6 +1306,12 @@ state = json.load(open(sys.argv[2]))
 assert state["capacity_reservations"]["azr-ctl000000001"]["status"] == "reserved"
 assert state["capacity_reservations"]["azr-shd000000008"]["status"] == "released"
 PY
+  if run_shape capacity-reserve-shape \
+      --shape-id shape-required --fence-binding "$fence" \
+      --constituent "reservation-id=azr-req000000001,role=review,sku=Standard_E4as_v6,sku-family=standardEav6Family,vcpus=4,amount-usd=25" \
+      --required --confirm-subscription "$SUB" >/dev/null 2>&1; then
+    fail "capacity-reserve-shape still accepted the cost-admission bypass"
+  fi
 
   # A released constituent identity can never re-enter a shape.
   if run_shape capacity-reserve-shape \
@@ -1251,6 +1321,49 @@ PY
     fail "released constituent identity was reused in a new shape"
   fi
   pass "complete specialized shapes admit atomically, queue on family or budget pressure, and never demote or reuse exact reservations"
+}
+
+landing_authority_refresh() {
+  local tmp remote seed checkout
+  fm_test_tmproot_into tmp fm-worker-landing-authority
+  remote="$tmp/origin.git"
+  seed="$tmp/seed"
+  checkout="$tmp/checkout"
+  git init --quiet --bare "$remote"
+  git -C "$remote" symbolic-ref HEAD refs/heads/main
+  git -C "$remote" config receive.denyDeleteCurrent ignore
+  git init --quiet -b main "$seed"
+  git -C "$seed" config user.name Test
+  git -C "$seed" config user.email test@example.invalid
+  printf 'landed\n' >"$seed/file"
+  git -C "$seed" add file
+  git -C "$seed" commit --quiet -m landed
+  git -C "$seed" remote add origin "$remote"
+  git -C "$seed" push --quiet -u origin main
+  git clone --quiet "$remote" "$checkout"
+  python3 - "$AUTHORITY" "$checkout" <<'PY' || fail "fresh origin branch did not prove landing"
+import importlib.util
+import sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("worker_authority", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert b"refs/remotes/origin/main" in module.landing_evidence(Path(sys.argv[2]))
+PY
+  git -C "$seed" push --quiet origin --delete main
+  if python3 - "$AUTHORITY" "$checkout" <<'PY'
+import importlib.util
+import sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("worker_authority", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module.landing_evidence(Path(sys.argv[2]))
+PY
+  then
+    fail "stale origin tracking ref still proved landing after remote deletion"
+  fi
+  pass "landing authority refreshes and prunes origin before proving reachability"
 }
 
 restart_idempotency() {
@@ -1319,6 +1432,7 @@ azure_provider_refusal_matrix
 end_to_end_lifecycle
 shared_specialized_cli
 shared_shape_cli
+landing_authority_refresh
 restart_idempotency
 
 echo "# fm-worker-lifecycle.test.sh: all assertions passed"

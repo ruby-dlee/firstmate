@@ -117,6 +117,10 @@ def landing_evidence(worktree):
     # remote-tracking ref must not count, and an unpushed local default
     # branch is not landed work.
     head = git(worktree, "rev-parse", "HEAD")
+    git(
+        worktree, "fetch", "--quiet", "--no-tags", "--prune", "origin",
+        "+refs/heads/*:refs/remotes/origin/*",
+    )
     refs = git(worktree, "for-each-ref", "--format=%(refname)", "refs/remotes/origin").splitlines()
     for ref in refs:
         if ref == "refs/remotes/origin/HEAD":

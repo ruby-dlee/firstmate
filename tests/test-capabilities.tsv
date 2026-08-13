@@ -1,4 +1,5 @@
 # Every behavior test declares whether it can reach a real Herdr lifecycle.
+agents-operating-contract.test.sh	hermetic
 bridge-cutover-python.test.sh	hermetic
 fm-account-directory.test.sh	hermetic
 fm-account-routing-a.test.sh	hermetic

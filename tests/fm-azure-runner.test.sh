@@ -151,7 +151,7 @@ private_snapshot_prepare_contract() {
 import argparse,importlib.util,json,pathlib,sys
 spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 repo=pathlib.Path(sys.argv[2]); bundle=pathlib.Path(sys.argv[3]); state_dir=pathlib.Path(sys.argv[4])
-env={"state_dir":state_dir,"home_binding":"sha256:"+"a"*64,"deployment_generation":"gen","prefix":"fmtest","subscription":"11111111-1111-4111-8111-111111111111","resource_group":"rg","owner":"owner"}
+env={"state_dir":state_dir,"home_binding":"sha256:"+"a"*64,"deployment_generation":"gen","prefix":"fmtest","subscription":"11111111-1111-4111-8111-111111111111","resource_group":"rg","owner":"owner","cost_admission_mode":m.STRICT_COST_ADMISSION_MODE,"cell_ordinal":None}
 m.ensure_state_dirs(env)
 head=m.git(repo,"rev-parse","HEAD").stdout.strip(); tree=m.git(repo,"rev-parse","HEAD^{tree}").stdout.strip()
 m.public_origin_proof=lambda *_a,**_k:{"remote":"https://github.com/Ruby-Labs/cloud-host-owner.git","default_ref":"refs/heads/main","default_head":"d"*40,"source_ref":"refs/heads/topic","source_head":head,"tree":tree}

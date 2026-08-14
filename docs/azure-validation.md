@@ -391,3 +391,14 @@ After this stack is released to public main and the operator has explicit billab
 
 A failed acceptance leg means Azure validation is not the default and does not authorize local fallback, weakened identity proof, shared daemon use, retained-cost deletion, or credential broadening.
 The exact failed leg, retained resources, and recovery action must be reported.
+
+## Live acceptance record
+
+The first complete no-mistakes pipeline run inside an isolated Azure
+validation cell executed on 2026-08-14 against this repository (run
+`01M00YX1QS5H608DPH6DFV7CDN`, generation azv-stage-c-013), and the first
+cell whose authenticated result recorded that success end to end followed
+the same day once the guest's outcome derivation was ground-truthed
+through generations 014 and 015. This section is itself the first change
+validated by a cell through the full push, pull request, and CI-green
+proof path.

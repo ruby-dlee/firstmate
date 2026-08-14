@@ -971,7 +971,11 @@ exit 3"
 }
 
 file_mode() {
-  stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%Lp' "$1"
+  else
+    stat -c '%a' "$1"
+  fi
 }
 
 # install_spawn_manifest <home> <case-dir> [<jq-filter>]: write the project

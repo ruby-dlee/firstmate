@@ -71,7 +71,7 @@ No available artifact distinguishes those branches for the two incidents.
 
 ## Remediation
 
-`bin/fm-author-identity-sweep.sh` reports modern Pi ship/scout metadata with the epoch and no non-empty identity.
+`bin/fm-author-identity-sweep.sh` reports modern Pi ship/scout metadata with the epoch and without exactly one non-empty identity.
 `bin/fm-bootstrap.sh` runs the read-only sweep at session start.
 The diagnostic is explicitly informational and records capture reliability without stopping healthy work.
 

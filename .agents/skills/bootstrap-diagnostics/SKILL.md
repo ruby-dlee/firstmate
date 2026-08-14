@@ -24,7 +24,7 @@ The inline rules in `AGENTS.md` section 3 still bind: detect, then consent, then
 - `MISSING_MANUAL: <tool> (instructions: <url>)` - tell the captain why the tool is required and give them the printed instructions URL, but do not pass the tool to `bin/fm-bootstrap.sh install`; wait for the captain to complete the manual installation, then rerun session start to confirm the dependency is present.
 - `BACKEND_INVALID: <name> (known: <names>)` - the resolved runtime backend has no verified dependency or lifecycle contract, so do not dispatch work until the invalid `FM_BACKEND` or `config/backend` value is corrected to one of the listed backends.
 - `ACCOUNT_ROUTING: invalid routing policy - <reason>` - the environment or `config/account-routing-mode` cannot resolve to exactly one of `off`, `observe`, or `enforce`; fix the reported source before dispatch because managed spawns will fail closed on the same policy error.
-- `AUTHOR_IDENTITY_CAPTURE_GAP: <id>: <reason>` - an existing modern Pi ship/scout carries the immutable launch epoch without a launch-bound author identity.
+- `AUTHOR_IDENTITY_CAPTURE_GAP: <id>: <reason>` - an existing modern Pi ship/scout carries the immutable launch epoch without exactly one non-empty launch-bound author identity.
   This is informational only: reviewer independence is structural through the separate reviewer account pool and different model, so the gap must not block spawn, review, validation, or merge.
   Keep the line as visibility into capture reliability and investigate repeated gaps as tooling health without stopping otherwise healthy work.
 - `NEEDS_GH_AUTH` - ask the captain to run `! gh auth login` (interactive; you cannot run it for them).

@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 # shellcheck source=tests/test-entry.sh
 . "$(dirname "$0")/test-entry.sh"
-# Contract, fake-Azure failure, restart, integrity, dispatch, and exact-cleanup
-# coverage for the private disposable Azure command runner.
 set -u
-
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-RUNNER="$ROOT/bin/fm-azure-runner.sh"
-DISPATCH="$ROOT/bin/fm-azure-runner-dispatch.sh"
 HOST="$ROOT/bin/fm-azure-runner.py"
+RUNNER="$ROOT/bin/fm-azure-runner.sh"
 GUEST="$ROOT/bin/fm-azure-runner-guest.sh"
 EXECUTOR="$ROOT/bin/fm-azure-runner-exec.py"
 TEMPLATE="$ROOT/docs/azure-runner/invocation.json"
@@ -20,1297 +16,687 @@ PE_GUID=33333333-3333-4333-8333-333333333333
 
 make_repo() {
   local path=$1
-  mkdir -p "$path"
-  git -C "$path" init -q -b main
+  mkdir -p "$path/tools/agent-fleet" "$path/declared"
+  git -C "$path" init -q -b topic
   git -C "$path" config user.name fixture
   git -C "$path" config user.email fixture@example.invalid
-  mkdir -p "$path/declared"
-  mkdir -p "$path/tools/agent-fleet"
   cp "$ROOT/tools/agent-fleet/uv.lock" "$path/tools/agent-fleet/uv.lock"
   printf 'locked\n' >"$path/declared/dependency.lock"
-  printf '# fixture\n' >"$path/README.md"
-  git -C "$path" add .
-  git -C "$path" commit -qm initial
+  git -C "$path" remote add origin https://github.com/Ruby-Labs/cloud-host-owner.git
+  git -C "$path" add . && git -C "$path" commit -qm initial
 }
 
 runner() {
-  local home=$1 fakebin=$2
-  shift 2
-  env \
-    PATH="$fakebin:$PATH" \
-    FM_HOME="$home" \
-    FM_AZURE_TENANT_ID="$TENANT" \
-    FM_AZURE_SUBSCRIPTION_ID="$SUB" \
-    FM_AZURE_NAMING_PREFIX=fmtest \
-    FM_AZURE_STORAGE_NAME=fmteststorage0001 \
-    FM_AZURE_OWNER_TAG=owner \
-    FM_AZURE_DEPLOYMENT_GENERATION=gen-one \
-    FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID="$PE_GUID" \
-    "$RUNNER" "$@"
+  local home=$1; shift
+  env FM_HOME="$home" FM_AZURE_TENANT_ID="$TENANT" FM_AZURE_SUBSCRIPTION_ID="$SUB" \
+    FM_AZURE_NAMING_PREFIX=fmtest FM_AZURE_STORAGE_NAME=fmteststorage0001 FM_AZURE_OWNER_TAG=owner \
+    FM_AZURE_DEPLOYMENT_GENERATION=gen-one FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID="$PE_GUID" "$RUNNER" "$@"
 }
 
-invocation_from() {
-  printf '%s\n' "$1" | awk -F'[ =]' '{for (i=1;i<=NF;i++) if ($i=="invocation") {print $(i+1); exit}}'
-}
-
-static_contract() {
-  python3 - "$TEMPLATE" "$HOST" "$GUEST" "$EXECUTOR" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-template = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-text = Path(sys.argv[1]).read_text(encoding="utf-8").lower()
-resources = template["resources"]
-assert len(resources) == 4
-nic = next(item for item in resources if item["type"] == "Microsoft.Network/networkInterfaces")
-vm = next(item for item in resources if item["type"] == "Microsoft.Compute/virtualMachines")
-safety_shutdown = next(item for item in resources if item["type"] == "Microsoft.Compute/virtualMachines/runCommands")
-ttl_schedule = next(item for item in resources if item["type"] == "Microsoft.DevTestLab/schedules")
-assert "publicipaddress" not in json.dumps(nic).lower()
-assert "identity" not in vm
-assert "ssh" not in json.dumps(vm["properties"]["osProfile"]).lower()
-assert "customdata" not in text
-assert "authorized_keys" not in text
-assert vm["properties"]["securityProfile"]["securityType"] == "TrustedLaunch"
-assert vm["properties"]["securityProfile"]["encryptionAtHost"] is True
-assert vm["properties"]["storageProfile"]["osDisk"]["deleteOption"] == "Detach"
-assert vm["properties"]["networkProfile"]["networkInterfaces"][0]["properties"]["deleteOption"] == "Detach"
-assert "shutdown -h now" in safety_shutdown["properties"]["source"]["script"]
-assert "expiryUtc" in template["parameters"]
-assert "expiryTimeOfDay" in template["parameters"]
-assert ttl_schedule["properties"]["taskType"] == "ComputeVmShutdownTask"
-assert ttl_schedule["properties"]["timeZoneId"] == "UTC"
-assert ttl_schedule["properties"]["targetResourceId"] == "[resourceId('Microsoft.Compute/virtualMachines', parameters('vmName'))]"
-host = Path(sys.argv[2]).read_text(encoding="utf-8")
-guest = Path(sys.argv[3]).read_text(encoding="utf-8")
-executor = Path(sys.argv[4]).read_text(encoding="utf-8")
-for required in ("request_digest", "command_digest", "snapshot_digest", "vm_instance_id", "boot_id", "expected_result_digest"):
-    assert required in host
-for required in ("MemoryMax", "MemorySwapMax=0", "TasksMax", "CPUQuota", "RuntimeMaxSec", "IPAddressDeny=any", "hidepid=2", "tc qdisc replace", "rate 1mbit", "max-filesize = 536870912", "BOOTSTRAP_NETWORK_BYTE_CEILING", "aggregate trusted-bootstrap network byte ceiling"):
-    assert required in guest
-assert "bootstrapEgressRateBitsPerSecond" in template["parameters"]
-assert "python3 -m pip" not in guest and "run_bootstrap_network pip" not in guest
-for required in ("timeout=timeout_seconds", "foundation_gate", "If-Match", "identities", "max_billable_lifetime_hours", "operation-ledger.json", "reservations.json"):
-    assert required in host
-for forbidden in ("GITHUB_TOKEN", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "AZURE_CLIENT_SECRET", "SSH_AUTH_SOCK"):
-    assert forbidden not in executor
-assert '"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' in executor
-command_helper = (Path(sys.argv[2]).parent / "fm-azure-runner-command.sh").read_text(encoding="utf-8")
-assert "curl" not in command_helper and "pip install" not in command_helper
-assert "uv 0.9.10" in command_helper and "0.11.0" in command_helper
+environment_mode_defaults() {
+  local home
+  home=$(mktemp -d)
+  env FM_HOME="$home" FM_AZURE_TENANT_ID="$TENANT" FM_AZURE_SUBSCRIPTION_ID="$SUB" \
+    FM_AZURE_NAMING_PREFIX=fmtest FM_AZURE_STORAGE_NAME=fmteststorage0001 FM_AZURE_OWNER_TAG=owner \
+    FM_AZURE_DEPLOYMENT_GENERATION=gen-one FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID="$PE_GUID" \
+    python3 - "$HOST" <<'PY'
+import importlib.util,os,sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+assert m.environment()["cost_admission_mode"]=="strict"
+assert m.environment()["operator_data_plane_ip"]==""
+os.environ["FM_AZURE_OPERATOR_DATA_PLANE_IP"]="203.0.113.10/32"
+assert m.environment()["operator_data_plane_ip"]=="203.0.113.10/32"
+os.environ.pop("FM_AZURE_OPERATOR_DATA_PLANE_IP")
+os.environ["FM_AZURE_RUNNER_MAX_CONCURRENCY"]="16"; assert m.environment()["max_concurrency"]==16
+os.environ["FM_AZURE_RUNNER_COST_ADMISSION_MODE"]="commissioning-bounded"; os.environ["FM_AZURE_RUNNER_CELL_ORDINAL"]="16"
+commissioning=m.environment(); assert commissioning["cell_ordinal"]==16 and m.runner_sku_for_environment(commissioning)=="Standard_D4ds_v6"
+os.environ["FM_AZURE_RUNNER_SKU"]="Standard_D4as_v6"
+try: m.runner_sku_for_environment(commissioning)
+except m.RunnerError: pass
+else: raise AssertionError("commissioning accepted an SKU override outside its exact cell")
+os.environ.pop("FM_AZURE_RUNNER_SKU"); os.environ.pop("FM_AZURE_RUNNER_COST_ADMISSION_MODE")
+os.environ.pop("FM_AZURE_RUNNER_CELL_ORDINAL")
+os.environ["FM_AZURE_RUNNER_MAX_CONCURRENCY"]="17"
+try: m.environment()
+except m.RunnerError: pass
+else: raise AssertionError("environment accepted concurrency above 16")
 PY
-  pass "invocation template and guest protocol preserve private identity-less bounded execution"
+  rm -rf "$home"
+  pass "normal environment defaults to strict without commissioning evidence or confirmation variables"
 }
 
-dispatch_contract() {
-  local tmp marker out rc
-  fm_test_tmproot_into tmp fm-azure-dispatch
-  marker="$tmp/local"
-  FM_AZURE_RUNNER_REMOTE_CLASSES='' "$DISPATCH" lint -- bash -c "printf local >'${marker}'"
-  [ "$(<"$marker")" = local ] || fail "dispatch did not preserve local default"
-  rm -f "$marker"
-  FM_AZURE_RUNNER_REMOTE_CLASSES=lint=validation-standard \
-    FM_AZURE_RUNNER_LOCAL_RECOVERY_CLASSES=lint \
-    "$DISPATCH" lint -- bash -c "printf recovery >'${marker}'" >/dev/null 2>&1
-  [ "$(<"$marker")" = recovery ] || fail "explicit local recovery did not run"
-  rm -f "$marker"
-  rc=0
-  out=$(FM_AZURE_RUNNER_REMOTE_CLASSES=lint=validation-standard \
-    "$DISPATCH" lint -- bash -c "printf forbidden >'${marker}'" 2>&1) || rc=$?
-  [ "$rc" -ne 0 ] || fail "remote selection ran without required fencing identity"
-  [ ! -e "$marker" ] || fail "remote dispatch failure silently reran the command locally"
-  assert_contains "$out" "FM_AZURE_RUNNER_TASK" "remote dispatch did not fail closed on missing task binding"
-  assert_grep "  test: 'bin/fm-no-mistakes-test-command.sh'" "$ROOT/.no-mistakes.yaml" "no-mistakes test must use the local/Azure split owner"
-  assert_grep 'tests/run.sh --skip-herdr' "$ROOT/bin/fm-no-mistakes-test-command.sh" "Azure test shard must select the sealed non-Herdr path"
-  assert_grep 'herdr-lab|herdr-mixed' "$ROOT/bin/fm-no-mistakes-test-command.sh" "local complement must select every Herdr declaration"
-  pass "command dispatch is local by default, explicit for recovery, and never falls back after remote selection"
+storage_network_access_contract() {
+  python3 - "$HOST" <<'PY' || fail "runner storage network-access contract failed"
+import importlib.util,inspect,sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+main={"properties":{"publicNetworkAccess":"Disabled","networkAcls":{"ipRules":[]}}}
+control={"properties":{"publicNetworkAccess":"Disabled","networkAcls":{}}}
+assert m.storage_network_access_is_exact(main,"")
+assert m.storage_network_access_is_exact(control,"")
+operator_ip="203.0.113.10/32"
+for resource in (main,control):
+ resource["properties"]["publicNetworkAccess"]="Enabled"
+ resource["properties"]["networkAcls"]["ipRules"]=[{"value":operator_ip,"action":"Allow"}]
+ assert m.storage_network_access_is_exact(resource,operator_ip)
+ resource["properties"]["networkAcls"]["ipRules"].append({"value":"203.0.113.11/32","action":"Allow"})
+ assert not m.storage_network_access_is_exact(resource,operator_ip)
+source=inspect.getsource(m.foundation_gate)
+assert 'storage_network_access_is_exact(storage, env["operator_data_plane_ip"])' in source
+assert 'storage_network_access_is_exact(control, env["operator_data_plane_ip"])' in source
+PY
+  pass "runner gates main and control storage to disabled or one exact operator /32 rule"
+}
+
+static_private_controller_contract() {
+  python3 - "$TEMPLATE" "$HOST" "$GUEST" <<'PY' || fail "private controller static contract failed"
+import json, pathlib, sys
+template=json.loads(pathlib.Path(sys.argv[1]).read_text()); host=pathlib.Path(sys.argv[2]).read_text(); guest=pathlib.Path(sys.argv[3]).read_text()
+vm=next(r for r in template["resources"] if r["type"]=="Microsoft.Compute/virtualMachines")
+nic=next(r for r in template["resources"] if r["type"]=="Microsoft.Network/networkInterfaces")
+assert template["parameters"]["controllerIdentityId"]["type"] == "string"
+assert set(template["parameters"]["vmSize"]["allowedValues"]) >= {"Standard_D4as_v7","Standard_D4as_v6","Standard_D4s_v6","Standard_D4ads_v7","Standard_D4ads_v6","Standard_E4as_v7","Standard_E4as_v6","Standard_D4ds_v6"}
+assert vm["identity"]["type"] == "UserAssigned"
+assert "controllerIdentityId" in json.dumps(vm["identity"])
+assert "publicipaddress" not in json.dumps(nic).lower()
+assert "ssh" not in json.dumps(vm["properties"]["osProfile"]).lower()
+assert "customdata" not in json.dumps(template).lower()
+for value in ("PrivateNetwork=yes","RestrictAddressFamilies=AF_UNIX","IPAddressDeny=any","CapabilityBoundingSet=CAP_SETUID CAP_SETGID","AmbientCapabilities=","NoNewPrivileges=yes"):
+    assert value in guest
+run_at=guest.index("systemd-run --quiet")
+input_token_at=guest.index("metadata/identity/oauth2/token")
+output_token_at=guest.rindex("metadata/identity/oauth2/token")
+assert input_token_at < guest.index('rm -f "$TOKEN_FILE"',input_token_at) < run_at < output_token_at
+assert '/usr/bin/python3 "$EXECUTOR"' in guest
+assert "https://files.pythonhosted.org/packages/*.whl" in guest
+assert 'repository"].get("source_ancestors", [])' in guest
+assert 'git -C /work/repo fetch --depth=1 origin "$ancestor"' in guest
+assert 'fetch_exact "$url"' in guest and '--location' not in guest[guest.index('while IFS=$\'\\t\' read -r url'):guest.index('done <"$BASE/wheels.tsv"')]
+assert "protectedParameters" not in host
+assert "generate-sas" not in host
+assert "controller_identity_client_id" in host
+assert "If-Match=" in host and "runner-cost-reservation" in host
+start=host.index("def dispatch_prepared")
+assert host.index("shared_capacity_reserve(env, state, cost)", start) < host.index("create_vm(env, state)", start)
+assert host.index("lease.renew_and_assert()", start) < host.index("create_vm(env, state)", start)
+cleanup=host[host.index("def cleanup(env, state):"):start]
+assert cleanup.index('"run-command-execute"') < cleanup.index('if "vm" in by_key') < cleanup.index('"ttl-schedule" in by_key') < cleanup.index("shared_capacity_release(env, state)")
+PY
+  pass "private controller has exact UAMI, no public ingress/SAS, isolated command, trusted post-command uploader, and safe cleanup order"
 }
 
 prepare_contract() {
-  local tmp repo home fakebin out invocation state staged_uv
-  fm_test_tmproot_into tmp fm-azure-prepare
-  repo="$tmp/repo"
-  home="$tmp/home"
-  fakebin=$(fm_fakebin "$tmp")
-  make_repo "$repo"
-  mkdir -p "$home"
-  out=$(cd "$repo" && runner "$home" "$fakebin" prepare \
-    --task task-one --generation generation-one --resource-class behavior-heavy \
-    --dependency declared/dependency.lock --artifact build/report.json -- bash -lc 'printf ok') || fail "prepare failed: $out"
-  invocation=$(invocation_from "$out")
-  [ -n "$invocation" ] || fail "prepare did not print invocation"
-  state="$home/state/azure-runner/$invocation.json"
-  [ -f "$state" ] || fail "prepare did not persist state"
-  python3 - "$state" "$repo" <<'PY' || fail "prepared request identity assertions failed"
-import hashlib
-import json
-import datetime as dt
-from pathlib import Path
-import subprocess
-import sys
-import tarfile
-
-state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-repo = Path(sys.argv[2])
-request = state["request"]
-unsigned = dict(request)
-supplied = unsigned.pop("request_digest")
-canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-assert supplied == "sha256:" + hashlib.sha256(canonical).hexdigest()
-assert request["repository"]["commit"] == subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
-assert request["repository"]["tree"] == subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"], text=True).strip()
-assert request["command"]["argv"] == ["bash", "-lc", "printf ok"]
-assert request["dependencies"][0]["path"] == "declared/dependency.lock"
-assert request["artifacts"] == ["build/report.json"]
-assert request["limits"]["memory_bytes"] == 14 * 1024**3
-assert request["limits"]["network_bytes"] == 0
-assert request["limits"]["sku"] == "Standard_D4as_v6"
-assert request["limits"]["sku_family"] == "standardDav6Family"
-assert request["lineage_root_invocation"] == state["invocation"]
-created = dt.datetime.fromisoformat(request["created_at"].replace("Z", "+00:00"))
-deadline = dt.datetime.fromisoformat(request["compute_deallocation_deadline"].replace("Z", "+00:00"))
-assert deadline - created == dt.timedelta(hours=23)
-assert "FM_AZURE_SUBSCRIPTION_ID" not in json.dumps(request)
-assert state["resources"]["vm_id"].endswith("/" + state["resources"]["vm_name"])
-assert state["resources"]["nic_id"].endswith("/" + state["resources"]["nic_name"])
-assert state["resources"]["os_disk_id"].endswith("/" + state["resources"]["os_disk_name"])
-assert state["resources"]["ttl_schedule_id"].endswith("/" + state["resources"]["ttl_schedule_name"])
-input_path = Path(state["input_path"])
-assert state["input_digest"] == "sha256:" + hashlib.sha256(input_path.read_bytes()).hexdigest()
-with tarfile.open(input_path, "r:gz") as archive:
-    assert set(archive.getnames()) == {"request.json", "snapshot.bundle", "runner-exec.py", "shellcheck.tar.xz", "uv.tar.gz", "agent-fleet-wheelhouse.tar"}
-assert request["protocol"]["agent_fleet_python"]["lock_digest"].startswith("sha256:")
-assert {item["name"] for item in request["protocol"]["agent_fleet_python"]["wheels"]} == {"iniconfig", "packaging", "pluggy", "pygments", "pytest", "ruff"}
+  python3 - "$HOST" <<'PY'
+import importlib.util, pathlib, types, sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+remote="https://github.com/Ruby-Labs/cloud-host-owner.git"; head="a"*40; candidate="b"*40; tree="c"*40; ancestor="d"*40
+class Result:
+    def __init__(self,stdout="",returncode=0): self.stdout=stdout; self.returncode=returncode
+calls=[]
+pr_ref="refs/pull/130/head"
+def public_git(_repo,*args,check=True):
+    calls.append(args)
+    if args[:2]==("init","--bare"): return Result()
+    if args[:2]==("ls-remote","--symref"): return Result("ref: refs/heads/main\tHEAD\n{}\tHEAD\n".format(head))
+    if args[:1]==("ls-remote",):
+        ref=args[-1]
+        if ref=="refs/heads/main": return Result("{}\t{}\n".format(head,ref))
+        if ref in ("refs/heads/fm/feature",pr_ref): return Result("{}\t{}\n".format(candidate,ref))
+        return Result("{}\t{}\n".format(head,ref))
+    if args[:1]==("fetch",): return Result()
+    if args[:2]==("rev-parse","--verify"):
+        return Result((candidate if args[-1].endswith("public-source") else head)+"\n")
+    if args[:2]==("merge-base","--is-ancestor"):
+        return Result(returncode=0 if args[2:]==(ancestor,candidate) else 1)
+    if args[:2]==("cat-file","-t"):
+        return Result("commit\n" if args[2] in {candidate,ancestor} else "tree\n")
+    if args[:1]==("rev-parse",) and args[1].endswith("^{tree}"): return Result(tree+"\n")
+    raise AssertionError(args)
+m.public_git=public_git
+try: m.public_origin_proof(pathlib.Path("/repo"),remote,candidate)
+except m.RunnerError as exc: assert "not reachable" in str(exc)
+else: raise AssertionError("unmerged branch accepted without an exact source ref")
+proof=m.public_origin_proof(pathlib.Path("/repo"),remote,candidate,source_ref="refs/heads/fm/feature")
+assert proof["source_ref"]=="refs/heads/fm/feature" and proof["source_head"]==candidate and proof["tree"]==tree
+# An advertised PR-head ref admits the exact candidate with bound ancestors.
+pr_proof=m.public_origin_proof(pathlib.Path("/repo"),remote,candidate,source_ref=pr_ref,source_ancestors=(ancestor,))
+assert pr_proof["source_ref"]==pr_ref and pr_proof["source_head"]==candidate
+assert pr_proof["source_ancestors"]==[ancestor] and pr_proof["tree"]==tree
+# A mutable pull merge ref and unsafe shapes refuse before any network use.
+for bad in ("refs/pull/130/merge","refs/heads/a..b","refs/heads/x.lock"):
+    try: m.validate_public_source_ref(bad)
+    except m.RunnerError: pass
+    else: raise AssertionError("unsafe source ref accepted: "+bad)
+try: m.public_origin_proof(pathlib.Path("/repo"),remote,candidate,source_ref=pr_ref,source_ancestors=("e"*40,))
+except m.RunnerError as exc: assert "fetched commit" in str(exc)
+else: raise AssertionError("unfetched source ancestor accepted")
+def local_git(_repo,*args,check=True):
+    if args[:2]==("cat-file","-t"): return Result(("commit" if args[-1]==candidate else "tree")+"\n")
+    if args[:1]==("rev-parse",): return Result(tree+"\n")
+    raise AssertionError(args)
+m.git=local_git
+private=m.public_origin_proof(pathlib.Path("/repo"),remote,candidate,source_ref="refs/heads/fm/unpushed",private_source=True)
+assert private["source_ref"]=="refs/heads/fm/unpushed" and private["source_head"]==candidate and private["tree"]==tree
+assert ("fetch","--no-tags","--force",remote,"+refs/heads/main:refs/fm-azure-runner/public-main") in calls
+assert ("fetch","--no-tags","--force",remote,"+refs/heads/fm/feature:refs/fm-azure-runner/public-source") in calls
+assert ("fetch","--no-tags","--force",remote,"+{}:refs/fm-azure-runner/public-source".format(pr_ref)) in calls
+# A stale tracking ref is irrelevant; proof uses fresh advertisement/fetch.
+assert not any("origin/main" in part for call in calls for part in call)
 PY
-  mkdir -p "$tmp/offline-wheelhouse" "$tmp/offline-target" "$tmp/staged-uv"
-  tar -xOf "$home/state/azure-runner/payloads/$invocation/input.tar.gz" agent-fleet-wheelhouse.tar >"$tmp/wheelhouse.tar"
-  tar -xf "$tmp/wheelhouse.tar" -C "$tmp/offline-wheelhouse"
-  tar -xOf "$home/state/azure-runner/payloads/$invocation/input.tar.gz" uv.tar.gz >"$tmp/uv.tar.gz"
-  tar -xf "$tmp/uv.tar.gz" -C "$tmp/staged-uv"
-  if [ "$(uname -s)" = Linux ]; then
-    staged_uv=$(find "$tmp/staged-uv" -type f -name uv -print -quit)
-    [ -n "$staged_uv" ] || fail "pinned staged uv executable was absent"
-    chmod +x "$staged_uv"
-    UV_CACHE_DIR="$tmp/empty-uv-cache" UV_OFFLINE=1 "$staged_uv" pip install \
-      --target "$tmp/offline-target" --python-platform x86_64-manylinux_2_17 \
-      --offline --no-index --find-links "$tmp/offline-wheelhouse" pytest==9.1.1 ruff==0.15.21 >/dev/null || \
-      fail "fresh empty-cache Linux target could not resolve the staged locked wheel closure offline"
-    [ -f "$tmp/offline-target/pytest/__init__.py" ] && [ -d "$tmp/offline-target/ruff-0.15.21.dist-info" ] || \
-      fail "fresh offline wheel closure did not install the locked pytest/ruff environment"
-  else
-    python3 - "$tmp/offline-wheelhouse" <<'PY' || fail "staged Linux wheel closure was malformed"
-from pathlib import Path
-import sys
-import zipfile
-wheels = sorted(Path(sys.argv[1]).glob("*.whl"))
-assert len(wheels) == 6
-assert {path.name.split("-", 1)[0].replace("_", "-") for path in wheels} == {
-    "iniconfig", "packaging", "pluggy", "pygments", "pytest", "ruff",
-}
-for wheel in wheels:
-    with zipfile.ZipFile(wheel) as archive:
-        assert any(name.endswith(".dist-info/METADATA") for name in archive.namelist())
-PY
-  fi
-  printf 'dirty\n' >"$repo/untracked"
-  if (cd "$repo" && runner "$home" "$fakebin" prepare --task task-two --generation generation-two -- echo no) >/dev/null 2>&1; then
-    fail "prepare accepted an untracked file"
-  fi
-  [ "$(find "$home/state/azure-runner" -name 'azr-*.json' | wc -l | tr -d ' ')" -eq 1 ] || fail "dirty refusal created invocation state"
-  pass "prepare binds a clean commit/tree/bundle/command/dependency request and refuses dirty snapshots"
+  pass "prepare binds fresh public main and admits only an exact advertised branch or PR-head ref with bound ancestors"
 }
 
-executor_semantics_unit() {
-  local tmp repo request output uid gid rc
-  fm_test_tmproot_into tmp fm-azure-executor
+private_snapshot_prepare_contract() {
+  local tmp repo bundle
+  fm_test_tmproot_into tmp fm-azure-private-snapshot
   repo="$tmp/repo"
   make_repo "$repo"
-  uid=$(id -u)
-  gid=$(id -g)
-  request="$tmp/request.json"
-  python3 - "$request" <<'PY'
-import hashlib
-import json
-import sys
-
-request = {
-    "invocation": "azr-aaaaaaaaaaaa",
-    "attempt": 1,
-    "fence": "sha256:" + "1" * 64,
-    "repository": {"snapshot_digest": "sha256:" + "2" * 64, "commit": "a" * 40, "tree": "b" * 40},
-    "command": {"argv": ["python3", "-c", "import sys; print('out'); print('err', file=sys.stderr); raise SystemExit(7)"]},
-    "limits": {
-        "cpu_cores": 1, "memory_bytes": 1024**3, "pid_max": 64,
-        "disk_bytes": 1024**3, "log_bytes": 1024, "artifact_bytes": 0,
-        "network_bytes": 0, "wall_seconds": 10,
-    },
+  bundle="$tmp/snapshot.bundle"
+  git -C "$repo" bundle create "$bundle" refs/heads/topic
+  python3 - "$HOST" "$repo" "$bundle" "$tmp/state" <<'PY' || fail "private parent snapshot prepare failed"
+import argparse,importlib.util,json,pathlib,sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+repo=pathlib.Path(sys.argv[2]); bundle=pathlib.Path(sys.argv[3]); state_dir=pathlib.Path(sys.argv[4])
+env={"state_dir":state_dir,"home_binding":"sha256:"+"a"*64,"deployment_generation":"gen","prefix":"fmtest","subscription":"11111111-1111-4111-8111-111111111111","resource_group":"rg","owner":"owner","cost_admission_mode":m.STRICT_COST_ADMISSION_MODE,"cell_ordinal":None}
+m.ensure_state_dirs(env)
+head=m.git(repo,"rev-parse","HEAD").stdout.strip(); tree=m.git(repo,"rev-parse","HEAD^{tree}").stdout.strip()
+m.public_origin_proof=lambda *_a,**_k:{"remote":"https://github.com/Ruby-Labs/cloud-host-owner.git","default_ref":"refs/heads/main","default_head":"d"*40,"source_ref":"refs/heads/topic","source_head":head,"tree":tree}
+args=argparse.Namespace(repo=str(repo),task="azv-aaaaaaaaaaaa-s1",generation="round-aaaaaaaaaaaa",resource_class="behavior-heavy",source_ref="refs/heads/topic",private_snapshot_bundle=str(bundle),capacity_parent="azv-aaaaaaaaaaaa",capacity_reservation_vcpus=40,wall_seconds=None,dependency=[],artifact=[],command=["true"],invocation="azr-aaaaaaaaaaaa")
+state=m.prepare(env,args)
+r=state["request"]["repository"]
+assert r["source_mode"]=="private-parent-bundle" and r["source_head"]==head and r["tree"]==tree
+assert r["snapshot_bytes"]==bundle.stat().st_size and r["input_blob"].endswith("/snapshot.bundle")
+assert pathlib.Path(state["input_path"]).parent.joinpath("snapshot.bundle").read_bytes()==bundle.read_bytes()
+# A bundle with any source ref other than the exact declared one refuses.
+bad=repo.parent/"bad.bundle"; m.run(["git","-C",str(repo),"branch","extra","HEAD"]); m.run(["git","-C",str(repo),"bundle","create",str(bad),"refs/heads/topic","refs/heads/extra"])
+args.invocation="azr-bbbbbbbbbbbb"; args.private_snapshot_bundle=str(bad)
+try: m.prepare(env,args)
+except m.RunnerError as exc: assert "only the exact source-ref head" in str(exc)
+else: raise AssertionError("multi-ref private snapshot accepted")
+PY
+  pass "private parent prepare binds one exact source ref/head/tree/bundle/blob without requiring an early push"
 }
-canonical=lambda value: json.dumps(value,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
-request["command_digest"]="sha256:"+hashlib.sha256(canonical(request["command"])).hexdigest()
-request["request_digest"]="sha256:"+hashlib.sha256(canonical(request)).hexdigest()
-open(sys.argv[1],"wb").write(canonical(request)+b"\n")
-PY
-  output="$tmp/output"
-  printf '44444444-4444-4444-8444-444444444444\n' >"$tmp/boot-id"
-  FM_AZURE_RUNNER_TEST_NO_DROP=1 FM_AZURE_RUNNER_BOOT_ID_PATH="$tmp/boot-id" "$EXECUTOR" "$request" "$repo" "$output" "$uid" "$gid" /vm/id vm-instance >/dev/null || fail "executor did not publish an ordinary command failure"
-  python3 - "$output/result.json" "$output/stdout.log" "$output/stderr.log" <<'PY'
-import json,sys
-r=json.load(open(sys.argv[1]))
-assert r["exit_code"] == 7 and r["timed_out"] is False and r["signal"] is None
-assert open(sys.argv[2]).read()=="out\n"
-assert open(sys.argv[3]).read()=="err\n"
-PY
-  rm -rf "$output"
+
+executor_credential_adversary() {
+  local tmp repo request output uid gid
+  fm_test_tmproot_into tmp fm-azure-exec-adversary
+  repo="$tmp/repo"; make_repo "$repo"; request="$tmp/request.json"; output="$tmp/output"; uid=$(id -u); gid=$(id -g)
   python3 - "$request" <<'PY'
 import hashlib,json,sys
-p=sys.argv[1]; r=json.load(open(p)); r["command"]={"argv":["python3","-c","import time; time.sleep(30)"]}; r["limits"]["wall_seconds"]=1
-canon=lambda v:json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()
-r["command_digest"]="sha256:"+hashlib.sha256(canon(r["command"])).hexdigest(); r.pop("request_digest",None); r["request_digest"]="sha256:"+hashlib.sha256(canon(r)).hexdigest(); open(p,"wb").write(canon(r)+b"\n")
+command={"argv":["python3","-c","import os,pathlib; forbidden=[k for k in os.environ if any(x in k for x in ('TOKEN','SAS','SECRET','CREDENTIAL','CLIENT_ID','SUBSCRIPTION','TENANT'))]; targets=[]\nfor p in pathlib.Path('/dev/fd').iterdir():\n try: targets.append(os.readlink(p))\n except OSError: pass\nraise SystemExit(0 if not forbidden and not any(any(x in t.lower() for x in ('token','sas','credential','secret')) for t in targets) else 91)"]}
+r={"invocation":"azr-aaaaaaaaaaaa","attempt":1,"fence":"sha256:"+"1"*64,"repository":{"snapshot_digest":"sha256:"+"2"*64,"commit":"a"*40,"tree":"b"*40},"command":command,"limits":{"cpu_cores":1,"memory_bytes":2**30,"pid_max":64,"disk_bytes":2**30,"log_bytes":1024,"artifact_bytes":0,"network_bytes":0,"wall_seconds":10}}
+canon=lambda v:json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode(); r["command_digest"]="sha256:"+hashlib.sha256(canon(command)).hexdigest(); r["request_digest"]="sha256:"+hashlib.sha256(canon(r)).hexdigest(); open(sys.argv[1],"wb").write(canon(r)+b"\n")
 PY
-  FM_AZURE_RUNNER_TEST_NO_DROP=1 FM_AZURE_RUNNER_BOOT_ID_PATH="$tmp/boot-id" "$EXECUTOR" "$request" "$repo" "$output" "$uid" "$gid" /vm/id vm-instance >/dev/null || fail "executor did not publish timeout semantics"
-  python3 - "$output/result.json" <<'PY'
-import json,sys
-r=json.load(open(sys.argv[1])); assert r["exit_code"]==124 and r["timed_out"] is True and r["signal"] in (15,9)
+  printf '44444444-4444-4444-8444-444444444444\n' >"$tmp/boot"
+  env AZURE_CLIENT_SECRET=must-not-pass FM_AZURE_RUNNER_TEST_NO_DROP=1 FM_AZURE_RUNNER_BOOT_ID_PATH="$tmp/boot" \
+    /usr/bin/python3 "$EXECUTOR" "$request" "$repo" "$output" "$uid" "$gid" /vm/id vm-instance >/dev/null || \
+    fail "credential adversary escaped sanitized executor"
+  [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$output/result.json")" = 0 ] || fail "credential/fd adversary observed inherited authority"
+  pass "repository command receives no Azure/token/SAS/secret environment or inherited credential descriptor"
+}
+
+linux_systemd_drop_integration() {
+  [ "$(uname -s)" = Linux ] || { pass "Linux systemd uid/capability integration is CI-owned"; return; }
+  if ! command -v systemd-run >/dev/null || ! sudo -n true >/dev/null 2>&1; then
+    fail "Linux systemd integration requires passwordless sudo"
+  fi
+  local tmp repo controller_base work_base request output uid gid tracked_digest staged_digest systemd_rc
+  fm_test_tmproot_into tmp fm-azure-systemd-drop
+  repo="$tmp/repo"; make_repo "$repo"
+  controller_base=$(sudo -n mktemp -d /var/lib/fm-azure-runner-test.XXXXXXXX)
+  work_base=$(sudo -n mktemp -d /var/lib/fm-azure-runner-work.XXXXXXXX)
+  request="$controller_base/request.json"; output="$controller_base/output"
+  uid=$(id -u nobody); gid=$(id -g nobody)
+  sudo -n install -d -m 0700 -o root -g root "$controller_base"
+  sudo -n chmod 0755 "$work_base"
+  sudo -n install -d -m 0755 -o "$uid" -g "$gid" "$work_base/repo"
+  sudo -n cp -R "$repo/." "$work_base/repo/"
+  sudo -n chown -R "$uid:$gid" "$work_base/repo"
+  sudo -n install -m 0600 -o root -g root "$EXECUTOR" "$controller_base/runner-exec.py"
+  tracked_digest=$(sha256sum "$EXECUTOR" | awk '{print $1}')
+  staged_digest=$(sudo -n sha256sum "$controller_base/runner-exec.py" | awk '{print $1}')
+  [ "$tracked_digest" = "$staged_digest" ] || fail "root-staged executor digest differs from tracked executor"
+  python3 - "$tmp/request.json" "$uid" "$gid" <<'PY'
+import hashlib,json,sys
+uid=int(sys.argv[2]); gid=int(sys.argv[3])
+code="""import os,pathlib
+s={}
+for line in pathlib.Path('/proc/self/status').read_text().splitlines():
+    if ':' in line:
+        k,v=line.split(':',1); s[k]=v.strip()
+assert os.getuid()==%d and os.getgid()==%d and os.getgroups()==[]
+assert all(int(s[k],16)==0 for k in ('CapEff','CapPrm','CapAmb'))
+assert s['NoNewPrivs']=='1'
+"""%(uid,gid)
+command={"argv":["python3","-c",code]}
+r={"invocation":"azr-aaaaaaaaaaaa","attempt":1,"fence":"sha256:"+"1"*64,"repository":{"snapshot_digest":"sha256:"+"2"*64,"commit":"a"*40,"tree":"b"*40},"command":command,"limits":{"cpu_cores":1,"memory_bytes":2**30,"pid_max":64,"disk_bytes":2**30,"log_bytes":1024,"artifact_bytes":0,"network_bytes":0,"wall_seconds":10}}
+canon=lambda v:json.dumps(v,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode(); r["command_digest"]="sha256:"+hashlib.sha256(canon(command)).hexdigest(); r["request_digest"]="sha256:"+hashlib.sha256(canon(r)).hexdigest(); open(sys.argv[1],"wb").write(canon(r)+b"\n")
 PY
-  pass "trusted executor preserves ordinary failure logs/exit and explicit timeout/signal semantics"
+  printf '44444444-4444-4444-8444-444444444444\n' >"$tmp/boot"
+  sudo -n install -m 0600 -o root -g root "$tmp/request.json" "$request"
+  sudo -n install -m 0600 -o root -g root "$tmp/boot" "$controller_base/boot"
+  chmod 0755 "$tmp" "$repo"
+  # The broker intentionally lacks CAP_DAC_OVERRIDE. Pinned Python reads the
+  # staged executor and request as root inside the root-traversable BASE; only
+  # the child needs access to the repository and its already-open log pipes.
+  systemd_rc=0
+  sudo -n systemd-run --quiet --wait --collect --pipe \
+    --property=NoNewPrivileges=yes --property=PrivateNetwork=yes --property=RestrictAddressFamilies=AF_UNIX \
+    --property=IPAddressDeny=any --property='CapabilityBoundingSet=CAP_SETUID CAP_SETGID' \
+    --property=AmbientCapabilities= --property=RestrictSUIDSGID=yes \
+    env FM_AZURE_RUNNER_BOOT_ID_PATH="$controller_base/boot" /usr/bin/python3 "$controller_base/runner-exec.py" \
+    "$request" "$work_base/repo" "$output" "$uid" "$gid" /vm/id vm-instance >/dev/null || systemd_rc=$?
+  [ "$systemd_rc" -eq 0 ] && \
+    [ "$(sudo python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["exit_code"])' "$output/result.json")" = 0 ] || \
+    systemd_rc=1
+  sudo -n find "$controller_base" -xdev -mindepth 1 -delete
+  sudo -n rmdir "$controller_base"
+  sudo -n find "$work_base" -xdev -mindepth 1 -delete
+  sudo -n rmdir "$work_base"
+  [ "$systemd_rc" -eq 0 ] || fail "actual Linux/systemd broker could not run the secured child"
+  pass "actual Linux/systemd broker drops uid/gid/groups and repository child has empty capabilities/no-new-privileges/networkless"
 }
 
-request_integrity_unit() {
-  python3 - "$EXECUTOR" <<'PY'
-import importlib.util
-import json
-from pathlib import Path
-import sys
-
-spec = importlib.util.spec_from_file_location("runner_exec", sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-request = {
-    "command": {"argv": ["sh", "-c", "exit 7"]},
-    "limits": {
-        "cpu_cores": 1, "memory_bytes": 1024**3, "pid_max": 16,
-        "disk_bytes": 1024**3, "log_bytes": 1024, "artifact_bytes": 0,
-        "network_bytes": 0, "wall_seconds": 1,
-    },
-}
-request["command_digest"] = "sha256:" + module.hashlib.sha256(module.canonical_bytes(request["command"])).hexdigest()
-request["request_digest"] = "sha256:" + module.hashlib.sha256(module.canonical_bytes(request)).hexdigest()
-argv, limits = module.verify_request(request)
-assert argv[-1] == "exit 7" and limits["pid_max"] == 16
-request["command"]["argv"][-1] = "exit 0"
-try:
-    module.verify_request(request)
-except ValueError as exc:
-    assert "request digest mismatch" in str(exc)
-else:
-    raise AssertionError("tampered command was accepted")
+management_fencing_unit() {
+  python3 - "$HOST" <<'PY'
+import datetime as dt, importlib.util, sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+env={"subscription":"sub","resource_group":"rg","control_storage":"stctl","deployment_generation":"gen","state_dir":__import__('pathlib').Path('/tmp'),"azure_operation_count":0}
+state={"invocation":"azr-aaaaaaaaaaaa","request":{"fence":"sha256:"+"a"*64}}
+metadata={"schema":"fm-azure-runner-control-v1","deploymentgeneration":"gen","lockowner":"","lockfence":"","lockexpiry":""}; etag=['E1']
+def az(_env,args,**kwargs):
+    if args[:2]==["resource","show"]: return {"etag":etag[0],"properties":{"metadata":dict(metadata)}},0,""
+    if args[:2]==["rest","--method"]:
+        header=next(x for x in args if x.startswith("If-Match="))
+        if header != "If-Match="+etag[0]: return None,1,"412"
+        body=__import__('json').loads(args[args.index("--body")+1]); metadata.clear(); metadata.update(body["properties"]["metadata"]); etag[0]="E"+str(int(etag[0][1:])+1); return {"etag":etag[0]},0,""
+    raise AssertionError(args)
+m.az_command=az; m.time.sleep=lambda _:None
+a=m.ManagementAdmissionLease(env,state); a.__enter__()
+metadata.update({"lockowner":"azr-bbbbbbbbbbbb","lockfence":"b"*64,"lockexpiry":m.iso_utc(m.now_utc()+dt.timedelta(seconds=60))}); etag[0]="E99"
+try: a.renew_and_assert()
+except m.RunnerError: pass
+else: raise AssertionError("stale writer renewed successor lock")
+assert a.failed.is_set()
+# A hung/throwing renewal is sticky and admission cannot locally outlive it.
+b=m.ManagementAdmissionLease(env,state); b.expires_at=m.time.monotonic()+1
+b._read=lambda: (_ for _ in ()).throw(m.RunnerError("timeout"))
+try: b.renew_and_assert()
+except m.RunnerError: pass
+else: raise AssertionError("timeout renewal passed")
+assert b.failed.is_set()
+try: b.assert_held()
+except m.RunnerError: pass
+else: raise AssertionError("failed renewal was forgotten")
+# Eight contenders may read one free ETag, but exactly one stale snapshot can win the ARM CAS.
+metadata.clear(); metadata.update({"schema":"fm-azure-runner-control-v1","deploymentgeneration":"gen","lockowner":"","lockfence":"","lockexpiry":""}); etag[0]="E200"
+contenders=[]
+for i in range(8):
+    invocation="azr-{:012x}".format(i+1); fence=("{:x}".format(i+1))*64
+    contender=m.ManagementAdmissionLease(env,{"invocation":invocation,"request":{"fence":"sha256:"+fence}})
+    snapshot,snapshot_etag=contender._read(); snapshot.update({"lockowner":invocation,"lockfence":fence,"lockexpiry":m.iso_utc(m.now_utc()+dt.timedelta(seconds=60))})
+    contenders.append((contender,snapshot_etag,snapshot))
+winners=[]
+for contender,snapshot_etag,snapshot in contenders:
+    try: contender._cas(snapshot_etag,snapshot); winners.append(contender.state["invocation"])
+    except m.RunnerError: pass
+assert len(winners)==1 and metadata["lockowner"]==winners[0]
 PY
-  pass "guest executor rejects a command changed after request digest binding"
+  pass "management ETag CAS rejects stale successor clobber, admits one of eight interleaved writers, and fails hung renewal sticky"
 }
 
-write_fake_az_admission() {
-  local fakebin=$1 mode=$2 log=$3
-  cat >"$fakebin/az" <<'SH'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >>"$AZ_LOG"
-case "$1 $2" in
-  "account show")
-    printf '{"id":"%s","tenantId":"%s","state":"Enabled"}\n' "$FM_AZURE_SUBSCRIPTION_ID" "$FM_AZURE_TENANT_ID"
-    ;;
-  "resource show")
-    args="$*"
-    base="/subscriptions/$FM_AZURE_SUBSCRIPTION_ID/resourceGroups/rg-firstmate-pilot-eastus-001/providers"
-    common='"tags":{"workload":"firstmate","deployment-generation":"gen-one","cleanup-owner":"owner"}'
-    case "$args" in
-      *Microsoft.Storage/storageAccounts/fmteststorage0001*)
-        printf '{"id":"%s/Microsoft.Storage/storageAccounts/fmteststorage0001","location":"eastus",%s,"properties":{"publicNetworkAccess":"Disabled","allowSharedKeyAccess":false,"allowBlobPublicAccess":false,"supportsHttpsTrafficOnly":true,"minimumTlsVersion":"TLS1_2","networkAcls":{"defaultAction":"Deny","bypass":"None"}}}\n' "$base" "$common" ;;
-      *Microsoft.Network/virtualNetworks/vnet-fmtest-eus/subnets/snet-validation-shards*)
-        printf '{"id":"%s/Microsoft.Network/virtualNetworks/vnet-fmtest-eus/subnets/snet-validation-shards","properties":{"addressPrefix":"10.42.7.0/24","networkSecurityGroup":{"id":"%s/Microsoft.Network/networkSecurityGroups/nsg-fmtest-elastic-isolated"},"natGateway":{"id":"%s/Microsoft.Network/natGateways/nat-fmtest-eus"},"privateEndpointNetworkPolicies":"Enabled"}}\n' "$base" "$base" "$base" ;;
-      *Microsoft.Network/virtualNetworks/vnet-fmtest-eus*)
-        printf '{"id":"%s/Microsoft.Network/virtualNetworks/vnet-fmtest-eus","location":"eastus",%s,"properties":{}}\n' "$base" "$common" ;;
-      *Microsoft.Network/networkSecurityGroups/nsg-fmtest-elastic-isolated*)
-        printf '{"id":"%s/Microsoft.Network/networkSecurityGroups/nsg-fmtest-elastic-isolated",%s,"properties":{"securityRules":[{"name":"deny-public-inbound","properties":{"direction":"Inbound","access":"Deny","sourceAddressPrefix":"Internet"}},{"name":"deny-vnet-cross-compartment-inbound","properties":{"direction":"Inbound","access":"Deny","sourceAddressPrefix":"VirtualNetwork"}}]}}\n' "$base" "$common" ;;
-      *Microsoft.Network/natGateways/nat-fmtest-eus*)
-        printf '{"id":"%s/Microsoft.Network/natGateways/nat-fmtest-eus","location":"eastus",%s,"properties":{}}\n' "$base" "$common" ;;
-      *Microsoft.Network/privateEndpoints/pe-fmtest-blob/privateDnsZoneGroups/default*)
-        printf '{"id":"%s/Microsoft.Network/privateEndpoints/pe-fmtest-blob/privateDnsZoneGroups/default","properties":{"privateDnsZoneConfigs":[{"properties":{"privateDnsZoneId":"%s/Microsoft.Network/privateDnsZones/privatelink.blob.core.windows.net"}}]}}\n' "$base" "$base" ;;
-      *Microsoft.Network/privateEndpoints/pe-fmtest-blob*)
-        printf '{"id":"%s/Microsoft.Network/privateEndpoints/pe-fmtest-blob",%s,"properties":{"subnet":{"id":"%s/Microsoft.Network/virtualNetworks/vnet-fmtest-eus/subnets/snet-private-endpoints"},"networkInterfaces":[{"id":"%s/Microsoft.Network/networkInterfaces/pe-fmtest-blob.nic"}],"privateLinkServiceConnections":[{"properties":{"privateLinkServiceId":"%s/Microsoft.Storage/storageAccounts/fmteststorage0001","groupIds":["blob"],"privateLinkServiceConnectionState":{"status":"Approved"}}}]}}\n' "$base" "$common" "$base" "$base" "$base" ;;
-      *) exit 3 ;;
-    esac
-    ;;
-  "vm list-skus")
-    if [ "$AZ_MODE" = restricted ]; then
-      printf '[{"name":"Standard_D4as_v6","restrictions":[{"reasonCode":"NotAvailableForSubscription"}],"capabilities":[]}]\n'
-    else
-      printf '[{"name":"Standard_D4as_v6","restrictions":[],"capabilities":[{"name":"vCPUsAvailable","value":"4"},{"name":"MemoryGB","value":"16"},{"name":"CpuArchitectureType","value":"x64"},{"name":"HyperVGenerations","value":"V1,V2"},{"name":"TrustedLaunchDisabled","value":"False"},{"name":"EncryptionAtHostSupported","value":"True"}]}]\n'
-    fi
-    ;;
-  "vm list-usage")
-    printf '[{"name":{"value":"cores"},"limit":128,"currentValue":0},{"name":{"value":"standardDav6Family"},"limit":10,"currentValue":0}]\n'
-    ;;
-  "vm list") printf '[]\n' ;;
-  "rest --method")
-    if printf '%s' "$*" | grep -q 'prices.azure.com'; then
-      printf '{"Items":[{"unitOfMeasure":"1 Hour","productName":"Linux","meterName":"Standard","retailPrice":0.477}]}\n'
-    elif [ "$AZ_MODE" = budget ]; then
-      printf '{"properties":{"columns":[{"name":"PreTaxCost"}],"rows":[[1001.0]]}}\n'
-    else
-      printf '{"properties":{"columns":[{"name":"PreTaxCost"}],"rows":[[0.0]]}}\n'
-    fi
-    ;;
-  *)
-    echo "unexpected fake az call: $*" >&2
-    exit 88
-    ;;
-esac
-SH
-  chmod +x "$fakebin/az"
-  export AZ_MODE=$mode AZ_LOG=$log
-}
-
-admission_failures() {
-  local mode tmp repo home fakebin log out rc
-  for mode in restricted budget; do
-    fm_test_tmproot_into tmp "fm-azure-$mode"
-    repo="$tmp/repo"
-    home="$tmp/home"
-    fakebin=$(fm_fakebin "$tmp")
-    log="$tmp/az.log"
-    make_repo "$repo"
-    mkdir -p "$home"
-    : >"$log"
-    write_fake_az_admission "$fakebin" "$mode" "$log"
-    rc=0
-    out=$(cd "$repo" && runner "$home" "$fakebin" run --confirm-run --confirm-subscription "$SUB" \
-      --task task-one --generation gen-one --resource-class validation-standard -- true 2>&1) || rc=$?
-    [ "$rc" -eq 125 ] || fail "$mode admission failure returned $rc: $out"
-    if [ "$mode" = restricted ]; then
-      assert_contains "$out" "SKU is unavailable or restricted" "restricted SKU did not fail closed"
-    else
-      assert_contains "$out" "budget pressure stops new invocations" "budget pressure did not fail closed"
-    fi
-    assert_not_contains "$(<"$log")" "deployment group create" "$mode failure created compute"
-    assert_not_contains "$(<"$log")" "storage blob upload" "$mode failure staged input"
-  done
-  unset AZ_MODE AZ_LOG
-  pass "fake Azure SKU and budget failures refuse before staging or compute"
-}
-
-write_fake_az_absence() {
-  local fakebin=$1 log=$2
-  cat >"$fakebin/az" <<'SH'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >>"$AZ_LOG"
-case "$1 $2" in
-  "account show") printf '{"id":"%s","tenantId":"%s","state":"Enabled"}\n' "$FM_AZURE_SUBSCRIPTION_ID" "$FM_AZURE_TENANT_ID" ;;
-  "resource show")
-    args="$*"
-    base="/subscriptions/$FM_AZURE_SUBSCRIPTION_ID/resourceGroups/rg-firstmate-pilot-eastus-001/providers"
-    common='"tags":{"workload":"firstmate","deployment-generation":"gen-one","cleanup-owner":"owner"}'
-    case "$args" in
-      *Microsoft.Storage/storageAccounts/fmteststorage0001*)
-        printf '{"id":"%s/Microsoft.Storage/storageAccounts/fmteststorage0001","location":"eastus",%s,"properties":{"publicNetworkAccess":"Disabled","allowSharedKeyAccess":false,"allowBlobPublicAccess":false,"supportsHttpsTrafficOnly":true,"minimumTlsVersion":"TLS1_2","networkAcls":{"defaultAction":"Deny","bypass":"None"}}}\n' "$base" "$common" ;;
-      *Microsoft.Network/virtualNetworks/vnet-fmtest-eus/subnets/snet-validation-shards*)
-        printf '{"id":"%s/Microsoft.Network/virtualNetworks/vnet-fmtest-eus/subnets/snet-validation-shards","properties":{"addressPrefix":"10.42.7.0/24","networkSecurityGroup":{"id":"%s/Microsoft.Network/networkSecurityGroups/nsg-fmtest-elastic-isolated"},"natGateway":{"id":"%s/Microsoft.Network/natGateways/nat-fmtest-eus"},"privateEndpointNetworkPolicies":"Enabled"}}\n' "$base" "$base" "$base" ;;
-      *Microsoft.Network/virtualNetworks/vnet-fmtest-eus*)
-        printf '{"id":"%s/Microsoft.Network/virtualNetworks/vnet-fmtest-eus","location":"eastus",%s,"properties":{}}\n' "$base" "$common" ;;
-      *Microsoft.Network/networkSecurityGroups/nsg-fmtest-elastic-isolated*)
-        printf '{"id":"%s/Microsoft.Network/networkSecurityGroups/nsg-fmtest-elastic-isolated",%s,"properties":{"securityRules":[{"name":"deny-public-inbound","properties":{"direction":"Inbound","access":"Deny","sourceAddressPrefix":"Internet"}},{"name":"deny-vnet-cross-compartment-inbound","properties":{"direction":"Inbound","access":"Deny","sourceAddressPrefix":"VirtualNetwork"}}]}}\n' "$base" "$common" ;;
-      *Microsoft.Network/natGateways/nat-fmtest-eus*)
-        printf '{"id":"%s/Microsoft.Network/natGateways/nat-fmtest-eus","location":"eastus",%s,"properties":{}}\n' "$base" "$common" ;;
-      *Microsoft.Network/privateEndpoints/pe-fmtest-blob/privateDnsZoneGroups/default*)
-        printf '{"id":"%s/Microsoft.Network/privateEndpoints/pe-fmtest-blob/privateDnsZoneGroups/default","properties":{"privateDnsZoneConfigs":[{"properties":{"privateDnsZoneId":"%s/Microsoft.Network/privateDnsZones/privatelink.blob.core.windows.net"}}]}}\n' "$base" "$base" ;;
-      *Microsoft.Network/privateEndpoints/pe-fmtest-blob*)
-        printf '{"id":"%s/Microsoft.Network/privateEndpoints/pe-fmtest-blob",%s,"properties":{"subnet":{"id":"%s/Microsoft.Network/virtualNetworks/vnet-fmtest-eus/subnets/snet-private-endpoints"},"networkInterfaces":[{"id":"%s/Microsoft.Network/networkInterfaces/pe-fmtest-blob.nic"}],"privateLinkServiceConnections":[{"properties":{"privateLinkServiceId":"%s/Microsoft.Storage/storageAccounts/fmteststorage0001","groupIds":["blob"],"privateLinkServiceConnectionState":{"status":"Approved"}}}]}}\n' "$base" "$common" "$base" "$base" "$base" ;;
-      *) exit 3 ;;
-    esac
-    ;;
-  "storage blob") printf '{"exists":false}\n' ;;
-  "vm show") exit 3 ;;
-  "vm list") printf '[]\n' ;;
-  "resource show") exit 3 ;;
-  "resource list") printf '[]\n' ;;
-  *) echo "unexpected absence fake: $*" >&2; exit 89 ;;
-esac
-SH
-  chmod +x "$fakebin/az"
-  export AZ_LOG=$log
-}
-
-missing_vm_fences_attempt() {
-  local tmp repo home fakebin log out invocation state rc
-  fm_test_tmproot_into tmp fm-azure-absent
-  repo="$tmp/repo"
-  home="$tmp/home"
-  fakebin=$(fm_fakebin "$tmp")
-  log="$tmp/az.log"
-  make_repo "$repo"
-  mkdir -p "$home"
-  out=$(cd "$repo" && runner "$home" "$fakebin" prepare --task task-one --generation gen-one -- true)
-  invocation=$(invocation_from "$out")
-  state="$home/state/azure-runner/$invocation.json"
-  python3 - "$state" "$SUB" <<'PY'
-import json
-import sys
-p=sys.argv[1]
-s=json.load(open(p))
-s["phase"]="command-submitted"
-s["resources"].update({
- "vm_id":"/subscriptions/%s/resourceGroups/rg-firstmate-pilot-eastus-001/providers/Microsoft.Compute/virtualMachines/vm-one"%sys.argv[2],
- "vm_instance_id":"33333333-3333-4333-8333-333333333333",
- "nic_id":"/subscriptions/%s/resourceGroups/rg-firstmate-pilot-eastus-001/providers/Microsoft.Network/networkInterfaces/nic-one"%sys.argv[2],
- "os_disk_id":"/subscriptions/%s/resourceGroups/rg-firstmate-pilot-eastus-001/providers/Microsoft.Compute/disks/disk-one"%sys.argv[2],
-})
-json.dump(s,open(p,"w"),separators=(",",":"))
+effective_rbac_adversaries() {
+  python3 - "$HOST" <<'PY'
+import importlib.util, sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+env={"subscription":"sub","resource_group":"rg","prefix":"prefix"}
+seen=[]
+def az(_env,args,**kwargs):
+    seen.append(args)
+    return ([{"scope":"/subscriptions/sub","roleDefinitionId":"/role/owner","principalId":"group"}],0,"")
+m.az_command=az
+for label in ("direct","parent inherited","group derived"):
+    try: m.require_zero_effective_rbac(env,"principal",label)
+    except m.RunnerError: pass
+    else: raise AssertionError(label+" assignment accepted")
+assert all("--include-inherited" in args and "--include-groups" in args and "--all" in args for args in seen)
+m.az_command=lambda *_a,**_k: ({"not":"a list"},0,"")
+try: m.require_zero_effective_rbac(env,"principal","unreadable")
+except m.RunnerError: pass
+else: raise AssertionError("unreadable effective RBAC accepted")
+reservation_id="/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-prefix-rsv-aaaaaaaaaaaa"
+identity={"id":reservation_id,"location":"eastus","etag":"E","properties":{"principalId":"p"},"tags":{"workload":"firstmate","firstmate-role":"runner-cost-reservation","deployment-generation":"gen","cleanup-owner":"owner","invocation-binding":"azr-aaaaaaaaaaaa","fence-digest":"a"*64,"lineage-root":"azr-aaaaaaaaaaaa","parent-invocation":"none","amount-microusd":"1","cost-admission-mode":"strict","cell-ordinal":"none","selected-sku":"Standard_D4as_v6","sku-family":"standardDav6Family","reserved-at":"2026-01-01T00:00:00Z","compute-deadline":"2026-01-02T00:00:00Z","cleanup-verified-at":"none","reservation-principal":"p"}}
+env.update({"deployment_generation":"gen","owner":"owner"})
+calls=[]
+def reservation_az(_env,args,**kwargs):
+    calls.append(args)
+    if args[:2]==["identity","list"]: return ([identity],0,"")
+    if args[:2]==["resource","show"]: return (identity,0,"")
+    if args[:3]==["role","assignment","list"]: return ([{"scope":"/subscriptions/sub"}],0,"")
+    raise AssertionError(args)
+m.az_command=reservation_az
+try: m.list_management_reservations(env)
+except m.RunnerError: pass
+else: raise AssertionError("authorized reservation principal accepted")
+assert any(args[:3]==["role","assignment","list"] for args in calls)
+m.az_command=lambda *_a,**_k: ([{"identity":{"userAssignedIdentities":{"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-prefix-rsv-aaaaaaaaaaaa":{}}},"tags":{},"powerState":"VM running"}],0,"")
+try: m.active_runner_vms(env)
+except m.RunnerError: pass
+else: raise AssertionError("VM-attached reservation identity accepted")
 PY
-  : >"$log"
-  write_fake_az_absence "$fakebin" "$log"
-  rc=0
-  out=$(runner "$home" "$fakebin" resume --invocation "$invocation" 2>&1) || rc=$?
-  [ "$rc" -eq 125 ] || fail "missing VM resume returned $rc: $out"
-  assert_contains "$out" "retry requires a new fenced attempt" "missing VM did not fence duplicate execution"
-  [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["phase"])' "$state")" = absent-fenced ] || fail "missing VM was not recorded absent-fenced"
-  assert_not_contains "$(<"$log")" "deployment group create" "resume duplicated an absent command"
-  unset AZ_LOG
-  pass "missing VM is fenced absent and cannot create a duplicate invocation"
+  pass "direct, inherited, group, unreadable, replacement, and VM-attached reservation RBAC adversaries refuse"
 }
 
-foundation_binding_matrix() {
-  python3 - "$HOST" <<'PY' || fail "complete foundation identity/private-network matrix failed"
-import importlib.util
-import json
-import sys
-
-spec = importlib.util.spec_from_file_location("runner_host_foundation", sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-env = {
-    "subscription": "sub", "resource_group": "rg", "prefix": "prefix", "storage": "store", "vnet": "vnet-prefix-eus",
-    "subnet": "snet-validation-shards", "elastic_nsg": "nsg-prefix-elastic-isolated", "nat": "nat-prefix-eus",
-    "blob_private_endpoint": "pe-prefix-blob", "blob_private_endpoint_nic": "nic-prefix-pe-blob",
-    "blob_private_dns_zone": "privatelink.blob.core.windows.net",
-    "blob_private_endpoint_nic_resource_guid": "33333333-3333-4333-8333-333333333333",
-    "deployment_generation": "gen-one", "owner": "owner", "azure_operation_count": 0,
+validation_parent_capacity_contract() {
+  python3 - "$HOST" <<'PY'
+import importlib.util,sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+env={"subscription":"sub","resource_group":"rg","deployment_generation":"gen","owner":"owner"}
+state={"request":{"capacity_parent":"azv-aaaaaaaaaaaa","capacity_reservation_vcpus":40,"home_binding":"sha256:"+"a"*64}}
+parent={"powerState":"VM running","tags":{"workload":"firstmate","firstmate-role":"validation-cell","lifecycle":"elastic-scale-to-zero","deployment-generation":"gen","cleanup-owner":"owner","home-binding":"sha256:"+"a"*64,"validation-cell":"azv-aaaaaaaaaaaa","reserved-vcpus":"40"}}
+children=[{"powerState":"VM running","tags":{"firstmate-role":"validation-shard","capacity-parent":"azv-aaaaaaaaaaaa"}} for _ in range(7)]
+m.az_command=lambda *_a,**_k: ([parent]+children,0,"")
+m.validation_capacity_parent_gate(env,state)
+children.append({"powerState":"VM running","tags":{"firstmate-role":"validation-shard","capacity-parent":"azv-aaaaaaaaaaaa"}})
+try: m.validation_capacity_parent_gate(env,state)
+except m.RunnerError as exc: assert "no reserved processor slot" in str(exc)
+else: raise AssertionError("ninth child exceeded the exact 40-vCPU parent shape")
+base=m.itemized_cost_bound(.25,24,m.RESOURCE_CLASSES["behavior-heavy"])
+child=m.itemized_cost_bound(.25,24,m.RESOURCE_CLASSES["behavior-heavy"],parent_managed=True)
+assert base["categories"]["foundation_shared_meter_reserve"]==210.0
+assert child["categories"]["foundation_shared_meter_reserve"]==0.0
+assert base["total"]-child["total"]==210.0
+PY
+  pass "validation parent proof bounds child count and removes only the already-reserved shared meter"
 }
-def rid(provider, kind, name):
-    return "/subscriptions/sub/resourceGroups/rg/providers/{}/{}/{}".format(provider, kind, name)
-common = {"workload": "firstmate", "deployment-generation": "gen-one", "cleanup-owner": "owner"}
-store_id = rid("Microsoft.Storage", "storageAccounts", "store")
-vnet_id = rid("Microsoft.Network", "virtualNetworks", "vnet-prefix-eus")
-subnet_id = vnet_id + "/subnets/snet-validation-shards"
-nsg_id = rid("Microsoft.Network", "networkSecurityGroups", "nsg-prefix-elastic-isolated")
-nat_id = rid("Microsoft.Network", "natGateways", "nat-prefix-eus")
-pip_id = rid("Microsoft.Network", "publicIPAddresses", "pip-prefix-nat-eus")
-pe_id = rid("Microsoft.Network", "privateEndpoints", "pe-prefix-blob")
-dns_id = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Network/privateDnsZones/privatelink.blob.core.windows.net"
-dns_link_id = dns_id + "/virtualNetworkLinks/firstmate-vnet"
-pe_nic_id = rid("Microsoft.Network", "networkInterfaces", "nic-prefix-pe-blob")
-resources = {
-    store_id.lower(): {"id": store_id, "location": "eastus", "kind": "StorageV2", "sku": {"name": "Standard_ZRS"}, "tags": common, "properties": {"accessTier": "Hot", "defaultToOAuthAuthentication": True, "publicNetworkAccess": "Disabled", "allowSharedKeyAccess": False, "allowBlobPublicAccess": False, "supportsHttpsTrafficOnly": True, "minimumTlsVersion": "TLS1_2", "networkAcls": {"defaultAction": "Deny", "bypass": "None"}}},
-    vnet_id.lower(): {"id": vnet_id, "location": "eastus", "tags": common, "properties": {"addressSpace": {"addressPrefixes": ["10.42.0.0/16"]}}},
-    subnet_id.lower(): {"id": subnet_id, "properties": {"addressPrefix": "10.42.7.0/24", "networkSecurityGroup": {"id": nsg_id}, "natGateway": {"id": nat_id}, "privateEndpointNetworkPolicies": "Enabled"}},
-    (vnet_id + "/subnets/snet-private-endpoints").lower(): {"id": vnet_id + "/subnets/snet-private-endpoints", "properties": {"addressPrefix": "10.42.3.0/27", "privateEndpointNetworkPolicies": "Disabled"}},
-    nsg_id.lower(): {"id": nsg_id, "location": "eastus", "tags": common, "properties": {"securityRules": [{"name": "deny-public-inbound", "properties": {"priority": 100, "direction": "Inbound", "access": "Deny", "protocol": "*", "sourcePortRange": "*", "destinationPortRange": "*", "sourceAddressPrefix": "Internet", "destinationAddressPrefix": "*"}}, {"name": "deny-vnet-cross-compartment-inbound", "properties": {"priority": 110, "direction": "Inbound", "access": "Deny", "protocol": "*", "sourcePortRange": "*", "destinationPortRange": "*", "sourceAddressPrefix": "VirtualNetwork", "destinationAddressPrefix": "*"}}]}},
-    pip_id.lower(): {"id": pip_id, "location": "eastus", "sku": {"name": "Standard"}, "tags": common, "properties": {"publicIPAllocationMethod": "Static", "publicIPAddressVersion": "IPv4", "idleTimeoutInMinutes": 4}},
-    nat_id.lower(): {"id": nat_id, "location": "eastus", "sku": {"name": "Standard"}, "tags": common, "properties": {"idleTimeoutInMinutes": 10, "publicIpAddresses": [{"id": pip_id}]}},
-    pe_id.lower(): {"id": pe_id, "location": "eastus", "tags": common, "properties": {"subnet": {"id": vnet_id + "/subnets/snet-private-endpoints"}, "networkInterfaces": [{"id": pe_nic_id}], "privateLinkServiceConnections": [{"name": "blob", "properties": {"privateLinkServiceId": store_id, "groupIds": ["blob"], "privateLinkServiceConnectionState": {"status": "Approved"}}}]}},
-    pe_nic_id.lower(): {"id": pe_nic_id, "tags": common, "properties": {"resourceGuid": "33333333-3333-4333-8333-333333333333", "privateEndpoint": {"id": pe_id}, "ipConfigurations": [{"properties": {"subnet": {"id": vnet_id + "/subnets/snet-private-endpoints"}}}]}},
-    dns_id.lower(): {"id": dns_id, "location": "global", "tags": common},
-    dns_link_id.lower(): {"id": dns_link_id, "location": "global", "properties": {"registrationEnabled": False, "virtualNetwork": {"id": vnet_id}}},
-    (pe_id + "/privateDnsZoneGroups/default").lower(): {"id": pe_id + "/privateDnsZoneGroups/default", "properties": {"privateDnsZoneConfigs": [{"name": "blob", "properties": {"privateDnsZoneId": dns_id}}]}},
-}
-def run_gate(values, output_id=pe_nic_id, output_guid="33333333-3333-4333-8333-333333333333"):
-    def fake_az(env_arg, args, **kwargs):
-        if args[0:3] == ["deployment", "sub", "show"]:
-            return {"properties": {"outputs": {
-                "blobPrivateEndpointNicId": {"value": output_id},
-                "blobPrivateEndpointNicResourceGuid": {"value": output_guid},
-            }}}, 0, ""
-        resource_id = args[args.index("--ids") + 1].lower()
-        return json.loads(json.dumps(values[resource_id])), 0, ""
-    module.az_command = fake_az
-    module.foundation_gate(env)
-run_gate(resources)
-for resource_id, mutation in (
-    (store_id, lambda r: r["tags"].update({"cleanup-owner": "foreign"})),
-    (store_id, lambda r: r["properties"].update({"publicNetworkAccess": "Enabled"})),
-    (vnet_id, lambda r: r.update({"id": vnet_id + "-foreign"})),
-    (vnet_id, lambda r: r["properties"]["addressSpace"].update({"addressPrefixes": ["10.99.0.0/16"]})),
-    (subnet_id, lambda r: r["properties"]["networkSecurityGroup"].update({"id": nsg_id + "-foreign"})),
-    (subnet_id, lambda r: r["properties"]["natGateway"].update({"id": nat_id + "-foreign"})),
-    (vnet_id + "/subnets/snet-private-endpoints", lambda r: r["properties"].update({"privateEndpointNetworkPolicies": "Enabled"})),
-    (nsg_id, lambda r: r["properties"].update({"securityRules": []})),
-    (nsg_id, lambda r: r["properties"]["securityRules"].append({"name": "allow-public", "properties": {"priority": 90, "direction": "Inbound", "access": "Allow", "protocol": "*", "sourcePortRange": "*", "destinationPortRange": "*", "sourceAddressPrefix": "Internet", "destinationAddressPrefix": "*"}})),
-    (pip_id, lambda r: r["sku"].update({"name": "Basic"})),
-    (nat_id, lambda r: r["tags"].update({"deployment-generation": "foreign"})),
-    (nat_id, lambda r: r["properties"]["publicIpAddresses"][0].update({"id": "/foreign"})),
-    (pe_id, lambda r: r["properties"]["subnet"].update({"id": "/foreign"})),
-    (pe_id, lambda r: r["properties"]["privateLinkServiceConnections"][0].update({"name": "foreign"})),
-    (pe_id, lambda r: r["properties"]["privateLinkServiceConnections"][0]["properties"]["privateLinkServiceConnectionState"].update({"status": "Rejected"})),
-    (pe_id, lambda r: r["properties"].update({"networkInterfaces": []})),
-    (pe_id, lambda r: r["properties"]["networkInterfaces"][0].update({"id": "/foreign"})),
-    (pe_nic_id, lambda r: r["tags"].update({"deployment-generation": "foreign"})),
-    (pe_nic_id, lambda r: r["properties"].update({"resourceGuid": "foreign-guid"})),
-    (pe_nic_id, lambda r: r["properties"]["privateEndpoint"].update({"id": "/foreign"})),
-    (dns_id, lambda r: r.update({"id": dns_id + "-foreign"})),
-    (dns_link_id, lambda r: r["properties"]["virtualNetwork"].update({"id": "/foreign"})),
-    (pe_id + "/privateDnsZoneGroups/default", lambda r: r["properties"]["privateDnsZoneConfigs"][0].update({"name": "foreign"})),
-    (pe_id + "/privateDnsZoneGroups/default", lambda r: r["properties"]["privateDnsZoneConfigs"][0]["properties"].update({"privateDnsZoneId": "/foreign"})),
-):
-    changed = json.loads(json.dumps(resources))
-    mutation(changed[resource_id.lower()])
-    try:
-        run_gate(changed)
-    except module.RunnerError:
-        pass
-    else:
-        raise AssertionError("foreign foundation binding accepted: {}".format(resource_id))
-for output_id, output_guid in (("/foreign", "33333333-3333-4333-8333-333333333333"), (pe_nic_id, "44444444-4444-4444-8444-444444444444")):
-    try:
-        run_gate(resources, output_id=output_id, output_guid=output_guid)
-    except module.RunnerError:
-        pass
-    else:
-        raise AssertionError("foreign deployment-output NIC binding was accepted")
 
-# A same-name NIC replacement plus same-name deployment rerun cannot rewrite
-# the independently accepted resourceGuid anchor.
-coupled = json.loads(json.dumps(resources))
-coupled[pe_nic_id.lower()]["properties"]["resourceGuid"] = "44444444-4444-4444-8444-444444444444"
-try:
-    run_gate(coupled, output_guid="44444444-4444-4444-8444-444444444444")
-except module.RunnerError:
-    pass
-else:
-    raise AssertionError("coupled live NIC and mutable deployment-output replacement was accepted")
-
-# Dispatch proves immediately before staging and again immediately before compute create.
-sequence = []
-module.scope_gate = lambda e: None
-module.sku_quota_gate = lambda e, limits: None
-module.budget_gate = lambda e, limits: {"max_increment": 1}
-module.foundation_gate = lambda e: sequence.append("foundation")
-module.active_runner_vms = lambda e: []
-module.reserve_budget = lambda e, s, lease, limits: sequence.append("reservation-write") or {"max_increment": 1}
-module.storage_upload = lambda *args, **kwargs: sequence.append("stage")
-module.blob_sas = lambda *args, **kwargs: "https://capability"
-module.create_vm = lambda e, s: sequence.append("create-vm")
-module.create_run_command = lambda *args, **kwargs: (_ for _ in ()).throw(module.RunnerError("stop after create"))
-module.transition = lambda e, s, phase, note=None, **updates: s.update({"phase": phase, **updates})
-class FakeLease:
-    def __init__(self, *args): pass
+cost_retry_unit() {
+  python3 - "$HOST" <<'PY'
+import datetime as dt, email.message, importlib.util, io, json, pathlib, tempfile, types, urllib.error, sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+env={"subscription":"sub","resource_group":"rg","state_dir":pathlib.Path(tempfile.mkdtemp()),"azure_operation_count":0,"home_binding":"sha256:"+"a"*64,"deployment_generation":"gen"}
+m.record_azure_operation=lambda *_:None; m.run=lambda *a,**k:types.SimpleNamespace(stdout="token\n")
+headers=email.message.Message(); headers["x-ms-ratelimit-microsoft.costmanagement-qpu-retry-after"]="2"
+throttle=urllib.error.HTTPError("https://management.azure.com/x",429,"throttle",headers,io.BytesIO())
+class Response:
+    headers={"Date":__import__('email').utils.format_datetime(m.now_utc())}
     def __enter__(self): return self
-    def __exit__(self, *args): pass
-    def assert_held(self): sequence.append("lease-held")
-    def renew_and_assert(self): sequence.append("lease-renewed")
-module.AdmissionLease = FakeLease
-state = {
-    "invocation": "azr-aaaaaaaaaaaa", "parent_invocation": None,
-    "request": {
-        "limits": {"wall_seconds": 3600}, "fence": "sha256:fence",
-        "lineage_root_invocation": "azr-aaaaaaaaaaaa",
-        "compute_deallocation_deadline": "2099-01-01T00:00:00Z",
-    },
-    "phase": "prepared", "input_path": "/input",
-    "staging": {"input_blob": "in", "output_blob": "out"},
-}
-try:
-    module.dispatch_prepared({"subscription": "sub", "max_concurrency": 1}, state, "sub")
-except module.RunnerError as exc:
-    assert "stop after create" in str(exc)
-else:
-    raise AssertionError("dispatch fixture did not stop")
-assert sequence[sequence.index("reservation-write") + 1] == "foundation"
-create_index = sequence.index("create-vm")
-assert sequence[create_index - 1] == "lease-renewed"
-assert sequence[create_index + 1] == "lease-held"
-
-# An expired or unrenewable admission owner is rejected synchronously before
-# the first compute mutation, even if its background renewal thread failed late.
-sequence.clear()
-class ExpiredLease(FakeLease):
-    def renew_and_assert(self):
-        raise module.RunnerError("runner lease expiry safety margin exhausted")
-module.AdmissionLease = ExpiredLease
-expired_state = json.loads(json.dumps(state))
-expired_state["phase"] = "prepared"
-try:
-    module.dispatch_prepared({"subscription": "sub", "max_concurrency": 1}, expired_state, "sub")
-except module.RunnerError as exc:
-    assert "expiry safety margin" in str(exc)
-else:
-    raise AssertionError("expired lease reached compute creation")
-assert "create-vm" not in sequence
+    def __exit__(self,*_): pass
+    def read(self): return b'{"properties":{"columns":[],"rows":[]}}'
+calls=[throttle,Response()]; sleeps=[]
+def urlopen(*_a,**_k):
+    item=calls.pop(0)
+    if isinstance(item,Exception): raise item
+    return item
+m.urllib.request.urlopen=urlopen; m.time.sleep=lambda seconds:sleeps.append(seconds)
+result=m.cost_http_query(env,"query","https://management.azure.com/x",{"type":"Usage"})
+assert result["properties"]["rows"]==[] and sleeps==[2]
+# Only exact body/endpoint bindings can read the authoritative success cache.
+body=m.canonical_bytes({"type":"Usage"}); digest="sha256:"+m.sha256_bytes(body); key=m.sha256_bytes(("query\0https://management.azure.com/x\0"+digest).encode())
+assert m.load_cost_cache(env,key,"query",digest) is not None
+assert m.load_cost_cache(env,key,"forecast",digest) is None
+assert m.COST_RETRY_DEADLINE_SECONDS==900 and m.COST_CACHE_MAX_AGE_SECONDS==14400
 PY
-  pass "foundation exact owner/resource/subnet/NSG/NAT/private-endpoint/DNS matrix and mutation-boundary reproof pass"
+  pass "Cost Management retry is bounded, honors both Azure guidance headers, and only permits a short exact authoritative cache"
 }
 
-audit_blocker_regressions() {
-  python3 - "$HOST" <<'PY' || fail "complete audit-blocker adversarial matrix failed"
-import importlib.util
-import json
-import subprocess
-import sys
-import tempfile
-import threading
-import time
-from pathlib import Path
-
-spec = importlib.util.spec_from_file_location("runner_host", sys.argv[1])
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-
-try:
-    module.run([sys.executable, "-c", "import time; time.sleep(2)"], timeout_seconds=0.01)
-except module.RunnerError as exc:
-    assert "bounded" in str(exc)
-else:
-    raise AssertionError("host subprocess deadline was not enforced")
-
-# A delayed dispatch cannot create compute inside Azure's documented 30-minute
-# schedule-change window plus the complete bounded deployment call.
-original_now_utc = module.now_utc
-fixed_now = original_now_utc()
-stale_state = {
-    "request": {
-        "compute_deallocation_deadline": module.iso_utc(
-            fixed_now + module.dt.timedelta(
-                seconds=module.AZURE_SCHEDULE_MINIMUM_LEAD_SECONDS
-                + module.LOCAL_COMMAND_TIMEOUT_SECONDS
-            )
-        )
-    }
-}
-module.now_utc = lambda: fixed_now
-module.az_command = lambda *args, **kwargs: (_ for _ in ()).throw(
-    AssertionError("stale schedule lead reached Azure compute creation")
-)
-try:
-    module.create_vm({}, stale_state)
-except module.RunnerError as exc:
-    assert "30-minute activation window" in str(exc)
-else:
-    raise AssertionError("slow dispatch could slip the TTL schedule into the next day")
-module.now_utc = original_now_utc
-
-state = {
-    "invocation": "azr-aaaaaaaaaaaa",
-    "request": {
-        "home_binding": "sha256:" + "0" * 64,
-        "task": "task-one",
-        "generation": "gen-one",
-        "fence": "sha256:" + "1" * 64,
-        "lineage_root_invocation": "azr-aaaaaaaaaaaa",
-        "compute_deallocation_deadline": "2099-01-01T00:00:00Z",
-        "repository": {"snapshot_digest": "sha256:" + "2" * 64},
-        "command_digest": "sha256:" + "3" * 64,
-        "resource_class": "behavior-heavy",
-        "limits": {"sku": "Standard_D4as_v6", "sku_family": "standardDav6Family", "wall_seconds": 3600},
-    },
-    "resources": {
-        "vm_id": "/vm/exact",
-        "nic_id": "/nic/exact",
-        "os_disk_id": "/disk/exact",
-        "run_command_name": "execute",
-        "safety_run_command_name": "safety-shutdown",
-        "ttl_schedule_name": "shutdown-vm-exact",
-        "ttl_schedule_id": "/ttl/exact",
-        "identities": {},
-    },
-    "attempt": 1,
-}
-foreign = {
-    "id": "/nic/exact",
-    "etag": '"foreign"',
-    "tags": {
-        "invocation-binding": "foreign",
-        "fence": "foreign",
-        "snapshot-digest": "foreign",
-        "command-digest": "foreign",
-    },
-    "properties": {"virtualMachine": {"id": "/vm/foreign"}},
-}
-module.read_exact_resource = lambda env, resource_id, kind: (True, foreign)
-module.az_command = lambda *args, **kwargs: ([], 0, "") if args[1][0:2] == ["resource", "list"] else (_ for _ in ()).throw(AssertionError("foreign resource reached delete"))
-try:
-    module.cleanup_partial_capacity({"deployment_generation": "gen-one", "owner": "owner", "resource_group": "rg"}, state)
-except module.RunnerError as exc:
-    assert "tag mismatch" in str(exc)
-else:
-    raise AssertionError("foreign replacement was accepted for cleanup")
-
-module.cost_query = lambda env, forecast=False: 0.0
-module.retail_rate = lambda env, sku: 0.182
-limits = {"sku": "Standard_D4as_v6", "network_bytes": 0}
-cost = module.budget_gate({"budget_limit": 1000}, limits)
-assert cost["max_network_bytes"] == 0
-assert cost["max_billable_lifetime_hours"] == 24
-assert cost["max_increment"] >= 210
-assert set(cost["first_hour"]["categories"]) == {
-    "vm_compute", "os_disk_storage_capacity", "nat_gateway", "public_ip", "private_endpoints",
-    "private_dns", "monitoring", "boot_diagnostics", "storage_capacity", "storage_operations",
-    "control_operations", "provisioning_control_interval", "nat_data_processing", "internet_egress",
-    "trusted_bootstrap_traffic", "foundation_shared_meter_reserve", "repository_command_egress",
-}
-assert cost["first_day"]["total"] > cost["first_hour"]["total"]
-assert cost["first_day"]["vm_network_bytes"] <= module.MAX_BOOTSTRAP_NETWORK_BYTES
-assert cost["first_hour"]["vm_network_bytes"] < cost["first_day"]["vm_network_bytes"]
-assert cost["first_day"]["control_operation_ceiling"] == module.RUNNER_CONTROL_OPERATION_CEILING
-assert cost["first_day"]["storage_operation_ceiling"] == module.RUNNER_STORAGE_OPERATION_CEILING
-
-# Azure operation accounting is increment-before-call, durable across process
-# recreation, category-specific, and shared across an attempt lineage.
-original_control_ceiling = module.RUNNER_CONTROL_OPERATION_CEILING
-original_storage_ceiling = module.RUNNER_STORAGE_OPERATION_CEILING
-module.RUNNER_CONTROL_OPERATION_CEILING = 2
-module.RUNNER_STORAGE_OPERATION_CEILING = 1
-with tempfile.TemporaryDirectory() as tmp:
-    ledger_env = {
-        "state_dir": Path(tmp), "home_binding": "sha256:home", "deployment_generation": "gen-one",
-    }
-    module.bind_operation_context(ledger_env, state)
-    module.record_azure_operation(ledger_env, ["account", "show"])
-    module.record_azure_operation(ledger_env, ["rest", "--method", "get"])
-    recreated = dict(ledger_env)
-    recreated.pop("operation_context", None)
-    module.bind_operation_context(recreated, state)
-    try:
-        module.record_azure_operation(recreated, ["account", "show"])
-    except module.RunnerError as exc:
-        assert "exhausted" in str(exc)
-    else:
-        raise AssertionError("process recreation reset the durable control-operation ceiling")
-    retry_state = json.loads(json.dumps(state))
-    retry_state["invocation"] = "azr-bbbbbbbbbbbb-a2"
-    retry_state["parent_invocation"] = state["invocation"]
-    retry_state["request"]["fence"] = "sha256:" + "9" * 64
-    retry_state["request"]["lineage_root_invocation"] = state["invocation"]
-    module.bind_operation_context(recreated, retry_state)
-    try:
-        module.record_azure_operation(recreated, ["account", "show"])
-    except module.RunnerError:
-        pass
-    else:
-        raise AssertionError("new attempt reset its old-attempt lineage operation ceiling")
-    module.record_azure_operation(recreated, ["storage", "blob", "exists"])
-    try:
-        module.record_azure_operation(recreated, ["storage", "blob", "exists"])
-    except module.RunnerError:
-        pass
-    else:
-        raise AssertionError("storage-operation ceiling was not enforced independently")
-module.RUNNER_CONTROL_OPERATION_CEILING = original_control_ceiling
-module.RUNNER_STORAGE_OPERATION_CEILING = original_storage_ceiling
-
-# A leased, durable worst-case reservation blocks both concurrent and later
-# stale-cost admissions even while Cost Management still reports zero.
-reservation_env = {
-    "subscription": "sub", "resource_group": "rg", "storage": "store",
-    "deployment_generation": "gen-one", "budget_limit": 400,
-}
-# The real admission owner acquires and releases independent admission and
-# reservation-object leases with non-interchangeable IDs.
-lease_calls = []
-lease_timeouts = []
-module.ensure_admission_blob = lambda *args: None
-module.ensure_reservation_blob = lambda *args: None
-def lease_az(env_arg, args, **kwargs):
-    if args[0:3] == ["storage", "blob", "lease"]:
-        lease_calls.append(list(args))
-        lease_timeouts.append(kwargs.get("timeout_seconds"))
-        return ({}, 0, "")
-    raise AssertionError("unexpected dual-lease Azure call: {}".format(args))
-module.az_command = lease_az
-lease_state = {"staging": {"admission_blob": "admission.lock", "reservation_blob": "reservations.json"}}
-with module.AdmissionLease(reservation_env, lease_state) as dual_lease:
-    assert dual_lease.admission_lease_id != dual_lease.reservation_lease_id
-assert [(args[3], args[args.index("--blob-name") + 1]) for args in lease_calls] == [
-    ("acquire", "admission.lock"), ("acquire", "reservations.json"),
-    ("renew", "admission.lock"), ("renew", "reservations.json"),
-    ("release", "reservations.json"), ("release", "admission.lock"),
-]
-assert lease_timeouts == [module.LEASE_RENEW_TIMEOUT_SECONDS] * len(lease_calls)
-
-# Every lease call has a bound shorter than the lease lifetime. A timeout from
-# either renewal is sticky, and an independently expired certificate cannot be
-# mistaken for current Azure ownership.
-hung_lease = module.AdmissionLease(reservation_env, lease_state)
-hung_lease._record_success("admission")
-hung_lease._record_success("reservation")
-hung_lease._lease_call = lambda *args, **kwargs: (_ for _ in ()).throw(
-    module.RunnerError("command exceeded bounded renewal deadline")
-)
-try:
-    hung_lease.renew_and_assert()
-except module.RunnerError as exc:
-    assert "bounded renewal deadline" in str(exc)
-else:
-    raise AssertionError("hung renewal retained admission authority")
-assert hung_lease.failed.is_set()
-try:
-    hung_lease.assert_held()
-except module.RunnerError as exc:
-    assert "renewal failed" in str(exc)
-else:
-    raise AssertionError("renewal timeout was not sticky")
-
-expired_lease = module.AdmissionLease(reservation_env, lease_state)
-expired_lease.expires_at = {
-    "admission": time.monotonic() - 1,
-    "reservation": time.monotonic() - 1,
-}
-try:
-    expired_lease.assert_held()
-except module.RunnerError as exc:
-    assert "expiry safety margin exhausted" in str(exc)
-else:
-    raise AssertionError("expired local lease certificate was accepted")
-reservation_ledger = module.empty_reservation_ledger(reservation_env)
-reservation_lock = threading.Lock()
-real_load_reservation_ledger = module.load_reservation_ledger
-real_save_reservation_ledger = module.save_reservation_ledger
-class ReservationLease:
-    def assert_held(self): pass
-def load_ledger(*args):
-    return reservation_ledger
-def save_ledger(*args):
-    return None
-module.load_reservation_ledger = load_ledger
-module.save_reservation_ledger = save_ledger
-states = []
-for invocation, fence in (("azr-bbbbbbbbbbbb", "sha256:b"), ("azr-cccccccccccc", "sha256:c")):
-    candidate = json.loads(json.dumps(state))
-    candidate["invocation"] = invocation
-    candidate["parent_invocation"] = None
-    candidate["request"]["fence"] = fence
-    candidate["request"]["lineage_root_invocation"] = invocation
-    candidate["staging"] = {"reservation_blob": "runner-control/reservations.json"}
-    states.append(candidate)
-outcomes = []
-def contend(candidate):
-    with reservation_lock:
-        try:
-            module.reserve_budget(reservation_env, candidate, ReservationLease(), limits)
-            outcomes.append("reserved")
-        except module.RunnerError:
-            outcomes.append("refused")
-threads = [threading.Thread(target=contend, args=(candidate,)) for candidate in states]
-for thread in threads: thread.start()
-for thread in threads: thread.join()
-assert sorted(outcomes) == ["refused", "reserved"]
-third = json.loads(json.dumps(states[1]))
-third["invocation"] = "azr-dddddddddddd"
-third["request"]["fence"] = "sha256:d"
-third["request"]["lineage_root_invocation"] = third["invocation"]
-try:
-    module.reserve_budget(reservation_env, third, ReservationLease(), limits)
-except module.RunnerError as exc:
-    assert "outstanding reservations" in str(exc)
-else:
-    raise AssertionError("sequential stale-cost admission ignored the durable reservation")
-
-# The reservation blob's own lease fences a stale controller even when it
-# reaches its write after successor B acquired the object lease.
-with tempfile.TemporaryDirectory() as tmp:
-    fenced_env = dict(reservation_env, state_dir=Path(tmp))
-    fenced_state = {"staging": {"reservation_blob": "runner-control/reservations.json"}}
-    stored = {"value": None, "current_lease": "lease-b", "calls": []}
-    class ObjectLease:
-        def __init__(self, lease_id):
-            self.reservation_lease_id = lease_id
-            self.assertions = 0
-        def assert_held(self): self.assertions += 1
-    def fenced_az(env_arg, args, **kwargs):
-        lease_id = args[args.index("--lease-id") + 1]
-        stored["calls"].append((args[2], lease_id))
-        if lease_id != stored["current_lease"]:
-            raise module.RunnerError("Azure rejected stale reservation blob lease")
-        path = Path(args[args.index("--file") + 1])
-        if args[2] == "upload":
-            stored["value"] = json.loads(path.read_text())
-        else:
-            path.write_text(json.dumps(stored["value"]))
-        return ({}, 0, "")
-    module.az_command = fenced_az
-    ledger_b = module.empty_reservation_ledger(fenced_env)
-    ledger_b["reservations"]["azr-bbbbbbbbbbbb"] = {"status": "reserved"}
-    lease_b = ObjectLease("lease-b")
-    real_save_reservation_ledger(fenced_env, fenced_state, ledger_b, lease_b)
-    assert lease_b.assertions == 2
-    assert real_load_reservation_ledger(
-        fenced_env, fenced_state, ObjectLease("lease-b")
-    )["reservations"] == ledger_b["reservations"]
-    ledger_a = module.empty_reservation_ledger(fenced_env)
-    ledger_a["reservations"]["azr-aaaaaaaaaaaa"] = {"status": "reserved"}
-    try:
-        real_save_reservation_ledger(fenced_env, fenced_state, ledger_a, ObjectLease("lease-a"))
-    except module.RunnerError as exc:
-        assert "stale reservation blob lease" in str(exc)
-    else:
-        raise AssertionError("stale controller A clobbered successor B's reservation ledger")
-    assert stored["value"]["reservations"] == ledger_b["reservations"]
-    assert ("upload", "lease-b") in stored["calls"] and ("download", "lease-b") in stored["calls"]
-
-# Complete one-property-at-a-time disposable-resource identity matrix.
-env = {"deployment_generation": "gen-one", "owner": "owner", "resource_group": "rg"}
-env["subscription"] = "sub"
-state["resources"]["ttl_schedule_id"] = module.exact_id(env, "Microsoft.DevTestLab", "schedules", state["resources"]["ttl_schedule_name"])
-expected_tags = module.ownership_tags(env, state)
-resources = {
-    "vm": {"id": "/vm/exact", "etag": '"vm-etag"', "tags": dict(expected_tags), "properties": {"vmId": "vm-instance"}},
-    "nic": {"id": "/nic/exact", "etag": '"nic-etag"', "tags": dict(expected_tags), "properties": {"resourceGuid": "nic-guid", "virtualMachine": {"id": "/vm/exact"}}},
-    "disk": {"id": "/disk/exact", "etag": '"disk-etag"', "tags": dict(expected_tags), "managedBy": "/vm/exact", "properties": {"uniqueId": "disk-unique"}},
-    "run-command": {"id": "/vm/exact/runCommands/execute", "etag": '"run-etag"', "tags": dict(expected_tags), "properties": {"provisioningState": "Succeeded"}},
-    "run-command-safety": {"id": "/vm/exact/runCommands/safety-shutdown", "etag": '"safety-etag"', "tags": dict(expected_tags), "properties": {"provisioningState": "Succeeded"}},
-    "ttl-schedule": {"id": state["resources"]["ttl_schedule_id"], "etag": '"ttl-etag"', "location": "eastus", "tags": dict(expected_tags), "properties": {"status": "Enabled", "taskType": "ComputeVmShutdownTask", "dailyRecurrence": {"time": "0000"}, "timeZoneId": "UTC", "targetResourceId": "/vm/exact", "notificationSettings": {"status": "Disabled"}}},
-}
-state["resources"].update({
-    "vm_instance_id": "vm-instance",
-    "run_command_id": resources["run-command"]["id"],
-    "safety_run_command_id": resources["run-command-safety"]["id"],
-    "identities": {
-        "vm": module.immutable_identity(resources["vm"], "vm"),
-        "nic": module.immutable_identity(resources["nic"], "nic"),
-        "disk": module.immutable_identity(resources["disk"], "disk"),
-        "run-command": module.immutable_identity(resources["run-command"], "run-command"),
-        "run-command-execute": module.immutable_identity(resources["run-command"], "run-command"),
-        "run-command-safety": module.immutable_identity(resources["run-command-safety"], "run-command"),
-        "ttl-schedule": module.immutable_identity(resources["ttl-schedule"], "ttl-schedule"),
-    },
-})
-original_reader = module.read_exact_resource
-for kind, resource in {key: value for key, value in resources.items() if key != "run-command-safety"}.items():
-    resource_id = resource["id"]
-    for tag in (
-        "workload", "firstmate-role", "lifecycle", "deployment-generation", "cleanup-owner",
-        "home-binding", "task-binding", "task-generation", "invocation-binding", "attempt", "fence",
-        "snapshot-digest", "command-digest", "resource-class", "selected-sku", "sku-family",
-        "cost-attribution", "cleanup-token",
-    ):
-        changed = json.loads(json.dumps(resource))
-        changed["tags"][tag] = "foreign"
-        module.read_exact_resource = lambda env_arg, id_arg, kind_arg, changed=changed: (True, changed)
-        try:
-            module.verify_live_resource_identity(env, state, kind, resource_id)
-        except module.RunnerError:
-            pass
-        else:
-            raise AssertionError("foreign {} {} was accepted".format(kind, tag))
-for kind, field, container in (
-    ("vm", "vmId", "properties"),
-    ("nic", "resourceGuid", "properties"),
-    ("disk", "uniqueId", "properties"),
-    ("run-command", "provisioningState", "properties"),
-    ("ttl-schedule", "taskType", "properties"),
-):
-    changed = json.loads(json.dumps(resources[kind]))
-    changed[container][field] = "foreign"
-    module.read_exact_resource = lambda env_arg, id_arg, kind_arg, changed=changed: (True, changed)
-    try:
-        module.verify_live_resource_identity(env, state, kind, resources[kind]["id"])
-    except module.RunnerError:
-        pass
-    else:
-        raise AssertionError("foreign {} immutable {} was accepted".format(kind, field))
-for kind, changed in (
-    ("nic", {"virtualMachine": {"id": "/vm/foreign"}, "resourceGuid": "nic-guid"}),
-    ("disk", {"uniqueId": "disk-unique"}),
-):
-    resource = json.loads(json.dumps(resources[kind]))
-    if kind == "nic":
-        resource["properties"].update(changed)
-    else:
-        resource["managedBy"] = "/vm/foreign"
-    module.read_exact_resource = lambda env_arg, id_arg, kind_arg, resource=resource: (True, resource)
-    try:
-        module.verify_live_resource_identity(env, state, kind, resources[kind]["id"])
-    except module.RunnerError:
-        pass
-    else:
-        raise AssertionError("foreign {} VM ownership was accepted".format(kind))
-for field, value in (
-    ("status", "Disabled"),
-    ("timeZoneId", "Pacific Standard Time"),
-    ("targetResourceId", "/vm/foreign"),
-    ("dailyRecurrence", {"time": "2359"}),
-    ("notificationSettings", {"status": "Enabled"}),
-):
-    changed = json.loads(json.dumps(resources["ttl-schedule"]))
-    changed["properties"][field] = value
-    module.read_exact_resource = lambda env_arg, id_arg, kind_arg, changed=changed: (True, changed)
-    try:
-        module.verify_live_resource_identity(env, state, "ttl-schedule", resources["ttl-schedule"]["id"])
-    except module.RunnerError:
-        pass
-    else:
-        raise AssertionError("foreign TTL schedule {} was accepted".format(field))
-module.read_exact_resource = original_reader
-
-# VM-absent cleanup inventories residual Run Commands and refuses an unplanned one.
-module.az_command = lambda env_arg, args, **kwargs: ([{"id": "/vm/exact/runCommands/foreign", "tags": {}}], 0, "")
-try:
-    module.cleanup_partial_capacity(env, state)
-except module.RunnerError as exc:
-    assert "unplanned residual" in str(exc)
-else:
-    raise AssertionError("tagless residual Run Command was not inventoried")
-
-# A complete classify-before-delete pass must discover a later foreign NIC
-# before deleting either exact Run Command, both with and without a live VM.
-exact_by_id = {
-    resources["ttl-schedule"]["id"].lower(): resources["ttl-schedule"],
-    resources["run-command"]["id"].lower(): resources["run-command"],
-    resources["run-command-safety"]["id"].lower(): resources["run-command-safety"],
-    resources["vm"]["id"].lower(): resources["vm"],
-    resources["disk"]["id"].lower(): resources["disk"],
-}
-foreign_nic = json.loads(json.dumps(resources["nic"]))
-foreign_nic["tags"]["cleanup-token"] = "foreign"
-def classify_reader(env_arg, resource_id, kind):
-    if resource_id.lower() == resources["nic"]["id"].lower():
-        return True, foreign_nic
-    value = exact_by_id.get(resource_id.lower())
-    return (value is not None), value
-listed = [{"id": value["id"], "tags": value.get("tags", {})} for value in resources.values()]
-delete_calls = []
-current_listing = [item for item in listed if item["id"].lower() != resources["vm"]["id"].lower()]
-module.read_exact_resource = classify_reader
-module.az_command = lambda env_arg, args, **kwargs: (current_listing, 0, "") if args[0:2] == ["resource", "list"] else delete_calls.append(args)
-module.transition = lambda env_arg, state_arg, phase, note=None, **updates: state_arg.update({"phase": phase, **updates})
-for operation, listing in (
-    (lambda: module.cleanup_partial_capacity(env, state), [item for item in listed if item["id"].lower() != resources["vm"]["id"].lower()]),
-    (lambda: module.cleanup(env, dict(state, phase="result-collected")), listed),
-):
-    current_listing[:] = listing
-    delete_calls.clear()
-    try:
-        operation()
-    except module.RunnerError as exc:
-        assert "cleanup tag mismatch" in str(exc)
-    else:
-        raise AssertionError("foreign NIC was accepted by complete cleanup classification")
-    assert not delete_calls, "cleanup mutated an exact resource before classifying the later foreign NIC"
-
-# Exact positive cleanup deletes both commands before the VM and records the
-# only allowed NIC/disk ETag transition after Azure detaches them.
-positive = json.loads(json.dumps(state))
-positive["phase"] = "result-collected"
-positive["staging"] = {"input_blob": "input", "output_blob": "output"}
-live = {
-    resources["ttl-schedule"]["id"].lower(): json.loads(json.dumps(resources["ttl-schedule"])),
-    resources["run-command"]["id"].lower(): json.loads(json.dumps(resources["run-command"])),
-    resources["run-command-safety"]["id"].lower(): json.loads(json.dumps(resources["run-command-safety"])),
-    resources["vm"]["id"].lower(): json.loads(json.dumps(resources["vm"])),
-    resources["nic"]["id"].lower(): json.loads(json.dumps(resources["nic"])),
-    resources["disk"]["id"].lower(): json.loads(json.dumps(resources["disk"])),
-}
-deleted = []
-def positive_reader(env_arg, resource_id, kind):
-    value = live.get(resource_id.lower())
-    return (value is not None), value
-def positive_az(env_arg, args, **kwargs):
-    if args[0:2] == ["resource", "list"]:
-        return ([{"id": value["id"], "tags": value.get("tags", {})} for value in live.values()], 0, "")
-    if args[0:3] == ["rest", "--method", "delete"]:
-        resource_id = args[args.index("--url") + 1].split("https://management.azure.com", 1)[1].split("?", 1)[0]
-        value = live.pop(resource_id.lower())
-        deleted.append(value["id"])
-        if resource_id.lower() == resources["vm"]["id"].lower():
-            live[resources["nic"]["id"].lower()]["properties"].pop("virtualMachine", None)
-            live[resources["nic"]["id"].lower()]["etag"] = '"nic-detached"'
-            live[resources["disk"]["id"].lower()].pop("managedBy", None)
-            live[resources["disk"]["id"].lower()]["etag"] = '"disk-detached"'
-        return ({}, 0, "")
-    raise AssertionError("unexpected positive cleanup Azure call: {}".format(args))
-with tempfile.TemporaryDirectory() as tmp:
-    positive_env = dict(env, state_dir=Path(tmp))
-    payload = Path(tmp) / "payloads" / positive["invocation"]
-    payload.mkdir(parents=True)
-    positive["input_path"] = str(payload / "input.tar.gz")
-    module.read_exact_resource = positive_reader
-    module.az_command = positive_az
-    module.save_state = lambda *args, **kwargs: None
-    module.storage_delete = lambda *args, **kwargs: None
-    module.transition = lambda env_arg, state_arg, phase, note=None, **updates: state_arg.update({"phase": phase, **updates})
-    module.cleanup(positive_env, positive)
-assert deleted == [
-    resources["run-command"]["id"], resources["run-command-safety"]["id"], resources["vm"]["id"],
-    resources["nic"]["id"], resources["disk"]["id"], resources["ttl-schedule"]["id"],
-]
-assert positive["phase"] == "complete"
-
-# A failed VM deletion retains the already-classified Azure TTL owner untouched.
-failure_state = json.loads(json.dumps(state))
-failure_state["phase"] = "result-collected"
-failure_live = {key: json.loads(json.dumps(value)) for key, value in live.items()}
-for value in resources.values():
-    failure_live[value["id"].lower()] = json.loads(json.dumps(value))
-failure_deleted = []
-def failure_reader(env_arg, resource_id, kind):
-    value = failure_live.get(resource_id.lower())
-    return (value is not None), value
-def failure_az(env_arg, args, **kwargs):
-    if args[0:2] == ["resource", "list"]:
-        return ([{"id": value["id"], "tags": value.get("tags", {})} for value in failure_live.values()], 0, "")
-    if args[0:3] == ["rest", "--method", "delete"]:
-        resource_id = args[args.index("--url") + 1].split("https://management.azure.com", 1)[1].split("?", 1)[0]
-        if resource_id.lower() == resources["vm"]["id"].lower():
-            return (None, 1, "bounded VM delete failed")
-        failure_deleted.append(resource_id)
-        failure_live.pop(resource_id.lower())
-        return ({}, 0, "")
-    raise AssertionError("unexpected failed-cleanup Azure call: {}".format(args))
-module.read_exact_resource = failure_reader
-module.az_command = failure_az
-module.transition = lambda env_arg, state_arg, phase, note=None, **updates: state_arg.update({"phase": phase, **updates})
-try:
-    module.cleanup(env, failure_state)
-except module.RunnerError as exc:
-    assert "VM delete failed" in str(exc)
-else:
-    raise AssertionError("failed VM deletion did not retain cleanup state")
-assert failure_state["phase"] == "cleanup-retained"
-assert resources["ttl-schedule"]["id"].lower() in failure_live
-assert resources["ttl-schedule"]["id"] not in failure_deleted
-assert failure_deleted == [resources["run-command"]["id"], resources["run-command-safety"]["id"]]
-
-# create_run_command publishes the complete ownership tags and records immutable identity.
-with tempfile.TemporaryDirectory() as tmp:
-    create_env = dict(env, state_dir=Path(tmp), subscription="sub")
-    module.ensure_state_dirs(create_env)
-    create_state = json.loads(json.dumps(state))
-    create_state["phase"] = "vm-created"
-    create_state["request"]["protocol"] = {"guest_digest": "sha256:" + module.sha256_file(module.GUEST)}
-    create_state["input_digest"] = "sha256:" + "4" * 64
-    create_state["resources"]["identities"].pop("run-command-execute", None)
-    vm_for_adoption = json.loads(json.dumps(resources["vm"]))
-    vm_for_adoption["properties"].update({
-        "networkProfile": {"networkInterfaces": [{"id": resources["nic"]["id"]}]},
-        "storageProfile": {"osDisk": {"managedDisk": {"id": resources["disk"]["id"]}}},
-    })
-    adoption = {
-        resources["vm"]["id"].lower(): vm_for_adoption,
-        resources["nic"]["id"].lower(): resources["nic"],
-        resources["disk"]["id"].lower(): resources["disk"],
-        resources["run-command-safety"]["id"].lower(): resources["run-command-safety"],
-        resources["ttl-schedule"]["id"].lower(): resources["ttl-schedule"],
-    }
-    module.read_exact_resource = lambda env_arg, resource_id, kind: (True, adoption[resource_id.lower()])
-    module.adopt_vm_identity(create_env, create_state, vm_for_adoption)
-    assert create_state["resources"]["identities"]["run-command-safety"]["provisioning_state"] == "Succeeded"
-    assert create_state["resources"]["identities"]["ttl-schedule"]["task_type"] == "ComputeVmShutdownTask"
-    captured = {}
-    def fake_az(env_arg, args, **kwargs):
-        if args[0:3] == ["rest", "--method", "put"]:
-            body_path = Path(args[args.index("--body") + 1][1:])
-            body = json.loads(body_path.read_text())
-            captured["tags"] = body["tags"]
-            return ({}, 0, "")
-        raise AssertionError("unexpected create Run Command call: {}".format(args))
-    run_resource = json.loads(json.dumps(resources["run-command"]))
-    run_resource["tags"] = module.ownership_tags(create_env, create_state)
-    module.az_command = fake_az
-    module.read_exact_resource = lambda env_arg, resource_id, kind: (True, run_resource)
-    module.transition = lambda env_arg, state_arg, phase, note=None, **updates: state_arg.update({"phase": phase, **updates})
-    module.create_run_command(create_env, create_state, "https://input", "https://output")
-    assert captured["tags"] == module.ownership_tags(create_env, create_state)
-    assert create_state["resources"]["identities"]["run-command-execute"]["provisioning_state"] == "Succeeded"
+retail_rate_unit() {
+  python3 - "$HOST" <<'PY'
+import copy, importlib.util, sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+env={"azure_operation_count":0}
+on_demand={"currencyCode":"USD","tierMinimumUnits":0,"retailPrice":0.182,"unitPrice":0.182,"armRegionName":"eastus","armSkuName":"Standard_D4as_v6","productName":"Virtual Machines Dasv6 Series","skuName":"D4as v6","meterName":"D4as v6","serviceName":"Virtual Machines","serviceFamily":"Compute","unitOfMeasure":"1 Hour","type":"Consumption","isPrimaryMeterRegion":True}
+low_priority={**on_demand,"retailPrice":0.0363,"unitPrice":0.0363,"meterName":"D4as v6 Low Priority"}
+spot={**on_demand,"retailPrice":0.041,"unitPrice":0.041,"meterName":"D4as v6 Spot"}
+windows={**on_demand,"retailPrice":0.31,"unitPrice":0.31,"productName":"Virtual Machines Dasv6 Series Windows"}
+dev_test={**on_demand,"retailPrice":0.15,"unitPrice":0.15,"productName":"Virtual Machines Dasv6 Series Dev/Test"}
+reservation={**on_demand,"retailPrice":0.09,"unitPrice":0.09,"type":"Reservation","reservationTerm":"1 Year"}
+savings={**on_demand,"retailPrice":0.08,"unitPrice":0.08,"productName":"Virtual Machines Dasv6 Series Savings Plan"}
+rows=[low_priority,spot,windows,dev_test,reservation,savings,on_demand]
+m.az_command=lambda *_a,**_k:({"Items":copy.deepcopy(rows)},0,"")
+assert m.retail_rate(env,"Standard_D4as_v6")==0.182
+# Every audited mixed-family SKU binds its own exact Linux on-demand meter/product.
+rates={"Standard_D4as_v7":0.182,"Standard_D4as_v6":0.182,"Standard_D4s_v6":0.202,"Standard_D4ads_v7":0.228,"Standard_D4ads_v6":0.228,"Standard_E4as_v7":0.238,"Standard_E4as_v6":0.238,"Standard_D4ds_v6":0.249}
+for sku,rate in rates.items():
+    shape=__import__('re').fullmatch(r"Standard_([DE])(\d+)([a-z]+)_v(\d+)",sku); meter=sku.removeprefix("Standard_").replace("_"," "); product="Virtual Machines {}{}v{} Series".format(shape.group(1),shape.group(3),shape.group(4))
+    exact={**on_demand,"armSkuName":sku,"skuName":meter,"meterName":meter,"productName":product,"retailPrice":rate,"unitPrice":rate}
+    m.az_command=lambda *_a,_exact=exact,**_k:({"Items":[copy.deepcopy(_exact)]},0,"")
+    assert m.retail_rate(env,sku)==rate
+m.az_command=lambda *_a,**_k:({"Items":[copy.deepcopy(low_priority)]},0,"")
+try: m.retail_rate(env,"Standard_D4as_v6")
+except m.RunnerError as exc: assert "on-demand" in str(exc) and "unreadable" in str(exc)
+else: raise AssertionError("Low Priority meter was accepted as on-demand")
+ambiguous={**on_demand,"retailPrice":0.183,"unitPrice":0.183,"meterId":"different-current-meter"}
+m.az_command=lambda *_a,**_k:({"Items":[copy.deepcopy(on_demand),ambiguous]},0,"")
+try: m.retail_rate(env,"Standard_D4as_v6")
+except m.RunnerError as exc: assert "ambiguous" in str(exc)
+else: raise AssertionError("distinct eligible on-demand prices were minimized instead of refused")
 PY
-  pass "audit blockers stay fixed: complete ownership/immutable matrix, residual inventory, Run Command creation tags, deadlines, networkless command, and itemized cost bounds"
+  pass "retail pricing selects exact Linux on-demand consumption and refuses Low Priority or ambiguity"
 }
 
-result_digest_rejection() {
-  local tmp repo home fakebin out invocation state blob_source rc log
-  fm_test_tmproot_into tmp fm-azure-result
-  repo="$tmp/repo"
-  home="$tmp/home"
-  fakebin=$(fm_fakebin "$tmp")
-  make_repo "$repo"
-  mkdir -p "$home"
-  out=$(cd "$repo" && runner "$home" "$fakebin" prepare --task task-one --generation gen-one -- true)
-  invocation=$(invocation_from "$out")
-  state="$home/state/azure-runner/$invocation.json"
-  blob_source="$tmp/wrong-result.tar.gz"
-  printf 'not the expected result\n' >"$blob_source"
-  python3 - "$state" "$SUB" <<'PY'
-import json
-import sys
-p=sys.argv[1]
-s=json.load(open(p))
-s["phase"]="result-published"
-s["expected_result_digest"]="sha256:"+"0"*64
-s["expected_boot_id"]="44444444-4444-4444-8444-444444444444"
-s["resources"].update({
- "vm_id":"/subscriptions/%s/resourceGroups/rg-firstmate-pilot-eastus-001/providers/Microsoft.Compute/virtualMachines/vm-one"%sys.argv[2],
- "vm_instance_id":"33333333-3333-4333-8333-333333333333",
- "nic_id":"/subscriptions/%s/resourceGroups/rg-firstmate-pilot-eastus-001/providers/Microsoft.Network/networkInterfaces/nic-one"%sys.argv[2],
- "os_disk_id":"/subscriptions/%s/resourceGroups/rg-firstmate-pilot-eastus-001/providers/Microsoft.Compute/disks/disk-one"%sys.argv[2],
-})
-json.dump(s,open(p,"w"),separators=(",",":"))
+commissioning_inventory_role_overlap_unit() {
+  python3 - "$HOST" <<'PY'
+import importlib.util, sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+controller={"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-prefix-validation-shards","name":"id-prefix-validation-shards","type":"Microsoft.ManagedIdentity/userAssignedIdentities","tags":{"firstmate-role":"validation-shard"}}
+expected={("microsoft.managedidentity/userassignedidentities","id-prefix-validation-shards")}
+disposable,reservations=m.partition_commissioning_inventory([controller],expected)
+assert disposable==[] and reservations==[]
+runner_vm={"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/vm-prefix-run-aaaaaaaaaaaa","name":"vm-prefix-run-aaaaaaaaaaaa","type":"Microsoft.Compute/virtualMachines","tags":{"firstmate-role":"validation-shard","invocation-binding":"azr-aaaaaaaaaaaa"}}
+disposable,reservations=m.partition_commissioning_inventory([controller,runner_vm],expected)
+assert disposable==[runner_vm] and reservations==[]
+foreign={"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-foreign","name":"id-foreign","type":"Microsoft.ManagedIdentity/userAssignedIdentities","tags":{"firstmate-role":"validation-shard"}}
+try: m.partition_commissioning_inventory([controller,foreign],expected)
+except m.RunnerError as exc: assert "zero foreign" in str(exc)
+else: raise AssertionError("foreign role-tagged managed identity bypassed exact foundation inventory")
+foreign_vm={**runner_vm,"type":"Microsoft.Network/publicIPAddresses","name":"pip-foreign"}
+try: m.partition_commissioning_inventory([controller,foreign_vm],expected)
+except m.RunnerError as exc: assert "zero foreign" in str(exc)
+else: raise AssertionError("foreign validation-shard role on an unapproved disposable type bypassed inventory")
 PY
-  log="$tmp/az.log"
-  cat >"$fakebin/az" <<'SH'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >>"$AZ_LOG"
-case "$1 $2" in
-  "account show") printf '{"id":"%s","tenantId":"%s","state":"Enabled"}\n' "$FM_AZURE_SUBSCRIPTION_ID" "$FM_AZURE_TENANT_ID" ;;
-  "resource show")
-    args="$*"
-    base="/subscriptions/$FM_AZURE_SUBSCRIPTION_ID/resourceGroups/rg-firstmate-pilot-eastus-001/providers"
-    common='"tags":{"workload":"firstmate","deployment-generation":"gen-one","cleanup-owner":"owner"}'
-    case "$args" in
-      *Microsoft.Storage/storageAccounts/fmteststorage0001*)
-        printf '{"id":"%s/Microsoft.Storage/storageAccounts/fmteststorage0001","location":"eastus",%s,"properties":{"publicNetworkAccess":"Disabled","allowSharedKeyAccess":false,"allowBlobPublicAccess":false,"supportsHttpsTrafficOnly":true,"minimumTlsVersion":"TLS1_2","networkAcls":{"defaultAction":"Deny","bypass":"None"}}}\n' "$base" "$common" ;;
-      *Microsoft.Network/virtualNetworks/vnet-fmtest-eus/subnets/snet-validation-shards*)
-        printf '{"id":"%s/Microsoft.Network/virtualNetworks/vnet-fmtest-eus/subnets/snet-validation-shards","properties":{"addressPrefix":"10.42.7.0/24","networkSecurityGroup":{"id":"%s/Microsoft.Network/networkSecurityGroups/nsg-fmtest-elastic-isolated"},"natGateway":{"id":"%s/Microsoft.Network/natGateways/nat-fmtest-eus"},"privateEndpointNetworkPolicies":"Enabled"}}\n' "$base" "$base" "$base" ;;
-      *Microsoft.Network/virtualNetworks/vnet-fmtest-eus*)
-        printf '{"id":"%s/Microsoft.Network/virtualNetworks/vnet-fmtest-eus","location":"eastus",%s,"properties":{}}\n' "$base" "$common" ;;
-      *Microsoft.Network/networkSecurityGroups/nsg-fmtest-elastic-isolated*)
-        printf '{"id":"%s/Microsoft.Network/networkSecurityGroups/nsg-fmtest-elastic-isolated",%s,"properties":{"securityRules":[{"name":"deny-public-inbound","properties":{"direction":"Inbound","access":"Deny","sourceAddressPrefix":"Internet"}},{"name":"deny-vnet-cross-compartment-inbound","properties":{"direction":"Inbound","access":"Deny","sourceAddressPrefix":"VirtualNetwork"}}]}}\n' "$base" "$common" ;;
-      *Microsoft.Network/natGateways/nat-fmtest-eus*)
-        printf '{"id":"%s/Microsoft.Network/natGateways/nat-fmtest-eus","location":"eastus",%s,"properties":{}}\n' "$base" "$common" ;;
-      *Microsoft.Network/privateEndpoints/pe-fmtest-blob/privateDnsZoneGroups/default*)
-        printf '{"id":"%s/Microsoft.Network/privateEndpoints/pe-fmtest-blob/privateDnsZoneGroups/default","properties":{"privateDnsZoneConfigs":[{"properties":{"privateDnsZoneId":"%s/Microsoft.Network/privateDnsZones/privatelink.blob.core.windows.net"}}]}}\n' "$base" "$base" ;;
-      *Microsoft.Network/privateEndpoints/pe-fmtest-blob*)
-        printf '{"id":"%s/Microsoft.Network/privateEndpoints/pe-fmtest-blob",%s,"properties":{"subnet":{"id":"%s/Microsoft.Network/virtualNetworks/vnet-fmtest-eus/subnets/snet-private-endpoints"},"networkInterfaces":[{"id":"%s/Microsoft.Network/networkInterfaces/pe-fmtest-blob.nic"}],"privateLinkServiceConnections":[{"properties":{"privateLinkServiceId":"%s/Microsoft.Storage/storageAccounts/fmteststorage0001","groupIds":["blob"],"privateLinkServiceConnectionState":{"status":"Approved"}}}]}}\n' "$base" "$common" "$base" "$base" "$base" ;;
-      *) exit 3 ;;
-    esac
-    ;;
-  "storage blob")
-    destination=
-    previous=
-    for arg in "$@"; do
-      [ "$previous" != --file ] || destination=$arg
-      previous=$arg
-    done
-    cp "$AZ_BLOB_SOURCE" "$destination"
-    printf '{}\n'
-    ;;
-  *) echo "unexpected result fake: $*" >&2; exit 90 ;;
-esac
-SH
-  chmod +x "$fakebin/az"
-  export AZ_LOG=$log AZ_BLOB_SOURCE=$blob_source
-  rc=0
-  out=$(runner "$home" "$fakebin" resume --invocation "$invocation" 2>&1) || rc=$?
-  [ "$rc" -eq 125 ] || fail "wrong result digest returned $rc: $out"
-  assert_contains "$out" "retrieved result digest" "wrong result digest was not rejected"
-  assert_not_contains "$(<"$log")" "vm delete" "integrity failure deleted runner compute"
-  unset AZ_LOG AZ_BLOB_SOURCE
-  pass "wrong result digest is rejected before any cleanup"
+  pass "foundation controller UAMI survives overlapping role classification while foreign role-tagged resources refuse"
 }
 
-static_contract
-dispatch_contract
+mixed_pool_capacity_unit() {
+  python3 - "$HOST" <<'PY'
+import importlib.util, pathlib, tempfile, sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+env={"subscription":"sub","resource_group":"rg","max_concurrency":16,"state_dir":pathlib.Path(tempfile.mkdtemp()),"azure_operation_count":0}
+caps=lambda memory:[{"name":"vCPUsAvailable","value":"4"},{"name":"MemoryGB","value":str(memory)},{"name":"CpuArchitectureType","value":"x64"},{"name":"HyperVGenerations","value":"V1,V2"},{"name":"TrustedLaunchDisabled","value":"False"},{"name":"EncryptionAtHostSupported","value":"True"}]
+skus=[{"name":sku,"restrictions":[],"capabilities":caps(m.SKU_MEMORY_GIB[sku])} for sku in m.COMMISSIONING_SKU_POOL]
+usage=[{"name":{"value":"cores"},"limit":128,"currentValue":0}]+[{"name":{"value":m.SKU_FAMILY[sku]},"limit":10,"currentValue":0} for sku in m.COMMISSIONING_SKU_POOL]
+def az(_env,args,**_kwargs):
+    if args[1]=="list-skus": return skus,0,""
+    if args[1]=="list-usage": return usage,0,""
+    raise AssertionError(args)
+m.az_command=az
+snapshot=m.runner_quota_snapshot(env,m.COMMISSIONING_SKU_POOL)
+assert snapshot["regional"]=={"limit":128,"current":0,"free":128}
+assert all(snapshot["families"][sku]["limit"]==10 for sku in m.COMMISSIONING_SKU_POOL)
+m.runner_quota_snapshot=lambda *_:snapshot
+base=dict(m.RESOURCE_CLASSES["behavior-heavy"])
+def state_for(ordinal,invocation=None):
+    sku=m.COMMISSIONING_SKU_POOL[(ordinal-1)//2]; invocation=invocation or "azr-{:012x}".format(ordinal)
+    limits={**base,"sku":sku,"sku_family":m.SKU_FAMILY[sku]}
+    return {"schema":m.SCHEMA,"invocation":invocation,"request":{"cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE,"cell_ordinal":ordinal,"limits":limits}}
+def reservation_for(state):
+    request=state["request"]; m.save_state(env,state,create=True)
+    return {"invocation-binding":state["invocation"],"cell_ordinal":request["cell_ordinal"],"selected-sku":request["limits"]["sku"],"sku-family":request["limits"]["sku_family"]}
+reservations=[]; states=[]
+# Simulate eight callers serialized from one stale zero-usage snapshot: every exact slot wins once and no family exceeds two.
+for ordinal in range(1,9):
+    state=state_for(ordinal); m.commissioning_capacity_gate(env,state,reservations,[]); reservations.append(reservation_for(state)); states.append(state)
+assert len(reservations)==8 and all(sum(r["selected-sku"]==sku for r in reservations)<=2 for sku in m.COMMISSIONING_SKU_POOL)
+for ordinal in range(9,17):
+    state=state_for(ordinal); m.commissioning_capacity_gate(env,state,reservations,[]); reservations.append(reservation_for(state)); states.append(state)
+assert m.commissioning_capacity_gate(env,states[-1],reservations,[])["reserved_slots"]==16
+try: m.commissioning_capacity_gate(env,state_for(1,"azr-bbbbbbbbbbbb"),reservations,[])
+except m.RunnerError as exc: assert "already reserved" in str(exc)
+else: raise AssertionError("seventeenth caller reused occupied slot 1")
+# Live usage that already includes two active VMs is not added to those same VMs again.
+active=[]
+for state in states:
+    request=state["request"]; active.append({"tags":{"invocation-binding":state["invocation"],"cell-ordinal":str(request["cell_ordinal"]),"selected-sku":request["limits"]["sku"],"sku-family":request["limits"]["sku_family"]},"hardwareProfile":{"vmSize":request["limits"]["sku"]}})
+used={"regional":{"limit":128,"current":64,"free":64},"families":{sku:{"limit":10,"current":8,"free":2} for sku in m.COMMISSIONING_SKU_POOL}}
+m.runner_quota_snapshot=lambda *_:used
+assert m.commissioning_capacity_gate(env,states[-1],reservations,active)["active_vcpus"]==64
+# One active plus one pending against a live value of eight must refuse at 12, proving max(live, active)+pending.
+try: m.commissioning_capacity_gate(env,states[1],reservations[:2],active[:1])
+except m.RunnerError as exc: assert "live quota" in str(exc)
+else: raise AssertionError("stale/foreign live usage plus a pending reservation overbooked a family")
+PY
+  pass "mixed pool serializes eight stale callers, caps two per family, admits 16, refuses 17, and avoids active double-count"
+}
+
+shared_allocator_bridge_unit() {
+  python3 - "$HOST" <<'PY' || fail "shared allocator runner bridge failed"
+import importlib.util, json, pathlib, subprocess, tempfile, sys
+spec=importlib.util.spec_from_file_location("runner_shared",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+env={"subscription":"sub","resource_group":"rg","prefix":"prefix","budget_limit":1500,"state_dir":pathlib.Path(tempfile.mkdtemp()),"azure_operation_count":0}
+limits={**m.RESOURCE_CLASSES["behavior-heavy"],"sku":"Standard_D4as_v7","sku_family":"StandardDasv7Family"}
+state={"schema":m.SCHEMA,"invocation":"azr-aaaaaaaaaaaa","resources":{},"request":{"fence":"sha256:"+"a"*64,"resource_class":"behavior-heavy","limits":limits}}
+m.save_state=lambda *_a,**_k:None
+calls=[]
+def completed(value):
+    return subprocess.CompletedProcess(["python"],0,stdout=json.dumps(value),stderr="")
+def allocator_run(command,**kwargs):
+    assert kwargs["env"]["FM_HOME"]==str(m.ROOT)
+    assert kwargs["env"]["FM_AZURE_WORKER_STATE_DIR"]==str(m.ROOT/"state"/"azure-workers")
+    calls.append(command)
+    return completed({"reservation_id":"azr-aaaaaaaaaaaa","status":"reserved","reason":"","actual_usd":100.0,"forecast_usd":200.0,"admission_limit_usd":1500.0})
+m.run=allocator_run
+cost={"max_increment":25.0}
+result=m.shared_capacity_reserve(env,state,cost)
+assert result["actual"]==100.0 and result["forecast"]==200.0
+assert "capacity-reserve" in calls[-1] and calls[-1][calls[-1].index("--sku-family")+1]=="StandardDasv7Family"
+assert state["shared_capacity_reservation"]["status"]=="reserved"
+# Queue, unreadable telemetry, and shared actual/forecast pressure each refuse before compute.
+for payload,text in (
+    ({"reservation_id":"azr-aaaaaaaaaaaa","status":"queued","reason":"family full","actual_usd":100.0,"forecast_usd":200.0,"admission_limit_usd":1500.0},"queued"),
+    ({"reservation_id":"azr-aaaaaaaaaaaa","status":"reserved","reason":"","actual_usd":None,"forecast_usd":200.0,"admission_limit_usd":1500.0},"readable"),
+    ({"reservation_id":"azr-aaaaaaaaaaaa","status":"reserved","reason":"","actual_usd":100.0,"forecast_usd":1490.0,"admission_limit_usd":1500.0},"pressure"),
+):
+    m.run=lambda *_a,payload=payload,**_k:completed(payload)
+    try:m.shared_capacity_reserve(env,state,{"max_increment":25.0})
+    except m.RunnerError as exc:assert text in str(exc)
+    else:raise AssertionError("shared allocator failure was bypassed: "+text)
+# Release is sent only from the post-cleanup bridge with one digest-bound receipt.
+m.run=lambda command,**_kwargs:calls.append(command) or completed({})
+state["shared_capacity_reservation"]={"status":"reserved"}
+m.shared_capacity_release(env,state)
+assert "capacity-release" in calls[-1] and len(calls[-1][calls[-1].index("--cleanup-receipt")+1])==64
+assert state["shared_capacity_reservation"]["status"]=="released"
+PY
+  pass "runner queues behind the shared allocator and requires actual/forecast evidence before compute"
+}
+
+commissioning_admission_unit() {
+  python3 - "$HOST" <<'PY' || fail "commissioning admission adversaries failed"
+import importlib.util, math, pathlib, tempfile, sys
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+env={"subscription":"sub","resource_group":"rg","prefix":"prefix","max_concurrency":16,"budget_limit":1500,"cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE,"state_dir":pathlib.Path(tempfile.mkdtemp()),"azure_operation_count":0}
+limits=dict(m.RESOURCE_CLASSES["behavior-heavy"]); limits.update({"sku":"Standard_D4ds_v6","sku_family":"StandardDdsv6Family"})
+state={"schema":m.SCHEMA,"invocation":"azr-aaaaaaaaaaaa","request":{"fence":"sha256:"+"a"*64,"lineage_root_invocation":"azr-aaaaaaaaaaaa","cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE,"cell_ordinal":16,"limits":limits,"compute_deallocation_deadline":"2026-01-02T00:00:00Z"}}
+seen=[]
+m.cost_query=lambda *_a,**_k: (_ for _ in ()).throw(AssertionError("commissioning queried Cost Management"))
+real_commissioning_budget=m.exact_commissioning_budget
+m.exact_commissioning_budget=lambda _env:seen.append("budget") or {"id":"budget","etag":"E"}
+m.commissioning_inventory_gate=lambda _env,_state:seen.append("inventory") or set()
+m.list_management_reservations=lambda _env:[]
+m.active_runner_vms=lambda _env:[]
+m.retail_rate=lambda _env,_sku:0.10
+m.runner_quota_snapshot=lambda _env,_skus:{"regional":{"limit":128,"current":0,"free":128},"families":{sku:{"limit":10,"current":0,"free":10} for sku in m.COMMISSIONING_SKU_POOL}}
+cost=m.commissioning_cost_gate(env,state,limits)
+assert seen==["budget","inventory"] and cost["actual"] is None and cost["forecast"] is None
+assert cost["cost_admission_mode"]==m.COMMISSIONING_COST_ADMISSION_MODE
+assert cost["max_increment"]==cost["first_day"]["total"] and cost["max_billable_lifetime_hours"]==24
+tags=m.reservation_tags({**env,"deployment_generation":"gen","owner":"owner"},state,cost["max_increment"],"2026-01-01T00:00:00Z")
+assert tags["cost-admission-mode"]==m.COMMISSIONING_COST_ADMISSION_MODE and tags["cell-ordinal"]=="16" and tags["selected-sku"]=="Standard_D4ds_v6"
+# The live Budget contract is exact: $1500 Monthly RG filter and all eight alerts.
+notifications={}
+for prefix,kind in (("Actual","Actual"),("Forecast","Forecasted")):
+    for label,threshold in (("750",50),("1000",66.67),("1250",83.33),("1500",100)):
+        notifications[(prefix+label).lower()]={"enabled":True,"operator":"GreaterThanOrEqualTo","threshold":threshold,"thresholdType":kind,"contactEmails":["operator@example.invalid"]}
+budget={"id":"/subscriptions/sub/providers/Microsoft.Consumption/budgets/bud-prefix-monthly","name":"bud-prefix-monthly","type":"Microsoft.Consumption/budgets","eTag":"E","properties":{"category":"Cost","amount":1500,"timeGrain":"Monthly","filter":{"dimensions":{"name":"ResourceGroupName","operator":"In","values":["rg"]}},"notifications":notifications}}
+m.az_command=lambda *_a,**_k:(budget,0,"")
+m.exact_commissioning_budget=real_commissioning_budget
+assert m.exact_commissioning_budget(env)["etag"]=="E"
+notifications["actual750"]["enabled"]=False
+try: m.exact_commissioning_budget(env)
+except m.RunnerError: pass
+else: raise AssertionError("commissioning accepted a disabled budget alert")
+notifications["actual750"]["enabled"]=True
+m.exact_commissioning_budget=lambda _env:{"id":"budget","etag":"E"}
+for change,text in (({"max_concurrency":17},"1..16"),({"budget_limit":1000},"$1500")):
+    changed=dict(env); changed.update(change)
+    try: m.commissioning_cost_gate(changed,state,limits)
+    except m.RunnerError as exc: assert text in str(exc)
+    else: raise AssertionError("invalid commissioning policy accepted")
+# Fifteen exact mixed-family slots allow the sixteenth; after its reservation the same invocation remains admitted, but a seventeenth cannot collide with slot 1.
+def make_reservation(invocation,ordinal):
+    sku=m.COMMISSIONING_SKU_POOL[(ordinal-1)//2]; slot_limits={**limits,"sku":sku,"sku_family":m.SKU_FAMILY[sku]}
+    record={"schema":m.SCHEMA,"invocation":invocation,"phase":"cost-reserved","cost":{"max_billable_lifetime_hours":24,"max_increment":cost["max_increment"]},"request":{"fence":"sha256:"+"c"*64,"cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE,"cell_ordinal":ordinal,"limits":slot_limits}}
+    m.save_state(env,record,create=True)
+    return {"id":"/reservations/"+invocation,"invocation-binding":invocation,"amount_usd":cost["max_increment"],"cell_ordinal":ordinal,"selected-sku":sku,"sku-family":m.SKU_FAMILY[sku]}
+reservations=[make_reservation("azr-{:012x}".format(i),i) for i in range(1,16)]
+m.list_management_reservations=lambda _env:list(reservations)
+m.commissioning_inventory_gate=lambda _env,_state:{item["id"].lower() for item in reservations}
+sixteenth=m.commissioning_cost_gate(env,state,limits)
+assert sixteenth["reserved_invocations"]==15 and math.isclose(sixteenth["outstanding_reservations"],15*cost["max_increment"])
+state["cost"]={"max_billable_lifetime_hours":24,"max_increment":cost["max_increment"]}; m.save_state(env,state,create=True)
+current={"id":"/reservations/"+state["invocation"],"invocation-binding":state["invocation"],"amount_usd":cost["max_increment"],"cell_ordinal":16,"selected-sku":limits["sku"],"sku-family":limits["sku_family"]}; reservations.append(current)
+assert m.commissioning_cost_gate(env,state,limits)["reserved_invocations"]==16
+first_limits={**limits,"sku":m.COMMISSIONING_SKU_POOL[0],"sku_family":m.SKU_FAMILY[m.COMMISSIONING_SKU_POOL[0]]}
+seventeenth={"schema":m.SCHEMA,"invocation":"azr-bbbbbbbbbbbb","request":{"fence":"sha256:"+"b"*64,"cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE,"cell_ordinal":1,"limits":first_limits}}
+try: m.commissioning_cost_gate(env,seventeenth,first_limits)
+except m.RunnerError as exc: assert "already reserved" in str(exc)
+else: raise AssertionError("seventeenth commissioning runner was admitted")
+# Exact completed cleanup releases slot 1 without deleting its retained audit/cost identity.
+first_state=m.load_state(env,reservations[0]["invocation-binding"]); first_state["phase"]="complete"; m.save_state(env,first_state)
+reservations[0]["cleanup-verified-at"]="2026-01-03T00:00:00Z"
+replacement={"schema":m.SCHEMA,"invocation":"azr-cccccccccccc","request":{"fence":"sha256:"+"d"*64,"cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE,"cell_ordinal":1,"limits":first_limits}}
+replacement_cost=m.commissioning_cost_gate(env,replacement,first_limits)
+assert replacement_cost["reserved_invocations"]==15 and replacement_cost["retained_reservations"]==16
+# Default strict mode calls actual and forecast and propagates an unavailable forecast.
+strict_env=dict(env,cost_admission_mode=m.STRICT_COST_ADMISSION_MODE,budget_limit=1000,max_concurrency=4)
+calls=[]
+def cost_query(_env,forecast=False,**_kwargs):
+    calls.append(forecast)
+    if forecast: raise m.RunnerError("429")
+    return 0.0
+m.cost_query=cost_query
+try: m.budget_gate(strict_env,limits)
+except m.RunnerError: pass
+else: raise AssertionError("strict admission bypassed unavailable Cost Management")
+assert calls==[False,True]
+# Dispatch requires exact explicit confirmation only for commissioning mode.
+minimal={"invocation":"azr-aaaaaaaaaaaa","parent_invocation":None,"request":{"fence":"sha256:"+"a"*64,"lineage_root_invocation":"azr-aaaaaaaaaaaa","cost_admission_mode":m.COMMISSIONING_COST_ADMISSION_MODE}}
+try: m.dispatch_prepared(env,minimal,"sub",None)
+except m.RunnerError as exc: assert "--confirm-cost-admission-mode" in str(exc)
+else: raise AssertionError("commissioning ran without exact confirmation")
+minimal["request"]["cost_admission_mode"]=m.STRICT_COST_ADMISSION_MODE
+try: m.dispatch_prepared(strict_env,minimal,"sub",m.COMMISSIONING_COST_ADMISSION_MODE)
+except m.RunnerError as exc: assert "accepted only" in str(exc)
+else: raise AssertionError("strict mode accepted commissioning confirmation")
+PY
+  pass "runner-local strict and commissioning defenses retain exact slot, budget-alert, and itemized reservation controls"
+}
+
+static_private_controller_contract
+environment_mode_defaults
+storage_network_access_contract
 prepare_contract
-executor_semantics_unit
-request_integrity_unit
-admission_failures
-missing_vm_fences_attempt
-foundation_binding_matrix
-audit_blocker_regressions
-result_digest_rejection
+private_snapshot_prepare_contract
+executor_credential_adversary
+linux_systemd_drop_integration
+management_fencing_unit
+effective_rbac_adversaries
+validation_parent_capacity_contract
+cost_retry_unit
+retail_rate_unit
+commissioning_inventory_role_overlap_unit
+mixed_pool_capacity_unit
+shared_allocator_bridge_unit
+commissioning_admission_unit
 
 echo "# fm-azure-runner.test.sh: all assertions passed"

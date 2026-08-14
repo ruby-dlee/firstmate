@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Host-side controller for one-shot private Azure command runners.
 
-The script packages a clean committed Git snapshot, binds it to a canonical
-command request, stages exact input/output blobs, creates one identity-less VM,
-drives it through Azure Managed Run Command, verifies the result, and removes
-only resources whose recorded identities match the invocation.
+The script binds a clean public committed Git snapshot to a canonical command
+request, creates one private controller VM with a container-scoped UAMI, drives
+an isolated networkless child through Azure Managed Run Command, verifies the
+bounded result, and removes only resources whose recorded identities match the
+invocation.
 
 See docs/azure-runner.md and `bin/fm-azure-runner.sh help` for the operator
 contract. This file intentionally uses only the Python standard library and the
@@ -12,44 +13,58 @@ installed Azure CLI.
 """
 
 import argparse
+import base64
 import contextlib
 import datetime as dt
+import email.utils
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
-import tarfile
 import tempfile
 import threading
 import time
-import uuid
+import urllib.error
 import urllib.request
+import uuid
 
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "docs" / "azure-runner" / "invocation.json"
 GUEST = ROOT / "bin" / "fm-azure-runner-guest.sh"
 EXECUTOR = ROOT / "bin" / "fm-azure-runner-exec.py"
+WORKER_LIFECYCLE = ROOT / "bin" / "fm-worker-lifecycle.py"
 CONTAINER = "validation-shards"
+CONTROL_CONTAINER = "runner-control"
 SCHEMA = "fm.azure-command/v1"
 RESULT_SCHEMA = "fm.azure-command-result/v1"
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 SAFE_INVOCATION = re.compile(r"^azr-[a-z0-9]{12}(?:-a[2-9][0-9]*)?$")
 SAFE_ARTIFACT = re.compile(r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$))[A-Za-z0-9._/+@:-]{1,240}$")
+SAFE_PUBLIC_GIT_REMOTE = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?$")
+SAFE_PUBLIC_GIT_REF = re.compile(
+    r"^refs/(?:heads/[A-Za-z0-9._/-]{1,200}|pull/[1-9][0-9]*/head)$"
+)
 LOCAL_COMMAND_TIMEOUT_SECONDS = 300
+COST_QUERY_TIMEOUT_SECONDS = 60
+COST_RETRY_DEADLINE_SECONDS = 900
+COST_CACHE_MAX_AGE_SECONDS = 4 * 60 * 60
 LEASE_DURATION_SECONDS = 60
 LEASE_RENEW_TIMEOUT_SECONDS = 10
 LEASE_SAFETY_MARGIN_SECONDS = 15
-MAX_STAGING_INPUT_BYTES = 512 * 1024**2
+MAX_STAGING_INPUT_BYTES = 1024**3
 MAX_BOOTSTRAP_NETWORK_BYTES = 16 * 1024**3
 MAX_RESULT_UPLOAD_BYTES = 600 * 1024**2
 BOOTSTRAP_RATE_BITS_PER_SECOND = 1_000_000
 MAX_BILLABLE_LIFETIME_HOURS = 24
+STRICT_COST_ADMISSION_MODE = "strict"
+COMMISSIONING_COST_ADMISSION_MODE = "commissioning-bounded"
 TTL_SCHEDULE_HOURS_AFTER_PREPARATION = 23
 AZURE_SCHEDULE_MINIMUM_LEAD_SECONDS = 30 * 60
 SHELLCHECK_ARCHIVE_BYTES = 2_559_196
@@ -122,9 +137,28 @@ SKU_FAMILY = {
     "Standard_D4s_v7": "StandardDsv7Family",
     "Standard_D4ds_v7": "StandardDdsv7Family",
     "Standard_D4ads_v6": "standardDadv6Family",
+    "Standard_E4as_v7": "StandardEasv7Family",
+    "Standard_E4as_v6": "standardEav6Family",
 }
 SKU_VCPUS = {sku: 4 for sku in SKU_FAMILY}
-SKU_MEMORY_GIB = {sku: 16 for sku in SKU_FAMILY}
+SKU_MEMORY_GIB = {sku: (32 if sku.startswith("Standard_E") else 16) for sku in SKU_FAMILY}
+COMMISSIONING_SKU_POOL = (
+    "Standard_D4as_v7",
+    "Standard_D4as_v6",
+    "Standard_D4s_v6",
+    "Standard_D4ads_v7",
+    "Standard_D4ads_v6",
+    "Standard_E4as_v7",
+    "Standard_E4as_v6",
+    "Standard_D4ds_v6",
+)
+COMMISSIONING_DISPOSABLE_RESOURCE_TYPES = {
+    "microsoft.compute/disks",
+    "microsoft.compute/virtualmachines",
+    "microsoft.compute/virtualmachines/runcommands",
+    "microsoft.devtestlab/schedules",
+    "microsoft.network/networkinterfaces",
+}
 
 
 class RunnerError(RuntimeError):
@@ -149,7 +183,7 @@ def sha256_file(path):
             digest.update(chunk)
 
 
-def run(command, cwd=None, check=True, capture=True, timeout_seconds=LOCAL_COMMAND_TIMEOUT_SECONDS):
+def run(command, cwd=None, check=True, capture=True, timeout_seconds=LOCAL_COMMAND_TIMEOUT_SECONDS, env=None):
     try:
         result = subprocess.run(
             command,
@@ -158,6 +192,7 @@ def run(command, cwd=None, check=True, capture=True, timeout_seconds=LOCAL_COMMA
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.PIPE if capture else None,
             timeout=timeout_seconds,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         raise RunnerError("command exceeded its bounded {}-second deadline: {}".format(
@@ -175,6 +210,126 @@ def git(repo, *args, check=True):
     return run(["git", "-C", str(repo)] + list(args), check=check)
 
 
+def public_git(repo, *args, check=True):
+    git_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/bin/false",
+        "SSH_ASKPASS": "/bin/false",
+    }
+    command = [
+        "git", "-c", "credential.helper=", "-c", "http.extraHeader=",
+        "-c", "protocol.file.allow=never", "-C", str(repo),
+    ] + list(args)
+    return run(command, check=check, env=git_env)
+
+
+def validate_public_source_ref(value):
+    if not isinstance(value, str) or not SAFE_PUBLIC_GIT_REF.fullmatch(value):
+        raise RunnerError("public source ref is not an allow-listed branch or PR-head ref")
+    if (
+        any(m in value for m in ("..", "//", "@{", "\\"))
+        or value.endswith(("/", ".", ".lock"))
+    ):
+        raise RunnerError("public source ref has an unsafe shape")
+    return value
+
+
+def public_origin_proof(
+    repo, remote, candidate_commit, expected=None, source_ref=None,
+    source_ancestors=(), private_source=False,
+):
+    if not SAFE_PUBLIC_GIT_REMOTE.match(remote) or "@" in remote:
+        raise RunnerError("Azure private controller requires a credential-free public GitHub HTTPS origin")
+    if source_ref is not None:
+        source_ref = validate_public_source_ref(source_ref)
+    with tempfile.TemporaryDirectory(prefix="fm-azure-public-proof-") as temporary:
+        proof_repo = Path(temporary)
+        public_git(proof_repo, "init", "--bare")
+        advertised = public_git(proof_repo, "ls-remote", "--symref", remote, "HEAD").stdout.splitlines()
+        symrefs = [line.split("\t", 1)[0][5:] for line in advertised if line.startswith("ref: ") and line.endswith("\tHEAD")]
+        heads = [line.split("\t", 1)[0] for line in advertised if line.endswith("\tHEAD") and not line.startswith("ref: ")]
+        if symrefs != ["refs/heads/main"] or len(heads) != 1 or not re.match(r"^[0-9a-f]{40,64}$", heads[0]):
+            raise RunnerError("public origin must advertise one exact refs/heads/main default")
+        default_ref = symrefs[0]
+        default_head = heads[0]
+        exact = public_git(proof_repo, "ls-remote", remote, default_ref).stdout.splitlines()
+        if exact != ["{}\t{}".format(default_head, default_ref)]:
+            raise RunnerError("public origin default-head advertisement changed or is ambiguous")
+        public_git(
+            proof_repo, "fetch", "--no-tags", "--force", remote,
+            "+{}:refs/fm-azure-runner/public-main".format(default_ref),
+        )
+        fetched_default = public_git(
+            proof_repo, "rev-parse", "--verify", "refs/fm-azure-runner/public-main"
+        ).stdout.strip()
+        if fetched_default != default_head:
+            raise RunnerError("fresh public default-head fetch differs from its advertisement")
+
+        selected_ref = source_ref or default_ref
+        selected_head = default_head
+        fetched_ref = "refs/fm-azure-runner/public-main"
+        if private_source:
+            if source_ref is None:
+                raise RunnerError("private parent snapshot requires one exact source ref")
+            selected_head = candidate_commit
+        elif source_ref is not None:
+            source_lines = public_git(proof_repo, "ls-remote", remote, source_ref).stdout.splitlines()
+            if source_lines != ["{}\t{}".format(candidate_commit, source_ref)]:
+                raise RunnerError("candidate commit is not the exact advertised public source-ref head")
+            fetched_ref = "refs/fm-azure-runner/public-source"
+            public_git(
+                proof_repo, "fetch", "--no-tags", "--force", remote,
+                "+{}:{}".format(source_ref, fetched_ref),
+            )
+            selected_head = public_git(proof_repo, "rev-parse", "--verify", fetched_ref).stdout.strip()
+            if selected_head != candidate_commit:
+                raise RunnerError("fresh public source-ref fetch differs from the candidate commit")
+        elif public_git(
+            proof_repo, "merge-base", "--is-ancestor", candidate_commit, fetched_ref, check=False
+        ).returncode != 0:
+            raise RunnerError("candidate commit is not reachable from the exact public origin/main head")
+
+        object_repo = repo if private_source else proof_repo
+        object_git = git if private_source else public_git
+        ancestors = []
+        for ancestor in source_ancestors:
+            if not isinstance(ancestor, str) or not re.fullmatch(r"[0-9a-f]{40,64}", ancestor):
+                raise RunnerError("public source ancestor is not an exact commit identity")
+            if ancestor in ancestors:
+                continue
+            if object_git(object_repo, "cat-file", "-t", ancestor, check=False).stdout.strip() != "commit":
+                raise RunnerError("public source ancestor is not a fetched commit")
+            if object_git(
+                object_repo, "merge-base", "--is-ancestor", ancestor, candidate_commit,
+                check=False,
+            ).returncode != 0:
+                raise RunnerError("public source ancestor is not reachable from the candidate")
+            ancestors.append(ancestor)
+
+        proof_identity = {
+            "remote": remote,
+            "default_ref": default_ref,
+            "default_head": default_head,
+            "source_ref": selected_ref,
+            "source_head": selected_head,
+            "source_ancestors": ancestors,
+        }
+        if expected is not None and expected != proof_identity:
+            raise RunnerError("public origin/source identity changed after request preparation")
+        if object_git(object_repo, "cat-file", "-t", candidate_commit).stdout.strip() != "commit":
+            raise RunnerError("candidate source object is not an exact commit")
+        tree = object_git(object_repo, "rev-parse", "{}^{{tree}}".format(candidate_commit)).stdout.strip()
+        if not re.match(r"^[0-9a-f]{40,64}$", tree) or object_git(object_repo, "cat-file", "-t", tree).stdout.strip() != "tree":
+            raise RunnerError("candidate source commit tree identity is malformed")
+        proof_identity["tree"] = tree
+        return proof_identity
+
+
 def now_utc():
     return dt.datetime.now(dt.timezone.utc)
 
@@ -187,6 +342,12 @@ def iso_utc(value=None):
 def require_identifier(label, value):
     if not SAFE_ID.match(value):
         raise RunnerError("{} must use 1-64 bounded identifier characters".format(label))
+    return value
+
+
+def require_capacity_fence(value):
+    if not re.fullmatch(r"[0-9a-f]{64}", str(value)):
+        raise RunnerError("capacity fence must be 64 lowercase hex characters")
     return value
 
 
@@ -233,11 +394,21 @@ def environment():
         raise RunnerError("FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID must be the explicitly accepted Azure resourceGuid")
     resource_group = os.environ.get("FM_AZURE_RESOURCE_GROUP", "rg-firstmate-pilot-eastus-001")
     max_concurrency = int(os.environ.get("FM_AZURE_RUNNER_MAX_CONCURRENCY", "4"))
-    if max_concurrency < 1 or max_concurrency > 8:
-        raise RunnerError("FM_AZURE_RUNNER_MAX_CONCURRENCY must be between 1 and 8")
+    if max_concurrency < 1 or max_concurrency > 16:
+        raise RunnerError("FM_AZURE_RUNNER_MAX_CONCURRENCY must be between 1 and 16")
     budget_limit = int(os.environ.get("FM_AZURE_RUNNER_BUDGET_LIMIT_USD", "1000"))
     if budget_limit not in (1000, 1500):
         raise RunnerError("FM_AZURE_RUNNER_BUDGET_LIMIT_USD must be 1000 or 1500")
+    cost_admission_mode = os.environ.get("FM_AZURE_RUNNER_COST_ADMISSION_MODE", STRICT_COST_ADMISSION_MODE)
+    if cost_admission_mode not in {STRICT_COST_ADMISSION_MODE, COMMISSIONING_COST_ADMISSION_MODE}:
+        raise RunnerError("FM_AZURE_RUNNER_COST_ADMISSION_MODE must be strict or commissioning-bounded")
+    cell_ordinal_text = os.environ.get("FM_AZURE_RUNNER_CELL_ORDINAL")
+    try:
+        cell_ordinal = int(cell_ordinal_text) if cell_ordinal_text is not None else None
+    except ValueError:
+        raise RunnerError("FM_AZURE_RUNNER_CELL_ORDINAL must be an integer from 1 through 16")
+    if cell_ordinal is not None and not 1 <= cell_ordinal <= 16:
+        raise RunnerError("FM_AZURE_RUNNER_CELL_ORDINAL must be an integer from 1 through 16")
     home = Path(os.environ["FM_HOME"]).resolve()
     state_dir = Path(os.environ.get("FM_AZURE_RUNNER_STATE_DIR", str(home / "state" / "azure-runner"))).resolve()
     return {
@@ -245,11 +416,16 @@ def environment():
         "subscription": subscription,
         "prefix": prefix,
         "storage": storage,
+        "operator_data_plane_ip": os.environ.get("FM_AZURE_OPERATOR_DATA_PLANE_IP", ""),
+        "control_storage": "st{}ctl01".format(prefix),
+        "controller_identity": "id-{}-validation-shards".format(prefix),
         "owner": owner,
         "deployment_generation": generation,
         "resource_group": resource_group,
         "max_concurrency": max_concurrency,
         "budget_limit": budget_limit,
+        "cost_admission_mode": cost_admission_mode,
+        "cell_ordinal": cell_ordinal,
         "home": home,
         "home_binding": "sha256:" + sha256_bytes(str(home).encode("utf-8")),
         "state_dir": state_dir,
@@ -446,70 +622,8 @@ def new_invocation(attempt=1):
     return base
 
 
-def download_pinned(url, destination, expected_digest, expected_bytes):
-    temp = destination.with_name(destination.name + ".tmp")
-    request = urllib.request.Request(url, headers={"User-Agent": "firstmate-azure-runner/1"})
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response, open(temp, "xb") as handle:
-            remaining = expected_bytes
-            while True:
-                chunk = response.read(min(1024 * 1024, remaining + 1))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
-                if remaining < 0:
-                    raise RunnerError("pinned tool download exceeds its exact byte contract")
-                handle.write(chunk)
-        if remaining != 0 or sha256_file(temp) != expected_digest:
-            raise RunnerError("pinned tool download identity mismatch")
-        os.replace(str(temp), str(destination))
-        os.chmod(destination, 0o600)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            temp.unlink()
 
-
-def prepare_tool_closure(payload_dir):
-    cache = Path(os.environ.get("FM_AZURE_RUNNER_TOOL_CACHE", str(Path(tempfile.gettempdir()) / "fm-azure-runner-tools")))
-    cache.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(cache, 0o700)
-    lock_path = cache / ".lock"
-    tools = (
-        (
-            "shellcheck.tar.xz",
-            "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz",
-            "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198",
-            SHELLCHECK_ARCHIVE_BYTES,
-        ),
-        (
-            "uv.tar.gz",
-            "https://github.com/astral-sh/uv/releases/download/0.9.10/uv-x86_64-unknown-linux-gnu.tar.gz",
-            "440c4215b171e64061d65d16a23753dd25c29a7f7b1b0446c9e9aed0fa372f27",
-            UV_ARCHIVE_BYTES,
-        ),
-    )
-    with open(lock_path, "a+", encoding="utf-8") as lock:
-        os.chmod(lock_path, 0o600)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        for name, url, digest, size in tools:
-            cached = cache / name
-            if not cached.exists() or cached.stat().st_size != size or sha256_file(cached) != digest:
-                with contextlib.suppress(FileNotFoundError):
-                    cached.unlink()
-                download_pinned(url, cached, digest, size)
-    destinations = []
-    for name, _, digest, size in tools:
-        source = cache / name
-        destination = payload_dir / name
-        shutil.copyfile(source, destination)
-        os.chmod(destination, 0o600)
-        if destination.stat().st_size != size or sha256_file(destination) != digest:
-            raise RunnerError("copied pinned tool closure identity mismatch")
-        destinations.append(destination)
-    return tuple(destinations)
-
-
-def prepare_locked_python_closure(repo, payload_dir):
+def locked_python_manifest(repo):
     lock_path = repo / "tools" / "agent-fleet" / "uv.lock"
     if not lock_path.is_file():
         raise RunnerError("locked Agent Fleet Python closure is absent from the exact snapshot")
@@ -534,6 +648,8 @@ def prepare_locked_python_closure(repo, payload_dir):
             selected = next((item for item in candidates if "manylinux2014_x86_64.whl" in item["url"]), None)
         if selected is None:
             raise RunnerError("locked Agent Fleet package has no reviewed Linux x86_64 wheel: {}".format(name))
+        if not re.match(r"^https://files\.pythonhosted\.org/packages/[A-Za-z0-9/_.-]+\.whl$", selected["url"]):
+            raise RunnerError("locked Agent Fleet wheel URL is outside the reviewed credential-free PyPI file origin")
         wheels.append({
             "name": name,
             "version": version_match.group(1),
@@ -544,36 +660,8 @@ def prepare_locked_python_closure(repo, payload_dir):
         })
     if {item["name"] for item in wheels} != {"iniconfig", "packaging", "pluggy", "pygments", "pytest", "ruff"}:
         raise RunnerError("locked Agent Fleet Linux wheel set differs from the reviewed closure")
-    cache = Path(os.environ.get(
-        "FM_AZURE_RUNNER_TOOL_CACHE", str(Path(tempfile.gettempdir()) / "fm-azure-runner-tools")
-    )) / "agent-fleet-wheels"
-    cache.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with open(cache / ".lock", "a+", encoding="utf-8") as handle:
-        os.chmod(cache / ".lock", 0o600)
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        for item in wheels:
-            destination = cache / item["file"]
-            digest = item["digest"].split(":", 1)[1]
-            if not destination.exists() or destination.stat().st_size != item["bytes"] or sha256_file(destination) != digest:
-                with contextlib.suppress(FileNotFoundError):
-                    destination.unlink()
-                download_pinned(item["url"], destination, digest, item["bytes"])
-    archive_path = payload_dir / "agent-fleet-wheelhouse.tar"
-    with tarfile.open(archive_path, "w", format=tarfile.PAX_FORMAT) as archive:
-        for item in sorted(wheels, key=lambda value: value["file"]):
-            source = cache / item["file"]
-            info = archive.gettarinfo(str(source), arcname=item["file"])
-            info.uid = info.gid = 0
-            info.uname = info.gname = "root"
-            info.mtime = 0
-            with open(source, "rb") as source_handle:
-                archive.addfile(info, source_handle)
-    return archive_path, {
-        "lock_digest": "sha256:" + sha256_file(lock_path),
-        "archive_digest": "sha256:" + sha256_file(archive_path),
-        "archive_bytes": archive_path.stat().st_size,
-        "wheels": [{key: item[key] for key in ("name", "version", "file", "digest", "bytes")} for item in wheels],
-    }
+    return lock_path, wheels
+
 
 
 def tree_digest(repo, relative):
@@ -601,6 +689,20 @@ def tree_digest(repo, relative):
     return "sha256:" + digest.hexdigest(), total
 
 
+def runner_sku_for_environment(env):
+    configured_sku = os.environ.get("FM_AZURE_RUNNER_SKU")
+    if env["cost_admission_mode"] == COMMISSIONING_COST_ADMISSION_MODE:
+        if env["cell_ordinal"] is None:
+            raise RunnerError("commissioning-bounded requires FM_AZURE_RUNNER_CELL_ORDINAL from 1 through 16")
+        selected_sku = COMMISSIONING_SKU_POOL[(env["cell_ordinal"] - 1) // 2]
+        if configured_sku is not None and configured_sku != selected_sku:
+            raise RunnerError("FM_AZURE_RUNNER_SKU differs from the deterministic commissioning cell allocation")
+        return selected_sku
+    if env["cell_ordinal"] is not None:
+        raise RunnerError("FM_AZURE_RUNNER_CELL_ORDINAL is accepted only for commissioning-bounded")
+    return configured_sku or "Standard_D4as_v6"
+
+
 def prepare(env, args, parent_state=None):
     repo = Path(args.repo or os.getcwd()).resolve()
     top = Path(git(repo, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
@@ -610,12 +712,36 @@ def prepare(env, args, parent_state=None):
     if dirty:
         raise RunnerError("repository must be an exact clean committed snapshot; tracked or untracked changes are present")
     branch = git(repo, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
-    if branch.returncode != 0:
-        raise RunnerError("repository must be on a named committed branch")
+    if branch.returncode != 0 and args.public_ref is None:
+        raise RunnerError(
+            "repository must be on a named committed branch unless an exact public source ref is supplied"
+        )
     commit = git(repo, "rev-parse", "HEAD").stdout.strip()
-    tree = git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
-    if not re.match(r"^[0-9a-f]{40,64}$", commit) or not re.match(r"^[0-9a-f]{40,64}$", tree):
-        raise RunnerError("repository commit/tree identity is malformed")
+    remote = git(repo, "remote", "get-url", "origin").stdout.strip()
+    private_snapshot_source = None
+    if args.private_snapshot_bundle:
+        private_snapshot_arg = Path(args.private_snapshot_bundle)
+        private_snapshot_source = private_snapshot_arg.resolve()
+        if private_snapshot_arg.is_symlink() or not private_snapshot_source.is_file():
+            raise RunnerError("private parent snapshot must be a regular non-link Git bundle")
+        if private_snapshot_source.stat().st_size > MAX_STAGING_INPUT_BYTES:
+            raise RunnerError("private parent snapshot exceeds the one-GiB staging bound")
+        if not args.capacity_parent or not args.source_ref:
+            raise RunnerError("private parent snapshot requires exact capacity parent and source ref")
+        heads = git(repo, "bundle", "list-heads", str(private_snapshot_source)).stdout.splitlines()
+        expected_head = "{} {}".format(commit, args.source_ref)
+        if heads != [expected_head]:
+            raise RunnerError("private parent snapshot must contain only the exact source-ref head")
+        run(["git", "bundle", "verify", str(private_snapshot_source)], cwd=repo)
+    if getattr(args, "public_ref", None) and args.source_ref:
+        raise RunnerError("choose one exact source identity: --source-ref or --public-ref")
+    public = public_origin_proof(
+        repo, remote, commit,
+        source_ref=getattr(args, "public_ref", None) or args.source_ref,
+        source_ancestors=tuple(getattr(args, "public_ancestor", None) or ()),
+        private_source=private_snapshot_source is not None,
+    )
+    tree = public["tree"]
 
     task = require_identifier("task", args.task)
     generation = require_identifier("generation", args.generation)
@@ -623,7 +749,7 @@ def prepare(env, args, parent_state=None):
     if resource_class not in RESOURCE_CLASSES:
         raise RunnerError("unknown resource class: {}".format(resource_class))
     limits = dict(RESOURCE_CLASSES[resource_class])
-    selected_sku = os.environ.get("FM_AZURE_RUNNER_SKU", "Standard_D4as_v6")
+    selected_sku = runner_sku_for_environment(env)
     if selected_sku not in SKU_FAMILY:
         raise RunnerError("runner SKU is not reviewed")
     limits["sku"] = selected_sku
@@ -641,12 +767,26 @@ def prepare(env, args, parent_state=None):
         raise RunnerError("invocation payload directory already exists")
     payload_dir.mkdir(parents=True, mode=0o700)
     os.chmod(payload_dir, 0o700)
-    bundle_path = payload_dir / "snapshot.bundle"
-    run(["git", "-C", str(repo), "bundle", "create", str(bundle_path), "HEAD"])
-    run(["git", "bundle", "verify", str(bundle_path)])
-    if bundle_path.stat().st_size > MAX_STAGING_INPUT_BYTES:
-        raise RunnerError("reachable committed snapshot history exceeds the bounded staging input allowance")
-    snapshot_digest = "sha256:" + sha256_file(bundle_path)
+    private_snapshot_path = None
+    private_snapshot_digest = None
+    private_snapshot_bytes = 0
+    if private_snapshot_source is not None:
+        private_snapshot_path = payload_dir / "snapshot.bundle"
+        shutil.copyfile(str(private_snapshot_source), str(private_snapshot_path))
+        os.chmod(private_snapshot_path, 0o600)
+        private_snapshot_digest = "sha256:" + sha256_file(private_snapshot_path)
+        private_snapshot_bytes = private_snapshot_path.stat().st_size
+    source_identity = {
+        "remote": remote,
+        "default_ref": public["default_ref"],
+        "default_head": public["default_head"],
+        "source_ref": public["source_ref"],
+        "source_head": public["source_head"],
+        "source_ancestors": public.get("source_ancestors", []),
+        "commit": commit,
+        "tree": tree,
+    }
+    snapshot_digest = "sha256:" + sha256_bytes(canonical_bytes(source_identity))
 
     dependencies = []
     for relative in args.dependency or []:
@@ -666,7 +806,14 @@ def prepare(env, args, parent_state=None):
     if any("\x00" in value for value in command["argv"]):
         raise RunnerError("command argv contains NUL")
     command_digest = "sha256:" + sha256_bytes(canonical_bytes(command))
-    locked_python_path, locked_python = prepare_locked_python_closure(repo, payload_dir)
+    lock_path, wheel_manifest = locked_python_manifest(repo)
+    locked_python = {
+        "lock_digest": "sha256:" + sha256_file(lock_path),
+        "wheels": [
+            {key: item[key] for key in ("name", "version", "file", "url", "digest", "bytes")}
+            for item in wheel_manifest
+        ],
+    }
     prepared_at = now_utc()
     expires_at = prepared_at + dt.timedelta(hours=TTL_SCHEDULE_HOURS_AFTER_PREPARATION)
     request = {
@@ -674,7 +821,18 @@ def prepare(env, args, parent_state=None):
         "home_binding": env["home_binding"],
         "task": task,
         "generation": generation,
+        "capacity_parent": (
+            require_identifier("capacity parent", args.capacity_parent)
+            if args.capacity_parent else None
+        ),
+        "capacity_reservation_vcpus": args.capacity_reservation_vcpus,
+        "capacity_fence": (
+            require_capacity_fence(args.capacity_fence)
+            if getattr(args, "capacity_fence", None) else None
+        ),
         "deployment_generation": env["deployment_generation"],
+        "cost_admission_mode": env["cost_admission_mode"],
+        "cell_ordinal": env["cell_ordinal"],
         "invocation": invocation,
         "attempt": attempt,
         "parent_invocation": parent_state["invocation"] if parent_state else None,
@@ -684,10 +842,21 @@ def prepare(env, args, parent_state=None):
         ),
         "fence": fence,
         "repository": {
+            "source_mode": (
+                "private-parent-bundle" if private_snapshot_path else "public-github-https"
+            ),
+            "remote": remote,
+            "default_ref": public["default_ref"],
+            "default_head": public["default_head"],
+            "source_ref": public["source_ref"],
+            "source_head": public["source_head"],
+            "source_ancestors": public.get("source_ancestors", []),
             "commit": commit,
             "tree": tree,
-            "snapshot_digest": snapshot_digest,
-            "snapshot_bytes": bundle_path.stat().st_size,
+            "snapshot_digest": (
+                private_snapshot_digest if private_snapshot_path else snapshot_digest
+            ),
+            "snapshot_bytes": private_snapshot_bytes,
         },
         "command": command,
         "command_digest": command_digest,
@@ -705,36 +874,28 @@ def prepare(env, args, parent_state=None):
         "created_at": iso_utc(prepared_at),
         "compute_deallocation_deadline": iso_utc(expires_at),
     }
+    if bool(request["capacity_parent"]) != bool(request["capacity_reservation_vcpus"]):
+        raise RunnerError("capacity parent and reservation vCPUs must be supplied together")
+    if request["capacity_parent"]:
+        if not re.match(r"^azv-[a-z0-9]{12}$", request["capacity_parent"]):
+            raise RunnerError("capacity parent must be an exact Azure validation cell id")
+        if not 8 <= request["capacity_reservation_vcpus"] <= 64:
+            raise RunnerError("capacity parent reservation must be 8-64 vCPUs")
+    if private_snapshot_path:
+        request["repository"]["input_blob"] = staging_prefix = "{}/{}/{}/{}/attempt-{}/snapshot.bundle".format(
+            env["home_binding"].split(":", 1)[1][:16], task, generation, invocation, attempt
+        )
+    else:
+        request["repository"]["input_blob"] = None
     request_digest = "sha256:" + sha256_bytes(canonical_bytes(request))
     request["request_digest"] = request_digest
     request_path = payload_dir / "request.json"
     request_path.write_bytes(canonical_bytes(request) + b"\n")
     os.chmod(request_path, 0o600)
-    executor_path = payload_dir / "runner-exec.py"
-    shutil.copyfile(EXECUTOR, executor_path)
-    os.chmod(executor_path, 0o600)
-    shellcheck_path, uv_archive_path = prepare_tool_closure(payload_dir)
-    input_path = payload_dir / "input.tar.gz"
-    with tarfile.open(input_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-        for source, name in (
-            (request_path, "request.json"),
-            (bundle_path, "snapshot.bundle"),
-            (executor_path, "runner-exec.py"),
-            (shellcheck_path, "shellcheck.tar.xz"),
-            (uv_archive_path, "uv.tar.gz"),
-            (locked_python_path, "agent-fleet-wheelhouse.tar"),
-        ):
-            info = archive.gettarinfo(str(source), arcname=name)
-            info.uid = 0
-            info.gid = 0
-            info.uname = "root"
-            info.gname = "root"
-            info.mtime = 0
-            with open(source, "rb") as handle:
-                archive.addfile(info, handle)
-    if input_path.stat().st_size > MAX_STAGING_INPUT_BYTES:
-        raise RunnerError("staged snapshot and pinned tool closure exceed the bounded input allowance")
-    input_digest = "sha256:" + sha256_file(input_path)
+    request_bytes = request_path.read_bytes()
+    if len(request_bytes) > 48 * 1024:
+        raise RunnerError("private controller request exceeds the bounded control-plane parameter allowance")
+    input_digest = "sha256:" + sha256_bytes(request_bytes)
     token = invocation.split("-")[1]
     vm_name = "vm-{}-run-{}".format(env["prefix"], token)
     nic_name = "nic-{}-run-{}".format(env["prefix"], token)
@@ -752,15 +913,15 @@ def prepare(env, args, parent_state=None):
         "request": request,
         "request_digest": request_digest,
         "input_digest": input_digest,
-        "input_bytes": input_path.stat().st_size,
-        "input_path": str(input_path),
+        "input_bytes": len(request_bytes),
+        "input_path": str(request_path),
         "repository_root": str(repo),
         "staging": {
             "container": CONTAINER,
-            "input_blob": staging_prefix + "/input.tar.gz",
+            "input_blob": request["repository"]["input_blob"],
+            "input_blob_etag": None,
             "output_blob": staging_prefix + "/result.tar.gz",
-            "admission_blob": "runner-control/admission.lock",
-            "reservation_blob": "runner-control/reservations.json",
+            "control_container": CONTROL_CONTAINER,
         },
         "resources": {
             "deployment": "fm-run-{}".format(token),
@@ -782,6 +943,40 @@ def prepare(env, args, parent_state=None):
     }
     save_state(env, state, create=True)
     return state
+
+
+def reprove_public_request(state):
+    repository = state["request"]["repository"]
+    repo = Path(state["repository_root"]).resolve()
+    private_source = repository.get("source_mode") == "private-parent-bundle"
+    proof = public_origin_proof(
+        repo, repository["remote"], repository["commit"],
+        expected={
+            "remote": repository["remote"],
+            "default_ref": repository["default_ref"],
+            "default_head": repository["default_head"],
+            "source_ref": repository["source_ref"],
+            "source_head": repository["source_head"],
+            "source_ancestors": repository.get("source_ancestors", []),
+        },
+        source_ref=(
+            repository["source_ref"]
+            if repository["source_ref"] != repository["default_ref"]
+            else None
+        ),
+        source_ancestors=repository.get("source_ancestors", []),
+        private_source=private_source,
+    )
+    if private_source:
+        snapshot_path = Path(state["input_path"]).parent / "snapshot.bundle"
+        if (
+            not snapshot_path.is_file()
+            or "sha256:" + sha256_file(snapshot_path) != repository["snapshot_digest"]
+            or snapshot_path.stat().st_size != repository["snapshot_bytes"]
+        ):
+            raise RunnerError("private parent snapshot changed after request preparation")
+    if proof["tree"] != repository["tree"]:
+        raise RunnerError("public request tree changed after preparation")
 
 
 def az_command(env, args, check=True, parse_json=True, timeout_seconds=LOCAL_COMMAND_TIMEOUT_SECONDS):
@@ -818,8 +1013,42 @@ def verify_foundation_tags(env, resource, label):
         raise RunnerError("foundation {} owner/generation identity is not exact".format(label))
 
 
+def effective_role_assignments(env, principal_id):
+    assignments, _, _ = az_command(env, [
+        "role", "assignment", "list", "--assignee-object-id", principal_id, "--all",
+        "--include-inherited", "--include-groups",
+    ])
+    if not isinstance(assignments, list):
+        raise RunnerError("effective RBAC assignment expansion is unreadable")
+    return assignments
+
+
+def require_zero_effective_rbac(env, principal_id, label):
+    assignments = effective_role_assignments(env, principal_id)
+    if assignments:
+        raise RunnerError("{} must have zero direct, group, and inherited effective RBAC assignments".format(label))
+
+
+def storage_network_access_is_exact(resource, operator_data_plane_ip, ip_rule_key="value"):
+    properties = resource.get("properties", resource)
+    network_acls = properties.get("networkAcls") or properties.get("networkRuleSet") or {}
+    ip_rules = network_acls.get("ipRules") or []
+    if not operator_data_plane_ip:
+        return properties.get("publicNetworkAccess") == "Disabled" and not ip_rules
+    return (
+        properties.get("publicNetworkAccess") == "Enabled"
+        and len(ip_rules) == 1
+        and isinstance(ip_rules[0], dict)
+        and ip_rules[0].get(ip_rule_key) == operator_data_plane_ip
+        and ip_rules[0].get("action") == "Allow"
+    )
+
+
 def foundation_gate(env):
     storage_id = exact_id(env, "Microsoft.Storage", "storageAccounts", env["storage"])
+    control_storage_id = exact_id(env, "Microsoft.Storage", "storageAccounts", env["control_storage"])
+    controller_identity_id = exact_id(env, "Microsoft.ManagedIdentity", "userAssignedIdentities", env["controller_identity"])
+    validation_container_id = storage_id + "/blobServices/default/containers/" + CONTAINER
     vnet_id = exact_id(env, "Microsoft.Network", "virtualNetworks", env["vnet"])
     subnet_id = vnet_id + "/subnets/" + env["subnet"]
     nsg_id = exact_id(env, "Microsoft.Network", "networkSecurityGroups", env["elastic_nsg"])
@@ -844,7 +1073,7 @@ def foundation_gate(env):
         or (storage.get("sku") or {}).get("name") != "Standard_ZRS"
         or properties.get("accessTier") != "Hot"
         or properties.get("defaultToOAuthAuthentication") is not True
-        or properties.get("publicNetworkAccess") != "Disabled"
+        or not storage_network_access_is_exact(storage, env["operator_data_plane_ip"])
         or properties.get("allowSharedKeyAccess") is not False
         or properties.get("allowBlobPublicAccess") is not False
         or properties.get("supportsHttpsTrafficOnly") is not True
@@ -853,6 +1082,56 @@ def foundation_gate(env):
         or network_acls.get("bypass") != "None"
     ):
         raise RunnerError("foundation storage identity/private-security contract is not exact")
+
+    control, _, _ = az_command(env, ["resource", "show", "--ids", control_storage_id, "--api-version", "2023-05-01"])
+    verify_foundation_tags(env, control, "runner control storage")
+    control_properties = control.get("properties", control)
+    control_acls = control_properties.get("networkAcls") or {}
+    if (
+        str(control.get("id", "")).lower() != control_storage_id.lower()
+        or control.get("location") != "eastus"
+        or control.get("kind") != "StorageV2"
+        or (control.get("sku") or {}).get("name") != "Standard_LRS"
+        or not storage_network_access_is_exact(control, env["operator_data_plane_ip"])
+        or control_properties.get("allowSharedKeyAccess") is not False
+        or control_properties.get("allowBlobPublicAccess") is not False
+        or control_properties.get("defaultToOAuthAuthentication") is not True
+        or control_acls.get("defaultAction") != "Deny"
+        or control_acls.get("bypass") != "None"
+    ):
+        raise RunnerError("runner control storage exact zero-data security contract is not exact")
+    control_container, _, _ = az_command(env, [
+        "resource", "show", "--ids", runner_control_id(env), "--api-version", "2023-05-01",
+    ])
+    control_metadata = control_container.get("properties", {}).get("metadata") or {}
+    allowed_control_metadata = {"schema", "deploymentgeneration", "lockowner", "lockfence", "lockexpiry"}
+    if (
+        str(control_container.get("id", "")).lower() != runner_control_id(env).lower()
+        or control_container.get("properties", {}).get("publicAccess") != "None"
+        or control_metadata.get("schema") != "fm-azure-runner-control-v1"
+        or control_metadata.get("deploymentgeneration") != env["deployment_generation"]
+        or not set(control_metadata).issubset(allowed_control_metadata)
+        or not (control_container.get("etag") or control_container.get("properties", {}).get("etag"))
+    ):
+        raise RunnerError("runner control container identity/ETag contract is not exact")
+    controller_identity, _, _ = az_command(env, [
+        "resource", "show", "--ids", controller_identity_id, "--api-version", "2023-01-31",
+    ])
+    verify_foundation_tags(env, controller_identity, "runner controller identity")
+    principal_id = controller_identity.get("properties", {}).get("principalId") or controller_identity.get("principalId")
+    client_id = controller_identity.get("properties", {}).get("clientId") or controller_identity.get("clientId")
+    if str(controller_identity.get("id", "")).lower() != controller_identity_id.lower() or controller_identity.get("location") != "eastus" or not principal_id or not client_id:
+        raise RunnerError("runner controller UAMI identity is not exact")
+    assignments = effective_role_assignments(env, principal_id)
+    expected_role = "/subscriptions/{}/providers/Microsoft.Authorization/roleDefinitions/ba92f5b4-2d11-453d-a403-e96b0029c9fe".format(env["subscription"])
+    if (
+        len(assignments) != 1
+        or str(assignments[0].get("principalId", "")).lower() != str(principal_id).lower()
+        or str(assignments[0].get("scope", "")).lower() != validation_container_id.lower()
+        or str(assignments[0].get("roleDefinitionId", "")).lower() != expected_role.lower()
+    ):
+        raise RunnerError("runner controller UAMI must have only exact validation container data scope")
+    env["controller_identity_client_id"] = client_id
 
     vnet, _, _ = az_command(env, ["resource", "show", "--ids", vnet_id, "--api-version", "2023-09-01"])
     verify_foundation_tags(env, vnet, "VNet")
@@ -1009,35 +1288,74 @@ def foundation_gate(env):
         raise RunnerError("foundation blob private-DNS binding is not exact")
 
 
-def sku_quota_gate(env, limits):
-    skus, _, _ = az_command(env, ["vm", "list-skus", "--location", "eastus", "--resource-type", "virtualMachines", "--all"])
-    matching = [item for item in skus if item.get("name") == limits["sku"]]
-    if len(matching) != 1 or matching[0].get("restrictions"):
+def validate_runner_sku_record(item, sku):
+    if item.get("restrictions"):
         raise RunnerError("runner SKU is unavailable or restricted")
-    capabilities = {item.get("name"): item.get("value") for item in matching[0].get("capabilities", [])}
-    if int(capabilities.get("vCPUsAvailable", "0")) < SKU_VCPUS[limits["sku"]] or float(capabilities.get("MemoryGB", "0")) < SKU_MEMORY_GIB[limits["sku"]]:
+    capabilities = {entry.get("name"): entry.get("value") for entry in item.get("capabilities", [])}
+    if int(capabilities.get("vCPUsAvailable", "0")) < SKU_VCPUS[sku] or float(capabilities.get("MemoryGB", "0")) < SKU_MEMORY_GIB[sku]:
         raise RunnerError("runner SKU no longer satisfies the reviewed CPU/memory class")
     if capabilities.get("CpuArchitectureType") != "x64" or "V2" not in capabilities.get("HyperVGenerations", ""):
         raise RunnerError("runner SKU no longer satisfies x64 Gen2")
     if capabilities.get("TrustedLaunchDisabled") == "True" or capabilities.get("EncryptionAtHostSupported") != "True":
         raise RunnerError("runner SKU no longer satisfies Trusted Launch/encryption-at-host")
+
+
+def runner_quota_snapshot(env, selected_skus):
+    selected_skus = tuple(selected_skus)
+    if not selected_skus or any(sku not in SKU_FAMILY for sku in selected_skus):
+        raise RunnerError("runner quota snapshot requested an unreviewed SKU")
+    skus, _, _ = az_command(env, ["vm", "list-skus", "--location", "eastus", "--resource-type", "virtualMachines", "--all"])
+    if not isinstance(skus, list):
+        raise RunnerError("runner SKU inventory is unreadable")
+    for sku in selected_skus:
+        matching = [item for item in skus if item.get("name") == sku]
+        if len(matching) != 1:
+            raise RunnerError("runner SKU is unavailable or ambiguous")
+        validate_runner_sku_record(matching[0], sku)
     usage, _, _ = az_command(env, ["vm", "list-usage", "--location", "eastus"])
-    wanted = ("cores", SKU_FAMILY[limits["sku"]].lower())
-    free = {}
+    if not isinstance(usage, list):
+        raise RunnerError("runner quota usage is unreadable")
+    wanted = {"cores"} | {SKU_FAMILY[sku].lower() for sku in selected_skus}
+    matching_usage = {name: [] for name in wanted}
     for item in usage:
         name = str(item.get("name", {}).get("value", "")).lower()
-        free[name] = int(item.get("limit", 0)) - int(item.get("currentValue", 0))
+        if name in matching_usage:
+            matching_usage[name].append(item)
+    if any(len(entries) != 1 for entries in matching_usage.values()):
+        raise RunnerError("regional or exact runner-family quota identity is unavailable or ambiguous")
+    quota = {}
+    for name, entries in matching_usage.items():
+        limit = int(entries[0].get("limit", 0))
+        current = int(entries[0].get("currentValue", 0))
+        if limit < 0 or current < 0 or current > limit:
+            raise RunnerError("regional or exact runner-family quota values are invalid")
+        quota[name] = {"limit": limit, "current": current, "free": limit - current}
+    return {
+        "regional": quota["cores"],
+        "families": {sku: quota[SKU_FAMILY[sku].lower()] for sku in selected_skus},
+    }
+
+
+def sku_quota_gate(env, limits):
+    snapshot = runner_quota_snapshot(env, (limits["sku"],))
     required = SKU_VCPUS[limits["sku"]]
     current_active = active_runner_vms(env)
     same_family_active = sum(
         1
         for vm in current_active
-        if (vm.get("tags") or {}).get("sku-family") == SKU_FAMILY[limits["sku"]]
+        if str((vm.get("tags") or {}).get("sku-family", "")).lower() == SKU_FAMILY[limits["sku"]].lower()
     )
-    remaining_slots = free.get(wanted[1], 0) // required
-    if free.get("cores", 0) < required or free.get(wanted[1], 0) < required or remaining_slots < 1:
+    regional = snapshot["regional"]
+    family = snapshot["families"][limits["sku"]]
+    if regional["free"] < required or family["free"] < required:
         raise RunnerError("regional or exact runner-family free vCPU quota is insufficient")
-    return {"family_free_vcpus": free.get(wanted[1], 0), "family_active": same_family_active}
+    return {
+        "regional_limit_vcpus": regional["limit"],
+        "regional_free_vcpus": regional["free"],
+        "family_limit_vcpus": family["limit"],
+        "family_free_vcpus": family["free"],
+        "family_active": same_family_active,
+    }
 
 
 def write_private_json(env, prefix, value):
@@ -1089,11 +1407,7 @@ def cost_query(env, forecast=False, invocation=None, reserved_at=None):
             "from": month_start.isoformat() + "T00:00:00Z",
             "to": month_end.isoformat() + "T00:00:00Z",
         }
-    path = write_private_json(env, ".cost-", body)
-    try:
-        result, _, _ = az_command(env, ["rest", "--method", "post", "--url", url, "--body", "@" + str(path)])
-    finally:
-        path.unlink(missing_ok=True)
+    result = cost_http_query(env, endpoint, url, body)
     properties = result.get("properties", result)
     columns = properties.get("columns", [])
     rows = properties.get("rows", [])
@@ -1107,6 +1421,143 @@ def cost_query(env, forecast=False, invocation=None, reserved_at=None):
         raise RunnerError("Azure cost result did not contain a readable PreTaxCost")
 
 
+def cost_cache_path(env):
+    return env["state_dir"] / "cost-management-cache.json"
+
+
+def load_cost_cache(env, cache_key, endpoint, body_digest):
+    try:
+        cache = json.loads(cost_cache_path(env).read_text(encoding="utf-8"))
+        entry = cache["entries"][cache_key]
+        fetched = dt.datetime.fromisoformat(entry["fetched_at"].replace("Z", "+00:00"))
+        server = email.utils.parsedate_to_datetime(entry["server_date"])
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        cache.get("schema") != "fm.azure-cost-cache/v1"
+        or cache.get("subscription") != env["subscription"]
+        or cache.get("resource_group") != env["resource_group"]
+        or entry.get("endpoint") != endpoint
+        or entry.get("body_digest") != body_digest
+        or server.tzinfo is None
+        or fetched.tzinfo is None
+    ):
+        return None
+    now = now_utc()
+    if now < server or now - server > dt.timedelta(seconds=COST_CACHE_MAX_AGE_SECONDS):
+        return None
+    if now < fetched or now - fetched > dt.timedelta(seconds=COST_CACHE_MAX_AGE_SECONDS):
+        return None
+    return entry.get("result") if isinstance(entry.get("result"), dict) else None
+
+
+def save_cost_cache(env, cache_key, endpoint, body_digest, server_date, result):
+    path = cost_cache_path(env)
+    with state_lock(env):
+        try:
+            cache = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            cache = {
+                "schema": "fm.azure-cost-cache/v1",
+                "subscription": env["subscription"],
+                "resource_group": env["resource_group"],
+                "entries": {},
+            }
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RunnerError("Cost Management cache is unreadable: {}".format(exc))
+        if (
+            cache.get("schema") != "fm.azure-cost-cache/v1"
+            or cache.get("subscription") != env["subscription"]
+            or cache.get("resource_group") != env["resource_group"]
+            or not isinstance(cache.get("entries"), dict)
+        ):
+            raise RunnerError("Cost Management cache binding is not exact")
+        cache["entries"][cache_key] = {
+            "endpoint": endpoint,
+            "body_digest": body_digest,
+            "server_date": server_date,
+            "fetched_at": iso_utc(),
+            "result": result,
+        }
+        save_private_json_atomic(path, cache)
+
+
+def retry_after_seconds(headers):
+    for name in (
+        "x-ms-ratelimit-microsoft.costmanagement-qpu-retry-after",
+        "x-ms-ratelimit-microsoft.consumption-retry-after",
+        "Retry-After",
+    ):
+        raw = headers.get(name)
+        if raw is None:
+            continue
+        try:
+            return max(1, min(3600, int(raw)))
+        except (TypeError, ValueError):
+            try:
+                when = email.utils.parsedate_to_datetime(raw)
+                return max(1, min(3600, int((when - now_utc()).total_seconds())))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def cost_http_query(env, endpoint, url, body):
+    body_bytes = canonical_bytes(body)
+    body_digest = "sha256:" + sha256_bytes(body_bytes)
+    cache_key = sha256_bytes((endpoint + "\0" + url + "\0" + body_digest).encode("utf-8"))
+    deadline = time.monotonic() + COST_RETRY_DEADLINE_SECONDS
+    while True:
+        record_azure_operation(env, ["cost-management", endpoint])
+        token_result = run([
+            "az", "account", "get-access-token", "--subscription", env["subscription"],
+            "--resource", "https://management.azure.com/", "--query", "accessToken",
+            "--output", "tsv", "--only-show-errors",
+        ], timeout_seconds=COST_QUERY_TIMEOUT_SECONDS)
+        token = token_result.stdout.strip()
+        if not token:
+            raise RunnerError("Azure CLI returned no management token for Cost Management")
+        request = urllib.request.Request(
+            url, data=body_bytes, method="POST",
+            headers={
+                "Authorization": "Bearer " + token,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
+        token = ""
+        try:
+            with urllib.request.urlopen(request, timeout=COST_QUERY_TIMEOUT_SECONDS) as response:
+                server_date = response.headers.get("Date")
+                if not server_date:
+                    raise RunnerError("Cost Management success omitted its authoritative server date")
+                try:
+                    result = json.loads(response.read().decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise RunnerError("Cost Management returned malformed JSON: {}".format(exc))
+                if not isinstance(result, dict):
+                    raise RunnerError("Cost Management returned a non-object response")
+                save_cost_cache(env, cache_key, endpoint, body_digest, server_date, result)
+                return result
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429:
+                raise RunnerError("Cost Management {} failed with HTTP {}".format(endpoint, exc.code))
+            cached = load_cost_cache(env, cache_key, endpoint, body_digest)
+            wait_seconds = retry_after_seconds(exc.headers)
+            remaining = deadline - time.monotonic()
+            if wait_seconds is not None and wait_seconds <= remaining:
+                time.sleep(wait_seconds)
+                continue
+            if cached is not None:
+                return cached
+            detail = "missing server retry guidance" if wait_seconds is None else "server retry exceeds bounded deadline"
+            raise RunnerError(
+                "Cost Management {} remained throttled with no exact authoritative cache ({})".format(endpoint, detail)
+            )
+        except urllib.error.URLError as exc:
+            raise RunnerError("Cost Management {} transport failed closed: {}".format(endpoint, exc.reason))
+
+
 def retail_rate(env, sku):
     escaped = sku.replace("_", "%5F")
     url = (
@@ -1114,19 +1565,55 @@ def retail_rate(env, sku):
         "armRegionName%20eq%20%27eastus%27%20and%20armSkuName%20eq%20%27{}%27%20and%20priceType%20eq%20%27Consumption%27"
     ).format(escaped)
     result, _, _ = az_command(env, ["rest", "--method", "get", "--url", url, "--skip-authorization-header"])
-    prices = []
-    for item in result.get("Items", []):
-        product = str(item.get("productName", "")).lower()
-        meter = str(item.get("meterName", "")).lower()
-        if item.get("unitOfMeasure") == "1 Hour" and "windows" not in product and "spot" not in meter:
-            with contextlib.suppress(TypeError, ValueError):
-                prices.append(float(item["retailPrice"]))
+    items = result.get("Items")
+    sku_shape = re.fullmatch(r"Standard_([DE])\d+([a-z]+)_v(\d+)", sku)
+    if not isinstance(items, list) or sku_shape is None:
+        raise RunnerError("current runner retail rate response is unreadable")
+    expected_meter = sku.removeprefix("Standard_").replace("_", " ")
+    expected_product = "Virtual Machines {}{}v{} Series".format(
+        sku_shape.group(1), sku_shape.group(2), sku_shape.group(3)
+    )
+    excluded_offers = ("spot", "low priority", "low-priority", "windows", "dev/test", "dev test", "reservation", "savings")
+    prices = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        offer = " ".join(str(item.get(field, "")) for field in (
+            "productName", "meterName", "skuName", "type", "priceType", "reservationTerm",
+        )).casefold()
+        if any(excluded in offer for excluded in excluded_offers):
+            continue
+        if (
+            str(item.get("armRegionName", "")).casefold() != "eastus"
+            or item.get("armSkuName") != sku
+            or str(item.get("serviceName", "")).casefold() != "virtual machines"
+            or str(item.get("serviceFamily", "")).casefold() != "compute"
+            or str(item.get("type", "")).casefold() != "consumption"
+            or item.get("unitOfMeasure") != "1 Hour"
+            or str(item.get("currencyCode", "")).upper() != "USD"
+            or str(item.get("productName", "")).casefold() != expected_product.casefold()
+            or str(item.get("skuName", "")).casefold() != expected_meter.casefold()
+            or str(item.get("meterName", "")).casefold() != expected_meter.casefold()
+            or item.get("isPrimaryMeterRegion") is not True
+        ):
+            continue
+        try:
+            price = float(item["retailPrice"])
+            unit_price = float(item["unitPrice"])
+            tier_minimum = float(item["tierMinimumUnits"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(price) or price <= 0 or price != unit_price or tier_minimum != 0:
+            continue
+        prices.add(price)
     if not prices:
-        raise RunnerError("current runner retail rate is unreadable")
-    return min(prices)
+        raise RunnerError("exact Linux on-demand consumption retail rate is unreadable")
+    if len(prices) != 1:
+        raise RunnerError("exact Linux on-demand consumption retail rate is ambiguous")
+    return prices.pop()
 
 
-def itemized_cost_bound(rate, hours, limits):
+def itemized_cost_bound(rate, hours, limits, parent_managed=False):
     rate_bound_bytes = BOOTSTRAP_RATE_BITS_PER_SECOND * 3600 * hours // 8
     vm_network_bytes = min(MAX_BOOTSTRAP_NETWORK_BYTES, rate_bound_bytes)
     bootstrap_bytes = min(
@@ -1150,7 +1637,7 @@ def itemized_cost_bound(rate, hours, limits):
         "nat_data_processing": bootstrap_gib * NAT_DATA_GIB_RATE_CEILING_USD,
         "internet_egress": bootstrap_gib * INTERNET_EGRESS_GIB_RATE_CEILING_USD,
         "trusted_bootstrap_traffic": bootstrap_gib * BOOTSTRAP_GIB_RATE_CEILING_USD,
-        "foundation_shared_meter_reserve": FOUNDATION_SHARED_METER_RESERVE_USD,
+        "foundation_shared_meter_reserve": 0.0 if parent_managed else FOUNDATION_SHARED_METER_RESERVE_USD,
         "repository_command_egress": 0.0,
     }
     return {
@@ -1177,12 +1664,28 @@ def itemized_cost_bound(rate, hours, limits):
     }
 
 
-def budget_gate(env, limits, outstanding_reservations=0.0):
+def budget_gate(env, limits, outstanding_reservations=0.0, parent_managed=False):
     actual = cost_query(env, forecast=False)
-    forecast = cost_query(env, forecast=True)
+    try:
+        forecast = cost_query(env, forecast=True)
+    except RunnerError as exc:
+        # A young subscription has no cost training data and the forecast
+        # endpoint fails with HTTP 424 until it trains. Commissioning-bounded
+        # admission substitutes the readable actual as the forecast, mirroring
+        # the worker lifecycle's released commissioning seam; strict admission
+        # keeps failing closed.
+        if (
+            env.get("cost_admission_mode") == COMMISSIONING_COST_ADMISSION_MODE
+            and "failed with HTTP 424" in str(exc)
+        ):
+            forecast = actual
+        else:
+            raise
     rate = retail_rate(env, limits["sku"])
-    first_hour = itemized_cost_bound(rate, 1, limits)
-    first_day = itemized_cost_bound(rate, MAX_BILLABLE_LIFETIME_HOURS, limits)
+    first_hour = itemized_cost_bound(rate, 1, limits, parent_managed=parent_managed)
+    first_day = itemized_cost_bound(
+        rate, MAX_BILLABLE_LIFETIME_HOURS, limits, parent_managed=parent_managed
+    )
     maximum_increment = first_day["total"]
     pressure = max(actual, forecast) + outstanding_reservations + maximum_increment
     if pressure >= env["budget_limit"]:
@@ -1200,144 +1703,697 @@ def budget_gate(env, limits, outstanding_reservations=0.0):
         "max_increment": maximum_increment,
         "outstanding_reservations": outstanding_reservations,
         "admission_pressure": pressure,
+        "cost_admission_mode": STRICT_COST_ADMISSION_MODE,
     }
 
 
-def empty_reservation_ledger(env):
-    return {
-        "schema": "fm.azure-cost-reservations/v1",
-        "subscription": env["subscription"],
-        "resource_group": env["resource_group"],
-        "storage": env["storage"],
-        "container": CONTAINER,
-        "deployment_generation": env["deployment_generation"],
-        "reservations": {},
+def exact_commissioning_budget(env):
+    budget_name = "bud-{}-monthly".format(env["prefix"])
+    budget_id = "/subscriptions/{}/providers/Microsoft.Consumption/budgets/{}".format(
+        env["subscription"], budget_name
+    )
+    budget, _, _ = az_command(env, [
+        "rest", "--method", "get", "--url",
+        "https://management.azure.com{}?api-version=2024-08-01".format(budget_id),
+    ])
+    properties = budget.get("properties", budget)
+    exact_filter = {
+        "dimensions": {
+            "name": "ResourceGroupName", "operator": "In", "values": [env["resource_group"]],
+        }
     }
+    expected_notifications = {
+        "actual750": (50, "Actual"), "actual1000": (66.67, "Actual"),
+        "actual1250": (83.33, "Actual"), "actual1500": (100, "Actual"),
+        "forecast750": (50, "Forecasted"), "forecast1000": (66.67, "Forecasted"),
+        "forecast1250": (83.33, "Forecasted"), "forecast1500": (100, "Forecasted"),
+    }
+    notifications = {
+        str(name).lower(): value for name, value in (properties.get("notifications") or {}).items()
+    }
+    notifications_exact = set(notifications) == set(expected_notifications)
+    if notifications_exact:
+        for name, (threshold, threshold_type) in expected_notifications.items():
+            value = notifications[name]
+            if (
+                value.get("enabled") is not True
+                or value.get("operator") != "GreaterThanOrEqualTo"
+                or float(value.get("threshold", -1)) != threshold
+                or value.get("thresholdType") != threshold_type
+                or len(value.get("contactEmails") or []) != 1
+            ):
+                notifications_exact = False
+                break
+    if (
+        str(budget.get("id", "")).lower() != budget_id.lower()
+        or budget.get("name") != budget_name
+        or budget.get("type") != "Microsoft.Consumption/budgets"
+        or properties.get("category") != "Cost"
+        or float(properties.get("amount", -1)) != 1500.0
+        or properties.get("timeGrain") != "Monthly"
+        or properties.get("filter") != exact_filter
+        or not notifications_exact
+        or not (budget.get("eTag") or budget.get("etag"))
+    ):
+        raise RunnerError("commissioning budget identity/amount/filter/alerts are not exact")
+    return {"id": budget_id, "etag": budget.get("eTag") or budget.get("etag")}
 
 
-def verify_reservation_ledger(env, ledger):
-    expected = empty_reservation_ledger(env)
-    for field in ("schema", "subscription", "resource_group", "storage", "container", "deployment_generation"):
-        if ledger.get(field) != expected[field]:
-            raise RunnerError("cost reservation ledger {} binding is not exact".format(field))
-    if not isinstance(ledger.get("reservations"), dict):
-        raise RunnerError("cost reservation ledger entries are malformed")
+def partition_commissioning_inventory(resources, expected_foundation):
+    disposable = []
+    reservation_resources = []
+    foundation_resources = []
+    for item in resources:
+        role = (item.get("tags") or {}).get("firstmate-role")
+        resource_type = str(item.get("type", "")).lower()
+        if role == "validation-shard" and resource_type in COMMISSIONING_DISPOSABLE_RESOURCE_TYPES:
+            disposable.append(item)
+        elif role == "runner-cost-reservation":
+            reservation_resources.append(item)
+        else:
+            foundation_resources.append(item)
+    actual_foundation = {
+        (str(item.get("type", "")).lower(), item.get("name")) for item in foundation_resources
+    }
+    if actual_foundation != expected_foundation:
+        raise RunnerError("commissioning requires the exact 29-resource foundation and zero foreign resources")
+    return disposable, reservation_resources
 
 
-def load_reservation_ledger(env, state, lease):
-    lease.assert_held()
-    path = write_private_json(env, ".reservations-empty-", empty_reservation_ledger(env))
-    try:
-        _, rc, stderr = az_command(env, [
-            "storage", "blob", "download", "--auth-mode", "login", "--account-name", env["storage"],
-            "--container-name", CONTAINER, "--name", state["staging"]["reservation_blob"],
-            "--file", str(path), "--overwrite", "true", "--lease-id", lease.reservation_lease_id,
-        ], check=False)
-        if rc != 0:
-            raise RunnerError("leased cost reservation ledger is unavailable: {}".format(stderr))
+def commissioning_inventory_gate(env, state):
+    resources, _, _ = az_command(env, ["resource", "list", "--resource-group", env["resource_group"]])
+    vault_endpoints = [
+        item for item in resources
+        if str(item.get("type", "")).lower() == "microsoft.network/privateendpoints"
+        and item.get("name") == "pe-{}-vault".format(env["prefix"])
+    ]
+    if len(vault_endpoints) != 1:
+        raise RunnerError("commissioning vault private endpoint inventory is not exact")
+    vault_endpoint, _, _ = az_command(env, [
+        "resource", "show", "--ids", vault_endpoints[0]["id"], "--api-version", "2023-09-01",
+    ])
+    vault_nics = vault_endpoint.get("properties", {}).get("networkInterfaces", [])
+    deployment, _, _ = az_command(env, [
+        "deployment", "sub", "show", "--name", "fm-azure-pilot-{}".format(env["deployment_generation"]),
+    ])
+    parameters = (deployment.get("properties") or {}).get("parameters") or {}
+    key_vault_name = (parameters.get("keyVaultName") or {}).get("value")
+    if len(vault_nics) != 1 or not key_vault_name:
+        raise RunnerError("commissioning generated foundation inventory is ambiguous")
+    vault_nic_name = str(vault_nics[0].get("id", "")).rsplit("/", 1)[-1]
+    expected = {
+        ("microsoft.insights/actiongroups", "ag-{}-ops".format(env["prefix"])),
+        ("microsoft.insights/datacollectionrules", "dcr-{}-linux".format(env["prefix"])),
+        ("microsoft.insights/metricalerts", "alert-{}-storage-availability".format(env["prefix"])),
+        ("microsoft.insights/scheduledqueryrules", "alert-{}-disk-usage".format(env["prefix"])),
+        ("microsoft.insights/scheduledqueryrules", "alert-{}-sync-age".format(env["prefix"])),
+        ("microsoft.keyvault/vaults", key_vault_name),
+        ("microsoft.operationalinsights/workspaces", "log-{}-eus".format(env["prefix"])),
+        ("microsoft.network/natgateways", "nat-{}-eus".format(env["prefix"])),
+        ("microsoft.network/networkinterfaces", env["blob_private_endpoint_nic"]),
+        ("microsoft.network/networkinterfaces", vault_nic_name),
+        ("microsoft.network/privateendpoints", env["blob_private_endpoint"]),
+        ("microsoft.network/privateendpoints", "pe-{}-vault".format(env["prefix"])),
+        ("microsoft.network/publicipaddresses", "pip-{}-nat-eus".format(env["prefix"])),
+        ("microsoft.network/virtualnetworks", env["vnet"]),
+        ("microsoft.network/privatednszones", "privatelink.blob.core.windows.net"),
+        ("microsoft.network/privatednszones", "privatelink.vaultcore.azure.net"),
+        ("microsoft.network/privatednszones/virtualnetworklinks", "privatelink.blob.core.windows.net/firstmate-vnet"),
+        ("microsoft.network/privatednszones/virtualnetworklinks", "privatelink.vaultcore.azure.net/firstmate-vnet"),
+        ("microsoft.storage/storageaccounts", env["storage"]),
+        ("microsoft.storage/storageaccounts", env["control_storage"]),
+    }
+    expected.update(
+        ("microsoft.network/networksecuritygroups", "nsg-{}-{}".format(env["prefix"], suffix))
+        for suffix in ("elastic-isolated", "networkless-verifier", "supervisor", "workers")
+    )
+    expected.update(
+        ("microsoft.managedidentity/userassignedidentities", "id-{}-{}".format(env["prefix"], suffix))
+        for suffix in ("validation", "policy-review", "crosscheck-tools", "validation-shards", "networkless-verifier")
+    )
+    disposable, reservation_resources = partition_commissioning_inventory(resources, expected)
+    ensure_state_dirs(env)
+    for path in sorted(env["state_dir"].glob("azr-*.json")):
         try:
-            ledger = json.loads(path.read_text(encoding="utf-8"))
+            record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise RunnerError("cost reservation ledger is unreadable: {}".format(exc))
-        verify_reservation_ledger(env, ledger)
-        return ledger
-    finally:
-        path.unlink(missing_ok=True)
-
-
-def save_reservation_ledger(env, state, ledger, lease):
-    lease.assert_held()
-    verify_reservation_ledger(env, ledger)
-    path = write_private_json(env, ".reservations-", ledger)
-    try:
-        az_command(env, [
-            "storage", "blob", "upload", "--auth-mode", "login", "--account-name", env["storage"],
-            "--container-name", CONTAINER, "--name", state["staging"]["reservation_blob"],
-            "--file", str(path), "--overwrite", "true", "--lease-id", lease.reservation_lease_id,
-        ])
-        lease.assert_held()
-    finally:
-        path.unlink(missing_ok=True)
-
-
-def reservation_is_reconciled(env, entry, actual, forecast):
-    invocation = entry.get("invocation")
-    if not invocation or entry.get("cleanup_verified_at") is None:
-        return False
-    try:
-        cleanup_at = dt.datetime.fromisoformat(entry["cleanup_verified_at"].replace("Z", "+00:00"))
-        state = load_state(env, invocation)
-    except (RunnerError, TypeError, ValueError):
-        return False
-    if state.get("phase") not in ("complete", "absent-fenced") or now_utc() < cleanup_at + dt.timedelta(hours=72):
-        return False
-    invocation_cost = cost_query(
-        env, forecast=False, invocation=invocation, reserved_at=entry["reserved_at"]
-    )
-    entry.update({
-        "status": "reconciled",
-        "reconciled_at": iso_utc(),
-        "reconciled_actual": actual,
-        "reconciled_forecast": forecast,
-        "reconciled_invocation_cost": invocation_cost,
-    })
-    return True
-
-
-def reserve_budget(env, state, lease, limits):
-    ledger = load_reservation_ledger(env, state, lease)
-    preliminary = budget_gate(env, limits)
-    for entry in ledger["reservations"].values():
-        if entry.get("status") == "reserved":
-            reservation_is_reconciled(env, entry, preliminary["actual"], preliminary["forecast"])
-    existing = ledger["reservations"].get(state["invocation"])
-    if existing is not None:
+            raise RunnerError("commissioning local queue is unreadable: {}".format(exc))
+        if record.get("invocation") == state["invocation"]:
+            continue
+    for item in disposable:
+        invocation = (item.get("tags") or {}).get("invocation-binding", "")
+        if not SAFE_INVOCATION.match(invocation):
+            raise RunnerError("commissioning disposable resource invocation is malformed")
+        invocation_state = load_state(env, invocation)
+        verify_resource_tags(env, invocation_state, item, "commissioning disposable resource")
+        resource_id = str(item.get("id", "")).lower()
+        planned = invocation_state.get("resources") or {}
+        planned_resources = {
+            str(planned.get("vm_id", "")).lower(): ("vm", "vm"),
+            str(planned.get("nic_id", "")).lower(): ("nic", "nic"),
+            str(planned.get("os_disk_id", "")).lower(): ("disk", "disk"),
+            str(planned.get("ttl_schedule_id", "")).lower(): ("ttl-schedule", "ttl-schedule"),
+            str(planned.get("vm_id", "") + "/runCommands/execute").lower(): ("run-command", "run-command-execute"),
+            str(planned.get("vm_id", "") + "/runCommands/safety-shutdown").lower(): ("run-command", "run-command-safety"),
+        }
+        if resource_id not in planned_resources:
+            raise RunnerError("commissioning disposable resource is outside its exact invocation plan")
+        kind, identity_key = planned_resources[resource_id]
+        exists, exact_resource = verify_live_resource_identity(
+            env, invocation_state, kind, item["id"], identity_key=identity_key
+        )
+        if not exists:
+            raise RunnerError("commissioning disposable resource disappeared during exact revalidation")
+        if kind == "vm":
+            hardware = exact_resource.get("hardwareProfile") or exact_resource.get("properties", {}).get("hardwareProfile", {})
+            if hardware.get("vmSize") != invocation_state["request"]["limits"]["sku"]:
+                raise RunnerError("commissioning retained VM size differs from its exact capacity slot")
+    for item in reservation_resources:
+        tags = item.get("tags") or {}
+        invocation = tags.get("invocation-binding", "")
         if (
-            existing.get("fence") != state["request"]["fence"]
-            or existing.get("lineage_root") != state["request"]["lineage_root_invocation"]
+            not SAFE_INVOCATION.match(invocation)
+            or str(item.get("id", "")).lower() != reservation_id(env, invocation).lower()
+            or tags.get("workload") != "firstmate"
+            or tags.get("deployment-generation") != env["deployment_generation"]
+            or tags.get("cleanup-owner") != env["owner"]
         ):
-            raise RunnerError("cost reservation invocation/fence lineage is not exact")
-        return existing["cost_bound"]
-    outstanding = sum(
-        float(entry["amount_usd"])
-        for entry in ledger["reservations"].values()
-        if entry.get("status") == "reserved"
+            raise RunnerError("commissioning reservation resource is not exact")
+    return {str(item.get("id", "")).lower() for item in reservation_resources}
+
+
+def commissioning_slot(request):
+    if request.get("cost_admission_mode") != COMMISSIONING_COST_ADMISSION_MODE:
+        raise RunnerError("commissioning capacity contains a non-commissioning invocation")
+    ordinal = request.get("cell_ordinal")
+    limits = request.get("limits") or {}
+    if (
+        not isinstance(ordinal, int)
+        or not 1 <= ordinal <= 16
+        or limits.get("sku") != COMMISSIONING_SKU_POOL[(ordinal - 1) // 2]
+        or limits.get("sku_family") != SKU_FAMILY.get(limits.get("sku"))
+    ):
+        raise RunnerError("commissioning invocation is not bound to its exact reviewed capacity slot")
+    return ordinal, limits["sku"], limits["sku_family"]
+
+
+def commissioning_capacity_gate(env, state, reservations, active):
+    current_ordinal, current_sku, _ = commissioning_slot(state["request"])
+    if current_ordinal > env["max_concurrency"]:
+        raise RunnerError("commissioning cell ordinal exceeds configured concurrency")
+    by_invocation = {}
+    by_ordinal = {}
+    for reservation in reservations:
+        invocation = reservation["invocation-binding"]
+        reservation_state = load_state(env, invocation)
+        ordinal, sku, family = commissioning_slot(reservation_state["request"])
+        if (
+            reservation.get("cell_ordinal") != ordinal
+            or reservation.get("selected-sku") != sku
+            or reservation.get("sku-family") != family
+            or ordinal > env["max_concurrency"]
+        ):
+            raise RunnerError("commissioning reservation differs from its exact state capacity slot")
+        if invocation in by_invocation or ordinal in by_ordinal:
+            raise RunnerError("commissioning reservation duplicates an invocation or capacity slot")
+        by_invocation[invocation] = {"ordinal": ordinal, "sku": sku, "family": family}
+        by_ordinal[ordinal] = invocation
+    current_invocation = state["invocation"]
+    if current_invocation in by_invocation:
+        if by_invocation[current_invocation]["ordinal"] != current_ordinal:
+            raise RunnerError("current commissioning reservation changed capacity slot")
+    else:
+        if current_ordinal in by_ordinal:
+            raise RunnerError("commissioning capacity slot is already reserved")
+        by_invocation[current_invocation] = {
+            "ordinal": current_ordinal,
+            "sku": current_sku,
+            "family": SKU_FAMILY[current_sku],
+        }
+    active_invocations = set()
+    active_by_sku = {sku: 0 for sku in COMMISSIONING_SKU_POOL}
+    for vm in active:
+        tags = vm.get("tags") or {}
+        invocation = tags.get("invocation-binding", "")
+        slot = by_invocation.get(invocation)
+        hardware = vm.get("hardwareProfile") or vm.get("properties", {}).get("hardwareProfile", {})
+        if (
+            slot is None
+            or invocation in active_invocations
+            or tags.get("cell-ordinal") != str(slot["ordinal"])
+            or tags.get("selected-sku") != slot["sku"]
+            or tags.get("sku-family") != slot["family"]
+            or hardware.get("vmSize") != slot["sku"]
+        ):
+            raise RunnerError("commissioning active VM differs from its exact reservation capacity slot")
+        active_invocations.add(invocation)
+        active_by_sku[slot["sku"]] += 1
+    pending_by_sku = {sku: 0 for sku in COMMISSIONING_SKU_POOL}
+    for invocation, slot in by_invocation.items():
+        if invocation not in active_invocations:
+            pending_by_sku[slot["sku"]] += 1
+    snapshot = runner_quota_snapshot(env, COMMISSIONING_SKU_POOL)
+    for sku in COMMISSIONING_SKU_POOL:
+        quota = snapshot["families"][sku]
+        active_vcpus = active_by_sku[sku] * SKU_VCPUS[sku]
+        pending_vcpus = pending_by_sku[sku] * SKU_VCPUS[sku]
+        if max(quota["current"], active_vcpus) + pending_vcpus > quota["limit"]:
+            raise RunnerError("commissioning exact runner-family live quota and reservations are exhausted")
+    regional_active_vcpus = sum(active_by_sku[sku] * SKU_VCPUS[sku] for sku in COMMISSIONING_SKU_POOL)
+    regional_pending_vcpus = sum(pending_by_sku[sku] * SKU_VCPUS[sku] for sku in COMMISSIONING_SKU_POOL)
+    regional = snapshot["regional"]
+    if max(regional["current"], regional_active_vcpus) + regional_pending_vcpus > regional["limit"]:
+        raise RunnerError("commissioning regional live quota and reservations are exhausted")
+    return {
+        "cell_ordinal": current_ordinal,
+        "selected_sku": current_sku,
+        "reserved_slots": len(by_invocation),
+        "active_vcpus": regional_active_vcpus,
+        "pending_vcpus": regional_pending_vcpus,
+        "regional_limit_vcpus": regional["limit"],
+    }
+
+
+def commissioning_cost_gate(env, state, limits):
+    if not 1 <= env["max_concurrency"] <= 16 or env["budget_limit"] != 1500:
+        raise RunnerError("commissioning-bounded requires configured concurrency 1..16 and the exact $1500 alert budget")
+    if limits != state.get("request", {}).get("limits"):
+        raise RunnerError("commissioning cost limits differ from the exact prepared capacity slot")
+    exact_commissioning_budget(env)
+    inventory_reservation_ids = commissioning_inventory_gate(env, state)
+    rate = retail_rate(env, limits["sku"])
+    first_hour = itemized_cost_bound(rate, 1, limits)
+    first_day = itemized_cost_bound(rate, MAX_BILLABLE_LIFETIME_HOURS, limits)
+    if not 0 < first_day["total"] < float("inf"):
+        raise RunnerError("commissioning-bounded full 24-hour itemized maximum is not finite and positive")
+    reservations = list_management_reservations(env)
+    if {str(item["id"]).lower() for item in reservations} != inventory_reservation_ids:
+        raise RunnerError("commissioning reservation inventory differs across exact ARM boundaries")
+    seen_reservation_invocations = set()
+    reservation_invocations = set()
+    outstanding_reservations = []
+    reserved_total = 0.0
+    for reservation in reservations:
+        invocation = reservation["invocation-binding"]
+        if invocation in seen_reservation_invocations:
+            raise RunnerError("commissioning reservation invocation is duplicated")
+        seen_reservation_invocations.add(invocation)
+        reservation_state = load_state(env, invocation)
+        recorded_cost = reservation_state.get("cost") or {}
+        if (
+            recorded_cost.get("max_billable_lifetime_hours") != MAX_BILLABLE_LIFETIME_HOURS
+            or float(recorded_cost.get("max_increment", -1)) != reservation["amount_usd"]
+            or not reservation["amount_usd"] > 0
+            or reservation.get("selected-sku") != reservation_state.get("request", {}).get("limits", {}).get("sku")
+            or reservation.get("sku-family") != reservation_state.get("request", {}).get("limits", {}).get("sku_family")
+            or reservation.get("cell_ordinal") != reservation_state.get("request", {}).get("cell_ordinal")
+        ):
+            raise RunnerError("commissioning reservation is not bound to an exact full 24-hour maximum")
+        cleanup_verified_at = reservation.get("cleanup-verified-at", "none")
+        if cleanup_verified_at == "none":
+            reservation_invocations.add(invocation)
+            outstanding_reservations.append(reservation)
+            reserved_total += reservation["amount_usd"]
+        else:
+            try:
+                dt.datetime.fromisoformat(cleanup_verified_at.replace("Z", "+00:00"))
+            except (AttributeError, ValueError):
+                raise RunnerError("commissioning retained reservation cleanup marker is malformed")
+            if reservation_state.get("phase") not in ("complete", "absent-fenced"):
+                raise RunnerError("commissioning retained reservation claims cleanup before exact completion")
+    active = active_runner_vms(env)
+    active_invocations = set()
+    for vm in active:
+        invocation = (vm.get("tags") or {}).get("invocation-binding", "")
+        if not SAFE_INVOCATION.match(invocation) or invocation in active_invocations:
+            raise RunnerError("commissioning active VM invocation inventory is ambiguous")
+        if invocation not in reservation_invocations:
+            raise RunnerError("commissioning active VM has no exact durable full-day reservation")
+        active_invocations.add(invocation)
+    capacity = commissioning_capacity_gate(env, state, outstanding_reservations, active)
+    current_reserved = state["invocation"] in reservation_invocations
+    occupied = len(reservation_invocations)
+    if occupied > env["max_concurrency"] or (not current_reserved and occupied >= env["max_concurrency"]):
+        raise RunnerError("commissioning runner queue is at its bounded concurrency limit ({})".format(env["max_concurrency"]))
+    return {
+        "actual": None,
+        "forecast": None,
+        "hourly_rate": rate,
+        "first_hour": first_hour,
+        "first_day": first_day,
+        "max_network_bytes": limits["network_bytes"],
+        "max_billable_lifetime_hours": MAX_BILLABLE_LIFETIME_HOURS,
+        "max_increment": first_day["total"],
+        "outstanding_reservations": reserved_total,
+        "reserved_invocations": occupied,
+        "retained_reservations": len(reservations),
+        "active_runner_vms": len(active_invocations),
+        "capacity": capacity,
+        "admission_pressure": None,
+        "cost_admission_mode": COMMISSIONING_COST_ADMISSION_MODE,
+    }
+
+
+
+def shared_capacity_role(state):
+    resource_class = state["request"].get("resource_class")
+    if resource_class == "crosscheck-tool":
+        return "crosscheck"
+    return "validation"
+
+
+def shared_capacity_environment(env):
+    command_env = dict(os.environ)
+    command_env["FM_HOME"] = str(ROOT)
+    command_env["FM_AZURE_WORKER_STATE_DIR"] = str(
+        Path(os.environ.get("FM_AZURE_SHARED_CAPACITY_STATE_DIR", str(ROOT / "state" / "azure-workers"))).resolve()
     )
-    cost = budget_gate(env, limits, outstanding_reservations=outstanding)
-    ledger["reservations"][state["invocation"]] = {
+    if env["budget_limit"] == 1500:
+        command_env["FM_AZURE_WORKER_POLICY_PHASE"] = "commissioning"
+        command_env["FM_AZURE_WORKER_COMMISSIONING_CEILING_USD"] = "1500"
+    else:
+        command_env["FM_AZURE_WORKER_POLICY_PHASE"] = "steady"
+        command_env["FM_AZURE_WORKER_STEADY_TARGET_USD"] = str(env["budget_limit"])
+    return command_env
+
+
+def shared_capacity_reserve(env, state, cost):
+    request = state["request"]
+    limits = request["limits"]
+    fence = request.get("capacity_fence") or request["fence"].split(":", 1)[1]
+    command = [
+        sys.executable, str(WORKER_LIFECYCLE), "capacity-reserve",
+        "--reservation-id", state["invocation"],
+        "--fence-binding", fence,
+        "--role", shared_capacity_role(state),
+        "--sku", limits["sku"],
+        "--sku-family", limits["sku_family"],
+        "--vcpus", str(SKU_VCPUS[limits["sku"]]),
+        "--amount-usd", str(cost["max_increment"]),
+        "--confirm-subscription", env["subscription"],
+    ]
+    result = run(command, env=shared_capacity_environment(env))
+    try:
+        reservation = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        raise RunnerError("shared allocator returned a malformed capacity reservation")
+    if (
+        not isinstance(reservation, dict)
+        or reservation.get("reservation_id") != state["invocation"]
+        or reservation.get("status") not in ("queued", "reserved")
+    ):
+        raise RunnerError("shared allocator returned a reservation with the wrong identity")
+    state["shared_capacity_reservation"] = {
+        "reservation_id": state["invocation"],
+        "fence_binding": fence,
+        "status": reservation["status"],
+        "amount_usd": cost["max_increment"],
+        "sku": limits["sku"],
+        "sku_family": limits["sku_family"],
+        "actual_usd": reservation.get("actual_usd"),
+        "forecast_usd": reservation.get("forecast_usd"),
+        "admission_limit_usd": reservation.get("admission_limit_usd"),
+    }
+    save_state(env, state)
+    if reservation["status"] != "reserved":
+        raise RunnerError("shared allocator queued disposable-runner demand: {}".format(
+            str(reservation.get("reason") or "capacity unavailable")[:500]
+        ))
+    cost["actual"] = reservation.get("actual_usd")
+    cost["forecast"] = reservation.get("forecast_usd")
+    cost["shared_admission_limit"] = reservation.get("admission_limit_usd")
+    if not isinstance(cost["actual"], (int, float)) or not isinstance(cost["forecast"], (int, float)):
+        raise RunnerError("shared allocator omitted readable actual or forecast spend evidence")
+    if max(float(cost["actual"]), float(cost["forecast"])) + float(cost["max_increment"]) >= env["budget_limit"]:
+        raise RunnerError("shared actual/forecast cost pressure reaches the runner admission limit")
+    return cost
+
+
+def shared_capacity_release(env, state):
+    reservation = state.get("shared_capacity_reservation")
+    if not reservation or reservation.get("status") == "released":
+        return
+    fence = state["request"].get("capacity_fence") or state["request"]["fence"].split(":", 1)[1]
+    receipt = sha256_bytes(canonical_bytes({
         "invocation": state["invocation"],
         "fence": state["request"]["fence"],
-        "parent_invocation": state.get("parent_invocation"),
-        "lineage_root": state["request"]["lineage_root_invocation"],
-        "amount_usd": cost["max_increment"],
-        "status": "reserved",
-        "reserved_at": iso_utc(),
-        "compute_deallocation_deadline": state["request"]["compute_deallocation_deadline"],
-        "cost_bound": cost,
+        "resources": state.get("resources"),
+        "compute_absent_phase": state.get("phase"),
+    }))
+    run([
+        sys.executable, str(WORKER_LIFECYCLE), "capacity-release",
+        "--reservation-id", state["invocation"],
+        "--fence-binding", fence,
+        "--cleanup-receipt", receipt,
+        "--confirm-subscription", env["subscription"],
+    ], env=shared_capacity_environment(env))
+    reservation["status"] = "released"
+    reservation["cleanup_receipt"] = receipt
+    save_state(env, state)
+
+
+def runner_control_id(env):
+    return (
+        "/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Storage/storageAccounts/{}"
+        "/blobServices/default/containers/{}"
+    ).format(env["subscription"], env["resource_group"], env["control_storage"], CONTROL_CONTAINER)
+
+
+def reservation_name(env, invocation):
+    return "id-{}-rsv-{}".format(env["prefix"], require_invocation(invocation).split("-")[1])
+
+
+def reservation_id(env, invocation):
+    return exact_id(env, "Microsoft.ManagedIdentity", "userAssignedIdentities", reservation_name(env, invocation))
+
+
+def reservation_tags(env, state, amount_usd, reserved_at):
+    request = state["request"]
+    limits = request["limits"]
+    return {
+        "workload": "firstmate",
+        "firstmate-role": "runner-cost-reservation",
+        "deployment-generation": env["deployment_generation"],
+        "cleanup-owner": env["owner"],
+        "invocation-binding": state["invocation"],
+        "fence-digest": request["fence"].split(":", 1)[1],
+        "lineage-root": request["lineage_root_invocation"],
+        "parent-invocation": state.get("parent_invocation") or "none",
+        "amount-microusd": str(int(round(amount_usd * 1_000_000))),
+        "cost-admission-mode": request.get("cost_admission_mode", STRICT_COST_ADMISSION_MODE),
+        "cell-ordinal": str(request.get("cell_ordinal") or "none"),
+        "selected-sku": limits["sku"],
+        "sku-family": limits["sku_family"],
+        "reserved-at": reserved_at,
+        "compute-deadline": request["compute_deallocation_deadline"],
+        "cleanup-verified-at": "none",
+        "reservation-principal": "pending",
     }
-    ledger["updated_at"] = iso_utc()
-    save_reservation_ledger(env, state, ledger, lease)
+
+
+def parse_management_reservation(env, identity):
+    tags = identity.get("tags") or {}
+    if tags.get("firstmate-role") != "runner-cost-reservation":
+        return None
+    invocation = tags.get("invocation-binding", "")
+    expected_id = reservation_id(env, invocation) if SAFE_INVOCATION.match(invocation) else ""
+    parent = tags.get("parent-invocation", "")
+    properties = identity.get("properties", identity)
+    principal_id = properties.get("principalId") or identity.get("principalId")
+    selected_sku = tags.get("selected-sku", "")
+    cell_ordinal = tags.get("cell-ordinal", "")
+    mode = tags.get("cost-admission-mode")
+    if mode == COMMISSIONING_COST_ADMISSION_MODE:
+        try:
+            ordinal = int(cell_ordinal)
+        except (TypeError, ValueError):
+            ordinal = 0
+        exact_slot = 1 <= ordinal <= 16 and selected_sku == COMMISSIONING_SKU_POOL[(ordinal - 1) // 2]
+    else:
+        exact_slot = cell_ordinal == "none"
+    if (
+        str(identity.get("id", "")).lower() != expected_id.lower()
+        or identity.get("location") != "eastus"
+        or tags.get("workload") != "firstmate"
+        or tags.get("deployment-generation") != env["deployment_generation"]
+        or tags.get("cleanup-owner") != env["owner"]
+        or not re.match(r"^[0-9a-f]{64}$", tags.get("fence-digest", ""))
+        or not SAFE_INVOCATION.match(tags.get("lineage-root", ""))
+        or (parent != "none" and not SAFE_INVOCATION.match(parent))
+        or not tags.get("amount-microusd", "").isdigit()
+        or mode not in {
+            STRICT_COST_ADMISSION_MODE, COMMISSIONING_COST_ADMISSION_MODE,
+        }
+        or selected_sku not in SKU_FAMILY
+        or tags.get("sku-family") != SKU_FAMILY.get(selected_sku)
+        or not exact_slot
+        or not principal_id
+        or tags.get("reservation-principal") != principal_id
+    ):
+        raise RunnerError("durable cost reservation identity/tags are not exact")
+    result = dict(tags)
+    result["id"] = identity["id"]
+    result["etag"] = identity.get("etag")
+    result["principal_id"] = principal_id
+    result["amount_usd"] = int(tags["amount-microusd"]) / 1_000_000
+    result["cell_ordinal"] = None if cell_ordinal == "none" else int(cell_ordinal)
+    return result
+
+
+def list_management_reservations(env):
+    identities, _, _ = az_command(env, ["identity", "list", "--resource-group", env["resource_group"]])
+    reservations = []
+    for item in identities:
+        if (item.get("tags") or {}).get("firstmate-role") != "runner-cost-reservation":
+            continue
+        exact, _, _ = az_command(env, [
+            "resource", "show", "--ids", item["id"], "--api-version", "2023-01-31",
+        ])
+        parsed = parse_management_reservation(env, exact)
+        if parsed is not None:
+            require_zero_effective_rbac(env, parsed["principal_id"], "cost reservation principal")
+            reservations.append(parsed)
+    return reservations
+
+
+def reconcile_management_reservations(env, reservations):
+    retained = []
+    for entry in reservations:
+        cleanup_text = entry.get("cleanup-verified-at")
+        if cleanup_text == "none":
+            retained.append(entry)
+            continue
+        try:
+            cleanup_at = dt.datetime.fromisoformat(cleanup_text.replace("Z", "+00:00"))
+            state = load_state(env, entry["invocation-binding"])
+        except (RunnerError, TypeError, ValueError):
+            retained.append(entry)
+            continue
+        if state.get("phase") not in ("complete", "absent-fenced") or now_utc() < cleanup_at + dt.timedelta(hours=72):
+            retained.append(entry)
+            continue
+        cost_query(env, forecast=False, invocation=entry["invocation-binding"], reserved_at=entry["reserved-at"])
+        reread, _, _ = az_command(env, ["resource", "show", "--ids", entry["id"], "--api-version", "2023-01-31"])
+        exact = parse_management_reservation(env, reread)
+        require_zero_effective_rbac(env, exact["principal_id"], "reconciled cost reservation principal")
+        if exact["principal_id"] != entry["principal_id"]:
+            raise RunnerError("reconciled cost reservation immutable identity changed")
+        delete_args = ["rest", "--method", "delete", "--url", resource_url(entry["id"], "2023-01-31")]
+        if exact.get("etag"):
+            delete_args += ["--headers", "If-Match={}".format(exact["etag"])]
+        _, rc, stderr = az_command(env, delete_args, check=False)
+        if rc != 0:
+            raise RunnerError("reconciled cost reservation deletion failed: {}".format(stderr))
+    return retained
+
+
+def reserve_budget_management(env, state, lease, limits, admitted_cost=None):
+    lease.assert_held()
+    reservations = reconcile_management_reservations(env, list_management_reservations(env))
+    existing = [item for item in reservations if item["invocation-binding"] == state["invocation"]]
+    if len(existing) > 1:
+        raise RunnerError("durable cost reservation identity is ambiguous")
+    if existing:
+        expected_fence = state["request"]["fence"].split(":", 1)[1]
+        if (
+            existing[0]["fence-digest"] != expected_fence
+            or existing[0]["lineage-root"] != state["request"]["lineage_root_invocation"]
+            or existing[0]["cost-admission-mode"]
+            != state["request"].get("cost_admission_mode", STRICT_COST_ADMISSION_MODE)
+        ):
+            raise RunnerError("cost reservation invocation/fence lineage is not exact")
+        lease.assert_held()
+        existing_cost = state.get("cost")
+        if existing_cost:
+            return existing_cost
+        if admitted_cost is not None:
+            return admitted_cost
+        return budget_gate(
+            env, limits,
+            outstanding_reservations=sum(
+                item["amount_usd"] for item in reservations if item["id"] != existing[0]["id"]
+            ),
+            parent_managed=bool(state["request"].get("capacity_parent")),
+        )
+    outstanding = sum(item["amount_usd"] for item in reservations)
+    if admitted_cost is not None:
+        cost = admitted_cost
+    else:
+        cost = budget_gate(
+            env, limits, outstanding_reservations=outstanding,
+            parent_managed=bool(state["request"].get("capacity_parent")),
+        )
+    tags = reservation_tags(env, state, cost["max_increment"], iso_utc())
+    az_command(env, [
+        "identity", "create", "--resource-group", env["resource_group"], "--name", reservation_name(env, state["invocation"]),
+        "--location", "eastus", "--tags",
+    ] + ["{}={}".format(key, value) for key, value in sorted(tags.items())])
+    lease.renew_and_assert()
+    reread, _, _ = az_command(env, ["resource", "show", "--ids", reservation_id(env, state["invocation"]), "--api-version", "2023-01-31"])
+    principal_id = reread.get("properties", {}).get("principalId") or reread.get("principalId")
+    if not principal_id or (reread.get("tags") or {}) != tags:
+        raise RunnerError("durable cost reservation initial binding is not exact")
+    tags["reservation-principal"] = principal_id
+    az_command(env, [
+        "rest", "--method", "patch", "--url", resource_url(reread["id"], "2023-01-31"),
+        "--headers", "Content-Type=application/json",
+        "--body", json.dumps({"location": "eastus", "tags": tags}, separators=(",", ":")),
+    ])
+    reread, _, _ = az_command(env, ["resource", "show", "--ids", reservation_id(env, state["invocation"]), "--api-version", "2023-01-31"])
+    parsed = parse_management_reservation(env, reread)
+    if (
+        parsed is None
+        or parsed["fence-digest"] != tags["fence-digest"]
+        or parsed["cost-admission-mode"] != tags["cost-admission-mode"]
+    ):
+        raise RunnerError("durable cost reservation changed before compute admission")
+    require_zero_effective_rbac(env, parsed["principal_id"], "new cost reservation principal")
     lease.assert_held()
     return cost
 
 
-def mark_reservation_cleanup_verified(env, state):
-    with AdmissionLease(env, state) as lease:
-        ledger = load_reservation_ledger(env, state, lease)
-        entry = ledger["reservations"].get(state["invocation"])
-        if entry is None:
-            raise RunnerError("cost reservation is absent after compute cleanup")
-        if entry.get("fence") != state["request"]["fence"] or entry.get("status") != "reserved":
+def mark_management_reservation_cleanup_verified(env, state):
+    with ManagementAdmissionLease(env, state) as lease:
+        identity, _, _ = az_command(env, [
+            "resource", "show", "--ids", reservation_id(env, state["invocation"]), "--api-version", "2023-01-31",
+        ])
+        entry = parse_management_reservation(env, identity)
+        expected_fence = state["request"]["fence"].split(":", 1)[1]
+        expected_mode = state["request"].get("cost_admission_mode", STRICT_COST_ADMISSION_MODE)
+        if (
+            entry is None
+            or entry["fence-digest"] != expected_fence
+            or entry["cost-admission-mode"] != expected_mode
+            or entry["cleanup-verified-at"] != "none"
+        ):
             raise RunnerError("cost reservation cleanup binding is not exact")
-        entry["cleanup_verified_at"] = iso_utc()
-        ledger["updated_at"] = iso_utc()
-        save_reservation_ledger(env, state, ledger, lease)
+        require_zero_effective_rbac(env, entry["principal_id"], "cleanup cost reservation principal")
+        tags = dict(identity.get("tags") or {})
+        tags["cleanup-verified-at"] = iso_utc()
+        update_args = [
+            "rest", "--method", "patch", "--url", resource_url(identity["id"], "2023-01-31"),
+            "--headers", "Content-Type=application/json",
+            "--body", json.dumps({"location": "eastus", "tags": tags}, separators=(",", ":")),
+        ]
+        if identity.get("etag"):
+            update_args[6:6] = ["If-Match={}".format(identity["etag"])]
+        az_command(env, update_args)
+        lease.renew_and_assert()
+
+
+def verify_all_reservation_rbac_zero(env):
+    for reservation in list_management_reservations(env):
+        require_zero_effective_rbac(env, reservation["principal_id"], "pre-create cost reservation principal")
 
 
 def active_runner_vms(env):
     vms, _, _ = az_command(env, ["vm", "list", "--resource-group", env["resource_group"], "--show-details"])
     active = []
     for vm in vms:
+        assigned = list((vm.get("identity") or {}).get("userAssignedIdentities", {}))
+        reservation_fragment = "/userAssignedIdentities/id-{}-rsv-".format(env["prefix"]).lower()
+        if any(reservation_fragment in str(identity_id).lower() for identity_id in assigned):
+            raise RunnerError("runner VM attaches a cost reservation identity")
         tags = vm.get("tags") or {}
         if tags.get("firstmate-role") != "validation-shard":
             continue
@@ -1347,107 +2403,134 @@ def active_runner_vms(env):
     return active
 
 
-def ensure_admission_blob(env, state):
-    empty = env["state_dir"] / ".admission-empty"
-    empty.touch(mode=0o600, exist_ok=True)
-    args = [
-        "storage", "blob", "upload", "--auth-mode", "login", "--account-name", env["storage"],
-        "--container-name", CONTAINER, "--name", state["staging"]["admission_blob"], "--file", str(empty),
-        "--overwrite", "false",
-    ]
-    _, rc, _ = az_command(env, args, check=False)
-    if rc != 0:
-        exists, _, _ = az_command(env, [
-            "storage", "blob", "exists", "--auth-mode", "login", "--account-name", env["storage"],
-            "--container-name", CONTAINER, "--name", state["staging"]["admission_blob"],
-        ])
-        if not exists.get("exists"):
-            raise RunnerError("admission-lock blob could not be created or proven present")
+def validation_capacity_parent_gate(env, state):
+    parent = state["request"].get("capacity_parent")
+    if not parent:
+        return
+    reservation = int(state["request"]["capacity_reservation_vcpus"])
+    vms, _, _ = az_command(env, [
+        "vm", "list", "--resource-group", env["resource_group"], "--show-details",
+    ])
+    parents = []
+    child_count = 0
+    for vm in vms:
+        tags = vm.get("tags") or {}
+        if "deallocated" in str(vm.get("powerState", "")).lower():
+            continue
+        if tags.get("firstmate-role") == "validation-cell" and tags.get("validation-cell") == parent:
+            parents.append(vm)
+        if tags.get("firstmate-role") == "validation-shard" and tags.get("capacity-parent") == parent:
+            child_count += 1
+    if len(parents) != 1:
+        raise RunnerError("capacity parent cell is absent, deallocated, or ambiguous")
+    tags = parents[0].get("tags") or {}
+    expected = {
+        "workload": "firstmate",
+        "firstmate-role": "validation-cell",
+        "lifecycle": "elastic-scale-to-zero",
+        "deployment-generation": env["deployment_generation"],
+        "cleanup-owner": env["owner"],
+        "home-binding": state["request"]["home_binding"],
+        "validation-cell": parent,
+        "reserved-vcpus": str(reservation),
+    }
+    if any(tags.get(key) != value for key, value in expected.items()):
+        raise RunnerError("capacity parent owner/generation/home/reservation identity is not exact")
+    if child_count >= max(0, (reservation - 8) // 4):
+        raise RunnerError("capacity parent has no reserved processor slot for another shard")
 
 
-def ensure_reservation_blob(env, state):
-    path = write_private_json(env, ".reservations-initial-", empty_reservation_ledger(env))
-    try:
-        _, rc, _ = az_command(env, [
-            "storage", "blob", "upload", "--auth-mode", "login", "--account-name", env["storage"],
-            "--container-name", CONTAINER, "--name", state["staging"]["reservation_blob"],
-            "--file", str(path), "--overwrite", "false",
-        ], check=False)
-        if rc != 0:
-            exists, _, _ = az_command(env, [
-                "storage", "blob", "exists", "--auth-mode", "login", "--account-name", env["storage"],
-                "--container-name", CONTAINER, "--name", state["staging"]["reservation_blob"],
-            ])
-            if not exists.get("exists"):
-                raise RunnerError("cost reservation ledger blob could not be created or proven present")
-    finally:
-        path.unlink(missing_ok=True)
+class ManagementAdmissionLease:
+    """Single management-resource CAS owner for admission and reservations."""
 
-
-class AdmissionLease:
     def __init__(self, env, state):
         self.env = env
         self.state = state
-        self.admission_lease_id = str(uuid.uuid4())
-        self.reservation_lease_id = str(uuid.uuid4())
+        self.fence = state["request"]["fence"].split(":", 1)[1]
+        self.etag = None
         self.stop = threading.Event()
         self.failed = threading.Event()
         self.thread = None
         self.renew_lock = threading.Lock()
         self.expiry_lock = threading.Lock()
-        self.expires_at = {"admission": 0.0, "reservation": 0.0}
+        self.expires_at = 0.0
 
-    def _lease_args(self, operation, blob_name, lease_id):
-        args = [
-            "storage", "blob", "lease", operation, "--auth-mode", "login", "--account-name", self.env["storage"],
-            "--container-name", CONTAINER, "--blob-name", blob_name,
-        ]
-        if operation == "acquire":
-            args += ["--lease-duration", "60", "--proposed-lease-id", lease_id]
-        else:
-            args += ["--lease-id", lease_id]
-        return args
+    def _read(self):
+        resource, _, _ = az_command(self.env, [
+            "resource", "show", "--ids", runner_control_id(self.env), "--api-version", "2023-05-01",
+        ], timeout_seconds=LEASE_RENEW_TIMEOUT_SECONDS)
+        metadata = resource.get("properties", {}).get("metadata") or {}
+        allowed = {"schema", "deploymentgeneration", "lockowner", "lockfence", "lockexpiry"}
+        owner = metadata.get("lockowner", "")
+        fence = metadata.get("lockfence", "")
+        expiry = metadata.get("lockexpiry", "")
+        if (
+            metadata.get("schema") != "fm-azure-runner-control-v1"
+            or metadata.get("deploymentgeneration") != self.env["deployment_generation"]
+            or not set(metadata).issubset(allowed)
+            or bool(owner) != bool(fence) or bool(owner) != bool(expiry)
+            or (fence and not re.match(r"^[0-9a-f]{64}$", fence))
+            or (owner and not SAFE_INVOCATION.match(owner))
+        ):
+            raise RunnerError("runner management control resource binding is not exact")
+        etag = resource.get("etag") or resource.get("properties", {}).get("etag")
+        if not etag:
+            raise RunnerError("runner management control resource has no ETag")
+        return metadata, etag
 
-    def _lease_call(self, operation, blob_name, lease_id):
-        return az_command(
-            self.env, self._lease_args(operation, blob_name, lease_id), check=False,
-            timeout_seconds=LEASE_RENEW_TIMEOUT_SECONDS,
-        )
+    def _cas(self, etag, metadata):
+        body = {"properties": {"publicAccess": "None", "metadata": metadata}}
+        result, rc, stderr = az_command(self.env, [
+            "rest", "--method", "put", "--url", resource_url(runner_control_id(self.env), "2023-05-01"),
+            "--headers", "If-Match={}".format(etag), "Content-Type=application/json",
+            "--body", json.dumps(body, separators=(",", ":")),
+        ], check=False, timeout_seconds=LEASE_RENEW_TIMEOUT_SECONDS)
+        if rc != 0:
+            raise RunnerError("runner management lease CAS failed: {}".format(stderr))
+        response_etag = (result or {}).get("etag") or (result or {}).get("properties", {}).get("etag")
+        current_metadata, new_etag = self._read()
+        if current_metadata != metadata or (response_etag and response_etag != new_etag):
+            raise RunnerError("runner management lease CAS did not retain its exact metadata/ETag")
+        return new_etag
 
-    def _record_success(self, label):
+    def _record_success(self):
         with self.expiry_lock:
-            self.expires_at[label] = time.monotonic() + LEASE_DURATION_SECONDS
+            self.expires_at = time.monotonic() + LEASE_DURATION_SECONDS
 
     def __enter__(self):
-        ensure_admission_blob(self.env, self.state)
-        acquired = False
         for _ in range(7):
-            _, rc, _ = self._lease_call(
-                "acquire", self.state["staging"]["admission_blob"], self.admission_lease_id
-            )
-            if rc == 0:
-                self._record_success("admission")
-                acquired = True
-                break
-            time.sleep(10)
-        if not acquired:
-            raise RunnerError("runner admission lock is busy or unreachable")
+            metadata, etag = self._read()
+            expiry = metadata.get("lockexpiry")
+            busy = False
+            if metadata.get("lockowner") and expiry:
+                try:
+                    busy = now_utc() < dt.datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+                except ValueError:
+                    raise RunnerError("runner management lock expiry is malformed")
+            if busy:
+                time.sleep(10)
+                continue
+            updated = {
+                "schema": "fm-azure-runner-control-v1",
+                "deploymentgeneration": self.env["deployment_generation"],
+                "lockowner": self.state["invocation"],
+                "lockfence": self.fence,
+                "lockexpiry": iso_utc(now_utc() + dt.timedelta(seconds=LEASE_DURATION_SECONDS)),
+            }
+            try:
+                self.etag = self._cas(etag, updated)
+            except RunnerError:
+                time.sleep(10)
+                continue
+            self._record_success()
+            break
+        else:
+            raise RunnerError("runner management admission lock is busy or unreachable")
         try:
-            ensure_reservation_blob(self.env, self.state)
-            _, reservation_rc, _ = self._lease_call(
-                "acquire", self.state["staging"]["reservation_blob"], self.reservation_lease_id
-            )
-            if reservation_rc != 0:
-                raise RunnerError("cost reservation ledger lease is busy or unreachable")
-            self._record_success("reservation")
             self.renew_and_assert()
         except Exception:
-            for blob_name, lease_id in (
-                (self.state["staging"]["reservation_blob"], self.reservation_lease_id),
-                (self.state["staging"]["admission_blob"], self.admission_lease_id),
-            ):
-                with contextlib.suppress(RunnerError):
-                    self._lease_call("release", blob_name, lease_id)
+            with contextlib.suppress(RunnerError):
+                self._release()
             raise
         self.thread = threading.Thread(target=self._renew, daemon=True)
         self.thread.start()
@@ -1464,14 +2547,12 @@ class AdmissionLease:
     def renew_and_assert(self):
         try:
             with self.renew_lock:
-                for blob_name, lease_id, label in (
-                    (self.state["staging"]["admission_blob"], self.admission_lease_id, "admission"),
-                    (self.state["staging"]["reservation_blob"], self.reservation_lease_id, "reservation"),
-                ):
-                    _, rc, stderr = self._lease_call("renew", blob_name, lease_id)
-                    if rc != 0:
-                        raise RunnerError("runner {} lease renewal failed: {}".format(label, stderr))
-                    self._record_success(label)
+                metadata, etag = self._read()
+                if metadata.get("lockowner") != self.state["invocation"] or metadata.get("lockfence") != self.fence or etag != self.etag:
+                    raise RunnerError("runner management lease owner/fence/ETag changed")
+                metadata["lockexpiry"] = iso_utc(now_utc() + dt.timedelta(seconds=LEASE_DURATION_SECONDS))
+                self.etag = self._cas(etag, metadata)
+                self._record_success()
         except Exception:
             self.failed.set()
             raise
@@ -1479,77 +2560,26 @@ class AdmissionLease:
 
     def assert_held(self):
         if self.failed.is_set():
-            raise RunnerError("runner admission lease renewal failed; no command was started")
+            raise RunnerError("runner management lease renewal failed; no command was started")
         with self.expiry_lock:
-            remaining = {
-                label: expiry - time.monotonic()
-                for label, expiry in self.expires_at.items()
-            }
-        stale = [label for label, seconds in remaining.items() if seconds <= LEASE_SAFETY_MARGIN_SECONDS]
-        if stale:
+            remaining = self.expires_at - time.monotonic()
+        if remaining <= LEASE_SAFETY_MARGIN_SECONDS:
             self.failed.set()
-            raise RunnerError("runner lease expiry safety margin exhausted for {}; no command was started".format(
-                ", ".join(sorted(stale))
-            ))
+            raise RunnerError("runner management lease expiry safety margin exhausted; no command was started")
+
+    def _release(self):
+        metadata, etag = self._read()
+        if metadata.get("lockowner") != self.state["invocation"] or metadata.get("lockfence") != self.fence or etag != self.etag:
+            return
+        metadata.update({"lockowner": "", "lockfence": "", "lockexpiry": ""})
+        self.etag = self._cas(etag, metadata)
 
     def __exit__(self, exc_type, exc, traceback):
         self.stop.set()
         if self.thread:
             self.thread.join(timeout=2)
-        for blob_name, lease_id in (
-            (self.state["staging"]["reservation_blob"], self.reservation_lease_id),
-            (self.state["staging"]["admission_blob"], self.admission_lease_id),
-        ):
-            with contextlib.suppress(RunnerError):
-                self._lease_call("release", blob_name, lease_id)
-
-
-def storage_upload(env, local_path, blob, overwrite=False):
-    args = [
-        "storage", "blob", "upload", "--auth-mode", "login", "--account-name", env["storage"],
-        "--container-name", CONTAINER, "--name", blob, "--file", str(local_path),
-        "--overwrite", "true" if overwrite else "false",
-    ]
-    az_command(env, args)
-
-
-def storage_download(env, blob, local_path):
-    az_command(env, [
-        "storage", "blob", "download", "--auth-mode", "login", "--account-name", env["storage"],
-        "--container-name", CONTAINER, "--name", blob, "--file", str(local_path), "--overwrite", "true",
-    ])
-
-
-def storage_delete(env, blob):
-    exists, _, _ = az_command(env, [
-        "storage", "blob", "exists", "--auth-mode", "login", "--account-name", env["storage"],
-        "--container-name", CONTAINER, "--name", blob,
-    ])
-    if not exists.get("exists"):
-        return
-    _, rc, stderr = az_command(env, [
-        "storage", "blob", "delete", "--auth-mode", "login", "--account-name", env["storage"],
-        "--container-name", CONTAINER, "--name", blob, "--delete-snapshots", "include",
-    ], check=False)
-    if rc != 0:
-        raise RunnerError("exact staging blob deletion failed: {}".format(stderr))
-    remains, _, _ = az_command(env, [
-        "storage", "blob", "exists", "--auth-mode", "login", "--account-name", env["storage"],
-        "--container-name", CONTAINER, "--name", blob,
-    ])
-    if remains.get("exists"):
-        raise RunnerError("exact staging blob remains after deletion")
-
-
-def blob_sas(env, blob, permissions, expiry):
-    stdout, rc, stderr = az_command(env, [
-        "storage", "blob", "generate-sas", "--as-user", "--auth-mode", "login", "--https-only",
-        "--account-name", env["storage"], "--container-name", CONTAINER, "--name", blob,
-        "--permissions", permissions, "--expiry", expiry, "--full-uri", "--output", "tsv",
-    ], parse_json=False)
-    if rc != 0 or not stdout.startswith("https://"):
-        raise RunnerError("object-scoped user-delegation SAS creation failed: {}".format(stderr))
-    return stdout
+        with contextlib.suppress(RunnerError):
+            self._release()
 
 
 def ownership_tags(env, state):
@@ -1564,6 +2594,8 @@ def ownership_tags(env, state):
         "home-binding": request["home_binding"],
         "task-binding": request["task"],
         "task-generation": request["generation"],
+        "capacity-parent": request.get("capacity_parent") or "none",
+        "capacity-reservation-vcpus": str(request.get("capacity_reservation_vcpus") or 0),
         "invocation-binding": state["invocation"],
         "attempt": str(state["attempt"]),
         "fence": request["fence"],
@@ -1572,6 +2604,7 @@ def ownership_tags(env, state):
         "resource-class": request["resource_class"],
         "selected-sku": request["limits"]["sku"],
         "sku-family": request["limits"]["sku_family"],
+        "cell-ordinal": str(request.get("cell_ordinal") or "none"),
         "cost-attribution": "validation-shard",
         "expiry-utc": request["compute_deallocation_deadline"],
         "cleanup-token": token,
@@ -1595,6 +2628,7 @@ def deployment_parameters(env, state):
             "nicName": {"value": resources["nic_name"]},
             "osDiskName": {"value": resources["os_disk_name"]},
             "subnetId": {"value": subnet_id},
+            "controllerIdentityId": {"value": exact_id(env, "Microsoft.ManagedIdentity", "userAssignedIdentities", env["controller_identity"])},
             "vmSize": {"value": request["limits"]["sku"]},
             "expiryUtc": {"value": iso_utc(expiry)},
             "expiryTimeOfDay": {"value": expiry.strftime("%H%M")},
@@ -1659,6 +2693,8 @@ def adopt_vm_identity(env, state, vm):
     instance_id = vm_properties.get("vmId")
     nic_ids = [item.get("id") for item in vm_properties.get("networkProfile", {}).get("networkInterfaces", [])]
     os_disk_id = vm_properties.get("storageProfile", {}).get("osDisk", {}).get("managedDisk", {}).get("id")
+    expected_identity_id = exact_id(env, "Microsoft.ManagedIdentity", "userAssignedIdentities", env["controller_identity"])
+    assigned_identities = list((vm.get("identity") or vm_properties.get("identity") or {}).get("userAssignedIdentities", {}))
     if (
         not vm_id
         or not instance_id
@@ -1666,6 +2702,7 @@ def adopt_vm_identity(env, state, vm):
         or vm_id.lower() != resources["vm_id"].lower()
         or nic_ids[0].lower() != resources["nic_id"].lower()
         or str(os_disk_id).lower() != resources["os_disk_id"].lower()
+        or [item.lower() for item in assigned_identities] != [expected_identity_id.lower()]
     ):
         raise RunnerError("created VM identity inventory is incomplete or differs from the fenced plan")
     identities = {}
@@ -1729,7 +2766,7 @@ def create_vm(env, state):
     if not exists:
         raise RunnerError("runner deployment completed without its exact VM")
     adopt_vm_identity(env, state, vm)
-    transition(env, state, "vm-created", "exact identity-less VM/NIC/OS disk created")
+    transition(env, state, "vm-created", "exact private controller VM/UAMI/NIC/OS disk created")
 
 
 def managed_run_command_id(state):
@@ -1765,25 +2802,122 @@ def verify_ttl_schedule(state, resource):
         raise RunnerError("control-plane TTL schedule binding is not exact")
 
 
-def create_run_command(env, state, input_url, output_url):
+def private_snapshot_record(env, state):
+    blob = state["staging"].get("input_blob")
+    if not blob:
+        return None
+    value, rc, stderr = az_command(env, [
+        "storage", "blob", "show", "--auth-mode", "login",
+        "--account-name", env["storage"], "--container-name", CONTAINER,
+        "--name", blob,
+    ], check=False)
+    if rc != 0:
+        exists, exists_rc, exists_stderr = az_command(env, [
+            "storage", "blob", "exists", "--auth-mode", "login",
+            "--account-name", env["storage"], "--container-name", CONTAINER,
+            "--name", blob,
+        ], check=False)
+        if exists_rc != 0:
+            raise RunnerError("private snapshot existence is ambiguous: {}; {}".format(stderr, exists_stderr))
+        if not exists.get("exists"):
+            return None
+        raise RunnerError("private snapshot exists but its exact identity is unreadable")
+    return value
+
+
+def verify_private_snapshot_record(state, value):
+    repository = state["request"]["repository"]
+    properties = value.get("properties", value)
+    metadata = value.get("metadata") or properties.get("metadata") or {}
+    etag = value.get("etag") or properties.get("etag")
+    if (
+        not etag
+        or int(properties.get("contentLength", value.get("contentLength", -1))) != repository["snapshot_bytes"]
+        or metadata != {
+            "snapshotdigest": repository["snapshot_digest"].split(":", 1)[1],
+            "commit": repository["commit"],
+        }
+    ):
+        raise RunnerError("private snapshot blob size/digest/commit identity is not exact")
+    return etag
+
+
+def stage_private_snapshot(env, state):
+    blob = state["staging"].get("input_blob")
+    if not blob:
+        return
+    existing = private_snapshot_record(env, state)
+    if existing is not None:
+        state["staging"]["input_blob_etag"] = verify_private_snapshot_record(state, existing)
+        save_state(env, state)
+        return
+    source = Path(state["input_path"]).parent / "snapshot.bundle"
+    repository = state["request"]["repository"]
+    if (
+        not source.is_file()
+        or "sha256:" + sha256_file(source) != repository["snapshot_digest"]
+        or source.stat().st_size != repository["snapshot_bytes"]
+    ):
+        raise RunnerError("private snapshot payload differs from its request binding")
+    az_command(env, [
+        "storage", "blob", "upload", "--auth-mode", "login",
+        "--account-name", env["storage"], "--container-name", CONTAINER,
+        "--name", blob, "--file", str(source), "--overwrite", "false",
+        "--metadata",
+        "snapshotdigest={}".format(repository["snapshot_digest"].split(":", 1)[1]),
+        "commit={}".format(repository["commit"]),
+    ])
+    created = private_snapshot_record(env, state)
+    if created is None:
+        raise RunnerError("private snapshot upload completed without its exact blob")
+    state["staging"]["input_blob_etag"] = verify_private_snapshot_record(state, created)
+    save_state(env, state)
+
+
+def delete_private_snapshot(env, state):
+    blob = state["staging"].get("input_blob")
+    if not blob:
+        return
+    value = private_snapshot_record(env, state)
+    if value is None:
+        return
+    etag = verify_private_snapshot_record(state, value)
+    if state["staging"].get("input_blob_etag") != etag:
+        raise RunnerError("private snapshot blob ETag changed; cleanup retained")
+    _, rc, stderr = az_command(env, [
+        "storage", "blob", "delete", "--auth-mode", "login",
+        "--account-name", env["storage"], "--container-name", CONTAINER,
+        "--name", blob, "--if-match", etag,
+    ], check=False)
+    if rc != 0:
+        raise RunnerError("private snapshot conditional delete failed: {}".format(stderr))
+    if private_snapshot_record(env, state) is not None:
+        raise RunnerError("private snapshot remains after exact deletion")
+
+
+def create_run_command(env, state):
     current_guest_digest = "sha256:" + sha256_file(GUEST)
     if current_guest_digest != state["request"]["protocol"]["guest_digest"]:
         raise RunnerError("trusted guest protocol changed after request preparation")
     script = GUEST.read_text(encoding="utf-8")
+    request_b64 = base64.b64encode(Path(state["input_path"]).read_bytes()).decode("ascii")
+    executor_b64 = base64.b64encode(EXECUTOR.read_bytes()).decode("ascii")
     properties = {
         "location": "eastus",
         "tags": ownership_tags(env, state),
         "properties": {
             "source": {"script": script},
             "parameters": [
-                {"name": "input_digest", "value": state["input_digest"]},
+                {"name": "request_b64", "value": request_b64},
                 {"name": "vm_resource_id", "value": state["resources"]["vm_id"]},
                 {"name": "vm_instance_id", "value": state["resources"]["vm_instance_id"]},
                 {"name": "guest_digest", "value": state["request"]["protocol"]["guest_digest"]},
-            ],
-            "protectedParameters": [
-                {"name": "input_url", "value": input_url},
-                {"name": "output_url", "value": output_url},
+                {"name": "storage_account", "value": env["storage"]},
+                {"name": "container", "value": CONTAINER},
+                {"name": "output_blob", "value": state["staging"]["output_blob"]},
+                {"name": "input_blob", "value": state["staging"].get("input_blob") or "none"},
+                {"name": "identity_client_id", "value": env["controller_identity_client_id"]},
+                {"name": "executor_b64", "value": executor_b64},
             ],
             "asyncExecution": False,
             "timeoutInSeconds": state["request"]["limits"]["wall_seconds"] + 1200,
@@ -1838,66 +2972,29 @@ def poll_run_command(env, state):
             error = str(view.get("error", ""))
             if execution != "Succeeded":
                 raise RunnerError("managed run command failed ({}, {}): {}".format(execution, provisioning, error[-1000:]))
-            marker = re.search(r"FM_AZURE_RESULT\s+(sha256:[0-9a-f]{64})\s+boot=([0-9a-f-]{36})", output)
+            marker = re.search(r"FM_AZURE_RESULT\s+(sha256:[0-9a-f]{64})\s+boot=([0-9a-f-]{36})\s+result=([A-Za-z0-9+/=]+)", output)
             if not marker:
                 raise RunnerError("managed run command completed without a valid result identity marker")
             state["expected_result_digest"] = marker.group(1)
             state["expected_boot_id"] = marker.group(2)
+            try:
+                state["control_plane_result"] = json.loads(base64.b64decode(marker.group(3), validate=True))
+            except (ValueError, json.JSONDecodeError) as exc:
+                raise RunnerError("managed run command returned malformed bounded result: {}".format(exc))
             transition(env, state, "result-published", "guest published digest-bound output")
             return
         time.sleep(10)
     raise RunnerError("managed run command exceeded its control-plane completion bound")
 
 
-def safe_extract_result(archive_path, destination):
-    allowed = {"result.json", "stdout.log", "stderr.log"}
-    with tarfile.open(archive_path, "r:gz") as archive:
-        members = archive.getmembers()
-        for member in members:
-            name = member.name
-            if name in allowed or name == "artifacts":
-                pass
-            elif name.startswith("artifacts/") and require_artifact(name[len("artifacts/"):]):
-                pass
-            else:
-                raise RunnerError("result archive contains an undeclared path: {}".format(name))
-            if member.issym() or member.islnk() or member.isdev():
-                raise RunnerError("result archive contains a link/device")
-            target = (destination / name).resolve()
-            if destination.resolve() not in target.parents and target != destination.resolve():
-                raise RunnerError("result archive path escapes destination")
-        archive.extractall(str(destination), members=members)
-
 
 def collect_result(env, state):
     result_dir = env["state_dir"] / "results" / state["invocation"]
     if result_dir.exists():
         raise RunnerError("result destination already exists; collection will not overwrite it")
-    work_dir = result_dir.with_name(".{}.{}.tmp".format(result_dir.name, uuid.uuid4().hex))
-    work_dir.mkdir(parents=True, mode=0o700)
-    try:
-        result = verify_downloaded_result(env, state, work_dir)
-        os.replace(str(work_dir), str(result_dir))
-    except Exception:
-        shutil.rmtree(work_dir, ignore_errors=True)
-        raise
-    state["result"] = result
-    state["result_path"] = str(result_dir)
-    state["result_digest"] = state["expected_result_digest"]
-    transition(env, state, "result-collected", "result identity and every returned digest verified")
-    return result
-
-
-def verify_downloaded_result(env, state, result_dir):
-    archive_path = result_dir / "result.tar.gz"
-    storage_download(env, state["staging"]["output_blob"], archive_path)
-    digest = "sha256:" + sha256_file(archive_path)
-    if digest != state.get("expected_result_digest"):
-        raise RunnerError("retrieved result digest does not match the control-plane publication marker")
-    extracted = result_dir / "extracted"
-    extracted.mkdir(mode=0o700)
-    safe_extract_result(archive_path, extracted)
-    result = json.loads((extracted / "result.json").read_text(encoding="utf-8"))
+    result = state.get("control_plane_result")
+    if not isinstance(result, dict):
+        raise RunnerError("bounded control-plane result is absent")
     checks = {
         "schema": RESULT_SCHEMA,
         "request_digest": state["request_digest"],
@@ -1914,35 +3011,19 @@ def verify_downloaded_result(env, state, result_dir):
     }
     for key, expected in checks.items():
         if result.get(key) != expected:
-            raise RunnerError("result identity mismatch: {}".format(key))
-    for log_name, field in (("stdout.log", "stdout_digest"), ("stderr.log", "stderr_digest")):
-        actual = "sha256:" + sha256_file(extracted / log_name)
-        if result.get(field) != actual:
-            raise RunnerError("result log integrity mismatch: {}".format(log_name))
-    declared = state["request"].get("artifacts", [])
-    records = result.get("artifacts")
-    if not isinstance(records, list):
-        raise RunnerError("result artifact manifest is malformed")
-    seen = set()
-    for record in records:
-        if not isinstance(record, dict) or not isinstance(record.get("path"), str):
-            raise RunnerError("result artifact record is malformed")
-        relative = require_artifact(record["path"])
-        if relative in seen or not any(relative == item or relative.startswith(item.rstrip("/") + "/") for item in declared):
-            raise RunnerError("result returned an undeclared or duplicate artifact: {}".format(relative))
-        seen.add(relative)
-        artifact_path = extracted / "artifacts" / relative
-        if not artifact_path.is_file() or artifact_path.is_symlink():
-            raise RunnerError("result artifact file is absent or linked: {}".format(relative))
-        if artifact_path.stat().st_size != record.get("bytes") or "sha256:" + sha256_file(artifact_path) != record.get("digest"):
-            raise RunnerError("result artifact integrity mismatch: {}".format(relative))
-    returned_files = set()
-    artifact_root = extracted / "artifacts"
-    if artifact_root.exists():
-        returned_files = {path.relative_to(artifact_root).as_posix() for path in artifact_root.rglob("*") if path.is_file()}
-    if returned_files != seen:
-        raise RunnerError("result archive and artifact manifest disagree")
+            raise RunnerError("bounded result identity mismatch: {}".format(key))
+    if not isinstance(result.get("artifacts"), list):
+        raise RunnerError("bounded result artifact manifest is malformed")
+    result_dir.mkdir(parents=True, mode=0o700)
+    result_path = result_dir / "result.json"
+    result_path.write_bytes(canonical_bytes(result) + b"\n")
+    os.chmod(result_path, 0o600)
+    state["result"] = result
+    state["result_path"] = str(result_dir)
+    state["result_digest"] = state["expected_result_digest"]
+    transition(env, state, "result-collected", "result identity and every returned digest verified")
     return result
+
 
 
 def get_vm(env, state):
@@ -1965,9 +3046,9 @@ def verify_resource_tags(env, state, resource, label):
     expected = ownership_tags(env, state)
     for key in (
         "workload", "firstmate-role", "lifecycle", "deployment-generation", "cleanup-owner",
-        "home-binding", "task-binding", "task-generation", "invocation-binding", "attempt", "fence",
+        "home-binding", "task-binding", "task-generation", "capacity-parent", "capacity-reservation-vcpus", "invocation-binding", "attempt", "fence",
         "snapshot-digest", "command-digest", "resource-class", "selected-sku", "sku-family",
-        "cost-attribution", "cleanup-token",
+        "cell-ordinal", "cost-attribution", "cleanup-token",
     ):
         if tags.get(key) != expected[key]:
             raise RunnerError("live {} cleanup tag mismatch: {}".format(label, key))
@@ -2110,27 +3191,46 @@ def cleanup(env, state):
         raise
     transition(env, state, "compute-removed", "exact invocation VM/NIC/OS disk absent")
     try:
-        storage_delete(env, state["staging"]["input_blob"])
-        storage_delete(env, state["staging"]["output_blob"])
+        delete_private_snapshot(env, state)
     except RunnerError:
-        transition(env, state, "cleanup-retained", "staging cleanup ambiguous after compute removal")
+        transition(env, state, "cleanup-retained", "private snapshot cleanup is ambiguous")
         raise
     payload_dir = Path(state["input_path"]).parent
     if payload_dir.parent == env["state_dir"] / "payloads":
         shutil.rmtree(payload_dir, ignore_errors=False)
     if state.get("reservation_recorded"):
         try:
-            mark_reservation_cleanup_verified(env, state)
+            mark_management_reservation_cleanup_verified(env, state)
         except RunnerError:
             transition(env, state, "cleanup-retained", "cost reservation reconciliation marker is ambiguous")
             raise
-    transition(env, state, "complete", "verified result retained locally; invocation compute and staging are zero")
+    try:
+        shared_capacity_release(env, state)
+    except RunnerError:
+        transition(env, state, "cleanup-retained", "shared capacity reservation release is ambiguous")
+        raise
+    transition(env, state, "complete", "verified bounded result retained locally; private result archive retained; invocation compute is zero")
 
 
-def dispatch_prepared(env, state, confirm_subscription):
+def dispatch_prepared(env, state, confirm_subscription, confirm_cost_admission_mode=None):
     bind_operation_context(env, state)
     if confirm_subscription != env["subscription"]:
         raise RunnerError("--confirm-subscription must exactly match FM_AZURE_SUBSCRIPTION_ID")
+    mode = state["request"].get("cost_admission_mode", STRICT_COST_ADMISSION_MODE)
+    if mode != env["cost_admission_mode"]:
+        raise RunnerError("prepared cost admission mode differs from current operator configuration")
+    if mode == COMMISSIONING_COST_ADMISSION_MODE:
+        if confirm_cost_admission_mode != COMMISSIONING_COST_ADMISSION_MODE:
+            raise RunnerError("commissioning-bounded requires --confirm-cost-admission-mode commissioning-bounded")
+        if env.get("cell_ordinal") != state["request"].get("cell_ordinal"):
+            raise RunnerError("current commissioning cell ordinal differs from the exact prepared request")
+        configured_sku = os.environ.get("FM_AZURE_RUNNER_SKU")
+        if configured_sku is not None and configured_sku != state["request"].get("limits", {}).get("sku"):
+            raise RunnerError("current commissioning SKU override differs from the exact prepared request")
+    elif confirm_cost_admission_mode is not None:
+        raise RunnerError("--confirm-cost-admission-mode is accepted only for commissioning-bounded")
+    elif env.get("cell_ordinal") is not None:
+        raise RunnerError("FM_AZURE_RUNNER_CELL_ORDINAL is accepted only for commissioning-bounded")
     try:
         deadline = dt.datetime.fromisoformat(
             state["request"]["compute_deallocation_deadline"].replace("Z", "+00:00")
@@ -2140,32 +3240,50 @@ def dispatch_prepared(env, state, confirm_subscription):
         scope_gate(env)
         limits = state["request"]["limits"]
         sku_quota_gate(env, limits)
-        cost = budget_gate(env, limits)
+        validation_capacity_parent_gate(env, state)
+        cost = (
+            commissioning_cost_gate(env, state, limits)
+            if mode == COMMISSIONING_COST_ADMISSION_MODE
+            else budget_gate(
+                env, limits, parent_managed=bool(state["request"].get("capacity_parent"))
+            )
+        )
         foundation_gate(env)
-        transition(env, state, "admission-checked", "scope, quota, SKU, budget, and exact foundation gates passed", cost=cost)
-        with AdmissionLease(env, state) as lease:
+        cost = shared_capacity_reserve(env, state, cost)
+        transition(
+            env, state, "admission-checked",
+            "scope, SKU, exact foundation, and shared regional/family/actual-forecast cost admission passed",
+            cost=cost,
+        )
+        with ManagementAdmissionLease(env, state) as lease:
             foundation_gate(env)
             sku_quota_gate(env, limits)
             active = active_runner_vms(env)
             if len(active) >= env["max_concurrency"]:
                 raise RunnerError("runner queue is at its bounded concurrency limit ({})".format(env["max_concurrency"]))
-            cost = reserve_budget(env, state, lease, limits)
+            if mode == COMMISSIONING_COST_ADMISSION_MODE:
+                commissioning_cost_gate(env, state, limits)
+            cost = reserve_budget_management(
+                env, state, lease, limits,
+                admitted_cost=cost if mode == COMMISSIONING_COST_ADMISSION_MODE else None,
+            )
             transition(
                 env, state, "cost-reserved",
                 "durable worst-case cost reserved under the admission lease",
                 cost=cost, reservation_recorded=True,
             )
+            if mode == COMMISSIONING_COST_ADMISSION_MODE:
+                commissioning_cost_gate(env, state, limits)
+                sku_quota_gate(env, limits)
             foundation_gate(env)
-            storage_upload(env, state["input_path"], state["staging"]["input_blob"], overwrite=False)
-            transition(env, state, "input-staged", "exact private input object uploaded")
-            expiry = (now_utc() + dt.timedelta(seconds=limits["wall_seconds"] + 1800)).strftime("%Y-%m-%dT%H:%MZ")
-            input_url = blob_sas(env, state["staging"]["input_blob"], "r", expiry)
-            output_url = blob_sas(env, state["staging"]["output_blob"], "cw", expiry)
-            foundation_gate(env)
+            validation_capacity_parent_gate(env, state)
+            reprove_public_request(state)
+            verify_all_reservation_rbac_zero(env)
+            stage_private_snapshot(env, state)
             lease.renew_and_assert()
             create_vm(env, state)
             lease.assert_held()
-        create_run_command(env, state, input_url, output_url)
+        create_run_command(env, state)
         poll_run_command(env, state)
         result = collect_result(env, state)
         cleanup(env, state)
@@ -2178,22 +3296,12 @@ def dispatch_prepared(env, state, confirm_subscription):
 
 
 def print_logs_and_summary(state, result):
-    extracted = Path(state["result_path"]) / "extracted"
-    stdout = (extracted / "stdout.log").read_text(encoding="utf-8", errors="replace")
-    stderr = (extracted / "stderr.log").read_text(encoding="utf-8", errors="replace")
-    if stdout:
-        sys.stdout.write(stdout)
-        if not stdout.endswith("\n"):
-            sys.stdout.write("\n")
-    if stderr:
-        sys.stderr.write(stderr)
-        if not stderr.endswith("\n"):
-            sys.stderr.write("\n")
     print(
-        "azure-runner: invocation={} exit={} timeout={} signal={} stdout_truncated={} stderr_truncated={} max_cost=${:.2f}".format(
+        "azure-runner: invocation={} exit={} timeout={} signal={} stdout_truncated={} stderr_truncated={} private_archive={} max_cost=${:.2f}".format(
             state["invocation"], result["exit_code"], str(result["timed_out"]).lower(),
             result.get("signal") if result.get("signal") is not None else "none",
             str(result["stdout_truncated"]).lower(), str(result["stderr_truncated"]).lower(),
+            state["staging"]["output_blob"],
             state.get("cost", {}).get("max_increment", 0.0),
         ),
         file=sys.stderr,
@@ -2217,37 +3325,15 @@ def resume(env, state):
         print_logs_and_summary(state, state["result"])
         return int(state["result"]["exit_code"])
     if phase in (
-        "prepared", "admission-checked", "cost-reserved", "input-staged", "vm-created", "command-submitted", "failed-retained"
+        "prepared", "admission-checked", "cost-reserved", "vm-created", "command-submitted", "failed-retained"
     ):
-        output_exists, _, _ = az_command(env, [
-            "storage", "blob", "exists", "--auth-mode", "login", "--account-name", env["storage"],
-            "--container-name", CONTAINER, "--name", state["staging"]["output_blob"],
-        ])
         vm_exists, vm = get_vm(env, state)
-        if output_exists.get("exists") and state.get("expected_result_digest"):
-            result = collect_result(env, state)
-            cleanup(env, state)
-            print_logs_and_summary(state, result)
-            return int(result["exit_code"])
         if vm_exists:
             foundation_gate(env)
             adopt_vm_identity(env, state, vm)
             command_exists, _ = run_command_exists(env, state)
             if not command_exists:
-                if output_exists.get("exists"):
-                    raise RunnerError("output exists without a durable Managed Run Command digest marker; state is retained")
-                input_exists, _, _ = az_command(env, [
-                    "storage", "blob", "exists", "--auth-mode", "login", "--account-name", env["storage"],
-                    "--container-name", CONTAINER, "--name", state["staging"]["input_blob"],
-                ])
-                if not input_exists.get("exists"):
-                    raise RunnerError("VM exists but exact staged input is absent; state is retained")
-                expiry = (
-                    now_utc() + dt.timedelta(seconds=state["request"]["limits"]["wall_seconds"] + 1800)
-                ).strftime("%Y-%m-%dT%H:%MZ")
-                input_url = blob_sas(env, state["staging"]["input_blob"], "r", expiry)
-                output_url = blob_sas(env, state["staging"]["output_blob"], "cw", expiry)
-                create_run_command(env, state, input_url, output_url)
+                create_run_command(env, state)
             else:
                 transition(env, state, "command-submitted", "existing Managed Run Command adopted without resubmission")
             poll_run_command(env, state)
@@ -2255,18 +3341,12 @@ def resume(env, state):
             cleanup(env, state)
             print_logs_and_summary(state, result)
             return int(result["exit_code"])
-        if output_exists.get("exists"):
-            raise RunnerError("VM is absent but an unverified result object remains; retry is unsafe")
         cleanup_partial_capacity(env, state)
-        input_exists, _, _ = az_command(env, [
-            "storage", "blob", "exists", "--auth-mode", "login", "--account-name", env["storage"],
-            "--container-name", CONTAINER, "--name", state["staging"]["input_blob"],
-        ])
-        if input_exists.get("exists"):
-            storage_delete(env, state["staging"]["input_blob"])
-        transition(env, state, "absent-fenced", "VM and invocation staging absence proven; same invocation will never be rerun", old_lease_absent=True)
+        delete_private_snapshot(env, state)
+        transition(env, state, "absent-fenced", "VM absence proven; same invocation will never be rerun", old_lease_absent=True)
         if state.get("reservation_recorded"):
-            mark_reservation_cleanup_verified(env, state)
+            mark_management_reservation_cleanup_verified(env, state)
+        shared_capacity_release(env, state)
         raise RunnerError("runner VM is absent without a verified result; retry requires a new fenced attempt")
     raise RunnerError("invocation phase {} cannot be resumed automatically".format(phase))
 
@@ -2277,23 +3357,38 @@ def retry(env, old_state, args):
         raise RunnerError("retry requires old invocation absence to be proven by resume/reconcile")
     scope_gate(env)
     vm_exists, _ = get_vm(env, old_state)
-    input_exists, _, _ = az_command(env, [
-        "storage", "blob", "exists", "--auth-mode", "login", "--account-name", env["storage"],
-        "--container-name", CONTAINER, "--name", old_state["staging"]["input_blob"],
-    ])
-    output_exists, _, _ = az_command(env, [
-        "storage", "blob", "exists", "--auth-mode", "login", "--account-name", env["storage"],
-        "--container-name", CONTAINER, "--name", old_state["staging"]["output_blob"],
-    ])
-    if vm_exists or input_exists.get("exists") or output_exists.get("exists"):
+    if vm_exists:
         raise RunnerError("old invocation absence no longer holds; retry is fenced")
     current = Path(old_state["repository_root"]).resolve()
     if git(current, "rev-parse", "HEAD").stdout.strip() != old_state["request"]["repository"]["commit"]:
         raise RunnerError("retry repository HEAD differs from the fenced old snapshot")
+    reprove_public_request(old_state)
     args.repo = str(current)
     args.task = old_state["request"]["task"]
     args.generation = old_state["request"]["generation"]
     args.resource_class = old_state["request"]["resource_class"]
+    args.capacity_parent = old_state["request"].get("capacity_parent")
+    args.capacity_reservation_vcpus = old_state["request"].get("capacity_reservation_vcpus")
+    args.capacity_fence = old_state["request"].get("capacity_fence")
+    repository = old_state["request"]["repository"]
+    private_source = repository.get("source_mode") == "private-parent-bundle"
+    selected_source_ref = (
+        repository["source_ref"]
+        if repository["source_ref"] != repository["default_ref"]
+        else None
+    )
+    if private_source or not repository.get("source_ancestors"):
+        args.source_ref = selected_source_ref
+        args.public_ref = None
+    else:
+        args.source_ref = None
+        args.public_ref = selected_source_ref
+    args.public_ancestor = list(repository.get("source_ancestors", []))
+    args.private_snapshot_bundle = (
+        str(Path(old_state["input_path"]).parent / "snapshot.bundle")
+        if private_source
+        else None
+    )
     args.wall_seconds = old_state["request"]["limits"]["wall_seconds"]
     args.dependency = [item["path"] for item in old_state["request"].get("dependencies", [])]
     args.artifact = list(old_state["request"].get("artifacts", []))
@@ -2303,7 +3398,7 @@ def retry(env, old_state, args):
         state = prepare(env, args, parent_state=old_state)
     bind_operation_context(env, state)
     with invocation_lock(env, state["invocation"]):
-        return dispatch_prepared(env, state, args.confirm_subscription)
+        return dispatch_prepared(env, state, args.confirm_subscription, args.confirm_cost_admission_mode)
 
 
 def local_queue(env):
@@ -2343,8 +3438,27 @@ def add_request_arguments(parser, require_command=True):
     parser.add_argument("--task", required=True)
     parser.add_argument("--generation", required=True)
     parser.add_argument("--invocation")
+    parser.add_argument("--public-ref")
+    parser.add_argument("--public-ancestor", action="append", default=[])
     parser.add_argument("--resource-class", choices=sorted(RESOURCE_CLASSES), default="validation-standard")
+    parser.add_argument(
+        "--capacity-parent",
+        help="exact parent cell whose processor reservation already covers this invocation",
+    )
+    parser.add_argument("--capacity-reservation-vcpus", type=int)
+    parser.add_argument(
+        "--capacity-fence",
+        help="exact parent shape fence so this invocation re-admits its pre-reserved constituent",
+    )
     parser.add_argument("--wall-seconds", type=int)
+    parser.add_argument(
+        "--source-ref",
+        help="exact refs/heads/* identity for a public remote head or private parent snapshot",
+    )
+    parser.add_argument(
+        "--private-snapshot-bundle",
+        help="exact parent-cell Git bundle staged privately for an unpushed validation head",
+    )
     parser.add_argument("--dependency", action="append", default=[])
     parser.add_argument("--artifact", action="append", default=[])
     if require_command:
@@ -2360,12 +3474,14 @@ def parser():
     add_request_arguments(run_parser)
     run_parser.add_argument("--confirm-run", action="store_true")
     run_parser.add_argument("--confirm-subscription")
+    run_parser.add_argument("--confirm-cost-admission-mode")
     resume_parser = sub.add_parser("resume", help="resume collection/cleanup without duplicating execution")
     resume_parser.add_argument("--invocation", required=True)
     retry_parser = sub.add_parser("retry", help="create a new fenced attempt after proven old-lease absence")
     retry_parser.add_argument("--invocation", required=True)
     retry_parser.add_argument("--confirm-run", action="store_true")
     retry_parser.add_argument("--confirm-subscription")
+    retry_parser.add_argument("--confirm-cost-admission-mode")
     queue_parser = sub.add_parser("queue", help="show concise local invocation queue state")
     cost_parser = sub.add_parser("cost", help="show concise Azure cost/concurrency admission state")
     status_parser = sub.add_parser("status", help="show one invocation identity and outcome")
@@ -2399,7 +3515,7 @@ def main():
         with state_lock(env):
             state = prepare(env, args)
         with invocation_lock(env, state["invocation"]):
-            return dispatch_prepared(env, state, args.confirm_subscription)
+            return dispatch_prepared(env, state, args.confirm_subscription, args.confirm_cost_admission_mode)
     if args.operation == "queue":
         local_queue(env)
         return 0

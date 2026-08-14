@@ -13,6 +13,7 @@ fm-auto-reap.test.sh	hermetic
 fm-autocompact.test.sh	hermetic
 fm-azure-pilot.test.sh	hermetic
 fm-azure-runner.test.sh	hermetic
+fm-azure-validation.test.sh	hermetic
 fm-backend-autodetect-smoke.test.sh	herdr-lab
 fm-backend-cmux-smoke.test.sh	hermetic
 fm-backend-cmux.test.sh	hermetic
@@ -42,6 +43,7 @@ fm-checkout-return-boundary.test.sh	hermetic
 fm-composer-ghost.test.sh	hermetic
 fm-composer-lib.test.sh	hermetic
 fm-crew-state.test.sh	hermetic
+fm-crosscheck-azure.test.sh	hermetic
 fm-crosscheck.test.sh	hermetic
 fm-daemon.test.sh	hermetic
 fm-decision-pretool-check.test.sh	hermetic
@@ -97,6 +99,8 @@ fm-watch-checkpoint.test.sh	hermetic
 fm-watch-pause-absorb.test.sh	hermetic
 fm-watch-triage.test.sh	hermetic
 fm-watcher-lock.test.sh	hermetic
+fm-worker-lifecycle.test.sh	hermetic
+fm-worker-supervisor.test.sh	hermetic
 fm-x-mode.test.sh	hermetic
 lavish-repair.test.sh	hermetic
 lavish.test.sh	hermetic

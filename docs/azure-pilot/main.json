@@ -276,6 +276,13 @@
       "metadata": {
         "description": "Reserved integrity seam. No installer consumes it in this revision."
       }
+    },
+    "operatorDataPlaneIp": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional single operator egress IPv4 (or CIDR) allowed to the storage data plane for private management. Empty keeps public network access fully disabled. Never weakens the Deny default, shared-key/public-blob disablement, or private endpoints."
+      }
     }
   },
   "variables": {
@@ -402,6 +409,9 @@
           },
           "commonTags": {
             "value": "[variables('commonTags')]"
+          },
+          "operatorDataPlaneIp": {
+            "value": "[parameters('operatorDataPlaneIp')]"
           }
         },
         "template": {
@@ -485,6 +495,13 @@
             },
             "commonTags": {
               "type": "object"
+            },
+            "operatorDataPlaneIp": {
+              "type": "string",
+              "defaultValue": "",
+              "metadata": {
+                "description": "Optional single operator egress IPv4 (or CIDR) allowed to the storage data plane for private management. Empty keeps public network access fully disabled. Never weakens the Deny default, shared-key/public-blob disablement, or private endpoints."
+              }
             }
           },
           "variables": {
@@ -511,6 +528,7 @@
             "dcrName": "[format('dcr-{0}-linux', parameters('namingPrefix'))]",
             "blobPrivateEndpointName": "[format('pe-{0}-blob', parameters('namingPrefix'))]",
             "blobPrivateEndpointNicName": "[format('nic-{0}-pe-blob', parameters('namingPrefix'))]",
+            "runnerControlStorageName": "[format('st{0}ctl01', parameters('namingPrefix'))]",
             "vaultPrivateEndpointName": "[format('pe-{0}-vault', parameters('namingPrefix'))]",
             "blobPrivateDnsZone": "privatelink.blob.core.windows.net",
             "vaultPrivateDnsZone": "privatelink.vaultcore.azure.net",
@@ -533,6 +551,31 @@
             "workerCount": "[length(parameters('workerSlots'))]"
           },
           "resources": [
+            {
+              "type": "Microsoft.Storage/storageAccounts",
+              "apiVersion": "2023-05-01",
+              "name": "[variables('runnerControlStorageName')]",
+              "location": "[parameters('region')]",
+              "kind": "StorageV2",
+              "sku": {
+                "name": "Standard_LRS"
+              },
+              "tags": "[union(parameters('commonTags'), createObject('firstmate-role', 'runner-admission-control', 'data-plane', 'disabled'))]",
+              "properties": {
+                "accessTier": "Hot",
+                "allowBlobPublicAccess": false,
+                "allowSharedKeyAccess": false,
+                "defaultToOAuthAuthentication": true,
+                "minimumTlsVersion": "TLS1_2",
+                "publicNetworkAccess": "[if(empty(parameters('operatorDataPlaneIp')), 'Disabled', 'Enabled')]",
+                "supportsHttpsTrafficOnly": true,
+                "networkAcls": {
+                  "bypass": "None",
+                  "defaultAction": "Deny",
+                  "ipRules": "[if(empty(parameters('operatorDataPlaneIp')), createArray(), createArray(createObject('value', parameters('operatorDataPlaneIp'), 'action', 'Allow')))]"
+                }
+              }
+            },
             {
               "type": "Microsoft.OperationalInsights/workspaces",
               "apiVersion": "2023-09-01",
@@ -929,10 +972,11 @@
                 "defaultToOAuthAuthentication": true,
                 "supportsHttpsTrafficOnly": true,
                 "minimumTlsVersion": "TLS1_2",
-                "publicNetworkAccess": "Disabled",
+                "publicNetworkAccess": "[if(empty(parameters('operatorDataPlaneIp')), 'Disabled', 'Enabled')]",
                 "networkAcls": {
                   "bypass": "None",
-                  "defaultAction": "Deny"
+                  "defaultAction": "Deny",
+                  "ipRules": "[if(empty(parameters('operatorDataPlaneIp')), createArray(), createArray(createObject('value', parameters('operatorDataPlaneIp'), 'action', 'Allow')))]"
                 }
               }
             },
@@ -1032,6 +1076,21 @@
               ],
               "properties": {
                 "publicAccess": "None"
+              }
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+              "apiVersion": "2023-05-01",
+              "name": "[format('{0}/default/runner-control', variables('runnerControlStorageName'))]",
+              "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('runnerControlStorageName'))]"
+              ],
+              "properties": {
+                "publicAccess": "None",
+                "metadata": {
+                  "schema": "fm-azure-runner-control-v1",
+                  "deploymentgeneration": "[parameters('deploymentGeneration')]"
+                }
               }
             },
             {
@@ -1196,7 +1255,6 @@
               "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
               "apiVersion": "2023-01-31",
               "name": "[format('id-{0}-wkr-{1}', parameters('namingPrefix'), padLeft(string(parameters('workerSlots')[copyIndex()]), 2, '0'))]",
-
               "copy": {
                 "name": "workerIdentities",
                 "count": "[variables('workerCount')]"
@@ -1931,6 +1989,20 @@
               "properties": {
                 "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('blobDataContributorRoleId'))]",
                 "principalId": "[parameters('runnerOperatorPrincipalId')]"
+              }
+            },
+            {
+              "type": "Microsoft.Storage/storageAccounts/blobServices/containers/providers/roleAssignments",
+              "apiVersion": "2022-04-01",
+              "name": "[format('{0}/default/validation-shards/Microsoft.Authorization/{1}', parameters('storageAccountName'), guid(resourceGroup().id, 'runner-private-controller-validation-shards'))]",
+              "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('validationShardIdentityName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts/blobServices/containers', parameters('storageAccountName'), 'default', 'validation-shards')]"
+              ],
+              "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('blobDataContributorRoleId'))]",
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('validationShardIdentityName')), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal"
               }
             },
             {

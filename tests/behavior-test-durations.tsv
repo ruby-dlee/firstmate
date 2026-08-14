@@ -21,6 +21,7 @@
 5950	tests/fm-autocompact.test.sh
 1000	tests/fm-azure-pilot.test.sh
 5000	tests/fm-azure-runner.test.sh
+6000	tests/fm-azure-validation.test.sh
 20	tests/fm-backend-autodetect-smoke.test.sh
 20	tests/fm-backend-cmux-smoke.test.sh
 3400	tests/fm-backend-cmux.test.sh
@@ -50,6 +51,7 @@
 263	tests/fm-composer-ghost.test.sh
 30	tests/fm-composer-lib.test.sh
 10055	tests/fm-crew-state.test.sh
+5000	tests/fm-crosscheck-azure.test.sh
 94232	tests/fm-crosscheck.test.sh
 13991	tests/fm-daemon.test.sh
 340	tests/fm-decision-pretool-check.test.sh
@@ -105,6 +107,8 @@
 180000	tests/fm-watch-pause-absorb.test.sh
 95645	tests/fm-watch-triage.test.sh
 20435	tests/fm-watcher-lock.test.sh
+8000	tests/fm-worker-lifecycle.test.sh
+1000	tests/fm-worker-supervisor.test.sh
 23744	tests/fm-x-mode.test.sh
 250	tests/lavish-repair.test.sh
 6200	tests/lavish.test.sh

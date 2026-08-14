@@ -25,9 +25,6 @@
     "subnetId": {
       "type": "string"
     },
-    "controllerIdentityId": {
-      "type": "string"
-    },
     "vmSize": {
       "type": "string",
       "allowedValues": [
@@ -38,39 +35,30 @@
         "Standard_D4ds_v6",
         "Standard_D4s_v7",
         "Standard_D4ds_v7",
-        "Standard_D4ads_v6",
-        "Standard_E4as_v7",
-        "Standard_E4as_v6"
+        "Standard_D4ads_v6"
       ]
     },
-    "ubuntuImageVersion": {
+    "modelImageId": {
       "type": "string",
-      "defaultValue": "24.04.202608070"
+      "metadata": {
+        "description": "Exact reviewed Azure image resource ID carrying the pinned reviewer CLI closure."
+      }
     },
     "expiryUtc": {
       "type": "string",
       "minLength": 20,
-      "maxLength": 20,
-      "metadata": {
-        "description": "Exact UTC shutdown deadline formatted as YYYY-MM-DDTHH:MM:SSZ."
-      }
-    },
-    "expiryTimeOfDay": {
-      "type": "string",
-      "minLength": 4,
-      "maxLength": 4,
-      "metadata": {
-        "description": "Exact UTC deallocation time formatted as HHmm."
-      }
+      "maxLength": 20
     },
     "tags": {
       "type": "object"
     },
-    "bootstrapEgressRateBitsPerSecond": {
+    "providerHost": {
+      "type": "string"
+    },
+    "providerPort": {
       "type": "int",
-      "defaultValue": 1000000,
-      "minValue": 1000000,
-      "maxValue": 1000000
+      "minValue": 1,
+      "maxValue": 65535
     }
   },
   "resources": [
@@ -82,7 +70,6 @@
       "tags": "[parameters('tags')]",
       "properties": {
         "enableAcceleratedNetworking": true,
-        "auxiliaryMode": "None",
         "ipConfigurations": [
           {
             "name": "primary",
@@ -103,10 +90,6 @@
       "location": "[parameters('region')]",
       "zones": ["1"],
       "tags": "[parameters('tags')]",
-      "identity": {
-        "type": "UserAssigned",
-        "userAssignedIdentities": "[createObject(parameters('controllerIdentityId'), createObject())]"
-      },
       "dependsOn": [
         "[resourceId('Microsoft.Network/networkInterfaces', parameters('nicName'))]"
       ],
@@ -132,15 +115,12 @@
         },
         "storageProfile": {
           "imageReference": {
-            "publisher": "Canonical",
-            "offer": "ubuntu-24_04-lts",
-            "sku": "server",
-            "version": "[parameters('ubuntuImageVersion')]"
+            "id": "[parameters('modelImageId')]"
           },
           "osDisk": {
             "name": "[parameters('osDiskName')]",
             "createOption": "FromImage",
-            "deleteOption": "Detach",
+            "deleteOption": "Delete",
             "diskSizeGB": 96,
             "managedDisk": {
               "storageAccountType": "StandardSSD_LRS"
@@ -152,7 +132,7 @@
             {
               "id": "[resourceId('Microsoft.Network/networkInterfaces', parameters('nicName'))]",
               "properties": {
-                "deleteOption": "Detach",
+                "deleteOption": "Delete",
                 "primary": true
               }
             }
@@ -176,33 +156,11 @@
       ],
       "properties": {
         "source": {
-          "script": "[format('set -eu\\ncat > /etc/systemd/system/fm-azure-runner-expiry.service <<\"EOF\"\\n[Unit]\\nDescription=Stop expired disposable Firstmate Azure runner\\n[Service]\\nType=oneshot\\nExecStart=/usr/sbin/shutdown -h now\\nEOF\\ncat > /etc/systemd/system/fm-azure-runner-expiry.timer <<\"EOF\"\\n[Unit]\\nDescription=Bound disposable Firstmate Azure runner lifetime\\n[Timer]\\nOnCalendar={0}\\nPersistent=true\\nUnit=fm-azure-runner-expiry.service\\n[Install]\\nWantedBy=timers.target\\nEOF\\nsystemctl daemon-reload\\nsystemctl enable --now fm-azure-runner-expiry.timer', parameters('expiryUtc'))]"
+          "script": "[format('set -eu\\ncat > /etc/systemd/system/fm-crosscheck-expiry.service <<\"EOF\"\\n[Unit]\\nDescription=Stop expired disposable Firstmate Crosscheck model compartment\\n[Service]\\nType=oneshot\\nExecStart=/usr/sbin/shutdown -h now\\nEOF\\ncat > /etc/systemd/system/fm-crosscheck-expiry.timer <<\"EOF\"\\n[Unit]\\nDescription=Bound disposable Firstmate Crosscheck model lifetime\\n[Timer]\\nOnCalendar={0}\\nPersistent=true\\nUnit=fm-crosscheck-expiry.service\\n[Install]\\nWantedBy=timers.target\\nEOF\\nsystemctl daemon-reload\\nsystemctl enable --now fm-crosscheck-expiry.timer', parameters('expiryUtc'))]"
         },
         "asyncExecution": false,
         "timeoutInSeconds": 300,
         "treatFailureAsDeploymentFailure": true
-      }
-    },
-    {
-      "type": "Microsoft.DevTestLab/schedules",
-      "apiVersion": "2018-09-15",
-      "name": "[format('shutdown-{0}', parameters('vmName'))]",
-      "location": "[parameters('region')]",
-      "tags": "[parameters('tags')]",
-      "dependsOn": [
-        "[resourceId('Microsoft.Compute/virtualMachines', parameters('vmName'))]"
-      ],
-      "properties": {
-        "status": "Enabled",
-        "taskType": "ComputeVmShutdownTask",
-        "dailyRecurrence": {
-          "time": "[parameters('expiryTimeOfDay')]"
-        },
-        "timeZoneId": "UTC",
-        "targetResourceId": "[resourceId('Microsoft.Compute/virtualMachines', parameters('vmName'))]",
-        "notificationSettings": {
-          "status": "Disabled"
-        }
       }
     }
   ],
@@ -218,10 +176,6 @@
     "osDiskId": {
       "type": "string",
       "value": "[resourceId('Microsoft.Compute/disks', parameters('osDiskName'))]"
-    },
-    "ttlScheduleId": {
-      "type": "string",
-      "value": "[resourceId('Microsoft.DevTestLab/schedules', format('shutdown-{0}', parameters('vmName')))]"
     }
   }
 }

@@ -1028,6 +1028,31 @@ def require_zero_effective_rbac(env, principal_id, label):
         raise RunnerError("{} must have zero direct, group, and inherited effective RBAC assignments".format(label))
 
 
+def acceptable_public_network_posture(properties, network_acls):
+    """Sealed storage or the released operator data-plane route, nothing else.
+
+    The foundation template (PR 141) maintains publicNetworkAccess=Enabled
+    with a Deny default and exactly one operator /32 when
+    FM_AZURE_OPERATOR_DATA_PLANE_IP is declared; the gate accepts precisely
+    that declared posture or the fully sealed one. An enabled endpoint with
+    any undeclared, extra, or broader rule still refuses.
+    """
+    access = properties.get("publicNetworkAccess")
+    if access == "Disabled":
+        return True
+    if access != "Enabled":
+        return False
+    declared = os.environ.get("FM_AZURE_OPERATOR_DATA_PLANE_IP", "").strip()
+    if not declared:
+        return False
+    rules = network_acls.get("ipRules")
+    if not isinstance(rules, list) or len(rules) != 1:
+        return False
+    rule = rules[0] or {}
+    value = str(rule.get("value") or rule.get("ipAddressOrRange") or "").strip()
+    return rule.get("action") in (None, "Allow") and value in (declared, declared + "/32")
+
+
 def foundation_gate(env):
     storage_id = exact_id(env, "Microsoft.Storage", "storageAccounts", env["storage"])
     control_storage_id = exact_id(env, "Microsoft.Storage", "storageAccounts", env["control_storage"])
@@ -1057,7 +1082,7 @@ def foundation_gate(env):
         or (storage.get("sku") or {}).get("name") != "Standard_ZRS"
         or properties.get("accessTier") != "Hot"
         or properties.get("defaultToOAuthAuthentication") is not True
-        or properties.get("publicNetworkAccess") != "Disabled"
+        or not acceptable_public_network_posture(properties, network_acls)
         or properties.get("allowSharedKeyAccess") is not False
         or properties.get("allowBlobPublicAccess") is not False
         or properties.get("supportsHttpsTrafficOnly") is not True
@@ -1076,7 +1101,7 @@ def foundation_gate(env):
         or control.get("location") != "eastus"
         or control.get("kind") != "StorageV2"
         or (control.get("sku") or {}).get("name") != "Standard_LRS"
-        or control_properties.get("publicNetworkAccess") != "Disabled"
+        or not acceptable_public_network_posture(control_properties, control_acls)
         or control_properties.get("allowSharedKeyAccess") is not False
         or control_properties.get("allowBlobPublicAccess") is not False
         or control_properties.get("defaultToOAuthAuthentication") is not True

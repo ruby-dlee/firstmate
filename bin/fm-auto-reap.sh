@@ -8,8 +8,9 @@
 #
 # `maintenance` recovers pre-metadata Treehouse acquisitions left by a crashed
 # spawn. A record is eligible only after an age threshold and exact PID/start-time
-# death proof. Recovery installs fail-closed cleanup metadata, then invokes the
-# same ordinary teardown proof. Every refusal stays on disk and is printed.
+# death proof. An exact never-acquired record is cleared only after a project-pool
+# holder-absence proof; acquired records install fail-closed cleanup metadata and
+# invoke ordinary teardown. Every refusal stays on disk and is printed.
 # Usage: fm-auto-reap.sh task <id> <pr-merged|scout-done|local-merged>
 #        fm-auto-reap.sh maintenance
 set -eu

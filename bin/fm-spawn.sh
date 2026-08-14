@@ -3505,7 +3505,6 @@ finally:
   BRIEF=$CONTINUATION_PACKET
 fi
 
-PI_AUTHOR_ACCOUNT_IDENTITY=
 PI_AUTHOR_ACCOUNT_HOME=
 
 # prepare_launch_environment: every step the launch-command construction below
@@ -3593,14 +3592,11 @@ persist_worktree_acquisition_phases || {
 if [ "$HARNESS" = pi ] && [ "$RAW_LAUNCH" != 1 ]; then
   PI_AUTHOR_SOURCE_HOME=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
   PI_AUTHOR_ACCOUNT_HOME="$TASK_TMP/pi-author-agent"
-  if PI_CAPTURED_ACCOUNT_IDENTITY=$(
-    "$SCRIPT_DIR/fm-pi-author-snapshot.py" \
-      "${MODEL:-default}" "$PI_AUTHOR_SOURCE_HOME" "$PI_AUTHOR_ACCOUNT_HOME"
-  ); then
-    PI_AUTHOR_ACCOUNT_IDENTITY=$PI_CAPTURED_ACCOUNT_IDENTITY
+  if "$SCRIPT_DIR/fm-pi-author-snapshot.py" \
+    "$PI_AUTHOR_SOURCE_HOME" "$PI_AUTHOR_ACCOUNT_HOME"; then
+    :
   else
     PI_AUTHOR_ACCOUNT_HOME=
-    PI_AUTHOR_ACCOUNT_IDENTITY=
     echo "WARNING: Pi task-private account capture failed; launching $ID without the captured account snapshot" >&2
   fi
 fi
@@ -4185,7 +4181,6 @@ META_TMP=$(mktemp "$STATE/.$ID.meta.XXXXXX") || exit 1
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
   echo "generation_id=$SPAWN_GENERATION_ID"
-  [ -z "$PI_AUTHOR_ACCOUNT_IDENTITY" ] || echo "author_account_identity=$PI_AUTHOR_ACCOUNT_IDENTITY"
   [ -z "${PROVISION_SUMMARY:-}" ] || echo "provision=$PROVISION_SUMMARY"
   [ "$NO_ACCOUNT_ROUTING" != 1 ] || echo "account_routing_emergency_bypass=1"
   [ -z "$BACKLOG_ROW_EXEMPTION" ] || echo "backlog_row_exemption=$BACKLOG_ROW_EXEMPTION"

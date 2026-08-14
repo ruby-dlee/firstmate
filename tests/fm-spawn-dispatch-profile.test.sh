@@ -538,7 +538,7 @@ test_pi_secondmate_approves_without_excluding_tools() {
 }
 
 test_pi_author_account_snapshot_binds_launch_and_recovery() {
-  local rec id source out status launch meta tasktmp private count absent_marker failed_id
+  local rec id source out status launch meta tasktmp private absent_marker failed_id
   id=profile-pi-author-snapshot-z23
   rec=$(make_spawn_case profile-pi-author-snapshot pi "$id")
   read_case_record "$rec"
@@ -556,8 +556,8 @@ test_pi_author_account_snapshot_binds_launch_and_recovery() {
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "PI_CODING_AGENT_DIR='$private' pi --approve" \
     "Pi launch did not bind the task-private author account"
-  assert_grep 'author_account_identity=account-A' "$meta" \
-    "Pi launch did not record the identity derived from its private snapshot"
+  assert_no_grep 'author_account_identity=' "$meta" \
+    "Pi launch retained obsolete author identity metadata"
   python3 - "$private" account-A <<'PY' \
     || fail "Pi task-private snapshot contents or permissions are invalid"
 import json
@@ -582,11 +582,8 @@ PY
       "$id" "$PROJ_DIR" --model openai-codex-5/gpt-5.6-sol --effort xhigh)
   status=$?
   expect_code 0 "$status" "Pi author snapshot recovery should succeed: $out"
-  count=$(grep -c '^author_account_identity=' "$meta" || true)
-  [ "$count" -eq 1 ] \
-    || fail "Pi metadata recovery did not preserve exactly one owned author identity"
-  assert_grep 'author_account_identity=account-A' "$meta" \
-    "Pi metadata recovery changed its launch-bound author identity"
+  assert_no_grep 'author_account_identity=' "$meta" \
+    "Pi metadata recovery restored obsolete author identity metadata"
 
   make_pi_account_source "$source" account-B
   : > "$absent_marker"
@@ -594,12 +591,9 @@ PY
     run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
       "$id" "$PROJ_DIR" --model openai-codex-5/gpt-5.6-sol --effort xhigh)
   status=$?
-  expect_code 0 "$status" "Pi account-change recovery should record its current account: $out"
-  count=$(grep -c '^author_account_identity=' "$meta" || true)
-  [ "$count" -eq 1 ] \
-    || fail "Pi account-change recovery did not record exactly one current identity"
-  assert_grep 'author_account_identity=account-B' "$meta" \
-    "Pi account-change recovery did not replace the previous account identity"
+  expect_code 0 "$status" "Pi account-change recovery should refresh its private snapshot: $out"
+  assert_no_grep 'author_account_identity=' "$meta" \
+    "Pi account-change recovery restored obsolete author identity metadata"
   tasktmp=$(sed -n 's/^tasktmp=//p' "$meta")
   private="$tasktmp/pi-author-agent"
   launch=$(cat "$LAUNCH_LOG")
@@ -610,19 +604,21 @@ PY
   rec=$(make_spawn_case profile-pi-author-snapshot-failed pi "$failed_id")
   read_case_record "$rec"
   source="$CASE_DIR/pi-source"
-  mkdir -p "$source"
+  mkdir -p "$source/extensions"
   out=$(PI_CODING_AGENT_DIR="$source" \
     run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" \
       "$failed_id" "$PROJ_DIR" --model openai-codex-5/gpt-5.6-sol --effort xhigh)
   status=$?
-  expect_code 0 "$status" "Pi identity-capture failure must not refuse the spawn: $out"
-  assert_contains "$out" \
-    "WARNING: Pi task-private account capture failed; launching $failed_id without the captured account snapshot" \
-    "Pi identity-capture failure did not use the nonfatal launch path"
+  expect_code 0 "$status" "missing Pi author identity must not refuse the spawn: $out"
   meta="$HOME_DIR/state/$failed_id.meta"
   assert_no_grep 'author_account_identity=' "$meta" \
     "a failed Pi snapshot invented an author identity"
-  pass "Pi identity capture remains nonfatal while successful snapshots stay bound"
+  tasktmp=$(sed -n 's/^tasktmp=//p' "$meta")
+  private="$tasktmp/pi-author-agent"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "PI_CODING_AGENT_DIR='$private' pi --approve" \
+    "Pi launch still made author identity a snapshot precondition"
+  pass "Pi snapshots remain bound without recording or requiring author identity"
 }
 
 test_batch_forwards_shared_profile_flags() {

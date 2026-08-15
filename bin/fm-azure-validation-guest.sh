@@ -567,7 +567,15 @@ if [ "$rc" -eq 0 ]; then
     start) "$NM_BIN" axi run --intent "$(cat "$INTENT_FILE")" >>"$RUN_LOG" 2>&1 ;;
     reattach) "$NM_BIN" axi run >>"$RUN_LOG" 2>&1 ;;
     respond)
-      "$NM_BIN" axi respond <"$RESPONSE_FILE" >>"$RUN_LOG" 2>&1
+      # axi respond takes its decision as required argv flags and reads
+      # nothing from stdin, so the response file carries one argument per
+      # line (e.g. "--action" / "fix" / "--findings" / "review-1"); values
+      # must not contain newlines.
+      set --
+      while IFS= read -r respond_arg || [ -n "$respond_arg" ]; do
+        set -- "$@" "$respond_arg"
+      done <"$RESPONSE_FILE"
+      "$NM_BIN" axi respond "$@" >>"$RUN_LOG" 2>&1
       response_rc=$?
       if [ "$response_rc" -eq 0 ]; then
         "$NM_BIN" axi run >>"$RUN_LOG" 2>&1

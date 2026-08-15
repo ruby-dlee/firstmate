@@ -693,6 +693,17 @@ else: raise AssertionError("strict admission accepted an untrained forecast with
 _os.environ["FM_AZURE_WORKER_ALLOW_UNTRAINED_FORECAST"]="1"
 admitted=m.budget_gate(strict_env,limits)
 assert admitted["forecast"]==1.5 and admitted["actual"]==1.5
+def throttled_query(_env,forecast=False,**_kwargs):
+    if forecast: raise m.RunnerError("Cost Management forecast remained throttled with no exact authoritative cache (missing server retry guidance)")
+    return 1.5
+m.cost_query=throttled_query
+admitted=m.budget_gate(strict_env,limits)
+assert admitted["forecast"]==1.5
+_os.environ.pop("FM_AZURE_WORKER_ALLOW_UNTRAINED_FORECAST",None)
+try: m.budget_gate(strict_env,limits)
+except m.RunnerError as exc: assert "remained throttled" in str(exc)
+else: raise AssertionError("throttled forecast substituted without operator confirmation")
+_os.environ["FM_AZURE_WORKER_ALLOW_UNTRAINED_FORECAST"]="1"
 m.cost_query=cost_query
 try: m.budget_gate(strict_env,limits)
 except m.RunnerError as exc: assert "HTTP 424" not in str(exc)

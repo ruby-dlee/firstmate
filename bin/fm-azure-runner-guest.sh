@@ -259,10 +259,10 @@ chmod 0600 "$TOKEN_FILE"
 UPLOAD_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER}/${OUTPUT_BLOB}"
 run_bootstrap_network curl --fail --silent --show-error --connect-timeout 30 --max-time 600 -X PUT \
   -H "Authorization: Bearer $(<"$TOKEN_FILE")" -H 'x-ms-version: 2023-11-03' -H 'x-ms-blob-type: BlockBlob' \
-  -H "x-ms-meta-result-digest: ${RESULT_DIGEST#sha256:}" --upload-file "$RESULT_ARCHIVE" "$UPLOAD_URL"
+  -H "x-ms-meta-result_digest: ${RESULT_DIGEST#sha256:}" --upload-file "$RESULT_ARCHIVE" "$UPLOAD_URL"
 run_bootstrap_network curl --fail --silent --show-error --head --connect-timeout 30 --max-time 60 \
   -H "Authorization: Bearer $(<"$TOKEN_FILE")" -H 'x-ms-version: 2023-11-03' "$UPLOAD_URL" >"$BASE/result-head"
-grep -qi "^x-ms-meta-result-digest: ${RESULT_DIGEST#sha256:}" "$BASE/result-head" || { echo "guest bootstrap: uploaded result verification failed" >&2; exit 125; }
+grep -qi "^x-ms-meta-result_digest: ${RESULT_DIGEST#sha256:}" "$BASE/result-head" || { echo "guest bootstrap: uploaded result verification failed" >&2; exit 125; }
 rm -f "$TOKEN_FILE" "$BASE/result-head"
 RESULT_B64=$(base64 -w0 "$OUTPUT/result.json")
 BOOT_ID=$(cat /proc/sys/kernel/random/boot_id)

@@ -394,19 +394,6 @@ The exact failed leg, retained resources, and recovery action must be reported.
 
 ## Live acceptance record
 
-The first complete no-mistakes pipeline run inside an isolated Azure
-`validation-standard` cell executed on 2026-08-14 against this repository: run
-`01M00YX1QS5H608DPH6DFV7CDN`, validation generation `azv-stage-c-013`,
-lease task `azure-stage-c-validation`, task generation
-`spawn:558423dc544ebe5c`, validating exact head
-`126b60419613938c055b41447f9a65c76c31923a` through the pushed
-`codex/azure-stage-c-validation` branch. Generations `azv-stage-c-014`
-and `azv-stage-c-015` (same head, branch, and lease coordinates) then
-ground-truthed the guest's outcome derivation until the authenticated
-result recorded that success end to end. Those cells validated an
-already-merged head, so their pipeline completed at pre-push with
-nothing to publish; this section, submitted on the
-`fm/stage-c-live-acceptance` branch under the same lease coordinates in
-one isolated Azure `validation-standard` cell, is itself the first
-change validated by a cell through the full push, pull request, and
-CI-green proof path.
+The first complete no-mistakes pipeline run inside an isolated Azure `validation-standard` cell executed on 2026-08-14 against this repository: run `01M00YX1QS5H608DPH6DFV7CDN`, validation generation `azv-stage-c-013`, lease task `azure-stage-c-validation`, task generation `spawn:558423dc544ebe5c`, validating exact head `126b60419613938c055b41447f9a65c76c31923a` through the pushed `codex/azure-stage-c-validation` branch.
+Generations `azv-stage-c-014` and `azv-stage-c-015` (same head, branch, and lease coordinates) then ground-truthed the guest's outcome derivation until the authenticated result recorded that success end to end.
+Those cells validated an already-merged head, so their pipeline completed at pre-push with nothing to publish; this section, submitted on the `fm/stage-c-live-acceptance` branch under the same lease coordinates in one isolated Azure `validation-standard` cell, is itself the first change validated by a cell through the full push, pull request, and CI-green proof path.

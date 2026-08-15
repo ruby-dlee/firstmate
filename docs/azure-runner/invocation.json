@@ -73,6 +73,13 @@
       "defaultValue": 1000000,
       "minValue": 1000000,
       "maxValue": 1000000
+    },
+    "bakedImageId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional gallery image id baked by fm-azure-cell-image.sh; empty selects the stock Ubuntu marketplace image."
+      }
     }
   },
   "resources": [
@@ -118,14 +125,6 @@
         "hardwareProfile": {
           "vmSize": "[parameters('vmSize')]"
         },
-        "securityProfile": {
-          "securityType": "TrustedLaunch",
-          "uefiSettings": {
-            "secureBootEnabled": true,
-            "vTpmEnabled": true
-          },
-          "encryptionAtHost": true
-        },
         "osProfile": {
           "computerName": "[parameters('vmName')]",
           "adminUsername": "fmbootstrap",
@@ -143,12 +142,7 @@
           }
         },
         "storageProfile": {
-          "imageReference": {
-            "publisher": "Canonical",
-            "offer": "ubuntu-24_04-lts",
-            "sku": "server",
-            "version": "[parameters('ubuntuImageVersion')]"
-          },
+          "imageReference": "[if(empty(parameters('bakedImageId')), createObject('publisher', 'Canonical', 'offer', 'ubuntu-24_04-lts', 'sku', 'server', 'version', parameters('ubuntuImageVersion')), createObject('id', parameters('bakedImageId')))]",
           "osDisk": {
             "name": "[parameters('osDiskName')]",
             "createOption": "FromImage",

@@ -3295,7 +3295,12 @@ def cleanup(env, state):
         raise
     payload_dir = Path(state["input_path"]).parent
     if payload_dir.parent == env["state_dir"] / "payloads":
-        shutil.rmtree(payload_dir, ignore_errors=False)
+        # A repeated cleanup can race an earlier partial removal; an already
+        # absent tree is exactly the desired end state.
+        try:
+            shutil.rmtree(payload_dir, ignore_errors=False)
+        except FileNotFoundError:
+            pass
     if state.get("reservation_recorded"):
         try:
             mark_management_reservation_cleanup_verified(env, state)

@@ -188,7 +188,7 @@
       ],
       "properties": {
         "source": {
-          "script": "[format('set -eu\\ncat > /etc/systemd/system/fm-azure-runner-expiry.service <<\"EOF\"\\n[Unit]\\nDescription=Stop expired disposable Firstmate Azure runner\\n[Service]\\nType=oneshot\\nExecStart=/usr/sbin/shutdown -h now\\nEOF\\ncat > /etc/systemd/system/fm-azure-runner-expiry.timer <<\"EOF\"\\n[Unit]\\nDescription=Bound disposable Firstmate Azure runner lifetime\\n[Timer]\\nOnCalendar={0}\\nPersistent=true\\nUnit=fm-azure-runner-expiry.service\\n[Install]\\nWantedBy=timers.target\\nEOF\\nsystemctl daemon-reload\\nsystemctl enable --now fm-azure-runner-expiry.timer', parameters('expiryUtc'))]"
+          "script": "[format(replace('set -eu|cat > /etc/systemd/system/fm-azure-runner-expiry.service <<\"EOF\"|[Unit]|Description=Stop expired disposable Firstmate Azure runner|[Service]|Type=oneshot|ExecStart=/usr/sbin/shutdown -h now|EOF|cat > /etc/systemd/system/fm-azure-runner-expiry.timer <<\"EOF\"|[Unit]|Description=Bound disposable Firstmate Azure runner lifetime|[Timer]|OnCalendar={0}|Persistent=true|Unit=fm-azure-runner-expiry.service|[Install]|WantedBy=timers.target|EOF|systemctl daemon-reload|systemctl enable --now fm-azure-runner-expiry.timer', '|', uriComponentToString('%0A')), parameters('expiryUtc'))]"
         },
         "asyncExecution": false,
         "timeoutInSeconds": 300,

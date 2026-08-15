@@ -138,6 +138,11 @@ assert '"ttl_schedule_id": base + "/Microsoft.DevTestLab/schedules/shutdown-comp
 assert 'run_mode = replacement_run_mode(state)' in host
 assert 'command_env.setdefault("FM_HOME", str(ROOT))' in host
 assert 'command_env["FM_HOME"] = str(ROOT)' not in host
+assert 'def follow_shard_lineage' in host
+assert host.count('followed = follow_shard_lineage(env, record)') == 2
+assert 'value.get("phase") == "absent-fenced" and value.get("old_lease_absent") is True' in host
+assert host.index('"retry",') < host.index('"--confirm-run",')
+assert 'value.get("parent_invocation") == current' in host
 assert 'create_run_command(env, state, "start", input_url=input_url, output_url=output_url)' in host
 assert '"running", "reattaching", "collected")' in host
 for value in ("MemoryMax","MemorySwapMax=0","TasksMax","CPUQuota=700%","PrivateTmp=yes","ProtectSystem=strict","CapabilityBoundingSet=","cryptsetup luksUUID","provider account-binding marker mismatch","credential disk content binding mismatch","FM_AZURE_VALIDATION_RUNTIME_PATH","axi status","/dev/disk/azure/scsi1/lun","/dev/disk/azure/data/by-lun/"):

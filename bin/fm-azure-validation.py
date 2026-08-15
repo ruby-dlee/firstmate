@@ -2442,6 +2442,22 @@ def run_shard_invocations(env, state, records):
         save_state(env, state)
     for record in records:
         runner_state = runner_state_dir(env) / (record["invocation"] + ".json")
+        if runner_state.is_file():
+            try:
+                probe = json.loads(runner_state.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValidationError("recorded shard runner state is unreadable: {}".format(exc))
+            probe_digest = (probe.get("request") or {}).get("command_digest")
+            if probe_digest is not None and probe_digest != record["command_digest"]:
+                # The state at this invocation belongs to a different request
+                # that shared the id (two records on one shard constituent):
+                # retrying it would rerun the other record's command forever.
+                # Rebind this record to its own derived invocation instead.
+                record["invocation"] = "azr-" + hashlib.sha256(
+                    record["request_digest"].encode("utf-8")
+                ).hexdigest()[:12]
+                save_state(env, state)
+                runner_state = runner_state_dir(env) / (record["invocation"] + ".json")
         operation = [str(runner), "resume", "--invocation", record["invocation"]]
         if runner_state.is_file():
             try:

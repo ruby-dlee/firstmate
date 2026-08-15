@@ -3260,7 +3260,7 @@ def adopt_expected_detach(env, state, kind, identity_key, resource_id):
 
 
 def cleanup(env, state):
-    if state.get("phase") not in ("result-collected", "cleanup-retained", "complete"):
+    if state.get("phase") not in ("result-collected", "cleanup-retained", "compute-removed", "complete"):
         raise RunnerError("cleanup requires a safely collected result; active or ambiguous work is retained")
     if state.get("phase") == "complete":
         return

@@ -2367,7 +2367,7 @@ def prepare_shard_runner(env, state, blob, request, extracted, plan):
         "head": request["repository"]["head"],
         "command_digest": request["command_digest"],
         "repo": str(repo),
-        "snapshot_bundle": str(git_bundle),
+        "snapshot_bundle": str(extracted / "snapshot.bundle"),
         "source_ref": "refs/heads/" + request["repository"]["branch"],
         "task": "{}-s{}".format(state["cell"], request["shard"]),
         "generation": request["round"],

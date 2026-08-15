@@ -3055,7 +3055,16 @@ def poll_run_command(env, state):
             output = str(view.get("output", ""))
             error = str(view.get("error", ""))
             if execution != "Succeeded":
-                raise RunnerError("managed run command failed ({}, {}): {}".format(execution, provisioning, error[-1000:]))
+                # An unstructured guest death (bootstrap failure, OOM, eviction)
+                # used to raise here and leave a live VM holding an ambiguous
+                # non-result forever: retry demands proven absence, and nothing
+                # deleted the VM (generation 044 deadlock). Record the failure
+                # durably and tear the disposable compute down in this same
+                # call so the next pass can fence and retry without an
+                # operator sweep.
+                transition(env, state, "failed-retained", "managed run command failed ({}, {}): {}".format(execution, provisioning, error[-500:]))
+                teardown_failed_compute(env, state)
+                raise RunnerError("guest died without a structured result ({}); compute removed so the retry lane can fence: {}".format(execution, error[-500:]))
             marker = re.search(r"FM_AZURE_RESULT\s+(sha256:[0-9a-f]{64})\s+boot=([0-9a-f-]{36})\s+result=([A-Za-z0-9+/=]+)", output)
             if not marker:
                 raise RunnerError("managed run command completed without a valid result identity marker")
@@ -3158,12 +3167,23 @@ def verify_live_resource_identity(env, state, kind, resource_id, identity_key=No
         # Deleting the VM mutates every dependent resource's etag, so the
         # absence fence compares the stable immutable field and exact id
         # instead of the full creation-time identity.
-        stable_field = {
-            "vm": "instance_id", "nic": "resource_guid", "disk": "unique_id",
-            "run-command": "provisioning_state", "ttl-schedule": "task_type",
-        }[kind]
-        if live["id"] != recorded["id"] or live.get(stable_field) != recorded.get(stable_field):
-            raise RunnerError("live {} immutable identity changed; cleanup retained ambiguous state".format(kind))
+        if kind == "run-command":
+            # A run command's provisioning state legitimately transitions when
+            # it executes - including the wallet's safety-shutdown sibling
+            # firing on its own schedule - so it can never serve as a stable
+            # identity field: doing so deadlocked cleanup behind a deterministic
+            # refusal once the wallet fired (generation 041/044 ground truth).
+            # The exact resource id plus verified ownership tags carry the
+            # whole identity, matching the non-stable run-command rule above.
+            if live["id"] != recorded["id"]:
+                raise RunnerError("live {} immutable identity changed; cleanup retained ambiguous state".format(kind))
+        else:
+            stable_field = {
+                "vm": "instance_id", "nic": "resource_guid", "disk": "unique_id",
+                "ttl-schedule": "task_type",
+            }[kind]
+            if live["id"] != recorded["id"] or live.get(stable_field) != recorded.get(stable_field):
+                raise RunnerError("live {} immutable identity changed; cleanup retained ambiguous state".format(kind))
     elif live != recorded:
         raise RunnerError("live {} immutable identity changed; cleanup retained ambiguous state".format(kind))
     if require_vm_relation and kind == "nic" and str(resource.get("properties", {}).get("virtualMachine", {}).get("id", "")).lower() != state["resources"]["vm_id"].lower():
@@ -3280,6 +3300,37 @@ def adopt_expected_detach(env, state, kind, identity_key, resource_id):
     state["resources"]["identities"][identity_key] = current
     save_state(env, state)
     return resource
+
+
+def teardown_failed_compute(env, state):
+    """Remove a dead guest's disposable compute so absence can be proven.
+
+    Reached only from a durably recorded terminal run-command failure with no
+    result to protect. Deletes the same disposable set as cleanup (run
+    commands, VM, NIC, OS disk, TTL schedule) under the same identity
+    verification; durable snapshot/staging state is untouched. A refusal
+    leaves the phase failed-retained, and the next resume converges by
+    re-entering this teardown.
+    """
+    classified = classify_disposable_resources(env, state, include_vm=True)
+    by_key = {identity_key: (kind, resource_id, resource) for kind, identity_key, resource_id, resource in classified}
+    for identity_key in ("run-command-execute", "run-command-safety"):
+        if identity_key in by_key:
+            kind, resource_id, resource = by_key[identity_key]
+            delete_classified_resource(env, state, resource_id, kind, identity_key, resource)
+    if "vm" in by_key:
+        kind, resource_id, resource = by_key["vm"]
+        delete_classified_resource(env, state, resource_id, kind, "vm", resource)
+    for kind, identity_key, resource_id in (
+        ("nic", "nic", state["resources"]["nic_id"]),
+        ("disk", "disk", state["resources"]["os_disk_id"]),
+    ):
+        resource = adopt_expected_detach(env, state, kind, identity_key, resource_id)
+        if resource is not None:
+            delete_classified_resource(env, state, resource_id, kind, identity_key, resource)
+    if "ttl-schedule" in by_key:
+        kind, resource_id, resource = by_key["ttl-schedule"]
+        delete_classified_resource(env, state, resource_id, kind, "ttl-schedule", resource)
 
 
 def cleanup(env, state):

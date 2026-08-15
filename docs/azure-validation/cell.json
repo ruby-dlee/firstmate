@@ -5,11 +5,17 @@
     "region": {
       "type": "string",
       "defaultValue": "eastus",
-      "allowedValues": ["eastus"]
+      "allowedValues": [
+        "eastus"
+      ]
     },
     "zone": {
       "type": "string",
-      "allowedValues": ["1", "2", "3"]
+      "allowedValues": [
+        "1",
+        "2",
+        "3"
+      ]
     },
     "vmName": {
       "type": "string",
@@ -36,9 +42,6 @@
     },
     "createWorktreeDisk": {
       "type": "bool"
-    },
-    "credentialDiskId": {
-      "type": "string"
     },
     "identityName": {
       "type": "string",
@@ -93,6 +96,13 @@
     },
     "tags": {
       "type": "object"
+    },
+    "bakedImageId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional gallery image id baked by fm-azure-cell-image.sh; empty selects the stock Ubuntu marketplace image."
+      }
     }
   },
   "variables": {
@@ -150,11 +160,13 @@
       "apiVersion": "2023-10-02",
       "name": "[parameters('worktreeDiskName')]",
       "location": "[parameters('region')]",
-      "zones": ["[parameters('zone')]"],
+      "zones": [
+        "[parameters('zone')]"
+      ],
       "sku": {
         "name": "StandardSSD_LRS"
       },
-      "tags": "[union(parameters('tags'), createObject('disk-purpose', 'validation-worktree', 'guest-encryption', 'luks2-required', 'snapshot-policy', 'forbidden', 'retention', 'detach-on-vm-failure'))]",
+      "tags": "[union(parameters('tags'), createObject('disk-purpose', 'validation-worktree', 'snapshot-policy', 'forbidden', 'retention', 'detach-on-vm-failure'))]",
       "properties": {
         "creationData": {
           "createOption": "Empty"
@@ -190,7 +202,9 @@
       "apiVersion": "2024-03-01",
       "name": "[parameters('vmName')]",
       "location": "[parameters('region')]",
-      "zones": ["[parameters('zone')]"],
+      "zones": [
+        "[parameters('zone')]"
+      ],
       "tags": "[parameters('tags')]",
       "dependsOn": [
         "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', parameters('identityName'))]",
@@ -207,14 +221,6 @@
         "hardwareProfile": {
           "vmSize": "[parameters('vmSize')]"
         },
-        "securityProfile": {
-          "securityType": "TrustedLaunch",
-          "uefiSettings": {
-            "secureBootEnabled": true,
-            "vTpmEnabled": true
-          },
-          "encryptionAtHost": true
-        },
         "osProfile": {
           "computerName": "[parameters('vmName')]",
           "adminUsername": "fmbootstrap",
@@ -222,20 +228,17 @@
             "disablePasswordAuthentication": true,
             "provisionVMAgent": true,
             "ssh": {
-              "publicKeys": [{
-                "path": "/home/fmbootstrap/.ssh/authorized_keys",
-                "keyData": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCaAn1stDlmF2Wo5Dn44vAV+AzWGUIBaXvoCEJdxmx6Xhq6ElG4OQj0VAJkBhIqtXGIdUgObA0/ix3U4WIgwX/JYWcgYhQ8yZsNnYIfn6cfTduCD+4kJdHnss8S2C268S/4GszEH90cpSUI5bMXXVB1Adsntnz4S3Q1Z2hsB33zKOaB/sDnKYCck8y17JWTLCmVlwRpjiCL2NnKNwNkYbVeNa2U98/OJbHA2UGttqpI/GKnb2wB/iZV9KQ/Cf1kHIvJO99IFT12AKL2YoApLVVWrd2cxOHt2uAvnI3Pc+Qh2p8AZz++00eso1cmXkD5VzTNTpOnYPmGJAEO4Lo2Mb+00Op+LHWoPXifHtBt2E3588JPxSx/cXUaLIpvHHs7RwWSG+88rXQY1s628ZrhJFn7U/1logJ6lJo5exJAqDDzwlagdIxzCeNiyoKp/GQpwtSPYK1EIQDHqoYcBR6BJsRAbeZPzQ3TS/6lwEFE9EWfzohhHkVthPqsblympNQmWr8= firstmate-validation-blackhole"
-              }]
+              "publicKeys": [
+                {
+                  "path": "/home/fmbootstrap/.ssh/authorized_keys",
+                  "keyData": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCaAn1stDlmF2Wo5Dn44vAV+AzWGUIBaXvoCEJdxmx6Xhq6ElG4OQj0VAJkBhIqtXGIdUgObA0/ix3U4WIgwX/JYWcgYhQ8yZsNnYIfn6cfTduCD+4kJdHnss8S2C268S/4GszEH90cpSUI5bMXXVB1Adsntnz4S3Q1Z2hsB33zKOaB/sDnKYCck8y17JWTLCmVlwRpjiCL2NnKNwNkYbVeNa2U98/OJbHA2UGttqpI/GKnb2wB/iZV9KQ/Cf1kHIvJO99IFT12AKL2YoApLVVWrd2cxOHt2uAvnI3Pc+Qh2p8AZz++00eso1cmXkD5VzTNTpOnYPmGJAEO4Lo2Mb+00Op+LHWoPXifHtBt2E3588JPxSx/cXUaLIpvHHs7RwWSG+88rXQY1s628ZrhJFn7U/1logJ6lJo5exJAqDDzwlagdIxzCeNiyoKp/GQpwtSPYK1EIQDHqoYcBR6BJsRAbeZPzQ3TS/6lwEFE9EWfzohhHkVthPqsblympNQmWr8= firstmate-validation-blackhole"
+                }
+              ]
             }
           }
         },
         "storageProfile": {
-          "imageReference": {
-            "publisher": "Canonical",
-            "offer": "ubuntu-24_04-lts",
-            "sku": "server",
-            "version": "[parameters('ubuntuImageVersion')]"
-          },
+          "imageReference": "[if(empty(parameters('bakedImageId')), createObject('publisher', 'Canonical', 'offer', 'ubuntu-24_04-lts', 'sku', 'server', 'version', parameters('ubuntuImageVersion')), createObject('id', parameters('bakedImageId')))]",
           "osDisk": {
             "name": "[parameters('osDiskName')]",
             "createOption": "FromImage",
@@ -253,15 +256,6 @@
               "deleteOption": "Detach",
               "managedDisk": {
                 "id": "[variables('worktreeId')]"
-              }
-            },
-            {
-              "lun": 1,
-              "name": "[last(split(parameters('credentialDiskId'), '/'))]",
-              "createOption": "Attach",
-              "deleteOption": "Detach",
-              "managedDisk": {
-                "id": "[parameters('credentialDiskId')]"
               }
             }
           ]

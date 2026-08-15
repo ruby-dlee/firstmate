@@ -2735,7 +2735,14 @@ def immutable_identity(resource, label):
         "run-command": "provisioning_state",
         "ttl-schedule": "task_type",
     }[label]
-    if not identity["id"] or not identity["etag"] or not identity.get(required):
+    # Run commands and DevTestLab schedules return no body etag on GET,
+    # exactly as the validation controller's identity contract records;
+    # their stable field plus the exact id carry the identity.
+    if (
+        not identity["id"]
+        or (label not in ("run-command", "ttl-schedule") and not identity["etag"])
+        or not identity.get(required)
+    ):
         raise RunnerError("created {} immutable identity is incomplete".format(label))
     return identity
 
@@ -3188,10 +3195,10 @@ def delete_resource(env, state, resource_id, kind):
 
 def delete_classified_resource(env, state, resource_id, kind, identity_key, resource):
     url = resource_url(resource_id, RESOURCE_API_VERSIONS[kind])
-    _, rc, stderr = az_command(env, [
-        "rest", "--method", "delete", "--url", url,
-        "--headers", "If-Match={}".format(resource["etag"]),
-    ], check=False)
+    arguments = ["rest", "--method", "delete", "--url", url]
+    if resource.get("etag"):
+        arguments += ["--headers", "If-Match={}".format(resource["etag"])]
+    _, rc, stderr = az_command(env, arguments, check=False)
     if rc != 0:
         raise RunnerError("conditional exact {} deletion failed: {}".format(kind, stderr))
     remains, _ = read_exact_resource(env, resource_id, kind)

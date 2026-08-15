@@ -173,6 +173,9 @@ assert '"reattaching", "collected")' in host
 assert "retain-failure owns only failed outcomes" in host
 assert '"$NM_BIN" axi respond <"$RESPONSE_FILE"' not in guest
 assert '"$NM_BIN" axi respond "$@"' in guest
+respond_block=guest[guest.index("    respond)"):guest.index('*) exit 125 ;;')]
+assert respond_block.index('"$NM_BIN" axi run') < respond_block.index('axi respond "$@"')
+assert '|| true' in respond_block
 assert 'while IFS= read -r respond_arg || [ -n "$respond_arg" ]; do' in guest
 assert guest.index("set --") < guest.index('"$NM_BIN" axi respond "$@"')
 assert '"$NM_BIN" init >"$RUN_LOG" 2>&1' in guest

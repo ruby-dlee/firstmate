@@ -567,6 +567,11 @@ if [ "$rc" -eq 0 ]; then
     start) "$NM_BIN" axi run --intent "$(cat "$INTENT_FILE")" >>"$RUN_LOG" 2>&1 ;;
     reattach) "$NM_BIN" axi run >>"$RUN_LOG" 2>&1 ;;
     respond)
+      # The gated run was owned by the previous attempt's daemon, which died
+      # with that attempt's unit; a reattaching axi run resurfaces the parked
+      # gate for this fresh daemon before any respond can address it. The
+      # reattach stops at the gate, so its exit status is not consulted.
+      "$NM_BIN" axi run >>"$RUN_LOG" 2>&1 || true
       # axi respond takes its decision as required argv flags and reads
       # nothing from stdin, so the response file carries one argument per
       # line (e.g. "--action" / "fix" / "--findings" / "review-1"); values

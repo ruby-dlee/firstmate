@@ -2319,23 +2319,7 @@ def shard_plan_entry(state, shard):
     raise ValidationError("shard {} has no pre-reserved shape constituent".format(shard))
 
 
-def prepare_shard_runner(env, state, blob, request, extracted, plan):
-    sku = plan["sku"]
-    key = request["request_digest"]
-    existing = state.setdefault("shard_runs", {}).get(key)
-    if existing:
-        expected = {
-            "blob": blob,
-            "sku": sku,
-            "invocation": plan["invocation"],
-            "round": request["round"],
-            "shard": request["shard"],
-            "head": request["repository"]["head"],
-            "command_digest": request["command_digest"],
-        }
-        if any(existing.get(name) != value for name, value in expected.items()):
-            raise ValidationError("recorded shard runner identity differs from the exact request")
-        return existing
+def materialize_shard_repo(request, extracted):
     repo = extracted / "repo"
     git_bundle = extracted / "snapshot.bundle"
     run(["git", "clone", "--no-local", str(git_bundle), str(repo)])
@@ -2346,6 +2330,32 @@ def prepare_shard_runner(env, state, blob, request, extracted, plan):
         raise ValidationError("materialized shard tree mismatch")
     public_remote = "https://github.com/{}.git".format(request["repository"]["slug"])
     git(repo, "remote", "set-url", "origin", public_remote)
+    return repo
+
+
+def prepare_shard_runner(env, state, blob, request, extracted, plan):
+    sku = plan["sku"]
+    key = request["request_digest"]
+    existing = state.setdefault("shard_runs", {}).get(key)
+    if existing:
+        expected = {
+            "blob": blob,
+            "sku": sku,
+            "round": request["round"],
+            "shard": request["shard"],
+            "head": request["repository"]["head"],
+            "command_digest": request["command_digest"],
+        }
+        if any(existing.get(name) != value for name, value in expected.items()):
+            raise ValidationError("recorded shard runner identity differs from the exact request")
+        # Every pass re-downloads a still-pending request into a clean
+        # extraction, which drops the previously materialized clone; the
+        # retry and resume paths both need the exact repo back at its
+        # recorded path.
+        if not Path(existing["repo"]).is_dir():
+            materialize_shard_repo(request, extracted)
+        return existing
+    repo = materialize_shard_repo(request, extracted)
     invocation = plan["invocation"]
     record = {
         "blob": blob,
@@ -2469,8 +2479,9 @@ def run_shard_invocations(env, state, records):
             rebound = True
         if process.returncode == 125 or process.returncode < 0:
             failures.append("{} rc={}".format(record["invocation"], process.returncode))
-    if rebound:
-        save_state(env, state)
+    # The tails and any rebind must survive the failure raise below, or a
+    # refused transport leaves no durable ground truth for the operator.
+    save_state(env, state)
     if failures:
         raise ValidationError("one or more shard transports retained ambiguous state: " + ", ".join(failures))
 

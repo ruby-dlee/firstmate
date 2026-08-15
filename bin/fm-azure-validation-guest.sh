@@ -68,9 +68,20 @@ for tool in curl git python3 sha256sum tar systemd-run cryptsetup blkid lsblk fi
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y --no-install-recommends \
-    ca-certificates curl git python3 cryptsetup-bin util-linux jq systemd tar passwd
+  bootstrap_packages() {
+    apt-get update -qq
+    apt-get install -y --no-install-recommends \
+      ca-certificates curl git python3 cryptsetup-bin util-linux jq systemd tar passwd
+  }
+  if ! bootstrap_packages; then
+    # The regional azure.archive mirror rides plain port 80, whose egress can
+    # die while 443 stays healthy (generation 044 ground truth: connection
+    # timeouts to the mirror while storage uploads succeeded). apt-get update
+    # exits 0 on failed fetches, so the install step is what surfaces it.
+    sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+      /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+    bootstrap_packages
+  fi
 fi
 for tool in curl git python3 sha256sum tar systemd-run cryptsetup blkid lsblk findmnt jq mount umount useradd runuser; do
   command -v "$tool" >/dev/null 2>&1 || { echo "validation guest: fixed bootstrap closure is incomplete" >&2; exit 125; }

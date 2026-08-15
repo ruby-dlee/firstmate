@@ -98,7 +98,12 @@ assert set(template["parameters"]["vmSize"]["allowedValues"]) >= {"Standard_D4as
 assert vm["identity"]["type"] == "UserAssigned"
 assert "controllerIdentityId" in json.dumps(vm["identity"])
 assert "publicipaddress" not in json.dumps(nic).lower()
-assert "ssh" not in json.dumps(vm["properties"]["osProfile"]).lower()
+linux=vm["properties"]["osProfile"]["linuxConfiguration"]
+assert linux["disablePasswordAuthentication"] is True
+runner_key=linux["ssh"]["publicKeys"][0]
+assert runner_key["path"]=="/home/fmbootstrap/.ssh/authorized_keys"
+assert runner_key["keyData"].startswith("ssh-rsa ") and runner_key["keyData"].endswith(" firstmate-runner-blackhole")
+assert "adminPassword" not in json.dumps(vm["properties"]["osProfile"])
 assert "customdata" not in json.dumps(template).lower()
 for value in ("PrivateNetwork=yes","RestrictAddressFamilies=AF_UNIX","IPAddressDeny=any","CapabilityBoundingSet=CAP_SETUID CAP_SETGID","AmbientCapabilities=","NoNewPrivileges=yes"):
     assert value in guest
@@ -118,6 +123,11 @@ assert "If-Match=" in host and "runner-cost-reservation" in host
 assert 'command_env.setdefault("FM_HOME", str(ROOT))' in host
 assert 'command_env["FM_HOME"] = str(ROOT)' not in host
 assert 'str(Path(command_env["FM_HOME"]) / "state" / "azure-workers")' in host
+assert "DEPLOYMENT_TIMEOUT_SECONDS = 900" in host
+assert "LEASE_ACQUIRE_ATTEMPTS = 90" in host
+assert "for _ in range(LEASE_ACQUIRE_ATTEMPTS):" in host
+assert "timeout_seconds=DEPLOYMENT_TIMEOUT_SECONDS" in host
+assert "AZURE_SCHEDULE_MINIMUM_LEAD_SECONDS + DEPLOYMENT_TIMEOUT_SECONDS" in host
 start=host.index("def dispatch_prepared")
 assert host.index("shared_capacity_reserve(env, state, cost)", start) < host.index("create_vm(env, state)", start)
 assert host.index("lease.renew_and_assert()", start) < host.index("create_vm(env, state)", start)

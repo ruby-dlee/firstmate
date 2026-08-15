@@ -52,6 +52,12 @@ SAFE_PUBLIC_GIT_REF = re.compile(
     r"^refs/(?:heads/[A-Za-z0-9._/-]{1,200}|pull/[1-9][0-9]*/head)$"
 )
 LOCAL_COMMAND_TIMEOUT_SECONDS = 300
+# A TrustedLaunch VM deployment routinely outlives the general command bound,
+# especially with sibling shard deployments in flight; the ARM call gets its
+# own generous-but-bounded deadline.
+DEPLOYMENT_TIMEOUT_SECONDS = 900
+# Admission-lock acquisition tries, spaced ten seconds apart.
+LEASE_ACQUIRE_ATTEMPTS = 90
 COST_QUERY_TIMEOUT_SECONDS = 60
 COST_RETRY_DEADLINE_SECONDS = 900
 COST_CACHE_MAX_AGE_SECONDS = 4 * 60 * 60
@@ -2520,7 +2526,10 @@ class ManagementAdmissionLease:
             self.expires_at = time.monotonic() + LEASE_DURATION_SECONDS
 
     def __enter__(self):
-        for _ in range(7):
+        # Sibling shard runners legitimately hold this lease through their
+        # own admission and VM creation, so the wait must cover several
+        # multi-minute predecessors before failing closed.
+        for _ in range(LEASE_ACQUIRE_ATTEMPTS):
             metadata, etag = self._read()
             expiry = metadata.get("lockexpiry")
             busy = False
@@ -2769,7 +2778,7 @@ def create_vm(env, state):
         state["request"]["compute_deallocation_deadline"].replace("Z", "+00:00")
     )
     required_lead = dt.timedelta(
-        seconds=AZURE_SCHEDULE_MINIMUM_LEAD_SECONDS + LOCAL_COMMAND_TIMEOUT_SECONDS
+        seconds=AZURE_SCHEDULE_MINIMUM_LEAD_SECONDS + DEPLOYMENT_TIMEOUT_SECONDS
     )
     if deadline <= now_utc() + required_lead:
         raise RunnerError(
@@ -2781,7 +2790,7 @@ def create_vm(env, state):
             "deployment", "group", "create", "--resource-group", env["resource_group"],
             "--name", state["resources"]["deployment"], "--template-file", str(TEMPLATE),
             "--parameters", "@" + str(params), "--mode", "Incremental",
-        ])
+        ], timeout_seconds=DEPLOYMENT_TIMEOUT_SECONDS)
     finally:
         params.unlink(missing_ok=True)
     exists, vm = read_exact_resource(env, state["resources"]["vm_id"], "vm")

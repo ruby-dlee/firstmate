@@ -123,6 +123,10 @@ assert "If-Match=" in host and "runner-cost-reservation" in host
 assert 'command_env.setdefault("FM_HOME", str(ROOT))' in host
 assert 'command_env["FM_HOME"] = str(ROOT)' not in host
 assert 'str(Path(command_env["FM_HOME"]) / "state" / "azure-workers")' in host
+schedule=next(r for r in template["resources"] if r["type"]=="Microsoft.DevTestLab/schedules")
+assert schedule["name"]=="[format('shutdown-computevm-{0}', parameters('vmName'))]"
+assert '"ttl_schedule_name": "shutdown-computevm-{}".format(vm_name)' in host
+assert "schedules/shutdown-computevm-{}" in host
 assert "DEPLOYMENT_TIMEOUT_SECONDS = 900" in host
 assert "LEASE_ACQUIRE_ATTEMPTS = 90" in host
 assert "for _ in range(LEASE_ACQUIRE_ATTEMPTS):" in host

@@ -939,8 +939,10 @@ def prepare(env, args, parent_state=None):
             "os_disk_id": "/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Compute/disks/{}".format(env["subscription"], env["resource_group"], disk_name),
             "run_command_name": "execute",
             "safety_run_command_name": "safety-shutdown",
-            "ttl_schedule_name": "shutdown-{}".format(vm_name),
-            "ttl_schedule_id": "/subscriptions/{}/resourceGroups/{}/providers/Microsoft.DevTestLab/schedules/shutdown-{}".format(
+            # DevTestLab requires the exact name shutdown-computevm-<vmName>;
+            # anything else fails the deployment at the schedule resource.
+            "ttl_schedule_name": "shutdown-computevm-{}".format(vm_name),
+            "ttl_schedule_id": "/subscriptions/{}/resourceGroups/{}/providers/Microsoft.DevTestLab/schedules/shutdown-computevm-{}".format(
                 env["subscription"], env["resource_group"], vm_name
             ),
             "identities": {},

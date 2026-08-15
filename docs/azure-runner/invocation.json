@@ -198,7 +198,7 @@
     {
       "type": "Microsoft.DevTestLab/schedules",
       "apiVersion": "2018-09-15",
-      "name": "[format('shutdown-{0}', parameters('vmName'))]",
+      "name": "[format('shutdown-computevm-{0}', parameters('vmName'))]",
       "location": "[parameters('region')]",
       "tags": "[parameters('tags')]",
       "dependsOn": [

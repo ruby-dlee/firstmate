@@ -3418,7 +3418,7 @@ def resume(env, state):
         cleanup(env, state)
         print_logs_and_summary(state, result)
         return int(result["exit_code"])
-    if phase == "result-collected" or phase == "cleanup-retained":
+    if phase in ("result-collected", "cleanup-retained", "compute-removed"):
         cleanup(env, state)
         print_logs_and_summary(state, state["result"])
         return int(state["result"]["exit_code"])

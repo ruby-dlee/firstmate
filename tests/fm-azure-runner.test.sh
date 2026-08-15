@@ -164,6 +164,7 @@ assert "elif stable_only:" in host
 assert host.index('if kind == "run-command":') < host.index("elif stable_only:")
 assert "still exists after conditional delete" in host
 assert host.index("deadline = time.monotonic() + 90") < host.index("still exists after conditional delete")
+assert 'if phase in ("result-collected", "cleanup-retained", "compute-removed"):' in host
 provider_text=open("bin/fm-azure-worker-provider.py").read()
 assert 'SAFE_INVOCATION = re.compile(r"^azr-[0-9a-f]{12}(?:-a(?:[2-9]|[1-9][0-9]+))?$")' in provider_text
 assert '"ttl_schedule_name": "shutdown-computevm-{}".format(vm_name)' in host

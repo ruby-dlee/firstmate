@@ -21,7 +21,7 @@ Remote Herdr is not part of this path.
 Later Herdr proxy tabs may display state, but validation submission, ask-user responses, recovery, evidence collection, and cleanup use Azure Resource Manager, Managed Run Command, and the private storage endpoint.
 
 No Azure resource was created while implementing this feature.
-Live Azure acceptance of these cells remains unperformed; it happens later from released public main under separate explicit billable authorization.
+Live Azure acceptance of these cells runs from released public main under separate explicit billable authorization; the first live Stage C pipeline acceptance has occurred and is recorded in the Live acceptance record section, while the full multi-leg checklist in the Live acceptance section remains unperformed.
 The released private foundation, its PR 136 inventory correction, and the released whole-fleet allocator are the integration base, and the dispatcher consumes the released runner's exact foundation/controller-identity contract rather than a partial parallel proof.
 
 ## Capacity and cost shape
@@ -367,8 +367,8 @@ A missing ETag, changed instance, foreign tag, foreign principal, extra role ass
 
 ## Live acceptance
 
-Focused fake-cloud and static tests do not claim real Azure usability. The full multi-leg acceptance checklist below remains unperformed; the first live Stage C pipeline acceptance has now occurred, as described in the Live acceptance record section.
-After this stack is released to public main and the operator has explicit billable authorization, the first live acceptance must run from that released main and record all of these results:
+Focused fake-cloud and static tests do not claim real Azure usability. The first live Stage C pipeline acceptance has occurred, as described in the Live acceptance record section, while the full multi-leg acceptance checklist below remains unperformed.
+After this stack is released to public main and the operator has explicit billable authorization, the full checklist acceptance must run from that released main and record all of these results:
 
 1. Record Mac wall time, CPU, memory, swap, process count, and interactive latency before admission.
 2. Queue more work than the configured processor/concurrency limit and prove saturation remains queued with no oversubscription.

@@ -124,6 +124,9 @@ assert "cwd=str(repo)," not in executor_text
 assert executor_text.index("drop_privileges(uid, gid,") < executor_text.index("os.chdir(str(repo))")
 assert "x-ms-meta-result_digest" in guest and "x-ms-meta-result-digest" not in guest
 assert 'SAFE_INVOCATION = re.compile(r"^azr-[a-z0-9]{12}(?:-a(?:[2-9]|[1-9][0-9]+))?$")' in host
+assert '[ -s "$OUTPUT/result.json" ] || { echo "guest bootstrap: isolated executor failed"' in guest
+assert "TimeoutStopSec=15" in guest
+assert guest.index('[ "$NETWORK_BYTES" -eq 0 ] ||') < guest.index('if [ "$EXECUTOR_STATUS" -ne 0 ]; then')
 assert "$#\" -eq 10" not in guest
 run_at=guest.index("systemd-run --quiet")
 input_token_at=guest.index("metadata/identity/oauth2/token")

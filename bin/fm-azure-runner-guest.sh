@@ -223,10 +223,17 @@ systemd-run --quiet --wait --collect --unit "$UNIT" --property=Type=exec --prope
   --property=ProtectKernelTunables=yes --property=ProtectKernelModules=yes --property=ProtectControlGroups=yes \
   --property=RestrictRealtime=yes --property=RestrictSUIDSGID=yes --property=LockPersonality=yes \
   --property='CapabilityBoundingSet=CAP_SETUID CAP_SETGID' --property=AmbientCapabilities= \
-  --property="ReadWritePaths=/work $OUTPUT" /usr/bin/python3 "$EXECUTOR" "$REQUEST" /work/repo "$OUTPUT" "$RUNNER_UID" "$RUNNER_GID" "$VM_RESOURCE_ID" "$VM_INSTANCE_ID"
+  --property=TimeoutStopSec=15 --property="ReadWritePaths=/work $OUTPUT" /usr/bin/python3 "$EXECUTOR" "$REQUEST" /work/repo "$OUTPUT" "$RUNNER_UID" "$RUNNER_GID" "$VM_RESOURCE_ID" "$VM_INSTANCE_ID"
 EXECUTOR_STATUS=$?
 set -e
-[ "$NETWORK_BYTES" -eq 0 ] && [ "$EXECUTOR_STATUS" -eq 0 ] || { echo "guest bootstrap: isolated executor failed" >&2; exit 125; }
+[ "$NETWORK_BYTES" -eq 0 ] || { echo "guest bootstrap: isolated executor failed" >&2; exit 125; }
+if [ "$EXECUTOR_STATUS" -ne 0 ]; then
+  # Lingering repository-test daemons can hold the cgroup past stop-sigterm
+  # and fail the unit after the executor already finished its protocol; the
+  # executor writes its result atomically as its last act, so that result is
+  # the authority and only its absence makes the unit status fatal.
+  [ -s "$OUTPUT/result.json" ] || { echo "guest bootstrap: isolated executor failed" >&2; exit 125; }
+fi
 
 python3 - "$REQUEST" /work/repo "$OUTPUT" "$ARTIFACT_BYTES" <<'PY'
 import hashlib,json,os,pathlib,shutil,stat,sys

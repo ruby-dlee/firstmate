@@ -194,6 +194,12 @@ finally:
 plain_unreadable = copy.deepcopy(inventory)
 plain_unreadable["metrics"]["forecast_usd"] = None
 assert module.admission_result(env, state, plain_unreadable, 1, item)[0] is False
+# The reserve report carries the seam-substituted forecast, so an admission
+# that relied on the substitution never reads as omitted evidence.
+assert module.reported_forecast(True, 3.25, None) == 3.25
+assert module.reported_forecast(False, 3.25, None) is None
+assert module.reported_forecast(True, None, None) is None
+assert module.reported_forecast(True, 3.25, 7.5) == 7.5
 changed = copy.deepcopy(inventory)
 changed["metrics"]["regional_limit_vcpus"] = 127
 assert module.admission_result(env, state, changed, 1, item)[0] is False

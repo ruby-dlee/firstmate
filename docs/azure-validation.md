@@ -12,8 +12,12 @@
 > primary, one claude cross-check profile) lives on the `fm-auth-home` Azure
 > Files share and syncs into the cell home each boot; runner spend is tracked
 > in a local JSON ledger; and `bin/fm-azure-cell-image.sh` can bake a golden
-> image preferred via `FM_AZURE_BAKED_IMAGE_ID`. Sections below describing the
-> removed machinery are retained as history until rewritten.
+> image preferred via `FM_AZURE_BAKED_IMAGE_ID`. Dispatch is multi-lane:
+> `FM_AZURE_VALIDATION_LANES` (default 4) concurrent cells, FIFO admission of
+> any number of queued generations, lane index mapped deterministically onto
+> the four-family coordinator SKU pool; `queue` shows lanes used and queue
+> order. Sections below describing the removed machinery are retained as
+> history until rewritten.
 
 This document owns the architecture, identity, admission, recovery, credential, cleanup, and operator contract for elastic Azure no-mistakes validation cells.
 [`bin/fm-azure-validation.sh`](../bin/fm-azure-validation.sh) owns exact host commands, [`bin/fm-azure-validation.py`](../bin/fm-azure-validation.py) owns the state machine, and [`docs/azure-validation/cell.json`](azure-validation/cell.json) owns the per-cell Azure declaration.

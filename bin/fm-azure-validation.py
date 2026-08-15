@@ -74,6 +74,18 @@ VALIDATION_SKUS = (
     "Standard_D8ds_v6",
 )
 
+# Coordinator SKU spread: four concurrent coordinator cells cannot share one
+# family cap, so lane index maps deterministically onto four reviewed
+# eight-vCPU SKUs in four distinct families (Dasv6, Dsv6, Dadsv6, Ddsv6).
+COORDINATOR_SKU_POOL = VALIDATION_SKUS
+
+# Phases in which a cell occupies a dispatch lane (compute exists or is
+# reserved). Queued, collected, closed, and retained-failure cells do not.
+LANE_PHASES = (
+    "starting", "running", "reattaching", "responding",
+    "needs-decision", "result-published",
+)
+
 RESOURCE_CLASSES = {
     "validation-heavy": {
         "vcpus": 8,
@@ -215,7 +227,7 @@ def environment(require_cloud=False):
         "home_binding": sha256_bytes(str(home).encode("utf-8")),
         "state_dir": state_dir,
         "queue_limit": bounded_int("FM_AZURE_VALIDATION_QUEUE_LIMIT", 128, 1, 1000),
-        "max_active": bounded_int("FM_AZURE_VALIDATION_MAX_ACTIVE", 8, 1, 8),
+        "lanes": bounded_int("FM_AZURE_VALIDATION_LANES", 4, 1, 8),
         "budget_limit": bounded_float(
             "FM_AZURE_VALIDATION_BUDGET_LIMIT_USD", BUDGET_TARGET_USD,
             BUDGET_TARGET_USD, BUDGET_CEILING_USD,
@@ -365,6 +377,36 @@ def count_queued(env):
             if json.loads(path.read_text(encoding="utf-8")).get("phase") == "queued":
                 count += 1
     return count
+
+
+def all_states(env):
+    ensure_dirs(env)
+    states = []
+    for path in env["state_dir"].glob("azv-*.json"):
+        with contextlib.suppress(OSError, json.JSONDecodeError):
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if value.get("schema") == SCHEMA and value.get("cell"):
+                states.append(value)
+    return states
+
+
+def occupied_states(env, exclude_cell=None):
+    return [
+        state for state in all_states(env)
+        if state.get("phase") in LANE_PHASES and state.get("cell") != exclude_cell
+    ]
+
+
+def lane_sku(lane):
+    """Deterministic lane-index to coordinator-SKU mapping (family spread)."""
+    return COORDINATOR_SKU_POOL[lane % len(COORDINATOR_SKU_POOL)]
+
+
+def next_free_lane(used_lanes, lane_count):
+    for index in range(lane_count):
+        if index not in used_lanes:
+            return index
+    raise ValidationError("no validation lane is free")
 
 
 def load_credentials(path):
@@ -1416,98 +1458,139 @@ def create_run_command(env, state, mode, input_url=None, output_url=None, respon
     save_state(env, state)
 
 
+def dispatch_cell(env, state, lane):
+    """Admit one queued/starting cell into its lane; returns started or queued."""
+    if state["request"]["deployment_generation"] != env["deployment_generation"]:
+        raise ValidationError("queued request deployment generation differs from the live foundation")
+    live_resources = resource_names(env, state["cell"].split("-", 1)[1])
+    expected_bindings = state["request"].get("resource_bindings") or {}
+    actual_bindings = {
+        "vm_id": live_resources["vm_id"],
+        "worktree_disk_id": live_resources["worktree_disk_id"],
+        "identity_id": live_resources["identity_id"],
+        "shard_container": state["staging"]["container"],
+    }
+    if expected_bindings != actual_bindings:
+        raise ValidationError("queued run resource bindings differ from the exact live foundation scope")
+    recovering = state["phase"] == "starting"
+    if recovering:
+        for key, value in live_resources.items():
+            if key.endswith("_id") and state.get("resources", {}).get(key) != value:
+                raise ValidationError("starting cell resource bindings differ from its exact recorded identities")
+    else:
+        state["resources"] = live_resources
+        state["lane"] = lane
+        save_state(env, state)
+    if recovering:
+        lane = state.get("lane", lane)
+        allocation = state.get("allocation") or {}
+        admission = state.get("admission") or {}
+        selected = {
+            "sku": allocation.get("sku"),
+            "family": allocation.get("sku_family"),
+            "rate": admission.get("hourly_rate"),
+            "owner": env["owner"],
+        }
+        if (
+            selected["sku"] not in VALIDATION_SKUS
+            or not selected["family"] or not isinstance(selected["rate"], (int, float))
+            or admission.get("shape_id") != state["cell"]
+            or len(admission.get("shard_plan") or []) != state["request"]["limits"]["behavior_shards"]
+        ):
+            raise ValidationError("starting cell lacks its exact allocation and shape reservation")
+    else:
+        limits = state["request"]["limits"]
+        candidates = sku_candidates(env, limits["vcpus"], limits["memory_gib"])
+        # The lane's deterministic pool SKU keeps concurrent coordinator
+        # cells in distinct families; a lane SKU that is not currently live
+        # falls back to the cheapest live candidate.
+        preferred = lane_sku(lane)
+        selected = next((item for item in candidates if item["sku"] == preferred), candidates[0])
+        selected["owner"] = env["owner"]
+        shape = shared_shape_reserve(env, state, selected)
+        if shape["status"] != "reserved":
+            state.setdefault("admission", {})["shard_plan"] = shape["shard_plan"]
+            state["admission"]["last_refusal"] = {"at": iso_utc(), "reason": shape.get("reason", "")[:400]}
+            save_state(env, state)
+            print("AZURE VALIDATION QUEUED cell={} reason={}".format(state["cell"], shape.get("reason", "")))
+            return "queued"
+        state["allocation"] = {"sku": selected["sku"], "sku_family": selected["family"]}
+        state["admission"] = {
+            "at": iso_utc(), "sku": selected["sku"], "sku_family": selected["family"],
+            "hourly_rate": selected["rate"],
+            "actual_usd": shape.get("actual_usd"), "forecast_usd": shape.get("forecast_usd"),
+            "admission_limit_usd": shape.get("admission_limit_usd"),
+            "shape_id": state["cell"], "capacity_fence": state["request"]["fence"].split(":", 1)[-1],
+            "control_amount_usd": shape["control_amount_usd"],
+            "shard_plan": shape["shard_plan"],
+        }
+        transition(env, state, "starting", "shared allocator atomically reserved the complete specialized shape")
+    create_cell(env, state, selected)
+    storage_upload_after_role(
+        env, Path(state["input_path"]), state["staging"]["input_blob"],
+        state["staging"]["container"],
+    )
+    input_url = blob_sas(
+        env, state["staging"]["input_blob"], "r", container=state["staging"]["container"]
+    )
+    output_url = blob_sas(
+        env, state["staging"]["result_blob"], "cw", container=state["staging"]["container"]
+    )
+    create_run_command(env, state, "start", input_url=input_url, output_url=output_url)
+    transition(env, state, "running", "isolated per-run no-mistakes cell started", started_at=iso_utc())
+    print("AZURE VALIDATION STARTED cell={} lane={} sku={} head={}".format(
+        state["cell"], state.get("lane"), selected["sku"], state["request"]["repository"]["head"]
+    ))
+    return "started"
+
+
 def dispatch(env, args):
+    """Admit queued generations FIFO into free lanes, one cell per lane.
+
+    Recovery of a starting cell comes first (it already owns its lane), then
+    queued cells oldest-first while a lane is free. Strict FIFO: a shape the
+    allocator queues stops admission so younger work never jumps the line.
+    """
     if not args.confirm_dispatch or args.confirm_subscription != env["subscription"]:
         raise ValidationError("billable dispatch requires --confirm-dispatch and the exact subscription")
     with lock(env):
-        candidates = []
-        for path in env["state_dir"].glob("azv-*.json"):
-            with contextlib.suppress(OSError, json.JSONDecodeError):
-                value = json.loads(path.read_text(encoding="utf-8"))
-                if value.get("phase") in ("queued", "starting"):
-                    candidates.append(value)
+        candidates = [
+            state for state in all_states(env)
+            if state.get("phase") in ("queued", "starting")
+        ]
         candidates.sort(key=lambda item: (
             0 if item.get("phase") == "starting" else 1,
             item.get("created_at", ""), item.get("cell", ""),
         ))
         if not candidates:
-            print("AZURE VALIDATION QUEUE empty active=0")
+            print("AZURE VALIDATION QUEUE empty active={}".format(len(occupied_states(env))))
             return
-        state = candidates[0]
-        if state["request"]["deployment_generation"] != env["deployment_generation"]:
-            raise ValidationError("queued request deployment generation differs from the live foundation")
-        live_resources = resource_names(env, state["cell"].split("-", 1)[1])
-        expected_bindings = state["request"].get("resource_bindings") or {}
-        actual_bindings = {
-            "vm_id": live_resources["vm_id"],
-            "worktree_disk_id": live_resources["worktree_disk_id"],
-            "identity_id": live_resources["identity_id"],
-            "shard_container": state["staging"]["container"],
-        }
-        if expected_bindings != actual_bindings:
-            raise ValidationError("queued run resource bindings differ from the exact live foundation scope")
-        recovering = state["phase"] == "starting"
-        if recovering:
-            for key, value in live_resources.items():
-                if key.endswith("_id") and state.get("resources", {}).get(key) != value:
-                    raise ValidationError("starting cell resource bindings differ from its exact recorded identities")
-        else:
-            state["resources"] = live_resources
-            save_state(env, state)
         scope_gate(env)
         foundation_gate(env)
-        if recovering:
-            allocation = state.get("allocation") or {}
-            admission = state.get("admission") or {}
-            selected = {
-                "sku": allocation.get("sku"),
-                "family": allocation.get("sku_family"),
-                "rate": admission.get("hourly_rate"),
-                "owner": env["owner"],
+        started = 0
+        for candidate in candidates:
+            occupied = occupied_states(env, exclude_cell=candidate["cell"])
+            if candidate["phase"] == "queued" and len(occupied) >= env["lanes"]:
+                print("AZURE VALIDATION LANES FULL used={}/{} queued={}".format(
+                    len(occupied), env["lanes"], count_queued(env)
+                ))
+                break
+            used_lanes = {
+                state.get("lane") for state in occupied
+                if isinstance(state.get("lane"), int)
             }
-            if (
-                selected["sku"] not in VALIDATION_SKUS
-                or not selected["family"] or not isinstance(selected["rate"], (int, float))
-                or admission.get("shape_id") != state["cell"]
-                or len(admission.get("shard_plan") or []) != state["request"]["limits"]["behavior_shards"]
-            ):
-                raise ValidationError("starting cell lacks its exact allocation and shape reservation")
-        else:
-            limits = state["request"]["limits"]
-            selected = sku_candidates(env, limits["vcpus"], limits["memory_gib"])[0]
-            selected["owner"] = env["owner"]
-            shape = shared_shape_reserve(env, state, selected)
-            if shape["status"] != "reserved":
-                state.setdefault("admission", {})["shard_plan"] = shape["shard_plan"]
-                state["admission"]["last_refusal"] = {"at": iso_utc(), "reason": shape.get("reason", "")[:400]}
-                save_state(env, state)
-                print("AZURE VALIDATION QUEUED cell={} reason={}".format(state["cell"], shape.get("reason", "")))
-                return
-            state["allocation"] = {"sku": selected["sku"], "sku_family": selected["family"]}
-            state["admission"] = {
-                "at": iso_utc(), "sku": selected["sku"], "sku_family": selected["family"],
-                "hourly_rate": selected["rate"],
-                "actual_usd": shape.get("actual_usd"), "forecast_usd": shape.get("forecast_usd"),
-                "admission_limit_usd": shape.get("admission_limit_usd"),
-                "shape_id": state["cell"], "capacity_fence": state["request"]["fence"].split(":", 1)[-1],
-                "control_amount_usd": shape["control_amount_usd"],
-                "shard_plan": shape["shard_plan"],
-            }
-            transition(env, state, "starting", "shared allocator atomically reserved the complete specialized shape")
-        create_cell(env, state, selected)
-        storage_upload_after_role(
-            env, Path(state["input_path"]), state["staging"]["input_blob"],
-            state["staging"]["container"],
-        )
-        input_url = blob_sas(
-            env, state["staging"]["input_blob"], "r", container=state["staging"]["container"]
-        )
-        output_url = blob_sas(
-            env, state["staging"]["result_blob"], "cw", container=state["staging"]["container"]
-        )
-        create_run_command(env, state, "start", input_url=input_url, output_url=output_url)
-        transition(env, state, "running", "isolated per-run no-mistakes cell started", started_at=iso_utc())
-    print("AZURE VALIDATION STARTED cell={} sku={} head={}".format(state["cell"], selected["sku"], state["request"]["repository"]["head"]))
+            lane = (
+                candidate.get("lane")
+                if candidate["phase"] == "starting" and isinstance(candidate.get("lane"), int)
+                else next_free_lane(used_lanes, env["lanes"])
+            )
+            outcome = dispatch_cell(env, candidate, lane)
+            if outcome != "started":
+                break
+            started += 1
+        print("AZURE VALIDATION DISPATCH started={} lanes_used={}/{} queued={}".format(
+            started, len(occupied_states(env)), env["lanes"], count_queued(env)
+        ))
 
 
 def run_command_status(env, state):
@@ -2546,11 +2629,19 @@ def queue(env):
             rows.append((value.get("created_at", ""), value))
     rows.sort(key=lambda item: (item[0], item[1].get("cell", "")))
     if not rows:
-        print("AZURE VALIDATION QUEUE empty active=0 queued=0")
+        print("AZURE VALIDATION QUEUE empty active=0 queued=0 lanes_used=0/{}".format(env["lanes"]))
         return
+    occupied = [state for _, state in rows if state.get("phase") in LANE_PHASES]
+    queued = [state for _, state in rows if state.get("phase") == "queued"]
+    print("AZURE VALIDATION LANES used={}/{} queued={}".format(
+        len(occupied), env["lanes"], len(queued)
+    ))
     for _, state in rows:
-        print("cell={} phase={} task={} head={} class={} attempt={}".format(
-            state.get("cell"), state.get("phase"), state.get("request", {}).get("task"),
+        lane = state.get("lane")
+        print("cell={} phase={} lane={} task={} head={} class={} attempt={}".format(
+            state.get("cell"), state.get("phase"),
+            lane if isinstance(lane, int) else "-",
+            state.get("request", {}).get("task"),
             state.get("request", {}).get("repository", {}).get("head"),
             state.get("request", {}).get("resource_class"), state.get("attempt"),
         ))

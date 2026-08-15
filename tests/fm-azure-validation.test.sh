@@ -119,6 +119,16 @@ assert "credentialdiskid" not in text
 # The baked golden image is preferred when supplied; stock Ubuntu otherwise.
 assert template["parameters"]["imageId"]["defaultValue"]==""
 assert "if(empty(parameters('imageId'))" in vm["properties"]["storageProfile"]["imageReference"]
+# The dispatch deployment grants the fresh per-cell UAMI its auth-share
+# file-data role in the same lane as the blob-container role assignments;
+# a manual grant would evaporate with each cell.
+assert template["parameters"]["authShareName"]["defaultValue"]=="fm-auth-home"
+assert template["variables"]["fileDataPrivilegedContributorRoleId"]=="69566ab7-960f-475b-8e7c-b3118f30c6bd"
+file_grant=next(item for item in resources if item["type"]=="Microsoft.Storage/storageAccounts/providers/roleAssignments")
+assert file_grant["condition"]=="[not(empty(parameters('authShareName')))]"
+assert "fileDataPrivilegedContributorRoleId" in file_grant["properties"]["roleDefinitionId"]
+assert "auth-share-file-data" in file_grant["name"]
+assert file_grant["properties"]["principalType"]=="ServicePrincipal"
 schedule=next(item for item in resources if item["type"]=="Microsoft.DevTestLab/schedules")
 assert schedule["name"]=="[format('shutdown-computevm-{0}', parameters('vmName'))]"
 assert schedule["properties"]["taskType"]=="ComputeVmShutdownTask"
@@ -171,8 +181,17 @@ for absent in ("cryptsetup","luks","LEASE_SCHEMA","credential_lease_digest","cre
     assert absent not in host, absent
 assert 'protected.append({"name": "github_token", "value": read_github_token(state)})' in host
 assert "FM_AZURE_GITHUB_TOKEN_FILE" in host
+<<<<<<< HEAD
 assert '"auth_share", "value": os.environ.get("FM_AZURE_AUTH_SHARE", "fm-auth-home")' in host
 assert '"imageId": {"value": os.environ.get("FM_AZURE_VM_IMAGE_ID", "")}' in host
+=======
+assert '"auth_share", "value": auth_share_name()' in host
+assert 'FILE_DATA_PRIVILEGED_CONTRIBUTOR_ROLE = "69566ab7-960f-475b-8e7c-b3118f30c6bd"' in host
+assert "def delete_auth_share_role" in host
+assert host.index("delete_auth_share_role(env, state)", host.index("def delete_cell_storage_scope")) < host.index('delete_resource(env, state, state["resources"]["identity_id"], "identity")')
+assert "container and auth-share grants" in host
+assert '"bakedImageId": {"value": os.environ.get("FM_AZURE_BAKED_IMAGE_ID", "")}' in host
+>>>>>>> 4db84b0 (fix(validation): grant the cell UAMI its auth-share file-data role in code)
 for value in ("MemoryMax","MemorySwapMax=0","TasksMax","CPUQuota=700%","PrivateTmp=yes","ProtectSystem=strict","CapabilityBoundingSet=","FM_AZURE_VALIDATION_RUNTIME_PATH","axi status","/dev/disk/azure/scsi1/lun","/dev/disk/azure/data/by-lun/"):
     assert value in guest
 for value in ('MODE=${mode:-}','VM_RESOURCE_ID=${vm_resource_id:-}','INPUT_URL=${input_url:-}','GITHUB_TOKEN_VALUE=${github_token:-}','AUTH_SHARE=${auth_share:-fm-auth-home}','unset input_url output_url response github_token'):
@@ -730,8 +749,10 @@ spec=importlib.util.spec_from_file_location("validation",sys.argv[1]); m=importl
 env={"subscription":"sub","resource_group":"rg","storage":"storage","operator_object_id":"operator"}
 state={"cell":"azv-aaaaaaaaaaaa","staging":{"container":"fmvalaaaaaaaaaaaa"},"resources":{"identity_principal_id":"cell-principal","identity_id":"/identity"},"request":{"fence":"sha256:"+"a"*64}}
 scope="/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/storage/blobServices/default/containers/fmvalaaaaaaaaaaaa"
+account_scope="/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/storage"
 role="/subscriptions/sub/providers/Microsoft.Authorization/roleDefinitions/"+m.BLOB_DATA_CONTRIBUTOR_ROLE
-roles=[{"id":"/role/one","scope":scope,"principalId":"operator","roleDefinitionId":role},{"id":"/role/two","scope":scope,"principalId":"cell-principal","roleDefinitionId":role}]
+file_role="/subscriptions/sub/providers/Microsoft.Authorization/roleDefinitions/"+m.FILE_DATA_PRIVILEGED_CONTRIBUTOR_ROLE
+roles=[{"id":"/role/one","scope":scope,"principalId":"operator","roleDefinitionId":role},{"id":"/role/two","scope":scope,"principalId":"cell-principal","roleDefinitionId":role},{"id":"/role/file","scope":account_scope,"principalId":"cell-principal","roleDefinitionId":file_role}]
 container=[True]
 def read(_env,rid,kind):
  if kind=="container": return (container[0],{"id":scope,"etag":"E1","properties":{"publicAccess":"None"}} if container[0] else None)
@@ -746,8 +767,10 @@ def az(_env,args,**kwargs):
 m.read_resource=read; m.az_command=az; m.save_state=lambda *_:None; m.delete_resource=lambda *_:None; m.time.sleep=lambda _n:None
 m.delete_cell_storage_scope(env,state)
 assert state["storage_cleanup"]=={"scope":scope,"container_etag":"E1","role_ids":["/role/one","/role/two"],"roles_absent":True,"container_absent":True}
-# A retry after both child assignments and the container are already absent is
-# idempotent from the persisted exact plan rather than permanently wedged.
+# The account-scoped auth-share file grant is removed through the same lane.
+assert not any(item["id"]=="/role/file" for item in roles)
+# A retry after both child assignments, the file grant, and the container are
+# already absent is idempotent from the persisted exact plan.
 m.delete_cell_storage_scope(env,state)
 PY
   pass "partial container/role cleanup resumes idempotently from its exact persisted plan"

@@ -62,6 +62,9 @@ MAX_CELL_LIFETIME_HOURS = 24
 FOUNDATION_METER_RESERVE_USD = 210.0
 VALIDATION_METER_RESERVE_USD = 80.0
 BLOB_DATA_CONTRIBUTOR_ROLE = "ba92f5b4-2d11-453d-a403-e96b0029c9fe"
+# Storage File Data Privileged Contributor: the role OAuth FileREST access
+# needs so the per-cell UAMI can sync the persistent fm-auth-home share.
+FILE_DATA_PRIVILEGED_CONTRIBUTOR_ROLE = "69566ab7-960f-475b-8e7c-b3118f30c6bd"
 
 # Control cells use the allocator's reviewed eight-vCPU control lane inside
 # the same unrestricted v6 families as the fleet; the old v5 candidates are
@@ -400,6 +403,17 @@ def load_credentials(path):
         "auth_home": auth_home,
         "github_token_file": token_file,
     }
+
+
+def auth_share_name():
+    """Configured persistent auth share; empty disables the auth-home sync."""
+    return os.environ.get("FM_AZURE_AUTH_SHARE", "fm-auth-home")
+
+
+def storage_account_scope(env):
+    return "/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Storage/storageAccounts/{}".format(
+        env["subscription"], env["resource_group"], env["storage"]
+    )
 
 
 def read_github_token(state):
@@ -1295,6 +1309,7 @@ def deployment_parameters(env, state, selected, replacement=False):
             "worktreeDiskName": {"value": resources["worktree_disk_name"]},
             "worktreeDiskId": {"value": resources["worktree_disk_id"]},
             "createWorktreeDisk": {"value": not replacement},
+            "authShareName": {"value": auth_share_name()},
             "identityName": {"value": resources["identity_name"]},
             "storageAccountName": {"value": env["storage"]},
             "shardContainerName": {"value": state["staging"]["container"]},
@@ -1346,16 +1361,29 @@ def adopt_resources(env, state):
         "role", "assignment", "list", "--assignee-object-id", principal_id,
         "--all", "--include-inherited", "--include-groups",
     ])
-    expected_role = "/subscriptions/{}/providers/Microsoft.Authorization/roleDefinitions/{}".format(
+    blob_role = "/subscriptions/{}/providers/Microsoft.Authorization/roleDefinitions/{}".format(
         env["subscription"], BLOB_DATA_CONTRIBUTOR_ROLE
     )
+    file_role = "/subscriptions/{}/providers/Microsoft.Authorization/roleDefinitions/{}".format(
+        env["subscription"], FILE_DATA_PRIVILEGED_CONTRIBUTOR_ROLE
+    )
+    expected_grants = {(container_scope.lower(), blob_role.lower())}
+    if auth_share_name():
+        # The deployment grants the cell identity file-data access for the
+        # persistent auth share alongside its private-container blob grant.
+        expected_grants.add((storage_account_scope(env).lower(), file_role.lower()))
     if (
-        not isinstance(assignments, list) or len(assignments) != 1
-        or str(assignments[0].get("principalId", "")).lower() != str(principal_id).lower()
-        or str(assignments[0].get("scope", "")).lower() != container_scope.lower()
-        or str(assignments[0].get("roleDefinitionId", "")).lower() != expected_role.lower()
+        not isinstance(assignments, list)
+        or any(
+            str(item.get("principalId", "")).lower() != str(principal_id).lower()
+            for item in assignments
+        )
+        or {
+            (str(item.get("scope", "")).lower(), str(item.get("roleDefinitionId", "")).lower())
+            for item in assignments
+        } != expected_grants
     ):
-        raise ValidationError("cell identity effective RBAC exceeds its exact private container")
+        raise ValidationError("cell identity effective RBAC exceeds its exact container and auth-share grants")
     identities["identity"] = identity
     resources["identity_client_id"] = client_id
     resources["identity_principal_id"] = principal_id
@@ -1404,7 +1432,7 @@ def create_run_command(env, state, mode, input_url=None, output_url=None, respon
         {"name": "storage_account", "value": env["storage"]},
         {"name": "storage_container", "value": state["staging"]["container"]},
         {"name": "identity_client_id", "value": resources["identity_client_id"]},
-        {"name": "auth_share", "value": os.environ.get("FM_AZURE_AUTH_SHARE", "fm-auth-home")},
+        {"name": "auth_share", "value": auth_share_name()},
     ]
     protected = []
     if input_url:
@@ -1982,6 +2010,34 @@ def wait_exact_disk_detached(env, disk_id, recorded, label):
     raise ValidationError("{} disk did not detach after bounded reconciliation".format(label))
 
 
+def delete_auth_share_role(env, state):
+    """Remove the cell identity's account-scoped auth-share file-data grant.
+
+    Same lane as the container role cleanup: absent assignments are the
+    desired end state, so a repeat run is a no-op.
+    """
+    if not auth_share_name():
+        return
+    principal = (state.get("resources") or {}).get("identity_principal_id")
+    if not principal:
+        return
+    account_scope = storage_account_scope(env)
+    expected_role = "/subscriptions/{}/providers/Microsoft.Authorization/roleDefinitions/{}".format(
+        env["subscription"], FILE_DATA_PRIVILEGED_CONTRIBUTOR_ROLE
+    )
+    assignments, _, _ = az_command(env, ["role", "assignment", "list", "--scope", account_scope, "--all"])
+    for item in assignments or []:
+        if (
+            str(item.get("scope", "")).lower() == account_scope.lower()
+            and str(item.get("principalId", "")).lower() == str(principal).lower()
+            and str(item.get("roleDefinitionId", "")).lower() == expected_role.lower()
+            and item.get("id")
+        ):
+            _, rc, stderr = az_command(env, ["role", "assignment", "delete", "--ids", item["id"]], check=False)
+            if rc != 0:
+                raise ValidationError("exact auth-share role assignment deletion failed: {}".format(stderr))
+
+
 def delete_cell_storage_scope(env, state):
     scope = "/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Storage/storageAccounts/{}/blobServices/default/containers/{}".format(
         env["subscription"], env["resource_group"], env["storage"], state["staging"]["container"]
@@ -2072,6 +2128,7 @@ def delete_cell_storage_scope(env, state):
         raise ValidationError("cell container remains after bounded exact deletion")
     plan["container_absent"] = True
     save_state(env, state)
+    delete_auth_share_role(env, state)
     delete_resource(env, state, state["resources"]["identity_id"], "identity")
 
 

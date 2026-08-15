@@ -421,6 +421,17 @@ if ! id fmvalidate >/dev/null 2>&1; then
 fi
 chown -R fmvalidate:fmvalidate "$CELL_ROOT" "$PROVIDER_HOME"
 chown fmvalidate:fmvalidate "$GITHUB_TOKEN_FILE"
+# The token file's intermediate directories on the credential mount are
+# root-only, so the credential helper's read as the cell user dies on
+# traversal before it ever reaches the 0600 token (generation 043 ground
+# truth: "cat: .../github/token: Permission denied" inside the gate push).
+# Hand every directory between the mount root and the token to the cell user.
+token_dir=$(dirname "$GITHUB_TOKEN_FILE")
+while [ "$token_dir" != "$CREDENTIAL_MOUNT" ] && [ "$token_dir" != "/" ]; do
+  chown fmvalidate:fmvalidate "$token_dir"
+  chmod 0700 "$token_dir"
+  token_dir=$(dirname "$token_dir")
+done
 chmod 0700 "$CELL_ROOT" "$HOME_DIR" "$NM_HOME" "$CACHE" "$TMP" "$PROVIDER_HOME"
 chmod 0600 "$GITHUB_TOKEN_FILE"
 # The chown above hands the cloned repository to fmvalidate, so every later

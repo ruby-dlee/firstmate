@@ -128,6 +128,10 @@ assert schedule["name"]=="[format('shutdown-computevm-{0}', parameters('vmName')
 safety=next(r for r in template["resources"] if r["type"]=="Microsoft.Compute/virtualMachines/runCommands")
 safety_script=safety["properties"]["source"]["script"]
 assert "uriComponentToString('%0A')" in safety_script and "\\n" not in safety_script
+assert "residual_ids - expected_ids - {reservation_resource}" in host
+assert host.index("reservation_resource = reservation_id") < host.index("unknown = sorted")
+assert "cost reservation resource proven absent; cleanup verification recorded on absence" in host
+assert "cost reservation absence is ambiguous" in host
 assert '"ttl_schedule_name": "shutdown-computevm-{}".format(vm_name)' in host
 assert "schedules/shutdown-computevm-{}" in host
 assert "DEPLOYMENT_TIMEOUT_SECONDS = 900" in host

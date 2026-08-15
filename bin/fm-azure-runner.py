@@ -2384,9 +2384,26 @@ def reserve_budget_management(env, state, lease, limits, admitted_cost=None):
 
 def mark_management_reservation_cleanup_verified(env, state):
     with ManagementAdmissionLease(env, state) as lease:
-        identity, _, _ = az_command(env, [
+        identity, show_rc, show_stderr = az_command(env, [
             "resource", "show", "--ids", reservation_id(env, state["invocation"]), "--api-version", "2023-01-31",
-        ])
+        ], check=False)
+        if show_rc != 0:
+            # A reservation resource that no longer exists holds no Azure
+            # capacity or spend; proven absence completes verification, while
+            # any other read failure stays ambiguous and refuses.
+            listing, list_rc, list_stderr = az_command(env, [
+                "resource", "list", "--resource-group", env["resource_group"],
+            ], check=False)
+            if list_rc != 0:
+                raise RunnerError("cost reservation absence is ambiguous: {}; {}".format(show_stderr, list_stderr))
+            target = reservation_id(env, state["invocation"]).lower()
+            if any(str(item.get("id", "")).lower() == target for item in listing):
+                raise RunnerError("cost reservation resource exists but is unreadable: {}".format(show_stderr))
+            transition(
+                env, state, state["phase"],
+                "cost reservation resource proven absent; cleanup verification recorded on absence",
+            )
+            return
         entry = parse_management_reservation(env, identity)
         expected_fence = state["request"]["fence"].split(":", 1)[1]
         expected_mode = state["request"].get("cost_admission_mode", STRICT_COST_ADMISSION_MODE)
@@ -3137,7 +3154,11 @@ def classify_disposable_resources(env, state, include_vm=True):
         or str(item.get("id", "")).lower().startswith(vm_child_prefix)
     ]
     residual_ids = {str(item.get("id", "")).lower() for item in residual}
-    unknown = sorted(residual_ids - expected_ids)
+    # The durable cost-reservation identity carries this invocation's binding
+    # tag by design and is verified and released through its own lane, never
+    # deleted here; it must not read as an unplanned residual.
+    reservation_resource = reservation_id(env, state["invocation"]).lower()
+    unknown = sorted(residual_ids - expected_ids - {reservation_resource})
     if unknown:
         raise RunnerError("VM-absent invocation has an unplanned residual resource; cleanup retained ambiguous state")
     classified = []

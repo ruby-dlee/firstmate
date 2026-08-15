@@ -175,7 +175,17 @@ def main():
         argv, limits = verify_request(request)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return fail(str(exc))
-    output.mkdir(mode=0o700, parents=True, exist_ok=False)
+    try:
+        output.mkdir(mode=0o700, parents=True, exist_ok=False)
+    except FileExistsError:
+        # The guest pre-creates the output directory so the hardened unit
+        # can bind it writable under ProtectSystem=strict; accept it only
+        # root-owned and empty, and keep the exclusive log creates below as
+        # the per-run freshness fence.
+        details = output.stat()
+        if details.st_uid != 0 or any(output.iterdir()):
+            return fail("output directory is not a fresh root-owned staging area")
+        os.chmod(output, 0o700)
     stdout_path = output / "stdout.log"
     stderr_path = output / "stderr.log"
     stdout_handle = open(stdout_path, "xb", buffering=0)

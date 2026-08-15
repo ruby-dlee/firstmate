@@ -115,6 +115,9 @@ assert 'fetch "$SNAPSHOT"' not in guest
 assert "GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/work/repo" in guest
 assert guest.index("runuser -u fmrunner -- git -C /work/repo init") < guest.index("GIT_CONFIG_KEY_0=safe.directory")
 assert guest.index("cd /work/repo") < guest.index("uv venv --python")
+executor_text=open("bin/fm-azure-runner-exec.py").read()
+assert "output directory is not a fresh root-owned staging area" in executor_text
+assert 'open(stdout_path, "xb"' in executor_text
 assert "$#\" -eq 10" not in guest
 run_at=guest.index("systemd-run --quiet")
 input_token_at=guest.index("metadata/identity/oauth2/token")

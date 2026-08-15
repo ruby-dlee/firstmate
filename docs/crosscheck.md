@@ -6,7 +6,7 @@ No-mistakes remains the owner of that validation pipeline.
 
 By default, the review portion is intentionally close to "no-mistakes review with a fresh, different model."
 Most of its review-quality value comes from that cross-model independence.
-Review independence is structural: Crosscheck runs from its dedicated reviewer account pool, separately from the lane that authored the work, and its model policy defaults to a different model.
+Review independence is structural: Crosscheck and no-mistakes use different models from separate account pools, and Crosscheck runs separately from the lane that authored the work.
 The gate does not read, infer, compare, warn on, or require author-account identity metadata because that bookkeeping only restated the architecture and turned failed capture into a false merge blocker.
 The separate mechanism earns its keep only through four contracts that no-mistakes does not currently own: durable finding lifecycle across runs, gate-executed reproduction evidence, gate-executed mutation proof for fixes, and an exact reviewed SHA passed atomically to GitHub at merge.
 If those contracts move into no-mistakes, the separate reviewer runner should be removed rather than defended as a parallel product.

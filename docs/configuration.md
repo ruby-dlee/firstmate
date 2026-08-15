@@ -109,9 +109,7 @@ The current schema has one nonempty `reviewers` array, whose entries require exa
 The accepted policy profiles are Codex `gpt-5.6-sol` at `xhigh` effort and Pi `gpt-5.6-sol` at `xhigh` effort; Claude is never an eligible Crosscheck reviewer.
 Every reviewer `account_home` must be an existing absolute directory.
 
-Review independence is structural: this dedicated pool is separate from author lanes, so Crosscheck never reads or compares author-account identity metadata.
-A failed lane identity capture therefore cannot refuse, downgrade, or warn on a review.
-The former `config/crosscheck-legacy-author-admissions.json` workaround is no longer read because the author-identity refusal it bypassed no longer exists.
+[`crosscheck.md`](crosscheck.md) owns the reviewer-independence policy, including the removal of author-identity checks and the legacy admission workaround.
 
 The optional local, gitignored `config/crosscheck-same-model` file contains exactly `on` or `off`, defaults to `off` when absent, and is read fresh for every reviewer selection.
 `on` relaxes only the default model-separation screen and makes the weaker mode explicit in the prompt and durable evidence.

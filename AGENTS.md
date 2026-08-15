@@ -373,7 +373,7 @@ Load `memory-hygiene` before writing or leaning `data/captain.md` or `data/learn
 
 When the captain invokes `/stow`, load the `stow` skill.
 It sweeps the current session for uncaptured durable knowledge, routes findings with this table, files undone next steps to the backlog, and reports whether the session is safe to reset.
-The tracked Claude `PreCompact` bridge runs a bounded isolated transcript judgment capture in addition to its unchanged deterministic anchor; `docs/autocompact-recovery.md` owns its timeout, safe-publication, loud-degradation, and recovery contract.
+The Claude `PreCompact` bridge is no longer registered, so nothing captures a resume anchor automatically across a compaction boundary; `docs/autocompact-recovery.md` owns what the manual `bin/fm-autocompact.sh` entry points still do.
 
 **Delivery mode (choose at add).** `<mode>` is how a finished change reaches `main`, picked per project when you add it and recorded in the registry line (`fm-project-mode.sh` parses it; `fm-spawn` records it into each task's meta):
 

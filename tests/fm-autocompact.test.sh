@@ -83,17 +83,15 @@ EOF
   FM_FAKE_JUDGMENT_MODE=$mode printf '%s\n' "$fake"
 }
 
-test_tracked_hook_registration_preserves_existing_hooks() {
-  local settings="$ROOT/.claude/settings.json" pre recover timeout
+test_compaction_bridge_is_not_registered() {
+  local settings="$ROOT/.claude/settings.json" pre recover
   pre=$(jq -r '.hooks.PreCompact[]?.hooks[]?.command // empty' "$settings")
   recover=$(jq -r '.hooks.SessionStart[]? | select(.matcher == "compact") | .hooks[]?.command // empty' "$settings")
-  timeout=$(jq -r '.hooks.PreCompact[]?.hooks[]? | select(.command | contains("fm-autocompact.sh capture")) | .timeout' "$settings")
-  assert_contains "$pre" "\"\$CLAUDE_PROJECT_DIR\"/bin/fm-autocompact.sh capture" "PreCompact hook is not project-root anchored"
-  assert_contains "$recover" "\"\$CLAUDE_PROJECT_DIR\"/bin/fm-autocompact.sh recover" "compact SessionStart hook is not project-root anchored"
-  [ "$timeout" = 180 ] || fail "PreCompact hook does not reserve the measured 180s outer budget"
+  [ -z "$pre" ] || fail "PreCompact hook is registered again; the compaction bridge is intentionally manual"
+  [ -z "$recover" ] || fail "compact SessionStart recovery is registered again without its capture half"
   [ "$(jq '.hooks.Stop | length' "$settings")" -gt 0 ] || fail "Stop hooks were disturbed"
   [ "$(jq '.hooks.PreToolUse | length' "$settings")" -gt 0 ] || fail "PreToolUse hooks were disturbed"
-  pass "tracked Claude settings register both compaction phases without disturbing existing hooks"
+  pass "tracked Claude settings register no compaction hooks and leave existing hooks intact"
 }
 
 test_capture_writes_fresh_durable_anchor() {
@@ -679,7 +677,7 @@ EOF
   pass "ordinary startup and resume events do not run compact recovery"
 }
 
-test_tracked_hook_registration_preserves_existing_hooks
+test_compaction_bridge_is_not_registered
 test_capture_writes_fresh_durable_anchor
 test_capture_is_inert_in_child_worktree
 test_capture_failure_blocks_compaction

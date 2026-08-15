@@ -498,10 +498,17 @@ scout_report_lines() {
     | jq -s 'sort_by(.id)'
 }
 
-BACKLOG_JSON=$(backlog_json)
-TASKS_JSON=$(task_json_lines)
-SCOUT_REPORTS_JSON=$(scout_report_lines)
-SECONDMATE_LANDED_JSON=$(secondmate_landed_json)
+# The fleet payload routinely exceeds ARG_MAX once several tasks carry large
+# status files, so these blobs travel to jq through files rather than argv.
+# Passing them as --argjson made the whole snapshot die with
+# "jq: Argument list too long", which failed capture and blocked compaction.
+SNAPSHOT_TMP=$(mktemp -d "${TMPDIR:-/tmp}/fm-fleet-snapshot.XXXXXX") || exit 1
+trap 'rm -rf "$SNAPSHOT_TMP"' EXIT
+
+backlog_json > "$SNAPSHOT_TMP/backlog.json" || exit 1
+task_json_lines > "$SNAPSHOT_TMP/tasks.json" || exit 1
+scout_report_lines > "$SNAPSHOT_TMP/scout_reports.json" || exit 1
+secondmate_landed_json > "$SNAPSHOT_TMP/secondmate_landed.json" || exit 1
 
 jq -n \
   --arg fm_home "$FM_HOME" \
@@ -510,11 +517,15 @@ jq -n \
   --arg data "$DATA" \
   --arg config "$CONFIG" \
   --arg projects "$PROJECTS" \
-  --argjson backlog "$BACKLOG_JSON" \
-  --argjson tasks "$TASKS_JSON" \
-  --argjson scout_reports "$SCOUT_REPORTS_JSON" \
-  --argjson secondmate_landed "$SECONDMATE_LANDED_JSON" \
-  'def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
+  --slurpfile backlog_in "$SNAPSHOT_TMP/backlog.json" \
+  --slurpfile tasks_in "$SNAPSHOT_TMP/tasks.json" \
+  --slurpfile scout_reports_in "$SNAPSHOT_TMP/scout_reports.json" \
+  --slurpfile secondmate_landed_in "$SNAPSHOT_TMP/secondmate_landed.json" \
+  '$backlog_in[0] as $backlog
+   | $tasks_in[0] as $tasks
+   | $scout_reports_in[0] as $scout_reports
+   | $secondmate_landed_in[0] as $secondmate_landed
+   | def backlog_by_id($id): ($backlog.records[]? | select(.structured == true and .id == $id) | .) // null;
    def task_by_id($id): ($tasks[]? | select(.id == $id) | .) // null;
    def report_kind($id): (task_by_id($id).kind // backlog_by_id($id).kind // "scout");
    {

@@ -4,7 +4,9 @@ This document is the authoritative contract and empirical record for Firstmate's
 
 ## Contract
 
-Tracked `.claude/settings.json` registers `bin/fm-autocompact.sh capture` for `PreCompact` and `bin/fm-autocompact.sh recover` for `SessionStart` with matcher `compact`.
+Tracked `.claude/settings.json` registers neither compaction phase: the `PreCompact` capture hook and its paired `SessionStart` matcher `compact` recovery hook were both removed, so no compaction hook runs automatically.
+`bin/fm-autocompact.sh capture` and `bin/fm-autocompact.sh recover` remain runnable by hand with the same payloads on stdin, and the rest of this document describes their behavior when invoked that way.
+Re-register both halves together if the bridge is ever restored; recovery alone reports a missing anchor on every post-compact session.
 The capture phase first atomically replaces `data/autocompact-resume.md` with the same deterministic view of durable fleet state used before judgment capture was added.
 The anchor includes the full backlog, every in-flight `state/*.meta` file, and the complete local-only bearings projection with current task state, open decisions, held queued work, recorded PRs, reports, endpoint health, task paths, and next actions.
 Hook payload parsing does not require `jq`; when `jq` is unavailable, capture logs a loud limitation and publishes the complete raw backlog and metadata while marking the derived bearings projection unavailable.

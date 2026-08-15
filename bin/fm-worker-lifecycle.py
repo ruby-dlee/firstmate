@@ -812,16 +812,17 @@ def capacity_admission(
     forecast = metrics.get("forecast_usd")
     if (
         forecast is None
-        and metrics.get("forecast_untrained") is True
         and isinstance(actual, (int, float))
         and not isinstance(actual, bool)
         and env["policy_phase"] == "commissioning"
         and os.environ.get("FM_AZURE_WORKER_ALLOW_UNTRAINED_FORECAST") == "1"
     ):
         # Bootstrap-only seam: a fresh resource group cannot train the
-        # forecast model until real spend exists. With the operator's explicit
-        # commissioning confirmation, the readable actual substitutes as the
-        # conservative forecast; any other unreadable telemetry still refuses.
+        # forecast model until real spend exists, and concurrent shard
+        # admissions can exhaust the throttle window before the endpoint
+        # even returns its untrained refusal. With the operator's explicit
+        # commissioning confirmation, the readable actual substitutes for
+        # any unreadable forecast; an unreadable actual still refuses.
         forecast = float(actual)
     if not isinstance(actual, (int, float)) or not isinstance(forecast, (int, float)):
         return False, "shared actual or forecast spend is unreadable"

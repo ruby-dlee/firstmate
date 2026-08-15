@@ -138,6 +138,9 @@ assert "cost reservation absence is ambiguous" in host
 assert host.count('identity["etag"] = identity["etag"] or identity["unique_id"]') == 1
 assert 'label not in ("run-command", "ttl-schedule") and not identity["etag"]' in host
 assert 'if resource.get("etag"):' in host
+assert "stable_only=True," in host
+assert "require_vm_relation=False," in host
+assert '"nic": "resource_guid", "disk": "unique_id",' in host
 assert '"ttl_schedule_name": "shutdown-computevm-{}".format(vm_name)' in host
 assert "schedules/shutdown-computevm-{}" in host
 assert "DEPLOYMENT_TIMEOUT_SECONDS = 900" in host

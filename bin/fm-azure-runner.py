@@ -3115,14 +3115,27 @@ def verify_resource_tags(env, state, resource, label):
             raise RunnerError("live {} cleanup tag mismatch: {}".format(label, key))
 
 
-def verify_live_resource_identity(env, state, kind, resource_id, identity_key=None, require_vm_relation=True):
+def verify_live_resource_identity(env, state, kind, resource_id, identity_key=None, require_vm_relation=True, stable_only=False):
     exists, resource = read_exact_resource(env, resource_id, kind)
     if not exists:
         return False, None
     verify_resource_tags(env, state, resource, kind)
     identity_key = identity_key or kind
     recorded = state["resources"].get("identities", {}).get(identity_key)
-    if recorded is None or immutable_identity(resource, kind) != recorded:
+    live = immutable_identity(resource, kind)
+    if recorded is None:
+        raise RunnerError("live {} immutable identity changed; cleanup retained ambiguous state".format(kind))
+    if stable_only:
+        # Deleting the VM mutates every dependent resource's etag, so the
+        # absence fence compares the stable immutable field and exact id
+        # instead of the full creation-time identity.
+        stable_field = {
+            "vm": "instance_id", "nic": "resource_guid", "disk": "unique_id",
+            "run-command": "provisioning_state", "ttl-schedule": "task_type",
+        }[kind]
+        if live["id"] != recorded["id"] or live.get(stable_field) != recorded.get(stable_field):
+            raise RunnerError("live {} immutable identity changed; cleanup retained ambiguous state".format(kind))
+    elif live != recorded:
         raise RunnerError("live {} immutable identity changed; cleanup retained ambiguous state".format(kind))
     if require_vm_relation and kind == "nic" and str(resource.get("properties", {}).get("virtualMachine", {}).get("id", "")).lower() != state["resources"]["vm_id"].lower():
         raise RunnerError("live NIC is not managed by the exact runner VM")
@@ -3174,7 +3187,10 @@ def classify_disposable_resources(env, state, include_vm=True):
         raise RunnerError("VM-absent invocation has an unplanned residual resource; cleanup retained ambiguous state")
     classified = []
     for kind, identity_key, resource_id in planned:
-        exists, resource = verify_live_resource_identity(env, state, kind, resource_id, identity_key)
+        exists, resource = verify_live_resource_identity(
+            env, state, kind, resource_id, identity_key,
+            require_vm_relation=False, stable_only=True,
+        )
         if exists:
             classified.append((kind, identity_key, resource_id, resource))
     return classified

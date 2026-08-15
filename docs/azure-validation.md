@@ -367,7 +367,7 @@ A missing ETag, changed instance, foreign tag, foreign principal, extra role ass
 
 ## Live acceptance
 
-Focused fake-cloud and static tests do not claim real Azure usability, and no live acceptance of these cells has been performed.
+Focused fake-cloud and static tests do not claim real Azure usability. The full multi-leg acceptance checklist below remains unperformed; the first live Stage C pipeline acceptance has now occurred, as described in the Live acceptance record section.
 After this stack is released to public main and the operator has explicit billable authorization, the first live acceptance must run from that released main and record all of these results:
 
 1. Record Mac wall time, CPU, memory, swap, process count, and interactive latency before admission.

@@ -187,6 +187,10 @@ while IFS=$'\t' read -r url file bytes digest; do
 done <"$BASE/wheels.tsv"
 chown -R fmrunner:fmrunner /work/home/.fm-runner-tools
 [ "sha256:$(sha256sum /work/repo/tools/agent-fleet/uv.lock | awk '{print $1}')" = "$(read_request protocol.agent_fleet_python.lock_digest)" ] || { echo "guest bootstrap: lock mismatch" >&2; exit 125; }
+# The run-command handler's download directory is root-only, so the
+# unprivileged uv invocations must not inherit it as their working
+# directory (uv's config discovery reads ./uv.toml and refuses on EACCES).
+cd /work/repo
 runuser -u fmrunner -- /work/home/.fm-runner-tools/uv/uv venv --python /usr/bin/python3 /work/repo/tools/agent-fleet/.venv >/dev/null
 runuser -u fmrunner -- env UV_OFFLINE=1 UV_NO_INDEX=1 /work/home/.fm-runner-tools/uv/uv pip install --python /work/repo/tools/agent-fleet/.venv/bin/python --offline --no-index --find-links /work/home/.fm-runner-tools/wheelhouse pytest ruff >/dev/null
 

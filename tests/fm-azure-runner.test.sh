@@ -114,6 +114,7 @@ assert "git -C /work/repo fetch /work/snapshot.bundle" in guest
 assert 'fetch "$SNAPSHOT"' not in guest
 assert "GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/work/repo" in guest
 assert guest.index("runuser -u fmrunner -- git -C /work/repo init") < guest.index("GIT_CONFIG_KEY_0=safe.directory")
+assert guest.index("cd /work/repo") < guest.index("uv venv --python")
 assert "$#\" -eq 10" not in guest
 run_at=guest.index("systemd-run --quiet")
 input_token_at=guest.index("metadata/identity/oauth2/token")

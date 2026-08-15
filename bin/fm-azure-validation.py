@@ -22,7 +22,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -36,14 +35,17 @@ SHARD_BRIDGE = ROOT / "bin" / "fm-azure-validation-shard-bridge.py"
 CONTAINER = "validation-shards"
 SCHEMA = "fm.azure-validation/v1"
 RESULT_SCHEMA = "fm.azure-validation-result/v1"
-LEASE_SCHEMA = "fm.azure-credential-lease/v1"
+CREDENTIALS_SCHEMA = "fm.azure-validation-credentials/v1"
 RUNTIME_SCHEMA = "fm.azure-validation-runtime/v1"
+# Azure firstmate is powered entirely by pi-codex; the single claude profile
+# exists only for the cross-check lane. Add further providers here only when
+# a lane actually consumes them.
+PROVIDERS = ("codex", "claude")
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
 SAFE_CELL = re.compile(r"^azv-[a-z0-9]{12}$")
 HEX_OBJECT = re.compile(r"^[0-9a-f]{40,64}$")
 SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
-RESOURCE_ID = re.compile(r"^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\.Compute/disks/[^/]+$", re.I)
 PR_URL = re.compile(r"^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$")
 NM_RUN_ID = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
 RUNNER_INVOCATION = re.compile(r"^azr-[a-z0-9]{12}(?:-a[2-9][0-9]*)?$")
@@ -95,10 +97,6 @@ RESOURCE_CLASSES = {
     },
 }
 
-FORBIDDEN_LEASE_KEYS = {
-    "token", "secret", "password", "private_key", "access_token",
-    "refresh_token", "credential", "cookie", "authorization",
-}
 FORBIDDEN_RUNTIME_NAMES = {
     ".claude", ".config/gh", ".credentials.json", "auth.json", "hosts.yml",
     "credentials", "token", "secret", "keychain", "cookies",
@@ -371,97 +369,69 @@ def count_queued(env):
     return count
 
 
-def reject_secret_keys(value, path="lease"):
-    if isinstance(value, dict):
-        for key, child in value.items():
-            normalized = str(key).lower().replace("-", "_")
-            if normalized in FORBIDDEN_LEASE_KEYS:
-                raise ValidationError("credential lease descriptor contains forbidden secret field: {}.{}".format(path, key))
-            reject_secret_keys(child, path + "." + str(key))
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            reject_secret_keys(child, "{}[{}]".format(path, index))
+def load_credentials(path):
+    """Read the plain single-operator credentials descriptor.
 
-
-def load_credential_lease(path, task, generation, repo_slug):
-    source_arg = Path(path)
-    source = source_arg.resolve()
+    The descriptor names the provider plus host paths for a home-shaped auth
+    directory (containing .codex/, .claude/, ... as they would sit in the
+    agent user's home) and the GitHub token file. It carries no secret values
+    itself; the auth directory ships to the cell inside the input archive as
+    the first-boot seed (the fm-auth-home share overlays it afterwards) and
+    the token flows at dispatch time as a run-command parameter.
+    """
+    source = Path(path).expanduser().resolve()
     try:
-        if source_arg.is_symlink() or not source.is_file():
-            raise ValidationError("credential lease descriptor must be a regular non-link file")
-        mode = source.stat().st_mode & 0o777
         value = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValidationError("credential lease descriptor is unreadable: {}".format(exc))
-    reject_secret_keys(value)
-    if not isinstance(value, dict) or set(value) != {
-        "schema", "lease_id", "task", "task_generation", "provider",
-        "provider_account_binding", "disk_content_binding", "disk", "paths",
-        "github_authority", "expires_at",
-    }:
-        raise ValidationError("credential lease descriptor field inventory is not exact")
-    if mode & 0o077:
-        raise ValidationError("credential lease descriptor must not be group/world accessible")
-    expected = {
-        "schema": LEASE_SCHEMA,
-        "task": task,
-        "task_generation": generation,
-    }
-    for key, wanted in expected.items():
-        if value.get(key) != wanted:
-            raise ValidationError("credential lease descriptor {} does not match the run".format(key))
-    require_id("credential lease id", value.get("lease_id"))
-    require_sha256("provider account binding", value.get("provider_account_binding"))
-    require_sha256("credential disk content binding", value.get("disk_content_binding"))
-    disk = value.get("disk") or {}
-    if not isinstance(disk, dict) or set(disk) != {"id", "etag", "luks_uuid", "zone"}:
-        raise ValidationError("credential lease disk field inventory is not exact")
-    if not RESOURCE_ID.match(str(disk.get("id", ""))):
-        raise ValidationError("credential lease disk id is malformed")
-    if not disk.get("etag") or not UUID.match(str(disk.get("luks_uuid", ""))):
-        raise ValidationError("credential lease disk immutable/LUKS identity is incomplete")
-    if str(disk.get("zone")) not in ("1", "2", "3"):
-        raise ValidationError("credential lease disk zone must be 1, 2, or 3")
-    github = value.get("github_authority") or {}
-    if not isinstance(github, dict) or set(github) != {"kind", "repository", "permissions"}:
-        raise ValidationError("GitHub authority field inventory is not exact")
-    if github.get("repository") != repo_slug:
-        raise ValidationError("GitHub authority is not scoped to the exact repository")
-    permissions = set(github.get("permissions") or [])
-    # GitHub's fine-grained token UI no longer offers a Checks permission;
-    # actions:read plus statuses:read is its exact successor for reading CI
-    # results. Either the historical triple or the successor quad is an
-    # acceptable minimal declaration; nothing broader is.
-    exact_permission_sets = (
-        {"contents:write", "pull_requests:write", "checks:read"},
-        {"contents:write", "pull_requests:write", "actions:read", "statuses:read"},
-    )
-    if permissions not in exact_permission_sets:
-        raise ValidationError(
-            "GitHub authority must declare only contents:write, pull_requests:write, "
-            "and either checks:read or actions:read plus statuses:read"
-        )
-    if github.get("kind") not in ("fine-grained-token", "github-app-installation"):
-        raise ValidationError("GitHub authority must be a fine-grained token or installation lease")
-    expires = parse_utc(value.get("expires_at"), "credential lease expiry")
-    if expires <= now_utc() + dt.timedelta(hours=1):
-        raise ValidationError("credential lease expires too soon for admission")
+        raise ValidationError("credentials descriptor is unreadable: {}".format(exc))
+    if not isinstance(value, dict) or value.get("schema") != CREDENTIALS_SCHEMA:
+        raise ValidationError("credentials descriptor schema is invalid")
     provider = value.get("provider")
-    if provider not in ("claude", "codex", "pi", "opencode", "grok"):
-        raise ValidationError("credential lease provider is not a verified Firstmate adapter")
-    paths = value.get("paths") or {}
-    if not isinstance(paths, dict) or set(paths) != {"provider_home", "account_binding", "github_token"}:
-        raise ValidationError("credential lease path field inventory is not exact")
-    for key in ("provider_home", "account_binding", "github_token"):
-        relative = paths.get(key)
-        if not isinstance(relative, str) or not relative or relative.startswith("/") or ".." in relative.split("/"):
-            raise ValidationError("credential lease {} must be a bounded disk-relative path".format(key))
-    if len(set(paths.values())) != len(paths):
-        raise ValidationError("provider, account-binding, and GitHub lease paths must remain distinct")
-    provider_prefix = paths["provider_home"].rstrip("/") + "/"
-    if not paths["account_binding"].startswith(provider_prefix):
-        raise ValidationError("provider account-binding marker must live inside the exact provider home")
-    return value, sha256_file(source)
+    if provider not in PROVIDERS:
+        raise ValidationError("credentials provider is not a verified Firstmate adapter")
+    auth_home = Path(str(value.get("auth_home", ""))).expanduser()
+    if not str(value.get("auth_home", "")) or not auth_home.is_dir():
+        raise ValidationError("credentials auth_home must be an existing home-shaped directory")
+    token_file = Path(str(value.get("github_token_file", ""))).expanduser()
+    if not str(value.get("github_token_file", "")) or not token_file.is_file():
+        raise ValidationError("credentials github_token_file must be an existing file")
+    return {
+        "provider": provider,
+        "auth_home": auth_home,
+        "github_token_file": token_file,
+    }
+
+
+def read_github_token(state):
+    """Read the current GitHub token for boot-time injection into the guest."""
+    override = os.environ.get("FM_AZURE_GITHUB_TOKEN_FILE")
+    path = Path(override) if override else Path(state["request"]["credentials"]["github_token_file"])
+    try:
+        token = path.expanduser().read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValidationError("GitHub token file is unreadable: {}".format(exc))
+    if not token:
+        raise ValidationError("GitHub token file is empty")
+    return token
+
+
+def pack_auth_home(auth_home, destination):
+    with tarfile.open(destination, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+        for source in sorted(auth_home.rglob("*")):
+            if source.is_symlink():
+                continue
+            arcname = source.relative_to(auth_home).as_posix()
+            info = archive.gettarinfo(str(source), arcname=arcname)
+            info.uid = info.gid = 0
+            info.uname = info.gname = "root"
+            info.mtime = 0
+            if source.is_file():
+                with open(source, "rb") as handle:
+                    archive.addfile(info, handle)
+            elif source.is_dir():
+                archive.addfile(info)
+    if destination.stat().st_size > 1024**3:
+        raise ValidationError("auth home bundle exceeds one GiB")
 
 
 def validate_runtime_bundle(path, provider):
@@ -597,7 +567,7 @@ def project_resource_class(env, repo_slug, requested):
     return selected
 
 
-def prepare_payload(env, state, runtime_source):
+def prepare_payload(env, state, runtime_source, auth_home):
     payload = env["state_dir"] / "payloads" / state["cell"]
     if payload.exists():
         raise ValidationError("cell payload already exists")
@@ -612,6 +582,9 @@ def prepare_payload(env, state, runtime_source):
     state["request"]["repository"]["snapshot_bytes"] = bundle.stat().st_size
     runtime_copy = payload / "runtime.tar.gz"
     shutil.copyfile(str(runtime_source), str(runtime_copy))
+    credentials_copy = payload / "credentials.tar.gz"
+    pack_auth_home(auth_home, credentials_copy)
+    state["request"]["credentials"]["bundle_digest"] = sha256_file(credentials_copy)
     request_unsigned = dict(state["request"])
     request_unsigned.pop("request_digest", None)
     state["request_digest"] = sha256_bytes(canonical_bytes(request_unsigned))
@@ -625,6 +598,7 @@ def prepare_payload(env, state, runtime_source):
         (request_path, "request.json"),
         (bundle, "snapshot.bundle"),
         (runtime_copy, "runtime.tar.gz"),
+        (credentials_copy, "credentials.tar.gz"),
         (payload / "shard-bridge.py", "shard-bridge.py"),
     )
     with tarfile.open(input_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
@@ -659,13 +633,11 @@ def submit(env, args):
             raise ValidationError("intent file is unreadable: {}".format(exc))
         if not intent.strip() or len(intent.encode("utf-8")) > 64 * 1024:
             raise ValidationError("intent must contain 1-65536 bytes")
-        lease, lease_digest = load_credential_lease(
-            args.credential_lease, task, generation, repo_slug
-        )
-        runtime, runtime_digest = validate_runtime_bundle(args.runtime_bundle, lease["provider"])
+        credentials = load_credentials(args.credential_lease)
+        runtime, runtime_digest = validate_runtime_bundle(args.runtime_bundle, credentials["provider"])
         cell = new_cell()
         token = cell.split("-", 1)[1]
-        resources = resource_names(env, token, lease)
+        resources = resource_names(env, token)
         shard_container = "fmval" + token
         fence = sha256_bytes(os.urandom(32))
         limits = dict(RESOURCE_CLASSES[resource_class])
@@ -683,7 +655,6 @@ def submit(env, args):
             "resource_bindings": {
                 "vm_id": resources["vm_id"],
                 "worktree_disk_id": resources["worktree_disk_id"],
-                "credential_disk_id": resources["credential_disk_id"],
                 "identity_id": resources["identity_id"],
                 "shard_container": shard_container,
             },
@@ -695,8 +666,11 @@ def submit(env, args):
                 "snapshot_digest": None,
                 "snapshot_bytes": None,
             },
-            "credential_lease": lease,
-            "credential_lease_digest": lease_digest,
+            "credentials": {
+                "provider": credentials["provider"],
+                "github_token_file": str(credentials["github_token_file"]),
+                "bundle_digest": None,
+            },
             "runtime": runtime,
             "runtime_digest": runtime_digest,
             "resource_class": resource_class,
@@ -725,8 +699,6 @@ def submit(env, args):
                 "input_blob": "control/input.tar.gz",
                 "result_blob": "control/result.tar.gz",
                 "evidence_prefix": "control/evidence",
-                "admission_container": CONTAINER,
-                "admission_blob": "validation-cells/admission.lock",
                 "lineage_prefix": staging_prefix,
             },
             "resources": resources,
@@ -735,7 +707,10 @@ def submit(env, args):
         ensure_dirs(env)
         save_state(env, state, create=True)
         try:
-            prepare_payload(env, state, Path(args.runtime_bundle).resolve())
+            prepare_payload(
+                env, state, Path(args.runtime_bundle).resolve(),
+                credentials["auth_home"],
+            )
             transition(env, state, "queued", "exact pushed head queued without local validation execution")
         except Exception:
             with contextlib.suppress(OSError):
@@ -747,7 +722,7 @@ def submit(env, args):
     ))
 
 
-def resource_names(env, token, lease):
+def resource_names(env, token):
     prefix = os.environ.get("FM_AZURE_NAMING_PREFIX", "")
     sub = os.environ.get("FM_AZURE_SUBSCRIPTION_ID", "")
     group = os.environ.get("FM_AZURE_RESOURCE_GROUP", "rg-firstmate-pilot-eastus-001")
@@ -767,7 +742,6 @@ def resource_names(env, token, lease):
         "nic_name": nic,
         "os_disk_name": os_disk,
         "worktree_disk_name": worktree,
-        "credential_disk_id": lease["disk"]["id"],
         "identity_name": identity,
         "identity_id": base + "/Microsoft.ManagedIdentity/userAssignedIdentities/" + identity,
         "vm_id": base + "/Microsoft.Compute/virtualMachines/" + vm,
@@ -920,8 +894,6 @@ def sku_candidates(env, required_vcpus, required_memory):
             vcpus != required_vcpus or memory < required_memory
             or capabilities.get("CpuArchitectureType") != "x64"
             or "V2" not in str(capabilities.get("HyperVGenerations", ""))
-            or capabilities.get("TrustedLaunchDisabled") == "True"
-            or capabilities.get("EncryptionAtHostSupported") != "True"
             or not {"1", "2", "3"}.issubset(zones)
         ):
             continue
@@ -1166,21 +1138,6 @@ def retail_rate_from_api(env, sku):
 
 
 
-def ensure_secret_file(name):
-    value = os.environ.get(name)
-    if not value:
-        raise ValidationError("{} must name an owner-only key file for billable dispatch".format(name))
-    path = Path(value).resolve()
-    try:
-        mode = path.stat().st_mode & 0o777
-        data = path.read_bytes()
-    except OSError as exc:
-        raise ValidationError("{} is unreadable: {}".format(name, exc))
-    if mode & 0o077 or len(data) < 32 or len(data) > 4096:
-        raise ValidationError("{} must be owner-only and contain 32-4096 bytes".format(name))
-    return path, data
-
-
 def storage_upload(env, path, blob, overwrite=False, container=CONTAINER):
     az_command(env, [
         "storage", "blob", "upload", "--auth-mode", "login", "--account-name", env["storage"],
@@ -1230,99 +1187,6 @@ def blob_sas(env, blob, permissions, hours=MAX_CELL_LIFETIME_HOURS, container=CO
     if rc != 0 or not stdout.startswith("https://"):
         raise ValidationError("exact-object SAS creation failed: {}".format(stderr))
     return stdout
-
-
-class CloudAdmissionLease:
-    def __init__(self, env, state):
-        self.env = env
-        self.state = state
-        self.lease_id = str(uuid.uuid4())
-        self.failed = threading.Event()
-        self.stop = threading.Event()
-        self.thread = None
-        self.expiry_lock = threading.Lock()
-        self.expires_at = 0.0
-
-    def lease_args(self, action):
-        args = [
-            "storage", "blob", "lease", action, "--auth-mode", "login",
-            "--account-name", self.env["storage"], "--container-name", CONTAINER,
-            "--blob-name", self.state["staging"]["admission_blob"],
-        ]
-        if action == "acquire":
-            args += ["--lease-duration", "60", "--proposed-lease-id", self.lease_id]
-        else:
-            args += ["--lease-id", self.lease_id]
-        return args
-
-    def __enter__(self):
-        empty = self.env["state_dir"] / ".validation-admission-empty"
-        empty.touch(mode=0o600, exist_ok=True)
-        _, rc, _ = az_command(self.env, [
-            "storage", "blob", "upload", "--auth-mode", "login", "--account-name", self.env["storage"],
-            "--container-name", CONTAINER, "--name", self.state["staging"]["admission_blob"],
-            "--file", str(empty), "--overwrite", "false",
-        ], check=False)
-        if rc != 0:
-            exists, _, _ = az_command(self.env, [
-                "storage", "blob", "exists", "--auth-mode", "login", "--account-name", self.env["storage"],
-                "--container-name", CONTAINER, "--name", self.state["staging"]["admission_blob"],
-            ])
-            if not exists.get("exists"):
-                raise ValidationError("global validation admission lock could not be created or proven")
-        for _ in range(7):
-            _, rc, _ = az_command(
-                self.env, self.lease_args("acquire"), check=False, timeout=10
-            )
-            if rc == 0:
-                with self.expiry_lock:
-                    self.expires_at = time.monotonic() + 60
-                break
-            time.sleep(10)
-        else:
-            raise ValidationError("global validation admission lock is busy or unreachable")
-        self.thread = threading.Thread(target=self.renew, daemon=True)
-        self.thread.start()
-        return self
-
-    def renew_once(self):
-        try:
-            _, rc, _ = az_command(
-                self.env, self.lease_args("renew"), check=False, timeout=10
-            )
-            if rc != 0:
-                raise ValidationError("global validation admission renewal was refused")
-            with self.expiry_lock:
-                self.expires_at = time.monotonic() + 60
-        except Exception:
-            self.failed.set()
-            raise
-
-    def renew(self):
-        while not self.stop.wait(25):
-            try:
-                self.renew_once()
-            except Exception:
-                return
-
-    def assert_held(self):
-        with self.expiry_lock:
-            safely_live = time.monotonic() < self.expires_at - 15
-        if self.failed.is_set() or not safely_live:
-            self.failed.set()
-            raise ValidationError("global validation admission lease was lost before cell start")
-
-    def renew_and_assert(self):
-        if self.failed.is_set():
-            self.assert_held()
-        self.renew_once()
-        self.assert_held()
-
-    def __exit__(self, exc_type, exc, traceback):
-        self.stop.set()
-        if self.thread:
-            self.thread.join(timeout=2)
-        az_command(self.env, self.lease_args("release"), check=False, timeout=10)
 
 
 def read_resource(env, resource_id, kind):
@@ -1399,7 +1263,6 @@ def expected_tags(state, selected):
         "branch-binding": sha256_bytes(request["repository"]["branch"].encode("utf-8")),
         "head-binding": request["repository"]["head"],
         "worktree-binding": sha256_bytes(state["resources"]["worktree_disk_id"].encode("utf-8")),
-        "credential-lease": request["credential_lease"]["lease_id"],
         "resource-class": request["resource_class"],
         "selected-sku": selected["sku"],
         "sku-family": selected["family"],
@@ -1417,19 +1280,21 @@ def deployment_parameters(env, state, selected, replacement=False):
     )
     expiry_value = now_utc() + dt.timedelta(hours=MAX_CELL_LIFETIME_HOURS - 1)
     expiry = iso_utc(expiry_value)
+    zone = os.environ.get("FM_AZURE_VALIDATION_ZONE", "1")
+    if zone not in ("1", "2", "3"):
+        raise ValidationError("FM_AZURE_VALIDATION_ZONE must be 1, 2, or 3")
     return {
         "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
         "contentVersion": "1.0.0.0",
         "parameters": {
             "region": {"value": "eastus"},
-            "zone": {"value": request["credential_lease"]["disk"]["zone"]},
+            "zone": {"value": zone},
             "vmName": {"value": resources["vm_name"]},
             "nicName": {"value": resources["nic_name"]},
             "osDiskName": {"value": resources["os_disk_name"]},
             "worktreeDiskName": {"value": resources["worktree_disk_name"]},
             "worktreeDiskId": {"value": resources["worktree_disk_id"]},
             "createWorktreeDisk": {"value": not replacement},
-            "credentialDiskId": {"value": resources["credential_disk_id"]},
             "identityName": {"value": resources["identity_name"]},
             "storageAccountName": {"value": env["storage"]},
             "shardContainerName": {"value": state["staging"]["container"]},
@@ -1446,31 +1311,6 @@ def deployment_parameters(env, state, selected, replacement=False):
             "imageId": {"value": os.environ.get("FM_AZURE_VM_IMAGE_ID", "")},
         },
     }
-
-
-def verify_credential_disk(env, state, allow_expected_vm=False):
-    expected = state["request"]["credential_lease"]["disk"]
-    expected_prefix = "/subscriptions/{}/resourceGroups/{}/providers/Microsoft.Compute/disks/".format(
-        env["subscription"], env["resource_group"]
-    )
-    if not expected["id"].lower().startswith(expected_prefix.lower()):
-        raise ValidationError("credential lease disk is outside the exact subscription/resource group")
-    exists, disk = read_resource(env, expected["id"], "disk")
-    if not exists:
-        raise ValidationError("exact credential lease disk is absent")
-    properties = disk.get("properties") or {}
-    live_identity = disk.get("etag") or properties.get("etag") or properties.get("uniqueId")
-    if live_identity != expected["etag"]:
-        raise ValidationError("credential lease disk ETag changed")
-    managed_by = disk.get("managedBy") or properties.get("managedBy")
-    expected_vm = (state.get("resources") or {}).get("vm_id")
-    if managed_by and not (
-        allow_expected_vm and expected_vm and str(managed_by).lower() == str(expected_vm).lower()
-    ):
-        raise ValidationError("credential lease disk is already attached to another cell")
-    tags = disk.get("tags") or {}
-    if tags.get("credential-lease") != state["request"]["credential_lease"]["lease_id"]:
-        raise ValidationError("credential disk tag does not match the exact lease")
 
 
 def adopt_resources(env, state):
@@ -1526,13 +1366,6 @@ def adopt_resources(env, state):
     if tags.get("validation-cell") != state["cell"] or tags.get("fence") != state["request"]["fence"]:
         raise ValidationError("durable worktree disk identity is foreign")
     identities["worktree"] = immutable_identity(worktree, "disk")
-    credential_exists, credential = read_resource(env, resources["credential_disk_id"], "disk")
-    if not credential_exists:
-        raise ValidationError("credential lease disk disappeared during cell creation")
-    managed_by = credential.get("managedBy") or credential.get("properties", {}).get("managedBy")
-    if str(managed_by or "").lower() != resources["vm_id"].lower():
-        raise ValidationError("credential lease disk is not attached only to the exact cell VM")
-    identities["credential"] = immutable_identity(credential, "disk")
     resources["identities"] = identities
     resources["vm_instance_id"] = identities["vm"]["instance_id"]
     save_state(env, state)
@@ -1568,10 +1401,10 @@ def create_run_command(env, state, mode, input_url=None, output_url=None, respon
         {"name": "vm_resource_id", "value": resources["vm_id"]},
         {"name": "vm_instance_id", "value": resources["vm_instance_id"]},
         {"name": "worktree_disk_id", "value": resources["worktree_disk_id"]},
-        {"name": "credential_disk_id", "value": resources["credential_disk_id"]},
         {"name": "storage_account", "value": env["storage"]},
         {"name": "storage_container", "value": state["staging"]["container"]},
         {"name": "identity_client_id", "value": resources["identity_client_id"]},
+        {"name": "auth_share", "value": os.environ.get("FM_AZURE_AUTH_SHARE", "fm-auth-home")},
     ]
     protected = []
     if input_url:
@@ -1580,16 +1413,9 @@ def create_run_command(env, state, mode, input_url=None, output_url=None, respon
         protected.append({"name": "output_url", "value": output_url})
     if response is not None:
         protected.append({"name": "response", "value": response})
-    _, worktree_key = ensure_secret_file("FM_AZURE_VALIDATION_WORKTREE_KEY_FILE")
-    protected.append({
-        "name": "fm_azure_validation_worktree_key_file",
-        "value": worktree_key.decode("utf-8").rstrip("\n"),
-    })
-    _, credential_key = ensure_secret_file("FM_AZURE_VALIDATION_CREDENTIAL_KEY_FILE")
-    protected.append({
-        "name": "fm_azure_validation_credential_key_file",
-        "value": credential_key.decode("utf-8"),
-    })
+    # Boot-time credential injection: the token reaches the guest as a
+    # run-command parameter and never lands in durable state files.
+    protected.append({"name": "github_token", "value": read_github_token(state)})
     selected = {
         "sku": state["allocation"]["sku"],
         "family": state["allocation"]["sku_family"],
@@ -1674,14 +1500,11 @@ def dispatch(env, args):
         state = candidates[0]
         if state["request"]["deployment_generation"] != env["deployment_generation"]:
             raise ValidationError("queued request deployment generation differs from the live foundation")
-        live_resources = resource_names(
-            env, state["cell"].split("-", 1)[1], state["request"]["credential_lease"]
-        )
+        live_resources = resource_names(env, state["cell"].split("-", 1)[1])
         expected_bindings = state["request"].get("resource_bindings") or {}
         actual_bindings = {
             "vm_id": live_resources["vm_id"],
             "worktree_disk_id": live_resources["worktree_disk_id"],
-            "credential_disk_id": live_resources["credential_disk_id"],
             "identity_id": live_resources["identity_id"],
             "shard_container": state["staging"]["container"],
         }
@@ -1697,50 +1520,45 @@ def dispatch(env, args):
             save_state(env, state)
         scope_gate(env)
         foundation_gate(env)
-        with CloudAdmissionLease(env, state) as admission_lease:
-            foundation_gate(env)
-            verify_credential_disk(env, state, allow_expected_vm=recovering)
-            if recovering:
-                allocation = state.get("allocation") or {}
-                admission = state.get("admission") or {}
-                selected = {
-                    "sku": allocation.get("sku"),
-                    "family": allocation.get("sku_family"),
-                    "rate": admission.get("hourly_rate"),
-                    "owner": env["owner"],
-                }
-                if (
-                    selected["sku"] not in VALIDATION_SKUS
-                    or not selected["family"] or not isinstance(selected["rate"], (int, float))
-                    or admission.get("shape_id") != state["cell"]
-                    or len(admission.get("shard_plan") or []) != state["request"]["limits"]["behavior_shards"]
-                ):
-                    raise ValidationError("starting cell lacks its exact allocation and shape reservation")
-            else:
-                limits = state["request"]["limits"]
-                selected = sku_candidates(env, limits["vcpus"], limits["memory_gib"])[0]
-                selected["owner"] = env["owner"]
-                shape = shared_shape_reserve(env, state, selected)
-                if shape["status"] != "reserved":
-                    state.setdefault("admission", {})["shard_plan"] = shape["shard_plan"]
-                    state["admission"]["last_refusal"] = {"at": iso_utc(), "reason": shape.get("reason", "")[:400]}
-                    save_state(env, state)
-                    print("AZURE VALIDATION QUEUED cell={} reason={}".format(state["cell"], shape.get("reason", "")))
-                    return
-                state["allocation"] = {"sku": selected["sku"], "sku_family": selected["family"]}
-                state["admission"] = {
-                    "at": iso_utc(), "sku": selected["sku"], "sku_family": selected["family"],
-                    "hourly_rate": selected["rate"],
-                    "actual_usd": shape.get("actual_usd"), "forecast_usd": shape.get("forecast_usd"),
-                    "admission_limit_usd": shape.get("admission_limit_usd"),
-                    "shape_id": state["cell"], "capacity_fence": state["request"]["fence"].split(":", 1)[-1],
-                    "control_amount_usd": shape["control_amount_usd"],
-                    "shard_plan": shape["shard_plan"],
-                }
-                transition(env, state, "starting", "shared allocator atomically reserved the complete specialized shape")
-            admission_lease.renew_and_assert()
-            create_cell(env, state, selected)
-            admission_lease.assert_held()
+        if recovering:
+            allocation = state.get("allocation") or {}
+            admission = state.get("admission") or {}
+            selected = {
+                "sku": allocation.get("sku"),
+                "family": allocation.get("sku_family"),
+                "rate": admission.get("hourly_rate"),
+                "owner": env["owner"],
+            }
+            if (
+                selected["sku"] not in VALIDATION_SKUS
+                or not selected["family"] or not isinstance(selected["rate"], (int, float))
+                or admission.get("shape_id") != state["cell"]
+                or len(admission.get("shard_plan") or []) != state["request"]["limits"]["behavior_shards"]
+            ):
+                raise ValidationError("starting cell lacks its exact allocation and shape reservation")
+        else:
+            limits = state["request"]["limits"]
+            selected = sku_candidates(env, limits["vcpus"], limits["memory_gib"])[0]
+            selected["owner"] = env["owner"]
+            shape = shared_shape_reserve(env, state, selected)
+            if shape["status"] != "reserved":
+                state.setdefault("admission", {})["shard_plan"] = shape["shard_plan"]
+                state["admission"]["last_refusal"] = {"at": iso_utc(), "reason": shape.get("reason", "")[:400]}
+                save_state(env, state)
+                print("AZURE VALIDATION QUEUED cell={} reason={}".format(state["cell"], shape.get("reason", "")))
+                return
+            state["allocation"] = {"sku": selected["sku"], "sku_family": selected["family"]}
+            state["admission"] = {
+                "at": iso_utc(), "sku": selected["sku"], "sku_family": selected["family"],
+                "hourly_rate": selected["rate"],
+                "actual_usd": shape.get("actual_usd"), "forecast_usd": shape.get("forecast_usd"),
+                "admission_limit_usd": shape.get("admission_limit_usd"),
+                "shape_id": state["cell"], "capacity_fence": state["request"]["fence"].split(":", 1)[-1],
+                "control_amount_usd": shape["control_amount_usd"],
+                "shard_plan": shape["shard_plan"],
+            }
+            transition(env, state, "starting", "shared allocator atomically reserved the complete specialized shape")
+        create_cell(env, state, selected)
         storage_upload_after_role(
             env, Path(state["input_path"]), state["staging"]["input_blob"],
             state["staging"]["container"],
@@ -1832,7 +1650,6 @@ def verify_result_identity(state, result):
         "branch": state["request"]["repository"]["branch"],
         "submitted_head": state["request"]["repository"]["head"],
         "worktree_disk_id": state["resources"]["worktree_disk_id"],
-        "credential_lease_id": state["request"]["credential_lease"]["lease_id"],
         "vm_resource_id": state["resources"]["vm_id"],
         "vm_instance_id": state["resources"]["vm_instance_id"],
         "boot_id": state.get("expected_boot_id"),
@@ -1840,11 +1657,6 @@ def verify_result_identity(state, result):
     for key, wanted in expected.items():
         if result.get(key) != wanted:
             raise ValidationError("validation result identity mismatch: {}".format(key))
-    worktree_luks_uuid = result.get("worktree_luks_uuid")
-    if not isinstance(worktree_luks_uuid, str) or not UUID.match(worktree_luks_uuid):
-        raise ValidationError("validation result worktree LUKS identity is malformed")
-    if state.get("worktree_luks_uuid") and state["worktree_luks_uuid"] != worktree_luks_uuid:
-        raise ValidationError("validation result worktree LUKS identity changed")
     head = result.get("current_head")
     tree = result.get("current_tree")
     if (
@@ -1969,7 +1781,6 @@ def collect(env, args):
             raise
         state["result"] = result
         state["result_path"] = str(result_root)
-        state["worktree_luks_uuid"] = result["worktree_luks_uuid"]
         if result.get("run_id"):
             state["run_id"] = result["run_id"]
         phase = "needs-decision" if result["outcome"] == "needs-decision" else "collected"
@@ -2006,28 +1817,17 @@ def respond(env, args):
     print("AZURE VALIDATION RESPONDED cell={} attempt={}".format(state["cell"], state["attempt"]))
 
 
-def replacement_allowed(state, vm_presence, worktree_identity, remote_head):
+def replacement_allowed(state, vm_presence):
+    """Minimum absence fence: VM gone plus a phase that owns recoverable work."""
     if vm_presence != "absent-proven":
         return False, "old VM absence is not proven"
-    expected = state.get("resources", {}).get("identities", {}).get("worktree")
-    if not same_stable_identity(expected, worktree_identity, "disk"):
-        return False, "durable worktree identity changed"
-    if remote_head != state["request"]["repository"]["head"] and state.get("run_id") is None:
-        return False, "remote head changed before an exact run id was recorded"
     if state.get("phase") not in ("running", "needs-decision", "failed-retained", "responding", "reattaching"):
         return False, "cell phase does not own recoverable work"
     return True, "replacement admitted"
 
 
 def replacement_run_mode(state):
-    if state.get("run_id") is not None:
-        return "reattach"
-    if (
-        state.get("phase") == "failed-retained"
-        and state.get("control_error") == "No key available with this passphrase.\n"
-    ):
-        return "reattach"
-    return "start"
+    return "reattach" if state.get("run_id") is not None else "start"
 
 
 def replace(env, args):
@@ -2035,40 +1835,30 @@ def replace(env, args):
         raise ValidationError("replacement requires --confirm-replace and the exact subscription")
     with lock(env, require_cell(args.cell)):
         state = load_state(env, args.cell)
-        exists, vm = read_resource(env, state["resources"]["vm_id"], "vm")
+        exists, _vm = read_resource(env, state["resources"]["vm_id"], "vm")
         if exists:
-            if same_stable_identity(
-                state["resources"]["identities"]["vm"], immutable_identity(vm, "vm"), "vm"
-            ):
-                raise ValidationError("old exact VM still exists; duplicate replacement is forbidden")
-            raise ValidationError("foreign VM occupies the recorded identity")
-        work_exists, worktree = read_resource(env, state["resources"]["worktree_disk_id"], "disk")
+            raise ValidationError("old exact VM still exists; duplicate replacement is forbidden")
+        work_exists, _worktree = read_resource(env, state["resources"]["worktree_disk_id"], "disk")
         if not work_exists:
             raise ValidationError("durable validation worktree disk is absent")
-        remote = git(Path(state["repository_root"]), "ls-remote", "--heads", "origin", "refs/heads/" + state["request"]["repository"]["branch"]).stdout.split()
-        remote_head = remote[0] if len(remote) == 2 else "unreadable"
-        allowed, reason = replacement_allowed(state, "absent-proven", immutable_identity(worktree, "disk"), remote_head)
+        allowed, reason = replacement_allowed(state, "absent-proven")
         if not allowed:
             raise ValidationError(reason)
         run_mode = replacement_run_mode(state)
-        # Prove and remove the old attempt's exact disposable remnants before
-        # their names leave authoritative state. Durable worktree, identity,
-        # private container, and credential lease are retained.
+        # Remove the old attempt's disposable remnants before their names
+        # leave authoritative state. Durable worktree, identity, and private
+        # container are retained.
         cleanup_compute(env, state)
         worktree_identity = wait_exact_disk_detached(
             env, state["resources"]["worktree_disk_id"],
             state["resources"]["identities"]["worktree"], "validation worktree",
-        )
-        wait_exact_disk_detached(
-            env, state["resources"]["credential_disk_id"],
-            state["resources"]["identities"]["credential"], "credential lease",
         )
         state["attempt"] += 1
         token = state["cell"].split("-", 1)[1] + "a{}".format(state["attempt"])
         old_resources = state["resources"]
         old_worktree_id = old_resources["worktree_disk_id"]
         old_worktree_name = old_resources["worktree_disk_name"]
-        state["resources"] = resource_names(env, token, state["request"]["credential_lease"])
+        state["resources"] = resource_names(env, token)
         state["resources"]["worktree_disk_id"] = old_worktree_id
         state["resources"]["worktree_disk_name"] = old_worktree_name
         for key in ("identity_name", "identity_id", "identity_client_id", "identity_principal_id"):
@@ -2302,10 +2092,6 @@ def close(env, args):
             raise ValidationError("remote branch is not current with the exact validated head")
         try:
             cleanup_compute(env, state)
-            wait_exact_disk_detached(
-                env, state["resources"]["credential_disk_id"],
-                state["resources"]["identities"]["credential"], "credential lease",
-            )
             # Worktree deletion is authorized only after result/evidence collection,
             # current remote proof, CI green, and exact head confirmation.
             delete_resource(env, state, state["resources"]["worktree_disk_id"], "disk", recorded_key="worktree")
@@ -2347,11 +2133,7 @@ def fail_retain(env, args):
             env, state["resources"]["worktree_disk_id"],
             state["resources"]["identities"]["worktree"], "validation worktree",
         )
-        state["resources"]["identities"]["credential"] = wait_exact_disk_detached(
-            env, state["resources"]["credential_disk_id"],
-            state["resources"]["identities"]["credential"], "credential lease",
-        )
-        transition(env, state, "failed-retained", "exact disposable compute removed; worktree and credential lease retained")
+        transition(env, state, "failed-retained", "exact disposable compute removed; worktree retained")
     print("AZURE VALIDATION RETAINED cell={} compute=zero worktree=retained".format(state["cell"]))
 
 
@@ -2581,7 +2363,7 @@ def run_shard_invocations(env, state, records):
                 raise ValidationError("recorded shard runner state is unreadable: {}".format(exc))
             if value.get("phase") == "complete":
                 continue
-            if value.get("phase") == "absent-fenced" and value.get("old_lease_absent") is True:
+            if value.get("phase") == "absent-fenced":
                 # The fenced invocation can never rerun; the runner's retry
                 # lane reproves absence and creates the lineage descendant
                 # that the next pass rebinds to.
@@ -2888,9 +2670,7 @@ def pure_check(args):
         print(json.dumps({"valid": True}, sort_keys=True))
         return
     if operation == "replacement":
-        allowed, reason = replacement_allowed(
-            value["state"], value["vm_presence"], value["worktree_identity"], value["remote_head"]
-        )
+        allowed, reason = replacement_allowed(value["state"], value["vm_presence"])
         print(json.dumps({"allowed": allowed, "reason": reason}, sort_keys=True))
         return
     raise ValidationError("unknown focused pure-check operation")

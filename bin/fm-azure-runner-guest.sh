@@ -138,7 +138,13 @@ if [ "$SOURCE_MODE" = private-parent-bundle ]; then
   [ "$(stat -c %s "$SNAPSHOT")" = "$(read_request repository.snapshot_bytes)" ] \
     && [ "sha256:$(sha256sum "$SNAPSHOT" | awk '{print $1}')" = "$(read_request repository.snapshot_digest)" ] \
     || { echo "guest bootstrap: private snapshot digest/size mismatch" >&2; exit 125; }
-  runuser -u fmrunner -- git -C /work/repo fetch "$SNAPSHOT" "$COMMIT"
+  # The bootstrap base is root-only (umask 077), unreadable to the
+  # unprivileged fetch; the digest-verified snapshot moves onto the
+  # runner-owned work filesystem for the fetch and is removed after it.
+  install -m 0400 -o fmrunner -g fmrunner "$SNAPSHOT" /work/snapshot.bundle
+  rm -f "$SNAPSHOT"
+  runuser -u fmrunner -- git -C /work/repo fetch /work/snapshot.bundle "$COMMIT"
+  rm -f /work/snapshot.bundle
 elif [ "$SOURCE_REF" != none ] && [ "$SOURCE_HEAD" = "$COMMIT" ]; then
   [ "$INPUT_BLOB" = none ] || { echo "guest bootstrap: public source received a private snapshot blob" >&2; exit 125; }
   run_bootstrap_network runuser -u fmrunner -- git -C /work/repo fetch --depth=1 origin "$SOURCE_REF"

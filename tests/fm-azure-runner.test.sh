@@ -109,6 +109,9 @@ for value in ("PrivateNetwork=yes","RestrictAddressFamilies=AF_UNIX","IPAddressD
     assert value in guest
 for value in ("positional parameters are forbidden","REQUEST_B64=${request_b64:-}","EXECUTOR_B64=${executor_b64:-}","unset request_b64 vm_resource_id"):
     assert value in guest
+assert 'install -m 0400 -o fmrunner -g fmrunner "$SNAPSHOT" /work/snapshot.bundle' in guest
+assert "git -C /work/repo fetch /work/snapshot.bundle" in guest
+assert 'fetch "$SNAPSHOT"' not in guest
 assert "$#\" -eq 10" not in guest
 run_at=guest.index("systemd-run --quiet")
 input_token_at=guest.index("metadata/identity/oauth2/token")

@@ -3223,9 +3223,20 @@ def delete_classified_resource(env, state, resource_id, kind, identity_key, reso
     _, rc, stderr = az_command(env, arguments, check=False)
     if rc != 0:
         raise RunnerError("conditional exact {} deletion failed: {}".format(kind, stderr))
-    remains, _ = read_exact_resource(env, resource_id, kind)
-    if remains:
-        raise RunnerError("exact {} still exists after conditional delete".format(kind))
+    # ARM deletions are asynchronous: a half-deleted resource can keep
+    # listing while its GET already fails, so absence is proven by a
+    # bounded poll rather than one immediate read-back.
+    deadline = time.monotonic() + 90
+    while True:
+        try:
+            remains, _ = read_exact_resource(env, resource_id, kind)
+        except RunnerError:
+            remains = True
+        if not remains:
+            return
+        if time.monotonic() >= deadline:
+            raise RunnerError("exact {} still exists after conditional delete".format(kind))
+        time.sleep(5)
 
 
 def adopt_expected_detach(env, state, kind, identity_key, resource_id):

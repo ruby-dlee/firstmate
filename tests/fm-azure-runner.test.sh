@@ -162,6 +162,8 @@ assert '"nic": "resource_guid", "disk": "unique_id",' in host
 assert 'if kind == "run-command":' in host
 assert "elif stable_only:" in host
 assert host.index('if kind == "run-command":') < host.index("elif stable_only:")
+assert "still exists after conditional delete" in host
+assert host.index("deadline = time.monotonic() + 90") < host.index("still exists after conditional delete")
 assert '"ttl_schedule_name": "shutdown-computevm-{}".format(vm_name)' in host
 assert "schedules/shutdown-computevm-{}" in host
 assert "DEPLOYMENT_TIMEOUT_SECONDS = 900" in host

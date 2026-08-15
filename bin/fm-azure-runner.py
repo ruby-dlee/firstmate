@@ -1673,11 +1673,16 @@ def budget_gate(env, limits, outstanding_reservations=0.0, parent_managed=False)
         # A young subscription has no cost training data and the forecast
         # endpoint fails with HTTP 424 until it trains. Commissioning-bounded
         # admission substitutes the readable actual as the forecast, mirroring
-        # the worker lifecycle's released commissioning seam; strict admission
-        # keeps failing closed.
-        if (
+        # the worker lifecycle's released commissioning seam. Strict admission
+        # accepts the same substitution only under the operator's explicit
+        # FM_AZURE_WORKER_ALLOW_UNTRAINED_FORECAST=1 confirmation (the one
+        # knob the lifecycle already honors), because validation shards run
+        # strict under a capacity parent on the same untrained subscription;
+        # any other unreadable cost state still refuses.
+        untrained = "failed with HTTP 424" in str(exc)
+        if untrained and (
             env.get("cost_admission_mode") == COMMISSIONING_COST_ADMISSION_MODE
-            and "failed with HTTP 424" in str(exc)
+            or os.environ.get("FM_AZURE_WORKER_ALLOW_UNTRAINED_FORECAST") == "1"
         ):
             forecast = actual
         else:

@@ -181,17 +181,12 @@ for absent in ("cryptsetup","luks","LEASE_SCHEMA","credential_lease_digest","cre
     assert absent not in host, absent
 assert 'protected.append({"name": "github_token", "value": read_github_token(state)})' in host
 assert "FM_AZURE_GITHUB_TOKEN_FILE" in host
-<<<<<<< HEAD
-assert '"auth_share", "value": os.environ.get("FM_AZURE_AUTH_SHARE", "fm-auth-home")' in host
-assert '"imageId": {"value": os.environ.get("FM_AZURE_VM_IMAGE_ID", "")}' in host
-=======
 assert '"auth_share", "value": auth_share_name()' in host
 assert 'FILE_DATA_PRIVILEGED_CONTRIBUTOR_ROLE = "69566ab7-960f-475b-8e7c-b3118f30c6bd"' in host
 assert "def delete_auth_share_role" in host
 assert host.index("delete_auth_share_role(env, state)", host.index("def delete_cell_storage_scope")) < host.index('delete_resource(env, state, state["resources"]["identity_id"], "identity")')
 assert "container and auth-share grants" in host
-assert '"bakedImageId": {"value": os.environ.get("FM_AZURE_BAKED_IMAGE_ID", "")}' in host
->>>>>>> 4db84b0 (fix(validation): grant the cell UAMI its auth-share file-data role in code)
+assert '"imageId": {"value": os.environ.get("FM_AZURE_VM_IMAGE_ID", "")}' in host
 for value in ("MemoryMax","MemorySwapMax=0","TasksMax","CPUQuota=700%","PrivateTmp=yes","ProtectSystem=strict","CapabilityBoundingSet=","FM_AZURE_VALIDATION_RUNTIME_PATH","axi status","/dev/disk/azure/scsi1/lun","/dev/disk/azure/data/by-lun/"):
     assert value in guest
 for value in ('MODE=${mode:-}','VM_RESOURCE_ID=${vm_resource_id:-}','INPUT_URL=${input_url:-}','GITHUB_TOKEN_VALUE=${github_token:-}','AUTH_SHARE=${auth_share:-fm-auth-home}','unset input_url output_url response github_token'):
@@ -427,8 +422,9 @@ assert m.immutable_identity({"id":"/schedule"},"ttl-schedule")=={"id":"/schedule
 uami=m.immutable_identity({"id":"/identity","properties":{"clientId":"client","principalId":"principal"}},"identity")
 assert uami=={"id":"/identity","etag":None,"client_id":"client","principal_id":"principal"}
 source=inspect.getsource(m.dispatch)
-assert 'value.get("phase") in ("queued", "starting")' in source
-assert 'admission.get("shape_id") != state["cell"]' in source
+assert 'state.get("phase") in ("queued", "starting")' in source
+cell_source=inspect.getsource(m.dispatch_cell)
+assert 'admission.get("shape_id") != state["cell"]' in cell_source
 PY2
   pass "immutable identity fallbacks and starting-phase recovery keep the exact recorded cell"
 }
@@ -776,6 +772,61 @@ PY
   pass "partial container/role cleanup resumes idempotently from its exact persisted plan"
 }
 
+multi_lane_queue_contract() {
+  local tmp home out rc
+  fm_test_tmproot_into tmp fm-azure-validation-lanes
+  home="$tmp/home"
+  mkdir -p "$home/state/azure-validation"
+  python3 - "$HOST" "$home/state/azure-validation" <<'PY2' || fail "multi-lane dispatch contract failed"
+import importlib.util,inspect,json,pathlib,sys
+spec=importlib.util.spec_from_file_location("validation",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+# Deterministic lane -> SKU spread across four distinct reviewed families.
+assert m.COORDINATOR_SKU_POOL==m.VALIDATION_SKUS and len(set(m.COORDINATOR_SKU_POOL))==4
+assert [m.lane_sku(i) for i in range(4)]==list(m.COORDINATOR_SKU_POOL)
+assert m.lane_sku(4)==m.COORDINATOR_SKU_POOL[0]
+# Lane assignment fills the lowest free index and refuses when saturated.
+assert m.next_free_lane(set(),4)==0
+assert m.next_free_lane({0,2},4)==1
+assert m.next_free_lane({0,1,2},4)==3
+try: m.next_free_lane({0,1,2,3},4)
+except m.ValidationError: pass
+else: raise AssertionError("saturated lanes still assigned")
+# Occupancy phases: queued/collected/closed cells never hold a lane.
+assert "queued" not in m.LANE_PHASES and "collected" not in m.LANE_PHASES and "closed" not in m.LANE_PHASES
+for phase in ("starting","running","needs-decision","result-published"):
+    assert phase in m.LANE_PHASES
+# FIFO dispatch: starting cells recover first, queued admit oldest-first up
+# to the lane cap, and an allocator-queued shape stops younger admissions.
+source=inspect.getsource(m.dispatch)
+assert '0 if item.get("phase") == "starting" else 1' in source
+assert 'len(occupied) >= env["lanes"]' in source
+assert "AZURE VALIDATION LANES FULL" in source
+assert source.index('if outcome != "started":') < source.index("started += 1")
+assert "AZURE VALIDATION DISPATCH started=" in source
+cell_source=inspect.getsource(m.dispatch_cell)
+assert "preferred = lane_sku(lane)" in cell_source
+assert 'next((item for item in candidates if item["sku"] == preferred), candidates[0])' in cell_source
+# Queue listing surfaces lanes: seed one running lane-0 cell and one queued.
+state_dir=pathlib.Path(sys.argv[2])
+def seed(cell,phase,lane,created):
+    value={"schema":m.SCHEMA,"cell":cell,"phase":phase,"created_at":created,"attempt":1,
+           "request":{"task":"task-"+cell,"repository":{"head":"a"*40},"resource_class":"validation-heavy"}}
+    if lane is not None: value["lane"]=lane
+    (state_dir/(cell+".json")).write_text(json.dumps(value))
+seed("azv-aaaaaaaaaaaa","running",0,"2026-08-15T00:00:00Z")
+seed("azv-bbbbbbbbbbbb","queued",None,"2026-08-15T00:00:01Z")
+PY2
+  out=$(validation "$home" queue) || fail "multi-lane queue read failed: $out"
+  assert_contains "$out" "AZURE VALIDATION LANES used=1/4 queued=1" "queue did not summarize lanes"
+  assert_contains "$out" "cell=azv-aaaaaaaaaaaa phase=running lane=0" "queue did not report the running lane"
+  assert_contains "$out" "cell=azv-bbbbbbbbbbbb phase=queued lane=-" "queue did not report the queued cell"
+  rc=0
+  out=$(FM_AZURE_VALIDATION_LANES=9 validation "$home" queue 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "lane cap above the bounded maximum was accepted"
+  assert_contains "$out" "FM_AZURE_VALIDATION_LANES must be between 1 and 8" "lane bound refusal was not explicit"
+  pass "four FIFO lanes admit queued generations oldest-first with deterministic family spread and a lane-aware queue view"
+}
+
 operator_documentation_contract() {
   for text in \
     'queue depth' \
@@ -805,4 +856,5 @@ identity_and_recovery_contract
 trusted_manifest_verifier_contract
 shard_runner_integration_contract
 cleanup_recovery_contract
+multi_lane_queue_contract
 operator_documentation_contract

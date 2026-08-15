@@ -2005,8 +2005,13 @@ def commissioning_cost_gate(env, state, limits):
     exact_commissioning_budget(env)
     inventory_reservation_ids = commissioning_inventory_gate(env, state)
     rate = retail_rate(env, limits["sku"])
-    first_hour = itemized_cost_bound(rate, 1, limits)
-    first_day = itemized_cost_bound(rate, MAX_BILLABLE_LIFETIME_HOURS, limits)
+    # A shard under a validation capacity parent omits the shared foundation
+    # share the parent already reserved, exactly as the strict budget gate
+    # does; without this the child's bound exceeds its pre-reserved shape
+    # cushion and idempotent constituent re-admission can never succeed.
+    parent_managed = bool(state.get("request", {}).get("capacity_parent"))
+    first_hour = itemized_cost_bound(rate, 1, limits, parent_managed=parent_managed)
+    first_day = itemized_cost_bound(rate, MAX_BILLABLE_LIFETIME_HOURS, limits, parent_managed=parent_managed)
     if not 0 < first_day["total"] < float("inf"):
         raise RunnerError("commissioning-bounded full 24-hour itemized maximum is not finite and positive")
     reservations = list_management_reservations(env)

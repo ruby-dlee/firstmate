@@ -1,0 +1,195 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "namingPrefix": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 12
+    },
+    "imageVersion": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "eastus",
+      "allowedValues": ["eastus"]
+    },
+    "builderIdentityId": {
+      "type": "string"
+    },
+    "ubuntuOffer": {
+      "type": "string",
+      "defaultValue": "ubuntu-24_04-lts"
+    },
+    "ubuntuSku": {
+      "type": "string",
+      "defaultValue": "server"
+    },
+    "ubuntuExactVersion": {
+      "type": "string",
+      "metadata": {
+        "description": "Exact marketplace image version; latest is refused by the wrapper."
+      }
+    },
+    "codexCliUrl": {
+      "type": "string"
+    },
+    "codexCliSha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "claudeCliUrl": {
+      "type": "string"
+    },
+    "claudeCliSha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "shellcheckUrl": {
+      "type": "string",
+      "defaultValue": "https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz"
+    },
+    "shellcheckSha256": {
+      "type": "string",
+      "defaultValue": "6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "uvUrl": {
+      "type": "string",
+      "defaultValue": "https://github.com/astral-sh/uv/releases/download/0.8.5/uv-x86_64-unknown-linux-gnu.tar.gz"
+    },
+    "uvSha256": {
+      "type": "string",
+      "defaultValue": "440c4215b171e64061d65d16a23753dd25c29a7f7b1b0446c9e9aed0fa372f27",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "runtimeBundleUrl": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional HTTPS URL of a runtime bundle (no-mistakes/provider/gh/gh-axi) staged at /opt/fm-azure/runtime-bundle.tar.gz; empty skips."
+      }
+    },
+    "runtimeBundleSha256": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Required when runtimeBundleUrl is set."
+      }
+    },
+    "commonTags": {
+      "type": "object"
+    }
+  },
+  "variables": {
+    "templateName": "[format('it-{0}-cell-{1}', parameters('namingPrefix'), parameters('imageVersion'))]",
+    "imageName": "[format('img-{0}-cell-{1}', parameters('namingPrefix'), parameters('imageVersion'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.VirtualMachineImages/imageTemplates",
+      "apiVersion": "2024-02-01",
+      "name": "[variables('templateName')]",
+      "location": "[parameters('location')]",
+      "tags": "[union(parameters('commonTags'), createObject('firstmate-role', 'cell-image', 'image-version', parameters('imageVersion')))]",
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[parameters('builderIdentityId')]": {}
+        }
+      },
+      "properties": {
+        "buildTimeoutInMinutes": 120,
+        "source": {
+          "type": "PlatformImage",
+          "publisher": "Canonical",
+          "offer": "[parameters('ubuntuOffer')]",
+          "sku": "[parameters('ubuntuSku')]",
+          "version": "[parameters('ubuntuExactVersion')]"
+        },
+        "customize": [
+          {
+            "type": "Shell",
+            "name": "install-cell-and-runner-closure",
+            "inline": [
+              "set -eu",
+              "export DEBIAN_FRONTEND=noninteractive",
+              "apt-get update -qq",
+              "apt-get install -y -qq ca-certificates curl git python3 python3-venv util-linux jq systemd tar passwd e2fsprogs xz-utils >/dev/null",
+              "install -d -m 0755 /opt/fm-azure /opt/fm-azure/cache /opt/fm-azure/bin",
+              "[format('curl --fail --silent --show-error --location --output /tmp/shellcheck.tar.xz {0}', parameters('shellcheckUrl'))]",
+              "[format('printf ''%s  /tmp/shellcheck.tar.xz\\n'' {0} | sha256sum --check --quiet', parameters('shellcheckSha256'))]",
+              "tar -xJf /tmp/shellcheck.tar.xz -C /tmp",
+              "install -m 0755 /tmp/shellcheck-*/shellcheck /opt/fm-azure/bin/shellcheck",
+              "cp /tmp/shellcheck.tar.xz /opt/fm-azure/cache/shellcheck.tar.xz",
+              "[format('curl --fail --silent --show-error --location --output /tmp/uv.tar.gz {0}', parameters('uvUrl'))]",
+              "[format('printf ''%s  /tmp/uv.tar.gz\\n'' {0} | sha256sum --check --quiet', parameters('uvSha256'))]",
+              "tar -xzf /tmp/uv.tar.gz -C /tmp",
+              "install -m 0755 /tmp/uv-*/uv /opt/fm-azure/bin/uv",
+              "cp /tmp/uv.tar.gz /opt/fm-azure/cache/uv.tar.gz"
+            ]
+          },
+          {
+            "type": "Shell",
+            "name": "install-agent-clis",
+            "inline": [
+              "set -eu",
+              "[format('curl --fail --silent --show-error --location --output /tmp/codex {0}', parameters('codexCliUrl'))]",
+              "[format('printf ''%s  /tmp/codex\\n'' {0} | sha256sum --check --quiet', parameters('codexCliSha256'))]",
+              "install -m 0755 /tmp/codex /usr/local/bin/codex",
+              "[format('curl --fail --silent --show-error --location --output /tmp/claude {0}', parameters('claudeCliUrl'))]",
+              "[format('printf ''%s  /tmp/claude\\n'' {0} | sha256sum --check --quiet', parameters('claudeCliSha256'))]",
+              "install -m 0755 /tmp/claude /usr/local/bin/claude",
+              "/usr/local/bin/codex --version",
+              "/usr/local/bin/claude --version"
+            ]
+          },
+          {
+            "type": "Shell",
+            "name": "stage-runtime-bundle-and-bootstrap-marker",
+            "inline": [
+              "set -eu",
+              "[format('RUNTIME_URL={0}', if(empty(parameters('runtimeBundleUrl')), '\"\"', parameters('runtimeBundleUrl')))]",
+              "[format('RUNTIME_SHA={0}', if(empty(parameters('runtimeBundleSha256')), '\"\"', parameters('runtimeBundleSha256')))]",
+              "if [ -n \"$RUNTIME_URL\" ]; then curl --fail --silent --show-error --location --output /opt/fm-azure/runtime-bundle.tar.gz \"$RUNTIME_URL\"; printf '%s  /opt/fm-azure/runtime-bundle.tar.gz\\n' \"$RUNTIME_SHA\" | sha256sum --check --quiet; fi",
+              "[format('printf ''schema=fm.azure-baked-image/v1\\nimage_version=%s\\nbaked_at=%s\\n'' {0} \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > /opt/fm-azure/baked', parameters('imageVersion'))]",
+              "chmod 0644 /opt/fm-azure/baked",
+              "apt-get clean",
+              "rm -rf /tmp/shellcheck* /tmp/uv* /tmp/codex /tmp/claude"
+            ]
+          }
+        ],
+        "distribute": [
+          {
+            "type": "ManagedImage",
+            "imageId": "[resourceId('Microsoft.Compute/images', variables('imageName'))]",
+            "location": "[parameters('location')]",
+            "runOutputName": "[variables('imageName')]",
+            "artifactTags": "[union(parameters('commonTags'), createObject('firstmate-role', 'cell-image', 'codex-cli-sha256', parameters('codexCliSha256'), 'claude-cli-sha256', parameters('claudeCliSha256')))]"
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "imageTemplateName": {
+      "type": "string",
+      "value": "[variables('templateName')]"
+    },
+    "managedImageName": {
+      "type": "string",
+      "value": "[variables('imageName')]"
+    },
+    "managedImageId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/images', variables('imageName'))]"
+    }
+  }
+}

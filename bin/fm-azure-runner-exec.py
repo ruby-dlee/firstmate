@@ -202,14 +202,21 @@ def main():
     }
     started = time.monotonic()
     try:
+        def enter_repo_as_runner():
+            # The unit's bounding set has no CAP_DAC_OVERRIDE, so root
+            # cannot enter the 0700 runner-owned repository; the child
+            # drops privileges first and then changes directory as the
+            # runner user, instead of Popen's early root chdir.
+            drop_privileges(uid, gid, limits["pid_max"], limits["disk_bytes"])
+            os.chdir(str(repo))
+
         process = subprocess.Popen(
             argv,
-            cwd=str(repo),
             env=child_env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            preexec_fn=lambda: drop_privileges(uid, gid, limits["pid_max"], limits["disk_bytes"]),
+            preexec_fn=enter_repo_as_runner,
             close_fds=True,
         )
         selector = selectors.DefaultSelector()

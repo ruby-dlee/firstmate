@@ -118,6 +118,10 @@ assert guest.index("cd /work/repo") < guest.index("uv venv --python")
 executor_text=open("bin/fm-azure-runner-exec.py").read()
 assert "output directory is not a fresh root-owned staging area" in executor_text
 assert 'open(stdout_path, "xb"' in executor_text
+assert "def enter_repo_as_runner():" in executor_text
+assert "preexec_fn=enter_repo_as_runner," in executor_text
+assert "cwd=str(repo)," not in executor_text
+assert executor_text.index("drop_privileges(uid, gid,") < executor_text.index("os.chdir(str(repo))")
 assert "$#\" -eq 10" not in guest
 run_at=guest.index("systemd-run --quiet")
 input_token_at=guest.index("metadata/identity/oauth2/token")

@@ -121,6 +121,10 @@ chown fmrunner:fmrunner /work
 
 runuser -u fmrunner -- git -C /work/repo init -q
 runuser -u fmrunner -- git -C /work/repo remote add origin "$REMOTE"
+# Root's read-only identity verification would refuse the runner-owned
+# repository as dubious (CVE-2022-24765); scope the exception through the
+# environment exactly as the validation cell guest does.
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/work/repo
 if [ "$SOURCE_MODE" = private-parent-bundle ]; then
   [ "$INPUT_BLOB" = "$(read_request repository.input_blob)" ] || { echo "guest bootstrap: private snapshot blob mismatch" >&2; exit 125; }
   SNAPSHOT=$BASE/snapshot.bundle

@@ -112,6 +112,8 @@ for value in ("positional parameters are forbidden","REQUEST_B64=${request_b64:-
 assert 'install -m 0400 -o fmrunner -g fmrunner "$SNAPSHOT" /work/snapshot.bundle' in guest
 assert "git -C /work/repo fetch /work/snapshot.bundle" in guest
 assert 'fetch "$SNAPSHOT"' not in guest
+assert "GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/work/repo" in guest
+assert guest.index("runuser -u fmrunner -- git -C /work/repo init") < guest.index("GIT_CONFIG_KEY_0=safe.directory")
 assert "$#\" -eq 10" not in guest
 run_at=guest.index("systemd-run --quiet")
 input_token_at=guest.index("metadata/identity/oauth2/token")

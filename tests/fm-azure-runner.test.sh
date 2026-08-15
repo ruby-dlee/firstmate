@@ -153,6 +153,7 @@ assert "residual_ids - expected_ids - {reservation_resource}" in host
 assert host.index("reservation_resource = reservation_id") < host.index("unknown = sorted")
 assert "cost reservation resource proven absent; cleanup verification recorded on absence" in host
 assert "cost reservation absence is ambiguous" in host
+assert host.index('if entry["cleanup-verified-at"] != "none":') < host.index("tags[\"cleanup-verified-at\"] = iso_utc()")
 assert host.count('identity["etag"] = identity["etag"] or identity["unique_id"]') == 1
 assert 'label not in ("run-command", "ttl-schedule") and not identity["etag"]' in host
 assert 'if resource.get("etag"):' in host

@@ -2411,9 +2411,12 @@ def mark_management_reservation_cleanup_verified(env, state):
             entry is None
             or entry["fence-digest"] != expected_fence
             or entry["cost-admission-mode"] != expected_mode
-            or entry["cleanup-verified-at"] != "none"
         ):
             raise RunnerError("cost reservation cleanup binding is not exact")
+        if entry["cleanup-verified-at"] != "none":
+            # A repeated cleanup finds its own earlier verification stamp;
+            # the exact fence and mode above prove it is this invocation's.
+            return
         require_zero_effective_rbac(env, entry["principal_id"], "cleanup cost reservation principal")
         tags = dict(identity.get("tags") or {})
         tags["cleanup-verified-at"] = iso_utc()

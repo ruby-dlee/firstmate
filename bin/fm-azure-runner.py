@@ -3156,7 +3156,18 @@ def verify_live_resource_identity(env, state, kind, resource_id, identity_key=No
     recorded = state["resources"].get("identities", {}).get(identity_key)
     live = immutable_identity(resource, kind)
     if recorded is None:
-        raise RunnerError("live {} immutable identity changed; cleanup retained ambiguous state".format(kind))
+        if kind == "run-command":
+            # The resume adopt lane ("existing Managed Run Command adopted
+            # without resubmission") can own a run command whose creating
+            # pass was interrupted between creation and identity recording;
+            # its ownership tags were verified above, and its exact id plus
+            # those tags carry its whole identity, so adopt-and-log instead
+            # of refusing cleanup forever (generation 044 ground truth).
+            state["resources"].setdefault("identities", {})[identity_key] = live
+            save_state(env, state)
+            recorded = live
+        else:
+            raise RunnerError("live {} immutable identity changed; cleanup retained ambiguous state".format(kind))
     if kind == "run-command":
         # Execution mutates a run command's etag and provisioning state, so
         # the exact resource id plus the verified ownership tags carry its

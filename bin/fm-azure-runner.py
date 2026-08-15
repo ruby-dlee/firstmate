@@ -2720,6 +2720,10 @@ def immutable_identity(resource, label):
         identity["resource_guid"] = properties.get("resourceGuid") or resource.get("resourceGuid")
     elif label == "disk":
         identity["unique_id"] = properties.get("uniqueId") or resource.get("uniqueId")
+        # Managed-disk GETs return no body etag at any current API version;
+        # the immutable uniqueId substitutes, matching the validation
+        # controller's disk identity contract.
+        identity["etag"] = identity["etag"] or identity["unique_id"]
     elif label == "run-command":
         identity["provisioning_state"] = properties.get("provisioningState")
     elif label == "ttl-schedule":

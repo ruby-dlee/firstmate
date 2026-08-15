@@ -132,6 +132,7 @@ assert "residual_ids - expected_ids - {reservation_resource}" in host
 assert host.index("reservation_resource = reservation_id") < host.index("unknown = sorted")
 assert "cost reservation resource proven absent; cleanup verification recorded on absence" in host
 assert "cost reservation absence is ambiguous" in host
+assert host.count('identity["etag"] = identity["etag"] or identity["unique_id"]') == 1
 assert '"ttl_schedule_name": "shutdown-computevm-{}".format(vm_name)' in host
 assert "schedules/shutdown-computevm-{}" in host
 assert "DEPLOYMENT_TIMEOUT_SECONDS = 900" in host

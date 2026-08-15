@@ -4,18 +4,26 @@
 set -euo pipefail
 umask 077
 
-[ "$#" -eq 10 ] || { echo "guest bootstrap: expected ten bound parameters" >&2; exit 125; }
-REQUEST_B64=$1
-VM_RESOURCE_ID=$2
-VM_INSTANCE_ID=$3
-GUEST_DIGEST=$4
-STORAGE_ACCOUNT=$5
-CONTAINER=$6
-OUTPUT_BLOB=$7
-INPUT_BLOB=$8
-IDENTITY_CLIENT_ID=$9
-EXECUTOR_B64=${10}
-set --
+# Managed Run Command delivers parameters as environment variables named
+# after each declared parameter, never as positional arguments; the
+# validation cell guest proved this contract live.
+[ "$#" -eq 0 ] || { echo "guest bootstrap: positional parameters are forbidden" >&2; exit 125; }
+REQUEST_B64=${request_b64:-}
+VM_RESOURCE_ID=${vm_resource_id:-}
+VM_INSTANCE_ID=${vm_instance_id:-}
+GUEST_DIGEST=${guest_digest:-}
+STORAGE_ACCOUNT=${storage_account:-}
+CONTAINER=${container:-}
+OUTPUT_BLOB=${output_blob:-}
+INPUT_BLOB=${input_blob:-}
+IDENTITY_CLIENT_ID=${identity_client_id:-}
+EXECUTOR_B64=${executor_b64:-}
+unset request_b64 vm_resource_id vm_instance_id guest_digest storage_account
+unset container output_blob input_blob identity_client_id executor_b64
+for bound in "$REQUEST_B64" "$VM_RESOURCE_ID" "$VM_INSTANCE_ID" "$GUEST_DIGEST" "$STORAGE_ACCOUNT" "$CONTAINER" "$OUTPUT_BLOB" "$INPUT_BLOB" "$IDENTITY_CLIENT_ID" "$EXECUTOR_B64"; do
+  [ -n "$bound" ] || { echo "guest bootstrap: expected ten bound parameters" >&2; exit 125; }
+done
+unset bound
 case "$GUEST_DIGEST" in sha256:[0-9a-f][0-9a-f]*) ;; *) echo "guest bootstrap: bad protocol digest" >&2; exit 125 ;; esac
 case "$STORAGE_ACCOUNT" in [a-z0-9][a-z0-9]*) ;; *) echo "guest bootstrap: bad storage name" >&2; exit 125 ;; esac
 [ "$CONTAINER" = validation-shards ] || { echo "guest bootstrap: bad result container" >&2; exit 125; }

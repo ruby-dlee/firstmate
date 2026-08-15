@@ -107,6 +107,9 @@ assert "adminPassword" not in json.dumps(vm["properties"]["osProfile"])
 assert "customdata" not in json.dumps(template).lower()
 for value in ("PrivateNetwork=yes","RestrictAddressFamilies=AF_UNIX","IPAddressDeny=any","CapabilityBoundingSet=CAP_SETUID CAP_SETGID","AmbientCapabilities=","NoNewPrivileges=yes"):
     assert value in guest
+for value in ("positional parameters are forbidden","REQUEST_B64=${request_b64:-}","EXECUTOR_B64=${executor_b64:-}","unset request_b64 vm_resource_id"):
+    assert value in guest
+assert "$#\" -eq 10" not in guest
 run_at=guest.index("systemd-run --quiet")
 input_token_at=guest.index("metadata/identity/oauth2/token")
 output_token_at=guest.rindex("metadata/identity/oauth2/token")

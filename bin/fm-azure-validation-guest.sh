@@ -495,10 +495,13 @@ runuser -u fmvalidate -- git -C "$REPO" config user.email "dongkeun@rubydata.ai"
 # home, where repo-local config does not reach (generation 041 ground truth:
 # "could not read Username for 'https://github.com': terminal prompts
 # disabled"). User-level config covers every git context the cell user owns.
-runuser -u fmvalidate -- env HOME="$HOME_DIR" git config --global credential.helper "$GIT_HELPER"
-runuser -u fmvalidate -- env HOME="$HOME_DIR" git config --global credential.useHttpPath true
-runuser -u fmvalidate -- env HOME="$HOME_DIR" git config --global user.name "ruby-dlee"
-runuser -u fmvalidate -- env HOME="$HOME_DIR" git config --global user.email "dongkeun@rubydata.ai"
+# -C keeps git's working directory inside the repo: without it git resolves
+# the run-command handler's root-only download directory as cwd and fatals
+# with EACCES before touching the global config (generation 042 ground truth).
+runuser -u fmvalidate -- env HOME="$HOME_DIR" git -C "$REPO" config --global credential.helper "$GIT_HELPER"
+runuser -u fmvalidate -- env HOME="$HOME_DIR" git -C "$REPO" config --global credential.useHttpPath true
+runuser -u fmvalidate -- env HOME="$HOME_DIR" git -C "$REPO" config --global user.name "ruby-dlee"
+runuser -u fmvalidate -- env HOME="$HOME_DIR" git -C "$REPO" config --global user.email "dongkeun@rubydata.ai"
 
 IDENTITY=$STATE/identity.json
 CURRENT_HEAD=$(git -C "$REPO" rev-parse HEAD)

@@ -3125,7 +3125,13 @@ def verify_live_resource_identity(env, state, kind, resource_id, identity_key=No
     live = immutable_identity(resource, kind)
     if recorded is None:
         raise RunnerError("live {} immutable identity changed; cleanup retained ambiguous state".format(kind))
-    if stable_only:
+    if kind == "run-command":
+        # Execution mutates a run command's etag and provisioning state, so
+        # the exact resource id plus the verified ownership tags carry its
+        # whole identity.
+        if live["id"] != recorded["id"]:
+            raise RunnerError("live {} immutable identity changed; cleanup retained ambiguous state".format(kind))
+    elif stable_only:
         # Deleting the VM mutates every dependent resource's etag, so the
         # absence fence compares the stable immutable field and exact id
         # instead of the full creation-time identity.

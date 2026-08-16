@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ import sys
 
 
 MAX_CAPTURE = 200_000
+MAX_MANIFEST_JSON_BYTES = 8 * 1024 * 1024
 MAX_FILES = 64
 MAX_FILE_BYTES = 12 * 1024
 MAX_TOTAL_BYTES = 24 * 1024
@@ -58,8 +60,12 @@ def safe_manifest_parent(root: Path, relative: str) -> Path:
 
 def materialize_manifest(root: Path, encoded: str) -> None:
     try:
-        files = json.loads(base64.b64decode(encoded, validate=True))
-    except (ValueError, json.JSONDecodeError) as exc:
+        compressed = base64.b64decode(encoded, validate=True)
+        raw = gzip.decompress(compressed)
+        if len(raw) > MAX_MANIFEST_JSON_BYTES:
+            raise ValueError("evidence manifest exceeds its decoded byte bound")
+        files = json.loads(raw)
+    except (ValueError, json.JSONDecodeError, OSError, EOFError) as exc:
         raise ValueError("evidence manifest is malformed") from exc
     if not isinstance(files, dict) or not files or len(files) > MAX_FILES:
         raise ValueError("evidence manifest item count is invalid")

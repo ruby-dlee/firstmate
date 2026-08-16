@@ -10,6 +10,7 @@ per accepted reproduction: one fresh tool attempt and one fresh verifier attempt
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import importlib.util
 import json
@@ -82,11 +83,14 @@ REMOTE_EVIDENCE_PROGRAM = REPLAY.read_text(encoding="utf-8")
 
 
 def encoded_manifest(files: dict[str, bytes]) -> str:
+    # The manifest rides the runner request, which is bounded at 48KiB for
+    # its control-plane parameter transport; deterministic gzip (mtime=0)
+    # keeps realistic textual evidence inside that envelope.
     value = {
         relative: base64.b64encode(body).decode("ascii")
         for relative, body in sorted(files.items())
     }
-    return base64.b64encode(canonical(value)).decode("ascii")
+    return base64.b64encode(gzip.compress(canonical(value), mtime=0)).decode("ascii")
 
 
 def evidence_command(

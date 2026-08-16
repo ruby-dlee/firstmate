@@ -461,7 +461,8 @@ body=b"#!/usr/bin/env bash\nprintf 'allowed-positive-control\\n'\nprintf 'receip
 value={".crosscheck/reproductions/pass.sh":base64.b64encode(body).decode(),".crosscheck/reproductions/receipt.txt":base64.b64encode(b"placeholder").decode()}
 # The helper owns the receipt, so do not pre-stage its output path.
 del value[".crosscheck/reproductions/receipt.txt"]
-print(base64.b64encode(json.dumps(value,sort_keys=True,separators=(",",":")).encode()).decode())
+import gzip
+print(base64.b64encode(gzip.compress(json.dumps(value,sort_keys=True,separators=(",",":")).encode(),mtime=0)).decode())
 PY
 )
   (
@@ -528,7 +529,8 @@ SH
   patch_evidence=$(python3 - "$mutation_tmp/proof.patch" <<'PY'
 import base64,json,sys
 body=base64.b64encode(open(sys.argv[1],"rb").read()).decode()
-print(base64.b64encode(json.dumps({".crosscheck/mutations/proof.patch":body},sort_keys=True,separators=(",",":")).encode()).decode())
+import gzip
+print(base64.b64encode(gzip.compress(json.dumps({".crosscheck/mutations/proof.patch":body},sort_keys=True,separators=(",",":")).encode(),mtime=0)).decode())
 PY
 )
   (

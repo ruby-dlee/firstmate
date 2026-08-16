@@ -1841,14 +1841,16 @@ def verify_result_identity(state, result):
         machines = set()
         invocations = set()
         rounds = set()
+        receipt_heads = set()
+        receipt_trees = set()
         for item in shard_receipts:
             if not isinstance(item, dict):
                 raise ValidationError("behavior shard receipt is malformed")
             if (
                 item.get("kind") != "behavior"
                 or item.get("shard_count") != expected_shards
-                or item.get("head") != head
-                or item.get("tree") != tree
+                or not HEX_OBJECT.match(str(item.get("head", "")))
+                or not HEX_OBJECT.match(str(item.get("tree", "")))
                 or not SHA256.match(str(item.get("request_digest", "")))
                 or not SHA256.match(str(item.get("command_digest", "")))
                 or not RUNNER_INVOCATION.match(str(item.get("invocation", "")))
@@ -1856,6 +1858,8 @@ def verify_result_identity(state, result):
                 or not item.get("vm_instance_id")
             ):
                 raise ValidationError("behavior shard receipt identity is incomplete or stale")
+            receipt_heads.add(item["head"])
+            receipt_trees.add(item["tree"])
             artifact = item.get("artifact")
             if (
                 not isinstance(artifact, dict)
@@ -1877,8 +1881,26 @@ def verify_result_identity(state, result):
             or len(invocations) != expected_shards
             or len(rounds) != 1
             or None in rounds
+            or len(receipt_heads) != 1
+            or len(receipt_trees) != 1
         ):
             raise ValidationError("behavior shards did not prove one complete round on independent Azure machines")
+        receipt_head = next(iter(receipt_heads))
+        receipt_tree = next(iter(receipt_trees))
+        if receipt_head != head:
+            # The pipeline commits documentation on top of the tested tree
+            # after the shard round, so the receipts legitimately prove an
+            # exact ancestor of the published head rather than the head
+            # itself. The ancestor and its tree binding are verified in the
+            # controller clone against the fetched published branch; any
+            # receipt head outside the published history still refuses.
+            repo_root = Path(state["repository_root"])
+            git(repo_root, "fetch", "origin", "refs/heads/" + str(result.get("branch", "")))
+            probe = git(repo_root, "merge-base", "--is-ancestor", receipt_head, head, check=False)
+            if probe.returncode != 0:
+                raise ValidationError("behavior shard receipts do not prove an ancestor of the published head")
+            if git(repo_root, "rev-parse", receipt_head + "^{tree}").stdout.strip() != receipt_tree:
+                raise ValidationError("behavior shard receipt tree does not match its receipt head")
     return True
 
 

@@ -164,6 +164,11 @@ case "$HARNESS" in
     id fmccmodel >/dev/null 2>&1 \
       || useradd --system --home-dir "$HOME_DIR" --shell /usr/sbin/nologin fmccmodel
     chown -R fmccmodel:fmccmodel "$ACCOUNT" "$HOME_DIR" "$TMPDIR" "$XDG_CACHE_HOME"
+    # The compartment base stays root-owned, but the unprivileged model
+    # process must traverse it to reach its handed-over leaves (the same
+    # root-only-ancestor traversal failure the validation cells hit live);
+    # execute-only keeps the root-custody files unlistable and unreadable.
+    chmod 0711 "$BASE"
     runuser -u fmccmodel -- env \
       HOME="$HOME_DIR" TMPDIR="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
       CLAUDE_CONFIG_DIR="$ACCOUNT" CLAUDE_SECURESTORAGE_CONFIG_DIR="$ACCOUNT" \

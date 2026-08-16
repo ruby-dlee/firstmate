@@ -211,9 +211,16 @@ def dispatch_once(
     state, _arguments, env = prepare_exact_snapshot(
         runner, request, suffix, command, wall_seconds
     )
+    # The runner accepts the cost-admission confirmation only as the
+    # commissioning double-confirmation; a strict-mode dispatch must omit it.
+    admission_mode = state["request"].get("cost_admission_mode")
     exit_code = runner.dispatch_prepared(
         env, state, env["subscription"],
-        confirm_cost_admission_mode=state["request"].get("cost_admission_mode"),
+        confirm_cost_admission_mode=(
+            admission_mode
+            if admission_mode == runner.COMMISSIONING_COST_ADMISSION_MODE
+            else None
+        ),
     )
     if state.get("phase") != "complete":
         raise BridgeError("Azure runner did not prove complete exact cleanup")

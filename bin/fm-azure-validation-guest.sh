@@ -766,6 +766,25 @@ NEW_BINDING=$(python3 "$LEASE_BINDING_HELPER" "$CREDENTIAL_MOUNT" "$PROVIDER_PAT
 tmp=$IDENTITY.tmp
 jq --arg binding "$NEW_BINDING" '.credential_content_binding=$binding' "$IDENTITY" >"$tmp"
 mv "$tmp" "$IDENTITY"
+# The pipeline daemon owns the branch and advances it past this checkout
+# (document commits, CI-fix commits, monitor rebases are committed and
+# pushed from the daemon's own workspace), so the checkout HEAD is not
+# the pipeline's final state - generation 050 ground truth: the document
+# step's pushed history commit left remote_head one commit ahead of
+# current_head and the collect head-freshness invariant refused an
+# otherwise checks-passed result. Fast-forward the checkout to the pushed
+# branch before capturing heads: only a descendant of the local HEAD is
+# accepted, so a foreign or rewritten remote still captures mismatched
+# heads and fails collection exactly as before.
+set +e
+runuser -u fmvalidate -- git -C "$REPO" fetch --quiet origin "refs/heads/$BRANCH" 2>>"$RUN_LOG"
+if [ $? -eq 0 ]; then
+  FETCHED=$(git -C "$REPO" rev-parse FETCH_HEAD 2>/dev/null)
+  if [ -n "$FETCHED" ] && git -C "$REPO" merge-base --is-ancestor HEAD "$FETCHED" 2>/dev/null; then
+    runuser -u fmvalidate -- git -C "$REPO" merge --ff-only --quiet "$FETCHED" >>"$RUN_LOG" 2>&1
+  fi
+fi
+set -e
 CURRENT_HEAD=$(git -C "$REPO" rev-parse HEAD)
 CURRENT_TREE=$(git -C "$REPO" rev-parse 'HEAD^{tree}')
 REMOTE_HEAD=$(git -C "$REPO" ls-remote --heads origin "refs/heads/$BRANCH" | awk 'NR==1 {print $1}')

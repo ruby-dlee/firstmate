@@ -21,6 +21,10 @@ SUB=11111111-1111-4111-8111-111111111111
 make_spawn_fakebin() {
   local dir=$1 fakebin
   fakebin=$(fm_fakebin "$dir")
+  # The herdr adapter's safe-ancestry check refuses any group-writable
+  # non-root directory or binary on the resolved path (a umask 002 host
+  # would otherwise create 775 fixtures and unpin the fake).
+  chmod 755 "$dir" "$fakebin"
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -120,7 +124,10 @@ case "$cmd $sub" in
     jq_state --arg t "$tab_target" '.tabs |= [.[]|select(.tab_id != $t)]' | save
     ;;
   "agent start")
-    n=$(jq_state -r '.next'); paneid="agent:p$n"
+    # Real herdr pane ids carry the workspace prefix (w1:p4); the recorded
+    # endpoint target session:wsid:pane depends on that exact shape for its
+    # later absence proof.
+    n=$(jq_state -r '.next'); paneid="${tab%%:*}:p$n"
     jq_state --arg t "$tab" --arg paneid "$paneid" \
       '(.tabs[] | select(.tab_id == $t) | .pane_id) = $paneid
        | .next = (.next + 1)' | save
@@ -134,7 +141,7 @@ case "$cmd $sub" in
 esac
 exit 0
 SH
-  chmod +x "$fakebin/herdr"
+  chmod 755 "$fakebin/herdr"
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -313,6 +320,7 @@ make_cloud_case() {
   worktree="$case_dir/worktree"
   mkdir -p "$home/data" "$home/projects" "$home/state" "$home/config" "$home/treehouse-pools" \
     "$case_dir/codex-home" "$case_dir/pi-agent-home"
+  chmod 755 "$case_dir"
   printf '%s\n' codex > "$home/config/crew-harness"
   printf '%s\n' manual > "$home/config/backlog-backend"
   fm_git_init_commit "$project"

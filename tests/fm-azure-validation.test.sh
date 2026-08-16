@@ -342,7 +342,7 @@ PY
   [ "$rc" -ne 0 ] || fail "submit accepted broad GitHub authority"
   assert_contains "$out" "must declare only" "broad GitHub authority refusal was not explicit"
   # The fine-grained UI's successor pair for checks:read is accepted as an
-  # equally minimal declaration; validate_credential_lease alone proves it
+  # equally minimal declaration; load_credential_lease alone proves it
   # (submit would next require the live disk).
   make_lease "$tmp/lease.json" task-one generation-one "fixture/repository"
   python3 - "$tmp/lease.json" "$ROOT/bin/fm-azure-validation.py" <<'PY'
@@ -354,7 +354,7 @@ spec=importlib.util.spec_from_file_location("v", sys.argv[2])
 m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 import os
 os.chmod(p, 0o600)
-m.validate_credential_lease(p, "task-one", "generation-one")
+m.load_credential_lease(p, "task-one", "generation-one", "fixture/repository")
 print("successor authority pair accepted")
 PY
   # A modified file whose stale manifest digest remains otherwise structurally
@@ -464,7 +464,7 @@ PY
 
 retail_price_transport_contract() {
   python3 - "$HOST" <<'PY' || fail "validation retail-price transport contract failed"
-import importlib.util,io,json,sys
+import importlib.util,io,json,pathlib,sys,tempfile
 spec=importlib.util.spec_from_file_location("validation",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 payload={"Items":[{"productName":"Virtual Machines Dasv6 Series","meterName":"D8as v6","unitOfMeasure":"1 Hour","retailPrice":0.4}]}
 class Reply(io.BytesIO):
@@ -475,7 +475,8 @@ def urlopen(request,timeout):
  seen.append((request.full_url,request.headers,timeout)); return Reply(json.dumps(payload).encode())
 m.urllib.request.urlopen=urlopen
 m.az_command=lambda *_args,**_kwargs: (_ for _ in ()).throw(AssertionError("Azure CLI must not proxy the public retail API"))
-assert m.retail_rate({},"Standard_D8as_v6")==0.4
+state_dir=pathlib.Path(tempfile.mkdtemp())
+assert m.retail_rate({"state_dir":state_dir},"Standard_D8as_v6")==0.4
 assert seen[0][2]==20 and seen[0][1]["User-agent"]=="firstmate-azure-validation/1"
 PY
   pass "validation reads the public retail API directly with a bounded identified request"

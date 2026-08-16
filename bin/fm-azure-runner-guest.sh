@@ -131,9 +131,12 @@ install -d -m 0700 -o fmrunner -g fmrunner /work/home /work/repo /work/home/.fm-
 # Same-device temp root for the repository command: the executor unit's
 # PrivateTmp puts /tmp on its own tmpfs, which breaks tests that hard-link
 # between their temp root and the work mount (generation 051 ground
-# truth). Created here because the unconfined bootstrap can always
-# guarantee it; the sandboxed executor only points TMPDIR at it.
-install -d -m 1777 -o fmrunner -g fmrunner /work/tmp
+# truth). Owned by the runner user and closed to everyone else: a
+# world-writable mode here trips the repository's own path guard, which
+# requires root sticky protection on world-writable ancestors
+# (generation 052 ground truth). Created here because the unconfined
+# bootstrap can always guarantee it; the executor only points TMPDIR at it.
+install -d -m 0700 -o fmrunner -g fmrunner /work/tmp
 chown fmrunner:fmrunner /work
 
 runuser -u fmrunner -- git -C /work/repo init -q

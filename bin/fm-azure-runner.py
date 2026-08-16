@@ -2434,7 +2434,20 @@ def reserve_budget_management(env, state, lease, limits, admitted_cost=None):
         "identity", "create", "--resource-group", env["resource_group"], "--name", reservation_name(env, state["invocation"]),
         "--location", "eastus", "--tags",
     ] + ["{}={}".format(key, value) for key, value in sorted(tags.items())])
-    lease.renew_and_assert()
+    lease.assert_held()
+    # The lease-critical section ends once the amount-tagged reservation is
+    # visible to every concurrent budgeter's listing. Principal stamping and
+    # RBAC verification harden this one resource and run after the lease in
+    # finalize_budget_reservation, so four concurrent shard transports no
+    # longer stagger behind minutes of per-resource hardening.
+    state["cost_reservation_expected_tags"] = tags
+    return cost
+
+
+def finalize_budget_reservation(env, state):
+    tags = state.pop("cost_reservation_expected_tags", None)
+    if tags is None:
+        return
     reread, _, _ = az_command(env, ["resource", "show", "--ids", reservation_id(env, state["invocation"]), "--api-version", "2023-01-31"])
     principal_id = reread.get("properties", {}).get("principalId") or reread.get("principalId")
     if not principal_id or (reread.get("tags") or {}) != tags:
@@ -2454,8 +2467,6 @@ def reserve_budget_management(env, state, lease, limits, admitted_cost=None):
     ):
         raise RunnerError("durable cost reservation changed before compute admission")
     require_zero_effective_rbac(env, parsed["principal_id"], "new cost reservation principal")
-    lease.assert_held()
-    return cost
 
 
 def mark_management_reservation_cleanup_verified(env, state):
@@ -3538,6 +3549,7 @@ def dispatch_prepared(env, state, confirm_subscription, confirm_cost_admission_m
         # invocation tags atomically at create, so concurrent transports
         # may create their own compute in parallel instead of holding the
         # admission lease through a multi-minute control-plane operation.
+        finalize_budget_reservation(env, state)
         create_vm(env, state)
         create_run_command(env, state)
         poll_run_command(env, state)

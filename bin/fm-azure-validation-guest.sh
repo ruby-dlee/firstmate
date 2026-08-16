@@ -776,15 +776,12 @@ mv "$tmp" "$IDENTITY"
 # branch before capturing heads: only a descendant of the local HEAD is
 # accepted, so a foreign or rewritten remote still captures mismatched
 # heads and fails collection exactly as before.
-set +e
-runuser -u fmvalidate -- git -C "$REPO" fetch --quiet origin "refs/heads/$BRANCH" 2>>"$RUN_LOG"
-if [ $? -eq 0 ]; then
-  FETCHED=$(git -C "$REPO" rev-parse FETCH_HEAD 2>/dev/null)
+if runuser -u fmvalidate -- git -C "$REPO" fetch --quiet origin "refs/heads/$BRANCH" 2>>"$RUN_LOG"; then
+  FETCHED=$(git -C "$REPO" rev-parse FETCH_HEAD 2>/dev/null || true)
   if [ -n "$FETCHED" ] && git -C "$REPO" merge-base --is-ancestor HEAD "$FETCHED" 2>/dev/null; then
-    runuser -u fmvalidate -- git -C "$REPO" merge --ff-only --quiet "$FETCHED" >>"$RUN_LOG" 2>&1
+    runuser -u fmvalidate -- git -C "$REPO" merge --ff-only --quiet "$FETCHED" >>"$RUN_LOG" 2>&1 || true
   fi
 fi
-set -e
 CURRENT_HEAD=$(git -C "$REPO" rev-parse HEAD)
 CURRENT_TREE=$(git -C "$REPO" rev-parse 'HEAD^{tree}')
 REMOTE_HEAD=$(git -C "$REPO" ls-remote --heads origin "refs/heads/$BRANCH" | awk 'NR==1 {print $1}')

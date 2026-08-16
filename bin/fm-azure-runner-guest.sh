@@ -180,6 +180,26 @@ while IFS= read -r ancestor; do
   git -C /work/repo cat-file -e "$ancestor^{commit}" || { echo "guest bootstrap: source ancestor is absent" >&2; exit 125; }
 done <"$BASE/source-ancestors"
 [ "$(git -C /work/repo rev-parse HEAD)" = "$COMMIT" ] && [ "$(git -C /work/repo rev-parse 'HEAD^{tree}')" = "$TREE" ] || { echo "guest bootstrap: source identity mismatch" >&2; exit 125; }
+# Repository tests compare the snapshot against the default branch through
+# the refs/remotes/origin view (generation 051 ground truth: a behavior
+# shard died on "ambiguous argument 'refs/remotes/origin/main'"), but a
+# bundle fetch materializes no remote-tracking refs. Recreate the admitted
+# default-branch identity exactly: prefer the commit already in the
+# snapshot history, otherwise fetch it by admitted digest exactly like
+# source ancestors, and refuse anything that resolves differently.
+DEFAULT_REF=$(read_request repository.default_ref)
+DEFAULT_HEAD=$(read_request repository.default_head)
+if [ "$DEFAULT_REF" != none ] && [ "$DEFAULT_HEAD" != none ]; then
+  case "$DEFAULT_REF" in refs/heads/?*) DEFAULT_NAME=${DEFAULT_REF#refs/heads/} ;; *) DEFAULT_NAME= ;; esac
+  if [ -n "$DEFAULT_NAME" ]; then
+    if ! git -C /work/repo cat-file -e "$DEFAULT_HEAD^{commit}" 2>/dev/null; then
+      run_bootstrap_network runuser -u fmrunner -- git -C /work/repo fetch --depth=1 origin "$DEFAULT_HEAD"
+      [ "$(git -C /work/repo rev-parse FETCH_HEAD)" = "$DEFAULT_HEAD" ] || { echo "guest bootstrap: default head identity mismatch" >&2; exit 125; }
+    fi
+    runuser -u fmrunner -- git -C /work/repo update-ref "refs/remotes/origin/$DEFAULT_NAME" "$DEFAULT_HEAD"
+    runuser -u fmrunner -- git -C /work/repo symbolic-ref refs/remotes/origin/HEAD "refs/remotes/origin/$DEFAULT_NAME"
+  fi
+fi
 
 fetch_exact() { local url=$1 path=$2 bytes=$3 digest=$4 redirects=${5:-no} args=(); [ "$redirects" != yes ] || args+=(--location); run_bootstrap_network curl --fail --silent --show-error "${args[@]}" --connect-timeout 30 --max-time 300 --max-filesize "$bytes" --output "$path" "$url"; [ "$(stat -c %s "$path")" = "$bytes" ] && [ "sha256:$(sha256sum "$path" | awk '{print $1}')" = "$digest" ] || { echo "guest bootstrap: pinned download mismatch" >&2; exit 125; }; }
 fetch_exact https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz "$BASE/shellcheck.tar.xz" 2559196 "$(read_request protocol.shellcheck_archive_digest)" yes

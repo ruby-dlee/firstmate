@@ -190,15 +190,29 @@ def main():
     stderr_path = output / "stderr.log"
     stdout_handle = open(stdout_path, "xb", buffering=0)
     stderr_handle = open(stderr_path, "xb", buffering=0)
+    # The unit's PrivateTmp puts /tmp on its own tmpfs, so repository tests
+    # that hard-link between their temp root and /work fail with EXDEV
+    # (generation 051 ground truth: fm-auto-reap's fixture hard link).
+    # A work-mount temp root keeps test temp files on the same device.
+    work_tmp = Path("/work/tmp")
+    work_tmp.mkdir(mode=0o700, exist_ok=True)
+    os.chown(work_tmp, uid, gid)
     child_env = {
         "HOME": "/work/home",
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "CI": "true",
+        "TMPDIR": str(work_tmp),
         "FM_AZURE_RUNNER": "1",
         "FM_AZURE_RUNNER_INVOCATION": request["invocation"],
         "FM_AZURE_RUNNER_DEPENDENCIES": "/work/repo",
+        # Declares the sealed-lane environment fact: deny-all repository
+        # networking with only the staged tool closure. Tests whose runtime
+        # dependencies cannot exist here (interpreter versions, package
+        # registries) key their explicit skip on this, keeping their full
+        # coverage in public CI which the ci step still requires green.
+        "FM_TEST_SEALED_CELL": "1",
     }
     started = time.monotonic()
     try:

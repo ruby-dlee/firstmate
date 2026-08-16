@@ -1573,7 +1573,57 @@ def cost_http_query(env, endpoint, url, body):
             raise RunnerError("Cost Management {} transport failed closed: {}".format(endpoint, exc.reason))
 
 
+RETAIL_RATE_CACHE_FRESH_SECONDS = 7 * 24 * 3600
+
+
 def retail_rate(env, sku):
+    """Resolve the SKU's hourly retail rate through a durable cache.
+
+    The rate only feeds worst-case cost ceilings, so freshness is worth very
+    little: prices.azure.com throttles bursts hard (generation 045 lost 21
+    minutes to HTTP 429 backoff on a single dispatch), and a same-week cached
+    ceiling bounds spend exactly as well. A fresh cache entry skips the API
+    entirely; a stale entry is refreshed best-effort and still used verbatim
+    when the API times out or throttles. Only a SKU with no cached rate at
+    all requires the live read to succeed.
+    """
+    cache_path = env["state_dir"] / "retail-rate-cache.json"
+    cache = {}
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    entry = cache.get(sku)
+    now = time.time()
+    if (
+        isinstance(entry, dict)
+        and isinstance(entry.get("rate"), (int, float))
+        and entry["rate"] > 0
+        and isinstance(entry.get("fetched_at"), (int, float))
+        and now - entry["fetched_at"] < RETAIL_RATE_CACHE_FRESH_SECONDS
+    ):
+        return float(entry["rate"])
+    try:
+        rate = retail_rate_from_api(env, sku)
+    except RunnerError as exc:
+        if isinstance(entry, dict) and isinstance(entry.get("rate"), (int, float)) and entry["rate"] > 0:
+            print(
+                "azure-runner: retail rate API unavailable ({}); using cached ceiling for {}".format(
+                    str(exc)[:120], sku
+                ),
+                file=sys.stderr,
+            )
+            return float(entry["rate"])
+        raise
+    cache[sku] = {"rate": rate, "fetched_at": now}
+    tmp = cache_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    tmp.replace(cache_path)
+    return rate
+
+
+def retail_rate_from_api(env, sku):
     escaped = sku.replace("_", "%5F")
     url = (
         "https://prices.azure.com/api/retail/prices?%24filter="

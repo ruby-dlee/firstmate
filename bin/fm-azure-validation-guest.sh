@@ -781,20 +781,33 @@ OUTCOME=failed
 # post-mortem status can never say so. The run log's structured gate block
 # is authoritative for gate detection; the status read stays authoritative
 # for completed outcomes.
+# A run parked at a gate when the unit tore down is a decision, not a
+# failure - but the daemon marks the run failed on shutdown, so the durable
+# status cannot say so (generation 047 ground truth: a rebase-conflict gate
+# classified failed). Conversely, an ALREADY-ANSWERED gate leaves awaiting
+# lines mid-log while the run continues to a genuine terminal failure
+# (generation 041 ground truth: a failed push classified needs-decision).
+# The discriminator is whether the run log ENDS parked: after the last
+# awaiting line, a still-parked run shows only gate findings and help text,
+# while an answered gate is followed by later step rows or terminal lines.
+gate_parked=0
+last_awaiting=$(grep -nEi 'status:[[:space:]]*awaiting[_ -](approval|user)' "$RUN_LOG" 2>/dev/null | tail -n 1 | cut -d: -f1)
+# A refused respond attempt prints an error line while the gate stays
+# parked, so error lines cannot terminate the parked window; only later
+# step-progress rows or a rendered run outcome prove the gate was answered.
+if [ -n "$last_awaiting" ] && ! tail -n +"$((last_awaiting + 1))" "$RUN_LOG" | grep -Eq ',(completed|failed),|^outcome:'; then
+  gate_parked=1
+fi
 if [ "$STATUS_RC" -eq 0 ] && grep -Eiq 'needs[-_ ]decision|awaiting[_ -]user|awaiting[_ -]approval|ask-user' "$STATUS_LOG"; then
+  OUTCOME=needs-decision
+elif [ "$gate_parked" = 1 ]; then
   OUTCOME=needs-decision
 elif [ "$STATUS_RC" -eq 0 ] && grep -Eiq 'outcome:[[:space:]]*(passed|checks-passed)|checks[- ]passed|checks green' "$STATUS_LOG"; then
   OUTCOME=checks-passed
 elif [ "$RUN_EXIT" -eq 0 ] && [ "$STATUS_RC" -eq 0 ] && grep -Eiq 'outcome:[[:space:]]*passed' "$STATUS_LOG"; then
   OUTCOME=passed
 elif [ "$STATUS_RC" -eq 0 ] && grep -Eiq 'outcome:[[:space:]]*failed' "$STATUS_LOG"; then
-  # A terminal failed status is authoritative even when the run log carries
-  # a historical gate block from an earlier, already-answered decision point
-  # (generation 041 ground truth: a failed push classified as needs-decision
-  # because the answered test gate still matched the run-log grep).
   OUTCOME=failed
-elif grep -Eq '^gate:' "$RUN_LOG" && grep -Eiq 'status:[[:space:]]*awaiting[_ -](approval|user)' "$RUN_LOG"; then
-  OUTCOME=needs-decision
 fi
 PR=$(grep -hEo 'https://github\.com/[^ /]+/[^ /]+/pull/[0-9]+' "$STATUS_LOG" "$RUN_LOG" | tail -n 1 || true)
 CHECKS_GREEN=false

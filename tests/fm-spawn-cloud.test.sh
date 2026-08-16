@@ -24,6 +24,9 @@ make_spawn_fakebin() {
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
 set -u
+if [ -n "${FM_TEST_TMUX_CALLS:-}" ]; then
+  printf 'TMUX %s\n' "$*" >> "$FM_TEST_TMUX_CALLS"
+fi
 case "$*" in
   *"#{pane_current_path}"*) printf '%s\n' "${FM_FAKE_PANE_PATH:-}"; exit 0 ;;
 esac
@@ -40,6 +43,98 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
+  # Stateful fake herdr: the same modeled behaviors the fm-backend-herdr suite
+  # verified against the real binary (workspace create seeds a default tab and
+  # returns its ids in the same response; agent start SPLITS the target tab
+  # into a new agent pane; pane close removes a single-pane tab), extended
+  # with the agent-start argv log the cloud lane asserts its Herdr tracking
+  # endpoint through. Backed by a JSON state file at $FM_FAKE_HERDR_STATE.
+  cat > "$fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+LOG="${FM_HERDR_LOG:?}"
+STATE="${FM_FAKE_HERDR_STATE:?}"
+{
+  printf 'HERDR_SESSION=%s' "${HERDR_SESSION:-}"
+  for a in "$@"; do printf '\x1f%s' "$a"; done
+  printf '\n'
+} >> "$LOG"
+
+jq_state() { jq "$@" "$STATE"; }
+save() { local tmp="$STATE.tmp.$$"; cat > "$tmp" && mv "$tmp" "$STATE"; }
+
+cmd=${1:-}; sub=${2:-}
+ws=""; label=""; tab=""
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    --workspace) ws=${args[$((i+1))]:-} ;;
+    --label) label=${args[$((i+1))]:-} ;;
+    --tab) tab=${args[$((i+1))]:-} ;;
+  esac
+done
+
+case "$cmd $sub" in
+  "status --json")
+    printf '{"client":{"version":"0.7.1","protocol":14},"server":{"running":true}}\n'
+    ;;
+  "workspace list")
+    jq_state '{result:{workspaces:.workspaces}}'
+    ;;
+  "workspace create")
+    n=$(jq_state -r '.next'); wsid="w$n"; dn=$((n + 1))
+    jq_state --arg wsid "$wsid" --arg wlabel "$label" \
+      --arg tabid "$wsid:t$dn" --arg paneid "$wsid:p$dn" \
+      '.workspaces += [{workspace_id:$wsid, label:$wlabel}]
+       | .tabs += [{tab_id:$tabid, label:"1", workspace_id:$wsid, pane_id:$paneid}]
+       | .next = (.next + 2)' | save
+    printf '{"result":{"workspace":{"workspace_id":"%s","label":"%s"},"tab":{"tab_id":"%s"},"root_pane":{"pane_id":"%s"}}}\n' \
+      "$wsid" "$label" "$wsid:t$dn" "$wsid:p$dn"
+    ;;
+  "tab list")
+    jq_state --arg w "$ws" '{result:{tabs:[.tabs[]|select(.workspace_id==$w)]}}'
+    ;;
+  "tab create")
+    n=$(jq_state -r '.next'); tabid="$ws:t$n"; paneid="$ws:p$n"
+    jq_state --arg w "$ws" --arg wlabel "$label" --arg tabid "$tabid" --arg paneid "$paneid" \
+      '.tabs += [{tab_id:$tabid, label:$wlabel, workspace_id:$w, pane_id:$paneid}]
+       | .next = (.next + 1)' | save
+    printf '{"result":{"tab":{"tab_id":"%s"},"root_pane":{"pane_id":"%s"}}}\n' "$tabid" "$paneid"
+    ;;
+  "pane list")
+    if [ -n "$ws" ]; then
+      jq_state --arg w "$ws" '{result:{panes:[.tabs[]|select(.workspace_id==$w)|{pane_id:.pane_id, tab_id:.tab_id}]}}'
+    else
+      jq_state '{result:{panes:[.tabs[]|{pane_id:.pane_id, tab_id:.tab_id}]}}'
+    fi
+    ;;
+  "session list")
+    printf '{"sessions":[{"name":"default","running":true}]}\n'
+    ;;
+  "pane close")
+    pane=${3:-}
+    jq_state --arg p "$pane" '.tabs |= [.[]|select(.pane_id != $p)]' | save
+    ;;
+  "tab close")
+    tab_target=${3:-}
+    jq_state --arg t "$tab_target" '.tabs |= [.[]|select(.tab_id != $t)]' | save
+    ;;
+  "agent start")
+    n=$(jq_state -r '.next'); paneid="agent:p$n"
+    jq_state --arg t "$tab" --arg paneid "$paneid" \
+      '(.tabs[] | select(.tab_id == $t) | .pane_id) = $paneid
+       | .next = (.next + 1)' | save
+    printf '{"result":{"agent":{"pane_id":"%s","tab_id":"%s"}}}\n' "$paneid" "$tab"
+    ;;
+  "agent get")
+    pane=${3:-}
+    printf '{"error":{"code":"agent_not_found","message":"agent target %s not found"}}\n' "$pane"
+    ;;
+  *) : ;;
+esac
+exit 0
+SH
+  chmod +x "$fakebin/herdr"
   cat > "$fakebin/treehouse" <<'SH'
 #!/usr/bin/env bash
 set -u
@@ -230,6 +325,9 @@ make_cloud_case() {
   fakebin=$(make_spawn_fakebin "$case_dir/fake")
   write_fixture_provider "$case_dir/provider.py"
   : > "$case_dir/launch.log"
+  : > "$case_dir/tmux-calls.log"
+  : > "$case_dir/herdr.log"
+  printf '{"next":1,"workspaces":[],"tabs":[],"agent_status":{}}\n' > "$case_dir/herdr-state.json"
   printf '%s\n' "$case_dir|$home|$project|$worktree|$fakebin"
 }
 
@@ -250,6 +348,10 @@ run_spawn() {
     FM_SPAWN_NO_GUARD=1 FM_FAKE_PANE_PATH="$worktree" TMUX="fake,1,0" \
     FM_FAKE_TREEHOUSE_WORKTREE="$worktree" \
     FM_TEST_LAUNCH_LOG="$case_dir/launch.log" \
+    FM_TEST_TMUX_CALLS="$case_dir/tmux-calls.log" \
+    FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 \
+    FM_HERDR_LOG="$case_dir/herdr.log" \
+    FM_FAKE_HERDR_STATE="$case_dir/herdr-state.json" \
     CODEX_HOME="$case_dir/codex-home" \
     PI_CODING_AGENT_DIR="$case_dir/pi-agent-home" \
     PATH="$fakebin:$PATH" "$SPAWN" "$@" 2>&1
@@ -312,8 +414,20 @@ test_cloud_spawn_places_worker_and_runs_the_entrypoint() {
   assert_grep "account_home=$CASE_DIR/pi-agent-home" "$meta" "the cloud spawn did not record the pi coding-agent account home"
   assert_grep 'worktree_git_dir_identity=' "$meta" "the cloud spawn did not record the worktree Git-dir identity"
   assert_grep 'worktree_git_dir=' "$meta" "the cloud spawn did not record the worktree Git dir"
+  # Herdr tracking endpoint: every cloud crewmate registers a real Herdr
+  # endpoint running the cloud monitor, with ZERO tmux involvement anywhere
+  # in the cloud lane.
   assert_grep 'window=' "$meta" "the cloud spawn lost its window key"
-  assert_no_grep 'backend=' "$meta" "a cloud spawn recorded a local backend key"
+  assert_grep 'backend=herdr' "$meta" "the cloud spawn did not record its Herdr tracking backend"
+  assert_grep 'herdr_session=' "$meta" "the cloud spawn did not record its Herdr session"
+  assert_grep 'herdr_workspace_id=' "$meta" "the cloud spawn did not record its Herdr workspace"
+  assert_grep 'herdr_tab_id=' "$meta" "the cloud spawn did not record its Herdr tab"
+  assert_grep 'herdr_pane_id=' "$meta" "the cloud spawn did not record its Herdr pane"
+  assert_grep "$(printf 'agent\x1fstart')" "$CASE_DIR/herdr.log" "the cloud spawn never registered a Herdr endpoint"
+  assert_grep 'fm-spawn-cloud-monitor.sh' "$CASE_DIR/herdr.log" "the Herdr endpoint does not run the cloud monitor"
+  assert_no_grep 'fm-spawn-cloud-monitor.sh' "$HOME_DIR/state/$id.worker-execute.log" \
+    "the worker entrypoint was replaced by the local monitor command"
+  test ! -s "$CASE_DIR/tmux-calls.log" || fail "a cloud spawn invoked tmux: $(cat "$CASE_DIR/tmux-calls.log")"
   assert_grep 'worker_assignment_generation=' "$meta" "the cloud spawn did not record its worker assignment generation"
   assert_no_grep 'LAUNCH' "$CASE_DIR/launch.log" "a cloud spawn typed a launch command into a local pane"
   assert_grep "\"task\":\"$id\"" "$HOME_DIR/state/azure-workers/controller.json" \

@@ -526,6 +526,7 @@ if [ "$SPAWN_CLOUD" = azure ] && [ "$STATE" != "$FM_HOME/state" ]; then
 fi
 CLOUD_ACCOUNT_HOME=
 CLOUD_PLACEMENT_STATE=
+CLOUD_WORKER_LAUNCH=
 RESUME_META=
 LIFECYCLE_LOCK=
 LIFECYCLE_LOCK_OWNED=0
@@ -873,15 +874,17 @@ if [ "$RECOVERY_ACCOUNT" = 1 ]; then
 fi
 
 if [ "$SPAWN_CLOUD" = azure ]; then
-  # Cloud placement replaces the local session backend entirely: no endpoint is
-  # created, so runtime auto-detection is skipped and an explicit --backend is a
-  # contradiction. BACKEND stays the meta-silent default so the recorded
-  # metadata carries placement=azure instead of a backend key.
+  # Cloud placement replaces the local session backend for the crewmate itself
+  # (it runs on an elastic worker), but every cloud crewmate still registers a
+  # Herdr tracking endpoint so none is ever lost: the fleet supervises through
+  # Herdr only, and an endpoint-less spawn would be invisible to status/reap.
+  # Runtime auto-detection is skipped and an explicit --backend is a
+  # contradiction: the tracking endpoint is Herdr unconditionally.
   if [ "$BACKEND_SET" -eq 1 ]; then
     echo "error: --backend cannot be combined with cloud placement ($SPAWN_CLOUD_SOURCE=azure)" >&2
     exit 1
   fi
-  BACKEND=tmux
+  BACKEND=herdr
 elif [ "$BACKEND_SET" -eq 1 ]; then
   BACKEND=$BACKEND_ARG
 else
@@ -3963,16 +3966,17 @@ SPAWN_CWD=${WT:-$PROJ_ABS}
 if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
   validate_direct_recovery_worktree_identity || exit 1
 fi
-# Cloud placement creates no local endpoint at all: the crewmate runs on an
-# elastic worker driven through bin/fm-worker-lifecycle.sh after metadata
-# install. window= stays empty in metadata, so endpoint-state probes report
-# unknown and every local status/reap flow fails closed instead of treating
-# the lane as dead.
+# Cloud placement still creates a local endpoint, but a Herdr TRACKING one:
+# the crewmate entrypoint runs on an elastic worker through
+# bin/fm-worker-lifecycle.sh after metadata install, while the Herdr tab runs
+# the cloud monitor so the crewmate stays visible and reapable in the same
+# workspace as local crewmates. The worker entrypoint is preserved verbatim
+# in CLOUD_WORKER_LAUNCH before the endpoint's own launch string replaces
+# LAUNCH for the tracking pane.
 if [ "$SPAWN_CLOUD" = azure ]; then
-  T=
-  WID=
-  ENDPOINT_CREATED=0
-else
+  CLOUD_WORKER_LAUNCH=$LAUNCH
+  LAUNCH="exec $(printf '%q' "$SCRIPT_DIR/fm-spawn-cloud-monitor.sh") $(printf '%q' "$ID") $(printf '%q' "$SPAWN_GENERATION_ID")"
+fi
 case "$BACKEND" in
   tmux)
     SES=$(fm_backend_tmux_container_ensure)
@@ -4145,7 +4149,6 @@ EOF
     ENDPOINT_CREATED=1
     ;;
 esac
-fi
 if spawn_test_lab_enabled && [ "${FM_TEST_FAIL_AFTER_ENDPOINT:-0}" = 1 ]; then
   echo "error: test-only failure after endpoint creation for $ID" >&2
   exit 1
@@ -4228,13 +4231,13 @@ spawn_cloud_record_assignment() {  # <assignment-generation>
   fm_account_meta_lock_release "$lock" || return 1
 }
 # spawn_cloud_dispatch: after metadata install, drive the elastic worker
-# lifecycle instead of typing a launch line into a local pane. The request is
-# durable; if admission leaves it queued (budget/quota/cost evidence), the
-# spawn still succeeds with worker=queued and a later
+# lifecycle; the local Herdr endpoint holds only the tracking monitor. The
+# request is durable; if admission leaves it queued (budget/quota/cost
+# evidence), the spawn still succeeds with worker=queued and a later
 # `bin/fm-worker-lifecycle.sh reconcile --apply` converges it. Once assigned,
-# the crewmate entrypoint (the exact LAUNCH string every local backend uses)
-# runs on the worker through a detached bounded `execute`, whose digest-bound
-# result lands in state/<id>.worker-result.json.
+# the crewmate entrypoint (CLOUD_WORKER_LAUNCH, the exact launch string every
+# local backend uses) runs on the worker through a detached bounded
+# `execute`, whose digest-bound result lands in state/<id>.worker-result.json.
 spawn_cloud_dispatch() {
   local owner_kind=primary assignment wall
   CLOUD_PLACEMENT_STATE=queued
@@ -4267,7 +4270,7 @@ spawn_cloud_dispatch() {
     --task "$ID" --task-generation "$SPAWN_GENERATION_ID" \
     --assignment-generation "$assignment" --wall-seconds "$wall" \
     --confirm-execute --confirm-subscription "${FM_AZURE_SUBSCRIPTION_ID:-}" \
-    -- /bin/bash -lc "$LAUNCH" \
+    -- /bin/bash -lc "$CLOUD_WORKER_LAUNCH" \
     > "$STATE/$ID.worker-result.json" 2> "$STATE/$ID.worker-execute.log" < /dev/null &
   disown $! 2>/dev/null || true
   CLOUD_PLACEMENT_STATE=executing

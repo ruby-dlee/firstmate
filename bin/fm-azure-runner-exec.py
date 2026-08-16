@@ -191,19 +191,26 @@ def main():
     stdout_handle = open(stdout_path, "xb", buffering=0)
     stderr_handle = open(stderr_path, "xb", buffering=0)
     # The unit's PrivateTmp puts /tmp on its own tmpfs, so repository tests
-    # that hard-link between their temp root and /work fail with EXDEV
-    # (generation 051 ground truth: fm-auto-reap's fixture hard link).
-    # A work-mount temp root keeps test temp files on the same device.
-    work_tmp = Path("/work/tmp")
-    work_tmp.mkdir(mode=0o700, exist_ok=True)
-    os.chown(work_tmp, uid, gid)
+    # that hard-link between their temp root and the work mount fail with
+    # EXDEV (generation 051 ground truth: fm-auto-reap's fixture hard
+    # link). A temp root beside the repository stays on the same device.
+    # Sticky world-writable /tmp semantics instead of chown: the unit's
+    # bounding set carries no CAP_CHOWN, so a chown here crashes the
+    # executor on the real VM. When the directory cannot be provided
+    # (hermetic harnesses run the executor outside a work mount) the
+    # child simply keeps the default TMPDIR.
+    work_tmp = Path(repo).resolve().parent / "tmp"
+    try:
+        work_tmp.mkdir(exist_ok=True)
+        os.chmod(work_tmp, 0o1777)
+    except OSError:
+        work_tmp = None
     child_env = {
         "HOME": "/work/home",
         "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "CI": "true",
-        "TMPDIR": str(work_tmp),
         "FM_AZURE_RUNNER": "1",
         "FM_AZURE_RUNNER_INVOCATION": request["invocation"],
         "FM_AZURE_RUNNER_DEPENDENCIES": "/work/repo",
@@ -214,6 +221,8 @@ def main():
         # coverage in public CI which the ci step still requires green.
         "FM_TEST_SEALED_CELL": "1",
     }
+    if work_tmp is not None:
+        child_env["TMPDIR"] = str(work_tmp)
     started = time.monotonic()
     try:
         def enter_repo_as_runner():

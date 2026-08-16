@@ -3530,7 +3530,7 @@ fm_backend_herdr_wait_transition() {  # <session> <timeout_secs> <state_dir> <pa
     fm_backend_herdr_control_exec rm -rf "$fifo_dir" 2>/dev/null || true
     return 2
   fi
-  fm_backend_herdr_scrubbed_exec "${reader[@]}" "$sock" "$timeout" "${pane_ids[@]}" > "$fifo" 2>/dev/null &
+  fm_backend_herdr_scrubbed_exec exec "${reader[@]}" "$sock" "$timeout" "${pane_ids[@]}" > "$fifo" 2>/dev/null &
   reader_pid=$!
   if ! exec 9< "$fifo"; then
     kill "$reader_pid" 2>/dev/null || true

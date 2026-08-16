@@ -258,7 +258,7 @@ fm_afk_launch_namespace_guard_release() {
   return "$result"
 }
 
-fm_afk_launch_namespace_guard_acquire() {
+fm_afk_launch_namespace_guard_acquire() {  # 0 acquired, 2 busy
   local ready response helper_status=0
   [ -z "$FM_AFK_LAUNCH_NAMESPACE_GUARD_PID" ] \
     && [ "$FM_AFK_LAUNCH_NAMESPACE_GUARD_HELD" -eq 0 ] || return 1
@@ -296,7 +296,11 @@ if not stat.S_ISREG(held.st_mode) or not stat.S_ISREG(named.st_mode):
     raise RuntimeError("namespace guard is not a regular file")
 if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
     raise RuntimeError("namespace guard pathname changed before flock")
-fcntl.flock(17, fcntl.LOCK_EX)
+try:
+    fcntl.flock(17, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    os.write(1, b"busy\n")
+    raise SystemExit(75)
 confirmed = os.lstat(sys.argv[1])
 if (held.st_dev, held.st_ino) != (confirmed.st_dev, confirmed.st_ino):
     raise RuntimeError("namespace guard pathname changed while acquiring flock")
@@ -315,7 +319,7 @@ finally:
 ' "$FM_AFK_LAUNCH_NAMESPACE_GUARD" "$FM_AFK_LAUNCH_NAMESPACE_GUARD_DIR" >&18 18>&- \
     2> "$FM_AFK_LAUNCH_NAMESPACE_GUARD_DIR/error" &
   FM_AFK_LAUNCH_NAMESPACE_GUARD_PID=$!
-  if ! IFS= read -r -t 5 -u 18 response || [ "$response" != ready ]; then
+  if ! IFS= read -r -t 5 -u 18 response; then
     fm_afk_launch_namespace_guard_release >/dev/null 2>&1 || true
     return 1
   fi
@@ -324,6 +328,11 @@ finally:
   { exec 18>&-; } 2>/dev/null || true
   rm -rf "$FM_AFK_LAUNCH_NAMESPACE_GUARD_DIR" 2>/dev/null || helper_status=1
   FM_AFK_LAUNCH_NAMESPACE_GUARD_DIR=
+  if [ "$response" = busy ] && [ "$helper_status" -eq 75 ]; then
+    { exec 17>&-; } 2>/dev/null || true
+    return 2
+  fi
+  [ "$response" = ready ] || helper_status=1
   if [ "$helper_status" -ne 0 ]; then
     { exec 17>&-; } 2>/dev/null || true
     return 1
@@ -590,7 +599,14 @@ fm_afk_launch_lock_acquire() {
   FM_AFK_LAUNCH_LOCK_INCOMPLETE=0
   FM_AFK_LAUNCH_LOCK_LAST_IDENTITY=
   for i in $(seq 1 200); do
-    fm_afk_launch_namespace_guard_acquire || return 1
+    fm_afk_launch_namespace_guard_acquire
+    result=$?
+    if [ "$result" -eq 2 ]; then
+      sleep 0.05
+      continue
+    elif [ "$result" -ne 0 ]; then
+      return 1
+    fi
     fm_afk_launch_lock_try_guarded "$i" "$ownerless_grace"
     result=$?
     fm_afk_launch_namespace_guard_release || return 1
@@ -618,7 +634,7 @@ fm_afk_launch_lock_release_guarded() {
 }
 
 fm_afk_launch_lock_release() {
-  local result=0
+  local i acquire_result result=0
   # EXIT/TERM may land after publication but before the guarded attempt returns.
   # In that case the current shell already owns the sibling guard; reacquiring
   # it would self-deadlock, so clean the exact token while fd 17 still retains
@@ -628,7 +644,13 @@ fm_afk_launch_lock_release() {
     fm_afk_launch_namespace_guard_release || result=1
     return "$result"
   fi
-  fm_afk_launch_namespace_guard_acquire || return 1
+  for i in $(seq 1 200); do
+    fm_afk_launch_namespace_guard_acquire
+    acquire_result=$?
+    [ "$acquire_result" -ne 2 ] && break
+    sleep 0.05
+  done
+  [ "$acquire_result" -eq 0 ] || return 1
   fm_afk_launch_lock_release_guarded || result=1
   fm_afk_launch_namespace_guard_release || result=1
   return "$result"

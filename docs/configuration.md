@@ -315,7 +315,7 @@ If no dispatch rule fits, firstmate uses the dispatch profile `default` when pre
 Because the spawn backstop is gated by file presence, any fallback path after a missing match, validation error, or missing `jq` still passes a resolved harness explicitly until the file is fixed or removed.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 
-## Worktree provisioning (config/worktree-provision)
+## Worktree provisioning
 
 A git worktree carries only tracked files, and Treehouse v2.0.0 exposes no setup hook, so a freshly leased task worktree arrives with the project's source and none of the gitignored machinery that runs it - no virtual environment, no installed packages.
 A lane launched into that state cannot run the project's own tests, formatters, or browser checks, so it validates on another agent's evidence or on none.
@@ -375,6 +375,133 @@ Any other content refuses the spawn rather than silently disabling the gate.
 `--no-provision` is the per-spawn opt-out.
 Provisioning currently covers genuinely new ship and scout spawns - the point at which a worktree is acquired.
 Secondmate homes, Orca's legacy recovery path, and the account recovery paths reuse an existing worktree and are not provisioned; a recovery into a worktree whose environment was destroyed still needs manual repair.
+
+### Explicit manifest override (config/provision/<project>.json)
+
+A Treehouse lease delivers a clean Git worktree and nothing else.
+The environments a project's own checks need - its virtualenv, its `node_modules`, the interpreter and runtime those were built for - are gitignored, so a fresh lease never carries them, and Treehouse exposes no setup hook.
+For a project that needs more precise runtime checks or probes than declaration-driven detection can express, `bin/fm-spawn.sh` uses `bin/fm-provision.sh` after the leased worktree is proven isolated and clean and before the endpoint is created.
+A present explicit manifest overrides declaration-driven detection for that project, so the same environment is never installed twice by the two engines.
+
+Explicit manifest provisioning is opt-in per project and per home.
+`config/provision/<project>.json` is a local, gitignored manifest named after the project directory under `projects/`.
+After spawn retires any prior task evidence, the engine's no-manifest path is a single file-existence check with no environment work, so projects and homes that have not opted in remain unchanged.
+This section is the single owner of the manifest schema; `bin/fm-provision.sh`'s header owns the readiness contract, the exit codes, and the operational guarantees, and `AGENTS.md` keeps only concise operational pointers.
+See [`docs/examples/provision-relvino.json`](examples/provision-relvino.json) for a working manifest to copy and adapt.
+
+```json
+{
+  "description": "<human note>",
+  "kinds": ["ship"],
+  "on_failure": "warn",
+  "timeout_seconds": 1800,
+  "step_timeout_seconds": 600,
+  "path_prepend": ["<absolute directory placed ahead of PATH>"],
+  "components": [
+    {
+      "name": "<component name>",
+      "dir": "<directory relative to the worktree>",
+      "env": { "<NAME>": "<value>" },
+      "path_prepend": ["<absolute directory, this component only>"],
+      "runtime_checks": [
+        { "name": "<label>", "argv": ["<cmd>", "<arg>"], "expect": "<exact expected output>", "timeout_seconds": 60 }
+      ],
+      "fingerprint": {
+        "path": "<file inside the built tree, relative to dir>",
+        "files": ["<input file relative to dir>"],
+        "versions": [ { "name": "<label>", "argv": ["<cmd>", "<arg>"] } ]
+      },
+      "reset": ["<path relative to dir removed before a rebuild>"],
+      "install": [ { "name": "<label>", "argv": ["<cmd>", "<arg>"], "timeout_seconds": 900 } ],
+      "probes": [ { "name": "<label>", "argv": ["<cmd>", "<arg>"], "expect": "<optional exact output>" } ]
+    }
+  ]
+}
+```
+
+`components` is required and every component needs a `name`.
+The remaining component fields are optional, with `dir` defaulting to the worktree root, but every step included in a step list still needs the non-empty `argv` described below.
+Every list in the manifest must actually be an array, and a run reads each list whole and reconciles the records it read against the length that list declares before acting on any of it.
+A field that is present but is not an array fails the run rather than being iterated into nothing, and a `ready` verdict is emitted only when the run recorded one outcome per declared component.
+That matters because a JSON `length` is defined for values that cannot be iterated, so `"components": "abc"` would otherwise look like three components and provision none of them.
+`kinds` defaults to `["ship"]`, so scouts are skipped unless the manifest lists them or the spawn passes `--provision`; a scout that only reads code does not need a toolchain.
+A no-manifest or excluded-kind skip publishes no provision record, log, brief section, or `path_prepend`; spawn retires any evidence from a prior attempt before taking an early-return path.
+`on_failure` is `warn` or `block` and defaults to `warn`; the reasoning behind that default lives in `bin/fm-provision.sh`'s header.
+`bin/fm-spawn.sh` reads `on_failure` from the manifest before it runs the provisioner, so the policy is known even when the provisioner dies without saying anything.
+A resolved `block` aborts the spawn no matter what the provisioner did, and a non-ready verdict continues only under a resolved `warn`, so the two scripts cannot silently disagree about what `block` means.
+That covers the documented non-ready verdict and equally a provisioner that died without a parseable verdict - signal death, a usage error, a gate refusal, any exit the readiness contract does not document.
+Under `warn` such a death still continues, with the banner and a durable verdict recording that provisioning died without one.
+A manifest whose `on_failure` cannot be read, or is present and is neither `warn` nor `block`, is treated as `block`, because an unreadable policy is exactly the ambiguity that must not fail open.
+`bin/fm-provision.sh` applies that same rule and exits 4 for such a manifest, so only the one project whose manifest is malformed is blocked.
+An absent `on_failure` is not ambiguous and still takes the `warn` default.
+A project with no manifest at all is untouched by any of this: provisioning is skipped, nothing is created, and the spawn proceeds.
+`timeout_seconds` bounds the whole run, including reset deletions, and `step_timeout_seconds` is the per-step default, which a step overrides with its own `timeout_seconds`.
+Every declared step is an object with a required non-empty `argv` argument vector and optional `name`, `expect`, and `timeout_seconds`; using an argument vector makes quoting unambiguous, and `["sh", "-c", "..."]` is the explicit opt-in when a shell is genuinely wanted.
+Every step runs with its standard input on `/dev/null`, so a step that wants input opens it itself, as in `["sh", "-c", "cmd < file"]`.
+`${HOME}` and `${WORKTREE}` are the only tokens that expand in command arguments, expected output, environment values, and the manifest's path fields, so a manifest can name a host runtime directory or a path inside the lease without being rewritten per worktree.
+Names and `description` are labels and do not expand, and no value is implicitly evaluated as a shell command.
+
+`path_prepend` directories go ahead of `PATH` for every step, and the manifest-level entries are also handed to `fm-spawn.sh`, which delivers them to the crewmate's session environment.
+That handover only happens for a `ready` verdict.
+Without it, provisioning could build a project under its pinned runtime while the crewmate's shell still resolved a different one, which is precisely the drift that had npm delegating a native build to an unpinned node.
+Every `path_prepend` entry, at either level, must already be a directory and may not contain a colon.
+A colon is the separator of every `PATH` an entry is composed into, so an entry carrying one would split into two fragments naming no directory at all, and the pin would read as declared while silently not applying.
+Manifest-level entries additionally refuse a space and a single quote, because those entries alone are transported into a `PATH` a shell reads and into the colon-joined argument the launcher below receives.
+Component-level entries reach their steps as `/usr/bin/env` argv, where a space or a quote is carried verbatim and is harmless, so they are not refused there.
+
+Precedence, when both levels declare `path_prepend`: **the more specific declaration wins.**
+A component's own entries lead its steps' `PATH`, and the manifest-level entries follow them as the default for components that declare nothing.
+The other order is not merely surprising, it is actively misleading: a component that declares Node 18 under a Node 20 manifest pin would build against Node 20 and its own `runtime_checks` would then validate the wrong interpreter, and a check that passes against something the component is not using manufactures confidence rather than providing it.
+Only the manifest-level entries are handed to `fm-spawn.sh`; component-level entries affect that component's provisioning steps alone.
+
+Where a published pin applies is deliberately not "the `PATH` that resolves the launch line".
+A pin can carry any command name - a pinned Node prefix is exactly where a globally npm-installed `claude` or `codex` lives, and a pyenv shim or virtualenv prefix carries `python3` - so a manifest directory on that `PATH` would decide which binary every bare word of the launch line means: the harness, a wrapper, that wrapper's target, an interpreter.
+The crewmate `PATH` Firstmate exports therefore carries no manifest-supplied entry at all, and the whole launch line resolves from Firstmate's own resolution order as a property of the line rather than as a list of remembered words.
+The pin is applied instead by `bin/fm-launch-pinned.sh`, which is named by an absolute path, resolves the launch command against that un-pinned `PATH`, and only then exports the pin for the agent and every process it starts.
+So the pin still wins for the project's own tools inside the crewmate's session, which is the whole point of declaring it, and it decides nothing about what Firstmate itself launches.
+A raw launch command receives a published pin only when Firstmate can resolve its first word to an executable on its own `PATH`, or verify a slash-containing first word as an executable path before endpoint creation.
+When an applicable explicit manifest makes raw-launch undeliverability knowable up front, a shell builtin, operator alias, shell function, shell construct, unresolved name, or non-executable absolute path is refused before a worktree is leased.
+Relative raw paths require the acquired worktree, and declaration-driven runtime pins are known only after provisioning, so the shared definitive check refuses those combinations after provisioning and before endpoint creation or task metadata installation.
+When no pin can be published, raw launch behavior is unchanged and the line is typed exactly as supplied.
+
+A harness turn-end hook is not part of the launch line - it is a command Firstmate writes into a file the harness runs from inside the crewmate's session, where the pin is in effect by design - so those commands are pinned in their own right.
+The shell a hook runs, the hook script's own interpreter, and the `touch` that marks the turn are all named by the absolute path Firstmate resolved from its own `PATH`, for every harness that has a hook.
+A spawn that could publish a pin but could not resolve those is refused before a worktree is leased and before any install runs, so the refusal never costs a lease, and it names the command it could not resolve.
+The same pre-lease refusal covers a checkout whose `bin/fm-launch-pinned.sh` is missing or has lost its executable bit, for the same reason: a proven pin that cannot be carried into the session is a refusal and never a silent downgrade to an unpinned launch, and deciding it up front is what keeps that refusal from stranding a dirty lease the pool then has to skip.
+That pre-lease refusal applies only when this spawn could actually publish a pin: a manifest whose `kinds` excludes this task's kind publishes nothing, so a scout on a `"kinds": ["ship"]` project is treated exactly like a project with no manifest, unless `--provision` overrides the kinds gate.
+An unreadable or malformed manifest is treated as one that could pin, so an unreadable file never buys a launch that a readable one would refuse.
+A component's `env` may not set `PATH`; use `path_prepend`, so a manifest cannot route around its own runtime checks.
+
+`runtime_checks` run before anything is built, so a component is never compiled or installed under the wrong runtime.
+A runtime check or probe with `expect` must print exactly that value; one that prints nothing never satisfies an `expect`.
+The value a step contributes - to `expect` and to a fingerprint - is the last non-empty line it printed on standard output, trimmed.
+Standard error is captured to the step log for diagnosis but never contributes to that value, so a tool that trails its answer with an unrelated notice on stderr - npm's update banner, a uv warning, a deprecation note - cannot fail an `expect` comparison or move a fingerprint input.
+
+`fingerprint` is what makes an unchanged environment reusable.
+Reuse requires both a matching digest over the declared `files` and `versions` AND passing `probes`; probes run on every invocation, so a merely existing directory is never assumed healthy, and a fingerprint hit whose probes fail rebuilds instead.
+An absent or unavailable fingerprint forces a rebuild on every applicable invocation.
+Put `fingerprint.path` inside the tree it describes, such as `.venv/` or `node_modules/`, so deleting the environment deletes its claim of health.
+A `versions` command must be independent of the thing it fingerprints, and so must a `files` input: a lockfile that the install step rewrites is not a usable input.
+Every declared input is recomputed after a build, and the fingerprint is recorded only when both readings are non-empty and equal.
+If those readings differ, including an empty-to-non-empty transition, the verdict reports the refusal rather than silently rebuilding on every future lease, and it names which cause applied: an input that could not be recomputed at all, an input that only became readable after the build, or the specific `files` or `versions` inputs whose value moved.
+Existing ancestors of `dir`, `reset`, fingerprint input, and `fingerprint.path` paths are resolved before use; symlinks and physical escapes from the worktree are refused before reads, writes, or deletion.
+A component `dir` may be the worktree root, but every reset, fingerprint input, and `fingerprint.path` must be a strict descendant of that component directory.
+This strict-descendant invariant structurally prevents `.`, `sub/..`, an empty value, or an absolute reset from ever resolving to the component root passed to deletion.
+
+Automatic provisioning applies to new or recorded non-Orca ship and scout worktrees; secondmate and Orca launches do not use this seam.
+`bin/fm-spawn.sh` takes `--provision` to force provisioning for one spawn, including for a kind the manifest excludes and rebuilding rather than reusing a matching fingerprint, and `--no-provision` to skip it entirely.
+Both apply to every pair of a batch spawn.
+An opted-in project whose provisioner cannot be run at all, whether the file is missing or has lost its executable bit, is a provisioning failure governed by that manifest's `on_failure` rather than a silent skip, so `block` still refuses the spawn.
+Where a project's manifest lives is asked of `bin/fm-provision.sh`, which owns that answer, and derived locally only when the provisioner itself is unavailable, so a broken provisioner can never make an opted-in project look like one that never opted in.
+With `--task`, the verdict is written to `state/<id>.provision` and the full step log to `state/<id>.provision.log`, both removed by teardown.
+A leased worktree is re-proven clean, isolated, and still at its expected detached tip after provisioning has written into it and before the endpoint is created, using the same predicate the return path applies.
+Residue an install step left behind is therefore a provisioning failure under the manifest's own policy: it is loud and durable at dispatch, and no agent is launched onto a base that is no longer proven.
+Refusing the spawn does not clean the residue up, so under `block` the abort still leaves that lease dirty, and a dirty lease is retained rather than returned and is skipped by pool preflight until someone attends to it.
+What the re-proof buys is that the residue is named at dispatch by the manifest step that caused it, instead of surfacing later as an unexplained shrinking pool.
+Every applicable ready or failed run appends a delimiter-idempotent "Environment readiness" section to the crewmate's brief; a ready section reports component results, while a failure section directs the crewmate to report a blocker instead of substituting evidence it did not produce.
+That section is written through the same pinned task-file transaction the other brief mutators use, so it stages inside the task directory, preserves the brief's mode, and refuses a brief whose task directory or file identity changed under it.
+On failure, spawn also prints a bordered banner with the durable verdict and log paths.
+The legacy `--continue-account` path replaces the brief with its continuation packet after provisioning, so that path retains the durable verdict and any failure banner but not the appended readiness section.
 
 ## Checkout refresh
 

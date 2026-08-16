@@ -188,6 +188,7 @@ EVENT_CAP_FAIL_MAX=${FM_EVENT_CAP_FAIL_MAX:-3}
 # a ~220KB `herdr api schema` read, too heavy to repeat every poll). Keyed by
 # "<backend>:<session>"; re-probed only when that key changes.
 _event_cap_key=""
+_event_sleep_pid=""
 _event_cap_ok=0
 _event_cap_fails=0
 
@@ -960,7 +961,7 @@ event_wait_or_sleep() {
   done < <(recorded_windows)
 
   if [ "${#windows[@]}" -eq 0 ]; then
-    sleep "$POLL"
+    event_poll_sleep
     return
   fi
 
@@ -976,7 +977,7 @@ event_wait_or_sleep() {
     _event_cap_fails=0
   fi
   if [ "$_event_cap_ok" != 1 ]; then
-    sleep "$POLL"
+    event_poll_sleep
     return
   fi
 
@@ -993,7 +994,7 @@ event_wait_or_sleep() {
       # pure polling for the rest of this watcher process.
       _event_cap_fails=$((_event_cap_fails + 1))
       [ "$_event_cap_fails" -ge "$EVENT_CAP_FAIL_MAX" ] && _event_cap_ok=0
-      sleep "$POLL"
+      event_poll_sleep
       ;;
     *)
       # 1: a clean full-budget wait with no actionable edge - the reader already
@@ -1001,6 +1002,22 @@ event_wait_or_sleep() {
       _event_cap_fails=0
       ;;
   esac
+}
+
+event_poll_sleep() {
+  sleep "$POLL" &
+  _event_sleep_pid=$!
+  wait "$_event_sleep_pid"
+  _event_sleep_pid=""
+}
+
+watcher_cleanup() {
+  if [ -n "$_event_sleep_pid" ]; then
+    kill "$_event_sleep_pid" 2>/dev/null || true
+    wait "$_event_sleep_pid" 2>/dev/null || true
+    _event_sleep_pid=""
+  fi
+  fm_lock_release "$WATCH_LOCK"
 }
 
 # handle_push_transition: act on a fresh actionable (blocked) transition record
@@ -1063,7 +1080,7 @@ if ! fm_lock_try_acquire "$WATCH_LOCK"; then
   fi
   exit 0
 fi
-trap 'fm_lock_release "$WATCH_LOCK"' EXIT
+trap watcher_cleanup EXIT
 # This watcher's own pid, as recorded in the lock by fm_lock_claim (which writes
 # ${BASHPID:-$$} from this same main shell). Read directly, never via a command
 # substitution, so it matches the stored holder pid for the self-eviction check.

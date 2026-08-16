@@ -162,7 +162,7 @@ case "$HARNESS" in
     export CLAUDE_SECURESTORAGE_CONFIG_DIR="$ACCOUNT"
     claude -p --safe-mode --model "$MODEL" --effort "$EFFORT" \
       --dangerously-skip-permissions --tools "" --no-session-persistence \
-      --disable-slash-commands --strict-mcp-config --mcp-config '{}' \
+      --disable-slash-commands --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
       --output-format json --json-schema "$(<"$SCHEMA")" "$(<"$PROMPT")" >"$BASE/claude-envelope.json"
     jq -e '.is_error == false and .subtype == "success" and .terminal_reason == "completed" and (.structured_output|type == "object")' "$BASE/claude-envelope.json" >/dev/null
     jq -c '.structured_output' "$BASE/claude-envelope.json" >"$RESULT"

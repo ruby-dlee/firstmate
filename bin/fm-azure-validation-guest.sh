@@ -807,7 +807,23 @@ elif [ "$STATUS_RC" -eq 0 ] && grep -Eiq 'outcome:[[:space:]]*(passed|checks-pas
 elif [ "$RUN_EXIT" -eq 0 ] && [ "$STATUS_RC" -eq 0 ] && grep -Eiq 'outcome:[[:space:]]*passed' "$STATUS_LOG"; then
   OUTCOME=passed
 elif [ "$STATUS_RC" -eq 0 ] && grep -Eiq 'outcome:[[:space:]]*failed' "$STATUS_LOG"; then
-  OUTCOME=failed
+  # The ci step turns green and then stays running to monitor until merge,
+  # so unit teardown kills it mid-monitor and the daemon marks the run
+  # failed on shutdown - the same teardown artifact the gate discriminator
+  # above handles (generation 049 ground truth: every step green, ci
+  # verified "all CI checks passed", durable status still failed with
+  # "daemon shutting down"). The run command's final rendered outcome is
+  # written before teardown, so when the durable failure carries the
+  # shutdown signature and the run's own terminal report was
+  # checks-passed, the terminal report wins. The LAST outcome line guards
+  # against checks that greened mid-run and regressed before the end.
+  last_run_outcome=$(grep -Ei '^outcome:' "$RUN_LOG" 2>/dev/null | tail -n 1)
+  if [ "$RUN_EXIT" -eq 0 ] && grep -q 'daemon shutting down' "$STATUS_LOG" \
+    && printf '%s' "$last_run_outcome" | grep -Eiq 'outcome:[[:space:]]*checks-passed'; then
+    OUTCOME=checks-passed
+  else
+    OUTCOME=failed
+  fi
 fi
 PR=$(grep -hEo 'https://github\.com/[^ /]+/[^ /]+/pull/[0-9]+' "$STATUS_LOG" "$RUN_LOG" | tail -n 1 || true)
 CHECKS_GREEN=false

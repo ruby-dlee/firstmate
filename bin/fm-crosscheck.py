@@ -258,6 +258,71 @@ def prepare_pi_execution_home(protocol_dir: Path, account_home: Path) -> Path:
     return execution_home
 
 
+def account_identity(harness: str, account_home: Path) -> str:
+    """Stable upstream executing-account identity for one reviewer home.
+
+    The returned string never carries token material: Codex and Pi expose
+    explicit upstream account ids; the Claude OAuth file holds only opaque
+    tokens, so its identity is a one-way digest of the long-lived refresh
+    token (two homes mirroring one account share that token byte for byte,
+    which is exactly the same-account condition the Azure adapter refuses).
+    """
+
+    home = Path(account_home).resolve()
+    if harness == "codex":
+        credential = read_json(
+            home / "auth.json",
+            "Codex executing-account credential",
+            maximum_bytes=1024 * 1024,
+            maximum_items=256,
+        )
+        tokens = credential.get("tokens") if isinstance(credential, dict) else None
+        account = tokens.get("account_id") if isinstance(tokens, dict) else None
+        if isinstance(account, str) and account.strip():
+            return "codex:" + account.strip()
+        api_key = (
+            credential.get("OPENAI_API_KEY") if isinstance(credential, dict) else None
+        )
+        if isinstance(api_key, str) and api_key.strip():
+            digest = hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest()
+            return "codex-api-key-digest:" + digest
+        tool_fail(
+            f"Codex credential at {home} exposes no executing account identity"
+        )
+    if harness == "pi":
+        credentials = read_json(
+            home / "auth.json",
+            "Pi executing-account credential",
+            maximum_bytes=1024 * 1024,
+            maximum_items=256,
+        )
+        credential = (
+            credentials.get("openai-codex") if isinstance(credentials, dict) else None
+        )
+        account = credential.get("accountId") if isinstance(credential, dict) else None
+        if isinstance(account, str) and account.strip():
+            return "openai-codex:" + account.strip()
+        tool_fail(f"Pi credential at {home} exposes no executing account identity")
+    if harness == "claude":
+        credential = read_json(
+            home / ".credentials.json",
+            "Claude executing-account credential",
+            maximum_bytes=1024 * 1024,
+            maximum_items=256,
+        )
+        oauth = (
+            credential.get("claudeAiOauth") if isinstance(credential, dict) else None
+        )
+        refresh = oauth.get("refreshToken") if isinstance(oauth, dict) else None
+        if isinstance(refresh, str) and refresh.strip():
+            digest = hashlib.sha256(refresh.strip().encode("utf-8")).hexdigest()
+            return "claude-refresh-digest:" + digest
+        tool_fail(
+            f"Claude credential at {home} exposes no executing account identity"
+        )
+    tool_fail(f"no executing-account identity reader for harness {harness!r}")
+
+
 def inspect_codex_credential(account_home: Path) -> tuple[str, str]:
     """Validate the credential file selected by one Codex home."""
 

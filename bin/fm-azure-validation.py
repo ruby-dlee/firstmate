@@ -1065,8 +1065,17 @@ def release_shape_constituent(env, state, reservation_id, evidence):
         "--confirm-subscription", env["subscription"],
     ])
     if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        # Release is a cleanup operation and must be idempotent: a
+        # constituent already released under another recorded receipt (an
+        # operator supersede raced a queued dispatch in generation 054)
+        # leaves nothing reserved, so the released end state satisfies
+        # this release instead of wedging close into cleanup-retained.
+        # Both receipts remain in the durable ledger.
+        if "already has a different cleanup receipt" in detail:
+            return
         raise ValidationError("shared capacity release refused for {}: {}".format(
-            reservation_id, (result.stderr or result.stdout or "").strip()[-400:]
+            reservation_id, detail[-400:]
         ))
 
 

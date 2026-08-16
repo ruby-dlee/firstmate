@@ -169,6 +169,7 @@ case "$HARNESS" in
     # root-only-ancestor traversal failure the validation cells hit live);
     # execute-only keeps the root-custody files unlistable and unreadable.
     chmod 0711 "$BASE"
+    set +e
     runuser -u fmccmodel -- env \
       HOME="$HOME_DIR" TMPDIR="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
       CLAUDE_CONFIG_DIR="$ACCOUNT" CLAUDE_SECURESTORAGE_CONFIG_DIR="$ACCOUNT" \
@@ -176,8 +177,21 @@ case "$HARNESS" in
       claude -p --safe-mode --model "$MODEL" --effort "$EFFORT" \
       --dangerously-skip-permissions --tools "" --no-session-persistence \
       --disable-slash-commands --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
-      --output-format json --json-schema "$(<"$SCHEMA")" "$(<"$PROMPT")" >"$BASE/claude-envelope.json"
-    jq -e '.is_error == false and .subtype == "success" and .terminal_reason == "completed" and (.structured_output|type == "object")' "$BASE/claude-envelope.json" >/dev/null
+      --output-format json --json-schema "$(<"$SCHEMA")" "$(<"$PROMPT")" \
+      >"$BASE/claude-envelope.json" 2>"$BASE/claude-stderr.log"
+    claude_rc=$?
+    set -e
+    if [ "$claude_rc" -ne 0 ] || ! jq -e '.is_error == false and .subtype == "success" and .terminal_reason == "completed" and (.structured_output|type == "object")' "$BASE/claude-envelope.json" >/dev/null 2>&1; then
+      # A refused review must name its cause in the run-command error stream;
+      # bounded envelope status and stderr slices only, never the credential.
+      {
+        echo "model guest: claude reviewer did not return a completed structured envelope (exit $claude_rc)"
+        tail -c 800 "$BASE/claude-stderr.log" 2>/dev/null
+        jq -c '{is_error, subtype, terminal_reason}' "$BASE/claude-envelope.json" 2>/dev/null
+        jq -r '.result // empty' "$BASE/claude-envelope.json" 2>/dev/null | head -c 600
+      } >&2
+      exit 125
+    fi
     jq -c '.structured_output' "$BASE/claude-envelope.json" >"$RESULT"
     ;;
   pi)

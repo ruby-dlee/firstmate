@@ -111,11 +111,9 @@ IMAGE_ID=$(az sig image-version show --resource-group "$RESOURCE_GROUP" --galler
 
 echo "fm-azure-cell-image: deleting builder" >&2
 az vm delete --resource-group "$RESOURCE_GROUP" --name "$BUILDER" --yes --output none
-for kind in disk nic; do
-  for id in $(az resource list --resource-group "$RESOURCE_GROUP" \
-    --query "[?contains(name, '$BUILDER')].id" -o tsv); do
-    az resource delete --ids "$id" --output none || true
-  done
+for id in $(az resource list --resource-group "$RESOURCE_GROUP" \
+  --query "[?contains(name, '$BUILDER')].id" -o tsv); do
+  az resource delete --ids "$id" --output none || true
 done
 
 printf 'FM_AZURE_CELL_IMAGE %s\n' "$IMAGE_ID"

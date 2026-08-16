@@ -1431,6 +1431,10 @@ def deployment_parameters(env, state, selected, replacement=False):
             "expiryUtc": {"value": expiry},
             "expiryTimeOfDay": {"value": expiry_value.strftime("%H%M")},
             "tags": {"value": expected_tags(state, selected)},
+            # Optional golden image: an empty value keeps the marketplace
+            # base; the guests re-verify every staged archive digest at
+            # boot either way, so the image only caches the bootstrap.
+            "imageId": {"value": os.environ.get("FM_AZURE_VM_IMAGE_ID", "")},
         },
     }
 

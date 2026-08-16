@@ -87,8 +87,14 @@ METER_RATE_CEILINGS_USD = {
     "storage_capacity": 0.02,
     "provisioning_control_interval": 0.01,
 }
-RUNNER_CONTROL_OPERATION_CEILING = 2_000
-RUNNER_STORAGE_OPERATION_CEILING = 2_000
+# Runaway-automation backstops, not budgets: spend is governed by the
+# durable reservations and the dollar limit. The original 2000-op
+# lifetime bootstrap bucket was legitimately exhausted by the
+# multi-generation commissioning campaign (generation 054 ground
+# truth), so the ceilings now sit an order of magnitude above any
+# single campaign while still bounding a runaway loop.
+RUNNER_CONTROL_OPERATION_CEILING = 20_000
+RUNNER_STORAGE_OPERATION_CEILING = 20_000
 STORAGE_OPERATION_RESERVE_USD = 5.0
 CONTROL_OPERATION_RESERVE_USD = 20.0
 BOOTSTRAP_GIB_RATE_CEILING_USD = 0.25

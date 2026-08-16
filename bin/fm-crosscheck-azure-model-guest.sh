@@ -9,15 +9,21 @@
 set -euo pipefail
 umask 077
 
-[ "$#" -eq 7 ] || { echo "model guest: expected seven bound parameters" >&2; exit 125; }
-REVIEW_GENERATION=$1
-VM_RESOURCE_ID=$2
-VM_INSTANCE_ID=$3
-GUEST_DIGEST=$4
-INPUT_URL=$5
-CREDENTIAL_URL=$6
-OUTPUT_URL=$7
-set --
+# Managed Run Command delivers parameters as environment variables, never as
+# positional arguments (the same contract the validation guest proved live).
+[ "$#" -eq 0 ] || { echo "model guest: positional parameters are forbidden" >&2; exit 125; }
+REVIEW_GENERATION=${review_generation:-}
+VM_RESOURCE_ID=${vm_resource_id:-}
+VM_INSTANCE_ID=${vm_instance_id:-}
+GUEST_DIGEST=${guest_digest:-}
+INPUT_URL=${input_url:-}
+CREDENTIAL_URL=${credential_url:-}
+OUTPUT_URL=${output_url:-}
+unset review_generation vm_resource_id vm_instance_id guest_digest
+unset input_url credential_url output_url
+[ -n "$REVIEW_GENERATION" ] && [ -n "$VM_RESOURCE_ID" ] && [ -n "$VM_INSTANCE_ID" ] \
+  && [ -n "$GUEST_DIGEST" ] && [ -n "$INPUT_URL" ] && [ -n "$CREDENTIAL_URL" ] \
+  && [ -n "$OUTPUT_URL" ] || { echo "model guest: expected seven bound parameters" >&2; exit 125; }
 
 case "$REVIEW_GENERATION" in [0-9a-f][0-9a-f]*) ;; *) echo "model guest: malformed review generation" >&2; exit 125 ;; esac
 case "$GUEST_DIGEST" in sha256:[0-9a-f][0-9a-f]*) ;; *) echo "model guest: malformed guest digest" >&2; exit 125 ;; esac

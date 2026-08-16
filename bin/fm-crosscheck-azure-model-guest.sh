@@ -158,9 +158,17 @@ case "$HARNESS" in
       --color never --output-schema "$SCHEMA" --output-last-message "$RESULT" - <"$PROMPT"
     ;;
   claude)
-    export CLAUDE_CONFIG_DIR="$ACCOUNT"
-    export CLAUDE_SECURESTORAGE_CONFIG_DIR="$ACCOUNT"
-    claude -p --safe-mode --model "$MODEL" --effort "$EFFORT" \
+    # claude refuses --dangerously-skip-permissions under root, so the
+    # credentialed model process drops to a dedicated unprivileged user;
+    # only the paths that process must touch are handed over.
+    id fmccmodel >/dev/null 2>&1 \
+      || useradd --system --home-dir "$HOME_DIR" --shell /usr/sbin/nologin fmccmodel
+    chown -R fmccmodel:fmccmodel "$ACCOUNT" "$HOME_DIR" "$TMPDIR" "$XDG_CACHE_HOME"
+    runuser -u fmccmodel -- env \
+      HOME="$HOME_DIR" TMPDIR="$TMPDIR" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
+      CLAUDE_CONFIG_DIR="$ACCOUNT" CLAUDE_SECURESTORAGE_CONFIG_DIR="$ACCOUNT" \
+      FM_CROSSCHECK_REVIEW_GENERATION="$REVIEW_GENERATION" PATH="$PATH" \
+      claude -p --safe-mode --model "$MODEL" --effort "$EFFORT" \
       --dangerously-skip-permissions --tools "" --no-session-persistence \
       --disable-slash-commands --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
       --output-format json --json-schema "$(<"$SCHEMA")" "$(<"$PROMPT")" >"$BASE/claude-envelope.json"

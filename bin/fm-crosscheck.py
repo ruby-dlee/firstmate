@@ -40,6 +40,11 @@ FINDING_ID_RE = re.compile(r"^cc-[0-9a-f]{12}$")
 ACTIVE_LIFECYCLES = {"open", "claimed-fixed"}
 ALL_LIFECYCLES = ACTIVE_LIFECYCLES | {"verified-fixed", "closed-equivalent"}
 SEVERITIES = {"blocking", "high", "medium", "low"}
+# Legacy author-admission sentinel: the Azure adapter re-verifies a
+# legacy-admitted reviewer account only when a future authorship record
+# opts in with this exact mode; current task metadata never sets it.
+LEGACY_AUTHOR_ADMISSION_MODE = "legacy-author-admission"
+
 MAX_CAPTURE = 200_000
 DEFAULT_REVIEWER_CAPTURE = 16 * 1024 * 1024
 MAX_REVIEWER_CAPTURE = 64 * 1024 * 1024
@@ -4095,6 +4100,12 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
                             snapshot_value=snapshot_value,
                             ledger=ledger,
                             config=config,
+                            # Task metadata carries no upstream authorship
+                            # account record; reviewer independence stays
+                            # structural (the dedicated Crosscheck account
+                            # pool) and the adapter's same-account refusal
+                            # arms once an authorship identity exists.
+                            author_account_identity="",
                         )
                     else:
                         raw_review = run_reviewer(

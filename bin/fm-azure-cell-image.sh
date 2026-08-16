@@ -88,7 +88,26 @@ az vm deallocate --resource-group "$RESOURCE_GROUP" --name "$BUILDER" --output n
 az vm generalize --resource-group "$RESOURCE_GROUP" --name "$BUILDER" --output none
 az image create --resource-group "$RESOURCE_GROUP" --name "$IMAGE" \
   --source "$BUILDER" --hyper-v-generation V2 --output none
-IMAGE_ID=$(az image show --resource-group "$RESOURCE_GROUP" --name "$IMAGE" --query id -o tsv)
+MANAGED_ID=$(az image show --resource-group "$RESOURCE_GROUP" --name "$IMAGE" --query id -o tsv)
+
+# The v6 SKU families are NVMe-only and a plain managed image cannot carry
+# the DiskControllerTypes capability (generation 053 ground truth: every
+# dispatch refused with "cannot boot with OS image or disk"), so the
+# bootable artifact is a Compute Gallery image version whose definition
+# declares SCSI+NVMe and TrustedLaunchSupported.
+az sig create --resource-group "$RESOURCE_GROUP" --gallery-name fmcellgallery --output none
+az sig image-definition show --resource-group "$RESOURCE_GROUP" --gallery-name fmcellgallery \
+  --gallery-image-definition fm-cell --output none 2>/dev/null || \
+az sig image-definition create --resource-group "$RESOURCE_GROUP" --gallery-name fmcellgallery \
+  --gallery-image-definition fm-cell --publisher firstmate --offer fm-cell --sku fm-cell \
+  --os-type Linux --os-state Generalized --hyper-v-generation V2 \
+  --features "DiskControllerTypes=SCSI,NVMe SecurityType=TrustedLaunchSupported" --output none
+VERSION=1.0.$(date -u +%s)
+az sig image-version create --resource-group "$RESOURCE_GROUP" --gallery-name fmcellgallery \
+  --gallery-image-definition fm-cell --gallery-image-version "$VERSION" \
+  --managed-image "$MANAGED_ID" --target-regions eastus --replica-count 1 --output none
+IMAGE_ID=$(az sig image-version show --resource-group "$RESOURCE_GROUP" --gallery-name fmcellgallery \
+  --gallery-image-definition fm-cell --gallery-image-version "$VERSION" --query id -o tsv)
 
 echo "fm-azure-cell-image: deleting builder" >&2
 az vm delete --resource-group "$RESOURCE_GROUP" --name "$BUILDER" --yes --output none

@@ -867,9 +867,20 @@ def provision_model_vm(
 def submit_model_run(
     config: dict[str, Any], identity: dict[str, str], resources: dict[str, Any]
 ) -> dict[str, Any]:
+    # The identity read expects the raw ARM shape (properties.vmId plus the
+    # top-level etag the cleanup identity records), and `az vm show` neither
+    # accepts this --expand form nor returns that shape.
     vm, rc, detail = az(
         config,
-        ["vm", "show", "--ids", resources["vm_id"], "--expand", "instanceView"],
+        [
+            "rest",
+            "--method",
+            "get",
+            "--url",
+            "https://management.azure.com"
+            + resources["vm_id"]
+            + "?api-version=2024-03-01&$expand=instanceView",
+        ],
         check=False,
     )
     if rc != 0:

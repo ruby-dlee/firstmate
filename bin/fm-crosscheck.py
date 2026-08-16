@@ -317,6 +317,14 @@ def account_identity(harness: str, account_home: Path) -> str:
         if isinstance(refresh, str) and refresh.strip():
             digest = hashlib.sha256(refresh.strip().encode("utf-8")).hexdigest()
             return "claude-refresh-digest:" + digest
+        # Access-token-only credentials (the dedicated reviewer pool carries
+        # an empty refreshToken): the access token is the only account-bound
+        # material, and two homes mirroring one account share it byte for
+        # byte at any moment, which is the same-account condition screened.
+        access = oauth.get("accessToken") if isinstance(oauth, dict) else None
+        if isinstance(access, str) and access.strip():
+            digest = hashlib.sha256(access.strip().encode("utf-8")).hexdigest()
+            return "claude-access-digest:" + digest
         tool_fail(
             f"Claude credential at {home} exposes no executing account identity"
         )

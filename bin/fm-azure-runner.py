@@ -57,7 +57,7 @@ LOCAL_COMMAND_TIMEOUT_SECONDS = 300
 # own generous-but-bounded deadline.
 DEPLOYMENT_TIMEOUT_SECONDS = 900
 # Admission-lock acquisition tries, spaced ten seconds apart.
-LEASE_ACQUIRE_ATTEMPTS = 90
+LEASE_ACQUIRE_ATTEMPTS = 240
 COST_QUERY_TIMEOUT_SECONDS = 60
 COST_RETRY_DEADLINE_SECONDS = 900
 COST_CACHE_MAX_AGE_SECONDS = 4 * 60 * 60
@@ -3493,6 +3493,14 @@ def dispatch_prepared(env, state, confirm_subscription, confirm_cost_admission_m
             "scope, SKU, exact foundation, and shared regional/family/actual-forecast cost admission passed",
             cost=cost,
         )
+        # Read-only proofs and per-invocation staging need no shared-state
+        # protection, so they run before the lease: concurrent shard
+        # transports previously serialized their multi-minute snapshot
+        # uploads and GitHub re-proofs behind one holder, and generation
+        # 052's fourth transport timed out waiting on exactly that.
+        reprove_public_request(state)
+        verify_all_reservation_rbac_zero(env)
+        stage_private_snapshot(env, state)
         with ManagementAdmissionLease(env, state) as lease:
             foundation_gate(env)
             sku_quota_gate(env, limits)
@@ -3515,12 +3523,12 @@ def dispatch_prepared(env, state, confirm_subscription, confirm_cost_admission_m
                 sku_quota_gate(env, limits)
             foundation_gate(env)
             validation_capacity_parent_gate(env, state)
-            reprove_public_request(state)
-            verify_all_reservation_rbac_zero(env)
-            stage_private_snapshot(env, state)
-            lease.renew_and_assert()
-            create_vm(env, state)
-            lease.assert_held()
+        # The durable fence-bound reservation recorded above is the shared
+        # capacity claim; VM creation only materializes it and binds the
+        # invocation tags atomically at create, so concurrent transports
+        # may create their own compute in parallel instead of holding the
+        # admission lease through a multi-minute control-plane operation.
+        create_vm(env, state)
         create_run_command(env, state)
         poll_run_command(env, state)
         result = collect_result(env, state)

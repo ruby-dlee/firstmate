@@ -32,7 +32,16 @@ nic = next(item for item in resources if item["type"] == "Microsoft.Network/netw
 vm = next(item for item in resources if item["type"] == "Microsoft.Compute/virtualMachines")
 assert "publicipaddress" not in json.dumps(nic).lower()
 assert "identity" not in vm
-assert "ssh" not in json.dumps(vm["properties"]["osProfile"]).lower()
+# Azure refuses a Linux profile with password auth disabled and no SSH key,
+# so the profile carries the crosscheck blackhole key: nobody holds its
+# private half, which is the same no-operator-access posture as no key at
+# all (the exact pattern the validation cell template proved live).
+linux = vm["properties"]["osProfile"]["linuxConfiguration"]
+assert linux["disablePasswordAuthentication"] is True
+blackhole = linux["ssh"]["publicKeys"][0]
+assert blackhole["path"] == "/home/fmbootstrap/.ssh/authorized_keys"
+assert blackhole["keyData"].startswith("ssh-rsa ")
+assert blackhole["keyData"].endswith(" firstmate-crosscheck-blackhole")
 assert vm["properties"]["securityProfile"]["securityType"] == "TrustedLaunch"
 assert vm["properties"]["storageProfile"]["imageReference"] == {"id": "[parameters('modelImageId')]"}
 source = adapter.read_text(encoding="utf-8")

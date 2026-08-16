@@ -1650,6 +1650,27 @@ def dispatch(env, args):
         if not candidates:
             print("AZURE VALIDATION QUEUE empty active=0")
             return
+        # A queued submission whose shape reservation has been released is
+        # a superseded corpse, not a candidate: dispatching it runs a cell
+        # outside its capacity accounting and every shard transport fails
+        # on its released constituent (generation 054 ground truth, where
+        # an operator supersede raced this FIFO). Skip released fences.
+        controller_path = env["home"] / "state" / "azure-workers" / "controller.json"
+        try:
+            reservations = json.loads(controller_path.read_text(encoding="utf-8")).get("capacity_reservations", {})
+        except (OSError, json.JSONDecodeError):
+            reservations = {}
+        live = []
+        for item in candidates:
+            entry = reservations.get(item.get("cell"))
+            if entry is not None and entry.get("status") == "released":
+                print("AZURE VALIDATION SKIPPED cell={} shape reservation already released".format(item.get("cell")))
+                continue
+            live.append(item)
+        candidates = live
+        if not candidates:
+            print("AZURE VALIDATION QUEUE empty active=0")
+            return
         state = candidates[0]
         if state["request"]["deployment_generation"] != env["deployment_generation"]:
             raise ValidationError("queued request deployment generation differs from the live foundation")

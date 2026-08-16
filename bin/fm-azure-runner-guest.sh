@@ -128,6 +128,12 @@ getent group fmrunner >/dev/null 2>&1 || groupadd --system fmrunner
 id fmrunner >/dev/null 2>&1 || useradd --system --gid fmrunner --home-dir /work/home --shell /usr/sbin/nologin fmrunner
 RUNNER_UID=$(id -u fmrunner); RUNNER_GID=$(id -g fmrunner)
 install -d -m 0700 -o fmrunner -g fmrunner /work/home /work/repo /work/home/.fm-runner-tools/bin /work/home/.fm-runner-tools/uv /work/home/.fm-runner-tools/wheelhouse
+# Same-device temp root for the repository command: the executor unit's
+# PrivateTmp puts /tmp on its own tmpfs, which breaks tests that hard-link
+# between their temp root and the work mount (generation 051 ground
+# truth). Created here because the unconfined bootstrap can always
+# guarantee it; the sandboxed executor only points TMPDIR at it.
+install -d -m 1777 -o fmrunner -g fmrunner /work/tmp
 chown fmrunner:fmrunner /work
 
 runuser -u fmrunner -- git -C /work/repo init -q

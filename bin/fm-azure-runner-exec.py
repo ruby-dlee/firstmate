@@ -202,8 +202,13 @@ def main():
     work_tmp = Path(repo).resolve().parent / "tmp"
     try:
         work_tmp.mkdir(exist_ok=True)
+    except OSError:
+        pass
+    try:
         os.chmod(work_tmp, 0o1777)
     except OSError:
+        pass
+    if not work_tmp.is_dir() or not os.access(work_tmp, os.W_OK):
         work_tmp = None
     child_env = {
         "HOME": "/work/home",

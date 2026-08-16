@@ -177,8 +177,8 @@ case "$HARNESS" in
       claude -p --safe-mode --model "$MODEL" --effort "$EFFORT" \
       --dangerously-skip-permissions --tools "" --no-session-persistence \
       --disable-slash-commands --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
-      --output-format json --json-schema "$(<"$SCHEMA")" "$(<"$PROMPT")" \
-      >"$BASE/claude-envelope.json" 2>"$BASE/claude-stderr.log"
+      --output-format json --json-schema "$(<"$SCHEMA")" \
+      <"$PROMPT" >"$BASE/claude-envelope.json" 2>"$BASE/claude-stderr.log"
     claude_rc=$?
     set -e
     if [ "$claude_rc" -ne 0 ] || ! jq -e '.is_error == false and .subtype == "success" and .terminal_reason == "completed" and (.structured_output|type == "object")' "$BASE/claude-envelope.json" >/dev/null 2>&1; then

@@ -9,6 +9,9 @@ set -u
 
 SCRIPT="$ROOT/bin/fm-azure-pilot.sh"
 TEMPLATE="$ROOT/docs/azure-pilot/main.json"
+WORKER_PROVIDER="$ROOT/bin/fm-azure-worker-provider.py"
+# A separate handle from TEMPLATE, which later cases reassign in subshells.
+WORKER_TEMPLATE="$ROOT/docs/azure-pilot/main.json"
 DOC="$ROOT/docs/azure-pilot.md"
 
 run_static_template_checks() {
@@ -855,7 +858,7 @@ assert seen["timeout"] >= request["wall_seconds"] + 1800, (
 )
 print("OK")
 GUESTBOUND
-  out=$(python3 "$tmp/driver.py" "$ROOT/bin/fm-azure-worker-provider.py" "$tmp" 2>&1)
+  out=$(python3 "$tmp/driver.py" "$WORKER_PROVIDER" "$tmp" 2>&1)
   expect_code 0 $? "the blocking execute call must cover a whole guest run: $out"
   assert_contains "$out" "OK" "the guest-run bound driver did not complete: $out"
   pass "the blocking worker execute call is bounded by the whole guest run"
@@ -865,7 +868,7 @@ run_worker_os_disk_image_check() {
   # A captured golden image carries its own OS disk size, and Azure refuses any
   # smaller pin outright ("disk size 64 GB is smaller than ... 96 GB"), so the
   # worker template must not assert a size it cannot know.
-  python3 - "$ROOT/docs/azure-pilot/main.json" <<'OSDISK' || fail "the worker OS disk pins a size it cannot know"
+  python3 - "$WORKER_TEMPLATE" <<'OSDISK' || fail "the worker OS disk pins a size it cannot know"
 import json
 import re
 import sys

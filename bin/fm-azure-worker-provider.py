@@ -54,15 +54,29 @@ OUTCOME_BLOB_PREFIX = "outcome-"
 # two literals are kept in step by a test rather than by runtime coupling.
 MAX_OUTCOME_BYTES = 256 * 1024 * 1024
 # Staging (archive fetches plus the repository clone) runs BEFORE the wall
-# starts, and bundle creation plus upload runs after it ends. Every bound that
-# has to cover a whole guest run measures wall plus this, never wall alone.
-# Staging (archive fetches plus the repository clone) runs BEFORE the wall
 # starts and collection runs after it ends, so a bound covering a whole guest
-# run is wall plus this. The GUEST gives up first and the client waiting on it
-# gets the extra margin, so a guest timeout is reported rather than raced.
-GUEST_RUN_SLACK_SECONDS = 1800
-CLIENT_WAIT_SLACK_SECONDS = 2400
+# run is wall plus this, never wall alone. The GUEST gives up first and the
+# client waiting on it gets the extra margin, so a guest timeout is reported
+# rather than raced.
+#
+# The floor is the supervisor's OWN worst case outside the wall, summed from
+# its per-step timeouts: payload fetch 300 + account fetch 300 + clone 600 +
+# rev-parse 60 + rev-list 120 + status 120 + bundle 600 + upload 600 = 2700.
+# Undershooting it is not a slow failure, it is a DESTRUCTIVE one: an Azure
+# kill is not an exception the supervisor can catch, so no executed marker is
+# written, and the next dispatch re-runs the command and rmtrees the staged
+# repository, deleting the commits the killed run had already made.
+# tests/fm-azure-pilot.test.sh derives this floor from the supervisor source so
+# it cannot rot back under the budget.
+GUEST_RUN_SLACK_SECONDS = 3000
+CLIENT_WAIT_SLACK_SECONDS = 3600
 AZ_TIMEOUT_SECONDS = 300
+# The bootstrap run command blocks on the guest too. Its work is bounded and
+# much smaller than a task: a per-disk device wait (60s each), mkfs and the
+# mounts, plus the supervisor install. Same nesting rule as the execute path,
+# the guest gives up first so its timeout is what gets reported.
+BOOTSTRAP_GUEST_TIMEOUT_SECONDS = 1800
+BOOTSTRAP_CLIENT_TIMEOUT_SECONDS = 2400
 RESOURCE_API = {
     "vm": "2024-03-01",
     "nic": "2023-09-01",
@@ -1525,11 +1539,21 @@ def create_lifecycle_children(controller, action):
     vm_name = names["vm"]
     tags = action_tags(controller, action)
     script, supervisor_digest = bootstrap_script(action)
+    # This BLOCKS on the guest exactly like the execute path does, and for the
+    # same reason it cannot take the ordinary control-plane bound: the script
+    # waits up to 60s per data disk for the device to appear, then runs mkfs
+    # and the mounts. Under the default 300s the CLI gives up while the guest
+    # carries on, and the controller records a failed create for a VM that is
+    # in fact alive and finishing - the precise outcome
+    # PROVIDER_CREATE_TIMEOUT_SECONDS exists to prevent, which it cannot do
+    # from the outside while the inner bound fires 6900 seconds earlier.
     _, rc, stderr = az(controller, [
         "vm", "run-command", "create", "--resource-group", controller["resource_group"],
         "--vm-name", vm_name, "--name", names["bootstrap-command"],
-        "--script", script, "--async-execution", "false", "--tags",
-    ] + ["{}={}".format(key, value) for key, value in sorted(tags.items())], check=False)
+        "--script", script, "--async-execution", "false",
+        "--timeout-in-seconds", str(BOOTSTRAP_GUEST_TIMEOUT_SECONDS), "--tags",
+    ] + ["{}={}".format(key, value) for key, value in sorted(tags.items())], check=False,
+        timeout=BOOTSTRAP_CLIENT_TIMEOUT_SECONDS)
     if rc != 0:
         raise ProviderError("pinned worker supervisor bootstrap failed: {}".format(stderr))
     # A managed Run Command reports create success even when the guest script

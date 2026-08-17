@@ -64,6 +64,13 @@ PROVIDER_TIMEOUT_SECONDS = 300
 # failure this exists to stop: hanging up while Azure carries on and leaving a
 # live VM the controller never recorded.
 PROVIDER_CREATE_TIMEOUT_SECONDS = 7200
+# A steer is a control-plane action, but not a cheap one: the provider runs a
+# full inventory sweep, then a blocking run-command invoke at its own 300s
+# bound, then another sweep. Leaving it at PROVIDER_TIMEOUT_SECONDS makes the
+# controller bound EQUAL to just the inner invoke, so an ordinary steer whose
+# sweeps take any time at all is killed by the controller and reported as a
+# missed deadline while the steer may already have landed in the guest.
+PROVIDER_STEER_TIMEOUT_SECONDS = 1200
 # Strictly larger than the provider's own client wait, because the provider
 # runs a full inventory sweep, archive builds, uploads and SAS mints BEFORE the
 # blocking call and another sweep plus a result upload AFTER it. A controller
@@ -427,6 +434,8 @@ def provider_action_timeout(action):
         return PROVIDER_GUEST_RUN_SLACK_SECONDS
     if action.get("type") in ("create", "resume", "reset", "delete-compute", "deallocate"):
         return PROVIDER_CREATE_TIMEOUT_SECONDS
+    if action.get("type") == "steer":
+        return PROVIDER_STEER_TIMEOUT_SECONDS
     return PROVIDER_TIMEOUT_SECONDS
 
 

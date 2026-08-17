@@ -782,6 +782,7 @@ run_guest_run_bound_check() {
   cat >"$tmp/driver.py" <<'GUESTBOUND'
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -917,8 +918,31 @@ assert command.index("--timeout-in-seconds") < command.index("--protected-parame
     "the guest bound sits after --protected-parameters and would be swallowed", command,
 )
 guest_bound = int(command[command.index("--timeout-in-seconds") + 1])
-assert guest_bound >= request["wall_seconds"] + 1800, (
-    "the guest run-command bound does not cover its own wall", guest_bound,
+# The floor is DERIVED from the supervisor's own per-step timeouts, not from
+# GUEST_RUN_SLACK_SECONDS: asserting against the constant under test certifies
+# whatever value it happens to hold, which is how a bound 900s under the real
+# budget passed review once already. Everything the supervisor does outside the
+# wall (payload fetch, account fetch, clone, rev-parse, rev-list, status,
+# bundle, upload) has an explicit `timeout=` in its source; their sum is the
+# smallest guest bound that cannot kill a run mid-collection. An Azure kill is
+# not catchable, so undershooting deletes the crewmate's commits on the next
+# dispatch rather than merely losing the outcome.
+supervisor_source = Path(sys.argv[1]).with_name("fm-worker-supervisor.py").read_text()
+step_timeouts = [int(value) for value in re.findall(r"timeout=(\d+)", supervisor_source)]
+assert len(step_timeouts) >= 6, ("the supervisor timeout scan found almost nothing, so the "
+                                 "floor below is not a real budget", step_timeouts)
+# A source scan counts each bounded step ONCE, but fetch_archive is defined
+# once and called twice (payload, then account), so the scan alone understates
+# the real worst case by one fetch and would happily certify a bound 300s short.
+fetch_timeout = int(re.search(r"opener\.open\(url, timeout=(\d+)\)", supervisor_source).group(1))
+fetch_calls = len(re.findall(r"fetch_archive\(\"", supervisor_source))
+assert fetch_calls >= 2, ("fetch_archive call sites are no longer countable, so the extra "
+                          "fetch below is guesswork", fetch_calls)
+collection_floor = sum(step_timeouts) + (fetch_calls - 1) * fetch_timeout
+assert guest_bound >= request["wall_seconds"] + collection_floor, (
+    "the guest run-command bound is under the supervisor's own non-wall budget, so a slow "
+    "collection is killed and its commits are destroyed on redispatch",
+    guest_bound, request["wall_seconds"], collection_floor,
 )
 
 # The controller bounds the whole provider process, which does a full inventory
@@ -937,8 +961,10 @@ assert seen["timeout"] > guest_bound, (
 )
 print("OK")
 GUESTBOUND
-  out=$(python3 "$tmp/driver.py" "$WORKER_PROVIDER" "$WORKER_LIFECYCLE" "$tmp" 2>&1) || true
-  expect_code 0 $? "the blocking execute call must cover a whole guest run: $out"
+  # NOT `|| true`: that makes the compound status unconditionally 0, so the
+  # expect_code below can never fail and only assert_contains still guards.
+  if out=$(python3 "$tmp/driver.py" "$WORKER_PROVIDER" "$WORKER_LIFECYCLE" "$tmp" 2>&1); then status=0; else status=$?; fi
+  expect_code 0 "$status" "the blocking execute call must cover a whole guest run: $out"
   assert_contains "$out" "OK" "the guest-run bound driver did not complete: $out"
   pass "the blocking worker execute call is bounded by the whole guest run"
 }
@@ -1197,7 +1223,17 @@ def recording_upload(controller, account, container, name, value, tags, **kwargs
 
 
 provider.upload_json_blob = recording_upload
-provider.az = lambda controller, args, check=True, timeout=None: ({}, 0, "")
+# Record every az call the REAL create makes, so the bootstrap run command's
+# bounds are asserted from the call site rather than from a fixture.
+captured_az = []
+
+
+def recording_az(controller, args, check=True, timeout=None):
+    captured_az.append((list(args), timeout))
+    return {}, 0, ""
+
+
+provider.az = recording_az
 provider.run_command_instance_view = lambda *a, **k: {"executionState": "Succeeded", "output": "", "error": ""}
 # The real key set, so a rename in expected_names surfaces here rather than
 # being papered over by a short fixture.
@@ -1221,6 +1257,61 @@ except Exception as exc:  # noqa: BLE001 - the uploads are what this asserts on
 finally:
     provider.upload_json_blob = _real_upload
 
+# The bootstrap run command BLOCKS on the guest exactly like the execute does:
+# it waits up to 60s per data disk for the device node, then runs mkfs and the
+# mounts. Left on the ordinary control-plane bound the CLI hangs up while the
+# guest carries on, and the controller records a failed create for a VM that is
+# alive - which is the failure PROVIDER_CREATE_TIMEOUT_SECONDS is supposed to
+# prevent and cannot, from the outside, if the inner bound fires first.
+run_commands = [
+    (args, timeout) for args, timeout in captured_az
+    if args[:3] == ["vm", "run-command", "create"]
+]
+assert len(run_commands) == 2, ("the create no longer issues the bootstrap and the task stub, "
+                                "so the split below is wrong", [a for a, _ in run_commands])
+# Select by what actually matters - whether the call BLOCKS on the guest -
+# rather than by name, so a renamed command cannot quietly skip these bounds.
+blocking = [
+    (args, timeout) for args, timeout in run_commands
+    if args[args.index("--async-execution") + 1] == "false"
+]
+non_blocking = [
+    (args, timeout) for args, timeout in run_commands
+    if args[args.index("--async-execution") + 1] == "true"
+]
+assert len(blocking) == 1 and len(non_blocking) == 1, (
+    "the blocking/non-blocking split of the create's run commands changed",
+    [(a[a.index("--name") + 1], a[a.index("--async-execution") + 1]) for a, _ in run_commands],
+)
+bootstrap_args, bootstrap_client_timeout = blocking[0]
+# The fire-and-forget stub returns immediately and correctly stays on the
+# ordinary control-plane bound; pinning that keeps this case honest about
+# which call the bounds below are for.
+stub_args, stub_timeout = non_blocking[0]
+assert stub_timeout in (None, provider.AZ_TIMEOUT_SECONDS), (
+    "a non-blocking run command took a long bound it does not need", stub_timeout,
+)
+assert "--timeout-in-seconds" in bootstrap_args, (
+    "the blocking bootstrap carries no guest bound, so Azure applies its own default while "
+    "the CLI waits", bootstrap_args,
+)
+bootstrap_guest = int(bootstrap_args[bootstrap_args.index("--timeout-in-seconds") + 1])
+assert bootstrap_client_timeout is not None and bootstrap_client_timeout > bootstrap_guest, (
+    "the client hangs up at or before the guest bound it set, so a bootstrap timeout races",
+    bootstrap_client_timeout, bootstrap_guest,
+)
+assert bootstrap_client_timeout > provider.AZ_TIMEOUT_SECONDS, (
+    "the bootstrap is still on the ordinary control-plane bound",
+    bootstrap_client_timeout, provider.AZ_TIMEOUT_SECONDS,
+)
+# --tags is nargs-many: anything after it is swallowed as another tag, so the
+# guest bound has to be placed before it or it is silently lost.
+assert "--tags" in bootstrap_args, ("the fixture built no tags, so the ordering below proves "
+                                    "nothing", bootstrap_args)
+assert bootstrap_args.index("--timeout-in-seconds") < bootstrap_args.index("--tags"), (
+    "the bootstrap guest bound sits after --tags and would be swallowed", bootstrap_args,
+)
+
 reservation_uploads = [item for item in captured_uploads if "reservation" in item[0]]
 assert reservation_uploads, (
     "create_lifecycle_children uploaded no reservation",
@@ -1232,8 +1323,8 @@ assert "ttl_deadline" in reservation_uploads[0][1], (
 )
 print("OK")
 CREATEREPLAY
-  out=$(python3 "$tmp/driver.py" "$WORKER_PROVIDER" "$tmp" 2>&1) || true
-  expect_code 0 $? "a create replay must converge on identical content: $out"
+  if out=$(python3 "$tmp/driver.py" "$WORKER_PROVIDER" "$tmp" 2>&1); then status=0; else status=$?; fi
+  expect_code 0 "$status" "a create replay must converge on identical content: $out"
   assert_contains "$out" "OK" "the create-replay driver did not complete: $out"
   pass "a create-once staging blob converges on replay and still refuses different content"
 }
@@ -1251,6 +1342,11 @@ import sys
 spec = importlib.util.spec_from_file_location("fm_lifecycle", sys.argv[1])
 lifecycle = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(lifecycle)
+# The provider module supplies the INNER bounds this file's floors are
+# measured against, so they never restate a lifecycle constant.
+provider_spec = importlib.util.spec_from_file_location("fm_provider", sys.argv[2])
+provider = importlib.util.module_from_spec(provider_spec)
+provider_spec.loader.exec_module(provider)
 
 # A VM create is an ARM deployment measured in minutes and an execute blocks
 # for the whole guest run; neither fits the ordinary control-plane bound.
@@ -1278,8 +1374,18 @@ execute = lifecycle.provider_action_timeout(
 )
 assert execute >= 3600 + 1800, ("an execute is bounded below its own guest run", execute)
 
+# A steer is not an ordinary read: the provider runs a full inventory sweep,
+# then a BLOCKING run-command invoke at its own bound, then another sweep. A
+# controller bound merely EQUAL to that inner invoke kills the steer whenever
+# the sweeps cost anything, and reports a missed deadline for a steer that may
+# already have landed in the guest. The floor is the provider's inner bound
+# read from the provider module, never the lifecycle constant under test.
+steer = lifecycle.provider_action_timeout({"type": "steer"})
+assert steer > provider.AZ_TIMEOUT_SECONDS, (
+    "the controller bound for a steer does not outlast the blocking invoke inside it",
+    steer, provider.AZ_TIMEOUT_SECONDS,
+)
 # An ordinary read stays on the ordinary bound.
-assert lifecycle.provider_action_timeout({"type": "steer"}) == lifecycle.PROVIDER_TIMEOUT_SECONDS
 assert lifecycle.provider_action_timeout(None) == lifecycle.PROVIDER_TIMEOUT_SECONDS
 # A malformed wall must not produce a shorter bound than a bare guest run.
 assert lifecycle.provider_action_timeout({"type": "execute", "request": {}}) >= 1800
@@ -1335,8 +1441,8 @@ assert execute_timeout >= 3600 + 1800, (
 )
 print("OK")
 PROVIDERBOUND
-  out=$(python3 "$tmp/driver.py" "$WORKER_LIFECYCLE" 2>&1) || true
-  expect_code 0 $? "the provider subprocess bound must cover its action: $out"
+  if out=$(python3 "$tmp/driver.py" "$WORKER_LIFECYCLE" "$WORKER_PROVIDER" 2>&1); then status=0; else status=$?; fi
+  expect_code 0 "$status" "the provider subprocess bound must cover its action: $out"
   assert_contains "$out" "OK" "the provider-bound driver did not complete: $out"
   pass "the provider subprocess bound covers the action it runs"
 }

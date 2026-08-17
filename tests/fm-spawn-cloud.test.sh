@@ -602,9 +602,48 @@ test_cloud_monitor_launch_carries_fm_home() {
   read_cloud_case "$record"
   out=$(FM_TEST_ACTUAL_USD=2000 run_cloud_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR")
   expect_code 0 $? "the monitor-env cloud spawn should succeed: $out"
-  grep -F 'fm-spawn-cloud-monitor.sh' "$CASE_DIR/herdr.log" | grep -q "FM_HOME=$HOME_DIR" \
+  grep -F 'fm-spawn-cloud-monitor.sh' "$CASE_DIR/herdr.log" | grep -qF "FM_HOME=$HOME_DIR" \
     || fail "the Herdr monitor launch string does not carry FM_HOME: $(grep -F 'fm-spawn-cloud-monitor.sh' "$CASE_DIR/herdr.log" | head -1)"
-  pass "the cloud monitor launch string carries FM_HOME for the closed Herdr pane environment"
+  grep -F 'fm-spawn-cloud-monitor.sh' "$CASE_DIR/herdr.log" | grep -qF "FM_STATE_OVERRIDE=$HOME_DIR/state" \
+    || fail "the Herdr monitor launch string does not carry the spawn's state directory"
+  pass "the cloud monitor launch string carries FM_HOME and the state override for the closed Herdr pane environment"
+}
+
+test_respawn_sweeps_stale_cloud_artifacts() {
+  # Cloud state files are keyed by task ID while the queue is keyed by
+  # ID@GENERATION. A re-spawn that inherits the previous generation's result
+  # would kill the new monitor at once, and an inherited dispatch marker
+  # would make BOTH owners stand down, so the new worker would never run its
+  # entrypoint. The spawn must sweep them before the tracking pane exists.
+  local record id out
+  id=cloud-swp-c14
+  record=$(make_cloud_case respawn-sweep "$id")
+  read_cloud_case "$record"
+  printf '{"stale":"previous-generation"}\n' > "$HOME_DIR/state/$id.worker-result.json"
+  : > "$HOME_DIR/state/$id.cloud-execute-dispatched"
+  printf 'stale execute log\n' > "$HOME_DIR/state/$id.worker-execute.log"
+  printf 'stale entrypoint\n' > "$HOME_DIR/state/$id.cloud-entrypoint"
+  out=$(run_cloud_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR")
+  expect_code 0 $? "a spawn over stale cloud artifacts should succeed: $out"
+  assert_contains "$out" "placement=azure worker=executing" \
+    "the spawn over stale artifacts did not reach the executing state: $out"
+  local deadline
+  deadline=$(( $(date +%s) + 30 ))
+  while :; do
+    if [ -s "$HOME_DIR/state/$id.worker-result.json" ] \
+      && grep -F '"exit_code":0' "$HOME_DIR/state/$id.worker-result.json" >/dev/null 2>&1; then
+      break
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      fail "the re-spawn never produced a fresh bounded result: $(cat "$HOME_DIR/state/$id.worker-execute.log" 2>/dev/null)"
+    fi
+    sleep 0.2
+  done
+  grep -F 'previous-generation' "$HOME_DIR/state/$id.worker-result.json" >/dev/null 2>&1 \
+    && fail "the fresh result still carries the stale generation's content"
+  grep -F 'stale entrypoint' "$HOME_DIR/state/$id.cloud-entrypoint" >/dev/null 2>&1 \
+    && fail "the stale entrypoint survived the re-spawn sweep"
+  pass "a re-spawn sweeps the previous generation's cloud artifacts before the tracking pane exists"
 }
 
 test_queued_spawn_converges_through_the_monitor() {
@@ -703,6 +742,7 @@ test_cloud_switch_off_keeps_the_local_path_and_metadata_shape
 test_cloud_spawn_places_worker_and_runs_the_entrypoint
 test_cloud_spawn_stays_durably_queued_without_admission
 test_cloud_monitor_launch_carries_fm_home
+test_respawn_sweeps_stale_cloud_artifacts
 test_queued_spawn_converges_through_the_monitor
 test_monitor_stands_down_when_dispatch_already_claimed
 test_cloud_spawn_config_file_default_and_env_override

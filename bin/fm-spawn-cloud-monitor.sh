@@ -160,6 +160,12 @@ land_outcome_bundle() {
   # the bundle was cut from; the ordinary landing flow (push, PR, teardown's
   # landed-work check) then proceeds unchanged.
   local bundle wt base head error
+  if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$RESULT" 2>/dev/null; then
+    # A refusal string or a torn write is not a result. Say so: silence here
+    # would be indistinguishable from a task that simply had nothing to land.
+    echo "cloud-crewmate $ID: worker result is not readable as a bound result; no outcome landing attempted"
+    return 0
+  fi
   error=$(result_field outcome_error)
   if [ -n "$error" ]; then
     echo "cloud-crewmate $ID: worker could not return its work: $error"

@@ -1570,6 +1570,7 @@ def parser():
     withdraw_parser.add_argument("--task", required=True)
     withdraw_parser.add_argument("--task-generation", required=True)
     withdraw_parser.add_argument("--confirm-withdraw", action="store_true")
+    withdraw_parser.add_argument("--confirm-subscription", required=True)
     reconcile_parser = sub.add_parser("reconcile", help="plan or apply bounded convergence")
     reconcile_parser.add_argument("--apply", action="store_true")
     reconcile_parser.add_argument("--confirm-subscription")
@@ -2283,6 +2284,10 @@ def command_withdraw(env, args):
     require_id("task generation", args.task_generation)
     if not args.confirm_withdraw:
         raise LifecycleError("--confirm-withdraw is required")
+    # Every other mutating subcommand demands this, and withdraw deletes
+    # durable state, so it does not get to be the lenient one.
+    if args.confirm_subscription != env["subscription"]:
+        raise LifecycleError("--confirm-subscription must exactly match FM_AZURE_SUBSCRIPTION_ID")
     with controller_lock(env):
         state = load_state(env)
         key = request_key(args.task, args.task_generation)
@@ -2294,12 +2299,34 @@ def command_withdraw(env, args):
             # Anything past `queued` has cloud capacity or a live assignment
             # behind it, and dropping the entry would strand that worker with no
             # queue owner. Those go out through release.
+            # `release` only accepts `assigned`, so pointing a `complete` or
+            # `releasing` entry at it would be impossible advice.
+            remedy = "release it instead" if status == "assigned" else (
+                "it is already past the queue and no longer counts as demand"
+            )
             raise LifecycleError(
-                "withdraw refuses a task generation that is already {}; release it instead".format(status)
+                "withdraw refuses a task generation that is already {}; {}".format(status, remedy)
             )
         for worker in state["workers"].values():
             if worker.get("queue_key") == key:
                 raise LifecycleError("withdraw refuses a task generation a worker still owns")
+        # An in-flight or wedged action names its queue owner. Deleting the
+        # entry out from under it does not fail loudly: the next reconcile
+        # replays the pending action, apply_action_result cannot find the owner
+        # and raises, and because the pending action never clears, that repeats
+        # forever. One stale entry would take the whole fleet's convergence
+        # with it.
+        pending = state.get("pending_action") or {}
+        pending_request = pending.get("request") or {}
+        pending_bindings = pending.get("bindings") or {}
+        for candidate in (pending_request, pending_bindings):
+            if candidate.get("task") is None:
+                continue
+            if request_key(candidate["task"], candidate["task_generation"]) == key:
+                raise LifecycleError(
+                    "withdraw refuses a task generation a pending {} action still names; "
+                    "reconcile it first".format(pending.get("type", "provider"))
+                )
         del state["queue"][key]
         save_state(env, state)
     print("withdrew queued request {}".format(key))

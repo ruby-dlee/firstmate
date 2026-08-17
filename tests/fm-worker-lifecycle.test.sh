@@ -26,12 +26,17 @@ azure = Path(sys.argv[2]).read_text(encoding="utf-8")
 supervisor = Path(sys.argv[3]).read_text(encoding="utf-8")
 authority = Path(sys.argv[4]).read_text(encoding="utf-8")
 doc = Path(sys.argv[5]).read_text(encoding="utf-8")
+# The operator contract in docs/azure-workers.md owns the queue's mutations. A
+# new one that is not written there leaves the doc stating, wrongly, that
+# release is the only exit.
+assert "withdraw" in doc, "docs/azure-workers.md does not document the withdraw queue mutation"
 for marker in (
     '"assigned", "clean-warm", "deallocated", "orphaned-safe-to-delete", "retained-for-investigation"',
     "REGIONAL_ADMISSION_CEILING_VCPUS = 128", "AUTHOR_PLAN_VCPUS = MAX_WORKERS * VCPUS_PER_WORKER",
     "SPECIALIZED_SHAPE_VCPUS = 40", "SHARED_HEADROOM_VCPUS = 22", "MAX_WORKERS = 16",
     'FM_AZURE_WORKER_WARM_IDLE currently must remain zero', "pending_action",
     "capacity-reserve", "capacity-reserve-shape", "capacity-release", "merged_specialized_reservations",
+    "command_withdraw",
     "REVIEWED_CONTROL_SKU_FAMILY", "command_capacity_reserve_shape",
     "fm.worker-authority/v1", "authority-receipt", "fm.worker-execution/v1",
 ):
@@ -1037,19 +1042,26 @@ assert [item for item in plan["actions"] if item["type"] == "create"], (
     "a queued request did not pull a worker, so the withdraw below proves nothing",
     plan["actions"],
 )
-refused = run("withdraw", "--task", "task-9", "--task-generation", "gen-9", check=False)
+refused = run("withdraw", "--task", "task-9", "--task-generation", "gen-9",
+                  "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"], check=False)
 assert refused.returncode != 0 and "--confirm-withdraw" in refused.stderr, refused.stderr
 assert "task-9@gen-9" in controller_state()["queue"], "a refused withdraw dropped the entry anyway"
-run("withdraw", "--task", "task-9", "--task-generation", "gen-9", "--confirm-withdraw")
+run("withdraw", "--task", "task-9", "--task-generation", "gen-9", "--confirm-withdraw",
+    "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
 withdrawn = controller_state()
 assert "task-9@gen-9" not in withdrawn["queue"], withdrawn["queue"]
-assert withdrawn["workers"] == {}, ("withdraw touched capacity", withdrawn["workers"])
+# NOT an assertion that workers is empty: at this point only a DRY reconcile
+# has run, which rolls its provisional worker back and never persists, so
+# `workers` is empty no matter what withdraw does. The real check runs below,
+# once durable capacity exists.
+assert "workers" in withdrawn
 plan = json.loads(run("reconcile", "--json").stdout)
 assert not [item for item in plan["actions"] if item["type"] == "create"], (
     "reconcile still plans a worker for a withdrawn request", plan["actions"],
 )
 assert run("withdraw", "--task", "task-9", "--task-generation", "gen-9",
-           "--confirm-withdraw", check=False).returncode != 0, "withdrawing twice succeeded"
+           "--confirm-withdraw",
+                       "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"], check=False).returncode != 0, "withdrawing twice succeeded"
 
 for number in range(1, 5):
     request(number)
@@ -1057,10 +1069,13 @@ run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION
 # An entry with a worker behind it must go out through release, not withdraw:
 # dropping it would strand that worker with no queue owner.
 assigned_refusal = run("withdraw", "--task", "task-1", "--task-generation", "gen-1",
-                       "--confirm-withdraw", check=False)
+                       "--confirm-withdraw",
+                       "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"], check=False)
 assert assigned_refusal.returncode != 0, "withdraw accepted a task a worker owns"
 assert "release it instead" in assigned_refusal.stderr, assigned_refusal.stderr
 assert "task-1@gen-1" in controller_state()["queue"], "a refused withdraw dropped an assigned entry"
+
+
 state = controller_state()
 fixture = fixture_state()
 assert len(state["workers"]) == 4 and len(fixture["workers"]) == 4
@@ -1205,6 +1220,63 @@ result = json.loads(run("reconcile", "--json").stdout)
 assert result["actions"][0]["type"] == "admission-refused"
 assert result["status"]["actual_active_workers"] == 1
 assert len(fixture_state()["workers"]) == 1
+
+# Capacity is untouched, checked where there IS capacity to touch.
+capacity_before = controller_state()["workers"]
+assert capacity_before, "no durable workers exist, so the capacity check below is vacuous"
+request(10)
+run("withdraw", "--task", "task-10", "--task-generation", "gen-10", "--confirm-withdraw",
+    "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+after_withdraw = controller_state()
+assert after_withdraw["workers"] == capacity_before, (
+    "withdraw changed durable capacity", capacity_before, after_withdraw["workers"],
+)
+assert "task-10@gen-10" not in after_withdraw["queue"], after_withdraw["queue"]
+
+# A pending provider action names its queue owner. Dropping the entry makes the
+# next reconcile replay that action, fail to find the owner, and raise forever,
+# because the pending action never clears. One stale entry would take the whole
+# fleet's convergence with it.
+request(11)
+pending_state = controller_state()
+pending_state["pending_action"] = {
+    "type": "create", "idempotency_key": "f" * 64, "slot": 9,
+    "bindings": {"task": "task-11", "task_generation": "gen-11"},
+    "request": {"task": "task-11", "task_generation": "gen-11"},
+}
+controller_file = Path(env["FM_HOME"]) / "state/azure-workers/controller.json"
+controller_file.write_text(json.dumps(pending_state, sort_keys=True, separators=(",", ":")))
+pending_refusal = run("withdraw", "--task", "task-11", "--task-generation", "gen-11",
+                      "--confirm-withdraw", "--confirm-subscription",
+                      env["FM_AZURE_SUBSCRIPTION_ID"], check=False)
+assert pending_refusal.returncode != 0, "withdraw dropped an entry a pending action names"
+assert "pending" in pending_refusal.stderr, pending_refusal.stderr
+assert "task-11@gen-11" in controller_state()["queue"], "the refused entry was dropped anyway"
+
+# A wrong subscription must refuse, like every other mutating subcommand.
+request(12)
+wrong_subscription = run("withdraw", "--task", "task-12", "--task-generation", "gen-12",
+                         "--confirm-withdraw", "--confirm-subscription",
+                         "00000000-0000-0000-0000-00000000dead", check=False)
+assert wrong_subscription.returncode != 0, "withdraw accepted a foreign subscription"
+assert "--confirm-subscription" in wrong_subscription.stderr, wrong_subscription.stderr
+assert "task-12@gen-12" in controller_state()["queue"], "the refused entry was dropped anyway"
+
+# A withdrawn request leaves no owner for the per-task cloud state bin/fm-spawn.sh
+# staged, and that includes a PLAINTEXT provider credential. Teardown never runs
+# for a task that never got a worker, so withdraw has to be the owner.
+cloud_account = Path(env["FM_HOME"]) / "state" / "task-12.cloud-account"
+cloud_account.mkdir(parents=True, exist_ok=True)
+credential = cloud_account / "auth.json"
+credential.write_text('{"staged": "credential"}')
+entrypoint = Path(env["FM_HOME"]) / "state" / "task-12.cloud-entrypoint"
+entrypoint.write_text("launch\n")
+run("withdraw", "--task", "task-12", "--task-generation", "gen-12", "--confirm-withdraw",
+    "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+assert "task-12@gen-12" not in controller_state()["queue"]
+assert not credential.exists(), "withdraw left the staged provider credential behind"
+assert not cloud_account.exists(), "withdraw left the cloud-account directory behind"
+assert not entrypoint.exists(), "withdraw left the convergence entrypoint behind"
 PY
   pass "zero-to-zero flow executes privately, replays idempotently, resets before reuse, resumes dirty disks, and preserves active work under budget refusal"
 }

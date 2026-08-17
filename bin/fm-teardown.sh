@@ -138,6 +138,7 @@ CHECKOUT_STATE_BASE="${FM_CHECKOUT_REFRESH_STATE_BASE:-${XDG_STATE_HOME:-$HOME/.
 SECONDMATE_REG="$DATA/secondmates.md"
 SUB_HOME_MARKER=".fm-secondmate-home"
 # shellcheck source=bin/fm-checkout-lock-lib.sh
+. "$SCRIPT_DIR/fm-cloud-state-lib.sh"
 . "$SCRIPT_DIR/fm-checkout-lock-lib.sh"
 CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
 # shellcheck source=bin/fm-tasks-axi-lib.sh
@@ -5287,6 +5288,7 @@ if [ "$ORCA_CLEANUP_PENDING" = 1 ]; then
   pending_orca_endpoint_absent || exit 1
   fm_checkout_lock_run "$WT" "$CHECKOUT_LOCK_ROOT" remove_pending_orca_worktree_locked || exit 1
   remove_grok_turnend_auth "$STATE" "$ID"
+  fm_cloud_state_remove "$STATE" "$ID"
   fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
   safe_remove_task_tmp "$TASK_TMP" || exit 1
   rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log"
@@ -5814,6 +5816,7 @@ EOF
   PREPARED_REGISTRY_LOCK=
 fi
 remove_grok_turnend_auth "$STATE" "$ID"
+fm_cloud_state_remove "$STATE" "$ID"
 fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the exact recorded per-generation task temp root, including gotmp.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.

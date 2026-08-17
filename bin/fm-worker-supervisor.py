@@ -91,8 +91,11 @@ def read_request(path):
         # The URL is an unbound protected parameter; refusing here means a
         # control-plane actor cannot silently downgrade a landing task into a
         # fire-and-forget one by withholding it.
-        armed = os.environ.get("FM_WORKER_OUTCOME_URL", "").startswith("https://")
-        if not armed and not os.environ.get("FM_WORKER_OUTCOME_FILE", ""):
+        # The URL alone arms the lane. FM_WORKER_OUTCOME_FILE only redirects
+        # the sink for the hermetic test lane and can never satisfy this gate,
+        # so adding an unprotected FILE cannot stand in for a stripped
+        # protected URL.
+        if not os.environ.get("FM_WORKER_OUTCOME_URL", "").startswith("https://"):
             raise SupervisorError("execution expects an outcome but no outcome staging URL was armed")
     return request
 
@@ -390,13 +393,17 @@ def execute(request, worktree):
     # failure must never abort the result: it is recorded in the digest-bound
     # result instead, which both blocks a landing that would be built on
     # unverifiable bytes and stops a replay from running the command twice.
+    # Every exception, not just SupervisorError: a git timeout, a full disk,
+    # or a MemoryError on a large bundle would otherwise escape, leave no
+    # executed marker, and let the next dispatch run the command a second time.
     try:
         outcome = collect_outcome(request, worktree)
         outcome["outcome_error"] = ""
-    except SupervisorError as exc:
+    except Exception as exc:  # noqa: BLE001 - see above; losing the marker is worse
         outcome = {
             "outcome_present": False, "outcome_sha256": "", "outcome_bytes": 0,
-            "outcome_commits": 0, "outcome_error": str(exc)[:500],
+            "outcome_commits": 0,
+            "outcome_error": "{}: {}".format(type(exc).__name__, exc)[:500],
         }
     result = {
         "schema": RESULT_SCHEMA,

@@ -456,7 +456,7 @@ PY
   }
   supervisor_outcome_run() {
     # $1 = request, $2 = result, $3 = worktree, $4 = executed dir,
-    # $5 = outcome sink ("" arms nothing)
+    # $5 = outcome sink, $6 = outcome URL ("" arms nothing)
     local payload_sha payload_bytes account_sha account_bytes
     mkdir -p "$3"
     payload_sha=$(python3 -c "import json;print(json.load(open('$tmp/staging-meta.json'))['payload']['sha256'])")
@@ -473,13 +473,13 @@ PY
       FM_WORKER_PAYLOAD_BYTES="$payload_bytes" FM_WORKER_PAYLOAD_FILE="$tmp/payload.tar.gz" \
       FM_WORKER_ACCOUNT_URL="https://fixture.invalid/account" FM_WORKER_ACCOUNT_SHA256="$account_sha" \
       FM_WORKER_ACCOUNT_BYTES="$account_bytes" FM_WORKER_ACCOUNT_FILE="$tmp/account.tar.gz" \
-      FM_WORKER_OUTCOME_FILE="$5" \
+      FM_WORKER_OUTCOME_URL="$6" FM_WORKER_OUTCOME_FILE="$5" \
       python3 "$SUPERVISOR" execute --request "$1" --result "$2" 2>&1
   }
   # A crewmate that commits: the outcome must carry exactly its new commits.
   supervisor_outcome_request "$tmp/request.json" \
     'git config user.email a@b.c; git config user.name t; echo work >> file.txt; git add -A; git commit -qm "crewmate work"' 1 1
-  out=$(supervisor_outcome_run "$tmp/request.json" "$tmp/result.json" "$work" "$tmp/executed" "$sink")
+  out=$(supervisor_outcome_run "$tmp/request.json" "$tmp/result.json" "$work" "$tmp/executed" "$sink" "https://fixture.invalid/outcome")
   status=$?
   expect_code 0 "$status" "outcome-collecting execution should succeed: $out"
   test -s "$sink" || fail "the outcome bundle was never written"
@@ -508,7 +508,7 @@ PY
   # A read-only task reports no outcome and no error, and writes no bundle.
   rm -f "$sink"
   supervisor_outcome_request "$tmp/request-ro.json" 'true' 1 1
-  out=$(supervisor_outcome_run "$tmp/request-ro.json" "$tmp/result-ro.json" "$tmp/work-ro" "$tmp/executed-ro" "$tmp/sink-ro")
+  out=$(supervisor_outcome_run "$tmp/request-ro.json" "$tmp/result-ro.json" "$tmp/work-ro" "$tmp/executed-ro" "$tmp/sink-ro" "https://fixture.invalid/outcome")
   status=$?
   expect_code 0 "$status" "read-only execution should succeed: $out"
   test ! -e "$tmp/sink-ro" || fail "a read-only task must not upload an outcome bundle"
@@ -521,17 +521,48 @@ assert r['outcome_commits'] == 0, r
 " || fail "a read-only task reported a wrong outcome disposition"
   # Arming an outcome without a staged repository is refused before the argv runs.
   supervisor_outcome_request "$tmp/request-nopayload.json" 'touch "$PWD/ran"' 1 0
-  out=$(supervisor_outcome_run "$tmp/request-nopayload.json" "$tmp/result-np.json" "$tmp/work-np" "$tmp/executed-np" "$tmp/sink-np")
+  out=$(supervisor_outcome_run "$tmp/request-nopayload.json" "$tmp/result-np.json" "$tmp/work-np" "$tmp/executed-np" "$tmp/sink-np" "https://fixture.invalid/outcome")
   status=$?
   expect_code 2 "$status" "an outcome without a staged repository should be refused"
   assert_contains "$out" "outcome cannot be collected without a staged repository" "the refusal should name the missing repository"
   # An expected outcome with no staging armed at all is refused, so a stripped
   # protected parameter cannot silently downgrade a landing task.
   supervisor_outcome_request "$tmp/request-nourl.json" 'true' 1 1
-  out=$(supervisor_outcome_run "$tmp/request-nourl.json" "$tmp/result-nu.json" "$tmp/work-nu" "$tmp/executed-nu" "")
+  out=$(supervisor_outcome_run "$tmp/request-nourl.json" "$tmp/result-nu.json" "$tmp/work-nu" "$tmp/executed-nu" "" "")
   status=$?
   expect_code 2 "$status" "an unarmed outcome lane should be refused"
   assert_contains "$out" "no outcome staging URL was armed" "the refusal should name the unarmed staging lane"
+  supervisor_outcome_request "$tmp/request-fileonly.json" 'true' 1 1
+  out=$(supervisor_outcome_run "$tmp/request-fileonly.json" "$tmp/result-fo.json" \
+    "$tmp/work-fo" "$tmp/executed-fo" "$tmp/sink-fo" "")
+  status=$?
+  expect_code 2 "$status" "a file sink must not arm the outcome lane on its own"
+  assert_contains "$out" "no outcome staging URL was armed" \
+    "an unprotected file sink stood in for the stripped protected URL"
+  test ! -e "$tmp/sink-fo" || fail "the refused run still wrote an outcome"
+  # The severest failure this contract can have: an outcome failure that is
+  # NOT a SupervisorError must still leave the executed marker and a result,
+  # or a redispatch runs the crewmate's command a second time. Induced for
+  # real by pointing the sink at a directory that does not exist, which
+  # raises OSError from inside the collection.
+  local counter
+  counter="$tmp/side-effect-count"
+  supervisor_outcome_request "$tmp/request-oserr.json" \
+    "git config user.email a@b.c; git config user.name t; echo x >> $counter; echo work >> f.txt; git add -A; git commit -qm w" 1 1
+  for _ in 1 2; do
+    out=$(supervisor_outcome_run "$tmp/request-oserr.json" "$tmp/result-oe.json" \
+      "$tmp/work-oe" "$tmp/executed-oe" "$tmp/absent-dir/sink" "https://fixture.invalid/outcome")
+    status=$?
+    expect_code 0 "$status" "a non-SupervisorError outcome failure must still produce a result: $out"
+  done
+  test "$(wc -l < "$counter" | tr -d ' ')" = 1 \
+    || fail "an outcome collection failure let the task command run a second time"
+  python3 -c "
+import json
+r = json.load(open('$tmp/result-oe.json'))
+assert r['outcome_present'] is False, r
+assert 'FileNotFoundError' in r['outcome_error'], r
+" || fail "the outcome failure was not recorded in the bound result"
   pass "the supervisor collects, bounds and proves crewmate outcomes"
 }
 

@@ -121,7 +121,12 @@ dispatch_converged_execute() {
     payload_args=()
     if [ -d "$STATE/$ID.cloud-payload" ] && [ -d "$STATE/$ID.cloud-account" ]; then
       payload_args=(--payload-dir "$STATE/$ID.cloud-payload" --account-dir "$STATE/$ID.cloud-account")
-      [ ! -d "$STATE/$ID.cloud-outcome" ] || payload_args+=(--outcome-dir "$STATE/$ID.cloud-outcome")
+      # A staged repository means a landing task. Dropping --outcome-dir here
+      # because a pre-D5 spawn left no directory would silently downgrade it
+      # to fire-and-forget, which is exactly what the digest-bound
+      # outcome_expected exists to prevent; create the directory instead.
+      install -d -m 0700 "$STATE/$ID.cloud-outcome" 2>/dev/null || true
+      payload_args+=(--outcome-dir "$STATE/$ID.cloud-outcome")
     fi
     nohup env FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
       "$SCRIPT_DIR/fm-worker-lifecycle.sh" execute \
@@ -159,7 +164,7 @@ land_outcome_bundle() {
   # stays local, so all that happens here is a fast-forward of the same branch
   # the bundle was cut from; the ordinary landing flow (push, PR, teardown's
   # landed-work check) then proceeds unchanged.
-  local bundle wt base head error
+  local bundle wt base head error tip
   if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$RESULT" 2>/dev/null; then
     # A refusal string or a torn write is not a result. Say so: silence here
     # would be indistinguishable from a task that simply had nothing to land.
@@ -184,11 +189,26 @@ land_outcome_bundle() {
   fi
   base=$(result_field repository_generation)
   head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || head=
-  if [ -z "$base" ] || [ "$head" != "$base" ]; then
+  if [ -z "$base" ] || [ -z "$head" ]; then
+    echo "cloud-crewmate $ID: cannot read the leased worktree head; outcome kept at $bundle for manual landing"
+    return 0
+  fi
+  if [ "$head" != "$base" ]; then
+    # Already landed, or genuinely diverged. Only the bundle's own tip can
+    # tell them apart, and reporting divergence for work we already landed
+    # would send the operator hunting for nothing.
+    tip=$(git -C "$wt" bundle list-heads "$bundle" 2>/dev/null | head -1)
+    tip=${tip%% *}
+    if [ -n "$tip" ] && git -C "$wt" merge-base --is-ancestor "$tip" "$head" 2>/dev/null; then
+      echo "cloud-crewmate $ID: outcome already landed in $wt"
+      return 0
+    fi
     echo "cloud-crewmate $ID: local worktree moved off $base since dispatch; outcome kept at $bundle for manual landing"
     return 0
   fi
-  if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+  # Untracked files cannot conflict with a fast-forward; only tracked-tree
+  # changes are a reason to refuse one.
+  if [ -n "$(git -C "$wt" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
     echo "cloud-crewmate $ID: local worktree has uncommitted changes; outcome kept at $bundle for manual landing"
     return 0
   fi

@@ -374,7 +374,7 @@ run_supervisor_outcome_collection() {
   # The REAL supervisor collects the REAL commits a task command makes in the
   # staged repository, bundles them against the bound generation, and the
   # bundle really fast-forwards the source repository the payload came from.
-  local tmp work account src head out status bundle sink
+  local tmp work account src head out status sink
   local home account_binding worktree_binding repo_binding
   fm_test_tmproot_into tmp fm-worker-supervisor-outcome
   work="$tmp/work"
@@ -520,6 +520,7 @@ assert r['outcome_error'] == '', r
 assert r['outcome_commits'] == 0, r
 " || fail "a read-only task reported a wrong outcome disposition"
   # Arming an outcome without a staged repository is refused before the argv runs.
+  # shellcheck disable=SC2016 # $PWD is expanded by the guest argv, not here
   supervisor_outcome_request "$tmp/request-nopayload.json" 'touch "$PWD/ran"' 1 0
   out=$(supervisor_outcome_run "$tmp/request-nopayload.json" "$tmp/result-np.json" "$tmp/work-np" "$tmp/executed-np" "$tmp/sink-np" "https://fixture.invalid/outcome")
   status=$?

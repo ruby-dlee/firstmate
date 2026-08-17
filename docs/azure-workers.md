@@ -156,7 +156,7 @@ A worker whose pinned supervisor predates this contract answers with no outcome 
 The controller downloads the blob only after the digest-bound result commits to its bytes, verifies size and SHA-256, and stores it in the requesting task's outcome directory.
 The tracking monitor then fast-forwards the leased local worktree, but only when that worktree still sits on the dispatched generation and is clean; otherwise the verified bundle is kept and its path reported.
 Landing authority, push, and release receipts stay exactly where the ordinary local flow already puts them.
-The blob name carries the request digest, so a later execute against the same worker cannot overwrite an outcome the controller has not collected yet; reset removes them by that reviewed prefix along with the inbound staging archives.
+The blob name carries the request digest, so a later execute against the same worker cannot overwrite an outcome the controller has not collected yet. Reset deletes the inbound staging archives by name and the outcome blobs as part of removing the whole state container.
 
 ## Release, reset, and cooldown
 

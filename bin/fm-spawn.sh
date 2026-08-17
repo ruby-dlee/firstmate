@@ -3992,7 +3992,19 @@ if [ "$SPAWN_CLOUD" = azure ]; then
   rm -f "$STATE/$ID.cloud-entrypoint" "$STATE/$ID.cloud-env" \
     "$STATE/$ID.cloud-execute-dispatched" "$STATE/$ID.cloud-worktree" \
     "$STATE/$ID.worker-result.json" "$STATE/$ID.worker-execute.log"
-  rm -rf "$STATE/$ID.cloud-payload" "$STATE/$ID.cloud-account" "$STATE/$ID.cloud-outcome"
+  rm -rf "$STATE/$ID.cloud-payload" "$STATE/$ID.cloud-account"
+  # The outcome directory is NOT transport. When the monitor cannot
+  # fast-forward it tells the operator the bundle is "kept for manual
+  # landing", and by then the guest copy is usually gone with the VM, so a
+  # re-spawn deleting it would destroy the last copy of the crewmate's
+  # commits. Preserve any bundle under a superseded name instead, and say so.
+  if [ -s "$STATE/$ID.cloud-outcome/outcome.bundle" ]; then
+    superseded="$STATE/$ID.cloud-outcome.superseded-$(date -u +%Y%m%d%H%M%S)"
+    if mv "$STATE/$ID.cloud-outcome" "$superseded" 2>/dev/null; then
+      echo "notice: $ID had an unlanded outcome bundle; preserved at $superseded/outcome.bundle" >&2
+    fi
+  fi
+  rm -rf "$STATE/$ID.cloud-outcome"
   # The Herdr server starts endpoint panes in its closed environment, so the
   # monitor's own FM_HOME (and any state override the spawn ran with) must
   # travel inside the launch string; without FM_HOME the monitor's
@@ -4343,7 +4355,19 @@ spawn_cloud_dispatch() {
     # owner; remove them (including the copied provider credential) with the
     # rolled-back spawn.
     rm -f "$STATE/$ID.cloud-entrypoint" "$STATE/$ID.cloud-env" "$STATE/$ID.cloud-worktree"
-    rm -rf "$STATE/$ID.cloud-payload" "$STATE/$ID.cloud-account" "$STATE/$ID.cloud-outcome"
+    rm -rf "$STATE/$ID.cloud-payload" "$STATE/$ID.cloud-account"
+  # The outcome directory is NOT transport. When the monitor cannot
+  # fast-forward it tells the operator the bundle is "kept for manual
+  # landing", and by then the guest copy is usually gone with the VM, so a
+  # re-spawn deleting it would destroy the last copy of the crewmate's
+  # commits. Preserve any bundle under a superseded name instead, and say so.
+  if [ -s "$STATE/$ID.cloud-outcome/outcome.bundle" ]; then
+    superseded="$STATE/$ID.cloud-outcome.superseded-$(date -u +%Y%m%d%H%M%S)"
+    if mv "$STATE/$ID.cloud-outcome" "$superseded" 2>/dev/null; then
+      echo "notice: $ID had an unlanded outcome bundle; preserved at $superseded/outcome.bundle" >&2
+    fi
+  fi
+  rm -rf "$STATE/$ID.cloud-outcome"
     echo "error: cloud worker request was refused for $ID" >&2
     return 1
   }

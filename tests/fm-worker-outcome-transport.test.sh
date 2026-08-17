@@ -214,11 +214,38 @@ unsigned = dict(request)
 request["request_digest"] = hashlib.sha256(
     json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 ).hexdigest()
+payload_dir = root / "payload"
+account_dir = root / "account"
+payload_dir.mkdir(exist_ok=True)
+account_dir.mkdir(exist_ok=True)
+(payload_dir / "repo.bundle").write_bytes(b"bundle fixture")
+(payload_dir / "brief.md").write_text("brief\n")
+(account_dir / "auth.json").write_text("{}\n")
+
+
+def manifest(directory):
+    entries = {}
+    for entry in sorted(directory.iterdir()):
+        blob = entry.read_bytes()
+        entries[entry.name] = {
+            "sha256": hashlib.sha256(blob).hexdigest(), "bytes": len(blob),
+        }
+    return entries
+
+
+request["payload_files"] = manifest(payload_dir)
+request["account_files"] = manifest(account_dir)
+unsigned = dict(request)
+unsigned.pop("request_digest")
+request["request_digest"] = hashlib.sha256(
+    json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+).hexdigest()
 action = {
     "type": "execute", "slot": 1, "cloud_instance_id": "vm-instance",
     "bindings": bindings, "request": request,
     "request_digest": request["request_digest"],
     "idempotency_key": "e" * 64, "outcome_dir": str(root / "outcome"),
+    "payload_dir": str(payload_dir), "account_dir": str(account_dir),
 }
 
 execution = {
@@ -258,6 +285,8 @@ def recording_az(controller, args, check=True, timeout=None):
     if "update" in args and "run-command" in args:
         captured["update"] = list(args)
         captured["timeout"] = timeout
+    if "generate-sas" in args:
+        captured.setdefault("sas", []).append(list(args))
     if timeout is None:
         return real_az(controller, args, check=check)
     return real_az(controller, args, check=check, timeout=timeout)
@@ -289,6 +318,24 @@ assert captured["timeout"] >= request["wall_seconds"] + 1800, (
     "the run-command bound does not cover staging and collection", captured["timeout"],
 )
 
+# Every staging credential must outlive the whole guest run, not just the
+# wall: the guest stages before the wall starts and uploads after it ends, and
+# an expired write SAS means the bundle never arrives. Compared against an
+# absolute floor, never against the constant under test.
+import datetime as _dt
+
+minted = _dt.datetime.now(_dt.timezone.utc)
+assert captured.get("sas"), "no staging SAS was minted"
+for sas_args in captured["sas"]:
+    expiry_text = sas_args[sas_args.index("--expiry") + 1]
+    expiry = _dt.datetime.strptime(expiry_text, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=_dt.timezone.utc
+    )
+    window = (expiry - minted).total_seconds()
+    assert window >= request["wall_seconds"] + 1800, (
+        "a staging SAS expires before the guest run can finish", sas_args, window,
+    )
+
 # A result claiming an outcome written anywhere but the staging blob is a
 # diverted upload and must be refused, not collected.
 landed.unlink()
@@ -309,6 +356,26 @@ try:
 except provider.ProviderError as exc:
     assert "rather than the staging blob" in str(exc), exc
 assert not landed.exists(), "a refused sink still collected a bundle"
+
+# A result with NO sink at all is what a supervisor predating this contract
+# returns; it must be refused too, not treated as a blob upload.
+absent = dict(execution)
+absent.pop("outcome_sink")
+absent.pop("result_digest")
+absent["result_digest"] = hashlib.sha256(
+    json.dumps(absent, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+).hexdigest()
+provider.run_command_instance_view = lambda controller, vm, name: {
+    "executionState": "Succeeded",
+    "output": "FM-WORKER-RESULT:" + json.dumps(absent, sort_keys=True, separators=(",", ":")),
+    "error": "",
+}
+try:
+    provider.mutate_execute(controller, action)
+    raise AssertionError("an outcome with no recorded sink was accepted")
+except provider.ProviderError as exc:
+    assert "rather than the staging blob" in str(exc), exc
+assert not landed.exists(), "a missing sink still collected a bundle"
 print("OK")
 CALLSITES
   out=$(PATH="$bin:$PATH" FAKE_AZ_LOG="$tmp/az.log" FAKE_AZ_BLOB="$fixture" \

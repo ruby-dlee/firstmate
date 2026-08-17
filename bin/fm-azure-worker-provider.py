@@ -2046,7 +2046,7 @@ printf 'FM-WORKER-RESULT:%s\\n' "$(cat /var/lib/firstmate-worker/result.json)"
         # staging blob means the upload was diverted (a test sink, an injected
         # unprotected FM_WORKER_OUTCOME_FILE), and the result must not be
         # treated as a collectable outcome.
-        if execution.get("outcome_sink") != "blob":
+        if execution.get("outcome_sink", "") != "blob":
             raise ProviderError(
                 "execution claims an outcome written to {!r} rather than the staging blob".format(
                     execution.get("outcome_sink")

@@ -169,6 +169,8 @@ land_outcome_bundle() {
     # A refusal string or a torn write is not a result. Say so: silence here
     # would be indistinguishable from a task that simply had nothing to land.
     echo "cloud-crewmate $ID: worker result is not readable as a bound result; no outcome landing attempted"
+    [ ! -s "$STATE/$ID.cloud-outcome/outcome.bundle" ] \
+      || echo "cloud-crewmate $ID: a verified outcome bundle is waiting at $STATE/$ID.cloud-outcome/outcome.bundle"
     return 0
   fi
   error=$(result_field outcome_error)

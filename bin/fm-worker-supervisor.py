@@ -219,18 +219,6 @@ def stage_payload(request, worktree, account_home):
         # it rather than wedging every future dispatch of this request.
         if repo.is_symlink() or not repo.is_dir():
             raise SupervisorError("staged repository target is not a removable directory")
-        ahead = subprocess.run(
-            ["git", "-C", str(repo), "rev-list", "--count",
-             "{}..HEAD".format(request["repository_generation"])],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=120, check=False,
-        )
-        carried = ahead.stdout.decode("utf-8", errors="replace").strip()
-        if ahead.returncode == 0 and carried.isdigit() and int(carried) > 0:
-            raise SupervisorError(
-                "staged repository carries {} uncollected commit(s) beyond the bound "
-                "generation; refusing to destroy them".format(carried)
-            )
         shutil.rmtree(repo)
     bundle = staging / "repo.bundle"
     clone = subprocess.run(
@@ -339,11 +327,19 @@ def collect_outcome(request, repo, worktree_root):
         # A crewmate that edited without committing looks identical here, so
         # the result says so explicitly rather than reading as "nothing to do".
         dirty = git_in(repo, "status", "--porcelain", timeout=120)
-        uncommitted = dirty.returncode == 0 and bool(dirty.stdout.strip())
+        if dirty.returncode != 0:
+            # Unknown is not clean. Reporting False here would render an
+            # unreadable tree as a tidy read-only task, which is the exact
+            # confusion this field exists to prevent.
+            raise SupervisorError(
+                "outcome working-tree state is unreadable: {}".format(
+                    dirty.stderr.decode("utf-8", errors="replace")[-200:]
+                )
+            )
         return {
             "outcome_present": False, "outcome_sha256": "", "outcome_bytes": 0,
             "outcome_commits": 0, "outcome_sink": "",
-            "outcome_uncommitted_changes": uncommitted,
+            "outcome_uncommitted_changes": bool(dirty.stdout.strip()),
         }
     bundle = outcome_bundle_path(request, worktree_root)
     bundle.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -365,6 +361,33 @@ def collect_outcome(request, repo, worktree_root):
         "outcome_commits": commits,
         "outcome_sink": sink,
     }
+
+
+def replay_outcome_upload(request, worktree, recorded):
+    """Re-upload the retained bundle on a replay.
+
+    A replay happens when the controller lost the result in transport, or when
+    it could not collect the blob. These are the exact bytes the recorded
+    result already committed to, so the controller's digest check still gates
+    the landing. Without this the lifecycle wedges forever on a lost blob and
+    the crewmate's commits die with the VM. A failure here must not stop the
+    replay from answering, so it is reported and swallowed.
+    """
+    if not recorded.get("outcome_present"):
+        return False
+    retained = outcome_bundle_path(request, worktree)
+    try:
+        body = retained.read_bytes()
+        if hashlib.sha256(body).hexdigest() != recorded.get("outcome_sha256"):
+            raise SupervisorError("retained outcome bundle differs from the recorded result")
+        put_outcome_blob(body)
+        return True
+    except Exception as exc:  # noqa: BLE001 - a replay must still answer
+        print(
+            "outcome re-upload on replay failed: {}: {}".format(type(exc).__name__, exc),
+            file=os.sys.stderr,
+        )
+        return False
 
 
 def write_atomic(path, value):
@@ -429,7 +452,7 @@ def execute(request, worktree, worktree_root):
     try:
         logs_dir.mkdir(mode=0o700, exist_ok=True)
         for suffix, data in (("stdout", stdout), ("stderr", stderr)):
-            stream_path = logs_dir / "{}-{}.log".format(request["assignment_generation"], suffix)
+            stream_path = logs_dir / "{}-{}.log".format(request["request_digest"][:32], suffix)
             fd = os.open(str(stream_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
@@ -539,25 +562,7 @@ def main():
         supplied = unsigned.pop("result_digest", None)
         if supplied != digest(unsigned) or recorded.get("request_digest") != request["request_digest"]:
             raise SupervisorError("recorded execution replay evidence is not exact")
-        # A replay happens when the controller lost the result in transport, or
-        # when it could not collect the blob. Re-upload the retained bundle so
-        # a blob that went missing between execution and collection is
-        # recoverable: these are the exact bytes the recorded result already
-        # committed to, so the controller's digest check still gates the
-        # landing. Without this the lifecycle wedges forever on a lost blob
-        # and the crewmate's commits die with the VM.
-        if recorded.get("outcome_present"):
-            retained = outcome_bundle_path(request, worktree)
-            try:
-                body = retained.read_bytes()
-                if hashlib.sha256(body).hexdigest() != recorded.get("outcome_sha256"):
-                    raise SupervisorError("retained outcome bundle differs from the recorded result")
-                put_outcome_blob(body)
-            except Exception as exc:  # noqa: BLE001 - a replay must still answer
-                print(
-                    "outcome re-upload on replay failed: {}: {}".format(type(exc).__name__, exc),
-                    file=os.sys.stderr,
-                )
+        replay_outcome_upload(request, worktree, recorded)
         write_atomic(args.result, recorded)
         print(json.dumps({"result_digest": recorded["result_digest"]}, separators=(",", ":")))
         return

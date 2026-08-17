@@ -10,6 +10,7 @@ disk, account, and worktree identity matches the controller action.
 import contextlib
 import datetime as dt
 import email.utils
+import io
 import fcntl
 import hashlib
 import json
@@ -19,6 +20,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.parse
@@ -1233,6 +1235,75 @@ def upload_json_blob(controller, account, container, name, value, tags, overwrit
     return digest
 
 
+def upload_bytes_blob(controller, account, container, name, payload, tags):
+    digest = hashlib.sha256(payload).hexdigest()
+    fd, path = tempfile.mkstemp(prefix="fm-worker-payload-")
+    os.chmod(path, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+        metadata = dict(tags_to_metadata(tags))
+        metadata["content_digest"] = digest
+        _, rc, stderr = az(controller, [
+            "storage", "blob", "upload", "--auth-mode", "login", "--account-name", account,
+            "--container-name", container, "--name", name, "--file", path,
+            "--overwrite", "true", "--metadata",
+        ] + ["{}={}".format(key, value) for key, value in sorted(metadata.items())], check=False)
+        if rc != 0:
+            raise ProviderError("exact worker payload upload failed: {}".format(stderr))
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            Path(path).unlink()
+    return digest
+
+
+def blob_read_sas(controller, account, container, name, expiry_seconds):
+    expiry = (
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=expiry_seconds)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    uri, rc, stderr = az(
+        controller,
+        [
+            "storage", "blob", "generate-sas", "--as-user", "--auth-mode", "login",
+            "--https-only", "--account-name", account, "--container-name", container,
+            "--name", name, "--permissions", "r", "--expiry", expiry,
+            "--full-uri",
+        ],
+        check=False,
+    )
+    if rc != 0 or not isinstance(uri, str) or not uri.strip().startswith("https://"):
+        raise ProviderError("exact worker payload SAS creation failed: {}".format(stderr))
+    return str(uri).strip()
+
+
+def staged_directory_archive(directory, manifest, label):
+    """Deterministic tar of one flat staging directory, verified against the
+    digest-bound request manifest before any byte leaves the controller."""
+    root = Path(directory)
+    if root.is_symlink() or not root.is_dir():
+        raise ProviderError("{} staging directory is unavailable".format(label))
+    seen = {}
+    for name, expected in sorted(manifest.items()):
+        entry = root / name
+        if entry.is_symlink() or not entry.is_file():
+            raise ProviderError("{} staging entry is not a regular file: {}".format(label, name))
+        body = entry.read_bytes()
+        if hashlib.sha256(body).hexdigest() != expected["sha256"] or len(body) != expected["bytes"]:
+            raise ProviderError("{} staging entry differs from its bound manifest: {}".format(label, name))
+        seen[name] = body
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+        for name, body in sorted(seen.items()):
+            info = tarfile.TarInfo(name=name)
+            info.size = len(body)
+            info.mode = 0o600
+            info.mtime = 0
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            archive.addfile(info, io.BytesIO(body))
+    return buffer.getvalue()
+
+
 def run_command_instance_view(controller, vm_name, command_name):
     value, rc, stderr = az(controller, [
         "vm", "run-command", "show", "--resource-group", controller["resource_group"],
@@ -1768,6 +1839,28 @@ def mutate_execute(controller, action):
         controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
         names["staging-request"], request, tags, overwrite=True,
     )
+    # Crewmate payload plane: the digest-bound request carries only manifests;
+    # the archives ride private blobs and reach the guest over short-lived
+    # read-only user-delegation SAS bounded to the wall plus collection slack.
+    staging_env = ""
+    if action.get("payload_dir"):
+        storage = os.environ.get("FM_AZURE_STORAGE_NAME", "")
+        sas_seconds = int(request["wall_seconds"]) + 1800
+        for label, directory, manifest, blob_key in (
+            ("payload", action["payload_dir"], request["payload_files"], "staging-payload"),
+            ("account", action["account_dir"], request["account_files"], "staging-account"),
+        ):
+            archive = staged_directory_archive(directory, manifest, label)
+            blob_name = names["staging-request"].rsplit("/", 1)[0] + "/{}.tar.gz".format(label)
+            archive_digest = upload_bytes_blob(
+                controller, storage, names["state-container"], blob_name, archive, tags,
+            )
+            sas_url = blob_read_sas(
+                controller, storage, names["state-container"], blob_name, sas_seconds,
+            )
+            staging_env += (
+                "export FM_WORKER_{0}_URL='{1}' FM_WORKER_{0}_SHA256='{2}' FM_WORKER_{0}_BYTES='{3}'\n"
+            ).format(label.upper(), sas_url, archive_digest, len(archive))
     request_json = json.dumps(request, sort_keys=True, separators=(",", ":"))
     bindings = action["bindings"]
     script = """set -eu
@@ -1781,14 +1874,14 @@ export FM_WORKER_ASSIGNMENT_GENERATION='{assignment}' FM_WORKER_ACCOUNT_BINDING=
 export FM_WORKER_WORKTREE_BINDING='{worktree}' FM_WORKER_REPOSITORY_BINDING='{repository}'
 export FM_WORKER_REPOSITORY_GENERATION='{repository_generation}' FM_WORKER_CLOUD_INSTANCE_ID='{cloud}'
 export FM_WORKER_WORKTREE=/mnt/task FM_WORKER_ACCOUNT_HOME=/mnt/account
-/usr/local/libexec/fm-worker-supervisor execute --request /var/lib/firstmate-worker/request.json --result /var/lib/firstmate-worker/result.json
+{staging}/usr/local/libexec/fm-worker-supervisor execute --request /var/lib/firstmate-worker/request.json --result /var/lib/firstmate-worker/result.json
 printf 'FM-WORKER-RESULT:%s\\n' "$(cat /var/lib/firstmate-worker/result.json)"
 """.format(
         request=request_json, home=bindings["home_binding"], task=bindings["task"],
         task_generation=bindings["task_generation"], assignment=bindings["assignment_generation"],
         account=bindings["account_binding"], worktree=bindings["worktree_binding"],
         repository=bindings["repository_binding"], repository_generation=bindings["repository_generation"],
-        cloud=action["cloud_instance_id"],
+        cloud=action["cloud_instance_id"], staging=staging_env,
     )
     _, rc, stderr = az(controller, [
         "vm", "run-command", "update", "--resource-group", controller["resource_group"],

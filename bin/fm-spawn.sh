@@ -3999,9 +3999,16 @@ if [ "$SPAWN_CLOUD" = azure ]; then
   # re-spawn deleting it would destroy the last copy of the crewmate's
   # commits. Preserve any bundle under a superseded name instead, and say so.
   if [ -s "$STATE/$ID.cloud-outcome/outcome.bundle" ]; then
-    superseded="$STATE/$ID.cloud-outcome.superseded-$(date -u +%Y%m%d%H%M%S)"
-    if mv "$STATE/$ID.cloud-outcome" "$superseded" 2>/dev/null; then
+    superseded="$STATE/$ID.cloud-outcome.superseded-$(date -u +%Y%m%d%H%M%S)-$$"
+    if mv "$STATE/$ID.cloud-outcome" "$superseded"; then
       echo "notice: $ID had an unlanded outcome bundle; preserved at $superseded/outcome.bundle" >&2
+    else
+      # Failing here and sweeping anyway would destroy the last copy of the
+      # crewmate's commits, which is the whole reason this block exists. Fail
+      # closed instead: refuse the re-spawn rather than choose silently
+      # between destroying the work and landing it for the wrong generation.
+      echo "error: $ID has an unlanded outcome bundle that could not be preserved; refusing to sweep it" >&2
+      exit 1
     fi
   fi
   rm -rf "$STATE/$ID.cloud-outcome"

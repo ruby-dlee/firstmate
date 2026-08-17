@@ -34,6 +34,14 @@ Item 6 is the one still open.
    worker. The crewmate's commits ride home as a digest-verified bundle and the
    local side keeps the landing authority. Direct push from a worker remains
    explicitly deferred.
+6a. OPEN. Resume destroys uncollected commits: the executed marker is on the
+   disposable OS disk and /mnt/task is retained, so a resume reattaches a task
+   disk holding the previous run's commits to a worker with no marker. The next
+   execute re-stages and removes them. The retained outcome bundle survives but
+   is unreachable, because the only re-upload path is the marker branch and
+   there is no collect-only mode. A refusing guard was tried and reverted (it
+   wedged the slot and lost the work anyway); the fix needs collect-only, which
+   belongs with D6.
 6. OPEN. Release-after-teardown: bin/fm-worker-authority.py needs the task meta
    and worktree that bin/fm-teardown.sh deletes in the same pass that removes
    the endpoint, so an ordinarily torn-down cloud task can never produce its

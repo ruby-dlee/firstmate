@@ -637,6 +637,11 @@ test_respawn_sweeps_stale_cloud_artifacts() {
   : > "$HOME_DIR/state/$id.cloud-execute-dispatched"
   printf 'stale execute log\n' > "$HOME_DIR/state/$id.worker-execute.log"
   printf 'stale entrypoint\n' > "$HOME_DIR/state/$id.cloud-entrypoint"
+  # An unlanded outcome bundle from the previous generation is the last copy of
+  # a crewmate's commits once the guest is gone, so the sweep must preserve it
+  # rather than delete it with the transport state.
+  mkdir -p "$HOME_DIR/state/$id.cloud-outcome"
+  printf 'previous generation commits\n' > "$HOME_DIR/state/$id.cloud-outcome/outcome.bundle"
   out=$(run_cloud_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR")
   expect_code 0 $? "a spawn over stale cloud artifacts should succeed: $out"
   assert_contains "$out" "placement=azure worker=executing" \
@@ -657,6 +662,15 @@ test_respawn_sweeps_stale_cloud_artifacts() {
     && fail "the fresh result still carries the stale generation's content"
   grep -F 'stale entrypoint' "$HOME_DIR/state/$id.cloud-entrypoint" >/dev/null 2>&1 \
     && fail "the stale entrypoint survived the re-spawn sweep"
+  local preserved
+  preserved=$(find "$HOME_DIR/state" -maxdepth 1 -name "$id.cloud-outcome.superseded-*" | head -1)
+  test -n "$preserved" \
+    || fail "the re-spawn destroyed the previous generation's unlanded outcome bundle"
+  assert_present "$preserved/outcome.bundle" "the preserved directory holds no bundle"
+  assert_grep 'previous generation commits' "$preserved/outcome.bundle" \
+    "the preserved bundle is not the previous generation's bytes"
+  assert_absent "$HOME_DIR/state/$id.cloud-outcome/outcome.bundle" \
+    "a stale bundle stayed where the new generation's monitor would land it"
   pass "a re-spawn sweeps the previous generation's cloud artifacts before the tracking pane exists"
 }
 

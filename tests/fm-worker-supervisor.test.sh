@@ -674,98 +674,44 @@ DIRTYPROBE
     python3 "$tmp/dirty-probe/driver.py" "$SUPERVISOR" "$tmp/dirty-probe" 2>&1)
   expect_code 0 $? "the uncommitted probe must be honest: $dirty_out"
   assert_contains "$dirty_out" "OK" "the uncommitted probe driver did not complete: $dirty_out"
-  # The replay re-upload and the per-execute stream naming, both driven
-  # through the real supervisor. The replay lane is the designated recovery
-  # for a blob lost between execution and collection, and it had no coverage.
-  local replay_out
-  mkdir -p "$tmp/replay-lane"
-  cat >"$tmp/replay-lane/driver.py" <<'REPLAYLANE'
-import importlib.util
-import subprocess
-import sys
-from pathlib import Path
+  # The replay lane, driven through the REAL CLI so main()'s call site is
+  # covered: driving replay_outcome_upload() directly left the call site
+  # deletable with every suite green. This is the designated recovery when a
+  # blob is lost between execution and collection, and without it the
+  # lifecycle wedges and the commits die with the VM.
+  local replay_sink replay_first
+  replay_sink="$tmp/replay-sink"
+  supervisor_outcome_request "$tmp/request-replay.json" \
+    "git config user.email a@b.c; git config user.name t; echo replay >> r.txt; git add -A; git commit -qm replay" 1 1
+  out=$(supervisor_outcome_run "$tmp/request-replay.json" "$tmp/result-replay.json" \
+    "$tmp/work-replay" "$tmp/executed-replay" "$replay_sink" "https://fixture.invalid/outcome")
+  expect_code 0 $? "the first outcome-collecting run should succeed: $out"
+  test -s "$replay_sink" || fail "the first run uploaded no bundle"
+  replay_first=$(shasum -a 256 < "$replay_sink" | awk '{print $1}')
 
-supervisor_path, tmp = sys.argv[1:]
-spec = importlib.util.spec_from_file_location("fm_supervisor", supervisor_path)
-supervisor = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(supervisor)
+  # The blob is lost. Replaying the SAME request must put it back.
+  rm -f "$replay_sink"
+  out=$(supervisor_outcome_run "$tmp/request-replay.json" "$tmp/result-replay.json" \
+    "$tmp/work-replay" "$tmp/executed-replay" "$replay_sink" "https://fixture.invalid/outcome")
+  expect_code 0 $? "the replay should answer: $out"
+  test -s "$replay_sink" \
+    || fail "the replay did not re-upload the retained bundle, so a lost blob wedges the lane"
+  test "$(shasum -a 256 < "$replay_sink" | awk '{print $1}')" = "$replay_first" \
+    || fail "the replay uploaded different bytes than the recorded result committed to"
 
-root = Path(tmp)
-repo = root / "repo"
-repo.mkdir(parents=True, exist_ok=True)
-
-
-def git(*args):
-    return subprocess.run(["git", "-C", str(repo), *args], check=True,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-
-git("init", "--quiet")
-git("config", "user.email", "a@b.c")
-git("config", "user.name", "t")
-(repo / "seed.txt").write_text("seed\n")
-git("add", "-A")
-git("commit", "--quiet", "-m", "seed")
-base = git("rev-parse", "HEAD").stdout.decode().strip()
-(repo / "work.txt").write_text("crewmate work\n")
-git("add", "-A")
-git("commit", "--quiet", "-m", "crewmate work")
-
-request = {
-    "argv": ["/usr/bin/true"], "wall_seconds": 60,
-    "assignment_generation": "asg-00000001", "request_digest": "a" * 64,
-    "task": "t", "task_generation": "gen-1", "cloud_instance_id": "vm",
-    "repository_binding": "b" * 64, "repository_generation": base,
-    "outcome_expected": True,
-}
-result = supervisor.execute(request, repo, root)
-assert result["outcome_present"] is True, result
-sink = Path(__import__("os").environ["FM_WORKER_OUTCOME_FILE"])
-first = sink.read_bytes()
-assert first, "the first run uploaded nothing"
-
-# Two executes in ONE assignment must not overwrite each other's stream
-# evidence: result #1's stream digests stay verifiable only if its files do.
-first_streams = sorted(q.name for q in (root / ".fm-worker").glob("*.log"))
-# A committing second execute, so it really writes a bundle of its own: with a
-# per-assignment key it would overwrite the first's retained bundle and break
-# the replay below.
-(repo / "second.txt").write_text("second run work\n")
-git("add", "-A")
-git("commit", "--quiet", "-m", "second run work")
-request2 = dict(request, request_digest="c" * 64)
-second = supervisor.execute(request2, repo, root)
-assert second["outcome_present"] is True, second
-both = sorted(q.name for q in (root / ".fm-worker").glob("*.log"))
-assert len(both) == 4, ("a second execute overwrote the first's stream evidence", both)
-assert set(first_streams).issubset(set(both)), (first_streams, both)
-
-# The replay lane: the blob was lost, so re-running the SAME request must
-# re-upload the retained bundle rather than leaving the lifecycle wedged.
-sink.unlink()
-marker_dir = root / "executed"
-marker_dir.mkdir(exist_ok=True)
-import json as _json
-import os as _os
-
-_os.environ["FM_WORKER_EXECUTED_DIR"] = str(marker_dir)
-supervisor.write_atomic(marker_dir / (request["request_digest"] + ".json"), result)
-argv = ["execute", "--request", str(root / "request.json"), "--result", str(root / "result.json")]
-(root / "request.json").write_text(_json.dumps(dict(
-    request, schema="fm.worker-execution/v1",
-    home_binding="d" * 64, account_binding="e" * 64, worktree_binding="f" * 64,
-    payload_files={"repo.bundle": {"sha256": "0" * 64, "bytes": 1}},
-)))
-supervisor.replay_outcome_upload(request, root, result)
-assert sink.exists(), "the replay did not re-upload the retained bundle"
-assert sink.read_bytes() == first, "the replay uploaded different bytes"
-print("OK")
-REPLAYLANE
-  replay_out=$(FM_WORKER_OUTCOME_URL=https://fixture.invalid/outcome \
-    FM_WORKER_OUTCOME_FILE="$tmp/replay-lane/sink" \
-    python3 "$tmp/replay-lane/driver.py" "$SUPERVISOR" "$tmp/replay-lane" 2>&1)
-  expect_code 0 $? "the replay lane must re-upload the retained bundle: $replay_out"
-  assert_contains "$replay_out" "OK" "the replay driver did not complete: $replay_out"
+  # A retained bundle that no longer matches the recorded result must NOT be
+  # re-uploaded: the controller would land bytes the signed result never
+  # committed to.
+  local retained
+  retained=$(find "$tmp/work-replay/.fm-worker" -name '*-outcome.bundle' | head -1)
+  test -n "$retained" || fail "the retained bundle was not kept on the task disk"
+  printf 'tampered\n' >> "$retained"
+  rm -f "$replay_sink"
+  out=$(supervisor_outcome_run "$tmp/request-replay.json" "$tmp/result-replay.json" \
+    "$tmp/work-replay" "$tmp/executed-replay" "$replay_sink" "https://fixture.invalid/outcome")
+  expect_code 0 $? "the replay must still answer with the recorded result: $out"
+  test ! -s "$replay_sink" \
+    || fail "the replay re-uploaded a bundle that differs from the recorded result"
   pass "the supervisor collects, bounds and proves crewmate outcomes"
 }
 

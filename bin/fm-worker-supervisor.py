@@ -214,9 +214,19 @@ def stage_payload(request, worktree, account_home):
     extract_staged_archive(fetch_archive("account"), account_manifest, account_target, "account")
     repo = worktree / "repo"
     if repo.exists():
-        # Staging only runs when no executed marker exists, so anything at
-        # the target is the debris of an interrupted earlier staging; remove
-        # it rather than wedging every future dispatch of this request.
+        # Staging runs when no executed marker exists, which is USUALLY the
+        # debris of an interrupted earlier staging.
+        #
+        # KNOWN GAP, not fixed here: it is not always. The executed marker
+        # lives on the disposable OS disk while /mnt/task is retained, so a
+        # resume (which replaces VM, NIC and OS disk and reattaches the task
+        # disk) destroys the marker while the previous run's commits survive
+        # here, and this removes them. A guard that merely refused was tried
+        # and reverted: it preserved the commits on a disk with no reader,
+        # since there is no collect-only mode, and wedged every later dispatch
+        # until a reset deleted them anyway. Closing it properly needs a way
+        # to collect a retained outcome without re-executing, which belongs
+        # with the release-receipt work (D6) rather than here.
         if repo.is_symlink() or not repo.is_dir():
             raise SupervisorError("staged repository target is not a removable directory")
         shutil.rmtree(repo)

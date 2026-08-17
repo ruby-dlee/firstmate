@@ -79,6 +79,8 @@ def validate_evidence_files(value: Any) -> dict[str, bytes]:
     return result
 
 
+AZURE_EVIDENCE_BATCH_SECONDS = 4 * 3600
+
 REMOTE_EVIDENCE_PROGRAM = REPLAY.read_text(encoding="utf-8")
 
 
@@ -283,6 +285,12 @@ class RemoteEvidenceExecutor:
         review_generation: str,
         evidence_files: dict[str, bytes],
     ) -> None:
+        # The core's aggregate evidence deadline is sized for local replay
+        # (seconds per item); every remote pair costs two fresh VM boots, so
+        # the Azure executor owns its own aggregate bound instead: enough
+        # for a bounded number of pairs, still finite against runaway
+        # evidence, with each dispatch keeping its 900-second wall.
+        self.batch_deadline = time.monotonic() + AZURE_EVIDENCE_BATCH_SECONDS
         self.request = {
             "repository_root": str(repository_root.resolve()),
             "remote": remote,
@@ -311,6 +319,8 @@ class RemoteEvidenceExecutor:
     def _execute_pair(
         self, runner: Any, command: list[str], deadline: float
     ) -> dict[str, Any]:
+        del deadline
+        deadline = self.batch_deadline
         suffix = str(len(self.attempts) + 1)
         remaining = int(deadline - time.monotonic())
         if remaining < 60:

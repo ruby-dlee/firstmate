@@ -35,13 +35,23 @@ assert "identity" not in vm
 # Azure refuses a Linux profile with password auth disabled and no SSH key,
 # so the profile carries the crosscheck blackhole key: nobody holds its
 # private half, which is the same no-operator-access posture as no key at
-# all (the exact pattern the validation cell template proved live).
+# all (the exact pattern the validation cell template proved live). The
+# EXACT key bytes are pinned, so substituting any other key (whose private
+# half someone could hold) fails this suite even if it copies the comment.
 linux = vm["properties"]["osProfile"]["linuxConfiguration"]
 assert linux["disablePasswordAuthentication"] is True
 blackhole = linux["ssh"]["publicKeys"][0]
 assert blackhole["path"] == "/home/fmbootstrap/.ssh/authorized_keys"
-assert blackhole["keyData"].startswith("ssh-rsa ")
-assert blackhole["keyData"].endswith(" firstmate-crosscheck-blackhole")
+assert blackhole["keyData"] == (
+    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCaAn1stDlmF2Wo5Dn44vAV+AzWGUIBaXvoC"
+    "EJdxmx6Xhq6ElG4OQj0VAJkBhIqtXGIdUgObA0/ix3U4WIgwX/JYWcgYhQ8yZsNnYIfn6cfTd"
+    "uCD+4kJdHnss8S2C268S/4GszEH90cpSUI5bMXXVB1Adsntnz4S3Q1Z2hsB33zKOaB/sDnKYC"
+    "ck8y17JWTLCmVlwRpjiCL2NnKNwNkYbVeNa2U98/OJbHA2UGttqpI/GKnb2wB/iZV9KQ/Cf1k"
+    "HIvJO99IFT12AKL2YoApLVVWrd2cxOHt2uAvnI3Pc+Qh2p8AZz++00eso1cmXkD5VzTNTpOnY"
+    "PmGJAEO4Lo2Mb+00Op+LHWoPXifHtBt2E3588JPxSx/cXUaLIpvHHs7RwWSG+88rXQY1s628Z"
+    "rhJFn7U/1logJ6lJo5exJAqDDzwlagdIxzCeNiyoKp/GQpwtSPYK1EIQDHqoYcBR6BJsRAbeZ"
+    "PzQ3TS/6lwEFE9EWfzohhHkVthPqsblympNQmWr8= firstmate-crosscheck-blackhole"
+)
 assert vm["properties"]["securityProfile"]["securityType"] == "TrustedLaunch"
 assert vm["properties"]["storageProfile"]["imageReference"] == {"id": "[parameters('modelImageId')]"}
 source = adapter.read_text(encoding="utf-8")

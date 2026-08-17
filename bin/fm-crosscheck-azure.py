@@ -1128,13 +1128,22 @@ def delete_exact_blob(config: dict[str, Any], blob: str) -> None:
 def prove_resource_absent(
     config: dict[str, Any], resource_id: str, api_version: str, label: str
 ) -> None:
+    # Bounded poll, matching delete_exact_resource's own absence proof: the
+    # parent deletion is asynchronous on the control plane, so a child can
+    # stay briefly resolvable (or return a not-yet-classified error) right
+    # after the parent's terminal 404. Only a still-resolvable child at the
+    # deadline is a real cleanup failure.
     url = "https://management.azure.com" + resource_id + "?api-version=" + api_version
-    _resource, rc, detail = az(config, ["rest", "--method", "get", "--url", url], check=False)
-    if rc != 0:
-        if azure_resource_absent(detail):
+    deadline = time.monotonic() + MAX_AZURE_CALL_SECONDS
+    while True:
+        _resource, rc, detail = az(config, ["rest", "--method", "get", "--url", url], check=False)
+        if rc != 0 and azure_resource_absent(detail):
             return
-        raise AzureCrosscheckError(f"{label} absence is ambiguous: {detail}")
-    raise AzureCrosscheckError(f"{label} survived its parent deletion")
+        if time.monotonic() >= deadline:
+            if rc != 0:
+                raise AzureCrosscheckError(f"{label} absence is ambiguous: {detail}")
+            raise AzureCrosscheckError(f"{label} survived its parent deletion")
+        time.sleep(5)
 
 
 def cleanup_model_vm(config: dict[str, Any], resources: dict[str, Any], identity: dict[str, str]) -> None:

@@ -84,15 +84,26 @@ AZURE_EVIDENCE_BATCH_SECONDS = 4 * 3600
 REMOTE_EVIDENCE_PROGRAM = REPLAY.read_text(encoding="utf-8")
 
 
+MAX_ENCODED_MANIFEST_BYTES = 48 * 1024
+
+
 def encoded_manifest(files: dict[str, bytes]) -> str:
     # The manifest rides the runner request, which is bounded at 48KiB for
     # its control-plane parameter transport; deterministic gzip (mtime=0)
-    # keeps realistic textual evidence inside that envelope.
+    # keeps realistic textual evidence inside that envelope, and the bound
+    # is asserted here so an oversized manifest fails loudly at build time
+    # instead of opaquely inside the control plane.
     value = {
         relative: base64.b64encode(body).decode("ascii")
         for relative, body in sorted(files.items())
     }
-    return base64.b64encode(gzip.compress(canonical(value), mtime=0)).decode("ascii")
+    encoded = base64.b64encode(gzip.compress(canonical(value), mtime=0)).decode("ascii")
+    if len(encoded) > MAX_ENCODED_MANIFEST_BYTES:
+        raise BridgeError(
+            "evidence manifest exceeds its control-plane parameter bound: "
+            f"{len(encoded)} > {MAX_ENCODED_MANIFEST_BYTES} encoded bytes"
+        )
+    return encoded
 
 
 def evidence_command(

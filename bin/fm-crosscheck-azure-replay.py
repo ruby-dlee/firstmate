@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import gzip
+import io
 import json
 import os
 from pathlib import Path
@@ -61,7 +62,12 @@ def safe_manifest_parent(root: Path, relative: str) -> Path:
 def materialize_manifest(root: Path, encoded: str) -> None:
     try:
         compressed = base64.b64decode(encoded, validate=True)
-        raw = gzip.decompress(compressed)
+        # Bounded incremental decompression: read at most one byte past the
+        # bound so an over-limit manifest is rejected without ever being
+        # materialized in full (a whole-buffer gzip.decompress would expand
+        # the bomb before the size check could fire).
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as stream:
+            raw = stream.read(MAX_MANIFEST_JSON_BYTES + 1)
         if len(raw) > MAX_MANIFEST_JSON_BYTES:
             raise ValueError("evidence manifest exceeds its decoded byte bound")
         files = json.loads(raw)

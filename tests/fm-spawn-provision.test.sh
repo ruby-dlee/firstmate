@@ -318,6 +318,33 @@ test_a_bare_requirements_list_installs_dependencies_not_a_project() {
   pass "a bare requirements.txt installs only its dependencies"
 }
 
+test_bare_requirements_take_precedence_over_a_standalone_uv_lock() {
+  local case_dir out fakebin detected
+  case_dir=$(new_case requirements-and-uv-lock none)
+  fakebin=$(case_fakebin "$case_dir")
+  mkdir -p "$case_dir/wt/dependency-list"
+  printf 'six==1.16.0\n' > "$case_dir/wt/dependency-list/requirements.txt"
+  printf 'version = 1\nrevision = 3\nrequires-python = ">=3.11"\n' \
+    > "$case_dir/wt/dependency-list/uv.lock"
+
+  detected=$(PATH="$fakebin:/usr/bin:/bin" bash -c '
+    set -u
+    . "$1"
+    fm_provision_detect "$2"
+  ' _ "$LIB" "$case_dir/wt")
+  [ "$detected" = 'pip dependency-list' ] \
+    || fail "requirements.txt did not take precedence over a standalone uv.lock: $detected"
+
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'rc=0 summary=pip:dependency-list=installed' \
+    "requirements.txt plus a standalone uv.lock did not install successfully: $out"
+  assert_grep 'uv pip install --python .venv/bin/python -r requirements.txt' "$case_dir/install.log" \
+    "requirements.txt plus a standalone uv.lock did not use the dependency installer"
+  assert_no_grep 'uv sync' "$case_dir/install.log" \
+    "requirements.txt plus a standalone uv.lock reached the project-style installer"
+  pass "bare requirements take precedence over a standalone uv.lock"
+}
+
 test_a_standalone_uv_lock_installs_dependencies_not_a_project() {
   local case_dir out fakebin detected
   case_dir=$(new_case standalone-uv-lock none)
@@ -2109,6 +2136,7 @@ test_spawn_into_an_undeclared_project_is_unchanged() {
 
 test_worktree_declaring_nothing_is_a_clean_noop
 test_a_bare_requirements_list_installs_dependencies_not_a_project
+test_bare_requirements_take_precedence_over_a_standalone_uv_lock
 test_a_standalone_uv_lock_installs_dependencies_not_a_project
 test_an_unresolved_standalone_uv_lock_is_a_gap_not_a_failure
 test_an_npm_lock_without_a_package_manifest_is_a_gap_not_a_failure

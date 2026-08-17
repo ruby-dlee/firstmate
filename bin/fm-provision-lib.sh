@@ -525,11 +525,14 @@ fm_provision_detect() {  # <worktree> [<scan-line>...]
       continue
     fi
     dir=$(fm_provision_component_dir "$wt" "$rel")
-    # Python: a uv project wins over a bare dependency list. A standalone
-    # uv.lock is distinct because uv sync cannot discover a project there and
-    # must install through cache-local synthetic metadata instead.
+    # Python: a uv project wins over a bare dependency list. Without project
+    # metadata, requirements.txt is the directly supported dependency-list
+    # declaration even when a standalone uv.lock is also present. A standalone
+    # uv.lock otherwise installs through cache-local synthetic metadata.
     if [ -f "$dir/uv.lock" ] && [ -f "$dir/pyproject.toml" ]; then
       printf '%s %s\n' uv "$rel"
+    elif [ -f "$dir/requirements.txt" ]; then
+      printf '%s %s\n' pip "$rel"
     elif [ -f "$dir/uv.lock" ]; then
       root_name=$(fm_provision_uv_lock_root_name "$dir") || root_name=
       if [ -n "$root_name" ]; then
@@ -537,8 +540,6 @@ fm_provision_detect() {  # <worktree> [<scan-line>...]
       else
         printf '%s %s\n' python-lock "$rel"
       fi
-    elif [ -f "$dir/requirements.txt" ]; then
-      printf '%s %s\n' pip "$rel"
     else
       declared_rc=0
       fm_provision_python_project_declared "$dir" || declared_rc=$?

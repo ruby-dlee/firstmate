@@ -266,6 +266,107 @@ PY
     *"differs from its bound digest"*) : ;;
     *) fail "the tampered payload refusal did not name the digest gate: $out" ;;
   esac
+  # Lying manifest: the archive is intact (archive-level digest passes), but
+  # the request's per-member digest for brief.md is wrong; the PER-MEMBER
+  # gate must fire, so deleting that check can never pass this suite again.
+  python3 - "$tmp" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+request = json.loads((root / "request.json").read_text())
+request.pop("request_digest")
+request["payload_files"]["brief.md"]["sha256"] = "0" * 64
+request["request_digest"] = hashlib.sha256(
+    json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+).hexdigest()
+(root / "request-lying.json").write_text(json.dumps(request))
+PY
+  git -C "$src" bundle create "$tmp/repo.bundle" HEAD >/dev/null 2>&1
+  python3 - "$tmp" <<'PY'
+import hashlib
+import io
+import json
+import tarfile
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+buffer = io.BytesIO()
+with tarfile.open(fileobj=buffer, mode="w:gz") as handle:
+    for name in ("repo.bundle", "brief.md"):
+        body = (root / name).read_bytes()
+        info = tarfile.TarInfo(name=name)
+        info.size = len(body)
+        handle.addfile(info, io.BytesIO(body))
+payload = buffer.getvalue()
+(root / "payload.tar.gz").write_bytes(payload)
+meta = json.loads((root / "staging-meta.json").read_text())
+meta["payload"] = {"sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload)}
+(root / "staging-meta.json").write_text(json.dumps(meta))
+PY
+  payload_sha=$(python3 -c "import json;print(json.load(open('$tmp/staging-meta.json'))['payload']['sha256'])")
+  payload_bytes=$(python3 -c "import json;print(json.load(open('$tmp/staging-meta.json'))['payload']['bytes'])")
+  mkdir -p "$tmp/work3"
+  out=$(FM_WORKER_HOME_BINDING="$home" FM_WORKER_TASK=task-one FM_WORKER_TASK_GENERATION="$task_gen" \
+    FM_WORKER_ASSIGNMENT_GENERATION="$assignment" FM_WORKER_ACCOUNT_BINDING="$account_binding" \
+    FM_WORKER_WORKTREE_BINDING="$worktree_binding" FM_WORKER_REPOSITORY_BINDING="$repo_binding" \
+    FM_WORKER_REPOSITORY_GENERATION="$repo_gen" FM_WORKER_CLOUD_INSTANCE_ID="$cloud" \
+    FM_WORKER_WORKTREE="$tmp/work3" FM_WORKER_ACCOUNT_HOME="$account" \
+    FM_WORKER_EXECUTED_DIR="$tmp/executed3" \
+    FM_WORKER_PAYLOAD_URL="https://fixture.invalid/payload" FM_WORKER_PAYLOAD_SHA256="$payload_sha" \
+    FM_WORKER_PAYLOAD_BYTES="$payload_bytes" FM_WORKER_PAYLOAD_FILE="$tmp/payload.tar.gz" \
+    FM_WORKER_ACCOUNT_URL="https://fixture.invalid/account" FM_WORKER_ACCOUNT_SHA256="$account_sha" \
+    FM_WORKER_ACCOUNT_BYTES="$account_bytes" FM_WORKER_ACCOUNT_FILE="$tmp/account.tar.gz" \
+    python3 "$SUPERVISOR" execute --request "$tmp/request-lying.json" --result "$tmp/result3.json" 2>&1)
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    fail "a lying per-member manifest was accepted: $out"
+  fi
+  case "$out" in
+    *"staged file differs from its bound manifest"*) : ;;
+    *) fail "the lying-manifest refusal did not name the per-member gate: $out" ;;
+  esac
+  # Wrong bound repository generation: staging succeeds but the clone's HEAD
+  # proof must refuse before any execution.
+  python3 - "$tmp" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+request = json.loads((root / "request.json").read_text())
+request.pop("request_digest")
+request["repository_generation"] = "f" * 40
+request["request_digest"] = hashlib.sha256(
+    json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+).hexdigest()
+(root / "request-wrong-gen.json").write_text(json.dumps(request))
+PY
+  mkdir -p "$tmp/work4"
+  out=$(FM_WORKER_HOME_BINDING="$home" FM_WORKER_TASK=task-one FM_WORKER_TASK_GENERATION="$task_gen" \
+    FM_WORKER_ASSIGNMENT_GENERATION="$assignment" FM_WORKER_ACCOUNT_BINDING="$account_binding" \
+    FM_WORKER_WORKTREE_BINDING="$worktree_binding" FM_WORKER_REPOSITORY_BINDING="$repo_binding" \
+    FM_WORKER_REPOSITORY_GENERATION="$(python3 -c "print('f'*40)")" \
+    FM_WORKER_CLOUD_INSTANCE_ID="$cloud" \
+    FM_WORKER_WORKTREE="$tmp/work4" FM_WORKER_ACCOUNT_HOME="$account" \
+    FM_WORKER_EXECUTED_DIR="$tmp/executed4" \
+    FM_WORKER_PAYLOAD_URL="https://fixture.invalid/payload" FM_WORKER_PAYLOAD_SHA256="$payload_sha" \
+    FM_WORKER_PAYLOAD_BYTES="$payload_bytes" FM_WORKER_PAYLOAD_FILE="$tmp/payload.tar.gz" \
+    FM_WORKER_ACCOUNT_URL="https://fixture.invalid/account" FM_WORKER_ACCOUNT_SHA256="$account_sha" \
+    FM_WORKER_ACCOUNT_BYTES="$account_bytes" FM_WORKER_ACCOUNT_FILE="$tmp/account.tar.gz" \
+    python3 "$SUPERVISOR" execute --request "$tmp/request-wrong-gen.json" --result "$tmp/result4.json" 2>&1)
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    fail "a wrong bound repository generation was accepted: $out"
+  fi
+  case "$out" in
+    *"staged repository head differs"*) : ;;
+    *) fail "the wrong-generation refusal did not name the head proof: $out" ;;
+  esac
   pass "the supervisor stages digest-bound payload, account, and repository exactly"
 }
 

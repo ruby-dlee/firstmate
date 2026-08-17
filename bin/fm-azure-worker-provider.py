@@ -1792,6 +1792,19 @@ def mutate_reset(controller, action):
                 raise ProviderError("conditional {} blob deletion failed: {}".format(kind, stderr))
         else:
             conditional_delete(controller, kind, resource)
+    # The payload and account archives are per-execution transport (their
+    # content is bound through the request manifests, never identity-fenced),
+    # and the account archive fronts provider credentials: both are removed
+    # unconditionally at reset, tolerating absence.
+    for blob_name in ("payload.tar.gz", "account.tar.gz"):
+        _, rc, stderr = az(controller, [
+            "storage", "blob", "delete", "--auth-mode", "login",
+            "--account-name", os.environ.get("FM_AZURE_STORAGE_NAME", ""),
+            "--container-name", expected_names(controller, action["slot"])["state-container"],
+            "--name", blob_name,
+        ], check=False)
+        if rc != 0 and "does not exist" not in stderr and "BlobNotFound" not in stderr:
+            raise ProviderError("staging archive deletion failed for {}: {}".format(blob_name, stderr))
     refreshed = worker_by_slot(inventory(controller, include_metrics=False), action["slot"])
     if refreshed is None:
         raise ProviderError("cleanup marker container disappeared before exact reset completed")
@@ -1842,25 +1855,36 @@ def mutate_execute(controller, action):
     # Crewmate payload plane: the digest-bound request carries only manifests;
     # the archives ride private blobs and reach the guest over short-lived
     # read-only user-delegation SAS bounded to the wall plus collection slack.
-    staging_env = ""
+    # The SAS URLs travel as PROTECTED run-command parameters: ARM GET and
+    # az vm run-command show return source.script but never protected
+    # parameters, so the account-archive SAS is not readable off the control
+    # plane for its validity window. The managed run-command agent delivers
+    # parameters as environment variables for the script process, which the
+    # supervisor inherits.
+    protected_parameters = []
     if action.get("payload_dir"):
         storage = os.environ.get("FM_AZURE_STORAGE_NAME", "")
         sas_seconds = int(request["wall_seconds"]) + 1800
-        for label, directory, manifest, blob_key in (
-            ("payload", action["payload_dir"], request["payload_files"], "staging-payload"),
-            ("account", action["account_dir"], request["account_files"], "staging-account"),
+        for label, directory, manifest in (
+            ("payload", action["payload_dir"], request["payload_files"]),
+            ("account", action["account_dir"], request["account_files"]),
         ):
             archive = staged_directory_archive(directory, manifest, label)
-            blob_name = names["staging-request"].rsplit("/", 1)[0] + "/{}.tar.gz".format(label)
+            blob_name = "{}.tar.gz".format(label)
             archive_digest = upload_bytes_blob(
                 controller, storage, names["state-container"], blob_name, archive, tags,
             )
             sas_url = blob_read_sas(
                 controller, storage, names["state-container"], blob_name, sas_seconds,
             )
-            staging_env += (
-                "export FM_WORKER_{0}_URL='{1}' FM_WORKER_{0}_SHA256='{2}' FM_WORKER_{0}_BYTES='{3}'\n"
-            ).format(label.upper(), sas_url, archive_digest, len(archive))
+            if not re.fullmatch(r"https://[A-Za-z0-9.:/_?&=%+-]+", sas_url):
+                raise ProviderError("{} staging SAS carries unsupported characters".format(label))
+            prefix = "FM_WORKER_{}_".format(label.upper())
+            protected_parameters += [
+                prefix + "URL=" + sas_url,
+                prefix + "SHA256=" + archive_digest,
+                prefix + "BYTES=" + str(len(archive)),
+            ]
     request_json = json.dumps(request, sort_keys=True, separators=(",", ":"))
     bindings = action["bindings"]
     script = """set -eu
@@ -1874,20 +1898,23 @@ export FM_WORKER_ASSIGNMENT_GENERATION='{assignment}' FM_WORKER_ACCOUNT_BINDING=
 export FM_WORKER_WORKTREE_BINDING='{worktree}' FM_WORKER_REPOSITORY_BINDING='{repository}'
 export FM_WORKER_REPOSITORY_GENERATION='{repository_generation}' FM_WORKER_CLOUD_INSTANCE_ID='{cloud}'
 export FM_WORKER_WORKTREE=/mnt/task FM_WORKER_ACCOUNT_HOME=/mnt/account
-{staging}/usr/local/libexec/fm-worker-supervisor execute --request /var/lib/firstmate-worker/request.json --result /var/lib/firstmate-worker/result.json
+/usr/local/libexec/fm-worker-supervisor execute --request /var/lib/firstmate-worker/request.json --result /var/lib/firstmate-worker/result.json
 printf 'FM-WORKER-RESULT:%s\\n' "$(cat /var/lib/firstmate-worker/result.json)"
 """.format(
         request=request_json, home=bindings["home_binding"], task=bindings["task"],
         task_generation=bindings["task_generation"], assignment=bindings["assignment_generation"],
         account=bindings["account_binding"], worktree=bindings["worktree_binding"],
         repository=bindings["repository_binding"], repository_generation=bindings["repository_generation"],
-        cloud=action["cloud_instance_id"], staging=staging_env,
+        cloud=action["cloud_instance_id"],
     )
-    _, rc, stderr = az(controller, [
+    update_command = [
         "vm", "run-command", "update", "--resource-group", controller["resource_group"],
         "--vm-name", names["vm"], "--name", names["task-command"],
         "--script", script, "--async-execution", "false",
-    ], check=False)
+    ]
+    if protected_parameters:
+        update_command += ["--protected-parameters"] + protected_parameters
+    _, rc, stderr = az(controller, update_command, check=False)
     if rc != 0:
         raise ProviderError("exact private worker execution failed: {}".format(stderr))
     # The update response body has no instance view; only the explicit

@@ -93,10 +93,21 @@ installed=\$(node -p "require('/usr/lib/node_modules/@earendil-works/pi-coding-a
 test "\$installed" = 0.84.1
 apt-get clean
 waagent -deprovision+user -force
+echo FM-BAKE-COMPLETE
 EOF
 echo "fm-azure-cell-image: baking (packages + closure)" >&2
-az vm run-command invoke --resource-group "$RESOURCE_GROUP" --name "$BUILDER" \
-  --command-id RunShellScript --scripts @"$BAKE" --output none
+# The invoke returns rc 0 regardless of the guest script's exit; the
+# terminal marker is the only proof the whole bake actually ran.
+BAKE_MESSAGE=$(az vm run-command invoke --resource-group "$RESOURCE_GROUP" --name "$BUILDER" \
+  --command-id RunShellScript --scripts @"$BAKE" --query "value[0].message" -o tsv)
+case "$BAKE_MESSAGE" in
+  *FM-BAKE-COMPLETE*) ;;
+  *)
+    printf '%s\n' "$BAKE_MESSAGE" | tail -40 >&2
+    echo "fm-azure-cell-image: guest bake script did not complete; refusing to capture" >&2
+    exit 1
+    ;;
+esac
 
 echo "fm-azure-cell-image: capturing image $IMAGE" >&2
 az vm deallocate --resource-group "$RESOURCE_GROUP" --name "$BUILDER" --output none

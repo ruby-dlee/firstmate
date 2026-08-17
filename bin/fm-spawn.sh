@@ -4296,7 +4296,6 @@ spawn_cloud_persist_convergence_artifacts() {
       exit 1
     }
     cp "$DATA/$ID/brief.md" "$STATE/$ID.cloud-payload/brief.md" || exit 1
-    [ ! -f "$STATE/$ID.pi-ext.ts" ] || cp "$STATE/$ID.pi-ext.ts" "$STATE/$ID.cloud-payload/pi-ext.ts" || exit 1
     CLOUD_ACCOUNT_SOURCE=${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}
     if [ ! -f "$CLOUD_ACCOUNT_SOURCE/auth.json" ]; then
       echo "error: cloud account source lacks auth.json at $CLOUD_ACCOUNT_SOURCE" >&2
@@ -4336,8 +4335,10 @@ spawn_cloud_dispatch() {
     --task "$ID" --task-generation "$SPAWN_GENERATION_ID" \
     --owner-kind "$owner_kind" --eligible >&2 || {
     # No durable queue entry exists, so the convergence artifacts have no
-    # owner; remove them with the rolled-back spawn.
+    # owner; remove them (including the copied provider credential) with the
+    # rolled-back spawn.
     rm -f "$STATE/$ID.cloud-entrypoint" "$STATE/$ID.cloud-env"
+    rm -rf "$STATE/$ID.cloud-payload" "$STATE/$ID.cloud-account"
     echo "error: cloud worker request was refused for $ID" >&2
     return 1
   }

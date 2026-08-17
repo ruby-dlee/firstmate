@@ -2015,7 +2015,6 @@ def command_capacity_release(env, args):
 PAYLOAD_FILE_BOUNDS = {
     "repo.bundle": 512 * 1024 * 1024,
     "brief.md": 256 * 1024,
-    "pi-ext.ts": 256 * 1024,
 }
 ACCOUNT_TOTAL_BOUND = 1024 * 1024
 

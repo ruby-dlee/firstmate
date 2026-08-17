@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -109,6 +110,11 @@ def bounded(value):
     return value[:MAX_OUTPUT_BYTES], True
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise SupervisorError("staging fetch was redirected, which is refused")
+
+
 MAX_ARCHIVE_BYTES = 600 * 1024 * 1024
 SAFE_STAGED_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -131,8 +137,12 @@ def fetch_archive(label):
         # network fetch; every verification below still runs unchanged.
         body = Path(local_source).read_bytes()
     else:
+        # A redirect-refusing opener: the staging endpoint never redirects,
+        # and following one could silently downgrade to plaintext before the
+        # digest check.
+        opener = urllib.request.build_opener(_NoRedirect())
         try:
-            with urllib.request.urlopen(url, timeout=300) as response:
+            with opener.open(url, timeout=300) as response:
                 body = response.read(size + 1)
         except OSError as exc:
             raise SupervisorError("{} staging fetch failed: {}".format(label, exc))
@@ -186,7 +196,12 @@ def stage_payload(request, worktree, account_home):
     extract_staged_archive(fetch_archive("account"), account_manifest, account_target, "account")
     repo = worktree / "repo"
     if repo.exists():
-        raise SupervisorError("staged repository target already exists")
+        # Staging only runs when no executed marker exists, so anything at
+        # the target is the debris of an interrupted earlier staging; remove
+        # it rather than wedging every future dispatch of this request.
+        if repo.is_symlink() or not repo.is_dir():
+            raise SupervisorError("staged repository target is not a removable directory")
+        shutil.rmtree(repo)
     bundle = staging / "repo.bundle"
     clone = subprocess.run(
         ["git", "clone", "--quiet", str(bundle), str(repo)],

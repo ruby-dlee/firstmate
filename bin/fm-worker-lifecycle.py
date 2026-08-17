@@ -53,6 +53,12 @@ SHARED_HEADROOM_VCPUS = 22
 REGIONAL_NON_AUTHOR_RESERVE_VCPUS = SPECIALIZED_SHAPE_VCPUS + SHARED_HEADROOM_VCPUS
 DEFAULT_COOLDOWN_SECONDS = 300
 PROVIDER_TIMEOUT_SECONDS = 300
+# A create runs an ARM deployment (minutes, not seconds) and an execute blocks
+# for the whole guest run. Bounding those at PROVIDER_TIMEOUT_SECONDS hangs the
+# controller up while Azure carries on, leaving a live resource the controller
+# never recorded.
+PROVIDER_CREATE_TIMEOUT_SECONDS = 1800
+PROVIDER_GUEST_RUN_SLACK_SECONDS = 2400
 MAX_PROVIDER_OUTPUT_BYTES = 2 * 1024 * 1024
 REQUIRED_RESOURCE_KINDS = (
     "vm", "nic", "os-disk", "task-disk", "account-disk", "identity",
@@ -393,6 +399,20 @@ def ensure_unique_bindings(state, candidate, ignore_key=None):
             raise LifecycleError("writable worktree binding is already owned by another queued or active task")
 
 
+def provider_action_timeout(action):
+    """How long the provider subprocess may take for one action."""
+    if not isinstance(action, dict):
+        return PROVIDER_TIMEOUT_SECONDS
+    if action.get("type") == "execute":
+        wall = (action.get("request") or {}).get("wall_seconds")
+        if isinstance(wall, int) and not isinstance(wall, bool) and wall > 0:
+            return wall + PROVIDER_GUEST_RUN_SLACK_SECONDS
+        return PROVIDER_GUEST_RUN_SLACK_SECONDS
+    if action.get("type") in ("create", "reset", "delete-compute", "deallocate"):
+        return PROVIDER_CREATE_TIMEOUT_SECONDS
+    return PROVIDER_TIMEOUT_SECONDS
+
+
 def provider_call(env, operation, action=None):
     request = {
         "schema": PROVIDER_REQUEST_SCHEMA,
@@ -412,7 +432,7 @@ def provider_call(env, operation, action=None):
         result = subprocess.run(
             env["provider_argv"], input=canonical_bytes(request) + b"\n",
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=PROVIDER_TIMEOUT_SECONDS,
+            timeout=provider_action_timeout(action),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise LifecycleError("provider operation is unavailable or exceeded its bounded deadline: {}".format(exc))

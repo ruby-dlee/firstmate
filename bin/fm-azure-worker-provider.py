@@ -1245,6 +1245,25 @@ def upload_json_blob(controller, account, container, name, value, tags, overwrit
             "--overwrite", "true" if overwrite else "false", "--metadata",
         ] + ["{}={}".format(key, value) for key, value in sorted(metadata.items())], check=False)
         if rc != 0:
+            # A create-once blob that already carries exactly these bytes is
+            # this same action replaying after a lost or timed-out response,
+            # which must converge rather than wedge. Different bytes under the
+            # same name still refuse: that is a foreign or newer assignment.
+            if not overwrite and ("BlobAlreadyExists" in stderr or "already exists" in stderr):
+                existing, show_rc, show_stderr = az(controller, [
+                    "storage", "blob", "show", "--auth-mode", "login",
+                    "--account-name", account, "--container-name", container,
+                    "--name", name, "--query", "metadata.content_digest",
+                ], check=False)
+                if show_rc != 0:
+                    raise ProviderError(
+                        "existing worker staging blob is unreadable: {}".format(show_stderr)
+                    )
+                if existing != digest:
+                    raise ProviderError(
+                        "worker staging blob {} already exists with different content".format(name)
+                    )
+                return digest
             raise ProviderError("exact worker staging upload failed: {}".format(stderr))
     finally:
         with contextlib.suppress(FileNotFoundError):
@@ -2008,6 +2027,11 @@ printf 'FM-WORKER-RESULT:%s\\n' "$(cat /var/lib/firstmate-worker/result.json)"
         "vm", "run-command", "update", "--resource-group", controller["resource_group"],
         "--vm-name", names["vm"], "--name", names["task-command"],
         "--script", script, "--async-execution", "false",
+        # Without this the managed run command takes Azure's own default while
+        # the CLI waits out the whole wall, so a long task dies guest-side with
+        # the client still blocked. bin/fm-azure-runner.py and
+        # bin/fm-azure-validation.py both set it for the same reason.
+        "--timeout-in-seconds", str(int(request["wall_seconds"]) + GUEST_RUN_SLACK_SECONDS),
     ]
     if protected_parameters:
         update_command += ["--protected-parameters"] + protected_parameters

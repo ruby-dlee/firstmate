@@ -10,7 +10,7 @@ set -u
 SCRIPT="$ROOT/bin/fm-azure-pilot.sh"
 TEMPLATE="$ROOT/docs/azure-pilot/main.json"
 WORKER_PROVIDER="$ROOT/bin/fm-azure-worker-provider.py"
-# A separate handle from TEMPLATE, which later cases reassign in subshells.
+WORKER_LIFECYCLE="$ROOT/bin/fm-worker-lifecycle.py"
 WORKER_TEMPLATE="$ROOT/docs/azure-pilot/main.json"
 DOC="$ROOT/docs/azure-pilot.md"
 
@@ -839,14 +839,28 @@ provider.run_command_instance_view = lambda controller, vm, name: {
 }
 seen = {}
 
+# Substitute run(), NOT az(): monkeypatching provider.az leaves the whole az ->
+# run plumbing untested, so dropping the timeout parameter from az() (a
+# TypeError on every real execute) stayed green. This drives the real az().
+_real_run = provider.run
 
-def fake_az(controller, args, check=True, timeout=provider.AZ_TIMEOUT_SECONDS):
-    if "update" in args and "run-command" in args:
+
+class _Result:
+    returncode = 0
+    stderr = b""
+
+    def __init__(self, payload):
+        self.stdout = payload
+
+
+def fake_run(command, check=True, input_bytes=None, timeout=provider.AZ_TIMEOUT_SECONDS, env=None):
+    if "run-command" in command and "update" in command:
         seen["timeout"] = timeout
-    return {}, 0, ""
+        seen["command"] = list(command)
+    return _Result(b"{}")
 
 
-provider.az = fake_az
+provider.run = fake_run
 provider.mutate_execute(controller, action)
 
 # The blocking call must clear the wall by far more than the ordinary
@@ -855,6 +869,15 @@ provider.mutate_execute(controller, action)
 assert seen.get("timeout") is not None, "the run-command update carried no explicit bound"
 assert seen["timeout"] >= request["wall_seconds"] + 1800, (
     "the blocking run-command bound does not cover a whole guest run", seen["timeout"],
+)
+
+# The guest side needs its own bound or Azure applies its default while the
+# client waits out the whole wall.
+command = seen.get("command") or []
+assert "--timeout-in-seconds" in command, ("the run command carries no guest bound", command)
+guest_bound = int(command[command.index("--timeout-in-seconds") + 1])
+assert guest_bound >= request["wall_seconds"] + 1800, (
+    "the guest run-command bound does not cover its own wall", guest_bound,
 )
 print("OK")
 GUESTBOUND
@@ -865,32 +888,242 @@ GUESTBOUND
 }
 
 run_worker_os_disk_image_check() {
-  # A captured golden image carries its own OS disk size, and Azure refuses any
-  # smaller pin outright ("disk size 64 GB is smaller than ... 96 GB"), so the
-  # worker template must not assert a size it cannot know.
-  python3 - "$WORKER_TEMPLATE" <<'OSDISK' || fail "the worker OS disk pins a size it cannot know"
+  # A captured golden image carries its own OS disk size and Azure refuses any
+  # smaller pin outright, failing the whole deployment. The first version of
+  # this check was string surgery and stayed green when the condition was
+  # INVERTED, which reproduces that failure verbatim, so it now parses the
+  # expression and evaluates both branches.
+  python3 - "$WORKER_TEMPLATE" <<'OSDISK' || fail "the worker OS disk expression is not exact"
 import json
 import re
 import sys
 
 body = open(sys.argv[1], encoding="utf-8").read()
-template = json.loads(body)
-worker_os_disk = [
-    line for line in body.splitlines()
-    if '"osDisk"' in line and "wkr-{1}-os" in line
-]
-assert len(worker_os_disk) == 1, worker_os_disk
-expression = worker_os_disk[0]
-assert "workerImageId" in expression, "the worker OS disk does not branch on the custom image"
-default_branch, custom_branch = expression.split("createObject", 1)[1], expression.rsplit("createObject('name'", 1)[1]
-assert "diskSizeGB" in default_branch, "the Canonical branch lost its explicit size"
-assert "diskSizeGB" not in custom_branch, "the custom-image branch still pins a size"
-assert isinstance(template, dict)
+json.loads(body)
+lines = [line for line in body.splitlines() if '"osDisk"' in line and "wkr-{1}-os" in line]
+assert len(lines) == 1, lines
+expression = lines[0].split('"osDisk": "', 1)[1].rsplit('",', 1)[0]
+
+assert expression.startswith("[if(equals(parameters('workerImageId'), '')"), (
+    "the branch condition is not the exact empty-image test", expression[:80],
+)
+assert expression.count("(") == expression.count(")"), "unbalanced parentheses"
+
+
+def split_args(text):
+    parts, depth, current, quoted = [], 0, [], False
+    for ch in text:
+        if ch == "'":
+            quoted = not quoted
+        if not quoted:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                parts.append("".join(current).strip())
+                current = []
+                continue
+        current.append(ch)
+    parts.append("".join(current).strip())
+    return parts
+
+
+inner = expression[len("[if("):-2]
+args = split_args(inner)
+assert len(args) == 3, ("if() arity", len(args))
+condition, default_branch, custom_branch = args
+assert "workerImageId" in condition and "equals(" in condition, condition
+
+def keys_of(branch):
+    assert branch.startswith("createObject("), branch[:40]
+    items = split_args(branch[len("createObject("):-1])
+    assert len(items) % 2 == 0, ("createObject arity is odd", len(items))
+    return {items[i].strip("'"): items[i + 1] for i in range(0, len(items), 2)}
+
+# The EMPTY-image branch keeps the explicit size; the custom-image branch must
+# not pin one. Inverting the condition swaps these and fails here.
+default_keys = keys_of(default_branch)
+custom_keys = keys_of(custom_branch)
+assert "diskSizeGB" in default_keys, ("the Canonical branch lost its size", sorted(default_keys))
+assert "diskSizeGB" not in custom_keys, ("the custom-image branch pins a size", sorted(custom_keys))
+
+required = {"name", "createOption", "deleteOption", "managedDisk"}
+for label, keys in (("default", default_keys), ("custom", custom_keys)):
+    missing = required - set(keys)
+    assert not missing, (label + " branch is missing properties", sorted(missing))
+    assert keys["createOption"] == "'FromImage'", (label, keys["createOption"])
+    assert "StandardSSD_LRS" in keys["managedDisk"], (label, keys["managedDisk"])
+
+# The lifecycle matches resources by exact name, so both branches must produce
+# the identical disk name.
+assert default_keys["name"] == custom_keys["name"], (
+    "the two branches build different OS disk names",
+    default_keys["name"], custom_keys["name"],
+)
+assert "disk-{0}-wkr-{1}-os" in default_keys["name"], default_keys["name"]
 OSDISK
-  pass "the worker OS disk inherits a custom image's size instead of pinning one"
+  pass "the worker OS disk expression branches correctly and names one disk"
 }
 
 run_guest_run_bound_check
 run_worker_os_disk_image_check
+
+run_create_replay_idempotence_check() {
+  # A create whose response was lost or timed out replays. Its create-once
+  # blobs already exist, so without content-equal convergence the lane wedges
+  # permanently: observed live as "The specified blob already exists" on the
+  # very first real worker creation.
+  local tmp out
+  fm_test_tmproot_into tmp fm-azure-create-replay
+  cat >"$tmp/driver.py" <<'CREATEREPLAY'
+import importlib.util
+import sys
+from pathlib import Path
+
+provider_path, tmp = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("fm_provider", provider_path)
+provider = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(provider)
+
+controller = {
+    "subscription": "00000000-0000-0000-0000-000000000000",
+    "resource_group": "rg-test", "prefix": "fmtest", "owner": "owner",
+    "deployment_generation": "dep-one", "home_binding": "a" * 64,
+}
+value = {"schema": "fm.worker-global-reservation/v1", "slot": 1}
+digest = provider.hashlib.sha256(provider.canonical_bytes(value) + b"\n").hexdigest()
+calls = []
+
+
+def make_az(existing_digest):
+    def fake_az(controller, args, check=True, timeout=provider.AZ_TIMEOUT_SECONDS):
+        calls.append(list(args))
+        if "upload" in args:
+            return None, 1, "ERROR: The specified blob already exists.\nErrorCode:BlobAlreadyExists"
+        if "show" in args:
+            return existing_digest, 0, ""
+        return {}, 0, ""
+    return fake_az
+
+
+# Replay of the same action: the blob already holds exactly these bytes, so the
+# create must converge instead of wedging the lane forever.
+provider.az = make_az(digest)
+landed = provider.upload_json_blob(
+    controller, "acct", "runner-control", "worker/01/reservation.json", value, {},
+)
+assert landed == digest, landed
+assert any("show" in call for call in calls), "the replay never checked the existing content"
+
+# A DIFFERENT reservation under the same name is a foreign or newer assignment
+# and must still refuse: create-once safety is not weakened.
+calls.clear()
+provider.az = make_az("f" * 64)
+try:
+    provider.upload_json_blob(
+        controller, "acct", "runner-control", "worker/01/reservation.json", value, {},
+    )
+    raise AssertionError("a conflicting create-once blob was accepted")
+except provider.ProviderError as exc:
+    assert "different content" in str(exc), exc
+print("OK")
+CREATEREPLAY
+  out=$(python3 "$tmp/driver.py" "$WORKER_PROVIDER" "$tmp" 2>&1)
+  expect_code 0 $? "a create replay must converge on identical content: $out"
+  assert_contains "$out" "OK" "the create-replay driver did not complete: $out"
+  pass "a create-once staging blob converges on replay and still refuses different content"
+}
+
+run_provider_action_bound_check() {
+  # The controller bounds the provider subprocess. A flat bound hangs the
+  # controller up mid-deployment while Azure carries on, leaving live resources
+  # the controller never recorded: observed live on the first worker creation.
+  local tmp out
+  fm_test_tmproot_into tmp fm-azure-provider-bound
+  cat >"$tmp/driver.py" <<'PROVIDERBOUND'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_lifecycle", sys.argv[1])
+lifecycle = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(lifecycle)
+
+# A VM create is an ARM deployment measured in minutes and an execute blocks
+# for the whole guest run; neither fits the ordinary control-plane bound.
+# Absolute floors, not the constants under test.
+create = lifecycle.provider_action_timeout({"type": "create"})
+assert create >= 900, ("a create is bounded too tightly for an ARM deployment", create)
+
+execute = lifecycle.provider_action_timeout(
+    {"type": "execute", "request": {"wall_seconds": 3600}}
+)
+assert execute >= 3600 + 1800, ("an execute is bounded below its own guest run", execute)
+
+# An ordinary read stays on the ordinary bound.
+assert lifecycle.provider_action_timeout({"type": "steer"}) == lifecycle.PROVIDER_TIMEOUT_SECONDS
+assert lifecycle.provider_action_timeout(None) == lifecycle.PROVIDER_TIMEOUT_SECONDS
+# A malformed wall must not produce a shorter bound than a bare guest run.
+assert lifecycle.provider_action_timeout({"type": "execute", "request": {}}) >= 1800
+# The bound above is only real if provider_call USES it. Drive the real
+# provider_call and capture what it actually passes to subprocess.run:
+# asserting the helper alone stays green with the call site reverted.
+import json as _json
+import subprocess as _subprocess
+
+captured = {}
+_real_run = lifecycle.subprocess.run
+
+
+class _Completed:
+    returncode = 0
+    stderr = b""
+
+    def __init__(self, payload):
+        self.stdout = payload
+
+
+def _fake_run(argv, input=None, stdout=None, stderr=None, timeout=None):
+    captured["timeout"] = timeout
+    body = _json.loads(input.decode("utf-8"))
+    response = {
+        "schema": "fm.worker-provider-response/v1",
+        "operation": body["operation"],
+        "controller": body["controller"],
+        "result": {"idempotency_key": "k"},
+    }
+    return _Completed(_json.dumps(response).encode("utf-8"))
+
+
+lifecycle.subprocess.run = _fake_run
+env = {
+    "home_binding": "a" * 64, "subscription": "sub", "deployment_generation": "dep",
+    "owner": "owner", "prefix": "fmtest", "resource_group": "rg",
+    "provider_argv": ["/usr/bin/true"],
+}
+try:
+    lifecycle.provider_call(env, "mutate", {"type": "create"})
+    create_timeout = captured["timeout"]
+    lifecycle.provider_call(
+        env, "mutate", {"type": "execute", "request": {"wall_seconds": 3600}}
+    )
+    execute_timeout = captured["timeout"]
+finally:
+    lifecycle.subprocess.run = _real_run
+
+assert create_timeout >= 900, ("provider_call did not bound a create by its action", create_timeout)
+assert execute_timeout >= 3600 + 1800, (
+    "provider_call did not bound an execute by its guest run", execute_timeout,
+)
+print("OK")
+PROVIDERBOUND
+  out=$(python3 "$tmp/driver.py" "$WORKER_LIFECYCLE" 2>&1)
+  expect_code 0 $? "the provider subprocess bound must cover its action: $out"
+  assert_contains "$out" "OK" "the provider-bound driver did not complete: $out"
+  pass "the provider subprocess bound covers the action it runs"
+}
+
+run_create_replay_idempotence_check
+run_provider_action_bound_check
 
 echo "# fm-azure-pilot.test.sh: all assertions passed"

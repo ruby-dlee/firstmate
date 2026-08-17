@@ -1168,6 +1168,17 @@ provider.upload_json_blob(
     reservation_payload(21), {}, volatile_fields=provider.RESERVATION_VOLATILE_FIELDS,
 )
 
+# A replay carrying a NEWER supervisor must converge. This is the live case:
+# a create fails, main merges a commit touching bin/fm-worker-supervisor.py, and
+# the replay recomputes a different digest. Treating that as identity turns a
+# recoverable wedge into one whose only exit is deleting the blob by hand.
+rebuilt = reservation_payload(21)
+rebuilt["supervisor_sha256"] = "b" * 64
+provider.upload_json_blob(
+    controller, "acct", "runner-control", reservation_name,
+    rebuilt, {}, volatile_fields=provider.RESERVATION_VOLATILE_FIELDS,
+)
+
 # A different SLOT ASSIGNMENT under the same name is still refused.
 conflicting = reservation_payload(21)
 conflicting["assignment_generation"] = "asg-00000002"
@@ -1218,7 +1229,7 @@ _real_upload = provider.upload_json_blob
 
 
 def recording_upload(controller, account, container, name, value, tags, **kwargs):
-    captured_uploads.append((name, kwargs.get("volatile_fields", ())))
+    captured_uploads.append((name, kwargs.get("volatile_fields", ()), kwargs.get("overwrite", False)))
     return "0" * 64
 
 
@@ -1321,6 +1332,26 @@ assert "ttl_deadline" in reservation_uploads[0][1], (
     "the real caller does not declare its recomputed deadline volatile, so a replay "
     "will never converge", reservation_uploads[0],
 )
+assert "supervisor_sha256" in reservation_uploads[0][1], (
+    "the real caller treats the supervisor digest as slot identity, so any merge touching "
+    "bin/fm-worker-supervisor.py between a failed create and its replay wedges the slot "
+    "permanently", reservation_uploads[0],
+)
+assert reservation_uploads[0][2] is False, (
+    "the reservation stopped being create-once, so it no longer arbitrates slot ownership",
+    reservation_uploads[0],
+)
+# The staging pair is per-assignment working state that mutate_execute already
+# overwrites. Leaving it create-once makes a resume after the first execute find
+# an execution body where an assignment belongs and refuse forever.
+staging_uploads = [item for item in captured_uploads if "staging" in item[0]]
+assert len(staging_uploads) == 2, ("the create no longer writes the staging pair",
+                                   captured_uploads)
+for item in staging_uploads:
+    assert item[2] is True, (
+        "a staging blob is still create-once, so a replay or resume cannot refresh it",
+        item,
+    )
 print("OK")
 CREATEREPLAY
   if out=$(python3 "$tmp/driver.py" "$WORKER_PROVIDER" "$tmp" 2>&1); then status=0; else status=$?; fi

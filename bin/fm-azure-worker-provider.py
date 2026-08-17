@@ -1244,7 +1244,19 @@ def mark_cleanup_container(controller, action, key, value):
     )
 
 
-RESERVATION_VOLATILE_FIELDS = ("ttl_deadline",)
+# What the reservation blob IDENTIFIES is the capacity grant: which slot, for
+# which assignment generation, at which SKU and price. Everything else in it is
+# provenance recorded alongside that grant, and must not be able to wedge a
+# replay.
+#
+# ttl_deadline is recomputed from now() on every attempt. supervisor_sha256 is
+# the digest of the supervisor the bootstrap script CARRIES; the guest re-proves
+# it from the script it actually received, so the reservation's copy is a record,
+# not the binding. Treating it as identity means any merge that touches
+# bin/fm-worker-supervisor.py between a failed create and its replay turns a
+# recoverable wedge into a permanent one whose only exit is hand-deleting the
+# blob. That is not theoretical: it is the state slot 2 is in right now.
+RESERVATION_VOLATILE_FIELDS = ("ttl_deadline", "supervisor_sha256")
 
 
 def blob_identity_digest(value, volatile_fields=()):
@@ -1609,9 +1621,19 @@ def create_lifecycle_children(controller, action):
         "slot": action["slot"], "bindings": action["bindings"],
         "supervisor_sha256": supervisor_digest,
     }
+    # The staging pair is per-assignment WORKING state, not a claim on the slot.
+    # mutate_execute overwrites both blobs with execution content, so create-once
+    # here never actually guarded anything: after the first execute a resume
+    # finds an fm.worker-execution/v1 body where it expects an assignment and
+    # refuses forever. The reservation blob above is the one arbiter of who owns
+    # this slot, and it stays strictly create-once.
+    #
+    # These must be REWRITTEN rather than converged onto: the guest verifies the
+    # supervisor it was actually handed against this record, so a replay carrying
+    # a newer supervisor has to leave the newer digest here, not the stale one.
     upload_json_blob(
         controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
-        names["staging-request"], assignment, tags,
+        names["staging-request"], assignment, tags, overwrite=True,
     )
     pending_result = {
         "schema": "fm.worker-staging-result/v1", "status": "pending",
@@ -1619,7 +1641,7 @@ def create_lifecycle_children(controller, action):
     }
     upload_json_blob(
         controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
-        names["staging-result"], pending_result, tags,
+        names["staging-result"], pending_result, tags, overwrite=True,
     )
 
 

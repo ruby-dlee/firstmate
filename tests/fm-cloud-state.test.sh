@@ -74,10 +74,12 @@ run_teardown_actually_calls_the_owner() {
   # The teardown suite is case-based and drives the whole script, so this pins
   # the call sites directly instead. Both terminal paths must clean up, or a
   # torn-down cloud task keeps its credential.
-  local script calls
+  local script calls needle
   script="$ROOT/bin/fm-teardown.sh"
   assert_grep 'fm-cloud-state-lib.sh' "$script" "teardown no longer sources the cloud state owner"
-  calls=$(grep -c 'fm_cloud_state_remove "\$STATE" "\$ID"' "$script" || true)
+  # shellcheck disable=SC2016 # the literal call text must not expand here
+  needle='fm_cloud_state_remove "$STATE" "$ID"'
+  calls=$(grep -Fc "$needle" "$script" || true)
   test "$calls" -ge 2 \
     || fail "teardown calls the cloud state owner on $calls of its 2 terminal paths"
   pass "both teardown exit paths call the cloud state owner"

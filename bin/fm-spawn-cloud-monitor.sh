@@ -7,14 +7,26 @@
 # (queue/assignment from the worker controller, then the bounded execute log)
 # and exits when the digest-bound result lands, so the pane's lifetime tracks
 # the crewmate's remote lifetime instead of ending at spawn time.
+#
+# Convergence duty: when the spawn-time reconcile left the request queued
+# (transient admission evidence), a LATER reconcile assigns the worker after
+# the spawn process is gone. This monitor is the surviving local owner, so on
+# seeing status=assigned it dispatches the persisted entrypoint through the
+# same bounded execute the spawn would have run. The dispatch marker file is
+# claimed with O_EXCL and shared with fm-spawn.sh, so exactly one owner ever
+# dispatches.
 set -u
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 ID=${1:?task id}
 GENERATION=${2:?task generation id}
 STATE=${FM_HOME:?FM_HOME is required}/state
 CONTROLLER=$STATE/azure-workers/controller.json
 RESULT=$STATE/$ID.worker-result.json
 EXEC_LOG=$STATE/$ID.worker-execute.log
+ENTRYPOINT=$STATE/$ID.cloud-entrypoint
+CLOUD_ENV=$STATE/$ID.cloud-env
+DISPATCH_MARKER=$STATE/$ID.cloud-execute-dispatched
 INTERVAL=${FM_SPAWN_CLOUD_MONITOR_INTERVAL_SECONDS:-30}
 case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=30 ;; esac
 
@@ -35,6 +47,55 @@ print(item.get("status") or "unqueued")
 PY
 }
 
+assignment_generation() {
+  python3 - "$CONTROLLER" "$ID" "$GENERATION" <<'PY'
+import json
+import sys
+
+path, task, generation = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        state = json.load(handle)
+except (OSError, ValueError):
+    raise SystemExit(0)
+item = (state.get("queue") or {}).get("{}@{}".format(task, generation)) or {}
+if item.get("status") == "assigned" and item.get("assignment_generation"):
+    print(item["assignment_generation"])
+PY
+}
+
+dispatch_converged_execute() {
+  # Claim first (O_EXCL): if the spawn process already dispatched, or a prior
+  # monitor iteration did, stand down permanently.
+  local assignment entry wall
+  (set -C; : > "$DISPATCH_MARKER") 2>/dev/null || return 0
+  assignment=$(assignment_generation) || assignment=
+  if [ -z "$assignment" ]; then
+    rm -f "$DISPATCH_MARKER"
+    return 0
+  fi
+  entry=$(cat "$ENTRYPOINT" 2>/dev/null) || entry=
+  if [ -z "$entry" ]; then
+    echo "cloud-crewmate $ID: assigned but the persisted entrypoint is empty; not dispatching"
+    rm -f "$DISPATCH_MARKER"
+    return 0
+  fi
+  # The persisted environment carries the FM_AZURE_* identity (and optional
+  # provider-command override) the spawn ran with; the Herdr server's closed
+  # pane environment has neither.
+  # shellcheck source=/dev/null
+  . "$CLOUD_ENV" 2>/dev/null || true
+  wall=${FM_SPAWN_CLOUD_WALL_SECONDS:-3600}
+  case "$wall" in ''|*[!0-9]*) wall=3600 ;; esac
+  echo "cloud-crewmate $ID: reconcile converged assignment $assignment; dispatching bounded execute"
+  nohup env FM_HOME="$FM_HOME" "$SCRIPT_DIR/fm-worker-lifecycle.sh" execute \
+    --task "$ID" --task-generation "$GENERATION" \
+    --assignment-generation "$assignment" --wall-seconds "$wall" \
+    --confirm-execute --confirm-subscription "${FM_AZURE_SUBSCRIPTION_ID:-}" \
+    -- /bin/bash -lc "$entry" \
+    > "$RESULT" 2> "$EXEC_LOG" < /dev/null &
+}
+
 shown_bytes=0
 while :; do
   if [ -s "$RESULT" ]; then
@@ -44,6 +105,10 @@ while :; do
   fi
   status=$(queue_status)
   printf '%s cloud-crewmate %s worker=%s\n' "$(date -u +%H:%M:%SZ)" "$ID" "$status"
+  if [ "$status" = assigned ] && [ ! -f "$DISPATCH_MARKER" ] && [ ! -f "$EXEC_LOG" ] \
+    && [ -f "$ENTRYPOINT" ] && [ -f "$CLOUD_ENV" ]; then
+    dispatch_converged_execute
+  fi
   if [ -f "$EXEC_LOG" ]; then
     size=$(wc -c < "$EXEC_LOG" 2>/dev/null | tr -d '[:space:]')
     case "$size" in ''|*[!0-9]*) size=0 ;; esac

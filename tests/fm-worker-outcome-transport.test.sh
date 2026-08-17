@@ -26,6 +26,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     storage|blob) shift ;;
     show|download|generate-sas|list|upload|delete) mode=$1; shift ;;
+    run-command) mode=run-command; shift ;;
+    update) [ "$mode" = run-command ] && mode=run-command-update; shift ;;
     --container-name) container=$2; shift 2 ;;
     --name) name=$2; shift 2 ;;
     --file) file=$2; shift 2 ;;
@@ -44,6 +46,9 @@ case "$mode" in
     ;;
   generate-sas)
     printf '"https://fixture.invalid/%s/%s?sig=fake&sp=%s"\n' "$container" "$name" "$permissions"
+    ;;
+  run-command-update)
+    printf '{}\n'
     ;;
   *)
     printf '{}\n'
@@ -162,5 +167,140 @@ PY
 }
 
 run_outcome_transport
+
+run_outcome_call_sites() {
+  # The functions above can be perfect and still never run. This drives the
+  # REAL mutate_execute so the production CALL SITES are covered: deleting the
+  # download call, or the line that arms FM_WORKER_OUTCOME_URL, must fail here.
+  local tmp bin fixture out status
+  fm_test_tmproot_into tmp fm-worker-outcome-callsites
+  bin="$tmp/bin"
+  mkdir -p "$bin" "$tmp/outcome"
+  write_fake_az "$bin/az"
+  fixture="$tmp/fixture.bundle"
+  printf 'pretend git bundle bytes\n' > "$fixture"
+  cat >"$tmp/callsites.py" <<'CALLSITES'
+import hashlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+provider_path, tmp = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("fm_provider", provider_path)
+provider = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(provider)
+
+root = Path(tmp)
+body = (root / "fixture.bundle").read_bytes()
+outcome_digest = hashlib.sha256(body).hexdigest()
+controller = {
+    "subscription": "00000000-0000-0000-0000-000000000000",
+    "resource_group": "rg-test", "prefix": "fmtest", "owner": "owner",
+    "deployment_generation": "dep-one", "home_binding": "a" * 64,
+}
+bindings = {
+    "home_binding": "a" * 64, "task": "task-one", "task_generation": "gen-1",
+    "assignment_generation": "asg-00000001", "account_binding": "b" * 64,
+    "worktree_binding": "c" * 64, "repository_binding": "d" * 64,
+    "repository_generation": "repo-gen",
+}
+request = dict(bindings)
+request.update({
+    "schema": "fm.worker-execution/v1", "cloud_instance_id": "vm-instance",
+    "argv": ["/usr/bin/true"], "wall_seconds": 60, "outcome_expected": True,
+})
+unsigned = dict(request)
+request["request_digest"] = hashlib.sha256(
+    json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+).hexdigest()
+action = {
+    "type": "execute", "slot": 1, "cloud_instance_id": "vm-instance",
+    "bindings": bindings, "request": request,
+    "request_digest": request["request_digest"],
+    "idempotency_key": "e" * 64, "outcome_dir": str(root / "outcome"),
+}
+
+execution = {
+    "schema": "fm.worker-execution-result/v1",
+    "request_digest": request["request_digest"], "task": "task-one",
+    "task_generation": "gen-1", "assignment_generation": "asg-00000001",
+    "cloud_instance_id": "vm-instance", "repository_binding": "d" * 64,
+    "repository_generation": "repo-gen", "exit_code": 0, "timed_out": False,
+    "stdout_sha256": "0" * 64, "stderr_sha256": "1" * 64,
+    "stdout_truncated": False, "stderr_truncated": False,
+    "outcome_present": True, "outcome_error": "", "outcome_commits": 1,
+    "outcome_sha256": outcome_digest, "outcome_bytes": len(body),
+    "outcome_sink": "blob",
+}
+execution["result_digest"] = hashlib.sha256(
+    json.dumps(execution, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+).hexdigest()
+
+# Only the collaborators that read live Azure state are substituted; every
+# line of mutate_execute own body runs for real.
+worker = {"slot": 1, "resources": {"vm": {"power_state": "VM running"}}}
+provider.inventory = lambda controller, include_metrics=True: {"workers": [worker]}
+provider.worker_by_slot = lambda snapshot, slot: worker
+provider.recorded_exact = lambda action, worker, **kwargs: worker["resources"]
+provider.action_tags = lambda controller, action: {}
+provider.upload_json_blob = lambda *a, **k: "0" * 64
+provider.run_command_instance_view = lambda controller, vm, name: {
+    "executionState": "Succeeded",
+    "output": "FM-WORKER-RESULT:" + json.dumps(execution, sort_keys=True, separators=(",", ":")),
+    "error": "",
+}
+captured = {}
+real_az = provider.az
+
+
+def recording_az(controller, args, check=True, timeout=None):
+    if "update" in args and "run-command" in args:
+        captured["update"] = list(args)
+    if timeout is None:
+        return real_az(controller, args, check=check)
+    return real_az(controller, args, check=check, timeout=timeout)
+
+
+provider.az = recording_az
+_worker, returned = provider.mutate_execute(controller, action)
+assert returned["outcome_present"] is True, returned
+
+update = captured.get("update")
+assert update, "mutate_execute never issued a run-command update"
+joined = " ".join(update)
+assert "--protected-parameters" in joined, joined
+assert any(item.startswith("FM_WORKER_OUTCOME_URL=https://") for item in update), update
+
+landed = root / "outcome" / "outcome.bundle"
+assert landed.is_file(), "mutate_execute never collected the outcome bundle"
+assert landed.read_bytes() == body, "the collected bundle is not the blob"
+print("OK")
+CALLSITES
+  out=$(PATH="$bin:$PATH" FAKE_AZ_LOG="$tmp/az.log" FAKE_AZ_BLOB="$fixture" \
+    FM_AZURE_STORAGE_NAME=fmteststorage \
+    python3 "$tmp/callsites.py" "$PROVIDER" "$tmp" 2>&1)
+  status=$?
+  expect_code 0 "$status" "mutate_execute should arm and collect the outcome: $out"
+  assert_contains "$out" "OK" "the call-site driver did not complete: $out"
+  pass "mutate_execute really arms the outcome lane and really collects the bundle"
+}
+
+run_outcome_call_sites
+
+run_outcome_bound_agreement() {
+  # The guest enforces its ceiling before uploading and the controller enforces
+  # it on the claim. They are separate literals in separate files, so drift
+  # would make the guest write a blob the controller refuses.
+  local guest controller_bound
+  guest=$(sed -n 's/^MAX_OUTCOME_BYTES = //p' "$ROOT/bin/fm-worker-supervisor.py" | head -1)
+  controller_bound=$(sed -n 's/^MAX_OUTCOME_BYTES = //p' "$PROVIDER" | head -1)
+  test -n "$guest" || fail "the guest outcome bound is missing"
+  test "$guest" = "$controller_bound" \
+    || fail "outcome bounds drifted: guest=$guest controller=$controller_bound"
+  pass "the guest and controller agree on the outcome byte ceiling"
+}
+
+run_outcome_bound_agreement
 
 echo "# fm-worker-outcome-transport.test.sh: all assertions passed"

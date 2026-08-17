@@ -250,6 +250,18 @@ def git_in(repo, *arguments, timeout=600):
     )
 
 
+def outcome_bundle_path(request, worktree):
+    """Where the collected bundle lives on the RETAINED task disk.
+
+    Keeping the bytes rather than a temp copy is what makes a replay able to
+    re-upload the exact same bundle: the recorded result already commits to
+    its digest, so a blob lost between execution and collection is recoverable
+    instead of wedging the lifecycle forever.
+    """
+    return worktree / ".fm-worker" / "{}-outcome.bundle".format(request["assignment_generation"])
+
+
+
 def put_outcome_blob(body):
     """Upload the outcome bundle to the single write-scoped staging URL the
     execute request armed.  The URL arrives as a protected run-command
@@ -258,9 +270,11 @@ def put_outcome_blob(body):
     local_sink = os.environ.get("FM_WORKER_OUTCOME_FILE", "")
     if local_sink:
         # Hermetic test lane: the blob is a local file instead of a network
-        # PUT; everything the result records about the bytes is unchanged.
+        # PUT. The result records this sink, so a control-plane actor who adds
+        # an unprotected FILE to divert a real upload produces a result the
+        # controller refuses rather than a claim it cannot collect.
         Path(local_sink).write_bytes(body)
-        return
+        return "file"
     url = os.environ.get("FM_WORKER_OUTCOME_URL", "")
     if not url.startswith("https://"):
         raise SupervisorError("outcome staging environment is incomplete")
@@ -280,9 +294,10 @@ def put_outcome_blob(body):
         raise SupervisorError("outcome staging upload failed: {}".format(exc))
     if status not in (201, 202):
         raise SupervisorError("outcome staging upload was rejected: status={}".format(status))
+    return "blob"
 
 
-def collect_outcome(request, repo):
+def collect_outcome(request, repo, worktree_root):
     """Bundle the commits the crewmate added on top of the bound repository
     generation and push them to the staging blob.
 
@@ -292,7 +307,10 @@ def collect_outcome(request, repo):
     digest, so a tampered blob cannot land.
     """
     if not request.get("outcome_expected"):
-        return {"outcome_present": False, "outcome_sha256": "", "outcome_bytes": 0, "outcome_commits": 0}
+        return {
+            "outcome_present": False, "outcome_sha256": "", "outcome_bytes": 0,
+            "outcome_commits": 0, "outcome_sink": "",
+        }
     base = request["repository_generation"]
     counted = git_in(repo, "rev-list", "--count", "{}..HEAD".format(base), timeout=120)
     if counted.returncode != 0:
@@ -306,25 +324,34 @@ def collect_outcome(request, repo):
     except ValueError:
         raise SupervisorError("outcome commit count is not a number")
     if commits == 0:
-        return {"outcome_present": False, "outcome_sha256": "", "outcome_bytes": 0, "outcome_commits": 0}
-    with tempfile.TemporaryDirectory() as staging:
-        bundle = Path(staging) / "outcome.bundle"
-        created = git_in(repo, "bundle", "create", str(bundle), "{}..HEAD".format(base))
-        if created.returncode != 0 or not bundle.is_file():
-            raise SupervisorError(
-                "outcome bundle creation failed: {}".format(
-                    created.stderr.decode("utf-8", errors="replace")[-500:]
-                )
+        # A crewmate that edited without committing looks identical here, so
+        # the result says so explicitly rather than reading as "nothing to do".
+        dirty = git_in(repo, "status", "--porcelain", timeout=120)
+        uncommitted = dirty.returncode == 0 and bool(dirty.stdout.strip())
+        return {
+            "outcome_present": False, "outcome_sha256": "", "outcome_bytes": 0,
+            "outcome_commits": 0, "outcome_sink": "",
+            "outcome_uncommitted_changes": uncommitted,
+        }
+    bundle = outcome_bundle_path(request, worktree_root)
+    bundle.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    created = git_in(repo, "bundle", "create", str(bundle), "{}..HEAD".format(base))
+    if created.returncode != 0 or not bundle.is_file():
+        raise SupervisorError(
+            "outcome bundle creation failed: {}".format(
+                created.stderr.decode("utf-8", errors="replace")[-500:]
             )
-        if bundle.stat().st_size > MAX_OUTCOME_BYTES:
-            raise SupervisorError("outcome bundle exceeds its bounded allowance")
-        body = bundle.read_bytes()
-    put_outcome_blob(body)
+        )
+    if bundle.stat().st_size > MAX_OUTCOME_BYTES:
+        raise SupervisorError("outcome bundle exceeds its bounded allowance")
+    body = bundle.read_bytes()
+    sink = put_outcome_blob(body)
     return {
         "outcome_present": True,
         "outcome_sha256": hashlib.sha256(body).hexdigest(),
         "outcome_bytes": len(body),
         "outcome_commits": commits,
+        "outcome_sink": sink,
     }
 
 
@@ -349,7 +376,7 @@ def write_atomic(path, value):
             pass
 
 
-def execute(request, worktree):
+def execute(request, worktree, worktree_root):
     safe_env = {
         "HOME": str(Path(os.environ.get("FM_WORKER_ACCOUNT_HOME", "/nonexistent")).resolve()),
         "PATH": "/usr/local/bin:/usr/bin:/bin",
@@ -375,6 +402,15 @@ def execute(request, worktree):
         stderr = exc.stderr or b""
     stdout, stdout_truncated = bounded(stdout)
     stderr, stderr_truncated = bounded(stderr)
+    # NOTHING after the task command may raise. Its effects already happened,
+    # so any escape here means no executed marker is written, and the next
+    # dispatch both re-runs the command and (through stage_payload's rmtree of
+    # the staged repository) destroys the commits the first run produced.
+    # Every post-command failure is therefore recorded in the digest-bound
+    # result instead of raised, whatever its exception class: a full disk
+    # reaches the stream write, a git timeout or MemoryError reaches the
+    # bundle, and both must still produce a result.
+    post_command_errors = []
     # Persist the exact digested streams on the retained task disk so the
     # bounded result's stream digests stay verifiable after the VM is gone.
     logs_dir = worktree / ".fm-worker"
@@ -387,27 +423,27 @@ def execute(request, worktree):
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-    except OSError as exc:
-        raise SupervisorError("guest stream evidence could not be persisted: {}".format(exc))
-    # The task command has already had its effects, so an outcome-collection
-    # failure must never abort the result: it is recorded in the digest-bound
-    # result instead, which both blocks a landing that would be built on
-    # unverifiable bytes and stops a replay from running the command twice.
-    # Every exception, not just SupervisorError: a git timeout, a full disk,
-    # or a MemoryError on a large bundle would otherwise escape, leave no
-    # executed marker, and let the next dispatch run the command a second time.
+        streams_persisted = True
+    except Exception as exc:  # noqa: BLE001 - see above; losing the marker is worse
+        streams_persisted = False
+        post_command_errors.append(
+            "stream evidence: {}: {}".format(type(exc).__name__, exc)
+        )
     try:
-        outcome = collect_outcome(request, worktree)
+        outcome = collect_outcome(request, worktree, worktree_root)
         outcome["outcome_error"] = ""
     except Exception as exc:  # noqa: BLE001 - see above; losing the marker is worse
         outcome = {
             "outcome_present": False, "outcome_sha256": "", "outcome_bytes": 0,
-            "outcome_commits": 0,
-            "outcome_error": "{}: {}".format(type(exc).__name__, exc)[:500],
+            "outcome_commits": 0, "outcome_error": "", "outcome_sink": "",
         }
+        post_command_errors.append("outcome: {}: {}".format(type(exc).__name__, exc))
+    if post_command_errors:
+        outcome["outcome_error"] = "; ".join(post_command_errors)[:500]
     result = {
         "schema": RESULT_SCHEMA,
         **outcome,
+        "streams_persisted": streams_persisted,
         "request_digest": request["request_digest"],
         "task": request["task"],
         "task_generation": request["task_generation"],
@@ -491,14 +527,33 @@ def main():
         supplied = unsigned.pop("result_digest", None)
         if supplied != digest(unsigned) or recorded.get("request_digest") != request["request_digest"]:
             raise SupervisorError("recorded execution replay evidence is not exact")
+        # A replay happens when the controller lost the result in transport, or
+        # when it could not collect the blob. Re-upload the retained bundle so
+        # a blob that went missing between execution and collection is
+        # recoverable: these are the exact bytes the recorded result already
+        # committed to, so the controller's digest check still gates the
+        # landing. Without this the lifecycle wedges forever on a lost blob
+        # and the crewmate's commits die with the VM.
+        if recorded.get("outcome_present"):
+            retained = outcome_bundle_path(request, worktree)
+            try:
+                body = retained.read_bytes()
+                if hashlib.sha256(body).hexdigest() != recorded.get("outcome_sha256"):
+                    raise SupervisorError("retained outcome bundle differs from the recorded result")
+                put_outcome_blob(body)
+            except Exception as exc:  # noqa: BLE001 - a replay must still answer
+                print(
+                    "outcome re-upload on replay failed: {}: {}".format(type(exc).__name__, exc),
+                    file=os.sys.stderr,
+                )
         write_atomic(args.result, recorded)
         print(json.dumps({"result_digest": recorded["result_digest"]}, separators=(",", ":")))
         return
     # Staging happens only on a first execution: a controller replay above
     # re-emits the recorded result without touching the staged repository.
     account_home = Path(os.environ.get("FM_WORKER_ACCOUNT_HOME", "/nonexistent")).resolve()
-    worktree = stage_payload(request, worktree, account_home)
-    result = execute(request, worktree)
+    repo = stage_payload(request, worktree, account_home)
+    result = execute(request, repo, worktree)
     write_atomic(marker, result)
     write_atomic(args.result, result)
     print(json.dumps({"result_digest": result["result_digest"]}, separators=(",", ":")))

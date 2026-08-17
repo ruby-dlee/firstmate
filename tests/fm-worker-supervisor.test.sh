@@ -563,6 +563,47 @@ r = json.load(open('$tmp/result-oe.json'))
 assert r['outcome_present'] is False, r
 assert 'FileNotFoundError' in r['outcome_error'], r
 " || fail "the outcome failure was not recorded in the bound result"
+  # The same double-execution defect through the OTHER post-command arm: the
+  # stream-evidence write. Driving the REAL execute() against a repository
+  # whose .fm-worker path is a file makes that write raise for real; nothing
+  # after the task command may escape, or no executed marker is written and
+  # the next dispatch re-runs the crewmate and rmtree's its commits.
+  local stream_out
+  mkdir -p "$tmp/stream-arm"
+  cat >"$tmp/stream-arm/driver.py" <<'STREAMARM'
+import importlib.util
+import sys
+from pathlib import Path
+
+supervisor_path, tmp = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("fm_supervisor", supervisor_path)
+supervisor = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(supervisor)
+
+root = Path(tmp)
+repo = root / "repo"
+repo.mkdir(parents=True, exist_ok=True)
+# .fm-worker as a FILE: the stream-evidence mkdir then raises, which is the
+# post-command arm that used to escape and cost the executed marker.
+(repo / ".fm-worker").write_text("not a directory\n")
+counter = root / "count"
+request = {
+    "argv": ["/bin/sh", "-c", "echo x >> {}".format(counter)],
+    "wall_seconds": 60, "assignment_generation": "asg-00000001",
+    "request_digest": "a" * 64, "task": "t", "task_generation": "gen-1",
+    "cloud_instance_id": "vm", "repository_binding": "b" * 64,
+    "repository_generation": "r" * 40,
+}
+result = supervisor.execute(request, repo, root)
+assert result["exit_code"] == 0, result
+assert result["streams_persisted"] is False, result
+assert "stream evidence" in result["outcome_error"], result
+assert counter.read_text().count("x") == 1, "the command ran more than once"
+print("OK")
+STREAMARM
+  stream_out=$(python3 "$tmp/stream-arm/driver.py" "$SUPERVISOR" "$tmp/stream-arm" 2>&1)
+  expect_code 0 $? "a stream-persistence failure must still produce a result: $stream_out"
+  assert_contains "$stream_out" "OK" "the stream-arm driver did not complete: $stream_out"
   pass "the supervisor collects, bounds and proves crewmate outcomes"
 }
 

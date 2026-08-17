@@ -176,7 +176,17 @@ land_outcome_bundle() {
     echo "cloud-crewmate $ID: worker could not return its work: $error"
     return 0
   fi
-  [ -n "$(result_field outcome_present)" ] || return 0
+  if [ -z "$(result_field outcome_present)" ]; then
+    # A landing task that returns nothing is worth one line either way: the
+    # operator otherwise cannot tell "read-only task" from "the crewmate
+    # edited files and never committed them", and the second loses work.
+    if [ -n "$(result_field outcome_uncommitted_changes)" ]; then
+      echo "cloud-crewmate $ID: crewmate left uncommitted changes and returned no commits; nothing was landed"
+    else
+      echo "cloud-crewmate $ID: crewmate returned no commits; nothing to land"
+    fi
+    return 0
+  fi
   bundle=$STATE/$ID.cloud-outcome/outcome.bundle
   if [ ! -s "$bundle" ]; then
     echo "cloud-crewmate $ID: result claims an outcome but no verified bundle landed locally"

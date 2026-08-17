@@ -49,7 +49,14 @@ MAX_INPUT_BYTES = 2 * 1024 * 1024
 # carries the request digest so a later execute against the same worker
 # cannot overwrite an outcome the controller has not collected yet.
 OUTCOME_BLOB_PREFIX = "outcome-"
+# Must equal MAX_OUTCOME_BYTES in bin/fm-worker-supervisor.py. The supervisor
+# is a standalone pinned file that cannot import from the repository, so the
+# two literals are kept in step by a test rather than by runtime coupling.
 MAX_OUTCOME_BYTES = 256 * 1024 * 1024
+# Staging (archive fetches plus the repository clone) runs BEFORE the wall
+# starts, and bundle creation plus upload runs after it ends. Every bound that
+# has to cover a whole guest run measures wall plus this, never wall alone.
+GUEST_RUN_SLACK_SECONDS = 2400
 AZ_TIMEOUT_SECONDS = 300
 # A guest run is staging (archive fetches plus the repository clone) BEFORE the
 # wall starts, then the wall, then collection after it ends. Any bound that has
@@ -1258,7 +1265,8 @@ def upload_bytes_blob(controller, account, container, name, payload, tags):
             "storage", "blob", "upload", "--auth-mode", "login", "--account-name", account,
             "--container-name", container, "--name", name, "--file", path,
             "--overwrite", "true", "--metadata",
-        ] + ["{}={}".format(key, value) for key, value in sorted(metadata.items())], check=False)
+        ] + ["{}={}".format(key, value) for key, value in sorted(metadata.items())],
+            check=False, timeout=AZ_TIMEOUT_SECONDS + len(payload) // (256 * 1024))
         if rc != 0:
             raise ProviderError("exact worker payload upload failed: {}".format(stderr))
     finally:
@@ -1870,22 +1878,7 @@ def mutate_reset(controller, action):
     # and the account archive fronts provider credentials: both are removed
     # unconditionally at reset, tolerating absence.
     state_container_name = expected_names(controller, action["slot"])["state-container"]
-    # Outcome blobs are named per request digest, so reset collects them by
-    # their reviewed prefix rather than one fixed name; anything left here
-    # would outlive the slot it belongs to.
-    listed, rc, stderr = az(controller, [
-        "storage", "blob", "list", "--auth-mode", "login",
-        "--account-name", os.environ.get("FM_AZURE_STORAGE_NAME", ""),
-        "--container-name", state_container_name, "--prefix", OUTCOME_BLOB_PREFIX,
-        "--query", "[].name",
-    ], check=False)
-    if rc != 0:
-        raise ProviderError("outcome staging listing failed at reset: {}".format(stderr))
-    outcome_blobs = [
-        name for name in (listed or [])
-        if isinstance(name, str) and re.fullmatch(r"outcome-[0-9a-f]{32}\.bundle", name)
-    ]
-    for blob_name in ("payload.tar.gz", "account.tar.gz", *outcome_blobs):
+    for blob_name in ("payload.tar.gz", "account.tar.gz"):
         _, rc, stderr = az(controller, [
             "storage", "blob", "delete", "--auth-mode", "login",
             "--account-name", os.environ.get("FM_AZURE_STORAGE_NAME", ""),
@@ -1953,7 +1946,7 @@ def mutate_execute(controller, action):
     protected_parameters = []
     if action.get("payload_dir"):
         storage = os.environ.get("FM_AZURE_STORAGE_NAME", "")
-        sas_seconds = int(request["wall_seconds"]) + 1800
+        sas_seconds = int(request["wall_seconds"]) + GUEST_RUN_SLACK_SECONDS
         for label, directory, manifest in (
             ("payload", action["payload_dir"], request["payload_files"]),
             ("account", action["account_dir"], request["account_files"]),
@@ -1978,10 +1971,13 @@ def mutate_execute(controller, action):
         # Landing v1 return path: the guest gets create/write on exactly one
         # blob name and no forge or provider credential at all. What it writes
         # is only landable after the digest in the signed result matches.
+        # The guest uploads AFTER staging and after the full wall, so a SAS
+        # measured from mint time must cover both or a slow clone silently
+        # expires the credential and the crewmate's commits die with the VM.
         outcome_sas = blob_sas(
             controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
             outcome_blob_name(request["request_digest"]),
-            int(request["wall_seconds"]) + 1800, permissions="cw",
+            int(request["wall_seconds"]) + GUEST_RUN_SLACK_SECONDS, permissions="cw",
         )
         if not re.fullmatch(r"https://[A-Za-z0-9.:/_?&=%+-]+", outcome_sas):
             raise ProviderError("outcome staging SAS carries unsupported characters")

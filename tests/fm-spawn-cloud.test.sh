@@ -801,6 +801,54 @@ test_monitor_lands_the_outcome_bundle() {
   pass "the monitor lands a verified outcome bundle into the leased worktree"
 }
 
+test_monitor_reports_an_already_landed_outcome() {
+  # Re-opening a tracking pane over a landed result must not report the work
+  # as diverged and send the operator hunting for a landing that happened.
+  local record id src
+  id=cloud-land-c16
+  record=$(make_cloud_case landing-again-lane "$id")
+  read_cloud_case "$record"
+  src="$CASE_DIR/leased"
+  stage_landing_case "$id" "$src" "$HOME_DIR/state/$id.cloud-outcome" >/dev/null
+  FM_HOME="$HOME_DIR" FM_SPAWN_CLOUD_MONITOR_INTERVAL_SECONDS=1 \
+    "$ROOT/bin/fm-spawn-cloud-monitor.sh" "$id" gen-1 > "$CASE_DIR/first.log" 2>&1
+  assert_grep 'landed 1 commit' "$CASE_DIR/first.log" "the first run did not land the outcome"
+  FM_HOME="$HOME_DIR" FM_SPAWN_CLOUD_MONITOR_INTERVAL_SECONDS=1 \
+    "$ROOT/bin/fm-spawn-cloud-monitor.sh" "$id" gen-1 > "$CASE_DIR/second.log" 2>&1
+  assert_grep 'already landed' "$CASE_DIR/second.log" \
+    "a second pane reported an already-landed outcome as something else"
+  assert_no_grep 'moved off' "$CASE_DIR/second.log" \
+    "an already-landed outcome was reported as divergence"
+  pass "a re-opened pane reports an already-landed outcome as landed"
+}
+
+test_monitor_reports_a_crewmate_that_never_committed() {
+  # outcome_present=false with uncommitted changes is work that did not come
+  # home; it must not read as a clean read-only task.
+  local record id
+  id=cloud-land-c17
+  record=$(make_cloud_case landing-dirty-lane "$id")
+  read_cloud_case "$record"
+  python3 - "$HOME_DIR/state/$id.worker-result.json" <<'RESULT'
+import json
+import sys
+
+json.dump({
+    "schema": "fm.worker-execution-result/v1", "task": "t", "task_generation": "gen-1",
+    "assignment_generation": "asg-00000001", "cloud_instance_id": "vm",
+    "repository_binding": "b" * 64, "repository_generation": "r" * 40,
+    "request_digest": "d" * 64, "result_digest": "e" * 64, "exit_code": 0,
+    "timed_out": False, "outcome_present": False, "outcome_error": "",
+    "outcome_commits": 0, "outcome_uncommitted_changes": True,
+}, open(sys.argv[1], "w"), sort_keys=True, separators=(",", ":"))
+RESULT
+  FM_HOME="$HOME_DIR" FM_SPAWN_CLOUD_MONITOR_INTERVAL_SECONDS=1 \
+    "$ROOT/bin/fm-spawn-cloud-monitor.sh" "$id" gen-1 > "$CASE_DIR/monitor.log" 2>&1
+  assert_grep 'uncommitted changes' "$CASE_DIR/monitor.log" \
+    "a crewmate that never committed was reported as having nothing to land"
+  pass "a crewmate that edited without committing is reported, not silently dropped"
+}
+
 test_monitor_keeps_the_outcome_when_the_worktree_moved() {
   # If the local side moved on, a silent fast-forward would be wrong: the
   # bundle is kept and the operator is told where it is.
@@ -824,6 +872,8 @@ test_monitor_keeps_the_outcome_when_the_worktree_moved() {
 test_cloud_switch_off_keeps_the_local_path_and_metadata_shape
 test_cloud_spawn_places_worker_and_runs_the_entrypoint
 test_monitor_lands_the_outcome_bundle
+test_monitor_reports_an_already_landed_outcome
+test_monitor_reports_a_crewmate_that_never_committed
 test_monitor_keeps_the_outcome_when_the_worktree_moved
 test_cloud_spawn_stays_durably_queued_without_admission
 test_cloud_monitor_launch_carries_fm_home

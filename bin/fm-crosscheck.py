@@ -3521,7 +3521,15 @@ def apply_review(
     by_id = {finding["id"]: finding for finding in working_ledger["findings"]}
     updated_ids: list[str] = []
     seen_updates: set[str] = set()
-    evidence_deadline = time.monotonic() + evidence_run_timeout()
+    # A remote evidence executor owns its own aggregate clock (two fresh VM
+    # boots per item make the local seconds-per-item budget meaningless);
+    # the local path keeps the configured bound unchanged.
+    executor_deadline = getattr(evidence_executor, "batch_deadline", None)
+    evidence_deadline = (
+        float(executor_deadline)
+        if isinstance(executor_deadline, (int, float))
+        else time.monotonic() + evidence_run_timeout()
+    )
     try:
         execution = review["executed_reproduction"]
         receipt_path = require_string(

@@ -56,12 +56,13 @@ MAX_OUTCOME_BYTES = 256 * 1024 * 1024
 # Staging (archive fetches plus the repository clone) runs BEFORE the wall
 # starts, and bundle creation plus upload runs after it ends. Every bound that
 # has to cover a whole guest run measures wall plus this, never wall alone.
-GUEST_RUN_SLACK_SECONDS = 2400
+# Staging (archive fetches plus the repository clone) runs BEFORE the wall
+# starts and collection runs after it ends, so a bound covering a whole guest
+# run is wall plus this. The GUEST gives up first and the client waiting on it
+# gets the extra margin, so a guest timeout is reported rather than raced.
+GUEST_RUN_SLACK_SECONDS = 1800
+CLIENT_WAIT_SLACK_SECONDS = 2400
 AZ_TIMEOUT_SECONDS = 300
-# A guest run is staging (archive fetches plus the repository clone) BEFORE the
-# wall starts, then the wall, then collection after it ends. Any bound that has
-# to cover a whole guest run measures wall plus this, never wall alone.
-GUEST_RUN_SLACK_SECONDS = 2400
 RESOURCE_API = {
     "vm": "2024-03-01",
     "nic": "2023-09-01",
@@ -1980,7 +1981,7 @@ def mutate_execute(controller, action):
     protected_parameters = []
     if action.get("payload_dir"):
         storage = os.environ.get("FM_AZURE_STORAGE_NAME", "")
-        sas_seconds = int(request["wall_seconds"]) + GUEST_RUN_SLACK_SECONDS
+        sas_seconds = int(request["wall_seconds"]) + CLIENT_WAIT_SLACK_SECONDS
         for label, directory, manifest in (
             ("payload", action["payload_dir"], request["payload_files"]),
             ("account", action["account_dir"], request["account_files"]),
@@ -2011,7 +2012,7 @@ def mutate_execute(controller, action):
         outcome_sas = blob_sas(
             controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
             outcome_blob_name(request["request_digest"]),
-            int(request["wall_seconds"]) + GUEST_RUN_SLACK_SECONDS, permissions="cw",
+            int(request["wall_seconds"]) + CLIENT_WAIT_SLACK_SECONDS, permissions="cw",
         )
         if not re.fullmatch(r"https://[A-Za-z0-9.:/_?&=%+-]+", outcome_sas):
             raise ProviderError("outcome staging SAS carries unsupported characters")
@@ -2056,7 +2057,7 @@ printf 'FM-WORKER-RESULT:%s\\n' "$(cat /var/lib/firstmate-worker/result.json)"
     # result, and every smoke that passed before was a sub-second command.
     _, rc, stderr = az(
         controller, update_command, check=False,
-        timeout=int(request["wall_seconds"]) + GUEST_RUN_SLACK_SECONDS,
+        timeout=int(request["wall_seconds"]) + CLIENT_WAIT_SLACK_SECONDS,
     )
     if rc != 0:
         raise ProviderError("exact private worker execution failed: {}".format(stderr))

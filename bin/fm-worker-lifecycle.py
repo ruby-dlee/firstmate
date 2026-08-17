@@ -64,10 +64,12 @@ PROVIDER_TIMEOUT_SECONDS = 300
 # failure this exists to stop: hanging up while Azure carries on and leaving a
 # live VM the controller never recorded.
 PROVIDER_CREATE_TIMEOUT_SECONDS = 7200
-# Long enough that a queued command reports contention rather than hanging
-# forever, short enough that an operator sees it.
-CONTROLLER_LOCK_WAIT_SECONDS = 900
-PROVIDER_GUEST_RUN_SLACK_SECONDS = 2400
+# Strictly larger than the provider's own client wait, because the provider
+# runs a full inventory sweep, archive builds, uploads and SAS mints BEFORE the
+# blocking call and another sweep plus a result upload AFTER it. A controller
+# bound equal to the inner one kills the provider during collection and the
+# task re-runs.
+PROVIDER_GUEST_RUN_SLACK_SECONDS = 4200
 MAX_PROVIDER_OUTPUT_BYTES = 2 * 1024 * 1024
 REQUIRED_RESOURCE_KINDS = (
     "vm", "nic", "os-disk", "task-disk", "account-disk", "identity",
@@ -280,19 +282,13 @@ def controller_lock(env):
     os.chmod(env["state_dir"], 0o700)
     with open(env["lock_path"], "a+", encoding="utf-8") as handle:
         os.chmod(env["lock_path"], 0o600)
-        deadline = time.monotonic() + CONTROLLER_LOCK_WAIT_SECONDS
-        while True:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    raise LifecycleError(
-                        "controller lock is held by another lifecycle command; an execute holds "
-                        "it for the whole guest run, so concurrent crewmates serialize here "
-                        "until per-action pending state lands"
-                    )
-                time.sleep(1)
+        # NOTE: an execute holds this for its whole guest run, so concurrent
+        # crewmates serialize here. Callers WAIT rather than fail; making the
+        # loser error out was tried and reverted, because status, reconcile and
+        # release would then start failing under ordinary contention. Real
+        # concurrency needs per-action pending state so the provider call can
+        # run outside this lock, which is its own change.
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         yield
 
 

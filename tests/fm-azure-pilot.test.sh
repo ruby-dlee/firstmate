@@ -785,10 +785,13 @@ import json
 import sys
 from pathlib import Path
 
-provider_path, tmp = sys.argv[1:]
+provider_path, lifecycle_path, tmp = sys.argv[1:]
 spec = importlib.util.spec_from_file_location("fm_provider", provider_path)
 provider = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(provider)
+lifecycle_spec = importlib.util.spec_from_file_location("fm_lifecycle", lifecycle_path)
+lifecycle = importlib.util.module_from_spec(lifecycle_spec)
+lifecycle_spec.loader.exec_module(lifecycle)
 
 root = Path(tmp)
 controller = {
@@ -807,11 +810,35 @@ request.update({
     "schema": "fm.worker-execution/v1", "cloud_instance_id": "vm-instance",
     "argv": ["/usr/bin/true"], "wall_seconds": 3600,
 })
+payload_dir = root / "payload"
+account_dir = root / "account"
+payload_dir.mkdir(parents=True, exist_ok=True)
+account_dir.mkdir(parents=True, exist_ok=True)
+(payload_dir / "repo.bundle").write_bytes(b"bundle fixture")
+(payload_dir / "brief.md").write_text("brief\n")
+(account_dir / "auth.json").write_text("{}\n")
+
+
+def manifest(directory):
+    entries = {}
+    for entry in sorted(directory.iterdir()):
+        blob = entry.read_bytes()
+        entries[entry.name] = {
+            "sha256": provider.hashlib.sha256(blob).hexdigest(), "bytes": len(blob),
+        }
+    return entries
+
+
+# A real execute carries a payload, so protected parameters are built and the
+# guest bound's position relative to that nargs-many flag actually matters.
+request["payload_files"] = manifest(payload_dir)
+request["account_files"] = manifest(account_dir)
 request["request_digest"] = "f" * 64
 action = {
     "type": "execute", "slot": 1, "cloud_instance_id": "vm-instance",
     "bindings": bindings, "request": request,
     "request_digest": request["request_digest"], "idempotency_key": "e" * 64,
+    "payload_dir": str(payload_dir), "account_dir": str(account_dir),
 }
 execution = {
     "schema": "fm.worker-execution-result/v1",
@@ -854,6 +881,9 @@ def fake_run(command, check=True, input_bytes=None, timeout=provider.AZ_TIMEOUT_
     if "run-command" in command and "update" in command:
         seen["timeout"] = timeout
         seen["command"] = list(command)
+    if "generate-sas" in command:
+        # az --full-uri renders a bare JSON string.
+        return _Result(b'"https://fixture.invalid/staging?sig=fake"')
     return _Result(b"{}")
 
 
@@ -880,17 +910,34 @@ assert command[command.index("--async-execution") + 1] == "false", (
 )
 # --protected-parameters is nargs-many, so anything after it is swallowed and
 # the guest bound is silently lost.
-if "--protected-parameters" in command:
-    assert command.index("--timeout-in-seconds") < command.index("--protected-parameters"), (
-        "the guest bound sits after --protected-parameters and would be swallowed", command,
-    )
+assert "--protected-parameters" in command, (
+    "the fixture built no protected parameters, so the ordering below proves nothing", command,
+)
+assert command.index("--timeout-in-seconds") < command.index("--protected-parameters"), (
+    "the guest bound sits after --protected-parameters and would be swallowed", command,
+)
 guest_bound = int(command[command.index("--timeout-in-seconds") + 1])
 assert guest_bound >= request["wall_seconds"] + 1800, (
     "the guest run-command bound does not cover its own wall", guest_bound,
 )
+
+# The controller bounds the whole provider process, which does a full inventory
+# sweep, archive builds, uploads and SAS mints BEFORE the blocking call and
+# another inventory sweep plus a result upload AFTER it. If its bound is not
+# strictly greater than the provider's own, it kills the provider during result
+# collection and the task runs a second time.
+controller_bound = lifecycle.provider_action_timeout(action)
+assert controller_bound > seen["timeout"], (
+    "the controller does not outlast the provider call it supervises",
+    controller_bound, seen["timeout"],
+)
+assert seen["timeout"] > guest_bound, (
+    "the client hangs up at or before the guest bound it set, so a guest timeout races",
+    seen["timeout"], guest_bound,
+)
 print("OK")
 GUESTBOUND
-  out=$(python3 "$tmp/driver.py" "$WORKER_PROVIDER" "$tmp" 2>&1)
+  out=$(python3 "$tmp/driver.py" "$WORKER_PROVIDER" "$WORKER_LIFECYCLE" "$tmp" 2>&1) || true
   expect_code 0 $? "the blocking execute call must cover a whole guest run: $out"
   assert_contains "$out" "OK" "the guest-run bound driver did not complete: $out"
   pass "the blocking worker execute call is bounded by the whole guest run"
@@ -1106,9 +1153,86 @@ try:
     raise AssertionError("a different assignment converged onto an existing reservation")
 except provider.ProviderError as exc:
     assert "different content" in str(exc), exc
+# A blob written by an older build carries no identity_digest. Converging on
+# that would accept bytes nothing has vouched for.
+store.pop(reservation_name)
+provider.az = lambda controller, args, check=True, timeout=None: (
+    (None, 1, "ErrorCode:BlobAlreadyExists") if "upload" in args else (None, 0, "")
+)
+try:
+    provider.upload_json_blob(
+        controller, "acct", "runner-control", reservation_name,
+        reservation_payload(18), {}, volatile_fields=provider.RESERVATION_VOLATILE_FIELDS,
+    )
+    raise AssertionError("a blob with no recorded identity was converged onto")
+except provider.ProviderError as exc:
+    assert "different content" in str(exc), exc
+
+# Convergence is a create-once affordance. An overwrite upload that somehow
+# reports the blob exists must still fail rather than silently accept it.
+try:
+    provider.upload_json_blob(
+        controller, "acct", "runner-control", reservation_name,
+        reservation_payload(18), {}, overwrite=True,
+    )
+    raise AssertionError("an overwrite upload took the create-once convergence path")
+except provider.ProviderError as exc:
+    assert "staging upload failed" in str(exc), exc
+# The checks above drive upload_json_blob directly and so cannot see the REAL
+# caller dropping volatile_fields, which is what made S1 revertible with a
+# green suite. Capture what create_lifecycle_children actually passes.
+create_bindings = {
+    "home_binding": "a" * 64, "task": "task-one", "task_generation": "gen-1",
+    "assignment_generation": "asg-00000001", "account_binding": "b" * 64,
+    "worktree_binding": "c" * 64, "repository_binding": "d" * 64,
+    "repository_generation": "repo-gen",
+}
+captured_uploads = []
+_real_upload = provider.upload_json_blob
+
+
+def recording_upload(controller, account, container, name, value, tags, **kwargs):
+    captured_uploads.append((name, kwargs.get("volatile_fields", ())))
+    return "0" * 64
+
+
+provider.upload_json_blob = recording_upload
+provider.az = lambda controller, args, check=True, timeout=None: ({}, 0, "")
+provider.run_command_instance_view = lambda *a, **k: {"executionState": "Succeeded", "output": "", "error": ""}
+# The real key set, so a rename in expected_names surfaces here rather than
+# being papered over by a short fixture.
+provider.expected_names = lambda controller, slot: {
+    key: key for key in (
+        "vm", "nic", "os-disk", "task-disk", "account-disk", "identity",
+        "state-container", "monitor-extension", "bootstrap-command",
+        "task-command", "ttl-schedule", "global-reservation",
+        "staging-request", "staging-result",
+    )
+}
+provider.action_tags = lambda controller, action: {}
+try:
+    provider.create_lifecycle_children(controller, {
+        "slot": 1, "sku": "Standard_D4as_v6", "sku_family": "standardDav6Family",
+        "reservation_usd": 1.0, "bindings": create_bindings,
+        "cloud_instance_id": "vm-instance", "idempotency_key": "e" * 64,
+    })
+except Exception as exc:  # noqa: BLE001 - the uploads are what this asserts on
+    creation_error = "{}: {}".format(type(exc).__name__, exc)
+finally:
+    provider.upload_json_blob = _real_upload
+
+reservation_uploads = [item for item in captured_uploads if "reservation" in item[0]]
+assert reservation_uploads, (
+    "create_lifecycle_children uploaded no reservation",
+    captured_uploads, locals().get("creation_error"),
+)
+assert "ttl_deadline" in reservation_uploads[0][1], (
+    "the real caller does not declare its recomputed deadline volatile, so a replay "
+    "will never converge", reservation_uploads[0],
+)
 print("OK")
 CREATEREPLAY
-  out=$(python3 "$tmp/driver.py" "$WORKER_PROVIDER" "$tmp" 2>&1)
+  out=$(python3 "$tmp/driver.py" "$WORKER_PROVIDER" "$tmp" 2>&1) || true
   expect_code 0 $? "a create replay must converge on identical content: $out"
   assert_contains "$out" "OK" "the create-replay driver did not complete: $out"
   pass "a create-once staging blob converges on replay and still refuses different content"
@@ -1136,7 +1260,10 @@ spec.loader.exec_module(lifecycle)
 # sweeps. A controller bound below that reproduces the failure this exists to
 # stop, so the floor is the inner budget, not a round number.
 create = lifecycle.provider_action_timeout({"type": "create"})
-assert create > 3600, ("a create is bounded below the provider's own deployment budget", create)
+assert create >= 3600 + 1800, (
+    "a create leaves no headroom over the provider's own 3600s deployment budget for the "
+    "bootstrap run command, the TTL schedule, three uploads and two inventory sweeps", create,
+)
 
 # resume runs through the IDENTICAL provider path (mutate routes create and
 # resume to create_or_resume), and it is the recovery path, so leaving it on
@@ -1208,7 +1335,7 @@ assert execute_timeout >= 3600 + 1800, (
 )
 print("OK")
 PROVIDERBOUND
-  out=$(python3 "$tmp/driver.py" "$WORKER_LIFECYCLE" 2>&1)
+  out=$(python3 "$tmp/driver.py" "$WORKER_LIFECYCLE" 2>&1) || true
   expect_code 0 $? "the provider subprocess bound must cover its action: $out"
   assert_contains "$out" "OK" "the provider-bound driver did not complete: $out"
   pass "the provider subprocess bound covers the action it runs"

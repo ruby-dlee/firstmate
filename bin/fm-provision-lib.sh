@@ -419,9 +419,10 @@ fm_provision_scan() {  # <worktree>
 # A standalone uv.lock has no project file for uv to discover, but the lock
 # still names the root whose dependency edges select the environment. Return
 # that one root package name only when uv's generated lock shape identifies it
-# unambiguously through a virtual or editable source at ".". An unreadable,
-# malformed, or rootless lock returns non-zero so detection can record a gap
-# instead of attempting a project sync that must fail.
+# unambiguously through a virtual or editable source at "." and every other
+# package source is independent of the original project path. An unreadable,
+# malformed, path-dependent, or rootless lock returns non-zero so detection can
+# record a gap instead of attempting an incomplete project sync.
 fm_provision_uv_lock_root_name() {  # <component-dir>
   local dir=$1
   fm_provision_run_bounded "$FM_PROVISION_PROBE_TIMEOUT" "$dir" \
@@ -441,8 +442,11 @@ for block in blocks:
     source = re.search(r"(?m)^\s*source\s*=\s*\{([^\n]*)\}\s*(?:#.*)?$", block)
     if not name or not source:
         continue
-    if re.search(r'\b(?:editable|virtual)\s*=\s*"\."(?:\s*[,}]|\s*$)', source.group(1) + "}"):
+    source_text = source.group(1)
+    if re.search(r'\b(?:editable|virtual)\s*=\s*"\."(?:\s*[,}]|\s*$)', source_text + "}"):
         roots.append(name.group(1))
+    elif re.search(r'\b(?:editable|virtual|directory|path|workspace)\s*=', source_text):
+        raise SystemExit(1)
 if len(roots) != 1:
     raise SystemExit(1)
 sys.stdout.write(roots[0])

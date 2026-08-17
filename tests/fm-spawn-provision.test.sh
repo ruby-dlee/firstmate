@@ -420,6 +420,46 @@ test_an_unresolved_standalone_uv_lock_is_a_gap_not_a_failure() {
   pass "an unresolved standalone uv.lock records a capability gap without refusing"
 }
 
+test_a_path_dependent_standalone_uv_lock_is_a_gap() {
+  local case_dir out fakebin detected
+  case_dir=$(new_case path-dependent-uv-lock none)
+  fakebin=$(case_fakebin "$case_dir")
+  mkdir -p "$case_dir/wt/dependency-list"
+  cat > "$case_dir/wt/dependency-list/uv.lock" <<'LOCK'
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[[package]]
+name = "dependency-list"
+version = "0.0.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "local-dependency" },
+]
+
+[[package]]
+name = "local-dependency"
+version = "0.0.0"
+source = { editable = "../local-dependency" }
+LOCK
+
+  detected=$(PATH="$fakebin:/usr/bin:/bin" bash -c '
+    set -u
+    . "$1"
+    fm_provision_detect "$2"
+  ' _ "$LIB" "$case_dir/wt")
+  [ "$detected" = 'python-lock dependency-list' ] \
+    || fail "a path-dependent standalone uv.lock was classified as installable: $detected"
+
+  out=$(run_provision "$case_dir" "$case_dir/wt" "$fakebin")
+  assert_contains "$out" 'rc=0 summary=python-lock:dependency-list=skipped:standalone-uv-lock-unresolved' \
+    "a path-dependent standalone uv.lock did not record a capability gap: $out"
+  assert_no_grep 'uv sync' "$case_dir/install.log" \
+    "a path-dependent standalone uv.lock reached the copied-lock installer"
+  pass "a path-dependent standalone uv.lock records a capability gap"
+}
+
 test_an_npm_lock_without_a_package_manifest_is_a_gap_not_a_failure() {
   local case_dir out fakebin detected
   case_dir=$(new_case npm-lock-only none)
@@ -2139,6 +2179,7 @@ test_a_bare_requirements_list_installs_dependencies_not_a_project
 test_bare_requirements_take_precedence_over_a_standalone_uv_lock
 test_a_standalone_uv_lock_installs_dependencies_not_a_project
 test_an_unresolved_standalone_uv_lock_is_a_gap_not_a_failure
+test_a_path_dependent_standalone_uv_lock_is_a_gap
 test_an_npm_lock_without_a_package_manifest_is_a_gap_not_a_failure
 test_a_pnpm_lock_without_a_package_manifest_is_a_gap_not_a_failure
 test_first_spawn_installs_and_second_reuses_the_cache

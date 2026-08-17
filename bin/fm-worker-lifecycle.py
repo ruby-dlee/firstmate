@@ -57,7 +57,16 @@ PROVIDER_TIMEOUT_SECONDS = 300
 # for the whole guest run. Bounding those at PROVIDER_TIMEOUT_SECONDS hangs the
 # controller up while Azure carries on, leaving a live resource the controller
 # never recorded.
-PROVIDER_CREATE_TIMEOUT_SECONDS = 1800
+# The provider's own worker-create step is allowed 3600s for the ARM
+# deployment alone (run_pilot_create), and a create then runs the blocking
+# bootstrap run command, the lifecycle children and two full inventory sweeps
+# for tag convergence. A controller bound below that reproduces the very
+# failure this exists to stop: hanging up while Azure carries on and leaving a
+# live VM the controller never recorded.
+PROVIDER_CREATE_TIMEOUT_SECONDS = 7200
+# Long enough that a queued command reports contention rather than hanging
+# forever, short enough that an operator sees it.
+CONTROLLER_LOCK_WAIT_SECONDS = 900
 PROVIDER_GUEST_RUN_SLACK_SECONDS = 2400
 MAX_PROVIDER_OUTPUT_BYTES = 2 * 1024 * 1024
 REQUIRED_RESOURCE_KINDS = (
@@ -271,7 +280,19 @@ def controller_lock(env):
     os.chmod(env["state_dir"], 0o700)
     with open(env["lock_path"], "a+", encoding="utf-8") as handle:
         os.chmod(env["lock_path"], 0o600)
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        deadline = time.monotonic() + CONTROLLER_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise LifecycleError(
+                        "controller lock is held by another lifecycle command; an execute holds "
+                        "it for the whole guest run, so concurrent crewmates serialize here "
+                        "until per-action pending state lands"
+                    )
+                time.sleep(1)
         yield
 
 
@@ -408,7 +429,7 @@ def provider_action_timeout(action):
         if isinstance(wall, int) and not isinstance(wall, bool) and wall > 0:
             return wall + PROVIDER_GUEST_RUN_SLACK_SECONDS
         return PROVIDER_GUEST_RUN_SLACK_SECONDS
-    if action.get("type") in ("create", "reset", "delete-compute", "deallocate"):
+    if action.get("type") in ("create", "resume", "reset", "delete-compute", "deallocate"):
         return PROVIDER_CREATE_TIMEOUT_SECONDS
     return PROVIDER_TIMEOUT_SECONDS
 

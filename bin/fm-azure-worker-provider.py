@@ -1229,9 +1229,22 @@ def mark_cleanup_container(controller, action, key, value):
     )
 
 
-def upload_json_blob(controller, account, container, name, value, tags, overwrite=False):
+RESERVATION_VOLATILE_FIELDS = ("ttl_deadline",)
+
+
+def blob_identity_digest(value, volatile_fields=()):
+    """Digest of what IDENTIFIES this blob, ignoring fields that legitimately
+    differ between attempts of the same action (a recomputed deadline, say)."""
+    identity = {key: item for key, item in value.items() if key not in volatile_fields}
+    return hashlib.sha256(canonical_bytes(identity) + b"\n").hexdigest()
+
+
+def upload_json_blob(
+    controller, account, container, name, value, tags, overwrite=False, volatile_fields=(),
+):
     payload = canonical_bytes(value) + b"\n"
     digest = hashlib.sha256(payload).hexdigest()
+    identity = blob_identity_digest(value, volatile_fields)
     fd, path = tempfile.mkstemp(prefix="fm-worker-blob-", suffix=".json")
     os.chmod(path, 0o600)
     try:
@@ -1239,6 +1252,7 @@ def upload_json_blob(controller, account, container, name, value, tags, overwrit
             handle.write(payload)
         metadata = dict(tags_to_metadata(tags))
         metadata["content_digest"] = digest
+        metadata["identity_digest"] = identity
         _, rc, stderr = az(controller, [
             "storage", "blob", "upload", "--auth-mode", "login", "--account-name", account,
             "--container-name", container, "--name", name, "--file", path,
@@ -1253,13 +1267,13 @@ def upload_json_blob(controller, account, container, name, value, tags, overwrit
                 existing, show_rc, show_stderr = az(controller, [
                     "storage", "blob", "show", "--auth-mode", "login",
                     "--account-name", account, "--container-name", container,
-                    "--name", name, "--query", "metadata.content_digest",
+                    "--name", name, "--query", "metadata.identity_digest",
                 ], check=False)
                 if show_rc != 0:
                     raise ProviderError(
                         "existing worker staging blob is unreadable: {}".format(show_stderr)
                     )
-                if existing != digest:
+                if existing != identity:
                     raise ProviderError(
                         "worker staging blob {} already exists with different content".format(name)
                     )
@@ -1563,6 +1577,7 @@ def create_lifecycle_children(controller, action):
     upload_json_blob(
         controller, "st{}ctl01".format(controller["prefix"]), "runner-control",
         "worker/{:02d}/reservation.json".format(action["slot"]), reservation, tags,
+        volatile_fields=RESERVATION_VOLATILE_FIELDS,
     )
     assignment = {
         "schema": "fm.worker-staging-request/v1", "status": "assigned",

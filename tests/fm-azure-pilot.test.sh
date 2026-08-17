@@ -842,9 +842,6 @@ seen = {}
 # Substitute run(), NOT az(): monkeypatching provider.az leaves the whole az ->
 # run plumbing untested, so dropping the timeout parameter from az() (a
 # TypeError on every real execute) stayed green. This drives the real az().
-_real_run = provider.run
-
-
 class _Result:
     returncode = 0
     stderr = b""
@@ -860,7 +857,7 @@ def fake_run(command, check=True, input_bytes=None, timeout=provider.AZ_TIMEOUT_
     return _Result(b"{}")
 
 
-provider.run = fake_run
+provider.run = fake_run  # restored below
 provider.mutate_execute(controller, action)
 
 # The blocking call must clear the wall by far more than the ordinary
@@ -875,6 +872,18 @@ assert seen["timeout"] >= request["wall_seconds"] + 1800, (
 # client waits out the whole wall.
 command = seen.get("command") or []
 assert "--timeout-in-seconds" in command, ("the run command carries no guest bound", command)
+# The call is only blocking because of this, and an async execute returns
+# immediately with the instance view still Running.
+assert "--async-execution" in command, command
+assert command[command.index("--async-execution") + 1] == "false", (
+    "the execute stopped waiting for the guest", command,
+)
+# --protected-parameters is nargs-many, so anything after it is swallowed and
+# the guest bound is silently lost.
+if "--protected-parameters" in command:
+    assert command.index("--timeout-in-seconds") < command.index("--protected-parameters"), (
+        "the guest bound sits after --protected-parameters and would be swallowed", command,
+    )
 guest_bound = int(command[command.index("--timeout-in-seconds") + 1])
 assert guest_bound >= request["wall_seconds"] + 1800, (
     "the guest run-command bound does not cover its own wall", guest_bound,
@@ -953,7 +962,14 @@ for label, keys in (("default", default_keys), ("custom", custom_keys)):
     missing = required - set(keys)
     assert not missing, (label + " branch is missing properties", sorted(missing))
     assert keys["createOption"] == "'FromImage'", (label, keys["createOption"])
-    assert "StandardSSD_LRS" in keys["managedDisk"], (label, keys["managedDisk"])
+    # Detach leaks an OS disk on every VM delete and breaks the absence proofs.
+    assert keys["deleteOption"] == "'Delete'", (label, keys["deleteOption"])
+    assert keys["managedDisk"] == "createObject('storageAccountType', 'StandardSSD_LRS')", (
+        label, keys["managedDisk"],
+    )
+
+# The size is the whole point of the branch, so pin the value, not its presence.
+assert default_keys["diskSizeGB"] == "64", ("the Canonical OS disk size changed", default_keys["diskSizeGB"])
 
 # The lifecycle matches resources by exact name, so both branches must produce
 # the identical disk name.
@@ -1027,6 +1043,69 @@ try:
     raise AssertionError("a conflicting create-once blob was accepted")
 except provider.ProviderError as exc:
     assert "different content" in str(exc), exc
+# The check above drives upload_json_blob with a hand-written value, which
+# cannot see a REAL caller whose payload is not byte-stable across attempts.
+# create_lifecycle_children recomputes a TTL deadline from now() on every call,
+# so replaying it minutes later must still converge.
+store = {}
+now_calls = []
+
+
+def replay_az(controller, args, check=True, timeout=provider.AZ_TIMEOUT_SECONDS):
+    if "upload" in args:
+        name = args[args.index("--name") + 1]
+        meta = {}
+        for item in args[args.index("--metadata") + 1:]:
+            if "=" in item:
+                key, _, item_value = item.partition("=")
+                meta[key] = item_value
+        if name in store:
+            return None, 1, "ErrorCode:BlobAlreadyExists"
+        store[name] = meta
+        return {}, 0, ""
+    if "show" in args:
+        name = args[args.index("--name") + 1]
+        query = args[args.index("--query") + 1].split(".")[-1]
+        return store.get(name, {}).get(query), 0, ""
+    return {}, 0, ""
+
+
+provider.az = replay_az
+reservation_name = "worker/01/reservation.json"
+
+
+def reservation_payload(deadline_hours):
+    return {
+        "schema": "fm.worker-global-reservation/v1", "slot": 1,
+        "assignment_generation": "asg-00000001", "sku": "Standard_D4as_v6",
+        "sku_family": "standardDav6Family", "reservation_usd": 1.0,
+        "supervisor_sha256": "a" * 64,
+        "ttl_deadline": "2026-08-17T{:02d}:00:00Z".format(deadline_hours),
+    }
+
+
+provider.upload_json_blob(
+    controller, "acct", "runner-control", reservation_name,
+    reservation_payload(18), {}, volatile_fields=provider.RESERVATION_VOLATILE_FIELDS,
+)
+# The replay recomputes a LATER deadline, exactly as create_lifecycle_children
+# does. It must still converge: the deadline is not what identifies the slot.
+provider.upload_json_blob(
+    controller, "acct", "runner-control", reservation_name,
+    reservation_payload(21), {}, volatile_fields=provider.RESERVATION_VOLATILE_FIELDS,
+)
+
+# A different SLOT ASSIGNMENT under the same name is still refused.
+conflicting = reservation_payload(21)
+conflicting["assignment_generation"] = "asg-00000002"
+try:
+    provider.upload_json_blob(
+        controller, "acct", "runner-control", reservation_name,
+        conflicting, {}, volatile_fields=provider.RESERVATION_VOLATILE_FIELDS,
+    )
+    raise AssertionError("a different assignment converged onto an existing reservation")
+except provider.ProviderError as exc:
+    assert "different content" in str(exc), exc
 print("OK")
 CREATEREPLAY
   out=$(python3 "$tmp/driver.py" "$WORKER_PROVIDER" "$tmp" 2>&1)
@@ -1052,8 +1131,20 @@ spec.loader.exec_module(lifecycle)
 # A VM create is an ARM deployment measured in minutes and an execute blocks
 # for the whole guest run; neither fits the ordinary control-plane bound.
 # Absolute floors, not the constants under test.
+# The provider's own worker-create step allows 3600s for the ARM deployment
+# ALONE, and a create then runs the blocking bootstrap plus two inventory
+# sweeps. A controller bound below that reproduces the failure this exists to
+# stop, so the floor is the inner budget, not a round number.
 create = lifecycle.provider_action_timeout({"type": "create"})
-assert create >= 900, ("a create is bounded too tightly for an ARM deployment", create)
+assert create > 3600, ("a create is bounded below the provider's own deployment budget", create)
+
+# resume runs through the IDENTICAL provider path (mutate routes create and
+# resume to create_or_resume), and it is the recovery path, so leaving it on
+# the ordinary bound strands a half-built replacement exactly when things have
+# already gone wrong.
+for action_type in ("resume", "reset", "delete-compute", "deallocate"):
+    bound = lifecycle.provider_action_timeout({"type": action_type})
+    assert bound == create, (action_type + " is not bounded like the create it shares a path with", bound)
 
 execute = lifecycle.provider_action_timeout(
     {"type": "execute", "request": {"wall_seconds": 3600}}

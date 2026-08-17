@@ -3981,6 +3981,7 @@ if [ "$SPAWN_CLOUD" = azure ]; then
   # account at /mnt/account/pi-agent. The local LAUNCH string is therefore
   # NOT reused - its paths exist only on this machine. --print keeps the run
   # bounded and non-interactive under the supervisor's device-null stdin.
+  # shellcheck disable=SC2016  # single quotes are deliberate: $(cat ...) expands on the worker, not here
   CLOUD_WORKER_LAUNCH="env PI_CODING_AGENT_DIR=/mnt/account/pi-agent pi --print --approve --exclude-tools ask_question ${MODELFLAG}${EFFORTFLAG}"'"$(cat /mnt/task/.fm-task/brief.md)"'
   # Cloud state files are keyed by task ID while the queue is keyed
   # ID@GENERATION: a re-spawn of the same task must not inherit the previous

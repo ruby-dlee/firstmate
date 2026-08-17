@@ -826,7 +826,48 @@ PY
   pass "the safety-shutdown expiry script renders real newlines with the exact unit text"
 }
 
+parameter_contract_unit() {
+  # The model run-command parameter contract is env-vars-only and split
+  # across two files: the adapter SUBMITS named (protected) parameters and
+  # the guest CONSUMES them as lowercase environment variables, refusing
+  # everything else with exit 125. This pins both halves to the same seven
+  # names so a rename on either side fails here instead of as an opaque
+  # live provisioning failure.
+  python3 - "$ADAPTER" "$MODEL_GUEST" <<'PY' || fail "run-command parameter contract diverged"
+import re
+import sys
+from pathlib import Path
+
+adapter = Path(sys.argv[1]).read_text(encoding="utf-8")
+guest = Path(sys.argv[2]).read_text(encoding="utf-8")
+
+produced = set(re.findall(r'\{"name": "([a-z_]+)", "value"', adapter))
+expected = {
+    "review_generation", "vm_resource_id", "vm_instance_id", "guest_digest",
+    "input_url", "credential_url", "output_url",
+}
+assert produced == expected, ("adapter submits", sorted(produced))
+
+consumed = set()
+for upper, lower in re.findall(r'([A-Z_]+)=\$\{([a-z_]+):-\}', guest):
+    consumed.add(lower)
+assert consumed == expected, ("guest consumes", sorted(consumed))
+# The guest must scrub every carrier after adoption and refuse positional
+# argument delivery outright.
+unset_line = re.search(r"^unset ([a-z_ ]+)$", guest, re.M)
+assert unset_line, "the guest no longer scrubs its parameter carriers"
+assert set(unset_line.group(1).split()) == {
+    "review_generation", "vm_resource_id", "vm_instance_id", "guest_digest",
+}, "the guest scrubs a different public-parameter set than it consumes"
+assert "expected seven bound parameters" in guest
+assert re.search(r'\[ "\$#" -eq 0 \]|\$# -ne 0|positional', guest), \
+    "the guest no longer refuses positional parameters"
+PY
+  pass "the adapter and guest agree on the exact seven-parameter contract"
+}
+
 static_contract
+parameter_contract_unit
 adapter_mode_unit
 identity_outcome_unit
 account_and_cleanup_identity_unit

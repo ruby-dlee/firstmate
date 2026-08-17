@@ -7,6 +7,7 @@ import argparse
 import base64
 import gzip
 import io
+import zlib
 import json
 import os
 from pathlib import Path
@@ -71,7 +72,7 @@ def materialize_manifest(root: Path, encoded: str) -> None:
         if len(raw) > MAX_MANIFEST_JSON_BYTES:
             raise ValueError("evidence manifest exceeds its decoded byte bound")
         files = json.loads(raw)
-    except (ValueError, json.JSONDecodeError, OSError, EOFError) as exc:
+    except (ValueError, json.JSONDecodeError, OSError, EOFError, zlib.error) as exc:
         raise ValueError("evidence manifest is malformed") from exc
     if not isinstance(files, dict) or not files or len(files) > MAX_FILES:
         raise ValueError("evidence manifest item count is invalid")

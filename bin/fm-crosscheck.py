@@ -280,12 +280,12 @@ def account_identity(harness: str, account_home: Path) -> str:
         account = tokens.get("account_id") if isinstance(tokens, dict) else None
         if isinstance(account, str) and account.strip():
             return "codex:" + account.strip()
-        api_key = (
-            credential.get("OPENAI_API_KEY") if isinstance(credential, dict) else None
-        )
-        if isinstance(api_key, str) and api_key.strip():
-            digest = hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest()
-            return "codex-api-key-digest:" + digest
+        # No API-key fallback: a key digest is key-bound, not account-bound -
+        # one upstream account yields a new identity after an ordinary key
+        # rotation, the same defect removed from the Claude lane (live
+        # crosscheck finding cc-36d5b5cfcb2a). A credential without an
+        # upstream account id exposes no stable executing-account identity
+        # and is refused.
         tool_fail(
             f"Codex credential at {home} exposes no executing account identity"
         )
@@ -3527,6 +3527,7 @@ def apply_review(
     evidence_deadline = (
         float(executor_deadline)
         if isinstance(executor_deadline, (int, float))
+        and not isinstance(executor_deadline, bool)
         else time.monotonic() + evidence_run_timeout()
     )
     try:

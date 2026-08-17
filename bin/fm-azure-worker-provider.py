@@ -77,6 +77,42 @@ AZ_TIMEOUT_SECONDS = 300
 # the guest gives up first so its timeout is what gets reported.
 BOOTSTRAP_GUEST_TIMEOUT_SECONDS = 1800
 BOOTSTRAP_CLIENT_TIMEOUT_SECONDS = 2400
+
+# What the provider spends AROUND the blocking guest call, each step at its own
+# bound. The controller supervises the WHOLE subprocess, so its bound has to
+# cover the client wait plus both of these; covering only the client wait kills
+# the provider during collection and the task runs a second time. These are
+# named here, next to the bounds they are made of, so bin/fm-worker-lifecycle.py
+# cannot drift away from them unnoticed: tests/fm-azure-pilot.test.sh checks the
+# controller bound against these exact values.
+PRE_GUEST_CALL_BUDGET_SECONDS = (
+    AZ_TIMEOUT_SECONDS        # opening inventory sweep
+    + AZ_TIMEOUT_SECONDS      # payload archive upload
+    + AZ_TIMEOUT_SECONDS      # account archive upload
+    + AZ_TIMEOUT_SECONDS      # request blob upload and SAS mints
+)
+POST_GUEST_CALL_BUDGET_SECONDS = (
+    AZ_TIMEOUT_SECONDS                                          # instance-view read
+    + AZ_TIMEOUT_SECONDS                                        # outcome size probe
+    + AZ_TIMEOUT_SECONDS + MAX_OUTCOME_BYTES // (256 * 1024)    # bounded download at its ceiling
+    + AZ_TIMEOUT_SECONDS                                        # staging-result upload
+    + AZ_TIMEOUT_SECONDS                                        # closing inventory sweep
+)
+# A create does not block on a task, but it does run a long ARM deployment and
+# the blocking bootstrap, plus the lifecycle children and two tag-convergence
+# sweeps. Same rule: the controller bound must cover all of it.
+# A steer also blocks on the guest. RunShellScript is an unmanaged run command
+# and takes no --timeout-in-seconds, so the client bound is the only one there
+# is, and leaving it at the ordinary control-plane default is the same shape
+# called broken for bootstrap and execute above.
+STEER_CLIENT_TIMEOUT_SECONDS = 600
+# The steer is bracketed by two full inventory sweeps.
+STEER_BUDGET_SECONDS = STEER_CLIENT_TIMEOUT_SECONDS + AZ_TIMEOUT_SECONDS * 2
+PILOT_CREATE_DEPLOY_TIMEOUT_SECONDS = 3600
+CREATE_LIFECYCLE_BUDGET_SECONDS = (
+    BOOTSTRAP_CLIENT_TIMEOUT_SECONDS
+    + AZ_TIMEOUT_SECONDS * 16   # instance view, task stub, TTL, blob uploads, sweeps, tagging
+)
 RESOURCE_API = {
     "vm": "2024-03-01",
     "nic": "2023-09-01",
@@ -1249,14 +1285,17 @@ def mark_cleanup_container(controller, action, key, value):
 # provenance recorded alongside that grant, and must not be able to wedge a
 # replay.
 #
-# ttl_deadline is recomputed from now() on every attempt. supervisor_sha256 is
-# the digest of the supervisor the bootstrap script CARRIES; the guest re-proves
-# it from the script it actually received, so the reservation's copy is a record,
-# not the binding. Treating it as identity means any merge that touches
-# bin/fm-worker-supervisor.py between a failed create and its replay turns a
-# recoverable wedge into a permanent one whose only exit is hand-deleting the
-# blob. That is not theoretical: it is the state slot 2 is in right now.
-RESERVATION_VOLATILE_FIELDS = ("ttl_deadline", "supervisor_sha256")
+# ttl_deadline is recomputed from now() on every attempt, so it is volatile.
+#
+# The supervisor digest is NOT here at all, rather than being listed as
+# volatile: it is the digest of the supervisor the bootstrap script carries,
+# the guest re-proves it from the script it actually received, and a converging
+# replay does not rewrite the blob, so keeping a copy would guarantee a stale
+# one. Carrying it as identity was worse still: any merge touching
+# bin/fm-worker-supervisor.py between a failed create and its replay turned a
+# recoverable wedge into a permanent one whose only exit was hand-deleting the
+# blob. That is not theoretical, it is the state slot 2 is in right now.
+RESERVATION_VOLATILE_FIELDS = ("ttl_deadline",)
 
 
 def blob_identity_digest(value, volatile_fields=()):
@@ -1608,7 +1647,13 @@ def create_lifecycle_children(controller, action):
         "schema": "fm.worker-global-reservation/v1", "slot": action["slot"],
         "assignment_generation": action["bindings"]["assignment_generation"],
         "sku": action["sku"], "sku_family": action["sku_family"],
-        "reservation_usd": action.get("reservation_usd"), "supervisor_sha256": supervisor_digest,
+        "reservation_usd": action.get("reservation_usd"),
+        # No supervisor_sha256 here. A converging replay returns without
+        # rewriting the blob, so this field would be guaranteed stale after
+        # exactly the event it was kept for, and a record that is reliably
+        # wrong is worse than no record. Nothing reads it: the guest proves its
+        # supervisor against the digest carried by the bootstrap script it was
+        # actually handed, and staging-request keeps the live copy.
         "ttl_deadline": deadline.isoformat().replace("+00:00", "Z"),
     }
     upload_json_blob(
@@ -2177,7 +2222,7 @@ exec \"$supervisor\" steer --home-binding '{}' --task '{}' --task-generation '{}
         "vm", "run-command", "invoke", "--resource-group", controller["resource_group"],
         "--name", expected_names(controller, action["slot"])["vm"],
         "--command-id", "RunShellScript", "--scripts", script,
-    ], check=False)
+    ], check=False, timeout=STEER_CLIENT_TIMEOUT_SECONDS)
     if rc != 0:
         raise ProviderError("exact guest-supervisor steer failed: {}".format(stderr))
     # RunShellScript never propagates the guest exit code, so only the

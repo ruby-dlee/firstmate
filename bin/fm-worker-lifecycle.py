@@ -63,20 +63,31 @@ PROVIDER_TIMEOUT_SECONDS = 300
 # for tag convergence. A controller bound below that reproduces the very
 # failure this exists to stop: hanging up while Azure carries on and leaving a
 # live VM the controller never recorded.
-PROVIDER_CREATE_TIMEOUT_SECONDS = 7200
+# Must cover the provider's own ARM deployment budget PLUS its blocking
+# bootstrap and lifecycle children. Kept above
+# PILOT_CREATE_DEPLOY_TIMEOUT_SECONDS + CREATE_LIFECYCLE_BUDGET_SECONDS in
+# bin/fm-azure-worker-provider.py; tests/fm-azure-pilot.test.sh checks it
+# against those, because raising an inner bound without this one silently
+# recreates the failure this constant exists to prevent.
+PROVIDER_CREATE_TIMEOUT_SECONDS = 12600
 # A steer is a control-plane action, but not a cheap one: the provider runs a
 # full inventory sweep, then a blocking run-command invoke at its own 300s
 # bound, then another sweep. Leaving it at PROVIDER_TIMEOUT_SECONDS makes the
 # controller bound EQUAL to just the inner invoke, so an ordinary steer whose
 # sweeps take any time at all is killed by the controller and reported as a
 # missed deadline while the steer may already have landed in the guest.
-PROVIDER_STEER_TIMEOUT_SECONDS = 1200
+PROVIDER_STEER_TIMEOUT_SECONDS = 1800
 # Strictly larger than the provider's own client wait, because the provider
 # runs a full inventory sweep, archive builds, uploads and SAS mints BEFORE the
 # blocking call and another sweep plus a result upload AFTER it. A controller
 # bound equal to the inner one kills the provider during collection and the
 # task re-runs.
-PROVIDER_GUEST_RUN_SLACK_SECONDS = 4200
+# Covers the provider's client wait PLUS everything it does around the blocking
+# call (PRE_/POST_GUEST_CALL_BUDGET_SECONDS in the provider). Raising the client
+# wait without raising this cuts the margin toward zero and the controller kills
+# the provider mid-collection, which reads as a deadline miss for an execute
+# that actually ran.
+PROVIDER_GUEST_RUN_SLACK_SECONDS = 8400
 MAX_PROVIDER_OUTPUT_BYTES = 2 * 1024 * 1024
 REQUIRED_RESOURCE_KINDS = (
     "vm", "nic", "os-disk", "task-disk", "account-disk", "identity",

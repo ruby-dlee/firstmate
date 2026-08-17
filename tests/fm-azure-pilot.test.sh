@@ -786,6 +786,13 @@ import re
 import sys
 from pathlib import Path
 
+def load_module(name, path):
+    module_spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    return module
+
+
 provider_path, lifecycle_path, tmp = sys.argv[1:]
 spec = importlib.util.spec_from_file_location("fm_provider", provider_path)
 provider = importlib.util.module_from_spec(spec)
@@ -918,27 +925,19 @@ assert command.index("--timeout-in-seconds") < command.index("--protected-parame
     "the guest bound sits after --protected-parameters and would be swallowed", command,
 )
 guest_bound = int(command[command.index("--timeout-in-seconds") + 1])
-# The floor is DERIVED from the supervisor's own per-step timeouts, not from
-# GUEST_RUN_SLACK_SECONDS: asserting against the constant under test certifies
-# whatever value it happens to hold, which is how a bound 900s under the real
-# budget passed review once already. Everything the supervisor does outside the
-# wall (payload fetch, account fetch, clone, rev-parse, rev-list, status,
-# bundle, upload) has an explicit `timeout=` in its source; their sum is the
-# smallest guest bound that cannot kill a run mid-collection. An Azure kill is
-# not catchable, so undershooting deletes the crewmate's commits on the next
-# dispatch rather than merely losing the outcome.
-supervisor_source = Path(sys.argv[1]).with_name("fm-worker-supervisor.py").read_text()
-step_timeouts = [int(value) for value in re.findall(r"timeout=(\d+)", supervisor_source)]
-assert len(step_timeouts) >= 6, ("the supervisor timeout scan found almost nothing, so the "
-                                 "floor below is not a real budget", step_timeouts)
-# A source scan counts each bounded step ONCE, but fetch_archive is defined
-# once and called twice (payload, then account), so the scan alone understates
-# the real worst case by one fetch and would happily certify a bound 300s short.
-fetch_timeout = int(re.search(r"opener\.open\(url, timeout=(\d+)\)", supervisor_source).group(1))
-fetch_calls = len(re.findall(r"fetch_archive\(\"", supervisor_source))
-assert fetch_calls >= 2, ("fetch_archive call sites are no longer countable, so the extra "
-                          "fetch below is guesswork", fetch_calls)
-collection_floor = sum(step_timeouts) + (fetch_calls - 1) * fetch_timeout
+# The floor comes from the supervisor MODULE, not from GUEST_RUN_SLACK_SECONDS
+# and not from a scan of the supervisor's source text. Asserting against the
+# constant under test certifies whatever it holds; scanning the text silently
+# UNDER-counts the moment a literal becomes a named constant, which is the
+# direction that kills a run. fm-worker-supervisor.py sums its own per-step
+# bounds into NON_WALL_BUDGET_SECONDS at the same names its call sites use, so
+# growing a step grows this floor.
+supervisor = load_module("fm_supervisor", str(Path(sys.argv[1]).with_name("fm-worker-supervisor.py")))
+collection_floor = supervisor.NON_WALL_BUDGET_SECONDS
+assert collection_floor > 0, collection_floor
+# An Azure kill is not catchable, so undershooting this does not merely lose the
+# outcome: no executed marker is written and the next dispatch rmtrees the
+# staged repository, deleting the commits the killed run had already made.
 assert guest_bound >= request["wall_seconds"] + collection_floor, (
     "the guest run-command bound is under the supervisor's own non-wall budget, so a slow "
     "collection is killed and its commits are destroyed on redispatch",
@@ -951,9 +950,21 @@ assert guest_bound >= request["wall_seconds"] + collection_floor, (
 # strictly greater than the provider's own, it kills the provider during result
 # collection and the task runs a second time.
 controller_bound = lifecycle.provider_action_timeout(action)
-assert controller_bound > seen["timeout"], (
-    "the controller does not outlast the provider call it supervises",
-    controller_bound, seen["timeout"],
+# A bare `>` is not the property: the controller supervises the WHOLE provider
+# subprocess, so it must outlast the client wait plus everything the provider
+# does around it. Those budgets are named in the provider next to the bounds
+# they are summed from, so this reads them rather than restating a number - a
+# one-second margin used to satisfy the old assertion while the controller
+# killed the provider mid-download.
+provider_whole_run = (
+    seen["timeout"]
+    + provider.PRE_GUEST_CALL_BUDGET_SECONDS
+    + provider.POST_GUEST_CALL_BUDGET_SECONDS
+)
+assert controller_bound >= provider_whole_run, (
+    "the controller bound does not cover the provider's work around the blocking call, so a "
+    "long task returning a large outcome is killed during collection and re-runs",
+    controller_bound, seen["timeout"], provider_whole_run,
 )
 assert seen["timeout"] > guest_bound, (
     "the client hangs up at or before the guest bound it set, so a guest timeout races",
@@ -1152,7 +1163,8 @@ def reservation_payload(deadline_hours):
         "schema": "fm.worker-global-reservation/v1", "slot": 1,
         "assignment_generation": "asg-00000001", "sku": "Standard_D4as_v6",
         "sku_family": "standardDav6Family", "reservation_usd": 1.0,
-        "supervisor_sha256": "a" * 64,
+        # Deliberately no supervisor_sha256: the real reservation carries none,
+        # and a fixture richer than its producer proves nothing about it.
         "ttl_deadline": "2026-08-17T{:02d}:00:00Z".format(deadline_hours),
     }
 
@@ -1166,17 +1178,6 @@ provider.upload_json_blob(
 provider.upload_json_blob(
     controller, "acct", "runner-control", reservation_name,
     reservation_payload(21), {}, volatile_fields=provider.RESERVATION_VOLATILE_FIELDS,
-)
-
-# A replay carrying a NEWER supervisor must converge. This is the live case:
-# a create fails, main merges a commit touching bin/fm-worker-supervisor.py, and
-# the replay recomputes a different digest. Treating that as identity turns a
-# recoverable wedge into one whose only exit is deleting the blob by hand.
-rebuilt = reservation_payload(21)
-rebuilt["supervisor_sha256"] = "b" * 64
-provider.upload_json_blob(
-    controller, "acct", "runner-control", reservation_name,
-    rebuilt, {}, volatile_fields=provider.RESERVATION_VOLATILE_FIELDS,
 )
 
 # A different SLOT ASSIGNMENT under the same name is still refused.
@@ -1229,7 +1230,9 @@ _real_upload = provider.upload_json_blob
 
 
 def recording_upload(controller, account, container, name, value, tags, **kwargs):
-    captured_uploads.append((name, kwargs.get("volatile_fields", ()), kwargs.get("overwrite", False)))
+    captured_uploads.append(
+        (name, kwargs.get("volatile_fields", ()), kwargs.get("overwrite", False), value)
+    )
     return "0" * 64
 
 
@@ -1332,11 +1335,20 @@ assert "ttl_deadline" in reservation_uploads[0][1], (
     "the real caller does not declare its recomputed deadline volatile, so a replay "
     "will never converge", reservation_uploads[0],
 )
-assert "supervisor_sha256" in reservation_uploads[0][1], (
-    "the real caller treats the supervisor digest as slot identity, so any merge touching "
-    "bin/fm-worker-supervisor.py between a failed create and its replay wedges the slot "
-    "permanently", reservation_uploads[0],
+# Stronger than declaring it volatile: the digest is not in the reservation at
+# all, so it can neither wedge a replay nor rot into a stale record. A
+# converging replay never rewrites the blob, so any copy kept here would be
+# guaranteed wrong after exactly the event it was kept for.
+assert "supervisor_sha256" not in reservation_uploads[0][3], (
+    "the reservation carries the supervisor digest again, which either wedges a replay when "
+    "bin/fm-worker-supervisor.py changes or records a digest the worker is not running",
+    reservation_uploads[0][3],
 )
+# It still has to be recorded somewhere live, and staging-request is rewritten
+# on every attempt, so that is where it belongs.
+assert any(
+    "staging-request" in item[0] and "supervisor_sha256" in item[3] for item in captured_uploads
+), ("nothing records the supervisor digest any more", [item[0] for item in captured_uploads])
 assert reservation_uploads[0][2] is False, (
     "the reservation stopped being create-once, so it no longer arbitrates slot ownership",
     reservation_uploads[0],
@@ -1344,6 +1356,18 @@ assert reservation_uploads[0][2] is False, (
 # The staging pair is per-assignment working state that mutate_execute already
 # overwrites. Leaving it create-once makes a resume after the first execute find
 # an execution body where an assignment belongs and refuse forever.
+# The reservation is what refuses a foreign or newer assignment, and it is
+# create-once. That refusal only protects the staging pair because it happens
+# FIRST: reorder these and an overwrite-mode staging write clobbers a live
+# assignment before anything checks who owns the slot.
+upload_order = [item[0] for item in captured_uploads]
+reservation_index = next(i for i, name in enumerate(upload_order) if "reservation" in name)
+staging_indexes = [i for i, name in enumerate(upload_order) if "staging" in name]
+assert staging_indexes and reservation_index < min(staging_indexes), (
+    "a staging blob is written before the create-once reservation that arbitrates the slot, "
+    "so a foreign assignment overwrites a live one before it is refused", upload_order,
+)
+
 staging_uploads = [item for item in captured_uploads if "staging" in item[0]]
 assert len(staging_uploads) == 2, ("the create no longer writes the staging pair",
                                    captured_uploads)
@@ -1387,6 +1411,14 @@ provider_spec.loader.exec_module(provider)
 # sweeps. A controller bound below that reproduces the failure this exists to
 # stop, so the floor is the inner budget, not a round number.
 create = lifecycle.provider_action_timeout({"type": "create"})
+assert create >= (provider.PILOT_CREATE_DEPLOY_TIMEOUT_SECONDS
+                  + provider.CREATE_LIFECYCLE_BUDGET_SECONDS), (
+    "the controller create bound does not cover the provider's deployment budget plus its "
+    "blocking bootstrap and lifecycle children, so raising an inner bound just moved the "
+    "same failure one level out",
+    create, provider.PILOT_CREATE_DEPLOY_TIMEOUT_SECONDS,
+    provider.CREATE_LIFECYCLE_BUDGET_SECONDS,
+)
 assert create >= 3600 + 1800, (
     "a create leaves no headroom over the provider's own 3600s deployment budget for the "
     "bootstrap run command, the TTL schedule, three uploads and two inventory sweeps", create,
@@ -1412,9 +1444,16 @@ assert execute >= 3600 + 1800, ("an execute is bounded below its own guest run",
 # already have landed in the guest. The floor is the provider's inner bound
 # read from the provider module, never the lifecycle constant under test.
 steer = lifecycle.provider_action_timeout({"type": "steer"})
-assert steer > provider.AZ_TIMEOUT_SECONDS, (
-    "the controller bound for a steer does not outlast the blocking invoke inside it",
-    steer, provider.AZ_TIMEOUT_SECONDS,
+# Not `> AZ_TIMEOUT_SECONDS`: a one-second margin satisfied that while the steer
+# was still bracketed by two full inventory sweeps. The provider names its own
+# steer budget next to the bounds it is summed from.
+assert steer > provider.STEER_BUDGET_SECONDS, (
+    "the controller bound for a steer does not outlast the blocking invoke plus the two "
+    "inventory sweeps around it", steer, provider.STEER_BUDGET_SECONDS,
+)
+assert provider.STEER_CLIENT_TIMEOUT_SECONDS > provider.AZ_TIMEOUT_SECONDS, (
+    "the blocking steer invoke is still on the ordinary control-plane bound",
+    provider.STEER_CLIENT_TIMEOUT_SECONDS,
 )
 # An ordinary read stays on the ordinary bound.
 assert lifecycle.provider_action_timeout(None) == lifecycle.PROVIDER_TIMEOUT_SECONDS

@@ -5778,6 +5778,7 @@ if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then
   fm_account_meta_lock_release "$direct_spawn_restore_lock" || exit 1
   fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
   [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
+  fm_cloud_state_remove "$STATE" "$ID"
   echo "cleaned failed direct spawn for $ID and restored the prior task generation"
   exit 0
 fi

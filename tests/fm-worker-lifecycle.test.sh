@@ -869,7 +869,9 @@ if request["operation"] == "mutate":
                 execution.update({
                     "outcome_present": False, "outcome_error": "",
                     "outcome_commits": 0, "outcome_sha256": "", "outcome_bytes": 0,
+                    "outcome_sink": "", "outcome_uncommitted_changes": False,
                 })
+            execution["streams_persisted"] = True
             execution["result_digest"] = hashlib.sha256(canonical(execution)).hexdigest()
             result = {"idempotency_key": key, "action": kind, "worker": state["workers"][slot], "execution": execution}
         elif kind == "steer":

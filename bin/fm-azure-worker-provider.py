@@ -2042,6 +2042,16 @@ printf 'FM-WORKER-RESULT:%s\\n' "$(cat /var/lib/firstmate-worker/result.json)"
         outcome_target = action.get("outcome_dir")
         if not outcome_target:
             raise ProviderError("execution collected an outcome with no controller directory to land it in")
+        # The guest records where it actually put the bytes. Anything but the
+        # staging blob means the upload was diverted (a test sink, an injected
+        # unprotected FM_WORKER_OUTCOME_FILE), and the result must not be
+        # treated as a collectable outcome.
+        if execution.get("outcome_sink") != "blob":
+            raise ProviderError(
+                "execution claims an outcome written to {!r} rather than the staging blob".format(
+                    execution.get("outcome_sink")
+                )
+            )
         digest_claim = execution.get("outcome_sha256")
         bytes_claim = execution.get("outcome_bytes")
         if not isinstance(digest_claim, str) or not re.fullmatch(r"[0-9a-f]{64}", digest_claim):

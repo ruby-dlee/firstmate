@@ -219,6 +219,18 @@ def stage_payload(request, worktree, account_home):
         # it rather than wedging every future dispatch of this request.
         if repo.is_symlink() or not repo.is_dir():
             raise SupervisorError("staged repository target is not a removable directory")
+        ahead = subprocess.run(
+            ["git", "-C", str(repo), "rev-list", "--count",
+             "{}..HEAD".format(request["repository_generation"])],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=120, check=False,
+        )
+        carried = ahead.stdout.decode("utf-8", errors="replace").strip()
+        if ahead.returncode == 0 and carried.isdigit() and int(carried) > 0:
+            raise SupervisorError(
+                "staged repository carries {} uncollected commit(s) beyond the bound "
+                "generation; refusing to destroy them".format(carried)
+            )
         shutil.rmtree(repo)
     bundle = staging / "repo.bundle"
     clone = subprocess.run(
@@ -258,7 +270,7 @@ def outcome_bundle_path(request, worktree):
     its digest, so a blob lost between execution and collection is recoverable
     instead of wedging the lifecycle forever.
     """
-    return worktree / ".fm-worker" / "{}-outcome.bundle".format(request["assignment_generation"])
+    return worktree / ".fm-worker" / "{}-outcome.bundle".format(request["request_digest"][:32])
 
 
 
@@ -413,7 +425,7 @@ def execute(request, worktree, worktree_root):
     post_command_errors = []
     # Persist the exact digested streams on the retained task disk so the
     # bounded result's stream digests stay verifiable after the VM is gone.
-    logs_dir = worktree / ".fm-worker"
+    logs_dir = worktree_root / ".fm-worker"
     try:
         logs_dir.mkdir(mode=0o700, exist_ok=True)
         for suffix, data in (("stdout", stdout), ("stderr", stderr)):

@@ -265,7 +265,9 @@ if request["operation"] == "mutate":
                 execution.update({
                     "outcome_present": False, "outcome_error": "",
                     "outcome_commits": 0, "outcome_sha256": "", "outcome_bytes": 0,
+                    "outcome_sink": "", "outcome_uncommitted_changes": False,
                 })
+            execution["streams_persisted"] = True
             execution["result_digest"] = hashlib.sha256(canonical(execution)).hexdigest()
             result = {"idempotency_key": key, "action": kind, "worker": state["workers"][slot], "execution": execution}
         else:
@@ -849,6 +851,36 @@ RESULT
   pass "a crewmate that edited without committing is reported, not silently dropped"
 }
 
+test_monitor_lands_despite_a_collection_error() {
+  # A failure in one arm of the run (stream evidence, say) is reported, but it
+  # must never throw away work the controller already downloaded and verified.
+  local record id src base
+  id=cloud-land-c18
+  record=$(make_cloud_case landing-error-lane "$id")
+  read_cloud_case "$record"
+  src="$CASE_DIR/leased"
+  base=$(stage_landing_case "$id" "$src" "$HOME_DIR/state/$id.cloud-outcome")
+  python3 - "$HOME_DIR/state/$id.worker-result.json" <<'RESULT'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    result = json.load(handle)
+result["outcome_error"] = "stream evidence: FileExistsError: /mnt/task/.fm-worker"
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(result, handle, sort_keys=True, separators=(",", ":"))
+RESULT
+  FM_HOME="$HOME_DIR" FM_SPAWN_CLOUD_MONITOR_INTERVAL_SECONDS=1 \
+    "$ROOT/bin/fm-spawn-cloud-monitor.sh" "$id" gen-1 > "$CASE_DIR/monitor.log" 2>&1
+  assert_grep 'reported a failure during collection' "$CASE_DIR/monitor.log" \
+    "the collection failure was not reported"
+  assert_grep 'landed 1 commit' "$CASE_DIR/monitor.log" \
+    "a verified bundle was discarded because another arm of the run failed"
+  assert_present "$src/outcome.txt" "the crewmate's commit did not reach the leased worktree"
+  pass "a collection error is reported without discarding a bundle that arrived"
+}
+
 test_monitor_keeps_the_outcome_when_the_worktree_moved() {
   # If the local side moved on, a silent fast-forward would be wrong: the
   # bundle is kept and the operator is told where it is.
@@ -874,6 +906,7 @@ test_cloud_spawn_places_worker_and_runs_the_entrypoint
 test_monitor_lands_the_outcome_bundle
 test_monitor_reports_an_already_landed_outcome
 test_monitor_reports_a_crewmate_that_never_committed
+test_monitor_lands_despite_a_collection_error
 test_monitor_keeps_the_outcome_when_the_worktree_moved
 test_cloud_spawn_stays_durably_queued_without_admission
 test_cloud_monitor_launch_carries_fm_home

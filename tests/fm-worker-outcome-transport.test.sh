@@ -257,6 +257,7 @@ real_az = provider.az
 def recording_az(controller, args, check=True, timeout=None):
     if "update" in args and "run-command" in args:
         captured["update"] = list(args)
+        captured["timeout"] = timeout
     if timeout is None:
         return real_az(controller, args, check=check)
     return real_az(controller, args, check=check, timeout=timeout)
@@ -275,6 +276,39 @@ assert any(item.startswith("FM_WORKER_OUTCOME_URL=https://") for item in update)
 landed = root / "outcome" / "outcome.bundle"
 assert landed.is_file(), "mutate_execute never collected the outcome bundle"
 assert landed.read_bytes() == body, "the collected bundle is not the blob"
+
+# The blocking call must be bounded by the whole guest run, not the bare wall:
+# staging happens before the wall starts and collection after it ends.
+assert captured.get("timeout") is not None, "the run-command update carried no explicit bound"
+# An absolute floor, not the constant under test: comparing against
+# GUEST_RUN_SLACK_SECONDS itself would pass with the constant set to zero.
+# Staging alone is two 300s fetches plus a 600s clone, and collection adds a
+# 600s bundle and a 600s upload, so the bound must clear the wall by far more
+# than the ordinary control-plane timeout.
+assert captured["timeout"] >= request["wall_seconds"] + 1800, (
+    "the run-command bound does not cover staging and collection", captured["timeout"],
+)
+
+# A result claiming an outcome written anywhere but the staging blob is a
+# diverted upload and must be refused, not collected.
+landed.unlink()
+diverted = dict(execution)
+diverted["outcome_sink"] = "file"
+diverted.pop("result_digest")
+diverted["result_digest"] = hashlib.sha256(
+    json.dumps(diverted, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+).hexdigest()
+provider.run_command_instance_view = lambda controller, vm, name: {
+    "executionState": "Succeeded",
+    "output": "FM-WORKER-RESULT:" + json.dumps(diverted, sort_keys=True, separators=(",", ":")),
+    "error": "",
+}
+try:
+    provider.mutate_execute(controller, action)
+    raise AssertionError("a diverted outcome sink was accepted")
+except provider.ProviderError as exc:
+    assert "rather than the staging blob" in str(exc), exc
+assert not landed.exists(), "a refused sink still collected a bundle"
 print("OK")
 CALLSITES
   out=$(PATH="$bin:$PATH" FAKE_AZ_LOG="$tmp/az.log" FAKE_AZ_BLOB="$fixture" \

@@ -172,10 +172,10 @@ land_outcome_bundle() {
     return 0
   fi
   error=$(result_field outcome_error)
-  if [ -n "$error" ]; then
-    echo "cloud-crewmate $ID: worker could not return its work: $error"
-    return 0
-  fi
+  # Reported, but never a reason to discard work that did arrive: a failure in
+  # one arm of the run (stream evidence, say) must not throw away a bundle the
+  # controller already downloaded and verified.
+  [ -z "$error" ] || echo "cloud-crewmate $ID: worker reported a failure during collection: $error"
   if [ -z "$(result_field outcome_present)" ]; then
     # A landing task that returns nothing is worth one line either way: the
     # operator otherwise cannot tell "read-only task" from "the crewmate

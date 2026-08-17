@@ -583,9 +583,11 @@ spec.loader.exec_module(supervisor)
 root = Path(tmp)
 repo = root / "repo"
 repo.mkdir(parents=True, exist_ok=True)
-# .fm-worker as a FILE: the stream-evidence mkdir then raises, which is the
-# post-command arm that used to escape and cost the executed marker.
-(repo / ".fm-worker").write_text("not a directory\n")
+# .fm-worker as a FILE at the worktree ROOT (where stream evidence lives, so
+# it survives the next dispatch and does not dirty the crewmate's tree): the
+# mkdir then raises, which is the post-command arm that used to escape and
+# cost the executed marker.
+(root / ".fm-worker").write_text("not a directory\n")
 counter = root / "count"
 request = {
     "argv": ["/bin/sh", "-c", "echo x >> {}".format(counter)],
@@ -604,6 +606,73 @@ STREAMARM
   stream_out=$(python3 "$tmp/stream-arm/driver.py" "$SUPERVISOR" "$tmp/stream-arm" 2>&1)
   expect_code 0 $? "a stream-persistence failure must still produce a result: $stream_out"
   assert_contains "$stream_out" "OK" "the stream-arm driver did not complete: $stream_out"
+  # The uncommitted-changes probe, driven through the REAL supervisor rather
+  # than a hand-written fixture: it must be False for a pristine repository
+  # (the supervisor writes stream evidence during the run, so this catches
+  # that evidence dirtying the crewmate's own tree) and True for a real edit.
+  local dirty_out
+  mkdir -p "$tmp/dirty-probe"
+  cat >"$tmp/dirty-probe/driver.py" <<'DIRTYPROBE'
+import importlib.util
+import subprocess
+import sys
+from pathlib import Path
+
+supervisor_path, tmp = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("fm_supervisor", supervisor_path)
+supervisor = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(supervisor)
+
+root = Path(tmp)
+repo = root / "repo"
+repo.mkdir(parents=True, exist_ok=True)
+
+
+def git(*args):
+    return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+git("init", "--quiet")
+git("config", "user.email", "a@b.c")
+git("config", "user.name", "t")
+(repo / "seed.txt").write_text("seed\n")
+git("add", "-A")
+git("commit", "--quiet", "-m", "seed")
+base = git("rev-parse", "HEAD").stdout.decode().strip()
+
+request = {
+    "argv": ["/usr/bin/true"], "wall_seconds": 60,
+    "assignment_generation": "asg-00000001", "request_digest": "a" * 64,
+    "task": "t", "task_generation": "gen-1", "cloud_instance_id": "vm",
+    "repository_binding": "b" * 64, "repository_generation": base,
+    "outcome_expected": True,
+}
+
+# A genuinely pristine repository must report NO uncommitted changes. The
+# supervisor writes its own stream evidence during this run, so this fails if
+# that evidence lands inside the crewmate's tree.
+result = supervisor.execute(request, repo, root)
+assert result["outcome_present"] is False, result
+assert result.get("outcome_uncommitted_changes") is False, (
+    "a pristine repository was reported as dirty", result,
+    subprocess.run(["git", "-C", str(repo), "status", "--porcelain"],
+                   stdout=subprocess.PIPE).stdout.decode(),
+)
+
+# And a repository the crewmate really did dirty must report True.
+(repo / "edited.txt").write_text("uncommitted work\n")
+request2 = dict(request, request_digest="c" * 64)
+dirty = supervisor.execute(request2, repo, root)
+assert dirty["outcome_present"] is False, dirty
+assert dirty.get("outcome_uncommitted_changes") is True, dirty
+print("OK")
+DIRTYPROBE
+  dirty_out=$(FM_WORKER_OUTCOME_URL=https://fixture.invalid/outcome \
+    FM_WORKER_OUTCOME_FILE="$tmp/dirty-probe/sink" \
+    python3 "$tmp/dirty-probe/driver.py" "$SUPERVISOR" "$tmp/dirty-probe" 2>&1)
+  expect_code 0 $? "the uncommitted probe must be honest: $dirty_out"
+  assert_contains "$dirty_out" "OK" "the uncommitted probe driver did not complete: $dirty_out"
   pass "the supervisor collects, bounds and proves crewmate outcomes"
 }
 

@@ -1565,6 +1565,11 @@ def parser():
     request.add_argument("--eligible", action="store_true")
     request.add_argument("--required", action="store_true", help="mark non-discretionary recovery/landing work")
 
+    withdraw_parser = sub.add_parser(
+        "withdraw", help="retire one exact queued request no worker ever took")
+    withdraw_parser.add_argument("--task", required=True)
+    withdraw_parser.add_argument("--task-generation", required=True)
+    withdraw_parser.add_argument("--confirm-withdraw", action="store_true")
     reconcile_parser = sub.add_parser("reconcile", help="plan or apply bounded convergence")
     reconcile_parser.add_argument("--apply", action="store_true")
     reconcile_parser.add_argument("--confirm-subscription")
@@ -2260,6 +2265,46 @@ def command_release(env, args):
     print("release proofs recorded; only exact idle capacity is now eligible for deallocation and reset")
 
 
+def command_withdraw(env, args):
+    """Retire a queued request that no worker ever took.
+
+    A task can finish, be cancelled, or be superseded locally long before any
+    cloud capacity is built for it, and its queue entry then keeps counting as
+    demand: reconcile sees eligible depth and builds a worker for work that is
+    already done. That is not merely wasted spend. Re-running a task that has
+    side effects outside this fleet, posting or sending or filing, repeats them.
+
+    `release` cannot cover this: it requires an ASSIGNED item with a durable
+    worker owner and a release proof describing that worker. An entry that was
+    never assigned has neither, so before this command the only way to clear one
+    was to hand-edit controller state.
+    """
+    require_id("task", args.task)
+    require_id("task generation", args.task_generation)
+    if not args.confirm_withdraw:
+        raise LifecycleError("--confirm-withdraw is required")
+    with controller_lock(env):
+        state = load_state(env)
+        key = request_key(args.task, args.task_generation)
+        item = state["queue"].get(key)
+        if item is None:
+            raise LifecycleError("withdraw requires one exact queued task generation")
+        status = item.get("status")
+        if status != "queued":
+            # Anything past `queued` has cloud capacity or a live assignment
+            # behind it, and dropping the entry would strand that worker with no
+            # queue owner. Those go out through release.
+            raise LifecycleError(
+                "withdraw refuses a task generation that is already {}; release it instead".format(status)
+            )
+        for worker in state["workers"].values():
+            if worker.get("queue_key") == key:
+                raise LifecycleError("withdraw refuses a task generation a worker still owns")
+        del state["queue"][key]
+        save_state(env, state)
+    print("withdrew queued request {}".format(key))
+
+
 def command_resume(env, args):
     if not args.confirm_resume:
         raise LifecycleError("--confirm-resume is required")
@@ -2395,6 +2440,8 @@ def main(argv=None):
         command_proof_template(env, args)
     elif args.command == "release":
         command_release(env, args)
+    elif args.command == "withdraw":
+        command_withdraw(env, args)
     elif args.command == "resume":
         command_resume(env, args)
     elif args.command == "steer":

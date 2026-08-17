@@ -1027,9 +1027,40 @@ assert status["regional_admission_ceiling_vcpus"] == 128
 assert status["author_plan_vcpus"] == 64
 assert status["specialized_shape_vcpus"] == 40
 assert status["shared_headroom_vcpus"] == 22
+# A queued request that no worker ever took keeps counting as demand, so
+# reconcile builds capacity for work that may already be finished elsewhere.
+# Withdrawing it must remove that demand without touching capacity.
+request(9)
+assert "task-9@gen-9" in controller_state()["queue"]
+plan = json.loads(run("reconcile", "--json").stdout)
+assert [item for item in plan["actions"] if item["type"] == "create"], (
+    "a queued request did not pull a worker, so the withdraw below proves nothing",
+    plan["actions"],
+)
+refused = run("withdraw", "--task", "task-9", "--task-generation", "gen-9", check=False)
+assert refused.returncode != 0 and "--confirm-withdraw" in refused.stderr, refused.stderr
+assert "task-9@gen-9" in controller_state()["queue"], "a refused withdraw dropped the entry anyway"
+run("withdraw", "--task", "task-9", "--task-generation", "gen-9", "--confirm-withdraw")
+withdrawn = controller_state()
+assert "task-9@gen-9" not in withdrawn["queue"], withdrawn["queue"]
+assert withdrawn["workers"] == {}, ("withdraw touched capacity", withdrawn["workers"])
+plan = json.loads(run("reconcile", "--json").stdout)
+assert not [item for item in plan["actions"] if item["type"] == "create"], (
+    "reconcile still plans a worker for a withdrawn request", plan["actions"],
+)
+assert run("withdraw", "--task", "task-9", "--task-generation", "gen-9",
+           "--confirm-withdraw", check=False).returncode != 0, "withdrawing twice succeeded"
+
 for number in range(1, 5):
     request(number)
 run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+# An entry with a worker behind it must go out through release, not withdraw:
+# dropping it would strand that worker with no queue owner.
+assigned_refusal = run("withdraw", "--task", "task-1", "--task-generation", "gen-1",
+                       "--confirm-withdraw", check=False)
+assert assigned_refusal.returncode != 0, "withdraw accepted a task a worker owns"
+assert "release it instead" in assigned_refusal.stderr, assigned_refusal.stderr
+assert "task-1@gen-1" in controller_state()["queue"], "a refused withdraw dropped an assigned entry"
 state = controller_state()
 fixture = fixture_state()
 assert len(state["workers"]) == 4 and len(fixture["workers"]) == 4

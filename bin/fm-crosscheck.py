@@ -317,14 +317,13 @@ def account_identity(harness: str, account_home: Path) -> str:
         if isinstance(refresh, str) and refresh.strip():
             digest = hashlib.sha256(refresh.strip().encode("utf-8")).hexdigest()
             return "claude-refresh-digest:" + digest
-        # Access-token-only credentials (the dedicated reviewer pool carries
-        # an empty refreshToken): the access token is the only account-bound
-        # material, and two homes mirroring one account share it byte for
-        # byte at any moment, which is the same-account condition screened.
-        access = oauth.get("accessToken") if isinstance(oauth, dict) else None
-        if isinstance(access, str) and access.strip():
-            digest = hashlib.sha256(access.strip().encode("utf-8")).hexdigest()
-            return "claude-access-digest:" + digest
+        # No access-token fallback: an access-token digest is token-bound,
+        # not account-bound - it changes on every ordinary refresh and two
+        # homes of one account diverge the moment their tokens differ, so it
+        # can neither power the same-account refusal nor stay pinned across
+        # a run (live crosscheck finding cc-65277c0525c7). A credential
+        # without a refresh token exposes no stable executing-account
+        # identity and is refused.
         tool_fail(
             f"Claude credential at {home} exposes no executing account identity"
         )

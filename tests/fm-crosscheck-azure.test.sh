@@ -723,11 +723,116 @@ PY2
   pass "reviewer lanes admit FIFO, spread families deterministically, prune dead waiters, and never write auth back"
 }
 
+manifest_bounds_unit() {
+  python3 - "$BRIDGE" "$REPLAY" <<'PY' || fail "Azure manifest transport bounds contract failed"
+import importlib.util
+import base64
+import gzip
+from pathlib import Path
+import sys
+import tempfile
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+bridge = load("bridge", sys.argv[1])
+replay = load("replay", sys.argv[2])
+
+# Producer/consumer agreement through the REAL functions on both sides: the
+# exact string encoded_manifest emits must materialize byte-identically
+# through the replay guest's materialize_manifest.
+files = {
+    ".crosscheck/reproductions/proof.sh": b"#!/usr/bin/env bash\nprintf 'ok\\n'\n",
+    ".crosscheck/mutations/proof.patch": b"diff --git a/value.py b/value.py\n",
+}
+encoded = bridge.encoded_manifest(files)
+assert encoded == bridge.encoded_manifest(files), "encoded manifest is not deterministic"
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp).resolve()
+    replay.materialize_manifest(root, encoded)
+    for relative, body in files.items():
+        assert (root / relative).read_bytes() == body, relative
+
+# Producer bound: an over-limit manifest refuses at build time with the
+# parameter-bound error instead of reaching the control plane.
+import hashlib
+chunk = b""
+seed = b"fm-bound"
+while len(chunk) < 80 * 1024:
+    seed = hashlib.sha256(seed).digest()
+    chunk += seed
+try:
+    bridge.encoded_manifest({".crosscheck/reproductions/big.sh": chunk})
+except bridge.BridgeError as exc:
+    assert "control-plane parameter bound" in str(exc), exc
+else:
+    raise AssertionError("oversized manifest did not refuse the parameter bound")
+
+# Consumer bound: a small compressed payload that expands past
+# MAX_MANIFEST_JSON_BYTES is rejected without being trusted; the bounded
+# incremental read means the guard fires on the bound itself.
+bomb = base64.b64encode(
+    gzip.compress(b"0" * (replay.MAX_MANIFEST_JSON_BYTES + 2), mtime=0)
+).decode("ascii")
+with tempfile.TemporaryDirectory() as tmp:
+    try:
+        replay.materialize_manifest(Path(tmp).resolve(), bomb)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("decompression bomb was not rejected")
+PY
+  pass "manifest transport bounds hold through the real producer and consumer"
+}
+
+template_expiry_render_unit() {
+  python3 - "$TEMPLATE" <<'PY' || fail "safety-shutdown expiry render contract failed"
+import json
+import re
+import sys
+
+template = json.load(open(sys.argv[1]))
+command = next(
+    item for item in template["resources"]
+    if item["type"] == "Microsoft.Compute/virtualMachines/runCommands"
+    and "safety-shutdown" in item["name"]
+)
+expression = command["properties"]["source"]["script"]
+match = re.fullmatch(
+    r"\[format\(replace\('(.*)', '\|', uriComponentToString\('%0A'\)\), "
+    r"parameters\('expiryUtc'\)\)\]",
+    expression,
+    re.S,
+)
+assert match, "safety-shutdown script expression changed shape"
+source = match.group(1)
+# The '|' sentinel becomes a newline at render time, so the source itself may
+# never legitimately contain a pipe character as shell syntax; and the old
+# live breakage (a literal backslash-n that ARM format() never interprets)
+# must never come back.
+assert "\\n" not in source, "literal backslash-n reappeared in the expiry script"
+rendered = source.replace("|", "\n").format("2027-01-01T00:00:00Z")
+lines = rendered.split("\n")
+assert lines[0] == "set -eu"
+assert "ExecStart=/usr/sbin/shutdown -h now" in lines
+assert "OnCalendar=2027-01-01T00:00:00Z" in lines
+assert "systemctl enable --now fm-crosscheck-expiry.timer" in lines
+assert lines.count("EOF") == 2, "heredoc terminators did not render as their own lines"
+assert "|" not in rendered
+PY
+  pass "the safety-shutdown expiry script renders real newlines with the exact unit text"
+}
+
 static_contract
 adapter_mode_unit
 identity_outcome_unit
 account_and_cleanup_identity_unit
 bridge_security_unit
+manifest_bounds_unit
+template_expiry_render_unit
 replay_positive_and_failure_unit
 shared_capacity_unit
 lane_queue_unit

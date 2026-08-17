@@ -1,8 +1,10 @@
 # Azure worker crewmate runtime and payload plane (design)
 
-Status: DESIGN. Nothing in this document is implemented; docs/azure-workers.md
-remains the authority for everything the worker lane already does. This
-document owns the design for the missing pieces between "a worker executes a
+Status: PARTLY BUILT. D1-D3 (runtime image, payload plane, worker-coordinate
+entrypoint) and D5 (landing v1) have shipped; docs/azure-workers.md is the
+authority for their built behavior and this document keeps only the decisions
+and what remains. D6 (release receipts before cloud teardown) is still open.
+This document owns the design for the pieces between "a worker executes a
 digest-bound argv" (proven live 2026-08-17 on vm-fm7c799d-wkr-01) and "a real
 pi crewmate does task work in the cloud".
 
@@ -125,7 +127,7 @@ so the slot deallocates inside its cooldown instead of riding the TTL.
 3. Flip: workerImageId parameter supplied; one live crewmate smoke on a real
    task; the crosscheck lane reviews the whole stack (it gates its own
    producer now).
-4. Landing: outcome bundle + monitor fetch + local push (D5), then D6.
+4. Landing: outcome bundle + monitor fetch + local push (D5, SHIPPED), then D6.
 5. Wide soak (8 then 16 lanes) only after 3 and 4 hold.
 
 ## Non-goals

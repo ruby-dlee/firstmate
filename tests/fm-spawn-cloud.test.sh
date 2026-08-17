@@ -259,6 +259,13 @@ if request["operation"] == "mutate":
                 "stdout_sha256": "a" * 64, "stderr_sha256": "b" * 64,
                 "stdout_truncated": False, "stderr_truncated": False,
             }
+            if request_value.get("outcome_expected"):
+                # The fixture crewmate commits nothing, which is the disposition
+                # a supervisor that understands the outcome contract reports.
+                execution.update({
+                    "outcome_present": False, "outcome_error": "",
+                    "outcome_commits": 0, "outcome_sha256": "", "outcome_bytes": 0,
+                })
             execution["result_digest"] = hashlib.sha256(canonical(execution)).hexdigest()
             result = {"idempotency_key": key, "action": kind, "worker": state["workers"][slot], "execution": execution}
         else:
@@ -743,8 +750,81 @@ test_monitor_stands_down_when_dispatch_already_claimed() {
   pass "the monitor stands down when the execute dispatch is already claimed"
 }
 
+stage_landing_case() {
+  # Build a REAL round trip: a source worktree, a clone that commits like a
+  # crewmate would, and the outcome bundle the supervisor would have written.
+  local id=$1 src=$2 outcome=$3 base
+  fm_git_init_commit "$src"
+  base=$(git -C "$src" rev-parse HEAD)
+  git clone --quiet "$src" "$CASE_DIR/worker-copy"
+  fm_git_identity "$CASE_DIR/worker-copy"
+  printf 'crewmate work\n' > "$CASE_DIR/worker-copy/outcome.txt"
+  git -C "$CASE_DIR/worker-copy" add -A
+  git -C "$CASE_DIR/worker-copy" commit --quiet -m "crewmate work"
+  mkdir -p "$outcome"
+  git -C "$CASE_DIR/worker-copy" bundle create "$outcome/outcome.bundle" "$base..HEAD" >/dev/null 2>&1
+  printf '%s\n' "$src" > "$HOME_DIR/state/$id.cloud-worktree"
+  python3 - "$HOME_DIR/state/$id.worker-result.json" "$base" <<'PY'
+import json
+import sys
+
+path, base = sys.argv[1:]
+json.dump({
+    "schema": "fm.worker-execution-result/v1",
+    "task": "task", "task_generation": "gen-1", "assignment_generation": "asg-00000001",
+    "cloud_instance_id": "vm", "repository_binding": "b" * 64, "repository_generation": base,
+    "request_digest": "d" * 64, "result_digest": "e" * 64, "exit_code": 0, "timed_out": False,
+    "outcome_present": True, "outcome_error": "", "outcome_commits": 1,
+    "outcome_sha256": "f" * 64, "outcome_bytes": 1,
+}, open(path, "w"), sort_keys=True, separators=(",", ":"))
+PY
+  printf '%s\n' "$base"
+}
+
+test_monitor_lands_the_outcome_bundle() {
+  # Landing v1: when the digest-verified outcome bundle is home and the leased
+  # worktree still sits on the dispatched generation, the monitor really
+  # fast-forwards it, so the ordinary local landing flow has the work.
+  local record id src base
+  id=cloud-land-c14
+  record=$(make_cloud_case landing-lane "$id")
+  read_cloud_case "$record"
+  src="$CASE_DIR/leased"
+  base=$(stage_landing_case "$id" "$src" "$HOME_DIR/state/$id.cloud-outcome")
+  FM_HOME="$HOME_DIR" FM_SPAWN_CLOUD_MONITOR_INTERVAL_SECONDS=1 \
+    "$ROOT/bin/fm-spawn-cloud-monitor.sh" "$id" gen-1 > "$CASE_DIR/monitor.log" 2>&1
+  expect_code 0 $? "the monitor should exit cleanly on a landed result: $(cat "$CASE_DIR/monitor.log")"
+  assert_grep 'landed 1 commit' "$CASE_DIR/monitor.log" "the monitor did not report the landing"
+  assert_present "$src/outcome.txt" "the crewmate's commit did not reach the leased worktree"
+  test "$(git -C "$src" rev-parse HEAD)" != "$base" \
+    || fail "the leased worktree was never fast-forwarded"
+  pass "the monitor lands a verified outcome bundle into the leased worktree"
+}
+
+test_monitor_keeps_the_outcome_when_the_worktree_moved() {
+  # If the local side moved on, a silent fast-forward would be wrong: the
+  # bundle is kept and the operator is told where it is.
+  local record id src
+  id=cloud-land-c15
+  record=$(make_cloud_case landing-moved-lane "$id")
+  read_cloud_case "$record"
+  src="$CASE_DIR/leased"
+  stage_landing_case "$id" "$src" "$HOME_DIR/state/$id.cloud-outcome" >/dev/null
+  printf 'local divergence\n' > "$src/local.txt"
+  git -C "$src" add -A
+  git -C "$src" commit --quiet -m "local work after dispatch"
+  FM_HOME="$HOME_DIR" FM_SPAWN_CLOUD_MONITOR_INTERVAL_SECONDS=1 \
+    "$ROOT/bin/fm-spawn-cloud-monitor.sh" "$id" gen-1 > "$CASE_DIR/monitor.log" 2>&1
+  expect_code 0 $? "the monitor should exit cleanly: $(cat "$CASE_DIR/monitor.log")"
+  assert_grep 'kept at' "$CASE_DIR/monitor.log" "the monitor did not report where it kept the outcome"
+  assert_absent "$src/outcome.txt" "the monitor landed onto a worktree that had moved"
+  pass "the monitor refuses to land onto a worktree that moved off the dispatched generation"
+}
+
 test_cloud_switch_off_keeps_the_local_path_and_metadata_shape
 test_cloud_spawn_places_worker_and_runs_the_entrypoint
+test_monitor_lands_the_outcome_bundle
+test_monitor_keeps_the_outcome_when_the_worktree_moved
 test_cloud_spawn_stays_durably_queued_without_admission
 test_cloud_monitor_launch_carries_fm_home
 test_respawn_sweeps_stale_cloud_artifacts

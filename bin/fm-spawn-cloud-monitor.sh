@@ -121,6 +121,7 @@ dispatch_converged_execute() {
     payload_args=()
     if [ -d "$STATE/$ID.cloud-payload" ] && [ -d "$STATE/$ID.cloud-account" ]; then
       payload_args=(--payload-dir "$STATE/$ID.cloud-payload" --account-dir "$STATE/$ID.cloud-account")
+      [ ! -d "$STATE/$ID.cloud-outcome" ] || payload_args+=(--outcome-dir "$STATE/$ID.cloud-outcome")
     fi
     nohup env FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
       "$SCRIPT_DIR/fm-worker-lifecycle.sh" execute \
@@ -133,11 +134,75 @@ dispatch_converged_execute() {
   )
 }
 
+result_field() {
+  python3 - "$RESULT" "$1" <<'PY'
+import json
+import sys
+
+path, field = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        result = json.load(handle)
+except (OSError, ValueError):
+    raise SystemExit(0)
+value = result.get(field)
+if isinstance(value, bool):
+    print("1" if value else "")
+elif value is not None:
+    print(value)
+PY
+}
+
+land_outcome_bundle() {
+  # Landing v1: the crewmate committed on the worker's copy of the leased
+  # worktree and the bundle came home digest-verified. The landing authority
+  # stays local, so all that happens here is a fast-forward of the same branch
+  # the bundle was cut from; the ordinary landing flow (push, PR, teardown's
+  # landed-work check) then proceeds unchanged.
+  local bundle wt base head error
+  error=$(result_field outcome_error)
+  if [ -n "$error" ]; then
+    echo "cloud-crewmate $ID: worker could not return its work: $error"
+    return 0
+  fi
+  [ -n "$(result_field outcome_present)" ] || return 0
+  bundle=$STATE/$ID.cloud-outcome/outcome.bundle
+  if [ ! -s "$bundle" ]; then
+    echo "cloud-crewmate $ID: result claims an outcome but no verified bundle landed locally"
+    return 0
+  fi
+  wt=$(cat "$STATE/$ID.cloud-worktree" 2>/dev/null) || wt=
+  if [ -z "$wt" ] || [ ! -d "$wt" ]; then
+    echo "cloud-crewmate $ID: outcome bundle is at $bundle but the leased worktree is gone; landing skipped"
+    return 0
+  fi
+  base=$(result_field repository_generation)
+  head=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || head=
+  if [ -z "$base" ] || [ "$head" != "$base" ]; then
+    echo "cloud-crewmate $ID: local worktree moved off $base since dispatch; outcome kept at $bundle for manual landing"
+    return 0
+  fi
+  if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+    echo "cloud-crewmate $ID: local worktree has uncommitted changes; outcome kept at $bundle for manual landing"
+    return 0
+  fi
+  if ! git -C "$wt" fetch --quiet "$bundle" HEAD 2>&1; then
+    echo "cloud-crewmate $ID: outcome bundle could not be fetched into $wt; kept at $bundle"
+    return 0
+  fi
+  if ! git -C "$wt" merge --ff-only FETCH_HEAD 2>&1; then
+    echo "cloud-crewmate $ID: outcome bundle is not a fast-forward of $base; kept at $bundle"
+    return 0
+  fi
+  echo "cloud-crewmate $ID: landed $(result_field outcome_commits) commit(s) into $wt"
+}
+
 shown_bytes=0
 while :; do
   if [ -s "$RESULT" ]; then
     echo "cloud-crewmate $ID: worker result landed"
     python3 -m json.tool "$RESULT" 2>/dev/null | head -40 || cat "$RESULT"
+    land_outcome_bundle
     exit 0
   fi
   status=$(queue_status)

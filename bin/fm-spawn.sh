@@ -3990,9 +3990,9 @@ if [ "$SPAWN_CLOUD" = azure ]; then
   # execute), or logs. Swept HERE, before the tracking pane exists, so the
   # new monitor can never observe them.
   rm -f "$STATE/$ID.cloud-entrypoint" "$STATE/$ID.cloud-env" \
-    "$STATE/$ID.cloud-execute-dispatched" \
+    "$STATE/$ID.cloud-execute-dispatched" "$STATE/$ID.cloud-worktree" \
     "$STATE/$ID.worker-result.json" "$STATE/$ID.worker-execute.log"
-  rm -rf "$STATE/$ID.cloud-payload" "$STATE/$ID.cloud-account"
+  rm -rf "$STATE/$ID.cloud-payload" "$STATE/$ID.cloud-account" "$STATE/$ID.cloud-outcome"
   # The Herdr server starts endpoint panes in its closed environment, so the
   # monitor's own FM_HOME (and any state override the spawn ran with) must
   # travel inside the launch string; without FM_HOME the monitor's
@@ -4290,7 +4290,12 @@ spawn_cloud_persist_convergence_artifacts() {
     # encrypted account disk. Both directories are digest-manifested into
     # the execute request by the lifecycle, so every staged byte is verified
     # on the guest before the entrypoint runs.
-    install -d -m 0700 "$STATE/$ID.cloud-payload" "$STATE/$ID.cloud-account" || exit 1
+    install -d -m 0700 "$STATE/$ID.cloud-payload" "$STATE/$ID.cloud-account" \
+      "$STATE/$ID.cloud-outcome" || exit 1
+    # The landing side of the round trip: the leased local worktree this
+    # bundle came from is where the crewmate's commits come back to, and the
+    # tracking monitor (which outlives the spawn) needs it by path.
+    printf '%s\n' "$WT" > "$STATE/$ID.cloud-worktree" || exit 1
     git -C "$WT" bundle create "$STATE/$ID.cloud-payload/repo.bundle" HEAD >/dev/null 2>&1 || {
       echo "error: cloud payload repository bundle failed for $ID" >&2
       exit 1
@@ -4337,8 +4342,8 @@ spawn_cloud_dispatch() {
     # No durable queue entry exists, so the convergence artifacts have no
     # owner; remove them (including the copied provider credential) with the
     # rolled-back spawn.
-    rm -f "$STATE/$ID.cloud-entrypoint" "$STATE/$ID.cloud-env"
-    rm -rf "$STATE/$ID.cloud-payload" "$STATE/$ID.cloud-account"
+    rm -f "$STATE/$ID.cloud-entrypoint" "$STATE/$ID.cloud-env" "$STATE/$ID.cloud-worktree"
+    rm -rf "$STATE/$ID.cloud-payload" "$STATE/$ID.cloud-account" "$STATE/$ID.cloud-outcome"
     echo "error: cloud worker request was refused for $ID" >&2
     return 1
   }
@@ -4369,6 +4374,7 @@ spawn_cloud_dispatch() {
     --task "$ID" --task-generation "$SPAWN_GENERATION_ID" \
     --assignment-generation "$assignment" --wall-seconds "$wall" \
     --payload-dir "$STATE/$ID.cloud-payload" --account-dir "$STATE/$ID.cloud-account" \
+    --outcome-dir "$STATE/$ID.cloud-outcome" \
     --confirm-execute --confirm-subscription "${FM_AZURE_SUBSCRIPTION_ID:-}" \
     -- /bin/bash -lc "$CLOUD_WORKER_LAUNCH" \
     > "$STATE/$ID.worker-result.json" 2> "$STATE/$ID.worker-execute.log" < /dev/null &

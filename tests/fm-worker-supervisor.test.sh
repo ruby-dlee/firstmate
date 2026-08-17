@@ -370,8 +370,174 @@ PY
   pass "the supervisor stages digest-bound payload, account, and repository exactly"
 }
 
+run_supervisor_outcome_collection() {
+  # The REAL supervisor collects the REAL commits a task command makes in the
+  # staged repository, bundles them against the bound generation, and the
+  # bundle really fast-forwards the source repository the payload came from.
+  local tmp work account src head out status bundle sink
+  local home account_binding worktree_binding repo_binding
+  fm_test_tmproot_into tmp fm-worker-supervisor-outcome
+  work="$tmp/work"
+  account="$tmp/account"
+  src="$tmp/src"
+  mkdir -p "$work" "$account"
+  fm_git_init_commit "$src"
+  head=$(git -C "$src" rev-parse HEAD)
+  git -C "$src" bundle create "$tmp/repo.bundle" HEAD >/dev/null 2>&1
+  printf 'do the task\n' > "$tmp/brief.md"
+  printf '{"auth":"fixture"}\n' > "$tmp/auth.json"
+  home=$(printf home | shasum -a 256 | awk '{print $1}')
+  account_binding=$(printf account | shasum -a 256 | awk '{print $1}')
+  worktree_binding=$(printf worktree | shasum -a 256 | awk '{print $1}')
+  repo_binding=$(printf repo | shasum -a 256 | awk '{print $1}')
+  sink="$tmp/outcome.bundle"
+  supervisor_outcome_request() {
+    # $1 = request path, $2 = argv command, $3 = outcome_expected (1/0),
+    # $4 = include payload manifests (1/0)
+    python3 - "$tmp" "$home" "$account_binding" "$worktree_binding" "$repo_binding" "$head" "$@" <<'PY'
+import hashlib
+import io
+import json
+import sys
+import tarfile
+from pathlib import Path
+
+tmp, home, account_b, worktree_b, repo_b, head, target, command, expected, with_payload = sys.argv[1:]
+root = Path(tmp)
+
+
+def archive(names):
+    files = {}
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as handle:
+        for name in names:
+            body = (root / name).read_bytes()
+            info = tarfile.TarInfo(name=name)
+            info.size = len(body)
+            handle.addfile(info, io.BytesIO(body))
+            files[name] = {"sha256": hashlib.sha256(body).hexdigest(), "bytes": len(body)}
+    return buffer.getvalue(), files
+
+
+payload_bytes, payload_files = archive(["repo.bundle", "brief.md"])
+account_bytes, account_files = archive(["auth.json"])
+(root / "payload.tar.gz").write_bytes(payload_bytes)
+(root / "account.tar.gz").write_bytes(account_bytes)
+request = {
+    "schema": "fm.worker-execution/v1",
+    "home_binding": home,
+    "task": "task-one",
+    "task_generation": "task-gen",
+    "assignment_generation": "asg-00000001",
+    "account_binding": account_b,
+    "worktree_binding": worktree_b,
+    "repository_binding": repo_b,
+    "repository_generation": head,
+    "cloud_instance_id": "vm-instance",
+    "argv": ["/bin/sh", "-c", command],
+    "wall_seconds": 60,
+}
+if with_payload == "1":
+    request["payload_files"] = payload_files
+    request["account_files"] = account_files
+if expected == "1":
+    request["outcome_expected"] = True
+unsigned = dict(request)
+request["request_digest"] = hashlib.sha256(
+    json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+).hexdigest()
+Path(target).write_text(json.dumps(request))
+meta = {
+    "payload": {"sha256": hashlib.sha256(payload_bytes).hexdigest(), "bytes": len(payload_bytes)},
+    "account": {"sha256": hashlib.sha256(account_bytes).hexdigest(), "bytes": len(account_bytes)},
+}
+(root / "staging-meta.json").write_text(json.dumps(meta))
+PY
+  }
+  supervisor_outcome_run() {
+    # $1 = request, $2 = result, $3 = worktree, $4 = executed dir,
+    # $5 = outcome sink ("" arms nothing)
+    local payload_sha payload_bytes account_sha account_bytes
+    mkdir -p "$3"
+    payload_sha=$(python3 -c "import json;print(json.load(open('$tmp/staging-meta.json'))['payload']['sha256'])")
+    payload_bytes=$(python3 -c "import json;print(json.load(open('$tmp/staging-meta.json'))['payload']['bytes'])")
+    account_sha=$(python3 -c "import json;print(json.load(open('$tmp/staging-meta.json'))['account']['sha256'])")
+    account_bytes=$(python3 -c "import json;print(json.load(open('$tmp/staging-meta.json'))['account']['bytes'])")
+    FM_WORKER_HOME_BINDING="$home" FM_WORKER_TASK=task-one FM_WORKER_TASK_GENERATION=task-gen \
+      FM_WORKER_ASSIGNMENT_GENERATION=asg-00000001 FM_WORKER_ACCOUNT_BINDING="$account_binding" \
+      FM_WORKER_WORKTREE_BINDING="$worktree_binding" FM_WORKER_REPOSITORY_BINDING="$repo_binding" \
+      FM_WORKER_REPOSITORY_GENERATION="$head" FM_WORKER_CLOUD_INSTANCE_ID=vm-instance \
+      FM_WORKER_WORKTREE="$3" FM_WORKER_ACCOUNT_HOME="$account" \
+      FM_WORKER_EXECUTED_DIR="$4" \
+      FM_WORKER_PAYLOAD_URL="https://fixture.invalid/payload" FM_WORKER_PAYLOAD_SHA256="$payload_sha" \
+      FM_WORKER_PAYLOAD_BYTES="$payload_bytes" FM_WORKER_PAYLOAD_FILE="$tmp/payload.tar.gz" \
+      FM_WORKER_ACCOUNT_URL="https://fixture.invalid/account" FM_WORKER_ACCOUNT_SHA256="$account_sha" \
+      FM_WORKER_ACCOUNT_BYTES="$account_bytes" FM_WORKER_ACCOUNT_FILE="$tmp/account.tar.gz" \
+      FM_WORKER_OUTCOME_FILE="$5" \
+      python3 "$SUPERVISOR" execute --request "$1" --result "$2" 2>&1
+  }
+  # A crewmate that commits: the outcome must carry exactly its new commits.
+  supervisor_outcome_request "$tmp/request.json" \
+    'git config user.email a@b.c; git config user.name t; echo work >> file.txt; git add -A; git commit -qm "crewmate work"' 1 1
+  out=$(supervisor_outcome_run "$tmp/request.json" "$tmp/result.json" "$work" "$tmp/executed" "$sink")
+  status=$?
+  expect_code 0 "$status" "outcome-collecting execution should succeed: $out"
+  test -s "$sink" || fail "the outcome bundle was never written"
+  python3 - "$tmp/result.json" "$sink" <<'PY' || fail "the recorded outcome does not describe the written bundle"
+import hashlib
+import json
+import sys
+
+result = json.load(open(sys.argv[1]))
+body = open(sys.argv[2], "rb").read()
+assert result["outcome_present"] is True, result
+assert result["outcome_error"] == "", result
+assert result["outcome_commits"] == 1, result
+assert result["outcome_bytes"] == len(body), result
+assert result["outcome_sha256"] == hashlib.sha256(body).hexdigest(), result
+unsigned = dict(result)
+supplied = unsigned.pop("result_digest")
+canonical = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+assert supplied == hashlib.sha256(canonical).hexdigest(), "outcome fields are outside the result digest"
+PY
+  # The whole point of the bundle: it lands on the source repository.
+  git -C "$src" fetch --quiet "$sink" HEAD || fail "the outcome bundle does not fetch into the source repository"
+  git -C "$src" merge --ff-only FETCH_HEAD >/dev/null 2>&1 \
+    || fail "the outcome bundle is not a fast-forward of the bound generation"
+  test -f "$src/file.txt" || fail "the crewmate's committed file did not land in the source repository"
+  # A read-only task reports no outcome and no error, and writes no bundle.
+  rm -f "$sink"
+  supervisor_outcome_request "$tmp/request-ro.json" 'true' 1 1
+  out=$(supervisor_outcome_run "$tmp/request-ro.json" "$tmp/result-ro.json" "$tmp/work-ro" "$tmp/executed-ro" "$tmp/sink-ro")
+  status=$?
+  expect_code 0 "$status" "read-only execution should succeed: $out"
+  test ! -e "$tmp/sink-ro" || fail "a read-only task must not upload an outcome bundle"
+  python3 -c "
+import json,sys
+r=json.load(open('$tmp/result-ro.json'))
+assert r['outcome_present'] is False, r
+assert r['outcome_error'] == '', r
+assert r['outcome_commits'] == 0, r
+" || fail "a read-only task reported a wrong outcome disposition"
+  # Arming an outcome without a staged repository is refused before the argv runs.
+  supervisor_outcome_request "$tmp/request-nopayload.json" 'touch "$PWD/ran"' 1 0
+  out=$(supervisor_outcome_run "$tmp/request-nopayload.json" "$tmp/result-np.json" "$tmp/work-np" "$tmp/executed-np" "$tmp/sink-np")
+  status=$?
+  expect_code 2 "$status" "an outcome without a staged repository should be refused"
+  assert_contains "$out" "outcome cannot be collected without a staged repository" "the refusal should name the missing repository"
+  # An expected outcome with no staging armed at all is refused, so a stripped
+  # protected parameter cannot silently downgrade a landing task.
+  supervisor_outcome_request "$tmp/request-nourl.json" 'true' 1 1
+  out=$(supervisor_outcome_run "$tmp/request-nourl.json" "$tmp/result-nu.json" "$tmp/work-nu" "$tmp/executed-nu" "")
+  status=$?
+  expect_code 2 "$status" "an unarmed outcome lane should be refused"
+  assert_contains "$out" "no outcome staging URL was armed" "the refusal should name the unarmed staging lane"
+  pass "the supervisor collects, bounds and proves crewmate outcomes"
+}
+
 run_supervisor_controls
 run_supervisor_replay_controls
 run_supervisor_steer_controls
 run_supervisor_payload_staging
+run_supervisor_outcome_collection
 echo "# fm-worker-supervisor.test.sh: all assertions passed"

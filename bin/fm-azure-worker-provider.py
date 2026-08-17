@@ -44,6 +44,10 @@ REQUEST_SCHEMA = "fm.worker-provider-request/v1"
 RESPONSE_SCHEMA = "fm.worker-provider-response/v1"
 INVENTORY_SCHEMA = "fm.worker-provider-inventory/v1"
 MAX_INPUT_BYTES = 2 * 1024 * 1024
+# The one blob name the guest may create, and the ceiling the supervisor
+# enforces before it uploads; both sides bound the same transfer.
+OUTCOME_BLOB_NAME = "outcome.bundle"
+MAX_OUTCOME_BYTES = 256 * 1024 * 1024
 AZ_TIMEOUT_SECONDS = 300
 # A guest run is staging (archive fetches plus the repository clone) BEFORE the
 # wall starts, then the wall, then collection after it ends. Any bound that has
@@ -1261,7 +1265,15 @@ def upload_bytes_blob(controller, account, container, name, payload, tags):
     return digest
 
 
-def blob_read_sas(controller, account, container, name, expiry_seconds):
+def blob_sas(controller, account, container, name, expiry_seconds, permissions="r"):
+    """One short-lived user-delegation SAS over exactly one blob name.
+
+    Inbound staging uses "r"; the outcome lane uses "cw", which lets the guest
+    create and write that one blob and nothing else - it cannot read, list, or
+    overwrite any other name in the container.
+    """
+    if permissions not in ("r", "cw"):
+        raise ProviderError("worker blob SAS permissions are not one of the reviewed sets")
     expiry = (
         dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=expiry_seconds)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1270,7 +1282,7 @@ def blob_read_sas(controller, account, container, name, expiry_seconds):
         [
             "storage", "blob", "generate-sas", "--as-user", "--auth-mode", "login",
             "--https-only", "--account-name", account, "--container-name", container,
-            "--name", name, "--permissions", "r", "--expiry", expiry,
+            "--name", name, "--permissions", permissions, "--expiry", expiry,
             "--full-uri",
         ],
         check=False,
@@ -1278,6 +1290,32 @@ def blob_read_sas(controller, account, container, name, expiry_seconds):
     if rc != 0 or not isinstance(uri, str) or not uri.strip().startswith("https://"):
         raise ProviderError("exact worker payload SAS creation failed: {}".format(stderr))
     return str(uri).strip()
+
+
+def download_outcome_bundle(controller, account, container, name, expected_digest, expected_bytes, target):
+    """Pull the guest-written outcome blob to the controller and prove it is
+    exactly the bytes the digest-bound result committed to."""
+    target = Path(target)
+    if target.parent.is_symlink() or not target.parent.is_dir():
+        raise ProviderError("outcome directory is unavailable")
+    fd, staging = tempfile.mkstemp(prefix="fm-worker-outcome-", dir=str(target.parent))
+    os.close(fd)
+    try:
+        os.chmod(staging, 0o600)
+        _, rc, stderr = az(controller, [
+            "storage", "blob", "download", "--auth-mode", "login", "--account-name", account,
+            "--container-name", container, "--name", name, "--file", staging, "--overwrite",
+        ], check=False)
+        if rc != 0:
+            raise ProviderError("outcome bundle download failed: {}".format(stderr))
+        body = Path(staging).read_bytes()
+        if len(body) != expected_bytes or hashlib.sha256(body).hexdigest() != expected_digest:
+            raise ProviderError("outcome bundle differs from the digest-bound result")
+        os.replace(staging, str(target))
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            Path(staging).unlink()
+    return len(body)
 
 
 def staged_directory_archive(directory, manifest, label):
@@ -1800,7 +1838,7 @@ def mutate_reset(controller, action):
     # content is bound through the request manifests, never identity-fenced),
     # and the account archive fronts provider credentials: both are removed
     # unconditionally at reset, tolerating absence.
-    for blob_name in ("payload.tar.gz", "account.tar.gz"):
+    for blob_name in ("payload.tar.gz", "account.tar.gz", OUTCOME_BLOB_NAME):
         _, rc, stderr = az(controller, [
             "storage", "blob", "delete", "--auth-mode", "login",
             "--account-name", os.environ.get("FM_AZURE_STORAGE_NAME", ""),
@@ -1878,7 +1916,7 @@ def mutate_execute(controller, action):
             archive_digest = upload_bytes_blob(
                 controller, storage, names["state-container"], blob_name, archive, tags,
             )
-            sas_url = blob_read_sas(
+            sas_url = blob_sas(
                 controller, storage, names["state-container"], blob_name, sas_seconds,
             )
             if not re.fullmatch(r"https://[A-Za-z0-9.:/_?&=%+-]+", sas_url):
@@ -1889,6 +1927,17 @@ def mutate_execute(controller, action):
                 prefix + "SHA256=" + archive_digest,
                 prefix + "BYTES=" + str(len(archive)),
             ]
+    if request.get("outcome_expected"):
+        # Landing v1 return path: the guest gets create/write on exactly one
+        # blob name and no forge or provider credential at all. What it writes
+        # is only landable after the digest in the signed result matches.
+        outcome_sas = blob_sas(
+            controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
+            OUTCOME_BLOB_NAME, int(request["wall_seconds"]) + 1800, permissions="cw",
+        )
+        if not re.fullmatch(r"https://[A-Za-z0-9.:/_?&=%+-]+", outcome_sas):
+            raise ProviderError("outcome staging SAS carries unsupported characters")
+        protected_parameters.append("FM_WORKER_OUTCOME_URL=" + outcome_sas)
     request_json = json.dumps(request, sort_keys=True, separators=(",", ":"))
     bindings = action["bindings"]
     script = """set -eu
@@ -1945,6 +1994,21 @@ printf 'FM-WORKER-RESULT:%s\\n' "$(cat /var/lib/firstmate-worker/result.json)"
     unsigned.pop("result_digest", None)
     if supplied != hashlib.sha256(canonical_bytes(unsigned)).hexdigest():
         raise ProviderError("private worker result digest is not exact")
+    if request.get("outcome_expected") and execution.get("outcome_present"):
+        outcome_target = action.get("outcome_dir")
+        if not outcome_target:
+            raise ProviderError("execution collected an outcome with no controller directory to land it in")
+        digest_claim = execution.get("outcome_sha256")
+        bytes_claim = execution.get("outcome_bytes")
+        if not isinstance(digest_claim, str) or not re.fullmatch(r"[0-9a-f]{64}", digest_claim):
+            raise ProviderError("execution outcome digest is malformed")
+        if not isinstance(bytes_claim, int) or isinstance(bytes_claim, bool) or not 0 < bytes_claim <= MAX_OUTCOME_BYTES:
+            raise ProviderError("execution outcome size is malformed or unbounded")
+        download_outcome_bundle(
+            controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
+            OUTCOME_BLOB_NAME, digest_claim, bytes_claim,
+            Path(outcome_target) / OUTCOME_BLOB_NAME,
+        )
     upload_json_blob(
         controller, os.environ.get("FM_AZURE_STORAGE_NAME", ""), names["state-container"],
         names["staging-result"], execution, tags, overwrite=True,

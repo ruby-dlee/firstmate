@@ -80,6 +80,20 @@ def read_request(path):
     wall = request.get("wall_seconds")
     if not isinstance(wall, int) or isinstance(wall, bool) or not 1 <= wall <= MAX_WALL_SECONDS:
         raise SupervisorError("execution wall deadline is invalid")
+    outcome_expected = request.get("outcome_expected", False)
+    if not isinstance(outcome_expected, bool):
+        raise SupervisorError("execution outcome expectation is malformed")
+    if outcome_expected:
+        # An outcome is bundled out of the staged repository, so the request
+        # that arms it must also be the one that stages that repository.
+        if not isinstance(request.get("payload_files"), dict):
+            raise SupervisorError("an outcome cannot be collected without a staged repository")
+        # The URL is an unbound protected parameter; refusing here means a
+        # control-plane actor cannot silently downgrade a landing task into a
+        # fire-and-forget one by withholding it.
+        armed = os.environ.get("FM_WORKER_OUTCOME_URL", "").startswith("https://")
+        if not armed and not os.environ.get("FM_WORKER_OUTCOME_FILE", ""):
+            raise SupervisorError("execution expects an outcome but no outcome staging URL was armed")
     return request
 
 
@@ -116,6 +130,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 MAX_ARCHIVE_BYTES = 600 * 1024 * 1024
+MAX_OUTCOME_BYTES = 256 * 1024 * 1024
 SAFE_STAGED_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
@@ -224,6 +239,92 @@ def stage_payload(request, worktree, account_home):
     return repo
 
 
+def git_in(repo, *arguments, timeout=600):
+    return subprocess.run(
+        ["git", "-C", str(repo), *arguments],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=timeout, check=False,
+    )
+
+
+def put_outcome_blob(body):
+    """Upload the outcome bundle to the single write-scoped staging URL the
+    execute request armed.  The URL arrives as a protected run-command
+    parameter, so it is never readable off the control plane, and it grants
+    create/write on exactly one blob name for the wall's duration."""
+    local_sink = os.environ.get("FM_WORKER_OUTCOME_FILE", "")
+    if local_sink:
+        # Hermetic test lane: the blob is a local file instead of a network
+        # PUT; everything the result records about the bytes is unchanged.
+        Path(local_sink).write_bytes(body)
+        return
+    url = os.environ.get("FM_WORKER_OUTCOME_URL", "")
+    if not url.startswith("https://"):
+        raise SupervisorError("outcome staging environment is incomplete")
+    request = urllib.request.Request(
+        url, data=body, method="PUT",
+        headers={
+            "x-ms-blob-type": "BlockBlob",
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(body)),
+        },
+    )
+    opener = urllib.request.build_opener(_NoRedirect())
+    try:
+        with opener.open(request, timeout=600) as response:
+            status = response.status
+    except OSError as exc:
+        raise SupervisorError("outcome staging upload failed: {}".format(exc))
+    if status not in (201, 202):
+        raise SupervisorError("outcome staging upload was rejected: status={}".format(status))
+
+
+def collect_outcome(request, repo):
+    """Bundle the commits the crewmate added on top of the bound repository
+    generation and push them to the staging blob.
+
+    No provider or forge credential exists on the worker: the bundle is the
+    whole return path, and the local side (which owns the lease, the branch and
+    the landing authority) is what pushes.  The result carries the bundle's
+    digest, so a tampered blob cannot land.
+    """
+    if not request.get("outcome_expected"):
+        return {"outcome_present": False, "outcome_sha256": "", "outcome_bytes": 0, "outcome_commits": 0}
+    base = request["repository_generation"]
+    counted = git_in(repo, "rev-list", "--count", "{}..HEAD".format(base), timeout=120)
+    if counted.returncode != 0:
+        raise SupervisorError(
+            "outcome commit range is unreadable: {}".format(
+                counted.stderr.decode("utf-8", errors="replace")[-500:]
+            )
+        )
+    try:
+        commits = int(counted.stdout.decode().strip())
+    except ValueError:
+        raise SupervisorError("outcome commit count is not a number")
+    if commits == 0:
+        return {"outcome_present": False, "outcome_sha256": "", "outcome_bytes": 0, "outcome_commits": 0}
+    with tempfile.TemporaryDirectory() as staging:
+        bundle = Path(staging) / "outcome.bundle"
+        created = git_in(repo, "bundle", "create", str(bundle), "{}..HEAD".format(base))
+        if created.returncode != 0 or not bundle.is_file():
+            raise SupervisorError(
+                "outcome bundle creation failed: {}".format(
+                    created.stderr.decode("utf-8", errors="replace")[-500:]
+                )
+            )
+        if bundle.stat().st_size > MAX_OUTCOME_BYTES:
+            raise SupervisorError("outcome bundle exceeds its bounded allowance")
+        body = bundle.read_bytes()
+    put_outcome_blob(body)
+    return {
+        "outcome_present": True,
+        "outcome_sha256": hashlib.sha256(body).hexdigest(),
+        "outcome_bytes": len(body),
+        "outcome_commits": commits,
+    }
+
+
 def write_atomic(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -285,8 +386,21 @@ def execute(request, worktree):
                 os.fsync(handle.fileno())
     except OSError as exc:
         raise SupervisorError("guest stream evidence could not be persisted: {}".format(exc))
+    # The task command has already had its effects, so an outcome-collection
+    # failure must never abort the result: it is recorded in the digest-bound
+    # result instead, which both blocks a landing that would be built on
+    # unverifiable bytes and stops a replay from running the command twice.
+    try:
+        outcome = collect_outcome(request, worktree)
+        outcome["outcome_error"] = ""
+    except SupervisorError as exc:
+        outcome = {
+            "outcome_present": False, "outcome_sha256": "", "outcome_bytes": 0,
+            "outcome_commits": 0, "outcome_error": str(exc)[:500],
+        }
     result = {
         "schema": RESULT_SCHEMA,
+        **outcome,
         "request_digest": request["request_digest"],
         "task": request["task"],
         "task_generation": request["task_generation"],

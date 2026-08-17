@@ -852,16 +852,27 @@ consumed = set()
 for upper, lower in re.findall(r'([A-Z_]+)=\$\{([a-z_]+):-\}', guest):
     consumed.add(lower)
 assert consumed == expected, ("guest consumes", sorted(consumed))
-# The guest must scrub every carrier after adoption and refuse positional
-# argument delivery outright.
-unset_line = re.search(r"^unset ([a-z_ ]+)$", guest, re.M)
-assert unset_line, "the guest no longer scrubs its parameter carriers"
-assert set(unset_line.group(1).split()) == {
-    "review_generation", "vm_resource_id", "vm_instance_id", "guest_digest",
-}, "the guest scrubs a different public-parameter set than it consumes"
-assert "expected seven bound parameters" in guest
-assert re.search(r'\[ "\$#" -eq 0 \]|\$# -ne 0|positional', guest), \
-    "the guest no longer refuses positional parameters"
+# Assertions below read CODE only: a comment mentioning a guard would
+# otherwise keep this unit green after the guard itself is deleted.
+code = "\n".join(
+    line for line in guest.splitlines() if not line.lstrip().startswith("#")
+)
+# Every carrier must be scrubbed after adoption, the protected SAS-URL
+# carriers included: leaving those in the environment would hand a
+# short-lived credential URL to every process the guest goes on to run.
+# The union across ALL scrub lines must be exactly what the guest consumed,
+# so deleting any one of them fails here.
+scrubbed = set()
+for line in re.findall(r"^unset ([a-z_ ]+)$", code, re.M):
+    scrubbed.update(line.split())
+assert scrubbed == expected, ("guest scrubs", sorted(scrubbed))
+assert "expected seven bound parameters" in code
+# The refusal itself, not the word: this must match the guard construct and
+# its bounded exit.
+positional_guard = re.search(
+    r'\[ "\$#" -eq 0 \][^\n]*exit 125', code
+)
+assert positional_guard, "the guest no longer refuses positional parameters"
 PY
   pass "the adapter and guest agree on the exact seven-parameter contract"
 }

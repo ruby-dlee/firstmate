@@ -310,7 +310,7 @@ auth_home_pull() {
       && chmod 0600 "$STATE/auth-needed"; } || :
     echo "validation guest: auth share is empty; interactive auth marker written" >&2
   else
-    rm -f "$STATE/auth-needed"
+    rm -f "$STATE/auth-needed" || :
   fi
   # From here on this cell owns auth the share has not seen, whether it came
   # from the share, from the seeded bundle after a failed pull, or from a first
@@ -338,7 +338,7 @@ auth_home_push() {
   push_rc=$?
   set -e
   if [ "$push_rc" -eq 0 ]; then
-    rm -f "$STATE/auth-push-owed" "$STATE/auth-push-failed"
+    rm -f "$STATE/auth-push-owed" "$STATE/auth-push-failed" || :
     return 0
   fi
   # A warning on stderr dies with the guest. The share is now stale, every

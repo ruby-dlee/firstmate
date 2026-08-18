@@ -165,6 +165,13 @@ def load_credential_expiry() -> Any:
     )
 
 
+# The interval between a granted lane and the reviewer's first token: scope
+# verification, VM create, boot, and bundle upload. `poll_model_run` budgets
+# it on the run deadline and the credential margin budgets it on the token,
+# so both read the same number.
+PROVISIONING_ALLOWANCE_SECONDS = 900
+
+
 def preflight_reviewer_credential(core: Any, config: dict[str, str]) -> dict[str, Any]:
     """Refuse a dead reviewer credential before any billable compartment.
 
@@ -180,6 +187,12 @@ def preflight_reviewer_credential(core: Any, config: dict[str, str]) -> dict[str
     The margin covers the review, not the wait in front of it, so this is
     called twice: once to fail fast, and once after the lane is held, which
     is the call that actually stands between a dead token and a paid VM.
+
+    It also covers the gap between the check and the reviewer's first token:
+    scope verification, VM create, boot, and bundle upload all happen after
+    the lane is granted. `poll_model_run` already budgets that gap, so the
+    margin reuses its constant rather than inventing a second estimate of the
+    same interval.
     """
 
     expiry = load_credential_expiry()
@@ -188,7 +201,8 @@ def preflight_reviewer_credential(core: Any, config: dict[str, str]) -> dict[str
         harness=config["harness"],
         margin_seconds=bounded_environment_integer(
             "FM_CROSSCHECK_REVIEWER_TIMEOUT_SECONDS", 1800, 30, MAX_REVIEW_SECONDS
-        ),
+        )
+        + PROVISIONING_ALLOWANCE_SECONDS,
     )
     try:
         expiry.require_state(record, "usable", "Azure Crosscheck reviewer")
@@ -993,7 +1007,7 @@ def submit_model_run(
 def poll_model_run(
     config: dict[str, Any], command_id: str, timeout_seconds: int
 ) -> tuple[str, str]:
-    deadline = time.monotonic() + timeout_seconds + 900
+    deadline = time.monotonic() + timeout_seconds + PROVISIONING_ALLOWANCE_SECONDS
     url = "https://management.azure.com" + command_id + "?api-version=2024-03-01&$expand=instanceView"
     while time.monotonic() < deadline:
         value, rc, detail = az(config, ["rest", "--method", "get", "--url", url], check=False)

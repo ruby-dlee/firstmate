@@ -64,6 +64,12 @@ write("codex", "expiring", "auth.json", codex({
     "access_token": jwt(now + 1200), "refresh_token": marker,
     "id_token": jwt(now + 1200), "account_id": "acct-expiring",
 }))
+# Outlives the review margin (1800) but not the provisioning that happens
+# before the review starts, so only the allowance refuses it.
+write("codex", "provisioning", "auth.json", codex({
+    "access_token": jwt(now + 2100), "refresh_token": marker,
+    "id_token": jwt(now + 2100), "account_id": "acct-provisioning",
+}))
 write("codex", "orphan", "auth.json", codex({
     "access_token": jwt(now - 3600), "refresh_token": "",
     "id_token": jwt(now - 3600), "account_id": "acct-orphan",
@@ -220,29 +226,28 @@ cli_unit() {
   code=0
   out=$(python3 "$EXPIRY" check --min-state refreshable "$work/pool/codex/stale" 2>&1) || code=$?
   expect_code 0 "$code" "check refused a refreshable profile at the refreshable minimum"
+  # `check` is a gate. A minimum state that nothing can fall below is a gate
+  # that cannot refuse, which reads like one and is not.
+  code=0
+  "$ROOT/bin/fm-credential-expiry.py" check --min-state unusable "$work/pool/codex/live" >/dev/null 2>&1 || code=$?
+  expect_code 2 "$code" "check accepted a minimum state it can never refuse"
+
   pass "the expiry CLI reports and gates profiles without ever emitting token material"
 }
 
 crosscheck_preflight_unit() {
-  local work fakebin
+  local work
   work=$(fm_test_tmproot fm-credential-expiry-crosscheck)
   make_profiles "$work/pool"
-  mkdir -p "$work/home" "$work/fakebin"
-  fakebin=$work/fakebin
-  # Any Azure CLI call at all fails this test: the whole point of the preflight
-  # is that a dead reviewer costs nothing, not even a control-plane read.
-  cat >"$fakebin/az" <<AZ
-#!/bin/sh
-printf 'az %s\n' "\$*" >>"$work/az-invocations"
-exit 0
-AZ
-  chmod +x "$fakebin/az"
-
-  # A complete Azure scope, so a refused reviewer is refused by the preflight
-  # and not by an absent environment. Without it, runtime_config raises before
-  # any lane or CLI call is reached and the no-lane/no-az assertions below hold
-  # identically whether the preflight exists or not.
-  PATH="$fakebin:$PATH" \
+  mkdir -p "$work/home"
+  # Enough Azure scope that a refused reviewer is refused by the preflight and
+  # not by an absent environment: without it, runtime_config raises before a
+  # lane is ever taken and the no-lane assertion below holds identically
+  # whether the preflight exists or not.
+  #
+  # It is deliberately not a COMPLETE scope. verify_scope_and_foundation still
+  # raises inside the lane before any `az` runs, so this unit cannot observe
+  # Azure CLI calls at all and does not claim to; the lane is what it proves.
   FM_AZURE_TENANT_ID=11111111-1111-4111-8111-111111111111 \
   FM_AZURE_SUBSCRIPTION_ID=11111111-1111-4111-8111-111111111111 \
   FM_AZURE_NAMING_PREFIX=fmtest FM_AZURE_STORAGE_NAME=stfmtest \
@@ -250,9 +255,11 @@ AZ
   FM_AZURE_RUNNER_OPERATOR_OBJECT_ID=11111111-1111-4111-8111-111111111111 \
   FM_CROSSCHECK_AZURE_MODEL_IMAGE_ID="/subscriptions/11111111-1111-4111-8111-111111111111/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/i/versions/1.0.0" \
   python3 - "$ADAPTER" "$CORE" "$work" <<'PY' || fail "Azure Crosscheck reviewer preflight contract failed"
+import fcntl
 import importlib.util
 import inspect
 import pathlib
+import subprocess
 import sys
 
 
@@ -326,22 +333,31 @@ except core.CrosscheckToolError as exc:
 else:
     raise AssertionError("a reviewer that dies mid-review reached the Azure compartment path")
 
-# Nothing above took a lane or ran the Azure CLI.
+# A credential that outlives the review itself but not the VM create, boot, and
+# bundle upload in front of it still cannot finish, so the margin covers that
+# gap too. Without the allowance this profile is admitted and buys a VM.
+try:
+    review(pool / "codex" / "provisioning", "codex")
+except core.CrosscheckToolError as exc:
+    assert "refreshable" in str(exc) or "expired" in str(exc), str(exc)
+else:
+    raise AssertionError("a reviewer that dies during provisioning reached the Azure compartment path")
+
+# Nothing above took a lane.
 lanes = adapter.lane_root(home)
 assert not lanes.exists() or not any(lanes.iterdir()), "a refused reviewer held a review lane"
-assert not (work / "az-invocations").exists(), "a refused reviewer invoked the Azure CLI"
 
-# Positive control for those two assertions: a usable credential must get PAST
-# the preflight and reach the billable machinery. If it did not, the two checks
-# above would be satisfied by a code path that never reaches a lane or a CLI at
-# all, and would stay green with the whole feature deleted.
+# Positive control for that assertion: a usable credential must get PAST the
+# preflight and reach the lane. Without this, the check above would be satisfied
+# by a code path that never reaches a lane at all, and would stay green with the
+# whole feature deleted.
 try:
     review(pool / "codex" / "live", "codex")
 except Exception:
     pass
-assert (work / "az-invocations").exists() or (
-    lanes.exists() and any(lanes.iterdir())
-), "a usable reviewer never reached a lane or the Azure CLI, so the refusal assertions prove nothing"
+assert lanes.exists() and any(lanes.iterdir()), (
+    "a usable reviewer never reached a lane, so the refusal assertion proves nothing"
+)
 
 # The second preflight, the one that gates spend, is proved by expiring the
 # credential during the lane wait: the pre-lane call saw a live token, so only
@@ -352,9 +368,43 @@ live_body = (pool / "codex" / "live" / "auth.json").read_text(encoding="utf-8")
 dead_body = (pool / "codex" / "stale" / "auth.json").read_text(encoding="utf-8")
 (expiring_home / "auth.json").write_text(live_body, encoding="utf-8")
 
-# The positive control above deliberately ran into the billable machinery, so
-# compare against the lane state it left rather than against empty.
-lanes_before = sorted(q.name for q in lanes.iterdir()) if lanes.exists() else []
+# Lane occupancy is an flock on a lock file that acquire_review_lane creates
+# once and never unlinks, so a held lane and a released one produce identical
+# directory listings. Probe the lock itself: a non-blocking flock from a
+# separate process succeeds only if nothing still holds it.
+def lanes_held():
+    held = []
+    if not lanes.exists():
+        return held
+    for lock in sorted(lanes.glob("lane-*.lock")):
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import fcntl,sys\n"
+             "handle = open(sys.argv[1], 'a+')\n"
+             "try:\n"
+             "    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+             "except OSError:\n"
+             "    raise SystemExit(3)\n"
+             "raise SystemExit(0)\n",
+             str(lock)],
+            capture_output=True,
+        )
+        if probe.returncode == 3:
+            held.append(lock.name)
+    return held
+
+
+# Self-check: the probe must actually observe a held lane, or every assertion
+# built on it is vacuous.
+_probe_lane = lanes / "lane-probe.lock"
+lanes.mkdir(parents=True, exist_ok=True)
+_probe_handle = open(_probe_lane, "a+")
+fcntl.flock(_probe_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+assert "lane-probe.lock" in lanes_held(), "the lane occupancy probe cannot see a held lane"
+_probe_handle.close()
+assert "lane-probe.lock" not in lanes_held(), "the lane occupancy probe reports a released lane as held"
+_probe_lane.unlink()
+
 real_acquire = adapter.acquire_review_lane
 
 
@@ -378,12 +428,10 @@ finally:
     adapter.acquire_review_lane = real_acquire
 
 # That refusal released its lane rather than leaking it.
-lanes_after = sorted(q.name for q in lanes.iterdir()) if lanes.exists() else []
-assert lanes_after == lanes_before, (
-    "the second preflight leaked its review lane: %r -> %r" % (lanes_before, lanes_after)
-)
+still_held = lanes_held()
+assert not still_held, "the second preflight leaked its review lane: %r" % (still_held,)
 PY
-  pass "an expired or unrefreshable Azure reviewer is refused before any lane, Azure call, or compartment"
+  pass "an expired, unrefreshable, or mid-review-expiring Azure reviewer is refused before any lane or compartment"
 }
 
 auth_seed_unit() {
@@ -565,6 +613,45 @@ DRIVER
   expect_code 0 "$code" "an unwritable state directory turned an auth marker into a run-killer"
   assert_contains "$out" "FM-TEST-RUN-REACHED-END" \
     "a failed auth marker write stopped the run before it could package its result"
+
+  # Clearing a marker is the same bookkeeping as writing one, and it fails the
+  # same way. Seeding a marker BEFORE making the directory unwritable is what
+  # reaches the `rm -f` paths at all: with no pre-existing file, `rm -f` never
+  # has anything to fail on and the cleanup side goes untested.
+  rm -f "$work/state"/auth-*
+  : >"$work/state/auth-needed"
+  : >"$work/state/auth-push-owed"
+  chmod 0500 "$work/state"
+  code=0
+  out=$(drive_auth 1 1 push 2>/dev/null) || code=$?
+  chmod 0700 "$work/state"
+  expect_code 0 "$code" "a stale marker plus an unwritable state directory killed the run before it started"
+  assert_contains "$out" "FM-TEST-RUN-REACHED-END" \
+    "clearing a stale marker stopped the run before it started"
+
+  # The same on the far side of a SUCCESSFUL push, which is the expensive case:
+  # the run is finished and paid for, and only the marker cleanup is left.
+  rm -f "$work/state"/auth-*
+  : >"$work/state/auth-push-owed"
+  : >"$work/state/auth-push-failed"
+  chmod 0500 "$work/state"
+  code=0
+  out=$(drive_auth 0 1 push 2>/dev/null) || code=$?
+  chmod 0700 "$work/state"
+  expect_code 0 "$code" "a successful push died clearing its markers after the run was already paid for"
+  assert_contains "$out" "FM-TEST-RUN-REACHED-END" \
+    "a successful push stopped the run while clearing its markers"
+
+  # The empty-share marker is written on a different branch from the two above,
+  # so an unwritable directory has to reach that branch too.
+  rm -f "$work/state"/auth-*
+  chmod 0500 "$work/state"
+  code=0
+  out=$(drive_auth 0 0 push 2>/dev/null) || code=$?
+  chmod 0700 "$work/state"
+  expect_code 0 "$code" "an unwritable state directory turned the empty-share marker into a run-killer"
+  assert_contains "$out" "FM-TEST-RUN-REACHED-END" \
+    "a failed empty-share marker write stopped the run"
 
   # Same for the pull-side marker, which sits before the run rather than after
   # it: a failure there must not stop the run from starting.

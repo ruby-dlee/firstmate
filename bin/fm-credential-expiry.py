@@ -329,10 +329,21 @@ def inspect_profile(
     if facts["has_refresh"] and not refresh_dead:
         record["state"] = "refreshable"
         expiry = record["expires_at"] or "an unrecorded instant"
-        record["detail"] = (
-            f"{resolved_harness} access token expired at {expiry}; refresh "
-            "material is present but firstmate never refreshes it"
-        )
+        # Distinguish the two ways a credential lands here. A token that is
+        # alive now but dies inside the margin is not expired, and calling it
+        # expired contradicts `report`, which shows the same profile as usable
+        # with a future expiry.
+        if facts.get("access_expires_at") is not None and facts["access_expires_at"] > moment:
+            record["detail"] = (
+                f"{resolved_harness} access token expires at {expiry}, inside the "
+                "window this caller needs it for; refresh material is present but "
+                "firstmate never refreshes it"
+            )
+        else:
+            record["detail"] = (
+                f"{resolved_harness} access token expired at {expiry}; refresh "
+                "material is present but firstmate never refreshes it"
+            )
         return record
 
     record["state"] = "expired"

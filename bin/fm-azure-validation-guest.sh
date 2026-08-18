@@ -551,6 +551,12 @@ for executable in "$NM_BIN" "$PROVIDER_BIN" "$GH_BIN" "$GH_AXI_BIN"; do
   [ -x "$executable" ] || { echo "validation guest: exact runtime executable is absent" >&2; exit 125; }
 done
 PROVIDER=$(jq -r '.credentials.provider' "$REQUEST")
+# A receipt set proves something about the attempt that produced it. The shard
+# exchange is on the durable worktree mount and survives a reattach, so a stale
+# receipts.json would let this attempt inherit the previous one's proof - which
+# the controller accepts, because it allows a receipt head that is merely an
+# ancestor of the published head. Every attempt starts from no receipts.
+rm -f "$SHARD_EXCHANGE/receipts.json" || :
 ENV_FILE=$STATE/cell.env
 {
   printf 'HOME=%s\n' "$HOME_DIR"
@@ -940,12 +946,22 @@ SHARD_RECEIPTS=$SHARD_EXCHANGE/receipts.json
 # neither close nor be retained on its own outcome, and its worktree disk stays
 # allocated with nothing in the result saying why. Demote here instead, where
 # the reason is still known.
-SHARD_EXPECTED=$(jq -r '.limits.behavior_shards' "$REQUEST" 2>/dev/null || echo 0)
-SHARD_OBSERVED=$(jq -r 'if type == "array" then length else -1 end' "$SHARD_RECEIPTS" 2>/dev/null || echo -1)
+# Both sentinels are out of band. A numeric default would sit inside the value
+# space of real counts, and the obvious choice - zero - is exactly the observed
+# value in the failure being guarded, so an unreadable request would compare
+# equal to an empty receipt set and wave it through.
+SHARD_EXPECTED=$(jq -r 'if (.limits.behavior_shards | type) == "number" then .limits.behavior_shards else "unreadable" end' "$REQUEST" 2>/dev/null || echo unreadable)
+SHARD_OBSERVED=$(jq -r 'if type == "array" then length else "unreadable" end' "$SHARD_RECEIPTS" 2>/dev/null || echo unreadable)
 SHARD_SHORTFALL=""
 case "$OUTCOME" in
   passed|checks-passed)
-    if [ "$SHARD_OBSERVED" != "$SHARD_EXPECTED" ]; then
+    # Anything that is not a plain integer is a shortfall, not a comparison to
+    # attempt: this fails closed on a truncated request, a malformed receipt
+    # file, or a schema that stops emitting an integer count.
+    case "$SHARD_EXPECTED" in ''|*[!0-9]*) SHARD_EXPECTED=unreadable ;; esac
+    case "$SHARD_OBSERVED" in ''|*[!0-9]*) SHARD_OBSERVED=unreadable ;; esac
+    if [ "$SHARD_EXPECTED" = unreadable ] || [ "$SHARD_OBSERVED" = unreadable ] \
+      || [ "$SHARD_OBSERVED" -ne "$SHARD_EXPECTED" ]; then
       SHARD_SHORTFALL="expected $SHARD_EXPECTED behavior-shard receipts, found $SHARD_OBSERVED"
       echo "validation guest: $SHARD_SHORTFALL; demoting outcome $OUTCOME to failed" >&2
       OUTCOME=failed

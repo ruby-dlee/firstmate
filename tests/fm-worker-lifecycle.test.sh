@@ -29,7 +29,21 @@ doc = Path(sys.argv[5]).read_text(encoding="utf-8")
 # The operator contract in docs/azure-workers.md owns the queue's mutations. A
 # new one that is not written there leaves the doc stating, wrongly, that
 # release is the only exit.
-assert "withdraw" in doc, "docs/azure-workers.md does not document the withdraw queue mutation"
+# Not a bare substring: `<!-- there is no withdraw -->` satisfied that while
+# saying the opposite. Require the contract sentence, outside any comment.
+withdraw_doc_lines = [
+    line for line in doc.splitlines()
+    if "withdraw" in line and not line.lstrip().startswith("<!--")
+]
+assert withdraw_doc_lines, "docs/azure-workers.md does not document the withdraw queue mutation"
+assert any(
+    "queued" in line and "credential" in line for line in withdraw_doc_lines
+), ("docs/azure-workers.md mentions withdraw without stating what it accepts or that it "
+    "removes the staged credential", withdraw_doc_lines)
+assert any(
+    "Release remains the only exit" in line for line in doc.splitlines()
+    if not line.lstrip().startswith("<!--")
+), "docs/azure-workers.md no longer states that release owns work which held capacity"
 for marker in (
     '"assigned", "clean-warm", "deallocated", "orphaned-safe-to-delete", "retained-for-investigation"',
     "REGIONAL_ADMISSION_CEILING_VCPUS = 128", "AUTHOR_PLAN_VCPUS = MAX_WORKERS * VCPUS_PER_WORKER",
@@ -1253,6 +1267,25 @@ assert pending_refusal.returncode != 0, "withdraw dropped an entry a pending act
 assert "pending" in pending_refusal.stderr, pending_refusal.stderr
 assert "task-11@gen-11" in controller_state()["queue"], "the refused entry was dropped anyway"
 
+# `assigning` is persisted before the provider call and, behind a slow create,
+# can hold for hours. It still counts as demand, so the refusal must not tell
+# the operator it is "past the queue", and release cannot take it either.
+request(14)
+assigning_state = controller_state()
+assigning_state["queue"]["task-14@gen-14"]["status"] = "assigning"
+controller_path = Path(env["FM_HOME"]) / "state/azure-workers/controller.json"
+controller_path.write_text(json.dumps(assigning_state, sort_keys=True, separators=(",", ":")))
+assigning_refusal = run("withdraw", "--task", "task-14", "--task-generation", "gen-14",
+                        "--confirm-withdraw", "--confirm-subscription",
+                        env["FM_AZURE_SUBSCRIPTION_ID"], check=False)
+assert assigning_refusal.returncode != 0, "withdraw accepted an assigning entry"
+assert "in flight" in assigning_refusal.stderr, assigning_refusal.stderr
+assert "past the queue" not in assigning_refusal.stderr, (
+    "an assigning entry still counts as demand, so calling it past the queue is false",
+    assigning_refusal.stderr,
+)
+assert "task-14@gen-14" in controller_state()["queue"], "the refused entry was dropped anyway"
+
 # A wrong subscription must refuse, like every other mutating subcommand.
 request(12)
 wrong_subscription = run("withdraw", "--task", "task-12", "--task-generation", "gen-12",
@@ -1277,6 +1310,44 @@ assert "task-12@gen-12" not in controller_state()["queue"]
 assert not credential.exists(), "withdraw left the staged provider credential behind"
 assert not cloud_account.exists(), "withdraw left the cloud-account directory behind"
 assert not entrypoint.exists(), "withdraw left the convergence entrypoint behind"
+
+# Cleanup must be bound to a withdrawal that actually happened. `--help` exits
+# 0 without withdrawing, and an exit-code gate therefore destroyed a LIVE
+# task's staged credential, payload and returned result.
+live_account = Path(env["FM_HOME"]) / "state" / "task-1.cloud-account"
+live_account.mkdir(parents=True, exist_ok=True)
+live_credential = live_account / "auth.json"
+live_credential.write_text('{"staged": "live"}')
+live_result = Path(env["FM_HOME"]) / "state" / "task-1.worker-result.json"
+live_result.write_text('{"result": "returned"}')
+run("withdraw", "--task", "task-1", "--help", check=False)
+assert live_credential.exists(), "withdraw --help destroyed a live task's provider credential"
+assert live_result.exists(), "withdraw --help destroyed a live task's returned result"
+assert "task-1@gen-1" in controller_state()["queue"], "withdraw --help dropped a live entry"
+
+# A REFUSED withdraw must leave the task's cloud state alone too.
+refused_live = run("withdraw", "--task", "task-1", "--task-generation", "gen-1",
+                   "--confirm-withdraw", "--confirm-subscription",
+                   env["FM_AZURE_SUBSCRIPTION_ID"], check=False)
+assert refused_live.returncode != 0, "withdraw accepted an assigned task"
+assert live_credential.exists(), "a refused withdraw destroyed the task's provider credential"
+assert live_result.exists(), "a refused withdraw destroyed the task's returned result"
+live_credential.unlink()
+live_result.unlink()
+
+# The --task=<value> form parses fine, so cleanup must work there too; keying
+# off argv missed it and silently left the credential on disk.
+request(13)
+equals_account = Path(env["FM_HOME"]) / "state" / "task-13.cloud-account"
+equals_account.mkdir(parents=True, exist_ok=True)
+equals_credential = equals_account / "auth.json"
+equals_credential.write_text('{"staged": "credential"}')
+run("withdraw", "--task=task-13", "--task-generation=gen-13", "--confirm-withdraw",
+    "--confirm-subscription={}".format(env["FM_AZURE_SUBSCRIPTION_ID"]))
+assert "task-13@gen-13" not in controller_state()["queue"]
+assert not equals_credential.exists(), (
+    "the --task=<value> form withdrew the entry but left the staged credential behind"
+)
 PY
   pass "zero-to-zero flow executes privately, replays idempotently, resets before reuse, resumes dirty disks, and preserves active work under budget refusal"
 }

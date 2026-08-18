@@ -2301,9 +2301,15 @@ def command_withdraw(env, args):
             # queue owner. Those go out through release.
             # `release` only accepts `assigned`, so pointing a `complete` or
             # `releasing` entry at it would be impossible advice.
-            remedy = "release it instead" if status == "assigned" else (
-                "it is already past the queue and no longer counts as demand"
-            )
+            # `release` only accepts `assigned`. `assigning` still counts as
+            # demand (desired_count includes it) and can persist for hours
+            # behind a slow create, so calling it "past the queue" is false.
+            if status == "assigned":
+                remedy = "release it instead"
+            elif status == "assigning":
+                remedy = "a create is in flight for it; reconcile first"
+            else:
+                remedy = "it is past the queue and release cannot take it either"
             raise LifecycleError(
                 "withdraw refuses a task generation that is already {}; {}".format(status, remedy)
             )
@@ -2329,6 +2335,12 @@ def command_withdraw(env, args):
                 )
         del state["queue"][key]
         save_state(env, state)
+    # A machine-readable receipt naming the exact entry that was deleted. The
+    # wrapper keys its cloud-state cleanup off THIS line, not off the exit
+    # code: `--help` also exits 0 without withdrawing anything, and gating on
+    # the exit code let `withdraw --task <id> --help` destroy a live task's
+    # staged credential, payload and returned result.
+    print("FM-WITHDREW {} {}".format(args.task, args.task_generation))
     print("withdrew queued request {}".format(key))
 
 

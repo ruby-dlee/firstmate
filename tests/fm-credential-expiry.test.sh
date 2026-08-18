@@ -423,24 +423,26 @@ exit "${FM_TEST_AUTH_SYNC_RC:-0}"
 PYSHIM
   chmod +x "$work/fakebin/python3"
 
+  cat >"$work/drive.sh" <<'DRIVER'
+set -u
+AUTH_SYNC=/dev/null
+STORAGE_ACCOUNT=acct
+AUTH_SHARE=fm-auth-home
+IDENTITY_CLIENT_ID=cid
+HOME_DIR=$FM_TEST_AUTH_WORK/home
+STATE=$FM_TEST_AUTH_WORK/state
+LOGS=$FM_TEST_AUTH_WORK/logs
+ATTEMPT=1
+. "$FM_TEST_AUTH_WORK/functions.sh"
+auth_home_pull
+[ "$FM_TEST_AUTH_MODE" = pull-only ] || auth_home_push
+DRIVER
+
   drive_auth() {
     env PATH="$work/fakebin:$PATH" \
       FM_TEST_AUTH_SYNC_RC="$1" FM_TEST_AUTH_SYNC_COUNT="$2" \
       FM_TEST_AUTH_MODE="$3" FM_TEST_AUTH_WORK="$work" \
-      bash -c '
-        set -u
-        AUTH_SYNC=/dev/null
-        STORAGE_ACCOUNT=acct
-        AUTH_SHARE=fm-auth-home
-        IDENTITY_CLIENT_ID=cid
-        HOME_DIR=$FM_TEST_AUTH_WORK/home
-        STATE=$FM_TEST_AUTH_WORK/state
-        LOGS=$FM_TEST_AUTH_WORK/logs
-        ATTEMPT=1
-        . "$FM_TEST_AUTH_WORK/functions.sh"
-        auth_home_pull
-        [ "$FM_TEST_AUTH_MODE" = pull-only ] || auth_home_push
-      '
+      bash "$work/drive.sh"
   }
 
   rm -f "$work/state"/auth-*

@@ -108,6 +108,15 @@ POST_GUEST_CALL_BUDGET_SECONDS = (
 # Starting a stopped VM is an ARM power operation measured in minutes, not the
 # seconds an ordinary control-plane call takes.
 VM_START_TIMEOUT_SECONDS = 900
+# How long to wait between power-state reads while an ARM power transition is
+# in flight. The TTL schedule fires daily, so a create racing a deallocate is
+# ordinary, not exotic.
+VM_POWER_POLL_SECONDS = 10
+# Bound the READS as well as the wall clock. A deadline alone means a gate that
+# never settles spins until the deadline: a slow failure, and an unpredictable
+# one, since how long it takes depends on how fast Azure answers. A read count
+# fails the same way every time.
+VM_POWER_MAX_READS = 90
 STEER_CLIENT_TIMEOUT_SECONDS = 600
 # The steer is bracketed by two full inventory sweeps.
 STEER_BUDGET_SECONDS = STEER_CLIENT_TIMEOUT_SECONDS + AZ_TIMEOUT_SECONDS * 2
@@ -1589,21 +1598,8 @@ prepare_disk 1 /mnt/task
     return script, supervisor_digest
 
 
-def ensure_worker_running(controller, vm_name):
-    """Start a converged worker whose compute is stopped.
-
-    A create does not always build a new VM. The ARM deployment is idempotent,
-    so a create that replays, or that follows a failed attempt, converges onto
-    the worker that already exists. Meanwhile the TTL shutdown schedule
-    deallocates idle workers, so the VM the create converges onto is very often
-    stopped. Azure then refuses the bootstrap run command outright with
-    OperationNotAllowed, "Cannot modify extensions in the VM when the VM is not
-    running", and nothing else in this provider can start compute: every other
-    power operation here deallocates. The slot wedges with no owned way out and
-    the operator has to run `az vm start` by hand, which is how this was found.
-
-    Returns whether it had to start the VM, so the caller can say so.
-    """
+def worker_power_state(controller, vm_name):
+    """The VM's PowerState code, lowercased, or "" when Azure reports none."""
     view, rc, stderr = az(controller, [
         "vm", "get-instance-view", "--resource-group", controller["resource_group"],
         "--name", vm_name, "--query",
@@ -1611,26 +1607,115 @@ def ensure_worker_running(controller, vm_name):
     ], check=False)
     if rc != 0:
         raise ProviderError("exact worker power state is unreadable: {}".format(stderr))
-    codes = " ".join(str(item) for item in (view or [])).lower()
-    if "running" in codes:
-        return False
+    if not isinstance(view, list):
+        view = [] if view is None else [view]
+    for item in view:
+        text = str(item).lower()
+        if text.startswith("powerstate/"):
+            return text.split("/", 1)[1]
+    return ""
+
+
+def ensure_worker_running(controller, vm_name):
+    """Prove the worker is running, starting it if it is not.
+
+    A create does not always build a new VM. The ARM deployment is idempotent,
+    so a create that replays, or one that follows a failed attempt, converges
+    onto the worker that already exists. Meanwhile the TTL shutdown schedule
+    deallocates idle workers, so the VM a create converges onto is very often
+    stopped. Azure then refuses the bootstrap run command outright with
+    OperationNotAllowed, "Cannot modify extensions in the VM when the VM is not
+    running", and nothing else in this provider can start compute: every other
+    power operation here deallocates. The slot wedges with no owned way out.
+
+    Transitional states matter and are not hypothetical. The TTL schedule fires
+    daily, so `deallocating` and `stopping` are exactly what a create racing it
+    sees, and issuing a start against an in-flight stop earns an ARM 409 rather
+    than a running VM. Those are waited out before deciding.
+
+    Returns whether it had to start the VM, so a caller can undo it.
+    """
+    deadline = time.monotonic() + VM_START_TIMEOUT_SECONDS
+    started = False
+    reads = 0
+    while True:
+        if reads >= VM_POWER_MAX_READS:
+            raise ProviderError(
+                "exact worker power state did not settle within {} reads".format(VM_POWER_MAX_READS)
+            )
+        reads += 1
+        state = worker_power_state(controller, vm_name)
+        if state == "running":
+            return started
+        if state in ("stopping", "deallocating", "starting"):
+            # An in-flight power transition: a start now races it. Wait for the
+            # state machine to settle rather than guessing.
+            if time.monotonic() >= deadline:
+                raise ProviderError(
+                    "exact worker stayed in transitional power state {}".format(state)
+                )
+            time.sleep(VM_POWER_POLL_SECONDS)
+            continue
+        if started:
+            # Already started once and it still is not running. Starting again
+            # would loop; report the state Azure actually reports.
+            if time.monotonic() >= deadline:
+                raise ProviderError(
+                    "exact worker did not reach running after a start: {}".format(state or "unknown")
+                )
+            time.sleep(VM_POWER_POLL_SECONDS)
+            continue
+        _, rc, stderr = az(controller, [
+            "vm", "start", "--resource-group", controller["resource_group"], "--name", vm_name,
+        ], check=False, timeout=VM_START_TIMEOUT_SECONDS)
+        if rc != 0:
+            raise ProviderError("exact worker compute could not be started: {}".format(stderr))
+        started = True
+
+
+def deallocate_started_worker(controller, vm_name):
+    """Put back a worker this provider started, after a create failed.
+
+    Without this a failed create leaves BILLABLE compute running that nothing
+    reclaims: the controller records the worker as `creating`, classify_worker
+    reports retained-for-investigation, and the reconcile loop only ever emits a
+    deallocate for a worker carrying a release proof. Reclamation would fall to
+    the daily TTL schedule, up to a full day of unattended compute per failed
+    create. Best effort on purpose: the create's own error is what matters and
+    must not be replaced by a cleanup error.
+    """
     _, rc, stderr = az(controller, [
-        "vm", "start", "--resource-group", controller["resource_group"], "--name", vm_name,
+        "vm", "deallocate", "--resource-group", controller["resource_group"], "--name", vm_name,
     ], check=False, timeout=VM_START_TIMEOUT_SECONDS)
     if rc != 0:
-        raise ProviderError("exact worker compute could not be started: {}".format(stderr))
-    return True
+        sys.stderr.write(
+            "AZURE WORKER PROVIDER WARNING: started {} for a create that failed and could not "
+            "put it back; it bills until its TTL schedule fires: {}\n".format(vm_name, stderr)
+        )
 
 
 def create_lifecycle_children(controller, action):
+    """Start the worker if needed, build its children, and put it back on failure."""
+    vm_name = expected_names(controller, action["slot"])["vm"]
+    started = ensure_worker_running(controller, vm_name)
+    try:
+        return build_lifecycle_children(controller, action)
+    except Exception:
+        if started:
+            # This provider started billable compute for a create that then
+            # failed. Nothing else would put it back: the controller leaves the
+            # worker `creating`, classify_worker reports
+            # retained-for-investigation, and the reconcile loop only emits a
+            # deallocate for a worker carrying a release proof.
+            deallocate_started_worker(controller, vm_name)
+        raise
+
+
+def build_lifecycle_children(controller, action):
     names = expected_names(controller, action["slot"])
     vm_name = names["vm"]
     tags = action_tags(controller, action)
     script, supervisor_digest = bootstrap_script(action)
-    # Before anything is asked of the guest. A converged worker is routinely
-    # found deallocated by its own TTL schedule, and every guest-facing call
-    # below fails closed against stopped compute.
-    ensure_worker_running(controller, vm_name)
     # This BLOCKS on the guest exactly like the execute path does, and for the
     # same reason it cannot take the ordinary control-plane bound: the script
     # waits up to 60s per data disk for the device to appear, then runs mkfs
@@ -1794,6 +1879,19 @@ def create_or_resume(controller, action):
         if resources.get("vm"):
             try:
                 recorded_exact(action, existing)
+                # A fully converged worker returns from here without ever
+                # reaching create_lifecycle_children, and the TTL schedule
+                # deallocates idle workers daily. Returning one as-is reports
+                # success while the controller marks the task assigned, and the
+                # NEXT action, execute, hard-refuses deallocated compute with no
+                # owned recovery: classify_worker only reports "deallocated" for
+                # a worker carrying a release proof, so the reconcile loop never
+                # starts or reclaims it. This is the case the whole change is
+                # for, and it is the one that skips the create path entirely.
+                if ensure_worker_running(controller, expected_names(controller, action["slot"])["vm"]):
+                    existing = worker_by_slot(
+                        inventory(controller, include_metrics=False), action["slot"]
+                    )
                 return existing
             except ProviderError:
                 # A submitted create can be visible with the template's exact VM

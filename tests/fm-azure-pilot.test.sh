@@ -1242,8 +1242,12 @@ provider.upload_json_blob = recording_upload
 captured_az = []
 
 
+# The worker this create converges onto is DEALLOCATED, which is the ordinary
+# state of a worker whose TTL schedule has fired.
 def recording_az(controller, args, check=True, timeout=None):
     captured_az.append((list(args), timeout))
+    if args[:2] == ["vm", "get-instance-view"]:
+        return ["PowerState/deallocated"], 0, ""
     return {}, 0, ""
 
 
@@ -1277,6 +1281,29 @@ finally:
 # guest carries on, and the controller records a failed create for a VM that is
 # alive - which is the failure PROVIDER_CREATE_TIMEOUT_SECONDS is supposed to
 # prevent and cannot, from the outside, if the inner bound fires first.
+# Azure refuses run commands against stopped compute outright, and nothing else
+# in this provider can start a VM, so a create that does not start the worker it
+# converged onto wedges the slot with no owned way out.
+az_order = [args for args, _ in captured_az]
+start_indexes = [i for i, args in enumerate(az_order) if args[:2] == ["vm", "start"]]
+assert start_indexes, (
+    "the create never starts the deallocated worker it converged onto, so the bootstrap "
+    "below fails with OperationNotAllowed", [" ".join(a[:3]) for a in az_order],
+)
+guest_indexes = [
+    i for i, args in enumerate(az_order)
+    if args[:3] == ["vm", "run-command", "create"] or args[:3] == ["vm", "run-command", "update"]
+]
+assert guest_indexes and min(start_indexes) < min(guest_indexes), (
+    "the worker is started AFTER the first guest-facing call, which is the call that fails",
+    [" ".join(a[:3]) for a in az_order],
+)
+start_timeout = [timeout for args, timeout in captured_az if args[:2] == ["vm", "start"]][0]
+assert start_timeout is not None and start_timeout > provider.AZ_TIMEOUT_SECONDS, (
+    "starting a VM is an ARM power operation in minutes and cannot take the ordinary "
+    "control-plane bound", start_timeout,
+)
+
 run_commands = [
     (args, timeout) for args, timeout in captured_az
     if args[:3] == ["vm", "run-command", "create"]

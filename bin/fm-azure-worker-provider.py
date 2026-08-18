@@ -105,13 +105,17 @@ POST_GUEST_CALL_BUDGET_SECONDS = (
 # and takes no --timeout-in-seconds, so the client bound is the only one there
 # is, and leaving it at the ordinary control-plane default is the same shape
 # called broken for bootstrap and execute above.
+# Starting a stopped VM is an ARM power operation measured in minutes, not the
+# seconds an ordinary control-plane call takes.
+VM_START_TIMEOUT_SECONDS = 900
 STEER_CLIENT_TIMEOUT_SECONDS = 600
 # The steer is bracketed by two full inventory sweeps.
 STEER_BUDGET_SECONDS = STEER_CLIENT_TIMEOUT_SECONDS + AZ_TIMEOUT_SECONDS * 2
 PILOT_CREATE_DEPLOY_TIMEOUT_SECONDS = 3600
 CREATE_LIFECYCLE_BUDGET_SECONDS = (
     BOOTSTRAP_CLIENT_TIMEOUT_SECONDS
-    + AZ_TIMEOUT_SECONDS * 16   # instance view, task stub, TTL, blob uploads, sweeps, tagging
+    + VM_START_TIMEOUT_SECONDS   # a converged worker is often stopped by its TTL
+    + AZ_TIMEOUT_SECONDS * 16    # instance view, task stub, TTL, blob uploads, sweeps, tagging
 )
 RESOURCE_API = {
     "vm": "2024-03-01",
@@ -1585,11 +1589,48 @@ prepare_disk 1 /mnt/task
     return script, supervisor_digest
 
 
+def ensure_worker_running(controller, vm_name):
+    """Start a converged worker whose compute is stopped.
+
+    A create does not always build a new VM. The ARM deployment is idempotent,
+    so a create that replays, or that follows a failed attempt, converges onto
+    the worker that already exists. Meanwhile the TTL shutdown schedule
+    deallocates idle workers, so the VM the create converges onto is very often
+    stopped. Azure then refuses the bootstrap run command outright with
+    OperationNotAllowed, "Cannot modify extensions in the VM when the VM is not
+    running", and nothing else in this provider can start compute: every other
+    power operation here deallocates. The slot wedges with no owned way out and
+    the operator has to run `az vm start` by hand, which is how this was found.
+
+    Returns whether it had to start the VM, so the caller can say so.
+    """
+    view, rc, stderr = az(controller, [
+        "vm", "get-instance-view", "--resource-group", controller["resource_group"],
+        "--name", vm_name, "--query",
+        "instanceView.statuses[?starts_with(code, 'PowerState')].code",
+    ], check=False)
+    if rc != 0:
+        raise ProviderError("exact worker power state is unreadable: {}".format(stderr))
+    codes = " ".join(str(item) for item in (view or [])).lower()
+    if "running" in codes:
+        return False
+    _, rc, stderr = az(controller, [
+        "vm", "start", "--resource-group", controller["resource_group"], "--name", vm_name,
+    ], check=False, timeout=VM_START_TIMEOUT_SECONDS)
+    if rc != 0:
+        raise ProviderError("exact worker compute could not be started: {}".format(stderr))
+    return True
+
+
 def create_lifecycle_children(controller, action):
     names = expected_names(controller, action["slot"])
     vm_name = names["vm"]
     tags = action_tags(controller, action)
     script, supervisor_digest = bootstrap_script(action)
+    # Before anything is asked of the guest. A converged worker is routinely
+    # found deallocated by its own TTL schedule, and every guest-facing call
+    # below fails closed against stopped compute.
+    ensure_worker_running(controller, vm_name)
     # This BLOCKS on the guest exactly like the execute path does, and for the
     # same reason it cannot take the ordinary control-plane bound: the script
     # waits up to 60s per data disk for the device to appear, then runs mkfs

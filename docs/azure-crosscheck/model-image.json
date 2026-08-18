@@ -2,7 +2,7 @@
  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
  "contentVersion": "1.0.0.0",
  "metadata": {
-  "description": "Tracked pinned model-image build contract for the credentialed Crosscheck reviewer compartment. The image carries exactly the pinned Codex, Claude, and Pi reviewer CLI closures (cross-review: a reviewer always runs a different executing account than the author, and may also run a different harness) plus the digest-pinned Node runtime the Pi CLI executes on, and the tracked model guest; it has no ambient credential, Azure CLI, repository helper, generic shell service, MCP server, extension, skill, or session surface. Building it is a billable mutation owned by bin/fm-crosscheck-azure-image.sh and requires explicit operator confirmation from released main."
+  "description": "Tracked pinned model-image build contract for the credentialed Crosscheck reviewer compartment. The image carries the pinned Codex and Claude reviewer CLI closures, the Pi CLI published tarball and the pinned Node runtime it executes on, and the tracked model guest (cross-review: a reviewer runs a different executing account than the author, and may also run a different harness). Pi's dependency packages resolve over the network at build time through npm's own metadata and are not digest-pinned here; it has no ambient credential, Azure CLI, repository helper, generic shell service, MCP server, extension, skill, or session surface. Building it is a billable mutation owned by bin/fm-crosscheck-azure-image.sh and requires explicit operator confirmation from released main."
  },
  "parameters": {
   "namingPrefix": {
@@ -187,7 +187,7 @@
        "[format('curl --fail --silent --show-error --location --connect-timeout 30 --max-time 600 --max-filesize {0} --output /tmp/pi-coding-agent.tgz ''{1}''', parameters('piTarballBytes'), parameters('piTarballUrl'))]",
        "[format('[ \"$(stat -c %s /tmp/pi-coding-agent.tgz)\" = ''{0}'' ]', parameters('piTarballBytes'))]",
        "[format('printf ''%s  %s\\n'' ''{0}'' /tmp/pi-coding-agent.tgz | sha256sum -c -', parameters('piTarballSha256'))]",
-       "/usr/local/bin/npm install -g --prefix /usr/local --ignore-scripts /tmp/pi-coding-agent.tgz",
+       "timeout 900 /usr/local/bin/npm install -g --prefix /usr/local --ignore-scripts /tmp/pi-coding-agent.tgz",
        "rm -f /tmp/pi-coding-agent.tgz",
        "/usr/local/bin/codex --version",
        "/usr/local/bin/claude --version",

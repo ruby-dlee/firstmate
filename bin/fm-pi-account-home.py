@@ -116,8 +116,81 @@ def select(pool: dict[str, dict], requested: list[str], every: bool) -> list[str
     return list(dict.fromkeys(requested))
 
 
+def make_private_directory(path: Path) -> None:
+    """Create one directory component, refusing to traverse a planted link.
+
+    `Path.mkdir(parents=True)` applies its mode to the leaf only, so every
+    ancestor lands at the caller's umask - 0777 under a permissive one, which
+    is precisely the precondition for planting the link this refuses. And
+    `exist_ok=True` succeeds on a symlink to a directory, because `isdir`
+    follows it, so guarding only the final credential path leaves the write
+    redirectable one component higher.
+    """
+
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    except OSError as exc:
+        fail(f"account home path is unreadable at {path}: {exc.strerror}")
+    if existing is not None:
+        if not stat.S_ISDIR(existing.st_mode) or path.is_symlink():
+            fail(f"refusing to write through a non-directory account home path at {path}")
+        try:
+            os.chmod(path, 0o700)
+        except OSError as exc:
+            fail(f"account home path cannot be made owner-only at {path}: {exc.strerror}")
+        return
+    try:
+        os.mkdir(path, 0o700)
+    except OSError as exc:
+        fail(f"account home path cannot be created at {path}: {exc.strerror}")
+    os.chmod(path, 0o700)
+
+
+def prepare_root(root: Path) -> None:
+    """Admit the operator-chosen root without widening anything above it."""
+
+    try:
+        existing = root.lstat()
+    except FileNotFoundError:
+        # We create it, so we own its mode. `parents=True` applies the mode to
+        # the leaf only, leaving intermediates at the caller's umask - 0777
+        # under a permissive one, which is the precondition for planting the
+        # link the profile component refuses below.
+        missing = []
+        walk = root
+        while not walk.exists():
+            missing.append(walk)
+            if walk.parent == walk:
+                break
+            walk = walk.parent
+        for component in reversed(missing):
+            os.mkdir(component, 0o700)
+            os.chmod(component, 0o700)
+        return
+    except OSError as exc:
+        fail(f"destination root is unreadable at {root}: {exc.strerror}")
+    if not stat.S_ISDIR(existing.st_mode) or root.is_symlink():
+        fail(f"destination root must be a real directory, not a link, at {root}")
+    # A pre-existing root that anyone can write to is exactly where a profile
+    # component gets replaced by a link between this check and the write.
+    if existing.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not (
+        existing.st_mode & stat.S_ISVTX
+    ):
+        fail(
+            f"destination root is group- or world-writable at {root}; "
+            "a credential is not written under a path others can replace"
+        )
+
+
 def write_home(destination: Path, entry: dict) -> Path:
     credential = destination / "auth.json"
+    # The profile component, not just the credential inside it: an intermediate
+    # symlink redirects the write exactly as effectively, and mkdir(exist_ok)
+    # follows one because `isdir` does.
+    make_private_directory(destination)
+
     try:
         existing = credential.lstat()
     except FileNotFoundError:
@@ -130,13 +203,13 @@ def write_home(destination: Path, entry: dict) -> Path:
         # Never follow a symlink into a write: the destination is chosen by an
         # operator argument and a planted link would redirect a credential.
         fail(f"refusing to replace a non-regular credential path at {credential}")
-
-    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(destination, 0o700)
     body = json.dumps({CONSUMER_KEY: entry}, sort_keys=True, indent=2) + "\n"
 
-    # Written to a private temp file and renamed, so a reader never observes a
-    # half-written credential and never sees one at default permissions.
+    # Written to a private temp file and renamed: no reader observes the token
+    # at default permissions, and a partial write cannot truncate the previous
+    # credential in place. Only the mode is covered by a test; the atomicity
+    # and the fsync ordering are argued from the mechanism, not proven here,
+    # because the failure they defend against is a crash mid-write.
     handle, staged = tempfile.mkstemp(dir=str(destination), prefix=".auth-", suffix=".tmp")
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
@@ -160,7 +233,7 @@ def write_home(destination: Path, entry: dict) -> Path:
 
 
 def command_report(args: argparse.Namespace) -> int:
-    pool = read_pool(Path(args.source).expanduser().resolve())
+    pool = read_pool(Path(args.source).expanduser())
     rows = []
     for name in sorted(pool):
         faults = entry_faults(pool[name])
@@ -178,9 +251,10 @@ def command_report(args: argparse.Namespace) -> int:
 
 
 def command_project(args: argparse.Namespace) -> int:
-    source = Path(args.source).expanduser().resolve()
+    source = Path(args.source).expanduser()
     root = Path(args.destination_root).expanduser().resolve()
     pool = read_pool(source)
+    prepare_root(root)
     names = select(pool, args.profile or [], args.all)
     if not names:
         fail("name at least one --profile, or pass --all")
@@ -232,6 +306,15 @@ def main(argv: list[str] | None = None) -> int:
         return args.handler(args)
     except ProjectionError as exc:
         print(f"PI ACCOUNT HOME REFUSED: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        # A traceback is not a refusal contract. Report the path and the errno
+        # text, never the value being written.
+        location = getattr(exc, "filename", None) or "an account home path"
+        print(
+            f"PI ACCOUNT HOME REFUSED: {location}: {exc.strerror or exc}",
+            file=sys.stderr,
+        )
         return 1
 
 

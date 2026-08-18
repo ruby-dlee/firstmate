@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
+# shellcheck source=tests/test-entry.sh
+. "$(dirname "$0")/test-entry.sh"
 # Behavior: projecting one Pi profile into the single-profile account home its
 # consumers actually read, without ever writing a token into the transcript.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 # shellcheck source=tests/lib.sh
-. "$ROOT/tests/lib.sh"
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 TOOL="$ROOT/bin/fm-pi-account-home.py"
 # A marker standing in for token material, so leakage is detectable by grep
@@ -121,6 +123,78 @@ PY
   "$TOOL" project --source "$pool" --destination-root "$work/none" --profile absent >/dev/null 2>&1 || code=$?
   expect_code 1 "$code" "a profile absent from the pool was projected"
 
+  # A lone unknown name is refused by the empty-selection guard, which says
+  # nothing about whether unknown names are noticed. Mix one in with a good one:
+  # a typo that is silently dropped tells the operator the projection succeeded.
+  code=0
+  out=$("$TOOL" project --source "$pool" --destination-root "$work/mixed" \
+    --profile openai-codex-2 --profile openai-codex-77 2>&1) || code=$?
+  expect_code 1 "$code" "an unknown profile mixed with a known one was silently dropped"
+  assert_contains "$out" "openai-codex-77" "the refusal did not name the unknown profile"
+  assert_absent "$work/mixed/openai-codex-2/auth.json" "a refused selection projected its known profiles anyway"
+
+  # Every reason at once, not just the first: the blanked fixture has two.
+  code=0
+  out=$("$TOOL" project --source "$pool" --destination-root "$work/faults" --profile openai-codex-3 2>&1) || code=$?
+  expect_code 1 "$code" "a blanked profile was projected"
+  assert_contains "$out" "blank access" "the refusal omitted the blank access token"
+  assert_contains "$out" "blank refresh" "the refusal reported only the first fault"
+
+  # The source guard must be reachable: resolving the path before reading it
+  # strips the symlink and the guard can never fire.
+  ln -s "$pool" "$work/linked-pool.json"
+  code=0
+  "$TOOL" report --source "$work/linked-pool.json" >/dev/null 2>&1 || code=$?
+  expect_code 1 "$code" "a symlinked credential pool was read"
+
+  # The reported instant and the distinct-account count are the values an
+  # operator plans a rotation from; neither is proved by the header alone.
+  "$TOOL" report --source "$pool" >"$work/report2.txt" 2>&1 || fail "report refused"
+  assert_grep "2030-01-01T00:00:00Z" "$work/report2.txt" "the report did not render the expiry instant"
+  assert_grep "profiles=6 distinct-accounts=5" "$work/report2.txt" "the report miscounted distinct accounts"
+
+  # An intermediate symlink redirects the write as effectively as one at the
+  # credential path, and mkdir(exist_ok) follows it because isdir does.
+  mkdir -p "$work/traverse" "$work/elsewhere"
+  ln -s "$work/elsewhere" "$work/traverse/openai-codex-2"
+  code=0
+  "$TOOL" project --source "$pool" --destination-root "$work/traverse" --profile openai-codex-2 >/dev/null 2>&1 || code=$?
+  expect_code 1 "$code" "a symlinked profile directory was followed into a write"
+  assert_absent "$work/elsewhere/auth.json" "the projection wrote a credential outside its destination root"
+
+  # A root anyone can write to is where a profile component gets replaced by a
+  # link between the check and the write.
+  mkdir -p "$work/openroot"; chmod 0777 "$work/openroot"
+  code=0
+  "$TOOL" project --source "$pool" --destination-root "$work/openroot" --profile openai-codex-2 >/dev/null 2>&1 || code=$?
+  expect_code 1 "$code" "a credential was written under a world-writable root"
+
+  # Created ancestors are owner-only regardless of the caller's umask; a mode
+  # that only holds under a strict umask is not an assurance.
+  (umask 000; "$TOOL" project --source "$pool" --destination-root "$work/deep/nested/root" \
+    --profile openai-codex-2 >/dev/null 2>&1) || fail "projecting into a new root refused"
+  for created in "$work/deep" "$work/deep/nested" "$work/deep/nested/root"; do
+    expect_code 700 "$(stat -f '%Lp' "$created" 2>/dev/null || stat -c '%a' "$created")" \
+      "a created ancestor was left readable to others under a permissive umask"
+  done
+
+  # An account is identified by digest, so the raw upstream id never appears.
+  assert_no_grep "acct-two" "$work/report2.txt" "the report printed a raw account identifier"
+
+  # The pool bound is a real refusal, not a comment.
+  python3 -c 'import sys; open(sys.argv[1],"w").write("{\"openai-codex\":\"" + "x"*5000000 + "\"}")' "$work/huge.json"
+  code=0
+  "$TOOL" report --source "$work/huge.json" >/dev/null 2>&1 || code=$?
+  expect_code 1 "$code" "an oversized credential pool was read"
+
+  # An ordinary OS error is still a refusal, not a traceback.
+  mkdir -p "$work/readonly"; chmod 0500 "$work/readonly"
+  code=0
+  out=$("$TOOL" project --source "$pool" --destination-root "$work/readonly/sub" --profile openai-codex-2 2>&1) || code=$?
+  chmod 0700 "$work/readonly"
+  expect_code 1 "$code" "an unwritable destination did not refuse cleanly"
+  assert_contains "$out" "PI ACCOUNT HOME REFUSED" "an OS error escaped the refusal contract"
+
   code=0
   "$TOOL" report --source "$work/missing.json" >/dev/null 2>&1 || code=$?
   expect_code 1 "$code" "an absent pool was reported as readable"
@@ -161,7 +235,34 @@ assert identifier == str(home / "auth.json"), identifier
 identity = core.account_identity("pi", home)
 assert identity == "openai-codex:acct-two", identity
 PY
-  pass "the real fm-crosscheck Pi reader accepts a projected home and derives its executing account"
+  # The reader must also refuse the pooled file outright. Without that, the
+  # hazard this tool exists to remove stays reachable for anyone who does not
+  # run it: the pool passes every check, and the Azure archive stages all of it.
+  python3 - "$ROOT/bin/fm-crosscheck.py" "$work" <<'PY' || fail "the Pi reader accepted a pooled account home"
+import importlib.util
+import json
+import pathlib
+import sys
+
+spec = importlib.util.spec_from_file_location("core", sys.argv[1])
+core = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(core)
+home = pathlib.Path(sys.argv[2]) / "pooled"
+home.mkdir(parents=True, exist_ok=True)
+entry = {"type": "oauth", "access": "a", "refresh": "r",
+         "expires": 1893456000000, "accountId": "acct"}
+(home / "auth.json").write_text(
+    json.dumps({"openai-codex": entry, "openai-codex-2": entry}), encoding="utf-8"
+)
+try:
+    core.inspect_pi_credential(home)
+except core.CrosscheckToolError as exc:
+    assert "provider slots" in str(exc), str(exc)
+else:
+    raise AssertionError("a pooled multi-slot account home was accepted")
+PY
+
+  pass "the real fm-crosscheck Pi reader accepts a projected home, derives its account, and refuses a pooled one"
 }
 
 projection_contract

@@ -312,6 +312,13 @@ auth_home_pull() {
   else
     rm -f "$STATE/auth-needed"
   fi
+  # From here on this cell owns auth the share has not seen. The owed marker
+  # is durable on the worktree disk, so a cell that dies before its clean
+  # shutdown - the only place the push runs - still reports the skipped
+  # write-back on its next attempt instead of losing it silently.
+  printf 'auth pulled from share %s at %s; a write-back is owed\n' \
+    "$AUTH_SHARE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$STATE/auth-push-owed"
+  chmod 0600 "$STATE/auth-push-owed"
 }
 
 auth_home_push() {
@@ -320,7 +327,17 @@ auth_home_push() {
     >>"$LOGS/auth-sync-a$ATTEMPT.log" 2>&1
   push_rc=$?
   set -e
-  [ "$push_rc" -eq 0 ] || echo "validation guest: auth-home push failed; refreshed tokens stay cell-local" >&2
+  if [ "$push_rc" -eq 0 ]; then
+    rm -f "$STATE/auth-push-owed" "$STATE/auth-push-failed"
+    return 0
+  fi
+  # A warning on stderr dies with the guest. The share is now stale, every
+  # later boot starts from an older credential, and only a durable marker
+  # carried into the operator report says so.
+  printf 'auth-home push to share %s failed with status %s at %s; refreshed tokens stay cell-local and the share is stale\n' \
+    "$AUTH_SHARE" "$push_rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$STATE/auth-push-failed"
+  chmod 0600 "$STATE/auth-push-failed"
+  echo "validation guest: auth-home push failed; refreshed tokens stay cell-local" >&2
 }
 
 if [ "$MODE" = start ]; then
@@ -978,6 +995,11 @@ REPORT=$STATE/report.md
   printf -- "- Run id: \`%s\`\n" "${RUN_ID:-unavailable}"
   if [ -f "$STATE/auth-needed" ]; then
     printf -- "- Auth: \`interactive provider auth needed once (auth share empty)\`\n"
+  fi
+  if [ -f "$STATE/auth-push-failed" ]; then
+    printf -- "- Auth write-back: \`FAILED - refreshed tokens stayed cell-local and %s is stale\`\n" "$AUTH_SHARE"
+  elif [ -f "$STATE/auth-push-owed" ]; then
+    printf -- "- Auth write-back: \`SKIPPED - an attempt ended without reaching its clean-shutdown push to %s\`\n" "$AUTH_SHARE"
   fi
 } >"$REPORT"
 

@@ -60,6 +60,7 @@ MODEL_GUEST = ROOT / "bin" / "fm-crosscheck-azure-model-guest.sh"
 RUNNER_CONTROLLER = ROOT / "bin" / "fm-azure-runner.py"
 RUNNER_GUEST = ROOT / "bin" / "fm-azure-runner-guest.sh"
 RUNNER_EXECUTOR = ROOT / "bin" / "fm-azure-runner-exec.py"
+CREDENTIAL_EXPIRY = ROOT / "bin" / "fm-credential-expiry.py"
 
 
 class AzureCrosscheckError(RuntimeError):
@@ -154,6 +155,45 @@ def load_tool_bridge() -> Any:
         "firstmate_azure_crosscheck_tool_bridge",
         "Azure Crosscheck host tool bridge",
     )
+
+
+def load_credential_expiry() -> Any:
+    return load_module(
+        CREDENTIAL_EXPIRY,
+        "firstmate_credential_expiry",
+        "provider credential expiry preflight",
+    )
+
+
+def preflight_reviewer_credential(core: Any, config: dict[str, str]) -> dict[str, Any]:
+    """Refuse a dead reviewer credential before any billable compartment.
+
+    The model compartment's egress allowlist is Azure DNS plus exactly one
+    provider API host (docs/azure-crosscheck/network-policy.json), and a
+    provider auth host is not on it. A CLI inside the compartment therefore
+    cannot refresh an expired token, so `refreshable` is not recoverable
+    there: the credential must already authenticate and must still do so
+    after the review deadline. Raising the core tool failure lets the
+    reviewer roster skip this account and try the next one, which is the
+    same treatment any other environment fault gets.
+    """
+
+    expiry = load_credential_expiry()
+    record = expiry.inspect_profile(
+        config["account_home"],
+        harness=config["harness"],
+        margin_seconds=bounded_environment_integer(
+            "FM_CROSSCHECK_REVIEWER_TIMEOUT_SECONDS", 1800, 30, MAX_REVIEW_SECONDS
+        ),
+    )
+    try:
+        expiry.require_state(record, "usable", "Azure Crosscheck reviewer")
+    except expiry.CredentialExpiryError as exc:
+        raise core.CrosscheckToolError(
+            f"{exc}; re-authenticate that account before another review "
+            "(no model compartment, lane, or staged object was created)"
+        ) from exc
+    return record
 
 
 def azure_review_enabled(home: Path) -> bool:
@@ -1459,6 +1499,11 @@ def run_azure_review(
     until a lane frees, in exact submission order. The lane index selects the
     reviewer SKU deterministically so concurrent reviewers spread families.
     """
+    # Expiry first: a dead credential must cost nothing. This runs before the
+    # lane wait, before any Azure call, and before any staged object, so an
+    # expired reviewer is skipped instead of provisioning a VM that dies with
+    # an unrefreshable session.
+    preflight_reviewer_credential(core, config)
     probe = runtime_config(home)
     lane, lane_handle = acquire_review_lane(
         home, probe["lanes"], probe["queue_wait_seconds"]

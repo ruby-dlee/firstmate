@@ -107,6 +107,25 @@ A result schema `fm.azure-validation-result/v1` repeats the home, task, task gen
 A passed result additionally requires a full PR URL, CI-green marker, exact remote-current head, and the complete independent behavior-shard receipt set.
 Wrong-head, wrong-run, wrong-disk, wrong-VM, wrong-boot, stale, partial, or malformed results are retained and refused.
 
+## Persistent auth home and expiry
+
+The `fm-auth-home` Azure Files share is exactly one home-shaped tree, not a profile pool.
+The guest's `auth_home_pull` copies the whole share into one cell home and then exports `CODEX_HOME=$HOME/.codex` or `CLAUDE_CONFIG_DIR=$HOME/.claude`, so the only paths any consumer reads are `.codex/auth.json` and `.claude/.credentials.json`.
+Azure Crosscheck reviewers never read the share at all; they receive a per-review credential archive.
+A multi-profile layout has no consumer and is not created.
+
+`bin/fm-credential-expiry.py` owns the question of whether one local account profile's credential is usable, and until when.
+It classifies a profile as `usable`, `refreshable`, `expired`, or `unusable` from the provider's own credential file, never emits token material, and never logs in or refreshes.
+`refreshable` means the access token is dead but refresh material survives; firstmate has no token refresh anywhere, so only an interactive login, or the provider CLI reaching its own auth host from wherever the profile runs, turns `refreshable` into `usable`.
+
+`bin/fm-azure-validation.sh auth-seed` publishes a locally re-authenticated credential onto the share so cells stop booting with a dead token.
+It plans locally with no Azure call, refuses any profile that is not `usable`, uploads only the credential file into the layout above, and re-reads the share to prove the exact byte count landed.
+`--apply` additionally requires `--confirm-seed` and the exact `--confirm-subscription`.
+
+The clean-shutdown `auth_home_push` is the only write-back.
+A pull now leaves a durable `auth-push-owed` marker on the worktree disk, a failed push leaves `auth-push-failed`, and a successful push clears both.
+The cell report surfaces the surviving marker the same way it surfaces `auth-needed`, so a stale share is an operator signal rather than a stderr line that died with the guest.
+
 ## Credential lease
 
 Credential bytes never enter the repository bundle, runtime bundle, request JSON, local state JSON, Azure tags, ARM parameters, snapshots, reports, command logs, shard requests, shard responses, or identity-less command VMs.

@@ -393,28 +393,93 @@ PY
 }
 
 guest_writeback_markers_unit() {
-  python3 - "$GUEST" <<'PY' || fail "guest auth write-back marker contract failed"
+  local work
+  work=$(fm_test_tmproot fm-credential-expiry-guest)
+  mkdir -p "$work/state" "$work/logs" "$work/fakebin" "$work/home"
+
+  # Drive the guest's real auth-sync functions in isolation. The auth-sync
+  # helper is PATH-shimmed so pull and push outcomes are chosen by the test
+  # rather than by an Azure Files share.
+  python3 - "$GUEST" "$work/functions.sh" <<'EXTRACT' || fail "guest auth function extraction failed"
 import pathlib
 import sys
 
 guest = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-# A failed write-back left only a stderr warning that died with the guest. It
-# must now leave the same class of durable marker as the empty-share case, and
-# that marker must reach the operator report.
-assert '"$STATE/auth-push-failed"' in guest
-assert '"$STATE/auth-push-owed"' in guest
-assert guest.index('>"$STATE/auth-push-owed"') < guest.index("auth_home_push() {")
-assert 'rm -f "$STATE/auth-push-owed" "$STATE/auth-push-failed"' in guest
-assert "Auth write-back:" in guest
-# The report must be composed after the push decides, or it reports the marker
-# state of the previous attempt.
-assert guest.index("\nauth_home_push\n") < guest.index("REPORT=$STATE/report.md")
-assert guest.index("Auth write-back:") > guest.index("REPORT=$STATE/report.md")
-# Both surfaced states are distinguishable: a push that ran and failed, and a
-# write-back that never completed at all.
+start = guest.index("auth_home_pull() {")
+end = guest.index('\nif [ "$MODE" = start ]; then', start)
+pathlib.Path(sys.argv[2]).write_text(guest[start:end] + "\n", encoding="utf-8")
+EXTRACT
+
+  cat >"$work/fakebin/python3" <<'PYSHIM'
+#!/bin/sh
+# Stand in for the guest's auth-sync helper. The pull always succeeds so the
+# push outcome is the only variable; FM_TEST_AUTH_SYNC_RC picks it and
+# FM_TEST_AUTH_SYNC_COUNT is the pulled-file count the pull reports.
+if [ "$2" = pull ]; then
+  printf '%s\n' "${FM_TEST_AUTH_SYNC_COUNT:-1}"
+  exit 0
+fi
+exit "${FM_TEST_AUTH_SYNC_RC:-0}"
+PYSHIM
+  chmod +x "$work/fakebin/python3"
+
+  drive_auth() {
+    env PATH="$work/fakebin:$PATH" \
+      FM_TEST_AUTH_SYNC_RC="$1" FM_TEST_AUTH_SYNC_COUNT="$2" \
+      FM_TEST_AUTH_MODE="$3" FM_TEST_AUTH_WORK="$work" \
+      bash -c '
+        set -u
+        AUTH_SYNC=/dev/null
+        STORAGE_ACCOUNT=acct
+        AUTH_SHARE=fm-auth-home
+        IDENTITY_CLIENT_ID=cid
+        HOME_DIR=$FM_TEST_AUTH_WORK/home
+        STATE=$FM_TEST_AUTH_WORK/state
+        LOGS=$FM_TEST_AUTH_WORK/logs
+        ATTEMPT=1
+        . "$FM_TEST_AUTH_WORK/functions.sh"
+        auth_home_pull
+        [ "$FM_TEST_AUTH_MODE" = pull-only ] || auth_home_push
+      '
+  }
+
+  rm -f "$work/state"/auth-*
+  drive_auth 0 1 pull-only
+  assert_present "$work/state/auth-push-owed" "a pulled auth home recorded no owed write-back"
+
+  rm -f "$work/state"/auth-*
+  # A push that fails must leave a durable marker, not just a dead stderr line.
+  drive_auth 1 1 push
+  assert_present "$work/state/auth-push-failed" "a failed auth write-back left no durable marker"
+  assert_present "$work/state/auth-push-owed" "a failed auth write-back cleared the owed marker"
+  assert_grep "fm-auth-home" "$work/state/auth-push-failed" "the failure marker did not name the stale share"
+
+  rm -f "$work/state"/auth-*
+  drive_auth 0 1 push
+  assert_absent "$work/state/auth-push-failed" "a successful write-back left a stale failure marker"
+  assert_absent "$work/state/auth-push-owed" "a successful write-back left the owed marker behind"
+
+  rm -f "$work/state"/auth-*
+  # The empty-share case keeps its existing interactive-auth marker.
+  drive_auth 0 0 push
+  assert_present "$work/state/auth-needed" "an empty auth share left no interactive-auth marker"
+
+  python3 - "$GUEST" <<'REPORTCONTRACT' || fail "guest auth report contract failed"
+import pathlib
+import re
+import sys
+
+guest = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 report = guest[guest.index("REPORT=$STATE/report.md"):]
+# Both durable markers must reach the operator report, the same way the
+# existing empty-share marker does.
+assert '[ -f "$STATE/auth-push-failed" ]' in report, report[:2000]
+assert '[ -f "$STATE/auth-push-owed" ]' in report, report[:2000]
+assert len(re.findall(r"Auth write-back:", report)) == 2, report[:2000]
 assert "FAILED" in report and "SKIPPED" in report
-PY
+# The report is composed after the push decides, or it prints stale state.
+assert guest.index("\nauth_home_push\n") < guest.index("REPORT=$STATE/report.md")
+REPORTCONTRACT
   pass "a failed or incomplete auth write-back leaves a durable marker and reaches the operator report"
 }
 

@@ -479,6 +479,29 @@ except module.ProviderError as exc:
     assert "no exact durable reservation" in str(exc)
 else:
     raise AssertionError("active specialized VM without reservation was accepted")
+# A shard that declares no reserved capacity never mints a reservation identity.
+# Demanding one refused every WORKER operation for as long as any crosscheck
+# shard was up, because this inventory is global and fails closed: an unrelated
+# lane's compute took the worker lane down, with an error naming reservations.
+unreserved_vm = copy.deepcopy(specialized_vm)
+unreserved_vm["tags"]["invocation-binding"] = "azr-00000000beef"
+unreserved_vm["tags"]["capacity-reservation-vcpus"] = "0"
+unreserved_vm["tags"]["capacity-parent"] = "none"
+capacity, unreserved_family = module.specialized_capacity_inventory(
+    controller, [unreserved_vm], []
+)
+# Its vCPUs still count. Quota, not the reservation ledger, is what actually
+# bounds concurrent spend, so exempting the ledger must not exempt the quota.
+assert unreserved_family["standardDav6Family"] == 4, unreserved_family
+# And a shard that DOES claim reserved capacity is still held to a reservation.
+claiming_vm = copy.deepcopy(unreserved_vm)
+claiming_vm["tags"]["capacity-reservation-vcpus"] = "4"
+try:
+    module.specialized_capacity_inventory(controller, [claiming_vm], [])
+except module.ProviderError as exc:
+    assert "no exact durable reservation" in str(exc)
+else:
+    raise AssertionError("a shard claiming reserved capacity skipped its reservation")
 foreign = copy.deepcopy(reservation)
 foreign["tags"]["cleanup-owner"] = "foreign"
 try:

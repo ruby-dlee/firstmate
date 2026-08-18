@@ -473,35 +473,29 @@ capacity, active_family = module.specialized_capacity_inventory(
     controller, [specialized_vm], [reservation]
 )
 assert capacity[0]["active"] is True and active_family["standardDav6Family"] == 4
-try:
-    module.specialized_capacity_inventory(controller, [specialized_vm], [])
-except module.ProviderError as exc:
-    assert "no exact durable reservation" in str(exc)
-else:
-    raise AssertionError("active specialized VM without reservation was accepted")
-# A shard that declares no reserved capacity never mints a reservation identity.
-# Demanding one refused every WORKER operation for as long as any crosscheck
-# shard was up, because this inventory is global and fails closed: an unrelated
-# lane's compute took the worker lane down, with an error naming reservations.
-unreserved_vm = copy.deepcopy(specialized_vm)
-unreserved_vm["tags"]["invocation-binding"] = "azr-00000000beef"
-unreserved_vm["tags"]["capacity-reservation-vcpus"] = "0"
-unreserved_vm["tags"]["capacity-parent"] = "none"
-capacity, unreserved_family = module.specialized_capacity_inventory(
-    controller, [unreserved_vm], []
+# NO refusal for an active specialized VM without a reservation: nothing in this
+# repo mints a runner-cost-reservation identity, so that requirement could never
+# be met, and being global and fail-closed it refused every WORKER operation
+# while ANOTHER lane had compute up.
+capacity, no_ledger_family = module.specialized_capacity_inventory(
+    controller, [specialized_vm], []
 )
-# Its vCPUs still count. Quota, not the reservation ledger, is what actually
-# bounds concurrent spend, so exempting the ledger must not exempt the quota.
-assert unreserved_family["standardDav6Family"] == 4, unreserved_family
-# And a shard that DOES claim reserved capacity is still held to a reservation.
-claiming_vm = copy.deepcopy(unreserved_vm)
-claiming_vm["tags"]["capacity-reservation-vcpus"] = "4"
-try:
-    module.specialized_capacity_inventory(controller, [claiming_vm], [])
-except module.ProviderError as exc:
-    assert "no exact durable reservation" in str(exc)
-else:
-    raise AssertionError("a shard claiming reserved capacity skipped its reservation")
+assert no_ledger_family["standardDav6Family"] == 4, no_ledger_family
+
+# Both real producer shapes must pass. bin/fm-azure-runner.py defaults to
+# ("none","0") for a standalone shard, while bin/fm-azure-validation.py launches
+# one with a REAL parent and a real reserved count. Matching only the first shape
+# was tried and left the outage live for every validation-cell run.
+for parent, reserved in (("none", "0"), ("azv-0000000000ab", "40")):
+    lane_vm = copy.deepcopy(specialized_vm)
+    lane_vm["tags"]["invocation-binding"] = "azr-0000000000fe"
+    lane_vm["tags"]["capacity-parent"] = parent
+    lane_vm["tags"]["capacity-reservation-vcpus"] = reserved
+    _, lane_family = module.specialized_capacity_inventory(controller, [lane_vm], [])
+    assert lane_family["standardDav6Family"] == 4, (parent, reserved, lane_family)
+
+# The guards that DO still fail closed are untouched: a foreign owner is still
+# refused even though the reservation requirement is gone.
 foreign = copy.deepcopy(reservation)
 foreign["tags"]["cleanup-owner"] = "foreign"
 try:

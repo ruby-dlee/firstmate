@@ -844,6 +844,65 @@ operator_documentation_contract() {
   pass "operator documentation records queue, cost, failure, recovery, eight-shard, scale-zero, and real acceptance contracts"
 }
 
+shard_receipt_demotion_contract() {
+  local work block
+  work=$(fm_test_tmproot fm-azure-validation-shard-demotion)
+  # Execute the guest's real demotion text rather than grepping for it: a
+  # source-text assertion passes on a block that cannot run.
+  block=$work/demote.sh
+  awk '/^SHARD_EXPECTED=/,/^esac$/' "$GUEST" >"$block"
+  [ -s "$block" ] || fail "the shard demotion block was not found in the guest"
+  grep -q 'OUTCOME=failed' "$block" || fail "the extracted block does not demote the outcome"
+
+  printf '{"limits":{"behavior_shards":8}}\n' >"$work/request.json"
+
+  # The guest runs under `set -euo pipefail`; drive the block under the same
+  # options so a demotion that aborts the run cannot pass as a demotion.
+  cat >"$work/drive.sh" <<'DRIVER'
+set -euo pipefail
+. "$FM_TEST_DEMOTE_BLOCK"
+printf '%s\t%s\t%s\n' "$OUTCOME" "$CHECKS_GREEN" "$SHARD_SHORTFALL"
+DRIVER
+
+  drive_demote() {
+    # $1 = starting outcome, $2 = receipts JSON body
+    printf '%s\n' "$2" >"$work/receipts.json"
+    env REQUEST="$work/request.json" SHARD_RECEIPTS="$work/receipts.json" \
+      OUTCOME="$1" CHECKS_GREEN=true FM_TEST_DEMOTE_BLOCK="$block" \
+      bash "$work/drive.sh"
+  }
+
+  local full out
+  full=$(python3 -c 'import json;print(json.dumps([{"shard":i} for i in range(1,9)]))')
+
+  out=$(drive_demote passed "$full")
+  assert_contains "$out" "passed" "a complete receipt set did not keep its passed outcome"
+  case "$out" in *failed*) fail "a complete receipt set was demoted" ;; esac
+
+  # The stranding case: the bridge never ran, so the guest substituted an empty
+  # set and still reported passed. The controller then refused the whole result
+  # and the cell could never be collected, closed, or retained on its own
+  # outcome, holding its worktree disk indefinitely.
+  out=$(drive_demote passed '[]')
+  assert_contains "$out" "failed" "a passed outcome with no shard receipts was not demoted"
+  assert_contains "$out" "found 0" "the demotion did not report the observed receipt count"
+  case "$out" in *"	true	"*) fail "a demoted outcome kept its CI-green marker" ;; esac
+
+  out=$(drive_demote checks-passed "$(python3 -c 'import json;print(json.dumps([{"shard":i} for i in range(1,4)]))')")
+  assert_contains "$out" "failed" "a partial receipt set was not demoted"
+
+  # A run that already failed is not touched, so the demotion cannot invent a
+  # second reason for a failure that already has one.
+  out=$(drive_demote failed '[]')
+  case "$out" in
+    failed*) : ;;
+    *) fail "an already-failed outcome was rewritten by the shard check" ;;
+  esac
+  case "$out" in *"receipts, found"*) fail "an already-failed outcome gained a spurious shard shortfall" ;; esac
+
+  pass "a passed cell result without its complete shard receipt set is demoted in the guest, not refused after the spend"
+}
+
 static_contract
 submit_contract
 security_negative_contract
@@ -858,3 +917,4 @@ shard_runner_integration_contract
 cleanup_recovery_contract
 multi_lane_queue_contract
 operator_documentation_contract
+shard_receipt_demotion_contract

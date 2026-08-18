@@ -931,6 +931,28 @@ CHECKS_GREEN=false
 case "$OUTCOME" in passed|checks-passed) CHECKS_GREEN=true ;; esac
 SHARD_RECEIPTS=$SHARD_EXCHANGE/receipts.json
 [ -f "$SHARD_RECEIPTS" ] || printf '[]\n' >"$SHARD_RECEIPTS"
+# A passed outcome asserts the complete independent behavior-shard receipt set
+# (docs/azure-validation.md: "A missing ... shard fails the no-mistakes test
+# step"). When the bridge never ran, the substituted empty set above turns
+# "sharding did not happen" into "passed with no receipts", and the controller
+# then refuses the entire result as malformed. That refusal is correct but it
+# lands too late to be useful: the cell never reaches `collected`, so it can
+# neither close nor be retained on its own outcome, and its worktree disk stays
+# allocated with nothing in the result saying why. Demote here instead, where
+# the reason is still known.
+SHARD_EXPECTED=$(jq -r '.limits.behavior_shards' "$REQUEST" 2>/dev/null || echo 0)
+SHARD_OBSERVED=$(jq -r 'if type == "array" then length else -1 end' "$SHARD_RECEIPTS" 2>/dev/null || echo -1)
+SHARD_SHORTFALL=""
+case "$OUTCOME" in
+  passed|checks-passed)
+    if [ "$SHARD_OBSERVED" != "$SHARD_EXPECTED" ]; then
+      SHARD_SHORTFALL="expected $SHARD_EXPECTED behavior-shard receipts, found $SHARD_OBSERVED"
+      echo "validation guest: $SHARD_SHORTFALL; demoting outcome $OUTCOME to failed" >&2
+      OUTCOME=failed
+      CHECKS_GREEN=false
+    fi
+    ;;
+esac
 install -d -m 0700 -o fmvalidate -g fmvalidate "$EVIDENCE/attempt-$ATTEMPT"
 cp "$SHARD_RECEIPTS" "$EVIDENCE/attempt-$ATTEMPT/behavior-shards.json"
 # The outcome derivation reads the status log; archive it with the evidence
@@ -1003,6 +1025,9 @@ REPORT=$STATE/report.md
   printf -- "- Submitted head: \`%s\`\n" "$(jq -r '.repository.head' "$REQUEST")"
   printf -- "- Current head: \`%s\`\n" "$CURRENT_HEAD"
   printf -- "- Run id: \`%s\`\n" "${RUN_ID:-unavailable}"
+  if [ -n "$SHARD_SHORTFALL" ]; then
+    printf -- "- Behavior shards: \`%s; outcome demoted to failed\`\n" "$SHARD_SHORTFALL"
+  fi
   if [ -f "$STATE/auth-needed" ]; then
     printf -- "- Auth: \`interactive provider auth needed once (auth share empty)\`\n"
   fi

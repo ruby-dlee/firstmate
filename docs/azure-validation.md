@@ -105,6 +105,8 @@ The newly created worktree LUKS UUID is retained in the durable run identity, re
 
 A result schema `fm.azure-validation-result/v1` repeats the home, task, task generation, validation generation, cell, fence, branch, submitted head, current head, remote head, worktree disk, credential lease, no-mistakes run, VM, instance, and boot identities.
 A passed result additionally requires a full PR URL, CI-green marker, exact remote-current head, and the complete independent behavior-shard receipt set.
+The guest enforces the receipt half of that before it assembles the result: a `passed` or `checks-passed` run whose receipt count does not match the requested shard count is demoted to `failed` in the cell, with the expected and observed counts in the report.
+The controller keeps its own refusal as a second line, but the demotion is what makes the shortfall actionable: a result refused as malformed never reaches `collected`, so the cell can neither close on its head nor retain on its own outcome, and its worktree disk stays allocated with nothing in the result saying why.
 Wrong-head, wrong-run, wrong-disk, wrong-VM, wrong-boot, stale, partial, or malformed results are retained and refused.
 
 ## Persistent auth home and expiry

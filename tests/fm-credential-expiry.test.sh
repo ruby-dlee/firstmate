@@ -60,6 +60,10 @@ write("codex", "stale", "auth.json", codex({
     "access_token": jwt(now - 3600), "refresh_token": marker,
     "id_token": jwt(now - 3600), "account_id": "acct-stale",
 }))
+write("codex", "expiring", "auth.json", codex({
+    "access_token": jwt(now + 1200), "refresh_token": marker,
+    "id_token": jwt(now + 1200), "account_id": "acct-expiring",
+}))
 write("codex", "orphan", "auth.json", codex({
     "access_token": jwt(now - 3600), "refresh_token": "",
     "id_token": jwt(now - 3600), "account_id": "acct-orphan",
@@ -234,7 +238,18 @@ exit 0
 AZ
   chmod +x "$fakebin/az"
 
-  PATH="$fakebin:$PATH" python3 - "$ADAPTER" "$CORE" "$work" <<'PY' || fail "Azure Crosscheck reviewer preflight contract failed"
+  # A complete Azure scope, so a refused reviewer is refused by the preflight
+  # and not by an absent environment. Without it, runtime_config raises before
+  # any lane or CLI call is reached and the no-lane/no-az assertions below hold
+  # identically whether the preflight exists or not.
+  PATH="$fakebin:$PATH" \
+  FM_AZURE_TENANT_ID=11111111-1111-4111-8111-111111111111 \
+  FM_AZURE_SUBSCRIPTION_ID=11111111-1111-4111-8111-111111111111 \
+  FM_AZURE_NAMING_PREFIX=fmtest FM_AZURE_STORAGE_NAME=stfmtest \
+  FM_AZURE_DEPLOYMENT_GENERATION=gen-1 FM_AZURE_OWNER_TAG=owner \
+  FM_AZURE_RUNNER_OPERATOR_OBJECT_ID=11111111-1111-4111-8111-111111111111 \
+  FM_CROSSCHECK_AZURE_MODEL_IMAGE_ID="/subscriptions/11111111-1111-4111-8111-111111111111/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/i/versions/1.0.0" \
+  python3 - "$ADAPTER" "$CORE" "$work" <<'PY' || fail "Azure Crosscheck reviewer preflight contract failed"
 import importlib.util
 import inspect
 import pathlib
@@ -256,11 +271,13 @@ work = pathlib.Path(sys.argv[3])
 pool = work / "pool"
 home = work / "home"
 
-# The preflight must be the first thing run_azure_review does: before the FIFO
-# lane wait, before runtime_config, before any staged object.
+# The preflight runs before the FIFO lane wait, before runtime_config, and
+# before any staged object - and again once the lane is held, because the lane
+# wait can outlast the credential.
 source = inspect.getsource(adapter.run_azure_review)
 assert source.index("preflight_reviewer_credential") < source.index("acquire_review_lane")
 assert source.index("preflight_reviewer_credential") < source.index("runtime_config")
+assert source.rindex("preflight_reviewer_credential") > source.index("acquire_review_lane")
 
 
 def review(profile, harness):
@@ -295,20 +312,76 @@ except core.CrosscheckToolError as exc:
 else:
     raise AssertionError("a refreshable reviewer reached the Azure compartment path")
 
-# Positive control: a live credential passes the preflight and only then meets
-# the ordinary Azure environment gate. Without this, a preflight that refused
-# everything would still satisfy the refusals above.
+# A credential alive right now but dead before the review deadline is refused
+# too. This is the only fixture the review margin participates in: without it
+# the margin could be zeroed and every assertion here would still pass.
 try:
-    review(pool / "codex" / "live", "codex")
-except adapter.AzureCrosscheckError as exc:
-    assert "environment is missing" in str(exc), str(exc)
+    review(pool / "codex" / "expiring", "codex")
+except core.CrosscheckToolError as exc:
+    # 1200s of life is more than the module default margin (900) and less than
+    # the caller's review margin (1800), so only the caller's own margin
+    # refuses it: dropping that argument makes this fixture pass.
+    assert "acct" not in str(exc)
+    assert "refreshable" in str(exc) or "expired" in str(exc), str(exc)
 else:
-    raise AssertionError("a usable reviewer did not reach the Azure environment gate")
+    raise AssertionError("a reviewer that dies mid-review reached the Azure compartment path")
 
-# No lane was taken and no Azure call was made on any refused path.
+# Nothing above took a lane or ran the Azure CLI.
 lanes = adapter.lane_root(home)
 assert not lanes.exists() or not any(lanes.iterdir()), "a refused reviewer held a review lane"
 assert not (work / "az-invocations").exists(), "a refused reviewer invoked the Azure CLI"
+
+# Positive control for those two assertions: a usable credential must get PAST
+# the preflight and reach the billable machinery. If it did not, the two checks
+# above would be satisfied by a code path that never reaches a lane or a CLI at
+# all, and would stay green with the whole feature deleted.
+try:
+    review(pool / "codex" / "live", "codex")
+except Exception:
+    pass
+assert (work / "az-invocations").exists() or (
+    lanes.exists() and any(lanes.iterdir())
+), "a usable reviewer never reached a lane or the Azure CLI, so the refusal assertions prove nothing"
+
+# The second preflight, the one that gates spend, is proved by expiring the
+# credential during the lane wait: the pre-lane call saw a live token, so only
+# a check behind the lane can refuse this.
+expiring_home = pool / "codex" / "secondgate"
+expiring_home.mkdir(parents=True)
+live_body = (pool / "codex" / "live" / "auth.json").read_text(encoding="utf-8")
+dead_body = (pool / "codex" / "stale" / "auth.json").read_text(encoding="utf-8")
+(expiring_home / "auth.json").write_text(live_body, encoding="utf-8")
+
+# The positive control above deliberately ran into the billable machinery, so
+# compare against the lane state it left rather than against empty.
+lanes_before = sorted(q.name for q in lanes.iterdir()) if lanes.exists() else []
+real_acquire = adapter.acquire_review_lane
+
+
+def expire_during_wait(*args, **kwargs):
+    # Stand in for a queue wait that outlasts the token.
+    (expiring_home / "auth.json").write_text(dead_body, encoding="utf-8")
+    return real_acquire(*args, **kwargs)
+
+
+adapter.acquire_review_lane = expire_during_wait
+try:
+    try:
+        review(expiring_home, "codex")
+    except core.CrosscheckToolError as exc:
+        assert "expired" in str(exc), str(exc)
+    else:
+        raise AssertionError(
+            "a credential that died during the lane wait was never re-checked behind the lane"
+        )
+finally:
+    adapter.acquire_review_lane = real_acquire
+
+# That refusal released its lane rather than leaking it.
+lanes_after = sorted(q.name for q in lanes.iterdir()) if lanes.exists() else []
+assert lanes_after == lanes_before, (
+    "the second preflight leaked its review lane: %r -> %r" % (lanes_before, lanes_after)
+)
 PY
   pass "an expired or unrefreshable Azure reviewer is refused before any lane, Azure call, or compartment"
 }
@@ -412,10 +485,15 @@ EXTRACT
 
   cat >"$work/fakebin/python3" <<'PYSHIM'
 #!/bin/sh
-# Stand in for the guest's auth-sync helper. The pull always succeeds so the
-# push outcome is the only variable; FM_TEST_AUTH_SYNC_RC picks it and
-# FM_TEST_AUTH_SYNC_COUNT is the pulled-file count the pull reports.
+# Stand in for the guest's auth-sync helper. FM_TEST_AUTH_SYNC_RC picks the
+# push outcome and FM_TEST_AUTH_SYNC_COUNT is the pulled-file count the pull
+# reports. FM_TEST_AUTH_PULL_RC picks the pull outcome separately, because the
+# guest takes a different branch when the pull itself fails and that branch
+# cannot be reached while the pull is hardwired to succeed.
 if [ "$2" = pull ]; then
+  if [ "${FM_TEST_AUTH_PULL_RC:-0}" -ne 0 ]; then
+    exit "${FM_TEST_AUTH_PULL_RC}"
+  fi
   printf '%s\n' "${FM_TEST_AUTH_SYNC_COUNT:-1}"
   exit 0
 fi
@@ -424,7 +502,10 @@ PYSHIM
   chmod +x "$work/fakebin/python3"
 
   cat >"$work/drive.sh" <<'DRIVER'
-set -u
+# The guest runs under `set -euo pipefail`. Driving these functions under
+# anything weaker cannot observe a marker write that aborts the run, which is
+# exactly the failure this unit exists to catch.
+set -euo pipefail
 AUTH_SYNC=/dev/null
 STORAGE_ACCOUNT=acct
 AUTH_SHARE=fm-auth-home
@@ -436,12 +517,17 @@ ATTEMPT=1
 . "$FM_TEST_AUTH_WORK/functions.sh"
 auth_home_pull
 [ "$FM_TEST_AUTH_MODE" = pull-only ] || auth_home_push
+# Stands in for everything the guest does after auth: packaging the report,
+# uploading the result blob, and echoing the completion marker the caller
+# blocks on. If a marker write can abort the run, this line is what disappears.
+echo FM-TEST-RUN-REACHED-END
 DRIVER
 
   drive_auth() {
     env PATH="$work/fakebin:$PATH" \
       FM_TEST_AUTH_SYNC_RC="$1" FM_TEST_AUTH_SYNC_COUNT="$2" \
-      FM_TEST_AUTH_MODE="$3" FM_TEST_AUTH_WORK="$work" \
+      FM_TEST_AUTH_MODE="$3" FM_TEST_AUTH_PULL_RC="${4:-0}" \
+      FM_TEST_AUTH_WORK="$work" \
       bash "$work/drive.sh"
   }
 
@@ -465,6 +551,39 @@ DRIVER
   # The empty-share case keeps its existing interactive-auth marker.
   drive_auth 0 0 push
   assert_present "$work/state/auth-needed" "an empty auth share left no interactive-auth marker"
+
+  # A marker is a note to the operator; the run outranks it. With an unwritable
+  # state directory every marker write fails, and under the guest's own
+  # `set -euo pipefail` that must not stop the run: the pull marker would abort
+  # before the run starts, and the push marker would abort a completed run
+  # before it packages its result or echoes its completion marker.
+  rm -f "$work/state"/auth-*
+  chmod 0500 "$work/state"
+  code=0
+  out=$(drive_auth 1 1 push 2>/dev/null) || code=$?
+  chmod 0700 "$work/state"
+  expect_code 0 "$code" "an unwritable state directory turned an auth marker into a run-killer"
+  assert_contains "$out" "FM-TEST-RUN-REACHED-END" \
+    "a failed auth marker write stopped the run before it could package its result"
+
+  # Same for the pull-side marker, which sits before the run rather than after
+  # it: a failure there must not stop the run from starting.
+  rm -f "$work/state"/auth-*
+  chmod 0500 "$work/state"
+  code=0
+  out=$(drive_auth 0 1 push 2>/dev/null) || code=$?
+  chmod 0700 "$work/state"
+  expect_code 0 "$code" "an unwritable state directory stopped the run before it started"
+  assert_contains "$out" "FM-TEST-RUN-REACHED-END" \
+    "a failed owed-marker write stopped the run before it started"
+
+  # The owed marker must not claim a pull that did not happen.
+  rm -f "$work/state"/auth-*
+  drive_auth 0 1 pull-only 1
+  assert_grep "seeded bundle" "$work/state/auth-push-owed" "the owed marker claimed a pull that failed"
+  rm -f "$work/state"/auth-*
+  drive_auth 0 0 pull-only
+  assert_grep "empty share" "$work/state/auth-push-owed" "the owed marker claimed a pull from an empty share"
 
   python3 - "$GUEST" <<'REPORTCONTRACT' || fail "guest auth report contract failed"
 import pathlib

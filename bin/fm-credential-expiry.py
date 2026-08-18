@@ -471,7 +471,12 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument(
         "--margin-seconds", type=float, default=DEFAULT_MARGIN_SECONDS
     )
-    check.add_argument("--min-state", choices=list(STATE_ORDER), default="usable")
+    # Deliberately not the full STATE_ORDER: `check --min-state unusable` is a
+    # gate that cannot refuse anything, which is worse than no gate because it
+    # reads like one.
+    check.add_argument(
+        "--min-state", choices=["usable", "refreshable"], default="usable"
+    )
     check.set_defaults(handler=_command_check)
     return parser
 

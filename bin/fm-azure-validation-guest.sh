@@ -305,20 +305,30 @@ auth_home_pull() {
   elif [ "${pulled:-0}" -eq 0 ]; then
     # First-ever boot against an empty share: proceed, but leave a durable
     # marker so the operator knows one interactive auth is still needed.
-    printf 'auth share %s was empty at %s; interactive provider auth is needed once\n' \
-      "$AUTH_SHARE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$STATE/auth-needed"
-    chmod 0600 "$STATE/auth-needed"
+    { printf 'auth share %s was empty at %s; interactive provider auth is needed once\n' \
+      "$AUTH_SHARE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$STATE/auth-needed" \
+      && chmod 0600 "$STATE/auth-needed"; } || :
     echo "validation guest: auth share is empty; interactive auth marker written" >&2
   else
     rm -f "$STATE/auth-needed"
   fi
-  # From here on this cell owns auth the share has not seen. The owed marker
-  # is durable on the worktree disk, so a cell that dies before its clean
-  # shutdown - the only place the push runs - still reports the skipped
-  # write-back on its next attempt instead of losing it silently.
-  printf 'auth pulled from share %s at %s; a write-back is owed\n' \
-    "$AUTH_SHARE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$STATE/auth-push-owed"
-  chmod 0600 "$STATE/auth-push-owed"
+  # From here on this cell owns auth the share has not seen, whether it came
+  # from the share, from the seeded bundle after a failed pull, or from a first
+  # interactive auth against an empty share. The owed marker is durable on the
+  # worktree disk, so a cell that dies before its clean shutdown - the only
+  # place the push runs - carries the skipped write-back into its report
+  # instead of losing it silently. Naming the actual origin keeps the marker
+  # from asserting a pull that did not happen.
+  if [ "$pull_rc" -ne 0 ]; then
+    owed_origin="the seeded bundle after a failed pull from share $AUTH_SHARE"
+  elif [ "${pulled:-0}" -eq 0 ]; then
+    owed_origin="a first interactive auth against empty share $AUTH_SHARE"
+  else
+    owed_origin="a pull from share $AUTH_SHARE"
+  fi
+  { printf 'this cell owns auth from %s at %s; a write-back to %s is owed\n' \
+    "$owed_origin" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$AUTH_SHARE" >"$STATE/auth-push-owed" \
+    && chmod 0600 "$STATE/auth-push-owed"; } || :
 }
 
 auth_home_push() {
@@ -334,9 +344,9 @@ auth_home_push() {
   # A warning on stderr dies with the guest. The share is now stale, every
   # later boot starts from an older credential, and only a durable marker
   # carried into the operator report says so.
-  printf 'auth-home push to share %s failed with status %s at %s; refreshed tokens stay cell-local and the share is stale\n' \
-    "$AUTH_SHARE" "$push_rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$STATE/auth-push-failed"
-  chmod 0600 "$STATE/auth-push-failed"
+  { printf 'auth-home push to share %s failed with status %s at %s; refreshed tokens stay cell-local and the share is stale\n' \
+    "$AUTH_SHARE" "$push_rc" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$STATE/auth-push-failed" \
+    && chmod 0600 "$STATE/auth-push-failed"; } || :
   echo "validation guest: auth-home push failed; refreshed tokens stay cell-local" >&2
 }
 

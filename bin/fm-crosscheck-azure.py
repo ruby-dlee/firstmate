@@ -176,6 +176,10 @@ def preflight_reviewer_credential(core: Any, config: dict[str, str]) -> dict[str
     after the review deadline. Raising the core tool failure lets the
     reviewer roster skip this account and try the next one, which is the
     same treatment any other environment fault gets.
+
+    The margin covers the review, not the wait in front of it, so this is
+    called twice: once to fail fast, and once after the lane is held, which
+    is the call that actually stands between a dead token and a paid VM.
     """
 
     expiry = load_credential_expiry()
@@ -1499,16 +1503,25 @@ def run_azure_review(
     until a lane frees, in exact submission order. The lane index selects the
     reviewer SKU deterministically so concurrent reviewers spread families.
     """
-    # Expiry first: a dead credential must cost nothing. This runs before the
-    # lane wait, before any Azure call, and before any staged object, so an
-    # expired reviewer is skipped instead of provisioning a VM that dies with
-    # an unrefreshable session.
+    # Expiry first: a dead credential must cost nothing. This runs before any
+    # Azure call and before any staged object, so an already-expired reviewer
+    # is skipped instead of provisioning a VM that dies with an unrefreshable
+    # session.
     preflight_reviewer_credential(core, config)
     probe = runtime_config(home)
     lane, lane_handle = acquire_review_lane(
         home, probe["lanes"], probe["queue_wait_seconds"]
     )
     try:
+        # The check above bounded nothing but its own instant. acquire_review_lane
+        # blocks in FIFO order for up to queue_wait_seconds - 7200 by default and
+        # 86400 at the maximum - which is far longer than the review margin, so a
+        # credential admitted as usable can be long dead by the time a lane frees.
+        # Under load, which is exactly when spend is highest, the first check is
+        # the one that proves nothing. This second check is the one that gates
+        # spend: every billable action happens after it, and it costs one local
+        # file read.
+        preflight_reviewer_credential(core, config)
         return _run_azure_review_in_lane(
             core=core, root=root, home=home, task_id=task_id, pr_url=pr_url,
             review_dir=review_dir, proof_root=proof_root,

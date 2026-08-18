@@ -118,12 +118,15 @@ A multi-profile layout has no consumer and is not created.
 It classifies a profile as `usable`, `refreshable`, `expired`, or `unusable` from the provider's own credential file, never emits token material, and never logs in or refreshes.
 `refreshable` means the access token is dead but refresh material survives; firstmate has no token refresh anywhere, so only an interactive login, or the provider CLI reaching its own auth host from wherever the profile runs, turns `refreshable` into `usable`.
 
-`bin/fm-azure-validation.sh auth-seed` publishes a locally re-authenticated credential onto the share so cells stop booting with a dead token.
+`bin/fm-azure-validation.sh auth-seed` publishes a locally re-authenticated credential onto the share, so an operator can replace a dead share credential without waiting for a cell to fail on it.
+It gates what goes onto the share, not what comes off it: `dispatch_cell` does not re-check the share before creating a cell, so a credential that expires between seedings still reaches a booted cell.
 It plans locally with no Azure call, refuses any profile that is not `usable`, uploads only the credential file into the layout above, and re-reads the share to prove the exact byte count landed.
 `--apply` additionally requires `--confirm-seed` and the exact `--confirm-subscription`.
 
 The clean-shutdown `auth_home_push` is the only write-back.
-A pull now leaves a durable `auth-push-owed` marker on the worktree disk, a failed push leaves `auth-push-failed`, and a successful push clears both.
+A pull now leaves a durable `auth-push-owed` marker on the worktree disk naming where the cell's credential actually came from, a failed push leaves `auth-push-failed`, and a successful push clears both.
+Because a successful push clears the owed marker, an earlier skipped write-back is reported only while the share is still stale, which is the window in which it matters.
+Every marker write is best-effort: the guest runs under `set -euo pipefail`, and a note to the operator must never abort a run that has already been paid for.
 The cell report surfaces the surviving marker the same way it surfaces `auth-needed`, so a stale share is an operator signal rather than a stderr line that died with the guest.
 
 ## Credential lease

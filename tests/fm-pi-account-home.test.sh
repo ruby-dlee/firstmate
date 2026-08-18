@@ -49,6 +49,13 @@ path.write_text(json.dumps(pool, indent=2) + "\n", encoding="utf-8")
 PY
 }
 
+# `stat -f` is a BSD format string and a GNU filesystem-status flag, so a
+# `stat -f ... || stat -c ...` pair silently reports the wrong thing on Linux
+# rather than falling through. Python means one thing on both.
+file_mode() {
+  python3 -c 'import os,sys; print("%o" % (os.stat(sys.argv[1]).st_mode & 0o777))' "$1"
+}
+
 projection_contract() {
   local work pool out code
   work=$(fm_test_tmproot fm-pi-account-home)
@@ -74,10 +81,8 @@ PY
     "a sibling profile's account rode along into the projected home"
 
   # The consumer reads this file directly; wrong modes expose a live token.
-  expect_code 600 "$(stat -f '%Lp' "$work/homes/openai-codex-2/auth.json" 2>/dev/null \
-    || stat -c '%a' "$work/homes/openai-codex-2/auth.json")" "the projected credential is not owner-only"
-  expect_code 700 "$(stat -f '%Lp' "$work/homes/openai-codex-2" 2>/dev/null \
-    || stat -c '%a' "$work/homes/openai-codex-2")" "the projected account home is not owner-only"
+  expect_code 600 "$(file_mode "$work/homes/openai-codex-2/auth.json")" "the projected credential is not owner-only"
+  expect_code 700 "$(file_mode "$work/homes/openai-codex-2")" "the projected account home is not owner-only"
 
   # Nothing the command prints may carry token material.
   assert_no_grep "$MARKER" "$work/out.txt" "the projection printed token material"
@@ -174,7 +179,7 @@ PY
   (umask 000; "$TOOL" project --source "$pool" --destination-root "$work/deep/nested/root" \
     --profile openai-codex-2 >/dev/null 2>&1) || fail "projecting into a new root refused"
   for created in "$work/deep" "$work/deep/nested" "$work/deep/nested/root"; do
-    expect_code 700 "$(stat -f '%Lp' "$created" 2>/dev/null || stat -c '%a' "$created")" \
+    expect_code 700 "$(file_mode "$created")" \
       "a created ancestor was left readable to others under a permissive umask"
   done
 

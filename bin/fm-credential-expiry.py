@@ -69,6 +69,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+import time
 from typing import Any
 
 
@@ -249,8 +250,6 @@ def inspect_profile(
     name, state, both expiry instants, and a human detail line. It never
     carries token material, and no field is derived from one.
     """
-
-    import time
 
     moment = time.time() if now is None else float(now)
     path = Path(profile).expanduser()

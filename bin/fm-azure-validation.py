@@ -1107,7 +1107,7 @@ def auth_seed(env, args):
             "--share-name", share,
             "--name", target["share_directory"],
         ] + backup)
-        uploaded, code, detail = az_command(env, [
+        _, code, detail = az_command(env, [
             "storage", "file", "upload",
             "--account-name", env["storage"],
             "--share-name", share,
@@ -1118,7 +1118,9 @@ def auth_seed(env, args):
             raise ValidationError("auth-seed upload failed for {}: {}".format(
                 target["share_path"], detail
             ))
-        del uploaded
+        # An accepted upload is not proof: re-read the share and require the
+        # exact byte count, so a truncated or replaced object is caught here
+        # instead of at the next cell boot.
         published, code, detail = az_command(env, [
             "storage", "file", "show",
             "--account-name", env["storage"],
@@ -1126,9 +1128,7 @@ def auth_seed(env, args):
             "--path", target["share_path"],
         ] + backup, check=False)
         expected = target["source"].stat().st_size
-        published_size = (published or {}).get("properties", {}).get(
-            "contentLength", (published or {}).get("content_length")
-        )
+        published_size = ((published or {}).get("properties") or {}).get("contentLength")
         if code != 0 or published_size != expected:
             raise ValidationError(
                 "auth-seed could not prove {} landed at its expected {} bytes: {}".format(

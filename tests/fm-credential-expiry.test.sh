@@ -93,6 +93,18 @@ write("claude", "dead", ".credentials.json", {"claudeAiOauth": {
     "expiresAt": int((now - 864000) * 1000),
     "refreshTokenExpiresAt": int((now - 3600) * 1000),
 }})
+# A zeroed stamp is Claude's "no instant recorded", not an instant in 1970.
+# Reading zero as a real timestamp would declare live refresh material dead.
+write("claude", "zeroedrefresh", ".credentials.json", {"claudeAiOauth": {
+    "accessToken": marker, "refreshToken": marker,
+    "expiresAt": int((now - 3600) * 1000),
+    "refreshTokenExpiresAt": 0,
+}})
+write("claude", "clearedaccess", ".credentials.json", {"claudeAiOauth": {
+    "accessToken": marker, "refreshToken": marker,
+    "expiresAt": 0,
+    "refreshTokenExpiresAt": int((now + 864000) * 1000),
+}})
 write("claude", "blanked", ".credentials.json", {"claudeAiOauth": {
     "accessToken": "", "refreshToken": "",
     "expiresAt": 0,
@@ -131,6 +143,12 @@ expected = {
     ("claude", "stale"): "refreshable",
     # The refresh token's own declared expiry has passed: provably dead.
     ("claude", "dead"): "expired",
+    # A zeroed refresh stamp records no instant at all, so the refresh cannot
+    # be proved dead and this is stale, not expired.
+    ("claude", "zeroedrefresh"): "refreshable",
+    # A cleared access stamp is not an expiry in 1970; the live refresh token
+    # still makes this recoverable by an interactive login.
+    ("claude", "clearedaccess"): "refreshable",
     # Blanked token strings carry no material to classify at all.
     ("claude", "blanked"): "unusable",
     ("claude", "empty"): "unusable",

@@ -624,18 +624,30 @@ image=json.load(open(sys.argv[1]))
 policy=json.load(open(sys.argv[2]))
 parameters=image["parameters"]
 assert "ubuntuExactVersion" in parameters and "defaultValue" not in parameters["ubuntuExactVersion"]
-for name in (
+closure_parameters = (
     "codexCliUrl","codexCliSha256","codexCliBytes",
     "claudeCliUrl","claudeCliSha256","claudeCliBytes",
-    "modelGuestSha256","modelGuestBase64",
-):
+    "piTarballUrl","piTarballSha256","piTarballBytes","piVersion",
+    "nodeTarballUrl","nodeTarballSha256","nodeTarballBytes",
+)
+for name in closure_parameters + ("modelGuestSha256","modelGuestBase64"):
     assert name in parameters, name
 inline="\n".join(image["resources"][0]["properties"]["customize"][0]["inline"])
 for marker in (
     "mcp=disabled","skills=disabled","extensions=disabled","sessions=disabled","sha256sum -c",
-    "/usr/local/bin/codex","/usr/local/bin/claude",
+    "/usr/local/bin/codex","/usr/local/bin/claude","/usr/local/bin/pi","/usr/local/bin/node",
 ):
     assert marker in inline, marker
+# A declared parameter that no build step reads is a closure the image does not
+# actually carry, which parameter-presence alone cannot tell apart from one it
+# does. Every closure parameter must be referenced by the steps that build it.
+for name in closure_parameters:
+    assert "parameters('%s')" % name in inline, "unwired closure parameter: " + name
+# The Pi CLI is an npm package, so its interpreter has to be part of the same
+# pinned closure; a distribution-repository install would not be digest-bound.
+assert "deb.nodesource.com" not in inline and "add-apt-repository" not in inline
+# Ambient reviewer credential state, Pi's included, never survives the build.
+assert "'.pi'" in inline
 assert image["resources"][0]["properties"]["distribute"][0]["type"]=="ManagedImage"
 rules={rule["name"]:rule["properties"] for rule in policy["resources"][0]["properties"]["securityRules"]}
 assert rules["deny-all-inbound"]["access"]=="Deny" and rules["deny-all-inbound"]["direction"]=="Inbound"

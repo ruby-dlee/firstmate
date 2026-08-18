@@ -153,9 +153,22 @@ No resource group, subnet, shared storage account, foundation resource, sibling 
 
 The complete retained 29-resource private foundation, its controller-identity inventory correction, and the shared whole-fleet allocator are released on `main` with zero VMs; live Azure Crosscheck acceptance remains unperformed and happens later from released public main under separate explicit billable and security-sensitive authorization.
 The pinned model image and the role-specific network policy are tracked declarations at [`docs/azure-crosscheck/model-image.json`](azure-crosscheck/model-image.json) and [`docs/azure-crosscheck/network-policy.json`](azure-crosscheck/network-policy.json), owned by the bounded command [`bin/fm-crosscheck-azure-image.sh`](../bin/fm-crosscheck-azure-image.sh).
-The image pins the exact marketplace base version, the single supported reviewer CLI by URL/size/SHA-256, and the tracked model guest by SHA-256, and disables every command, MCP, extension, skill, and session surface; the policy allows model egress only to Azure-provided DNS and the exact provider endpoint, denies instance metadata and the virtual network, and keeps tool/verifier repository execution networkless.
+The image pins the exact marketplace base version, every supported reviewer CLI by URL/size/SHA-256, and the tracked model guest by SHA-256, and disables every command, MCP, extension, skill, and session surface; the Pi CLI is an npm package rather than a static binary, so its Node runtime is pinned by the same URL/size/SHA-256 contract and its installed version is asserted after the build, because starting the CLI proves only that some version reached PATH; the policy allows model egress only to Azure-provided DNS and the exact provider endpoint, denies instance metadata and the virtual network, and keeps tool/verifier repository execution networkless.
 Plan legs are read-only; `image-build` and `policy-apply` are billable/security-sensitive, refuse without their exact confirmation flags and subscription, and run only from a clean checkout landed on public main.
 Record the exact built image resource ID before any live review.
+`image-build` distributes a managed image; the reviewer SKUs in [`azure-crosscheck/compartment.json`](azure-crosscheck/compartment.json) need the `DiskControllerTypes` feature a managed image cannot carry, so an operator promotes that managed image into a Compute Gallery image version and it is the gallery version's resource ID that `model_image_id` names.
+That promotion is the one step of this contract the bounded command does not own, so a rebuilt image reaches reviews only after it is promoted and `model_image_id` is repointed.
+
+The Pi closure parameters must name the same tarball the crewmate cell image installs, so that a Pi reviewer and a Pi author run one identical agent rather than two versions that can disagree for reasons the review would report as a finding:
+
+| parameter | value |
+|---|---|
+| `piTarballUrl` / `piTarballSha256` / `piTarballBytes` / `piVersion` | exactly `PI_URL` / `PI_DIGEST` / `PI_BYTES` / the asserted version in [`bin/fm-azure-cell-image.sh`](../bin/fm-azure-cell-image.sh) |
+| `nodeTarballUrl` | `https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz` |
+| `nodeTarballSha256` | `d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307` |
+| `nodeTarballBytes` | `31058332` |
+
+Pi declares `engines.node >= 22.19.0` and ships a `#!/usr/bin/env node` entrypoint, so the Node pin is a correctness bound and not a preference: an older runtime or an unresolvable `node` on `PATH` fails the reviewer at launch rather than at admission.
 
 The home-local configuration is optional and gitignored:
 

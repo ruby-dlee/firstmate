@@ -36,8 +36,8 @@ Added the same day:
 - A cost guard, so that a day's spend cannot quietly reach 100 dollars.
 - "For cross-check, just use the same pi fleet (or copy it in, whatever works)."
 
-Amended by the owner on 2026-08-19: the crosscheck requirement is model-family bidirectionality,
-not the literal codex/claude pairing quoted above. The second reviewer family is Kimi-K2.7-Code
+Amended by the owner on 2026-08-19: the crosscheck requirement is that no author's work is
+reviewed by its own model family, not the literal codex/claude pairing quoted above. The second reviewer family is Kimi-K2.7-Code
 on Azure AI Foundry. pi-anthropic was rejected the same day (API pricing), as was an interim
 same-day Claude-Code-CLI-subscription direction. Details and work in R6.
 
@@ -114,9 +114,11 @@ separately, one validation cell reaches `close` with its worktree disk released.
 
 Status: PARTIAL.
 
-Crosscheck is done: eight pi profiles across eight distinct upstream accounts, projected into
-single-profile account homes by `bin/fm-pi-account-home.py`, with the roster repointed and read
-back through the real `bin/fm-crosscheck.py` reader and policy screen.
+Crosscheck on the pi fleet is done at the roster level: eight pi profiles across eight distinct
+upstream accounts, projected into single-profile account homes by `bin/fm-pi-account-home.py`,
+with the roster repointed and read back through the real `bin/fm-crosscheck.py` reader and
+policy screen. Under the second 2026-08-19 amendment this roster is now the dormant crosscheck
+fallback; the pi fleet's primary duties are authors and no-mistakes.
 Crewmate placement is not wired: the cell image carries pi, but placement does not select across
 the eight profiles.
 
@@ -125,9 +127,9 @@ tool and the account-lease identity already present in the worker request path.
 
 Acceptance: concurrent crewmates run on distinct pi profiles with no account collision.
 
-## R6. Crosscheck is bidirectional across model families
+## R6. Crosscheck reviews outside the author's model family
 
-Status: NOT DONE. Direction decided by the owner 2026-08-19 (see the amendment above).
+Status: NOT DONE. Direction decided by the owner 2026-08-19 (see the second amendment above).
 
 The requirement is that no author's work is reviewed only by its own model family.
 The roster was instead made eight reviewers all on `openai-codex`, by reading "just use the same
@@ -152,6 +154,11 @@ author fleet consume. The pi-codex roster (which R5 records as proven at the ros
 R9 still owes the live proof) is retained as a dormant fallback behind a config flip, never
 deleted; every review must name the lane that produced it, and a status read must show whether
 Kimi is serving or the fallback is active, so a silent fallback is impossible.
+Fallback operation is a recorded degradation, not free service restoration: with the fallback
+active, codex-authored work is reviewed by its own family again (the flip therefore includes
+`config/crosscheck-same-model` on for the duration, which the policy screen otherwise refuses),
+which is exactly the defect this requirement removes - accepted only while Kimi is unavailable,
+and one more reason fallback activation must be loud.
 The model pick is explicitly provisional: reevaluate after live review data (GLM-5.2 was the
 runner-up; the comparison is in the owner's evidence folder,
 R6-FOUNDRY-RESEARCH-2026-08-19.md).
@@ -181,13 +188,16 @@ artifacts (the `("claude", "claude-opus-5", "xhigh")` `allowed_profiles` entry, 
 `docs/azure-crosscheck.md`); review guards sized to the model's context window at deploy time: a
 strict findings schema, path-existence validation before filing, and a per-review context cap;
 routing so every crosscheck draws the Kimi reviewer, with the pi-codex roster behind a config
-flip as fallback; and lane visibility: the review evidence and report name the reviewing lane,
-and a status command answers whether Kimi is serving or the fallback is active.
+flip as fallback (the flip sets `config/crosscheck-same-model` on, accepting same-family review
+of codex-authored work as the recorded degraded mode while it is active); and lane visibility:
+the review evidence and report name the reviewing lane, and a status command answers whether
+Kimi is serving or the fallback is active.
 
 Acceptance: a codex-authored change and a claude-authored change are each reviewed by a
 Kimi-backed reviewer with bound reviewer identity and the same evidence discipline as the codex
-lane; the fallback flip to pi-codex is demonstrated once and its activation is visible in the
-review evidence and the status read.
+lane; the fallback flip to pi-codex is demonstrated once, its activation is visible in the review
+evidence and the status read, and the demonstration records the degraded same-family mode it
+accepts for codex-authored work.
 
 ## R7. Everything is logged in
 
@@ -250,7 +260,7 @@ Proving it requires a real spawned crewmate task that commits.
 
 ## R10. Crosscheck is exposed to team engineers through Slack
 
-Status: NOT STARTED. Directed by the owner 2026-08-19; builds after R6.
+Status: NOT DONE. Directed by the owner 2026-08-19; builds after R6.
 
 The owner's v1 shape: an engineer tags the crosscheck bot in a Slack channel with a pull request
 link; the Kimi lane reviews it; the bot posts the findings as a thread reply on the engineer's
@@ -330,11 +340,15 @@ rather than daily, so nothing today refuses a single expensive day.
 Workers also do not deallocate on idle.
 Compute is released only when an exact release receipt is followed by a controller `reconcile`,
 and the sole self-acting bound is a per-VM shutdown schedule at a wall-clock deadline.
-Four worker slots are assigned with no release proof, one of their VMs is running with no live
-task, and one validation work disk is unattached and stranded.
+The four stranded worker slots and the unattached validation disk that illustrated this were
+cleaned to zero on 2026-08-19 through the new surrender lane, but only by hand: wkr-04 had
+idled about four hours with no release proof until its TTL fired, which is the live example the
+idle-release work exists to remove.
 
-Work: a daily spend bound that refuses a mutation once the day's spend crosses it, and an idle
-release path so an assigned worker whose task ended returns its compute without a human.
+Work: a daily spend bound that refuses a mutation once the day's spend crosses it; an idle
+release path so an assigned worker whose task ended returns its compute without a human; and,
+once R10 exists, the per-submitter daily metering and the listener's standing cost that R10
+books here.
 
 Acceptance: a day cannot cross the bound without an explicit operator override, and a worker whose
 task ended releases and deallocates unattended.

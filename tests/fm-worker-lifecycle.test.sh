@@ -2180,7 +2180,7 @@ moved = {
     }
     for kind in controller.REQUIRED_RESOURCE_KINDS
 }
-# A real minted action: execute_action now durably claims it, and the claim
+# A real minted action: the call-site sequence durably claims it, and the claim
 # must self-hash at save, so a fake key would make this unit die at the save
 # and never reach the moved-identity apply it exists to test.
 MINT_WORKER = dict(copy.deepcopy(WORKER), sku="sku", sku_family="fam",
@@ -2303,6 +2303,43 @@ with controller.controller_lock(env):
     except controller.LifecycleError as error:
         stale_apply = error
 assert stale_apply is not None and "no longer this action" in str(stale_apply), stale_apply
+
+# abandon-claim's under-lease re-read: a claim a concurrent drain applied
+# between abandon's pre-check and its lease must refuse WITHOUT re-sending
+# the mutation. The load sequence is substituted (present at the pre-check,
+# gone under the lease); the raw provider boundary asserts no call happens.
+import types as _types
+real_load = controller.load_state
+with controller.controller_lock(env):
+    seeded = real_load(env)
+    seeded["workers"]["1"] = copy.deepcopy(WORKER)
+    seeded["pending_actions"]["1"] = copy.deepcopy(action)
+    controller.save_state(env, seeded)
+loads = {"count": 0}
+def sequenced_load(environment):
+    loads["count"] += 1
+    state = real_load(environment)
+    if loads["count"] >= 2:
+        state["pending_actions"].pop("1", None)
+    return state
+def never_mutate(environment, operation, payload):
+    raise AssertionError("abandon re-sent a mutation after its claim was applied elsewhere")
+controller.load_state = sequenced_load
+controller._provider_call_raw = never_mutate
+raced = None
+try:
+    controller.command_abandon_claim(env, _types.SimpleNamespace(
+        slot="1", idempotency_key=action["idempotency_key"],
+        confirm_abandon=True, confirm_subscription=env["subscription"]))
+except controller.LifecycleError as error:
+    raced = error
+finally:
+    controller.load_state = real_load
+assert raced is not None and "changed while abandoning" in str(raced), raced
+with controller.controller_lock(env):
+    cleanup = real_load(env)
+    cleanup["pending_actions"].pop("1", None)
+    controller.save_state(env, cleanup)
 PY
 
   # An apply whose effects reach outside the slot it names is refused rather
@@ -3067,6 +3104,7 @@ FIXTURE_BARRIER_DIR=$tmp/barrier
 FIXTURE_BARRIER_TYPES=create
 EOF
 
+  FM_LIFECYCLE_CONTROLLER="$CONTROLLER" \
   python3 - "$WRAPPER" "$envfile" "$fixture" "$tmp/barrier" <<'PY' || fail "two provider mutations did not run concurrently"
 import json
 import os
@@ -3077,6 +3115,7 @@ import time
 
 wrapper, envfile, fixture_path, barrier = sys.argv[1:]
 env = os.environ.copy()
+env["FM_LIFECYCLE_CONTROLLER"] = os.environ.get("FM_LIFECYCLE_CONTROLLER", "")
 for line in Path(envfile).read_text().splitlines():
     key, value = line.split("=", 1)
     env[key] = value
@@ -3148,6 +3187,29 @@ try:
     run("withdraw", "--task", "task-9", "--task-generation", "gen-9", "--confirm-withdraw",
         "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
 
+    # The lease itself, against a LIVE cross-process holder: the parked child
+    # owns slot 1's lease, so a second taker must refuse with SlotBusy at
+    # once. This is the only behavioral pin the LOCK_NB discipline has; a
+    # blocking lease here deadlocks the fleet-lock/lease cycle the design
+    # rules out, so the probe runs in a bounded subprocess.
+    probe = subprocess.run(
+        [sys.executable, "-c", (
+            "import importlib.util, sys\n"
+            "spec = importlib.util.spec_from_file_location('c', sys.argv[1])\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(m)\n"
+            "env = m.environment()\n"
+            "try:\n"
+            "    with m.slot_lease(env, 1):\n"
+            "        print('ACQUIRED')\n"
+            "except m.SlotBusy as exc:\n"
+            "    print('BUSY:', exc)\n"
+        ), os.environ.get("FM_LIFECYCLE_CONTROLLER", "")],
+        env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+    assert probe.returncode == 0, probe.stderr
+    assert "BUSY:" in probe.stdout and "owned by a live process" in probe.stdout, (
+        "a live holder did not refuse a second lease taker immediately", probe.stdout, probe.stderr)
+
     # A steer at a PARKED slot refuses without a third provider call: the
     # queue entry is honestly still `assigning` while the create is in
     # flight, so the earliest gate fires. (The claimed-slot refusal itself,
@@ -3170,8 +3232,6 @@ state = controller_state()
 fixture = json.loads(Path(fixture_path).read_text())
 assert state["pending_actions"] == {}
 assert len(fixture["workers"]) == 2 and len(fixture["seen"]) == 2
-for key, count in {}.items():
-    pass
 create_calls = [entry for entry in fixture["calls"] if entry["type"] == "create"]
 per_key = {}
 for entry in create_calls:
@@ -3299,6 +3359,15 @@ plan = json.loads(run("reconcile", "--json").stdout)
 planned_slots = [entry.get("slot") for entry in plan["actions"] if entry["type"] not in ("admission-refused", "replay-refused")]
 assert 1 not in planned_slots, (
     "the planner proposed a mutation for a slot an unapplied claim owns", plan["actions"])
+
+# strict drain RAISES on the wedged claim instead of recording and moving on:
+# resume depends on exactly this to refuse resuming over unapplied state.
+strict_raised = None
+try:
+    module.drain_pending(menv, slot="9", strict=True)
+except module.LifecycleError as exc:
+    strict_raised = exc
+assert strict_raised is not None, "a strict drain swallowed a wedged claim's refusal"
 PY
   pass "a wedged slot's claim is reported and retained while the rest of the fleet converges"
 }

@@ -1974,7 +1974,7 @@ def parser():
     surrender_parser.add_argument("--confirm-subscription", required=True)
     abandon_parser = sub.add_parser(
         "abandon-claim",
-        help="retire one slot's unapplied claim after proving its mutation is complete",
+        help="retire one slot's unapplied claim by replaying its mutation to completion first",
     )
     abandon_parser.add_argument("--slot", required=True)
     abandon_parser.add_argument("--idempotency-key", required=True)
@@ -2975,7 +2975,12 @@ def command_abandon_claim(env, args):
     This command takes the slot lease (no live owner), REPLAYS the claim
     itself and requires the provider result to bind the exact idempotency key
     - proving the mutation is complete at the provider and its result is
-    final under key-idempotency - then attempts the ordinary apply. An apply
+    final under key-idempotency - then attempts the ordinary apply. The proof
+    is obtained BY submitting: for a claim that never reached the provider,
+    the replay IS the first submission (abandoning a create builds the VM),
+    because dropping a claim of unknown provider-side status could strand a
+    resource that exists and is billing. An abandoned refused create leaves
+    its cloud resources to the ordinary planner, which now sees the slot. An apply
     that succeeds ends the claim normally. An apply that refuses is recorded
     verbatim, with the result digest, in cleanup_refusals before the claim is
     cleared, so the abandonment preserves the evidence it retires.
@@ -2996,6 +3001,15 @@ def command_abandon_claim(env, args):
             raise LifecycleError(
                 "slot {} holds a different claim; pass its exact idempotency key".format(slot))
     with slot_lease(env, slot) as lease:
+        # The pre-lease read may be stale: a drain can have applied and
+        # cleared this claim between the check above and this lease. Re-read
+        # under the lease before re-sending, exactly as the drain does, so an
+        # already-applied key is never mutated again without a durable claim
+        # naming it.
+        with controller_lock(env):
+            current = (load_state(env).get("pending_actions") or {}).get(slot)
+        if not isinstance(current, dict) or current.get("idempotency_key") != action["idempotency_key"]:
+            raise LifecycleError("slot {} claim changed while abandoning; retry".format(slot))
         result = provider_mutate(env, action, lease)
         with controller_lock(env):
             try:

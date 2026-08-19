@@ -113,30 +113,46 @@ tool and the account-lease identity already present in the worker request path.
 
 Acceptance: concurrent crewmates run on distinct pi profiles with no account collision.
 
-## R6. Crosscheck is bidirectional across providers
+## R6. Crosscheck is bidirectional across model families
 
-Status: NOT DONE.
+Status: NOT DONE. Direction decided by the owner 2026-08-19.
 
-The requirement is codex reviewing claude work and claude reviewing codex work.
+The requirement is that no author's work is reviewed only by its own model family.
 The roster was instead made eight reviewers all on `openai-codex`, by reading "just use the same
 pi fleet" as a restriction to one provider.
 It was not one, and that is the defect.
 
-pi drives `anthropic`, `openai`, and `openai-codex`, so one pi fleet and cross-provider review are
-compatible: the same harness, different providers, distinct accounts.
-No image rebake is needed, because the model image already carries pi.
+The provider question was settled by two owner directives on 2026-08-19, the second superseding
+the first:
 
-Work: generalize the provider slot key, which is written literally as `openai-codex` in
-`bin/fm-pi-account-home.py`, in `bin/fm-crosscheck.py` (`inspect_pi_credential` and
-`account_identity`), and in the Azure credential archive in `bin/fm-crosscheck-azure.py`, so that
-those three refuse any non-codex pi slot today; anthropic profiles added to the pi fleet; a roster
-carrying both providers; `config/crosscheck-same-model` turned off; and authors present on both
-providers so review is genuinely bidirectional rather than one-directional.
-An anthropic credential also carries no `accountId`, which the projection tool currently requires,
-so reviewer identity for that provider needs its own answer.
+1. The pi-anthropic path is dead either way. pi's anthropic OAuth authenticates as its own client
+   against its own token endpoint, so a Claude CLI refresh token cannot be spent by pi, and a
+   fresh pi-anthropic login would bill at API pricing, which the owner rejected outright.
+   An earlier same-day directive routed claude reviews through the Claude Code CLI on the owner's
+   subscription profile instead.
+2. The standing decision: the second reviewer family is **Kimi-K2.7-Code on Azure AI Foundry**
+   (Direct-from-Azure lane, Global Standard, eastus, pay-per-token), chosen for tool calling
+   support, the Microsoft-hosted custody lane, published pricing, and lineage independent of both
+   OpenAI and Anthropic. Codex-authored work is reviewed by a Kimi-backed reviewer; claude-authored
+   work keeps the existing pi-codex crosscheck, which already works. The model pick is explicitly
+   provisional: reevaluate after live review data (GLM-5.2 was the runner-up; the comparison is in
+   the owner's evidence folder, R6-FOUNDRY-RESEARCH-2026-08-19.md).
 
-Acceptance: a claude-authored change is reviewed by a codex-backed reviewer and a codex-authored
-change by a claude-backed reviewer, both through pi, on distinct accounts.
+No owner login is needed anymore: the Kimi lane authenticates with a Foundry deployment and an
+api-key, not a subscription session.
+
+Work: deploy `Kimi-K2.7-Code` in a Foundry resource (eastus, Global Standard) and store the key in
+the fleet's secret custody, never in the repo; a pi provider entry pointing at the resource's
+OpenAI-compatible `/openai/v1` endpoint with the deployment name as the model id; verify pi
+tolerates `reasoning_content` in streamed deltas before rollout; a roster lane for the Kimi
+reviewer with `config/crosscheck-same-model` off; review guards sized to the model's 262K context:
+a strict findings schema, path-existence validation before filing, and a per-review context cap;
+and routing so codex-authored changes draw the Kimi reviewer while claude-authored changes draw
+codex reviewers.
+
+Acceptance: a codex-authored change is reviewed by a Kimi-backed reviewer and a claude-authored
+change by a codex-backed reviewer, on distinct credentials, with the same evidence discipline as
+the codex lane.
 
 ## R7. Everything is logged in
 
@@ -145,10 +161,9 @@ Status: HOLDS, through R8.
 The eight pi profiles renew on their own now, which is R8.
 Two of the three profiles in `~/.local/share/agent-fleet/accounts/claude/` hold blanked,
 length-zero tokens; the third is `refreshable` with material declared valid to 2026-09-10.
-That third profile does not help R6.
-It is a Claude CLI credential, and pi's anthropic OAuth authenticates as its own client against
-its own token endpoint, so a refresh token issued to one client cannot be spent by the other.
-R6 therefore does need an owner login, as stated there.
+None of the three is needed for R6 anymore: the Kimi lane authenticates with a Foundry
+deployment key, and claude-authored work is reviewed by the codex fleet, so R7 holds with no
+owner login outstanding.
 
 ## R8. Auth refreshes on its own
 
@@ -268,7 +283,7 @@ task ended releases and deallocates unattended.
 1. R8, done 2026-08-19.
 2. C2, because contention blocks demonstrating anything at scale. One of its three changes landed.
 3. R2/R3, the largest architectural gap and the requirement most misread by the current build.
-4. R6, which needs an owner login before it can be finished.
+4. R6, whose direction is decided (Kimi-K2.7-Code on Foundry) and which no longer needs an owner login.
 5. R4, which needs the runner caller built and one validation cell closed.
 6. R5.
 7. C1, measured before it is changed.

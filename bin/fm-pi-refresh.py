@@ -80,6 +80,13 @@ DEFAULT_HORIZON_SECONDS = 5 * 24 * 60 * 60
 DEFAULT_TIMEOUT_MS = 20_000
 ADAPTER_START_ALLOWANCE_SECONDS = 30
 
+# Pi gives up acquiring its credential lock after 30 seconds, so a slot can
+# spend that long waiting before its own refresh timeout even starts. Budgeting
+# only the round trip made the whole invocation killable mid-write, which is
+# exactly the interrupted write the pre-rotation copy exists to survive, self
+# inflicted.
+ADAPTER_LOCK_WAIT_SECONDS = 30
+
 # The adapter emits one small JSON object per slot. Anything larger is not
 # output we know how to read, and is refused rather than parsed.
 MAX_ADAPTER_OUTPUT_BYTES = 256 * 1024
@@ -88,6 +95,8 @@ MAX_ADAPTER_OUTPUT_BYTES = 256 * 1024
 # installs on this machine declare >= 22.19.0.
 FALLBACK_NODE_MAJOR = 22
 NODE_PROBE_TIMEOUT_SECONDS = 10
+
+PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent"
 
 # Backups exist for one failure: an interrupted in-place write of the pool.
 # Once a run has proved the pool still parses and still carries every slot, the
@@ -106,6 +115,19 @@ DEFAULT_DESTINATION_ROOT = "~/.local/share/agent-fleet/accounts/pi"
 # Republished homes are verified with headroom, not merely "not yet expired": a
 # credential that dies an hour from now is not a successful renewal.
 VERIFY_MARGIN_SECONDS = 24 * 60 * 60
+
+
+# Any run of this length in the base64url alphabet is treated as token material.
+# The adapter redacts its own writes, but stderr is a channel this side does not
+# control: Node warnings, import-time output and internal traces land there too,
+# and slicing is not redaction.
+TOKEN_LIKE = re.compile(r"[A-Za-z0-9_-]{40,}")
+
+
+def redact(text: str, limit: int = 300) -> str:
+    """Strip token-shaped runs, then truncate. Never the other way round."""
+
+    return TOKEN_LIKE.sub("[redacted]", text)[:limit]
 
 
 class RefreshError(RuntimeError):
@@ -144,9 +166,15 @@ def pi_executable() -> Path:
     by the same sibling rule for the same reason.
     """
 
-    name = os.environ.get("FM_PI_BIN") or "pi"
+    override = os.environ.get("FM_PI_BIN")
+    name = override or "pi"
     located = shutil.which(name)
     if not located:
+        # `which` refuses a file without the execute bit exactly as it refuses
+        # an absent one, and telling an operator who DID set FM_PI_BIN that it
+        # is "not on PATH" sends them to the wrong problem.
+        if override and Path(override).expanduser().exists():
+            fail(f"FM_PI_BIN names {override}, which exists but is not executable")
         fail(
             f"Pi executable {name!r} is not on PATH; set FM_PI_BIN to its path. "
             "A scheduled run has almost no PATH, so it must set it."
@@ -164,10 +192,23 @@ def pi_package_root(entrypoint: Path | None = None) -> Path:
 
     resolved = (entrypoint or pi_executable()).resolve()
     root = resolved.parent.parent
-    if not (root / "package.json").is_file():
+    manifest_path = root / "package.json"
+    if not manifest_path.is_file():
         fail(
             f"Pi entrypoint {resolved} does not sit inside a package directory "
             f"({root} carries no package.json)"
+        )
+    # Named, not merely shaped. Any directory holding a package.json satisfied
+    # the old check, which pushed the real refusal one layer down into the
+    # module import where it reads as a missing file rather than a wrong Pi.
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        fail(f"Pi package manifest at {manifest_path} is unreadable: {type(exc).__name__}")
+    if manifest.get("name") != PI_PACKAGE_NAME:
+        fail(
+            f"{root} is not a {PI_PACKAGE_NAME} install (its package.json names "
+            f"{manifest.get('name')!r}); check FM_PI_BIN"
         )
     return root
 
@@ -230,12 +271,16 @@ def node_binary(entrypoint: Path | None = None) -> str:
             candidates.append(str(Path(located).resolve()))
     if not candidates:
         fail("node is not on PATH; set FM_PI_NODE_BIN to the Node that runs Pi")
-    for candidate in candidates:
-        major = node_major(candidate)
+    # Probed once each. A hanging Node costs NODE_PROBE_TIMEOUT_SECONDS, and
+    # probing again to build the refusal message doubled that before the
+    # adapter's own timeout could apply.
+    probed = [(candidate, node_major(candidate)) for candidate in candidates]
+    for candidate, major in probed:
         if major is not None and major >= floor:
             return candidate
     reported = ", ".join(
-        f"{candidate} (v{node_major(candidate) or '?'})" for candidate in candidates
+        f"{candidate} (v{major if major is not None else '?'})"
+        for candidate, major in probed
     )
     fail(
         f"no Node meets the floor this Pi install declares (>= {floor}); tried: "
@@ -346,7 +391,9 @@ def private_directory(path: Path) -> None:
     os.chmod(path, 0o700)
 
 
-def backup_pool(source: Path, backup_root: Path, *, now: float) -> Path:
+def backup_pool(
+    source: Path, backup_root: Path, *, now: float, expected: set[str]
+) -> Path:
     """Copy the pool before anything rotates.
 
     Pi rewrites the credential file with a plain truncating `writeFileSync`
@@ -390,6 +437,20 @@ def backup_pool(source: Path, backup_root: Path, *, now: float) -> Path:
         except OSError:
             pass
         raise
+    # The read above is unlocked, which is the same non-atomic read this module
+    # faults Pi for. A torn copy is worse than no copy, because it is only ever
+    # reached for by an operator who already has a damaged pool, so the copy is
+    # proved before it is offered as one.
+    damage = pool_is_intact(destination, expected)
+    if damage:
+        try:
+            os.unlink(destination)
+        except OSError:
+            pass
+        fail(
+            f"the pre-renewal copy of {source} did not come out intact "
+            f"({damage}); nothing was rotated"
+        )
     return destination
 
 
@@ -432,7 +493,9 @@ def run_adapter(
     ]
     for slot in slots:
         command += ["--slot", slot]
-    budget = (timeout_ms / 1000.0) * len(slots) + ADAPTER_START_ALLOWANCE_SECONDS
+    budget = (
+        timeout_ms / 1000.0 + ADAPTER_LOCK_WAIT_SECONDS
+    ) * len(slots) + ADAPTER_START_ALLOWANCE_SECONDS
     try:
         completed = subprocess.run(
             command,
@@ -469,7 +532,7 @@ def run_adapter(
         fail(
             "the renewal adapter reported nothing for "
             f"{len(slots)} slots (exit {completed.returncode})"
-            + (f": {detail[:300]}" if detail else "")
+            + (f": {redact(detail)}" if detail else "")
         )
     seen = {record["slot"] for record in records}
     unreported = [slot for slot in slots if slot not in seen]
@@ -513,7 +576,7 @@ def reproject(
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
         fail(
             "renewed credentials could not be republished into "
-            f"{destination_root}: {detail[:400]}"
+            f"{destination_root}: {redact(detail, 400)}"
         )
     return present, absent
 
@@ -595,6 +658,8 @@ def command_report(args: argparse.Namespace) -> int:
 
 
 def command_run_once(args: argparse.Namespace) -> int:
+    if args.all and args.slot:
+        fail("--all and --slot name different selections; pass one")
     if not args.all and not args.slot:
         fail("name at least one --slot, or pass --all")
     source = Path(args.source).expanduser()
@@ -636,7 +701,7 @@ def command_run_once(args: argparse.Namespace) -> int:
         # so a scheduled run does not report success over a dying account.
         return 1 if unrenewable else 0
 
-    backup = backup_pool(source, backup_root, now=now)
+    backup = backup_pool(source, backup_root, now=now, expected=expected)
     summary["backup"] = str(backup)
     slots = [record["slot"] for record in due]
     records = run_adapter(source=source, slots=slots, timeout_ms=args.timeout_ms)
@@ -647,6 +712,11 @@ def command_run_once(args: argparse.Namespace) -> int:
             f"{damage}; the pre-renewal copy is at {backup} and can be restored "
             "over it once the cause is understood"
         )
+    # Pruned here, not at the end. Every step below can refuse, and a recurring
+    # refusal used to leave one more full copy of every credential in the fleet
+    # at rest per scheduled run. Once the pool is proved intact the older copies
+    # protect nothing, which is what BACKUP_KEEP's own comment says.
+    summary["pruned"] = [str(path) for path in prune_backups(backup_root, BACKUP_KEEP)]
 
     renewed = [record["slot"] for record in records if record.get("outcome") == "refreshed"]
     problems = [record for record in records if record.get("outcome") != "refreshed"]
@@ -664,8 +734,6 @@ def command_run_once(args: argparse.Namespace) -> int:
         summary["republished"] = republished
         summary["unprojected"] = unprojected
         summary["verified"] = verify_homes(destination_root, republished)
-
-    summary["pruned"] = [str(path) for path in prune_backups(backup_root, BACKUP_KEEP)]
 
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
@@ -702,6 +770,20 @@ def command_run_once(args: argparse.Namespace) -> int:
             print(
                 f"REFUSED {record['slot']}: {record.get('detail', record.get('outcome'))}",
                 file=sys.stderr,
+            )
+        stranded = [
+            record["slot"]
+            for record in problems
+            if record.get("outcome") == "rotated-unpersisted"
+        ]
+        if stranded:
+            # Named apart from an ordinary failure because the recovery differs:
+            # the provider has already retired what the host holds, so there is
+            # nothing to retry and no copy that helps.
+            fail(
+                "the provider rotated these profiles and the rotation could not be "
+                "stored, so each now needs an interactive login: "
+                + ", ".join(sorted(stranded))
             )
         fail(f"{len(problems)} of {len(records)} due profiles were not renewed")
     if unrenewable:

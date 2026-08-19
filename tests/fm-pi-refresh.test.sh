@@ -62,7 +62,10 @@ PY
 make_fake_pi() {
   local root=$1
   mkdir -p "$root/pkg/dist" "$root/bin"
-  printf '{"name":"pi","version":"0.0.0","engines":{"node":">=22.19.0"}}\n' \
+  # The real package name: the resolver checks it, because any directory with a
+  # package.json used to pass and pushed the refusal one layer down into the
+  # module import, where a wrong Pi reads as a missing file.
+  printf '{"name":"@earendil-works/pi-coding-agent","version":"0.0.0","engines":{"node":">=22.19.0"}}\n' \
     >"$root/pkg/package.json"
   printf '#!/usr/bin/env node\n' >"$root/pkg/dist/cli.js"
   # Executable on purpose: a Pi entrypoint without the bit is not resolvable,
@@ -308,12 +311,25 @@ spec.loader.exec_module(refresh)
 
 work = pathlib.Path(sys.argv[2])
 source = work / "seed.json"
-source.write_text("{}")
+source.write_text('{"openai-codex": {}}')
 root = work / "backups"
+expected = {"openai-codex"}
 made = [
-    refresh.backup_pool(source, root, now=1_700_000_000 + index * 60)
+    refresh.backup_pool(source, root, now=1_700_000_000 + index * 60, expected=expected)
     for index in range(refresh.BACKUP_KEEP + 2)
 ]
+
+# The copy is proved to be a copy before it is offered as one: an unlocked read
+# of a pool being written can tear, and a torn copy is worse than none because
+# it is only ever reached for by an operator whose pool is already damaged.
+torn = work / "torn.json"
+torn.write_text('{"openai-codex": {}, "openai-codex-2": {}}')
+try:
+    refresh.backup_pool(torn, root, now=1_700_000_999, expected={"openai-codex", "gone"})
+except refresh.RefreshError as error:
+    assert "did not come out intact" in str(error), error
+else:
+    raise AssertionError("a copy missing a profile was accepted as a backup")
 assert all(path.is_file() for path in made), made
 assert stat.S_IMODE(root.stat().st_mode) == 0o700, oct(root.stat().st_mode)
 refresh.prune_backups(root, refresh.BACKUP_KEEP)
@@ -325,7 +341,108 @@ PY
   pass "a damaged pool is named rather than reported as renewed, and the pre-rotation copies stay bounded and owner-only"
 }
 
-adapter_contract() {
+# Every outcome the adapter can report, driven through the REAL refreshSlots
+# with a store that keeps `modify`'s contract. This unit needs Node and nothing
+# else, because the classification it pins is the adapter's own logic; the
+# integration with Pi's credential store is the next unit's job. Splitting them
+# is the point: the previous shape put the redaction and the rotation decision
+# behind a `pi is installed` check, so both were compiled out on the gate.
+adapter_outcome_contract() {
+  local work
+  work=$(fm_test_tmproot fm-pi-refresh-outcomes)
+  command -v node >/dev/null 2>&1 || fail "node is required to run the renewal adapter"
+
+  node --input-type=module -e "
+const adapter = await import('file://$ADAPTER');
+
+// Faithful to the one behavior the classification depends on: a callback that
+// returns undefined leaves the stored credential alone and modify hands that
+// same stored credential back, which is otherwise indistinguishable from a
+// successful rotation that returned an identical credential.
+const makeStore = (data) => ({
+  data,
+  async read(slot) { return this.data[slot]; },
+  async modify(slot, fn) {
+    const next = await fn(this.data[slot]);
+    if (next !== undefined) this.data[slot] = next;
+    return this.data[slot];
+  },
+});
+
+const codex = (id) => ({ type: 'oauth', access: 'a.' + id, refresh: 'r.' + id, expires: 1, accountId: id });
+const run = (data, oauth, slots) => adapter.refreshSlots({
+  storeFactory: () => makeStore(data), oauth, poolPath: '$work/unused.json', slots, timeoutMs: 1000,
+});
+const only = async (data, oauth, slot) => (await run(data, oauth, [slot]))[0];
+
+const rotating = { refresh: async (c) => ({ ...c, access: 'NEW.' + c.accountId, refresh: 'NEWR.' + c.accountId }) };
+const identical = { refresh: async (c) => ({ ...c }) };
+const drifting = { refresh: async (c) => ({ ...c, access: 'z', accountId: 'someone-else' }) };
+const never = { refresh: async () => { throw new Error('boom'); } };
+
+let r = await only({ s: codex('one') }, rotating, 's');
+if (r.outcome !== 'refreshed') throw new Error('a rotation was not reported: ' + r.outcome);
+if (r.access_rotated !== true || r.account_stable !== true) throw new Error('rotation flags wrong: ' + JSON.stringify(r));
+
+// The case a truthy return cannot distinguish on its own.
+r = await only({ s: codex('one') }, identical, 's');
+if (r.outcome !== 'unchanged') throw new Error('an unrotated credential was counted as renewed: ' + r.outcome);
+
+r = await only({}, rotating, 's');
+if (r.outcome !== 'absent') throw new Error('an absent slot was not reported absent: ' + r.outcome);
+
+r = await only({ s: { type: 'api_key', key: 'k' } }, rotating, 's');
+if (r.outcome !== 'not-oauth') throw new Error('a non-oauth credential was not reported: ' + r.outcome);
+
+// An Anthropic Pi credential carries no accountId. Handing it to the Codex
+// flow would POST its refresh token to the wrong provider's token endpoint.
+r = await only({ s: { type: 'oauth', access: 'a', refresh: 'r', expires: 1 } }, rotating, 's');
+if (r.outcome !== 'unsupported-provider') throw new Error('a non-Codex credential reached the Codex flow: ' + r.outcome);
+
+r = await only({ s: codex('one') }, never, 's');
+if (r.outcome !== 'failed') throw new Error('a throwing refresh was not reported failed: ' + r.outcome);
+
+r = await only({ s: codex('one') }, drifting, 's');
+if (r.account_stable !== false) throw new Error('an account change was not reported');
+
+// A provider error carrying token-shaped text must come back redacted, and the
+// redaction must be applied before the truncation or a short run survives.
+const leaky = { refresh: async () => { throw new Error('missing fields: {\"access_token\":\"$MARKER-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}'); } };
+r = await only({ s: codex('one') }, leaky, 's');
+if (r.detail.includes('$MARKER')) throw new Error('a provider error leaked token material');
+if (!r.detail.includes('[redacted]')) throw new Error('a token-shaped run was not redacted');
+
+// The provider rotated and the store could not keep it. That is not an
+// ordinary failure: the host now holds a token the provider has retired, and
+// no pre-renewal copy helps, so it must be reported as its own outcome.
+const refusingStore = {
+  async read(slot) { return codex('one'); },
+  async modify(slot, fn) { await fn(codex('one')); throw new Error('EACCES: permission denied'); },
+};
+r = (await adapter.refreshSlots({
+  storeFactory: () => refusingStore, oauth: rotating, poolPath: 'x', slots: ['s'], timeoutMs: 1000,
+}))[0];
+if (r.outcome !== 'rotated-unpersisted') throw new Error('a lost rotation was reported as an ordinary failure: ' + r.outcome);
+
+// A store that refuses BEFORE the provider is reached is an ordinary failure.
+const deadStore = { async read() { return codex('one'); }, async modify() { throw new Error('ELOCKED'); } };
+r = (await adapter.refreshSlots({
+  storeFactory: () => deadStore, oauth: rotating, poolPath: 'x', slots: ['s'], timeoutMs: 1000,
+}))[0];
+if (r.outcome !== 'failed') throw new Error('a failure before the provider was miscalled a lost rotation: ' + r.outcome);
+
+const all = JSON.stringify(await run({ s: codex('one') }, rotating, ['s']));
+if (all.includes('a.one') || all.includes('r.one') || all.includes('\"one\"')) {
+  throw new Error('the adapter emitted raw credential or account material');
+}
+" || fail "the adapter reported the wrong outcome for a case it must distinguish"
+
+  pass "the adapter distinguishes refreshed, unchanged, absent, not-oauth, unsupported-provider, failed and a rotation it could not store, and redacts before it truncates"
+}
+
+# The integration the unit above deliberately does not cover: Pi's own
+# credential store, its lock, and what actually lands on disk.
+adapter_store_contract() {
   local work pool package
   work=$(fm_test_tmproot fm-pi-refresh-adapter)
   pool=$work/auth.json
@@ -335,18 +452,21 @@ adapter_contract() {
   if [ -z "$package" ]; then
     local located
     located=$(command -v pi 2>/dev/null || true)
-    [ -n "$located" ] || { echo "skip: pi is not installed for the adapter contract"; return 0; }
-    package=$(cd "$(dirname "$(readlink -f "$located")")/.." && pwd -P)
+    if [ -n "$located" ]; then
+      package=$(cd "$(dirname "$(readlink -f "$located")")/.." && pwd -P)
+    fi
   fi
-  [ -f "$package/dist/core/auth-storage.js" ] || {
-    echo "skip: the installed Pi carries no credential store to contract against"
+  if [ -z "$package" ] || [ ! -f "$package/dist/core/auth-storage.js" ]; then
+    # FM_PI_REQUIRED is set wherever Pi is supposed to be installed, so an
+    # install that silently failed goes red instead of skipping. A skip that
+    # can never fail is how this contract came to be absent from CI.
+    [ "${FM_PI_REQUIRED:-0}" != 1 ] \
+      || fail "FM_PI_REQUIRED is set but no Pi credential store was found to contract against"
+    echo "skip: pi is not installed for the adapter store contract"
     return 0
-  }
-  command -v node >/dev/null 2>&1 || { echo "skip: node not found"; return 0; }
+  fi
+  command -v node >/dev/null 2>&1 || fail "node is required to run the renewal adapter"
 
-  # The rotation itself is the only thing stubbed. The credential store is Pi's
-  # real one, so the lock, the read-modify-write, and the on-disk result are the
-  # production mechanism rather than a description of it.
   node --input-type=module -e "
 import { readFileSync } from 'node:fs';
 const adapter = await import('file://$ADAPTER');
@@ -354,66 +474,39 @@ const { AuthStorage } = await import('file://$package/dist/core/auth-storage.js'
 
 const rotating = {
   refresh: async (current) => ({
-    type: 'oauth',
-    access: 'rotated.' + current.accountId,
+    type: 'oauth', access: 'rotated.' + current.accountId,
     refresh: 'rotated-refresh.' + current.accountId,
-    expires: Date.now() + 864e5,
-    accountId: current.accountId,
+    expires: Date.now() + 864e5, accountId: current.accountId,
   }),
 };
-const identical = { refresh: async (current) => ({ ...current }) };
-const drifting = {
-  refresh: async (current) => ({ ...current, access: 'x', accountId: 'someone-else' }),
-};
-const failing = {
-  refresh: async () => {
-    throw new Error('token refresh response missing fields: {\"access_token\":\"$MARKER-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}');
-  },
-};
-
-const run = (oauth, slots) => adapter.refreshSlots({
+const records = await adapter.refreshSlots({
   storeFactory: (path) => AuthStorage.create(path),
-  oauth, poolPath: '$pool', slots, timeoutMs: 5000,
+  oauth: rotating, poolPath: '$pool', slots: ['openai-codex', 'no-such-slot'], timeoutMs: 5000,
 });
-
-const first = await run(rotating, ['openai-codex', 'no-such-slot']);
-const rotated = first.find((record) => record.slot === 'openai-codex');
-if (rotated.outcome !== 'refreshed') throw new Error('a rotation was not reported: ' + rotated.outcome);
-if (!rotated.account_stable) throw new Error('a stable account was reported as changed');
-if (JSON.stringify(first).includes('$MARKER')) throw new Error('the adapter emitted token material');
-if (JSON.stringify(first).includes('acct-one')) throw new Error('the adapter emitted a raw account id');
-if (first.find((record) => record.slot === 'no-such-slot').outcome !== 'absent') {
-  throw new Error('an absent slot was not reported as absent');
+const rotated = records.find((record) => record.slot === 'openai-codex');
+if (rotated.outcome !== 'refreshed') throw new Error('Pi store did not persist a rotation: ' + rotated.outcome);
+if (records.find((record) => record.slot === 'no-such-slot').outcome !== 'absent') {
+  throw new Error('an absent slot was not reported absent through the real store');
 }
+if (JSON.stringify(records).includes('$MARKER')) throw new Error('the adapter emitted token material');
 
 const onDisk = JSON.parse(readFileSync('$pool', 'utf8'));
-if (onDisk['openai-codex'].access !== 'rotated.acct-one') {
-  throw new Error('the rotation did not land in the pool');
-}
+if (onDisk['openai-codex'].access !== 'rotated.acct-one') throw new Error('the rotation did not land in the pool');
 if (Object.keys(onDisk).length !== 3) throw new Error('the pool lost a slot');
 if (onDisk['openai-codex-3'].accountId !== 'acct-three') throw new Error('an untouched slot changed');
 
-// A store that writes back an identical credential is not a renewal, and must
-// not be counted as one just because the call returned a credential.
-const second = await run(identical, ['openai-codex']);
-if (second[0].outcome !== 'unchanged') {
-  throw new Error('an unrotated credential was counted as renewed: ' + second[0].outcome);
-}
-
-const third = await run(drifting, ['openai-codex-2']);
-if (third[0].account_stable !== false) throw new Error('an account change was not reported');
-
-const fourth = await run(failing, ['openai-codex-2']);
-if (fourth[0].outcome !== 'failed') throw new Error('a throwing refresh was not reported as failed');
-if (fourth[0].detail.includes('$MARKER')) throw new Error('a provider error leaked token material');
-if (!fourth[0].detail.includes('[redacted]')) throw new Error('a token-shaped run was not redacted');
+// Also prove the module paths the production entrypoint resolves are the ones
+// this Pi actually ships, so a Pi upgrade that moves them fails here.
+const loaded = await adapter.loadPiModules('$package');
+if (typeof loaded.oauth.refresh !== 'function') throw new Error('the resolved Pi OAuth flow has no refresh');
 " || fail "the adapter contract against Pi's real credential store failed"
 
-  pass "the adapter rotates through Pi's real credential store, distinguishes an unrotated credential, and redacts a provider error"
+  pass "the adapter rotates through Pi's real credential store and lands exactly one slot on disk"
 }
 
 selection_contract
 refusal_contract
 republish_contract
 pool_integrity_contract
-adapter_contract
+adapter_outcome_contract
+adapter_store_contract

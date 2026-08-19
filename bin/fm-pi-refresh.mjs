@@ -126,8 +126,51 @@ export async function refreshSlots({ storeFactory, oauth, poolPath, slots, timeo
   const deadline = typeof timeoutMs === "number" ? timeoutMs : DEFAULT_TIMEOUT_MS;
   const records = [];
   for (const slot of slots) {
-    const before = await store.read(slot);
-    if (!before) {
+    // Everything the outcome depends on is read INSIDE the lock. An optimistic
+    // read outside it is not merely redundant: `AuthStorage.read` gives up
+    // after Pi's 30s lock-acquisition deadline and swallows the failure over an
+    // empty snapshot, so a slot whose credential is merely held by a running Pi
+    // reads as having no credential at all. Reporting a live account as absent
+    // is the wrong diagnosis to hand an unattended run.
+    let before;
+    let rotated_at_provider = false;
+    let after;
+    try {
+      after = await store.modify(slot, async (current) => {
+        before = current;
+        if (current === undefined) return undefined;
+        if (current.type !== "oauth") return undefined;
+        // The Codex flow derives its account from the access token and throws
+        // without one, and only Codex credentials carry `accountId` at all.
+        // Handing an Anthropic credential to this flow would POST its refresh
+        // token to the wrong provider's token endpoint, so the shape is
+        // checked here rather than left to the caller's slot naming.
+        if (typeof current.accountId !== "string" || current.accountId.trim() === "") {
+          return undefined;
+        }
+        const next = await oauth.refresh(current, AbortSignal.timeout(deadline));
+        // Past this line the provider has issued a rotation and invalidated
+        // what we held, whether or not the write below lands.
+        rotated_at_provider = true;
+        return next;
+      });
+    } catch (error) {
+      records.push({
+        slot,
+        // A refusal from the provider and a failure to persist a rotation the
+        // provider already made are not the same event. The second one means
+        // the host is holding a dead refresh token, and no pre-rotation copy
+        // helps: restoring it restores the token the provider just retired.
+        outcome: rotated_at_provider ? "rotated-unpersisted" : "failed",
+        detail: rotated_at_provider
+          ? "the provider rotated this credential and it could not be stored, so the " +
+            "host now holds a retired token and this profile needs an interactive " +
+            `login: ${safeErrorText(error)}`
+          : safeErrorText(error),
+      });
+      continue;
+    }
+    if (before === undefined) {
       records.push({ slot, outcome: "absent", detail: `no credential stored under ${slot}` });
       continue;
     }
@@ -139,17 +182,13 @@ export async function refreshSlots({ storeFactory, oauth, poolPath, slots, timeo
       });
       continue;
     }
-    let after;
-    try {
-      after = await store.modify(slot, async (current) => {
-        // Re-read under the lock. A slot that stopped being an OAuth credential
-        // between the optimistic read and the lock was logged out or replaced,
-        // and returning undefined leaves it exactly as the other writer left it.
-        if (current?.type !== "oauth") return undefined;
-        return await oauth.refresh(current, AbortSignal.timeout(deadline));
+    if (typeof before.accountId !== "string" || before.accountId.trim() === "") {
+      records.push({
+        slot,
+        outcome: "unsupported-provider",
+        detail: `credential under ${slot} carries no accountId, so it is not an ` +
+          "OpenAI Codex credential and this flow must not rotate it",
       });
-    } catch (error) {
-      records.push({ slot, outcome: "failed", detail: safeErrorText(error) });
       continue;
     }
     if (after?.type !== "oauth") {

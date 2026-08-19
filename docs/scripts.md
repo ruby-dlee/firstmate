@@ -76,6 +76,7 @@ The shared no-mistakes gate refusal used by every directly invocable mutating co
 | `fm-pi-account-home.py` | Project one Pi profile from the pooled `auth.json` into the single-profile account home its consumers read |
 | `fm-pi-refresh.py` | Renew Pi credentials before they expire, republish them into their account homes, and verify the result |
 | `fm-pi-refresh.mjs` | Rotate one Pi credential through Pi's own OAuth refresh and its own credential lock (the actuator `fm-pi-refresh.py` drives) |
+| `fm-lint-node.sh` | Parse every JavaScript tool in `bin/`, the lane ShellCheck's shell-only file set cannot cover |
 | `fm-nm-step-liveness.sh` | Read a no-mistakes step's processes as alive, dead, or graded unknown                |
 | `fm-tangle-lib.sh`       | Shared default-branch resolution and primary-checkout tangle classification          |
 | `fm-supervision-lib.sh`  | Shared in-flight-work-without-fresh-watcher-beacon predicate                         |

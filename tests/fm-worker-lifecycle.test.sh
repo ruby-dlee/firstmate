@@ -2174,6 +2174,11 @@ assert crashed is not None
 durable = json.loads((env["state_path"]).read_text())
 assert durable["pending_actions"]["1"]["idempotency_key"] == action["idempotency_key"], (
     "a crash during the provider call left no durable claim to replay")
+# And on the CALLER'S object after the earlier failed apply: a pop that moved
+# ahead of the apply would erase the replay obligation from the very object a
+# later refusal handler saves, silently wedging the slot instead of replaying.
+assert state["pending_actions"]["1"]["idempotency_key"] == action["idempotency_key"], (
+    "a failed apply left the caller's object without its slot's durable claim")
 controller.provider_call = lambda environment, operation, payload: {
     "result": {"idempotency_key": action["idempotency_key"],
                "worker": {"slot": 1, "resources": moved}}
@@ -2882,6 +2887,56 @@ with module.controller_lock(env):
     else:
         raise AssertionError("a tampered claim loaded cleanly")
 # Restore an honest document for the CAS case below.
+raw["pending_actions"] = {}
+Path(env["state_path"]).write_text(json.dumps(raw, sort_keys=True, separators=(",", ":")))
+
+# A corrupt legacy scalar refuses at load instead of being paved over.
+raw = json.loads(Path(env["state_path"]).read_text())
+raw["pending_action"] = "corrupted-garbage"
+Path(env["state_path"]).write_text(json.dumps(raw, sort_keys=True, separators=(",", ":")))
+with module.controller_lock(env):
+    try:
+        module.load_state(env)
+    except module.LifecycleError as exc:
+        assert "pending provider action is malformed" in str(exc), exc
+    else:
+        raise AssertionError("a corrupt legacy scalar was silently paved over")
+
+# A legacy scalar that DISAGREES with the map entry for its slot refuses.
+raw["pending_action"] = claim
+disagreeing = json.loads(json.dumps(claim))
+disagreeing["cloud_generation"] = 2
+disagreeing["idempotency_key"] = module.action_id(disagreeing)
+raw["pending_actions"] = {"1": disagreeing}
+Path(env["state_path"]).write_text(json.dumps(raw, sort_keys=True, separators=(",", ":")))
+with module.controller_lock(env):
+    try:
+        module.load_state(env)
+    except module.LifecycleError as exc:
+        assert "disagree" in str(exc), exc
+    else:
+        raise AssertionError("disagreeing legacy and per-slot claims loaded cleanly")
+
+# A claim naming a slot outside 1..MAX_WORKERS refuses, even when it
+# self-hashes: the planner can never produce one, so it is a hand edit.
+out_of_range = {
+    "slot": 17, "sku": "sku", "sku_family": "fam", "cloud_generation": 1,
+    "cloud_instance_id": None, "reservation_usd": 1.0, "resources": {},
+    "bindings": {"task": "t", "task_generation": "g"},
+}
+range_claim = module.make_action(
+    {"deployment_generation": env["deployment_generation"], "owner": env["owner"]},
+    "deallocate", worker=out_of_range)
+raw["pending_action"] = None
+raw["pending_actions"] = {"17": range_claim}
+Path(env["state_path"]).write_text(json.dumps(raw, sort_keys=True, separators=(",", ":")))
+with module.controller_lock(env):
+    try:
+        module.load_state(env)
+    except module.LifecycleError as exc:
+        assert "pending provider action is malformed" in str(exc), exc
+    else:
+        raise AssertionError("a claim outside the slot range loaded cleanly")
 raw["pending_actions"] = {}
 Path(env["state_path"]).write_text(json.dumps(raw, sort_keys=True, separators=(",", ":")))
 

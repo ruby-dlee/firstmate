@@ -460,6 +460,11 @@ def load_state(env):
     state.setdefault("pending_actions", {})
     state.setdefault("revision", 0)
     legacy = state.get("pending_action")
+    if legacy is not None and legacy != LEGACY_PENDING_SENTINEL and not isinstance(legacy, dict):
+        # The old binary refused this shape loudly; paving it over with the
+        # sentinel would silently destroy whatever replay obligation the
+        # corrupted bytes used to be. Refuse rather than guess.
+        raise LifecycleError("pending provider action is malformed")
     if isinstance(legacy, dict):
         # apply_action_result has always addressed the worker by
         # action["slot"], so the action already carries its own key; nothing

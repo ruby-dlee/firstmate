@@ -184,6 +184,13 @@ Reset deletion uses exact IDs, immutable identities, tags or metadata, detach re
 A replacement, unreadable relation, foreign tag, missing ETag, public NIC relation, or partial inventory records a bounded cleanup refusal and retains the resources.
 No age or cost override can convert retained-for-investigation into safe deletion.
 
+### Operator surrender for unrecoverable ordinary authority
+
+`surrender` releases one exact ASSIGNED worker whose ordinary release authority can no longer be minted, for example when local teardown consumed the task metadata before any receipt existed.
+It is refusal-first, not a shortcut: the command runs the ordinary authority itself and refuses when that succeeds, refuses live compute (the VM must be deallocated or stopped), refuses to replace an ordinary release proof, refuses while a pending provider action exists, and demands an operator `--reason` plus the same explicit confirmation pair as withdraw.
+The minted bundle keeps the `fm.worker-release/v2` shape the deallocate/delete-compute/reset machinery fences on, but every authority verdict is `surrendered` - `release` rejects that verdict, so a surrender bundle can never replay through the ordinary release command - and a top-level `surrender` block records the operator reason and the ordinary authority's refusal verbatim.
+After the proof is recorded, reconcile owns deallocation, compute deletion, and reset exactly as for an ordinary release, and the wrapper removes the task's locally staged provider credential keyed off the command's own `FM-SURRENDERED` receipt.
+
 ## Recovery and reconciliation classes
 
 Every live read classifies each controller-owned slot into exactly one operator outcome:

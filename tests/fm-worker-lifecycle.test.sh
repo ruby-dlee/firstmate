@@ -2248,6 +2248,207 @@ PY
   pass "restart replays one exact idempotency key without duplicating assignment"
 }
 
+
+surrender_lane() {
+  local tmp provider fixture home envfile
+  fm_test_tmproot_into tmp fm-worker-surrender
+  provider="$tmp/provider.py"
+  fixture="$tmp/provider-state.json"
+  home="$tmp/home"
+  mkdir -p "$home"
+  write_fixture_provider "$provider"
+  envfile="$tmp/env"
+  cat >"$envfile" <<EOF
+FM_HOME=$home
+FM_AZURE_SUBSCRIPTION_ID=$SUB
+FM_AZURE_DEPLOYMENT_GENERATION=dep-one
+FM_AZURE_OWNER_TAG=owner
+FM_AZURE_NAMING_PREFIX=fmtest
+FM_AZURE_WORKER_IDLE_COOLDOWN_SECONDS=0
+FM_WORKER_PROVIDER_COMMAND=python3 $provider
+FIXTURE_STATE=$fixture
+FM_WORKER_TEST_ALLOW_ASSERTED_BINDINGS=1
+EOF
+
+  python3 - "$CONTROLLER" "$WRAPPER" "$envfile" "$fixture" <<'PY' || fail "surrender lane exercise failed"
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+controller_path, wrapper, envfile, fixture_path = sys.argv[1:]
+env = os.environ.copy()
+for line in Path(envfile).read_text().splitlines():
+    key, value = line.split("=", 1)
+    env[key] = value
+
+def run(*args, check=True):
+    result = subprocess.run([wrapper] + list(args), env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and result.returncode != 0:
+        raise AssertionError("{} failed: {}".format(args, result.stderr))
+    return result
+
+def binding(number):
+    return format(number, "064x")
+
+def controller_state():
+    return json.loads((Path(env["FM_HOME"]) / "state/azure-workers/controller.json").read_text())
+
+run(
+    "request", "--task", "task-1", "--task-generation", "gen-1",
+    "--home-binding", binding(1001), "--account-binding", binding(2001),
+    "--worktree-binding", binding(3001), "--repository-binding", binding(4001),
+    "--repository-generation", "repo-1", "--owner-kind", "primary", "--eligible",
+)
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+state = controller_state()
+assert state["queue"]["task-1@gen-1"]["status"] == "assigned"
+slot = str(state["queue"]["task-1@gen-1"]["slot"])
+
+surrender = [
+    "surrender", "--task", "task-1", "--task-generation", "gen-1",
+    "--reason", "local teardown consumed the task metadata before any receipt existed",
+    "--output", str(Path(env["FM_HOME"]) / "surrender-1.json"),
+]
+confirm = ["--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"]]
+
+# Confirmation gates.
+refused = run(*surrender, *confirm, check=False)
+assert refused.returncode != 0 and "--confirm-surrender" in refused.stderr, refused.stderr
+refused = run(*surrender, "--confirm-surrender", "--confirm-subscription", "22222222-2222-4222-8222-222222222222", check=False)
+assert refused.returncode != 0 and "confirm-subscription" in refused.stderr, refused.stderr
+refused = run(*surrender[:-2], "--output", surrender[-1], "--reason", " ", "--confirm-surrender", *confirm, check=False)
+assert refused.returncode != 0 and "--reason" in refused.stderr, refused.stderr
+
+# Live compute refuses: the fixture VM is running.
+refused = run(*surrender, "--confirm-surrender", *confirm, check=False)
+assert refused.returncode != 0 and "dark compute" in refused.stderr, refused.stderr
+assert controller_state()["workers"][slot].get("release_proof") is None
+
+# The TTL fires outside the controller: model it in provider-side cloud state.
+fixture = json.loads(Path(fixture_path).read_text())
+fixture["workers"][slot]["resources"]["vm"]["power_state"] = "VM deallocated"
+Path(fixture_path).write_text(json.dumps(fixture, sort_keys=True, separators=(",", ":")) + "\n")
+
+# The ordinary authority genuinely refuses here (no task metadata exists in
+# this home), so surrender proceeds against dark compute.
+staged = Path(env["FM_HOME"]) / "state" / "task-1.cloud-account"
+staged.mkdir(parents=True)
+(staged / "auth.json").write_text("{}")
+result = run(*surrender, "--confirm-surrender", *confirm)
+assert "FM-SURRENDERED task-1 gen-1" in result.stdout, result.stdout
+assert not staged.exists(), "staged provider credential survived the surrender receipt"
+
+state = controller_state()
+worker = state["workers"][slot]
+proof = worker["release_proof"]
+assert state["queue"]["task-1@gen-1"]["status"] == "releasing"
+assert worker["phase"] == "release-proved"
+assert proof["surrender"]["reason"].startswith("local teardown")
+assert proof["surrender"]["ordinary_refusal"]
+assert all(v["verdict"] == "surrendered" for v in proof["authorities"].values())
+written = json.loads((Path(env["FM_HOME"]) / "surrender-1.json").read_text())
+assert written == proof
+
+# The proof digest round-trips the canonical digest, and the ordinary release
+# command refuses the surrender bundle outright.
+unsigned = dict(proof)
+supplied = unsigned.pop("proof_digest")
+recomputed = hashlib.sha256(json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+assert supplied == recomputed, "surrender proof digest does not round-trip"
+import importlib.util
+spec = importlib.util.spec_from_file_location("controller", controller_path)
+controller = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(controller)
+try:
+    controller.release_receipt(state, str(Path(env["FM_HOME"]) / "surrender-1.json"))
+except controller.LifecycleError as exc:
+    assert "did not prove release safety" in str(exc), exc
+else:
+    raise AssertionError("the ordinary release validator accepted a surrendered verdict")
+
+# Re-running is idempotent and re-issues the receipt without a second proof.
+again = run(*surrender, "--confirm-surrender", *confirm)
+assert "already recorded" in again.stdout and "FM-SURRENDERED task-1 gen-1" in again.stdout
+assert controller_state()["workers"][slot]["release_proof"] == proof
+
+# Reconcile now converges the surrendered slot to nothing through the ordinary
+# fenced machinery: delete-compute, then reset.
+for _ in range(4):
+    run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+state = controller_state()
+assert state["workers"] == {}, state["workers"]
+assert state["queue"]["task-1@gen-1"]["status"] == "complete"
+assert slot not in json.loads(Path(fixture_path).read_text())["workers"]
+PY
+  pass "surrender releases an authority-less worker through refusal-first gates and ordinary reset"
+}
+
+surrender_refuses_when_ordinary_authority_passes() {
+  # The gate under test is the caller's reaction to an authority SUCCESS. The
+  # subprocess contract itself (argv shape, refusal capture) is exercised for
+  # real in surrender_lane above; here only the attempt outcome is substituted,
+  # at module level, to prove success closes the lane.
+  local tmp
+  fm_test_tmproot_into tmp fm-worker-surrender-authority-pass
+  mkdir -p "$tmp/home"
+  python3 - "$CONTROLLER" "$tmp/home" <<'PY' || fail "surrender accepted a worker the ordinary release lane can still prove"
+import importlib.util
+import json
+import sys
+import types
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("controller", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+home = Path(sys.argv[2])
+(home / "state/azure-workers").mkdir(parents=True)
+env = {
+    "home": home, "state_dir": home / "state/azure-workers",
+    "subscription": "11111111-1111-4111-8111-111111111111",
+}
+worker = {
+    "slot": 1, "queue_key": "task-1@gen-1", "assignment_generation": "asg-00000001",
+    "cloud_instance_id": "cloud-1", "resources": {},
+    "bindings": {
+        "home_binding": "1" * 64, "task": "task-1", "task_generation": "gen-1",
+        "assignment_generation": "asg-00000001", "account_binding": "2" * 64,
+        "worktree_binding": "3" * 64, "repository_binding": "4" * 64,
+        "repository_generation": "repo-1",
+    },
+}
+state = {
+    "queue": {"task-1@gen-1": {"status": "assigned", "slot": 1, "task": "task-1", "task_generation": "gen-1"}},
+    "workers": {"1": worker},
+    "pending_action": None,
+}
+
+module.load_state = lambda _env: state
+module.controller_lock = __import__("contextlib").nullcontext
+module.save_state = lambda _env, _state: (_ for _ in ()).throw(AssertionError("a refused surrender persisted state"))
+module.ordinary_authority_attempt = lambda _env, _args, _worker: None
+module.provider_call = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("surrender consulted the provider after an authority success"))
+
+args = types.SimpleNamespace(
+    task="task-1", task_generation="gen-1", reason="reason", output=str(home / "out.json"),
+    confirm_surrender=True, confirm_subscription="11111111-1111-4111-8111-111111111111",
+)
+try:
+    module.command_surrender(env, args)
+except module.LifecycleError as exc:
+    assert "ordinary release authority succeeded" in str(exc), exc
+else:
+    raise AssertionError("surrender did not refuse a provable ordinary release")
+assert worker.get("release_proof") is None
+PY
+  pass "surrender refuses when the ordinary release authority still succeeds"
+}
+
+
 static_contract
 classification_and_admission_matrix
 azure_provider_refusal_matrix
@@ -2259,5 +2460,7 @@ endpoint_authority_checkout_helper
 account_authority_real_helper
 restart_idempotency
 partial_apply_never_persists
+surrender_lane
+surrender_refuses_when_ordinary_authority_passes
 
 echo "# fm-worker-lifecycle.test.sh: all assertions passed"

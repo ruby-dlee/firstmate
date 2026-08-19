@@ -154,8 +154,9 @@ The custody trade was accepted by the owner on 2026-08-19 knowing its exact shap
 disclaims data handling for the Fireworks lane (data is shared between Microsoft and Fireworks
 and processed on Fireworks infrastructure inside the US data zone), and the zero-data-retention
 promise (volatile memory only, no logging by default, on the chat-completions surface) is
-Fireworks' own policy, not Microsoft's. The lane must therefore use plain chat completions only
-- the Responses API retains data for 30 days under its default store flag and is forbidden here.
+Fireworks' own policy, not Microsoft's. The lane must therefore use plain chat completions
+only; the Responses API retains data for 30 days under its default store flag and is forbidden
+here.
 Billing was verified before acceptance: Fireworks pay-per-token on Foundry bills as Azure
 consumption (a feature registration, not a Marketplace SaaS purchase), is MACC-eligible, and
 Microsoft's own Startups material states startup credits apply to exactly this SKU; a small live
@@ -359,8 +360,8 @@ rather than daily, so nothing today refuses a single expensive day.
 Workers also do not deallocate on idle.
 Compute is released only when an exact release receipt is followed by a controller `reconcile`,
 and the sole self-acting bound is a per-VM shutdown schedule at a wall-clock deadline.
-The four stranded worker slots and the unattached validation disk that illustrated this were
-cleaned to zero on 2026-08-19 through the new surrender lane, but only by hand: wkr-04 had
+The four stranded worker slots were cleaned to zero on 2026-08-19 through the new surrender
+lane, and the unattached validation disk by the owner's directed delete, but only by hand: wkr-04 had
 idled about four hours with no release proof until its TTL fired, which is the live example the
 idle-release work exists to remove.
 
@@ -378,8 +379,7 @@ task ended releases and deallocates unattended.
 2. C2, because contention blocks demonstrating anything at scale. One of its three changes landed.
 3. R2/R3, the largest architectural gap and the requirement most misread by the current build.
 4. R6, whose direction is decided (GLM-5.2 on the Fireworks Foundry lane) and which no longer
-   needs an
-   owner login.
+   needs an owner login.
 5. R4, which needs the runner caller built and one validation cell closed.
 6. R5.
 7. C1, measured before it is changed.

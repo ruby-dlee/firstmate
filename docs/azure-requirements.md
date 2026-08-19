@@ -36,6 +36,12 @@ Added the same day:
 - A cost guard, so that a day's spend cannot quietly reach 100 dollars.
 - "For cross-check, just use the same pi fleet (or copy it in, whatever works)."
 
+Amended by the owner on 2026-08-19: the crosscheck requirement is model-family bidirectionality,
+not the literal codex/claude pairing quoted above. The second reviewer family is Kimi-K2.7-Code
+on Azure AI Foundry, reviewing codex-authored work; claude-authored work keeps the codex
+crosscheck. pi-anthropic was rejected the same day (API pricing), as was an interim same-day
+Claude-Code-CLI-subscription direction. Details and work in R6.
+
 ## R1. Crewmates run in Azure
 
 Status: DONE.
@@ -115,44 +121,59 @@ Acceptance: concurrent crewmates run on distinct pi profiles with no account col
 
 ## R6. Crosscheck is bidirectional across model families
 
-Status: NOT DONE. Direction decided by the owner 2026-08-19.
+Status: NOT DONE. Direction decided by the owner 2026-08-19 (see the amendment above).
 
 The requirement is that no author's work is reviewed only by its own model family.
 The roster was instead made eight reviewers all on `openai-codex`, by reading "just use the same
 pi fleet" as a restriction to one provider.
 It was not one, and that is the defect.
 
-The provider question was settled by two owner directives on 2026-08-19, the second superseding
-the first:
-
-1. The pi-anthropic path is dead either way. pi's anthropic OAuth authenticates as its own client
-   against its own token endpoint, so a Claude CLI refresh token cannot be spent by pi, and a
-   fresh pi-anthropic login would bill at API pricing, which the owner rejected outright.
-   An earlier same-day directive routed claude reviews through the Claude Code CLI on the owner's
-   subscription profile instead.
-2. The standing decision: the second reviewer family is **Kimi-K2.7-Code on Azure AI Foundry**
-   (Direct-from-Azure lane, Global Standard, eastus, pay-per-token), chosen for tool calling
-   support, the Microsoft-hosted custody lane, published pricing, and lineage independent of both
-   OpenAI and Anthropic. Codex-authored work is reviewed by a Kimi-backed reviewer; claude-authored
-   work keeps the existing pi-codex crosscheck, which already works. The model pick is explicitly
-   provisional: reevaluate after live review data (GLM-5.2 was the runner-up; the comparison is in
-   the owner's evidence folder, R6-FOUNDRY-RESEARCH-2026-08-19.md).
+The provider question was settled on 2026-08-19.
+pi-anthropic is dead twice over: pi's anthropic OAuth authenticates as its own client against its
+own token endpoint, so a Claude CLI refresh token cannot be spent by pi, and a fresh pi-anthropic
+login would bill at API pricing, which the owner rejected.
+An interim directive the same day routed claude reviews through the Claude Code CLI on the
+owner's subscription profile; the standing decision superseded it: the second reviewer family is
+Kimi-K2.7-Code on Azure AI Foundry (Direct-from-Azure lane; at decision time deployable Global
+Standard from eastus with tool calling and published pay-per-token pricing - re-verify at deploy
+time), chosen for tool calling, the Microsoft-hosted custody lane, and lineage independent of
+both OpenAI and Anthropic.
+Codex-authored work is reviewed by a Kimi-backed reviewer; claude-authored work keeps the codex
+crosscheck, which R5 records as proven at the roster level while R9 still owes the live proof.
+The model pick is explicitly provisional: reevaluate after live review data (GLM-5.2 was the
+runner-up; the comparison is in the owner's evidence folder,
+R6-FOUNDRY-RESEARCH-2026-08-19.md).
 
 No owner login is needed anymore: the Kimi lane authenticates with a Foundry deployment and an
 api-key, not a subscription session.
+The Kimi credential is an api-key, not a pi OAuth slot, so the literal `openai-codex` slot key in
+`bin/fm-pi-account-home.py`, `bin/fm-crosscheck.py` (`inspect_pi_credential`,
+`account_identity`), and the Azure credential archive in `bin/fm-crosscheck-azure.py` stays as it
+is - those three still refuse any non-codex pi OAuth slot, which no longer blocks R6 and remains
+the recorded constraint if a second pi OAuth provider is ever added.
+The identity question those tools answered with `accountId` still needs an answer for an api-key
+credential: reviewer identity for the Kimi lane must bind the Foundry resource and deployment,
+since an api-key carries no account identity of its own.
 
-Work: deploy `Kimi-K2.7-Code` in a Foundry resource (eastus, Global Standard) and store the key in
-the fleet's secret custody, never in the repo; a pi provider entry pointing at the resource's
-OpenAI-compatible `/openai/v1` endpoint with the deployment name as the model id; verify pi
-tolerates `reasoning_content` in streamed deltas before rollout; a roster lane for the Kimi
-reviewer with `config/crosscheck-same-model` off; review guards sized to the model's 262K context:
-a strict findings schema, path-existence validation before filing, and a per-review context cap;
+Work: deploy `Kimi-K2.7-Code` in a Foundry resource and store the key in the fleet's secret
+custody, never in the repo; a pi custom provider entry (`models.json` `baseUrl` +
+`openai-completions` api) pointing at the resource's OpenAI-compatible `/openai/v1` endpoint
+with the deployment name as the model id; verify pi tolerates `reasoning_content` in streamed
+deltas before rollout; extend `bin/fm-crosscheck.py` `allowed_profiles` and roster validation to
+carry the Kimi lane (today they pin pi to `("pi", "gpt-5.6-sol", "xhigh")` and would refuse it)
+with `config/crosscheck-same-model` off; extend the `bin/fm-crosscheck-azure.py` endpoint
+allowlist and credential archive for the Foundry host and api-key shape; define reviewer
+identity for api-key credentials as above; retire or re-point the interim claude reviewer
+artifacts (the `("claude", "claude-opus-5", "xhigh")` `allowed_profiles` entry, the
+`api.anthropic.com` allowlist entry, and the claude-profile boot copy described in
+`docs/azure-crosscheck.md`); review guards sized to the model's context window at deploy time: a
+strict findings schema, path-existence validation before filing, and a per-review context cap;
 and routing so codex-authored changes draw the Kimi reviewer while claude-authored changes draw
 codex reviewers.
 
 Acceptance: a codex-authored change is reviewed by a Kimi-backed reviewer and a claude-authored
-change by a codex-backed reviewer, on distinct credentials, with the same evidence discipline as
-the codex lane.
+change by a codex-backed reviewer, on distinct credentials with bound reviewer identities, with
+the same evidence discipline as the codex lane.
 
 ## R7. Everything is logged in
 

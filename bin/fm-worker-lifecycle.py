@@ -1094,11 +1094,21 @@ def record_refusal(state, worker, note):
 # action's request digest, and the fleet's completed-seconds accumulator.
 APPLY_SCOPE = ("workers", "queue", "executions", "completed_worker_seconds")
 
-# Not part of the apply's business, and not comparable either: `make_action`
+# Coarse on purpose: it is per container, not per action type, so it permits
+# writes no individual type makes (an `executions` entry from a `create`, say).
+# A per-type contract would be tighter and would also have to change every time
+# a type does, which is how an allowlist becomes a wedge on the money path.
+
+# Not part of the apply's business, and not comparable either. `make_action`
 # aliases live state into the action it mints (`action["request"]` IS the queue
-# entry), and `copy.deepcopy` preserves that sharing, so mutating the copy's
-# queue entry also changes the copy's own record of the pending action.
-# `execute_action` and `replay_pending` own this key on both sides of the call.
+# entry), and `copy.deepcopy` preserves that sharing, so applying into the copy
+# also changes the copy's own record of the pending action while the original's
+# stays put. Excluding the key is what makes the comparison meaningful; copying
+# BOTH sides does not, because the apply writes only into the copy.
+#
+# It excludes the whole subtree rather than the aliased part, so an apply that
+# rebound `state["pending_action"]` outright would go unseen. That is safe only
+# because both call sites set it themselves immediately afterwards.
 CALLER_OWNED_KEYS = ("pending_action",)
 
 
@@ -1117,7 +1127,8 @@ def assert_scoped(before, after, *, slot, queue_key, request_digest):
             continue
         if before.get(key) != after.get(key):
             raise LifecycleError(
-                "provider mutation result touched {} outside its slot".format(key)
+                "provider mutation result touched {} outside its slot; the pending "
+                "action stays durable and will replay until this is resolved".format(key)
             )
     for container, allowed in (
         ("workers", {slot}),
@@ -1132,7 +1143,8 @@ def assert_scoped(before, after, *, slot, queue_key, request_digest):
             if first.get(key) != second.get(key):
                 raise LifecycleError(
                     "provider mutation result changed {}[{}], which its slot does "
-                    "not own".format(container, key)
+                    "not own; the pending action stays durable and will replay "
+                    "until this is resolved".format(container, key)
                 )
 
 
@@ -1151,11 +1163,7 @@ def apply_result_transactionally(env, state, action, result):
     and the caller's dict identity is preserved because callers hold it.
     """
 
-    # Two copies, not the live object against one copy. `make_action` aliases
-    # live state into the action it mints, so `state["pending_action"]` shares
-    # structure with `state["queue"]`, and comparing an aliased original with
-    # an unaliased copy reports a difference the apply never made.
-    before = copy.deepcopy(state)
+    before = state
     working = copy.deepcopy(state)
     slot = str(action.get("slot", ""))
     # Read before the apply: `reset` removes the worker record, so its queue

@@ -1949,6 +1949,34 @@ controller.apply_result_transactionally(
 assert proof["workers"]["1"]["phase"] == "assigned", proof["workers"]["1"]["phase"]
 assert proof["queue"][WORKER["queue_key"]]["status"] == "assigned"
 
+# The guard at its call site, not only as a function. Deleting the
+# assert_scoped call from apply_result_transactionally leaves every other
+# assertion in this file green, which is exactly the hole this closes: the
+# guard is the whole reason the change exists.
+original_apply = controller.apply_action_result
+
+
+def reaches_outside(env, document_, action_, result_):
+    original_apply(env, document_, action_, result_)
+    document_["capacity_reservations"]["rogue"] = 1
+
+
+controller.apply_action_result = reaches_outside
+scoped = document()
+raised = None
+try:
+    controller.apply_result_transactionally(
+        {}, scoped, action, {"idempotency_key": "k", "worker": copy.deepcopy(CLOUD)}
+    )
+except controller.LifecycleError as error:
+    raised = error
+finally:
+    controller.apply_action_result = original_apply
+assert raised is not None, "apply_result_transactionally committed an out-of-scope apply"
+# Refused for the right reason, not merely refused.
+assert "capacity_reservations" in str(raised), str(raised)
+assert scoped == document(), "an out-of-scope apply reached the caller's record"
+
 # Now the same apply with every resource identity moved. adopt_cloud_resources
 # writes the whole resource set onto the record and only then refuses it, so
 # that write is the partial effect under test.
@@ -2125,7 +2153,7 @@ controller.assert_scoped(before, allowed, slot="1", queue_key="mine", request_di
 # And a reset removes the worker outright, which the allowlist must permit.
 removed = dict(before)
 removed.update({"workers": {"2": {"slot": 2}}})
-controller.assert_scoped(removed and before, removed, slot="1", queue_key=None, request_digest=None)
+controller.assert_scoped(before, removed, slot="1", queue_key=None, request_digest=None)
 PY
 
   pass "a provider mutation that fails partway leaves the durable record untouched, and one that reaches outside its slot is refused"

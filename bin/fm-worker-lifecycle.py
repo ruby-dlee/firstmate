@@ -612,11 +612,21 @@ def verify_request(request):
             "a secondmate compartment is requested only by the primary; "
             "secondmates own author crewmates, never another secondmate")
     parent = request.get("parent_task")
-    if role == "author" and request.get("owner_kind") == "secondmate":
+    parent_generation = request.get("parent_task_generation")
+    if (parent is None) != (parent_generation is None):
+        raise LifecycleError(
+            "parent_task and parent_task_generation travel together or not at all")
+    if parent is not None:
+        # The parent pair marks a COMPARTMENT child specifically. A local
+        # secondmate home still requests its own cloud crewmates with
+        # owner_kind=secondmate and no parent (the documented lane in
+        # docs/azure-workers.md), bounded by local policy rather than a
+        # compartment budget; the compartment bridge always stamps the pair.
+        if role != "author" or request.get("owner_kind") != "secondmate":
+            raise LifecycleError(
+                "parent_task is owned by secondmate-owned author requests only")
         require_id("parent_task", parent)
-        require_id("parent_task_generation", request.get("parent_task_generation"))
-    elif parent is not None:
-        raise LifecycleError("parent_task is owned by secondmate-owned author requests only")
+        require_id("parent_task_generation", parent_generation)
     if request.get("eligible") is not True:
         raise LifecycleError("worker request must be explicitly eligible")
 
@@ -2194,7 +2204,15 @@ def enforce_child_bounds(env, state, item):
             "secondmate {} already owns {} active children (cap {})".format(
                 item["parent_task"], active, env["secondmate_child_max"]))
     parent_worker = state["workers"].get(str(parent.get("slot")))
-    lifetime = int((parent_worker or {}).get("children_total", 0))
+    if parent_worker is None or parent_worker.get("queue_key") != parent_key:
+        # Unreachable through code paths today (assigned implies a worker,
+        # reset both pops the worker and completes the item), so reaching it
+        # means hand-edited or corrupted state; the lifetime bound must not
+        # degrade silently there.
+        raise LifecycleError(
+            "assigned secondmate compartment {} has no exact worker record".format(
+                item["parent_task"]))
+    lifetime = int(parent_worker.get("children_total", 0))
     if lifetime >= env["secondmate_child_total"]:
         raise LifecycleError(
             "secondmate {} reached its lifetime child total ({}, cap {})".format(
@@ -2269,9 +2287,8 @@ def command_request(env, args):
         state["queue"][key] = item
         if item.get("parent_task") is not None:
             parent_key = request_key(item["parent_task"], item["parent_task_generation"])
-            parent_worker = state["workers"].get(str(state["queue"][parent_key].get("slot")))
-            if parent_worker is not None:
-                parent_worker["children_total"] = int(parent_worker.get("children_total", 0)) + 1
+            parent_worker = state["workers"][str(state["queue"][parent_key].get("slot"))]
+            parent_worker["children_total"] = int(parent_worker.get("children_total", 0)) + 1
         save_state(env, state)
     print("queued {} generation {} for one isolated author worker".format(item["task"], item["task_generation"]))
 

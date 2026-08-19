@@ -2342,12 +2342,30 @@ fixture = json.loads(Path(fixture_path).read_text())
 fixture["workers"][slot]["resources"]["vm"]["power_state"] = "VM deallocated"
 Path(fixture_path).write_text(json.dumps(fixture, sort_keys=True, separators=(",", ":")) + "\n")
 
+# Durable execution evidence of unlanded work blocks the lane until the
+# discard is named, and the named discard is recorded in the proof. The
+# record is injected into durable controller state exactly where
+# apply_action_result persists executions.
+state = controller_state()
+evidence_digest = "b" * 64
+state["executions"][evidence_digest] = {
+    "task": "task-1", "task_generation": "gen-1",
+    "assignment_generation": state["workers"][slot]["assignment_generation"],
+    "outcome_present": True, "outcome_commits": 1,
+}
+(Path(env["FM_HOME"]) / "state/azure-workers/controller.json").write_text(
+    json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
+refused = run(*surrender, "--confirm-surrender", *confirm, check=False)
+assert refused.returncode != 0 and evidence_digest in refused.stderr, refused.stderr
+assert controller_state()["workers"][slot].get("release_proof") is None
+
 # The ordinary authority genuinely refuses here (no task metadata exists in
-# this home), so surrender proceeds against dark compute.
+# this home), so surrender proceeds against dark compute once the discard is
+# deliberately named.
 staged = Path(env["FM_HOME"]) / "state" / "task-1.cloud-account"
 staged.mkdir(parents=True)
 (staged / "auth.json").write_text("{}")
-result = run(*surrender, "--confirm-surrender", *confirm)
+result = run(*surrender, "--confirm-surrender", "--confirm-discard-unlanded", *confirm)
 assert "FM-SURRENDERED task-1 gen-1" in result.stdout, result.stdout
 assert not staged.exists(), "staged provider credential survived the surrender receipt"
 
@@ -2358,6 +2376,7 @@ assert state["queue"]["task-1@gen-1"]["status"] == "releasing"
 assert worker["phase"] == "release-proved"
 assert proof["surrender"]["reason"].startswith("local teardown")
 assert proof["surrender"]["ordinary_refusal"]
+assert proof["surrender"]["discarded_unlanded_executions"] == [evidence_digest]
 assert all(v["verdict"] == "surrendered" for v in proof["authorities"].values())
 written = json.loads((Path(env["FM_HOME"]) / "surrender-1.json").read_text())
 assert written == proof

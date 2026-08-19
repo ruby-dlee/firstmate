@@ -172,7 +172,10 @@ checkout_refresh_ensure() {
 
 pi_auth_refresh_ensure() {
   local out
-  [ "$(uname)" = Darwin ] || return 0
+  # The same seam the Python half uses. Checking uname directly made this
+  # unreachable on Linux, so the assertion that bootstrap reports an unhealthy
+  # schedule could only ever run on a developer's Mac.
+  [ "${FM_PI_REFRESH_PLATFORM:-$(uname)}" = Darwin ] || return 0
   [ -x "$SCRIPT_DIR/fm-pi-refresh.py" ] || return 0
   # Silent under the test bypass unless a test asks for it, the same seam
   # checkout-refresh and report-retention use: this reports one machine-global

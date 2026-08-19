@@ -41,8 +41,9 @@ Added the same day:
 Status: DONE.
 
 `config/spawn-cloud=azure` is set and accepted by `bin/fm-spawn.sh`'s own parser, and a crewmate
-has run end to end in Azure.
-Placement is still single-profile; multi-profile placement is R5, not a residual of this item.
+has been created, staged, and executed in Azure with exit 0.
+No crewmate has returned an outcome, which is R9 rather than a residual of this item.
+Placement is still single-profile; multi-profile placement is R5.
 
 ## R2/R3. Secondmates run in Azure, and can spawn crewmates in Azure
 
@@ -76,13 +77,20 @@ Status: PARTIAL, and neither lane functions today.
 Two lanes exist.
 The validation-cell lane (`docs/azure-validation.md`) has never closed a cell; there is no
 `azure-validation` state under `$FM_HOME/state`.
-The shard-receipt strand that prevented a cell from closing was fixed, and that fix is still
-unproven against a live cell.
-The runner-offload lane (`FM_AZURE_RUNNER_REMOTE_CLASSES`) has no caller: nothing sets
-`FM_AZURE_RUNNER_TASK`, `FM_AZURE_RUNNER_GENERATION`, or `FM_AZURE_RUNNER_CONFIRM_SUBSCRIPTION`.
-Selecting a remote class therefore makes `bin/fm-no-mistakes-test-command.sh` skip the entire
-local suite and then fail, with no fallback by design, so the setting stays off until its caller
-exists.
+A stranding strand was fixed: a passed run carrying a short receipt set is now demoted to failed
+so the cell collects and retains legibly.
+That buys legibility, not closing, and the root cause (an in-cell bridge producing no receipts) is
+untouched, so a demoted cell still cannot `close`.
+One stranded work disk is on the subscription today.
+The runner-offload lane (`FM_AZURE_RUNNER_REMOTE_CLASSES`) has no caller: nothing in the
+repository sets `FM_AZURE_RUNNER_TASK`, `FM_AZURE_RUNNER_GENERATION`, or
+`FM_AZURE_RUNNER_CONFIRM_SUBSCRIPTION`, and the placeholders in `docs/azure-runner.md` are an
+operator recipe rather than a caller.
+Selecting the `test` class therefore routes every non-Herdr test to Azure and keeps only the
+Herdr lifecycle scripts local; with no caller supplying the bindings the dispatch fails, so those
+non-Herdr tests run nowhere and the step exits 1.
+There is no automatic fallback to the host, and `FM_AZURE_RUNNER_LOCAL_RECOVERY_CLASSES` is the
+explicit operator opt-out that restores the full local run.
 
 Work: build the caller that derives the per-run bindings from the ambient no-mistakes run, then
 drive one validation cell from dispatch to close.
@@ -118,9 +126,14 @@ pi drives `anthropic`, `openai`, and `openai-codex`, so one pi fleet and cross-p
 compatible: the same harness, different providers, distinct accounts.
 No image rebake is needed, because the model image already carries pi.
 
-Work: anthropic profiles added to the pi fleet, which needs an owner login; a roster carrying both
-providers; `config/crosscheck-same-model` turned off; and authors present on both providers so
-review is genuinely bidirectional rather than one-directional.
+Work: generalize the provider slot key, which is written literally as `openai-codex` in
+`bin/fm-pi-account-home.py`, in `bin/fm-crosscheck.py` (`inspect_pi_credential` and
+`account_identity`), and in the Azure credential archive in `bin/fm-crosscheck-azure.py`, so that
+those three refuse any non-codex pi slot today; anthropic profiles added to the pi fleet; a roster
+carrying both providers; `config/crosscheck-same-model` turned off; and authors present on both
+providers so review is genuinely bidirectional rather than one-directional.
+An anthropic credential also carries no `accountId`, which the projection tool currently requires,
+so reviewer identity for that provider needs its own answer.
 
 Acceptance: a claude-authored change is reviewed by a codex-backed reviewer and a codex-authored
 change by a claude-backed reviewer, both through pi, on distinct accounts.
@@ -130,8 +143,11 @@ change by a claude-backed reviewer, both through pi, on distinct accounts.
 Status: FRAGILE, and superseded in practice by R8.
 
 The eight pi profiles are valid until 2026-08-25.
-The `~/.local/share/agent-fleet/accounts/claude/` pool holds blanked, length-zero tokens and is
-abandoned.
+Two of the three profiles in `~/.local/share/agent-fleet/accounts/claude/` hold blanked,
+length-zero tokens.
+The third is `refreshable`: its access token expired on 2026-08-17, but refresh material is
+present and declares itself valid to 2026-09-10, so it may be recoverable without a fresh login.
+That matters to R6, which currently assumes an owner login is required.
 
 ## R8. Auth refreshes on its own
 
@@ -200,11 +216,23 @@ the controller serializing them.
 
 ## C3. Cost guard
 
-Status: HOLDING.
+Status: NOT DONE.
 
-Spend is inside the commissioning ceiling and workers idle-deallocate on their own.
-Every new lane stays inside that ceiling, and a lane that keeps compute alive between tasks states
-its own cost bound before it is enabled.
+The requirement is that a day's spend cannot quietly reach 100 dollars.
+The only bound that exists is `FM_AZURE_WORKER_COMMISSIONING_CEILING_USD`, which is cumulative
+rather than daily, so nothing today refuses a single expensive day.
+
+Workers also do not deallocate on idle.
+Compute is released only when an exact release receipt is followed by a controller `reconcile`,
+and the sole self-acting bound is a per-VM shutdown schedule at a wall-clock deadline.
+Four worker slots are assigned with no release proof, one of their VMs is running with no live
+task, and one validation work disk is unattached and stranded.
+
+Work: a daily spend bound that refuses a mutation once the day's spend crosses it, and an idle
+release path so an assigned worker whose task ended returns its compute without a human.
+
+Acceptance: a day cannot cross the bound without an explicit operator override, and a worker whose
+task ended releases and deallocates unattended.
 
 ## Order of work
 

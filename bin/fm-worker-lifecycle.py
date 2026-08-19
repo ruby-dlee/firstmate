@@ -1677,6 +1677,10 @@ def parser():
     surrender_parser.add_argument("--reason", required=True)
     surrender_parser.add_argument("--output", required=True)
     surrender_parser.add_argument("--confirm-surrender", action="store_true")
+    surrender_parser.add_argument(
+        "--confirm-discard-unlanded", action="store_true",
+        help="acknowledge that recorded execute outcomes never proven landed are discarded",
+    )
     surrender_parser.add_argument("--confirm-subscription", required=True)
     reconcile_parser = sub.add_parser("reconcile", help="plan or apply bounded convergence")
     reconcile_parser.add_argument("--apply", action="store_true")
@@ -2481,7 +2485,16 @@ def ordinary_authority_attempt(env, args, worker):
             Path(output_path).unlink()
     if result.returncode == 0:
         return None
-    return result.stderr.decode("utf-8", errors="replace").strip()[-1000:]
+    stderr_text = result.stderr.decode("utf-8", errors="replace").strip()
+    # Only a genuine refusal unlocks surrender. The authority also exits
+    # nonzero on tool or environment trouble (broken git, unreadable helper),
+    # and treating that as a refusal would make every dark worker
+    # surrenderable exactly when the machine is least trustworthy.
+    if "WORKER AUTHORITY REFUSED" not in stderr_text:
+        raise LifecycleError(
+            "ordinary release authority tool failed rather than refusing: {}".format(stderr_text[-500:])
+        )
+    return stderr_text[-1000:]
 
 
 def command_surrender(env, args):
@@ -2522,6 +2535,12 @@ def command_surrender(env, args):
             raise LifecycleError("a pending provider action exists; reconcile first")
         key = request_key(args.task, args.task_generation)
         item = state["queue"].get(key)
+        if item is not None and item.get("status") == "complete":
+            raise LifecycleError(
+                "surrendered task generation already converged; if its staged credential "
+                "remains under state/, remove it with fm_cloud_state_remove from "
+                "bin/fm-cloud-state-lib.sh"
+            )
         if item is None or item.get("status") not in ("assigned", "releasing"):
             raise LifecycleError("surrender requires one exact assigned task generation")
         worker = state["workers"].get(str(item.get("slot")))
@@ -2530,6 +2549,9 @@ def command_surrender(env, args):
         existing = worker.get("release_proof")
         if existing is not None:
             if isinstance(existing.get("surrender"), dict):
+                if (existing.get("task") != args.task
+                        or existing.get("task_generation") != args.task_generation):
+                    raise LifecycleError("stored surrender proof binds a different task generation")
                 write_surrender_output(args.output, existing)
                 print("surrender proof already recorded with exact identity")
                 print("FM-SURRENDERED {} {}".format(args.task, args.task_generation))
@@ -2537,6 +2559,28 @@ def command_surrender(env, args):
             raise LifecycleError("worker already has an ordinary release proof; reconcile releases it")
         if item.get("status") != "assigned":
             raise LifecycleError("surrender requires one exact assigned task generation")
+        produced = []
+        for request_digest, execution in sorted((state.get("executions") or {}).items()):
+            if not isinstance(execution, dict):
+                continue
+            if (execution.get("task") != args.task
+                    or execution.get("task_generation") != args.task_generation
+                    or execution.get("assignment_generation") != worker["assignment_generation"]):
+                continue
+            if (execution.get("outcome_present") is True
+                    or execution.get("outcome_uncommitted_changes") is True
+                    or (execution.get("outcome_commits") or 0) > 0):
+                produced.append(request_digest)
+        if produced and not args.confirm_discard_unlanded:
+            # The controller's own durable record says this worker produced
+            # repository work whose landing is unproven; surrendering it leads
+            # to a reset that deletes the task disk holding that work. The
+            # operator can override, but only by naming the discard.
+            raise LifecycleError(
+                "surrender refuses: execution(s) {} produced repository work whose landing "
+                "is unproven; inspect the task disk, then pass --confirm-discard-unlanded "
+                "to discard it deliberately".format(", ".join(produced))
+            )
         refusal = ordinary_authority_attempt(env, args, worker)
         if refusal is None:
             raise LifecycleError(
@@ -2559,6 +2603,7 @@ def command_surrender(env, args):
             "surrendered_at": surrendered_at,
             "power_state": power,
             "last_execution_digest": worker.get("last_execution_digest"),
+            "discarded_unlanded_executions": produced,
         }
         proof = {
             "schema": RELEASE_SCHEMA,

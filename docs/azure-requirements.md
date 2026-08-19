@@ -361,7 +361,8 @@ Workers also do not deallocate on idle.
 Compute is released only when an exact release receipt is followed by a controller `reconcile`,
 and the sole self-acting bound is a per-VM shutdown schedule at a wall-clock deadline.
 The four stranded worker slots were cleaned to zero on 2026-08-19 through the new surrender
-lane, and the unattached validation disk by the owner's directed delete, but only by hand: wkr-04 had
+lane, and the unattached validation disk by the owner's directed delete, but only by hand:
+wkr-04 had
 idled about four hours with no release proof until its TTL fired, which is the live example the
 idle-release work exists to remove.
 

@@ -38,8 +38,9 @@ Added the same day:
 
 Amended by the owner on 2026-08-19: the crosscheck requirement is that no author's work is
 reviewed only by its own model family, not the literal codex/claude pairing quoted above.
-The second reviewer family is Kimi-K2.7-Code on Azure AI Foundry. pi-anthropic was rejected the same day (API pricing), as was an interim
-same-day Claude-Code-CLI-subscription direction. Details and work in R6.
+The second reviewer family is Kimi-K2.7-Code on Azure AI Foundry.
+pi-anthropic was rejected the same day (API pricing), as was an interim same-day
+Claude-Code-CLI-subscription direction. Details and work in R6.
 
 Amended again by the owner later on 2026-08-19: crosscheck routes through Kimi only. A single
 reviewer family outside both author families satisfies the paradigm for every author, unbinds

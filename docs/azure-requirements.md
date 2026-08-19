@@ -38,9 +38,15 @@ Added the same day:
 
 Amended by the owner on 2026-08-19: the crosscheck requirement is model-family bidirectionality,
 not the literal codex/claude pairing quoted above. The second reviewer family is Kimi-K2.7-Code
-on Azure AI Foundry, reviewing codex-authored work; claude-authored work keeps the codex
-crosscheck. pi-anthropic was rejected the same day (API pricing), as was an interim same-day
-Claude-Code-CLI-subscription direction. Details and work in R6.
+on Azure AI Foundry. pi-anthropic was rejected the same day (API pricing), as was an interim
+same-day Claude-Code-CLI-subscription direction. Details and work in R6.
+
+Amended again by the owner later on 2026-08-19: crosscheck routes through Kimi only. A single
+reviewer family outside both author families satisfies the paradigm for every author, unbinds
+review capacity from the pi-codex subscription profiles the fleet's own work depends on, and
+makes the lane scalable for firstmate and for engineers' on-demand use. pi-codex stays as an
+explicit fallback whose activation must be easy to see. no-mistakes stays on pi-codex.
+The owner also directed a Slack v1 team exposure of crosscheck, recorded as R10.
 
 ## R1. Crewmates run in Azure
 
@@ -138,8 +144,14 @@ Kimi-K2.7-Code on Azure AI Foundry (Direct-from-Azure lane; at decision time dep
 Standard from eastus with tool calling and published pay-per-token pricing - re-verify at deploy
 time), chosen for tool calling, the Microsoft-hosted custody lane, and lineage independent of
 both OpenAI and Anthropic.
-Codex-authored work is reviewed by a Kimi-backed reviewer; claude-authored work keeps the codex
-crosscheck, which R5 records as proven at the roster level while R9 still owes the live proof.
+Later the same day the owner simplified the routing: ALL crosscheck reviews route through the
+Kimi lane, for codex-authored and claude-authored work alike. Kimi belongs to neither author
+family, so single-family review is avoided for every author with one reviewer lane, and review
+capacity stops competing with the pi-codex subscription profiles that no-mistakes and the
+author fleet consume. The pi-codex roster (which R5 records as proven at the roster level while
+R9 still owes the live proof) is retained as a dormant fallback behind a config flip, never
+deleted; every review must name the lane that produced it, and a status read must show whether
+Kimi is serving or the fallback is active, so a silent fallback is impossible.
 The model pick is explicitly provisional: reevaluate after live review data (GLM-5.2 was the
 runner-up; the comparison is in the owner's evidence folder,
 R6-FOUNDRY-RESEARCH-2026-08-19.md).
@@ -168,12 +180,14 @@ artifacts (the `("claude", "claude-opus-5", "xhigh")` `allowed_profiles` entry, 
 `api.anthropic.com` allowlist entry, and the claude-profile boot copy described in
 `docs/azure-crosscheck.md`); review guards sized to the model's context window at deploy time: a
 strict findings schema, path-existence validation before filing, and a per-review context cap;
-and routing so codex-authored changes draw the Kimi reviewer while claude-authored changes draw
-codex reviewers.
+routing so every crosscheck draws the Kimi reviewer, with the pi-codex roster behind a config
+flip as fallback; and lane visibility: the review evidence and report name the reviewing lane,
+and a status command answers whether Kimi is serving or the fallback is active.
 
-Acceptance: a codex-authored change is reviewed by a Kimi-backed reviewer and a claude-authored
-change by a codex-backed reviewer, on distinct credentials with bound reviewer identities, with
-the same evidence discipline as the codex lane.
+Acceptance: a codex-authored change and a claude-authored change are each reviewed by a
+Kimi-backed reviewer with bound reviewer identity and the same evidence discipline as the codex
+lane; the fallback flip to pi-codex is demonstrated once and its activation is visible in the
+review evidence and the status read.
 
 ## R7. Everything is logged in
 
@@ -183,8 +197,7 @@ The eight pi profiles renew on their own now, which is R8.
 Two of the three profiles in `~/.local/share/agent-fleet/accounts/claude/` hold blanked,
 length-zero tokens; the third is `refreshable` with material declared valid to 2026-09-10.
 None of the three is needed for R6 anymore: the Kimi lane authenticates with a Foundry
-deployment key, and claude-authored work is reviewed by the codex fleet, so R7 holds with no
-owner login outstanding.
+deployment key and reviews all authors, so R7 holds with no owner login outstanding.
 
 ## R8. Auth refreshes on its own
 
@@ -234,6 +247,33 @@ backstop.
 The existing smoke assignments cannot be reused because their `repository_generation` is not a
 commit that exists.
 Proving it requires a real spawned crewmate task that commits.
+
+## R10. Crosscheck is exposed to team engineers through Slack
+
+Status: NOT STARTED. Directed by the owner 2026-08-19; builds after R6.
+
+The owner's v1 shape: an engineer tags the crosscheck bot in a Slack channel with a pull request
+link; the Kimi lane reviews it; the bot posts the findings as a thread reply on the engineer's
+own message. No engineer wires up a harness or touches an endpoint, and the same path works for
+deliberate on-demand use. Cursor Bugbot continues to run for engineers' pull requests (it stays
+disabled on the owner's), so this lane complements rather than replaces it.
+
+Constraints the build must honor:
+
+- The listener uses Slack Socket Mode, so no public inbound endpoint is added to the private
+  lane posture. It is a resident process; where it runs is decided at build time and its
+  standing cost is recorded under C3.
+- v1 accepts pull request links only, and only for repositories in the organization allowlist.
+  The bot's repository read credential must never be pointed at a repository outside that
+  allowlist, because a review pulls untrusted content into a credentialed context.
+- Every thread reply names the lane that produced it (Kimi, or the pi-codex fallback), the same
+  visibility R6 requires, so engineers and the owner can always see what is serving.
+- Team usage is metered per submitter under a daily cost bound (C3); when the bound is reached
+  the bot says so in the thread instead of silently dropping the request.
+
+Acceptance: an engineer other than the owner tags the bot with a pull request link and receives
+threaded findings produced by the Kimi lane, with the lane named in the reply, the request
+metered, and an out-of-allowlist link refused with a clear message.
 
 ## C1. Crosscheck completes in 20 to 30 minutes
 
@@ -309,6 +349,8 @@ task ended releases and deallocates unattended.
 6. R5.
 7. C1, measured before it is changed.
 8. R9, which is the proof of the rest.
+9. R10, the Slack team exposure, which needs R6's lane and can be pulled forward right after R6
+   if the owner wants engineers on it sooner.
 
 ## Standing constraints
 

@@ -37,8 +37,8 @@ Added the same day:
 - "For cross-check, just use the same pi fleet (or copy it in, whatever works)."
 
 Amended by the owner on 2026-08-19: the crosscheck requirement is that no author's work is
-reviewed by its own model family, not the literal codex/claude pairing quoted above. The second reviewer family is Kimi-K2.7-Code
-on Azure AI Foundry. pi-anthropic was rejected the same day (API pricing), as was an interim
+reviewed only by its own model family, not the literal codex/claude pairing quoted above.
+The second reviewer family is Kimi-K2.7-Code on Azure AI Foundry. pi-anthropic was rejected the same day (API pricing), as was an interim
 same-day Claude-Code-CLI-subscription direction. Details and work in R6.
 
 Amended again by the owner later on 2026-08-19: crosscheck routes through Kimi only. A single
@@ -93,7 +93,9 @@ A stranding strand was fixed: a passed run carrying a short receipt set is now d
 so the cell collects and retains legibly.
 That buys legibility, not closing, and the root cause (an in-cell bridge producing no receipts) is
 untouched, so a demoted cell still cannot `close`.
-One stranded work disk is on the subscription today.
+The one stranded work disk that sat on the subscription was deleted by the owner's direction on
+2026-08-19 after no cell record could be found anywhere for the sanctioned close, so the lane's
+inability to close now has no live residue, only the unfixed root cause.
 The runner-offload lane (`FM_AZURE_RUNNER_REMOTE_CLASSES`) has no caller: nothing in the
 repository sets `FM_AZURE_RUNNER_TASK`, `FM_AZURE_RUNNER_GENERATION`, or
 `FM_AZURE_RUNNER_CONFIRM_SUBSCRIPTION`, and the placeholders in `docs/azure-runner.md` are an
@@ -358,7 +360,8 @@ task ended releases and deallocates unattended.
 1. R8, done 2026-08-19.
 2. C2, because contention blocks demonstrating anything at scale. One of its three changes landed.
 3. R2/R3, the largest architectural gap and the requirement most misread by the current build.
-4. R6, whose direction is decided (Kimi-K2.7-Code on Foundry) and which no longer needs an owner login.
+4. R6, whose direction is decided (Kimi-K2.7-Code on Foundry) and which no longer needs an
+   owner login.
 5. R4, which needs the runner caller built and one validation cell closed.
 6. R5.
 7. C1, measured before it is changed.

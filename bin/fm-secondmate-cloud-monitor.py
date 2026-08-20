@@ -26,6 +26,36 @@ already delivered, or wiped and re-minted as a fresh self-consistent chain
 from genesis, refuses instead of verifying - a chain that merely hangs
 together is not the chain this compartment was speaking on.
 
+THE TIP IS ALSO ATTESTED TO THE CONTROLLER (PR 6's missing half). The release
+authority proves compartment landing against a verified chain tip it reads
+ONLY from the controller-owned worker record, and REFUSES when that record
+carries none - so until this monitor records tips, every compartment exits
+through `surrender` rather than the ordinary release path. Whenever the
+verified tip ADVANCES, this helper therefore calls
+`fm-worker-lifecycle.sh compartment-chain-tip` with the sequence and
+chain_digest it just proved, and remembers the recorded pair durably so an
+unchanged tip costs nothing on later passes. The call happens only AFTER the
+whole chain verified locally: the command attests without verifying (it never
+reads the mailbox), so a tip this monitor has not itself proven must never be
+reported. It is deliberately its own lifecycle verb and NOT part of the
+claim-exempt message lane, whose invariant is that message-put/message-collect
+write no lifecycle state.
+
+A refusal from that command is a real signal and is split three ways:
+  - a MONOTONICITY refusal (a rewind, or the same sequence carrying a
+    different digest) means the controller's record and this monitor's own
+    proof disagree about the chain, which is the same harm class as a chain
+    break and cannot be repaired by a later pass, so it FREEZES the lane
+    through the same sticky .chain-break marker;
+  - "released work cannot record a compartment chain tip" is benign
+    end-of-life: the worker is already released, nothing further can be
+    attested, so the tip lane closes durably and quietly;
+  - anything else (not assigned, wrong assignment generation, an unreadable
+    controller, an invocation failure) is about who owns the worker RIGHT NOW,
+    changes between passes by design (a resume mints a new assignment
+    generation), and would wedge a healthy compartment if it froze; it warns
+    loudly in the pane, is recorded durably, and retries on the next pass.
+
 On a chain break this helper writes a loud .chain-break marker into the
 mailbox, delivers NOTHING (not even entries before the break - the whole
 mailbox is refused), retains every file, and exits 3. The marker is sticky:
@@ -191,6 +221,21 @@ CLOUD_CHILD_HARNESS = "pi"
 GIT_TIMEOUT = 600
 SPAWN_TIMEOUT = 900
 LIFECYCLE_TIMEOUT = 900
+# compartment-chain-tip makes no provider call: it takes the controller lock,
+# checks monotonicity, and writes one field. Its only wait is lock contention
+# with another lifecycle command's controller phase, so it gets a much shorter
+# deadline than the blob-transfer lane - this runs inside a poll loop whose
+# default interval is 15 seconds.
+CHAIN_TIP_TIMEOUT = 300
+
+# The controller's own refusal texts (bin/fm-worker-lifecycle.py
+# command_compartment_chain_tip), matched to classify a refusal rather than
+# treating every non-zero exit alike.
+CHAIN_TIP_FORK_REFUSALS = (
+    "refuses to rewind",
+    "already recorded a different digest",
+)
+CHAIN_TIP_RELEASED_REFUSAL = "released work cannot record a compartment chain tip"
 
 CHAIN_BREAK_MARKER = ".chain-break"
 
@@ -251,6 +296,14 @@ def load_state(path):
     state.setdefault("kept_bundles", [])
     state.setdefault("last_summary", None)
     state.setdefault("verified_tip", None)
+    # The (sequence, chain_digest) pair this monitor last recorded on the
+    # CONTROLLER-owned worker record, so an unchanged tip is skipped rather
+    # than replayed on every poll; the last refusal that was not fatal; and
+    # the durable close once the worker is released and nothing more can be
+    # attested.
+    state.setdefault("recorded_chain_tip", None)
+    state.setdefault("chain_tip_error", None)
+    state.setdefault("chain_tip_closed", None)
     return state
 
 
@@ -494,6 +547,104 @@ def chain_break_refuse(task, mailbox, reason, out):
     out.write(
         "SECONDMATE MAILBOX REFUSED: the whole mailbox is retained at {} for investigation; nothing was or will be relayed past this break, and {} is sticky until an operator removes it\n".format(mailbox, marker)
     )
+
+
+def record_chain_tip(args, state, sequence, chain_digest, out):
+    """Attest the JUST-VERIFIED chain tip onto the controller-owned worker record.
+
+    Called only from command_process_mailbox, and only after verify_mailbox
+    plus both stateful rewind checks have succeeded: `compartment-chain-tip`
+    never reads the mailbox, so everything it records is this monitor's word,
+    and this monitor may only give its word for a chain it has itself proved.
+
+    Returns ("", "") to continue, or ("freeze", reason) when the controller's
+    record contradicts the chain and the lane must stop like a chain break.
+    """
+    if not args.lifecycle_bin or not args.task_generation or not args.assignment_generation:
+        # The recording lane is not wired into this invocation (the same
+        # opt-in shape as --childreq). The bash monitor always wires it.
+        return "", ""
+    if not isinstance(chain_digest, str) or not HEX.fullmatch(chain_digest):
+        # verify_mailbox proved this digest, so this is belt and braces: an
+        # inexact digest is refused by the CLI anyway and is never reported.
+        return "", ""
+    if isinstance(state.get("chain_tip_closed"), dict):
+        return "", ""
+    recorded = state.get("recorded_chain_tip")
+    if (
+        isinstance(recorded, dict)
+        and recorded.get("sequence") == sequence
+        and recorded.get("chain_digest") == chain_digest
+    ):
+        # UNCHANGED TIP: a replay would be idempotent and harmless, but this
+        # runs every poll, so the durable pair is what keeps it cheap.
+        return "", ""
+    argv = [
+        args.lifecycle_bin, "compartment-chain-tip",
+        "--task", args.task,
+        "--task-generation", args.task_generation,
+        "--assignment-generation", args.assignment_generation,
+        "--sequence", str(sequence),
+        "--chain-digest", chain_digest,
+    ]
+    try:
+        completed = subprocess.run(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=CHAIN_TIP_TIMEOUT, check=False,
+        )
+        code = completed.returncode
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        if not detail:
+            detail = completed.stdout.decode("utf-8", errors="replace").strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        code = 127
+        detail = "the chain tip lane could not be driven: {}".format(exc)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if code == 0:
+        state["recorded_chain_tip"] = {
+            "sequence": sequence,
+            "chain_digest": chain_digest,
+            "recorded_at": now,
+        }
+        state["chain_tip_error"] = None
+        out.write(
+            "secondmate {}: recorded verified chain tip {:08d} on the controller worker record "
+            "(the ordinary release authority can prove landing from it)\n".format(
+                args.task, sequence)
+        )
+        return "", ""
+    detail = detail[-1200:]
+    if any(marker in detail for marker in CHAIN_TIP_FORK_REFUSALS):
+        # THE CONTROLLER AND THIS MONITOR DISAGREE ABOUT THE CHAIN. The record
+        # is monotone by construction, so a rewind or a same-sequence fork can
+        # only mean the chain this monitor just proved is not the one already
+        # attested for this compartment - exactly what the sticky marker
+        # exists for, and not something a later pass can heal.
+        state["chain_tip_error"] = {"check": detail, "observed_at": now, "fatal": True}
+        return "freeze", (
+            "the controller-owned chain tip refuses the tip this monitor verified at sequence "
+            "{}: {}".format(sequence, detail)
+        )
+    if CHAIN_TIP_RELEASED_REFUSAL in detail:
+        # BENIGN END OF LIFE: the worker already carries a release proof, so
+        # there is nothing left to attest and nothing is wrong. Close the lane
+        # durably so later passes stay quiet.
+        state["chain_tip_closed"] = {"reason": detail, "closed_at": now}
+        out.write(
+            "secondmate {}: the compartment worker is already released; chain tip recording is "
+            "closed at sequence {:08d}\n".format(args.task, sequence)
+        )
+        return "", ""
+    # EVERYTHING ELSE is about who owns this worker right now (not assigned,
+    # a moved assignment generation, an unreadable controller, a failed
+    # invocation). Those change between passes by design, so this warns and
+    # retries rather than wedging a healthy compartment.
+    state["chain_tip_error"] = {"check": detail, "observed_at": now, "fatal": False}
+    out.write(
+        "warning: secondmate {}: the controller refused the verified chain tip {:08d} "
+        "(retrying next pass): {}\n".format(args.task, sequence, detail)
+    )
+    return "", ""
 
 
 def land_relay_requests(verified, mailbox, childreq, out):
@@ -1353,6 +1504,17 @@ def command_process_mailbox(args, out):
                     out,
                 )
                 return 3
+    # THE CHAIN IS NOW PROVED, so - and only so - its tip may be attested to
+    # the controller, which is the anchor the release authority reads. This
+    # sits BEFORE delivery on purpose: a controller that disputes this tip
+    # disputes this chain, and a disputed chain relays nothing.
+    if total > 0:
+        verdict, reason = record_chain_tip(
+            args, state, total, verified[-1][1].get("chain_digest"), out)
+        if verdict == "freeze":
+            chain_break_refuse(args.task, mailbox, reason, out)
+            save_state(args.state_file, state)
+            return 3
     for sequence, message in verified:
         if sequence <= delivered:
             continue
@@ -1409,6 +1571,15 @@ def main(argv=None):
     process.add_argument(
         "--childreq", default="",
         help="directory verified child/attach requests land in for the child relay",
+    )
+    # The chain tip recording lane. Opt-in like --childreq: all three are
+    # needed to name one exact assignment on the controller, and the bash
+    # monitor always supplies them.
+    process.add_argument("--task-generation", default="")
+    process.add_argument("--assignment-generation", default="")
+    process.add_argument(
+        "--lifecycle-bin", default="",
+        help="the lifecycle CLI that records the verified chain tip on the worker record",
     )
     relay = sub.add_parser(
         "child-relay",

@@ -153,6 +153,25 @@ if [ -n "${FM_FIXTURE_SPAWN_REFUSAL:-}" ]; then
   echo "error: cloud worker request was refused for ${1:-}" >&2
   exit 1
 fi
+# A real spawn's admission is a queue entry carrying the parent pair. The
+# fixture writes exactly that, so the relay's readback has something true to
+# find; FM_FIXTURE_SPAWN_NO_ADMIT models the exit-0-without-admission shape
+# the readback exists to catch.
+if [ -z "${FM_FIXTURE_SPAWN_NO_ADMIT:-}" ] && [ -n "${FM_FIXTURE_SPAWN_CONTROLLER:-}" ]; then
+  python3 - "$FM_FIXTURE_SPAWN_CONTROLLER" "${1:-}" "${FM_SPAWN_PARENT_TASK:-}" "${FM_SPAWN_PARENT_TASK_GENERATION:-}" <<'PY'
+import json, sys
+path, child, parent, parent_generation = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    state = json.load(handle)
+state.setdefault("queue", {})["{}@fixture-gen".format(child)] = {
+    "task": child, "task_generation": "fixture-gen", "status": "queued",
+    "role": "author", "owner_kind": "secondmate",
+    "parent_task": parent, "parent_task_generation": parent_generation,
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(state, handle)
+PY
+fi
 printf 'spawned %s\n' "${1:-}"
 SH
   chmod +x "$1"
@@ -290,6 +309,7 @@ start_monitor() {
     FM_SECONDMATE_MONITOR_INTERVAL_SECONDS=1 \
     FM_FIXTURE_LIFECYCLE_LOG="$LC_LOG" FM_FIXTURE_STORE="$STORE" \
     FM_FIXTURE_SPAWN_LOG="$SP_LOG" \
+    FM_FIXTURE_SPAWN_CONTROLLER="$STATE_DIR/azure-workers/controller.json" \
     "$MONITOR" "$ID" "$GEN" >> "$PANE_LOG" 2>&1 &
   MONITOR_PID=$!
 }
@@ -628,6 +648,8 @@ run_helper() {
 run_relay() {
   env FM_FIXTURE_SPAWN_LOG="$SP_LOG" FM_FIXTURE_LIFECYCLE_LOG="$LC_LOG" \
     FM_FIXTURE_STORE="$STORE" \
+    FM_FIXTURE_SPAWN_CONTROLLER="$STATE_DIR/azure-workers/controller.json" \
+    FM_FIXTURE_SPAWN_NO_ADMIT="${FM_FIXTURE_SPAWN_NO_ADMIT:-}" \
     FM_FIXTURE_SPAWN_REFUSAL="${FM_FIXTURE_SPAWN_REFUSAL:-}" \
     FM_FIXTURE_ATTACH_RECEIPT_SKEW="${FM_FIXTURE_ATTACH_RECEIPT_SKEW:-}" \
     python3 "$ROOT/bin/fm-secondmate-cloud-monitor.py" child-relay \
@@ -825,7 +847,7 @@ PY
   [ -n "$self_digest" ] || fail "the real runner landed no child request"
   child="$ID-c${self_digest:0:8}"
   argv=$(sed -n 1p "$SP_LOG")
-  [ "$argv" = "$(printf '%s\x1f%s\x1f--model\x1fgpt-5\x1f--effort\x1fhigh' "$child" "$LANDING/projects/alpha")" ] \
+  [ "$argv" = "$(printf '%s\x1f%s\x1f--harness\x1fpi\x1f--model\x1fgpt-5\x1f--effort\x1fhigh' "$child" "$LANDING/projects/alpha")" ] \
     || fail "the child spawn argv is not the exact ship shape: $(printf '%s' "$argv" | tr '\037' '|')"
   env_line=$(sed -n 2p "$SP_LOG")
   assert_contains "$env_line" "FM_HOME=$LANDING" "the child spawn did not run as the secondmate home"
@@ -886,6 +908,150 @@ test_invalid_child_requests_refuse_by_name_and_never_reach_the_request() {
     [ "$(grep_lc $'^message-put\x1f')" = 0 ] || fail "$case_name: an invalid request spent the message lane"
   done
   pass "unknown key, bad child kind, wrong parent triple and a tampered self digest each refuse by name, deliver it, and never spawn"
+}
+
+test_non_string_optional_field_refuses_and_the_pass_continues() {
+  # THE ALWAYS-AN-ANSWER RULE. A present-but-not-a-string optional field used
+  # to reach a regex and raise, which killed the whole pass: no refusal
+  # record, no delivered refusal, every later request unanswered, and child
+  # status mirroring dead for good. Each type must refuse by name, and the
+  # NEXT request in the SAME pass must still be served.
+  local shape expected
+  for shape in int dict list null bool; do
+    make_world "child-nonstring-$shape"
+    emit_child_intent '{"kind":"ship","brief":"the poisoned request"}'
+    land_from_store
+    case "$shape" in
+      int) expected='message["child_model"] = 7' ;;
+      dict) expected='message["child_model"] = {"a": 1}' ;;
+      list) expected='message["child_model"] = ["a"]' ;;
+      null) expected='message["child_model"] = None' ;;
+      bool) expected='message["child_model"] = True' ;;
+    esac
+    craft_landed_request resign "$expected" >/dev/null || fail "$shape: crafting failed"
+    # A SECOND, entirely valid request lands after the poisoned one, in the
+    # same relay pass, at a later chain sequence.
+    land_second_valid_request
+    run_relay > "$WORLD/relay.log" 2>&1
+    expect_code 0 $? "$shape: the relay pass must survive a poisoned field: $(cat "$WORLD/relay.log")"
+    local delivered
+    delivered=$(inbox_messages)
+    assert_contains "$delivered" "request field child_model is present but is not a non-empty string" \
+      "$shape: the non-string optional field was not refused by name"
+    [ -n "$(first_matching "$CHILDREQ" '.refused-*.json')" ] \
+      || fail "$shape: no durable refusal record for the poisoned request"
+    assert_contains "$delivered" "FIRSTMATE ACCEPTED" \
+      "$shape: the request AFTER the poisoned one was never served (the pass died)"
+    [ "$(spawn_invocations)" = 2 ] \
+      || fail "$shape: expected exactly one spawn for the following valid request, saw $(spawn_invocations) log lines"
+  done
+  pass "a non-string optional field of any type refuses by name and the next request in the pass is still served"
+}
+
+# land_second_valid_request - a valid child request at a later chain sequence,
+# minted the way the runner mints one (payload, then self digest over it).
+land_second_valid_request() {
+  python3 - "$CHILDREQ" "$ID" "$GEN" "$ASSIGNMENT" <<'PY'
+import hashlib, json, pathlib, sys
+childreq, task, generation, assignment = sys.argv[1:]
+childreq = pathlib.Path(childreq)
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+payload = {
+    "kind": "fm.secondmate-child-request/v1",
+    "parent_task": task,
+    "parent_task_generation": generation,
+    "parent_assignment_generation": assignment,
+    "child_kind": "ship",
+    "brief": "the request that must still be served",
+}
+message = dict(payload)
+message["self_digest"] = hashlib.sha256(canonical(payload)).hexdigest()
+message["sequence"] = 90
+message["content_sha256"] = "c" * 64
+message["chain_digest"] = "d" * 64
+body = canonical(message)
+(childreq / "00000090-{}.json".format(hashlib.sha256(body).hexdigest())).write_bytes(body)
+PY
+}
+
+test_leading_dash_brief_refuses() {
+  make_world child-dash-brief
+  emit_child_intent '{"kind":"ship","brief":"the brief"}'
+  land_from_store
+  craft_landed_request resign 'message["brief"] = "--session-dir /mnt/account"' >/dev/null \
+    || fail "crafting the leading-dash brief failed"
+  run_relay > "$WORLD/relay.log" 2>&1 || fail "the relay pass failed: $(cat "$WORLD/relay.log")"
+  assert_contains "$(inbox_messages)" "request brief begins with '-' and cannot ride the pi argv" \
+    "a leading-dash brief was not refused by name"
+  [ ! -s "$SP_LOG" ] || fail "a leading-dash brief reached the spawn: $(cat "$SP_LOG")"
+  pass "a brief beginning with '-' refuses, matching the runner's own leading-dash rule"
+}
+
+test_spawn_exit_zero_without_admission_refuses() {
+  # B.1's invariant is that child compute exists only when the ONE controller
+  # admits it. fm-spawn has an exit-0 path that silently downgrades placement,
+  # so a zero exit is never proof of admission: the queue is.
+  make_world child-no-admission
+  emit_child_intent '{"kind":"ship","brief":"a child that is never admitted"}'
+  land_from_store
+  FM_FIXTURE_SPAWN_NO_ADMIT=1 run_relay > "$WORLD/relay.log" 2>&1 \
+    || fail "the relay pass failed: $(cat "$WORLD/relay.log")"
+  assert_contains "$(inbox_messages)" "the controller holds no queue entry for" \
+    "an exit-0 spawn with no admitted queue entry was accepted"
+  [ -z "$(first_matching "$CHILDREQ" '.accepted-*.json')" ] \
+    || fail "an unadmitted child was recorded as accepted"
+  pass "a zero-exit spawn that admitted nothing refuses loudly instead of counting as a child"
+}
+
+test_attach_sequence_allows_repeat_asks_and_refuses_non_monotone() {
+  make_world attach-sequence
+  printf 'first artifact\n' >> "$LANDING/README.md"
+  git -C "$LANDING" add README.md
+  git -C "$LANDING" commit -qm 'home artifact one'
+  land_attach_request 1 1 >/dev/null
+  run_relay > "$WORLD/relay-1.log" 2>&1 || fail "the first attach pass failed: $(cat "$WORLD/relay-1.log")"
+  [ "$(inbox_messages | grep -c 'fm.secondmate-attach/v1')" = 1 ] \
+    || fail "the first ask did not announce exactly one attach"
+  # A SECOND ask, distinguished only by attach_sequence, is served: without
+  # the discriminator its payload would hash identically and refuse.
+  printf 'second artifact\n' >> "$LANDING/README.md"
+  git -C "$LANDING" add README.md
+  git -C "$LANDING" commit -qm 'home artifact two'
+  land_attach_request 2 2 >/dev/null
+  run_relay > "$WORLD/relay-2.log" 2>&1 || fail "the second attach pass failed: $(cat "$WORLD/relay-2.log")"
+  [ "$(inbox_messages | grep -c 'fm.secondmate-attach/v1')" = 2 ] \
+    || fail "a second attach ask was not served: $(inbox_messages | grep -c 'fm.secondmate-attach/v1') announcements"
+  # Non-monotone: an ask at or below what was served refuses by name.
+  land_attach_request 2 3 >/dev/null
+  run_relay > "$WORLD/relay-3.log" 2>&1 || fail "the third attach pass failed"
+  assert_contains "$(inbox_messages)" "is not past the 2 already served" \
+    "a non-monotone attach_sequence was not refused by name"
+  [ "$(inbox_messages | grep -c 'fm.secondmate-attach/v1')" = 2 ] \
+    || fail "a non-monotone ask still announced an attach"
+  pass "attach_sequence lets a compartment ask more than once and refuses a non-monotone ask by name"
+}
+
+test_empty_delta_burns_no_attach_sequence() {
+  make_world attach-empty
+  # No commits over the dispatched base: the ask serves nothing.
+  land_attach_request 1 1 >/dev/null
+  run_relay > "$WORLD/relay-1.log" 2>&1 || fail "the empty attach pass failed: $(cat "$WORLD/relay-1.log")"
+  assert_contains "$(inbox_messages)" "is not spent and you may ask again with it" \
+    "the empty delta did not tell the compartment its sequence survived"
+  [ -z "$(first_matching "$CHILDREQ" '.accepted-*.json')" ] \
+    || fail "an empty delta recorded an acceptance and burned the sequence"
+  # The SAME attach_sequence is therefore still available once work lands.
+  printf 'late artifact\n' >> "$LANDING/README.md"
+  git -C "$LANDING" add README.md
+  git -C "$LANDING" commit -qm 'home artifact after the empty ask'
+  land_attach_request 1 2 >/dev/null
+  run_relay > "$WORLD/relay-2.log" 2>&1 || fail "the re-ask pass failed: $(cat "$WORLD/relay-2.log")"
+  [ "$(inbox_messages | grep -c 'fm.secondmate-attach/v1')" = 1 ] \
+    || fail "re-asking with the unspent sequence was not served"
+  pass "an ask that finds no delta serves nothing, records nothing, and leaves its attach_sequence unspent"
 }
 
 test_duplicate_child_request_refuses_loudly_and_spawns_once() {
@@ -1039,12 +1205,13 @@ PY
   pass "a child's terminal status mirrors into the inbox exactly once, with its complete/failed classification"
 }
 
-# land_attach_request - the attach contract this monitor PINS (the runner-side
-# emission is a follow-up), landed exactly as the chain verifier would.
+# land_attach_request [attach-sequence] [chain-sequence] - the attach contract
+# this monitor PINS (the runner-side emission is a follow-up), landed exactly
+# as the chain verifier would.
 land_attach_request() {
-  python3 - "$CHILDREQ" "$ID" "$GEN" "$ASSIGNMENT" <<'PY'
+  python3 - "$CHILDREQ" "$ID" "$GEN" "$ASSIGNMENT" "${1:-1}" "${2:-1}" <<'PY'
 import hashlib, json, pathlib, sys
-childreq, task, generation, assignment = sys.argv[1:]
+childreq, task, generation, assignment, counter, chain = sys.argv[1:]
 childreq = pathlib.Path(childreq)
 childreq.mkdir(parents=True, exist_ok=True)
 
@@ -1056,15 +1223,17 @@ payload = {
     "parent_task": task,
     "parent_task_generation": generation,
     "parent_assignment_generation": assignment,
+    "attach_sequence": int(counter),
 }
 message = dict(payload)
 message["self_digest"] = hashlib.sha256(canonical(payload)).hexdigest()
-message["sequence"] = 1
-message["content_sha256"] = "a" * 64
+message["sequence"] = int(chain)
+message["content_sha256"] = "{:064x}".format(int(chain))
 message["chain_digest"] = "b" * 64
 body = canonical(message)
-name = "00000001-{}.json".format(hashlib.sha256(body).hexdigest())
+name = "{:08d}-{}.json".format(int(chain), hashlib.sha256(body).hexdigest())
 (childreq / name).write_bytes(body)
+print(message["self_digest"])
 PY
 }
 
@@ -1190,6 +1359,166 @@ run_lifecycle() {  # <world> <home> <args...>
     FM_WORKER_PROVIDER_COMMAND="python3 $world/provider.py" \
     FIXTURE_STATE="$world/provider-state.json" \
     python3 "$ROOT/bin/fm-worker-lifecycle.py" "$@"
+}
+
+test_child_request_through_the_real_fm_spawn_with_crew_dispatch() {
+  # THE SEAM THE FIXTURE SPAWN CANNOT TOUCH: relay argv -> the REAL
+  # bin/fm-spawn.sh argument validation, in a home carrying
+  # config/crew-dispatch.json (the primary propagates it into secondmate
+  # homes, so most real homes have it). The relay must resolve a harness
+  # explicitly rather than rely on implicit resolution, and the child must
+  # come out ADMITTED on the one controller under the parent pair.
+  local out rc parent parent_generation assignment controller relay_home
+  setup_spawn_world real-spawn mast
+  out=$(run_gate_spawn mast \
+    FM_SPAWN_CLOUD=azure FM_SPAWN_SECONDMATE_CLOUD=1 \
+    FM_AZURE_SUBSCRIPTION_ID="$SUB" FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
+    FM_AZURE_OWNER_TAG=owner FM_AZURE_NAMING_PREFIX=fmtest \
+    FM_AZURE_WORKER_IDLE_COOLDOWN_SECONDS=0 \
+    FM_WORKER_PROVIDER_COMMAND="python3 $SP_DIR/provider.py" \
+    FIXTURE_STATE="$SP_DIR/provider-state.json" \
+    -- --secondmate)
+  rc=$?
+  expect_code 0 "$rc" "the compartment spawn should succeed: $out"
+  controller="$SP_HOME/state/azure-workers/controller.json"
+  parent=mast
+  parent_generation=$(python3 -c 'import json,sys
+state = json.load(open(sys.argv[1]))
+for key, item in state["queue"].items():
+    if item.get("task") == sys.argv[2]:
+        print(item["task_generation"]); break' "$controller" "$parent")
+  assignment=$(python3 -c 'import json,sys
+state = json.load(open(sys.argv[1]))
+for key, item in state["queue"].items():
+    if item.get("task") == sys.argv[2]:
+        print(item.get("assignment_generation", "")); break' "$controller" "$parent")
+  [ -n "$parent_generation" ] && [ -n "$assignment" ] \
+    || fail "the compartment is not assigned on the controller: $(cat "$controller")"
+  # The consultation backstop file, exactly as a real secondmate home carries it.
+  mkdir -p "$SP_SUB/config"
+  printf '{"profiles":[]}\n' > "$SP_SUB/config/crew-dispatch.json"
+  relay_home="$SP_SUB"
+  # One valid child request landed for this compartment.
+  mkdir -p "$SP_DIR/childreq" "$SP_DIR/inbox"
+  python3 - "$SP_DIR/childreq" "$parent" "$parent_generation" "$assignment" <<'PY'
+import hashlib, json, pathlib, sys
+childreq, task, generation, assignment = sys.argv[1:]
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+payload = {
+    "kind": "fm.secondmate-child-request/v1",
+    "parent_task": task, "parent_task_generation": generation,
+    "parent_assignment_generation": assignment,
+    "child_kind": "scout", "brief": "read the alpha project and report",
+}
+message = dict(payload)
+message["self_digest"] = hashlib.sha256(canonical(payload)).hexdigest()
+message["sequence"] = 1
+message["content_sha256"] = "e" * 64
+message["chain_digest"] = "f" * 64
+body = canonical(message)
+(pathlib.Path(childreq) / "00000001-{}.json".format(hashlib.sha256(body).hexdigest())).write_bytes(body)
+PY
+  out=$(perl -e 'alarm 600; exec @ARGV or die "exec failed: $!"' -- \
+    env PATH="$SP_FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$SPAWN_PRIMARY_ROOT" \
+    FM_FAKE_TMUX_LOG="$SP_TMUX_LOG" FM_FAKE_TMUX_CAPTURE="$SP_PANE" \
+    FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 \
+    FM_HERDR_LOG="$SP_HERDR_LOG" FM_FAKE_HERDR_STATE="$SP_DIR/herdr-state.json" \
+    PI_CODING_AGENT_DIR="$SP_DIR/pi-agent-home" FM_SPAWN_NO_GUARD=1 \
+    FM_AZURE_SUBSCRIPTION_ID="$SUB" FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
+    FM_AZURE_OWNER_TAG=owner FM_AZURE_NAMING_PREFIX=fmtest \
+    FM_AZURE_WORKER_IDLE_COOLDOWN_SECONDS=0 \
+    FM_WORKER_PROVIDER_COMMAND="python3 $SP_DIR/provider.py" \
+    FIXTURE_STATE="$SP_DIR/provider-state.json" \
+    python3 "$ROOT/bin/fm-secondmate-cloud-monitor.py" child-relay \
+    --task "$parent" --task-generation "$parent_generation" \
+    --assignment-generation "$assignment" \
+    --childreq "$SP_DIR/childreq" --inbox "$SP_DIR/inbox" --home "$relay_home" \
+    --controller "$controller" \
+    --spawn-bin "$SPAWN" --lifecycle-bin "$ROOT/bin/fm-worker-lifecycle.sh" 2>&1)
+  rc=$?
+  expect_code 0 "$rc" "the relay pass over the real fm-spawn failed: $out"
+  local delivered
+  delivered=$(python3 - "$SP_DIR/inbox" <<'PY'
+import json, pathlib, re, sys
+inbox = pathlib.Path(sys.argv[1])
+for path in sorted(p for p in inbox.iterdir() if re.fullmatch(r"[0-9]{8}-[0-9a-f]{64}\.json", p.name)):
+    print(json.dumps(json.loads(path.read_bytes()), sort_keys=True))
+PY
+)
+  assert_not_contains "$delivered" "crew-dispatch.json is active" \
+    "the real fm-spawn refused the relay's argv at the harness consultation backstop: $delivered"
+  assert_contains "$delivered" "FIRSTMATE ACCEPTED" \
+    "the child request was not served through the real fm-spawn: $delivered / relay: $out"
+  # ADMITTED, on the one controller, under this compartment's parent pair.
+  python3 - "$controller" "$parent" "$parent_generation" <<'PY' || fail "the real spawn produced no bounded child queue entry"
+import json, sys
+controller, parent, generation = sys.argv[1:]
+state = json.load(open(controller))
+children = [
+    item for item in state["queue"].values()
+    if item.get("parent_task") == parent and item.get("parent_task_generation") == generation
+]
+assert len(children) == 1, children
+child = children[0]
+assert child["role"] == "author" and child["owner_kind"] == "secondmate", child
+PY
+  pass "a child request is served through the REAL fm-spawn in a crew-dispatch home and comes out admitted under the parent pair"
+}
+
+test_crewmate_monitor_reclaims_a_stale_dispatch_marker() {
+  # BEHAVIORAL coverage of the fixed branch (Darwin here): a stale dispatch
+  # claim with no result must actually be reclaimed. If the mtime read yields
+  # anything non-numeric the guard returns early and NOTHING is reclaimed,
+  # which is exactly the bug the uname branch fixes.
+  local dir state marker log pid
+  dir="$TMP_ROOT/crewmate-reclaim"
+  state="$dir/home/state"
+  mkdir -p "$state/azure-workers"
+  marker="$state/reclaim-task.cloud-execute-dispatched"
+  log="$dir/monitor.log"
+  python3 - "$state/azure-workers/controller.json" reclaim-task gen-1 <<'PY'
+import json, sys
+path, task, generation = sys.argv[1:]
+state = {"queue": {"{}@{}".format(task, generation): {
+    "task": task, "task_generation": generation, "status": "assigned",
+    "assignment_generation": "asg-00000001", "slot": 1}}, "workers": {}}
+json.dump(state, open(path, "w"))
+PY
+  printf 'export FM_SPAWN_CLOUD_WALL_SECONDS=60\n' > "$state/reclaim-task.cloud-env"
+  # An EMPTY entrypoint: the dispatch that follows a successful reclaim stands
+  # down loudly instead of driving a real execute, so the reclaim is what the
+  # log proves.
+  : > "$state/reclaim-task.cloud-entrypoint"
+  : > "$marker"
+  python3 - "$marker" <<'PY'
+import os, sys, time
+stale = time.time() - 4000  # far past wall(60) + 300 slack
+os.utime(sys.argv[1], (stale, stale))
+PY
+  perl -e 'alarm 60; exec @ARGV or die "exec failed: $!"' -- \
+    env FM_HOME="$dir/home" FM_SPAWN_CLOUD_MONITOR_INTERVAL_SECONDS=1 \
+    "$ROOT/bin/fm-spawn-cloud-monitor.sh" reclaim-task gen-1 > "$log" 2>&1 &
+  pid=$!
+  wait_for_file_grep "$log" 'dispatch claim is stale' 40 \
+    || { kill "$pid" 2>/dev/null; fail "the stale dispatch claim was never reclaimed (the mtime read failed closed): $(cat "$log")"; }
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null
+  assert_grep 'persisted entrypoint is empty' "$log" \
+    "the reclaim did not release the claim for the next dispatch attempt"
+  pass "the crewmate monitor really reclaims a stale dispatch claim through the uname-branched mtime read"
+}
+
+wait_for_file_grep() {  # <file> <pattern> <iterations>
+  local file=$1 pattern=$2 limit=$3 i=0
+  while [ "$i" -lt "$limit" ]; do
+    grep -q "$pattern" "$file" 2>/dev/null && return 0
+    sleep 0.25
+    i=$((i + 1))
+  done
+  return 1
 }
 
 test_crewmate_monitor_stat_chain_is_uname_branched() {
@@ -1819,12 +2148,19 @@ test_spawn_gate_on_flag_routes_compartment_and_never_executes
 test_spawn_forwards_the_parent_pair_into_the_request
 test_valid_child_request_spawns_with_the_exact_parent_pair
 test_invalid_child_requests_refuse_by_name_and_never_reach_the_request
+test_non_string_optional_field_refuses_and_the_pass_continues
+test_leading_dash_brief_refuses
+test_spawn_exit_zero_without_admission_refuses
 test_duplicate_child_request_refuses_loudly_and_spawns_once
 test_admission_refusal_round_trips_into_the_inbox
 test_attach_announcement_matches_the_uploaded_bundle
 test_size_mismatched_announcement_is_never_sent
+test_attach_sequence_allows_repeat_asks_and_refuses_non_monotone
+test_empty_delta_burns_no_attach_sequence
 test_child_terminal_status_mirrors_once
 test_child_request_queue_item_bindings_equal_local_mints
+test_child_request_through_the_real_fm_spawn_with_crew_dispatch
+test_crewmate_monitor_reclaims_a_stale_dispatch_marker
 test_crewmate_monitor_stat_chain_is_uname_branched
 
 echo "# fm-secondmate-cloud-monitor.test.sh: all assertions passed"

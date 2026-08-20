@@ -169,14 +169,27 @@ Acceptance: concurrent crewmates run on distinct pi profiles with no account col
 
 ## R6. Crosscheck reviews outside the author's model family
 
-Status: BUILT AND SERVING 2026-08-20, with the live end-to-end GLM review still owed. The lane
-below was built and merged (#264), the deployment is live, and the roster now names GLM as the
-sole primary reviewer. The Work list below is retained as the record of what was asked for; the
-state of each item is in "What landed" immediately after it. One item is genuinely unmet and it
-blocks the acceptance sentence: a real GLM review cannot complete today, because the deployment's
-Fireworks token-per-minute quota is 25K and a review's resent conversation crosses it after about
-five tool turns. Raising it is an owner action in the Foundry portal; the Microsoft.Quota API does
-not cover Cognitive Services.
+Status: BUILT 2026-08-20; no GLM review has ever completed. The lane below was built and merged
+(#264) and the deployment is live, but the primary reviewer is 0 for 6. Six GLM attempts are
+recorded against PR #220 in the crosscheck ledger on 2026-08-20, and all six ended in
+`tool-failure` with no citations and no execution proof; a seventh attempt, against PR #266, sits
+in the archived ledger beside it and also failed. GLM has produced no verdict at all. The one
+verdict this lane has produced came from the pi-codex fallback reviewer.
+
+The roster was GLM-only when those attempts ran. As of 2026-08-20 it is not: the operator restored
+the pi-codex fallback entries alongside GLM with `config/crosscheck-same-model` on, the sanctioned
+degraded mode while GLM is quota-blocked, so crosscheck can return verdicts again. It returns them
+from the fallback, which means codex-authored work is being reviewed by its own family again for
+the duration, exactly the degradation this requirement exists to remove.
+
+The deployment carries two per-minute limits, not one: 25,000 tokens and 25 requests (`FW-GLM-5.2`,
+DataZoneStandard, capacity 25). The 429 body names neither, reading only that requests to
+`FW-GLM-5.2` in eastus have "exceeded rate limit". Attributing the blocker to the token-per-minute
+limit specifically is therefore inference rather than measurement. Raising either is an owner
+action in the Foundry portal; the Microsoft.Quota API does not cover Cognitive Services.
+
+The Work list below is retained as the record of what was asked for; the state of each item is in
+"What landed" or "Still owed" below.
 
 The requirement is that no author's work is reviewed only by its own model family.
 The roster was instead made eight reviewers all on `openai-codex`, by reading "just use the same
@@ -256,15 +269,17 @@ of codex-authored work as the recorded degraded mode while it is active); and la
 the review evidence and report name the reviewing lane, and a status command answers whether
 GLM is serving or the fallback is active.
 
-What landed, 2026-08-20 (#264, plus #268 for a defect the first live runs exposed):
+What landed, 2026-08-20 (#264, plus #268 for a defect the live runs exposed):
 
 - `Fireworks.EnableDeploy` registered; Foundry resource `aif-fm7c799d-eus01` created in the
   program's resource group; `FW-GLM-5.2` deployed pay-per-token Data Zone Standard in eastus.
   The key lives in the fleet's secret custody, never in the repo.
-- Verified live against the deployment: chat completions answer; `reasoning_effort` passes
-  through at low, high, xhigh and max, each returning real reasoning tokens; a pi custom provider
+- Exercised live against the deployment: chat completions answer, and a pi custom provider
   (`models.json` with a top-level `providers` wrapper, `openai-completions` api, the resource's
-  `/openai/v1` baseUrl, the deployment name as the model id) drives it end to end.
+  `/openai/v1` baseUrl, the deployment name as the model id) drives it end to end. A probe of
+  `reasoning_effort` at low, high, xhigh and max was run and each was observed to be accepted and
+  to return reasoning tokens, but no request or response capture was retained, so that one is an
+  unretained observation rather than evidence. Re-run it and keep the artifact if it matters.
 - `allowed_profiles` carries `("pi", "FW-GLM-5.2", "xhigh")`; the model decides the provider;
   the GLM credential is validated for shape and pinned to one exact endpoint, with any
   model-level `baseUrl` or `api` override refused (pi's provider composer lets a model-level
@@ -277,22 +292,74 @@ What landed, 2026-08-20 (#264, plus #268 for a defect the first live runs expose
 - Fallback demonstrated end to end on 2026-08-20 against PR #220: the roster flipped to
   pi-codex with `config/crosscheck-same-model` on, the run printed the exact degraded warning
   naming the standing-in reviewer and the relaxation, the ledger recorded
-  `review_family_mode: codex-fallback` and `model_independence: same-model`, the review reached a
-  real clear verdict, and the roster was flipped back.
+  `review_family_mode: codex-fallback` and `model_independence: same-model`, and the review reached
+  a real clear verdict with citations and an execution proof. The roster was flipped back
+  afterwards; the operator has since restored the fallback entries again, as the status above
+  records. This run is still the only verdict this requirement's lane has produced.
 
 Still owed, and honestly so:
 
-- The live end-to-end GLM review. The 25K token-per-minute Fireworks quota refuses a real review
-  partway through; the first attempts died at exactly that point. #268 fixed a defect those runs
-  exposed (pi continues a retried attempt after `agent_end` via `auto_retry_start`, and the
-  reviewer stream parser was reading that continuation as a turn after completion, masking the
-  429 behind a generic refusal). After the quota bump, one real review end to end closes this.
-- The startup-credit decrement check. About 510K tokens were spent against the deployment on
-  2026-08-20 and Cost Management still shows no charge against the resource hours later, so
-  whether the charge lands on startup credit is unconfirmed. This needs the portal's cost view.
-- The Azure-compartment GLM lane is code-complete but not executable: the `fm-ccm` model image
-  carries no pi binary, so that lane needs an image rebake. The serving lane today is the local
-  pi reviewer, which is why C1's numbers changed shape.
+- The live end-to-end GLM review. The six attempts did not all die of the quota, and the record
+  should not be read as if they did. Attempts 0 and 1 (05:54Z) died before reaching the provider
+  at all, on a local harness fault in an operator-authored instrumentation shim whose `/dev/fd`
+  redirect was refused under the reviewer sandbox. Attempts 2, 3 and 4 (05:55Z to 05:59Z) each
+  recorded only `Pi reviewer emitted a turn after agent completion`, the parser defect #268 then
+  fixed (pi continues a retried attempt after `agent_end` via `auto_retry_start`, and the stream
+  parser read that continuation as a turn after completion, masking whatever the provider had
+  actually returned). Because the parser masked it, no retained artifact records what killed those
+  three. Attempt 6 (06:25Z), two minutes after #268 landed, is the only review run anywhere that
+  records an actual 429. The remaining ledger slot, index 5 at 06:08Z, is not a GLM run at all: it
+  is the pi-codex fallback demonstration. What is measured rather than inferred is the traffic
+  shape: in the deployment's metrics the 06:00Z hour shows 35 model requests and 23 client errors.
+  One real GLM review end to end closes this item, and the quota is the leading suspect for what
+  stands in the way, not an established cause.
+- The startup-credit decrement check. Deployment metrics for `aif-fm7c799d-eus01` record 727,136
+  tokens on 2026-08-20: 515,965 in the 04:00Z hour, 135,911 in 05:00Z, 75,260 in 06:00Z. (An
+  earlier draft of this section reported roughly 510K for the day; that was the 04:00Z hour alone.)
+  Cost Management shows no charge against the resource yet. That absence carries no information
+  either way at this range: C3 records that Cost Management actual lags hours, which is why its
+  own bound is a backstop on recorded spend. This needs the portal's cost view.
+- The Azure-compartment GLM lane, which is switched off rather than unbuildable. The serving lane
+  today is the local pi reviewer. The reason recorded here previously, that the `fm-ccm` image
+  carries no `pi` binary and needs a rebake, is stale and is corrected below.
+- A spend signal for the new primary reviewer. The GLM provider entry declares `cost` as zeros for
+  `input`, `output`, `cacheRead` and `cacheWrite` (`tests/fm-crosscheck.test.sh:1046`), so a GLM
+  review prices at zero and the crosscheck ledger records no per-review cost for it. That is the
+  same ledger R10's `daily_budget_usd` waits on, and the reason it does not bind today. It leaves
+  C3's daily bound as the only guard over this lane's spend, and C3's own caveat is that the bound
+  is a backstop on Cost-Management-recorded spend rather than a real-time meter.
+- Three items from the Work list above that neither landed nor were separately tracked. The status
+  command that answers whether GLM is serving or the fallback is active does not exist:
+  `bin/fm-crosscheck.py` exposes `run`, `verify` and `merge` and nothing else. This one is
+  substantive rather than cosmetic, because the stated reason for it was that a silent fallback
+  must be impossible, and the fallback is active right now. Second, that pi tolerates
+  `reasoning_content` in streamed deltas was never verified; the string appears nowhere in the
+  repository outside this document. Third, review guards sized to the model's context window at
+  deploy time: the generic guards pre-exist, and the one size that exists, `MAX_PROMPT_BYTES` in
+  `bin/fm-crosscheck-azure.py`, was set in #130 on 2026-08-13 and was not revisited for a
+  1M-token model.
+
+Correcting the Azure-compartment blocker, 2026-08-20: the current `fm-ccm` image does carry `pi`,
+and the lane is off because it was switched off. `$FM_HOME/config/crosscheck-azure.json` has
+`"enabled": false`, set by an operator on 2026-08-20; that switch, not the image, is why no
+compartment review runs today. The image claim was already stale when it was written: it entered
+`docs/azure-crosscheck.md` in #264 on 2026-08-20, citing a diagnostic boot taken on 2026-08-16
+against an image the config had stopped naming two days earlier. That measurement was correct
+about gallery version `1.0.1786915905`, whose source managed image `img-fm7c799d-ccm-1.0.0` was
+built from the pre-Pi declaration and carries no `pi-tarball-sha256` tag. The config now names
+`1.0.1787092687`, published 2026-08-18T22:38:08Z from managed image
+`img-fm7c799d-ccm-1.0.1787091895`, which does carry both `pi-tarball-sha256` and
+`node-tarball-sha256`, matching the digests tracked in `docs/azure-crosscheck/model-image-closure.json`
+for `pi-coding-agent-0.84.1` and Node v22.23.2. Those tags exist only on an image built from the
+Pi-carrying declaration that #246 added to `docs/azure-crosscheck/model-image.json`, whose build
+asserts that `/usr/local/bin/pi --version` equals the tracked version twice, once before and once
+after the credential purge, so a build that reached distribution could not have omitted `pi`. That
+Image Builder run succeeded between 22:26:20Z and 22:36:46Z on 2026-08-18, after #246 landed on
+main at 20:51:35Z, and `bin/fm-crosscheck-azure-image.sh` builds only from the tracked declaration
+at a HEAD already landed on public main. What remains genuinely unproven is a pi review completing
+on this image, which is what R9 records; the binary's presence and a working lane are separate
+claims. The same stale sentence is still carried by `docs/azure-crosscheck.md` and needs the same
+correction there.
 
 Acceptance: a codex-authored change and a claude-authored change are each reviewed by a
 GLM-backed reviewer with bound reviewer identity and the same evidence discipline as the codex

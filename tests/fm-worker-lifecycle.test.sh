@@ -1013,18 +1013,24 @@ elif request["operation"] in ("message-put", "message-collect"):
         result = {"blob_name": name, "sha256": digest, "bytes": len(body), "replayed": replayed}
     else:
         out = Path(message["output_dir"])
+        after = message.get("after")
         fetched = []
         skipped = []
+        cursor = after
         for name in sorted(blobs):
             if not name.startswith("session/out/"):
                 continue
+            local_name = name[len("session/out/"):]
+            if after is not None and local_name <= after:
+                continue
             body = bytes.fromhex(blobs[name])
             digest = hashlib.sha256(body).hexdigest()
-            target = out / name[len("session/out/"):]
+            target = out / local_name
             record = {"blob_name": name, "bytes": len(body), "sha256": digest}
             if target.exists():
                 if hashlib.sha256(target.read_bytes()).hexdigest() == digest:
                     skipped.append(record)
+                    cursor = local_name
                     continue
                 sys.stderr.write(
                     "FIXTURE PROVIDER REFUSED: collected message blob {} diverges "
@@ -1032,9 +1038,10 @@ elif request["operation"] in ("message-put", "message-collect"):
                 raise SystemExit(1)
             target.write_bytes(body)
             fetched.append(record)
+            cursor = local_name
         state["calls"].append({"type": "message-collect", "slot": message["slot"]})
         save()
-        result = {"fetched": fetched, "skipped": skipped}
+        result = {"fetched": fetched, "skipped": skipped, "cursor": cursor, "more": False}
 else:
     active = sum(
         1 for worker in state["workers"].values()
@@ -3734,13 +3741,21 @@ def message(**fields):
 
 store = {}
 uploads = []
+downloads = {"count": 0}
+
+def entry_for(name, body):
+    return {
+        "name": name,
+        "properties": {"contentLength": len(body)},
+        "metadata": {"content_digest": hashlib.sha256(body).hexdigest()},
+    }
 
 def fake_az(ctrl, args, check=True, timeout=None):
     if args[:3] == ["storage", "blob", "show"]:
         name = args[args.index("--name") + 1]
         if name not in store:
             return None, 1, "BlobNotFound"
-        return {"properties": {"contentLength": len(store[name])}}, 0, ""
+        return entry_for(name, store[name]), 0, ""
     if args[:3] == ["storage", "blob", "upload"]:
         name = args[args.index("--name") + 1]
         store[name] = Path(args[args.index("--file") + 1]).read_bytes()
@@ -3748,11 +3763,15 @@ def fake_az(ctrl, args, check=True, timeout=None):
         return None, 0, ""
     if args[:3] == ["storage", "blob", "list"]:
         prefix = args[args.index("--prefix") + 1]
-        return ([
-            {"name": name, "properties": {"contentLength": len(body)}}
-            for name, body in sorted(store.items()) if name.startswith(prefix)
-        ], 0, "")
+        limit = int(args[args.index("--num-results") + 1])
+        names = [name for name in sorted(store) if name.startswith(prefix)]
+        start = int(args[args.index("--marker") + 1]) if "--marker" in args else 0
+        page = [entry_for(name, store[name]) for name in names[start:start + limit]]
+        if "--show-next-marker" in args and start + limit < len(names):
+            page.append({"nextMarker": str(start + limit)})
+        return page, 0, ""
     if args[:3] == ["storage", "blob", "download"]:
+        downloads["count"] += 1
         Path(args[args.index("--file") + 1]).write_bytes(store[args[args.index("--name") + 1]])
         return None, 0, ""
     raise AssertionError(args)
@@ -3818,14 +3837,30 @@ finally:
     module.MESSAGE_ATTACH_MAX_BYTES = original_bound
 
 # A name that already exists with bytes other than its own content address is
-# corruption or a foreign writer, never a replay.
+# corruption or a foreign writer, never a replay. The judgment is the stamped
+# content_digest metadata, so a SAME-LENGTH different-bytes blob refuses too,
+# and a blob with no digest metadata at all (a foreign writer; this op's own
+# uploads always stamp it) refuses rather than reading as a replay.
 corrupt_payload = json.dumps({"n": 42}).encode()
 corrupt_name = "session/in/{}.json".format(hashlib.sha256(corrupt_payload).hexdigest())
-store[corrupt_name] = b"xx"
 corrupt_file = tmp / "corrupt.json"
 corrupt_file.write_bytes(corrupt_payload)
+store[corrupt_name] = b"xx"
 refuses(lambda: module.message_put(controller, message(lane="json", file=str(corrupt_file))),
         "differs from its content address")
+store[corrupt_name] = b"Y" * len(corrupt_payload)
+refuses(lambda: module.message_put(controller, message(lane="json", file=str(corrupt_file))),
+        "differs from its content address")
+def digestless_show(ctrl, args, check=True, timeout=None):
+    if args[:3] == ["storage", "blob", "show"]:
+        name = args[args.index("--name") + 1]
+        return {"properties": {"contentLength": len(store[name])}}, 0, ""
+    return fake_az(ctrl, args, check=check, timeout=timeout)
+store[corrupt_name] = corrupt_payload
+module.az = digestless_show
+refuses(lambda: module.message_put(controller, message(lane="json", file=str(corrupt_file))),
+        "differs from its content address")
+module.az = fake_az
 del store[corrupt_name]
 
 # The namespace guard is the enforced boundary for BOTH ops.
@@ -3837,11 +3872,13 @@ refuses(lambda: module.require_session_blob_name("session/out/../../request.json
 refuses(lambda: module.require_session_blob_name("session/in/x.json", module.MESSAGE_OUTBOX_PREFIX),
         "outside its session/out/ lane")
 
-# Collect: fetches new outbox blobs, never touches session/in/, skips
-# identical existing files, refuses divergent ones, and reports exactly what
-# it moved.
+# Collect: fetches new outbox blobs, never touches session/in/, and NEVER
+# re-downloads collected history: an existing local name is judged against
+# the listing's digest metadata without a transfer (the download counter is
+# the proof), identical skips, divergent refuses.
 store.clear()
 uploads.clear()
+downloads["count"] = 0
 first = json.dumps({"sequence": 1}).encode()
 second = json.dumps({"sequence": 2}).encode()
 store["session/out/000001-aa.json"] = first
@@ -3853,15 +3890,106 @@ collected = module.message_collect(controller, message(output_dir=str(outdir)))
 assert [entry["blob_name"] for entry in collected["fetched"]] == [
     "session/out/000001-aa.json", "session/out/000002-bb.json"], collected
 assert collected["skipped"] == []
+assert collected["cursor"] == "000002-bb.json" and collected["more"] is False, collected
+assert downloads["count"] == 2, downloads
 assert sorted(path.name for path in outdir.iterdir()) == ["000001-aa.json", "000002-bb.json"]
 assert (outdir / "000001-aa.json").read_bytes() == first
 assert collected["fetched"][0]["sha256"] == hashlib.sha256(first).hexdigest()
 again = module.message_collect(controller, message(output_dir=str(outdir)))
 assert again["fetched"] == [] and len(again["skipped"]) == 2, again
+assert again["cursor"] == "000002-bb.json" and again["more"] is False, again
+assert downloads["count"] == 2, ("collected history was re-downloaded", downloads)
+# Divergence is decided from the digest metadata, also without a transfer.
 (outdir / "000001-aa.json").write_bytes(b"locally diverged")
 refuses(lambda: module.message_collect(controller, message(output_dir=str(outdir))),
         "collected message blob 000001-aa.json diverges from the existing local file")
+assert downloads["count"] == 2, ("a divergence check downloaded the blob", downloads)
 (outdir / "000001-aa.json").write_bytes(first)
+# The cursor makes the walk incremental: nothing at or before it is touched.
+after_cursor = module.message_collect(controller, message(output_dir=str(outdir), after="000001-aa.json"))
+assert after_cursor["fetched"] == [] and len(after_cursor["skipped"]) == 1, after_cursor
+assert after_cursor["skipped"][0]["blob_name"] == "session/out/000002-bb.json", after_cursor
+refuses(lambda: module.message_collect(controller, message(output_dir=str(outdir), after="../evil")),
+        "message collect cursor is malformed")
+
+# Digestless guest-written blobs (no metadata) are judged by exact size:
+# same size skips without a transfer, a size mismatch refuses.
+def digestless_list(entries):
+    def digestless_az(ctrl, args, check=True, timeout=None):
+        if args[:3] == ["storage", "blob", "list"]:
+            return entries, 0, ""
+        return fake_az(ctrl, args, check=check, timeout=timeout)
+    return digestless_az
+module.az = digestless_list([
+    {"name": "session/out/000001-aa.json", "properties": {"contentLength": len(first)}},
+])
+digestless = module.message_collect(controller, message(output_dir=str(outdir)))
+assert digestless["fetched"] == [] and len(digestless["skipped"]) == 1, digestless
+assert downloads["count"] == 2, ("a digestless same-size blob was re-downloaded", downloads)
+module.az = digestless_list([
+    {"name": "session/out/000001-aa.json", "properties": {"contentLength": len(first) + 7}},
+])
+refuses(lambda: module.message_collect(controller, message(output_dir=str(outdir))),
+        "collected message blob 000001-aa.json diverges from the existing local file")
+assert downloads["count"] == 2, downloads
+module.az = fake_az
+
+# Cursor pagination collects a mailbox deeper than one call's processing
+# page across successive calls (proven through the constant seam), and the
+# per-call transfer budget stops a call early with an honest cursor.
+paged_store_names = ["session/out/{:08d}-pp.json".format(index) for index in range(1, 6)]
+store.clear()
+for index, name in enumerate(paged_store_names, 1):
+    store[name] = json.dumps({"page_sequence": index}).encode()
+paged_dir = tmp / "collected-paged"
+paged_dir.mkdir()
+original_page = module.MESSAGE_COLLECT_PAGE_BLOBS
+module.MESSAGE_COLLECT_PAGE_BLOBS = 2
+try:
+    page_one = module.message_collect(controller, message(output_dir=str(paged_dir)))
+    assert len(page_one["fetched"]) == 2 and page_one["more"] is True, page_one
+    assert page_one["cursor"] == "00000002-pp.json", page_one
+    page_two = module.message_collect(controller, message(output_dir=str(paged_dir), after=page_one["cursor"]))
+    assert len(page_two["fetched"]) == 2 and page_two["more"] is True, page_two
+    page_three = module.message_collect(controller, message(output_dir=str(paged_dir), after=page_two["cursor"]))
+    assert len(page_three["fetched"]) == 1 and page_three["more"] is False, page_three
+finally:
+    module.MESSAGE_COLLECT_PAGE_BLOBS = original_page
+assert sorted(path.name for path in paged_dir.iterdir()) == [name.split("/")[-1] for name in paged_store_names]
+
+# The marker walk crosses truncated listing pages inside one call: with a
+# two-entry listing page the whole five-blob mailbox still collects at once.
+marker_dir = tmp / "collected-marker"
+marker_dir.mkdir()
+original_max = module.MESSAGE_COLLECT_MAX_BLOBS
+module.MESSAGE_COLLECT_MAX_BLOBS = 2
+try:
+    marker_walk = module.message_collect(controller, message(output_dir=str(marker_dir)))
+    assert len(marker_walk["fetched"]) == 5 and marker_walk["more"] is False, marker_walk
+finally:
+    module.MESSAGE_COLLECT_MAX_BLOBS = original_max
+
+# The transfer budget bounds one call's downloads and reports the remainder
+# through the cursor instead of refusing or overrunning.
+budget_dir = tmp / "collected-budget"
+budget_dir.mkdir()
+store.clear()
+store["session/out/00000001-bg.json"] = b"12345678"
+store["session/out/00000002-bg.json"] = b"87654321"
+original_budget = module.MESSAGE_COLLECT_TRANSFER_BUDGET_BYTES
+module.MESSAGE_COLLECT_TRANSFER_BUDGET_BYTES = 10
+try:
+    budget_one = module.message_collect(controller, message(output_dir=str(budget_dir)))
+    assert len(budget_one["fetched"]) == 1 and budget_one["more"] is True, budget_one
+    assert budget_one["cursor"] == "00000001-bg.json", budget_one
+    budget_two = module.message_collect(controller, message(output_dir=str(budget_dir), after=budget_one["cursor"]))
+    assert len(budget_two["fetched"]) == 1 and budget_two["more"] is False, budget_two
+finally:
+    module.MESSAGE_COLLECT_TRANSFER_BUDGET_BYTES = original_budget
+
+store.clear()
+store["session/out/000001-aa.json"] = first
+store["session/out/000002-bb.json"] = second
 
 # A hostile or buggy listing cannot walk the op outside session/out/: foreign
 # names, traversal aliases, nested paths, and unbounded sizes all refuse.
@@ -4043,6 +4171,14 @@ again = json.loads(run(
     "--assignment-generation", worker1["assignment_generation"], "--output-dir", str(outdir),
 ).stdout)
 assert again["fetched"] == [] and len(again["skipped"]) == 2, again
+assert again["cursor"] == "000002-bb.json" and again["more"] is False, again
+resumed = json.loads(run(
+    "message-collect", "--task", "task-1", "--task-generation", "gen-1",
+    "--assignment-generation", worker1["assignment_generation"], "--output-dir", str(outdir),
+    "--after", "000001-aa.json",
+).stdout)
+assert resumed["fetched"] == [] and len(resumed["skipped"]) == 1, resumed
+assert resumed["skipped"][0]["blob_name"] == "session/out/000002-bb.json", resumed
 (outdir / "000001-aa.json").write_bytes(b"locally diverged")
 diverged = run(
     "message-collect", "--task", "task-1", "--task-generation", "gen-1",
@@ -4100,7 +4236,8 @@ collect_exempt = json.loads(run(
     "message-collect", "--task", "task-2", "--task-generation", "gen-2",
     "--assignment-generation", worker2["assignment_generation"], "--output-dir", str(outdir2),
 ).stdout)
-assert collect_exempt == {"fetched": [], "skipped": []}, collect_exempt
+assert collect_exempt["fetched"] == [] and collect_exempt["skipped"] == [], collect_exempt
+assert "cursor" in collect_exempt and collect_exempt["more"] is False, collect_exempt
 message_calls = [entry for entry in fixture_state()["calls"] if entry["type"] == "message-put"]
 assert any(entry["slot"] == item2["slot"] for entry in message_calls), message_calls
 
@@ -4181,11 +4318,24 @@ for op_name, lane_marker in (("message_put", "session/in/"), ("message_collect",
     docstring = ast.get_docstring(op_node) or ""
     assert "CLAIM-EXEMPT" in docstring, op_name
     assert lane_marker in docstring, op_name
+    # The interim role scope (both roles until PR 4 spawns compartments) is
+    # stated where the ops live, not discovered in production.
+    assert "author-role" in docstring and "PR 4/6" in docstring, op_name
     assert "require_session_blob_name" in segment(azure_src, op_name), op_name
 collect_doc = ast.get_docstring(node_of(azure_src, "message_collect")) or ""
 assert "never deletes or overwrites" in collect_doc
+assert "never re-downloads collected history" in collect_doc
+put_doc = ast.get_docstring(node_of(azure_src, "message_put")) or ""
+assert "assignment_generation" in put_doc, "the delivery-fencing contract left the put docstring"
+module_doc = ast.get_docstring(ast.parse(azure_src)) or ""
+assert "assignment_generation" in module_doc, "the delivery-fencing contract left the module docstring"
 guard_doc = ast.get_docstring(node_of(azure_src, "require_session_blob_name")) or ""
 assert "session/" in guard_doc and "ENFORCED" in guard_doc
+# The per-call transfer budget IS the constant the controller sizes the
+# subprocess deadline from, and collect never hard-refuses mailbox depth.
+assert "MESSAGE_COLLECT_TRANSFER_BUDGET_BYTES = MESSAGE_ATTACH_MAX_BYTES" in azure_src
+collect_src = segment(azure_src, "message_collect")
+assert "message outbox exceeds" not in collect_src, "the mailbox-depth hard refusal came back"
 
 # Controller side of the carve: the message commands never touch the claim
 # machinery or the durable document, and the generic mutate verb still

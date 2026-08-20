@@ -5,6 +5,13 @@ The adapter accepts one bounded JSON request on stdin and prints one JSON
 response. It never adopts names outside the reviewed resource group and never
 mutates a resource until complete owner, generation, task, cloud-instance,
 disk, account, and worktree identity matches the controller action.
+
+The compartment message lane (message-put/message-collect) is claim-exempt
+data-plane transport with one delivery-fencing contract PR 4 must implement:
+a slot-addressed transfer runs outside the controller lock, so a late message
+can land in a recreated slot's container; the secondmate monitor therefore
+stamps assignment_generation inside every message envelope and the session
+runner refuses envelopes naming a foreign generation.
 """
 
 import contextlib
@@ -66,7 +73,19 @@ SESSION_BLOB_PREFIX = "session/"
 MESSAGE_INBOX_PREFIX = "session/in/"
 MESSAGE_ATTACH_PREFIX = "session/in/attach/"
 MESSAGE_OUTBOX_PREFIX = "session/out/"
+# Collect is a bounded incremental walk, never a hard refusal on mailbox
+# depth: at most MAX_BLOBS names per az listing page, at most MAX_PAGES pages
+# walked per call while skipping already-collected history, at most
+# PAGE_BLOBS entries processed per call, and at most the transfer budget
+# downloaded per call. The budget equals the per-blob attach ceiling, so one
+# maximum-size blob always fits in one call and the controller can size the
+# subprocess deadline from the same number the fetch loop is bounded by.
+# Anything beyond a bound is reported through the cursor and the more flag,
+# collectable by the next call.
 MESSAGE_COLLECT_MAX_BLOBS = 4096
+MESSAGE_COLLECT_PAGE_BLOBS = 512
+MESSAGE_COLLECT_MAX_PAGES = 16
+MESSAGE_COLLECT_TRANSFER_BUDGET_BYTES = MESSAGE_ATTACH_MAX_BYTES
 MESSAGE_LOCAL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # Staging (archive fetches plus the repository clone) runs BEFORE the wall
 # starts and collection runs after it ends, so a bound covering a whole guest
@@ -1592,6 +1611,15 @@ def message_put(controller, message):
     upload, and the same name holding different bytes refuses. Namespace
     boundary: every name this op writes must sit under session/in/ -
     require_session_blob_name raises on anything else.
+
+    Role scope: until PR 4's spawn lane creates compartments, no secondmate
+    worker exists to address, so the lane deliberately serves author-role
+    workers as well as secondmate compartments; PR 4/6 narrows the callers
+    to compartments. Delivery fencing (PR 4 contract): this transfer is
+    slot-addressed and runs outside the controller lock, so a late put can
+    land in a recreated slot's container; the monitor therefore stamps
+    assignment_generation inside every message envelope and the session
+    runner refuses envelopes naming a foreign generation.
     """
     slot = verify_message_spec(message, "file")
     lane = message.get("lane")
@@ -1631,9 +1659,13 @@ def message_put(controller, message):
         length = properties.get("contentLength")
         if length is None:
             length = existing.get("contentLength")
-        if length != len(payload):
-            # The name IS the content digest, so a different size under it is
-            # corruption or a foreign writer, never a replay.
+        metadata = existing.get("metadata") or properties.get("metadata") or {}
+        remote_digest = metadata.get("content_digest") or metadata.get("content-digest")
+        if remote_digest != digest or length != len(payload):
+            # The name IS the content digest and this op's own upload path
+            # always stamps content_digest metadata, so a missing or
+            # different digest under this name (same-length different bytes
+            # included) is corruption or a foreign writer, never a replay.
             raise ProviderError(
                 "existing message blob {} differs from its content address".format(name))
         return {"blob_name": name, "sha256": digest, "bytes": len(payload), "replayed": True}
@@ -1647,40 +1679,100 @@ def message_put(controller, message):
     return {"blob_name": name, "sha256": digest, "bytes": len(payload), "replayed": False}
 
 
+def message_outbox_listing(controller, storage, container, after):
+    """Name-ordered new outbox entries after the cursor, plus whether more
+    remain beyond this call's bounded walk.
+
+    The az listing is name-ordered, so the cursor (a local outbox name) is a
+    deterministic high-water mark: entries at or before it are dropped
+    client-side, and when a deep already-collected history fills whole
+    listing pages the walk follows the service continuation marker for at
+    most MESSAGE_COLLECT_MAX_PAGES pages. The walk stops early once one full
+    processing page of new entries is in hand; anything beyond is reported
+    as more rather than refused.
+    """
+    threshold = MESSAGE_OUTBOX_PREFIX + after if after else None
+    entries = []
+    marker = None
+    for _page in range(MESSAGE_COLLECT_MAX_PAGES):
+        arguments = [
+            "storage", "blob", "list", "--auth-mode", "login", "--account-name", storage,
+            "--container-name", container, "--prefix", MESSAGE_OUTBOX_PREFIX,
+            "--num-results", str(MESSAGE_COLLECT_MAX_BLOBS), "--include", "m",
+            "--show-next-marker",
+        ]
+        if marker:
+            arguments += ["--marker", marker]
+        listing, rc, stderr = az(controller, arguments, check=False)
+        if rc != 0 or not isinstance(listing, list):
+            raise ProviderError("message outbox listing failed or was malformed: {}".format(stderr))
+        marker = None
+        page = []
+        for item in listing:
+            if isinstance(item, dict) and "nextMarker" in item and "name" not in item:
+                marker = item.get("nextMarker") or None
+                continue
+            if not isinstance(item, dict):
+                raise ProviderError("message outbox listing entry is malformed")
+            page.append(item)
+        page.sort(key=lambda item: str(item.get("name", "")))
+        for item in page:
+            if threshold is not None and str(item.get("name", "")) <= threshold:
+                continue
+            entries.append(item)
+            if len(entries) > MESSAGE_COLLECT_PAGE_BLOBS:
+                # One entry beyond the processing page proves more remain;
+                # the caller reports its cursor and the next call resumes.
+                return entries[:MESSAGE_COLLECT_PAGE_BLOBS], True
+        if marker is None:
+            return entries, False
+    return entries, True
+
+
 def message_collect(controller, message):
     """Fetch new compartment outbox blobs (session/out/...) into one local
-    directory and report their names, sizes, and SHA-256 digests.
+    directory and report their names, sizes, and SHA-256 digests, plus the
+    cursor (last processed local name) and whether more remain.
 
     CLAIM-EXEMPT BY DESIGN, read-only, and shaped like inventory: dumb
     transport that touches no compute, no money, and no lifecycle state. It
     performs NO chain verification - the secondmate monitor owns the
     sequence/chain checks - and it never deletes or overwrites an existing
-    local file: an existing name with identical bytes is skipped, an existing
-    name with different bytes refuses the whole collect. Namespace boundary:
-    the LIST is prefixed to session/out/ and every returned name is
-    re-checked through require_session_blob_name, so a listing that names any
-    blob outside session/out/ refuses rather than fetching it.
+    local file. It also never re-downloads collected history: an existing
+    local name is judged WITHOUT a transfer, against the listing's
+    content_digest metadata when the writer stamped it (this provider's own
+    uploads always do), or by exact size for digestless guest-written blobs;
+    a digest or size mismatch refuses the collect, and a digestless
+    same-size match is presumed already collected because the monitor's
+    chain verification owns full integrity. Each call downloads at most
+    MESSAGE_COLLECT_TRANSFER_BUDGET_BYTES of new content and processes at
+    most one bounded page of entries after the optional cursor; the summary
+    reports the cursor and the more flag instead of ever hard-refusing a
+    deep mailbox. Namespace boundary: the LIST is prefixed to session/out/
+    and every returned name is re-checked through require_session_blob_name,
+    so a listing that names any blob outside session/out/ refuses rather
+    than fetching it.
+
+    Role scope: until PR 4's spawn lane creates compartments, no secondmate
+    worker exists to address, so the lane deliberately serves author-role
+    workers as well as secondmate compartments; PR 4/6 narrows the callers
+    to compartments.
     """
     slot = verify_message_spec(message, "output_dir")
     output_dir = Path(message["output_dir"])
     if output_dir.is_symlink() or not output_dir.is_dir():
         raise ProviderError("message collect output directory is unavailable")
+    after = message.get("after")
+    if after is not None and (not isinstance(after, str) or not MESSAGE_LOCAL_NAME.match(after)):
+        raise ProviderError("message collect cursor is malformed")
     storage = os.environ.get("FM_AZURE_STORAGE_NAME", "")
     container = expected_names(controller, slot)["state-container"]
-    listing, rc, stderr = az(controller, [
-        "storage", "blob", "list", "--auth-mode", "login", "--account-name", storage,
-        "--container-name", container, "--prefix", MESSAGE_OUTBOX_PREFIX,
-        "--num-results", str(MESSAGE_COLLECT_MAX_BLOBS),
-    ], check=False)
-    if rc != 0 or not isinstance(listing, list):
-        raise ProviderError("message outbox listing failed or was malformed: {}".format(stderr))
-    if len(listing) >= MESSAGE_COLLECT_MAX_BLOBS:
-        raise ProviderError("message outbox exceeds its bounded listing")
+    entries, more = message_outbox_listing(controller, storage, container, after)
     fetched = []
     skipped = []
-    for blob in sorted(listing, key=lambda item: str((item or {}).get("name", ""))):
-        if not isinstance(blob, dict):
-            raise ProviderError("message outbox listing entry is malformed")
+    cursor = after
+    spent = 0
+    for blob in entries:
         name = require_session_blob_name(blob.get("name"), MESSAGE_OUTBOX_PREFIX)
         local_name = name[len(MESSAGE_OUTBOX_PREFIX):]
         if not MESSAGE_LOCAL_NAME.match(local_name):
@@ -1696,6 +1788,30 @@ def message_collect(controller, message):
         if target.is_symlink():
             raise ProviderError(
                 "message collect refuses a symlinked local target: {}".format(local_name))
+        if target.exists():
+            # Already-collected history is judged WITHOUT a transfer, or a
+            # poll would re-pay the whole outbox on every call and a deep
+            # history would eventually exceed any fixed deadline.
+            local_bytes = target.read_bytes()
+            local_digest = hashlib.sha256(local_bytes).hexdigest()
+            metadata = blob.get("metadata") or properties.get("metadata") or {}
+            remote_digest = metadata.get("content_digest") or metadata.get("content-digest")
+            if remote_digest is not None:
+                if remote_digest != local_digest:
+                    raise ProviderError(
+                        "collected message blob {} diverges from the existing local file".format(local_name))
+            elif length != len(local_bytes):
+                raise ProviderError(
+                    "collected message blob {} diverges from the existing local file".format(local_name))
+            skipped.append({"blob_name": name, "bytes": length, "sha256": local_digest})
+            cursor = local_name
+            continue
+        if spent and spent + length > MESSAGE_COLLECT_TRANSFER_BUDGET_BYTES:
+            # Budget exhausted mid-walk: report the cursor and let the next
+            # call continue. The first fetch of a call always fits because
+            # no single blob exceeds the attach ceiling the budget equals.
+            more = True
+            break
         fd, staging = tempfile.mkstemp(prefix="fm-message-collect-", dir=str(output_dir))
         os.close(fd)
         try:
@@ -1710,19 +1826,14 @@ def message_collect(controller, message):
             if len(body) != length:
                 raise ProviderError("message blob size differs from its listing claim")
             digest = hashlib.sha256(body).hexdigest()
-            record = {"blob_name": name, "bytes": length, "sha256": digest}
-            if target.exists():
-                if hashlib.sha256(target.read_bytes()).hexdigest() == digest:
-                    skipped.append(record)
-                    continue
-                raise ProviderError(
-                    "collected message blob {} diverges from the existing local file".format(local_name))
             os.replace(staging, str(target))
         finally:
             with contextlib.suppress(FileNotFoundError):
                 Path(staging).unlink()
-        fetched.append(record)
-    return {"fetched": fetched, "skipped": skipped}
+        spent += length
+        fetched.append({"blob_name": name, "bytes": length, "sha256": digest})
+        cursor = local_name
+    return {"fetched": fetched, "skipped": skipped, "cursor": cursor, "more": more}
 
 
 def staged_directory_archive(directory, manifest, label):

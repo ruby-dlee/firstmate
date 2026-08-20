@@ -2153,6 +2153,10 @@ def parser():
     message_collect.add_argument("--task-generation", required=True)
     message_collect.add_argument("--assignment-generation", required=True)
     message_collect.add_argument("--output-dir", required=True)
+    message_collect.add_argument(
+        "--after", default=None,
+        help="resume after this local outbox name (the cursor a previous summary reported)",
+    )
 
     status = sub.add_parser("status", help="show bounded local lifecycle and cost evidence")
     status.add_argument("--live", action="store_true")
@@ -3298,6 +3302,11 @@ def message_lane_worker(env, args, command):
     with command_execute's own identity gates (assigned status, exact
     assignment generation, no release proof), and never saved - neither
     message op modifies controller.json or any other lifecycle state.
+
+    Role scope: until PR 4's spawn lane creates compartments, no secondmate
+    worker exists to address, so the lane deliberately serves author-role
+    workers as well as secondmate compartments; PR 4/6 narrows the callers
+    to compartments.
     """
     with controller_lock(env):
         state = load_state(env)
@@ -3351,8 +3360,14 @@ def command_message_collect(env, args):
     message = message_lane_worker(env, args, "message-collect")
     message.update({
         "output_dir": str(output_dir.resolve()),
+        # The provider caps each call's downloads at its transfer budget,
+        # which equals this constant, so the subprocess deadline is sized
+        # from the bytes one call can actually fetch; already-collected
+        # history is skipped without a transfer and costs nothing here.
         "message_bytes": MESSAGE_ATTACH_MAX_BYTES,
     })
+    if args.after is not None:
+        message["after"] = args.after
     # Same claim-exempt carve as message-put: read-only dumb transport,
     # shaped like inventory. Chain verification belongs to the secondmate
     # monitor, never here, and the provider op refuses divergent overwrites

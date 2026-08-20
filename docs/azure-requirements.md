@@ -280,7 +280,24 @@ Proving it requires a real spawned crewmate task that commits.
 
 ## R10. Crosscheck is exposed to team engineers through Slack
 
-Status: NOT DONE. Directed by the owner 2026-08-19; builds after R6.
+Status: BUILT, ready-to-flip; awaiting the three owner inputs (the Slack app's
+two tokens, the GitHub read credential, and the daily budget number). Directed
+by the owner 2026-08-19; builds after R6. The lane is
+`bin/fm-crosscheck-slack.sh` and its owning document is
+`docs/crosscheck-slack.md`; a missing token environment variable refuses
+startup naming the exact variable, so flipping it on is supplying tokens, not
+changing code. Live acceptance still requires those inputs and an engineer
+other than the owner.
+
+What DK must click: create a Slack app in the workspace with Socket Mode on;
+mint the app-level token with `connections:write` and the bot token with
+`app_mentions:read`, `chat:write`, `channels:history`, and `reactions:write`;
+subscribe it to the `app_mention` event, install it, and invite the bot to the
+channel(s) going into `channel_allowlist`; mint a read-only GitHub credential
+scoped to the allowlisted repositories; export the three values under the
+environment variable names in `$FM_HOME/config/crosscheck-slack.json`; and
+pick the `daily_budget_usd` number (null stays unmetered pass-through, still
+ledgered). Details and the run recipe: `docs/crosscheck-slack.md`.
 
 The owner's v1 shape: an engineer tags the crosscheck bot in a Slack channel with a pull request
 link; the GLM lane reviews it; the bot posts the findings as a thread reply on the engineer's

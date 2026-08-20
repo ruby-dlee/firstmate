@@ -172,6 +172,10 @@ This lane measures the four phases only it performs into the core run record's `
 Cleanup is deliberately not one of them, so `total` is larger than the sum of the named phases by the cleanup and admission time between them.
 The timer is optional at this boundary: the adapter's own CLI records nothing, and nothing recorded reads as "not measured" rather than as a zero.
 
+These phases are lane-bound in the ledger contract: they are admitted only on a run record whose reviewer entry carries `execution_mode: azure-compartment-v1`, which this adapter stamps once a review completes.
+A compartment review that fails before that identity record is complete therefore cannot keep its recorded `create`/`stage` phases, and the writer drops that run's whole measurement rather than write a record every later reader would refuse.
+That loses exactly the numbers a failed compartment review would be most useful for, and it is a deliberate choice over the two alternatives: bricking the task ledger, or letting any record claim compartment phases it never performed.
+
 These numbers do not exist yet.
 The compartment lane is disabled in the operator home and is code-only until the `fm-ccm` model image is rebaked with pi, so no run has executed these phases since they were instrumented.
 `bin/fm-crosscheck.sh timings <task-id>` shows `-` in the `create`, `stage`, `boot`, and `collect` columns for every local-lane run, which is the honest reading: that lane did not do that work.

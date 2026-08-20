@@ -135,9 +135,21 @@ at                    family          state         snapshot  reviewer  proofs  
 2026-08-20T13:49:06Z  codex-fallback  clear         1217      539       479     0       -       -      -     -        2525
 ```
 
+Rows are per run record, not per invocation, and their totals can overlap.
+One invocation that fails over to a second reviewer writes two rows: the first records the invocation up to that failure, and the second records the whole invocation including it.
+Summing the `total` column therefore double counts; read the last row of an invocation for its duration, not the column sum.
+
 `durations_ms` is additive.
 A run recorded before this field existed still validates and still renders, and shows `-` in every phase column rather than a fabricated zero.
-A record that does carry one is held to the full contract: integers only, never negative, only phase names the gate defines, and a `total` that covers the phases it names.
+A record that does carry one is held to the full contract: integers only, never negative, only phase names the gate defines, a `snapshot` phase (every run that reaches a record has performed it), and a `total` that covers the phases it names.
+The compartment phases are lane-bound rather than writer-asserted: `create`, `stage`, `boot`, and `collect` are admitted only on a record whose own reviewer entry carries `execution_mode: azure-compartment-v1`, so "absent means this lane did not do it" is enforced by the gate and not merely by the writer's good behavior.
+A run's `at` stamp is pinned to `YYYY-MM-DDTHH:MM:SSZ` for the same reason: it is the one free-form string the table renders, and an embedded newline would let one record forge extra rows.
+
+The writer validates the measurement against that same contract before writing it, and drops it if it fails.
+Everything that later reads this ledger validates it, so an unvalidated write would be a durable outage: one writer bug and `run`, `verify` and `timings` all refuse the task until a human edits the JSON by hand.
+The measurement is the disposable half of that trade, so a timing bug loudly costs one run its breakdown and never the durable findings.
+The honest consequence at the compartment boundary: a compartment review that fails before its identity record is complete carries no `execution_mode`, so its recorded `create`/`stage` phases fail the lane check and the whole measurement is dropped for that run.
+That is a real loss of exactly the numbers C1 wants, and it is preferred over both the alternatives, which are bricking the ledger or letting any record claim compartment phases.
 
 `bin/fm-pr-merge.sh` calls the verification form automatically after approval.
 Do not call the verification form as a substitute for running a reviewer.

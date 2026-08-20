@@ -37,6 +37,11 @@ from fm_bounded_io import BoundedIOError, read_bounded_json, run_bounded
 SCHEMA = "firstmate.crosscheck-ledger.v2"
 REVIEW_SCHEMA = "firstmate.crosscheck-review.v2"
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# `utc_now()` is the only producer of a run's `at` stamp and has only ever
+# emitted this shape. Pinning it keeps a free-form string out of the rendered
+# `timings` table, where an embedded newline would otherwise let a recorded
+# stamp forge additional table rows.
+RUN_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 FINDING_ID_RE = re.compile(r"^cc-[0-9a-f]{12}$")
 ACTIVE_LIFECYCLES = {"open", "claimed-fixed"}
@@ -2554,7 +2559,9 @@ def execute_mutation_proof(
     return proof
 
 
-def validate_durations(value: Any, label: str) -> dict[str, int]:
+def validate_durations(
+    value: Any, label: str, *, compartment: bool = False
+) -> dict[str, int]:
     """Hold a recorded phase measurement to its contract.
 
     Milliseconds, integers, never negative, never a bool masquerading as an
@@ -2562,6 +2569,14 @@ def validate_durations(value: Any, label: str) -> dict[str, int]:
     covers the phases it names. A record that fails any of these is a
     fabricated measurement, and a ledger holding one is refused rather than
     read as evidence about where a review's time went.
+
+    Two of those checks are the gate's own, not the writer's word for it.
+    "Absent means this lane did not do it" is only true if the gate refuses a
+    lane's phases on a record that does not place the run in that lane, so
+    `create`/`stage`/`boot`/`collect` are admitted only for a reviewer record
+    the compartment lane actually stamped. And every run that reaches a record
+    has performed the snapshot phase, so a measurement without one describes a
+    run that cannot exist and is refused rather than read as a breakdown.
     """
 
     require(isinstance(value, dict), f"{label} must be an object")
@@ -2569,7 +2584,20 @@ def validate_durations(value: Any, label: str) -> dict[str, int]:
         set(value) - set(CROSSCHECK_PHASES) - {CROSSCHECK_TOTAL_PHASE}
     )
     require(not unknown, f"{label} names unknown phase(s): {', '.join(unknown)}")
+    if not compartment:
+        misplaced = sorted(set(value) & set(CROSSCHECK_COMPARTMENT_PHASES))
+        require(
+            not misplaced,
+            f"{label} records compartment-lane phase(s) "
+            f"({', '.join(misplaced)}) on a run whose reviewer record does not "
+            "place it in the Azure compartment lane",
+        )
     require(CROSSCHECK_TOTAL_PHASE in value, f"{label} must record a total")
+    require(
+        "snapshot" in value,
+        f"{label} must record the snapshot phase, which every run that reaches "
+        "a record has performed",
+    )
     for name in sorted(value):
         measured = value[name]
         require(
@@ -2589,6 +2617,46 @@ def validate_durations(value: Any, label: str) -> dict[str, int]:
         f"named phases ({named}ms)",
     )
     return dict(value)
+
+
+def run_is_compartment_lane(run: dict[str, Any]) -> bool:
+    """Whether this run's own reviewer record places it in the Azure lane."""
+
+    reviewer = run.get("reviewer")
+    return (
+        isinstance(reviewer, dict)
+        and reviewer.get("execution_mode") == "azure-compartment-v1"
+    )
+
+
+def stamp_durations(run: dict[str, Any], measured: dict[str, int]) -> None:
+    """Record this run's measurement, or drop it rather than brick the ledger.
+
+    Everything that later reads this ledger validates it, so an unvalidated
+    write is a durable outage waiting to happen: one writer bug and `run`,
+    `verify` and `timings` all refuse the task until a human edits the JSON by
+    hand. The measurement is the disposable half of that trade. A timing bug
+    should cost the operator a breakdown, never the durable findings, so a
+    measurement that fails its own contract is dropped loudly and the record
+    is written without it.
+    """
+
+    try:
+        validate_durations(
+            measured,
+            "recorded durations_ms",
+            compartment=run_is_compartment_lane(run),
+        )
+    except CrosscheckError as exc:
+        run.pop("durations_ms", None)
+        print(
+            "crosscheck: dropping this run's phase measurement because it "
+            f"failed its own contract ({exc}); the run record and the durable "
+            "findings are unaffected",
+            file=sys.stderr,
+        )
+        return
+    run["durations_ms"] = measured
 
 
 def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
@@ -2740,13 +2808,22 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
         optional_run_keys = {"durations_ms"}
         require_exact_keys(run, run_keys | (set(run) & optional_run_keys), label)
         if "durations_ms" in run:
-            validate_durations(run["durations_ms"], f"{label}.durations_ms")
+            validate_durations(
+                run["durations_ms"],
+                f"{label}.durations_ms",
+                compartment=run_is_compartment_lane(run),
+            )
         require(
             run.get("state")
             in {"clear", "blocking", "cannot-certify", "unreviewed", "tool-failure"},
             f"{label}.state is invalid",
         )
-        require_string(run.get("at"), f"{label}.at")
+        recorded_at = require_string(run.get("at"), f"{label}.at")
+        require(
+            RUN_AT_RE.fullmatch(recorded_at) is not None,
+            f"{label}.at must be a UTC instant of the form "
+            "YYYY-MM-DDTHH:MM:SSZ",
+        )
         head = run.get("head_sha")
         require(isinstance(head, str) and SHA_RE.fullmatch(head) is not None, f"{label}.head_sha is invalid")
         base = run.get("base_sha")
@@ -4492,10 +4569,15 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
         record cannot contain the duration of writing itself. That leaves the
         final write as the only unmeasured step, which keeps `total` a floor
         rather than an inflated estimate.
+
+        The measurement is validated before it is written, against the same
+        contract every later reader enforces, and dropped rather than written
+        if it fails. A timing bug must cost this run its breakdown, never the
+        task's durable ledger.
         """
 
         with timer.phase("ledger"):
-            run["durations_ms"] = timer.durations_ms()
+            stamp_durations(run, timer.durations_ms())
             write_ledger(ledger_path, ledger)
             atomic_write(report_path, render_report(ledger, run), mode=0o644)
 
@@ -4795,6 +4877,17 @@ def render_timings(ledger: dict[str, Any]) -> str:
                 ),
             )
         )
+    # Second gate on row forgery. `validate_ledger` already pins `at` and the
+    # other cells come from fixed sets, but this renderer turns records into
+    # lines, so it refuses any cell carrying the whitespace that would let one
+    # record occupy two rows rather than trusting an upstream check.
+    for row in rows:
+        for index, cell in enumerate(row):
+            require(
+                cell == " ".join(cell.split()) and "\n" not in cell,
+                f"crosscheck run record field {columns[index]} carries "
+                "whitespace that would forge a timings row",
+            )
     widths = [
         max(len(column), *(len(row[index]) for row in rows)) if rows else len(column)
         for index, column in enumerate(columns)

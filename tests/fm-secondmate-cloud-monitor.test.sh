@@ -1397,7 +1397,22 @@ for key, item in state["queue"].items():
   # The consultation backstop file, exactly as a real secondmate home carries it.
   mkdir -p "$SP_SUB/config"
   printf '{"profiles":[]}\n' > "$SP_SUB/config/crew-dispatch.json"
+  printf '%s\n' manual > "$SP_SUB/config/backlog-backend"
   relay_home="$SP_SUB"
+  # A crewmate child leases a worktree of its PROJECT repo, so this world needs
+  # the crewmate-shaped treehouse stub (the secondmate helper's leases homes).
+  mkdir -p "$SP_DIR/child-fake"
+  cat > "$SP_DIR/child-fake/treehouse" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = get ]; then
+  printf '%s\n' "${FM_FAKE_TREEHOUSE_WORKTREE:?}"
+fi
+exit 0
+SH
+  chmod +x "$SP_DIR/child-fake/treehouse"
+  git -C "$SP_SUB/projects/alpha" worktree add --quiet --detach "$SP_DIR/child-worktree" \
+    || fail "could not stage a child worktree of the home's project"
   # One valid child request landed for this compartment.
   mkdir -p "$SP_DIR/childreq" "$SP_DIR/inbox"
   python3 - "$SP_DIR/childreq" "$parent" "$parent_generation" "$assignment" <<'PY'
@@ -1422,10 +1437,14 @@ body = canonical(message)
 (pathlib.Path(childreq) / "00000001-{}.json".format(hashlib.sha256(body).hexdigest())).write_bytes(body)
 PY
   out=$(perl -e 'alarm 600; exec @ARGV or die "exec failed: $!"' -- \
-    env PATH="$SP_FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$SPAWN_PRIMARY_ROOT" \
+    env PATH="$SP_DIR/child-fake:$SP_FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$SPAWN_PRIMARY_ROOT" \
     FM_FAKE_TMUX_LOG="$SP_TMUX_LOG" FM_FAKE_TMUX_CAPTURE="$SP_PANE" \
     FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 \
     FM_HERDR_LOG="$SP_HERDR_LOG" FM_FAKE_HERDR_STATE="$SP_DIR/herdr-state.json" \
+    FM_FAKE_TREEHOUSE_WORKTREE="$SP_DIR/child-worktree" \
+    FM_FAKE_PANE_PATH="$SP_DIR/child-worktree" \
+    FM_TREEHOUSE_ROOT="$SP_SUB/treehouse-pools" \
+    FM_CHECKOUT_REFRESH_STATE_BASE="$SP_DIR/checkout-refresh-state" \
     PI_CODING_AGENT_DIR="$SP_DIR/pi-agent-home" FM_SPAWN_NO_GUARD=1 \
     FM_AZURE_SUBSCRIPTION_ID="$SUB" FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
     FM_AZURE_OWNER_TAG=owner FM_AZURE_NAMING_PREFIX=fmtest \

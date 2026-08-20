@@ -4582,14 +4582,11 @@ for durations, expected in (
     # A local-lane record cannot claim compartment phases, and a measurement
     # with no snapshot phase describes a run that cannot exist.
     (
-        {"create": 1, "total": 1},
-        "records compartment-lane phase(s) (create) on a run whose reviewer "
-        "record does not place it in the Azure compartment lane",
-    ),
-    (
         {"snapshot": 1, "boot": 1, "collect": 1, "total": 30},
-        "compartment-lane phase(s) (boot, collect)",
+        "records compartment-lane phase(s) (boot, collect) on a run whose "
+        "reviewer record does not place it in the Azure compartment lane",
     ),
+    ({"create": 1, "total": 1}, "compartment-lane phase(s) (create)"),
     ({"total": 0}, "must record the snapshot phase"),
     ({"reviewer": 5, "total": 30}, "must record the snapshot phase"),
 ):
@@ -4772,6 +4769,18 @@ assert module.run_is_compartment_lane({"reviewer": None}) is False
 with contextlib.redirect_stderr(io.StringIO()):
     module.stamp_durations(compartment, {"snapshot": 1, "create": 2, "total": 30})
 assert compartment["durations_ms"]["create"] == 2, compartment
+
+# Secondary, structural: the behavioral proof that the WRITER routes through
+# this drop is the end-to-end re-read in
+# test_timings_reads_every_run_and_refuses_a_missing_ledger, which refuses the
+# whole task ledger if an invalid measurement ever lands. This pins the call
+# site itself so a direct assignment cannot quietly reintroduce the
+# unvalidated write that made a timing bug a durable outage.
+import inspect
+
+source = inspect.getsource(module.run_crosscheck)
+assert "stamp_durations(run, timer.durations_ms())" in source, source
+assert 'run["durations_ms"] =' not in source, source
 PY
   pass "a measurement failing its own contract is dropped loudly, never written into the ledger"
 }

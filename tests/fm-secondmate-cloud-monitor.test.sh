@@ -518,6 +518,132 @@ test_leg_seconds_above_ceiling_refused_at_startup() {
   pass "leg_seconds above 19800 refuses at startup (wall = leg + 1800 must fit 21600)"
 }
 
+# --- fm-send compartment routing ----------------------------------------------
+
+# shellcheck source=bin/fm-marker-lib.sh
+. "$ROOT/bin/fm-marker-lib.sh"
+
+make_send_stubs() {  # <dir> -> echoes fakebin (fake tmux logging literal sends)
+  local dir=$1 fb="$1/fakebin"
+  mkdir -p "$fb"
+  cat > "$fb/tmux" <<'SH'
+#!/usr/bin/env bash
+set -u
+case "${1:-}" in
+  send-keys)
+    shift
+    literal=0
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -t) shift 2 ;;
+        -l) literal=1; shift ;;
+        *) break ;;
+      esac
+    done
+    if [ "$literal" = 1 ]; then
+      printf '%s' "${1:-}" >> "$FM_SEND_LOG"
+    fi
+    exit 0 ;;
+  has-session|display-message)
+    for a in "$@"; do case "$a" in *cursor_y*) printf '0\n'; exit 0 ;; esac; done
+    printf 'fakepane\n'; exit 0 ;;
+  capture-pane) printf '\xe2\x94\x82 \xe2\x94\x82\n'; exit 0 ;;
+  list-windows) exit 0 ;;
+esac
+exit 0
+SH
+  chmod +x "$fb/tmux"
+  printf '%s\n' "$fb"
+}
+
+run_send() {  # <fakebin> <home> <send-log> <fm-send args...>
+  local fb=$1 home=$2 log=$3
+  shift 3
+  : > "$log"
+  env PATH="$fb:$PATH" \
+    FM_ROOT_OVERRIDE="$home" FM_HOME="$home" FM_SEND_LOG="$log" FM_SEND_SETTLE=0 \
+    "$SEND" "$@" 2>&1
+}
+
+make_send_home() {  # <name> <with-placement> <with-assignment> -> SEND_HOME/SEND_FB/SEND_LOG
+  local name=$1 with_placement=$2 with_assignment=$3 dir
+  dir="$TMP_ROOT/send-$name"
+  SEND_HOME="$dir/home"
+  mkdir -p "$SEND_HOME/state" "$dir/stubs"
+  SEND_FB=$(make_send_stubs "$dir/stubs")
+  SEND_LOG="$dir/send.log"
+  fm_write_secondmate_meta "$SEND_HOME/state/domain.meta" "$SEND_HOME" "firstmate:fm-domain"
+  {
+    printf 'generation_id=%s\n' "$GEN"
+    [ "$with_placement" != 1 ] || printf 'placement=azure\n'
+    [ "$with_assignment" != 1 ] || printf 'worker_assignment_generation=%s\n' "$ASSIGNMENT"
+  } >> "$SEND_HOME/state/domain.meta"
+}
+
+test_fm_send_routes_cloud_secondmate_into_the_compartment_inbox() {
+  local out rc inbox
+  make_send_home routed 1 1
+  inbox="$SEND_HOME/state/domain.cloud-inbox"
+  out=$(run_send "$SEND_FB" "$SEND_HOME" "$SEND_LOG" fm-domain 'audit the build')
+  rc=$?
+  expect_code 0 "$rc" "cloud secondmate send should succeed: $out"
+  assert_contains "$out" "queued for cloud secondmate" "the routed send did not report its envelope: $out"
+  [ ! -s "$SEND_LOG" ] || fail "a cloud secondmate send typed into a local pane: $(cat "$SEND_LOG")"
+  python3 - "$inbox" "$ASSIGNMENT" "$FM_FROMFIRST_MARK" <<'PY' || fail "the compartment envelope is not the canonical fenced shape"
+import hashlib, json, pathlib, re, sys
+inbox, assignment, marker = sys.argv[1:]
+files = sorted(p for p in pathlib.Path(inbox).iterdir() if re.fullmatch(r"[0-9]{8}-[0-9a-f]{64}\.json", p.name))
+assert len(files) == 1, files
+body = files[0].read_bytes()
+digest = hashlib.sha256(body).hexdigest()
+assert files[0].name == "00000001-{}.json".format(digest), files[0].name
+message = json.loads(body)
+assert set(message) == {"kind", "text", "nonce"}, message
+assert message["kind"] == "fm.secondmate-message/v1"
+assert message["nonce"] == assignment + "/00000001", message["nonce"]
+assert message["text"] == marker + "audit the build", repr(message["text"])
+canonical = json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+assert canonical == body, "envelope bytes are not canonical"
+PY
+  # A second identical send is a NEW message (distinct sequence and nonce),
+  # never a silent dedupe of a repeated captain instruction.
+  out=$(run_send "$SEND_FB" "$SEND_HOME" "$SEND_LOG" fm-domain 'audit the build')
+  expect_code 0 $? "second cloud secondmate send should succeed: $out"
+  [ "$(ls "$inbox" | grep -c '^00000002-')" = 1 ] || fail "a repeated send did not claim the next sequence"
+  # --key has no composer to press.
+  out=$(run_send "$SEND_FB" "$SEND_HOME" "$SEND_LOG" fm-domain --key Enter)
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "--key to a cloud compartment must refuse: $out"
+  assert_contains "$out" "no local composer" "--key refusal did not explain the compartment lane: $out"
+  pass "fm-send routes cloud secondmate text into fenced canonical inbox envelopes; --key refuses"
+}
+
+test_fm_send_local_secondmate_path_is_unchanged() {
+  local out rc got
+  make_send_home local-path 0 0
+  out=$(run_send "$SEND_FB" "$SEND_HOME" "$SEND_LOG" fm-domain 'route this work')
+  rc=$?
+  expect_code 0 "$rc" "local secondmate send should succeed: $out"
+  got=$(cat "$SEND_LOG")
+  [ "$got" = "${FM_FROMFIRST_MARK}route this work" ] \
+    || fail "a placement-less secondmate send changed behavior (must stay the marked backend send): $(printf '%s' "$got" | od -An -c | head -3)"
+  assert_absent "$SEND_HOME/state/domain.cloud-inbox" "a local secondmate send created a compartment inbox"
+  pass "fm-send to a local secondmate stays byte-identical (marker + backend send, no inbox)"
+}
+
+test_fm_send_cloud_secondmate_without_assignment_refuses() {
+  local out rc
+  make_send_home unassigned 1 0
+  out=$(run_send "$SEND_FB" "$SEND_HOME" "$SEND_LOG" fm-domain 'too early')
+  rc=$?
+  [ "$rc" -ne 0 ] || fail "an unassigned compartment send must refuse (no generation to fence): $out"
+  assert_contains "$out" "no worker assignment yet" "the unassigned refusal did not explain itself: $out"
+  [ ! -e "$SEND_HOME/state/domain.cloud-inbox" ] \
+    || [ -z "$(ls "$SEND_HOME/state/domain.cloud-inbox" 2>/dev/null | grep -v '^\.')" ] \
+    || fail "an unfenced envelope was written despite the refusal"
+  pass "fm-send refuses a cloud secondmate send that cannot be generation-fenced"
+}
+
 test_leg1_carries_staging_and_leg2_is_manifest_free_golden
 test_o_excl_guard_prevents_double_dispatch
 test_inbox_relay_is_content_addressed_and_replay_safe
@@ -528,5 +654,8 @@ test_bundle_lands_by_fast_forward_when_clean
 test_bundle_kept_when_worktree_dirty
 test_ttl_refuses_renewal
 test_leg_seconds_above_ceiling_refused_at_startup
+test_fm_send_routes_cloud_secondmate_into_the_compartment_inbox
+test_fm_send_local_secondmate_path_is_unchanged
+test_fm_send_cloud_secondmate_without_assignment_refuses
 
 echo "# fm-secondmate-cloud-monitor.test.sh: all assertions passed"

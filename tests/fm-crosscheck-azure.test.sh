@@ -1098,6 +1098,14 @@ assert isinstance(harness_argument.value, ast.Name)
 assert harness_argument.value.id == "config"
 assert harness_argument.slice.value == "harness", ast.dump(harness_argument)
 
+# Every harness the adapter can dispatch must have an attestation, and the
+# table may not accumulate entries for harnesses no lane dispatches. A new
+# lane added without a tag is refused rather than admitted, so this is a
+# drift check and not the safety boundary.
+assert set(m.HARNESS_IMAGE_ATTESTATION) == set(m.HARNESS_PROVIDER_HOSTS), (
+    sorted(set(m.HARNESS_IMAGE_ATTESTATION) ^ set(m.HARNESS_PROVIDER_HOSTS))
+)
+
 # The declaration must keep writing the tags this guard now reads.
 declaration = json.loads(
     (closure_path.parent / "model-image.json").read_text(encoding="utf-8")

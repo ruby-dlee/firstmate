@@ -253,6 +253,24 @@ PY
   pass "an expiring leg exits 0 with a reason=wall summary before the hard timeout"
 }
 
+wall_defers_unstarted_turn() {
+  fixture
+  local digest
+  digest=$(put_inbox '{"kind":"fm.secondmate-message/v1","text":"too late"}')
+  # leg=2 puts the deadline one second out: the message is listed but no
+  # honest turn fits, so it must be DEFERRED (not marked processed), never
+  # silently swallowed.
+  run_leg FM_SECONDMATE_LEG_SECONDS=2 >/dev/null 2>&1 || fail "deferral leg did not exit cleanly"
+  test "$(wc -l < "$TURN_LOG" | tr -d ' ')" = 0 || fail "a turn ran with no room before the wall"
+  assert_absent "$STATE_DIR/processed/$digest" \
+    "a deferred message must not enter the processed set"
+  # The next leg with room replays the deferred message exactly once.
+  put_inbox '{"kind":"fm.secondmate-control/v1","action":"close"}' >/dev/null
+  run_leg >/dev/null 2>&1 || fail "replay leg did not exit cleanly"
+  test "$(wc -l < "$TURN_LOG" | tr -d ' ')" = 1 || fail "the deferred message did not replay once"
+  pass "a message with no room before the wall defers to the next leg instead of vanishing"
+}
+
 child_intent_round_trip() {
   fixture
   local intents="$TMP/intents"
@@ -302,6 +320,13 @@ invalid_intent_refused_not_emitted() {
   mkdir -p "$intents"
   printf '%s' '{"kind":"ship","brief":"fine","sku":"Standard_D4as_v7"}' > "$intents/unknown-key.json"
   printf '%s' '{"kind":"frigate","brief":"fine"}' > "$intents/bad-kind.json"
+  # A brief at the 256KiB bound passes the intent schema but cannot fit the
+  # framed outbox message: that refuses the one intent, not the leg.
+  python3 - "$intents/oversize.json" <<'PY'
+import json, sys
+brief = "x" * (256 * 1024)
+open(sys.argv[1], "w").write(json.dumps({"kind": "ship", "brief": brief}))
+PY
   put_inbox '{"kind":"fm.secondmate-message/v1","text":"spawn things"}' >/dev/null
   put_inbox '{"kind":"fm.secondmate-control/v1","action":"close"}' >/dev/null
   run_leg FM_FAKE_PI_MODE=intent FM_FAKE_PI_INTENT_SRC="$intents" >/dev/null 2>&1 \
@@ -321,6 +346,7 @@ for path in sorted((blob / "session" / "out").iterdir()):
 assert "fm.secondmate-child-request/v1" not in kinds, kinds
 assert any("unknown key: sku" in check for check in checks), checks
 assert any("kind must be ship or scout" in check for check in checks), checks
+assert any("exceeds the outbox message cap" in check for check in checks), checks
 PY
   pass "an invalid spool intent is refused naming the exact check and never emitted"
 }
@@ -504,6 +530,7 @@ chain_tamper_refuses
 idle_exit_emits_summary
 close_control_exits
 wall_exit_before_hard_timeout
+wall_defers_unstarted_turn
 child_intent_round_trip
 invalid_intent_refused_not_emitted
 namespace_boundary_refuses

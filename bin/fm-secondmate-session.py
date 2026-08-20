@@ -632,14 +632,18 @@ class SessionRunner:
         return True
 
     def handle_message(self, message, digest_hex):
+        """Handle one inbox message. Returns False only when the message was
+        deliberately DEFERRED (not processed) so the caller must not mark it:
+        a turn that no longer fits before the wall replays on the next leg
+        rather than being silently swallowed."""
         kind = message.get("kind")
         if kind == MESSAGE_KIND:
             if not self.validate_closed(message, digest_hex, ("text",), ()):
-                return
-            self.agent_turn(message["text"])
-        elif kind == CONTROL_KIND:
+                return True
+            return self.agent_turn(message["text"])
+        if kind == CONTROL_KIND:
             if not self.validate_closed(message, digest_hex, ("action",), ()):
-                return
+                return True
             action = message["action"]
             if action == "close":
                 self.close_requested = True
@@ -647,12 +651,13 @@ class SessionRunner:
                 self.bundle_commits()
             else:
                 self.refuse_input(digest_hex, "control action is unsupported: {}".format(action))
-        elif kind == ATTACH_KIND:
-            if not self.validate_closed(message, digest_hex, ("name", "sha256"), ("bytes",)):
-                return
-            self.handle_attach(message, digest_hex)
-        else:
-            self.refuse_input(digest_hex, "message kind is unsupported: {!r}".format(kind))
+            return True
+        if kind == ATTACH_KIND:
+            if self.validate_closed(message, digest_hex, ("name", "sha256"), ("bytes",)):
+                self.handle_attach(message, digest_hex)
+            return True
+        self.refuse_input(digest_hex, "message kind is unsupported: {!r}".format(kind))
+        return True
 
     def handle_attach(self, message, digest_hex):
         name = message["name"]
@@ -701,7 +706,9 @@ class SessionRunner:
     def agent_turn(self, text):
         remaining = self.wall_deadline - time.monotonic()
         if remaining <= 1:
-            return
+            # Too close to the wall for an honest turn: defer, do not mark
+            # processed, so the next leg replays this message.
+            return False
         argv = [
             self.config["pi_bin"], "--print",
             "--session-id", self.session_id,
@@ -736,6 +743,7 @@ class SessionRunner:
         })
         self.sweep_spool()
         self.last_activity = time.monotonic()
+        return True
 
     # -- child intents --------------------------------------------------------
 
@@ -767,6 +775,16 @@ class SessionRunner:
             if "effort" in intent:
                 payload["child_effort"] = intent["effort"]
             payload["self_digest"] = sha256_hex(canonical(payload))
+            # A brief at the 256KiB bound plus chain framing can overrun the
+            # outbox message cap; that refuses the one intent, not the leg.
+            probe = dict(payload)
+            probe["sequence"] = self.outbox.sequence + 1
+            probe["content_sha256"] = GENESIS_CHAIN_DIGEST
+            probe["chain_digest"] = GENESIS_CHAIN_DIGEST
+            if len(canonical(probe)) > MAX_MESSAGE_BYTES:
+                self.refuse_input(name, "child request exceeds the outbox message cap")
+                self.archive_intent(path)
+                continue
             self.outbox.emit(payload)
             path.unlink()
 
@@ -885,9 +903,11 @@ class SessionRunner:
                 if time.monotonic() >= self.wall_deadline:
                     break
                 message = self.read_message(name, digest_hex, size)
+                handled = True
                 if message is not None:
-                    self.handle_message(message, digest_hex)
-                self.state.mark_processed(digest_hex)
+                    handled = self.handle_message(message, digest_hex)
+                if handled:
+                    self.state.mark_processed(digest_hex)
                 self.last_activity = time.monotonic()
             if self.close_requested:
                 reason = "close"

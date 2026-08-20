@@ -34,6 +34,7 @@ repo carries no third-party Python dependencies and none was added.
   "repo_allowlist": ["Ruby-Labs/relvino"],
   "github_token_env": "FM_GITHUB_READ_TOKEN",
   "daily_budget_usd": null,
+  "daily_request_cap": null,
   "state_dir": "$FM_HOME/state/crosscheck-slack"
 }
 ```
@@ -52,10 +53,16 @@ repo carries no third-party Python dependencies and none was added.
   repository and the allowlist.
 - `channel_allowlist` bounds where the bot works; mentions elsewhere get a
   threaded "not enabled" refusal and no review.
-- `daily_budget_usd: null` means unmetered pass-through: every request is
-  still ledgered, no bound is enforced. A number is a per-submitter,
-  per-UTC-day bound; when a submitter's recorded day total meets it, the
-  bot says so in the thread instead of silently dropping the request.
+- `daily_request_cap` is the metering control that BINDS TODAY: a
+  per-submitter, per-UTC-day cap on started reviews, needing no cost data.
+  At the cap the bot says so in the thread instead of silently dropping the
+  request. Null = uncapped, still ledgered.
+- `daily_budget_usd` is a forward contract, stated plainly: it binds only
+  once the crosscheck ledger records per-review cost, which today's ledger
+  schema does not, so a submitter's recorded day total stays 0.0 and this
+  bound cannot fire until that lands. When cost data exists, a submitter at
+  the bound gets the same in-thread reply. Null = unmetered pass-through,
+  still ledgered.
 - `state_dir` supports a literal leading `$FM_HOME` and nothing else.
 
 `bin/fm-crosscheck-slack.sh --selftest [config-path]` validates the config
@@ -80,9 +87,11 @@ these three things.
    exactly the allowlisted repositories is the right shape; the listener
    hands it to the crosscheck subprocess (also as `GH_TOKEN`) and to
    nothing else.
-3. **The daily budget number** for `daily_budget_usd`. This is a DK input
-   recorded under C3; until it is set the lane runs unmetered pass-through
-   with full ledgering.
+3. **The two metering numbers**, both DK inputs recorded under C3:
+   `daily_request_cap` (the control that binds today; a per-submitter daily
+   count of started reviews) and `daily_budget_usd` (the USD bound, which
+   binds only once the crosscheck ledger records per-review cost). Until
+   they are set the lane runs unmetered pass-through with full ledgering.
 
 ## Run recipe
 
@@ -116,11 +125,13 @@ capped backoff.
 URL, event id, start/finish timestamps, outcome status, the lane that
 served it, token usage when the crosscheck output exposes it, and
 estimated USD when derivable, else null. Writes are atomic under an
-advisory lock. Honest limit: today's crosscheck ledger schema does not
-record token usage or cost, so `estimated_usd` stays null and the USD
-bound can only bind on recorded costs; the per-request records are already
-durable, so C3 can attach a per-review price or a usage-derived cost
-without a schema change here. Event dedupe markers live in
+advisory lock. Honest limit, stated plainly: today's crosscheck ledger
+schema does not record token usage or cost, so `estimated_usd` stays null,
+recorded spend stays 0.0, and the USD bound cannot bind until the lane
+records cost; `daily_request_cap` is the binding control today. The
+per-request records are already durable, so C3 can attach a per-review
+price or a usage-derived cost without a schema change here. Event dedupe
+markers live in
 `<state_dir>/events/`; a redelivered Slack event id never starts a second
 review.
 

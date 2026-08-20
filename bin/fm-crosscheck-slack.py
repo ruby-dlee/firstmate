@@ -24,10 +24,12 @@ Posture, in one place:
 - Every Slack event id is claimed durably before any work starts, so a
   retried delivery of the same event never starts a second review.
 - Team usage is metered per submitter per UTC day in a durable JSON ledger
-  (the C3 hook). When `daily_budget_usd` is set and a submitter's recorded
-  day total meets it, the bot says so in the thread instead of silently
-  dropping the request. A null budget is unmetered pass-through, still
-  ledgered.
+  (the C3 hook). Two bounds exist and both reply in thread instead of
+  silently dropping: `daily_request_cap` counts started reviews and is the
+  BINDING control today; `daily_budget_usd` is a forward contract that can
+  only bind once the crosscheck ledger records per-review cost, which
+  today's ledger schema does not (estimated USD stays null until it does).
+  Null for either means that bound is off; requests are still ledgered.
 
 The review itself belongs to bin/fm-crosscheck.sh; this file never
 reimplements or weakens any part of that gate. The websocket client below
@@ -79,15 +81,20 @@ CONFIG_KEYS = {
     "repo_allowlist",
     "github_token_env",
     "daily_budget_usd",
+    "daily_request_cap",
     "state_dir",
 }
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 CHANNEL_RE = re.compile(r"^[A-Z0-9]{1,32}$")
 EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# The trailing lookahead makes the PR number strictly bounded: an 11+ digit
+# run never truncates into a shorter, DIFFERENT PR id inside an allowlisted
+# repository; the link simply does not match and the mention is refused as
+# link-less rather than reviewed as the wrong PR.
 PR_LINK_RE = re.compile(
     r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/"
-    r"([A-Za-z0-9._-]{1,100})/pull/([0-9]{1,10})"
+    r"([A-Za-z0-9._-]{1,100})/pull/([0-9]{1,10})(?![0-9])"
 )
 
 MAX_CONFIG_BYTES = 64 * 1024
@@ -152,6 +159,7 @@ class Config:
     channel_allowlist: tuple[str, ...]
     repo_allowlist: tuple[str, ...]
     daily_budget_usd: float | None
+    daily_request_cap: int | None
     state_dir: Path
 
 
@@ -263,6 +271,17 @@ def load_config(path: Path) -> Config:
         budget = float(budget_raw)
         require(budget > 0, "configuration daily_budget_usd must be null or a positive number")
 
+    cap_raw = value.get("daily_request_cap")
+    cap: int | None
+    if cap_raw is None:
+        cap = None
+    else:
+        require(
+            isinstance(cap_raw, int) and not isinstance(cap_raw, bool) and cap_raw > 0,
+            "configuration daily_request_cap must be null or a positive integer",
+        )
+        cap = cap_raw
+
     state_dir = expand_state_dir(require_string(value.get("state_dir"), "configuration state_dir"))
 
     return Config(
@@ -273,6 +292,7 @@ def load_config(path: Path) -> Config:
         channel_allowlist=tuple(channels),
         repo_allowlist=tuple(repos),
         daily_budget_usd=budget,
+        daily_request_cap=cap,
         state_dir=state_dir,
     )
 
@@ -586,14 +606,17 @@ def render_verdict_reply(
     lane: str,
     report_path: Path,
 ) -> str:
-    state = str(run.get("state") or "unknown").upper()
+    # Every ledger-derived value is escaped uniformly: state, lane, head,
+    # summary, severities, and titles all pass through escape_slack, so no
+    # reviewer- or PR-influenced string can smuggle Slack control sequences.
+    state = escape_slack(clamp(str(run.get("state") or "unknown"), 40).upper())
     lines = [
         f"Crosscheck {state} for {pr_url}",
-        f"Lane: {lane}",
+        f"Lane: {escape_slack(clamp(lane, 120))}",
     ]
     head = run.get("head_sha")
     if isinstance(head, str) and head:
-        lines.append(f"Reviewed head: {head}")
+        lines.append(f"Reviewed head: {escape_slack(clamp(head, 64))}")
     summary = run.get("summary")
     if isinstance(summary, str) and summary.strip():
         lines.append(f"Summary: {escape_slack(clamp(summary.strip(), MAX_SUMMARY_CHARS))}")
@@ -609,7 +632,7 @@ def render_verdict_reply(
             lines.append(f"Active findings ({len(active)}):")
             for finding in active[:MAX_LISTED_FINDINGS]:
                 title = escape_slack(clamp(str(finding.get("title") or "(untitled)"), 200))
-                severity = str(finding.get("severity") or "unrated")
+                severity = escape_slack(clamp(str(finding.get("severity") or "unrated"), 40))
                 lines.append(f"- [{severity}] {title}")
             if len(active) > MAX_LISTED_FINDINGS:
                 lines.append(f"- ... and {len(active) - MAX_LISTED_FINDINGS} more in the report")
@@ -850,6 +873,23 @@ def handle_mention(event_id: str, event: dict[str, Any], ctx: MentionContext) ->
             "credential is never pointed at repositories outside the allowlist.",
         )
         return "repo-refused"
+
+    # The request-count cap is the bound that actually binds today; the USD
+    # bound below is a forward contract that can only bind once the
+    # crosscheck ledger records per-review cost (today it does not, so the
+    # recorded day total stays 0.0 until that lands).
+    cap = ctx.config.daily_request_cap
+    if cap is not None:
+        count = ctx.meter.submitter_day_count(user)
+        if count >= cap:
+            ctx.post(
+                channel,
+                thread_ts,
+                f"Daily crosscheck request cap reached: {count} of {cap} "
+                "requests recorded for you today, so this review is not "
+                "starting. The bound resets at midnight UTC.",
+            )
+            return "cap-refused"
 
     budget = ctx.config.daily_budget_usd
     if budget is not None:
@@ -1235,8 +1275,18 @@ def selftest(config_path: Path) -> int:
         f"({'set' if os.environ.get(config.github_token_env) else 'UNSET'})",
         f"channel_allowlist: {len(config.channel_allowlist)} channel(s)",
         f"repo_allowlist: {', '.join(config.repo_allowlist)}",
+        "daily_request_cap: "
+        + (
+            f"{config.daily_request_cap} (the binding control today)"
+            if config.daily_request_cap is not None
+            else "null (uncapped; requests still ledgered)"
+        ),
         "daily_budget_usd: "
-        + (f"{config.daily_budget_usd:.2f}" if config.daily_budget_usd is not None else "null (unmetered pass-through, still ledgered)"),
+        + (
+            f"{config.daily_budget_usd:.2f} (binds only once the crosscheck ledger records cost)"
+            if config.daily_budget_usd is not None
+            else "null (unmetered pass-through, still ledgered)"
+        ),
         f"state_dir: {config.state_dir}",
     ]
     print("\n".join(lines))
@@ -1283,9 +1333,16 @@ def main() -> int:
         service = SocketModeService(config)
         log(
             f"starting Socket Mode listener; repos: {', '.join(config.repo_allowlist)}; "
-            f"channels: {len(config.channel_allowlist)}; budget: "
+            f"channels: {len(config.channel_allowlist)}; request cap: "
             + (
-                f"${config.daily_budget_usd:.2f}/submitter/day"
+                f"{config.daily_request_cap}/submitter/day"
+                if config.daily_request_cap is not None
+                else "uncapped (null)"
+            )
+            + "; budget: "
+            + (
+                f"${config.daily_budget_usd:.2f}/submitter/day "
+                "(binds only once the ledger records cost)"
                 if config.daily_budget_usd is not None
                 else "unmetered (null)"
             )

@@ -44,8 +44,10 @@ GH_TOKEN_VALUE='ghp_SECRETGITHUB0123456789abcdef'
 
 CONFIG_MAIN="$TMP_ROOT/config-main.json"
 CONFIG_BUDGET="$TMP_ROOT/config-budget.json"
+CONFIG_CAP="$TMP_ROOT/config-cap.json"
+CONFIG_TINYBUDGET="$TMP_ROOT/config-tinybudget.json"
 
-write_config() { # <path> <daily_budget_usd-json>
+write_config() { # <path> <daily_budget_usd-json> <daily_request_cap-json>
   cat > "$1" <<JSON
 {
   "app_token_env": "FM_TEST_SLACK_APP_TOKEN",
@@ -54,12 +56,15 @@ write_config() { # <path> <daily_budget_usd-json>
   "repo_allowlist": ["ruby-labs/goodrepo"],
   "github_token_env": "FM_TEST_GITHUB_READ_TOKEN",
   "daily_budget_usd": $2,
+  "daily_request_cap": $3,
   "state_dir": "\$FM_HOME/state/crosscheck-slack"
 }
 JSON
 }
-write_config "$CONFIG_MAIN" null
-write_config "$CONFIG_BUDGET" 5.0
+write_config "$CONFIG_MAIN" null null
+write_config "$CONFIG_BUDGET" 5.0 null
+write_config "$CONFIG_CAP" null 2
+write_config "$CONFIG_TINYBUDGET" 0.01 null
 
 # The fixture crosscheck binary: records every invocation, refuses if a Slack
 # token leaked into its environment, verifies the bot staged real task
@@ -154,6 +159,9 @@ if command == "extract":
             ["https://github.com/a/b/pull/1", "https://github.com/a/b/pull/2"],
         ),
         ("no links here, just github.com/a/b/pull/3 without scheme", []),
+        # An over-long PR number must be refused whole, never truncated into
+        # a different, shorter PR id inside an allowlisted repository.
+        ("https://github.com/a/b/pull/12345678901 is too long", []),
         ("http://github.com/a/b/pull/4 is not https", []),
         ("https://github.com/a/b/issues/5 is not a pull", []),
         ("https://evilgithub.com/a/b/pull/6 is not github.com", []),
@@ -278,6 +286,8 @@ test_selftest_validates_config_shape() {
     "selftest did not report the repo allowlist"
   assert_contains "$output" "unmetered pass-through" \
     "selftest did not explain the null budget"
+  assert_contains "$output" "daily_request_cap: null (uncapped" \
+    "selftest did not report the null request cap"
 
   bad="$TMP_ROOT/config-bad.json"
   "$PYTHON" -c 'import json, sys
@@ -446,7 +456,13 @@ test_duplicate_event_id_starts_one_review() {
   pass "the same event id delivered twice starts exactly one review"
 }
 
-test_meter_accumulates_and_bound_reached_replies() {
+# FORWARD CONTRACT: today's crosscheck ledger schema records no usage/cost, so
+# this unit injects a `usage` object through the FIXTURE to exercise the USD
+# path that will bind once the lane records cost. It is deliberately not a
+# claim that the USD bound binds in production today; the unit after it proves
+# the production-shaped ledger yields null cost and no bound trip, and
+# test_request_cap_binds_today covers the control that actually binds now.
+test_usd_meter_forward_contract_with_fixture_injected_usage() {
   before=$(fixture_run_count)
   export FM_FIXTURE_USAGE_JSON='{"total_tokens": 120000, "estimated_usd": 3.5}'
   event="$TMP_ROOT/event-budget.json"
@@ -491,7 +507,72 @@ print(len(rows), len(tokens), len(lanes))' "$meter_day")
   assert_contains "$RUN_MENTION_OUTPUT" "action: completed:clear" \
     "budget bound leaked across submitters"
   unset FM_FIXTURE_USAGE_JSON
-  pass "per-submitter daily meter accumulates cost and the bound is announced in thread"
+  pass "per-submitter USD meter accumulates fixture-injected forward-contract cost and the bound is announced in thread"
+}
+
+test_production_shaped_ledger_never_trips_usd_bound() {
+  # The default fixture ledger carries NO usage field, exactly like today's
+  # crosscheck schema. Under a tiny USD budget, reviews must still run:
+  # estimated_usd stays null, the recorded day total stays 0.0, and the
+  # bound never fires falsely.
+  trip_before=$(grep -c "Daily crosscheck budget reached" "$POSTS" || true)
+  event="$TMP_ROOT/event-prod-shape.json"
+  write_event "$event" C0TESTCHAN U0PRODSHAPE 1755640020.000100 "$GOOD_PR_TEXT"
+  run_mention ev-prodshape-1 "$CONFIG_TINYBUDGET" "$event" prodshape-1 \
+    || fail "first production-shaped review errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: completed:clear" \
+    "first production-shaped review did not run"
+  write_event "$event" C0TESTCHAN U0PRODSHAPE 1755640021.000100 "$GOOD_PR_TEXT"
+  run_mention ev-prodshape-2 "$CONFIG_TINYBUDGET" "$event" prodshape-2 \
+    || fail "second production-shaped review errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: completed:clear" \
+    "the USD bound tripped falsely on a production-shaped ledger"
+  trip_after=$(grep -c "Daily crosscheck budget reached" "$POSTS" || true)
+  [ "$trip_after" = "$trip_before" ] \
+    || fail "a budget-reached reply appeared without any recorded cost"
+  meter_day="$HOMEDIR/state/crosscheck-slack/meter/$(date -u +%Y-%m-%d).json"
+  shape=$("$PYTHON" -c 'import json, sys
+value = json.load(open(sys.argv[1]))
+rows = [r for r in value["requests"] if r["submitter"] == "U0PRODSHAPE"]
+nulls = [r for r in rows if r["estimated_usd"] is None and r["tokens"] is None]
+print(len(rows), len(nulls))' "$meter_day")
+  [ "$shape" = "2 2" ] || fail "production-shaped meter rows wrong: $shape"
+  pass "a production-shaped ledger yields null cost, zero recorded spend, and no false USD bound trip"
+}
+
+test_request_cap_binds_today() {
+  before=$(fixture_run_count)
+  event="$TMP_ROOT/event-cap.json"
+
+  write_event "$event" C0TESTCHAN U0CAPPED 1755640030.000100 "$GOOD_PR_TEXT"
+  run_mention ev-cap-1 "$CONFIG_CAP" "$event" cap-1 \
+    || fail "first capped review errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: completed:clear" "first capped review refused"
+
+  write_event "$event" C0TESTCHAN U0CAPPED 1755640031.000100 "$GOOD_PR_TEXT"
+  run_mention ev-cap-2 "$CONFIG_CAP" "$event" cap-2 \
+    || fail "second capped review errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: completed:clear" "second capped review refused"
+
+  write_event "$event" C0TESTCHAN U0CAPPED 1755640032.000100 "$GOOD_PR_TEXT"
+  run_mention ev-cap-3 "$CONFIG_CAP" "$event" cap-3 \
+    || fail "third capped mention errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: cap-refused" \
+    "the request-count cap was not enforced"
+  reply=$(last_post_text)
+  assert_contains "$reply" "Daily crosscheck request cap reached" "cap-reached reply missing"
+  assert_contains "$reply" "2 of 2" "cap-reached reply did not state the totals"
+
+  after=$(fixture_run_count)
+  [ "$after" = $((before + 2)) ] || fail "cap-refused request still reached the crosscheck CLI"
+
+  # A different submitter is not bound by U0CAPPED's count.
+  write_event "$event" C0TESTCHAN U0UNCAPPED 1755640033.000100 "$GOOD_PR_TEXT"
+  run_mention ev-cap-other "$CONFIG_CAP" "$event" cap-other \
+    || fail "other-submitter capped review errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: completed:clear" \
+    "request cap leaked across submitters"
+  pass "the per-submitter daily request cap binds today with no cost data and is announced in thread"
 }
 
 test_tool_failure_is_reported_honestly() {
@@ -548,7 +629,9 @@ UNITS=(
   test_completed_review_names_the_lane_and_writes_gate_metadata
   test_lane_naming_covers_fallback_and_explicit_marker
   test_duplicate_event_id_starts_one_review
-  test_meter_accumulates_and_bound_reached_replies
+  test_usd_meter_forward_contract_with_fixture_injected_usage
+  test_production_shaped_ledger_never_trips_usd_bound
+  test_request_cap_binds_today
   test_tool_failure_is_reported_honestly
   test_blocking_verdict_reply_names_state_and_findings
   test_tokens_never_reach_logs_or_ledgers

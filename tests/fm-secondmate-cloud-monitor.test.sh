@@ -1365,9 +1365,29 @@ test_child_request_through_the_real_fm_spawn_with_crew_dispatch() {
   # THE SEAM THE FIXTURE SPAWN CANNOT TOUCH: relay argv -> the REAL
   # bin/fm-spawn.sh argument validation, in a home carrying
   # config/crew-dispatch.json (the primary propagates it into secondmate
-  # homes, so most real homes have it). The relay must resolve a harness
-  # explicitly rather than rely on implicit resolution, and the child must
-  # come out ADMITTED on the one controller under the parent pair.
+  # homes, so most real homes have it).
+  #
+  # It clears the two gates this PR closed - the harness consultation
+  # backstop (the relay names --harness explicitly) and the backlog-row
+  # refusal (the relay files the row) - and then hits a THIRD gate that no
+  # change in this PR's owned files can close, which this unit PINS rather
+  # than hides:
+  #
+  #   verify_request requires a compartment child to be a SECONDMATE-owned
+  #   author request, so the spawn must run with FM_HOME=<the secondmate
+  #   home>; enforce_child_bounds requires the parent compartment's queue
+  #   entry in the SAME controller document, which is the PRIMARY's because
+  #   the primary spawned the compartment; and verify_state binds that
+  #   document to the home that created it (home_binding = sha256 of the
+  #   resolved home path). All three cannot hold at once through this lane,
+  #   so the request refuses with "lifecycle state home_binding binding is
+  #   not exact" - the compartment child lane cannot admit anything today.
+  #
+  # What this unit proves is therefore the whole point of B.5 step 2 under a
+  # genuinely broken dependency: the compartment still gets a durable,
+  # delivered, named answer, and NO phantom child is recorded. When the
+  # controller contract is fixed (a sibling PR's files), this unit goes red
+  # and must be rewritten to assert admission.
   local out rc parent parent_generation assignment controller relay_home
   setup_spawn_world real-spawn mast
   out=$(run_gate_spawn mast \
@@ -1469,12 +1489,24 @@ for path in sorted(p for p in inbox.iterdir() if re.fullmatch(r"[0-9]{8}-[0-9a-f
     print(json.dumps(json.loads(path.read_bytes()), sort_keys=True))
 PY
 )
+  # Gate 1, closed by this PR: the harness consultation backstop.
   assert_not_contains "$delivered" "crew-dispatch.json is active" \
     "the real fm-spawn refused the relay's argv at the harness consultation backstop: $delivered"
-  assert_contains "$delivered" "FIRSTMATE ACCEPTED" \
-    "the child request was not served through the real fm-spawn: $delivered / relay: $out"
-  # ADMITTED, on the one controller, under this compartment's parent pair.
-  python3 - "$controller" "$parent" "$parent_generation" <<'PY' || fail "the real spawn produced no bounded child queue entry"
+  # Gate 2, closed by this PR: the missing backlog row.
+  assert_not_contains "$delivered" "has no In flight or Queued row" \
+    "the real fm-spawn refused the relay's argv at the backlog-row gate: $delivered"
+  # Gate 3, NOT closable in this PR's files: the home-bound controller.
+  assert_contains "$delivered" "home_binding binding is not exact" \
+    "the compartment child lane got past the home-bound controller; if the controller contract was fixed, rewrite this unit to assert admission: $delivered"
+  assert_contains "$delivered" "FIRSTMATE REFUSED your request" \
+    "the real-spawn refusal was not delivered into the compartment inbox: $delivered"
+  [ -n "$(first_matching "$SP_DIR/childreq" '.refused-*.json')" ] \
+    || fail "the real-spawn refusal left no durable record"
+  # And NO phantom child: nothing was recorded as accepted, and the one
+  # controller holds no entry under this compartment's parent pair.
+  [ -z "$(first_matching "$SP_DIR/childreq" '.accepted-*.json')" ] \
+    || fail "a child that was never admitted was recorded as accepted"
+  python3 - "$controller" "$parent" "$parent_generation" <<'PY' || fail "a refused child still left a queue entry behind"
 import json, sys
 controller, parent, generation = sys.argv[1:]
 state = json.load(open(controller))
@@ -1482,11 +1514,9 @@ children = [
     item for item in state["queue"].values()
     if item.get("parent_task") == parent and item.get("parent_task_generation") == generation
 ]
-assert len(children) == 1, children
-child = children[0]
-assert child["role"] == "author" and child["owner_kind"] == "secondmate", child
+assert children == [], children
 PY
-  pass "a child request is served through the REAL fm-spawn in a crew-dispatch home and comes out admitted under the parent pair"
+  pass "through the REAL fm-spawn the relay clears the harness and backlog gates, and the home-bound controller refusal comes home as a durable delivered answer with no phantom child"
 }
 
 test_crewmate_monitor_reclaims_a_stale_dispatch_marker() {

@@ -975,6 +975,21 @@ class Relay:
                 env.pop(key, None)
         # The ONE money authority: the local controller document, whichever
         # home the spawn runs under.
+        #
+        # KNOWN OPEN COLLISION, proven by the real-spawn unit and NOT fixable
+        # in this file: verify_request needs a compartment child to be a
+        # secondmate-owned author request (so FM_HOME must be the secondmate
+        # home), enforce_child_bounds needs the parent compartment's entry in
+        # THIS document (the primary's, since the primary spawned the
+        # compartment), and verify_state binds the document to the home that
+        # created it. All three cannot hold at once, so the request refuses
+        # with "lifecycle state home_binding binding is not exact" and no
+        # compartment child can be admitted until the controller contract is
+        # resolved in bin/fm-worker-lifecycle.py. Pointing this at the
+        # secondmate home's own controller instead would make the document
+        # load and then fail the parent-liveness bound - two money documents
+        # is the outcome the design forbids - so the pin stays and the
+        # refusal stays loud.
         env["FM_AZURE_WORKER_STATE_DIR"] = str(self.controller.parent)
         env["FM_SPAWN_CLOUD"] = "azure"
         env["FM_SPAWN_PARENT_TASK"] = self.task

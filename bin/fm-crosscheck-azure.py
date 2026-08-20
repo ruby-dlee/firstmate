@@ -398,7 +398,7 @@ def verify_scope_and_foundation(config: dict[str, Any]) -> Any:
 # bin/fm-crosscheck.py; tests/fm-crosscheck-azure.test.sh enforces the
 # equality. The GLM lane binds exactly one Foundry resource + deployment and
 # exactly one chat-completions endpoint; the interim claude reviewer lane
-# (api.anthropic.com) is retired.
+# and its provider host are retired.
 GLM_REVIEWER_MODEL = "FW-GLM-5.2"
 GLM_PROVIDER_SLOT = "azure-glm"
 GLM_FOUNDRY_RESOURCE = "aif-fm7c799d-eus01"
@@ -527,7 +527,7 @@ def create_credential_archive(
 ) -> tuple[str, str]:
     """Package the reviewer credential for one-way copy-in at boot.
 
-    Reviewers copy their credential in and never sync it back: the model
+    Reviewers copy their credential in and never sync back: the model
     guest has no share access and no write-back path, so concurrent
     reviewers can never clobber each other's token refresh. The GLM lane
     packages the api-key models.json; the codex-family lanes package their

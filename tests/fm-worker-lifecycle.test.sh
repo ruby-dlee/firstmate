@@ -992,6 +992,49 @@ if request["operation"] == "mutate":
             raise AssertionError(kind)
         state["seen"][key] = result
     save()
+elif request["operation"] in ("message-put", "message-collect"):
+    # The claim-exempt message lane: raw ops, never routed through mutate,
+    # never touching the mutate branch's idempotency-key machinery. Blobs
+    # live in fixture state as hex under session/... names per slot.
+    message = request["action"]
+    blobs = state.setdefault("session_blobs", {}).setdefault(str(message["slot"]), {})
+    if request["operation"] == "message-put":
+        body = Path(message["file"]).read_bytes()
+        digest = hashlib.sha256(body).hexdigest()
+        if message["lane"] == "json":
+            name = "session/in/{}.json".format(digest)
+        else:
+            name = "session/in/attach/{}.bundle".format(digest)
+        replayed = name in blobs
+        if not replayed:
+            blobs[name] = body.hex()
+        state["calls"].append({"type": "message-put", "slot": message["slot"], "name": name})
+        save()
+        result = {"blob_name": name, "sha256": digest, "bytes": len(body), "replayed": replayed}
+    else:
+        out = Path(message["output_dir"])
+        fetched = []
+        skipped = []
+        for name in sorted(blobs):
+            if not name.startswith("session/out/"):
+                continue
+            body = bytes.fromhex(blobs[name])
+            digest = hashlib.sha256(body).hexdigest()
+            target = out / name[len("session/out/"):]
+            record = {"blob_name": name, "bytes": len(body), "sha256": digest}
+            if target.exists():
+                if hashlib.sha256(target.read_bytes()).hexdigest() == digest:
+                    skipped.append(record)
+                    continue
+                sys.stderr.write(
+                    "FIXTURE PROVIDER REFUSED: collected message blob {} diverges "
+                    "from the existing local file\n".format(target.name))
+                raise SystemExit(1)
+            target.write_bytes(body)
+            fetched.append(record)
+        state["calls"].append({"type": "message-collect", "slot": message["slot"]})
+        save()
+        result = {"fetched": fetched, "skipped": skipped}
 else:
     active = sum(
         1 for worker in state["workers"].values()
@@ -1031,7 +1074,7 @@ response = {
     "schema": "fm.worker-provider-response/v1", "operation": request["operation"],
     "controller": controller,
 }
-response["result" if request["operation"] == "mutate" else "inventory"] = result
+response["inventory" if request["operation"] == "inventory" else "result"] = result
 print(json.dumps(response, sort_keys=True, separators=(",", ":")))
 PY
   chmod +x "$1"
@@ -3654,6 +3697,538 @@ PY
 }
 
 
+message_lane_provider_contract() {
+  local tmp
+  fm_test_tmproot_into tmp fm-message-lane-provider
+  python3 - "$AZURE" "$tmp" <<'PY' || fail "message lane provider contract failed"
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+provider_path, tmp = sys.argv[1], Path(sys.argv[2])
+os.environ["FM_AZURE_STORAGE_NAME"] = "stfmtestwkr01"
+spec = importlib.util.spec_from_file_location("azure_provider", provider_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+SUB = "11111111-1111-4111-8111-111111111111"
+controller = {
+    "home_binding": "0" * 64, "subscription": SUB,
+    "deployment_generation": "dep-one", "owner": "owner", "prefix": "fmtest",
+    "resource_group": "rg-fixture",
+}
+bindings = {
+    "home_binding": "1" * 64, "task": "task-msg", "task_generation": "gen-msg",
+    "assignment_generation": "asg-00000001", "account_binding": "2" * 64,
+    "worktree_binding": "3" * 64, "repository_binding": "4" * 64,
+    "repository_generation": "repo-msg",
+}
+def message(**fields):
+    base = {"slot": 3, "role": "author", "cloud_generation": 1, "bindings": bindings}
+    base.update(fields)
+    return base
+
+store = {}
+uploads = []
+
+def fake_az(ctrl, args, check=True, timeout=None):
+    if args[:3] == ["storage", "blob", "show"]:
+        name = args[args.index("--name") + 1]
+        if name not in store:
+            return None, 1, "BlobNotFound"
+        return {"properties": {"contentLength": len(store[name])}}, 0, ""
+    if args[:3] == ["storage", "blob", "upload"]:
+        name = args[args.index("--name") + 1]
+        store[name] = Path(args[args.index("--file") + 1]).read_bytes()
+        uploads.append(name)
+        return None, 0, ""
+    if args[:3] == ["storage", "blob", "list"]:
+        prefix = args[args.index("--prefix") + 1]
+        return ([
+            {"name": name, "properties": {"contentLength": len(body)}}
+            for name, body in sorted(store.items()) if name.startswith(prefix)
+        ], 0, "")
+    if args[:3] == ["storage", "blob", "download"]:
+        Path(args[args.index("--file") + 1]).write_bytes(store[args[args.index("--name") + 1]])
+        return None, 0, ""
+    raise AssertionError(args)
+
+module.az = fake_az
+
+def refuses(callable_, needle):
+    try:
+        callable_()
+    except module.ProviderError as exc:
+        assert needle in str(exc), (needle, str(exc))
+        return
+    raise AssertionError("no refusal containing {!r}".format(needle))
+
+# The exact reviewed bounds, and the exact refusal strings derived from them.
+assert module.MESSAGE_JSON_MAX_BYTES == 262144
+assert module.MESSAGE_ATTACH_MAX_BYTES == 268435456
+
+# JSON lane: content-addressed name, single upload, replay is a no-op success.
+payload = json.dumps({"schema": "fm.secondmate-message/v1", "text": "hello"}).encode()
+digest = hashlib.sha256(payload).hexdigest()
+msg_file = tmp / "msg.json"
+msg_file.write_bytes(payload)
+result = module.message_put(controller, message(lane="json", file=str(msg_file)))
+expected_name = "session/in/{}.json".format(digest)
+assert result == {"blob_name": expected_name, "sha256": digest, "bytes": len(payload), "replayed": False}, result
+assert uploads == [expected_name] and store[expected_name] == payload
+replay = module.message_put(controller, message(lane="json", file=str(msg_file)))
+assert replay["replayed"] is True and uploads == [expected_name], (replay, uploads)
+
+# Size bound, JSON requirement, and emptiness all refuse with exact strings
+# BEFORE any az call could run.
+big = tmp / "big.json"
+big.write_bytes(json.dumps("a" * 262200).encode())
+refuses(lambda: module.message_put(controller, message(lane="json", file=str(big))),
+        "message payload exceeds its 262144-byte bound")
+bad = tmp / "bad.json"
+bad.write_bytes(b"not json {{{")
+refuses(lambda: module.message_put(controller, message(lane="json", file=str(bad))),
+        "message payload is not valid JSON")
+empty = tmp / "empty.json"
+empty.write_bytes(b"")
+refuses(lambda: module.message_put(controller, message(lane="json", file=str(empty))),
+        "message payload is empty")
+
+# Attach lane: binary content with NO JSON requirement, its own prefix, and a
+# bound proven through the constant seam rather than a 256MiB fixture (the
+# refusal string derives from the same constant the check reads).
+blob = b"\x00\x01\x02binary-not-json\xff" * 8
+attach_file = tmp / "delta.bundle"
+attach_file.write_bytes(blob)
+attach_result = module.message_put(controller, message(lane="attach", file=str(attach_file)))
+attach_digest = hashlib.sha256(blob).hexdigest()
+assert attach_result["blob_name"] == "session/in/attach/{}.bundle".format(attach_digest), attach_result
+original_bound = module.MESSAGE_ATTACH_MAX_BYTES
+module.MESSAGE_ATTACH_MAX_BYTES = 4096
+try:
+    oversized = tmp / "oversized.bundle"
+    oversized.write_bytes(b"\xab" * 5000)
+    refuses(lambda: module.message_put(controller, message(lane="attach", file=str(oversized))),
+            "message attachment exceeds its 4096-byte bound")
+finally:
+    module.MESSAGE_ATTACH_MAX_BYTES = original_bound
+
+# A name that already exists with bytes other than its own content address is
+# corruption or a foreign writer, never a replay.
+corrupt_payload = json.dumps({"n": 42}).encode()
+corrupt_name = "session/in/{}.json".format(hashlib.sha256(corrupt_payload).hexdigest())
+store[corrupt_name] = b"xx"
+corrupt_file = tmp / "corrupt.json"
+corrupt_file.write_bytes(corrupt_payload)
+refuses(lambda: module.message_put(controller, message(lane="json", file=str(corrupt_file))),
+        "differs from its content address")
+del store[corrupt_name]
+
+# The namespace guard is the enforced boundary for BOTH ops.
+assert module.require_session_blob_name("session/out/000001-aa.json", module.MESSAGE_OUTBOX_PREFIX)
+refuses(lambda: module.require_session_blob_name("outcome-" + "a" * 32 + ".bundle", module.MESSAGE_OUTBOX_PREFIX),
+        "outside the session/ namespace")
+refuses(lambda: module.require_session_blob_name("session/out/../../request.json", module.MESSAGE_OUTBOX_PREFIX),
+        "outside the session/ namespace")
+refuses(lambda: module.require_session_blob_name("session/in/x.json", module.MESSAGE_OUTBOX_PREFIX),
+        "outside its session/out/ lane")
+
+# Collect: fetches new outbox blobs, never touches session/in/, skips
+# identical existing files, refuses divergent ones, and reports exactly what
+# it moved.
+store.clear()
+uploads.clear()
+first = json.dumps({"sequence": 1}).encode()
+second = json.dumps({"sequence": 2}).encode()
+store["session/out/000001-aa.json"] = first
+store["session/out/000002-bb.json"] = second
+store["session/in/planted.json"] = b"{}"
+outdir = tmp / "collected"
+outdir.mkdir()
+collected = module.message_collect(controller, message(output_dir=str(outdir)))
+assert [entry["blob_name"] for entry in collected["fetched"]] == [
+    "session/out/000001-aa.json", "session/out/000002-bb.json"], collected
+assert collected["skipped"] == []
+assert sorted(path.name for path in outdir.iterdir()) == ["000001-aa.json", "000002-bb.json"]
+assert (outdir / "000001-aa.json").read_bytes() == first
+assert collected["fetched"][0]["sha256"] == hashlib.sha256(first).hexdigest()
+again = module.message_collect(controller, message(output_dir=str(outdir)))
+assert again["fetched"] == [] and len(again["skipped"]) == 2, again
+(outdir / "000001-aa.json").write_bytes(b"locally diverged")
+refuses(lambda: module.message_collect(controller, message(output_dir=str(outdir))),
+        "collected message blob 000001-aa.json diverges from the existing local file")
+(outdir / "000001-aa.json").write_bytes(first)
+
+# A hostile or buggy listing cannot walk the op outside session/out/: foreign
+# names, traversal aliases, nested paths, and unbounded sizes all refuse.
+real_az = module.az
+def hostile(entries):
+    def hostile_az(ctrl, args, check=True, timeout=None):
+        if args[:3] == ["storage", "blob", "list"]:
+            return entries, 0, ""
+        return real_az(ctrl, args, check=check, timeout=timeout)
+    return hostile_az
+module.az = hostile([{"name": "outcome-evil.bundle", "properties": {"contentLength": 3}}])
+refuses(lambda: module.message_collect(controller, message(output_dir=str(outdir))),
+        "outside the session/ namespace")
+module.az = hostile([{"name": "session/out/../request.json", "properties": {"contentLength": 3}}])
+refuses(lambda: module.message_collect(controller, message(output_dir=str(outdir))),
+        "outside the session/ namespace")
+module.az = hostile([{"name": "session/out/nested/blob.json", "properties": {"contentLength": 3}}])
+refuses(lambda: module.message_collect(controller, message(output_dir=str(outdir))),
+        "message outbox blob name is unsupported")
+module.az = hostile([{"name": "session/out/huge.bundle", "properties": {"contentLength": 268435457}}])
+refuses(lambda: module.message_collect(controller, message(output_dir=str(outdir))),
+        "message outbox blob size is malformed or unbounded")
+module.az = real_az
+
+# A symlinked local target is never followed.
+os.symlink(tmp / "elsewhere", outdir / "000003-cc.json")
+store["session/out/000003-cc.json"] = b"{}"
+refuses(lambda: module.message_collect(controller, message(output_dir=str(outdir))),
+        "symlinked local target")
+(outdir / "000003-cc.json").unlink()
+del store["session/out/000003-cc.json"]
+
+# End-to-end dispatch pin: the REAL provider binary routes message-put to the
+# same bounded op, and the refusal fires before any az invocation exists to
+# fail differently.
+env = dict(os.environ)
+env.update({
+    "FM_AZURE_SUBSCRIPTION_ID": SUB, "FM_AZURE_DEPLOYMENT_GENERATION": "dep-one",
+    "FM_AZURE_OWNER_TAG": "owner", "FM_AZURE_NAMING_PREFIX": "fmtest",
+    "FM_AZURE_STORAGE_NAME": "stfmtestwkr01",
+})
+request = {
+    "schema": "fm.worker-provider-request/v1", "operation": "message-put",
+    "controller": controller, "action": message(lane="json", file=str(big)),
+}
+proc = subprocess.run(
+    [sys.executable, provider_path], input=json.dumps(request).encode(),
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=60,
+)
+assert proc.returncode == 2, (proc.returncode, proc.stderr)
+assert b"AZURE WORKER PROVIDER REFUSED: message payload exceeds its 262144-byte bound" in proc.stderr, proc.stderr
+PY
+  pass "message lane provider ops bound size, address by content, and hold the session/ boundary"
+}
+
+message_lane_claim_exemption() {
+  local tmp provider fixture home envfile
+  fm_test_tmproot_into tmp fm-message-lane-claim
+  provider="$tmp/provider.py"
+  fixture="$tmp/provider-state.json"
+  home="$tmp/home"
+  mkdir -p "$home"
+  write_fixture_provider "$provider"
+  envfile="$tmp/env"
+  cat >"$envfile" <<EOF
+FM_HOME=$home
+FM_AZURE_SUBSCRIPTION_ID=$SUB
+FM_AZURE_DEPLOYMENT_GENERATION=dep-one
+FM_AZURE_OWNER_TAG=owner
+FM_AZURE_NAMING_PREFIX=fmtest
+FM_AZURE_WORKER_IDLE_COOLDOWN_SECONDS=0
+FM_WORKER_PROVIDER_COMMAND=python3 $provider
+FIXTURE_STATE=$fixture
+FM_WORKER_TEST_ALLOW_ASSERTED_BINDINGS=1
+EOF
+
+  python3 - "$WRAPPER" "$envfile" "$fixture" "$tmp" <<'PY' || fail "message lane claim exemption failed"
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+wrapper, envfile, fixture_path, tmp = sys.argv[1:]
+tmp = Path(tmp)
+env = os.environ.copy()
+for line in Path(envfile).read_text().splitlines():
+    key, value = line.split("=", 1)
+    env[key] = value
+
+def run(*args, check=True, overrides=None):
+    call_env = dict(env)
+    call_env.update(overrides or {})
+    result = subprocess.run(
+        [wrapper] + list(args), env=call_env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if check and result.returncode != 0:
+        raise AssertionError("{} failed: {}".format(args, result.stderr))
+    return result
+
+def binding(number):
+    return format(number, "064x")
+
+def request(number):
+    run(
+        "request", "--task", "task-{}".format(number), "--task-generation", "gen-{}".format(number),
+        "--home-binding", binding(1000 + number), "--account-binding", binding(2000 + number),
+        "--worktree-binding", binding(3000 + number), "--repository-binding", binding(4000 + number),
+        "--repository-generation", "repo-{}".format(number), "--owner-kind", "primary", "--eligible",
+    )
+
+controller_json = Path(env["FM_HOME"]) / "state/azure-workers/controller.json"
+
+def controller_state():
+    return json.loads(controller_json.read_text())
+
+def fixture_state():
+    return json.loads(Path(fixture_path).read_text())
+
+def assignment(number):
+    state = controller_state()
+    item = state["queue"]["task-{}@gen-{}".format(number, number)]
+    return item, state["workers"][str(item["slot"])]
+
+request(1)
+request(2)
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+
+# JSON message: content-addressed upload through the CLI, replay converges.
+item1, worker1 = assignment(1)
+payload = json.dumps({"schema": "fm.secondmate-message/v1", "text": "hi"}).encode()
+digest = hashlib.sha256(payload).hexdigest()
+message_file = tmp / "message.json"
+message_file.write_bytes(payload)
+baseline = controller_json.read_bytes()
+put = json.loads(run(
+    "message-put", "--task", "task-1", "--task-generation", "gen-1",
+    "--assignment-generation", worker1["assignment_generation"], "--file", str(message_file),
+).stdout)
+assert put["blob_name"] == "session/in/{}.json".format(digest) and put["replayed"] is False, put
+replay = json.loads(run(
+    "message-put", "--task", "task-1", "--task-generation", "gen-1",
+    "--assignment-generation", worker1["assignment_generation"], "--file", str(message_file),
+).stdout)
+assert replay["replayed"] is True, replay
+assert put["blob_name"] in fixture_state()["session_blobs"][str(item1["slot"])]
+
+# Attach lane rides the CLI too, into its own prefix, without a JSON body.
+attach_file = tmp / "delta.bundle"
+attach_file.write_bytes(b"\x00binary\xff" * 4)
+attach = json.loads(run(
+    "message-put", "--task", "task-1", "--task-generation", "gen-1",
+    "--assignment-generation", worker1["assignment_generation"], "--attach", str(attach_file),
+).stdout)
+assert attach["blob_name"].startswith("session/in/attach/") and attach["blob_name"].endswith(".bundle"), attach
+
+# Collect fetches only session/out/ blobs, skips identical replays, refuses
+# divergence, and a planted session/in/ blob never comes home.
+fixture = fixture_state()
+slot_blobs = fixture["session_blobs"][str(item1["slot"])]
+out_one = json.dumps({"sequence": 1}).encode()
+out_two = json.dumps({"sequence": 2}).encode()
+slot_blobs["session/out/000001-aa.json"] = out_one.hex()
+slot_blobs["session/out/000002-bb.json"] = out_two.hex()
+Path(fixture_path).write_text(json.dumps(fixture, sort_keys=True, separators=(",", ":")))
+outdir = tmp / "collected"
+outdir.mkdir()
+collected = json.loads(run(
+    "message-collect", "--task", "task-1", "--task-generation", "gen-1",
+    "--assignment-generation", worker1["assignment_generation"], "--output-dir", str(outdir),
+).stdout)
+assert [entry["blob_name"] for entry in collected["fetched"]] == [
+    "session/out/000001-aa.json", "session/out/000002-bb.json"], collected
+assert sorted(path.name for path in outdir.iterdir()) == ["000001-aa.json", "000002-bb.json"]
+again = json.loads(run(
+    "message-collect", "--task", "task-1", "--task-generation", "gen-1",
+    "--assignment-generation", worker1["assignment_generation"], "--output-dir", str(outdir),
+).stdout)
+assert again["fetched"] == [] and len(again["skipped"]) == 2, again
+(outdir / "000001-aa.json").write_bytes(b"locally diverged")
+diverged = run(
+    "message-collect", "--task", "task-1", "--task-generation", "gen-1",
+    "--assignment-generation", worker1["assignment_generation"], "--output-dir", str(outdir),
+    check=False,
+)
+assert diverged.returncode != 0 and "diverges from the existing local file" in diverged.stderr, diverged.stderr
+(outdir / "000001-aa.json").write_bytes(out_one)
+
+# Neither op writes controller state: the durable document is byte-identical
+# across every message-lane call above.
+assert controller_json.read_bytes() == baseline, "a message op rewrote controller.json"
+
+# THE test proposal A's design would have failed: an outstanding execute
+# claim on the slot does not block message delivery. Wedge a durable execute
+# claim (the provider result omits the outcome disposition, so its apply
+# refuses deterministically and the claim stays), then message-put succeeds
+# while a compute-mutating action with the same shape refuses.
+staging = tmp / "staging"
+payload_dir = staging / "payload"
+account_dir = staging / "account"
+outcome_dir = staging / "outcome"
+for directory in (payload_dir, account_dir, outcome_dir):
+    directory.mkdir(parents=True)
+(payload_dir / "repo.bundle").write_bytes(b"bundle-fixture")
+(payload_dir / "brief.md").write_text("brief\n")
+(account_dir / "auth.json").write_text("{}\n")
+item2, worker2 = assignment(2)
+
+def execute_two(command, overrides=None):
+    return run(
+        "execute", "--task", "task-2", "--task-generation", "gen-2",
+        "--assignment-generation", worker2["assignment_generation"], "--wall-seconds", "60",
+        "--payload-dir", str(payload_dir), "--account-dir", str(account_dir),
+        "--outcome-dir", str(outcome_dir),
+        "--confirm-execute", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"],
+        "--", command, check=False, overrides=overrides,
+    )
+
+skewed = execute_two("/bin/echo", overrides={"FIXTURE_OMIT_OUTCOME": "1"})
+assert skewed.returncode != 0 and "no outcome disposition" in skewed.stderr, skewed.stderr
+claimed_state = controller_state()
+slot2 = str(item2["slot"])
+assert claimed_state["pending_actions"][slot2]["type"] == "execute", claimed_state["pending_actions"]
+claimed_bytes = controller_json.read_bytes()
+
+exempt = json.loads(run(
+    "message-put", "--task", "task-2", "--task-generation", "gen-2",
+    "--assignment-generation", worker2["assignment_generation"], "--file", str(message_file),
+).stdout)
+assert exempt["blob_name"] == "session/in/{}.json".format(digest), exempt
+outdir2 = tmp / "collected-2"
+outdir2.mkdir()
+collect_exempt = json.loads(run(
+    "message-collect", "--task", "task-2", "--task-generation", "gen-2",
+    "--assignment-generation", worker2["assignment_generation"], "--output-dir", str(outdir2),
+).stdout)
+assert collect_exempt == {"fetched": [], "skipped": []}, collect_exempt
+message_calls = [entry for entry in fixture_state()["calls"] if entry["type"] == "message-put"]
+assert any(entry["slot"] == item2["slot"] for entry in message_calls), message_calls
+
+# Positive control: a compute-mutating action with the same task shape (a
+# fresh argv, so a fresh idempotency key rather than a replay of the wedged
+# one) still refuses against the outstanding claim, and the claim survived
+# the message traffic untouched.
+control = execute_two("/usr/bin/true")
+assert control.returncode != 0 and "still has an unapplied execute action" in control.stderr, control.stderr
+assert controller_json.read_bytes() == claimed_bytes, "message ops disturbed the durable claim"
+
+# Refusal shapes: unknown or unassigned task, wrong generation, and a
+# malformed flag pair all refuse before any provider call.
+missing = run("message-put", "--task", "task-9", "--task-generation", "gen-9",
+              "--assignment-generation", "asg-00000009", "--file", str(message_file), check=False)
+assert missing.returncode != 0 and "requires one exact assigned task generation" in missing.stderr, missing.stderr
+wrong_generation = run("message-put", "--task", "task-1", "--task-generation", "gen-1",
+                       "--assignment-generation", "asg-99999999", "--file", str(message_file), check=False)
+assert wrong_generation.returncode != 0 and "assignment generation is not exact" in wrong_generation.stderr
+both = run("message-put", "--task", "task-1", "--task-generation", "gen-1",
+           "--assignment-generation", worker1["assignment_generation"],
+           "--file", str(message_file), "--attach", str(attach_file), check=False)
+assert both.returncode != 0 and "exactly one of --file or --attach" in both.stderr, both.stderr
+neither = run("message-put", "--task", "task-1", "--task-generation", "gen-1",
+              "--assignment-generation", worker1["assignment_generation"], check=False)
+assert neither.returncode != 0 and "exactly one of --file or --attach" in neither.stderr, neither.stderr
+PY
+  pass "message-put succeeds across an outstanding execute claim; the compute path still refuses"
+}
+
+message_lane_static_contract() {
+  python3 - "$CONTROLLER" "$AZURE" "$DOC" "$WRAPPER" <<'PY' || fail "message lane static contract failed"
+import ast
+import re
+import sys
+from pathlib import Path
+
+controller_src = Path(sys.argv[1]).read_text(encoding="utf-8")
+azure_src = Path(sys.argv[2]).read_text(encoding="utf-8")
+doc = Path(sys.argv[3]).read_text(encoding="utf-8")
+wrapper = Path(sys.argv[4]).read_text(encoding="utf-8")
+
+def node_of(source, name):
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError("function {} is absent".format(name))
+
+def segment(source, name):
+    return ast.get_source_segment(source, node_of(source, name))
+
+# D.3 static contract: the provider's inventory reads exactly the three NAMED
+# per-slot blob records (reservation.json, request.json, result.json) through
+# blob_record's exact-name show, and never lists container contents. A future
+# contents-sweep edit inside inventory goes red here.
+inventory = segment(azure_src, "inventory")
+assert inventory.count("blob_record(") == 3, inventory.count("blob_record(")
+assert '"reservation.json"' in inventory
+assert '"request.json"' in inventory
+assert '"result.json"' in inventory
+assert '"storage", "blob", "list"' not in inventory
+assert '"blob", "list"' not in inventory
+assert "list_blobs" not in inventory
+blob_record_src = segment(azure_src, "blob_record")
+assert '"storage", "blob", "show"' in blob_record_src
+assert '"list"' not in blob_record_src
+
+# The carve is dispatched like inventory and never through the mutate path:
+# main routes the message verbs raw while mutate alone keeps the landed-code
+# gate, and mutate's action-type allowlist cannot reach the message ops.
+main_src = segment(azure_src, "main")
+assert '"message-put"' in main_src and '"message-collect"' in main_src
+assert "require_landed_code()" in main_src
+mutate_src = segment(azure_src, "mutate")
+assert "message" not in mutate_src
+for op_name, lane_marker in (("message_put", "session/in/"), ("message_collect", "session/out/")):
+    op_node = node_of(azure_src, op_name)
+    docstring = ast.get_docstring(op_node) or ""
+    assert "CLAIM-EXEMPT" in docstring, op_name
+    assert lane_marker in docstring, op_name
+    assert "require_session_blob_name" in segment(azure_src, op_name), op_name
+collect_doc = ast.get_docstring(node_of(azure_src, "message_collect")) or ""
+assert "never deletes or overwrites" in collect_doc
+guard_doc = ast.get_docstring(node_of(azure_src, "require_session_blob_name")) or ""
+assert "session/" in guard_doc and "ENFORCED" in guard_doc
+
+# Controller side of the carve: the message commands never touch the claim
+# machinery or the durable document, and the generic mutate verb still
+# refuses outside provider_mutate.
+for name in ("message_lane_worker", "command_message_put", "command_message_collect"):
+    source = segment(controller_src, name)
+    # Call tokens, not bare names: the carve comment inside the command is
+    # allowed to NAME the machinery it stays out of; invoking it is what
+    # must go red.
+    for banned in ("make_action(", "claim_pending(", "apply_pending(", "provider_mutate(",
+                   "slot_lease(", "save_state(", '"mutate"'):
+        assert banned not in source, (name, banned)
+assert 'provider_call(env, "message-put"' in segment(controller_src, "command_message_put")
+assert 'provider_call(env, "message-collect"' in segment(controller_src, "command_message_collect")
+assert "provider mutations go through provider_mutate with a slot lease" in segment(controller_src, "provider_call")
+action_types = re.search(r"ACTION_TYPES = frozenset\(\{(.*?)\}\)", controller_src, re.S)
+assert action_types and "message" not in action_types.group(1), "message ops leaked into the claim contract"
+
+# The two size constants stay in step across controller and provider, like
+# MAX_OUTCOME_BYTES does with the supervisor.
+controller_bound = re.search(r"^MESSAGE_ATTACH_MAX_BYTES = (.+)$", controller_src, re.M)
+provider_bound = re.search(r"^MESSAGE_ATTACH_MAX_BYTES = (.+)$", azure_src, re.M)
+assert controller_bound and provider_bound and controller_bound.group(1) == provider_bound.group(1)
+assert re.search(r"^MESSAGE_JSON_MAX_BYTES = 256 \* 1024$", azure_src, re.M)
+
+# The doc names the carve, verbatim, next to the claim contract.
+carve = (
+    "The compartment message lane (`message-put`/`message-collect`) is the one provider "
+    "operation family outside the per-slot claim contract: bounded, content-addressed, "
+    "idempotent data-plane blob transfers that touch no compute, no money, and no lifecycle "
+    "state; every compute-mutating action keeps the full claim/lease/fence discipline."
+)
+lines = doc.splitlines()
+carve_index = next(index for index, line in enumerate(lines) if line == carve)
+claim_index = next(index for index, line in enumerate(lines) if "pending_actions" in line and "idempotency key" in line)
+assert abs(carve_index - claim_index) <= 4, (carve_index, claim_index)
+
+# The wrapper dispatches both verbs through the gated lane.
+assert "|message-put|message-collect)" in wrapper
+PY
+  pass "inventory stays three named blob reads; the carve is pinned in code, doc, and wrapper"
+}
+
 static_contract
 classification_and_admission_matrix
 azure_provider_refusal_matrix
@@ -3673,5 +4248,8 @@ state_fence_and_revision_cas
 concurrent_mutations_do_not_serialize
 wedged_slot_does_not_stop_the_fleet
 secondmate_role_bounds
+message_lane_provider_contract
+message_lane_claim_exemption
+message_lane_static_contract
 
 echo "# fm-worker-lifecycle.test.sh: all assertions passed"

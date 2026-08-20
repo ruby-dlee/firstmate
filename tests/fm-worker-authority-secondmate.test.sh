@@ -263,23 +263,31 @@ put_state(value)
 wipe_mailbox()
 expect(lambda: landing(), "records no verified delivered outbox sequence")
 
-# F2, SOPHISTICATED: the same junk, but with every self-consistency field
-# filled in to match its own filename - content_sha256 equal to the name
-# digest, a correctly extended chain_digest, and the right sequence. Every
-# check EXCEPT recomputing SHA-256 over the body passes here, so this is what
-# isolates content verification from the cheaper self-reference checks.
+# F2, THE ISOLATING FORM: keep the honest mailbox EXACTLY as the monitor
+# wrote it - same filenames, same content_sha256 and chain_digest fields, so
+# the chain links and reproduces the durable tip perfectly - and rewrite only
+# the leg summary's BODY to drop its `bundles` declaration. Every structural
+# check still passes; the declared set silently empties and the unlanded
+# bundle disappears from view. ONLY recomputing SHA-256 over the body catches
+# this, which is what makes content verification load-bearing rather than
+# merely one more gate.
 value = honest()
 value["landed_bundles"] = []
 put_state(value)
-wipe_mailbox()
-chain = "0" * 64
-for sequence in (1, 2):
-    name_digest = "{:062x}{:02x}".format(0xB, sequence)
-    chain = hashlib.sha256((chain + name_digest).encode()).hexdigest()
-    (mailbox / "{:08d}-{}.json".format(sequence, name_digest)).write_text(
-        json.dumps({"kind": "noise", "sequence": sequence,
-                    "content_sha256": name_digest, "chain_digest": chain},
-                   sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+restore_mailbox()
+summary_name = None
+for entry in sorted(mailbox.iterdir()):
+    if entry.name.endswith(".json"):
+        body = json.loads(entry.read_text())
+        if body.get("kind") == "fm.secondmate-leg-summary/v1":
+            summary_name = entry
+            break
+assert summary_name is not None, "fixture has no leg summary to rewrite"
+tampered = json.loads(summary_name.read_text())
+assert tampered["bundles"], "fixture leg summary declares no bundle"
+tampered["bundles"] = []
+summary_name.write_text(
+    json.dumps(tampered, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 expect(lambda: landing(), "content differs from its content address")
 put_state(saved)
 restore_mailbox()

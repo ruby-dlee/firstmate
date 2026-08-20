@@ -284,6 +284,10 @@ def load_state(path):
             "landed_bundles": [],
             "kept_bundles": [],
             "last_summary": None,
+            "verified_tip": None,
+            "recorded_chain_tip": None,
+            "chain_tip_error": None,
+            "chain_tip_closed": None,
         }
     try:
         state = json.loads(path.read_text(encoding="utf-8"))

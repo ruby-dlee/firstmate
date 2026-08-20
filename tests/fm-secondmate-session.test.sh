@@ -16,7 +16,7 @@ RUNNER="$ROOT/bin/fm-secondmate-session.py"
 EXTENSION="$ROOT/bin/fm-secondmate-spawn.pi-ext.ts"
 
 # Globals set by fixture(): TMP BLOB STATE_DIR REPO ORIGIN BASE FAKE_PI TURN_LOG
-TMP= BLOB= STATE_DIR= REPO= ORIGIN= BASE= FAKE_PI= TURN_LOG=
+TMP='' BLOB='' STATE_DIR='' REPO='' ORIGIN='' BASE='' FAKE_PI='' TURN_LOG=''
 
 fixture() {
   fm_test_tmproot_into TMP fm-secondmate-session

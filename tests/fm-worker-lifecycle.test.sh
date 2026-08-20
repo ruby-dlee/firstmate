@@ -3737,7 +3737,6 @@ compartment_fixture_env() {  # <tmproot-label> -> sets COMPARTMENT_ENVFILE/COMPA
   # Shared stand-up for the PR-6 compartment units: fixture provider, envfile.
   local tmp
   fm_test_tmproot_into tmp "$1"
-  COMPARTMENT_TMP=$tmp
   COMPARTMENT_FIXTURE="$tmp/provider-state.json"
   mkdir -p "$tmp/home"
   write_fixture_provider "$tmp/provider.py"

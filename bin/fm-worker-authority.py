@@ -195,43 +195,85 @@ def secondmate_monitor_state(home, task):
 
 def secondmate_bundle_ledger(home, task):
     """Declared and collected outbox bundles against the monitor's durable
-    landed record. Enumeration is deliberately conservative and one-sided:
-    chain verification stays with the monitor (the chain authority); this
-    reads every collected leg summary for its bundle declarations and every
-    collected bundle file by name, so a declared-but-never-landed bundle can
-    only ever ADD to what must be proven landed, never subtract."""
+    landed record.
+
+    Enumeration alone is NOT sufficient evidence, and the earlier version of
+    this function wrongly assumed it was: declared/collected are derived by
+    scanning the collected mailbox, so wiping or emptying that directory made
+    both sets empty and "every bundle landed, or provably none" proved with an
+    empty landed record. The mailbox is local, mutable, and at release time
+    unowned - the monitor is dead by construction, since the endpoint receipt
+    proves its pane absent - which makes THIS the last reader, not a
+    second opinion.
+
+    So the durable monitor state is treated as the authority on how much the
+    chain must contain, exactly as the monitor itself treats it: the mailbox
+    may never hold fewer message entries than the monitor durably recorded as
+    delivered (or than its verified tip's sequence), and a monitor that
+    delivered anything at all must still have its mailbox. That is the same
+    rewound-outbox rule the monitor applies before it delivers anything.
+
+    Within that bound, enumeration stays deliberately one-sided: chain
+    verification remains the monitor's job, and reading both leg-summary
+    declarations and collected bundle files by name means an unenumerated
+    bundle can only ADD to what must be proven landed, never subtract."""
     mailbox = home / "state" / (task + ".cloud-mailbox")
-    if (mailbox / ".chain-break").exists():
+    # lexists, not exists: a DANGLING symlink named .chain-break is still a
+    # marker in the mailbox, and exists() follows it into nothing, which
+    # silently bypassed the freeze a real marker triggers.
+    if os.path.lexists(str(mailbox / ".chain-break")):
         raise AuthorityError(
             "secondmate landing authority is frozen by a recorded outbox chain break")
     state = secondmate_monitor_state(home, task)
     landed = {entry for entry in state.get("landed_bundles") or [] if isinstance(entry, str)}
     kept = sorted(entry for entry in state.get("kept_bundles") or [] if isinstance(entry, str))
+    delivered = state.get("delivered_sequence")
+    if isinstance(delivered, bool) or not isinstance(delivered, int) or delivered < 0:
+        delivered = 0
+    tip = state.get("verified_tip")
+    tip_sequence = tip.get("sequence") if isinstance(tip, dict) else None
+    if isinstance(tip_sequence, bool) or not isinstance(tip_sequence, int) or tip_sequence < 0:
+        tip_sequence = 0
+    required = max(delivered, tip_sequence)
     declared = set()
     collected = set()
-    if mailbox.is_dir():
-        for entry in sorted(mailbox.iterdir()):
-            if entry.is_symlink() or not entry.is_file():
-                continue
-            bundle = SECONDMATE_BUNDLE_NAME.fullmatch(entry.name)
-            if bundle:
-                collected.add(bundle.group(1))
-                continue
-            if not SECONDMATE_MESSAGE_NAME.fullmatch(entry.name):
-                continue
-            if entry.stat().st_size > SECONDMATE_MAX_MESSAGE_BYTES:
-                raise AuthorityError(
-                    "secondmate landing authority found an oversized outbox entry: {}".format(entry.name))
-            try:
-                message = json.loads(entry.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                raise AuthorityError(
-                    "secondmate landing authority cannot read outbox entry {}".format(entry.name))
-            if not isinstance(message, dict) or message.get("kind") != SECONDMATE_LEG_SUMMARY_KIND:
-                continue
-            for declaration in message.get("bundles") or []:
-                if isinstance(declaration, dict) and isinstance(declaration.get("sha256"), str):
-                    declared.add(declaration["sha256"])
+    messages = 0
+    # A symlinked mailbox is not the monitor's mailbox: is_dir() follows the
+    # link, so a link to an empty directory read as a legitimately empty chain.
+    if mailbox.is_symlink() or not mailbox.is_dir():
+        if required:
+            raise AuthorityError(
+                "secondmate landing authority: the durable monitor state delivered {} outbox "
+                "entries but its mailbox is absent or redirected".format(required))
+        return state, landed, kept, declared, collected
+    for entry in sorted(mailbox.iterdir()):
+        if entry.is_symlink() or not entry.is_file():
+            continue
+        bundle = SECONDMATE_BUNDLE_NAME.fullmatch(entry.name)
+        if bundle:
+            collected.add(bundle.group(1))
+            continue
+        if not SECONDMATE_MESSAGE_NAME.fullmatch(entry.name):
+            continue
+        messages += 1
+        if entry.stat().st_size > SECONDMATE_MAX_MESSAGE_BYTES:
+            raise AuthorityError(
+                "secondmate landing authority found an oversized outbox entry: {}".format(entry.name))
+        try:
+            message = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise AuthorityError(
+                "secondmate landing authority cannot read outbox entry {}".format(entry.name))
+        if not isinstance(message, dict) or message.get("kind") != SECONDMATE_LEG_SUMMARY_KIND:
+            continue
+        for declaration in message.get("bundles") or []:
+            if isinstance(declaration, dict) and isinstance(declaration.get("sha256"), str):
+                declared.add(declaration["sha256"])
+    if messages < required:
+        raise AuthorityError(
+            "secondmate landing authority: the collected mailbox holds {} outbox entries but the "
+            "durable monitor state records {} (a rewound or truncated outbox)".format(
+                messages, required))
     return state, landed, kept, declared, collected
 
 
@@ -263,10 +305,19 @@ def secondmate_report_evidence(home, task):
     return "{}\0{}\0{}\0".format(terminal, ack, legs).encode() + content
 
 
-def secondmate_landing_evidence(home, task):
+def secondmate_landing_evidence(home, task, worktree, repository_generation):
     """Every chained outbox bundle landed into the local home worktree, or
-    provably none: the durable monitor state exists, keeps nothing, and every
-    declared or collected bundle digest appears in its landed record."""
+    provably none: the durable monitor state exists, keeps nothing, every
+    declared or collected bundle digest appears in its landed record, and the
+    home worktree's head descends from the assignment's exact starting
+    repository generation.
+
+    That last clause is the same lineage tether the ordinary lane applies
+    (landing_evidence): without it the compartment receipt was bound only to
+    LOCAL files, so a home whose head belongs to an entirely unrelated
+    lineage still minted a landing proof. The controller owns
+    repository_generation in the worker record, so it cannot be edited from
+    the task metadata the way `kind` can."""
     state, landed, kept, declared, collected = secondmate_bundle_ledger(home, task)
     if kept:
         raise AuthorityError(
@@ -275,26 +326,41 @@ def secondmate_landing_evidence(home, task):
     if unlanded:
         raise AuthorityError(
             "secondmate landing authority found unlanded outbox bundles: {}".format(",".join(unlanded)))
+    head = git(worktree, "rev-parse", "HEAD")
+    lineage = subprocess.run(
+        ["git", "-C", str(worktree), "merge-base", "--is-ancestor", repository_generation, head]
+    )
+    if lineage.returncode != 0:
+        raise AuthorityError(
+            "secondmate landing authority home head does not descend from the assignment "
+            "repository generation")
     return canonical({
         "delivered_sequence": state.get("delivered_sequence"),
         "declared": sorted(declared),
         "landed": sorted(landed),
+        "head": head,
+        "repository_generation": repository_generation,
     })
 
 
 def secondmate_worktree_evidence(home, task, values):
-    """Home quiesced: the exact secondmate home worktree root with no tracked
-    modifications and no unlanded outbox bundles. Untracked files are the
-    home's ordinary runtime state, so cleanliness is tracked-files-only here
-    (the same clause the monitor's own landing gate uses). Children are
-    deliberately NOT consulted: command_release refuses live children under
-    the controller lock, so this receipt stays advisory for them."""
+    """Home quiesced: the exact secondmate home worktree root with nothing
+    left in it - no tracked modifications, no untracked never-added work, and
+    no unlanded outbox bundles.
+
+    Untracked files count, exactly as they do in the ordinary lane: a release
+    receipt answers "is anything left here", not the monitor's narrower "can I
+    fast-forward into this", and the repo's own .gitignore already excludes
+    the home's runtime state (/state/, /data/, /projects/), which
+    --untracked-files=all never lists anyway. Children are deliberately NOT
+    consulted: command_release refuses live children under the controller
+    lock, so this receipt stays advisory for them."""
     worktree = Path(exactly(values, "worktree")).resolve()
     if worktree.is_symlink() or not worktree.is_dir() or Path(git(worktree, "rev-parse", "--show-toplevel")).resolve() != worktree:
         raise AuthorityError("secondmate home worktree authority is not the exact repository root")
-    if git(worktree, "status", "--porcelain=v1", "--untracked-files=no"):
+    if git(worktree, "status", "--porcelain=v1", "--untracked-files=all"):
         raise AuthorityError(
-            "secondmate home worktree authority is not quiesced: tracked modifications remain")
+            "secondmate home worktree authority is not quiesced: uncommitted or untracked work remains")
     _state, landed, kept, declared, collected = secondmate_bundle_ledger(home, task)
     if kept or (declared | collected) - landed:
         raise AuthorityError(
@@ -369,14 +435,33 @@ def main():
     kind_entries = values.get("kind", [])
     if len(kind_entries) > 1:
         raise AuthorityError("task metadata kind identity is not exact")
-    if kind_entries == ["secondmate"]:
+    # WHICH evidence semantics apply is a release-safety decision, so it may
+    # not rest on the task metadata alone: `kind` is a local, operator-writable
+    # line, while `role` is minted by the controller into the worker record and
+    # travels here inside the same durable document the bindings come from.
+    # Flipping one meta line must never move an ordinary author worker onto the
+    # compartment lane, where the ordinary landing proof (commits reachable
+    # from origin) is replaced by compartment evidence and unlanded work can be
+    # released. Both directions refuse, fail closed, before any evidence runs.
+    meta_kind = kind_entries[0] if kind_entries else ""
+    worker_role = worker.get("role", "author")
+    if meta_kind == "secondmate" and worker_role != "secondmate":
+        raise AuthorityError(
+            "task metadata claims a secondmate compartment but the controller-owned worker "
+            "role is {!r}; compartment evidence is refused".format(worker_role))
+    if worker_role == "secondmate" and meta_kind != "secondmate":
+        raise AuthorityError(
+            "the controller-owned worker role is secondmate but the task metadata kind is "
+            "{!r}; ordinary evidence is refused for a compartment".format(meta_kind))
+    if worker_role == "secondmate":
         # The secondmate compartment evidence mode (design B.7): same bundle,
         # same five receipt names, compartment semantics. The bundle still
         # verifies through the lifecycle's UNMODIFIED release_receipt and
         # verify_release_against_worker.
-        worktree_info, _worktree = secondmate_worktree_evidence(home, args.task, values)
+        worktree_info, home_worktree = secondmate_worktree_evidence(home, args.task, values)
         report_authority = lambda: secondmate_report_evidence(home, args.task)
-        landing_authority = lambda: secondmate_landing_evidence(home, args.task)
+        landing_authority = lambda: secondmate_landing_evidence(
+            home, args.task, home_worktree, worker["bindings"]["repository_generation"])
     else:
         worktree_info, worktree = worktree_evidence(args.task, values)
         report_authority = lambda: report_evidence(home, args.task)

@@ -3471,8 +3471,14 @@ def command_surrender(env, args):
             "power_state": power,
             "last_execution_digest": worker.get("last_execution_digest"),
             "discarded_unlanded_executions": produced,
-            "orphaned_children": len(live_children),
         }
+        if live_children:
+            # Scoped deliberately: an ordinary childless surrender must mint
+            # BYTE-IDENTICAL receipts to before this change, and every receipt's
+            # evidence_digest is taken over this block, so an unconditional
+            # "orphaned_children": 0 would move all five digests on a lane that
+            # never orphaned anything.
+            surrender["orphaned_children"] = len(live_children)
         proof = {
             "schema": RELEASE_SCHEMA,
             "home_binding": worker["bindings"]["home_binding"],

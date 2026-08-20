@@ -58,17 +58,26 @@ one place that validates them and spends anything.
     loudly, as a duplicate (durable dedupe, the delivered-refusal ack rule).
     An invalid request therefore never reaches command_request at all.
   - A valid request spawns through the EXISTING lane and nothing else:
-    FM_HOME=<the secondmate home> bin/fm-spawn.sh <child> <project>
-    --harness pi, with --parent-task/--parent-task-generation forwarded into
-    the lifecycle request so compartment children cannot dodge the bounds
-    (AMENDMENT 1). FM_AZURE_WORKER_STATE_DIR is pinned to the LOCAL
-    controller directory: the money authority stays the one document even
-    though FM_HOME moves to the secondmate home. Nothing about home, account,
-    worktree, harness, SKU, project, or repository comes from the cloud side -
-    the project is local policy (FM_SECONDMATE_CHILD_PROJECT, else the home's
-    single project), and the harness is the cloud lane's only runtime. The
-    child's backlog row is filed first, because fm-spawn refuses a new
-    ship/scout task that has none.
+    bin/fm-spawn.sh <child> <project> --harness pi, with
+    --parent-task/--parent-task-generation forwarded into the lifecycle
+    request so compartment children cannot dodge the bounds (AMENDMENT 1).
+    FM_HOME is left exactly as this monitor received it, which is the
+    controller's own home, so the money document needs no pin and none is set
+    (see spawn_environment for why a pin here would be a durable trap and why
+    moving FM_HOME aims at a second money document). Nothing about home,
+    account, worktree, harness, SKU, project, or repository comes from the
+    cloud side - the project is local policy (FM_SECONDMATE_CHILD_PROJECT,
+    else that home's single project), and the harness is the cloud lane's only
+    runtime. The child's backlog row is filed first, because fm-spawn refuses
+    a new ship/scout task that has none.
+  - NOT YET POSSIBLE, and refused loudly: fm-spawn derives owner_kind from its
+    own home marker, so a request minted from the controller's home is
+    primary-owned and verify_request refuses a primary-owned request that
+    carries a parent pair. The controller itself is ready - `--owner-kind` is
+    an ordinary argv flag and a secondmate-owned request with the pair is
+    admitted under all four bounds - so the missing pieces are an assertable
+    owner_kind on the spawn side and an authorized task-home parameter on
+    authoritative_request_bindings.
   - ACCEPTANCE IS PROVEN BY THE QUEUE. A zero exit from fm-spawn is evidence
     the script ran, never that the controller admitted a bounded child, so a
     served request is confirmed by reading the one controller document back
@@ -687,6 +696,8 @@ class Relay:
         self.childreq = Path(args.childreq)
         self.childreq.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.inbox = Path(args.inbox)
+        # TWO HOMES, deliberately separate (see spawn_environment):
+        self.spawn_home = Path(args.spawn_home)
         self.home = Path(args.home) if args.home else None
         self.controller = Path(args.controller)
         self.spawn_bin = args.spawn_bin
@@ -862,9 +873,9 @@ class Relay:
         is expressible from the cloud side, so this is decided here from the
         secondmate home alone.
         """
-        if self.home is None or not self.home.is_dir():
-            return "", "child spawn refused: the secondmate home is unavailable locally"
-        projects = self.home / "projects"
+        if not self.spawn_home.is_dir():
+            return "", "child spawn refused: the requesting home is unavailable locally"
+        projects = self.spawn_home / "projects"
         chosen = os.environ.get("FM_SECONDMATE_CHILD_PROJECT", "")
         if chosen:
             if "/" in chosen or chosen in ("", ".", ".."):
@@ -891,7 +902,7 @@ class Relay:
         when the tasks-axi backend is unavailable. Returns "" or a failed
         check.
         """
-        data = self.home / "data"
+        data = self.spawn_home / "data"
         backlog = data / "backlog.md"
         summary = ""
         for line in brief.splitlines():
@@ -964,33 +975,54 @@ class Relay:
         return False
 
     def spawn_environment(self):
+        """The child spawn's environment: this home, no pins, no overrides.
+
+        WHAT ACTUALLY BLOCKS A COMPARTMENT CHILD, stated correctly (an earlier
+        revision of this comment blamed verify_state's home fence, which is
+        wrong and pointed at the one guard here that must NOT be weakened):
+
+        The controller already admits a compartment child. `--owner-kind` is a
+        plain argv flag on `request`; the controller never inspects FM_HOME to
+        decide it. A request minted with FM_HOME set to the controller's own
+        home and `--owner-kind secondmate` plus the parent pair is admitted
+        with all four B.1 bounds enforced and children_total incremented.
+
+        The pinch point is that FM_HOME does three separable jobs at once:
+        (1) where the requesting task's local authorities live, because
+        authoritative_request_bindings reads `env["home"]/state/<task>.meta`
+        (bin/fm-worker-lifecycle.py:2446); (2) the identity stamped into the
+        request's home_binding; and (3) the identity of the money document.
+        Jobs 1 and 2 belong to the requester, job 3 belongs to the controller,
+        and the compartment child is the first case where they differ. The
+        missing capability is an authorized task-home parameter on
+        authoritative_request_bindings, plus a way for fm-spawn to assert
+        owner_kind rather than derive it from its own home marker
+        (bin/fm-spawn.sh:4429).
+
+        So this method deliberately does NOTHING clever: it leaves FM_HOME as
+        the monitor's own home, which is the controller's home, so the default
+        worker state directory is already the right one. Two earlier ideas are
+        rejected on evidence:
+          - Pinning FM_AZURE_WORKER_STATE_DIR is a DURABLE TRAP, not a
+            one-shot: that name is inside SPAWN_CLOUD_ENV_ALLOWLIST
+            (bin/fm-spawn.sh:4332), so it is persisted into the child's
+            <id>.cloud-env and would permanently pair a foreign FM_HOME with
+            this state dir for every later execute and release.
+          - Moving FM_HOME to the secondmate home aims the request at a SECOND
+            money document (the one the documented local-secondmate lane
+            already creates) and refuses at parent liveness, which is both the
+            outcome the design forbids and a refusal that names the wrong
+            cause.
+        With neither, the lane refuses early and honestly at verify_request,
+        naming owner_kind: the exact capability that is missing.
+        """
         env = dict(os.environ)
-        # FM_HOME moves to the secondmate home so fm-spawn derives
-        # owner_kind=secondmate from its marker; the state override and the
-        # compartment's own leg configuration must NOT travel with it.
-        env["FM_HOME"] = str(self.home)
+        # The compartment's own leg configuration and any state override must
+        # not travel into an ordinary crewmate spawn.
         env.pop("FM_STATE_OVERRIDE", None)
         for key in list(env):
             if key.startswith("FM_SECONDMATE_"):
                 env.pop(key, None)
-        # The ONE money authority: the local controller document, whichever
-        # home the spawn runs under.
-        #
-        # KNOWN OPEN COLLISION, proven by the real-spawn unit and NOT fixable
-        # in this file: verify_request needs a compartment child to be a
-        # secondmate-owned author request (so FM_HOME must be the secondmate
-        # home), enforce_child_bounds needs the parent compartment's entry in
-        # THIS document (the primary's, since the primary spawned the
-        # compartment), and verify_state binds the document to the home that
-        # created it. All three cannot hold at once, so the request refuses
-        # with "lifecycle state home_binding binding is not exact" and no
-        # compartment child can be admitted until the controller contract is
-        # resolved in bin/fm-worker-lifecycle.py. Pointing this at the
-        # secondmate home's own controller instead would make the document
-        # load and then fail the parent-liveness bound - two money documents
-        # is the outcome the design forbids - so the pin stays and the
-        # refusal stays loud.
-        env["FM_AZURE_WORKER_STATE_DIR"] = str(self.controller.parent)
         env["FM_SPAWN_CLOUD"] = "azure"
         env["FM_SPAWN_PARENT_TASK"] = self.task
         env["FM_SPAWN_PARENT_TASK_GENERATION"] = self.generation
@@ -1002,7 +1034,7 @@ class Relay:
             self.refuse(digest, landed, failed)
             return
         child_task = "{}-c{}".format(self.task, digest[:8])
-        brief = self.home / "data" / child_task / "brief.md"
+        brief = self.spawn_home / "data" / child_task / "brief.md"
         try:
             write_atomic(brief, message["brief"].encode("utf-8"))
         except OSError as exc:
@@ -1028,7 +1060,7 @@ class Relay:
                 argv += [flag, message[key]]
         try:
             completed = subprocess.run(
-                argv, env=self.spawn_environment(), cwd=str(self.home),
+                argv, env=self.spawn_environment(), cwd=str(self.spawn_home),
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 timeout=SPAWN_TIMEOUT, check=False,
             )
@@ -1136,9 +1168,7 @@ class Relay:
         the work succeeded, so the split comes from the result the child's own
         lane wrote; absent, the honest answer says so rather than guessing.
         """
-        if self.home is None:
-            return "complete (no recorded execution result)"
-        path = self.home / "state" / "{}.worker-result.json".format(child_task)
+        path = self.spawn_home / "state" / "{}.worker-result.json".format(child_task)
         try:
             result = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1389,7 +1419,14 @@ def main(argv=None):
     relay.add_argument("--assignment-generation", required=True)
     relay.add_argument("--childreq", required=True)
     relay.add_argument("--inbox", required=True)
-    relay.add_argument("--home", required=True, help="the compartment's local secondmate home")
+    relay.add_argument(
+        "--spawn-home", required=True,
+        help="the home the child spawn runs under, which is the controller's own home",
+    )
+    relay.add_argument(
+        "--home", required=True,
+        help="the compartment's local secondmate home (delta bundles only)",
+    )
     relay.add_argument("--controller", required=True, help="the ONE money authority document")
     relay.add_argument("--spawn-bin", required=True)
     relay.add_argument("--lifecycle-bin", required=True)

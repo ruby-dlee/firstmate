@@ -391,7 +391,8 @@ child_relay() {  # <assignment>
     python3 "$HELPER" child-relay \
       --task "$ID" --task-generation "$GENERATION" \
       --assignment-generation "$assignment" \
-      --childreq "$CHILDREQ" --inbox "$INBOX" --home "$worktree" \
+      --childreq "$CHILDREQ" --inbox "$INBOX" \
+      --spawn-home "$FM_HOME" --home "$worktree" \
       --controller "$CONTROLLER" \
       --spawn-bin "$SPAWN" --lifecycle-bin "$LIFECYCLE"
   ) || echo "warning: secondmate $ID: the child relay pass refused (see above)"

@@ -145,7 +145,7 @@ LOG=${FM_FIXTURE_SPAWN_LOG:?}
   printf '\n'
   printf 'env\x1fFM_HOME=%s\x1fFM_SPAWN_PARENT_TASK=%s\x1fFM_SPAWN_PARENT_TASK_GENERATION=%s\x1fFM_SPAWN_CLOUD=%s\x1fFM_AZURE_WORKER_STATE_DIR=%s\x1fFM_STATE_OVERRIDE=%s\x1fFM_SECONDMATE_LEG_SECONDS=%s\n' \
     "${FM_HOME:-}" "${FM_SPAWN_PARENT_TASK:-}" "${FM_SPAWN_PARENT_TASK_GENERATION:-}" \
-    "${FM_SPAWN_CLOUD:-}" "${FM_AZURE_WORKER_STATE_DIR:-}" \
+    "${FM_SPAWN_CLOUD:-}" "${FM_AZURE_WORKER_STATE_DIR:-<unset>}" \
     "${FM_STATE_OVERRIDE:-<unset>}" "${FM_SECONDMATE_LEG_SECONDS:-<unset>}"
 } >> "$LOG"
 if [ -n "${FM_FIXTURE_SPAWN_REFUSAL:-}" ]; then
@@ -215,9 +215,12 @@ make_world() {
   git clone --quiet "$ORIGIN" "$GUEST_REPO"
   BASE=$(git -C "$LANDING" rev-parse HEAD)
   printf '%s\n' "$LANDING" > "$STATE_DIR/$ID.cloud-worktree"
-  # The compartment's local secondmate home IS the recorded worktree, and its
-  # single project is the child relay's local project policy.
-  mkdir -p "$LANDING/projects/alpha" "$LANDING/data"
+  # The compartment's local secondmate home IS the recorded worktree; its only
+  # job in the relay is the delta bundle. The CHILD's local authorities (brief,
+  # backlog row, project) live in the home the spawn runs under, which is this
+  # monitor's own home, because that is the controller's home and the relay
+  # deliberately does not move FM_HOME.
+  mkdir -p "$LANDING/data" "$HOME_DIR/projects/alpha" "$HOME_DIR/data"
   # Persisted compartment environment: identities and durable leg config,
   # exactly what the gated spawn writes. Small legs keep the suite fast.
   {
@@ -655,7 +658,8 @@ run_relay() {
     python3 "$ROOT/bin/fm-secondmate-cloud-monitor.py" child-relay \
     --task "$ID" --task-generation "$GEN" \
     --assignment-generation "${1:-$ASSIGNMENT}" \
-    --childreq "$CHILDREQ" --inbox "$INBOX_DIR" --home "$LANDING" \
+    --childreq "$CHILDREQ" --inbox "$INBOX_DIR" \
+    --spawn-home "$HOME_DIR" --home "$LANDING" \
     --controller "$STATE_DIR/azure-workers/controller.json" \
     --spawn-bin "$SPAWN_FIXTURE" --lifecycle-bin "$LIFECYCLE_FIXTURE"
 }
@@ -847,23 +851,27 @@ PY
   [ -n "$self_digest" ] || fail "the real runner landed no child request"
   child="$ID-c${self_digest:0:8}"
   argv=$(sed -n 1p "$SP_LOG")
-  [ "$argv" = "$(printf '%s\x1f%s\x1f--harness\x1fpi\x1f--model\x1fgpt-5\x1f--effort\x1fhigh' "$child" "$LANDING/projects/alpha")" ] \
+  [ "$argv" = "$(printf '%s\x1f%s\x1f--harness\x1fpi\x1f--model\x1fgpt-5\x1f--effort\x1fhigh' "$child" "$HOME_DIR/projects/alpha")" ] \
     || fail "the child spawn argv is not the exact ship shape: $(printf '%s' "$argv" | tr '\037' '|')"
   env_line=$(sed -n 2p "$SP_LOG")
-  assert_contains "$env_line" "FM_HOME=$LANDING" "the child spawn did not run as the secondmate home"
+  assert_contains "$env_line" "FM_HOME=$HOME_DIR" \
+    "the child spawn moved FM_HOME; it must stay the controller's own home"
   assert_contains "$env_line" "FM_SPAWN_PARENT_TASK=$ID" "the child spawn lost the parent task"
   assert_contains "$env_line" "FM_SPAWN_PARENT_TASK_GENERATION=$GEN" "the child spawn lost the parent generation"
   assert_contains "$env_line" "FM_SPAWN_CLOUD=azure" "the child spawn was not placed on the cloud lane"
-  assert_contains "$env_line" "FM_AZURE_WORKER_STATE_DIR=$STATE_DIR/azure-workers" \
-    "the child spawn did not pin the ONE controller as its money authority"
+  # NO state-dir pin: that name is persisted into the child's durable cloud
+  # environment, so a pin would outlive this spawn and misdirect every later
+  # execute and release. With FM_HOME unmoved the default is already right.
+  assert_contains "$env_line" "FM_AZURE_WORKER_STATE_DIR=<unset>" \
+    "the child spawn pinned a worker state dir, which is persisted and becomes a durable trap"
   assert_contains "$env_line" "FM_STATE_OVERRIDE=<unset>" \
     "the compartment's own state override leaked into the child spawn"
   assert_contains "$env_line" "FM_SECONDMATE_LEG_SECONDS=<unset>" \
     "the compartment's leg configuration leaked into the child spawn"
   # The brief bytes became the child's brief file, byte for byte.
-  assert_present "$LANDING/data/$child/brief.md" "the child brief was never written"
-  [ "$(cat "$LANDING/data/$child/brief.md")" = "ship the compartment child" ] \
-    || fail "the child brief is not the requested bytes: $(cat "$LANDING/data/$child/brief.md")"
+  assert_present "$HOME_DIR/data/$child/brief.md" "the child brief was never written"
+  [ "$(cat "$HOME_DIR/data/$child/brief.md")" = "ship the compartment child" ] \
+    || fail "the child brief is not the requested bytes: $(cat "$HOME_DIR/data/$child/brief.md")"
   assert_present "$CHILDREQ/.accepted-$self_digest.json" "no durable acceptance record"
   [ "$(spawn_invocations)" = 2 ] || fail "expected exactly one spawn (argv + env lines), saw $(spawn_invocations) lines"
   pass "a real runner-emitted child request spawns once, as the secondmate, with the exact parent pair"
@@ -1193,7 +1201,7 @@ PY
   # carries the non-zero exit that makes it a failure.
   write_controller_with_child "$child" complete 0
   printf '{"schema":"fm.worker-execution-result/v1","exit_code":3,"timed_out":false}\n' \
-    > "$LANDING/state/$child.worker-result.json"
+    > "$HOME_DIR/state/$child.worker-result.json"
   run_relay > "$WORLD/relay-3.log" 2>&1 || fail "the terminal relay pass failed"
   assert_contains "$(inbox_messages)" "CHILD $child is failed (exit code 3)" \
     "the child's terminal status was not mirrored with its failure classification"
@@ -1240,7 +1248,7 @@ PY
 # write_controller_with_child <child-task> <child-status> <unused> - the
 # compartment plus one child queue item carrying the parent pair.
 write_controller_with_child() {
-  mkdir -p "$LANDING/state"
+  mkdir -p "$HOME_DIR/state"
   python3 - "$STATE_DIR/azure-workers/controller.json" "$ID" "$GEN" "$ASSIGNMENT" "$BASE" "$1" "$2" <<'PY'
 import json
 import sys
@@ -1414,10 +1422,14 @@ for key, item in state["queue"].items():
         print(item.get("assignment_generation", "")); break' "$controller" "$parent")
   [ -n "$parent_generation" ] && [ -n "$assignment" ] \
     || fail "the compartment is not assigned on the controller: $(cat "$controller")"
-  # The consultation backstop file, exactly as a real secondmate home carries it.
-  mkdir -p "$SP_SUB/config"
+  # The consultation backstop file, in BOTH homes: the primary carries it and
+  # propagates it into secondmate homes, and the spawn runs under the
+  # controller's home, so that is the copy the harness gate reads.
+  mkdir -p "$SP_SUB/config" "$SP_HOME/config"
   printf '{"profiles":[]}\n' > "$SP_SUB/config/crew-dispatch.json"
+  printf '{"profiles":[]}\n' > "$SP_HOME/config/crew-dispatch.json"
   printf '%s\n' manual > "$SP_SUB/config/backlog-backend"
+  printf '%s\n' manual > "$SP_HOME/config/backlog-backend"
   relay_home="$SP_SUB"
   # A crewmate child leases a worktree of its PROJECT repo, so this world needs
   # the crewmate-shaped treehouse stub (the secondmate helper's leases homes).
@@ -1431,9 +1443,9 @@ fi
 exit 0
 SH
   chmod +x "$SP_DIR/child-fake/treehouse"
-  mkdir -p "$SP_SUB/treehouse-pools"
-  chmod 755 "$SP_SUB" "$SP_SUB/treehouse-pools"
-  git -C "$SP_SUB/projects/alpha" worktree add --quiet --detach "$SP_DIR/child-worktree" \
+  mkdir -p "$SP_SUB/treehouse-pools" "$SP_HOME/treehouse-pools"
+  chmod 755 "$SP_SUB" "$SP_SUB/treehouse-pools" "$SP_HOME/treehouse-pools"
+  git -C "$SP_HOME/projects/alpha" worktree add --quiet --detach "$SP_DIR/child-worktree" \
     || fail "could not stage a child worktree of the home's project"
   # One valid child request landed for this compartment.
   mkdir -p "$SP_DIR/childreq" "$SP_DIR/inbox"
@@ -1465,7 +1477,8 @@ PY
     FM_HERDR_LOG="$SP_HERDR_LOG" FM_FAKE_HERDR_STATE="$SP_DIR/herdr-state.json" \
     FM_FAKE_TREEHOUSE_WORKTREE="$SP_DIR/child-worktree" \
     FM_FAKE_PANE_PATH="$SP_DIR/child-worktree" \
-    FM_TREEHOUSE_ROOT="$SP_SUB/treehouse-pools" \
+    FM_HOME="$SP_HOME" \
+    FM_TREEHOUSE_ROOT="$SP_HOME/treehouse-pools" \
     FM_CHECKOUT_REFRESH_STATE_BASE="$SP_DIR/checkout-refresh-state" \
     PI_CODING_AGENT_DIR="$SP_DIR/pi-agent-home" FM_SPAWN_NO_GUARD=1 \
     FM_AZURE_SUBSCRIPTION_ID="$SUB" FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
@@ -1476,7 +1489,8 @@ PY
     python3 "$ROOT/bin/fm-secondmate-cloud-monitor.py" child-relay \
     --task "$parent" --task-generation "$parent_generation" \
     --assignment-generation "$assignment" \
-    --childreq "$SP_DIR/childreq" --inbox "$SP_DIR/inbox" --home "$relay_home" \
+    --childreq "$SP_DIR/childreq" --inbox "$SP_DIR/inbox" \
+    --spawn-home "$SP_HOME" --home "$relay_home" \
     --controller "$controller" \
     --spawn-bin "$SPAWN" --lifecycle-bin "$ROOT/bin/fm-worker-lifecycle.sh" 2>&1)
   rc=$?
@@ -1495,9 +1509,10 @@ PY
   # Gate 2, closed by this PR: the missing backlog row.
   assert_not_contains "$delivered" "has no In flight or Queued row" \
     "the real fm-spawn refused the relay's argv at the backlog-row gate: $delivered"
-  # Gate 3, NOT closable in this PR's files: the home-bound controller.
-  assert_contains "$delivered" "home_binding binding is not exact" \
-    "the compartment child lane got past the home-bound controller; if the controller contract was fixed, rewrite this unit to assert admission: $delivered"
+  # Gate 3, the real blocker: owner_kind is derived, not assertable, so the
+  # parent pair arrives on a primary-owned request and verify_request refuses.
+  assert_contains "$delivered" "parent_task is owned by secondmate-owned author requests only" \
+    "the compartment child lane got past the owner-kind gate; if an assertable owner kind and a task-home parameter landed, rewrite this unit to assert admission: $delivered"
   assert_contains "$delivered" "FIRSTMATE REFUSED your request" \
     "the real-spawn refusal was not delivered into the compartment inbox: $delivered"
   [ -n "$(first_matching "$SP_DIR/childreq" '.refused-*.json')" ] \

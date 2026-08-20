@@ -992,12 +992,14 @@ receipt_run_scope_contract() {
   block=$work/wipe.sh
   awk '/^# Receipts are run-scoped/{f=1} f{print; if($0=="fi") exit}' "$GUEST" >"$block"
   [ -s "$block" ] || fail "the guest receipt-wipe region was not found"
+  # shellcheck disable=SC2016  # The pattern is literal guest text, not an expansion.
   grep -q 'rm -f "$SHARD_EXCHANGE/receipts.json"' "$block" \
     || fail "the extracted region does not clear receipts"
 
   run_wipe() {  # <mode>
     mkdir -p "$work/exchange"
     printf '[]\n' >"$work/exchange/receipts.json"
+    # shellcheck disable=SC2016  # The inner shell reads its own environment.
     env MODE="$1" SHARD_EXCHANGE="$work/exchange" \
       bash -c 'set -euo pipefail; MODE=$MODE; SHARD_EXCHANGE=$SHARD_EXCHANGE; . "$1"' wipe "$block"
   }

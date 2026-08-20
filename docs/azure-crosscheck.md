@@ -159,6 +159,23 @@ The reused Azure runner independently performs the same identity-pinned cleanup 
 Foreign, missing, replaced, unreadable, or partially deleted resources retain state and fail closed.
 No resource group, subnet, shared storage account, foundation resource, sibling prefix, author VM, validation run, browser, supervisor, or another review can be deleted.
 
+## Recorded phase durations
+
+This lane measures the four phases only it performs into the core run record's `durations_ms` (C1, `docs/azure-requirements.md`), alongside the `reviewer` and `proofs` phases the local lane also records:
+
+- `create`: shared-allocator capacity reservation plus model VM provisioning.
+- `stage`: the credential archive, the request document, and their two blob uploads.
+- `boot`: the Managed Run Command dispatch that starts the guest.
+- `reviewer`: polling that run command to completion, which is the remote review itself.
+- `collect`: the result download and its digest-bound parse.
+
+Cleanup is deliberately not one of them, so `total` is larger than the sum of the named phases by the cleanup and admission time between them.
+The timer is optional at this boundary: the adapter's own CLI records nothing, and nothing recorded reads as "not measured" rather than as a zero.
+
+These numbers do not exist yet.
+The compartment lane is disabled in the operator home and is code-only until the `fm-ccm` model image is rebaked with pi, so no run has executed these phases since they were instrumented.
+`bin/fm-crosscheck.sh timings <task-id>` shows `-` in the `create`, `stage`, `boot`, and `collect` columns for every local-lane run, which is the honest reading: that lane did not do that work.
+
 ## Operator setup
 
 The complete retained 29-resource private foundation, its controller-identity inventory correction, and the shared whole-fleet allocator are released on `main` with zero VMs; live Azure Crosscheck acceptance remains unperformed and happens later from released public main under separate explicit billable and security-sensitive authorization.

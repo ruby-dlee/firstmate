@@ -109,6 +109,36 @@ Each run records both values: `base_sha` is the reviewed merge base, and `base_b
 The authoring worktree is not cloned, checked for cleanliness, or required to match the PR head because no verdict about the remote PR may depend on mutable author-lane filesystem state.
 An empty `FM_STATE_OVERRIDE` falls back to the home state directory, so task metadata, the shared per-task lock, and the disposable review checkout cannot split across callers' current working directories.
 
+### Recorded phase durations
+
+Every run record carries `durations_ms`, an integer millisecond breakdown of where that invocation's wall clock went (C1, `docs/azure-requirements.md`).
+The local lane records `snapshot` (task metadata, the GitHub head/claims lookup, reviewer selection, and the exact-head review checkout), `reviewer` (the bounded reviewer subprocess), `proofs` (the reproduction and mutation verification the gate re-executes for itself), `ledger` (reading and validating the durable ledger plus this invocation's earlier writes), and `total`.
+The Azure compartment lane additionally records `create`, `stage`, `boot`, and `collect`, which only that lane performs.
+
+A phase appears only if the run actually entered it.
+An absent phase means the lane never did that work; it never means the work was free, so a run that failed before reviewer launch records no `reviewer` key rather than `reviewer: 0`.
+Durations are measured on `time.monotonic()`, so a clock change cannot move them, while the record's `at` stamp remains the wall clock it has always been.
+Phases never nest and named phases round down while `total` rounds up, so `total >= sum(named phases)` holds exactly; the difference is real unattributed time between phases, not rounding.
+Two reviewer attempts inside one invocation accumulate into one `reviewer` phase, because the invocation really did spend both.
+The one cost `total` does not include is the final write that lands the record: a record cannot contain the duration of writing itself, which makes `total` a floor rather than an inflated estimate.
+
+The readable report and the run's own output each name the total and the largest phases on one line.
+The full table is a read-only subcommand that takes no lock and changes nothing:
+
+```sh
+bin/fm-crosscheck.sh timings <task-id>
+```
+
+```
+at                    family          state         snapshot  reviewer  proofs  ledger  create  stage  boot  collect  total
+2026-08-02T00:00:00Z  -               tool-failure  -         -         -       -       -       -      -     -        -
+2026-08-20T13:49:06Z  codex-fallback  clear         1217      539       479     0       -       -      -     -        2525
+```
+
+`durations_ms` is additive.
+A run recorded before this field existed still validates and still renders, and shows `-` in every phase column rather than a fabricated zero.
+A record that does carry one is held to the full contract: integers only, never negative, only phase names the gate defines, and a `total` that covers the phases it names.
+
 `bin/fm-pr-merge.sh` calls the verification form automatically after approval.
 Do not call the verification form as a substitute for running a reviewer.
 

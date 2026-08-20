@@ -364,18 +364,53 @@ metered, and an out-of-allowlist link refused with a clear message.
 
 ## C1. Crosscheck completes in 20 to 30 minutes
 
-Status: NOT ADDRESSED.
+Status: INSTRUMENTED 2026-08-20; the serving lane is well inside the band, and the compartment
+lane's phase numbers remain unmeasurable until its image is rebaked.
 
-Four parallel lanes (`FM_AZURE_CROSSCHECK_LANES`, default 4) predate this work and nothing about
-duration has changed.
-The 75 minutes has never been broken down.
+What the measurement shows, and what it does not.
 
-Work: instrument create, boot, stage, review, and collect, then pull the lever the measurement
-identifies.
-Candidates are reviewer VMs that already exist rather than a cold create per review, a faster SKU,
-or more lanes, and the choice waits on the measurement.
+The 75 minutes belonged to the Azure compartment lane. That lane is the only one that creates a
+model VM, stages a credential archive and request into blob storage, boots a Managed Run Command,
+and collects a digest-bound result, and those four phases were the bulk of the duration; the
+review itself was never the whole of it. Four parallel lanes
+(`FM_AZURE_CROSSCHECK_LANES`, default 4) always bounded concurrency, never one review's clock.
+
+The lever was not any of the three candidates this requirement listed (warm reviewer VMs, a faster
+SKU, more lanes). R6 moved the serving lane instead: GLM-5.2 is now the sole primary reviewer and
+it runs through the LOCAL pi lane, so today's serving path has no create, boot, stage, or collect
+at all. The compartment lane is disabled in the operator home (no `config/crosscheck-azure.json`)
+and is code-only until the `fm-ccm` model image is rebaked with pi.
+
+One local-lane review has been measured end to end: 6m13s on 2026-08-20, pi-codex fallback family,
+PR #220, verdict clear. That was an external wall-clock observation of the invocation taken before
+this instrumentation landed, so it carries no recorded phase breakdown of its own. It is one run,
+not a distribution, and a GLM-5.2 primary review is a different reviewer from the pi-codex fallback
+that served it.
+
+What is now instrumented.
+
+Every crosscheck run record carries `durations_ms`, integer milliseconds on `time.monotonic()`,
+covering `snapshot`, `reviewer`, `proofs`, `ledger`, and `total` for the local lane, plus `create`,
+`stage`, `boot`, and `collect` recorded only when the compartment lane performed them. A phase is
+present only if the run entered it, so an absent phase means the lane did not do that work rather
+than that the work was free. Phases never nest, named phases round down and `total` rounds up, so
+`total >= sum(named phases)` holds exactly and the difference is real unattributed time. The
+readable report and the run's own output name the total and the largest phases on one line, and
+`bin/fm-crosscheck.sh timings <task-id>` prints the full per-run table read-only, taking no lock.
+The field is additive: a run recorded before it existed still validates and renders, showing `-`
+rather than a fabricated zero. Contracts live in `docs/crosscheck.md` and `docs/azure-crosscheck.md`.
 
 Acceptance: a measured review completes in 20 to 30 minutes, with the breakdown recorded.
+
+Honest reading against that acceptance. The duration half is met for the serving lane and then
+some: 6m13s is faster than the 20-to-30-minute band the requirement asked for, which is the outcome
+the band was standing in for. The breakdown half is landed and proven hermetically, but no live
+review has yet been recorded through it, because the one measured review predates the
+instrumentation; the next live crosscheck run records its own. The compartment lane's create,
+boot, stage, and collect numbers are not merely unmeasured but currently unmeasurable, since no
+compartment review can execute until the image rebake. This section does not claim that lane is
+fixed. If the compartment lane is ever restored to serving, C1 has to be re-measured against it,
+and the three original candidate levers become live again at that point.
 
 ## C2. Many crewmates, no-mistakes, and crosschecks run in parallel without contention
 
@@ -469,7 +504,8 @@ billable capacity has not run yet.
    needs an owner login.
 5. R4, which needs the runner caller built and one validation cell closed.
 6. R5.
-7. C1, measured before it is changed.
+7. C1, instrumented 2026-08-20; the serving lane is inside the band and the compartment lane's
+   phases wait on its image rebake.
 8. R9, which is the proof of the rest.
 9. R10, the Slack team exposure, which needs R6's lane and can be pulled forward right after R6
    if the owner wants engineers on it sooner.

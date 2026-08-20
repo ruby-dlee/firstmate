@@ -83,7 +83,16 @@ reclaim_stale_dispatch() {
   local mtime now wall
   [ -f "$DISPATCH_MARKER" ] || return 0
   [ ! -s "$RESULT" ] || return 0
-  mtime=$(stat -f %m "$DISPATCH_MARKER" 2>/dev/null || stat -c %Y "$DISPATCH_MARKER" 2>/dev/null) || return 0
+  # Portable epoch mtime, branched on uname like bin/fm-lock-lib.sh: GNU stat
+  # ACCEPTS `-f %m` without failing (there it names a filesystem, not a
+  # format), so a BSD-first `||` fallback chain never reaches the GNU form and
+  # silently yields non-numeric output on Linux - which the guard below reads
+  # as "not a number" and returns from, disabling the reclaim forever there.
+  if [ "$(uname)" = Darwin ]; then
+    mtime=$(stat -f %m "$DISPATCH_MARKER" 2>/dev/null) || return 0
+  else
+    mtime=$(stat -c %Y "$DISPATCH_MARKER" 2>/dev/null) || return 0
+  fi
   case "$mtime" in ''|*[!0-9]*) return 0 ;; esac
   now=$(date +%s)
   wall=$(persisted_wall_seconds)

@@ -959,6 +959,8 @@ make_child_case() {  # <name> <child-id> <parent-id> -> record
   # The two independent primary-owned links in the authority chain: the marker
   # inside the home NAMES the secondmate, and the primary's own registry maps
   # that secondmate to exactly this directory.
+  printf 'fixture home\n' > "$sub/AGENTS.md"
+  mkdir -p "$sub/bin"
   printf '%s\n' "$parent" > "$sub/.fm-secondmate-home"
   printf '# secondmates\n\n- %s - the compartment (home: %s; scope: everything; projects: ; added 2026-08-20)\n' \
     "$parent" "$sub" > "$primary/data/secondmates.md"

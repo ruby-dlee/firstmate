@@ -218,6 +218,14 @@ if [ -n "${FM_SPAWN_TASK_HOME:-}" ]; then
     echo "error: FM_SPAWN_TASK_HOME is not a seeded secondmate home: $TASK_HOME" >&2
     exit 1
   }
+  # Content too, not only shape: without this a typo in the parent id refuses
+  # LATE at the controller, after the lifecycle locks are taken and the
+  # convergence artifacts (including the copied provider credential) are staged.
+  if [ -n "${FM_SPAWN_PARENT_TASK:-}" ] \
+    && [ "$(cat "$TASK_HOME/$SUB_HOME_MARKER" 2>/dev/null || true)" != "$FM_SPAWN_PARENT_TASK" ]; then
+    echo "error: FM_SPAWN_TASK_HOME is not marked for secondmate $FM_SPAWN_PARENT_TASK" >&2
+    exit 1
+  fi
 fi
 STATE="${FM_STATE_OVERRIDE:-$TASK_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$TASK_HOME/data}"

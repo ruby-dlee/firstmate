@@ -4682,6 +4682,37 @@ def seed_home(path, marker_bytes):
     return path
 
 
+git_env = dict(env)
+git_env.update({
+    "GIT_AUTHOR_NAME": "fmtest", "GIT_AUTHOR_EMAIL": "fmtest@example.invalid",
+    "GIT_COMMITTER_NAME": "fmtest", "GIT_COMMITTER_EMAIL": "fmtest@example.invalid",
+})
+
+
+def task_meta(home, task, generation):
+    """A COMPLETE set of local authorities, so that when a home rule is deleted
+    the request is genuinely ADMITTED rather than failing later on a missing
+    metadata file. Every refusal below has to be the rule, not an accident."""
+    worktree = root / "worktrees" / task
+    worktree.mkdir(parents=True, exist_ok=True)
+    if not (worktree / ".git").is_dir():
+        for argv in (["git", "init", "-q", "-b", "main", "."], ["git", "add", "README.md"],
+                     ["git", "commit", "-q", "-m", "fixture", "--no-gpg-sign"]):
+            if argv[1] == "add":
+                (worktree / "README.md").write_text("fixture\n")
+            subprocess.run(argv, cwd=str(worktree), env=git_env, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    account = root / "accounts" / task
+    account.mkdir(parents=True, exist_ok=True)
+    git_dir = worktree / ".git"
+    (home / "state").mkdir(parents=True, exist_ok=True)
+    (home / "state" / (task + ".meta")).write_text(
+        "generation_id={}\nworktree={}\naccount_home={}\naccount_task={}\n"
+        "worktree_git_dir_identity={}:{}\n".format(
+            generation, worktree, account, task,
+            os.stat(git_dir).st_dev, os.stat(git_dir).st_ino))
+
+
 sub = seed_home(root / "homes" / "compartment", "smc-1\n")
 nested = seed_home(primary / "inner-home", "smc-1\n")
 padded = seed_home(root / "homes" / "padded", "  smc-1\n")
@@ -4706,6 +4737,7 @@ run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION
 
 
 def child(number, home):
+    task_meta(home, "mark-{}".format(number), "gen-m{}".format(number))
     return run("request", "--task", "mark-{}".format(number),
                "--task-generation", "gen-m{}".format(number),
                "--owner-kind", "secondmate", "--eligible", "--task-home", str(home),
@@ -4733,6 +4765,7 @@ assert 'is marked for secondmate "  smc-1", not the parent compartment smc-1' in
 
 # A relative --task-home never resolves against the caller's cwd.
 registry(("smc-1", sub))
+task_meta(sub, "mark-4", "gen-m4")
 relative = subprocess.run(
     [wrapper, "request", "--task", "mark-4", "--task-generation", "gen-m4",
      "--owner-kind", "secondmate", "--eligible", "--task-home", "homes/compartment",

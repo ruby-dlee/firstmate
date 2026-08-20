@@ -1093,9 +1093,31 @@ test_refused_chain_verification_records_no_tip() {
   out=$(run_helper_recording)
   [ $? -eq 3 ] || fail "a gapped chain verified instead of refusing: $out"
   [ "$(chain_tip_invocations)" = 0 ] \
-    || fail "a tip was attested for a chain that never verified"
-  [ -z "$(recorded_worker_tip)" ] || fail "the controller record carries a tip from a refused mailbox"
-  pass "a refused chain verification attests no tip at all"
+    || fail "a gapped chain attested a tip it never verified"
+  [ -z "$(recorded_worker_tip)" ] || fail "the controller record carries a tip from a gapped mailbox"
+  # THE SUBSTITUTION CASE, which is what the ordering exists for: the names
+  # (and therefore the whole chain arithmetic over them) are intact while the
+  # bodies are forged. Only verification tells these apart, so a monitor that
+  # attested first would report a tip for a mailbox it goes on to refuse.
+  make_world tip-after-verify-tampered
+  put_guest_inbox '{"kind":"fm.secondmate-message/v1","text":"authentic"}' >/dev/null
+  put_guest_inbox '{"kind":"fm.secondmate-control/v1","action":"close"}' >/dev/null
+  run_guest_leg >/dev/null 2>&1 || fail "the guest leg did not exit cleanly"
+  collect_store_into_mailbox
+  python3 - "$STATE_DIR/$ID.cloud-mailbox" <<'PY'
+import json, pathlib, sys
+mailbox = pathlib.Path(sys.argv[1])
+first = sorted(mailbox.glob("00000001-*.json"))[0]
+message = json.loads(first.read_text())
+message["text"] = "forged reply"
+first.write_text(json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+PY
+  out=$(run_helper_recording)
+  [ $? -eq 3 ] || fail "a substituted body verified instead of refusing: $out"
+  [ "$(chain_tip_invocations)" = 0 ] \
+    || fail "a tip was attested for a mailbox whose bodies were substituted"
+  [ -z "$(recorded_worker_tip)" ] || fail "the controller record carries a tip from a tampered mailbox"
+  pass "a refused chain verification attests no tip at all, gapped or substituted"
 }
 
 test_monotonicity_refusal_freezes_the_lane_like_a_chain_break() {

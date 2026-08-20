@@ -268,8 +268,8 @@ run_guest_leg() {
     "$@" python3 "$RUNNER"
 }
 
-put_guest_inbox() {  # '<json>' - store one canonical inbox message
-  python3 - "$STORE" "$1" <<'PY'
+put_guest_inbox() {  # '<json>' [store] - store one canonical inbox message
+  python3 - "${2:-$STORE}" "$1" <<'PY'
 import hashlib, json, pathlib, sys
 store, raw = sys.argv[1:]
 body = json.dumps(json.loads(raw), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
@@ -784,11 +784,12 @@ test_regenesis_chain_refuses_via_durable_tip() {
   # delivered sequence would deliver as verified on a stateless verifier.
   local store2="$WORLD/store2" guest_state2="$WORLD/guest-state2" out
   mkdir -p "$store2/session/in" "$store2/session/out"
-  ( STORE="$store2"
-    put_guest_inbox '{"kind":"fm.secondmate-message/v1","text":"attack payload one"}' >/dev/null
-    put_guest_inbox '{"kind":"fm.secondmate-message/v1","text":"attack payload two","nonce":"n2"}' >/dev/null
-    put_guest_inbox '{"kind":"fm.secondmate-control/v1","action":"close"}' >/dev/null
-  ) || fail "attacker inbox staging failed"
+  put_guest_inbox '{"kind":"fm.secondmate-message/v1","text":"attack payload one"}' "$store2" >/dev/null \
+    || fail "attacker inbox staging failed"
+  put_guest_inbox '{"kind":"fm.secondmate-message/v1","text":"attack payload two","nonce":"n2"}' "$store2" >/dev/null \
+    || fail "attacker inbox staging failed"
+  put_guest_inbox '{"kind":"fm.secondmate-control/v1","action":"close"}' "$store2" >/dev/null \
+    || fail "attacker inbox staging failed"
   run_guest_leg FM_SECONDMATE_BLOB_DIR="$store2" FM_SECONDMATE_STATE_DIR="$guest_state2" \
     >/dev/null 2>&1 || fail "attacker chain generation failed"
   rm "$STATE_DIR/$ID.cloud-mailbox/"*.json
@@ -969,12 +970,12 @@ assert len(body) == message["bytes"], (len(body), message["bytes"])
 assert message["name"] == "session/in/attach/{}.bundle".format(message["sha256"])
 PY
   # The runner's own size-checked fetch consumes it: relay the announcement
-  # into the guest inbox and run a REAL leg, which must fetch the bundle.
+  # VERBATIM (nonce and all, exactly the bytes the monitor delivers) into the
+  # guest inbox and run a REAL leg, which must fetch the bundle.
   python3 - "$STORE" "$announcement" <<'PY'
 import hashlib, json, pathlib, sys
 store, raw = sys.argv[1:]
 message = json.loads(raw)
-message.pop("nonce", None)
 body = json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 target = pathlib.Path(store) / "session" / "in" / (hashlib.sha256(body).hexdigest() + ".json")
 target.write_bytes(body)
@@ -1106,7 +1107,7 @@ test_child_request_queue_item_bindings_equal_local_mints() {
   # fixture provider: a compartment is requested and assigned, then a child is
   # requested with the parent pair, and its queue item's bindings are diffed
   # FIELD BY FIELD against what authoritative_request_bindings mints locally.
-  local world home azure sub_home_state out
+  local world home azure out
   world="$TMP_ROOT/real-request"
   home="$world/home"
   azure="$home/state/azure-workers"
@@ -1199,6 +1200,7 @@ test_crewmate_monitor_stat_chain_is_uname_branched() {
   local monitor="$ROOT/bin/fm-spawn-cloud-monitor.sh"
   assert_no_grep 'stat -f %m .* || stat -c %Y' "$monitor" \
     "the crewmate monitor still carries the BSD-first stat fallback chain"
+  # shellcheck disable=SC2016  # the literal shell text is the pin, not an expansion
   grep -q 'if \[ "$(uname)" = Darwin \]; then' "$monitor" \
     || fail "the crewmate monitor does not branch its mtime read on uname like bin/fm-lock-lib.sh"
   python3 - "$monitor" <<'PY' || fail "the uname branch does not guard the reclaim marker read"

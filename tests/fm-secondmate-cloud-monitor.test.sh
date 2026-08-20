@@ -1117,7 +1117,7 @@ test_attach_announcement_matches_the_uploaded_bundle() {
   printf 'child work\n' >> "$LANDING/README.md"
   git -C "$LANDING" add README.md
   git -C "$LANDING" commit -qm 'child landed work'
-  land_attach_request
+  land_attach_request 1 1 >/dev/null
   run_relay > "$WORLD/relay.log" 2>&1 || fail "the relay pass failed: $(cat "$WORLD/relay.log")"
   local announcement
   announcement=$(inbox_messages | grep 'fm.secondmate-attach/v1') \
@@ -1158,7 +1158,7 @@ test_size_mismatched_announcement_is_never_sent() {
   printf 'child work\n' >> "$LANDING/README.md"
   git -C "$LANDING" add README.md
   git -C "$LANDING" commit -qm 'child landed work'
-  land_attach_request
+  land_attach_request 1 1 >/dev/null
   FM_FIXTURE_ATTACH_RECEIPT_SKEW=1 run_relay > "$WORLD/relay.log" 2>&1 \
     || fail "the relay pass failed: $(cat "$WORLD/relay.log")"
   local delivered

@@ -66,7 +66,9 @@ one place that validates them and spends anything.
     though FM_HOME moves to the secondmate home. Nothing about home, account,
     worktree, harness, SKU, project, or repository comes from the cloud side -
     the project is local policy (FM_SECONDMATE_CHILD_PROJECT, else the home's
-    single project), and the harness is the cloud lane's only runtime.
+    single project), and the harness is the cloud lane's only runtime. The
+    child's backlog row is filed first, because fm-spawn refuses a new
+    ship/scout task that has none.
   - ACCEPTANCE IS PROVEN BY THE QUEUE. A zero exit from fm-spawn is evidence
     the script ran, never that the controller admitted a bounded child, so a
     served request is confirmed by reading the one controller document back
@@ -878,6 +880,89 @@ class Relay:
             return "", "child spawn refused: the secondmate home has {} projects; set FM_SECONDMATE_CHILD_PROJECT to name one".format(len(candidates))
         return str(candidates[0]), ""
 
+    def ensure_backlog_row(self, child_task, kind, project, brief):
+        """File the child's backlog row before dispatch.
+
+        fm-spawn refuses a NEW ship/scout task that has no In-flight or Queued
+        backlog row, so without this the relay's every child request would
+        refuse at that gate in any real home - the exact failure the real-spawn
+        unit surfaced. The sanctioned writer is tried first; the manual
+        markdown append is the documented fallback shape fm-spawn itself scans
+        when the tasks-axi backend is unavailable. Returns "" or a failed
+        check.
+        """
+        data = self.home / "data"
+        backlog = data / "backlog.md"
+        summary = ""
+        for line in brief.splitlines():
+            if line.strip():
+                summary = line.strip()
+                break
+        summary = (summary or "compartment child")[:120].lstrip("-").strip()
+        summary = summary or "compartment child"
+        repo = Path(project).name or "unknown"
+        writer = Path(__file__).resolve().parent / "fm-data-write.py"
+        if writer.is_file():
+            try:
+                subprocess.run(
+                    [
+                        sys.executable, str(writer), "--data", str(data), "--",
+                        "tasks-axi", "add", child_task, summary,
+                        "--kind", kind, "--repo", repo, "--start",
+                        "--backend", "markdown", "--file", str(backlog),
+                    ],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, timeout=120, check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if self.backlog_row_present(backlog, child_task):
+            return ""
+        try:
+            body = backlog.read_text(encoding="utf-8") if backlog.is_file() else ""
+            row = "- **{}** {}\n".format(child_task, summary)
+            if "## In flight" in body:
+                head, _, tail = body.partition("## In flight")
+                newline, _, rest = tail.partition("\n")
+                body = "{}## In flight{}\n{}{}".format(head, newline, row, rest)
+            else:
+                body = body.rstrip("\n") + "\n\n## In flight\n\n" + row
+            write_atomic(backlog, body.encode("utf-8"))
+        except OSError as exc:
+            return "child backlog row could not be filed locally: {}".format(exc)
+        if not self.backlog_row_present(backlog, child_task):
+            return "child backlog row could not be filed locally: the row is absent after writing it"
+        return ""
+
+    @staticmethod
+    def backlog_row_present(backlog, child_task):
+        """The same rule fm-spawn's manual scan applies: an In-flight or
+        Queued section row whose key is the task id."""
+        try:
+            body = backlog.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        active = False
+        for line in body.splitlines():
+            if re.fullmatch(r"##\s+(In flight|Queued)\s*", line):
+                active = True
+                continue
+            if line.startswith("## "):
+                active = False
+                continue
+            if not active:
+                continue
+            entry = re.sub(r"^\s*-\s*", "", line)
+            entry = re.sub(r"^\[[ xX]\]\s*", "", entry)
+            if entry.startswith("**"):
+                closing = entry[2:].find("**")
+                key = entry[2:2 + closing] if closing >= 0 else ""
+            else:
+                key = entry.split()[0] if entry.split() else ""
+            if key == child_task:
+                return True
+        return False
+
     def spawn_environment(self):
         env = dict(os.environ)
         # FM_HOME moves to the secondmate home so fm-spawn derives
@@ -907,6 +992,10 @@ class Relay:
             write_atomic(brief, message["brief"].encode("utf-8"))
         except OSError as exc:
             self.refuse(digest, landed, "child brief could not be written locally: {}".format(exc))
+            return
+        failed = self.ensure_backlog_row(child_task, message["child_kind"], project, message["brief"])
+        if failed:
+            self.refuse(digest, landed, failed)
             return
         # --harness is passed EXPLICITLY rather than left to resolution. A
         # home carrying config/crew-dispatch.json refuses a crewmate spawn

@@ -2010,7 +2010,77 @@ assert reviewer["review_family_mode"] == "codex-fallback", reviewer
 assert reviewer["model_independence"] == "same-model", reviewer
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" \
     || fail "the same-model fallback run did not record both degraded markers"
-  pass "the codex-family fallback is loud, names the relaxation state, and records a durable marker"
+
+  # A forged ledger cannot claim the wrong family: the marker is bound to the
+  # reviewer model at validation, both directions.
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' \
+    || fail "validate_ledger did not bind review_family_mode to the reviewer model"
+import copy
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+URL = "https://github.com/ruby-dlee/firstmate/pull/72"
+
+
+def ledger_with(model, family):
+    reviewer = {
+        "harness": "pi",
+        "model": model,
+        "effort": "xhigh",
+        "account_home": "/independent/pi",
+    }
+    if family is not None:
+        reviewer["review_family_mode"] = family
+    return {
+        "schema": module.SCHEMA,
+        "task_id": "task-x1",
+        "pull_request": URL,
+        "findings": [],
+        "runs": [{
+            "at": "2026-08-20T00:00:00Z",
+            "head_sha": "a" * 40,
+            "base_sha": "b" * 40,
+            "base_branch_sha": "b" * 40,
+            "claims_sha256": "c" * 64,
+            "reviewer": reviewer,
+            "state": "tool-failure",
+            "summary": "attempt",
+            "citations": [],
+            "updated_findings": [],
+            "new_findings": [],
+            "active_blockers": [],
+            "suspicions": [],
+        }],
+    }
+
+
+# Honest pairings load; the field also remains optional for older ledgers.
+for model, family in (
+    ("FW-GLM-5.2", "glm-primary"),
+    ("gpt-5.6-sol", "codex-fallback"),
+    ("azure-glm/FW-GLM-5.2", "glm-primary"),
+    ("gpt-5.6-sol", None),
+):
+    module.validate_ledger(ledger_with(model, family), "task-x1", URL)
+
+# Forged pairings refuse, in both directions.
+for model, family in (
+    ("gpt-5.6-sol", "glm-primary"),
+    ("FW-GLM-5.2", "codex-fallback"),
+):
+    try:
+        module.validate_ledger(ledger_with(model, family), "task-x1", URL)
+    except module.CrosscheckError as exc:
+        assert "review_family_mode does not match the reviewer model" in str(exc), str(exc)
+    else:
+        raise AssertionError(f"forged family {family} for {model} validated")
+PY
+  pass "the codex-family fallback is loud, names the relaxation state, and records a model-bound durable marker"
 }
 
 test_same_model_review_is_adversarial_and_durable() {

@@ -293,10 +293,10 @@ def account_identity(harness: str, account_home: Path) -> str:
     """Stable upstream executing-account identity for one reviewer home.
 
     The returned string never carries token material: Codex and Pi expose
-    explicit upstream account ids; the Claude OAuth file holds only opaque
-    tokens, so its identity is a one-way digest of the long-lived refresh
-    token (two homes mirroring one account share that token byte for byte,
-    which is exactly the same-account condition the Azure adapter refuses).
+    explicit upstream account ids. The GLM api-key lane never reaches this
+    reader - its identity is the non-secret Foundry resource/deployment
+    binding (GLM_REVIEWER_ACCOUNT_IDENTITY), because an api key names no
+    upstream account.
     """
 
     home = Path(account_home).resolve()
@@ -334,30 +334,9 @@ def account_identity(harness: str, account_home: Path) -> str:
         if isinstance(account, str) and account.strip():
             return "openai-codex:" + account.strip()
         tool_fail(f"Pi credential at {home} exposes no executing account identity")
-    if harness == "claude":
-        credential = read_json(
-            home / ".credentials.json",
-            "Claude executing-account credential",
-            maximum_bytes=1024 * 1024,
-            maximum_items=256,
-        )
-        oauth = (
-            credential.get("claudeAiOauth") if isinstance(credential, dict) else None
-        )
-        refresh = oauth.get("refreshToken") if isinstance(oauth, dict) else None
-        if isinstance(refresh, str) and refresh.strip():
-            digest = hashlib.sha256(refresh.strip().encode("utf-8")).hexdigest()
-            return "claude-refresh-digest:" + digest
-        # No access-token fallback: an access-token digest is token-bound,
-        # not account-bound - it changes on every ordinary refresh and two
-        # homes of one account diverge the moment their tokens differ, so it
-        # can neither power the same-account refusal nor stay pinned across
-        # a run (live crosscheck finding cc-65277c0525c7). A credential
-        # without a refresh token exposes no stable executing-account
-        # identity and is refused.
-        tool_fail(
-            f"Claude credential at {home} exposes no executing account identity"
-        )
+    # The claude reader (a refresh-token digest over .credentials.json) left
+    # with the retired claude reviewer lane (R6); no crosscheck profile can
+    # reach it, so an unknown harness refuses by name.
     tool_fail(f"no executing-account identity reader for harness {harness!r}")
 
 
@@ -2638,8 +2617,9 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
                 reviewer.get("model_independence") in {None, "same-model"},
                 f"{label}.reviewer.model_independence is invalid",
             )
+            family = reviewer.get("review_family_mode")
             require(
-                reviewer.get("review_family_mode")
+                family
                 in {
                     None,
                     REVIEW_FAMILY_GLM_PRIMARY,
@@ -2647,6 +2627,20 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
                 },
                 f"{label}.reviewer.review_family_mode is invalid",
             )
+            if family is not None:
+                # The family marker is bound to the model, so a forged record
+                # cannot claim glm-primary for a codex-family review or hide
+                # a fallback behind the primary label.
+                reviewer_model = reviewer.get("model")
+                model_is_glm = (
+                    isinstance(reviewer_model, str)
+                    and model_identity(reviewer_model) == GLM_REVIEWER_MODEL
+                )
+                require(
+                    (family == REVIEW_FAMILY_GLM_PRIMARY) == model_is_glm,
+                    f"{label}.reviewer.review_family_mode does not match the "
+                    "reviewer model",
+                )
         if (
             isinstance(reviewer, dict)
             and reviewer.get("execution_mode") == "azure-compartment-v1"

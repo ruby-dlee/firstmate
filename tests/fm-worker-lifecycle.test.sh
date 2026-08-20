@@ -137,7 +137,8 @@ assert "hosted form service" in doc and "force-delete" in doc
 for marker in (
     "--confirm-orphan-children", "reparented_to: primary",
     "verify_release_against_worker", "children-quiesced",
-    "chained close ack", "BY CONTENT", "refuses outright instead of being read as zero",
+    "chained close ack", "BY CONTENT", "compartment-chain-tip",
+    "monitor-local state may never supply it",
 ):
     assert marker in doc, marker
 PY

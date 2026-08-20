@@ -328,7 +328,8 @@ def secondmate_landing_evidence(home, task, worktree, repository_generation):
             "secondmate landing authority found unlanded outbox bundles: {}".format(",".join(unlanded)))
     head = git(worktree, "rev-parse", "HEAD")
     lineage = subprocess.run(
-        ["git", "-C", str(worktree), "merge-base", "--is-ancestor", repository_generation, head]
+        ["git", "-C", str(worktree), "merge-base", "--is-ancestor", repository_generation, head],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     if lineage.returncode != 0:
         raise AuthorityError(

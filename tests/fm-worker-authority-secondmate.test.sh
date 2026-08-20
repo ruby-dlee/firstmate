@@ -50,27 +50,37 @@ bundle_digest = hashlib.sha256(bundle_body).hexdigest()
     "landed_bundles": [bundle_digest],
     "kept_bundles": [],
     "last_summary": {"reason": "close", "legs_completed": 2},
-    "verified_tip": {"sequence": 2, "chain_digest": "f" * 64},
+    "verified_tip": {"sequence": 2},
 }, sort_keys=True, separators=(",", ":")) + "\n")
 
 mailbox = state / (task + ".cloud-mailbox")
 mailbox.mkdir(exist_ok=True)
-summary = {
-    "kind": "fm.secondmate-leg-summary/v1",
-    "sequence": 2,
-    "reason": "close",
-    "legs_completed": 2,
-    "bundles": [{
-        "name": "session/out/bundle-00000001-{}.bundle".format(bundle_digest),
-        "sha256": bundle_digest, "bytes": len(bundle_body), "commits": 1,
-    }],
-}
-unsigned = json.dumps(summary, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-content = hashlib.sha256(unsigned).hexdigest()
-summary["content_sha256"] = content
-summary["chain_digest"] = hashlib.sha256(("0" * 64 + content).encode()).hexdigest()
-(mailbox / "{:08d}-{}.json".format(2, content)).write_text(
-    json.dumps(summary, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+# A REAL collected chain: sequences 1..N with no gaps, each entry content
+# addressed and chained onto the previous, exactly as the monitor collects
+# them. delivered_sequence/verified_tip below must agree with what is here -
+# the authority now refuses a mailbox holding fewer entries than the durable
+# state claims, which is the rewound-outbox rule the monitor itself applies.
+chain = "0" * 64
+for sequence, body in enumerate((
+    {"kind": "fm.secondmate-message/v1", "text": "checking in"},
+    {
+        "kind": "fm.secondmate-leg-summary/v1",
+        "reason": "close",
+        "legs_completed": 2,
+        "bundles": [{
+            "name": "session/out/bundle-00000001-{}.bundle".format(bundle_digest),
+            "sha256": bundle_digest, "bytes": len(bundle_body), "commits": 1,
+        }],
+    },
+), 1):
+    message = dict(body, sequence=sequence)
+    unsigned = json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    content = hashlib.sha256(unsigned).hexdigest()
+    chain = hashlib.sha256((chain + content).encode()).hexdigest()
+    message["content_sha256"] = content
+    message["chain_digest"] = chain
+    (mailbox / "{:08d}-{}.json".format(sequence, content)).write_text(
+        json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 (mailbox / "bundle-00000001-{}.bundle".format(bundle_digest)).write_bytes(bundle_body)
 
 report = home / "data" / task
@@ -130,12 +140,18 @@ def expect(callable_, fragment):
     else:
         raise AssertionError("no refusal: {}".format(fragment))
 
+HEAD = module.git(subhome, "rev-parse", "HEAD")
+
+def landing(generation=None):
+    return module.secondmate_landing_evidence(
+        home, task, subhome, generation if generation is not None else HEAD)
+
 # The good fixture proves all three compartment legs.
 report = module.secondmate_report_evidence(home, task)
 assert report.startswith(b"closed\0close\x002\0"), report[:40]
 assert b"## Summary" in report
-landing = module.secondmate_landing_evidence(home, task)
-assert bundle_digest.encode() in landing
+landing_bytes = landing()
+assert bundle_digest.encode() in landing_bytes
 worktree_info, worktree = module.secondmate_worktree_evidence(home, task, values)
 assert worktree == subhome.resolve()
 
@@ -171,21 +187,21 @@ put_state(saved)
 state_path.rename(str(state_path) + ".away")
 expect(lambda: module.secondmate_report_evidence(home, task),
        "no durable monitor state")
-expect(lambda: module.secondmate_landing_evidence(home, task),
+expect(lambda: landing(),
        "no durable monitor state")
 Path(str(state_path) + ".away").rename(state_path)
 # landing: a bundle the monitor kept instead of landing.
 value = monitor_state()
 value["kept_bundles"] = [bundle_digest]
 put_state(value)
-expect(lambda: module.secondmate_landing_evidence(home, task),
+expect(lambda: landing(),
        "kept unlanded")
 put_state(saved)
 # landing: a DECLARED bundle absent from the landed record.
 value = monitor_state()
 value["landed_bundles"] = []
 put_state(value)
-expect(lambda: module.secondmate_landing_evidence(home, task),
+expect(lambda: landing(),
        "unlanded outbox bundles")
 # worktree: the same unlanded evidence blocks the quiesced-home receipt.
 expect(lambda: module.secondmate_worktree_evidence(home, task, values),
@@ -194,31 +210,90 @@ put_state(saved)
 # landing: a collected-but-undeclared bundle FILE must also be landed.
 stray = mailbox / ("bundle-00000009-" + "a" * 64 + ".bundle")
 stray.write_bytes(b"stray")
-expect(lambda: module.secondmate_landing_evidence(home, task),
+expect(lambda: landing(),
        "unlanded outbox bundles")
 stray.unlink()
-# landing: a recorded chain break freezes the receipt.
+# landing: a recorded chain break freezes the receipt...
 (mailbox / ".chain-break").write_text("{}")
-expect(lambda: module.secondmate_landing_evidence(home, task),
+expect(lambda: landing(),
        "frozen by a recorded outbox chain break")
 (mailbox / ".chain-break").unlink()
-# landing: provably none - an empty verified chain with nothing declared.
+# ... and a DANGLING SYMLINK named .chain-break is still a marker: exists()
+# follows it into nothing, which bypassed the freeze a real marker triggers.
+(mailbox / ".chain-break").symlink_to(mailbox / "no-such-target")
+expect(lambda: landing(),
+       "frozen by a recorded outbox chain break")
+(mailbox / ".chain-break").unlink()
+
+# landing: the mailbox may never hold FEWER entries than the durable monitor
+# state recorded as delivered. Enumeration alone made an emptied or wiped
+# mailbox read as "provably none", releasing unlanded compartment work.
+kept_entries = {entry.name: entry.read_bytes() for entry in mailbox.iterdir()}
+for entry in list(mailbox.iterdir()):
+    entry.unlink()
+expect(lambda: landing(), "a rewound or truncated outbox")
+# the same, wiped rather than emptied in place
+mailbox.rmdir()
+expect(lambda: landing(), "its mailbox is absent or redirected")
+# ... and a SYMLINKED mailbox pointing at an empty directory is not the
+# monitor's mailbox either (is_dir() follows the link).
+decoy = home / "state" / "decoy-mailbox"
+decoy.mkdir()
+mailbox.symlink_to(decoy)
+expect(lambda: landing(), "its mailbox is absent or redirected")
+mailbox.unlink()
+mailbox.mkdir()
+for name, body in kept_entries.items():
+    (mailbox / name).write_bytes(body)
+# The durable verified tip counts too, even when delivered_sequence is 0.
+value = monitor_state()
+value["delivered_sequence"] = 0
+value["verified_tip"] = {"sequence": 9, "chain_digest": "f" * 64}
+put_state(value)
+expect(lambda: landing(), "a rewound or truncated outbox")
+put_state(saved)
+
+# landing: the compartment head must descend from the assignment's exact
+# starting repository generation, the same lineage tether the ordinary lane
+# applies - local files alone are not a landing proof.
+expect(lambda: landing("0" * 40),
+       "does not descend from the assignment repository generation")
+
+# landing: provably none - a monitor that delivered nothing, with an empty
+# mailbox and nothing declared, still proves.
 value = monitor_state()
 value["landed_bundles"] = []
+value["delivered_sequence"] = 0
+value["verified_tip"] = None
 put_state(value)
 for entry in list(mailbox.iterdir()):
     entry.unlink()
-empty = module.secondmate_landing_evidence(home, task)
+empty = landing()
 assert b'"declared":[]' in empty and b'"landed":[]' in empty
+for name, body in kept_entries.items():
+    (mailbox / name).write_bytes(body)
 put_state(saved)
 # worktree: tracked modifications are not a quiesced home.
 (subhome / "charter.md").write_text("edited\n")
 expect(lambda: module.secondmate_worktree_evidence(home, task, values),
-       "not quiesced: tracked modifications remain")
-# ... while UNTRACKED runtime files are the home's ordinary state.
+       "not quiesced: uncommitted or untracked work remains")
 import subprocess
 subprocess.run(["git", "-C", str(subhome), "checkout", "--", "charter.md"], check=True)
-(subhome / "runtime.log").write_text("noise\n")
+module.secondmate_worktree_evidence(home, task, values)
+# UNTRACKED never-added work is work left behind too: a release receipt
+# answers "is anything left here", not the monitor's narrower "can I
+# fast-forward into this", and the ordinary lane has always refused it.
+(subhome / "new_feature.py").write_text("print('unsaved')\n")
+expect(lambda: module.secondmate_worktree_evidence(home, task, values),
+       "not quiesced: uncommitted or untracked work remains")
+(subhome / "new_feature.py").unlink()
+# A gitignored runtime path is still not "work left behind": --untracked-files=all
+# never lists ignored paths, which is why the ordinary strictness is safe here.
+(subhome / ".gitignore").write_text("runtime/\n")
+subprocess.run(["git", "-C", str(subhome), "add", ".gitignore"], check=True)
+subprocess.run(["git", "-C", str(subhome), "commit", "--quiet", "-m", "ignore runtime"], check=True)
+(subhome / "runtime").mkdir()
+(subhome / "runtime" / "monitor.log").write_text("noise\n")
 module.secondmate_worktree_evidence(home, task, values)
 PY
   pass "every secondmate evidence leg refuses distinctly and the ack mapping binds all three terminals"
@@ -277,11 +352,18 @@ resources = {
     kind: {"id": "/fixture/slot/1/{}".format(kind), "immutable_id": "{}-1".format(kind)}
     for kind in controller.REQUIRED_RESOURCE_KINDS
 }
+# The compartment landing receipt is tethered to the controller-owned
+# repository generation, so the fixture binds the home's REAL starting head.
+subhome_path = Path(
+    (home / "state" / "smc-1.meta").read_text().splitlines()[1].split("=", 1)[1])
+start_head = subprocess.run(
+    ["git", "-C", str(subhome_path), "rev-parse", "HEAD"],
+    text=True, stdout=subprocess.PIPE, check=True).stdout.strip()
 bindings = {
     "home_binding": "1" * 64, "task": "smc-1", "task_generation": "gen-s1",
     "assignment_generation": "asg-00000001", "account_binding": "2" * 64,
     "worktree_binding": "3" * 64, "repository_binding": "4" * 64,
-    "repository_generation": "repo-s1",
+    "repository_generation": start_head,
 }
 worker = {
     "slot": 1, "role": "secondmate", "sku": "sku", "sku_family": "fam",
@@ -339,10 +421,10 @@ refused = authority_run()
 assert refused.returncode == 2 and "unlanded outbox bundles" in refused.stderr, refused.stderr
 monitor_path.write_text(json.dumps(monitor, sort_keys=True, separators=(",", ":")))
 
-subhome = Path((smstate / "smc-1.meta").read_text().splitlines()[1].split("=", 1)[1])
+subhome = subhome_path
 (subhome / "charter.md").write_text("dirty\n")
 refused = authority_run()
-assert refused.returncode == 2 and "not quiesced: tracked modifications remain" in refused.stderr, refused.stderr
+assert refused.returncode == 2 and "not quiesced: uncommitted or untracked work remains" in refused.stderr, refused.stderr
 subprocess.run(["git", "-C", str(subhome), "checkout", "--", "charter.md"], check=True)
 
 # The complete fixture mints five proved receipts.
@@ -452,8 +534,123 @@ PY
   pass "evidence mode selection follows the exact task metadata kind"
 }
 
+role_kind_cross_check() {
+  # The adversarial finding this closes: the evidence mode used to be chosen
+  # from the LOCAL task meta's kind= line alone. Flipping that one line (plus
+  # planting the two compartment state files) moved a role=author worker
+  # holding an UNLANDED COMMIT onto the compartment lane, where the ordinary
+  # "reachable from origin" landing proof does not apply - all five receipts
+  # minted proved and the real release moved the queue to `releasing` with the
+  # work still only local. The controller-owned role decides now, and both
+  # directions refuse.
+  local tmp
+  fm_test_tmproot_into tmp fm-authority-role-kind
+  mkdir -p "$tmp/home" "$tmp/accounts/codex/1" "$tmp/shim"
+  cat > "$tmp/shim/tmux" <<'SH'
+#!/bin/sh
+echo "no server running on /tmp/fm-secondmate-authority-test" >&2
+exit 1
+SH
+  chmod +x "$tmp/shim/tmux"
+  write_home_worktree "$tmp/subhome"
+  # A REAL origin with the base commit pushed, then an UNLANDED commit on top:
+  # the ordinary landing authority reaches its own proof and refuses because
+  # the work is not reachable from origin - which is exactly the refusal the
+  # compartment lane was bypassing.
+  git init --quiet --bare "$tmp/origin.git"
+  git -C "$tmp/origin.git" symbolic-ref HEAD refs/heads/main
+  git -C "$tmp/subhome" remote add origin "$tmp/origin.git"
+  git -C "$tmp/subhome" push --quiet -u origin main
+  printf 'unlanded\n' >"$tmp/subhome/feature.txt"
+  git -C "$tmp/subhome" add feature.txt
+  git -C "$tmp/subhome" commit --quiet -m "UNLANDED WORK"
+  write_compartment_fixture "$tmp/home" task-a >/dev/null || fail "compartment fixture build failed"
+  cat > "$tmp/home/state/task-a.meta" <<EOF
+window=fmtest:1
+worktree=$tmp/subhome
+kind=ship
+generation_id=gen-a
+account_home=$tmp/accounts/codex/1
+account_task=task-a
+EOF
+  PATH="$tmp/shim:$PATH" \
+  FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
+  FM_ACCOUNT_DIRECTORY_ROOT="$tmp/accounts" \
+  python3 - "$AUTHORITY" "$tmp/home" "$tmp/subhome" <<'PY' || fail "the controller role does not decide the evidence mode"
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+authority, home_raw, subhome_raw = sys.argv[1:]
+home = Path(home_raw)
+subhome = Path(subhome_raw)
+meta = home / "state" / "task-a.meta"
+worker_state = home / "worker-state.json"
+head = subprocess.run(["git", "-C", str(subhome), "rev-parse", "HEAD"],
+                      text=True, stdout=subprocess.PIPE, check=True).stdout.strip()
+
+def write_worker(role):
+    worker = {
+        "assignment_generation": "asg-00000001", "role": role,
+        "bindings": {"repository_generation": head, "home_binding": "1" * 64,
+                     "account_binding": "2" * 64, "worktree_binding": "3" * 64,
+                     "repository_binding": "4" * 64},
+        "cloud_instance_id": "cloud-1", "resources": {},
+    }
+    worker_state.write_text(json.dumps(worker, sort_keys=True, separators=(",", ":")))
+
+def set_kind(kind):
+    lines = [line for line in meta.read_text().splitlines() if not line.startswith("kind=")]
+    lines.insert(3, "kind=" + kind)
+    meta.write_text("\n".join(lines) + "\n")
+
+def run():
+    return subprocess.run([
+        "python3", authority, "--home", str(home), "--task", "task-a",
+        "--task-generation", "gen-a", "--assignment-generation", "asg-00000001",
+        "--worker-state", str(worker_state), "--output", str(home / "out.json"),
+    ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+# The reviewer's exact escalation: an ORDINARY author worker whose meta claims
+# a compartment. It must refuse on the role mismatch, never mint.
+write_worker("author")
+set_kind("secondmate")
+result = run()
+assert result.returncode == 2, (result.returncode, result.stdout)
+assert "the controller-owned worker role is 'author'" in result.stderr, result.stderr
+assert not (home / "out.json").exists(), "a refused authority still wrote a bundle"
+
+# Control: the SAME author worker on its honest meta refuses for the ordinary
+# reason - the commit is genuinely not landed. This is what the compartment
+# lane was letting through.
+set_kind("ship")
+result = run()
+assert result.returncode == 2, result.stdout
+assert "landing authority did not prove committed work reachable" in result.stderr, result.stderr
+
+# The mirror direction: a controller-owned compartment whose meta says
+# otherwise refuses too, rather than quietly taking the ordinary lane.
+write_worker("secondmate")
+set_kind("ship")
+result = run()
+assert result.returncode == 2, result.stdout
+assert "the task metadata kind is 'ship'" in result.stderr, result.stderr
+
+# Positive control: role and kind agreeing on secondmate reaches the
+# compartment evidence and mints (the fixture is a clean closed-out home).
+set_kind("secondmate")
+result = run()
+assert result.returncode == 0, result.stderr
+proof = json.loads((home / "out.json").read_text())
+assert all(v["verdict"] == "proved" for v in proof["authorities"].values()), proof["authorities"]
+PY
+  pass "the controller-owned worker role decides the evidence mode in both directions"
+}
+
 secondmate_evidence_refusal_matrix
 secondmate_authority_bundle_end_to_end
 ordinary_mode_selection_golden
+role_kind_cross_check
 
 echo "# fm-worker-authority-secondmate.test.sh: all assertions passed"

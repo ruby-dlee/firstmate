@@ -92,12 +92,20 @@ for marker in ("endpoint_evidence", "report_evidence", "landing_evidence", "acco
     assert marker in authority, marker
 for marker in (
     # The PR-6 compartment evidence mode: same five receipt names, secondmate
-    # semantics, selected by the ordinary task metadata's kind.
+    # semantics, gated on the CONTROLLER-OWNED worker role (never the local
+    # task metadata's kind alone), with the mailbox bound to the durable
+    # monitor state and the home head tethered to the assignment lineage.
     "secondmate_report_evidence", "secondmate_landing_evidence",
     "secondmate_worktree_evidence", "SECONDMATE_TERMINAL_ACKS",
-    '["secondmate"]',
+    'worker_role = worker.get("role", "author")',
+    'if worker_role == "secondmate":',
+    "compartment evidence is refused", "ordinary evidence is refused",
+    "a rewound or truncated outbox", "os.path.lexists",
+    "--untracked-files=all",
 ):
     assert marker in authority, marker
+# The compartment worktree receipt must not be laxer than the ordinary one.
+assert '"--untracked-files=no"' not in authority
 for marker in (
     "sixteen 4-vCPU workers", "$1,500", "3,500 aggregate author worker-hours",
     "downloaded self-contained form artifact", "returns through a file",
@@ -3863,6 +3871,71 @@ PY
   pass "surrender refuses live children without the orphan confirmation and durably reparents them with it"
 }
 
+childless_surrender_bytes_unchanged() {
+  # The orphan count is SCOPED to surrenders that actually orphaned children:
+  # every receipt's evidence_digest is taken over the surrender block, so an
+  # unconditional "orphaned_children": 0 would move all five digests on the
+  # ordinary childless lane that never orphaned anything.
+  compartment_fixture_env fm-worker-surrender-childless
+  python3 - "$WRAPPER" "$COMPARTMENT_ENVFILE" "$COMPARTMENT_FIXTURE" <<'PY' || fail "a childless surrender no longer mints its original bytes"
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+wrapper, envfile, fixture_path = sys.argv[1:]
+env = os.environ.copy()
+for line in Path(envfile).read_text().splitlines():
+    key, value = line.split("=", 1)
+    env[key] = value
+
+def run(*args, check=True):
+    result = subprocess.run([wrapper] + list(args), env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and result.returncode != 0:
+        raise AssertionError("{} failed: {}".format(args, result.stderr))
+    return result
+
+def binding(number):
+    return format(number, "064x")
+
+run("request", "--task", "task-1", "--task-generation", "gen-1",
+    "--home-binding", binding(1001), "--account-binding", binding(2001),
+    "--worktree-binding", binding(3001), "--repository-binding", binding(4001),
+    "--repository-generation", "repo-1", "--owner-kind", "primary", "--eligible")
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+state = json.loads((Path(env["FM_HOME"]) / "state/azure-workers/controller.json").read_text())
+slot = str(state["queue"]["task-1@gen-1"]["slot"])
+fixture = json.loads(Path(fixture_path).read_text())
+fixture["workers"][slot]["resources"]["vm"]["power_state"] = "VM deallocated"
+Path(fixture_path).write_text(json.dumps(fixture, sort_keys=True, separators=(",", ":")) + "\n")
+
+# A childless ORDINARY surrender - and the orphan flag is accepted but must
+# change nothing, since there is nothing to orphan.
+run("surrender", "--task", "task-1", "--task-generation", "gen-1",
+    "--reason", "ordinary childless surrender", "--output", str(Path(env["FM_HOME"]) / "s.json"),
+    "--confirm-surrender", "--confirm-orphan-children",
+    "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+proof = json.loads((Path(env["FM_HOME"]) / "s.json").read_text())
+assert "orphaned_children" not in proof["surrender"], proof["surrender"]
+assert sorted(proof["surrender"]) == [
+    "discarded_unlanded_executions", "last_execution_digest", "ordinary_refusal",
+    "power_state", "reason", "surrendered_at",
+], sorted(proof["surrender"])
+
+# The receipts are digests of exactly that block, so pinning the block pins
+# the bytes: recompute each evidence_digest the way the command does.
+import hashlib
+for name, receipt in proof["authorities"].items():
+    expected = hashlib.sha256(json.dumps(
+        {"authority": name, "surrender": proof["surrender"]},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert receipt["evidence_digest"] == expected, (name, receipt["evidence_digest"], expected)
+PY
+  pass "a childless surrender mints its original receipt bytes with no orphan key"
+}
+
 secondmate_release_children_positive_control() {
   # The design C item 6 positive control: release refuses under a live child,
   # and FINISHING that child (the ordinary release+reset lane, not a
@@ -5475,6 +5548,7 @@ concurrent_mutations_do_not_serialize
 wedged_slot_does_not_stop_the_fleet
 secondmate_role_bounds
 surrender_orphan_confirm
+childless_surrender_bytes_unchanged
 secondmate_release_children_positive_control
 compartment_status_projection
 message_lane_provider_contract

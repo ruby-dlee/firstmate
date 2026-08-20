@@ -69,6 +69,8 @@ for marker in (
     "roll_daily_baseline", "daily_bound_refusal", "idle_deallocate_due",
     "daily_cost_baseline", "FM_AZURE_WORKER_DAILY_BOUND_OVERRIDE", "idle_deallocated_at",
     "record_daily_override_use", "last_steer_at",
+    "--confirm-orphan-children", "reparented_to", "orphaned_children",
+    "compartment_projection",
 ):
     assert marker in controller, marker
 assert 'shape.add_argument("--required"' not in controller
@@ -89,6 +91,14 @@ for marker in ("fm.worker-execution/v1", "request_digest", "subprocess.run", "MA
 for marker in ("endpoint_evidence", "report_evidence", "landing_evidence", "account_evidence", "worktree_evidence"):
     assert marker in authority, marker
 for marker in (
+    # The PR-6 compartment evidence mode: same five receipt names, secondmate
+    # semantics, selected by the ordinary task metadata's kind.
+    "secondmate_report_evidence", "secondmate_landing_evidence",
+    "secondmate_worktree_evidence", "SECONDMATE_TERMINAL_ACKS",
+    '["secondmate"]',
+):
+    assert marker in authority, marker
+for marker in (
     "sixteen 4-vCPU workers", "$1,500", "3,500 aggregate author worker-hours",
     "downloaded self-contained form artifact", "returns through a file",
     "Combined author and specialized demand beyond the shared 128-vCPU ceiling remains queued",
@@ -104,6 +114,12 @@ for marker in (
 ):
     assert marker in doc, marker
 assert "hosted form service" in doc and "force-delete" in doc
+for marker in (
+    "--confirm-orphan-children", "reparented_to: primary",
+    "verify_release_against_worker", "children-quiesced",
+    "chained close ack",
+):
+    assert marker in doc, marker
 PY
   pass "provider seam, Azure identity fencing, cost boundary, Lavish contract, and acceptance controls are documented"
 }
@@ -3717,6 +3733,324 @@ PY
 }
 
 
+compartment_fixture_env() {  # <tmproot-label> -> sets COMPARTMENT_ENVFILE/COMPARTMENT_FIXTURE
+  # Shared stand-up for the PR-6 compartment units: fixture provider, envfile.
+  local tmp
+  fm_test_tmproot_into tmp "$1"
+  COMPARTMENT_TMP=$tmp
+  COMPARTMENT_FIXTURE="$tmp/provider-state.json"
+  mkdir -p "$tmp/home"
+  write_fixture_provider "$tmp/provider.py"
+  COMPARTMENT_ENVFILE="$tmp/env"
+  cat >"$COMPARTMENT_ENVFILE" <<EOF
+FM_HOME=$tmp/home
+FM_AZURE_SUBSCRIPTION_ID=$SUB
+FM_AZURE_DEPLOYMENT_GENERATION=dep-one
+FM_AZURE_OWNER_TAG=owner
+FM_AZURE_NAMING_PREFIX=fmtest
+FM_AZURE_WORKER_IDLE_COOLDOWN_SECONDS=0
+FM_WORKER_PROVIDER_COMMAND=python3 $tmp/provider.py
+FIXTURE_STATE=$COMPARTMENT_FIXTURE
+FM_WORKER_TEST_ALLOW_ASSERTED_BINDINGS=1
+EOF
+}
+
+surrender_orphan_confirm() {
+  # AMENDMENT 1 closed: surrendering a parent with live children refuses
+  # unless --confirm-orphan-children, and the flag path stamps a durable
+  # reparented_to note on every live child in the same lock hold.
+  compartment_fixture_env fm-worker-surrender-orphan
+  python3 - "$WRAPPER" "$COMPARTMENT_ENVFILE" "$COMPARTMENT_FIXTURE" <<'PY' || fail "the surrender orphan-confirm contract is not enforced"
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+wrapper, envfile, fixture_path = sys.argv[1:]
+env = os.environ.copy()
+for line in Path(envfile).read_text().splitlines():
+    key, value = line.split("=", 1)
+    env[key] = value
+
+def run(*args, check=True):
+    result = subprocess.run([wrapper] + list(args), env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and result.returncode != 0:
+        raise AssertionError("{} failed: {}".format(args, result.stderr))
+    return result
+
+def binding(number):
+    return format(number, "064x")
+
+state_path = Path(env["FM_HOME"]) / "state/azure-workers/controller.json"
+
+def controller_state():
+    return json.loads(state_path.read_text())
+
+# Compartment plus one ASSIGNED child; a second child stays QUEUED, so the
+# stamp path must cover both live shapes.
+run("request", "--task", "smc-1", "--task-generation", "gen-s1",
+    "--home-binding", binding(21), "--account-binding", binding(22),
+    "--worktree-binding", binding(23), "--repository-binding", binding(24),
+    "--repository-generation", "repo-s1", "--owner-kind", "primary",
+    "--role", "secondmate", "--eligible")
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+run("request", "--task", "child-1", "--task-generation", "gen-c1",
+    "--home-binding", binding(31), "--account-binding", binding(32),
+    "--worktree-binding", binding(33), "--repository-binding", binding(34),
+    "--repository-generation", "repo-c1", "--owner-kind", "secondmate", "--eligible",
+    "--parent-task", "smc-1", "--parent-task-generation", "gen-s1")
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+run("request", "--task", "child-2", "--task-generation", "gen-c2",
+    "--home-binding", binding(41), "--account-binding", binding(42),
+    "--worktree-binding", binding(43), "--repository-binding", binding(44),
+    "--repository-generation", "repo-c2", "--owner-kind", "secondmate", "--eligible",
+    "--parent-task", "smc-1", "--parent-task-generation", "gen-s1")
+state = controller_state()
+assert state["queue"]["smc-1@gen-s1"]["status"] == "assigned"
+assert state["queue"]["child-1@gen-c1"]["status"] == "assigned"
+assert state["queue"]["child-2@gen-c2"]["status"] == "queued"
+slot = str(state["queue"]["smc-1@gen-s1"]["slot"])
+
+# A hand-planted COMPLETE child (release+reset is the only honest path and is
+# exercised elsewhere): it must be untouched by the orphan stamping.
+state["queue"]["child-done@gen-cd"] = {
+    "schema": "fm.worker-request/v1", "task": "child-done", "task_generation": "gen-cd",
+    "parent_task": "smc-1", "parent_task_generation": "gen-s1",
+    "owner_kind": "secondmate", "role": "author", "status": "complete",
+}
+state_path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
+
+# Dark the parent compute (the TTL fires outside the controller).
+fixture = json.loads(Path(fixture_path).read_text())
+fixture["workers"][slot]["resources"]["vm"]["power_state"] = "VM deallocated"
+Path(fixture_path).write_text(json.dumps(fixture, sort_keys=True, separators=(",", ":")) + "\n")
+
+surrender = [
+    "surrender", "--task", "smc-1", "--task-generation", "gen-s1",
+    "--reason", "compartment authority evidence is unrecoverable",
+    "--output", str(Path(env["FM_HOME"]) / "surrender-smc.json"),
+    "--confirm-surrender", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"],
+]
+
+# Without the orphan confirmation: the exact refusal, and nothing persisted.
+refused = run(*surrender, check=False)
+expected = ("surrender refuses: 2 active children name parent smc-1; pass "
+            "--confirm-orphan-children to reparent them to the primary deliberately")
+assert refused.returncode != 0 and expected in refused.stderr, refused.stderr
+state = controller_state()
+assert state["workers"][slot].get("release_proof") is None
+assert all("reparented_to" not in entry for entry in state["queue"].values())
+
+# With the flag: surrender proceeds, both live children carry the durable
+# note, the complete child is untouched, and the block records the count.
+result = run(*surrender, "--confirm-orphan-children")
+assert "FM-SURRENDERED smc-1 gen-s1" in result.stdout, result.stdout
+state = controller_state()
+assert state["queue"]["child-1@gen-c1"]["reparented_to"] == "primary"
+assert state["queue"]["child-2@gen-c2"]["reparented_to"] == "primary"
+assert "reparented_to" not in state["queue"]["child-done@gen-cd"]
+proof = state["workers"][slot]["release_proof"]
+assert proof["surrender"]["orphaned_children"] == 2, proof["surrender"]
+assert all(v["verdict"] == "surrendered" for v in proof["authorities"].values())
+
+# The idempotent rerun re-issues the stored proof BEFORE the children gate,
+# so it needs no orphan flag and restamps nothing.
+again = run(*surrender)
+assert "already recorded" in again.stdout, again.stdout
+assert controller_state()["workers"][slot]["release_proof"] == proof
+PY
+  pass "surrender refuses live children without the orphan confirmation and durably reparents them with it"
+}
+
+secondmate_release_children_positive_control() {
+  # The design C item 6 positive control: release refuses under a live child,
+  # and FINISHING that child (the ordinary release+reset lane, not a
+  # withdrawal) makes the same parent release succeed.
+  compartment_fixture_env fm-worker-release-positive
+  python3 - "$WRAPPER" "$COMPARTMENT_ENVFILE" <<'PY' || fail "finishing the child did not unlock the parent release"
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+wrapper, envfile = sys.argv[1:]
+env = os.environ.copy()
+for line in Path(envfile).read_text().splitlines():
+    key, value = line.split("=", 1)
+    env[key] = value
+
+def run(*args, check=True):
+    result = subprocess.run([wrapper] + list(args), env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and result.returncode != 0:
+        raise AssertionError("{} failed: {}".format(args, result.stderr))
+    return result
+
+def binding(number):
+    return format(number, "064x")
+
+def controller_state():
+    return json.loads((Path(env["FM_HOME"]) / "state/azure-workers/controller.json").read_text())
+
+def proved_proof(task, generation, worker, seed):
+    proof = {
+        "schema": "fm.worker-release/v2", "home_binding": worker["bindings"]["home_binding"],
+        "task": task, "task_generation": generation,
+        "assignment_generation": worker["assignment_generation"],
+        "account_binding": worker["bindings"]["account_binding"],
+        "worktree_binding": worker["bindings"]["worktree_binding"],
+        "repository_binding": worker["bindings"]["repository_binding"],
+        "repository_generation": worker["bindings"]["repository_generation"],
+        "cloud_instance_id": worker["cloud_instance_id"], "resources": worker["resources"],
+        "authorities": {},
+    }
+    for offset, authority in enumerate(("endpoint", "report", "landing", "account", "worktree"), 5):
+        receipt = {
+            "schema": "fm.worker-authority/v1", "authority": authority,
+            "task": task, "task_generation": generation,
+            "assignment_generation": worker["assignment_generation"], "verdict": "proved",
+            "evidence_digest": binding(offset * 1000 + seed),
+        }
+        receipt["receipt_digest"] = hashlib.sha256(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        proof["authorities"][authority] = receipt
+    proof["proof_digest"] = hashlib.sha256(
+        json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    path = Path(env["FM_HOME"]) / "{}-proof.json".format(task)
+    path.write_text(json.dumps(proof, sort_keys=True, separators=(",", ":")))
+    return str(path)
+
+run("request", "--task", "smc-1", "--task-generation", "gen-s1",
+    "--home-binding", binding(21), "--account-binding", binding(22),
+    "--worktree-binding", binding(23), "--repository-binding", binding(24),
+    "--repository-generation", "repo-s1", "--owner-kind", "primary",
+    "--role", "secondmate", "--eligible")
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+run("request", "--task", "child-1", "--task-generation", "gen-c1",
+    "--home-binding", binding(31), "--account-binding", binding(32),
+    "--worktree-binding", binding(33), "--repository-binding", binding(34),
+    "--repository-generation", "repo-c1", "--owner-kind", "secondmate", "--eligible",
+    "--parent-task", "smc-1", "--parent-task-generation", "gen-s1")
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+state = controller_state()
+parent_worker = state["workers"][str(state["queue"]["smc-1@gen-s1"]["slot"])]
+child_worker = state["workers"][str(state["queue"]["child-1@gen-c1"]["slot"])]
+parent_proof = proved_proof("smc-1", "gen-s1", parent_worker, 77)
+
+# Live child: the parent release refuses atomically under the lock.
+refused = run("release", "--task", "smc-1", "--task-generation", "gen-s1",
+              "--proof-file", parent_proof, check=False)
+assert refused.returncode != 0, refused.stdout
+assert "release refuses: 1 active children name parent smc-1" in refused.stderr, refused.stderr
+
+# FINISH the child: ordinary release, then reconcile to complete (deallocate,
+# delete-compute, reset).
+child_proof = proved_proof("child-1", "gen-c1", child_worker, 88)
+run("release", "--task", "child-1", "--task-generation", "gen-c1", "--proof-file", child_proof)
+for _ in range(6):
+    run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+    if controller_state()["queue"]["child-1@gen-c1"]["status"] == "complete":
+        break
+assert controller_state()["queue"]["child-1@gen-c1"]["status"] == "complete"
+
+# The SAME parent proof now releases: the child bound was the only refusal.
+run("release", "--task", "smc-1", "--task-generation", "gen-s1", "--proof-file", parent_proof)
+assert controller_state()["queue"]["smc-1@gen-s1"]["status"] == "releasing"
+PY
+  pass "a finished child unlocks the exact parent release the live child refused"
+}
+
+compartment_status_projection() {
+  # PR-6 status projection: every live compartment appears in bounded status
+  # from controller.json fields only, additively for JSON consumers.
+  compartment_fixture_env fm-worker-compartment-status
+  python3 - "$WRAPPER" "$COMPARTMENT_ENVFILE" <<'PY' || fail "the compartment status projection golden failed"
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+wrapper, envfile = sys.argv[1:]
+env = os.environ.copy()
+for line in Path(envfile).read_text().splitlines():
+    key, value = line.split("=", 1)
+    env[key] = value
+
+def run(*args, check=True):
+    result = subprocess.run([wrapper] + list(args), env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and result.returncode != 0:
+        raise AssertionError("{} failed: {}".format(args, result.stderr))
+    return result
+
+def binding(number):
+    return format(number, "064x")
+
+state_path = Path(env["FM_HOME"]) / "state/azure-workers/controller.json"
+
+def controller_state():
+    return json.loads(state_path.read_text())
+
+# An author-only fleet projects an EMPTY compartments section and prints no
+# compartment line: the key is additive and the text output is unchanged.
+run("request", "--task", "task-1", "--task-generation", "gen-1",
+    "--home-binding", binding(11), "--account-binding", binding(12),
+    "--worktree-binding", binding(13), "--repository-binding", binding(14),
+    "--repository-generation", "repo-1", "--owner-kind", "primary", "--eligible")
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+status = json.loads(run("status", "--json").stdout)
+assert status["compartments"] == [], status["compartments"]
+assert "compartment:" not in run("status").stdout
+
+# One compartment, three lifetime children, one withdrawn: active 2, total 3.
+run("request", "--task", "smc-1", "--task-generation", "gen-s1",
+    "--home-binding", binding(21), "--account-binding", binding(22),
+    "--worktree-binding", binding(23), "--repository-binding", binding(24),
+    "--repository-generation", "repo-s1", "--owner-kind", "primary",
+    "--role", "secondmate", "--eligible")
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+for number in (1, 2, 3):
+    run("request", "--task", "child-{}".format(number), "--task-generation", "gen-c{}".format(number),
+        "--home-binding", binding(30 + number * 10), "--account-binding", binding(31 + number * 10),
+        "--worktree-binding", binding(32 + number * 10), "--repository-binding", binding(33 + number * 10),
+        "--repository-generation", "repo-c{}".format(number), "--owner-kind", "secondmate", "--eligible",
+        "--parent-task", "smc-1", "--parent-task-generation", "gen-s1")
+run("withdraw", "--task", "child-3", "--task-generation", "gen-c3", "--confirm-withdraw",
+    "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+
+state = controller_state()
+slot = state["queue"]["smc-1@gen-s1"]["slot"]
+worker = state["workers"][str(slot)]
+status = json.loads(run("status", "--json").stdout)
+assert status["compartments"] == [{
+    "task": "smc-1", "task_generation": "gen-s1", "status": "assigned",
+    "slot": slot, "assignment_generation": worker["assignment_generation"],
+    "children_active": 2, "children_total": 3,
+    "ttl_anchor": worker["assigned_at"] or worker["created_at"],
+}], status["compartments"]
+text = run("status").stdout
+expected_line = "compartment: task=smc-1@gen-s1 status=assigned slot={} children=2/3 ttl-anchor={}".format(
+    slot, worker["assigned_at"] or worker["created_at"])
+assert expected_line in text, (expected_line, text)
+
+# session_legs is projected only when a worker record actually carries it
+# (the additive design B.2 field): plant it and it appears, JSON and text.
+state = controller_state()
+state["workers"][str(slot)]["session_legs"] = 5
+state_path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
+status = json.loads(run("status", "--json").stdout)
+assert status["compartments"][0]["session_legs"] == 5, status["compartments"]
+assert expected_line + " legs=5" in run("status").stdout
+PY
+  pass "bounded status projects live compartments with children counts, TTL anchor, and optional legs"
+}
+
+
 message_lane_provider_contract() {
   local tmp
   fm_test_tmproot_into tmp fm-message-lane-provider
@@ -5141,6 +5475,9 @@ state_fence_and_revision_cas
 concurrent_mutations_do_not_serialize
 wedged_slot_does_not_stop_the_fleet
 secondmate_role_bounds
+surrender_orphan_confirm
+secondmate_release_children_positive_control
+compartment_status_projection
 message_lane_provider_contract
 message_lane_claim_exemption
 message_lane_static_contract

@@ -47,14 +47,21 @@ A refusal from that command is a real signal and is split three ways:
     proof disagree about the chain, which is the same harm class as a chain
     break and cannot be repaired by a later pass, so it FREEZES the lane
     through the same sticky .chain-break marker;
-  - "released work cannot record a compartment chain tip" is benign
-    end-of-life: the worker is already released, nothing further can be
-    attested, so the tip lane closes durably and quietly;
+  - "released work cannot record a compartment chain tip" is end-of-life, but
+    it is NOT taken at face value: the controller checks its release proof
+    BEFORE its monotonicity block, so a released worker answers a genuine
+    rewind or fork with this same string. The held tip is therefore read back
+    from the controller document and judged by the controller's own rule -
+    a contradiction freezes exactly as above, an unreadable document falls to
+    the retry class rather than closing, and only a tip that cannot contradict
+    this chain closes the lane durably and quietly;
   - anything else (not assigned, wrong assignment generation, an unreadable
     controller, an invocation failure) is about who owns the worker RIGHT NOW,
-    changes between passes by design (a resume mints a new assignment
-    generation), and would wedge a healthy compartment if it froze; it warns
-    loudly in the pane, is recorded durably, and retries on the next pass.
+    changes between passes by design (a re-spawn mints a new assignment
+    generation; a resume preserves it and bumps cloud_generation), and would
+    wedge a healthy compartment if it froze; it warns in the pane, is recorded
+    durably, and retries under exponential backoff, since every attempt takes
+    the controller lock.
 
 On a chain break this helper writes a loud .chain-break marker into the
 mailbox, delivers NOTHING (not even entries before the break - the whole
@@ -236,6 +243,13 @@ CHAIN_TIP_FORK_REFUSALS = (
     "already recorded a different digest",
 )
 CHAIN_TIP_RELEASED_REFUSAL = "released work cannot record a compartment chain tip"
+# The retry class re-invokes a command that TAKES THE CONTROLLER LOCK, so an
+# ownership refusal that persists must not turn a 15-second poll loop into
+# thousands of daily lock acquisitions and pane lines. Attempts back off
+# exponentially from this base to this cap, keyed on the durable error, and a
+# repeated identical refusal is recorded without being re-announced.
+CHAIN_TIP_RETRY_BASE_SECONDS = 30
+CHAIN_TIP_RETRY_CAP_SECONDS = 3600
 
 CHAIN_BREAK_MARKER = ".chain-break"
 
@@ -553,6 +567,50 @@ def chain_break_refuse(task, mailbox, reason, out):
     )
 
 
+def controller_worker_tip(controller, task, generation):
+    """The verified chain tip the CONTROLLER still holds for this compartment.
+
+    Returns ("tip", {...}), ("absent", None) when the document is readable but
+    carries no tip for this compartment (including a worker already reaped),
+    or ("unreadable", None) when the document cannot be read at all. The
+    caller must never treat "unreadable" as agreement.
+    """
+    if not controller:
+        return "unreadable", None
+    try:
+        with open(str(controller), encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        return "unreadable", None
+    if not isinstance(state, dict):
+        return "unreadable", None
+    item = (state.get("queue") or {}).get("{}@{}".format(task, generation))
+    if not isinstance(item, dict):
+        return "absent", None
+    worker = (state.get("workers") or {}).get(str(item.get("slot")))
+    if not isinstance(worker, dict):
+        return "absent", None
+    tip = worker.get("verified_chain_tip")
+    if not isinstance(tip, dict):
+        return "absent", None
+    return "tip", tip
+
+
+def chain_tip_forks(held, sequence, chain_digest):
+    """The controller's own monotonicity rule, applied to a tip read back here.
+
+    True when the held tip and the tip just proved cannot both describe one
+    chain: a rewind (the controller is past this sequence) or a fork (the same
+    sequence carrying a different digest).
+    """
+    held_sequence = held.get("sequence")
+    if isinstance(held_sequence, bool) or not isinstance(held_sequence, int):
+        return False
+    if sequence < held_sequence:
+        return True
+    return sequence == held_sequence and held.get("chain_digest") != chain_digest
+
+
 def record_chain_tip(args, state, sequence, chain_digest, out):
     """Attest the JUST-VERIFIED chain tip onto the controller-owned worker record.
 
@@ -583,6 +641,22 @@ def record_chain_tip(args, state, sequence, chain_digest, out):
         # UNCHANGED TIP: a replay would be idempotent and harmless, but this
         # runs every poll, so the durable pair is what keeps it cheap.
         return "", ""
+    held_error = state.get("chain_tip_error")
+    attempts = 0
+    if isinstance(held_error, dict) and not held_error.get("fatal"):
+        if (
+            held_error.get("sequence") == sequence
+            and held_error.get("chain_digest") == chain_digest
+        ):
+            # THE SAME CALL FAILED BEFORE. Backing off is not cosmetic: every
+            # attempt takes the controller lock, so an ownership refusal that
+            # persists would otherwise cost thousands of lock acquisitions and
+            # pane lines a day for one stuck compartment.
+            attempts = held_error.get("attempts")
+            attempts = attempts if isinstance(attempts, int) and not isinstance(attempts, bool) else 0
+            due = held_error.get("next_attempt_at")
+            if isinstance(due, (int, float)) and not isinstance(due, bool) and time.time() < due:
+                return "", ""
     argv = [
         args.lifecycle_bin, "compartment-chain-tip",
         "--task", args.task,
@@ -630,23 +704,70 @@ def record_chain_tip(args, state, sequence, chain_digest, out):
             "{}: {}".format(sequence, detail)
         )
     if CHAIN_TIP_RELEASED_REFUSAL in detail:
-        # BENIGN END OF LIFE: the worker already carries a release proof, so
-        # there is nothing left to attest and nothing is wrong. Close the lane
-        # durably so later passes stay quiet.
-        state["chain_tip_closed"] = {"reason": detail, "closed_at": now}
-        out.write(
-            "secondmate {}: the compartment worker is already released; chain tip recording is "
-            "closed at sequence {:08d}\n".format(args.task, sequence)
-        )
-        return "", ""
+        # END OF LIFE, BUT NOT AUTOMATICALLY BENIGN. The controller checks the
+        # release proof BEFORE its monotonicity block
+        # (fm-worker-lifecycle.py command_compartment_chain_tip), so a
+        # RELEASED worker answers a genuine rewind or fork with this same
+        # string. Closing on the string alone would let the one refusal class
+        # that must freeze arrive dressed as the one that must not, so the
+        # held tip is read back and judged by the controller's own rule.
+        verdict, held = controller_worker_tip(args.controller, args.task, args.task_generation)
+        if verdict == "tip" and chain_tip_forks(held, sequence, chain_digest):
+            state["chain_tip_error"] = {"check": detail, "observed_at": now, "fatal": True}
+            return "freeze", (
+                "the released compartment worker holds chain tip {} which cannot be the tip this "
+                "monitor verified at sequence {} (the controller checks its release proof before "
+                "its monotonicity rule, so the fork arrived as: {})".format(
+                    held.get("sequence"), sequence, detail)
+            )
+        if verdict == "unreadable":
+            # Cannot prove agreement, so must not close: closing here would
+            # silently downgrade the compartment to surrender on an unreadable
+            # document. Fall through to the retry class instead.
+            detail = (
+                "{} (and the controller document could not be read back to check the held tip "
+                "against sequence {})".format(detail, sequence)
+            )
+        else:
+            # Readable, and either no held tip or one this chain extends:
+            # nothing is left to attest and nothing is wrong.
+            state["chain_tip_closed"] = {
+                "reason": detail, "closed_at": now,
+                "held_tip": held.get("sequence") if isinstance(held, dict) else None,
+            }
+            state["chain_tip_error"] = None
+            out.write(
+                "secondmate {}: the compartment worker is already released and its held tip does "
+                "not contradict this chain; chain tip recording is closed at sequence {:08d}\n".format(
+                    args.task, sequence)
+            )
+            return "", ""
     # EVERYTHING ELSE is about who owns this worker right now (not assigned,
     # a moved assignment generation, an unreadable controller, a failed
     # invocation). Those change between passes by design, so this warns and
     # retries rather than wedging a healthy compartment.
-    state["chain_tip_error"] = {"check": detail, "observed_at": now, "fatal": False}
+    attempts += 1
+    delay = min(
+        CHAIN_TIP_RETRY_BASE_SECONDS * (2 ** (attempts - 1)), CHAIN_TIP_RETRY_CAP_SECONDS)
+    repeated = (
+        isinstance(held_error, dict)
+        and not held_error.get("fatal")
+        and held_error.get("check") == detail
+    )
+    state["chain_tip_error"] = {
+        "check": detail, "observed_at": now, "fatal": False,
+        "sequence": sequence, "chain_digest": chain_digest,
+        "attempts": attempts, "next_attempt_at": time.time() + delay,
+    }
+    if repeated:
+        # Recorded durably, announced once: the same refusal every pass is
+        # noise, and the durable record is where the count and the next
+        # attempt live.
+        return "", ""
     out.write(
         "warning: secondmate {}: the controller refused the verified chain tip {:08d} "
-        "(retrying next pass): {}\n".format(args.task, sequence, detail)
+        "(retrying in {}s, attempt {}; identical repeats are recorded durably rather than "
+        "reprinted): {}\n".format(args.task, sequence, delay, attempts, detail)
     )
     return "", ""
 
@@ -1584,6 +1705,10 @@ def main(argv=None):
     process.add_argument(
         "--lifecycle-bin", default="",
         help="the lifecycle CLI that records the verified chain tip on the worker record",
+    )
+    process.add_argument(
+        "--controller", default="",
+        help="the ONE money authority document, read back to judge a released worker's held tip",
     )
     relay = sub.add_parser(
         "child-relay",

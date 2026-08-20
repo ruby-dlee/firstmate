@@ -34,8 +34,11 @@
 #     ordinary release path instead of `surrender`. The command attests
 #     without verifying, so it is driven from inside the helper, strictly
 #     after the local proof; a monotonicity refusal freezes the lane like a
-#     chain break, an already-released refusal closes the lane quietly, and
-#     any other refusal warns and retries.
+#     chain break, an already-released refusal closes the lane quietly only
+#     once the held tip is read back and found not to contradict this chain
+#     (the controller checks its release proof before its monotonicity rule,
+#     so a fork can arrive wearing the released string), and any other
+#     refusal warns and retries under backoff.
 #   - CHILD RELAY: verified child-spawn and attach requests land under
 #     state/<id>.cloud-childreq/ and are validated, spent, or refused by
 #     bin/fm-secondmate-cloud-monitor.py child-relay (design B.5 steps 2-5).
@@ -386,7 +389,7 @@ process_mailbox() {  # <assignment>
       --task "$ID" --mailbox "$MAILBOX" --state-file "$STATE_FILE" \
       --worktree "$worktree" --childreq "$CHILDREQ" \
       --task-generation "$GENERATION" --assignment-generation "$assignment" \
-      --lifecycle-bin "$LIFECYCLE"
+      --lifecycle-bin "$LIFECYCLE" --controller "$CONTROLLER"
   )
   # Exit 3 (chain break) already rendered its loud refusal; the sticky
   # marker freezes relay in both directions from the next loop check.

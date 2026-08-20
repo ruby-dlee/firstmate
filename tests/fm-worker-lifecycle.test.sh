@@ -102,6 +102,12 @@ for marker in (
     "compartment evidence is refused", "ordinary evidence is refused",
     "a rewound or truncated outbox", "os.path.lexists",
     "--untracked-files=all",
+    # The compartment chain is verified BY CONTENT, and malformed durable
+    # state refuses instead of coercing to a permissive zero.
+    "secondmate_verified_chain", "secondmate_chain_extent",
+    "content differs from its content", "the recomputed chain at sequence",
+    "durable monitor state records no verified delivered",
+    "secondmate_report_sections",
 ):
     assert marker in authority, marker
 # The compartment worktree receipt must not be laxer than the ordinary one.
@@ -125,7 +131,7 @@ assert "hosted form service" in doc and "force-delete" in doc
 for marker in (
     "--confirm-orphan-children", "reparented_to: primary",
     "verify_release_against_worker", "children-quiesced",
-    "chained close ack",
+    "chained close ack", "BY CONTENT", "refuses outright instead of being read as zero",
 ):
     assert marker in doc, marker
 PY

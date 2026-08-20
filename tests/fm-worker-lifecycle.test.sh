@@ -3985,6 +3985,20 @@ assert "child-2@gen-c2" not in after["queue"], "a refused child still mutated th
 assert after["queue"] == before["queue"], "a refused child mutated the queue"
 assert parent_children_total() == 1, "a refused child still spent the lifetime bound"
 
+# 2b. The marker is LOAD BEARING, not decorative: even a home the primary's
+#     own registry names for smc-1 refuses while the directory itself is
+#     marked for someone else. Drop the marker check and this one admits.
+registry(("smc-1", stranger), ("smc-2", idle))
+refused = child("child-2b", "gen-c2b", stranger,
+                "--parent-task", "smc-1", "--parent-task-generation", "gen-s1",
+                check=False)
+assert refused.returncode != 0, refused.stdout
+assert "is marked for secondmate smc-9, not the parent compartment smc-1" in refused.stderr, \
+    refused.stderr
+assert "child-2b@gen-c2b" not in controller_state()["queue"], refused.stdout
+assert parent_children_total() == 1
+registry(("smc-1", compartment), ("smc-2", idle))
+
 # 3a. A home the primary never registered for this secondmate refuses, even
 #     though it plants the exact right marker.
 refused = child("child-3", "gen-c3", impostor,

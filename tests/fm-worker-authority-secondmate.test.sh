@@ -45,13 +45,6 @@ bundle_body = b"fixture-compartment-bundle"
 bundle_digest = hashlib.sha256(bundle_body).hexdigest()
 
 (state / (task + ".cloud-secondmate-status")).write_text("closed\n")
-(state / (task + ".cloud-secondmate-state.json")).write_text(json.dumps({
-    "delivered_sequence": 2,
-    "landed_bundles": [bundle_digest],
-    "kept_bundles": [],
-    "last_summary": {"reason": "close", "legs_completed": 2},
-    "verified_tip": {"sequence": 2},
-}, sort_keys=True, separators=(",", ":")) + "\n")
 
 mailbox = state / (task + ".cloud-mailbox")
 mailbox.mkdir(exist_ok=True)
@@ -83,6 +76,17 @@ for sequence, body in enumerate((
         json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 (mailbox / "bundle-00000001-{}.bundle".format(bundle_digest)).write_bytes(bundle_body)
 
+# The durable state is written from the chain that was actually built, so the
+# verified tip carries the REAL recomputed chain digest - the authority now
+# re-derives the chain by content and requires it to reproduce this tip.
+(state / (task + ".cloud-secondmate-state.json")).write_text(json.dumps({
+    "delivered_sequence": 2,
+    "landed_bundles": [bundle_digest],
+    "kept_bundles": [],
+    "last_summary": {"reason": "close", "legs_completed": 2},
+    "verified_tip": {"sequence": 2, "chain_digest": chain},
+}, sort_keys=True, separators=(",", ":")) + "\n")
+
 report = home / "data" / task
 report.mkdir(parents=True, exist_ok=True)
 (report / "completion.md").write_text(
@@ -108,6 +112,7 @@ secondmate_evidence_refusal_matrix() {
   write_home_worktree "$tmp/subhome"
   bundle_digest=$(write_compartment_fixture "$tmp/home" smc-1) || fail "compartment fixture build failed"
   python3 - "$AUTHORITY" "$tmp/home" "$tmp/subhome" "$bundle_digest" <<'PY' || fail "a secondmate evidence leg refusal is missing or indistinct"
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -225,33 +230,104 @@ expect(lambda: landing(),
        "frozen by a recorded outbox chain break")
 (mailbox / ".chain-break").unlink()
 
-# landing: the mailbox may never hold FEWER entries than the durable monitor
-# state recorded as delivered. Enumeration alone made an emptied or wiped
-# mailbox read as "provably none", releasing unlanded compartment work.
+# landing: THE THREE PROVEN FORGERIES. Each one minted all five proved
+# receipts and passed the real release CLI while a declared bundle was
+# unlanded, because the checks trusted things inside the attacker's own write
+# set - the mailbox filenames, and the durable state file that sits in the
+# same state/ directory. Verification is now by CONTENT over the chain's own
+# arithmetic, and malformed durable state refuses instead of zeroing.
 kept_entries = {entry.name: entry.read_bytes() for entry in mailbox.iterdir()}
-for entry in list(mailbox.iterdir()):
-    entry.unlink()
+
+def wipe_mailbox():
+    for entry in list(mailbox.iterdir()):
+        entry.unlink()
+
+def restore_mailbox():
+    for entry in list(mailbox.iterdir()):
+        entry.unlink()
+    for name, body in kept_entries.items():
+        (mailbox / name).write_bytes(body)
+
+def honest():
+    """A fresh copy of the state the honest monitor wrote, so one forgery
+    never inherits the previous one's edits."""
+    return json.loads(json.dumps(saved))
+
+# F1: empty the mailbox, then zero the very fields the completeness check read,
+# in the same JSON the attacker was already rewriting to set landed_bundles=[].
+value = honest()
+value["landed_bundles"] = []
+value["delivered_sequence"] = 0
+value.pop("verified_tip", None)
+put_state(value)
+wipe_mailbox()
+expect(lambda: landing(), "records no verified delivered outbox sequence")
+
+# F2 (the worst): leave delivered_sequence and verified_tip exactly as the
+# honest monitor wrote them and replace the real entries with well-named junk.
+# Cardinality and the name regex were the only gates, so contents were never
+# read: declared came out empty and the unlanded bundle vanished from view.
+value = honest()
+value["landed_bundles"] = []
+put_state(value)
+wipe_mailbox()
+for sequence in (1, 2):
+    (mailbox / "{:08d}-{}.json".format(sequence, "b" * 64)).write_text('{"kind":"noise"}')
+expect(lambda: landing(), "content differs from its content address")
+
+# F3: the type guards failed OPEN - a string or negative sequence coerced to 0.
+for forged in ("2", -1, 2.0, None, True):
+    value = honest()
+    value["landed_bundles"] = []
+    value["delivered_sequence"] = forged
+    put_state(value)
+    wipe_mailbox()
+    expect(lambda: landing(), "records no verified delivered outbox sequence")
+# ... and the same fail-open in the verified tip itself.
+for forged in ({"sequence": "2", "chain_digest": "a" * 64}, {"sequence": 2},
+               {"sequence": 2, "chain_digest": "nothex"}, {}, "tip", None):
+    value = honest()
+    value["verified_tip"] = forged
+    put_state(value)
+    expect(lambda: landing(), "verified chain tip")
+put_state(saved)
+restore_mailbox()
+
+# A wiped store re-minted as a fresh, internally consistent chain from genesis
+# must not verify: the durable tip is what ties the chain to this compartment.
+value = honest()
+value["landed_bundles"] = []
+put_state(value)
+wipe_mailbox()
+chain = "0" * 64
+for sequence, body in enumerate((
+    {"kind": "fm.secondmate-message/v1", "text": "fresh"},
+    {"kind": "fm.secondmate-leg-summary/v1", "reason": "close", "legs_completed": 2, "bundles": []},
+), 1):
+    message = dict(body, sequence=sequence)
+    unsigned = json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    content = hashlib.sha256(unsigned).hexdigest()
+    chain = hashlib.sha256((chain + content).encode()).hexdigest()
+    message["content_sha256"] = content
+    message["chain_digest"] = chain
+    (mailbox / "{:08d}-{}.json".format(sequence, content)).write_text(
+        json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+expect(lambda: landing(), "does not reproduce the durable verified tip")
+put_state(saved)
+restore_mailbox()
+
+# A truncated chain, a wiped mailbox, and a symlinked one all still refuse.
+wipe_mailbox()
 expect(lambda: landing(), "a rewound or truncated outbox")
-# the same, wiped rather than emptied in place
 mailbox.rmdir()
 expect(lambda: landing(), "its mailbox is absent or redirected")
-# ... and a SYMLINKED mailbox pointing at an empty directory is not the
-# monitor's mailbox either (is_dir() follows the link).
 decoy = home / "state" / "decoy-mailbox"
 decoy.mkdir()
 mailbox.symlink_to(decoy)
 expect(lambda: landing(), "its mailbox is absent or redirected")
 mailbox.unlink()
 mailbox.mkdir()
-for name, body in kept_entries.items():
-    (mailbox / name).write_bytes(body)
-# The durable verified tip counts too, even when delivered_sequence is 0.
-value = monitor_state()
-value["delivered_sequence"] = 0
-value["verified_tip"] = {"sequence": 9, "chain_digest": "f" * 64}
-put_state(value)
-expect(lambda: landing(), "a rewound or truncated outbox")
-put_state(saved)
+restore_mailbox()
 
 # landing: the compartment head must descend from the assignment's exact
 # starting repository generation, the same lineage tether the ordinary lane
@@ -259,20 +335,35 @@ put_state(saved)
 expect(lambda: landing("0" * 40),
        "does not descend from the assignment repository generation")
 
-# landing: provably none - a monitor that delivered nothing, with an empty
-# mailbox and nothing declared, still proves.
-value = monitor_state()
+# landing: "provably none" is about BUNDLES, not about an empty chain. A
+# VERIFIED chain whose leg summaries declare nothing, with nothing collected,
+# proves - and that is the only shape that does.
+value = honest()
 value["landed_bundles"] = []
-value["delivered_sequence"] = 0
-value["verified_tip"] = None
 put_state(value)
-for entry in list(mailbox.iterdir()):
-    entry.unlink()
+wipe_mailbox()
+chain = "0" * 64
+for sequence, body in enumerate((
+    {"kind": "fm.secondmate-message/v1", "text": "checking in"},
+    {"kind": "fm.secondmate-leg-summary/v1", "reason": "close", "legs_completed": 2, "bundles": []},
+), 1):
+    message = dict(body, sequence=sequence)
+    unsigned = json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    content = hashlib.sha256(unsigned).hexdigest()
+    chain = hashlib.sha256((chain + content).encode()).hexdigest()
+    message["content_sha256"] = content
+    message["chain_digest"] = chain
+    (mailbox / "{:08d}-{}.json".format(sequence, content)).write_text(
+        json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+value = honest()
+value["landed_bundles"] = []
+value["verified_tip"] = {"sequence": 2, "chain_digest": chain}
+put_state(value)
 empty = landing()
 assert b'"declared":[]' in empty and b'"landed":[]' in empty
-for name, body in kept_entries.items():
-    (mailbox / name).write_bytes(body)
 put_state(saved)
+restore_mailbox()
+
 # worktree: tracked modifications are not a quiesced home.
 (subhome / "charter.md").write_text("edited\n")
 expect(lambda: module.secondmate_worktree_evidence(home, task, values),

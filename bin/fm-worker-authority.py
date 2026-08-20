@@ -53,7 +53,9 @@ SECONDMATE_TERMINAL_ACKS = {
     "ttl-exhausted": "wall",
 }
 SECONDMATE_LEG_SUMMARY_KIND = "fm.secondmate-leg-summary/v1"
-SECONDMATE_MESSAGE_NAME = re.compile(r"^[0-9]{8}-[0-9a-f]{64}\.json$")
+SECONDMATE_MESSAGE_NAME = re.compile(r"^([0-9]{8})-([0-9a-f]{64})\.json$")
+SECONDMATE_GENESIS_CHAIN_DIGEST = "0" * 64
+SECONDMATE_HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SECONDMATE_BUNDLE_NAME = re.compile(r"^bundle-[0-9]{8}-([0-9a-f]{64})\.bundle$")
 SECONDMATE_MAX_MESSAGE_BYTES = 256 * 1024
 SECONDMATE_MAX_STATE_BYTES = 16 * 1024 * 1024
@@ -193,30 +195,148 @@ def secondmate_monitor_state(home, task):
     return state
 
 
+def secondmate_chain_canonical(value):
+    """The monitor's canonical form, byte for byte (ensure_ascii=False)."""
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+
+
+def secondmate_chain_extent(state):
+    """How much verified chain the durable monitor state commits to.
+
+    Fails CLOSED on anything malformed. An earlier version coerced a
+    non-integer, negative, or missing value to 0, which made the completeness
+    check vacuous: `delivered_sequence: "2"` as a string, or a dropped
+    verified_tip, zeroed the requirement and an emptied mailbox proved.
+
+    A compartment that reaches release has necessarily closed out, and the
+    closeout is itself a chained leg summary (the report receipt requires
+    last_summary.legs_completed >= 1), so a released compartment ALWAYS has a
+    delivered chain of at least one entry. There is no legitimate
+    zero-entry chain here; "provably none" is about BUNDLES, and is proved by
+    a verified chain whose leg summaries declare nothing."""
+    delivered = state.get("delivered_sequence")
+    if isinstance(delivered, bool) or not isinstance(delivered, int) or delivered < 1:
+        raise AuthorityError(
+            "secondmate landing authority: durable monitor state records no verified delivered "
+            "outbox sequence ({!r}); a closed-out compartment always delivered its leg summary".format(
+                delivered))
+    tip = state.get("verified_tip")
+    if not isinstance(tip, dict):
+        raise AuthorityError(
+            "secondmate landing authority: durable monitor state carries no verified chain tip")
+    sequence = tip.get("sequence")
+    chain_digest = tip.get("chain_digest")
+    if (
+        isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1
+        or not isinstance(chain_digest, str) or not SECONDMATE_HEX64.fullmatch(chain_digest)
+    ):
+        raise AuthorityError(
+            "secondmate landing authority: durable monitor state verified chain tip is malformed")
+    return delivered, sequence, chain_digest
+
+
+def secondmate_verified_chain(mailbox, delivered, tip_sequence, tip_digest):
+    """Re-derive the collected outbox chain BY CONTENT and return its verified
+    messages in order.
+
+    Filenames prove nothing: they are attacker-writable, and an earlier
+    version counted well-named files without ever reading them, so two junk
+    blobs named 00000001-<hex>.json / 00000002-<hex>.json satisfied a
+    cardinality check while declaring no bundles at all. The chain is
+    content-addressed and hash-chained precisely so it can be re-derived, and
+    this mirrors the monitor's own verify_mailbox: each entry's name digest
+    must equal the SHA-256 of its canonical unsigned body, its sequence field
+    must match its name, each chain_digest must extend the previous, and the
+    recomputed chain must reproduce the durable verified tip - which is what
+    stops a wiped store from being re-minted as a fresh self-consistent chain
+    from genesis."""
+    by_sequence = {}
+    for entry in sorted(mailbox.iterdir()):
+        if entry.is_symlink() or not entry.is_file():
+            continue
+        match = SECONDMATE_MESSAGE_NAME.fullmatch(entry.name)
+        if not match:
+            continue
+        sequence = int(match.group(1))
+        if sequence in by_sequence:
+            raise AuthorityError(
+                "secondmate landing authority: duplicate outbox sequence {:08d}".format(sequence))
+        by_sequence[sequence] = (match.group(2), entry)
+    total = len(by_sequence)
+    required = max(delivered, tip_sequence)
+    if total < required:
+        raise AuthorityError(
+            "secondmate landing authority: the collected mailbox holds {} outbox entries but the "
+            "durable monitor state records {} (a rewound or truncated outbox)".format(
+                total, required))
+    if sorted(by_sequence) != list(range(1, total + 1)):
+        raise AuthorityError(
+            "secondmate landing authority: collected outbox sequences are not exactly 1..{} "
+            "(a dropped or reordered entry)".format(total))
+    chain = SECONDMATE_GENESIS_CHAIN_DIGEST
+    verified = []
+    for sequence in range(1, total + 1):
+        content_digest, entry = by_sequence[sequence]
+        if entry.stat().st_size > SECONDMATE_MAX_MESSAGE_BYTES:
+            raise AuthorityError(
+                "secondmate landing authority found an oversized outbox entry: {}".format(entry.name))
+        try:
+            message = json.loads(entry.read_bytes().decode("utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            raise AuthorityError(
+                "secondmate landing authority cannot read outbox entry {}".format(entry.name))
+        if not isinstance(message, dict):
+            raise AuthorityError(
+                "secondmate landing authority: outbox entry {:08d} is not a JSON object".format(sequence))
+        unsigned = dict(message)
+        claimed_content = unsigned.pop("content_sha256", None)
+        claimed_chain = unsigned.pop("chain_digest", None)
+        if hashlib.sha256(secondmate_chain_canonical(unsigned)).hexdigest() != content_digest:
+            raise AuthorityError(
+                "secondmate landing authority: outbox entry {:08d} content differs from its content "
+                "address (tampered or substituted)".format(sequence))
+        if claimed_content != content_digest or message.get("sequence") != sequence:
+            raise AuthorityError(
+                "secondmate landing authority: outbox entry {:08d} does not bind its own name".format(
+                    sequence))
+        expected_chain = hashlib.sha256((chain + content_digest).encode()).hexdigest()
+        if claimed_chain != expected_chain:
+            raise AuthorityError(
+                "secondmate landing authority: outbox entry {:08d} chain_digest does not extend the "
+                "previous entry".format(sequence))
+        chain = expected_chain
+        verified.append((sequence, message))
+    if verified[tip_sequence - 1][1].get("chain_digest") != tip_digest:
+        raise AuthorityError(
+            "secondmate landing authority: the recomputed chain at sequence {} does not reproduce "
+            "the durable verified tip (a re-genesis or substitution)".format(tip_sequence))
+    return verified
+
+
 def secondmate_bundle_ledger(home, task):
     """Declared and collected outbox bundles against the monitor's durable
-    landed record.
+    landed record, over a chain re-derived BY CONTENT.
 
-    Enumeration alone is NOT sufficient evidence, and the earlier version of
-    this function wrongly assumed it was: declared/collected are derived by
-    scanning the collected mailbox, so wiping or emptying that directory made
-    both sets empty and "every bundle landed, or provably none" proved with an
-    empty landed record. The mailbox is local, mutable, and at release time
-    unowned - the monitor is dead by construction, since the endpoint receipt
-    proves its pane absent - which makes THIS the last reader, not a
-    second opinion.
+    Two earlier versions of this function were forgeable, and both failures
+    had the same shape: they trusted something the attacker can write. The
+    first trusted mere enumeration, so an emptied mailbox read as "provably
+    none". The second added a cardinality check against the durable monitor
+    state - but that state lives in the same state/ directory as the mailbox,
+    inside the attacker's write set, so counting well-named files proved
+    nothing.
 
-    So the durable monitor state is treated as the authority on how much the
-    chain must contain, exactly as the monitor itself treats it: the mailbox
-    may never hold fewer message entries than the monitor durably recorded as
-    delivered (or than its verified tip's sequence), and a monitor that
-    delivered anything at all must still have its mailbox. That is the same
-    rewound-outbox rule the monitor applies before it delivers anything.
+    What is NOT in the attacker's gift is the chain's own arithmetic: every
+    entry is content-addressed and hash-chained, so a forged mailbox must
+    reproduce SHA-256 to be accepted. This function therefore verifies the
+    chain rather than counting it, and refuses outright when the durable state
+    is malformed instead of coercing it to a permissive zero.
 
-    Within that bound, enumeration stays deliberately one-sided: chain
-    verification remains the monitor's job, and reading both leg-summary
-    declarations and collected bundle files by name means an unenumerated
-    bundle can only ADD to what must be proven landed, never subtract."""
+    Within a verified chain, enumeration stays deliberately one-sided:
+    declarations come from VERIFIED leg summaries, and collected bundle files
+    are read by name as well, so an unenumerated bundle can only ADD to what
+    must be proven landed, never subtract."""
     mailbox = home / "state" / (task + ".cloud-mailbox")
     # lexists, not exists: a DANGLING symlink named .chain-break is still a
     # marker in the mailbox, and exists() follows it into nothing, which
@@ -227,53 +347,28 @@ def secondmate_bundle_ledger(home, task):
     state = secondmate_monitor_state(home, task)
     landed = {entry for entry in state.get("landed_bundles") or [] if isinstance(entry, str)}
     kept = sorted(entry for entry in state.get("kept_bundles") or [] if isinstance(entry, str))
-    delivered = state.get("delivered_sequence")
-    if isinstance(delivered, bool) or not isinstance(delivered, int) or delivered < 0:
-        delivered = 0
-    tip = state.get("verified_tip")
-    tip_sequence = tip.get("sequence") if isinstance(tip, dict) else None
-    if isinstance(tip_sequence, bool) or not isinstance(tip_sequence, int) or tip_sequence < 0:
-        tip_sequence = 0
-    required = max(delivered, tip_sequence)
-    declared = set()
-    collected = set()
-    messages = 0
+    delivered, tip_sequence, tip_digest = secondmate_chain_extent(state)
     # A symlinked mailbox is not the monitor's mailbox: is_dir() follows the
     # link, so a link to an empty directory read as a legitimately empty chain.
     if mailbox.is_symlink() or not mailbox.is_dir():
-        if required:
-            raise AuthorityError(
-                "secondmate landing authority: the durable monitor state delivered {} outbox "
-                "entries but its mailbox is absent or redirected".format(required))
-        return state, landed, kept, declared, collected
+        raise AuthorityError(
+            "secondmate landing authority: the durable monitor state delivered {} outbox "
+            "entries but its mailbox is absent or redirected".format(delivered))
+    verified = secondmate_verified_chain(mailbox, delivered, tip_sequence, tip_digest)
+    declared = set()
+    for _sequence, message in verified:
+        if message.get("kind") != SECONDMATE_LEG_SUMMARY_KIND:
+            continue
+        for declaration in message.get("bundles") or []:
+            if isinstance(declaration, dict) and isinstance(declaration.get("sha256"), str):
+                declared.add(declaration["sha256"])
+    collected = set()
     for entry in sorted(mailbox.iterdir()):
         if entry.is_symlink() or not entry.is_file():
             continue
         bundle = SECONDMATE_BUNDLE_NAME.fullmatch(entry.name)
         if bundle:
             collected.add(bundle.group(1))
-            continue
-        if not SECONDMATE_MESSAGE_NAME.fullmatch(entry.name):
-            continue
-        messages += 1
-        if entry.stat().st_size > SECONDMATE_MAX_MESSAGE_BYTES:
-            raise AuthorityError(
-                "secondmate landing authority found an oversized outbox entry: {}".format(entry.name))
-        try:
-            message = json.loads(entry.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raise AuthorityError(
-                "secondmate landing authority cannot read outbox entry {}".format(entry.name))
-        if not isinstance(message, dict) or message.get("kind") != SECONDMATE_LEG_SUMMARY_KIND:
-            continue
-        for declaration in message.get("bundles") or []:
-            if isinstance(declaration, dict) and isinstance(declaration.get("sha256"), str):
-                declared.add(declaration["sha256"])
-    if messages < required:
-        raise AuthorityError(
-            "secondmate landing authority: the collected mailbox holds {} outbox entries but the "
-            "durable monitor state records {} (a rewound or truncated outbox)".format(
-                messages, required))
     return state, landed, kept, declared, collected
 
 
@@ -302,7 +397,47 @@ def secondmate_report_evidence(home, task):
         raise AuthorityError(
             "secondmate report authority lacks the chained close ack for terminal status {!r}".format(terminal))
     content = report_evidence(home, task)
+    # The shared report_evidence stays VERBATIM (design B.7, and it serves the
+    # ordinary lane too), so this is an ADDITIONAL compartment-only check on
+    # top of it. The shared one is text.find() plus monotonic position, which
+    # accepts headings inside a fenced code block, mid-sentence in prose,
+    # concatenated with no whitespace, or as a body-less skeleton. For a
+    # compartment the closeout report is the only human-readable account of a
+    # long-lived session, so require each heading to actually open a section:
+    # at the start of its own line, outside any fence, with content under it.
+    secondmate_report_sections(content)
     return "{}\0{}\0{}\0".format(terminal, ack, legs).encode() + content
+
+
+def secondmate_report_sections(content):
+    """Every contract heading opens a real section, in order, outside fences."""
+    fenced = False
+    seen = []
+    bodies = {}
+    current = None
+    for raw in content.decode("utf-8").splitlines():
+        line = raw.strip()
+        if line.startswith("```") or line.startswith("~~~"):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        if raw.lstrip().startswith("## ") and raw.lstrip() in REQUIRED_HEADINGS:
+            current = raw.lstrip()
+            seen.append(current)
+            bodies.setdefault(current, "")
+            continue
+        if current is not None and line:
+            bodies[current] += line
+    if seen != list(REQUIRED_HEADINGS):
+        raise AuthorityError(
+            "secondmate report authority: the closeout report does not open the exact ordered "
+            "contract sections outside code fences")
+    empty = [heading for heading in REQUIRED_HEADINGS if not bodies.get(heading)]
+    if empty:
+        raise AuthorityError(
+            "secondmate report authority: closeout report section(s) {} carry no content".format(
+                ", ".join(empty)))
 
 
 def secondmate_landing_evidence(home, task, worktree, repository_generation):

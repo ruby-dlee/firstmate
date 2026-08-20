@@ -3767,6 +3767,46 @@ compartment_child_task_home() {
   # (the identity of the ONE money document) stays on the primary. Every
   # binding here is a REAL mint through authoritative_request_bindings.
   local tmp provider fixture envfile
+  # Structural pin: the authorization is decided INSIDE the one exclusive hold
+  # that inserts, and before the bounds it anchors. Outside the lock it would
+  # be a check against a document another process may have moved on by the
+  # time the insert lands, and the queue would admit on stale authority.
+  python3 - "$CONTROLLER" <<'PY' || fail "the task home authorization left the controller lock hold"
+import ast
+import sys
+from pathlib import Path
+
+tree = ast.parse(Path(sys.argv[1]).read_text(encoding="utf-8"))
+command_request = next(
+    node for node in tree.body
+    if isinstance(node, ast.FunctionDef) and node.name == "command_request"
+)
+
+
+def calls(scope, name):
+    return [
+        node for node in ast.walk(scope)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+    ]
+
+
+holds = [
+    node for node in ast.walk(command_request)
+    if isinstance(node, ast.With) and calls(ast.Module(body=[
+        ast.Expr(value=item.context_expr) for item in node.items], type_ignores=[]),
+        "controller_lock")
+]
+assert len(holds) == 1, holds
+hold = holds[0]
+inside = calls(ast.Module(body=hold.body, type_ignores=[]), "authorize_task_home")
+everywhere = calls(command_request, "authorize_task_home")
+assert len(inside) == 1, "authorize_task_home is not called inside the controller lock hold"
+assert len(everywhere) == 1, "authorize_task_home is also called outside the lock hold"
+bounds = calls(ast.Module(body=hold.body, type_ignores=[]), "enforce_child_bounds")
+assert len(bounds) == 1, bounds
+assert inside[0].lineno < bounds[0].lineno, \
+    "the task home is authorized after the bounds it anchors"
+PY
   fm_test_tmproot_into tmp fm-worker-task-home
   provider="$tmp/provider.py"
   fixture="$tmp/provider-state.json"

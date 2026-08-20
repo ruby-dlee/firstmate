@@ -668,6 +668,12 @@ class Relay:
             handled = self.childreq / ".handled-{}".format(entry.name[:-len(".json")])
             if handled.exists():
                 continue
+            # The marker is written AFTER the handler on purpose: a crash mid
+            # handling replays this request on the next pass, where the durable
+            # self-digest verdict turns an already-spent intent into a loud
+            # duplicate refusal. Marking first would instead drop a request
+            # silently, which is the one outcome the delivered-refusal rule
+            # exists to prevent.
             self.handle(entry, match.group(2))
             write_atomic(handled, b"")
         self.mirror_child_status()

@@ -21,6 +21,43 @@ REQUIRED_HEADINGS = (
     "## Artifacts", "## Follow-ups",
 )
 
+# Secondmate compartment evidence (R2/R3 design B.7). The five receipt names
+# and the fm.worker-release/v2 shape are IDENTICAL to the ordinary mode - the
+# lifecycle's release_receipt and verify_release_against_worker stay
+# unmodified - only what each receipt PROVES changes when the ordinary task
+# metadata records kind=secondmate:
+#   endpoint -> the compartment monitor pane is absent (same backend oracle).
+#   report   -> session closeout: the monitor's terminal status file, the
+#               chained close ack in its durable state, and the ordered
+#               completion.md contract (report_evidence, reused verbatim).
+#   landing  -> every chained outbox bundle landed into the local secondmate
+#               home worktree, or provably none.
+#   account  -> unchanged.
+#   worktree -> the secondmate home is quiesced: exact repository root, no
+#               tracked modifications, no unlanded outbox bundles. Children
+#               are deliberately NOT consulted here - command_release owns
+#               the children-quiesced refusal under the controller lock.
+#
+# The durable shapes below bind to bin/fm-secondmate-cloud-monitor.{sh,py}
+# (branch fm/secondmate-cloud-monitor): the terminal status file
+# state/<task>.cloud-secondmate-status holds one of closed|idle|ttl-exhausted;
+# the durable monitor state state/<task>.cloud-secondmate-state.json carries
+# last_summary {reason, legs_completed}, landed_bundles, kept_bundles; the
+# mailbox state/<task>.cloud-mailbox holds the collected chained outbox
+# (<seq8>-<sha256>.json messages, bundle-<seq8>-<sha256>.bundle bundles, and
+# a sticky .chain-break marker on a refused chain).
+SECONDMATE_TERMINAL_ACKS = {
+    # terminal status line -> the leg-summary reason that acknowledges it
+    "closed": "close",
+    "idle": "idle",
+    "ttl-exhausted": "wall",
+}
+SECONDMATE_LEG_SUMMARY_KIND = "fm.secondmate-leg-summary/v1"
+SECONDMATE_MESSAGE_NAME = re.compile(r"^[0-9]{8}-[0-9a-f]{64}\.json$")
+SECONDMATE_BUNDLE_NAME = re.compile(r"^bundle-[0-9]{8}-([0-9a-f]{64})\.bundle$")
+SECONDMATE_MAX_MESSAGE_BYTES = 256 * 1024
+SECONDMATE_MAX_STATE_BYTES = 16 * 1024 * 1024
+
 
 class AuthorityError(RuntimeError):
     pass
@@ -141,6 +178,133 @@ def landing_evidence(worktree, repository_generation):
     raise AuthorityError("landing authority did not prove committed work reachable from the origin remote")
 
 
+def secondmate_monitor_state(home, task):
+    """The compartment monitor's durable state, or a refusal. Its existence is
+    itself evidence: the monitor wrote it while verifying the outbox chain."""
+    path = home / "state" / (task + ".cloud-secondmate-state.json")
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > SECONDMATE_MAX_STATE_BYTES:
+        raise AuthorityError("secondmate authority has no durable monitor state")
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise AuthorityError("secondmate authority has no durable monitor state")
+    if not isinstance(state, dict):
+        raise AuthorityError("secondmate authority has no durable monitor state")
+    return state
+
+
+def secondmate_bundle_ledger(home, task):
+    """Declared and collected outbox bundles against the monitor's durable
+    landed record. Enumeration is deliberately conservative and one-sided:
+    chain verification stays with the monitor (the chain authority); this
+    reads every collected leg summary for its bundle declarations and every
+    collected bundle file by name, so a declared-but-never-landed bundle can
+    only ever ADD to what must be proven landed, never subtract."""
+    mailbox = home / "state" / (task + ".cloud-mailbox")
+    if (mailbox / ".chain-break").exists():
+        raise AuthorityError(
+            "secondmate landing authority is frozen by a recorded outbox chain break")
+    state = secondmate_monitor_state(home, task)
+    landed = {entry for entry in state.get("landed_bundles") or [] if isinstance(entry, str)}
+    kept = sorted(entry for entry in state.get("kept_bundles") or [] if isinstance(entry, str))
+    declared = set()
+    collected = set()
+    if mailbox.is_dir():
+        for entry in sorted(mailbox.iterdir()):
+            if entry.is_symlink() or not entry.is_file():
+                continue
+            bundle = SECONDMATE_BUNDLE_NAME.fullmatch(entry.name)
+            if bundle:
+                collected.add(bundle.group(1))
+                continue
+            if not SECONDMATE_MESSAGE_NAME.fullmatch(entry.name):
+                continue
+            if entry.stat().st_size > SECONDMATE_MAX_MESSAGE_BYTES:
+                raise AuthorityError(
+                    "secondmate landing authority found an oversized outbox entry: {}".format(entry.name))
+            try:
+                message = json.loads(entry.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                raise AuthorityError(
+                    "secondmate landing authority cannot read outbox entry {}".format(entry.name))
+            if not isinstance(message, dict) or message.get("kind") != SECONDMATE_LEG_SUMMARY_KIND:
+                continue
+            for declaration in message.get("bundles") or []:
+                if isinstance(declaration, dict) and isinstance(declaration.get("sha256"), str):
+                    declared.add(declaration["sha256"])
+    return state, landed, kept, declared, collected
+
+
+def secondmate_report_evidence(home, task):
+    """Session closeout: terminal status file, chained close ack, completion.md."""
+    status_path = home / "state" / (task + ".cloud-secondmate-status")
+    if status_path.is_symlink() or not status_path.is_file():
+        raise AuthorityError("secondmate report authority lacks the terminal session status")
+    try:
+        terminal = status_path.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        raise AuthorityError("secondmate report authority lacks the terminal session status")
+    ack = SECONDMATE_TERMINAL_ACKS.get(terminal)
+    if ack is None:
+        raise AuthorityError(
+            "secondmate report authority terminal status is unrecognized: {!r}".format(terminal))
+    summary = secondmate_monitor_state(home, task).get("last_summary")
+    legs = (summary or {}).get("legs_completed") if isinstance(summary, dict) else None
+    if (
+        not isinstance(summary, dict)
+        or summary.get("reason") != ack
+        or isinstance(legs, bool)
+        or not isinstance(legs, int)
+        or legs < 1
+    ):
+        raise AuthorityError(
+            "secondmate report authority lacks the chained close ack for terminal status {!r}".format(terminal))
+    content = report_evidence(home, task)
+    return "{}\0{}\0{}\0".format(terminal, ack, legs).encode() + content
+
+
+def secondmate_landing_evidence(home, task):
+    """Every chained outbox bundle landed into the local home worktree, or
+    provably none: the durable monitor state exists, keeps nothing, and every
+    declared or collected bundle digest appears in its landed record."""
+    state, landed, kept, declared, collected = secondmate_bundle_ledger(home, task)
+    if kept:
+        raise AuthorityError(
+            "secondmate landing authority found bundles kept unlanded: {}".format(",".join(kept)))
+    unlanded = sorted((declared | collected) - landed)
+    if unlanded:
+        raise AuthorityError(
+            "secondmate landing authority found unlanded outbox bundles: {}".format(",".join(unlanded)))
+    return canonical({
+        "delivered_sequence": state.get("delivered_sequence"),
+        "declared": sorted(declared),
+        "landed": sorted(landed),
+    })
+
+
+def secondmate_worktree_evidence(home, task, values):
+    """Home quiesced: the exact secondmate home worktree root with no tracked
+    modifications and no unlanded outbox bundles. Untracked files are the
+    home's ordinary runtime state, so cleanliness is tracked-files-only here
+    (the same clause the monitor's own landing gate uses). Children are
+    deliberately NOT consulted: command_release refuses live children under
+    the controller lock, so this receipt stays advisory for them."""
+    worktree = Path(exactly(values, "worktree")).resolve()
+    if worktree.is_symlink() or not worktree.is_dir() or Path(git(worktree, "rev-parse", "--show-toplevel")).resolve() != worktree:
+        raise AuthorityError("secondmate home worktree authority is not the exact repository root")
+    if git(worktree, "status", "--porcelain=v1", "--untracked-files=no"):
+        raise AuthorityError(
+            "secondmate home worktree authority is not quiesced: tracked modifications remain")
+    _state, landed, kept, declared, collected = secondmate_bundle_ledger(home, task)
+    if kept or (declared | collected) - landed:
+        raise AuthorityError(
+            "secondmate home worktree authority is not quiesced: unlanded outbox bundles remain")
+    common = Path(git(worktree, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = (worktree / common).resolve()
+    return "{}\0{}\0{}".format(worktree, common.resolve(), git(worktree, "rev-parse", "HEAD")).encode(), worktree
+
+
 def account_evidence(values, task, home):
     account_home = exactly(values, "account_home")
     if not Path(account_home).resolve().is_dir():
@@ -202,14 +366,26 @@ def main():
     worker = json.loads(Path(args.worker_state).read_text(encoding="utf-8"))
     if worker["assignment_generation"] != args.assignment_generation:
         raise AuthorityError("worker assignment generation differs")
-    worktree_info, worktree = worktree_evidence(args.task, values)
+    kind_entries = values.get("kind", [])
+    if len(kind_entries) > 1:
+        raise AuthorityError("task metadata kind identity is not exact")
+    if kind_entries == ["secondmate"]:
+        # The secondmate compartment evidence mode (design B.7): same bundle,
+        # same five receipt names, compartment semantics. The bundle still
+        # verifies through the lifecycle's UNMODIFIED release_receipt and
+        # verify_release_against_worker.
+        worktree_info, _worktree = secondmate_worktree_evidence(home, args.task, values)
+        report_authority = lambda: secondmate_report_evidence(home, args.task)
+        landing_authority = lambda: secondmate_landing_evidence(home, args.task)
+    else:
+        worktree_info, worktree = worktree_evidence(args.task, values)
+        report_authority = lambda: report_evidence(home, args.task)
+        landing_authority = lambda: landing_evidence(
+            worktree, worker["bindings"]["repository_generation"])
     authorities = {
         "endpoint": receipt("endpoint", args.task, generation, args.assignment_generation, endpoint_evidence(home, args.task, values)),
-        "report": receipt("report", args.task, generation, args.assignment_generation, report_evidence(home, args.task)),
-        "landing": receipt(
-            "landing", args.task, generation, args.assignment_generation,
-            landing_evidence(worktree, worker["bindings"]["repository_generation"]),
-        ),
+        "report": receipt("report", args.task, generation, args.assignment_generation, report_authority()),
+        "landing": receipt("landing", args.task, generation, args.assignment_generation, landing_authority()),
         "account": receipt("account", args.task, generation, args.assignment_generation, account_evidence(values, args.task, home)),
         "worktree": receipt("worktree", args.task, generation, args.assignment_generation, worktree_info),
     }

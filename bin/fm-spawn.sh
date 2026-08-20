@@ -4422,11 +4422,12 @@ spawn_cloud_persist_convergence_artifacts() {
         # not persisted here is unreachable in production no matter what the
         # docs say. Bare names only (a project directory name), never a path
         # and never a secret.
-        for var in FM_SECONDMATE_CHILD_PROJECT; do
-          [ -n "${!var+x}" ] || continue
-          case "${!var}" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
-          printf 'export %s=%q\n' "$var" "${!var}"
-        done
+        if [ -n "${FM_SECONDMATE_CHILD_PROJECT:-}" ]; then
+          case "$FM_SECONDMATE_CHILD_PROJECT" in
+            *[!A-Za-z0-9._-]*) : ;;
+            *) printf 'export FM_SECONDMATE_CHILD_PROJECT=%q\n' "$FM_SECONDMATE_CHILD_PROJECT" ;;
+          esac
+        fi
       fi
       for var in $SPAWN_CLOUD_ENV_ALLOWLIST; do
         [ -n "${!var+x}" ] || continue

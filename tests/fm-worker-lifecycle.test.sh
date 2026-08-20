@@ -4435,18 +4435,29 @@ assert final["queue"]["child-1@gen-c1"]["status"] in ("releasing", "complete"), 
     final["queue"]["child-1@gen-c1"]
 
 # A tampered durable task home cannot redirect the authority lane: the recorded
-# home_binding is the fence.
+# home_binding is the fence. The decoy is a home that would otherwise mint the
+# receipts successfully, so dropping the fence ADMITS a foreign home rather
+# than merely changing which error appears.
+decoy = root / "homes" / "decoy"
+(decoy / "state").mkdir(parents=True, exist_ok=True)
+(decoy / "bin").mkdir(parents=True, exist_ok=True)
+(decoy / "AGENTS.md").write_text("fixture home\n")
+(decoy / ".fm-secondmate-home").write_text("smc-1\n")
+(decoy / "data" / "child-1").mkdir(parents=True, exist_ok=True)
+(decoy / "data" / "child-1" / "completion.md").write_text(
+    (sub / "data" / "child-1" / "completion.md").read_text())
+(decoy / "state" / "child-1.meta").write_text((sub / "state" / "child-1.meta").read_text())
 tampered = json.loads((primary / "state/azure-workers/controller.json").read_text())
 victim = tampered["workers"].get(str(item["slot"]))
-if victim is not None:
-    victim["task_home"] = str(root / "homes")
-    (primary / "state/azure-workers/controller.json").write_text(
-        json.dumps(tampered, sort_keys=True, separators=(",", ":")))
-    refused = run("authority-receipt", "--task", "child-1", "--task-generation", "gen-c1",
-                  "--assignment-generation", assignment, "--output", str(receipt_path),
-                  check=False)
-    assert refused.returncode != 0, refused.stdout
-    assert "does not match its recorded home binding" in refused.stderr, refused.stderr
+assert victim is not None, "the released worker record vanished before the fence check"
+victim["task_home"] = str(decoy)
+(primary / "state/azure-workers/controller.json").write_text(
+    json.dumps(tampered, sort_keys=True, separators=(",", ":")))
+refused = run("authority-receipt", "--task", "child-1", "--task-generation", "gen-c1",
+              "--assignment-generation", assignment, "--output", str(receipt_path),
+              check=False)
+assert refused.returncode != 0, "a foreign task home minted receipts: {}".format(refused.stdout)
+assert "does not match its recorded home binding" in refused.stderr, refused.stderr
 PY
   pass "an admitted compartment child mints its five receipts from the task home and releases through the unchanged path"
 }
@@ -4577,13 +4588,18 @@ run("request", "--task", "smc-1", "--task-generation", "gen-s1",
 run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
 
 
-def child(number, home, check=False):
+def child(number, home, check=False, cwd=None):
     task = "reg-child-{}".format(number)
     task_meta(sub, task, "gen-r{}".format(number))
     task_meta(other, task, "gen-r{}".format(number))
-    return run("request", "--task", task, "--task-generation", "gen-r{}".format(number),
-               "--owner-kind", "secondmate", "--eligible", "--task-home", str(home),
-               "--parent-task", "smc-1", "--parent-task-generation", "gen-s1", check=check)
+    args = ["request", "--task", task, "--task-generation", "gen-r{}".format(number),
+            "--owner-kind", "secondmate", "--eligible", "--task-home", str(home),
+            "--parent-task", "smc-1", "--parent-task-generation", "gen-s1"]
+    result = subprocess.run([wrapper] + args, env=env, text=True, cwd=cwd,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and result.returncode != 0:
+        raise AssertionError("{} failed: {}".format(args, result.stderr))
+    return result
 
 
 shapes = [
@@ -4598,13 +4614,23 @@ shapes = [
     ("one home under two ids",
      [good, "- smc-dup - the same home (home: {}; scope: everything; projects: ; added 2026-08-20)\n".format(sub)]),
 ]
+# Every shape is exercised even after one fails, so a weakened reader reports
+# ALL the shapes it admits rather than stopping at the first.
+admitted = []
+misrefused = []
 for number, (label, lines) in enumerate(shapes, start=1):
     write_registry(*lines)
     assert not canonical_reader_accepts("smc-1"), \
         "the canonical reader ACCEPTS the {} shape, so this case proves nothing".format(label)
-    refused = child(number, sub)
-    assert refused.returncode != 0, "{} was ADMITTED: {}".format(label, refused.stdout)
-    assert "does not validly register secondmate smc-1" in refused.stderr, (label, refused.stderr)
+    # The relative shape runs from the directory it would resolve against, so a
+    # cwd-anchored reader really does admit here instead of missing by luck.
+    result = child(number, sub, cwd=str(root) if label == "relative home" else None)
+    if result.returncode == 0:
+        admitted.append(label)
+    elif "does not validly register secondmate smc-1" not in result.stderr:
+        misrefused.append((label, result.stderr.strip()[-200:]))
+assert not admitted, "shapes the canonical reader refuses were ADMITTED: {}".format(admitted)
+assert not misrefused, misrefused
 
 # A valid registry that simply does not name this secondmate refuses the same way.
 write_registry("- smc-2 - another compartment (home: {}; scope: everything; projects: ; added 2026-08-20)\n".format(other))

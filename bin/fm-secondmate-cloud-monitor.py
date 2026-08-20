@@ -20,6 +20,12 @@ Chain contract (must match bin/fm-secondmate-session.py exactly):
   are not chain entries; they are declared inside chained leg summaries and
   verified size-and-digest against that declaration before any landing.
 
+Verification is STATEFUL: the durable state file carries the verified tip
+(sequence + chain_digest), so a store that was rewound below what was
+already delivered, or wiped and re-minted as a fresh self-consistent chain
+from genesis, refuses instead of verifying - a chain that merely hangs
+together is not the chain this compartment was speaking on.
+
 On a chain break this helper writes a loud .chain-break marker into the
 mailbox, delivers NOTHING (not even entries before the break - the whole
 mailbox is refused), retains every file, and exits 3. The marker is sticky:
@@ -122,6 +128,7 @@ def load_state(path):
     state.setdefault("landed_bundles", [])
     state.setdefault("kept_bundles", [])
     state.setdefault("last_summary", None)
+    state.setdefault("verified_tip", None)
     return state
 
 
@@ -379,12 +386,53 @@ def command_process_mailbox(args, out):
         chain_break_refuse(args.task, mailbox, str(exc), out)
         return 3
     delivered = state.get("delivered_sequence") or 0
+    # The durable tip is what makes verification stateful across passes: a
+    # self-consistent chain is NOT enough, because an attacker who can write
+    # the store can wipe it and mint a fresh chain from genesis. Two checks,
+    # both BEFORE anything is delivered:
+    #   1. the store may never hold fewer entries than were already
+    #      delivered (a rewound outbox), and
+    #   2. the recomputed chain at the durable verified tip's sequence must
+    #      reproduce the tip's chain_digest exactly (a re-genesis or a
+    #      substitution below the tip changes every digest above it).
+    total = len(verified)
+    if total < delivered:
+        chain_break_refuse(
+            args.task, mailbox,
+            "store holds {} entries but {} were already delivered (rewound outbox)".format(total, delivered),
+            out,
+        )
+        return 3
+    tip = state.get("verified_tip")
+    if isinstance(tip, dict):
+        tip_sequence = tip.get("sequence")
+        tip_digest = tip.get("chain_digest")
+        if isinstance(tip_sequence, int) and not isinstance(tip_sequence, bool) and tip_sequence > 0:
+            if total < tip_sequence:
+                chain_break_refuse(
+                    args.task, mailbox,
+                    "store holds {} entries but the durable verified tip is {} (rewound outbox)".format(total, tip_sequence),
+                    out,
+                )
+                return 3
+            if verified[tip_sequence - 1][1].get("chain_digest") != tip_digest:
+                chain_break_refuse(
+                    args.task, mailbox,
+                    "recomputed chain at sequence {} does not reproduce the durable verified tip (re-genesis or substitution)".format(tip_sequence),
+                    out,
+                )
+                return 3
     for sequence, message in verified:
         if sequence <= delivered:
             continue
         render_message(args.task, sequence, message, out)
         delivered = sequence
     state["delivered_sequence"] = delivered
+    if total > 0:
+        state["verified_tip"] = {
+            "sequence": total,
+            "chain_digest": verified[-1][1].get("chain_digest"),
+        }
     summaries = [message for _s, message in verified if message.get("kind") == LEG_SUMMARY_KIND]
     if summaries:
         latest = summaries[-1]

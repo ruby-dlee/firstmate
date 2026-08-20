@@ -171,8 +171,8 @@ SH
   chmod +x "$FAKE_PI"
 }
 
-write_controller() {  # <status>
-  python3 - "$STATE_DIR/azure-workers/controller.json" "$ID" "$GEN" "$ASSIGNMENT" "$BASE" "$1" <<'PY'
+write_controller() {  # <status> [assignment]
+  python3 - "$STATE_DIR/azure-workers/controller.json" "$ID" "$GEN" "${2:-$ASSIGNMENT}" "$BASE" "$1" <<'PY'
 import json
 import sys
 
@@ -531,6 +531,130 @@ test_leg_seconds_above_ceiling_refused_at_startup() {
   pass "leg_seconds above 19800 refuses at startup (wall = leg + 1800 must fit 21600)"
 }
 
+# stage_stale_leg1 <recorded-assignment>: the reviewer's resume scenario. A
+# leg-1 claim from hours ago (aged past wall+slack), an empty result (the
+# local execute invocation died), and the TTL anchor - the state a respawned
+# monitor meets after a crash, with or without an intervening resume.
+stage_stale_leg1() {
+  local recorded=$1 marker
+  marker="$STATE_DIR/$ID.cloud-secondmate-leg-0001.dispatched"
+  printf '%s\n' "$recorded" > "$marker"
+  : > "$STATE_DIR/$ID.cloud-secondmate-leg-0001.result.json"
+  python3 - "$marker" "$STATE_DIR/$ID.cloud-secondmate-first-dispatch" <<'PY'
+import os, sys, time
+marker, first = sys.argv[1:]
+stale = time.time() - 4000  # past WALL(1920) + 300 slack
+os.utime(marker, (stale, stale))
+with open(first, "w", encoding="utf-8") as handle:
+    handle.write(str(int(stale)) + "\n")
+PY
+}
+
+run_helper() {
+  python3 "$ROOT/bin/fm-secondmate-cloud-monitor.py" process-mailbox \
+    --task "$ID" --mailbox "$STATE_DIR/$ID.cloud-mailbox" \
+    --state-file "$STATE_DIR/$ID.cloud-secondmate-state.json" --worktree "$LANDING"
+}
+
+collect_store_into_mailbox() {  # [store-dir]
+  local source=${1:-$STORE} blob
+  mkdir -p "$STATE_DIR/$ID.cloud-mailbox"
+  for blob in "$source"/session/out/*; do
+    [ -e "$blob" ] || continue
+    cp "$blob" "$STATE_DIR/$ID.cloud-mailbox/${blob##*/}"
+  done
+}
+
+test_stale_leg1_reclaim_refuses_when_assignment_moved() {
+  make_world reclaim-moved
+  # The resume moved the worker to a NEW assignment generation; the stale
+  # claim was recorded under the old one. A manifest-carrying redispatch
+  # here is exactly the rmtree that erases the retained task disk.
+  write_controller assigned asg-00000002
+  stage_stale_leg1 "$ASSIGNMENT"
+  start_monitor
+  wait_for "the reclaim refusal" grep -q 'REFUSING to reclaim the stale leg 1 claim' "$PANE_LOG"
+  sleep 3
+  stop_monitor
+  [ "$(grep_lc $'^execute\x1f')" = 0 ] \
+    || fail "a moved-assignment stale leg-1 claim was redispatched (the resume rmtree): $(grep $'^execute\x1f' "$LC_LOG" | tr '\037' '|')"
+  assert_present "$STATE_DIR/$ID.cloud-secondmate-leg-0001.dispatched" "the refused claim was released anyway"
+  assert_contains "$(cat "$PANE_LOG")" "asg-00000002" "the refusal does not name the current assignment"
+  assert_contains "$(cat "$PANE_LOG")" "$ASSIGNMENT" "the refusal does not name the recorded assignment"
+  pass "a stale leg-1 claim under a moved assignment refuses redispatch, loudly, naming both generations"
+}
+
+test_stale_leg1_reclaim_replays_under_same_assignment() {
+  make_world reclaim-same
+  stage_stale_leg1 "$ASSIGNMENT"
+  start_monitor
+  wait_for "the digest-idempotent replay" grep -q $'execute\x1f.*FM_SECONDMATE_LEG=1' "$LC_LOG"
+  stop_monitor
+  assert_grep 'dispatch claim is stale (no result after its bounded wall); reclaiming' "$PANE_LOG" \
+    "the same-assignment reclaim was not announced"
+  [ "$(grep_lc $'^execute\x1f')" = 1 ] || fail "the same-assignment replay dispatched more than once"
+  case "$(grep $'^execute\x1f' "$LC_LOG")" in
+    *payload-dir*) : ;;
+    *) fail "the replayed leg 1 lost its staging pair" ;;
+  esac
+  pass "a stale leg-1 claim under the unchanged assignment replays (digest-idempotent)"
+}
+
+test_rewound_mailbox_refuses_via_durable_tip() {
+  make_world rewind-tip
+  put_guest_inbox '{"kind":"fm.secondmate-message/v1","text":"pre-rewind"}' >/dev/null
+  put_guest_inbox '{"kind":"fm.secondmate-control/v1","action":"close"}' >/dev/null
+  run_guest_leg >/dev/null 2>&1 || fail "guest leg did not exit cleanly"
+  collect_store_into_mailbox
+  local out
+  out=$(run_helper) || fail "the untouched chain did not verify: $out"
+  python3 - "$STATE_DIR/$ID.cloud-secondmate-state.json" <<'PY' || fail "the durable verified tip was not recorded"
+import json, sys
+state = json.load(open(sys.argv[1]))
+tip = state.get("verified_tip") or {}
+assert state.get("delivered_sequence") == 2, state
+assert tip.get("sequence") == 2 and len(tip.get("chain_digest") or "") == 64, tip
+PY
+  # ATTACK C: the store (and hence the collected mailbox) is rewound below
+  # what was already delivered. A stateless verifier calls that a valid
+  # short chain; the durable tip refuses it.
+  rm "$STATE_DIR/$ID.cloud-mailbox/"*.json
+  out=$(run_helper)
+  [ $? -eq 3 ] || fail "a rewound mailbox verified instead of refusing: $out"
+  assert_contains "$out" "rewound outbox" "the rewind refusal does not explain itself: $out"
+  assert_present "$STATE_DIR/$ID.cloud-mailbox/.chain-break" "the rewind left no sticky marker"
+  pass "a mailbox rewound below the delivered sequence refuses via the durable tip"
+}
+
+test_regenesis_chain_refuses_via_durable_tip() {
+  make_world regen-tip
+  put_guest_inbox '{"kind":"fm.secondmate-message/v1","text":"authentic turn"}' >/dev/null
+  put_guest_inbox '{"kind":"fm.secondmate-control/v1","action":"close"}' >/dev/null
+  run_guest_leg >/dev/null 2>&1 || fail "guest leg did not exit cleanly"
+  collect_store_into_mailbox
+  run_helper >/dev/null || fail "the authentic chain did not verify"
+  # ATTACK D: wipe the store and mint a fresh, longer, fully self-consistent
+  # chain from genesis (a second runner world), so entries past the old
+  # delivered sequence would deliver as verified on a stateless verifier.
+  local store2="$WORLD/store2" guest_state2="$WORLD/guest-state2" out
+  mkdir -p "$store2/session/in" "$store2/session/out"
+  ( STORE="$store2"
+    put_guest_inbox '{"kind":"fm.secondmate-message/v1","text":"attack payload one"}' >/dev/null
+    put_guest_inbox '{"kind":"fm.secondmate-message/v1","text":"attack payload two","nonce":"n2"}' >/dev/null
+    put_guest_inbox '{"kind":"fm.secondmate-control/v1","action":"close"}' >/dev/null
+  ) || fail "attacker inbox staging failed"
+  run_guest_leg FM_SECONDMATE_BLOB_DIR="$store2" FM_SECONDMATE_STATE_DIR="$guest_state2" \
+    >/dev/null 2>&1 || fail "attacker chain generation failed"
+  rm "$STATE_DIR/$ID.cloud-mailbox/"*.json
+  collect_store_into_mailbox "$store2"
+  out=$(run_helper)
+  [ $? -eq 3 ] || fail "a re-genesis chain verified instead of refusing: $out"
+  assert_contains "$out" "does not reproduce the durable verified tip" "the re-genesis refusal does not explain itself: $out"
+  assert_not_contains "$out" "attack payload" "re-genesis entries were delivered as verified"
+  assert_present "$STATE_DIR/$ID.cloud-mailbox/.chain-break" "the re-genesis left no sticky marker"
+  pass "a wiped-and-reminted chain refuses via the durable tip and delivers nothing"
+}
+
 # --- fm-send compartment routing ----------------------------------------------
 
 # shellcheck source=bin/fm-marker-lib.sh
@@ -642,6 +766,36 @@ test_fm_send_local_secondmate_path_is_unchanged() {
     || fail "a placement-less secondmate send changed behavior (must stay the marked backend send): $(printf '%s' "$got" | od -An -c | head -3)"
   assert_absent "$SEND_HOME/state/domain.cloud-inbox" "a local secondmate send created a compartment inbox"
   pass "fm-send to a local secondmate stays byte-identical (marker + backend send, no inbox)"
+}
+
+test_fm_send_prefers_controller_current_assignment() {
+  local out rc envelope
+  make_send_home resumed 1 1
+  # Meta still carries the spawn-time assignment; the controller moved on
+  # (a resume). The envelope must fence to the CURRENT generation, not the
+  # dead one meta remembers.
+  mkdir -p "$SEND_HOME/state/azure-workers"
+  python3 - "$SEND_HOME/state/azure-workers/controller.json" domain "$GEN" <<'PY'
+import json, sys
+path, task, generation = sys.argv[1:]
+key = "{}@{}".format(task, generation)
+state = {"queue": {key: {"task": task, "task_generation": generation, "status": "assigned",
+                         "role": "secondmate", "assignment_generation": "asg-00000099", "slot": 3}},
+         "workers": {}}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(state, handle)
+PY
+  out=$(run_send "$SEND_FB" "$SEND_HOME" "$SEND_LOG" fm-domain 'post-resume note')
+  rc=$?
+  expect_code 0 "$rc" "post-resume cloud send should succeed: $out"
+  envelope=$(first_matching "$SEND_HOME/state/domain.cloud-inbox" '[0-9]*.json')
+  [ -n "$envelope" ] || fail "no envelope was written: $out"
+  python3 - "$SEND_HOME/state/domain.cloud-inbox/$envelope" <<'PY' || fail "the envelope is not fenced to the controller's current assignment"
+import json, sys
+message = json.load(open(sys.argv[1]))
+assert message["nonce"].startswith("asg-00000099/"), message["nonce"]
+PY
+  pass "fm-send fences the envelope to the controller's current assignment, not the spawn-time meta"
 }
 
 test_fm_send_cloud_secondmate_without_assignment_refuses() {
@@ -1067,7 +1221,12 @@ test_bundle_lands_by_fast_forward_when_clean
 test_bundle_kept_when_worktree_dirty
 test_ttl_refuses_renewal
 test_leg_seconds_above_ceiling_refused_at_startup
+test_stale_leg1_reclaim_refuses_when_assignment_moved
+test_stale_leg1_reclaim_replays_under_same_assignment
+test_rewound_mailbox_refuses_via_durable_tip
+test_regenesis_chain_refuses_via_durable_tip
 test_fm_send_routes_cloud_secondmate_into_the_compartment_inbox
+test_fm_send_prefers_controller_current_assignment
 test_fm_send_local_secondmate_path_is_unchanged
 test_fm_send_cloud_secondmate_without_assignment_refuses
 test_spawn_gate_off_flag_is_byte_identical

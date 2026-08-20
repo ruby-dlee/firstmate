@@ -31,7 +31,18 @@
 #     refused past FM_SECONDMATE_TTL_HOURS from first dispatch);
 #     reason=close or idle ends the chain with a terminal status file.
 #     Release is deliberately NOT performed here - closeout and release
-#     receipts are operator work (design C item 6).
+#     receipts are operator work (design C item 6). The TTL is renewal-gated
+#     only: the last admitted leg still runs to its wall, so the compute
+#     overrun bound is FM_SECONDMATE_TTL_HOURS plus one wall
+#     (leg_seconds + 1800), never an unbounded chain.
+#
+# Local-state fragility, named: losing state/<id>.cloud-inbox/.claims/
+# re-anchors fm-send sequencing at 1 (old and new envelopes coexist under
+# distinct content-addressed names, so nothing is lost or deduped away, but
+# relay ordering between them is approximate) and losing the first-dispatch
+# file re-anchors the TTL clock at the next dispatch. Recovery for anything
+# worse is the sticky chain-break marker and the reclaim refusal above:
+# loud stops, never silent repair.
 #
 # wall_seconds arithmetic (the runner's documented monitor contract): the
 # runner leaves its poll loop at leg_seconds minus min(300, leg/10) and its
@@ -153,12 +164,23 @@ leg_marker() { printf '%s\n' "$STATE/$ID.cloud-secondmate-leg-$(printf '%04d' "$
 leg_result() { printf '%s\n' "$STATE/$ID.cloud-secondmate-leg-$(printf '%04d' "$1").result.json"; }
 leg_log() { printf '%s\n' "$STATE/$ID.cloud-secondmate-leg-$(printf '%04d' "$1").log"; }
 
-reclaim_stale_leg() {  # <n>
+reclaim_stale_leg() {  # <n> <current-assignment>
   # Same reclaim rule as the crewmate monitor: a held marker whose bounded
   # execute is provably over (older than wall plus slack) with no result was
   # a dead dispatcher; the lifecycle execute is digest-idempotent, so
-  # releasing the claim and redispatching the SAME leg is safe.
-  local n=$1 marker result mtime now
+  # releasing the claim and redispatching the SAME request is safe.
+  #
+  # EXCEPT for a manifest-carrying leg whose worker assignment has MOVED
+  # since the claim (a resume replaces the VM and OS disk and mints a new
+  # assignment generation, destroying the guest's executed marker while the
+  # retained task disk keeps the mid-leg commits): the redispatch would be a
+  # NEW request digest still carrying --payload-dir/--account-dir, the
+  # supervisor would re-stage, and stage_payload's rmtree would erase those
+  # retained commits. The marker records the assignment it was claimed
+  # under; a mismatch on a manifest-carrying leg refuses to auto-redispatch,
+  # loudly, and leaves the claim held for an operator. A legacy marker with
+  # no recorded assignment fails closed the same way.
+  local n=$1 current=$2 marker result mtime now recorded
   marker=$(leg_marker "$n")
   result=$(leg_result "$n")
   [ -f "$marker" ] || return 0
@@ -167,6 +189,13 @@ reclaim_stale_leg() {  # <n>
   case "$mtime" in ''|*[!0-9]*) return 0 ;; esac
   now=$(date +%s)
   [ $((now - mtime)) -gt $((WALL_SECONDS + 300)) ] || return 0
+  if [ "$n" -eq 1 ] && [ -f "$FIRST_DISPATCH" ]; then
+    recorded=$(head -1 "$marker" 2>/dev/null) || recorded=
+    if [ "$recorded" != "$current" ]; then
+      echo "secondmate $ID: REFUSING to reclaim the stale leg $n claim: it was dispatched under assignment '${recorded:-unrecorded}' but the worker is now '$current' (a resume moved the assignment); a manifest-carrying redispatch would re-stage and rmtree the retained task disk's mid-leg commits. Operator recovery required (collect the retained disk before any re-staging)."
+      return 0
+    fi
+  fi
   echo "secondmate $ID: leg $n dispatch claim is stale (no result after its bounded wall); reclaiming"
   rm -f "$marker"
 }
@@ -190,8 +219,12 @@ dispatch_leg() {  # <n> <assignment> <slot> <repo-generation>
       return 0
     fi
   fi
-  # Claim first (O_EXCL): exactly one owner dispatches a leg, ever.
-  (set -C; : > "$marker") 2>/dev/null || return 0
+  # Claim first (O_EXCL): exactly one owner dispatches a leg, ever. The
+  # marker body records the assignment generation the claim was made under,
+  # so a later reclaim can tell "same worker, replay is digest-idempotent"
+  # from "assignment moved, a manifest-carrying redispatch would rmtree the
+  # retained task disk" (see reclaim_stale_leg).
+  (set -C; printf '%s\n' "$assignment" > "$marker") 2>/dev/null || return 0
   [ -f "$FIRST_DISPATCH" ] || date +%s > "$FIRST_DISPATCH"
   echo "secondmate $ID: dispatching session leg $n (wall ${WALL_SECONDS}s = leg ${LEG_SECONDS}s + finish-leg budget ${FINISH_LEG_BUDGET_SECONDS}s)"
   (
@@ -328,7 +361,7 @@ leg_lifecycle() {  # <assignment> <slot> <repo-generation>
   fi
   result=$(leg_result "$legs")
   if [ ! -s "$result" ]; then
-    reclaim_stale_leg "$legs"
+    reclaim_stale_leg "$legs" "$assignment"
     return 0
   fi
   reason=$(state_field reason)

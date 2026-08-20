@@ -235,13 +235,13 @@ fm_send_cloud_secondmate_enqueue() {  # <marked-message-text>
   # sends never share a sequence number.
   local send_id assignment send_generation
   send_id=$(fm_send_id_from_meta "$TARGET_META")
-  assignment=$(fm_meta_get "$TARGET_META" worker_assignment_generation)
-  if [ -z "$assignment" ]; then
-    # A spawn whose admission converged through a LATER reconcile recorded
-    # the assignment in the controller but not in meta; the controller is the
-    # authority either way.
-    send_generation=$(fm_meta_get "$TARGET_META" generation_id)
-    assignment=$(python3 - "$STATE/azure-workers/controller.json" "$send_id" "$send_generation" <<'PY'
+  # The controller's CURRENT assignment is the authority: meta records the
+  # spawn-time assignment once, but a resume mints a new assignment
+  # generation, and an envelope fenced to the dead one would misname every
+  # message for the rest of the compartment's life. Meta is only the
+  # fallback for a controller that is momentarily unreadable.
+  send_generation=$(fm_meta_get "$TARGET_META" generation_id)
+  assignment=$(python3 - "$STATE/azure-workers/controller.json" "$send_id" "$send_generation" <<'PY'
 import json
 import sys
 
@@ -255,8 +255,8 @@ item = (state.get("queue") or {}).get("{}@{}".format(task, generation)) or {}
 if item.get("status") == "assigned" and item.get("assignment_generation"):
     print(item["assignment_generation"])
 PY
-    ) || assignment=
-  fi
+  ) || assignment=
+  [ -n "$assignment" ] || assignment=$(fm_meta_get "$TARGET_META" worker_assignment_generation)
   if [ -z "$assignment" ]; then
     echo "error: cloud secondmate $send_id has no worker assignment yet; run bin/fm-worker-lifecycle.sh reconcile --apply and retry so the message envelope can be generation-fenced" >&2
     return 1

@@ -233,11 +233,32 @@ fm_send_cloud_secondmate_enqueue() {  # <marked-message-text>
   # makes two sends of identical text distinct messages instead of one
   # deduped blob. Sequencing claims .claims/<seq> with O_EXCL so concurrent
   # sends never share a sequence number.
-  local send_id assignment
+  local send_id assignment send_generation
   send_id=$(fm_send_id_from_meta "$TARGET_META")
   assignment=$(fm_meta_get "$TARGET_META" worker_assignment_generation)
   if [ -z "$assignment" ]; then
-    echo "error: cloud secondmate $send_id has no recorded worker assignment yet; run bin/fm-worker-lifecycle.sh reconcile --apply and retry so the message envelope can be generation-fenced" >&2
+    # A spawn whose admission converged through a LATER reconcile recorded
+    # the assignment in the controller but not in meta; the controller is the
+    # authority either way.
+    send_generation=$(fm_meta_get "$TARGET_META" generation_id)
+    assignment=$(python3 - "$STATE/azure-workers/controller.json" "$send_id" "$send_generation" <<'PY'
+import json
+import sys
+
+path, task, generation = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        state = json.load(handle)
+except (OSError, ValueError):
+    raise SystemExit(0)
+item = (state.get("queue") or {}).get("{}@{}".format(task, generation)) or {}
+if item.get("status") == "assigned" and item.get("assignment_generation"):
+    print(item["assignment_generation"])
+PY
+    ) || assignment=
+  fi
+  if [ -z "$assignment" ]; then
+    echo "error: cloud secondmate $send_id has no worker assignment yet; run bin/fm-worker-lifecycle.sh reconcile --apply and retry so the message envelope can be generation-fenced" >&2
     return 1
   fi
   python3 - "$STATE/$send_id.cloud-inbox" "$assignment" "$1" <<'PY' || return 1

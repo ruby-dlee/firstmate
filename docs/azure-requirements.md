@@ -169,7 +169,14 @@ Acceptance: concurrent crewmates run on distinct pi profiles with no account col
 
 ## R6. Crosscheck reviews outside the author's model family
 
-Status: NOT DONE. Direction decided by the owner 2026-08-19 (see the second amendment above).
+Status: BUILT AND SERVING 2026-08-20, with the live end-to-end GLM review still owed. The lane
+below was built and merged (#264), the deployment is live, and the roster now names GLM as the
+sole primary reviewer. The Work list below is retained as the record of what was asked for; the
+state of each item is in "What landed" immediately after it. One item is genuinely unmet and it
+blocks the acceptance sentence: a real GLM review cannot complete today, because the deployment's
+Fireworks token-per-minute quota is 25K and a review's resent conversation crosses it after about
+five tool turns. Raising it is an owner action in the Foundry portal; the Microsoft.Quota API does
+not cover Cognitive Services.
 
 The requirement is that no author's work is reviewed only by its own model family.
 The roster was instead made eight reviewers all on `openai-codex`, by reading "just use the same
@@ -248,6 +255,44 @@ flip as fallback (the flip sets `config/crosscheck-same-model` on, accepting sam
 of codex-authored work as the recorded degraded mode while it is active); and lane visibility:
 the review evidence and report name the reviewing lane, and a status command answers whether
 GLM is serving or the fallback is active.
+
+What landed, 2026-08-20 (#264, plus #268 for a defect the first live runs exposed):
+
+- `Fireworks.EnableDeploy` registered; Foundry resource `aif-fm7c799d-eus01` created in the
+  program's resource group; `FW-GLM-5.2` deployed pay-per-token Data Zone Standard in eastus.
+  The key lives in the fleet's secret custody, never in the repo.
+- Verified live against the deployment: chat completions answer; `reasoning_effort` passes
+  through at low, high, xhigh and max, each returning real reasoning tokens; a pi custom provider
+  (`models.json` with a top-level `providers` wrapper, `openai-completions` api, the resource's
+  `/openai/v1` baseUrl, the deployment name as the model id) drives it end to end.
+- `allowed_profiles` carries `("pi", "FW-GLM-5.2", "xhigh")`; the model decides the provider;
+  the GLM credential is validated for shape and pinned to one exact endpoint, with any
+  model-level `baseUrl` or `api` override refused (pi's provider composer lets a model-level
+  field outrank the provider-level pin, so a provider-level-only check was bypassable).
+- Reviewer identity binds the Foundry resource and deployment and is provably independent of the
+  key: two configs differing only in `apiKey` produce byte-identical identifiers.
+- The three interim claude artifacts are retired: the `allowed_profiles` entry, the
+  `api.anthropic.com` allowlist entry, and the claude-profile boot copy in the model guest.
+  `validate_ledger` now binds `review_family_mode` to the reviewer model in both directions.
+- Fallback demonstrated end to end on 2026-08-20 against PR #220: the roster flipped to
+  pi-codex with `config/crosscheck-same-model` on, the run printed the exact degraded warning
+  naming the standing-in reviewer and the relaxation, the ledger recorded
+  `review_family_mode: codex-fallback` and `model_independence: same-model`, the review reached a
+  real clear verdict, and the roster was flipped back.
+
+Still owed, and honestly so:
+
+- The live end-to-end GLM review. The 25K token-per-minute Fireworks quota refuses a real review
+  partway through; the first attempts died at exactly that point. #268 fixed a defect those runs
+  exposed (pi continues a retried attempt after `agent_end` via `auto_retry_start`, and the
+  reviewer stream parser was reading that continuation as a turn after completion, masking the
+  429 behind a generic refusal). After the quota bump, one real review end to end closes this.
+- The startup-credit decrement check. About 510K tokens were spent against the deployment on
+  2026-08-20 and Cost Management still shows no charge against the resource hours later, so
+  whether the charge lands on startup credit is unconfirmed. This needs the portal's cost view.
+- The Azure-compartment GLM lane is code-complete but not executable: the `fm-ccm` model image
+  carries no pi binary, so that lane needs an image rebake. The serving lane today is the local
+  pi reviewer, which is why C1's numbers changed shape.
 
 Acceptance: a codex-authored change and a claude-authored change are each reviewed by a
 GLM-backed reviewer with bound reviewer identity and the same evidence discipline as the codex

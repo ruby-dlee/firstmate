@@ -311,10 +311,15 @@ def environment():
                 "unset means the default {} and 0 never means unbounded".format(
                     DEFAULT_DAILY_BOUND_USD))
     daily_override = (os.environ.get("FM_AZURE_WORKER_DAILY_BOUND_OVERRIDE") or "").strip() or None
-    idle_release = int(os.environ.get("FM_AZURE_WORKER_IDLE_RELEASE_SECONDS", "14400"))
+    try:
+        idle_release = int(os.environ.get("FM_AZURE_WORKER_IDLE_RELEASE_SECONDS", "14400"))
+    except ValueError:
+        # Mirror the daily-bound parse: refuse through the loud ELASTIC WORKER
+        # REFUSED lane, never a raw traceback.
+        idle_release = -1
     if idle_release < 600 or idle_release > 604800:
         raise LifecycleError(
-            "FM_AZURE_WORKER_IDLE_RELEASE_SECONDS must be between 600 and 604800")
+            "FM_AZURE_WORKER_IDLE_RELEASE_SECONDS must be an integer between 600 and 604800")
     planning_hours = float(os.environ.get("FM_AZURE_WORKER_HOUR_PLANNING_THRESHOLD", "3500"))
     if planning_hours <= 0:
         raise LifecycleError("FM_AZURE_WORKER_HOUR_PLANNING_THRESHOLD must be positive")
@@ -1043,16 +1048,22 @@ def daily_spend_evidence(state, actual, now=None):
 
 
 def daily_bound_refusal(env, state, actual, now=None):
-    """The C3 daily spend bound over NEW compute only.
+    """The C3 daily spend bound over NEW spend commitments only.
 
     Returns (refusal_or_None, override_day_or_None). A refusal blocks exactly
-    the compute-creating and compute-resuming provider actions (create,
-    resume). Releases, deallocates, compute deletions, resets, and the
+    the lanes that commit new money: the compute-creating and compute-resuming
+    provider actions (create, resume) and NEW specialized reservation
+    admissions (capacity-reserve, capacity-reserve-shape) - the disposable
+    runner performs those automatically, so an ungated reserve lane could
+    quietly burn past the bound with no human anywhere. Releases (including
+    capacity-release), deallocates, compute deletions, resets, and the
     claim-exempt message lane are never routed through this check: winding
     down must never be blocked by the very guard that exists to stop spend.
-    An execute on an already-assigned worker also stays allowed - the capacity
-    is already held and billing; refusing its work would burn the same money
-    for nothing.
+    An execute on an already-assigned worker stays allowed - the capacity is
+    already held and billing; refusing its work would burn the same money for
+    nothing - and for the same reason a lineage re-admission of an
+    already-reserved shape constituent is already-held accounting, not new
+    spend, and skips this gate.
 
     Honesty note: Cost Management actual lags hours, so this bound is a
     backstop on RECORDED spend, not a real-time meter. The same-day protectors
@@ -1061,7 +1072,10 @@ def daily_bound_refusal(env, state, actual, now=None):
     compute once the recorded number crosses it.
 
     Callers hold the fleet lock and must save state afterwards when they keep
-    going: this check rolls the daily baseline and records override use.
+    going: this check rolls the daily baseline. It never records override use
+    itself - only record_daily_override_use does, AFTER the admission decision,
+    so status can never claim an override "use" on a day where cumulative
+    admission then refused anyway.
     """
     day, spend = daily_spend_evidence(state, actual, now)
     bound = env["daily_bound_usd"]
@@ -1076,12 +1090,6 @@ def daily_bound_refusal(env, state, actual, now=None):
         return None, None
     override = env["daily_bound_override"]
     if override == day:
-        state["daily_bound_override_used"] = {
-            "utc_day": day,
-            "at": iso_utc(now),
-            "recorded_day_spend_usd": round(spend, 6),
-            "bound_usd": bound,
-        }
         return None, day
     if override:
         hint = "FM_AZURE_WORKER_DAILY_BOUND_OVERRIDE={} does not name today".format(override)
@@ -1091,10 +1099,27 @@ def daily_bound_refusal(env, state, actual, now=None):
             "for this day only".format(day))
     return (
         "daily spend bound: day {} recorded spend {:.2f} USD reached the {:.2f} USD "
-        "daily bound; new compute (create/resume) is refused, wind-down stays allowed; {}".format(
-            day, spend, bound, hint),
+        "daily bound; new compute and reservations (create/resume/capacity-reserve) "
+        "are refused, wind-down stays allowed; {}".format(day, spend, bound, hint),
         None,
     )
+
+
+def record_daily_override_use(env, state, actual, override_day, now=None):
+    """Durably record that the exact-day override actually ADMITTED something.
+
+    Called only after the admission decision went the override's way: recording
+    at check time let status claim the override was "used" on a day where
+    cumulative admission then refused the candidate anyway. Caller holds the
+    fleet lock and saves state.
+    """
+    day, spend = daily_spend_evidence(state, actual, now)
+    state["daily_bound_override_used"] = {
+        "utc_day": override_day,
+        "at": iso_utc(now),
+        "recorded_day_spend_usd": round(spend, 6) if spend is not None else None,
+        "bound_usd": env["daily_bound_usd"],
+    }
 
 
 def idle_deallocate_due(env, state, worker, cloud, now=None):
@@ -1107,6 +1132,12 @@ def idle_deallocate_due(env, state, worker, cloud, now=None):
     executed is NOT idle-deallocated here - nothing in controller state proves
     its task ended - and its per-VM TTL schedule remains the backstop, exactly
     as it was for wkr-04.
+
+    Recency counts EVERY durable activity stamp the worker record carries,
+    not just executions: a worker steered minutes ago is being actively
+    driven, and deallocating it would be operationally terminal for the
+    assignment (execute refuses deallocated compute; resume needs the VM
+    absent; release is the only exit).
     """
     now = now or now_utc()
     vm = ((cloud or {}).get("resources") or {}).get("vm")
@@ -1115,10 +1146,17 @@ def idle_deallocate_due(env, state, worker, cloud, now=None):
     item = state["queue"].get(worker.get("queue_key"))
     if item is None or item.get("status") != "assigned":
         return False
-    last = worker.get("last_execution_at")
-    if not last:
+    if not worker.get("last_execution_at"):
         return False
-    return (now - parse_time(last)).total_seconds() >= env["idle_release_seconds"]
+    newest = None
+    for field in ("last_execution_at", "last_steer_at"):
+        value = worker.get(field)
+        if not value:
+            continue
+        parsed = parse_time(value)
+        if newest is None or parsed > newest:
+            newest = parsed
+    return (now - newest).total_seconds() >= env["idle_release_seconds"]
 
 
 def active_count(state, inventory):
@@ -1883,6 +1921,13 @@ def next_reconcile_action(env, state, inventory, now=None):
     admitted, reason, reservation = admission_result(env, state, inventory, slot, item)
     if not admitted:
         return {"type": "admission-refused", "reason": reason, "slot": slot, "reservation_usd": reservation}
+    if override_day is not None:
+        # Recorded only now that admission actually admitted: the override
+        # carried this create past the bound, so its use is an effect, not an
+        # intent.
+        record_daily_override_use(
+            env, state, inventory["metrics"].get("actual_usd"), override_day, now=now
+        )
     worker = create_worker_record(env, state, slot, item, reservation)
     state["workers"][str(slot)] = worker
     item["status"] = "assigning"
@@ -2692,21 +2737,35 @@ def command_capacity_reserve(env, args):
             save_state(env, state)
         actual = None
         forecast = None
+        override_day = None
         try:
             inventory = provider_call(env, "inventory")["inventory"]
             state["last_metrics"] = metrics_from_inventory(inventory)
             actual = inventory["metrics"].get("actual_usd")
             forecast = inventory["metrics"].get("forecast_usd")
-            admitted, reason = capacity_admission(
-                env, state, inventory, candidate,
-                ignore_reservation_id=readmission_id,
-            )
+            # The C3 daily bound gates NEW reservation admissions exactly like
+            # create/resume: the disposable runner reserves automatically, so
+            # an ungated lane could quietly burn past the bound with no human.
+            # A lineage re-admission of an already-reserved constituent is
+            # already-held accounting, not new spend, and skips the gate.
+            bound_refusal = None
+            if readmission_id is None:
+                bound_refusal, override_day = daily_bound_refusal(env, state, actual)
+            if bound_refusal is not None:
+                admitted, reason = False, bound_refusal
+            else:
+                admitted, reason = capacity_admission(
+                    env, state, inventory, candidate,
+                    ignore_reservation_id=readmission_id,
+                )
         except LifecycleError as exc:
             admitted, reason = False, str(exc)
         if admitted:
             candidate["status"] = "reserved"
             candidate["reserved_at"] = candidate.get("reserved_at") or iso_utc()
             candidate["last_refusal"] = None
+            if override_day is not None:
+                record_daily_override_use(env, state, actual, override_day)
         else:
             # A reserved constituent of an atomically admitted shape keeps its
             # commitment: a child's lineage re-admission may observe transient
@@ -2722,6 +2781,7 @@ def command_capacity_reserve(env, args):
         "actual_usd": actual,
         "forecast_usd": reported_forecast(admitted, actual, forecast),
         "admission_limit_usd": budget_limit(env),
+        "daily_bound_override": override_day if admitted else None,
     }, sort_keys=True, separators=(",", ":")))
 
 
@@ -2796,6 +2856,7 @@ def command_capacity_reserve_shape(env, args):
         forecast = None
         reason = ""
         admitted = True
+        override_day = None
         if pending:
             pending_ids = frozenset(entry["reservation_id"] for entry in pending)
             try:
@@ -2803,15 +2864,22 @@ def command_capacity_reserve_shape(env, args):
                 state["last_metrics"] = metrics_from_inventory(inventory)
                 actual = inventory["metrics"].get("actual_usd")
                 forecast = inventory["metrics"].get("forecast_usd")
-                provisional = []
-                for entry in pending:
-                    admitted, reason = capacity_admission(
-                        env, state, inventory, entry, provisional,
-                        ignore_reservation_id=pending_ids,
-                    )
-                    if not admitted:
-                        break
-                    provisional.append(entry)
+                # Same C3 gate as capacity-reserve, once for the whole
+                # all-or-nothing shape: only not-yet-held constituents are
+                # pending here, so already-reserved ones never re-enter it.
+                bound_refusal, override_day = daily_bound_refusal(env, state, actual)
+                if bound_refusal is not None:
+                    admitted, reason = False, bound_refusal
+                else:
+                    provisional = []
+                    for entry in pending:
+                        admitted, reason = capacity_admission(
+                            env, state, inventory, entry, provisional,
+                            ignore_reservation_id=pending_ids,
+                        )
+                        if not admitted:
+                            break
+                        provisional.append(entry)
             except LifecycleError as exc:
                 admitted, reason = False, str(exc)
             now = iso_utc()
@@ -2820,6 +2888,8 @@ def command_capacity_reserve_shape(env, args):
                     entry["status"] = "reserved"
                     entry["reserved_at"] = entry.get("reserved_at") or now
                     entry["last_refusal"] = None
+                if override_day is not None:
+                    record_daily_override_use(env, state, actual, override_day)
             else:
                 # All-or-nothing: constituents that are not yet reserved stay queued;
                 # already reserved constituents are never demoted by a shape retry.
@@ -2848,6 +2918,7 @@ def command_capacity_reserve_shape(env, args):
         "actual_usd": actual,
         "forecast_usd": reported_forecast(admitted, actual, forecast),
         "admission_limit_usd": budget_limit(env),
+        "daily_bound_override": override_day if admitted else None,
     }, sort_keys=True, separators=(",", ":")))
 
 
@@ -3491,6 +3562,11 @@ def command_resume(env, args):
         if bound_refusal is not None:
             raise LifecycleError(bound_refusal)
         if override_day is not None:
+            # Resume has no further admission gate, so the guard passing IS
+            # the admission decision; record the override's effect now.
+            record_daily_override_use(
+                env, state, inventory["metrics"].get("actual_usd"), override_day
+            )
             print(
                 "DAILY BOUND OVERRIDE: resume admitted past the {:.2f} USD daily bound "
                 "for day {} by FM_AZURE_WORKER_DAILY_BOUND_OVERRIDE".format(

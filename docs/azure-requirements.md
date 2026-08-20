@@ -390,24 +390,32 @@ The requirement is that a day's spend cannot quietly reach 100 dollars.
 
 The daily spend bound is landed in `bin/fm-worker-lifecycle.py`: `FM_AZURE_WORKER_DAILY_BOUND_USD`
 (default 100; zero, negative, or non-numeric values refuse loudly rather than meaning unbounded)
-refuses every new compute-creating or compute-resuming provider action - `create` and `resume` -
-once the day's recorded spend crosses it, while releases, deallocates, deletions, resets, the
-message lane, and `execute` on already-held capacity stay allowed so wind-down is never blocked.
+refuses every lane that commits new money once the day's recorded spend crosses it - worker
+`create` and `resume` AND new specialized reservation admissions through `capacity-reserve` and
+`capacity-reserve-shape`, which the disposable runner performs automatically and which would
+otherwise let crosscheck/validation compute quietly cross the bound with no human anywhere.
+Releases, `capacity-release`, deallocates, deletions, resets, the message lane, `execute` on
+already-held capacity, and lineage re-admission of already-reserved constituents stay allowed so
+wind-down and held work are never blocked.
 The only way past it is the explicit operator override
 `FM_AZURE_WORKER_DAILY_BOUND_OVERRIDE=<utc-day>` naming the exact current UTC day, printed loudly
-and recorded durably every time it admits.
+and recorded durably - only after the admission decision actually admitted - every time it takes
+effect.
 Honest caveat: Cost Management gives month-to-date actual that lags hours, so day spend is
 current actual minus a durable baseline snapshotted at the first observation of each UTC day,
 and the bound is a backstop on RECORDED spend rather than a real-time meter; the same-day
 protectors ahead of it are the per-mutation cumulative admission and the idle deallocate path.
 
-Idle release is landed as idle DEALLOCATE: an assigned worker whose last durably recorded
-execution finished more than `FM_AZURE_WORKER_IDLE_RELEASE_SECONDS` ago (default 14,400 - the
-four hours wkr-04 idled - floor 600), with no pending claim on its slot and its queue item still
-assigned, gets an automatic deallocate planned by reconcile, and status loudly lists it until a
-human releases it properly.
+Idle release is landed as idle DEALLOCATE: an assigned worker whose newest durable activity
+stamp (last recorded execution or steer) is older than `FM_AZURE_WORKER_IDLE_RELEASE_SECONDS`
+(default 14,400 - the four hours wkr-04 idled - floor 600), with no pending claim on its slot
+and its queue item still assigned, gets an automatic deallocate planned by reconcile, and status
+loudly lists it until a human releases it properly.
 Deallocation, not release: releasing requires authority receipts a machine cannot mint, while
-deallocation is reversible and stops the spend, which is what this requirement needs.
+deallocation is reversible at the VM level and stops the spend, which is what this requirement
+needs; for the ASSIGNMENT it is terminal (no power-on lane exists; release or surrender is the
+exit), and compartments whose legs must live longer - the pending secondmate monitor renews at
+exactly the 14,400-second default - must raise the knob above their renewal cadence.
 A worker with no recorded execution is never idle-deallocated (nothing proves its task ended);
 its TTL remains the backstop.
 The adjacent cooldown gap is also closed: a release-proved worker whose VM was deallocated

@@ -68,6 +68,7 @@ for marker in (
     "fm.worker-authority/v1", "authority-receipt", "fm.worker-execution/v1",
     "roll_daily_baseline", "daily_bound_refusal", "idle_deallocate_due",
     "daily_cost_baseline", "FM_AZURE_WORKER_DAILY_BOUND_OVERRIDE", "idle_deallocated_at",
+    "record_daily_override_use", "last_steer_at",
 ):
     assert marker in controller, marker
 assert 'shape.add_argument("--required"' not in controller
@@ -98,6 +99,8 @@ for marker in (
     "FM_AZURE_WORKER_DAILY_BOUND_USD",
     "idle-deallocate stops compute cost unattended; the ordinary release stays human-driven",
     "backstop on RECORDED spend",
+    "an ungated reserve lane could quietly burn past the bound",
+    "no power-on lane exists",
 ):
     assert marker in doc, marker
 assert "hosted form service" in doc and "force-delete" in doc
@@ -1702,12 +1705,17 @@ shared_shape_cli() {
   fence=$(printf shape-fence | shasum -a 256 | awk '{print $1}')
   state_file="$home/state/azure-workers/controller.json"
   run_shape() {
+    # The C3 daily bound is deliberately pinned out of the way: this unit
+    # exercises the CUMULATIVE budget lane (its 1499 pressure step must reach
+    # capacity_admission's own refusal), and the daily bound over the same
+    # reserve entrances has its own dedicated units.
     env \
       FM_HOME="$home" \
       FM_AZURE_SUBSCRIPTION_ID="$SUB" \
       FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
       FM_AZURE_OWNER_TAG=owner \
       FM_AZURE_NAMING_PREFIX=fmtest \
+      FM_AZURE_WORKER_DAILY_BOUND_USD=100000 \
       FM_WORKER_PROVIDER_COMMAND="python3 $provider" \
       FIXTURE_STATE="$fixture" \
       "$WRAPPER" "$@"
@@ -4431,11 +4439,13 @@ assert module.environment()["daily_bound_usd"] == 250.0
 assert module.environment()["daily_bound_override"] == "2099-01-01"
 del os.environ["FM_AZURE_WORKER_DAILY_BOUND_USD"]
 del os.environ["FM_AZURE_WORKER_DAILY_BOUND_OVERRIDE"]
-for bad in ("599", "604801"):
+for bad in ("599", "604801", "abc", "4h"):
     os.environ["FM_AZURE_WORKER_IDLE_RELEASE_SECONDS"] = bad
     try:
         module.environment()
     except module.LifecycleError as exc:
+        # Non-numeric values refuse through the loud LifecycleError lane,
+        # never a raw ValueError traceback.
         assert "FM_AZURE_WORKER_IDLE_RELEASE_SECONDS" in str(exc), (bad, exc)
     else:
         raise AssertionError("idle release seconds {} was accepted".format(bad))
@@ -4475,7 +4485,8 @@ refusal, override_day = module.daily_bound_refusal(denv, state, 160.0, now=T0)
 assert override_day is None
 assert refusal == (
     "daily spend bound: day {} recorded spend 110.00 USD reached the 100.00 USD "
-    "daily bound; new compute (create/resume) is refused, wind-down stays allowed; "
+    "daily bound; new compute and reservations (create/resume/capacity-reserve) "
+    "are refused, wind-down stays allowed; "
     "set FM_AZURE_WORKER_DAILY_BOUND_OVERRIDE={} to admit past the bound "
     "for this day only".format(day0, day0)
 ), refusal
@@ -4483,6 +4494,11 @@ assert module.daily_bound_refusal(denv, state, 149.99, now=T0) == (None, None)
 right = dict(denv, daily_bound_override=day0)
 refusal, override_day = module.daily_bound_refusal(right, state, 160.0, now=T0)
 assert refusal is None and override_day == day0
+# The CHECK never records override use - only record_daily_override_use does,
+# after the admission decision, so a later cumulative refusal cannot leave a
+# false "used" claim behind.
+assert "daily_bound_override_used" not in state, state["daily_bound_override_used"]
+module.record_daily_override_use(right, state, 160.0, day0, now=T0)
 assert state["daily_bound_override_used"]["utc_day"] == day0
 assert state["daily_bound_override_used"]["recorded_day_spend_usd"] == 110.0
 assert state["daily_bound_override_used"]["bound_usd"] == 100.0
@@ -4567,6 +4583,61 @@ dark_cloud["resources"]["vm"]["power_state"] = "VM deallocated"
 assert module.idle_deallocate_due(penv, istate, worker, dark_cloud, now=T0) is False
 dark_inventory = dict(inventory, workers=[dark_cloud])
 assert module.next_reconcile_action(penv, istate, dark_inventory, now=T0) is None
+
+# --- steer counts as recency: a worker steered minutes ago is being actively
+# driven and must NOT be deallocated, however old its last execution is;
+# an old steer does not shield it.
+worker["last_execution_at"] = module.iso_utc(T0 - dt.timedelta(seconds=50000))
+worker["last_steer_at"] = module.iso_utc(T0 - dt.timedelta(seconds=60))
+assert module.idle_deallocate_due(penv, istate, worker, cloud, now=T0) is False
+assert module.next_reconcile_action(penv, istate, inventory, now=T0) is None
+worker["last_steer_at"] = module.iso_utc(T0 - dt.timedelta(seconds=15000))
+assert module.idle_deallocate_due(penv, istate, worker, cloud, now=T0) is True
+del worker["last_steer_at"]
+
+# --- override use is an EFFECT, recorded only when admission actually admits:
+# bound tripped + override named + cumulative admission refusing must leave no
+# durable "used" claim behind.
+create_metrics = {
+    "actual_usd": 1499.0, "forecast_usd": 1499.0,
+    "regional_limit_vcpus": 128, "regional_used_vcpus": 2,
+    "specialized_active_vcpus": 0, "specialized_active_by_family": {},
+    "family_limit_vcpus": {family: 10 for _, family in module.SKU_PLAN.values()},
+    "family_used_vcpus": {family: 0 for _, family in module.SKU_PLAN.values()},
+    "family_free_vcpus": {family: 10 for _, family in module.SKU_PLAN.values()},
+    "sku_hourly_usd": {sku: 0.25 for sku, _ in module.SKU_PLAN.values()},
+}
+create_inventory = {
+    "metrics": create_metrics, "workers": [], "capacity_reservations": [], "conflicts": [],
+}
+oenv = dict(penv, daily_bound_override=day0)
+create_state = {
+    "queue": {}, "workers": {}, "completed_worker_seconds": 0.0,
+    "cleanup_refusals": [], "next_assignment": 1, "pending_actions": {},
+    "capacity_reservations": {},
+    "daily_cost_baseline": {"utc_day": day0, "actual_usd_at_day_start": 0.0},
+}
+queued = {
+    "schema": module.REQUEST_SCHEMA, "task": "task-bound", "task_generation": "gen-bound",
+    "repository_generation": "repo-gen", "home_binding": "6" * 64,
+    "account_binding": "7" * 64, "worktree_binding": "8" * 64,
+    "repository_binding": "9" * 64, "owner_kind": "primary", "role": "author",
+    "eligible": True, "discretionary": True, "status": "queued",
+    "enqueued_at": module.iso_utc(T0),
+}
+create_state["queue"][module.request_key("task-bound", "gen-bound")] = queued
+refused_create = module.next_reconcile_action(oenv, create_state, create_inventory, now=T0)
+assert refused_create["type"] == "admission-refused", refused_create
+assert "daily spend bound" not in refused_create["reason"], refused_create["reason"]
+assert "daily_bound_override_used" not in create_state, create_state["daily_bound_override_used"]
+# With cumulative room the same override admits, the action carries the day,
+# and the use is recorded as an effect.
+create_metrics["actual_usd"] = 500.0
+create_metrics["forecast_usd"] = 500.0
+admitted_create = module.next_reconcile_action(oenv, create_state, create_inventory, now=T0)
+assert admitted_create["type"] == "create", admitted_create
+assert admitted_create.get("daily_bound_override") == day0
+assert create_state["daily_bound_override_used"]["utc_day"] == day0
 
 # --- the cooldown stamp: a release-proved worker whose VM is ALREADY dark but
 # whose cooldown_started_at is null gets stamped once at first observation, so
@@ -4720,7 +4791,8 @@ refused = [entry for entry in plan["actions"] if entry["type"] == "admission-ref
 assert refused, plan["actions"]
 expected = (
     "daily spend bound: day {} recorded spend 200.00 USD reached the 100.00 USD "
-    "daily bound; new compute (create/resume) is refused, wind-down stays allowed; "
+    "daily bound; new compute and reservations (create/resume/capacity-reserve) "
+    "are refused, wind-down stays allowed; "
     "set FM_AZURE_WORKER_DAILY_BOUND_OVERRIDE={} to admit past the bound "
     "for this day only".format(DAY, DAY)
 )
@@ -4790,6 +4862,45 @@ day_guard()
 assert "DAILY BOUND OVERRIDE" in resumed.stdout, resumed.stdout
 assert controller_state()["workers"][slot]["cloud_generation"] == 2
 
+# 6b. Specialized reservations are the runner's AUTOMATIC lane, so the exact
+# same bound gates capacity-reserve and capacity-reserve-shape with the exact
+# same string; the exact-day override admits and records; capacity-release is
+# wind-down and is never blocked.
+fence = "a" * 64
+blocked_reserve = json.loads(run(
+    "capacity-reserve", "--reservation-id", "azr-daily0000001", "--fence-binding", fence,
+    "--role", "validation", "--sku", "Standard_D4as_v7", "--sku-family", "StandardDasv7Family",
+    "--vcpus", "4", "--amount-usd", "25",
+    "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"]).stdout)
+day_guard()
+assert blocked_reserve["status"] == "queued", blocked_reserve
+assert blocked_reserve["reason"] == expected, blocked_reserve["reason"]
+blocked_shape = json.loads(run(
+    "capacity-reserve-shape", "--shape-id", "shape-daily", "--fence-binding", fence,
+    "--constituent",
+    "reservation-id=azr-daily0000002,role=validation,sku=Standard_D4as_v7,"
+    "sku-family=StandardDasv7Family,vcpus=4,amount-usd=25",
+    "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"]).stdout)
+day_guard()
+assert blocked_shape["status"] == "queued", blocked_shape
+assert blocked_shape["reason"] == expected, blocked_shape["reason"]
+reserved = json.loads(run(
+    "capacity-reserve", "--reservation-id", "azr-daily0000001", "--fence-binding", fence,
+    "--role", "validation", "--sku", "Standard_D4as_v7", "--sku-family", "StandardDasv7Family",
+    "--vcpus", "4", "--amount-usd", "25",
+    "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"],
+    overrides={"FM_AZURE_WORKER_DAILY_BOUND_OVERRIDE": DAY}).stdout)
+day_guard()
+assert reserved["status"] == "reserved", reserved
+assert reserved["daily_bound_override"] == DAY, reserved
+assert controller_state()["daily_bound_override_used"]["utc_day"] == DAY
+run("capacity-release", "--reservation-id", "azr-daily0000001", "--fence-binding", fence,
+    "--cleanup-receipt", "b" * 64,
+    "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+day_guard()
+assert controller_state()["capacity_reservations"]["azr-daily0000001"]["status"] == "released", (
+    "capacity-release was blocked by the tripped daily bound")
+
 # 7. The durable baseline rolls when the observed UTC day changes: a stale
 # yesterday baseline is re-snapshotted at the current actual, so the new day
 # starts at zero recorded spend.
@@ -4818,6 +4929,7 @@ PY
       fail "daily bound CLI exercise failed"
     fi
     # exit 99: UTC midnight crossed mid-unit; retry once on a fresh fixture.
+    echo "# daily bound CLI attempt $attempt crossed UTC midnight; retrying on a fresh fixture" >&2
   done
   fail "daily bound CLI exercise crossed UTC midnight twice"
 }
@@ -4907,6 +5019,29 @@ plan = json.loads(run("reconcile", "--apply", "--json",
                       "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"]).stdout)
 assert not [entry for entry in plan["actions"] if entry["type"] == "deallocate"], plan["actions"]
 assert "deallocated" not in fixture_state()["workers"][slot]["resources"]["vm"]["power_state"].lower()
+
+# A recent steer counts as recency: a worker being actively driven is never
+# deallocated, however old its last execution.
+state = controller_state()
+state["workers"][slot]["last_execution_at"] = stamp(4000)
+state["workers"][slot]["last_steer_at"] = stamp(30)
+state_file.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")))
+plan = json.loads(run("reconcile", "--apply", "--json",
+                      "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"]).stdout)
+assert not [entry for entry in plan["actions"] if entry["type"] == "deallocate"], plan["actions"]
+assert "deallocated" not in fixture_state()["workers"][slot]["resources"]["vm"]["power_state"].lower()
+state = controller_state()
+del state["workers"][slot]["last_steer_at"]
+state_file.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")))
+
+# A non-numeric idle threshold refuses through the loud lane, never a raw
+# traceback.
+env_bad = dict(env, FM_AZURE_WORKER_IDLE_RELEASE_SECONDS="abc")
+broken = subprocess.run([wrapper, "status"], env=env_bad, text=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+assert broken.returncode == 2, (broken.returncode, broken.stderr)
+assert "FM_AZURE_WORKER_IDLE_RELEASE_SECONDS" in broken.stderr, broken.stderr
+assert "Traceback" not in broken.stderr, broken.stderr
 
 # Past the threshold the planner deallocates unattended - dark compute, never
 # a machine-minted release - and marks the worker durably.

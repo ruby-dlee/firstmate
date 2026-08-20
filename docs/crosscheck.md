@@ -148,8 +148,22 @@ A run's `at` stamp is pinned to `YYYY-MM-DDTHH:MM:SSZ` for the same reason: it i
 The writer validates the measurement against that same contract before writing it, and drops it if it fails.
 Everything that later reads this ledger validates it, so an unvalidated write would be a durable outage: one writer bug and `run`, `verify` and `timings` all refuse the task until a human edits the JSON by hand.
 The measurement is the disposable half of that trade, so a timing bug loudly costs one run its breakdown and never the durable findings.
-The honest consequence at the compartment boundary: a compartment review that fails before its identity record is complete carries no `execution_mode`, so its recorded `create`/`stage` phases fail the lane check and the whole measurement is dropped for that run.
-That is a real loss of exactly the numbers C1 wants, and it is preferred over both the alternatives, which are bricking the ledger or letting any record claim compartment phases.
+#### Known gap, bound to the `fm-ccm` image rebake: stamp the compartment lane at its START
+
+The compartment lane's discriminator only exists on a run that COMPLETED that lane, so a compartment review which fails part-way loses its measurement entirely.
+`bin/fm-crosscheck-azure.py` `_run_azure_review_in_lane` stamps `execution_mode: azure-compartment-v1` onto the reviewer record only at the end, after a digest-bound result exists.
+A review that fails during `create`, `stage`, `boot`, or `collect` therefore reaches `append_failed_run` with those phases measured but no `execution_mode`, fails `validate_durations`' lane check, and has its whole `durations_ms` dropped by `stamp_durations` rather than written.
+That is precisely the run whose numbers would be most diagnostic: a compartment review that died in create or boot is the one an operator most needs a breakdown of.
+
+The obvious fix does not work as written, which is why this is recorded rather than done.
+Stamping `execution_mode` earlier makes `validate_ledger` route the record into `bin/fm-crosscheck-azure.py` `validate_azure_reviewer_record`, which demands a complete `azure_identity` (review generation, request and credential digests, model/tool/verifier identities).
+A failed part-way review has no such identity, so an early `execution_mode` would refuse the record outright: it trades a lost measurement for a bricked ledger, which is the worse end of the same trade.
+
+**Follow-up, due when the compartment lane becomes executable again:** before any compartment timing is relied on, stamp the lane at its start, either by making `validate_azure_reviewer_record` apply only to records that claim a completed compartment review, or by adding a separate early lane marker that `run_is_compartment_lane` also accepts.
+Do this at the rebake, not before: while the `fm-ccm` image carries no `pi` binary the compartment lane cannot run at all, so a failed compartment review is impossible and the lost-measurement cost is exactly zero.
+Adding schema surface for a lane that cannot execute would freeze a contract nothing has exercised.
+
+Until then the current behavior is deliberate and is preferred over both alternatives, which are bricking the ledger and letting any record claim compartment phases it never performed.
 
 `bin/fm-pr-merge.sh` calls the verification form automatically after approval.
 Do not call the verification form as a substitute for running a reviewer.

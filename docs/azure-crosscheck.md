@@ -175,6 +175,8 @@ The timer is optional at this boundary: the adapter's own CLI records nothing, a
 These phases are lane-bound in the ledger contract: they are admitted only on a run record whose reviewer entry carries `execution_mode: azure-compartment-v1`, which this adapter stamps once a review completes.
 A compartment review that fails before that identity record is complete therefore cannot keep its recorded `create`/`stage` phases, and the writer drops that run's whole measurement rather than write a record every later reader would refuse.
 That loses exactly the numbers a failed compartment review would be most useful for, and it is a deliberate choice over the two alternatives: bricking the task ledger, or letting any record claim compartment phases it never performed.
+**This is a known gap with a follow-up bound to the image rebake below: the lane must be stamped at its START before any compartment timing is relied on.**
+`docs/crosscheck.md` owns that follow-up, including why stamping `execution_mode` earlier refuses the record instead of fixing it.
 
 These numbers do not exist yet.
 The compartment lane is disabled in the operator home and is code-only until the `fm-ccm` model image is rebaked with pi, so no run has executed these phases since they were instrumented.

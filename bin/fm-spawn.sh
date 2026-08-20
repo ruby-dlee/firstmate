@@ -578,8 +578,11 @@ if [ "$SPAWN_CLOUD" = azure ] \
   echo "notice: cloud placement covers new ship/scout spawns only; this spawn stays on the local backend" >&2
   SPAWN_CLOUD=off
 fi
-if [ "$SPAWN_CLOUD" = azure ] && [ "$STATE" != "$FM_HOME/state" ]; then
-  echo "error: cloud placement requires the home's own state directory ($FM_HOME/state), not an override" >&2
+if [ "$SPAWN_CLOUD" = azure ] && [ "$STATE" != "$TASK_HOME/state" ]; then
+  # The task home's OWN state directory, never an override. TASK_HOME is
+  # FM_HOME everywhere except the compartment-child lane, where FM_SPAWN_TASK_HOME
+  # already refuses to be combined with any state/data/projects override.
+  echo "error: cloud placement requires the task home's own state directory ($TASK_HOME/state), not an override" >&2
   exit 1
 fi
 CLOUD_ACCOUNT_HOME=

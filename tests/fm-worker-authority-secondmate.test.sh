@@ -288,6 +288,12 @@ assert tampered["bundles"], "fixture leg summary declares no bundle"
 tampered["bundles"] = []
 summary_name.write_text(
     json.dumps(tampered, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+# ... and remove the collected bundle file too, so the one-sided
+# collected-by-name enumeration cannot serve as the backstop either. Now
+# nothing but the content address stands between this and a proved receipt.
+for entry in list(mailbox.iterdir()):
+    if entry.name.startswith("bundle-"):
+        entry.unlink()
 expect(lambda: landing(), "content differs from its content address")
 put_state(saved)
 restore_mailbox()

@@ -3972,19 +3972,6 @@ head = subprocess.check_output(
 assert item["repository_generation"] == head, item
 assert parent_children_total() == 1, "children_total did not increment exactly once"
 
-# 2. A marker naming a DIFFERENT secondmate refuses, mutating nothing.
-before = controller_state()
-refused = child("child-2", "gen-c2", stranger,
-                "--parent-task", "smc-1", "--parent-task-generation", "gen-s1",
-                check=False)
-assert refused.returncode != 0, refused.stdout
-assert "is marked for secondmate smc-9, not the parent compartment smc-1" in refused.stderr, \
-    refused.stderr
-after = controller_state()
-assert "child-2@gen-c2" not in after["queue"], "a refused child still mutated the queue"
-assert after["queue"] == before["queue"], "a refused child mutated the queue"
-assert parent_children_total() == 1, "a refused child still spent the lifetime bound"
-
 # 2b. The marker is LOAD BEARING, not decorative: even a home the primary's
 #     own registry names for smc-1 refuses while the directory itself is
 #     marked for someone else. Drop the marker check and this one admits.
@@ -3998,6 +3985,19 @@ assert "is marked for secondmate smc-9, not the parent compartment smc-1" in ref
 assert "child-2b@gen-c2b" not in controller_state()["queue"], refused.stdout
 assert parent_children_total() == 1
 registry(("smc-1", compartment), ("smc-2", idle))
+
+# 2. A marker naming a DIFFERENT secondmate refuses, mutating nothing.
+before = controller_state()
+refused = child("child-2", "gen-c2", stranger,
+                "--parent-task", "smc-1", "--parent-task-generation", "gen-s1",
+                check=False)
+assert refused.returncode != 0, refused.stdout
+assert "is marked for secondmate smc-9, not the parent compartment smc-1" in refused.stderr, \
+    refused.stderr
+after = controller_state()
+assert "child-2@gen-c2" not in after["queue"], "a refused child still mutated the queue"
+assert after["queue"] == before["queue"], "a refused child mutated the queue"
+assert parent_children_total() == 1, "a refused child still spent the lifetime bound"
 
 # 3a. A home the primary never registered for this secondmate refuses, even
 #     though it plants the exact right marker.

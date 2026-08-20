@@ -185,7 +185,15 @@ reclaim_stale_leg() {  # <n> <current-assignment>
   result=$(leg_result "$n")
   [ -f "$marker" ] || return 0
   [ ! -s "$result" ] || return 0
-  mtime=$(stat -f %m "$marker" 2>/dev/null || stat -c %Y "$marker" 2>/dev/null) || return 0
+  # Portable epoch mtime, branched on uname like bin/fm-lock-lib.sh: GNU
+  # stat accepts `-f %m` without failing (it means something else), so the
+  # BSD-first fallback chain silently yields a non-numeric value on Linux
+  # and the staleness guard below would bail forever.
+  if [ "$(uname)" = Darwin ]; then
+    mtime=$(stat -f %m "$marker" 2>/dev/null) || return 0
+  else
+    mtime=$(stat -c %Y "$marker" 2>/dev/null) || return 0
+  fi
   case "$mtime" in ''|*[!0-9]*) return 0 ;; esac
   now=$(date +%s)
   [ $((now - mtime)) -gt $((WALL_SECONDS + 300)) ] || return 0

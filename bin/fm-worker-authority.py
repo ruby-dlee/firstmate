@@ -62,6 +62,7 @@ SECONDMATE_GENESIS_CHAIN_DIGEST = "0" * 64
 SECONDMATE_HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SECONDMATE_BUNDLE_NAME = re.compile(r"^bundle-[0-9]{8}-([0-9a-f]{64})\.bundle$")
 SECONDMATE_MAX_MESSAGE_BYTES = 256 * 1024
+SECONDMATE_MAX_BUNDLE_BYTES = 256 * 1024 * 1024
 SECONDMATE_MAX_STATE_BYTES = 16 * 1024 * 1024
 
 
@@ -397,6 +398,21 @@ def secondmate_bundle_ledger(home, task, worker):
     return state, landed, kept, declared, collected
 
 
+def secondmate_bundle_file(home, task, digest):
+    """The collected bundle file for one digest, or None. Named by digest, so
+    the lookup cannot be redirected by an attacker choosing a sequence."""
+    mailbox = home / "state" / (task + ".cloud-mailbox")
+    if mailbox.is_symlink() or not mailbox.is_dir():
+        return None
+    for entry in sorted(mailbox.iterdir()):
+        if entry.is_symlink() or not entry.is_file():
+            continue
+        match = SECONDMATE_BUNDLE_NAME.fullmatch(entry.name)
+        if match and match.group(1) == digest:
+            return entry
+    return None
+
+
 def secondmate_report_evidence(home, task):
     """Session closeout: terminal status file, chained close ack, completion.md."""
     status_path = home / "state" / (task + ".cloud-secondmate-status")
@@ -470,12 +486,62 @@ def secondmate_report_sections(content):
                 ", ".join(empty)))
 
 
+def secondmate_prove_landed(home, task, worker, worktree, head):
+    """Prove every declared or collected bundle actually landed in the home.
+
+    Reachability, not assertion: the collected bundle names its own tip commit,
+    and that tip must be an ancestor of the home worktree's HEAD. The monitor's
+    landed_bundles is advisory - it is attacker-writable, and trusting it let a
+    single file write mint a landing proof over commits that were never in the
+    home. A declared bundle whose file is gone cannot be proven and refuses."""
+    _state, _claimed, _kept, declared, collected = secondmate_bundle_ledger(home, task, worker)
+    proven = {}
+    for digest in sorted(declared | collected):
+        local = secondmate_bundle_file(home, task, digest)
+        if local is None:
+            raise AuthorityError(
+                "secondmate landing authority cannot prove bundle {} landed: its collected file "
+                "is absent, so nothing names the commits it carried".format(digest))
+        body = local.read_bytes()
+        if len(body) > SECONDMATE_MAX_BUNDLE_BYTES or hashlib.sha256(body).hexdigest() != digest:
+            raise AuthorityError(
+                "secondmate landing authority: collected bundle {} differs from its digest".format(digest))
+        heads = subprocess.run(
+            ["git", "-C", str(worktree), "bundle", "list-heads", str(local)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        tips = [
+            line.split()[0] for line in heads.stdout.decode("utf-8", errors="replace").splitlines()
+            if line.split()
+        ]
+        if heads.returncode != 0 or not tips:
+            raise AuthorityError(
+                "secondmate landing authority cannot read the heads of collected bundle {}".format(digest))
+        for tip_commit in tips:
+            reachable = subprocess.run(
+                ["git", "-C", str(worktree), "merge-base", "--is-ancestor", tip_commit, head],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if reachable.returncode != 0:
+                raise AuthorityError(
+                    "secondmate landing authority found unlanded outbox bundles: {} (its commit {} "
+                    "is not reachable from the home worktree head)".format(digest, tip_commit[:12]))
+        proven[digest] = sorted(tips)
+    return proven
+
+
 def secondmate_landing_evidence(home, task, worker, worktree, repository_generation):
-    """Every chained outbox bundle landed into the local home worktree, or
-    provably none: the durable monitor state exists, keeps nothing, every
-    declared or collected bundle digest appears in its landed record, and the
-    home worktree's head descends from the assignment's exact starting
-    repository generation.
+    """Every chained outbox bundle PROVABLY landed into the local home
+    worktree, or provably none: the durable monitor state keeps nothing, every
+    declared or collected bundle's tip commit is reachable from the home
+    worktree's HEAD, and that HEAD descends from the assignment's exact
+    starting repository generation.
+
+    The reachability check is what makes this a proof. `landed_bundles` in the
+    durable monitor state is ADVISORY only: it is one more attacker-writable
+    field, and while this receipt trusted it, naming a digest there minted a
+    landing proof for commits that were nowhere in the home - a single file
+    write, no CLI and no hashing, falsifying the receipt's own sentence.
 
     That last clause is the same lineage tether the ordinary lane applies
     (landing_evidence): without it the compartment receipt was bound only to
@@ -483,15 +549,19 @@ def secondmate_landing_evidence(home, task, worker, worktree, repository_generat
     lineage still minted a landing proof. The controller owns
     repository_generation in the worker record, so it cannot be edited from
     the task metadata the way `kind` can."""
-    state, landed, kept, declared, collected = secondmate_bundle_ledger(home, task, worker)
+    state, claimed_landed, kept, declared, collected = secondmate_bundle_ledger(home, task, worker)
     if kept:
         raise AuthorityError(
             "secondmate landing authority found bundles kept unlanded: {}".format(",".join(kept)))
-    unlanded = sorted((declared | collected) - landed)
-    if unlanded:
-        raise AuthorityError(
-            "secondmate landing authority found unlanded outbox bundles: {}".format(",".join(unlanded)))
     head = git(worktree, "rev-parse", "HEAD")
+    # LANDING IS PROVEN, NOT CLAIMED. landed_bundles is advisory: it lives in
+    # the same attacker-writable durable file as everything else the monitor
+    # records, so simply naming a digest there used to satisfy this receipt
+    # while the bundle's commits were nowhere in the home. The material needed
+    # to check is already on disk - the collected bundle names its own tip
+    # commit - so each declared or collected bundle counts as landed only when
+    # that tip is provably reachable from the home worktree's HEAD.
+    proven = secondmate_prove_landed(home, task, worker, worktree, head)
     lineage = subprocess.run(
         ["git", "-C", str(worktree), "merge-base", "--is-ancestor", repository_generation, head],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -507,7 +577,10 @@ def secondmate_landing_evidence(home, task, worker, worktree, repository_generat
         "chain_tip_sequence": tip.get("sequence"),
         "chain_tip_digest": tip.get("chain_digest"),
         "declared": sorted(declared),
-        "landed": sorted(landed),
+        # What was PROVEN reachable in the home, with the commits that prove
+        # it - not what the monitor-local file claimed.
+        "landed": {digest: proven[digest] for digest in sorted(proven)},
+        "landed_claimed": sorted(claimed_landed),
         "head": head,
         "repository_generation": repository_generation,
     })
@@ -531,10 +604,18 @@ def secondmate_worktree_evidence(home, task, values, worker):
     if git(worktree, "status", "--porcelain=v1", "--untracked-files=all"):
         raise AuthorityError(
             "secondmate home worktree authority is not quiesced: uncommitted or untracked work remains")
-    _state, landed, kept, declared, collected = secondmate_bundle_ledger(home, task, worker)
-    if kept or (declared | collected) - landed:
+    _state, _claimed, kept, _declared, _collected = secondmate_bundle_ledger(home, task, worker)
+    if kept:
         raise AuthorityError(
             "secondmate home worktree authority is not quiesced: unlanded outbox bundles remain")
+    # Same proof as the landing receipt, not the monitor's claim: quiesced
+    # means nothing is left unlanded, and that is decided by reachability.
+    try:
+        secondmate_prove_landed(home, task, worker, worktree, git(worktree, "rev-parse", "HEAD"))
+    except AuthorityError as exc:
+        raise AuthorityError(
+            "secondmate home worktree authority is not quiesced: unlanded outbox bundles remain "
+            "({})".format(exc))
     common = Path(git(worktree, "rev-parse", "--git-common-dir"))
     if not common.is_absolute():
         common = (worktree / common).resolve()

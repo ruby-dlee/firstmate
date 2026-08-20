@@ -29,19 +29,44 @@ SUB=11111111-1111-4111-8111-111111111111
 
 # One shared fixture builder: a primary home with the compartment evidence a
 # closed-out secondmate leaves behind, plus the secondmate home worktree.
-write_compartment_fixture() {  # <home> <task>
-  python3 - "$1" "$2" <<'PY'
+# <home> <task> <home-worktree> [unlanded]
+# Builds a REAL git bundle from the home worktree, because the landing receipt
+# now proves reachability from the bundle's own tip commit rather than trusting
+# landed_bundles. With "unlanded", the home is rewound after bundling so the
+# bundle's commit is genuinely absent from the home - the shape L0/L1 need.
+write_compartment_fixture() {
+  python3 - "$1" "$2" "$3" "${4:-landed}" <<'PY'
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 home = Path(sys.argv[1])
 task = sys.argv[2]
+worktree = Path(sys.argv[3])
+mode = sys.argv[4]
 state = home / "state"
 state.mkdir(parents=True, exist_ok=True)
 
-bundle_body = b"fixture-compartment-bundle"
+def git(*args):
+    return subprocess.run(
+        ["git", "-C", str(worktree), *args], text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout.strip()
+
+base = git("rev-parse", "HEAD")
+(worktree / "compartment-work.txt").write_text("work from the compartment\n")
+git("add", "compartment-work.txt")
+git("commit", "--quiet", "-m", "compartment leg work")
+tip_commit = git("rev-parse", "HEAD")
+bundle_path = state / "fixture.bundle"
+git("bundle", "create", str(bundle_path), "{}..HEAD".format(base))
+bundle_body = bundle_path.read_bytes()
+bundle_path.unlink()
+if mode == "unlanded":
+    # The commits exist only in the bundle now, never in the home.
+    git("reset", "--hard", base)
+    git("clean", "-fd")
 bundle_digest = hashlib.sha256(bundle_body).hexdigest()
 
 (state / (task + ".cloud-secondmate-status")).write_text("closed\n")
@@ -94,6 +119,7 @@ report.mkdir(parents=True, exist_ok=True)
     "## Visual evidence\nnone\n## Artifacts\nnone\n## Follow-ups\nnone\n")
 print(bundle_digest)
 print(chain)
+print(tip_commit)
 PY
 }
 
@@ -111,7 +137,7 @@ secondmate_evidence_refusal_matrix() {
   fm_test_tmproot_into tmp fm-authority-secondmate-matrix
   mkdir -p "$tmp/home"
   write_home_worktree "$tmp/subhome"
-  fixture_out=$(write_compartment_fixture "$tmp/home" smc-1) || fail "compartment fixture build failed"
+  fixture_out=$(write_compartment_fixture "$tmp/home" smc-1 "$tmp/subhome") || fail "compartment fixture build failed"
   bundle_digest=$(printf '%s\n' "$fixture_out" | sed -n 1p)
   honest_tip=$(printf '%s\n' "$fixture_out" | sed -n 2p)
   python3 - "$AUTHORITY" "$tmp/home" "$tmp/subhome" "$bundle_digest" "$honest_tip" <<'PY' || fail "a secondmate evidence leg refusal is missing or indistinct"
@@ -218,21 +244,32 @@ put_state(value)
 expect(lambda: landing(),
        "kept unlanded")
 put_state(saved)
-# landing: a DECLARED bundle absent from the landed record.
+# landed_bundles is ADVISORY: this home genuinely contains the bundle's
+# commits, so emptying the monitor-local claim changes nothing. Landing is
+# decided by reachability, not by what the file asserts. (The converse - a
+# LYING claim over work that is genuinely absent - is L1 in its own unit.)
 value = monitor_state()
 value["landed_bundles"] = []
 put_state(value)
-expect(lambda: landing(),
-       "unlanded outbox bundles")
-# worktree: the same unlanded evidence blocks the quiesced-home receipt.
-expect(lambda: module.secondmate_worktree_evidence(home, task, values, controller_worker()),
-       "not quiesced: unlanded outbox bundles remain")
+landing()
+module.secondmate_worktree_evidence(home, task, values, controller_worker())
+# A collected bundle whose file is removed can no longer be proven landed:
+# nothing names the commits it carried, so it refuses rather than assuming.
+stashed = {}
+for entry in list(mailbox.iterdir()):
+    if entry.name.startswith("bundle-"):
+        stashed[entry.name] = entry.read_bytes()
+        entry.unlink()
+expect(lambda: landing(), "its collected file is absent")
+for name, body in stashed.items():
+    (mailbox / name).write_bytes(body)
 put_state(saved)
 # landing: a collected-but-undeclared bundle FILE must also be landed.
+# A collected-but-undeclared bundle file must ALSO be proven landed, so a
+# planted one refuses - here at its own digest, before any git call.
 stray = mailbox / ("bundle-00000009-" + "a" * 64 + ".bundle")
 stray.write_bytes(b"stray")
-expect(lambda: landing(),
-       "unlanded outbox bundles")
+expect(lambda: landing(), "differs from its digest")
 stray.unlink()
 # landing: a recorded chain break freezes the receipt...
 (mailbox / ".chain-break").write_text("{}")
@@ -475,7 +512,9 @@ value["landed_bundles"] = []
 put_state(value)
 # The CONTROLLER tip is what must match; the monitor-local one is inert now.
 empty = landing(tip={"sequence": 2, "chain_digest": chain})
-assert b'"declared":[]' in empty and b'"landed":[]' in empty
+# "landed" is now a PROOF map (digest -> reachable tip commits), so an honest
+# chain declaring nothing proves with both sides empty.
+assert b'"declared":[]' in empty and b'"landed":{}' in empty
 put_state(saved)
 restore_mailbox()
 
@@ -516,7 +555,7 @@ exit 1
 SH
   chmod +x "$tmp/shim/tmux"
   write_home_worktree "$tmp/subhome"
-  e2e_fixture=$(write_compartment_fixture "$tmp/home" smc-1) || fail "compartment fixture build failed"
+  e2e_fixture=$(write_compartment_fixture "$tmp/home" smc-1 "$tmp/subhome") || fail "compartment fixture build failed"
   e2e_tip=$(printf '%s\n' "$e2e_fixture" | sed -n 2p)
   cat > "$tmp/home/state/smc-1.meta" <<EOF
 window=fmtest:1
@@ -646,12 +685,24 @@ monitor_path.write_text(json.dumps(broken, sort_keys=True, separators=(",", ":")
 refused = authority_run()
 assert refused.returncode == 2 and "lacks the chained close ack" in refused.stderr, refused.stderr
 
+# L1 THROUGH THE REAL CLI: landed_bundles is advisory, so emptying it over a
+# genuinely-landed home changes nothing, and REMOVING the bundle file - the
+# only thing that names the landed commits - refuses.
 broken = json.loads(monitor_path.read_text())
 broken["last_summary"]["reason"] = "close"
 broken["landed_bundles"] = []
 monitor_path.write_text(json.dumps(broken, sort_keys=True, separators=(",", ":")))
+assert authority_run().returncode == 0, "advisory landed_bundles changed the verdict"
+mailbox_dir = smstate / "smc-1.cloud-mailbox"
+stashed = {}
+for entry in list(mailbox_dir.iterdir()):
+    if entry.name.startswith("bundle-"):
+        stashed[entry.name] = entry.read_bytes()
+        entry.unlink()
 refused = authority_run()
-assert refused.returncode == 2 and "unlanded outbox bundles" in refused.stderr, refused.stderr
+assert refused.returncode == 2 and "its collected file is absent" in refused.stderr, refused.stderr
+for name, body in stashed.items():
+    (mailbox_dir / name).write_bytes(body)
 monitor_path.write_text(json.dumps(monitor, sort_keys=True, separators=(",", ":")))
 
 subhome = subhome_path
@@ -797,7 +848,7 @@ SH
   printf 'unlanded\n' >"$tmp/subhome/feature.txt"
   git -C "$tmp/subhome" add feature.txt
   git -C "$tmp/subhome" commit --quiet -m "UNLANDED WORK"
-  rk_fixture=$(write_compartment_fixture "$tmp/home" task-a) || fail "compartment fixture build failed"
+  rk_fixture=$(write_compartment_fixture "$tmp/home" task-a "$tmp/subhome") || fail "compartment fixture build failed"
   rk_tip=$(printf '%s\n' "$rk_fixture" | sed -n 2p)
   cat > "$tmp/home/state/task-a.meta" <<EOF
 window=fmtest:1
@@ -885,7 +936,112 @@ PY
   pass "the controller-owned worker role decides the evidence mode in both directions"
 }
 
+landed_bundles_is_not_a_proof() {
+  # THE L0/L1 ESCALATION. With an honest content-verified chain and an honest
+  # controller-owned tip, the receipt still rested on landed_bundles - a bare
+  # assertion in the attacker-writable durable file. Naming a digest there
+  # minted a landing proof for commits that were nowhere in the home: one file
+  # write, no CLI and no hashing, falsifying the receipt's own sentence.
+  # Landing is now proven by reachability from the collected bundle's own tip.
+  local tmp
+  fm_test_tmproot_into tmp fm-authority-landed-claim
+  mkdir -p "$tmp/home" "$tmp/shim"
+  cat > "$tmp/shim/tmux" <<'SH'
+#!/bin/sh
+echo "no server running on /tmp/fm-secondmate-authority-test" >&2
+exit 1
+SH
+  chmod +x "$tmp/shim/tmux"
+  write_home_worktree "$tmp/subhome"
+  # "unlanded": the bundle is built and the home is then rewound, so the
+  # compartment's commits exist ONLY inside the bundle.
+  fixture_out=$(write_compartment_fixture "$tmp/home" smc-1 "$tmp/subhome" unlanded) \
+    || fail "compartment fixture build failed"
+  bundle_digest=$(printf '%s\n' "$fixture_out" | sed -n 1p)
+  honest_tip=$(printf '%s\n' "$fixture_out" | sed -n 2p)
+  tip_commit=$(printf '%s\n' "$fixture_out" | sed -n 3p)
+  PATH="$tmp/shim:$PATH" python3 - "$AUTHORITY" "$tmp/home" "$tmp/subhome" \
+    "$bundle_digest" "$honest_tip" "$tip_commit" <<'PY' || fail "landed_bundles is still taken on trust"
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("worker_authority", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+home = Path(sys.argv[2])
+subhome = Path(sys.argv[3])
+bundle_digest, honest_tip, tip_commit = sys.argv[4:7]
+task = "smc-1"
+state_path = home / "state" / (task + ".cloud-secondmate-state.json")
+HEAD = module.git(subhome, "rev-parse", "HEAD")
+
+def worker():
+    return {"verified_chain_tip": {"sequence": 2, "chain_digest": honest_tip}}
+
+def landing():
+    return module.secondmate_landing_evidence(home, task, worker(), subhome, HEAD)
+
+def put(landed):
+    value = json.loads(state_path.read_text())
+    value["landed_bundles"] = landed
+    state_path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+
+# The premise: the compartment's commits are genuinely NOT in this home.
+reachable = subprocess.run(
+    ["git", "-C", str(subhome), "merge-base", "--is-ancestor", tip_commit, HEAD],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+assert reachable.returncode != 0, "fixture failure: the bundle's commit IS in the home"
+
+# L0: the truthful claim refuses, as it always did.
+put([])
+try:
+    landing()
+except module.AuthorityError as exc:
+    assert "not reachable from the home worktree head" in str(exc), exc
+else:
+    raise AssertionError("L0: unlanded work proved landed")
+
+# L1: THE LIE. Naming the digest in landed_bundles used to mint all five
+# receipts and pass the real release. It must now change nothing.
+put([bundle_digest])
+try:
+    landing()
+except module.AuthorityError as exc:
+    assert "not reachable from the home worktree head" in str(exc), exc
+else:
+    raise AssertionError("L1: a lying landed_bundles still proved landing")
+
+# The worktree receipt refuses on the same evidence, not on the same claim.
+values = {"worktree": [str(subhome)]}
+try:
+    module.secondmate_worktree_evidence(home, task, values, worker())
+except module.AuthorityError as exc:
+    assert "not quiesced: unlanded outbox bundles remain" in str(exc), exc
+else:
+    raise AssertionError("L1: the worktree receipt accepted the claim")
+
+# THE HONEST CONTROL: actually land the work, and the same fixture proves -
+# with landed_bundles still EMPTY, since the file is advisory either way.
+bundle_path = home / "state" / (task + ".cloud-mailbox") / (
+    "bundle-00000001-{}.bundle".format(bundle_digest))
+subprocess.run(["git", "-C", str(subhome), "fetch", "--quiet", "--no-tags",
+                str(bundle_path), "HEAD"], check=True)
+subprocess.run(["git", "-C", str(subhome), "merge", "--ff-only", "FETCH_HEAD"],
+               check=True, stdout=subprocess.DEVNULL)
+landed_head = module.git(subhome, "rev-parse", "HEAD")
+put([])
+evidence = module.secondmate_landing_evidence(home, task, worker(), subhome, landed_head)
+assert tip_commit.encode() in evidence, evidence
+module.secondmate_worktree_evidence(home, task, values, worker())
+PY
+  pass "landing is proven by reachability; a lying landed_bundles proves nothing"
+}
+
 secondmate_evidence_refusal_matrix
+landed_bundles_is_not_a_proof
 secondmate_authority_bundle_end_to_end
 ordinary_mode_selection_golden
 role_kind_cross_check

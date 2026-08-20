@@ -263,18 +263,6 @@ put_state(value)
 wipe_mailbox()
 expect(lambda: landing(), "records no verified delivered outbox sequence")
 
-# F2 (the worst): leave delivered_sequence and verified_tip exactly as the
-# honest monitor wrote them and replace the real entries with well-named junk.
-# Cardinality and the name regex were the only gates, so contents were never
-# read: declared came out empty and the unlanded bundle vanished from view.
-value = honest()
-value["landed_bundles"] = []
-put_state(value)
-wipe_mailbox()
-for sequence in (1, 2):
-    (mailbox / "{:08d}-{}.json".format(sequence, "b" * 64)).write_text('{"kind":"noise"}')
-expect(lambda: landing(), "content differs from its content address")
-
 # F2, SOPHISTICATED: the same junk, but with every self-consistency field
 # filled in to match its own filename - content_sha256 equal to the name
 # digest, a correctly extended chain_digest, and the right sequence. Every
@@ -295,6 +283,18 @@ for sequence in (1, 2):
 expect(lambda: landing(), "content differs from its content address")
 put_state(saved)
 restore_mailbox()
+
+# F2 (the worst): leave delivered_sequence and verified_tip exactly as the
+# honest monitor wrote them and replace the real entries with well-named junk.
+# Cardinality and the name regex were the only gates, so contents were never
+# read: declared came out empty and the unlanded bundle vanished from view.
+value = honest()
+value["landed_bundles"] = []
+put_state(value)
+wipe_mailbox()
+for sequence in (1, 2):
+    (mailbox / "{:08d}-{}.json".format(sequence, "b" * 64)).write_text('{"kind":"noise"}')
+expect(lambda: landing(), "content differs from its content address")
 
 # F3: the type guards failed OPEN - a string or negative sequence coerced to 0.
 for forged in ("2", -1, 2.0, None, True):

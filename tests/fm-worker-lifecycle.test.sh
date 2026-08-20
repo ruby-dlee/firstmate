@@ -71,6 +71,7 @@ for marker in (
     "record_daily_override_use", "last_steer_at",
     "--confirm-orphan-children", "reparented_to", "orphaned_children",
     "compartment_projection",
+    "command_compartment_chain_tip", "verified_chain_tip", "refuses to rewind",
 ):
     assert marker in controller, marker
 assert 'shape.add_argument("--required"' not in controller
@@ -106,10 +107,15 @@ for marker in (
     # state refuses instead of coercing to a permissive zero.
     "secondmate_verified_chain", "secondmate_chain_extent",
     "content differs from its content", "the recomputed chain at sequence",
-    "durable monitor state records no verified delivered",
     "secondmate_report_sections",
+    # The landing anchor is CONTROLLER-owned; monitor-local state may never
+    # supply it, and its absence refuses rather than being inferred.
+    'worker.get("verified_chain_tip")', "carries no verified",
+    "controller-owned verified chain tip is malformed",
 ):
     assert marker in authority, marker
+assert 'state.get("verified_tip")' not in authority, (
+    "the landing anchor must not come from monitor-local durable state")
 # The compartment worktree receipt must not be laxer than the ordinary one.
 assert '"--untracked-files=no"' not in authority
 for marker in (
@@ -4042,6 +4048,96 @@ PY
   pass "a finished child unlocks the exact parent release the live child refused"
 }
 
+compartment_chain_tip_command() {
+  # The controller-owned anchor for compartment landing proofs. It is
+  # deliberately NOT part of the message lane (PR 3's invariant, pinned by a
+  # static test): recording the tip is a lifecycle write, so it is its own
+  # command with its own gates.
+  compartment_fixture_env fm-worker-chain-tip
+  python3 - "$WRAPPER" "$COMPARTMENT_ENVFILE" <<'PY' || fail "the compartment chain tip command is not gated"
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+wrapper, envfile = sys.argv[1:]
+env = os.environ.copy()
+for line in Path(envfile).read_text().splitlines():
+    key, value = line.split("=", 1)
+    env[key] = value
+
+def run(*args, check=True):
+    result = subprocess.run([wrapper] + list(args), env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and result.returncode != 0:
+        raise AssertionError("{} failed: {}".format(args, result.stderr))
+    return result
+
+def binding(number):
+    return format(number, "064x")
+
+state_path = Path(env["FM_HOME"]) / "state/azure-workers/controller.json"
+
+def controller_state():
+    return json.loads(state_path.read_text())
+
+run("request", "--task", "smc-1", "--task-generation", "gen-s1",
+    "--home-binding", binding(21), "--account-binding", binding(22),
+    "--worktree-binding", binding(23), "--repository-binding", binding(24),
+    "--repository-generation", "repo-s1", "--owner-kind", "primary",
+    "--role", "secondmate", "--eligible")
+run("request", "--task", "task-a", "--task-generation", "gen-a",
+    "--home-binding", binding(31), "--account-binding", binding(32),
+    "--worktree-binding", binding(33), "--repository-binding", binding(34),
+    "--repository-generation", "repo-a", "--owner-kind", "primary", "--eligible")
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+state = controller_state()
+smc_slot = str(state["queue"]["smc-1@gen-s1"]["slot"])
+assignment = state["workers"][smc_slot]["assignment_generation"]
+author_assignment = state["workers"][str(state["queue"]["task-a@gen-a"]["slot"])]["assignment_generation"]
+
+def tip(sequence, digest, task="smc-1", generation="gen-s1", asg=None, check=True):
+    return run("compartment-chain-tip", "--task", task, "--task-generation", generation,
+               "--assignment-generation", asg or assignment,
+               "--sequence", str(sequence), "--chain-digest", digest, check=check)
+
+# Records on the WORKER RECORD, under the controller lock.
+tip(1, "a" * 64)
+recorded = controller_state()["workers"][smc_slot]["verified_chain_tip"]
+assert recorded["sequence"] == 1 and recorded["chain_digest"] == "a" * 64, recorded
+assert recorded["recorded_at"], recorded
+
+# Monotonic: advancing is fine, rewinding refuses, and a same-sequence fork
+# refuses - a tip that could be rewritten freely would be no anchor at all.
+tip(2, "b" * 64)
+refused = tip(1, "a" * 64, check=False)
+assert refused.returncode != 0 and "refuses to rewind" in refused.stderr, refused.stderr
+refused = tip(2, "c" * 64, check=False)
+assert refused.returncode != 0 and "already recorded a different digest" in refused.stderr, refused.stderr
+# An exact replay of the current tip is idempotent.
+tip(2, "b" * 64)
+assert controller_state()["workers"][smc_slot]["verified_chain_tip"]["sequence"] == 2
+
+# Identity gates.
+refused = tip(3, "d" * 64, asg="asg-99999999", check=False)
+assert refused.returncode != 0 and "assignment generation is not exact" in refused.stderr, refused.stderr
+refused = tip(3, "d" * 64, task="task-a", generation="gen-a", asg=author_assignment, check=False)
+assert refused.returncode != 0 and "secondmate compartments only" in refused.stderr, refused.stderr
+refused = tip(3, "nothex", check=False)
+assert refused.returncode != 0, refused.stderr
+refused = tip(0, "d" * 64, check=False)
+assert refused.returncode != 0 and "positive integer" in refused.stderr, refused.stderr
+refused = tip(3, "d" * 64, task="ghost", generation="gen-x", check=False)
+assert refused.returncode != 0 and "exact assigned task generation" in refused.stderr, refused.stderr
+
+# The author worker never gains the field.
+assert "verified_chain_tip" not in controller_state()["workers"][
+    str(controller_state()["queue"]["task-a@gen-a"]["slot"])]
+PY
+  pass "the compartment chain tip records on the controller-owned worker record and is monotonic"
+}
+
 compartment_status_projection() {
   # PR-6 status projection: every live compartment appears in bounded status
   # from controller.json fields only, additively for JSON consumers.
@@ -4798,8 +4894,11 @@ carve_index = next(index for index, line in enumerate(lines) if line == carve)
 claim_index = next(index for index, line in enumerate(lines) if "pending_actions" in line and "idempotency key" in line)
 assert abs(carve_index - claim_index) <= 4, (carve_index, claim_index)
 
-# The wrapper dispatches both verbs through the gated lane.
-assert "|message-put|message-collect)" in wrapper
+# The wrapper dispatches both verbs through the gated lane. The compartment
+# chain tip rides the same gated lane but is NOT part of the carve: it is a
+# lifecycle write, which is exactly why it is a separate verb.
+assert "|message-put|message-collect|compartment-chain-tip)" in wrapper
+assert "compartment-chain-tip" not in carve
 PY
   pass "inventory stays three named blob reads; the carve is pinned in code, doc, and wrapper"
 }
@@ -5557,6 +5656,7 @@ surrender_orphan_confirm
 childless_surrender_bytes_unchanged
 secondmate_release_children_positive_control
 compartment_status_projection
+compartment_chain_tip_command
 message_lane_provider_contract
 message_lane_claim_exemption
 message_lane_static_contract

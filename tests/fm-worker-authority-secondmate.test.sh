@@ -93,6 +93,7 @@ report.mkdir(parents=True, exist_ok=True)
     "## Summary\nclosed\n## What changed\nx\n## Verification\nx\n"
     "## Visual evidence\nnone\n## Artifacts\nnone\n## Follow-ups\nnone\n")
 print(bundle_digest)
+print(chain)
 PY
 }
 
@@ -110,8 +111,10 @@ secondmate_evidence_refusal_matrix() {
   fm_test_tmproot_into tmp fm-authority-secondmate-matrix
   mkdir -p "$tmp/home"
   write_home_worktree "$tmp/subhome"
-  bundle_digest=$(write_compartment_fixture "$tmp/home" smc-1) || fail "compartment fixture build failed"
-  python3 - "$AUTHORITY" "$tmp/home" "$tmp/subhome" "$bundle_digest" <<'PY' || fail "a secondmate evidence leg refusal is missing or indistinct"
+  fixture_out=$(write_compartment_fixture "$tmp/home" smc-1) || fail "compartment fixture build failed"
+  bundle_digest=$(printf '%s\n' "$fixture_out" | sed -n 1p)
+  honest_tip=$(printf '%s\n' "$fixture_out" | sed -n 2p)
+  python3 - "$AUTHORITY" "$tmp/home" "$tmp/subhome" "$bundle_digest" "$honest_tip" <<'PY' || fail "a secondmate evidence leg refusal is missing or indistinct"
 import hashlib
 import importlib.util
 import json
@@ -146,10 +149,18 @@ def expect(callable_, fragment):
         raise AssertionError("no refusal: {}".format(fragment))
 
 HEAD = module.git(subhome, "rev-parse", "HEAD")
+HONEST_TIP = {"sequence": 2, "chain_digest": sys.argv[5]}
 
-def landing(generation=None):
+def controller_worker(tip=None):
+    """A worker record as the CONTROLLER hands it to the authority. The
+    verified chain tip lives HERE, not in the monitor-local state file, which
+    is what stops a forged chain from carrying its own matching anchor."""
+    return {"verified_chain_tip": json.loads(json.dumps(HONEST_TIP)) if tip is None else tip}
+
+def landing(generation=None, tip=None):
     return module.secondmate_landing_evidence(
-        home, task, subhome, generation if generation is not None else HEAD)
+        home, task, controller_worker(tip), subhome,
+        generation if generation is not None else HEAD)
 
 # The good fixture proves all three compartment legs.
 report = module.secondmate_report_evidence(home, task)
@@ -157,7 +168,7 @@ assert report.startswith(b"closed\0close\x002\0"), report[:40]
 assert b"## Summary" in report
 landing_bytes = landing()
 assert bundle_digest.encode() in landing_bytes
-worktree_info, worktree = module.secondmate_worktree_evidence(home, task, values)
+worktree_info, worktree = module.secondmate_worktree_evidence(home, task, values, controller_worker())
 assert worktree == subhome.resolve()
 
 # The ack mapping binds every terminal reason the monitor writes.
@@ -209,7 +220,7 @@ put_state(value)
 expect(lambda: landing(),
        "unlanded outbox bundles")
 # worktree: the same unlanded evidence blocks the quiesced-home receipt.
-expect(lambda: module.secondmate_worktree_evidence(home, task, values),
+expect(lambda: module.secondmate_worktree_evidence(home, task, values, controller_worker()),
        "not quiesced: unlanded outbox bundles remain")
 put_state(saved)
 # landing: a collected-but-undeclared bundle FILE must also be landed.
@@ -230,12 +241,12 @@ expect(lambda: landing(),
        "frozen by a recorded outbox chain break")
 (mailbox / ".chain-break").unlink()
 
-# landing: THE THREE PROVEN FORGERIES. Each one minted all five proved
-# receipts and passed the real release CLI while a declared bundle was
-# unlanded, because the checks trusted things inside the attacker's own write
-# set - the mailbox filenames, and the durable state file that sits in the
-# same state/ directory. Verification is now by CONTENT over the chain's own
-# arithmetic, and malformed durable state refuses instead of zeroing.
+# landing: THE FORGERY MATRIX. Every one of these minted all five proved
+# receipts and passed the real release CLI at some earlier head, and each
+# failure had the same shape: the check was anchored to something inside the
+# attacker's write set. The mailbox and the monitor-local state file share one
+# directory, so neither can anchor the other. The anchor is now the
+# CONTROLLER-OWNED verified chain tip.
 kept_entries = {entry.name: entry.read_bytes() for entry in mailbox.iterdir()}
 
 def wipe_mailbox():
@@ -253,44 +264,82 @@ def honest():
     never inherits the previous one's edits."""
     return json.loads(json.dumps(saved))
 
-# F1: empty the mailbox, then zero the very fields the completeness check read,
-# in the same JSON the attacker was already rewriting to set landed_bundles=[].
+def rebuild_chain(entries):
+    """Write a self-consistent chain from genesis and return its tip digest -
+    what an attacker who can recompute SHA-256 produces at will."""
+    chain = "0" * 64
+    for sequence, body in enumerate(entries, 1):
+        message = dict(body, sequence=sequence)
+        unsigned = json.dumps(
+            message, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        content = hashlib.sha256(unsigned).hexdigest()
+        chain = hashlib.sha256((chain + content).encode()).hexdigest()
+        message["content_sha256"] = content
+        message["chain_digest"] = chain
+        (mailbox / "{:08d}-{}.json".format(sequence, content)).write_text(
+            json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+    return chain
+
+MESSAGE_ENTRY = {"kind": "fm.secondmate-message/v1", "text": "checking in"}
+NO_BUNDLE_SUMMARY = {"kind": "fm.secondmate-leg-summary/v1", "reason": "close",
+                     "legs_completed": 2, "bundles": []}
+
+# THE ANCHOR ITSELF. Absent controller tip refuses and names the sanctioned
+# exit; it is never inferred from monitor-local state.
+expect(lambda: landing(tip=False and None or "MISSING"),
+       "controller-owned worker record carries no verified chain tip")
+for malformed in ({"sequence": "2", "chain_digest": "a" * 64}, {"sequence": 2},
+                  {"sequence": 0, "chain_digest": "a" * 64},
+                  {"sequence": 2, "chain_digest": "nothex"}, {}):
+    expect(lambda m=malformed: landing(tip=m), "controller-owned verified chain tip is malformed")
+
+# F1: empty the mailbox and zero the monitor-local sequence fields. Those
+# fields no longer supply the extent at all, so the controller tip still
+# demands the full chain.
 value = honest()
 value["landed_bundles"] = []
 value["delivered_sequence"] = 0
 value.pop("verified_tip", None)
 put_state(value)
 wipe_mailbox()
-expect(lambda: landing(), "records no verified delivered outbox sequence")
+expect(lambda: landing(), "a rewound or truncated outbox")
+
+# F3: the monitor-local sequence as a string, negative, float, or absent - all
+# inert now, for the same reason.
+for forged in ("2", -1, 2.0, None, True, 99):
+    value = honest()
+    value["landed_bundles"] = []
+    value["delivered_sequence"] = forged
+    value["verified_tip"] = {"sequence": 99, "chain_digest": "c" * 64}
+    put_state(value)
+    wipe_mailbox()
+    expect(lambda: landing(), "a rewound or truncated outbox")
+put_state(saved)
+restore_mailbox()
 
 # F2, THE ISOLATING FORM: keep the honest mailbox EXACTLY as the monitor
 # wrote it - same filenames, same content_sha256 and chain_digest fields, so
-# the chain links and reproduces the durable tip perfectly - and rewrite only
-# the leg summary's BODY to drop its `bundles` declaration. Every structural
-# check still passes; the declared set silently empties and the unlanded
-# bundle disappears from view. ONLY recomputing SHA-256 over the body catches
-# this, which is what makes content verification load-bearing rather than
-# merely one more gate.
+# the chain links and reproduces the tip perfectly - and rewrite only the leg
+# summary's BODY to drop its `bundles` declaration, deleting the collected
+# bundle file too. Every structural check still passes and the unlanded bundle
+# vanishes from view; ONLY recomputing SHA-256 over the body catches it.
 value = honest()
 value["landed_bundles"] = []
 put_state(value)
 restore_mailbox()
-summary_name = None
+summary_entry = None
 for entry in sorted(mailbox.iterdir()):
     if entry.name.endswith(".json"):
         body = json.loads(entry.read_text())
         if body.get("kind") == "fm.secondmate-leg-summary/v1":
-            summary_name = entry
+            summary_entry = entry
             break
-assert summary_name is not None, "fixture has no leg summary to rewrite"
-tampered = json.loads(summary_name.read_text())
+assert summary_entry is not None, "fixture has no leg summary to rewrite"
+tampered = json.loads(summary_entry.read_text())
 assert tampered["bundles"], "fixture leg summary declares no bundle"
 tampered["bundles"] = []
-summary_name.write_text(
+summary_entry.write_text(
     json.dumps(tampered, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
-# ... and remove the collected bundle file too, so the one-sided
-# collected-by-name enumeration cannot serve as the backstop either. Now
-# nothing but the content address stands between this and a proved receipt.
 for entry in list(mailbox.iterdir()):
     if entry.name.startswith("bundle-"):
         entry.unlink()
@@ -298,56 +347,82 @@ expect(lambda: landing(), "content differs from its content address")
 put_state(saved)
 restore_mailbox()
 
-# F2 (the worst): leave delivered_sequence and verified_tip exactly as the
-# honest monitor wrote them and replace the real entries with well-named junk.
-# Cardinality and the name regex were the only gates, so contents were never
-# read: declared came out empty and the unlanded bundle vanished from view.
+# G1: a fresh, wholly self-consistent chain minted from genesis declaring no
+# bundles, with a matching monitor-local tip. Internally perfect; it simply is
+# not the chain this compartment spoke on, and only a tip the attacker cannot
+# write can tell the difference.
 value = honest()
 value["landed_bundles"] = []
 put_state(value)
 wipe_mailbox()
-for sequence in (1, 2):
-    (mailbox / "{:08d}-{}.json".format(sequence, "b" * 64)).write_text('{"kind":"noise"}')
-expect(lambda: landing(), "content differs from its content address")
+forged_tip = rebuild_chain([MESSAGE_ENTRY, NO_BUNDLE_SUMMARY])
+value = honest()
+value["landed_bundles"] = []
+value["verified_tip"] = {"sequence": 2, "chain_digest": forged_tip}
+put_state(value)
+expect(lambda: landing(), "does not reproduce the controller-owned verified tip")
 
-# F3: the type guards failed OPEN - a string or negative sequence coerced to 0.
-for forged in ("2", -1, 2.0, None, True):
-    value = honest()
-    value["landed_bundles"] = []
-    value["delivered_sequence"] = forged
-    put_state(value)
-    wipe_mailbox()
-    expect(lambda: landing(), "records no verified delivered outbox sequence")
-# ... and the same fail-open in the verified tip itself.
-for forged in ({"sequence": "2", "chain_digest": "a" * 64}, {"sequence": 2},
-               {"sequence": 2, "chain_digest": "nothex"}, {}, "tip", None):
-    value = honest()
-    value["verified_tip"] = forged
-    put_state(value)
-    expect(lambda: landing(), "verified chain tip")
+# G2: the same trick at length one - a single-entry re-genesis chain with the
+# monitor-local delivered/tip set to 1.
+wipe_mailbox()
+short_tip = rebuild_chain([NO_BUNDLE_SUMMARY])
+value = honest()
+value["landed_bundles"] = []
+value["delivered_sequence"] = 1
+value["verified_tip"] = {"sequence": 1, "chain_digest": short_tip}
+put_state(value)
+expect(lambda: landing(), "a rewound or truncated outbox")
+# ... and even told the controller tip is length one, the digest is not ours.
+expect(lambda: landing(tip={"sequence": 1, "chain_digest": short_tip.replace(short_tip[0], "0", 1)}),
+       "controller-owned verified tip")
 put_state(saved)
 restore_mailbox()
 
-# A wiped store re-minted as a fresh, internally consistent chain from genesis
-# must not verify: the durable tip is what ties the chain to this compartment.
+# T7, THE SHARPEST: take F2's isolating forgery, which correctly refuses, and
+# add EXACTLY ONE more field write in the same monitor-local file the attacker
+# was already editing - recompute the rewritten entry's content address and
+# chain digest, and update verified_tip to match. Entry 1 stays byte-identical
+# to what the real monitor wrote. Surgical, not a wipe. That minted while the
+# tip was monitor-local; against a controller-owned tip it cannot.
 value = honest()
 value["landed_bundles"] = []
 put_state(value)
-wipe_mailbox()
-chain = "0" * 64
-for sequence, body in enumerate((
-    {"kind": "fm.secondmate-message/v1", "text": "fresh"},
-    {"kind": "fm.secondmate-leg-summary/v1", "reason": "close", "legs_completed": 2, "bundles": []},
-), 1):
-    message = dict(body, sequence=sequence)
-    unsigned = json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    content = hashlib.sha256(unsigned).hexdigest()
-    chain = hashlib.sha256((chain + content).encode()).hexdigest()
-    message["content_sha256"] = content
-    message["chain_digest"] = chain
-    (mailbox / "{:08d}-{}.json".format(sequence, content)).write_text(
-        json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
-expect(lambda: landing(), "does not reproduce the durable verified tip")
+restore_mailbox()
+entry_one_before = None
+summary_entry = None
+for entry in sorted(mailbox.iterdir()):
+    if not entry.name.endswith(".json"):
+        continue
+    body = json.loads(entry.read_text())
+    if body.get("kind") == "fm.secondmate-leg-summary/v1":
+        summary_entry = entry
+    elif body.get("sequence") == 1:
+        entry_one_before = (entry.name, entry.read_bytes())
+assert summary_entry is not None and entry_one_before is not None
+first_chain = json.loads((mailbox / entry_one_before[0]).read_text())["chain_digest"]
+tampered = json.loads(summary_entry.read_text())
+tampered["bundles"] = []
+unsigned = dict(tampered)
+unsigned.pop("content_sha256", None)
+unsigned.pop("chain_digest", None)
+new_content = hashlib.sha256(json.dumps(
+    unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+new_chain = hashlib.sha256((first_chain + new_content).encode()).hexdigest()
+tampered["content_sha256"] = new_content
+tampered["chain_digest"] = new_chain
+summary_entry.unlink()
+(mailbox / "{:08d}-{}.json".format(2, new_content)).write_text(
+    json.dumps(tampered, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+for entry in list(mailbox.iterdir()):
+    if entry.name.startswith("bundle-"):
+        entry.unlink()
+value = honest()
+value["landed_bundles"] = []
+value["verified_tip"] = {"sequence": 2, "chain_digest": new_chain}
+put_state(value)
+# Entry 1 is untouched, exactly as the reviewer's T7 requires.
+assert (mailbox / entry_one_before[0]).read_bytes() == entry_one_before[1]
+expect(lambda: landing(), "does not reproduce the controller-owned verified tip")
 put_state(saved)
 restore_mailbox()
 
@@ -355,11 +430,11 @@ restore_mailbox()
 wipe_mailbox()
 expect(lambda: landing(), "a rewound or truncated outbox")
 mailbox.rmdir()
-expect(lambda: landing(), "its mailbox is absent or redirected")
+expect(lambda: landing(), "mailbox is absent or redirected")
 decoy = home / "state" / "decoy-mailbox"
 decoy.mkdir()
 mailbox.symlink_to(decoy)
-expect(lambda: landing(), "its mailbox is absent or redirected")
+expect(lambda: landing(), "mailbox is absent or redirected")
 mailbox.unlink()
 mailbox.mkdir()
 restore_mailbox()
@@ -392,25 +467,25 @@ for sequence, body in enumerate((
         json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 value = honest()
 value["landed_bundles"] = []
-value["verified_tip"] = {"sequence": 2, "chain_digest": chain}
 put_state(value)
-empty = landing()
+# The CONTROLLER tip is what must match; the monitor-local one is inert now.
+empty = landing(tip={"sequence": 2, "chain_digest": chain})
 assert b'"declared":[]' in empty and b'"landed":[]' in empty
 put_state(saved)
 restore_mailbox()
 
 # worktree: tracked modifications are not a quiesced home.
 (subhome / "charter.md").write_text("edited\n")
-expect(lambda: module.secondmate_worktree_evidence(home, task, values),
+expect(lambda: module.secondmate_worktree_evidence(home, task, values, controller_worker()),
        "not quiesced: uncommitted or untracked work remains")
 import subprocess
 subprocess.run(["git", "-C", str(subhome), "checkout", "--", "charter.md"], check=True)
-module.secondmate_worktree_evidence(home, task, values)
+module.secondmate_worktree_evidence(home, task, values, controller_worker())
 # UNTRACKED never-added work is work left behind too: a release receipt
 # answers "is anything left here", not the monitor's narrower "can I
 # fast-forward into this", and the ordinary lane has always refused it.
 (subhome / "new_feature.py").write_text("print('unsaved')\n")
-expect(lambda: module.secondmate_worktree_evidence(home, task, values),
+expect(lambda: module.secondmate_worktree_evidence(home, task, values, controller_worker()),
        "not quiesced: uncommitted or untracked work remains")
 (subhome / "new_feature.py").unlink()
 # A gitignored runtime path is still not "work left behind": --untracked-files=all
@@ -420,7 +495,7 @@ subprocess.run(["git", "-C", str(subhome), "add", ".gitignore"], check=True)
 subprocess.run(["git", "-C", str(subhome), "commit", "--quiet", "-m", "ignore runtime"], check=True)
 (subhome / "runtime").mkdir()
 (subhome / "runtime" / "monitor.log").write_text("noise\n")
-module.secondmate_worktree_evidence(home, task, values)
+module.secondmate_worktree_evidence(home, task, values, controller_worker())
 PY
   pass "every secondmate evidence leg refuses distinctly and the ack mapping binds all three terminals"
 }
@@ -436,7 +511,8 @@ exit 1
 SH
   chmod +x "$tmp/shim/tmux"
   write_home_worktree "$tmp/subhome"
-  write_compartment_fixture "$tmp/home" smc-1 >/dev/null || fail "compartment fixture build failed"
+  e2e_fixture=$(write_compartment_fixture "$tmp/home" smc-1) || fail "compartment fixture build failed"
+  e2e_tip=$(printf '%s\n' "$e2e_fixture" | sed -n 2p)
   cat > "$tmp/home/state/smc-1.meta" <<EOF
 window=fmtest:1
 worktree=$tmp/subhome
@@ -455,7 +531,7 @@ EOF
   FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
   FM_AZURE_OWNER_TAG=owner \
   FM_AZURE_NAMING_PREFIX=fmtest \
-  python3 - "$AUTHORITY" "$CONTROLLER" "$WRAPPER" "$tmp/home" <<'PY' || fail "the secondmate authority bundle did not verify through the unmodified release path"
+  python3 - "$AUTHORITY" "$CONTROLLER" "$WRAPPER" "$tmp/home" "$e2e_tip" <<'PY' || fail "the secondmate authority bundle did not verify through the unmodified release path"
 import importlib.util
 import json
 import os
@@ -463,7 +539,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-authority, controller_path, wrapper, home_raw = sys.argv[1:]
+authority, controller_path, wrapper, home_raw, honest_tip = sys.argv[1:]
 home = Path(home_raw)
 
 spec = importlib.util.spec_from_file_location("controller", controller_path)
@@ -508,10 +584,36 @@ state["queue"]["smc-1@gen-s1"] = {
     "assignment_generation": "asg-00000001", **bindings,
 }
 state["workers"]["1"] = worker
+# The verified chain tip is CONTROLLER-owned. It is recorded below through the
+# real compartment-chain-tip CLI, so this exercise covers the whole path the
+# monitor will use rather than hand-planting the anchor.
 menv["state_dir"].mkdir(parents=True, exist_ok=True)
 menv["state_path"].write_text(json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
 
+# Record the tip through the REAL CLI, under the controller lock, exactly as
+# the monitor will. This also proves the new command's own gates: it refuses a
+# rewind and a same-sequence fork.
+def record_tip(sequence, digest, check=True):
+    result = subprocess.run(
+        [wrapper, "compartment-chain-tip", "--task", "smc-1",
+         "--task-generation", "gen-s1", "--assignment-generation", "asg-00000001",
+         "--sequence", str(sequence), "--chain-digest", digest],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy())
+    if check and result.returncode != 0:
+        raise AssertionError("compartment-chain-tip failed: {}".format(result.stderr))
+    return result
+
+record_tip(1, "d" * 64)
+rewound = record_tip(1, "e" * 64, check=False)
+assert rewound.returncode != 0 and "already recorded a different digest" in rewound.stderr, rewound.stderr
+record_tip(2, honest_tip)
+back = record_tip(1, "d" * 64, check=False)
+assert back.returncode != 0 and "refuses to rewind" in back.stderr, back.stderr
+recorded = json.loads(menv["state_path"].read_text())["workers"]["1"]["verified_chain_tip"]
+assert recorded["sequence"] == 2 and recorded["chain_digest"] == honest_tip, recorded
+
 worker_state = home / "worker-state.json"
+worker = json.loads(menv["state_path"].read_text())["workers"]["1"]
 worker_state.write_text(json.dumps(worker, sort_keys=True, separators=(",", ":")))
 proof_path = home / "smc-1-proof.json"
 
@@ -690,7 +792,8 @@ SH
   printf 'unlanded\n' >"$tmp/subhome/feature.txt"
   git -C "$tmp/subhome" add feature.txt
   git -C "$tmp/subhome" commit --quiet -m "UNLANDED WORK"
-  write_compartment_fixture "$tmp/home" task-a >/dev/null || fail "compartment fixture build failed"
+  rk_fixture=$(write_compartment_fixture "$tmp/home" task-a) || fail "compartment fixture build failed"
+  rk_tip=$(printf '%s\n' "$rk_fixture" | sed -n 2p)
   cat > "$tmp/home/state/task-a.meta" <<EOF
 window=fmtest:1
 worktree=$tmp/subhome
@@ -702,13 +805,13 @@ EOF
   PATH="$tmp/shim:$PATH" \
   FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
   FM_ACCOUNT_DIRECTORY_ROOT="$tmp/accounts" \
-  python3 - "$AUTHORITY" "$tmp/home" "$tmp/subhome" <<'PY' || fail "the controller role does not decide the evidence mode"
+  python3 - "$AUTHORITY" "$tmp/home" "$tmp/subhome" "$rk_tip" <<'PY' || fail "the controller role does not decide the evidence mode"
 import json
 from pathlib import Path
 import subprocess
 import sys
 
-authority, home_raw, subhome_raw = sys.argv[1:]
+authority, home_raw, subhome_raw, honest_tip = sys.argv[1:]
 home = Path(home_raw)
 subhome = Path(subhome_raw)
 meta = home / "state" / "task-a.meta"
@@ -723,6 +826,9 @@ def write_worker(role):
                      "account_binding": "2" * 64, "worktree_binding": "3" * 64,
                      "repository_binding": "4" * 64},
         "cloud_instance_id": "cloud-1", "resources": {},
+        # Controller-owned: the compartment lane needs its verified chain tip
+        # here, never from the monitor-local state file.
+        "verified_chain_tip": {"sequence": 2, "chain_digest": honest_tip},
     }
     worker_state.write_text(json.dumps(worker, sort_keys=True, separators=(",", ":")))
 

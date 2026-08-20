@@ -1411,6 +1411,8 @@ fi
 exit 0
 SH
   chmod +x "$SP_DIR/child-fake/treehouse"
+  mkdir -p "$SP_SUB/treehouse-pools"
+  chmod 755 "$SP_SUB" "$SP_SUB/treehouse-pools"
   git -C "$SP_SUB/projects/alpha" worktree add --quiet --detach "$SP_DIR/child-worktree" \
     || fail "could not stage a child worktree of the home's project"
   # One valid child request landed for this compartment.

@@ -2105,6 +2105,48 @@ def proof_template(state, task, generation):
     return proof
 
 
+def compartment_projection(state):
+    """Bounded status of every live secondmate compartment, from controller.json
+    fields ONLY: role/slot/status from the queue entry, children_total and the
+    assignment timestamps from the worker record, and the active-children count
+    from the same queue scan the child bounds use. Leg progress and the exact
+    TTL clock are the compartment monitor's local state and are deliberately
+    NOT invented here; ttl_anchor is the durable assignment anchor (assigned_at,
+    else created_at), the controller's honest approximation of when compartment
+    compute began. session_legs is projected only when a worker record actually
+    carries it (additive, per design B.2)."""
+    compartments = []
+    for key, item in sorted(state["queue"].items()):
+        if item.get("role") != "secondmate" or item.get("status") == "complete":
+            continue
+        worker = None
+        slot = item.get("slot")
+        if slot is not None:
+            candidate = state["workers"].get(str(slot))
+            if candidate is not None and candidate.get("queue_key") == key:
+                worker = candidate
+        children_active = sum(
+            1 for entry in state["queue"].values()
+            if entry.get("parent_task") == item.get("task")
+            and entry.get("parent_task_generation") == item.get("task_generation")
+            and entry.get("status") != "complete"
+        )
+        entry = {
+            "task": item.get("task"),
+            "task_generation": item.get("task_generation"),
+            "status": item.get("status"),
+            "slot": int(slot) if slot is not None else None,
+            "assignment_generation": (worker or {}).get("assignment_generation"),
+            "children_active": children_active,
+            "children_total": int((worker or {}).get("children_total", 0) or 0),
+            "ttl_anchor": (worker or {}).get("assigned_at") or (worker or {}).get("created_at"),
+        }
+        if worker is not None and "session_legs" in worker:
+            entry["session_legs"] = worker["session_legs"]
+        compartments.append(entry)
+    return compartments
+
+
 def status_projection(env, state, inventory=None):
     if inventory is None:
         metrics = state.get("last_metrics") or {}
@@ -2216,6 +2258,7 @@ def status_projection(env, state, inventory=None):
         "regional_observed_plus_reserved_vcpus": regional_committed,
         "family_observed_plus_reserved_vcpus": family_committed,
         "shared_headroom_vcpus": SHARED_HEADROOM_VCPUS,
+        "compartments": compartment_projection(state),
         "idle_cooldown_seconds": env["cooldown_seconds"],
         "warm_idle_target": env["warm_idle"],
         "retained_disks": retained_disks,
@@ -2257,6 +2300,16 @@ def print_status(status, json_output):
     print("specialized-queue: queued={} reserved={}".format(
         status["specialized_queued_reservations"], status["specialized_reserved_reservations"],
     ))
+    for compartment in status.get("compartments") or []:
+        line = (
+            "compartment: task={}@{} status={} slot={} children={}/{} ttl-anchor={}".format(
+                compartment["task"], compartment["task_generation"], compartment["status"],
+                compartment["slot"], compartment["children_active"],
+                compartment["children_total"], compartment["ttl_anchor"],
+            ))
+        if "session_legs" in compartment:
+            line += " legs={}".format(compartment["session_legs"])
+        print(line)
     if status["pending_mutations"]:
         print("pending-mutations: {}".format(json.dumps(
             status["pending_mutations"], sort_keys=True, separators=(",", ":"))))
@@ -2320,6 +2373,10 @@ def parser():
     surrender_parser.add_argument(
         "--confirm-discard-unlanded", action="store_true",
         help="acknowledge that recorded execute outcomes never proven landed are discarded",
+    )
+    surrender_parser.add_argument(
+        "--confirm-orphan-children", action="store_true",
+        help="acknowledge that live compartment children are durably reparented to the primary",
     )
     surrender_parser.add_argument("--confirm-subscription", required=True)
     abandon_parser = sub.add_parser(
@@ -3301,8 +3358,11 @@ def command_surrender(env, args):
     Surrender is the durable, refusal-first replacement for that hand edit. It
     is not a shortcut around release: it first runs the ordinary authority
     itself and refuses when that succeeds, refuses live compute (the VM must be
-    deallocated or stopped), refuses to replace an ordinary release proof, and
-    demands an operator reason plus the same double confirmation as withdraw.
+    deallocated or stopped), refuses to replace an ordinary release proof,
+    refuses to orphan live compartment children unless the operator passes
+    --confirm-orphan-children (which durably stamps reparented_to: primary on
+    every live child under the same lock hold), and demands an operator reason
+    plus the same double confirmation as withdraw.
     The minted bundle keeps the fm.worker-release/v2 shape the downstream
     deallocate/delete-compute/reset machinery already fences on, but every
     authority verdict is "surrendered" - release_receipt() rejects that verdict,
@@ -3371,6 +3431,23 @@ def command_surrender(env, args):
                 "is unproven; inspect the task disk, then pass --confirm-discard-unlanded "
                 "to discard it deliberately".format(", ".join(produced))
             )
+        # The children-quiesced gate, mirroring command_release's, with the one
+        # sanctioned bypass (design B.7 graft 4, closing AMENDMENT 1's
+        # temporary hole): orphaning live children demands its own explicit
+        # confirmation, and taking it stamps a durable reparented_to note on
+        # every live child in the SAME lock hold that records the surrender,
+        # so the reparenting and the surrender are one atomic durable fact.
+        live_children = [
+            entry for entry in state["queue"].values()
+            if entry.get("parent_task") == args.task
+            and entry.get("parent_task_generation") == args.task_generation
+            and entry.get("status") != "complete"
+        ]
+        if live_children and not args.confirm_orphan_children:
+            raise LifecycleError(
+                "surrender refuses: {} active children name parent {}; pass "
+                "--confirm-orphan-children to reparent them to the primary deliberately".format(
+                    len(live_children), args.task))
         refusal = ordinary_authority_attempt(env, args, worker)
         if refusal is None:
             raise LifecycleError(
@@ -3394,6 +3471,7 @@ def command_surrender(env, args):
             "power_state": power,
             "last_execution_digest": worker.get("last_execution_digest"),
             "discarded_unlanded_executions": produced,
+            "orphaned_children": len(live_children),
         }
         proof = {
             "schema": RELEASE_SCHEMA,
@@ -3427,6 +3505,11 @@ def command_surrender(env, args):
         worker["released_at"] = surrendered_at
         worker["phase"] = "release-proved"
         item["status"] = "releasing"
+        for entry in live_children:
+            # Durable, under this same lock hold: the child queue entries now
+            # name the primary as their driver. The parent fields stay for
+            # lineage; the note is what the captain reads.
+            entry["reparented_to"] = "primary"
         save_state(env, state)
     write_surrender_output(args.output, proof)
     print("FM-SURRENDERED {} {}".format(args.task, args.task_generation))

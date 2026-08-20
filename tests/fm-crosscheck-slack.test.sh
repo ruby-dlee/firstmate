@@ -194,8 +194,11 @@ if command == "mention":
     github_token = mod.required_token(config.github_token_env, "GitHub read credential")
     posts = Path(os.environ["FMT_POSTS"])
     reacts = Path(os.environ["FMT_REACTS"])
+    fail_verdict_post = os.environ.get("FMT_FAIL_VERDICT_POST") == "1"
 
     def post(channel, thread_ts, text):
+        if fail_verdict_post and text.startswith("Crosscheck "):
+            raise RuntimeError("induced post failure")
         with posts.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps({"channel": channel, "thread_ts": thread_ts, "text": text}) + "\n"
@@ -205,6 +208,12 @@ if command == "mention":
         with reacts.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"channel": channel, "ts": ts, "name": name}) + "\n")
 
+    def head_branch(pr_url):
+        value = os.environ.get("FMT_HEAD_BRANCH") or "engineer-topic"
+        if value == "ERROR":
+            raise RuntimeError("induced head-branch lookup failure")
+        return value
+
     config.state_dir.mkdir(parents=True, exist_ok=True)
     ctx = mod.MentionContext(
         config=config,
@@ -213,10 +222,104 @@ if command == "mention":
         post=post,
         react=react,
         run_review=mod.make_run_review(config, github_token),
+        head_branch=head_branch,
     )
     event = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
     action = mod.handle_mention(os.environ["FMT_EVENT_ID"], event, ctx)
     print(f"action: {action}")
+    sys.exit(0)
+
+if command == "rollover-unit":
+    state_dir = Path(os.environ["FMT_METER_DIR"])
+    day_one = "2026-01-01"
+    day_two = "2026-01-02"
+    meter_d1 = mod.DailyMeter(state_dir, day_fn=lambda: day_one)
+    request_id = meter_d1.begin("U0NIGHTOWL", "https://github.com/a/b/pull/1", "ev-night-1")
+    if not request_id.startswith(f"req-{day_one}-"):
+        print(f"request id does not encode its origin day: {request_id}")
+        sys.exit(1)
+    # The clock rolls over before the review completes.
+    meter_d2 = mod.DailyMeter(state_dir, day_fn=lambda: day_two)
+    meter_d2.finish(request_id, "clear", "GLM-5.2 primary", None, 1.25)
+    day_one_value = json.loads((state_dir / f"{day_one}.json").read_text(encoding="utf-8"))
+    rows = [r for r in day_one_value["requests"] if r["id"] == request_id]
+    if len(rows) != 1:
+        print(f"origin-day record count wrong: {len(rows)}")
+        sys.exit(1)
+    row = rows[0]
+    if row["status"] != "clear" or row["finished_at"] is None or row["estimated_usd"] != 1.25:
+        print(f"origin-day record was not finalized: {row}")
+        sys.exit(1)
+    if row["submitter"] != "U0NIGHTOWL":
+        print(f"origin-day record lost its submitter: {row}")
+        sys.exit(1)
+    day_two_path = state_dir / f"{day_two}.json"
+    if day_two_path.exists():
+        day_two_value = json.loads(day_two_path.read_text(encoding="utf-8"))
+        if any(r["id"] == request_id or r["submitter"] == "unknown"
+               for r in day_two_value["requests"]):
+            print("completion leaked into the next day's ledger")
+            sys.exit(1)
+    for path in state_dir.glob("*.json"):
+        if '"submitter": "unknown"' in path.read_text(encoding="utf-8"):
+            print(f"an unknown-submitter record appeared in {path}")
+            sys.exit(1)
+    if meter_d1.submitter_day_count("U0NIGHTOWL") != 1:
+        print("origin-day count wrong after rollover finalize")
+        sys.exit(1)
+    print("rollover-ok")
+    sys.exit(0)
+
+if command == "sweep-unit":
+    import time as time_module
+    state_dir = Path(os.environ["FMT_SWEEP_DIR"])
+    events = state_dir / "events"
+    meter = state_dir / "meter"
+    events.mkdir(parents=True, exist_ok=True)
+    meter.mkdir(parents=True, exist_ok=True)
+    old_claim = events / "Ev-old.claimed"
+    old_reply = events / "Ev-old.reply"
+    fresh_claim = events / "Ev-fresh.claimed"
+    for path in (old_claim, old_reply, fresh_claim):
+        path.write_text("{}\n", encoding="utf-8")
+    aged = time_module.time() - 20 * 86400
+    os.utime(old_claim, (aged, aged))
+    os.utime(old_reply, (aged, aged))
+    old_meter = meter / "2020-01-01.json"
+    fresh_meter = meter / f"{mod.utc_day()}.json"
+    old_meter.write_text("{}\n", encoding="utf-8")
+    fresh_meter.write_text("{}\n", encoding="utf-8")
+    removed = mod.sweep_state(state_dir)
+    removed_names = {Path(p).name for p in removed}
+    if removed_names != {"Ev-old.claimed", "Ev-old.reply", "2020-01-01.json"}:
+        print(f"sweep removed the wrong set: {sorted(removed_names)}")
+        sys.exit(1)
+    if not fresh_claim.exists() or not fresh_meter.exists():
+        print("sweep removed fresh files")
+        sys.exit(1)
+    if old_claim.exists() or old_reply.exists() or old_meter.exists():
+        print("sweep left aged files behind")
+        sys.exit(1)
+    print("sweep-ok")
+    sys.exit(0)
+
+if command == "postshape-unit":
+    captured = []
+    client = mod.SlackWebClient(bot_token="xoxb-shape-test", app_token="xapp-shape-test")
+    client._call = lambda method, payload, token: captured.append((method, payload)) or {"ok": True}
+    mod.register_secret("xoxb-shape-test")
+    client.post_message("C0TESTCHAN", "1755640000.000100", "hello xoxb-shape-test world")
+    method, payload = captured[0]
+    if method != "chat.postMessage":
+        print(f"unexpected method: {method}")
+        sys.exit(1)
+    if payload.get("mrkdwn") is not False:
+        print(f"mrkdwn was not disabled: {payload}")
+        sys.exit(1)
+    if "xoxb-shape-test" in payload.get("text", ""):
+        print("post payload leaked a registered secret")
+        sys.exit(1)
+    print("postshape-ok")
     sys.exit(0)
 
 print(f"unknown driver command: {command}")
@@ -249,6 +352,8 @@ run_mention() { # <event-id> <config> <event-file> <out-name>
       FMT_POSTS="$POSTS" \
       FMT_REACTS="$REACTS" \
       FMT_EVENT_ID="$1" \
+      FMT_HEAD_BRANCH="${FMT_HEAD_BRANCH:-}" \
+      FMT_FAIL_VERDICT_POST="${FMT_FAIL_VERDICT_POST:-}" \
       "$PYTHON" "$DRIVER" mention "$3" > "$out" 2>&1
   local code=$?
   RUN_MENTION_OUTPUT=$(cat "$out")
@@ -288,6 +393,8 @@ test_selftest_validates_config_shape() {
     "selftest did not explain the null budget"
   assert_contains "$output" "daily_request_cap: null (uncapped" \
     "selftest did not report the null request cap"
+  assert_contains "$output" "agent_branch_prefixes: fm/" \
+    "selftest did not report the default agent-branch screen"
 
   bad="$TMP_ROOT/config-bad.json"
   "$PYTHON" -c 'import json, sys
@@ -412,6 +519,8 @@ test_completed_review_names_the_lane_and_writes_gate_metadata() {
   assert_contains "$reply" "Crosscheck CLEAR" "verdict reply missing state"
   assert_contains "$reply" "Lane: GLM-5.2 primary" "verdict reply did not name the GLM lane"
   assert_contains "$reply" "crosscheck.md" "verdict reply did not point at the full report"
+  assert_contains "$reply" "Host report path for the operator:" \
+    "report path was not labeled as host-local"
   after=$(fixture_run_count)
   [ "$after" = $((before + 1)) ] || fail "expected exactly one crosscheck invocation"
   assert_grep "Review started" "$POSTS" "review start ack missing"
@@ -575,6 +684,98 @@ test_request_cap_binds_today() {
   pass "the per-submitter daily request cap binds today with no cost data and is announced in thread"
 }
 
+test_agent_branch_is_refused_to_the_ordinary_lane() {
+  before=$(fixture_run_count)
+  event="$TMP_ROOT/event-agentbranch.json"
+  write_event "$event" C0TESTCHAN U0ALICE 1755640040.000100 "$GOOD_PR_TEXT"
+  FMT_HEAD_BRANCH="fm/r10-something" \
+    run_mention ev-agentbranch-1 "$CONFIG_MAIN" "$event" agentbranch \
+    || fail "agent-branch mention errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: agent-branch-refused" \
+    "agent-prefixed branch was not refused"
+  reply=$(last_post_text)
+  assert_contains "$reply" "matches the agent-branch prefix fm/" \
+    "refusal did not name the matched prefix"
+  assert_contains "$reply" "ordinary crosscheck lane" \
+    "refusal did not name the ordinary lane"
+  assert_contains "$reply" "asserts human authorship" \
+    "refusal did not state the authorship assertion"
+  after=$(fixture_run_count)
+  [ "$after" = "$before" ] || fail "an agent-branch PR reached the crosscheck CLI"
+
+  # A failed branch lookup also refuses, fail closed, without a review.
+  event="$TMP_ROOT/event-branchfail.json"
+  write_event "$event" C0TESTCHAN U0ALICE 1755640041.000100 "$GOOD_PR_TEXT"
+  FMT_HEAD_BRANCH="ERROR" \
+    run_mention ev-branchfail-1 "$CONFIG_MAIN" "$event" branchfail \
+    || fail "branch-lookup-failure mention errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: branch-screen-failed" \
+    "a failed branch lookup did not fail closed"
+  assert_contains "$(last_post_text)" "could not be verified" \
+    "branch-lookup failure reply missing"
+  after=$(fixture_run_count)
+  [ "$after" = "$before" ] || fail "an unverified branch reached the crosscheck CLI"
+  pass "an agent-prefixed branch is refused to the ordinary lane and lookup failure fails closed"
+}
+
+test_day_rollover_finalizes_the_origin_day() {
+  rollover_dir="$TMP_ROOT/rollover-meter"
+  mkdir -p "$rollover_dir"
+  output=$(perl -e 'alarm 60; exec @ARGV' -- \
+    env FMT_BOT_PY="$BOT_PY" FMT_METER_DIR="$rollover_dir" \
+      "$PYTHON" "$DRIVER" rollover-unit 2>&1) \
+    || fail "rollover unit failed: $output"
+  assert_contains "$output" "rollover-ok" "rollover unit did not complete"
+  pass "a review crossing midnight UTC finalizes the origin day's record with no orphan"
+}
+
+test_undelivered_verdict_is_reposted_on_redelivery() {
+  before=$(fixture_run_count)
+  event="$TMP_ROOT/event-undelivered.json"
+  write_event "$event" C0TESTCHAN U0ALICE 1755640050.000100 "$GOOD_PR_TEXT"
+  FMT_FAIL_VERDICT_POST=1 \
+    run_mention ev-undelivered-1 "$CONFIG_MAIN" "$event" undelivered-first \
+    || fail "undelivered-first mention errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: undelivered:completed:clear" \
+    "a failed verdict post was not reported as undelivered"
+  after=$(fixture_run_count)
+  [ "$after" = $((before + 1)) ] || fail "expected exactly one review before redelivery"
+
+  run_mention ev-undelivered-1 "$CONFIG_MAIN" "$event" undelivered-second \
+    || fail "redelivery errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: redelivered" \
+    "redelivery did not re-post the stored verdict"
+  assert_contains "$(last_post_text)" "Crosscheck CLEAR" \
+    "the re-posted reply is not the stored verdict"
+  final=$(fixture_run_count)
+  [ "$final" = $((before + 1)) ] || fail "redelivery ran a second review"
+
+  # A delivered event stays a plain duplicate on further redelivery.
+  run_mention ev-undelivered-1 "$CONFIG_MAIN" "$event" undelivered-third \
+    || fail "third delivery errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: duplicate" \
+    "a delivered event was re-posted again"
+  pass "a produced-but-undelivered verdict is re-posted on redelivery without a second review"
+}
+
+test_retention_sweep_removes_only_aged_state() {
+  sweep_dir="$TMP_ROOT/sweep-state"
+  output=$(perl -e 'alarm 60; exec @ARGV' -- \
+    env FMT_BOT_PY="$BOT_PY" FMT_SWEEP_DIR="$sweep_dir" \
+      "$PYTHON" "$DRIVER" sweep-unit 2>&1) \
+    || fail "sweep unit failed: $output"
+  assert_contains "$output" "sweep-ok" "sweep unit did not complete"
+  pass "the retention sweep removes aged claim and meter files and keeps fresh ones"
+}
+
+test_posts_disable_mrkdwn() {
+  output=$(perl -e 'alarm 60; exec @ARGV' -- \
+    env FMT_BOT_PY="$BOT_PY" "$PYTHON" "$DRIVER" postshape-unit 2>&1) \
+    || fail "post-shape unit failed: $output"
+  assert_contains "$output" "postshape-ok" "post-shape unit did not complete"
+  pass "chat.postMessage payloads disable mrkdwn and redact registered secrets"
+}
+
 test_tool_failure_is_reported_honestly() {
   event="$TMP_ROOT/event-fail.json"
   write_event "$event" C0TESTCHAN U0ALICE 1755640012.000100 "$GOOD_PR_TEXT"
@@ -632,6 +833,11 @@ UNITS=(
   test_usd_meter_forward_contract_with_fixture_injected_usage
   test_production_shaped_ledger_never_trips_usd_bound
   test_request_cap_binds_today
+  test_agent_branch_is_refused_to_the_ordinary_lane
+  test_day_rollover_finalizes_the_origin_day
+  test_undelivered_verdict_is_reposted_on_redelivery
+  test_retention_sweep_removes_only_aged_state
+  test_posts_disable_mrkdwn
   test_tool_failure_is_reported_honestly
   test_blocking_verdict_reply_names_state_and_findings
   test_tokens_never_reach_logs_or_ledgers

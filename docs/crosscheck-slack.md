@@ -35,6 +35,7 @@ repo carries no third-party Python dependencies and none was added.
   "github_token_env": "FM_GITHUB_READ_TOKEN",
   "daily_budget_usd": null,
   "daily_request_cap": null,
+  "agent_branch_prefixes": ["fm/"],
   "state_dir": "$FM_HOME/state/crosscheck-slack"
 }
 ```
@@ -63,7 +64,29 @@ repo carries no third-party Python dependencies and none was added.
   bound cannot fire until that lands. When cost data exists, a submitter at
   the bound gets the same in-thread reply. Null = unmetered pass-through,
   still ledgered.
+- `agent_branch_prefixes` (optional; default `["fm/"]`) is the
+  human-authorship screen described below. An empty array deliberately
+  disables it; do that only if agent work never reaches the allowlisted
+  repositories.
 - `state_dir` supports a literal leading `$FM_HOME` and nothing else.
+
+## THE AUTHORSHIP ASSERTION (read this before pointing the lane anywhere)
+
+This lane stages every review's task metadata as `model=human-authored`,
+which satisfies the crosscheck gate's model-separation screen for EVERY
+reviewer. That is only sound because the lane asserts human authorship:
+submissions come from engineers in Slack, and before any review the bot
+fetches the PR's head branch (with the same read credential, only after
+the repository allowlist admitted the URL) and REFUSES in thread any PR
+whose branch matches an `agent_branch_prefixes` entry, directing it to the
+ordinary crosscheck lane (`bin/fm-crosscheck.sh`), which carries true
+author metadata. A branch-lookup failure also refuses (fail closed). The
+model-separation guarantee for Slack reviews therefore rests on this
+assertion plus the branch screen, not on the gate's own screen; the lane
+must never be pointed at agent-authored pull requests, and an
+agent-authored PR on a non-agent-prefixed branch is outside what this
+screen can catch, which is exactly why the refusal message names the
+ordinary lane.
 
 `bin/fm-crosscheck-slack.sh --selftest [config-path]` validates the config
 shape (and reports which token variables are set, values never shown) and
@@ -130,10 +153,19 @@ schema does not record token usage or cost, so `estimated_usd` stays null,
 recorded spend stays 0.0, and the USD bound cannot bind until the lane
 records cost; `daily_request_cap` is the binding control today. The
 per-request records are already durable, so C3 can attach a per-review
-price or a usage-derived cost without a schema change here. Event dedupe
-markers live in
-`<state_dir>/events/`; a redelivered Slack event id never starts a second
-review.
+price or a usage-derived cost without a schema change here. A request is
+metered against the UTC day it STARTED: the request id encodes the origin
+day and completion finalizes the origin day's file, so a review crossing
+midnight neither orphans its start record nor lands a misattributed
+completion in the next day's ledger.
+
+Event dedupe markers live in `<state_dir>/events/`; a redelivered Slack
+event id never starts a second review. The rendered final reply is stored
+durably BEFORE it is posted and marked delivered after the post succeeds,
+so a redelivery of an event whose verdict was produced but never delivered
+re-posts the stored verdict instead of being silently dropped. Retention:
+a sweep at startup and daily removes event artifacts older than 14 days
+and meter day-files older than 90 days; fresh files are never touched.
 
 ## Lane naming
 
@@ -156,9 +188,10 @@ links only, one per request. Nothing from Slack or from the PR is executed;
 replies render findings as escaped plain text. The crosscheck subprocess
 runs with a scrubbed environment that carries the GitHub read credential
 and the FM_* configuration and never the Slack tokens. Task metadata is
-staged as `harness=slack-team`, `model=human-authored`, so the gate's model
-separation policy treats every reviewer family as separate from the human
-author, which it is.
+staged as `harness=slack-team`, `model=human-authored`; that staging is
+sound only under the authorship assertion and branch screen above.
+Replies are posted with Slack `mrkdwn` disabled, so hostile finding text
+cannot render fake emphasis, code spans, or links.
 
 ## Tests
 

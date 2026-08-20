@@ -21,6 +21,16 @@ Posture, in one place:
 - A missing token environment variable is a startup refusal that names the
   exact variable, so the ready-to-flip posture is explicit: the owner
   supplies tokens later and nothing else changes.
+- AUTHORSHIP ASSERTION, stated loudly: this lane stages task metadata as
+  model=human-authored, which satisfies the crosscheck gate's
+  model-separation screen for EVERY reviewer. That is only true because
+  the lane asserts human authorship: submissions come from engineers in
+  Slack, and any PR whose head branch matches an `agent_branch_prefixes`
+  entry (default `fm/`) is refused in thread and redirected to the
+  ordinary crosscheck lane, which carries true author metadata. This lane
+  must never be pointed at agent-authored pull requests; the
+  model-separation guarantee for Slack reviews rests on that assertion
+  and on the branch screen, not on the gate's own screen.
 - Every Slack event id is claimed durably before any work starts, so a
   retried delivery of the same event never starts a second review.
 - Team usage is metered per submitter per UTC day in a durable JSON ledger
@@ -74,7 +84,7 @@ from fm_bounded_io import BoundedIOError, read_bounded_json, run_bounded
 TOOL = "fm-crosscheck-slack"
 METER_SCHEMA = "firstmate.crosscheck-slack-meter.v1"
 
-CONFIG_KEYS = {
+REQUIRED_CONFIG_KEYS = {
     "app_token_env",
     "bot_token_env",
     "channel_allowlist",
@@ -84,10 +94,17 @@ CONFIG_KEYS = {
     "daily_request_cap",
     "state_dir",
 }
+# Optional keys carry their own defaults; agent_branch_prefixes defaults to
+# the fleet's own branch prefix so the authorship screen is on out of the box.
+OPTIONAL_CONFIG_KEYS = {"agent_branch_prefixes"}
+CONFIG_KEYS = REQUIRED_CONFIG_KEYS | OPTIONAL_CONFIG_KEYS
+DEFAULT_AGENT_BRANCH_PREFIXES = ("fm/",)
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 CHANNEL_RE = re.compile(r"^[A-Z0-9]{1,32}$")
 EVENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+REQUEST_DAY_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+REQUEST_ID_RE = re.compile(r"^req-([0-9]{4}-[0-9]{2}-[0-9]{2})-[0-9a-f]{12}$")
 # The trailing lookahead makes the PR number strictly bounded: an 11+ digit
 # run never truncates into a shorter, DIFFERENT PR id inside an allowlisted
 # repository; the link simply does not match and the mention is refused as
@@ -160,6 +177,7 @@ class Config:
     repo_allowlist: tuple[str, ...]
     daily_budget_usd: float | None
     daily_request_cap: int | None
+    agent_branch_prefixes: tuple[str, ...]
     state_dir: Path
 
 
@@ -211,7 +229,7 @@ def load_config(path: Path) -> Config:
         raise SlackExposureError(f"configuration at {path} is unreadable: {exc}") from exc
     require(isinstance(value, dict), f"configuration at {path} must be a JSON object")
     unexpected = sorted(set(value) - CONFIG_KEYS)
-    missing = sorted(CONFIG_KEYS - set(value))
+    missing = sorted(REQUIRED_CONFIG_KEYS - set(value))
     require(not unexpected, f"configuration at {path} has unexpected keys: {', '.join(unexpected)}")
     require(not missing, f"configuration at {path} is missing keys: {', '.join(missing)}")
 
@@ -282,6 +300,21 @@ def load_config(path: Path) -> Config:
         )
         cap = cap_raw
 
+    if "agent_branch_prefixes" in value:
+        prefixes_raw = value.get("agent_branch_prefixes")
+        require(
+            isinstance(prefixes_raw, list),
+            "configuration agent_branch_prefixes must be an array of branch prefixes "
+            "(an empty array deliberately disables the agent-branch screen)",
+        )
+        prefixes: list[str] = []
+        for index, prefix in enumerate(prefixes_raw):
+            prefix = require_string(prefix, f"configuration agent_branch_prefixes[{index}]")
+            prefixes.append(prefix)
+        agent_branch_prefixes = tuple(prefixes)
+    else:
+        agent_branch_prefixes = DEFAULT_AGENT_BRANCH_PREFIXES
+
     state_dir = expand_state_dir(require_string(value.get("state_dir"), "configuration state_dir"))
 
     return Config(
@@ -293,6 +326,7 @@ def load_config(path: Path) -> Config:
         repo_allowlist=tuple(repos),
         daily_budget_usd=budget,
         daily_request_cap=cap,
+        agent_branch_prefixes=agent_branch_prefixes,
         state_dir=state_dir,
     )
 
@@ -313,18 +347,28 @@ def required_token(env_name: str, role: str) -> str:
 
 
 class EventDeduper:
-    """Durable first-claim-wins registry of processed Slack event ids."""
+    """Durable first-claim-wins registry of processed Slack event ids.
+
+    Besides the claim marker, it stores the rendered final reply BEFORE it is
+    posted and a delivered marker AFTER the post succeeds, so a redelivered
+    event whose verdict was produced but never delivered can be answered by
+    re-posting the stored reply instead of being silently deduped (and never
+    by running a second review).
+    """
 
     def __init__(self, directory: Path) -> None:
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True)
 
-    def claim(self, event_id: str) -> bool:
+    def _validated(self, event_id: str) -> str:
         require(
             EVENT_ID_RE.fullmatch(event_id) is not None,
             f"event id validation rejected {event_id!r}",
         )
-        path = self.directory / f"{event_id}.claimed"
+        return event_id
+
+    def claim(self, event_id: str) -> bool:
+        path = self.directory / f"{self._validated(event_id)}.claimed"
         try:
             descriptor = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
@@ -337,6 +381,92 @@ class EventDeduper:
         finally:
             os.close(descriptor)
         return True
+
+    def store_reply(self, event_id: str, text: str) -> None:
+        path = self.directory / f"{self._validated(event_id)}.reply"
+        descriptor, temp_name = tempfile.mkstemp(prefix=".reply.", dir=str(self.directory))
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            os.chmod(temp_name, 0o600)
+            os.replace(temp_name, path)
+        except BaseException:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
+
+    def mark_delivered(self, event_id: str) -> None:
+        path = self.directory / f"{self._validated(event_id)}.delivered"
+        path.write_text(json.dumps({"delivered_at": utc_now()}) + "\n", encoding="utf-8")
+        os.chmod(path, 0o600)
+
+    def undelivered_reply(self, event_id: str) -> str | None:
+        """Return the stored final reply if it was never delivered, else None."""
+
+        event_id = self._validated(event_id)
+        if (self.directory / f"{event_id}.delivered").exists():
+            return None
+        reply_path = self.directory / f"{event_id}.reply"
+        if not reply_path.is_file():
+            return None
+        try:
+            return reply_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return None
+
+
+CLAIM_RETENTION_DAYS = 14
+METER_RETENTION_DAYS = 90
+
+
+def sweep_state(
+    state_dir: Path,
+    now: float | None = None,
+    claim_days: int = CLAIM_RETENTION_DAYS,
+    meter_days: int = METER_RETENTION_DAYS,
+) -> list[str]:
+    """Bounded retention sweep; returns the removed paths (for logging/tests).
+
+    Event artifacts (claim, reply, delivered markers) age out by mtime after
+    `claim_days`; meter day-files age out by the day their FILENAME names
+    after `meter_days` (mtime as fallback for unparseable names). Fresh
+    files are never touched.
+    """
+
+    removed: list[str] = []
+    current = time.time() if now is None else now
+    events = state_dir / "events"
+    if events.is_dir():
+        cutoff = current - claim_days * 86400
+        for path in sorted(events.iterdir()):
+            if not path.is_file():
+                continue
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed.append(str(path))
+            except OSError:
+                continue
+    meter = state_dir / "meter"
+    if meter.is_dir():
+        cutoff = current - meter_days * 86400
+        for path in sorted(meter.glob("*.json")):
+            day = path.name[: -len(".json")]
+            try:
+                if REQUEST_DAY_RE.fullmatch(day):
+                    stamp = dt.datetime.strptime(day, "%Y-%m-%d").replace(
+                        tzinfo=dt.timezone.utc
+                    ).timestamp()
+                else:
+                    stamp = path.stat().st_mtime
+                if stamp < cutoff:
+                    path.unlink()
+                    removed.append(str(path))
+            except (OSError, ValueError):
+                continue
+    return removed
 
 
 # --- per-submitter daily meter --------------------------------------------------
@@ -357,10 +487,18 @@ class DailyMeter:
     token usage when the crosscheck output exposes it, and estimated USD when
     derivable (else null). Writes are atomic (temp file + rename) under one
     advisory lock so a crash never leaves a torn ledger.
+
+    Day binding: a request is metered against the UTC day it STARTED. The
+    request id encodes that origin day, and finish() finalizes the record in
+    the origin day's file, so a review crossing midnight UTC neither orphans
+    its started record nor lands a misattributed completion in the next
+    day's ledger (which would let a submitter evade the bound once costs
+    exist). `day_fn` is injectable so tests can prove the rollover.
     """
 
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, day_fn: Callable[[], str] = utc_day) -> None:
         self.directory = directory
+        self._day_fn = day_fn
         directory.mkdir(parents=True, exist_ok=True)
 
     def _day_path(self, day: str) -> Path:
@@ -402,13 +540,18 @@ class DailyMeter:
         return handle
 
     def begin(self, submitter: str, pr_url: str, event_id: str) -> str:
-        day = utc_day()
-        request_id = f"req-{secrets.token_hex(6)}"
+        day = self._day_fn()
+        require(
+            REQUEST_DAY_RE.fullmatch(day) is not None,
+            f"meter day function returned a non-day value: {day!r}",
+        )
+        request_id = f"req-{day}-{secrets.token_hex(6)}"
         with self._locked():
             ledger = self._load(day)
             ledger["requests"].append(
                 {
                     "id": request_id,
+                    "day": day,
                     "submitter": submitter,
                     "pr_url": pr_url,
                     "event_id": event_id,
@@ -431,7 +574,11 @@ class DailyMeter:
         tokens: dict[str, int] | None,
         estimated_usd: float | None,
     ) -> None:
-        day = utc_day()
+        # Finalize in the ORIGIN day's file, recovered from the request id,
+        # never in whatever day it happens to be at completion time.
+        match = REQUEST_ID_RE.fullmatch(request_id)
+        require(match is not None, f"meter request id validation rejected {request_id!r}")
+        day = match.group(1)
         with self._locked():
             ledger = self._load(day)
             for record in ledger["requests"]:
@@ -443,12 +590,13 @@ class DailyMeter:
                     record["estimated_usd"] = estimated_usd
                     break
             else:
-                # A request begun just before midnight UTC finishes in the
-                # next day's ledger as its own completed record rather than
-                # being dropped.
+                # The started record should always exist in the origin file;
+                # if it was lost, the completion still lands THERE, keeping
+                # the day's accounting in one place.
                 ledger["requests"].append(
                     {
                         "id": request_id,
+                        "day": day,
                         "submitter": "unknown",
                         "pr_url": "unknown",
                         "event_id": "unknown",
@@ -464,7 +612,7 @@ class DailyMeter:
 
     def submitter_day_usd(self, submitter: str) -> float:
         with self._locked():
-            ledger = self._load(utc_day())
+            ledger = self._load(self._day_fn())
         total = 0.0
         for record in ledger["requests"]:
             if record.get("submitter") != submitter:
@@ -476,7 +624,7 @@ class DailyMeter:
 
     def submitter_day_count(self, submitter: str) -> int:
         with self._locked():
-            ledger = self._load(utc_day())
+            ledger = self._load(self._day_fn())
         return sum(1 for record in ledger["requests"] if record.get("submitter") == submitter)
 
 
@@ -509,6 +657,55 @@ def repo_of(pr_url: str) -> str:
     match = PR_LINK_RE.fullmatch(pr_url)
     require(match is not None, f"internal error: unparseable PR URL {pr_url!r}")
     return f"{match.group(1)}/{match.group(2)}".lower()
+
+
+BRANCH_NAME_RE = re.compile(r"^[^\s]{1,255}$")
+
+
+def fetch_head_branch(pr_url: str, github_token: str) -> str:
+    """Return the PR's head branch name via the GitHub API, fail closed.
+
+    Called only AFTER the repository allowlist admitted the URL, so the read
+    credential is never pointed outside the allowlist. Used by the
+    agent-branch screen; any failure raises so the caller refuses to review
+    rather than reviewing with an unverified authorship assertion.
+    """
+
+    match = PR_LINK_RE.fullmatch(pr_url)
+    require(match is not None, f"internal error: unparseable PR URL {pr_url!r}")
+    owner, repo, number = match.group(1), match.group(2), match.group(3)
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}",
+        headers={
+            "Authorization": f"Bearer {github_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=WEB_API_TIMEOUT_SECONDS) as response:
+            body = response.read(1024 * 1024)
+    except (urllib.error.URLError, OSError) as exc:
+        raise SlackExposureError(f"head-branch lookup failed for {pr_url}: {exc}") from exc
+    try:
+        value = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SlackExposureError(
+            f"head-branch lookup returned malformed JSON for {pr_url}"
+        ) from exc
+    head = value.get("head") if isinstance(value, dict) else None
+    ref = head.get("ref") if isinstance(head, dict) else None
+    if not isinstance(ref, str) or BRANCH_NAME_RE.fullmatch(ref) is None:
+        raise SlackExposureError(f"head-branch lookup returned no usable ref for {pr_url}")
+    return ref
+
+
+def matched_agent_prefix(branch: str, prefixes: tuple[str, ...]) -> str | None:
+    for prefix in prefixes:
+        if branch.startswith(prefix):
+            return prefix
+    return None
 
 
 # --- lane naming -----------------------------------------------------------------
@@ -640,7 +837,9 @@ def render_verdict_reply(
             lines.append("No active findings for this head.")
     else:
         lines.append("No active findings for this head.")
-    lines.append(f"Full report: {report_path}")
+    # The report is a file on the listener's host, not a link anyone remote
+    # can open; label it so nobody reads it as one.
+    lines.append(f"Host report path for the operator: {report_path}")
     return clamp("\n".join(lines), MAX_REPLY_CHARS)
 
 
@@ -799,6 +998,14 @@ def make_run_review(config: Config, github_token: str) -> Callable[[str], Review
 # --- the event-handling core (driven directly by the tests) -------------------------
 
 
+def _unwired_head_branch(pr_url: str) -> str:
+    # Fail closed: a context built without a head-branch resolver must
+    # refuse to review, never silently skip the agent-branch screen.
+    raise SlackExposureError(
+        f"head-branch resolver is not wired; refusing to review {pr_url}"
+    )
+
+
 @dataclasses.dataclass
 class MentionContext:
     config: Config
@@ -807,6 +1014,9 @@ class MentionContext:
     post: Callable[[str, str, str], None]  # channel, thread_ts, text
     react: Callable[[str, str, str], None]  # channel, ts, emoji name
     run_review: Callable[[str], ReviewOutcome]
+    # Returns the PR's head branch name; raises on any failure so the
+    # agent-branch screen fails closed instead of reviewing unverified.
+    head_branch: Callable[[str], str] = _unwired_head_branch
     log: Callable[[str], None] = log
 
 
@@ -836,6 +1046,14 @@ def handle_mention(event_id: str, event: dict[str, Any], ctx: MentionContext) ->
         return "malformed"
 
     if not ctx.deduper.claim(event_id):
+        # A produced-but-undelivered verdict is re-posted from the stored
+        # reply on redelivery; a second review is never started.
+        stored = ctx.deduper.undelivered_reply(event_id)
+        if stored is not None:
+            ctx.post(channel, thread_ts, stored)
+            ctx.deduper.mark_delivered(event_id)
+            ctx.log(f"redelivered stored verdict for event {event_id}")
+            return "redelivered"
         ctx.log(f"duplicate delivery of event {event_id}; not starting a second review")
         return "duplicate"
 
@@ -873,6 +1091,39 @@ def handle_mention(event_id: str, event: dict[str, Any], ctx: MentionContext) ->
             "credential is never pointed at repositories outside the allowlist.",
         )
         return "repo-refused"
+
+    # Authorship screen: this lane stages human-authored task metadata, so
+    # agent-authored PRs must be refused here and reviewed through the
+    # ordinary crosscheck lane, which carries true author metadata. The
+    # lookup runs only after the allowlist admitted the repository, and any
+    # lookup failure fails closed.
+    if ctx.config.agent_branch_prefixes:
+        try:
+            branch = ctx.head_branch(pr_url)
+        except Exception as exc:
+            ctx.post(
+                channel,
+                thread_ts,
+                f"Refusing to review {pr_url}: the head branch could not be "
+                f"verified ({escape_slack(clamp(redact(str(exc)), 300))}), and "
+                "this lane only reviews once its human-authorship screen has "
+                "run. Retry, or use the ordinary crosscheck lane.",
+            )
+            return "branch-screen-failed"
+        prefix = matched_agent_prefix(branch, ctx.config.agent_branch_prefixes)
+        if prefix is not None:
+            ctx.post(
+                channel,
+                thread_ts,
+                f"Refusing to review {pr_url}: its head branch "
+                f"{escape_slack(clamp(branch, 120))} matches the agent-branch "
+                f"prefix {escape_slack(prefix)}. Agent-authored pull requests "
+                "must go through the ordinary crosscheck lane "
+                "(bin/fm-crosscheck.sh), which carries true author metadata; "
+                "the Slack lane asserts human authorship and its "
+                "model-separation guarantee rests on that assertion.",
+            )
+            return "agent-branch-refused"
 
     # The request-count cap is the bound that actually binds today; the USD
     # bound below is a forward contract that can only bind once the
@@ -920,8 +1171,8 @@ def handle_mention(event_id: str, event: dict[str, Any], ctx: MentionContext) ->
         outcome = ctx.run_review(pr_url)
     except Exception as exc:
         ctx.meter.finish(request_id, "tool-failure", None, None, None)
-        ctx.post(channel, thread_ts, render_failure_reply(pr_url, f"unexpected {type(exc).__name__}: {exc}"))
-        return "failed"
+        reply = render_failure_reply(pr_url, f"unexpected {type(exc).__name__}: {exc}")
+        return _deliver_final_reply(ctx, event_id, channel, thread_ts, reply, "failed")
     ctx.meter.finish(
         request_id,
         outcome.state if outcome.ok else "tool-failure",
@@ -929,8 +1180,38 @@ def handle_mention(event_id: str, event: dict[str, Any], ctx: MentionContext) ->
         outcome.tokens,
         outcome.estimated_usd,
     )
-    ctx.post(channel, thread_ts, outcome.reply_text)
-    return f"completed:{outcome.state}" if outcome.ok else "failed"
+    action = f"completed:{outcome.state}" if outcome.ok else "failed"
+    return _deliver_final_reply(
+        ctx, event_id, channel, thread_ts, outcome.reply_text, action
+    )
+
+
+def _deliver_final_reply(
+    ctx: MentionContext,
+    event_id: str,
+    channel: str,
+    thread_ts: str,
+    reply: str,
+    action: str,
+) -> str:
+    """Store the final reply durably, post it, and mark it delivered.
+
+    The store happens BEFORE the post: if the post fails, the verdict is not
+    lost; a redelivery of the same event re-posts the stored reply instead
+    of silently deduping (and never runs a second review).
+    """
+
+    ctx.deduper.store_reply(event_id, reply)
+    try:
+        ctx.post(channel, thread_ts, reply)
+    except Exception as exc:
+        ctx.log(
+            f"final reply for event {event_id} was produced but not delivered "
+            f"({type(exc).__name__}: {exc}); a redelivery will re-post it"
+        )
+        return f"undelivered:{action}"
+    ctx.deduper.mark_delivered(event_id)
+    return action
 
 
 # --- Slack Web API client ---------------------------------------------------------
@@ -973,9 +1254,16 @@ class SlackWebClient:
         return url
 
     def post_message(self, channel: str, thread_ts: str, text: str) -> None:
+        # mrkdwn stays off so hostile finding text cannot render fake
+        # emphasis, code, or links; replies are uniform plain text.
         self._call(
             "chat.postMessage",
-            {"channel": channel, "thread_ts": thread_ts, "text": redact(text)},
+            {
+                "channel": channel,
+                "thread_ts": thread_ts,
+                "text": redact(text),
+                "mrkdwn": False,
+            },
             self._bot_token,
         )
 
@@ -1159,10 +1447,29 @@ class SocketModeService:
         self.meter = DailyMeter(config.state_dir / "meter")
         self.deduper = EventDeduper(config.state_dir / "events")
         self.run_review = make_run_review(config, github_token)
+        self._github_token = github_token
+        removed = sweep_state(config.state_dir)
+        if removed:
+            log(f"retention sweep removed {len(removed)} aged state file(s) at startup")
+        self._sweeper = threading.Thread(
+            target=self._sweep_loop, name="crosscheck-slack-sweeper", daemon=True
+        )
         self.queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue(
             maxsize=REVIEW_QUEUE_LIMIT
         )
         self.worker = threading.Thread(target=self._drain, name="crosscheck-slack-worker", daemon=True)
+
+    def _sweep_loop(self) -> None:
+        # One retention pass per day (checked every 6 hours), plus the pass
+        # already taken at startup.
+        while True:
+            time.sleep(6 * 3600)
+            try:
+                removed = sweep_state(self.config.state_dir)
+                if removed:
+                    log(f"retention sweep removed {len(removed)} aged state file(s)")
+            except OSError as exc:
+                log(f"retention sweep failed: {exc}")
 
     def _context(self) -> MentionContext:
         return MentionContext(
@@ -1172,6 +1479,7 @@ class SocketModeService:
             post=self.web.post_message,
             react=self.web.add_reaction,
             run_review=self.run_review,
+            head_branch=lambda pr_url: fetch_head_branch(pr_url, self._github_token),
         )
 
     def _drain(self) -> None:
@@ -1235,6 +1543,7 @@ class SocketModeService:
 
     def serve_forever(self) -> NoReturn:
         self.worker.start()
+        self._sweeper.start()
         backoff = 1.0
         while True:
             try:
@@ -1275,6 +1584,12 @@ def selftest(config_path: Path) -> int:
         f"({'set' if os.environ.get(config.github_token_env) else 'UNSET'})",
         f"channel_allowlist: {len(config.channel_allowlist)} channel(s)",
         f"repo_allowlist: {', '.join(config.repo_allowlist)}",
+        "agent_branch_prefixes: "
+        + (
+            ", ".join(config.agent_branch_prefixes)
+            if config.agent_branch_prefixes
+            else "(empty: agent-branch screen deliberately disabled)"
+        ),
         "daily_request_cap: "
         + (
             f"{config.daily_request_cap} (the binding control today)"

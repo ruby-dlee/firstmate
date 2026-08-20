@@ -111,14 +111,20 @@ one place that validates them and spends anything.
     else that home's single project), and the harness is the cloud lane's only
     runtime. The child's backlog row is filed first, because fm-spawn refuses
     a new ship/scout task that has none.
-  - NOT YET POSSIBLE, and refused loudly: fm-spawn derives owner_kind from its
-    own home marker, so a request minted from the controller's home is
-    primary-owned and verify_request refuses a primary-owned request that
-    carries a parent pair. The controller itself is ready - `--owner-kind` is
-    an ordinary argv flag and a secondmate-owned request with the pair is
-    admitted under all four bounds - so the missing pieces are an assertable
-    owner_kind on the spawn side and an authorized task-home parameter on
-    authoritative_request_bindings.
+  - STILL REFUSED HERE, but no longer for want of a capability. The two
+    missing pieces this comment used to name - an assertable owner kind and an
+    authorized task-home parameter - both landed in PR #278: fm-spawn takes
+    FM_SPAWN_TASK_HOME, derives owner_kind from THAT home's marker rather than
+    from its own, and forwards it to the controller as `--task-home`, which
+    authorize_task_home proves under the same lock hold that inserts (marker,
+    canonical registry link, then the unchanged child bounds).
+    This relay does not set FM_SPAWN_TASK_HOME, so its spawn's task home is
+    still the controller's primary home, owner_kind is still derived as
+    primary, and verify_request still refuses a primary-owned request carrying
+    a parent pair - the refusal round-trips as a durable delivered answer and
+    no child is recorded, exactly as before. Wiring the compartment's own home
+    through as the task home is a behavior change with its own bounds to
+    prove, so it is a follow-up, not a side effect of the chain tip lane.
   - ACCEPTANCE IS PROVEN BY THE QUEUE. A zero exit from fm-spawn is evidence
     the script ran, never that the controller admitted a bounded child, so a
     served request is confirmed by reading the one controller document back
@@ -1293,34 +1299,42 @@ class Relay:
         home and `--owner-kind secondmate` plus the parent pair is admitted
         with all four B.1 bounds enforced and children_total incremented.
 
-        The pinch point is that FM_HOME does three separable jobs at once:
+        The pinch point was that FM_HOME did three separable jobs at once:
         (1) where the requesting task's local authorities live, because
-        authoritative_request_bindings reads `env["home"]/state/<task>.meta`
-        (bin/fm-worker-lifecycle.py:2446); (2) the identity stamped into the
-        request's home_binding; and (3) the identity of the money document.
-        Jobs 1 and 2 belong to the requester, job 3 belongs to the controller,
-        and the compartment child is the first case where they differ. The
-        missing capability is an authorized task-home parameter on
-        authoritative_request_bindings, plus a way for fm-spawn to assert
-        owner_kind rather than derive it from its own home marker
-        (bin/fm-spawn.sh:4429).
+        authoritative_request_bindings reads `env["home"]/state/<task>.meta`;
+        (2) the identity stamped into the request's home_binding; and (3) the
+        identity of the money document. Jobs 1 and 2 belong to the requester,
+        job 3 belongs to the controller, and the compartment child is the
+        first case where they differ.
 
-        So this method deliberately does NOTHING clever: it leaves FM_HOME as
-        the monitor's own home, which is the controller's home, so the default
-        worker state directory is already the right one. Two earlier ideas are
-        rejected on evidence:
+        PR #278 SPLIT THEM, so that capability is no longer missing: FM_HOME
+        keeps job 3 only and never moves for the spawn, while
+        FM_SPAWN_TASK_HOME carries jobs 1 and 2 and travels to the controller
+        as `--task-home`, which authorize_task_home proves under the same lock
+        hold that inserts. Nothing in that chain is self-authorizing (home
+        marker, canonical registry link, then the unchanged child bounds).
+
+        This method still does NOTHING clever, and now that is a CHOICE rather
+        than a constraint: it leaves FM_HOME as the monitor's own home, which
+        is the controller's home, so the money document stays one document and
+        the default worker state directory is already the right one. Because
+        it also sets no FM_SPAWN_TASK_HOME, the spawn's task home is the
+        primary home, owner_kind derives as primary, and the lane still
+        refuses early and honestly at verify_request. Passing the
+        compartment's own home as the task home is the follow-up that would
+        actually admit a compartment child, and it is a behavior change with
+        its own bounds to prove.
+
+        Two ideas remain rejected on evidence:
           - Pinning FM_AZURE_WORKER_STATE_DIR is a DURABLE TRAP, not a
-            one-shot: that name is inside SPAWN_CLOUD_ENV_ALLOWLIST
-            (bin/fm-spawn.sh:4332), so it is persisted into the child's
-            <id>.cloud-env and would permanently pair a foreign FM_HOME with
-            this state dir for every later execute and release.
-          - Moving FM_HOME to the secondmate home aims the request at a SECOND
-            money document (the one the documented local-secondmate lane
-            already creates) and refuses at parent liveness, which is both the
-            outcome the design forbids and a refusal that names the wrong
-            cause.
-        With neither, the lane refuses early and honestly at verify_request,
-        naming owner_kind: the exact capability that is missing.
+            one-shot: that name is inside SPAWN_CLOUD_ENV_ALLOWLIST, so it is
+            persisted into the child's <id>.cloud-env and would misdirect
+            every later execute and release. The doc says the same thing.
+          - Moving FM_HOME itself to the secondmate home aims the request at a
+            SECOND money document (the one the documented local-secondmate
+            lane already creates) and refuses at parent liveness. #278's
+            answer is exactly this comment's answer: move the TASK home, never
+            FM_HOME.
         """
         env = dict(os.environ)
         # The compartment's own leg configuration and any state override must

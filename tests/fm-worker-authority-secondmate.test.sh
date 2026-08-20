@@ -151,10 +151,15 @@ def expect(callable_, fragment):
 HEAD = module.git(subhome, "rev-parse", "HEAD")
 HONEST_TIP = {"sequence": 2, "chain_digest": sys.argv[5]}
 
+ABSENT = object()
+
 def controller_worker(tip=None):
     """A worker record as the CONTROLLER hands it to the authority. The
     verified chain tip lives HERE, not in the monitor-local state file, which
-    is what stops a forged chain from carrying its own matching anchor."""
+    is what stops a forged chain from carrying its own matching anchor.
+    tip=ABSENT models a compartment whose monitor has not recorded one."""
+    if tip is ABSENT:
+        return {}
     return {"verified_chain_tip": json.loads(json.dumps(HONEST_TIP)) if tip is None else tip}
 
 def landing(generation=None, tip=None):
@@ -286,7 +291,7 @@ NO_BUNDLE_SUMMARY = {"kind": "fm.secondmate-leg-summary/v1", "reason": "close",
 
 # THE ANCHOR ITSELF. Absent controller tip refuses and names the sanctioned
 # exit; it is never inferred from monitor-local state.
-expect(lambda: landing(tip=False and None or "MISSING"),
+expect(lambda: landing(tip=ABSENT),
        "controller-owned worker record carries no verified chain tip")
 for malformed in ({"sequence": "2", "chain_digest": "a" * 64}, {"sequence": 2},
                   {"sequence": 0, "chain_digest": "a" * 64},

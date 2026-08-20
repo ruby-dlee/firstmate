@@ -112,6 +112,10 @@ for marker in (
     # supply it, and its absence refuses rather than being inferred.
     'worker.get("verified_chain_tip")', "carries no verified",
     "controller-owned verified chain tip is malformed",
+    # Landing is PROVEN by reachability; landed_bundles is advisory only.
+    "secondmate_prove_landed", "merge-base", "--is-ancestor",
+    "bundle", "list-heads", "is not reachable from the home worktree head",
+    "cannot prove bundle",
 ):
     assert marker in authority, marker
 assert 'state.get("verified_tip")' not in authority, (
@@ -138,6 +142,7 @@ for marker in (
     "--confirm-orphan-children", "reparented_to: primary",
     "verify_release_against_worker", "children-quiesced",
     "chained close ack", "BY CONTENT", "compartment-chain-tip",
+    "REACHABILITY", "unverified ATTESTATION", "ADVISORY and never decides",
     "monitor-local state may never supply it",
 ):
     assert marker in doc, marker

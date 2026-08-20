@@ -45,6 +45,37 @@ SEVERITIES = {"blocking", "high", "medium", "low"}
 # opts in with this exact mode; current task metadata never sets it.
 LEGACY_AUTHOR_ADMISSION_MODE = "legacy-author-admission"
 
+# R6 (docs/azure-requirements.md): the primary Crosscheck reviewer family is
+# GLM-5.2 served from the fleet's own Azure AI Foundry resource through the
+# Fireworks partner lane, driven by Pi through a custom `azure-glm` provider.
+# The endpoint is an ALLOWLIST of exactly one chat-completions base URL: any
+# other baseUrl - including any Responses API surface - is refused by name.
+# The reviewer identity binds the Foundry resource + deployment, never the
+# api key or anything derived from it.
+GLM_REVIEWER_MODEL = "FW-GLM-5.2"
+GLM_PROVIDER_SLOT = "azure-glm"
+GLM_PROVIDER_API = "openai-completions"
+GLM_FOUNDRY_RESOURCE = "aif-fm7c799d-eus01"
+GLM_PROVIDER_HOST = "aif-fm7c799d-eus01.cognitiveservices.azure.com"
+GLM_ALLOWED_BASE_URL = (
+    "https://aif-fm7c799d-eus01.cognitiveservices.azure.com/openai/v1"
+)
+# Non-secret executing identity for the api-key GLM lane: an api key names no
+# upstream account, so the reviewer identity is the resource/deployment pair.
+GLM_REVIEWER_ACCOUNT_IDENTITY = (
+    GLM_PROVIDER_SLOT + ":" + GLM_FOUNDRY_RESOURCE + "/" + GLM_REVIEWER_MODEL
+)
+# The model decides the Pi provider slot. An unmapped model is refused rather
+# than guessed, so a roster typo can never route a review to a provider the
+# policy never named.
+PI_MODEL_PROVIDERS = {
+    GLM_REVIEWER_MODEL: GLM_PROVIDER_SLOT,
+    "gpt-5.6-sol": "openai-codex",
+}
+# Review family provenance recorded in every run's ledger reviewer record.
+REVIEW_FAMILY_GLM_PRIMARY = "glm-primary"
+REVIEW_FAMILY_CODEX_FALLBACK = "codex-fallback"
+
 MAX_CAPTURE = 200_000
 DEFAULT_REVIEWER_CAPTURE = 16 * 1024 * 1024
 MAX_REVIEWER_CAPTURE = 64 * 1024 * 1024
@@ -427,6 +458,110 @@ def inspect_pi_credential(account_home: Path) -> tuple[str, str]:
             f"{credential_file}"
         )
     return "pi-openai-codex-oauth-file", str(credential_file)
+
+
+def pi_provider_for_model(model: str) -> str:
+    """Return the exact Pi provider slot the reviewer model executes on.
+
+    The mapping is explicit, not heuristic: FW-GLM-5.2 runs on the R6
+    `azure-glm` Foundry provider and the gpt fallback family stays on
+    `openai-codex`. Any model outside the table refuses by name.
+    """
+
+    provider = PI_MODEL_PROVIDERS.get(model)
+    if provider is None:
+        tool_fail(
+            f"no Pi provider mapping exists for reviewer model {model!r}; "
+            "the gate refuses to guess a provider"
+        )
+    return provider
+
+
+def inspect_pi_glm_credential(account_home: Path) -> tuple[str, str]:
+    """Validate the api-key models.json credential of one GLM reviewer home.
+
+    A GLM reviewer's account home is a dedicated Pi agent dir whose credential
+    is `models.json` carrying exactly the `azure-glm` custom provider. The
+    endpoint is an allowlist of exactly GLM_ALLOWED_BASE_URL (chat completions
+    only; any configuration reaching for a Responses API surface is refused).
+    The returned credential identifier is a non-secret binding of the Foundry
+    resource + deployment + pinned endpoint; it neither contains nor is derived
+    from the api key.
+    """
+
+    credential_file = account_home.resolve() / "models.json"
+    try:
+        metadata = credential_file.lstat()
+    except OSError as exc:
+        tool_fail(
+            "GLM reviewer credential inspection failed at "
+            f"{credential_file}: {exc}"
+        )
+    if not stat.S_ISREG(metadata.st_mode) or credential_file.is_symlink():
+        tool_fail(
+            "GLM reviewer credential inspection requires a regular "
+            f"non-symlink file at {credential_file}"
+        )
+    try:
+        document = read_json(
+            credential_file,
+            "GLM reviewer credential",
+            maximum_bytes=1024 * 1024,
+            maximum_items=4096,
+        )
+    except CrosscheckError as exc:
+        tool_fail(str(exc))
+    providers = document.get("providers") if isinstance(document, dict) else None
+    if not isinstance(providers, dict) or set(providers) != {GLM_PROVIDER_SLOT}:
+        tool_fail(
+            f"GLM reviewer credential at {credential_file} must declare "
+            f"exactly the {GLM_PROVIDER_SLOT} provider"
+        )
+    provider = providers[GLM_PROVIDER_SLOT]
+    if not isinstance(provider, dict):
+        tool_fail(
+            f"GLM reviewer credential at {credential_file} has a malformed "
+            f"{GLM_PROVIDER_SLOT} provider entry"
+        )
+    base_url = provider.get("baseUrl")
+    if base_url != GLM_ALLOWED_BASE_URL:
+        tool_fail(
+            f"GLM reviewer endpoint allowlist refused baseUrl {base_url!r}; "
+            f"the only accepted endpoint is {GLM_ALLOWED_BASE_URL}"
+        )
+    if provider.get("api") != GLM_PROVIDER_API:
+        tool_fail(
+            f"GLM reviewer credential at {credential_file} must pin api "
+            f"{GLM_PROVIDER_API!r} (chat completions only; a Responses API "
+            "configuration is refused)"
+        )
+    api_key = provider.get("apiKey")
+    if not isinstance(api_key, str) or not api_key.strip():
+        tool_fail(
+            f"GLM reviewer credential is unusable at {credential_file}: "
+            "no api key material"
+        )
+    models = provider.get("models")
+    model_ids = [
+        entry.get("id")
+        for entry in (models if isinstance(models, list) else [])
+        if isinstance(entry, dict)
+    ]
+    if GLM_REVIEWER_MODEL not in model_ids:
+        tool_fail(
+            f"GLM reviewer credential at {credential_file} does not declare "
+            f"the {GLM_REVIEWER_MODEL} deployment"
+        )
+    binding = hashlib.sha256(
+        (
+            GLM_FOUNDRY_RESOURCE
+            + "/"
+            + GLM_REVIEWER_MODEL
+            + "\n"
+            + GLM_ALLOWED_BASE_URL
+        ).encode("utf-8")
+    ).hexdigest()
+    return "pi-azure-glm-models-file", "glm-foundry-binding:" + binding
 
 
 def model_identity(model: str) -> str:
@@ -2489,6 +2624,15 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
                 reviewer.get("model_independence") in {None, "same-model"},
                 f"{label}.reviewer.model_independence is invalid",
             )
+            require(
+                reviewer.get("review_family_mode")
+                in {
+                    None,
+                    REVIEW_FAMILY_GLM_PRIMARY,
+                    REVIEW_FAMILY_CODEX_FALLBACK,
+                },
+                f"{label}.reviewer.review_family_mode is invalid",
+            )
         if (
             isinstance(reviewer, dict)
             and reviewer.get("execution_mode") == "azure-compartment-v1"
@@ -2670,14 +2814,16 @@ def reviewer_candidates(
         isinstance(reviewers, list) and reviewers,
         "reviewer configuration.reviewers must be a nonempty array",
     )
+    # R6: GLM-5.2 on the fleet's own Foundry resource is the PRIMARY review
+    # family. The pi-codex/codex profiles remain only as the dormant fallback
+    # lane; selecting one is recorded as a degraded mode in the ledger and
+    # announced loudly at run time. The interim claude reviewer lane is
+    # retired: a claude profile is refused here by the same exact-profile
+    # message as any other unlisted profile.
     allowed_profiles = {
+        ("pi", GLM_REVIEWER_MODEL, "xhigh"),
         ("codex", "gpt-5.6-sol", "xhigh"),
         ("pi", "gpt-5.6-sol", "xhigh"),
-        # The claude lane exists for cross-provider review independence; it
-        # executes only through the Azure compartment adapter, whose model
-        # guest owns the schema-bound claude launch (run_reviewer below
-        # fails over rather than launching claude locally).
-        ("claude", "claude-opus-5", "xhigh"),
     }
     allowed_profiles_message = " or ".join(
         f"{harness} {model} {effort}"
@@ -2710,6 +2856,13 @@ def reviewer_candidates(
                 "model": model,
                 "effort": effort,
                 "account_home": str(account_home.resolve()),
+                # Durable review-family provenance: GLM is the primary lane;
+                # every codex-family profile is the recorded fallback.
+                "review_family_mode": (
+                    REVIEW_FAMILY_GLM_PRIMARY
+                    if model == GLM_REVIEWER_MODEL
+                    else REVIEW_FAMILY_CODEX_FALLBACK
+                ),
             }
         )
     author_model = model_identity(meta["model"])
@@ -3207,11 +3360,6 @@ def run_reviewer(
         environment.pop(provider_variable, None)
     account_home = Path(config["account_home"])
     config["executing_account_home"] = str(account_home)
-    if config["harness"] == "claude":
-        tool_fail(
-            "claude reviewers execute only through the Azure compartment lane; "
-            "enable config/crosscheck-azure.json or configure a codex/pi reviewer"
-        )
     if config["harness"] == "codex":
         execution_home = account_home
         credential_source, credential_identifier = inspect_codex_credential(
@@ -3220,9 +3368,17 @@ def run_reviewer(
         config["account_selector"] = "CODEX_HOME"
     else:
         execution_home = prepare_pi_execution_home(protocol_dir, account_home)
-        credential_source, credential_identifier = inspect_pi_credential(
-            account_home
-        )
+        # The model decides the credential shape as well as the provider: the
+        # GLM lane authenticates through the api-key models.json custom
+        # provider, while the codex-family fallback keeps its OAuth auth.json.
+        if pi_provider_for_model(config["model"]) == GLM_PROVIDER_SLOT:
+            credential_source, credential_identifier = inspect_pi_glm_credential(
+                account_home
+            )
+        else:
+            credential_source, credential_identifier = inspect_pi_credential(
+                account_home
+            )
         config["account_selector"] = "PI_CODING_AGENT_DIR"
     config["execution_home"] = str(execution_home.resolve())
     config["credential_source"] = credential_source
@@ -3321,7 +3477,7 @@ def run_reviewer(
             "--mode",
             "json",
             "--provider",
-            "openai-codex",
+            pi_provider_for_model(config["model"]),
             "--model",
             config["model"],
             "--thinking",
@@ -3856,6 +4012,17 @@ def render_report(ledger: dict[str, Any], run: dict[str, Any]) -> str:
                 "",
             ]
         )
+    if (
+        isinstance(reviewer, dict)
+        and reviewer.get("review_family_mode") == REVIEW_FAMILY_CODEX_FALLBACK
+    ):
+        lines.extend(
+            [
+                "Review family: **CODEX FALLBACK** (degraded; the GLM-5.2 "
+                "primary lane did not serve this run).",
+                "",
+            ]
+        )
     if isinstance(reviewer, dict) and reviewer.get("model_independence") == "same-model":
         lines.extend(
             [
@@ -4157,6 +4324,25 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
             fetched_source: Path | None = None
             for position, candidate in enumerate(candidates):
                 config = candidate
+                if (
+                    config.get("review_family_mode")
+                    == REVIEW_FAMILY_CODEX_FALLBACK
+                ):
+                    # Flipping to the dormant codex-family fallback must be
+                    # LOUD: firstmate authors also run on codex-family
+                    # models, so this lane usually needs the recorded
+                    # crosscheck-same-model degraded state.
+                    relaxation = (
+                        "crosscheck-same-model relaxation was required"
+                        if config.get("model_independence") == "same-model"
+                        else "crosscheck-same-model relaxation was not required"
+                    )
+                    print(
+                        "CROSSCHECK DEGRADED: codex-family fallback reviewer "
+                        f"{config['harness']} {config['model']} is standing in "
+                        f"for the GLM-5.2 primary lane; {relaxation}",
+                        file=sys.stderr,
+                    )
                 remaining = len(candidates) - position - 1
                 review_dir = temp_root / f"review-{position}"
                 try:

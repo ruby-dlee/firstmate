@@ -293,6 +293,10 @@ top-level, or, inside a no-mistakes gate worktree
 the exact snapshot HEAD as the generation.
 The subscription confirmation is always passed through from the operator
 environment's `FM_AZURE_SUBSCRIPTION_ID` and never synthesized.
+In the ambient lane, `FM_AZURE_RUNNER_REMOTE_CLASSES` is therefore the spend
+switch, full stop: selecting a class remote is the single operator gesture
+that authorizes billable dispatch, and the auto-derived subscription
+confirmation is no longer a second one.
 Explicit values are honored only as a task/generation pair; half a hand-set
 identity refuses.
 A binding that cannot be derived fails closed with an exact error naming what

@@ -602,6 +602,9 @@ state={
 receipts=[]
 for i in range(1,9):
  receipts.append({"round":"round-aaaaaaaaaaaa","kind":"behavior","shard":i,"shard_count":8,"head":head,"tree":tree,"request_digest":"sha256:"+format(i,"064x"),"command_digest":"sha256:"+format(i+8,"064x"),"invocation":"azr-"+format(i,"012x"),"boot_id":f"boot-{i}","vm_instance_id":f"vm-{i}","artifact":{"path":f"results/executed-{i}.tsv","digest":"sha256:"+format(i+16,"064x"),"bytes":100+i}})
+# The controller's own dispatch ledger: receipts must correspond to the shard
+# round this cell actually created, not merely be well-formed.
+state["shard_runs"]={item["request_digest"]:{"round":item["round"],"shard":item["shard"],"head":item["head"],"command_digest":item["command_digest"],"invocation":item["invocation"]} for item in receipts}
 result={
  "schema":"fm.azure-validation-result/v1","request_digest":state["request_digest"],"cell":state["cell"],"home_binding":state["request"]["home_binding"],"task":"task","task_generation":"gen","validation_generation":"val","fence":state["request"]["fence"],"branch":"fm/task","submitted_head":head,"current_head":head,"current_tree":tree,"remote_head":head,"worktree_disk_id":"/work","run_id":"01HZX7YQ7EJQH8C9G3N4M5P6R7","vm_resource_id":"/vm","vm_instance_id":"vm-instance","boot_id":state["expected_boot_id"],"outcome":"checks-passed","checks_green":True,"pr_url":"https://github.com/o/r/pull/1","behavior_shards":receipts
 }
@@ -624,6 +627,8 @@ reject("wrong VM",lambda r:r.__setitem__("vm_instance_id","peer-vm"))
 reject("wrong boot",lambda r:r.__setitem__("boot_id","peer-boot"))
 reject("stale shard head",lambda r:r["behavior_shards"][0].__setitem__("head","c"*40))
 reject("stale shard tree",lambda r:r["behavior_shards"][0].__setitem__("tree","c"*40))
+reject("alien shard round",lambda r:[item.__setitem__("round","round-ffffffffffff") for item in r["behavior_shards"]])
+reject("undispatched receipt digest",lambda r:r["behavior_shards"][0].__setitem__("request_digest","sha256:"+"e"*64))
 reject("duplicate shard index",lambda r:r["behavior_shards"][7].__setitem__("shard",1))
 reject("wrong artifact digest",lambda r:r["behavior_shards"][0]["artifact"].__setitem__("digest","bad"))
 reject("cross-repo PR",lambda r:r.__setitem__("pr_url","https://github.com/peer/repo/pull/1"))
@@ -1026,6 +1031,12 @@ receipt_chain_close_contract() {
   make_repo "$tmp/project"
   head=$(git -C "$tmp/project/repo" rev-parse HEAD)
   tree=$(git -C "$tmp/project/repo" rev-parse 'HEAD^{tree}')
+  # A later pipeline commit (documentation) publishes a head whose receipts
+  # legitimately prove an exact ancestor - the multi-attempt shape R4 fixes.
+  git -C "$tmp/project/repo" commit -q --allow-empty -m docs
+  git -C "$tmp/project/repo" push -q origin fm/fixture
+  published_head=$(git -C "$tmp/project/repo" rev-parse HEAD)
+  published_tree=$(git -C "$tmp/project/repo" rev-parse 'HEAD^{tree}')
 
   # 1. The REAL in-cell bridge emits the receipt set from a completed shard
   # round: verify_behavior against the repository's own trusted plan.
@@ -1117,15 +1128,20 @@ assert result["checks_green"] is True
 assert len(result["behavior_shards"])==8, "the emitted result dropped receipts"
 PY
 
-  # 3+4. The REAL controller receipt gate accepts exactly that emitted result,
-  # and the REAL close gate closes the cell on it; an empty receipt set is
-  # refused, and a demoted (failed) result still cannot close.
-  python3 - "$HOST" "$work/state/result-a2.json" "$tmp/home" "$tmp/project/repo" "$head" <<'PY' \
+  # 3+4. The REAL controller receipt gate accepts exactly that emitted result
+  # bound to this cell's own dispatched shard round, accepts the receipts as
+  # proof of an exact ancestor of the published head, refuses an alien round
+  # at that same valid ancestor head, refuses an empty set, and the REAL
+  # close gate closes the cell on the ancestor-proved result while a demoted
+  # (failed) result still cannot close.
+  python3 - "$HOST" "$work/state/result-a2.json" "$tmp/home" "$tmp/project/repo" \
+    "$published_head" "$published_tree" <<'PY' \
     || fail "collect/close did not accept the receipts the bridge produced"
 import copy,importlib.util,json,pathlib,sys,types
 spec=importlib.util.spec_from_file_location("validation",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 result=json.load(open(sys.argv[2]))
-home=pathlib.Path(sys.argv[3]); repo=sys.argv[4]; head=sys.argv[5]
+home=pathlib.Path(sys.argv[3]); repo=sys.argv[4]
+published_head,published_tree=sys.argv[5],sys.argv[6]
 state={
   "schema":m.SCHEMA,"cell":"azv-aaaaaaaaaaaa","phase":"collected","attempt":2,
   "request_digest":result["request_digest"],
@@ -1139,10 +1155,33 @@ state={
   },
   "resources":{"worktree_disk_id":"/work","vm_id":"/vm","vm_instance_id":"vm-instance"},
   "expected_boot_id":"44444444-4444-4444-8444-444444444444",
+  # The controller's own dispatch ledger for this cell's shard round, exactly
+  # as drive() records it when it serves the bridge's requests.
+  "shard_runs":{item["request_digest"]:{
+      "round":item["round"],"shard":item["shard"],"head":item["head"],
+      "command_digest":item["command_digest"],"invocation":item["invocation"],
+  } for item in result["behavior_shards"]},
   "result":result,
 }
 # The controller's own receipt gate accepts the exact emitted result.
 m.verify_result_identity(state,result)
+# The multi-attempt shape: a later pipeline commit published a descendant
+# head, and the round's receipts legitimately prove the exact ancestor.
+ancestor=copy.deepcopy(result)
+ancestor["current_head"]=published_head; ancestor["current_tree"]=published_tree
+ancestor["remote_head"]=published_head
+m.verify_result_identity(state,ancestor)
+# An alien round at that same valid ancestor head does not correspond to
+# this cell's own dispatched shard round and is refused.
+alien=copy.deepcopy(ancestor)
+for item in alien["behavior_shards"]:
+    item["round"]="round-ffffffffffff"
+try:
+    m.verify_result_identity(state,alien)
+except m.ValidationError as exc:
+    assert "own dispatched shard round" in str(exc), str(exc)
+else:
+    raise AssertionError("an alien shard round at a valid ancestor head was accepted")
 # An empty receipt set on the same otherwise-successful result is refused.
 empty=copy.deepcopy(result); empty["behavior_shards"]=[]
 try:
@@ -1151,20 +1190,22 @@ except m.ValidationError as exc:
     assert "receipt set" in str(exc)
 else:
     raise AssertionError("a successful result with no receipts was accepted")
-# The REAL close path: compute/storage teardown is faked, every gate is real.
+# The REAL close path on the ancestor-proved result: compute/storage teardown
+# is faked, every gate is real, and the remote-branch proof runs real git.
 env={"home":home,"state_dir":home/"state"/"azure-validation","subscription":"sub"}
 m.ensure_dirs(env)
+state["result"]=ancestor
 (env["state_dir"]/"azv-aaaaaaaaaaaa.json").write_text(json.dumps(state))
 m.cleanup_compute=lambda _env,_state:None
 m.delete_resource=lambda *_args,**_kwargs:None
 m.delete_cell_storage_scope=lambda _env,_state:None
-args=types.SimpleNamespace(cell="azv-aaaaaaaaaaaa",confirm_close=True,confirm_subscription="sub",confirm_head=head)
+args=types.SimpleNamespace(cell="azv-aaaaaaaaaaaa",confirm_close=True,confirm_subscription="sub",confirm_head=published_head)
 m.close(env,args)
 closed=json.loads((env["state_dir"]/"azv-aaaaaaaaaaaa.json").read_text())
 assert closed["phase"]=="closed", "close did not reach the closed phase: "+closed["phase"]
 # A demoted cell still cannot close: the failed outcome retains storage.
 failed=copy.deepcopy(state); failed["phase"]="collected"
-failed["result"]=copy.deepcopy(result); failed["result"]["outcome"]="failed"; failed["result"]["checks_green"]=False
+failed["result"]=copy.deepcopy(ancestor); failed["result"]["outcome"]="failed"; failed["result"]["checks_green"]=False
 (env["state_dir"]/"azv-aaaaaaaaaaaa.json").write_text(json.dumps(failed))
 try:
     m.close(env,args)
@@ -1174,7 +1215,7 @@ else:
     raise AssertionError("a demoted failed result was closed")
 PY
 
-  pass "the real bridge emits the receipt set, the guest carries it, and the real collect and close gates accept it end to end"
+  pass "the real bridge emits the receipt set, the guest carries it, and the real collect and close gates accept it end to end, bound to this cell's own shard round"
 }
 
 static_contract

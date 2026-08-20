@@ -880,6 +880,25 @@ PY
     "$dispatch" lint -- sh -c 'exit 0' 2>&1) || rc=$?
   [ "$rc" -ne 0 ] || fail "a half-explicit identity was accepted"
   assert_contains "$out" "export both or neither" "the half-explicit refusal was not explicit"
+  rc=0
+  out=$(cd "$taskwt" && env FM_HOME="$home" FM_AZURE_SUBSCRIPTION_ID="$SUB" \
+    FM_AZURE_RUNNER_REMOTE_CLASSES='lint=validation-standard' \
+    FM_AZURE_RUNNER_GENERATION=operator-gen \
+    "$dispatch" lint -- sh -c 'exit 0' 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "a generation-only explicit identity was accepted"
+  assert_contains "$out" "export both or neither" "the generation-only refusal was not explicit"
+
+  # 8b. A directory under worktrees/ whose name is not a ULID run id is not a
+  # gate worktree and refuses rather than minting a fake run identity.
+  make_ambient_worktree "$tmp/nm-home/worktrees/19543ae8611e/not-a-run-id"
+  rm -f "$fixture/captured" "$tmp/ran-locally"
+  rc=0
+  out=$(cd "$tmp/nm-home/worktrees/19543ae8611e/not-a-run-id" && env FM_HOME="$home" \
+    FM_AZURE_SUBSCRIPTION_ID="$SUB" FM_AZURE_RUNNER_REMOTE_CLASSES='lint=validation-standard' \
+    "$dispatch" lint -- sh -c "touch '$tmp/ran-locally'" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "a non-ULID worktrees directory minted a run identity"
+  assert_contains "$out" "not a no-mistakes gate worktree" "the non-ULID refusal was not explicit"
+  [ ! -e "$fixture/captured" ] && [ ! -e "$tmp/ran-locally" ] || fail "a non-ULID worktrees directory still executed"
 
   # 9. A class that is not remote-selected stays local and needs no identity.
   rm -f "$fixture/captured" "$tmp/ran-locally"

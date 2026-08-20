@@ -564,7 +564,10 @@ PROVIDER=$(jq -r '.credentials.provider' "$REQUEST")
 # ancestor of it, with the receipt tree bound to that head, so a carried
 # receipt can never vouch for history the run did not publish. Only a start
 # boot - a fresh run - begins from no receipts, so a retained disk can never
-# leak a previous run's proof into a new one.
+# leak a previous run's proof into a new one. Belt-and-suspenders only: the
+# filesystem gate above already refuses a start boot on a disk that carries a
+# filesystem, and a fresh mkfs cannot carry receipts, so this wipe is not
+# load-bearing today.
 if [ "$MODE" = start ]; then
   rm -f "$SHARD_EXCHANGE/receipts.json" || :
 fi

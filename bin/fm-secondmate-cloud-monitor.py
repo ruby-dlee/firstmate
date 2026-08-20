@@ -58,14 +58,19 @@ one place that validates them and spends anything.
     loudly, as a duplicate (durable dedupe, the delivered-refusal ack rule).
     An invalid request therefore never reaches command_request at all.
   - A valid request spawns through the EXISTING lane and nothing else:
-    FM_HOME=<the secondmate home> bin/fm-spawn.sh <child> <project>, with
-    --parent-task/--parent-task-generation forwarded into the lifecycle
-    request so compartment children cannot dodge the bounds (AMENDMENT 1).
-    FM_AZURE_WORKER_STATE_DIR is pinned to the LOCAL controller directory:
-    the money authority stays the one document even though FM_HOME moves to
-    the secondmate home. Nothing about home, account, worktree, harness, SKU,
-    project, or repository comes from the cloud side - the project is local
-    policy (FM_SECONDMATE_CHILD_PROJECT, else the home's single project).
+    FM_HOME=<the secondmate home> bin/fm-spawn.sh <child> <project>
+    --harness pi, with --parent-task/--parent-task-generation forwarded into
+    the lifecycle request so compartment children cannot dodge the bounds
+    (AMENDMENT 1). FM_AZURE_WORKER_STATE_DIR is pinned to the LOCAL
+    controller directory: the money authority stays the one document even
+    though FM_HOME moves to the secondmate home. Nothing about home, account,
+    worktree, harness, SKU, project, or repository comes from the cloud side -
+    the project is local policy (FM_SECONDMATE_CHILD_PROJECT, else the home's
+    single project), and the harness is the cloud lane's only runtime.
+  - ACCEPTANCE IS PROVEN BY THE QUEUE. A zero exit from fm-spawn is evidence
+    the script ran, never that the controller admitted a bounded child, so a
+    served request is confirmed by reading the one controller document back
+    and finding the child's entry carrying THIS compartment's parent pair.
   - An admission refusal from command_request (fan-out cap, lifetime total,
     parent liveness, depth) is a spawn failure: its exact text round-trips
     into the inbox the same way, and no queue item exists.
@@ -77,18 +82,36 @@ THE ATTACH CONTRACT (`fm.secondmate-attach-request/v1`), decided here: the
 session runner does not emit this kind yet, so this monitor PINS the shape and
 the runner-side emission is a follow-up change. It is symmetric with the child
 request and just as closed: exactly {kind, parent_task, parent_task_generation,
-parent_assignment_generation, self_digest} plus the chain framing, and NO
-selector of any kind. The delta is always the commits the local secondmate
-home worktree has gained over the compartment's dispatched
+parent_assignment_generation, attach_sequence, self_digest} plus the chain
+framing, and NO selector of any kind. `attach_sequence` selects nothing; it is
+a bounded monotone discriminator (1..32, strictly past what has been served),
+without which the payload would be CONSTANT for a whole assignment: every ask
+would hash to one self digest and the second would refuse as a duplicate of
+the first, leaving a 72-hour compartment exactly one attach.
+
+WHAT THE DELTA IS, AND WHAT IT IS NOT. The bundle is always the commits the
+local secondmate HOME worktree has gained over the compartment's dispatched
 repository_generation, so no base, ref, path, or repository field is
-expressible from the cloud side, and the guest cannot name a tree it was never
-given. The bundle rides the claim-exempt `message-put --attach` lane as
+expressible from the cloud side and the guest cannot name a tree it was never
+given. That is a decision, not an oversight: a child crewmate commits into a
+worktree of its PROJECT repository, whose history shares no ancestor with the
+home repository the compartment holds at /mnt/task/repo, so a project bundle
+could not be fast-forwarded there even if it were shipped. What genuinely
+reaches the compartment is the home's own delta - the child's report and other
+home artifacts - and the delivered text and the doc now say exactly that
+instead of promising the child's code commits. Shipping project work to a
+compartment would need a per-child repository binding and a selector, which
+this closed schema deliberately does not have.
+
+The bundle rides the claim-exempt `message-put --attach` lane as
 session/in/attach/<sha256>.bundle and is announced by an
 fm.secondmate-attach/v1 inbox message carrying name+sha256+bytes, which is
 exactly what the runner's size-checked fetch_attach path requires. The
 announcement is SIZE-BEFORE-FETCH: it is built from the upload receipt only
 after the receipt's digest and byte count both equal the local bundle's, so a
-mismatched announcement is never sent rather than sent and refused later.
+mismatched announcement is never sent rather than sent and refused later. An
+ask that finds no delta serves nothing, records no acceptance, and so burns no
+attach_sequence.
 
 Exit codes: 0 verified (possibly nothing new), 3 chain break (sticky), 2 bad
 invocation or unreadable durable state.
@@ -137,9 +160,22 @@ ATTACH_REQUEST_REQUIRED = (
     "kind", "parent_task", "parent_task_generation", "parent_assignment_generation",
     "self_digest",
 )
+# The attach request carries no selector, so without a discriminator its
+# payload would be CONSTANT for a whole assignment: every ask would hash to the
+# same self digest and the second would refuse as a duplicate, leaving one
+# attach for a 72-hour compartment that may own up to 32 children over its
+# lifetime. attach_sequence is that discriminator: an integer, bounded by the
+# lifetime child cap, and strictly increasing over the asks this monitor has
+# actually served. It selects nothing - the delta is still always the same
+# locally-decided range - it only distinguishes one ask from the next.
+ATTACH_REQUEST_COUNTED = "attach_sequence"
+MAX_ATTACH_SEQUENCE = 32
 # Child model/effort ride the child's spawn argv, so the monitor is stricter
 # than the runner: a bounded shell-safe token or nothing.
 SAFE_OPTION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# The cloud lane runs exactly one runtime: fm-spawn refuses every other
+# harness under cloud placement and forces this one itself.
+CLOUD_CHILD_HARNESS = "pi"
 
 GIT_TIMEOUT = 600
 SPAWN_TIMEOUT = 900
@@ -544,15 +580,31 @@ def payload_of(message):
 
 
 def check_request_shape(message, required, optional):
-    """Closed-schema check. Returns the exact failed check name, or ""."""
+    """Closed-schema check. Returns the exact failed check name, or "".
+
+    Type-checks the OPTIONAL fields too, not only the required ones: a present
+    optional field carrying an int, list, dict, or null used to reach the
+    later regex checks and raise instead of refusing, and a raised validator
+    defeats the delivered-refusal rule outright. Every string field this
+    schema admits is proven a non-empty string HERE, before any check that
+    assumes one.
+    """
     allowed = set(required) | set(optional) | set(CHAIN_FIELDS)
     for key in sorted(message):
         if key not in allowed:
             return "request carries unknown key: {}".format(key)
+    return check_request_body(message, required, optional)
+
+
+def check_request_body(message, required, optional):
+    """The type and digest half of the closed check, with no key-set opinion."""
     for key in required:
         value = message.get(key)
         if not isinstance(value, str) or not value:
             return "request field {} is missing or malformed".format(key)
+    for key in optional:
+        if key in message and (not isinstance(message[key], str) or not message[key]):
+            return "request field {} is present but is not a non-empty string".format(key)
     if not HEX.fullmatch(message["self_digest"]):
         return "request self_digest is not a sha256 hex digest"
     if sha256_hex(canonical(payload_of(message))) != message["self_digest"]:
@@ -585,14 +637,35 @@ def check_child_request(message, task, generation, assignment):
         return "request child_kind must be ship or scout, not {!r}".format(message["child_kind"])
     if len(message["brief"].encode("utf-8")) > MAX_BRIEF_BYTES:
         return "request brief exceeds the {} byte bound".format(MAX_BRIEF_BYTES)
+    if message["brief"].startswith("-"):
+        # The brief becomes ONE pi argv element on the worker
+        # (fm-spawn.sh's cloud launch line), so a leading dash could be parsed
+        # as a pi flag rather than a prompt - the same reason
+        # fm-secondmate-session.py refuses leading-dash inbox text, and the
+        # same reason child_model/child_effort carry a strict charset here.
+        return "request brief begins with '-' and cannot ride the pi argv"
     for key in CHILD_REQUEST_OPTIONAL:
         if key in message and not SAFE_OPTION.fullmatch(message[key]):
             return "request {} is malformed".format(key)
     return ""
 
 
-def check_attach_request(message, task, generation, assignment):
-    failed = check_request_shape(message, ATTACH_REQUEST_REQUIRED, ())
+def check_attach_request(message, task, generation, assignment, served):
+    allowed = set(ATTACH_REQUEST_REQUIRED) | {ATTACH_REQUEST_COUNTED} | set(CHAIN_FIELDS)
+    for key in sorted(message):
+        if key not in allowed:
+            return "request carries unknown key: {}".format(key)
+    counter = message.get(ATTACH_REQUEST_COUNTED)
+    if not isinstance(counter, int) or isinstance(counter, bool):
+        return "request attach_sequence is missing or is not an integer"
+    if not 1 <= counter <= MAX_ATTACH_SEQUENCE:
+        return "request attach_sequence must be between 1 and {}".format(MAX_ATTACH_SEQUENCE)
+    if counter <= served:
+        return (
+            "request attach_sequence {} is not past the {} already served; "
+            "attach requests count strictly upward".format(counter, served)
+        )
+    failed = check_request_body(message, ATTACH_REQUEST_REQUIRED, ())
     if failed:
         return failed
     if message["kind"] != ATTACH_REQUEST_KIND:
@@ -652,6 +725,25 @@ class Relay:
         except (OSError, ValueError):
             return {}
 
+    def admitted_child(self, child_task):
+        """This compartment's own queue entry for child_task, or None.
+
+        Ownership is the parent pair, not the name: an entry that exists but
+        names another parent (or no parent) is not this compartment's child
+        and never counts as admission under its bounds.
+        """
+        state = self.controller_state()
+        for entry in (state.get("queue") or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            if (
+                entry.get("task") == child_task
+                and entry.get("parent_task") == self.task
+                and entry.get("parent_task_generation") == self.generation
+            ):
+                return entry
+        return None
+
     def compartment_repository_generation(self):
         state = self.controller_state()
         item = (state.get("queue") or {}).get("{}@{}".format(self.task, self.generation)) or {}
@@ -674,7 +766,22 @@ class Relay:
             # duplicate refusal. Marking first would instead drop a request
             # silently, which is the one outcome the delivered-refusal rule
             # exists to prevent.
-            self.handle(entry, match.group(2))
+            try:
+                self.handle(entry, match.group(2))
+            except Exception as exc:  # noqa: BLE001 - deliberate, see below
+                # THE ALWAYS-AN-ANSWER BACKSTOP. A validator or spawn bug that
+                # raises must never become silence: an escaping exception used
+                # to kill this whole pass, so no refusal was recorded, no
+                # refusal was delivered, every later request in the pass went
+                # unanswered, and child status mirroring stopped for good
+                # while the bash monitor logged a 15-second warning. Any
+                # unexpected failure is therefore routed into the ordinary
+                # durable-and-delivered refusal, and the loop continues.
+                self.refuse(
+                    match.group(2), entry.name,
+                    "request handling failed unexpectedly ({}: {}); refused rather than "
+                    "left unanswered".format(type(exc).__name__, exc),
+                )
             write_atomic(handled, b"")
         self.mirror_child_status()
         return 0
@@ -692,7 +799,9 @@ class Relay:
         if kind == CHILD_REQUEST_KIND:
             check = check_child_request(message, self.task, self.generation, self.assignment)
         elif kind == ATTACH_REQUEST_KIND:
-            check = check_attach_request(message, self.task, self.generation, self.assignment)
+            check = check_attach_request(
+                message, self.task, self.generation, self.assignment, self.attach_served()
+            )
         else:
             self.refuse(content_digest, entry.name, "request kind is not relayed: {!r}".format(kind))
             return
@@ -716,6 +825,24 @@ class Relay:
             self.spawn_child(message, digest, entry.name)
         else:
             self.send_delta_bundle(message, digest, entry.name)
+
+    def attach_served(self) -> int:
+        """The highest attach_sequence this monitor has actually SERVED.
+
+        Durable, and deliberately advanced only by a served attach: an ask
+        that found no delta serves nothing, so it burns no sequence and the
+        compartment may ask again with the same number.
+        """
+        highest = 0
+        for record in self.childreq.glob(".accepted-*.json"):
+            try:
+                accepted = json.loads(record.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            counter = accepted.get(ATTACH_REQUEST_COUNTED)
+            if isinstance(counter, int) and not isinstance(counter, bool):
+                highest = max(highest, counter)
+        return highest
 
     def prior_verdict(self, digest):
         if (self.childreq / ".accepted-{}.json".format(digest)).exists():
@@ -781,7 +908,15 @@ class Relay:
         except OSError as exc:
             self.refuse(digest, landed, "child brief could not be written locally: {}".format(exc))
             return
-        argv = [self.spawn_bin, child_task, project]
+        # --harness is passed EXPLICITLY rather than left to resolution. A
+        # home carrying config/crew-dispatch.json refuses a crewmate spawn
+        # that resolves its harness implicitly (the consultation backstop),
+        # and the primary propagates that file into secondmate homes, so an
+        # implicit-harness child request would refuse in most real homes. The
+        # cloud lane runs exactly one runtime - it rejects every harness but
+        # pi and forces pi itself - so naming pi here is the resolution, not a
+        # guess, and it keeps the relay off the implicit path entirely.
+        argv = [self.spawn_bin, child_task, project, "--harness", CLOUD_CHILD_HARNESS]
         if message["child_kind"] == "scout":
             argv.append("--scout")
         for flag, key in (("--model", "child_model"), ("--effort", "child_effort")):
@@ -810,18 +945,37 @@ class Relay:
                 "child spawn was refused (exit {}): {}".format(code, output.strip()[-1200:]),
             )
             return
+        # ADMISSION IS PROVEN BY THE QUEUE, NOT BY AN EXIT CODE. fm-spawn is a
+        # long script with at least one exit-0 path that silently downgrades
+        # placement, so a zero exit is evidence the script ran, never evidence
+        # the controller admitted a bounded child. Read the one money
+        # authority back and require the child's own entry carrying THIS
+        # compartment's parent pair; anything else refuses loudly. This also
+        # bounds the crash window: a replay mints a fresh spawn generation and
+        # so a different queue key, and the readback is what would catch a
+        # second admission for one intent.
+        admitted = self.admitted_child(child_task)
+        if admitted is None:
+            self.refuse(
+                digest, landed,
+                "child spawn exited 0 but the controller holds no queue entry for {} owned by "
+                "this compartment ({}@{}); the child was not admitted under the child bounds".format(
+                    child_task, self.task, self.generation),
+            )
+            return
         self.record(".accepted-{}.json".format(digest), {
             "task": self.task,
             "digest": digest,
             "landed": landed,
             "child_task": child_task,
             "child_kind": message["child_kind"],
+            "child_task_generation": admitted.get("task_generation"),
             "project": project,
             "accepted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         })
         deliver_text(
             self.inbox, self.assignment,
-            "FIRSTMATE ACCEPTED your {} request ({}): child {} is queued on the local controller "
+            "FIRSTMATE ACCEPTED your {} request ({}): child {} is admitted on the local controller "
             "under this compartment's bounds. Its terminal status will arrive here.".format(
                 message["child_kind"], digest[:12], child_task),
         )
@@ -856,8 +1010,10 @@ class Relay:
             classification = self.child_classification(child_task)
             deliver_text(
                 self.inbox, self.assignment,
-                "CHILD {} is {}. Its landed commits, if any, are in this home's worktree; ask for "
-                "a delta bundle when you want them on the worker.".format(child_task, classification),
+                "CHILD {} is {}. Its code commits live in the project repository, which is NOT "
+                "the repository you hold; what can reach you is this home's own delta (its "
+                "report and home artifacts), which you can ask for with an attach request.".format(
+                    child_task, classification),
             )
             self.record(".status-{}.json".format(child_task), {
                 "child_task": child_task,
@@ -914,14 +1070,14 @@ class Relay:
             self.refuse(digest, landed, "attach refused: the delta commit count is not a number")
             return
         if commits == 0:
-            self.record(".accepted-{}.json".format(digest), {
-                "task": self.task, "digest": digest, "landed": landed,
-                "attach": "empty", "base": base,
-                "accepted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            })
+            # An empty delta SERVES NOTHING, so it records no acceptance and
+            # burns no attach_sequence: the compartment may ask again with the
+            # same number once its child's report has actually landed.
             deliver_text(
                 self.inbox, self.assignment,
-                "No delta to attach: this home's worktree holds no commits over the dispatched base.",
+                "No delta to attach: this home's worktree holds no commits over the dispatched "
+                "base, so attach_sequence {} is not spent and you may ask again with it.".format(
+                    message[ATTACH_REQUEST_COUNTED]),
             )
             return
         with tempfile.TemporaryDirectory(dir=str(self.childreq)) as scratch:
@@ -972,6 +1128,7 @@ class Relay:
             "task": self.task, "digest": digest, "landed": landed,
             "attach": receipt["blob_name"], "sha256": local_digest, "bytes": local_bytes,
             "commits": commits, "base": base,
+            ATTACH_REQUEST_COUNTED: message[ATTACH_REQUEST_COUNTED],
             "accepted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         })
         self.out.write(

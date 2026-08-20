@@ -198,10 +198,12 @@ reclaim_stale_leg() {  # <n> <current-assignment>
   result=$(leg_result "$n")
   [ -f "$marker" ] || return 0
   [ ! -s "$result" ] || return 0
-  # Portable epoch mtime, branched on uname like bin/fm-lock-lib.sh: GNU
-  # stat accepts `-f %m` without failing (it means something else), so the
-  # BSD-first fallback chain silently yields a non-numeric value on Linux
-  # and the staleness guard below would bail forever.
+  # Portable epoch mtime, branched on uname like bin/fm-lock-lib.sh. A
+  # BSD-first `stat -f %m || stat -c %Y` chain is broken on GNU: -f selects a
+  # filesystem-format mode taking no format operand, so %m becomes a second
+  # file operand, the filesystem block is printed into the captured
+  # substitution before the fallback runs, and the numeric guard below reads
+  # the mixture as "not a number" and bails forever.
   if [ "$(uname)" = Darwin ]; then
     mtime=$(stat -f %m "$marker" 2>/dev/null) || return 0
   else

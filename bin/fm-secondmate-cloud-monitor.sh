@@ -35,10 +35,11 @@
 #     without verifying, so it is driven from inside the helper, strictly
 #     after the local proof; a monotonicity refusal freezes the lane like a
 #     chain break, an already-released refusal closes the lane quietly only
-#     once the held tip is read back and found not to contradict this chain
-#     (the controller checks its release proof before its monotonicity rule,
-#     so a fork can arrive wearing the released string), and any other
-#     refusal warns and retries under backoff.
+#     once the held tip is read back and found both non-contradicting AND
+#     reproduced by this chain (the controller checks its release proof
+#     before its monotonicity rule, so a fork can arrive wearing the released
+#     string, and monotonicity alone never catches a divergence beneath the
+#     held tip), and any other refusal warns and retries under backoff.
 #   - CHILD RELAY: verified child-spawn and attach requests land under
 #     state/<id>.cloud-childreq/ and are validated, spent, or refused by
 #     bin/fm-secondmate-cloud-monitor.py child-relay (design B.5 steps 2-5).

@@ -51,10 +51,14 @@ A refusal from that command is a real signal and is split three ways:
     it is NOT taken at face value: the controller checks its release proof
     BEFORE its monotonicity block, so a released worker answers a genuine
     rewind or fork with this same string. The held tip is therefore read back
-    from the controller document and judged by the controller's own rule -
-    a contradiction freezes exactly as above, an unreadable document falls to
-    the retry class rather than closing, and only a tip that cannot contradict
-    this chain closes the lane durably and quietly;
+    from the controller document and judged by a rule STRICTLY STRONGER than
+    the controller's: the controller's monotonicity clause, plus the release
+    authority's own reproduction check, because a held tip below the proved
+    sequence passes monotonicity whatever its digest and would let a longer
+    chain that diverges beneath it close benignly. A contradiction freezes
+    exactly as above, an unreadable document falls to the retry class rather
+    than closing, and only a tip this chain both extends and reproduces closes
+    the lane durably and quietly;
   - anything else (not assigned, wrong assignment generation, an unreadable
     controller, an invocation failure) is about who owns the worker RIGHT NOW,
     changes between passes by design (a re-spawn mints a new assignment
@@ -596,22 +600,44 @@ def controller_worker_tip(controller, task, generation):
     return "tip", tip
 
 
-def chain_tip_forks(held, sequence, chain_digest):
-    """The controller's own monotonicity rule, applied to a tip read back here.
+def chain_tip_forks(held, sequence, chain_digest, verified):
+    """Can the held tip and the tip just proved describe ONE chain?
 
-    True when the held tip and the tip just proved cannot both describe one
-    chain: a rewind (the controller is past this sequence) or a fork (the same
-    sequence carrying a different digest).
+    True when they cannot. This is STRICTLY STRONGER than the controller's own
+    monotonicity block, deliberately: the read-back exists precisely because
+    the controller applies that block too late (after its release gate), and a
+    rule that only reproduces the controller's would inherit its blind spot.
+
+    Two clauses:
+      1. The controller's rule - a rewind (the record is past this sequence),
+         or the same sequence carrying a different digest.
+      2. REPRODUCTION, which the first clause misses entirely. A held tip
+         strictly BELOW the proved sequence passes clause 1 whatever its
+         digest, so a longer chain that diverges BENEATH the held tip was
+         never contradicted: prove it, get the released string, read back a
+         lower held sequence, and the forgery closes benignly and relays. The
+         proved chain must therefore REPRODUCE the held tip's digest at the
+         held tip's own sequence. That is not an invented rule - it is the
+         identical check bin/fm-worker-authority.py's secondmate_verified_chain
+         already applies before it will prove landing.
+
+    A held sequence that cannot be looked up in the proved chain (not a
+    positive integer, or past its end) cannot be reproduced, and an
+    unreproducible tip is never treated as agreement.
     """
     held_sequence = held.get("sequence")
     if isinstance(held_sequence, bool) or not isinstance(held_sequence, int):
-        return False
+        return True
     if sequence < held_sequence:
         return True
-    return sequence == held_sequence and held.get("chain_digest") != chain_digest
+    if sequence == held_sequence and held.get("chain_digest") != chain_digest:
+        return True
+    if not 1 <= held_sequence <= len(verified):
+        return True
+    return verified[held_sequence - 1][1].get("chain_digest") != held.get("chain_digest")
 
 
-def record_chain_tip(args, state, sequence, chain_digest, out):
+def record_chain_tip(args, state, sequence, chain_digest, verified, out):
     """Attest the JUST-VERIFIED chain tip onto the controller-owned worker record.
 
     Called only from command_process_mailbox, and only after verify_mailbox
@@ -710,15 +736,18 @@ def record_chain_tip(args, state, sequence, chain_digest, out):
         # RELEASED worker answers a genuine rewind or fork with this same
         # string. Closing on the string alone would let the one refusal class
         # that must freeze arrive dressed as the one that must not, so the
-        # held tip is read back and judged by the controller's own rule.
+        # held tip is read back and judged by chain_tip_forks - which also
+        # requires the proved chain to REPRODUCE a held tip below its own
+        # sequence, because the controller's rule alone never contradicts a
+        # longer chain that diverges beneath the held tip.
         verdict, held = controller_worker_tip(args.controller, args.task, args.task_generation)
-        if verdict == "tip" and chain_tip_forks(held, sequence, chain_digest):
+        if verdict == "tip" and chain_tip_forks(held, sequence, chain_digest, verified):
             state["chain_tip_error"] = {"check": detail, "observed_at": now, "fatal": True}
             return "freeze", (
                 "the released compartment worker holds chain tip {} which cannot be the tip this "
-                "monitor verified at sequence {} (the controller checks its release proof before "
-                "its monotonicity rule, so the fork arrived as: {})".format(
-                    held.get("sequence"), sequence, detail)
+                "monitor verified at sequence {}, and this chain does not reproduce it (the "
+                "controller checks its release proof before its monotonicity rule, so the fork "
+                "arrived as: {})".format(held.get("sequence"), sequence, detail)
             )
         if verdict == "unreadable":
             # Cannot prove agreement, so must not close: closing here would
@@ -729,8 +758,9 @@ def record_chain_tip(args, state, sequence, chain_digest, out):
                 "against sequence {})".format(detail, sequence)
             )
         else:
-            # Readable, and either no held tip or one this chain extends:
-            # nothing is left to attest and nothing is wrong.
+            # Readable, and either no held tip at all or one this chain both
+            # extends AND reproduces: nothing is left to attest, and nothing
+            # about the chain is in dispute.
             state["chain_tip_closed"] = {
                 "reason": detail, "closed_at": now,
                 "held_tip": held.get("sequence") if isinstance(held, dict) else None,
@@ -1635,7 +1665,7 @@ def command_process_mailbox(args, out):
     # disputes this chain, and a disputed chain relays nothing.
     if total > 0:
         verdict, reason = record_chain_tip(
-            args, state, total, verified[-1][1].get("chain_digest"), out)
+            args, state, total, verified[-1][1].get("chain_digest"), verified, out)
         if verdict == "freeze":
             chain_break_refuse(args.task, mailbox, reason, out)
             save_state(args.state_file, state)

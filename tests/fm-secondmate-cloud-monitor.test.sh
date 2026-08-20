@@ -962,24 +962,30 @@ run_helper_recording() {  # [assignment]
 # The tip an INDEPENDENT re-derivation of the collected mailbox proves,
 # computed from the chain contract itself rather than from anything the
 # monitor wrote, printed as "<sequence> <chain_digest>". This is the
-# ground truth every recorded tip below is compared against.
-mailbox_chain_tip() {
-  python3 - "$STATE_DIR/$ID.cloud-mailbox" <<'PY'
+# ground truth every recorded tip below is compared against. With an
+# argument it prints the chain state at THAT sequence instead of the last,
+# which is what a genuinely non-contradicting held tip has to carry.
+mailbox_chain_tip() {  # [sequence]
+  python3 - "$STATE_DIR/$ID.cloud-mailbox" "${1:-0}" <<'PY'
 import hashlib, json, pathlib, re, sys
 mailbox = pathlib.Path(sys.argv[1])
+want = int(sys.argv[2])
 entries = {}
 for path in sorted(mailbox.iterdir()):
     match = re.fullmatch(r"([0-9]{8})-([0-9a-f]{64})\.json", path.name)
     if match:
         entries[int(match.group(1))] = path
+total = len(entries)
+want = total if want <= 0 else want
+assert 1 <= want <= total or total == 0, "sequence {} is not in a {}-entry chain".format(want, total)
 chain = "0" * 64
-for sequence in range(1, len(entries) + 1):
+for sequence in range(1, want + 1):
     message = json.loads(entries[sequence].read_text(encoding="utf-8"))
     unsigned = {k: v for k, v in message.items() if k not in ("content_sha256", "chain_digest")}
     body = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     content = hashlib.sha256(body).hexdigest()
     chain = hashlib.sha256((chain + content).encode()).hexdigest()
-print("{} {}".format(len(entries), chain))
+print("{} {}".format(want if total else 0, chain))
 PY
 }
 
@@ -1049,25 +1055,37 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 }
 
-# build_real_controller <name> <assigned|released> <none|fork|clean>
+# build_real_controller <name> <assigned|released> <none|rewind|belowfork|clean>
 #
 # A REAL controller document for this compartment, minted through the real
 # lifecycle module's own environment()/empty_state() so load_state and
 # verify_state accept it. Prints the document path. <phase> sets the release
-# proof; <held> sets the tip the record already carries: "fork" is past this
-# chain's sequence (a rewind), "clean" is below it (an ordinary lag).
+# proof; <held> sets the tip the record already carries:
+#   none      - no tip at all
+#   rewind    - past this chain's sequence, which the controller's own
+#               monotonicity rule already calls a contradiction
+#   belowfork - BELOW this chain's sequence with a digest this chain does not
+#               reproduce: monotonicity alone accepts it, which is exactly the
+#               hole the reproduction check closes
+#   clean     - below this chain's sequence carrying the digest this chain
+#               ACTUALLY reproduces there, so it is genuinely non-contradicting
 build_real_controller() {
-  local name=$1 phase=$2 held=$3 home
+  local name=$1 phase=$2 held=$3 home reproduced
   home="$WORLD/$name-home"
   mkdir -p "$home/state/azure-workers"
+  # A "clean" control must be clean for the real reason: the held digest has
+  # to be the one the proved chain reproduces at that sequence, not merely a
+  # lower sequence number.
+  reproduced=$(mailbox_chain_tip 1)
+  reproduced=${reproduced##* }
   env FM_HOME="$home" FM_AZURE_SUBSCRIPTION_ID="$SUB" \
     FM_AZURE_DEPLOYMENT_GENERATION=dep-one FM_AZURE_OWNER_TAG=owner \
     FM_AZURE_NAMING_PREFIX=fmtest \
     python3 - "$ROOT/bin/fm-worker-lifecycle.py" "$home/state/azure-workers/controller.json" \
-    "$ID" "$GEN" "$ASSIGNMENT" "$phase" "$held" <<'PY' >/dev/null \
+    "$ID" "$GEN" "$ASSIGNMENT" "$phase" "$held" "$reproduced" <<'PY' >/dev/null \
     || fail "the real controller fixture could not be built"
 import importlib.util, json, sys
-module_path, out_path, task, generation, assignment, phase, held = sys.argv[1:]
+module_path, out_path, task, generation, assignment, phase, held, reproduced = sys.argv[1:]
 spec = importlib.util.spec_from_file_location("controller", module_path)
 controller = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(controller)
@@ -1084,10 +1102,13 @@ worker = {
 }
 if phase == "released":
     worker["release_proof"] = {"schema": "fm.worker-release/v2", "receipts": []}
-if held == "fork":
+if held == "rewind":
     worker["verified_chain_tip"] = {"sequence": 5, "chain_digest": "d" * 64}
-elif held == "clean":
+elif held == "belowfork":
     worker["verified_chain_tip"] = {"sequence": 1, "chain_digest": "d" * 64}
+elif held == "clean":
+    assert len(reproduced) == 64, "the clean control needs the digest this chain reproduces"
+    worker["verified_chain_tip"] = {"sequence": 1, "chain_digest": reproduced}
 state["workers"]["3"] = worker
 with open(out_path, "w", encoding="utf-8") as handle:
     json.dump(state, handle, sort_keys=True, separators=(",", ":"))
@@ -1332,7 +1353,7 @@ test_released_worker_holding_a_contradicting_tip_still_freezes() {
   # Classifying on the string alone would close the lane and keep relaying a
   # chain the controller's own record contradicts.
   local real_controller out
-  real_controller=$(build_real_controller tip-released-fork released fork)
+  real_controller=$(build_real_controller tip-released-fork released rewind)
   out=$(run_real_cli_recording "$real_controller")
   [ $? -eq 3 ] || fail "a released worker holding a contradicting tip did not freeze: $out"
   # The real CLI really did answer with the benign string, and the readback is
@@ -1348,13 +1369,46 @@ test_released_worker_holding_a_contradicting_tip_still_freezes() {
   pass "a released worker whose held tip contradicts this chain freezes, though the CLI calls it benign"
 }
 
+test_released_worker_holding_a_below_tip_fork_still_freezes() {
+  make_world tip-released-belowfork
+  verified_chain_of_two
+  # CASE E, which the controller's monotonicity rule alone NEVER catches: the
+  # held tip sits strictly BELOW the proved sequence, so no rewind and no
+  # same-sequence fork exists, and a longer chain that diverges BENEATH the
+  # held tip would be attested as an ordinary lagging record. Same
+  # preconditions as the rewind case (released worker, monitor state lost),
+  # and without the reproduction check the forgery closes benignly AND relays.
+  local real_controller out held
+  real_controller=$(build_real_controller tip-released-belowfork released belowfork)
+  held=$(mailbox_chain_tip 1)
+  [ "${held##* }" != "$(printf 'd%.0s' $(seq 1 64))" ] \
+    || fail "the below-tip control accidentally planted the digest this chain reproduces"
+  out=$(run_real_cli_recording "$real_controller")
+  [ $? -eq 3 ] || fail "a held tip below the proved sequence with a digest this chain does not reproduce was accepted: $out"
+  assert_contains "$out" "released work cannot record a compartment chain tip" \
+    "the real CLI did not produce the released refusal, so this no longer pins the ordering hole: $out"
+  assert_contains "$out" "does not reproduce it" "the freeze does not name the reproduction failure: $out"
+  assert_present "$STATE_DIR/$ID.cloud-mailbox/.chain-break" "the below-tip fork left no sticky marker"
+  assert_not_contains "$out" "chain turn" "a chain the held tip contradicts beneath the tip was relayed"
+  [ -z "$(monitor_state_field 'state["chain_tip_closed"]')" ] \
+    || fail "a below-tip fork closed the tip lane benignly"
+  [ "$(monitor_state_field 'state["delivered_sequence"]')" = 0 ] \
+    || fail "a below-tip fork advanced the delivered sequence"
+  pass "a held tip below the proved sequence that this chain does not reproduce freezes, not closes"
+}
+
 test_released_worker_with_no_contradicting_tip_closes_benignly() {
   make_world tip-released-clean
   verified_chain_of_two
-  # The same released refusal from the same real CLI, with a held tip this
-  # chain extends rather than contradicts: genuine end of life, no freeze.
-  local real_controller out
+  # The same released refusal from the same real CLI, with a GENUINELY
+  # non-contradicting held tip: below the proved sequence AND carrying the
+  # digest this chain actually reproduces there. A lower sequence number alone
+  # is not a clean control - that is the below-tip fork above.
+  local real_controller out held
   real_controller=$(build_real_controller tip-released-clean released clean)
+  held=$(mailbox_chain_tip 1)
+  assert_contains "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["workers"]["3"]["verified_chain_tip"]["chain_digest"])' "$real_controller")" \
+    "${held##* }" "the clean control does not carry the digest this chain reproduces at sequence 1"
   out=$(run_real_cli_recording "$real_controller") \
     || fail "a benign end-of-life refusal failed the pass: $out"
   assert_contains "$out" "chain tip recording is closed" "the benign close was not announced: $out"
@@ -2803,6 +2857,7 @@ test_monotonicity_refusal_freezes_the_lane_like_a_chain_break
 test_already_released_refusal_closes_the_tip_lane_benignly
 test_ownership_refusal_warns_backs_off_and_retries_without_freezing
 test_released_worker_holding_a_contradicting_tip_still_freezes
+test_released_worker_holding_a_below_tip_fork_still_freezes
 test_released_worker_with_no_contradicting_tip_closes_benignly
 test_unreadable_controller_never_closes_the_tip_lane
 test_monitor_pass_records_the_tip_end_to_end

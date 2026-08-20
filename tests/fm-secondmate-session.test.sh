@@ -36,6 +36,9 @@ fixture() {
 # Fixture pi: records each invocation's argv, then behaves per FM_FAKE_PI_MODE.
 set -u
 printf '%s\n' "$*" >> "$FM_FAKE_PI_LOG"
+if [ -n "${FM_FAKE_PI_ENVDUMP:-}" ]; then
+  printf '%s\n' "${PI_CODING_AGENT_DIR:-UNSET}" >> "$FM_FAKE_PI_ENVDUMP"
+fi
 last=
 for arg in "$@"; do last=$arg; done
 case "${FM_FAKE_PI_MODE:-reply}" in
@@ -250,7 +253,57 @@ assert len(names) == 1, names
 summary = json.loads((blob / "session" / "out" / names[0]).read_text())
 assert summary["reason"] == "wall", summary
 PY
+  # A leg above the pinned supervisor's wall ceiling refuses at configuration.
+  local rc=0 err
+  err=$(run_leg FM_SECONDMATE_LEG_SECONDS=21601 2>&1 >/dev/null) || rc=$?
+  expect_code 2 "$rc" "over-ceiling leg seconds must refuse"
+  assert_contains "$err" "leg seconds must be at most 21600" \
+    "over-ceiling refusal must name the supervisor wall ceiling"
   pass "an expiring leg exits 0 with a reason=wall summary before the hard timeout"
+}
+
+agent_dir_reaches_every_turn() {
+  fixture
+  put_inbox '{"kind":"fm.secondmate-message/v1","text":"who am i"}' >/dev/null
+  put_inbox '{"kind":"fm.secondmate-control/v1","action":"close"}' >/dev/null
+  # Default: the staged auth projection path, exactly as fm-spawn's cloud
+  # launch line and the D.1 gate set it.
+  run_leg FM_FAKE_PI_ENVDUMP="$TMP/envdump" >/dev/null 2>&1 \
+    || fail "agent-dir default leg did not exit cleanly"
+  test "$(cat "$TMP/envdump")" = "/mnt/account/pi-agent" \
+    || fail "pi did not observe the default PI_CODING_AGENT_DIR: $(cat "$TMP/envdump")"
+  # Override: the hermetic/agent-relocation lane.
+  put_inbox '{"kind":"fm.secondmate-message/v1","text":"who am i now"}' >/dev/null
+  put_inbox '{"kind":"fm.secondmate-control/v1","action":"close","nonce":"leg-2"}' >/dev/null
+  run_leg FM_FAKE_PI_ENVDUMP="$TMP/envdump2" FM_SECONDMATE_AGENT_DIR="$TMP/custom-agent" \
+    >/dev/null 2>&1 || fail "agent-dir override leg did not exit cleanly"
+  test "$(cat "$TMP/envdump2")" = "$TMP/custom-agent" \
+    || fail "pi did not observe the overridden PI_CODING_AGENT_DIR: $(cat "$TMP/envdump2")"
+  pass "every pi turn runs with PI_CODING_AGENT_DIR bound to the configured agent dir"
+}
+
+leading_dash_text_refused() {
+  fixture
+  # pi 0.84.1 rejects a '--' end-of-options separator (probed: "Unknown
+  # options: --, ..."), so text that could parse as a pi flag must refuse
+  # loudly and never reach the agent argv.
+  put_inbox '{"kind":"fm.secondmate-message/v1","text":"--exclude-tools"}' >/dev/null
+  put_inbox '{"kind":"fm.secondmate-message/v1","text":"a safe message"}' >/dev/null
+  put_inbox '{"kind":"fm.secondmate-control/v1","action":"close"}' >/dev/null
+  run_leg >/dev/null 2>&1 || fail "dash-refusal leg did not exit cleanly"
+  test "$(wc -l < "$TURN_LOG" | tr -d ' ')" = 1 || fail "expected exactly one pi turn"
+  assert_no_grep "--exclude-tools" "$TURN_LOG" "dash text must never reach the pi argv"
+  python3 - "$BLOB" <<'PY' || fail "dash refusal message missing"
+import json, pathlib, sys
+blob = pathlib.Path(sys.argv[1])
+checks = []
+for path in sorted((blob / "session" / "out").iterdir()):
+    message = json.loads(path.read_text())
+    if message["kind"] == "fm.secondmate-refusal/v1":
+        checks.append(message["check"])
+assert any("begins with '-' and cannot ride the pi argv" in check for check in checks), checks
+PY
+  pass "leading-dash message text refuses loudly and never reaches the pi argv"
 }
 
 wall_defers_unstarted_turn() {
@@ -518,7 +571,9 @@ for forbidden in ("http://", "https://", "blob.core.windows.net", "child_process
 # weakens the chain-break refusal into a skip.
 for marker in ("outside the session/ namespace", "outbox chain is broken",
                "SECONDMATE SESSION REFUSED: ", 'GENESIS_CHAIN_DIGEST = "0" * 64',
-               "x-ms-blob-type", "2021-08-06", "Metadata"):
+               "x-ms-blob-type", "2021-08-06", "Metadata",
+               "PI_CODING_AGENT_DIR", "MAX_LEG_SECONDS = 6 * 60 * 60",
+               "cannot ride the pi argv"):
     assert marker in runner, marker
 PY
   pass "extension does spool-only I/O and the runner pins its refusal strings"
@@ -530,6 +585,8 @@ chain_tamper_refuses
 idle_exit_emits_summary
 close_control_exits
 wall_exit_before_hard_timeout
+agent_dir_reaches_every_turn
+leading_dash_text_refused
 wall_defers_unstarted_turn
 child_intent_round_trip
 invalid_intent_refused_not_emitted

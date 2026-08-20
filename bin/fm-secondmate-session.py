@@ -27,9 +27,29 @@ direct invocation and the hermetic tests can use either):
   --blob-dir              FM_SECONDMATE_BLOB_DIR          dir backend (fixtures)
   --pi-bin                FM_SECONDMATE_PI_BIN            default pi
   --pi-ext                FM_SECONDMATE_PI_EXT            staged extension path
+  --agent-dir             FM_SECONDMATE_AGENT_DIR         default /mnt/account/pi-agent
   --poll-seconds          FM_SECONDMATE_POLL_SECONDS      default 10, floor 5
   --idle-seconds          FM_SECONDMATE_IDLE_SECONDS      default 7200
-  --leg-seconds           FM_SECONDMATE_LEG_SECONDS       default 14400
+  --leg-seconds           FM_SECONDMATE_LEG_SECONDS       default 14400, ceiling 21600
+
+Every pi turn runs with PI_CODING_AGENT_DIR set to the configured agent
+directory: the supervisor's scrubbed environment drops the variable, and
+without it pi would root its agent state at $HOME/.pi/agent instead of the
+staged auth projection at /mnt/account/pi-agent (the D.1 gate ran with it
+set, and fm-spawn.sh's cloud launch line sets it explicitly).
+
+Captain message text that begins with '-' is refused with a loud refusal
+outbox message rather than passed to pi: pi 0.84.1 does NOT honor a '--'
+end-of-options separator (probed 2026-08-20: `pi --print -- "--x"` fails
+with "Unknown options: --, --x"), so a leading-dash prompt argv could be
+parsed as a pi flag and is never sent.
+
+Monitor contract (PR 4): the supervisor `wall_seconds` for a leg dispatch
+must be at least leg_seconds plus the finish-leg budget - the leg-end
+bundling and summary run AFTER the internal wall-margin exit and can spend
+up to GIT_BUNDLE_TIMEOUT (600s) + BLOB_PUT_TIMEOUT (600s) beyond the capped
+300-second margin. --leg-seconds itself is refused above 21600, the pinned
+supervisor's MAX_WALL_SECONDS.
 
 Backend selection: FM_SECONDMATE_BLOB_DIR / --blob-dir selects the local
 directory backend the hermetic tests drive; otherwise the IMDS backend needs
@@ -111,7 +131,11 @@ DEFAULT_POLL_SECONDS = 10
 FLOOR_POLL_SECONDS = 5
 DEFAULT_IDLE_SECONDS = 7200
 DEFAULT_LEG_SECONDS = 14400
+# The pinned supervisor's MAX_WALL_SECONDS: a leg longer than the guest wall
+# ceiling could never exit cleanly, so it refuses here at configuration time.
+MAX_LEG_SECONDS = 6 * 60 * 60
 WALL_MARGIN_CEILING_SECONDS = 300
+DEFAULT_AGENT_DIR = "/mnt/account/pi-agent"
 
 GENESIS_CHAIN_DIGEST = "0" * 64
 HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -640,6 +664,15 @@ class SessionRunner:
         if kind == MESSAGE_KIND:
             if not self.validate_closed(message, digest_hex, ("text",), ()):
                 return True
+            if message["text"].startswith("-"):
+                # pi 0.84.1 rejects a '--' end-of-options separator, so a
+                # leading-dash prompt argv could be parsed as a pi flag.
+                # Refused loudly, never silently reshaped or passed through.
+                self.refuse_input(
+                    digest_hex,
+                    "message text begins with '-' and cannot ride the pi argv",
+                )
+                return True
             return self.agent_turn(message["text"])
         if kind == CONTROL_KIND:
             if not self.validate_closed(message, digest_hex, ("action",), ()):
@@ -719,6 +752,10 @@ class SessionRunner:
         argv.append(text)
         env = dict(os.environ)
         env["FM_SECONDMATE_SPOOL_DIR"] = str(self.state.spool_dir)
+        # The supervisor's scrubbed environment drops PI_CODING_AGENT_DIR;
+        # without it pi roots agent state at $HOME/.pi/agent instead of the
+        # staged auth projection, and every turn fails authentication.
+        env["PI_CODING_AGENT_DIR"] = self.config["agent_dir"]
         try:
             completed = subprocess.run(
                 argv, cwd=str(self.repo), env=env,
@@ -958,6 +995,9 @@ def build_config(args):
         )
     config["pi_bin"] = flag_or_env(args, "pi_bin", "FM_SECONDMATE_PI_BIN", "pi")
     config["pi_ext"] = flag_or_env(args, "pi_ext", "FM_SECONDMATE_PI_EXT")
+    config["agent_dir"] = flag_or_env(
+        args, "agent_dir", "FM_SECONDMATE_AGENT_DIR", DEFAULT_AGENT_DIR
+    )
     config["poll_seconds"] = max(
         positive_int(
             flag_or_env(args, "poll_seconds", "FM_SECONDMATE_POLL_SECONDS", DEFAULT_POLL_SECONDS),
@@ -973,6 +1013,10 @@ def build_config(args):
         flag_or_env(args, "leg_seconds", "FM_SECONDMATE_LEG_SECONDS", DEFAULT_LEG_SECONDS),
         "leg seconds", floor=2,
     )
+    if config["leg_seconds"] > MAX_LEG_SECONDS:
+        raise SessionError(
+            "leg seconds must be at most {} (the supervisor wall ceiling)".format(MAX_LEG_SECONDS)
+        )
     if not Path(config["repo_dir"]).is_dir():
         raise SessionError("session repository is unavailable: {}".format(config["repo_dir"]))
     return config
@@ -991,6 +1035,7 @@ def main():
     parser.add_argument("--container", default=None)
     parser.add_argument("--pi-bin", default=None)
     parser.add_argument("--pi-ext", default=None)
+    parser.add_argument("--agent-dir", default=None)
     parser.add_argument("--poll-seconds", default=None)
     parser.add_argument("--idle-seconds", default=None)
     parser.add_argument("--leg-seconds", default=None)

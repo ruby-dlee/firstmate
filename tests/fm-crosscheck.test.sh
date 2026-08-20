@@ -2207,8 +2207,11 @@ assert run["state"] == "tool-failure"
 assert run["head_sha"] == sys.argv[2]
 # A failure before launch must record the reviewer identity and nothing else;
 # the author account id carried for the launch check is not reviewer identity.
-assert set(run["reviewer"]) == {"harness", "model", "effort", "account_home"}, \
-    run["reviewer"]
+# The review-family provenance is reviewer identity and stays durable even on
+# a pre-launch failure.
+assert set(run["reviewer"]) == {
+    "harness", "model", "effort", "account_home", "review_family_mode",
+}, run["reviewer"]
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" "$head" \
     || fail "the exact-head fetch failure was not durably classified as a tool failure"
   pass "an absent remote PR head ref fails closed before review"

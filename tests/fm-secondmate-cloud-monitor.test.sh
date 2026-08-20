@@ -218,13 +218,13 @@ PY
 }
 
 MONITOR_PID=
-start_monitor() {  # [VAR=value ...]
+start_monitor() {
   perl -e 'alarm 90; exec @ARGV or die "exec failed: $!"' -- \
     env FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$STATE_DIR" \
     FM_SECONDMATE_LIFECYCLE_BIN="$LIFECYCLE_FIXTURE" \
     FM_SECONDMATE_MONITOR_INTERVAL_SECONDS=1 \
     FM_FIXTURE_LIFECYCLE_LOG="$LC_LOG" FM_FIXTURE_STORE="$STORE" \
-    "$@" "$MONITOR" "$ID" "$GEN" >> "$PANE_LOG" 2>&1 &
+    "$MONITOR" "$ID" "$GEN" >> "$PANE_LOG" 2>&1 &
   MONITOR_PID=$!
 }
 
@@ -255,7 +255,18 @@ wait_for() {  # <description> <check-command...>
 grep_lc() { grep -c "$1" "$LC_LOG" 2>/dev/null | tr -d '[:space:]'; }
 
 both_envelopes_relayed() {
-  [ "$(ls "$STATE_DIR/$ID.cloud-inbox/.relayed" 2>/dev/null | wc -l | tr -d '[:space:]')" -ge 2 ]
+  [ "$(find "$STATE_DIR/$ID.cloud-inbox/.relayed" -type f 2>/dev/null | wc -l | tr -d '[:space:]')" -ge 2 ]
+}
+
+first_matching() {  # <dir> <glob> - first matching basename, empty if none
+  local match
+  for match in "$1"/$2; do
+    if [ -e "$match" ]; then
+      printf '%s\n' "${match##*/}"
+      return 0
+    fi
+  done
+  printf '\n'
 }
 
 lc_line() {  # <n> - nth lifecycle invocation, unit separators shown as \x1f
@@ -398,7 +409,7 @@ test_dropped_blob_refuses_whole_mailbox_and_freezes_relay() {
   run_guest_leg >/dev/null 2>&1 || fail "guest leg did not exit cleanly"
   # Drop the MIDDLE chain entry from the store before any collection.
   local middle
-  middle=$(ls "$STORE/session/out" | grep '^00000002-' | head -1)
+  middle=$(first_matching "$STORE/session/out" '00000002-*.json')
   [ -n "$middle" ] || fail "fixture outbox lacks a second entry"
   rm "$STORE/session/out/$middle"
   # A pending captain envelope proves the inbound freeze.
@@ -421,7 +432,8 @@ PY
   assert_no_grep 'canned-reply:turn two' "$PANE_LOG" "a broken mailbox relayed a message"
   [ "$(grep_lc $'^message-put\x1f')" = 0 ] || fail "inbound relay ran after a chain break (must freeze both directions)"
   # Files retained, nothing deleted.
-  [ -n "$(ls "$STATE_DIR/$ID.cloud-mailbox" | grep '^00000001-')" ] || fail "mailbox files were not retained after the break"
+  [ -n "$(first_matching "$STATE_DIR/$ID.cloud-mailbox" '00000001-*.json')" ] \
+    || fail "mailbox files were not retained after the break"
   # The marker is sticky: a fresh monitor refuses again without new evidence.
   : > "$PANE_LOG"
   start_monitor
@@ -480,7 +492,8 @@ test_bundle_kept_when_worktree_dirty() {
   wait_for "kept-for-manual-landing report" grep -q 'kept at .* for manual landing' "$PANE_LOG"
   stop_monitor
   [ "$(git -C "$LANDING" rev-parse HEAD)" = "$BASE" ] || fail "a dirty worktree was mutated by bundle landing"
-  [ -n "$(ls "$STATE_DIR/$ID.cloud-mailbox" | grep '^bundle-')" ] || fail "the kept bundle is not retained in the mailbox"
+  [ -n "$(first_matching "$STATE_DIR/$ID.cloud-mailbox" 'bundle-*.bundle')" ] \
+    || fail "the kept bundle is not retained in the mailbox"
   pass "a dirty home worktree keeps the bundle and reports its path instead of landing"
 }
 
@@ -609,7 +622,7 @@ PY
   # never a silent dedupe of a repeated captain instruction.
   out=$(run_send "$SEND_FB" "$SEND_HOME" "$SEND_LOG" fm-domain 'audit the build')
   expect_code 0 $? "second cloud secondmate send should succeed: $out"
-  [ "$(ls "$inbox" | grep -c '^00000002-')" = 1 ] || fail "a repeated send did not claim the next sequence"
+  [ -n "$(first_matching "$inbox" '00000002-*.json')" ] || fail "a repeated send did not claim the next sequence"
   # --key has no composer to press.
   out=$(run_send "$SEND_FB" "$SEND_HOME" "$SEND_LOG" fm-domain --key Enter)
   rc=$?
@@ -639,7 +652,7 @@ test_fm_send_cloud_secondmate_without_assignment_refuses() {
   [ "$rc" -ne 0 ] || fail "an unassigned compartment send must refuse (no generation to fence): $out"
   assert_contains "$out" "no worker assignment yet" "the unassigned refusal did not explain itself: $out"
   [ ! -e "$SEND_HOME/state/domain.cloud-inbox" ] \
-    || [ -z "$(ls "$SEND_HOME/state/domain.cloud-inbox" 2>/dev/null | grep -v '^\.')" ] \
+    || [ -z "$(first_matching "$SEND_HOME/state/domain.cloud-inbox" '[0-9]*.json')" ] \
     || fail "an unfenced envelope was written despite the refusal"
   pass "fm-send refuses a cloud secondmate send that cannot be generation-fenced"
 }
@@ -981,7 +994,7 @@ test_spawn_gate_off_flag_is_byte_identical() {
 }
 
 test_spawn_gate_on_flag_routes_compartment_and_never_executes() {
-  local out rc meta assignment
+  local out rc meta
   setup_spawn_world on-flag helm
   out=$(run_gate_spawn helm \
     FM_SPAWN_CLOUD=azure FM_SPAWN_SECONDMATE_CLOUD=1 \

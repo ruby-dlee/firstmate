@@ -39,6 +39,12 @@ export FM_GATE_REFUSE_BYPASS=1
 # shellcheck disable=SC2034
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# The host-capability gate (fm_require_host_capability). Test files that do not
+# source this library source tests/host-capability-gate.sh directly; it is
+# idempotent either way.
+# shellcheck source=tests/host-capability-gate.sh
+. "$(dirname "${BASH_SOURCE[0]}")/host-capability-gate.sh"
+
 # --- reporters --------------------------------------------------------------
 
 fail() {

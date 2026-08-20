@@ -17,6 +17,14 @@ if [ "${1:-}" = --skip-herdr ]; then
 fi
 
 python3 "$SEAL" verify || exit $?
+
+# A host that declares itself unable to provide a sealed-suite capability says so
+# once per invocation, before any test runs. The per-unit FM_HOST_CAPABILITY_SKIP
+# lines are the detail; this is the header that makes a reduced run impossible to
+# read as a full one.
+if [ -n "${FM_TEST_HOST_CAPABILITIES_ABSENT:-}" ]; then
+  printf 'FM_HOST_CAPABILITY_DECLARATION absent=%s\n' "$FM_TEST_HOST_CAPABILITIES_ABSENT"
+fi
 if [ "$#" -eq 0 ]; then
   set -- "$TEST_DIR"/*.test.sh
 fi

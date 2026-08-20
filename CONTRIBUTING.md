@@ -95,6 +95,7 @@ Run the suites from a checkout sitting on its default branch, not from a task-br
 Do not bypass `tests/run.sh` for real-Herdr suites: their declarations require the runner to provision a never-default lab, route every Herdr call through the lab helper, and verify the before/after default-fleet tripwire.
 Direct execution is safe because the test header immediately re-enters the same runner before its body.
 Other tests that need a real optional backend, an explicit opt-in, or an ambient toolchain capability (real zellij/cmux smoke tests, the live Pi regression, the Pi TypeScript-extension checks when node cannot import `.ts` modules directly) skip themselves and print the tool or environment gate needed to enable them.
+Units that need a host capability some sealed-suite host genuinely cannot provide go through `tests/host-capability-gate.sh` and are declared in `tests/host-capabilities.tsv` instead: that gate reads the platform and an explicit by-name declaration the environment makes about itself, never a probe of the capability, so a merely broken host still goes red. See [`docs/test-isolation.md`](docs/test-isolation.md).
 
 ## Questions
 

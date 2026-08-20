@@ -33,6 +33,18 @@ SAFE_CELL = re.compile(r"^azv-[a-z0-9]{12}$")
 SAFE_PUBLIC_REMOTE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?$")
 SHA = re.compile(r"^[0-9a-f]{40,64}$")
 MAX_ARCHIVE = 1024**3
+# The cell declares, BY NAME, the sealed-suite host capabilities its shard
+# workers cannot provide. Measured on the first live cell (azv-36b2726cbcf3,
+# 2026-08-20): the shard worker has no tmux server it can create windows in, no
+# passwordless sudo or systemd-run, and no /usr/bin/cpp to derive SYS_openat
+# from. tests/host-capability-gate.sh turns each name into a LOUD skip of the
+# exact units bound to it in tests/host-capabilities.tsv; nothing else changes,
+# and no other host is affected. Keep this string byte-identical to the copy in
+# bin/fm-azure-validation.py, which refuses any shard command that differs.
+CELL_HOST_CAPABILITY_DECLARATION = (
+    "FM_TEST_HOST_CAPABILITIES_ABSENT="
+    "real-tmux-server,passwordless-root-escalation,system-openat-binding"
+)
 MAX_WAIT_SECONDS = 4 * 3600
 
 
@@ -216,7 +228,9 @@ def submit_requests(environment, kind, count, command):
         if kind == "behavior":
             argv = [
                 "bin/fm-azure-runner-command.sh", "bash", "-c",
-                "FM_TEST_SKIP_HERDR=1 bin/fm-behavior-shards.sh --run {} {} results/executed-{}.tsv".format(shard, count, shard),
+                "{} FM_TEST_SKIP_HERDR=1 bin/fm-behavior-shards.sh --run {} {} results/executed-{}.tsv".format(
+                    CELL_HOST_CAPABILITY_DECLARATION, shard, count, shard
+                ),
             ]
             artifacts = ["results/executed-{}.tsv".format(shard)]
             resource_class = "behavior-heavy"

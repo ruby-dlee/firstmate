@@ -144,6 +144,31 @@ neither is the receipts strand:
    approval markers), alongside 377 passing units. Until those units skip loudly off macOS, no
    intent reaches a green test step here.
 
+   Partially closed. The retained shard responses under
+   `$FM_HOME/state/azure-validation/shards/azv-36b2726cbcf3/*/response/` are the measurement, and
+   they name eleven failing test files, not three. Three classes are genuine host capabilities the
+   cell does not have, and those are now gated: a real tmux server it can create windows in
+   (`server exited unexpectedly` on the shard-2 and shard-4 workers), passwordless sudo with
+   `systemd-run` (`Linux systemd integration requires passwordless sudo`), and the `/usr/bin/cpp`
+   binding `bin/fm-account-directory.sh` needs before it can validate any Claude quota-axi
+   Keychain approval marker (`system openat binding unavailable`). Fifteen units across six test
+   files are bound to those three capabilities in `tests/host-capabilities.tsv`; the cell declares
+   the three absences by name in `bin/fm-azure-validation-shard-bridge.py`, and
+   `tests/host-capability-gate.sh` turns each into a loud `FM_HOST_CAPABILITY_SKIP`. The gate
+   refuses that declaration on Darwin, so macOS coverage is unchanged and cannot be switched off,
+   and CI declares nothing, so its coverage is unchanged too.
+
+   The other five failing files are NOT host-capability skips and are deliberately left red,
+   because a skip there would hide a real defect rather than an absent capability:
+   `fm-session-start` (its ordering unit forces a `MISSING: node` diagnostic by deleting a fakebin
+   `node`, which does nothing on a host that has `/usr/bin/node`, as the cell and any nodesource
+   Ubuntu do); `fm-teardown-a` and `fm-teardown-b` (`secondmate home upstream probe cleanup is
+   unverified`, a process-tree cleanup verification that also fails on an unrelated Linux
+   container, so its cause is not the cell); `fm-watcher-lock` (exit 124, a timeout, next to
+   `Killed` lines in the same shard log, so cell capacity rather than capability); and
+   `fm-pi-watch-extension`. Until those four are diagnosed and fixed on their own merits, a cell
+   run still cannot reach a green test step.
+
 So the receipts fix is exercised live up to the gate, which is exactly what used to be
 impossible, and `close` stays unproven: the acceptance sentence below is not yet met.
 

@@ -275,6 +275,27 @@ for sequence in (1, 2):
     (mailbox / "{:08d}-{}.json".format(sequence, "b" * 64)).write_text('{"kind":"noise"}')
 expect(lambda: landing(), "content differs from its content address")
 
+# F2, SOPHISTICATED: the same junk, but with every self-consistency field
+# filled in to match its own filename - content_sha256 equal to the name
+# digest, a correctly extended chain_digest, and the right sequence. Every
+# check EXCEPT recomputing SHA-256 over the body passes here, so this is what
+# isolates content verification from the cheaper self-reference checks.
+value = honest()
+value["landed_bundles"] = []
+put_state(value)
+wipe_mailbox()
+chain = "0" * 64
+for sequence in (1, 2):
+    name_digest = "{:062x}{:02x}".format(0xB, sequence)
+    chain = hashlib.sha256((chain + name_digest).encode()).hexdigest()
+    (mailbox / "{:08d}-{}.json".format(sequence, name_digest)).write_text(
+        json.dumps({"kind": "noise", "sequence": sequence,
+                    "content_sha256": name_digest, "chain_digest": chain},
+                   sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+expect(lambda: landing(), "content differs from its content address")
+put_state(saved)
+restore_mailbox()
+
 # F3: the type guards failed OPEN - a string or negative sequence coerced to 0.
 for forged in ("2", -1, 2.0, None, True):
     value = honest()

@@ -467,6 +467,8 @@ test_meter_accumulates_and_bound_reached_replies() {
   assert_contains "$RUN_MENTION_OUTPUT" "action: budget-refused" "budget bound was not enforced"
   reply=$(last_post_text)
   assert_contains "$reply" "Daily crosscheck budget reached" "bound-reached reply missing"
+  # The dollars below are literal money, not expansions.
+  # shellcheck disable=SC2016
   assert_contains "$reply" '$7.00 of $5.00' "bound-reached reply did not state the totals"
 
   after=$(fixture_run_count)

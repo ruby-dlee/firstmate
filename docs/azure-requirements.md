@@ -178,9 +178,9 @@ verdict this lane has produced came from the pi-codex fallback reviewer.
 
 The roster was GLM-only when those attempts ran. As of 2026-08-20 it is not: the operator restored
 the pi-codex fallback entries alongside GLM with `config/crosscheck-same-model` on, the sanctioned
-degraded mode while GLM is quota-blocked, so crosscheck can return verdicts again. It returns them
-from the fallback, which means codex-authored work is being reviewed by its own family again for
-the duration, exactly the degradation this requirement exists to remove.
+degraded mode while GLM cannot finish a review, so crosscheck can return verdicts again. It returns
+them from the fallback, which means codex-authored work is being reviewed by its own family again
+for the duration, exactly the degradation this requirement exists to remove.
 
 The deployment carries two per-minute limits, not one: 25,000 tokens and 25 requests (`FW-GLM-5.2`,
 DataZoneStandard, capacity 25). The 429 body names neither, reading only that requests to

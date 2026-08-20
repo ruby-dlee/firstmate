@@ -644,6 +644,401 @@ test_fm_send_cloud_secondmate_without_assignment_refuses() {
   pass "fm-send refuses a cloud secondmate send that cannot be generation-fenced"
 }
 
+# --- fm-spawn gate: FM_SPAWN_SECONDMATE_CLOUD -----------------------------------
+#
+# A REAL seeded secondmate home (bin/fm-home-seed.sh against an isolated
+# default-branch copy of this repo), a real fm-spawn, the fake herdr/tmux
+# backends, and the same hermetic provider protocol fixture the
+# fm-spawn-cloud suite drives. Off-flag behavior must match main's gate
+# byte-for-byte (the exact notice string, local backend, no cloud metadata,
+# no controller state); on-flag routes the spawn through queue request
+# (role=secondmate), reconcile, and the compartment monitor launch - and
+# never dispatches an execute itself.
+
+SPAWN="$ROOT/bin/fm-spawn.sh"
+# shellcheck source=tests/secondmate-helpers.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/secondmate-helpers.sh"
+
+GATE_NOTICE='notice: cloud placement covers new ship/scout spawns only; this spawn stays on the local backend'
+
+SPAWN_PRIMARY_ROOT=
+make_primary_root() {
+  [ -z "$SPAWN_PRIMARY_ROOT" ] || return 0
+  SPAWN_PRIMARY_ROOT="$TMP_ROOT/primary-root"
+  git init -q -b main "$SPAWN_PRIMARY_ROOT"
+  git -C "$SPAWN_PRIMARY_ROOT" fetch -q --no-tags "$ROOT" HEAD
+  git -C "$SPAWN_PRIMARY_ROOT" reset -q --hard FETCH_HEAD
+}
+
+write_role_fixture_provider() {
+  cat >"$1" <<'PY'
+#!/usr/bin/env python3
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+
+path = Path(os.environ["FIXTURE_STATE"])
+request = json.load(sys.stdin)
+controller = request["controller"]
+if path.exists():
+    state = json.loads(path.read_text())
+else:
+    state = {
+        "workers": {}, "seen": {}, "calls": [],
+        "metrics": {
+            "actual_usd": float(os.environ.get("FM_TEST_ACTUAL_USD", "100")),
+            "forecast_usd": float(os.environ.get("FM_TEST_FORECAST_USD", "150")),
+        },
+    }
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+def tags(action):
+    bindings = action["bindings"]
+    base = {
+        "workload": "firstmate",
+        "deployment-generation": action["deployment_generation"], "cleanup-owner": action["owner"],
+        "worker-slot": str(action["slot"]), "home-binding": bindings["home_binding"],
+        "task-binding": bindings["task"], "task-generation": bindings["task_generation"],
+        "assignment-generation": bindings["assignment_generation"],
+        "account-binding": bindings["account_binding"], "worktree-binding": bindings["worktree_binding"],
+        "repository-binding": bindings["repository_binding"],
+        "repository-generation": bindings["repository_generation"],
+        "nested-team": "forbidden", "browser-profile": "forbidden",
+    }
+    if action.get("role") == "secondmate":
+        base.update({
+            "firstmate-role": "secondmate-compartment",
+            "agent-capacity": "one-home-scoped-secondmate",
+            "child-launcher": "absent",
+        })
+    else:
+        base.update({
+            "firstmate-role": "worker",
+            "agent-capacity": "one-task-scoped-crewmate",
+            "secondmate-placement": "forbidden",
+        })
+    return base
+
+def resource(action, kind, serial=None):
+    serial = serial or "{}-{}".format(action["cloud_generation"], action["idempotency_key"][:8])
+    return {
+        "id": "/fixture/slot/{}/{}".format(action["slot"], kind),
+        "immutable_id": "{}-{}".format(kind, serial), "etag": "etag-{}".format(serial),
+        "tags": tags(action),
+    }
+
+def complete_worker(action):
+    resources = {}
+    for kind in (
+        "vm", "nic", "os-disk", "task-disk", "account-disk", "identity", "role-assignment",
+        "state-container", "monitor-extension", "bootstrap-command", "task-command", "ttl-schedule",
+        "global-reservation", "staging-request", "staging-result",
+    ):
+        resources[kind] = resource(action, kind)
+    resources["vm"]["power_state"] = "VM running"
+    resources["nic"]["attached_to"] = resources["vm"]["id"]
+    for kind in ("os-disk", "task-disk", "account-disk"):
+        resources[kind]["attached_to"] = resources["vm"]["id"]
+    for kind in ("monitor-extension", "bootstrap-command", "task-command", "ttl-schedule"):
+        resources[kind]["attached_to"] = resources["vm"]["id"]
+    for kind in ("monitor-extension", "bootstrap-command", "task-command"):
+        resources[kind]["provisioning_state"] = "Succeeded"
+    resources["ttl-schedule"].update({"status": "Enabled", "deadline": "2300"})
+    for kind in ("global-reservation", "staging-request", "staging-result"):
+        resources[kind].update({"digest": "f" * 64, "length": 1})
+    return {"slot": action["slot"], "resources": resources}
+
+def save():
+    path.write_text(json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n")
+
+if request["operation"] == "mutate":
+    action = request["action"]
+    key = action["idempotency_key"]
+    state["calls"].append({"type": action["type"], "slot": action["slot"], "key": key})
+    if key in state["seen"]:
+        result = state["seen"][key]
+    else:
+        slot = str(action["slot"])
+        kind = action["type"]
+        if kind == "create":
+            assert slot not in state["workers"]
+            worker = complete_worker(action)
+            state["workers"][slot] = worker
+            result = {"idempotency_key": key, "action": kind, "worker": worker}
+        else:
+            raise AssertionError("unexpected mutation for a compartment spawn: " + kind)
+        state["seen"][key] = result
+    save()
+else:
+    active = sum(
+        1 for worker in state["workers"].values()
+        if "vm" in worker["resources"] and "deallocated" not in worker["resources"]["vm"].get("power_state", "").lower()
+    )
+    metrics = {
+        "actual_usd": state["metrics"]["actual_usd"],
+        "forecast_usd": state["metrics"]["forecast_usd"],
+        "regional_limit_vcpus": 128, "regional_used_vcpus": 2 + 4 * active,
+        "specialized_active_vcpus": 0, "specialized_active_by_family": {},
+        "family_limit_vcpus": {}, "family_used_vcpus": {},
+        "family_free_vcpus": {}, "sku_hourly_usd": {},
+    }
+    plan = {
+        1:("Standard_D4as_v6","standardDav6Family"),2:("Standard_D4as_v6","standardDav6Family"),
+        3:("Standard_D4as_v7","StandardDasv7Family"),4:("Standard_D4as_v7","StandardDasv7Family"),
+        5:("Standard_D4s_v6","StandardDsv6Family"),6:("Standard_D4s_v6","StandardDsv6Family"),
+        7:("Standard_D4ads_v7","StandardDadsv7Family"),8:("Standard_D4ads_v7","StandardDadsv7Family"),
+        9:("Standard_D4ads_v6","standardDadv6Family"),10:("Standard_D4ads_v6","standardDadv6Family"),
+        11:("Standard_E4as_v7","StandardEasv7Family"),12:("Standard_E4as_v7","StandardEasv7Family"),
+        13:("Standard_E4as_v6","standardEav6Family"),14:("Standard_E4as_v6","standardEav6Family"),
+        15:("Standard_D4ds_v6","StandardDdsv6Family"),16:("Standard_D4ds_v6","StandardDdsv6Family"),
+    }
+    for sku, family in plan.values():
+        metrics["family_limit_vcpus"][family] = 10
+        metrics["family_used_vcpus"][family] = 0
+        metrics["family_free_vcpus"][family] = 10
+        metrics["sku_hourly_usd"][sku] = 0.25
+    inventory = {
+        "schema": "fm.worker-provider-inventory/v1", "observed_at": "2026-01-01T00:00:00Z",
+        "workers": [state["workers"][key] for key in sorted(state["workers"], key=int)],
+        "capacity_reservations": [], "conflicts": [], "metrics": metrics,
+    }
+    result = inventory
+
+response = {
+    "schema": "fm.worker-provider-response/v1", "operation": request["operation"],
+    "controller": controller,
+}
+response["result" if request["operation"] == "mutate" else "inventory"] = result
+print(json.dumps(response, sort_keys=True, separators=(",", ":")))
+PY
+  chmod +x "$1"
+}
+
+write_fake_herdr() {  # <fakebin>
+  local fakebin=$1
+  cat > "$fakebin/herdr" <<'SH'
+#!/usr/bin/env bash
+set -u
+LOG="${FM_HERDR_LOG:?}"
+STATE="${FM_FAKE_HERDR_STATE:?}"
+{
+  printf 'HERDR_SESSION=%s' "${HERDR_SESSION:-}"
+  for a in "$@"; do printf '\x1f%s' "$a"; done
+  printf '\n'
+} >> "$LOG"
+
+jq_state() { jq "$@" "$STATE"; }
+save() { local tmp="$STATE.tmp.$$"; cat > "$tmp" && mv "$tmp" "$STATE"; }
+
+cmd=${1:-}; sub=${2:-}
+ws=""; label=""; tab=""
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    --workspace) ws=${args[$((i+1))]:-} ;;
+    --label) label=${args[$((i+1))]:-} ;;
+    --tab) tab=${args[$((i+1))]:-} ;;
+  esac
+done
+
+case "$cmd $sub" in
+  "status --json")
+    printf '{"client":{"version":"0.7.1","protocol":14},"server":{"running":true}}\n'
+    ;;
+  "workspace list")
+    jq_state '{result:{workspaces:.workspaces}}'
+    ;;
+  "workspace create")
+    n=$(jq_state -r '.next'); wsid="w$n"; dn=$((n + 1))
+    jq_state --arg wsid "$wsid" --arg wlabel "$label" \
+      --arg tabid "$wsid:t$dn" --arg paneid "$wsid:p$dn" \
+      '.workspaces += [{workspace_id:$wsid, label:$wlabel}]
+       | .tabs += [{tab_id:$tabid, label:"1", workspace_id:$wsid, pane_id:$paneid}]
+       | .next = (.next + 2)' | save
+    printf '{"result":{"workspace":{"workspace_id":"%s","label":"%s"},"tab":{"tab_id":"%s"},"root_pane":{"pane_id":"%s"}}}\n' \
+      "$wsid" "$label" "$wsid:t$dn" "$wsid:p$dn"
+    ;;
+  "tab list")
+    jq_state --arg w "$ws" '{result:{tabs:[.tabs[]|select(.workspace_id==$w)]}}'
+    ;;
+  "tab create")
+    n=$(jq_state -r '.next'); tabid="$ws:t$n"; paneid="$ws:p$n"
+    jq_state --arg w "$ws" --arg wlabel "$label" --arg tabid "$tabid" --arg paneid "$paneid" \
+      '.tabs += [{tab_id:$tabid, label:$wlabel, workspace_id:$w, pane_id:$paneid}]
+       | .next = (.next + 1)' | save
+    printf '{"result":{"tab":{"tab_id":"%s"},"root_pane":{"pane_id":"%s"}}}\n' "$tabid" "$paneid"
+    ;;
+  "pane list")
+    if [ -n "$ws" ]; then
+      jq_state --arg w "$ws" '{result:{panes:[.tabs[]|select(.workspace_id==$w)|{pane_id:.pane_id, tab_id:.tab_id}]}}'
+    else
+      jq_state '{result:{panes:[.tabs[]|{pane_id:.pane_id, tab_id:.tab_id}]}}'
+    fi
+    ;;
+  "session list")
+    printf '{"sessions":[{"name":"default","running":true}]}\n'
+    ;;
+  "pane close")
+    pane=${3:-}
+    jq_state --arg p "$pane" '.tabs |= [.[]|select(.pane_id != $p)]' | save
+    ;;
+  "tab close")
+    tab_target=${3:-}
+    jq_state --arg t "$tab_target" '.tabs |= [.[]|select(.tab_id != $t)]' | save
+    ;;
+  "agent start")
+    n=$(jq_state -r '.next'); paneid="${tab%%:*}:p$n"
+    jq_state --arg t "$tab" --arg paneid "$paneid" \
+      '(.tabs[] | select(.tab_id == $t) | .pane_id) = $paneid
+       | .next = (.next + 1)' | save
+    printf '{"result":{"agent":{"pane_id":"%s","tab_id":"%s"}}}\n' "$paneid" "$tab"
+    ;;
+  "agent get")
+    pane=${3:-}
+    printf '{"error":{"code":"agent_not_found","message":"agent target %s not found"}}\n' "$pane"
+    ;;
+  *) : ;;
+esac
+exit 0
+SH
+  chmod 755 "$fakebin/herdr"
+}
+
+# setup_spawn_world <name> <id>: seeded secondmate home + fakes + provider.
+# Globals: SP_DIR SP_HOME SP_SUB SP_FAKEBIN SP_TMUX_LOG SP_HERDR_LOG SP_PANE
+setup_spawn_world() {
+  local name=$1 id=$2
+  make_primary_root
+  SP_DIR="$TMP_ROOT/spawn-$name"
+  SP_HOME="$SP_DIR/main-home"
+  SP_SUB="$SP_DIR/${id}-home"
+  SP_TMUX_LOG="$SP_DIR/tmux.log"
+  SP_HERDR_LOG="$SP_DIR/herdr.log"
+  SP_PANE="$SP_DIR/pane.txt"
+  mkdir -p "$SP_HOME/projects" "$SP_HOME/data" "$SP_HOME/state" "$SP_DIR/pi-agent-home"
+  chmod 755 "$SP_DIR"
+  printf '{"openai-codex":{"accountId":"fixture-account"}}\n' > "$SP_DIR/pi-agent-home/auth.json"
+  chmod 600 "$SP_DIR/pi-agent-home/auth.json"
+  fm_git_init_commit "$SP_HOME/projects/alpha"
+  fm_git_add_origin "$SP_HOME/projects/alpha" "$SP_DIR/remotes/alpha.git"
+  printf -- '- alpha - alpha project (added 2026-06-22)\n' > "$SP_HOME/data/projects.md"
+  SP_FAKEBIN=$(make_fake_tmux "$SP_DIR/fake")
+  chmod 755 "$SP_DIR/fake" "$SP_FAKEBIN"
+  write_fake_herdr "$SP_FAKEBIN"
+  write_role_fixture_provider "$SP_DIR/provider.py"
+  : > "$SP_TMUX_LOG"
+  : > "$SP_HERDR_LOG"
+  printf 'idle prompt\n' > "$SP_PANE"
+  printf '{"next":1,"workspaces":[],"tabs":[],"agent_status":{}}\n' > "$SP_DIR/herdr-state.json"
+  FM_SECONDMATE_SCOPE='compartment gate coverage' \
+    scaffold_secondmate_charter "$SP_HOME" "$id" 'compartment gate charter' alpha \
+    || fail "charter scaffold failed for $id"
+  PATH="$SP_FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$SPAWN_PRIMARY_ROOT" FM_HOME="$SP_HOME" \
+    "$ROOT/bin/fm-home-seed.sh" "$id" "$SP_SUB" alpha >/dev/null \
+    || fail "home seed failed for $id"
+}
+
+run_gate_spawn() {  # <id> [VAR=value ...] -- <spawn args...>
+  local id=$1 assignments=()
+  shift
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do
+    assignments+=("$1")
+    shift
+  done
+  [ "${1:-}" != -- ] || shift
+  env PATH="$SP_FAKEBIN:$PATH" FM_ROOT_OVERRIDE="$SPAWN_PRIMARY_ROOT" FM_HOME="$SP_HOME" \
+    FM_FAKE_TMUX_LOG="$SP_TMUX_LOG" FM_FAKE_TMUX_CAPTURE="$SP_PANE" \
+    FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1 \
+    FM_HERDR_LOG="$SP_HERDR_LOG" FM_FAKE_HERDR_STATE="$SP_DIR/herdr-state.json" \
+    PI_CODING_AGENT_DIR="$SP_DIR/pi-agent-home" \
+    FM_SPAWN_NO_GUARD=1 \
+    ${assignments[@]+"${assignments[@]}"} \
+    "$SPAWN" "$id" "$SP_SUB" "$@" 2>&1
+}
+
+test_spawn_gate_off_flag_is_byte_identical() {
+  local out rc meta
+  setup_spawn_world off-flag design
+  out=$(run_gate_spawn design FM_SPAWN_CLOUD=azure -- codex --secondmate)
+  rc=$?
+  expect_code 0 "$rc" "off-flag azure secondmate spawn should stay local and succeed: $out"
+  assert_contains "$out" "$GATE_NOTICE" "the gate notice string changed (off-flag byte-identity broken): $out"
+  assert_contains "$out" "spawned design" "the gated spawn did not complete locally: $out"
+  meta="$SP_HOME/state/design.meta"
+  assert_present "$meta" "the local spawn wrote no task metadata"
+  assert_grep 'kind=secondmate' "$meta" "meta lost kind=secondmate"
+  assert_no_grep 'placement=' "$meta" "an off-flag gated spawn recorded cloud placement"
+  assert_no_grep 'worker_assignment_generation=' "$meta" "an off-flag gated spawn recorded a worker assignment"
+  assert_absent "$SP_HOME/state/azure-workers/controller.json" "an off-flag gated spawn touched the worker controller"
+  assert_absent "$SP_HOME/state/design.cloud-payload" "an off-flag gated spawn staged a cloud payload"
+  grep -q 'FM_HOME=.*design-home' "$SP_TMUX_LOG" \
+    || fail "the local secondmate launch never ran in the subhome; tmux log: $(cat "$SP_TMUX_LOG" 2>/dev/null | head -8); out: $out"
+  pass "off-flag: azure + --secondmate keeps the exact gate notice and the byte-identical local path"
+}
+
+test_spawn_gate_on_flag_routes_compartment_and_never_executes() {
+  local out rc meta assignment
+  setup_spawn_world on-flag helm
+  out=$(run_gate_spawn helm \
+    FM_SPAWN_CLOUD=azure FM_SPAWN_SECONDMATE_CLOUD=1 \
+    FM_AZURE_SUBSCRIPTION_ID="$SUB" FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
+    FM_AZURE_OWNER_TAG=owner FM_AZURE_NAMING_PREFIX=fmtest \
+    FM_AZURE_WORKER_IDLE_COOLDOWN_SECONDS=0 \
+    FM_SECONDMATE_LEG_SECONDS=7200 \
+    FM_WORKER_PROVIDER_COMMAND="python3 $SP_DIR/provider.py" \
+    FIXTURE_STATE="$SP_DIR/provider-state.json" \
+    -- --secondmate)
+  rc=$?
+  expect_code 0 "$rc" "on-flag compartment spawn should succeed: $out"
+  assert_not_contains "$out" "$GATE_NOTICE" "the open gate still refused the compartment: $out"
+  assert_contains "$out" "spawned helm" "the compartment spawn did not complete: $out"
+  assert_contains "$out" "placement=azure" "the compartment spawn did not report cloud placement: $out"
+  assert_contains "$out" "secondmate compartment helm is assigned; fm-secondmate-cloud-monitor dispatches its session legs" \
+    "the compartment dispatch note is missing: $out"
+  meta="$SP_HOME/state/helm.meta"
+  assert_grep 'kind=secondmate' "$meta" "meta lost kind=secondmate"
+  assert_grep 'placement=azure' "$meta" "meta did not record placement=azure"
+  assert_grep 'harness=pi' "$meta" "the compartment did not select the pi runtime"
+  assert_grep 'worker_assignment_generation=' "$meta" "the compartment assignment was not recorded in meta"
+  # Queue entry: role=secondmate, assigned, on the primary's controller.
+  python3 - "$SP_HOME/state/azure-workers/controller.json" helm <<'PY' || fail "controller queue entry is not an assigned role=secondmate compartment"
+import json, sys
+state = json.load(open(sys.argv[1]))
+items = [item for key, item in state["queue"].items() if key.startswith(sys.argv[2] + "@")]
+assert len(items) == 1, items
+assert items[0]["role"] == "secondmate", items[0]
+assert items[0]["owner_kind"] == "primary", items[0]
+assert items[0]["status"] == "assigned", items[0]
+PY
+  # The spawn NEVER dispatches an execute for a compartment: the provider saw
+  # exactly one mutation (create), and no worker result or entrypoint exists.
+  python3 - "$SP_DIR/provider-state.json" <<'PY' || fail "the spawn drove more than the create mutation"
+import json, sys
+state = json.load(open(sys.argv[1]))
+kinds = sorted({call["type"] for call in state["calls"]})
+assert kinds == ["create"], kinds
+PY
+  assert_absent "$SP_HOME/state/helm.cloud-entrypoint" "a compartment spawn persisted a crewmate entrypoint"
+  [ ! -s "$SP_HOME/state/helm.worker-result.json" ] || fail "a compartment spawn dispatched an execute"
+  # The staged payload carries the runner, the extension, the repo bundle and
+  # the brief; the account dir carries the auth projection.
+  assert_present "$SP_HOME/state/helm.cloud-payload/repo.bundle" "payload lacks the home repo bundle"
+  assert_present "$SP_HOME/state/helm.cloud-payload/brief.md" "payload lacks the brief"
+  assert_present "$SP_HOME/state/helm.cloud-payload/fm-secondmate-session.py" "payload lacks the session runner"
+  assert_present "$SP_HOME/state/helm.cloud-payload/fm-secondmate-spawn.pi-ext.ts" "payload lacks the pi extension"
+  assert_present "$SP_HOME/state/helm.cloud-account/auth.json" "account staging lacks the auth projection"
+  # Durable leg config rode into the persisted compartment environment.
+  assert_grep 'FM_SECONDMATE_LEG_SECONDS=7200' "$SP_HOME/state/helm.cloud-env" "leg config was not persisted for the monitor"
+  # The tracking pane runs the COMPARTMENT monitor, not the crewmate one.
+  assert_grep 'fm-secondmate-cloud-monitor.sh' "$SP_HERDR_LOG" "the pane does not run the compartment monitor"
+  assert_no_grep 'fm-spawn-cloud-monitor.sh' "$SP_HERDR_LOG" "the pane runs the crewmate monitor instead of the compartment one"
+  pass "on-flag: --secondmate routes through role=secondmate request + monitor launch, with no spawn-side execute"
+}
+
 test_leg1_carries_staging_and_leg2_is_manifest_free_golden
 test_o_excl_guard_prevents_double_dispatch
 test_inbox_relay_is_content_addressed_and_replay_safe
@@ -657,5 +1052,7 @@ test_leg_seconds_above_ceiling_refused_at_startup
 test_fm_send_routes_cloud_secondmate_into_the_compartment_inbox
 test_fm_send_local_secondmate_path_is_unchanged
 test_fm_send_cloud_secondmate_without_assignment_refuses
+test_spawn_gate_off_flag_is_byte_identical
+test_spawn_gate_on_flag_routes_compartment_and_never_executes
 
 echo "# fm-secondmate-cloud-monitor.test.sh: all assertions passed"

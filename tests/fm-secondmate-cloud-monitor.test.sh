@@ -893,7 +893,7 @@ test_duplicate_child_request_refuses_loudly_and_spawns_once() {
   land_from_store
   run_relay > "$WORLD/relay-1.log" 2>&1 || fail "the first relay pass failed: $(cat "$WORLD/relay-1.log")"
   [ "$(spawn_invocations)" = 2 ] || fail "the first valid request did not spawn exactly once"
-  assert_grep -- '--scout' "$SP_LOG" "a scout request did not carry --scout"
+  grep -q -- '--scout' "$SP_LOG" || fail "a scout request did not carry --scout: $(tr '\037' '|' < "$SP_LOG")"
   # A RESEND of the same intent: the runner would re-emit it at a new
   # sequence, so the same self digest arrives under a new content address.
   python3 - "$CHILDREQ" <<'PY'
@@ -1204,7 +1204,7 @@ test_crewmate_monitor_stat_chain_is_uname_branched() {
   python3 - "$monitor" <<'PY' || fail "the uname branch does not guard the reclaim marker read"
 import re, sys
 body = open(sys.argv[1], encoding="utf-8").read()
-block = re.search(r'if \[ "\$\(uname\)" = Darwin \]; then(.*?)\nfi', body, re.S)
+block = re.search(r'if \[ "\$\(uname\)" = Darwin \]; then(.*?)\n\s*fi\n', body, re.S)
 assert block, "no uname branch found"
 inner = block.group(1)
 assert 'stat -f %m "$DISPATCH_MARKER"' in inner, inner

@@ -4578,6 +4578,20 @@ for durations, expected in (
     ({"invented": 10, "total": 30}, "names unknown phase(s): invented"),
     ({"snapshot": 40, "total": 30}, "does not cover its named phases"),
     ([], "must be an object"),
+    # The gate, not the writer, owns "absent means this lane did not do it".
+    # A local-lane record cannot claim compartment phases, and a measurement
+    # with no snapshot phase describes a run that cannot exist.
+    (
+        {"create": 1, "total": 1},
+        "records compartment-lane phase(s) (create) on a run whose reviewer "
+        "record does not place it in the Azure compartment lane",
+    ),
+    (
+        {"snapshot": 1, "boot": 1, "collect": 1, "total": 30},
+        "compartment-lane phase(s) (boot, collect)",
+    ),
+    ({"total": 0}, "must record the snapshot phase"),
+    ({"reviewer": 5, "total": 30}, "must record the snapshot phase"),
 ):
     try:
         module.validate_ledger(
@@ -4617,8 +4631,149 @@ except module.CrosscheckError as exc:
     assert "unknown crosscheck phase" in str(exc), str(exc)
 else:
     raise AssertionError("PhaseTimer admitted an undefined phase")
+
+# The compartment lane, and only it, may name its own phases.
+module.validate_durations(
+    {"snapshot": 1, "create": 2, "stage": 3, "boot": 4, "collect": 5, "total": 30},
+    "compartment",
+    compartment=True,
+)
 PY
   pass "durations_ms is additive: untimed records validate and render, dishonest ones refuse"
+}
+
+test_recorded_run_stamp_cannot_forge_a_timings_row() {
+  local record case_dir base head rc
+  record=$(make_case phase-row-injection)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  mkdir -p "$case_dir/data/task-x1"
+  # A free-form `at` used to reach the renderer verbatim, so a stamp carrying a
+  # newline printed a second, entirely fabricated row through the real read
+  # path. The stamp has exactly one producer and one shape; anything else is
+  # refused before it can be rendered.
+  "$CROSSCHECK_PYTHON" - "$case_dir/data/task-x1/crosscheck-ledger.json" "$head" <<'PY'
+import json
+import sys
+
+path, head = sys.argv[1], sys.argv[2]
+forged = (
+    "2026-08-02T00:00:00Z  glm-primary     clear         1  1  1  1  "
+    "-  -  -  -  1\n2026-08-03T00:00:00Z"
+)
+json.dump(
+    {
+        "schema": "firstmate.crosscheck-ledger.v2",
+        "task_id": "task-x1",
+        "pull_request": "https://github.com/ruby-dlee/firstmate/pull/72",
+        "findings": [],
+        "runs": [{
+            "at": forged,
+            "head_sha": head,
+            "base_sha": head,
+            "base_branch_sha": head,
+            "claims_sha256": "0" * 64,
+            "reviewer": None,
+            "state": "tool-failure",
+            "summary": "forged stamp",
+            "citations": [],
+            "updated_findings": [],
+            "new_findings": [],
+            "active_blockers": [],
+            "suspicions": [],
+        }],
+    },
+    open(path, "w"),
+)
+PY
+  set +e
+  run_timings "$case_dir" > "$case_dir/timings.out" 2> "$case_dir/timings.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "a run stamp carrying a forged row"
+  assert_grep 'must be a UTC instant of the form YYYY-MM-DDTHH:MM:SSZ' \
+    "$case_dir/timings.err" "the forged run stamp was not refused by name"
+  assert_no_grep '2026-08-03T00:00:00Z' "$case_dir/timings.out" \
+    "the forged row reached the rendered table"
+  # The renderer refuses row-forging whitespace itself rather than trusting the
+  # validator upstream of it.
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' \
+    || fail "the timings renderer trusted an unvalidated cell"
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+ledger = {"runs": [{
+    "at": "2026-08-02T00:00:00Z\n2026-08-03T00:00:00Z",
+    "state": "clear",
+    "reviewer": None,
+}]}
+try:
+    module.render_timings(ledger)
+except module.CrosscheckError as exc:
+    assert "would forge a timings row" in str(exc), str(exc)
+else:
+    raise AssertionError("render_timings emitted a row-forging cell")
+PY
+  pass "a run stamp cannot forge a timings row, at the validator and at the renderer"
+}
+
+test_unwritable_measurement_is_dropped_not_the_ledger() {
+  "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY' \
+    || fail "a bad measurement was written durably instead of dropped"
+import importlib.util
+import io
+import contextlib
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+# Everything that later reads the ledger validates it, so writing a
+# measurement that fails its own contract would refuse `run`, `verify` and
+# `timings` for this task until a human edited the JSON. The measurement is
+# the disposable half of that trade.
+run = {"reviewer": None, "state": "clear", "summary": "kept"}
+noise = io.StringIO()
+with contextlib.redirect_stderr(noise):
+    module.stamp_durations(run, {"snapshot": 40, "total": 30})
+assert "durations_ms" not in run, run
+assert run["summary"] == "kept", run
+assert "dropping this run's phase measurement" in noise.getvalue(), noise.getvalue()
+assert "does not cover its named phases" in noise.getvalue(), noise.getvalue()
+
+# A stale measurement from an earlier persist in the same invocation is
+# removed too, rather than left behind as the record's answer.
+run["durations_ms"] = {"snapshot": 1, "total": 2}
+with contextlib.redirect_stderr(io.StringIO()):
+    module.stamp_durations(run, {"create": 1, "snapshot": 1, "total": 30})
+assert "durations_ms" not in run, run
+
+# An honest measurement is still written, and the drop path is not the norm.
+good = {"snapshot": 10, "reviewer": 20, "total": 40}
+quiet = io.StringIO()
+with contextlib.redirect_stderr(quiet):
+    module.stamp_durations(run, good)
+assert run["durations_ms"] == good, run
+assert quiet.getvalue() == "", quiet.getvalue()
+
+# The lane discriminator the writer uses is the one every reader uses.
+compartment = {
+    "reviewer": {"execution_mode": "azure-compartment-v1"},
+    "state": "clear",
+}
+assert module.run_is_compartment_lane(compartment) is True
+assert module.run_is_compartment_lane({"reviewer": None}) is False
+with contextlib.redirect_stderr(io.StringIO()):
+    module.stamp_durations(compartment, {"snapshot": 1, "create": 2, "total": 30})
+assert compartment["durations_ms"]["create"] == 2, compartment
+PY
+  pass "a measurement failing its own contract is dropped loudly, never written into the ledger"
 }
 
 if [ -n "${FM_TEST_CASE:-}" ]; then
@@ -4692,7 +4847,9 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_failure_before_the_reviewer_records_no_reviewer_phase|\
     test_local_lane_run_records_no_compartment_phases|\
     test_timings_reads_every_run_and_refuses_a_missing_ledger|\
-    test_untimed_run_record_still_validates_and_renders)
+    test_untimed_run_record_still_validates_and_renders|\
+    test_recorded_run_stamp_cannot_forge_a_timings_row|\
+    test_unwritable_measurement_is_dropped_not_the_ledger)
       "$FM_TEST_CASE"
       exit 0
       ;;
@@ -4822,3 +4979,5 @@ test_failure_before_the_reviewer_records_no_reviewer_phase
 test_local_lane_run_records_no_compartment_phases
 test_timings_reads_every_run_and_refuses_a_missing_ledger
 test_untimed_run_record_still_validates_and_renders
+test_recorded_run_stamp_cannot_forge_a_timings_row
+test_unwritable_measurement_is_dropped_not_the_ledger

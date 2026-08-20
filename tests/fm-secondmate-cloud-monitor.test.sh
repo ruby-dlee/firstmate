@@ -303,9 +303,38 @@ print(digest)
 PY
 }
 
+# A monitor loop sleeps in a CHILD process, so killing the monitor alone
+# orphans that `sleep`. Orphaning does not change process-group membership, so
+# the sleep stays in the suite's owned group, where tests/run-one.py reaps it
+# and reports a test-isolation violation - failing the whole file with exit 97
+# AFTER every assertion has already passed (the exact CI failure this suite hit
+# while printing "all assertions passed").
+#
+# Every backgrounded monitor is therefore its own session leader
+# (POSIX::setsid before exec), so one group kill takes the monitor and its
+# in-flight sleep down together. That also moves them out of the harness's
+# owned group, so stop_process_group replaces the net it removed: it PROVES
+# the group is gone and fails loudly if anything survives, rather than letting
+# a leak go unnoticed.
+MONITOR_PERL='use POSIX (); POSIX::setsid(); alarm shift @ARGV; exec @ARGV or die "exec failed: $!"'
+
+stop_process_group() {  # <pid>
+  local pid=${1:-} i=0
+  [ -n "$pid" ] || return 0
+  kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null
+  while [ "$i" -lt 40 ]; do
+    kill -0 -- -"$pid" 2>/dev/null || return 0
+    sleep 0.05
+    i=$((i + 1))
+  done
+  kill -KILL -- -"$pid" 2>/dev/null || true
+  fail "monitor process group $pid survived its stop (a leaked background process)"
+}
+
 MONITOR_PID=
 start_monitor() {
-  perl -e 'alarm 90; exec @ARGV or die "exec failed: $!"' -- \
+  perl -e "$MONITOR_PERL" -- 90 \
     env FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$STATE_DIR" \
     FM_SECONDMATE_LIFECYCLE_BIN="$LIFECYCLE_FIXTURE" \
     FM_SECONDMATE_SPAWN_BIN="$SPAWN_FIXTURE" \
@@ -318,8 +347,7 @@ start_monitor() {
 }
 
 stop_monitor() {
-  [ -z "$MONITOR_PID" ] || kill "$MONITOR_PID" 2>/dev/null || true
-  [ -z "$MONITOR_PID" ] || wait "$MONITOR_PID" 2>/dev/null
+  stop_process_group "$MONITOR_PID"
   MONITOR_PID=
 }
 
@@ -411,7 +439,7 @@ test_o_excl_guard_prevents_double_dispatch() {
   # monitor could make.
   local second_pane="$WORLD/pane-2.log" second_pid
   start_monitor
-  perl -e 'alarm 90; exec @ARGV or die "exec failed: $!"' -- \
+  perl -e "$MONITOR_PERL" -- 90 \
     env FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$STATE_DIR" \
     FM_SECONDMATE_LIFECYCLE_BIN="$LIFECYCLE_FIXTURE" \
     FM_SECONDMATE_MONITOR_INTERVAL_SECONDS=1 \
@@ -421,8 +449,7 @@ test_o_excl_guard_prevents_double_dispatch() {
   wait_for "leg 1 dispatch" grep -q $'execute\x1f' "$LC_LOG"
   # Let both monitors run several further iterations against the same state.
   sleep 3
-  kill "$second_pid" 2>/dev/null || true
-  wait "$second_pid" 2>/dev/null
+  stop_process_group "$second_pid"
   stop_monitor
   local executes
   executes=$(grep_lc $'^execute\x1f')
@@ -1564,14 +1591,13 @@ import os, sys, time
 stale = time.time() - 4000  # far past wall(60) + 300 slack
 os.utime(sys.argv[1], (stale, stale))
 PY
-  perl -e 'alarm 60; exec @ARGV or die "exec failed: $!"' -- \
+  perl -e "$MONITOR_PERL" -- 60 \
     env FM_HOME="$dir/home" FM_SPAWN_CLOUD_MONITOR_INTERVAL_SECONDS=1 \
     "$ROOT/bin/fm-spawn-cloud-monitor.sh" reclaim-task gen-1 > "$log" 2>&1 &
   pid=$!
   wait_for_file_grep "$log" 'dispatch claim is stale' 40 \
-    || { kill "$pid" 2>/dev/null; fail "the stale dispatch claim was never reclaimed (the mtime read failed closed): $(cat "$log")"; }
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null
+    || { stop_process_group "$pid"; fail "the stale dispatch claim was never reclaimed (the mtime read failed closed): $(cat "$log")"; }
+  stop_process_group "$pid"
   assert_grep 'persisted entrypoint is empty' "$log" \
     "the reclaim did not release the claim for the next dispatch attempt"
   pass "the crewmate monitor really reclaims a stale dispatch claim through the uname-branched mtime read"

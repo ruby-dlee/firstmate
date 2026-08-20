@@ -2489,6 +2489,16 @@ def parser():
         help="resume after this local outbox name (the cursor a previous summary reported)",
     )
 
+    chain_tip = sub.add_parser(
+        "compartment-chain-tip",
+        help="record one compartment's verified outbox chain tip on its controller-owned worker record",
+    )
+    chain_tip.add_argument("--task", required=True)
+    chain_tip.add_argument("--task-generation", required=True)
+    chain_tip.add_argument("--assignment-generation", required=True)
+    chain_tip.add_argument("--sequence", type=int, required=True)
+    chain_tip.add_argument("--chain-digest", required=True)
+
     status = sub.add_parser("status", help="show bounded local lifecycle and cost evidence")
     status.add_argument("--live", action="store_true")
     status.add_argument("--json", action="store_true")
@@ -3798,6 +3808,78 @@ def command_message_collect(env, args):
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 
+def command_compartment_chain_tip(env, args):
+    """Record one compartment's verified outbox chain tip on its WORKER RECORD.
+
+    This exists because a hash chain proves nothing without a trustworthy
+    anchor. The compartment outbox is anchored at one end by a public genesis
+    constant and at the other by its verified tip; when the authority read that
+    tip out of state/<task>.cloud-secondmate-state.json, it was reading the
+    same attacker-writable file, in the same directory as the mailbox, that it
+    was trying to check. An attacker could recompute SHA-256 exactly as the
+    monitor does and write a matching tip, so a wholly fabricated chain
+    verified. The monitor's own tip check is sound because the monitor is the
+    live writer comparing against its own prior state; for the authority, which
+    by its own endpoint receipt runs only after the monitor is dead and the
+    file is unowned, that check was vacuous.
+
+    So the tip belongs where blocker 1's role fix put evidence provenance: the
+    controller document, fenced, lock-guarded, written only through this CLI.
+
+    Deliberately NOT part of the message lane. PR 3's invariant is that
+    message-put/message-collect touch no lifecycle state, and a static test
+    pins that neither rewrites controller.json; recording the tip inside
+    message-collect would trade one hole for another. This is its own command:
+    claim-exempt (it touches no compute, no money, and no provider), but it is
+    a lifecycle write, not a data-plane transfer.
+
+    Monotonic by construction: the sequence may only advance, and a replay of
+    the same sequence must carry the same digest. A lower sequence, or the same
+    sequence with a different digest, is a fork or a rewind and refuses.
+    """
+    require_id("task", args.task)
+    require_id("task generation", args.task_generation)
+    sequence = args.sequence
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+        raise LifecycleError("compartment chain tip sequence must be a positive integer")
+    chain_digest = require_binding("compartment chain tip digest", args.chain_digest)
+    with controller_lock(env):
+        state = load_state(env)
+        key = request_key(args.task, args.task_generation)
+        item = state["queue"].get(key)
+        if item is None or item.get("status") != "assigned":
+            raise LifecycleError(
+                "compartment chain tip requires one exact assigned task generation")
+        if item.get("role") != "secondmate":
+            raise LifecycleError("compartment chain tip is owned by secondmate compartments only")
+        worker = state["workers"].get(str(item.get("slot")))
+        if worker is None or worker.get("queue_key") != key:
+            raise LifecycleError("compartment chain tip task has no exact durable worker owner")
+        if worker.get("assignment_generation") != args.assignment_generation:
+            raise LifecycleError("compartment chain tip assignment generation is not exact")
+        if worker.get("release_proof") is not None:
+            raise LifecycleError("released work cannot record a compartment chain tip")
+        current = worker.get("verified_chain_tip")
+        if isinstance(current, dict):
+            held = current.get("sequence")
+            if isinstance(held, int) and not isinstance(held, bool):
+                if sequence < held:
+                    raise LifecycleError(
+                        "compartment chain tip refuses to rewind from sequence {} to {}".format(
+                            held, sequence))
+                if sequence == held and current.get("chain_digest") != chain_digest:
+                    raise LifecycleError(
+                        "compartment chain tip sequence {} already recorded a different digest".format(
+                            sequence))
+        worker["verified_chain_tip"] = {
+            "sequence": sequence,
+            "chain_digest": chain_digest,
+            "recorded_at": iso_utc(),
+        }
+        save_state(env, state)
+    print("recorded compartment chain tip {} for {}".format(sequence, args.task))
+
+
 def command_status(env, args):
     inventory = None
     if args.live:
@@ -3873,6 +3955,8 @@ def main(argv=None):
         command_message_put(env, args)
     elif args.command == "message-collect":
         command_message_collect(env, args)
+    elif args.command == "compartment-chain-tip":
+        command_compartment_chain_tip(env, args)
     elif args.command == "status":
         command_status(env, args)
     else:

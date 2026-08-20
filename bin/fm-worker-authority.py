@@ -24,25 +24,29 @@ REQUIRED_HEADINGS = (
 # Secondmate compartment evidence (R2/R3 design B.7). The five receipt names
 # and the fm.worker-release/v2 shape are IDENTICAL to the ordinary mode - the
 # lifecycle's release_receipt and verify_release_against_worker stay
-# unmodified - only what each receipt PROVES changes when the ordinary task
-# metadata records kind=secondmate:
+# unmodified - only what each receipt PROVES changes, and the mode is selected
+# by the CONTROLLER-OWNED worker role (the task metadata's kind must agree,
+# but never decides on its own):
 #   endpoint -> the compartment monitor pane is absent (same backend oracle).
 #   report   -> session closeout: the monitor's terminal status file, the
 #               chained close ack in its durable state, and the ordered
 #               completion.md contract (report_evidence, reused verbatim).
 #   landing  -> every chained outbox bundle landed into the local secondmate
-#               home worktree, or provably none.
+#               home worktree, or provably none, over a chain verified BY
+#               CONTENT against a CONTROLLER-OWNED tip, plus the same lineage
+#               tether the ordinary lane applies.
 #   account  -> unchanged.
 #   worktree -> the secondmate home is quiesced: exact repository root, no
-#               tracked modifications, no unlanded outbox bundles. Children
-#               are deliberately NOT consulted here - command_release owns
-#               the children-quiesced refusal under the controller lock.
+#               uncommitted or untracked work, no unlanded outbox bundles.
+#               Children are deliberately NOT consulted here - command_release
+#               owns the children-quiesced refusal under the controller lock.
 #
 # The durable shapes below bind to bin/fm-secondmate-cloud-monitor.{sh,py}
 # (branch fm/secondmate-cloud-monitor): the terminal status file
 # state/<task>.cloud-secondmate-status holds one of closed|idle|ttl-exhausted;
 # the durable monitor state state/<task>.cloud-secondmate-state.json carries
-# last_summary {reason, legs_completed}, landed_bundles, kept_bundles; the
+# last_summary {reason, legs_completed}, landed_bundles, kept_bundles - all of
+# it monitor-local and therefore NEVER the anchor for a landing proof; the
 # mailbox state/<task>.cloud-mailbox holds the collected chained outbox
 # (<seq8>-<sha256>.json messages, bundle-<seq8>-<sha256>.bundle bundles, and
 # a sticky .chain-break marker on a refused chain).
@@ -202,30 +206,39 @@ def secondmate_chain_canonical(value):
     ).encode()
 
 
-def secondmate_chain_extent(state):
-    """How much verified chain the durable monitor state commits to.
+def secondmate_chain_extent(worker):
+    """The verified chain tip, read ONLY from the controller-owned worker record.
 
-    Fails CLOSED on anything malformed. An earlier version coerced a
-    non-integer, negative, or missing value to 0, which made the completeness
-    check vacuous: `delivered_sequence: "2"` as a string, or a dropped
-    verified_tip, zeroed the requirement and an emptied mailbox proved.
+    A hash chain proves nothing without a trustworthy anchor. This one is
+    anchored at one end by a public genesis constant, and at the other by its
+    verified tip - so wherever the tip comes from IS the security boundary.
+    Two earlier versions of this function read the tip out of
+    state/<task>.cloud-secondmate-state.json: the same attacker-writable file,
+    in the same directory as the mailbox, that the check exists to police. An
+    attacker recomputes SHA-256 exactly as the monitor does, writes a matching
+    tip, and a wholly fabricated chain verifies. The monitor's equivalent check
+    is sound because the monitor is the live writer comparing against its own
+    prior persisted state; for this tool - which by its own endpoint receipt
+    runs only after the monitor is dead and the file is unowned - it was
+    vacuous.
 
-    A compartment that reaches release has necessarily closed out, and the
-    closeout is itself a chained leg summary (the report receipt requires
-    last_summary.legs_completed >= 1), so a released compartment ALWAYS has a
-    delivered chain of at least one entry. There is no legitimate
-    zero-entry chain here; "provably none" is about BUNDLES, and is proved by
-    a verified chain whose leg summaries declare nothing."""
-    delivered = state.get("delivered_sequence")
-    if isinstance(delivered, bool) or not isinstance(delivered, int) or delivered < 1:
-        raise AuthorityError(
-            "secondmate landing authority: durable monitor state records no verified delivered "
-            "outbox sequence ({!r}); a closed-out compartment always delivered its leg summary".format(
-                delivered))
-    tip = state.get("verified_tip")
+    The tip therefore comes from the controller document: fenced, lock-guarded,
+    written only by `fm-worker-lifecycle.sh compartment-chain-tip`, and handed
+    to this tool inside the same durable worker record that already carries the
+    bindings and the role. That is exactly the provenance that closed the
+    role/kind escalation.
+
+    ABSENT IS REFUSED, never inferred. A compartment whose monitor has not yet
+    recorded tips cannot prove landing through the ordinary authority at all;
+    its sanctioned exit is `surrender`. Proving landing from state the attacker
+    controls is not an option, so when there is no controller-owned tip the
+    honest answer is to refuse."""
+    tip = worker.get("verified_chain_tip")
     if not isinstance(tip, dict):
         raise AuthorityError(
-            "secondmate landing authority: durable monitor state carries no verified chain tip")
+            "secondmate landing authority: the controller-owned worker record carries no verified "
+            "chain tip; landing cannot be proved from monitor-local state, so this compartment "
+            "exits through surrender until its monitor records tips with compartment-chain-tip")
     sequence = tip.get("sequence")
     chain_digest = tip.get("chain_digest")
     if (
@@ -233,11 +246,11 @@ def secondmate_chain_extent(state):
         or not isinstance(chain_digest, str) or not SECONDMATE_HEX64.fullmatch(chain_digest)
     ):
         raise AuthorityError(
-            "secondmate landing authority: durable monitor state verified chain tip is malformed")
-    return delivered, sequence, chain_digest
+            "secondmate landing authority: the controller-owned verified chain tip is malformed")
+    return sequence, chain_digest
 
 
-def secondmate_verified_chain(mailbox, delivered, tip_sequence, tip_digest):
+def secondmate_verified_chain(mailbox, tip_sequence, tip_digest):
     """Re-derive the collected outbox chain BY CONTENT and return its verified
     messages in order.
 
@@ -249,9 +262,21 @@ def secondmate_verified_chain(mailbox, delivered, tip_sequence, tip_digest):
     this mirrors the monitor's own verify_mailbox: each entry's name digest
     must equal the SHA-256 of its canonical unsigned body, its sequence field
     must match its name, each chain_digest must extend the previous, and the
-    recomputed chain must reproduce the durable verified tip - which is what
-    stops a wiped store from being re-minted as a fresh self-consistent chain
-    from genesis."""
+    recomputed chain must reproduce the CONTROLLER-OWNED verified tip.
+
+    That last clause is load-bearing and its anchor is the whole point. The
+    chain's genesis is a public constant, so the tip is the only thing tying a
+    chain to THIS compartment; while the tip was read from monitor-local
+    state, an attacker could mint a fresh self-consistent chain and a matching
+    tip, and everything verified. The tip now comes from the controller
+    document (secondmate_chain_extent).
+
+    Recorded limitation: the content address binds the PARSED OBJECT, not the
+    file bytes - the body is re-canonicalized after json.loads - so trailing
+    newlines, pretty-printing, and raw key reordering are tolerated. Any
+    SEMANTIC change moves the digest, so this buys an attacker nothing, but it
+    is a real difference from byte-for-byte comparison and is stated here
+    rather than left for the next reader to discover."""
     by_sequence = {}
     for entry in sorted(mailbox.iterdir()):
         if entry.is_symlink() or not entry.is_file():
@@ -265,11 +290,11 @@ def secondmate_verified_chain(mailbox, delivered, tip_sequence, tip_digest):
                 "secondmate landing authority: duplicate outbox sequence {:08d}".format(sequence))
         by_sequence[sequence] = (match.group(2), entry)
     total = len(by_sequence)
-    required = max(delivered, tip_sequence)
+    required = tip_sequence
     if total < required:
         raise AuthorityError(
             "secondmate landing authority: the collected mailbox holds {} outbox entries but the "
-            "durable monitor state records {} (a rewound or truncated outbox)".format(
+            "controller-owned tip records {} (a rewound or truncated outbox)".format(
                 total, required))
     if sorted(by_sequence) != list(range(1, total + 1)):
         raise AuthorityError(
@@ -311,11 +336,11 @@ def secondmate_verified_chain(mailbox, delivered, tip_sequence, tip_digest):
     if verified[tip_sequence - 1][1].get("chain_digest") != tip_digest:
         raise AuthorityError(
             "secondmate landing authority: the recomputed chain at sequence {} does not reproduce "
-            "the durable verified tip (a re-genesis or substitution)".format(tip_sequence))
+            "the controller-owned verified tip (a re-genesis or substitution)".format(tip_sequence))
     return verified
 
 
-def secondmate_bundle_ledger(home, task):
+def secondmate_bundle_ledger(home, task, worker):
     """Declared and collected outbox bundles against the monitor's durable
     landed record, over a chain re-derived BY CONTENT.
 
@@ -347,14 +372,14 @@ def secondmate_bundle_ledger(home, task):
     state = secondmate_monitor_state(home, task)
     landed = {entry for entry in state.get("landed_bundles") or [] if isinstance(entry, str)}
     kept = sorted(entry for entry in state.get("kept_bundles") or [] if isinstance(entry, str))
-    delivered, tip_sequence, tip_digest = secondmate_chain_extent(state)
+    tip_sequence, tip_digest = secondmate_chain_extent(worker)
     # A symlinked mailbox is not the monitor's mailbox: is_dir() follows the
     # link, so a link to an empty directory read as a legitimately empty chain.
     if mailbox.is_symlink() or not mailbox.is_dir():
         raise AuthorityError(
-            "secondmate landing authority: the durable monitor state delivered {} outbox "
-            "entries but its mailbox is absent or redirected".format(delivered))
-    verified = secondmate_verified_chain(mailbox, delivered, tip_sequence, tip_digest)
+            "secondmate landing authority: the controller-owned tip records {} outbox "
+            "entries but the mailbox is absent or redirected".format(tip_sequence))
+    verified = secondmate_verified_chain(mailbox, tip_sequence, tip_digest)
     declared = set()
     for _sequence, message in verified:
         if message.get("kind") != SECONDMATE_LEG_SUMMARY_KIND:
@@ -410,7 +435,12 @@ def secondmate_report_evidence(home, task):
 
 
 def secondmate_report_sections(content):
-    """Every contract heading opens a real section, in order, outside fences."""
+    """Every contract heading opens a real section, in order, outside fences.
+
+    Recorded limitation: "carries content" is any non-empty text, so a single
+    "." under each heading still passes. This is cosmetic - it cannot hide
+    unlanded work or a missing closeout - and closing it would mean inventing
+    a prose-quality bar the ordinary lane does not have either."""
     fenced = False
     seen = []
     bodies = {}
@@ -440,7 +470,7 @@ def secondmate_report_sections(content):
                 ", ".join(empty)))
 
 
-def secondmate_landing_evidence(home, task, worktree, repository_generation):
+def secondmate_landing_evidence(home, task, worker, worktree, repository_generation):
     """Every chained outbox bundle landed into the local home worktree, or
     provably none: the durable monitor state exists, keeps nothing, every
     declared or collected bundle digest appears in its landed record, and the
@@ -453,7 +483,7 @@ def secondmate_landing_evidence(home, task, worktree, repository_generation):
     lineage still minted a landing proof. The controller owns
     repository_generation in the worker record, so it cannot be edited from
     the task metadata the way `kind` can."""
-    state, landed, kept, declared, collected = secondmate_bundle_ledger(home, task)
+    state, landed, kept, declared, collected = secondmate_bundle_ledger(home, task, worker)
     if kept:
         raise AuthorityError(
             "secondmate landing authority found bundles kept unlanded: {}".format(",".join(kept)))
@@ -470,8 +500,12 @@ def secondmate_landing_evidence(home, task, worktree, repository_generation):
         raise AuthorityError(
             "secondmate landing authority home head does not descend from the assignment "
             "repository generation")
+    tip = worker.get("verified_chain_tip") or {}
     return canonical({
-        "delivered_sequence": state.get("delivered_sequence"),
+        # The controller-owned tip, not the monitor-local counter: the evidence
+        # blob should name the anchor the proof actually rests on.
+        "chain_tip_sequence": tip.get("sequence"),
+        "chain_tip_digest": tip.get("chain_digest"),
         "declared": sorted(declared),
         "landed": sorted(landed),
         "head": head,
@@ -479,7 +513,7 @@ def secondmate_landing_evidence(home, task, worktree, repository_generation):
     })
 
 
-def secondmate_worktree_evidence(home, task, values):
+def secondmate_worktree_evidence(home, task, values, worker):
     """Home quiesced: the exact secondmate home worktree root with nothing
     left in it - no tracked modifications, no untracked never-added work, and
     no unlanded outbox bundles.
@@ -497,7 +531,7 @@ def secondmate_worktree_evidence(home, task, values):
     if git(worktree, "status", "--porcelain=v1", "--untracked-files=all"):
         raise AuthorityError(
             "secondmate home worktree authority is not quiesced: uncommitted or untracked work remains")
-    _state, landed, kept, declared, collected = secondmate_bundle_ledger(home, task)
+    _state, landed, kept, declared, collected = secondmate_bundle_ledger(home, task, worker)
     if kept or (declared | collected) - landed:
         raise AuthorityError(
             "secondmate home worktree authority is not quiesced: unlanded outbox bundles remain")
@@ -594,10 +628,10 @@ def main():
         # same five receipt names, compartment semantics. The bundle still
         # verifies through the lifecycle's UNMODIFIED release_receipt and
         # verify_release_against_worker.
-        worktree_info, home_worktree = secondmate_worktree_evidence(home, args.task, values)
+        worktree_info, home_worktree = secondmate_worktree_evidence(home, args.task, values, worker)
         report_authority = lambda: secondmate_report_evidence(home, args.task)
         landing_authority = lambda: secondmate_landing_evidence(
-            home, args.task, home_worktree, worker["bindings"]["repository_generation"])
+            home, args.task, worker, home_worktree, worker["bindings"]["repository_generation"])
     else:
         worktree_info, worktree = worktree_evidence(args.task, values)
         report_authority = lambda: report_evidence(home, args.task)

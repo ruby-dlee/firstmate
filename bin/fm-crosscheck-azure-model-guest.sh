@@ -141,6 +141,12 @@ if reviewer["harness"] == "pi" and reviewer["model"] == "FW-GLM-5.2":
     base_url = entry.get("baseUrl") if isinstance(entry, dict) else None
     if base_url != "https://aif-fm7c799d-eus01.cognitiveservices.azure.com/openai/v1":
         raise SystemExit("model guest: GLM credential endpoint allowlist mismatch")
+    # pi gives model-level baseUrl/api precedence over the provider level,
+    # so any model entry carrying either field escapes the provider pin.
+    models = entry.get("models") if isinstance(entry, dict) else None
+    for model_entry in (models if isinstance(models, list) else []):
+        if isinstance(model_entry, dict) and ("baseUrl" in model_entry or "api" in model_entry):
+            raise SystemExit("model guest: GLM credential model-level endpoint override")
     account = "azure-glm:aif-fm7c799d-eus01/FW-GLM-5.2"
 elif reviewer["harness"] == "codex":
     tokens = credential.get("tokens") if isinstance(credential, dict) else None

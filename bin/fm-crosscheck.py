@@ -542,12 +542,26 @@ def inspect_pi_glm_credential(account_home: Path) -> tuple[str, str]:
             "no api key material"
         )
     models = provider.get("models")
-    model_ids = [
-        entry.get("id")
+    model_entries = [
+        entry
         for entry in (models if isinstance(models, list) else [])
         if isinstance(entry, dict)
     ]
-    if GLM_REVIEWER_MODEL not in model_ids:
+    # pi's provider composer gives MODEL-level fields precedence over the
+    # provider level (dist/core/provider-composer.js: `definition.api ??
+    # providerConfig.api`, `definition.baseUrl ?? providerConfig.baseUrl`),
+    # so a model entry carrying its own baseUrl or api would silently escape
+    # the provider-level pin. The pinned provider level must own both fields:
+    # any model-level override refuses, even one repeating the pinned values.
+    for entry in model_entries:
+        if "baseUrl" in entry or "api" in entry:
+            tool_fail(
+                f"GLM reviewer credential at {credential_file} carries a "
+                "model-level baseUrl/api override; pi gives model-level "
+                "fields precedence over the provider, so the pinned "
+                "provider-level endpoint must own both"
+            )
+    if GLM_REVIEWER_MODEL not in [entry.get("id") for entry in model_entries]:
         tool_fail(
             f"GLM reviewer credential at {credential_file} does not declare "
             f"the {GLM_REVIEWER_MODEL} deployment"

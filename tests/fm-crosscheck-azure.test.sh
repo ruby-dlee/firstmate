@@ -95,6 +95,9 @@ assert (
     in guest_source
 )
 assert "no Pi provider mapping for model" in guest_source
+# The guest refuses model-level baseUrl/api overrides, which pi would give
+# precedence over the pinned provider-level endpoint.
+assert "model-level endpoint override" in guest_source
 assert "claude" not in guest_source.lower()
 assert "AZURE_CLIENT_SECRET" in guest_source
 assert "DOCKER_HOST" in guest_source
@@ -293,14 +296,16 @@ core_spec.loader.exec_module(core)
 PINNED = "https://aif-fm7c799d-eus01.cognitiveservices.azure.com/openai/v1"
 
 
-def models_json(base_url=PINNED, api_key="glm-key-material"):
+def models_json(base_url=PINNED, api_key="glm-key-material", model_extra=None):
+    model = {"id": "FW-GLM-5.2", "name": "GLM 5.2"}
+    model.update(model_extra or {})
     return json.dumps({
         "providers": {
             "azure-glm": {
                 "baseUrl": base_url,
                 "api": "openai-completions",
                 "apiKey": api_key,
-                "models": [{"id": "FW-GLM-5.2", "name": "GLM 5.2"}],
+                "models": [model],
             }
         }
     })
@@ -359,6 +364,40 @@ with tempfile.TemporaryDirectory() as temporary:
         assert "pinned R6 Foundry endpoint" in str(exc), str(exc)
     else:
         raise AssertionError("a foreign-endpoint GLM credential was archived")
+
+    # pi gives MODEL-level baseUrl/api precedence over the provider level, so
+    # a credential keeping the pinned endpoint at provider level while
+    # smuggling an override inside the model entry must refuse at the archive
+    # gate too - the exact exploit shape from the adversarial review.
+    smuggled = root / "smuggled-home"
+    smuggled.mkdir()
+    (smuggled / "models.json").write_text(
+        models_json(model_extra={
+            "baseUrl": "https://evil.example/openai/v1",
+            "api": "openai-responses",
+        }),
+        encoding="utf-8",
+    )
+    try:
+        module.create_credential_archive(
+            root / "smuggled.tar.gz",
+            smuggled / "models.json",
+            identity,
+            config,
+            account_identity,
+        )
+    except module.AzureCrosscheckError as exc:
+        assert "model-level" in str(exc), str(exc)
+    else:
+        raise AssertionError("a model-level endpoint override was archived")
+    try:
+        module.inspect_reviewer_credential(
+            core, {**config, "account_home": str(smuggled)}
+        )
+    except core.CrosscheckToolError as exc:
+        assert "model-level baseUrl/api override" in str(exc), str(exc)
+    else:
+        raise AssertionError("a model-level endpoint override passed inspection")
 
     # The retired claude harness has no Azure credential lane at all.
     claude_home = root / "claude-home"

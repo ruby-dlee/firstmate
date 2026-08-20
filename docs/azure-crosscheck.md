@@ -81,6 +81,7 @@ The macOS Keychain is never copied.
 
 The primary review family is GLM-5.2 on the fleet's own Azure AI Foundry resource through the Fireworks partner lane, driven by Pi as the `FW-GLM-5.2` deployment on the `azure-glm` custom provider.
 For that profile the packaged compartment credential is the api-key `models.json` (not a codex `auth.json`), pinned to exactly `https://aif-fm7c799d-eus01.cognitiveservices.azure.com/openai/v1` - chat completions only; any other baseUrl, including a Responses API surface, refuses before staging.
+pi gives model-level `baseUrl`/`api` fields precedence over the provider level, so the inspection, the archive gate, and the model guest all refuse a model entry carrying either field; the pinned provider level owns both.
 `effective_provider_host` is model-aware: a GLM review derives `aif-fm7c799d-eus01.cognitiveservices.azure.com` as its single egress host and refuses a conflicting configured `provider_host`, while the codex-family fallback keeps its `chatgpt.com` derivation.
 The executing identity is the non-secret Foundry resource/deployment binding (an api key names no upstream account); the api key and anything derived from it never enter identity, ledger, or output.
 The interim claude reviewer lane is retired end to end: no `api.anthropic.com` host derivation, no `.credentials.json` packaging or boot copy, and no claude launch branch in the model guest.

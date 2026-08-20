@@ -572,6 +572,20 @@ def create_credential_archive(
                 "archived GLM reviewer credential is not bound to the pinned "
                 f"R6 Foundry endpoint {GLM_ALLOWED_BASE_URL}"
             )
+        # pi gives model-level baseUrl/api precedence over the provider
+        # level, so a model entry carrying either field would escape the
+        # provider-level pin; the archive refuses any such override.
+        for model_entry in (
+            entry.get("models") if isinstance(entry.get("models"), list) else []
+        ):
+            if isinstance(model_entry, dict) and (
+                "baseUrl" in model_entry or "api" in model_entry
+            ):
+                raise AzureCrosscheckError(
+                    "archived GLM reviewer credential carries a model-level "
+                    "baseUrl/api override that escapes the pinned R6 Foundry "
+                    "endpoint"
+                )
         archived_identity = GLM_REVIEWER_ACCOUNT_IDENTITY
     elif config["harness"] == "codex":
         tokens = parsed.get("tokens") if isinstance(parsed, dict) else None

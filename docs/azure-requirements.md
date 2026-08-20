@@ -384,28 +384,45 @@ the controller serializing them.
 
 ## C3. Cost guard
 
-Status: NOT DONE.
+Status: BUILT 2026-08-20; live acceptance pending.
 
 The requirement is that a day's spend cannot quietly reach 100 dollars.
-The only bound that exists is `FM_AZURE_WORKER_COMMISSIONING_CEILING_USD`, which is cumulative
-rather than daily, so nothing today refuses a single expensive day.
 
-Workers also do not deallocate on idle.
-Compute is released only when an exact release receipt is followed by a controller `reconcile`,
-and the sole self-acting bound is a per-VM shutdown schedule at a wall-clock deadline.
-The four stranded worker slots were cleaned to zero on 2026-08-19 through the new surrender
-lane, and the unattached validation disk by the owner's directed delete, but only by hand:
-wkr-04 had
-idled about four hours with no release proof until its TTL fired, which is the live example the
-idle-release work exists to remove.
+The daily spend bound is landed in `bin/fm-worker-lifecycle.py`: `FM_AZURE_WORKER_DAILY_BOUND_USD`
+(default 100; zero, negative, or non-numeric values refuse loudly rather than meaning unbounded)
+refuses every new compute-creating or compute-resuming provider action - `create` and `resume` -
+once the day's recorded spend crosses it, while releases, deallocates, deletions, resets, the
+message lane, and `execute` on already-held capacity stay allowed so wind-down is never blocked.
+The only way past it is the explicit operator override
+`FM_AZURE_WORKER_DAILY_BOUND_OVERRIDE=<utc-day>` naming the exact current UTC day, printed loudly
+and recorded durably every time it admits.
+Honest caveat: Cost Management gives month-to-date actual that lags hours, so day spend is
+current actual minus a durable baseline snapshotted at the first observation of each UTC day,
+and the bound is a backstop on RECORDED spend rather than a real-time meter; the same-day
+protectors ahead of it are the per-mutation cumulative admission and the idle deallocate path.
 
-Work: a daily spend bound that refuses a mutation once the day's spend crosses it; an idle
-release path so an assigned worker whose task ended returns its compute without a human; and,
-once R10 exists, the per-submitter daily metering and the listener's standing cost that R10
-books here.
+Idle release is landed as idle DEALLOCATE: an assigned worker whose last durably recorded
+execution finished more than `FM_AZURE_WORKER_IDLE_RELEASE_SECONDS` ago (default 14,400 - the
+four hours wkr-04 idled - floor 600), with no pending claim on its slot and its queue item still
+assigned, gets an automatic deallocate planned by reconcile, and status loudly lists it until a
+human releases it properly.
+Deallocation, not release: releasing requires authority receipts a machine cannot mint, while
+deallocation is reversible and stops the spend, which is what this requirement needs.
+A worker with no recorded execution is never idle-deallocated (nothing proves its task ended);
+its TTL remains the backstop.
+The adjacent cooldown gap is also closed: a release-proved worker whose VM was deallocated
+operator-side (surrender's dark-compute gate) now gets `cooldown_started_at` stamped on first
+observation, so `delete-compute` becomes due instead of waiting forever.
 
-Acceptance: a day cannot cross the bound without an explicit operator override, and a worker whose
-task ended releases and deallocates unattended.
+R10 metering and standing-cost booking: the Slack listener runs on the operator mac in v1, so
+its standing Azure cost is approximately zero; its per-submitter daily request ledger lives
+under `$FM_HOME/state/crosscheck-slack`, with `daily_request_cap` binding today and
+`daily_budget_usd` binding once that ledger records per-review cost.
+
+Acceptance: a day cannot cross the bound without an explicit operator override, and a worker
+whose task ended deallocates unattended.
+The hermetic legs are covered in `tests/fm-worker-lifecycle.test.sh`; the live demonstration on
+billable capacity has not run yet.
 
 ## Order of work
 

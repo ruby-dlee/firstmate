@@ -48,7 +48,7 @@ MAX_ARCHIVE = 1024**3
 # bin/fm-azure-validation.py, which refuses any shard command that differs.
 CELL_HOST_CAPABILITY_DECLARATION = (
     "FM_TEST_HOST_CAPABILITIES_ABSENT="
-    "real-tmux-server,passwordless-root-escalation,system-openat-binding"
+    "real-tmux-server,passwordless-root-escalation,system-openat-binding,origin-egress"
 )
 MAX_WAIT_SECONDS = 4 * 3600
 

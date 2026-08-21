@@ -44,7 +44,7 @@ RUNTIME_SCHEMA = "fm.azure-validation-runtime/v1"
 # planner route, so the cell cannot quietly widen or drop the skip set.
 CELL_HOST_CAPABILITY_DECLARATION = (
     "FM_TEST_HOST_CAPABILITIES_ABSENT="
-    "real-tmux-server,passwordless-root-escalation,system-openat-binding"
+    "real-tmux-server,passwordless-root-escalation,system-openat-binding,origin-egress"
 )
 # Azure firstmate is powered entirely by pi-codex; the single claude profile
 # exists only for the cross-check lane. Add further providers here only when

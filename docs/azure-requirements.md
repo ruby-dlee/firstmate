@@ -178,37 +178,34 @@ neither is the receipts strand:
    `fm-watcher-lock` failed in the cell with exit 124, a timeout, next to `Killed` lines in the
    same shard log. A skip in either would hide a real regression.
 
-   STILL OPEN, and now root-caused: `fm-teardown-a` and `fm-teardown-b` refuse with `secondmate
-   home upstream probe cleanup is unverified`. Instrumenting `run_secondmate_remote_probe` showed
-   the probe never runs at all; `secondmate_remote_identity` fails first. Two independent
-   environment facts each cause it, and both were reproduced: a host with no interface inventory
-   at any of the four absolute paths `secondmate_network_remote_identity` accepts
-   (`/sbin/ifconfig`, `/usr/sbin/ifconfig`, `/usr/sbin/ip`, `/sbin/ip`), and a host with no
-   outbound reach to the origin remote's host. With `iproute2` installed AND network, both files
-   pass all 143 units; with `iproute2` installed and `--network none`, the identical refusal
-   returns. The cell has deny-all repository-command egress by design
-   (`bin/fm-azure-runner-command.sh`), so the second is permanent there and no package fixes it.
+   GATED, as a fourth declared capability: `fm-teardown-a` and `fm-teardown-b` refuse with
+   `secondmate home upstream probe cleanup is unverified`. Instrumenting
+   `run_secondmate_remote_probe` showed the probe never runs at all; `secondmate_remote_identity`
+   fails first, because it needs outbound DNS resolution and network reach to the origin remote's
+   host. With network both files pass all 143 units; with `--network none` the identical refusal
+   returns. The cell's repository-command egress is deny-all BY DESIGN
+   (`bin/fm-azure-runner-command.sh`), so this is a genuine and permanent capability absence
+   there, and no package fixes it. That is `origin-egress`.
 
-   That blocker is deliberately NOT gated here. Enumerating the affected units by iteration found
-   at least NINETEEN, all in the secondmate teardown/retirement family, and the enumeration had
-   not converged when it was stopped: `test_forced_secondmate_retains_child_on_treehouse_failure`,
-   `..._retains_child_when_treehouse_unavailable`, `..._retains_stash`,
-   `..._retains_unquiesced_unmanaged_child`, `..._retains_unverified_process_group`,
-   `..._quiesces_parent_before_child_cleanup`, `..._child_uses_child_home_for_endpoint_verification`,
-   `test_managed_child_teardown_locks_generation_before_snapshot`,
-   `test_secondmate_retirement_retains_idle_registered_child`,
-   `test_secondmate_project_tags_do_not_prove_landing`,
-   `test_secondmate_retirement_recurses_into_ignored_nested_repositories`,
-   `..._accounts_for_directory_symlinks`, `..._rejects_mount_boundaries`,
-   `..._rejects_incomplete_surviving_authority`, `..._rejects_local_network_aliases`,
-   `..._rejects_source_common_dir_in_home`, `..._retains_reflog_and_rewritten_history`,
-   `..._serializes_child_spawn`, `test_secondmate_registry_updates_are_locked_and_literal`, and
-   `test_secondmate_state_enumeration_fails_closed`. A partial skip set is worse than none: it
-   looks principled and covers less than it claims. It also needs a decision that is not the test
-   suite's to make, because there are two real resolutions and the better one may be the second:
-   declare one capability covering the whole family, or permit the upstream-authority probe a
-   narrow egress path to the origin host so the cell keeps the coverage. Until one is chosen and
-   the set is enumerated to convergence, a cell run cannot reach a green test step.
+   The affected units were enumerated to CONVERGENCE, in one deterministic pass rather than by
+   iteration: the suite invokes every case through a single choke point, `run_partitioned_test`,
+   so running each case in a subshell there reports every failure in one run instead of stopping
+   at the first. Both files were run to completion with the network off - 143 of 143 cases - and
+   the result is exactly 33 units, all in the secondmate teardown/retirement family. An earlier
+   one-at-a-time iteration had found only 19 and had not converged; the difference is why the
+   partial set was not shipped.
+
+   BE CLEAR ABOUT WHAT THIS COSTS. Those 33 units are SKIPPED in the cell, not preserved by some
+   other route. The cell does not verify secondmate teardown or retirement authority at all: not
+   the landed-work refusals, not the registry locking, not the network-authority pinning, not the
+   child quiescence ordering. macOS and CI still run every one of them, and CI is where that
+   coverage now lives for any change touching `bin/fm-teardown.sh`.
+
+   The alternative the owner could choose later is to permit the upstream-authority probe a
+   narrow egress path to the origin host, which would give the cell this coverage back. That was
+   deliberately NOT done here: deny-all egress in that cell is a security property, and trading
+   it for a green check is an owner-level decision about the cell's security posture, not a test
+   suite's call.
 
 So the receipts fix is exercised live up to the gate, which is exactly what used to be
 impossible, and `close` stays unproven: the acceptance sentence below is not yet met.

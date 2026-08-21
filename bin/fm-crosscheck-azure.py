@@ -748,6 +748,7 @@ def create_credential_archive(
     identity: dict[str, str],
     config: dict[str, str],
     reviewer_account_identity: str,
+    core: Any,
 ) -> tuple[str, str]:
     """Package the reviewer credential for one-way copy-in at boot.
 
@@ -831,12 +832,18 @@ def create_credential_archive(
                     "model-level compat that is not the pinned lane compat"
                 )
         archived_identity = cross_family_account_identity(archive_lane)
-    elif config["harness"] == "codex":
-        tokens = parsed.get("tokens") if isinstance(parsed, dict) else None
-        archived_identity = tokens.get("account_id") if isinstance(tokens, dict) else None
-    elif config["harness"] == "pi":
-        entry = parsed.get("openai-codex") if isinstance(parsed, dict) else None
-        archived_identity = entry.get("accountId") if isinstance(entry, dict) else None
+    elif config["harness"] in {"codex", "pi"}:
+        # ONE derivation, shared with `account_identity`. Deriving it here a
+        # second time is what broke this lane: this branch returned the bare
+        # account id while the admitted identity carried a `codex:` /
+        # `openai-codex:` prefix, so the comparison below could never be
+        # equal and no codex-family compartment review could ever run.
+        try:
+            archived_identity = core.account_identity_from_credential(
+                config["harness"], parsed, str(credential)
+            )
+        except core.CrosscheckToolError as exc:
+            raise AzureCrosscheckError(str(exc)) from exc
     else:
         raise AzureCrosscheckError(
             "Azure Crosscheck has no credential-archive lane for reviewer "
@@ -1971,13 +1978,27 @@ def _run_azure_review_in_lane(
         credential_path = work / "credential.tar.gz"
         result_path = work / "result.json"
         with measured_phase(phase_timer, "stage"):
-            credential_archive_digest, credential_digest = create_credential_archive(
-                credential_path,
-                credential,
-                identity,
-                config,
-                reviewer_account_identity,
-            )
+            # A raw AzureCrosscheckError here escapes to main()'s catch-all
+            # OUTSIDE the window whose handlers persist a run, so this class of
+            # refusal used to leave no ledger, no report and no data/ directory
+            # at all - the live codex-family identity refusal was invisible
+            # afterwards. Converting it to a tool failure is the same treatment
+            # the model-image attestation refusal above already gets: it is
+            # recorded, and the roster rotates to the next reviewer account.
+            try:
+                (
+                    credential_archive_digest,
+                    credential_digest,
+                ) = create_credential_archive(
+                    credential_path,
+                    credential,
+                    identity,
+                    config,
+                    reviewer_account_identity,
+                    core,
+                )
+            except AzureCrosscheckError as exc:
+                raise core.CrosscheckToolError(str(exc)) from exc
             reproved = inspect_reviewer_credential(core, config)
             if reproved != (credential, source, identifier, reviewer_account_identity):
                 raise AzureCrosscheckError(

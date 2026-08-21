@@ -438,6 +438,9 @@ author fleet consume. The pi-codex roster (which R5 records as proven at the ros
 R9 still owes the live proof) is retained as a dormant fallback behind a config flip, never
 deleted; every review must name the lane that produced it, and a status read must show whether
 GLM is serving or the fallback is active, so a silent fallback is impossible.
+(Correction, 2026-08-21: "behind a config flip" held for the LOCAL fallback only. For the
+Azure-compartment lane it was false - the codex-family path was additionally broken in code and no
+flip would have restored it. See the compartment bullet under "Still owed".)
 Fallback operation is a recorded degradation, not free service restoration: with the fallback
 active, codex-authored work is reviewed by its own family again (the flip therefore includes
 `config/crosscheck-same-model` on for the duration, which the policy screen otherwise refuses),
@@ -681,7 +684,14 @@ Still owed, and honestly so:
   04:00Z hour alone). That resource now has ZERO deployments, verified 2026-08-21, so it can serve
   nothing. If a spend signal is still wanted it is a Fireworks-side number, and the meter it would
   need does not exist here either: see the spend bullet below.
-- The Azure-compartment cross-family lane, which is switched off rather than unbuildable. The serving lane
+- The Azure-compartment lane. "Switched off rather than unbuildable" was TOO KIND, and this is the
+  second time this requirement has had to retract a merely-disabled claim without anyone reaching
+  the code (the first was the stale `pi`-binary reason). `enabled: false` was MASKING an
+  independent in-code blocker: the compartment archive gate derived the executing-account identity
+  separately from `account_identity` and compared a bare account id against a prefixed one, so the
+  codex-family path refused ITSELF and no codex-family compartment review has ever run. Fixed
+  2026-08-21 with a single shared derivation and a test that is red on the old code; the switch is
+  still off, so the lane still does not run. The serving lane
   today is the local pi reviewer. The reason recorded here previously, that the `fm-ccm` image
   carries no `pi` binary and needs a rebake, is stale and is corrected below.
 - A spend signal for the primary reviewer, HALF closed and honestly so. The cost declaration is no

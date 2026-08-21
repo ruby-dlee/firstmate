@@ -364,7 +364,7 @@ with tempfile.TemporaryDirectory() as temporary:
     identity = {"review_generation": "0123456789abcdef01234567"}
     archive_path = root / "credential.tar.gz"
     archive_digest, credential_digest = module.create_credential_archive(
-        archive_path, credential, identity, config, account_identity
+        archive_path, credential, identity, config, account_identity, core
     )
     assert archive_digest.startswith("sha256:")
     with tarfile.open(archive_path, "r:gz") as archive:
@@ -388,6 +388,7 @@ with tempfile.TemporaryDirectory() as temporary:
             identity,
             config,
             account_identity,
+            core,
         )
     except module.AzureCrosscheckError as exc:
         assert "pinned R6 provider endpoint" in str(exc), str(exc)
@@ -411,6 +412,7 @@ with tempfile.TemporaryDirectory() as temporary:
             identity,
             config,
             account_identity,
+            core,
         )
     except module.AzureCrosscheckError as exc:
         assert "pinned R6 provider endpoint" in str(exc), str(exc)
@@ -433,6 +435,7 @@ with tempfile.TemporaryDirectory() as temporary:
             identity,
             config,
             account_identity,
+            core,
         )
     except module.AzureCrosscheckError as exc:
         assert "model-level compat" in str(exc), str(exc)
@@ -459,6 +462,7 @@ with tempfile.TemporaryDirectory() as temporary:
             identity,
             config,
             account_identity,
+            core,
         )
     except module.AzureCrosscheckError as exc:
         assert "model-level" in str(exc), str(exc)
@@ -472,6 +476,56 @@ with tempfile.TemporaryDirectory() as temporary:
         assert "model-level baseUrl/api override" in str(exc), str(exc)
     else:
         raise AssertionError("a model-level endpoint override passed inspection")
+
+    # REGRESSION: the codex-family compartment path used to refuse itself.
+    # `account_identity` returned "codex:<id>" / "openai-codex:<id>" while the
+    # archive derived the BARE "<id>" separately, so
+    # `archived_identity != reviewer_account_identity` was structurally always
+    # true and no codex-family compartment review could ever run. Only the
+    # cross-family branch passed, because both sides there read one shared
+    # constant. This drives the REAL readers end to end for BOTH branches:
+    # it fails on the two-derivation code and passes on the shared one.
+    for harness, document in (
+        ("codex", {"tokens": {"account_id": "acct-codex-1"}}),
+        ("pi", {"openai-codex": {"accountId": "acct-pi-1"}}),
+    ):
+        family_home = root / ("family-home-" + harness)
+        family_home.mkdir()
+        (family_home / "auth.json").write_text(json.dumps(document), encoding="utf-8")
+        admitted = core.account_identity(harness, family_home)
+        # The prefix is the whole point: the identity is not a bare account id.
+        assert admitted.split(":", 1)[1] in {"acct-codex-1", "acct-pi-1"}, admitted
+        assert ":" in admitted and not admitted.startswith(":"), admitted
+        family_config = {
+            "harness": harness,
+            "model": "gpt-5.6-sol",
+            "effort": "xhigh",
+            "account_home": str(family_home),
+        }
+        archive_digest, _ = module.create_credential_archive(
+            root / ("family-" + harness + ".tar.gz"),
+            family_home / "auth.json",
+            identity,
+            family_config,
+            admitted,
+            core,
+        )
+        assert archive_digest.startswith("sha256:"), archive_digest
+        # A genuinely different account still refuses, so the fix did not make
+        # the comparison lenient.
+        try:
+            module.create_credential_archive(
+                root / ("family-wrong-" + harness + ".tar.gz"),
+                family_home / "auth.json",
+                identity,
+                family_config,
+                admitted + "-other",
+                core,
+            )
+        except module.AzureCrosscheckError as exc:
+            assert "differs from the admitted executing account" in str(exc), str(exc)
+        else:
+            raise AssertionError("a foreign executing account was archived")
 
     # The retired claude harness has no Azure credential lane at all.
     claude_home = root / "claude-home"
@@ -623,7 +677,7 @@ PY
 }
 
 account_and_cleanup_identity_unit() {
-  python3 - "$ADAPTER" <<'PY' || fail "Azure account and cleanup identity contract failed"
+  python3 - "$ADAPTER" "$CORE" <<'PY' || fail "Azure account and cleanup identity contract failed"
 import importlib.util
 import json
 from pathlib import Path
@@ -633,6 +687,9 @@ import tempfile
 spec = importlib.util.spec_from_file_location("azure_crosscheck", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+core_spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[2])
+core = importlib.util.module_from_spec(core_spec)
+core_spec.loader.exec_module(core)
 common = {
     "home": Path("/home/firstmate"),
     "task_id": "review-one",
@@ -658,8 +715,8 @@ common = {
     },
     "ledger": {"schema": "firstmate.crosscheck-ledger.v2", "findings": [], "runs": []},
 }
-first = module.review_identity(**common, reviewer_account_identity="account-one")
-second = module.review_identity(**common, reviewer_account_identity="account-two")
+first = module.review_identity(**common, reviewer_account_identity="openai-codex:account-one")
+second = module.review_identity(**common, reviewer_account_identity="openai-codex:account-two")
 assert first["reviewer_account_digest"] != second["reviewer_account_digest"]
 assert first["review_generation"] != second["review_generation"]
 with tempfile.TemporaryDirectory() as temporary:
@@ -667,12 +724,16 @@ with tempfile.TemporaryDirectory() as temporary:
     credential = root / "auth.json"
     credential.write_text(json.dumps({"openai-codex":{"accountId":"account-one"}}), encoding="utf-8")
     archive_digest, credential_digest = module.create_credential_archive(
-        root / "credential.tar.gz", credential, first, common["config"], "account-one"
+        root / "credential.tar.gz", credential, first, common["config"],
+        "openai-codex:account-one",
+        core,
     )
     assert archive_digest.startswith("sha256:") and credential_digest.startswith("sha256:")
     try:
         module.create_credential_archive(
-            root / "wrong.tar.gz", credential, first, common["config"], "account-two"
+            root / "wrong.tar.gz", credential, first, common["config"],
+            "openai-codex:account-two",
+            core,
         )
     except module.AzureCrosscheckError as exc:
         assert "differs" in str(exc)
@@ -682,7 +743,9 @@ with tempfile.TemporaryDirectory() as temporary:
     linked.symlink_to(credential)
     try:
         module.create_credential_archive(
-            root / "linked.tar.gz", linked, first, common["config"], "account-one"
+            root / "linked.tar.gz", linked, first, common["config"],
+            "openai-codex:account-one",
+            core,
         )
     except module.AzureCrosscheckError as exc:
         assert "symlink" in str(exc)

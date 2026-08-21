@@ -479,12 +479,46 @@ def account_identity(harness: str, account_home: Path) -> str:
 
     home = Path(account_home).resolve()
     if harness == "codex":
-        credential = read_json(
-            home / "auth.json",
-            "Codex executing-account credential",
-            maximum_bytes=1024 * 1024,
-            maximum_items=256,
-        )
+        label = "Codex executing-account credential"
+    elif harness == "pi":
+        label = "Pi executing-account credential"
+    else:
+        # The claude reader (a refresh-token digest over .credentials.json)
+        # left with the retired claude reviewer lane (R6); no crosscheck
+        # profile can reach it, so an unknown harness refuses by name.
+        tool_fail(f"no executing-account identity reader for harness {harness!r}")
+    credential = read_json(
+        home / "auth.json",
+        label,
+        maximum_bytes=1024 * 1024,
+        maximum_items=256,
+    )
+    return account_identity_from_credential(harness, credential, str(home))
+
+
+def account_identity_from_credential(
+    harness: str, credential: Any, source: str
+) -> str:
+    """Derive the executing-account identity from one PARSED credential.
+
+    This is the SINGLE derivation of that identity, and it exists because
+    there used to be two. `account_identity` reads a reviewer home's
+    `auth.json` and calls this; the Azure credential archive parses the bytes
+    it is about to package and calls the SAME function, then compares.
+
+    When the two derivations were written separately they disagreed by a
+    literal prefix: this one returns `codex:<id>` / `openai-codex:<id>` while
+    the archive returned the bare `<id>`. The archive's
+    `archived_identity != reviewer_account_identity` refusal was therefore
+    structurally always true, and NO codex-family compartment review could
+    ever run - a live run refused at that line before any billable resource.
+    Only the cross-family branch passed, because both sides there read one
+    shared constant, which is exactly why it went unnoticed. Keep it one
+    function; do not "fix" a future mismatch by making the comparison lenient
+    or by stripping prefixes in a third place.
+    """
+
+    if harness == "codex":
         tokens = credential.get("tokens") if isinstance(credential, dict) else None
         account = tokens.get("account_id") if isinstance(tokens, dict) else None
         if isinstance(account, str) and account.strip():
@@ -495,26 +529,13 @@ def account_identity(harness: str, account_home: Path) -> str:
         # crosscheck finding cc-36d5b5cfcb2a). A credential without an
         # upstream account id exposes no stable executing-account identity
         # and is refused.
-        tool_fail(
-            f"Codex credential at {home} exposes no executing account identity"
-        )
+        tool_fail(f"Codex credential at {source} exposes no executing account identity")
     if harness == "pi":
-        credentials = read_json(
-            home / "auth.json",
-            "Pi executing-account credential",
-            maximum_bytes=1024 * 1024,
-            maximum_items=256,
-        )
-        credential = (
-            credentials.get("openai-codex") if isinstance(credentials, dict) else None
-        )
-        account = credential.get("accountId") if isinstance(credential, dict) else None
+        entry = credential.get("openai-codex") if isinstance(credential, dict) else None
+        account = entry.get("accountId") if isinstance(entry, dict) else None
         if isinstance(account, str) and account.strip():
             return "openai-codex:" + account.strip()
-        tool_fail(f"Pi credential at {home} exposes no executing account identity")
-    # The claude reader (a refresh-token digest over .credentials.json) left
-    # with the retired claude reviewer lane (R6); no crosscheck profile can
-    # reach it, so an unknown harness refuses by name.
+        tool_fail(f"Pi credential at {source} exposes no executing account identity")
     tool_fail(f"no executing-account identity reader for harness {harness!r}")
 
 

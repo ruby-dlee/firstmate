@@ -105,8 +105,8 @@ JSON
     "project=$repo" \
     "kind=ship" \
     "mode=no-mistakes" \
-    "harness=codex" \
-    "model=gpt-5.5" \
+    "harness=claude" \
+    "model=claude-opus-5" \
     "account_home=$case_dir/author-home"
   cat > "$case_dir/reviewer.json" <<EOF
 {"reviewers":[{"harness":"codex","model":"gpt-5.6-sol","effort":"xhigh","account_home":"$case_dir/reviewer-home"}]}
@@ -420,7 +420,7 @@ done
 [ "$ephemeral" = yes ] && [ "$isolated" -eq 6 ] && [ -n "$prompt" ] || exit 69
 temporary=$(mktemp "${TMPDIR:-/tmp}/fm-crosscheck-pi.XXXXXX") || exit 70
 python3 "$FM_TEST_REVIEW_DRIVER" "$PWD" "$temporary" "$FM_TEST_REVIEW_SCENARIO" "$FM_TEST_HEAD" || exit 71
-python3 - "$temporary" <<'PY'
+python3 - "$temporary" "${FM_TEST_PI_STOP_REASON:-stop}" <<'PY'
 import json
 import sys
 structured = json.load(open(sys.argv[1]))
@@ -432,7 +432,7 @@ print(json.dumps({
     "message": {
         "role": "assistant",
         "content": [{"type": "text", "text": json.dumps(structured)}],
-        "stopReason": "stop",
+        "stopReason": sys.argv[2],
     },
     "toolResults": [{"toolName": "bash", "isError": False}],
 }))
@@ -1026,11 +1026,6 @@ JSON
 
 select_pi_reviewer() {
   local case_dir=$1
-  sed -i.bak \
-    -e 's/harness=codex/harness=claude/' \
-    -e 's/model=gpt-5.5/model=claude-opus-5/' \
-    "$case_dir/state/task-x1.meta"
-  rm "$case_dir/state/task-x1.meta.bak"
   cat > "$case_dir/reviewer.json" <<EOF
 {"reviewers":[
   {"harness":"pi","model":"gpt-5.6-sol","effort":"xhigh","account_home":"$case_dir/pi-home"}
@@ -1044,17 +1039,12 @@ EOF
 write_cross_family_models_json() {
   local destination=$1 slot=$2 model=$3 api_key=${4:-test-lane-key}
   cat > "$destination" <<EOF
-{"providers":{"$slot":{"baseUrl":"https://aif-fm7c799d-eus01.cognitiveservices.azure.com/openai/v1","api":"openai-completions","apiKey":"$api_key","models":[{"id":"$model","name":"$model (Azure Foundry)","reasoning":true,"input":["text"],"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0},"contextWindow":262144,"maxTokens":65536}]}}}
+{"providers":{"$slot":{"baseUrl":"https://api.fireworks.ai/inference/v1","api":"openai-completions","apiKey":"$api_key","models":[{"id":"$model","name":"cross-family reviewer","reasoning":true,"input":["text"],"cost":{"input":1.45,"output":4.69,"cacheRead":0.0,"cacheWrite":0.0},"contextWindow":1000000,"maxTokens":32000}]}}}
 EOF
 }
 
 select_cross_family_reviewer() {
-  local case_dir=$1 slot=${2:-azure-kimi} model=${3:-Kimi-K2.7-Code}
-  sed -i.bak \
-    -e 's/harness=codex/harness=claude/' \
-    -e 's/model=gpt-5.5/model=claude-opus-5/' \
-    "$case_dir/state/task-x1.meta"
-  rm "$case_dir/state/task-x1.meta.bak"
+  local case_dir=$1 slot=${2:-fireworks-glm} model=${3:-accounts/fireworks/models/glm-5p2}
   rm -f "$case_dir/pi-home/auth.json"
   write_cross_family_models_json "$case_dir/pi-home/models.json" "$slot" "$model"
   cat > "$case_dir/reviewer.json" <<EOF
@@ -1082,10 +1072,7 @@ root = Path(sys.argv[2]) / "reviewer-policy-profiles"
 root.mkdir()
 homes = {
     name: root / name
-    for name in (
-        "author-home", "codex-home", "kimi-home", "deepseek-home", "glm-home",
-        "pi-home",
-    )
+    for name in ("author-home", "codex-home", "lane-home", "pi-home")
 }
 for account_home in homes.values():
     account_home.mkdir()
@@ -1093,9 +1080,7 @@ config_path = root / "reviewer.json"
 os.environ["FM_CROSSCHECK_REVIEWER_CONFIG"] = str(config_path)
 
 profiles = [
-    ("pi", "Kimi-K2.7-Code", "xhigh", "kimi-home"),
-    ("pi", "DeepSeek-V4-Pro", "xhigh", "deepseek-home"),
-    ("pi", "FW-GLM-5.2", "xhigh", "glm-home"),
+    ("pi", "accounts/fireworks/models/glm-5p2", "xhigh", "lane-home"),
     ("codex", "gpt-5.6-sol", "xhigh", "codex-home"),
     ("pi", "gpt-5.6-sol", "xhigh", "pi-home"),
 ]
@@ -1130,9 +1115,7 @@ validation_author = {
     "account_home": str(homes["author-home"]),
 }
 expected_family = {
-    "Kimi-K2.7-Code": "cross-family-primary",
-    "DeepSeek-V4-Pro": "cross-family-primary",
-    "FW-GLM-5.2": "cross-family-primary",
+    "accounts/fireworks/models/glm-5p2": "cross-family-primary",
     "gpt-5.6-sol": "codex-fallback",
 }
 for harness, model, effort, home_name in profiles:
@@ -1158,9 +1141,7 @@ write_config(
 unlisted = expect_refused(validation_author, "must be")
 for accepted in (
     "codex gpt-5.6-sol xhigh",
-    "pi DeepSeek-V4-Pro xhigh",
-    "pi FW-GLM-5.2 xhigh",
-    "pi Kimi-K2.7-Code xhigh",
+    "pi accounts/fireworks/models/glm-5p2 xhigh",
     "pi gpt-5.6-sol xhigh",
 ):
     assert accepted in unlisted, unlisted
@@ -1176,13 +1157,13 @@ write_config(
             "harness": "claude",
             "model": "claude-opus-5",
             "effort": "xhigh",
-            "account_home": str(homes["glm-home"]),
+            "account_home": str(homes["lane-home"]),
         }
     ]
 )
 retired = expect_refused(
     validation_author,
-    "must be codex gpt-5.6-sol xhigh or pi DeepSeek-V4-Pro xhigh or pi FW-GLM-5.2 xhigh or pi Kimi-K2.7-Code xhigh or pi gpt-5.6-sol xhigh",
+    "must be codex gpt-5.6-sol xhigh or pi accounts/fireworks/models/glm-5p2 xhigh or pi gpt-5.6-sol xhigh",
 )
 print(f"REFUSED retired claude profile: {retired}")
 
@@ -1196,29 +1177,50 @@ codex_author = {
     "model": "gpt-5.6-sol",
     "account_home": str(homes["author-home"]),
 }
-# Every registered cross-family reviewer is model-separate from every
-# author family, and each records the same durable primary provenance.
-for lane_model, lane_home in (
-    ("Kimi-K2.7-Code", "kimi-home"),
-    ("DeepSeek-V4-Pro", "deepseek-home"),
-):
-    write_config([reviewer("pi", lane_model, "xhigh", lane_home)])
+# Every registered cross-family reviewer is family-separate from every
+# author family, and each records the durable primary provenance.
+for lane in module.CROSS_FAMILY_LANES.values():
+    write_config([reviewer("pi", lane["model"], "xhigh", "lane-home")])
     for author in (codex_author, claude_author):
         selected = module.reviewer_candidates(root, author)[0]
-        assert selected["model"] == lane_model, selected
+        assert selected["model"] == lane["model"], selected
         assert selected["review_family_mode"] == "cross-family-primary", selected
-    print(f"SELECTED {lane_model} primary reviewer for codex and claude authors")
+    print(f"SELECTED {lane['model']} primary reviewer for codex and claude authors")
 
 # A cross-family author (hypothetical same-model roster) still trips the
-# model screen, and the provider-slot prefix pi records does not hide it.
+# family screen, and the provider-slot prefix pi records does not hide it.
 lane_author = {
     "harness": "pi",
-    "model": "azure-kimi/Kimi-K2.7-Code",
+    "model": "fireworks-glm/accounts/fireworks/models/glm-5p2",
     "account_home": str(homes["author-home"]),
 }
-write_config([reviewer("pi", "Kimi-K2.7-Code", "xhigh", "kimi-home")])
-lane_same_model = expect_refused(lane_author, "different model")
-print(f"REFUSED same-model cross-family reviewer: {lane_same_model}")
+write_config([reviewer("pi", "accounts/fireworks/models/glm-5p2", "xhigh", "lane-home")])
+lane_same_model = expect_refused(lane_author, "outside the model family")
+print(f"REFUSED same-family cross-family reviewer: {lane_same_model}")
+
+# cc-4dcd7873f71a: independence is a FAMILY property, not a version string.
+# A gpt-5.5 author must NOT be admitted a gpt-5.6-sol codex reviewer just
+# because the ids differ.
+older_codex_author = {
+    "harness": "codex",
+    "model": "gpt-5.5",
+    "account_home": str(homes["author-home"]),
+}
+write_config([reviewer("pi", "gpt-5.6-sol", "xhigh", "pi-home")])
+codex_family = expect_refused(older_codex_author, "outside the model family")
+print(f"REFUSED codex-family reviewer for a differently versioned codex author: {codex_family}")
+# The same author is admitted the cross-family lane, with no same-model mark.
+write_config([reviewer("pi", "accounts/fireworks/models/glm-5p2", "xhigh", "lane-home")])
+selected = module.reviewer_candidates(root, older_codex_author)[0]
+assert "model_independence" not in selected, selected
+assert selected["review_family_mode"] == "cross-family-primary", selected
+print("SELECTED cross-family reviewer for a gpt-5.5 author with no relaxation")
+# And an unrecognized author model stays its own family, so nothing that used
+# to pass silently starts failing.
+assert module.model_family("mystery-1") != module.model_family("mystery-2")
+assert module.model_family("gpt-5.5") == module.model_family("gpt-5.6-sol") == "openai"
+assert module.model_family("claude-opus-5") == "anthropic"
+assert module.model_family("openai-codex-2/gpt-5.6-sol") == "openai"
 
 write_config([reviewer("pi", "gpt-5.6-sol", "xhigh", "pi-home")])
 selected = module.reviewer_candidates(root, claude_author)[0]
@@ -1232,8 +1234,8 @@ same_model_author = {
     "account_home": str(homes["author-home"]),
 }
 write_config([reviewer("pi", "gpt-5.6-sol", "xhigh", "pi-home")])
-same_model = expect_refused(same_model_author, "different model")
-print(f"REFUSED shared-model: {same_model}")
+same_model = expect_refused(same_model_author, "outside the model family")
+print(f"REFUSED shared-family: {same_model}")
 
 write_config(
     [
@@ -1360,9 +1362,9 @@ def expect_refused_exact(account_home, expected, label):
 
 
 # Absent and explicit-off configuration preserve the shipped cross-model rule.
-expect_refused(distinct, "different model", "same-model-default-off")
+expect_refused(distinct, "outside the model family", "same-model-default-off")
 mode_path.write_text("off\n", encoding="utf-8")
-expect_refused(distinct, "different model", "same-model-explicit-off")
+expect_refused(distinct, "outside the model family", "same-model-explicit-off")
 
 mode_path.write_text("on\n", encoding="utf-8")
 for account_home in (aliased, opaque, distinct):
@@ -1842,8 +1844,8 @@ test_missing_author_identity_reaches_normal_verdict() {
   record=$(make_case missing-author-identity-normal-verdict)
   IFS=$'\t' read -r case_dir base head <<< "$record"
   sed -i.bak \
-    -e 's/harness=codex/harness=pi/' \
-    -e 's#model=gpt-5.5#model=openai-codex-5/gpt-5.5#' \
+    -e 's/harness=claude/harness=pi/' \
+    -e 's#model=claude-opus-5#model=fireworks-glm/accounts/fireworks/models/glm-5p2#' \
     -e '/^account_home=/d' \
     "$case_dir/state/task-x1.meta"
   rm "$case_dir/state/task-x1.meta.bak"
@@ -1882,7 +1884,7 @@ EOF
   expect_code 1 "$rc" "retired claude reviewer profile"
   assert_grep 'CROSSCHECK TOOL-FAILURE: reviewer preflight failed' \
     "$case_dir/err" "the retired claude profile was not refused at reviewer preflight"
-  assert_grep 'must be codex gpt-5.6-sol xhigh or pi DeepSeek-V4-Pro xhigh or pi FW-GLM-5.2 xhigh or pi Kimi-K2.7-Code xhigh or pi gpt-5.6-sol xhigh' \
+  assert_grep 'must be codex gpt-5.6-sol xhigh or pi accounts/fireworks/models/glm-5p2 xhigh or pi gpt-5.6-sol xhigh' \
     "$case_dir/err" "the retired claude profile was not refused with the exact profile message"
   assert_absent "$case_dir/fakebin/claude" "Claude reviewer machinery was installed by the fixture"
   assert_absent "$case_dir/pi.log" "a reviewer launched despite the retired profile"
@@ -1895,7 +1897,7 @@ test_cross_family_reviewer_executes_bound_policy_profile() {
   # Both registered, live-verified cross-family lanes must execute on their
   # own provider slot and record their own non-secret Foundry binding: the
   # lane is data, not a hardcoded model.
-  for lane in "azure-kimi Kimi-K2.7-Code" "azure-deepseek DeepSeek-V4-Pro"; do
+  for lane in "fireworks-glm accounts/fireworks/models/glm-5p2"; do
     read -r slot model <<< "$lane"
     record=$(make_case "cross-family-reviewer-$slot")
     IFS=$'\t' read -r case_dir base head <<< "$record"
@@ -1924,10 +1926,10 @@ assert reviewer["executing_account_home"] == sys.argv[2]
 assert reviewer["account_selector"] == "PI_CODING_AGENT_DIR"
 assert reviewer["credential_source"] == "pi-" + slot + "-models-file"
 binding = hashlib.sha256(
-    ("aif-fm7c799d-eus01/" + model + "\n"
-     "https://aif-fm7c799d-eus01.cognitiveservices.azure.com/openai/v1").encode()
+    ("api.fireworks.ai/" + model + "\n"
+     "https://api.fireworks.ai/inference/v1").encode()
 ).hexdigest()
-assert reviewer["credential_identifier"] == "foundry-binding:" + slot + ":" + binding
+assert reviewer["credential_identifier"] == "provider-binding:" + slot + ":" + binding
 assert reviewer["execution_proof"]["actual_exit"] == 0
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" "$case_dir/pi-home" "$slot" "$model" \
       || fail "$model review did not record its bound provider, family mode, and non-secret credential binding"
@@ -1935,6 +1937,50 @@ assert reviewer["execution_proof"]["actual_exit"] == 0
       "a $model primary review rendered the degraded fallback marker"
   done
   pass "every registered cross-family reviewer executes on its own provider slot with a non-secret Foundry binding"
+}
+
+test_truncated_cross_family_verdict_is_never_a_verdict() {
+  local record case_dir base head rc
+  # GLM-5.2 is a reasoning model: at a tight output budget it spends the whole
+  # allowance on reasoning and the visible verdict is cut off. Measured live
+  # against the pinned Fireworks deployment on 2026-08-20: max_tokens=600
+  # returned finish_reason=length with empty visible content, while 4000
+  # completed. pi maps that finish_reason to stopReason "length".
+  #
+  # The body below is a COMPLETE, schema-valid clear verdict. Only the stop
+  # reason says it was truncated. The run must therefore refuse because a
+  # truncated turn was ADMITTED as a verdict, not because any text differed:
+  # a silently truncated verdict is a wrong verdict, and every merge rests on
+  # this lane.
+  record=$(make_case truncated-cross-family-verdict)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  select_cross_family_reviewer "$case_dir"
+  set +e
+  FM_TEST_PI_BIN=pi PATH="$case_dir/fakebin:$PATH" \
+    FM_TEST_PI_EXPECT_PROVIDER=fireworks-glm \
+    FM_TEST_PI_EXPECT_MODEL=accounts/fireworks/models/glm-5p2 \
+    FM_TEST_PI_STOP_REASON=length \
+    run_case "$case_dir" "$base" "$head" clear run \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "truncated cross-family verdict"
+  assert_no_grep 'crosscheck clear' "$case_dir/out" \
+    "a truncated reviewer turn was accepted as a clear verdict"
+  assert_grep "stopReason='length'" "$case_dir/err" \
+    "the truncated reviewer turn was not refused by its stop reason"
+  "$CROSSCHECK_PYTHON" - "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY' \
+    || fail "a truncated review was recorded as anything but a tool failure"
+import json
+import sys
+
+value = json.load(open(sys.argv[1]))
+run = value["runs"][-1]
+assert run["state"] == "tool-failure", run
+assert not run["citations"], run
+assert "reviewer" not in run or "execution_proof" not in run["reviewer"], run
+PY
+  pass "a truncated reviewer turn is a failed review, never a verdict"
 }
 
 test_cross_family_credential_binding_is_key_independent() {
@@ -1953,8 +1999,8 @@ spec.loader.exec_module(module)
 root = Path(sys.argv[2]) / "cross-family-credential-binding"
 root.mkdir()
 
-PINNED = "https://aif-fm7c799d-eus01.cognitiveservices.azure.com/openai/v1"
-LANE = module.CROSS_FAMILY_LANES["azure-kimi"]
+PINNED = "https://api.fireworks.ai/inference/v1"
+LANE = module.CROSS_FAMILY_LANES["fireworks-glm"]
 SLOT = LANE["slot"]
 MODEL = LANE["model"]
 assert LANE["base_url"] == PINNED, LANE
@@ -1963,6 +2009,8 @@ assert LANE["base_url"] == PINNED, LANE
 def write_home(name, api_key="key-one", base_url=PINNED, api="openai-completions",
                model_id=MODEL, extra_provider=False, model_extra=None,
                slot=SLOT, body=None):
+    # `name` may contain no path separators; lane ids do, so callers pass
+    # plain names.
     home = root / name
     home.mkdir()
     model = {"id": model_id, "name": "cross-family reviewer", "reasoning": True}
@@ -2006,11 +2054,16 @@ else:
     raise AssertionError("an unmapped Pi model was routed to a guessed provider")
 
 # The lane lookup is keyed on the model, tolerates pi's provider-slot prefix,
-# and never claims a codex-family model.
+# and never claims a codex-family model. Matching is EXACT: a lane model id
+# contains slashes, so a suffix rule would admit an unrelated model that
+# happens to end the same way.
 assert module.cross_family_lane_for_model(MODEL) is LANE
 assert module.cross_family_lane_for_model(SLOT + "/" + MODEL) is LANE
 assert module.cross_family_lane_for_model("gpt-5.6-sol") is None
 assert module.cross_family_lane_for_model("openai-codex-2/gpt-5.6-sol") is None
+assert module.cross_family_lane_for_model("glm-5p2") is None
+assert module.cross_family_lane_for_model("evil/models/glm-5p2") is None
+assert module.cross_family_lane_for_model(None) is None
 
 # Two credentials differing ONLY in api key must expose the identical
 # non-secret identifier: the binding is resource+deployment+endpoint and is
@@ -2028,29 +2081,25 @@ import hashlib
 for key in (first_key, second_key):
     assert key not in identifier_one
     assert hashlib.sha256(key.encode()).hexdigest() not in identifier_one
-expected = "foundry-binding:" + SLOT + ":" + hashlib.sha256(
-    ("aif-fm7c799d-eus01/" + MODEL + "\n" + PINNED).encode()
+expected = "provider-binding:" + SLOT + ":" + hashlib.sha256(
+    ("api.fireworks.ai/" + MODEL + "\n" + PINNED).encode()
 ).hexdigest()
 assert identifier_one == expected, identifier_one
 
-# Distinct lanes produce distinct identifiers: one lane's credential can
-# never be mistaken for another's in the ledger.
-other = module.CROSS_FAMILY_LANES["azure-deepseek"]
-_, other_identifier = module.inspect_pi_cross_family_credential(
-    write_home("deepseek-home", slot=other["slot"], model_id=other["model"]),
-    other,
+# The identity binds the pinned host and model, never the key.
+assert module.cross_family_account_identity(LANE) == (
+    SLOT + ":api.fireworks.ai/" + MODEL
 )
-assert other_identifier != identifier_one, other_identifier
 
 # The endpoint is an allowlist with an exact refusal, per lane.
 wrong = write_home(
     "wrong-endpoint-home",
-    base_url="https://aif-other.cognitiveservices.azure.com/openai/v1",
+    base_url="https://api.fireworks.ai.evil.example/inference/v1",
 )
 print("REFUSED foreign endpoint: " + expect_tool_failure(
     wrong,
     SLOT + " reviewer endpoint allowlist refused baseUrl "
-    "'https://aif-other.cognitiveservices.azure.com/openai/v1'; "
+    "'https://api.fireworks.ai.evil.example/inference/v1'; "
     "the only accepted endpoint is " + PINNED,
 ))
 
@@ -2103,12 +2152,33 @@ print("REFUSED pooled providers: " + expect_tool_failure(
     write_home("pooled-home", extra_provider=True),
     "exactly the " + SLOT + " provider",
 ))
-# Another registered lane's provider slot is still the wrong slot: the lane
-# comes from the code registry, so a credential cannot select its own.
-print("REFUSED foreign provider slot: " + expect_tool_failure(
-    write_home("foreign-slot-home", slot="azure-deepseek", model_id=MODEL),
+# An unexpected provider slot is refused: the lane comes from the code
+# registry, so a credential can never select its own.
+print("REFUSED unexpected provider slot: " + expect_tool_failure(
+    write_home("foreign-slot-home", slot="openai-codex", model_id=MODEL),
     "exactly the " + SLOT + " provider",
 ))
+print("REFUSED retired azure slot: " + expect_tool_failure(
+    write_home("retired-slot-home", slot="azure-glm", model_id=MODEL),
+    "exactly the " + SLOT + " provider",
+))
+
+# `compat` is the other model-level object pi honors, and some of its keys
+# weaken this gate's own defenses, so the lane owns it exactly. The pinned
+# lane declares none, so any compat at all refuses.
+assert LANE["compat"] == {}, LANE
+print("REFUSED model-level compat weakening the truncation guard: "
+      + expect_tool_failure(
+          write_home("compat-finish-home",
+                     model_extra={"compat": {"supportsFinishReason": False}}),
+          "model-level compat that is not the pinned lane compat",
+      ))
+print("REFUSED any model-level compat when the lane pins none: "
+      + expect_tool_failure(
+          write_home("compat-any-home",
+                     model_extra={"compat": {"supportsDeveloperRole": False}}),
+          "model-level compat that is not the pinned lane compat",
+      ))
 
 # The deployment id must be present.
 print("REFUSED missing deployment: " + expect_tool_failure(
@@ -2195,16 +2265,21 @@ for lane in module.CROSS_FAMILY_LANES.values():
 # The codex fallback may not.
 print("REFUSED forged primary: " + expect_refused("gpt-5.6-sol", "cross-family-primary"))
 # And a cross-family reviewer may not hide behind the fallback marker.
-print("REFUSED hidden primary: " + expect_refused("Kimi-K2.7-Code", "codex-fallback"))
+LANE_MODEL = next(iter(module.CROSS_FAMILY_LANES.values()))["model"]
+print("REFUSED hidden primary: " + expect_refused(LANE_MODEL, "codex-fallback"))
 
-# The legacy glm-primary value stays readable for durable ledgers, bound to
-# exactly the lane that recorded it - it is not a synonym for any primary.
+# The legacy glm-primary value stays readable for durable ledgers written
+# before the registry landed, bound to exactly the retired Azure lane model
+# that recorded it. It is not a synonym for any primary, and because that
+# model is no longer registered, a NEW run can never claim it either.
 module.validate_ledger(ledger("FW-GLM-5.2", "glm-primary"), "task-x1", URL)
-print("REFUSED legacy marker on another lane: " + expect_refused(
-    "Kimi-K2.7-Code", "glm-primary"
+module.validate_ledger(ledger("azure-glm/FW-GLM-5.2", "glm-primary"), "task-x1", URL)
+assert module.cross_family_lane_for_model("FW-GLM-5.2") is None
+print("REFUSED legacy marker on the live lane: " + expect_refused(
+    LANE_MODEL, "glm-primary"
 ))
 print("REFUSED unknown family: " + expect_refused(
-    "Kimi-K2.7-Code", "kimi-primary", "review_family_mode is invalid"
+    LANE_MODEL, "glm-5p2-primary", "review_family_mode is invalid"
 ))
 PY
   pass "review_family_mode stays bound to the reviewer model in both directions across every lane"
@@ -2244,8 +2319,8 @@ assert "model_independence" not in reviewer, reviewer
   mkdir -p "$case_dir/home/config"
   printf 'on\n' > "$case_dir/home/config/crosscheck-same-model"
   sed -i.bak \
-    -e 's/harness=codex/harness=pi/' \
-    -e 's#model=gpt-5.5#model=openai-codex-5/gpt-5.6-sol#' \
+    -e 's/harness=claude/harness=pi/' \
+    -e 's#model=claude-opus-5#model=openai-codex-5/gpt-5.6-sol#' \
     -e '/^account_home=/d' \
     "$case_dir/state/task-x1.meta"
   rm "$case_dir/state/task-x1.meta.bak"
@@ -2316,13 +2391,11 @@ def ledger_with(model, family):
 # Honest pairings load; the field also remains optional for older ledgers,
 # and the legacy glm-primary value stays readable for durable records.
 for model, family in (
-    ("Kimi-K2.7-Code", "cross-family-primary"),
-    ("DeepSeek-V4-Pro", "cross-family-primary"),
-    ("FW-GLM-5.2", "cross-family-primary"),
+    ("accounts/fireworks/models/glm-5p2", "cross-family-primary"),
+    ("fireworks-glm/accounts/fireworks/models/glm-5p2", "cross-family-primary"),
     ("FW-GLM-5.2", "glm-primary"),
-    ("gpt-5.6-sol", "codex-fallback"),
-    ("azure-kimi/Kimi-K2.7-Code", "cross-family-primary"),
     ("azure-glm/FW-GLM-5.2", "glm-primary"),
+    ("gpt-5.6-sol", "codex-fallback"),
     ("gpt-5.6-sol", None),
 ):
     module.validate_ledger(ledger_with(model, family), "task-x1", URL)
@@ -2332,9 +2405,9 @@ for model, family in (
 for model, family in (
     ("gpt-5.6-sol", "cross-family-primary"),
     ("gpt-5.6-sol", "glm-primary"),
-    ("Kimi-K2.7-Code", "codex-fallback"),
-    ("Kimi-K2.7-Code", "glm-primary"),
-    ("FW-GLM-5.2", "codex-fallback"),
+    ("accounts/fireworks/models/glm-5p2", "codex-fallback"),
+    ("accounts/fireworks/models/glm-5p2", "glm-primary"),
+    ("FW-GLM-5.2", "cross-family-primary"),
 ):
     try:
         module.validate_ledger(ledger_with(model, family), "task-x1", URL)
@@ -2353,8 +2426,8 @@ test_same_model_review_is_adversarial_and_durable() {
   mkdir -p "$case_dir/home/config"
   printf 'on\n' > "$case_dir/home/config/crosscheck-same-model"
   sed -i.bak \
-    -e 's/harness=codex/harness=pi/' \
-    -e 's#model=gpt-5.5#model=openai-codex-5/gpt-5.6-sol#' \
+    -e 's/harness=claude/harness=pi/' \
+    -e 's#model=claude-opus-5#model=openai-codex-5/gpt-5.6-sol#' \
     -e '/^account_home=/d' \
     "$case_dir/state/task-x1.meta"
   rm "$case_dir/state/task-x1.meta.bak"
@@ -2603,7 +2676,7 @@ assert reviewer["credential_identifier"] == sys.argv[2]
   # account identities: this case exists to exercise the launch-time Codex
   # credential preflight, and a same-provider pair would now be refused at
   # selection before the reviewer is ever bound.
-  sed -i.bak -e 's/harness=codex/harness=claude/' -e 's/model=gpt-5.5/model=claude-opus-5/' \
+  sed -i.bak -e 's/harness=claude/harness=claude/' -e 's/model=claude-opus-5/model=claude-opus-5/' \
     "$case_dir/state/task-x1.meta"
   rm "$case_dir/state/task-x1.meta.bak"
   set +e
@@ -4127,7 +4200,7 @@ test_reviewer_configuration_failures_are_tool_failures() {
     case "$mode" in
       absent) rm "$case_dir/reviewer.json" ;;
       same-model)
-        sed -i.bak 's/model=gpt-5.5/model=gpt-5.6-sol/' "$case_dir/state/task-x1.meta"
+        sed -i.bak -e 's/harness=claude/harness=codex/' -e 's/model=claude-opus-5/model=gpt-5.6-sol/' "$case_dir/state/task-x1.meta"
         rm "$case_dir/state/task-x1.meta.bak"
         ;;
     esac
@@ -4960,6 +5033,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_missing_author_identity_reaches_normal_verdict|\
     test_claude_reviewer_profile_is_retired|\
     test_cross_family_reviewer_executes_bound_policy_profile|\
+    test_truncated_cross_family_verdict_is_never_a_verdict|\
     test_cross_family_credential_binding_is_key_independent|\
     test_cross_family_family_marker_is_bound_to_the_reviewer_model|\
     test_codex_fallback_family_is_loud_and_recorded|\
@@ -5078,6 +5152,7 @@ test_clear_review_uses_policy_contract
 test_missing_author_identity_reaches_normal_verdict
 test_claude_reviewer_profile_is_retired
 test_cross_family_reviewer_executes_bound_policy_profile
+test_truncated_cross_family_verdict_is_never_a_verdict
 test_cross_family_credential_binding_is_key_independent
 test_cross_family_family_marker_is_bound_to_the_reviewer_model
 test_codex_fallback_family_is_loud_and_recorded

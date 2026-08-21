@@ -224,7 +224,7 @@ def preflight_reviewer_credential(core: Any, config: dict[str, str]) -> dict[str
         else None
     )
     if preflight_lane is not None:
-        # A cross-family lane authenticates with a Foundry api-key
+        # A cross-family lane authenticates with an api-key
         # models.json, which declares no expiry, so the preflight that matters
         # is the shape/allowlist inspection itself. A refusal there is already
         # the core tool failure the roster uses to rotate reviewers.
@@ -240,8 +240,8 @@ def preflight_reviewer_credential(core: Any, config: dict[str, str]) -> dict[str
             "expires_in_seconds": None,
             "refresh_expires_at": None,
             "detail": (
-                f"{preflight_lane['slot']} Foundry api-key credential "
-                "declares no expiry"
+                f"{preflight_lane['slot']} api-key credential declares no "
+                "expiry"
             ),
         }
     expiry = load_credential_expiry()
@@ -585,41 +585,18 @@ def require_model_image_attests_harness(
 # `CROSS_FAMILY_LANES` in bin/fm-crosscheck.py;
 # tests/fm-crosscheck-azure.test.sh enforces the equality as a whole, so a lane
 # added on one side and not the other is a test failure rather than a silently
-# divergent allowlist. Each lane binds exactly one Foundry resource +
-# deployment and exactly one chat-completions endpoint; the interim claude
-# reviewer lane and its provider host are retired.
+# divergent allowlist. Each lane binds exactly one provider slot + model and
+# exactly one chat-completions endpoint; the interim claude reviewer lane and
+# its provider host are retired.
 CROSS_FAMILY_LANE_API = "openai-completions"
-CROSS_FAMILY_FOUNDRY_RESOURCE = "aif-fm7c799d-eus01"
-CROSS_FAMILY_FOUNDRY_HOST = (
-    CROSS_FAMILY_FOUNDRY_RESOURCE + ".cognitiveservices.azure.com"
-)
-CROSS_FAMILY_FOUNDRY_BASE_URL = (
-    "https://" + CROSS_FAMILY_FOUNDRY_HOST + "/openai/v1"
-)
 CROSS_FAMILY_LANES = {
-    "azure-kimi": {
-        "slot": "azure-kimi",
-        "model": "Kimi-K2.7-Code",
+    "fireworks-glm": {
+        "slot": "fireworks-glm",
+        "model": "accounts/fireworks/models/glm-5p2",
         "api": CROSS_FAMILY_LANE_API,
-        "foundry_resource": CROSS_FAMILY_FOUNDRY_RESOURCE,
-        "host": CROSS_FAMILY_FOUNDRY_HOST,
-        "base_url": CROSS_FAMILY_FOUNDRY_BASE_URL,
-    },
-    "azure-deepseek": {
-        "slot": "azure-deepseek",
-        "model": "DeepSeek-V4-Pro",
-        "api": CROSS_FAMILY_LANE_API,
-        "foundry_resource": CROSS_FAMILY_FOUNDRY_RESOURCE,
-        "host": CROSS_FAMILY_FOUNDRY_HOST,
-        "base_url": CROSS_FAMILY_FOUNDRY_BASE_URL,
-    },
-    "azure-glm": {
-        "slot": "azure-glm",
-        "model": "FW-GLM-5.2",
-        "api": CROSS_FAMILY_LANE_API,
-        "foundry_resource": CROSS_FAMILY_FOUNDRY_RESOURCE,
-        "host": CROSS_FAMILY_FOUNDRY_HOST,
-        "base_url": CROSS_FAMILY_FOUNDRY_BASE_URL,
+        "compat": {},
+        "host": "api.fireworks.ai",
+        "base_url": "https://api.fireworks.ai/inference/v1",
     },
 }
 
@@ -632,28 +609,31 @@ HARNESS_PROVIDER_HOSTS = {
 def cross_family_lane_for_model(reviewer_model: Any) -> dict[str, str] | None:
     """Return the registered cross-family lane one reviewer model belongs to.
 
-    Mirrors `cross_family_lane_for_model` in bin/fm-crosscheck.py. The lane is
-    keyed on the model, never on anything the credential file supplies.
+    Mirrors `cross_family_lane_for_model` in bin/fm-crosscheck.py, including
+    its exact matching rule: a lane model id can itself contain slashes, so
+    the comparison is against the id or the `<slot>/<model>` form pi records,
+    never a suffix. The lane is keyed on the model, never on anything the
+    credential file supplies.
     """
 
     if not isinstance(reviewer_model, str):
         return None
-    identity = reviewer_model.rsplit("/", 1)[-1].strip()
+    candidate = reviewer_model.strip()
     for lane in CROSS_FAMILY_LANES.values():
-        if lane["model"] == identity:
+        if candidate in (lane["model"], lane["slot"] + "/" + lane["model"]):
             return lane
     return None
 
 
 def cross_family_account_identity(lane: dict[str, str]) -> str:
-    return lane["slot"] + ":" + lane["foundry_resource"] + "/" + lane["model"]
+    return lane["slot"] + ":" + lane["host"] + "/" + lane["model"]
 
 
 def effective_provider_host(
     azure: dict[str, Any], reviewer_harness: str, reviewer_model: str
 ) -> str:
     """One exact model-egress host per review, decided by the reviewer model
-    first: a cross-family review binds that lane's pinned Foundry host and
+    first: a cross-family review binds that lane's pinned provider host and
     refuses any other configured host. For the codex-family fallback, explicit
     config wins, else the reviewer harness names its provider."""
     lane = (
@@ -736,7 +716,7 @@ def inspect_reviewer_credential(
         and cross_family_lane_for_model(config["model"]) is not None
     ):
         # R6 cross-family lane: the credential is the api-key models.json and
-        # the executing identity is the non-secret Foundry resource/deployment
+        # the executing identity is the non-secret provider host/model
         # binding, because an api key names no upstream account.
         lane = cross_family_lane_for_model(config["model"])
         source, identifier = core.inspect_pi_cross_family_credential(
@@ -805,8 +785,7 @@ def create_credential_archive(
     if archive_lane is not None:
         # The archived cross-family credential must stay inside that lane's R6
         # endpoint allowlist, and its executing identity is the non-secret
-        # Foundry resource/deployment binding - never the api key or a digest
-        # of it.
+        # provider host/model binding - never the api key or a digest of it.
         slot = archive_lane["slot"]
         providers = parsed.get("providers") if isinstance(parsed, dict) else None
         entry = (
@@ -818,7 +797,7 @@ def create_credential_archive(
         if base_url != archive_lane["base_url"]:
             raise AzureCrosscheckError(
                 f"archived {slot} reviewer credential is not bound to the "
-                f"pinned R6 Foundry endpoint {archive_lane['base_url']}"
+                f"pinned R6 provider endpoint {archive_lane['base_url']}"
             )
         # pi gives model-level baseUrl/api precedence over the provider
         # level, so a model entry carrying either field would escape the
@@ -832,7 +811,15 @@ def create_credential_archive(
                 raise AzureCrosscheckError(
                     f"archived {slot} reviewer credential carries a "
                     "model-level baseUrl/api override that escapes the pinned "
-                    "R6 Foundry endpoint"
+                    "R6 provider endpoint"
+                )
+            if (
+                isinstance(model_entry, dict)
+                and model_entry.get("compat", {}) != archive_lane["compat"]
+            ):
+                raise AzureCrosscheckError(
+                    f"archived {slot} reviewer credential carries a "
+                    "model-level compat that is not the pinned lane compat"
                 )
         archived_identity = cross_family_account_identity(archive_lane)
     elif config["harness"] == "codex":
@@ -2241,7 +2228,7 @@ def validate_azure_reviewer_record(
     if recorded_lane is not None and identity["provider_host"] != recorded_lane["host"]:
         raise RuntimeError(
             f"{label}.reviewer {recorded_lane['slot']} provider host is not "
-            "the pinned R6 Foundry endpoint"
+            "the pinned R6 provider endpoint"
         )
     generation = digest_bytes(
         canonical_bytes({field: identity[field] for field in generation_fields})

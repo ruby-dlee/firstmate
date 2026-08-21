@@ -69,53 +69,32 @@ LEGACY_AUTHOR_ADMISSION_MODE = "legacy-author-admission"
 # The reviewer identity binds the Foundry resource + deployment, never the api
 # key or anything derived from it.
 CROSS_FAMILY_LANE_API = "openai-completions"
-CROSS_FAMILY_FOUNDRY_RESOURCE = "aif-fm7c799d-eus01"
-CROSS_FAMILY_FOUNDRY_HOST = (
-    CROSS_FAMILY_FOUNDRY_RESOURCE + ".cognitiveservices.azure.com"
-)
-CROSS_FAMILY_FOUNDRY_BASE_URL = (
-    "https://" + CROSS_FAMILY_FOUNDRY_HOST + "/openai/v1"
-)
+# pi's OpenAI-completions client honors two MODEL-LEVEL knobs that outrank the
+# provider level: `baseUrl`/`api` (dist/api provider composer) and the per-model
+# `compat` object. `compat` is not cosmetic - `supportsFinishReason: false`
+# would blunt the truncated-verdict refusal this gate depends on - so each lane
+# declares the EXACT compat its credential may carry and the inspector refuses
+# anything else, the same treatment baseUrl and api already get.
 CROSS_FAMILY_LANES = {
-    # Primary lane. Verified live 2026-08-20: HTTP 200 on the pinned endpoint.
-    "azure-kimi": {
-        "slot": "azure-kimi",
-        "model": "Kimi-K2.7-Code",
+    # The direct Fireworks account. Reaching GLM-5.2 through Azure AI Foundry's
+    # Fireworks partner lane is impossible on this subscription: partner models
+    # are Marketplace SaaS offers and a credit-only "Microsoft Azure
+    # Sponsorship" subscription cannot purchase them, so `FW-GLM-5.2` returned
+    # HTTP 500 `invalid_model_endpoint_authentication` on every request. Going
+    # direct bypasses Azure Marketplace. The evidence and citation are in
+    # docs/azure-requirements.md R6.
+    #
+    # The pinned model id, not the `accounts/fireworks/routers/glm-5p2-fast`
+    # router: a router may re-point to a different serving variant, and the
+    # reviewer identity this gate records has to name an exact model. Router
+    # latency is not worth an unattributable reviewer.
+    "fireworks-glm": {
+        "slot": "fireworks-glm",
+        "model": "accounts/fireworks/models/glm-5p2",
         "api": CROSS_FAMILY_LANE_API,
-        "foundry_resource": CROSS_FAMILY_FOUNDRY_RESOURCE,
-        "host": CROSS_FAMILY_FOUNDRY_HOST,
-        "base_url": CROSS_FAMILY_FOUNDRY_BASE_URL,
-    },
-    # Second cross-family lane, a genuinely different vendor from the primary,
-    # so one vendor outage does not drop reviews back to the author's own
-    # family. Verified live 2026-08-20: HTTP 200 on the pinned endpoint and on
-    # the `services.ai.azure.com/models` route.
-    "azure-deepseek": {
-        "slot": "azure-deepseek",
-        "model": "DeepSeek-V4-Pro",
-        "api": CROSS_FAMILY_LANE_API,
-        "foundry_resource": CROSS_FAMILY_FOUNDRY_RESOURCE,
-        "host": CROSS_FAMILY_FOUNDRY_HOST,
-        "base_url": CROSS_FAMILY_FOUNDRY_BASE_URL,
-    },
-    # Retained as evidence, NOT usable on this subscription and NOT rostered.
-    # Fireworks-published (`FW-*`) deployments are Marketplace SaaS offers, and
-    # this subscription is "Microsoft Azure Sponsorship": credit-only sponsored
-    # subscriptions cannot purchase Marketplace SaaS offers, so the deployment
-    # exists but its linkage to the publisher backend can never be established
-    # and every request returns HTTP 500
-    # `invalid_model_endpoint_authentication`. Non-Fireworks publishers on the
-    # same account, same key, same subscription answer 200. Details and the
-    # citation are in docs/azure-requirements.md R6. The entry stays registered
-    # so the roster can be pointed back at it without a code change if the
-    # subscription ever gains a pay-as-you-go billing method.
-    "azure-glm": {
-        "slot": "azure-glm",
-        "model": "FW-GLM-5.2",
-        "api": CROSS_FAMILY_LANE_API,
-        "foundry_resource": CROSS_FAMILY_FOUNDRY_RESOURCE,
-        "host": CROSS_FAMILY_FOUNDRY_HOST,
-        "base_url": CROSS_FAMILY_FOUNDRY_BASE_URL,
+        "compat": {},
+        "host": "api.fireworks.ai",
+        "base_url": "https://api.fireworks.ai/inference/v1",
     },
 }
 # The model decides the Pi provider slot. An unmapped model is refused rather
@@ -125,12 +104,30 @@ PI_MODEL_PROVIDERS = {
     **{lane["model"]: lane["slot"] for lane in CROSS_FAMILY_LANES.values()},
     "gpt-5.6-sol": "openai-codex",
 }
+# Model-family classification for the reviewer independence screen. Comparing
+# exact model IDs was not enough: a `gpt-5.5` author admitted a `gpt-5.6-sol`
+# codex fallback with no same-model marker, which is same-family review of the
+# kind R6 exists to prevent (crosscheck finding cc-4dcd7873f71a, reproduced
+# 2026-08-21). A registered cross-family lane is its own family; the prefixes
+# below name the families the fleet actually authors on. An unrecognized model
+# stays its own family, which preserves the previous behavior for anything not
+# listed while strictly tightening it for everything that is.
+AUTHOR_MODEL_FAMILY_PREFIXES = (
+    ("gpt-", "openai"),
+    ("o1-", "openai"),
+    ("o3-", "openai"),
+    ("o4-", "openai"),
+    ("codex-", "openai"),
+    ("claude-", "anthropic"),
+)
 # Review family provenance recorded in every run's ledger reviewer record.
 REVIEW_FAMILY_CROSS_FAMILY_PRIMARY = "cross-family-primary"
 # Legacy provenance value: runs recorded before the lane registry landed named
-# the GLM lane directly. Durable ledgers still carry it, so validation accepts
-# it - bound, as before, to exactly the GLM lane's model.
+# the Azure GLM lane directly. Durable ledgers still carry it, so validation
+# accepts it - bound, as before, to exactly that lane's model, which is no
+# longer a registered lane and so can never be claimed by a new run.
 REVIEW_FAMILY_GLM_PRIMARY = "glm-primary"
+LEGACY_GLM_PRIMARY_MODEL = "FW-GLM-5.2"
 REVIEW_FAMILY_CODEX_FALLBACK = "codex-fallback"
 REVIEW_FAMILY_PRIMARY_MODES = {
     REVIEW_FAMILY_CROSS_FAMILY_PRIMARY,
@@ -604,8 +601,14 @@ def inspect_pi_credential(account_home: Path) -> tuple[str, str]:
     return "pi-openai-codex-oauth-file", str(credential_file)
 
 
-def cross_family_lane_for_model(model: str) -> dict[str, str] | None:
+def cross_family_lane_for_model(model: Any) -> dict[str, str] | None:
     """Return the registered cross-family lane a reviewer model belongs to.
+
+    Matching is EXACT against the lane's model id, or against the
+    `<provider-slot>/<model>` form pi records. It is deliberately not a suffix
+    or `model_identity` comparison: a lane model id can itself contain slashes
+    (`accounts/fireworks/models/glm-5p2`), so a loose rule would either miss
+    the lane or admit an unrelated model that happens to end the same way.
 
     A model outside CROSS_FAMILY_LANES is not a cross-family reviewer: it is
     either the codex-family fallback or an unmapped model that
@@ -613,22 +616,42 @@ def cross_family_lane_for_model(model: str) -> dict[str, str] | None:
     the fallback lane and the primary lane from ever blurring together.
     """
 
-    identity = model_identity(model)
+    if not isinstance(model, str):
+        return None
+    candidate = model.strip()
     for lane in CROSS_FAMILY_LANES.values():
-        if lane["model"] == identity:
+        if candidate in (lane["model"], lane["slot"] + "/" + lane["model"]):
             return lane
     return None
+
+
+def model_family(model: Any) -> str:
+    """Classify one model into the family the independence screen compares.
+
+    Reviewer independence is a FAMILY property, not a version-string one.
+    Comparing exact ids let a `gpt-5.5` author be reviewed by `gpt-5.6-sol`
+    with no same-model marker recorded (cc-4dcd7873f71a).
+    """
+
+    lane = cross_family_lane_for_model(model)
+    if lane is not None:
+        return "cross-family:" + lane["slot"]
+    identity = model_identity(model if isinstance(model, str) else "").lower()
+    for prefix, family in AUTHOR_MODEL_FAMILY_PREFIXES:
+        if identity.startswith(prefix):
+            return family
+    return "model:" + identity
 
 
 def cross_family_account_identity(lane: dict[str, str]) -> str:
     """Non-secret executing identity for one api-key cross-family lane.
 
     An api key names no upstream account, so the reviewer identity is the
-    provider slot plus the Foundry resource/deployment pair. It neither
-    contains nor is derived from the key.
+    provider slot plus the pinned endpoint host and model. It neither contains
+    nor is derived from the key.
     """
 
-    return lane["slot"] + ":" + lane["foundry_resource"] + "/" + lane["model"]
+    return lane["slot"] + ":" + lane["host"] + "/" + lane["model"]
 
 
 def pi_provider_for_model(model: str) -> str:
@@ -740,6 +763,18 @@ def inspect_pi_cross_family_credential(
                 "fields precedence over the provider, so the pinned "
                 "provider-level endpoint must own both"
             )
+        # `compat` is the other model-level object pi honors, and some of its
+        # keys weaken this gate's own defenses (`supportsFinishReason: false`
+        # would blunt the truncated-verdict refusal), so every entry must
+        # carry exactly the lane's declared compat and nothing else.
+        if entry.get("compat", {}) != lane["compat"]:
+            tool_fail(
+                f"{slot} reviewer credential at {credential_file} carries a "
+                "model-level compat that is not the pinned lane compat "
+                f"{json.dumps(lane['compat'], sort_keys=True)}; compat keys "
+                "change how pi frames the request and reads the response, so "
+                "the lane owns them"
+            )
     if lane["model"] not in [entry.get("id") for entry in model_entries]:
         tool_fail(
             f"{slot} reviewer credential at {credential_file} does not "
@@ -747,7 +782,7 @@ def inspect_pi_cross_family_credential(
         )
     binding = hashlib.sha256(
         (
-            lane["foundry_resource"]
+            lane["host"]
             + "/"
             + lane["model"]
             + "\n"
@@ -756,7 +791,7 @@ def inspect_pi_cross_family_credential(
     ).hexdigest()
     return (
         "pi-" + slot + "-models-file",
-        "foundry-binding:" + slot + ":" + binding,
+        "provider-binding:" + slot + ":" + binding,
     )
 
 
@@ -2949,24 +2984,29 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
             if family is not None:
                 # The family marker is bound to the model, so a forged record
                 # cannot claim a primary lane for a codex-family review or
-                # hide a fallback behind the primary label.
+                # hide a fallback behind the primary label. Each marker names
+                # the exact set of models allowed to carry it:
+                #
+                #   cross-family-primary -> a currently registered lane
+                #   glm-primary (legacy)  -> only the retired Azure GLM model,
+                #                            which is no longer registered, so
+                #                            no new run can claim it
+                #   codex-fallback        -> neither of the above
                 reviewer_model = reviewer.get("model")
-                lane = (
-                    cross_family_lane_for_model(reviewer_model)
-                    if isinstance(reviewer_model, str)
-                    else None
+                lane = cross_family_lane_for_model(reviewer_model)
+                is_legacy_glm = (
+                    isinstance(reviewer_model, str)
+                    and model_identity(reviewer_model)
+                    == LEGACY_GLM_PRIMARY_MODEL
                 )
+                if family == REVIEW_FAMILY_CROSS_FAMILY_PRIMARY:
+                    matches = lane is not None
+                elif family == REVIEW_FAMILY_GLM_PRIMARY:
+                    matches = is_legacy_glm
+                else:
+                    matches = lane is None and not is_legacy_glm
                 require(
-                    (family in REVIEW_FAMILY_PRIMARY_MODES) == (lane is not None),
-                    f"{label}.reviewer.review_family_mode does not match the "
-                    "reviewer model",
-                )
-                # The legacy value names one specific lane, so it stays bound
-                # to that lane's model rather than becoming a free synonym for
-                # any cross-family primary.
-                require(
-                    family != REVIEW_FAMILY_GLM_PRIMARY
-                    or (lane is not None and lane["slot"] == "azure-glm"),
+                    matches,
                     f"{label}.reviewer.review_family_mode does not match the "
                     "reviewer model",
                 )
@@ -3203,10 +3243,15 @@ def reviewer_candidates(
                 ),
             }
         )
-    author_model = model_identity(meta["model"])
+    # Independence is compared on the model FAMILY, not the exact id: a
+    # `gpt-5.5` author admitting a `gpt-5.6-sol` reviewer is the same-family
+    # review this requirement exists to prevent (cc-4dcd7873f71a). The durable
+    # ledger marker keeps its `same-model` spelling, which older records
+    # already carry; it now means "shares the author's model family".
+    author_family = model_family(meta["model"])
     eligible: list[dict[str, str]] = []
     for reviewer in validated:
-        model_is_separate = model_identity(reviewer["model"]) != author_model
+        model_is_separate = model_family(reviewer["model"]) != author_family
         if model_is_separate or allow_same_model:
             if not model_is_separate:
                 reviewer["model_independence"] = "same-model"
@@ -3214,8 +3259,8 @@ def reviewer_candidates(
     if eligible:
         return eligible
     fail(
-        "reviewer model policy found no configured reviewer on a different model "
-        f"from {meta['model']!r}"
+        "reviewer model policy found no configured reviewer outside the model "
+        f"family of {meta['model']!r}"
     )
 
 
@@ -3721,8 +3766,10 @@ def run_reviewer(
         # The model decides the credential shape as well as the provider: a
         # cross-family lane authenticates through the api-key models.json
         # custom provider, while the codex-family fallback keeps its OAuth
-        # auth.json. `pi_provider_for_model` has already refused an unmapped
-        # model, so the lane lookup below cannot silently fall through.
+        # auth.json. The provider slot must be the lane's own slot: without
+        # that check a mapping edit could route a cross-family review onto the
+        # author's own family while the ledger still recorded the cross-family
+        # model.
         cross_family_lane = cross_family_lane_for_model(config["model"])
         if cross_family_lane is not None:
             require(

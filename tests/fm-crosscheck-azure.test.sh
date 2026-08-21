@@ -85,8 +85,8 @@ guest_source = guest.read_text(encoding="utf-8")
 assert "--disable shell_tool" in guest_source
 assert "--no-tools" in guest_source
 # R6: the model decides the Pi provider slot inside the guest too, every
-# registered cross-family credential is the models.json shape bound to the
-# exact Foundry endpoint, and the interim claude launch/boot-copy lane is gone
+# registered cross-family credential is the models.json shape bound to that
+# lane's exact endpoint, and the interim claude launch/boot-copy lane is gone
 # entirely. The guest is checked against the core registry rather than a
 # hardcoded name, so a lane added in one place and not the other fails here.
 import importlib.util
@@ -98,15 +98,14 @@ assert core_module.CROSS_FAMILY_LANES, "the core lane registry is empty"
 for lane in core_module.CROSS_FAMILY_LANES.values():
     assert lane["slot"] in guest_source, lane
     assert lane["model"] in guest_source, lane
+    assert lane["base_url"] in guest_source, lane
 assert "models.json" in guest_source
-assert (
-    "https://aif-fm7c799d-eus01.cognitiveservices.azure.com/openai/v1"
-    in guest_source
-)
 assert "no Pi provider mapping for model" in guest_source
 # The guest refuses model-level baseUrl/api overrides, which pi would give
-# precedence over the pinned provider-level endpoint.
+# precedence over the pinned provider-level endpoint, and the model-level
+# compat object, whose keys change how pi frames and reads the response.
 assert "model-level endpoint override" in guest_source
+assert "model-level compat override" in guest_source
 assert "claude" not in guest_source.lower()
 assert "AZURE_CLIENT_SECRET" in guest_source
 assert "DOCKER_HOST" in guest_source
@@ -207,11 +206,12 @@ assert module.CROSS_FAMILY_LANES == core.CROSS_FAMILY_LANES, (
     module.CROSS_FAMILY_LANES,
     core.CROSS_FAMILY_LANES,
 )
-assert module.CROSS_FAMILY_LANES["azure-kimi"]["model"] == "Kimi-K2.7-Code"
-assert module.CROSS_FAMILY_LANES["azure-deepseek"]["model"] == "DeepSeek-V4-Pro"
+assert module.CROSS_FAMILY_LANES["fireworks-glm"]["model"] == (
+    "accounts/fireworks/models/glm-5p2"
+)
 for lane in module.CROSS_FAMILY_LANES.values():
-    assert lane["host"] == "aif-fm7c799d-eus01.cognitiveservices.azure.com", lane
-    assert lane["base_url"] == "https://" + lane["host"] + "/openai/v1", lane
+    assert lane["host"] == "api.fireworks.ai", lane
+    assert lane["base_url"] == "https://api.fireworks.ai/inference/v1", lane
     assert module.cross_family_account_identity(lane) == (
         core.cross_family_account_identity(lane)
     )
@@ -265,7 +265,7 @@ identity = {
     "provider_host": "api.example.com",
     "provider_port": "443",
     "reviewer_harness": "pi",
-    "reviewer_model": "Kimi-K2.7-Code",
+    "reviewer_model": "accounts/fireworks/models/glm-5p2",
     "reviewer_effort": "xhigh",
     "reviewer_account_digest": "sha256:" + "2" * 64,
     "ledger_digest": "sha256:" + "f" * 64,
@@ -284,7 +284,7 @@ identity.update({
 reviewer = {
     "execution_mode": "azure-compartment-v1",
     "harness": "pi",
-    "model": "Kimi-K2.7-Code",
+    "model": "accounts/fireworks/models/glm-5p2",
     "effort": "xhigh",
     "reviewer_account_identity_sha256": "2" * 64,
     "azure_identity": identity,
@@ -293,7 +293,7 @@ run = {"head_sha": "a" * 40, "base_sha": "b" * 40, "claims_sha256": "c" * 64}
 try:
     module.validate_azure_reviewer_record(reviewer, run, "run")
 except RuntimeError as exc:
-    assert "azure-kimi provider host is not the pinned R6 Foundry endpoint" in str(exc), str(exc)
+    assert "fireworks-glm provider host is not the pinned R6 provider endpoint" in str(exc), str(exc)
 else:
     raise AssertionError(
         "a cross-family ledger record with a foreign provider host validated"
@@ -318,8 +318,8 @@ core_spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[2])
 core = importlib.util.module_from_spec(core_spec)
 core_spec.loader.exec_module(core)
 
-PINNED = "https://aif-fm7c799d-eus01.cognitiveservices.azure.com/openai/v1"
-LANE = module.CROSS_FAMILY_LANES["azure-kimi"]
+PINNED = "https://api.fireworks.ai/inference/v1"
+LANE = module.CROSS_FAMILY_LANES["fireworks-glm"]
 SLOT = LANE["slot"]
 MODEL = LANE["model"]
 
@@ -356,34 +356,8 @@ with tempfile.TemporaryDirectory() as temporary:
     )
     assert credential == home.resolve() / "models.json", credential
     assert source == "pi-" + SLOT + "-models-file", source
-    assert identifier.startswith("foundry-binding:" + SLOT + ":"), identifier
+    assert identifier.startswith("provider-binding:" + SLOT + ":"), identifier
     assert account_identity == module.cross_family_account_identity(LANE)
-
-    # Every other registered lane packages through the same code path with
-    # its own slot, model, and non-secret identity.
-    for other in module.CROSS_FAMILY_LANES.values():
-        if other["slot"] == SLOT:
-            continue
-        other_home = root / ("lane-home-" + other["slot"])
-        other_home.mkdir()
-        (other_home / "models.json").write_text(
-            models_json(slot=other["slot"], model_id=other["model"]),
-            encoding="utf-8",
-        )
-        _, other_source, other_identifier, other_identity = (
-            module.inspect_reviewer_credential(
-                core,
-                {
-                    "harness": "pi",
-                    "model": other["model"],
-                    "effort": "xhigh",
-                    "account_home": str(other_home),
-                },
-            )
-        )
-        assert other_source == "pi-" + other["slot"] + "-models-file", other_source
-        assert other_identifier != identifier, other_identifier
-        assert other_identity == module.cross_family_account_identity(other)
 
     # The packaged compartment credential is the models.json under the same
     # allowlist pin, and its archived identity is the non-secret binding.
@@ -404,7 +378,7 @@ with tempfile.TemporaryDirectory() as temporary:
     foreign = root / "foreign-home"
     foreign.mkdir()
     (foreign / "models.json").write_text(
-        models_json(base_url="https://aif-other.cognitiveservices.azure.com/openai/v1"),
+        models_json(base_url="https://api.fireworks.ai.evil.example/inference/v1"),
         encoding="utf-8",
     )
     try:
@@ -416,19 +390,19 @@ with tempfile.TemporaryDirectory() as temporary:
             account_identity,
         )
     except module.AzureCrosscheckError as exc:
-        assert "pinned R6 Foundry endpoint" in str(exc), str(exc)
+        assert "pinned R6 provider endpoint" in str(exc), str(exc)
     else:
         raise AssertionError(
             "a foreign-endpoint cross-family credential was archived"
         )
 
-    # Another registered lane's provider slot is still the wrong slot for
-    # this review: the lane is keyed on the reviewer model, never on what the
-    # credential file declares about itself.
+    # An unexpected provider slot is still the wrong slot for this review: the
+    # lane is keyed on the reviewer model, never on what the credential file
+    # declares about itself.
     swapped = root / "swapped-slot-home"
     swapped.mkdir()
     (swapped / "models.json").write_text(
-        models_json(slot="azure-deepseek"), encoding="utf-8"
+        models_json(slot="openai-codex"), encoding="utf-8"
     )
     try:
         module.create_credential_archive(
@@ -439,9 +413,31 @@ with tempfile.TemporaryDirectory() as temporary:
             account_identity,
         )
     except module.AzureCrosscheckError as exc:
-        assert "pinned R6 Foundry endpoint" in str(exc), str(exc)
+        assert "pinned R6 provider endpoint" in str(exc), str(exc)
     else:
         raise AssertionError("a foreign-slot cross-family credential was archived")
+
+    # The archive gate owns the model-level compat pin too, not just the
+    # inspector: a compat that weakens the truncation guard never ships into
+    # a compartment.
+    compat_home = root / "compat-home"
+    compat_home.mkdir()
+    (compat_home / "models.json").write_text(
+        models_json(model_extra={"compat": {"supportsFinishReason": False}}),
+        encoding="utf-8",
+    )
+    try:
+        module.create_credential_archive(
+            root / "compat.tar.gz",
+            compat_home / "models.json",
+            identity,
+            config,
+            account_identity,
+        )
+    except module.AzureCrosscheckError as exc:
+        assert "model-level compat" in str(exc), str(exc)
+    else:
+        raise AssertionError("a model-level compat override was archived")
 
     # pi gives MODEL-level baseUrl/api precedence over the provider level, so
     # a credential keeping the pinned endpoint at provider level while

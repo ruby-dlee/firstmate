@@ -49,10 +49,37 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # suite over any recorded reach; this lets the unit that owns the boundary go
 # red by itself, naming what it should never have touched.
 fm_assert_no_cloud_reach() {
-  local message=$1 log=${FM_TEST_CLOUD_REACH_LOG:-} reached
+  local message=$1 log=${FM_TEST_CLOUD_REACH_LOG:-} reached canary
   [ -n "$log" ] \
     || { printf 'not ok - %s (FM_TEST_CLOUD_REACH_LOG is unset; the cloud seal did not run)\n' "$message" >&2; exit 97; }
+
+  # Read FIRST. Everything below writes to and truncates the log, and a real
+  # reach recorded before this call must never be discarded unexamined.
   reached=$(cat "$log" 2>/dev/null || true)
+
+  # "The log is empty" only means "nothing happened" if the recorder is KNOWN
+  # LIVE. It is not enough that the guard was installed at suite start: a real
+  # `az` earlier on PATH, or an edit that stops prepending the guard directory,
+  # leaves this assertion reading an empty log while a genuine control-plane
+  # call sails past. That is a false green on the one test file that reached the
+  # operator's real subscription three separate times.
+  #
+  # So prove the detector in THIS process, through the SAME path a real call
+  # would take: resolve `az` off PATH exactly as product code does, and require
+  # the attempt to land in the log. If `az` is the guard, it records and we
+  # continue. If `az` is a real CLI, or absent, or the guard no longer writes
+  # where this reads, nothing lands and we REFUSE rather than pass.
+  canary="fm-cloud-reach-canary-$$-${RANDOM}${RANDOM}"
+  az "$canary" >/dev/null 2>&1 || true
+  grep -Fq "$canary" "$log" 2>/dev/null || {
+    printf 'not ok - %s (the cloud-reach detector is not intercepting: a canary az call left no record, so an empty log proves nothing)\n' \
+      "$message" >&2
+    exit 97
+  }
+  # Drop the canary, keep anything real, so the runner's own post-test check
+  # still sees a genuine reach and never sees this probe.
+  if [ -n "$reached" ]; then printf '%s\n' "$reached" > "$log"; else : > "$log"; fi
+
   [ -z "$reached" ] || {
     printf 'not ok - %s\n%s\n' "$message" "$reached" >&2
     exit 1

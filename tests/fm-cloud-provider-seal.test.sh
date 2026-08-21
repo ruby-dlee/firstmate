@@ -39,6 +39,7 @@ TESTS="$ROOT/tests"
 RUN_SH="$TESTS/run.sh"
 SEAL_REGISTRY="$TESTS/ambient-seal.tsv"
 TMP_ROOT=$(fm_test_tmproot fm-cloud-provider-seal)
+mkdir -p "$TMP_ROOT/empty-bin"
 
 FAILED=0
 soft_fail() { printf 'not ok - %s\n' "$1" >&2; FAILED=1; }
@@ -200,6 +201,78 @@ unit_recorded_reach_fails_the_suite() {
   pass "a recorded cloud reach fails the run, prints what was reached, and does not leak into the next test"
 }
 
+# --- 5b. the reach assertion proves its own detector is live ----------------
+#
+# "The reach log is empty" equals "nothing happened" ONLY if the recorder is
+# known live. fm_assert_no_cloud_reach therefore fires a canary through the same
+# PATH resolution a real call uses before it trusts silence. These units pin
+# that the canary is LOAD-BEARING: break the interception and the assertion must
+# REFUSE, not pass. A canary that cannot fail is the same defect one level up.
+
+unit_reach_assertion_passes_when_the_detector_is_live() {
+  local log out status
+  log="$TMP_ROOT/canary-live.log"
+  : > "$log"
+  out=$( ( FM_TEST_CLOUD_REACH_LOG="$log" fm_assert_no_cloud_reach "clean" ) 2>&1 ); status=$?
+  [ "$status" -eq 0 ] || soft_fail "a clean log with a live detector did not pass (exit $status): $out"
+  [ -s "$log" ] && soft_fail "the canary was left behind in the reach log: $(cat "$log")"
+  pass "the reach assertion passes on a clean log and leaves its own canary behind in nothing"
+}
+
+unit_reach_assertion_refuses_when_interception_is_broken() {
+  local log out status decoy
+  # A DECOY az, not the real one. The failure being modelled is "`az` resolves
+  # to something that is not the recorder", and the obvious way to stage that -
+  # drop the guard directory from PATH - falls through to the operator's REAL
+  # azure-cli. That actually ran it: the process reaper caught its telemetry
+  # child and failed the suite. Staging the break with a stub keeps this test
+  # from doing the exact thing the seal exists to prevent.
+  decoy="$TMP_ROOT/decoy-bin"
+  mkdir -p "$decoy"
+  cat > "$decoy/az" <<'SH'
+#!/usr/bin/env bash
+# Behaves like a real CLI: succeeds, and records nothing where the assertion reads.
+exit 0
+SH
+  chmod +x "$decoy/az"
+
+  log="$TMP_ROOT/canary-broken.log"
+  : > "$log"
+  out=$( ( PATH="$decoy:/usr/bin:/bin" FM_TEST_CLOUD_REACH_LOG="$log" \
+    fm_assert_no_cloud_reach "broken" ) 2>&1 ); status=$?
+  [ "$status" -eq 97 ] || soft_fail "a non-recording az did not refuse with 97 (exit $status): $out"
+  case "$out" in
+    *"detector is not intercepting"*) ;;
+    *) soft_fail "the refusal did not name the broken detector: $out" ;;
+  esac
+
+  # The other way interception breaks: no `az` on PATH at all.
+  : > "$log"
+  out=$( ( PATH="$TMP_ROOT/empty-bin" FM_TEST_CLOUD_REACH_LOG="$log" \
+    fm_assert_no_cloud_reach "absent" ) 2>&1 ); status=$?
+  [ "$status" -eq 97 ] || soft_fail "an absent az did not refuse with 97 (exit $status): $out"
+  pass "an empty log with a NON-intercepting detector refuses instead of passing green"
+}
+
+unit_reach_assertion_still_catches_a_real_reach() {
+  local log out status
+  log="$TMP_ROOT/canary-real.log"
+  printf 'FM_CLOUD_REACH test=x.test.sh via=az argv=vm create --name real\n' > "$log"
+  out=$( ( FM_TEST_CLOUD_REACH_LOG="$log" fm_assert_no_cloud_reach "real reach" ) 2>&1 ); status=$?
+  [ "$status" -eq 1 ] || soft_fail "a recorded reach did not fail with 1 (exit $status): $out"
+  case "$out" in
+    *"via=az argv=vm create --name real"*) ;;
+    *) soft_fail "the failure did not print what was reached: $out" ;;
+  esac
+  # The real reach must survive so the runner's own post-test check sees it too,
+  # and the canary must not survive.
+  grep -Fq 'argv=vm create --name real' "$log" \
+    || soft_fail "the real reach was discarded from the log: $(cat "$log")"
+  grep -Fq 'fm-cloud-reach-canary' "$log" \
+    && soft_fail "the canary was left in the log alongside the real reach"
+  pass "a real reach still fails, is printed, survives for the runner, and the canary does not"
+}
+
 # --- 6. no unit above may have polluted the REAL log ------------------------
 
 unit_this_test_reached_nothing() {
@@ -214,6 +287,9 @@ unit_this_process_is_sealed
 unit_provider_refusal_refuses_and_records
 unit_az_guard_refuses_and_records
 unit_recorded_reach_fails_the_suite
+unit_reach_assertion_passes_when_the_detector_is_live
+unit_reach_assertion_refuses_when_interception_is_broken
+unit_reach_assertion_still_catches_a_real_reach
 unit_this_test_reached_nothing
 
 exit "$FAILED"

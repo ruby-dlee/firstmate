@@ -77,6 +77,15 @@ The VM has exactly the foundation `validation-shards` UAMI, whose sole direct ro
 
 The guest root process fetches and verifies the exact public source and pinned dependency closure before creating the child.
 It remounts `/proc` with `hidepid=2` and starts repository code in a systemd private network namespace restricted to `AF_UNIX` with deny-all IP policy.
+That isolation is three unit properties on one `systemd-run` in `bin/fm-azure-runner-guest.sh` - `PrivateNetwork=yes`, `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any` - and it is the ONLY thing isolating this lane.
+It is worth being exact about which lane that is, because the sealed suite's behavior shards run HERE: the bridge submits them as `bin/fm-azure-runner-command.sh ...` and every shard result carries an `azr-` invocation id.
+The validation guest (`bin/fm-azure-validation-guest.sh`) carries no network property of its own, and the cell subnet's `nsg-<prefix>-elastic-isolated` has no custom outbound rule with a NAT gateway attached, so the validation lane is not itself network-restricted.
+Saying "the validation cell is deny-all" gets the lane wrong; the runner unit is what denies.
+
+`limits.network_bytes` is NOT a measurement, and nothing here measures bytes.
+The guest's `[ "$NETWORK_BYTES" -eq 0 ]` check reads the value the REQUEST declared and refuses any request that asked for a non-zero budget.
+That is a contract check on the request, not evidence about what the child did, and it must not be cited as proof that no traffic occurred.
+The evidence that no traffic is possible is the three unit properties above; if this lane is ever loosened, this check will still read zero and will still prove nothing.
 No managed-identity token exists before or during the child command.
 The untrusted child receives a fixed allowlisted environment with no ambient host variables.
 

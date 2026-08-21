@@ -58,6 +58,15 @@ UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][
 PR_URL = re.compile(r"^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$")
 NM_RUN_ID = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
 RUNNER_INVOCATION = re.compile(r"^azr-[a-z0-9]{12}(?:-a[2-9][0-9]*)?$")
+# The authenticated result marker. `attempt` is required: every other field
+# a control-plane read can see is identical across the attempts of one run
+# (same VM, same boot, same run id), so without it an unbound view cannot be
+# told from this attempt's own answer.
+MARKER = re.compile(
+    r"FM_AZURE_VALIDATION_RESULT\s+(sha256:[0-9a-f]{64})\s+boot=([0-9a-f-]{36})"
+    r"\s+outcome=([a-z-]+)\s+attempt=([0-9]{1,9})"
+)
+MARKER_SETTLE_SECONDS = 300
 # Shard transports legitimately run VM creation plus admission plus command
 # submission in one subprocess: near 300 seconds unloaded and well past it
 # under any operator-host load. The old 300-second cap manufactured
@@ -170,6 +179,32 @@ def now_utc():
 def iso_utc(value=None):
     value = value or now_utc()
     return value.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def marker_settle_seconds():
+    """How long an unbound terminal control view may persist before it is believed."""
+    raw = os.environ.get("FM_AZURE_VALIDATION_MARKER_SETTLE_SECONDS")
+    if raw is None or not raw.strip():
+        return MARKER_SETTLE_SECONDS
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValidationError("FM_AZURE_VALIDATION_MARKER_SETTLE_SECONDS must be a whole number of seconds")
+    if value < 0:
+        raise ValidationError("FM_AZURE_VALIDATION_MARKER_SETTLE_SECONDS must not be negative")
+    return value
+
+
+def seconds_since(stamp):
+    """Elapsed seconds since an exact recorded UTC stamp, or None when unreadable.
+
+    None is never treated as "long enough": an unreadable stamp keeps an
+    ambiguous view unsettled rather than authorizing a terminal decision.
+    """
+    try:
+        return (now_utc() - parse_utc(stamp, "recorded stamp")).total_seconds()
+    except (ValidationError, TypeError):
+        return None
 
 
 def parse_utc(value, label):
@@ -1695,6 +1730,9 @@ def create_run_command(env, state, mode, input_url=None, output_url=None, respon
         raise ValidationError("created validation Run Command has foreign identity")
     resources["run_command_name"] = name
     resources["run_command_id"] = run_id
+    # Every attempt starts its own settling window: a stamp left by the
+    # previous attempt's unbound view must never shorten this one's.
+    state.pop("unbound_view_since", None)
     resources.setdefault("run_commands", []).append({
         "id": run_id,
         "identity": immutable_identity(run_command, "run-command"),
@@ -1889,11 +1927,68 @@ def observe(env, args):
             return
         output = str((view or {}).get("output", ""))
         error = str((view or {}).get("error", ""))
-        marker = re.search(r"FM_AZURE_VALIDATION_RESULT\s+(sha256:[0-9a-f]{64})\s+boot=([0-9a-f-]{36})\s+outcome=([a-z-]+)", output)
-        if not marker:
+        marker = re.search(MARKER, output)
+        if not marker or int(marker.group(4)) != state["attempt"]:
+            # A terminal control state whose output does not carry THIS
+            # attempt's marker proves nothing about this attempt. The run
+            # command, the VM, the boot, and every identity field in
+            # result.json are shared across the attempts of one run, so an
+            # unbound view is ambiguous between "the guest died before
+            # publishing" and "the control plane has not caught up with the
+            # attempt just created". Retaining on the first such read is
+            # destructive and unrecoverable: failed-retained is a phase
+            # observe itself refuses, so one premature poll strands a cell
+            # whose attempt is still executing (generation azv-36b2 ground
+            # truth: read nine seconds after the respond Run Command was
+            # created). Fail closed by never ACCEPTING an unbound view, and
+            # take the terminal decision only once the ambiguity persists.
+            settle_seconds = marker_settle_seconds()
+            since = state.get("unbound_view_since")
+            if not since:
+                state["unbound_view_since"] = iso_utc()
+                save_state(env, state)
+                since = state["unbound_view_since"]
+            waited = seconds_since(since)
+            if waited is None or waited < settle_seconds:
+                observed = marker.group(4) if marker else "none"
+                print(
+                    "AZURE VALIDATION UNSETTLED cell={} attempt={} control_state={} "
+                    "marker_attempt={} waited={}s settle={}s".format(
+                        state["cell"], state["attempt"], execution,
+                        observed, "unknown" if waited is None else int(waited), settle_seconds,
+                    )
+                )
+                return
             transition(env, state, "failed-retained", "cell ended without an authenticated result marker", control_error=error[-2000:])
             raise ValidationError("cell ended without an authenticated result; worktree and lease remain retained")
-        state["expected_result_digest"] = marker.group(1)
+        state.pop("unbound_view_since", None)
+        digest = marker.group(1)
+        # A republished byte-identical result is a non-answer, not a verdict.
+        # An attempt that resumes a parked run without answering its gate, or
+        # one whose upload never happened and left the previous attempt's
+        # archive in place, publishes the exact bytes the previous attempt
+        # did. Name that instead of surfacing a generic failure.
+        previous = state.get("attempt_result_digests") or {}
+        stale = sorted(
+            key for key, value in previous.items()
+            if value == digest and key != str(state["attempt"])
+        )
+        if stale:
+            transition(
+                env, state, "failed-retained",
+                "attempt republished attempt {} result unchanged; the gate was not answered".format(
+                    ", ".join(stale)
+                ),
+                control_error=error[-2000:],
+            )
+            raise ValidationError(
+                "attempt {} published a byte-identical copy of attempt {}'s result; the operator "
+                "response did not reach the in-cell pipeline, so this is a non-answer, not a "
+                "verdict".format(state["attempt"], ", ".join(stale))
+            )
+        previous[str(state["attempt"])] = digest
+        state["attempt_result_digests"] = previous
+        state["expected_result_digest"] = digest
         state["expected_boot_id"] = marker.group(2)
         outcome = marker.group(3)
         if outcome == "needs-decision":
@@ -1941,6 +2036,18 @@ def verify_result_identity(state, result):
     for key, wanted in expected.items():
         if result.get(key) != wanted:
             raise ValidationError("validation result identity mismatch: {}".format(key))
+    # The attempt is the only field separating one attempt's result from
+    # another's on a resumed run, so it is required rather than defaulted: a
+    # result that does not declare its attempt is refused, never assumed to be
+    # the current one.
+    if not isinstance(result.get("attempt"), int) or isinstance(result.get("attempt"), bool):
+        raise ValidationError("validation result does not declare the attempt that produced it")
+    if result["attempt"] != state["attempt"]:
+        raise ValidationError(
+            "validation result was produced by attempt {}, not the observed attempt {}".format(
+                result["attempt"], state["attempt"]
+            )
+        )
     head = result.get("current_head")
     tree = result.get("current_tree")
     if (
@@ -2072,6 +2179,24 @@ def collect(env, args):
             digest = sha256_file(archive)
             if digest != state.get("expected_result_digest"):
                 raise ValidationError("downloaded result digest differs from the control-plane marker")
+            # Effect-shaped non-answer fence: the result blob has one name per
+            # cell, so an attempt that never uploaded leaves the previous
+            # attempt's archive in place and collect would otherwise verify it
+            # and file it as this attempt's answer. Every identity field
+            # matches on a resumed run, so byte equality with an earlier
+            # attempt is the observable that says the gate was not answered.
+            recorded = state.get("attempt_result_digests") or {}
+            stale = sorted(
+                key for key, value in recorded.items()
+                if value == digest and key != str(state["attempt"])
+            )
+            if stale:
+                raise ValidationError(
+                    "downloaded result is byte-identical to attempt {}; the operator response did "
+                    "not reach the in-cell pipeline, so this is a non-answer, not a verdict".format(
+                        ", ".join(stale)
+                    )
+                )
             extracted = temp / "extracted"
             extracted.mkdir(mode=0o700)
             safe_extract_result(archive, extracted)

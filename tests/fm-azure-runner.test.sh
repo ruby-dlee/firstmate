@@ -737,9 +737,15 @@ make_dispatch_fixture() {  # <root>: real dispatch + step code, capturing runner
   cp "$ROOT/bin/fm-azure-runner-dispatch.sh" "$root/bin/fm-azure-runner-dispatch.sh"
   cp "$ROOT/bin/fm-no-mistakes-test-command.sh" "$root/bin/fm-no-mistakes-test-command.sh"
   cp "$ROOT/bin/fm-azure-runner-command.sh" "$root/bin/fm-azure-runner-command.sh"
+  cp "$ROOT/bin/fm-azure-runner-routing.py" "$root/bin/fm-azure-runner-routing.py"
+  cp "$ROOT/bin/fm-azure-runner.py" "$root/bin/fm-azure-runner.py"
   cat >"$root/bin/fm-azure-runner.sh" <<SH
 #!/bin/sh
 printf '%s\n' "\$@" >"$root/captured"
+{
+  printf 'FM_HOME=%s\n' "\${FM_HOME:-}"
+  printf 'FM_AZURE_RUNNER_CONFIRM_SUBSCRIPTION=%s\n' "\${FM_AZURE_RUNNER_CONFIRM_SUBSCRIPTION:-}"
+} >"$root/captured-env"
 exit 0
 SH
   cat >"$root/tests/run.sh" <<SH
@@ -992,7 +998,196 @@ retail_rate_unit
 quota_snapshot_unit
 shared_allocator_bridge_unit
 commissioning_admission_unit
+routing_file_contract() {
+  local tmp fixture dispatch gatewt routing anchor fmhome expires out rc
+  fm_test_tmproot_into tmp fm-azure-runner-routing
+  fixture="$tmp/fixture"
+  make_dispatch_fixture "$fixture"
+  dispatch="$fixture/bin/fm-azure-runner-dispatch.sh"
+  gatewt="$tmp/nm-home/worktrees/19543ae8611e/$NM_RUN_FIXTURE"
+  make_ambient_worktree "$gatewt"
+  routing="$tmp/routing"
+  anchor="$tmp/home-anchor"
+  fmhome="$anchor/firstmate-home"
+  mkdir -p "$routing" "$fmhome/state"
+  expires=$(python3 -c 'import datetime as d;print((d.datetime.now(d.timezone.utc)+d.timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
+
+  write_routing() {  # <python-dict-overrides>
+    python3 - "$routing/$NM_RUN_FIXTURE.json" "$fmhome" "$SUB" "$expires" "$NM_RUN_FIXTURE" "$1" <<'PY'
+import json,sys
+value={
+  "schema":"fm.azure-runner-routing/v1","run_id":sys.argv[5],
+  "classes":{"lint":"validation-standard"},"fm_home":sys.argv[2],
+  "subscription":sys.argv[3],"expires_at":sys.argv[4],"max_dispatches":3,
+}
+value.update(json.loads(sys.argv[6]))
+for key in [k for k,v in value.items() if v is None]:
+    del value[key]
+open(sys.argv[1],"w").write(json.dumps(value,indent=2)+"\n")
+PY
+    chmod 600 "$routing/$NM_RUN_FIXTURE.json"
+  }
+
+  dispatch_here() {  # runs the real dispatch in the gate worktree
+    (cd "$gatewt" && env HOME="$anchor" FM_AZURE_RUNNER_ROUTING_ROOT="$routing" \
+      "$dispatch" lint -- sh -c "touch '$tmp/ran-locally'" 2>&1)
+  }
+
+  expect_refusal() {  # <needle> <what>
+    rm -f "$fixture/captured" "$tmp/ran-locally"
+    local rc=0 out
+    out=$(dispatch_here) || rc=$?
+    [ "$rc" -ne 0 ] || fail "$2: a broken routing file did not refuse"
+    assert_contains "$out" "$1" "$2: the refusal did not name the reason"
+    [ ! -e "$fixture/captured" ] || fail "$2: a broken routing file still dispatched to Azure"
+    [ ! -e "$tmp/ran-locally" ] || fail "$2: a broken routing file fell back to silent local execution"
+  }
+
+  # R1. ABSENT is safe: local execution, exactly today's default, and it SAYS SO.
+  # The line is what turns a routing file written too late - the run id cannot
+  # exist before the run starts - into a visible fact instead of a silent
+  # fallback, so it is asserted, not assumed.
+  rm -f "$fixture/captured" "$tmp/ran-locally"
+  out=$(dispatch_here) || fail "an absent routing file did not execute locally"
+  [ -e "$tmp/ran-locally" ] || fail "an absent routing file did not run the command locally"
+  [ ! -e "$fixture/captured" ] || fail "an absent routing file reached the runner"
+  assert_contains "$out" "executed LOCALLY (routing=absent, env=absent)" \
+    "a local execution did not announce itself distinguishably"
+
+  # R2. A valid selection dispatches with the file's OWN bindings. fm_home and
+  # the subscription come from the file rather than the environment, because the
+  # step has neither and fm_home selects which spend ledger the run writes to.
+  write_routing '{}'
+  rm -f "$fixture/captured" "$tmp/ran-locally" "$fixture/captured-env"
+  out=$(dispatch_here) || fail "a valid routing selection failed to dispatch"
+  [ -e "$fixture/captured" ] || fail "a valid routing selection never reached the runner"
+  [ ! -e "$tmp/ran-locally" ] || fail "a dispatched class also ran locally"
+  assert_contains "$out" "selected REMOTE resource-class=validation-standard" \
+    "the dispatch did not announce its remote selection"
+  python3 - "$fixture/captured" "$fixture/captured-env" "$fmhome" "$SUB" <<'PY' \
+    || fail "the routing file's own bindings were not passed to the runner"
+import sys
+argv=open(sys.argv[1]).read().splitlines()
+env=dict(line.split("=",1) for line in open(sys.argv[2]).read().splitlines())
+def value(flag): return argv[argv.index(flag)+1]
+assert value("--resource-class")=="validation-standard", argv
+assert value("--confirm-subscription")==sys.argv[4], argv
+assert env["FM_HOME"]==sys.argv[3], env
+assert env["FM_AZURE_RUNNER_CONFIRM_SUBSCRIPTION"]==sys.argv[4], env
+PY
+
+  # R3. The budget is durable: max_dispatches=1 spends once, then refuses.
+  write_routing '{"max_dispatches": 1}'
+  rm -f "$fixture/captured"
+  dispatch_here >/dev/null || fail "the first dispatch inside budget failed"
+  [ -e "$fixture/captured" ] || fail "the first dispatch never reached the runner"
+  expect_refusal "spent its dispatch budget" "an exhausted budget"
+
+  # R4. A file that exists but does not select this class is a SELECTION, not a
+  # fault: local, and distinguishable from absent.
+  write_routing '{"classes": {"test": "behavior-heavy"}}'
+  rm -f "$fixture/captured" "$tmp/ran-locally"
+  out=$(dispatch_here) || fail "an unselected class did not execute locally"
+  [ -e "$tmp/ran-locally" ] || fail "an unselected class did not run locally"
+  assert_contains "$out" "routing=present-not-selected" \
+    "a present-but-unselected file was not distinguishable from an absent one"
+
+  # R5. PRESENT-BUT-BROKEN never falls back to local. Every shape refuses BY NAME
+  # and the command runs NOWHERE.
+  write_routing '{"schema": "fm.azure-runner-routing/v99"}'
+  expect_refusal "declares schema" "a wrong schema"
+  write_routing '{"subscription": null}'
+  expect_refusal "missing required field" "a missing field"
+  write_routing '{"expires_at": "2020-01-01T00:00:00Z"}'
+  expect_refusal "expired at" "an expired window"
+  write_routing '{"run_id": "01ZZZZZZZZZZZZZZZZZZZZZZZZ"}'
+  expect_refusal "is bound to run" "a file bound to another run"
+  write_routing '{"fm_home": "/nonexistent/ledger"}'
+  expect_refusal "not an existing directory" "an unusable fm_home"
+  write_routing "{\"fm_home\": \"$tmp/outside-home\"}"
+  mkdir -p "$tmp/outside-home"
+  expect_refusal "outside" "an fm_home outside the user home"
+  write_routing '{"classes": {"lint": "not-a-real-class"}}'
+  expect_refusal "unknown resource class" "an unknown resource class"
+  write_routing '{"max_dispatches": 0}'
+  expect_refusal "positive whole number" "a non-positive budget"
+  printf '{"schema": "fm.azure-runner-rout' >"$routing/$NM_RUN_FIXTURE.json"
+  expect_refusal "not valid JSON" "a torn write"
+  : >"$routing/$NM_RUN_FIXTURE.json"
+  expect_refusal "torn write" "an empty file"
+  write_routing '{}'
+  chmod 000 "$routing/$NM_RUN_FIXTURE.json"
+  expect_refusal "unreadable" "an unreadable file"
+  chmod 600 "$routing/$NM_RUN_FIXTURE.json"
+  chmod 666 "$routing/$NM_RUN_FIXTURE.json"
+  expect_refusal "group- or world-writable" "a world-writable file"
+  rm -f "$routing/$NM_RUN_FIXTURE.json"
+  ln -s /dev/null "$routing/$NM_RUN_FIXTURE.json"
+  expect_refusal "is a symlink" "a symlinked routing file"
+  rm -f "$routing/$NM_RUN_FIXTURE.json"
+
+  # R6. Two authorities that disagree are never silently reconciled.
+  write_routing '{}'
+  rm -f "$fixture/captured" "$tmp/ran-locally"
+  rc=0
+  out=$(cd "$gatewt" && env HOME="$anchor" FM_AZURE_RUNNER_ROUTING_ROOT="$routing" \
+    FM_AZURE_RUNNER_REMOTE_CLASSES='lint=behavior-heavy' \
+    "$dispatch" lint -- sh -c "touch '$tmp/ran-locally'" 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "a routing/environment disagreement was silently reconciled"
+  assert_contains "$out" "disagree on class lint" "the disagreement refusal was not explicit"
+  [ ! -e "$fixture/captured" ] && [ ! -e "$tmp/ran-locally" ] \
+    || fail "a routing/environment disagreement still executed"
+
+  # R7. THE LOOKUP PATH IS NEVER DERIVED FROM REPOSITORY CONTENT. This is the
+  # whole answer to "what stops a checkout carrying one", so it is an asserted
+  # invariant rather than a property of today's code: a later refactor that
+  # anchors on the worktree or the working directory turns this red.
+  rm -f "$routing/$NM_RUN_FIXTURE.json"
+  mkdir -p "$gatewt/.fm-azure/runner-routing"
+  python3 - "$gatewt/.fm-azure/runner-routing/$NM_RUN_FIXTURE.json" "$fmhome" "$SUB" "$expires" \
+    "$NM_RUN_FIXTURE" <<'PY'
+import json,sys
+open(sys.argv[1],"w").write(json.dumps({
+  "schema":"fm.azure-runner-routing/v1","run_id":sys.argv[5],
+  "classes":{"lint":"validation-standard"},"fm_home":sys.argv[2],
+  "subscription":sys.argv[3],"expires_at":sys.argv[4],"max_dispatches":9,
+})+"\n")
+PY
+  cp "$gatewt/.fm-azure/runner-routing/$NM_RUN_FIXTURE.json" "$gatewt/$NM_RUN_FIXTURE.json"
+  mkdir -p "$anchor/.fm-azure/runner-routing"
+  rm -f "$fixture/captured" "$tmp/ran-locally"
+  # No FM_AZURE_RUNNER_ROUTING_ROOT: the DEFAULT lookup must anchor on $HOME.
+  out=$(cd "$gatewt" && env HOME="$anchor" "$dispatch" lint -- sh -c "touch '$tmp/ran-locally'" 2>&1) \
+    || fail "the default routing lookup failed"
+  [ -e "$tmp/ran-locally" ] || fail "a repository-carried routing file was not ignored"
+  [ ! -e "$fixture/captured" ] \
+    || fail "a routing file carried inside the checkout selected remote execution"
+  assert_contains "$out" "routing=absent" "a repository-carried routing file was consulted"
+
+  # R8. ...and the default DOES read $HOME, so R7 proves indifference to the
+  # checkout rather than a lookup that never resolves anything at all.
+  cp "$gatewt/.fm-azure/runner-routing/$NM_RUN_FIXTURE.json" \
+    "$anchor/.fm-azure/runner-routing/$NM_RUN_FIXTURE.json"
+  chmod 600 "$anchor/.fm-azure/runner-routing/$NM_RUN_FIXTURE.json"
+  rm -f "$fixture/captured" "$tmp/ran-locally"
+  (cd "$gatewt" && env HOME="$anchor" "$dispatch" lint -- sh -c "touch '$tmp/ran-locally'" >/dev/null 2>&1) \
+    || fail "the default HOME-anchored routing lookup failed to dispatch"
+  [ -e "$fixture/captured" ] || fail "the default routing root does not resolve under \$HOME"
+
+  # R9. Outside a gate worktree there is no run identity, so routing cannot
+  # apply and the environment variable remains the only selector.
+  make_ambient_worktree "$tmp/plain"
+  rm -f "$fixture/captured" "$tmp/ran-locally"
+  out=$(cd "$tmp/plain" && env HOME="$anchor" "$dispatch" lint -- sh -c "touch '$tmp/ran-locally'" 2>&1) \
+    || fail "a non-gate worktree failed to execute locally"
+  [ -e "$tmp/ran-locally" ] || fail "a non-gate worktree did not run locally"
+  assert_contains "$out" "routing=absent" "a non-gate worktree did not report an absent routing"
+
+  pass "per-run routing selects a class from a file the run can carry, an absent file stays local and says so, and every present-but-broken file refuses by name and runs the command nowhere"
+}
+
 dispatch_ambient_binding_contract
 no_mistakes_test_step_offload_contract
+routing_file_contract
 
 echo "# fm-azure-runner.test.sh: all assertions passed"

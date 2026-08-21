@@ -55,6 +55,10 @@ Staging the pool instead would put every signed-in account on the guest and let 
 
 Every failure refuses by name and none of them falls through to a shared or arbitrary profile: an unreadable or empty pool, a pool whose profiles are all unprojectable, a home naming no upstream account, and an exhausted pool (which names each leased profile and the task holding it).
 Bounded status projects the live placements - profile, task generation, status, and account home - from `controller.json` alone.
+
+**The pool is now a concurrency ceiling, and it is lower than the worker ceiling.** Concurrent placements are bounded by `min(FM_AZURE_WORKER_MAX, distinct upstream accounts in the pool)`: with the fleet's eight Pi accounts, the ninth concurrent placement refuses even though `MAX_WORKERS` is 16 and quota, budget and capacity would all admit it.
+That is the requirement, not a regression - sixteen crewmates never could run on eight accounts without sharing one, they just used to do it silently - but it does halve the effective author parallelism, and compartments compete in the same pool: one compartment plus its four children consumes five of the eight before an ordinary crewmate is placed.
+Raising the ceiling means adding signed-in profiles on distinct upstream accounts to the pool, not raising a knob here.
 A compartment child contends in the same document as an ordinary crewmate, because `FM_HOME` still names the primary's controller for both, so the two can never be handed one account.
 
 The controller rejects duplicate active account or writable-worktree bindings.

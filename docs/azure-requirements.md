@@ -176,6 +176,12 @@ hold three distinct accounts; killing placements between selection and the durab
 account) and end to end through the real `bin/fm-spawn.sh` by `tests/fm-spawn-cloud.test.sh`, which
 asserts the staged credential is the leased single profile.
 
+Operational consequence the owner must know: concurrent placements are now bounded by
+`min(FM_AZURE_WORKER_MAX, distinct upstream accounts in the pool)`. With eight Pi accounts the
+ninth concurrent placement refuses although MAX_WORKERS is 16, and compartments compete in the
+same pool. Sixteen crewmates never could run on eight accounts without sharing one; they used
+to do it silently. Raising the ceiling means adding profiles on distinct accounts.
+
 Still owed for DONE: the acceptance sentence on real compute. No leg of this has run against a live
 Azure worker, so "concurrent crewmates RUN on distinct pi profiles" is proven up to the credential
 the worker is handed and no further; what the guest agent does with that credential is unobserved

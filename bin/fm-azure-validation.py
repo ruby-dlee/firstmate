@@ -64,7 +64,16 @@ RUNNER_INVOCATION = re.compile(r"^azr-[a-z0-9]{12}(?:-a[2-9][0-9]*)?$")
 # told from this attempt's own answer.
 MARKER = re.compile(
     r"FM_AZURE_VALIDATION_RESULT\s+(sha256:[0-9a-f]{64})\s+boot=([0-9a-f-]{36})"
-    r"\s+outcome=([a-z-]+)\s+attempt=([0-9]{1,9})"
+    r"\s+outcome=([a-z-]+)\s+attempt=([0-9]{1,18})"
+)
+# The pre-attempt marker shape. A guest sealed into a cell BEFORE the attempt
+# stamp existed cannot be changed (the request is digest-sealed), so its output
+# must stay readable or every cell in flight across that upgrade is stranded.
+# Only consulted when the output carries no stamped marker at all: MARKER's
+# prefix is exactly this shape, so a stamped marker would match it too.
+LEGACY_MARKER = re.compile(
+    r"FM_AZURE_VALIDATION_RESULT\s+(sha256:[0-9a-f]{64})\s+boot=([0-9a-f-]{36})"
+    r"\s+outcome=([a-z-]+)"
 )
 MARKER_SETTLE_SECONDS = 300
 # Shard transports legitimately run VM creation plus admission plus command
@@ -1662,11 +1671,44 @@ def create_cell(env, state, selected, replacement=False):
     adopt_resources(env, state)
 
 
+def sealed_guest_text(env, state):
+    """The exact guest text this cell's request was sealed with.
+
+    The seal binds the guest a cell was ADMITTED with. Reading the working tree
+    instead made that seal depend on the tree never changing, so ANY later edit
+    to the guest refused `respond`, `reattach` AND `replace` on every cell
+    already in flight, stranding them with no recovery (`replace` is the only
+    documented way out of `failed-retained`, and it routes through here too).
+    `submit` stages a byte copy of the guest beside the request, so that copy is
+    the sealed artifact and is what a resumed attempt must run. The working tree
+    is used only when it still matches the seal, which keeps a cell whose
+    payload was pruned behaving exactly as before. Neither source is trusted on
+    provenance: only a file whose digest IS the sealed digest is ever returned,
+    so this widens recovery without widening what may execute.
+    """
+    expected = state["request"]["protocol"]["guest_digest"]
+    candidates = []
+    state_dir = env.get("state_dir")
+    if state_dir:
+        candidates.append(Path(state_dir) / "payloads" / state["cell"] / "guest.sh")
+    candidates.append(GUEST)
+    for candidate in candidates:
+        try:
+            if not candidate.is_file() or candidate.is_symlink():
+                continue
+        except OSError:
+            continue
+        if sha256_file(candidate) == expected:
+            return candidate.read_text(encoding="utf-8")
+    raise ValidationError(
+        "no guest matching this cell's exact sealed request digest is available; "
+        "neither the staged payload copy nor the working tree carries {}".format(expected)
+    )
+
+
 def create_run_command(env, state, mode, input_url=None, output_url=None, response=None):
     resources = state["resources"]
-    current_digest = sha256_file(GUEST)
-    if current_digest != state["request"]["protocol"]["guest_digest"]:
-        raise ValidationError("trusted guest changed after exact request preparation")
+    guest_text = sealed_guest_text(env, state)
     attempt = state["attempt"]
     name = "{}-a{}".format(mode, attempt)
     run_id = resources["vm_id"] + "/runCommands/" + name
@@ -1705,7 +1747,7 @@ def create_run_command(env, state, mode, input_url=None, output_url=None, respon
         "location": "eastus",
         "tags": run_tags,
         "properties": {
-            "source": {"script": GUEST.read_text(encoding="utf-8")},
+            "source": {"script": guest_text},
             "parameters": arguments,
             "protectedParameters": protected,
             "asyncExecution": True,
@@ -1927,8 +1969,35 @@ def observe(env, args):
             return
         output = str((view or {}).get("output", ""))
         error = str((view or {}).get("error", ""))
-        marker = re.search(MARKER, output)
-        if not marker or int(marker.group(4)) != state["attempt"]:
+        stamped = list(MARKER.finditer(output))
+        # Accept ANY marker naming the attempt being observed, not merely the
+        # first one in the output: re.search would hand back an earlier
+        # attempt's line and retain an attempt that completed correctly.
+        mine = {
+            (found.group(1), found.group(2), found.group(3))
+            for found in stamped
+            if int(found.group(4)) == state["attempt"]
+        }
+        binding = "attempt"
+        if len(mine) > 1:
+            # Two different results claiming one attempt is not an answer.
+            mine = set()
+        if not mine and not stamped:
+            # No stamped marker anywhere. Either nothing published, or the cell
+            # runs a guest sealed BEFORE the stamp existed. That guest cannot be
+            # changed, because the request is digest-sealed, so refusing to read
+            # it would strand every cell in flight across this upgrade: the
+            # attempt would be retained on a fully-published result and
+            # `expected_result_digest` would never be set, making the result
+            # unreachable. Fall back to the pre-stamp shape, which is consulted
+            # ONLY here because MARKER's prefix is exactly that shape and would
+            # otherwise match a stamped marker too. A stamped marker naming
+            # another attempt never reaches this branch and still fails closed.
+            legacy = LEGACY_MARKER.search(output)
+            if legacy:
+                mine = {(legacy.group(1), legacy.group(2), legacy.group(3))}
+                binding = "legacy"
+        if not mine:
             # A terminal control state whose output does not carry THIS
             # attempt's marker proves nothing about this attempt. The run
             # command, the VM, the boot, and every identity field in
@@ -1950,7 +2019,7 @@ def observe(env, args):
                 since = state["unbound_view_since"]
             waited = seconds_since(since)
             if waited is None or waited < settle_seconds:
-                observed = marker.group(4) if marker else "none"
+                observed = ",".join(sorted({found.group(4) for found in stamped})) or "none"
                 print(
                     "AZURE VALIDATION UNSETTLED cell={} attempt={} control_state={} "
                     "marker_attempt={} waited={}s settle={}s".format(
@@ -1962,7 +2031,12 @@ def observe(env, args):
             transition(env, state, "failed-retained", "cell ended without an authenticated result marker", control_error=error[-2000:])
             raise ValidationError("cell ended without an authenticated result; worktree and lease remain retained")
         state.pop("unbound_view_since", None)
-        digest = marker.group(1)
+        digest, boot_id, outcome = next(iter(mine))
+        # How this observation was bound decides how strictly the collected
+        # result is checked. A stamped marker means the guest can name its
+        # attempt, so its result MUST; a legacy marker cannot, so it is held to
+        # the pre-stamp contract instead of being refused.
+        state["result_binding"] = binding
         # A republished byte-identical result is a non-answer, not a verdict.
         # An attempt that resumes a parked run without answering its gate, or
         # one whose upload never happened and left the previous attempt's
@@ -1989,8 +2063,7 @@ def observe(env, args):
         previous[str(state["attempt"])] = digest
         state["attempt_result_digests"] = previous
         state["expected_result_digest"] = digest
-        state["expected_boot_id"] = marker.group(2)
-        outcome = marker.group(3)
+        state["expected_boot_id"] = boot_id
         if outcome == "needs-decision":
             transition(env, state, "needs-decision", "no-mistakes ask-user gate owns the exact run")
         else:
@@ -2037,17 +2110,21 @@ def verify_result_identity(state, result):
         if result.get(key) != wanted:
             raise ValidationError("validation result identity mismatch: {}".format(key))
     # The attempt is the only field separating one attempt's result from
-    # another's on a resumed run, so it is required rather than defaulted: a
-    # result that does not declare its attempt is refused, never assumed to be
-    # the current one.
-    if not isinstance(result.get("attempt"), int) or isinstance(result.get("attempt"), bool):
-        raise ValidationError("validation result does not declare the attempt that produced it")
-    if result["attempt"] != state["attempt"]:
-        raise ValidationError(
-            "validation result was produced by attempt {}, not the observed attempt {}".format(
-                result["attempt"], state["attempt"]
+    # another's on a resumed run, so where the guest can name it, it is required
+    # rather than defaulted: a result that does not declare its attempt is
+    # refused, never assumed to be the current one. `result_binding` is set by
+    # observe from the marker it actually read, so a cell whose sealed guest
+    # predates the stamp is held to the pre-stamp contract instead of being
+    # refused, and every cell that CAN prove its attempt still must.
+    if state.get("result_binding", "attempt") != "legacy":
+        if not isinstance(result.get("attempt"), int) or isinstance(result.get("attempt"), bool):
+            raise ValidationError("validation result does not declare the attempt that produced it")
+        if result["attempt"] != state["attempt"]:
+            raise ValidationError(
+                "validation result was produced by attempt {}, not the observed attempt {}".format(
+                    result["attempt"], state["attempt"]
+                )
             )
-        )
     head = result.get("current_head")
     tree = result.get("current_tree")
     if (
@@ -2179,24 +2256,6 @@ def collect(env, args):
             digest = sha256_file(archive)
             if digest != state.get("expected_result_digest"):
                 raise ValidationError("downloaded result digest differs from the control-plane marker")
-            # Effect-shaped non-answer fence: the result blob has one name per
-            # cell, so an attempt that never uploaded leaves the previous
-            # attempt's archive in place and collect would otherwise verify it
-            # and file it as this attempt's answer. Every identity field
-            # matches on a resumed run, so byte equality with an earlier
-            # attempt is the observable that says the gate was not answered.
-            recorded = state.get("attempt_result_digests") or {}
-            stale = sorted(
-                key for key, value in recorded.items()
-                if value == digest and key != str(state["attempt"])
-            )
-            if stale:
-                raise ValidationError(
-                    "downloaded result is byte-identical to attempt {}; the operator response did "
-                    "not reach the in-cell pipeline, so this is a non-answer, not a verdict".format(
-                        ", ".join(stale)
-                    )
-                )
             extracted = temp / "extracted"
             extracted.mkdir(mode=0o700)
             safe_extract_result(archive, extracted)

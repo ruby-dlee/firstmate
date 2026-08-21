@@ -1628,6 +1628,21 @@ saved=json.loads((env["state_dir"]/"azv-aaaaaaaaaaaa.json").read_text())
 assert "unbound_view_since" not in saved, \
     "a new attempt inherited the previous attempt's settle stamp"
 
+# N-2: the bytes VERIFIED must be the bytes RETURNED. Digesting one read and
+# returning a second read is a TOCTOU: a writer landing between them passes the
+# check while different content is handed back, and that content is uploaded as
+# the Run Command script and executes as root on the cell. A race cannot be
+# observed by waiting for it, so the second read is instrumented to differ - if
+# the implementation reads twice, it returns the instrumented bytes.
+saved_read_text=m.Path.read_text
+m.Path.read_text=lambda self,*a,**k:"#!/bin/sh\nEVIL\n"
+try:
+    returned=m.sealed_guest_text(env,seed())
+finally:
+    m.Path.read_text=saved_read_text
+assert returned==sealed_text, \
+    "sealed_guest_text returned bytes it never verified: "+repr(returned)
+
 # The recorded stamping flag comes from the bytes that are about to run.
 assert saved["guest_stamps_attempt"] is False, saved.get("guest_stamps_attempt")
 stamping=sealed_text+"printf 'FM_AZURE_VALIDATION_RESULT %s boot=%s outcome=%s attempt=%s\\n'\n"

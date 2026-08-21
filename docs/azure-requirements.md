@@ -296,8 +296,7 @@ worktree disk released.
 That is no-mistakes running on Azure: the cell executes the whole pipeline in-cell.
 The runner-offload lane - a hybrid that keeps the pipeline on the local daemon and ships one test
 class to a cell - is an OPTIMISATION, not an acceptance criterion; its per-run routing-file
-mechanism is designed (session record, AMENDMENT 10) and its branch is
-`fm/azure-runner-routing-file`.
+mechanism is implemented on branch `fm/azure-runner-routing-file`.
 
 The superseded sentence, kept here so the change of bar is visible, read: "a no-mistakes run
 offloads a test class to Azure and returns a real verdict; and, separately, one validation cell

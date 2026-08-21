@@ -1248,6 +1248,27 @@ assert module.model_family("mystery-1") != module.model_family("mystery-2")
 assert module.model_family("gpt-5.5") == module.model_family("gpt-5.6-sol") == "openai"
 assert module.model_family("claude-opus-5") == "anthropic"
 assert module.model_family("openai-codex-2/gpt-5.6-sol") == "openai"
+# The family screen must not depend on a literal separator: `gpt5.6-sol`
+# read as its own family and would have been admitted a `gpt-5.6-sol`
+# reviewer, which is cc-4dcd7873f71a one alias away.
+for spelling in ("gpt5.6-sol", "GPT-5.6-SOL", "gpt_5.6_sol", "Codex-Mini"):
+    assert module.model_family(spelling) == "openai", spelling
+assert module.model_family("CLAUDE-OPUS-5") == "anthropic"
+# And a lane model reached under ANY vendor alias is the lane's family, so an
+# author on GLM-5.2 via a non-Fireworks id cannot take the GLM reviewer with
+# no same-model marker.
+for alias in ("z-ai/glm-5.2", "GLM-5.2", "glm_5.2", "glm-5p2"):
+    assert module.model_family(alias) == "cross-family:" + LANE["slot"], alias
+    # Lane SELECTION stays exact - the alias must not pick a credential.
+    assert module.cross_family_lane_for_model(alias) is None, alias
+aliased_author = {
+    "harness": "pi",
+    "model": "z-ai/glm-5.2",
+    "account_home": str(homes["author-home"]),
+}
+write_config([reviewer("pi", LANE["model"], "xhigh", "lane-home")])
+aliased = expect_refused(aliased_author, "outside the model family")
+print(f"REFUSED aliased same-model author: {aliased}")
 
 write_config([reviewer("pi", "gpt-5.6-sol", "xhigh", "pi-home")])
 selected = module.reviewer_candidates(root, claude_author)[0]
@@ -1601,6 +1622,24 @@ for label, body in (
     ("unterminated fence", "```json\n%s" % verdict_text),
     ("truncated fenced verdict", '```json\n{"verdict": "cle'),
     ("truncated bare verdict", '{"verdict": "cle'),
+    # A truncated verdict fence contributes ZERO complete blocks, so ANY
+    # complete fence earlier in the message - a draft, an example, a quoted
+    # snippet - used to leave the count at one and get certified in place of
+    # the real, truncated verdict. stopReason is `stop` here and the parse
+    # SUCCEEDS on the wrong block, so nothing else downstream catches it.
+    (
+        "draft fence then truncated verdict fence",
+        'Draft:\n```json\n{"verdict": "clear", "findings": []}\n```\n'
+        'Final verdict:\n```json\n{"verdict": "blocking", "summary": "BLOCKING: the cre',
+    ),
+    (
+        "example fence then truncated bare verdict",
+        'For example:\n```json\n{"verdict": "clear"}\n```\n{"verdict": "block',
+    ),
+    (
+        "two complete fences then a truncated third",
+        "```\n%s\n```\n```\n%s\n```\n```json\n{\"verdict\": \"bl" % (verdict_text, verdict_text),
+    ),
 ):
     expect_tool_failure(
         label,

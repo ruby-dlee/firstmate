@@ -691,7 +691,10 @@ Still owed, and honestly so:
   separately from `account_identity` and compared a bare account id against a prefixed one, so the
   codex-family path refused ITSELF and no codex-family compartment review has ever run. Fixed
   2026-08-21 with a single shared derivation and a test that is red on the old code; the switch is
-  still off, so the lane still does not run. The serving lane
+  still off, so the lane still does not run. Recorded because the first fix was itself incomplete:
+  it unified the two HOST derivations while the model guest kept a third, moving the refusal from
+  staging into a booted, paid VM. The guest is covered by an executing test now rather than
+  substring assertions, which is why that was invisible. The serving lane
   today is the local pi reviewer. The reason recorded here previously, that the `fm-ccm` image
   carries no `pi` binary and needs a rebake, is stale and is corrected below.
 - A spend signal for the primary reviewer, HALF closed and honestly so. The cost declaration is no

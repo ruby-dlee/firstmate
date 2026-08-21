@@ -174,11 +174,26 @@ if lane is not None:
         if isinstance(model_entry, dict) and model_entry.get("compat", {}) != allowed_compat:
             raise SystemExit("model guest: cross-family credential model-level compat override")
 elif reviewer["harness"] == "codex":
+    # The PREFIXED identity, byte-identical to
+    # `account_identity_from_credential` on the host. This is the third place
+    # that derivation exists (host reader, host archive gate, and here), and
+    # it is the one that cannot import the others because the guest ships as a
+    # self-contained script onto a VM. It disagreed by exactly this prefix
+    # once already: the host digests `codex:<id>` while this derived the bare
+    # `<id>`, so the comparison below could never be equal and the refusal
+    # fired INSIDE a booted, paid VM instead of during staging. Any change to
+    # the host rule must be mirrored here, and
+    # `model_guest_executing_account_unit` in tests/fm-crosscheck-azure.test.sh
+    # executes this exact block against the host readers to prove they agree.
     tokens = credential.get("tokens") if isinstance(credential, dict) else None
-    account = tokens.get("account_id") if isinstance(tokens, dict) else None
+    raw = tokens.get("account_id") if isinstance(tokens, dict) else None
+    account = "codex:" + raw.strip() if isinstance(raw, str) and raw.strip() else None
 else:
     entry = credential.get("openai-codex") if isinstance(credential, dict) else None
-    account = entry.get("accountId") if isinstance(entry, dict) else None
+    raw = entry.get("accountId") if isinstance(entry, dict) else None
+    account = (
+        "openai-codex:" + raw.strip() if isinstance(raw, str) and raw.strip() else None
+    )
 if not isinstance(account, str) or "sha256:" + hashlib.sha256(account.encode()).hexdigest() != identity["reviewer_account_digest"]:
     raise SystemExit("model guest: credential executing account mismatch")
 path = destination / expected_name

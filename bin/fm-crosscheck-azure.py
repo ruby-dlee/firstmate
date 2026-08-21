@@ -597,6 +597,7 @@ CROSS_FAMILY_LANES = {
         "compat": {},
         "host": "api.fireworks.ai",
         "base_url": "https://api.fireworks.ai/inference/v1",
+        "family_aliases": frozenset({"glm5p2", "glm52", "glm5point2"}),
     },
 }
 
@@ -797,11 +798,20 @@ def create_credential_archive(
         # Pi composes provider-level compat/headers and a modelOverrides layer
         # into the effective model, so the archive gate allowlists the
         # provider's keys rather than naming fields to refuse
-        # (cc-ca5848b19ac3).
-        if isinstance(entry, dict) and set(entry) - {"baseUrl", "api", "apiKey", "models"}:
+        # (cc-ca5848b19ac3). The allowlists come from CORE, not a local copy:
+        # a hardcoded set here drifted weaker than the inspector's within one
+        # change - it applied no model-level allowlist and never checked
+        # `api`, so an archived credential could carry `openai-responses`,
+        # which R6 forbids outright.
+        if isinstance(entry, dict) and set(entry) - core.PI_PROVIDER_ALLOWED_KEYS:
             raise AzureCrosscheckError(
                 f"archived {slot} reviewer credential carries provider-level "
                 "fields the lane does not pin"
+            )
+        if isinstance(entry, dict) and entry.get("api") != archive_lane["api"]:
+            raise AzureCrosscheckError(
+                f"archived {slot} reviewer credential does not pin api "
+                f"{archive_lane['api']!r}"
             )
         base_url = entry.get("baseUrl") if isinstance(entry, dict) else None
         if base_url != archive_lane["base_url"]:
@@ -830,6 +840,13 @@ def create_credential_archive(
                 raise AzureCrosscheckError(
                     f"archived {slot} reviewer credential carries a "
                     "model-level compat that is not the pinned lane compat"
+                )
+            if isinstance(model_entry, dict) and (
+                set(model_entry) - core.PI_MODEL_ALLOWED_KEYS
+            ):
+                raise AzureCrosscheckError(
+                    f"archived {slot} reviewer credential carries model-level "
+                    "fields the lane does not pin"
                 )
         archived_identity = cross_family_account_identity(archive_lane)
     elif config["harness"] in {"codex", "pi"}:
@@ -2001,7 +2018,12 @@ def _run_azure_review_in_lane(
                 raise core.CrosscheckToolError(str(exc)) from exc
             reproved = inspect_reviewer_credential(core, config)
             if reproved != (credential, source, identifier, reviewer_account_identity):
-                raise AzureCrosscheckError(
+                # Tool failure, not a bare AzureCrosscheckError: this is the
+                # TOCTOU refusal and the most security-relevant one in the
+                # region, and a bare error here escapes the window whose
+                # handlers persist a run, so the fleet would see the credential
+                # swap as nothing at all.
+                raise core.CrosscheckToolError(
                     "reviewer credential identity changed before exact staging"
                 )
             identity.update(

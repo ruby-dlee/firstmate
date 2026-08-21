@@ -187,6 +187,160 @@ PY
   pass "Azure selection is explicit, local-default, and unsafe config fails closed"
 }
 
+model_guest_executing_account_unit() {
+  python3 - "$MODEL_GUEST" "$CORE" "$ADAPTER" <<'PY' \
+    || fail "model guest credential contract failed"
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+guest_path, core_path, adapter_path = map(Path, sys.argv[1:4])
+core_spec = importlib.util.spec_from_file_location("fm_crosscheck", core_path)
+core = importlib.util.module_from_spec(core_spec)
+core_spec.loader.exec_module(core)
+adapter_spec = importlib.util.spec_from_file_location("azure_crosscheck", adapter_path)
+adapter = importlib.util.module_from_spec(adapter_spec)
+adapter_spec.loader.exec_module(adapter)
+
+# EXECUTE the guest's own credential block, extracted from the shipped bytes
+# rather than reimplemented, so this covers behavior instead of substrings.
+# Substring assertions are why the guest could derive a different executing
+# account from the host for as long as it did.
+source = guest_path.read_text(encoding="utf-8")
+marker = 'python3 - "$CREDENTIAL" "$ACCOUNT" "$INPUT" <<\'PY\'\n'
+start = source.index(marker) + len(marker)
+end = source.index("\nPY\n", start)
+guest_block = source[start:end]
+assert "reviewer_account_digest" in guest_block, "extracted the wrong guest block"
+
+SCHEMA = adapter.SCHEMA
+
+
+def run_guest(harness, model, credential_document, account_identity):
+    """Drive the REAL guest block over a real archive, as the VM would."""
+    root = Path(tempfile.mkdtemp())
+    credential_bytes = json.dumps(credential_document).encode()
+    name = "models.json" if core.cross_family_lane_for_model(model) else "auth.json"
+    identity = {"review_generation": "0123456789abcdef01234567"}
+    material = {
+        "schema": SCHEMA,
+        "review_generation": identity["review_generation"],
+        "harness": harness,
+        "model": model,
+        "effort": "xhigh",
+        "credential_name": name,
+        "credential_digest": adapter.digest_bytes(credential_bytes),
+    }
+    payload = {
+        "manifest.json": adapter.canonical_bytes(material) + b"\n",
+        name: credential_bytes,
+    }
+    archive = root / "credential.tar.gz"
+    with tarfile.open(archive, "w:gz", format=tarfile.PAX_FORMAT) as handle:
+        for member_name, content in payload.items():
+            info = tarfile.TarInfo(member_name)
+            info.size = len(content)
+            handle.addfile(info, __import__("io").BytesIO(content))
+    request = {
+        "schema": SCHEMA,
+        "reviewer": {"harness": harness, "model": model, "effort": "xhigh"},
+        "identity": {
+            "review_generation": identity["review_generation"],
+            "credential_archive_digest": adapter.digest_bytes(archive.read_bytes()),
+            "credential_digest": material["credential_digest"],
+            "reviewer_account_digest": adapter.digest_bytes(
+                account_identity.encode("utf-8")
+            ),
+        },
+    }
+    request_path = root / "request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    destination = root / "account"
+    destination.mkdir()
+    script = root / "guest_block.py"
+    script.write_text(guest_block, encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(script), str(archive), str(destination),
+         str(request_path)],
+        capture_output=True, text=True, timeout=120,
+    )
+    return result, destination / name
+
+
+# The identity the HOST admits, derived by the host's single reader.
+for harness, document, key in (
+    ("codex", {"tokens": {"account_id": "acct_ABC123"}}, "auth.json"),
+    ("pi", {"openai-codex": {"accountId": "acct_ABC123"}}, "auth.json"),
+):
+    home = Path(tempfile.mkdtemp())
+    (home / "auth.json").write_text(json.dumps(document), encoding="utf-8")
+    admitted = core.account_identity(harness, home)
+    assert ":" in admitted, admitted
+
+    # REGRESSION: the guest used to derive the BARE account id while the host
+    # digests the PREFIXED one, so this refused inside a booted, paid VM and
+    # no codex-family compartment review could ever run. Red on that code.
+    result, landed = run_guest(harness, "gpt-5.6-sol", document, admitted)
+    assert result.returncode == 0, (
+        harness, result.returncode, result.stdout, result.stderr
+    )
+    assert landed.is_file(), landed
+    print(f"GUEST ACCEPTED {harness} with the host-admitted identity {admitted}")
+
+    # A different account still refuses, so agreement was not bought by
+    # dropping the check.
+    result, _ = run_guest(harness, "gpt-5.6-sol", document, admitted + "-other")
+    assert result.returncode != 0, (harness, result.stdout)
+    assert "credential executing account mismatch" in (result.stdout + result.stderr)
+    print(f"GUEST REFUSED {harness} with a foreign executing account")
+
+    # A credential carrying no account id refuses rather than landing None.
+    result, _ = run_guest(harness, "gpt-5.6-sol", {}, admitted)
+    assert result.returncode != 0, (harness, result.stdout)
+    print(f"GUEST REFUSED {harness} with no account id in the credential")
+
+# The cross-family lane keeps its own non-secret identity and still lands.
+lane = next(iter(core.CROSS_FAMILY_LANES.values()))
+lane_document = {"providers": {lane["slot"]: {
+    "baseUrl": lane["base_url"], "api": lane["api"], "apiKey": "k",
+    "models": [{"id": lane["model"], "name": "n"}],
+}}}
+result, landed = run_guest(
+    "pi", lane["model"], lane_document, core.cross_family_account_identity(lane)
+)
+assert result.returncode == 0, (result.stdout, result.stderr)
+assert landed.name == "models.json", landed
+print(f"GUEST ACCEPTED the {lane['slot']} lane credential")
+
+# A foreign endpoint in the archived credential still refuses in the guest.
+foreign = json.loads(json.dumps(lane_document))
+foreign["providers"][lane["slot"]]["baseUrl"] = "https://evil.example/v1"
+result, _ = run_guest(
+    "pi", lane["model"], foreign, core.cross_family_account_identity(lane)
+)
+assert result.returncode != 0, result.stdout
+print("GUEST REFUSED a foreign endpoint in the archived credential")
+
+# REGISTRATION COMPLETENESS: a lane in the registry with no `case "$MODEL"`
+# dispatch arm passes every substring assertion and dies at runtime with exit
+# 125. Registering a lane touches four places; pin all of them.
+for registered in core.CROSS_FAMILY_LANES.values():
+    assert f'{registered["model"]}) PI_PROVIDER={registered["slot"]} ;;' in source, (
+        f"lane {registered['slot']} has no provider dispatch arm in the guest"
+    )
+    assert f'"{registered["model"]}": (' in source, (
+        f"lane {registered['slot']} is absent from the guest lane table"
+    )
+print("GUEST dispatches every registered lane")
+PY
+  pass "the model guest derives the host's executing account, refuses foreign ones, and dispatches every registered lane"
+}
+
 cross_family_provider_host_unit() {
   python3 - "$ADAPTER" "$CORE" <<'PY' || fail "model-aware provider host derivation failed"
 import importlib.util
@@ -418,6 +572,47 @@ with tempfile.TemporaryDirectory() as temporary:
         assert "pinned R6 provider endpoint" in str(exc), str(exc)
     else:
         raise AssertionError("a foreign-slot cross-family credential was archived")
+
+    # The archive gate's allowlists come from CORE, not a local copy. A
+    # hardcoded set drifted weaker than the inspector inside one change: no
+    # model-level allowlist and no `api` check, so an archived credential
+    # could carry `openai-responses`, which R6 forbids outright.
+    assert module.__dict__.get("PI_PROVIDER_ALLOWED_KEYS") is None, (
+        "the archive gate must reference core's allowlist, not keep its own"
+    )
+    for label, mutate in (
+        ("responses api", lambda d: d["providers"][SLOT].__setitem__("api", "openai-responses")),
+        ("provider compat", lambda d: d["providers"][SLOT].__setitem__("compat", {"supportsFinishReason": False})),
+        ("modelOverrides", lambda d: d["providers"][SLOT].__setitem__("modelOverrides", {MODEL: {"compat": {}}})),
+        ("provider headers", lambda d: d["providers"][SLOT].__setitem__("headers", {"x": "1"})),
+        ("model-level extra", lambda d: d["providers"][SLOT]["models"][0].__setitem__("headers", {"x": "1"})),
+    ):
+        drifted = json.loads(models_json())
+        mutate(drifted)
+        drift_home = root / ("drift-" + label.replace(" ", "-"))
+        drift_home.mkdir()
+        (drift_home / "models.json").write_text(json.dumps(drifted), encoding="utf-8")
+        try:
+            module.create_credential_archive(
+                root / ("drift-" + label.replace(" ", "-") + ".tar.gz"),
+                drift_home / "models.json",
+                identity,
+                config,
+                account_identity,
+                core,
+            )
+        except module.AzureCrosscheckError:
+            pass
+        else:
+            raise AssertionError(f"the archive gate admitted {label}")
+        # The core inspector refuses the same shape, so the two agree.
+        try:
+            core.inspect_pi_cross_family_credential(drift_home, LANE)
+        except core.CrosscheckToolError:
+            pass
+        else:
+            raise AssertionError(f"the core inspector admitted {label}")
+    print("ARCHIVE GATE and CORE INSPECTOR agree on every drifted credential shape")
 
     # The archive gate owns the model-level compat pin too, not just the
     # inspector: a compat that weakens the truncation guard never ships into
@@ -1677,6 +1872,7 @@ parameter_contract_unit
 adapter_mode_unit
 cross_family_provider_host_unit
 cross_family_credential_lane_unit
+model_guest_executing_account_unit
 identity_outcome_unit
 account_and_cleanup_identity_unit
 bridge_security_unit

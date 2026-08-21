@@ -95,6 +95,13 @@ CROSS_FAMILY_LANES = {
         "compat": {},
         "host": "api.fireworks.ai",
         "base_url": "https://api.fireworks.ai/inference/v1",
+        # Every spelling of THIS MODEL that an author could be recorded under,
+        # normalized. The family screen keys on the final path segment, so
+        # `z-ai/glm-5.2` or a bare `GLM-5.2` would otherwise read as a
+        # different family and take the GLM reviewer with no same-model
+        # marker - the original bug reached through a vendor alias. Aliases
+        # are used ONLY by `model_family`; lane selection stays exact.
+        "family_aliases": frozenset({"glm5p2", "glm52", "glm5point2"}),
     },
 }
 # The model decides the Pi provider slot. An unmapped model is refused rather
@@ -128,14 +135,30 @@ PI_MODEL_ALLOWED_KEYS = {
     "maxTokens",
     "compat",
 }
+# Prefixes are matched against a NORMALIZED identity (lowercased, separators
+# removed), so they carry no separator of their own. Requiring a literal dash
+# meant `gpt5.6-sol` read as its own family and would have been admitted a
+# `gpt-5.6-sol` reviewer - the same defect as cc-4dcd7873f71a, one alias away.
 AUTHOR_MODEL_FAMILY_PREFIXES = (
-    ("gpt-", "openai"),
-    ("o1-", "openai"),
-    ("o3-", "openai"),
-    ("o4-", "openai"),
-    ("codex-", "openai"),
-    ("claude-", "anthropic"),
+    ("gpt", "openai"),
+    ("o1", "openai"),
+    ("o3", "openai"),
+    ("o4", "openai"),
+    ("codex", "openai"),
+    ("claude", "anthropic"),
 )
+
+
+def normalize_model_identity(identity: str) -> str:
+    """Fold a model id to the form the FAMILY screen compares.
+
+    Lowercased with separators removed, so `GLM-5.2`, `glm 5.2` and `glm_5.2`
+    are one string. Used ONLY by `model_family`, never by lane selection: the
+    safe error differs between them, and folding two ids together is safe only
+    where the consequence is refusing a reviewer.
+    """
+
+    return re.sub(r"[^a-z0-9]", "", identity.lower())
 # Review family provenance recorded in every run's ledger reviewer record.
 REVIEW_FAMILY_CROSS_FAMILY_PRIMARY = "cross-family-primary"
 # Legacy provenance value: runs recorded before the lane registry landed named
@@ -689,14 +712,14 @@ def model_family(model: Any) -> str:
     if exact is not None:
         return "cross-family:" + exact["slot"]
     identity = model_identity(model if isinstance(model, str) else "")
+    normalized = normalize_model_identity(identity)
     for lane in CROSS_FAMILY_LANES.values():
-        if identity == model_identity(lane["model"]):
+        if normalized in lane["family_aliases"]:
             return "cross-family:" + lane["slot"]
-    lowered = identity.lower()
     for prefix, family in AUTHOR_MODEL_FAMILY_PREFIXES:
-        if lowered.startswith(prefix):
+        if normalized.startswith(prefix):
             return family
-    return "model:" + lowered
+    return "model:" + normalized
 
 
 def cross_family_account_identity(lane: dict[str, str]) -> str:
@@ -3748,11 +3771,39 @@ PI_FENCED_BLOCK_RE = re.compile(
 
 
 def pi_verdict_body(final_text: str) -> str:
-    """Return the JSON body of a Pi reviewer's final assistant text."""
+    """Return the JSON body of a Pi reviewer's final assistant text.
+
+    An UNTERMINATED fence anywhere in the message refuses outright, before the
+    block count is even consulted. That ordering is the whole safety property.
+    A truncated verdict fence contributes ZERO complete blocks, so a model that
+    emitted any complete fence earlier in the same message - a draft, an
+    example, a quoted snippet - left the count at exactly one, and this
+    returned THAT EARLIER BLOCK as the verdict while silently discarding the
+    truncated real one. `stopReason` is `stop` in that shape (the exact live
+    condition seen on attempt 3), and the parse SUCCEEDS on the wrong block, so
+    nothing else downstream catches it: a superseded draft gets certified as
+    the review. That is strictly worse than the failure it replaced, which at
+    least failed loudly.
+    """
 
     stripped = final_text.strip()
+    # An odd number of fence markers means one was opened and never closed.
+    # Refusing on the marker count rather than on "no complete block found"
+    # is what makes a preceding complete fence unable to rescue a truncated
+    # one; returning the raw text sends it to the parser, which fails.
+    if stripped.count("```") % 2:
+        return stripped
     blocks = PI_FENCED_BLOCK_RE.findall(stripped)
     if len(blocks) != 1:
+        return stripped
+    # The block must be the ONLY JSON-bearing content in the message. An even
+    # fence count is not enough on its own: a COMPLETE example fence followed
+    # by a truncated BARE verdict also counts one block, and unwrapping there
+    # would certify the example and discard the real answer. Prose carries no
+    # braces, so this still tolerates a wrapper while refusing every shape
+    # where a second candidate verdict exists.
+    remainder = PI_FENCED_BLOCK_RE.sub("", stripped, count=1)
+    if "{" in remainder or "}" in remainder:
         return stripped
     return blocks[0].strip()
 

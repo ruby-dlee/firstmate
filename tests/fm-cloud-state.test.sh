@@ -123,9 +123,118 @@ run_cloud_credential_survives_a_symlinked_directory() {
   pass "a symlinked account directory still loses its credential"
 }
 
+seed_compartment_child_staging() {  # <primary state> <compartment home> <task id>
+  # The exact shape bin/fm-spawn.sh leaves behind for a compartment child: the
+  # credential in the COMPARTMENT's state directory, and the stager's record of
+  # that home under the CONTROLLER's state directory.
+  local primary_state=$1 home=$2 id=$3
+  mkdir -p "$primary_state" "$home/state/$id.cloud-account" "$home/state/$id.cloud-payload"
+  printf 'smc-1\n' > "$home/.fm-secondmate-home"
+  printf '{"refresh":"secret"}\n' > "$home/state/$id.cloud-account/auth.json"
+  printf '{}\n' > "$home/state/$id.cloud-account/settings.json"
+  printf 'bundle\n' > "$home/state/$id.cloud-payload/repo.bundle"
+  printf 'entry\n' > "$home/state/$id.cloud-entrypoint"
+  printf '%s\n' "$home" > "$primary_state/$id.cloud-task-home"
+}
+
+run_compartment_child_credential_is_removed_from_the_controller_home() {
+  # THE DEFECT. withdraw and surrender run with FM_HOME on the PRIMARY, because
+  # the controller document has exactly one home. Before this owner resolved
+  # the staging directory, they removed <primary>/state/<id>.cloud-account -
+  # a path that never existed - and the plaintext credential stayed in the
+  # compartment home forever with nothing left that would ever remove it.
+  local tmp primary_state home id
+  fm_test_tmproot_into tmp fm-cloud-state-compartment
+  primary_state="$tmp/primary/state"
+  home="$tmp/compartment"
+  id=child-1
+  seed_compartment_child_staging "$primary_state" "$home" "$id"
+
+  # Deliberately no resolution assertion here: what must go red under a broken
+  # resolution is the credential SURVIVING, not a path string differing.
+  fm_cloud_state_remove "$primary_state" "$id"
+
+  assert_absent "$home/state/$id.cloud-account/auth.json" \
+    "a compartment child's credential outlived its task in the compartment home"
+  assert_absent "$home/state/$id.cloud-account" "the account staging directory survived"
+  assert_absent "$home/state/$id.cloud-payload" "the payload staging directory survived"
+  assert_absent "$home/state/$id.cloud-entrypoint" "the persisted entrypoint survived"
+  assert_absent "$primary_state/$id.cloud-task-home" \
+    "the staging record outlived the state it pointed at"
+  pass "a remover in the controller home removes the credential from the task home"
+}
+
+run_compartment_child_credential_is_removed_from_its_own_home() {
+  # The other caller shape: teardown runs with FM_HOME on the TASK's home, so
+  # it hands its own state directory in and there is no record to read. It must
+  # still remove exactly the same files - the resolution's fallback is the
+  # directory the caller already had, never a widened search.
+  local tmp primary_state home id
+  fm_test_tmproot_into tmp fm-cloud-state-compartment-local
+  primary_state="$tmp/primary/state"
+  home="$tmp/compartment"
+  id=child-2
+  seed_compartment_child_staging "$primary_state" "$home" "$id"
+
+  fm_cloud_state_remove "$home/state" "$id"
+
+  assert_absent "$home/state/$id.cloud-account/auth.json" \
+    "teardown in the task's own home left the credential behind"
+  assert_absent "$home/state/$id.cloud-account" "the account staging directory survived"
+  pass "a remover in the task's own home still removes its credential"
+}
+
+run_a_record_never_walks_into_a_directory_it_does_not_own() {
+  # A remover that follows a record into the wrong home is worse than the leak.
+  # The record only redirects into a SEEDED SECONDMATE HOME, the same admission
+  # the stager itself required, and only as an absolute path with no traversal.
+  local tmp primary_state home id bystander
+  fm_test_tmproot_into tmp fm-cloud-state-record-guard
+  primary_state="$tmp/primary/state"
+  home="$tmp/compartment"
+  bystander="$tmp/not-a-home"
+  id=child-3
+  seed_compartment_child_staging "$primary_state" "$home" "$id"
+  mkdir -p "$bystander/state/$id.cloud-account"
+  printf '{"refresh":"secret"}\n' > "$bystander/state/$id.cloud-account/auth.json"
+
+  # An unmarked directory is refused, and the resolution falls back to the
+  # caller's own state directory rather than reaching into it.
+  printf '%s\n' "$bystander" > "$primary_state/$id.cloud-task-home"
+  [ "$(fm_cloud_state_dir "$primary_state" "$id")" = "$primary_state" ] \
+    || fail "an unmarked directory was accepted as a task home"
+  fm_cloud_state_remove "$primary_state" "$id"
+  assert_present "$bystander/state/$id.cloud-account/auth.json" \
+    "the remover walked into a directory that is not a seeded secondmate home"
+
+  # A relative path is refused for the same reason: it is not a shape the
+  # stager can ever write, so following one means following something else.
+  mkdir -p "$primary_state"
+  printf 'compartment\n' > "$primary_state/$id.cloud-task-home"
+  [ "$(fm_cloud_state_dir "$primary_state" "$id")" = "$primary_state" ] \
+    || fail "a relative task home record was followed"
+  # A traversal path is refused even though it is absolute.
+  printf '%s\n' "$home/../compartment" > "$primary_state/$id.cloud-task-home"
+  [ "$(fm_cloud_state_dir "$primary_state" "$id")" = "$primary_state" ] \
+    || fail "a traversal task home record was followed"
+  # And a symlinked record is not read at all.
+  rm -f "$primary_state/$id.cloud-task-home"
+  printf '%s\n' "$home" > "$tmp/redirect"
+  ln -s "$tmp/redirect" "$primary_state/$id.cloud-task-home"
+  [ "$(fm_cloud_state_dir "$primary_state" "$id")" = "$primary_state" ] \
+    || fail "a symlinked task home record was followed"
+  rm -f "$primary_state/$id.cloud-task-home"
+  assert_present "$home/state/$id.cloud-account/auth.json" \
+    "a refused record still reached the compartment home"
+  pass "a staging record only ever redirects into a seeded secondmate home"
+}
+
 run_cloud_credential_is_removed
 run_teardown_actually_calls_the_owner
 run_cloud_state_survives_set_e
 run_cloud_credential_survives_a_symlinked_directory
+run_compartment_child_credential_is_removed_from_the_controller_home
+run_compartment_child_credential_is_removed_from_its_own_home
+run_a_record_never_walks_into_a_directory_it_does_not_own
 
 echo "# fm-cloud-state.test.sh: all assertions passed"

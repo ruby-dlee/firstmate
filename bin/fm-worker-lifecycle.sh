@@ -82,9 +82,16 @@ case "${1:-}" in
       # Not `|| true`: fm_cloud_state_remove reports a stuck credential and
       # returns 0 so teardown can continue, but here it is the last step, so a
       # credential left on disk has to be visible to whatever ran this.
-      fm_cloud_state_remove "${FM_STATE_OVERRIDE:-${FM_HOME:?FM_HOME is required}/state}" "$withdraw_receipt"
-      state_root="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-      if [ -e "$state_root/$withdraw_receipt.cloud-account/auth.json" ]; then
+      state_root="${FM_STATE_OVERRIDE:-${FM_HOME:?FM_HOME is required}/state}"
+      # The controller's state directory is where the command ran, but NOT
+      # necessarily where the credential was staged: a compartment child's task
+      # home is the secondmate's. fm_cloud_state_dir is the same resolution
+      # fm_cloud_state_remove performs, so the check below inspects exactly the
+      # directory the removal touched. Read BEFORE the removal, which consumes
+      # the record the resolution reads.
+      staged_root=$(fm_cloud_state_dir "$state_root" "$withdraw_receipt")
+      fm_cloud_state_remove "$state_root" "$withdraw_receipt"
+      if [ -e "$staged_root/$withdraw_receipt.cloud-account/auth.json" ]; then
         echo "ELASTIC WORKER REFUSED: withdrew $withdraw_receipt but its staged provider credential remains" >&2
         exit 4
       fi
@@ -104,9 +111,13 @@ case "${1:-}" in
     printf '%s\n' "$surrender_output"
     surrender_receipt=$(printf '%s\n' "$surrender_output" | awk '$1 == "FM-SURRENDERED" { print $2; exit }')
     if [ -n "$surrender_receipt" ]; then
-      fm_cloud_state_remove "${FM_STATE_OVERRIDE:-${FM_HOME:?FM_HOME is required}/state}" "$surrender_receipt"
-      state_root="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
-      if [ -e "$state_root/$surrender_receipt.cloud-account/auth.json" ]; then
+      state_root="${FM_STATE_OVERRIDE:-${FM_HOME:?FM_HOME is required}/state}"
+      # Same resolution as the withdraw lane above, for the same reason: the
+      # surrendered task's credential lives in ITS task home, which is the
+      # secondmate's for a compartment child.
+      staged_root=$(fm_cloud_state_dir "$state_root" "$surrender_receipt")
+      fm_cloud_state_remove "$state_root" "$surrender_receipt"
+      if [ -e "$staged_root/$surrender_receipt.cloud-account/auth.json" ]; then
         echo "ELASTIC WORKER REFUSED: surrendered $surrender_receipt but its staged provider credential remains" >&2
         exit 4
       fi

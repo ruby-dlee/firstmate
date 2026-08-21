@@ -239,6 +239,8 @@ CHECKOUT_STATE_BASE="${FM_CHECKOUT_REFRESH_STATE_BASE:-${XDG_STATE_HOME:-$HOME/.
 # shellcheck source=bin/fm-checkout-lock-lib.sh
 . "$SCRIPT_DIR/fm-checkout-lock-lib.sh"
 CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
+# shellcheck source=bin/fm-cloud-state-lib.sh
+. "$SCRIPT_DIR/fm-cloud-state-lib.sh"
 # shellcheck source=bin/fm-ff-lib.sh
 . "$SCRIPT_DIR/fm-ff-lib.sh"
 # shellcheck source=bin/fm-config-inherit-lib.sh
@@ -4522,6 +4524,19 @@ spawn_cloud_persist_convergence_artifacts() {
   fi
   (
     umask 077
+    # WHERE this spawn is about to stage the provider credential, recorded
+    # under the CONTROLLER's state directory before the credential exists.
+    # Every remover resolves the staging directory through the same owner
+    # (bin/fm-cloud-state-lib.sh), so the stager and the remover cannot
+    # disagree about the home. Written FIRST: a credential that landed while
+    # the record did not would be exactly the leak this closes. The ordinary
+    # crewmate lane has TASK_HOME = FM_HOME and writes no record at all.
+    if [ "$TASK_HOME" = "$FM_HOME" ]; then
+      rm -f "$(fm_cloud_state_task_home_record "$PRIMARY_STATE" "$ID")" || exit 1
+    else
+      mkdir -p "$PRIMARY_STATE" || exit 1
+      printf '%s\n' "$TASK_HOME" > "$(fm_cloud_state_task_home_record "$PRIMARY_STATE" "$ID")" || exit 1
+    fi
     # A secondmate compartment has no single persisted entrypoint: leg argvs
     # are built per dispatch by fm-secondmate-cloud-monitor.sh, and leaving a
     # crewmate-shaped entrypoint here could tempt a future converged dispatch
@@ -4673,9 +4688,11 @@ spawn_cloud_dispatch() {
     rm -f "$request_report"
     # No durable queue entry exists, so the convergence artifacts have no
     # owner; remove them (including the copied provider credential) with the
-    # rolled-back spawn.
-    rm -f "$STATE/$ID.cloud-entrypoint" "$STATE/$ID.cloud-env" "$STATE/$ID.cloud-worktree"
-    rm -rf "$STATE/$ID.cloud-payload" "$STATE/$ID.cloud-account"
+    # rolled-back spawn. Through the shared owner, from the CONTROLLER's state
+    # directory: it resolves the same home this spawn staged into, which on
+    # the compartment-child lane is the secondmate's and not the primary's.
+    rm -f "$STATE/$ID.cloud-worktree"
+    fm_cloud_state_remove "$PRIMARY_STATE" "$ID"
   # The outcome directory is NOT transport. When the monitor cannot
   # fast-forward it tells the operator the bundle is "kept for manual
   # landing", and by then the guest copy is usually gone with the VM, so a

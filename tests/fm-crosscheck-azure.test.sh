@@ -84,11 +84,20 @@ for marker in (
 guest_source = guest.read_text(encoding="utf-8")
 assert "--disable shell_tool" in guest_source
 assert "--no-tools" in guest_source
-# R6: the model decides the Pi provider slot inside the guest too, the GLM
-# credential is the models.json shape bound to the exact Foundry endpoint,
-# and the interim claude launch/boot-copy lane is gone entirely.
-assert "azure-glm" in guest_source
-assert "FW-GLM-5.2" in guest_source
+# R6: the model decides the Pi provider slot inside the guest too, every
+# registered cross-family credential is the models.json shape bound to the
+# exact Foundry endpoint, and the interim claude launch/boot-copy lane is gone
+# entirely. The guest is checked against the core registry rather than a
+# hardcoded name, so a lane added in one place and not the other fails here.
+import importlib.util
+
+core_spec = importlib.util.spec_from_file_location("fm_crosscheck_core", core)
+core_module = importlib.util.module_from_spec(core_spec)
+core_spec.loader.exec_module(core_module)
+assert core_module.CROSS_FAMILY_LANES, "the core lane registry is empty"
+for lane in core_module.CROSS_FAMILY_LANES.values():
+    assert lane["slot"] in guest_source, lane
+    assert lane["model"] in guest_source, lane
 assert "models.json" in guest_source
 assert (
     "https://aif-fm7c799d-eus01.cognitiveservices.azure.com/openai/v1"
@@ -179,7 +188,7 @@ PY
   pass "Azure selection is explicit, local-default, and unsafe config fails closed"
 }
 
-glm_provider_host_unit() {
+cross_family_provider_host_unit() {
   python3 - "$ADAPTER" "$CORE" <<'PY' || fail "model-aware provider host derivation failed"
 import importlib.util
 import sys
@@ -191,28 +200,41 @@ core_spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[2])
 core = importlib.util.module_from_spec(core_spec)
 core_spec.loader.exec_module(core)
 
-# The adapter and the core pin one identical R6 endpoint binding.
-assert module.GLM_REVIEWER_MODEL == core.GLM_REVIEWER_MODEL == "FW-GLM-5.2"
-assert module.GLM_PROVIDER_HOST == core.GLM_PROVIDER_HOST
-assert module.GLM_ALLOWED_BASE_URL == core.GLM_ALLOWED_BASE_URL
-assert module.GLM_REVIEWER_ACCOUNT_IDENTITY == core.GLM_REVIEWER_ACCOUNT_IDENTITY
-assert module.GLM_PROVIDER_HOST == "aif-fm7c799d-eus01.cognitiveservices.azure.com"
-
-# The model decides the host: a GLM review derives the exact Foundry host,
-# refuses a conflicting configured host, and the codex-family fallback keeps
-# its existing derivation. The retired claude harness derives nothing.
-assert module.effective_provider_host({}, "pi", "FW-GLM-5.2") == module.GLM_PROVIDER_HOST
-assert module.effective_provider_host(
-    {"provider_host": module.GLM_PROVIDER_HOST}, "pi", "FW-GLM-5.2"
-) == module.GLM_PROVIDER_HOST
-try:
-    module.effective_provider_host(
-        {"provider_host": "api.example.com"}, "pi", "FW-GLM-5.2"
+# The adapter and the core pin ONE identical R6 lane registry. Comparing the
+# whole registry rather than a handful of constants means a lane added on one
+# side and not the other is a failure here rather than a divergent allowlist.
+assert module.CROSS_FAMILY_LANES == core.CROSS_FAMILY_LANES, (
+    module.CROSS_FAMILY_LANES,
+    core.CROSS_FAMILY_LANES,
+)
+assert module.CROSS_FAMILY_LANES["azure-kimi"]["model"] == "Kimi-K2.7-Code"
+assert module.CROSS_FAMILY_LANES["azure-deepseek"]["model"] == "DeepSeek-V4-Pro"
+for lane in module.CROSS_FAMILY_LANES.values():
+    assert lane["host"] == "aif-fm7c799d-eus01.cognitiveservices.azure.com", lane
+    assert lane["base_url"] == "https://" + lane["host"] + "/openai/v1", lane
+    assert module.cross_family_account_identity(lane) == (
+        core.cross_family_account_identity(lane)
     )
-except module.AzureCrosscheckError as exc:
-    assert "bind exactly one provider host" in str(exc), str(exc)
-else:
-    raise AssertionError("a GLM review accepted a foreign provider host")
+
+# The model decides the host: every cross-family review derives its own exact
+# Foundry host, refuses a conflicting configured host, and the codex-family
+# fallback keeps its existing derivation. The retired claude harness derives
+# nothing.
+for lane in module.CROSS_FAMILY_LANES.values():
+    assert module.effective_provider_host({}, "pi", lane["model"]) == lane["host"]
+    assert module.effective_provider_host(
+        {"provider_host": lane["host"]}, "pi", lane["model"]
+    ) == lane["host"]
+    try:
+        module.effective_provider_host(
+            {"provider_host": "api.example.com"}, "pi", lane["model"]
+        )
+    except module.AzureCrosscheckError as exc:
+        assert "bind exactly one provider host" in str(exc), str(exc)
+    else:
+        raise AssertionError(
+            "a cross-family review accepted a foreign provider host"
+        )
 assert module.effective_provider_host({}, "pi", "gpt-5.6-sol") == "chatgpt.com"
 assert module.effective_provider_host({}, "codex", "gpt-5.6-sol") == "chatgpt.com"
 assert module.effective_provider_host(
@@ -226,7 +248,8 @@ except module.AzureCrosscheckError as exc:
 else:
     raise AssertionError("the retired claude harness still derives a provider host")
 
-# The GLM identity record must carry the pinned host through validation.
+# The cross-family identity record must carry the pinned host through
+# validation.
 import copy
 identity = {
     "home_binding": "sha256:" + "1" * 64,
@@ -242,7 +265,7 @@ identity = {
     "provider_host": "api.example.com",
     "provider_port": "443",
     "reviewer_harness": "pi",
-    "reviewer_model": "FW-GLM-5.2",
+    "reviewer_model": "Kimi-K2.7-Code",
     "reviewer_effort": "xhigh",
     "reviewer_account_digest": "sha256:" + "2" * 64,
     "ledger_digest": "sha256:" + "f" * 64,
@@ -261,7 +284,7 @@ identity.update({
 reviewer = {
     "execution_mode": "azure-compartment-v1",
     "harness": "pi",
-    "model": "FW-GLM-5.2",
+    "model": "Kimi-K2.7-Code",
     "effort": "xhigh",
     "reviewer_account_identity_sha256": "2" * 64,
     "azure_identity": identity,
@@ -270,15 +293,17 @@ run = {"head_sha": "a" * 40, "base_sha": "b" * 40, "claims_sha256": "c" * 64}
 try:
     module.validate_azure_reviewer_record(reviewer, run, "run")
 except RuntimeError as exc:
-    assert "GLM provider host is not the pinned R6 Foundry endpoint" in str(exc), str(exc)
+    assert "azure-kimi provider host is not the pinned R6 Foundry endpoint" in str(exc), str(exc)
 else:
-    raise AssertionError("a GLM ledger record with a foreign provider host validated")
+    raise AssertionError(
+        "a cross-family ledger record with a foreign provider host validated"
+    )
 PY
   pass "the reviewer model derives the exact Foundry host and the claude host lane is retired"
 }
 
-glm_credential_lane_unit() {
-  python3 - "$ADAPTER" "$CORE" <<'PY' || fail "GLM Azure credential lane contract failed"
+cross_family_credential_lane_unit() {
+  python3 - "$ADAPTER" "$CORE" <<'PY' || fail "cross-family Azure credential lane contract failed"
 import importlib.util
 import json
 from pathlib import Path
@@ -294,14 +319,18 @@ core = importlib.util.module_from_spec(core_spec)
 core_spec.loader.exec_module(core)
 
 PINNED = "https://aif-fm7c799d-eus01.cognitiveservices.azure.com/openai/v1"
+LANE = module.CROSS_FAMILY_LANES["azure-kimi"]
+SLOT = LANE["slot"]
+MODEL = LANE["model"]
 
 
-def models_json(base_url=PINNED, api_key="glm-key-material", model_extra=None):
-    model = {"id": "FW-GLM-5.2", "name": "GLM 5.2"}
+def models_json(base_url=PINNED, api_key="lane-key-material", model_extra=None,
+                slot=SLOT, model_id=MODEL):
+    model = {"id": model_id, "name": "cross-family reviewer"}
     model.update(model_extra or {})
     return json.dumps({
         "providers": {
-            "azure-glm": {
+            slot: {
                 "baseUrl": base_url,
                 "api": "openai-completions",
                 "apiKey": api_key,
@@ -313,12 +342,12 @@ def models_json(base_url=PINNED, api_key="glm-key-material", model_extra=None):
 
 with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary)
-    home = root / "glm-home"
+    home = root / "lane-home"
     home.mkdir()
     (home / "models.json").write_text(models_json(), encoding="utf-8")
     config = {
         "harness": "pi",
-        "model": "FW-GLM-5.2",
+        "model": MODEL,
         "effort": "xhigh",
         "account_home": str(home),
     }
@@ -326,9 +355,35 @@ with tempfile.TemporaryDirectory() as temporary:
         module.inspect_reviewer_credential(core, config)
     )
     assert credential == home.resolve() / "models.json", credential
-    assert source == "pi-azure-glm-models-file", source
-    assert identifier.startswith("glm-foundry-binding:"), identifier
-    assert account_identity == module.GLM_REVIEWER_ACCOUNT_IDENTITY
+    assert source == "pi-" + SLOT + "-models-file", source
+    assert identifier.startswith("foundry-binding:" + SLOT + ":"), identifier
+    assert account_identity == module.cross_family_account_identity(LANE)
+
+    # Every other registered lane packages through the same code path with
+    # its own slot, model, and non-secret identity.
+    for other in module.CROSS_FAMILY_LANES.values():
+        if other["slot"] == SLOT:
+            continue
+        other_home = root / ("lane-home-" + other["slot"])
+        other_home.mkdir()
+        (other_home / "models.json").write_text(
+            models_json(slot=other["slot"], model_id=other["model"]),
+            encoding="utf-8",
+        )
+        _, other_source, other_identifier, other_identity = (
+            module.inspect_reviewer_credential(
+                core,
+                {
+                    "harness": "pi",
+                    "model": other["model"],
+                    "effort": "xhigh",
+                    "account_home": str(other_home),
+                },
+            )
+        )
+        assert other_source == "pi-" + other["slot"] + "-models-file", other_source
+        assert other_identifier != identifier, other_identifier
+        assert other_identity == module.cross_family_account_identity(other)
 
     # The packaged compartment credential is the models.json under the same
     # allowlist pin, and its archived identity is the non-secret binding.
@@ -343,7 +398,7 @@ with tempfile.TemporaryDirectory() as temporary:
         assert names == {"manifest.json", "models.json"}, names
         manifest = json.loads(archive.extractfile("manifest.json").read())
     assert manifest["credential_name"] == "models.json", manifest
-    assert manifest["model"] == "FW-GLM-5.2", manifest
+    assert manifest["model"] == MODEL, manifest
 
     # A credential outside the endpoint allowlist never enters the archive.
     foreign = root / "foreign-home"
@@ -363,7 +418,30 @@ with tempfile.TemporaryDirectory() as temporary:
     except module.AzureCrosscheckError as exc:
         assert "pinned R6 Foundry endpoint" in str(exc), str(exc)
     else:
-        raise AssertionError("a foreign-endpoint GLM credential was archived")
+        raise AssertionError(
+            "a foreign-endpoint cross-family credential was archived"
+        )
+
+    # Another registered lane's provider slot is still the wrong slot for
+    # this review: the lane is keyed on the reviewer model, never on what the
+    # credential file declares about itself.
+    swapped = root / "swapped-slot-home"
+    swapped.mkdir()
+    (swapped / "models.json").write_text(
+        models_json(slot="azure-deepseek"), encoding="utf-8"
+    )
+    try:
+        module.create_credential_archive(
+            root / "swapped.tar.gz",
+            swapped / "models.json",
+            identity,
+            config,
+            account_identity,
+        )
+    except module.AzureCrosscheckError as exc:
+        assert "pinned R6 Foundry endpoint" in str(exc), str(exc)
+    else:
+        raise AssertionError("a foreign-slot cross-family credential was archived")
 
     # pi gives MODEL-level baseUrl/api precedence over the provider level, so
     # a credential keeping the pinned endpoint at provider level while
@@ -418,8 +496,8 @@ with tempfile.TemporaryDirectory() as temporary:
     else:
         raise AssertionError("the retired claude credential lane still packages a profile")
 
-    # The GLM preflight accepts the api-key credential without an expiry
-    # reader and still refuses a missing credential loudly.
+    # The cross-family preflight accepts the api-key credential without an
+    # expiry reader and still refuses a missing credential loudly.
     record = module.preflight_reviewer_credential(core, config)
     assert record["state"] == "usable", record
     assert record["credential"] == "models.json", record
@@ -430,11 +508,11 @@ with tempfile.TemporaryDirectory() as temporary:
             core, {**config, "account_home": str(missing)}
         )
     except core.CrosscheckToolError as exc:
-        assert "GLM reviewer credential inspection failed" in str(exc), str(exc)
+        assert SLOT + " reviewer credential inspection failed" in str(exc), str(exc)
     else:
-        raise AssertionError("a missing GLM credential passed preflight")
+        raise AssertionError("a missing cross-family credential passed preflight")
 PY
-  pass "the Azure GLM credential lane packages models.json under the endpoint allowlist and the claude lane is gone"
+  pass "the Azure cross-family credential lane packages models.json under each lane's endpoint allowlist and the claude lane is gone"
 }
 
 identity_outcome_unit() {
@@ -1538,8 +1616,8 @@ PY
 static_contract
 parameter_contract_unit
 adapter_mode_unit
-glm_provider_host_unit
-glm_credential_lane_unit
+cross_family_provider_host_unit
+cross_family_credential_lane_unit
 identity_outcome_unit
 account_and_cleanup_identity_unit
 bridge_security_unit

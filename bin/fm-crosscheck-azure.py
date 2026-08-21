@@ -218,12 +218,19 @@ def preflight_reviewer_credential(core: Any, config: dict[str, str]) -> dict[str
     same interval.
     """
 
-    if config["harness"] == "pi" and config["model"] == GLM_REVIEWER_MODEL:
-        # The GLM lane authenticates with a Foundry api-key models.json,
-        # which declares no expiry, so the preflight that matters is the
-        # shape/allowlist inspection itself. A refusal there is already the
-        # core tool failure the roster uses to rotate reviewers.
-        core.inspect_pi_glm_credential(Path(config["account_home"]))
+    preflight_lane = (
+        cross_family_lane_for_model(config["model"])
+        if config["harness"] == "pi"
+        else None
+    )
+    if preflight_lane is not None:
+        # A cross-family lane authenticates with a Foundry api-key
+        # models.json, which declares no expiry, so the preflight that matters
+        # is the shape/allowlist inspection itself. A refusal there is already
+        # the core tool failure the roster uses to rotate reviewers.
+        core.inspect_pi_cross_family_credential(
+            Path(config["account_home"]), preflight_lane
+        )
         return {
             "profile": config["account_home"],
             "harness": "pi",
@@ -232,7 +239,10 @@ def preflight_reviewer_credential(core: Any, config: dict[str, str]) -> dict[str
             "expires_at": None,
             "expires_in_seconds": None,
             "refresh_expires_at": None,
-            "detail": "GLM Foundry api-key credential declares no expiry",
+            "detail": (
+                f"{preflight_lane['slot']} Foundry api-key credential "
+                "declares no expiry"
+            ),
         }
     expiry = load_credential_expiry()
     record = expiry.inspect_profile(
@@ -571,21 +581,47 @@ def require_model_image_attests_harness(
     return attested
 
 
-# R6 (docs/azure-requirements.md): these pins must equal the constants in
-# bin/fm-crosscheck.py; tests/fm-crosscheck-azure.test.sh enforces the
-# equality. The GLM lane binds exactly one Foundry resource + deployment and
-# exactly one chat-completions endpoint; the interim claude reviewer lane
-# and its provider host are retired.
-GLM_REVIEWER_MODEL = "FW-GLM-5.2"
-GLM_PROVIDER_SLOT = "azure-glm"
-GLM_FOUNDRY_RESOURCE = "aif-fm7c799d-eus01"
-GLM_PROVIDER_HOST = "aif-fm7c799d-eus01.cognitiveservices.azure.com"
-GLM_ALLOWED_BASE_URL = (
-    "https://aif-fm7c799d-eus01.cognitiveservices.azure.com/openai/v1"
+# R6 (docs/azure-requirements.md): this registry must equal
+# `CROSS_FAMILY_LANES` in bin/fm-crosscheck.py;
+# tests/fm-crosscheck-azure.test.sh enforces the equality as a whole, so a lane
+# added on one side and not the other is a test failure rather than a silently
+# divergent allowlist. Each lane binds exactly one Foundry resource +
+# deployment and exactly one chat-completions endpoint; the interim claude
+# reviewer lane and its provider host are retired.
+CROSS_FAMILY_LANE_API = "openai-completions"
+CROSS_FAMILY_FOUNDRY_RESOURCE = "aif-fm7c799d-eus01"
+CROSS_FAMILY_FOUNDRY_HOST = (
+    CROSS_FAMILY_FOUNDRY_RESOURCE + ".cognitiveservices.azure.com"
 )
-GLM_REVIEWER_ACCOUNT_IDENTITY = (
-    GLM_PROVIDER_SLOT + ":" + GLM_FOUNDRY_RESOURCE + "/" + GLM_REVIEWER_MODEL
+CROSS_FAMILY_FOUNDRY_BASE_URL = (
+    "https://" + CROSS_FAMILY_FOUNDRY_HOST + "/openai/v1"
 )
+CROSS_FAMILY_LANES = {
+    "azure-kimi": {
+        "slot": "azure-kimi",
+        "model": "Kimi-K2.7-Code",
+        "api": CROSS_FAMILY_LANE_API,
+        "foundry_resource": CROSS_FAMILY_FOUNDRY_RESOURCE,
+        "host": CROSS_FAMILY_FOUNDRY_HOST,
+        "base_url": CROSS_FAMILY_FOUNDRY_BASE_URL,
+    },
+    "azure-deepseek": {
+        "slot": "azure-deepseek",
+        "model": "DeepSeek-V4-Pro",
+        "api": CROSS_FAMILY_LANE_API,
+        "foundry_resource": CROSS_FAMILY_FOUNDRY_RESOURCE,
+        "host": CROSS_FAMILY_FOUNDRY_HOST,
+        "base_url": CROSS_FAMILY_FOUNDRY_BASE_URL,
+    },
+    "azure-glm": {
+        "slot": "azure-glm",
+        "model": "FW-GLM-5.2",
+        "api": CROSS_FAMILY_LANE_API,
+        "foundry_resource": CROSS_FAMILY_FOUNDRY_RESOURCE,
+        "host": CROSS_FAMILY_FOUNDRY_HOST,
+        "base_url": CROSS_FAMILY_FOUNDRY_BASE_URL,
+    },
+}
 
 HARNESS_PROVIDER_HOSTS = {
     "codex": "chatgpt.com",
@@ -593,22 +629,47 @@ HARNESS_PROVIDER_HOSTS = {
 }
 
 
+def cross_family_lane_for_model(reviewer_model: Any) -> dict[str, str] | None:
+    """Return the registered cross-family lane one reviewer model belongs to.
+
+    Mirrors `cross_family_lane_for_model` in bin/fm-crosscheck.py. The lane is
+    keyed on the model, never on anything the credential file supplies.
+    """
+
+    if not isinstance(reviewer_model, str):
+        return None
+    identity = reviewer_model.rsplit("/", 1)[-1].strip()
+    for lane in CROSS_FAMILY_LANES.values():
+        if lane["model"] == identity:
+            return lane
+    return None
+
+
+def cross_family_account_identity(lane: dict[str, str]) -> str:
+    return lane["slot"] + ":" + lane["foundry_resource"] + "/" + lane["model"]
+
+
 def effective_provider_host(
     azure: dict[str, Any], reviewer_harness: str, reviewer_model: str
 ) -> str:
     """One exact model-egress host per review, decided by the reviewer model
-    first: a GLM review binds the pinned Foundry host and refuses any other
-    configured host. For the codex-family fallback, explicit config wins,
-    else the reviewer harness names its provider."""
-    if reviewer_harness == "pi" and reviewer_model == GLM_REVIEWER_MODEL:
+    first: a cross-family review binds that lane's pinned Foundry host and
+    refuses any other configured host. For the codex-family fallback, explicit
+    config wins, else the reviewer harness names its provider."""
+    lane = (
+        cross_family_lane_for_model(reviewer_model)
+        if reviewer_harness == "pi"
+        else None
+    )
+    if lane is not None:
         host = azure.get("provider_host")
-        if host and host != GLM_PROVIDER_HOST:
+        if host and host != lane["host"]:
             raise AzureCrosscheckError(
-                "Azure Crosscheck GLM reviews bind exactly one provider host "
-                f"({GLM_PROVIDER_HOST}); refusing configured provider_host "
-                f"{host!r}"
+                f"Azure Crosscheck {lane['slot']} reviews bind exactly one "
+                f"provider host ({lane['host']}); refusing configured "
+                f"provider_host {host!r}"
             )
-        return GLM_PROVIDER_HOST
+        return lane["host"]
     host = azure.get("provider_host")
     if host:
         return host
@@ -670,13 +731,19 @@ def inspect_reviewer_credential(
         source, identifier = core.inspect_codex_credential(account_home)
         credential = account_home / "auth.json"
         account_identity = core.account_identity(config["harness"], account_home)
-    elif config["harness"] == "pi" and config["model"] == GLM_REVIEWER_MODEL:
-        # R6 GLM lane: the credential is the api-key models.json and the
-        # executing identity is the non-secret Foundry resource/deployment
+    elif (
+        config["harness"] == "pi"
+        and cross_family_lane_for_model(config["model"]) is not None
+    ):
+        # R6 cross-family lane: the credential is the api-key models.json and
+        # the executing identity is the non-secret Foundry resource/deployment
         # binding, because an api key names no upstream account.
-        source, identifier = core.inspect_pi_glm_credential(account_home)
+        lane = cross_family_lane_for_model(config["model"])
+        source, identifier = core.inspect_pi_cross_family_credential(
+            account_home, lane
+        )
         credential = account_home / "models.json"
-        account_identity = core.GLM_REVIEWER_ACCOUNT_IDENTITY
+        account_identity = core.cross_family_account_identity(lane)
     elif config["harness"] == "pi":
         source, identifier = core.inspect_pi_credential(account_home)
         credential = account_home / "auth.json"
@@ -726,28 +793,32 @@ def create_credential_archive(
         ) from exc
     if len(credential_bytes) > MAX_CONFIG_BYTES:
         raise AzureCrosscheckError("reviewer credential exceeds its byte bound")
-    glm_profile = (
-        config["harness"] == "pi" and config["model"] == GLM_REVIEWER_MODEL
+    archive_lane = (
+        cross_family_lane_for_model(config["model"])
+        if config["harness"] == "pi"
+        else None
     )
     try:
         parsed = json.loads(credential_bytes)
     except (json.JSONDecodeError, UnicodeError) as exc:
         raise AzureCrosscheckError("reviewer credential is malformed") from exc
-    if glm_profile:
-        # The archived GLM credential must stay inside the R6 endpoint
-        # allowlist, and its executing identity is the non-secret Foundry
-        # resource/deployment binding - never the api key or a digest of it.
+    if archive_lane is not None:
+        # The archived cross-family credential must stay inside that lane's R6
+        # endpoint allowlist, and its executing identity is the non-secret
+        # Foundry resource/deployment binding - never the api key or a digest
+        # of it.
+        slot = archive_lane["slot"]
         providers = parsed.get("providers") if isinstance(parsed, dict) else None
         entry = (
-            providers.get(GLM_PROVIDER_SLOT)
-            if isinstance(providers, dict) and set(providers) == {GLM_PROVIDER_SLOT}
+            providers.get(slot)
+            if isinstance(providers, dict) and set(providers) == {slot}
             else None
         )
         base_url = entry.get("baseUrl") if isinstance(entry, dict) else None
-        if base_url != GLM_ALLOWED_BASE_URL:
+        if base_url != archive_lane["base_url"]:
             raise AzureCrosscheckError(
-                "archived GLM reviewer credential is not bound to the pinned "
-                f"R6 Foundry endpoint {GLM_ALLOWED_BASE_URL}"
+                f"archived {slot} reviewer credential is not bound to the "
+                f"pinned R6 Foundry endpoint {archive_lane['base_url']}"
             )
         # pi gives model-level baseUrl/api precedence over the provider
         # level, so a model entry carrying either field would escape the
@@ -759,11 +830,11 @@ def create_credential_archive(
                 "baseUrl" in model_entry or "api" in model_entry
             ):
                 raise AzureCrosscheckError(
-                    "archived GLM reviewer credential carries a model-level "
-                    "baseUrl/api override that escapes the pinned R6 Foundry "
-                    "endpoint"
+                    f"archived {slot} reviewer credential carries a "
+                    "model-level baseUrl/api override that escapes the pinned "
+                    "R6 Foundry endpoint"
                 )
-        archived_identity = GLM_REVIEWER_ACCOUNT_IDENTITY
+        archived_identity = cross_family_account_identity(archive_lane)
     elif config["harness"] == "codex":
         tokens = parsed.get("tokens") if isinstance(parsed, dict) else None
         archived_identity = tokens.get("account_id") if isinstance(tokens, dict) else None
@@ -785,7 +856,9 @@ def create_credential_archive(
         "harness": config["harness"],
         "model": config["model"],
         "effort": config["effort"],
-        "credential_name": "models.json" if glm_profile else "auth.json",
+        "credential_name": (
+            "models.json" if archive_lane is not None else "auth.json"
+        ),
         "credential_digest": digest_bytes(credential_bytes),
     }
     payload = {
@@ -2160,13 +2233,15 @@ def validate_azure_reviewer_record(
         raise RuntimeError(f"{label}.reviewer Azure deployment identity is malformed")
     if not re.fullmatch(r"[0-9a-f]{64}", identity["claims_sha256"]):
         raise RuntimeError(f"{label}.reviewer Azure claims digest is malformed")
-    if (
-        identity["reviewer_harness"] == "pi"
-        and identity["reviewer_model"] == GLM_REVIEWER_MODEL
-        and identity["provider_host"] != GLM_PROVIDER_HOST
-    ):
+    recorded_lane = (
+        cross_family_lane_for_model(identity["reviewer_model"])
+        if identity["reviewer_harness"] == "pi"
+        else None
+    )
+    if recorded_lane is not None and identity["provider_host"] != recorded_lane["host"]:
         raise RuntimeError(
-            f"{label}.reviewer GLM provider host is not the pinned R6 Foundry endpoint"
+            f"{label}.reviewer {recorded_lane['slot']} provider host is not "
+            "the pinned R6 Foundry endpoint"
         )
     generation = digest_bytes(
         canonical_bytes({field: identity[field] for field in generation_fields})

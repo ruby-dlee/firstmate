@@ -52,36 +52,90 @@ SEVERITIES = {"blocking", "high", "medium", "low"}
 # opts in with this exact mode; current task metadata never sets it.
 LEGACY_AUTHOR_ADMISSION_MODE = "legacy-author-admission"
 
-# R6 (docs/azure-requirements.md): the primary Crosscheck reviewer family is
-# GLM-5.2 served from the fleet's own Azure AI Foundry resource through the
-# Fireworks partner lane, driven by Pi through a custom `azure-glm` provider.
-# The endpoint is an ALLOWLIST of exactly one chat-completions base URL: any
-# other baseUrl - including any Responses API surface - is refused by name.
-# The reviewer identity binds the Foundry resource + deployment, never the
-# api key or anything derived from it.
-GLM_REVIEWER_MODEL = "FW-GLM-5.2"
-GLM_PROVIDER_SLOT = "azure-glm"
-GLM_PROVIDER_API = "openai-completions"
-GLM_FOUNDRY_RESOURCE = "aif-fm7c799d-eus01"
-GLM_PROVIDER_HOST = "aif-fm7c799d-eus01.cognitiveservices.azure.com"
-GLM_ALLOWED_BASE_URL = (
-    "https://aif-fm7c799d-eus01.cognitiveservices.azure.com/openai/v1"
+# R6 (docs/azure-requirements.md): the primary Crosscheck reviewer family is a
+# NAMED cross-family lane served from the fleet's own Azure AI Foundry resource
+# and driven by Pi through a custom provider. Authors run on the OpenAI family,
+# so any lane below is outside it, which is what R6 actually requires; no
+# single partner model is baked into the gate.
+#
+# Every registered lane is a complete, code-reviewed ENDPOINT ALLOWLIST entry:
+# the deployment name, the Pi provider slot, the chat-completions api surface,
+# the Foundry resource, and the ONE accepted base URL. Substituting the serving
+# lane among registered lanes is a config change (the roster names the model);
+# admitting a NEW endpoint stays a reviewed code change on purpose, because the
+# allowlist is the security control - a credential file must never be able to
+# introduce an endpoint the policy never named.
+#
+# The reviewer identity binds the Foundry resource + deployment, never the api
+# key or anything derived from it.
+CROSS_FAMILY_LANE_API = "openai-completions"
+CROSS_FAMILY_FOUNDRY_RESOURCE = "aif-fm7c799d-eus01"
+CROSS_FAMILY_FOUNDRY_HOST = (
+    CROSS_FAMILY_FOUNDRY_RESOURCE + ".cognitiveservices.azure.com"
 )
-# Non-secret executing identity for the api-key GLM lane: an api key names no
-# upstream account, so the reviewer identity is the resource/deployment pair.
-GLM_REVIEWER_ACCOUNT_IDENTITY = (
-    GLM_PROVIDER_SLOT + ":" + GLM_FOUNDRY_RESOURCE + "/" + GLM_REVIEWER_MODEL
+CROSS_FAMILY_FOUNDRY_BASE_URL = (
+    "https://" + CROSS_FAMILY_FOUNDRY_HOST + "/openai/v1"
 )
+CROSS_FAMILY_LANES = {
+    # Primary lane. Verified live 2026-08-20: HTTP 200 on the pinned endpoint.
+    "azure-kimi": {
+        "slot": "azure-kimi",
+        "model": "Kimi-K2.7-Code",
+        "api": CROSS_FAMILY_LANE_API,
+        "foundry_resource": CROSS_FAMILY_FOUNDRY_RESOURCE,
+        "host": CROSS_FAMILY_FOUNDRY_HOST,
+        "base_url": CROSS_FAMILY_FOUNDRY_BASE_URL,
+    },
+    # Second cross-family lane, a genuinely different vendor from the primary,
+    # so one vendor outage does not drop reviews back to the author's own
+    # family. Verified live 2026-08-20: HTTP 200 on the pinned endpoint and on
+    # the `services.ai.azure.com/models` route.
+    "azure-deepseek": {
+        "slot": "azure-deepseek",
+        "model": "DeepSeek-V4-Pro",
+        "api": CROSS_FAMILY_LANE_API,
+        "foundry_resource": CROSS_FAMILY_FOUNDRY_RESOURCE,
+        "host": CROSS_FAMILY_FOUNDRY_HOST,
+        "base_url": CROSS_FAMILY_FOUNDRY_BASE_URL,
+    },
+    # Retained as evidence, NOT usable on this subscription and NOT rostered.
+    # Fireworks-published (`FW-*`) deployments are Marketplace SaaS offers, and
+    # this subscription is "Microsoft Azure Sponsorship": credit-only sponsored
+    # subscriptions cannot purchase Marketplace SaaS offers, so the deployment
+    # exists but its linkage to the publisher backend can never be established
+    # and every request returns HTTP 500
+    # `invalid_model_endpoint_authentication`. Non-Fireworks publishers on the
+    # same account, same key, same subscription answer 200. Details and the
+    # citation are in docs/azure-requirements.md R6. The entry stays registered
+    # so the roster can be pointed back at it without a code change if the
+    # subscription ever gains a pay-as-you-go billing method.
+    "azure-glm": {
+        "slot": "azure-glm",
+        "model": "FW-GLM-5.2",
+        "api": CROSS_FAMILY_LANE_API,
+        "foundry_resource": CROSS_FAMILY_FOUNDRY_RESOURCE,
+        "host": CROSS_FAMILY_FOUNDRY_HOST,
+        "base_url": CROSS_FAMILY_FOUNDRY_BASE_URL,
+    },
+}
 # The model decides the Pi provider slot. An unmapped model is refused rather
 # than guessed, so a roster typo can never route a review to a provider the
 # policy never named.
 PI_MODEL_PROVIDERS = {
-    GLM_REVIEWER_MODEL: GLM_PROVIDER_SLOT,
+    **{lane["model"]: lane["slot"] for lane in CROSS_FAMILY_LANES.values()},
     "gpt-5.6-sol": "openai-codex",
 }
 # Review family provenance recorded in every run's ledger reviewer record.
+REVIEW_FAMILY_CROSS_FAMILY_PRIMARY = "cross-family-primary"
+# Legacy provenance value: runs recorded before the lane registry landed named
+# the GLM lane directly. Durable ledgers still carry it, so validation accepts
+# it - bound, as before, to exactly the GLM lane's model.
 REVIEW_FAMILY_GLM_PRIMARY = "glm-primary"
 REVIEW_FAMILY_CODEX_FALLBACK = "codex-fallback"
+REVIEW_FAMILY_PRIMARY_MODES = {
+    REVIEW_FAMILY_CROSS_FAMILY_PRIMARY,
+    REVIEW_FAMILY_GLM_PRIMARY,
+}
 
 # C1 (docs/azure-requirements.md): every run records where its wall clock went.
 # The local lane owns the first four; the Azure compartment lane additionally
@@ -404,9 +458,9 @@ def account_identity(harness: str, account_home: Path) -> str:
     """Stable upstream executing-account identity for one reviewer home.
 
     The returned string never carries token material: Codex and Pi expose
-    explicit upstream account ids. The GLM api-key lane never reaches this
-    reader - its identity is the non-secret Foundry resource/deployment
-    binding (GLM_REVIEWER_ACCOUNT_IDENTITY), because an api key names no
+    explicit upstream account ids. The api-key cross-family lanes never reach
+    this reader - their identity is the non-secret Foundry resource/deployment
+    binding (`cross_family_account_identity`), because an api key names no
     upstream account.
     """
 
@@ -550,12 +604,40 @@ def inspect_pi_credential(account_home: Path) -> tuple[str, str]:
     return "pi-openai-codex-oauth-file", str(credential_file)
 
 
+def cross_family_lane_for_model(model: str) -> dict[str, str] | None:
+    """Return the registered cross-family lane a reviewer model belongs to.
+
+    A model outside CROSS_FAMILY_LANES is not a cross-family reviewer: it is
+    either the codex-family fallback or an unmapped model that
+    `pi_provider_for_model` refuses. Returning None rather than guessing keeps
+    the fallback lane and the primary lane from ever blurring together.
+    """
+
+    identity = model_identity(model)
+    for lane in CROSS_FAMILY_LANES.values():
+        if lane["model"] == identity:
+            return lane
+    return None
+
+
+def cross_family_account_identity(lane: dict[str, str]) -> str:
+    """Non-secret executing identity for one api-key cross-family lane.
+
+    An api key names no upstream account, so the reviewer identity is the
+    provider slot plus the Foundry resource/deployment pair. It neither
+    contains nor is derived from the key.
+    """
+
+    return lane["slot"] + ":" + lane["foundry_resource"] + "/" + lane["model"]
+
+
 def pi_provider_for_model(model: str) -> str:
     """Return the exact Pi provider slot the reviewer model executes on.
 
-    The mapping is explicit, not heuristic: FW-GLM-5.2 runs on the R6
-    `azure-glm` Foundry provider and the gpt fallback family stays on
-    `openai-codex`. Any model outside the table refuses by name.
+    The mapping is explicit, not heuristic: every registered cross-family
+    deployment runs on its own R6 Foundry provider slot and the gpt fallback
+    family stays on `openai-codex`. Any model outside the table refuses by
+    name.
     """
 
     provider = PI_MODEL_PROVIDERS.get(model)
@@ -567,68 +649,75 @@ def pi_provider_for_model(model: str) -> str:
     return provider
 
 
-def inspect_pi_glm_credential(account_home: Path) -> tuple[str, str]:
-    """Validate the api-key models.json credential of one GLM reviewer home.
+def inspect_pi_cross_family_credential(
+    account_home: Path, lane: dict[str, str]
+) -> tuple[str, str]:
+    """Validate the api-key models.json credential of one cross-family home.
 
-    A GLM reviewer's account home is a dedicated Pi agent dir whose credential
-    is `models.json` carrying exactly the `azure-glm` custom provider. The
-    endpoint is an allowlist of exactly GLM_ALLOWED_BASE_URL (chat completions
-    only; any configuration reaching for a Responses API surface is refused).
-    The returned credential identifier is a non-secret binding of the Foundry
-    resource + deployment + pinned endpoint; it neither contains nor is derived
-    from the api key.
+    A cross-family reviewer's account home is a dedicated Pi agent dir whose
+    credential is `models.json` carrying exactly that lane's custom provider.
+    The endpoint is an allowlist of exactly the lane's registered base URL
+    (chat completions only; any configuration reaching for a Responses API
+    surface is refused). The returned credential identifier is a non-secret
+    binding of the Foundry resource + deployment + pinned endpoint; it neither
+    contains nor is derived from the api key.
+
+    The lane comes from the code-side registry, never from the credential
+    file, so a models.json can only satisfy or fail the pin - never move it.
     """
 
+    slot = lane["slot"]
+    allowed_base_url = lane["base_url"]
     credential_file = account_home.resolve() / "models.json"
     try:
         metadata = credential_file.lstat()
     except OSError as exc:
         tool_fail(
-            "GLM reviewer credential inspection failed at "
+            f"{slot} reviewer credential inspection failed at "
             f"{credential_file}: {exc}"
         )
     if not stat.S_ISREG(metadata.st_mode) or credential_file.is_symlink():
         tool_fail(
-            "GLM reviewer credential inspection requires a regular "
+            f"{slot} reviewer credential inspection requires a regular "
             f"non-symlink file at {credential_file}"
         )
     try:
         document = read_json(
             credential_file,
-            "GLM reviewer credential",
+            f"{slot} reviewer credential",
             maximum_bytes=1024 * 1024,
             maximum_items=4096,
         )
     except CrosscheckError as exc:
         tool_fail(str(exc))
     providers = document.get("providers") if isinstance(document, dict) else None
-    if not isinstance(providers, dict) or set(providers) != {GLM_PROVIDER_SLOT}:
+    if not isinstance(providers, dict) or set(providers) != {slot}:
         tool_fail(
-            f"GLM reviewer credential at {credential_file} must declare "
-            f"exactly the {GLM_PROVIDER_SLOT} provider"
+            f"{slot} reviewer credential at {credential_file} must declare "
+            f"exactly the {slot} provider"
         )
-    provider = providers[GLM_PROVIDER_SLOT]
+    provider = providers[slot]
     if not isinstance(provider, dict):
         tool_fail(
-            f"GLM reviewer credential at {credential_file} has a malformed "
-            f"{GLM_PROVIDER_SLOT} provider entry"
+            f"{slot} reviewer credential at {credential_file} has a malformed "
+            f"{slot} provider entry"
         )
     base_url = provider.get("baseUrl")
-    if base_url != GLM_ALLOWED_BASE_URL:
+    if base_url != allowed_base_url:
         tool_fail(
-            f"GLM reviewer endpoint allowlist refused baseUrl {base_url!r}; "
-            f"the only accepted endpoint is {GLM_ALLOWED_BASE_URL}"
+            f"{slot} reviewer endpoint allowlist refused baseUrl "
+            f"{base_url!r}; the only accepted endpoint is {allowed_base_url}"
         )
-    if provider.get("api") != GLM_PROVIDER_API:
+    if provider.get("api") != lane["api"]:
         tool_fail(
-            f"GLM reviewer credential at {credential_file} must pin api "
-            f"{GLM_PROVIDER_API!r} (chat completions only; a Responses API "
+            f"{slot} reviewer credential at {credential_file} must pin api "
+            f"{lane['api']!r} (chat completions only; a Responses API "
             "configuration is refused)"
         )
     api_key = provider.get("apiKey")
     if not isinstance(api_key, str) or not api_key.strip():
         tool_fail(
-            f"GLM reviewer credential is unusable at {credential_file}: "
+            f"{slot} reviewer credential is unusable at {credential_file}: "
             "no api key material"
         )
     models = provider.get("models")
@@ -646,26 +735,29 @@ def inspect_pi_glm_credential(account_home: Path) -> tuple[str, str]:
     for entry in model_entries:
         if "baseUrl" in entry or "api" in entry:
             tool_fail(
-                f"GLM reviewer credential at {credential_file} carries a "
+                f"{slot} reviewer credential at {credential_file} carries a "
                 "model-level baseUrl/api override; pi gives model-level "
                 "fields precedence over the provider, so the pinned "
                 "provider-level endpoint must own both"
             )
-    if GLM_REVIEWER_MODEL not in [entry.get("id") for entry in model_entries]:
+    if lane["model"] not in [entry.get("id") for entry in model_entries]:
         tool_fail(
-            f"GLM reviewer credential at {credential_file} does not declare "
-            f"the {GLM_REVIEWER_MODEL} deployment"
+            f"{slot} reviewer credential at {credential_file} does not "
+            f"declare the {lane['model']} deployment"
         )
     binding = hashlib.sha256(
         (
-            GLM_FOUNDRY_RESOURCE
+            lane["foundry_resource"]
             + "/"
-            + GLM_REVIEWER_MODEL
+            + lane["model"]
             + "\n"
-            + GLM_ALLOWED_BASE_URL
+            + allowed_base_url
         ).encode("utf-8")
     ).hexdigest()
-    return "pi-azure-glm-models-file", "glm-foundry-binding:" + binding
+    return (
+        "pi-" + slot + "-models-file",
+        "foundry-binding:" + slot + ":" + binding,
+    )
 
 
 def model_identity(model: str) -> str:
@@ -2849,22 +2941,32 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
                 family
                 in {
                     None,
-                    REVIEW_FAMILY_GLM_PRIMARY,
+                    *REVIEW_FAMILY_PRIMARY_MODES,
                     REVIEW_FAMILY_CODEX_FALLBACK,
                 },
                 f"{label}.reviewer.review_family_mode is invalid",
             )
             if family is not None:
                 # The family marker is bound to the model, so a forged record
-                # cannot claim glm-primary for a codex-family review or hide
-                # a fallback behind the primary label.
+                # cannot claim a primary lane for a codex-family review or
+                # hide a fallback behind the primary label.
                 reviewer_model = reviewer.get("model")
-                model_is_glm = (
-                    isinstance(reviewer_model, str)
-                    and model_identity(reviewer_model) == GLM_REVIEWER_MODEL
+                lane = (
+                    cross_family_lane_for_model(reviewer_model)
+                    if isinstance(reviewer_model, str)
+                    else None
                 )
                 require(
-                    (family == REVIEW_FAMILY_GLM_PRIMARY) == model_is_glm,
+                    (family in REVIEW_FAMILY_PRIMARY_MODES) == (lane is not None),
+                    f"{label}.reviewer.review_family_mode does not match the "
+                    "reviewer model",
+                )
+                # The legacy value names one specific lane, so it stays bound
+                # to that lane's model rather than becoming a free synonym for
+                # any cross-family primary.
+                require(
+                    family != REVIEW_FAMILY_GLM_PRIMARY
+                    or (lane is not None and lane["slot"] == "azure-glm"),
                     f"{label}.reviewer.review_family_mode does not match the "
                     "reviewer model",
                 )
@@ -3049,14 +3151,14 @@ def reviewer_candidates(
         isinstance(reviewers, list) and reviewers,
         "reviewer configuration.reviewers must be a nonempty array",
     )
-    # R6: GLM-5.2 on the fleet's own Foundry resource is the PRIMARY review
-    # family. The pi-codex/codex profiles remain only as the dormant fallback
-    # lane; selecting one is recorded as a degraded mode in the ledger and
-    # announced loudly at run time. The interim claude reviewer lane is
-    # retired: a claude profile is refused here by the same exact-profile
-    # message as any other unlisted profile.
+    # R6: a registered cross-family lane on the fleet's own Foundry resource is
+    # the PRIMARY review family. The pi-codex/codex profiles remain only as the
+    # dormant fallback lane; selecting one is recorded as a degraded mode in
+    # the ledger and announced loudly at run time. The interim claude reviewer
+    # lane is retired: a claude profile is refused here by the same
+    # exact-profile message as any other unlisted profile.
     allowed_profiles = {
-        ("pi", GLM_REVIEWER_MODEL, "xhigh"),
+        *((("pi", lane["model"], "xhigh")) for lane in CROSS_FAMILY_LANES.values()),
         ("codex", "gpt-5.6-sol", "xhigh"),
         ("pi", "gpt-5.6-sol", "xhigh"),
     }
@@ -3091,11 +3193,12 @@ def reviewer_candidates(
                 "model": model,
                 "effort": effort,
                 "account_home": str(account_home.resolve()),
-                # Durable review-family provenance: GLM is the primary lane;
-                # every codex-family profile is the recorded fallback.
+                # Durable review-family provenance: a registered cross-family
+                # lane is the primary; every codex-family profile is the
+                # recorded fallback.
                 "review_family_mode": (
-                    REVIEW_FAMILY_GLM_PRIMARY
-                    if model == GLM_REVIEWER_MODEL
+                    REVIEW_FAMILY_CROSS_FAMILY_PRIMARY
+                    if cross_family_lane_for_model(model) is not None
                     else REVIEW_FAMILY_CODEX_FALLBACK
                 ),
             }
@@ -3615,12 +3718,24 @@ def run_reviewer(
         config["account_selector"] = "CODEX_HOME"
     else:
         execution_home = prepare_pi_execution_home(protocol_dir, account_home)
-        # The model decides the credential shape as well as the provider: the
-        # GLM lane authenticates through the api-key models.json custom
-        # provider, while the codex-family fallback keeps its OAuth auth.json.
-        if pi_provider_for_model(config["model"]) == GLM_PROVIDER_SLOT:
-            credential_source, credential_identifier = inspect_pi_glm_credential(
-                account_home
+        # The model decides the credential shape as well as the provider: a
+        # cross-family lane authenticates through the api-key models.json
+        # custom provider, while the codex-family fallback keeps its OAuth
+        # auth.json. `pi_provider_for_model` has already refused an unmapped
+        # model, so the lane lookup below cannot silently fall through.
+        cross_family_lane = cross_family_lane_for_model(config["model"])
+        if cross_family_lane is not None:
+            require(
+                pi_provider_for_model(config["model"])
+                == cross_family_lane["slot"],
+                "reviewer provider mapping does not match the cross-family "
+                f"lane registered for model {config['model']!r}",
+            )
+            (
+                credential_source,
+                credential_identifier,
+            ) = inspect_pi_cross_family_credential(
+                account_home, cross_family_lane
             )
         else:
             credential_source, credential_identifier = inspect_pi_credential(
@@ -4265,8 +4380,8 @@ def render_report(ledger: dict[str, Any], run: dict[str, Any]) -> str:
     ):
         lines.extend(
             [
-                "Review family: **CODEX FALLBACK** (degraded; the GLM-5.2 "
-                "primary lane did not serve this run).",
+                "Review family: **CODEX FALLBACK** (degraded; no cross-family "
+                "primary lane served this run).",
                 "",
             ]
         )
@@ -4624,7 +4739,7 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
                     print(
                         "CROSSCHECK DEGRADED: codex-family fallback reviewer "
                         f"{config['harness']} {config['model']} is standing in "
-                        f"for the GLM-5.2 primary lane; {relaxation}",
+                        f"for the cross-family primary lane; {relaxation}",
                         file=sys.stderr,
                     )
                 remaining = len(candidates) - position - 1

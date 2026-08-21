@@ -254,7 +254,14 @@ Acceptance: concurrent crewmates run on distinct pi profiles with no account col
 
 ## R6. Crosscheck reviews outside the author's model family
 
-Status: see "The Azure Foundry Fireworks lane is unusable on this subscription" and "The lane is a
+Status: NOT DONE. **No cross-family review has ever completed, and none completed for this change
+either.** The acceptance is two completed reviews, not correct wiring: a codex-authored change AND
+a claude-authored change each reviewed by a GLM-backed reviewer, with bound reviewer identity and
+the same evidence discipline as the codex lane. Zero of those two exist. What landed is the lane
+being executable at all, which it previously was not, plus the fixes below. Read "Where the lane
+actually stands" before treating any of it as finished.
+
+Context: see "The Azure Foundry Fireworks lane is unusable on this subscription" and "The lane is a
 named registry, now serving GLM-5.2 direct from Fireworks" below, both 2026-08-20. GLM never
 completed a review through Azure and on this subscription never can; it now serves through a direct
 Fireworks account instead.
@@ -501,6 +508,66 @@ What landed, 2026-08-20 (#264, plus #268 for a defect the live runs exposed):
   afterwards; the operator has since restored the fallback entries again, as the status above
   records. This run is still the only verdict this requirement's lane has produced.
 
+### Where the lane actually stands, 2026-08-21
+
+Stated plainly, because wiring being right is not the acceptance.
+
+**Has a cross-family review run end to end and produced a verdict? NO.** Not once, on any lane,
+ever. Two attempts were made against PR #281 on the direct Fireworks lane:
+
+| attempt | roster | outcome |
+|---|---|---|
+| 1 | `fireworks-glm` then the pi-codex fallback | GLM produced a complete turn but its final assistant text was not bare JSON, refused as `malformed verdict artifact`; the run fell through to the codex-family fallback, which DID reach a real blocking verdict |
+| 2 | `fireworks-glm` only | `Pi reviewer: bounded command timed out after 1800 seconds` |
+
+What IS established, by execution:
+
+- The provider is reachable and correct. Direct HTTP against
+  `https://api.fireworks.ai/inference/v1/chat/completions` with the pinned model returns HTTP 200,
+  `finish_reason: stop`, and streams to `[DONE]` in 1.56s carrying a usage chunk.
+- The crosscheck lane reaches it. Attempt 1's failure was a verdict SHAPE problem at the end of a
+  completed model turn, not a connectivity, credential or policy failure. That shape is now handled
+  (one whole-message Markdown fence is unwrapped) and the refusal names a bounded prefix of the
+  offending text, which it did not before.
+- The hang is in pi, not the provider. The same pi build, node runtime and harness complete against
+  `openai-codex`, and completed once against a different custom provider slot. Against this provider
+  pi has hung at 420s, 900s and 1800s on prompts of very different sizes while direct streaming of
+  the same model answers in under two seconds.
+
+Leading suspect, labelled as a suspicion rather than a finding: this requirement's own Work list
+asked to "verify pi tolerates `reasoning_content` in streamed deltas before rollout", and that was
+never done. GLM-5.2 returns `reasoning_content` on every response (observed: 1,139 characters of it
+beside a 180-character answer). That is the one thing this provider does which the working lanes do
+not. It has not been isolated, so it is a hypothesis, not a cause.
+
+**What #281 closes:**
+
+- The lane is executable at all. `azure-glm` / `FW-GLM-5.2` on main are dead references: the Foundry
+  account `aif-fm7c799d-eus01` has ZERO deployments as of 2026-08-21, so the pre-existing lane could
+  not have served a review under any circumstances.
+- Two reproduced high-severity policy bypasses, both found by a real completed review of the branch
+  (codex-family fallback lane) and both fixed with tests: provider-qualified authors bypassing
+  family separation (cc-4dcd7873f71a and cc-5ec330d3c74d) and the model-level `compat` pin missing
+  the provider and `modelOverrides` layers pi also composes (cc-ca5848b19ac3).
+- Operator documentation that told captains to provision an `openai-codex` `auth.json` for every Pi
+  reviewer, which misprovisions a cross-family lane home (cc-769d7eba2ded).
+- The startup-credit item above, retired as moot.
+
+**What #281 does NOT close, and must not be read as closing:**
+
+- The acceptance itself. Zero completed cross-family reviews; the requirement needs two, over two
+  different author families.
+- The status command answering whether the cross-family lane is serving or the fallback is active.
+  It still does not exist; `bin/fm-crosscheck.py` exposes `run`, `verify`, `merge` and `timings`.
+  This one is substantive rather than cosmetic, and it bites right now: the fallback IS active, and
+  the only thing that says so is a stderr line at run time.
+- `reasoning_content` in streamed deltas, still unverified, and now the leading suspect for the
+  hang above.
+- A per-review spend meter. The provider slot declares real per-million costs (input 1.45, output
+  4.69) instead of the old slot's zeros, but that number lives in pi's own config and this change
+  does NOT make the crosscheck ledger's cost non-zero, because the ledger records no token usage at
+  all. R10's `daily_budget_usd` therefore still has nothing to bind to.
+
 Still owed, and honestly so:
 
 - CLOSED as far as GLM is concerned, and the earlier reading of it was wrong. This item asked for
@@ -514,12 +581,17 @@ Still owed, and honestly so:
   slot 5 at 06:08Z is the pi-codex fallback demonstration, not a GLM run. The quota was named as
   the leading suspect. It was not the cause. The acceptance now rests on a completed review from a
   registered, reachable cross-family lane instead.
-- The startup-credit decrement check. Deployment metrics for `aif-fm7c799d-eus01` record 727,136
-  tokens on 2026-08-20: 515,965 in the 04:00Z hour, 135,911 in 05:00Z, 75,260 in 06:00Z. (An
-  earlier draft of this section reported roughly 510K for the day; that was the 04:00Z hour alone.)
-  Cost Management shows no charge against the resource yet. That absence carries no information
-  either way at this range: C3 records that Cost Management actual lags hours, which is why its
-  own bound is a backstop on recorded spend. This needs the portal's cost view.
+- The startup-credit decrement check is MOOT, retired rather than left standing. It asked for a
+  small live spend confirming the charge decrements Azure startup credit. That premise died with
+  the lane move. Fireworks pay-per-token ON FOUNDRY billed as Azure consumption; Fireworks DIRECT
+  bills a Fireworks account and touches no Azure credit at all, so no charge for this lane can ever
+  appear in Azure Cost Management. Nobody should go hunting for one. The historical Azure numbers
+  are kept only as a record of what the dead lane consumed: deployment metrics for
+  `aif-fm7c799d-eus01` recorded 727,136 tokens on 2026-08-20 (515,965 in the 04:00Z hour, 135,911
+  in 05:00Z, 75,260 in 06:00Z; an earlier draft reported roughly 510K for the day, which was the
+  04:00Z hour alone). That resource now has ZERO deployments, verified 2026-08-21, so it can serve
+  nothing. If a spend signal is still wanted it is a Fireworks-side number, and the meter it would
+  need does not exist here either: see the spend bullet below.
 - The Azure-compartment cross-family lane, which is switched off rather than unbuildable. The serving lane
   today is the local pi reviewer. The reason recorded here previously, that the `fm-ccm` image
   carries no `pi` binary and needs a rebake, is stale and is corrected below.

@@ -3661,6 +3661,44 @@ for name, body in COMPARTMENT_PAYLOAD.items():
     assert executed["payload_files"][name] == {
         "sha256": hashlib.sha256(body).hexdigest(), "bytes": len(body)}, executed
 
+# The lane is selected from the worker's DURABLE role, and the two records that
+# carry it must agree. create_worker_record copies the item's role onto the
+# worker, so a disagreement means durable state has drifted and the controller
+# must not guess which side is right. Reached through the real CLI by editing
+# ONLY the queue item, leaving the worker record and its cloud-attested VM tags
+# intact, which is exactly the drift this fails closed on.
+controller_file = Path(env["FM_HOME"]) / "state/azure-workers/controller.json"
+
+
+def rewrite_item_role(value):
+    durable = json.loads(controller_file.read_text())
+    item = durable["queue"]["smc-1@gen-s1"]
+    if value is None:
+        item.pop("role", None)
+    else:
+        item["role"] = value
+    # The worker record keeps role=secondmate; only the queue item moves.
+    assert durable["workers"][smc_slot]["role"] == "secondmate", durable["workers"][smc_slot]
+    controller_file.write_text(json.dumps(durable, sort_keys=True, separators=(",", ":")))
+
+
+stage_compartment(COMPARTMENT_PAYLOAD)
+for drifted in ("author", None):
+    rewrite_item_role(drifted)
+    refused = compartment_execute(check=False)
+    assert refused.returncode != 0 and "role disagrees with its queue item" in refused.stderr, (
+        "a worker/item role disagreement ({}) was not refused: {}".format(
+            drifted, refused.stderr))
+    # The refusal precedes make_action/slot_lease/claim_pending, so it must not
+    # have wedged the slot or left a durable claim behind.
+    assert smc_slot not in controller_state()["pending_actions"], controller_state()["pending_actions"]
+
+# Positive control: with the records agreeing again the SAME call succeeds, so
+# the refusals above are caused by the disagreement and nothing else.
+rewrite_item_role("secondmate")
+agreed = compartment_execute()
+assert json.loads(agreed.stdout)["schema"] == "fm.worker-execution-result/v1", agreed.stdout
+
 # The compartment cap (default 2): a third compartment refuses.
 run("request", "--task", "smc-2", "--task-generation", "gen-s2",
     "--home-binding", binding(31), "--account-binding", binding(32),

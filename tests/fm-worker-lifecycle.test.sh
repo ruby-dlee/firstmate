@@ -6889,7 +6889,8 @@ compartment_payload_contract() {
   # dispatch refused with "payload staging entry is not in the reviewed set".
   # The first block is the structural guard that makes that drift a red test
   # instead of a booted VM that cannot work.
-  python3 - "$CONTROLLER" "$ROOT/bin/fm-spawn.sh" <<'PY' || fail "compartment payload contract failed"
+  python3 - "$CONTROLLER" "$ROOT/bin/fm-spawn.sh" "$ROOT/bin/fm-secondmate-cloud-monitor.sh" \
+    <<'PY' || fail "compartment payload contract failed"
 import hashlib
 import importlib.util
 import re
@@ -6901,17 +6902,61 @@ spec = importlib.util.spec_from_file_location("lifecycle", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 spawn = Path(sys.argv[2]).read_text(encoding="utf-8")
+monitor = Path(sys.argv[3]).read_text(encoding="utf-8")
 
-# STRUCTURAL GUARD: every basename bin/fm-spawn.sh writes into the cloud
-# payload directory must be admitted by the compartment bounds. A staged name
-# with no bound is exactly the defect this closes.
-staged_names = set(re.findall(
-    r"\$STATE/\$ID\.cloud-payload/([A-Za-z0-9][A-Za-z0-9._-]*)", spawn))
+# STRUCTURAL GUARD, FAIL CLOSED: every basename bin/fm-spawn.sh writes into the
+# cloud payload directory must be admitted by the compartment bounds.
+#
+# This classifies EVERY occurrence of the payload directory and refuses the ones
+# it cannot read, because a guard whose silence is ambiguous between "nothing
+# unadmitted" and "I could not parse that" is not a control at all. An earlier
+# version matched only a literal basename written straight after the literal
+# directory path, so `.../cloud-payload/$NAME` and the ordinary
+# `cp src .../cloud-payload/` idiom both slipped past it while it printed green.
+# The authoritative check is effect-shaped and lives in
+# tests/fm-secondmate-cloud-monitor.test.sh, which runs this same validator over
+# the directory a real fm-spawn.sh actually produced; this one is the cheap
+# static companion that names the offending line.
+spawn_lines = spawn.splitlines()
+staged_names = set()
+unreadable = []
+for site in re.finditer(r"\.cloud-payload", spawn):
+    tail = spawn[site.end():]
+    if tail[:1] == '"':
+        # The directory ITSELF (install -d, rm -rf, --payload-dir): stages nothing.
+        continue
+    named = re.match(r"/([A-Za-z0-9][A-Za-z0-9._-]*)\"", tail)
+    if named:
+        staged_names.add(named.group(1))
+        continue
+    number = spawn.count("\n", 0, site.start()) + 1
+    unreadable.append("  line {}: {}".format(number, spawn_lines[number - 1].strip()))
+assert not unreadable, (
+    "the payload staging guard cannot classify these bin/fm-spawn.sh sites, so "
+    "it cannot prove what gets staged. Fail closed rather than pass blind; use a "
+    "literal basename or teach the guard:\n" + "\n".join(unreadable))
 assert staged_names, "no payload staging destinations found in bin/fm-spawn.sh"
 unbounded = sorted(staged_names - set(module.COMPARTMENT_PAYLOAD_FILE_BOUNDS))
 assert not unbounded, (
     "bin/fm-spawn.sh stages payload entries the reviewed set does not admit: "
     "{}".format(unbounded))
+
+# THIRD ENCODING: the compartment monitor's leg argv names these same two files
+# by absolute guest path. Producer, validator and consumer are three places
+# holding one contract, which is exactly the shape that drifted; the monitor
+# suite pins the argv literally, and this pins it to the reviewed set.
+argv_names = set(re.findall(r"/mnt/task/\.fm-task/([A-Za-z0-9][A-Za-z0-9._-]*)", monitor))
+assert argv_names, "no leg argv payload paths found in bin/fm-secondmate-cloud-monitor.sh"
+argv_unbounded = sorted(argv_names - set(module.COMPARTMENT_PAYLOAD_FILE_BOUNDS))
+assert not argv_unbounded, (
+    "the compartment leg argv names files the reviewed set does not admit, so "
+    "the guest would be told to run something that never travels: {}".format(
+        argv_unbounded))
+# ...and the reverse: a file the argv names must actually be staged.
+argv_unstaged = sorted(argv_names - staged_names)
+assert not argv_unstaged, (
+    "the compartment leg argv names files bin/fm-spawn.sh does not stage: "
+    "{}".format(argv_unstaged))
 # The guard is only meaningful while it actually sees the compartment pair.
 for name in ("fm-secondmate-session.py", "fm-secondmate-spawn.pi-ext.ts"):
     assert name in staged_names, (

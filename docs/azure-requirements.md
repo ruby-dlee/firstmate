@@ -801,13 +801,38 @@ accepts for codex-authored work.
 
 ## R7. Everything is logged in
 
-Status: HOLDS, through R8.
+Status: DONE.
 
-The eight pi profiles renew on their own now, which is R8.
-Two of the three profiles in `~/.local/share/agent-fleet/accounts/claude/` hold blanked,
-length-zero tokens; the third is `refreshable` with material declared valid to 2026-09-10.
-None of the three is needed for R6 anymore: the GLM lane authenticates with a Foundry
-deployment key and reviews all authors, so R7 holds with no owner login outstanding.
+Re-checked 2026-08-21 against `bin/fm-credential-expiry.py report` and the live roster rather
+than against an earlier note. Every credential a live lane reads is present and current, and no
+owner login is outstanding. Authors and no-mistakes run on the eight pi profiles `openai-codex`
+and `-2` through `-5`, `-7`, `-8`, `-9`, all `usable` to 2026-08-29; the numbering skips 6, and
+those eight names are exactly the slots `~/.pi/agent/auth.json` holds, which is what
+`bin/fm-pi-refresh.py` renews. R8 keeps them moving: its LaunchAgent
+`com.firstmate.pi-auth-refresh` is active with seven runs and last exit code 0. The crosscheck
+roster reads its GLM primary plus three of those same pi profiles, and the GLM lane
+authenticates with an api key rather than an owner login, so it adds no login to this
+requirement; whether that lane returns verdicts is R6 and not this.
+
+Nothing on a live path reads a claude credential, an `accounts/codex/*` profile, or
+`accounts/pi/1` through `6`. No script under `bin/`, `tools/` or `skills/` names the claude or
+codex pools at all outside the expiry reporter, no live file under `$FM_HOME/config` names them,
+and the pi slot list comes from pi's own `auth.json` rather than a scan of the account
+directory, so the numbered leftovers are never selected. Their state is recorded here rather
+than owed. An earlier revision of this section called the third claude profile "refreshable with
+material declared valid to 2026-09-10", which read the REFRESH token's horizon as readiness.
+What is true: two of the three profiles in `~/.local/share/agent-fleet/accounts/claude/` hold
+blanked, length-zero access AND refresh tokens, and the third's ACCESS token expired
+2026-08-17T20:31:18Z behind a refresh token good to 2026-09-10. `refreshable` states that a
+refresh token is held, never that the profile is ready to use. Renewing it is an OWNER LOGIN:
+nothing refreshes claude on a schedule, `bin/fm-pi-refresh.py` is hardcoded to `accounts/pi` and
+names claude nowhere, and `bin/fm-credential-expiry.py` only reads. None of it is needed, which
+is what makes this requirement met rather than blocked.
+
+This status stands on R8 continuing to hold, because the pi horizon is 2026-08-29 and the
+LaunchAgent is what advances it. Re-read `bin/fm-credential-expiry.py report` in full before
+relying on this line: a truncated listing miscounts the pool, and the profile numbering is not
+contiguous.
 
 ## R8. Auth refreshes on its own
 

@@ -14,6 +14,30 @@ set -u
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-cloud)
+
+# The fixture Pi credential POOL. The cloud lane's account home is the pooled
+# pi agent home, and placement leases ONE profile out of it (R5), so the fixture
+# has to look like the real pool: several profiles, each a complete oauth
+# credential shape naming a distinct upstream account.
+fm_spawn_cloud_write_pi_pool() {  # <auth.json path>
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+pool = {}
+for index in range(1, 5):
+    name = "openai-codex" if index == 1 else "openai-codex-{}".format(index)
+    pool[name] = {
+        "type": "oauth", "access": "fixture-access-{}".format(index),
+        "refresh": "fixture-refresh-{}".format(index),
+        "accountId": "fixture-account-{}".format(index),
+        "expires": 4102444800000,
+    }
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(pool, handle, sort_keys=True, indent=2)
+PY
+  chmod 600 "$1"
+}
 SUB=11111111-1111-4111-8111-111111111111
 
 # --- fixtures ---------------------------------------------------------------
@@ -349,8 +373,7 @@ make_cloud_case() {
   # Cloud dispatch packages the pi provider-account material for the worker's
   # encrypted account disk; the hermetic account home carries a fixture
   # credential so the persist step has something real to digest.
-  printf '{"openai-codex":{"accountId":"fixture-account"}}\n' > "$case_dir/pi-agent-home/auth.json"
-  chmod 600 "$case_dir/pi-agent-home/auth.json"
+  fm_spawn_cloud_write_pi_pool "$case_dir/pi-agent-home/auth.json"
   printf '%s\n' codex > "$home/config/crew-harness"
   printf '%s\n' manual > "$home/config/backlog-backend"
   fm_git_init_commit "$project"
@@ -452,6 +475,40 @@ test_cloud_spawn_places_worker_and_runs_the_entrypoint() {
   assert_grep "account_home=$CASE_DIR/pi-agent-home" "$meta" "the cloud spawn did not record the pi coding-agent account home"
   assert_grep 'worktree_git_dir_identity=' "$meta" "the cloud spawn did not record the worktree Git-dir identity"
   assert_grep 'worktree_git_dir=' "$meta" "the cloud spawn did not record the worktree Git dir"
+  # R5: the controller leased ONE profile out of that pool, and the credential
+  # this worker actually receives is that profile's alone. Staging the pool
+  # would put four accounts on the guest and let pi pick the first slot, which
+  # is a shared-account placement no matter what the queue records.
+  assert_grep 'worker_account_profile=' "$meta" "the cloud spawn did not record its leased provider-account profile"
+  assert_grep "worker_account_home=$HOME_DIR/state/azure-workers/accounts/" "$meta" \
+    "the cloud spawn did not record the controller-projected account home it was placed on"
+  python3 - "$meta" "$HOME_DIR/state/$id.cloud-account/auth.json" \
+    "$HOME_DIR/state/azure-workers/controller.json" "$id" <<'PY' \
+    || fail "the staged provider credential is not the leased single profile"
+import json
+import sys
+
+meta_path, staged_path, controller_path, task = sys.argv[1:]
+meta = {}
+for line in open(meta_path, encoding="utf-8"):
+    if "=" in line:
+        key, value = line.rstrip("\n").split("=", 1)
+        meta[key] = value
+staged = json.load(open(staged_path, encoding="utf-8"))
+assert list(staged) == ["openai-codex"], sorted(staged)
+leased = json.load(open(meta["worker_account_home"] + "/auth.json", encoding="utf-8"))
+assert staged == leased, "the staged credential is not the leased profile's"
+state = json.load(open(controller_path, encoding="utf-8"))
+item = next(entry for entry in state["queue"].values() if entry["task"] == task)
+assert item["account_profile"] == meta["worker_account_profile"], (item, meta)
+assert item["account_home"] == meta["worker_account_home"], (item, meta)
+assert item["account_pool_home"] == meta["account_home"], (item, meta)
+# The pool it was drawn from really did hold more than one account, so this
+# proves a SELECTION happened rather than there being nothing to choose.
+pool = json.load(open(meta["account_home"] + "/auth.json", encoding="utf-8"))
+assert len(pool) > 1, sorted(pool)
+assert leased["openai-codex"]["accountId"] == pool[item["account_profile"]]["accountId"], item
+PY
   # Herdr tracking endpoint: every cloud crewmate registers a real Herdr
   # endpoint running the cloud monitor, with ZERO tmux involvement anywhere
   # in the cloud lane.
@@ -945,8 +1002,7 @@ make_child_case() {  # <name> <child-id> <parent-id> -> record
     "$sub/data" "$sub/projects" "$sub/state" "$sub/treehouse-pools" \
     "$case_dir/codex-home" "$case_dir/pi-agent-home"
   chmod 755 "$case_dir"
-  printf '{"openai-codex":{"accountId":"fixture-account"}}\n' > "$case_dir/pi-agent-home/auth.json"
-  chmod 600 "$case_dir/pi-agent-home/auth.json"
+  fm_spawn_cloud_write_pi_pool "$case_dir/pi-agent-home/auth.json"
   printf '%s\n' codex > "$primary/config/crew-harness"
   printf '%s\n' manual > "$primary/config/backlog-backend"
   fm_git_init_commit "$project"

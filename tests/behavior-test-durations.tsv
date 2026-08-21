@@ -118,6 +118,7 @@
 3000	tests/fm-worker-authority-secondmate.test.sh
 12000	tests/fm-worker-lifecycle.test.sh
 1000	tests/fm-worker-outcome-transport.test.sh
+20000	tests/fm-worker-placement.test.sh
 1000	tests/fm-worker-supervisor.test.sh
 23744	tests/fm-x-mode.test.sh
 250	tests/lavish-repair.test.sh

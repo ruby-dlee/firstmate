@@ -158,16 +158,57 @@ neither is the receipts strand:
    refuses that declaration on Darwin, so macOS coverage is unchanged and cannot be switched off,
    and CI declares nothing, so its coverage is unchanged too.
 
-   The other five failing files are NOT host-capability skips and are deliberately left red,
-   because a skip there would hide a real defect rather than an absent capability:
-   `fm-session-start` (its ordering unit forces a `MISSING: node` diagnostic by deleting a fakebin
-   `node`, which does nothing on a host that has `/usr/bin/node`, as the cell and any nodesource
-   Ubuntu do); `fm-teardown-a` and `fm-teardown-b` (`secondmate home upstream probe cleanup is
-   unverified`, a process-tree cleanup verification that also fails on an unrelated Linux
-   container, so its cause is not the cell); `fm-watcher-lock` (exit 124, a timeout, next to
-   `Killed` lines in the same shard log, so cell capacity rather than capability); and
-   `fm-pi-watch-extension`. Until those four are diagnosed and fixed on their own merits, a cell
-   run still cannot reach a green test step.
+   The other five failing files have now been MEASURED rather than inferred, by running the
+   whole sealed suite in a local reproduction of the cell's own package closure (Ubuntu 24.04
+   with `bin/fm-azure-cell-image.sh`'s apt set, unprivileged, no build toolchain, four parallel
+   shards). That run executed 121 test files and failed six, and every failing assertion matched
+   the cell's own text. They are three different kinds of thing.
+
+   FIXED, because it was a hermeticity defect in the test rather than a host capability:
+   `fm-session-start`. Two of its units forced a `MISSING: node` diagnostic by deleting a fakebin
+   `node`. Bootstrap detects a tool with `command -v` against a real system base PATH, so that
+   only works on a host where node lives outside `/usr/bin`. On macOS it does; on the Linux the
+   cell runs, nodesource installs `/usr/bin/node` and the deletion changed nothing, so both units
+   failed for a reason that had nothing to do with what they test. They now choose the first
+   bootstrap-required tool this host does not already provide, and FAIL loudly if the host
+   provides all of them.
+
+   NOT GATED, because they are capacity rather than capability: `fm-pi-watch-extension` fails
+   under four-way parallel load and PASSES on its own in the same container, and
+   `fm-watcher-lock` failed in the cell with exit 124, a timeout, next to `Killed` lines in the
+   same shard log. A skip in either would hide a real regression.
+
+   STILL OPEN, and now root-caused: `fm-teardown-a` and `fm-teardown-b` refuse with `secondmate
+   home upstream probe cleanup is unverified`. Instrumenting `run_secondmate_remote_probe` showed
+   the probe never runs at all; `secondmate_remote_identity` fails first. Two independent
+   environment facts each cause it, and both were reproduced: a host with no interface inventory
+   at any of the four absolute paths `secondmate_network_remote_identity` accepts
+   (`/sbin/ifconfig`, `/usr/sbin/ifconfig`, `/usr/sbin/ip`, `/sbin/ip`), and a host with no
+   outbound reach to the origin remote's host. With `iproute2` installed AND network, both files
+   pass all 143 units; with `iproute2` installed and `--network none`, the identical refusal
+   returns. The cell has deny-all repository-command egress by design
+   (`bin/fm-azure-runner-command.sh`), so the second is permanent there and no package fixes it.
+
+   That blocker is deliberately NOT gated here. Enumerating the affected units by iteration found
+   at least NINETEEN, all in the secondmate teardown/retirement family, and the enumeration had
+   not converged when it was stopped: `test_forced_secondmate_retains_child_on_treehouse_failure`,
+   `..._retains_child_when_treehouse_unavailable`, `..._retains_stash`,
+   `..._retains_unquiesced_unmanaged_child`, `..._retains_unverified_process_group`,
+   `..._quiesces_parent_before_child_cleanup`, `..._child_uses_child_home_for_endpoint_verification`,
+   `test_managed_child_teardown_locks_generation_before_snapshot`,
+   `test_secondmate_retirement_retains_idle_registered_child`,
+   `test_secondmate_project_tags_do_not_prove_landing`,
+   `test_secondmate_retirement_recurses_into_ignored_nested_repositories`,
+   `..._accounts_for_directory_symlinks`, `..._rejects_mount_boundaries`,
+   `..._rejects_incomplete_surviving_authority`, `..._rejects_local_network_aliases`,
+   `..._rejects_source_common_dir_in_home`, `..._retains_reflog_and_rewritten_history`,
+   `..._serializes_child_spawn`, `test_secondmate_registry_updates_are_locked_and_literal`, and
+   `test_secondmate_state_enumeration_fails_closed`. A partial skip set is worse than none: it
+   looks principled and covers less than it claims. It also needs a decision that is not the test
+   suite's to make, because there are two real resolutions and the better one may be the second:
+   declare one capability covering the whole family, or permit the upstream-authority probe a
+   narrow egress path to the origin host so the cell keeps the coverage. Until one is chosen and
+   the set is enumerated to convergence, a cell run cannot reach a green test step.
 
 So the receipts fix is exercised live up to the gate, which is exactly what used to be
 impossible, and `close` stays unproven: the acceptance sentence below is not yet met.

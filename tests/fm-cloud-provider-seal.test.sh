@@ -87,6 +87,9 @@ unit_registry_failures_refuse() {
 
 # --- 2. run.sh actually consumes the seal -----------------------------------
 
+# The greps below are deliberately literal: they pin the exact text in
+# tests/run.sh, including its dollar signs, so single quotes are correct here.
+# shellcheck disable=SC2016
 unit_run_sh_wires_the_seal() {
   grep -q 'ambient-seal.py" names' "$RUN_SH" \
     || soft_fail "tests/run.sh no longer evaluates the ambient seal"

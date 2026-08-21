@@ -51,7 +51,11 @@ It pins the registry at an exact literal set and count, pins that `tests/run.sh`
 ## Host capabilities
 
 Herdr is not the only thing a sealed-suite host can lack.
-`tests/host-capabilities.tsv` declares every other host capability the suite depends on, the platforms that can provide it, and the exact units bound to it; `tests/host-capability-gate.sh` is the only door to that set, through `fm_require_host_capability <capability> "<label>" || return 0`.
+`tests/host-capabilities.tsv` declares every other host capability the suite depends on, the platforms that can provide it, and the exact units bound to it, and `tests/host-capability-gate.sh` is the only door to that set, through `fm_require_host_capability <capability> "<label>" || return 0`.
+The three today are a real tmux server, passwordless root escalation with `systemd-run`, and a system `openat` binding through `/usr/bin/cpp`, all measured from the retained shard responses of the first live Azure validation cell.
+A capability in this file is a statement about a HOST, not about a platform: the tmux units pass on CI's `ubuntu-latest` and in an ordinary Linux container, and are absent only in the cell, which is why the gate reads a by-name declaration rather than a blanket platform rule.
+A blanket platform rule would have silently removed coverage that CI and an ordinary container both provide.
+Where an environment could simply provide the capability instead, that is the better fix; the registry is for what an environment genuinely cannot have.
 `tests/fm-host-capability-gate.test.sh` pins the registry against the real call sites, pins the set at an exact literal count, and pins the required call shape, so the skip set cannot grow or shrink without a visible diff.
 
 The gate never probes the capability it guards.

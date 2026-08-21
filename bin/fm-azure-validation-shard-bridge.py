@@ -37,7 +37,12 @@ MAX_ARCHIVE = 1024**3
 # workers cannot provide. Measured on the first live cell (azv-36b2726cbcf3,
 # 2026-08-20): the shard worker has no tmux server it can create windows in, no
 # passwordless sudo or systemd-run, and no /usr/bin/cpp to derive SYS_openat
-# from. tests/host-capability-gate.sh turns each name into a LOUD skip of the
+# from. A local reproduction of that package closure (Ubuntu 24.04 with this
+# repo's own apt set, unprivileged, no build toolchain) reproduced all three,
+# and separately reproduced the fm-teardown refusal the cell also hit; that one
+# is NOT in this declaration, because its unit set has not been enumerated to
+# convergence. docs/azure-requirements.md R4 owns that open item.
+# tests/host-capability-gate.sh turns each name into a LOUD skip of the
 # exact units bound to it in tests/host-capabilities.tsv; nothing else changes,
 # and no other host is affected. Keep this string byte-identical to the copy in
 # bin/fm-azure-validation.py, which refuses any shard command that differs.

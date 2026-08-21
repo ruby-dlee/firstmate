@@ -3893,7 +3893,7 @@ def command_withdraw(env, args):
     print("withdrew queued request {}".format(key))
 
 
-def print_task_home_receipt(task, source):
+def print_task_home_receipt(task, item, worker=None):
     """Echo the authorized task home alongside a removal receipt.
 
     A compartment child's cloud state, including its plaintext provider
@@ -3905,15 +3905,28 @@ def print_task_home_receipt(task, source):
     controller does know - it authorized this exact path for this exact task
     generation under its own lock - so it says so here, and the wrapper removes
     from exactly that home.
+
+    The QUEUE ITEM is the source, never the worker record: both carry
+    task_home, but only the item carries parent_task, and the parent is what
+    lets the wrapper hold the home to the same marker-content check the spawn
+    held FM_SPAWN_TASK_HOME to. Sourcing the worker instead emitted nothing at
+    all for a real compartment child, and the surrender lane fell back to the
+    controller's own home and left the credential behind.
     """
-    source = source or {}
-    task_home = source.get("task_home")
-    parent = source.get("parent_task")
-    if (isinstance(task_home, str) and task_home.startswith("/")
+    item = item or {}
+    task_home = item.get("task_home")
+    parent = item.get("parent_task")
+    if not (isinstance(task_home, str) and task_home.startswith("/")
             and isinstance(parent, str) and parent):
-        # The parent travels with the path so the wrapper can hold the home to
-        # the same marker-content check the spawn held FM_SPAWN_TASK_HOME to.
-        print("FM-TASK-HOME {} {} {}".format(task, parent, task_home))
+        return
+    # A worker record that disagrees with its own queue item means the two
+    # halves of one admission diverged. Say nothing rather than pick a side:
+    # the fallback leaves a credential to be found, while following the wrong
+    # half would remove state in a home this task does not live in.
+    held = (worker or {}).get("task_home")
+    if held is not None and held != task_home:
+        return
+    print("FM-TASK-HOME {} {} {}".format(task, parent, task_home))
 
 
 def ordinary_authority_attempt(env, args, worker):
@@ -4010,7 +4023,7 @@ def command_surrender(env, args):
                 write_surrender_output(args.output, existing)
                 print("surrender proof already recorded with exact identity")
                 print("FM-SURRENDERED {} {}".format(args.task, args.task_generation))
-                print_task_home_receipt(args.task, worker)
+                print_task_home_receipt(args.task, item, worker)
                 return
             raise LifecycleError("worker already has an ordinary release proof; reconcile releases it")
         if item.get("status") != "assigned":
@@ -4125,7 +4138,7 @@ def command_surrender(env, args):
         save_state(env, state)
     write_surrender_output(args.output, proof)
     print("FM-SURRENDERED {} {}".format(args.task, args.task_generation))
-    print_task_home_receipt(args.task, worker)
+    print_task_home_receipt(args.task, item, worker)
     print("surrendered release recorded; reconcile now owns deallocation, compute deletion, and reset")
 
 

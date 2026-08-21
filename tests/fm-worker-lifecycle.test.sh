@@ -2756,9 +2756,15 @@ compartment = Path(env["FM_HOME"]).parent / "compartment"
 child_staged = compartment / "state" / "task-1.cloud-account"
 child_staged.mkdir(parents=True, exist_ok=True)
 (child_staged / "auth.json").write_text("{}")
-# The controller is what tells the wrapper where a compartment child lives:
-# task_home is durable on the worker record, and surrender echoes it back.
+# The controller is what tells the wrapper where a compartment child lives.
+# The real admission shape, not a convenient one: parent_task and task_home
+# land on the QUEUE ITEM, and only task_home is copied onto the worker record.
+# Sourcing the receipt from the worker therefore emitted nothing at all, and
+# this case caught exactly that.
 _state = controller_state()
+_state["queue"]["task-1@gen-1"]["parent_task"] = "smc-1"
+_state["queue"]["task-1@gen-1"]["parent_task_generation"] = "gen-s1"
+_state["queue"]["task-1@gen-1"]["task_home"] = str(compartment)
 _state["workers"][slot]["task_home"] = str(compartment)
 (Path(env["FM_HOME"]) / "state/azure-workers/controller.json").write_text(
     json.dumps(_state, sort_keys=True, separators=(",", ":")) + "\n")

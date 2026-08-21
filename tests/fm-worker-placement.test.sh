@@ -457,6 +457,12 @@ items = [item for item in state.get("queue", {}).values() if item.get("status") 
 held = [item["account_profile"] for item in items]
 # The kills have to have LANDED. If every attempt survived, the window was
 # never entered and this unit would be a proxy assertion rather than a test.
+# The FLOOR is one: at least one kill must have landed inside the window and at
+# least one placement must have survived it. That is deliberately the weakest
+# non-vacuous floor rather than a rate, because the pass condition must not
+# depend on how loaded the machine is; with the window calibrated against a real
+# uninterrupted request just above, roughly half of the attempts land in
+# practice (10 of 24 on a recent local run).
 # `calibrate` is the uninterrupted timing run and is not one of the attempts.
 attempted = [item for item in items if item["task"] != "calibrate"]
 assert 0 < len(attempted) < attempts, (

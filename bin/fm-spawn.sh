@@ -4418,6 +4418,12 @@ spawn_cloud_record_assignment() {  # <assignment-generation>
 # this worker will use".
 spawn_cloud_bind_leased_account() {  # <request-stdout-file>
   local out=$1 leased line tmp profile
+  if spawn_test_lab_enabled && [ "${FM_TEST_CLOUD_ACCOUNT_BIND_FAIL:-0}" = 1 ]; then
+    # Test-only: the lease-handback path below has no other injection point,
+    # and an untested handback is how a pool quietly shrinks to zero.
+    echo "error: test-only provider-account bind failure for $ID" >&2
+    return 1
+  fi
   leased=
   while IFS= read -r line; do
     case "$line" in
@@ -4671,6 +4677,19 @@ spawn_cloud_dispatch() {
   }
   cat "$request_report" >&2
   spawn_cloud_bind_leased_account "$request_report" || {
+    # The queue entry exists and is the LEASE on a provider account. A spawn
+    # that cannot bind that account must hand it back rather than leave it held
+    # by work that will never run: an orphaned lease shrinks the pool by one
+    # every time this happens. The entry is still `queued` here (reconcile has
+    # not run), which is exactly what withdraw accepts, and withdraw also
+    # removes the staged credential.
+    if spawn_cloud_lifecycle withdraw --task "$ID" \
+      --task-generation "$SPAWN_GENERATION_ID" --confirm-withdraw \
+      --confirm-subscription "${FM_AZURE_SUBSCRIPTION_ID:-}" >&2; then
+      echo "notice: released the provider-account lease for $ID with its withdrawn request" >&2
+    else
+      echo "error: the provider-account lease for $ID is still held by its queued request; withdraw it with bin/fm-worker-lifecycle.sh withdraw --task $ID --task-generation $SPAWN_GENERATION_ID" >&2
+    fi
     echo "error: cloud placement for $ID could not be bound to its leased provider account" >&2
     return 1
   }

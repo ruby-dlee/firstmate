@@ -346,3 +346,22 @@ Real usability remains unclaimed until the approved deployment performs this bou
 
 A failed leg means the runner is not yet usable.
 It does not authorize automatic local fallback or a weakened security path.
+
+### Live acceptance record
+
+R4's first leg is one ambient no-mistakes run offloading a selected command class to Azure and
+returning a real verdict. The class chosen for that leg is `lint`, not `test`: `bin/fm-lint.sh`
+plus the locked Agent Fleet ruff check is already Linux-clean, and the guest stages the pinned
+ShellCheck and uv closure it needs, so the leg does not wait on the sealed behavior suite
+becoming Linux-clean.
+
+Two artifacts, and only these two, prove the class actually executed on Azure rather than falling
+back to `bin/fm-azure-runner-dispatch.sh`'s local `exec "$@"`:
+
+- the step log carries `azure-runner: invocation=azr-<id> exit=... private_archive=...`, which
+  `print_logs_and_summary` writes to stderr, and
+- `$FM_HOME/state/azure-runner/azr-<id>.json` exists for that invocation and carries
+  `resources.vm_instance_id` and `expected_boot_id`, the VM identity the guest itself reported.
+
+The step's own exit status and the no-mistakes run record distinguish neither case, so the
+absence of either artifact is "not proven", never "it ran locally and passed".

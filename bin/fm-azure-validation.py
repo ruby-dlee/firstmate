@@ -1688,8 +1688,10 @@ def sealed_guest_text(env, state):
     the sealed artifact and is what a resumed attempt must run. The working tree
     is used only when it still matches the seal, which keeps a cell whose
     payload was pruned behaving exactly as before. Neither source is trusted on
-    provenance: only a file whose digest IS the sealed digest is ever returned,
-    so this widens recovery without widening what may execute.
+    provenance: the bytes are read ONCE, digested in memory, and those exact
+    bytes are what is returned, so what executes on the cell is what was
+    verified rather than whatever a later read would have found. This widens
+    recovery without widening what may execute.
     """
     expected = state["request"]["protocol"]["guest_digest"]
     candidates = []

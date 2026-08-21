@@ -112,6 +112,22 @@ PI_MODEL_PROVIDERS = {
 # below name the families the fleet actually authors on. An unrecognized model
 # stays its own family, which preserves the previous behavior for anything not
 # listed while strictly tightening it for everything that is.
+# Allowlisted credential shape for a cross-family lane's models.json. Pi
+# composes an effective model from the provider layer, the model entry, and a
+# `modelOverrides` layer, and several composed fields (`compat`, `headers`,
+# `baseUrl`, `api`) change where the request goes or how its completion is
+# read. Only these keys may appear; anything else refuses by name.
+PI_PROVIDER_ALLOWED_KEYS = {"baseUrl", "api", "apiKey", "models"}
+PI_MODEL_ALLOWED_KEYS = {
+    "id",
+    "name",
+    "reasoning",
+    "input",
+    "cost",
+    "contextWindow",
+    "maxTokens",
+    "compat",
+}
 AUTHOR_MODEL_FAMILY_PREFIXES = (
     ("gpt-", "openai"),
     ("o1-", "openai"),
@@ -631,16 +647,35 @@ def model_family(model: Any) -> str:
     Reviewer independence is a FAMILY property, not a version-string one.
     Comparing exact ids let a `gpt-5.5` author be reviewed by `gpt-5.6-sol`
     with no same-model marker recorded (cc-4dcd7873f71a).
+
+    Lane membership is judged MORE loosely here than in
+    `cross_family_lane_for_model`, and deliberately in the opposite direction.
+    That function picks a credential and a provider, so it must match exactly
+    or refuse. This one decides whether two models are the same family, where
+    the safe error is to say yes: pi records a model as
+    `<provider-slot>/<model>`, so the SAME lane model reached through some
+    other author-side slot must not read as a different family. Matching only
+    the registry's own slot let exactly that through - a
+    `some-slot/accounts/fireworks/models/glm-5p2` author was admitted the
+    `fireworks-glm` reviewer with no relaxation and no degraded marker
+    (cc-5ec330d3c74d). Any model whose final segment matches a lane's final
+    segment is now that lane's family. An unrelated model that happens to end
+    the same way is classified together with the lane and refused, which is
+    the direction that fails closed.
     """
 
-    lane = cross_family_lane_for_model(model)
-    if lane is not None:
-        return "cross-family:" + lane["slot"]
-    identity = model_identity(model if isinstance(model, str) else "").lower()
+    exact = cross_family_lane_for_model(model)
+    if exact is not None:
+        return "cross-family:" + exact["slot"]
+    identity = model_identity(model if isinstance(model, str) else "")
+    for lane in CROSS_FAMILY_LANES.values():
+        if identity == model_identity(lane["model"]):
+            return "cross-family:" + lane["slot"]
+    lowered = identity.lower()
     for prefix, family in AUTHOR_MODEL_FAMILY_PREFIXES:
-        if identity.startswith(prefix):
+        if lowered.startswith(prefix):
             return family
-    return "model:" + identity
+    return "model:" + lowered
 
 
 def cross_family_account_identity(lane: dict[str, str]) -> str:
@@ -713,7 +748,12 @@ def inspect_pi_cross_family_credential(
         )
     except CrosscheckError as exc:
         tool_fail(str(exc))
-    providers = document.get("providers") if isinstance(document, dict) else None
+    if not isinstance(document, dict) or set(document) != {"providers"}:
+        tool_fail(
+            f"{slot} reviewer credential at {credential_file} must be exactly "
+            'a {"providers": ...} document'
+        )
+    providers = document.get("providers")
     if not isinstance(providers, dict) or set(providers) != {slot}:
         tool_fail(
             f"{slot} reviewer credential at {credential_file} must declare "
@@ -724,6 +764,23 @@ def inspect_pi_cross_family_credential(
         tool_fail(
             f"{slot} reviewer credential at {credential_file} has a malformed "
             f"{slot} provider entry"
+        )
+    # Pi composes an effective model from SEVERAL layers, not just the model
+    # entry: `compat: mergeCompat(providerConfig.compat, definition.compat)`
+    # and a topmost `modelOverrides[<model id>]` layer that can carry `compat`
+    # and `headers` (dist/core/provider-composer.js). Naming the fields to
+    # refuse one at a time missed both of those and let a credential turn off
+    # `supportsFinishReason` behind the lane's pin (cc-ca5848b19ac3). The
+    # provider is therefore an ALLOWLIST of keys: anything this gate has not
+    # reasoned about is refused rather than composed.
+    unexpected = set(provider) - PI_PROVIDER_ALLOWED_KEYS
+    if unexpected:
+        tool_fail(
+            f"{slot} reviewer credential at {credential_file} carries "
+            f"provider-level fields the lane does not pin: "
+            f"{', '.join(sorted(unexpected))}; pi composes provider-level "
+            "compat, headers and modelOverrides into the effective model, so "
+            "only the pinned fields may appear"
         )
     base_url = provider.get("baseUrl")
     if base_url != allowed_base_url:
@@ -763,10 +820,19 @@ def inspect_pi_cross_family_credential(
                 "fields precedence over the provider, so the pinned "
                 "provider-level endpoint must own both"
             )
-        # `compat` is the other model-level object pi honors, and some of its
-        # keys weaken this gate's own defenses (`supportsFinishReason: false`
-        # would blunt the truncated-verdict refusal), so every entry must
-        # carry exactly the lane's declared compat and nothing else.
+        # Same allowlist reasoning one layer down: a model entry may only
+        # carry descriptive fields plus the lane's own pinned compat.
+        unexpected = set(entry) - PI_MODEL_ALLOWED_KEYS
+        if unexpected:
+            tool_fail(
+                f"{slot} reviewer credential at {credential_file} carries "
+                f"model-level fields the lane does not pin: "
+                f"{', '.join(sorted(unexpected))}"
+            )
+        # `compat` keys weaken this gate's own defenses
+        # (`supportsFinishReason: false` would blunt the truncated-verdict
+        # refusal), so every entry must carry exactly the lane's declared
+        # compat and nothing else.
         if entry.get("compat", {}) != lane["compat"]:
             tool_fail(
                 f"{slot} reviewer credential at {credential_file} carries a "
@@ -3634,6 +3700,30 @@ def pi_reviewer_command() -> list[str]:
     return [str(resolved_entrypoint)]
 
 
+# A verdict is a bare JSON object. Some models present it inside one Markdown
+# code fence instead, which is a formatting habit rather than a different
+# verdict; GLM-5.2 through Pi does exactly this. Precisely one fence, spanning
+# the WHOLE message, is unwrapped. Prose around the fence, several fences, or a
+# fence that never closes are all left alone so they fail to parse, because
+# each is a case where the reviewer said more than one thing and the gate must
+# not pick which part was the verdict. A truncated verdict never closes its
+# fence, so this cannot turn one into a parseable answer.
+PI_FENCED_VERDICT_RE = re.compile(
+    r"\A```[A-Za-z0-9_+.-]*[ \t]*\r?\n(?P<body>.*?)\r?\n?```\Z",
+    re.DOTALL,
+)
+
+
+def pi_verdict_body(final_text: str) -> str:
+    """Return the JSON body of a Pi reviewer's final assistant text."""
+
+    stripped = final_text.strip()
+    match = PI_FENCED_VERDICT_RE.match(stripped)
+    if match is None:
+        return stripped
+    return match.group("body").strip()
+
+
 def pi_review_result(output: str) -> tuple[dict[str, Any], int]:
     turn_count = 0
     agent_ended = False
@@ -3716,10 +3806,19 @@ def pi_review_result(output: str) -> tuple[dict[str, Any], int]:
         )
     if final_text is None or not final_text.strip():
         tool_fail("Pi reviewer completed without a verdict artifact")
+    body = pi_verdict_body(final_text)
     try:
-        verdict = json.loads(final_text)
+        verdict = json.loads(body)
     except (json.JSONDecodeError, ValueError, RecursionError) as exc:
-        tool_fail(f"Pi reviewer returned a malformed verdict artifact: {exc}")
+        # The offending text is bounded and repr-escaped: it is reviewer
+        # output, so it must never be able to inject lines into an operator's
+        # log, and without it "malformed verdict artifact" names no cause at
+        # all - the defect that made the first cross-family lane failure
+        # unreadable.
+        tool_fail(
+            f"Pi reviewer returned a malformed verdict artifact: {exc}; "
+            f"final assistant text began {body[:240]!r}"
+        )
     if not isinstance(verdict, dict):
         tool_fail("Pi reviewer verdict artifact must be an object")
     return verdict, turn_count

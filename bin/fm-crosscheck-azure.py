@@ -793,6 +793,15 @@ def create_credential_archive(
             if isinstance(providers, dict) and set(providers) == {slot}
             else None
         )
+        # Pi composes provider-level compat/headers and a modelOverrides layer
+        # into the effective model, so the archive gate allowlists the
+        # provider's keys rather than naming fields to refuse
+        # (cc-ca5848b19ac3).
+        if isinstance(entry, dict) and set(entry) - {"baseUrl", "api", "apiKey", "models"}:
+            raise AzureCrosscheckError(
+                f"archived {slot} reviewer credential carries provider-level "
+                "fields the lane does not pin"
+            )
         base_url = entry.get("baseUrl") if isinstance(entry, dict) else None
         if base_url != archive_lane["base_url"]:
             raise AzureCrosscheckError(

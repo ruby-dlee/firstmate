@@ -158,6 +158,11 @@ if lane is not None:
     base_url = entry.get("baseUrl") if isinstance(entry, dict) else None
     if base_url != allowed_base_url:
         raise SystemExit("model guest: cross-family credential endpoint allowlist mismatch")
+    # pi composes provider-level compat/headers and a modelOverrides layer into
+    # the effective model, so the provider's keys are allowlisted rather than
+    # individually refused.
+    if set(entry) - {"baseUrl", "api", "apiKey", "models"}:
+        raise SystemExit("model guest: cross-family credential provider-level field override")
     # pi gives model-level baseUrl/api precedence over the provider level,
     # so any model entry carrying either field escapes the provider pin.
     models = entry.get("models") if isinstance(entry, dict) else None

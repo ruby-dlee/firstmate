@@ -1215,6 +1215,33 @@ selected = module.reviewer_candidates(root, older_codex_author)[0]
 assert "model_independence" not in selected, selected
 assert selected["review_family_mode"] == "cross-family-primary", selected
 print("SELECTED cross-family reviewer for a gpt-5.5 author with no relaxation")
+# cc-5ec330d3c74d: pi records a model as <provider-slot>/<model>, so the SAME
+# lane model reached through some OTHER author-side slot must not read as a
+# different family. Matching only the registry's own slot admitted exactly
+# that reviewer with no relaxation and no degraded marker.
+LANE = next(iter(module.CROSS_FAMILY_LANES.values()))
+for disguise in (
+    LANE["model"],
+    LANE["slot"] + "/" + LANE["model"],
+    "some-other-slot/" + LANE["model"],
+    "author-side-slot/glm-5p2",
+    "glm-5p2",
+):
+    assert module.model_family(disguise) == "cross-family:" + LANE["slot"], disguise
+for slot_prefix in ("some-other-slot/", "author-side-slot/"):
+    disguised_author = {
+        "harness": "pi",
+        "model": slot_prefix + LANE["model"],
+        "account_home": str(homes["author-home"]),
+    }
+    write_config([reviewer("pi", LANE["model"], "xhigh", "lane-home")])
+    bypass = expect_refused(disguised_author, "outside the model family")
+    print(f"REFUSED provider-qualified same-model author {slot_prefix}: {bypass}")
+# The looser family rule must NOT loosen lane/credential selection, which
+# still has to match exactly or refuse.
+assert module.cross_family_lane_for_model("some-other-slot/" + LANE["model"]) is None
+assert module.cross_family_lane_for_model("glm-5p2") is None
+
 # And an unrecognized author model stays its own family, so nothing that used
 # to pass silently starts failing.
 assert module.model_family("mystery-1") != module.model_family("mystery-2")
@@ -1541,6 +1568,43 @@ expect_tool_failure(
     [assistant_turn(verdict_text, "length")],
     "stopReason='length'",
 )
+
+# One Markdown fence around the WHOLE verdict is a presentation habit, not a
+# different verdict, and GLM-5.2 through Pi produces exactly that. It is
+# unwrapped; everything looser still refuses, because each looser shape is one
+# where the reviewer said more than one thing.
+for fence in ("```json\n%s\n```", "```\n%s\n```", "```JSON \n%s\n```"):
+    fenced, count = module.pi_review_result(
+        event_stream([assistant_turn(fence % verdict_text, "stop")])
+    )
+    assert fenced == {"verdict": "clear"}, fenced
+    assert count == 1
+
+for label, body in (
+    ("prose before the fence", "Here is my verdict:\n```json\n%s\n```" % verdict_text),
+    ("prose after the fence", "```json\n%s\n```\nHope that helps." % verdict_text),
+    ("two fences", "```json\n%s\n```\n```json\n%s\n```" % (verdict_text, verdict_text)),
+    ("unterminated fence", "```json\n%s" % verdict_text),
+    ("truncated fenced verdict", '```json\n{"verdict": "cle'),
+):
+    expect_tool_failure(
+        label,
+        [assistant_turn(body, "stop")],
+        "malformed verdict artifact",
+    )
+
+# The refusal names the offending text, bounded and repr-escaped so reviewer
+# output can never inject a line into an operator's log.
+try:
+    module.pi_review_result(
+        event_stream([assistant_turn("not json at all\nsecond line", "stop")])
+    )
+except module.CrosscheckToolError as exc:
+    assert "final assistant text began" in str(exc), str(exc)
+    assert "\n" not in str(exc), repr(str(exc))
+    assert "not json at all" in str(exc), str(exc)
+else:
+    raise AssertionError("a non-JSON verdict artifact was accepted")
 expect_tool_failure(
     "nonterminal tool-use turn",
     [assistant_turn(verdict_text, "toolUse")],
@@ -1893,12 +1957,26 @@ EOF
 }
 
 test_cross_family_reviewer_executes_bound_policy_profile() {
-  local record case_dir base head output slot model
-  # Both registered, live-verified cross-family lanes must execute on their
-  # own provider slot and record their own non-secret Foundry binding: the
-  # lane is data, not a hardcoded model.
-  for lane in "fireworks-glm accounts/fireworks/models/glm-5p2"; do
-    read -r slot model <<< "$lane"
+  local record case_dir base head output slot model lanes
+  # EVERY registered cross-family lane must execute on its own provider slot
+  # and record its own non-secret binding: the lane is data, not a hardcoded
+  # model, so the case is driven from the registry itself and a lane added
+  # there is covered here without touching this test.
+  lanes=$("$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_crosscheck", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+for lane in module.CROSS_FAMILY_LANES.values():
+    print(lane["slot"], lane["model"])
+PY
+)
+  [ -n "$lanes" ] || fail "the cross-family lane registry is empty"
+  while read -r slot model; do
+    [ -n "$slot" ] || continue
     record=$(make_case "cross-family-reviewer-$slot")
     IFS=$'\t' read -r case_dir base head <<< "$record"
     select_cross_family_reviewer "$case_dir" "$slot" "$model"
@@ -1935,8 +2013,8 @@ assert reviewer["execution_proof"]["actual_exit"] == 0
       || fail "$model review did not record its bound provider, family mode, and non-secret credential binding"
     assert_no_grep 'CODEX FALLBACK' "$case_dir/data/task-x1/crosscheck.md" \
       "a $model primary review rendered the degraded fallback marker"
-  done
-  pass "every registered cross-family reviewer executes on its own provider slot with a non-secret Foundry binding"
+  done <<< "$lanes"
+  pass "every registered cross-family reviewer executes on its own provider slot with a non-secret binding"
 }
 
 test_truncated_cross_family_verdict_is_never_a_verdict() {
@@ -2179,6 +2257,51 @@ print("REFUSED any model-level compat when the lane pins none: "
                      model_extra={"compat": {"supportsDeveloperRole": False}}),
           "model-level compat that is not the pinned lane compat",
       ))
+
+# cc-ca5848b19ac3: pi composes the effective model from MORE than the model
+# entry - `mergeCompat(providerConfig.compat, definition.compat)` plus a
+# topmost `modelOverrides[<id>]` layer carrying compat and headers
+# (dist/core/provider-composer.js). Refusing named fields one at a time missed
+# both, so the credential shape is an allowlist at every layer.
+def write_raw(name, provider_extra=None, document_extra=None):
+    home = root / name
+    home.mkdir()
+    provider = {
+        "baseUrl": PINNED,
+        "api": "openai-completions",
+        "apiKey": "key-one",
+        "models": [{"id": MODEL, "name": "cross-family reviewer"}],
+    }
+    provider.update(provider_extra or {})
+    document = {"providers": {SLOT: provider}}
+    document.update(document_extra or {})
+    (home / "models.json").write_text(json.dumps(document), encoding="utf-8")
+    return home
+
+
+for label, provider_extra in (
+    ("provider-level compat", {"compat": {"supportsFinishReason": False}}),
+    ("modelOverrides compat", {"modelOverrides": {MODEL: {"compat": {"supportsFinishReason": False}}}}),
+    ("provider-level headers", {"headers": {"x-injected": "1"}}),
+    ("modelOverrides headers", {"modelOverrides": {MODEL: {"headers": {"x-injected": "1"}}}}),
+):
+    print("REFUSED " + label + ": " + expect_tool_failure(
+        write_raw("provider-" + label.replace(" ", "-"), provider_extra=provider_extra),
+        "provider-level fields the lane does not pin",
+    ))
+# An unexpected model-level field is refused by the same allowlist.
+print("REFUSED unexpected model-level field: " + expect_tool_failure(
+    write_home("model-extra-home", model_extra={"headers": {"x-injected": "1"}}),
+    "model-level fields the lane does not pin",
+))
+# And a stray top-level key beside `providers` is refused too.
+print("REFUSED stray top-level key: " + expect_tool_failure(
+    write_raw("top-level-home", document_extra={"modelOverrides": {}}),
+    'must be exactly a {"providers": ...} document',
+))
+# The shape the operator actually provisions still passes.
+module.inspect_pi_cross_family_credential(write_raw("clean-home"), LANE)
+print("ACCEPTED the pinned credential shape")
 
 # The deployment id must be present.
 print("REFUSED missing deployment: " + expect_tool_failure(

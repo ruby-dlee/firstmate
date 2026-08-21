@@ -789,6 +789,16 @@ test_cloud_switch_off_and_on_share_the_same_base_metadata() {
   pass "cloud metadata stays additive over the local metadata shape"
 }
 
+# The names spawn_cloud_persist_convergence_artifacts writes into
+# state/<id>.cloud-env from paths OTHER than the SPAWN_CLOUD_ENV_ALLOWLIST loop.
+# This list is the ONLY thing that excuses a name from the equality assertion
+# below, and it is spelled out here rather than falling out of a filter so that
+# adding an export somewhere else in that block is a visible decision instead of
+# a silent exemption. The compartment block (FM_SECONDMATE_*) is listed even
+# though a crewmate spawn never writes it, so the contract is stated once for
+# both lanes rather than depending on which lane a test happens to drive.
+CLOUD_ENV_NON_ALLOWLIST_EXPORTS='FM_SPAWN_CLOUD_WALL_SECONDS FM_WORKER_PROVIDER_COMMAND FM_SECONDMATE_LEG_SECONDS FM_SECONDMATE_POLL_SECONDS FM_SECONDMATE_IDLE_SECONDS FM_SECONDMATE_TTL_HOURS FM_SECONDMATE_CHILD_PROJECT'
+
 # A shape-valid value for one contract name. The SHAPES are what the readers
 # accept (a phase enum, a bounded integer, a directory); the NAMES they are
 # keyed off are pattern suffixes, never the specific variable this defect was
@@ -840,6 +850,17 @@ test_persisted_cloud_env_matches_the_deployment_read_set_exactly() {
   # name the allowlist currently spells - and any probe name that survives into
   # the file without a reader asking for it fails here.
   #
+  # THE COMPARISON IS SCOPED TO THE FILE, NOT TO THE PROBE. An earlier revision
+  # intersected the file's contents with the probe before comparing, which put
+  # every name written by a path OTHER than the allowlist loop outside the
+  # assertion entirely - a one-line `printf export FM_AZURE_CLIENT_SECRET`
+  # added anywhere else in spawn_cloud_persist_convergence_artifacts stayed
+  # green. The persist block really does have such paths (the wall, the
+  # provider-command override, the compartment leg block), so the exemption is
+  # spelled out by name in CLOUD_ENV_NON_ALLOWLIST_EXPORTS below and every
+  # other name in the file, whatever wrote it, is compared. A silent
+  # consequence of an intersect is how the last one hid.
+  #
   # Deliberately not a grep for any one variable: a name added to a reader and
   # not to the allowlist goes red here without this test ever having heard of
   # it. That is the failure that had to reach a live Azure run before, because
@@ -865,7 +886,23 @@ test_persisted_cloud_env_matches_the_deployment_read_set_exactly() {
   # Second vacuity guard: a failed extraction would silently narrow the probe
   # back to the contract and disarm the extra-name half of this test.
   [ "$count" -ge 12 ] || fail "only $count allowlist names could be read from bin/fm-spawn.sh; the probe environment would be too narrow to detect an extra name"
-  probe=$(printf '%s\n%s\n' "$required" "$declared" | grep '^FM_' | sort -u)
+  # Every name the persist block emits as a LITERAL `export NAME=` line, from
+  # any path, not just the allowlist loop. Also probe-widening only, never
+  # asserted against: a rogue export is written only when its variable is set,
+  # so without setting it the rogue line is inert and the file never shows it.
+  # That inertness is exactly what let a hand-added
+  # `printf 'export FM_AZURE_CLIENT_SECRET=%q\n'` pass review round two.
+  local emitted
+  # grep -o, not an anchored sed: these printfs appear after `||` and inside
+  # case arms, so a line-start anchor sees one of the three and the guard below
+  # is what caught that. The `%s` form (the allowlist loop itself) has no
+  # literal name and is deliberately not matched.
+  emitted=$(grep -o "printf 'export [A-Za-z_][A-Za-z0-9_]*=" "$ROOT/bin/fm-spawn.sh" \
+    | sed "s/^printf 'export //; s/=$//" | sort -u)
+  count=$(printf '%s\n' "$emitted" | grep -c '^[A-Za-z_]')
+  # Third vacuity guard, same reason as the other two.
+  [ "$count" -ge 2 ] || fail "only $count literal export names could be read from bin/fm-spawn.sh; the probe environment would miss a non-allowlist export path"
+  probe=$(printf '%s\n%s\n%s\n' "$required" "$declared" "$emitted" | grep '^[A-Za-z_]' | sort -u)
   out=$(
     while IFS= read -r name; do
       [ -n "$name" ] || continue
@@ -882,16 +919,18 @@ PROBE
   expect_code 0 $? "the contract cloud spawn should succeed: $out"
   env_file="$HOME_DIR/state/$id.cloud-env"
   assert_present "$env_file" "the cloud spawn persisted no environment for the closed pane"
-  # What the file actually carries, restricted to the probe: the spawn also
-  # persists wall/provider-command lines this contract has no opinion about.
+  # EVERY name the file carries, minus the explicitly named non-allowlist
+  # exports. Nothing is filtered by the probe here, so a name written by any
+  # other path in the persist block - allowlisted or not, FM_AZURE_ or not -
+  # lands in the comparison and has to be accounted for.
   persisted=$(sed -n 's/^export \([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$env_file" | sort -u \
-    | comm -12 - <(printf '%s\n' "$probe"))
+    | comm -23 - <(printf '%s\n' "$CLOUD_ENV_NON_ALLOWLIST_EXPORTS" | tr ' ' '\n' | grep . | sort -u))
   missing=$(comm -23 <(printf '%s\n' "$required" | sort -u) <(printf '%s\n' "$persisted") | tr '\n' ' ')
   extra=$(comm -13 <(printf '%s\n' "$required" | sort -u) <(printf '%s\n' "$persisted") | tr '\n' ' ')
   missing=${missing% }
   extra=${extra% }
   [ -z "$missing" ] || fail "the persisted cloud-env cannot reach the deployment path: the closed pane never sees $missing (regenerate SPAWN_CLOUD_ENV_ALLOWLIST in bin/fm-spawn.sh with bin/fm-cloud-env-contract.py --allowlist; if a name is here only because some reader MENTIONS it and its value would be a credential, the answer is an entry in SECRET_BEARING_EXCLUSIONS in bin/fm-cloud-env-contract.py, NOT a new allowlist entry)"
-  [ -z "$extra" ] || fail "the persisted cloud-env writes names no reader on the deployment path asks for: $extra (SPAWN_CLOUD_ENV_ALLOWLIST is what keeps a secret-bearing FM_AZURE_* off disk; drop them, or add the reader that needs them, or record the judgment in SECRET_BEARING_EXCLUSIONS in bin/fm-cloud-env-contract.py)"
+  [ -z "$extra" ] || fail "the persisted cloud-env writes names no reader on the deployment path asks for: $extra (SPAWN_CLOUD_ENV_ALLOWLIST is what keeps a secret-bearing FM_AZURE_* off disk; drop them, or add the reader that needs them, or record the judgment in SECRET_BEARING_EXCLUSIONS in bin/fm-cloud-env-contract.py. If one is a DELIBERATE non-allowlist export from another path in spawn_cloud_persist_convergence_artifacts, name it in CLOUD_ENV_NON_ALLOWLIST_EXPORTS in this file - deliberately, in the open, never by widening a filter)"
   mismatched=
   while IFS= read -r name; do
     [ -n "$name" ] || continue

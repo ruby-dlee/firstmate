@@ -34,6 +34,7 @@ Usage:
 
 from __future__ import annotations
 
+import ast
 import io
 import pathlib
 import re
@@ -45,22 +46,20 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 # The readers on the far side of the closed pane. Every FM_AZURE_* name any of
 # them takes from the environment is a name the persisted file has to be able to
 # carry, because the compartment-child lane reaches all three from the monitor:
-# fm-spawn.sh -> fm-worker-lifecycle.py -> fm-azure-worker-provider.py ->
-# fm-azure-pilot.sh (worker-create). The pilot is the one that was missed: it is
-# a SUBPROCESS of the provider, so a grep of the provider alone never saw it.
+# fm-spawn.sh -> fm-worker-lifecycle.sh -> fm-worker-lifecycle.py ->
+# fm-azure-worker-provider.py -> fm-azure-pilot.sh (worker-create). The pilot is
+# the one that was missed: it is a SUBPROCESS of the provider, so a grep of the
+# provider alone never saw it.
 READERS = (
     "bin/fm-azure-pilot.sh",
     "bin/fm-azure-worker-provider.py",
     "bin/fm-worker-lifecycle.py",
-    # In the chain (bin/fm-spawn.sh invokes it as the lifecycle entrypoint) and
-    # carrying zero non-comment FM_AZURE_ reads today. Scanned anyway so it is
-    # guarded rather than merely currently harmless.
+    # In the chain: bin/fm-spawn.sh invokes it as the lifecycle entrypoint. All
+    # 16 of its FM_AZURE_ names sit in its header documentation and are covered
+    # by the readers above, so it adds nothing to the set - but it is scanned,
+    # not exempted, so the day it grows a real read the contract sees it.
     "bin/fm-worker-lifecycle.sh",
 )
-
-# Readers that legitimately name nothing today, so the empty-reader guard below
-# does not mistake "guarded and quiet" for "the derivation broke".
-MAY_BE_EMPTY = ("bin/fm-worker-lifecycle.sh",)
 
 # Names the provider SUPPLIES to the pilot itself, per placement, in
 # run_pilot_create's env.update. Persisting an operator's copy of these would be
@@ -107,35 +106,44 @@ def read(relative: str) -> str:
 
 
 def code_text(relative: str, text: str) -> str:
-    """The reader's source with its COMMENTS removed.
+    """The reader's source with its `#` COMMENTS removed, where that is safe.
 
     The scan is a regex over source text and cannot tell a read from a mention,
     so without this a bare `# see FM_AZURE_CLIENT_SECRET` inside a reader would
     pull that name into the contract and the guarding test would then demand it
     be reachable from disk. Steering a developer toward persisting a credential
-    is the worst thing this module could do, so mentions are stripped before the
-    scan rather than argued about afterwards.
+    is the worst thing this module could do.
 
-    Conservative on purpose, in the safe direction. Python is tokenized, which
-    is exact. Shell drops only whole-line comments, because a `#` inside a shell
-    string is not a comment and no cheap parse tells them apart; a trailing
-    `# ... FM_AZURE_X` therefore still counts as a read. That over-includes,
-    which costs a spurious contract entry that SECRET_BEARING_EXCLUSIONS can
-    answer - never under-includes, which would silently drop a real name and
-    recreate the outage this module exists to prevent.
+    WHAT THIS ACTUALLY DOES, precisely, because overstating it is the exact
+    mistake this module exists to catch:
+
+      - Python is tokenized, and dropping COMMENT tokens is exact FOR `#`. It
+        is not a claim about mentions in general: a name inside a docstring or
+        any other string literal is still scanned and still enters the contract.
+        Docstrings are the natural place to document environment variables, so
+        that is a live case, not a corner. It over-includes, which is the safe
+        direction, and SECRET_BEARING_EXCLUSIONS is the answer when it matters.
+
+      - Shell is NOT stripped at all, deliberately. A `#` in shell is only
+        sometimes a comment: inside a multi-line double-quoted string, or in an
+        unquoted heredoc body, a line beginning `#$VAR` genuinely expands, and
+        the obvious `line.lstrip().startswith("#")` filter drops it. That is an
+        UNDER-include, the one direction that silently loses a real name and
+        recreates the outage this module exists to prevent. No cheap shell parse
+        tells the cases apart, so the scan does not try: shell comments count as
+        reads. Costs a spurious contract entry at worst; the union is unchanged
+        by this choice today.
     """
-    if relative.endswith(".py"):
-        try:
-            return "\n".join(
-                token.string
-                for token in tokenize.generate_tokens(io.StringIO(text).readline)
-                if token.type != tokenize.COMMENT
-            )
-        except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
-            raise ContractError("reader {} could not be tokenized: {}".format(relative, exc))
-    return "\n".join(
-        line for line in text.splitlines() if not line.lstrip().startswith("#")
-    )
+    if not relative.endswith(".py"):
+        return text
+    try:
+        return "\n".join(
+            token.string
+            for token in tokenize.generate_tokens(io.StringIO(text).readline)
+            if token.type != tokenize.COMMENT
+        )
+    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
+        raise ContractError("reader {} could not be tokenized: {}".format(relative, exc))
 
 
 def reader_names() -> dict[str, set[str]]:
@@ -143,7 +151,7 @@ def reader_names() -> dict[str, set[str]]:
     by_name: dict[str, set[str]] = {}
     for relative in READERS:
         found = set(NAME.findall(code_text(relative, read(relative))))
-        if not found and relative not in MAY_BE_EMPTY:
+        if not found:
             # A reader that suddenly matches nothing means the derivation broke,
             # not that the lane stopped needing an environment. Fail loudly: a
             # silently empty contract would make the guarding test vacuous.
@@ -156,38 +164,45 @@ def reader_names() -> dict[str, set[str]]:
 
 
 def run_pilot_create_body(source: str) -> str:
-    """Exactly run_pilot_create's own body, top-level def to top-level def.
+    """Exactly run_pilot_create's own body, sliced by the PARSER.
 
-    The slice matters more than it looks. An unanchored
-    search from the def to the first env.update will happily run PAST the
-    end of the function and match an `env.update` in some LATER helper, and
-    then the subtraction is computed from a call the pilot never receives.
-    Moving this block into a helper is an ordinary refactor, and the failure it
-    would cause is silent and severe: run_pilot_create would supply nothing, so
-    a real deployment would run at capacityProfile=foundation with all four
-    worker bindings left "unbound", while the contract still printed a
-    plausible set and every test stayed green.
+    The slice matters more than it looks. Any text search from the def to the
+    first env.update will happily run PAST the end of the function and match an
+    env.update in some LATER helper, and then the subtraction is computed from a
+    call the pilot never receives. Moving that block into a helper is an
+    ordinary refactor, and the failure it would cause is silent and severe:
+    run_pilot_create would supply nothing, so a real deployment would run at
+    capacityProfile=foundation with all four worker bindings left "unbound",
+    while the contract still printed a plausible set and every test stayed
+    green.
+
+    Sliced with ast rather than a terminator regex because a regex has to
+    enumerate the shapes that end a function, and the two it missed both
+    reopened exactly that hole: `async def` was not in the terminator, and a
+    run_pilot_create that is the LAST top-level def fell through to end-of-file
+    and swallowed any module-level code after it. ast.end_lineno knows where the
+    function ends without anyone having to list the ways it can.
     """
-    start = source.find("\ndef run_pilot_create(")
-    if start < 0:
-        raise ContractError(
-            "run_pilot_create is not defined in {}; the provider-supplied "
-            "subtraction cannot be derived".format(SUPPLIER)
-        )
-    start += 1
-    end = len(source)
-    for match in re.finditer(r"^(?:def |class )", source[start:], re.M):
-        offset = start + match.start()
-        if offset > start:
-            end = offset
-            break
-    return source[start:end]
+    try:
+        module = ast.parse(source)
+    except SyntaxError as exc:
+        raise ContractError("{} could not be parsed: {}".format(SUPPLIER, exc))
+    lines = source.splitlines()
+    for node in module.body:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "run_pilot_create"
+        ):
+            return "\n".join(lines[node.lineno - 1:node.end_lineno])
+    raise ContractError(
+        "run_pilot_create is not defined at module level in {}; the "
+        "provider-supplied subtraction cannot be derived".format(SUPPLIER)
+    )
 
 
 def provider_supplied() -> set[str]:
-    # RAW source here, not code_text: the function slicer needs real line layout
-    # to find its top-level `def` boundaries, and tokenizing flattens it away.
-    # Comments are stripped from the matched dict below instead.
+    # RAW source here, not code_text: ast needs real line layout, and tokenizing
+    # flattens it away. Comments are stripped from the matched dict below.
     body = run_pilot_create_body(read(SUPPLIER))
     match = re.search(r"env\.update\((\{.*?\})\)", body, re.S)
     if match is None:

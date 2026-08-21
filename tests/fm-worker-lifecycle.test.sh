@@ -6945,6 +6945,13 @@ monitor = Path(sys.argv[3]).read_text(encoding="utf-8")
 # STRUCTURAL GUARD, FAIL CLOSED: every basename bin/fm-spawn.sh writes into the
 # cloud payload directory must be admitted by the compartment bounds.
 #
+# SCOPE: this is a DRIFT DETECTOR, not the security control. It reads text, so
+# any staging that refers to the directory as a whole (tar -C, cd, cp -R src/.,
+# a variable alias) is invisible to it; it fails closed on the ones it can see
+# but cannot claim to see all of them. The control that actually bounds what
+# reaches a guest is staged_directory_manifest at dispatch, which refuses an
+# unadmitted entry however it was spelled.
+#
 # This classifies EVERY occurrence of the payload directory and refuses the ones
 # it cannot read, because a guard whose silence is ambiguous between "nothing
 # unadmitted" and "I could not parse that" is not a control at all. An earlier
@@ -6961,7 +6968,13 @@ unreadable = []
 for site in re.finditer(r"\.cloud-payload", spawn):
     tail = spawn[site.end():]
     if tail[:1] == '"':
-        # The directory ITSELF (install -d, rm -rf, --payload-dir): stages nothing.
+        # The directory as a WHOLE. Today's sites are install -d, rm -rf and
+        # --payload-dir, none of which stage a file. That is a property of the
+        # current callers, NOT of the form: `tar -C <dir>`, `cd <dir>`, and
+        # `cp -R src/. <dir>` all name the directory this way and DO stage.
+        # This guard cannot see those, which is why it is a drift detector and
+        # not the control. The control is staged_directory_manifest at dispatch,
+        # and the effect-shaped check in the compartment monitor suite.
         continue
     named = re.match(r"/([A-Za-z0-9][A-Za-z0-9._-]*)\"", tail)
     if named:

@@ -1403,6 +1403,49 @@ recorded=json.loads((env["state_dir"]/"azv-aaaaaaaaaaaa.json").read_text())
 assert recorded["attempt_result_digests"]=={"1":digest_one,"2":digest_two}, recorded["attempt_result_digests"]
 assert recorded["expected_result_digest"]==digest_two
 
+# 2e. TWO markers in one output: the current attempt's is accepted wherever it
+# sits, and the FIRST marker no longer wins.
+seed(attempt_result_digests={"1":digest_one})
+view(output=marker(digest_one,1)+"noise\n"+marker(digest_two,2))
+m.observe(env,args)
+assert phase()=="needs-decision", "a later marker naming this attempt was not accepted: "+phase()
+assert json.loads((env["state_dir"]/"azv-aaaaaaaaaaaa.json").read_text())["expected_result_digest"]==digest_two
+
+# 2f. Two DIFFERENT results claiming one attempt is not an answer.
+os.environ["FM_AZURE_VALIDATION_MARKER_SETTLE_SECONDS"]="0"
+seed()
+view(output=marker(digest_one,2)+marker(digest_two,2))
+try:
+    m.observe(env,args)
+except m.ValidationError:
+    pass
+else:
+    raise AssertionError("two conflicting results for one attempt were accepted")
+os.environ.pop("FM_AZURE_VALIDATION_MARKER_SETTLE_SECONDS")
+
+# 2g. LEGACY: a cell whose sealed guest predates the attempt stamp publishes an
+# UNSTAMPED marker. The request is digest-sealed so that guest can never be
+# changed; refusing to read it would retain a cell on a fully published result
+# and leave expected_result_digest unset, making the result unreachable.
+os.environ["FM_AZURE_VALIDATION_MARKER_SETTLE_SECONDS"]="0"
+seed()
+view(output="FM_AZURE_VALIDATION_RESULT {} boot={} outcome=needs-decision\n".format(digest_two,boot))
+m.observe(env,args)
+recorded=json.loads((env["state_dir"]/"azv-aaaaaaaaaaaa.json").read_text())
+assert phase()=="needs-decision", "a legacy cell was stranded by the attempt binding: "+phase()
+assert recorded["expected_result_digest"]==digest_two, "legacy result is unreachable"
+assert recorded["result_binding"]=="legacy", recorded.get("result_binding")
+# A STAMPED marker naming another attempt must NOT take the legacy path.
+seed()
+view(output=marker(digest_two,1))
+try:
+    m.observe(env,args)
+except m.ValidationError:
+    pass
+else:
+    raise AssertionError("a stamped marker for another attempt fell through to the legacy path")
+os.environ.pop("FM_AZURE_VALIDATION_MARKER_SETTLE_SECONDS")
+
 # 3. The REAL result-identity gate refuses a result from another attempt and
 # refuses one that does not declare its attempt at all.
 result=json.load(open(sys.argv[4]))
@@ -1433,9 +1476,93 @@ except m.ValidationError as exc:
     assert "does not declare the attempt" in str(exc), str(exc)
 else:
     raise AssertionError("a result that declares no attempt was assumed to be the current one")
+# ...but a LEGACY-bound observation holds that same result to the pre-stamp
+# contract instead of refusing it, or the sealed cell can never collect.
+legacy_state=dict(state); legacy_state["result_binding"]="legacy"
+m.verify_result_identity(legacy_state,undeclared)
 PY
 
-  pass "an attempt's published result is bound to that attempt, an unbound control view never strands a running cell, and an unchanged republished result is refused as a non-answer"
+  # 4. The REAL create_run_command: a guest edit must never brick a cell that is
+  # already in flight, and every new attempt must re-arm its own settle window.
+  python3 - "$HOST" "$tmp/home2" <<'PY' \
+    || fail "create_run_command did not preserve resume across a guest edit and re-arm the window"
+import hashlib,importlib.util,json,pathlib,sys,types
+spec=importlib.util.spec_from_file_location("validation",sys.argv[1])
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+home=pathlib.Path(sys.argv[2])
+env={"home":home,"state_dir":home/"state"/"azure-validation","subscription":"sub",
+     "storage":"stor","resource_group":"rg","owner":"owner","deployment_generation":"gen-1"}
+m.ensure_dirs(env)
+
+# The sealed guest is the one staged beside the request at submit. Its bytes
+# deliberately DIFFER from the working tree, which is the shape this PR creates:
+# the tree's guest is edited while cells sealed on the old one are still live.
+sealed_text="#!/usr/bin/env bash\n# sealed guest for this cell\nexit 0\n"
+sealed_digest="sha256:"+hashlib.sha256(sealed_text.encode()).hexdigest()
+assert sealed_digest != m.sha256_file(m.GUEST), "fixture must differ from the working tree"
+payload=env["state_dir"]/"payloads"/"azv-aaaaaaaaaaaa"
+payload.mkdir(parents=True,exist_ok=True)
+(payload/"guest.sh").write_text(sealed_text)
+
+fence="sha256:"+"3"*64
+def seed(**extra):
+    state={
+      "schema":m.SCHEMA,"cell":"azv-aaaaaaaaaaaa","phase":"needs-decision","attempt":2,
+      "input_digest":"sha256:"+"4"*64,"request_digest":"sha256:"+"5"*64,
+      "staging":{"container":"c","result_blob":"control/result.tar.gz"},
+      "allocation":{"sku":"Standard_D8as_v6","sku_family":"standardDav6Family"},
+      "request":{
+        "protocol":{"guest_digest":sealed_digest},
+        "deployment_generation":"gen-1","home_binding":"sha256:"+"2"*64,
+        "task":"task","task_generation":"tg","validation_generation":"vg","fence":fence,
+        "resource_class":"validation-standard",
+        "repository":{"branch":"fm/fixture","head":"a"*40,"slug":"o/r"},
+        "limits":{"behavior_shards":4,"wall_seconds":10800,"reserved_vcpus":24},
+      },
+      "resources":{"vm_id":"/subs/x/vm","vm_instance_id":"vm-i","worktree_disk_id":"/disk",
+                   "identity_client_id":"cid"},
+      "events":[],
+    }
+    state.update(extra)
+    (env["state_dir"]/"azv-aaaaaaaaaaaa.json").write_text(json.dumps(state))
+    return state
+
+sent={}
+def fake_az(env_,argv,**kw):
+    for index,item in enumerate(argv):
+        if item=="--body":
+            sent["body"]=json.loads(pathlib.Path(argv[index+1][1:]).read_text())
+    return {}
+m.az_command=fake_az
+m.read_github_token=lambda state:"gh-token"
+m.read_resource=lambda env_,rid,kind:(True,{"id":rid,"tags":{"validation-cell":"azv-aaaaaaaaaaaa","fence":fence}})
+m.immutable_identity=lambda resource,kind:{"id":resource.get("id","")}
+
+# F1: the sealed cell resumes, and it runs the SEALED bytes, not the tree's.
+state=seed(unbound_view_since="2020-01-01T00:00:00Z")
+m.create_run_command(env,state,"respond",output_url="https://o",response="--action\napprove")
+assert sent["body"]["properties"]["source"]["script"]==sealed_text, \
+    "a resumed attempt did not run the guest its request was sealed with"
+
+# F3: the settle window is re-armed per attempt. Without this the window is
+# keyed per CELL: a stamp written on attempt 1 makes attempt 2 look ancient the
+# moment it is observed, and a one-second-old attempt is retained.
+saved=json.loads((env["state_dir"]/"azv-aaaaaaaaaaaa.json").read_text())
+assert "unbound_view_since" not in saved, \
+    "a new attempt inherited the previous attempt's settle stamp"
+
+# The seal itself still binds: no source carrying the sealed digest refuses.
+(payload/"guest.sh").write_text("#!/usr/bin/env bash\ntampered\n")
+state=seed()
+try:
+    m.create_run_command(env,state,"respond",output_url="https://o",response="x")
+except m.ValidationError as exc:
+    assert "sealed request digest" in str(exc), str(exc)
+else:
+    raise AssertionError("a guest that matches no sealed digest was executed")
+PY
+
+  pass "an attempt's published result is bound to that attempt, a guest edit never bricks a sealed in-flight cell, an unbound control view never strands a running cell, and an unchanged republished result is refused as a non-answer"
 }
 
 static_contract

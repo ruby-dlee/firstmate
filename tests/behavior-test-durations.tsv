@@ -128,3 +128,4 @@
 92	tests/operating-fundamentals.test.sh
 100	tests/runner-entry-probe.test.sh
 1000	tests/test-suite-seal.test.sh
+1500	tests/fm-cloud-provider-seal.test.sh

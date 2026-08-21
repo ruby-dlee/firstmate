@@ -23,6 +23,31 @@ No cleanup path enumerates and kills fleet panes, adopts an existing session, or
 The tripwire detects default server/session changes, removed or replaced fleet panes, and removed or replaced agent identities, including losses while the default server remains running.
 It intentionally ignores volatile agent status and focus/activity fields, so normal work can continue during a lab test; it cannot prove preservation of pane contents or process internals that Herdr's read APIs do not expose.
 
+## The ambient seal, and the cloud seal under it
+
+A behavior test may only see the environment it sets for itself.
+`tests/run.sh` drops every name declared in `tests/ambient-seal.tsv` before it admits a single test: `FM_HOME`, `FM_WORKER_PROVIDER_COMMAND`, `FM_SPAWN_CLOUD`, and everything under `FM_AZURE_`, `AZURE_` and `ARM_`.
+It prints one `FM_AMBIENT_SEAL dropped=...` line per invocation, so a run in a rich operator shell says what it removed.
+Nothing under `FM_TEST_` is sealed: that prefix is the runner's own contract with the test.
+
+The seal exists because ambient environment made this suite provision real infrastructure.
+On 2026-08-20 a billable `Standard_D4as_v6` VM (`vm-fm7c799d-wkr-01`) was found running in the pilot resource group, tagged with the task id `cloud-noenv-c7` - a hardcoded fixture id that exists only in `tests/fm-spawn-cloud.test.sh` - and a repository-generation that is not a commit that exists.
+No controller queue entry, no worker record, no `state/<task>.meta`; nothing tracked it and nothing would have released it.
+That unit deliberately omits `FM_WORKER_PROVIDER_COMMAND` and the `FM_AZURE_*` identity in order to prove the lifecycle REFUSES such a request.
+With the operator's `fleet.env` sourced, the ambient identity satisfied the very check the unit asserts is missing, and `bin/fm-worker-lifecycle.py` resolved its default provider, which is the real Azure adapter.
+The request was served.
+The same ambient reach is what made `tests/fm-worker-lifecycle.test.sh` non-deterministic: `FM_HOME` alone was enough, and which unit failed varied between runs.
+
+Fail closed on the provider, never fall through.
+Under the ambient seal sit three more layers, all owned by `tests/run.sh`:
+
+- `FM_WORKER_PROVIDER_COMMAND` is bound to `tests/cloud-provider-refusal.py` for every admitted test, so a test that names no provider gets a loud refusal instead of Azure. A test that genuinely drives a provider names its own fixture on its own command line, which wins.
+- `tests/cloud-guard-bin/az` is on every admitted test's PATH, so even a path that reconstructs the real adapter cannot reach the control plane. A test that needs a fake `az` puts one in its own fakebin, which it prepends ahead of the guard.
+- Both refusals RECORD to `FM_TEST_CLOUD_REACH_LOG`, and `tests/cloud-reach-check.sh` runs after every admitted test on every lane. Any recorded reach fails the run and names what was reached. Containment is the refusal; this is the alarm, because a guard that only refused could be scrolled past.
+
+`tests/fm-cloud-provider-seal.test.sh` is the structural guard.
+It pins the registry at an exact literal set and count, pins that `tests/run.sh` wires all four layers on both admission lanes and checks for a reach after every lane, proves each refusal refuses and records, proves a recorded reach fails the run and does not leak into the next test, and asserts as live facts about its own process that no operator identity is set, that the bound provider is the refusing one, and that `az` resolves to the guard.
+
 ## Host capabilities
 
 Herdr is not the only thing a sealed-suite host can lack.

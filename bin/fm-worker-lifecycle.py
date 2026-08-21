@@ -828,7 +828,9 @@ def select_placement_account(env, state, pool_home, task):
             raise LifecycleError(
                 "provider-account placement is exhausted: the single account home {} is "
                 "already leased ({} holds profile {}); refusing to place {} on a shared "
-                "upstream account".format(
+                "upstream account. Sign in additional Pi profiles on distinct upstream "
+                "accounts to raise the ceiling, or release the placement above with "
+                "`bin/fm-worker-lifecycle.sh withdraw`".format(
                     pool_file, held[binding][1] or "unknown-task",
                     held[binding][0] or name, task))
         return {
@@ -866,9 +868,33 @@ def select_placement_account(env, state, pool_home, task):
         if binding in held:
             continue
         root = Path(env["pi_account_root"]).resolve()
+        # The projected home is keyed on the LEASE IDENTITY, never on the
+        # profile's local slot name. The two must be the same function of the
+        # pool or the projection is not injective over live leases, and the
+        # slot name is not: an operator re-logging slot `openai-codex` from one
+        # upstream account to another gives two placements two distinct
+        # bindings (correctly, they ARE two accounts) that both project into
+        # `accounts/openai-codex`, so the second write silently replaces the
+        # credential the first placement's still-live lease points at. The
+        # queue then reports two accounts while the disk holds one. Keying on
+        # the binding makes the directory name and the exclusion key the same
+        # string, so that state is unrepresentable.
+        destination = root / binding
+        for entry in state["queue"].values():
+            if entry.get("status") == "complete":
+                continue
+            if entry.get("account_home") == str(destination):
+                # Unreachable while the two keys agree, because a binding that
+                # is free by definition is named by no live entry. Kept as the
+                # second line: if a future change re-keys the projection, this
+                # refuses instead of clobbering a live placement's credential.
+                raise LifecycleError(
+                    "refusing to project Pi profile {} over the account home a live "
+                    "placement already holds ({} holds {})".format(
+                        name, entry.get("task") or "an unnamed task", destination))
         try:
             projection.prepare_root(root)
-            credential = projection.write_home(root / name, pool[name])
+            credential = projection.write_home(destination, pool[name])
         except projection.ProjectionError as exc:
             raise LifecycleError(
                 "Pi profile {} could not be projected into its account home: {}".format(
@@ -884,7 +910,9 @@ def select_placement_account(env, state, pool_home, task):
         }
     raise LifecycleError(
         "provider-account placement is exhausted: all {} distinct upstream accounts in {} "
-        "are leased ({}); refusing to place {} on a shared upstream account".format(
+        "are leased ({}); refusing to place {} on a shared upstream account. Sign in "
+        "additional Pi profiles on distinct upstream accounts to raise the ceiling, or "
+        "release a placement above with `bin/fm-worker-lifecycle.sh withdraw`".format(
             len(bindings), pool_file,
             ", ".join(
                 "{} -> {}".format(name, held[binding][1] or "unknown-task")
@@ -3120,6 +3148,10 @@ def command_request(env, args):
             if any(existing.get(field) != item.get(field) for field in identity_fields):
                 raise LifecycleError("task generation already exists with different queue identity")
             if existing.get("account_home"):
+                # The profile NAME is reported separately because the home is
+                # keyed on the lease identity, not on the name: the caller can
+                # no longer read the profile off the path's last component.
+                print("account-profile {}".format(existing.get("account_profile") or ""))
                 print("account-home {}".format(existing["account_home"]))
             print("request already exists with exact identity")
             return
@@ -3155,7 +3187,10 @@ def command_request(env, args):
     if item.get("account_home"):
         # The caller stages the provider credential from the home the
         # controller leased, so the leased profile is the ONE credential that
-        # reaches the worker. Printed as a path, never as its contents.
+        # reaches the worker. Printed as a path and a slot name, never as
+        # contents; the home is keyed on the lease identity, so the slot name
+        # is not recoverable from the path.
+        print("account-profile {}".format(item.get("account_profile") or ""))
         print("account-home {}".format(item["account_home"]))
     print("queued {} generation {} for one isolated author worker".format(item["task"], item["task_generation"]))
 

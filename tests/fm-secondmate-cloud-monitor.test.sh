@@ -1998,18 +1998,22 @@ PY
 # fm_secondmate_write_pi_pool <auth.json path> <profiles> - a fixture Pi
 # credential pool shaped as bin/fm-pi-account-home.py requires of a projectable
 # profile, with one distinct upstream account per slot.
-fm_secondmate_write_pi_pool() {
-  python3 - "$1" "$2" <<'FMPIPOOL'
+fm_secondmate_write_pi_pool() {  # <auth.json path> <profiles> [account-scope]
+  python3 - "$1" "$2" "${3:-shared}" <<'FMPIPOOL'
 import json
 import sys
 
+scope = sys.argv[3]
 pool = {}
 for index in range(1, int(sys.argv[2]) + 1):
     name = "openai-codex" if index == 1 else "openai-codex-{}".format(index)
     pool[name] = {
         "type": "oauth", "access": "fixture-access-{}".format(index),
         "refresh": "fixture-refresh-{}".format(index),
-        "accountId": "fixture-account-{}".format(index),
+        # Scoped so pools written for different tasks never name the same
+        # upstream account: placement leases the ACCOUNT, so colliding ids
+        # across fixtures would read as exhaustion rather than as a fixture bug.
+        "accountId": "fixture-account-{}-{}".format(scope, index),
         "expires": 4102444800000,
     }
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
@@ -2028,7 +2032,11 @@ make_lifecycle_task() {
   # pool named by this task's own metadata and refuses a directory it cannot
   # identify an upstream account in, so an empty directory is not a usable
   # account authority any more.
-  fm_secondmate_write_pi_pool "$world/$task-account/auth.json" 2
+  # Distinct accounts PER TASK, not a shared pair: every lifecycle task in this
+  # suite draws from its own pool, and identical accountId values across tasks
+  # would make a future third concurrent task hit exhaustion and look
+  # mysterious. The task name seeds the account ids so they cannot collide.
+  fm_secondmate_write_pi_pool "$world/$task-account/auth.json" 2 "$task"
   python3 - "$home/state/$task.meta" "$generation" "$world/$task-wt" "$world/$task-account" "$task" <<'PY'
 import os
 import pathlib

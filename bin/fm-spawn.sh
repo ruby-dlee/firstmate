@@ -4425,11 +4425,20 @@ spawn_cloud_bind_leased_account() {  # <request-stdout-file>
     return 1
   fi
   leased=
+  profile=
   while IFS= read -r line; do
     case "$line" in
       'account-home /'*) leased=${line#account-home } ;;
+      'account-profile '*) profile=${line#account-profile } ;;
     esac
   done < "$out"
+  # The controller reports the slot name separately BECAUSE the projected home
+  # is keyed on the lease identity rather than the slot name; reading the name
+  # off the path's last component would be reading the wrong thing.
+  [ -n "$profile" ] || {
+    echo "error: the controller named no leased provider-account profile for $ID" >&2
+    return 1
+  }
   [ -n "$leased" ] || {
     echo "error: the controller named no leased provider-account home for $ID; refusing to stage a pooled credential" >&2
     return 1
@@ -4465,7 +4474,6 @@ PY
   # credential truncated, which would fail the guest's digest check with no
   # clue why.
   mv "$tmp" "$STATE/$ID.cloud-account/auth.json" || { rm -f "$tmp"; return 1; }
-  profile=${leased##*/}
   spawn_cloud_record_account_placement "$profile" "$leased" || return 1
   echo "fm-spawn: $ID placed on pi profile $profile ($leased)" >&2
 }
@@ -4558,8 +4566,16 @@ spawn_cloud_persist_convergence_artifacts() {
       echo "error: cloud account source lacks auth.json at $CLOUD_ACCOUNT_SOURCE" >&2
       exit 1
     fi
-    cp "$CLOUD_ACCOUNT_SOURCE/auth.json" "$STATE/$ID.cloud-account/auth.json" || exit 1
-    chmod 0600 "$STATE/$ID.cloud-account/auth.json"
+    # The POOLED auth.json is deliberately NOT copied here. This runs BEFORE the
+    # request creates the lease, and the tracking monitor pane already exists and
+    # is already polling: a crash, kill, or plain slow reconcile between here and
+    # the narrowing would leave every signed-in account staged in a directory the
+    # monitor is willing to dispatch as --account-dir. The account directory is
+    # therefore written exactly once, by spawn_cloud_bind_leased_account, after
+    # the controller has said which single account this placement leased. That
+    # removes the window rather than guarding it.
+    # settings.json is pi CONFIGURATION, not credential material, so it is staged
+    # here with the rest of the payload.
     if [ -f "$CLOUD_ACCOUNT_SOURCE/settings.json" ]; then
       cp "$CLOUD_ACCOUNT_SOURCE/settings.json" "$STATE/$ID.cloud-account/settings.json" || exit 1
       chmod 0600 "$STATE/$ID.cloud-account/settings.json"
@@ -4676,6 +4692,13 @@ spawn_cloud_dispatch() {
     return 1
   }
   cat "$request_report" >&2
+  if spawn_test_lab_enabled && [ "${FM_TEST_CLOUD_ABORT_AFTER_REQUEST:-0}" = 1 ]; then
+    # Test-only: die exactly in the window between the durable lease and the
+    # narrowing, with the tracking monitor already live. This is the window the
+    # pool used to be staged in, and the only way to assert it is empty is to
+    # stop the process inside it.
+    kill -9 $$
+  fi
   spawn_cloud_bind_leased_account "$request_report" || {
     # The queue entry exists and is the LEASE on a provider account. A spawn
     # that cannot bind that account must hand it back rather than leave it held

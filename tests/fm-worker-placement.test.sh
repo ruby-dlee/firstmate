@@ -645,6 +645,116 @@ status_shows_who_holds_which_account() {
   pass "status names the account each live placement holds, in both renderings"
 }
 
+a_relogged_slot_never_clobbers_a_live_placements_credential() {
+  local world
+  placement_world world fm-placement-relogin 2 || fail "world setup failed"
+  placement_task "$world" "$world/home" task-1 gen-1 || fail "authorities not seeded"
+  placement_task "$world" "$world/home" task-2 gen-2 || fail "authorities not seeded"
+  run_placement "$world" request --task task-1 --task-generation gen-1 \
+    --owner-kind primary --eligible > /dev/null 2>&1 || fail "the first placement was refused"
+  # The exact case the exclusion unit is chosen for: an operator re-logs the
+  # SAME slot name into a DIFFERENT upstream account. Both placements are
+  # correct and distinct leases. If the projected home were keyed on the slot
+  # name the second projection would overwrite the credential the first
+  # placement's still-live lease points at.
+  python3 - "$world/pool/auth.json" <<'PY2' || fail "re-login rewrite failed"
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+pool = json.loads(path.read_text(encoding="utf-8"))
+pool["openai-codex"]["accountId"] = "fixture-account-relogged"
+path.write_text(json.dumps(pool, sort_keys=True, indent=2), encoding="utf-8")
+PY2
+  run_placement "$world" request --task task-2 --task-generation gen-2 \
+    --owner-kind primary --eligible > /dev/null 2>&1 || fail "the second placement was refused"
+  echo "# placements after a re-login of slot openai-codex:"
+  placements "$world" | sed 's/^/#   /'
+  python3 - "$world/home/state/azure-workers/controller.json" <<'PY2' \
+    || fail "a re-logged slot clobbered a live placement's credential"
+import json
+import pathlib
+import sys
+
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+items = {item["task"]: item for item in state["queue"].values()
+         if item.get("status") != "complete"}
+assert set(items) == {"task-1", "task-2"}, sorted(items)
+one, two = items["task-1"], items["task-2"]
+assert one["account_binding"] != two["account_binding"], (one, two)
+# The two leases are two accounts, so they must be two directories.
+assert one["account_home"] != two["account_home"], (one["account_home"], two["account_home"])
+# And the FIRST placement's credential must still be the account it leased,
+# read off the disk rather than off the queue.
+first = json.load(open(pathlib.Path(one["account_home"]) / "auth.json", encoding="utf-8"))
+second = json.load(open(pathlib.Path(two["account_home"]) / "auth.json", encoding="utf-8"))
+assert list(first) == ["openai-codex"] and list(second) == ["openai-codex"], (first, second)
+assert first["openai-codex"]["accountId"] == "fixture-account-1", first["openai-codex"]["accountId"]
+assert second["openai-codex"]["accountId"] == "fixture-account-relogged", \
+    second["openai-codex"]["accountId"]
+PY2
+  assert_no_cloud_call "$world" "the re-login unit"
+  pass "re-logging one slot into another account never overwrites the credential a live placement leased"
+}
+
+two_pools_with_the_same_slot_names_stay_two_placements() {
+  local world
+  placement_world world fm-placement-twopools 2 || fail "world setup failed"
+  # Two pool PATHS carrying the same slot names and different accounts. Keyed
+  # on the slot name both would land in one directory; keyed on the lease they
+  # cannot.
+  mkdir -p "$world/pool-b" || fail "second pool not created"
+  python3 - "$world/pool/auth.json" "$world/pool-b/auth.json" <<'PY2' || fail "second pool not written"
+import json
+import pathlib
+import sys
+
+pool = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+for index, name in enumerate(sorted(pool), start=1):
+    pool[name]["accountId"] = "other-pool-account-{}".format(index)
+pathlib.Path(sys.argv[2]).write_text(json.dumps(pool, sort_keys=True, indent=2), encoding="utf-8")
+PY2
+  placement_task "$world" "$world/home" task-1 gen-1 || fail "authorities not seeded"
+  fm_git_init_commit "$world/wt-task-2" > /dev/null || fail "worktree not created"
+  python3 - "$world/home/state/task-2.meta" "$world/wt-task-2" "$world/pool-b" <<'PY2' || fail "meta not written"
+import os
+import pathlib
+import sys
+
+meta, worktree, pool = sys.argv[1:]
+worktree = str(pathlib.Path(worktree).resolve())
+git_dir = os.path.join(worktree, ".git")
+stat = os.stat(git_dir)
+pathlib.Path(meta).write_text(
+    "generation_id=gen-2\nworktree={}\naccount_home={}\naccount_task=task-2\n"
+    "worktree_git_dir_identity={}:{}\n".format(
+        worktree, str(pathlib.Path(pool).resolve()), stat.st_dev, stat.st_ino),
+    encoding="utf-8")
+PY2
+  run_placement "$world" request --task task-1 --task-generation gen-1 \
+    --owner-kind primary --eligible > /dev/null 2>&1 || fail "the first placement was refused"
+  run_placement "$world" request --task task-2 --task-generation gen-2 \
+    --owner-kind primary --eligible > /dev/null 2>&1 || fail "the second placement was refused"
+  python3 - "$world/home/state/azure-workers/controller.json" <<'PY2' \
+    || fail "two pools sharing slot names collapsed onto one account home"
+import json
+import pathlib
+import sys
+
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+items = {item["task"]: item for item in state["queue"].values()
+         if item.get("status") != "complete"}
+one, two = items["task-1"], items["task-2"]
+assert one["account_home"] != two["account_home"], one["account_home"]
+first = json.load(open(pathlib.Path(one["account_home"]) / "auth.json", encoding="utf-8"))
+second = json.load(open(pathlib.Path(two["account_home"]) / "auth.json", encoding="utf-8"))
+assert first["openai-codex"]["accountId"] != second["openai-codex"]["accountId"], first
+PY2
+  assert_no_cloud_call "$world" "the two-pool unit"
+  pass "two pools carrying the same slot names resolve to two account homes, not one"
+}
+
 concurrent_placements_take_distinct_accounts
 exhaustion_refuses_by_name
 a_withdrawn_placement_returns_its_account
@@ -653,4 +763,6 @@ a_compartment_child_contends_with_a_crewmate
 replay_reuses_its_account_and_a_new_generation_takes_another
 two_profiles_on_one_account_are_one_lease
 status_shows_who_holds_which_account
+a_relogged_slot_never_clobbers_a_live_placements_credential
+two_pools_with_the_same_slot_names_stay_two_placements
 echo "# fm-worker-placement.test.sh: all assertions passed"

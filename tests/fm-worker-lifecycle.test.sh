@@ -4000,12 +4000,16 @@ assert item["home_binding"] != state["home_binding"]
 # account lease is the CONTROLLER's placement decision over that home's pool:
 # the lowest free profile, bound to its upstream account and nothing else.
 assert item["account_profile"] == "openai-codex", item
-assert item["account_home"] == str(
-    primary / "state" / "azure-workers" / "accounts" / "openai-codex"), item
-assert item["account_binding"] == hashlib.sha256(json.dumps(
+expected_binding = hashlib.sha256(json.dumps(
     {"provider": "pi", "upstream_account": hashlib.sha256(
         b"fixture-account-1").hexdigest()[:16]},
-    sort_keys=True, separators=(",", ":")).encode()).hexdigest(), item
+    sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+assert item["account_binding"] == expected_binding, item
+# The projected home is keyed on the LEASE IDENTITY, not the slot name: the
+# projection key and the exclusion key have to be the same function of the pool
+# or a re-logged slot silently overwrites a live placement's credential.
+assert item["account_home"] == str(
+    primary / "state" / "azure-workers" / "accounts" / expected_binding), item
 # The leased home is a SINGLE-profile home, projected by the one projection
 # tool: a pooled home would put every signed-in account on the worker and let
 # the guest pick the first slot, which is the collision this requirement removes.
@@ -4229,7 +4233,10 @@ expected = {
         "upstream_account": hashlib.sha256(b"fixture-account-1").hexdigest()[:16],
     }),
     "account_profile": "openai-codex",
-    "account_home": str(home / "state" / "azure-workers" / "accounts" / "openai-codex"),
+    "account_home": str(home / "state" / "azure-workers" / "accounts" / digest({
+        "provider": "pi",
+        "upstream_account": hashlib.sha256(b"fixture-account-1").hexdigest()[:16],
+    })),
     "account_pool_home": str(account.resolve()),
     "worktree_binding": digest(
         {"worktree": str(worktree.resolve()), "git_dir": str(git_dir.resolve())}),

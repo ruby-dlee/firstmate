@@ -645,6 +645,53 @@ test_cloud_spawn_fails_closed_when_the_lifecycle_refuses_the_request() {
   pass "a refused worker request rolls the spawn back instead of stranding the task"
 }
 
+test_the_pool_is_never_staged_in_the_request_to_narrow_window() {
+  local record id out status
+  id=cloud-window-c15
+  record=$(make_cloud_case narrow-window "$id")
+  read_cloud_case "$record"
+  # THE WINDOW: the durable lease exists and the tracking monitor pane is
+  # already polling, but the spawn has not yet narrowed the account directory.
+  # The spawn is killed exactly there. If the pooled auth.json were staged
+  # before the lease (as it used to be), every signed-in account would be
+  # sitting in a directory the monitor is willing to dispatch as --account-dir.
+  # Written to a FILE, never captured through a command substitution. The spawn
+  # is SIGKILLed here, and a command substitution would keep blocking on the
+  # pipe until every surviving descendant (the tracking pane among them) closed
+  # its copy - a hang that reads as a silent suite death rather than a failure.
+  FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
+    FM_TEST_CLOUD_ABORT_AFTER_REQUEST=1 \
+    run_cloud_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR" \
+    > "$CASE_DIR/window-spawn.log" 2>&1 </dev/null
+  status=$?
+  out=$(cat "$CASE_DIR/window-spawn.log" 2>/dev/null || true)
+  test "$status" -ne 0 || fail "the spawn was supposed to die inside the window: $out"
+  python3 - "$HOME_DIR/state/azure-workers/controller.json" "$HOME_DIR/state/$id.cloud-account" "$id" \
+    "$CASE_DIR/pi-agent-home/auth.json" <<'PY2' || fail "the pooled credential reached the window"
+import json
+import pathlib
+import sys
+
+controller, account_dir, task, pool_path = sys.argv[1:]
+state = json.load(open(controller, encoding="utf-8"))
+live = [item for item in state["queue"].values()
+        if item.get("task") == task and item.get("status") != "complete"]
+# The lease really is durable at this point, so the window is real and not
+# something the test skipped past.
+assert live, "no durable lease existed, so this never entered the window"
+pool = json.load(open(pool_path, encoding="utf-8"))
+assert len(pool) > 1, sorted(pool)
+staged = pathlib.Path(account_dir) / "auth.json"
+if staged.exists():
+    parsed = json.load(open(staged, encoding="utf-8"))
+    assert isinstance(parsed, dict) and len(parsed) == 1, (
+        "the pooled credential was staged inside the window", sorted(parsed))
+print("# window state: lease durable, staged slots = {}".format(
+    sorted(json.load(open(staged, encoding="utf-8"))) if staged.exists() else "no auth.json at all"))
+PY2
+  pass "the pooled credential is never staged in the window between the durable lease and the narrowing"
+}
+
 test_a_spawn_that_cannot_bind_its_leased_account_hands_it_back() {
   local record id out status
   id=cloud-bindfail-c14
@@ -1254,6 +1301,7 @@ test_cloud_spawn_config_file_default_and_env_override
 test_cloud_spawn_refuses_unknown_switch_value
 test_cloud_spawn_fails_closed_when_the_lifecycle_refuses_the_request
 test_a_spawn_that_cannot_bind_its_leased_account_hands_it_back
+test_the_pool_is_never_staged_in_the_request_to_narrow_window
 test_cloud_switch_refuses_non_pi_harness
 test_cloud_switch_refuses_explicit_backend
 test_compartment_child_spawn_splits_the_task_home_from_the_money_document

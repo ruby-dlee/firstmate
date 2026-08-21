@@ -508,37 +508,121 @@ What landed, 2026-08-20 (#264, plus #268 for a defect the live runs exposed):
   afterwards; the operator has since restored the fallback entries again, as the status above
   records. This run is still the only verdict this requirement's lane has produced.
 
+### The acceptance sentence is not evidenceable as written, and is amended (2026-08-21)
+
+R6's acceptance says "a codex-authored change AND a claude-authored change are each reviewed by a
+GLM-backed reviewer". **The system cannot evidence that sentence, and this must be said before any
+run is recorded against it.**
+
+What the code actually does, traced rather than assumed:
+
+- Eligibility derives from `model` in the task meta and NEVER from `harness`
+  (`bin/fm-crosscheck.py`, `model_family(meta["model"])`). `parse_meta` requires `harness` to be
+  present and non-empty, then nothing in reviewer selection reads it.
+- The ledger records **no author identity at all**. The one call site passes
+  `author_account_identity=""`, with an inline comment saying task metadata carries no upstream
+  authorship account record.
+- Git carries no harness signal either, by design: the no-self-attribution rule means no trailer
+  ever distinguishes a claude crewmate from a codex one.
+
+So the task meta is the only authorship input, and a task meta is a DECLARATION, not a record.
+Anyone can write `harness=claude` over any change. "A claude-authored change" is therefore not a
+checkable property of any artifact this system produces.
+
+**Amendment, and the reading to use.** The acceptance becomes what the system can actually
+evidence, which is also what the 2026-08-19 amendment's own reasoning needs ("one reviewer family
+outside both author families satisfies the paradigm for EVERY author"):
+
+> The cross-family lane completes a review end to end, and the family screen admits that reviewer
+> against BOTH a codex-model author and a non-codex-model author, with the ledger recording the
+> reviewer model, the review family mode, and whether the `crosscheck-same-model` relaxation was
+> required.
+
+Every clause there is checkable from the ledger. Nothing in it claims to know who wrote the code.
+This is deliberately weaker than the original sentence, and it is weaker in the only direction
+available: the original was never provable, so leaving it in place would have meant marking R6 DONE
+on an assertion.
+
+Making authorship genuinely recordable is the alternative, and it is a real change rather than a
+doc edit: it needs an authorship identity captured at task creation and carried into the ledger,
+which is the same `author_account_identity` field the Azure adapter's same-account refusal is
+already waiting on. Worth doing, out of scope here, and the amendment above does not depend on it.
+
+**Declaring a codex author is the SAFE error; declaring a claude author is the dangerous one.** A
+codex declaration can only narrow eligibility: against a codex-family reviewer it forces the
+`crosscheck-same-model` relaxation to appear in the record, and with the relaxation off it fails
+closed. A claude declaration widens eligibility silently and makes the run print "relaxation was
+not required" and record clean cross-family separation that may never have happened. When the real
+author is unknown, declare codex and take the louder record.
+
+**Correction to this program's own artifacts.** The two runs in
+`$FM_HOME/data/crossfamily-r6-281/` were driven by a hand-written two-line meta asserting
+`harness=claude` / `model=claude-opus-5` over a PR whose real author harness is not recorded
+anywhere. Those runs are real reviews and their findings were real and acted on, but their
+authorship claim is a declaration, and **they must not be counted toward the acceptance above**.
+Later probe runs declare a codex author instead, per the asymmetry.
+
 ### Where the lane actually stands, 2026-08-21
 
 Stated plainly, because wiring being right is not the acceptance.
 
 **Has a cross-family review run end to end and produced a verdict? NO.** Not once, on any lane,
-ever. Two attempts were made against PR #281 on the direct Fireworks lane:
+ever. Three attempts against PR #281 on the direct Fireworks lane, each failing FURTHER along than
+the last:
 
-| attempt | roster | outcome |
-|---|---|---|
-| 1 | `fireworks-glm` then the pi-codex fallback | GLM produced a complete turn but its final assistant text was not bare JSON, refused as `malformed verdict artifact`; the run fell through to the codex-family fallback, which DID reach a real blocking verdict |
-| 2 | `fireworks-glm` only | `Pi reviewer: bounded command timed out after 1800 seconds` |
+| # | outcome |
+|---|---|
+| 1 | GLM produced a COMPLETE turn; final text was not bare JSON, refused as `malformed verdict artifact`. Fell through to the codex fallback, which reached a real blocking verdict |
+| 2 | `Pi reviewer: bounded command timed out after 1800 seconds` |
+| 3 | GLM produced a real verdict naming the exact head and the exact account home, in BARE JSON, refused as `Unterminated string starting at: line 1 column 3045` |
+| 4 | GLM completed a full 424s review and produced a COMPLETE, SCHEMA-VALID verdict. Refused `UNREVIEWED` because the reviewer's own `executed_reproduction.command` did not name both SHAs |
+| 5 | Identical to 4, same refusal. So attempt 4 was not a lucky run and this failure is not variance |
 
-What IS established, by execution:
+Attempt 1 was never a hang: the model went through pi, completed a turn, and produced text, and was
+rejected at the LAST step on output SHAPE. That fact also disproved the suspect this document
+previously named. Measured since:
 
-- The provider is reachable and correct. Direct HTTP against
-  `https://api.fireworks.ai/inference/v1/chat/completions` with the pinned model returns HTTP 200,
-  `finish_reason: stop`, and streams to `[DONE]` in 1.56s carrying a usage chunk.
-- The crosscheck lane reaches it. Attempt 1's failure was a verdict SHAPE problem at the end of a
-  completed model turn, not a connectivity, credential or policy failure. That shape is now handled
-  (one whole-message Markdown fence is unwrapped) and the refusal names a bounded prefix of the
-  offending text, which it did not before.
-- The hang is in pi, not the provider. The same pi build, node runtime and harness complete against
-  `openai-codex`, and completed once against a different custom provider slot. Against this provider
-  pi has hung at 420s, 900s and 1800s on prompts of very different sizes while direct streaming of
-  the same model answers in under two seconds.
+- **`reasoning_content` in streamed deltas is NOT the problem, and that Work item is answered.**
+  Streaming the review-shaped prompt reaches `[DONE]` in 21-24s carrying 390 and 867 reasoning
+  deltas, at default and `high` reasoning effort, with a maximum inter-chunk gap of 3.4s. A large
+  reasoning stream streams fine.
+- **The output shape was a Markdown fence, confirmed byte for byte.** Asked for this gate's exact
+  review instruction and schema, GLM returns ` ```json\n{...}\n``` `, and a bare parse of that fails
+  with `Expecting value: line 1 column 1 (char 0)` - precisely attempt 1's recorded error. The
+  extractor now unwraps exactly one complete fenced block, and attempt 3 duly got past it.
+- **The remaining failure is a TRUNCATED verdict carrying a SUCCESSFUL stop reason.** Attempt 3's
+  JSON breaks mid-string at char 3044 while pi reported `stopReason: stop`, so the stop-reason
+  guard never fired and only the JSON parse caught it. That is the strongest possible argument for
+  keeping BOTH refusal grounds rather than treating either as redundant, and both stay pinned by
+  tests.
+- **It is not the token cap.** Both `max_completion_tokens` (what pi sends for this provider) and
+  `max_tokens` are honored at 20000 and both return complete, parseable verdicts of 3212 and 3775
+  completion tokens; the lane declares `maxTokens` 32000.
 
-Leading suspect, labelled as a suspicion rather than a finding: this requirement's own Work list
-asked to "verify pi tolerates `reasoning_content` in streamed deltas before rollout", and that was
-never done. GLM-5.2 returns `reasoning_content` on every response (observed: 1,139 characters of it
-beside a 180-character answer). That is the one thing this provider does which the working lanes do
-not. It has not been isolated, so it is a hypothesis, not a cause.
+Attempt 4 is the milestone: **the lane executes a complete review and produces a schema-valid
+verdict.** The ledger recorded a genuine cross-family reviewer record against a codex-model author
+- `model: accounts/fireworks/models/glm-5p2`, `review_family_mode: cross-family-primary`, NO
+`model_independence` marker (so clean family separation with no relaxation required),
+`credential_source: pi-fireworks-glm-models-file`, and the non-secret
+`credential_identifier: provider-binding:fireworks-glm:d2a164ff...`, over 424s of reviewer time.
+Under the amended acceptance above, the family-screen clause is now EVIDENCED for a codex-model
+author.
+
+What remains is NOT transport, shape, or policy wiring. It is the reviewer obeying the review's own
+evidence discipline: the gate refused the verdict because the model's `executed_reproduction`
+command did not name both the base and head SHAs, which the prompt requires. That is the gate
+working exactly as designed, and it must NOT be relaxed to get a green verdict - a lane that earns
+its first verdict by lowering the evidence bar would be worth less than no lane. Attempt 5 repeated attempt 4 exactly, so this is
+REPRODUCED behavior rather than a flaky run: GLM-5.2 reliably omits the SHAs from its reproduction
+command. The remaining risk is therefore instruction compliance by this model on the evidence
+contract, plus the intermittent truncation attempt 3 showed, and neither is a reason to weaken a
+refusal.
+
+The obvious next step is to strengthen the reproduction-command INSTRUCTION rather than the check,
+which is legitimate prompt work and not a relaxation. It is deliberately NOT done here: that prompt
+is shared with the codex lane, which currently satisfies the clause, and changing a contract that
+every merge depends on to accommodate one model is a decision to take deliberately rather than at
+the end of a long session.
 
 **What #281 closes:**
 
@@ -561,8 +645,13 @@ not. It has not been isolated, so it is a hypothesis, not a cause.
   It still does not exist; `bin/fm-crosscheck.py` exposes `run`, `verify`, `merge` and `timings`.
   This one is substantive rather than cosmetic, and it bites right now: the fallback IS active, and
   the only thing that says so is a stderr line at run time.
-- `reasoning_content` in streamed deltas, still unverified, and now the leading suspect for the
-  hang above.
+- Review guards sized to the model's context window. Two of the three the Work list names DO
+  exist and are stronger than asked: the findings schema is strict (`additionalProperties: false`,
+  enum'd severities, `maxItems` caps), and citations are validated before filing by escape check,
+  `git ls-files --error-unmatch` tracked-at-head check, and a line-in-range check. The third, a
+  per-review context cap actually SIZED to the serving model, does not exist:
+  `MAX_LEDGER_PROMPT_BYTES` (64,000) and `MAX_PROJECTED_FINDINGS` (512) are fixed constants, and
+  nothing reads the lane's declared `contextWindow`. This change does not re-size them.
 - A per-review spend meter. The provider slot declares real per-million costs (input 1.45, output
   4.69) instead of the old slot's zeros, but that number lives in pi's own config and this change
   does NOT make the crosscheck ledger's cost non-zero, because the ledger records no token usage at

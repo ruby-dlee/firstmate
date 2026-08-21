@@ -3700,16 +3700,28 @@ def pi_reviewer_command() -> list[str]:
     return [str(resolved_entrypoint)]
 
 
-# A verdict is a bare JSON object. Some models present it inside one Markdown
-# code fence instead, which is a formatting habit rather than a different
-# verdict; GLM-5.2 through Pi does exactly this. Precisely one fence, spanning
-# the WHOLE message, is unwrapped. Prose around the fence, several fences, or a
-# fence that never closes are all left alone so they fail to parse, because
-# each is a case where the reviewer said more than one thing and the gate must
-# not pick which part was the verdict. A truncated verdict never closes its
-# fence, so this cannot turn one into a parseable answer.
-PI_FENCED_VERDICT_RE = re.compile(
-    r"\A```[A-Za-z0-9_+.-]*[ \t]*\r?\n(?P<body>.*?)\r?\n?```\Z",
+# A verdict is a bare JSON object. Chat models routinely present one inside a
+# Markdown code fence instead, which is a formatting habit rather than a
+# different verdict. Measured, not assumed: asked for this gate's exact review
+# instruction and schema, GLM-5.2 returns "```json\n{...}\n```", and a bare
+# parse of that fails with `Expecting value: line 1 column 1 (char 0)` - byte
+# for byte the failure that cost the lane its first review attempt.
+#
+# The rule is "EXACTLY ONE complete fenced block in the message", which is
+# deterministic and never asks the gate to choose: with one block there is
+# nothing to pick between, so surrounding prose is harmless and unwrapping is
+# safe. Several complete blocks refuse, because then the gate WOULD be
+# choosing which one was the verdict. Requiring the fence to span the whole
+# message instead would re-break the lane the first time a model prefaces its
+# answer with a sentence, and the point of a registry-driven lane is that the
+# next model does not need the prompt re-tuned.
+#
+# This tolerates a WRAPPER, never a TRUNCATED verdict. A truncated verdict
+# never closes its fence, so it yields zero complete blocks, falls through to
+# the bare text, and still fails to parse - and `stopReason` refuses it one
+# step earlier regardless. Both remain pinned by tests.
+PI_FENCED_BLOCK_RE = re.compile(
+    r"```[A-Za-z0-9_+.-]*[ \t]*\r?\n(?P<body>.*?)\r?\n?```",
     re.DOTALL,
 )
 
@@ -3718,10 +3730,10 @@ def pi_verdict_body(final_text: str) -> str:
     """Return the JSON body of a Pi reviewer's final assistant text."""
 
     stripped = final_text.strip()
-    match = PI_FENCED_VERDICT_RE.match(stripped)
-    if match is None:
+    blocks = PI_FENCED_BLOCK_RE.findall(stripped)
+    if len(blocks) != 1:
         return stripped
-    return match.group("body").strip()
+    return blocks[0].strip()
 
 
 def pi_review_result(output: str) -> tuple[dict[str, Any], int]:

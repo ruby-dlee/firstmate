@@ -1580,12 +1580,27 @@ for fence in ("```json\n%s\n```", "```\n%s\n```", "```JSON \n%s\n```"):
     assert fenced == {"verdict": "clear"}, fenced
     assert count == 1
 
+# Exactly ONE complete fenced block leaves nothing to choose between, so
+# surrounding prose is harmless and the block is unwrapped.
 for label, body in (
     ("prose before the fence", "Here is my verdict:\n```json\n%s\n```" % verdict_text),
     ("prose after the fence", "```json\n%s\n```\nHope that helps." % verdict_text),
+    ("prose both sides", "Verdict:\n```\n%s\n```\nDone." % verdict_text),
+):
+    wrapped, count = module.pi_review_result(
+        event_stream([assistant_turn(body, "stop")])
+    )
+    assert wrapped == {"verdict": "clear"}, (label, wrapped)
+    assert count == 1
+
+# Several complete blocks WOULD make the gate choose, so they refuse. An
+# unterminated fence yields no complete block and still fails to parse, which
+# is what keeps a wrapper tolerance from becoming a truncation tolerance.
+for label, body in (
     ("two fences", "```json\n%s\n```\n```json\n%s\n```" % (verdict_text, verdict_text)),
     ("unterminated fence", "```json\n%s" % verdict_text),
     ("truncated fenced verdict", '```json\n{"verdict": "cle'),
+    ("truncated bare verdict", '{"verdict": "cle'),
 ):
     expect_tool_failure(
         label,

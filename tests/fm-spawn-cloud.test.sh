@@ -789,6 +789,106 @@ test_cloud_switch_off_and_on_share_the_same_base_metadata() {
   pass "cloud metadata stays additive over the local metadata shape"
 }
 
+# A shape-valid value for one contract name. The SHAPES are what the readers
+# accept (a phase enum, a bounded integer, a directory); the NAMES they are
+# keyed off are pattern suffixes, never the specific variable this defect was
+# reported as. A future contract name whose shape none of these fit fails the
+# spawn below, which is red for a true reason and says so.
+cloud_env_contract_sentinel() {  # <name>
+  case $1 in
+    # Mirrors of the values the rest of this suite's cloud lane runs with, so
+    # the fixture provider and the controller still agree with each other.
+    FM_AZURE_SUBSCRIPTION_ID) printf '%s' "$SUB" ;;
+    FM_AZURE_DEPLOYMENT_GENERATION) printf 'dep-one' ;;
+    FM_AZURE_OWNER_TAG) printf 'owner' ;;
+    FM_AZURE_NAMING_PREFIX) printf 'fmtest' ;;
+    FM_AZURE_WORKER_STATE_DIR) printf '%s' "$HOME_DIR/state/azure-workers" ;;
+    *_STATE_DIR) printf '%s' "$CASE_DIR/contract-state" ;;
+    *_POLICY_PHASE) printf 'commissioning' ;;
+    *_WORKER_MAX) printf '16' ;;
+    *_SECONDMATE_MAX) printf '2' ;;
+    *_BOUND_OVERRIDE) date -u +%Y-%m-%d ;;
+    *_ALLOW_UNTRAINED_FORECAST|*_PROTECT_DURABLE_STATE|*_WARM_IDLE) printf '0' ;;
+    # The commissioning ceiling is not a free knob: admission refuses any
+    # value other than the reviewed one.
+    *_CEILING_USD) printf '1500' ;;
+    *_HOURS) printf '24' ;;
+    *_SECONDS|*_USD|*_THRESHOLD) printf '900' ;;
+    *) printf 'fmcontract-%s' "$1" ;;
+  esac
+}
+
+test_persisted_cloud_env_carries_the_whole_deployment_read_set() {
+  # THE CLOSED-PANE CONTRACT, asserted as an EFFECT.
+  #
+  # state/<id>.cloud-env is the ONLY channel between the operator's shell and
+  # the compartment/crewmate monitors, whose Herdr panes inherit nothing. What
+  # that file must carry is decided on the far side, by the code that reads it
+  # when a lifecycle call reaches the provider and the provider shells out to
+  # bin/fm-azure-pilot.sh for the deployment. This test derives that read set
+  # from those readers (bin/fm-cloud-env-contract.py) and asserts the file the
+  # spawn ACTUALLY WROTE against it, value by value, through a source in a
+  # scrubbed environment - the same way a monitor reads it.
+  #
+  # Deliberately not a grep for any one variable: a name added to a reader and
+  # not to SPAWN_CLOUD_ENV_ALLOWLIST goes red here without this test ever
+  # having heard of it. That is the failure that had to reach a live Azure run
+  # before, because every provider in this suite is a fixture that never shells
+  # out to the pilot at all.
+  local record id out env_file required count name want got missing mismatched
+  id=cloud-env-c30
+  record=$(make_cloud_case env-contract "$id")
+  read_cloud_case "$record"
+  required=$("$ROOT/bin/fm-cloud-env-contract.py") \
+    || fail "the cloud-env contract could not be derived: $required"
+  count=$(printf '%s\n' "$required" | grep -c '^FM_AZURE_')
+  # Vacuity guard: a derivation that silently matched nothing would make every
+  # assertion below pass while proving nothing at all.
+  [ "$count" -ge 12 ] || fail "the cloud-env contract derived only $count names; the derivation is broken"
+  out=$(
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      export "$name=$(cloud_env_contract_sentinel "$name")"
+    done <<CONTRACT
+$required
+CONTRACT
+    FM_SPAWN_CLOUD=azure \
+      FM_TEST_ACTUAL_USD=2000 \
+      FM_WORKER_PROVIDER_COMMAND="python3 $CASE_DIR/provider.py" \
+      FIXTURE_STATE="$CASE_DIR/provider-state.json" \
+      run_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR"
+  )
+  expect_code 0 $? "the contract cloud spawn should succeed: $out"
+  env_file="$HOME_DIR/state/$id.cloud-env"
+  assert_present "$env_file" "the cloud spawn persisted no environment for the closed pane"
+  missing=
+  mismatched=
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    want=$(cloud_env_contract_sentinel "$name")
+    # Read it the way a monitor does: source the file in an environment
+    # scrubbed to what a Herdr pane actually keeps. `env -u FM_*` is not a
+    # thing, and unsetting by prefix here would leave the operator's own
+    # exports leaking in and hide exactly this defect.
+    # The inner script must stay unexpanded: $1/$2 are the scrubbed shell's own
+    # arguments, and the indirect read is what proves the name is reachable.
+    # shellcheck disable=SC2016
+    got=$(env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C}" \
+      bash -c '. "$1" >/dev/null 2>&1 || true; value=$2; printf "%s" "${!value-}"' \
+      _ "$env_file" "$name")
+    if [ -z "$got" ]; then
+      missing="$missing $name"
+    elif [ "$got" != "$want" ]; then
+      mismatched="$mismatched $name"
+    fi
+  done <<CONTRACT
+$required
+CONTRACT
+  [ -z "$missing" ] || fail "the persisted cloud-env cannot reach the deployment path: the closed pane never sees$missing (add them to SPAWN_CLOUD_ENV_ALLOWLIST in bin/fm-spawn.sh; regenerate with bin/fm-cloud-env-contract.py --allowlist)"
+  [ -z "$mismatched" ] || fail "the persisted cloud-env does not round-trip its value for$mismatched"
+  pass "the persisted cloud-env carries every name the cloud deployment path reads, value-exact through a closed environment"
+}
+
 test_cloud_monitor_launch_carries_fm_home() {
   # The Herdr server starts endpoint panes in a closed environment; the
   # monitor's launch string must therefore carry FM_HOME inline or the
@@ -1504,6 +1604,7 @@ test_monitor_lands_despite_a_collection_error
 test_monitor_keeps_the_outcome_when_the_worktree_moved
 test_cloud_spawn_stays_durably_queued_without_admission
 test_cloud_monitor_launch_carries_fm_home
+test_persisted_cloud_env_carries_the_whole_deployment_read_set
 test_respawn_sweeps_stale_cloud_artifacts
 test_queued_spawn_converges_through_the_monitor
 test_monitor_stands_down_when_dispatch_already_claimed

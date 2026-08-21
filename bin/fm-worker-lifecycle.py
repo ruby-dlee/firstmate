@@ -3937,6 +3937,14 @@ def write_task_home_receipt(path, item, worker=None):
     held = (worker or {}).get("task_home")
     if held is not None and held != task_home:
         return
+    # Named fail path: this runs AFTER the receipt is printed and after
+    # save_state, so an unwritable channel raises with the task already
+    # withdrawn or surrendered and no removal performed. The wrapper's own
+    # surviving-credential check does not see it either, because the fallback
+    # home is empty. It needs an unwritable TMPDIR, which the wrapper's own
+    # mktemp would have failed on first, so it is exotic rather than reachable;
+    # it is written down because the file channel is what introduced it.
+    #
     # The file is two lines exactly, so the reader needs no parser. A value
     # that cannot survive that shape is not written at all.
     if "\n" in parent or "\n" in task_home or "\r" in parent or "\r" in task_home:

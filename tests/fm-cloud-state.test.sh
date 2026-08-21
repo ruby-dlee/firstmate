@@ -149,7 +149,7 @@ run_compartment_child_credential_is_removed_from_its_task_home() {
   local tmp home id
   fm_test_tmproot_into tmp fm-cloud-state-compartment
   home="$tmp/compartment"
-  id=child-1
+  id='child-1'
   seed_compartment_child_staging "$home" "$id"
 
   fm_cloud_state_remove "$home/state" "$id"
@@ -319,7 +319,7 @@ run_the_removal_audit_does_not_derive_its_subject_from_the_resolution() {
   home="$tmp/compartment"
   fallback="$tmp/primary/state"
   channel="$tmp/task-home"
-  id=child-9
+  id='child-9'
   mkdir -p "$home/state/$id.cloud-account" "$fallback"
   printf 'smc-1\n' > "$home/.fm-secondmate-home"
   printf '{"refresh":"secret"}\n' > "$home/state/$id.cloud-account/auth.json"
@@ -357,7 +357,8 @@ run_no_second_enumeration_of_the_cloud_file_set() {
   # spelled with or without flags, through a glob, or through find -delete. It
   # cannot catch a name assembled at runtime from concatenation or from a
   # variable, and it is a lexical check, not a proof that no other remover
-  # exists.
+  # exists. It also deliberately ignores a name inside operator advice text and
+  # rsync's --delete, which are not removals of these files.
   python3 - "$ROOT" <<'ENUM' || fail "a per-task cloud file name is enumerated outside its owner"
 import re
 import sys
@@ -375,7 +376,7 @@ stems = [
 removal = re.compile(
     r"(\brm\b"                      # rm, with or without flags
     r"|\bunlink\b"
-    r"|-delete\b"                   # find ... -delete
+    r"|(?<![-\w])-delete\b"         # find ... -delete, but never rsync --delete
     r"|\bshutil\.rmtree\b"
     r"|\bos\.(remove|unlink)\b"
     r"|\.unlink\("                  # pathlib
@@ -393,6 +394,11 @@ for script in sorted(list((root / "bin").glob("*.sh"))
             continue
         match = removal.search(line)
         if match is None:
+            continue
+        # Operator advice is not a removal. This wrapper prints "remove it with
+        # ..." next to its refusals, and a guard that fires on the help text is
+        # the guard the next person in a hurry deletes.
+        if re.search(r"\b(echo|printf|cat)\b", line[:match.start()]):
             continue
         # Only what the removal is actually AIMED at. Matching the whole line
         # flags an atomic write whose failure arm removes its own temp file on
@@ -415,51 +421,99 @@ run_the_secondmate_child_reaping_loop_calls_the_owner() {
   # of a SECONDMATE home when the parent goes first, and on base it removed the
   # child's metadata while never removing its cloud state at all.
   #
-  # HONEST SCOPE: this is a source check, not an execution proof. It does not
-  # run teardown, and it cannot prove the call is reached. What it does prove is
-  # that the call exists, at the loop's own nesting level rather than inside a
-  # condition, before the metadata removal that ends the child, and that the
-  # script does not shadow the owner with a local no-op definition. Those are
-  # the three ways a text-and-position check was shown to be fooled while the
-  # behavior was broken; a run-time seam here would need teardown driven to a
-  # state where a home's children are reaped and the home then SURVIVES, which
-  # no current teardown path reaches.
-  python3 - "$ROOT/bin/fm-teardown.sh" <<'REAP' || fail "the child reaping loop no longer removes cloud state"
+  # A RUN-TIME SEAM, not a source check. The loop's own text is extracted from
+  # the shipped script and EXECUTED against stubs, with the owner replaced by a
+  # recorder that writes OUTSIDE the home - so "the home is removed afterwards"
+  # is irrelevant to whether the call was observed. A source check was shown to
+  # stay green while the behavior was dead three ways: the call wrapped in a
+  # never-true condition (shell does not force re-indentation), the owner
+  # shadowed by a local no-op, and $sub_state re-pointed at a directory that
+  # does not exist. This sees all three, because it asserts on a call that
+  # happened and on the arguments it happened with.
+  local tmp home sub_state child recorder driver worktree
+  fm_test_tmproot_into tmp fm-cloud-state-reap
+  home="$tmp/compartment"
+  sub_state="$home/state"
+  worktree="$tmp/child-worktree"
+  recorder="$tmp/observed-calls"
+  child='child-reap'
+  mkdir -p "$sub_state" "$worktree"
+  printf 'kind=ship\nbackend=tmux\nworktree=%s\n' "$worktree" > "$sub_state/$child.meta"
+  : > "$sub_state/$child.status"
+  : > "$recorder"
+
+  driver="$tmp/driver.sh"
+  cat > "$driver" <<'DRIVER'
+#!/usr/bin/env bash
+set -u
+root=$1
+home=$2
+worktree=$3
+recorder=$4
+child=$5
+
+# The shipped loop, verbatim.
+eval "$(awk '/^cleanup_firstmate_home_children\(\) \{/,/^\}/' "$root/bin/fm-teardown.sh")"
+
+# The owner, replaced by a recorder that lives OUTSIDE the home.
+fm_cloud_state_remove() { printf '%s\t%s\n' "$1" "$2" >> "$recorder"; }
+
+secondmate_state_metadata() { printf '%s\n' "$home/state/$child.meta"; }
+meta_value() {
+  case "$2" in
+    kind) printf 'ship\n' ;;
+    worktree) printf '%s\n' "$worktree" ;;
+    *) : ;;
+  esac
+}
+fm_backend_of_meta() { printf 'tmux\n'; }
+managed_account_meta() { return 1; }
+fm_account_lifecycle_lock_acquire() { printf 'lock-token\n'; }
+fm_account_lifecycle_lock_release() { return 0; }
+validate_child_worktree_for_removal() { return 0; }
+validate_child_worktree_landed_state() { return 0; }
+fm_treehouse_require_task_lease() { return 0; }
+canonical_existing_dir() { printf '%s\n' "$1"; }
+quiesce_child_endpoint() { return 0; }
+safe_rm_rf_child_worktree() { return 0; }
+remove_grok_turnend_auth() { return 0; }
+TEARDOWN_ACCOUNT_LOCKS=()
+CHECKOUT_LOCK_ROOT=$home/locks
+
+cleanup_firstmate_home_children "$home"
+DRIVER
+
+  bash "$driver" "$ROOT" "$home" "$worktree" "$recorder" "$child" > "$tmp/driver.out" 2>&1 \
+    || fail "the extracted reaping loop did not run: $(cat "$tmp/driver.out")"
+
+  # It ran at all: the loop really did reach the end of a child's life.
+  assert_absent "$sub_state/$child.meta" "the reaping loop never removed the child's metadata"
+  # And it called the owner, with the child's OWN home and the child's OWN id.
+  grep -qF "$(printf '%s\t%s' "$sub_state" "$child")" "$recorder" \
+    || fail "the reaping loop never removed the child's cloud state: $(cat "$recorder")"
+  pass "teardown's reaping loop is observed calling the owner with the child's own home"
+}
+
+run_no_shadowing_of_the_cloud_state_owner() {
+  # The one escape the run-time seam above cannot see, because a redefinition
+  # at the script's TOP LEVEL is outside the function text the seam extracts.
+  # Both spellings, since the parenthesis form is not the only one bash takes.
+  python3 - "$ROOT/bin/fm-teardown.sh" <<'SHADOW' || fail "the cloud state owner is shadowed"
 import re
 import sys
 
-text = open(sys.argv[1], encoding="utf-8").read()
-lines = text.splitlines()
-
-# Nobody may redefine the owner anywhere in the script: a local
-# `fm_cloud_state_remove() { :; }` keeps every call site looking correct.
-shadow = re.compile(r"^\s*fm_cloud_state_remove\s*\(\s*\)\s*\{")
-assert not [i for i, line in enumerate(lines, 1) if shadow.match(line)], (
-    "bin/fm-teardown.sh redefines fm_cloud_state_remove, shadowing the owner")
-
-start = next(i for i, line in enumerate(lines)
-             if line.startswith("cleanup_firstmate_home_children()"))
-end = next(i for i in range(start + 1, len(lines)) if lines[i] == "}")
-body = lines[start:end]
-
-call = re.compile(r'^(\s*)fm_cloud_state_remove\s+"\$sub_state"\s+"\$child_id"\s*$')
-matches = [(i, call.match(line)) for i, line in enumerate(body) if call.match(line)]
-assert matches, "cleanup_firstmate_home_children does not remove each child's cloud state"
-index, match = matches[0]
-
-# The metadata removal that ends the child is at the loop body's own level.
-meta_index, meta_line = next((i, line) for i, line in enumerate(body)
-                             if "$sub_state/$child_id.meta" in line)
-assert index < meta_index, (
-    "the cloud state removal must precede the metadata removal that ends the child")
-
-# Same indentation as that removal means same nesting: wrapping the call in an
-# `if` that is never true indents it one level deeper.
-assert len(match.group(1)) == len(meta_line) - len(meta_line.lstrip()), (
-    "the cloud state removal is nested more deeply than the child's own metadata removal, "
-    "so it is guarded by a condition the metadata removal is not")
-REAP
-  pass "teardown's reaping loop calls the owner unguarded, ahead of the child's metadata"
+path = sys.argv[1]
+shadow = re.compile(
+    r"^\s*(?:function\s+fm_cloud_state_remove\b|fm_cloud_state_remove\s*\(\s*\))")
+offenders = [
+    number
+    for number, line in enumerate(open(path, encoding="utf-8").read().splitlines(), 1)
+    if shadow.match(line)
+]
+assert not offenders, (
+    "bin/fm-teardown.sh redefines fm_cloud_state_remove, shadowing the owner", offenders)
+SHADOW
+  pass "no local definition shadows the cloud state owner"
 }
 
 run_cloud_credential_is_removed
@@ -473,5 +527,6 @@ run_the_receipt_reader_enforces_the_stagers_own_rules
 run_the_removal_audit_does_not_derive_its_subject_from_the_resolution
 run_no_second_enumeration_of_the_cloud_file_set
 run_the_secondmate_child_reaping_loop_calls_the_owner
+run_no_shadowing_of_the_cloud_state_owner
 
 echo "# fm-cloud-state.test.sh: all assertions passed"

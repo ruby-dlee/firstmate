@@ -109,13 +109,27 @@ fm_worker_receipt_state_dir() {  # <task home file> <controller state>
 # it audits cannot fail when that thing is wrong.
 #
 # The subjects are therefore fixed independently of the resolution: the home
-# the CONTROLLER named for this task, read raw and only ever stat'ed, plus the
-# controller's own state directory, which is where an ordinary task's
+# the CONTROLLER named for this task, read raw and tested rather than removed,
+# plus the controller's own state directory, which is where an ordinary task's
 # credential lives.
+#
+# Stated exactly, because a stronger claim would be false: `[ -e ]` FOLLOWS
+# symlinks. A named home that is itself a symlink to an empty marked decoy
+# therefore reports "gone" while the real credential survives behind the link.
+# That shape was silent before this change too, so it is not a regression, and
+# the two other symlink shapes now fail loudly rather than silently; but this
+# audit is a net for a wrongly resolved removal, not a proof of absence.
 fm_worker_receipt_credential_remains() {  # <task home file> <task id> <controller state>
-  local file=$1 id=$2 fallback=$3 named
+  local file=$1 id=$2 fallback=$3 named=
   [ ! -e "$fallback/$id.cloud-account/auth.json" ] || return 0
-  named=$(sed -n '2p' "$file" 2>/dev/null) || named=
+  # The SAME gate the reader applies to the same channel. Two functions
+  # applying different trust to one input is the seam that produced the first
+  # defect on this branch; here it also matters mechanically, because sed on a
+  # FIFO blocks forever and an indefinite hang is a worse failure than a wrong
+  # answer.
+  if [ -f "$file" ] && [ ! -L "$file" ]; then
+    named=$(sed -n '2p' "$file" 2>/dev/null) || named=
+  fi
   case "$named" in
     /*) [ ! -e "$named/state/$id.cloud-account/auth.json" ] || return 0 ;;
   esac

@@ -67,6 +67,12 @@ fm_cloud_state_result_paths() {  # <state_dir> <task_id>
 # spawn lane and removed by no task-end lane - the exact class of leak this
 # owner exists to close, asserted otherwise in a comment. It is in the one set
 # now, so every remover covers it.
+#
+# Consequence worth naming: withdraw and surrender now remove it too, and
+# bin/fm-spawn-cloud-monitor.sh reads it when landing an outcome bundle. Both
+# commands end the task, and the monitor treats an unreadable pointer as "the
+# leased worktree is gone" and keeps the bundle for manual landing rather than
+# discarding it, so the loss is a reported landing, never lost commits.
 fm_cloud_state_lease_paths() {  # <state_dir> <task_id>
   printf '%s\n' "$1/$2.cloud-worktree"
 }
@@ -105,9 +111,11 @@ EOF
 
 # The spawn lanes' door onto the same set: the re-spawn sweep (a new generation
 # must inherit no part of the previous one) and the rollback of a spawn whose
-# worker request was refused after staging. It removes exactly what the
-# task-end remover removes, and is a distinct name only so those call sites say
-# which lane they are.
+# worker request was refused after staging. It is a pure delegate: it removes
+# exactly what the task-end remover removes, and exists as a distinct name only
+# so those two call sites say which lane they are. If it ever stops delegating,
+# the enumeration has forked again and that is the bug this owner exists to
+# prevent.
 #
 # The outcome directory is deliberately absent from every group: it is not
 # transport, it can hold the only local copy of a crewmate's returned commits,

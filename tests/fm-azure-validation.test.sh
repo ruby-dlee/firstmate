@@ -1340,6 +1340,8 @@ def seed(phase="responding",attempt=2,**extra):
       "events":[],
     }
     state.update(extra)
+    if state.get("guest_stamps_attempt") is None:
+        state.pop("guest_stamps_attempt",None)
     (env["state_dir"]/"azv-aaaaaaaaaaaa.json").write_text(json.dumps(state))
     return state
 
@@ -1482,6 +1484,21 @@ for label,output in malformed.items():
         "a malformed marker still published a digest on "+label
     assert after.get("result_binding")!="legacy", \
         "a stamping guest was bound legacy on "+label
+
+# 2h-bis. A state that cannot answer "can this guest stamp" - no recorded flag,
+# no staged payload to derive it from - takes the STRICT contract. Falling back
+# to the weaker one would let exactly the states we know least about skip the
+# attempt check.
+seed(guest_stamps_attempt=None)
+view(output="FM_AZURE_VALIDATION_RESULT {} boot={} outcome=needs-decision\n".format(digest_two,boot))
+try:
+    m.observe(env,args)
+except m.ValidationError:
+    pass
+else:
+    raise AssertionError("an underivable stamping answer bought the weaker legacy contract")
+after=json.loads((env["state_dir"]/"azv-aaaaaaaaaaaa.json").read_text())
+assert after.get("result_binding")!="legacy", after.get("result_binding")
 
 # 2i. The composed shape, which is the silent false verdict this PR exists to
 # close, re-entered through the parse-failure path: observing attempt 2, the

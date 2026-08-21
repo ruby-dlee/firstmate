@@ -1749,7 +1749,12 @@ def guest_stamps_attempt(env, state):
         return recorded
     try:
         return guest_text_stamps_attempt(sealed_guest_text(env, state))
-    except ValidationError:
+    except (ValidationError, KeyError, TypeError, OSError):
+        # A state that cannot answer the question at all - no seal recorded, no
+        # staged payload, a truncated request - is not evidence that the guest
+        # cannot stamp. Take the STRICT contract: the worst case is a cell that
+        # must be observed again, never one that accepts another attempt's
+        # result as this attempt's answer.
         return True
 
 

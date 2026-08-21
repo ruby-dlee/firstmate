@@ -89,8 +89,11 @@ creates it, the crewmate completes a task, and both release cleanly.
 Status: PARTIAL. Both lanes are code-complete pending their live acceptance runs.
 
 Two lanes exist.
-The validation-cell lane (`docs/azure-validation.md`) has never closed a cell; there is no
-`azure-validation` state under `$FM_HOME/state`.
+The validation-cell lane (`docs/azure-validation.md`) has never closed a cell.
+Its state is not absent: `$FM_HOME/state/azure-validation/azv-36b2726cbcf3.json` holds the
+complete record of the first live attempt, including its transition timestamps, and is the
+ground truth correcting the account below. An earlier revision of this line claimed no
+`azure-validation` state existed; that was never re-checked against the directory.
 A stranding strand was fixed: a passed run carrying a short receipt set is now demoted to failed
 so the cell collects and retains legibly.
 The root cause behind "an in-cell bridge producing no receipts" is now found and fixed: the
@@ -131,14 +134,55 @@ compute zero, worktree disk and evidence retained, control reservation released.
 That attempt exposed two blockers that stand between this lane and its acceptance sentence, and
 neither is the receipts strand:
 
-1. `respond` does not answer a gate. It reports success and starts a new attempt, but the guest
-   re-publishes the byte-identical previous result: attempt 2's `result.json` matched attempt 1
-   exactly (sha256 prefix `330ddea31bfbbb05` both times, `run.log` identical at 3056 bytes, same
-   `run_id`, same `needs-decision`, same gate), after which the control command reported Failed.
-   The runtime bundle carried no-mistakes v1.48.0, so this is not the v1.41.2-era behavior. Until
-   the operator action reaches the in-cell pipeline, a parked cell can only be retained, and an
-   unchanged republished result should be refused as a non-answer rather than surfacing as a
-   generic failure.
+1. `observe` ended an attempt that was still running, and the ending was unrecoverable.
+   This was recorded here as "`respond` does not answer a gate" plus "the guest re-publishes the
+   byte-identical previous result". BOTH ARE WRONG. The operator's answer travelled; nothing in
+   the guest's respond path is implicated. Ground truth is the cell's own state file
+   (`$FM_HOME/state/azure-validation/azv-36b2726cbcf3.json`), whose events read `responding` at
+   09:47:51, `failed-retained` at 09:48:00, and compute removed at 09:50:30. The host declared
+   the attempt dead NINE SECONDS after creating its Run Command and deleted the VM 2m39s in;
+   attempt 1 had taken 1h57m. The `control_error` captured by that read is exactly two lines, the
+   boot-time auth-home pull warning and the post-run auth-home push warning, which cannot both
+   come from a guest that has existed for nine seconds: they are attempt 1's complete stderr, so
+   the instanceView `observe` read was not describing attempt 2 at all. `observe` treated a
+   terminal `executionState` whose output carried no result marker as proof the attempt had died,
+   and nothing bound the view it read to the attempt it had just created. The marker is the
+   guest's last action, so its absence proves nothing about an attempt still working, and
+   `failed-retained` is a phase `observe` itself refuses, so one premature read was terminal.
+   The byte-identical result was never a republish. The result blob has one fixed name per cell
+   (`staging.result_blob` is `control/result.tar.gz`), overwritten by each attempt's upload, and
+   attempt 2's VM was deleted before it could upload, so any later download necessarily returned
+   attempt 1's archive unchanged. That is the whole of the reported evidence: the same sha256
+   prefix `330ddea31bfbbb05`, the same 3056-byte `run.log`, the same `run_id`, the same
+   `needs-decision`, the same gate. `collect` never ran at all - the state file carries no
+   `result` and `state/azure-validation/results/` is empty - so the comparison was made by
+   downloading the one blob directly, twice.
+   The latent defect this exposed is worse than the reported one. Had that same stale view
+   carried attempt 1's MARKER rather than no marker, `observe` would have accepted it, `collect`
+   would have downloaded attempt 1's archive, matched its digest, and PASSED
+   `verify_result_identity`, because on a resumed attempt the VM, boot id, run id, heads and
+   every other verified field are identical and `result.json` carried no attempt number. A silent
+   false verdict is categorically worse than a generic failure.
+   Fixed: the guest stamps `attempt` into `result.json` and appends `attempt=<n>` to its marker;
+   `observe` requires the marker to name the attempt it is observing and never accepts an unbound
+   view, deferring the terminal decision behind a settling window
+   (`FM_AZURE_VALIDATION_MARKER_SETTLE_SECONDS`, default 300 seconds, reset per attempt) so
+   silence means "could not tell" and never authorizes the destructive action, including when the
+   recorded stamp is itself unreadable; `observe` and `collect` both refuse a result
+   byte-identical to an earlier attempt's as an explicit non-answer rather than a generic
+   failure, with `collect` checking the DOWNLOADED ARCHIVE rather than trusting the code path;
+   and `verify_result_identity` refuses a result that declares no attempt or another attempt's.
+   Proven hermetically in `tests/fm-azure-validation.test.sh` against the real guest emission
+   region, the real `observe`, and the real identity gate.
+   Residual, not fixed: `observe` still drives into `failed-retained`, a phase it refuses, so a
+   false negative that outlasts the settling window is recoverable only through `replace`.
+   Upgrading no-mistakes on the HOST is NOT the fix and cannot reach a running cell. The cell's
+   version comes from the `runtime.tar.gz` handed to `submit --runtime-bundle`; nothing in this
+   repo BUILDS that bundle, it is extracted only on a `start` boot, and the request is
+   digest-sealed (`create_run_command` refuses if the guest changed after request preparation).
+   `azv-36b2726cbcf3`'s bundle declares `no_mistakes_version: 1.48.0` across 110 files. Host
+   1.48.0 to 1.53.0 changes what runs in a cell only by rebuilding the bundle from the upgraded
+   binary and submitting a NEW cell. Do not spend time waiting on a host upgrade here.
 2. The sealed suite is not Linux-clean, so every cell run parks. Shard 2 failed on host-coupled
    units that cannot pass inside a Linux cell (passwordless sudo, tmux window creation, Keychain
    approval markers), alongside 377 passing units. Until those units skip loudly off macOS, no
@@ -206,6 +250,14 @@ neither is the receipts strand:
    deliberately NOT done here: deny-all egress in that cell is a security property, and trading
    it for a green check is an owner-level decision about the cell's security posture, not a test
    suite's call.
+
+Open finding from the same attempt, not addressed by that fix: the guest's `adjudicate_gates`
+polls `control/gate-response-a<n>-<i>.txt` through `fetch_gate_response`, and nothing in this
+repo ever writes that blob, so the loop can only ever time out at its
+`FM_AZURE_VALIDATION_GATE_WAIT_SECONDS` default of 5400 seconds. That is 90 minutes of billable
+cell per gate for nothing, and it is consistent with attempt 1's 1h57m wall time. The remedy is
+a scope decision between wiring the host to publish the blob and deleting the loop; the
+in-attempt response path the guest already has does not need it.
 
 So the receipts fix is exercised live up to the gate, which is exactly what used to be
 impossible, and `close` stays unproven: the acceptance sentence below is not yet met.

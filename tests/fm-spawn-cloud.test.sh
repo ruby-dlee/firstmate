@@ -871,8 +871,14 @@ test_persisted_cloud_env_matches_the_deployment_read_set_exactly() {
   id=cloud-env-c30
   record=$(make_cloud_case env-contract "$id")
   read_cloud_case "$record"
-  required=$("$ROOT/bin/fm-cloud-env-contract.py") \
-    || fail "the cloud-env contract could not be derived: $required"
+  # stderr is captured separately, not folded in: every ContractError the
+  # derivation raises goes to stderr, so folding it into $required would put the
+  # refusal text into the name list, and dropping it leaves the failure reading
+  # "could not be derived:" with nothing after the colon. A sealed re-drive of
+  # the async-def hoist produced exactly that empty message.
+  local contract_err="$CASE_DIR/contract.err"
+  required=$("$ROOT/bin/fm-cloud-env-contract.py" 2>"$contract_err") \
+    || fail "the cloud-env contract could not be derived: $(cat "$contract_err" 2>/dev/null)"
   count=$(printf '%s\n' "$required" | grep -c '^FM_')
   # Vacuity guard: a derivation that silently matched nothing would make every
   # assertion below pass while proving nothing at all.

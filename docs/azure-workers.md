@@ -33,6 +33,8 @@ The caller supplies only task, task generation, owner kind, and eligibility; the
 Caller-supplied bindings are unsupported outside the hermetic test backstop.
 Raw provider-account identity never appears in bounded status or Azure tags.
 The account binding must be a high-entropy digest produced by the account lease owner, not a digest of a guessable profile name.
+The lease owner is the controller: it derives the binding from the profile's upstream account identity (see the placement section below), never from the profile's local slot name.
+The local slot name (`openai-codex-2` and the like) DOES appear in bounded status, because an operator has to be able to see which profile a task holds; it is a local label for a pool slot, not the upstream account identity, and it never reaches an Azure tag.
 
 ## Provider-account placement across the Pi fleet
 

@@ -1336,6 +1336,7 @@ def seed(phase="responding",attempt=2,**extra):
                  "task":"task","task_generation":"gen","validation_generation":"val",
                  "limits":{"behavior_shards":0}},
       "resources":{"run_command_id":"/vm/runCommands/respond-a2"},
+      "guest_stamps_attempt":True,
       "events":[],
     }
     state.update(extra)
@@ -1402,6 +1403,11 @@ assert phase()=="needs-decision", phase()
 recorded=json.loads((env["state_dir"]/"azv-aaaaaaaaaaaa.json").read_text())
 assert recorded["attempt_result_digests"]=={"1":digest_one,"2":digest_two}, recorded["attempt_result_digests"]
 assert recorded["expected_result_digest"]==digest_two
+# The NORMAL path must record the strict binding. Pinning only the legacy case
+# leaves "every observation binds legacy" green while disabling the attempt
+# check for every modern cell.
+assert recorded["result_binding"]=="attempt", recorded.get("result_binding")
+observed_binding=recorded["result_binding"]
 
 # 2e. TWO markers in one output: the current attempt's is accepted wherever it
 # sits, and the FIRST marker no longer wins.
@@ -1428,7 +1434,7 @@ os.environ.pop("FM_AZURE_VALIDATION_MARKER_SETTLE_SECONDS")
 # changed; refusing to read it would retain a cell on a fully published result
 # and leave expected_result_digest unset, making the result unreachable.
 os.environ["FM_AZURE_VALIDATION_MARKER_SETTLE_SECONDS"]="0"
-seed()
+seed(guest_stamps_attempt=False)
 view(output="FM_AZURE_VALIDATION_RESULT {} boot={} outcome=needs-decision\n".format(digest_two,boot))
 m.observe(env,args)
 recorded=json.loads((env["state_dir"]/"azv-aaaaaaaaaaaa.json").read_text())
@@ -1446,6 +1452,56 @@ else:
     raise AssertionError("a stamped marker for another attempt fell through to the legacy path")
 os.environ.pop("FM_AZURE_VALIDATION_MARKER_SETTLE_SECONDS")
 
+# 2h. A guest that CAN stamp never buys the pre-stamp contract with a malformed
+# marker. LEGACY_MARKER is MARKER minus the attempt group, so every one of these
+# satisfies "no stamped marker matched"; the binding must come from the sealed
+# guest instead. The marker is the guest's LAST line by design, which is exactly
+# where an output cap lands, so this is a live shape rather than a theoretical one.
+os.environ["FM_AZURE_VALIDATION_MARKER_SETTLE_SECONDS"]="0"
+malformed={
+  "truncated inside the attempt word":
+    "FM_AZURE_VALIDATION_RESULT {} boot={} outcome=needs-decision attem".format(digest_two,boot),
+  "truncated right after attempt=":
+    "FM_AZURE_VALIDATION_RESULT {} boot={} outcome=needs-decision attempt=".format(digest_two,boot),
+  "empty attempt value":
+    "FM_AZURE_VALIDATION_RESULT {} boot={} outcome=needs-decision attempt=\n".format(digest_two,boot),
+  "non-numeric attempt value":
+    "FM_AZURE_VALIDATION_RESULT {} boot={} outcome=needs-decision attempt=two\n".format(digest_two,boot),
+}
+for label,output in malformed.items():
+    seed()
+    view(output=output)
+    try:
+        m.observe(env,args)
+    except m.ValidationError:
+        pass
+    else:
+        raise AssertionError("a stamping guest fell back to the legacy contract on "+label)
+    after=json.loads((env["state_dir"]/"azv-aaaaaaaaaaaa.json").read_text())
+    assert after.get("expected_result_digest") is None, \
+        "a malformed marker still published a digest on "+label
+    assert after.get("result_binding")!="legacy", \
+        "a stamping guest was bound legacy on "+label
+
+# 2i. The composed shape, which is the silent false verdict this PR exists to
+# close, re-entered through the parse-failure path: observing attempt 2, the
+# output carries attempt 1's own marker truncated inside its attempt field. If
+# legacy bound here, the expected digest would become attempt 1's, the blob
+# still holds attempt 1's archive so the digest check passes, and the attempt
+# check is skipped.
+seed(attempt_result_digests={"1":digest_one})
+view(output="FM_AZURE_VALIDATION_RESULT {} boot={} outcome=needs-decision attempt=".format(digest_one,boot))
+try:
+    m.observe(env,args)
+except m.ValidationError:
+    pass
+else:
+    raise AssertionError("a truncated stale attempt-1 marker was accepted as attempt 2's answer")
+after=json.loads((env["state_dir"]/"azv-aaaaaaaaaaaa.json").read_text())
+assert after.get("expected_result_digest")!=digest_one, \
+    "attempt 1's digest became attempt 2's expected result"
+os.environ.pop("FM_AZURE_VALIDATION_MARKER_SETTLE_SECONDS")
+
 # 3. The REAL result-identity gate refuses a result from another attempt and
 # refuses one that does not declare its attempt at all.
 result=json.load(open(sys.argv[4]))
@@ -1460,7 +1516,11 @@ state={
   },
   "resources":{"worktree_disk_id":"/work","vm_id":"/vm","vm_instance_id":"vm-instance"},
   "expected_boot_id":boot,
+  # Taken from what observe RECORDED, not asserted by hand: producer and
+  # consumer of this binding have to be pinned together or neither is pinned.
+  "result_binding":observed_binding,
 }
+assert state["result_binding"]=="attempt"
 m.verify_result_identity(state,result)
 older=json.load(open(sys.argv[3]))
 try:
@@ -1550,6 +1610,27 @@ assert sent["body"]["properties"]["source"]["script"]==sealed_text, \
 saved=json.loads((env["state_dir"]/"azv-aaaaaaaaaaaa.json").read_text())
 assert "unbound_view_since" not in saved, \
     "a new attempt inherited the previous attempt's settle stamp"
+
+# The recorded stamping flag comes from the bytes that are about to run.
+assert saved["guest_stamps_attempt"] is False, saved.get("guest_stamps_attempt")
+stamping=sealed_text+"printf 'FM_AZURE_VALIDATION_RESULT %s boot=%s outcome=%s attempt=%s\\n'\n"
+assert m.guest_text_stamps_attempt(stamping) is True
+assert m.guest_text_stamps_attempt(sealed_text) is False
+
+# A symlinked payload copy is refused even when it points at correct bytes:
+# the guest is uploaded and executed as root, so its supply path is held to the
+# same standard as credential material.
+real=payload/"real-guest.sh"; real.write_text(sealed_text)
+(payload/"guest.sh").unlink()
+(payload/"guest.sh").symlink_to(real)
+state=seed()
+try:
+    m.create_run_command(env,state,"respond",output_url="https://o",response="x")
+except m.ValidationError as exc:
+    assert "sealed request digest" in str(exc), str(exc)
+else:
+    raise AssertionError("a symlinked guest supply path was accepted")
+(payload/"guest.sh").unlink()
 
 # The seal itself still binds: no source carrying the sealed digest refuses.
 (payload/"guest.sh").write_text("#!/usr/bin/env bash\ntampered\n")

@@ -75,6 +75,11 @@ LEGACY_MARKER = re.compile(
     r"FM_AZURE_VALIDATION_RESULT\s+(sha256:[0-9a-f]{64})\s+boot=([0-9a-f-]{36})"
     r"\s+outcome=([a-z-]+)"
 )
+# Whether a guest CAN name its attempt is a property of the guest, read from the
+# sealed bytes that actually run. It must never be inferred from whether a
+# marker parsed: LEGACY_MARKER is MARKER minus the attempt group, so ANY
+# malformation of the attempt field satisfies "no stamped marker matched".
+GUEST_STAMPS_ATTEMPT = re.compile(r"^[^\n]*FM_AZURE_VALIDATION_RESULT[^\n]*attempt=", re.MULTILINE)
 MARKER_SETTLE_SECONDS = 300
 # Shard transports legitimately run VM creation plus admission plus command
 # submission in one subprocess: near 300 seconds unloaded and well past it
@@ -1698,17 +1703,62 @@ def sealed_guest_text(env, state):
                 continue
         except OSError:
             continue
-        if sha256_file(candidate) == expected:
-            return candidate.read_text(encoding="utf-8")
+        # ONE read. Digesting the file and then re-reading it to return would
+        # verify bytes that are not the bytes returned: a writer landing between
+        # the two reads passes the check and ships different content, and that
+        # content is uploaded as the Run Command script and executes as root on
+        # the cell. Digest exactly the bytes that are handed back.
+        try:
+            data = candidate.read_bytes()
+        except OSError:
+            continue
+        if "sha256:" + hashlib.sha256(data).hexdigest() == expected:
+            try:
+                return data.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
     raise ValidationError(
         "no guest matching this cell's exact sealed request digest is available; "
         "neither the staged payload copy nor the working tree carries {}".format(expected)
     )
 
 
+def guest_text_stamps_attempt(text):
+    """Does this exact guest text emit an attempt-stamped result marker?"""
+    return bool(GUEST_STAMPS_ATTEMPT.search(text))
+
+
+def guest_stamps_attempt(env, state):
+    """Whether this cell's SEALED guest can name the attempt in its marker.
+
+    Read from the guest, never inferred from the output. Inferring it from "no
+    stamped marker matched" hands the weaker pre-stamp contract to any cell
+    whose marker is merely MALFORMED, and the marker is the guest's last line by
+    design, which is exactly where an output cap lands. The consequence is not
+    theoretical: a stale attempt-1 marker truncated inside its own attempt field
+    makes the stamped set empty, binds legacy, sets the expected digest to
+    attempt 1's own, matches the blob that still holds attempt 1's archive, and
+    skips the attempt check - accepting attempt 1's result as attempt 2's
+    answer, which is the exact silent false verdict this binding exists to
+    prevent. Recorded at create time where the sealed text is already in hand,
+    and derived from the sealed guest for a cell whose state predates that.
+    An underivable answer takes the STRICT contract, never the weaker one.
+    """
+    recorded = state.get("guest_stamps_attempt")
+    if isinstance(recorded, bool):
+        return recorded
+    try:
+        return guest_text_stamps_attempt(sealed_guest_text(env, state))
+    except ValidationError:
+        return True
+
+
 def create_run_command(env, state, mode, input_url=None, output_url=None, response=None):
     resources = state["resources"]
     guest_text = sealed_guest_text(env, state)
+    # Recorded from the bytes that are about to run, so observe never has to
+    # guess it from output that may be truncated.
+    state["guest_stamps_attempt"] = guest_text_stamps_attempt(guest_text)
     attempt = state["attempt"]
     name = "{}-a{}".format(mode, attempt)
     run_id = resources["vm_id"] + "/runCommands/" + name
@@ -1982,8 +2032,10 @@ def observe(env, args):
         if len(mine) > 1:
             # Two different results claiming one attempt is not an answer.
             mine = set()
-        if not mine and not stamped:
-            # No stamped marker anywhere. Either nothing published, or the cell
+        if not mine and not stamped and not guest_stamps_attempt(env, state):
+            # No stamped marker anywhere AND the sealed guest provably cannot
+            # stamp. The second half is what keeps a malformed marker from
+            # buying the weaker contract. Either nothing published, or the cell
             # runs a guest sealed BEFORE the stamp existed. That guest cannot be
             # changed, because the request is digest-sealed, so refusing to read
             # it would strand every cell in flight across this upgrade: the

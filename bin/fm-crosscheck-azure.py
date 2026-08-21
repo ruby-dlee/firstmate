@@ -743,6 +743,28 @@ def inspect_reviewer_credential(
     return credential, source, identifier, account_identity
 
 
+def require_stable_reviewer_credential(
+    core: Any, config: dict[str, str], admitted: tuple[Any, str, str, str]
+) -> None:
+    """Re-prove the reviewer credential has not changed since admission.
+
+    Extracted so it can be DRIVEN by a test. It raises
+    `core.CrosscheckToolError`, not a bare `AzureCrosscheckError`, and the
+    class is the whole point: this is the TOCTOU refusal, the most
+    security-relevant one in the staging region, and `AzureCrosscheckError` is
+    a plain `RuntimeError` that none of the persisting handlers catch. Raised
+    as the bare class, a credential swapped between admission and staging
+    would leave no ledger, no report and no data directory - the fleet would
+    see the swap as nothing at all.
+    """
+
+    reproved = inspect_reviewer_credential(core, config)
+    if reproved != admitted:
+        raise core.CrosscheckToolError(
+            "reviewer credential identity changed before exact staging"
+        )
+
+
 def create_credential_archive(
     destination: Path,
     credential: Path,
@@ -2016,16 +2038,11 @@ def _run_azure_review_in_lane(
                 )
             except AzureCrosscheckError as exc:
                 raise core.CrosscheckToolError(str(exc)) from exc
-            reproved = inspect_reviewer_credential(core, config)
-            if reproved != (credential, source, identifier, reviewer_account_identity):
-                # Tool failure, not a bare AzureCrosscheckError: this is the
-                # TOCTOU refusal and the most security-relevant one in the
-                # region, and a bare error here escapes the window whose
-                # handlers persist a run, so the fleet would see the credential
-                # swap as nothing at all.
-                raise core.CrosscheckToolError(
-                    "reviewer credential identity changed before exact staging"
-                )
+            require_stable_reviewer_credential(
+                core,
+                config,
+                (credential, source, identifier, reviewer_account_identity),
+            )
             identity.update(
                 {
                     "credential_archive_digest": credential_archive_digest,

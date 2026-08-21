@@ -1640,6 +1640,21 @@ for label, body in (
         "two complete fences then a truncated third",
         "```\n%s\n```\n```\n%s\n```\n```json\n{\"verdict\": \"bl" % (verdict_text, verdict_text),
     ),
+    # The shape ONLY the odd-marker rule catches, and the reason that rule is
+    # not redundant with the brace-remainder rule: the real verdict is
+    # truncated immediately after its OPENING fence, so it contributes no
+    # braces at all. Markers 3 (odd), complete blocks 1, remainder brace-free
+    # - without the marker count the example below gets certified as the
+    # verdict. It is a plausible truncation point and it is exactly the
+    # failure this lane exists to close.
+    (
+        "example fence then a verdict truncated at its opening fence",
+        '```json\n{"verdict": "clear", "findings": []}\n```\nFinal verdict:\n```json\n',
+    ),
+    (
+        "example fence then a verdict truncated inside its fence header",
+        '```json\n{"verdict": "clear"}\n```\nHere is the real one:\n```js',
+    ),
 ):
     expect_tool_failure(
         label,

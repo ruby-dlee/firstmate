@@ -221,7 +221,8 @@ assert "reviewer_account_digest" in guest_block, "extracted the wrong guest bloc
 SCHEMA = adapter.SCHEMA
 
 
-def run_guest(harness, model, credential_document, account_identity):
+def run_guest(harness, model, credential_document, account_identity,
+              manifest_override=None):
     """Drive the REAL guest block over a real archive, as the VM would."""
     root = Path(tempfile.mkdtemp())
     credential_bytes = json.dumps(credential_document).encode()
@@ -236,6 +237,7 @@ def run_guest(harness, model, credential_document, account_identity):
         "credential_name": name,
         "credential_digest": adapter.digest_bytes(credential_bytes),
     }
+    material.update(manifest_override or {})
     payload = {
         "manifest.json": adapter.canonical_bytes(material) + b"\n",
         name: credential_bytes,
@@ -304,6 +306,39 @@ for harness, document, key in (
     assert result.returncode != 0, (harness, result.stdout)
     print(f"GUEST REFUSED {harness} with no account id in the credential")
 
+# The guest's MANIFEST identity check binds the archive to the REQUEST, not
+# just the credential to the account. Removing it is a real behavior change
+# rather than a no-op: a forged manifest is otherwise admitted, and the
+# reviewer effort or model the compartment actually runs stops matching what
+# the host admitted.
+for label, override in (
+    ("forged effort", {"effort": "low"}),
+    ("forged model", {"model": "gpt-4o-mini"}),
+    ("forged harness", {"harness": "claude"}),
+    ("forged review generation", {"review_generation": "ffffffffffffffffffffffff"}),
+    ("forged credential name", {"credential_name": "models.json"}),
+    ("forged credential digest", {"credential_digest": "sha256:" + "0" * 64}),
+):
+    result, _ = run_guest(
+        "codex",
+        "gpt-5.6-sol",
+        {"tokens": {"account_id": "acct_ABC123"}},
+        core.account_identity(
+            "codex",
+            (lambda h: (h.mkdir(exist_ok=True), (h / "auth.json").write_text(
+                json.dumps({"tokens": {"account_id": "acct_ABC123"}}), encoding="utf-8"
+            ), h)[-1])(Path(tempfile.mkdtemp()) / "home"),
+        ),
+        manifest_override=override,
+    )
+    assert result.returncode != 0, (label, result.stdout)
+    combined = result.stdout + result.stderr
+    assert (
+        "credential manifest identity mismatch" in combined
+        or "credential archive shape mismatch" in combined
+    ), (label, combined)
+    print(f"GUEST REFUSED a manifest with a {label}")
+
 # The cross-family lane keeps its own non-secret identity and still lands.
 lane = next(iter(core.CROSS_FAMILY_LANES.values()))
 lane_document = {"providers": {lane["slot"]: {
@@ -364,8 +399,12 @@ assert module.CROSS_FAMILY_LANES["fireworks-glm"]["model"] == (
     "accounts/fireworks/models/glm-5p2"
 )
 for lane in module.CROSS_FAMILY_LANES.values():
-    assert lane["host"] == "api.fireworks.ai", lane
-    assert lane["base_url"] == "https://api.fireworks.ai/inference/v1", lane
+    # Per-lane consistency, NOT one hardcoded host. Asserting a single host for
+    # every lane meant any genuinely new lane failed HERE first, so the
+    # registration-completeness guard in the model-guest unit - the one this
+    # repo advertises for that job - never got to run.
+    assert lane["base_url"].startswith("https://" + lane["host"] + "/"), lane
+    assert "://" not in lane["host"] and "/" not in lane["host"], lane
     assert module.cross_family_account_identity(lane) == (
         core.cross_family_account_identity(lane)
     )
@@ -721,6 +760,31 @@ with tempfile.TemporaryDirectory() as temporary:
             assert "differs from the admitted executing account" in str(exc), str(exc)
         else:
             raise AssertionError("a foreign executing account was archived")
+
+    # TOCTOU: a credential swapped between admission and staging must refuse
+    # as a TOOL FAILURE, not a bare AzureCrosscheckError. The class is the
+    # control: AzureCrosscheckError is a plain RuntimeError that none of the
+    # persisting handlers catch, so raised as that class the swap would leave
+    # no ledger, no report and no data directory at all.
+    assert not issubclass(module.AzureCrosscheckError, core.CrosscheckToolError), (
+        "the two classes must stay distinguishable for this test to mean anything"
+    )
+    stable = module.inspect_reviewer_credential(core, config)
+    module.require_stable_reviewer_credential(core, config, stable)
+    try:
+        module.require_stable_reviewer_credential(
+            core, config, (stable[0], stable[1], stable[2], "openai-codex:swapped")
+        )
+    except core.CrosscheckToolError as exc:
+        assert "identity changed before exact staging" in str(exc), str(exc)
+    except module.AzureCrosscheckError as exc:
+        raise AssertionError(
+            "the TOCTOU refusal raised a class the persisting handlers ignore: "
+            + str(exc)
+        )
+    else:
+        raise AssertionError("a swapped reviewer credential passed the TOCTOU re-proof")
+    print("TOCTOU refusal raises a persisted tool failure, not a vanishing error")
 
     # The retired claude harness has no Azure credential lane at all.
     claude_home = root / "claude-home"

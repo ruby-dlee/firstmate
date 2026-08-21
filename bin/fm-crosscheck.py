@@ -101,6 +101,15 @@ CROSS_FAMILY_LANES = {
         # different family and take the GLM reviewer with no same-model
         # marker - the original bug reached through a vendor alias. Aliases
         # are used ONLY by `model_family`; lane selection stays exact.
+        #
+        # An alias list is inherently INCOMPLETE and is not a security
+        # boundary. Sibling and successor ids - `glm-5.2-flash`, `glm-4.6`,
+        # and likewise `chatgpt-4o-latest` or `sonnet-5` for the prefix
+        # families - remain their own family, as does any id normalizing to
+        # the empty string. Every one of those is refused at ADMISSION today,
+        # because `allowed_profiles` accepts only registered models, so the
+        # gap costs a refusal rather than a same-family review. Extend the set
+        # when a lane's model gains a spelling the fleet actually authors on.
         "family_aliases": frozenset({"glm5p2", "glm52", "glm5point2"}),
     },
 }
@@ -3955,6 +3964,11 @@ def run_reviewer(
         # model.
         cross_family_lane = cross_family_lane_for_model(config["model"])
         if cross_family_lane is not None:
+            # Defensive only, and STRUCTURALLY UNREACHABLE today:
+            # PI_MODEL_PROVIDERS is built as {lane["model"]: lane["slot"]}, so
+            # the two cannot disagree unless someone hand-writes an entry.
+            # Kept as a cheap consistency assertion, but no documentation
+            # claims it as a control, because an unreachable guard is not one.
             require(
                 pi_provider_for_model(config["model"])
                 == cross_family_lane["slot"],

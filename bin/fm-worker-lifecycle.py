@@ -3934,6 +3934,16 @@ def write_task_home_receipt(path, item, worker=None):
     # halves of one admission diverged. Write nothing rather than pick a side:
     # the fallback leaves a credential to be found, while following the wrong
     # half would remove state in a home this task does not live in.
+    #
+    # Same doctrine as command_execute's role check, which refuses outright
+    # when worker["role"] disagrees with the item's. Both read a drifted pair
+    # as untrustworthy and both fail closed; they differ only in what closed
+    # means for their lane. Execute must not run, so it raises. A removal that
+    # does not happen is a credential left on disk to be found, so this one
+    # declines the redirect and lets the caller fall back rather than aiming a
+    # deletion with half of a disagreement. Neither guard can admit a state the
+    # other refuses: they read different fields on different commands, and
+    # neither ever widens what the other allows.
     held = (worker or {}).get("task_home")
     if held is not None and held != task_home:
         return

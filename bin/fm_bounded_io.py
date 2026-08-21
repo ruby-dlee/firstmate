@@ -76,6 +76,13 @@ class CommandResult:
     stderr: bytes
 
 
+@dataclass(frozen=True)
+class _OwnedProcessInventory:
+    processes: dict[int, tuple[int, int]]
+    complete: bool
+    gap: str = ""
+
+
 class DeadlineBudget:
     """One wall-clock budget shared by a bounded batch and its commands."""
 
@@ -459,8 +466,9 @@ def _darwin_owned_processes(
     command_id: int,
     token: str,
     known: dict[int, tuple[int, int]],
+    ownership_started: tuple[int, int] | None,
     budget: _ProcessCensusBudget,
-) -> dict[int, tuple[int, int]]:
+) -> _OwnedProcessInventory:
     budget.ensure_item_count(len(known))
     table = _darwin_process_table(budget)
     roots: dict[int, tuple[int, int]] = {}
@@ -470,8 +478,13 @@ def _darwin_owned_processes(
         if current is not None and current[3] == identity:
             roots[process_id] = identity
     owned = _darwin_descendants(table, roots, budget)
+    if ownership_started is None:
+        return _OwnedProcessInventory(
+            owned,
+            False,
+            "ownership start identity is unavailable; marker inventory was omitted",
+        )
     marker = f"{OWNERSHIP_ENVIRONMENT_KEY}={token}\0".encode("ascii")
-    earliest_owned_start = min(known.values(), default=(0, 0))
     for process_id, (_parent_id, group_id, uid, identity) in table.items():
         budget.checkpoint()
         if process_id == os.getpid() or process_id in owned:
@@ -479,12 +492,21 @@ def _darwin_owned_processes(
         if group_id == os.getpgrp():
             owned[process_id] = identity
             continue
-        if uid != os.getuid() or identity < earliest_owned_start:
+        if uid != os.getuid() or identity < ownership_started:
             continue
-        arguments = _darwin_process_arguments(process_id, budget)
+        try:
+            arguments = _darwin_process_arguments(process_id, budget)
+        except OSError as exc:
+            if exc.errno != errno.EOVERFLOW:
+                raise
+            return _OwnedProcessInventory(
+                owned,
+                False,
+                f"marker inventory stopped before process {process_id}: {exc}",
+            )
         if arguments is not None and marker in arguments:
             owned[process_id] = identity
-    return owned
+    return _OwnedProcessInventory(owned, True)
 
 
 def _darwin_record_descendants(
@@ -608,12 +630,19 @@ def _supervisor_owned_processes(
     command_id: int,
     token: str,
     known: dict[int, tuple[int, int]],
+    ownership_started: tuple[int, int] | None,
     deadline: float,
-) -> dict[int, tuple[int, int]]:
+) -> _OwnedProcessInventory:
     budget = _ProcessCensusBudget(deadline)
     if sys.platform.startswith("linux"):
-        return _linux_owned_processes(budget)
-    return _darwin_owned_processes(command_id, token, known, budget)
+        return _OwnedProcessInventory(_linux_owned_processes(budget), True)
+    return _darwin_owned_processes(
+        command_id,
+        token,
+        known,
+        ownership_started,
+        budget,
+    )
 
 
 def _supervisor_cleanup(
@@ -623,6 +652,7 @@ def _supervisor_cleanup(
     grace: float,
     command_status: int | None,
     initial_known: dict[int, tuple[int, int]],
+    ownership_started: tuple[int, int] | None,
 ) -> tuple[int | None, bool, str]:
     initial_budget = _ProcessCensusBudget(deadline)
     try:
@@ -635,10 +665,25 @@ def _supervisor_cleanup(
     while True:
         command_status = _reap_supervisor_children(command_id, command_status)
         try:
-            owned = _supervisor_owned_processes(command_id, token, known, deadline)
+            inventory = _supervisor_owned_processes(
+                command_id,
+                token,
+                known,
+                ownership_started,
+                deadline,
+            )
         except OSError as exc:
             return command_status, False, f"owned-process inventory failed: {exc}"
+        owned = inventory.processes
         known = dict(owned)
+        if not inventory.complete:
+            inspected = ",".join(str(value) for value in sorted(owned)) or "none"
+            return (
+                command_status,
+                False,
+                "owned-process inventory is partial; "
+                f"inspected owned processes: {inspected}; capability gap: {inventory.gap}",
+            )
         if not owned and command_status is not None:
             return command_status, True, ""
         now = time.monotonic()
@@ -671,6 +716,7 @@ def _run_supervisor(arguments: Sequence[str]) -> int:
 
     for signal_number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(signal_number, request_abort)
+    ownership_started: tuple[int, int] | None = None
     if sys.platform.startswith("linux"):
         try:
             _linux_enable_subreaper()
@@ -678,7 +724,17 @@ def _run_supervisor(arguments: Sequence[str]) -> int:
             _write_supervisor_status(status_descriptor, "E", f"subreaper setup: {exc}")
             _write_supervisor_status(status_descriptor, "C")
             return 126
-    elif sys.platform != "darwin":
+    elif sys.platform == "darwin":
+        ownership_started = _darwin_process_identity(os.getpid())
+        if ownership_started is None:
+            _write_supervisor_status(
+                status_descriptor,
+                "E",
+                "process ownership start identity is unavailable",
+            )
+            _write_supervisor_status(status_descriptor, "C")
+            return 126
+    else:
         _write_supervisor_status(
             status_descriptor, "E", "process ownership is unsupported on this platform"
         )
@@ -738,6 +794,7 @@ def _run_supervisor(arguments: Sequence[str]) -> int:
         grace,
         command_status,
         initial_known,
+        ownership_started,
     )
     if command_status is not None:
         _write_supervisor_status(status_descriptor, "X", str(command_status))

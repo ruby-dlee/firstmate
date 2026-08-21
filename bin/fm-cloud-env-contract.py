@@ -34,9 +34,11 @@ Usage:
 
 from __future__ import annotations
 
+import io
 import pathlib
 import re
 import sys
+import tokenize
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -50,7 +52,15 @@ READERS = (
     "bin/fm-azure-pilot.sh",
     "bin/fm-azure-worker-provider.py",
     "bin/fm-worker-lifecycle.py",
+    # In the chain (bin/fm-spawn.sh invokes it as the lifecycle entrypoint) and
+    # carrying zero non-comment FM_AZURE_ reads today. Scanned anyway so it is
+    # guarded rather than merely currently harmless.
+    "bin/fm-worker-lifecycle.sh",
 )
+
+# Readers that legitimately name nothing today, so the empty-reader guard below
+# does not mistake "guarded and quiet" for "the derivation broke".
+MAY_BE_EMPTY = ("bin/fm-worker-lifecycle.sh",)
 
 # Names the provider SUPPLIES to the pilot itself, per placement, in
 # run_pilot_create's env.update. Persisting an operator's copy of these would be
@@ -61,14 +71,24 @@ SUPPLIER = "bin/fm-azure-worker-provider.py"
 
 # Reviewed exclusions: a FM_AZURE_* name a reader takes from the environment that
 # must still NEVER be written to disk, because its VALUE is a credential (or
-# names a file holding one). The allowlist exists for exactly this reason - it is
-# not a prefix glob - and this tuple is where that judgment is recorded, one
-# entry per name with the reason inline.
+# names a file holding one). One entry per name, reason inline.
 #
-# Empty today, deliberately: no name any of the READERS takes is secret-bearing.
-# The shape to expect is the validation lane's FM_AZURE_VALIDATION_*_KEY_FILE
-# pair, which names key material and is excluded here by construction because no
-# reader above reads it.
+# THIS TUPLE IS THE LEVER THAT KEEPS A NAME OUT. The scan is a regex and cannot
+# tell a read from a mention, so code_text strips comments first - but that is a
+# reduction of the hazard, not its removal: a trailing shell comment still
+# counts, and a reader that genuinely reads a credential-valued name would pull
+# it in legitimately. When the guarding test demands such a name be reachable
+# from disk, the correct answer is an entry HERE, not a new allowlist entry,
+# which is why that test names this tuple in its failure message and asserts the
+# persisted set EQUALS the contract rather than merely contains it.
+#
+# Empty today: no name any of the READERS currently takes is secret-bearing.
+# That is a fact about today's readers, NOT a property of the scan. The fleet
+# environment really does hold key material under this prefix -
+# FM_AZURE_VALIDATION_CREDENTIAL_KEY_FILE, FM_AZURE_VALIDATION_WORKTREE_KEY_FILE
+# and FM_AZURE_GITHUB_TOKEN_FILE (bin/fm-azure-validation.py) - and those stay
+# out only because no scanned reader names them. A comment would be enough to
+# change that, and this tuple is where the answer goes when it does.
 SECRET_BEARING_EXCLUSIONS: tuple[str, ...] = ()
 
 NAME = re.compile(r"FM_AZURE_[A-Z0-9_]+")
@@ -86,12 +106,44 @@ def read(relative: str) -> str:
         raise ContractError("reader {} is unreadable: {}".format(relative, exc))
 
 
+def code_text(relative: str, text: str) -> str:
+    """The reader's source with its COMMENTS removed.
+
+    The scan is a regex over source text and cannot tell a read from a mention,
+    so without this a bare `# see FM_AZURE_CLIENT_SECRET` inside a reader would
+    pull that name into the contract and the guarding test would then demand it
+    be reachable from disk. Steering a developer toward persisting a credential
+    is the worst thing this module could do, so mentions are stripped before the
+    scan rather than argued about afterwards.
+
+    Conservative on purpose, in the safe direction. Python is tokenized, which
+    is exact. Shell drops only whole-line comments, because a `#` inside a shell
+    string is not a comment and no cheap parse tells them apart; a trailing
+    `# ... FM_AZURE_X` therefore still counts as a read. That over-includes,
+    which costs a spurious contract entry that SECRET_BEARING_EXCLUSIONS can
+    answer - never under-includes, which would silently drop a real name and
+    recreate the outage this module exists to prevent.
+    """
+    if relative.endswith(".py"):
+        try:
+            return "\n".join(
+                token.string
+                for token in tokenize.generate_tokens(io.StringIO(text).readline)
+                if token.type != tokenize.COMMENT
+            )
+        except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
+            raise ContractError("reader {} could not be tokenized: {}".format(relative, exc))
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
 def reader_names() -> dict[str, set[str]]:
     """Every FM_AZURE_* name each reader takes, keyed by name."""
     by_name: dict[str, set[str]] = {}
     for relative in READERS:
-        found = set(NAME.findall(read(relative)))
-        if not found:
+        found = set(NAME.findall(code_text(relative, read(relative))))
+        if not found and relative not in MAY_BE_EMPTY:
             # A reader that suddenly matches nothing means the derivation broke,
             # not that the lane stopped needing an environment. Fail loudly: a
             # silently empty contract would make the guarding test vacuous.
@@ -103,15 +155,52 @@ def reader_names() -> dict[str, set[str]]:
     return by_name
 
 
+def run_pilot_create_body(source: str) -> str:
+    """Exactly run_pilot_create's own body, top-level def to top-level def.
+
+    The slice matters more than it looks. An unanchored
+    search from the def to the first env.update will happily run PAST the
+    end of the function and match an `env.update` in some LATER helper, and
+    then the subtraction is computed from a call the pilot never receives.
+    Moving this block into a helper is an ordinary refactor, and the failure it
+    would cause is silent and severe: run_pilot_create would supply nothing, so
+    a real deployment would run at capacityProfile=foundation with all four
+    worker bindings left "unbound", while the contract still printed a
+    plausible set and every test stayed green.
+    """
+    start = source.find("\ndef run_pilot_create(")
+    if start < 0:
+        raise ContractError(
+            "run_pilot_create is not defined in {}; the provider-supplied "
+            "subtraction cannot be derived".format(SUPPLIER)
+        )
+    start += 1
+    end = len(source)
+    for match in re.finditer(r"^(?:def |class )", source[start:], re.M):
+        offset = start + match.start()
+        if offset > start:
+            end = offset
+            break
+    return source[start:end]
+
+
 def provider_supplied() -> set[str]:
-    source = read(SUPPLIER)
-    match = re.search(r"def run_pilot_create\(.*?env\.update\((\{.*?\})\)", source, re.S)
+    # RAW source here, not code_text: the function slicer needs real line layout
+    # to find its top-level `def` boundaries, and tokenizing flattens it away.
+    # Comments are stripped from the matched dict below instead.
+    body = run_pilot_create_body(read(SUPPLIER))
+    match = re.search(r"env\.update\((\{.*?\})\)", body, re.S)
     if match is None:
         raise ContractError(
-            "run_pilot_create's env.update could not be located in {}; "
-            "the provider-supplied subtraction cannot be derived".format(SUPPLIER)
+            "run_pilot_create's own body no longer contains an env.update; the "
+            "provider-supplied subtraction cannot be derived from {}. If that "
+            "call moved into a helper, point this function at the helper - do "
+            "NOT let the search widen past the function, which is how it would "
+            "silently read some other call's names.".format(SUPPLIER)
         )
-    supplied = set(NAME.findall(match.group(1)))
+    supplied = set(NAME.findall("\n".join(
+        line for line in match.group(1).splitlines() if not line.lstrip().startswith("#")
+    )))
     if not supplied:
         raise ContractError("run_pilot_create supplies no FM_AZURE_ names; the derivation is broken")
     return supplied

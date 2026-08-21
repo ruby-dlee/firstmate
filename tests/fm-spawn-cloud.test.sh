@@ -818,8 +818,8 @@ cloud_env_contract_sentinel() {  # <name>
   esac
 }
 
-test_persisted_cloud_env_carries_the_whole_deployment_read_set() {
-  # THE CLOSED-PANE CONTRACT, asserted as an EFFECT.
+test_persisted_cloud_env_matches_the_deployment_read_set_exactly() {
+  # THE CLOSED-PANE CONTRACT, asserted as an EFFECT, in BOTH directions.
   #
   # state/<id>.cloud-env is the ONLY channel between the operator's shell and
   # the compartment/crewmate monitors, whose Herdr panes inherit nothing. What
@@ -827,31 +827,52 @@ test_persisted_cloud_env_carries_the_whole_deployment_read_set() {
   # when a lifecycle call reaches the provider and the provider shells out to
   # bin/fm-azure-pilot.sh for the deployment. This test derives that read set
   # from those readers (bin/fm-cloud-env-contract.py) and asserts the file the
-  # spawn ACTUALLY WROTE against it, value by value, through a source in a
-  # scrubbed environment - the same way a monitor reads it.
+  # spawn ACTUALLY WROTE equals it.
+  #
+  # EQUALITY, not containment, and that is the whole point of the second half.
+  # A contract name the file cannot carry is an outage - that is the defect this
+  # test exists for. But an EXTRA name the file carries and no reader wants is
+  # the opposite failure and the more dangerous one: SPAWN_CLOUD_ENV_ALLOWLIST
+  # is what keeps a secret-bearing FM_AZURE_* off disk, and a containment-only
+  # assertion would let anyone widen it to FM_AZURE_GITHUB_TOKEN_FILE or the
+  # FM_AZURE_VALIDATION_*_KEY_FILE pair and stay green. So the probe environment
+  # is deliberately WIDER than the contract - it is the contract UNION every
+  # name the allowlist currently spells - and any probe name that survives into
+  # the file without a reader asking for it fails here.
   #
   # Deliberately not a grep for any one variable: a name added to a reader and
-  # not to SPAWN_CLOUD_ENV_ALLOWLIST goes red here without this test ever
-  # having heard of it. That is the failure that had to reach a live Azure run
-  # before, because every provider in this suite is a fixture that never shells
-  # out to the pilot at all.
-  local record id out env_file required count name want got missing mismatched
+  # not to the allowlist goes red here without this test ever having heard of
+  # it. That is the failure that had to reach a live Azure run before, because
+  # every provider in this suite is a fixture that never shells out to the
+  # pilot at all.
+  local record id out env_file required declared probe count name want got
+  local missing extra persisted mismatched
   id=cloud-env-c30
   record=$(make_cloud_case env-contract "$id")
   read_cloud_case "$record"
   required=$("$ROOT/bin/fm-cloud-env-contract.py") \
     || fail "the cloud-env contract could not be derived: $required"
-  count=$(printf '%s\n' "$required" | grep -c '^FM_AZURE_')
+  count=$(printf '%s\n' "$required" | grep -c '^FM_')
   # Vacuity guard: a derivation that silently matched nothing would make every
   # assertion below pass while proving nothing at all.
   [ "$count" -ge 12 ] || fail "the cloud-env contract derived only $count names; the derivation is broken"
+  # What the allowlist SPELLS, read only to widen the probe environment. It is
+  # never asserted against directly - the assertions below are all about the
+  # file the spawn wrote - but without it an extra allowlist name would simply
+  # be unset at spawn time and leave no trace to catch.
+  declared=$(sed -n "s/^SPAWN_CLOUD_ENV_ALLOWLIST='\(.*\)'$/\1/p" "$ROOT/bin/fm-spawn.sh" | tr ' ' '\n' | grep '^FM_')
+  count=$(printf '%s\n' "$declared" | grep -c '^FM_')
+  # Second vacuity guard: a failed extraction would silently narrow the probe
+  # back to the contract and disarm the extra-name half of this test.
+  [ "$count" -ge 12 ] || fail "only $count allowlist names could be read from bin/fm-spawn.sh; the probe environment would be too narrow to detect an extra name"
+  probe=$(printf '%s\n%s\n' "$required" "$declared" | grep '^FM_' | sort -u)
   out=$(
     while IFS= read -r name; do
       [ -n "$name" ] || continue
       export "$name=$(cloud_env_contract_sentinel "$name")"
-    done <<CONTRACT
-$required
-CONTRACT
+    done <<PROBE
+$probe
+PROBE
     FM_SPAWN_CLOUD=azure \
       FM_TEST_ACTUAL_USD=2000 \
       FM_WORKER_PROVIDER_COMMAND="python3 $CASE_DIR/provider.py" \
@@ -861,7 +882,16 @@ CONTRACT
   expect_code 0 $? "the contract cloud spawn should succeed: $out"
   env_file="$HOME_DIR/state/$id.cloud-env"
   assert_present "$env_file" "the cloud spawn persisted no environment for the closed pane"
-  missing=
+  # What the file actually carries, restricted to the probe: the spawn also
+  # persists wall/provider-command lines this contract has no opinion about.
+  persisted=$(sed -n 's/^export \([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$env_file" | sort -u \
+    | comm -12 - <(printf '%s\n' "$probe"))
+  missing=$(comm -23 <(printf '%s\n' "$required" | sort -u) <(printf '%s\n' "$persisted") | tr '\n' ' ')
+  extra=$(comm -13 <(printf '%s\n' "$required" | sort -u) <(printf '%s\n' "$persisted") | tr '\n' ' ')
+  missing=${missing% }
+  extra=${extra% }
+  [ -z "$missing" ] || fail "the persisted cloud-env cannot reach the deployment path: the closed pane never sees $missing (regenerate SPAWN_CLOUD_ENV_ALLOWLIST in bin/fm-spawn.sh with bin/fm-cloud-env-contract.py --allowlist; if a name is here only because some reader MENTIONS it and its value would be a credential, the answer is an entry in SECRET_BEARING_EXCLUSIONS in bin/fm-cloud-env-contract.py, NOT a new allowlist entry)"
+  [ -z "$extra" ] || fail "the persisted cloud-env writes names no reader on the deployment path asks for: $extra (SPAWN_CLOUD_ENV_ALLOWLIST is what keeps a secret-bearing FM_AZURE_* off disk; drop them, or add the reader that needs them, or record the judgment in SECRET_BEARING_EXCLUSIONS in bin/fm-cloud-env-contract.py)"
   mismatched=
   while IFS= read -r name; do
     [ -n "$name" ] || continue
@@ -876,17 +906,12 @@ CONTRACT
     got=$(env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C}" \
       bash -c '. "$1" >/dev/null 2>&1 || true; value=$2; printf "%s" "${!value-}"' \
       _ "$env_file" "$name")
-    if [ -z "$got" ]; then
-      missing="$missing $name"
-    elif [ "$got" != "$want" ]; then
-      mismatched="$mismatched $name"
-    fi
+    [ "$got" = "$want" ] || mismatched="$mismatched $name"
   done <<CONTRACT
 $required
 CONTRACT
-  [ -z "$missing" ] || fail "the persisted cloud-env cannot reach the deployment path: the closed pane never sees$missing (add them to SPAWN_CLOUD_ENV_ALLOWLIST in bin/fm-spawn.sh; regenerate with bin/fm-cloud-env-contract.py --allowlist)"
   [ -z "$mismatched" ] || fail "the persisted cloud-env does not round-trip its value for$mismatched"
-  pass "the persisted cloud-env carries every name the cloud deployment path reads, value-exact through a closed environment"
+  pass "the persisted cloud-env equals the deployment read set, value-exact through a closed environment, with no name the readers never asked for"
 }
 
 test_cloud_monitor_launch_carries_fm_home() {
@@ -1604,7 +1629,7 @@ test_monitor_lands_despite_a_collection_error
 test_monitor_keeps_the_outcome_when_the_worktree_moved
 test_cloud_spawn_stays_durably_queued_without_admission
 test_cloud_monitor_launch_carries_fm_home
-test_persisted_cloud_env_carries_the_whole_deployment_read_set
+test_persisted_cloud_env_matches_the_deployment_read_set_exactly
 test_respawn_sweeps_stale_cloud_artifacts
 test_queued_spawn_converges_through_the_monitor
 test_monitor_stands_down_when_dispatch_already_claimed

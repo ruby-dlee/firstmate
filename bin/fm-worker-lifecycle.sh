@@ -62,21 +62,20 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # exactly one home. Guessing from the task id would be worse than the leak,
 # because ids are home-scoped and the same id can be live in two homes at once,
 # so the answer comes from the CONTROLLER, which authorized that exact path for
-# that exact task generation under its own lock and echoes it back on the
-# FM-TASK-HOME line beside the receipt. Absent (every ordinary task), the
-# controller's own state directory is the answer, exactly as before.
+# that exact task generation under its own lock and writes it to the file named
+# by --task-home-out. Absent (every ordinary task), the controller's own state
+# directory is the answer, exactly as before.
 #
-# awk with a rest-of-line reconstruction, not `print $3`: a home path may
-# contain spaces, and a truncated path is a removal aimed somewhere else.
-fm_worker_receipt_state_dir() {  # <command output> <receipt task> <controller state>
-  local output=$1 receipt=$2 fallback=$3 line parent task_home canonical
-  line=$(printf '%s\n' "$output" | awk -v task="$receipt" \
-    '$1 == "FM-TASK-HOME" && $2 == task { print; exit }')
-  [ -n "$line" ] || { printf '%s\n' "$fallback"; return 0; }
-  parent=$(printf '%s\n' "$line" | awk '{ print $3 }')
-  # Rest of line, not `print $4`: a home path may contain spaces, and a
-  # truncated path is a removal aimed somewhere else.
-  task_home=$(printf '%s\n' "$line" | sed -e 's/^[^ ]* [^ ]* [^ ]* //')
+# A DEDICATED FILE, never a line in the command's stdout. On a shared stream
+# the value's safety rested on two unrelated invariants holding forever: that
+# stderr is never folded in, and that no id can contain a space or newline.
+# Either relaxing would let some other line decide where a removal is aimed.
+# The file is two lines exactly - parent, then home - so there is no parser.
+fm_worker_receipt_state_dir() {  # <task home file> <controller state>
+  local file=$1 fallback=$2 parent task_home canonical
+  [ -f "$file" ] && [ ! -L "$file" ] || { printf '%s\n' "$fallback"; return 0; }
+  IFS= read -r parent < "$file" || parent=
+  task_home=$(sed -n '2p' "$file")
   [ -n "$parent" ] || { printf '%s\n' "$fallback"; return 0; }
   case "$task_home" in
     /*/../*|*/..|*/../*|'') printf '%s\n' "$fallback"; return 0 ;;
@@ -100,6 +99,29 @@ fm_worker_receipt_state_dir() {  # <command output> <receipt task> <controller s
   printf '%s\n' "$task_home/state"
 }
 
+# Did this task's staged credential survive the removal? True (0) when it did.
+#
+# Deliberately NOT scoped to the directory the removal resolved. When
+# resolution falls back wrongly - which is the entire failure this change
+# exists to make impossible - that directory never held a credential, so
+# inspecting it passes and the command reports success while the plaintext file
+# sits in the compartment home. A check whose subject is derived from the thing
+# it audits cannot fail when that thing is wrong.
+#
+# The subjects are therefore fixed independently of the resolution: the home
+# the CONTROLLER named for this task, read raw and only ever stat'ed, plus the
+# controller's own state directory, which is where an ordinary task's
+# credential lives.
+fm_worker_receipt_credential_remains() {  # <task home file> <task id> <controller state>
+  local file=$1 id=$2 fallback=$3 named
+  [ ! -e "$fallback/$id.cloud-account/auth.json" ] || return 0
+  named=$(sed -n '2p' "$file" 2>/dev/null) || named=
+  case "$named" in
+    /*) [ ! -e "$named/state/$id.cloud-account/auth.json" ] || return 0 ;;
+  esac
+  return 1
+}
+
 case "${1:-}" in
   request|release|resume|steer|execute|authority-receipt|capacity-reserve|capacity-reserve-shape|capacity-release|abandon-claim|message-put|message-collect|compartment-chain-tip)
     fm_refuse_if_gate_agent
@@ -120,7 +142,9 @@ case "${1:-}" in
     # and an argv scan misses the --task=<value> form, silently leaving the
     # credential behind on a real withdrawal. The receipt names the exact entry
     # that was actually deleted, so cleanup cannot outrun the deletion.
-    withdraw_output=$(python3 "$SCRIPT_DIR/fm-worker-lifecycle.py" "$@")
+    task_home_file=$(mktemp "${TMPDIR:-/tmp}/fm-task-home.XXXXXX") || exit 1
+    withdraw_output=$(python3 "$SCRIPT_DIR/fm-worker-lifecycle.py" "$@" \
+      --task-home-out "$task_home_file")
     printf '%s\n' "$withdraw_output"
     withdraw_receipt=$(printf '%s\n' "$withdraw_output" | awk '$1 == "FM-WITHDREW" { print $2; exit }')
     if [ -n "$withdraw_receipt" ]; then
@@ -130,13 +154,15 @@ case "${1:-}" in
       state_root="${FM_STATE_OVERRIDE:-${FM_HOME:?FM_HOME is required}/state}"
       # Where the credential actually is, which is not the controller's home
       # for a compartment child.
-      staged_root=$(fm_worker_receipt_state_dir "$withdraw_output" "$withdraw_receipt" "$state_root")
+      staged_root=$(fm_worker_receipt_state_dir "$task_home_file" "$state_root")
       fm_cloud_state_remove "$staged_root" "$withdraw_receipt"
-      if [ -e "$staged_root/$withdraw_receipt.cloud-account/auth.json" ]; then
+      if fm_worker_receipt_credential_remains "$task_home_file" "$withdraw_receipt" "$state_root"; then
         echo "ELASTIC WORKER REFUSED: withdrew $withdraw_receipt but its staged provider credential remains" >&2
+        rm -f "$task_home_file"
         exit 4
       fi
     fi
+    rm -f "$task_home_file"
     exit 0
     ;;
   surrender)
@@ -148,7 +174,9 @@ case "${1:-}" in
     # cloud-side copies go later, through reconcile's fenced reset; the local
     # staging is owned here, keyed off the FM-SURRENDERED receipt for exactly
     # the reasons the withdraw lane documents above.
-    surrender_output=$(python3 "$SCRIPT_DIR/fm-worker-lifecycle.py" "$@")
+    task_home_file=$(mktemp "${TMPDIR:-/tmp}/fm-task-home.XXXXXX") || exit 1
+    surrender_output=$(python3 "$SCRIPT_DIR/fm-worker-lifecycle.py" "$@" \
+      --task-home-out "$task_home_file")
     printf '%s\n' "$surrender_output"
     surrender_receipt=$(printf '%s\n' "$surrender_output" | awk '$1 == "FM-SURRENDERED" { print $2; exit }')
     if [ -n "$surrender_receipt" ]; then
@@ -156,13 +184,15 @@ case "${1:-}" in
       # Same source as the withdraw lane above, for the same reason: the
       # surrendered task's credential lives in ITS task home, which is the
       # secondmate's for a compartment child.
-      staged_root=$(fm_worker_receipt_state_dir "$surrender_output" "$surrender_receipt" "$state_root")
+      staged_root=$(fm_worker_receipt_state_dir "$task_home_file" "$state_root")
       fm_cloud_state_remove "$staged_root" "$surrender_receipt"
-      if [ -e "$staged_root/$surrender_receipt.cloud-account/auth.json" ]; then
+      if fm_worker_receipt_credential_remains "$task_home_file" "$surrender_receipt" "$state_root"; then
         echo "ELASTIC WORKER REFUSED: surrendered $surrender_receipt but its staged provider credential remains" >&2
+        rm -f "$task_home_file"
         exit 4
       fi
     fi
+    rm -f "$task_home_file"
     exit 0
     ;;
   reconcile)

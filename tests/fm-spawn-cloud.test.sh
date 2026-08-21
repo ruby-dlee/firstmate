@@ -1285,12 +1285,16 @@ test_task_home_refusals_are_exact() {
   pass "every unsafe task home refuses before the spawn writes anything"
 }
 
-run_child_lifecycle() {  # <case> <primary> <lifecycle args...>
+run_child_lifecycle() {  # <case> <fakebin> <primary> <lifecycle args...>
   # The controller document is the PRIMARY's, so every lifecycle command for a
   # compartment child runs with FM_HOME on the primary. That is exactly the
   # condition under which a primary-resolved remover misses the credential.
-  local case_dir=$1 primary=$2
-  shift 2
+  local case_dir=$1 fakebin=$2 primary=$3
+  shift 3
+  # The fakebin goes first on PATH like every other helper here. Nothing in
+  # this lane shells a stubbed tool today; the moment one does, a helper that
+  # omitted this would reach the real one.
+  PATH="$fakebin:$PATH" \
   FM_HOME="$primary" \
     FM_AZURE_SUBSCRIPTION_ID="$SUB" \
     FM_AZURE_DEPLOYMENT_GENERATION=dep-one \
@@ -1466,7 +1470,7 @@ test_compartment_child_withdraw_removes_the_staged_credential() {
     "the child's credential was staged in the primary home instead of the task home"
   generation=$(child_queue_generation "$PRIMARY_DIR/state/azure-workers/controller.json" "$id")
   [ -n "$generation" ] || fail "the queued child has no controller generation to withdraw"
-  out=$(run_child_lifecycle "$CASE_DIR" "$PRIMARY_DIR" withdraw \
+  out=$(run_child_lifecycle "$CASE_DIR" "$FAKEBIN_DIR" "$PRIMARY_DIR" withdraw \
     --task "$id" --task-generation "$generation" \
     --confirm-withdraw --confirm-subscription "$SUB")
   status=$?

@@ -2647,6 +2647,9 @@ def parser():
     withdraw_parser.add_argument("--task-generation", required=True)
     withdraw_parser.add_argument("--confirm-withdraw", action="store_true")
     withdraw_parser.add_argument("--confirm-subscription", required=True)
+    withdraw_parser.add_argument(
+        "--task-home-out", default=None,
+        help="write the authorized task home for this removal to this file; the\n             wrapper reads it to remove the task's cloud state from the home it\n             was staged in rather than from the controller's own")
 
     surrender_parser = sub.add_parser(
         "surrender",
@@ -2657,6 +2660,9 @@ def parser():
     surrender_parser.add_argument("--reason", required=True)
     surrender_parser.add_argument("--output", required=True)
     surrender_parser.add_argument("--confirm-surrender", action="store_true")
+    surrender_parser.add_argument(
+        "--task-home-out", default=None,
+        help="write the authorized task home for this removal to this file; the\n             wrapper reads it to remove the task's cloud state from the home it\n             was staged in rather than from the controller's own")
     surrender_parser.add_argument(
         "--confirm-discard-unlanded", action="store_true",
         help="acknowledge that recorded execute outcomes never proven landed are discarded",
@@ -3889,12 +3895,12 @@ def command_withdraw(env, args):
     # the exit code let `withdraw --task <id> --help` destroy a live task's
     # staged credential, payload and returned result.
     print("FM-WITHDREW {} {}".format(args.task, args.task_generation))
-    print_task_home_receipt(args.task, withdrawn)
+    write_task_home_receipt(getattr(args, "task_home_out", None), withdrawn)
     print("withdrew queued request {}".format(key))
 
 
-def print_task_home_receipt(task, item, worker=None):
-    """Echo the authorized task home alongside a removal receipt.
+def write_task_home_receipt(path, item, worker=None):
+    """Record the authorized task home for a removal, on its own channel.
 
     A compartment child's cloud state, including its plaintext provider
     credential, is staged in the SECONDMATE's home, while withdraw and
@@ -3902,17 +3908,22 @@ def print_task_home_receipt(task, item, worker=None):
     controller document has exactly one home. The wrapper therefore cannot know
     where to remove from, and must not guess from the task id: ids are
     home-scoped, so the same id can be live in two homes at once. The
-    controller does know - it authorized this exact path for this exact task
-    generation under its own lock - so it says so here, and the wrapper removes
-    from exactly that home.
+    controller does know, having authorized this exact path for this exact task
+    generation under its own lock.
+
+    A DEDICATED FILE, not a line in stdout. Carrying it on the command's own
+    output made the value depend on two unrelated invariants holding forever:
+    that the wrapper never captures stderr into the same stream, and that no id
+    can contain a space or a newline. Either one relaxing would let another
+    line decide where a removal is aimed. A file has one writer and one reader.
 
     The QUEUE ITEM is the source, never the worker record: both carry
     task_home, but only the item carries parent_task, and the parent is what
     lets the wrapper hold the home to the same marker-content check the spawn
-    held FM_SPAWN_TASK_HOME to. Sourcing the worker instead emitted nothing at
-    all for a real compartment child, and the surrender lane fell back to the
-    controller's own home and left the credential behind.
+    held FM_SPAWN_TASK_HOME to.
     """
+    if not path:
+        return
     item = item or {}
     task_home = item.get("task_home")
     parent = item.get("parent_task")
@@ -3920,13 +3931,17 @@ def print_task_home_receipt(task, item, worker=None):
             and isinstance(parent, str) and parent):
         return
     # A worker record that disagrees with its own queue item means the two
-    # halves of one admission diverged. Say nothing rather than pick a side:
+    # halves of one admission diverged. Write nothing rather than pick a side:
     # the fallback leaves a credential to be found, while following the wrong
     # half would remove state in a home this task does not live in.
     held = (worker or {}).get("task_home")
     if held is not None and held != task_home:
         return
-    print("FM-TASK-HOME {} {} {}".format(task, parent, task_home))
+    # The file is two lines exactly, so the reader needs no parser. A value
+    # that cannot survive that shape is not written at all.
+    if "\n" in parent or "\n" in task_home or "\r" in parent or "\r" in task_home:
+        return
+    Path(path).write_text("{}\n{}\n".format(parent, task_home), encoding="utf-8")
 
 
 def ordinary_authority_attempt(env, args, worker):
@@ -4023,7 +4038,8 @@ def command_surrender(env, args):
                 write_surrender_output(args.output, existing)
                 print("surrender proof already recorded with exact identity")
                 print("FM-SURRENDERED {} {}".format(args.task, args.task_generation))
-                print_task_home_receipt(args.task, item, worker)
+                write_task_home_receipt(
+                    getattr(args, "task_home_out", None), item, worker)
                 return
             raise LifecycleError("worker already has an ordinary release proof; reconcile releases it")
         if item.get("status") != "assigned":
@@ -4138,7 +4154,7 @@ def command_surrender(env, args):
         save_state(env, state)
     write_surrender_output(args.output, proof)
     print("FM-SURRENDERED {} {}".format(args.task, args.task_generation))
-    print_task_home_receipt(args.task, item, worker)
+    write_task_home_receipt(getattr(args, "task_home_out", None), item, worker)
     print("surrendered release recorded; reconcile now owns deallocation, compute deletion, and reset")
 
 

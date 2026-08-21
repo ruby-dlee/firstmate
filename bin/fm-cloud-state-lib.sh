@@ -61,9 +61,12 @@ fm_cloud_state_result_paths() {  # <state_dir> <task_id>
     "$1/$2.worker-execute.log" "$1/$2.worker-reconcile.json"
 }
 
-# The leased local worktree pointer. Owned by the SPAWN lanes only: teardown
-# has its own worktree return path and removes this name with the rest of the
-# task's metadata, so the task-end remover deliberately leaves it alone.
+# The leased local worktree pointer. It used to be excluded from the task-end
+# set on the grounds that teardown removed it with the rest of the task's
+# metadata; teardown never mentions the name at all, so it was created by the
+# spawn lane and removed by no task-end lane - the exact class of leak this
+# owner exists to close, asserted otherwise in a comment. It is in the one set
+# now, so every remover covers it.
 fm_cloud_state_lease_paths() {  # <state_dir> <task_id>
   printf '%s\n' "$1/$2.cloud-worktree"
 }
@@ -88,6 +91,7 @@ EOF
   done <<EOF
 $(fm_cloud_state_dispatch_paths "$state" "$id")
 $(fm_cloud_state_result_paths "$state" "$id")
+$(fm_cloud_state_lease_paths "$state" "$id")
 EOF
   # Callers run under `set -e` and finish removing task metadata AFTER this.
   # Aborting there would leave a half-torn-down task AND the credential, so a
@@ -99,22 +103,15 @@ EOF
   return 0
 }
 
-# Remove one task GENERATION's cloud state, for the two spawn-side lanes: the
-# re-spawn sweep (a new generation must inherit no part of the previous one)
-# and the rollback of a spawn whose worker request was refused after staging.
-# Same set plus the lease pointer, which those lanes own.
+# The spawn lanes' door onto the same set: the re-spawn sweep (a new generation
+# must inherit no part of the previous one) and the rollback of a spawn whose
+# worker request was refused after staging. It removes exactly what the
+# task-end remover removes, and is a distinct name only so those call sites say
+# which lane they are.
 #
-# The outcome directory is deliberately NOT here: it is not transport, it can
-# hold the only local copy of a crewmate's returned commits, and its callers
-# preserve it under a superseded name instead.
+# The outcome directory is deliberately absent from every group: it is not
+# transport, it can hold the only local copy of a crewmate's returned commits,
+# and its callers preserve it under a superseded name instead.
 fm_cloud_state_remove_generation() {  # <state_dir> <task_id>
-  local state=${1:?cloud state directory is required} id=${2:?task id is required}
-  local path
-  fm_cloud_state_remove "$state" "$id"
-  while IFS= read -r path; do
-    rm -f "$path" || true
-  done <<EOF
-$(fm_cloud_state_lease_paths "$state" "$id")
-EOF
-  return 0
+  fm_cloud_state_remove "${1:?cloud state directory is required}" "${2:?task id is required}"
 }

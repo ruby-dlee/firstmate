@@ -134,6 +134,7 @@ seed_compartment_child_staging() {  # <compartment home> <task id>
   printf '{}\n' > "$home/state/$id.cloud-account/settings.json"
   printf 'bundle\n' > "$home/state/$id.cloud-payload/repo.bundle"
   printf 'entry\n' > "$home/state/$id.cloud-entrypoint"
+  printf 'path\n' > "$home/state/$id.cloud-worktree"
   printf 'request\n' > "$home/state/$id.worker-request.out"
   printf '{}\n' > "$home/state/$id.worker-result.json"
 }
@@ -158,6 +159,8 @@ run_compartment_child_credential_is_removed_from_its_task_home() {
   assert_absent "$home/state/$id.cloud-account" "the account staging directory survived"
   assert_absent "$home/state/$id.cloud-payload" "the payload staging directory survived"
   assert_absent "$home/state/$id.cloud-entrypoint" "the persisted entrypoint survived"
+  assert_absent "$home/state/$id.cloud-worktree" \
+    "the leased worktree pointer, claimed to be teardown's, outlived the task"
   assert_absent "$home/state/$id.worker-request.out" \
     "the request report, added to the file set by #280, outlived the task"
   assert_absent "$home/state/$id.worker-result.json" "the worker result survived"
@@ -201,7 +204,7 @@ run_a_removal_never_reaches_a_same_id_task_in_another_home() {
   pass "a removal never reaches a same-id task living in another home"
 }
 
-run_the_generation_sweep_removes_the_task_end_set_plus_the_lease() {
+run_the_generation_sweep_removes_the_whole_set_and_spares_the_outcome() {
   # The re-spawn sweep and the rollback share one lane. They must remove
   # everything the task-end remover does (or a new generation inherits it) plus
   # the leased-worktree pointer they own, and must never touch the outcome
@@ -235,74 +238,126 @@ run_the_generation_sweep_removes_the_task_end_set_plus_the_lease() {
   assert_absent "$state/$id.worker-execute.log" "the sweep left the previous generation's log"
   assert_present "$state/$id.cloud-outcome/outcome.bundle" \
     "the sweep destroyed an unlanded outcome bundle"
-  pass "the generation sweep removes the task-end set plus the lease and spares the outcome"
+  pass "the generation sweep removes the whole task-end set and spares the outcome"
 }
 
 run_the_receipt_reader_enforces_the_stagers_own_rules() {
-  # The one place a remover is TOLD a home rather than handed one: the
-  # FM-TASK-HOME line withdraw and surrender echo beside their receipt. The
-  # spawn resolved FM_SPAWN_TASK_HOME with `cd -P && pwd -P` and required the
-  # home's marker to name the parent compartment, so the reader must hold the
-  # value to the same rules. Anything else falls back to the controller's own
-  # state directory, which leaves a credential behind rather than deleting
-  # somewhere it does not own.
-  local tmp home real fallback answer
+  # The one place a remover is TOLD a home rather than handed one: the file the
+  # controller writes for --task-home-out. The spawn resolved FM_SPAWN_TASK_HOME
+  # with `cd -P && pwd -P` and required the home's marker to name the parent
+  # compartment, so the reader must hold the value to the same rules. Anything
+  # else falls back to the controller's own state directory, which leaves a
+  # credential to be found rather than deleting somewhere it does not own.
+  local tmp home fallback answer channel
   fm_test_tmproot_into tmp fm-cloud-state-receipt
   home="$tmp/compartment"
   fallback="$tmp/primary/state"
+  channel="$tmp/task-home"
   mkdir -p "$home/state" "$fallback"
   printf 'smc-1\n' > "$home/.fm-secondmate-home"
-  # shellcheck source=bin/fm-worker-lifecycle.sh
-  receipt_dir() {  # <line>
-    ( set +u
-      fm_worker_receipt_state_dir() { :; }
-      eval "$(sed -n '/^fm_worker_receipt_state_dir() {/,/^}/p' "$ROOT/bin/fm-worker-lifecycle.sh")"
-      fm_worker_receipt_state_dir "$1" child-1 "$fallback" )
+  wrapper_fn() {  # emit the wrapper's own function definitions
+    sed -n '/^fm_worker_receipt_state_dir() {/,/^}/p;/^fm_worker_receipt_credential_remains() {/,/^}/p' \
+      "$ROOT/bin/fm-worker-lifecycle.sh"
+  }
+  receipt_dir() {  # <parent> <home>
+    printf '%s\n%s\n' "$1" "$2" > "$channel"
+    ( eval "$(wrapper_fn)"; fm_worker_receipt_state_dir "$channel" "$fallback" )
   }
 
-  answer=$(receipt_dir "FM-TASK-HOME child-1 smc-1 $home")
+  answer=$(receipt_dir smc-1 "$home")
   [ "$answer" = "$home/state" ] || fail "an authorized home was not followed: $answer"
 
   # 1. A symlinked DIRECTORY pointing at a seeded home.
-  real="$tmp/link-to-home"
-  ln -s "$home" "$real"
-  answer=$(receipt_dir "FM-TASK-HOME child-1 smc-1 $real")
+  ln -s "$home" "$tmp/link-to-home"
+  answer=$(receipt_dir smc-1 "$tmp/link-to-home")
   [ "$answer" = "$fallback" ] || fail "a symlinked home directory was followed: $answer"
 
   # 2. A seeded home reached through a symlinked PATH COMPONENT.
   mkdir -p "$tmp/real-parent/inner/state"
   printf 'smc-1\n' > "$tmp/real-parent/inner/.fm-secondmate-home"
   ln -s "$tmp/real-parent" "$tmp/link-parent"
-  answer=$(receipt_dir "FM-TASK-HOME child-1 smc-1 $tmp/link-parent/inner")
+  answer=$(receipt_dir smc-1 "$tmp/link-parent/inner")
   [ "$answer" = "$fallback" ] || fail "a symlinked path component was followed: $answer"
 
   # 3. A real, marked home whose marker names a DIFFERENT secondmate.
   mkdir -p "$tmp/other/state"
   printf 'smc-other\n' > "$tmp/other/.fm-secondmate-home"
-  answer=$(receipt_dir "FM-TASK-HOME child-1 smc-1 $tmp/other")
+  answer=$(receipt_dir smc-1 "$tmp/other")
   [ "$answer" = "$fallback" ] || fail "a home marked for another secondmate was followed: $answer"
 
-  # And the shapes that were already refused stay refused.
-  answer=$(receipt_dir "FM-TASK-HOME child-1 smc-1 compartment")
+  # Shapes that were already refused stay refused.
+  answer=$(receipt_dir smc-1 compartment)
   [ "$answer" = "$fallback" ] || fail "a relative home was followed: $answer"
-  answer=$(receipt_dir "FM-TASK-HOME child-1 smc-1 $home/../compartment")
+  answer=$(receipt_dir smc-1 "$home/../compartment")
   [ "$answer" = "$fallback" ] || fail "a traversal home was followed: $answer"
-  answer=$(receipt_dir "FM-TASK-HOME child-1 smc-1 $tmp/absent")
+  answer=$(receipt_dir smc-1 "$tmp/absent")
   [ "$answer" = "$fallback" ] || fail "a missing home was followed: $answer"
-  answer=$(receipt_dir "FM-WITHDREW child-1 gen-1")
-  [ "$answer" = "$fallback" ] || fail "a receipt with no task home was not the fallback: $answer"
-  answer=$(receipt_dir "FM-TASK-HOME other-task smc-1 $home")
-  [ "$answer" = "$fallback" ] || fail "a line naming another task was followed: $answer"
+  answer=$(receipt_dir '' "$home")
+  [ "$answer" = "$fallback" ] || fail "a channel with no parent was followed: $answer"
+  : > "$channel"
+  answer=$( eval "$(wrapper_fn)"; fm_worker_receipt_state_dir "$channel" "$fallback" )
+  [ "$answer" = "$fallback" ] || fail "an empty channel was followed: $answer"
+  rm -f "$channel"
+  answer=$( eval "$(wrapper_fn)"; fm_worker_receipt_state_dir "$channel" "$fallback" )
+  [ "$answer" = "$fallback" ] || fail "an absent channel was followed: $answer"
+  ln -s "$tmp/elsewhere" "$channel"
+  answer=$( eval "$(wrapper_fn)"; fm_worker_receipt_state_dir "$channel" "$fallback" )
+  [ "$answer" = "$fallback" ] || fail "a symlinked channel was followed: $answer"
+  rm -f "$channel"
   pass "the receipt reader follows only a canonical home its marker names the parent of"
+}
+
+run_the_removal_audit_does_not_derive_its_subject_from_the_resolution() {
+  # THE SAFETY NET, and the reason F1 was silent in production rather than
+  # loud. The old check inspected the directory the removal had just resolved,
+  # so when resolution fell back wrongly it inspected the primary, found
+  # nothing (nothing was ever staged there), and the command exited 0
+  # announcing success while the plaintext credential sat in the compartment
+  # home. The audit's subjects must be fixed independently of the resolution.
+  local tmp home fallback channel id
+  fm_test_tmproot_into tmp fm-cloud-state-audit
+  home="$tmp/compartment"
+  fallback="$tmp/primary/state"
+  channel="$tmp/task-home"
+  id=child-9
+  mkdir -p "$home/state/$id.cloud-account" "$fallback"
+  printf 'smc-1\n' > "$home/.fm-secondmate-home"
+  printf '{"refresh":"secret"}\n' > "$home/state/$id.cloud-account/auth.json"
+  printf 'smc-1\n%s\n' "$home" > "$channel"
+  audit() {
+    ( eval "$(sed -n '/^fm_worker_receipt_credential_remains() {/,/^}/p' \
+        "$ROOT/bin/fm-worker-lifecycle.sh")"
+      fm_worker_receipt_credential_remains "$channel" "$id" "$fallback" && echo REMAINS || echo GONE )
+  }
+
+  # A credential surviving in the home the CONTROLLER named must be seen, even
+  # though the primary - the directory a wrongly fallen-back removal would have
+  # touched - is empty.
+  [ "$(audit)" = REMAINS ] \
+    || fail "the audit missed a credential surviving in the task home the controller named"
+  rm -f "$home/state/$id.cloud-account/auth.json"
+  [ "$(audit)" = GONE ] || fail "the audit reported a removed credential as remaining"
+
+  # And an ordinary task, whose credential lives in the controller's own home.
+  mkdir -p "$fallback/$id.cloud-account"
+  printf '{"refresh":"secret"}\n' > "$fallback/$id.cloud-account/auth.json"
+  : > "$channel"
+  [ "$(audit)" = REMAINS ] || fail "the audit missed a credential in the controller's own home"
+  pass "the removal audit inspects the homes the controller named, not the one it resolved"
 }
 
 run_no_second_enumeration_of_the_cloud_file_set() {
   # THE STRUCTURAL INVARIANT behind this change. The per-task cloud file set
   # used to be spelled out in three places - the library, the re-spawn sweep,
   # and the spawn rollback - and only two of them knew about any given name.
-  # That is how a file can be created by one lane and removed by none. Every
-  # name now lives in bin/fm-cloud-state-lib.sh and nowhere else; this fails if
-  # a second speller reappears.
+  # That is how a file can be created by one lane and removed by none.
+  #
+  # SCOPE, stated rather than implied: this reads source text. It catches a
+  # removal that NAMES one of these files, in any bin/ script of any language,
+  # spelled with or without flags, through a glob, or through find -delete. It
+  # cannot catch a name assembled at runtime from concatenation or from a
+  # variable, and it is a lexical check, not a proof that no other remover
+  # exists.
   python3 - "$ROOT" <<'ENUM' || fail "a per-task cloud file name is enumerated outside its owner"
 import re
 import sys
@@ -310,58 +365,101 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 owner = root / "bin" / "fm-cloud-state-lib.sh"
-names = [
-    ".cloud-account", ".cloud-payload", ".cloud-entrypoint", ".cloud-env",
-    ".cloud-execute-dispatched", ".cloud-worktree",
-    ".worker-request.out", ".worker-result.json", ".worker-execute.log",
-    ".worker-reconcile.json",
+# Stems, not full names: a glob like "$STATE/$ID".cloud-acc* names the file
+# without spelling it, and the point is the file, not the spelling.
+stems = [
+    ".cloud-acc", ".cloud-payl", ".cloud-entry", ".cloud-env", ".cloud-exec",
+    ".cloud-worktree", ".worker-req", ".worker-res", ".worker-exec",
+    ".worker-recon",
 ]
-removal = re.compile(r"\brm\s+-[A-Za-z]*[rf][A-Za-z]*\b")
+removal = re.compile(
+    r"(\brm\b"                      # rm, with or without flags
+    r"|\bunlink\b"
+    r"|-delete\b"                   # find ... -delete
+    r"|\bshutil\.rmtree\b"
+    r"|\bos\.(remove|unlink)\b"
+    r"|\.unlink\("                  # pathlib
+    r"|\bfs\.(unlink|rm)\b)"        # node
+)
 offenders = []
-for script in sorted((root / "bin").glob("*.sh")):
+for script in sorted(list((root / "bin").glob("*.sh"))
+                     + list((root / "bin").glob("*.py"))
+                     + list((root / "bin").glob("*.mjs"))):
     if script == owner:
         continue
     for number, line in enumerate(script.read_text(encoding="utf-8").splitlines(), 1):
-        if line.lstrip().startswith("#"):
+        stripped = line.lstrip()
+        if stripped.startswith("#") or stripped.startswith("//"):
             continue
-        for match in removal.finditer(line):
-            # Only what the removal is actually AIMED at. Matching the whole
-            # line flags an atomic write whose failure arm removes its own temp
-            # file on a line that merely names the destination.
-            arguments = line[match.end():]
-            if any(name in arguments for name in names):
-                offenders.append("{}:{}: {}".format(script.name, number, line.strip()))
-                break
+        match = removal.search(line)
+        if match is None:
+            continue
+        # Only what the removal is actually AIMED at. Matching the whole line
+        # flags an atomic write whose failure arm removes its own temp file on
+        # a line that merely names the destination. `find ... -delete` is the
+        # exception: its subject comes BEFORE the verb, so the whole line is
+        # the argument scope there.
+        if match.group(0).startswith("-delete"):
+            arguments = line
+        else:
+            arguments = line[match.start():]
+        if any(stem in arguments for stem in stems):
+            offenders.append("{}:{}: {}".format(script.name, number, line.strip()))
 assert not offenders, ("these remove a per-task cloud file outside bin/fm-cloud-state-lib.sh", offenders)
 ENUM
-  pass "the per-task cloud file set is enumerated in exactly one place"
+  pass "no bin/ script outside the owner names a per-task cloud file in a removal"
 }
 
-run_the_secondmate_child_reaping_loop_removes_cloud_state() {
+run_the_secondmate_child_reaping_loop_calls_the_owner() {
   # Teardown's reaping loop is the one teardown that ends a cloud-placed child
   # of a SECONDMATE home when the parent goes first, and on base it removed the
-  # child's metadata while never removing its cloud state at all. It is checked
-  # structurally rather than by execution: the loop is followed by the removal
-  # of the whole home, which would make any after-the-fact file assertion pass
-  # whether or not the call exists.
+  # child's metadata while never removing its cloud state at all.
+  #
+  # HONEST SCOPE: this is a source check, not an execution proof. It does not
+  # run teardown, and it cannot prove the call is reached. What it does prove is
+  # that the call exists, at the loop's own nesting level rather than inside a
+  # condition, before the metadata removal that ends the child, and that the
+  # script does not shadow the owner with a local no-op definition. Those are
+  # the three ways a text-and-position check was shown to be fooled while the
+  # behavior was broken; a run-time seam here would need teardown driven to a
+  # state where a home's children are reaped and the home then SURVIVES, which
+  # no current teardown path reaches.
   python3 - "$ROOT/bin/fm-teardown.sh" <<'REAP' || fail "the child reaping loop no longer removes cloud state"
 import re
 import sys
 
-lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+text = open(sys.argv[1], encoding="utf-8").read()
+lines = text.splitlines()
+
+# Nobody may redefine the owner anywhere in the script: a local
+# `fm_cloud_state_remove() { :; }` keeps every call site looking correct.
+shadow = re.compile(r"^\s*fm_cloud_state_remove\s*\(\s*\)\s*\{")
+assert not [i for i, line in enumerate(lines, 1) if shadow.match(line)], (
+    "bin/fm-teardown.sh redefines fm_cloud_state_remove, shadowing the owner")
+
 start = next(i for i, line in enumerate(lines)
              if line.startswith("cleanup_firstmate_home_children()"))
 end = next(i for i in range(start + 1, len(lines)) if lines[i] == "}")
 body = lines[start:end]
-call = re.compile(r'^\s*fm_cloud_state_remove\s+"\$sub_state"\s+"\$child_id"\s*$')
-assert any(call.match(line) for line in body), (
-    "cleanup_firstmate_home_children does not remove each child's cloud state")
-meta = next(i for i, line in enumerate(body) if "$sub_state/$child_id.meta" in line)
-removal = next(i for i, line in enumerate(body) if call.match(line))
-assert removal < meta, (
+
+call = re.compile(r'^(\s*)fm_cloud_state_remove\s+"\$sub_state"\s+"\$child_id"\s*$')
+matches = [(i, call.match(line)) for i, line in enumerate(body) if call.match(line)]
+assert matches, "cleanup_firstmate_home_children does not remove each child's cloud state"
+index, match = matches[0]
+
+# The metadata removal that ends the child is at the loop body's own level.
+meta_index, meta_line = next((i, line) for i, line in enumerate(body)
+                             if "$sub_state/$child_id.meta" in line)
+assert index < meta_index, (
     "the cloud state removal must precede the metadata removal that ends the child")
+
+# Same indentation as that removal means same nesting: wrapping the call in an
+# `if` that is never true indents it one level deeper.
+assert len(match.group(1)) == len(meta_line) - len(meta_line.lstrip()), (
+    "the cloud state removal is nested more deeply than the child's own metadata removal, "
+    "so it is guarded by a condition the metadata removal is not")
 REAP
-  pass "teardown's secondmate child reaping loop removes each child's cloud state"
+  pass "teardown's reaping loop calls the owner unguarded, ahead of the child's metadata"
 }
 
 run_cloud_credential_is_removed
@@ -370,9 +468,10 @@ run_cloud_state_survives_set_e
 run_cloud_credential_survives_a_symlinked_directory
 run_compartment_child_credential_is_removed_from_its_task_home
 run_a_removal_never_reaches_a_same_id_task_in_another_home
-run_the_generation_sweep_removes_the_task_end_set_plus_the_lease
+run_the_generation_sweep_removes_the_whole_set_and_spares_the_outcome
 run_the_receipt_reader_enforces_the_stagers_own_rules
+run_the_removal_audit_does_not_derive_its_subject_from_the_resolution
 run_no_second_enumeration_of_the_cloud_file_set
-run_the_secondmate_child_reaping_loop_removes_cloud_state
+run_the_secondmate_child_reaping_loop_calls_the_owner
 
 echo "# fm-cloud-state.test.sh: all assertions passed"

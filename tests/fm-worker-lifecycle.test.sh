@@ -983,6 +983,9 @@ if request["operation"] == "mutate":
         "type": action["type"], "slot": action["slot"], "key": key,
         "outcome_expected": bool((action.get("request") or {}).get("outcome_expected")),
         "outcome_dir": action.get("outcome_dir"),
+        # Additive: the digest-bound staged manifest the provider actually
+        # receives, so a caller can assert what a lane staged.
+        "payload_files": (action.get("request") or {}).get("payload_files"),
     })
     if key in state["seen"]:
         result = state["seen"][key]
@@ -3590,6 +3593,73 @@ state = controller_state()
 assert state["queue"]["smc-1@gen-s1"]["status"] == "assigned"
 smc_slot = str(state["queue"]["smc-1@gen-s1"]["slot"])
 assert state["workers"][smc_slot]["role"] == "secondmate"
+
+# A REAL compartment leg dispatch through command_execute: this is the path
+# that refused on the live azaccept run with "payload staging entry is not in
+# the reviewed set: fm-secondmate-session.py", because command_execute judged a
+# compartment payload against the ordinary crewmate set. The lane now comes
+# from the worker's durable role, resolved under the controller lock.
+import hashlib
+smc_assignment = state["workers"][smc_slot]["assignment_generation"]
+staging = Path(env["FM_HOME"]) / "compartment-staging"
+payload_dir = staging / "payload"
+account_dir = staging / "account"
+for directory in (payload_dir, account_dir):
+    directory.mkdir(parents=True)
+(account_dir / "auth.json").write_text("{}\n")
+COMPARTMENT_PAYLOAD = {
+    "repo.bundle": b"bundle-fixture",
+    "brief.md": b"brief\n",
+    "fm-secondmate-session.py": b"# session runner\n",
+    "fm-secondmate-spawn.pi-ext.ts": b"// spawn intent\n",
+}
+
+
+def stage_compartment(payload):
+    for stale in payload_dir.iterdir():
+        stale.unlink()
+    for name, body in payload.items():
+        (payload_dir / name).write_bytes(body)
+
+
+def compartment_execute(check=True):
+    return run(
+        "execute", "--task", "smc-1", "--task-generation", "gen-s1",
+        "--assignment-generation", smc_assignment, "--wall-seconds", "60",
+        "--payload-dir", str(payload_dir), "--account-dir", str(account_dir),
+        "--confirm-execute", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"],
+        "--", "/usr/bin/true", check=check)
+
+
+# Refusals first: each is raised before any provider claim is minted, so the
+# slot is never wedged by one.
+for missing in ("fm-secondmate-session.py", "fm-secondmate-spawn.pi-ext.ts"):
+    stage_compartment({name: body for name, body in COMPARTMENT_PAYLOAD.items()
+                       if name != missing})
+    refused = compartment_execute(check=False)
+    assert refused.returncode != 0 and "lacks required {}".format(missing) in refused.stderr, (
+        refused.stderr)
+stage_compartment(dict(COMPARTMENT_PAYLOAD, **{"id_rsa": b"key"}))
+refused = compartment_execute(check=False)
+assert refused.returncode != 0 and "not in the reviewed set: id_rsa" in refused.stderr, refused.stderr
+stage_compartment(dict(COMPARTMENT_PAYLOAD, **{
+    "fm-secondmate-spawn.pi-ext.ts": b"x" * (64 * 1024 + 1)}))
+refused = compartment_execute(check=False)
+assert refused.returncode != 0 and (
+    "exceeds its byte bound: fm-secondmate-spawn.pi-ext.ts" in refused.stderr), refused.stderr
+
+# ...and the exact live compartment payload now dispatches, with the
+# digest-bound request carrying all four staged entries.
+stage_compartment(COMPARTMENT_PAYLOAD)
+dispatched = json.loads(compartment_execute().stdout)
+assert dispatched["schema"] == "fm.worker-execution-result/v1", dispatched
+executed = [entry for entry in
+            json.loads(Path(env["FIXTURE_STATE"]).read_text())["calls"]
+            if entry["type"] == "execute"][-1]
+assert sorted(executed["payload_files"]) == sorted(COMPARTMENT_PAYLOAD), executed
+for name, body in COMPARTMENT_PAYLOAD.items():
+    assert executed["payload_files"][name] == {
+        "sha256": hashlib.sha256(body).hexdigest(), "bytes": len(body)}, executed
 
 # The compartment cap (default 2): a third compartment refuses.
 run("request", "--task", "smc-2", "--task-generation", "gen-s2",
@@ -6812,7 +6882,134 @@ PY
   pass "idle workers deallocate unattended at the threshold, are loudly listed, and still exit through the ordinary release"
 }
 
+compartment_payload_contract() {
+  # The producer (bin/fm-spawn.sh) and this validator encode the same contract.
+  # They drifted once: fm-spawn.sh staged the compartment session runner and pi
+  # extension, PAYLOAD_FILE_BOUNDS admitted neither, and every compartment leg
+  # dispatch refused with "payload staging entry is not in the reviewed set".
+  # The first block is the structural guard that makes that drift a red test
+  # instead of a booted VM that cannot work.
+  python3 - "$CONTROLLER" "$ROOT/bin/fm-spawn.sh" <<'PY' || fail "compartment payload contract failed"
+import hashlib
+import importlib.util
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("lifecycle", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+spawn = Path(sys.argv[2]).read_text(encoding="utf-8")
+
+# STRUCTURAL GUARD: every basename bin/fm-spawn.sh writes into the cloud
+# payload directory must be admitted by the compartment bounds. A staged name
+# with no bound is exactly the defect this closes.
+staged_names = set(re.findall(
+    r"\$STATE/\$ID\.cloud-payload/([A-Za-z0-9][A-Za-z0-9._-]*)", spawn))
+assert staged_names, "no payload staging destinations found in bin/fm-spawn.sh"
+unbounded = sorted(staged_names - set(module.COMPARTMENT_PAYLOAD_FILE_BOUNDS))
+assert not unbounded, (
+    "bin/fm-spawn.sh stages payload entries the reviewed set does not admit: "
+    "{}".format(unbounded))
+# The guard is only meaningful while it actually sees the compartment pair.
+for name in ("fm-secondmate-session.py", "fm-secondmate-spawn.pi-ext.ts"):
+    assert name in staged_names, (
+        "guard is vacuous: bin/fm-spawn.sh no longer stages {}".format(name))
+
+# Every admitted entry must really fit under its bound at today's size, so a
+# bound is never quietly set below the file it is meant to admit.
+for name in ("fm-secondmate-session.py", "fm-secondmate-spawn.pi-ext.ts"):
+    assert name in module.COMPARTMENT_PAYLOAD_FILE_BOUNDS, (
+        "the compartment reviewed set does not admit {}".format(name))
+    actual = (Path(sys.argv[2]).parent / name).stat().st_size
+    bound = module.COMPARTMENT_PAYLOAD_FILE_BOUNDS[name]
+    assert actual <= bound, "{} is {} bytes, over its {}-byte bound".format(
+        name, actual, bound)
+
+# LANE SPLIT: the ordinary crewmate lane is exactly as narrow as before.
+assert module.payload_contract("author") == (
+    module.PAYLOAD_FILE_BOUNDS, module.PAYLOAD_REQUIRED)
+assert set(module.PAYLOAD_FILE_BOUNDS) == {"repo.bundle", "brief.md"}
+assert module.payload_contract("secondmate") == (
+    module.COMPARTMENT_PAYLOAD_FILE_BOUNDS, module.COMPARTMENT_PAYLOAD_REQUIRED)
+
+
+def stage(names):
+    root = Path(tempfile.mkdtemp(prefix="fm-payload-contract-"))
+    for name, size in names.items():
+        (root / name).write_bytes(bytes((index % 251) for index in range(size)))
+    return root
+
+
+def manifest(role, root):
+    bounds, required = module.payload_contract(role)
+    return module.staged_directory_manifest(
+        "payload", root, bounds=bounds, required=required)
+
+
+def refusal(role, root):
+    try:
+        manifest(role, root)
+    except module.LifecycleError as exc:
+        return str(exc)
+    raise AssertionError("payload was accepted but should have been refused")
+
+
+# Sizes measured on the live azaccept compartment payload.
+LIVE = {
+    "brief.md": 4384,
+    "repo.bundle": 10042238,
+    "fm-secondmate-session.py": 45142,
+    "fm-secondmate-spawn.pi-ext.ts": 3867,
+}
+ORDINARY = {"brief.md": 4384, "repo.bundle": 10042238}
+
+# A compartment payload is admitted, and the manifest carries all four entries
+# with their exact digests and byte counts.
+compartment = manifest("secondmate", stage(LIVE))
+assert sorted(compartment) == sorted(LIVE), sorted(compartment)
+for name, size in LIVE.items():
+    body = bytes((index % 251) for index in range(size))
+    assert compartment[name] == {
+        "sha256": hashlib.sha256(body).hexdigest(), "bytes": size}, compartment[name]
+
+# The ordinary crewmate payload is unchanged: same two entries, same digests.
+ordinary = manifest("author", stage(ORDINARY))
+assert sorted(ordinary) == ["brief.md", "repo.bundle"], sorted(ordinary)
+assert all(ordinary[name] == compartment[name] for name in ORDINARY), ordinary
+
+# ...and the crewmate lane is NOT widened: a session runner staged onto an
+# ordinary worker is still refused, exactly as on the base revision.
+assert "not in the reviewed set: fm-secondmate-session.py" in refusal(
+    "author", stage(LIVE))
+
+# REQUIRED, not merely admitted: the leg argv runs the runner and passes
+# --pi-ext, so a compartment missing either file refuses at the controller
+# rather than dispatching a leg that cannot work.
+for name in ("fm-secondmate-session.py", "fm-secondmate-spawn.pi-ext.ts"):
+    partial = {key: value for key, value in LIVE.items() if key != name}
+    assert "lacks required {}".format(name) in refusal(
+        "secondmate", stage(partial))
+
+# Byte bounds still bind on the new entries.
+for name, bound in (("fm-secondmate-session.py", 256 * 1024),
+                    ("fm-secondmate-spawn.pi-ext.ts", 64 * 1024)):
+    assert module.COMPARTMENT_PAYLOAD_FILE_BOUNDS[name] == bound
+    oversize = dict(LIVE, **{name: bound + 1})
+    assert "exceeds its byte bound: {}".format(name) in refusal(
+        "secondmate", stage(oversize))
+
+# An unreviewed name is still refused in the compartment lane too: the fix
+# widened the set by exactly two names, it did not open the lane.
+assert "not in the reviewed set: id_rsa" in refusal(
+    "secondmate", stage(dict(LIVE, **{"id_rsa": 64})))
+PY
+  pass "the compartment payload lane admits exactly what fm-spawn.sh stages, requires it, and leaves the crewmate lane narrow"
+}
+
 static_contract
+compartment_payload_contract
 classification_and_admission_matrix
 azure_provider_refusal_matrix
 end_to_end_lifecycle

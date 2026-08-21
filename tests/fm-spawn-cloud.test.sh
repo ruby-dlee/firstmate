@@ -1401,11 +1401,15 @@ test_compartment_child_staging_and_removal_resolve_the_same_home() {
 }
 
 test_compartment_child_refused_request_leaves_no_credential() {
-  # The rollback lane: staging happens BEFORE the controller sees the request,
-  # so a refusal after staging must take the credential with it. The refusal
-  # here is a real controller refusal (the named parent compartment holds no
-  # assignment), reached only after the spawn has already copied the credential
-  # into the compartment home.
+  # The rollback lane: the payload and account staging happen BEFORE the
+  # controller sees the request, so a refusal after staging must take them with
+  # it, in the COMPARTMENT's home rather than the primary's. The refusal here
+  # is a real controller refusal, the named parent compartment holding no
+  # assignment. Scope, precisely: since #280 the credential itself is written
+  # after the request succeeds, by the narrowing step, so what this lane proves
+  # is the transport removal. The credential-bearing failure that comes after a
+  # SUCCESSFUL request is #280's own bind-failure path, and it exits through
+  # the same wrapper withdraw the lane above drives end to end.
   local record id parent out status
   id=child-c5
   parent=smc-rollback

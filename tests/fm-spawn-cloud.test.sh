@@ -1347,6 +1347,22 @@ assert_fixture_provider_drove_the_lane() {  # <case>
     "the fixture provider recorded no calls; this lane may have reached a real provider"
 }
 
+controller_task_state_dir() {  # <controller> <task> <fallback>
+  python3 - "$1" "$2" "$3" <<'CTRL'
+import json
+import sys
+from pathlib import Path
+
+controller, task, fallback = sys.argv[1:]
+state = json.loads(Path(controller).read_text())
+for item in state.get("queue", {}).values():
+    if item.get("task") == task:
+        home = item.get("task_home")
+        print("{}/state".format(home) if home else fallback)
+        break
+CTRL
+}
+
 test_compartment_child_staging_and_removal_resolve_the_same_home() {
   # THE STRUCTURAL INVARIANT, not a comment about it: whatever directory the
   # real spawn stages the credential into is the directory the remover
@@ -1374,11 +1390,13 @@ test_compartment_child_staging_and_removal_resolve_the_same_home() {
     break
   done
   [ -n "$staged" ] || fail "the compartment child spawn staged no provider credential anywhere"
-  # The remover's answer, from the home every lifecycle command actually runs
-  # in: the controller's.
-  resolved=$( . "$ROOT/bin/fm-cloud-state-lib.sh"; fm_cloud_state_dir "$PRIMARY_DIR/state" "$id" )
+  # The remover's answer, taken the way a lifecycle command running in the
+  # CONTROLLER's home actually takes it: from the authorized task home the
+  # controller durably recorded for this exact task generation.
+  resolved=$(controller_task_state_dir "$PRIMARY_DIR/state/azure-workers/controller.json" \
+    "$id" "$PRIMARY_DIR/state")
   [ "$resolved" = "$staged" ] || fail \
-    "the credential is staged in $staged but the remover resolves $resolved"
+    "the credential is staged in $staged but the controller resolves $resolved"
   pass "the staged cloud-account path and its remover resolve the same home"
 }
 
@@ -1406,8 +1424,10 @@ test_compartment_child_refused_request_leaves_no_credential() {
     "a refused compartment child left its account staging directory behind"
   assert_absent "$SUB_DIR/state/$id.cloud-payload" \
     "a refused compartment child left its payload staging directory behind"
-  assert_absent "$PRIMARY_DIR/state/$id.cloud-task-home" \
-    "a refused compartment child left its staging record behind"
+  assert_absent "$SUB_DIR/state/$id.cloud-entrypoint" \
+    "a refused compartment child left its persisted entrypoint behind"
+  assert_absent "$SUB_DIR/state/$id.cloud-worktree" \
+    "a refused compartment child left its leased worktree pointer behind"
   assert_absent "$SUB_DIR/state/$id.meta" "a refused compartment child left task metadata behind"
   pass "a compartment child request refused after staging takes its credential with it"
 }

@@ -3880,6 +3880,7 @@ def command_withdraw(env, args):
                         "still names; reconcile it first".format(
                             pending.get("type", "provider"), slot_key)
                     )
+        withdrawn = item
         del state["queue"][key]
         save_state(env, state)
     # A machine-readable receipt naming the exact entry that was deleted. The
@@ -3888,7 +3889,31 @@ def command_withdraw(env, args):
     # the exit code let `withdraw --task <id> --help` destroy a live task's
     # staged credential, payload and returned result.
     print("FM-WITHDREW {} {}".format(args.task, args.task_generation))
+    print_task_home_receipt(args.task, withdrawn)
     print("withdrew queued request {}".format(key))
+
+
+def print_task_home_receipt(task, source):
+    """Echo the authorized task home alongside a removal receipt.
+
+    A compartment child's cloud state, including its plaintext provider
+    credential, is staged in the SECONDMATE's home, while withdraw and
+    surrender necessarily run with FM_HOME on the primary because the
+    controller document has exactly one home. The wrapper therefore cannot know
+    where to remove from, and must not guess from the task id: ids are
+    home-scoped, so the same id can be live in two homes at once. The
+    controller does know - it authorized this exact path for this exact task
+    generation under its own lock - so it says so here, and the wrapper removes
+    from exactly that home.
+    """
+    source = source or {}
+    task_home = source.get("task_home")
+    parent = source.get("parent_task")
+    if (isinstance(task_home, str) and task_home.startswith("/")
+            and isinstance(parent, str) and parent):
+        # The parent travels with the path so the wrapper can hold the home to
+        # the same marker-content check the spawn held FM_SPAWN_TASK_HOME to.
+        print("FM-TASK-HOME {} {} {}".format(task, parent, task_home))
 
 
 def ordinary_authority_attempt(env, args, worker):
@@ -3985,6 +4010,7 @@ def command_surrender(env, args):
                 write_surrender_output(args.output, existing)
                 print("surrender proof already recorded with exact identity")
                 print("FM-SURRENDERED {} {}".format(args.task, args.task_generation))
+                print_task_home_receipt(args.task, worker)
                 return
             raise LifecycleError("worker already has an ordinary release proof; reconcile releases it")
         if item.get("status") != "assigned":
@@ -4099,6 +4125,7 @@ def command_surrender(env, args):
         save_state(env, state)
     write_surrender_output(args.output, proof)
     print("FM-SURRENDERED {} {}".format(args.task, args.task_generation))
+    print_task_home_receipt(args.task, worker)
     print("surrendered release recorded; reconcile now owns deallocation, compute deletion, and reset")
 
 

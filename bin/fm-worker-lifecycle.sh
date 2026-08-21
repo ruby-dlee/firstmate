@@ -55,6 +55,51 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 # shellcheck source=bin/fm-cloud-state-lib.sh
 . "$SCRIPT_DIR/fm-cloud-state-lib.sh"
 
+# The state directory a receipted task's cloud state was staged in.
+#
+# A compartment child lives in the SECONDMATE's home, while these commands
+# necessarily run with FM_HOME on the primary: the controller document has
+# exactly one home. Guessing from the task id would be worse than the leak,
+# because ids are home-scoped and the same id can be live in two homes at once,
+# so the answer comes from the CONTROLLER, which authorized that exact path for
+# that exact task generation under its own lock and echoes it back on the
+# FM-TASK-HOME line beside the receipt. Absent (every ordinary task), the
+# controller's own state directory is the answer, exactly as before.
+#
+# awk with a rest-of-line reconstruction, not `print $3`: a home path may
+# contain spaces, and a truncated path is a removal aimed somewhere else.
+fm_worker_receipt_state_dir() {  # <command output> <receipt task> <controller state>
+  local output=$1 receipt=$2 fallback=$3 line parent task_home canonical
+  line=$(printf '%s\n' "$output" | awk -v task="$receipt" \
+    '$1 == "FM-TASK-HOME" && $2 == task { print; exit }')
+  [ -n "$line" ] || { printf '%s\n' "$fallback"; return 0; }
+  parent=$(printf '%s\n' "$line" | awk '{ print $3 }')
+  # Rest of line, not `print $4`: a home path may contain spaces, and a
+  # truncated path is a removal aimed somewhere else.
+  task_home=$(printf '%s\n' "$line" | sed -e 's/^[^ ]* [^ ]* [^ ]* //')
+  [ -n "$parent" ] || { printf '%s\n' "$fallback"; return 0; }
+  case "$task_home" in
+    /*/../*|*/..|*/../*|'') printf '%s\n' "$fallback"; return 0 ;;
+    /*) : ;;
+    *) printf '%s\n' "$fallback"; return 0 ;;
+  esac
+  # The reader enforces exactly what the stager enforced, no more and no less.
+  # bin/fm-spawn.sh resolved FM_SPAWN_TASK_HOME with `cd -P && pwd -P` and then
+  # required the home's own marker to name the parent compartment, and the
+  # controller stores that resolved path; a value that is not its own physical
+  # path therefore did not come from an authorization. This is what makes a
+  # symlinked home, a symlinked path component, and a home whose marker names a
+  # different secondmate fall back instead of redirecting a removal.
+  canonical=$(cd -P "$task_home" 2>/dev/null && pwd -P) || canonical=
+  [ -n "$canonical" ] && [ "$canonical" = "$task_home" ] \
+    || { printf '%s\n' "$fallback"; return 0; }
+  [ -f "$task_home/.fm-secondmate-home" ] && [ ! -L "$task_home/.fm-secondmate-home" ] \
+    || { printf '%s\n' "$fallback"; return 0; }
+  [ "$(cat "$task_home/.fm-secondmate-home" 2>/dev/null || true)" = "$parent" ] \
+    || { printf '%s\n' "$fallback"; return 0; }
+  printf '%s\n' "$task_home/state"
+}
+
 case "${1:-}" in
   request|release|resume|steer|execute|authority-receipt|capacity-reserve|capacity-reserve-shape|capacity-release|abandon-claim|message-put|message-collect|compartment-chain-tip)
     fm_refuse_if_gate_agent
@@ -83,14 +128,10 @@ case "${1:-}" in
       # returns 0 so teardown can continue, but here it is the last step, so a
       # credential left on disk has to be visible to whatever ran this.
       state_root="${FM_STATE_OVERRIDE:-${FM_HOME:?FM_HOME is required}/state}"
-      # The controller's state directory is where the command ran, but NOT
-      # necessarily where the credential was staged: a compartment child's task
-      # home is the secondmate's. fm_cloud_state_dir is the same resolution
-      # fm_cloud_state_remove performs, so the check below inspects exactly the
-      # directory the removal touched. Read BEFORE the removal, which consumes
-      # the record the resolution reads.
-      staged_root=$(fm_cloud_state_dir "$state_root" "$withdraw_receipt")
-      fm_cloud_state_remove "$state_root" "$withdraw_receipt"
+      # Where the credential actually is, which is not the controller's home
+      # for a compartment child.
+      staged_root=$(fm_worker_receipt_state_dir "$withdraw_output" "$withdraw_receipt" "$state_root")
+      fm_cloud_state_remove "$staged_root" "$withdraw_receipt"
       if [ -e "$staged_root/$withdraw_receipt.cloud-account/auth.json" ]; then
         echo "ELASTIC WORKER REFUSED: withdrew $withdraw_receipt but its staged provider credential remains" >&2
         exit 4
@@ -112,11 +153,11 @@ case "${1:-}" in
     surrender_receipt=$(printf '%s\n' "$surrender_output" | awk '$1 == "FM-SURRENDERED" { print $2; exit }')
     if [ -n "$surrender_receipt" ]; then
       state_root="${FM_STATE_OVERRIDE:-${FM_HOME:?FM_HOME is required}/state}"
-      # Same resolution as the withdraw lane above, for the same reason: the
+      # Same source as the withdraw lane above, for the same reason: the
       # surrendered task's credential lives in ITS task home, which is the
       # secondmate's for a compartment child.
-      staged_root=$(fm_cloud_state_dir "$state_root" "$surrender_receipt")
-      fm_cloud_state_remove "$state_root" "$surrender_receipt"
+      staged_root=$(fm_worker_receipt_state_dir "$surrender_output" "$surrender_receipt" "$state_root")
+      fm_cloud_state_remove "$staged_root" "$surrender_receipt"
       if [ -e "$staged_root/$surrender_receipt.cloud-account/auth.json" ]; then
         echo "ELASTIC WORKER REFUSED: surrendered $surrender_receipt but its staged provider credential remains" >&2
         exit 4

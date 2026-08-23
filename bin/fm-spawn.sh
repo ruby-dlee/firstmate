@@ -667,12 +667,36 @@ resolve_cloud_account_home() {
   printf '%s\n' "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
 }
 
+validate_cloud_account_pool() {
+  python3 - "$SCRIPT_DIR/fm-pi-account-home.py" "$CLOUD_ACCOUNT_HOME/auth.json" <<'PY'
+import importlib.util
+import sys
+
+module_path, source = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("fm_pi_account_home", module_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+pool = module.read_pool(module.Path(source))
+expected = ["openai-codex"] + [f"openai-codex-{index}" for index in range(2, 7)]
+if sorted(pool) != sorted(expected):
+    module.fail("Azure Pi pool must contain exactly the gap-free profiles " + ", ".join(expected))
+faults = {name: module.entry_faults(pool[name]) for name in expected}
+broken = [f"{name}: {', '.join(items)}" for name, items in faults.items() if items]
+if broken:
+    module.fail("Azure Pi pool has unusable profile shapes: " + "; ".join(broken))
+accounts = [pool[name]["accountId"].strip() for name in expected]
+if len(set(accounts)) != len(accounts):
+    module.fail("Azure Pi pool profiles must name six distinct upstream accounts")
+PY
+}
+
 if [ "$SPAWN_CLOUD" = azure ]; then
   CLOUD_ACCOUNT_HOME=$(resolve_cloud_account_home) || exit 1
   [ -d "$CLOUD_ACCOUNT_HOME" ] || {
     echo "error: cloud placement account home '$CLOUD_ACCOUNT_HOME' is not a directory" >&2
     exit 1
   }
+  validate_cloud_account_pool || exit 1
 fi
 
 release_secondmate_home_lifecycle_locks() {
@@ -2741,7 +2765,7 @@ launch_template() {
         # revisit this if pi ever ships a question tool that can park a secondmate -
         # fm-watch.sh skips stale-pane wakes for kind=secondmate, so a parked
         # secondmate would not trip stale detection.
-        printf '%s' '__AGENT__ --approve __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ "$(cat __BRIEF__)"'
+        printf '%s' '__AGENT__ --approve --fast __MODELFLAG____EFFORTFLAG__-e __PITURNEND__ -e __PIWATCH__ "$(cat __BRIEF__)"'
       else
         # --exclude-tools is a plain denylist over built-in, extension, and custom
         # tool names (pi 0.84.0 filters it as a Set, ignoring names that are not
@@ -2749,7 +2773,7 @@ launch_template() {
         # crewmate's contract is to run autonomously and report through its status
         # file, so a tool that halts the run to ask a question nobody is watching is
         # never the right behavior here.
-        printf '%s' '__AGENT__ --approve --exclude-tools ask_question __MODELFLAG____EFFORTFLAG__-e __PIEXT__ "$(cat __BRIEF__)"'
+        printf '%s' '__AGENT__ --approve --exclude-tools ask_question --fast __MODELFLAG____EFFORTFLAG__-e __PIEXT__ "$(cat __BRIEF__)"'
       fi
       ;;
     # grok (Grok Build TUI): a positional prompt starts the supervised interactive

@@ -199,7 +199,9 @@ assert job["RunAtLoad"] is True, job
 assert job["StartInterval"] == 900, job
 arguments = job["ProgramArguments"]
 assert str(pathlib.Path(sys.argv[2]).resolve()) in arguments, arguments
-assert arguments[-3:] == ["run-once", "--all", "--scheduled"], arguments
+assert arguments[-5:-2] == ["run-once", "--all", "--scheduled"], arguments
+assert arguments[-2] == "--azure-home-config", arguments
+assert pathlib.Path(arguments[-1]).is_absolute(), arguments
 environment = job["EnvironmentVariables"]
 for name in ("PATH", "HOME", "FM_PI_BIN", "FM_PI_NODE_BIN",
              "FM_PI_REFRESH_STATE_ROOT", "FM_PI_REFRESH_ACTIVATION_NONCE",

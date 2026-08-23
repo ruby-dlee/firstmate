@@ -389,6 +389,47 @@ PY
   pass "the schedule is machine-global, stamps only for launchd, and reports absent, orphaned, foreign, unloaded, unproven, stale, failing and attention apart from healthy"
 }
 
+scheduled_azure_pool_contract() {
+  local work primary azure config out code
+  work=$(fm_test_tmproot fm-pi-refresh-azure-pool)
+  primary=$work/primary
+  azure=$work/azure
+  config=$work/azure-worker-account-home
+  mkdir -p "$primary" "$azure"
+  python3 - "$primary/auth.json" "$azure/auth.json" "$MARKER" <<'PY'
+import json
+import sys
+import time
+
+primary, azure, marker = sys.argv[1:]
+day = 86400 * 1000
+now = time.time() * 1000
+json.dump({
+    "openai-codex": {
+        "type": "oauth", "access": marker + ".primary.access",
+        "refresh": marker + ".primary.refresh", "accountId": "primary-account",
+        "expires": now + 9 * day,
+    }
+}, open(primary, "w"))
+json.dump({
+    "openai-codex": {
+        "type": "oauth", "access": marker + ".azure.access",
+        "refresh": "", "accountId": "azure-account", "expires": now + day,
+    }
+}, open(azure, "w"))
+PY
+  printf '%s\n' "$azure" > "$config"
+
+  code=0
+  out=$(python3 "$TOOL" run-once --source "$primary/auth.json" --all --scheduled \
+    --azure-home-config "$config" --backup-root "$work/backups" \
+    --destination-root "$work/homes" 2>&1) || code=$?
+  expect_code 1 "$code" "the scheduled run ignored an Azure pool that needs interactive login"
+  assert_contains "$out" "interactive login" "the Azure pool refusal did not reach the scheduler result"
+  assert_not_contains "$out" "$MARKER" "the two-pool scheduled refusal leaked credential material"
+  pass "the machine scheduler owns a separately configured Azure Pi pool"
+}
+
 selection_contract() {
   local work pool out code
   work=$(fm_test_tmproot fm-pi-refresh-select)
@@ -811,4 +852,5 @@ republish_contract
 pool_integrity_contract
 adapter_outcome_contract
 adapter_store_contract
+scheduled_azure_pool_contract
 scheduler_contract

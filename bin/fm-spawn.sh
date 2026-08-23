@@ -656,7 +656,7 @@ resolve_cloud_account_home() {
       echo "error: cloud placement account home '$configured' is not a real directory" >&2
       return 1
     }
-    canonical=$(CDPATH= cd -- "$configured" 2>/dev/null && pwd -P) || return 1
+    canonical=$(CDPATH='' cd -- "$configured" 2>/dev/null && pwd -P) || return 1
     [ "$canonical" = "$configured" ] || {
       echo "error: config/azure-worker-account-home must name its canonical physical directory ($canonical)" >&2
       return 1

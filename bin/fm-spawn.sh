@@ -677,16 +677,20 @@ spec = importlib.util.spec_from_file_location("fm_pi_account_home", module_path)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 pool = module.read_pool(module.Path(source))
-expected = ["openai-codex"] + [f"openai-codex-{index}" for index in range(2, 7)]
+if not pool:
+    module.fail("Azure Pi pool must contain at least one profile")
+expected = ["openai-codex"] + [
+    f"openai-codex-{index}" for index in range(2, len(pool) + 1)
+]
 if sorted(pool) != sorted(expected):
-    module.fail("Azure Pi pool must contain exactly the gap-free profiles " + ", ".join(expected))
+    module.fail("Azure Pi pool profiles must be gap-free: " + ", ".join(expected))
 faults = {name: module.entry_faults(pool[name]) for name in expected}
 broken = [f"{name}: {', '.join(items)}" for name, items in faults.items() if items]
 if broken:
     module.fail("Azure Pi pool has unusable profile shapes: " + "; ".join(broken))
 accounts = [pool[name]["accountId"].strip() for name in expected]
 if len(set(accounts)) != len(accounts):
-    module.fail("Azure Pi pool profiles must name six distinct upstream accounts")
+    module.fail("Azure Pi pool profiles must name distinct upstream accounts")
 PY
 }
 

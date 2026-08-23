@@ -613,7 +613,7 @@ test_cloud_spawn_refuses_an_unsafe_azure_account_pool_path() {
   pass "an unsafe Azure account-pool path fails closed before spawn mutation"
 }
 
-test_cloud_spawn_refuses_an_incomplete_azure_account_pool() {
+test_cloud_spawn_refuses_a_gap_in_the_azure_account_pool() {
   local record id out status azure_home
   id=cloud-pool-gap-c2e
   record=$(make_cloud_case incomplete-account-pool "$id")
@@ -633,10 +633,10 @@ PY
   printf '%s\n' "$azure_home" > "$HOME_DIR/config/azure-worker-account-home"
   out=$(run_cloud_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR")
   status=$?
-  expect_code 1 "$status" "an incomplete Azure account pool should fail closed: $out"
-  assert_contains "$out" "exactly the gap-free profiles" "the refusal did not explain the six-profile contract: $out"
-  assert_absent "$HOME_DIR/state/$id.meta" "an incomplete Azure pool still wrote task metadata"
-  pass "Azure placement requires its exact gap-free six-account pool"
+  expect_code 1 "$status" "a gapped Azure account pool should fail closed: $out"
+  assert_contains "$out" "profiles must be gap-free" "the refusal did not explain the profile-numbering contract: $out"
+  assert_absent "$HOME_DIR/state/$id.meta" "a gapped Azure pool still wrote task metadata"
+  pass "Azure placement requires gap-free account numbering while allowing pool growth"
 }
 
 test_cloud_spawn_refuses_a_credential_that_could_refresh_on_the_guest() {
@@ -1854,7 +1854,7 @@ test_cloud_switch_off_keeps_the_local_path_and_metadata_shape
 test_cloud_spawn_places_worker_and_runs_the_entrypoint
 test_cloud_spawn_uses_the_dedicated_azure_account_pool
 test_cloud_spawn_refuses_an_unsafe_azure_account_pool_path
-test_cloud_spawn_refuses_an_incomplete_azure_account_pool
+test_cloud_spawn_refuses_a_gap_in_the_azure_account_pool
 test_cloud_spawn_refuses_a_credential_that_could_refresh_on_the_guest
 test_monitor_lands_the_outcome_bundle
 test_monitor_reports_an_already_landed_outcome

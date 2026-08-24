@@ -3882,12 +3882,24 @@ def pi_review_output_schema(
     return schema
 
 
-def normalize_pi_review(value: Any) -> Any:
-    """Restore omitted generation-only nullable fields for full validation."""
+def normalize_pi_review(
+    value: Any,
+    executing_account_home: str,
+    execution_home: str,
+) -> Any:
+    """Restore host-owned identity and nullable fields after Pi generation.
+
+    The Pi schema keeps these two strings stable so the strict tool definition
+    remains cacheable across ephemeral review homes. The trusted launcher owns
+    both paths, and the independently checked Bash receipt still has to prove
+    that the reviewer observed those exact values.
+    """
 
     if not isinstance(value, dict):
         return value
     normalized = copy.deepcopy(value)
+    normalized["executing_account_home"] = executing_account_home
+    normalized["execution_home"] = execution_home
     updates = normalized.get("finding_updates")
     if isinstance(updates, list):
         for update in updates:
@@ -4934,7 +4946,11 @@ def run_reviewer(
             require_verdict_tool=True,
         )
         config["reviewer_turn_count"] = str(turn_count)
-        return normalize_pi_review(verdict)
+        return normalize_pi_review(
+            verdict,
+            config["executing_account_home"],
+            config["execution_home"],
+        )
 
     fail(f"unsupported reviewer harness after policy validation: {config['harness']}")
 

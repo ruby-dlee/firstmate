@@ -5659,7 +5659,17 @@ assert_strict_subset(outer, "azure")
 update = local["properties"]["finding_updates"]["items"]
 for name in ("reproduction", "mutation_proof", "equivalent_to"):
     assert name not in update["required"], update
-normalized = core.normalize_pi_review({"finding_updates": [{"id": "cc-test"}]})
+normalized = core.normalize_pi_review(
+    {
+        "executing_account_home": "/model/guessed-account",
+        "execution_home": "/model/guessed-home",
+        "finding_updates": [{"id": "cc-test"}],
+    },
+    "/host/bound-account",
+    "/host/bound-home",
+)
+assert normalized["executing_account_home"] == "/host/bound-account"
+assert normalized["execution_home"] == "/host/bound-home"
 assert normalized["finding_updates"][0] == {
     "id": "cc-test", "reproduction": None,
     "mutation_proof": None, "equivalent_to": None,

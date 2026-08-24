@@ -2306,7 +2306,11 @@ def _run_azure_review_in_lane(
                 )
             evidence_files = bridge.validate_evidence_files(raw_evidence_files)
             raw_review = (
-                core.normalize_pi_review(result["verdict"])
+                core.normalize_pi_review(
+                    result["verdict"],
+                    config["executing_account_home"],
+                    config["execution_home"],
+                )
                 if config["harness"] == "pi"
                 else result["verdict"]
             )

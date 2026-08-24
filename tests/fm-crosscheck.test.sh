@@ -5690,7 +5690,11 @@ import sys
 print(Path(sys.argv[1]).resolve())
 PY
 )
-  agent_root=$(cd "$(dirname "$pi_real")/.." && pwd -P)
+  if [ -n "${FM_PI_PACKAGE_DIR:-}" ]; then
+    agent_root=$(cd "$FM_PI_PACKAGE_DIR" && pwd -P)
+  else
+    agent_root=$(cd "$(dirname "$pi_real")/.." && pwd -P)
+  fi
   strict_module=
   for dependency_root in \
     "$agent_root/node_modules" "$(dirname "$(dirname "$agent_root")")"; do

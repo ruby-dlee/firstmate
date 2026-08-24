@@ -83,7 +83,10 @@ for marker in (
     assert marker in bridge_source
 guest_source = guest.read_text(encoding="utf-8")
 assert "--disable shell_tool" in guest_source
-assert "--no-tools" in guest_source
+assert "--tools submit_crosscheck_verdict" in guest_source
+assert '--extension "$VERDICT_EXTENSION"' in guest_source
+assert "--no-extensions" in guest_source
+assert "--offline" in guest_source
 # R6: the model decides the Pi provider slot inside the guest too, every
 # registered cross-family credential is the models.json shape bound to that
 # lane's exact endpoint, and the interim claude launch/boot-copy lane is gone
@@ -236,7 +239,7 @@ ledger = {"findings": []}
 config = {
     "harness": "pi",
     "account_selector": "PI_CODING_AGENT_DIR",
-    "model": "accounts/fireworks/routers/glm-5p2-fast",
+    "model": "accounts/fireworks/models/glm-5p2",
 }
 verdict_schema = {
     "type": "object",
@@ -244,7 +247,7 @@ verdict_schema = {
     "required": ["schema"],
     "properties": {"schema": {"const": "fm.crosscheck-review/v-test"}},
 }
-schema = module.azure_review_schema(verdict_schema)
+schema = module.azure_pi_review_schema(verdict_schema)
 host_prompt = core.make_prompt(snapshot, ledger, config)
 prompt = module.azure_review_prompt(
     core,
@@ -259,23 +262,45 @@ trusted_header = "AZURE REVIEW OUTPUT FORMAT (TRUSTED FINAL INSTRUCTION):"
 packet_close = "</AZURE_EXACT_HEAD_REVIEW_PACKET_UNTRUSTED>"
 
 
-def assert_bound(candidate):
+def assert_pi_bound(candidate):
     assert candidate.startswith(host_prompt)
     assert candidate.rfind(trusted_header) > candidate.rfind(packet_close)
-    assert candidate.endswith(expected)
-    assert candidate.count(expected) == 1
+    assert expected not in candidate
+    assert "Use `submit_crosscheck_verdict` exactly once" in candidate
     assert "supplied Crosscheck verdict schema" not in candidate
     trusted_tail = candidate[candidate.rfind(trusted_header):]
     assert "supplied" not in trusted_tail.lower()
 
 
-assert_bound(prompt)
+assert_pi_bound(prompt)
 assert schema["required"] == ["verdict", "evidence_files"], schema
 assert set(schema["properties"]) == {"verdict", "evidence_files"}, schema
 assert schema["additionalProperties"] is False
 assert schema["properties"]["verdict"] == verdict_schema
-assert schema["properties"]["evidence_files"]["type"] == "object"
+assert schema["properties"]["evidence_files"]["type"] == "array"
+evidence_item = schema["properties"]["evidence_files"]["items"]
+assert evidence_item["required"] == ["path", "content"]
+assert evidence_item["additionalProperties"] is False
+manifest = [
+    {"path": ".crosscheck/reproductions/proof.sh", "content": "true\n"},
+    {"path": ".crosscheck/mutations/fix.patch", "content": "patch\n"},
+]
+assert module.normalize_pi_evidence_files(manifest) == {
+    item["path"]: item["content"] for item in manifest
+}
+for malformed in (
+    [manifest[0], manifest[0]],
+    [{**manifest[0], "extra": True}],
+    {manifest[0]["path"]: manifest[0]["content"]},
+):
+    try:
+        module.normalize_pi_evidence_files(malformed)
+    except module.AzureCrosscheckError:
+        pass
+    else:
+        raise AssertionError(f"Pi evidence normalization admitted {malformed!r}")
 assert "Your final response must satisfy the supplied JSON schema" in host_prompt
+assert "The constrained verdict submitter is the only enabled tool." in prompt
 assert commands[0][0] == [
     "git", "-C", "/unused-review-checkout", "diff", "--no-ext-diff",
     "--no-renames", snapshot["base_sha"], snapshot["head_sha"], "--",
@@ -293,41 +318,43 @@ with tempfile.TemporaryDirectory() as temporary:
         config={"harness": "pi", "model": "model", "effort": "xhigh"},
     )
     request = json.loads(request_path.read_text(encoding="utf-8"))
-assert request["prompt"].endswith(expected)
+assert request["prompt"] == prompt
 assert request["review_schema"] == schema
-
-# Pin the test oracle itself: deleting the schema, weakening the outer required
-# keys, or moving the trusted format before the packet must all go red.
-weakened = expected.replace(
-    '"required":["verdict","evidence_files"]',
-    '"required":["verdict"]',
-    1,
+assert request["tool_protocol"]["model_tools"] == ["submit_crosscheck_verdict"]
+assert request["verdict_extension"]["sha256"] == module.digest_bytes(
+    request["verdict_extension"]["source"].encode("utf-8")
 )
-mutations = {
-    "deleted schema": prompt[:-len(expected)],
-    "weakened required keys": prompt[:-len(expected)] + weakened,
-    "format moved before packet": (
-        host_prompt + trusted_header + "\n" + expected
-        + "\n<AZURE_EXACT_HEAD_REVIEW_PACKET_UNTRUSTED>\nrepo data\n"
-        + packet_close
-    ),
+
+# Codex still receives the exact compact schema as both its prompt suffix and
+# --output-schema artifact, while Pi receives it only as the strict tool.
+codex_config = {
+    "harness": "codex",
+    "account_selector": "CODEX_HOME",
+    "model": "gpt-5.6-sol",
 }
-for label, mutation in mutations.items():
-    try:
-        assert_bound(mutation)
-    except AssertionError:
-        pass
-    else:
-        raise AssertionError(f"prompt contract oracle admitted {label}")
+codex_schema = module.azure_review_schema(verdict_schema)
+codex_expected = module.canonical_bytes(codex_schema).decode("utf-8")
+codex_host_prompt = core.make_prompt(snapshot, ledger, codex_config)
+codex_prompt = module.azure_review_prompt(
+    core,
+    snapshot,
+    ledger,
+    codex_config,
+    codex_schema,
+    Path("/unused-review-checkout"),
+)
+assert codex_prompt.startswith(codex_host_prompt)
+assert codex_prompt.endswith(codex_expected)
+assert codex_prompt.count(codex_expected) == 1
 
 with tempfile.TemporaryDirectory() as temporary:
     try:
         module.make_input(
             Path(temporary) / "mismatched-request.json",
-            prompt=mutations["weakened required keys"],
-            schema=schema,
+            prompt=codex_prompt[:-1],
+            schema=codex_schema,
             identity={"review_generation": "a" * 24},
-            config={"harness": "pi", "model": "model", "effort": "xhigh"},
+            config={"harness": "codex", "model": "model", "effort": "xhigh"},
         )
     except module.AzureCrosscheckError as exc:
         assert "does not end with its exact compact outer schema" in str(exc), str(exc)
@@ -349,7 +376,7 @@ else:
 finally:
     module.MAX_PROMPT_BYTES = original_limit
 
-print("AZURE PROMPT ends in the exact compact outer wrapper schema")
+print("AZURE PROMPT binds Pi through a strict tool and Codex through the exact schema")
 PY
   pass "the Azure model prompt ends with the exact verdict and evidence wrapper schema"
 }
@@ -510,7 +537,12 @@ for label, override in (
 lane = next(iter(core.CROSS_FAMILY_LANES.values()))
 lane_document = {"providers": {lane["slot"]: {
     "baseUrl": lane["base_url"], "api": lane["api"], "apiKey": "k",
-    "models": [{"id": lane["model"], "name": "n"}],
+    "models": [{
+        "id": lane["model"],
+        "name": "n",
+        "compat": lane["compat"],
+        "cost": lane["cost"],
+    }],
 }}}
 result, landed = run_guest(
     "pi", lane["model"], lane_document, core.cross_family_account_identity(lane)
@@ -543,6 +575,8 @@ PY
   pass "the model guest derives the host's executing account, refuses foreign ones, and dispatches every registered lane"
 }
 
+# The behavior suite below replaces this historical fixture later in the file.
+# shellcheck disable=SC2329
 model_guest_pi_verdict_unit() {
   python3 - "$MODEL_GUEST" "$CORE" <<'PY' \
     || fail "model guest Pi verdict parser contract failed"
@@ -729,6 +763,8 @@ PY
   pass "the exact model guest accepts one fenced verdict and preserves terminal-turn safety"
 }
 
+# The behavior suite below replaces this historical fixture later in the file.
+# shellcheck disable=SC2329
 model_guest_pi_protocol_retry_unit() {
   python3 - "$MODEL_GUEST" <<'PY' \
     || fail "model guest Pi protocol-correction contract failed"
@@ -761,7 +797,7 @@ BASE=$1
 PROMPT=$BASE/prompt.txt
 RESULT=$BASE/reviewer-result.json
 ACCOUNT=$BASE/account
-MODEL=accounts/fireworks/routers/glm-5p2-fast
+MODEL=accounts/fireworks/models/glm-5p2
 EFFORT=xhigh
 PI_PROVIDER=fireworks-glm
 REVIEW_GENERATION=0123456789abcdef01234567
@@ -789,7 +825,7 @@ capture.mkdir(exist_ok=True)
 
 scenario = os.environ["FAKE_PI_SCENARIO"]
 valid = json.dumps({"verdict": {"summary": "clear"}, "evidence_files": {}})
-reported_model = "accounts/fireworks/routers/glm-5p2-fast"
+reported_model = "accounts/fireworks/models/glm-5p2"
 if scenario == "nonzero-first":
     sys.stderr.buffer.write(
         b"HOSTILE_FIRST_STDERR" + b"\n\r\t\x00\x1b" * 1500 + b"Z" * 5000
@@ -798,7 +834,7 @@ if scenario == "nonzero-first":
 if scenario == "terminal-error":
     message = {
         "role": "assistant", "provider": "fireworks-glm",
-        "model": "accounts/fireworks/routers/glm-5p2-fast",
+        "model": "accounts/fireworks/models/glm-5p2",
         "stopReason": "error", "content": [],
         "errorMessage": "provider failed before an artifact",
     }
@@ -809,7 +845,7 @@ if scenario == "valid-first":
     artifact = valid
 elif scenario == "wrong-serving-route":
     artifact = valid
-    reported_model = "accounts/fireworks/models/glm-5p2"
+    reported_model = "accounts/fireworks/routers/glm-5p2-fast"
 elif scenario == "prose-valid":
     artifact = "Looking at this PR... UNIQUE_PRIOR_PROSE" if count == 1 else valid
 elif scenario == "missing-valid":
@@ -925,7 +961,7 @@ def run_scenario(scenario):
 def assert_protocol(argvs, metas):
     expected = [
         "--mode", "json", "--provider", "fireworks-glm", "--model",
-        "accounts/fireworks/routers/glm-5p2-fast", "--thinking", "xhigh",
+        "accounts/fireworks/models/glm-5p2", "--thinking", "xhigh",
         "--no-tools", "--no-session", "--no-extensions", "--no-skills",
         "--no-prompt-templates", "--no-themes", "--no-context-files",
         "--no-approve",
@@ -950,7 +986,7 @@ completed, count, prompts, argvs, metas, value = run_scenario("wrong-serving-rou
 assert completed.returncode == 125, (completed.stdout, completed.stderr)
 assert count == 1 and value is None, (count, value)
 assert "reported model" in completed.stderr, completed.stderr
-assert "accounts/fireworks/models/glm-5p2" in completed.stderr, completed.stderr
+assert "accounts/fireworks/routers/glm-5p2-fast" in completed.stderr, completed.stderr
 assert_protocol(argvs, metas)
 
 for scenario, forbidden in (
@@ -1043,16 +1079,16 @@ assert module.LEGACY_CROSS_FAMILY_MODELS == core.LEGACY_CROSS_FAMILY_MODELS, (
     core.LEGACY_CROSS_FAMILY_MODELS,
 )
 assert module.CROSS_FAMILY_LANES["fireworks-glm"]["model"] == (
-    "accounts/fireworks/routers/glm-5p2-fast"
+    "accounts/fireworks/models/glm-5p2"
 )
 assert module.cross_family_lane_for_model(
-    "accounts/fireworks/models/glm-5p2"
+    "accounts/fireworks/routers/glm-5p2-fast"
 ) is None
 assert module.recorded_cross_family_lane_for_model(
-    "accounts/fireworks/models/glm-5p2"
+    "accounts/fireworks/routers/glm-5p2-fast"
 ) is module.CROSS_FAMILY_LANES["fireworks-glm"]
 for lane in module.CROSS_FAMILY_LANES.values():
-    assert lane["model"].endswith("/routers/glm-5p2-fast"), lane
+    assert lane["model"].endswith("/models/glm-5p2"), lane
     # Per-lane consistency, NOT one hardcoded host. Asserting a single host for
     # every lane meant any genuinely new lane failed HERE first, so the
     # registration-completeness guard in the model-guest unit - the one this
@@ -1112,7 +1148,7 @@ identity = {
     "provider_host": "api.example.com",
     "provider_port": "443",
     "reviewer_harness": "pi",
-    "reviewer_model": "accounts/fireworks/routers/glm-5p2-fast",
+    "reviewer_model": "accounts/fireworks/models/glm-5p2",
     "reviewer_effort": "xhigh",
     "reviewer_account_digest": "sha256:" + "2" * 64,
     "ledger_digest": "sha256:" + "f" * 64,
@@ -1131,7 +1167,7 @@ identity.update({
 reviewer = {
     "execution_mode": "azure-compartment-v1",
     "harness": "pi",
-    "model": "accounts/fireworks/routers/glm-5p2-fast",
+    "model": "accounts/fireworks/models/glm-5p2",
     "effort": "xhigh",
     "reviewer_account_identity_sha256": "2" * 64,
     "azure_identity": identity,
@@ -1173,7 +1209,12 @@ MODEL = LANE["model"]
 
 def models_json(base_url=PINNED, api_key="lane-key-material", model_extra=None,
                 slot=SLOT, model_id=MODEL):
-    model = {"id": model_id, "name": "cross-family reviewer"}
+    model = {
+        "id": model_id,
+        "name": "cross-family reviewer",
+        "compat": LANE["compat"],
+        "cost": LANE["cost"],
+    }
     model.update(model_extra or {})
     return json.dumps({
         "providers": {
@@ -2304,7 +2345,8 @@ core.reviewer_candidates=lambda _home,_meta:[dict(item) for item in candidates]
 core.prepare_review_checkout=lambda destination,value,source=None:(destination.mkdir(parents=True),value["base_sha"])[1]
 core.assert_review_checkout_intact=lambda _directory,_head:None
 core.write_neutral_runner_config=lambda _root:None
-core.review_output_schema=lambda _account,_execution:{}
+core.review_output_schema=lambda _account,_execution,stable_identity=False:{}
+core.pi_review_output_schema=lambda _account,_execution:{}
 
 azure={
     "lanes":1,
@@ -2790,6 +2832,263 @@ positional_guard = re.search(
 assert positional_guard, "the guest no longer refuses positional parameters"
 PY
   pass "the adapter and guest agree on the exact seven-parameter contract"
+}
+
+# Override the historical final-text protocol tests with the strict terminating
+# verdict-tool contract now shipped to the model compartment.
+model_guest_pi_verdict_unit() {
+  python3 - "$MODEL_GUEST" <<'PY' || fail "model guest strict verdict tool contract failed"
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+guest = Path(sys.argv[1]).read_text(encoding="utf-8")
+marker = '    python3 - "$PI_EVENTS" "$RESULT" "$PI_PROVIDER" "$MODEL" <<\'PY\'\n'
+start = guest.index(marker) + len(marker)
+end = guest.index("\nPY\n", start)
+parser = guest[start:end]
+provider = "fireworks-glm"
+model = "accounts/fireworks/models/glm-5p2"
+
+
+def usage(input_tokens=10, output_tokens=2, cache_read=4, cache_write=0):
+    return {
+        "input": input_tokens,
+        "output": output_tokens,
+        "cacheRead": cache_read,
+        "cacheWrite": cache_write,
+        "cost": {
+            "input": 0.000014,
+            "output": 0.0000088,
+            "cacheRead": 0.00000056,
+            "cacheWrite": 0,
+            "total": 0.00002336,
+        },
+    }
+
+
+def turn(content, stop="toolUse", **usage_kwargs):
+    return {
+        "type": "turn_end",
+        "message": {
+            "role": "assistant",
+            "provider": provider,
+            "model": model,
+            "stopReason": stop,
+            "content": content,
+            "usage": usage(**usage_kwargs),
+        },
+    }
+
+
+outer = {
+    "verdict": {"summary": "clear"},
+    "evidence_files": [
+        {"path": ".crosscheck/reproductions/proof.sh", "content": "true\n"}
+    ],
+}
+call = {
+    "type": "toolCall",
+    "id": "verdict-1",
+    "name": "submit_crosscheck_verdict",
+    "arguments": outer,
+}
+
+
+def run(events):
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source = root / "events.jsonl"
+        result = root / "result.json"
+        script = root / "parse.py"
+        source.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+        script.write_text(parser, encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, str(script), str(source), str(result), provider, model],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        value = json.loads(result.read_text()) if result.is_file() else None
+        return completed, value
+
+
+completed, value = run([turn([call]), {"type": "agent_end"}])
+assert completed.returncode == 0, completed.stderr
+assert value["verdict"] == outer["verdict"]
+assert value["telemetry"]["tokens"] == {
+    "input": 10,
+    "output": 2,
+    "cache_read": 4,
+    "cache_write": 0,
+    "source": "pi-turn-end-message-usage",
+}
+assert value["telemetry"]["turns"] == 1
+
+for label, content in (
+    ("missing", []),
+    ("multiple", [call, {**call, "id": "verdict-2"}]),
+):
+    completed, value = run([turn(content), {"type": "agent_end"}])
+    assert completed.returncode != 0 and value is None, label
+    assert "exactly one verdict tool call" in completed.stderr, completed.stderr
+
+string_call = {**call, "arguments": "Reviewed. " + json.dumps(outer) + " Done."}
+completed, value = run([turn([string_call]), {"type": "agent_end"}])
+assert completed.returncode == 0 and value["verdict"] == outer["verdict"]
+truncated = {**call, "arguments": '{"verdict":{"summary":"clear"}' }
+completed, value = run([turn([truncated]), {"type": "agent_end"}])
+assert completed.returncode != 0 and value is None
+for malformed in (
+    "```json\n" + json.dumps(outer),
+    "true " + json.dumps(outer),
+    json.dumps(outer) + " false",
+    json.dumps(outer) + json.dumps({"second": True}),
+):
+    completed, value = run([
+        turn([{**call, "arguments": malformed}]), {"type": "agent_end"}
+    ])
+    assert completed.returncode != 0 and value is None, malformed
+
+partial_usage = turn([call])
+del partial_usage["message"]["usage"]["cost"]
+completed, value = run([partial_usage, {"type": "agent_end"}])
+assert completed.returncode == 0, completed.stderr
+assert value["telemetry"]["tokens"]["input"] == 10
+assert value["telemetry"]["costs_usd"]["pi_calculated"] is None
+assert value["telemetry"]["costs_usd"]["declared"] == 0.00002336
+
+failed = turn([], stop="error", input_tokens=3, output_tokens=1, cache_read=0)
+failed["message"]["errorMessage"] = "retryable provider error"
+completed, value = run([
+    failed,
+    {"type": "agent_end"},
+    {"type": "auto_retry_start"},
+    turn([call], input_tokens=10, output_tokens=2, cache_read=4),
+    {"type": "agent_end"},
+])
+assert completed.returncode == 0, completed.stderr
+assert value["telemetry"]["turns"] == 2
+assert value["telemetry"]["tokens"]["input"] == 13
+print("GUEST strict verdict tool accepts one call, refuses zero/multiple/truncation, and preserves retry usage")
+PY
+  pass "the model guest requires exactly one terminating strict verdict tool call"
+}
+
+model_guest_pi_protocol_retry_unit() {
+  python3 - "$MODEL_GUEST" "$ROOT/bin/fm-crosscheck-pi-verdict-extension.mjs" <<'PY' \
+    || fail "model guest Pi file/extension launch contract failed"
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+guest_path, extension_path = map(Path, sys.argv[1:3])
+guest = guest_path.read_text(encoding="utf-8")
+begin = "    # BEGIN PI_PROTOCOL_ATTEMPTS\n"
+end_marker = "    # END PI_PROTOCOL_ATTEMPTS"
+start = guest.index(begin) + len(begin)
+branch = guest[start:guest.index(end_marker, start)]
+model = "accounts/fireworks/models/glm-5p2"
+outer = {
+    "verdict": {"summary": "clear"},
+    "evidence_files": [
+        {"path": ".crosscheck/reproductions/proof.sh", "content": "true\n"}
+    ],
+}
+
+fake_pi = r'''#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+Path(os.environ["CAPTURE"]).write_text(json.dumps({
+    "argv": sys.argv[1:],
+    "schema": os.environ.get("FM_CROSSCHECK_REVIEW_SCHEMA"),
+}))
+scenario = os.environ.get("SCENARIO", "valid")
+outer = {
+    "verdict": {"summary": "clear"},
+    "evidence_files": [
+        {"path": ".crosscheck/reproductions/proof.sh", "content": "true\n"}
+    ],
+}
+call = {"type": "toolCall", "id": "v1", "name": "submit_crosscheck_verdict", "arguments": outer}
+content = [call]
+if scenario == "missing": content = []
+if scenario == "multiple": content = [call, {**call, "id": "v2"}]
+message = {
+    "role": "assistant", "provider": "fireworks-glm",
+    "model": "accounts/fireworks/models/glm-5p2", "stopReason": "toolUse",
+    "content": content,
+    "usage": {"input": 10, "output": 2, "cacheRead": 4, "cacheWrite": 0,
+              "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0.00002336}},
+}
+print(json.dumps({"type": "turn_end", "message": message}))
+print(json.dumps({"type": "agent_end"}))
+'''
+
+
+def run(scenario):
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        base = root / "base"
+        base.mkdir()
+        (base / "prompt.txt").write_text("PROMPT BY FILE", encoding="utf-8")
+        (base / "schema.json").write_text("{}", encoding="utf-8")
+        (base / "account").mkdir()
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        pi = fake_bin / "pi"
+        pi.write_text(fake_pi, encoding="utf-8")
+        pi.chmod(0o755)
+        script = root / "branch.sh"
+        script.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            "BASE=$1\nPROMPT=$BASE/prompt.txt\nSCHEMA=$BASE/schema.json\n"
+            "RESULT=$BASE/reviewer-result.json\nACCOUNT=$BASE/account\n"
+            f"MODEL={model}\nEFFORT=xhigh\nPI_PROVIDER=fireworks-glm\n"
+            f"VERDICT_EXTENSION={extension_path}\n" + branch,
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        capture = root / "capture.json"
+        env = dict(os.environ)
+        env.update({
+            "PATH": str(fake_bin) + os.pathsep + env["PATH"],
+            "CAPTURE": str(capture),
+            "SCENARIO": scenario,
+        })
+        completed = subprocess.run(
+            [str(script), str(base)], capture_output=True, text=True, env=env, timeout=30
+        )
+        captured = json.loads(capture.read_text())
+        value = json.loads((base / "reviewer-result.json").read_text()) if (base / "reviewer-result.json").is_file() else None
+        return completed, captured, value
+
+
+completed, captured, value = run("valid")
+assert completed.returncode == 0, completed.stderr
+argv = captured["argv"]
+for required in (
+    "--offline", "--no-extensions", "--extension", "--system-prompt",
+    "--session-id", "--no-session", "submit_crosscheck_verdict",
+):
+    assert required in argv, (required, argv)
+assert argv[-1].startswith("@") and argv[-1].endswith("/prompt.txt"), argv[-1]
+assert captured["schema"].endswith("/schema.json"), captured
+assert value["verdict"] == outer["verdict"]
+for scenario in ("missing", "multiple"):
+    completed, captured, value = run(scenario)
+    assert completed.returncode != 0 and value is None, scenario
+print("GUEST Pi launch uses @file, offline mode, deterministic affinity, and one explicit tool with discovery disabled")
+PY
+  pass "the exact Pi branch loads one explicit verdict tool with discovery disabled and never retries malformed output"
 }
 
 static_contract

@@ -2956,6 +2956,32 @@ PY
   pass "the digest-bound Pi runtime executes one isolated strict-tool review"
 }
 
+azure_pi_review_contract_unit() {
+  python3 - "$CORE" "$PI_REVIEWER_RUNTIME" <<'PY' \
+    || fail "Azure Pi review contract digest did not bind the reviewer runtime"
+import importlib.util
+from pathlib import Path
+import sys
+import tempfile
+
+core, runtime = map(Path, sys.argv[1:3])
+spec = importlib.util.spec_from_file_location("fm_crosscheck_contract_test", core)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+with tempfile.TemporaryDirectory() as raw_tmp:
+    candidate = Path(raw_tmp) / runtime.name
+    candidate.write_bytes(runtime.read_bytes())
+    module.PI_REVIEWER_RUNTIME = candidate
+    azure_before = module.review_contract_sha256(True, "pi")
+    local_before = module.review_contract_sha256(False, "pi")
+    candidate.write_bytes(candidate.read_bytes() + b"\n")
+    assert module.review_contract_sha256(True, "pi") != azure_before
+    assert module.review_contract_sha256(False, "pi") == local_before
+PY
+  pass "Azure Pi review reuse is bound to the executable reviewer runtime"
+}
+
 parameter_contract_unit() {
   # The model run-command parameter contract is env-vars-only and split
   # across two files: the adapter SUBMITS named (protected) parameters and
@@ -3012,6 +3038,7 @@ parameter_contract_unit
 adapter_mode_unit
 azure_prompt_wrapper_schema_unit
 pi_reviewer_runtime_unit
+azure_pi_review_contract_unit
 cross_family_provider_host_unit
 cross_family_credential_lane_unit
 model_guest_executing_account_unit

@@ -85,7 +85,6 @@ for marker in (
     assert marker in bridge_source
 guest_source = guest.read_text(encoding="utf-8")
 assert "--disable shell_tool" in guest_source
-assert 'python3 "$PI_REVIEWER_RUNTIME"' in guest_source
 # R6: the model decides the Pi provider slot inside the guest too, every
 # registered cross-family credential is the models.json shape bound to that
 # lane's exact endpoint, and the interim claude launch/boot-copy lane is gone

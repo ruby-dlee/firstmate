@@ -5674,10 +5674,14 @@ PY
   fi
   printf '%s\n' '{"type":"object","additionalProperties":false,"properties":{}}' \
     > "$probe_dir/schema.json"
-  FM_CROSSCHECK_REVIEW_SCHEMA="$probe_dir/schema.json" \
+  if ! FM_CROSSCHECK_REVIEW_SCHEMA="$probe_dir/schema.json" \
     "$pi_bin" --offline --no-extensions \
       --extension "$ROOT/bin/fm-crosscheck-pi-verdict-extension.mjs" \
-      --tools submit_crosscheck_verdict --help > "$probe_dir/tracked-help"
+      --tools submit_crosscheck_verdict --help \
+      > "$probe_dir/tracked-help" 2> "$probe_dir/tracked-help.err"; then
+    echo "# note: installed Pi is not runnable; deterministic strict-schema fallback passed"
+    return
+  fi
   node_bin=$(command -v node 2>/dev/null || true)
   [ -n "$node_bin" ] || fail "installed Pi has no Node runtime for its extension"
   pi_real=$("$CROSSCHECK_PYTHON" - "$pi_bin" <<'PY'

@@ -36,15 +36,17 @@ The first live invocation remains blocked until the foundation and this code are
 
 ## Request and snapshot contract
 
-`prepare` refuses tracked changes, untracked files, and any origin other than a credential-free public GitHub HTTPS URL.
-It also refuses a detached HEAD unless the caller supplies an exact public source ref whose fetched head equals that detached commit.
+`prepare` refuses tracked changes, untracked files, and any origin identity other than a credential-free GitHub HTTPS URL.
+It also refuses a detached HEAD unless the caller supplies an exact public source ref or a digest-bound private bundle for that detached commit.
 By default the candidate must be reachable from a freshly advertised and fetched `refs/heads/main` default head.
 The explicit `--source-ref refs/heads/<branch>` seam alone requires the candidate commit to be the exact freshly advertised and fetched head of that public branch; it never accepts an ancestor, stale tracking ref, tag, or changed remote head.
 An explicit `--public-ref` may instead name only an advertised branch head or `refs/pull/<number>/head`, and the candidate must equal that ref's exact fetched head; mutable pull merge refs and unsafe ref shapes are refused, and the two source-ref seams are mutually exclusive.
 A caller may additionally bind one or more exact `--public-ancestor` commits; each must be present in the freshly fetched public history and be an ancestor of the candidate, and trusted guest bootstrap fetches and verifies each object before repository networking closes.
+Crosscheck evidence for a private GitHub repository supplies `--private-snapshot-bundle` without a parent reservation: the trusted host packages its clean exact-head review checkout, binds the authenticated PR ref and base ancestor, and stages only that digest-bound Git bundle so the evidence VM receives no GitHub credential.
+When that arbitrary repository does not contain Firstmate's Agent Fleet lock, the `crosscheck-tool` class uses only the sealed base toolchain and records an empty Python-wheel closure instead of requiring Firstmate-specific files.
 An Azure validation cell additionally supplies `--private-snapshot-bundle` with its parent-cell reservation so an unpushed pipeline-fix head can execute without prematurely changing the task branch on GitHub.
-That private mode binds one exact source ref/head, a one-ref Git bundle, digest, size, parent cell, and private staging object while still freshly proving the public origin's trusted default ref/head.
-The public proof runs in a fresh bare repository with system/global Git configuration, credentials, prompts, extra HTTP headers, and file transport disabled; all modes repeat their exact public/private source proof immediately before compute creation and retry.
+Both private modes bind one exact source ref/head, a one-ref Git bundle, digest, size, and private staging object; the validation-cell mode additionally binds its parent cell and freshly proves the public origin's trusted default ref/head.
+The public proof runs in a fresh bare repository with system/global Git configuration, credentials, prompts, extra HTTP headers, and file transport disabled; private Crosscheck proof revalidates the clean checkout and bundle identities locally immediately before compute creation and retry.
 No live worktree, primary home, provider account home, browser profile, or peer storage is mounted or copied.
 
 The canonical `fm.azure-command/v1` request binds these fields:

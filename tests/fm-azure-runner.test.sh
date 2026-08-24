@@ -65,6 +65,41 @@ PY
   pass "normal environment defaults to strict without commissioning evidence or confirmation variables"
 }
 
+public_git_askpass_is_host_portable() {
+  python3 - "$HOST" <<'PY' || fail "public Git askpass portability contract failed"
+import importlib.util
+import pathlib
+import sys
+
+spec = importlib.util.spec_from_file_location("runner", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+observed = {}
+
+def fake_run(command, **kwargs):
+    observed["command"] = command
+    observed["env"] = kwargs["env"]
+
+m.run = fake_run
+m.shutil.which = lambda name, path=None: (
+    "/usr/bin/false" if (name, path) == ("false", "/usr/bin:/bin") else None
+)
+m.public_git(pathlib.Path("/proof"), "ls-remote", "https://github.com/example/repo.git")
+assert observed["command"][0] == "git"
+assert observed["env"]["GIT_ASKPASS"] == "/usr/bin/false"
+assert observed["env"]["SSH_ASKPASS"] == "/usr/bin/false"
+
+m.shutil.which = lambda _name, path=None: None
+try:
+    m.public_git(pathlib.Path("/proof"), "ls-remote", "https://github.com/example/repo.git")
+except m.RunnerError as exc:
+    assert "executable false command" in str(exc)
+else:
+    raise AssertionError("public Git proof accepted a host with no prompt refuser")
+PY
+  pass "public Git proof resolves a host-portable noninteractive askpass executable"
+}
+
 storage_network_access_contract() {
   python3 - "$HOST" <<'PY' || fail "runner storage network-access contract failed"
 import importlib.util,inspect,sys
@@ -149,7 +184,7 @@ assert 'command_env["FM_HOME"] = str(ROOT)' not in host
 assert 'str(Path(command_env["FM_HOME"]) / "state" / "azure-workers")' in host
 assert "cleanup-verified-at" not in host
 assert 'binding_keys = ("remote", "source_ref", "source_head", "source_ancestors")' in host
-assert host.count('expected.get(key) != proof_identity[key]') == 1
+assert host.count('expected.get(key) != proof_identity[key]') == 2
 assert '"default_head": default_head,' in host
 schedule=next(r for r in template["resources"] if r["type"]=="Microsoft.DevTestLab/schedules")
 assert schedule["name"]=="[format('shutdown-computevm-{0}', parameters('vmName'))]"
@@ -282,10 +317,48 @@ assert pathlib.Path(state["input_path"]).parent.joinpath("snapshot.bundle").read
 bad=repo.parent/"bad.bundle"; m.run(["git","-C",str(repo),"branch","extra","HEAD"]); m.run(["git","-C",str(repo),"bundle","create",str(bad),"refs/heads/topic","refs/heads/extra"])
 args.invocation="azr-bbbbbbbbbbbb"; args.private_snapshot_bundle=str(bad)
 try: m.prepare(env,args)
-except m.RunnerError as exc: assert "only the exact source-ref head" in str(exc)
+except m.RunnerError as exc: assert "only the exact source head" in str(exc)
 else: raise AssertionError("multi-ref private snapshot accepted")
+# Crosscheck evidence uses the same private transport without a validation
+# parent. Its authenticated exact PR checkout is the authority, so preparation
+# must not try to reach a private GitHub remote without credentials.
+m.public_origin_proof=lambda *_a,**_k: (_ for _ in ()).throw(AssertionError("private Crosscheck bundle attempted public Git proof"))
+args.invocation="azr-cccccccccccc"
+args.private_snapshot_bundle=str(bundle)
+args.capacity_parent=None
+args.capacity_reservation_vcpus=None
+private=m.prepare(env,args)
+private_repo=private["request"]["repository"]
+assert private_repo["source_mode"]=="private-exact-bundle"
+assert private_repo["source_ref"]=="refs/heads/topic" and private_repo["source_head"]==head
+assert private_repo["default_ref"] is None and private_repo["default_head"] is None
+m.reprove_public_request(private)
+# An arbitrary private repository need not carry Firstmate's Agent Fleet lock.
+# The evidence class records an empty closure and keeps every other class on
+# the existing locked path.
+plain=repo.parent/"plain"; plain.mkdir()
+m.run(["git","-C",str(plain),"init","-q","-b","main"])
+m.run(["git","-C",str(plain),"config","user.name","fixture"])
+m.run(["git","-C",str(plain),"config","user.email","fixture@example.invalid"])
+(plain/"value.txt").write_text("value\n")
+m.run(["git","-C",str(plain),"add","value.txt"])
+m.run(["git","-C",str(plain),"commit","-qm","fixture"])
+m.run(["git","-C",str(plain),"remote","add","origin","https://github.com/example/private.git"])
+plain_head=m.git(plain,"rev-parse","HEAD").stdout.strip()
+plain_bundle=plain.parent/"plain.bundle"
+m.run(["git","-C",str(plain),"bundle","create",str(plain_bundle),"HEAD"])
+args.repo=str(plain)
+args.source_ref="refs/pull/7/head"
+args.public_ancestor=[]
+args.resource_class="crosscheck-tool"
+args.command=["true"]
+args.invocation="azr-dddddddddddd"
+args.private_snapshot_bundle=str(plain_bundle)
+plain_state=m.prepare(env,args)
+assert plain_state["request"]["repository"]["source_head"]==plain_head
+assert plain_state["request"]["protocol"]["agent_fleet_python"]=={"lock_digest":None,"wheels":[]}
 PY
-  pass "private parent prepare binds one exact source ref/head/tree/bundle/blob without requiring an early push"
+  pass "private snapshot preparation binds both parent-cell and credentialless exact-checkout bundle modes"
 }
 
 executor_credential_adversary() {
@@ -1163,6 +1236,7 @@ PY
 
 static_private_controller_contract
 environment_mode_defaults
+public_git_askpass_is_host_portable
 storage_network_access_contract
 prepare_contract
 private_snapshot_prepare_contract

@@ -184,10 +184,15 @@ for value in json.load(open(sys.argv[1],encoding="utf-8"))["repository"].get("so
 PY
 while IFS= read -r ancestor; do
   [ -n "$ancestor" ] || continue
-  run_bootstrap_network runuser -u fmrunner -- git -C /work/repo fetch --depth=1 origin "$ancestor"
-  [ "$(git -C /work/repo rev-parse FETCH_HEAD)" = "$ancestor" ] || { echo "guest bootstrap: source ancestor identity mismatch" >&2; exit 125; }
-  git -C /work/repo cat-file -e "$ancestor^{commit}" || { echo "guest bootstrap: source ancestor is absent" >&2; exit 125; }
+  if [ "$SOURCE_MODE" = public-github-https ]; then
+    run_bootstrap_network runuser -u fmrunner -- git -C /work/repo fetch --depth=1 origin "$ancestor"
+    [ "$(git -C /work/repo rev-parse FETCH_HEAD)" = "$ancestor" ] || { echo "guest bootstrap: source ancestor identity mismatch" >&2; exit 125; }
+    git -C /work/repo cat-file -e "$ancestor^{commit}" || { echo "guest bootstrap: source ancestor is absent" >&2; exit 125; }
+  fi
 done <"$BASE/source-ancestors"
+if [ "$SOURCE_MODE" = private-parent-bundle ] || [ "$SOURCE_MODE" = private-exact-bundle ]; then
+  /usr/bin/python3 "$EXECUTOR" --verify-private-source-ancestors "$REQUEST" /work/repo
+fi
 [ "$(git -C /work/repo rev-parse HEAD)" = "$COMMIT" ] && [ "$(git -C /work/repo rev-parse 'HEAD^{tree}')" = "$TREE" ] || { echo "guest bootstrap: source identity mismatch" >&2; exit 125; }
 # Repository tests compare the snapshot against the default branch through
 # the refs/remotes/origin view (generation 051 ground truth: a behavior

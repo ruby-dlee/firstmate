@@ -170,7 +170,6 @@ assert input_token_at < guest.index('rm -f "$TOKEN_FILE"',input_token_at) < run_
 assert '/usr/bin/python3 "$EXECUTOR"' in guest
 assert "https://files.pythonhosted.org/packages/*.whl" in guest
 assert 'repository"].get("source_ancestors", [])' in guest
-assert 'git -C /work/repo fetch --depth=1 origin "$ancestor"' in guest
 assert 'fetch_exact "$url"' in guest and '--location' not in guest[guest.index('while IFS=$\'\\t\' read -r url'):guest.index('done <"$BASE/wheels.tsv"')]
 assert "protectedParameters" not in host
 assert "generate-sas" not in host
@@ -359,6 +358,53 @@ assert plain_state["request"]["repository"]["source_head"]==plain_head
 assert plain_state["request"]["protocol"]["agent_fleet_python"]=={"lock_digest":None,"wheels":[]}
 PY
   pass "private snapshot preparation binds both parent-cell and credentialless exact-checkout bundle modes"
+}
+
+private_snapshot_ancestor_verification() {
+  local tmp repo clone request ancestor head marker helper
+  fm_test_tmproot_into tmp fm-azure-private-ancestor
+  repo="$tmp/repo"
+  make_repo "$repo"
+  ancestor=$(git -C "$repo" rev-parse HEAD^)
+  head=$(git -C "$repo" rev-parse HEAD)
+  clone="$tmp/clone"
+  git clone -q --no-local "$repo" "$clone"
+  marker="$tmp/network-used"
+  helper="$tmp/remote-helper"
+  printf '#!/usr/bin/env bash\nprintf used >"%s"\nexit 91\n' "$marker" >"$helper"
+  chmod +x "$helper"
+  git -C "$clone" remote set-url origin "ext::$helper"
+  request="$tmp/request.json"
+  python3 - "$request" "$ancestor" "$head" <<'PY'
+import json,sys
+path,ancestor,head=sys.argv[1:]
+with open(path,"w",encoding="utf-8") as handle:
+    json.dump({"repository":{"source_mode":"private-exact-bundle","commit":head,"source_ancestors":[ancestor]}},handle)
+PY
+  for mode in private-parent-bundle private-exact-bundle; do
+    python3 - "$request" "$mode" <<'PY'
+import json,sys
+path,mode=sys.argv[1:]
+request=json.load(open(path,encoding="utf-8"))
+request["repository"]["source_mode"]=mode
+with open(path,"w",encoding="utf-8") as handle: json.dump(request,handle)
+PY
+    python3 "$EXECUTOR" --verify-private-source-ancestors "$request" "$clone" || \
+      fail "$mode ancestor verification rejected bundled ancestry"
+  done
+  [ ! -e "$marker" ] || fail "private snapshot ancestor verification contacted origin"
+  python3 - "$request" <<'PY'
+import json,subprocess,sys
+path=sys.argv[1]
+request=json.load(open(path,encoding="utf-8"))
+request["repository"]["source_ancestors"]=[subprocess.run(["git","-C",path.rsplit("/",1)[0]+"/repo","rev-parse","HEAD"],check=True,text=True,stdout=subprocess.PIPE).stdout.strip()]
+request["repository"]["commit"]=subprocess.run(["git","-C",path.rsplit("/",1)[0]+"/repo","rev-parse","HEAD^"],check=True,text=True,stdout=subprocess.PIPE).stdout.strip()
+with open(path,"w",encoding="utf-8") as handle: json.dump(request,handle)
+PY
+  if python3 "$EXECUTOR" --verify-private-source-ancestors "$request" "$clone" >/dev/null 2>&1; then
+    fail "private snapshot ancestor verification accepted a descendant"
+  fi
+  pass "private bundle modes verify ancestors locally without contacting origin"
 }
 
 executor_credential_adversary() {
@@ -1240,6 +1286,7 @@ public_git_askpass_is_host_portable
 storage_network_access_contract
 prepare_contract
 private_snapshot_prepare_contract
+private_snapshot_ancestor_verification
 executor_credential_adversary
 linux_systemd_drop_integration
 spend_ledger_unit

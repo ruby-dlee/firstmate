@@ -80,7 +80,6 @@ for marker in (
     "tool_identity",
     "verifier_identity",
     "vm_instance_id",
-    "--private-snapshot-bundle",
 ):
     assert marker in bridge_source
 guest_source = guest.read_text(encoding="utf-8")

@@ -92,8 +92,8 @@ pi gives model-level `baseUrl`/`api` fields precedence over the provider level, 
 `effective_provider_host` is model-aware: a cross-family review derives its own lane's host, today `api.fireworks.ai`, as its single egress host and refuses a conflicting configured `provider_host`, while the codex-family fallback keeps its `chatgpt.com` derivation.
 The executing identity is the non-secret provider-slot, endpoint, and model binding (an api key names no upstream account); the api key and anything derived from it never enter identity, ledger, or output.
 The interim claude reviewer lane is retired end to end: no `api.anthropic.com` host derivation, no `.credentials.json` packaging or boot copy, and no claude launch branch in the model guest.
-The request embeds the tracked verdict extension and its SHA-256 digest because the model VM has no repository checkout.
-The guest byte-checks that source before writing it and launches Pi with both `--no-extensions` and the exact explicit `--extension` path.
+The request embeds the tracked verdict extension and Pi reviewer runtime with their SHA-256 digests because the model VM has no repository checkout.
+The guest byte-checks both sources before writing them, then the digest-bound runtime launches Pi with `--offline`, `--no-extensions`, and the exact explicit `--extension` path and validates the terminating tool event stream.
 The extension registers only `submit_crosscheck_verdict` with strict JSON-schema constrained sampling and terminates the run after the call, so no paid follow-up turn is needed.
 The Pi generation schema represents `evidence_files` as bounded path/content records because strict-tool preparation does not support schema-valued object properties.
 The host refuses duplicate paths, converts those records to the existing manifest dictionary, and then applies the unchanged path, content, and aggregate bounds.

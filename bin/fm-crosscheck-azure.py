@@ -62,6 +62,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "docs" / "azure-crosscheck" / "compartment.json"
 MODEL_GUEST = ROOT / "bin" / "fm-crosscheck-azure-model-guest.sh"
 PI_VERDICT_EXTENSION = ROOT / "bin" / "fm-crosscheck-pi-verdict-extension.mjs"
+PI_REVIEWER_RUNTIME = ROOT / "bin" / "fm-crosscheck-pi-reviewer.py"
 RUNNER_CONTROLLER = ROOT / "bin" / "fm-azure-runner.py"
 RUNNER_GUEST = ROOT / "bin" / "fm-azure-runner-guest.sh"
 RUNNER_EXECUTOR = ROOT / "bin" / "fm-azure-runner-exec.py"
@@ -2002,6 +2003,10 @@ def make_input(
             "source": PI_VERDICT_EXTENSION.read_text(encoding="utf-8"),
             "sha256": digest_file(PI_VERDICT_EXTENSION),
         },
+        "pi_reviewer_runtime": {
+            "source": PI_REVIEWER_RUNTIME.read_text(encoding="utf-8"),
+            "sha256": digest_file(PI_REVIEWER_RUNTIME),
+        },
         "prompt": prompt,
         "tool_protocol": {
             "model_tools": (
@@ -2018,6 +2023,7 @@ def make_input(
         "protocol": {
             "model_guest_digest": digest_file(MODEL_GUEST),
             "verdict_extension_digest": digest_file(PI_VERDICT_EXTENSION),
+            "pi_reviewer_runtime_digest": digest_file(PI_REVIEWER_RUNTIME),
             "runner_guest_digest": digest_file(RUNNER_GUEST),
             "runner_executor_digest": digest_file(RUNNER_EXECUTOR),
         },

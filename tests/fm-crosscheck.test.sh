@@ -5602,7 +5602,7 @@ PY
 }
 
 test_explicit_pi_tool_loads_with_discovery_disabled() {
-  local agent_root node_bin pi_bin pi_real probe_dir strict_module
+  local agent_root dependency_root node_bin pi_bin pi_real probe_dir strict_module
   probe_dir="$TMP_ROOT/pi-explicit-extension"
   mkdir -p "$probe_dir"
   "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" \
@@ -5691,7 +5691,14 @@ print(Path(sys.argv[1]).resolve())
 PY
 )
   agent_root=$(cd "$(dirname "$pi_real")/.." && pwd -P)
-  strict_module="$agent_root/node_modules/@earendil-works/pi-ai/dist/api/constrained-sampling.js"
+  strict_module=
+  for dependency_root in \
+    "$agent_root/node_modules" "$(dirname "$(dirname "$agent_root")")"; do
+    if [ -f "$dependency_root/@earendil-works/pi-ai/dist/api/constrained-sampling.js" ]; then
+      strict_module="$dependency_root/@earendil-works/pi-ai/dist/api/constrained-sampling.js"
+      break
+    fi
+  done
   [ -f "$strict_module" ] || fail "installed Pi has no strict-schema implementation"
   "$node_bin" --input-type=module - "$strict_module" "$agent_root/package.json" \
     "$probe_dir/local-schema.json" "$probe_dir/azure-schema.json" <<'JS'

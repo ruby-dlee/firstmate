@@ -1481,6 +1481,30 @@ def parse_meta(path: Path) -> dict[str, str] | None:
     return result
 
 
+def require_new_task_if_meta_missing(
+    meta: dict[str, str] | None,
+    meta_path: Path,
+    ledger_path: Path,
+    report_path: Path,
+) -> None:
+    if meta is not None:
+        return
+    durable_paths = []
+    for path in (ledger_path, report_path):
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            fail(f"durable task state inspection failed at {path}: {exc}")
+        durable_paths.append(path)
+    require(
+        not durable_paths,
+        f"task metadata is missing at {meta_path} for existing Crosscheck state "
+        f"at {durable_paths[0]}",
+    )
+
+
 def github_snapshot(root: Path, url: str) -> dict[str, Any]:
     adapter = root / "bin" / "fm-github-pr.py"
     result = run_command(
@@ -6133,13 +6157,17 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
     azure_adapter = load_azure_crosscheck_adapter(root)
     use_azure = azure_adapter.azure_review_enabled(home)
     data = Path(environment_value("FM_DATA_OVERRIDE", str(home / "data")))
-    with timer.phase("snapshot"):
-        try:
-            meta = parse_meta(state / f"{task_id}.meta")
-        except CrosscheckError as exc:
-            tool_fail(str(exc))
+    meta_path = state / f"{task_id}.meta"
     ledger_path = data / task_id / "crosscheck-ledger.json"
     report_path = data / task_id / "crosscheck.md"
+    with timer.phase("snapshot"):
+        try:
+            meta = parse_meta(meta_path)
+            require_new_task_if_meta_missing(
+                meta, meta_path, ledger_path, report_path
+            )
+        except CrosscheckError as exc:
+            tool_fail(str(exc))
     with timer.phase("snapshot"):
         try:
             snapshot_value = github_snapshot(root, url)

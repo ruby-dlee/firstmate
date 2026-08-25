@@ -3181,6 +3181,34 @@ test_missing_task_metadata_starts_new_dispatch() {
   pass "a brand-new task ID dispatches without hidden pre-created metadata"
 }
 
+test_missing_metadata_for_existing_task_fails_closed() {
+  local state_kind record case_dir base head rc
+  for state_kind in ledger report; do
+    record=$(make_case "missing-metadata-existing-$state_kind")
+    IFS=$'\t' read -r case_dir base head <<< "$record"
+    rm "$case_dir/state/task-x1.meta"
+    mkdir -p "$case_dir/data/task-x1"
+    if [ "$state_kind" = ledger ]; then
+      seed_open_ledger "$case_dir" "$head"
+    else
+      printf '%s\n' '# Prior Crosscheck report' \
+        > "$case_dir/data/task-x1/crosscheck.md"
+    fi
+    set +e
+    run_case "$case_dir" "$base" "$head" clear run \
+      > "$case_dir/out" 2> "$case_dir/err"
+    rc=$?
+    set -e
+    expect_code 1 "$rc" "missing metadata with existing $state_kind state"
+    assert_grep 'for existing Crosscheck state at' \
+      "$case_dir/err" \
+      "missing metadata did not fail closed for existing $state_kind state"
+    assert_absent "$case_dir/codex.log" \
+      "reviewer launched without metadata for existing $state_kind state"
+  done
+  pass "existing durable Crosscheck state requires task metadata before dispatch"
+}
+
 test_existing_task_metadata_identity_collision_fails_closed() {
   local record case_dir base head rc
   record=$(make_case existing-task-identity-collision)
@@ -6129,6 +6157,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_empty_environment_fallback_is_generic|\
     test_set_runtime_overrides_remain_authoritative|\
     test_missing_task_metadata_starts_new_dispatch|\
+    test_missing_metadata_for_existing_task_fails_closed|\
     test_existing_task_metadata_identity_collision_fails_closed|\
     test_review_fetches_exact_pr_head_when_author_worktree_is_behind|\
     test_missing_pr_head_ref_fails_closed|\
@@ -6257,6 +6286,7 @@ test_empty_runtime_overrides_use_home_defaults
 test_empty_environment_fallback_is_generic
 test_set_runtime_overrides_remain_authoritative
 test_missing_task_metadata_starts_new_dispatch
+test_missing_metadata_for_existing_task_fails_closed
 test_existing_task_metadata_identity_collision_fails_closed
 test_review_fetches_exact_pr_head_when_author_worktree_is_behind
 test_missing_pr_head_ref_fails_closed

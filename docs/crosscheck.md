@@ -135,10 +135,10 @@ bin/fm-crosscheck.sh run <task-id> <https://github.com/owner/repo/pull/number>
 ```
 
 A brand-new task ID does not need a pre-created `state/<task-id>.meta` file.
-When that file is genuinely absent, Crosscheck starts with no recorded author
-model and dispatches the configured reviewer roster normally. If the file
-exists, its author harness/model identity remains authoritative: unreadable,
-malformed, duplicate, blank, or model-colliding metadata still fails closed.
+Metadata-free dispatch is allowed only when that task ID has neither an existing Crosscheck ledger nor report.
+In that case, Crosscheck starts with no recorded author model and dispatches the configured reviewer roster normally.
+Existing durable Crosscheck state plus missing metadata fails closed before reviewer dispatch.
+When metadata exists, its author harness/model identity remains authoritative: unreadable, malformed, duplicate, blank, or model-colliding metadata still fails closed.
 
 The run writes `data/<task-id>/crosscheck-ledger.json` and the readable `data/<task-id>/crosscheck.md` report.
 The run exits zero only when the exact head has a complete review, the reviewer supplied a successfully gate-reexecuted exact-base/exact-head reproduction, the durable ledger has no active blocker, and the reviewer returned no unreproduced suspicion.

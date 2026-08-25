@@ -3496,6 +3496,25 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
                 )
                 terminal_provider = reviewer.get("terminal_provider")
                 terminal_model = reviewer.get("terminal_model")
+                current_regular_contract = (
+                    reviewer.get("model")
+                    == CROSS_FAMILY_LANES["fireworks-glm"]["model"]
+                    and reviewer.get("review_family_mode")
+                    == REVIEW_FAMILY_CROSS_FAMILY_PRIMARY
+                    and reviewer.get("execution_mode")
+                    != "azure-compartment-v1"
+                    and reviewer.get("review_contract_sha256")
+                    == review_contract_sha256(False, "pi")
+                )
+                if current_regular_contract:
+                    require(
+                        terminal_provider is not None
+                        and terminal_model is not None
+                        and reviewer.get("review_depth_passes") is not None
+                        and reviewer.get("review_depth_mode") is not None,
+                        f"{label}.reviewer current regular review contract is "
+                        "missing terminal or depth fields",
+                    )
                 if terminal_provider is not None or terminal_model is not None:
                     require(
                         terminal_provider

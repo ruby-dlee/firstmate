@@ -3181,6 +3181,39 @@ test_missing_task_metadata_starts_new_dispatch() {
   pass "a brand-new task ID dispatches without hidden pre-created metadata"
 }
 
+test_mismatched_state_without_metadata_fails_closed() {
+  local override_kind record case_dir base head selected_state rc
+  for override_kind in empty nonexistent; do
+    record=$(make_case "mismatched-state-$override_kind")
+    IFS=$'\t' read -r case_dir base head <<< "$record"
+    mkdir -p "$case_dir/home/state"
+    mv "$case_dir/state/task-x1.meta" "$case_dir/home/state/task-x1.meta"
+    selected_state="$case_dir/$override_kind-state"
+    if [ "$override_kind" = empty ]; then
+      mkdir -p "$selected_state"
+    fi
+    set +e
+    FM_TEST_STATE_OVERRIDE="$selected_state" \
+      run_case "$case_dir" "$base" "$head" clear run \
+        > "$case_dir/out" 2> "$case_dir/err"
+    rc=$?
+    set -e
+    expect_code 1 "$rc" "mismatched $override_kind state override"
+    if [ "$override_kind" = empty ]; then
+      assert_grep 'but exists in the canonical state directory at' \
+        "$case_dir/err" \
+        "an empty mismatched state namespace hid canonical task metadata"
+    else
+      assert_grep 'selected Crosscheck state directory does not exist at' \
+        "$case_dir/err" \
+        "a nonexistent state namespace was accepted as a new task"
+    fi
+    assert_absent "$case_dir/codex.log" \
+      "reviewer launched from a mismatched state namespace"
+  done
+  pass "mismatched state namespaces fail closed before reviewer dispatch"
+}
+
 test_missing_metadata_for_existing_task_fails_closed() {
   local state_kind record case_dir base head rc
   for state_kind in ledger report; do
@@ -6157,6 +6190,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_empty_environment_fallback_is_generic|\
     test_set_runtime_overrides_remain_authoritative|\
     test_missing_task_metadata_starts_new_dispatch|\
+    test_mismatched_state_without_metadata_fails_closed|\
     test_missing_metadata_for_existing_task_fails_closed|\
     test_existing_task_metadata_identity_collision_fails_closed|\
     test_review_fetches_exact_pr_head_when_author_worktree_is_behind|\
@@ -6286,6 +6320,7 @@ test_empty_runtime_overrides_use_home_defaults
 test_empty_environment_fallback_is_generic
 test_set_runtime_overrides_remain_authoritative
 test_missing_task_metadata_starts_new_dispatch
+test_mismatched_state_without_metadata_fails_closed
 test_missing_metadata_for_existing_task_fails_closed
 test_existing_task_metadata_identity_collision_fails_closed
 test_review_fetches_exact_pr_head_when_author_worktree_is_behind

@@ -1483,12 +1483,46 @@ def parse_meta(path: Path) -> dict[str, str] | None:
 
 def require_new_task_if_meta_missing(
     meta: dict[str, str] | None,
+    state: Path,
+    default_state: Path,
     meta_path: Path,
     ledger_path: Path,
     report_path: Path,
 ) -> None:
     if meta is not None:
         return
+    try:
+        state_stat = state.stat()
+    except FileNotFoundError:
+        fail(f"selected Crosscheck state directory does not exist at {state}")
+    except OSError as exc:
+        fail(f"selected Crosscheck state directory inspection failed at {state}: {exc}")
+    require(
+        stat.S_ISDIR(state_stat.st_mode),
+        f"selected Crosscheck state path is not a directory at {state}",
+    )
+    try:
+        uses_default_state = os.path.samefile(state, default_state)
+    except FileNotFoundError:
+        uses_default_state = False
+    except OSError as exc:
+        fail(f"Crosscheck state directory comparison failed: {exc}")
+    if not uses_default_state:
+        default_meta_path = default_state / meta_path.name
+        try:
+            default_meta_path.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            fail(
+                "canonical task metadata inspection failed at "
+                f"{default_meta_path}: {exc}"
+            )
+        else:
+            fail(
+                f"task metadata is missing at {meta_path}, but exists in the "
+                f"canonical state directory at {default_meta_path}"
+            )
     durable_paths = []
     for path in (ledger_path, report_path):
         try:
@@ -6153,7 +6187,8 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
     # the recorded `total` covers everything the caller waits for, including
     # the unattributed gaps between the named phases.
     timer = PhaseTimer()
-    state = Path(environment_value("FM_STATE_OVERRIDE", str(home / "state")))
+    default_state = home / "state"
+    state = Path(environment_value("FM_STATE_OVERRIDE", str(default_state)))
     azure_adapter = load_azure_crosscheck_adapter(root)
     use_azure = azure_adapter.azure_review_enabled(home)
     data = Path(environment_value("FM_DATA_OVERRIDE", str(home / "data")))
@@ -6164,7 +6199,12 @@ def run_crosscheck(root: Path, home: Path, task_id: str, url: str) -> int:
         try:
             meta = parse_meta(meta_path)
             require_new_task_if_meta_missing(
-                meta, meta_path, ledger_path, report_path
+                meta,
+                state,
+                default_state,
+                meta_path,
+                ledger_path,
+                report_path,
             )
         except CrosscheckError as exc:
             tool_fail(str(exc))
@@ -7010,6 +7050,22 @@ def main() -> int:
         if args.command == "economics":
             # Read-only, outside the task lock like timings.
             return economics_crosscheck(home, args.task_id)
+        if args.command == "run":
+            try:
+                selected_state_stat = state.stat()
+            except FileNotFoundError:
+                tool_fail(
+                    f"selected Crosscheck state directory does not exist at {state}"
+                )
+            except OSError as exc:
+                tool_fail(
+                    "selected Crosscheck state directory inspection failed at "
+                    f"{state}: {exc}"
+                )
+            if not stat.S_ISDIR(selected_state_stat.st_mode):
+                tool_fail(
+                    f"selected Crosscheck state path is not a directory at {state}"
+                )
         state.mkdir(parents=True, exist_ok=True)
         lock_path = state / f".{args.task_id}.crosscheck.lock"
         with lock_path.open("a+", encoding="utf-8") as lock:

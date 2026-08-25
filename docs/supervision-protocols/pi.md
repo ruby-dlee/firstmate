@@ -1,4 +1,4 @@
-Mode: Pi extension background wake.
+Mode: Pi extension background wake with direct-exchange compaction continuity.
 
 When this session owns supervision and away mode is not active:
 1. Drain first with `bin/fm-wake-drain.sh`.
@@ -6,7 +6,7 @@ When this session owns supervision and away mode is not active:
 3. Arm supervision with the `fm_watch_arm_pi` tool.
    Use `/fm-watch-arm-pi` only as a human-entered fallback.
    Never run `bin/fm-watch-arm.sh` through Pi's bash tool because that foreground arm can wedge the agent and bypasses extension-owned cleanup.
-4. The extension starts `bin/fm-watch-arm.sh --restart`, keeps the child attached to the live Pi process, and sends a follow-up user message when the child exits with an actionable watcher reason.
+4. The extension starts `bin/fm-watch-arm.sh --restart`, keeps the child attached to the live Pi process, and sends a context-participating `firstmate-watcher-wake` custom follow-up when the child exits with an actionable watcher reason.
 5. If the extension says the watcher is already healthy, do not start another cycle.
 6. If the extension reports a watcher failure, drain queued wakes, inspect the failure text, and restart Pi with both extensions loaded if needed.
 7. Never use shell `&` for watcher supervision.
@@ -15,6 +15,49 @@ When this session owns supervision and away mode is not active:
 The turn-end guard extension lives at `__FM_PI_TURNEND_EXT__`.
 The watcher extension lives at `__FM_PI_EXT__`.
 Both are tracked, project-local `.pi/extensions/*.ts` files that Pi auto-discovers once the project is trusted; `bin/fm-session-start.sh` reports when the running Pi session has not loaded both required extensions.
+
+## Input provenance and compaction continuity
+
+This document owns the Pi-specific boundary between direct captain input, automated supervision prompts, pending input, and rebuilt post-compaction model context.
+The watcher and turn-end extensions use Pi's context-participating `sendMessage()` custom-message path with distinct `firstmate-watcher-wake` and `firstmate-turnend-guard` types, `deliverAs: "followUp"`, and `triggerTurn: true`.
+They never use `sendUserMessage()` for automation, so supervision remains visible to the model without becoming a human-authored `role: "user"` turn.
+
+The watcher extension observes Pi's `input` event and records only `interactive` or `rpc` submissions as non-context `firstmate-direct-exchange` entries before Pi queues or delivers them.
+It records the exact delivered user content on `message_end`, and records an exact completed assistant answer only on `stopReason: "stop"` when no extension custom message intervened after delivery.
+These append-only records survive compaction and session resume without changing Pi's queue ordering.
+A queued submission remains owned by Pi while `ctx.hasPendingMessages()` is true, so continuity metadata never bypasses the steering or follow-up queue.
+If Pi later reports no pending message and no delivered user message exists, the context hook emits the exact submitted text as `SUBMITTED_NOT_DELIVERED` instead of silently forgetting it.
+
+Before each model request, the extension compares Pi's compaction-aware message list with the full active branch.
+When compaction omitted the latest completed direct exchange, the hook injects one hidden `firstmate-direct-exchange-continuity` custom message containing the exact JSON user content, the exact JSON assistant answer, and `ANSWERED`.
+Every delivered input without a completed answer is included distinctly as `OPEN_REPLY_OBLIGATION`.
+The continuity message identifies itself as extension-generated metadata and states that watcher and guard prompts are custom messages rather than captain-authored requests.
+It is inserted before the current human user message, preserving that user message as the final prompt and avoiding tool-call or tool-result adjacency changes.
+The mechanism does not cancel compaction, enlarge `keepRecentTokens`, alter the cut point, or refuse a turn; malformed or absent continuity state simply leaves Pi's ordinary context unchanged.
+
+### 2026-08-25 incident evidence
+
+The source was the live Pi 0.84.2 JSONL session `2026-08-24T12-45-47-533Z_01a033ce-368d-7c69-9c34-acd78d33130d.jsonl` under the primary's Pi session directory.
+The captain's input carried message timestamp `2026-08-25T03:28:00.086Z` and was persisted as entry `e5eafcbb` at `03:28:06.116Z`, a 6.030-second steering delay while the current tool turn finished.
+The exact assistant answer was persisted as `f2a84da7` at `03:28:48.884Z`.
+An extension watcher input had been generated earlier at `03:27:33.185Z` but was persisted as `85a87db6` at `03:28:48.886Z`, a 75.701-second follow-up delay and two milliseconds after the direct answer.
+This ordering proves that the submitted human steering input was delayed but neither omitted nor starved: both its exact user entry and exact assistant answer exist before the older extension follow-up was delivered.
+The JSONL contains no additional submitted human entry between that answer and the watcher follow-up; editor text that was never submitted is outside session evidence and is not claimed either way.
+Compaction `d4b4f008` followed at `03:29:11.300Z` with `firstKeptEntryId=85a87db6`, so the exact direct exchange remained only inside a lossy summary while the automated follow-up and later supervision turns occupied the live tail.
+
+### 2026-08-25 regression evidence
+
+Deterministic command: `tests/fm-pi-watch-extension.test.sh`.
+Observed output included `ok - Pi compaction continuity preserves exact human exchange across automated custom prompts`.
+The regression uses Pi 0.84.2's installed `SessionManager` to build the actual compaction-aware context after an exact human question and answer, a custom watcher prompt, an assistant supervision response, and a compaction whose first-kept entry is the watcher custom message.
+It then delivers a referring human follow-up and proves the chained context hook adds the exact prior question and answer as `ANSWERED`, adds the follow-up as `OPEN_REPLY_OBLIGATION`, keeps both records custom rather than user-authored, leaves a still-pending steering submission in Pi's queue, and emits `SUBMITTED_NOT_DELIVERED` only after that pending signal disappears without delivery.
+A second compaction fixture cuts an unanswered direct question behind a custom watcher turn and proves the exact question returns as `OPEN_REPLY_OBLIGATION` rather than being inferred from summary prose.
+
+Live command: `FM_PI_COMPACTION_LIVE_E2E=1 FM_PI_LIVE_AUTH_DIR='/Users/dongkeun/.pi/firstmate-local' tests/fm-pi-primary-compaction-live-e2e.test.sh`.
+Observed output: `ok - Pi 0.84.2 live compaction rebuilt the exact answered captain exchange across a custom watcher turn (firstKeptType=message)`.
+The smoke used a cloned project, private tmux socket, isolated `PI_CODING_AGENT_DIR`, isolated `FM_HOME`, copied read-only credential input, synthetic isolated watcher arm, real Pi `/compact`, and a later model turn.
+The isolated session proved the compaction cut after the direct exchange, captured the provider-bound rebuilt context with the exact question, exact answer, `ANSWERED`, and custom-message provenance, and observed the resumed model identify the prior direct question and report that it had been answered.
+It did not touch the live primary session, home, session file, lock, wake queue, or watcher.
 
 Verification on 2026-07-09 used Pi 0.80.5, an isolated `PI_CODING_AGENT_DIR`, an isolated `FM_HOME`, and the dedicated tmux socket `fm-pi-q6-lab`.
 The command `Use the fm_watch_arm_pi custom tool now. Do not use bash.` rendered `watcher: started Pi extension arm child 1`, then the model returned `DONE` without the prior `result.content.filter(...)` crash.

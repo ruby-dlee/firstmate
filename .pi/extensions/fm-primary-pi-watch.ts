@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 type ArmResult = {
@@ -12,7 +12,161 @@ type ArmResult = {
   message: string;
 };
 
+type DirectExchangeEvent = {
+  version: 1;
+  event: "submitted" | "delivered" | "answered";
+  exchangeId: string;
+  at: number;
+  inputText?: string;
+  imageCount?: number;
+  delivery?: "immediate" | "steer" | "followUp";
+  content?: unknown;
+};
+
+type DirectExchangeState = {
+  exchangeId: string;
+  submittedAt: number;
+  inputText: string;
+  imageCount: number;
+  delivery: "immediate" | "steer" | "followUp";
+  deliveredAt?: number;
+  deliveredContent?: unknown;
+  deliveredRecordIndex?: number;
+  answeredAt?: number;
+  answerContent?: unknown;
+};
+
 type LockOwnership = "owned" | "missing" | "other";
+
+const directExchangeEntryType = "firstmate-direct-exchange";
+const continuityMessageType = "firstmate-direct-exchange-continuity";
+
+function cloneJson(value: unknown): unknown {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return String(value);
+  }
+}
+
+function textContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part): part is { type: "text"; text: string } => {
+      if (!part || typeof part !== "object") return false;
+      const candidate = part as { type?: unknown; text?: unknown };
+      return candidate.type === "text" && typeof candidate.text === "string";
+    })
+    .map((part) => part.text)
+    .join("\n");
+}
+
+function parseDirectExchangeEvent(entry: SessionEntry): DirectExchangeEvent | undefined {
+  if (entry.type !== "custom" || entry.customType !== directExchangeEntryType) return undefined;
+  const data = entry.data;
+  if (!data || typeof data !== "object") return undefined;
+  const candidate = data as Partial<DirectExchangeEvent>;
+  if (
+    candidate.version !== 1 ||
+    !["submitted", "delivered", "answered"].includes(candidate.event ?? "") ||
+    typeof candidate.exchangeId !== "string" ||
+    !candidate.exchangeId ||
+    typeof candidate.at !== "number"
+  ) {
+    return undefined;
+  }
+  return candidate as DirectExchangeEvent;
+}
+
+function foldDirectExchanges(entries: SessionEntry[]): DirectExchangeState[] {
+  const ordered: DirectExchangeState[] = [];
+  const byId = new Map<string, DirectExchangeState>();
+  entries.forEach((entry, index) => {
+    const event = parseDirectExchangeEvent(entry);
+    if (!event) return;
+    if (event.event === "submitted") {
+      if (byId.has(event.exchangeId) || typeof event.inputText !== "string") return;
+      const state: DirectExchangeState = {
+        exchangeId: event.exchangeId,
+        submittedAt: event.at,
+        inputText: event.inputText,
+        imageCount: event.imageCount ?? 0,
+        delivery: event.delivery ?? "immediate",
+      };
+      byId.set(event.exchangeId, state);
+      ordered.push(state);
+      return;
+    }
+    const state = byId.get(event.exchangeId);
+    if (!state) return;
+    if (event.event === "delivered") {
+      state.deliveredAt = event.at;
+      state.deliveredContent = event.content;
+      state.deliveredRecordIndex = index;
+    } else if (event.event === "answered") {
+      state.answeredAt = event.at;
+      state.answerContent = event.content;
+    }
+  });
+  return ordered;
+}
+
+function contentPresent(messages: Array<{ role: string; content?: unknown }>, role: string, content: unknown): boolean {
+  const expected = JSON.stringify(content);
+  return messages.some((message) => message.role === role && JSON.stringify(message.content) === expected);
+}
+
+function renderDirectExchangeContinuity(
+  entries: SessionEntry[],
+  messages: Array<{ role: string; content?: unknown }>,
+  hasPendingMessages: boolean,
+): string | undefined {
+  const exchanges = foldDirectExchanges(entries);
+  const sections: string[] = [];
+  const latestAnswered = [...exchanges].reverse().find((exchange) => exchange.answerContent !== undefined);
+  if (
+    latestAnswered &&
+    (!contentPresent(messages, "user", latestAnswered.deliveredContent) ||
+      !contentPresent(messages, "assistant", latestAnswered.answerContent))
+  ) {
+    sections.push(
+      [
+        `Exchange ${latestAnswered.exchangeId}: ANSWERED`,
+        `Human input, exact JSON: ${JSON.stringify(latestAnswered.deliveredContent)}`,
+        `Assistant answer, exact JSON: ${JSON.stringify(latestAnswered.answerContent)}`,
+      ].join("\n"),
+    );
+  }
+  for (const exchange of exchanges) {
+    if (exchange.answerContent !== undefined) continue;
+    if (exchange.deliveredContent !== undefined) {
+      sections.push(
+        [
+          `Exchange ${exchange.exchangeId}: OPEN_REPLY_OBLIGATION`,
+          `Human input, exact JSON: ${JSON.stringify(exchange.deliveredContent)}`,
+          "No completed assistant answer was observed before compaction.",
+        ].join("\n"),
+      );
+    } else if (!hasPendingMessages) {
+      sections.push(
+        [
+          `Exchange ${exchange.exchangeId}: SUBMITTED_NOT_DELIVERED`,
+          `Human input text, exact JSON: ${JSON.stringify(exchange.inputText)}`,
+          `Attached image count: ${exchange.imageCount}`,
+          "Pi no longer reports this submission in its pending queue and no delivered user message was observed. Treat it as an open reply obligation and verify the apparent delivery loss.",
+        ].join("\n"),
+      );
+    }
+  }
+  if (sections.length === 0) return undefined;
+  return [
+    "FIRSTMATE DIRECT EXCHANGE CONTINUITY",
+    "This is extension-generated context metadata, not human-authored input.",
+    "Watcher and turn-end supervision prompts are custom messages, not captain-authored requests.",
+    ...sections,
+  ].join("\n\n");
+}
 
 const extensionFile = fileURLToPath(import.meta.url);
 const extensionDir = dirname(extensionFile);
@@ -90,6 +244,12 @@ function failureLine(stdout: string, stderr: string, code: number | null): strin
 }
 
 export default function (pi: ExtensionAPI) {
+  let exchangeSequence = 0;
+
+  function appendDirectExchange(event: DirectExchangeEvent): void {
+    pi.appendEntry(directExchangeEntryType, event);
+  }
+
   function stopArm(): void {
     if (child) child.kill("SIGTERM");
     child = null;
@@ -100,10 +260,15 @@ export default function (pi: ExtensionAPI) {
   };
   process.once("exit", cleanupOnProcessExit);
 
-  async function sendWake(message: string) {
-    await pi.sendUserMessage(
-      `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first, handle the queued wake, then resume Pi supervision.`,
-      { deliverAs: "followUp" },
+  function sendWake(message: string): void {
+    pi.sendMessage(
+      {
+        customType: "firstmate-watcher-wake",
+        content: `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first, handle the queued wake, then resume Pi supervision.`,
+        display: true,
+        details: { version: 1, source: "firstmate-extension", kind: "watcher-wake" },
+      },
+      { deliverAs: "followUp", triggerTurn: true },
     );
   }
 
@@ -138,7 +303,7 @@ export default function (pi: ExtensionAPI) {
       const failure = reason ? "" : failureLine(stdout, stderr, code);
       if (!reason && !failure) return;
       try {
-        await sendWake(reason || failure);
+        sendWake(reason || failure);
       } catch {
         // Pi owns delivery errors; fail open so the extension never wedges the session.
       }
@@ -146,7 +311,7 @@ export default function (pi: ExtensionAPI) {
     child.on("error", async (error: Error) => {
       child = null;
       try {
-        await sendWake(`watcher: FAILED - Pi extension arm child ${id} failed: ${error.message}`);
+        sendWake(`watcher: FAILED - Pi extension arm child ${id} failed: ${error.message}`);
       } catch {
         // Fail open.
       }
@@ -156,6 +321,88 @@ export default function (pi: ExtensionAPI) {
 
   pi.on?.("session_start", () => {
     markLoaded();
+  });
+
+  pi.on("input", (event) => {
+    if (event.source === "extension") return;
+    const at = Date.now();
+    const exchangeId = createHash("sha256")
+      .update(`${at}\0${++exchangeSequence}\0${event.source}\0${event.text}`)
+      .digest("hex")
+      .slice(0, 16);
+    appendDirectExchange({
+      version: 1,
+      event: "submitted",
+      exchangeId,
+      at,
+      inputText: event.text,
+      imageCount: event.images?.length ?? 0,
+      delivery: event.streamingBehavior ?? "immediate",
+    });
+  });
+
+  pi.on("message_end", (event, ctx) => {
+    if (event.message.role === "user") {
+      const content = cloneJson(event.message.content);
+      const userText = textContent(event.message.content);
+      const pending = foldDirectExchanges(ctx.sessionManager.getBranch()).filter(
+        (exchange) => exchange.deliveredContent === undefined,
+      );
+      const exchange = pending.find((candidate) => candidate.inputText === userText) ?? pending[0];
+      if (!exchange) return;
+      appendDirectExchange({
+        version: 1,
+        event: "delivered",
+        exchangeId: exchange.exchangeId,
+        at: event.message.timestamp,
+        content,
+      });
+      return;
+    }
+    if (event.message.role !== "assistant" || event.message.stopReason !== "stop") return;
+    const answerText = textContent(event.message.content);
+    if (!answerText) return;
+    const branch = ctx.sessionManager.getBranch();
+    const open = foldDirectExchanges(branch).filter((exchange) => {
+      if (exchange.deliveredContent === undefined || exchange.answerContent !== undefined) return false;
+      const deliveredIndex = exchange.deliveredRecordIndex;
+      if (deliveredIndex === undefined) return false;
+      return !branch.slice(deliveredIndex + 1).some((entry) => entry.type === "custom_message");
+    });
+    for (const exchange of open) {
+      appendDirectExchange({
+        version: 1,
+        event: "answered",
+        exchangeId: exchange.exchangeId,
+        at: event.message.timestamp,
+        content: cloneJson(event.message.content),
+      });
+    }
+  });
+
+  pi.on("context", (event, ctx) => {
+    const continuity = renderDirectExchangeContinuity(
+      ctx.sessionManager.getBranch(),
+      event.messages,
+      ctx.hasPendingMessages(),
+    );
+    if (!continuity) return;
+    const message = {
+      role: "custom" as const,
+      customType: continuityMessageType,
+      content: continuity,
+      display: false,
+      details: { version: 1, source: "firstmate-extension", kind: "direct-exchange-continuity" },
+      timestamp: Date.now(),
+    };
+    let insertAt = 0;
+    for (let i = event.messages.length - 1; i >= 0; i -= 1) {
+      if (event.messages[i]?.role === "user") {
+        insertAt = i;
+        break;
+      }
+    }
+    return { messages: [...event.messages.slice(0, insertAt), message, ...event.messages.slice(insertAt)] };
   });
   pi.on?.("session_shutdown", () => {
     stopArm();

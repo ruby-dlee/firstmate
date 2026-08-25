@@ -39,8 +39,15 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" "fm_watch_arm_pi" "tracked extension missing tool name"
   assert_contains "$text" "fm-watch-arm-pi" "tracked extension missing command name"
   assert_contains "$text" "fm-watch-arm.sh" "tracked extension missing watcher arm"
-  assert_contains "$text" "sendUserMessage" "tracked extension missing Pi wake API"
+  assert_contains "$text" "sendMessage" "tracked extension missing Pi custom-message wake API"
+  assert_not_contains "$text" "sendUserMessage" "tracked extension still makes automated wakes masquerade as human input"
+  assert_contains "$text" 'customType: "firstmate-watcher-wake"' "tracked extension does not classify watcher wakes as custom messages"
   assert_contains "$text" "deliverAs: \"followUp\"" "tracked extension missing followUp delivery"
+  assert_contains "$text" "triggerTurn: true" "tracked extension custom wake does not trigger an idle Pi turn"
+  assert_contains "$text" 'pi.on("context"' "tracked extension missing direct-exchange compaction continuity"
+  assert_contains "$text" 'pi.on("input"' "tracked extension missing human-input source tracking"
+  assert_contains "$text" "OPEN_REPLY_OBLIGATION" "tracked extension missing explicit open-reply continuity state"
+  assert_contains "$text" "SUBMITTED_NOT_DELIVERED" "tracked extension missing submitted-versus-delivered continuity state"
   assert_contains "$text" ".pi-watch-extension-loaded" "tracked extension missing loaded marker"
   assert_contains "$text" 'createHash("sha256").update(readFileSync(extensionFile)).digest("hex")' "tracked extension does not self-hash its own content for extensionVersion"
   assert_contains "$text" 'fileURLToPath(import.meta.url)' "tracked extension does not self-locate via import.meta.url"
@@ -97,14 +104,19 @@ import { pathToFileURL } from "node:url";
 let handler = null;
 let notification = "";
 let prompt = "";
+let promptType = "";
+let promptOptions = null;
 const pi = {
   on() {},
+  appendEntry() {},
   registerCommand(name, options) {
     if (name === "fm-watch-arm-pi") handler = options.handler;
   },
   registerTool() {},
-  sendUserMessage: async (message) => {
-    prompt = message;
+  sendMessage(message, options) {
+    prompt = message.content;
+    promptType = message.customType;
+    promptOptions = options;
   },
 };
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
@@ -134,6 +146,14 @@ for (let i = 0; i < 50 && !prompt; i += 1) {
 }
 if (!prompt.includes("FIRSTMATE WATCHER WAKE")) {
   console.error(`missing follow-up prompt: ${prompt}`);
+  process.exit(1);
+}
+if (promptType !== "firstmate-watcher-wake") {
+  console.error(`wake was not a custom watcher message: ${promptType}`);
+  process.exit(1);
+}
+if (promptOptions?.deliverAs !== "followUp" || promptOptions?.triggerTurn !== true) {
+  console.error(`unexpected custom wake delivery: ${JSON.stringify(promptOptions)}`);
   process.exit(1);
 }
 if (!prompt.includes("external healthy watcher")) {
@@ -172,11 +192,12 @@ import { pathToFileURL } from "node:url";
 let tool = null;
 const pi = {
   on() {},
+  appendEntry() {},
   registerCommand() {},
   registerTool(candidate) {
     if (candidate.name === "fm_watch_arm_pi") tool = candidate;
   },
-  sendUserMessage: async () => {},
+  sendMessage() {},
 };
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -220,9 +241,10 @@ const pi = {
   on(event, handler) {
     handlers.set(event, handler);
   },
+  appendEntry() {},
   registerCommand() {},
   registerTool() {},
-  sendUserMessage: async () => {},
+  sendMessage() {},
 };
 const before = process.listenerCount("exit");
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -266,11 +288,12 @@ import { pathToFileURL } from "node:url";
 let tool = null;
 const pi = {
   on() {},
+  appendEntry() {},
   registerCommand() {},
   registerTool(candidate) {
     if (candidate.name === "fm_watch_arm_pi") tool = candidate;
   },
-  sendUserMessage: async () => {},
+  sendMessage() {},
 };
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -298,6 +321,226 @@ EOF
     fail "Pi arm child $pid survived process-exit cleanup"
   fi
   pass "Pi process-exit cleanup stops the attached arm child"
+}
+
+test_pi_compaction_preserves_direct_exchange_and_pending_input() {
+  local repo home plugin pi_bin pi_package_dir out status
+  fm_node_supports_ts_import || { pass "node lacks .ts import support, skipping Pi compaction-continuity check"; return; }
+  pi_bin=$(command -v pi 2>/dev/null || true)
+  [ -n "$pi_bin" ] || { pass "Pi is unavailable, skipping installed SessionManager compaction-continuity check"; return; }
+  pi_package_dir=$(cd "$(dirname "$pi_bin")/../lib/node_modules/@earendil-works/pi-coding-agent" 2>/dev/null && pwd -P) || {
+    pass "installed Pi package is unavailable, skipping SessionManager compaction-continuity check"
+    return
+  }
+  repo="$TMP_ROOT/pi-compaction-continuity-root"
+  home="$TMP_ROOT/pi-compaction-continuity-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'signal: deterministic supervision prompt\n'
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(NODE_OPTIONS=--disable-warning=ExperimentalWarning PLUGIN="$plugin" PI_PACKAGE_DIR="$pi_package_dir" REPO="$repo" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
+import { writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const { SessionManager } = await import(pathToFileURL(`${process.env.PI_PACKAGE_DIR}/dist/index.js`).href);
+let sessionManager = SessionManager.inMemory(process.env.REPO);
+const handlers = new Map();
+let tool = null;
+let automatedMessage = null;
+let automatedOptions = null;
+let pendingMessages = false;
+
+const pi = {
+  on(event, handler) {
+    handlers.set(event, handler);
+  },
+  appendEntry(customType, data) {
+    sessionManager.appendCustomEntry(customType, data);
+  },
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendMessage(message, options) {
+    automatedMessage = message;
+    automatedOptions = options;
+  },
+};
+const ctx = {
+  get sessionManager() {
+    return sessionManager;
+  },
+  hasPendingMessages: () => pendingMessages,
+};
+async function input(text, streamingBehavior) {
+  await handlers.get("input")(
+    { type: "input", text, source: "interactive", streamingBehavior },
+    ctx,
+  );
+}
+async function finishMessage(message) {
+  await handlers.get("message_end")({ type: "message_end", message }, ctx);
+  sessionManager.appendMessage(message);
+}
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+if (!tool) throw new Error("Pi watch tool was not registered");
+
+const question = "DIRECT-CAPTAIN-Q-7: Which harbor token should remain reserved?";
+const answer = "DIRECT-CAPTAIN-A-7: amber.";
+const followup = "Which question did I ask before the automated supervision turn, and was it answered?";
+const queued = "QUEUED-CAPTAIN-Q-8: preserve this pending input too";
+const questionContent = [{ type: "text", text: question }];
+const answerContent = [{ type: "text", text: answer }];
+
+await input(question);
+await finishMessage({ role: "user", content: questionContent, timestamp: 1700000000100 });
+await finishMessage({
+  role: "assistant",
+  content: answerContent,
+  stopReason: "stop",
+  timestamp: 1700000000200,
+});
+
+await tool.execute("tool-compaction", {}, undefined, undefined, {});
+for (let i = 0; i < 100 && !automatedMessage; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 10));
+}
+if (!automatedMessage) throw new Error("watcher did not produce an automated prompt");
+if (automatedMessage.customType !== "firstmate-watcher-wake") {
+  throw new Error(`watcher prompt masqueraded as user input: ${automatedMessage.customType}`);
+}
+if (automatedOptions?.deliverAs !== "followUp" || automatedOptions?.triggerTurn !== true) {
+  throw new Error(`wrong watcher queue behavior: ${JSON.stringify(automatedOptions)}`);
+}
+const automatedEntryId = sessionManager.appendCustomMessageEntry(
+  automatedMessage.customType,
+  automatedMessage.content,
+  true,
+  automatedMessage.details,
+);
+sessionManager.appendMessage({
+  role: "assistant",
+  content: [{ type: "text", text: "Automated supervision handled." }],
+  stopReason: "stop",
+  timestamp: 1700000000300,
+});
+const compactionId = sessionManager.appendCompaction(
+  "Lossy summary without the direct captain exchange.",
+  automatedEntryId,
+  131874,
+  { fixture: "automated-boundary" },
+  true,
+);
+const compaction = sessionManager.getEntry(compactionId);
+if (compaction?.type !== "compaction" || compaction.firstKeptEntryId !== automatedEntryId) {
+  throw new Error("fixture did not compact at the automated-message boundary");
+}
+
+await input(followup);
+const followupContent = [{ type: "text", text: followup }];
+await finishMessage({ role: "user", content: followupContent, timestamp: 1700000000400 });
+const rebuilt = sessionManager.buildSessionContext().messages;
+if (rebuilt.some((message) => message.role === "user" && JSON.stringify(message.content) === JSON.stringify(questionContent))) {
+  throw new Error("SessionManager fixture unexpectedly retained the pre-boundary captain question");
+}
+if (!rebuilt.some((message) => message.role === "custom" && message.customType === "firstmate-watcher-wake")) {
+  throw new Error("SessionManager fixture lost the retained custom supervision prompt");
+}
+const result = await handlers.get("context")({ type: "context", messages: rebuilt }, ctx);
+const continuity = result?.messages?.find(
+  (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
+);
+if (!continuity) throw new Error("rebuilt context lacks direct-exchange continuity");
+if (continuity.content.includes("Lossy summary without") && !continuity.content.includes(question)) {
+  throw new Error("continuity trusted the lossy summary instead of the exact exchange");
+}
+if (!continuity.content.includes("ANSWERED") || !continuity.content.includes(JSON.stringify(questionContent))) {
+  throw new Error(`exact answered question missing: ${continuity.content}`);
+}
+if (!continuity.content.includes(JSON.stringify(answerContent))) {
+  throw new Error(`exact assistant answer missing: ${continuity.content}`);
+}
+if (!continuity.content.includes("OPEN_REPLY_OBLIGATION") || !continuity.content.includes(JSON.stringify(followupContent))) {
+  throw new Error(`follow-up reply obligation missing: ${continuity.content}`);
+}
+if (!continuity.content.includes("not human-authored input") || !continuity.content.includes("custom messages")) {
+  throw new Error("continuity does not distinguish extension prompts from human input");
+}
+const continuityIndex = result.messages.indexOf(continuity);
+const followupIndex = result.messages.findIndex(
+  (message) => message.role === "user" && JSON.stringify(message.content) === JSON.stringify(followupContent),
+);
+if (continuityIndex < 0 || followupIndex < 0 || continuityIndex >= followupIndex) {
+  throw new Error("continuity metadata displaced the current human follow-up as the final prompt");
+}
+
+await input(queued, "steer");
+pendingMessages = true;
+const whilePending = await handlers.get("context")({ type: "context", messages: rebuilt }, ctx);
+const pendingContinuity = whilePending?.messages?.find(
+  (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
+);
+if (pendingContinuity?.content.includes(queued)) {
+  throw new Error("pending human input bypassed Pi's queue and was injected early");
+}
+pendingMessages = false;
+const afterQueueLoss = await handlers.get("context")({ type: "context", messages: rebuilt }, ctx);
+const lossContinuity = afterQueueLoss?.messages?.find(
+  (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
+);
+if (!lossContinuity?.content.includes("SUBMITTED_NOT_DELIVERED") || !lossContinuity.content.includes(queued)) {
+  throw new Error("submitted input disappeared after Pi no longer reported it pending");
+}
+
+sessionManager = SessionManager.inMemory(process.env.REPO);
+pendingMessages = false;
+const unanswered = "UNANSWERED-CAPTAIN-Q-9: Which reply remains due?";
+const unansweredContent = [{ type: "text", text: unanswered }];
+await input(unanswered);
+await finishMessage({ role: "user", content: unansweredContent, timestamp: 1700000000500 });
+const openAutomationId = sessionManager.appendCustomMessageEntry(
+  "firstmate-watcher-wake",
+  "FIRSTMATE WATCHER WAKE: deterministic open-obligation boundary",
+  true,
+  { version: 1, source: "firstmate-extension", kind: "watcher-wake" },
+);
+sessionManager.appendMessage({
+  role: "assistant",
+  content: [{ type: "text", text: "Automation handled without answering the captain." }],
+  stopReason: "stop",
+  timestamp: 1700000000600,
+});
+sessionManager.appendCompaction(
+  "Lossy summary that omits the unanswered direct question.",
+  openAutomationId,
+  131874,
+  { fixture: "open-obligation-boundary" },
+  true,
+);
+const openRebuilt = sessionManager.buildSessionContext().messages;
+if (openRebuilt.some((message) => message.role === "user")) {
+  throw new Error("open-obligation fixture unexpectedly retained the captain user message");
+}
+const openResult = await handlers.get("context")({ type: "context", messages: openRebuilt }, ctx);
+const openContinuity = openResult?.messages?.find(
+  (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
+);
+if (!openContinuity?.content.includes("OPEN_REPLY_OBLIGATION") || !openContinuity.content.includes(JSON.stringify(unansweredContent))) {
+  throw new Error("compaction lost the exact unanswered captain obligation");
+}
+EOF
+)
+  status=$?
+  expect_code 0 "$status" "Pi compaction continuity must preserve exact direct exchange and pending-input state"
+  [ -z "$out" ] || fail "Pi compaction-continuity test printed output: $out"
+  pass "Pi compaction continuity preserves exact human exchange across automated custom prompts"
 }
 
 test_opencode_primary_watch_plugin_uses_effective_state_home() {
@@ -869,6 +1112,7 @@ test_pi_extension_reports_external_healthy_watcher
 test_pi_tool_returns_agent_tool_result
 test_pi_process_exit_cleanup_listener_lifecycle
 test_pi_process_exit_cleanup_stops_arm_child
+test_pi_compaction_preserves_direct_exchange_and_pending_input
 test_opencode_primary_watch_plugin_uses_effective_state_home
 test_opencode_primary_watch_plugin_sources_effective_config
 test_opencode_primary_watch_plugin_requires_session_lock

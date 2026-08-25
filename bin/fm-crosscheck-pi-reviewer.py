@@ -98,7 +98,7 @@ def usage_telemetry(
 
 
 def merge_telemetry(attempts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Add the rejected repair attempt to the admitted attempt's spend."""
+    """Add the rejected initial attempt to the admitted repair attempt's spend."""
 
     token_names = ("input", "output", "cache_read", "cache_write")
     token_rows = [attempt["tokens"] for attempt in attempts]

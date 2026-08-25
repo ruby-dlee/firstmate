@@ -1498,11 +1498,11 @@ def require_new_task_if_meta_missing(
         except OSError as exc:
             fail(f"durable task state inspection failed at {path}: {exc}")
         durable_paths.append(path)
-    require(
-        not durable_paths,
-        f"task metadata is missing at {meta_path} for existing Crosscheck state "
-        f"at {durable_paths[0]}",
-    )
+    if durable_paths:
+        fail(
+            f"task metadata is missing at {meta_path} for existing Crosscheck "
+            f"state at {durable_paths[0]}"
+        )
 
 
 def github_snapshot(root: Path, url: str) -> dict[str, Any]:

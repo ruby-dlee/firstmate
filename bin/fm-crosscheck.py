@@ -1451,7 +1451,13 @@ def git(cwd: Path, *arguments: str, timeout: float = 60) -> str:
     return result.stdout.strip()
 
 
-def parse_meta(path: Path) -> dict[str, str]:
+def parse_meta(path: Path) -> dict[str, str] | None:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        fail(f"task metadata inspection failed at {path}: {exc}")
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as exc:
@@ -3661,7 +3667,7 @@ def load_ledger(path: Path, task_id: str, url: str) -> dict[str, Any]:
 
 def reviewer_candidates(
     home: Path,
-    meta: dict[str, str],
+    meta: dict[str, str] | None,
 ) -> list[dict[str, str]]:
     """Return every policy-eligible reviewer in configured order.
 
@@ -3677,7 +3683,8 @@ def reviewer_candidates(
     # review this requirement exists to prevent (cc-4dcd7873f71a). The durable
     # ledger marker keeps its `same-model` spelling, which older records
     # already carry; it now means "shares the author's model family".
-    author_family = model_family(meta["model"])
+    author_model = meta["model"] if meta is not None else ""
+    author_family = model_family(author_model)
     eligible: list[dict[str, str]] = []
     for roster_entry in validated:
         reviewer = dict(roster_entry)
@@ -3690,7 +3697,7 @@ def reviewer_candidates(
         return eligible
     fail(
         "reviewer model policy found no configured reviewer outside the model "
-        f"family of {meta['model']!r}"
+        f"family of {author_model!r}"
     )
 
 

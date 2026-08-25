@@ -5960,6 +5960,53 @@ PY
   pass "telemetry, economics, and exact-head reuse remain provenance-bound and fail closed"
 }
 
+test_current_regular_contract_requires_reuse_evidence() {
+  local record case_dir base head field before after rc
+  record=$(make_case current-contract-reuse-evidence)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  select_cross_family_reviewer "$case_dir"
+  FM_TEST_PI_BIN=pi PATH="$case_dir/fakebin:$PATH" \
+    FM_TEST_PI_EXPECT_PROVIDER=fireworks-glm \
+    FM_TEST_PI_EXPECT_MODEL=accounts/fireworks/models/glm-5p2 \
+    run_case "$case_dir" "$base" "$head" clear run > "$case_dir/source.out" \
+    || fail "the current-contract source review failed"
+  cp "$case_dir/data/task-x1/crosscheck-ledger.json" "$case_dir/valid-ledger.json"
+  before=$(wc -l < "$case_dir/pi.log")
+  for field in \
+    terminal_provider terminal_model review_depth_passes review_depth_mode; do
+    cp "$case_dir/valid-ledger.json" \
+      "$case_dir/data/task-x1/crosscheck-ledger.json"
+    "$CROSSCHECK_PYTHON" - \
+      "$case_dir/data/task-x1/crosscheck-ledger.json" "$field" <<'PY'
+import json
+import sys
+
+path, field = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    ledger = json.load(handle)
+del ledger["runs"][0]["reviewer"][field]
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(ledger, handle)
+    handle.write("\n")
+PY
+    set +e
+    FM_TEST_PI_BIN=pi PATH="$case_dir/fakebin:$PATH" \
+      FM_TEST_PI_EXPECT_PROVIDER=fireworks-glm \
+      FM_TEST_PI_EXPECT_MODEL=accounts/fireworks/models/glm-5p2 \
+      run_case "$case_dir" "$base" "$head" clear run \
+        > "$case_dir/$field.out" 2> "$case_dir/$field.err"
+    rc=$?
+    set -e
+    expect_code 1 "$rc" "current contract missing $field"
+    assert_grep 'current regular review contract is missing terminal or depth fields' \
+      "$case_dir/$field.err" "a current-contract record missing $field was accepted"
+    after=$(wc -l < "$case_dir/pi.log")
+    [ "$after" -eq "$before" ] \
+      || fail "a current-contract record missing $field reached reuse or review"
+  done
+  pass "current regular records missing terminal or depth evidence cannot be reused"
+}
+
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
     test_non_codex_prompt_addendum_preserves_codex_prompt_bytes|\
@@ -6040,7 +6087,8 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_recorded_run_stamp_cannot_forge_a_timings_row|\
     test_unwritable_measurement_is_dropped_not_the_ledger|\
     test_explicit_pi_tool_loads_with_discovery_disabled|\
-    test_telemetry_economics_and_exact_head_reuse)
+    test_telemetry_economics_and_exact_head_reuse|\
+    test_current_regular_contract_requires_reuse_evidence)
       "$FM_TEST_CASE"
       exit 0
       ;;
@@ -6181,3 +6229,4 @@ test_recorded_run_stamp_cannot_forge_a_timings_row
 test_unwritable_measurement_is_dropped_not_the_ledger
 test_explicit_pi_tool_loads_with_discovery_disabled
 test_telemetry_economics_and_exact_head_reuse
+test_current_regular_contract_requires_reuse_evidence

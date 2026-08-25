@@ -115,8 +115,33 @@ APT_LOCK_PATHS=(
   /var/lib/apt/lists/lock
 )
 run_bootstrap_apt() {
-  wait_for_apt_locks "$APT_LOCK_WAIT_SECONDS" 0.2 "${APT_LOCK_PATHS[@]}" || return
-  run_bootstrap_network apt-get -o "DPkg::Lock::Timeout=$APT_LOCK_WAIT_SECONDS" "$@"
+  local deadline=$((SECONDS + APT_LOCK_WAIT_SECONDS)) remaining stderr_file status
+  stderr_file=$(mktemp)
+  while true; do
+    remaining=$((deadline - SECONDS))
+    if [ "$remaining" -le 0 ]; then
+      echo "guest bootstrap: timed out retrying apt/dpkg lock contention" >&2
+      rm -f "$stderr_file"
+      return 1
+    fi
+    wait_for_apt_locks "$remaining" 0.2 "${APT_LOCK_PATHS[@]}" || {
+      rm -f "$stderr_file"
+      return 1
+    }
+    : >"$stderr_file"
+    if run_bootstrap_network apt-get -o "DPkg::Lock::Timeout=$remaining" "$@" 2>"$stderr_file"; then
+      cat "$stderr_file" >&2
+      rm -f "$stderr_file"
+      return 0
+    else
+      status=$?
+    fi
+    cat "$stderr_file" >&2
+    if ! grep -Eq 'Could not (get|open) lock |Unable to acquire (the )?(dpkg frontend|download directory|lists directory|archive) lock|is another process using it' "$stderr_file"; then
+      rm -f "$stderr_file"
+      return "$status"
+    fi
+  done
 }
 # END FM_AZURE_RUNNER_APT_LOCK_HELPERS
 

@@ -1927,7 +1927,7 @@ PY
 }
 
 apt_lock_wait_contract() {
-  local tmp helpers lock ready release holder_pid release_pid out rc call_log
+  local tmp helpers lock ready release holder_pid release_pid out rc call_log attempts
   tmp=$(mktemp -d)
   helpers="$tmp/apt-lock-helpers.sh"
   awk '
@@ -1976,6 +1976,25 @@ PY
   [ "$(<"$call_log")" = \
     "apt-get -o DPkg::Lock::Timeout=1 install -y fixture-package" ] \
     || fail "the executable apt wrapper lost its dpkg timeout or package arguments"
+
+  attempts="$tmp/apt-attempts"
+  printf '0\n' >"$attempts"
+  run_bootstrap_network() {
+    local count
+    count=$(<"$attempts")
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$attempts"
+    if [ "$count" -eq 1 ]; then
+      echo "E: Could not get lock $lock. It is held by process 42" >&2
+      return 100
+    fi
+    return 0
+  }
+  APT_LOCK_WAIT_SECONDS=2
+  run_bootstrap_apt update -qq \
+    || fail "the apt wrapper did not retry an invocation-boundary lock race"
+  [ "$(<"$attempts")" -eq 2 ] \
+    || fail "the apt wrapper did not perform exactly one lock-race retry"
 
   ready="$tmp/ready-timeout"
   release="$tmp/release-timeout"

@@ -2981,8 +2981,17 @@ message = {
         },
     },
 }
+if effective == "internal-retry":
+    message["content"] = [{**call, "id": ""}]
+    message["stopReason"] = "error"
 print(json.dumps({"type": "turn_end", "message": message}))
 print(json.dumps({"type": "agent_end"}))
+if effective == "internal-retry":
+    print(json.dumps({"type": "auto_retry_start"}))
+    message["content"] = [call]
+    message["stopReason"] = "toolUse"
+    print(json.dumps({"type": "turn_end", "message": message}))
+    print(json.dumps({"type": "agent_end"}))
 '''
 
 
@@ -3068,6 +3077,12 @@ assert value["telemetry"]["turns"] == 1
 
 completed, captured, value, account, prompt, schema = run("string")
 assert completed.returncode == 0 and value["verdict"] == outer["verdict"]
+assert_launch(captured, account, prompt, schema)
+
+completed, captured, value, account, prompt, schema = run("internal-retry")
+assert completed.returncode == 0 and value["verdict"] == outer["verdict"], (
+    completed.returncode, completed.stderr, value,
+)
 assert_launch(captured, account, prompt, schema)
 
 for scenario in ("missing-then-valid", "multiple-then-valid", "multiple-json-then-valid"):

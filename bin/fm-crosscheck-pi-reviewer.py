@@ -235,6 +235,7 @@ def parse_events(source: Path, expected_provider: str, expected_model: str) -> d
             final_provider = None
             final_model = None
             calls.clear()
+            verdict_protocol_error = None
 
     if not agent_ended or turns < 1 or attempt_turns < 1:
         raise ReviewError("model guest: Pi did not complete a reviewer turn")

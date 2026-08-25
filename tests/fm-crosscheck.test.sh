@@ -6044,6 +6044,48 @@ PY
   pass "current regular records missing terminal or depth evidence cannot be reused"
 }
 
+test_failed_current_regular_contract_remains_reloadable() {
+  local record case_dir base head rc states
+  record=$(make_case failed-current-regular-contract)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  select_cross_family_reviewer "$case_dir"
+  set +e
+  FM_TEST_PI_BIN=pi PATH="$case_dir/fakebin:$PATH" \
+    FM_TEST_PI_EXPECT_PROVIDER=fireworks-glm \
+    FM_TEST_PI_EXPECT_MODEL=accounts/fireworks/models/glm-5p2 \
+    FM_TEST_PI_STOP_REASON=length \
+    run_case "$case_dir" "$base" "$head" clear run \
+      > "$case_dir/failed.out" 2> "$case_dir/failed.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "failed current regular review"
+  FM_TEST_PI_BIN=pi PATH="$case_dir/fakebin:$PATH" \
+    FM_TEST_PI_EXPECT_PROVIDER=fireworks-glm \
+    FM_TEST_PI_EXPECT_MODEL=accounts/fireworks/models/glm-5p2 \
+    run_case "$case_dir" "$base" "$head" clear run \
+      > "$case_dir/retry.out" 2> "$case_dir/retry.err" \
+    || fail "a failed current regular record made its ledger unloadable"
+  states=$("$CROSSCHECK_PYTHON" -c '
+import json, sys
+ledger = json.load(open(sys.argv[1]))
+failed, retried = ledger["runs"]
+assert "execution_proof" not in failed["reviewer"], failed
+for field in (
+    "terminal_provider",
+    "terminal_model",
+    "review_depth_passes",
+    "review_depth_mode",
+):
+    assert field not in failed["reviewer"], failed
+    assert field in retried["reviewer"], retried
+print(failed["state"], retried["state"])
+' "$case_dir/data/task-x1/crosscheck-ledger.json") \
+    || fail "failed and retried current regular records have the wrong evidence shape"
+  [ "$states" = "tool-failure clear" ] \
+    || fail "current regular retry recorded states '$states'"
+  pass "failed current regular records remain reloadable for a successful retry"
+}
+
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
     test_non_codex_prompt_addendum_preserves_codex_prompt_bytes|\
@@ -6125,7 +6167,8 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_unwritable_measurement_is_dropped_not_the_ledger|\
     test_explicit_pi_tool_loads_with_discovery_disabled|\
     test_telemetry_economics_and_exact_head_reuse|\
-    test_current_regular_contract_requires_reuse_evidence)
+    test_current_regular_contract_requires_reuse_evidence|\
+    test_failed_current_regular_contract_remains_reloadable)
       "$FM_TEST_CASE"
       exit 0
       ;;
@@ -6267,3 +6310,4 @@ test_unwritable_measurement_is_dropped_not_the_ledger
 test_explicit_pi_tool_loads_with_discovery_disabled
 test_telemetry_economics_and_exact_head_reuse
 test_current_regular_contract_requires_reuse_evidence
+test_failed_current_regular_contract_remains_reloadable

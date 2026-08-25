@@ -7054,18 +7054,31 @@ def main() -> int:
             try:
                 selected_state_stat = state.stat()
             except FileNotFoundError:
-                tool_fail(
-                    f"selected Crosscheck state directory does not exist at {state}"
-                )
+                default_state = home / "state"
+                try:
+                    selected_is_default = state.resolve(strict=False) == (
+                        default_state.resolve(strict=False)
+                    )
+                except (OSError, RuntimeError) as exc:
+                    tool_fail(
+                        "selected Crosscheck state directory comparison failed: "
+                        f"{exc}"
+                    )
+                if not selected_is_default:
+                    tool_fail(
+                        "selected Crosscheck state directory does not exist at "
+                        f"{state}"
+                    )
             except OSError as exc:
                 tool_fail(
                     "selected Crosscheck state directory inspection failed at "
                     f"{state}: {exc}"
                 )
-            if not stat.S_ISDIR(selected_state_stat.st_mode):
-                tool_fail(
-                    f"selected Crosscheck state path is not a directory at {state}"
-                )
+            else:
+                if not stat.S_ISDIR(selected_state_stat.st_mode):
+                    tool_fail(
+                        f"selected Crosscheck state path is not a directory at {state}"
+                    )
         state.mkdir(parents=True, exist_ok=True)
         lock_path = state / f".{args.task_id}.crosscheck.lock"
         with lock_path.open("a+", encoding="utf-8") as lock:

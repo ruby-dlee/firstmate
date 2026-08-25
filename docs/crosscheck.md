@@ -135,6 +135,7 @@ bin/fm-crosscheck.sh run <task-id> <https://github.com/owner/repo/pull/number>
 ```
 
 A brand-new task ID does not need a pre-created `state/<task-id>.meta` file.
+On a fresh `FM_HOME`, Crosscheck creates the default `state/` directory; an explicitly selected nonexistent state override still fails closed.
 Metadata-free dispatch is allowed only when that task ID has neither an existing Crosscheck ledger nor report.
 In that case, Crosscheck starts with no recorded author model and dispatches the configured reviewer roster normally.
 Existing durable Crosscheck state plus missing metadata fails closed before reviewer dispatch.

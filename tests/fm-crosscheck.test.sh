@@ -3181,6 +3181,26 @@ test_missing_task_metadata_starts_new_dispatch() {
   pass "a brand-new task ID dispatches without hidden pre-created metadata"
 }
 
+test_missing_default_state_directory_starts_new_dispatch() {
+  local record case_dir base head output
+  record=$(make_case missing-default-state-directory)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  rm "$case_dir/state/task-x1.meta"
+  rmdir "$case_dir/state"
+  output=$(FM_TEST_STATE_OVERRIDE= \
+    run_case "$case_dir" "$base" "$head" clear run) \
+    || fail "a fresh default state directory was not initialized"
+  assert_contains "$output" 'crosscheck clear' \
+    "a fresh home did not complete after reviewer dispatch"
+  assert_present "$case_dir/codex.log" \
+    "reviewer dispatch never began for a fresh home"
+  assert_present "$case_dir/home/state/.task-x1.crosscheck.lock" \
+    "the default state directory was not initialized for a fresh home"
+  assert_absent "$case_dir/home/state/task-x1.meta" \
+    "Crosscheck invented author identity metadata for a fresh home"
+  pass "a fresh home initializes its default state directory and dispatches"
+}
+
 test_mismatched_state_without_metadata_fails_closed() {
   local override_kind record case_dir base head selected_state rc
   for override_kind in empty nonexistent; do
@@ -6190,6 +6210,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_empty_environment_fallback_is_generic|\
     test_set_runtime_overrides_remain_authoritative|\
     test_missing_task_metadata_starts_new_dispatch|\
+    test_missing_default_state_directory_starts_new_dispatch|\
     test_mismatched_state_without_metadata_fails_closed|\
     test_missing_metadata_for_existing_task_fails_closed|\
     test_existing_task_metadata_identity_collision_fails_closed|\
@@ -6320,6 +6341,7 @@ test_empty_runtime_overrides_use_home_defaults
 test_empty_environment_fallback_is_generic
 test_set_runtime_overrides_remain_authoritative
 test_missing_task_metadata_starts_new_dispatch
+test_missing_default_state_directory_starts_new_dispatch
 test_mismatched_state_without_metadata_fails_closed
 test_missing_metadata_for_existing_task_fails_closed
 test_existing_task_metadata_identity_collision_fails_closed

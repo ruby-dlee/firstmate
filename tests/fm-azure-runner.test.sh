@@ -1970,6 +1970,7 @@ PY
   APT_LOCK_PATHS=("$lock")
   wait_for_apt_locks "$APT_LOCK_WAIT_SECONDS" 0.02 "${APT_LOCK_PATHS[@]}" \
     || fail "the test apt lock set was not available for wrapper execution"
+  # shellcheck disable=SC2329 # Invoked indirectly by the extracted run_bootstrap_apt helper.
   run_bootstrap_network() { printf '%s\n' "$*" >"$call_log"; }
   run_bootstrap_apt install -y fixture-package \
     || fail "the bounded apt wrapper did not reach apt-get after lock admission"

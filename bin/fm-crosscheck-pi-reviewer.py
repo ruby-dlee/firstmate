@@ -23,6 +23,16 @@ class VerdictProtocolError(ReviewError):
         self.telemetry = telemetry
 
 
+def provider_error_diagnostic(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = " ".join(value.split())
+    printable = "".join(
+        character for character in normalized if character.isprintable()
+    )
+    return printable[:512] or None
+
+
 def recover_single_object(value: str) -> dict[str, Any]:
     body = value.strip()
     if body.count("```") % 2:
@@ -171,12 +181,7 @@ def parse_events(source: Path, expected_provider: str, expected_model: str) -> d
             turns += 1
             attempt_turns += 1
             final_stop = message.get("stopReason")
-            error_message = message.get("errorMessage")
-            final_error = (
-                " ".join(error_message.split())[:512]
-                if isinstance(error_message, str) and error_message.strip()
-                else None
-            )
+            final_error = provider_error_diagnostic(message.get("errorMessage"))
             final_provider = message.get("provider")
             final_model = message.get("model")
             usage = message.get("usage")

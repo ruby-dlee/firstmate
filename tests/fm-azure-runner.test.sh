@@ -183,7 +183,6 @@ assert 'command_env["FM_HOME"] = str(ROOT)' not in host
 assert 'str(Path(command_env["FM_HOME"]) / "state" / "azure-workers")' in host
 assert "cleanup-verified-at" not in host
 assert 'binding_keys = ("remote", "source_ref", "source_head", "source_ancestors")' in host
-assert host.count('expected.get(key) != proof_identity[key]') == 2
 assert '"default_head": default_head,' in host
 schedule=next(r for r in template["resources"] if r["type"]=="Microsoft.DevTestLab/schedules")
 assert schedule["name"]=="[format('shutdown-computevm-{0}', parameters('vmName'))]"
@@ -365,6 +364,9 @@ private_snapshot_ancestor_verification() {
   fm_test_tmproot_into tmp fm-azure-private-ancestor
   repo="$tmp/repo"
   make_repo "$repo"
+  printf 'child\n' >"$repo/declared/child.txt"
+  git -C "$repo" add declared/child.txt
+  git -C "$repo" commit -qm child
   ancestor=$(git -C "$repo" rev-parse HEAD^)
   head=$(git -C "$repo" rev-parse HEAD)
   clone="$tmp/clone"

@@ -3187,7 +3187,7 @@ test_missing_default_state_directory_starts_new_dispatch() {
   IFS=$'\t' read -r case_dir base head <<< "$record"
   rm "$case_dir/state/task-x1.meta"
   rmdir "$case_dir/state"
-  output=$(FM_TEST_STATE_OVERRIDE= \
+  output=$(FM_TEST_STATE_OVERRIDE='' \
     run_case "$case_dir" "$base" "$head" clear run) \
     || fail "a fresh default state directory was not initialized"
   assert_contains "$output" 'crosscheck clear' \

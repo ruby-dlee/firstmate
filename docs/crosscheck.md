@@ -83,7 +83,9 @@ That extension registers a strict JSON-schema-constrained `submit_crosscheck_ver
 The local regular GLM lane runs a fixed two-pass full-diff protocol: an isolated advisory challenge followed by an authoritative synthesis that independently inspects the same exact-base/exact-head diff and receives only a bounded projection of the challenge's untrusted hypotheses.
 Only the synthesis supplies the ledger verdict, and it must reproduce any challenge concern it carries forward rather than treating the challenge as execution proof.
 The two passes never wait or sleep to affect timing, and Crosscheck aggregates their token, cost, turn, and reviewer-latency telemetry without inventing unavailable values.
-The regular-lane reviewer record binds `review_depth_passes: "2"`, `review_depth_mode: two-pass-independent-synthesis-v1`, and the terminal provider/model readback to the registered regular cross-family lane; current records missing or contradicting those fields fail validation.
+The regular-lane reviewer record binds `review_depth_passes: "2"`, `review_depth_mode: two-pass-independent-synthesis-v1`, and the terminal provider/model readback to the registered regular cross-family lane.
+Successful current-contract `clear` and `blocking` records, including reusable records, fail validation when any of those fields is missing or contradictory.
+Failed `tool-failure`, `unreviewed`, and `cannot-certify` attempts may omit terminal and depth evidence they never earned, so their ledgers remain reloadable for a later retry; they are never reusable.
 Crosscheck accepts exactly one verdict tool call from each successful pass and preserves usage across Pi auto-retries.
 If an otherwise completed pass makes zero, multiple, or malformed verdict calls, the same isolated reviewer session receives one fixed verdict-only repair prompt and retains the exact-head packet plus that pass's reasoning without repeating the review.
 The repair is attempted once per pass, its usage is included in the run economics, and a second protocol miss fails closed instead of selecting a convenient call or rotating to another reviewer.

@@ -428,6 +428,7 @@ done
 }
 [ "$ephemeral" = yes ] && [ "$isolated" -eq 6 ] \
   && [ "${prompt#@}" != "$prompt" ] && [ -f "${prompt#@}" ] || exit 69
+cat "${prompt#@}" >> "$FM_TEST_PROMPT_LOG"
 temporary=$(mktemp "${TMPDIR:-/tmp}/fm-crosscheck-pi.XXXXXX") || exit 70
 python3 "$FM_TEST_REVIEW_DRIVER" "$PWD" "$temporary" "$FM_TEST_REVIEW_SCENARIO" "$FM_TEST_HEAD" || exit 71
 python3 - "$temporary" "${FM_TEST_PI_STOP_REASON:-toolUse}" <<'PY'
@@ -1863,11 +1864,17 @@ route_turn["message"].update(
         "model": "accounts/fireworks/models/glm-5p2",
     }
 )
+terminal_identity = {}
 module.pi_review_result(
     event_stream([route_turn]),
     expected_provider="fireworks-glm",
     expected_model="accounts/fireworks/models/glm-5p2",
+    terminal_identity=terminal_identity,
 )
+assert terminal_identity == {
+    "provider": "fireworks-glm",
+    "model": "accounts/fireworks/models/glm-5p2",
+}, terminal_identity
 for field, observed, expected, diagnostic in (
     ("provider", "openai-codex", "fireworks-glm", "reported provider"),
     (
@@ -2441,9 +2448,24 @@ binding = hashlib.sha256(
      "https://api.fireworks.ai/inference/v1").encode()
 ).hexdigest()
 assert reviewer["credential_identifier"] == "provider-binding:" + slot + ":" + binding
+assert reviewer["terminal_provider"] == slot
+assert reviewer["terminal_model"] == model
+assert reviewer["review_depth_passes"] == "2"
+assert reviewer["review_depth_mode"] == "two-pass-independent-synthesis-v1"
+assert reviewer["reviewer_turn_count"] == "2"
 assert reviewer["execution_proof"]["actual_exit"] == 0
 ' "$case_dir/data/task-x1/crosscheck-ledger.json" "$case_dir/pi-home" "$slot" "$model" \
-      || fail "$model review did not record its bound provider, family mode, and non-secret credential binding"
+      || fail "$model review did not record its bound provider, terminal route, depth, and non-secret credential binding"
+    [ "$(wc -l < "$case_dir/pi.log")" -eq 2 ] \
+      || fail "$model did not execute exactly one challenge and one synthesis pass"
+    assert_grep 'REGULAR GLM REVIEW DEPTH - PASS 1 OF 2' "$case_dir/prompt.log" \
+      "$model challenge pass was not independently prompted"
+    assert_grep 'REGULAR GLM REVIEW DEPTH - PASS 2 OF 2' "$case_dir/prompt.log" \
+      "$model synthesis pass was not independently prompted"
+    assert_grep 'BEGIN UNTRUSTED PRIOR REVIEW ANALYSIS' "$case_dir/prompt.log" \
+      "$model synthesis did not receive a delimited bounded challenge projection"
+    assert_no_grep 'review-execution.sh' "$case_dir/prompt.log" \
+      "$model synthesis received a challenge execution claim instead of hypotheses"
     assert_no_grep 'CODEX FALLBACK' "$case_dir/data/task-x1/crosscheck.md" \
       "a $model primary review rendered the degraded fallback marker"
   done <<< "$lanes"
@@ -5867,7 +5889,7 @@ test_telemetry_economics_and_exact_head_reuse() {
     run_case "$case_dir" "$base" "$head" clear run > "$case_dir/reuse.out" \
     || fail "the exact-head reuse failed"
   after=$(wc -l < "$case_dir/pi.log")
-  [ "$before" -eq 1 ] && [ "$after" -eq 1 ] \
+  [ "$before" -eq 2 ] && [ "$after" -eq 2 ] \
     || fail "exact-head reuse launched another paid reviewer"
   "$CROSSCHECK_PYTHON" - "$CROSSCHECK_PY" \
     "$case_dir/data/task-x1/crosscheck-ledger.json" "$head" <<'PY' \
@@ -5882,13 +5904,13 @@ source, reused = ledger["runs"]
 assert source["state"] == reused["state"] == "clear"
 assert reused["telemetry"]["reuse"]["source_run_sha256"] == module.run_sha256(source)
 tokens = source["telemetry"]["tokens"]
-assert tokens == {"input": 100, "output": 20, "cache_read": 80,
+assert tokens == {"input": 200, "output": 40, "cache_read": 160,
                   "cache_write": 0, "source": "pi-turn-end-message-usage"}
 costs = source["telemetry"]["costs_usd"]
 assert costs["provider_reported"] is None
-assert costs["pi_calculated"] == 0.0002392
-assert costs["declared"] == 0.0002392
-assert source["telemetry"]["turns"] == 1
+assert costs["pi_calculated"] == 0.0004784
+assert costs["declared"] == 0.0004784
+assert source["telemetry"]["turns"] == 2
 assert source["telemetry"]["reviewer_latency_ms"] >= 0
 config = dict(source["reviewer"])
 snapshot = {"head_sha": head, "base_sha": source["base_sha"],
@@ -5914,9 +5936,9 @@ PY
   output=$(run_economics "$case_dir") || fail "the read-only economics report failed"
   assert_contains "$output" "provider-reported total: \$0.000000 across 0 run(s)." \
     "economics hid provider-cost provenance"
-  assert_contains "$output" "Pi-calculated total: \$0.000239 across 1 run(s)." \
+  assert_contains "$output" "Pi-calculated total: \$0.000478 across 1 run(s)." \
     "economics omitted Pi-calculated cost"
-  assert_contains "$output" "declared-rate total: \$0.000239 across 2 run(s)." \
+  assert_contains "$output" "declared-rate total: \$0.000478 across 2 run(s)." \
     "economics omitted declared regular-lane cost and zero-cost reuse"
   verified=$(run_case "$case_dir" "$base" "$head" clear verify) \
     || fail "verify did not follow the reused run to its source proof"

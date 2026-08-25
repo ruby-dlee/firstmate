@@ -2441,10 +2441,17 @@ azure={
     "subscription":"test-subscription",
 }
 runner=SimpleNamespace(
+    RunnerError=RuntimeError,
     SKU_FAMILY={"Standard_D4as_v6":"standardDav6Family"},
     SKU_VCPUS={"Standard_D4as_v6":4},
     retail_rate=lambda _environment,_sku:0.2,
     environment=lambda:{},
+    scope_gate=lambda _environment:events.append("scope-gate"),
+    foundation_gate=lambda _environment:events.append("foundation-gate"),
+    sku_quota_gate=lambda *_args:(_ for _ in ()).throw(
+        AssertionError("transient SKU capacity bypassed the durable allocator")
+    ),
+    budget_gate=lambda _environment,_limits:events.append("budget-gate"),
 )
 config={
     "harness":"pi","model":"test-model","effort":"xhigh",
@@ -2457,7 +2464,7 @@ snapshot={
 events=[]
 adapter.preflight_reviewer_credential=lambda _core,_config:events.append("credential-preflight")
 adapter.runtime_config=lambda _home:dict(azure)
-adapter.verify_scope_and_foundation=lambda _config:runner
+adapter.load_runner=lambda:runner
 adapter.active_review_vms=lambda _config:0
 adapter.require_model_image_attests_harness=lambda _config,_harness:None
 adapter.inspect_reviewer_credential=lambda _core,config:(
@@ -2531,6 +2538,7 @@ reserve_calls=[call for call in capacity_calls if call[0]=="capacity-reserve"]
 release_call=next(call for call in capacity_calls if call[0]=="capacity-release")
 field=lambda call,name:call[call.index(name)+1]
 assert len(reserve_calls)==2
+assert events[:3]==["scope-gate","foundation-gate","budget-gate"],events
 assert field(reserve_calls[0],"--fence-binding")==field(reserve_calls[1],"--fence-binding")
 assert field(release_call,"--fence-binding")==field(reserve_calls[0],"--fence-binding")
 assert events.index("capacity-reserved") < events.index("credential-preflight")

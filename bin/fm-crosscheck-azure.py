@@ -427,13 +427,6 @@ def verify_scope_and_foundation(config: dict[str, Any]) -> Any:
         runner_env = runner.environment()
         runner.scope_gate(runner_env)
         runner.foundation_gate(runner_env)
-        runner.sku_quota_gate(
-            runner_env,
-            {
-                "sku": config["reviewer_sku"],
-                "sku_family": runner.SKU_FAMILY[config["reviewer_sku"]],
-            },
-        )
         runner.budget_gate(
             runner_env, {"sku": config["reviewer_sku"], "network_bytes": 0}
         )

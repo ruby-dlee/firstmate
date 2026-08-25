@@ -6004,6 +6004,43 @@ PY
     [ "$after" -eq "$before" ] \
       || fail "a current-contract record missing $field reached reuse or review"
   done
+  cp "$case_dir/valid-ledger.json" \
+    "$case_dir/data/task-x1/crosscheck-ledger.json"
+  FM_TEST_PI_BIN=pi PATH="$case_dir/fakebin:$PATH" \
+    FM_TEST_PI_EXPECT_PROVIDER=fireworks-glm \
+    FM_TEST_PI_EXPECT_MODEL=accounts/fireworks/models/glm-5p2 \
+    run_case "$case_dir" "$base" "$head" clear run > "$case_dir/reuse.out" \
+    || fail "the valid current-contract record did not reuse"
+  "$CROSSCHECK_PYTHON" - \
+    "$case_dir/data/task-x1/crosscheck-ledger.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    ledger = json.load(handle)
+reviewer = ledger["runs"][1]["reviewer"]
+for field in (
+    "execution_proof",
+    "terminal_provider",
+    "terminal_model",
+    "review_depth_passes",
+    "review_depth_mode",
+):
+    del reviewer[field]
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(ledger, handle)
+    handle.write("\n")
+PY
+  set +e
+  run_case "$case_dir" "$base" "$head" clear verify \
+    > "$case_dir/reuse-omission.out" 2> "$case_dir/reuse-omission.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "reused current contract missing review evidence"
+  assert_grep 'current regular review contract is missing terminal or depth fields' \
+    "$case_dir/reuse-omission.err" \
+    "a reused current-contract record omitted its proof and depth evidence"
   pass "current regular records missing terminal or depth evidence cannot be reused"
 }
 

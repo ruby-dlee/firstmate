@@ -3468,7 +3468,7 @@ def validate_ledger(value: Any, task_id: str, url: str) -> dict[str, Any]:
             and reviewer.get("review_contract_sha256")
             == review_contract_sha256(False, "pi")
         )
-        if current_regular_contract:
+        if current_regular_contract and run["state"] in {"clear", "blocking"}:
             require(
                 reviewer.get("terminal_provider") is not None
                 and reviewer.get("terminal_model") is not None

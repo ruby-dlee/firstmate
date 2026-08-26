@@ -280,9 +280,10 @@ home = work / "home"
 
 # The preflight runs before the FIFO lane wait, before runtime_config, and
 # again once the lane is held because the lane wait can outlast the
-# credential. A third check after shared-capacity admission still precedes
-# every staged object. The snapshot wrapper deliberately delegates these
-# contracts to the two functions that own lane admission and paid compute.
+# credential. A third check immediately before staging still precedes every
+# uploaded object and shared-host run. The snapshot wrapper deliberately
+# delegates these contracts to the two functions that own lane admission and
+# review execution.
 lane_source = inspect.getsource(adapter._run_azure_review_after_snapshot)
 entry_source = inspect.getsource(adapter.run_azure_review)
 assert "_run_azure_review_after_snapshot" in entry_source
@@ -290,8 +291,8 @@ assert lane_source.index("preflight_reviewer_credential") < lane_source.index("a
 assert lane_source.index("preflight_reviewer_credential") < lane_source.index("runtime_config")
 assert lane_source.rindex("preflight_reviewer_credential") > lane_source.index("acquire_review_lane")
 compute_source = inspect.getsource(adapter._run_azure_review_in_lane)
-assert compute_source.index("reserve_model_capacity") < compute_source.index("preflight_reviewer_credential")
 assert compute_source.index("preflight_reviewer_credential") < compute_source.index("upload_blob")
+assert compute_source.index("preflight_reviewer_credential") < compute_source.index("submit_model_run")
 
 
 def review(profile, harness):

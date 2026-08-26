@@ -339,6 +339,8 @@ import { writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const { SessionManager } = await import(pathToFileURL(`${process.env.PI_PACKAGE_DIR}/dist/index.js`).href);
+const { Agent } = await import(pathToFileURL(`${process.env.PI_PACKAGE_DIR}/node_modules/@earendil-works/pi-agent-core/dist/index.js`).href);
+const { AssistantMessageEventStream } = await import(pathToFileURL(`${process.env.PI_PACKAGE_DIR}/node_modules/@earendil-works/pi-ai/dist/index.js`).href);
 let sessionManager = SessionManager.inMemory(process.env.REPO);
 const handlers = new Map();
 let tool = null;
@@ -383,6 +385,55 @@ writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
 mod.default(pi);
 if (!tool) throw new Error("Pi watch tool was not registered");
+
+const providerContexts = [];
+let releaseInitial;
+let providerCall = 0;
+const usage = {
+  input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+const agent = new Agent({
+  initialState: {
+    systemPrompt: "queue regression",
+    model: { id: "fixture", name: "fixture", api: "openai-completions", provider: "fixture", baseUrl: "http://fixture", reasoning: false, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 },
+    tools: [],
+  },
+  convertToLlm: (messages) => messages.map((message) => message.role === "custom"
+    ? { role: "user", content: [{ type: "text", text: message.content }], timestamp: message.timestamp }
+    : message),
+  streamFn: (_model, context) => {
+    providerContexts.push(structuredClone(context.messages));
+    const call = ++providerCall;
+    const stream = new AssistantMessageEventStream();
+    const finish = () => {
+      const message = { role: "assistant", content: [{ type: "text", text: `provider-${call}` }], api: "openai-completions", provider: "fixture", model: "fixture", usage, stopReason: "stop", timestamp: Date.now() };
+      stream.push({ type: "start", partial: { ...message, content: [], stopReason: "pending" } });
+      stream.push({ type: "done", reason: "stop", message });
+    };
+    if (call === 1) releaseInitial = finish;
+    else queueMicrotask(finish);
+    return stream;
+  },
+});
+const exactImage = { type: "image", data: "QUEUE-ORDER-IMAGE-DATA", mimeType: "image/png" };
+const initialRun = agent.prompt("INITIAL-HELD-RESPONSE");
+for (let i = 0; i < 100 && !releaseInitial; i += 1) await new Promise((resolve) => setTimeout(resolve, 1));
+if (!releaseInitial) throw new Error("controlled provider did not hold the initial response");
+agent.followUp({ role: "custom", customType: "firstmate-watcher-wake", content: "OLDER-AUTOMATION-FOLLOWUP", display: true, timestamp: Date.now() });
+agent.steer({ role: "user", content: [{ type: "text", text: "LATER-HUMAN-IMAGE-STEER" }, exactImage], timestamp: Date.now() });
+releaseInitial();
+await initialRun;
+await agent.waitForIdle();
+if (providerContexts.length !== 3) throw new Error(`expected three provider turns, got ${providerContexts.length}`);
+const secondTail = providerContexts[1].at(-1);
+const thirdTail = providerContexts[2].at(-1);
+if (secondTail?.role !== "user" || JSON.stringify(secondTail.content) !== JSON.stringify([{ type: "text", text: "LATER-HUMAN-IMAGE-STEER" }, exactImage])) {
+  throw new Error(`human image steer was reordered or altered: ${JSON.stringify(secondTail)}`);
+}
+if (thirdTail?.role !== "user" || JSON.stringify(thirdTail.content) !== JSON.stringify([{ type: "text", text: "OLDER-AUTOMATION-FOLLOWUP" }])) {
+  throw new Error(`older automation was starved or delivered early: ${JSON.stringify(thirdTail)}`);
+}
 
 const question = "DIRECT-CAPTAIN-Q-7: Which harbor token should remain reserved?";
 const answer = "DIRECT-CAPTAIN-A-7: amber.";
@@ -473,8 +524,9 @@ if (continuityIndex < 0 || followupIndex < 0 || continuityIndex >= followupIndex
   throw new Error("continuity metadata displaced the current human follow-up as the final prompt");
 }
 
-await input(queued, "steer");
 pendingMessages = true;
+await input(queued, "steer");
+await new Promise((resolve) => setTimeout(resolve, 0));
 const whilePending = await handlers.get("context")({ type: "context", messages: rebuilt }, ctx);
 const pendingContinuity = whilePending?.messages?.find(
   (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
@@ -483,6 +535,12 @@ if (pendingContinuity?.content.includes(queued)) {
   throw new Error("pending human input bypassed Pi's queue and was injected early");
 }
 pendingMessages = false;
+const provisional = "PROVISIONAL-REJECTED-Q-8B";
+await input(provisional);
+const provisionalResult = await handlers.get("context")({ type: "context", messages: rebuilt }, ctx);
+if (provisionalResult?.messages?.some((message) => message.customType === "firstmate-direct-exchange-continuity" && message.content.includes(provisional))) {
+  throw new Error("unadmitted provisional input became a reply obligation");
+}
 const afterQueueLoss = await handlers.get("context")({ type: "context", messages: rebuilt }, ctx);
 const lossContinuity = afterQueueLoss?.messages?.find(
   (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
@@ -496,7 +554,10 @@ pendingMessages = false;
 const imageQueued = "QUEUED-CAPTAIN-IMAGE-Q-9: identify the attached harbor signal";
 const image = { type: "image", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", mimeType: "image/png" };
 const imageSubmittedContent = [{ type: "text", text: imageQueued }, image];
+pendingMessages = true;
 await input(imageQueued, "followUp", [image]);
+await new Promise((resolve) => setTimeout(resolve, 0));
+pendingMessages = false;
 const imageBoundaryId = sessionManager.appendCustomMessageEntry(
   "firstmate-watcher-wake",
   "FIRSTMATE WATCHER WAKE: compaction before queued image delivery",

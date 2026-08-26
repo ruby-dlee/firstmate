@@ -14,7 +14,7 @@ type ArmResult = {
 
 type DirectExchangeEvent = {
   version: 1;
-  event: "submitted" | "delivered" | "answered";
+  event: "submitted" | "admitted" | "delivered" | "answered";
   exchangeId: string;
   at: number;
   inputText?: string;
@@ -31,6 +31,7 @@ type DirectExchangeState = {
   imageCount: number;
   inputContent?: unknown;
   delivery: "immediate" | "steer" | "followUp";
+  admittedAt?: number;
   deliveredAt?: number;
   deliveredContent?: unknown;
   deliveredRecordIndex?: number;
@@ -71,7 +72,7 @@ function parseDirectExchangeEvent(entry: SessionEntry): DirectExchangeEvent | un
   const candidate = data as Partial<DirectExchangeEvent>;
   if (
     candidate.version !== 1 ||
-    !["submitted", "delivered", "answered"].includes(candidate.event ?? "") ||
+    !["submitted", "admitted", "delivered", "answered"].includes(candidate.event ?? "") ||
     typeof candidate.exchangeId !== "string" ||
     !candidate.exchangeId ||
     typeof candidate.at !== "number"
@@ -103,7 +104,10 @@ function foldDirectExchanges(entries: SessionEntry[]): DirectExchangeState[] {
     }
     const state = byId.get(event.exchangeId);
     if (!state) return;
-    if (event.event === "delivered") {
+    if (event.event === "admitted") {
+      state.admittedAt = event.at;
+    } else if (event.event === "delivered") {
+      state.admittedAt ??= event.at;
       state.deliveredAt = event.at;
       state.deliveredContent = event.content;
       state.deliveredRecordIndex = index;
@@ -151,7 +155,7 @@ function renderDirectExchangeContinuity(
           "No completed assistant answer was observed before compaction.",
         ].join("\n"),
       );
-    } else if (!hasPendingMessages) {
+    } else if (exchange.admittedAt !== undefined && !hasPendingMessages) {
       const submissionEvidence =
         exchange.inputContent !== undefined
           ? [`Human input, exact submitted JSON: ${JSON.stringify(exchange.inputContent)}`]
@@ -254,6 +258,9 @@ function failureLine(stdout: string, stderr: string, code: number | null): strin
 
 export default function (pi: ExtensionAPI) {
   let exchangeSequence = 0;
+  const provisionalExchangeIds: string[] = [];
+  const provisionalExchanges = new Map<string, { content: unknown; delivery: "immediate" | "steer" | "followUp" }>();
+  const admittedExchangeIds = new Set<string>();
 
   function appendDirectExchange(event: DirectExchangeEvent): void {
     pi.appendEntry(directExchangeEntryType, event);
@@ -332,13 +339,29 @@ export default function (pi: ExtensionAPI) {
     markLoaded();
   });
 
-  pi.on("input", (event) => {
+  function admitExchange(exchangeId: string): void {
+    if (!provisionalExchanges.has(exchangeId) || admittedExchangeIds.has(exchangeId)) return;
+    appendDirectExchange({ version: 1, event: "admitted", exchangeId, at: Date.now() });
+    admittedExchangeIds.add(exchangeId);
+  }
+
+  function matchingProvisional(content: unknown): { exchangeId: string; delivery: "immediate" | "steer" | "followUp" } | undefined {
+    const expected = JSON.stringify(content);
+    return provisionalExchangeIds
+      .filter((exchangeId) => !admittedExchangeIds.has(exchangeId))
+      .map((exchangeId) => ({ exchangeId, ...provisionalExchanges.get(exchangeId)! }))
+      .find((candidate) => JSON.stringify(candidate.content) === expected);
+  }
+
+  pi.on("input", (event, ctx) => {
     if (event.source === "extension") return;
     const at = Date.now();
     const exchangeId = createHash("sha256")
       .update(`${at}\0${++exchangeSequence}\0${event.source}\0${event.text}`)
       .digest("hex")
       .slice(0, 16);
+    const inputContent = cloneJson([{ type: "text", text: event.text }, ...(event.images ?? [])]);
+    const delivery = event.streamingBehavior ?? "immediate";
     appendDirectExchange({
       version: 1,
       event: "submitted",
@@ -346,9 +369,28 @@ export default function (pi: ExtensionAPI) {
       at,
       inputText: event.text,
       imageCount: event.images?.length ?? 0,
-      inputContent: cloneJson([{ type: "text", text: event.text }, ...(event.images ?? [])]),
-      delivery: event.streamingBehavior ?? "immediate",
+      inputContent,
+      delivery,
     });
+    provisionalExchangeIds.push(exchangeId);
+    provisionalExchanges.set(exchangeId, { content: inputContent, delivery });
+    if (event.streamingBehavior) {
+      setTimeout(() => {
+        if (ctx.hasPendingMessages()) admitExchange(exchangeId);
+      }, 0);
+    }
+  });
+
+  pi.on("before_agent_start", (event) => {
+    const content = cloneJson([{ type: "text", text: event.prompt }, ...(event.images ?? [])]);
+    const exchange =
+      matchingProvisional(content) ??
+      [...provisionalExchangeIds]
+        .reverse()
+        .filter((exchangeId) => !admittedExchangeIds.has(exchangeId))
+        .map((exchangeId) => ({ exchangeId, ...provisionalExchanges.get(exchangeId)! }))
+        .find((candidate) => candidate.delivery === "immediate");
+    if (exchange?.delivery === "immediate") admitExchange(exchange.exchangeId);
   });
 
   pi.on("message_end", (event, ctx) => {
@@ -367,6 +409,7 @@ export default function (pi: ExtensionAPI) {
         pending.find((candidate) => candidate.inputText === userText) ??
         pending[0];
       if (!exchange) return;
+      admitExchange(exchange.exchangeId);
       appendDirectExchange({
         version: 1,
         event: "delivered",

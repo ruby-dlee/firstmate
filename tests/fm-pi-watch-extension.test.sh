@@ -368,9 +368,9 @@ const ctx = {
   },
   hasPendingMessages: () => pendingMessages,
 };
-async function input(text, streamingBehavior) {
+async function input(text, streamingBehavior, images) {
   await handlers.get("input")(
-    { type: "input", text, source: "interactive", streamingBehavior },
+    { type: "input", text, images, source: "interactive", streamingBehavior },
     ctx,
   );
 }
@@ -493,7 +493,41 @@ if (!lossContinuity?.content.includes("SUBMITTED_NOT_DELIVERED") || !lossContinu
 
 sessionManager = SessionManager.inMemory(process.env.REPO);
 pendingMessages = false;
-const unanswered = "UNANSWERED-CAPTAIN-Q-9: Which reply remains due?";
+const imageQueued = "QUEUED-CAPTAIN-IMAGE-Q-9: identify the attached harbor signal";
+const image = { type: "image", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", mimeType: "image/png" };
+const imageSubmittedContent = [{ type: "text", text: imageQueued }, image];
+await input(imageQueued, "followUp", [image]);
+const imageBoundaryId = sessionManager.appendCustomMessageEntry(
+  "firstmate-watcher-wake",
+  "FIRSTMATE WATCHER WAKE: compaction before queued image delivery",
+  true,
+  { version: 1, source: "firstmate-extension", kind: "watcher-wake" },
+);
+sessionManager.appendCompaction(
+  "Lossy summary that omits the queued image submission.",
+  imageBoundaryId,
+  131874,
+  { fixture: "image-before-delivery-boundary" },
+  true,
+);
+const imageRebuilt = sessionManager.buildSessionContext().messages;
+if (JSON.stringify(imageRebuilt).includes(image.data)) {
+  throw new Error("image-before-delivery fixture unexpectedly retained the queued image in Pi context");
+}
+const imageResult = await handlers.get("context")({ type: "context", messages: imageRebuilt }, ctx);
+const imageContinuity = imageResult?.messages?.find(
+  (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
+);
+if (
+  !imageContinuity?.content.includes("SUBMITTED_NOT_DELIVERED") ||
+  !imageContinuity.content.includes(JSON.stringify(imageSubmittedContent))
+) {
+  throw new Error(`compaction lost exact queued image submission: ${imageContinuity?.content}`);
+}
+
+sessionManager = SessionManager.inMemory(process.env.REPO);
+pendingMessages = false;
+const unanswered = "UNANSWERED-CAPTAIN-Q-10: Which reply remains due?";
 const unansweredContent = [{ type: "text", text: unanswered }];
 await input(unanswered);
 await finishMessage({ role: "user", content: unansweredContent, timestamp: 1700000000500 });

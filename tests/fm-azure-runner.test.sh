@@ -388,11 +388,18 @@ args.source_ref="refs/heads/fm-no-mistakes/01BX5ZZKBKACTAV9WEVGEMMVRZ"
 args.invocation="azr-eeeeeeeeeeee"; args.task="nm-01BX5ZZKBKACTAV9WEVGEMMVRZ"
 (repo/"second").write_text("second\n"); m.run(["git","-C",str(repo),"add","second"]); m.run(["git","-C",str(repo),"commit","-qm","second"])
 head=m.git(repo,"rev-parse","HEAD").stdout.strip(); parent=m.git(repo,"rev-parse","HEAD^1").stdout.strip()
-m.public_origin_proof=lambda *_a,**k:{"remote":"https://github.com/Ruby-Labs/cloud-host-owner.git","default_ref":"refs/heads/main","default_head":"d"*40,"source_ref":k.get("source_ref"),"source_head":head,"tree":m.git(repo,"rev-parse","HEAD^{tree}").stdout.strip()}
+tree=m.git(repo,"rev-parse","HEAD^{tree}").stdout.strip(); origin_proofs=[]
+def direct_origin_proof(*_a,**kwargs):
+    origin_proofs.append(kwargs)
+    assert kwargs.get("private_source") is True, kwargs
+    return {"remote":"https://github.com/Ruby-Labs/cloud-host-owner.git","default_ref":"refs/heads/main","default_head":"d"*40,"source_ref":kwargs.get("source_ref"),"source_head":head,"tree":tree}
+m.public_origin_proof=direct_origin_proof
 m.run(["git","-C",str(repo),"checkout","-q","--detach",head])
 direct=m.prepare(env,args); direct_repo=direct["request"]["repository"]
+assert len(origin_proofs)==1
 assert direct_repo["source_mode"]=="private-direct-bundle"
 assert direct_repo["source_ref"]==args.source_ref and direct_repo["source_head"]==head
+assert direct_repo["tree"]==tree
 assert direct["request"]["capacity_parent"] is None
 assert direct["request"]["capacity_fence"] is None
 sealed=pathlib.Path(direct["input_path"]).parent/"snapshot.bundle"

@@ -19,6 +19,7 @@ type DirectExchangeEvent = {
   at: number;
   inputText?: string;
   imageCount?: number;
+  inputContent?: unknown;
   delivery?: "immediate" | "steer" | "followUp";
   content?: unknown;
 };
@@ -28,6 +29,7 @@ type DirectExchangeState = {
   submittedAt: number;
   inputText: string;
   imageCount: number;
+  inputContent?: unknown;
   delivery: "immediate" | "steer" | "followUp";
   deliveredAt?: number;
   deliveredContent?: unknown;
@@ -94,6 +96,7 @@ function foldDirectExchanges(entries: SessionEntry[]): DirectExchangeState[] {
         imageCount: event.imageCount ?? 0,
         delivery: event.delivery ?? "immediate",
       };
+      if (event.inputContent !== undefined) state.inputContent = event.inputContent;
       byId.set(event.exchangeId, state);
       ordered.push(state);
       return;
@@ -149,11 +152,17 @@ function renderDirectExchangeContinuity(
         ].join("\n"),
       );
     } else if (!hasPendingMessages) {
+      const submissionEvidence =
+        exchange.inputContent !== undefined
+          ? [`Human input, exact submitted JSON: ${JSON.stringify(exchange.inputContent)}`]
+          : [
+              `Human input text, exact JSON: ${JSON.stringify(exchange.inputText)}`,
+              `Attached image count: ${exchange.imageCount}`,
+            ];
       sections.push(
         [
           `Exchange ${exchange.exchangeId}: SUBMITTED_NOT_DELIVERED`,
-          `Human input text, exact JSON: ${JSON.stringify(exchange.inputText)}`,
-          `Attached image count: ${exchange.imageCount}`,
+          ...submissionEvidence,
           "Pi no longer reports this submission in its pending queue and no delivered user message was observed. Treat it as an open reply obligation and verify the apparent delivery loss.",
         ].join("\n"),
       );
@@ -337,6 +346,7 @@ export default function (pi: ExtensionAPI) {
       at,
       inputText: event.text,
       imageCount: event.images?.length ?? 0,
+      inputContent: cloneJson([{ type: "text", text: event.text }, ...(event.images ?? [])]),
       delivery: event.streamingBehavior ?? "immediate",
     });
   });
@@ -348,7 +358,14 @@ export default function (pi: ExtensionAPI) {
       const pending = foldDirectExchanges(ctx.sessionManager.getBranch()).filter(
         (exchange) => exchange.deliveredContent === undefined,
       );
-      const exchange = pending.find((candidate) => candidate.inputText === userText) ?? pending[0];
+      const exchange =
+        pending.find(
+          (candidate) =>
+            candidate.inputContent !== undefined &&
+            JSON.stringify(candidate.inputContent) === JSON.stringify(content),
+        ) ??
+        pending.find((candidate) => candidate.inputText === userText) ??
+        pending[0];
       if (!exchange) return;
       appendDirectExchange({
         version: 1,

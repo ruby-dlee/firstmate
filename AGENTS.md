@@ -109,12 +109,7 @@ Otherwise restore live supervision and continue.
 
 ## 6. Projects, routing, and memory
 
-All registered projects live flat under `projects/`.
-Each `data/projects.md` line records a name, delivery mode, concise description, and added date; an optional `+yolo` records captain-authorized routine approval posture.
-Default new projects to `no-mistakes` with `yolo` off unless the captain explicitly chooses otherwise.
-Project creation requires captain approval of name, owner or organization, visibility, and mode before creating a remote.
-`local-only` projects have no remote.
-Only the documented project initialization command may perform guarded setup in a `no-mistakes` clone; direct-PR and local-only projects skip it.
+`docs/configuration.md`, `docs/architecture.md`, and the project scripts own project registration, creation, delivery modes, and initialization mechanics.
 
 Route work by each registered secondmate's natural-language scope, not by its non-exclusive project clone list.
 Keep local-only work in the main home.
@@ -133,12 +128,6 @@ Route durable knowledge to one owner:
 Prefer pointers to authoritative code or docs over copied detail.
 Rewrite or prune memory instead of appending forever.
 Load `/stow` when the captain invokes it or before a context reset that needs a durable knowledge sweep.
-
-Delivery modes are:
-
-- `no-mistakes`: the task worker drives the full validation pipeline through a PR, then waits for merge authority.
-- `direct-PR`: the worker pushes and opens a PR without no-mistakes, then waits for merge authority.
-- `local-only`: the worker leaves a clean local branch for guarded review and an approved fast-forward merge.
 
 ## 7. Task lifecycle
 
@@ -212,37 +201,12 @@ Load `lavish-decisions` before creating, repairing, or presenting a multi-option
 Whenever a PR is mentioned, include its full `https://...` URL before any shorthand.
 Mention cost as a courtesy when unusually much work is active, but never block merely to mention it.
 
-## 10. Backlog
-
-`data/backlog.md` tracks actionable work, not agents and not questions already answered in chat.
-Persistent secondmates never appear as backlog items; routed work belongs in the destination home's backlog.
-Update a work item on dispatch, decision, completion, and changed dependency.
-Re-evaluate dependencies and time gates after every terminal cleanup and fleet review.
-
-Use compatible `tasks-axi` through `bin/fm-data-write.py` when configured, and the documented manual path otherwise.
-`.tasks.toml`, `docs/configuration.md`, and current command help own schema, compatibility, retention, and exact verbs.
-Use `bin/fm-backlog-handoff.sh` for cross-home handoff after loading `secondmate-provisioning`.
-Keep notes free of temporary paths, moving versions, and copied live state; verify volatile detail at its source and correct stale prose immediately.
-
-## 11. Crewmate briefs
-
-`bin/fm-brief.sh` and its help own scaffold variants, status protocol, delivery-mode definitions of done, completion reports, and exact safety mechanics.
-Load `crew-steering` before writing or materially revising a brief.
-Replace every `{TASK}` with a clear result, acceptance criteria, constraints, and necessary context.
-Do not repeat lifecycle prose that the scaffold or an owning skill already supplies.
-
-Every ship brief retains the isolated-worktree assertion.
-A firstmate-repo brief explicitly requires `firstmate-coding-guidelines` before editing shared tracked material.
-A task that drives Herdr lifecycle must be scaffolded with `--herdr-lab`; if that scope appears later, regenerate rather than adding lifecycle commands by hand.
-Load `secondmate-provisioning` before creating or using a secondmate charter and preserve its marked return channel and idle-by-default contract.
-Status appends are sparse actionable events, not routine progress.
-
-## 12. Self-update
+## 10. Self-update
 
 When the captain invokes `/updatefirstmate` or asks to update firstmate, load `/updatefirstmate`.
 It owns guarded fast-forward updates of firstmate and registered secondmate homes and never touches projects.
 
-## 13. Agent-only reference skills
+## 11. Agent-only reference skills
 
 These skills are not captain-invocable; load them only at their precise triggers.
 

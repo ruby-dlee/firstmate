@@ -22,12 +22,15 @@ This document owns the Pi-specific boundary between direct captain input, automa
 The watcher and turn-end extensions use Pi's context-participating `sendMessage()` custom-message path with distinct `firstmate-watcher-wake` and `firstmate-turnend-guard` types, `deliverAs: "followUp"`, and `triggerTurn: true`.
 They never use `sendUserMessage()` for automation, so supervision remains visible to the model without becoming a human-authored `role: "user"` turn.
 
-The watcher extension observes Pi's `input` event and records only `interactive` or `rpc` submissions as non-context `firstmate-direct-exchange` entries before Pi queues or delivers them.
-Each submission record carries the exact text-and-image content from that boundary, including image data and MIME type, so compaction before delivery cannot reduce an attachment to a count.
-It records the exact delivered user content on `message_end`, and records an exact completed assistant answer only on `stopReason: "stop"` when no extension custom message intervened after delivery.
+The watcher extension observes Pi's `input` event and records only `interactive` or `rpc` submissions as provisional non-context `firstmate-direct-exchange` entries before Pi queues or delivers them.
+Each provisional record carries the exact text-and-image content from that boundary, including image data and MIME type, so compaction before delivery cannot reduce an attachment to a count.
+A provisional immediate input becomes admitted only when Pi emits `before_agent_start` after input-handler dispatch, model validation, and prompt assembly.
+A provisional steering or follow-up input becomes admitted only after Pi reports a live pending-message queue; exact delivered user content on `message_end` also proves admission directly.
+Unadmitted provisional records never become reply obligations, so preflight failures or inputs consumed by another handler cannot be resurrected as captain requests.
+The extension records an exact completed assistant answer only on `stopReason: "stop"` when no extension custom message intervened after delivery.
 These append-only records survive compaction and session resume without changing Pi's queue ordering.
 A queued submission remains owned by Pi while `ctx.hasPendingMessages()` is true, so continuity metadata never bypasses the steering or follow-up queue.
-If Pi later reports no pending message and no delivered user message exists, the context hook emits the exact submitted text-and-image JSON as `SUBMITTED_NOT_DELIVERED` instead of silently forgetting it.
+If Pi later reports no pending message and an admitted input has no delivered user message, the context hook emits the exact submitted text-and-image JSON as `SUBMITTED_NOT_DELIVERED` instead of silently forgetting it.
 
 Before each model request, the extension compares Pi's compaction-aware message list with the full active branch.
 When compaction omitted the latest completed direct exchange, the hook injects one hidden `firstmate-direct-exchange-continuity` custom message containing the exact JSON user content, the exact JSON assistant answer, and `ANSWERED`.
@@ -35,6 +38,8 @@ Every delivered input without a completed answer is included distinctly as `OPEN
 The continuity message identifies itself as extension-generated metadata and states that watcher and guard prompts are custom messages rather than captain-authored requests.
 It is inserted before the current human user message, preserving that user message as the final prompt and avoiding tool-call or tool-result adjacency changes.
 The mechanism does not cancel compaction, enlarge `keepRecentTokens`, alter the cut point, or refuse a turn; malformed or absent continuity state simply leaves Pi's ordinary context unchanged.
+The tracked `.pi/extensions/fm-primary-pi-watch.ts` file is the authoritative continuity source.
+Runtime continuity entries are artifacts emitted from that source through Pi's `input`, `before_agent_start`, `message_end`, and `context` hooks; deterministic tests regenerate them by loading the current source into scratch homes and driving the installed Pi `SessionManager` and `Agent`, rather than editing a generated copy.
 
 ### 2026-08-25 incident evidence
 
@@ -52,8 +57,10 @@ Deterministic command: `tests/fm-pi-watch-extension.test.sh`.
 Observed output included `ok - Pi compaction continuity preserves exact human exchange across automated custom prompts`.
 The regression uses Pi 0.84.2's installed `SessionManager` to build the actual compaction-aware context after an exact human question and answer, a custom watcher prompt, an assistant supervision response, and a compaction whose first-kept entry is the watcher custom message.
 It then delivers a referring human follow-up and proves the chained context hook adds the exact prior question and answer as `ANSWERED`, adds the follow-up as `OPEN_REPLY_OBLIGATION`, keeps both records custom rather than user-authored, leaves a still-pending steering submission in Pi's queue, and emits `SUBMITTED_NOT_DELIVERED` only after that pending signal disappears without delivery.
-A compaction-before-delivery fixture submits text plus an image, cuts at a later custom watcher entry before any user message exists, and proves continuity restores the exact submitted text, image data, and MIME type after Pi's rebuilt context has lost them.
+A compaction-before-delivery fixture submits text plus an image, observes Pi queue admission, cuts at a later custom watcher entry before any user message exists, and proves continuity restores the exact submitted text, image data, and MIME type after Pi's rebuilt context has lost them.
+A preflight/handled fixture proves a provisional input without admission never appears in continuity as a reply obligation.
 A separate compaction fixture cuts an unanswered direct question behind a custom watcher turn and proves the exact question returns as `OPEN_REPLY_OBLIGATION` rather than being inferred from summary prose.
+The same command drives the installed Pi `Agent` with a controlled provider stream, queues an older custom watcher follow-up and then a human image steering message, and proves the human message is delivered unchanged and gets its provider turn before the automation follow-up.
 
 Live command: `FM_PI_COMPACTION_LIVE_E2E=1 FM_PI_LIVE_AUTH_DIR='/Users/dongkeun/.pi/firstmate-local' tests/fm-pi-primary-compaction-live-e2e.test.sh`.
 Observed output: `ok - Pi 0.84.2 live compaction rebuilt the exact answered captain exchange across a custom watcher turn (firstKeptType=message)`.

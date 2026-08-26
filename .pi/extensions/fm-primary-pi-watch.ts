@@ -14,7 +14,7 @@ type ArmResult = {
 
 type DirectExchangeEvent = {
   version: 1;
-  event: "submitted" | "delivered" | "answered";
+  event: "submitted" | "admitted" | "delivered" | "answered";
   exchangeId: string;
   at: number;
   inputText?: string;
@@ -31,6 +31,7 @@ type DirectExchangeState = {
   imageCount: number;
   inputContent?: unknown;
   delivery: "immediate" | "steer" | "followUp";
+  admittedAt?: number;
   deliveredAt?: number;
   deliveredContent?: unknown;
   deliveredRecordIndex?: number;
@@ -71,7 +72,7 @@ function parseDirectExchangeEvent(entry: SessionEntry): DirectExchangeEvent | un
   const candidate = data as Partial<DirectExchangeEvent>;
   if (
     candidate.version !== 1 ||
-    !["submitted", "delivered", "answered"].includes(candidate.event ?? "") ||
+    !["submitted", "admitted", "delivered", "answered"].includes(candidate.event ?? "") ||
     typeof candidate.exchangeId !== "string" ||
     !candidate.exchangeId ||
     typeof candidate.at !== "number"
@@ -103,7 +104,10 @@ function foldDirectExchanges(entries: SessionEntry[]): DirectExchangeState[] {
     }
     const state = byId.get(event.exchangeId);
     if (!state) return;
-    if (event.event === "delivered") {
+    if (event.event === "admitted") {
+      state.admittedAt = event.at;
+    } else if (event.event === "delivered") {
+      state.admittedAt ??= event.at;
       state.deliveredAt = event.at;
       state.deliveredContent = event.content;
       state.deliveredRecordIndex = index;
@@ -151,7 +155,7 @@ function renderDirectExchangeContinuity(
           "No completed assistant answer was observed before compaction.",
         ].join("\n"),
       );
-    } else if (!hasPendingMessages) {
+    } else if (exchange.admittedAt !== undefined && !hasPendingMessages) {
       const submissionEvidence =
         exchange.inputContent !== undefined
           ? [`Human input, exact submitted JSON: ${JSON.stringify(exchange.inputContent)}`]
@@ -351,6 +355,26 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
+  pi.on("before_agent_start", (event, ctx) => {
+    const content = cloneJson([{ type: "text", text: event.prompt }, ...(event.images ?? [])]);
+    const unadmitted = foldDirectExchanges(ctx.sessionManager.getBranch())
+      .filter((exchange) => exchange.admittedAt === undefined && exchange.delivery === "immediate")
+      .reverse();
+    const exchange =
+      unadmitted.find(
+        (candidate) =>
+          candidate.inputContent !== undefined &&
+          JSON.stringify(candidate.inputContent) === JSON.stringify(content),
+      ) ?? unadmitted[0];
+    if (!exchange) return;
+    appendDirectExchange({
+      version: 1,
+      event: "admitted",
+      exchangeId: exchange.exchangeId,
+      at: Date.now(),
+    });
+  });
+
   pi.on("message_end", (event, ctx) => {
     if (event.message.role === "user") {
       const content = cloneJson(event.message.content);
@@ -398,11 +422,21 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("context", (event, ctx) => {
-    const continuity = renderDirectExchangeContinuity(
-      ctx.sessionManager.getBranch(),
-      event.messages,
-      ctx.hasPendingMessages(),
-    );
+    const hasPendingMessages = ctx.hasPendingMessages();
+    let branch = ctx.sessionManager.getBranch();
+    if (hasPendingMessages) {
+      for (const exchange of foldDirectExchanges(branch)) {
+        if (exchange.admittedAt !== undefined || exchange.delivery === "immediate") continue;
+        appendDirectExchange({
+          version: 1,
+          event: "admitted",
+          exchangeId: exchange.exchangeId,
+          at: Date.now(),
+        });
+      }
+      branch = ctx.sessionManager.getBranch();
+    }
+    const continuity = renderDirectExchangeContinuity(branch, event.messages, hasPendingMessages);
     if (!continuity) return;
     const message = {
       role: "custom" as const,

@@ -493,10 +493,29 @@ if (!lossContinuity?.content.includes("SUBMITTED_NOT_DELIVERED") || !lossContinu
 
 sessionManager = SessionManager.inMemory(process.env.REPO);
 pendingMessages = false;
-const imageQueued = "QUEUED-CAPTAIN-IMAGE-Q-9: identify the attached harbor signal";
+const rejected = "REJECTED-OR-HANDLED-CAPTAIN-Q-9: never create a reply obligation";
+await input(rejected);
+const rejectedResult = await handlers.get("context")({ type: "context", messages: [] }, ctx);
+if (
+  rejectedResult?.messages?.some(
+    (message) =>
+      message.role === "custom" &&
+      message.customType === "firstmate-direct-exchange-continuity" &&
+      message.content.includes(rejected),
+  )
+) {
+  throw new Error("unadmitted input was resurrected as a reply obligation");
+}
+
+sessionManager = SessionManager.inMemory(process.env.REPO);
+pendingMessages = false;
+const imageQueued = "QUEUED-CAPTAIN-IMAGE-Q-10: identify the attached harbor signal";
 const image = { type: "image", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", mimeType: "image/png" };
 const imageSubmittedContent = [{ type: "text", text: imageQueued }, image];
 await input(imageQueued, "followUp", [image]);
+pendingMessages = true;
+await handlers.get("context")({ type: "context", messages: [] }, ctx);
+pendingMessages = false;
 const imageBoundaryId = sessionManager.appendCustomMessageEntry(
   "firstmate-watcher-wake",
   "FIRSTMATE WATCHER WAKE: compaction before queued image delivery",
@@ -527,7 +546,7 @@ if (
 
 sessionManager = SessionManager.inMemory(process.env.REPO);
 pendingMessages = false;
-const unanswered = "UNANSWERED-CAPTAIN-Q-10: Which reply remains due?";
+const unanswered = "UNANSWERED-CAPTAIN-Q-11: Which reply remains due?";
 const unansweredContent = [{ type: "text", text: unanswered }];
 await input(unanswered);
 await finishMessage({ role: "user", content: unansweredContent, timestamp: 1700000000500 });
@@ -560,6 +579,116 @@ const openContinuity = openResult?.messages?.find(
 );
 if (!openContinuity?.content.includes("OPEN_REPLY_OBLIGATION") || !openContinuity.content.includes(JSON.stringify(unansweredContent))) {
   throw new Error("compaction lost the exact unanswered captain obligation");
+}
+
+const { Agent } = await import(
+  pathToFileURL(`${process.env.PI_PACKAGE_DIR}/node_modules/@earendil-works/pi-agent-core/dist/index.js`).href
+);
+const { createAssistantMessageEventStream } = await import(
+  pathToFileURL(`${process.env.PI_PACKAGE_DIR}/node_modules/@earendil-works/pi-ai/dist/index.js`).href
+);
+const zeroUsage = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+let requestCount = 0;
+let releaseFirstResponse;
+const queueDelivery = [];
+const queueContexts = [];
+const queueAgent = new Agent({
+  steeringMode: "one-at-a-time",
+  followUpMode: "one-at-a-time",
+  convertToLlm(messages) {
+    return messages.map((message) => {
+      if (message.role !== "custom") return message;
+      return {
+        role: "user",
+        content: [{ type: "text", text: String(message.content) }],
+        timestamp: message.timestamp,
+      };
+    });
+  },
+  streamFn(_model, context) {
+    requestCount += 1;
+    queueContexts.push(JSON.parse(JSON.stringify(context.messages)));
+    const stream = createAssistantMessageEventStream();
+    const finish = () => {
+      const message = {
+        role: "assistant",
+        content: [{ type: "text", text: `queue-response-${requestCount}` }],
+        api: "unknown",
+        provider: "fixture",
+        model: "fixture",
+        usage: zeroUsage,
+        stopReason: "stop",
+        timestamp: 1700000010000 + requestCount,
+      };
+      stream.push({ type: "done", reason: "stop", message });
+    };
+    if (requestCount === 1) releaseFirstResponse = finish;
+    else queueMicrotask(finish);
+    return stream;
+  },
+});
+queueAgent.subscribe((event) => {
+  if (event.type !== "message_end") return;
+  if (event.message.role === "custom" && event.message.customType === "firstmate-watcher-wake") {
+    queueDelivery.push({ kind: "automation", content: event.message.content });
+    return;
+  }
+  if (event.message.role !== "user") return;
+  const text = Array.isArray(event.message.content)
+    ? event.message.content
+        .filter((part) => part?.type === "text")
+        .map((part) => part.text)
+        .join("\n")
+    : String(event.message.content);
+  if (text.includes("QUEUED-HUMAN-WITH-IMAGE")) {
+    queueDelivery.push({ kind: "human", content: event.message.content });
+  }
+});
+const queueRun = queueAgent.prompt({
+  role: "user",
+  content: [{ type: "text", text: "INITIAL-TURN-FOR-QUEUE-ORDER" }],
+  timestamp: 1700000010000,
+});
+for (let i = 0; i < 100 && !releaseFirstResponse; i += 1) {
+  await new Promise((resolve) => setTimeout(resolve, 1));
+}
+if (!releaseFirstResponse) throw new Error("real Pi Agent queue fixture did not start its first response");
+const queuedHumanContent = [
+  { type: "text", text: "QUEUED-HUMAN-WITH-IMAGE" },
+  { type: "image", data: "aHVtYW4taW1hZ2U=", mimeType: "image/png" },
+];
+queueAgent.followUp({
+  role: "custom",
+  customType: automatedMessage.customType,
+  content: automatedMessage.content,
+  display: automatedMessage.display,
+  details: automatedMessage.details,
+  timestamp: 1700000010100,
+});
+queueAgent.steer({ role: "user", content: queuedHumanContent, timestamp: 1700000010200 });
+releaseFirstResponse();
+await queueRun;
+if (queueDelivery.map((entry) => entry.kind).join(",") !== "human,automation") {
+  throw new Error(`real Pi queue starved or reordered human input: ${JSON.stringify(queueDelivery)}`);
+}
+if (JSON.stringify(queueDelivery[0].content) !== JSON.stringify(queuedHumanContent)) {
+  throw new Error(`real Pi queue changed exact human image content: ${JSON.stringify(queueDelivery[0])}`);
+}
+if (
+  !JSON.stringify(queueContexts[1]).includes("QUEUED-HUMAN-WITH-IMAGE") ||
+  JSON.stringify(queueContexts[1]).includes("FIRSTMATE WATCHER WAKE")
+) {
+  throw new Error(`human steering input did not get its own provider turn first: ${JSON.stringify(queueContexts)}`);
+}
+if (!JSON.stringify(queueContexts[2]).includes("FIRSTMATE WATCHER WAKE")) {
+  throw new Error(`automation follow-up never ran after human input: ${JSON.stringify(queueContexts)}`);
 }
 EOF
 )

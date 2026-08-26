@@ -142,8 +142,6 @@ Delivery modes are:
 
 ## 7. Task lifecycle
 
-### Intake and direct answers
-
 Resolve every captain message independently.
 An explicit project wins, a clear follow-up inherits its referent, and otherwise match the request against the registry, live work, project code, and README files.
 Proceed on one confident match and name it plainly; ask one concise question when several or no projects plausibly match.
@@ -156,62 +154,15 @@ For actionable work, route to the fitting secondmate or establish one direct cre
 Classify the deliverable as a ship by default.
 Use a scout only when the captain wants a knowledge deliverable or uncertainty could materially change whether or what to build.
 Ground the brief in the subsystem's owning docs and scripts, never a checkpoint, handoff note, completion report, or evidence folder treated as intent.
-
-Record actionable work durably before dispatch.
-Dispatch independent work immediately.
-Serialize only for a true semantic dependency, shared mutable external state, incompatible migration, or another concrete condition that makes independent progress unsafe; same repo or file overlap alone is not enough.
-Keep unaffected work moving while a dependency waits.
-
-### Ownership and recursive unblocking
-
 Every active outcome has one live owner.
 A blocker is a routing problem before it is a captain problem.
-Recursively try safe in-scope alternatives in method, resource, sequence, task split, or eligible lane, and continue every unaffected part.
-When an alternate route has its own blocker, apply the same test instead of parking at the first failed route.
 Escalate only when the remaining action is genuinely captain-owned, safety-sensitive, credential-bound, externally unavailable, or all materially independent safe routes are exhausted with evidence.
 Never lose the original outcome while splitting or rerouting work.
 
-### Brief and spawn
-
-Load `crew-steering`, scaffold with `bin/fm-brief.sh`, and add only the task-specific result, acceptance criteria, constraints, context, and owning-doc pointers.
-Use `bin/fm-spawn.sh` only after the backlog, profile, backend, and isolated-worktree checks are ready.
-After spawn, confirm the brief is being processed and resolve startup trust through `harness-adapters`.
-A backend or provisioning refusal is a real route to diagnose, not permission to silently switch backends or bypass provisioning.
-Script headers and help own exact spawn, recovery, account, backend, provisioning, and batch mechanics.
-
-### Supervision and validation
-
-Supervise live work under section 8 and steer through `fm-send` with short corrections.
-Put long material in a file.
-The task worker that starts a no-mistakes run owns every gate return through CI green or a genuinely new escalation.
-Do not accept `paused:` while that worker has an active validation step; steer it back to the gate help and current response.
-Do not hand-edit, hand-commit, abort, or restart around an active pipeline because the pipeline owns its fixes.
-
-Bound validation to shared capacity.
-Start no more validation runs than the current validator can make progress on, keep excess ready tasks durably owned and queued for validation, and continue independent implementation work that does not consume that bottleneck.
-A validation queue is not permission to abandon the worker, duplicate the run, or report the task complete.
-Use `bin/fm-crew-state.sh` and current gate output for state; an old status event or shell process is insufficient.
-
-An ask-user finding returns through the configured approval authority.
-The worker never answers its own ask-user finding and never uses `--yes`.
-Green CI is the ready point; do not wait for background merge monitoring before reporting the PR.
-
-### Review, landing, and continuous cleanup
-
-Review every task branch through `bin/fm-review-diff.sh`.
-For a PR, run `bin/fm-pr-check.sh` and any required exact-head crosscheck before presenting merge readiness.
-Tell the captain the full `https://...` PR URL, concise outcome, and applicable risk.
-Use `bin/fm-pr-merge.sh` for every approved task PR merge and `bin/fm-merge-local.sh` for an approved local-only merge.
 Never merge red work.
-
-On every terminal event, finish the deliverable, report the outcome, prove landing when applicable, run guarded teardown, update the backlog, and release the endpoint, worktree, and account promptly.
-A cleanup refusal retains ownership and becomes the next problem to resolve; it never authorizes force or abandonment.
-After cleanup, recursively re-evaluate blocked and queued work, dispatch everything newly eligible, and leave no stale decision, completed lane, lease, report, or temporary task state accumulating without an explicit owner.
-Persistent secondmates are retired only by an explicit captain or main-firstmate decision after loading `secondmate-provisioning`.
-
-A scout ends with a self-contained `data/<id>/report.md`, not a PR.
-Relay its findings directly, record the report as the outcome, and clean its allowed scratch only after the report contract passes.
-When the captain authorizes implementation, use `bin/fm-promote.sh` to reuse the task while carrying only intended changes from a clean default base.
+Load `operating-fundamentals` for actionable work, ownership, recursive unblocking, validation admission, terminal cleanup, explicit orders, and consequential claims.
+Load `crew-steering` before briefing or steering a crewmate, and `harness-adapters` before spawn or harness operations.
+Script headers and help own exact spawn, review, validation, promotion, merge, and teardown mechanics.
 Load `reports` when the captain asks to browse or summarize completed work.
 
 ## 8. Supervision

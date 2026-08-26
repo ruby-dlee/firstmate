@@ -662,7 +662,7 @@ run_capacity_contract_checks() {
   write_sourceable_script "$sourceable"
   set +e
   # These exports intentionally reset names assigned in earlier isolated runtime-test subshells.
-  # shellcheck disable=SC2031
+  # shellcheck disable=SC2030,SC2031
   output=$(
     (
       set --
@@ -750,6 +750,7 @@ run_worker_create_replay_quota_checks() {
   sourceable=$(mktemp)
   write_sourceable_script "$sourceable"
   set +e
+  # shellcheck disable=SC2030,SC2031
   output=$(
     (
       set --

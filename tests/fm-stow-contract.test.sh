@@ -18,15 +18,16 @@ test_stow_skill_task_note_contract() {
   pass "stow skill task-note contract includes recoverable body archival"
 }
 
-test_agents_backlog_task_note_contract() {
+test_agents_routes_task_note_mechanics_to_owner() {
   local agents="$ROOT/AGENTS.md"
 
-  assert_grep 'tasks-axi show <id> --full' "$agents" "AGENTS.md does not require inspecting task notes first"
-  assert_grep 'tasks-axi update <id> --body-file <path>' "$agents" "AGENTS.md does not require task body replacement"
-  assert_grep '--archive-body' "$agents" "AGENTS.md does not document recoverable task body archival"
-  assert_no_grep 'carry that context into the replacement body' "$agents" "AGENTS.md still preserves archive-only context in the replacement body"
-  pass "AGENTS.md task-note contract includes recoverable body archival"
+  assert_no_grep 'tasks-axi show <id> --full' "$agents" "AGENTS.md duplicates conditional task-note mechanics"
+  assert_no_grep 'tasks-axi update <id> --body-file <path>' "$agents" "AGENTS.md duplicates task-note command syntax"
+  assert_grep "Load \`/stow\`" "$agents" "AGENTS.md does not route the stow workflow to its skill"
+  assert_grep 'current command help own schema, compatibility, retention, and exact verbs' "$agents" \
+    "AGENTS.md does not route routine backlog mechanics to command help"
+  pass "AGENTS.md routes conditional task-note mechanics to their owner"
 }
 
 test_stow_skill_task_note_contract
-test_agents_backlog_task_note_contract
+test_agents_routes_task_note_mechanics_to_owner

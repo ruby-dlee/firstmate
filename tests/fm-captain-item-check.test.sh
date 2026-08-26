@@ -219,9 +219,10 @@ test_usage_and_file_errors() {
 }
 
 test_wiring() {
-  # shellcheck disable=SC2016  # These are literal tracked Markdown fragments.
-  grep -F 'require `bin/fm-captain-item-check.sh` to clear' "$ROOT/AGENTS.md" >/dev/null \
-    || fail "AGENTS.md does not require the check before surfacing an item"
+  # The check belongs to the structured Lavish path, not every direct captain answer.
+  # shellcheck disable=SC2016  # This is a literal tracked Markdown fragment.
+  ! grep -F 'require `bin/fm-captain-item-check.sh` to clear' "$ROOT/AGENTS.md" >/dev/null \
+    || fail "AGENTS.md still blocks direct answers on the structured-item checker"
   # shellcheck disable=SC2016  # These are literal tracked Markdown fragments.
   grep -F 'Creation snapshots the request bytes once' \
     "$ROOT/.agents/skills/lavish-decisions/SKILL.md" >/dev/null \
@@ -232,7 +233,7 @@ test_wiring() {
     || fail "Lavish creation does not check annotation item bodies before durable creation"
   grep -F 'request,' "$ROOT/tools/lavish/src/cli.mjs" >/dev/null \
     || fail "Lavish creation does not pass the checked bytes to durable creation"
-  pass "always-loaded and Lavish creation paths invoke the check"
+  pass "structured Lavish creation invokes the check without gating direct answers"
 }
 
 test_negative_controls

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck source=tests/test-entry.sh
 . "$(dirname "$0")/test-entry.sh"
-# Contract tests for operating fundamentals and related behavioral guardrails.
+# Contract tests for direct answers, live ownership, recursive unblocking,
+# bounded validation, cleanup, and the concise skills that own those practices.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -9,153 +10,159 @@ set -u
 
 SKILL="$ROOT/.agents/skills/operating-fundamentals/SKILL.md"
 CREW_SKILL="$ROOT/.agents/skills/crew-steering/SKILL.md"
+HARNESS_SKILL="$ROOT/.agents/skills/harness-adapters/SKILL.md"
 LAVISH_SKILL="$ROOT/.agents/skills/lavish-decisions/SKILL.md"
 AGENTS="$ROOT/AGENTS.md"
 
-test_agent_only_folded_frontmatter_and_size() {
-  local frontmatter line_count delimiter_count
+section_body() {
+  local heading=$1
+  awk -v heading="$heading" '$0 == heading { capture=1; next } capture && /^## / { exit } capture' "$SKILL"
+}
 
-  assert_present "$SKILL" "skill missing"
+test_operating_skill_shape() {
+  local frontmatter headings expected line_count
+  assert_present "$SKILL" "operating-fundamentals skill missing"
   frontmatter=$(awk 'NR == 1 && $0 == "---" { capture=1; next } capture && $0 == "---" { exit } capture' "$SKILL")
   assert_contains "$frontmatter" "name: operating-fundamentals" "canonical name missing"
   assert_contains "$frontmatter" "description: >-" "folded YAML required"
-  assert_contains "$frontmatter" "user-invocable: false" "agent-only required"
-  assert_contains "$frontmatter" "metadata:" "metadata missing"
-  assert_contains "$frontmatter" "  internal: true" "internal flag missing"
-  assert_contains "$frontmatter" "before making or relaying a consequential claim about success, failure, a blocker, or a capability" "claim trigger missing"
-
-  delimiter_count=$(grep -c '^---$' "$SKILL")
-  [ "$delimiter_count" -eq 2 ] || fail "invalid frontmatter delimiters"
+  assert_contains "$frontmatter" "user-invocable: false" "agent-only flag missing"
+  assert_contains "$frontmatter" "actionable work that stays continuously owned" "description lost its outcome"
+  assert_contains "$frontmatter" "making or relaying a consequential claim" "claim trigger missing"
+  [ "$(grep -c '^---$' "$SKILL")" -eq 2 ] || fail "invalid frontmatter delimiters"
   line_count=$(wc -l < "$SKILL" | tr -d '[:space:]')
-  [ "$line_count" -le 90 ] || fail "skill exceeds the 90-line limit: $line_count"
-  pass "operating-fundamentals metadata and size"
-}
+  [ "$line_count" -le 80 ] || fail "operating skill exceeds 80 lines: $line_count"
 
-test_seven_ordered_principles() {
-  local headings expected principle_seven contract_text
   headings=$(sed -nE 's/^## ([0-9]+\. .*)$/\1/p' "$SKILL")
-  principle_seven=$(awk '/^## 7\./ { capture=1; next } capture && /^## / { exit } capture' "$SKILL")
-  contract_text=$(git -C "$ROOT" ls-files 'AGENTS.md' '.agents/**/*.md' | sed "s#^#$ROOT/#" | xargs cat)
   expected=$(printf '%s\n' \
-    "1. Orchestrate; never work inline" \
-    "2. Saturate every available lane" \
-    "3. Route around blockers" \
-    "4. Decouple validation from worker budgets" \
+    "1. Preserve the direct-answer boundary" \
+    "2. Keep one live owner" \
+    "3. Unblock recursively" \
+    "4. Bound validation" \
     "5. Reap continuously" \
-    "6. Obey explicit orders decisively" \
-    "7. Prove each consequential claim at the scope you report")
-  [ "$headings" = "$expected" ] || fail "seven principles out of order"
-
-  assert_grep "every captain ask" "$SKILL" "intake missing"
-  assert_grep "durable backlog item" "$SKILL" "backlog missing"
-  assert_grep "tracked crewmate assignment" "$SKILL" "owner missing"
-  assert_grep "never perform project investigation, planning, implementation, or deliverable production inline" "$SKILL" "inline ban missing"
-  assert_grep "every healthy lane" "$SKILL" "saturation missing"
-  assert_grep "blocker as a routing problem" "$SKILL" "routing missing"
-  assert_grep "shared validation" "$SKILL" "validation missing"
-  assert_grep "single exhaustible budget" "$SKILL" "budget isolation missing"
-  assert_grep "On every terminal wake" "$SKILL" "reaping missing"
-  assert_grep "Fill released capacity" "$SKILL" "refill missing"
-  assert_grep "explicit captain order as the governing objective" "$SKILL" "order priority missing"
-  assert_grep "non-overridable safety and instruction constraints" "$SKILL" "safety boundary missing"
-  assert_not_contains "$contract_text" "shallowest level" "shallow shortcut remains"
-  assert_not_contains "$contract_text" "one load-bearing assumption" "one-assumption shortcut remains"
-  for proof in "every leg covered" "neighboring pass" "single failure" "blocks the claim until reproduced and resolved or proven out-of-scope" "unresolved, report observations only" "direct end-to-end evidence" "unverified" "authoritative reference" "materially independent safe in-scope route" "narrowest supported result"; do assert_contains "$principle_seven" "$proof" "missing '$proof'"; done
-  for bypass_contract in "target outcome" "critical path" "record the target outcome and critical-path rationale" "operation failing, not noise"; do assert_contains "$principle_seven" "$bypass_contract" "missing '$bypass_contract'"; done
-  pass "seven principles preserved"
+    "6. Execute explicit orders decisively" \
+    "7. Prove consequential claims at their reported scope")
+  [ "$headings" = "$expected" ] || fail "operating principles are incomplete or out of order"
+  pass "operating skill shape and seven owners"
 }
 
-test_single_conditional_agents_trigger() {
-  local section blocker_section global_count section_count
-  section=$(awk '/^## 13\. Agent-only reference skills$/ { capture=1; next } capture && /^## / { exit } capture' "$AGENTS")
-  blocker_section=$(awk '/^## 9\./ { capture=1; next } capture && /^## / { exit } capture' "$AGENTS")
-  global_count=$(grep -Fc "\`operating-fundamentals\`" "$AGENTS")
-  section_count=$(printf '%s\n' "$section" | grep -Fc "\`operating-fundamentals\`")
-  [ "$global_count" -eq 1 ] || fail "duplicate skill reference"
-  [ "$section_count" -eq 1 ] || fail "skill route misplaced"
-  assert_contains "$section" "before making or relaying a consequential claim about success, failure, a blocker, or a capability" "claim route missing"
-  assert_contains "$blocker_section" "applies equally to firstmate-owned and relayed claims" "symmetry missing"
-  assert_not_contains "$blocker_section" "directing the crewmate" "old blocker bar remains"
-  assert_not_contains "$blocker_section" "get it working through the crewmate first" "old stopping rule remains"
-  pass "claim route and blocker symmetry"
+test_direct_answer_and_live_owner() {
+  local answer owner
+  answer=$(section_body "## 1. Preserve the direct-answer boundary")
+  owner=$(section_body "## 2. Keep one live owner")
+  assert_contains "$answer" "direct-answer obligation in \`AGENTS.md\`" "direct-answer owner missing"
+  assert_contains "$answer" "return it without loading the captain with records, investigation, or machinery" "process substitution remains"
+  assert_contains "$answer" "only the bounded work needed" "bounded uncertainty work missing"
+  assert_contains "$owner" "one durable record and one live owner" "single ownership missing"
+  assert_contains "$owner" "through proof, landing when applicable, reporting, and cleanup" "end-to-end ownership missing"
+  assert_contains "$owner" "do not manufacture work merely to fill capacity" "passive lane saturation remains"
+  pass "direct answers and live ownership"
 }
 
-test_crew_steering_contract_and_trigger() {
-  local section headings expected
+test_recursive_unblocking_and_bounded_validation() {
+  local unblock validation
+  unblock=$(section_body "## 3. Unblock recursively")
+  validation=$(section_body "## 4. Bound validation")
+  assert_contains "$unblock" "routing problem before treating it as a stopping point" "blocker routing missing"
+  assert_contains "$unblock" "apply the same test to that blocker" "recursive unblocking missing"
+  assert_contains "$unblock" "not scope expansion or a safety bypass" "unblocking boundary missing"
+  assert_contains "$unblock" "every materially independent safe route is exhausted with evidence" "escalation bar missing"
+  assert_contains "$validation" "finite capacity, not an unbounded fan-out target" "validation bound missing"
+  assert_contains "$validation" "excess ready work durably owned in a visible validation queue" "queued ownership missing"
+  assert_contains "$validation" "worker drives every synchronous gate return" "validation custody missing"
+  assert_contains "$validation" "never an external pause" "parked validation contradiction remains"
+  pass "recursive unblocking and bounded validation"
+}
 
-  assert_present "$CREW_SKILL" "crew-steering SKILL.md is missing"
-  assert_grep "name: crew-steering" "$CREW_SKILL" "crew-steering skill is missing its canonical name"
-  headings=$(sed -nE 's/^## ([1-6]\. .*)$/\1/p' "$CREW_SKILL")
-  expected=$(printf '%s\n' \
-    "1. Demand ownership" \
-    "2. Reject vague or optimistic claims" \
-    "3. Fact-check the load-bearing premise" \
-    "4. Prefer quality and robustness" \
-    "5. Preserve goal fidelity" \
-    "6. Be direct and early")
-  [ "$headings" = "$expected" ] || fail "crew-steering must retain all six captain-standard guardrails"
+test_cleanup_orders_and_claims() {
+  local cleanup orders claims
+  cleanup=$(section_body "## 5. Reap continuously")
+  orders=$(section_body "## 6. Execute explicit orders decisively")
+  claims=$(section_body "## 7. Prove consequential claims at their reported scope")
+  assert_contains "$cleanup" "On every terminal event" "terminal cleanup trigger missing"
+  assert_contains "$cleanup" "cleanup refusal as retained owned work" "cleanup refusal ownership missing"
+  assert_contains "$cleanup" "re-evaluate blocked and queued work recursively" "cleanup refill missing"
+  assert_contains "$orders" "explicit captain order as the governing objective" "captain order priority missing"
+  assert_contains "$orders" "higher-priority safety and authority constraints" "order safety boundary missing"
+  for proof in "every leg covered" "single route failure" "report observations only" "direct end-to-end evidence" "unverified" "authoritative reference" "materially independent safe route" "narrowest supported result" "critical path"; do
+    assert_contains "$claims" "$proof" "claim proof missing: $proof"
+  done
+  pass "continuous cleanup, decisive orders, and scoped proof"
+}
 
-  assert_grep "name the outcome, constraint, evidence, and next action" "$CREW_SKILL" "crew steering must keep briefs and steers proportional"
-  assert_grep "expected result, authority boundaries, verification, and definition of done" "$CREW_SKILL" "crew briefs must define their result, scope, proof, and completion bar"
-  assert_grep "smallest load-bearing mistake early" "$CREW_SKILL" "live steering must correct the load-bearing mistake early"
-  assert_grep "carry the fix through implementation and proof" "$CREW_SKILL" "live steering must require implementation and proof"
-  assert_grep "preserve the captain's actual goal" "$CREW_SKILL" "crew steering must preserve the captain's actual goal"
-  assert_grep "use the existing owner for detail instead of copying its contract" "$CREW_SKILL" "crew steering must preserve contract ownership"
-  assert_grep "solve and implement the task" "$CREW_SKILL" "crews must own both solution and implementation"
-  assert_grep "never stops solely because work is hard or failing" "$CREW_SKILL" "crews must not treat difficulty as a stopping condition"
-  assert_grep "preserves mandated safety" "$CREW_SKILL" "crew ownership must preserve legitimate safety stops"
-  assert_grep "unsafe or non-isolated worktree placement" "$CREW_SKILL" "crew ownership must retain the worktree safety stop"
-  assert_grep "exhausts its capability before following the solve-first escalation bar" "$CREW_SKILL" "crew ownership must preserve legitimate blocker escalation"
-  assert_grep "Treat \`almost there\` as unfinished" "$CREW_SKILL" "crew steering must reject optimistic partial-completion claims"
-  assert_grep "real evidence because work is not done until proven" "$CREW_SKILL" "crew steering must require evidence before completion"
-  assert_grep "review adversarially rather than rubber-stamping" "$CREW_SKILL" "crew steering must require adversarial review"
-  assert_grep "Reject a shallow-false premise without overcorrecting" "$CREW_SKILL" "premise checking must reject false premises without overreach"
-  assert_grep "captain's technical-decision bias" "$CREW_SKILL" "crew steering must apply the captain's quality bar"
-  assert_grep "reject preserving a leaky component merely to save development cost or sunk work" "$CREW_SKILL" "crew steering must prefer robustness over development cost or sunk work"
-  assert_grep "Reject any quiet reframing of the task into a smaller win" "$CREW_SKILL" "crew steering must reject weakened goals"
-  assert_grep "fixed-goal guardrail" "$CREW_SKILL" "crew steering must retain the fixed-goal authority"
-  assert_grep "specific, un-bloated briefs and steers" "$CREW_SKILL" "crew steering must remain direct"
-  assert_grep "correct a wrong path before it is built" "$CREW_SKILL" "crew steering must correct wrong paths early"
-  assert_grep "concrete result the crewmate must produce" "$CREW_SKILL" "a steer must end with the required result"
-  assert_grep "evidence that will prove it" "$CREW_SKILL" "a steer must end with required proof"
-  assert_grep "next action it should take" "$CREW_SKILL" "a steer must end with the next action"
-  assert_grep "Do not add motivational padding, duplicate background, or a second copy of an existing procedure" "$CREW_SKILL" "crew steering must avoid padding and duplicate contracts"
+test_agents_hot_path_and_single_trigger() {
+  local trigger_section count
+  assert_grep "Answer the captain's current question directly in the same turn" "$AGENTS" "hot path lacks direct-answer rule"
+  assert_grep "Every active outcome has one live owner" "$AGENTS" "hot path lacks live ownership"
+  assert_grep "Recursively try safe in-scope alternatives" "$AGENTS" "hot path lacks recursive unblocking"
+  assert_grep "Bound validation to shared capacity" "$AGENTS" "hot path lacks bounded validation"
+  assert_grep "On every terminal event" "$AGENTS" "hot path lacks continuous cleanup"
+  assert_grep "Never discard unlanded work" "$AGENTS" "unlanded-work safety missing"
+  assert_grep "Fail-closed is reserved for spending money, credentials leaving custody, and irreversible data loss" "$AGENTS" "single-operator fail-closed boundary missing"
+  trigger_section=$(awk '/^## 13\. Agent-only reference skills$/ { capture=1; next } capture && /^## / { exit } capture' "$AGENTS")
+  count=$(grep -Fc "\`operating-fundamentals\`" "$AGENTS")
+  [ "$count" -eq 1 ] || fail "operating-fundamentals must have one trigger owner, found $count"
+  assert_contains "$trigger_section" "requires action beyond a direct answer" "actionable-work trigger missing"
+  assert_contains "$trigger_section" "recursively unblocking work" "unblocking trigger missing"
+  assert_contains "$trigger_section" "admitting validation" "validation trigger missing"
+  assert_contains "$trigger_section" "cleaning a terminal lane" "cleanup trigger missing"
+  pass "AGENTS hot path and single conditional trigger"
+}
 
-  section=$(awk '/^## 13\. Agent-only reference skills$/ { capture=1; next } capture && /^## / { exit } capture' "$AGENTS")
-  assert_contains "$section" "\`crew-steering\` - load before writing or materially revising any crewmate brief and before live-steering a crewmate" "section 13 must trigger crew-steering for briefs and live steers"
-  pass "crew-steering retains its behavioral guardrails and conditional trigger"
+test_crew_steering_is_concise_and_active() {
+  local line_count
+  assert_present "$CREW_SKILL" "crew-steering skill missing"
+  line_count=$(wc -l < "$CREW_SKILL" | tr -d '[:space:]')
+  [ "$line_count" -le 60 ] || fail "crew-steering exceeds 60 lines: $line_count"
+  assert_grep "result, authority boundary, evidence, and next action" "$CREW_SKILL" "concise steer shape missing"
+  assert_grep "unsafe or non-isolated worktree" "$CREW_SKILL" "worktree safety missing"
+  assert_grep "Apply the same question recursively" "$CREW_SKILL" "recursive steer missing"
+  assert_grep "parked approval or fix-review step is not \`paused:\`" "$CREW_SKILL" "validation custody missing"
+  assert_grep "bounded validation queue" "$CREW_SKILL" "bounded validation steer missing"
+  assert_grep "Do not add motivational padding" "$CREW_SKILL" "anti-padding rule missing"
+  pass "crew steering remains concise and active"
+}
+
+test_harness_guidance_is_concise_and_owned() {
+  local line_count
+  line_count=$(wc -l < "$HARNESS_SKILL" | tr -d '[:space:]')
+  [ "$line_count" -le 140 ] || fail "harness-adapters exceeds 140 lines: $line_count"
+  assert_grep "Use only the verified adapters \`claude\`, \`codex\`, \`opencode\`, \`pi\`, and \`grok\`" "$HARNESS_SKILL" \
+    "verified adapter boundary missing"
+  assert_grep "A spawn is not complete until the endpoint is running and processing its brief" "$HARNESS_SKILL" \
+    "spawn ownership missing"
+  assert_grep "security-sensitive mid-run decision" "$HARNESS_SKILL" "permission boundary missing"
+  assert_grep "fm_watch_arm_pi" "$HARNESS_SKILL" "Pi primary supervision owner missing"
+  assert_grep "The emitted block, not this summary, owns exact commands and repair behavior" "$HARNESS_SKILL" \
+    "primary protocol owner missing"
+  assert_no_grep "**Incident" "$HARNESS_SKILL" "incident narrative remains in operational harness guidance"
+  assert_no_grep "VERIFIED 2026" "$HARNESS_SKILL" "dated verification narrative remains in operational harness guidance"
+  pass "harness guidance stays concise, live, and owner-directed"
 }
 
 test_live_surface_freshness_contract() {
-  assert_grep "reconcile it against live fleet state" "$AGENTS" "captain-facing surfaces must reconcile against live state"
-  assert_grep "removing resolved actionable or decision items" "$AGENTS" "serve-fresh removal must cover resolved actionable and decision items"
-  assert_grep "Recently Landed section of \`/bearings\` and \`/reports\`" "$AGENTS" "completion-oriented surfaces must retain relevant history"
-  assert_grep "Reconcile the proposed decision against live fleet state" "$LAVISH_SKILL" "Lavish decisions must use live fleet state"
-  assert_grep "Do not edit \`request.md\` or \`manifest.toon\` after surfacing" "$LAVISH_SKILL" "surfaced decision contracts must be immutable"
-  assert_grep "The answer file is authoritative; the wake record is only a pointer" "$LAVISH_SKILL" "durable answers must outrank wake pointers"
-  assert_grep "Never start a server, create or share a session URL, poll, long-poll" "$LAVISH_SKILL" "the disqualified served and polling lifecycle must stay prohibited"
-  assert_grep "The sole browser exception is \`bin/fm-lavish-board.sh\`" "$LAVISH_SKILL" "the browser allowance must stay limited to the self-contained board wrapper"
-  assert_grep "before creating, repairing, or presenting a multi-option captain choice" "$LAVISH_SKILL" "Lavish frontmatter must trigger when presenting a choice"
-  assert_grep "load before creating, repairing, or presenting a multi-option captain choice" "$AGENTS" "AGENTS must route presenting a choice through Lavish"
-  pass "live-surface freshness preserves completion history and in-progress answers"
+  assert_grep "Reconcile every captain-facing status, decision, and summary against live fleet state" "$AGENTS" "captain surface freshness missing"
+  assert_grep "Remove resolved actionable or decision items" "$AGENTS" "resolved item cleanup missing"
+  assert_grep "Reconcile the proposed decision against live fleet state" "$LAVISH_SKILL" "Lavish decision freshness missing"
+  assert_grep "The answer file is authoritative; the wake record is only a pointer" "$LAVISH_SKILL" "answer authority missing"
+  pass "captain surfaces remain live and answerable"
 }
 
 test_provider_neutral_and_no_maintenance_boilerplate() {
   if grep -Eiq 'Claude|Codex|OpenAI|Anthropic|Gemini|Grok|Orca|Herdr|tmux|zellij|cmux|AWS|GitHub|provider|account' "$SKILL"; then
-    fail "skill contains a named provider, harness, account, or incident-specific dependency"
+    fail "operating skill contains a named provider, harness, account, or incident dependency"
   fi
   if grep -Eiq 'https?://|@[[:alnum:]_.-]+|[[:xdigit:]]{8}-[[:xdigit:]-]{27,}' "$SKILL"; then
-    fail "skill contains an incident-specific URL, address, or identifier"
+    fail "operating skill contains an incident-specific URL, address, or identifier"
   fi
-  if grep -Eiq 'maintain|maintenance|when updating|keep this file|for maintainers' "$SKILL"; then
-    fail "skill contains maintenance boilerplate"
-  fi
-  pass "operating-fundamentals stays provider-neutral and omits incident and maintenance detail"
+  pass "operating skill stays provider-neutral"
 }
 
-test_agent_only_folded_frontmatter_and_size
-test_seven_ordered_principles
-test_single_conditional_agents_trigger
-test_crew_steering_contract_and_trigger
+test_operating_skill_shape
+test_direct_answer_and_live_owner
+test_recursive_unblocking_and_bounded_validation
+test_cleanup_orders_and_claims
+test_agents_hot_path_and_single_trigger
+test_crew_steering_is_concise_and_active
+test_harness_guidance_is_concise_and_owned
 test_live_surface_freshness_contract
 test_provider_neutral_and_no_maintenance_boilerplate

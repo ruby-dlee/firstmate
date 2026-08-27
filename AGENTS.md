@@ -258,7 +258,7 @@ Act on the digest's lock result exactly as section 3 requires and keep its drain
 Treat the printed `data/backlog.md`, `data/secondmates.md`, `state/*.meta`, and bounded `state/*.status` tails as already read; status tails are wake-event history, so use `bin/fm-crew-state.sh <id>` for current state and read only an individually named full log when older history matters.
 Use each recorded `window=` and `endpoint: alive|dead` result as the direct-report set and presence check; do not re-probe or sweep every `fm-*` tmux window, herdr tab, zellij tab, Orca terminal, or cmux workspace across homes.
 For a missing `window=` or dead endpoint, reconcile by kind through its meta.
-If ship/scout meta records `account_home=`, run `bin/fm-spawn.sh <id> --recover-direct-account` for fresh direct account-directory selection.
+If ship/scout meta records `account_home=`, or records a local `harness=pi` generation that predates direct-account metadata, run `bin/fm-spawn.sh <id> --recover-direct-account`; Claude/Codex select a fresh account directory, while legacy Pi reuses its task-private author snapshot and upgrades exact-worktree metadata.
 If it records `account_profile=`, try `bin/fm-spawn.sh <id> --resume-account`, then use `--continue-account` only after re-verifying live and repository state; `bin/fm-account-continuation.sh` owns the fail-closed packet contract.
 For ordinary crewmates, inspect recorded backend metadata first, use `treehouse status` for treehouse-backed tasks, and use recorded `orca_worktree_id=` and `terminal=` for Orca tasks.
 For unmanaged `kind=secondmate`, load `secondmate-provisioning` and follow its "Recovery" procedure.
@@ -405,7 +405,7 @@ bin/fm-spawn.sh <id> projects/<repo>             # uses the active crewmate harn
 bin/fm-spawn.sh <id> projects/<repo> --harness codex --model gpt-5.5 --effort high   # explicit profile axes
 bin/fm-spawn.sh <id> projects/<repo> --harness codex --account-pool codex-crew   # compatibility flag activating direct account-directory selection
 bin/fm-spawn.sh <id> projects/<repo> --harness claude --account-profile claude-2   # compatibility flag activating direct account-directory selection
-bin/fm-spawn.sh <id> --recover-direct-account    # metadata-preserving ship/scout direct account recovery with fresh selection
+bin/fm-spawn.sh <id> --recover-direct-account    # metadata-preserving ship/scout endpoint recovery; fresh Claude/Codex selection or legacy Pi snapshot reuse
 bin/fm-spawn.sh <id> --resume-account             # sticky legacy managed recovery; never a fresh prompt
 bin/fm-spawn.sh <id> --continue-account           # fresh legacy managed session from verified task-owned continuation state
 bin/fm-spawn.sh <id> projects/<repo> --backend <tmux|herdr|zellij|cmux>   # explicit new-task runtime backend (docs/configuration.md "Runtime backend")

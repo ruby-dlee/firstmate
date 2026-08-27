@@ -7,14 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 selected_node=
 pi_package=${FM_PI_PACKAGE_DIR:-}
 
-for node_bin in $(
-  {
-    type -a -p node 2>/dev/null
-    for node_bin in /opt/homebrew/opt/node/bin/node /usr/local/opt/node/bin/node; do
-      [ -x "$node_bin" ] && printf '%s\n' "$node_bin"
-    done
-  } | awk '!seen[$0]++'
-); do
+while IFS= read -r node_bin; do
   node_dir=$(dirname "$node_bin")
   if [ -z "$selected_node" ] && [ "$("$node_bin" -p 'process.features?.typescript ? "yes" : "no"' 2>/dev/null)" = yes ]; then
     selected_node=$node_dir
@@ -25,7 +18,14 @@ for node_bin in $(
       pi_package=$candidate
     fi
   fi
-done
+done < <(
+  {
+    type -a -p node 2>/dev/null
+    for candidate_node in /opt/homebrew/opt/node/bin/node /usr/local/opt/node/bin/node; do
+      [ -x "$candidate_node" ] && printf '%s\n' "$candidate_node"
+    done
+  } | awk '!seen[$0]++'
+)
 
 [ -n "$selected_node" ] || { echo "not ok - no available Node runtime supports TypeScript import" >&2; exit 1; }
 [ -n "$pi_package" ] && [ -f "$pi_package/package.json" ] || { echo "not ok - installed Pi package not found" >&2; exit 1; }

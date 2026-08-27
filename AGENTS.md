@@ -65,21 +65,9 @@ Read a script's header before first use rather than copying its mechanics into t
 
 ## 3. Session start
 
-Run `bin/fm-session-start.sh` exactly once at every session start.
-Do not rerun it after an injected Claude compact-recovery digest.
-The digest owns locking, bootstrap detection, wake draining, context files, direct-report inventory, and the primary harness supervision block.
-Treat its drained wakes as the first work queue and its printed context as already read.
-Re-read an input only when it was absent or corrupt, a targeted writer must inspect current contents, or older task-specific history is required.
-
-If the lock was not acquired, another live session owns the fleet.
-Operate read-only and tell the captain that another session is managing the work; do not spawn, steer, merge, or mutate fleet state.
-If bootstrap prints a diagnostic, load `bootstrap-diagnostics`; silence needs no commentary.
-Never install anything without captain approval in the current session.
-Do not dispatch until required tools and GitHub authentication are usable.
-Use `gh-axi` for GitHub, `chrome-devtools-axi` for browser operations, and the firstmate Lavish file protocol for durable structured decisions.
-
-After the digest, reconcile existing work before starting new work.
-A present captain question still deserves a direct answer while reconciliation continues unless the answer depends on unresolved live state.
+Every session starts through `bin/fm-session-start.sh`; its header and output own the procedure and `docs/architecture.md` owns the lifecycle contract.
+Another live session's fleet lock makes this session read-only for fleet operations.
+Never install anything without captain approval in the current session, and never dispatch without usable required tools and credentials.
 
 ## 4. Harness routing
 
@@ -131,51 +119,22 @@ Load `/stow` when the captain invokes it or before a context reset that needs a 
 
 ## 7. Task lifecycle
 
-Resolve every captain message independently.
-An explicit project wins, a clear follow-up inherits its referent, and otherwise match the request against the registry, live work, project code, and README files.
-Proceed on one confident match and name it plainly; ask one concise question when several or no projects plausibly match.
-
-Answer informational and fleet-state questions now from authoritative existing evidence or bounded read-only checks.
-Do not create a backlog item or scout merely to delay an answer already available.
-If unresolved uncertainty materially affects the answer, dispatch only the bounded investigation needed and tell the captain what outcome it owns.
-
-For actionable work, route to the fitting secondmate or establish one direct crewmate owner.
-Classify the deliverable as a ship by default.
-Use a scout only when the captain wants a knowledge deliverable or uncertainty could materially change whether or what to build.
-Ground the brief in the subsystem's owning docs and scripts, never a checkpoint, handoff note, completion report, or evidence folder treated as intent.
 Every active outcome has one live owner.
 A blocker is a routing problem before it is a captain problem.
-Escalate only when the remaining action is genuinely captain-owned, safety-sensitive, credential-bound, externally unavailable, or all materially independent safe routes are exhausted with evidence.
 Never lose the original outcome while splitting or rerouting work.
-
 Never merge red work.
 Load `operating-fundamentals` for actionable work, ownership, recursive unblocking, validation admission, terminal cleanup, explicit orders, and consequential claims.
 Load `crew-steering` before briefing or steering a crewmate, and `harness-adapters` before spawn or harness operations.
-Script headers and help own exact spawn, review, validation, promotion, merge, and teardown mechanics.
-Load `reports` when the captain asks to browse or summarize completed work.
+`docs/architecture.md`, triggered skills, and script headers or help own classification, escalation, spawn, review, validation, promotion, merge, and teardown procedure.
 
 ## 8. Supervision
 
-Whenever work is in flight, keep exactly one live supervision cycle using the primary-harness block emitted by session start.
-Do not substitute another harness's wait shape, use shell `&`, or start a second cycle when a healthy one exists.
 No turn ends blind while work is active, including a turn described as holding or waiting.
-Waiting on a healthy cycle is silent; empty polls and no-change updates are not captain-facing progress.
-
-At every wake turn, drain the durable wake queue before peeking, steering, or starting new work.
-The queue is lossless; the reason line is only a summary.
-Use `bin/fm-crew-state.sh` for current task state rather than a status tail.
-Handle actionable wakes completely, including the terminal cleanup and recursively unblocked queue, then resume the emitted supervision protocol.
-
 For a stale, permission-stalled, looping, confused, or unresponsive worker, or a failed steer, load `stuck-crewmate-recovery`.
-For permission evidence, preserve the decision and do not approve, deny, interrupt, or relaunch before following that playbook.
-For a heartbeat, review the whole live fleet, current validation ownership, ready merges, cleanup refusals, and newly eligible backlog work.
 Secondmate idle is healthy.
-
 While `state/.afk` exists, load `/afk` and let its daemon own supervision.
-Any real unmarked captain message means the captain returned; use the skill's return path before ordinary work.
 On an X-mode mention, X-mode error, or X-linked milestone or terminal event, load `fmx-respond` before replying or cleaning up.
-
-`docs/architecture.md`, the emitted supervision block, `harness-adapters`, and script help own wake classification, backend mechanics, watcher repair, and harness-specific waits.
+`docs/architecture.md`, the emitted supervision block, `harness-adapters`, and script help own supervision cycles, wake handling, backend mechanics, watcher repair, and harness-specific waits.
 
 ## 9. Captain communication
 

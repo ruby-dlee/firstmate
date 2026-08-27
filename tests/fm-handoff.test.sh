@@ -76,7 +76,7 @@ run:
   active_steps[0]{step,status,active_for,last_activity,agent_pid,round}:
 EOF
         ;;
-      terminal)
+      terminal|stale-terminal|terminal-unavailable)
         cat <<EOF
 run:
   id: "run-done-1"
@@ -95,6 +95,7 @@ EOF
     case "$mode" in
       active) printf '  running      %s %s  2026-08-26 00:00\n' "$branch" "$head" ;;
       parked) printf '  running      %s %s  2026-08-26 00:00\n' "$branch" "$head" ;;
+      stale-terminal) printf '  running      %s %s  2026-08-26 00:00\n' "$branch" "$head" ;;
       terminal) printf '  completed    %s %s  2026-08-26 00:00\n' "$branch" "$head" ;;
       none) ;;
       *) printf 'runs unavailable\n' >&2; exit 70 ;;
@@ -327,6 +328,22 @@ test_final_recheck_catches_pipeline_activation() {
   pass "final recheck catches a pipeline activated between generation and delivery"
 }
 
+test_completed_status_reconciles_newest_run() {
+  local state out
+  make_case stale-terminal
+  out=$CASE_DIR/out
+  for state in stale-terminal terminal-unavailable; do
+    printf '%s\n' "$state" > "$NM_STATE"
+    handoff_env > "$out" || fail "completed-status reconciliation failed"
+    assert_supervise_only "$out" "$state reconciliation"
+  done
+  printf 'terminal\n' > "$NM_STATE"
+  handoff_env > "$out" || fail "terminal reconciliation rerun failed"
+  assert_free_edit "$out" "confirmed terminal reconciliation"
+  pass "completed status cannot hide a newer owner or unavailable history"
+}
+
+test_completed_status_reconciles_newest_run
 test_no_active_owner_is_free_edit_and_idempotent
 test_active_no_mistakes_owner_is_supervise_only
 test_active_crewmate_owner_is_supervise_only

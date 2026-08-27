@@ -351,7 +351,7 @@ capture_live() {  # <identity-file> <block-file> [force-supervise-reason]
     else
       nm_state=lookup-required
     fi
-    if [ "$nm_state" = lookup-required ]; then
+    if [ "$nm_state" = lookup-required ] || [ "$nm_state" = inactive ]; then
       nm_runs_file=$(new_tmp handoff-nm-runs) || return 1
       set +e
       run_nm_bounded "$worktree_real" "$nm_runs_file" no-mistakes runs --limit "$NM_RUNS_LIMIT"

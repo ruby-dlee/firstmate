@@ -3310,6 +3310,40 @@ PY
   pass "$harness can continue safely under a different account profile"
 }
 
+test_continuation_delivery_refreshes_custody() {
+  local harness=$1 id launch delivered
+  test_cross_profile_continuation_for_harness "$harness" "$harness-2" "$harness-3" "$harness"
+  id="account-continue-$harness-z21"
+  git -C "$WT_DIR" checkout -qb "fm/delivery-$harness"
+  delivered="$CASE_DIR/delivered-prompt"
+  launch=$(cat "$LAUNCH_LOG")
+  cat > "$FAKEBIN_DIR/no-mistakes" <<'SH'
+#!/usr/bin/env bash
+case "$1:$2" in
+  axi:status)
+    printf 'run:\n  id: run-delivery\n  branch: %s\n  status: running\n  head: %s\n  active_steps[1]{step,status,active_for,last_activity,agent_pid,round}:\n    fix,fixing,1s,now,321,1\n' \
+      "$(git -C "$FM_DELIVERY_WORKTREE" branch --show-current)" "$(git -C "$FM_DELIVERY_WORKTREE" rev-parse HEAD)"
+    ;;
+  runs:--limit) printf 'running %s %s\n' "$(git -C "$FM_DELIVERY_WORKTREE" branch --show-current)" "$(git -C "$FM_DELIVERY_WORKTREE" rev-parse HEAD)" ;;
+  *) exit 2 ;;
+esac
+SH
+  cat > "$FAKEBIN_DIR/agent-fleet" <<'SH'
+#!/usr/bin/env bash
+printf '%s' "${!#}" > "$FM_DELIVERY_PROMPT"
+SH
+  chmod +x "$FAKEBIN_DIR/no-mistakes" "$FAKEBIN_DIR/agent-fleet"
+  FM_DELIVERY_WORKTREE="$WT_DIR" FM_DELIVERY_PROMPT="$delivered" \
+    FM_HOME="$HOME_DIR" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    PATH="$FAKEBIN_DIR:$PATH" bash -c "$launch" || fail "$harness delayed continuation launch failed"
+  assert_grep 'run-delivery' "$delivered" "$harness delivery omitted the newly active pipeline"
+  assert_grep '`may mutate now`: **no**' "$delivered" "$harness delivery granted mutation"
+  assert_grep '`supervise only`: **yes**' "$delivered" "$harness delivery omitted supervised custody"
+  assert_grep 'done: external side effect alpha; do not rerun' "$delivered" "$harness delivery lost captured resumability context"
+  assert_not_grep 'replacement launch generation' "$delivered" "$harness delivery reread the replaced snapshot"
+  pass "$harness executable continuation refreshes custody after capture and before provider delivery"
+}
+
 test_cross_provider_continuation_uses_target_default_pool() {
   local source=$1 target=$2 id rec old_task out status source_model target_model launch
   id="account-continue-$source-to-$target-z21a"
@@ -6547,6 +6581,12 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-15 ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = handoff-custody ]; then
+  run_isolated_test test_continuation_delivery_refreshes_custody claude
+  run_isolated_test test_continuation_delivery_refreshes_custody codex
+  exit 0
+fi
+
 if [ "${FM_TEST_FOCUSED:-}" = review-round-16 ]; then
   run_isolated_test test_managed_recovery_accepts_inherited_lifecycle_lock
   run_isolated_test test_inherited_lifecycle_handoff_releases_on_child_abort
@@ -6869,6 +6909,8 @@ run_isolated_test test_explicit_secondmate_profile_ignores_configured_pool
 run_isolated_test test_enforced_orca_is_rejected_before_owned_resource_creation
 run_isolated_test test_cross_profile_continuation_for_harness claude claude-2 claude-3 claude
 run_isolated_test test_cross_profile_continuation_for_harness codex codex-2 codex-3 codex
+run_isolated_test test_continuation_delivery_refreshes_custody claude
+run_isolated_test test_continuation_delivery_refreshes_custody codex
 run_isolated_test test_cross_provider_continuation_uses_target_default_pool claude codex
 run_isolated_test test_cross_provider_continuation_uses_target_default_pool codex claude
 run_isolated_test test_continuation_refuses_unknown_endpoint_state

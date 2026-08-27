@@ -4211,7 +4211,8 @@ if [ "$KIND" = secondmate ]; then
   LAUNCH="env -u FM_ROOT_OVERRIDE -u FM_STATE_OVERRIDE -u FM_DATA_OVERRIDE -u FM_PROJECTS_OVERRIDE -u FM_CONFIG_OVERRIDE FM_HOME=$sq_home $LAUNCH"
 fi
 if [ "$CONTINUE_ACCOUNT" = 1 ]; then
-  continuation_launch_command=$LAUNCH
+  continuation_handoff_command="env FM_HOME=$(shell_quote "$FM_HOME") FM_STATE_OVERRIDE=$(shell_quote "$STATE") FM_DATA_OVERRIDE=$(shell_quote "$DATA") $(shell_quote "$SCRIPT_DIR/fm-handoff.sh") $(shell_quote "$ID")"
+  printf -v continuation_launch_command 'handoff=$(%s) || exit $?; set -- "$handoff\n\n## Historical continuation context (live custody above takes precedence)\n\n$1"; %s' "$continuation_handoff_command" "$LAUNCH"
   LAUNCH="$(shell_quote python3) $(shell_quote "$SCRIPT_DIR/fm-prompt-exec.py") $(shell_quote "$CONTINUATION_PROMPT_FILE") $(shell_quote "$CONTINUATION_PROMPT_DIR_ID") $(shell_quote "$CONTINUATION_PROMPT_FILE_ID") $(shell_quote "$CONTINUATION_PROMPT_CONTENT_ID") $(shell_quote "$continuation_launch_command")"
 fi
 }

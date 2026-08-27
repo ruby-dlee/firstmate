@@ -29,7 +29,9 @@ A steering or follow-up submission becomes a distinct admitted and delivered exc
 When multiple admitted immediate exchanges have identical exact content, delivery associates them one at a time in admission order.
 Global queue state and later lifecycle events never promote or match a provisional observation because they cannot identify which input Pi accepted.
 Unadmitted provisional records never become reply obligations.
-It records the exact delivered user content on `message_end`, and records an exact completed assistant answer only on `stopReason: "stop"` when no extension custom message intervened after delivery.
+Each `agent_start` creates an in-process run identity, and every exact user delivery is attributed to the active run.
+It records an exact completed assistant answer only for open exchanges delivered in that same run, on `stopReason: "stop"`, when no extension custom message intervened after delivery.
+An aborted run therefore leaves its delivered exchange open when a later run successfully answers a newer input.
 These append-only records survive compaction and session resume without changing Pi's queue ordering.
 A queued submission remains owned by Pi until exact delivery, so continuity metadata never bypasses the steering or follow-up queue.
 If Pi later reports no pending message and no delivered user message exists for an admitted submission, the context hook emits the exact submitted text-and-image JSON as `SUBMITTED_NOT_DELIVERED` instead of silently forgetting it.

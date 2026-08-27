@@ -22,6 +22,7 @@ type DirectExchangeEvent = {
   inputContent?: unknown;
   delivery?: "immediate" | "steer" | "followUp";
   content?: unknown;
+  runKey?: string;
 };
 
 type DirectExchangeState = {
@@ -35,6 +36,7 @@ type DirectExchangeState = {
   deliveredAt?: number;
   deliveredContent?: unknown;
   deliveredRecordIndex?: number;
+  deliveredRunKey?: string;
   answeredAt?: number;
   answerContent?: unknown;
 };
@@ -112,6 +114,7 @@ function foldDirectExchanges(entries: SessionEntry[]): DirectExchangeState[] {
       state.deliveredAt = event.at;
       state.deliveredContent = event.content;
       state.deliveredRecordIndex = index;
+      state.deliveredRunKey = event.runKey;
     } else if (event.event === "answered") {
       state.answeredAt = event.at;
       state.answerContent = event.content;
@@ -259,6 +262,8 @@ function failureLine(stdout: string, stderr: string, code: number | null): strin
 
 export default function (pi: ExtensionAPI) {
   let exchangeSequence = 0;
+  let agentRunSequence = 0;
+  let activeAgentRunKey: string | undefined;
 
   function appendDirectExchange(event: DirectExchangeEvent): void {
     pi.appendEntry(directExchangeEntryType, event);
@@ -337,6 +342,10 @@ export default function (pi: ExtensionAPI) {
     markLoaded();
   });
 
+  pi.on("agent_start", () => {
+    activeAgentRunKey = `${process.pid}:${++agentRunSequence}`;
+  });
+
   function newExchangeId(at: number, content: unknown): string {
     return createHash("sha256")
       .update(`${at}\0${++exchangeSequence}\0${JSON.stringify(content)}`)
@@ -409,6 +418,7 @@ export default function (pi: ExtensionAPI) {
         exchangeId,
         at: event.message.timestamp,
         content,
+        runKey: activeAgentRunKey,
       });
       return;
     }
@@ -418,6 +428,7 @@ export default function (pi: ExtensionAPI) {
     const branch = ctx.sessionManager.getBranch();
     const open = foldDirectExchanges(branch).filter((exchange) => {
       if (exchange.deliveredContent === undefined || exchange.answerContent !== undefined) return false;
+      if (exchange.deliveredRunKey === undefined || exchange.deliveredRunKey !== activeAgentRunKey) return false;
       const deliveredIndex = exchange.deliveredRecordIndex;
       if (deliveredIndex === undefined) return false;
       return !branch.slice(deliveredIndex + 1).some((entry) => entry.type === "custom_message");

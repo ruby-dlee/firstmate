@@ -380,6 +380,9 @@ async function finishMessage(message) {
   await handlers.get("message_end")({ type: "message_end", message }, ctx);
   sessionManager.appendMessage(message);
 }
+async function startAgent() {
+  await handlers.get("agent_start")({ type: "agent_start" }, ctx);
+}
 
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
@@ -443,6 +446,7 @@ const questionContent = [{ type: "text", text: question }];
 const answerContent = [{ type: "text", text: answer }];
 
 await input(question);
+await startAgent();
 await finishMessage({ role: "user", content: questionContent, timestamp: 1700000000100 });
 await finishMessage({
   role: "assistant",
@@ -732,6 +736,61 @@ const openContinuity = openResult?.messages?.find(
 );
 if (!openContinuity?.content.includes("OPEN_REPLY_OBLIGATION") || !openContinuity.content.includes(JSON.stringify(unansweredContent))) {
   throw new Error("compaction lost the exact unanswered captain obligation");
+}
+
+sessionManager = SessionManager.inMemory(process.env.REPO);
+const abortedQuestion = [{ type: "text", text: "ABORTED-RUN-CAPTAIN-Q: which answer remains due?" }];
+const laterQuestion = [{ type: "text", text: "LATER-RUN-CAPTAIN-Q: answer only this question" }];
+const joinedQuestion = [{ type: "text", text: "JOINED-RUN-CAPTAIN-Q: preserve joined delivery" }];
+const laterAnswer = [{ type: "text", text: "LATER-RUN-CAPTAIN-A: this question only" }];
+await startAgent();
+await finishMessage({ role: "user", content: abortedQuestion, timestamp: 1700000000700 });
+await startAgent();
+await finishMessage({ role: "user", content: laterQuestion, timestamp: 1700000000800 });
+await finishMessage({ role: "user", content: joinedQuestion, timestamp: 1700000000850 });
+await finishMessage({
+  role: "assistant",
+  content: laterAnswer,
+  stopReason: "stop",
+  timestamp: 1700000000900,
+});
+const runExchangeEvents = sessionManager.getBranch().filter(
+  (entry) => entry.type === "custom" && entry.customType === "firstmate-direct-exchange",
+);
+const laterRunAnswers = runExchangeEvents.filter(
+  (entry) => entry.data?.event === "answered" && JSON.stringify(entry.data?.content) === JSON.stringify(laterAnswer),
+);
+if (laterRunAnswers.length !== 2) {
+  throw new Error(`same-run deliveries were not both answered: ${JSON.stringify(laterRunAnswers)}`);
+}
+const runBoundaryId = sessionManager.appendCustomMessageEntry(
+  "firstmate-watcher-wake",
+  "FIRSTMATE WATCHER WAKE: compact run-attribution fixture",
+  true,
+  { version: 1, source: "firstmate-extension", kind: "watcher-wake" },
+);
+sessionManager.appendCompaction(
+  "Lossy summary that omits both run-attribution questions.",
+  runBoundaryId,
+  131874,
+  { fixture: "run-attribution-boundary" },
+  true,
+);
+const runResult = await handlers.get("context")(
+  { type: "context", messages: sessionManager.buildSessionContext().messages },
+  ctx,
+);
+const runContinuity = runResult?.messages?.find(
+  (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
+);
+if (!runContinuity?.content.includes(`OPEN_REPLY_OBLIGATION\nHuman input, exact JSON: ${JSON.stringify(abortedQuestion)}`)) {
+  throw new Error(`aborted run obligation was incorrectly closed: ${runContinuity?.content}`);
+}
+if (!runContinuity.content.includes(`ANSWERED\nHuman input, exact JSON: ${JSON.stringify(joinedQuestion)}`)) {
+  throw new Error(`joined delivery in the later run was not answered: ${runContinuity.content}`);
+}
+if (!runContinuity.content.includes(JSON.stringify(laterAnswer))) {
+  throw new Error(`later run answer was not preserved: ${runContinuity.content}`);
 }
 EOF
 )

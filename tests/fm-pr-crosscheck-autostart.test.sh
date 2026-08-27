@@ -37,6 +37,16 @@ EOF
 }
 trap cleanup_autostart_workers EXIT
 
+if [ -n "${FM_TEST_AUTOSTART_REVISION:-}" ]; then
+  mkdir -p "$TMP_ROOT/implementation"
+  cp -R "$ROOT/bin" "$TMP_ROOT/implementation/bin"
+  for implementation in fm-pr-check.sh fm-crosscheck-autostart.py; do
+    git -C "$ROOT" show "$FM_TEST_AUTOSTART_REVISION:bin/$implementation" \
+      > "$TMP_ROOT/implementation/bin/$implementation" || fail "cannot load pre-repair implementation"
+  done
+  PR_CHECK="$TMP_ROOT/implementation/bin/fm-pr-check.sh"
+fi
+
 make_case() {
   local name=$1 case_dir root home control
   case_dir="$TMP_ROOT/$name"
@@ -443,32 +453,59 @@ test_retirement_handoff() {
   set_head "$case_dir" "$pull" "$HEAD_ONE"
   mkdir "$case_dir/hook"
   cat > "$case_dir/hook/sitecustomize.py" <<'PYHOOK'
+import fcntl
 import os
 from pathlib import Path
 import subprocess
 import sys
+import time
+
+control = Path(os.environ["FM_TEST_CONTROL"])
+state = Path(os.environ["FM_STATE_OVERRIDE"])
+original_close = os.close
+original_flock = fcntl.flock
+original_replace = os.replace
+
+
+def wait_for(path):
+    deadline = time.monotonic() + 15
+    while not path.exists():
+        if time.monotonic() > deadline:
+            raise RuntimeError("retirement barrier timed out")
+        time.sleep(0.01)
+
+
+if len(sys.argv) > 3 and sys.argv[1] == "start":
+    def flock(descriptor, operation):
+        handoff = state / ".retire.crosscheck-autostart-handoff.lock"
+        if handoff.exists() and os.fstat(descriptor).st_ino == handoff.stat().st_ino:
+            (control / "successor-contending").touch()
+        return original_flock(descriptor, operation)
+
+    def replace(source, destination, *args, **kwargs):
+        result = original_replace(source, destination, *args, **kwargs)
+        if Path(destination).name == "retire.crosscheck-autostart.request.json":
+            (control / "successor-contending").touch()
+        return result
+
+    fcntl.flock = flock
+    os.replace = replace
 
 if len(sys.argv) > 3 and sys.argv[1] == "worker":
-    original_close = os.close
     coordinator = int(sys.argv[2])
-    control = Path(os.environ["FM_TEST_CONTROL"])
 
     def close(descriptor):
         if descriptor == coordinator and not (control / "retirement-entered").exists():
             (control / "retirement-entered").touch()
             (control / "head-7").write_text("2" * 40 + "\n")
-            environment = os.environ.copy()
-            environment.pop("PYTHONPATH", None)
+            (control / "successor-contending").unlink(missing_ok=True)
             with (control / "registration-output").open("w") as output:
-                process = subprocess.Popen(
-                    [environment["FM_TEST_PR_CHECK"], "retire",
+                subprocess.Popen(
+                    [os.environ["FM_TEST_PR_CHECK"], "retire",
                      "https://github.com/example/repo/pull/7"],
-                    env=environment, stdout=output, stderr=output,
+                    stdout=output, stderr=output,
                 )
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
+            wait_for(control / "successor-contending")
         return original_close(descriptor)
 
     os.close = close
@@ -487,12 +524,177 @@ PYHOOK
   pass "registration at coordinator retirement hands off the new exact head"
 }
 
-test_retirement_handoff
+test_registration_capture_order() {
+  local case_dir task=ordered pull=8 first second state_file
+  case_dir=$(make_case capture-order)
+  seed_task "$case_dir" "$task"
+  set_head "$case_dir" "$pull" "$HEAD_ONE"
+  cat > "$case_dir/root/bin/fm-github-pr.py" <<'SH'
+#!/usr/bin/env bash
+if [ "$1" != head ]; then
+  echo OPEN
+  exit 0
+fi
+head=$(cat "$FM_TEST_CONTROL/head-8")
+if [ "${FM_TEST_CAPTURE_FIRST:-}" = 1 ]; then
+  touch "$FM_TEST_CONTROL/captured-first"
+  while [ ! -f "$FM_TEST_CONTROL/release-capture" ]; do sleep 0.01; done
+fi
+printf '%s\n' "$head"
+SH
+  touch "$case_dir/control/block-$task-$HEAD_TWO"
+  FM_TEST_CAPTURE_FIRST=1 run_pr_check "$case_dir" "$task" "$pull" \
+    > "$case_dir/first.out" 2>&1 &
+  first=$!
+  fm_test_wait_for_file "$case_dir/control/captured-first" '' 0.02 \
+    || fail "first registration did not capture its head"
+  set_head "$case_dir" "$pull" "$HEAD_TWO"
+  (
+    FM_ACCOUNT_ROUTING_TEST_LAB=firstmate-account-routing-test-lab-v1 \
+    FM_ACCOUNT_TEST_HOOKS=firstmate-account-tests-v1 \
+    FM_ACCOUNT_LOCK_WAIT_TEST_OBSERVED="$case_dir/control/second-waiting" \
+      run_pr_check "$case_dir" "$task" "$pull" > "$case_dir/second.out" 2>&1
+    result=$?
+    touch "$case_dir/control/second-finished"
+    exit "$result"
+  ) &
+  second=$!
+  python3 - "$case_dir/control" <<'PYWAIT' || fail "second registration did not reach the ordering barrier"
+from pathlib import Path
+import sys
+import time
+control = Path(sys.argv[1])
+deadline = time.monotonic() + 15
+while not any((control / name).exists() for name in ("second-waiting", "second-finished")):
+    if time.monotonic() > deadline:
+        raise SystemExit(1)
+    time.sleep(0.01)
+PYWAIT
+  touch "$case_dir/control/release-capture"
+  wait "$first" || fail "first registration failed"
+  wait "$second" || fail "second registration failed"
+  state_file="$case_dir/home/state/$task.crosscheck-autostart.request.json"
+  [ "$(json_field "$state_file" head_sha)" = "$HEAD_TWO" ] \
+    || fail "older captured head replaced the newer registration"
+  touch "$case_dir/control/release-$task-$HEAD_TWO"
+  state_file="$case_dir/home/state/$task.crosscheck-autostart.json"
+  wait_for_state "$state_file" clear "$HEAD_TWO" \
+    || fail "latest captured head never reached CLEAR"
+  expect_code 1 "$(count_run_calls "$case_dir" "$task" "$HEAD_TWO")" \
+    "latest captured head review count"
+  pass "head capture and publication preserve task-local registration order"
+}
 
-test_prompt_return_active_and_clear_dedupe
-test_configuration_failures_are_visible_and_retryable
-test_dead_coordinator_is_visible_and_retryable
-test_new_head_restarts_without_prompt_wait
-test_unrelated_prs_start_concurrently
+test_status_completion_race() {
+  local case_dir task=statusrace pull=9 state_file out
+  case_dir=$(make_case status-race)
+  seed_task "$case_dir" "$task"
+  set_head "$case_dir" "$pull" "$HEAD_ONE"
+  touch "$case_dir/control/block-$task-$HEAD_ONE"
+  mkdir "$case_dir/hook"
+  cat > "$case_dir/hook/sitecustomize.py" <<'PYHOOK'
+import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+import time
 
-echo '# all fm-pr-crosscheck-autostart tests passed'
+control = Path(os.environ["FM_TEST_CONTROL"])
+state = Path(os.environ["FM_STATE_OVERRIDE"])
+original_flock = fcntl.flock
+original_close = os.close
+original_loads = json.loads
+
+
+def same_file(descriptor, name):
+    path = state / name
+    return path.exists() and os.fstat(descriptor).st_ino == path.stat().st_ino
+
+
+def wait_for(path):
+    deadline = time.monotonic() + 15
+    while not path.exists():
+        if time.monotonic() > deadline:
+            raise RuntimeError("status barrier timed out")
+        time.sleep(0.01)
+
+
+if len(sys.argv) > 3 and sys.argv[1] == "worker":
+    coordinator = int(sys.argv[2])
+
+    def flock(descriptor, operation):
+        if same_file(descriptor, ".statusrace.crosscheck-autostart-handoff.lock"):
+            (control / "worker-retiring").touch()
+        return original_flock(descriptor, operation)
+
+    def close(descriptor):
+        result = original_close(descriptor)
+        if descriptor == coordinator:
+            (control / "worker-closed").touch()
+        return result
+
+    fcntl.flock = flock
+    os.close = close
+
+if len(sys.argv) > 3 and sys.argv[1] == "status":
+    coordinated = False
+
+    def flock(descriptor, operation):
+        global coordinated
+        result = original_flock(descriptor, operation)
+        if same_file(descriptor, ".statusrace.crosscheck-autostart-handoff.lock"):
+            coordinated = True
+        return result
+
+    fcntl.flock = flock
+
+    def loads(raw, *args, **kwargs):
+        value = original_loads(raw, *args, **kwargs)
+        if isinstance(value, dict) and value.get("state") == "running":
+            (control / "status-read-running").touch()
+            (control / ("release-statusrace-" + "1" * 40)).touch()
+            wait_for(control / ("worker-retiring" if coordinated else "worker-closed"))
+        return value
+
+    json.loads = loads
+PYHOOK
+  PYTHONPATH="$case_dir/hook" run_pr_check "$case_dir" "$task" "$pull" >/dev/null \
+    || fail "status-race registration failed"
+  fm_test_wait_for_file "$case_dir/control/started-$task-$HEAD_ONE" '' 0.02 \
+    || fail "status-race review never started"
+  out=$(PYTHONPATH="$case_dir/hook" FM_HOME="$case_dir/home" \
+    FM_STATE_OVERRIDE="$case_dir/home/state" FM_TEST_CONTROL="$case_dir/control" \
+    "$(dirname "$PR_CHECK")/fm-crosscheck-autostart.py" status "$task" \
+      "https://github.com/example/repo/pull/$pull" "$HEAD_ONE" "generation-$task" 2>&1) \
+    || fail "status replaced worker completion with failure: $out"
+  [ -f "$case_dir/control/status-read-running" ] || fail "status race was not exercised"
+  state_file="$case_dir/home/state/$task.crosscheck-autostart.json"
+  wait_for_state "$state_file" clear "$HEAD_ONE" \
+    || fail "status overwrote durable CLEAR"
+  out=$(FM_HOME="$case_dir/home" FM_STATE_OVERRIDE="$case_dir/home/state" \
+    FM_TEST_CONTROL="$case_dir/control" bash "$case_dir/home/state/$task.check.sh") \
+    || fail "follow-up poll failed"
+  [ -z "$out" ] || fail "CLEAR unexpectedly emitted a merge or failure wake: $out"
+  pass "status cannot replace concurrent worker completion with a stale failure"
+}
+
+case "${FM_TEST_AUTOSTART_CASE:-all}" in
+  retirement) test_retirement_handoff ;;
+  registration) test_registration_capture_order ;;
+  status) test_status_completion_race ;;
+  consumer) test_configuration_failures_are_visible_and_retryable ;;
+  all)
+    test_retirement_handoff
+    test_registration_capture_order
+    test_status_completion_race
+    test_prompt_return_active_and_clear_dedupe
+    test_configuration_failures_are_visible_and_retryable
+    test_dead_coordinator_is_visible_and_retryable
+    test_new_head_restarts_without_prompt_wait
+    test_unrelated_prs_start_concurrently
+    ;;
+  *) fail "unknown autostart regression selection" ;;
+esac
+
+echo '# all selected fm-pr-crosscheck-autostart tests passed'

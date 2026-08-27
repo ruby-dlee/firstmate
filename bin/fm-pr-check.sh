@@ -45,6 +45,10 @@ case "${FM_CROSSCHECK_AUTOSTART_TEST_DISABLE:-}" in
     ;;
 esac
 META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+release_meta_lock() {
+  fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
+}
+trap release_meta_lock EXIT
 if [ ! -f "$META" ]; then
   fm_account_meta_lock_release "$META_LOCK"
   echo "error: no task metadata for $ID" >&2
@@ -72,18 +76,12 @@ if [ -z "$LOOKUP_GENERATION" ]; then
     exit 1
   fi
 fi
-fm_account_meta_lock_release "$META_LOCK"
 if ! PR_HEAD_LOOKUP=$("$FM_ROOT/bin/fm-github-pr.py" head "$URL" 2>&1); then
   PR_HEAD_DIAGNOSTIC=$(printf '%s' "$PR_HEAD_LOOKUP" | tr '\r\n' '  ')
   printf 'UNREVIEWED: PR head lookup failed: %.500s\n' "$PR_HEAD_DIAGNOSTIC" >&2
   exit 1
 fi
 PR_HEAD=$PR_HEAD_LOOKUP
-META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
-release_meta_lock() {
-  fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
-}
-trap release_meta_lock EXIT
 if [ -f "$META" ]; then
   CURRENT_WT=$(fm_account_meta_value "$META" worktree)
   CURRENT_GENERATION=$(fm_account_meta_value "$META" generation_id)
@@ -131,8 +129,6 @@ esac
 EOF
 chmod +x "$CHECK_TMP"
 mv "$CHECK_TMP" "$STATE/$ID.check.sh"
-fm_account_meta_lock_release "$META_LOCK"
-trap - EXIT
 SLACK_CONFIG=${FM_CROSSCHECK_SLACK_CONFIG:-$FM_HOME/config/crosscheck-slack.json}
 if [ -f "$SLACK_CONFIG" ]; then
   "$FM_ROOT/bin/fm-crosscheck-slack.sh" attest-task \
@@ -152,3 +148,5 @@ if [ "$CROSSCHECK_AUTOSTART_ENABLED" = 1 ]; then
       "$CROSSCHECK_AUTOSTART_DIAGNOSTIC" >&2
   fi
 fi
+fm_account_meta_lock_release "$META_LOCK"
+trap - EXIT

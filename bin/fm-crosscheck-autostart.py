@@ -725,6 +725,13 @@ def status(task_id: str, url: str, head: str, generation: str) -> int:
     validate_identity(task_id, url, head, generation)
     _root, _home, state = runtime_paths()
     paths = task_paths(state, task_id)
+    with task_handoff(paths):
+        return status_locked(paths, task_id, url, head, generation)
+
+
+def status_locked(
+    paths: Dict[str, Path], task_id: str, url: str, head: str, generation: str
+) -> int:
     record = load_json(paths["state"], SCHEMA)
     record_matches = record is not None and (
         record.get("pull_request") == url

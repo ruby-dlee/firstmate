@@ -12,6 +12,9 @@ set -u
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# Later commits in leased fixture worktrees must not depend on host Git config.
+fm_git_identity
+
 SPAWN="$ROOT/bin/fm-spawn.sh"
 fm_test_tmproot_into TMP_ROOT fm-spawn-dispatch-profile
 

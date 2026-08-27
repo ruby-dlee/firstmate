@@ -117,7 +117,7 @@ $PROJECT_CLONES_BODY
 Your isolated home's \`AGENTS.md\` is your job description, and its private state and projects are yours to operate.
 $PROJECT_CLONES_NOTE
 Delegate project work through the normal firstmate lifecycle and keep one live owner until each routed outcome is finished.
-Act only on routed tasks; never start a survey, audit, or improvement sweep on your own initiative.
+Act only on tasks the main firstmate routes to you; never spawn a survey, audit, or any self-directed work.
 
 # Requests and replies
 A leading \`$FM_FROMFIRST_LABEL\` marker identifies a request from the main firstmate.
@@ -134,8 +134,8 @@ Routine progress, retries, supervision, and child churn stay inside this home.
 
 # Definition of done
 You are persistent and do not exit for an empty queue.
-On startup, reconcile only work already owned by this home through \`bin/fm-session-start.sh\`.
-With no assigned or active work, wait silently for routing rather than inventing work.
+On startup, run normal firstmate bootstrap and recovery only to RECONCILE work that is already yours through \`bin/fm-session-start.sh\`.
+With no assigned or active work, go idle and wait silently for the main firstmate.
 If the charter is impossible after safe routes are exhausted, append a narrow evidence-backed \`blocked:\` or \`failed:\` line.
 EOF
 if [ "$SECONDMATE_CHARTER" = "{TASK}" ]; then
@@ -286,9 +286,9 @@ $HERDR_SECTION
 # Setup
 You are in a disposable worktree of $REPO on a clean detached default base.
 Before branching, run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must name this isolated task worktree, not firstmate's primary checkout.
-Git-dir paths do not prove isolation.
+The path check is authoritative; Git-dir paths do not prove isolation.
 If isolation fails, do not branch or edit; append \`blocked: launched in primary checkout, not an isolated worktree\` and stop.
-Create \`fm/$ID\` as your first project change.$SETUP2
+Run \`git checkout -b fm/$ID\` as your first project change.$SETUP2
 
 # Rules
 $RULE1

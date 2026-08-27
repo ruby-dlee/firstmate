@@ -2506,10 +2506,6 @@ def apply_action_result(env, state, action, result):
             elif execution.get("step_outcome_sha256") not in (None, ""):
                 raise LifecycleError(
                     "absent no-mistakes service return asserted a step outcome digest")
-        cloud = result.get("worker")
-        if not isinstance(cloud, dict) or cloud.get("slot") != worker["slot"]:
-            raise LifecycleError("provider execute result returned the wrong worker slot")
-        adopt_cloud_resources(worker, cloud)
         state["executions"][action["request_digest"]] = execution
         worker["last_execution_digest"] = supplied
         worker["last_execution_at"] = iso_utc()

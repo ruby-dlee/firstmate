@@ -1604,9 +1604,16 @@ def upload_json_blob(
                     # and a concurrent writer loses the fresh If-Match.
                     current_metadata = current.get("metadata") or {}
                     expected_metadata = tags_to_metadata(tags)
-                    if overwrite and all(
-                        current_metadata.get(key) == item
-                        for key, item in expected_metadata.items()
+                    sequential_identity_keys = {
+                        "assignment_generation", "task_binding"
+                    }
+                    if (
+                        overwrite
+                        and sequential_identity_keys.issubset(expected_metadata)
+                        and all(
+                            current_metadata.get(key) == item
+                            for key, item in expected_metadata.items()
+                        )
                     ):
                         retry_args = list(upload_args)
                         match_index = retry_args.index("--if-match")
@@ -1617,9 +1624,7 @@ def upload_json_blob(
                         if retry_rc == 0:
                             return digest
                         raise ProviderError(
-                            "conditionally retried worker staging upload failed: {}".format(
-                                retry_stderr
-                            )
+                            "exact worker staging upload failed: {}".format(retry_stderr)
                         )
                 finally:
                     with contextlib.suppress(FileNotFoundError):

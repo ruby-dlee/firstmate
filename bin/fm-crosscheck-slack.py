@@ -974,6 +974,8 @@ def issue_task_attestation(
     require(identity["pr_head"] == head_sha, "task metadata head does not match the attestation subject")
     snapshot = PrSnapshot(pr_url, repo_of(pr_url), int(PR_LINK_RE.fullmatch(pr_url).group(3)), head_sha)  # type: ignore[union-attr]
     author_kind = "human" if identity["harness"] == "human" and identity["model"] == "human-authored" else "agent"
+    if author_kind == "agent":
+        require_provenance_string(identity.get("author_account_identity"), "agent author account identity")
     destination = attestation_path(config.state_dir, snapshot)
     if destination.exists():
         existing = verify_attestation(config, key, snapshot)
@@ -1021,7 +1023,8 @@ def issue_task_attestation(
             existing.harness == identity["harness"]
             and existing.model == identity["model"]
             and existing.task_id == task_id
-            and existing.task_generation == identity["generation_id"],
+            and existing.task_generation == identity["generation_id"]
+            and existing.author_account_identity == identity.get("author_account_identity"),
             f"conflicting provenance won a concurrent issue at {destination}",
         )
         return destination
@@ -1104,7 +1107,7 @@ def verify_attestation(config: Config, key: bytes, snapshot: PrSnapshot) -> Auth
     require(author["kind"] == expected_kind, f"authorship attestation at {path} conflicts on author kind")
     require(author["model_family"] == crosscheck_model_family(author["model"]), f"authorship attestation at {path} conflicts on model family")
     account = author["account_identity"]
-    if account is not None:
+    if author["kind"] == "agent" or account is not None:
         require_provenance_string(
             account, f"authorship attestation at {path} account identity"
         )
@@ -1652,10 +1655,9 @@ def handle_mention(event_id: str, event: dict[str, Any], ctx: MentionContext) ->
         # reply on redelivery; a second review is never started.
         stored = ctx.deduper.undelivered_reply(event_id)
         if stored is not None:
-            ctx.post(channel, thread_ts, stored)
-            ctx.deduper.mark_delivered(event_id)
-            ctx.log(f"redelivered stored verdict for event {event_id}")
-            return "redelivered"
+            return _deliver_final_reply(
+                ctx, event_id, channel, thread_ts, stored, "redelivered"
+            )
         ctx.log(f"duplicate delivery of event {event_id}; not starting a second review")
         return "duplicate"
 
@@ -1772,6 +1774,33 @@ def handle_mention(event_id: str, event: dict[str, Any], ctx: MentionContext) ->
     )
 
 
+def revalidate_reply(ctx: MentionContext, reply: str) -> str:
+    lines = reply.splitlines()
+    if len(lines) < 4 or not lines[0].startswith("Crosscheck "):
+        return reply
+    if lines[0].startswith("Crosscheck STALE for "):
+        return reply
+    if not lines[3].startswith("Reviewed head: "):
+        return reply
+    links = extract_pr_links(lines[0])
+    if len(links) != 1 or repo_of(links[0]) not in ctx.config.repo_allowlist:
+        return render_failure_reply("", "Stored verdict has no allowlisted PR subject")
+    pr_url = links[0]
+    reviewed_head = lines[3].removeprefix("Reviewed head: ")
+    try:
+        require(SHA_RE.fullmatch(reviewed_head) is not None, "Stored verdict has no exact reviewed head")
+        current = ctx.pr_snapshot(pr_url)
+        require(SHA_RE.fullmatch(current.head_sha) is not None, "Live PR lookup returned no exact head")
+    except Exception as exc:
+        return render_failure_reply(pr_url, f"Cannot validate verdict head before delivery: {exc}")
+    if current.head_sha != reviewed_head:
+        lines[0] = f"Crosscheck STALE for {pr_url}"
+        lines.insert(4, f"Current head at delivery: {current.head_sha}")
+        lines.insert(5, "The reviewed verdict does not apply to the current head. Request a new review.")
+        return clamp("\n".join(lines), MAX_REPLY_CHARS)
+    return reply
+
+
 def _deliver_final_reply(
     ctx: MentionContext,
     event_id: str,
@@ -1787,6 +1816,7 @@ def _deliver_final_reply(
     of silently deduping (and never runs a second review).
     """
 
+    reply = revalidate_reply(ctx, reply)
     ctx.deduper.store_reply(event_id, reply)
     try:
         ctx.post(channel, thread_ts, reply)

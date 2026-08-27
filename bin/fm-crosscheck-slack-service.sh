@@ -27,6 +27,9 @@ usage() {
 }
 
 write_plist() {
+  . "$SCRIPT_DIR/fm-crosscheck-python-lib.sh"
+  interpreter=$(fm_crosscheck_resolve_python)
+  interpreter=$("$interpreter" -c 'import os, sys; print(os.path.abspath(sys.executable))')
   mkdir -p "$AGENT_DIR" "$LOG_DIR"
   temporary=$(mktemp "$AGENT_DIR/.$LABEL.XXXXXX")
   trap 'rm -f "$temporary"' EXIT
@@ -38,6 +41,8 @@ write_plist() {
   plutil -insert ProgramArguments.2 -string --config "$temporary"
   plutil -insert ProgramArguments.3 -string "$CONFIG" "$temporary"
   plutil -insert EnvironmentVariables -dictionary "$temporary"
+  plutil -insert EnvironmentVariables.PATH -string "$PATH" "$temporary"
+  plutil -insert EnvironmentVariables.FM_CROSSCHECK_PYTHON -string "$interpreter" "$temporary"
   plutil -insert EnvironmentVariables.FM_HOME -string "$FM_HOME" "$temporary"
   plutil -insert EnvironmentVariables.FM_CROSSCHECK_SLACK_CONFIG \
     -string "$CONFIG" "$temporary"
@@ -77,7 +82,10 @@ case "${1:-}" in
       echo "error: service is not installed at $PLIST" >&2
       exit 1
     }
-    "$WRAPPER" preflight --config "$CONFIG"
+    runtime_python=$(plutil -extract EnvironmentVariables.FM_CROSSCHECK_PYTHON raw -o - "$PLIST")
+    runtime_path=$(plutil -extract EnvironmentVariables.PATH raw -o - "$PLIST")
+    FM_CROSSCHECK_PYTHON="$runtime_python" PATH="$runtime_path" \
+      "$WRAPPER" preflight --config "$CONFIG"
     stop_service
     launchctl bootstrap "$DOMAIN" "$PLIST"
     launchctl enable "$DOMAIN/$LABEL"

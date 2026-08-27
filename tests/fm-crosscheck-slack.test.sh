@@ -258,6 +258,7 @@ if command == "mention":
                     f"generation_id={os.environ.get('FMT_SOURCE_GENERATION') or 'spawn:test-generation'}",
                     f"pr={links[0]}",
                     f"pr_head={head_sha}",
+                    "author_account_identity=fixture-author-account",
                 ]
             )
             + "\n",
@@ -589,6 +590,7 @@ test_attestation_cli_derives_and_signs_author_identity() {
 harness=pi
 model=openai-codex-8/gpt-5.6-sol
 generation_id=spawn:attest-agent
+author_account_identity=fixture-author-account
 pr=$agent_pr
 pr_head=$agent_head
 EOF
@@ -955,6 +957,74 @@ test_undelivered_verdict_is_reposted_on_redelivery() {
   pass "a produced-but-undelivered verdict is re-posted on redelivery without a second review"
 }
 
+test_redelivery_revalidates_head() {
+  local next_head event before reply
+  for next_head in 2222222222222222222222222222222222222222 ERROR; do
+    event="$TMP_ROOT/redelivery-$next_head.json"
+    write_event "$event" C0TESTCHAN U0ALICE 1755640014.000100 "$GOOD_PR_TEXT"
+    before=$(fixture_run_count)
+    FMT_FAIL_VERDICT_POST=1 run_mention "ev-retry-$next_head" "$CONFIG_MAIN" "$event" "retry-first-$next_head" \
+      || fail "initial review failed: $RUN_MENTION_OUTPUT"
+    assert_contains "$RUN_MENTION_OUTPUT" "undelivered:completed:clear" "verdict was not stored"
+    FMT_HEAD_SHA="$next_head" run_mention "ev-retry-$next_head" "$CONFIG_MAIN" "$event" "retry-second-$next_head" \
+      || fail "redelivery failed: $RUN_MENTION_OUTPUT"
+    reply=$(last_post_text)
+    assert_not_contains "$reply" "Crosscheck CLEAR" "redelivery emitted an unverified CLEAR"
+    if [ "$next_head" = ERROR ]; then
+      assert_contains "$reply" "TOOL FAILURE" "lookup failure did not invalidate verdict"
+    else
+      assert_contains "$reply" "Crosscheck STALE" "changed head did not invalidate verdict"
+      assert_contains "$reply" "$next_head" "stale verdict omitted current head"
+    fi
+    [ "$(fixture_run_count)" = $((before + 1)) ] || fail "redelivery started another review"
+  done
+  pass "redelivery checks current head and never translates lookup failure to CLEAR"
+}
+
+test_agent_account_is_required() {
+  output=$(env FM_HOME="$HOMEDIR" FMT_BOT_PY="$BOT_PY" \
+    FM_CROSSCHECK_SLACK_CONFIG="$CONFIG_MAIN" "$PYTHON" - <<'PYTEST'
+import importlib.util
+import os
+import sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("slack_account_test", os.environ["FMT_BOT_PY"])
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+config = mod.load_config(Path(os.environ["FM_CROSSCHECK_SLACK_CONFIG"]))
+key = mod.load_provenance_key(config.provenance_key_file)
+url = "https://github.com/Ruby-Labs/goodrepo/pull/91"
+head = "9" * 40
+task = "account-required"
+meta = Path(os.environ["FM_HOME"]) / "state" / f"{task}.meta"
+base = f"harness=pi\nmodel=openai-codex-8/gpt-5.6-sol\ngeneration_id=spawn:account\npr={url}\npr_head={head}\n"
+for account in ("", "author_account_identity=\n"):
+    meta.write_text(base + account)
+    try:
+        mod.issue_task_attestation(config, key, task, url, head)
+    except mod.SlackExposureError:
+        pass
+    else:
+        raise AssertionError("issuer accepted absent account identity")
+meta.write_text(base + "author_account_identity=fixture-author-account\n")
+path = mod.issue_task_attestation(config, key, task, url, head)
+import json
+payload = json.loads(path.read_text())["payload"]
+payload["author"]["account_identity"] = None
+path.write_text(json.dumps(mod.signed_attestation(payload, key)))
+snapshot = mod.PrSnapshot(url, mod.repo_of(url), 91, head)
+try:
+    mod.verify_attestation(config, key, snapshot)
+except mod.SlackExposureError:
+    pass
+else:
+    raise AssertionError("verifier accepted signed null account identity")
+PYTEST
+  ) || fail "required account regression failed: $output"
+  pass "issuer and verifier reject missing agent account identity"
+}
+
 test_retention_sweep_removes_only_aged_state() {
   sweep_dir="$TMP_ROOT/sweep-state"
   output=$(perl -e 'alarm 60; exec @ARGV' -- \
@@ -1003,8 +1073,24 @@ test_service_install_contains_no_credentials() {
   for secret in "$APP_TOKEN" "$BOT_TOKEN" "$GH_TOKEN_VALUE"; do
     assert_no_grep "$secret" "$plist" "launch agent contained a credential value"
   done
-  assert_grep "fm-crosscheck-slack.sh" "$plist" \
-    "launch agent did not point at the supported wrapper"
+  output=$("$PYTHON" - "$plist" <<'PYTEST'
+import os
+import plistlib
+import subprocess
+import sys
+with open(sys.argv[1], "rb") as handle:
+    agent = plistlib.load(handle)
+env = agent["EnvironmentVariables"]
+assert os.path.isabs(env["FM_CROSSCHECK_PYTHON"])
+assert env["PATH"]
+assert set(env) == {"FM_HOME", "FM_CROSSCHECK_SLACK_CONFIG", "FM_CROSSCHECK_PYTHON", "PATH"}
+env["FM_GATE_REFUSE_BYPASS"] = "1"
+command = agent["ProgramArguments"]
+result = subprocess.run([command[0], "--selftest", command[3]], env=env, capture_output=True, text=True, timeout=30)
+assert result.returncode == 0, result.stderr
+assert "schema: valid" in result.stdout, result.stdout
+PYTEST
+  ) || fail "launch-agent environment cannot run wrapper: $output"
   pass "central service installation stores no credentials and stays stopped until preflight"
 }
 
@@ -1070,6 +1156,8 @@ UNITS=(
   test_head_change_invalidates_the_verdict
   test_day_rollover_finalizes_the_origin_day
   test_undelivered_verdict_is_reposted_on_redelivery
+  test_redelivery_revalidates_head
+  test_agent_account_is_required
   test_retention_sweep_removes_only_aged_state
   test_posts_disable_mrkdwn
   test_four_workers_and_concurrent_cap_are_binding
@@ -1078,6 +1166,13 @@ UNITS=(
   test_blocking_verdict_reply_names_state_and_findings
   test_tokens_never_reach_logs_or_ledgers
 )
+
+case "${FM_SLACK_TEST_GROUP:-all}" in
+  repair) UNITS=(test_agent_account_is_required test_redelivery_revalidates_head test_service_install_contains_no_credentials) ;;
+  compatibility) UNITS=(test_attestation_cli_derives_and_signs_author_identity test_completed_review_names_lane_head_task_and_artifact test_undelivered_verdict_is_reposted_on_redelivery test_head_change_invalidates_the_verdict test_four_workers_and_concurrent_cap_are_binding) ;;
+  all) ;;
+  *) fail "unknown Slack test group" ;;
+esac
 
 for unit in "${UNITS[@]}"; do
   declare -F "$unit" >/dev/null || fail "registered unit is not a defined function: $unit"

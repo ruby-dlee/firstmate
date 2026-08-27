@@ -55,7 +55,7 @@ Each attestation is HMAC-signed by the coordinator and binds all of these values
 - Exact 40-character head SHA.
 - Author kind, harness, model, and model family.
 - Originating Firstmate task ID and task generation.
-- Author account identity when Firstmate captured one.
+- Required captured author account identity for agents; optional identity for humans.
 
 `bin/fm-pr-check.sh` emits this attestation automatically after it records the live PR head for a Firstmate task and only when the central Slack config is installed.
 It invokes the supported command below and derives every author field from the task record.
@@ -67,12 +67,14 @@ bin/fm-crosscheck-slack.sh attest-task <task-id> <pr-url> <head-sha> --config <c
 
 The Slack listener fetches the live PR head with its read-only GitHub credential, verifies the exact-head signature, recomputes the model family through Crosscheck's own classifier, and stages the verified harness and model for the core family-separation screen.
 The signed attestation is copied into the review's durable artifact directory.
-When captured, author account identity also arms the Azure adapter's same-account refusal.
+Agent attestations require a captured author account identity, which also arms the Azure adapter's same-account refusal.
 
 Slack identity, branch names, PR text, and caller-supplied free text carry no authorship authority.
 Missing, malformed, tampered, conflicting, or wrong-head provenance gets a clear threaded refusal and starts no review.
 A human-authored PR is classified as human only when a signed upstream task attestation says `harness=human` and `model=human-authored`.
-An unattested human PR remains unclassified and fails closed until the centrally operated no-mistakes author path emits that trusted record.
+An unattested human PR remains unclassified and fails closed.
+Production remains blocked: this tree has no trusted ingestion path for independent engineer/no-mistakes provenance, and the current issuer signs a task-associated live head without proof that the task produced it.
+The producer must bind identity when creating the head before the coordinator can safely ingest or sign that evidence; a signature over mutable task metadata alone does not establish authorship.
 
 ## Exact-head response contract
 
@@ -157,7 +159,8 @@ Every process log and Slack error path passes through the registered secret reda
 Slack event markers live under `<state_dir>/events`.
 The first process to create an event claim owns it, so concurrent duplicate delivery starts exactly one review.
 The final reply is stored before posting and marked delivered afterward.
-If Slack delivery fails, a redelivery posts the stored reply without rerunning the review.
+If Slack delivery fails, a redelivery revalidates the stored reviewed head before posting without rerunning the review.
+A moved head produces STALE, and an unavailable head lookup produces a tool failure.
 
 Per-engineer request records live under `<state_dir>/meter/<YYYY-MM-DD>.json`.
 Each record includes the Slack user ID, PR URL, event ID, start and finish times, state, lane, available token data, and available cost data.
@@ -218,3 +221,6 @@ Activation requires these coordinator inputs by name and location only:
 The live acceptance request must come from an internal engineer other than Dongkeun in an approved channel.
 Record the request thread, exact admitted and returned SHA, provenance task, reviewer lane, Slack task ID, durable artifact, meter row, dedupe result, and service status in the R10 evidence directory.
 Never copy credential values into that evidence.
+
+The launch agent persists the resolved absolute Python interpreter and executable PATH, and start preflight uses those persisted runtime settings.
+Reinstall the launch agent after moving the interpreter or changing tool locations.

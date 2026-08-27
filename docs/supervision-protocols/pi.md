@@ -22,12 +22,12 @@ This document owns the Pi-specific boundary between direct captain input, automa
 The watcher and turn-end extensions use Pi's context-participating `sendMessage()` custom-message path with distinct `firstmate-watcher-wake` and `firstmate-turnend-guard` types, `deliverAs: "followUp"`, and `triggerTurn: true`.
 They never use `sendUserMessage()` for automation, so supervision remains visible to the model without becoming a human-authored `role: "user"` turn.
 
-The watcher extension observes Pi's `input` event and records `interactive` or `rpc` submissions as provisional non-context `firstmate-direct-exchange` entries before Pi queues or delivers them.
+The watcher extension observes Pi's `input` event and records `interactive` or `rpc` submissions as provisional non-context `firstmate-direct-input-observation` entries before Pi queues or delivers them.
 Each provisional record carries the exact text-and-image content from that boundary, including image data and MIME type, so compaction before delivery cannot reduce an attachment to a count.
-An immediate submission becomes admitted only when `before_agent_start` contains an exact text-and-image match, after Pi's input-handler chain, model and authentication checks, compaction preflight, and prompt assembly have succeeded.
-A steering or follow-up submission becomes admitted only when a delivered user `message_end` contains an exact text-and-image match.
-When multiple unresolved submissions have identical exact content, delivery associates them one at a time in submission order.
-Global queue state and unmatched later lifecycle events never admit a provisional record because they cannot identify which input Pi accepted.
+An immediate submission becomes a distinct admitted exchange only from the exact prompt and images delivered by `before_agent_start`, after Pi's input-handler chain, model and authentication checks, compaction preflight, and prompt assembly have succeeded.
+A steering or follow-up submission becomes a distinct admitted and delivered exchange only from the exact user content delivered by `message_end`.
+When multiple admitted immediate exchanges have identical exact content, delivery associates them one at a time in admission order.
+Global queue state and later lifecycle events never promote or match a provisional observation because they cannot identify which input Pi accepted.
 Unadmitted provisional records never become reply obligations.
 It records the exact delivered user content on `message_end`, and records an exact completed assistant answer only on `stopReason: "stop"` when no extension custom message intervened after delivery.
 These append-only records survive compaction and session resume without changing Pi's queue ordering.

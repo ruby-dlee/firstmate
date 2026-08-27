@@ -534,6 +534,7 @@ if (pendingContinuity?.content.includes(queued)) {
   throw new Error("pending human input bypassed Pi's queue and was injected early");
 }
 pendingMessages = false;
+sessionManager = SessionManager.inMemory(process.env.REPO);
 const provisional = "PROVISIONAL-CONSUMED-Q-8B";
 pendingMessages = true;
 await input(provisional, "steer");
@@ -545,6 +546,44 @@ pendingMessages = false;
 const afterAutomationDrain = await handlers.get("context")({ type: "context", messages: rebuilt }, ctx);
 if (afterAutomationDrain?.messages?.some((message) => message.customType === "firstmate-direct-exchange-continuity" && message.content.includes(provisional))) {
   throw new Error("consumed provisional input became continuity after unrelated automation drained");
+}
+pendingMessages = true;
+await input(provisional, "steer");
+await finishMessage({ role: "user", content: [{ type: "text", text: provisional }], timestamp: 1700000000410 });
+pendingMessages = false;
+const consumedRetryBoundaryId = sessionManager.appendCustomMessageEntry(
+  "firstmate-watcher-wake",
+  "FIRSTMATE WATCHER WAKE: unrelated automation after identical accepted retry",
+  true,
+  { version: 1, source: "firstmate-extension", kind: "watcher-wake" },
+);
+sessionManager.appendCompaction(
+  "Lossy summary that omits the identical accepted retry.",
+  consumedRetryBoundaryId,
+  131874,
+  { fixture: "consumed-identical-retry-boundary" },
+  true,
+);
+const consumedRetryResult = await handlers.get("context")(
+  { type: "context", messages: sessionManager.buildSessionContext().messages },
+  ctx,
+);
+const consumedRetryContinuity = consumedRetryResult?.messages?.find(
+  (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
+);
+const consumedRetryObligations = consumedRetryContinuity?.content.match(/OPEN_REPLY_OBLIGATION/g) ?? [];
+if (consumedRetryObligations.length !== 1 || !consumedRetryContinuity.content.includes(JSON.stringify([{ type: "text", text: provisional }]))) {
+  throw new Error(`consumed input was confused with identical accepted retry: ${consumedRetryContinuity?.content}`);
+}
+const consumedRetryEntries = sessionManager.getBranch().filter((entry) => entry.type === "custom");
+const consumedRetryObservations = consumedRetryEntries.filter(
+  (entry) => entry.customType === "firstmate-direct-input-observation" && entry.data?.inputText === provisional,
+);
+const consumedRetryExchanges = consumedRetryEntries.filter(
+  (entry) => entry.customType === "firstmate-direct-exchange" && entry.data?.event === "submitted" && entry.data?.inputText === provisional,
+);
+if (consumedRetryObservations.length !== 2 || consumedRetryExchanges.length !== 1) {
+  throw new Error("input observations were promoted instead of admitting only the delivered identical retry");
 }
 
 sessionManager = SessionManager.inMemory(process.env.REPO);
@@ -628,7 +667,7 @@ if (imageBeforeDelivery?.messages?.some((message) => message.customType === "fir
   throw new Error("unadmitted queued image bypassed Pi ownership before delivery");
 }
 const imageSubmissionEntry = sessionManager.getBranch().find(
-  (entry) => entry.type === "custom" && entry.customType === "firstmate-direct-exchange" && entry.data?.event === "submitted",
+  (entry) => entry.type === "custom" && entry.customType === "firstmate-direct-input-observation",
 );
 if (JSON.stringify(imageSubmissionEntry?.data?.inputContent) !== JSON.stringify(imageSubmittedContent)) {
   throw new Error("provisional session contract did not preserve exact queued image content");
@@ -697,6 +736,7 @@ if (!openContinuity?.content.includes("OPEN_REPLY_OBLIGATION") || !openContinuit
 EOF
 )
   status=$?
+  [ "$status" -eq 0 ] || printf '%s\n' "$out" >&2
   expect_code 0 "$status" "Pi compaction continuity must preserve exact direct exchange and pending-input state"
   [ -z "$out" ] || fail "Pi compaction-continuity test printed output: $out"
   pass "Pi compaction continuity preserves exact human exchange across automated custom prompts"

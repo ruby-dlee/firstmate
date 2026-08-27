@@ -792,6 +792,57 @@ if (!runContinuity.content.includes(`ANSWERED\nHuman input, exact JSON: ${JSON.s
 if (!runContinuity.content.includes(JSON.stringify(laterAnswer))) {
   throw new Error(`later run answer was not preserved: ${runContinuity.content}`);
 }
+
+sessionManager = SessionManager.inMemory(process.env.REPO);
+const retryQuestion = [{ type: "text", text: "RETRY-CAPTAIN-Q: close this after retry" }];
+const retryAnswer = [{ type: "text", text: "RETRY-CAPTAIN-A: closed after retry" }];
+await startAgent();
+await finishMessage({ role: "user", content: retryQuestion, timestamp: 1700000001000 });
+await startAgent();
+await finishMessage({ role: "assistant", content: retryAnswer, stopReason: "stop", timestamp: 1700000001100 });
+const retryEvents = sessionManager.getBranch().filter(
+  (entry) => entry.type === "custom" && entry.customType === "firstmate-direct-exchange",
+);
+const retryAnswered = retryEvents.find(
+  (entry) => entry.data?.event === "answered" && JSON.stringify(entry.data?.content) === JSON.stringify(retryAnswer),
+);
+if (!retryAnswered) throw new Error("successful retry did not answer the retained captain exchange");
+
+sessionManager = SessionManager.inMemory(process.env.REPO);
+const failedQuestion = [{ type: "text", text: "FAILED-CAPTAIN-Q: leave this open" }];
+const replacementQuestion = [{ type: "text", text: "REPLACEMENT-CAPTAIN-Q: answer this instead" }];
+const replacementAnswer = [{ type: "text", text: "REPLACEMENT-CAPTAIN-A: answered replacement" }];
+await startAgent();
+await finishMessage({ role: "user", content: failedQuestion, timestamp: 1700000001200 });
+await startAgent();
+await finishMessage({ role: "user", content: replacementQuestion, timestamp: 1700000001300 });
+await finishMessage({ role: "assistant", content: replacementAnswer, stopReason: "stop", timestamp: 1700000001400 });
+const replacementBoundaryId = sessionManager.appendCustomMessageEntry(
+  "firstmate-watcher-wake",
+  "FIRSTMATE WATCHER WAKE: retry replacement boundary",
+  true,
+  { version: 1, source: "firstmate-extension", kind: "watcher-wake" },
+);
+sessionManager.appendCompaction(
+  "Lossy summary that omits retry lifecycle exchanges.",
+  replacementBoundaryId,
+  131874,
+  { fixture: "retry-replacement-boundary" },
+  true,
+);
+const replacementResult = await handlers.get("context")(
+  { type: "context", messages: sessionManager.buildSessionContext().messages },
+  ctx,
+);
+const replacementContinuity = replacementResult?.messages?.find(
+  (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
+);
+if (!replacementContinuity?.content.includes(`OPEN_REPLY_OBLIGATION\nHuman input, exact JSON: ${JSON.stringify(failedQuestion)}`)) {
+  throw new Error(`failed original question was incorrectly closed: ${replacementContinuity?.content}`);
+}
+if (!replacementContinuity.content.includes(`ANSWERED\nHuman input, exact JSON: ${JSON.stringify(replacementQuestion)}`)) {
+  throw new Error(`replacement question was not answered: ${replacementContinuity.content}`);
+}
 EOF
 )
   status=$?
@@ -1367,6 +1418,12 @@ EOF
 if [ "${FM_PI_EXACT_DELIVERY_PROOF:-0}" = 1 ]; then
   test_pi_compaction_preserves_direct_exchange_and_pending_input
   printf '%s\n' 'PI_EXACT_DELIVERY_ASSOCIATION_PROOF_OK'
+  exit 0
+fi
+
+if [ "${FM_PI_RETRY_CONTINUITY_PROOF:-0}" = 1 ]; then
+  test_pi_compaction_preserves_direct_exchange_and_pending_input
+  printf '%s\n' 'PI_RETRY_CONTINUITY_PROOF_OK'
   exit 0
 fi
 

@@ -28,9 +28,10 @@ Every direct submission becomes a fresh admitted and delivered exchange only fro
 The delivery boundary never associates a user message with an observation or an older exchange by content, order, or fallback, so a consumed observation followed by an identical accepted retry remains unambiguous.
 Global queue state and later lifecycle events never promote or match a provisional observation because they cannot identify which input Pi accepted.
 Unadmitted provisional records never become reply obligations.
-Each `agent_start` creates an in-process run identity, and every exact user delivery is attributed to the active run.
-It records an exact completed assistant answer only for open exchanges delivered in that same run, on `stopReason: "stop"`, when no extension custom message intervened after delivery.
-An aborted run therefore leaves its delivered exchange open when a later run successfully answers a newer input.
+Each exact user delivery joins an in-process logical reply cohort awaiting the next completed answer.
+A retry `agent_start` retains that cohort until Pi delivers another human message, so a successful retry can close the original exchange without another user `message_end`.
+The first human delivery after an `agent_start` replaces a retained cohort, and additional human deliveries before the answer join it, so an answer to a newer request cannot close an older failed request.
+It records an exact completed assistant answer only for the active cohort, on `stopReason: "stop"`, when no extension custom message intervened after delivery, then clears the answered cohort.
 These append-only records survive compaction and session resume without changing Pi's queue ordering.
 A queued submission remains owned by Pi until exact delivery, so continuity metadata never bypasses the steering or follow-up queue.
 Queue disappearance without an exact user delivery remains durable observation evidence but never creates an exchange or reply obligation.

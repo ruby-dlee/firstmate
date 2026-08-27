@@ -248,6 +248,8 @@ export default function (pi: ExtensionAPI) {
   let exchangeSequence = 0;
   let agentRunSequence = 0;
   let activeAgentRunKey: string | undefined;
+  let replyCohort = new Set<string>();
+  let agentStartAwaitingHumanDelivery = false;
 
   function appendDirectExchange(event: DirectExchangeEvent): void {
     pi.appendEntry(directExchangeEntryType, event);
@@ -328,6 +330,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     activeAgentRunKey = `${process.pid}:${++agentRunSequence}`;
+    agentStartAwaitingHumanDelivery = true;
   });
 
   function newExchangeId(at: number, content: unknown): string {
@@ -391,6 +394,11 @@ export default function (pi: ExtensionAPI) {
         content,
         runKey: activeAgentRunKey,
       });
+      if (agentStartAwaitingHumanDelivery) {
+        replyCohort = new Set<string>();
+        agentStartAwaitingHumanDelivery = false;
+      }
+      replyCohort.add(exchangeId);
       return;
     }
     if (event.message.role !== "assistant" || event.message.stopReason !== "stop") return;
@@ -399,7 +407,7 @@ export default function (pi: ExtensionAPI) {
     const branch = ctx.sessionManager.getBranch();
     const open = foldDirectExchanges(branch).filter((exchange) => {
       if (exchange.deliveredContent === undefined || exchange.answerContent !== undefined) return false;
-      if (exchange.deliveredRunKey === undefined || exchange.deliveredRunKey !== activeAgentRunKey) return false;
+      if (!replyCohort.has(exchange.exchangeId)) return false;
       const deliveredIndex = exchange.deliveredRecordIndex;
       if (deliveredIndex === undefined) return false;
       return !branch.slice(deliveredIndex + 1).some((entry) => entry.type === "custom_message");
@@ -413,6 +421,7 @@ export default function (pi: ExtensionAPI) {
         content: cloneJson(event.message.content),
       });
     }
+    if (open.length > 0) replyCohort.clear();
   });
 
   pi.on("context", (event, ctx) => {

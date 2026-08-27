@@ -24,14 +24,14 @@ They never use `sendUserMessage()` for automation, so supervision remains visibl
 
 The watcher extension observes Pi's `input` event and records `interactive` or `rpc` submissions as provisional non-context `firstmate-direct-input-observation` entries before Pi queues or delivers them.
 Each provisional record carries the exact text-and-image content from that boundary, including image data and MIME type, so compaction before delivery cannot reduce an attachment to a count.
-Every direct submission becomes a fresh admitted and delivered exchange only from the exact user content delivered by `message_end`.
+Only exact user content delivered by `message_end` becomes a fresh admitted and delivered exchange.
 The delivery boundary never associates a user message with an observation or an older exchange by content, order, or fallback, so a consumed observation followed by an identical accepted retry remains unambiguous.
 Global queue state and later lifecycle events never promote or match a provisional observation because they cannot identify which input Pi accepted.
 Unadmitted provisional records never become reply obligations.
 Each exact user delivery joins an in-process logical reply cohort awaiting the next completed answer.
 A retry `agent_start` retains that cohort until Pi delivers another human message, so a successful retry can close the original exchange without another user `message_end`.
 The first human delivery after an `agent_start` replaces a retained cohort, and additional human deliveries before the answer join it, so an answer to a newer request cannot close an older failed request.
-It records an exact completed assistant answer only for the active cohort, on `stopReason: "stop"`, when no extension custom message intervened after delivery, then clears the answered cohort.
+It records an exact completed assistant answer only for the active cohort, on `stopReason: "stop"`, when no custom message intervened after delivery, then clears the answered cohort.
 These append-only records survive compaction and session resume without changing Pi's queue ordering.
 A queued submission remains owned by Pi until exact delivery, so continuity metadata never bypasses the steering or follow-up queue.
 Queue disappearance without an exact user delivery remains durable observation evidence but never creates an exchange or reply obligation.
@@ -62,6 +62,7 @@ It then delivers a referring human follow-up and proves the chained context hook
 A compaction-before-delivery fixture records text plus an image provisionally, cuts at a later custom watcher entry before any user message exists, proves the durable session contract retains exact image data and MIME type without injecting it into context, then delivers the exact input and proves a later compaction restores it as `OPEN_REPLY_OBLIGATION`.
 It also proves a consumed steer does not become continuity metadata while unrelated automation is pending or after that automation drains.
 A separate compaction fixture cuts an unanswered direct question behind a custom watcher turn and proves the exact question returns as `OPEN_REPLY_OBLIGATION` rather than being inferred from summary prose.
+`tests/fm-pi-retry-continuity.test.sh` exercises the installed-Pi proof that an error followed by a retry without another human delivery closes the retained exchange, while a new human delivery on the retry replaces the retained cohort so its answer cannot close the older failed exchange.
 
 Live command: `FM_PI_COMPACTION_LIVE_E2E=1 FM_PI_LIVE_AUTH_DIR='/Users/dongkeun/.pi/firstmate-local' tests/fm-pi-primary-compaction-live-e2e.test.sh`.
 Observed output: `ok - Pi 0.84.2 live compaction rebuilt the exact answered captain exchange across a custom watcher turn (firstKeptType=message)`.

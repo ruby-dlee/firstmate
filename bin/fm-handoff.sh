@@ -544,7 +544,9 @@ while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
   [ "$source_install" = "$source_before" ] || { attempt=$((attempt + 1)); continue; }
   build_candidate "$block_after" "$candidate"
   [ "$(artifact_generation)" = "$source_install" ] || { attempt=$((attempt + 1)); continue; }
-  mv -f -- "$candidate" "$ARTIFACT"
+  installation=$(new_tmp handoff-installation) || exit 1
+  cp -p -- "$candidate" "$installation"
+  mv -f -- "$installation" "$ARTIFACT"
 
   capture_live "$identity_final" "$block_final"
   if ! cmp -s "$identity_after" "$identity_final"; then
@@ -552,7 +554,7 @@ while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
     continue
   fi
 
-  cat "$ARTIFACT"
+  cat "$candidate"
   exit 0
 done
 

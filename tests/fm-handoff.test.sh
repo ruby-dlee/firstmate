@@ -52,6 +52,19 @@ branch=$(cat "$FM_FAKE_BRANCH_FILE" 2>/dev/null || printf unknown)
 head=$(cat "$FM_FAKE_PIPELINE_HEAD_FILE" 2>/dev/null || printf unknown)
 case "${1:-}:${2:-}" in
   axi:status)
+    if [ -n "${FM_FAKE_CAPTURE_GATE:-}" ]; then
+      count=$(cat "$FM_FAKE_CAPTURE_GATE.count" 2>/dev/null || printf 0)
+      count=$((count + 1))
+      printf '%s\n' "$count" > "$FM_FAKE_CAPTURE_GATE.count"
+      if [ "$count" -eq 3 ]; then
+        touch "$FM_FAKE_CAPTURE_GATE.ready"
+        for ((attempt=0; attempt<2000; attempt++)); do
+          [ ! -e "$FM_FAKE_CAPTURE_GATE.proceed" ] || break
+          sleep 0.01
+        done
+        [ -e "$FM_FAKE_CAPTURE_GATE.proceed" ] || exit 70
+      fi
+    fi
     case "$mode" in
       active)
         cat <<EOF
@@ -365,6 +378,46 @@ test_verified_successor_is_not_competing_owner() {
   assert_supervise_only "$out" "pipeline with verified successor"
   pass "exact Herdr successor exclusion preserves competing worker and pipeline custody"
 }
+
+test_overlapping_presentations_keep_private_decisions() {
+  local normal successor gate pid status=0
+  make_case overlap
+  normal=$CASE_DIR/normal.out
+  successor=$CASE_DIR/successor.out
+  gate=$CASE_DIR/capture
+  printf '#!/usr/bin/env bash\nexec python3 %q "$@"\n' "$ROOT/tests/herdr-custody-fixture.py" > "$FAKEBIN/herdr"
+  chmod +x "$FAKEBIN/herdr"
+  printf '%s\n' window=default:pane-custody backend=herdr herdr_session=default herdr_workspace_id=ws-custody herdr_tab_id=tab-custody herdr_pane_id=pane-custody >> "$HOME_DIR/state/$ID.meta"
+  export FM_FAKE_ENDPOINT_FILE="$CASE_DIR/live" FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/label"
+  touch "$FM_FAKE_ENDPOINT_FILE"
+  printf 'fm-%s\n' "$ID" > "$FM_FAKE_TMUX_LABEL_FILE"
+  FM_HANDOFF_NM_TIMEOUT_SECONDS=60 FM_FAKE_CAPTURE_GATE="$gate" handoff_env > "$normal" &
+  pid=$!
+  if ! fm_test_wait_for_file "$gate.ready" "$pid"; then
+    touch "$gate.proceed"
+    wait "$pid" || true
+    fail "normal presentation did not reach final capture"
+  fi
+  assert_supervise_only "$ARTIFACT" "normal installed generation"
+  FM_HANDOFF_SUCCESSOR_BACKEND=herdr FM_HANDOFF_SUCCESSOR_TARGET=default:pane-custody \
+    handoff_env > "$successor" || status=$?
+  touch "$gate.proceed"
+  wait "$pid" || fail "normal overlapping presentation failed"
+  [ "$status" -eq 0 ] || fail "successor overlapping presentation failed"
+  assert_free_edit "$successor" "successor private presentation"
+  assert_free_edit "$ARTIFACT" "successor durable generation"
+  assert_supervise_only "$normal" "normal private presentation"
+  [ -z "$(find "$HOME_DIR/data/$ID" -name '.handoff-refresh.*' -print)" ] \
+    || fail "overlapping presentation left private data behind"
+  pass "overlapping normal and successor presentations retain their own validated decisions"
+}
+
+if [ "${FM_TEST_FOCUSED:-}" = presentation-overlap ]; then
+  test_overlapping_presentations_keep_private_decisions
+  exit 0
+fi
+
+test_overlapping_presentations_keep_private_decisions
 
 test_pipeline_custody_ignores_delivery_mode() {
   local state out ready proceed

@@ -24,9 +24,8 @@ They never use `sendUserMessage()` for automation, so supervision remains visibl
 
 The watcher extension observes Pi's `input` event and records `interactive` or `rpc` submissions as provisional non-context `firstmate-direct-input-observation` entries before Pi queues or delivers them.
 Each provisional record carries the exact text-and-image content from that boundary, including image data and MIME type, so compaction before delivery cannot reduce an attachment to a count.
-An immediate submission becomes a distinct admitted exchange only from the exact prompt and images delivered by `before_agent_start`, after Pi's input-handler chain, model and authentication checks, compaction preflight, and prompt assembly have succeeded.
-A steering or follow-up submission becomes a distinct admitted and delivered exchange only from the exact user content delivered by `message_end`.
-When multiple admitted immediate exchanges have identical exact content, delivery associates them one at a time in admission order.
+Every direct submission becomes a fresh admitted and delivered exchange only from the exact user content delivered by `message_end`.
+The delivery boundary never associates a user message with an observation or an older exchange by content, order, or fallback, so a consumed observation followed by an identical accepted retry remains unambiguous.
 Global queue state and later lifecycle events never promote or match a provisional observation because they cannot identify which input Pi accepted.
 Unadmitted provisional records never become reply obligations.
 Each `agent_start` creates an in-process run identity, and every exact user delivery is attributed to the active run.
@@ -34,7 +33,7 @@ It records an exact completed assistant answer only for open exchanges delivered
 An aborted run therefore leaves its delivered exchange open when a later run successfully answers a newer input.
 These append-only records survive compaction and session resume without changing Pi's queue ordering.
 A queued submission remains owned by Pi until exact delivery, so continuity metadata never bypasses the steering or follow-up queue.
-If Pi later reports no pending message and no delivered user message exists for an admitted submission, the context hook emits the exact submitted text-and-image JSON as `SUBMITTED_NOT_DELIVERED` instead of silently forgetting it.
+Queue disappearance without an exact user delivery remains durable observation evidence but never creates an exchange or reply obligation.
 
 Before each model request, the extension compares Pi's compaction-aware message list with the full active branch.
 When compaction omitted the latest completed direct exchange, the hook injects one hidden `firstmate-direct-exchange-continuity` custom message containing the exact JSON user content, the exact JSON assistant answer, and `ANSWERED`.

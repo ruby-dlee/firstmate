@@ -3317,6 +3317,7 @@ PY
 
 test_continuation_delivery_refreshes_custody() {
   local harness=$1 mode=${2:-no-mistakes} id launch delivered
+  local FM_TEST_CONTINUATION_CASE_SUFFIX="-delivery-$mode"
   test_cross_profile_continuation_for_harness "$harness" "$harness-2" "$harness-3" "$harness"
   id="account-continue-$harness-z21"
   printf 'mode=%s\n' "$mode" >> "$HOME_DIR/state/$id.meta"

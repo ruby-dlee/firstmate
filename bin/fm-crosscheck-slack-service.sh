@@ -24,6 +24,7 @@ usage() {
 }
 
 write_plist() {
+  # shellcheck source=bin/fm-crosscheck-python-lib.sh
   . "$SCRIPT_DIR/fm-crosscheck-python-lib.sh"
   interpreter=$(fm_crosscheck_resolve_python)
   interpreter=$("$interpreter" -c 'import os, sys; print(os.path.abspath(sys.executable))')
@@ -57,6 +58,7 @@ write_plist() {
 }
 
 validate_plist() {
+  # shellcheck source=bin/fm-crosscheck-python-lib.sh
   . "$SCRIPT_DIR/fm-crosscheck-python-lib.sh"
   validator_python=$(fm_crosscheck_resolve_python)
   "$validator_python" - "$1" <<'PY'

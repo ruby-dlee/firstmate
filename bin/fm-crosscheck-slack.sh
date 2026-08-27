@@ -5,6 +5,7 @@
 #   fm-crosscheck-slack.sh run [--config <path>] [--keychain-only]
 #   fm-crosscheck-slack.sh preflight [--config <path>] [--keychain-only]
 #   fm-crosscheck-slack.sh --selftest [<config-path>]
+#   fm-crosscheck-slack.sh attest-launch <task-id> <generation> <worktree> <harness> <model> [--account-home <path>] [--config <path>]
 #   fm-crosscheck-slack.sh attest-task <task-id> <pr-url> <head-sha> [--config <path>]
 #
 # Credential sources and service startup requirements are owned by

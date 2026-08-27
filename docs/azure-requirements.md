@@ -667,10 +667,10 @@ This is deliberately weaker than the original sentence, and it is weaker in the 
 available: the original was never provable, so leaving it in place would have meant marking R6 DONE
 on an assertion.
 
-Making authorship genuinely recordable is the alternative, and it is a real change rather than a
-doc edit: it needs an authorship identity captured at task creation and carried into the ledger,
-which is the same `author_account_identity` field the Azure adapter's same-account refusal is
-already waiting on. Worth doing, out of scope here, and the amendment above does not depend on it.
+Making authorship genuinely recordable was the alternative, and at the time of this amendment it
+was out of scope. Resumed R10 later added a signed pre-agent launch record plus an exact-head
+binding for centrally configured Firstmate tasks. That newer producer does not retroactively make
+the historical R6 declaration runs into authorship evidence.
 
 **Declaring a codex author is the SAFE error; declaring a claude author is the dangerous one.** A
 codex declaration can only narrow eligibility: against a codex-family reviewer it forces the
@@ -981,7 +981,7 @@ did.
 
 ## R10. Crosscheck is exposed to team engineers through Slack
 
-Status: DEFERRED 2026-08-21, RESUMED 2026-08-26; implementation and activation in progress.
+Status: DEFERRED 2026-08-21, RESUMED 2026-08-26; implementation complete, central activation and live-team acceptance pending.
 
 Historical explanation: the owner dropped R10 from the August 21 critical path only to ship the
 core Crosscheck lane sooner.
@@ -996,10 +996,15 @@ visible saturation, central reports, and a launchd restart owner remain required
 
 The original build's branch-prefix authorship screen and unconditional `model=human-authored`
 staging are retired as unsafe.
-The resumed lane requires a signed Firstmate/no-mistakes attestation bound to the exact PR head,
-originating harness, model family, task ID, and task generation.
+For managed agent work, the resumed lane requires a signed Firstmate launch attestation created
+before the agent starts and a second signed record that binds the same worktree, harness, exact
+model, model family, account identity, task identity, and generation to the exact PR head.
+Mutable task metadata cannot establish that provenance by itself.
 Slack submitter identity, branch names, and free text carry no authorship authority.
 Missing, conflicting, or unverifiable provenance fails closed in the request thread.
+Human authorship is accepted only from a separate trustworthy exact-head producer; until a
+no-mistakes human producer exists, such requests remain unclassified and fail closed rather than
+being guessed from commit or PR metadata.
 
 Activation still requires the Slack app's two credential values, one repository-scoped read-only
 GitHub credential, exact approved channel IDs, exact approved repositories, and a binding daily

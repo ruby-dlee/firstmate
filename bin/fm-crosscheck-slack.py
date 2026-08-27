@@ -124,7 +124,8 @@ WEB_API_TIMEOUT_SECONDS = 30
 REVIEW_QUEUE_LIMIT = 8
 REVIEW_WORKERS = 4
 RECONNECT_BACKOFF_CAP_SECONDS = 60.0
-PROVENANCE_SCHEMA = "firstmate.crosscheck-authorship.v1"
+LAUNCH_PROVENANCE_SCHEMA = "firstmate.crosscheck-author-launch.v1"
+PROVENANCE_SCHEMA = "firstmate.crosscheck-authorship.v2"
 PROVENANCE_SIGNATURE_ALGORITHM = "hmac-sha256"
 MAX_PROVENANCE_BYTES = 64 * 1024
 MAX_TASK_META_BYTES = 64 * 1024
@@ -817,6 +818,24 @@ class AuthorshipProvenance:
     task_generation: str
     author_kind: str
     author_account_identity: str | None
+    launch_attestation_path: Path
+    launch_attestation_sha256: str
+    attestation_path: Path
+    attestation_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class LaunchProvenance:
+    harness: str
+    model: str
+    model_family: str
+    task_id: str
+    task_generation: str
+    author_account_identity: str | None
+    worktree: Path
+    git_dir_identity: str
+    launch_head: str
+    launch_ref: str
     attestation_path: Path
     attestation_sha256: str
 
@@ -863,15 +882,21 @@ def canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-@functools.lru_cache(maxsize=128)
-def crosscheck_model_family(model: str) -> str:
-    """Use the core gate's exact family classifier, never a Slack-local guess."""
-
+@functools.lru_cache(maxsize=1)
+def crosscheck_core() -> Any:
     module_path = BIN_DIR / "fm-crosscheck.py"
     spec = importlib.util.spec_from_file_location("fm_crosscheck_core_identity", module_path)
     require(spec is not None and spec.loader is not None, "Crosscheck model-family owner is unavailable")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+@functools.lru_cache(maxsize=128)
+def crosscheck_model_family(model: str) -> str:
+    """Use the core gate's exact family classifier, never a Slack-local guess."""
+
+    module = crosscheck_core()
     family = module.model_family(model)
     require(isinstance(family, str) and family != "", "Crosscheck model family is empty")
     return family
@@ -881,6 +906,136 @@ def attestation_path(state_dir: Path, snapshot: PrSnapshot) -> Path:
     identity = f"{snapshot.repository}#{snapshot.number}@{snapshot.head_sha}"
     name = hashlib.sha256(identity.encode("utf-8")).hexdigest() + ".json"
     return state_dir / "provenance" / name
+
+
+def launch_attestation_path(
+    state_dir: Path, task_id: str, task_generation: str
+) -> Path:
+    identity = f"{task_id}@{task_generation}"
+    name = hashlib.sha256(identity.encode("utf-8")).hexdigest() + ".json"
+    return state_dir / "launch-provenance" / name
+
+
+def git_inspect_worktree(worktree: Path) -> dict[str, str]:
+    """Return the exact physical Git identity of one clean task worktree."""
+
+    require(worktree.is_absolute(), f"task worktree must be absolute: {worktree}")
+    try:
+        metadata = worktree.lstat()
+    except OSError as exc:
+        raise SlackExposureError(f"task worktree is unavailable at {worktree}: {exc}") from exc
+    require(
+        stat.S_ISDIR(metadata.st_mode) and not worktree.is_symlink(),
+        f"task worktree must be a real directory at {worktree}",
+    )
+    resolved = worktree.resolve()
+
+    def git(*arguments: str) -> str:
+        try:
+            result = run_bounded(
+                ["git", "-C", str(resolved), *arguments],
+                timeout_seconds=30,
+                maximum_output_bytes=1024 * 1024,
+                env={
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "HOME": os.environ.get("HOME", "/var/empty"),
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "GIT_ASKPASS": "/usr/bin/false",
+                    "SSH_ASKPASS": "/usr/bin/false",
+                },
+            )
+        except BoundedIOError as exc:
+            raise SlackExposureError(
+                f"task worktree Git inspection exceeded its bounds at {resolved}: {exc}"
+            ) from exc
+        diagnostic = result.stderr.decode("utf-8", "replace").strip()
+        require(
+            result.returncode == 0,
+            f"task worktree Git inspection failed at {resolved}: "
+            f"{clamp(redact(diagnostic or 'no diagnostic'), 300)}",
+        )
+        return result.stdout.decode("utf-8", "strict").strip()
+
+    top = Path(git("rev-parse", "--show-toplevel")).resolve()
+    require(top == resolved, f"task worktree top differs from its recorded path: {top}")
+    head = git("rev-parse", "HEAD")
+    require(SHA_RE.fullmatch(head) is not None, f"task worktree has no exact HEAD at {resolved}")
+    git_dir_raw = Path(git("rev-parse", "--git-dir"))
+    git_dir = git_dir_raw if git_dir_raw.is_absolute() else resolved / git_dir_raw
+    git_dir = git_dir.resolve()
+    try:
+        git_dir_stat = git_dir.stat()
+    except OSError as exc:
+        raise SlackExposureError(
+            f"task worktree Git directory is unavailable at {git_dir}: {exc}"
+        ) from exc
+    require(stat.S_ISDIR(git_dir_stat.st_mode), f"task Git directory is not a directory at {git_dir}")
+    ref_result = git("rev-parse", "--symbolic-full-name", "HEAD")
+    return {
+        "worktree": str(resolved),
+        "head": head,
+        "ref": ref_result if ref_result != "HEAD" else "DETACHED",
+        "git_dir_identity": f"{git_dir_stat.st_dev}:{git_dir_stat.st_ino}",
+        "tracked_status": git("status", "--porcelain=v1", "--untracked-files=no"),
+    }
+
+
+def git_head_descends_from(worktree: Path, ancestor: str) -> bool:
+    """Prove the current task head retains the commit it launched from."""
+
+    require(SHA_RE.fullmatch(ancestor) is not None, "launch head is not an exact SHA")
+    try:
+        result = run_bounded(
+            ["git", "-C", str(worktree.resolve()), "merge-base", "--is-ancestor", ancestor, "HEAD"],
+            timeout_seconds=30,
+            maximum_output_bytes=1024 * 1024,
+            env={
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": os.environ.get("HOME", "/var/empty"),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_ASKPASS": "/usr/bin/false",
+                "SSH_ASKPASS": "/usr/bin/false",
+            },
+        )
+    except BoundedIOError as exc:
+        raise SlackExposureError(
+            f"task worktree ancestry inspection exceeded its bounds at {worktree}: {exc}"
+        ) from exc
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    diagnostic = result.stderr.decode("utf-8", "replace").strip()
+    raise SlackExposureError(
+        f"task worktree ancestry inspection failed at {worktree}: "
+        f"{clamp(redact(diagnostic or 'no diagnostic'), 300)}"
+    )
+
+
+def launch_account_identity(harness: str, account_home: Path) -> str:
+    """Derive the author account through Crosscheck's identity owner."""
+
+    core = crosscheck_core()
+    if harness == "codex":
+        return core.account_identity(harness, account_home)
+    require(harness == "pi", f"unsupported OpenAI author harness {harness!r}")
+    credential_path = account_home.resolve() / "auth.json"
+    try:
+        credential = read_bounded_json(credential_path, maximum_bytes=1024 * 1024)
+    except BoundedIOError as exc:
+        raise SlackExposureError(
+            f"Pi author credential is unreadable at {credential_path}: {exc}"
+        ) from exc
+    require(
+        isinstance(credential, dict) and len(credential) == 1,
+        f"Pi author credential at {credential_path} must contain exactly one profile",
+    )
+    entry = next(iter(credential.values()))
+    return core.account_identity_from_credential(
+        "pi", {"openai-codex": entry}, str(credential_path)
+    )
 
 
 def parse_task_identity(meta_path: Path) -> dict[str, str]:
@@ -906,13 +1061,13 @@ def parse_task_identity(meta_path: Path) -> dict[str, str]:
             "harness",
             "model",
             "generation_id",
+            "worktree",
             "pr",
             "pr_head",
-            "author_account_identity",
         }:
             values.setdefault(key, []).append(value)
     result: dict[str, str] = {}
-    for key in ("harness", "model", "generation_id", "pr"):
+    for key in ("harness", "model", "generation_id", "worktree", "pr"):
         found = values.get(key, [])
         require(
             len(found) == 1 and found[0] != "",
@@ -922,10 +1077,6 @@ def parse_task_identity(meta_path: Path) -> dict[str, str]:
     heads = values.get("pr_head", [])
     require(heads and SHA_RE.fullmatch(heads[-1]) is not None, f"task metadata at {meta_path} has no exact PR head")
     result["pr_head"] = heads[-1]
-    accounts = values.get("author_account_identity", [])
-    require(len(accounts) <= 1, f"task metadata at {meta_path} duplicates author_account_identity")
-    if accounts and accounts[0]:
-        result["author_account_identity"] = accounts[0]
     return result
 
 
@@ -939,10 +1090,13 @@ def require_provenance_string(value: Any, label: str, maximum: int = 512) -> str
     return value
 
 
-def signed_attestation(payload: dict[str, Any], key: bytes) -> dict[str, Any]:
-    signature = hmac.new(key, canonical_json(payload), hashlib.sha256).hexdigest()
+def signed_attestation(
+    payload: dict[str, Any], key: bytes, *, schema: str = PROVENANCE_SCHEMA
+) -> dict[str, Any]:
+    signed_body = {"schema": schema, "payload": payload}
+    signature = hmac.new(key, canonical_json(signed_body), hashlib.sha256).hexdigest()
     return {
-        "schema": PROVENANCE_SCHEMA,
+        "schema": schema,
         "payload": payload,
         "signature": {
             "algorithm": PROVENANCE_SIGNATURE_ALGORITHM,
@@ -952,6 +1106,206 @@ def signed_attestation(payload: dict[str, Any], key: bytes) -> dict[str, Any]:
     }
 
 
+def write_new_attestation(destination: Path, document: dict[str, Any]) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(document, indent=2, sort_keys=True) + "\n"
+    try:
+        descriptor = os.open(
+            str(destination), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+    except FileExistsError:
+        raise
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(encoded)
+    except BaseException:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def issue_launch_attestation(
+    config: Config,
+    key: bytes,
+    task_id: str,
+    task_generation: str,
+    worktree: Path,
+    harness: str,
+    model: str,
+    account_home: Path | None,
+) -> Path:
+    """Capture the author identity before the task's agent process starts."""
+
+    require(TASK_ID_RE.fullmatch(task_id) is not None, f"task id validation rejected {task_id!r}")
+    for value, label in (
+        (task_generation, "task generation"),
+        (harness, "author harness"),
+        (model, "author model"),
+    ):
+        require_provenance_string(value, label)
+    require(
+        harness != "human" and model != "human-authored",
+        "Firstmate task launch provenance cannot classify human authorship",
+    )
+    require(model != "default", "author model is unresolved at task launch")
+    worktree_identity = git_inspect_worktree(worktree)
+    family = crosscheck_model_family(model)
+    account_identity: str | None = None
+    if family == "openai":
+        require(
+            harness in {"pi", "codex"},
+            f"codex-family author model {model!r} has unsupported harness {harness!r}",
+        )
+        require(account_home is not None, "codex-family author has no launch-bound account home")
+        try:
+            account_identity = launch_account_identity(harness, account_home)
+        except Exception as exc:
+            raise SlackExposureError(
+                f"codex-family author account identity is unverifiable: {exc}"
+            ) from exc
+        require_provenance_string(account_identity, "author account identity")
+    destination = launch_attestation_path(config.state_dir, task_id, task_generation)
+    payload: dict[str, Any] = {
+        "issued_at": utc_now(),
+        "issuer": "firstmate-spawn",
+        "task": {
+            "task_id": task_id,
+            "task_generation": task_generation,
+        },
+        "author": {
+            "harness": harness,
+            "model": model,
+            "model_family": family,
+            "account_identity": account_identity,
+        },
+        "launch": {
+            "worktree": worktree_identity["worktree"],
+            "git_dir_identity": worktree_identity["git_dir_identity"],
+            "head_sha": worktree_identity["head"],
+            "ref": worktree_identity["ref"],
+        },
+    }
+    document = signed_attestation(payload, key, schema=LAUNCH_PROVENANCE_SCHEMA)
+    if destination.exists():
+        existing = verify_launch_attestation(config, key, task_id, task_generation)
+        require(
+            existing.harness == harness
+            and existing.model == model
+            and existing.author_account_identity == account_identity
+            and existing.worktree == Path(worktree_identity["worktree"])
+            and existing.git_dir_identity == worktree_identity["git_dir_identity"]
+            and existing.launch_head == worktree_identity["head"]
+            and existing.launch_ref == worktree_identity["ref"],
+            f"conflicting launch provenance already exists at {destination}",
+        )
+        return destination
+    try:
+        write_new_attestation(destination, document)
+    except FileExistsError:
+        existing = verify_launch_attestation(config, key, task_id, task_generation)
+        require(
+            existing.harness == harness
+            and existing.model == model
+            and existing.author_account_identity == account_identity
+            and existing.worktree == Path(worktree_identity["worktree"])
+            and existing.git_dir_identity == worktree_identity["git_dir_identity"]
+            and existing.launch_head == worktree_identity["head"]
+            and existing.launch_ref == worktree_identity["ref"],
+            f"conflicting launch provenance won a concurrent issue at {destination}",
+        )
+    return destination
+
+
+def verify_launch_attestation(
+    config: Config,
+    key: bytes,
+    task_id: str,
+    task_generation: str,
+) -> LaunchProvenance:
+    path = launch_attestation_path(config.state_dir, task_id, task_generation)
+    try:
+        raw_document = path.read_bytes()
+    except OSError as exc:
+        raise SlackExposureError(
+            f"no launch-bound Firstmate authorship attestation exists for task "
+            f"{task_id} generation {task_generation}: {exc}"
+        ) from exc
+    require(len(raw_document) <= MAX_PROVENANCE_BYTES, f"launch attestation at {path} exceeds its byte bound")
+    try:
+        document = read_bounded_json(path, maximum_bytes=MAX_PROVENANCE_BYTES)
+        raw_value = json.loads(raw_document.decode("utf-8"))
+    except (BoundedIOError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise SlackExposureError(f"launch attestation is malformed at {path}: {exc}") from exc
+    require(raw_value == document, f"launch attestation changed while it was verified at {path}")
+    require(isinstance(document, dict), f"launch attestation at {path} must be an object")
+    require(set(document) == {"schema", "payload", "signature"}, f"launch attestation at {path} has an unknown shape")
+    require(document.get("schema") == LAUNCH_PROVENANCE_SCHEMA, f"launch attestation at {path} has an unknown schema")
+    payload = document.get("payload")
+    signature = document.get("signature")
+    require(isinstance(payload, dict) and isinstance(signature, dict), f"launch attestation at {path} is incomplete")
+    require(
+        set(payload) == {"issued_at", "issuer", "task", "author", "launch"}
+        and payload.get("issuer") == "firstmate-spawn"
+        and isinstance(payload.get("issued_at"), str),
+        f"launch attestation at {path} has unknown issuer metadata",
+    )
+    require(
+        signature.get("algorithm") == PROVENANCE_SIGNATURE_ALGORITHM
+        and signature.get("key_id") == provenance_key_id(key)
+        and isinstance(signature.get("value"), str),
+        f"launch attestation at {path} has untrusted signature metadata",
+    )
+    expected = hmac.new(
+        key,
+        canonical_json({"schema": LAUNCH_PROVENANCE_SCHEMA, "payload": payload}),
+        hashlib.sha256,
+    ).hexdigest()
+    require(hmac.compare_digest(signature["value"], expected), f"launch attestation signature verification failed at {path}")
+    task = payload.get("task")
+    author = payload.get("author")
+    launch = payload.get("launch")
+    require(
+        task == {"task_id": task_id, "task_generation": task_generation},
+        f"launch attestation at {path} conflicts with the requested task generation",
+    )
+    require(isinstance(author, dict) and set(author) == {"harness", "model", "model_family", "account_identity"}, f"launch attestation at {path} has an unknown author shape")
+    require(isinstance(launch, dict) and set(launch) == {"worktree", "git_dir_identity", "head_sha", "ref"}, f"launch attestation at {path} has an unknown worktree shape")
+    for field in ("harness", "model", "model_family"):
+        require_provenance_string(author.get(field), f"launch attestation at {path} field {field}")
+    require(
+        author["harness"] != "human" and author["model"] != "human-authored",
+        f"launch attestation at {path} cannot establish human authorship",
+    )
+    require(author["model_family"] == crosscheck_model_family(author["model"]), f"launch attestation at {path} conflicts on model family")
+    account = author.get("account_identity")
+    if author["model_family"] == "openai":
+        require_provenance_string(account, f"launch attestation at {path} account identity")
+    else:
+        require(account is None or isinstance(account, str), f"launch attestation at {path} has malformed account identity")
+    worktree = Path(require_provenance_string(launch.get("worktree"), f"launch attestation at {path} worktree", 4096))
+    require(worktree.is_absolute(), f"launch attestation at {path} has a relative worktree")
+    git_dir_identity = require_provenance_string(launch.get("git_dir_identity"), f"launch attestation at {path} Git identity")
+    launch_head = require_provenance_string(launch.get("head_sha"), f"launch attestation at {path} head")
+    require(SHA_RE.fullmatch(launch_head) is not None, f"launch attestation at {path} has no exact launch head")
+    launch_ref = require_provenance_string(launch.get("ref"), f"launch attestation at {path} ref")
+    return LaunchProvenance(
+        harness=author["harness"],
+        model=author["model"],
+        model_family=author["model_family"],
+        task_id=task_id,
+        task_generation=task_generation,
+        author_account_identity=account,
+        worktree=worktree,
+        git_dir_identity=git_dir_identity,
+        launch_head=launch_head,
+        launch_ref=launch_ref,
+        attestation_path=path,
+        attestation_sha256=hashlib.sha256(raw_document).hexdigest(),
+    )
+
+
 def issue_task_attestation(
     config: Config,
     key: bytes,
@@ -959,7 +1313,7 @@ def issue_task_attestation(
     pr_url: str,
     head_sha: str,
 ) -> Path:
-    """Mint one exact-head attestation from controller-owned task metadata."""
+    """Mint exact-head provenance from a launch-bound Firstmate task record."""
 
     require(TASK_ID_RE.fullmatch(task_id) is not None, f"task id validation rejected {task_id!r}")
     require(PR_LINK_RE.fullmatch(pr_url) is not None, f"PR URL validation rejected {pr_url!r}")
@@ -970,20 +1324,50 @@ def issue_task_attestation(
     identity = parse_task_identity(meta_path)
     require(identity["pr"].rstrip("/") == pr_url.rstrip("/"), "task metadata PR does not match the attestation subject")
     require(identity["pr_head"] == head_sha, "task metadata head does not match the attestation subject")
+    require(
+        identity["harness"] != "human" and identity["model"] != "human-authored",
+        "Firstmate task metadata cannot establish human authorship; a trusted upstream producer is required",
+    )
+    launch = verify_launch_attestation(
+        config, key, task_id, identity["generation_id"]
+    )
+    require(
+        launch.harness == identity["harness"]
+        and launch.model == identity["model"],
+        "task metadata conflicts with launch-bound author identity",
+    )
+    current = git_inspect_worktree(Path(identity["worktree"]))
+    require(
+        Path(current["worktree"]) == launch.worktree,
+        "task metadata worktree conflicts with launch-bound provenance",
+    )
+    require(
+        current["git_dir_identity"] == launch.git_dir_identity,
+        "task worktree Git identity changed after author launch",
+    )
+    require(
+        git_head_descends_from(Path(current["worktree"]), launch.launch_head),
+        "task worktree HEAD does not descend from its launch-bound head",
+    )
+    require(
+        current["tracked_status"] == "",
+        "task worktree has uncommitted tracked changes; exact-head authorship is not attestable",
+    )
+    require(
+        current["head"] == head_sha,
+        "task worktree HEAD does not equal the live PR head; another worktree or later author produced it",
+    )
     snapshot = PrSnapshot(pr_url, repo_of(pr_url), int(PR_LINK_RE.fullmatch(pr_url).group(3)), head_sha)  # type: ignore[union-attr]
-    author_kind = "human" if identity["harness"] == "human" and identity["model"] == "human-authored" else "agent"
-    if author_kind == "agent":
-        require_provenance_string(identity.get("author_account_identity"), "agent author account identity")
     destination = attestation_path(config.state_dir, snapshot)
     if destination.exists():
         existing = verify_attestation(config, key, snapshot)
-        expected_account = identity.get("author_account_identity")
         require(
-            existing.harness == identity["harness"]
-            and existing.model == identity["model"]
+            existing.harness == launch.harness
+            and existing.model == launch.model
             and existing.task_id == task_id
             and existing.task_generation == identity["generation_id"]
-            and existing.author_account_identity == expected_account,
+            and existing.author_account_identity == launch.author_account_identity
+            and existing.launch_attestation_sha256 == launch.attestation_sha256,
             f"conflicting provenance already exists at {destination}",
         )
         return destination
@@ -997,44 +1381,34 @@ def issue_task_attestation(
             "head_sha": snapshot.head_sha,
         },
         "author": {
-            "kind": author_kind,
-            "harness": identity["harness"],
-            "model": identity["model"],
-            "model_family": crosscheck_model_family(identity["model"]),
+            "kind": "agent",
+            "harness": launch.harness,
+            "model": launch.model,
+            "model_family": launch.model_family,
             "task_id": task_id,
             "task_generation": identity["generation_id"],
-            "account_identity": identity.get("author_account_identity"),
+            "account_identity": launch.author_account_identity,
+        },
+        "origin": {
+            "schema": LAUNCH_PROVENANCE_SCHEMA,
+            "sha256": launch.attestation_sha256,
         },
     }
     document = signed_attestation(payload, key)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    encoded = json.dumps(document, indent=2, sort_keys=True) + "\n"
     try:
-        descriptor = os.open(
-            str(destination),
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-            0o600,
-        )
+        write_new_attestation(destination, document)
     except FileExistsError:
         existing = verify_attestation(config, key, snapshot)
         require(
-            existing.harness == identity["harness"]
-            and existing.model == identity["model"]
+            existing.harness == launch.harness
+            and existing.model == launch.model
             and existing.task_id == task_id
             and existing.task_generation == identity["generation_id"]
-            and existing.author_account_identity == identity.get("author_account_identity"),
+            and existing.author_account_identity == launch.author_account_identity
+            and existing.launch_attestation_sha256 == launch.attestation_sha256,
             f"conflicting provenance won a concurrent issue at {destination}",
         )
         return destination
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(encoded)
-    except BaseException:
-        try:
-            destination.unlink()
-        except OSError:
-            pass
-        raise
     return destination
 
 
@@ -1071,7 +1445,7 @@ def verify_attestation(config: Config, key: bytes, snapshot: PrSnapshot) -> Auth
     signature = document.get("signature")
     require(isinstance(payload, dict) and isinstance(signature, dict), f"authorship attestation at {path} is incomplete")
     require(
-        set(payload) == {"issued_at", "issuer", "subject", "author"}
+        set(payload) == {"issued_at", "issuer", "subject", "author", "origin"}
         and payload.get("issuer") == "firstmate-pr-check"
         and isinstance(payload.get("issued_at"), str),
         f"authorship attestation at {path} has unknown issuer metadata",
@@ -1082,11 +1456,16 @@ def verify_attestation(config: Config, key: bytes, snapshot: PrSnapshot) -> Auth
         and isinstance(signature.get("value"), str),
         f"authorship attestation at {path} has untrusted signature metadata",
     )
-    expected = hmac.new(key, canonical_json(payload), hashlib.sha256).hexdigest()
+    expected = hmac.new(
+        key,
+        canonical_json({"schema": PROVENANCE_SCHEMA, "payload": payload}),
+        hashlib.sha256,
+    ).hexdigest()
     require(hmac.compare_digest(signature["value"], expected), f"authorship attestation signature verification failed at {path}")
     subject = payload.get("subject")
     author = payload.get("author")
-    require(isinstance(subject, dict) and isinstance(author, dict), f"authorship attestation at {path} has no subject or author")
+    origin = payload.get("origin")
+    require(isinstance(subject, dict) and isinstance(author, dict) and isinstance(origin, dict), f"authorship attestation at {path} has no subject, author, or origin")
     expected_subject = {
         "repository": snapshot.repository,
         "pull_request": snapshot.number,
@@ -1105,13 +1484,31 @@ def verify_attestation(config: Config, key: bytes, snapshot: PrSnapshot) -> Auth
     require(author["kind"] == expected_kind, f"authorship attestation at {path} conflicts on author kind")
     require(author["model_family"] == crosscheck_model_family(author["model"]), f"authorship attestation at {path} conflicts on model family")
     account = author["account_identity"]
-    if author["kind"] == "agent" or account is not None:
+    if author["model_family"] == "openai" or account is not None:
         require_provenance_string(
             account, f"authorship attestation at {path} account identity"
         )
     require(
         TASK_ID_RE.fullmatch(author["task_id"]) is not None,
         f"authorship attestation at {path} has malformed task identity",
+    )
+    require(
+        origin.get("schema") == LAUNCH_PROVENANCE_SCHEMA
+        and set(origin) == {"schema", "sha256"}
+        and isinstance(origin.get("sha256"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", origin["sha256"]) is not None,
+        f"authorship attestation at {path} has untrusted launch provenance",
+    )
+    launch = verify_launch_attestation(
+        config, key, author["task_id"], author["task_generation"]
+    )
+    require(
+        launch.attestation_sha256 == origin["sha256"]
+        and launch.harness == author["harness"]
+        and launch.model == author["model"]
+        and launch.model_family == author["model_family"]
+        and launch.author_account_identity == account,
+        f"authorship attestation at {path} conflicts with launch-bound provenance",
     )
     return AuthorshipProvenance(
         harness=author["harness"],
@@ -1121,6 +1518,8 @@ def verify_attestation(config: Config, key: bytes, snapshot: PrSnapshot) -> Auth
         task_generation=author["task_generation"],
         author_kind=author["kind"],
         author_account_identity=account,
+        launch_attestation_path=launch.attestation_path,
+        launch_attestation_sha256=launch.attestation_sha256,
         attestation_path=path,
         attestation_sha256=hashlib.sha256(raw_document).hexdigest(),
     )
@@ -1413,6 +1812,7 @@ def make_run_review(
             f"author_task_id={provenance.task_id}",
             f"author_task_generation={provenance.task_generation}",
             f"author_attestation_sha256={provenance.attestation_sha256}",
+            f"author_launch_attestation_sha256={provenance.launch_attestation_sha256}",
         ]
         if provenance.author_account_identity:
             meta_lines.append(
@@ -1433,6 +1833,15 @@ def make_run_review(
         )
         attestation_copy.write_bytes(attestation_bytes)
         os.chmod(attestation_copy, 0o600)
+        launch_copy = task_data / "author-launch-attestation.json"
+        launch_bytes = provenance.launch_attestation_path.read_bytes()
+        require(
+            hashlib.sha256(launch_bytes).hexdigest()
+            == provenance.launch_attestation_sha256,
+            "author launch attestation changed after verification",
+        )
+        launch_copy.write_bytes(launch_bytes)
+        os.chmod(launch_copy, 0o600)
         argv = crosscheck_argv(task_id, pr_url)
         try:
             result = run_bounded(
@@ -2270,6 +2679,17 @@ def build_parser() -> argparse.ArgumentParser:
     attest.add_argument("pr_url")
     attest.add_argument("head_sha")
     attest.add_argument("--config", default="", help="config path override")
+    launch = subparsers.add_parser(
+        "attest-launch",
+        help="capture a task's author identity before its agent starts",
+    )
+    launch.add_argument("task_id")
+    launch.add_argument("task_generation")
+    launch.add_argument("worktree")
+    launch.add_argument("harness")
+    launch.add_argument("model")
+    launch.add_argument("--account-home", default="")
+    launch.add_argument("--config", default="", help="config path override")
     return parser
 
 
@@ -2286,6 +2706,23 @@ def main() -> int:
             )
             for name in (config.app_token_env, config.bot_token_env, config.github_token_env):
                 os.environ.pop(name, None)
+        if args.command == "attest-launch":
+            path = Path(args.config) if args.config else default_config_path()
+            config = load_config(path)
+            key = load_provenance_key(config.provenance_key_file)
+            account_home = Path(args.account_home) if args.account_home else None
+            destination = issue_launch_attestation(
+                config,
+                key,
+                args.task_id,
+                args.task_generation,
+                Path(args.worktree),
+                args.harness,
+                args.model,
+                account_home,
+            )
+            print(f"launch-attested: {destination}")
+            return 0
         if args.command == "attest-task":
             path = Path(args.config) if args.config else default_config_path()
             config = load_config(path)

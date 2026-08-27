@@ -48,33 +48,42 @@ The listener never translates a queue, GitHub, reviewer, Azure, cleanup, ledger,
 The old R10 build inferred authorship from branch prefixes and staged every request as `model=human-authored`.
 That was unsafe and is retired.
 
-The active lane accepts authorship only from `firstmate.crosscheck-authorship.v1` attestations.
-Each attestation is HMAC-signed by the coordinator and binds all of these values:
+The active Firstmate producer uses two coordinator-signed records.
+`fm-spawn` writes `firstmate.crosscheck-author-launch.v1` before the agent process starts.
+That immutable launch record binds:
+
+- Originating Firstmate task ID and task generation.
+- Exact task worktree, Git directory identity, branch ref, and launch head.
+- Author harness, exact model, model family, and required captured account identity for OpenAI-family agents.
+
+`fm-pr-check` later writes `firstmate.crosscheck-authorship.v2` only when the same worktree and Git identity remain, the current head descends from the launch head, tracked files are clean, and current HEAD equals the live PR head.
+That exact-head record binds:
 
 - Exact repository and pull request number.
 - Exact 40-character head SHA.
-- Author kind, harness, model, and model family.
-- Originating Firstmate task ID and task generation.
-- Required captured author account identity for agents; optional identity for humans.
+- The complete launch-bound author identity.
+- The SHA-256 digest of the signed launch record.
 
-`bin/fm-pr-check.sh` emits this attestation automatically after it records the live PR head for a Firstmate task and only when the central Slack config is installed.
-It invokes the supported command below and derives every author field from the task record.
-No caller supplies a model value:
+Both records authenticate their schema and payload with the coordinator provenance key.
+Mutable task metadata can only agree with the signed launch identity; it cannot replace it.
+A head produced in another worktree, a changed branch identity, or uncommitted tracked source is refused.
+
+`bin/fm-spawn.sh` creates the launch record automatically for a managed task when central Slack configuration is installed, and `bin/fm-pr-check.sh` emits the exact-head record after it resolves the live PR head.
+The exact-head command below is a pipeline interface, not a way for a caller to claim a model:
 
 ```sh
 bin/fm-crosscheck-slack.sh attest-task <task-id> <pr-url> <head-sha> --config <config-path>
 ```
 
 The Slack listener fetches the live PR head with its read-only GitHub credential, verifies the exact-head signature, recomputes the model family through Crosscheck's own classifier, and stages the verified harness and model for the core family-separation screen.
-The signed attestation is copied into the review's durable artifact directory.
+Both signed attestations are copied into the review's durable artifact directory.
 Agent attestations require a captured author account identity, which also arms the Azure adapter's same-account refusal.
 
 Slack identity, branch names, PR text, and caller-supplied free text carry no authorship authority.
 Missing, malformed, tampered, conflicting, or wrong-head provenance gets a clear threaded refusal and starts no review.
-A human-authored PR is classified as human only when a signed upstream task attestation says `harness=human` and `model=human-authored`.
-An unattested human PR remains unclassified and fails closed.
-Production remains blocked: this tree has no trusted ingestion path for independent engineer/no-mistakes provenance, and the current issuer signs a task-associated live head without proof that the task produced it.
-The producer must bind identity when creating the head before the coordinator can safely ingest or sign that evidence; a signature over mutable task metadata alone does not establish authorship.
+Firstmate launch records deliberately cannot claim human authorship.
+A human-authored PR may be classified as human only after a separate trusted producer, such as no-mistakes, supplies verifiable exact-head evidence from its own author boundary.
+No such human producer is inferred from commit metadata, Slack identity, an unsigned PR-body marker, or absence of a Firstmate record; without it, the request fails closed as unclassified.
 
 ## Exact-head response contract
 
@@ -166,8 +175,8 @@ Per-engineer request records live under `<state_dir>/meter/<YYYY-MM-DD>.json`.
 Each record includes the Slack user ID, PR URL, event ID, start and finish times, state, lane, available token data, and available cost data.
 Request records stay bound to the UTC day on which they started, including reviews that cross midnight.
 
-Signed authorship records live under `<state_dir>/provenance`.
-Review reports and the copied attestation live under `$FM_HOME/data/<task-id>`.
+Signed launch records live under `<state_dir>/launch-provenance`, and exact-head records live under `<state_dir>/provenance`.
+Review reports and both copied attestations live under `$FM_HOME/data/<task-id>`.
 
 Event artifacts expire after 14 days and meter files after 90 days.
 Review artifacts follow the central Crosscheck retention owner.
@@ -216,6 +225,7 @@ Reinstall the launch agent after moving the interpreter or changing tool locatio
 ## Activation and live acceptance
 
 Before activation, supply the coordinator inputs in [Central configuration](#central-configuration) and satisfy [Credentials and app permissions](#credentials-and-app-permissions).
+Install the central configuration before spawning an agent whose PR must be reviewable, because provenance begins at agent launch and cannot be reconstructed later.
 The launchd credential checks and lifecycle are owned by [Install, restart, and inspect](#install-restart-and-inspect).
 
 The live acceptance request must come from an internal engineer other than Dongkeun in an approved channel.

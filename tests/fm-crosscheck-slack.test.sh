@@ -247,18 +247,50 @@ if command == "mention":
         and mod.repo_of(links[0]) in config.repo_allowlist
         and os.environ.get("FMT_PROVENANCE_MODE", "valid") != "missing"
         and head_sha != "ERROR"
+        and not (
+            config.state_dir / "events" / f"{os.environ['FMT_EVENT_ID']}.claimed"
+        ).exists()
     ):
         source_task = os.environ.get("FMT_SOURCE_TASK") or "source-task"
+        source_generation = os.environ.get("FMT_SOURCE_GENERATION") or "spawn:test-generation"
+        source_harness = os.environ.get("FMT_SOURCE_HARNESS") or "pi"
+        source_model = os.environ.get("FMT_SOURCE_MODEL") or "openai-codex-8/gpt-5.6-sol"
+        source_worktree = Path(os.environ["FM_HOME"]) / "source-worktrees" / source_task
+        source_worktree.mkdir(parents=True, exist_ok=True)
+        account_home = Path(os.environ["FM_HOME"]) / "source-accounts" / source_task
+        account_home.mkdir(parents=True, exist_ok=True)
+        (account_home / "auth.json").write_text(json.dumps({
+            "openai-codex": {"accountId": "fixture-author-account"}
+        }))
+        worktree_identity = {
+            "worktree": str(source_worktree.resolve()),
+            "head": head_sha,
+            "ref": "refs/heads/codex/fixture",
+            "git_dir_identity": f"fixture:{source_task}",
+            "tracked_status": "",
+        }
+        mod.git_inspect_worktree = lambda _worktree: dict(worktree_identity)
+        mod.git_head_descends_from = lambda _worktree, _ancestor: True
+        mod.issue_launch_attestation(
+            config,
+            provenance_key,
+            source_task,
+            source_generation,
+            source_worktree,
+            source_harness,
+            source_model,
+            account_home,
+        )
         source_meta = Path(os.environ["FM_HOME"]) / "state" / f"{source_task}.meta"
         source_meta.write_text(
             "\n".join(
                 [
-                    f"harness={os.environ.get('FMT_SOURCE_HARNESS') or 'pi'}",
-                    f"model={os.environ.get('FMT_SOURCE_MODEL') or 'openai-codex-8/gpt-5.6-sol'}",
-                    f"generation_id={os.environ.get('FMT_SOURCE_GENERATION') or 'spawn:test-generation'}",
+                    f"harness={source_harness}",
+                    f"model={source_model}",
+                    f"generation_id={source_generation}",
+                    f"worktree={source_worktree.resolve()}",
                     f"pr={links[0]}",
                     f"pr_head={head_sha}",
-                    "author_account_identity=fixture-author-account",
                 ]
             )
             + "\n",
@@ -585,12 +617,31 @@ test_missing_token_env_refuses_start() {
 test_attestation_cli_derives_and_signs_author_identity() {
   agent_task=attest-agent-task
   agent_pr=https://github.com/Ruby-Labs/goodrepo/pull/77
-  agent_head=7777777777777777777777777777777777777777
+  agent_worktree="$TMP_ROOT/attest-agent-worktree"
+  agent_account="$TMP_ROOT/attest-agent-account"
+  mkdir -p "$agent_worktree" "$agent_account"
+  git -C "$agent_worktree" init -q
+  git -C "$agent_worktree" config user.email fixture@example.com
+  git -C "$agent_worktree" config user.name Fixture
+  printf 'launch\n' > "$agent_worktree/value.txt"
+  git -C "$agent_worktree" add value.txt
+  git -C "$agent_worktree" commit -qm 'fixture launch'
+  agent_head=$(git -C "$agent_worktree" rev-parse HEAD)
+  printf '%s\n' '{"openai-codex":{"accountId":"fixture-author-account"}}' \
+    > "$agent_account/auth.json"
+  output=$(perl -e 'alarm 60; exec @ARGV' -- \
+    env FM_HOME="$HOMEDIR" "$BOT_SH" attest-launch \
+      "$agent_task" spawn:attest-agent "$agent_worktree" pi \
+      openai-codex-8/gpt-5.6-sol --account-home "$agent_account" \
+      --config "$CONFIG_MAIN" 2>&1) \
+    || fail "agent launch attestation command failed: $output"
+  assert_contains "$output" "launch-attested:" \
+    "agent launch attestation was not written"
   cat > "$HOMEDIR/state/$agent_task.meta" <<EOF
 harness=pi
 model=openai-codex-8/gpt-5.6-sol
 generation_id=spawn:attest-agent
-author_account_identity=fixture-author-account
+worktree=$agent_worktree
 pr=$agent_pr
 pr_head=$agent_head
 EOF
@@ -607,26 +658,31 @@ print(author["kind"], author["harness"], author["model_family"], author["task_id
     "$agent_path")
   [ "$shape" = "agent pi openai $agent_task" ] \
     || fail "agent provenance fields were not derived correctly: $shape"
+  origin_shape=$($PYTHON -c 'import json, sys
+value=json.load(open(sys.argv[1]))
+print(value["schema"], value["payload"]["origin"]["schema"])' "$agent_path")
+  [ "$origin_shape" = "firstmate.crosscheck-authorship.v2 firstmate.crosscheck-author-launch.v1" ] \
+    || fail "exact-head attestation did not bind launch provenance: $origin_shape"
 
   human_task=attest-human-task
   human_pr=https://github.com/Ruby-Labs/goodrepo/pull/78
-  human_head=8888888888888888888888888888888888888888
+  human_head=$agent_head
   cat > "$HOMEDIR/state/$human_task.meta" <<EOF
 harness=human
 model=human-authored
 generation_id=no-mistakes:human-run-1
+worktree=$agent_worktree
 pr=$human_pr
 pr_head=$human_head
 EOF
-  output=$(perl -e 'alarm 60; exec @ARGV' -- \
+  if output=$(perl -e 'alarm 60; exec @ARGV' -- \
     env FM_HOME="$HOMEDIR" "$BOT_SH" attest-task \
-      "$human_task" "$human_pr" "$human_head" --config "$CONFIG_MAIN" 2>&1) \
-    || fail "human attestation command failed: $output"
-  human_path=${output#attested: }
-  human_kind=$($PYTHON -c 'import json, sys
-print(json.load(open(sys.argv[1]))["payload"]["author"]["kind"])' "$human_path")
-  [ "$human_kind" = human ] || fail "signed human task was not classified as human"
-  pass "the attestation CLI derives agent and human identity only from signed task provenance"
+      "$human_task" "$human_pr" "$human_head" --config "$CONFIG_MAIN" 2>&1); then
+    fail "unsigned human task metadata was accepted as trusted provenance"
+  fi
+  assert_contains "$output" "cannot establish human authorship" \
+    "human provenance refusal did not name the missing trusted producer"
+  pass "the attestation CLI binds agent identity to launch evidence and refuses unsigned human classification"
 }
 
 test_mention_without_link_gets_usage_reply() {
@@ -997,17 +1053,42 @@ key = mod.load_provenance_key(config.provenance_key_file)
 url = "https://github.com/Ruby-Labs/goodrepo/pull/91"
 head = "9" * 40
 task = "account-required"
+generation = "spawn:account"
+worktree = Path(os.environ["FM_HOME"]) / "account-required-worktree"
+worktree.mkdir()
+account_home = Path(os.environ["FM_HOME"]) / "account-required-home"
+account_home.mkdir()
+identity = {
+    "worktree": str(worktree.resolve()),
+    "head": head,
+    "ref": "refs/heads/codex/account-required",
+    "git_dir_identity": "fixture:account-required",
+    "tracked_status": "",
+}
+mod.git_inspect_worktree = lambda _worktree: dict(identity)
+mod.git_head_descends_from = lambda _worktree, _ancestor: True
+try:
+    mod.issue_launch_attestation(
+        config, key, task, generation, worktree, "pi",
+        "openai-codex-8/gpt-5.6-sol", None,
+    )
+except mod.SlackExposureError:
+    pass
+else:
+    raise AssertionError("launch issuer accepted absent account identity")
+(account_home / "auth.json").write_text(
+    '{"openai-codex":{"accountId":"fixture-author-account"}}'
+)
+mod.issue_launch_attestation(
+    config, key, task, generation, worktree, "pi",
+    "openai-codex-8/gpt-5.6-sol", account_home,
+)
 meta = Path(os.environ["FM_HOME"]) / "state" / f"{task}.meta"
-base = f"harness=pi\nmodel=openai-codex-8/gpt-5.6-sol\ngeneration_id=spawn:account\npr={url}\npr_head={head}\n"
-for account in ("", "author_account_identity=\n"):
-    meta.write_text(base + account)
-    try:
-        mod.issue_task_attestation(config, key, task, url, head)
-    except mod.SlackExposureError:
-        pass
-    else:
-        raise AssertionError("issuer accepted absent account identity")
-meta.write_text(base + "author_account_identity=fixture-author-account\n")
+meta.write_text(
+    f"harness=pi\nmodel=openai-codex-8/gpt-5.6-sol\n"
+    f"generation_id={generation}\nworktree={worktree.resolve()}\n"
+    f"pr={url}\npr_head={head}\n"
+)
 path = mod.issue_task_attestation(config, key, task, url, head)
 import json
 payload = json.loads(path.read_text())["payload"]
@@ -1023,6 +1104,84 @@ else:
 PYTEST
   ) || fail "required account regression failed: $output"
   pass "issuer and verifier reject missing agent account identity"
+}
+
+test_exact_head_cannot_be_rebound_to_another_worktree() {
+  output=$(env FM_HOME="$HOMEDIR" FMT_BOT_PY="$BOT_PY" \
+    FM_CROSSCHECK_SLACK_CONFIG="$CONFIG_MAIN" "$PYTHON" - <<'PYTEST'
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+spec = importlib.util.spec_from_file_location("slack_worktree_test", os.environ["FMT_BOT_PY"])
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+config = mod.load_config(Path(os.environ["FM_CROSSCHECK_SLACK_CONFIG"]))
+key = mod.load_provenance_key(config.provenance_key_file)
+root = Path(os.environ["FM_HOME"]) / "worktree-binding"
+root.mkdir(exist_ok=True)
+
+def repository(name, value):
+    path = root / name
+    path.mkdir()
+    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "fixture@example.com"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "Fixture"], check=True)
+    (path / "value.txt").write_text(value)
+    subprocess.run(["git", "-C", str(path), "add", "value.txt"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-qm", f"fixture {name}"], check=True)
+    head = subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
+    return path.resolve(), head
+
+author_worktree, author_head = repository("author", "author\n")
+other_worktree, other_head = repository("other", "other\n")
+account_home = root / "account"
+account_home.mkdir()
+(account_home / "auth.json").write_text(json.dumps({
+    "openai-codex": {"accountId": "fixture-author-account"}
+}))
+task = "worktree-bound"
+generation = "spawn:worktree-bound"
+url = "https://github.com/Ruby-Labs/goodrepo/pull/92"
+mod.issue_launch_attestation(
+    config, key, task, generation, author_worktree, "pi",
+    "openai-codex-8/gpt-5.6-sol", account_home,
+)
+meta = Path(os.environ["FM_HOME"]) / "state" / f"{task}.meta"
+
+def write_meta(worktree, head):
+    meta.write_text(
+        "harness=pi\nmodel=openai-codex-8/gpt-5.6-sol\n"
+        f"generation_id={generation}\nworktree={worktree}\n"
+        f"pr={url}\npr_head={head}\n"
+    )
+
+write_meta(other_worktree, other_head)
+try:
+    mod.issue_task_attestation(config, key, task, url, other_head)
+except mod.SlackExposureError as exc:
+    assert "worktree conflicts" in str(exc)
+else:
+    raise AssertionError("another worktree was rebound to the original task")
+
+write_meta(author_worktree, other_head)
+try:
+    mod.issue_task_attestation(config, key, task, url, other_head)
+except mod.SlackExposureError as exc:
+    assert "does not equal the live PR head" in str(exc)
+else:
+    raise AssertionError("another head was attributed to the original task worktree")
+
+write_meta(author_worktree, author_head)
+path = mod.issue_task_attestation(config, key, task, url, author_head)
+assert path.is_file()
+PYTEST
+  ) || fail "worktree-bound provenance regression failed: $output"
+  pass "launch provenance cannot be rebound to a head produced in another worktree"
 }
 
 test_retention_sweep_removes_only_aged_state() {
@@ -1229,6 +1388,7 @@ UNITS=(
   test_undelivered_verdict_is_reposted_on_redelivery
   test_redelivery_revalidates_head
   test_agent_account_is_required
+  test_exact_head_cannot_be_rebound_to_another_worktree
   test_retention_sweep_removes_only_aged_state
   test_posts_disable_mrkdwn
   test_four_workers_and_concurrent_cap_are_binding
@@ -1240,8 +1400,8 @@ UNITS=(
 
 case "${FM_SLACK_TEST_GROUP:-all}" in
   service-repair) UNITS=(test_service_install_contains_no_credentials) ;;
-  repair) UNITS=(test_agent_account_is_required test_redelivery_revalidates_head test_service_install_contains_no_credentials) ;;
-  compatibility) UNITS=(test_attestation_cli_derives_and_signs_author_identity test_completed_review_names_lane_head_task_and_artifact test_undelivered_verdict_is_reposted_on_redelivery test_head_change_invalidates_the_verdict test_four_workers_and_concurrent_cap_are_binding) ;;
+  repair) UNITS=(test_agent_account_is_required test_exact_head_cannot_be_rebound_to_another_worktree test_redelivery_revalidates_head test_service_install_contains_no_credentials) ;;
+  compatibility) UNITS=(test_attestation_cli_derives_and_signs_author_identity test_exact_head_cannot_be_rebound_to_another_worktree test_completed_review_names_lane_head_task_and_artifact test_undelivered_verdict_is_reposted_on_redelivery test_head_change_invalidates_the_verdict test_four_workers_and_concurrent_cap_are_binding) ;;
   all) ;;
   *) fail "unknown Slack test group" ;;
 esac

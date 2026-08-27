@@ -1364,6 +1364,12 @@ EOF
   pass "OpenCode healthy arm output does not suppress the turn-end guard"
 }
 
+if [ "${FM_PI_EXACT_DELIVERY_PROOF:-0}" = 1 ]; then
+  test_pi_compaction_preserves_direct_exchange_and_pending_input
+  printf '%s\n' 'PI_EXACT_DELIVERY_ASSOCIATION_PROOF_OK'
+  exit 0
+fi
+
 test_tracked_extension_present_and_self_hashing
 test_spawn_template_mentions_pi_watch_placeholder
 test_pi_extension_reports_external_healthy_watcher

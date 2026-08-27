@@ -131,7 +131,6 @@ function contentPresent(messages: Array<{ role: string; content?: unknown }>, ro
 function renderDirectExchangeContinuity(
   entries: SessionEntry[],
   messages: Array<{ role: string; content?: unknown }>,
-  hasPendingMessages: boolean,
 ): string | undefined {
   const exchanges = foldDirectExchanges(entries);
   const sections: string[] = [];
@@ -157,21 +156,6 @@ function renderDirectExchangeContinuity(
           `Exchange ${exchange.exchangeId}: OPEN_REPLY_OBLIGATION`,
           `Human input, exact JSON: ${JSON.stringify(exchange.deliveredContent)}`,
           "No completed assistant answer was observed before compaction.",
-        ].join("\n"),
-      );
-    } else if (exchange.admittedAt !== undefined && !hasPendingMessages) {
-      const submissionEvidence =
-        exchange.inputContent !== undefined
-          ? [`Human input, exact submitted JSON: ${JSON.stringify(exchange.inputContent)}`]
-          : [
-              `Human input text, exact JSON: ${JSON.stringify(exchange.inputText)}`,
-              `Attached image count: ${exchange.imageCount}`,
-            ];
-      sections.push(
-        [
-          `Exchange ${exchange.exchangeId}: SUBMITTED_NOT_DELIVERED`,
-          ...submissionEvidence,
-          "Pi no longer reports this submission in its pending queue and no delivered user message was observed. Treat it as an open reply obligation and verify the apparent delivery loss.",
         ].join("\n"),
       );
     }
@@ -395,23 +379,10 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  pi.on("before_agent_start", (event) => {
-    const content = cloneJson([{ type: "text", text: event.prompt }, ...(event.images ?? [])]);
-    createAdmittedExchange(content, "immediate", Date.now());
-  });
-
   pi.on("message_end", (event, ctx) => {
     if (event.message.role === "user") {
       const content = cloneJson(event.message.content);
-      const pending = foldDirectExchanges(ctx.sessionManager.getBranch()).filter(
-        (exchange) => exchange.admittedAt !== undefined && exchange.deliveredContent === undefined,
-      );
-      const exchange = pending.find(
-        (candidate) =>
-          candidate.inputContent !== undefined &&
-          JSON.stringify(candidate.inputContent) === JSON.stringify(content),
-      );
-      const exchangeId = exchange?.exchangeId ?? createAdmittedExchange(content, "steer", event.message.timestamp);
+      const exchangeId = createAdmittedExchange(content, "steer", event.message.timestamp);
       appendDirectExchange({
         version: 1,
         event: "delivered",
@@ -448,7 +419,6 @@ export default function (pi: ExtensionAPI) {
     const continuity = renderDirectExchangeContinuity(
       ctx.sessionManager.getBranch(),
       event.messages,
-      ctx.hasPendingMessages(),
     );
     if (!continuity) return;
     const message = {

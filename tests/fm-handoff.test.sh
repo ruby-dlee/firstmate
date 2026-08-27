@@ -366,6 +366,42 @@ test_verified_successor_is_not_competing_owner() {
   pass "exact Herdr successor exclusion preserves competing worker and pipeline custody"
 }
 
+test_pipeline_custody_ignores_delivery_mode() {
+  local state out ready proceed
+  make_case local-only-pipeline
+  printf 'mode=local-only\n' >> "$HOME_DIR/state/$ID.meta"
+  out=$CASE_DIR/out
+  for state in active parked stale-terminal terminal-unavailable; do
+    printf '%s\n' "$state" > "$NM_STATE"
+    handoff_env > "$out" || fail "local-only $state handoff failed"
+    assert_supervise_only "$out" "local-only $state pipeline"
+  done
+  for state in none terminal; do
+    printf '%s\n' "$state" > "$NM_STATE"
+    handoff_env > "$out" || fail "local-only $state handoff failed"
+    assert_free_edit "$out" "local-only $state pipeline"
+  done
+  printf 'none\n' > "$NM_STATE"
+  ready=$CASE_DIR/recheck.ready
+  proceed=$CASE_DIR/recheck.proceed
+  run_gated_handoff "$out" "$ready" "$proceed"
+  fm_test_wait_for_file "$ready" "$GATED_PID" || fail "local-only final-recheck gate did not open"
+  printf 'active\n' > "$NM_STATE"
+  touch "$proceed"
+  wait "$GATED_PID" || fail "local-only activation handoff failed"
+  assert_supervise_only "$out" "local-only activation after capture"
+  assert_grep 'Active mutation owner: **no-mistakes run run-live-1**' "$out" \
+    "local-only activation lost pipeline ownership"
+  pass "pipeline custody is independent of delivery mode and refreshes at delivery"
+}
+
+if [ "${FM_TEST_FOCUSED:-}" = delivery-mode ]; then
+  test_pipeline_custody_ignores_delivery_mode
+  exit 0
+fi
+
+test_pipeline_custody_ignores_delivery_mode
+
 test_verified_successor_is_not_competing_owner
 test_completed_status_reconciles_newest_run
 test_no_active_owner_is_free_edit_and_idempotent

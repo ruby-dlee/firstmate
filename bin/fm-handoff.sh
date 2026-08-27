@@ -224,7 +224,7 @@ run_nm_bounded() {
 
 capture_live() {  # <identity-file> <block-file> [force-supervise-reason]
   local identity=$1 block=$2 force_reason=${3:-}
-  local worktree_recorded worktree_real=unavailable project kind mode backend target scoped probe_home
+  local worktree_recorded worktree_real=unavailable project kind backend target scoped probe_home
   local repo_state=unknown branch=unknown head=unknown repo_status='unavailable' unpublished='unavailable' unpublished_count=unknown
   local endpoint_state=unknown process_state=unknown endpoint_owner=none
   local nm_state=unknown nm_run=unknown nm_branch=unknown nm_status=unknown nm_outcome=none nm_step=unknown nm_step_status=unknown nm_head=unknown
@@ -235,8 +235,6 @@ capture_live() {  # <identity-file> <block-file> [force-supervise-reason]
   project=$(meta_value project)
   kind=$(meta_value kind)
   [ -n "$kind" ] || kind=ship
-  mode=$(meta_value mode)
-  [ -n "$mode" ] || mode=no-mistakes
   backend=$(fm_backend_of_meta "$META")
   target=$(fm_backend_target_of_meta "$META")
   scoped=$(meta_value tmux_session_target)
@@ -309,15 +307,7 @@ capture_live() {  # <identity-file> <block-file> [force-supervise-reason]
     endpoint_owner=none
   fi
 
-  if [ "$mode" != no-mistakes ]; then
-    nm_state=not-applicable
-    nm_run=none
-    nm_branch=$branch
-    nm_status="mode=$mode"
-    nm_step=none
-    nm_step_status=none
-    nm_head=none
-  elif [ "$repo_state" = exact ] && command -v no-mistakes >/dev/null 2>&1; then
+  if [ "$repo_state" = exact ] && command -v no-mistakes >/dev/null 2>&1; then
     nm_status_file=$(new_tmp handoff-nm-status) || return 1
     set +e
     run_nm_bounded "$worktree_real" "$nm_status_file" no-mistakes axi status

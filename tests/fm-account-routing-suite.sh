@@ -3316,9 +3316,10 @@ PY
 }
 
 test_continuation_delivery_refreshes_custody() {
-  local harness=$1 id launch delivered
+  local harness=$1 mode=${2:-no-mistakes} id launch delivered
   test_cross_profile_continuation_for_harness "$harness" "$harness-2" "$harness-3" "$harness"
   id="account-continue-$harness-z21"
+  printf 'mode=%s\n' "$mode" >> "$HOME_DIR/state/$id.meta"
   git -C "$WT_DIR" checkout -qb "fm/delivery-$harness"
   delivered="$CASE_DIR/delivered-prompt"
   launch=$(cat "$LAUNCH_LOG")
@@ -6622,6 +6623,12 @@ fi
 if [ "${FM_TEST_FOCUSED:-}" = review-round-15 ]; then
   run_isolated_test test_inherited_lifecycle_lock_rejects_owner_aba
   run_isolated_test test_continuation_rejects_load_bearing_source_replacement_during_open
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = handoff-delivery-mode ]; then
+  run_isolated_test test_continuation_delivery_refreshes_custody claude local-only
+  run_isolated_test test_continuation_delivery_refreshes_custody codex local-only
   exit 0
 fi
 

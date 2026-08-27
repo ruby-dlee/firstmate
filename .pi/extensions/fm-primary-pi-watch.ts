@@ -351,7 +351,7 @@ export default function (pi: ExtensionAPI) {
       .filter((exchangeId) => !admittedExchangeIds.has(exchangeId))
       .map((exchangeId) => ({ exchangeId, ...provisionalExchanges.get(exchangeId)! }))
       .filter((candidate) => JSON.stringify(candidate.content) === expected);
-    return matches.length === 1 ? matches[0] : undefined;
+    return matches[0];
   }
 
   pi.on("input", (event) => {
@@ -394,7 +394,7 @@ export default function (pi: ExtensionAPI) {
           candidate.inputContent !== undefined &&
           JSON.stringify(candidate.inputContent) === JSON.stringify(content),
       );
-      const exchange = matches.length === 1 ? matches[0] : undefined;
+      const exchange = matches[0];
       if (!exchange) return;
       admitExchange(exchange.exchangeId);
       appendDirectExchange({

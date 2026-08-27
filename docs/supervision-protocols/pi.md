@@ -26,6 +26,7 @@ The watcher extension observes Pi's `input` event and records `interactive` or `
 Each provisional record carries the exact text-and-image content from that boundary, including image data and MIME type, so compaction before delivery cannot reduce an attachment to a count.
 An immediate submission becomes admitted only when `before_agent_start` contains an exact text-and-image match, after Pi's input-handler chain, model and authentication checks, compaction preflight, and prompt assembly have succeeded.
 A steering or follow-up submission becomes admitted only when a delivered user `message_end` contains an exact text-and-image match.
+When multiple unresolved submissions have identical exact content, delivery associates them one at a time in submission order.
 Global queue state and unmatched later lifecycle events never admit a provisional record because they cannot identify which input Pi accepted.
 Unadmitted provisional records never become reply obligations.
 It records the exact delivered user content on `message_end`, and records an exact completed assistant answer only on `stopReason: "stop"` when no extension custom message intervened after delivery.

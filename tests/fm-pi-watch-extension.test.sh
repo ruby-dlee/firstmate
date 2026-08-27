@@ -548,6 +548,57 @@ if (afterAutomationDrain?.messages?.some((message) => message.customType === "fi
 }
 
 sessionManager = SessionManager.inMemory(process.env.REPO);
+const duplicate = "DUPLICATE-QUEUED-CAPTAIN-Q: preserve both obligations";
+const duplicateContent = [{ type: "text", text: duplicate }];
+await input(duplicate, "steer");
+await input(duplicate, "steer");
+await finishMessage({ role: "user", content: duplicateContent, timestamp: 1700000000420 });
+await finishMessage({ role: "user", content: duplicateContent, timestamp: 1700000000430 });
+const duplicateEvents = sessionManager.getBranch().filter(
+  (entry) => entry.type === "custom" && entry.customType === "firstmate-direct-exchange",
+);
+const duplicateSubmissions = duplicateEvents.filter(
+  (entry) => entry.data?.event === "submitted" && entry.data?.inputText === duplicate,
+);
+const duplicateDeliveries = duplicateEvents.filter(
+  (entry) => entry.data?.event === "delivered" && JSON.stringify(entry.data?.content) === JSON.stringify(duplicateContent),
+);
+if (duplicateSubmissions.length !== 2 || new Set(duplicateSubmissions.map((entry) => entry.data.exchangeId)).size !== 2) {
+  throw new Error("duplicate submissions did not retain distinct exchange identities");
+}
+if (
+  duplicateDeliveries.length !== 2 ||
+  duplicateDeliveries[0]?.data?.exchangeId !== duplicateSubmissions[0]?.data?.exchangeId ||
+  duplicateDeliveries[1]?.data?.exchangeId !== duplicateSubmissions[1]?.data?.exchangeId
+) {
+  throw new Error("duplicate exact deliveries were not associated in submission order");
+}
+const duplicateBoundaryId = sessionManager.appendCustomMessageEntry(
+  "firstmate-watcher-wake",
+  "FIRSTMATE WATCHER WAKE: compact duplicate direct inputs",
+  true,
+  { version: 1, source: "firstmate-extension", kind: "watcher-wake" },
+);
+sessionManager.appendCompaction(
+  "Lossy summary that omits both duplicate direct inputs.",
+  duplicateBoundaryId,
+  131874,
+  { fixture: "duplicate-input-boundary" },
+  true,
+);
+const duplicateResult = await handlers.get("context")(
+  { type: "context", messages: sessionManager.buildSessionContext().messages },
+  ctx,
+);
+const duplicateContinuity = duplicateResult?.messages?.find(
+  (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
+);
+const duplicateObligations = duplicateContinuity?.content.match(/OPEN_REPLY_OBLIGATION/g) ?? [];
+if (duplicateObligations.length !== 2) {
+  throw new Error(`compaction did not preserve two duplicate reply obligations: ${duplicateContinuity?.content}`);
+}
+
+sessionManager = SessionManager.inMemory(process.env.REPO);
 pendingMessages = false;
 const imageQueued = "QUEUED-CAPTAIN-IMAGE-Q-9: identify the attached harbor signal";
 const image = { type: "image", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", mimeType: "image/png" };

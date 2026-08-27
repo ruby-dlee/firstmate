@@ -347,13 +347,14 @@ export default function (pi: ExtensionAPI) {
 
   function matchingProvisional(content: unknown): { exchangeId: string; delivery: "immediate" | "steer" | "followUp" } | undefined {
     const expected = JSON.stringify(content);
-    return provisionalExchangeIds
+    const matches = provisionalExchangeIds
       .filter((exchangeId) => !admittedExchangeIds.has(exchangeId))
       .map((exchangeId) => ({ exchangeId, ...provisionalExchanges.get(exchangeId)! }))
-      .find((candidate) => JSON.stringify(candidate.content) === expected);
+      .filter((candidate) => JSON.stringify(candidate.content) === expected);
+    return matches.length === 1 ? matches[0] : undefined;
   }
 
-  pi.on("input", (event, ctx) => {
+  pi.on("input", (event) => {
     if (event.source === "extension") return;
     const at = Date.now();
     const exchangeId = createHash("sha256")
@@ -374,40 +375,26 @@ export default function (pi: ExtensionAPI) {
     });
     provisionalExchangeIds.push(exchangeId);
     provisionalExchanges.set(exchangeId, { content: inputContent, delivery });
-    if (event.streamingBehavior) {
-      setTimeout(() => {
-        if (ctx.hasPendingMessages()) admitExchange(exchangeId);
-      }, 0);
-    }
   });
 
   pi.on("before_agent_start", (event) => {
     const content = cloneJson([{ type: "text", text: event.prompt }, ...(event.images ?? [])]);
-    const exchange =
-      matchingProvisional(content) ??
-      [...provisionalExchangeIds]
-        .reverse()
-        .filter((exchangeId) => !admittedExchangeIds.has(exchangeId))
-        .map((exchangeId) => ({ exchangeId, ...provisionalExchanges.get(exchangeId)! }))
-        .find((candidate) => candidate.delivery === "immediate");
+    const exchange = matchingProvisional(content);
     if (exchange?.delivery === "immediate") admitExchange(exchange.exchangeId);
   });
 
   pi.on("message_end", (event, ctx) => {
     if (event.message.role === "user") {
       const content = cloneJson(event.message.content);
-      const userText = textContent(event.message.content);
       const pending = foldDirectExchanges(ctx.sessionManager.getBranch()).filter(
         (exchange) => exchange.deliveredContent === undefined,
       );
-      const exchange =
-        pending.find(
-          (candidate) =>
-            candidate.inputContent !== undefined &&
-            JSON.stringify(candidate.inputContent) === JSON.stringify(content),
-        ) ??
-        pending.find((candidate) => candidate.inputText === userText) ??
-        pending[0];
+      const matches = pending.filter(
+        (candidate) =>
+          candidate.inputContent !== undefined &&
+          JSON.stringify(candidate.inputContent) === JSON.stringify(content),
+      );
+      const exchange = matches.length === 1 ? matches[0] : undefined;
       if (!exchange) return;
       admitExchange(exchange.exchangeId);
       appendDirectExchange({

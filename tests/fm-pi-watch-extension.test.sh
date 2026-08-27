@@ -526,7 +526,6 @@ if (continuityIndex < 0 || followupIndex < 0 || continuityIndex >= followupIndex
 
 pendingMessages = true;
 await input(queued, "steer");
-await new Promise((resolve) => setTimeout(resolve, 0));
 const whilePending = await handlers.get("context")({ type: "context", messages: rebuilt }, ctx);
 const pendingContinuity = whilePending?.messages?.find(
   (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
@@ -535,18 +534,17 @@ if (pendingContinuity?.content.includes(queued)) {
   throw new Error("pending human input bypassed Pi's queue and was injected early");
 }
 pendingMessages = false;
-const provisional = "PROVISIONAL-REJECTED-Q-8B";
-await input(provisional);
+const provisional = "PROVISIONAL-CONSUMED-Q-8B";
+pendingMessages = true;
+await input(provisional, "steer");
 const provisionalResult = await handlers.get("context")({ type: "context", messages: rebuilt }, ctx);
 if (provisionalResult?.messages?.some((message) => message.customType === "firstmate-direct-exchange-continuity" && message.content.includes(provisional))) {
-  throw new Error("unadmitted provisional input became a reply obligation");
+  throw new Error("consumed provisional input was admitted by unrelated pending automation");
 }
-const afterQueueLoss = await handlers.get("context")({ type: "context", messages: rebuilt }, ctx);
-const lossContinuity = afterQueueLoss?.messages?.find(
-  (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
-);
-if (!lossContinuity?.content.includes("SUBMITTED_NOT_DELIVERED") || !lossContinuity.content.includes(queued)) {
-  throw new Error("submitted input disappeared after Pi no longer reported it pending");
+pendingMessages = false;
+const afterAutomationDrain = await handlers.get("context")({ type: "context", messages: rebuilt }, ctx);
+if (afterAutomationDrain?.messages?.some((message) => message.customType === "firstmate-direct-exchange-continuity" && message.content.includes(provisional))) {
+  throw new Error("consumed provisional input became continuity after unrelated automation drained");
 }
 
 sessionManager = SessionManager.inMemory(process.env.REPO);
@@ -556,7 +554,6 @@ const image = { type: "image", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", mimeTyp
 const imageSubmittedContent = [{ type: "text", text: imageQueued }, image];
 pendingMessages = true;
 await input(imageQueued, "followUp", [image]);
-await new Promise((resolve) => setTimeout(resolve, 0));
 pendingMessages = false;
 const imageBoundaryId = sessionManager.appendCustomMessageEntry(
   "firstmate-watcher-wake",
@@ -575,15 +572,39 @@ const imageRebuilt = sessionManager.buildSessionContext().messages;
 if (JSON.stringify(imageRebuilt).includes(image.data)) {
   throw new Error("image-before-delivery fixture unexpectedly retained the queued image in Pi context");
 }
-const imageResult = await handlers.get("context")({ type: "context", messages: imageRebuilt }, ctx);
-const imageContinuity = imageResult?.messages?.find(
+const imageBeforeDelivery = await handlers.get("context")({ type: "context", messages: imageRebuilt }, ctx);
+if (imageBeforeDelivery?.messages?.some((message) => message.customType === "firstmate-direct-exchange-continuity" && message.content.includes(imageQueued))) {
+  throw new Error("unadmitted queued image bypassed Pi ownership before delivery");
+}
+const imageSubmissionEntry = sessionManager.getBranch().find(
+  (entry) => entry.type === "custom" && entry.customType === "firstmate-direct-exchange" && entry.data?.event === "submitted",
+);
+if (JSON.stringify(imageSubmissionEntry?.data?.inputContent) !== JSON.stringify(imageSubmittedContent)) {
+  throw new Error("provisional session contract did not preserve exact queued image content");
+}
+await finishMessage({ role: "user", content: imageSubmittedContent, timestamp: 1700000000450 });
+const deliveredBoundaryId = sessionManager.appendCustomMessageEntry(
+  "firstmate-watcher-wake",
+  "FIRSTMATE WATCHER WAKE: compaction after exact image delivery",
+  true,
+  { version: 1, source: "firstmate-extension", kind: "watcher-wake" },
+);
+sessionManager.appendCompaction(
+  "Lossy summary that omits the delivered image question.",
+  deliveredBoundaryId,
+  131874,
+  { fixture: "image-after-delivery-boundary" },
+  true,
+);
+const imageAfterDelivery = await handlers.get("context")(
+  { type: "context", messages: sessionManager.buildSessionContext().messages },
+  ctx,
+);
+const imageContinuity = imageAfterDelivery?.messages?.find(
   (message) => message.role === "custom" && message.customType === "firstmate-direct-exchange-continuity",
 );
-if (
-  !imageContinuity?.content.includes("SUBMITTED_NOT_DELIVERED") ||
-  !imageContinuity.content.includes(JSON.stringify(imageSubmittedContent))
-) {
-  throw new Error(`compaction lost exact queued image submission: ${imageContinuity?.content}`);
+if (!imageContinuity?.content.includes("OPEN_REPLY_OBLIGATION") || !imageContinuity.content.includes(JSON.stringify(imageSubmittedContent))) {
+  throw new Error(`compaction lost exact admitted image obligation: ${imageContinuity?.content}`);
 }
 
 sessionManager = SessionManager.inMemory(process.env.REPO);

@@ -24,12 +24,13 @@ They never use `sendUserMessage()` for automation, so supervision remains visibl
 
 The watcher extension observes Pi's `input` event and records `interactive` or `rpc` submissions as provisional non-context `firstmate-direct-exchange` entries before Pi queues or delivers them.
 Each provisional record carries the exact text-and-image content from that boundary, including image data and MIME type, so compaction before delivery cannot reduce an attachment to a count.
-An immediate submission becomes admitted only at `before_agent_start`, after Pi's input-handler chain, model and authentication checks, compaction preflight, and prompt assembly have succeeded.
-A steering or follow-up submission becomes admitted only after Pi reports a pending queue message, while a delivered user `message_end` also proves admission.
+An immediate submission becomes admitted only when `before_agent_start` contains an exact text-and-image match, after Pi's input-handler chain, model and authentication checks, compaction preflight, and prompt assembly have succeeded.
+A steering or follow-up submission becomes admitted only when a delivered user `message_end` contains an exact text-and-image match.
+Global queue state and unmatched later lifecycle events never admit a provisional record because they cannot identify which input Pi accepted.
 Unadmitted provisional records never become reply obligations.
 It records the exact delivered user content on `message_end`, and records an exact completed assistant answer only on `stopReason: "stop"` when no extension custom message intervened after delivery.
 These append-only records survive compaction and session resume without changing Pi's queue ordering.
-A queued submission remains owned by Pi while `ctx.hasPendingMessages()` is true, so continuity metadata never bypasses the steering or follow-up queue.
+A queued submission remains owned by Pi until exact delivery, so continuity metadata never bypasses the steering or follow-up queue.
 If Pi later reports no pending message and no delivered user message exists for an admitted submission, the context hook emits the exact submitted text-and-image JSON as `SUBMITTED_NOT_DELIVERED` instead of silently forgetting it.
 
 Before each model request, the extension compares Pi's compaction-aware message list with the full active branch.
@@ -54,9 +55,9 @@ Compaction `d4b4f008` followed at `03:29:11.300Z` with `firstKeptEntryId=85a87db
 Deterministic command: `tests/fm-pi-watch-extension.test.sh`.
 Observed output included `ok - Pi compaction continuity preserves exact human exchange across automated custom prompts`.
 The regression uses Pi 0.84.2's installed `Agent` with a controlled assistant event stream to prove a later human image steer receives its own provider turn before an older automation follow-up, then uses installed `SessionManager` to build the actual compaction-aware context after an exact human question and answer, a custom watcher prompt, an assistant supervision response, and a compaction whose first-kept entry is the watcher custom message.
-It then delivers a referring human follow-up and proves the chained context hook adds the exact prior question and answer as `ANSWERED`, adds the follow-up as `OPEN_REPLY_OBLIGATION`, keeps both records custom rather than user-authored, leaves a still-pending steering submission in Pi's queue, and emits `SUBMITTED_NOT_DELIVERED` only after that pending signal disappears without delivery.
-A compaction-before-delivery fixture observes queue admission for text plus an image, cuts at a later custom watcher entry before any user message exists, and proves continuity restores the exact submitted text, image data, and MIME type after Pi's rebuilt context has lost them.
-It also proves an unadmitted provisional input does not become continuity metadata.
+It then delivers a referring human follow-up and proves the chained context hook adds the exact prior question and answer as `ANSWERED`, adds the follow-up as `OPEN_REPLY_OBLIGATION`, keeps both records custom rather than user-authored, and leaves still-pending steering submissions under Pi's ownership.
+A compaction-before-delivery fixture records text plus an image provisionally, cuts at a later custom watcher entry before any user message exists, proves the durable session contract retains exact image data and MIME type without injecting it into context, then delivers the exact input and proves a later compaction restores it as `OPEN_REPLY_OBLIGATION`.
+It also proves a consumed steer does not become continuity metadata while unrelated automation is pending or after that automation drains.
 A separate compaction fixture cuts an unanswered direct question behind a custom watcher turn and proves the exact question returns as `OPEN_REPLY_OBLIGATION` rather than being inferred from summary prose.
 
 Live command: `FM_PI_COMPACTION_LIVE_E2E=1 FM_PI_LIVE_AUTH_DIR='/Users/dongkeun/.pi/firstmate-local' tests/fm-pi-primary-compaction-live-e2e.test.sh`.

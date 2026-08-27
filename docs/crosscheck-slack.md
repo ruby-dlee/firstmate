@@ -130,7 +130,7 @@ Admission and ledger append occur under one lock, so concurrent workers cannot o
 Null disables that bound without disabling request logging.
 
 The three environment variables remain supported for foreground operation.
-On the central macOS service, `keychain_services` provides the restart-safe fallback.
+The central macOS service requires all three `keychain_services`; environment-only credentials are supported only for foreground operation.
 Only Keychain service names appear in config or launchd state.
 Credential values never appear there.
 
@@ -222,5 +222,8 @@ The live acceptance request must come from an internal engineer other than Dongk
 Record the request thread, exact admitted and returned SHA, provenance task, reviewer lane, Slack task ID, durable artifact, meter row, dedupe result, and service status in the R10 evidence directory.
 Never copy credential values into that evidence.
 
-The launch agent persists the resolved absolute Python interpreter and executable PATH, and start preflight uses those persisted runtime settings.
+The launch agent persists the resolved absolute Python interpreter, executable PATH, HOME, and service configuration.
+Install and start execute selftest and credential preflight with exactly the emitted environment and require Keychain access, ignoring inherited token variables.
+Installation refuses before replacing an existing plist if validation fails.
+The listener also requires Keychain credentials on every launch, including launchd restarts.
 Reinstall the launch agent after moving the interpreter or changing tool locations.

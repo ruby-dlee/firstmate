@@ -2255,6 +2255,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     run = subparsers.add_parser("run", help="start the Socket Mode listener")
     run.add_argument("--config", default="", help="config path (default: $FM_HOME/config/crosscheck-slack.json)")
+    run.add_argument("--keychain-only", action="store_true", help="require service-accessible Keychain credentials; ignore token environment")
     check = subparsers.add_parser("selftest", help="validate config shape and exit")
     check.add_argument("config", nargs="?", default="", help="config path override")
     preflight = subparsers.add_parser(
@@ -2262,6 +2263,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="validate config, provenance key, and central credentials",
     )
     preflight.add_argument("--config", default="", help="config path override")
+    preflight.add_argument("--keychain-only", action="store_true", help="require service-accessible Keychain credentials; ignore token environment")
     attest = subparsers.add_parser(
         "attest-task",
         help="sign exact-head authorship from a Firstmate task record",
@@ -2277,6 +2279,15 @@ def main() -> int:
     assert_supported_interpreter()
     args = build_parser().parse_args()
     try:
+        if getattr(args, "keychain_only", False):
+            path = Path(args.config) if args.config else default_config_path()
+            config = load_config(path)
+            require(
+                set(config.keychain_services) == {"app_token", "bot_token", "github_token"},
+                "service requires Keychain services for all three credentials",
+            )
+            for name in (config.app_token_env, config.bot_token_env, config.github_token_env):
+                os.environ.pop(name, None)
         if args.command == "attest-task":
             path = Path(args.config) if args.config else default_config_path()
             config = load_config(path)

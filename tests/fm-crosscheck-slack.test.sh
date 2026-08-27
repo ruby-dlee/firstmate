@@ -1059,39 +1059,110 @@ test_four_workers_and_concurrent_cap_are_binding() {
 }
 
 test_service_install_contains_no_credentials() {
-  service_home="$TMP_ROOT/service-home"
-  mkdir -p "$service_home"
-  output=$(perl -e 'alarm 60; exec @ARGV' -- \
-    env HOME="$service_home" FM_HOME="$HOMEDIR" \
-      FM_CROSSCHECK_SLACK_CONFIG="$CONFIG_MAIN" \
-      "$SERVICE_SH" install 2>&1) \
-    || fail "service install failed: $output"
-  plist="$service_home/Library/LaunchAgents/com.firstmate.crosscheck-slack.plist"
-  assert_present "$plist" "service install did not create the launch agent"
-  assert_contains "$output" "listener remains stopped" \
-    "service install did not keep an uncredentialed listener stopped"
-  for secret in "$APP_TOKEN" "$BOT_TOKEN" "$GH_TOKEN_VALUE"; do
-    assert_no_grep "$secret" "$plist" "launch agent contained a credential value"
-  done
-  output=$("$PYTHON" - "$plist" <<'PYTEST'
+  output=$("$PYTHON" - "$TMP_ROOT" "$ROOT" "$HOMEDIR" "$CONFIG_MAIN" "$SERVICE_SH" <<'PYTEST'
+import json
 import os
+from pathlib import Path
 import plistlib
 import subprocess
 import sys
-with open(sys.argv[1], "rb") as handle:
-    agent = plistlib.load(handle)
-env = agent["EnvironmentVariables"]
-assert os.path.isabs(env["FM_CROSSCHECK_PYTHON"])
-assert env["PATH"]
-assert set(env) == {"FM_HOME", "FM_CROSSCHECK_SLACK_CONFIG", "FM_CROSSCHECK_PYTHON", "PATH"}
-env["FM_GATE_REFUSE_BYPASS"] = "1"
-command = agent["ProgramArguments"]
-result = subprocess.run([command[0], "--selftest", command[3]], env=env, capture_output=True, text=True, timeout=30)
-assert result.returncode == 0, result.stderr
-assert "schema: valid" in result.stdout, result.stdout
+
+root, repo, fm_home, original_config, service = map(Path, sys.argv[1:])
+home = root / "service-home"
+fixture = root / "service-fixture"
+bin_dir = fixture / "bin"
+bin_dir.mkdir(parents=True)
+home.mkdir()
+config_path = fixture / "config.json"
+config = json.loads(original_config.read_text())
+config["keychain_services"] = dict(app_token="fixture-app", bot_token="fixture-bot", github_token="fixture-github")
+config_path.write_text(json.dumps(config))
+ready = fixture / "keychain-ready"
+launch_log = fixture / "launch.log"
+wrapper = bin_dir / "fm-crosscheck-slack.sh"
+wrapper.write_text(f"#!{sys.executable}\n" + f"""
+import importlib.util
+import os
+from pathlib import Path
+import subprocess
+import sys
+spec = importlib.util.spec_from_file_location('slack_service_fixture', {str(repo / 'bin/fm-crosscheck-slack.py')!r})
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+real_run = subprocess.run
+real_is_file = Path.is_file
+def is_file(path):
+    return True if str(path) == '/usr/bin/security' else real_is_file(path)
+def run(command, **kwargs):
+    if command[0] == '/usr/bin/security':
+        assert not any(os.environ.get(name) for name in {tuple(config[k] for k in ('app_token_env', 'bot_token_env', 'github_token_env'))!r})
+        if not Path({str(ready)!r}).exists():
+            return subprocess.CompletedProcess(command, 1, b'')
+        return subprocess.CompletedProcess(command, 0, b'fixture-keychain-secret')
+    return real_run(command, **kwargs)
+subprocess.run = run
+Path.is_file = is_file
+if sys.argv[1] == '--selftest':
+    sys.argv[1] = 'selftest'
+sys.exit(mod.main())
+""")
+wrapper.chmod(0o755)
+launchctl = bin_dir / "launchctl"
+launchctl.write_text(f"#!{sys.executable}\n" + f"""
+from pathlib import Path
+import sys
+with Path({str(launch_log)!r}).open('a') as handle:
+    handle.write(' '.join(sys.argv[1:]) + '\\n')
+sys.exit(1 if sys.argv[1] == 'print' else 0)
+""")
+launchctl.chmod(0o755)
+environment = dict(os.environ, HOME=str(home), FM_HOME=str(fm_home), FM_ROOT_OVERRIDE=str(fixture), FM_CROSSCHECK_SLACK_CONFIG=str(config_path), FM_CROSSCHECK_PYTHON=sys.executable, PATH=str(bin_dir) + os.pathsep + os.environ['PATH'])
+for name in ('app_token_env', 'bot_token_env', 'github_token_env'):
+    environment[config[name]] = 'fixture-inherited-secret'
+plist = home / 'Library/LaunchAgents/com.firstmate.crosscheck-slack.plist'
+def invoke(operation):
+    result = subprocess.run([str(service), operation], env=environment, capture_output=True, text=True, timeout=60)
+    assert 'fixture-inherited-secret' not in result.stdout + result.stderr
+    assert 'fixture-keychain-secret' not in result.stdout + result.stderr
+    return result
+result = invoke('install')
+assert result.returncode != 0, 'install accepted shell credentials with unavailable Keychain'
+assert not plist.exists()
+assert not launch_log.exists()
+ready.touch()
+result = invoke('install')
+assert result.returncode == 0, result.stdout + result.stderr
+assert not launch_log.exists(), 'install started listener'
+agent = plistlib.loads(plist.read_bytes())
+assert set(agent['EnvironmentVariables']) == {'HOME', 'FM_HOME', 'FM_CROSSCHECK_SLACK_CONFIG', 'FM_CROSSCHECK_PYTHON', 'PATH'}
+assert '--keychain-only' in agent['ProgramArguments']
+assert 'fixture-inherited-secret' not in plist.read_text()
+assert 'fixture-keychain-secret' not in plist.read_text()
+command = agent['ProgramArguments']
+result = subprocess.run([command[0], 'preflight', *command[2:]], env=agent['EnvironmentVariables'], capture_output=True, text=True, timeout=30)
+assert result.returncode == 0, result.stdout + result.stderr
+result = invoke('start')
+assert result.returncode == 0, result.stdout + result.stderr
+assert 'bootstrap' in launch_log.read_text()
+launch_log.unlink()
+ready.unlink()
+result = invoke('start')
+assert result.returncode != 0, 'start accepted unavailable Keychain'
+assert not launch_log.exists(), 'failed validation mutated service state'
+previous = plist.read_bytes()
+result = invoke('install')
+assert result.returncode != 0
+assert plist.read_bytes() == previous, 'failed reinstall replaced plist'
+ready.touch()
+del config['keychain_services']
+config_path.write_text(json.dumps(config))
+result = invoke('install')
+assert result.returncode != 0, 'service accepted environment-only configuration'
+assert plist.read_bytes() == previous
 PYTEST
-  ) || fail "launch-agent environment cannot run wrapper: $output"
-  pass "central service installation stores no credentials and stays stopped until preflight"
+  ) || fail "launch-agent credential contract failed: $output"
+  pass "service validates emitted environment and refuses unavailable Keychain without mutating launch state"
 }
 
 test_tool_failure_is_reported_honestly() {
@@ -1168,6 +1239,7 @@ UNITS=(
 )
 
 case "${FM_SLACK_TEST_GROUP:-all}" in
+  service-repair) UNITS=(test_service_install_contains_no_credentials) ;;
   repair) UNITS=(test_agent_account_is_required test_redelivery_revalidates_head test_service_install_contains_no_credentials) ;;
   compatibility) UNITS=(test_attestation_cli_derives_and_signs_author_identity test_completed_review_names_lane_head_task_and_artifact test_undelivered_verdict_is_reposted_on_redelivery test_head_change_invalidates_the_verdict test_four_workers_and_concurrent_cap_are_binding) ;;
   all) ;;

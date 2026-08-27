@@ -3,9 +3,6 @@
 #
 # Usage: fm-crosscheck-slack-service.sh install|start|stop|restart|status|uninstall
 #
-# The launch agent stores only executable paths, FM_HOME, and the config path.
-# Slack and GitHub credentials stay in the environment or the macOS Keychain
-# services named by config/crosscheck-slack.json.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,7 +37,9 @@ write_plist() {
   plutil -insert ProgramArguments.1 -string run "$temporary"
   plutil -insert ProgramArguments.2 -string --config "$temporary"
   plutil -insert ProgramArguments.3 -string "$CONFIG" "$temporary"
+  plutil -insert ProgramArguments.4 -string --keychain-only "$temporary"
   plutil -insert EnvironmentVariables -dictionary "$temporary"
+  plutil -insert EnvironmentVariables.HOME -string "$HOME" "$temporary"
   plutil -insert EnvironmentVariables.PATH -string "$PATH" "$temporary"
   plutil -insert EnvironmentVariables.FM_CROSSCHECK_PYTHON -string "$interpreter" "$temporary"
   plutil -insert EnvironmentVariables.FM_HOME -string "$FM_HOME" "$temporary"
@@ -52,8 +51,30 @@ write_plist() {
   plutil -insert StandardOutPath -string "$STDOUT_LOG" "$temporary"
   plutil -insert StandardErrorPath -string "$STDERR_LOG" "$temporary"
   chmod 600 "$temporary"
+  validate_plist "$temporary"
   mv "$temporary" "$PLIST"
   trap - EXIT
+}
+
+validate_plist() {
+  . "$SCRIPT_DIR/fm-crosscheck-python-lib.sh"
+  validator_python=$(fm_crosscheck_resolve_python)
+  "$validator_python" - "$1" <<'PY'
+import plistlib
+import subprocess
+import sys
+
+with open(sys.argv[1], "rb") as handle:
+    agent = plistlib.load(handle)
+command = agent["ProgramArguments"]
+if "--keychain-only" not in command:
+    raise SystemExit("error: reinstall the service to require Keychain credentials")
+environment = agent["EnvironmentVariables"]
+for arguments in ([command[0], "--selftest", command[3]], [command[0], "preflight", *command[2:]]):
+    result = subprocess.run(arguments, env=environment, timeout=60, check=False)
+    if result.returncode:
+        raise SystemExit(result.returncode)
+PY
 }
 
 loaded() {
@@ -72,7 +93,6 @@ case "${1:-}" in
       echo "error: Crosscheck Slack wrapper is not executable at $WRAPPER" >&2
       exit 1
     }
-    "$WRAPPER" --selftest "$CONFIG"
     write_plist
     echo "installed: $PLIST"
     echo "listener remains stopped until '$0 start' passes credential preflight"
@@ -82,10 +102,7 @@ case "${1:-}" in
       echo "error: service is not installed at $PLIST" >&2
       exit 1
     }
-    runtime_python=$(plutil -extract EnvironmentVariables.FM_CROSSCHECK_PYTHON raw -o - "$PLIST")
-    runtime_path=$(plutil -extract EnvironmentVariables.PATH raw -o - "$PLIST")
-    FM_CROSSCHECK_PYTHON="$runtime_python" PATH="$runtime_path" \
-      "$WRAPPER" preflight --config "$CONFIG"
+    validate_plist "$PLIST"
     stop_service
     launchctl bootstrap "$DOMAIN" "$PLIST"
     launchctl enable "$DOMAIN/$LABEL"

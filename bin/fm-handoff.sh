@@ -8,7 +8,9 @@
 # it defaults to data/<task-id>/handoff.md. The command preserves the human-written
 # artifact, replaces its one machine-owned live-custody block, atomically installs
 # the refreshed generation, performs a final live recheck, and only then prints the
-# complete artifact to stdout. That stdout is the presentation boundary: callers
+# complete artifact from this invocation's privately retained, validated generation
+# to stdout, without reopening the shared artifact path. That stdout is the
+# presentation boundary: callers
 # must present the command's output, never a previously read artifact generation.
 #
 # The concrete enemy is concurrent mutation of unpublished pipeline work, which can
@@ -20,9 +22,22 @@
 # repository, and unpublished-commit facts cause a refresh. Re-running the same
 # command is the recovery path after any refusal or unstable observation.
 #
+# Pipeline discovery is independent of configured delivery mode. An inactive
+# status result is reconciled with the newest same-branch run before granting
+# mutation; unavailable or truncated ownership evidence remains unknown.
+#
+# Automated --continue-account delivery in fm-spawn.sh invokes this boundary
+# immediately before launching the provider, ahead of historical packet context.
+# Only that launch path may supply FM_HANDOFF_SUCCESSOR_BACKEND=herdr and
+# FM_HANDOFF_SUCCESSOR_TARGET after verifying the exact replacement endpoint.
+# A present matching endpoint is the recipient, not a competing worker owner;
+# a distinct endpoint or live pipeline is never excluded. These variables are
+# launch-scoped, not operator overrides for ordinary handoff presentation.
+#
 # The live block is the single owner of the mutation split:
-#   may mutate now = yes only when repository identity is exact and every worker
-#                    and pipeline liveness source proves no active owner.
+#   may mutate now = yes only when repository identity is exact and every
+#                    non-excluded worker and pipeline liveness source proves
+#                    no active owner.
 #   supervise only = yes for any active or unknown owner. Inspection, monitoring,
 #                    steering, and the owning pipeline's response flow remain
 #                    allowed; direct edit/commit/reset/rebase actions do not.

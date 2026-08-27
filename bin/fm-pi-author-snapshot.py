@@ -91,7 +91,7 @@ def copy_file(
     name: str,
     source_path: Path,
     expected: os.stat_result,
-) -> int:
+) -> Tuple[int, Fingerprint]:
     if expected.st_size > MAX_FILE_BYTES:
         raise SnapshotError(f"source file exceeds the per-file bound: {source_path}")
     source_descriptor = os.open(
@@ -128,7 +128,7 @@ def copy_file(
         if fingerprint(final) != initial:
             raise SnapshotError(f"source file changed during snapshot: {source_path}")
         os.fsync(destination_descriptor)
-        return copied
+        return copied, fingerprint(os.fstat(destination_descriptor))
     finally:
         os.close(source_descriptor)
         if destination_descriptor >= 0:
@@ -142,12 +142,11 @@ def resolve_link(
     if link.target is None or os.path.isabs(link.target):
         raise SnapshotError(f"Pi source contains an unsafe symlink: {'/'.join(link_path)}")
 
-    remaining = link.target.split("/")
+    remaining = [(part, frozenset({link_path})) for part in link.target.split("/")]
     resolved = list(link_path[:-1])
     dependencies: Set[RelativePath] = set()
-    visited: Set[RelativePath] = set()
     while remaining:
-        component = remaining.pop(0)
+        component, active = remaining.pop(0)
         if component in ("", "."):
             continue
         if component == "..":
@@ -166,17 +165,18 @@ def resolve_link(
             )
         dependencies.add(candidate)
         if node.kind == "symlink":
-            if candidate in visited:
+            if candidate in active:
                 raise SnapshotError(
                     f"Pi source contains a symlink loop: {'/'.join(link_path)}"
                 )
-            visited.add(candidate)
             if node.target is None or os.path.isabs(node.target):
                 raise SnapshotError(
                     f"Pi source contains an unsafe symlink: {'/'.join(candidate)}"
                 )
             resolved = list(candidate[:-1])
-            remaining = node.target.split("/") + remaining
+            remaining = [
+                (part, active | {candidate}) for part in node.target.split("/")
+            ] + remaining
             continue
         if node.kind == "directory":
             resolved.append(component)
@@ -238,12 +238,13 @@ def verify_source_node(
     source_root: Path,
     relative: RelativePath,
     manifest: Dict[RelativePath, Node],
-) -> None:
+) -> os.stat_result:
     expected = manifest[relative]
     if not relative:
-        if fingerprint(os.fstat(root_descriptor)) != expected.fingerprint:
+        metadata = os.fstat(root_descriptor)
+        if fingerprint(metadata) != expected.fingerprint:
             raise SnapshotError(f"source directory changed during snapshot: {source_root}")
-        return
+        return metadata
 
     descriptor = os.dup(root_descriptor)
     try:
@@ -272,6 +273,7 @@ def verify_source_node(
             raise SnapshotError(
                 f"source symlink changed during snapshot: {shown(source_root, relative)}"
             )
+        return metadata
     finally:
         os.close(descriptor)
 
@@ -280,26 +282,12 @@ def verify_destination_node(
     root_descriptor: int,
     destination_root: Path,
     relative: RelativePath,
-    expected: Node,
+    manifest: Dict[RelativePath, Node],
 ) -> None:
-    if not relative:
-        metadata = os.fstat(root_descriptor)
-    else:
-        descriptor = os.dup(root_descriptor)
-        try:
-            for component in relative[:-1]:
-                child = os.open(component, DIRECTORY_FLAGS, dir_fd=descriptor)
-                os.close(descriptor)
-                descriptor = child
-            metadata = os.stat(relative[-1], dir_fd=descriptor, follow_symlinks=False)
-            if expected.kind == "symlink" and os.readlink(
-                relative[-1], dir_fd=descriptor
-            ) != expected.target:
-                raise SnapshotError(
-                    f"destination symlink changed during snapshot: {shown(destination_root, relative)}"
-                )
-        finally:
-            os.close(descriptor)
+    metadata = verify_source_node(
+        root_descriptor, destination_root, relative, manifest
+    )
+    expected = manifest[relative]
     if kind(metadata) != expected.kind:
         raise SnapshotError(
             f"destination entry changed during snapshot: {shown(destination_root, relative)}"
@@ -322,57 +310,37 @@ def verify_link_graphs(
     source_root: Path,
     destination_root: Path,
     manifest: Dict[RelativePath, Node],
+    destination_manifest: Dict[RelativePath, Node],
 ) -> None:
     resolutions: Dict[RelativePath, RelativePath] = {}
-    dependencies: Set[RelativePath] = {()}
     for path, node in manifest.items():
         if node.kind != "symlink":
             continue
-        final_path, used = resolve_link(path, manifest)
+        final_path, _ = resolve_link(path, manifest)
         resolutions[path] = final_path
-        dependencies.add(path)
-        dependencies.add(final_path)
-        dependencies.update(used)
 
     reject_directory_cycles(manifest, resolutions)
-    for path in sorted(dependencies, key=lambda value: (len(value), value)):
-        verify_source_node(source_descriptor, source_root, path, manifest)
-        verify_destination_node(
-            destination_descriptor, destination_root, path, manifest[path]
-        )
-
-    for link_path, target_path in resolutions.items():
-        link_value = "/".join(link_path)
-        source_target = os.stat(
-            link_value, dir_fd=source_descriptor, follow_symlinks=True
-        )
-        expected_target = manifest[target_path]
-        if (
-            kind(source_target) != expected_target.kind
-            or source_target.st_dev != expected_target.fingerprint[0]
-            or source_target.st_ino != expected_target.fingerprint[1]
+    for path, target in resolutions.items():
+        destination_target, _ = resolve_link(path, destination_manifest)
+        if destination_target != target:
+            raise SnapshotError("destination symlink graph changed during snapshot")
+    for _ in range(2):
+        for root, graph in (
+            (source_root, manifest), (destination_root, destination_manifest)
         ):
-            raise SnapshotError(
-                f"source symlink target changed during snapshot: {shown(source_root, link_path)}"
+            if fingerprint(os.stat(root, follow_symlinks=False)) != graph[()].fingerprint:
+                raise SnapshotError(f"snapshot root changed during capture: {root}")
+        for path in sorted(manifest, key=lambda value: (len(value), value)):
+            verify_source_node(source_descriptor, source_root, path, manifest)
+            verify_destination_node(
+                destination_descriptor, destination_root, path, destination_manifest
             )
-        destination_target = os.stat(
-            link_value, dir_fd=destination_descriptor, follow_symlinks=True
-        )
-        if kind(destination_target) != expected_target.kind:
-            raise SnapshotError(
-                f"destination symlink target changed during snapshot: {shown(destination_root, link_path)}"
-            )
-
-    # The followed lookups above are bounded to a graph already proved inside
-    # each root. Recheck every source dependency afterwards so a rename during
-    # either lookup cannot turn a successful validation into a raced capture.
-    for path in sorted(dependencies, key=lambda value: (len(value), value)):
-        verify_source_node(source_descriptor, source_root, path, manifest)
 
 
 def copy_tree(source: Path, destination: Path) -> None:
     counters = {"files": 0, "bytes": 0}
     manifest: Dict[RelativePath, Node] = {}
+    destination_manifest: Dict[RelativePath, Node] = {}
 
     source_metadata = os.stat(source, follow_symlinks=False)
     if not stat.S_ISDIR(source_metadata.st_mode):
@@ -429,6 +397,10 @@ def copy_tree(source: Path, destination: Path) -> None:
                         )
                         os.fchmod(destination_child, 0o700)
                         visit(source_child, destination_child, relative, depth + 1)
+                        destination_final = os.fstat(destination_child)
+                        destination_manifest[relative] = Node(
+                            "directory", fingerprint(destination_final), None
+                        )
                         if fingerprint(os.fstat(source_child)) != node.fingerprint:
                             raise SnapshotError(
                                 f"source directory changed during snapshot: {source_path}"
@@ -441,12 +413,16 @@ def copy_tree(source: Path, destination: Path) -> None:
                     consume_entry()
                     node = Node("file", fingerprint(entry_metadata), None)
                     manifest[relative] = node
-                    counters["bytes"] += copy_file(
+                    copied, destination_fingerprint = copy_file(
                         source_directory,
                         destination_directory,
                         name,
                         source_path,
                         entry_metadata,
+                    )
+                    counters["bytes"] += copied
+                    destination_manifest[relative] = Node(
+                        "file", destination_fingerprint, None
                     )
                     if counters["bytes"] > MAX_TOTAL_BYTES:
                         raise SnapshotError("Pi source exceeds the total-size bound")
@@ -470,6 +446,9 @@ def copy_tree(source: Path, destination: Path) -> None:
                     destination_link = os.stat(
                         name, dir_fd=destination_directory, follow_symlinks=False
                     )
+                    destination_manifest[relative] = Node(
+                        "symlink", fingerprint(destination_link), target
+                    )
                     if not stat.S_ISLNK(destination_link.st_mode) or os.readlink(
                         name, dir_fd=destination_directory
                     ) != target:
@@ -482,13 +461,6 @@ def copy_tree(source: Path, destination: Path) -> None:
                     )
 
         visit(source_descriptor, destination_descriptor, (), 0)
-        verify_link_graphs(
-            source_descriptor,
-            destination_descriptor,
-            source,
-            destination,
-            manifest,
-        )
         os.mkdir("sessions", 0o700, dir_fd=destination_descriptor)
         sessions_descriptor = os.open(
             "sessions", DIRECTORY_FLAGS, dir_fd=destination_descriptor
@@ -497,6 +469,17 @@ def copy_tree(source: Path, destination: Path) -> None:
             os.fchmod(sessions_descriptor, 0o700)
         finally:
             os.close(sessions_descriptor)
+        destination_manifest[()] = Node(
+            "directory", fingerprint(os.fstat(destination_descriptor)), None
+        )
+        verify_link_graphs(
+            source_descriptor,
+            destination_descriptor,
+            source,
+            destination,
+            manifest,
+            destination_manifest,
+        )
     finally:
         os.close(source_descriptor)
         if destination_descriptor >= 0:

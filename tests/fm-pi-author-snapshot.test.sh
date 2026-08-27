@@ -222,9 +222,78 @@ PY
   pass "a symlink target replaced during capture is refused"
 }
 
+test_finite_repeated_link_traversal() {
+  local source="$TMP_ROOT/repeated-source" destination="$TMP_ROOT/repeated-destination"
+  mkdir -p "$source/real"
+  printf 'captured\n' > "$source/real/file"
+  ln -s real "$source/alias"
+  ln -s alias/../alias/file "$source/shim"
+  "$SNAPSHOT" "$source" "$destination" >/dev/null 2>&1 \
+    || fail "finite repeated traversal was refused"
+  [ "$(readlink "$destination/shim")" = alias/../alias/file ] \
+    || fail "finite repeated traversal was not preserved"
+  [ "$(cat "$destination/shim")" = captured ] \
+    || fail "finite repeated traversal resolved incorrectly"
+  pass "finite repeated traversal of an in-root link succeeds"
+}
+
+test_destination_mutation_race_is_refused() {
+  local source="$TMP_ROOT/destination-race-source" destination="$TMP_ROOT/destination-race-output"
+  mkdir -p "$source"
+  printf 'captured\n' > "$source/target"
+  ln -s target "$source/shim"
+  printf 'outside\n' > "$TMP_ROOT/destination-race-outside"
+  python3 - "$SNAPSHOT" "$source" "$destination" "$TMP_ROOT/destination-race-outside" <<'PYTHON' \
+    || fail "destination mutation was accepted or not cleaned"
+import contextlib
+import importlib.util
+import io
+import os
+from pathlib import Path
+import sys
+
+module_path, source_value, destination_value, outside_value = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("fm_pi_author_snapshot", module_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+real_readlink = os.readlink
+reads = 0
+mutated = False
+
+
+def racing_readlink(path, *args, **kwargs):
+    global reads, mutated
+    result = real_readlink(path, *args, **kwargs)
+    descriptor = kwargs.get("dir_fd")
+    if path == "shim" and descriptor is not None:
+        actual = os.fstat(descriptor)
+        destination = os.stat(destination_value, follow_symlinks=False)
+        if (actual.st_dev, actual.st_ino) == (destination.st_dev, destination.st_ino):
+            reads += 1
+            if reads == 2:
+                os.unlink("shim", dir_fd=descriptor)
+                os.symlink(outside_value, "shim", dir_fd=descriptor)
+                mutated = True
+    return result
+
+
+module.os.readlink = racing_readlink
+module.sys.argv = [module_path, source_value, destination_value]
+with contextlib.redirect_stderr(io.StringIO()):
+    status = module.main()
+assert mutated
+assert status == 1
+assert not Path(destination_value).exists()
+assert Path(outside_value).read_text() == "outside\n"
+PYTHON
+  pass "destination link replacement during validation is refused and cleaned"
+}
+
 test_safe_relative_links_are_preserved
 test_unsafe_links_are_refused
 test_links_consume_the_file_count_budget
 test_target_mutation_race_is_refused
+test_destination_mutation_race_is_refused
+test_finite_repeated_link_traversal
 
 echo "# all fm-pi-author-snapshot tests passed"

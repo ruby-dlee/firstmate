@@ -237,6 +237,79 @@ test_finite_repeated_link_traversal() {
   pass "finite repeated traversal of an in-root link succeeds"
 }
 
+test_symlink_resolution_bound() {
+  local source destination index previous current
+
+  source="$TMP_ROOT/resolution-limit-source"
+  destination="$TMP_ROOT/resolution-limit-destination"
+  mkdir -p "$source"
+  printf 'captured\n' > "$source/target"
+  ln -s target "$source/link-00"
+  previous=link-00
+  index=1
+  while [ "$index" -lt 32 ]; do
+    current=$(printf 'link-%02d' "$index")
+    ln -s "$previous" "$source/$current"
+    previous=$current
+    index=$((index + 1))
+  done
+  "$SNAPSHOT" "$source" "$destination" >/dev/null 2>&1 \
+    || fail "a portable 32-dereference chain was refused"
+  [ "$(cat "$destination/link-31")" = captured ] \
+    || fail "a portable 32-dereference chain did not resolve"
+
+  source="$TMP_ROOT/over-limit-source"
+  destination="$TMP_ROOT/over-limit-destination"
+  mkdir -p "$source"
+  printf 'captured\n' > "$source/target"
+  ln -s target "$source/link-00"
+  previous=link-00
+  index=1
+  while [ "$index" -lt 33 ]; do
+    current=$(printf 'link-%02d' "$index")
+    ln -s "$previous" "$source/$current"
+    previous=$current
+    index=$((index + 1))
+  done
+  assert_refused_and_cleaned \
+    "$source" "$destination" "over-limit symlink resolution"
+
+  source="$TMP_ROOT/expanding-source"
+  destination="$TMP_ROOT/expanding-destination"
+  mkdir -p "$source/real"
+  printf 'captured\n' > "$source/real/file"
+  ln -s real "$source/l0"
+  previous=l0
+  index=1
+  while [ "$index" -le 30 ]; do
+    current="l$index"
+    ln -s "$previous/../$previous" "$source/$current"
+    previous=$current
+    index=$((index + 1))
+  done
+  python3 - "$SNAPSHOT" "$source" "$destination" <<'PYTHON' \
+    || fail "expanding link graph did not fail quickly and cleanly"
+from pathlib import Path
+import subprocess
+import sys
+
+snapshot, source, destination = sys.argv[1:]
+try:
+    result = subprocess.run(
+        [snapshot, source, destination],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+        check=False,
+    )
+except subprocess.TimeoutExpired as exc:
+    raise AssertionError("expanding link graph exceeded the resolution deadline") from exc
+assert result.returncode != 0
+assert not Path(destination).exists()
+PYTHON
+  pass "symlink resolution is portable and hostile expansion is bounded"
+}
+
 test_destination_mutation_race_is_refused() {
   local source="$TMP_ROOT/destination-race-source" destination="$TMP_ROOT/destination-race-output"
   mkdir -p "$source"
@@ -295,5 +368,6 @@ test_links_consume_the_file_count_budget
 test_target_mutation_race_is_refused
 test_destination_mutation_race_is_refused
 test_finite_repeated_link_traversal
+test_symlink_resolution_bound
 
 echo "# all fm-pi-author-snapshot tests passed"

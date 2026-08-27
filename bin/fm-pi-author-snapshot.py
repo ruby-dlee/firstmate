@@ -26,6 +26,11 @@ from typing import Dict, NamedTuple, Optional, Set, Tuple
 MAX_FILES = 20_000
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_FILE_BYTES = 16 * 1024 * 1024
+# Darwin permits at most 32 symlink dereferences while resolving one path;
+# Linux permits 40. Keeping snapshots within the lower supported-host limit
+# prevents both unusable link chains and expansion work that can grow
+# exponentially while still preserving normal package-manager shims.
+MAX_SYMLINK_DEREFERENCES = 32
 
 DIRECTORY_FLAGS = (
     os.O_RDONLY
@@ -145,6 +150,7 @@ def resolve_link(
     remaining = [(part, frozenset({link_path})) for part in link.target.split("/")]
     resolved = list(link_path[:-1])
     dependencies: Set[RelativePath] = set()
+    dereferences = 1
     while remaining:
         component, active = remaining.pop(0)
         if component in ("", "."):
@@ -165,6 +171,12 @@ def resolve_link(
             )
         dependencies.add(candidate)
         if node.kind == "symlink":
+            dereferences += 1
+            if dereferences > MAX_SYMLINK_DEREFERENCES:
+                raise SnapshotError(
+                    "Pi source symlink exceeds the resolution bound: "
+                    f"{'/'.join(link_path)}"
+                )
             if candidate in active:
                 raise SnapshotError(
                     f"Pi source contains a symlink loop: {'/'.join(link_path)}"

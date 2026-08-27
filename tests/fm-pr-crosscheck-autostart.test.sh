@@ -30,7 +30,7 @@ PY
 )
 EOF
     case "$state:$pid" in
-      starting:[1-9]*|running:[1-9]*) /bin/kill -TERM "-$pid" >/dev/null 2>&1 || true ;;
+      starting:[1-9]*|running:[1-9]*) /bin/kill -TERM -- "-$pid" >/dev/null 2>&1 || true ;;
     esac
   done < <(find "$TMP_ROOT" -name '*.crosscheck-autostart.json' -type f 2>/dev/null)
   fm_test_cleanup
@@ -356,7 +356,7 @@ test_dead_coordinator_is_visible_and_retryable() {
     || fail "dead-coordinator new-head queue failed: $out"
   assert_contains "$out" "queued new head $HEAD_TWO" \
     "dead-coordinator fixture did not queue its successor head"
-  /bin/kill -TERM "-$pid" >/dev/null 2>&1 \
+  /bin/kill -TERM -- "-$pid" >/dev/null 2>&1 \
     || fail "could not terminate the isolated coordinator fixture"
 
   sleep 0.1

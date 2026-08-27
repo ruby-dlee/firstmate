@@ -5,6 +5,8 @@
 # task-local coordinator is requested; review latency never parks the caller.
 # Matching active or CLEAR heads deduplicate, failed/dead coordinators remain
 # visible and retryable, and unrelated tasks never share a launcher lock.
+# A task-local registration lock orders head capture and publication without
+# holding the account metadata lock across the remote lookup.
 # With central Slack config installed, binds the live PR head to the signed
 # launch record created before the task agent started before requesting review.
 # Issuance failure exits nonzero after poll setup.
@@ -44,11 +46,17 @@ case "${FM_CROSSCHECK_AUTOSTART_TEST_DISABLE:-}" in
     exit 1
     ;;
 esac
-META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
+REGISTRATION_LOCK=$(fm_account_lock_acquire "$STATE" "$ID" pr-registration \
+  "PR registration" "${FM_ACCOUNT_META_LOCK_WAIT_SECONDS:-10}") || exit 1
+META_LOCK=
 release_meta_lock() {
-  fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
+  if [ -n "$META_LOCK" ]; then
+    fm_account_meta_lock_release "$META_LOCK" >/dev/null 2>&1 || true
+  fi
+  fm_account_meta_lock_release "$REGISTRATION_LOCK" >/dev/null 2>&1 || true
 }
 trap release_meta_lock EXIT
+META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
 if [ ! -f "$META" ]; then
   fm_account_meta_lock_release "$META_LOCK"
   echo "error: no task metadata for $ID" >&2
@@ -76,12 +84,17 @@ if [ -z "$LOOKUP_GENERATION" ]; then
     exit 1
   fi
 fi
+# Serialize head capture/publication only against other registrations, not
+# account-session updates or task retirement during a remote lookup.
+fm_account_meta_lock_release "$META_LOCK"
+META_LOCK=
 if ! PR_HEAD_LOOKUP=$("$FM_ROOT/bin/fm-github-pr.py" head "$URL" 2>&1); then
   PR_HEAD_DIAGNOSTIC=$(printf '%s' "$PR_HEAD_LOOKUP" | tr '\r\n' '  ')
   printf 'UNREVIEWED: PR head lookup failed: %.500s\n' "$PR_HEAD_DIAGNOSTIC" >&2
   exit 1
 fi
 PR_HEAD=$PR_HEAD_LOOKUP
+META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
 if [ -f "$META" ]; then
   CURRENT_WT=$(fm_account_meta_value "$META" worktree)
   CURRENT_GENERATION=$(fm_account_meta_value "$META" generation_id)
@@ -149,4 +162,5 @@ if [ "$CROSSCHECK_AUTOSTART_ENABLED" = 1 ]; then
   fi
 fi
 fm_account_meta_lock_release "$META_LOCK"
+fm_account_meta_lock_release "$REGISTRATION_LOCK"
 trap - EXIT

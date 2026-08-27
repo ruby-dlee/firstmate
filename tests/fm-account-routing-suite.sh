@@ -3343,7 +3343,11 @@ SH
     FM_HOME="$HOME_DIR" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
     PATH="$FAKEBIN_DIR:$PATH" bash -c "$launch" || fail "$harness delayed continuation launch failed"
   assert_grep 'run-delivery' "$delivered" "$harness delivery omitted the newly active pipeline"
+  # Match literal Markdown backticks.
+  # shellcheck disable=SC2016
   assert_grep '`may mutate now`: **no**' "$delivered" "$harness delivery granted mutation"
+  # Match literal Markdown backticks.
+  # shellcheck disable=SC2016
   assert_grep '`supervise only`: **yes**' "$delivered" "$harness delivery omitted supervised custody"
   assert_grep 'done: external side effect alpha; do not rerun' "$delivered" "$harness delivery lost captured resumability context"
   assert_not_grep 'replacement launch generation' "$delivered" "$harness delivery reread the replaced snapshot"
@@ -3381,8 +3385,12 @@ SH
     FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" PATH="$FAKEBIN_DIR:$PATH" \
     bash -c "$launch" || fail "$harness Herdr provider delivery failed"
   if [ "$owner" = none ]; then
+    # Match literal Markdown backticks.
+    # shellcheck disable=SC2016
     assert_grep '`may mutate now`: **yes**' "$delivered" "$harness successor was mistaken for predecessor"
   else
+    # Match literal Markdown backticks.
+    # shellcheck disable=SC2016
     assert_grep '`supervise only`: **yes**' "$delivered" "$harness newly active pipeline was ignored"
   fi
   assert_grep 'done: external side effect alpha; do not rerun' "$delivered" "$harness Herdr delivery lost resumability"

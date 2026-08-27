@@ -89,9 +89,7 @@ A separate deterministic capture failure was established after this incident.
 The local Pi home contains package-manager shims under `npm/node_modules/.bin`, and the snapshot helper rejected every symlink before inspecting whether it was safe.
 That refusal removed the task-private snapshot needed by retained local Pi recovery even though the package links were relative and stayed inside the Pi home.
 
-`bin/fm-pi-author-snapshot.py` now preserves a relative symlink only when its complete captured source and destination graphs resolve to copied regular files or directories inside their respective snapshot roots.
-Descriptor-relative no-follow copying and post-copy source checks reject absolute, escaping, dangling, looping, changing, excluded, and special-file targets without dereferencing a link into copied bytes.
-Links consume the file-count budget.
+The [snapshot helper header](../../bin/fm-pi-author-snapshot.py) owns the current relative-link acceptance, containment, and budget contract.
 
 `tests/fm-pi-author-snapshot.test.sh` owns the executable filesystem boundary regressions.
 The focused Pi spawn and retained-task recovery cases also carry a package-manager shim so those lifecycle paths prove that a usable task-private snapshot survives capture and reuse.

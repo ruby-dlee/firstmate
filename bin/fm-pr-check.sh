@@ -3,6 +3,8 @@
 # state/<id>.meta when available, then arms the watcher's merge poll by writing
 # state/<id>.check.sh, which prints one line when the PR is merged or its lookup
 # fails (the watcher's check contract: output = wake, silence = keep sleeping).
+# With central Slack config installed, then issues an attestation as described
+# in docs/crosscheck-slack.md; issuance failure exits nonzero after poll setup.
 # Usage: fm-pr-check.sh <task-id> <pr-url>
 set -eu
 

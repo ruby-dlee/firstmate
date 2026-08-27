@@ -14,7 +14,7 @@ FM_HOME=/Users/dongkeun/firstmate-home bin/fm-crosscheck.sh run <task-id> <full-
 ```
 
 The Slack lane is an access adapter around that command.
-It does not implement a second reviewer, queue, or evidence policy.
+It does not implement a second reviewer, lane allocator, or evidence policy.
 Do not create a Crosscheck agent skill for this lane.
 
 ## Engineer request
@@ -181,11 +181,11 @@ FM_HOME=/Users/dongkeun/firstmate-home \
   bin/fm-crosscheck-slack.sh --selftest
 ```
 
-Validate all three central credentials without printing them:
+Check that all three central credentials can be loaded without printing them (this does not authenticate against Slack or GitHub):
 
 ```sh
 FM_HOME=/Users/dongkeun/firstmate-home \
-  bin/fm-crosscheck-slack.sh preflight
+  bin/fm-crosscheck-slack.sh preflight --keychain-only
 ```
 
 Install the macOS launch agent without starting an uncredentialed listener:
@@ -207,23 +207,17 @@ FM_HOME=/Users/dongkeun/firstmate-home bin/fm-crosscheck-slack-service.sh stop
 The launch agent is `~/Library/LaunchAgents/com.firstmate.crosscheck-slack.plist`.
 Logs are `$FM_HOME/logs/crosscheck-slack.log` and `$FM_HOME/logs/crosscheck-slack.error.log`.
 The launch agent contains no credential values.
-
-## Activation and live acceptance
-
-Activation requires these coordinator inputs by name and location only:
-
-- Slack app-level Socket Mode token in environment `FM_SLACK_APP_TOKEN` or Keychain service `firstmate-crosscheck-slack-app`.
-- Slack bot token in environment `FM_SLACK_BOT_TOKEN` or Keychain service `firstmate-crosscheck-slack-bot`.
-- Read-only GitHub credential in environment `FM_GITHUB_READ_TOKEN` or Keychain service `firstmate-crosscheck-github-read`.
-- Exact approved Slack channel IDs in `$FM_HOME/config/crosscheck-slack.json`.
-- Exact approved repositories and binding daily request cap in the same config.
-
-The live acceptance request must come from an internal engineer other than Dongkeun in an approved channel.
-Record the request thread, exact admitted and returned SHA, provenance task, reviewer lane, Slack task ID, durable artifact, meter row, dedupe result, and service status in the R10 evidence directory.
-Never copy credential values into that evidence.
-
 The launch agent persists the resolved absolute Python interpreter, executable PATH, HOME, and service configuration.
 Install and start execute selftest and credential preflight with exactly the emitted environment and require Keychain access, ignoring inherited token variables.
 Installation refuses before replacing an existing plist if validation fails.
 The listener also requires Keychain credentials on every launch, including launchd restarts.
 Reinstall the launch agent after moving the interpreter or changing tool locations.
+
+## Activation and live acceptance
+
+Before activation, supply the coordinator inputs in [Central configuration](#central-configuration) and satisfy [Credentials and app permissions](#credentials-and-app-permissions).
+The launchd credential checks and lifecycle are owned by [Install, restart, and inspect](#install-restart-and-inspect).
+
+The live acceptance request must come from an internal engineer other than Dongkeun in an approved channel.
+Record the request thread, exact admitted and returned SHA, provenance task, reviewer lane, Slack task ID, durable artifact, meter row, dedupe result, and service status in the R10 evidence directory.
+Never copy credential values into that evidence.

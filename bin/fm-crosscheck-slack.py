@@ -13,14 +13,12 @@ Posture, in one place:
   this process ever takes from a mention is one pull-request URL, which is
   validated against the repository allowlist before any credentialed tool
   sees it. Nothing from Slack or from the PR is ever executed.
-- Tokens come only from environment variables named by the config file.
-  They are never stored in the config, never written to state, never placed
+- Credential sources and service startup requirements are owned by
+  docs/crosscheck-slack.md.
+  Tokens are never stored in the config, never written to state, never placed
   in a child process environment (except the GitHub read credential, whose
   entire job is to be the crosscheck subprocess's read credential), and
   every log line passes through a redactor that knows every secret value.
-- A missing token environment variable is a startup refusal that names the
-  exact variable, so the ready-to-flip posture is explicit: the owner
-  supplies tokens later and nothing else changes.
 - Authorship comes only from an HMAC-signed Firstmate/no-mistakes
   attestation bound to the exact repository, pull request, and head SHA.
   Slack text, the submitter, branch names, and caller-supplied model text

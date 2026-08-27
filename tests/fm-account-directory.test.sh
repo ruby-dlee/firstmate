@@ -902,6 +902,46 @@ test_pi_recovery_adopts_legacy_local_task_identity() {
   pass "legacy local Pi recovery reuses its author snapshot and upgrades exact worktree identity"
 }
 
+test_pi_recovery_refuses_missing_author_snapshot() {
+  local record id meta tasktmp source_home out status
+  reset_accounts
+  id=pi-missing-author-snapshot-z3
+  record=$(make_spawn_case pi-missing-author-snapshot pi "$id")
+  read_spawn_case "$record"
+  source_home="$SPAWN_HOME/pi-source"
+  mkdir -p "$source_home"
+  printf '{"fixture":"original"}\n' > "$source_home/auth.json"
+
+  PI_CODING_AGENT_DIR="$source_home" \
+    run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+      "$id" "$SPAWN_PROJECT" >/dev/null 2>&1
+  meta=$SPAWN_HOME/state/$id.meta
+  tasktmp=$(sed -n 's/^tasktmp=//p' "$meta")
+  assert_present "$tasktmp/pi-author-agent/auth.json" \
+    "initial Pi launch did not create the author snapshot fixture"
+  git -C "$SPAWN_WORKTREE" switch --quiet -c "fm/$id"
+  rm -f "$SPAWN_HOME/state/.fake-endpoint"
+  rm -rf "$tasktmp/pi-author-agent"
+  printf '{"fixture":"ambient-replacement"}\n' > "$source_home/auth.json"
+  if out=$(PI_CODING_AGENT_DIR="$source_home" \
+    run_direct_spawn "$SPAWN_HOME" "$SPAWN_WORKTREE" "$SPAWN_LAUNCH_LOG" \
+      "$id" --recover-direct-account 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -ne 0 ] || fail "Pi recovery accepted a missing task-private author snapshot"
+  assert_contains "$out" "task-private Pi author snapshot is unavailable" \
+    "Pi recovery did not identify the missing author identity boundary: $out"
+  assert_absent "$SPAWN_HOME/state/.fake-endpoint" \
+    "Pi recovery created an endpoint without its recorded author snapshot"
+  assert_absent "$tasktmp/pi-author-agent" \
+    "Pi recovery recreated the missing snapshot from ambient credentials"
+  [ ! -s "$SPAWN_LAUNCH_LOG" ] \
+    || fail "Pi recovery launched after refusing the missing author snapshot: $(cat "$SPAWN_LAUNCH_LOG")"
+  pass "legacy local Pi recovery fails closed without its task-private author snapshot"
+}
+
 test_direct_recovery_early_refusal_has_bounded_abort_cleanup() {
   local record id meta out status
   reset_accounts
@@ -1505,6 +1545,7 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = pi-direct-recovery ]; then
   test_pi_recovery_adopts_legacy_local_task_identity
+  test_pi_recovery_refuses_missing_author_snapshot
   test_direct_recovery_early_refusal_has_bounded_abort_cleanup
   exit 0
 fi
@@ -1536,6 +1577,7 @@ test_spawn_uses_direct_claude_fallback_and_hook
 test_claude_spawn_rejects_mismatched_explicit_model
 test_direct_claude_recovery_resolves_legacy_default_to_anchor
 test_pi_recovery_adopts_legacy_local_task_identity
+test_pi_recovery_refuses_missing_author_snapshot
 test_direct_recovery_early_refusal_has_bounded_abort_cleanup
 test_observe_spawn_uses_direct_directory_without_agent_fleet
 test_direct_spawn_and_recovery_support_detached_worktree

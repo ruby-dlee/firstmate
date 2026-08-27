@@ -3938,9 +3938,11 @@ persist_worktree_acquisition_phases || {
 if [ "$HARNESS" = pi ] && [ "$RAW_LAUNCH" != 1 ] && [ "$SPAWN_CLOUD" != azure ]; then
   PI_AUTHOR_SOURCE_HOME=${DIRECT_ACCOUNT_HOME:-${RECORDED_ACCOUNT_HOME:-${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}}}
   PI_AUTHOR_ACCOUNT_HOME="$TASK_TMP/pi-author-agent"
-  if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ] \
-    && [ -d "$PI_AUTHOR_ACCOUNT_HOME" ] && [ ! -L "$PI_AUTHOR_ACCOUNT_HOME" ]; then
-    :
+  if [ "$DIRECT_ACCOUNT_RECOVERY" = 1 ]; then
+    if [ ! -d "$PI_AUTHOR_ACCOUNT_HOME" ] || [ -L "$PI_AUTHOR_ACCOUNT_HOME" ]; then
+      echo "error: task-private Pi author snapshot is unavailable for $ID" >&2
+      exit 1
+    fi
   elif "$SCRIPT_DIR/fm-pi-author-snapshot.py" \
     "$PI_AUTHOR_SOURCE_HOME" "$PI_AUTHOR_ACCOUNT_HOME"; then
     :

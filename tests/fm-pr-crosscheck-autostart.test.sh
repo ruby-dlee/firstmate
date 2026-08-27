@@ -56,7 +56,13 @@ url=$2
 number=${url##*/}
 case "$command" in
   head) cat "$FM_TEST_CONTROL/head-$number" ;;
-  state) printf 'OPEN\n' ;;
+  state)
+    if [ -f "$FM_TEST_CONTROL/merged-$number" ]; then
+      printf 'MERGED\n'
+    else
+      printf 'OPEN\n'
+    fi
+    ;;
   *) exit 97 ;;
 esac
 SH
@@ -299,6 +305,16 @@ test_configuration_failures_are_visible_and_retryable() {
   assert_contains "$wake" 'UNREVIEWED: Crosscheck autostart failed' \
     "failed background launch was not visible to supervision"
 
+  touch "$case_dir/control/merged-$pull"
+  wake=$(FM_HOME="$case_dir/home" FM_STATE_OVERRIDE="$case_dir/home/state" \
+    FM_TEST_CONTROL="$case_dir/control" \
+    bash "$case_dir/home/state/$task.check.sh") \
+    || fail "merged task check exited nonzero"
+  [ "$wake" = merged ] || fail "persisted launcher failure hid live merge: $wake"
+  [ "$(json_field "$state_file" state)" = failed ] \
+    || fail "merge observation erased the actionable launcher failure"
+  rm "$case_dir/control/merged-$pull"
+
   printf "FM_TEST_FLEET_SECRET='%s'\n" "$SECRET_VALUE" > "$case_dir/fleet.env"
   out=$(run_pr_check "$case_dir" "$task" "$pull") \
     || fail "retry after restoring the fleet environment failed: $out"
@@ -419,6 +435,59 @@ test_unrelated_prs_start_concurrently() {
     || fail "second concurrent Crosscheck did not clear"
   pass "unrelated PR Crosschecks run concurrently with task-local coordination only"
 }
+
+test_retirement_handoff() {
+  local case_dir task=retire pull=7
+  case_dir=$(make_case retirement)
+  seed_task "$case_dir" "$task"
+  set_head "$case_dir" "$pull" "$HEAD_ONE"
+  mkdir "$case_dir/hook"
+  cat > "$case_dir/hook/sitecustomize.py" <<'PYHOOK'
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+if len(sys.argv) > 3 and sys.argv[1] == "worker":
+    original_close = os.close
+    coordinator = int(sys.argv[2])
+    control = Path(os.environ["FM_TEST_CONTROL"])
+
+    def close(descriptor):
+        if descriptor == coordinator and not (control / "retirement-entered").exists():
+            (control / "retirement-entered").touch()
+            (control / "head-7").write_text("2" * 40 + "\n")
+            environment = os.environ.copy()
+            environment.pop("PYTHONPATH", None)
+            with (control / "registration-output").open("w") as output:
+                process = subprocess.Popen(
+                    [environment["FM_TEST_PR_CHECK"], "retire",
+                     "https://github.com/example/repo/pull/7"],
+                    env=environment, stdout=output, stderr=output,
+                )
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+        return original_close(descriptor)
+
+    os.close = close
+PYHOOK
+  PYTHONPATH="$case_dir/hook" FM_TEST_PR_CHECK="$PR_CHECK" \
+    run_pr_check "$case_dir" "$task" "$pull" >/dev/null \
+    || fail "retirement fixture registration failed"
+  fm_test_wait_for_file "$case_dir/control/retirement-entered" '' 0.02 \
+    || fail "coordinator did not reach the retirement boundary"
+  fm_test_wait_for_file "$case_dir/control/started-$task-$HEAD_TWO" '' 0.02 \
+    || fail "registration during retirement lost its successor review"
+  wait_for_state "$case_dir/home/state/$task.crosscheck-autostart.json" clear "$HEAD_TWO" 2 \
+    || fail "retirement successor did not clear the new exact head"
+  expect_code 1 "$(count_run_calls "$case_dir" "$task" "$HEAD_TWO")" \
+    "retirement successor Crosscheck count"
+  pass "registration at coordinator retirement hands off the new exact head"
+}
+
+test_retirement_handoff
 
 test_prompt_return_active_and_clear_dedupe
 test_configuration_failures_are_visible_and_retryable

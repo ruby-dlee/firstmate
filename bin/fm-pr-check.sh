@@ -109,14 +109,18 @@ printf -v URL_Q '%q' "$URL"
 printf -v PR_HEAD_Q '%q' "$PR_HEAD"
 printf -v GENERATION_Q '%q' "$LOOKUP_GENERATION"
 cat > "$CHECK_TMP" <<EOF
-if ! crosscheck_state=\$($CROSSCHECK_AUTOSTART_Q status $ID_Q $URL_Q $PR_HEAD_Q $GENERATION_Q 2>&1); then
-  diagnostic=\$(printf '%s' "\$crosscheck_state" | tr '\r\n' '  ')
-  printf 'UNREVIEWED: Crosscheck autostart failed: %.500s\n' "\$diagnostic"
-  exit 0
-fi
 if ! state=\$($PR_ADAPTER_Q state $URL_Q 2>&1); then
   diagnostic=\$(printf '%s' "\$state" | tr '\r\n' '  ')
   printf 'UNREVIEWED: PR state lookup failed: %.500s\n' "\$diagnostic"
+  exit 0
+fi
+if [ "\$state" = MERGED ]; then
+  echo "merged"
+  exit 0
+fi
+if ! crosscheck_state=\$($CROSSCHECK_AUTOSTART_Q status $ID_Q $URL_Q $PR_HEAD_Q $GENERATION_Q 2>&1); then
+  diagnostic=\$(printf '%s' "\$crosscheck_state" | tr '\r\n' '  ')
+  printf 'UNREVIEWED: Crosscheck autostart failed: %.500s\n' "\$diagnostic"
   exit 0
 fi
 case "\$state" in

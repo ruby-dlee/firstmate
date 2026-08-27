@@ -9,6 +9,7 @@ Coordinator and operation locks are task-local, while the existing Azure lane an
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import datetime as dt
 import fcntl
 import json
@@ -112,6 +113,7 @@ def task_paths(state: Path, task_id: str) -> Dict[str, Path]:
         "request": state / f"{task_id}.crosscheck-autostart.request.json",
         "state": state / f"{task_id}.crosscheck-autostart.json",
         "log": state / f"{task_id}.crosscheck-autostart.log",
+        "handoff_lock": state / f".{task_id}.crosscheck-autostart-handoff.lock",
         "coordinator_lock": state / f".{task_id}.crosscheck-autostart.lock",
         "crosscheck_lock": state / f".{task_id}.crosscheck.lock",
     }
@@ -225,6 +227,16 @@ def open_lock(path: Path) -> int:
         os.close(descriptor)
         fail(f"unsafe Crosscheck autostart lock: {path}")
     return descriptor
+
+
+@contextmanager
+def task_handoff(paths: Dict[str, Path]):
+    descriptor = open_lock(paths["handoff_lock"])
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def fleet_environment_path() -> Path:
@@ -571,36 +583,43 @@ def worker(lock_descriptor: int, task_id: str, starting_attempt: int) -> int:
                 os.getpid(),
                 paths["log"],
             )
-            if latest_request(paths["request"]) == request:
-                return 0 if result_state == "clear" else 1
+            with task_handoff(paths):
+                if latest_request(paths["request"]) == request:
+                    os.close(lock_descriptor)
+                    lock_descriptor = -1
+                    return 0 if result_state == "clear" else 1
             attempt += 1
             processed += 1
         fail(f"Crosscheck autostart exceeded {MAX_HEAD_RESTARTS} queued head restarts")
     except Exception as exc:
-        message = str(exc) if isinstance(exc, AutostartError) else (
-            f"unexpected {type(exc).__name__}: {exc}"
-        )
-        try:
-            failed_task, url, head, generation = latest_request(paths["request"])
-            if failed_task == task_id:
-                write_state(
-                    paths["state"],
-                    task_id,
-                    url,
-                    head,
-                    generation,
-                    "failed",
-                    attempt,
-                    message,
-                    os.getpid(),
-                    paths["log"],
-                )
-                append_log(paths["log"], "coordinator failure", message.encode())
-        except Exception:
-            pass
-        return 1
+        with task_handoff(paths):
+            message = str(exc) if isinstance(exc, AutostartError) else (
+                f"unexpected {type(exc).__name__}: {exc}"
+            )
+            try:
+                failed_task, url, head, generation = latest_request(paths["request"])
+                if failed_task == task_id:
+                    write_state(
+                        paths["state"],
+                        task_id,
+                        url,
+                        head,
+                        generation,
+                        "failed",
+                        attempt,
+                        message,
+                        os.getpid(),
+                        paths["log"],
+                    )
+                    append_log(paths["log"], "coordinator failure", message.encode())
+            except Exception:
+                pass
+            os.close(lock_descriptor)
+            lock_descriptor = -1
+            return 1
     finally:
-        os.close(lock_descriptor)
+        if lock_descriptor >= 0:
+            os.close(lock_descriptor)
 
 
 def start(task_id: str, url: str, head: str, generation: str) -> int:
@@ -608,6 +627,13 @@ def start(task_id: str, url: str, head: str, generation: str) -> int:
     root, _home, state = runtime_paths()
     validate_task_generation(state, task_id, generation)
     paths = task_paths(state, task_id)
+    with task_handoff(paths):
+        return start_locked(root, paths, task_id, url, head, generation)
+
+
+def start_locked(
+    root: Path, paths: Dict[str, Path], task_id: str, url: str, head: str, generation: str
+) -> int:
     descriptor = open_lock(paths["coordinator_lock"])
     try:
         try:

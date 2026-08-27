@@ -20,7 +20,9 @@ FM_HOME=/Users/dongkeun/firstmate-home \
 Registration records the live PR head, arms the merge poll, durably requests Crosscheck, starts one task-local coordinator, and returns without waiting for the review.
 A matching active request is reused, and a matching exact-head and exact-claims `CLEAR` result is verified without another review.
 Registering a new head replaces the queued request so the coordinator reviews that head next.
+A short task-local handoff lock couples request publication with coordinator retirement; it is never held during review execution.
 A dead or failed coordinator releases its task-local lock and retries when the same registration command runs again.
+The merge poll observes live GitHub merge state before reporting launcher failures, so manual completion and merge still trigger cleanup without granting merge authorization.
 Unrelated task coordinators share no launcher lock, so the Azure lane-capacity and cost-admission controls remain the only review spending authority.
 
 Before launching a review, the coordinator loads the authoritative operator-private fleet environment from `~/.fm-azure/fleet.env` by default.

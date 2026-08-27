@@ -234,6 +234,16 @@ replacement_before = copy.deepcopy(replacement)
 module.command_service_cancel(env, args)
 assert replacement == replacement_before, replacement
 
+valid_receipt = item["service_completion_receipt"]
+item["service_completion_receipt"] = "corrupt"
+try:
+    module.command_service_cancel(env, args)
+except module.LifecycleError as exc:
+    assert "receipt identity differs" in str(exc), exc
+else:
+    raise AssertionError("malformed service cancellation receipt escaped as valid")
+item["service_completion_receipt"] = valid_receipt
+
 item["status"] = "assigned"
 item.pop("service_completion_receipt")
 state["workers"] = {"1": worker}

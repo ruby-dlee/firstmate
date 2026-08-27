@@ -4639,7 +4639,9 @@ def command_service_cancel(env, args):
             raise LifecycleError("service cancellation is owned by no-mistakes workers only")
         receipt = item.get("service_completion_receipt")
         if receipt is not None:
-            unsigned = dict(receipt) if isinstance(receipt, dict) else {}
+            if not isinstance(receipt, dict):
+                raise LifecycleError("service cancellation receipt identity differs")
+            unsigned = dict(receipt)
             proof_digest = unsigned.pop("proof_digest", None)
             if (
                 item.get("status") not in ("releasing", "complete")

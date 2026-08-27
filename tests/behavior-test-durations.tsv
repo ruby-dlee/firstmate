@@ -132,7 +132,6 @@
 26000	tests/fm-worker-placement.test.sh
 1000	tests/fm-worker-supervisor.test.sh
 23744	tests/fm-x-mode.test.sh
-250	tests/lavish-repair.test.sh
 6200	tests/lavish.test.sh
 100	tests/runner-entry-probe.test.sh
 1000	tests/test-suite-seal.test.sh

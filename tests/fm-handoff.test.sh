@@ -7,7 +7,8 @@ set -eu
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-HANDOFF=$ROOT/bin/fm-handoff.sh
+HANDOFF=${FM_TEST_HANDOFF_COMMAND:-$ROOT/bin/fm-handoff.sh}
+export FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1
 fm_test_tmproot_into TMP_ROOT fm-handoff
 
 make_fakebin() {
@@ -343,6 +344,29 @@ test_completed_status_reconciles_newest_run() {
   pass "completed status cannot hide a newer owner or unavailable history"
 }
 
+test_verified_successor_is_not_competing_owner() {
+  local out
+  make_case successor
+  out=$CASE_DIR/out
+  printf '#!/usr/bin/env bash\nexec python3 %q "$@"\n' "$ROOT/tests/herdr-custody-fixture.py" > "$FAKEBIN/herdr"
+  chmod +x "$FAKEBIN/herdr"
+  printf '%s\n' window=default:pane-custody backend=herdr herdr_session=default herdr_workspace_id=ws-custody herdr_tab_id=tab-custody herdr_pane_id=pane-custody >> "$HOME_DIR/state/$ID.meta"
+  export FM_FAKE_ENDPOINT_FILE="$CASE_DIR/live" FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/label"
+  touch "$FM_FAKE_ENDPOINT_FILE"
+  printf 'fm-%s\n' "$ID" > "$FM_FAKE_TMUX_LABEL_FILE"
+  handoff_env > "$out" || fail "Herdr owner capture failed"
+  assert_supervise_only "$out" "unexcluded Herdr owner"
+  FM_HANDOFF_SUCCESSOR_BACKEND=herdr FM_HANDOFF_SUCCESSOR_TARGET=default:pane-custody handoff_env > "$out" || fail "successor refresh failed"
+  assert_free_edit "$out" "verified successor"
+  FM_HANDOFF_SUCCESSOR_BACKEND=herdr FM_HANDOFF_SUCCESSOR_TARGET=default:different handoff_env > "$out" || fail "distinct owner refresh failed"
+  assert_supervise_only "$out" "distinct Herdr owner"
+  printf 'active\n' > "$NM_STATE"
+  FM_HANDOFF_SUCCESSOR_BACKEND=herdr FM_HANDOFF_SUCCESSOR_TARGET=default:pane-custody handoff_env > "$out" || fail "successor pipeline refresh failed"
+  assert_supervise_only "$out" "pipeline with verified successor"
+  pass "exact Herdr successor exclusion preserves competing worker and pipeline custody"
+}
+
+test_verified_successor_is_not_competing_owner
 test_completed_status_reconciles_newest_run
 test_no_active_owner_is_free_edit_and_idempotent
 test_active_no_mistakes_owner_is_supervise_only

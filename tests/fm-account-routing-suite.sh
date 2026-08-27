@@ -18,6 +18,7 @@ SEND="$ROOT/bin/fm-send.sh"
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
 SESSION_SYNC="$ROOT/bin/fm-account-session-sync.sh"
 CONTINUATION="$ROOT/bin/fm-account-continuation.sh"
+export FM_BACKEND_HERDR_TEST_LAB=firstmate-herdr-test-lab-v1
 fm_test_tmproot_into TMP_ROOT fm-account-routing-tests
 
 assert_not_grep() {
@@ -3203,17 +3204,21 @@ test_enforced_orca_is_rejected_before_owned_resource_creation() {
 }
 
 test_cross_profile_continuation_for_harness() {
-  local harness=$1 old_profile=$2 new_profile=$3 provider=$4 id rec old_task new_task new_attempt packet canonical out status launch source_model
+  local harness=$1 old_profile=$2 new_profile=$3 provider=$4 backend=${5:-tmux} id rec old_task new_task new_attempt packet canonical out status launch source_model
   id="account-continue-$harness-z21"
-  rec=$(make_case "continue-$harness" "$harness" "$id")
+  rec=$(make_case "continue-$harness${FM_TEST_CONTINUATION_CASE_SUFFIX:-}" "$harness" "$id")
   read_case "$rec"
+  if [ "$backend" = herdr ]; then
+    printf '#!/usr/bin/env bash\nexec python3 %q "$@"\n' "$ROOT/tests/herdr-custody-fixture.py" > "$FAKEBIN_DIR/herdr"
+    chmod +x "$FAKEBIN_DIR/herdr"
+  fi
   if [ "$harness" = claude ]; then
     source_model=claude-opus-5
   else
     source_model="$harness-source-model"
   fi
   out=$(FM_FAKE_AF_PROVIDER="$provider" FM_FAKE_AF_PROFILE="$old_profile" FM_FAKE_AF_POOL="$harness-crew" \
-    run_spawn "$id" "$PROJ_DIR" --account-pool "$harness-crew" --model "$source_model" --effort high)
+    run_spawn "$id" "$PROJ_DIR" --backend "$backend" --account-pool "$harness-crew" --model "$source_model" --effort high)
   status=$?
   [ "$status" -eq 0 ] || fail "$harness initial managed spawn failed: $out"
   old_task=$(meta_account_task "$id")
@@ -3342,6 +3347,45 @@ SH
   assert_grep 'done: external side effect alpha; do not rerun' "$delivered" "$harness delivery lost captured resumability context"
   assert_not_grep 'replacement launch generation' "$delivered" "$harness delivery reread the replaced snapshot"
   pass "$harness executable continuation refreshes custody after capture and before provider delivery"
+}
+
+test_herdr_continuation_successor_delivery() {
+  local harness=$1 owner=$2 id delivered launch
+  local FM_TEST_CONTINUATION_CASE_SUFFIX="-herdr-$2"
+  test_cross_profile_continuation_for_harness "$harness" "$harness-2" "$harness-3" "$harness" herdr
+  id="account-continue-$harness-z21"
+  git -C "$WT_DIR" checkout -qb "fm/herdr-delivery-$harness"
+  delivered="$CASE_DIR/herdr-delivered"
+  launch=$(cat "$LAUNCH_LOG")
+  cat > "$FAKEBIN_DIR/no-mistakes" <<'SH'
+#!/usr/bin/env bash
+case "$1:$2" in
+  axi:status) exit 1 ;;
+  runs:--limit)
+    if [ "$FM_DELIVERY_OWNER" = pipeline ]; then
+      printf 'running %s %s\n' "$(git -C "$FM_DELIVERY_WORKTREE" branch --show-current)" "$(git -C "$FM_DELIVERY_WORKTREE" rev-parse HEAD)"
+    fi
+    ;;
+  *) exit 2 ;;
+esac
+SH
+  cat > "$FAKEBIN_DIR/agent-fleet" <<'SH'
+#!/usr/bin/env bash
+[ -z "${FM_HANDOFF_SUCCESSOR_TARGET:-}" ] || exit 71
+printf '%s' "${!#}" > "$FM_DELIVERY_PROMPT"
+SH
+  chmod +x "$FAKEBIN_DIR/no-mistakes" "$FAKEBIN_DIR/agent-fleet"
+  FM_DELIVERY_OWNER="$owner" FM_DELIVERY_WORKTREE="$WT_DIR" FM_DELIVERY_PROMPT="$delivered" \
+    FM_HOME="$HOME_DIR" FM_FAKE_ENDPOINT_FILE="$CASE_DIR/endpoint-live" \
+    FM_FAKE_TMUX_LABEL_FILE="$CASE_DIR/tmux-label" PATH="$FAKEBIN_DIR:$PATH" \
+    bash -c "$launch" || fail "$harness Herdr provider delivery failed"
+  if [ "$owner" = none ]; then
+    assert_grep '`may mutate now`: **yes**' "$delivered" "$harness successor was mistaken for predecessor"
+  else
+    assert_grep '`supervise only`: **yes**' "$delivered" "$harness newly active pipeline was ignored"
+  fi
+  assert_grep 'done: external side effect alpha; do not rerun' "$delivered" "$harness Herdr delivery lost resumability"
+  pass "$harness Herdr continuation delivers refreshed custody with owner=$owner"
 }
 
 test_cross_provider_continuation_uses_target_default_pool() {
@@ -6582,6 +6626,10 @@ if [ "${FM_TEST_FOCUSED:-}" = review-round-15 ]; then
 fi
 
 if [ "${FM_TEST_FOCUSED:-}" = handoff-custody ]; then
+  run_isolated_test test_herdr_continuation_successor_delivery claude none
+  run_isolated_test test_herdr_continuation_successor_delivery codex none
+  run_isolated_test test_herdr_continuation_successor_delivery claude pipeline
+  run_isolated_test test_herdr_continuation_successor_delivery codex pipeline
   run_isolated_test test_continuation_delivery_refreshes_custody claude
   run_isolated_test test_continuation_delivery_refreshes_custody codex
   exit 0

@@ -302,6 +302,13 @@ capture_live() {  # <identity-file> <block-file> [force-supervise-reason]
     *) endpoint_state=unknown; process_state=unknown; endpoint_owner=unknown ;;
   esac
 
+  if [ "$backend" = herdr ] && [ "$endpoint_state" = present ] \
+    && [ "${FM_HANDOFF_SUCCESSOR_BACKEND:-}" = "$backend" ] \
+    && [ -n "${FM_HANDOFF_SUCCESSOR_TARGET:-}" ] \
+    && [ "$FM_HANDOFF_SUCCESSOR_TARGET" = "$target" ]; then
+    endpoint_owner=none
+  fi
+
   if [ "$mode" != no-mistakes ]; then
     nm_state=not-applicable
     nm_run=none

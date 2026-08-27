@@ -93,7 +93,7 @@ case "${1:-} ${2:-}" in
     ;;
   "api /repos/ruby-dlee/firstmate/rules/branches/main")
     case "${FM_TEST_QUEUE_RULE:-absent}" in
-      absent) printf '%s\n' '[0]:' ;;
+      absent) printf '%s\n' '[]' ;;
       active)
         printf '%s\n' \
           '[1]:' \
@@ -101,6 +101,7 @@ case "${1:-} ${2:-}" in
           '    parameters:' \
           '      merge_method: SQUASH'
         ;;
+      malformed) printf '%s\n' 'unexpected branch-rules response' ;;
       *) exit 98 ;;
     esac
     ;;
@@ -222,9 +223,9 @@ run_pr_merge() {
     "$PR_MERGE" "$@"
 }
 
-test_exact_head_is_recorded_and_merged_atomically() {
+test_empty_branch_rules_use_atomic_merge_path() {
   local case_dir output
-  case_dir=$(make_case exact-head)
+  case_dir=$(make_case empty-branch-rules)
   : > "$case_dir/gh-axi.log"
   output=$(run_pr_merge "$case_dir" task-x1 "$PR_URL") \
     || fail "exact-head merge should succeed"
@@ -241,11 +242,15 @@ test_exact_head_is_recorded_and_merged_atomically() {
     "merge poll did not use the observed gh-axi adapter"
   assert_no_grep 'gh pr view' "$case_dir/state/task-x1.check.sh" \
     "merge poll regressed to raw gh"
+  assert_grep 'api /repos/ruby-dlee/firstmate/rules/branches/main' "$case_dir/gh-axi.log" \
+    "merge did not inspect the empty base-branch rules"
   assert_grep "api PUT /repos/ruby-dlee/firstmate/pulls/72/merge --field sha=$HEAD_SHA --field merge_method=squash" "$case_dir/gh-axi.log" \
     "merge did not use the atomic expected-head API"
+  assert_no_grep '^api POST ' "$case_dir/gh-axi.log" \
+    "empty branch rules incorrectly selected the merge queue API"
   assert_no_grep 'pr merge' "$case_dir/gh-axi.log" \
     "merge regressed to the unguarded gh-axi pr merge surface"
-  pass "merge records and atomically submits the exact crosschecked SHA"
+  pass "empty branch rules use the atomic non-queue merge path"
 }
 
 test_merge_queue_acceptance_is_enqueued_unconfirmed() {
@@ -274,6 +279,25 @@ test_merge_queue_acceptance_is_enqueued_unconfirmed() {
   assert_no_grep 'pr merge' "$case_dir/gh-axi.log" \
     "queue submission used the ambiguous unguarded merge wrapper"
   pass "merge queue acceptance is enqueued/unconfirmed, not merged or failed"
+}
+
+test_malformed_branch_rules_refuse_before_merge() {
+  local case_dir rc
+  case_dir=$(make_case malformed-branch-rules)
+  : > "$case_dir/gh-axi.log"
+  set +e
+  FM_TEST_QUEUE_RULE=malformed run_pr_merge "$case_dir" task-x1 "$PR_URL" \
+    > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "malformed branch-rules response"
+  assert_grep 'gh-axi returned an invalid root TOON array' "$case_dir/err" \
+    "malformed branch-rules response was not rejected by the strict parser"
+  assert_no_grep '^api PUT ' "$case_dir/gh-axi.log" \
+    "malformed branch-rules response reached the immediate merge API"
+  assert_no_grep '^api POST ' "$case_dir/gh-axi.log" \
+    "malformed branch-rules response reached the merge queue API"
+  pass "malformed branch rules still refuse before any merge mutation"
 }
 
 test_draft_and_undeterminable_status_refuse_before_merge() {
@@ -448,9 +472,10 @@ test_missing_meta_and_malformed_url_fail_fast() {
   pass "missing metadata and malformed PR URLs fail before GitHub operations"
 }
 
-test_exact_head_is_recorded_and_merged_atomically
+test_empty_branch_rules_use_atomic_merge_path
 test_draft_and_undeterminable_status_refuse_before_merge
 test_merge_queue_acceptance_is_enqueued_unconfirmed
+test_malformed_branch_rules_refuse_before_merge
 test_missing_or_malformed_ledger_blocks_merge
 test_clear_without_reviewer_bash_receipt_blocks_merge
 test_changed_head_blocks_before_merge

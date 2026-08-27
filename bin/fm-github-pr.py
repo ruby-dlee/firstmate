@@ -478,6 +478,8 @@ def base_uses_merge_queue(owner: str, repo: str, base_ref: str) -> bool:
     raw = run_gh_axi(
         ["api", f"/repos/{owner}/{repo}/rules/branches/{encoded_ref}"]
     )
+    if raw.strip() == "[]":
+        return False
     parse_root_toon_array(raw)
     return MERGE_QUEUE_RULE_RE.search(raw) is not None
 

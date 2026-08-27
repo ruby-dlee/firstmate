@@ -99,4 +99,12 @@ chmod +x "$CHECK_TMP"
 mv "$CHECK_TMP" "$STATE/$ID.check.sh"
 fm_account_meta_lock_release "$META_LOCK"
 trap - EXIT
+SLACK_CONFIG=${FM_CROSSCHECK_SLACK_CONFIG:-$FM_HOME/config/crosscheck-slack.json}
+if [ -f "$SLACK_CONFIG" ]; then
+  "$FM_ROOT/bin/fm-crosscheck-slack.sh" attest-task \
+    "$ID" "$URL" "$PR_HEAD" --config "$SLACK_CONFIG" || {
+      echo "error: could not issue exact-head Crosscheck authorship provenance for $ID" >&2
+      exit 1
+    }
+fi
 echo "armed: state/$ID.check.sh polls $URL"

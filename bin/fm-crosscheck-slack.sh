@@ -4,6 +4,7 @@
 # Usage:
 #   fm-crosscheck-slack.sh run [--config <path>]
 #   fm-crosscheck-slack.sh --selftest [<config-path>]
+#   fm-crosscheck-slack.sh attest-task <task-id> <pr-url> <head-sha> [--config <path>]
 #
 # `run` starts the resident Socket Mode listener; it refuses to start when
 # any token environment variable named by $FM_HOME/config/crosscheck-slack.json

@@ -21,6 +21,7 @@ PYTHON="$(fm_crosscheck_resolve_python)" || fail "no supported python interprete
 
 BOT_PY="$ROOT/bin/fm-crosscheck-slack.py"
 BOT_SH="$ROOT/bin/fm-crosscheck-slack.sh"
+SERVICE_SH="$ROOT/bin/fm-crosscheck-slack-service.sh"
 
 fm_test_tmproot_into TMP_ROOT fm-crosscheck-slack-tests
 
@@ -41,6 +42,10 @@ mkdir -p "$HOMEDIR/config" "$HOMEDIR/state" "$HOMEDIR/data" "$OUTDIR"
 APP_TOKEN='xapp-1-SECRETAPP-cafef00dcafef00d'
 BOT_TOKEN='xoxb-SECRETBOT-deadbeefdeadbeef'
 GH_TOKEN_VALUE='ghp_SECRETGITHUB0123456789abcdef'
+PROVENANCE_KEY_FILE="$HOMEDIR/config/crosscheck-slack-provenance.key"
+printf '%s\n' '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' \
+  > "$PROVENANCE_KEY_FILE"
+chmod 600 "$PROVENANCE_KEY_FILE"
 
 CONFIG_MAIN="$TMP_ROOT/config-main.json"
 CONFIG_BUDGET="$TMP_ROOT/config-budget.json"
@@ -57,6 +62,7 @@ write_config() { # <path> <daily_budget_usd-json> <daily_request_cap-json>
   "github_token_env": "FM_TEST_GITHUB_READ_TOKEN",
   "daily_budget_usd": $2,
   "daily_request_cap": $3,
+  "provenance_key_file": "\$FM_HOME/config/crosscheck-slack-provenance.key",
   "state_dir": "\$FM_HOME/state/crosscheck-slack"
 }
 JSON
@@ -81,7 +87,7 @@ fi
 task=$2
 url=$3
 meta="$FM_HOME/state/$task.meta"
-if ! grep -q '^harness=slack-team$' "$meta" || ! grep -q '^model=human-authored$' "$meta"; then
+if ! grep -q '^harness=pi$' "$meta" || ! grep -q '^model=openai-codex-8/gpt-5.6-sol$' "$meta"; then
   echo "fixture: task metadata missing or wrong at $meta" >&2
   exit 67
 fi
@@ -107,7 +113,7 @@ cat > "$dest/crosscheck-ledger.json" <<JSON
   "runs": [
     {
       "at": "2026-08-20T00:00:00Z",
-      "head_sha": "1111111111111111111111111111111111111111",
+      "head_sha": "${FM_FIXTURE_HEAD_SHA:-1111111111111111111111111111111111111111}",
       "state": "$mode",
       "summary": "fixture review summary",
       "reviewer": $reviewer_json,
@@ -199,6 +205,9 @@ if command == "mention":
     posts = Path(os.environ["FMT_POSTS"])
     reacts = Path(os.environ["FMT_REACTS"])
     fail_verdict_post = os.environ.get("FMT_FAIL_VERDICT_POST") == "1"
+    event = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+    head_sha = os.environ.get("FMT_HEAD_SHA") or "1" * 40
+    head_after = os.environ.get("FMT_HEAD_AFTER") or head_sha
 
     def post(channel, thread_ts, text):
         if fail_verdict_post and text.startswith("Crosscheck "):
@@ -212,23 +221,69 @@ if command == "mention":
         with reacts.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"channel": channel, "ts": ts, "name": name}) + "\n")
 
-    def head_branch(pr_url):
-        value = os.environ.get("FMT_HEAD_BRANCH") or "engineer-topic"
-        if value == "ERROR":
-            raise RuntimeError("induced head-branch lookup failure")
-        return value
+    def pr_snapshot(pr_url):
+        if head_sha == "ERROR":
+            raise RuntimeError("induced PR head lookup failure")
+        return mod.PrSnapshot(
+            pr_url=pr_url,
+            repository=mod.repo_of(pr_url),
+            number=int(mod.PR_LINK_RE.fullmatch(pr_url).group(3)),
+            head_sha=head_sha,
+        )
+
+    def current_snapshot(pr_url):
+        return mod.PrSnapshot(
+            pr_url=pr_url,
+            repository=mod.repo_of(pr_url),
+            number=int(mod.PR_LINK_RE.fullmatch(pr_url).group(3)),
+            head_sha=head_after,
+        )
 
     config.state_dir.mkdir(parents=True, exist_ok=True)
+    provenance_key = mod.load_provenance_key(config.provenance_key_file)
+    links = mod.extract_pr_links(str(event.get("text") or ""))
+    if (
+        len(links) == 1
+        and mod.repo_of(links[0]) in config.repo_allowlist
+        and os.environ.get("FMT_PROVENANCE_MODE", "valid") != "missing"
+        and head_sha != "ERROR"
+    ):
+        source_task = os.environ.get("FMT_SOURCE_TASK") or "source-task"
+        source_meta = Path(os.environ["FM_HOME"]) / "state" / f"{source_task}.meta"
+        source_meta.write_text(
+            "\n".join(
+                [
+                    f"harness={os.environ.get('FMT_SOURCE_HARNESS') or 'pi'}",
+                    f"model={os.environ.get('FMT_SOURCE_MODEL') or 'openai-codex-8/gpt-5.6-sol'}",
+                    f"generation_id={os.environ.get('FMT_SOURCE_GENERATION') or 'spawn:test-generation'}",
+                    f"pr={links[0]}",
+                    f"pr_head={head_sha}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        path = mod.issue_task_attestation(
+            config, provenance_key, source_task, links[0], head_sha
+        )
+        if os.environ.get("FMT_PROVENANCE_MODE") == "tampered":
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["payload"]["author"]["model"] = "claude-opus-5"
+            path.write_text(json.dumps(value) + "\n", encoding="utf-8")
     ctx = mod.MentionContext(
         config=config,
         meter=mod.DailyMeter(config.state_dir / "meter"),
         deduper=mod.EventDeduper(config.state_dir / "events"),
         post=post,
         react=react,
-        run_review=mod.make_run_review(config, github_token),
-        head_branch=head_branch,
+        run_review=mod.make_run_review(
+            config, github_token, current_snapshot=current_snapshot
+        ),
+        pr_snapshot=pr_snapshot,
+        provenance=lambda snapshot: mod.verify_attestation(
+            config, provenance_key, snapshot
+        ),
     )
-    event = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
     action = mod.handle_mention(os.environ["FMT_EVENT_ID"], event, ctx)
     print(f"action: {action}")
     sys.exit(0)
@@ -238,7 +293,12 @@ if command == "rollover-unit":
     day_one = "2026-01-01"
     day_two = "2026-01-02"
     meter_d1 = mod.DailyMeter(state_dir, day_fn=lambda: day_one)
-    request_id = meter_d1.begin("U0NIGHTOWL", "https://github.com/a/b/pull/1", "ev-night-1")
+    request_id, refusal, _ = meter_d1.begin(
+        "U0NIGHTOWL", "https://github.com/a/b/pull/1", "ev-night-1"
+    )
+    if refusal is not None or request_id is None:
+        print(f"unexpected meter refusal: {refusal}")
+        sys.exit(1)
     if not request_id.startswith(f"req-{day_one}-"):
         print(f"request id does not encode its origin day: {request_id}")
         sys.exit(1)
@@ -326,6 +386,62 @@ if command == "postshape-unit":
     print("postshape-ok")
     sys.exit(0)
 
+if command == "concurrency-unit":
+    import threading
+
+    config = mod.load_config(Path(os.environ["FM_CROSSCHECK_SLACK_CONFIG"]))
+    meter_dir = Path(os.environ["FMT_METER_DIR"])
+    meter = mod.DailyMeter(meter_dir)
+    results = []
+    result_lock = threading.Lock()
+
+    def admit(index):
+        result = meter.begin(
+            "U0CONCURRENT",
+            f"https://github.com/a/b/pull/{index + 1}",
+            f"ev-concurrent-{index}",
+            request_cap=3,
+        )
+        with result_lock:
+            results.append(result)
+
+    threads = [threading.Thread(target=admit, args=(index,)) for index in range(12)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    admitted = [result for result in results if result[0] is not None]
+    refused = [result for result in results if result[1] == "cap"]
+    if len(admitted) != 3 or len(refused) != 9:
+        print(f"atomic cap failed: admitted={len(admitted)} refused={len(refused)}")
+        sys.exit(1)
+    service = mod.SocketModeService(config)
+    if len(service.workers) != 4:
+        print(f"listener worker count is {len(service.workers)}, not 4")
+        sys.exit(1)
+    saturation = []
+    service.web.post_message = (
+        lambda channel, thread_ts, text: saturation.append(
+            (channel, thread_ts, text)
+        )
+    )
+    for index in range(mod.REVIEW_QUEUE_LIMIT):
+        service.queue.put_nowait((f"ev-fill-{index}", {}))
+    service._enqueue(
+        "ev-overflow",
+        {
+            "channel": "C0TESTCHAN",
+            "ts": "1755640099.000100",
+            "user": "U0CONCURRENT",
+            "text": "review",
+        },
+    )
+    if len(saturation) != 1 or "review queue is full" not in saturation[0][2]:
+        print(f"queue saturation was not visible: {saturation}")
+        sys.exit(1)
+    print("concurrency-ok")
+    sys.exit(0)
+
 print(f"unknown driver command: {command}")
 sys.exit(2)
 PY
@@ -352,11 +468,18 @@ run_mention() { # <event-id> <config> <event-file> <out-name>
       FM_FIXTURE_REVIEWER_JSON="${FM_FIXTURE_REVIEWER_JSON:-}" \
       FM_FIXTURE_USAGE_JSON="${FM_FIXTURE_USAGE_JSON:-}" \
       FM_FIXTURE_FINDINGS_JSON="${FM_FIXTURE_FINDINGS_JSON:-}" \
+      FM_FIXTURE_HEAD_SHA="${FMT_HEAD_SHA:-1111111111111111111111111111111111111111}" \
       FMT_BOT_PY="$BOT_PY" \
       FMT_POSTS="$POSTS" \
       FMT_REACTS="$REACTS" \
       FMT_EVENT_ID="$1" \
-      FMT_HEAD_BRANCH="${FMT_HEAD_BRANCH:-}" \
+      FMT_HEAD_SHA="${FMT_HEAD_SHA:-}" \
+      FMT_HEAD_AFTER="${FMT_HEAD_AFTER:-}" \
+      FMT_PROVENANCE_MODE="${FMT_PROVENANCE_MODE:-}" \
+      FMT_SOURCE_TASK="${FMT_SOURCE_TASK:-}" \
+      FMT_SOURCE_HARNESS="${FMT_SOURCE_HARNESS:-}" \
+      FMT_SOURCE_MODEL="${FMT_SOURCE_MODEL:-}" \
+      FMT_SOURCE_GENERATION="${FMT_SOURCE_GENERATION:-}" \
       FMT_FAIL_VERDICT_POST="${FMT_FAIL_VERDICT_POST:-}" \
       "$PYTHON" "$DRIVER" mention "$3" > "$out" 2>&1
   local code=$?
@@ -397,8 +520,10 @@ test_selftest_validates_config_shape() {
     "selftest did not explain the null budget"
   assert_contains "$output" "daily_request_cap: null (uncapped" \
     "selftest did not report the null request cap"
-  assert_contains "$output" "agent_branch_prefixes: fm/" \
-    "selftest did not report the default agent-branch screen"
+  assert_contains "$output" "provenance_key_file:" \
+    "selftest did not validate the provenance key"
+  assert_contains "$output" "review_workers: 4" \
+    "selftest did not report four shared-capacity workers"
 
   bad="$TMP_ROOT/config-bad.json"
   "$PYTHON" -c 'import json, sys
@@ -456,6 +581,52 @@ test_missing_token_env_refuses_start() {
   pass "a missing token environment variable refuses startup naming the exact variable"
 }
 
+test_attestation_cli_derives_and_signs_author_identity() {
+  agent_task=attest-agent-task
+  agent_pr=https://github.com/Ruby-Labs/goodrepo/pull/77
+  agent_head=7777777777777777777777777777777777777777
+  cat > "$HOMEDIR/state/$agent_task.meta" <<EOF
+harness=pi
+model=openai-codex-8/gpt-5.6-sol
+generation_id=spawn:attest-agent
+pr=$agent_pr
+pr_head=$agent_head
+EOF
+  output=$(perl -e 'alarm 60; exec @ARGV' -- \
+    env FM_HOME="$HOMEDIR" "$BOT_SH" attest-task \
+      "$agent_task" "$agent_pr" "$agent_head" --config "$CONFIG_MAIN" 2>&1) \
+    || fail "agent attestation command failed: $output"
+  agent_path=${output#attested: }
+  assert_present "$agent_path" "agent attestation was not written"
+  shape=$($PYTHON -c 'import json, sys
+value=json.load(open(sys.argv[1]))
+author=value["payload"]["author"]
+print(author["kind"], author["harness"], author["model_family"], author["task_id"])' \
+    "$agent_path")
+  [ "$shape" = "agent pi openai $agent_task" ] \
+    || fail "agent provenance fields were not derived correctly: $shape"
+
+  human_task=attest-human-task
+  human_pr=https://github.com/Ruby-Labs/goodrepo/pull/78
+  human_head=8888888888888888888888888888888888888888
+  cat > "$HOMEDIR/state/$human_task.meta" <<EOF
+harness=human
+model=human-authored
+generation_id=no-mistakes:human-run-1
+pr=$human_pr
+pr_head=$human_head
+EOF
+  output=$(perl -e 'alarm 60; exec @ARGV' -- \
+    env FM_HOME="$HOMEDIR" "$BOT_SH" attest-task \
+      "$human_task" "$human_pr" "$human_head" --config "$CONFIG_MAIN" 2>&1) \
+    || fail "human attestation command failed: $output"
+  human_path=${output#attested: }
+  human_kind=$($PYTHON -c 'import json, sys
+print(json.load(open(sys.argv[1]))["payload"]["author"]["kind"])' "$human_path")
+  [ "$human_kind" = human ] || fail "signed human task was not classified as human"
+  pass "the attestation CLI derives agent and human identity only from signed task provenance"
+}
+
 test_mention_without_link_gets_usage_reply() {
   event="$TMP_ROOT/event-nolink.json"
   write_event "$event" C0TESTCHAN U0ALICE 1755640000.000100 '<@U0BOT> hello there'
@@ -511,7 +682,7 @@ test_channel_outside_allowlist_is_refused() {
   pass "a mention outside the channel allowlist is refused without a review"
 }
 
-test_completed_review_names_the_lane_and_writes_gate_metadata() {
+test_completed_review_names_lane_head_task_and_artifact() {
   before=$(fixture_run_count)
   event="$TMP_ROOT/event-clear.json"
   write_event "$event" C0TESTCHAN U0ALICE 1755640004.000100 "$GOOD_PR_TEXT"
@@ -523,9 +694,13 @@ test_completed_review_names_the_lane_and_writes_gate_metadata() {
   assert_contains "$reply" "Crosscheck CLEAR" "verdict reply missing state"
   assert_contains "$reply" "Lane: glm-5p2 primary" \
     "verdict reply did not name the cross-family lane"
+  assert_contains "$reply" "Reviewed head: 1111111111111111111111111111111111111111" \
+    "verdict reply did not name the exact reviewed head"
+  assert_contains "$reply" "Task ID: slack-" \
+    "verdict reply did not name the durable task"
   assert_contains "$reply" "crosscheck.md" "verdict reply did not point at the full report"
-  assert_contains "$reply" "Host report path for the operator:" \
-    "report path was not labeled as host-local"
+  assert_contains "$reply" "Durable artifact:" \
+    "report path was not labeled as the durable artifact"
   after=$(fixture_run_count)
   [ "$after" = $((before + 1)) ] || fail "expected exactly one crosscheck invocation"
   assert_grep "Review started" "$POSTS" "review start ack missing"
@@ -685,38 +860,59 @@ test_request_cap_binds_today() {
   pass "the per-submitter daily request cap binds today with no cost data and is announced in thread"
 }
 
-test_agent_branch_is_refused_to_the_ordinary_lane() {
+test_missing_or_tampered_provenance_fails_closed() {
   before=$(fixture_run_count)
-  event="$TMP_ROOT/event-agentbranch.json"
+  event="$TMP_ROOT/event-provenance-missing.json"
   write_event "$event" C0TESTCHAN U0ALICE 1755640040.000100 "$GOOD_PR_TEXT"
-  FMT_HEAD_BRANCH="fm/r10-something" \
-    run_mention ev-agentbranch-1 "$CONFIG_MAIN" "$event" agentbranch \
-    || fail "agent-branch mention errored: $RUN_MENTION_OUTPUT"
-  assert_contains "$RUN_MENTION_OUTPUT" "action: agent-branch-refused" \
-    "agent-prefixed branch was not refused"
+  FMT_HEAD_SHA="2222222222222222222222222222222222222222" \
+  FMT_PROVENANCE_MODE=missing \
+    run_mention ev-provenance-missing "$CONFIG_MAIN" "$event" provenance-missing \
+    || fail "missing-provenance mention errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: provenance-refused" \
+    "missing provenance was not refused"
   reply=$(last_post_text)
-  assert_contains "$reply" "matches the agent-branch prefix fm/" \
-    "refusal did not name the matched prefix"
-  assert_contains "$reply" "ordinary crosscheck lane" \
-    "refusal did not name the ordinary lane"
-  assert_contains "$reply" "asserts human authorship" \
-    "refusal did not state the authorship assertion"
+  assert_contains "$reply" "no trustworthy Firstmate/no-mistakes authorship attestation" \
+    "missing provenance refusal did not name the trust requirement"
+  assert_contains "$reply" "Branch names, Slack identity, and message text cannot assert" \
+    "refusal did not reject caller-controlled authorship signals"
   after=$(fixture_run_count)
-  [ "$after" = "$before" ] || fail "an agent-branch PR reached the crosscheck CLI"
+  [ "$after" = "$before" ] || fail "a PR without provenance reached the crosscheck CLI"
 
-  # A failed branch lookup also refuses, fail closed, without a review.
-  event="$TMP_ROOT/event-branchfail.json"
+  event="$TMP_ROOT/event-provenance-tampered.json"
   write_event "$event" C0TESTCHAN U0ALICE 1755640041.000100 "$GOOD_PR_TEXT"
-  FMT_HEAD_BRANCH="ERROR" \
-    run_mention ev-branchfail-1 "$CONFIG_MAIN" "$event" branchfail \
-    || fail "branch-lookup-failure mention errored: $RUN_MENTION_OUTPUT"
-  assert_contains "$RUN_MENTION_OUTPUT" "action: branch-screen-failed" \
-    "a failed branch lookup did not fail closed"
-  assert_contains "$(last_post_text)" "could not be verified" \
-    "branch-lookup failure reply missing"
+  FMT_HEAD_SHA="3333333333333333333333333333333333333333" \
+  FMT_PROVENANCE_MODE=tampered \
+  FMT_SOURCE_TASK=source-tampered \
+    run_mention ev-provenance-tampered "$CONFIG_MAIN" "$event" provenance-tampered \
+    || fail "tampered-provenance mention errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: provenance-refused" \
+    "tampered provenance was not refused"
+  assert_contains "$(last_post_text)" "signature verification failed" \
+    "tampered provenance refusal did not name signature verification"
   after=$(fixture_run_count)
-  [ "$after" = "$before" ] || fail "an unverified branch reached the crosscheck CLI"
-  pass "an agent-prefixed branch is refused to the ordinary lane and lookup failure fails closed"
+  [ "$after" = "$before" ] || fail "a PR with tampered provenance reached the crosscheck CLI"
+  pass "missing and tampered exact-head provenance fail closed without a review"
+}
+
+test_head_change_invalidates_the_verdict() {
+  event="$TMP_ROOT/event-stale.json"
+  write_event "$event" C0TESTCHAN U0ALICE 1755640042.000100 "$GOOD_PR_TEXT"
+  FMT_HEAD_SHA="4444444444444444444444444444444444444444" \
+  FMT_HEAD_AFTER="5555555555555555555555555555555555555555" \
+  FMT_SOURCE_TASK=source-stale \
+    run_mention ev-stale-1 "$CONFIG_MAIN" "$event" stale \
+    || fail "head-change mention errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: failed" \
+    "head change did not invalidate the review"
+  reply=$(last_post_text)
+  assert_contains "$reply" "Crosscheck STALE" "head change was not reported as stale"
+  assert_contains "$reply" "Reviewed head: 4444444444444444444444444444444444444444" \
+    "stale reply lost the reviewed head"
+  assert_contains "$reply" "Current head: 5555555555555555555555555555555555555555" \
+    "stale reply lost the new head"
+  assert_not_contains "$reply" "Crosscheck CLEAR" \
+    "a stale review was translated into CLEAR"
+  pass "a PR head change invalidates the earlier verdict visibly"
 }
 
 test_day_rollover_finalizes_the_origin_day() {
@@ -777,6 +973,41 @@ test_posts_disable_mrkdwn() {
   pass "chat.postMessage payloads disable mrkdwn and redact registered secrets"
 }
 
+test_four_workers_and_concurrent_cap_are_binding() {
+  concurrency_dir="$TMP_ROOT/concurrency-meter"
+  output=$(perl -e 'alarm 60; exec @ARGV' -- \
+    env FM_HOME="$HOMEDIR" \
+      FM_TEST_SLACK_APP_TOKEN="$APP_TOKEN" \
+      FM_TEST_SLACK_BOT_TOKEN="$BOT_TOKEN" \
+      FM_TEST_GITHUB_READ_TOKEN="$GH_TOKEN_VALUE" \
+      FM_CROSSCHECK_SLACK_CONFIG="$CONFIG_MAIN" \
+      FMT_BOT_PY="$BOT_PY" FMT_METER_DIR="$concurrency_dir" \
+      "$PYTHON" "$DRIVER" concurrency-unit 2>&1) \
+    || fail "concurrency unit failed: $output"
+  assert_contains "$output" "concurrency-ok" "concurrency unit did not complete"
+  pass "four Slack workers expose shared capacity and concurrent requests cannot overrun the engineer cap"
+}
+
+test_service_install_contains_no_credentials() {
+  service_home="$TMP_ROOT/service-home"
+  mkdir -p "$service_home"
+  output=$(perl -e 'alarm 60; exec @ARGV' -- \
+    env HOME="$service_home" FM_HOME="$HOMEDIR" \
+      FM_CROSSCHECK_SLACK_CONFIG="$CONFIG_MAIN" \
+      "$SERVICE_SH" install 2>&1) \
+    || fail "service install failed: $output"
+  plist="$service_home/Library/LaunchAgents/com.firstmate.crosscheck-slack.plist"
+  assert_present "$plist" "service install did not create the launch agent"
+  assert_contains "$output" "listener remains stopped" \
+    "service install did not keep an uncredentialed listener stopped"
+  for secret in "$APP_TOKEN" "$BOT_TOKEN" "$GH_TOKEN_VALUE"; do
+    assert_no_grep "$secret" "$plist" "launch agent contained a credential value"
+  done
+  assert_grep "fm-crosscheck-slack.sh" "$plist" \
+    "launch agent did not point at the supported wrapper"
+  pass "central service installation stores no credentials and stays stopped until preflight"
+}
+
 test_tool_failure_is_reported_honestly() {
   event="$TMP_ROOT/event-fail.json"
   write_event "$event" C0TESTCHAN U0ALICE 1755640012.000100 "$GOOD_PR_TEXT"
@@ -824,21 +1055,25 @@ UNITS=(
   test_pr_link_extraction
   test_selftest_validates_config_shape
   test_missing_token_env_refuses_start
+  test_attestation_cli_derives_and_signs_author_identity
   test_mention_without_link_gets_usage_reply
   test_multiple_links_are_refused
   test_out_of_allowlist_repo_is_refused
   test_channel_outside_allowlist_is_refused
-  test_completed_review_names_the_lane_and_writes_gate_metadata
+  test_completed_review_names_lane_head_task_and_artifact
   test_lane_naming_covers_fallback_and_explicit_marker
   test_duplicate_event_id_starts_one_review
   test_usd_meter_forward_contract_with_fixture_injected_usage
   test_production_shaped_ledger_never_trips_usd_bound
   test_request_cap_binds_today
-  test_agent_branch_is_refused_to_the_ordinary_lane
+  test_missing_or_tampered_provenance_fails_closed
+  test_head_change_invalidates_the_verdict
   test_day_rollover_finalizes_the_origin_day
   test_undelivered_verdict_is_reposted_on_redelivery
   test_retention_sweep_removes_only_aged_state
   test_posts_disable_mrkdwn
+  test_four_workers_and_concurrent_cap_are_binding
+  test_service_install_contains_no_credentials
   test_tool_failure_is_reported_honestly
   test_blocking_verdict_reply_names_state_and_findings
   test_tokens_never_reach_logs_or_ledgers

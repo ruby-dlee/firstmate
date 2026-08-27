@@ -2057,6 +2057,14 @@ def make_action(env, action_type, worker=None, item=None, **fields):
         })
         if worker.get("retired_execute_key") is not None:
             action["retired_execute_key"] = worker["retired_execute_key"]
+        service_cancel_proof = worker.get("release_proof")
+        if (
+            action_type == "delete-compute"
+            and isinstance(service_cancel_proof, dict)
+            and service_cancel_proof.get("schema") == "fm.worker-service-cancel/v1"
+            and service_cancel_proof.get("verdict") == "cancelled-before-execution"
+        ):
+            action["service_cancel_proof"] = copy.deepcopy(service_cancel_proof)
     if item is not None:
         action["request"] = item
     action.update(fields)
@@ -2498,6 +2506,10 @@ def apply_action_result(env, state, action, result):
             elif execution.get("step_outcome_sha256") not in (None, ""):
                 raise LifecycleError(
                     "absent no-mistakes service return asserted a step outcome digest")
+        cloud = result.get("worker")
+        if not isinstance(cloud, dict) or cloud.get("slot") != worker["slot"]:
+            raise LifecycleError("provider execute result returned the wrong worker slot")
+        adopt_cloud_resources(worker, cloud)
         state["executions"][action["request_digest"]] = execution
         worker["last_execution_digest"] = supplied
         worker["last_execution_at"] = iso_utc()

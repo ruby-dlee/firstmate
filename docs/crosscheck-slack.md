@@ -50,12 +50,12 @@ Authorship, model family, account identity, branch, worktree, checkout state, ta
 A revision produced in another checkout therefore follows the same review path as any other revision.
 
 The concrete enemies stopped at admission are a request aimed outside the operator-approved repositories and a request whose live revision cannot be bound exactly.
-The listener passes the admitted URL to the configured independent Crosscheck roster, requires the ledger head to match the admitted SHA, and checks the live head again before delivering a verdict.
+The listener passes the admitted URL to the independent roster described in [Crosscheck's reviewer contract](crosscheck.md#reviewer-harness); the response checks below bind the verdict to that revision.
 No authorship artifact is produced or copied into the review data directory.
 
 ## Exact-head response contract
 
-The listener resolves the current PR head before admission and binds provenance to it.
+The listener resolves the current PR head before admission.
 After Crosscheck returns, it requires the ledger's reviewed head to equal the admitted head.
 It then fetches the live head again.
 
@@ -213,5 +213,5 @@ Before activation, supply the coordinator inputs in [Central configuration](#cen
 The launchd credential checks and lifecycle are owned by [Install, restart, and inspect](#install-restart-and-inspect).
 
 The live acceptance request must come from an internal engineer other than Dongkeun in an approved channel.
-Record the request thread, exact admitted and returned SHA, provenance task, reviewer lane, Slack task ID, durable artifact, meter row, dedupe result, and service status in the R10 evidence directory.
+Record the request thread, exact admitted and returned SHA, reviewer lane, Slack task ID, durable artifact, meter row, dedupe result, and service status in the R10 evidence directory.
 Never copy credential values into that evidence.

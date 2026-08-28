@@ -375,9 +375,9 @@ These limits are machine-readable in `limitations`.
 
 ## R6. Crosscheck uses the configured independent reviewer lane
 
-Current policy amendment: exact-revision review replaced author-family comparison.
-The configured dedicated reviewer roster is the independence boundary; author harness, model, account, branch, worktree, checkout, and launch provenance are not admission or execution inputs.
-Historical ledgers retain their review-family fields and the history below remains readable, but no new run compares them with an asserted author origin or consults `config/crosscheck-same-model`.
+Current reviewer policy is owned by [Crosscheck](crosscheck.md#reviewer-harness).
+The remainder of R6 is historical acceptance evidence, not current configuration or operating instructions.
+Its author-family screens, declaration advice, same-model toggles, and launch attestations are retired; preserve the dated observations only as evidence of those earlier runs.
 
 Status: DONE, met live on 2026-08-22. Accepted Azure review `azure-r4-respond-285` recorded a
 `cross-family-primary` verdict against the codex-declared PR #285 head. Accepted Azure review

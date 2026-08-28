@@ -77,7 +77,21 @@ REACTS="$TMP_ROOT/reacts.jsonl"
 FIXTURE_LOG="$TMP_ROOT/fixture-invocations.log"
 DRIVER="$TMP_ROOT/driver.py"
 FIXTURE="$TMP_ROOT/fake-crosscheck.sh"
-mkdir -p "$HOMEDIR/config" "$HOMEDIR/state" "$HOMEDIR/data" "$OUTDIR"
+REVIEWER_CONFIG="$HOMEDIR/config/crosscheck-reviewer.json"
+REVIEWER_HOME="$TMP_ROOT/reviewer-home"
+mkdir -p "$HOMEDIR/config" "$HOMEDIR/state" "$HOMEDIR/data" "$OUTDIR" "$REVIEWER_HOME"
+cat > "$REVIEWER_CONFIG" <<JSON
+{
+  "reviewers": [
+    {
+      "harness": "codex",
+      "model": "gpt-5.6-sol",
+      "effort": "xhigh",
+      "account_home": "$REVIEWER_HOME"
+    }
+  ]
+}
+JSON
 : > "$POSTS"
 : > "$REACTS"
 : > "$FIXTURE_LOG"
@@ -290,6 +304,7 @@ if command == "mention":
         deduper=mod.EventDeduper(config.state_dir / "events"),
         post=post,
         react=react,
+        reviewer_preflight=mod.make_reviewer_preflight(),
         run_review=mod.make_run_review(
             config, github_token, current_snapshot=current_snapshot
         ),
@@ -474,6 +489,7 @@ run_mention() { # <event-id> <config> <event-file> <out-name>
       FM_TEST_GITHUB_READ_TOKEN="$GH_TOKEN_VALUE" \
       FM_CROSSCHECK_SLACK_CONFIG="$2" \
       FM_CROSSCHECK_SLACK_CROSSCHECK_BIN="$FIXTURE" \
+      FM_CROSSCHECK_REVIEWER_CONFIG="${FMT_REVIEWER_CONFIG:-$REVIEWER_CONFIG}" \
       FM_FIXTURE_LOG="$FIXTURE_LOG" \
       FM_FIXTURE_MODE="${FM_FIXTURE_MODE:-clear}" \
       FM_FIXTURE_REVIEWER_JSON="${FM_FIXTURE_REVIEWER_JSON:-}" \
@@ -495,6 +511,15 @@ run_mention() { # <event-id> <config> <event-file> <out-name>
 
 fixture_run_count() {
   grep -c . "$FIXTURE_LOG" || true
+}
+
+meter_request_count() {
+  "$PYTHON" -c 'import json, pathlib, sys
+count = 0
+for path in pathlib.Path(sys.argv[1]).glob("*.json"):
+    value = json.loads(path.read_text(encoding="utf-8"))
+    count += len(value.get("requests", []))
+print(count)' "$HOMEDIR/state/crosscheck-slack/meter"
 }
 
 last_post_text() {
@@ -677,6 +702,38 @@ test_channel_outside_allowlist_is_refused() {
   after=$(fixture_run_count)
   [ "$after" = "$before" ] || fail "a non-allowlisted channel reached the crosscheck CLI"
   pass "a mention outside the channel allowlist is refused without a review"
+}
+
+test_missing_configured_reviewer_is_refused_before_admission() {
+  before_runs=$(fixture_run_count)
+  before_requests=$(meter_request_count)
+  before_starts=$(grep -c "Review started" "$POSTS" || true)
+  before_reacts=$(wc -l < "$REACTS" | tr -d ' ')
+  event="$TMP_ROOT/event-no-reviewer.json"
+  write_event "$event" C0TESTCHAN U0ALICE 1755640003.500100 "$GOOD_PR_TEXT"
+  FMT_REVIEWER_CONFIG="$TMP_ROOT/missing-reviewer.json" \
+    run_mention ev-no-reviewer-1 "$CONFIG_MAIN" "$event" no-reviewer \
+    || fail "missing-reviewer mention errored: $RUN_MENTION_OUTPUT"
+  assert_contains "$RUN_MENTION_OUTPUT" "action: reviewer-refused" \
+    "missing reviewer was not refused at Slack admission"
+  reply=$(last_post_text)
+  assert_contains "$reply" "no configured Crosscheck reviewer is available" \
+    "reviewer refusal did not name the unavailable configuration"
+  assert_contains "$reply" "No review started" \
+    "reviewer refusal did not state that no review started"
+  after_runs=$(fixture_run_count)
+  after_requests=$(meter_request_count)
+  after_starts=$(grep -c "Review started" "$POSTS" || true)
+  after_reacts=$(wc -l < "$REACTS" | tr -d ' ')
+  [ "$after_runs" = "$before_runs" ] \
+    || fail "missing reviewer reached the Crosscheck CLI"
+  [ "$after_requests" = "$before_requests" ] \
+    || fail "missing reviewer consumed the submitter request meter"
+  [ "$after_starts" = "$before_starts" ] \
+    || fail "missing reviewer posted a review-start acknowledgement"
+  [ "$after_reacts" = "$before_reacts" ] \
+    || fail "missing reviewer posted a review-start reaction"
+  pass "a missing configured reviewer is refused before metering or review startup"
 }
 
 test_completed_review_names_lane_head_task_and_artifact() {
@@ -1184,6 +1241,7 @@ UNITS=(
   test_multiple_links_are_refused
   test_out_of_allowlist_repo_is_refused
   test_channel_outside_allowlist_is_refused
+  test_missing_configured_reviewer_is_refused_before_admission
   test_completed_review_names_lane_head_task_and_artifact
   test_lane_naming_covers_fallback_and_explicit_marker
   test_duplicate_event_id_starts_one_review
@@ -1206,7 +1264,7 @@ UNITS=(
 case "${FM_SLACK_TEST_GROUP:-all}" in
   service-repair) UNITS=(test_service_install_contains_no_credentials) ;;
   repair) UNITS=(test_completed_review_names_lane_head_task_and_artifact test_redelivery_revalidates_head test_service_install_contains_no_credentials) ;;
-  compatibility) UNITS=(test_completed_review_names_lane_head_task_and_artifact test_undelivered_verdict_is_reposted_on_redelivery test_head_change_invalidates_the_verdict test_four_workers_and_concurrent_cap_are_binding) ;;
+  compatibility) UNITS=(test_missing_configured_reviewer_is_refused_before_admission test_completed_review_names_lane_head_task_and_artifact test_undelivered_verdict_is_reposted_on_redelivery test_head_change_invalidates_the_verdict test_four_workers_and_concurrent_cap_are_binding) ;;
   all) ;;
   *) fail "unknown Slack test group" ;;
 esac

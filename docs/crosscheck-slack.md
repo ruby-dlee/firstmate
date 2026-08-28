@@ -45,12 +45,13 @@ The listener never translates a queue, GitHub, reviewer, Azure, cleanup, ledger,
 
 ## Exact-head admission
 
-The listener admits one allowlisted PR URL only after its read-only GitHub credential resolves a live 40-character head SHA.
+The listener admits one allowlisted PR URL only after its read-only GitHub credential resolves a live 40-character head SHA and Crosscheck validates a nonempty configured reviewer roster.
+That reviewer preflight happens before the submitter request meter, start acknowledgement, reaction, or review process, so a broken roster is a visible refusal rather than an admitted request.
 Draft status is deliberately not a review-admission input; review clearance does not authorize a merge (see [the merge lifecycle](architecture.md#project-modes-are-explicit)).
 Authorship, model family, account identity, branch, worktree, checkout state, task metadata, and launch records are not admission inputs.
 A revision produced in another checkout therefore follows the same review path as any other revision.
 
-The concrete enemies stopped at admission are a request aimed outside the operator-approved repositories and a request whose live revision cannot be bound exactly.
+The concrete enemies stopped at admission are a request aimed outside the operator-approved repositories, a request whose live revision cannot be bound exactly, and a request that cannot reach the configured independent reviewer roster.
 The listener passes the admitted URL to the independent roster described in [Crosscheck's reviewer contract](crosscheck.md#reviewer-harness); the response checks below bind the verdict to that revision.
 No authorship artifact is produced or copied into the review data directory.
 
@@ -174,7 +175,7 @@ FM_HOME=/Users/dongkeun/firstmate-home \
   bin/fm-crosscheck-slack.sh --selftest
 ```
 
-Check that all three central credentials can be loaded without printing them (this does not authenticate against Slack or GitHub):
+Check that all three central credentials and the configured Crosscheck reviewer roster can be loaded without printing them (this does not authenticate against Slack or GitHub):
 
 ```sh
 FM_HOME=/Users/dongkeun/firstmate-home \

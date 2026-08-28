@@ -19,10 +19,11 @@ Posture, in one place:
   in a child process environment (except the GitHub read credential, whose
   entire job is to be the crosscheck subprocess's read credential), and
   every log line passes through a redactor that knows every secret value.
-- Admission binds only the allowlisted repository and URL to the live PR head.
-  Authorship, account, model, branch, worktree, checkout, and launch records are
-  not admission inputs. The exact reviewed head is checked again before any
-  verdict is delivered.
+- Admission requires the allowlisted repository and URL, the live PR head, and
+  a nonempty configured Crosscheck reviewer roster before metering or review
+  startup. Authorship, account, model, branch, worktree, checkout, and launch
+  records are not admission inputs. The exact reviewed head is checked again
+  before any verdict is delivered.
 - Every Slack event id is claimed durably before any work starts, so a
   retried delivery of the same event never starts a second review.
 - Team usage is metered per submitter per UTC day in a durable JSON ledger
@@ -795,6 +796,47 @@ def fetch_pr_snapshot(pr_url: str, github_token: str) -> PrSnapshot:
 
 
 @functools.lru_cache(maxsize=1)
+def crosscheck_core() -> Any:
+    """Load the Crosscheck policy owner without copying its roster contract."""
+
+    module_path = BIN_DIR / "fm-crosscheck.py"
+    spec = importlib.util.spec_from_file_location(
+        "fm_crosscheck_slack_core", module_path
+    )
+    require(
+        spec is not None and spec.loader is not None,
+        "Crosscheck policy owner is unavailable",
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def make_reviewer_preflight() -> Callable[[], None]:
+    """Return a live admission check for the configured reviewer roster."""
+
+    fm_home_raw = os.environ.get("FM_HOME", "")
+    if not fm_home_raw:
+        raise SlackExposureError("FM_HOME is required to validate Crosscheck reviewers")
+    fm_home = Path(fm_home_raw).resolve()
+
+    def reviewer_preflight() -> None:
+        try:
+            reviewers = crosscheck_core().reviewer_roster(fm_home)
+        except Exception as exc:
+            raise SlackExposureError(
+                f"configured Crosscheck reviewer preflight failed: {exc}"
+            ) from exc
+        require(
+            isinstance(reviewers, list) and reviewers,
+            "configured Crosscheck reviewer preflight returned no reviewers",
+        )
+
+    return reviewer_preflight
+
+
+@functools.lru_cache(maxsize=1)
 def operator_azure_environment() -> dict[str, str]:
     """Load the coordinator's proven fleet environment for launchd service use."""
 
@@ -1283,6 +1325,7 @@ class MentionContext:
     deduper: EventDeduper
     post: Callable[[str, str, str], None]  # channel, thread_ts, text
     react: Callable[[str, str, str], None]  # channel, ts, emoji name
+    reviewer_preflight: Callable[[], None]
     run_review: Callable[[str, PrSnapshot], ReviewOutcome]
     pr_snapshot: Callable[[str], PrSnapshot] = _unwired_pr_snapshot
     log: Callable[[str], None] = log
@@ -1364,6 +1407,14 @@ def handle_mention(event_id: str, event: dict[str, Any], ctx: MentionContext) ->
             "head-refused",
             f"Refusing to review {pr_url}: its exact current head could not be "
             f"verified ({escape_slack(clamp(redact(str(exc)), 300))}). No review started.",
+        )
+    try:
+        ctx.reviewer_preflight()
+    except Exception as exc:
+        return terminal_reply(
+            "reviewer-refused",
+            f"Refusing to review {pr_url}: no configured Crosscheck reviewer is "
+            f"available ({escape_slack(clamp(redact(str(exc)), 300))}). No review started.",
         )
     # The request-count cap is the bound that actually binds today. The USD
     # bound remains a forward contract; observational Crosscheck telemetry
@@ -1712,6 +1763,7 @@ class SocketModeService:
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
         self.meter = DailyMeter(config.state_dir / "meter")
         self.deduper = EventDeduper(config.state_dir / "events")
+        self.reviewer_preflight = make_reviewer_preflight()
         self.run_review = make_run_review(config, github_token)
         self._github_token = github_token
         removed = sweep_state(config.state_dir)
@@ -1751,6 +1803,7 @@ class SocketModeService:
             deduper=self.deduper,
             post=self.web.post_message,
             react=self.web.add_reaction,
+            reviewer_preflight=self.reviewer_preflight,
             run_review=self.run_review,
             pr_snapshot=lambda pr_url: fetch_pr_snapshot(pr_url, self._github_token),
         )
@@ -1858,7 +1911,8 @@ def selftest(config_path: Path) -> int:
         f"({'set' if os.environ.get(config.github_token_env) else 'UNSET'})",
         f"channel_allowlist: {len(config.channel_allowlist)} channel(s)",
         f"repo_allowlist: {', '.join(config.repo_allowlist)}",
-        "admission: allowlisted URL plus live exact head (authorship ignored)",
+        "admission: allowlisted URL, live exact head, and configured reviewer "
+        "(authorship ignored)",
         f"review_workers: {REVIEW_WORKERS} (shared core FIFO lanes)",
         "daily_request_cap: "
         + (
@@ -1931,7 +1985,11 @@ def main() -> int:
             path = Path(args.config) if args.config else default_config_path()
             config = load_config(path)
             configured_credentials(config)
-            print("preflight: config, central credentials, and Azure fleet are ready")
+            make_reviewer_preflight()()
+            print(
+                "preflight: config, central credentials, reviewer roster, "
+                "and Azure fleet are ready"
+            )
             return 0
         if args.command == "selftest":
             path = Path(args.config) if args.config else default_config_path()

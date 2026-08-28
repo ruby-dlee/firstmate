@@ -48,12 +48,6 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" "readFileSync(\`\${state}/.lock\`" "tracked extension does not read the effective session lock"
   assert_contains "$text" 'return pidAlive(lockPid) ? "other" : "missing"' "tracked extension does not allow a pre-lock load marker"
   assert_contains "$text" 'if (lockOwnership() === "other") return' "tracked extension overwrites another live session marker"
-  assert_contains "$text" "if (!sessionOwnsLock()) {" "tracked extension arms without the session lock"
-  assert_contains "$text" 'startArmChild();' "tracked extension does not start a successor watcher from the child-exit path"
-  assert_contains "$text" 'pi.on("agent_settled"' "tracked extension does not use Pi settlement semantics for delivery retry"
-  assert_contains "$text" 'observeWakeAdmission' "tracked extension does not require observable custom-message admission"
-  assert_contains "$text" 'deliveryId: pending.deliveryId' "tracked extension wake attempts lack a stable admission identity"
-  assert_contains "$text" 'watch(state, { persistent: false }' "tracked extension does not stop its cycle on lock or away-mode transitions"
   assert_contains "$text" "writeFileSync(marker, \`\${extensionVersion}\\n\${process.pid}\\n\`)" "tracked extension does not write the content version and process marker"
   assert_contains "$text" "const config = process.env.FM_CONFIG_OVERRIDE" "tracked extension missing effective config resolution"
   assert_contains "$text" "FM_CONFIG_OVERRIDE: config" "tracked extension does not pass the effective config to the watcher arm"
@@ -363,6 +357,7 @@ let idle = true;
 let sendAttempts = 0;
 let admissions = 0;
 let triggeredTurns = 0;
+const deliveryAttempts = [];
 const admittedMessages = [];
 const ctx = {
   sessionManager: { getBranch: () => branch },
@@ -380,13 +375,20 @@ const pi = {
   },
   sendMessage(message, options) {
     sendAttempts += 1;
+    deliveryAttempts.push({
+      deliveryId: message.details?.deliveryId,
+      attempt: message.details?.attempt,
+    });
     if (message.customType !== "firstmate-watcher-wake" || message.display !== true) {
       throw new Error(`wake was not a visible custom message: ${JSON.stringify(message)}`);
     }
     if (options?.deliverAs !== "followUp" || options?.triggerTurn !== true) {
       throw new Error(`wake did not use triggering follow-up delivery: ${JSON.stringify(options)}`);
     }
-    if (sendAttempts === 1) return; // Reproduce Pi handoff with no observable admission.
+    if (sendAttempts === 1) {
+      idle = false;
+      return; // Reproduce Pi handoff with no observable admission while its run remains active.
+    }
     idle = false;
     queueMicrotask(async () => {
       triggeredTurns += 1;
@@ -474,8 +476,21 @@ if (!queuePending()) throw new Error("first queue drained before successor proof
 assertSingleLiveArm(2);
 const firstBeacon = readFileSync(`${process.env.FM_HOME}/state/.last-watcher-beat`, "utf8");
 if (!firstBeacon.includes("launch=2")) throw new Error(`successor beacon was not fresh: ${firstBeacon}`);
-await waitFor(() => sendAttempts >= 2 && admissions >= 1 && triggeredTurns >= 1, "retried admitted first wake");
+await waitFor(() => sendAttempts === 1, "first unadmitted delivery attempt");
+await sleep(60);
+if (sendAttempts !== 1) throw new Error(`delivery retried before Pi settled: ${sendAttempts}`);
+idle = true;
+await handlers.get("agent_settled")?.({ type: "agent_settled" }, ctx);
+await waitFor(() => sendAttempts >= 2 && admissions >= 1 && triggeredTurns >= 1, "settlement retry admitting first wake");
 if (sendAttempts !== 2) throw new Error(`first wake flooded delivery attempts: ${sendAttempts}`);
+if (
+  !deliveryAttempts[0]?.deliveryId ||
+  deliveryAttempts[0].deliveryId !== deliveryAttempts[1]?.deliveryId ||
+  deliveryAttempts[0].attempt !== 1 ||
+  deliveryAttempts[1]?.attempt !== 2
+) {
+  throw new Error(`first wake did not retain one delivery identity across retry: ${JSON.stringify(deliveryAttempts)}`);
+}
 if (admittedMessages[0]?.details?.attempt !== 2) {
   throw new Error(`first wake was not admitted on retry: ${JSON.stringify(admittedMessages[0]?.details)}`);
 }
@@ -490,6 +505,12 @@ const secondBeacon = readFileSync(`${process.env.FM_HOME}/state/.last-watcher-be
 if (!secondBeacon.includes("launch=3")) throw new Error(`second successor beacon was not fresh: ${secondBeacon}`);
 await waitFor(() => admissions >= 2 && triggeredTurns >= 2, "admitted second wake");
 if (sendAttempts !== 3) throw new Error(`second wake flooded delivery attempts: ${sendAttempts}`);
+if (
+  deliveryAttempts[2]?.attempt !== 1 ||
+  deliveryAttempts[2]?.deliveryId === deliveryAttempts[1]?.deliveryId
+) {
+  throw new Error(`second wake reused the first wake delivery identity: ${JSON.stringify(deliveryAttempts)}`);
+}
 if (admittedMessages[1]?.customType !== "firstmate-watcher-wake") {
   throw new Error("second wake was not context-participating custom input");
 }

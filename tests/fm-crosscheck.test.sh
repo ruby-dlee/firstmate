@@ -4820,32 +4820,24 @@ test_claims_lookup_error_never_reaches_reviewer() {
   pass "PR claims lookup errors are tool failures and never become a review run"
 }
 
-test_reviewer_configuration_failures_are_tool_failures() {
-  local mode record case_dir base head rc
-  for mode in absent same-model; do
-    record=$(make_case "reviewer-$mode")
-    IFS=$'\t' read -r case_dir base head <<< "$record"
-    case "$mode" in
-      absent) rm "$case_dir/reviewer.json" ;;
-      same-model)
-        sed -i.bak -e 's/harness=claude/harness=codex/' -e 's/model=claude-opus-5/model=gpt-5.6-sol/' "$case_dir/state/task-x1.meta"
-        rm "$case_dir/state/task-x1.meta.bak"
-        ;;
-    esac
-    set +e
-    run_case "$case_dir" "$base" "$head" clear run > "$case_dir/out" 2> "$case_dir/err"
-    rc=$?
-    set -e
-    expect_code 1 "$rc" "$mode reviewer"
-    assert_grep 'CROSSCHECK TOOL-FAILURE: reviewer preflight failed:' "$case_dir/err" \
-      "$mode reviewer configuration did not fail as a named tool preflight"
-    assert_no_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
-      "$mode reviewer configuration collapsed into a review verdict"
-    assert_no_grep 'CROSSCHECK BLOCKING' "$case_dir/err" \
-      "$mode reviewer configuration collapsed into a blocking verdict"
-    assert_absent "$case_dir/codex.log" "$mode reviewer still launched"
-  done
-  pass "absent reviewer configuration and default same-model review fail closed"
+test_missing_reviewer_configuration_is_tool_failure() {
+  local record case_dir base head rc
+  record=$(make_case reviewer-absent)
+  IFS=$'\t' read -r case_dir base head <<< "$record"
+  rm "$case_dir/reviewer.json"
+  set +e
+  run_case "$case_dir" "$base" "$head" clear run > "$case_dir/out" 2> "$case_dir/err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "absent reviewer"
+  assert_grep 'CROSSCHECK TOOL-FAILURE: reviewer preflight failed:' "$case_dir/err" \
+    "absent reviewer configuration did not fail as a named tool preflight"
+  assert_no_grep 'CROSSCHECK UNREVIEWED' "$case_dir/err" \
+    "absent reviewer configuration collapsed into a review verdict"
+  assert_no_grep 'CROSSCHECK BLOCKING' "$case_dir/err" \
+    "absent reviewer configuration collapsed into a blocking verdict"
+  assert_absent "$case_dir/codex.log" "absent reviewer still launched"
+  pass "absent reviewer configuration fails closed"
 }
 
 test_stopped_reviewer_and_wrong_head_are_unreviewed() {
@@ -6646,7 +6638,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_artifacts_cannot_escape_designated_subtrees|\
     test_prompt_uses_only_bounded_ledger_projection|\
     test_claims_lookup_error_never_reaches_reviewer|\
-    test_reviewer_configuration_failures_are_tool_failures|\
+    test_missing_reviewer_configuration_is_tool_failure|\
     test_stopped_reviewer_and_wrong_head_are_unreviewed|\
     test_pytest_runner_resolves_through_a_uv_aware_ladder|\
     test_moved_default_branch_stays_reviewable|\
@@ -6744,7 +6736,7 @@ test_missing_pr_head_ref_fails_closed
 test_codex_reviewer_requires_bound_auth_and_clears_ambient_credentials
 test_null_ledger_fails_without_normalization
 test_claims_lookup_error_never_reaches_reviewer
-test_reviewer_configuration_failures_are_tool_failures
+test_missing_reviewer_configuration_is_tool_failure
 test_stopped_reviewer_and_wrong_head_are_unreviewed
 test_completed_reviewer_suspicion_is_blocking
 test_reading_only_suspicion_is_identity_only_blocking

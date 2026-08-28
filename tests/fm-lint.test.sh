@@ -22,6 +22,7 @@ set -u
 LINT="$ROOT/bin/fm-lint.sh"
 CI="$ROOT/.github/workflows/ci.yml"
 NM="$ROOT/.no-mistakes.yaml"
+NM_COMMAND="$ROOT/bin/fm-no-mistakes-lint-command.sh"
 INSTALLER="$ROOT/bin/fm-install-shellcheck.sh"
 # The authoritative file set the one owner must run.
 # The canonical set is these globs, spelled in the owner and nowhere else. The
@@ -72,9 +73,11 @@ test_nomistakes_invokes_the_owner() {
   assert_grep 'else exec bin/fm-azure-runner-dispatch.sh lint -- bin/fm-azure-runner-command.sh' "$NM" "no-mistakes commands.lint must preserve the local/default dispatch owner"
   # shellcheck disable=SC2016  # The literal gate command must preserve runtime expansion.
   assert_grep 'exec "$FM_AZURE_VALIDATION_SHARD_BRIDGE" lint -- bin/fm-azure-runner-command.sh' "$NM" "Azure validation must move lint to the credential-free shard bridge"
-  [ "$(grep -Fc "bin/fm-lint.sh && uv run --directory tools/agent-fleet --locked ruff check ." "$NM")" -eq 1 ] || fail "no-mistakes lint must preserve one exact shell/Agent Fleet command"
+  [ "$(grep -Fc "bin/fm-no-mistakes-lint-command.sh" "$NM")" -eq 1 ] || fail "no-mistakes lint must preserve one exact scoped lint command"
+  assert_grep 'bin/fm-lint.sh' "$NM_COMMAND" "the scoped no-mistakes command must retain the shell-lint owner"
+  assert_grep 'uv run --directory tools/agent-fleet --locked ruff check .' "$NM_COMMAND" "the scoped no-mistakes command must retain locked Agent Fleet lint"
   assert_grep 'exec "$@"' "$ROOT/bin/fm-azure-runner-dispatch.sh" "Azure dispatch must preserve local execution as the default"
-  pass "no-mistakes pre-push lint preserves the exact owner locally and delegates it from Azure cells"
+  pass "no-mistakes pre-push lint preserves CI scope locally and delegates it from Azure cells"
 }
 
 test_pins_an_explicit_version() {

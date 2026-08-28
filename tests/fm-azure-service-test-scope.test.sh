@@ -12,7 +12,7 @@ focused_inventory_contract() {
   local listed count path
   listed=$($SCOPE list) || fail "focused Azure service inventory was unreadable"
   count=$(printf '%s\n' "$listed" | grep -c .)
-  [ "$count" -eq 10 ] || fail "focused Azure service inventory did not contain 10 tests"
+  [ "$count" -eq 11 ] || fail "focused Azure service inventory did not contain 11 tests"
   [ "$(printf '%s\n' "$listed" | sort -u | grep -c .)" -eq "$count" ] \
     || fail "focused Azure service inventory contains duplicates"
   while IFS= read -r path; do
@@ -22,11 +22,11 @@ focused_inventory_contract() {
   done <<EOF
 $listed
 EOF
-  pass "focused Azure service inventory contains only ten executable hermetic contracts"
+  pass "focused Azure service inventory contains only eleven executable hermetic contracts"
 }
 
 mode_falls_back_contract() {
-  local tmp repo base focused template_head shell_head broad out rc
+  local tmp repo base focused template_head lint_head shell_head broad out rc
   fm_test_tmproot_into tmp fm-azure-service-test-scope
   repo="$tmp/repo"
   mkdir -p "$repo/bin" "$repo/tests"
@@ -54,13 +54,19 @@ mode_falls_back_contract() {
   template_head=$(git -C "$repo" rev-parse HEAD)
   [ "$($repo/bin/fm-azure-service-test-scope.py mode "$base" "$template_head")" = focused ] \
     || fail "the authoritative Azure template did not select focused mode"
+  cp "$ROOT/bin/fm-no-mistakes-lint-command.sh" "$repo/bin/fm-no-mistakes-lint-command.sh"
+  git -C "$repo" add bin/fm-no-mistakes-lint-command.sh
+  git -C "$repo" commit -qm scoped-lint
+  lint_head=$(git -C "$repo" rev-parse HEAD)
+  [ "$($repo/bin/fm-azure-service-test-scope.py mode "$template_head" "$lint_head")" = focused ] \
+    || fail "the no-mistakes lint owner did not retain focused Azure CI"
   printf '#!/bin/sh\n' > "$repo/bin/fm-worker-lifecycle.sh"
   git -C "$repo" add bin/fm-worker-lifecycle.sh
   git -C "$repo" commit -qm focused-shell
   shell_head=$(git -C "$repo" rev-parse HEAD)
-  [ "$($repo/bin/fm-azure-service-test-scope.py mode "$base" "$shell_head")" = focused ] \
+  [ "$($repo/bin/fm-azure-service-test-scope.py mode "$lint_head" "$shell_head")" = focused ] \
     || fail "an owned shell change did not preserve focused mode"
-  [ "$($repo/bin/fm-azure-service-test-scope.py shell "$base" "$shell_head")" = bin/fm-worker-lifecycle.sh ] \
+  [ "$($repo/bin/fm-azure-service-test-scope.py shell "$lint_head" "$shell_head")" = bin/fm-worker-lifecycle.sh ] \
     || fail "focused lint did not select the exact changed shell file"
   printf 'broad\n' > "$repo/bin/fm-spawn.sh"
   git -C "$repo" add bin/fm-spawn.sh

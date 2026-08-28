@@ -419,11 +419,13 @@ No caller chooses an Azure account, sees a credential, invokes `fm-azure-runner.
 
 ### Production latency evidence
 
-The 2026-08-28 production run `01M151DHQQBWBHN2SEKJMM1ZDE` measured the bounded-parallel inventory runtime before the later six-reader and scoped-lint cutovers.
+The 2026-08-28 production run `01M151DHQQBWBHN2SEKJMM1ZDE` established the bounded-parallel inventory baseline before the later six-reader and scoped-lint cutovers.
 Its exact review worker completed admission in 216,327 ms, execution in 159,436 ms, and cleanup in 158,683 ms, for 534,446 ms across the three measured phases.
 Its exact test worker completed admission in 194,666 ms, execution in 254,543 ms, and cleanup in 136,369 ms, for 585,578 ms across the three measured phases.
 Both workers reached zero exact-slot residue.
 The same run spent 639,421 ms in the previous complete pre-push lint, which is the baseline the focused lint path replaces for an Azure-only diff.
+The first ordinary post-cutover review, run `01M157FJ7HKYMNYMFD2H9Z7GJX` at exact repository head `d729fd0978fe100c5f270e0c97568813fe172f51`, exercised the six-reader inventory path and completed admission in 216,383 ms, execution in 125,450 ms, and cleanup in 148,227 ms, for 490,060 ms across the three phases with zero exact-slot residue.
+That run was cancelled through the owner-fixes-only path after its reviewer found that the earlier wording overstated what this evidence proved, so it is review-phase evidence rather than an end-to-end validation result.
 These figures are operational observations, not timeout targets; later comparisons must use the same durable phase evidence and report cleanup residue separately.
 
 The failed retained proof `azr-763d70ab8206` used the generic Azure runner, reached runtime dependency installation, then exited 125 at `guest bootstrap: isolated executor failed` without any structured result.

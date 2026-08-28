@@ -31,37 +31,104 @@ export const Type = {
 JS
 }
 
-test_tracked_extension_present_and_self_hashing() {
-  local text expected_config_source
-  expected_config_source="config_dir=\\\"\${FM_CONFIG_OVERRIDE:-\$FM_HOME/config}\\\""
-  assert_present "$EXT" "tracked Pi primary watcher extension is missing"
-  text=$(cat "$EXT")
-  assert_contains "$text" "fm_watch_arm_pi" "tracked extension missing tool name"
-  assert_contains "$text" "fm-watch-arm-pi" "tracked extension missing command name"
-  assert_contains "$text" "fm-watch-arm.sh" "tracked extension missing watcher arm"
-  assert_contains "$text" "deliverAs: \"followUp\"" "tracked extension missing followUp delivery"
-  assert_contains "$text" ".pi-watch-extension-loaded" "tracked extension missing loaded marker"
-  assert_contains "$text" 'createHash("sha256").update(readFileSync(extensionFile)).digest("hex")' "tracked extension does not self-hash its own content for extensionVersion"
-  assert_contains "$text" 'fileURLToPath(import.meta.url)' "tracked extension does not self-locate via import.meta.url"
-  assert_contains "$text" "sessionOwnsLock" "tracked extension missing session lock ownership check"
-  assert_contains "$text" 'type LockOwnership = "owned" | "missing" | "other"' "tracked extension does not distinguish missing lock from another owner"
-  assert_contains "$text" "readFileSync(\`\${state}/.lock\`" "tracked extension does not read the effective session lock"
-  assert_contains "$text" 'return pidAlive(lockPid) ? "other" : "missing"' "tracked extension does not allow a pre-lock load marker"
-  assert_contains "$text" 'if (lockOwnership() === "other") return' "tracked extension overwrites another live session marker"
-  assert_contains "$text" "writeFileSync(marker, \`\${extensionVersion}\\n\${process.pid}\\n\`)" "tracked extension does not write the content version and process marker"
-  assert_contains "$text" "const config = process.env.FM_CONFIG_OVERRIDE" "tracked extension missing effective config resolution"
-  assert_contains "$text" "FM_CONFIG_OVERRIDE: config" "tracked extension does not pass the effective config to the watcher arm"
-  assert_contains "$text" "FM_WATCH_ARM_SCRIPT: armScript" "tracked extension does not pass the effective watcher arm script"
-  assert_contains "$text" "$expected_config_source" "tracked extension does not source the effective x-mode config"
-  assert_contains "$text" "exec \\\"\$FM_WATCH_ARM_SCRIPT\\\" --restart" "tracked extension does not restart into a Pi-owned watcher child"
-  assert_contains "$text" 'label: "Arm firstmate watcher"' "tracked extension tool is missing its human-readable label"
-  assert_contains "$text" 'parameters: Type.Object({})' "tracked extension tool is not using Pi's canonical TypeBox schema"
-  assert_contains "$text" 'content: [{ type: "text", text: result.message }]' "tracked extension tool is missing Pi text content"
-  assert_contains "$text" 'details: result' "tracked extension tool is missing structured result details"
-  assert_contains "$text" 'ctx.ui.notify' "tracked extension command does not notify through Pi's UI"
-  assert_contains "$text" 'process.once("exit", cleanupOnProcessExit)' "tracked extension lacks clean-process-exit cleanup"
-  assert_not_contains "$text" "[ -f config/x-mode.env ]" "tracked extension kept a repo-relative x-mode config path"
-  pass "Pi primary watcher extension is tracked, self-hashing, and self-locating"
+test_pi_extension_runtime_configuration_contract() {
+  local repo home config_dir plugin arm_log out status
+  fm_node_supports_ts_import || { pass "node lacks .ts import support, skipping Pi runtime configuration check"; return; }
+  repo="$TMP_ROOT/pi-runtime-contract-root"
+  home="$TMP_ROOT/pi-runtime-contract-home"
+  config_dir="$TMP_ROOT/pi-runtime-contract-config"
+  arm_log="$TMP_ROOT/pi-runtime-contract-arm.log"
+  mkdir -p "$repo/bin" "$home/state" "$home/config" "$config_dir"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  printf 'export FM_POLL=17\n' > "$config_dir/x-mode.env"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'config=%s script=%s poll=%s args=%s\n' \
+  "$FM_CONFIG_OVERRIDE" "$FM_WATCH_ARM_SCRIPT" "${FM_POLL:-}" "$*" > "$FM_ARM_LOG"
+printf '%s\n' "$$" > "$FM_CHILD_PID_FILE"
+exec sleep 600
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(NODE_OPTIONS=--disable-warning=ExperimentalWarning \
+    PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_CONFIG_OVERRIDE="$config_dir" \
+    FM_ARM_LOG="$arm_log" FM_CHILD_PID_FILE="$TMP_ROOT/pi-runtime-contract-child.pid" \
+    node --input-type=module 2>&1 <<'EOF'
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+let tool;
+const ctx = {
+  isIdle: () => true,
+  sessionManager: { getBranch: () => [] },
+  ui: { notify() {} },
+};
+const pi = {
+  on(event, handler) {
+    handlers.set(event, handler);
+  },
+  appendEntry() {},
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendMessage() {},
+};
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+async function waitFor(predicate, label) {
+  for (let i = 0; i < 100; i += 1) {
+    if (predicate()) return;
+    await sleep(20);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, "1\n");
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+if (!tool) throw new Error("Pi watch tool was not registered");
+const refused = await tool.execute("arm-without-lock", {}, undefined, undefined, ctx);
+if (refused.details?.ok !== false || !refused.content?.[0]?.text.includes("read-only")) {
+  throw new Error(`arm did not refuse another session lock: ${JSON.stringify(refused)}`);
+}
+if (existsSync(process.env.FM_ARM_LOG)) throw new Error("arm child started without session lock ownership");
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+const started = await tool.execute("arm-owned", {}, undefined, undefined, ctx);
+if (started.details?.ok !== true || !started.content?.[0]?.text.includes("started Pi extension arm child")) {
+  throw new Error(`owned arm did not start: ${JSON.stringify(started)}`);
+}
+await waitFor(() => existsSync(process.env.FM_ARM_LOG), "effective arm configuration");
+const expectedArm = `config=${process.env.FM_CONFIG_OVERRIDE} script=${process.env.FM_ROOT_OVERRIDE}/bin/fm-watch-arm.sh poll=17 args=--restart`;
+const armLog = readFileSync(process.env.FM_ARM_LOG, "utf8").trim();
+if (armLog !== expectedArm) throw new Error(`unexpected effective arm configuration: ${armLog}`);
+
+const marker = readFileSync(`${process.env.FM_HOME}/state/.pi-watch-extension-loaded`, "utf8").trim().split("\n");
+const expectedVersion = `sha256:${createHash("sha256").update(readFileSync(process.env.PLUGIN)).digest("hex")}`;
+if (marker[0] !== expectedVersion || marker[1] !== String(process.pid)) {
+  throw new Error(`loaded marker did not bind extension content and process: ${JSON.stringify(marker)}`);
+}
+const childPid = Number(readFileSync(process.env.FM_CHILD_PID_FILE, "utf8").trim());
+await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+await waitFor(() => !alive(childPid), "session shutdown cleanup");
+EOF
+)
+  status=$?
+  [ "$status" -eq 0 ] || printf '%s\n' "$out" >&2
+  expect_code 0 "$status" "Pi extension runtime must enforce lock, config, marker, arm, and cleanup contracts"
+  [ -z "$out" ] || fail "Pi runtime configuration test printed output: $out"
+  pass "Pi extension enforces its runtime lock, config, marker, arm, and cleanup contracts"
 }
 
 test_spawn_template_mentions_pi_watch_placeholder() {
@@ -1676,7 +1743,7 @@ if [ "${FM_PI_RETRY_CONTINUITY_PROOF:-0}" = 1 ]; then
   exit 0
 fi
 
-test_tracked_extension_present_and_self_hashing
+test_pi_extension_runtime_configuration_contract
 test_spawn_template_mentions_pi_watch_placeholder
 test_pi_extension_reports_external_healthy_watcher
 test_pi_tool_returns_agent_tool_result

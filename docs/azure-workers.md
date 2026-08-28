@@ -249,6 +249,7 @@ Reset deletes the inbound staging archives by name and the outcome blobs as part
 
 A cancelled no-mistakes placement may retain a pre-upgrade `delete-compute` claim that omitted the later service-cancel proof field.
 Task-scoped reconcile retires that legacy claim only when the current self-digested cancellation proof is exact, no matching execution or last execution exists, and live inventory already classifies the slot as exact released residual data capacity with all compute absent; it then continues through the ordinary reset path and logs the adopted mismatch.
+On explicitly absence-tolerant child inventory reads, Azure's generic `NotFound` with `vmName` after the parent VM disappears is handled like `ResourceNotFound`; mutation reads and every non-absence provider error still refuse.
 
 ## Release, reset, and cooldown
 

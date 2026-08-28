@@ -974,12 +974,21 @@ module.az = lambda *_args, **_kwargs: (
     "ERROR: (ResourceNotFound) child disappeared\nCode: ResourceNotFound\n",
 )
 assert module.show_full(controller, "/child", inventory_missing_ok=True) is None
+# Azure reports a listed Run Command whose parent VM disappeared as generic
+# NotFound with target vmName rather than ResourceNotFound. It is the same
+# read-only child-list race and is absence only on the opted-in inventory read.
+module.az = lambda *_args, **_kwargs: (
+    None, 3,
+    "ERROR: (NotFound) The entity was not found in this Azure location.\n"
+    "Code: NotFound\nTarget: vmName\n",
+)
+assert module.show_full(controller, "/child", inventory_missing_ok=True) is None
 try:
     module.show_full(controller, "/child")
 except module.ProviderError as exc:
-    assert "ResourceNotFound" in str(exc), exc
+    assert "NotFound" in str(exc), exc
 else:
-    raise AssertionError("non-inventory child read softened ResourceNotFound")
+    raise AssertionError("non-inventory child read softened an Azure absence response")
 module.az = lambda *_args, **_kwargs: (None, 3, "ERROR: (AuthorizationFailed) denied")
 try:
     module.show_full(controller, "/child")

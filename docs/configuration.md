@@ -115,7 +115,8 @@ Every reviewer `account_home` must be an existing absolute directory.
 
 [`crosscheck.md`](crosscheck.md) owns the reviewer-independence policy, including the removal of author-identity checks and the legacy admission workaround.
 
-The optional local, gitignored `config/crosscheck-same-model` file contains exactly `on` or `off`, defaults to `off` when absent, and is read fresh for every reviewer selection.
+Historical homes may still carry the retired gitignored `config/crosscheck-same-model` file.
+Crosscheck ignores it because reviewer selection no longer consumes author model origin; the configured dedicated reviewer roster is the independence boundary.
 `on` relaxes only the default model-FAMILY separation screen and makes the weaker mode explicit in the prompt and durable evidence. Independence is a family comparison: `gpt-5.5` and `gpt-5.6-sol` are one family, so a version bump never buys independence.
 Invalid values and unsafe file shapes fail closed.
 Crosscheck runs eligible entries in configured order, advancing to the next only when a reviewer could not reach its provider.

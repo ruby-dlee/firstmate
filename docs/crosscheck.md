@@ -17,7 +17,8 @@ FM_HOME=/Users/dongkeun/firstmate-home \
   https://github.com/OWNER/REPO/pull/NUMBER
 ```
 
-Registration records the live PR head, arms the merge poll, durably requests Crosscheck, starts one task-local coordinator, and returns without waiting for the review.
+Registration atomically replaces the task's recorded PR URL and live head, arms the merge poll, durably requests Crosscheck, starts one task-local coordinator, and returns without waiting for the review.
+Authorship, account, model, branch, worktree, checkout, and launch records are not registration or reviewer-admission inputs.
 A matching active request is reused, and a matching exact-head and exact-claims `CLEAR` result is verified without another review.
 Registering a new head replaces the queued request so the coordinator reviews that head next.
 Registration holds the task metadata lock from head capture through poll emission and request publication, so an older capture cannot replace a newer registration.

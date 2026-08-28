@@ -373,7 +373,11 @@ What this does NOT prove, stated so nobody reads more into it: four concurrent a
 The committing leg is the compartment child, recorded in R2/R3.
 These limits are machine-readable in `limitations`.
 
-## R6. Crosscheck reviews outside the author's model family
+## R6. Crosscheck uses the configured independent reviewer lane
+
+Current policy amendment: exact-revision review replaced author-family comparison.
+The configured dedicated reviewer roster is the independence boundary; author harness, model, account, branch, worktree, checkout, and launch provenance are not admission or execution inputs.
+Historical ledgers retain their review-family fields and the history below remains readable, but no new run compares them with an asserted author origin or consults `config/crosscheck-same-model`.
 
 Status: DONE, met live on 2026-08-22. Accepted Azure review `azure-r4-respond-285` recorded a
 `cross-family-primary` verdict against the codex-declared PR #285 head. Accepted Azure review
@@ -994,17 +998,10 @@ enter the same central four-lane FIFO allocator as direct requests.
 Exact channel and repository allowlists, durable event dedupe, atomic per-engineer daily caps,
 visible saturation, central reports, and a launchd restart owner remain required.
 
-The original build's branch-prefix authorship screen and unconditional `model=human-authored`
-staging are retired as unsafe.
-For managed agent work, the resumed lane requires a signed Firstmate launch attestation created
-before the agent starts and a second signed record that binds the same worktree, harness, exact
-model, model family, account identity, task identity, and generation to the exact PR head.
-Mutable task metadata cannot establish that provenance by itself.
-Slack submitter identity, branch names, and free text carry no authorship authority.
-Missing, conflicting, or unverifiable provenance fails closed in the request thread.
-Human authorship is accepted only from a separate trustworthy exact-head producer; until a
-no-mistakes human producer exists, such requests remain unclassified and fail closed rather than
-being guessed from commit or PR metadata.
+The original build's branch-prefix authorship screen, unconditional `model=human-authored` staging, and signed launch/exact-head author attestations are retired.
+The Slack lane admits an allowlisted URL only after resolving its live exact head.
+It never reads author declarations, account or model origin, branch names, task worktree state, checkout lineage, or launch records.
+The configured dedicated reviewer roster supplies independence, and the returned ledger must cover the admitted exact head.
 
 Activation still requires the Slack app's two credential values, one repository-scoped read-only
 GitHub credential, exact approved channel IDs, exact approved repositories, and a binding daily
@@ -1016,7 +1013,7 @@ Acceptance: an internal engineer other than the owner tags the bot in an approve
 allowlisted PR URL and receives an admitted exact-head CLEAR or findings reply in the same thread.
 The reply names the reviewed SHA, reviewer lane, task ID, and durable artifact; the meter records
 the engineer; duplicate delivery starts exactly one review; head movement invalidates the verdict;
-out-of-allowlist and unverified-provenance requests refuse; infrastructure failure never reads CLEAR.
+out-of-allowlist requests and requests without a resolvable exact live head refuse; infrastructure failure never reads CLEAR.
 
 ## C1. Crosscheck completes in 20 to 30 minutes
 

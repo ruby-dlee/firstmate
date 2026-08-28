@@ -11,12 +11,14 @@ When this session owns supervision and away mode is not active:
 6. The wake carries a stable delivery identity.
    Pi's `message_end` custom-message event or the matching `custom_message` session entry proves admission.
    A rejected or dropped handoff retries with capped exponential spacing while the durable queue remains undrained, and Pi's `agent_settled` event is the retry boundary for a handoff attempted during an active run.
+   Observed admission or queue drainage clears the pending delivery and cancels its retry timer.
 7. The follow-up delivery mode preserves Pi's steering priority for direct captain input, and one pending delivery plus one arm child prevents message floods and duplicate watchers.
 8. After a watcher wake, drain and handle the queue, but do not call the arm tool again because the extension already owns the successor.
 9. If the extension says the watcher is already healthy, do not start another cycle.
 10. Session shutdown, process exit, session-lock loss, or away-mode entry stops the extension-owned child and retry state.
     After lock reacquisition or away-mode exit, the same arm tool resumes the cycle.
 11. If the extension reports a watcher failure, drain queued wakes, inspect the failure text, and restart Pi with both extensions loaded if needed.
+    Non-actionable exits and spawn failures schedule automatic child restarts with capped exponential spacing; failure notifications without a queue requirement stop after three unadmitted attempts.
 12. Never use shell `&` for watcher supervision.
     The arm mechanism above is extension-owned, not a model tool call, but a manual recovery probe that backgrounds, pipes, or bundles the arm is denied automatically by the PreToolUse seatbelt (`bin/fm-arm-pretool-check.sh`, wired into the turn-end guard extension at `__FM_PI_TURNEND_EXT__`).
 
@@ -28,7 +30,7 @@ Both are tracked, project-local `.pi/extensions/*.ts` files that Pi auto-discove
 
 This document owns the Pi-specific boundary between direct captain input, automated supervision prompts, pending input, and rebuilt post-compaction model context.
 The watcher and turn-end extensions use Pi's context-participating `sendMessage()` custom-message path with distinct `firstmate-watcher-wake` and `firstmate-turnend-guard` types, `deliverAs: "followUp"`, and `triggerTurn: true`.
-Watcher delivery admission is observed through Pi's custom `message_end` lifecycle and matching session entry, not inferred from `sendMessage()` returning because the extension API intentionally returns `void` and reports asynchronous rejection separately.
+The admission checks in the cycle above do not infer success from `sendMessage()` returning because the extension API intentionally returns `void` and reports asynchronous rejection separately.
 They never use `sendUserMessage()` for automation, so supervision remains visible to the model without becoming a human-authored `role: "user"` turn.
 
 The watcher extension observes Pi's `input` event and records `interactive` or `rpc` submissions as provisional non-context `firstmate-direct-input-observation` entries before Pi queues or delivers them.
@@ -76,12 +78,11 @@ A separate compaction fixture cuts an unanswered direct question behind a custom
 ### 2026-08-28 persistent-cycle regression evidence
 
 The observed failure sequence was an armed Pi child, an actionable watcher exit with a durable queued wake, no persisted `firstmate-watcher-wake`, no successor child, and a stale beacon until later captain input caused a manual re-arm.
-The extension now treats one successful arm as ownership of a persistent single-child cycle rather than one child lifetime.
-It starts the successor before requesting model delivery, carries one stable delivery identity across attempts in custom-message details, observes admission through Pi's real `message_end` or session-entry semantics, and retries only after a no-run rejection timer or `agent_settled` proves that an active run did not admit the follow-up.
+The cycle protocol above owns the recovery contract exercised by the following proofs.
 
 Deterministic command: `tests/fm-pi-watch-extension.test.sh`.
 Observed output included `ok - Pi watcher self-rearms, retries unadmitted delivery, survives two wakes, and stops on ownership changes`.
-The fixture reproduces arm, durable queue append, actionable exit, first handoff with no observable admission, capped retry, custom-message admission and triggered turn, successor with a fresh beacon before queue drain, a second actionable exit, another successor, away-mode stop and resume, lock-loss stop and resume, and session-shutdown cleanup.
+The fixture reproduces arm, durable queue append, actionable exit, first handoff with no observable admission, settlement-triggered retry, custom-message admission and triggered turn, successor with a fresh beacon before queue drain, a second actionable exit, another successor, away-mode stop and resume, lock-loss stop and resume, and session-shutdown cleanup.
 
 Live command: `FM_PI_LIVE_E2E=1 FM_PI_LIVE_AUTH_DIR='/Users/dongkeun/.pi/firstmate-local' tests/fm-pi-primary-live-e2e.test.sh`.
 Observed output: `ok - Pi 0.84.2 live E2E persisted two custom wakes, self-rearmed both successors, and cleaned up on exit`.

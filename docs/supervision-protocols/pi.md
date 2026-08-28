@@ -10,8 +10,9 @@ When this session owns supervision and away mode is not active:
 5. On every actionable child exit, the extension starts the successor immediately without waiting for a model or tool turn, then sends a visible context-participating `firstmate-watcher-wake` custom follow-up.
 6. The wake carries a stable delivery identity.
    Pi's `message_end` custom-message event or the matching `custom_message` session entry proves admission.
-   A rejected or dropped handoff retries with capped exponential spacing while the durable queue remains undrained, and Pi's `agent_settled` event is the retry boundary for a handoff attempted during an active run.
-   Observed admission or queue drainage clears the pending delivery and cancels its retry timer.
+   The extension marks each fire-and-forget handoff in flight before calling Pi and does not retry it while asynchronous admission remains possible.
+   Pi's `agent_settled` event is the concrete non-admission boundary: if the matching wake was not observed by then, capped exponential retry continues while the durable queue remains undrained.
+   A synchronous handoff failure also permits retry; observed admission or queue drainage clears the pending delivery and cancels its retry timer.
 7. The follow-up delivery mode preserves Pi's steering priority for direct captain input, and one pending delivery plus one arm child prevents message floods and duplicate watchers.
 8. After a watcher wake, drain and handle the queue, but do not call the arm tool again because the extension already owns the successor.
 9. If the extension says the watcher is already healthy, do not start another cycle.
@@ -81,8 +82,8 @@ The observed failure sequence was an armed Pi child, an actionable watcher exit 
 The cycle protocol above owns the recovery contract exercised by the following proofs.
 
 Deterministic command: `tests/fm-pi-watch-extension.test.sh`.
-Observed output included `ok - Pi watcher self-rearms, retries unadmitted delivery, survives two wakes, and stops on ownership changes`.
-The fixture reproduces arm, durable queue append, actionable exit, first handoff with no observable admission, settlement-triggered retry, custom-message admission and triggered turn, successor with a fresh beacon before queue drain, a second actionable exit, another successor, away-mode stop and resume, lock-loss stop and resume, and session-shutdown cleanup.
+Observed output included `ok - Pi watcher avoids duplicate in-flight admission, retries after settlement, survives two wakes, and stops on ownership changes`.
+The fixture reproduces arm, durable queue append, actionable exit, a delayed asynchronous admission that arrives after the former retry timer would have fired without a duplicate handoff, custom-message admission and triggered turn, successor with a fresh beacon before queue drain, a second actionable exit whose first handoff reaches settlement without admission, stable-identity retry and admission, another successor, away-mode stop and resume, lock-loss stop and resume, and session-shutdown cleanup.
 
 Live command: `FM_PI_LIVE_E2E=1 FM_PI_LIVE_AUTH_DIR='/Users/dongkeun/.pi/firstmate-local' tests/fm-pi-primary-live-e2e.test.sh`.
 Observed output: `ok - Pi 0.84.2 live E2E persisted two custom wakes, self-rearmed both successors, and cleaned up on exit`.

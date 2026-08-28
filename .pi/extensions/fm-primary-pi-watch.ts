@@ -48,6 +48,7 @@ type PendingWakeDelivery = {
   reason: string;
   attempts: number;
   requiresQueue: boolean;
+  handoffPending: boolean;
 };
 
 const directExchangeEntryType = "firstmate-direct-exchange";
@@ -390,7 +391,7 @@ export default function (pi: ExtensionAPI) {
 
   function scheduleWakeDeliveryRetry(): void {
     const pending = pendingWakeDelivery;
-    if (!pending || deliveryRetryTimer || !cycleCanRun()) return;
+    if (!pending || pending.handoffPending || deliveryRetryTimer || !cycleCanRun()) return;
     if (pending.requiresQueue && !wakeQueuePending()) {
       clearPendingWakeDelivery();
       return;
@@ -409,7 +410,7 @@ export default function (pi: ExtensionAPI) {
 
   function attemptWakeDelivery(): void {
     const pending = pendingWakeDelivery;
-    if (!pending || !cycleCanRun()) return;
+    if (!pending || pending.handoffPending || !cycleCanRun()) return;
     if (observeWakeAdmission()) return;
     if (pending.requiresQueue && !wakeQueuePending()) {
       clearPendingWakeDelivery();
@@ -420,6 +421,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     pending.attempts += 1;
+    pending.handoffPending = true;
     try {
       pi.sendMessage(
         {
@@ -437,6 +439,7 @@ export default function (pi: ExtensionAPI) {
         { deliverAs: "followUp", triggerTurn: true },
       );
     } catch {
+      if (pendingWakeDelivery?.deliveryId === pending.deliveryId) pending.handoffPending = false;
       scheduleWakeDeliveryRetry();
       return;
     }
@@ -444,14 +447,7 @@ export default function (pi: ExtensionAPI) {
     queueMicrotask(() => {
       if (pendingWakeDelivery?.deliveryId !== pending.deliveryId) return;
       if (observeWakeAdmission()) return;
-      if (pending.requiresQueue && !wakeQueuePending()) {
-        clearPendingWakeDelivery();
-        return;
-      }
-      // Accepted follow-ups are delivered before Pi emits agent_settled.
-      // Retry on that lifecycle event while Pi is busy; use this bounded timer
-      // only when no agent run started, which is the observable rejection/drop case.
-      if (runtimeIsIdle() !== false) scheduleWakeDeliveryRetry();
+      if (pending.requiresQueue && !wakeQueuePending()) clearPendingWakeDelivery();
     });
   }
 
@@ -466,6 +462,7 @@ export default function (pi: ExtensionAPI) {
       reason,
       attempts: 0,
       requiresQueue,
+      handoffPending: false,
     };
     attemptWakeDelivery();
   }
@@ -626,6 +623,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", (_event, ctx) => {
     rememberContext(ctx);
     if (!pendingWakeDelivery || observeWakeAdmission()) return;
+    pendingWakeDelivery.handoffPending = false;
     if (pendingWakeDelivery.requiresQueue && !wakeQueuePending()) {
       clearPendingWakeDelivery();
       return;

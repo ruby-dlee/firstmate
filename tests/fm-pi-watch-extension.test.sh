@@ -453,32 +453,37 @@ const pi = {
       throw new Error(`wake did not use triggering follow-up delivery: ${JSON.stringify(options)}`);
     }
     if (sendAttempts === 1) {
-      idle = false;
-      return; // Reproduce Pi handoff with no observable admission while its run remains active.
+      setTimeout(() => void admitMessage(message), 80);
+      return; // Reproduce asynchronous admission after the old retry timer would have fired.
     }
-    idle = false;
-    queueMicrotask(async () => {
-      triggeredTurns += 1;
-      await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
-      const customMessage = { role: "custom", ...message, timestamp: Date.now() };
-      await handlers.get("message_end")?.({ type: "message_end", message: customMessage }, ctx);
-      branch.push({
-        type: "custom_message",
-        id: `wake-${admissions + 1}`,
-        parentId: branch.at(-1)?.id ?? null,
-        timestamp: new Date().toISOString(),
-        customType: message.customType,
-        content: message.content,
-        display: message.display,
-        details: message.details,
-      });
-      admittedMessages.push(customMessage);
-      admissions += 1;
-      idle = true;
-      await handlers.get("agent_settled")?.({ type: "agent_settled" }, ctx);
-    });
+    if (sendAttempts === 2) {
+      idle = false;
+      return; // Reproduce a handoff that reaches settlement without observable admission.
+    }
+    queueMicrotask(() => void admitMessage(message));
   },
 };
+async function admitMessage(message) {
+  idle = false;
+  triggeredTurns += 1;
+  await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+  const customMessage = { role: "custom", ...message, timestamp: Date.now() };
+  await handlers.get("message_end")?.({ type: "message_end", message: customMessage }, ctx);
+  branch.push({
+    type: "custom_message",
+    id: `wake-${admissions + 1}`,
+    parentId: branch.at(-1)?.id ?? null,
+    timestamp: new Date().toISOString(),
+    customType: message.customType,
+    content: message.content,
+    display: message.display,
+    details: message.details,
+  });
+  admittedMessages.push(customMessage);
+  admissions += 1;
+  idle = true;
+  await handlers.get("agent_settled")?.({ type: "agent_settled" }, ctx);
+}
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 async function waitFor(predicate, label, attempts = 500) {
   for (let i = 0; i < attempts; i += 1) {
@@ -543,24 +548,14 @@ if (!queuePending()) throw new Error("first queue drained before successor proof
 assertSingleLiveArm(2);
 const firstBeacon = readFileSync(`${process.env.FM_HOME}/state/.last-watcher-beat`, "utf8");
 if (!firstBeacon.includes("launch=2")) throw new Error(`successor beacon was not fresh: ${firstBeacon}`);
-await waitFor(() => sendAttempts === 1, "first unadmitted delivery attempt");
-await sleep(60);
-if (sendAttempts !== 1) throw new Error(`delivery retried before Pi settled: ${sendAttempts}`);
-idle = true;
-await handlers.get("agent_settled")?.({ type: "agent_settled" }, ctx);
-await waitFor(() => sendAttempts >= 2 && admissions >= 1 && triggeredTurns >= 1, "settlement retry admitting first wake");
-if (sendAttempts !== 2) throw new Error(`first wake flooded delivery attempts: ${sendAttempts}`);
-if (
-  !deliveryAttempts[0]?.deliveryId ||
-  deliveryAttempts[0].deliveryId !== deliveryAttempts[1]?.deliveryId ||
-  deliveryAttempts[0].attempt !== 1 ||
-  deliveryAttempts[1]?.attempt !== 2
-) {
-  throw new Error(`first wake did not retain one delivery identity across retry: ${JSON.stringify(deliveryAttempts)}`);
+await waitFor(() => sendAttempts === 1, "first delayed delivery attempt");
+await sleep(50);
+if (sendAttempts !== 1) throw new Error(`in-flight handoff was duplicated before admission: ${sendAttempts}`);
+await waitFor(() => admissions >= 1 && triggeredTurns >= 1, "asynchronous admission of first wake");
+if (sendAttempts !== 1 || deliveryAttempts[0]?.attempt !== 1 || admittedMessages[0]?.details?.attempt !== 1) {
+  throw new Error(`first wake was not admitted exactly once: ${JSON.stringify({ deliveryAttempts, admittedMessages })}`);
 }
-if (admittedMessages[0]?.details?.attempt !== 2) {
-  throw new Error(`first wake was not admitted on retry: ${JSON.stringify(admittedMessages[0]?.details)}`);
-}
+if (!deliveryAttempts[0]?.deliveryId) throw new Error("first wake had no delivery identity");
 writeFileSync(`${process.env.FM_HOME}/state/.wake-queue`, "");
 await waitFor(() => !queuePending(), "first queue drain");
 
@@ -570,16 +565,24 @@ await waitFor(() => launchCount() >= 3 && alive(armPid(3)), "successor after sec
 assertSingleLiveArm(3);
 const secondBeacon = readFileSync(`${process.env.FM_HOME}/state/.last-watcher-beat`, "utf8");
 if (!secondBeacon.includes("launch=3")) throw new Error(`second successor beacon was not fresh: ${secondBeacon}`);
-await waitFor(() => admissions >= 2 && triggeredTurns >= 2, "admitted second wake");
+await waitFor(() => sendAttempts === 2, "second unadmitted delivery attempt");
+await sleep(60);
+if (sendAttempts !== 2) throw new Error(`second wake retried before Pi settled: ${sendAttempts}`);
+idle = true;
+await handlers.get("agent_settled")?.({ type: "agent_settled" }, ctx);
+await waitFor(() => sendAttempts >= 3 && admissions >= 2 && triggeredTurns >= 2, "settlement retry admitting second wake");
 if (sendAttempts !== 3) throw new Error(`second wake flooded delivery attempts: ${sendAttempts}`);
 if (
-  deliveryAttempts[2]?.attempt !== 1 ||
-  deliveryAttempts[2]?.deliveryId === deliveryAttempts[1]?.deliveryId
+  deliveryAttempts[1]?.attempt !== 1 ||
+  deliveryAttempts[2]?.attempt !== 2 ||
+  !deliveryAttempts[1]?.deliveryId ||
+  deliveryAttempts[1].deliveryId !== deliveryAttempts[2]?.deliveryId ||
+  deliveryAttempts[1].deliveryId === deliveryAttempts[0]?.deliveryId
 ) {
-  throw new Error(`second wake reused the first wake delivery identity: ${JSON.stringify(deliveryAttempts)}`);
+  throw new Error(`second wake did not retain a distinct delivery identity across retry: ${JSON.stringify(deliveryAttempts)}`);
 }
-if (admittedMessages[1]?.customType !== "firstmate-watcher-wake") {
-  throw new Error("second wake was not context-participating custom input");
+if (admittedMessages[1]?.customType !== "firstmate-watcher-wake" || admittedMessages[1]?.details?.attempt !== 2) {
+  throw new Error(`second wake was not admitted on retry as custom input: ${JSON.stringify(admittedMessages[1])}`);
 }
 writeFileSync(`${process.env.FM_HOME}/state/.wake-queue`, "");
 await waitFor(() => !queuePending(), "second queue drain");
@@ -619,7 +622,7 @@ EOF
   [ "$status" -eq 0 ] || printf '%s\n' "$out" >&2
   expect_code 0 "$status" "Pi durable watcher cycle must retry observable delivery and survive consecutive wakes"
   [ -z "$out" ] || fail "Pi durable-cycle test printed output: $out"
-  pass "Pi watcher self-rearms, retries unadmitted delivery, survives two wakes, and stops on ownership changes"
+  pass "Pi watcher avoids duplicate in-flight admission, retries after settlement, survives two wakes, and stops on ownership changes"
 }
 
 test_pi_compaction_preserves_direct_exchange_and_pending_input() {

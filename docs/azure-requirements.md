@@ -36,7 +36,9 @@ Added the same day:
 - A cost guard, so that a day's spend cannot quietly reach 100 dollars.
 - "For cross-check, just use the same pi fleet (or copy it in, whatever works)."
 
-Amended by the owner on 2026-08-19: the crosscheck requirement is that no author's work is
+The following dated Crosscheck amendments are historical; [Crosscheck's reviewer contract](crosscheck.md#reviewer-harness) owns the current policy and supersedes their author-family requirements.
+
+Amended by the owner on 2026-08-19: the crosscheck requirement was that no author's work was
 reviewed only by its own model family, not the literal codex/claude pairing quoted above.
 The second reviewer family is GLM-5.2 on Azure AI Foundry.
 pi-anthropic was rejected the same day (API pricing), as was an interim same-day

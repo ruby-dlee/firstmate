@@ -996,7 +996,7 @@ def recorded_cross_family_lane_for_model(model: Any) -> dict[str, str] | None:
 
     New reviewer selection must use `cross_family_lane_for_model`, which
     recognizes only the current regular selector. This compatibility reader is
-    deliberately limited to model-family and ledger validation so an accepted
+    deliberately limited to durable reviewer and ledger validation so an accepted
     Fast-path record stays readable without making that path launchable.
     """
 

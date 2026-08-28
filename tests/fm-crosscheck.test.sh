@@ -2978,27 +2978,22 @@ test_missing_metadata_for_existing_task_fails_closed() {
   pass "existing durable Crosscheck state requires task metadata before dispatch"
 }
 
-test_existing_task_metadata_identity_collision_fails_closed() {
-  local record case_dir base head rc
-  record=$(make_case existing-task-identity-collision)
+test_existing_task_author_identity_is_ignored() {
+  local record case_dir base head output
+  record=$(make_case existing-task-author-identity)
   IFS=$'\t' read -r case_dir base head <<< "$record"
   sed -i.bak \
     -e 's/harness=claude/harness=codex/' \
     -e 's/model=claude-opus-5/model=gpt-5.6-sol/' \
     "$case_dir/state/task-x1.meta"
   rm "$case_dir/state/task-x1.meta.bak"
-  set +e
-  run_case "$case_dir" "$base" "$head" clear run \
-    > "$case_dir/out" 2> "$case_dir/err"
-  rc=$?
-  set -e
-  expect_code 1 "$rc" "existing task identity collision"
-  assert_grep "reviewer model policy found no configured reviewer outside the model family" \
-    "$case_dir/err" \
-    "existing model identity stopped governing reviewer separation"
-  assert_absent "$case_dir/codex.log" \
-    "reviewer launched despite an existing author/reviewer model collision"
-  pass "existing task identity collisions remain fail-closed before dispatch"
+  output=$(run_case "$case_dir" "$base" "$head" clear run) \
+    || fail "historical task author identity blocked exact-head review"
+  assert_contains "$output" 'crosscheck clear' \
+    "historical task author identity prevented a normal verdict"
+  assert_present "$case_dir/codex.log" \
+    "configured reviewer did not launch independently of historical task author identity"
+  pass "historical task author identity is ignored before reviewer dispatch"
 }
 
 test_review_fetches_exact_pr_head_when_author_worktree_is_behind() {
@@ -6589,7 +6584,7 @@ if [ -n "${FM_TEST_CASE:-}" ]; then
     test_missing_default_state_directory_starts_new_dispatch|\
     test_mismatched_state_without_metadata_fails_closed|\
     test_missing_metadata_for_existing_task_fails_closed|\
-    test_existing_task_metadata_identity_collision_fails_closed|\
+    test_existing_task_author_identity_is_ignored|\
     test_review_fetches_exact_pr_head_when_author_worktree_is_behind|\
     test_registered_expected_head_refuses_a_moved_head_before_spend|\
     test_missing_pr_head_ref_fails_closed|\
@@ -6742,7 +6737,7 @@ test_missing_task_metadata_starts_new_dispatch
 test_missing_default_state_directory_starts_new_dispatch
 test_mismatched_state_without_metadata_fails_closed
 test_missing_metadata_for_existing_task_fails_closed
-test_existing_task_metadata_identity_collision_fails_closed
+test_existing_task_author_identity_is_ignored
 test_review_fetches_exact_pr_head_when_author_worktree_is_behind
 test_registered_expected_head_refuses_a_moved_head_before_spend
 test_missing_pr_head_ref_fails_closed

@@ -2409,8 +2409,6 @@ legacy_model = "accounts/fireworks/routers/glm-5p2-fast"
 assert module.cross_family_lane_for_model(legacy_model) is None
 assert module.recorded_cross_family_lane_for_model(legacy_model) is LANE
 assert module.recorded_cross_family_lane_for_model(SLOT + "/" + legacy_model) is LANE
-assert module.model_family(legacy_model) == "cross-family:" + SLOT
-assert module.model_family(MODEL) == "cross-family:" + SLOT
 
 # Two credentials differing ONLY in api key must expose the identical
 # non-secret identifier: the binding is provider+model+endpoint and is

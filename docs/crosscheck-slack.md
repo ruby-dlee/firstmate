@@ -46,6 +46,7 @@ The listener never translates a queue, GitHub, reviewer, Azure, cleanup, ledger,
 ## Exact-head admission
 
 The listener admits one allowlisted PR URL only after its read-only GitHub credential resolves a live 40-character head SHA.
+Draft status is deliberately not a review-admission input; review clearance does not authorize a merge (see [the merge lifecycle](architecture.md#project-modes-are-explicit)).
 Authorship, model family, account identity, branch, worktree, checkout state, task metadata, and launch records are not admission inputs.
 A revision produced in another checkout therefore follows the same review path as any other revision.
 

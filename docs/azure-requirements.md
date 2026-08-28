@@ -1001,9 +1001,7 @@ Exact channel and repository allowlists, durable event dedupe, atomic per-engine
 visible saturation, central reports, and a launchd restart owner remain required.
 
 The original build's branch-prefix authorship screen, unconditional `model=human-authored` staging, and signed launch/exact-head author attestations are retired.
-The Slack lane admits an allowlisted URL only after resolving its live exact head.
-It never reads author declarations, account or model origin, branch names, task worktree state, checkout lineage, or launch records.
-The configured dedicated reviewer roster supplies independence, and the returned ledger must cover the admitted exact head.
+[Exact-head admission](crosscheck-slack.md#exact-head-admission) owns the replacement admission policy and reviewer-contract reference.
 
 Activation still requires the Slack app's two credential values, one repository-scoped read-only
 GitHub credential, exact approved channel IDs, exact approved repositories, and a binding daily

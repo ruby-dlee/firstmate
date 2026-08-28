@@ -148,5 +148,6 @@ No Herdr command was issued and no fleet state was touched; the experiment wrote
 
 `tests/fm-turnend-guard.test.sh` covers the shared predicate, primary scoping (including a secondmate's own home being guarded like the main primary while its child worktrees stay exempt), `FM_HOME` and `FM_STATE_OVERRIDE` precedence, Pi logical-run latch behavior for no-tool and multi-tool runs, fail-open behavior without `jq`, tracked hook registration for all five harnesses, and the Grok adapter's forced-resume loop guard and permission-mode regression.
 The default behavior suite does not invoke live language-model harnesses.
-`FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression recorded above.
+`FM_PI_LIVE_E2E=1 FM_PI_LIVE_AUTH_DIR=<isolated-smoke-auth-source> tests/fm-pi-primary-live-e2e.test.sh` opts into the isolated interactive Pi regression that proves the guard arms once, two consecutive watcher exits each gain an extension-owned successor and persisted custom wake, and clean session exit removes the final child.
+[`supervision-protocols/pi.md`](supervision-protocols/pi.md#2026-08-28-persistent-cycle-regression-evidence) owns the current Pi cycle and delivery evidence.
 `FM_PI_COMPACTION_LIVE_E2E=1 FM_PI_LIVE_AUTH_DIR=<isolated-smoke-auth-source> tests/fm-pi-primary-compaction-live-e2e.test.sh` opts into the isolated real-compaction regression owned and evidenced by [`supervision-protocols/pi.md`](supervision-protocols/pi.md#2026-08-25-regression-evidence).

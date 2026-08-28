@@ -48,7 +48,12 @@ test_tracked_extension_present_and_self_hashing() {
   assert_contains "$text" "readFileSync(\`\${state}/.lock\`" "tracked extension does not read the effective session lock"
   assert_contains "$text" 'return pidAlive(lockPid) ? "other" : "missing"' "tracked extension does not allow a pre-lock load marker"
   assert_contains "$text" 'if (lockOwnership() === "other") return' "tracked extension overwrites another live session marker"
-  assert_contains "$text" "if (!sessionOwnsLock()) return { ok: false" "tracked extension arms without the session lock"
+  assert_contains "$text" "if (!sessionOwnsLock()) {" "tracked extension arms without the session lock"
+  assert_contains "$text" 'startArmChild();' "tracked extension does not start a successor watcher from the child-exit path"
+  assert_contains "$text" 'pi.on("agent_settled"' "tracked extension does not use Pi settlement semantics for delivery retry"
+  assert_contains "$text" 'observeWakeAdmission' "tracked extension does not require observable custom-message admission"
+  assert_contains "$text" 'deliveryId: pending.deliveryId' "tracked extension wake attempts lack a stable admission identity"
+  assert_contains "$text" 'watch(state, { persistent: false }' "tracked extension does not stop its cycle on lock or away-mode transitions"
   assert_contains "$text" "writeFileSync(marker, \`\${extensionVersion}\\n\${process.pid}\\n\`)" "tracked extension does not write the content version and process marker"
   assert_contains "$text" "const config = process.env.FM_CONFIG_OVERRIDE" "tracked extension missing effective config resolution"
   assert_contains "$text" "FM_CONFIG_OVERRIDE: config" "tracked extension does not pass the effective config to the watcher arm"
@@ -315,6 +320,220 @@ EOF
   pass "Pi process-exit cleanup stops the attached arm child"
 }
 
+test_pi_durable_cycle_retries_delivery_and_rearms() {
+  local repo home plugin out status
+  fm_node_supports_ts_import || { pass "node lacks .ts import support, skipping Pi durable-cycle check"; return; }
+  repo="$TMP_ROOT/pi-durable-cycle-root"
+  home="$TMP_ROOT/pi-durable-cycle-home"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+count_file="$FM_HOME/state/.fixture-arm-count"
+count=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$count" > "$count_file"
+printf '%s\n' "$$" > "$FM_HOME/state/.fixture-arm-$count.pid"
+printf 'launch=%s pid=%s\n' "$count" "$$" > "$FM_HOME/state/.last-watcher-beat"
+printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+case "$count" in
+  1|2)
+    while [ ! -e "$FM_HOME/state/.fixture-fire-$count" ]; do sleep 0.01; done
+    printf '%s\t%s\tsignal\tfixture-%s\tsignal: durable wake %s\n' \
+      "$(date +%s)" "$count" "$count" "$count" >> "$FM_HOME/state/.wake-queue"
+    printf 'signal: durable wake %s\n' "$count"
+    ;;
+  *) exec sleep 600 ;;
+esac
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(NODE_OPTIONS=--disable-warning=ExperimentalWarning \
+    PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" \
+    FM_PI_WAKE_RETRY_BASE_MS=10 FM_PI_WAKE_RETRY_MAX_MS=20 \
+    FM_PI_ARM_RESTART_BASE_MS=10 FM_PI_ARM_RESTART_MAX_MS=20 \
+    node --input-type=module 2>&1 <<'EOF'
+import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const handlers = new Map();
+const branch = [];
+let tool;
+let idle = true;
+let sendAttempts = 0;
+let admissions = 0;
+let triggeredTurns = 0;
+const admittedMessages = [];
+const ctx = {
+  sessionManager: { getBranch: () => branch },
+  isIdle: () => idle,
+  ui: { notify() {} },
+};
+const pi = {
+  on(event, handler) {
+    handlers.set(event, handler);
+  },
+  appendEntry() {},
+  registerCommand() {},
+  registerTool(candidate) {
+    if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+  },
+  sendMessage(message, options) {
+    sendAttempts += 1;
+    if (message.customType !== "firstmate-watcher-wake" || message.display !== true) {
+      throw new Error(`wake was not a visible custom message: ${JSON.stringify(message)}`);
+    }
+    if (options?.deliverAs !== "followUp" || options?.triggerTurn !== true) {
+      throw new Error(`wake did not use triggering follow-up delivery: ${JSON.stringify(options)}`);
+    }
+    if (sendAttempts === 1) return; // Reproduce Pi handoff with no observable admission.
+    idle = false;
+    queueMicrotask(async () => {
+      triggeredTurns += 1;
+      await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+      const customMessage = { role: "custom", ...message, timestamp: Date.now() };
+      await handlers.get("message_end")?.({ type: "message_end", message: customMessage }, ctx);
+      branch.push({
+        type: "custom_message",
+        id: `wake-${admissions + 1}`,
+        parentId: branch.at(-1)?.id ?? null,
+        timestamp: new Date().toISOString(),
+        customType: message.customType,
+        content: message.content,
+        display: message.display,
+        details: message.details,
+      });
+      admittedMessages.push(customMessage);
+      admissions += 1;
+      idle = true;
+      await handlers.get("agent_settled")?.({ type: "agent_settled" }, ctx);
+    });
+  },
+};
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+async function waitFor(predicate, label, attempts = 500) {
+  for (let i = 0; i < attempts; i += 1) {
+    if (predicate()) return;
+    await sleep(10);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+function launchCount() {
+  try {
+    return Number(readFileSync(`${process.env.FM_HOME}/state/.fixture-arm-count`, "utf8").trim());
+  } catch {
+    return 0;
+  }
+}
+function armPid(number) {
+  try {
+    return Number(readFileSync(`${process.env.FM_HOME}/state/.fixture-arm-${number}.pid`, "utf8").trim());
+  } catch {
+    return 0;
+  }
+}
+function alive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function queuePending() {
+  try {
+    return readFileSync(`${process.env.FM_HOME}/state/.wake-queue`, "utf8").length > 0;
+  } catch {
+    return false;
+  }
+}
+function assertSingleLiveArm(expected) {
+  const live = [];
+  for (let number = 1; number <= launchCount(); number += 1) {
+    if (alive(armPid(number))) live.push(number);
+  }
+  if (live.length !== 1 || live[0] !== expected) {
+    throw new Error(`expected only arm ${expected} live, saw ${JSON.stringify(live)}`);
+  }
+}
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const mod = await import(pathToFileURL(process.env.PLUGIN).href);
+mod.default(pi);
+await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+if (!tool) throw new Error("Pi watch tool was not registered");
+await tool.execute("arm-initial", {}, undefined, undefined, ctx);
+await waitFor(() => launchCount() === 1 && alive(armPid(1)), "initial arm child");
+assertSingleLiveArm(1);
+
+writeFileSync(`${process.env.FM_HOME}/state/.fixture-fire-1`, "fire\n");
+await waitFor(() => queuePending(), "first durable queued wake");
+await waitFor(() => launchCount() >= 2 && alive(armPid(2)), "successor after first wake");
+if (!queuePending()) throw new Error("first queue drained before successor proof");
+assertSingleLiveArm(2);
+const firstBeacon = readFileSync(`${process.env.FM_HOME}/state/.last-watcher-beat`, "utf8");
+if (!firstBeacon.includes("launch=2")) throw new Error(`successor beacon was not fresh: ${firstBeacon}`);
+await waitFor(() => sendAttempts >= 2 && admissions >= 1 && triggeredTurns >= 1, "retried admitted first wake");
+if (sendAttempts !== 2) throw new Error(`first wake flooded delivery attempts: ${sendAttempts}`);
+if (admittedMessages[0]?.details?.attempt !== 2) {
+  throw new Error(`first wake was not admitted on retry: ${JSON.stringify(admittedMessages[0]?.details)}`);
+}
+writeFileSync(`${process.env.FM_HOME}/state/.wake-queue`, "");
+await waitFor(() => !queuePending(), "first queue drain");
+
+writeFileSync(`${process.env.FM_HOME}/state/.fixture-fire-2`, "fire\n");
+await waitFor(() => queuePending(), "second durable queued wake");
+await waitFor(() => launchCount() >= 3 && alive(armPid(3)), "successor after second wake");
+assertSingleLiveArm(3);
+const secondBeacon = readFileSync(`${process.env.FM_HOME}/state/.last-watcher-beat`, "utf8");
+if (!secondBeacon.includes("launch=3")) throw new Error(`second successor beacon was not fresh: ${secondBeacon}`);
+await waitFor(() => admissions >= 2 && triggeredTurns >= 2, "admitted second wake");
+if (sendAttempts !== 3) throw new Error(`second wake flooded delivery attempts: ${sendAttempts}`);
+if (admittedMessages[1]?.customType !== "firstmate-watcher-wake") {
+  throw new Error("second wake was not context-participating custom input");
+}
+writeFileSync(`${process.env.FM_HOME}/state/.wake-queue`, "");
+await waitFor(() => !queuePending(), "second queue drain");
+
+writeFileSync(`${process.env.FM_HOME}/state/.afk`, "away\n");
+await waitFor(() => !alive(armPid(3)), "away-mode arm stop");
+const awayLaunchCount = launchCount();
+await sleep(80);
+if (launchCount() !== awayLaunchCount) throw new Error("away mode restarted the Pi-owned watcher cycle");
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+await import("node:fs/promises").then(({ unlink }) => unlink(`${process.env.FM_HOME}/state/.afk`));
+await tool.execute("arm-after-away", {}, undefined, undefined, ctx);
+await waitFor(() => launchCount() === awayLaunchCount + 1 && alive(armPid(4)), "arm after away exit");
+assertSingleLiveArm(4);
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, "999999\n");
+await waitFor(() => !alive(armPid(4)), "session-lock-loss arm stop");
+const lockLossCount = launchCount();
+await sleep(80);
+if (launchCount() !== lockLossCount) throw new Error("lock loss restarted the Pi-owned watcher cycle");
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+await tool.execute("arm-after-lock", {}, undefined, undefined, ctx);
+await waitFor(() => launchCount() === lockLossCount + 1 && alive(armPid(5)), "arm after lock reacquisition");
+assertSingleLiveArm(5);
+
+await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
+await waitFor(() => !alive(armPid(5)), "session-shutdown arm cleanup");
+for (let number = 1; number <= launchCount(); number += 1) {
+  if (alive(armPid(number))) throw new Error(`arm child ${number} survived cleanup`);
+}
+if (branch.length !== 2 || new Set(branch.map((entry) => entry.details?.deliveryId)).size !== 2) {
+  throw new Error(`unexpected admitted wake entries: ${JSON.stringify(branch)}`);
+}
+EOF
+)
+  status=$?
+  [ "$status" -eq 0 ] || printf '%s\n' "$out" >&2
+  expect_code 0 "$status" "Pi durable watcher cycle must retry observable delivery and survive consecutive wakes"
+  [ -z "$out" ] || fail "Pi durable-cycle test printed output: $out"
+  pass "Pi watcher self-rearms, retries unadmitted delivery, survives two wakes, and stops on ownership changes"
+}
+
 test_pi_compaction_preserves_direct_exchange_and_pending_input() {
   local repo home plugin pi_bin pi_package_dir out status
   fm_node_supports_ts_import || { pass "node lacks .ts import support, skipping Pi compaction-continuity check"; return; }
@@ -331,7 +550,15 @@ test_pi_compaction_preserves_direct_exchange_and_pending_input() {
   plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
   cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
-printf 'signal: deterministic supervision prompt\n'
+count_file="$FM_HOME/state/.fixture-arm-count"
+count=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
+printf '%s\n' "$count" > "$count_file"
+if [ "$count" -eq 1 ]; then
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" 1 signal deterministic 'signal: deterministic supervision prompt' >> "$FM_HOME/state/.wake-queue"
+  printf 'signal: deterministic supervision prompt\n'
+  exit 0
+fi
+exec sleep 600
 SH
   chmod +x "$repo/bin/fm-watch-arm.sh"
   out=$(NODE_OPTIONS=--disable-warning=ExperimentalWarning PLUGIN="$plugin" PI_PACKAGE_DIR="$pi_package_dir" REPO="$repo" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" node --input-type=module 2>&1 <<'EOF'
@@ -843,6 +1070,7 @@ if (!replacementContinuity?.content.includes(`OPEN_REPLY_OBLIGATION\nHuman input
 if (!replacementContinuity.content.includes(`ANSWERED\nHuman input, exact JSON: ${JSON.stringify(replacementQuestion)}`)) {
   throw new Error(`replacement question was not answered: ${replacementContinuity.content}`);
 }
+await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
 EOF
 )
   status=$?
@@ -1433,6 +1661,7 @@ test_pi_extension_reports_external_healthy_watcher
 test_pi_tool_returns_agent_tool_result
 test_pi_process_exit_cleanup_listener_lifecycle
 test_pi_process_exit_cleanup_stops_arm_child
+test_pi_durable_cycle_retries_delivery_and_rearms
 test_pi_compaction_preserves_direct_exchange_and_pending_input
 test_opencode_primary_watch_plugin_uses_effective_state_home
 test_opencode_primary_watch_plugin_sources_effective_config

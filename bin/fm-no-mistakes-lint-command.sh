@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
+# fm-no-mistakes-lint-command.sh - run CI-equivalent pre-push lint scope.
+#
 # Match required CI's full or focused ShellCheck scope, then always preserve
 # the locked Agent Fleet Python lint.
+# Unknown repository identity or scope fails closed to the complete shell
+# inventory.
+#
+# Usage: fm-no-mistakes-lint-command.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

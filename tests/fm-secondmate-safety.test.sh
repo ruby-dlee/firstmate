@@ -81,6 +81,9 @@ case "$*" in
       -e 's#ruby-dlee/firstmate#example/repo#g' \
       "$FM_TEST_PR_API_FIXTURE"
     ;;
+  "pr checks 1 --repo example/repo")
+    printf '%s\n' 'summary: "1 passed, 0 failed, 1 total"'
+    ;;
   *)
     echo "unsupported fake gh-axi invocation: $*" >&2
     exit 97

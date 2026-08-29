@@ -174,8 +174,10 @@ PY
 retired_role_upgrade_contract() {
   python3 - "$CONTROLLER" "$AZURE" <<'PY' || fail "retired worker-role upgrade contract failed"
 import copy
+import contextlib
 import importlib.util
 import sys
+import types
 
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -230,6 +232,14 @@ assert lifecycle.adopt_observed_retired_create(
 assert calls == [{"worker": observed}]
 assert "1" not in loaded["pending_actions"]
 
+resume_action = {"type": "resume", "role": "no-mistakes", "slot": 1}
+loaded["pending_actions"]["1"] = resume_action
+assert lifecycle.adopt_observed_retired_create(
+    env, loaded, {"workers": [observed]}
+)
+assert calls[-1] == {"worker": observed}
+assert "1" not in loaded["pending_actions"]
+
 proof = {
     "schema": "fm.worker-service-cancel/v1",
     "verdict": "cancelled-before-execution",
@@ -253,6 +263,77 @@ cleanup_action = {
 assert provider.service_cancel_allows_missing_task_command(cleanup_action)
 cleanup_action["cloud_instance_id"] = "different"
 assert not provider.service_cancel_allows_missing_task_command(cleanup_action)
+
+legacy_delete = {
+    "type": "delete-compute",
+    "role": "no-mistakes",
+    "slot": 1,
+    "idempotency_key": "f" * 64,
+}
+loaded["workers"]["1"] = {"release_proof": proof}
+loaded["pending_actions"]["1"] = legacy_delete
+saved = []
+lifecycle.save_state = lambda _env, value: saved.append(copy.deepcopy(value))
+enriched = lifecycle.enrich_legacy_service_cleanup_claim(
+    env, loaded, "1", legacy_delete
+)
+assert enriched["service_cancel_proof"] == proof
+assert enriched["idempotency_key"] == lifecycle.action_id(enriched)
+assert enriched["idempotency_key"] != legacy_delete["idempotency_key"]
+assert saved and loaded["pending_actions"]["1"] == enriched
+
+queue_key = "legacy-review@generation-1"
+retired_item = dict(item, status="retired", eligible=False, retired_role=True)
+retired_create = {
+    "type": "create",
+    "role": "no-mistakes",
+    "slot": 1,
+    "idempotency_key": "e" * 64,
+}
+retire_state = {
+    "queue": {queue_key: retired_item},
+    "workers": {"1": {
+        "slot": 1,
+        "role": "no-mistakes",
+        "queue_key": queue_key,
+        "cloud_instance_id": None,
+        "resources": {},
+        "assignment_generation": "asg-1",
+    }},
+    "pending_actions": {"1": retired_create},
+    "cleanup_refusals": [],
+}
+lifecycle.controller_lock = lambda _env: contextlib.nullcontext()
+lifecycle.load_state = lambda _env: retire_state
+lifecycle.provider_call = lambda _env, operation: {
+    "inventory": {"workers": []}
+} if operation == "inventory" else (_ for _ in ()).throw(AssertionError(operation))
+cleaned = []
+lifecycle.cleanup_placement_projection = lambda _env, value: cleaned.append(value)
+lifecycle.save_state = lambda _env, value: saved.append(copy.deepcopy(value))
+assert lifecycle.retire_unsubmitted_retired_create(env, retired_create) == "retired"
+assert retire_state["pending_actions"] == {}
+assert retire_state["workers"] == {}
+assert retire_state["queue"] == {}
+assert cleaned == [retired_item]
+assert retire_state["cleanup_refusals"][-1]["note"].startswith(
+    "retired create abandoned after two exact Azure absence observations"
+)
+
+withdraw_state = {
+    "queue": {queue_key: retired_item},
+    "workers": {},
+    "pending_actions": {},
+}
+lifecycle.load_state = lambda _env: withdraw_state
+lifecycle.command_withdraw(env, types.SimpleNamespace(
+    task="legacy-review",
+    task_generation="generation-1",
+    confirm_withdraw=True,
+    confirm_subscription=env["subscription"],
+    task_home_out=None,
+))
+assert withdraw_state["queue"] == {}
 PY
   pass "retired worker roles cannot admit fresh capacity and retain exact cleanup compatibility"
 }

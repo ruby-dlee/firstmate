@@ -129,8 +129,8 @@ This distinction prevents remote failure from becoming a pass.
 
 After a verified result is collected, the runner writes one summary into the command step's own stderr beside its verdict.
 That run-owned proof names the invocation, exit result, immutable Azure `vm_instance_id`, and verified guest `boot_id`.
-The earlier `selected REMOTE ... (dispatching)` line proves only selection; it is never evidence that Azure executed the command.
-Conversely, every local path writes `executed LOCALLY` into the same step-owned log, so a routing file written after the selected step began is visible as a local run rather than being mistaken for remote execution.
+That verified summary is the Azure execution proof. Selection or routing messages are not execution evidence.
+Explicit local mode has its own local command result and never produces the Azure VM identity proof.
 
 ## Admission, parallelism, and cost
 

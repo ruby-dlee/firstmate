@@ -1117,7 +1117,8 @@ required = (
     "FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID",
     "immutable Azure `vm_instance_id`",
     "verified guest `boot_id`",
-    "The earlier `selected REMOTE ... (dispatching)` line proves only selection",
+    "That verified summary is the Azure execution proof",
+    "Selection or routing messages are not execution evidence",
 )
 missing = [needle for needle in required if needle not in document]
 assert not missing, missing

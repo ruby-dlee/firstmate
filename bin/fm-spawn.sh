@@ -1425,7 +1425,15 @@ spawn_test_lab_enabled() {
 snapshot_existing_artifacts() {
   local backup name source tasktmp=$SPAWN_TASK_TMP
   backup=$(mktemp -d "$STATE/.$ID.artifacts.rollback.XXXXXX") || return 1
-  for name in "$ID.status" "$ID.turn-ended" "$ID.check.sh" "$ID.pi-ext.ts" "$ID.grok-turnend-token"; do
+  for name in \
+    "$ID.status" \
+    "$ID.turn-ended" \
+    "$ID.check.sh" \
+    "$ID.pi-ext.ts" \
+    "$ID.grok-turnend-token" \
+    "$ID.crosscheck-autostart.request.json" \
+    "$ID.crosscheck-autostart.json" \
+    "$ID.crosscheck-autostart.log"; do
     source="$STATE/$name"
     if [ -e "$source" ] || [ -L "$source" ]; then
       if ! cp -Pp "$source" "$backup/$name"; then

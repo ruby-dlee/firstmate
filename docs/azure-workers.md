@@ -63,7 +63,7 @@ No writable directory is keyed only by profile label or upstream account identit
 The pooled `auth.json` is never staged.
 As defence in depth at use, `bin/fm-spawn-cloud-monitor.sh` checks that the staged account directory holds exactly one provider slot before taking the exactly-once dispatch marker.
 
-`withdraw` accepts both queued and interrupted `projecting` requests and removes only the exact projection binding the queue entry owns.
+`withdraw` accepts queued, interrupted `projecting`, and upgrade-retired requests and removes only the exact projection binding the queue entry owns.
 Provider reset removes the same exact projection only after release and cloud-side cleanup are proved.
 Cleanup inventories no sibling path, so one assignment cannot replace, inspect, or delete another assignment that uses the same profile.
 A legacy entry with no projection binding is never inferred to own and delete a shared home.
@@ -97,7 +97,7 @@ The `bounded` in the compartment invariant is per message, not aggregate: each r
 Bounded status additionally projects every live compartment - task, status, slot, active and lifetime children counts, and the durable assignment TTL anchor - from `controller.json` fields only, never from the leg state the compartment monitor owns locally.
 The same task generation and exact identity is idempotent, while a changed identity under the same task generation refuses.
 An assigned request stays in the queue until its ordinary release proof is accepted and every exact cloud resource is safely reset.
-A request that never reached assignment leaves the queue by `withdraw`: it accepts `projecting` or `queued`, refuses anything a worker owns or a pending provider action names, requires `--confirm-withdraw` and `--confirm-subscription`, touches no capacity, and removes the exact provider projection plus per-task cloud state including the staged credential.
+A request that never reached assignment leaves the queue by `withdraw`: it accepts `projecting`, `queued`, or upgrade-retired status, refuses anything a worker owns or a pending provider action names, requires `--confirm-withdraw` and `--confirm-subscription`, touches no capacity, and removes the exact provider projection plus per-task cloud state including the staged credential.
 Release remains the only exit for work that ever held capacity.
 Operator surrender is not a second exit: it mints that release proof for the one case where the ordinary authorities are unrecoverable, under its own refusal-first gates (below).
 Therefore a truly empty queue also means there is no active task worker and desired worker compute is zero.

@@ -942,6 +942,31 @@ def coordinator_command(pid: int) -> str:
     return result.stdout.strip()
 
 
+def process_group_is_active(process_group: int) -> bool:
+    """Return whether a non-zombie process remains in one exact group."""
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pgid=,stat="],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+            text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"cannot inspect Crosscheck process group {process_group}: {exc}")
+    if result.returncode != 0:
+        fail(f"cannot inspect Crosscheck process group {process_group}")
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            continue
+        if int(fields[0]) == process_group and not fields[1].startswith("Z"):
+            return True
+    return False
+
+
 def cancel(task_id: str, generation: str) -> int:
     """Stop one exact task generation's detached coordinator and process group."""
     if ID_RE.fullmatch(task_id) is None:
@@ -1013,14 +1038,25 @@ def cancel(task_id: str, generation: str) -> int:
         if wait_seconds > 60:
             fail("FM_CROSSCHECK_AUTOSTART_CANCEL_WAIT_SECONDS must not exceed 60")
         deadline = time.monotonic() + wait_seconds
-        while lock_is_active(paths["coordinator_lock"]) and time.monotonic() < deadline:
+        while (
+            lock_is_active(paths["coordinator_lock"])
+            or process_group_is_active(process_group)
+        ) and time.monotonic() < deadline:
             time.sleep(0.05)
-        if lock_is_active(paths["coordinator_lock"]):
-            os.killpg(process_group, signal.SIGKILL)
+        if process_group_is_active(process_group):
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             deadline = time.monotonic() + 5
-            while lock_is_active(paths["coordinator_lock"]) and time.monotonic() < deadline:
+            while (
+                lock_is_active(paths["coordinator_lock"])
+                or process_group_is_active(process_group)
+            ) and time.monotonic() < deadline:
                 time.sleep(0.05)
-        if lock_is_active(paths["coordinator_lock"]):
+        if lock_is_active(paths["coordinator_lock"]) or process_group_is_active(
+            process_group
+        ):
             fail("Crosscheck coordinator process group did not terminate within its bound")
 
         latest = load_json(paths["state"], SCHEMA) or record

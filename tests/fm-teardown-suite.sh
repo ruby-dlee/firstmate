@@ -1708,6 +1708,72 @@ test_pr_check_backfills_legacy_generation_before_race_check() {
   pass "fm-pr-check backfills legacy identity before generation race checks"
 }
 
+test_teardown_fences_crosscheck_registration_through_state_removal() {
+  local case_dir source marker release teardown_pid rc
+  case_dir=$(make_case crosscheck-teardown-fence)
+  write_meta "$case_dir" local-only ship
+  wt_commit "$case_dir" "landed Crosscheck retirement fixture"
+  add_fork_with_pushed_branch "$case_dir"
+  source="$case_dir/firstmate-root"
+  mkdir -p "$source"
+  cp -R "$ROOT/bin" "$source/bin"
+  marker="$case_dir/cancel-entered"
+  release="$case_dir/cancel-release"
+  cat > "$source/bin/fm-crosscheck-autostart.py" <<'SH'
+#!/usr/bin/env bash
+set -u
+[ "${1:-}" = cancel ] || exit 97
+touch "${FM_TEST_CANCEL_MARKER:?}"
+while [ ! -f "${FM_TEST_CANCEL_RELEASE:?}" ]; do sleep 0.02; done
+SH
+  cat > "$source/bin/fm-github-pr.py" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  head|checks) printf '%s\n' 1111111111111111111111111111111111111111 ;;
+  state) printf '%s\n' OPEN ;;
+  *) exit 97 ;;
+esac
+SH
+  chmod +x "$source/bin/fm-crosscheck-autostart.py" \
+    "$source/bin/fm-github-pr.py"
+  printf '{}\n' > "$case_dir/state/task-x1.crosscheck-autostart.request.json"
+
+  FM_TEST_TEARDOWN_ROOT="$source" \
+  FM_TEST_CANCEL_MARKER="$marker" \
+  FM_TEST_CANCEL_RELEASE="$release" \
+    run_teardown "$case_dir" --force > "$case_dir/teardown.out" \
+      2> "$case_dir/teardown.err" &
+  teardown_pid=$!
+  fm_test_wait_for_file "$marker" "$teardown_pid" 0.02 \
+    || { touch "$release"; wait "$teardown_pid" 2>/dev/null || true; fail "teardown never reached Crosscheck cancellation"; }
+
+  set +e
+  FM_ROOT_OVERRIDE="$source" FM_HOME="$case_dir" \
+  FM_STATE_OVERRIDE="$case_dir/state" FM_DATA_OVERRIDE="$case_dir/data" \
+  FM_ACCOUNT_META_LOCK_WAIT_SECONDS=1 PATH="$case_dir/fakebin:$PATH" \
+    "$source/bin/fm-pr-check.sh" task-x1 \
+      https://github.com/example/repo/pull/1 \
+      > "$case_dir/register.out" 2> "$case_dir/register.err"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || {
+    touch "$release"
+    wait "$teardown_pid" 2>/dev/null || true
+    fail "PR registration entered during Crosscheck teardown"
+  }
+  assert_grep 'timed out waiting for PR registration lock' \
+    "$case_dir/register.err" \
+    "registration did not wait on teardown's exact task-local fence"
+  touch "$release"
+  wait "$teardown_pid" \
+    || fail "fenced teardown failed: $(cat "$case_dir/teardown.err")"
+  assert_absent "$case_dir/state/task-x1.meta" \
+    "fenced teardown retained task metadata"
+  assert_absent "$case_dir/state/task-x1.crosscheck-autostart.request.json" \
+    "fenced teardown left a successor Crosscheck request"
+  pass "teardown fences PR registration from coordinator cancellation through state removal"
+}
+
 test_content_in_default_fallback_allows() {
   local case_dir rc expected_lock lock_marker
   case_dir=$(make_case content-landed)
@@ -7005,6 +7071,11 @@ if [ "${FM_TEST_FOCUSED:-}" = crosscheck-pr-lookup ]; then
   exit 0
 fi
 
+if [ "${FM_TEST_FOCUSED:-}" = crosscheck-teardown-fence ]; then
+  test_teardown_fences_crosscheck_registration_through_state_removal
+  exit 0
+fi
+
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
     test_pr_check_without_worktree_still_performs_lookup|test_closed_pr_wakes_loudly_as_unreviewed)
@@ -7348,6 +7419,7 @@ FM_TEARDOWN_PART_CASES=0
 
 TEARDOWN_FULL_SUITE_CASES=(
   test_local_only_fork_remote_allows
+  test_teardown_fences_crosscheck_registration_through_state_removal
   test_teardown_prompts_tasks_axi_done_when_compatible
   test_teardown_manual_backend_prompts_hand_edit_even_when_tasks_axi_present
   test_local_only_truly_unpushed_refuses

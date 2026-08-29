@@ -838,7 +838,7 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
   mkdir -p "$lock_root"
   lock_marker="$CASE_DIR/checkout-return-held-lock"
   cp "$HOME_DIR/state/$id.meta" "$expected"
-  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token crosscheck-autostart.request.json crosscheck-autostart.json crosscheck-autostart.log; do
     printf 'prior-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
   done
 
@@ -853,7 +853,7 @@ test_unmanaged_postinstall_failure_restores_prior_state() {
   [ "$status" -ne 0 ] || fail "post-metadata unmanaged launch failure unexpectedly succeeded"
   cmp -s "$HOME_DIR/state/$id.meta" "$expected" \
     || fail "post-metadata unmanaged failure did not restore prior metadata"
-  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token crosscheck-autostart.request.json crosscheck-autostart.json crosscheck-autostart.log; do
     [ "$(cat "$HOME_DIR/state/$id.$artifact" 2>/dev/null)" = "prior-$artifact" ] \
       || fail "post-metadata unmanaged failure did not restore prior $artifact state"
   done
@@ -1618,7 +1618,7 @@ test_failed_managed_respawn_restores_unmanaged_metadata() {
     "custom_extension=preserve-me"
   expected="$CASE_DIR/original.meta"
   cp "$HOME_DIR/state/$id.meta" "$expected"
-  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token crosscheck-autostart.request.json crosscheck-autostart.json crosscheck-autostart.log; do
     printf 'prior-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
   done
   out=$(FM_FAKE_AF_SESSION_MISSING=1 run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew)
@@ -1630,7 +1630,7 @@ test_failed_managed_respawn_restores_unmanaged_metadata() {
     diff -u "$expected" "$HOME_DIR/state/$id.meta" >&2 || true
     fail "failed managed respawn did not restore the original unmanaged metadata"
   fi
-  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token crosscheck-autostart.request.json crosscheck-autostart.json crosscheck-autostart.log; do
     [ "$(cat "$HOME_DIR/state/$id.$artifact" 2>/dev/null)" = "prior-$artifact" ] \
       || fail "failed managed respawn did not restore prior $artifact state"
   done
@@ -2700,7 +2700,7 @@ test_duplicate_spawn_preserves_original_endpoint_and_lease() {
   rec=$(make_case duplicate claude "$id")
   read_case "$rec"
   run_spawn "$id" "$PROJ_DIR" --account-pool claude-crew >/dev/null || fail "initial duplicate test spawn failed"
-  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token crosscheck-autostart.request.json crosscheck-autostart.json crosscheck-autostart.log; do
     printf 'existing-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
   done
   clear_case_logs
@@ -2710,7 +2710,7 @@ test_duplicate_spawn_preserves_original_endpoint_and_lease() {
   [ ! -s "$AF_LOG" ] || fail "duplicate managed spawn touched the original lease: $(cat "$AF_LOG")"
   assert_not_grep '^kill-window ' "$TMUX_LOG" "duplicate managed spawn killed the original endpoint"
   assert_present "$CASE_DIR/endpoint-live" "duplicate managed spawn removed the original endpoint marker"
-  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token crosscheck-autostart.request.json crosscheck-autostart.json crosscheck-autostart.log; do
     [ "$(cat "$HOME_DIR/state/$id.$artifact" 2>/dev/null)" = "existing-$artifact" ] \
       || fail "duplicate managed spawn removed the existing $artifact sidecar"
   done
@@ -3125,7 +3125,7 @@ test_failed_secondmate_respawn_rollback_restores_prior_state() {
     "custom_extension=preserve-secondmate"
   expected="$CASE_DIR/original-secondmate.meta"
   cp "$HOME_DIR/state/$id.meta" "$expected"
-  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token crosscheck-autostart.request.json crosscheck-autostart.json crosscheck-autostart.log; do
     printf 'prior-%s\n' "$artifact" > "$HOME_DIR/state/$id.$artifact"
   done
 
@@ -3140,7 +3140,7 @@ test_failed_secondmate_respawn_rollback_restores_prior_state() {
   status=$?
   [ "$status" -ne 0 ] || fail "secondmate rollback cleanup continued through a restored generation"
   cmp -s "$HOME_DIR/state/$id.meta" "$expected" || fail "secondmate rollback cleanup deleted or changed restored metadata"
-  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token; do
+  for artifact in status turn-ended check.sh pi-ext.ts grok-turnend-token crosscheck-autostart.request.json crosscheck-autostart.json crosscheck-autostart.log; do
     [ "$(cat "$HOME_DIR/state/$id.$artifact" 2>/dev/null)" = "prior-$artifact" ] \
       || fail "secondmate rollback cleanup deleted restored $artifact state"
   done
@@ -6217,6 +6217,14 @@ fi
 
 if [ "${FM_TEST_FOCUSED:-}" = stale-reclaim-generation ]; then
   run_isolated_test test_stale_reclaim_guard_is_owned_before_lock_removal
+  exit 0
+fi
+
+if [ "${FM_TEST_FOCUSED:-}" = crosscheck-artifact-rollback ]; then
+  run_isolated_test test_unmanaged_postinstall_failure_restores_prior_state
+  run_isolated_test test_failed_managed_respawn_restores_unmanaged_metadata
+  run_isolated_test test_duplicate_spawn_preserves_original_endpoint_and_lease
+  run_isolated_test test_failed_secondmate_respawn_rollback_restores_prior_state
   exit 0
 fi
 

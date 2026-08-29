@@ -69,7 +69,9 @@ case "$*" in
   "pr checks 72 --repo ruby-dlee/firstmate")
     case "${FM_TEST_CHECKS_MODE:-green}" in
       green) printf '%s\n' 'summary: "3 passed, 0 failed, 3 total"' ;;
+      green-skipped) printf '%s\n' 'summary: "3 passed, 0 failed, 2 skipped, 5 total"' ;;
       pending) printf '%s\n' 'summary: "2 passed, 0 failed, 3 total"' ;;
+      pending-skipped) printf '%s\n' 'summary: "2 passed, 0 failed, 1 skipped, 4 total"' ;;
       failed) printf '%s\n' 'summary: "2 passed, 1 failed, 3 total"' ;;
       empty) printf '%s\n' 'summary: "0 passed, 0 failed, 0 total"' ;;
       malformed) printf '%s\n' 'checks unavailable' ;;
@@ -181,7 +183,13 @@ test_exact_head_checks_must_be_green() {
   assert_grep 'pr checks 72 --repo ruby-dlee/firstmate' "$FM_TEST_GH_AXI_LOG" \
     "CI admission did not use the supported gh-axi checks surface"
 
-  for mode in pending failed empty malformed; do
+  output=$(FM_TEST_CHECKS_MODE=green-skipped "$ADAPTER" checks "$PR_URL" \
+    c9cbe79154013efcec9aa478f1476d0eff6c63df) \
+    || fail "green checks with skipped jobs were rejected"
+  [ "$output" = c9cbe79154013efcec9aa478f1476d0eff6c63df ] \
+    || fail "green checks with skipped jobs did not return the admitted head"
+
+  for mode in pending pending-skipped failed empty malformed; do
     set +e
     FM_TEST_CHECKS_MODE=$mode "$ADAPTER" checks "$PR_URL" \
       c9cbe79154013efcec9aa478f1476d0eff6c63df \
@@ -192,7 +200,7 @@ test_exact_head_checks_must_be_green() {
     assert_grep 'GitHub state is unreviewed' "$TMP_ROOT/checks-$mode.err" \
       "$mode CI checks did not fail closed"
   done
-  pass "CI admission requires a nonempty all-green check set fenced to one exact head"
+  pass "CI admission accepts terminal skipped jobs but rejects pending or failed exact-head checks"
 }
 
 test_public_merge_subcommand_is_unavailable() {

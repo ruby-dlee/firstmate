@@ -231,6 +231,7 @@ require_safe_task_metadata || exit 1
 TEARDOWN_ACCOUNT_LOCKS=('')
 MANAGED_ACCOUNT_LOCK=
 ACCOUNT_DELETE_LOCK=
+PR_REGISTRATION_LOCK=
 SECONDMATE_HOME_LIFECYCLE_LOCK=
 SECONDMATE_REGISTRY_LOCK=
 PREPARED_REGISTRY_PATH=
@@ -241,6 +242,10 @@ PREPARED_REGISTRY_LOCK=
 
 release_teardown_account_locks() {
   local lock
+  if [ -n "$PR_REGISTRATION_LOCK" ]; then
+    fm_account_meta_lock_release "$PR_REGISTRATION_LOCK" >/dev/null 2>&1 || true
+    PR_REGISTRATION_LOCK=
+  fi
   for lock in "${TEARDOWN_ACCOUNT_LOCKS[@]}"; do
     [ -n "$lock" ] || continue
     fm_account_lifecycle_lock_release "$lock" >/dev/null 2>&1 || true
@@ -5772,7 +5777,11 @@ fi
 
 # The worktree is now safely returned (or the provider worktree is gone), but
 # task metadata still supplies the exact generation. Stop the detached
-# coordinator before removing that identity and its task-local state.
+# coordinator before removing that identity and its task-local state. Use the
+# same task-local fence as PR registration and retain it through state removal,
+# so a new coordinator cannot be published between cancellation and unlink.
+PR_REGISTRATION_LOCK=$(fm_account_lock_acquire "$STATE" "$ID" pr-registration \
+  "PR registration retirement" "${FM_ACCOUNT_META_LOCK_WAIT_SECONDS:-10}") || exit 1
 if [ -e "$STATE/$ID.crosscheck-autostart.request.json" ] \
     || [ -e "$STATE/$ID.crosscheck-autostart.json" ] \
     || [ -e "$STATE/.$ID.crosscheck-autostart.lock" ]; then
@@ -5863,6 +5872,8 @@ rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/
   "$STATE/$ID.crosscheck-autostart.request.json" "$STATE/$ID.crosscheck-autostart.json" \
   "$STATE/$ID.crosscheck-autostart.log" "$STATE/.$ID.crosscheck-autostart-handoff.lock" \
   "$STATE/.$ID.crosscheck-autostart.lock"
+[ -z "$PR_REGISTRATION_LOCK" ] || fm_account_meta_lock_release "$PR_REGISTRATION_LOCK" >/dev/null 2>&1 || true
+PR_REGISTRATION_LOCK=
 [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true

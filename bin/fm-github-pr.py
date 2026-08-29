@@ -482,18 +482,23 @@ def checks_green(url: str, expected_head: str) -> str:
         ["pr", "checks", str(before["number"]), "--repo", f"{before['owner']}/{before['repo']}"]
     )
     summary = re.search(
-        r'^summary:\s*"?([0-9]+) passed, ([0-9]+) failed, ([0-9]+) total"?\s*$',
+        r'^summary:\s*"?([0-9]+) passed, ([0-9]+) failed,'
+        r'(?: ([0-9]+) skipped,)? ([0-9]+) total"?\s*$',
         raw,
         re.MULTILINE,
     )
     if summary is None:
         raise GitHubContractError("gh-axi checks document has no exact summary")
-    passed, failed, total = (int(value) for value in summary.groups())
+    passed = int(summary.group(1))
+    failed = int(summary.group(2))
+    skipped = int(summary.group(3) or 0)
+    total = int(summary.group(4))
     if total < 1:
         raise GitHubContractError("PR has no CI checks to prove green")
-    if failed != 0 or passed != total:
+    if failed != 0 or passed + skipped != total:
         raise GitHubContractError(
-            f"PR CI is not green: {passed} passed, {failed} failed, {total} total"
+            "PR CI is not green: "
+            f"{passed} passed, {failed} failed, {skipped} skipped, {total} total"
         )
     after = fetch_pr_api(url)
     if after["head_sha"] != expected_head:

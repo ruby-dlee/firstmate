@@ -2120,6 +2120,33 @@ def make_action(env, action_type, worker=None, item=None, **fields):
     return action
 
 
+def enrich_legacy_service_cleanup_claim(env, state, slot, action):
+    """Copy an exact retired-service cancellation proof into an old claim.
+
+    The custom worker release predates delete-compute carrying this proof.
+    Enrichment happens only while the slot lease and controller lock are both
+    held, so replacing the idempotency key cannot race an older mutation.
+    """
+    if action.get("type") != "delete-compute" or action.get(
+        "service_cancel_proof"
+    ) is not None:
+        return action
+    worker = state.get("workers", {}).get(str(slot))
+    proof = worker.get("release_proof") if isinstance(worker, dict) else None
+    if not (
+        isinstance(proof, dict)
+        and proof.get("schema") == "fm.worker-service-cancel/v1"
+        and proof.get("verdict") == "cancelled-before-execution"
+    ):
+        return action
+    enriched = copy.deepcopy(action)
+    enriched["service_cancel_proof"] = copy.deepcopy(proof)
+    enriched["idempotency_key"] = action_id(enriched)
+    state["pending_actions"][str(slot)] = enriched
+    save_state(env, state)
+    return enriched
+
+
 def next_assignment_generation(state):
     value = int(state.get("next_assignment", 1))
     state["next_assignment"] = value + 1
@@ -2364,9 +2391,21 @@ def drain_pending(env, slot=None, strict=True, skip_slots=None):
                 # second time for nothing and its absence then reads as a
                 # refusal.
                 with controller_lock(env):
-                    current = load_state(env).get("pending_actions", {}).get(slot_key)
-                if not isinstance(current, dict) or current.get("idempotency_key") != action.get("idempotency_key"):
+                    live = load_state(env)
+                    current = live.get("pending_actions", {}).get(slot_key)
+                    if (
+                        isinstance(current, dict)
+                        and current.get("idempotency_key")
+                        == action.get("idempotency_key")
+                    ):
+                        current = enrich_legacy_service_cleanup_claim(
+                            env, live, slot_key, current
+                        )
+                    else:
+                        current = None
+                if not isinstance(current, dict):
                     continue
+                action = current
                 result = provider_mutate(env, action, lease)
                 with controller_lock(env):
                     apply_pending(env, action, result)
@@ -2708,19 +2747,22 @@ def next_reconcile_action(env, state, inventory, now=None):
 
 
 def adopt_observed_retired_create(env, state, inventory):
-    """Adopt an already-created retired worker without replaying its create.
+    """Adopt already-present retired capacity without replaying create/resume.
 
-    A pre-upgrade create claim is ambiguous: absence may mean it never ran or
-    Azure has not exposed it yet. Keep that claim inert on absence. When the
+    A pre-upgrade provisioning claim is ambiguous: absence may mean it never
+    ran or Azure has not exposed it yet. Keep it inert on absence. When the
     exact tagged worker is visible, apply the observed result locally so the
-    next pass can deallocate it without issuing another create.
+    next pass can deallocate it without issuing create or resume again.
     """
     cloud = inventory_by_slot(inventory)
     changed = False
     for slot_key, action in sorted(
         (state.get("pending_actions") or {}).items(), key=lambda pair: int(pair[0])
     ):
-        if action.get("role") not in RETIRED_WORKER_ROLES or action.get("type") != "create":
+        if (
+            action.get("role") not in RETIRED_WORKER_ROLES
+            or action.get("type") not in ("create", "resume")
+        ):
             continue
         observed = cloud.get(int(slot_key))
         if observed is None:
@@ -4617,7 +4659,7 @@ def command_withdraw(env, args):
         if item is None:
             raise LifecycleError("withdraw requires one exact queued task generation")
         status = item.get("status")
-        if status not in ("queued", "projecting"):
+        if status not in ("queued", "projecting", "retired"):
             # Anything past the queue has cloud capacity or a live assignment
             # behind it, and dropping the entry would strand that worker with no
             # queue owner. Those go out through release.
@@ -4673,6 +4715,67 @@ def command_withdraw(env, args):
     print("FM-WITHDREW {} {}".format(args.task, args.task_generation))
     write_task_home_receipt(getattr(args, "task_home_out", None), withdrawn)
     print("withdrew queued request {}".format(key))
+
+
+def retire_unsubmitted_retired_create(env, action):
+    """Resolve one retired create claim without ever submitting a create.
+
+    Two fresh exact inventories must agree. Stable observed capacity is
+    adopted for ordinary darkening; stable absence retires only the provisional
+    local owner and its private credential projection. Any disagreement stays
+    fail-closed behind the original durable claim.
+    """
+    slot = str(action.get("slot", ""))
+    first = inventory_by_slot(provider_call(env, "inventory")["inventory"]).get(
+        int(slot)
+    )
+    second = inventory_by_slot(provider_call(env, "inventory")["inventory"]).get(
+        int(slot)
+    )
+    if (first is None) != (second is None):
+        raise LifecycleError(
+            "retired create absence changed between fresh Azure inventories"
+        )
+    if first is not None and digest_value(first) != digest_value(second):
+        raise LifecycleError(
+            "retired create identity changed between fresh Azure inventories"
+        )
+    with controller_lock(env):
+        state = load_state(env)
+        current = state.get("pending_actions", {}).get(slot)
+        if not isinstance(current, dict) or current.get("idempotency_key") != action.get(
+            "idempotency_key"
+        ):
+            raise LifecycleError("retired create claim changed while resolving it")
+        worker = state.get("workers", {}).get(slot)
+        if not isinstance(worker, dict) or worker.get("role") not in RETIRED_WORKER_ROLES:
+            raise LifecycleError("retired create has no exact provisional worker owner")
+        if first is not None:
+            apply_result_transactionally(env, state, current, {"worker": second})
+            state["pending_actions"].pop(slot, None)
+            save_state(env, state)
+            return "adopted"
+        if worker.get("cloud_instance_id") is not None or worker.get("resources"):
+            raise LifecycleError(
+                "absent retired create has non-provisional durable cloud identity"
+            )
+        queue_key = worker.get("queue_key")
+        item = state.get("queue", {}).get(queue_key)
+        if not isinstance(item, dict) or item.get("status") != "retired":
+            raise LifecycleError("absent retired create has no exact retired queue owner")
+        cleanup_placement_projection(env, item)
+        record_refusal(
+            state,
+            worker,
+            LifecycleError(
+                "retired create abandoned after two exact Azure absence observations"
+            ),
+        )
+        state["pending_actions"].pop(slot, None)
+        state["workers"].pop(slot, None)
+        state["queue"].pop(queue_key, None)
+        save_state(env, state)
+    return "retired"
 
 
 def write_task_home_receipt(path, item, worker=None):
@@ -5031,6 +5134,18 @@ def command_abandon_claim(env, args):
             current = (load_state(env).get("pending_actions") or {}).get(slot)
         if not isinstance(current, dict) or current.get("idempotency_key") != action["idempotency_key"]:
             raise LifecycleError("slot {} claim changed while abandoning; retry".format(slot))
+        if (
+            action.get("role") in RETIRED_WORKER_ROLES
+            and action.get("type") == "create"
+        ):
+            disposition = retire_unsubmitted_retired_create(env, action)
+            print("FM-ABANDONED-CLAIM {} {}".format(
+                slot, action["idempotency_key"]
+            ))
+            print(
+                "retired create resolved without provisioning: {}".format(disposition)
+            )
+            return
         identity_refusal = None
         replay_failure = None
         try:

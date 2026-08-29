@@ -89,6 +89,15 @@ if ! PR_HEAD_LOOKUP=$("$FM_ROOT/bin/fm-github-pr.py" head "$URL" 2>&1); then
   exit 1
 fi
 PR_HEAD=$PR_HEAD_LOOKUP
+if ! CI_HEAD=$("$FM_ROOT/bin/fm-github-pr.py" checks "$URL" "$PR_HEAD" 2>&1); then
+  CI_DIAGNOSTIC=$(printf '%s' "$CI_HEAD" | tr '\r\n' '  ')
+  printf 'UNREVIEWED: PR CI is not green: %.500s\n' "$CI_DIAGNOSTIC" >&2
+  exit 1
+fi
+[ "$CI_HEAD" = "$PR_HEAD" ] || {
+  echo "UNREVIEWED: CI verification did not return the exact live PR head" >&2
+  exit 1
+}
 META_LOCK=$(fm_account_meta_lock_acquire "$STATE" "$ID") || exit 1
 if [ -f "$META" ]; then
   CURRENT_GENERATION=$(fm_account_meta_value "$META" generation_id)
@@ -109,15 +118,6 @@ else
   echo "error: task metadata disappeared while resolving PR state for $ID" >&2
   exit 1
 fi
-if ! CI_HEAD=$("$FM_ROOT/bin/fm-github-pr.py" checks "$URL" "$PR_HEAD" 2>&1); then
-  CI_DIAGNOSTIC=$(printf '%s' "$CI_HEAD" | tr '\r\n' '  ')
-  printf 'UNREVIEWED: PR CI is not green: %.500s\n' "$CI_DIAGNOSTIC" >&2
-  exit 1
-fi
-[ "$CI_HEAD" = "$PR_HEAD" ] || {
-  echo "UNREVIEWED: CI verification did not return the exact live PR head" >&2
-  exit 1
-}
 CHECK_TMP=$(mktemp "$STATE/.$ID.check.XXXXXX") || exit 1
 printf -v PR_ADAPTER_Q '%q' "$FM_ROOT/bin/fm-github-pr.py"
 printf -v CROSSCHECK_AUTOSTART_Q '%q' "$CROSSCHECK_AUTOSTART"

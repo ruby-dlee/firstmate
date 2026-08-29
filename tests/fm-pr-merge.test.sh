@@ -308,9 +308,15 @@ test_non_green_ci_refuses_before_review_or_merge() {
 }
 
 test_draft_and_undeterminable_status_refuse_before_merge() {
-  local mode case_dir rc
+  local mode case_dir rc prior_pr prior_head
+  prior_pr=https://github.com/ruby-dlee/firstmate/pull/71
+  prior_head=7171717171717171717171717171717171717171
   for mode in draft missing; do
     case_dir=$(make_case "draft-$mode")
+    printf '%s\n' \
+      'generation_id=generation-task-x1' \
+      "pr=$prior_pr" \
+      "pr_head=$prior_head" >> "$case_dir/state/task-x1.meta"
     : > "$case_dir/gh-axi.log"
     set +e
     FM_TEST_DRAFT_MODE=$mode run_pr_merge "$case_dir" task-x1 "$PR_URL" \
@@ -318,10 +324,14 @@ test_draft_and_undeterminable_status_refuse_before_merge() {
     rc=$?
     set -e
     expect_code 1 "$rc" "draft mode $mode"
-    assert_grep "pr=$PR_URL" "$case_dir/state/task-x1.meta" \
-      "draft mode $mode did not preserve PR metadata before refusal"
-    assert_grep "pr_head=$HEAD_SHA" "$case_dir/state/task-x1.meta" \
-      "draft mode $mode did not preserve the live head before refusal"
+    assert_grep "pr=$prior_pr" "$case_dir/state/task-x1.meta" \
+      "draft mode $mode replaced the prior admitted PR before refusal"
+    assert_grep "pr_head=$prior_head" "$case_dir/state/task-x1.meta" \
+      "draft mode $mode replaced the prior admitted head before refusal"
+    assert_no_grep "pr=$PR_URL" "$case_dir/state/task-x1.meta" \
+      "draft mode $mode published an inadmissible replacement PR"
+    assert_no_grep "pr_head=$HEAD_SHA" "$case_dir/state/task-x1.meta" \
+      "draft mode $mode published an inadmissible replacement head"
     assert_no_grep '^api PUT ' "$case_dir/gh-axi.log" \
       "draft mode $mode reached the merge mutation"
   done
@@ -329,7 +339,7 @@ test_draft_and_undeterminable_status_refuse_before_merge() {
     "draft CI admission did not name the non-draft requirement"
   assert_grep 'requires a provably non-draft PR' "$TMP_ROOT/draft-missing/err" \
     "undeterminable draft status did not fail closed"
-  pass "draft and undeterminable draft status refuse after recording, before merge"
+  pass "draft and undeterminable status preserve the prior admitted registration"
 }
 
 test_missing_or_malformed_ledger_blocks_merge() {

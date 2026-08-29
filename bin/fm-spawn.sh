@@ -258,14 +258,8 @@ CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
-# shellcheck source=bin/fm-gate-refuse-lib.sh
-. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-provision-lib.sh
 . "$SCRIPT_DIR/fm-provision-lib.sh"
-# Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
-# a direct report (see bin/fm-gate-refuse-lib.sh).
-fm_refuse_if_gate_agent
-
 spawn_checkout_refresh() {  # <command> [args...]
   # A compartment child keeps FM_HOME on the primary because that home owns
   # the one elastic-worker controller and money document. Checkout refresh is
@@ -1474,7 +1468,7 @@ persist_orca_cleanup_quarantine() {
   [ -d "$STATE" ] && [ ! -L "$STATE" ] || return 1
   python3 - "$STATE" "$STATE/$ID.meta" "$phase" \
     "${W:-fm-$ID}" "${WT:-}" "${PROJ_ABS:-}" "${HARNESS:-}" "${KIND:-ship}" \
-    "${MODE:-no-mistakes}" "${YOLO:-off}" "${TASK_TMP:-}" "${MODEL:-default}" \
+    "${MODE:-direct-PR}" "${YOLO:-off}" "${TASK_TMP:-}" "${MODEL:-default}" \
     "${EFFORT:-default}" "${ORCA_WORKTREE_ID:-}" "${ORCA_TERMINAL:-}" \
     "${ORCA_TERMINAL_PROOF:-unproven}" "${ORCA_REPO_ID:-}" "fm-$ID" \
     "repo-path:${PROJ_ABS:-}" <<'PY'
@@ -1597,7 +1591,7 @@ persist_failed_account_rollback() {
       echo "project=${PROJ_ABS:-}"
       echo "harness=${HARNESS:-}"
       echo "kind=${KIND:-ship}"
-      echo "mode=${MODE:-no-mistakes}"
+      echo "mode=${MODE:-direct-PR}"
       echo "yolo=${YOLO:-off}"
       echo "tasktmp=${TASK_TMP:-}"
       echo "tasktmp_phase=${WORKTREE_ACQUIRE_TASKTMP_PHASE:-not-created}"
@@ -1682,7 +1676,7 @@ persist_failed_direct_recovery() {
     echo "project=${PROJ_ABS:-${RECORDED_PROJECT:-}}"
     echo "harness=${HARNESS:-${RECORDED_HARNESS:-}}"
     echo "kind=${KIND:-${RECORDED_KIND:-ship}}"
-    echo "mode=${MODE:-${RECORDED_MODE:-no-mistakes}}"
+    echo "mode=${MODE:-${RECORDED_MODE:-direct-PR}}"
     echo "yolo=${YOLO:-${RECORDED_YOLO:-off}}"
     echo "tasktmp=${TASK_TMP:-$SPAWN_TASK_TMP}"
     echo "tasktmp_phase=${WORKTREE_ACQUIRE_TASKTMP_PHASE:-not-created}"
@@ -1730,7 +1724,7 @@ persist_failed_direct_spawn() {  # <endpoint-created:0|1>
   retained_tmux_session=
   retained_mode=${MODE:-}
   retained_yolo=${YOLO:-off}
-  [ -n "$retained_mode" ] || retained_mode=no-mistakes
+  [ -n "$retained_mode" ] || retained_mode=direct-PR
   if [ "$endpoint_created" = 1 ]; then
     retained_window=${META_WINDOW:-${T:-${W:-fm-$ID}}}
     if [ "${BACKEND:-tmux}" = tmux ]; then

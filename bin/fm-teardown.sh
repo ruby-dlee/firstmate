@@ -150,11 +150,6 @@ CHECKOUT_LOCK_ROOT=$(fm_checkout_lock_root "$CHECKOUT_STATE_BASE")
 . "$SCRIPT_DIR/fm-lock-lib.sh"
 # shellcheck source=bin/fm-process-tree-lib.sh
 . "$SCRIPT_DIR/fm-process-tree-lib.sh"
-# shellcheck source=bin/fm-gate-refuse-lib.sh
-. "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
-# Fail closed before any fleet mutation: a no-mistakes gate agent must never tear
-# down a worktree (see bin/fm-gate-refuse-lib.sh).
-fm_refuse_if_gate_agent
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
 # shellcheck source=bin/fm-treehouse-lib.sh
@@ -441,7 +436,7 @@ if [ "$REAP_DEAD" -eq 1 ] && [ "$KIND" != ship ]; then
   exit 2
 fi
 MODE=$(grep '^mode=' "$META" | cut -d= -f2- || true)
-[ -n "$MODE" ] || MODE=no-mistakes
+[ -n "$MODE" ] || MODE=direct-PR
 REPORT_GATED=0
 SCOUT_SCRATCH_RELEASABLE=0
 REPORT_REQUIRED_COUNT=$(grep -c '^report_required=' "$META" 2>/dev/null || true)
@@ -2721,7 +2716,7 @@ validate_child_worktree_landed_state() {
   local WT=$child_worktree PROJ=$child_project ID=$child_id KIND=ship FORCE=
   local MODE PR_URL TEARDOWN_WORKTREE_BRANCH_FOR_SAFETY=
   MODE=$(meta_value "$child_meta" mode)
-  [ -n "$MODE" ] || MODE=no-mistakes
+  [ -n "$MODE" ] || MODE=direct-PR
   PR_URL=$(meta_value "$child_meta" pr)
   stash_list=$(git -C "$WT" stash list 2>/dev/null) || {
     echo "REFUSED: child worktree stash state is uninspectable at $WT" >&2

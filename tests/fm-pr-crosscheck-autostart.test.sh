@@ -138,7 +138,7 @@ seed_task() {
     "worktree=$case_dir/worktrees/$task" \
     "project=$case_dir/projects/$task" \
     'kind=ship' \
-    'mode=no-mistakes' \
+    'mode=direct-PR' \
     "generation_id=generation-$task"
 }
 

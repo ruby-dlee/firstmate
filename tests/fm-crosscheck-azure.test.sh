@@ -2353,6 +2353,7 @@ marker = 'python3 - "$SNAPSHOT" "$REPOSITORY" "$INPUT" <<\'PY\'\n'
 start = guest.index(marker) + len(marker)
 end = guest.index('\nPY\nrm -f "$SNAPSHOT"', start)
 extractor = guest[start:end]
+assert "if len(members) > 15002:" in extractor
 
 def run(*argv, cwd):
     return subprocess.run(

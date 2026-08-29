@@ -329,7 +329,8 @@ def safe_link(path, target):
 manifest_name = "repository/.crosscheck-snapshot/manifest.json"
 with tarfile.open(source, "r:gz") as archive:
     members = archive.getmembers()
-    if len(members) > 15001:
+    # 15,000 tracked files, one generated exact-diff member, and the manifest.
+    if len(members) > 15002:
         raise SystemExit("model guest: repository snapshot exceeds member bound")
     names = [member.name for member in members]
     if len(names) != len(set(names)) or manifest_name not in names:

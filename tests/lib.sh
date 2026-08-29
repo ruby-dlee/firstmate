@@ -25,6 +25,11 @@ if [ -n "${FM_TEST_LIB_SOURCED:-}" ]; then
 fi
 FM_TEST_LIB_SOURCED=1
 
+# Behavior tests drive bootstrap and related entrypoints against isolated homes.
+# Keep machine background-service management out of those fixtures while leaving
+# every explicit service test free to opt in through its dedicated test seam.
+export FM_BOOTSTRAP_BACKGROUND_BYPASS=1
+
 # Resolve the repo root from this library's own location. Consumed by sourcing
 # test files, not by this library, so it reads as "unused" here.
 # shellcheck disable=SC2034

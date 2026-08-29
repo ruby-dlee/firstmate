@@ -2902,7 +2902,7 @@ test_missing_task_metadata_starts_new_dispatch() {
   assert_grep "crosscheck_pull_request=$PR_URL" \
     "$case_dir/state/task-x1.meta" \
     "a brand-new task did not bind its pull request"
-  assert_no_grep '^harness=' "$case_dir/state/task-x1.meta" \
+  assert_no_grep 'harness=' "$case_dir/state/task-x1.meta" \
     "managed task metadata invented author provenance"
   pass "a brand-new task ID persists managed identity and dispatches"
 }
@@ -2925,7 +2925,7 @@ test_missing_default_state_directory_starts_new_dispatch() {
   assert_grep 'crosscheck_task_id=task-x1' \
     "$case_dir/home/state/task-x1.meta" \
     "a fresh home did not persist the managed task identity"
-  assert_no_grep '^model=' "$case_dir/home/state/task-x1.meta" \
+  assert_no_grep 'model=' "$case_dir/home/state/task-x1.meta" \
     "managed task metadata invented an author model"
   pass "a fresh home initializes state, persists task identity, and dispatches"
 }

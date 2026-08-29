@@ -498,6 +498,7 @@ case "$*" in
       'number: 7' \
       'state: open' \
       'merged: false' \
+      'draft: false' \
       'head:' \
       '  ref: fm/task-x1' \
       "  sha: $FM_TEST_PR_HEAD" \
@@ -508,6 +509,10 @@ case "$*" in
       '  sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
       '  repo:' \
       '    full_name: example/repo'
+    exit 0
+    ;;
+  "pr checks 7 --repo example/repo")
+    printf '%s\n' 'summary: "1 passed, 0 failed, 1 total"'
     exit 0
     ;;
 esac
@@ -544,6 +549,10 @@ install_pr_check_lookup_fake() {
   local case_dir=$1
   cat > "$case_dir/fakebin/gh-axi" <<'SH'
 #!/usr/bin/env bash
+if [ "$*" = "pr checks 7 --repo example/repo" ]; then
+  printf '%s\n' 'summary: "1 passed, 0 failed, 1 total"'
+  exit 0
+fi
 [ "$*" = "api /repos/example/repo/pulls/7" ] || exit 97
 [ -z "${FM_TEST_LOOKUP_READY:-}" ] || touch "$FM_TEST_LOOKUP_READY"
 while [ -n "${FM_TEST_LOOKUP_RELEASE:-}" ] && [ ! -f "$FM_TEST_LOOKUP_RELEASE" ]; do
@@ -553,6 +562,7 @@ printf '%s\n' \
   'number: 7' \
   'state: open' \
   'merged: false' \
+  'draft: false' \
   'head:' \
   '  ref: fm/task-x1' \
   "  sha: $FM_TEST_PR_HEAD" \

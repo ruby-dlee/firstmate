@@ -99,6 +99,14 @@ if [ "$KIND" != secondmate ] && crew_endpoint_is_busy; then
   emit working pane "harness busy"
 fi
 
+# A scout's terminal event means its one deliverable has been returned. Its
+# earlier gate may remain in the append-only history, but it must not reopen a
+# completed report as a pending captain decision. Persistent secondmates keep
+# the full keyed fold because one concern can finish while another stays open.
+if [ "$KIND" = scout ] && { [ "$LOG_STATE" = done ] || [ "$LOG_STATE" = failed ]; }; then
+  emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")"
+fi
+
 if [ -n "$OPEN_DECISION" ]; then
   IFS=$'\t' read -r _OPEN_KEY OPEN_VERB OPEN_NOTE <<EOF
 $OPEN_DECISION

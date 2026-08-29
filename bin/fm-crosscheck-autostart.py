@@ -33,9 +33,41 @@ MAX_RECORD_BYTES = 64 * 1024
 MAX_FLEET_ENV_BYTES = 1024 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024
 MAX_LOG_BYTES = 2 * 1024 * 1024
+MAX_OPERATOR_ENVIRONMENT_BYTES = 64 * 1024
 DEFAULT_ACTIVE_WAIT_SECONDS = 4 * 60 * 60
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 4 * 60 * 60
 MAX_HEAD_RESTARTS = 16
+AZURE_REQUIRED_ENVIRONMENT_NAMES = (
+    "FM_AZURE_TENANT_ID",
+    "FM_AZURE_SUBSCRIPTION_ID",
+    "FM_AZURE_NAMING_PREFIX",
+    "FM_AZURE_STORAGE_NAME",
+    "FM_AZURE_OWNER_TAG",
+    "FM_AZURE_DEPLOYMENT_GENERATION",
+    "FM_AZURE_BLOB_PE_NIC_RESOURCE_GUID",
+)
+AZURE_ALLOWED_ENVIRONMENT_NAMES = frozenset(AZURE_REQUIRED_ENVIRONMENT_NAMES) | {
+    "FM_AZURE_OPERATOR_DATA_PLANE_IP",
+    "FM_AZURE_RESOURCE_GROUP",
+    "FM_AZURE_RUNNER_BUDGET_LIMIT_USD",
+    "FM_AZURE_RUNNER_CELL_ORDINAL",
+    "FM_AZURE_RUNNER_COST_ADMISSION_MODE",
+    "FM_AZURE_RUNNER_MAX_CONCURRENCY",
+    "FM_AZURE_RUNNER_SKU",
+    "FM_AZURE_VM_IMAGE_ID",
+    "FM_AZURE_WORKER_ALLOW_UNTRAINED_FORECAST",
+}
+AZURE_FORBIDDEN_ENVIRONMENT_NAMES = frozenset(
+    {
+        "FM_AZURE_RUNNER_CONFIRM_SUBSCRIPTION",
+        "FM_AZURE_RUNNER_GENERATION",
+        "FM_AZURE_RUNNER_LOCAL_RECOVERY_CLASSES",
+        "FM_AZURE_RUNNER_REMOTE_CLASSES",
+        "FM_AZURE_RUNNER_ROUTING_ROOT",
+        "FM_AZURE_RUNNER_TASK",
+    }
+)
+AZURE_ENVIRONMENT_NAME_RE = re.compile(r"^FM_AZURE_[A-Z0-9_]+$")
 
 
 class AutostartError(RuntimeError):
@@ -272,6 +304,103 @@ def open_fleet_environment(path: Path) -> int:
     except Exception:
         os.close(descriptor)
         raise
+
+
+def operator_environment_values() -> Dict[str, str]:
+    """Load the launchd-safe Azure values used by Crosscheck services."""
+
+    home = Path.home()
+    if not home.is_absolute():
+        fail("Crosscheck operator home must be absolute")
+    path = home / ".fm-azure" / "fleet.env"
+    current = path
+    while True:
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            fail(f"Crosscheck fleet environment path is unreadable at {current}: {exc}")
+        if stat.S_ISLNK(metadata.st_mode):
+            fail(f"Crosscheck fleet environment path contains a symlink: {current}")
+        if metadata.st_uid != os.getuid():
+            fail(f"Crosscheck fleet environment path is not operator-owned: {current}")
+        if stat.S_IMODE(metadata.st_mode) & 0o022:
+            fail(f"Crosscheck fleet environment path is group/world writable: {current}")
+        if current == home:
+            break
+        current = current.parent
+        if home not in current.parents and current != home:
+            fail("Crosscheck fleet environment path escaped the operator home")
+
+    descriptor = open_fleet_environment(path)
+    try:
+        chunks = []
+        remaining = MAX_OPERATOR_ENVIRONMENT_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    except OSError as exc:
+        fail(f"Crosscheck fleet environment could not be read: {exc}")
+    finally:
+        os.close(descriptor)
+    if len(raw) > MAX_OPERATOR_ENVIRONMENT_BYTES:
+        fail("Crosscheck fleet environment exceeds its service byte bound")
+    if b"\0" in raw:
+        fail("Crosscheck fleet environment contains a NUL byte")
+
+    script = r"""
+set -e
+for name in "$@"; do unset "$name"; done
+set -a
+. /dev/stdin >/dev/null
+set +a
+/usr/bin/env -0
+"""
+    try:
+        evaluated = subprocess.run(
+            ["/bin/bash", "--noprofile", "--norc", "-c", script, "fleet.env"]
+            + list(AZURE_REQUIRED_ENVIRONMENT_NAMES),
+            input=raw,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+            env={"HOME": str(home), "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"Crosscheck fleet environment could not be evaluated exactly: {exc}")
+    if evaluated.returncode != 0:
+        fail("Crosscheck fleet environment could not be evaluated exactly")
+
+    values: Dict[str, str] = {}
+    try:
+        for field in evaluated.stdout.split(b"\0"):
+            if not field:
+                continue
+            encoded_name, separator, encoded_value = field.partition(b"=")
+            if not separator:
+                fail("Crosscheck fleet environment returned a malformed value")
+            name = encoded_name.decode("ascii")
+            if AZURE_ENVIRONMENT_NAME_RE.fullmatch(name) is None:
+                continue
+            value = encoded_value.decode("utf-8")
+            if len(value) > 512 or any(
+                ord(character) < 32 or ord(character) == 127 for character in value
+            ):
+                fail(f"Crosscheck fleet environment declares an unsafe value for {name}")
+            if name in AZURE_FORBIDDEN_ENVIRONMENT_NAMES or name.endswith("_STATE_DIR"):
+                fail(f"Crosscheck fleet environment may not declare per-run control {name}")
+            if name in AZURE_ALLOWED_ENVIRONMENT_NAMES:
+                values[name] = value
+    except UnicodeDecodeError as exc:
+        fail(f"Crosscheck fleet environment returned non-UTF-8 values: {exc}")
+    missing = [name for name in AZURE_REQUIRED_ENVIRONMENT_NAMES if not values.get(name)]
+    if missing:
+        fail("Crosscheck fleet environment is missing required values: " + ", ".join(missing))
+    return values
 
 
 def crosscheck_command(root: Path) -> Path:

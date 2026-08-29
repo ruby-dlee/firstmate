@@ -10,7 +10,11 @@
 # spawn. A record is eligible only after an age threshold and exact PID/start-time
 # death proof. An exact never-acquired record is cleared only after a project-pool
 # holder-absence proof; acquired records install fail-closed cleanup metadata and
-# invoke ordinary teardown. Every refusal stays on disk and is printed.
+# invoke ordinary teardown. For terminal historical tasks only, maintenance audits
+# an unavailable retired no-mistakes executable and lets ordinary teardown remain
+# the sole landing, cleanliness, stash, and worktree-release authority. Task-specific
+# routes still require the executable for exact active-run cancellation. Every
+# refusal stays on disk and is printed.
 # Usage: fm-auto-reap.sh task <id> <pr-merged|scout-done|local-merged>
 #        fm-auto-reap.sh maintenance
 set -eu
@@ -21,6 +25,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 AUTO_REAP_STALE_SECS=${FM_AUTO_REAP_STALE_SECS:-300}
 AUTO_REAP_COMMAND_TIMEOUT=${FM_AUTO_REAP_COMMAND_TIMEOUT:-20}
+AUTO_REAP_MAINTENANCE=0
 
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
@@ -187,6 +192,10 @@ reap_no_mistakes_run() {  # <meta>
     return 1
   }
   nm=$(auto_reap_tool FM_AUTO_REAP_NO_MISTAKES_BIN no-mistakes) || {
+    if [ "${AUTO_REAP_MAINTENANCE:-0}" = 1 ]; then
+      AUTO_REAP_RETIRED_GATE_UNAVAILABLE=1
+      return 0
+    fi
     refuse "no-mistakes is unavailable for exact run reaping"
     return 1
   }
@@ -265,6 +274,7 @@ run_teardown() {  # <task>
 reap_task() {  # <task> <trigger>
   local id=$1 trigger=$2 meta kind mode
   AUTO_REAP_ID=$id
+  AUTO_REAP_RETIRED_GATE_UNAVAILABLE=0
   fm_account_valid_id "$id" || refuse "invalid task id"
   meta="$STATE/$id.meta"
   [ -f "$meta" ] && [ ! -L "$meta" ] || refuse "task metadata is unavailable"
@@ -284,6 +294,9 @@ reap_task() {  # <task> <trigger>
     *) refuse "trigger $trigger does not match kind=$kind mode=${mode:-no-mistakes}" ;;
   esac
   reap_no_mistakes_run "$meta" || return 1
+  if [ "$AUTO_REAP_RETIRED_GATE_UNAVAILABLE" -eq 1 ]; then
+    log_result "audit: retired no-mistakes executable unavailable for terminal $id; attempting cancellation-free ordinary teardown without bypassing landing or preservation proofs"
+  fi
   run_teardown "$id"
 }
 
@@ -563,6 +576,7 @@ recover_acquisition() {  # <record>
 
 maintenance() {
   local record meta id kind mode probe_status
+  AUTO_REAP_MAINTENANCE=1
   for record in "$STATE"/.worktree-acquire-*.pending; do
     [ -e "$record" ] || continue
     recover_acquisition "$record"

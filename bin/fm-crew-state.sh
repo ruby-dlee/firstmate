@@ -103,7 +103,7 @@ fi
 # earlier gate may remain in the append-only history, but it must not reopen a
 # completed report as a pending captain decision. Persistent secondmates keep
 # the full keyed fold because one concern can finish while another stays open.
-if [ "$KIND" = scout ] && { [ "$LOG_STATE" = done ] || [ "$LOG_STATE" = failed ]; }; then
+if [ "$KIND" = scout ] && { [ "$LOG_STATE" = "done" ] || [ "$LOG_STATE" = "failed" ]; }; then
   emit "$LOG_STATE" status-log "$(status_line_note "$LOG_LINE")"
 fi
 

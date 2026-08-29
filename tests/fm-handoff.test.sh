@@ -160,6 +160,19 @@ test_unknown_process_liveness_is_supervise_only() {
   pass "unknown endpoint process liveness never grants mutation custody"
 }
 
+test_retired_mode_is_supervise_only() {
+  local out
+  make_case retired-mode
+  sed -i.bak 's/^mode=direct-PR$/mode=no-mistakes/' "$HOME_DIR/state/$ID.meta"
+  rm -f "$HOME_DIR/state/$ID.meta.bak"
+  out=$CASE_DIR/out
+  handoff_env > "$out" || fail "retired-mode handoff failed"
+  assert_supervise_only "$out" "retired-mode handoff"
+  assert_grep 'retired no-mistakes task custody requires explicit operator recovery' "$out" \
+    "retired-mode handoff did not preserve ambiguous mutation custody"
+  pass "pre-upgrade review custody cannot grant a concurrent editor"
+}
+
 test_owner_termination_after_capture_refreshes_to_free_edit() {
   local out ready proceed
   make_case owner-terminates
@@ -218,6 +231,7 @@ test_verified_successor_is_not_competing_owner() {
 test_no_active_owner_is_free_edit_and_idempotent
 test_active_crewmate_owner_is_supervise_only
 test_unknown_process_liveness_is_supervise_only
+test_retired_mode_is_supervise_only
 test_owner_termination_after_capture_refreshes_to_free_edit
 test_head_change_after_capture_refreshes_exact_generation
 test_verified_successor_is_not_competing_owner

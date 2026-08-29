@@ -105,6 +105,21 @@ test_open_pr_refuses_without_teardown() {
   pass "unmerged PR retains all task state"
 }
 
+test_retired_mode_never_auto_reaps() {
+  local out rc
+  reset_logs
+  make_task legacy-custody no-mistakes
+  out=$("$AUTO_REAP" task legacy-custody pr-merged 2>&1); rc=$?
+  expect_code 1 "$rc" "retired task auto-reap refusal"
+  assert_contains "$out" "retired no-mistakes task custody requires explicit operator recovery" \
+    "retired task refusal did not name its recovery boundary"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] || fail "retired task invoked destructive teardown"
+  [ -f "$HOME_DIR/state/legacy-custody.meta" ] \
+    || fail "retired task metadata was removed"
+  rm -f "$HOME_DIR/state/legacy-custody.meta" "$HOME_DIR/state/legacy-custody.status"
+  pass "pre-upgrade review custody remains explicit and non-reapable"
+}
+
 test_scout_done_uses_ordinary_teardown() {
   local id=detached-scout worktree out rc
   reset_logs
@@ -609,6 +624,7 @@ test_local_merge_immediately_auto_reaps() {
 
 test_merged_task_tears_down
 test_open_pr_refuses_without_teardown
+test_retired_mode_never_auto_reaps
 test_scout_done_uses_ordinary_teardown
 test_x_link_and_teardown_refusal_remain_visible
 test_dead_acquisition_recovers_but_live_owner_is_untouched

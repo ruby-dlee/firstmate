@@ -171,6 +171,92 @@ PY
   pass "provider seam, Azure identity fencing, cost boundary, Lavish contract, and acceptance controls are documented"
 }
 
+retired_role_upgrade_contract() {
+  python3 - "$CONTROLLER" "$AZURE" <<'PY' || fail "retired worker-role upgrade contract failed"
+import copy
+import importlib.util
+import sys
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+lifecycle = load("retired_lifecycle", sys.argv[1])
+provider = load("retired_provider", sys.argv[2])
+env = {
+    "home_binding": "a" * 64,
+    "subscription": "11111111-1111-4111-8111-111111111111",
+    "deployment_generation": "dep",
+    "owner": "owner",
+    "prefix": "fixture",
+    "state_path": "/fixture/controller.json",
+}
+state = lifecycle.empty_state(env)
+item = {
+    "schema": lifecycle.REQUEST_SCHEMA,
+    "task": "legacy-review",
+    "task_generation": "generation-1",
+    "repository_generation": "repo-1",
+    "home_binding": "b" * 64,
+    "account_binding": "c" * 64,
+    "worktree_binding": "d" * 64,
+    "repository_binding": "e" * 64,
+    "owner_kind": "primary",
+    "role": "no-mistakes",
+    "eligible": True,
+    "status": "queued",
+    "enqueued_at": "2026-08-29T00:00:00Z",
+}
+state["queue"]["legacy-review@generation-1"] = item
+lifecycle.read_json = lambda *_args: copy.deepcopy(state)
+lifecycle._LOCK_STATE.update({"held": True, "epoch": 7})
+loaded = lifecycle.load_state(env)
+retired = loaded["queue"]["legacy-review@generation-1"]
+assert retired["status"] == "retired"
+assert retired["eligible"] is False
+assert retired["retired_role"] is True
+assert lifecycle.queued_items(loaded) == []
+
+action = {"type": "create", "role": "no-mistakes", "slot": 1}
+loaded["pending_actions"]["1"] = action
+observed = {"slot": 1}
+calls = []
+lifecycle.apply_result_transactionally = lambda _env, _state, _action, result: calls.append(result)
+assert lifecycle.adopt_observed_retired_create(
+    env, loaded, {"workers": [observed]}
+)
+assert calls == [{"worker": observed}]
+assert "1" not in loaded["pending_actions"]
+
+proof = {
+    "schema": "fm.worker-service-cancel/v1",
+    "verdict": "cancelled-before-execution",
+    "task": "legacy-review",
+    "task_generation": "generation-1",
+    "assignment_generation": "asg-1",
+    "cloud_instance_id": "cloud-1",
+}
+proof["proof_digest"] = provider.hashlib.sha256(
+    provider.canonical_bytes(proof)
+).hexdigest()
+cleanup_action = {
+    "bindings": {
+        "task": "legacy-review",
+        "task_generation": "generation-1",
+        "assignment_generation": "asg-1",
+    },
+    "cloud_instance_id": "cloud-1",
+    "service_cancel_proof": proof,
+}
+assert provider.service_cancel_allows_missing_task_command(cleanup_action)
+cleanup_action["cloud_instance_id"] = "different"
+assert not provider.service_cancel_allows_missing_task_command(cleanup_action)
+PY
+  pass "retired worker roles cannot admit fresh capacity and retain exact cleanup compatibility"
+}
+
 classification_and_admission_matrix() {
   python3 - "$CONTROLLER" <<'PY' || fail "classification/admission matrix failed"
 import copy
@@ -9085,6 +9171,7 @@ PY
 }
 
 static_contract
+retired_role_upgrade_contract
 independent_cleanup_contract
 targeted_slot_inventory_contract
 compartment_payload_contract

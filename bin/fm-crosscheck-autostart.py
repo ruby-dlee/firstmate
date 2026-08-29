@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -923,6 +924,128 @@ def status_locked(
     return 0
 
 
+def coordinator_command(pid: int) -> str:
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+            text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        fail(f"cannot inspect Crosscheck coordinator process {pid}: {exc}")
+    if result.returncode != 0 or not result.stdout.strip():
+        fail(f"Crosscheck coordinator process {pid} is not inspectable")
+    return result.stdout.strip()
+
+
+def cancel(task_id: str, generation: str) -> int:
+    """Stop one exact task generation's detached coordinator and process group."""
+    if ID_RE.fullmatch(task_id) is None:
+        fail(f"invalid task id: {task_id!r}")
+    if (
+        not generation
+        or len(generation.encode("utf-8")) > 512
+        or any(character in generation for character in "\0\r\n")
+    ):
+        fail("invalid task generation identity")
+    _root, _home, state = runtime_paths()
+    paths = task_paths(state, task_id)
+    with task_handoff(paths):
+        request = load_json(paths["request"], REQUEST_SCHEMA)
+        record = load_json(paths["state"], SCHEMA)
+        if request is None and record is None:
+            print(f"crosscheck autostart: no coordinator state for {task_id}")
+            return 0
+        for label, value in (("request", request), ("state", record)):
+            if value is None:
+                continue
+            stored_task = value.get("task_id")
+            stored_url = value.get("pull_request")
+            stored_head = value.get("head_sha")
+            stored_generation = value.get("generation_id")
+            if not all(
+                isinstance(field, str)
+                for field in (stored_task, stored_url, stored_head, stored_generation)
+            ):
+                fail(f"Crosscheck autostart {label} has malformed identity")
+            validate_identity(stored_task, stored_url, stored_head, stored_generation)
+            if stored_task != task_id or stored_generation != generation:
+                fail(f"Crosscheck autostart {label} belongs to a different task generation")
+        if not lock_is_active(paths["coordinator_lock"]):
+            print(f"crosscheck autostart: coordinator already inactive for {task_id}")
+            return 0
+
+        deadline = time.monotonic() + 5
+        while True:
+            record = load_json(paths["state"], SCHEMA)
+            pid = record.get("pid") if record is not None else None
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                break
+            if not lock_is_active(paths["coordinator_lock"]):
+                print(f"crosscheck autostart: coordinator already inactive for {task_id}")
+                return 0
+            if time.monotonic() >= deadline:
+                fail("active Crosscheck coordinator did not publish its process identity")
+            time.sleep(0.05)
+
+        command = coordinator_command(pid)
+        script = str(Path(__file__).resolve())
+        if script not in command or " worker " not in f" {command} " or task_id not in command:
+            fail(f"Crosscheck coordinator process {pid} has a different executable identity")
+        try:
+            process_group = os.getpgid(pid)
+        except ProcessLookupError:
+            if not lock_is_active(paths["coordinator_lock"]):
+                print(f"crosscheck autostart: coordinator already inactive for {task_id}")
+                return 0
+            fail(f"Crosscheck coordinator process {pid} disappeared while its lock remained active")
+        if process_group != pid:
+            fail(f"Crosscheck coordinator process {pid} is not its isolated process-group leader")
+
+        os.killpg(process_group, signal.SIGTERM)
+        wait_seconds = positive_int_environment(
+            "FM_CROSSCHECK_AUTOSTART_CANCEL_WAIT_SECONDS", 10
+        )
+        if wait_seconds > 60:
+            fail("FM_CROSSCHECK_AUTOSTART_CANCEL_WAIT_SECONDS must not exceed 60")
+        deadline = time.monotonic() + wait_seconds
+        while lock_is_active(paths["coordinator_lock"]) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if lock_is_active(paths["coordinator_lock"]):
+            os.killpg(process_group, signal.SIGKILL)
+            deadline = time.monotonic() + 5
+            while lock_is_active(paths["coordinator_lock"]) and time.monotonic() < deadline:
+                time.sleep(0.05)
+        if lock_is_active(paths["coordinator_lock"]):
+            fail("Crosscheck coordinator process group did not terminate within its bound")
+
+        latest = load_json(paths["state"], SCHEMA) or record
+        assert latest is not None
+        latest_url = latest.get("pull_request")
+        latest_head = latest.get("head_sha")
+        if not isinstance(latest_url, str) or not isinstance(latest_head, str):
+            fail("Crosscheck coordinator state lost its exact PR identity after cancellation")
+        validate_identity(task_id, latest_url, latest_head, generation)
+        write_state(
+            paths["state"],
+            task_id,
+            latest_url,
+            latest_head,
+            generation,
+            "failed",
+            int(latest.get("attempt", 1)),
+            "exact-generation coordinator cancelled before task teardown",
+            0,
+            paths["log"],
+        )
+        print(f"crosscheck autostart: cancelled exact generation for {task_id}")
+        return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -933,6 +1056,9 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("pr_url")
         command.add_argument("head_sha")
         command.add_argument("generation_id")
+    cancel_parser = subparsers.add_parser("cancel")
+    cancel_parser.add_argument("task_id")
+    cancel_parser.add_argument("generation_id")
     worker_parser = subparsers.add_parser("worker")
     worker_parser.add_argument("lock_descriptor", type=int)
     worker_parser.add_argument("task_id")
@@ -957,6 +1083,8 @@ def main() -> int:
                 args.head_sha,
                 args.generation_id,
             )
+        if args.command == "cancel":
+            return cancel(args.task_id, args.generation_id)
         return worker(args.lock_descriptor, args.task_id, args.attempt)
     except AutostartError as exc:
         print(

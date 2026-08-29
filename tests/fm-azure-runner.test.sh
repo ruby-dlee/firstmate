@@ -1087,6 +1087,24 @@ PY
   pass "the run-owned step log carries the verified Azure VM instance and boot identities beside the verdict"
 }
 
+environment_mode_defaults
+public_git_askpass_is_host_portable
+storage_network_access_contract
+static_private_controller_contract
+prepare_contract
+private_snapshot_prepare_contract
+private_snapshot_ancestor_verification
+agent_fleet_offline_install_contract
+executor_credential_adversary
+linux_systemd_drop_integration
+spend_ledger_unit
+foundation_rbac_read_unit
+validation_parent_capacity_contract
+cost_retry_unit
+retail_rate_unit
+quota_snapshot_unit
+shared_allocator_bridge_unit
+commissioning_admission_unit
 run_owned_execution_proof_contract
 runner_document_contract() {
   python3 - "$ROOT/docs/azure-runner.md" <<'PY' \

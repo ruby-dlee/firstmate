@@ -2903,6 +2903,25 @@ def mutate_deallocate(controller, action):
     return final
 
 
+def service_cancel_allows_missing_task_command(action):
+    """Backward-compatible cleanup proof for a retired service worker."""
+    proof = action.get("service_cancel_proof")
+    if not isinstance(proof, dict):
+        return False
+    unsigned = dict(proof)
+    supplied = unsigned.pop("proof_digest", None)
+    bindings = action.get("bindings") or {}
+    return (
+        proof.get("schema") == "fm.worker-service-cancel/v1"
+        and proof.get("verdict") == "cancelled-before-execution"
+        and supplied == hashlib.sha256(canonical_bytes(unsigned)).hexdigest()
+        and proof.get("task") == bindings.get("task")
+        and proof.get("task_generation") == bindings.get("task_generation")
+        and proof.get("assignment_generation") == bindings.get("assignment_generation")
+        and proof.get("cloud_instance_id") == action.get("cloud_instance_id")
+    )
+
+
 def mutate_delete_compute(controller, action):
     snapshot = inventory_slot(controller, action["slot"])
     worker = worker_by_slot(snapshot, action["slot"])
@@ -2923,7 +2942,11 @@ def mutate_delete_compute(controller, action):
             or not cleanup_marker(container, EXECUTE_ABANDON_MARKER, retired_execute_key)
         ):
             raise ProviderError("retired-execute custody marker is not exact")
-        if task_command_missing and retired_execute_key is None:
+        if (
+            task_command_missing
+            and retired_execute_key is None
+            and not service_cancel_allows_missing_task_command(action)
+        ):
             raise ProviderError(
                 "missing task-command has no exact retired-execute custody proof"
             )

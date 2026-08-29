@@ -207,6 +207,9 @@ capture_live() {  # <identity-file> <block-file> [force-supervise-reason]
   backend=$(fm_backend_of_meta "$META")
   target=$(fm_backend_target_of_meta "$META")
   scoped=$(meta_value tmux_session_target)
+  if [ "$(meta_value mode)" = no-mistakes ]; then
+    force_reason='retired no-mistakes task custody requires explicit operator recovery'
+  fi
 
   if [ -n "$worktree_recorded" ] && [ -d "$worktree_recorded" ] && [ ! -L "$worktree_recorded" ]; then
     worktree_real=$(CDPATH='' cd -- "$worktree_recorded" 2>/dev/null && pwd -P) || worktree_real=unavailable

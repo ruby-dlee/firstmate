@@ -68,7 +68,7 @@ An unknown capability name, on either side, refuses the run with exit 97 rather 
 
 The declaration is refused outright on Darwin: macOS is the coverage of record for these units, so there they always run.
 CI declares nothing, so its coverage is unchanged.
-The Azure validation cell is the one declaring environment (`docs/azure-validation.md`), and its shard command carries the declaration its first live run measured.
+Any Azure caller that runs the suite owns its explicit environment declaration under the generic runner contract in `docs/azure-runner.md`; Crosscheck does not run the repository behavior suite.
 Every skip prints one `FM_HOST_CAPABILITY_SKIP` line on stdout and stderr naming the test, the unit, the capability, what the capability is, and why it was unavailable, and `tests/run.sh` prints the whole declaration once per invocation.
 
 Use `tests/run.sh --skip-herdr` for the explicit non-Herdr path.

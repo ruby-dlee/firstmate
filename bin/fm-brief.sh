@@ -232,7 +232,8 @@ case "$MODE" in
 Commit the implementation on your branch.
 $USABILITY_CONTRACT
 Push the branch, open a PR with \`gh-axi\`, append \`done: PR {url}\`, and remain available for corrections.
-Firstmate owns the final exact-head Crosscheck and merge admission.
+This transfers implementation custody to Firstmate; it is not task completion.
+Firstmate owns green-CI proof, the final exact-head Crosscheck, merge admission, and merged-state verification.
 EOF
 )
     ;;

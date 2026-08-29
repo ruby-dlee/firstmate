@@ -71,6 +71,7 @@ map_log_state() {  # <line>
 
 LOG_LINE=$(log_last_line || true)
 LOG_STATE=$(map_log_state "$LOG_LINE")
+OPEN_DECISION=$(status_open_decisions "$LOG" | tail -1)
 TASK_BACKEND=$(fm_backend_of_meta "$META")
 BACKEND_TARGET=$(fm_backend_target_of_meta "$META")
 EXPECTED_LABEL="fm-$ID"
@@ -96,6 +97,16 @@ crew_endpoint_is_busy() {
 # meaningful than a terminal busy signature.
 if [ "$KIND" != secondmate ] && crew_endpoint_is_busy; then
   emit working pane "harness busy"
+fi
+
+if [ -n "$OPEN_DECISION" ]; then
+  IFS=$'\t' read -r _OPEN_KEY OPEN_VERB OPEN_NOTE <<EOF
+$OPEN_DECISION
+EOF
+  case "$OPEN_VERB" in
+    needs-decision) emit parked status-log "$OPEN_NOTE" ;;
+    blocked) emit blocked status-log "$OPEN_NOTE" ;;
+  esac
 fi
 
 if [ "$LOG_STATE" != unknown ]; then

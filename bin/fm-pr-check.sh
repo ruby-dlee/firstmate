@@ -109,6 +109,15 @@ else
   echo "error: task metadata disappeared while resolving PR state for $ID" >&2
   exit 1
 fi
+if ! CI_HEAD=$("$FM_ROOT/bin/fm-github-pr.py" checks "$URL" "$PR_HEAD" 2>&1); then
+  CI_DIAGNOSTIC=$(printf '%s' "$CI_HEAD" | tr '\r\n' '  ')
+  printf 'UNREVIEWED: PR CI is not green: %.500s\n' "$CI_DIAGNOSTIC" >&2
+  exit 1
+fi
+[ "$CI_HEAD" = "$PR_HEAD" ] || {
+  echo "UNREVIEWED: CI verification did not return the exact live PR head" >&2
+  exit 1
+}
 CHECK_TMP=$(mktemp "$STATE/.$ID.check.XXXXXX") || exit 1
 printf -v PR_ADAPTER_Q '%q' "$FM_ROOT/bin/fm-github-pr.py"
 printf -v CROSSCHECK_AUTOSTART_Q '%q' "$CROSSCHECK_AUTOSTART"

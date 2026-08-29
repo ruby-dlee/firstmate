@@ -188,6 +188,8 @@ reap_task() {  # <task> <trigger>
   kind=$(meta_value "$meta" kind)
   [ -n "$kind" ] || kind=ship
   mode=$(meta_value "$meta" mode)
+  [ "$mode" != no-mistakes ] \
+    || refuse "retired no-mistakes task custody requires explicit operator recovery"
   [ -z "$(meta_value "$meta" x_request)" ] || refuse "X-linked tasks require their final follow-up before teardown"
   [ "$kind" != secondmate ] || refuse "persistent secondmates are never auto-reaped"
   [ "$(status_last_verb "$id")" = "done" ] || refuse "last task status is not terminal done"
@@ -198,7 +200,7 @@ reap_task() {  # <task> <trigger>
       ;;
     scout-done:scout:*) ;;
     local-merged:ship:local-only) ;;
-    *) refuse "trigger $trigger does not match kind=$kind mode=-e" ;;
+    *) refuse "trigger $trigger does not match kind=$kind mode=${mode:-direct-PR}" ;;
   esac
   run_teardown "$id"
 }

@@ -66,6 +66,7 @@ url=$2
 number=${url##*/}
 case "$command" in
   head) cat "$FM_TEST_CONTROL/head-$number" ;;
+  checks) cat "$FM_TEST_CONTROL/head-$number" ;;
   state)
     if [ -f "$FM_TEST_CONTROL/merged-$number" ]; then
       printf 'MERGED\n'
@@ -381,6 +382,53 @@ test_dead_coordinator_is_visible_and_retryable() {
   pass "a dead task-local coordinator surfaces and retries its queued exact head"
 }
 
+test_exact_generation_cancel() {
+  local case_dir task=cancelled pull=12 state_file pid out rc i
+  case_dir=$(make_case cancel)
+  seed_task "$case_dir" "$task"
+  set_head "$case_dir" "$pull" "$HEAD_ONE"
+  touch "$case_dir/control/block-$task-$HEAD_ONE"
+  run_pr_check "$case_dir" "$task" "$pull" >/dev/null \
+    || fail "cancel fixture did not register"
+  fm_test_wait_for_file "$case_dir/control/started-$task-$HEAD_ONE" '' 0.02 \
+    || fail "cancel fixture never entered Crosscheck"
+  state_file="$case_dir/home/state/$task.crosscheck-autostart.json"
+  wait_for_state "$state_file" running "$HEAD_ONE" 1 \
+    || fail "cancel fixture never recorded its coordinator"
+  pid=$(json_field "$state_file" pid)
+
+  set +e
+  out=$(FM_ROOT_OVERRIDE="$case_dir/root" FM_HOME="$case_dir/home" \
+    FM_STATE_OVERRIDE="$case_dir/home/state" \
+    "$(dirname "$PR_CHECK")/fm-crosscheck-autostart.py" cancel "$task" wrong-generation 2>&1)
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "cross-generation cancellation"
+  assert_contains "$out" 'different task generation' \
+    "cross-generation cancellation did not fail closed"
+  /bin/kill -0 "$pid" >/dev/null 2>&1 \
+    || fail "cross-generation refusal killed the live coordinator"
+
+  out=$(FM_ROOT_OVERRIDE="$case_dir/root" FM_HOME="$case_dir/home" \
+    FM_STATE_OVERRIDE="$case_dir/home/state" \
+    FM_CROSSCHECK_AUTOSTART_CANCEL_WAIT_SECONDS=2 \
+    "$(dirname "$PR_CHECK")/fm-crosscheck-autostart.py" cancel \
+      "$task" "generation-$task") \
+    || fail "exact-generation coordinator cancellation failed: $out"
+  assert_contains "$out" 'cancelled exact generation' \
+    "coordinator cancellation did not report exact-generation completion"
+  i=0
+  while /bin/kill -0 "$pid" >/dev/null 2>&1 && [ "$i" -lt 100 ]; do
+    sleep 0.02
+    i=$((i + 1))
+  done
+  /bin/kill -0 "$pid" >/dev/null 2>&1 \
+    && fail "exact-generation cancellation left the coordinator alive"
+  [ "$(json_field "$state_file" state)" = failed ] \
+    || fail "exact-generation cancellation did not leave terminal state"
+  pass "task teardown can cancel only its exact detached Crosscheck generation"
+}
+
 test_new_head_restarts_without_prompt_wait() {
   local case_dir task=newhead pull=4 state_file out calls
   case_dir=$(make_case new-head)
@@ -529,12 +577,14 @@ test_registration_capture_order() {
   case_dir=$(make_case capture-order)
   seed_task "$case_dir" "$task"
   set_head "$case_dir" "$pull" "$HEAD_ONE"
-  cat > "$case_dir/root/bin/fm-github-pr.py" <<'SH'
+cat > "$case_dir/root/bin/fm-github-pr.py" <<'SH'
 #!/usr/bin/env bash
-if [ "$1" != head ]; then
-  echo OPEN
-  exit 0
-fi
+case "$1" in
+  state) echo OPEN; exit 0 ;;
+  checks) printf '%s\n' "$3"; exit 0 ;;
+  head) ;;
+  *) exit 97 ;;
+esac
 head=$(cat "$FM_TEST_CONTROL/head-8")
 if [ "${FM_TEST_CAPTURE_FIRST:-}" = 1 ]; then
   touch "$FM_TEST_CONTROL/captured-first"
@@ -720,6 +770,7 @@ case "${FM_TEST_AUTOSTART_CASE:-all}" in
     test_prompt_return_active_and_clear_dedupe
     test_configuration_failures_are_visible_and_retryable
     test_dead_coordinator_is_visible_and_retryable
+    test_exact_generation_cancel
     test_new_head_restarts_without_prompt_wait
     test_unrelated_prs_start_concurrently
     ;;

@@ -5770,6 +5770,19 @@ elif [ -d "$WT" ] && [ "$KIND" != secondmate ]; then
   fi
 fi
 
+# The worktree is now safely returned (or the provider worktree is gone), but
+# task metadata still supplies the exact generation. Stop the detached
+# coordinator before removing that identity and its task-local state.
+if [ -e "$STATE/$ID.crosscheck-autostart.request.json" ] \
+    || [ -e "$STATE/$ID.crosscheck-autostart.json" ] \
+    || [ -e "$STATE/.$ID.crosscheck-autostart.lock" ]; then
+  [ -n "$TASK_GENERATION" ] || {
+    echo "error: Crosscheck coordinator state has no exact task generation for $ID" >&2
+    exit 1
+  }
+  "$FM_ROOT/bin/fm-crosscheck-autostart.py" cancel "$ID" "$TASK_GENERATION" || exit 1
+fi
+
 if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then
   case "$DIRECT_SPAWN_BACKUP" in
     ".$ID.meta.rollback."*) ;;
@@ -5846,7 +5859,10 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the exact recorded per-generation task temp root, including gotmp.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -z "$TASK_TMP" ] || safe_remove_task_tmp "$TASK_TMP" || exit 1
-rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log"
+rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log" \
+  "$STATE/$ID.crosscheck-autostart.request.json" "$STATE/$ID.crosscheck-autostart.json" \
+  "$STATE/$ID.crosscheck-autostart.log" "$STATE/.$ID.crosscheck-autostart-handoff.lock" \
+  "$STATE/.$ID.crosscheck-autostart.lock"
 [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true
 if [ "$KIND" != scout ] && [ "$KIND" != secondmate ] && [ "$MODE" != local-only ]; then
   "$FM_ROOT/bin/fm-fleet-sync.sh" "$PROJ" || true

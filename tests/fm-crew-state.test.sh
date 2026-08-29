@@ -56,6 +56,17 @@ printf '%s\n' 'done: PR merged' > "$state/demo.status"
 FM_FAKE_PANE=idle \
   assert_line 'state: done · source: status-log · PR merged' "$SCRIPT" demo
 
+printf '%s\n' \
+  'needs-decision [key=audience]: choose the release audience' \
+  'working: unrelated follow-up' \
+  'done: implementation ready' > "$state/demo.status"
+FM_FAKE_PANE=idle \
+  assert_line 'state: parked · source: status-log · choose the release audience' "$SCRIPT" demo
+
+printf '%s\n' 'resolved [key=audience]: captain chose' >> "$state/demo.status"
+FM_FAKE_PANE=idle \
+  assert_line 'state: unknown · source: none · backend idle with no current-state event' "$SCRIPT" demo
+
 FM_FAKE_TMUX_MISSING=1 \
   assert_line 'state: unknown · source: none · backend target gone' "$SCRIPT" demo
 

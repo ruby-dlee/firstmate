@@ -60,7 +60,7 @@ No validation, reviewer, tool, or verifier VM is created by this template.
 Those workload classes must scale to zero and may not mount a control home; subnet and identity separation never implies pre-provisioned compute.
 The policy reviewer identity is separate from the browser/tool identity so the follow-up can preserve a credentialed-reviewer and uncredentialed-tool boundary.
 The template does not claim that moving a shared singleton daemon into Azure solves contention.
-The isolated per-run daemon, database, cache, process, credential, worktree, and lifecycle behavior is owned by [`docs/azure-validation.md`](azure-validation.md).
+Generic isolated invocation behavior is owned by [`docs/azure-runner.md`](azure-runner.md), and review-specific compartment behavior is owned by [`docs/azure-crosscheck.md`](azure-crosscheck.md).
 
 The live 128-vCPU regional limit can cover a 2-vCPU supervisor, sixteen 4-vCPU mixed-family author workers, and a 62-vCPU landing reserve.
 That headroom is reserved for isolated validation, Crosscheck, browser, replacement, recovery, and ancillary capacity.

@@ -2,8 +2,8 @@
 
 This document owns what running Firstmate on Azure is required to do, and how far the build has
 got toward each requirement.
-The five component documents (`docs/azure-pilot.md`, `docs/azure-runner.md`,
-`docs/azure-validation.md`, `docs/azure-crosscheck.md`, `docs/azure-workers.md`) own the
+The four active component documents (`docs/azure-pilot.md`, `docs/azure-runner.md`,
+`docs/azure-crosscheck.md`, `docs/azure-workers.md`) own the
 mechanics of what is built.
 Where a component document contradicts a requirement here, the requirement is authoritative and
 that document is corrected as the requirement lands.

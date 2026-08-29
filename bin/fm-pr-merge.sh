@@ -125,6 +125,11 @@ grep -qxF "pr_head=$REVIEWED_HEAD" "$META" || {
   echo "error: fm-pr-check did not record the reviewed live head in $META" >&2
   exit 1
 }
+CI_HEAD=$("$SCRIPT_DIR/fm-github-pr.py" checks "$URL" "$REVIEWED_HEAD") || exit 1
+[ "$CI_HEAD" = "$REVIEWED_HEAD" ] || {
+  echo "error: final CI verification did not return the exact reviewed SHA" >&2
+  exit 1
+}
 
 MERGE_COMMAND=("$SCRIPT_DIR/fm-crosscheck.sh" merge "$ID" "$URL" "$REVIEWED_HEAD" "$MERGE_METHOD")
 [ "$MERGE_METHOD_EXPLICIT" -eq 1 ] || MERGE_COMMAND+=(--allow-queue)

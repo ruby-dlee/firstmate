@@ -54,6 +54,8 @@ STATE_SCHEMA = "fm.worker-lifecycle/v2"
 # it refuses loudly instead, cured by rolling forward.
 LEGACY_PENDING_SENTINEL = "superseded-by-pending-actions"
 REQUEST_SCHEMA = "fm.worker-request/v1"
+ACTIVE_WORKER_ROLES = ("author", "secondmate")
+RETIRED_WORKER_ROLES = ("no-mistakes",)
 EXECUTION_SCHEMA = "fm.worker-execution/v1"
 EXECUTION_RESULT_SCHEMA = "fm.worker-execution-result/v1"
 EXECUTION_TERMINAL_SCHEMA = "fm.worker-execution-terminal/v1"
@@ -770,6 +772,14 @@ def load_state(env):
     state.setdefault("executions", {})
     state.setdefault("pending_actions", {})
     state.setdefault("revision", 0)
+    for item in state["queue"].values():
+        if isinstance(item, dict) and item.get("role") in RETIRED_WORKER_ROLES:
+            # Upgrade compatibility only: retired service requests remain
+            # visible but can never become fresh Azure admissions.
+            item["eligible"] = False
+            item["retired_role"] = True
+            if item.get("status") in ("queued", "projecting"):
+                item["status"] = "retired"
     for worker in state["workers"].values():
         if isinstance(worker, dict):
             worker.setdefault("placement", "azure")
@@ -839,7 +849,7 @@ def verify_request(request):
     for field in ("home_binding", "account_binding", "worktree_binding", "repository_binding"):
         require_binding(field, request.get(field))
     role = request.get("role")
-    if role not in ("author", "secondmate"):
+    if role not in ACTIVE_WORKER_ROLES:
         raise LifecycleError("worker request role must be author or secondmate")
     if request.get("owner_kind") not in ("primary", "secondmate"):
         raise LifecycleError("worker request owner_kind must be primary or secondmate")
@@ -2025,7 +2035,12 @@ def admission_result(env, state, inventory, slot, item=None, provisional=()):
 
 def queued_items(state):
     return sorted(
-        [item for item in state["queue"].values() if item.get("status") == "queued" and item.get("eligible")],
+        [
+            item for item in state["queue"].values()
+            if item.get("role") in ACTIVE_WORKER_ROLES
+            and item.get("status") == "queued"
+            and item.get("eligible")
+        ],
         key=lambda item: (item.get("enqueued_at", ""), item["task"], item["task_generation"]),
     )
 
@@ -2033,7 +2048,9 @@ def queued_items(state):
 def desired_count(env, state, inventory):
     total_work = sum(
         1 for item in state["queue"].values()
-        if item.get("status") in ("queued", "assigning", "assigned") and item.get("eligible")
+        if item.get("role") in ACTIVE_WORKER_ROLES
+        and item.get("status") in ("queued", "assigning", "assigned")
+        and item.get("eligible")
     )
     actual = active_count(state, inventory)
     waiting = queued_items(state)
@@ -2088,6 +2105,14 @@ def make_action(env, action_type, worker=None, item=None, **fields):
         })
         if worker.get("retired_execute_key") is not None:
             action["retired_execute_key"] = worker["retired_execute_key"]
+        service_cancel_proof = worker.get("release_proof")
+        if (
+            action_type == "delete-compute"
+            and isinstance(service_cancel_proof, dict)
+            and service_cancel_proof.get("schema") == "fm.worker-service-cancel/v1"
+            and service_cancel_proof.get("verdict") == "cancelled-before-execution"
+        ):
+            action["service_cancel_proof"] = copy.deepcopy(service_cancel_proof)
     if item is not None:
         action["request"] = item
     action.update(fields)
@@ -2320,6 +2345,16 @@ def drain_pending(env, slot=None, strict=True, skip_slots=None):
         if slot_key in skipped:
             continue
         if slot is not None and slot_key != str(slot):
+            continue
+        if (
+            action.get("role") in RETIRED_WORKER_ROLES
+            and action.get("type") in ("create", "resume", "execute", "steer")
+        ):
+            refusals.append({
+                "type": "replay-refused",
+                "slot": int(slot_key),
+                "reason": "retired worker role cannot replay a provisioning or execution action",
+            })
             continue
         try:
             with slot_lease(env, slot_key) as lease:
@@ -2619,6 +2654,12 @@ def next_reconcile_action(env, state, inventory, now=None):
         classification, note = classify_worker(worker, current, now=now)
         worker["last_classification"] = classification
         worker["classification_note"] = note
+        if worker.get("role") in RETIRED_WORKER_ROLES and not worker.get("release_proof"):
+            # An already-created retired worker may be made dark, but it is
+            # never destroyed without its historical exact release proof.
+            if classification == "assigned":
+                return make_action(env, "deallocate", worker=worker, retired_role=True)
+            continue
         if not worker.get("release_proof"):
             # C3 idle release: an assigned worker whose recorded task ended
             # long ago gets its compute DEALLOCATED unattended - reversible,
@@ -2666,6 +2707,30 @@ def next_reconcile_action(env, state, inventory, now=None):
     return create_admission_action(env, state, inventory, waiting[0], slot, now=now)
 
 
+def adopt_observed_retired_create(env, state, inventory):
+    """Adopt an already-created retired worker without replaying its create.
+
+    A pre-upgrade create claim is ambiguous: absence may mean it never ran or
+    Azure has not exposed it yet. Keep that claim inert on absence. When the
+    exact tagged worker is visible, apply the observed result locally so the
+    next pass can deallocate it without issuing another create.
+    """
+    cloud = inventory_by_slot(inventory)
+    changed = False
+    for slot_key, action in sorted(
+        (state.get("pending_actions") or {}).items(), key=lambda pair: int(pair[0])
+    ):
+        if action.get("role") not in RETIRED_WORKER_ROLES or action.get("type") != "create":
+            continue
+        observed = cloud.get(int(slot_key))
+        if observed is None:
+            continue
+        apply_result_transactionally(env, state, action, {"worker": observed})
+        state["pending_actions"].pop(slot_key, None)
+        changed = True
+    return changed
+
+
 
 def reconcile(env, apply, confirm_subscription):
     """One bounded convergence pass. Provider calls run OUTSIDE the fleet lock;
@@ -2686,6 +2751,9 @@ def reconcile(env, apply, confirm_subscription):
             with controller_lock(env):
                 state = load_state(env)
                 state["last_metrics"] = metrics_from_inventory(inventory)
+                if adopt_observed_retired_create(env, state, inventory):
+                    save_state(env, state)
+                    continue
                 refresh_classifications(state, inventory)
                 action = next_reconcile_action(env, state, inventory)
                 if action is None:

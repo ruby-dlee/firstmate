@@ -2017,8 +2017,15 @@ class ProgressRecord:
             if rc != 0:
                 self.value["progress_observation"] = "unavailable"
             else:
-                encoded = (properties.get("metadata") or {}).get("fmprogress")
-                if encoded is None:
+                # Metadata names are HTTP header names: urllib sends Fmprogress
+                # while curl may send fmprogress. Azure preserves that casing.
+                metadata = properties.get("metadata") or {}
+                observations = [value for key, value in metadata.items()
+                                if isinstance(key, str) and key.lower() == "fmprogress"] if isinstance(metadata, dict) else []
+                encoded = observations[0] if len(observations) == 1 else None
+                if len(observations) > 1 or not isinstance(metadata, dict):
+                    self.value["progress_observation"] = "malformed"
+                elif encoded is None:
                     self.value["progress_observation"] = "missing"
                 elif not isinstance(encoded, str) or len(encoded) > 8192:
                     self.value["progress_observation"] = "malformed"

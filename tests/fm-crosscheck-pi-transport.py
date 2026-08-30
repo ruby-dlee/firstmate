@@ -103,7 +103,10 @@ def progress_contract():
             # Both Azure operations replace metadata, but only Put Blob writes
             # body bytes. Deliberately model metadata loss unless PUT carries it.
             metadata.clear()
-            metadata["fmprogress"] = self.headers.get("x-ms-meta-fmprogress")
+            # Azure preserves the metadata suffix casing of actual wire
+            # headers. urllib title-cases it; curl's final PUT can be lowercase.
+            metadata.update({key[len("x-ms-meta-"):]: value for key, value in self.headers.items()
+                             if key.lower().startswith("x-ms-meta-")})
             self.send_response(201)
             self.end_headers()
             published.set()
@@ -170,16 +173,22 @@ def progress_contract():
                     pass
                 else:
                     raise AssertionError("hard guest death must not return a result marker")
+                assert record.value["guest"] is not None, "case-insensitive metadata observation missing"
                 retained = dict(record.value["guest"])
                 assert retained["stage"] == "synthesis" and "exit_code" not in retained
                 record.collect()
                 assert len(reads) == 1, "optional reads must respect their cadence"
                 stale = {**retained, "stage": "challenge", "updated_at_ms": retained["updated_at_ms"] - 1}
+                assert "Fmprogress" in metadata, "fixture must preserve urllib's actual wire casing"
                 metadata["fmprogress"] = base64.b64encode(runtime.canonical_bytes(stale)).decode()
+                record.collect(force=True)
+                assert record.value["progress_observation"] == "malformed" and record.value["guest"] == retained
+                metadata.clear()
+                metadata["fMpRoGrEsS"] = base64.b64encode(runtime.canonical_bytes(stale)).decode()
                 record.collect(force=True)
                 assert record.value["progress_observation"] == "stale" and record.value["guest"] == retained
                 for bad in (None, [], "!invalid-base64!", base64.b64encode(b'{"schema":"invalid"}').decode()):
-                    metadata["fmprogress"] = bad
+                    metadata["fMpRoGrEsS"] = bad
                     record.collect(force=True)
                     assert record.value["guest"] == retained
                     assert record.value["progress_observation"] in {"missing", "malformed", "unavailable"}

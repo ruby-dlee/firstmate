@@ -55,6 +55,7 @@ LANDED_FILES = (
 REQUEST_SCHEMA = "fm.worker-provider-request/v1"
 RESPONSE_SCHEMA = "fm.worker-provider-response/v1"
 INVENTORY_SCHEMA = "fm.worker-provider-inventory/v1"
+RELEASED_ABSENCE_SCHEMA = "fm.worker-released-absence/v1"
 EXECUTION_TERMINAL_SCHEMA = "fm.worker-execution-terminal/v1"
 EXECUTION_RESULT_SCHEMA = "fm.worker-execution-result/v1"
 EXECUTE_DISPOSITION_SUBMIT = "submit"
@@ -273,6 +274,10 @@ MUTABLE_PROVISIONING_CHILD_KINDS = frozenset({
     "monitor-extension", "bootstrap-command", "task-command", "ttl-schedule",
 })
 READY_CHILD_KINDS = frozenset({"monitor-extension", "bootstrap-command"})
+RELEASED_ABSENT_RESOURCE_KINDS = (
+    "vm", "nic", "os-disk", "task-disk", "account-disk",
+    "monitor-extension", "bootstrap-command", "task-command", "ttl-schedule",
+)
 
 
 class ProviderError(RuntimeError):
@@ -3046,11 +3051,37 @@ def mutate_delete_compute(controller, action):
     return final
 
 
+def released_absent_data_reset(action):
+    """Validate the controller's narrow, idempotency-bound absence adoption."""
+    evidence = action.get("released_absent_data")
+    if evidence is None:
+        return False
+    expected = {
+        "schema": RELEASED_ABSENCE_SCHEMA,
+        "assignment_generation": (action.get("bindings") or {}).get(
+            "assignment_generation"
+        ),
+        "release_proof_digest": action.get("release_proof_digest"),
+        "absent_resources": list(RELEASED_ABSENT_RESOURCE_KINDS),
+    }
+    if evidence != expected:
+        raise ProviderError("released-absence reset evidence is not exact")
+    return True
+
+
+def reset_worker_inventory(controller, action, released_absent_data):
+    """Read one reset snapshot, preserving ambiguity refusal on every replay step."""
+    snapshot = inventory_slot(controller, action["slot"])
+    if released_absent_data and snapshot.get("conflicts"):
+        raise ProviderError("released-absence reset inventory is ambiguous")
+    return worker_by_slot(snapshot, action["slot"])
+
+
 def mutate_reset(controller, action):
     if not re.match(r"^[0-9a-f]{64}$", str(action.get("release_proof_digest", ""))):
         raise ProviderError("reset requires the exact ordinary release-proof digest")
-    snapshot = inventory_slot(controller, action["slot"])
-    worker = worker_by_slot(snapshot, action["slot"])
+    released_absent_data = released_absent_data_reset(action)
+    worker = reset_worker_inventory(controller, action, released_absent_data)
     if worker is None:
         return None
     resources = worker.get("resources") or {}
@@ -3065,20 +3096,37 @@ def mutate_reset(controller, action):
             "vm", "nic", "os-disk", "monitor-extension", "bootstrap-command", "task-command",
             "ttl-schedule",
         )
+        allowed_missing = disposable
+        if released_absent_data:
+            allowed_missing += RELEASED_ABSENT_RESOURCE_KINDS + (
+                "staging-request", "staging-result",
+            )
         resources = cleanup_recorded_exact(
-            action, worker, allow_missing=disposable, require_ready_children=False
+            action, worker, allow_missing=allowed_missing, require_ready_children=False
         )
+        if released_absent_data and any(
+            kind in resources for kind in RELEASED_ABSENT_RESOURCE_KINDS
+        ):
+            raise ProviderError(
+                "released-absence reset refuses while data or compute still exists"
+            )
         if any(kind in resources for kind in disposable):
             raise ProviderError("reset refuses while disposable compute still exists")
         mark_cleanup_container(
             controller, action, "reset-action", action["idempotency_key"]
         )
-        worker = worker_by_slot(inventory_slot(controller, action["slot"]), action["slot"])
+        worker = reset_worker_inventory(controller, action, released_absent_data)
     allow_missing = tuple(kind for kind in REQUIRED_RESOURCE_KINDS if kind != "state-container")
     resources = cleanup_recorded_exact(
         action, worker, allow_missing=allow_missing, skip_immutable=("state-container",),
         require_ready_children=False,
     )
+    if released_absent_data and any(
+        kind in resources for kind in RELEASED_ABSENT_RESOURCE_KINDS
+    ):
+        raise ProviderError(
+            "released-absence reset refuses while data or compute still exists"
+        )
     if any(kind in resources for kind in (
         "vm", "nic", "os-disk", "monitor-extension", "bootstrap-command", "task-command",
         "ttl-schedule",
@@ -3138,7 +3186,7 @@ def mutate_reset(controller, action):
                     "staging archive deletion failed for {}: {}".format(blob_name, stderr))
         independent.append((blob_name, delete_archive))
     run_independent_cleanup(independent)
-    refreshed = worker_by_slot(inventory_slot(controller, action["slot"]), action["slot"])
+    refreshed = reset_worker_inventory(controller, action, released_absent_data)
     if refreshed is None:
         raise ProviderError("cleanup marker container disappeared before exact reset completed")
     state_container = (refreshed.get("resources") or {}).get("state-container")
@@ -3164,8 +3212,8 @@ def mutate_reset(controller, action):
     ], check=False)
     if rc != 0:
         raise ProviderError("exact worker state-container deletion failed: {}".format(stderr))
-    final = inventory_slot(controller, action["slot"])
-    if worker_by_slot(final, action["slot"]) is not None:
+    final = reset_worker_inventory(controller, action, released_absent_data)
+    if final is not None:
         raise ProviderError("released worker capacity remains after exact reset")
     return None
 

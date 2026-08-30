@@ -960,6 +960,102 @@ except module.ProviderIdentityRefusal as exc:
 else:
     raise AssertionError("deallocate cleanup accepted a foreign monitor-extension ID")
 module.inventory = original_inventory
+
+# A reset may adopt only the controller's exact surrendered-absence shape.
+# The real reset reaches its durable marker with exact identity/storage
+# residuals and both data disks absent. Missing/malformed evidence, a disk that
+# still exists, residual identity drift, and a provider conflict all refuse
+# before that marker can authorize deletion.
+absence_action = copy.deepcopy(action)
+absence_action.update({
+    "type": "reset",
+    "release_proof_digest": "6" * 64,
+})
+absence_action["released_absent_data"] = {
+    "schema": module.RELEASED_ABSENCE_SCHEMA,
+    "assignment_generation": absence_action["bindings"]["assignment_generation"],
+    "release_proof_digest": absence_action["release_proof_digest"],
+    "absent_resources": list(module.RELEASED_ABSENT_RESOURCE_KINDS),
+}
+absence_action["idempotency_key"] = hashlib.sha256(module.canonical_bytes(
+    {key: value for key, value in absence_action.items() if key != "idempotency_key"}
+)).hexdigest()
+residual = copy.deepcopy(worker)
+for kind in module.RELEASED_ABSENT_RESOURCE_KINDS:
+    residual["resources"].pop(kind, None)
+
+class MarkerReached(Exception):
+    pass
+
+original_inventory_slot = module.inventory_slot
+original_mark_cleanup_container = module.mark_cleanup_container
+module.inventory_slot = lambda *_a, **_k: {
+    "workers": [copy.deepcopy(residual)], "conflicts": [], "metrics": {},
+}
+module.mark_cleanup_container = lambda *_a, **_k: (_ for _ in ()).throw(MarkerReached())
+try:
+    module.mutate_reset(controller, absence_action)
+except MarkerReached:
+    pass
+else:
+    raise AssertionError("released-absence reset did not reach its fenced residual marker")
+
+without_evidence = copy.deepcopy(absence_action)
+without_evidence.pop("released_absent_data")
+try:
+    module.mutate_reset(controller, without_evidence)
+except module.ProviderError as exc:
+    assert "task-disk resource is absent" in str(exc), exc
+else:
+    raise AssertionError("data-disk absence authorized reset without release evidence")
+
+malformed_evidence = copy.deepcopy(absence_action)
+malformed_evidence["released_absent_data"]["assignment_generation"] = "asg-foreign"
+try:
+    module.mutate_reset(controller, malformed_evidence)
+except module.ProviderError as exc:
+    assert "evidence is not exact" in str(exc), exc
+else:
+    raise AssertionError("malformed released-absence evidence authorized reset")
+
+attached_residual = copy.deepcopy(residual)
+attached_residual["resources"]["task-disk"] = copy.deepcopy(worker["resources"]["task-disk"])
+module.inventory_slot = lambda *_a, **_k: {
+    "workers": [copy.deepcopy(attached_residual)], "conflicts": [], "metrics": {},
+}
+try:
+    module.mutate_reset(controller, absence_action)
+except module.ProviderError as exc:
+    assert "data or compute still exists" in str(exc), exc
+else:
+    raise AssertionError("released-absence reset accepted an attached task disk")
+
+foreign_residual = copy.deepcopy(residual)
+foreign_residual["resources"]["identity"]["immutable_id"] = "foreign-principal"
+module.inventory_slot = lambda *_a, **_k: {
+    "workers": [copy.deepcopy(foreign_residual)], "conflicts": [], "metrics": {},
+}
+try:
+    module.mutate_reset(controller, absence_action)
+except module.ProviderIdentityRefusal as exc:
+    assert "identity immutable identity differs" in str(exc), exc
+else:
+    raise AssertionError("released-absence reset accepted residual identity drift")
+
+module.inventory_slot = lambda *_a, **_k: {
+    "workers": [copy.deepcopy(residual)],
+    "conflicts": [{"slot": 1, "kind": "unknown", "reason": "ambiguous"}],
+    "metrics": {},
+}
+try:
+    module.mutate_reset(controller, absence_action)
+except module.ProviderError as exc:
+    assert "inventory is ambiguous" in str(exc), exc
+else:
+    raise AssertionError("released-absence reset accepted ambiguous provider inventory")
+module.inventory_slot = original_inventory_slot
+module.mark_cleanup_container = original_mark_cleanup_container
+
 # Ordinary provider failures stay on exit 2. If every ProviderError were
 # mislabeled as a permanent identity refusal, abandon-claim could clear a
 # transiently failed claim.
@@ -4247,14 +4343,52 @@ assert controller_state()["workers"][slot]["release_proof"] == proof
 rewritten = json.loads((Path(env["FM_HOME"]) / "surrender-1.json").read_text())
 assert rewritten == proof, "the idempotent rerun did not re-issue the exact stored proof"
 
-# Reconcile now converges the surrendered slot to nothing through the ordinary
-# fenced machinery: delete-compute, then reset.
+# The deliberately discarded worker keeps its existing ordinary convergence
+# path: deallocate/delete-compute/reset.
 for _ in range(4):
     run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
 state = controller_state()
 assert state["workers"] == {}, state["workers"]
 assert state["queue"]["task-1@gen-1"]["status"] == "complete"
 assert slot not in json.loads(Path(fixture_path).read_text())["workers"]
+
+# A second, clean surrender models the live recovery seam: Azure has already
+# removed the exact VM, NIC, OS disk, both data disks, and every VM child while
+# exact identity/storage residuals remain. Reconcile adopts that
+# authority-bound absence and resets directly, without inventing or replaying
+# a compute deletion.
+run(
+    "request", "--task", "task-2", "--task-generation", "gen-2",
+    "--home-binding", binding(1002), "--account-binding", binding(2002),
+    "--worktree-binding", binding(3002), "--repository-binding", binding(4002),
+    "--repository-generation", "repo-2", "--owner-kind", "primary", "--eligible",
+)
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+state = controller_state()
+slot2 = str(state["queue"]["task-2@gen-2"]["slot"])
+fixture = json.loads(Path(fixture_path).read_text())
+fixture["workers"][slot2]["resources"]["vm"]["power_state"] = "VM deallocated"
+Path(fixture_path).write_text(json.dumps(fixture, sort_keys=True, separators=(",", ":")) + "\n")
+run(
+    "surrender", "--task", "task-2", "--task-generation", "gen-2",
+    "--reason", "local metadata was consumed after the replacement landed",
+    "--output", str(Path(env["FM_HOME"]) / "surrender-2.json"),
+    "--confirm-surrender", *confirm,
+)
+fixture = json.loads(Path(fixture_path).read_text())
+for kind in (
+    "vm", "nic", "os-disk", "task-disk", "account-disk",
+    "monitor-extension", "bootstrap-command", "task-command", "ttl-schedule",
+):
+    fixture["workers"][slot2]["resources"].pop(kind, None)
+calls_before = len(fixture["calls"])
+Path(fixture_path).write_text(json.dumps(fixture, sort_keys=True, separators=(",", ":")) + "\n")
+run("reconcile", "--apply", "--confirm-subscription", env["FM_AZURE_SUBSCRIPTION_ID"])
+state = controller_state()
+fixture = json.loads(Path(fixture_path).read_text())
+assert state["queue"]["task-2@gen-2"]["status"] == "complete"
+assert slot2 not in state["workers"] and slot2 not in fixture["workers"]
+assert [call["type"] for call in fixture["calls"][calls_before:]] == ["reset"], fixture["calls"]
 PY
   pass "surrender releases an authority-less worker through refusal-first gates and ordinary reset"
 }
@@ -8133,6 +8267,146 @@ def build_assigned(slot):
         "workers": [cloud], "capacity_reservations": [], "conflicts": [],
     }
     return build_state, worker, item, cloud, inventory
+
+def surrender_proof(worker, task=None):
+    bindings = worker["bindings"]
+    task = task or bindings["task"]
+    surrender = {
+        "reason": "ordinary authority is gone after a landed replacement",
+        "ordinary_refusal": "WORKER AUTHORITY REFUSED: fixture metadata is absent",
+        "surrendered_at": module.iso_utc(T0 - dt.timedelta(hours=1)),
+        "power_state": "vm deallocated",
+        "last_execution_digest": worker.get("last_execution_digest"),
+        "discarded_unlanded_executions": [],
+    }
+    proof = {
+        "schema": module.RELEASE_SCHEMA,
+        "home_binding": bindings["home_binding"],
+        "task": task,
+        "task_generation": bindings["task_generation"],
+        "assignment_generation": worker["assignment_generation"],
+        "account_binding": bindings["account_binding"],
+        "worktree_binding": bindings["worktree_binding"],
+        "repository_binding": bindings["repository_binding"],
+        "repository_generation": bindings["repository_generation"],
+        "cloud_instance_id": worker["cloud_instance_id"],
+        "resources": copy.deepcopy(worker["resources"]),
+        "surrender": surrender,
+        "authorities": {},
+    }
+    for name in ("endpoint", "report", "landing", "account", "worktree"):
+        receipt = {
+            "schema": module.AUTHORITY_SCHEMA,
+            "authority": name,
+            "task": task,
+            "task_generation": bindings["task_generation"],
+            "assignment_generation": worker["assignment_generation"],
+            "verdict": "surrendered",
+            "evidence_digest": module.digest_value({"authority": name, "surrender": surrender}),
+        }
+        receipt["receipt_digest"] = module.digest_value(receipt)
+        proof["authorities"][name] = receipt
+    proof["proof_digest"] = module.digest_value(proof)
+    return proof
+
+def mark_surrendered(state, worker, item, task=None):
+    worker["release_proof"] = surrender_proof(worker, task=task)
+    worker["released_at"] = module.iso_utc(T0 - dt.timedelta(hours=1))
+    worker["phase"] = "release-proved"
+    item["status"] = "releasing"
+    return state, worker, item
+
+def released_absent_fixture(slot=3):
+    state, worker, item, cloud, inventory = build_assigned(slot)
+    mark_surrendered(state, worker, item)
+    for kind in module.RELEASED_ABSENT_RESOURCE_KINDS:
+        cloud["resources"].pop(kind, None)
+    state["executions"] = {}
+    inventory = dict(inventory, workers=[cloud])
+    return state, worker, item, cloud, inventory
+
+# A release-proved surrender whose exact VM, NIC, OS disk, both data disks,
+# and compute children are already absent adopts only the exact residuals and
+# plans reset directly. The action carries a proof/assignment-bound shape that
+# the provider re-observes before deleting anything.
+rstate, rworker, ritem, rcloud, rinventory = released_absent_fixture()
+classification, note = module.reconciled_worker_classification(
+    rstate, rworker, rcloud, now=T0
+)
+assert classification == "orphaned-safe-to-delete", (classification, note)
+rreset = module.next_reconcile_action(penv, rstate, rinventory, now=T0)
+assert rreset["type"] == "reset", rreset
+assert rreset["released_absent_data"] == {
+    "schema": module.RELEASED_ABSENCE_SCHEMA,
+    "assignment_generation": rworker["assignment_generation"],
+    "release_proof_digest": rworker["release_proof"]["proof_digest"],
+    "absent_resources": list(module.RELEASED_ABSENT_RESOURCE_KINDS),
+}, rreset
+
+# Absence is never authority on its own. Unreleased state, a missing proof,
+# any durable unlanded outcome, residual identity drift, live compute, an
+# attached data disk, a proof bound to another task, and provider ambiguity all
+# stay outside the released-absence reset path.
+refusal_state, refusal_worker, refusal_item, refusal_cloud, refusal_inventory = (
+    released_absent_fixture(4)
+)
+refusal_worker["release_proof"] = None
+refusal_worker["phase"] = "assigned"
+refusal_item["status"] = "assigned"
+assert module.next_reconcile_action(
+    penv, refusal_state, refusal_inventory, now=T0
+) is None
+
+missing_state, missing_worker, missing_item, _missing_cloud, missing_inventory = (
+    released_absent_fixture(5)
+)
+missing_worker["release_proof"] = None
+assert module.next_reconcile_action(penv, missing_state, missing_inventory, now=T0) is None
+
+outcome_state, outcome_worker, _outcome_item, _outcome_cloud, outcome_inventory = (
+    released_absent_fixture(6)
+)
+outcome_state["executions"]["e" * 64] = {
+    "task": outcome_worker["bindings"]["task"],
+    "task_generation": outcome_worker["bindings"]["task_generation"],
+    "assignment_generation": outcome_worker["assignment_generation"],
+    "outcome_present": False,
+    "outcome_commits": 0,
+    "outcome_uncommitted_changes": True,
+}
+assert module.next_reconcile_action(penv, outcome_state, outcome_inventory, now=T0) is None
+
+identity_state, _identity_worker, _identity_item, identity_cloud, identity_inventory = (
+    released_absent_fixture(7)
+)
+identity_cloud["resources"]["identity"]["immutable_id"] = "foreign-principal"
+assert module.next_reconcile_action(penv, identity_state, identity_inventory, now=T0) is None
+
+live_state, live_worker, live_item, _live_cloud, live_inventory = build_assigned(8)
+mark_surrendered(live_state, live_worker, live_item)
+live_action = module.next_reconcile_action(penv, live_state, live_inventory, now=T0)
+assert live_action["type"] == "deallocate", live_action
+assert "released_absent_data" not in live_action
+
+attached_state, attached_worker, attached_item, attached_cloud, attached_inventory = build_assigned(9)
+mark_surrendered(attached_state, attached_worker, attached_item)
+for kind in module.RELEASED_ABSENT_RESOURCE_KINDS:
+    if kind != "task-disk":
+        attached_cloud["resources"].pop(kind, None)
+assert attached_cloud["resources"]["task-disk"]["attached_to"]
+assert module.next_reconcile_action(penv, attached_state, attached_inventory, now=T0) is None
+
+proof_state, proof_worker, proof_item, _proof_cloud, proof_inventory = released_absent_fixture(10)
+mark_surrendered(proof_state, proof_worker, proof_item, task="another-task")
+assert module.next_reconcile_action(penv, proof_state, proof_inventory, now=T0) is None
+
+conflict_state, _conflict_worker, _conflict_item, _conflict_cloud, conflict_inventory = (
+    released_absent_fixture(11)
+)
+conflict_inventory["conflicts"] = [
+    {"slot": 11, "kind": "unknown-child", "reason": "ambiguous residual"}
+]
+assert module.next_reconcile_action(penv, conflict_state, conflict_inventory, now=T0) is None
 
 # --- one exact conflicted compartment cannot freeze unrelated cleanup or be
 # selected for fresh admission. The conflicting slot itself stays parked.

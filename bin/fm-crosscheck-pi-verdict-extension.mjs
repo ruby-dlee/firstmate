@@ -107,12 +107,20 @@ function register(pi, name, description, parameters, handler) {
 
 export default function registerCrosscheckTools(pi) {
 	// Task-only diagnostics carry no payload, response headers or model content.
-	if (process.env.FM_CROSSCHECK_EVALUATION_DIAGNOSTICS === "1") {
+	const providerLog = process.env.FM_CROSSCHECK_PROVIDER_EVENT_LOG;
+	if (process.env.FM_CROSSCHECK_EVALUATION_DIAGNOSTICS === "1" && providerLog) {
+		let markers = 0;
+		const recordTiming = (type, status) => {
+			if (markers > 2048) return;
+			const record = { type: markers++ === 2048 ? "crosscheck_diagnostics_truncated" : type, at_unix_ms: Date.now() };
+			if (Number.isInteger(status) && status >= 100 && status <= 599) record.status = status;
+			try { appendFileSync(providerLog, `${JSON.stringify(record)}\n`, { mode: 0o600 }); } catch { /* Optional measurement only. */ }
+		};
 		pi.on("before_provider_request", () => {
-			process.stdout.write(`${JSON.stringify({ type: "crosscheck_provider_request" })}\n`);
+			recordTiming("crosscheck_provider_request");
 		});
 		pi.on("after_provider_response", (event) => {
-			process.stdout.write(`${JSON.stringify({ type: "crosscheck_provider_response", status: event.status })}\n`);
+			recordTiming("crosscheck_provider_response", event.status);
 		});
 	}
 	const schemaPath = process.env.FM_CROSSCHECK_REVIEW_SCHEMA;

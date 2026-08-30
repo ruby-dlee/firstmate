@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Run one isolated Pi Crosscheck review and validate its tool verdict."""
+"""Run one isolated Pi Crosscheck review and validate its tool verdict.
+
+Task evaluation only: FM_CROSSCHECK_EVALUATION_DIAGNOSTICS=1 adds bounded,
+sanitized review_diagnostics to the result (not the admission ledger). It records
+observed request/header/stream/tool/retry timing and candidate metadata, never
+model text, reasoning, search queries, headers or credentials. Each attempt is
+capped at 64 events/16 KiB, with explicit omissions and priority for review items.
+The Azure adapter enables this only through config['_evaluation_diagnostics'].
+Diagnostics are available on collected results; guest failure before publication
+can leave no exported diagnostics. This is not proof that no work occurred.
+"""
 
 from __future__ import annotations
 
@@ -1255,11 +1265,12 @@ class EvaluationDiagnostics:
     MAX_BYTES = 16 * 1024
     ITEM_TOOLS = {
         "report_finding", "report_suspicion", "retract_review_item",
-        "update_finding", "finish_review",
+        "update_finding", "finish_review", "counterexample",
     }
 
     def __init__(self, stage: str, attempt: int, paths: set[str]) -> None:
         self.started = time.monotonic()
+        self.started_unix_ms = int(time.time() * 1000)
         self.paths = paths
         self.request_at: int | None = None
         self.response_at: int | None = None
@@ -1372,6 +1383,10 @@ class EvaluationDiagnostics:
             if len(self.tools) < MAX_TOOL_CALLS and isinstance(event.get("toolCallId"), str):
                 self.tools[event["toolCallId"]] = (now, self.tool_metadata(event["toolName"], event.get("args")))
             return
+        elif kind == "crosscheck_diagnostics_truncated":
+            self.value["truncated"] = True
+            self.value["omitted_events"] += 1
+            return
         elif kind == "tool_execution_end":
             stored = self.tools.pop(event.get("toolCallId"), None)
             if stored is None:
@@ -1400,12 +1415,20 @@ class EvaluationDiagnostics:
 def run_pi_with_diagnostics(command: list[str], environment: dict[str, str],
                             stdout_file: Any, stderr_file: Any,
                             diagnostics: EvaluationDiagnostics) -> subprocess.CompletedProcess:
-    with subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=stderr_file) as process:
+    provider_path = Path(environment["FM_CROSSCHECK_PROVIDER_EVENT_LOG"])
+    provider_path.write_text("", encoding="utf-8")
+    provider_path.chmod(0o600)
+    with provider_path.open(encoding="utf-8") as provider_events, subprocess.Popen(
+        command, env=environment, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=stderr_file,
+    ) as process:
         assert process.stdout is not None
         for line in process.stdout:
             stdout_file.write(line)
             try:
+                for marker in provider_events:
+                    value = json.loads(marker)
+                    diagnostics.observe(value, max(0, value["at_unix_ms"] - diagnostics.started_unix_ms))
                 diagnostics.observe(json.loads(line))
             except (ValueError, TypeError, AttributeError, RecursionError):
                 # Optional measurement must never alter review acceptance.
@@ -1633,6 +1656,7 @@ def run(argv: list[str]) -> int:
         ]
         with events.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
             if diagnostics_enabled:
+                environment["FM_CROSSCHECK_PROVIDER_EVENT_LOG"] = str(result.with_name(f"provider-events-{attempt + 1}.jsonl"))
                 observer = EvaluationDiagnostics(stage, attempt + 1, diagnostic_paths)
                 completed = run_pi_with_diagnostics(command, environment, stdout_file, stderr_file, observer)
                 diagnostics.append(observer.value)
@@ -1783,6 +1807,14 @@ def run(argv: list[str]) -> int:
         }
         if stage == "challenge":
             value["source_excerpts"] = source_excerpts
+            if diagnostics_enabled:
+                case_stats: dict[str, Any] = {}
+                cases = bounded_counterexamples(value["verdict"].get("summary"), case_stats)
+                observer.remember({"event": "case_summary", **case_stats})
+                for case in cases:
+                    metadata = observer.tool_metadata("report_suspicion", case)
+                    observer.remember({**metadata, "tool": "counterexample",
+                                       "event": "case", "outcome": case["outcome"]})
         if diagnostics_enabled:
             value["review_diagnostics"] = diagnostics
         result.write_text(

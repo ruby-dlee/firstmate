@@ -62,6 +62,9 @@ cli = Path(cli_raw).resolve()
 closure = json.loads((ROOT / "docs/azure-crosscheck/model-image-closure.json").read_text())
 version = json.loads((cli.parent.parent / "package.json").read_text())["version"]
 assert version == closure["piVersion"]["value"], "transport fixture must use the image-pinned Pi"
+for family in ("pi-agent-core", "pi-ai", "pi-client", "pi-protocol", "pi-tui", "pi-telemetry"):
+    family_version = json.loads((cli.parent.parent / "node_modules/@earendil-works" / family / "package.json").read_text())["version"]
+    assert family_version == version, "the transport fixture must use a consistent pinned Pi family"
 
 
 def exercise(scenario):

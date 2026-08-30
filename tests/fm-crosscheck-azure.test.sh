@@ -5415,6 +5415,7 @@ print(json.dumps({"type": "agent_end"}))
             "FM_CROSSCHECK_EXECUTION_HOME": str(root / "home"),
             "FM_CROSSCHECK_REVIEW_STAGE": "synthesis",
             "FM_CROSSCHECK_LOOKUP_ALLOWED": "0",
+            "FM_CROSSCHECK_EVALUATION_DIAGNOSTICS": "1" if scenario == "diagnostics" else "0",
         })
         completed = subprocess.run(
             [sys.executable, str(runtime), str(account), "test-model", "xhigh",
@@ -5463,6 +5464,15 @@ print(json.dumps({"type": "agent_end"}))
     metrics = telemetry["review_process"]["stage_metrics"]
     assert [row["stage"] for row in metrics] == ["challenge", "synthesis"]
     assert all(row["elapsed_ms"] >= 0 and row["turns"] == 1 for row in metrics)
+
+    completed, launches, value = execute("diagnostics")
+    assert completed.returncode == 0, completed.stderr
+    assert [row["stage"] for row in value["review_diagnostics"]] == ["challenge", "synthesis"]
+    assert all(len(module.canonical_bytes(row)) <= module.EvaluationDiagnostics.MAX_BYTES
+               for row in value["review_diagnostics"])
+    assert any(row.get("event") == "case_summary" and row["accepted_cases"] == 0
+               for row in value["review_diagnostics"][0]["events"])
+    assert "UNIQUE-CHALLENGE-CLEAR-CONCLUSION" not in json.dumps(value["review_diagnostics"])
 
     completed, launches, value = execute("unicode-handoff")
     assert completed.returncode == 0, completed.stderr

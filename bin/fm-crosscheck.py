@@ -4738,8 +4738,12 @@ Trace changed behavior through callers, consumers, failure paths, concurrency bo
 and compatibility contracts. Check tests and documentation where they are part of the claim.
 Try concrete counterexamples to the changed behavior, especially silent fallback or coercion,
 boundary inputs, partial failure followed by retry, and producer/consumer disagreement where relevant.
-Follow the input through normalization to the actual write or returned result; a passing helper
-test or a later correction UI does not establish that the production consequence is safe.
+When free-form input is parsed or validated by regexes, enums, or finite spelling lists,
+try plausible inputs outside the recognized cases and inspect meaningful unconsumed text.
+Trace whether that input is rejected, ignored, or defaulted, through normalization to the
+actual write or returned result. Equal parses can both discard the same input semantics;
+passing recognized examples does not prove a conservative fallback. A passing helper test
+or a later correction UI does not establish that the production consequence is safe.
 Distinguish behavior introduced or exposed by the diff from unrelated pre-existing issues.
 Disprove each candidate against surrounding code before reporting it; do not invent a blocker
 merely to satisfy a checklist, and do not repeat checks once the relevant path is resolved.

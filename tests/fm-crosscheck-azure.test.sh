@@ -5293,6 +5293,38 @@ with tempfile.TemporaryDirectory() as temporary:
         '@@ -1 +1 @@\n-old\n+new\n'
         'diff --git a/deleted.py b/deleted.py\n--- a/deleted.py\n+++ /dev/null\n'
         '@@ -1 +0,0 @@\n-deleted\n') == {"renamed.py": [(1, 13)]}
+    # Use Git's real headers: spaces add a literal TAB separator; tab names
+    # remain C-quoted even when quotePath=false leaves UTF-8 characters literal.
+    git_paths = root / "git-path-fixtures"
+    git_paths.mkdir()
+    (git_paths / ".crosscheck-review").mkdir()
+    path_names = ["space name.py", "caf\u00e9\t.py", "tab\tname.py", "caf\u00e9 space.py", 'quote"name.py']
+    for name in path_names:
+        (git_paths / name).write_bytes(b"first = 1\nsecond = 2\n")
+    for quote_path in ("true", "false"):
+        generated = []
+        for name in path_names:
+            emitted = subprocess.run(
+                ["git", "-c", f"core.quotePath={quote_path}", "diff", "--no-index",
+                 "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/",
+                 "--", "/dev/null", name], cwd=git_paths, capture_output=True, timeout=15,
+            )
+            assert emitted.returncode == 1, emitted.stderr.decode()
+            header = next(line for line in emitted.stdout.decode().split("\n") if line.startswith("+++ "))
+            if name == "space name.py":
+                assert header == "+++ b/space name.py\t", repr(header)
+            if name == "caf\u00e9\t.py":
+                assert ("caf\u00e9" in header) == (quote_path == "false"), repr(header)
+                assert '\\t.py"' in header
+            assert module.head_hunk_ranges(emitted.stdout.decode()) == {name: [(1, 14)]}
+            generated.append(emitted.stdout)
+        (git_paths / ".crosscheck-review/exact.diff").write_bytes(b"".join(generated))
+        git_windows = module.bounded_head_windows(git_paths)
+        assert git_windows["omitted_windows"] == 0 and "unavailable" not in git_windows
+        assert {window["path"] for window in git_windows["windows"]} == set(path_names)
+        assert all(window["omitted_lines"] == 0 and window["lines"] == [
+            {"line": 1, "text": "first = 1"}, {"line": 2, "text": "second = 2"},
+        ] for window in git_windows["windows"])
     windows = module.bounded_head_windows(repository)
     gap_windows = [row for row in windows["windows"] if row["path"] == "gap.py"]
     assert len(gap_windows) == 2, gap_windows

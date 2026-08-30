@@ -804,10 +804,12 @@ def head_hunk_ranges(diff: str) -> dict[str, list[tuple[int, int]]]:
         if line.startswith("diff --git "):
             path = None
         elif line.startswith("+++ "):
-            raw = line[4:]
-            # Git quotes non-ASCII paths with C/octal byte escapes.
+            # Git escapes embedded tabs; a literal TAB separates the header.
+            raw = line[4:].partition("\t")[0]
             if raw.startswith('"'):
-                raw = ast.literal_eval("b" + raw).decode("utf-8")
+                # quotePath=false can mix literal UTF-8 and C/octal escapes.
+                literal = raw.encode("utf-8").decode("ascii", errors="backslashreplace")
+                raw = ast.literal_eval("b" + literal).decode("utf-8")
             path = safe_relative(raw[2:]) if raw.startswith("b/") else None
         elif line.startswith("@@ "):
             match = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)

@@ -5241,6 +5241,14 @@ accepted = module.bounded_counterexamples(json.dumps({"counterexamples": unicode
 assert accepted == []
 accepted = module.bounded_counterexamples(json.dumps({"counterexamples": unicode_cases[:4]}, ensure_ascii=False))
 assert accepted and len(module.canonical_bytes(accepted)) <= module.MAX_COUNTEREXAMPLE_BYTES
+for text, expected in (
+    ("", []), ("\n", [""]), ("first\nsecond", ["first", "second"]),
+    ("first\nsecond\n", ["first", "second"]),
+    ("first\r\nsecond\r\n", ["first\r", "second\r"]),
+    ("first\r\nsecond\r", ["first\r", "second\r"]),
+    ("first\u2028second\fthird\n", ["first\u2028second\fthird"]),
+):
+    assert module.lf_lines(text) == expected
 
 with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary)
@@ -5317,6 +5325,103 @@ with tempfile.TemporaryDirectory() as temporary:
     except module.ReviewError:
         pass
     (diff_dir / "exact.diff").write_text(diff, encoding="utf-8")
+
+    # Git counts LF only. Exercise the actual JS tools and Python replay, not
+    # just two helpers that could agree on the same incorrect coordinates.
+    coordinate_repo = root / "coordinates"
+    coordinate_repo.mkdir()
+    source_lines = [f"line_{number} = {number}" for number in range(1, 61)]
+    source_lines[0] = 'label = "' + "first\u2028second\f" * 30 + '"'
+    source_lines[1] = 'other = "inside\fformfeed"'
+    source_lines[38] = 'changed_39 = "first\u2028second"'
+    source_lines[39] = 'changed_40 = "first\fsecond"'
+    (coordinate_repo / "coordinates.py").write_bytes(("\n".join(source_lines) + "\n").encode())
+    coordinate_diff = (
+        "diff --git a/coordinates.py b/coordinates.py\n--- a/coordinates.py\n+++ b/coordinates.py\n"
+        "@@ -1,2 +1,2 @@\n " + source_lines[0] + "\n-other = 'old'\n+" + source_lines[1] + "\n"
+        "@@ -39,2 +39,2 @@\n-old39\n-old40\n+" + source_lines[38] + "\n+" + source_lines[39] + "\n"
+    )
+    (coordinate_repo / ".crosscheck-review").mkdir()
+    (coordinate_repo / ".crosscheck-review/exact.diff").write_bytes(coordinate_diff.encode())
+    assert module.head_hunk_ranges(coordinate_diff) == {"coordinates.py": [(1, 14), (27, 52)]}
+    coordinate_windows = module.bounded_head_windows(coordinate_repo)
+    assert coordinate_windows["omitted_windows"] == 0
+    assert all(window["omitted_lines"] == 0 for window in coordinate_windows["windows"])
+    assert [row for window in coordinate_windows["windows"] for row in window["lines"]
+            if row["line"] == 40] == [{"line": 40, "text": source_lines[39]}]
+    terminal_fixtures = {
+        "lf.py": ("first\nsecond\n", ["first", "second"]),
+        "lf-open.py": ("first\nsecond", ["first", "second"]),
+        "crlf.py": ("first\r\nsecond\r\n", ["first\r", "second\r"]),
+        "crlf-open.py": ("first\r\nsecond\r", ["first\r", "second\r"]),
+        "empty.py": ("", [""]),
+        "blank.py": ("\n", [""]),
+    }
+    for path, (content, _) in terminal_fixtures.items():
+        (coordinate_repo / path).write_bytes(content.encode())
+    core_spec = importlib.util.spec_from_file_location("coordinate_schema", runtime.with_name("fm-crosscheck.py"))
+    core = importlib.util.module_from_spec(core_spec)
+    core_spec.loader.exec_module(core)
+    coordinate_schema = root / "coordinate-schema.json"
+    coordinate_schema.write_text(json.dumps(core.pi_review_output_schema("/account", "/execution")))
+    coordinate_log = root / "coordinate-events.jsonl"
+    node = subprocess.run(["node", "--input-type=module", "-", str(extension),
+                           str(coordinate_repo), str(coordinate_schema), str(coordinate_log)],
+                          input=r'''
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+Object.assign(process.env, {
+  FM_CROSSCHECK_REPOSITORY: process.argv[3], FM_CROSSCHECK_REVIEW_SCHEMA: process.argv[4],
+  FM_CROSSCHECK_TOOL_EVENT_LOG: process.argv[5], FM_CROSSCHECK_BASE_SHA: "b".repeat(40),
+  FM_CROSSCHECK_HEAD_SHA: "a".repeat(40), FM_CROSSCHECK_FINDING_IDS: "[]",
+  FM_CROSSCHECK_ACTIVE_FINDING_IDS: "[]", FM_CROSSCHECK_BLOCKING_FINDING_IDS: "[]",
+  FM_CROSSCHECK_TRUST_SNAPSHOT_MANIFEST: "0", FM_CROSSCHECK_LOOKUP_ALLOWED: "0",
+});
+const tools = {};
+(await import(pathToFileURL(process.argv[2]).href)).default({ registerTool(tool) { tools[tool.name] = tool; } });
+const reads = {};
+for (const path of ["coordinates.py", "lf.py", "lf-open.py", "crlf.py", "crlf-open.py", "empty.py", "blank.py"]) {
+  const result = await tools.repo_read.execute("read", {path});
+  assert.deepEqual(result.details, {accepted: true});
+  reads[path] = JSON.parse(result.content[0].text);
+}
+const search = await tools.repo_search.execute("search", {query: "changed_40", paths: ["coordinates.py"]});
+assert.deepEqual(search.details, {accepted: true});
+const invalid = await tools.finish_review.execute("invalid", {
+  verdict: "CLEAR", summary: "invalid coordinate", citations: [{path: "coordinates.py", line: 61}],
+});
+assert.deepEqual(invalid.details, {accepted: false, correctable: true});
+const finish = await tools.finish_review.execute("finish", {
+  verdict: "CLEAR", summary: "line\u2028integrity\fchecked", citations: [{path: "coordinates.py", line: 40}],
+});
+assert.deepEqual(finish.details, {accepted: true});
+console.log(JSON.stringify({reads, search: JSON.parse(search.content[0].text)}));
+''', text=True, capture_output=True, timeout=15)
+    assert node.returncode == 0, node.stderr
+    observed = json.loads(node.stdout)
+    assert [row["text"] for row in observed["reads"]["coordinates.py"]["lines"]] == source_lines
+    for path, (_, expected) in terminal_fixtures.items():
+        assert [row["text"] for row in observed["reads"][path]["lines"]] == expected
+    assert observed["search"]["matches"] == [
+        {"path": "coordinates.py", "line": 40, "text": source_lines[39]}]
+    coordinate_records = [json.loads(line) for line in module.lf_lines(coordinate_log.read_text())]
+    replayed = module.replay_tool_log(
+        coordinate_records, repository=coordinate_repo, head_sha="a" * 40,
+        base_sha="b" * 40, executing_account_home="/account", execution_home="/execution",
+    )
+    assert replayed["verdict"]["citations"] == [{"path": "coordinates.py", "line": 40}]
+    assert replayed["verdict"]["summary"] == "line\u2028integrity\fchecked"
+    # JS emits literal U+2028 in JSON strings, not a new JSONL record.
+    coordinate_pi_events = root / "coordinate-pi-events.jsonl"
+    coordinate_pi_events.write_bytes(b"\n".join(module.canonical_bytes(event) for event in [
+        {"type": "turn_end", "message": {
+            "role": "assistant", "provider": "fireworks-glm", "model": "test-model",
+            "stopReason": "toolUse", "content": [{"type": "toolCall", "id": "finish",
+                "name": "finish_review", "arguments": coordinate_records[-1]["arguments"]}],
+        }}, {"type": "agent_end"},
+    ]) + b"\n")
+    parsed = module.parse_events(coordinate_pi_events, "fireworks-glm", "test-model", coordinate_log)
+    assert parsed["finishes"] == [coordinate_records[-1]["arguments"]]
     account = root / "account"
     account.mkdir()
     prompt = root / "prompt.txt"

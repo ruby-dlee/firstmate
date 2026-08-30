@@ -26,7 +26,8 @@ class FatalToolError extends Error {}
 let guardCall = () => {};
 
 function splitLines(value) {
-	const lines = value.split(/\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]/u);
+	// Git counts LF boundaries; literal Unicode separators and CR are source text.
+	const lines = value.split("\n");
 	if (lines.length > 1 && lines.at(-1) === "") lines.pop();
 	return lines.length ? lines : [""];
 }

@@ -86,6 +86,15 @@ def canonical_bytes(value: Any) -> bytes:
     ).encode("utf-8")
 
 
+def lf_lines(value: str) -> list[str]:
+    """Git source coordinates and JSONL records use LF, not Unicode separators."""
+
+    lines = value.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def value_digest(value: Any) -> str:
     import hashlib
 
@@ -301,7 +310,7 @@ def replay_tool_log(
                 raise ReviewError("model guest: snapshot metadata is not citable")
             if record.get("kind") != "excluded":
                 _relative, text = repository_text(relative)
-                line_count = max(len(text.splitlines()), 1)
+                line_count = max(len(lf_lines(text)), 1)
                 if line > line_count:
                     raise ReviewError("model guest: citation line is outside its file")
             validated.append({"path": relative, "line": line})
@@ -348,7 +357,7 @@ def replay_tool_log(
                     "model guest: repo_search aggregate scan budget is exhausted"
                 )
             search_scanned_bytes += scanned
-            lines = text.splitlines()
+            lines = lf_lines(text)
             for line_number, text in enumerate(lines, start=1):
                 if len(matches) >= limit:
                     break
@@ -365,7 +374,7 @@ def replay_tool_log(
     def repo_read(arguments: dict[str, Any]) -> dict[str, Any]:
         exact_object(arguments, {"path"}, {"start_line", "end_line"})
         relative, text = repository_text(arguments["path"])
-        lines = text.splitlines()
+        lines = lf_lines(text)
         if not lines:
             lines = [""]
         start = integer(arguments.get("start_line", 1), "repo_read.start_line", 1, max(1, len(lines)))
@@ -778,7 +787,7 @@ def head_hunk_ranges(diff: str) -> dict[str, list[tuple[int, int]]]:
     ranges: dict[str, list[tuple[int, int]]] = {}
     path = None
     old_remaining = new_remaining = 0
-    for line in diff.splitlines():
+    for line in lf_lines(diff):
         if old_remaining or new_remaining:
             if line.startswith(" "):
                 old_remaining -= 1
@@ -857,7 +866,7 @@ def bounded_head_windows(
                 MAX_HEAD_WINDOW_FILE_BYTES if text is None
                 else len(text.encode("utf-8"))
             )
-        lines = text.splitlines() if text is not None else []
+        lines = lf_lines(text) if text is not None else []
         for start, end in merged:
             end = min(end, len(lines))
             if text is None or start > end or len(result["windows"]) >= 12:
@@ -1065,7 +1074,7 @@ def parse_events(
     cost_complete = True
     verdict_protocol_error: str | None = None
 
-    for line_number, line in enumerate(source.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_number, line in enumerate(lf_lines(source.read_text(encoding="utf-8")), start=1):
         if not line.strip():
             continue
         try:
@@ -1180,9 +1189,9 @@ def parse_events(
                 )
             accepted_records = [
                 json.loads(line)
-                for line in accepted_tool_events.read_text(
+                for line in lf_lines(accepted_tool_events.read_text(
                     encoding="utf-8"
-                ).splitlines()
+                ))
                 if line.strip()
             ]
         except (
@@ -1709,7 +1718,7 @@ def run(argv: list[str]) -> int:
                 )
             records: list[Any] = []
             for line_number, line in enumerate(
-                tool_events.read_text(encoding="utf-8").splitlines(), start=1
+                lf_lines(tool_events.read_text(encoding="utf-8")), start=1
             ):
                 if not line.strip():
                     continue

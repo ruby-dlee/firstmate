@@ -237,6 +237,8 @@ When available, the ledger's optional `telemetry.review_process.stage_metrics` r
 These measurements support before/after comparisons on real reviews; they do not establish a speed improvement by themselves.
 Task-only calibration can opt into bounded sanitized timing and tool/candidate events; the opt-in and exact bounds are owned by the header of `bin/fm-crosscheck-pi-reviewer.py`.
 These diagnostics are not stored in the admission ledger and cannot establish the absence of unreported reasoning or events omitted by truncation or an early guest failure.
+Separately, every Azure generation keeps a small, private, best-effort progress/failure record even when no final result arrives; its path, fields and collection bounds are owned by `bin/fm-crosscheck-azure.py`.
+That record preserves observed facts and unknowns after staging cleanup, never a verdict or a guessed failure cause.
 Provider request-to-header waits and observed Pi message/stream/tool durations are measured independently; their buffered event sources are not a correlated per-request timeline.
 Provider-reported cost remains separate from locally calculated cost.
 

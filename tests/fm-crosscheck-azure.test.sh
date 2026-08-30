@@ -3255,7 +3255,7 @@ def shared_capacity(arguments):
 adapter.shared_capacity_command=shared_capacity
 adapter.time.monotonic=lambda:0.0
 adapter.time.sleep=lambda _seconds:events.append("capacity-wait")
-adapter.upload_blob=lambda _azure,_path,blob:events.append("upload:"+blob)
+adapter.upload_blob=lambda _azure,_path,blob,**_kwargs:events.append("upload:"+blob)
 adapter.provision_model_vm=lambda *_args,**_kwargs:{"resource_id":"model-resource"}
 def stop_after_create(*_args,**_kwargs):
     events.append("model-submit")
@@ -3263,7 +3263,7 @@ def stop_after_create(*_args,**_kwargs):
 adapter.submit_model_run=stop_after_create
 adapter.cleanup_model_vm=lambda *_args,**_kwargs:events.append("model-cleanup")
 deleted=[]
-adapter.delete_exact_blob=lambda _azure,blob:deleted.append(blob)
+adapter.delete_exact_blob=lambda _azure,blob,**_kwargs:deleted.append(blob)
 
 try:
     adapter._run_azure_review_in_lane(
@@ -3416,7 +3416,7 @@ adapter.reserve_model_capacity = lambda *_args: {
     "fence": "fence-1",
 }
 adapter.preflight_reviewer_credential = lambda *_args: None
-adapter.upload_blob = lambda *_args: None
+adapter.upload_blob = lambda *_args, **_kwargs: None
 adapter.provision_model_vm = lambda *_args: {"resource_id": "/model"}
 adapter.submit_model_run = lambda *_args: {
     "resource_id": "/model",
@@ -3508,7 +3508,7 @@ def cleanup(*_args):
     raise adapter.AzureCrosscheckError("fixture cleanup ambiguity")
 adapter.cleanup_model_vm = cleanup
 adapter.release_model_capacity = lambda *_args: events.append("release")
-adapter.delete_exact_blob = lambda *_args: None
+adapter.delete_exact_blob = lambda *_args, **_kwargs: None
 
 try:
     adapter._run_azure_review_in_lane(
@@ -5040,7 +5040,8 @@ assert safety["condition"] == "[not(parameters('persistent'))]"
 guest = guest_path.read_text(encoding="utf-8")
 assert 'BASE=$ROOT/$REVIEW_GENERATION' in guest
 assert "review generation already exists" in guest
-assert "trap 'rm -rf \"$BASE\"' EXIT" in guest
+assert "trap cleanup_guest EXIT" in guest
+assert 'rm -rf "$BASE" || guest_status=125' in guest
 assert "submit_evidence_file" not in guest
 assert "evidence_files" not in guest
 

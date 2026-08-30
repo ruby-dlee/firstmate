@@ -14,6 +14,7 @@ can leave no exported diagnostics. This is not proof that no work occurred.
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -58,6 +59,133 @@ CODE_SUFFIXES = frozenset(
 SEVERITIES = {"high", "medium", "low"}
 MERGE_DISPOSITIONS = {"must-fix", "advisory"}
 LIFECYCLES = {"open", "claimed-fixed", "verified-fixed", "closed-equivalent"}
+PROGRESS_SCHEMA = "fm.crosscheck-progress/v1"
+PROGRESS_STAGES = {"bootstrap", "challenge", "synthesis"}
+PROGRESS_PHASES = {"starting", "reviewing", "receiving", "tool", "retry", "complete", "failed"}
+PROGRESS_REASONS = {"pi-exit", "protocol-error", "runtime-error", "provider-error"}
+
+
+def sanitize_progress(value: Any) -> dict[str, Any] | None:
+    """The single allowlist for non-authoritative guest progress metadata."""
+    if not isinstance(value, dict) or value.get("schema") != PROGRESS_SCHEMA:
+        return None
+    if (not isinstance(value.get("stage"), str) or value["stage"] not in PROGRESS_STAGES
+            or not isinstance(value.get("phase"), str) or value["phase"] not in PROGRESS_PHASES):
+        return None
+    result = {"schema": PROGRESS_SCHEMA, "stage": value["stage"], "phase": value["phase"]}
+    for key in ("updated_at_ms", "turns", "retries", "attempt", "retries_remaining"):
+        number = value.get(key)
+        if type(number) is int and 0 <= number <= 10 ** 15:
+            result[key] = number
+    if type(value.get("exit_code")) is int and -255 <= value["exit_code"] <= 255:
+        result["exit_code"] = value["exit_code"]
+    if isinstance(value.get("reason"), str) and value["reason"] in PROGRESS_REASONS:
+        result["reason"] = value["reason"]
+    return result
+
+
+def update_progress(**changes: Any) -> None:
+    """Best effort local observation, never a review-acceptance condition."""
+    raw = os.environ.get("FM_CROSSCHECK_PROGRESS_PATH")
+    if not raw:
+        return
+    path = Path(raw)
+    temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
+    try:
+        current = json.loads(path.read_text()) if path.is_file() else {}
+        current = sanitize_progress(current) or {"schema": PROGRESS_SCHEMA, "stage": "bootstrap", "phase": "starting"}
+        if changes.get("phase") == "starting":
+            for key in ("exit_code", "reason", "retries_remaining"):
+                current.pop(key, None)
+        value = sanitize_progress({**current, **changes, "updated_at_ms": int(time.time() * 1000)})
+        temporary.write_bytes(canonical_bytes(value) + b"\n")
+        temporary.chmod(0o600)
+        os.replace(temporary, path)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def record_guest_failure(exit_code: int, reason: str = "runtime-error") -> None:
+    """Do not replace a precise reviewer failure with its wrapper's exit."""
+    try:
+        current = sanitize_progress(json.loads(Path(os.environ["FM_CROSSCHECK_PROGRESS_PATH"]).read_bytes()))
+        if current is not None and current["phase"] == "failed":
+            return
+    except (KeyError, OSError, ValueError, TypeError):
+        pass
+    update_progress(phase="failed", reason=reason, exit_code=exit_code)
+
+
+def progress_metadata_header(path: Path) -> str:
+    """Safe ASCII header only, shared by metadata updates and the final PUT."""
+    import base64
+    try:
+        value = sanitize_progress(json.loads(path.read_bytes()))
+        return base64.b64encode(canonical_bytes(value)).decode("ascii") if value is not None else ""
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
+class LiveProgress:
+    def __init__(self) -> None:
+        self.turns = self.retries = 0
+        self.last_write = 0.0
+        self.phase = "starting"
+
+    def observe(self, event: Any) -> None:
+        if not isinstance(event, dict):
+            return
+        kind = event.get("type")
+        phase = {"message_start": "reviewing", "message_update": "receiving",
+                 "tool_execution_start": "tool", "auto_retry_start": "retry"}.get(kind)
+        if kind == "turn_end":
+            self.turns += 1
+        if kind == "auto_retry_start":
+            self.retries += 1
+        if phase is None and kind != "turn_end":
+            return
+        now = time.monotonic()
+        if phase != self.phase or now - self.last_write >= 1 or kind in {"turn_end", "auto_retry_start"}:
+            self.phase = phase or self.phase
+            changes: dict[str, Any] = {"phase": self.phase, "turns": self.turns, "retries": self.retries}
+            if kind == "auto_retry_start":
+                maximum, attempt = event.get("maxAttempts"), event.get("attempt")
+                if type(maximum) is int and type(attempt) is int and 0 <= attempt <= maximum <= 100:
+                    changes["retries_remaining"] = maximum - attempt
+            update_progress(**changes)
+            self.last_write = now
+
+
+def publish_progress_metadata(url_path: Path, progress_path: Path, stop_path: Path) -> int:
+    """Root-only publisher: update blob metadata, never authoritative body bytes."""
+    import email.utils
+    import urllib.request
+
+    try:
+        url = url_path.read_text().strip() + "&comp=metadata"
+    except OSError:
+        return 0
+    previous: str | None = None
+    next_publish = 0.0
+    while True:
+        stopping = stop_path.exists()
+        if stopping or time.monotonic() >= next_publish:
+            try:
+                encoded = progress_metadata_header(progress_path)
+                if encoded and encoded != previous:
+                    request = urllib.request.Request(url, data=b"", method="PUT", headers={
+                        "x-ms-version": "2023-11-03", "x-ms-date": email.utils.formatdate(usegmt=True),
+                        "x-ms-meta-fmprogress": encoded,
+                    })
+                    with urllib.request.urlopen(request, timeout=3):
+                        pass
+                    previous = encoded
+            except Exception:
+                pass  # No URL, headers, body or raw exception can enter logs.
+            next_publish = time.monotonic() + 15
+        if stopping:
+            return 0
+        time.sleep(0.5)
 
 
 class ReviewError(RuntimeError):
@@ -1434,11 +1562,13 @@ class EvaluationDiagnostics:
 
 def run_pi_with_diagnostics(command: list[str], environment: dict[str, str],
                             stdout_file: Any, stderr_file: Any,
-                            diagnostics: EvaluationDiagnostics) -> subprocess.CompletedProcess:
-    provider_path = Path(environment["FM_CROSSCHECK_PROVIDER_EVENT_LOG"])
-    provider_path.write_text("", encoding="utf-8")
-    provider_path.chmod(0o600)
-    with provider_path.open(encoding="utf-8") as provider_events, subprocess.Popen(
+                            diagnostics: EvaluationDiagnostics | None) -> subprocess.CompletedProcess:
+    provider_path = Path(environment["FM_CROSSCHECK_PROVIDER_EVENT_LOG"]) if diagnostics else None
+    if provider_path is not None:
+        provider_path.write_text("", encoding="utf-8")
+        provider_path.chmod(0o600)
+    progress = LiveProgress()
+    with (provider_path.open(encoding="utf-8") if provider_path else contextlib.nullcontext(None)) as provider_events, subprocess.Popen(
         command, env=environment, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=stderr_file,
     ) as process:
@@ -1446,14 +1576,17 @@ def run_pi_with_diagnostics(command: list[str], environment: dict[str, str],
         for line in process.stdout:
             stdout_file.write(line)
             try:
-                for marker in provider_events:
-                    value = json.loads(marker)
-                    diagnostics.observe(value, max(0, value["at_unix_ms"] - diagnostics.started_unix_ms))
-                diagnostics.observe(json.loads(line))
+                if diagnostics is not None:
+                    for marker in provider_events:
+                        value = json.loads(marker)
+                        diagnostics.observe(value, max(0, value["at_unix_ms"] - diagnostics.started_unix_ms))
+                    diagnostics.observe(json.loads(line))
+                progress.observe(json.loads(line))
             except (ValueError, TypeError, AttributeError, RecursionError):
                 # Optional measurement must never alter review acceptance.
-                diagnostics.value["truncated"] = True
-                diagnostics.value["omitted_events"] += 1
+                if diagnostics is not None:
+                    diagnostics.value["truncated"] = True
+                    diagnostics.value["omitted_events"] += 1
         return subprocess.CompletedProcess(command, process.wait())
 
 
@@ -1640,6 +1773,7 @@ def run(argv: list[str]) -> int:
     ):
         raise ReviewError("model guest: Pi command binding is malformed")
     for attempt in range(2):
+        update_progress(stage=stage, phase="starting", attempt=attempt + 1, turns=0, retries=0)
         active_prompt = prompt if attempt == 0 else repair_prompt
         events = result.with_name(f"pi-events-{attempt + 1}.jsonl")
         tool_events = result.with_name(f"tool-events-{attempt + 1}.jsonl")
@@ -1675,17 +1809,21 @@ def run(argv: list[str]) -> int:
             f"@{active_prompt}",
         ]
         with events.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
-            if diagnostics_enabled:
-                environment["FM_CROSSCHECK_PROVIDER_EVENT_LOG"] = str(result.with_name(f"provider-events-{attempt + 1}.jsonl"))
-                observer = EvaluationDiagnostics(stage, attempt + 1, diagnostic_paths)
+            if diagnostics_enabled or environment.get("FM_CROSSCHECK_PROGRESS_PATH"):
+                observer = None
+                if diagnostics_enabled:
+                    environment["FM_CROSSCHECK_PROVIDER_EVENT_LOG"] = str(result.with_name(f"provider-events-{attempt + 1}.jsonl"))
+                    observer = EvaluationDiagnostics(stage, attempt + 1, diagnostic_paths)
                 completed = run_pi_with_diagnostics(command, environment, stdout_file, stderr_file, observer)
-                diagnostics.append(observer.value)
+                if observer is not None:
+                    diagnostics.append(observer.value)
             else:
                 completed = subprocess.run(
                     command, check=False, env=environment, stdin=subprocess.DEVNULL,
                     stdout=stdout_file, stderr=stderr_file,
                 )
         if completed.returncode != 0:
+            update_progress(phase="failed", reason="pi-exit", exit_code=completed.returncode)
             diagnostic = provider_error_diagnostic(
                 stderr_path.read_text(encoding="utf-8", errors="replace")
             )
@@ -1842,14 +1980,18 @@ def run(argv: list[str]) -> int:
             encoding="utf-8",
         )
         stderr_path.unlink(missing_ok=True)
+        update_progress(phase="complete", exit_code=0)
         return 0
     raise ReviewError("model guest: Pi verdict repair loop ended without a result")
 
 
 def main() -> int:
+    if len(sys.argv) == 5 and sys.argv[1] == "--publish-progress":
+        return publish_progress_metadata(*map(Path, sys.argv[2:]))
     try:
         return run(sys.argv)
     except (OSError, ReviewError, ValueError, RecursionError) as exc:
+        record_guest_failure(125, "protocol-error" if isinstance(exc, ReviewError) else "runtime-error")
         print(str(exc), file=sys.stderr)
         return 125
 

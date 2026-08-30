@@ -106,6 +106,15 @@ function register(pi, name, description, parameters, handler) {
 }
 
 export default function registerCrosscheckTools(pi) {
+	// Task-only diagnostics carry no payload, response headers or model content.
+	if (process.env.FM_CROSSCHECK_EVALUATION_DIAGNOSTICS === "1") {
+		pi.on("before_provider_request", () => {
+			process.stdout.write(`${JSON.stringify({ type: "crosscheck_provider_request" })}\n`);
+		});
+		pi.on("after_provider_response", (event) => {
+			process.stdout.write(`${JSON.stringify({ type: "crosscheck_provider_response", status: event.status })}\n`);
+		});
+	}
 	const schemaPath = process.env.FM_CROSSCHECK_REVIEW_SCHEMA;
 	const repository = process.env.FM_CROSSCHECK_REPOSITORY;
 	const logPath = process.env.FM_CROSSCHECK_TOOL_EVENT_LOG;

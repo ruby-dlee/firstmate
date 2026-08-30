@@ -1023,6 +1023,172 @@ def parse_events(
     }
 
 
+class EvaluationDiagnostics:
+    """Bounded event metadata, never model text or a substitute for replay."""
+
+    MAX_EVENTS = 64
+    MAX_BYTES = 16 * 1024
+    ITEM_TOOLS = {
+        "report_finding", "report_suspicion", "retract_review_item",
+        "update_finding", "finish_review",
+    }
+
+    def __init__(self, stage: str, attempt: int, paths: set[str]) -> None:
+        self.started = time.monotonic()
+        self.paths = paths
+        self.request_at: int | None = None
+        self.response_at: int | None = None
+        self.first_delta_at: int | None = None
+        self.last_delta_at: int | None = None
+        self.tools: dict[str, tuple[int, dict[str, Any]]] = {}
+        self.value: dict[str, Any] = {
+            "stage": stage, "attempt": attempt, "elapsed_ms": 0,
+            "requests": 0, "responses": 0, "retries": 0,
+            "retry_delay_ms": 0, "response_wait_ms": 0,
+            "first_delta_wait_ms": 0, "stream_ms": 0,
+            "max_delta_gap_ms": 0, "tool_ms": 0,
+            "truncated": False, "omitted_events": 0, "events": [],
+        }
+
+    def remember(self, record: dict[str, Any]) -> None:
+        events = self.value["events"]
+        events.append(record)
+        while len(events) > self.MAX_EVENTS or len(canonical_bytes(self.value)) > self.MAX_BYTES:
+            # Keep report/retraction/finalization events preferentially. Truncation
+            # is explicit, including if even those events cannot all be retained.
+            index = next((i for i, row in enumerate(events)
+                          if row.get("tool") not in self.ITEM_TOOLS), 0)
+            events.pop(index)
+            self.value["truncated"] = True
+            self.value["omitted_events"] += 1
+
+    def tool_metadata(self, name: str, arguments: Any) -> dict[str, Any]:
+        result: dict[str, Any] = {"tool": name}
+        if not isinstance(arguments, dict):
+            return result
+        rows = arguments.get("reads", [arguments])
+        if name in {"report_finding", "report_suspicion", "update_finding"}:
+            rows = arguments.get("citations", [])
+        locations = []
+        for row in rows[:8] if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or row.get("path") not in self.paths:
+                continue
+            location = {"path": row["path"]}
+            for key in ("start_line", "end_line", "line"):
+                number = row.get(key)
+                if type(number) is int and 1 <= number <= 10000000:
+                    location[key] = number
+            locations.append(location)
+        if locations:
+            result["locations"] = locations
+        for key, allowed in (("severity", SEVERITIES),
+                             ("merge_disposition", MERGE_DISPOSITIONS),
+                             ("requested_status", LIFECYCLES)):
+            if arguments.get(key) in allowed:
+                result[key] = arguments[key]
+        for key in ("id", "provisional_id", "finding_id"):
+            identifier = arguments.get(key)
+            if isinstance(identifier, str):
+                result[key + "_sha256"] = value_digest(identifier)
+        return result
+
+    def observe(self, event: Any, elapsed_ms: int | None = None) -> None:
+        if not isinstance(event, dict):
+            return
+        now = elapsed_ms if elapsed_ms is not None else int((time.monotonic() - self.started) * 1000)
+        self.value["elapsed_ms"] = now
+        kind = event.get("type")
+        row: dict[str, Any] = {"at_ms": now}
+        if kind == "crosscheck_provider_request":
+            self.value["requests"] += 1
+            self.request_at = now
+            self.response_at = self.first_delta_at = self.last_delta_at = None
+            row["event"] = "request"
+        elif kind == "crosscheck_provider_response":
+            self.value["responses"] += 1
+            self.response_at = now
+            if self.request_at is not None:
+                row["wait_ms"] = max(0, now - self.request_at)
+                self.value["response_wait_ms"] += row["wait_ms"]
+            status = event.get("status")
+            if type(status) is int and 100 <= status <= 599:
+                row["status"] = status
+            row["event"] = "response"
+        elif kind == "message_update":
+            delta = event.get("assistantMessageEvent")
+            if not isinstance(delta, dict) or delta.get("type") not in {"text_delta", "thinking_delta", "toolcall_delta"}:
+                return
+            if self.first_delta_at is None:
+                self.first_delta_at = now
+                if self.request_at is not None:
+                    self.value["first_delta_wait_ms"] += max(0, now - self.request_at)
+            if self.last_delta_at is not None:
+                self.value["max_delta_gap_ms"] = max(self.value["max_delta_gap_ms"], now - self.last_delta_at)
+            self.last_delta_at = now
+            return
+        elif kind == "message_end" and event.get("message", {}).get("role") == "assistant":
+            row["event"] = "assistant_end"
+            if self.response_at is not None:
+                row["stream_ms"] = max(0, now - self.response_at)
+                self.value["stream_ms"] += row["stream_ms"]
+            if self.request_at is not None:
+                row["request_elapsed_ms"] = max(0, now - self.request_at)
+            stop = event.get("message", {}).get("stopReason")
+            if stop in {"stop", "toolUse", "error", "aborted", "length"}:
+                row["stop"] = stop
+        elif kind == "auto_retry_start":
+            self.value["retries"] += 1
+            row["event"] = "retry"
+            delay = event.get("delayMs")
+            if type(delay) is int and 0 <= delay <= 60000:
+                row["delay_ms"] = delay
+                self.value["retry_delay_ms"] += delay
+        elif kind == "tool_execution_start" and event.get("toolName") in TOOL_NAMES:
+            if len(self.tools) < MAX_TOOL_CALLS and isinstance(event.get("toolCallId"), str):
+                self.tools[event["toolCallId"]] = (now, self.tool_metadata(event["toolName"], event.get("args")))
+            return
+        elif kind == "tool_execution_end":
+            stored = self.tools.pop(event.get("toolCallId"), None)
+            if stored is None:
+                return
+            started, metadata = stored
+            row.update(metadata)
+            row.update(event="tool", elapsed_ms=max(0, now - started))
+            self.value["tool_ms"] += row["elapsed_ms"]
+            result = event.get("result")
+            details = result.get("details") if isinstance(result, dict) else None
+            row["accepted"] = isinstance(details, dict) and details.get("accepted") is True
+            if row["accepted"] and row["tool"] in {"report_finding", "report_suspicion"}:
+                for part in result.get("content", []):
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        try:
+                            identifier = json.loads(part.get("text", "")).get("provisional_id")
+                            if isinstance(identifier, str):
+                                row["id_sha256"] = value_digest(identifier)
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+        else:
+            return
+        self.remember(row)
+
+
+def run_pi_with_diagnostics(command: list[str], environment: dict[str, str],
+                            stdout_file: Any, stderr_file: Any,
+                            diagnostics: EvaluationDiagnostics) -> subprocess.CompletedProcess:
+    with subprocess.Popen(command, env=environment, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=stderr_file) as process:
+        assert process.stdout is not None
+        for line in process.stdout:
+            stdout_file.write(line)
+            try:
+                diagnostics.observe(json.loads(line))
+            except (ValueError, TypeError, AttributeError, RecursionError):
+                # Optional measurement must never alter review acceptance.
+                diagnostics.value["truncated"] = True
+                diagnostics.value["omitted_events"] += 1
+        return subprocess.CompletedProcess(command, process.wait())
+
+
 def run(argv: list[str]) -> int:
     if len(argv) != 9:
         raise ReviewError("model guest: Pi reviewer expected eight arguments")
@@ -1057,6 +1223,16 @@ def run(argv: list[str]) -> int:
     if stage not in {"challenge", "synthesis"}:
         raise ReviewError("model guest: Pi review stage is invalid")
     challenge_telemetry: dict[str, Any] | None = None
+    diagnostics_enabled = environment.get("FM_CROSSCHECK_EVALUATION_DIAGNOSTICS") == "1"
+    diagnostics: list[dict[str, Any]] = []
+    diagnostic_paths: set[str] = set()
+    if diagnostics_enabled:
+        try:
+            diagnostic_paths = {path for path, record in repository_files(
+                repository, trust_repository_manifest=environment.get("FM_CROSSCHECK_TRUST_SNAPSHOT_MANIFEST") == "1"
+            ).items() if record.get("kind") in {"file", "executable", "metadata"}}
+        except (OSError, ValueError, ReviewError):
+            pass  # Missing navigation is not a new review gate.
     if stage == "synthesis":
         challenge_prompt = result.with_name("challenge-prompt.txt")
         challenge_result = result.with_name("challenge-result.json")
@@ -1102,6 +1278,8 @@ def run(argv: list[str]) -> int:
         except (json.JSONDecodeError, ValueError, RecursionError) as exc:
             raise ReviewError("model guest: challenge result is malformed") from exc
         challenge_telemetry = challenge_value.get("telemetry")
+        if diagnostics_enabled:
+            diagnostics.extend(challenge_value.get("review_diagnostics", []))
         if not isinstance(challenge_telemetry, dict):
             raise ReviewError("model guest: challenge telemetry is missing")
         synthesis_prompt = result.with_name("synthesis-prompt.txt")
@@ -1197,14 +1375,15 @@ def run(argv: list[str]) -> int:
             f"@{active_prompt}",
         ]
         with events.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
-            completed = subprocess.run(
-                command,
-                check=False,
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_file,
-                stderr=stderr_file,
-            )
+            if diagnostics_enabled:
+                observer = EvaluationDiagnostics(stage, attempt + 1, diagnostic_paths)
+                completed = run_pi_with_diagnostics(command, environment, stdout_file, stderr_file, observer)
+                diagnostics.append(observer.value)
+            else:
+                completed = subprocess.run(
+                    command, check=False, env=environment, stdin=subprocess.DEVNULL,
+                    stdout=stdout_file, stderr=stderr_file,
+                )
         if completed.returncode != 0:
             diagnostic = provider_error_diagnostic(
                 stderr_path.read_text(encoding="utf-8", errors="replace")
@@ -1347,6 +1526,8 @@ def run(argv: list[str]) -> int:
         }
         if stage == "challenge":
             value["source_excerpts"] = source_excerpts
+        if diagnostics_enabled:
+            value["review_diagnostics"] = diagnostics
         result.write_text(
             json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",

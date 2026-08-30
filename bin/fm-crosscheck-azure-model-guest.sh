@@ -275,6 +275,12 @@ if not isinstance(account, str) or "sha256:" + hashlib.sha256(account.encode()).
 path = destination / expected_name
 path.write_bytes(credential_bytes)
 path.chmod(0o600)
+if reviewer["harness"] == "pi":
+    # This account is destroyed at the end of this generation. Bound network
+    # inactivity, not review duration; Pi retains context across native retries.
+    settings = destination / "settings.json"
+    settings.write_text(json.dumps({"httpIdleTimeoutMs": 120000}) + "\n")
+    settings.chmod(0o600)
 PY
 rm -f "$CREDENTIAL"
 
@@ -490,6 +496,9 @@ case "$HARNESS" in
     ;;
   pi)
     export PI_CODING_AGENT_DIR="$ACCOUNT"
+    if [ "$(jq -r '.evaluation_diagnostics // false' "$INPUT")" = true ]; then
+      export FM_CROSSCHECK_EVALUATION_DIAGNOSTICS=1
+    fi
     # The model decides the provider slot (R6): each cross-family deployment
     # runs on its own provider slot, the gpt fallback family stays on
     # openai-codex, and an unmapped model refuses rather than guessing.
@@ -533,6 +542,8 @@ output = {
     **({"tool_events": review["tool_events"]} if harness == "pi" else {}),
     "telemetry": review.get("telemetry"),
 }
+if request.get("evaluation_diagnostics") is True and harness == "pi":
+    output["review_diagnostics"] = review.get("review_diagnostics", [])
 lookup = review.get("lookup_request")
 if lookup is not None:
     if harness != "pi" or not isinstance(lookup, list) or not lookup:

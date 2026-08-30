@@ -5370,6 +5370,7 @@ PY
   pass "two fresh Pi stages reuse bounded exact source excerpts without sharing verdict authority"
 }
 
+python3 "$ROOT/tests/fm-crosscheck-pi-transport.py" "$ROOT" || fail "Pi inactivity transport or diagnostics regression"
 pi_review_handoff_unit
 shared_host_contract_unit
 parameter_contract_unit

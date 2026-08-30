@@ -2369,6 +2369,7 @@ def make_input(
             "effort": config["effort"],
         },
         "review_schema": schema,
+        "evaluation_diagnostics": config.get("_evaluation_diagnostics") is True,
         "verdict_extension": {
             "source": PI_VERDICT_EXTENSION.read_text(encoding="utf-8"),
             "sha256": digest_file(PI_VERDICT_EXTENSION),

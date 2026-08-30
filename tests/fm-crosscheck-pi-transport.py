@@ -32,6 +32,7 @@ core = load("crosscheck_transport_core", ROOT / "bin/fm-crosscheck.py")
 observer = runtime.EvaluationDiagnostics("challenge", 1, {"safe.py"})
 observer.observe({"type": "crosscheck_provider_request", "payload": "SECRET"}, 0)
 observer.observe({"type": "crosscheck_provider_response", "status": 200, "headers": {"secret": "SECRET"}}, 100)
+observer.observe({"type": "message_start", "message": {"role": "assistant"}}, 20)
 observer.observe({"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta", "delta": "SECRET"}}, 125)
 observer.observe({"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta", "delta": "SECRET"}}, 150)
 observer.observe({"type": "message_end", "message": {"role": "assistant", "stopReason": "toolUse", "content": "SECRET"}}, 200)
@@ -49,10 +50,29 @@ assert "SECRET" not in json.dumps(diagnostics)
 assert len(runtime.canonical_bytes(diagnostics)) <= observer.MAX_BYTES
 assert diagnostics["truncated"] and diagnostics["omitted_events"] > 0
 assert any(row.get("tool") == "report_finding" for row in diagnostics["events"])
-assert diagnostics["response_wait_ms"] == 100 and diagnostics["stream_ms"] == 100
-assert diagnostics["first_delta_wait_ms"] == 125 and diagnostics["max_delta_gap_ms"] == 25
+assert diagnostics["response_wait_ms"] == 100 and diagnostics["stream_ms"] == 75
+assert diagnostics["assistant_first_delta_ms"] == 105 and diagnostics["max_delta_gap_ms"] == 25
+assert diagnostics["assistant_elapsed_ms"] == 180
 assert diagnostics["tool_ms"] == 10 and diagnostics["retries"] == 200
 print("Sanitized bounded diagnostics passed")
+
+# A sidecar can run ahead of buffered stdout. Its future request must not
+# reattribute a previous assistant's stream or fabricate missing correlations.
+backlog = runtime.EvaluationDiagnostics("challenge", 1, set())
+for at, kind in ((0, "request"), (100, "response"), (200, "request"), (300, "response")):
+    backlog.observe({"type": "crosscheck_provider_" + kind, "status": 200}, at)
+for at in (400, 500):
+    backlog.observe({"type": "message_end", "message": {"role": "assistant", "stopReason": "toolUse"}}, at)
+assert backlog.value["response_wait_ms"] == 200
+assert backlog.value["stream_ms"] == backlog.value["assistant_elapsed_ms"] == 0
+assert all("request_elapsed_ms" not in event for event in backlog.value["events"])
+backlog.observe({"type": "message_start", "message": {"role": "assistant"}}, 600)
+backlog.observe({"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta"}}, 650)
+backlog.observe({"type": "crosscheck_provider_request"}, 1000)
+backlog.observe({"type": "crosscheck_provider_response", "status": 200}, 1100)
+backlog.observe({"type": "message_end", "message": {"role": "assistant", "stopReason": "toolUse"}}, 700)
+assert backlog.value["stream_ms"] == 50 and backlog.value["assistant_elapsed_ms"] == 100
+print("Independently buffered provider/stdout timing regression passed")
 
 cli_raw = os.environ.get("FM_TEST_PINNED_PI_CLI")
 if not cli_raw:

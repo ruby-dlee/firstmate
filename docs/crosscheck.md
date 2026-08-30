@@ -167,7 +167,7 @@ without widening repository or network access.
 The Pi runtime performs both review stages inside the same isolated Azure generation, without another provisioning or staging cycle.
 Only the synthesis event log becomes ledger authority; challenge output is bounded and injected as untrusted hypotheses.
 The synthesis also receives a small cache of exact source excerpts copied only from successfully replayed snapshot reads, with omitted lines explicitly marked.
-Both stages receive bounded numbered source windows around changed head hunks, using the same snapshot containment checks as repository reads and explicit omissions.
+The challenge receives bounded numbered source windows around changed head hunks, using the same snapshot containment checks as repository reads and explicit omissions.
 Challenge work centers on concrete input/state counterexamples and source-traced outcomes; optional structured case notes accompany findings as untrusted leads, while malformed or absent notes add no new failure condition.
 Synthesis still inspects the complete diff and independently verifies findings, using ordinary batched reads for missing context; raw challenge prose or its `CLEAR` conclusion is not handed forward.
 Telemetry combines both stages and identifies the two-stage review process.
@@ -237,6 +237,7 @@ When available, the ledger's optional `telemetry.review_process.stage_metrics` r
 These measurements support before/after comparisons on real reviews; they do not establish a speed improvement by themselves.
 Task-only calibration can opt into bounded sanitized timing and tool/candidate events; the opt-in and exact bounds are owned by the header of `bin/fm-crosscheck-pi-reviewer.py`.
 These diagnostics are not stored in the admission ledger and cannot establish the absence of unreported reasoning or events omitted by truncation or an early guest failure.
+Provider request-to-header waits and observed Pi message/stream/tool durations are measured independently; their buffered event sources are not a correlated per-request timeline.
 Provider-reported cost remains separate from locally calculated cost.
 
 An accepted clear review can be reused without another model request only when

@@ -1282,7 +1282,7 @@ class EvaluationDiagnostics:
         self.started_unix_ms = int(time.time() * 1000)
         self.paths = paths
         self.request_at: int | None = None
-        self.response_at: int | None = None
+        self.assistant_at: int | None = None
         self.first_delta_at: int | None = None
         self.last_delta_at: int | None = None
         self.tools: dict[str, tuple[int, dict[str, Any]]] = {}
@@ -1290,7 +1290,7 @@ class EvaluationDiagnostics:
             "stage": stage, "attempt": attempt, "elapsed_ms": 0,
             "requests": 0, "responses": 0, "retries": 0,
             "retry_delay_ms": 0, "response_wait_ms": 0,
-            "first_delta_wait_ms": 0, "stream_ms": 0,
+            "assistant_first_delta_ms": 0, "assistant_elapsed_ms": 0, "stream_ms": 0,
             "max_delta_gap_ms": 0, "tool_ms": 0,
             "truncated": False, "omitted_events": 0, "events": [],
         }
@@ -1341,17 +1341,17 @@ class EvaluationDiagnostics:
         if not isinstance(event, dict):
             return
         now = elapsed_ms if elapsed_ms is not None else int((time.monotonic() - self.started) * 1000)
-        self.value["elapsed_ms"] = now
+        self.value["elapsed_ms"] = max(self.value["elapsed_ms"], now)
         kind = event.get("type")
-        row: dict[str, Any] = {"at_ms": now}
+        row: dict[str, Any] = {"at_ms": now, "source": "pi"}
         if kind == "crosscheck_provider_request":
             self.value["requests"] += 1
             self.request_at = now
-            self.response_at = self.first_delta_at = self.last_delta_at = None
+            row["source"] = "provider"
             row["event"] = "request"
         elif kind == "crosscheck_provider_response":
             self.value["responses"] += 1
-            self.response_at = now
+            row["source"] = "provider"
             if self.request_at is not None:
                 row["wait_ms"] = max(0, now - self.request_at)
                 self.value["response_wait_ms"] += row["wait_ms"]
@@ -1359,25 +1359,34 @@ class EvaluationDiagnostics:
             if type(status) is int and 100 <= status <= 599:
                 row["status"] = status
             row["event"] = "response"
+        elif kind == "message_start" and event.get("message", {}).get("role") == "assistant":
+            # Pi stdout and the provider sidecar can be buffered independently.
+            # Correlate only within each ordered source, never a sidecar request
+            # with an earlier stdout turn that happened to arrive later.
+            self.assistant_at = now
+            self.first_delta_at = self.last_delta_at = None
+            return
         elif kind == "message_update":
             delta = event.get("assistantMessageEvent")
             if not isinstance(delta, dict) or delta.get("type") not in {"text_delta", "thinking_delta", "toolcall_delta"}:
                 return
             if self.first_delta_at is None:
                 self.first_delta_at = now
-                if self.request_at is not None:
-                    self.value["first_delta_wait_ms"] += max(0, now - self.request_at)
+                if self.assistant_at is not None:
+                    self.value["assistant_first_delta_ms"] += max(0, now - self.assistant_at)
             if self.last_delta_at is not None:
                 self.value["max_delta_gap_ms"] = max(self.value["max_delta_gap_ms"], now - self.last_delta_at)
             self.last_delta_at = now
             return
         elif kind == "message_end" and event.get("message", {}).get("role") == "assistant":
             row["event"] = "assistant_end"
-            if self.response_at is not None:
-                row["stream_ms"] = max(0, now - self.response_at)
+            if self.first_delta_at is not None:
+                row["stream_ms"] = max(0, now - self.first_delta_at)
                 self.value["stream_ms"] += row["stream_ms"]
-            if self.request_at is not None:
-                row["request_elapsed_ms"] = max(0, now - self.request_at)
+            if self.assistant_at is not None:
+                row["assistant_elapsed_ms"] = max(0, now - self.assistant_at)
+                self.value["assistant_elapsed_ms"] += row["assistant_elapsed_ms"]
+            self.assistant_at = self.first_delta_at = self.last_delta_at = None
             stop = event.get("message", {}).get("stopReason")
             if stop in {"stop", "toolUse", "error", "aborted", "length"}:
                 row["stop"] = stop

@@ -1545,6 +1545,8 @@ test_closed_pr_wakes_loudly_as_unreviewed() {
 [ "$*" = "api /repos/example/repo/pulls/7" ] || exit 97
 printf '%s\n' \
   'number: 7' \
+  'title: Fixture PR' \
+  'body: Fixture body' \
   'state: closed' \
   'merged: false' \
   'head:' \

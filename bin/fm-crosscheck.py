@@ -196,6 +196,11 @@ PI_MODEL_PROVIDERS = {
     **{lane["model"]: lane["slot"] for lane in CROSS_FAMILY_LANES.values()},
     "gpt-5.6-sol": "openai-codex",
 }
+PI_DETERMINISTIC_LOCATIONS = (
+    "/opt/homebrew/bin/pi",
+    "/usr/local/bin/pi",
+    "~/.local/bin/pi",
+)
 # Allowlisted credential shape for a cross-family lane's models.json. Pi
 # composes an effective model from the provider layer, the model entry, and a
 # `modelOverrides` layer, and several composed fields (`compat`, `headers`,
@@ -4854,7 +4859,27 @@ def env_shebang_node_arguments(shebang: str) -> list[str] | None:
 def pi_reviewer_command() -> list[str]:
     """Resolve Pi and its env-selected Node runtime before reviewer launch."""
 
-    entrypoint = reviewer_binary_path("FM_CROSSCHECK_PI_BIN", "pi", "Pi reviewer")
+    if os.environ.get("FM_CROSSCHECK_PI_BIN"):
+        entrypoint = reviewer_binary_path(
+            "FM_CROSSCHECK_PI_BIN", "pi", "Pi reviewer"
+        )
+    else:
+        candidates = tuple(
+            Path(location).expanduser() for location in PI_DETERMINISTIC_LOCATIONS
+        )
+        entrypoint = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate.is_file() and os.access(candidate, os.X_OK)
+            ),
+            None,
+        )
+        if entrypoint is None:
+            tool_fail(
+                "Pi reviewer has no deterministic installation; set "
+                "FM_CROSSCHECK_PI_BIN to its absolute path"
+            )
     resolved_entrypoint = entrypoint.resolve()
     try:
         with resolved_entrypoint.open("rb") as handle:
@@ -4865,10 +4890,32 @@ def pi_reviewer_command() -> list[str]:
     node_arguments = env_shebang_node_arguments(shebang)
     if node_arguments is not None:
         sibling_node = entrypoint.parent / "node"
-        node_default = str(sibling_node) if sibling_node.is_file() else "node"
-        node = reviewer_binary(
-            "FM_CROSSCHECK_PI_NODE_BIN", node_default, "Pi Node runtime"
-        )
+        if os.environ.get("FM_CROSSCHECK_PI_NODE_BIN"):
+            node = reviewer_binary(
+                "FM_CROSSCHECK_PI_NODE_BIN", "node", "Pi Node runtime"
+            )
+        elif sibling_node.is_file() and os.access(sibling_node, os.X_OK):
+            node = str(sibling_node.resolve())
+        else:
+            tool_fail(
+                "Pi reviewer has no sibling Node runtime; set "
+                "FM_CROSSCHECK_PI_NODE_BIN to its absolute path"
+            )
+        try:
+            version = run_command(
+                [node, "--version"], timeout=10, maximum_output_bytes=1024
+            )
+        except (OSError, CrosscheckError) as exc:
+            tool_fail(f"Pi Node runtime version inspection failed: {exc}")
+        match = re.fullmatch(r"v([0-9]+)\.([0-9]+)\.([0-9]+)\s*", version.stdout)
+        if version.returncode != 0 or match is None:
+            tool_fail("Pi Node runtime did not report one semantic version")
+        actual = tuple(int(match.group(index)) for index in range(1, 4))
+        if actual < (22, 19, 0):
+            tool_fail(
+                "Pi Node runtime must be at least 22.19.0; resolved "
+                + ".".join(str(part) for part in actual)
+            )
         return [node, *node_arguments, str(resolved_entrypoint)]
     return [str(resolved_entrypoint)]
 

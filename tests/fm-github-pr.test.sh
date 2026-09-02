@@ -29,13 +29,6 @@ case "$*" in
       *) exit 98 ;;
     esac
     ;;
-  "pr view 1 --repo ruby-dlee/firstmate --full")
-    case "${FM_TEST_CLAIMS_MODE:-ok}" in
-      ok) sed 's/^  number: 72$/  number: 1/' "$FM_TEST_CLAIMS_FIXTURE" ;;
-      boolean-number) sed 's/^  number: 72$/  number: true/' "$FM_TEST_CLAIMS_FIXTURE" ;;
-      *) exit 98 ;;
-    esac
-    ;;
   "api /repos/ruby-dlee/firstmate/pulls/72")
     case "${FM_TEST_API_MODE:-ok}" in
       ok) cat "$FM_TEST_API_FIXTURE" ;;
@@ -55,14 +48,9 @@ case "$*" in
         sleep 30
         ;;
       boolean-number) sed 's/^number: 72$/number: true/' "$FM_TEST_API_FIXTURE" ;;
-      *) exit 98 ;;
-    esac
-    ;;
-  "pr view 72 --repo ruby-dlee/firstmate --full")
-    case "${FM_TEST_CLAIMS_MODE:-ok}" in
-      ok) cat "$FM_TEST_CLAIMS_FIXTURE" ;;
-      error) exit 43 ;;
-      boolean-number) sed 's/^  number: 72$/  number: true/' "$FM_TEST_CLAIMS_FIXTURE" ;;
+      missing-title) sed '/^title:/d' "$FM_TEST_API_FIXTURE" ;;
+      bad-body) sed 's/^body:.*/body: true/' "$FM_TEST_API_FIXTURE" ;;
+      null-body) sed 's/^body:.*/body: null/' "$FM_TEST_API_FIXTURE" ;;
       *) exit 98 ;;
     esac
     ;;
@@ -96,7 +84,6 @@ chmod +x "$FAKEBIN/gh-axi"
 export FM_GH_AXI_BIN="$FAKEBIN/gh-axi"
 export FM_TEST_GH_AXI_LOG="$TMP_ROOT/gh-axi.log"
 export FM_TEST_API_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-api.toon"
-export FM_TEST_CLAIMS_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-view-full.toon"
 export FM_TEST_MERGE_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-merge-success.toon"
 export FM_TEST_QUEUE_FIXTURE="$ROOT/tests/fixtures/gh-axi-merge-enqueued.toon"
 PR_URL=https://github.com/ruby-dlee/firstmate/pull/72
@@ -133,17 +120,17 @@ import json, sys
 value = json.load(sys.stdin)
 assert value["head_sha"] == "c9cbe79154013efcec9aa478f1476d0eff6c63df"
 assert value["base_sha"] == "68f014697d0eea733a4e7c0294becff4e76c7bcf"
-assert value["claims_document"].startswith("pull_request:\n")
+assert json.loads(value["claims_document"]) == value["claims_identity"]
 assert value["claims_identity"] == {
     "number": 72,
     "title": "feat: observed contract fixture",
-    "body": "Complete claims returned by --full.",
+    "body": "Complete claims returned by the pull request REST document.",
 }
 ' <<< "$output" || fail "snapshot did not preserve the observed head, base, and claims"
   grep -qxF 'api /repos/ruby-dlee/firstmate/pulls/72' "$FM_TEST_GH_AXI_LOG" \
     || fail "snapshot did not use the observed gh-axi API form"
-  grep -qxF 'pr view 72 --repo ruby-dlee/firstmate --full' "$FM_TEST_GH_AXI_LOG" \
-    || fail "snapshot did not use the observed full-claims form"
+  assert_no_grep '^pr view ' "$FM_TEST_GH_AXI_LOG" \
+    "snapshot requested the over-broad GraphQL pull-request view"
   assert_no_grep '--json' "$FM_TEST_GH_AXI_LOG" \
     "snapshot regressed to unsupported raw-gh --json"
   assert_no_grep '-q' "$FM_TEST_GH_AXI_LOG" \
@@ -154,12 +141,12 @@ assert value["claims_identity"] == {
 test_lookup_errors_fail_closed() {
   local rc
   set +e
-  FM_TEST_CLAIMS_MODE=error "$ADAPTER" snapshot "$PR_URL" > "$TMP_ROOT/error.out" 2> "$TMP_ROOT/error.err"
+  FM_TEST_API_MODE=missing-title "$ADAPTER" snapshot "$PR_URL" > "$TMP_ROOT/error.out" 2> "$TMP_ROOT/error.err"
   rc=$?
   set -e
-  expect_code 1 "$rc" "claims lookup error"
+  expect_code 1 "$rc" "missing claims title"
   assert_grep 'GitHub state is unreviewed' "$TMP_ROOT/error.err" \
-    "claims lookup error was not loud"
+    "missing claims title was not loud"
 
   set +e
   FM_TEST_API_MODE=malformed "$ADAPTER" snapshot "$PR_URL" > "$TMP_ROOT/malformed.out" 2> "$TMP_ROOT/malformed.err"
@@ -169,6 +156,19 @@ test_lookup_errors_fail_closed() {
   assert_grep 'missing head.sha' "$TMP_ROOT/malformed.err" \
     "malformed API output was not rejected"
   pass "GitHub lookup errors and malformed documents fail closed"
+}
+
+test_null_pr_body_is_empty_claims() {
+  local output
+  output=$(FM_TEST_API_MODE=null-body "$ADAPTER" snapshot "$PR_URL") \
+    || fail "a PR without a body was rejected"
+  python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+assert value["claims_identity"]["body"] == ""
+assert json.loads(value["claims_document"])["body"] == ""
+' <<< "$output" || fail "a null GitHub body was not normalized to empty claims"
+  pass "a bodyless PR retains stable empty review claims"
 }
 
 test_exact_head_checks_must_be_green() {
@@ -306,23 +306,16 @@ test_timeout_reaps_gh_axi_children() {
 }
 
 test_boolean_pr_numbers_fail_closed() {
-  local mode rc
-  for mode in api claims; do
-    set +e
-    if [ "$mode" = api ]; then
-      FM_TEST_API_MODE=boolean-number "$ADAPTER" snapshot "$BOOLEAN_PR_URL" \
-        > "$TMP_ROOT/boolean-$mode.out" 2> "$TMP_ROOT/boolean-$mode.err"
-    else
-      FM_TEST_CLAIMS_MODE=boolean-number "$ADAPTER" snapshot "$BOOLEAN_PR_URL" \
-        > "$TMP_ROOT/boolean-$mode.out" 2> "$TMP_ROOT/boolean-$mode.err"
-    fi
-    rc=$?
-    set -e
-    expect_code 1 "$rc" "boolean PR number in $mode document"
-    assert_grep 'returned PR True, expected 1' "$TMP_ROOT/boolean-$mode.err" \
-      "boolean PR number was treated as integer 1 in $mode document"
-  done
-  pass "boolean PR numbers fail closed in API and claims documents"
+  local rc
+  set +e
+  FM_TEST_API_MODE=boolean-number "$ADAPTER" snapshot "$BOOLEAN_PR_URL" \
+    > "$TMP_ROOT/boolean-api.out" 2> "$TMP_ROOT/boolean-api.err"
+  rc=$?
+  set -e
+  expect_code 1 "$rc" "boolean PR number in API document"
+  assert_grep 'returned PR True, expected 1' "$TMP_ROOT/boolean-api.err" \
+    "boolean PR number was treated as integer 1 in API document"
+  pass "boolean PR numbers fail closed in the single snapshot document"
 }
 
 if [ -n "${FM_TEST_CASE:-}" ]; then
@@ -351,6 +344,7 @@ fi
 
 test_snapshot_uses_observed_contract
 test_lookup_errors_fail_closed
+test_null_pr_body_is_empty_claims
 test_exact_head_checks_must_be_green
 test_public_merge_subcommand_is_unavailable
 test_malformed_array_subtrees_fail_closed

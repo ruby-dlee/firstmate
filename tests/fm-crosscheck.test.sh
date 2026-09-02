@@ -22,7 +22,6 @@ CROSSCHECK_PYTHON="$(fm_crosscheck_resolve_python)" \
   || fail "no Python meeting the crosscheck safety floor is available"
 fm_test_tmproot_into TMP_ROOT fm-crosscheck-tests
 API_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-api.toon"
-CLAIMS_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-view-full.toon"
 PR_URL=https://github.com/ruby-dlee/firstmate/pull/72
 
 make_case() {
@@ -278,19 +277,12 @@ case "$*" in
     sed \
       -e "s/c9cbe79154013efcec9aa478f1476d0eff6c63df/$FM_TEST_HEAD/" \
       -e "s/68f014697d0eea733a4e7c0294becff4e76c7bcf/$FM_TEST_BASE/" \
-      "$FM_TEST_API_FIXTURE"
-    ;;
-  "pr view 72 --repo ruby-dlee/firstmate --full")
-    [ "${FM_TEST_CLAIMS_MODE:-ok}" = ok ] || exit 43
-    case "${FM_TEST_CLAIMS_VARIANT:-original}" in
-      changed)
-        sed 's/Complete claims returned by --full./Changed claims after review./' "$FM_TEST_CLAIMS_FIXTURE"
-        ;;
-      dynamic)
-        sed 's/comment_count: 0/comment_count: 1/' "$FM_TEST_CLAIMS_FIXTURE"
-        ;;
-      *) cat "$FM_TEST_CLAIMS_FIXTURE" ;;
-    esac
+      -e "${FM_TEST_CLAIMS_MODE:+s/^title:.*/title: true/}" \
+      "$FM_TEST_API_FIXTURE" |
+      case "${FM_TEST_CLAIMS_VARIANT:-original}" in
+        changed) sed 's/Complete claims returned by the pull request REST document./Changed claims after review./' ;;
+        *) cat ;;
+      esac
     ;;
   *)
     echo "unsupported fake gh-axi invocation: $*" >&2
@@ -1022,7 +1014,6 @@ run_case() {
   FM_TEST_CONTEXT_LOG="$case_dir/reviewer-context.log" \
   FM_TEST_PROMPT_LOG="$case_dir/prompt.log" \
   FM_TEST_API_FIXTURE="$API_FIXTURE" \
-  FM_TEST_CLAIMS_FIXTURE="$CLAIMS_FIXTURE" \
   FM_TEST_REVIEW_DRIVER="$TMP_ROOT/review-driver.py" \
   FM_TEST_REVIEW_SCENARIO="$scenario" \
   FM_TEST_REVIEWER_HOME="$case_dir/reviewer-home" \
@@ -1890,7 +1881,7 @@ with tempfile.TemporaryDirectory() as raw:
     sibling_node = toolchain / "node"
     hostile_node = hostile / "node"
     pi.write_text("#!/usr/bin/env node\n", encoding="utf-8")
-    sibling_node.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    sibling_node.write_text("#!/bin/sh\nprintf 'v22.19.0\\n'\n", encoding="utf-8")
     hostile_node.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
     for path in (pi, sibling_node, hostile_node):
         path.chmod(0o700)
@@ -1905,9 +1896,103 @@ with tempfile.TemporaryDirectory() as raw:
         os.environ.clear()
         os.environ.update(prior)
 
+    # Without an explicit operator override, a hostile caller PATH is never
+    # accepted as the reviewer installation.
+    prior = os.environ.copy()
+    original_locations = module.PI_DETERMINISTIC_LOCATIONS
+    try:
+        os.environ.pop("FM_CROSSCHECK_PI_BIN", None)
+        os.environ.pop("FM_CROSSCHECK_PI_NODE_BIN", None)
+        os.environ["PATH"] = str(hostile)
+        module.PI_DETERMINISTIC_LOCATIONS = (
+            str(root / "missing-one"),
+            str(root / "missing-two"),
+        )
+        try:
+            module.pi_reviewer_command()
+        except module.CrosscheckToolError as exc:
+            assert "no deterministic installation" in str(exc), str(exc)
+        else:
+            raise AssertionError("Pi was selected from hostile caller PATH")
+    finally:
+        module.PI_DETERMINISTIC_LOCATIONS = original_locations
+        os.environ.clear()
+        os.environ.update(prior)
+
     assert command == [str(sibling_node.resolve()), str(pi.resolve())], command
+
+    prior = os.environ.copy()
+    original_locations = module.PI_DETERMINISTIC_LOCATIONS
+    try:
+        os.environ.pop("FM_CROSSCHECK_PI_BIN", None)
+        os.environ.pop("FM_CROSSCHECK_PI_NODE_BIN", None)
+        os.environ["PATH"] = str(hostile)
+        module.PI_DETERMINISTIC_LOCATIONS = (str(pi),)
+        command = module.pi_reviewer_command()
+    finally:
+        module.PI_DETERMINISTIC_LOCATIONS = original_locations
+        os.environ.clear()
+        os.environ.update(prior)
+    assert command == [str(sibling_node.resolve()), str(pi.resolve())], command
+
+    detached_pi = root / "detached" / "pi"
+    detached_pi.parent.mkdir()
+    detached_pi.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    detached_pi.chmod(0o700)
+    prior = os.environ.copy()
+    original_locations = module.PI_DETERMINISTIC_LOCATIONS
+    try:
+        os.environ.pop("FM_CROSSCHECK_PI_BIN", None)
+        os.environ.pop("FM_CROSSCHECK_PI_NODE_BIN", None)
+        os.environ["PATH"] = str(hostile)
+        module.PI_DETERMINISTIC_LOCATIONS = (str(detached_pi),)
+        try:
+            module.pi_reviewer_command()
+        except module.CrosscheckToolError as exc:
+            assert "no sibling Node runtime" in str(exc), str(exc)
+        else:
+            raise AssertionError("detached Pi selected Node from hostile PATH")
+
+        os.environ["FM_CROSSCHECK_PI_NODE_BIN"] = str(sibling_node)
+        command = module.pi_reviewer_command()
+    finally:
+        module.PI_DETERMINISTIC_LOCATIONS = original_locations
+        os.environ.clear()
+        os.environ.update(prior)
+    assert command == [str(sibling_node.resolve()), str(detached_pi.resolve())], command
+
+    original_run_command = module.run_command
+    try:
+        module.run_command = lambda *args, **kwargs: module.fail("timed out")
+        os.environ["FM_CROSSCHECK_PI_BIN"] = str(pi)
+        os.environ.pop("FM_CROSSCHECK_PI_NODE_BIN", None)
+        try:
+            module.pi_reviewer_command()
+        except module.CrosscheckToolError as exc:
+            assert "version inspection failed" in str(exc), str(exc)
+        else:
+            raise AssertionError("bounded Node version failure was not tool-failure")
+    finally:
+        module.run_command = original_run_command
+        os.environ.clear()
+        os.environ.update(prior)
+
+    sibling_node.write_text("#!/bin/sh\nprintf 'v20.20.2\\n'\n", encoding="utf-8")
+    prior = os.environ.copy()
+    try:
+        os.environ["FM_CROSSCHECK_PI_BIN"] = str(pi)
+        os.environ.pop("FM_CROSSCHECK_PI_NODE_BIN", None)
+        try:
+            module.pi_reviewer_command()
+        except module.CrosscheckToolError as exc:
+            assert "at least 22.19.0" in str(exc), str(exc)
+        else:
+            raise AssertionError("an incompatible Pi Node runtime was admitted")
+    finally:
+        os.environ.clear()
+        os.environ.update(prior)
 PY
-  pass "Pi pins its installed sibling Node runtime before hostile PATH entries"
+  pass "Pi pins and version-checks its installed sibling Node runtime"
 }
 
 test_pi_reviewer_executes_bound_policy_profile() {

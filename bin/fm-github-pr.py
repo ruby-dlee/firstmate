@@ -5,8 +5,8 @@ Observed against gh-axi 0.1.25 on 2026-08-02:
 
 * ``gh-axi api /repos/<owner>/<repo>/pulls/<number>`` emits a nested TOON
   document whose ``head.sha`` and ``base.sha`` values are exact Git SHAs.
-* ``gh-axi pr view <number> --repo <owner>/<repo> --full`` emits the complete
-  pull-request claims as a ``pull_request:`` TOON document.
+* The same REST pull-request document carries the stable title and body used
+  as review claims. This avoids requesting unrelated check-rollup fields.
 * ``gh-axi api PUT .../merge --field sha=<sha> --field merge_method=<method>``
   emits root ``sha``, ``merged``, and ``message`` fields on success.
 
@@ -384,6 +384,10 @@ def fetch_pr_api(url: str) -> dict[str, Any]:
     state = _required(values, "state")
     merged = _required(values, "merged")
     draft = values.get(("draft",))
+    title = _required(values, "title")
+    body = values.get(("body",), "")
+    if body is None:
+        body = ""
     head_sha = _required(values, "head", "sha")
     head_ref = _required(values, "head", "ref")
     head_repo = _required(values, "head", "repo", "full_name")
@@ -403,6 +407,10 @@ def fetch_pr_api(url: str) -> dict[str, Any]:
         raise GitHubContractError("gh-axi returned invalid PR state fields")
     if draft is not None and not isinstance(draft, bool):
         raise GitHubContractError("gh-axi returned an invalid draft field")
+    if not isinstance(title, str) or not title:
+        raise GitHubContractError("gh-axi returned an invalid PR title")
+    if not isinstance(body, str):
+        raise GitHubContractError("gh-axi returned a non-string PR body")
     if not isinstance(head_sha, str) or SHA_RE.fullmatch(head_sha) is None:
         raise GitHubContractError("gh-axi returned an invalid head.sha")
     if not isinstance(base_sha, str) or SHA_RE.fullmatch(base_sha) is None:
@@ -424,6 +432,8 @@ def fetch_pr_api(url: str) -> dict[str, Any]:
         "state": state,
         "merged": merged,
         "draft": draft,
+        "title": title,
+        "body": body,
         "head_sha": head_sha,
         "head_ref": head_ref,
         "head_repo": head_repo,
@@ -434,35 +444,16 @@ def fetch_pr_api(url: str) -> dict[str, Any]:
     }
 
 
-def fetch_claims(url: str) -> tuple[str, dict[str, Any]]:
-    owner, repo, number = parse_pr_url(url)
-    raw = run_gh_axi(
-        ["pr", "view", str(number), "--repo", f"{owner}/{repo}", "--full"]
-    )
-    values = parse_toon_mapping(raw)
-    actual_number = _required(values, "pull_request", "number")
-    if (
-        not isinstance(actual_number, int)
-        or isinstance(actual_number, bool)
-        or actual_number != number
-    ):
-        raise GitHubContractError(
-            f"gh-axi claims document returned PR {actual_number!r}, expected {number}"
-        )
-    title = _required(values, "pull_request", "title")
-    body = _required(values, "pull_request", "body")
-    if not isinstance(title, str) or not title:
-        raise GitHubContractError("gh-axi claims document has an invalid title")
-    if not isinstance(body, str):
-        raise GitHubContractError("gh-axi claims document has a non-string body")
-    return raw, {"number": number, "title": title, "body": body}
-
-
 def snapshot(url: str) -> dict[str, Any]:
     result = fetch_pr_api(url)
-    claims_document, claims_identity = fetch_claims(url)
-    result["claims_document"] = claims_document
-    result["claims_identity"] = claims_identity
+    result["claims_identity"] = {
+        "number": result["number"],
+        "title": result["title"],
+        "body": result["body"],
+    }
+    result["claims_document"] = json.dumps(
+        result["claims_identity"], sort_keys=True, separators=(",", ":")
+    )
     return result
 
 

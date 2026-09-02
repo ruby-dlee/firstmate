@@ -1096,10 +1096,10 @@ def review_timeout_seconds() -> float:
     return value
 
 
-def crosscheck_argv(task_id: str, pr_url: str) -> list[str]:
+def crosscheck_argv(task_id: str, pr_url: str, expected_head: str) -> list[str]:
     override = os.environ.get("FM_CROSSCHECK_SLACK_CROSSCHECK_BIN", "")
     binary = override or str(BIN_DIR / "fm-crosscheck.sh")
-    return [binary, "run", task_id, pr_url]
+    return [binary, "run", task_id, pr_url, "--expected-head", expected_head]
 
 
 def scrubbed_child_environment(config: Config, github_token: str) -> dict[str, str]:
@@ -1147,7 +1147,7 @@ def make_run_review(
         task_id = f"slack-{secrets.token_hex(6)}"
         task_data = data / task_id
         task_data.mkdir(parents=True, exist_ok=True)
-        argv = crosscheck_argv(task_id, pr_url)
+        argv = crosscheck_argv(task_id, pr_url, snapshot.head_sha)
         try:
             result = run_bounded(
                 argv,

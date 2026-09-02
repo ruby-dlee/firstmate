@@ -61,6 +61,7 @@ EXECUTION_RESULT_SCHEMA = "fm.worker-execution-result/v1"
 EXECUTION_TERMINAL_SCHEMA = "fm.worker-execution-terminal/v1"
 EXECUTE_ABANDON_MARKER = "execute-abandon-action"
 RELEASE_SCHEMA = "fm.worker-release/v2"
+RELEASED_ABSENCE_SCHEMA = "fm.worker-released-absence/v1"
 AUTHORITY_SCHEMA = "fm.worker-authority/v1"
 CAPACITY_RESERVATION_SCHEMA = "fm.capacity-reservation/v1"
 CAPACITY_FENCE_RETIREMENT_SCHEMA = "fm.capacity-fence-retirement/v1"
@@ -158,6 +159,17 @@ REQUIRED_RESOURCE_KINDS = (
 MUTABLE_PROVISIONING_CHILD_KINDS = frozenset({
     "monitor-extension", "bootstrap-command", "task-command", "ttl-schedule",
 })
+MISSING_COMPUTE_RESOURCE_KINDS = frozenset({
+    "vm", "nic", "os-disk", "monitor-extension", "bootstrap-command",
+    "task-command", "ttl-schedule", "staging-request", "staging-result",
+})
+# This is deliberately a complete observed-absence shape, not another generic
+# missing-resource allowance.  Only an exact surrendered release can use it,
+# and the provider re-observes the same absence before touching residuals.
+RELEASED_ABSENT_RESOURCE_KINDS = (
+    "vm", "nic", "os-disk", "task-disk", "account-disk",
+    "monitor-extension", "bootstrap-command", "task-command", "ttl-schedule",
+)
 REVIEWED_SKU_FAMILY = {
     "Standard_D4as_v6": "standardDav6Family",
     "Standard_D4as_v7": "StandardDasv7Family",
@@ -1525,7 +1537,7 @@ def resource_identity(resource):
     }
 
 
-def resources_exact(worker, cloud, allow_missing_compute=False):
+def _resources_exact(worker, cloud, allowed_missing):
     resources = cloud.get("resources") or {}
     recorded = worker.get("resources") or {}
     missing = []
@@ -1533,10 +1545,7 @@ def resources_exact(worker, cloud, allow_missing_compute=False):
         current = resources.get(kind)
         prior = recorded.get(kind)
         if current is None:
-            if allow_missing_compute and kind in (
-                "vm", "nic", "os-disk", "monitor-extension", "bootstrap-command",
-                "task-command", "ttl-schedule", "staging-request", "staging-result",
-            ):
+            if kind in allowed_missing:
                 continue
             missing.append(kind)
             continue
@@ -1576,6 +1585,33 @@ def resources_exact(worker, cloud, allow_missing_compute=False):
     return True, ""
 
 
+def resources_exact(worker, cloud, allow_missing_compute=False):
+    allowed_missing = MISSING_COMPUTE_RESOURCE_KINDS if allow_missing_compute else ()
+    return _resources_exact(worker, cloud, allowed_missing)
+
+
+def released_absent_data_resources_exact(worker, cloud):
+    """Prove the one reset-adoption inventory shape without widening absence."""
+    if not isinstance(cloud, dict) or cloud.get("slot") != worker.get("slot"):
+        return False, "released absence is not bound to the exact worker slot"
+    resources = cloud.get("resources") or {}
+    unknown = sorted(set(resources) - set(REQUIRED_RESOURCE_KINDS))
+    if unknown:
+        return False, "released absence inventory has unknown resources: {}".format(
+            ", ".join(unknown)
+        )
+    present = [kind for kind in RELEASED_ABSENT_RESOURCE_KINDS if resources.get(kind) is not None]
+    if present:
+        return False, "released absence still has data or compute resources: {}".format(
+            ", ".join(present)
+        )
+    return _resources_exact(
+        worker,
+        cloud,
+        MISSING_COMPUTE_RESOURCE_KINDS.union({"task-disk", "account-disk"}),
+    )
+
+
 def classify_worker(worker, cloud, now=None):
     now = now or now_utc()
     if cloud is None:
@@ -1608,6 +1644,93 @@ def classify_worker(worker, cloud, now=None):
     if worker.get("bindings", {}).get("task") == "unbound":
         return "clean-warm", "fresh unassigned generation"
     return "assigned", "one exact active task generation"
+
+
+def recorded_unlanded_executions(state, worker):
+    """Return exact-assignment executions whose repository outcome is not clean."""
+    produced = []
+    bindings = worker.get("bindings") or {}
+    for request_digest, execution in sorted((state.get("executions") or {}).items()):
+        if not isinstance(execution, dict):
+            continue
+        if (
+            execution.get("task") != bindings.get("task")
+            or execution.get("task_generation") != bindings.get("task_generation")
+            or execution.get("assignment_generation") != worker.get("assignment_generation")
+        ):
+            continue
+        commits = execution.get("outcome_commits")
+        if (
+            execution.get("outcome_present") not in (None, False)
+            or execution.get("outcome_uncommitted_changes") not in (None, False)
+            or commits not in (None, 0)
+        ):
+            produced.append(request_digest)
+    return produced
+
+
+def released_absent_data_adoption(state, worker, cloud):
+    """Recognize only an exact surrender whose data and compute are already gone.
+
+    The release proof remains bound to the durable pre-absence identities.  A
+    fresh provider inventory must still prove every residual identity and tag;
+    absence supplies no authority for an unreleased or outcome-bearing worker.
+    """
+    exact, reason = released_absent_data_resources_exact(worker, cloud)
+    if not exact:
+        return False, reason
+    if worker.get("phase") != "release-proved":
+        return False, "released absence worker is not in release-proved phase"
+    proof = worker.get("release_proof")
+    try:
+        verify_surrender_release_against_worker(proof, worker)
+    except LifecycleError as exc:
+        return False, "released absence proof is not exact: {}".format(exc)
+    item = state.get("queue", {}).get(worker.get("queue_key"))
+    bindings = worker.get("bindings") or {}
+    if (
+        not isinstance(item, dict)
+        or worker.get("queue_key") != request_key(
+            bindings.get("task", ""), bindings.get("task_generation", "")
+        )
+        or item.get("status") != "releasing"
+        or item.get("slot") != worker.get("slot")
+        or item.get("assignment_generation") != worker.get("assignment_generation")
+    ):
+        return False, "released absence has no exact releasing queue owner"
+    recorded = recorded_unlanded_executions(state, worker)
+    discarded = (proof.get("surrender") or {}).get("discarded_unlanded_executions")
+    if recorded or discarded:
+        return False, "released absence has recorded unlanded outcome: {}".format(
+            ", ".join(recorded or discarded)
+        )
+    return True, "exact surrendered worker data and compute are authoritatively absent"
+
+
+def reconciled_worker_classification(state, worker, cloud, now=None):
+    classification, note = classify_worker(worker, cloud, now=now)
+    if classification != "retained-for-investigation" or cloud is None:
+        return classification, note
+    adopted, adoption_note = released_absent_data_adoption(state, worker, cloud)
+    if adopted:
+        return "orphaned-safe-to-delete", adoption_note
+    # Name a failed candidate precisely, but preserve the ordinary classifier's
+    # reason for every shape that still has compute or data.
+    if not any(
+        (cloud.get("resources") or {}).get(kind) is not None
+        for kind in RELEASED_ABSENT_RESOURCE_KINDS
+    ):
+        return classification, adoption_note
+    return classification, note
+
+
+def released_absence_evidence(worker):
+    return {
+        "schema": RELEASED_ABSENCE_SCHEMA,
+        "assignment_generation": worker["assignment_generation"],
+        "release_proof_digest": worker["release_proof"]["proof_digest"],
+        "absent_resources": list(RELEASED_ABSENT_RESOURCE_KINDS),
+    }
 
 
 def adopt_cloud_resources(worker, cloud):
@@ -2654,7 +2777,9 @@ def refresh_classifications(state, inventory, now=None):
             # An unapplied mutation owns this slot; a display value derived
             # from a record whose durable phase is not yet true would lie.
             continue
-        classification, note = classify_worker(worker, cloud.get(worker["slot"]), now=now)
+        classification, note = reconciled_worker_classification(
+            state, worker, cloud.get(worker["slot"]), now=now
+        )
         worker["last_classification"] = classification
         worker["classification_note"] = note
 
@@ -2741,7 +2866,9 @@ def next_reconcile_action(env, state, inventory, now=None):
             )
             continue
         current = cloud.get(worker["slot"])
-        classification, note = classify_worker(worker, current, now=now)
+        classification, note = reconciled_worker_classification(
+            state, worker, current, now=now
+        )
         worker["last_classification"] = classification
         worker["classification_note"] = note
         if worker.get("role") in RETIRED_WORKER_ROLES and not worker.get("release_proof"):
@@ -2782,10 +2909,13 @@ def next_reconcile_action(env, state, inventory, now=None):
                 )
             continue
         if classification == "orphaned-safe-to-delete":
-            return make_action(
-                env, "reset", worker=worker,
-                release_proof_digest=worker["release_proof"]["proof_digest"],
-            )
+            fields = {
+                "release_proof_digest": worker["release_proof"]["proof_digest"],
+            }
+            adopted, _ = released_absent_data_adoption(state, worker, current)
+            if adopted:
+                fields["released_absent_data"] = released_absence_evidence(worker)
+            return make_action(env, "reset", worker=worker, **fields)
 
     if not waiting:
         return None
@@ -2942,8 +3072,54 @@ def verify_release_against_worker(proof, worker):
         "resources": worker["resources"],
     }
     for field, expected in checks.items():
-        if proof.get(field) != expected:
+        if not isinstance(proof, dict) or proof.get(field) != expected:
             raise LifecycleError("worker release proof {} binding is not exact".format(field))
+
+
+def verify_surrender_release_against_worker(proof, worker):
+    """Validate the stored surrender bytes before absence can authorize reset."""
+    if not isinstance(proof, dict) or proof.get("schema") != RELEASE_SCHEMA:
+        raise LifecycleError("surrender release proof schema is not exact")
+    surrender = proof.get("surrender")
+    if not isinstance(surrender, dict):
+        raise LifecycleError("release proof is not a surrender proof")
+    supplied = proof.get("proof_digest")
+    unsigned = dict(proof)
+    unsigned.pop("proof_digest", None)
+    if supplied != digest_value(unsigned):
+        raise LifecycleError("surrender release proof digest is not exact")
+    verify_release_against_worker(proof, worker)
+    for field in ("home_binding", "account_binding", "worktree_binding", "repository_binding"):
+        require_binding(field, proof.get(field))
+    for field in ("task", "task_generation", "assignment_generation", "repository_generation"):
+        require_id(field, proof.get(field))
+    resources = proof.get("resources")
+    if not isinstance(resources, dict) or set(resources) != set(REQUIRED_RESOURCE_KINDS):
+        raise LifecycleError("surrender release proof does not bind every worker resource")
+    for kind, identity in resources.items():
+        if not isinstance(identity, dict) or not identity.get("id") or not identity.get("immutable_id"):
+            raise LifecycleError("surrender release proof {} identity is incomplete".format(kind))
+    authorities = proof.get("authorities")
+    expected_authorities = {"endpoint", "report", "landing", "account", "worktree"}
+    if not isinstance(authorities, dict) or set(authorities) != expected_authorities:
+        raise LifecycleError("surrender release proof authority set is not exact")
+    for name, receipt in authorities.items():
+        if not isinstance(receipt, dict) or receipt.get("schema") != AUTHORITY_SCHEMA:
+            raise LifecycleError("{} surrender authority schema is not exact".format(name))
+        receipt_unsigned = dict(receipt)
+        receipt_digest = receipt_unsigned.pop("receipt_digest", None)
+        if receipt_digest != digest_value(receipt_unsigned):
+            raise LifecycleError("{} surrender authority digest is not exact".format(name))
+        if (
+            receipt.get("authority") != name
+            or receipt.get("task") != proof.get("task")
+            or receipt.get("task_generation") != proof.get("task_generation")
+            or receipt.get("assignment_generation") != proof.get("assignment_generation")
+            or receipt.get("verdict") != "surrendered"
+            or receipt.get("evidence_digest")
+            != digest_value({"authority": name, "surrender": surrender})
+        ):
+            raise LifecycleError("{} surrender authority binding is not exact".format(name))
 
 
 def proof_template(state, task, generation):
@@ -5283,18 +5459,7 @@ def command_surrender(env, args):
             raise LifecycleError("worker already has an ordinary release proof; reconcile releases it")
         if item.get("status") != "assigned":
             raise LifecycleError("surrender requires one exact assigned task generation")
-        produced = []
-        for request_digest, execution in sorted((state.get("executions") or {}).items()):
-            if not isinstance(execution, dict):
-                continue
-            if (execution.get("task") != args.task
-                    or execution.get("task_generation") != args.task_generation
-                    or execution.get("assignment_generation") != worker["assignment_generation"]):
-                continue
-            if (execution.get("outcome_present") is True
-                    or execution.get("outcome_uncommitted_changes") is True
-                    or (execution.get("outcome_commits") or 0) > 0):
-                produced.append(request_digest)
+        produced = recorded_unlanded_executions(state, worker)
         if produced and not args.confirm_discard_unlanded:
             # The controller's own durable record says this worker produced
             # repository work whose landing is unproven; surrendering it leads

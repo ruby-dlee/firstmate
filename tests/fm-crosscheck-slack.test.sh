@@ -140,6 +140,14 @@ fi
 [ "${1:-}" = run ] || { echo "fixture: expected run, got ${1:-}" >&2; exit 65; }
 task=$2
 url=$3
+[ "${4:-}" = --expected-head ] || {
+  echo "fixture: expected exact-head option, got ${4:-}" >&2
+  exit 69
+}
+[ "${5:-}" = "${FM_FIXTURE_HEAD_SHA:-1111111111111111111111111111111111111111}" ] || {
+  echo "fixture: expected admitted head, got ${5:-}" >&2
+  exit 70
+}
 meta="$FM_HOME/state/$task.meta"
 [ ! -e "$meta" ] || {
   echo "fixture: Slack admission produced forbidden author metadata at $meta" >&2
@@ -757,6 +765,8 @@ test_completed_review_names_lane_head_task_and_artifact() {
     "report path was not labeled as the durable artifact"
   after=$(fixture_run_count)
   [ "$after" = $((before + 1)) ] || fail "expected exactly one crosscheck invocation"
+  assert_grep '--expected-head 1111111111111111111111111111111111111111' \
+    "$FIXTURE_LOG" "Slack did not bind the admitted head in the Crosscheck argv"
   assert_grep "Review started" "$POSTS" "review start ack missing"
   assert_grep "hourglass" "$REACTS" "ack reaction missing"
   pass "an allowlisted exact head starts review without author metadata or attestation artifacts"

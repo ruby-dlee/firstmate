@@ -15,7 +15,6 @@ export FM_CROSSCHECK_AUTOSTART_TEST_DISABLE=firstmate-pr-check-nonautostart-test
 
 PR_MERGE="$ROOT/bin/fm-pr-merge.sh"
 API_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-api.toon"
-CLAIMS_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-view-full.toon"
 MERGE_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-merge-success.toon"
 PR_URL=https://github.com/ruby-dlee/firstmate/pull/72
 HEAD_SHA=c9cbe79154013efcec9aa478f1476d0eff6c63df
@@ -66,10 +65,6 @@ case "${1:-} ${2:-}" in
         ;;
       *) exit 98 ;;
     esac
-    ;;
-  "pr view")
-    [ "$*" = "pr view 72 --repo ruby-dlee/firstmate --full" ] || exit 97
-    cat "$FM_TEST_CLAIMS_FIXTURE"
     ;;
   "pr checks")
     [ "$*" = "pr checks 72 --repo ruby-dlee/firstmate" ] || exit 97
@@ -162,7 +157,7 @@ seed_clear_ledger() {
   local case_dir=$1 claims_digest
   claims_digest=$(python3 -c '
 import hashlib, json
-claims = {"number": 72, "title": "feat: observed contract fixture", "body": "Complete claims returned by --full."}
+claims = {"number": 72, "title": "feat: observed contract fixture", "body": "Complete claims returned by the pull request REST document."}
 print(hashlib.sha256(json.dumps(claims, sort_keys=True, separators=(",", ":")).encode()).hexdigest())
 ')
   cat > "$case_dir/data/task-x1/crosscheck-ledger.json" <<EOF
@@ -223,7 +218,6 @@ run_pr_merge() {
   FM_GH_AXI_BIN="$case_dir/fakebin/gh-axi" \
   FM_TEST_GH_AXI_LOG="$case_dir/gh-axi.log" \
   FM_TEST_API_FIXTURE="$API_FIXTURE" \
-  FM_TEST_CLAIMS_FIXTURE="$CLAIMS_FIXTURE" \
   FM_TEST_MERGE_FIXTURE="$MERGE_FIXTURE" \
   FM_TEST_QUEUE_RULE="${FM_TEST_QUEUE_RULE:-absent}" \
   FM_TEST_CHECKS_MODE="${FM_TEST_CHECKS_MODE:-green}" \

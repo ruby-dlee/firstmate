@@ -496,6 +496,8 @@ case "$*" in
   "api /repos/example/repo/pulls/7")
     printf '%s\n' \
       'number: 7' \
+      'title: Fixture PR' \
+      'body: Fixture body' \
       'state: open' \
       'merged: false' \
       'draft: false' \
@@ -7078,7 +7080,7 @@ fi
 
 if [ -n "${FM_TEST_CASE:-}" ]; then
   case "$FM_TEST_CASE" in
-    test_pr_check_without_worktree_still_performs_lookup|test_closed_pr_wakes_loudly_as_unreviewed)
+    test_pr_check_without_worktree_still_performs_lookup|test_closed_pr_wakes_loudly_as_unreviewed|test_pr_check_records_remote_head_when_local_lags|test_pr_check_does_not_refresh_stale_pr_head)
       "$FM_TEST_CASE"
       exit 0
       ;;

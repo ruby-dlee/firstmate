@@ -1961,6 +1961,22 @@ with tempfile.TemporaryDirectory() as raw:
         os.environ.update(prior)
     assert command == [str(sibling_node.resolve()), str(detached_pi.resolve())], command
 
+    original_run_command = module.run_command
+    try:
+        module.run_command = lambda *args, **kwargs: module.fail("timed out")
+        os.environ["FM_CROSSCHECK_PI_BIN"] = str(pi)
+        os.environ.pop("FM_CROSSCHECK_PI_NODE_BIN", None)
+        try:
+            module.pi_reviewer_command()
+        except module.CrosscheckToolError as exc:
+            assert "version inspection failed" in str(exc), str(exc)
+        else:
+            raise AssertionError("bounded Node version failure was not tool-failure")
+    finally:
+        module.run_command = original_run_command
+        os.environ.clear()
+        os.environ.update(prior)
+
     sibling_node.write_text("#!/bin/sh\nprintf 'v20.20.2\\n'\n", encoding="utf-8")
     prior = os.environ.copy()
     try:

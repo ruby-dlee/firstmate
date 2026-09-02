@@ -4905,7 +4905,7 @@ def pi_reviewer_command() -> list[str]:
             version = run_command(
                 [node, "--version"], timeout=10, maximum_output_bytes=1024
             )
-        except OSError as exc:
+        except (OSError, CrosscheckError) as exc:
             tool_fail(f"Pi Node runtime version inspection failed: {exc}")
         match = re.fullmatch(r"v([0-9]+)\.([0-9]+)\.([0-9]+)\s*", version.stdout)
         if version.returncode != 0 or match is None:

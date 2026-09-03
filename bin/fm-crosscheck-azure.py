@@ -421,7 +421,7 @@ def _review_guidance(
     except (UnicodeError, ValueError) as exc:
         raise AzureCrosscheckError("merge-base guidance tree is not UTF-8") from exc
     selected: dict[str, set[str]] = {"AGENTS.md": {"**"}} if "AGENTS.md" in paths else {}
-    for changed in changed_paths:
+    for changed in sorted(changed_paths):
         parents = list(PurePosixPath(changed).parents)
         for parent in parents:
             prefix = "" if str(parent) == "." else str(parent) + "/"
@@ -440,7 +440,7 @@ def _review_guidance(
         if path.startswith(".github/instructions/") and path.endswith(".instructions.md")
     ]
     try:
-        for path in selected:
+        for path in sorted(selected):
             blob_id, size = blobs[path]
             if size > 2 * 1024 * 1024 or source_bytes + size > MAX_REVIEW_GUIDANCE_SOURCE_BYTES:
                 omitted.append(path)

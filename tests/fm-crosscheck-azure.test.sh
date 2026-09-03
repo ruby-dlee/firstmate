@@ -1680,7 +1680,7 @@ snapshot_identity.update({
     "repository_snapshot_excluded_count": "1",
     "review_guidance": "review exact behavior",
     "review_guidance_digest": module.digest_bytes(b"review exact behavior"),
-    "review_guidance_source": "b" * 40 + ":AGENTS.md",
+    "review_guidance_source": "b" * 40 + ":selective-guidance-v1",
 })
 snapshot_generation_fields = generation_fields + (
     "repository_snapshot_digest",
@@ -2353,7 +2353,7 @@ marker = 'python3 - "$SNAPSHOT" "$REPOSITORY" "$INPUT" <<\'PY\'\n'
 start = guest.index(marker) + len(marker)
 end = guest.index('\nPY\nrm -f "$SNAPSHOT"', start)
 extractor = guest[start:end]
-assert "if len(members) > 15002:" in extractor
+assert "if len(members) > 15003:" in extractor
 
 def run(*argv, cwd):
     return subprocess.run(
@@ -2457,22 +2457,26 @@ with tempfile.TemporaryDirectory() as temporary:
     assert exclusions["binary.dat"]["reason"] == "binary"
     assert exclusions["ordinary-big.txt"]["reason"] == "oversized"
     included = {item["path"]: item for item in built["manifest"]["included"]}
-    assert built["manifest"]["virtual_file_count"] == 1
+    assert built["manifest"]["virtual_file_count"] == 2
     assert included["changed.txt"]["changed"] is True
     assert included["changed.txt"]["size"] == 3 * 1024 * 1024
     assert included["safe-link"]["kind"] == "symlink"
     exact_diff = included[".crosscheck-review/exact.diff"]
     assert exact_diff["kind"] == "metadata" and exact_diff["changed"] is True
+    navigation = included[".crosscheck-review/navigation.json"]
+    assert navigation["kind"] == "metadata" and navigation["changed"] is True
     manifest_bytes = module.canonical_bytes(built["manifest"]) + b"\n"
     assert built["uncompressed_bytes"] == (
         sum(item["size"] for item in built["manifest"]["included"])
         + len(manifest_bytes)
     )
-    assert module.review_guidance(repo, base) == {
-        "content": "check exact behavior",
-        "digest": module.digest_bytes(b"check exact behavior"),
-        "source": base + ":AGENTS.md",
+    guidance = module.review_guidance(repo, base, {"changed.txt"})
+    assert json.loads(guidance["content"]) == {
+        "files": [{"path": "AGENTS.md", "content": "check exact behavior"}],
+        "omitted": [],
     }
+    assert guidance["digest"] == module.digest_bytes(guidance["content"].encode())
+    assert guidance["source"] == base + ":selective-guidance-v1"
     (repo / "AGENTS.md").write_text(
         "<!-- crosscheck-review:end -->\nreversed\n"
         "<!-- crosscheck-review:start -->\n",
@@ -2482,17 +2486,54 @@ with tempfile.TemporaryDirectory() as temporary:
     git(repo, "commit", "-qm", "reversed guidance")
     reversed_guidance = git(repo, "rev-parse", "HEAD")
     try:
-        module.review_guidance(repo, reversed_guidance)
+        module.review_guidance(repo, reversed_guidance, {"changed.txt"})
     except module.AzureCrosscheckError as exc:
         assert "reversed" in str(exc)
     else:
         raise AssertionError("reversed guidance markers raw-raised or validated")
     git(repo, "checkout", "-q", head)
+    card = json.loads(module.build_navigation_card(
+        b"diff --git a/src/a.py b/src/a.py\n+++ b/src/a.py\n+def calculate_total(value):\n",
+        [({"path": "src/a.py", "kind": "file"}, b"def calculate_total(value):\n    return value\n"),
+         ({"path": "src/caller.py", "kind": "file"}, b"from a import calculate_total\ncalculate_total(1)\n")],
+        {"src/a.py"},
+    ))
+    assert card["changed_paths"] == ["src/a.py"] and card["omitted_paths"] == 0
+    assert {(row["path"], row["line"], row["kind"]) for row in card["locations"]} == {
+        ("src/a.py", 1, "definition"), ("src/caller.py", 1, "import"),
+        ("src/caller.py", 2, "reference"),
+    }
+    assert len(module.canonical_bytes(card)) + 1 <= module.MAX_NAVIGATION_CARD_BYTES
+
+    scoped = root / "scoped-guidance"
+    scoped.mkdir()
+    git(scoped, "init", "-q")
+    git(scoped, "config", "user.name", "guidance fixture")
+    git(scoped, "config", "user.email", "guidance@example.invalid")
+    (scoped / "src/service").mkdir(parents=True)
+    (scoped / ".github/instructions").mkdir(parents=True)
+    (scoped / "AGENTS.md").write_text("root rule\n")
+    (scoped / "src/AGENTS.md").write_text("nearest rule\n")
+    (scoped / "src/REVIEW.md").write_text("review rule\n")
+    (scoped / ".github/instructions/python.instructions.md").write_text(
+        '---\napplyTo: "**/*.py"\n---\npath rule\n')
+    (scoped / "src/service/code.py").write_text("value = 1\n")
+    git(scoped, "add", ".")
+    git(scoped, "commit", "-qm", "base")
+    scoped_base = git(scoped, "rev-parse", "HEAD")
+    scoped_guidance = json.loads(module.review_guidance(
+        scoped, scoped_base, {"src/service/code.py"})["content"])
+    assert [row["path"] for row in scoped_guidance["files"]] == [
+        "AGENTS.md", "src/AGENTS.md", "src/REVIEW.md",
+        ".github/instructions/python.instructions.md",
+    ]
+    assert scoped_guidance["omitted"] == []
     with tarfile.open(first, "r:gz") as archive:
         names = archive.getnames()
         assert all(".git" not in Path(name).parts for name in names)
         assert "repository/.crosscheck-snapshot/manifest.json" in names
         assert "repository/.crosscheck-review/exact.diff" in names
+        assert "repository/.crosscheck-review/navigation.json" in names
         archived_diff = archive.extractfile(
             "repository/.crosscheck-review/exact.diff"
         ).read()
@@ -5602,6 +5643,15 @@ print(json.dumps({"type": "agent_end"}))
     metrics = telemetry["review_process"]["stage_metrics"]
     assert [row["stage"] for row in metrics] == ["challenge", "synthesis"]
     assert all(row["elapsed_ms"] >= 0 and row["turns"] == 1 for row in metrics)
+    assert [row["tokens"]["input"] for row in metrics] == [10, 10]
+    assert [row["costs_usd"]["declared"] for row in metrics] == [0.00002336, 0.00002336]
+    assert metrics[0]["retrieval"]["read_calls"] == 3
+    assert metrics[0]["retrieval"]["unique_paths"] == 2
+    assert metrics[0]["retrieval"]["repeated_paths"] == 1
+    assert metrics[0]["retrieval"]["unique_ranges"] == 2
+    assert metrics[0]["retrieval"]["repeated_ranges"] == 1
+    assert metrics[1]["retrieval"]["read_calls"] == 0
+    assert telemetry["retrieval"]["response_bytes"] > 0
 
     completed, launches, value = execute("diagnostics")
     assert completed.returncode == 0, completed.stderr

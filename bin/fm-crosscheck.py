@@ -580,6 +580,8 @@ def attach_run_telemetry(
         run["telemetry"]["review_process"] = copy.deepcopy(
             measured["review_process"]
         )
+    if isinstance(measured.get("retrieval"), dict):
+        run["telemetry"]["retrieval"] = copy.deepcopy(measured["retrieval"])
 
 
 def validate_run_telemetry(value: Any, label: str) -> None:
@@ -600,7 +602,7 @@ def validate_run_telemetry(value: Any, label: str) -> None:
         telemetry_keys
         | (
             set(value)
-            & {"snapshot", "lookup", "finish_repairs", "review_process"}
+            & {"snapshot", "lookup", "finish_repairs", "review_process", "retrieval"}
         ),
         label,
     )
@@ -697,6 +699,20 @@ def validate_run_telemetry(value: Any, label: str) -> None:
             and value["finish_repairs"] >= 0,
             f"{label}.finish_repairs must be a nonnegative integer",
         )
+    retrieval_fields = {
+        "read_calls", "search_calls", "navigation_calls", "unique_paths",
+        "repeated_paths", "unique_ranges", "repeated_ranges", "response_bytes",
+        "truncated_results", "navigation_hits",
+    }
+    if "retrieval" in value:
+        retrieval = value["retrieval"]
+        require(isinstance(retrieval, dict), f"{label}.retrieval must be an object")
+        require_exact_keys(retrieval, retrieval_fields, f"{label}.retrieval")
+        for name, measured in retrieval.items():
+            require(
+                isinstance(measured, int) and not isinstance(measured, bool) and measured >= 0,
+                f"{label}.retrieval.{name} must be a nonnegative integer",
+            )
     if "review_process" in value:
         process = value["review_process"]
         require(
@@ -725,7 +741,13 @@ def validate_run_telemetry(value: Any, label: str) -> None:
             for expected, measured in zip(("challenge", "synthesis"), stages):
                 stage_label = f"{label}.review_process.stage_metrics.{expected}"
                 require(isinstance(measured, dict), f"{stage_label} must be an object")
-                require_exact_keys(measured, {"stage", "elapsed_ms", "turns"}, stage_label)
+                legacy_stage = set(measured) == {"stage", "elapsed_ms", "turns"}
+                require_exact_keys(
+                    measured,
+                    ({"stage", "elapsed_ms", "turns"} if legacy_stage else
+                     {"stage", "elapsed_ms", "turns", "tokens", "costs_usd", "retrieval"}),
+                    stage_label,
+                )
                 require(measured["stage"] == expected, f"{stage_label}.stage is invalid")
                 for name in ("elapsed_ms", "turns"):
                     require(
@@ -733,6 +755,51 @@ def validate_run_telemetry(value: Any, label: str) -> None:
                         and not isinstance(measured[name], bool)
                         and measured[name] >= 0,
                         f"{stage_label}.{name} must be a nonnegative integer",
+                    )
+                if legacy_stage:
+                    continue
+                stage_tokens = measured["tokens"]
+                require(isinstance(stage_tokens, dict), f"{stage_label}.tokens must be an object")
+                require_exact_keys(
+                    stage_tokens,
+                    {"input", "output", "cache_read", "cache_write", "source"},
+                    f"{stage_label}.tokens",
+                )
+                for name in ("input", "output", "cache_read", "cache_write"):
+                    number = stage_tokens[name]
+                    require(
+                        number is None or (
+                            isinstance(number, int) and not isinstance(number, bool) and number >= 0
+                        ),
+                        f"{stage_label}.tokens.{name} is invalid",
+                    )
+                require_string(stage_tokens["source"], f"{stage_label}.tokens.source")
+                stage_costs = measured["costs_usd"]
+                require(isinstance(stage_costs, dict), f"{stage_label}.costs_usd must be an object")
+                require_exact_keys(
+                    stage_costs,
+                    {"provider_reported", "provider_reported_source", "pi_calculated",
+                     "pi_calculated_source", "declared", "declared_source"},
+                    f"{stage_label}.costs_usd",
+                )
+                for name in ("provider_reported", "pi_calculated", "declared"):
+                    number = stage_costs[name]
+                    require(
+                        number is None or (
+                            isinstance(number, (int, float)) and not isinstance(number, bool)
+                            and math.isfinite(float(number)) and number >= 0
+                        ),
+                        f"{stage_label}.costs_usd.{name} is invalid",
+                    )
+                for name in ("provider_reported_source", "pi_calculated_source", "declared_source"):
+                    require_string(stage_costs[name], f"{stage_label}.costs_usd.{name}")
+                stage_retrieval = measured["retrieval"]
+                require(isinstance(stage_retrieval, dict), f"{stage_label}.retrieval must be an object")
+                require_exact_keys(stage_retrieval, retrieval_fields, f"{stage_label}.retrieval")
+                for name, number in stage_retrieval.items():
+                    require(
+                        isinstance(number, int) and not isinstance(number, bool) and number >= 0,
+                        f"{stage_label}.retrieval.{name} is invalid",
                     )
     for name in ("turns", "reviewer_latency_ms"):
         measured = value.get(name)
@@ -6003,7 +6070,7 @@ this provisional pass.
         def replay_pi_pass(
             value: dict[str, Any], *, allow_lookup: bool
         ) -> dict[str, Any]:
-            return runtime.replay_tool_log(
+            replayed = runtime.replay_tool_log(
                 value.get("tool_events"),
                 repository=review_dir,
                 head_sha=snapshot_value["head_sha"],
@@ -6030,6 +6097,8 @@ this provisional pass.
                 blocking_finding_ids=blocking_finding_ids(ledger),
                 allow_lookup_request=allow_lookup,
             )
+            replayed.pop("_retrieval", None)
+            return replayed
 
         first_result, first_latency = execute_pi_pass(
             "initial", prompt, allow_lookup=True
@@ -6156,6 +6225,7 @@ this provisional pass.
             )
         except Exception as exc:
             tool_fail(f"Pi reviewer tool event replay failed: {exc}")
+        replayed.pop("_retrieval", None)
         replay_projection = {"verdict": runtime_result.get("verdict")}
         if json.dumps(
             replayed, sort_keys=True, separators=(",", ":"), ensure_ascii=False

@@ -233,7 +233,8 @@ burst, show that capacity is the bottleneck.
 ## Economics and reuse
 
 Each run records available Pi tokens, declared model cost, queue wait, snapshot build time, reviewer latency, review-process mode, outcome, finding disposition, lookup use, and phase timings.
-When available, the ledger's optional `telemetry.review_process.stage_metrics` records challenge and synthesis elapsed time and turn counts; historical records and lookup-followup runs without these fields remain readable.
+When available, the ledger's optional `telemetry.review_process.stage_metrics` records challenge and synthesis elapsed time, turn counts, token classes, declared cost, and aggregate retrieval counts. Retrieval includes read/search calls, per-stage unique and repeated paths/ranges, returned bytes, truncations, and navigation-card hits; it never stores paths, queries, or source. Historical records and lookup-followup runs without these fields remain readable.
+The exact snapshot also carries a bounded location-only navigation card derived from changed declarations and their textual definitions/imports/references. It is a reading aid, not evidence. Review guidance is selected from the merge-base root and nearest applicable `AGENTS.md`/`REVIEW.md`/path instruction files, deduplicated and bounded, and remains untrusted guidance rather than proof.
 These measurements support before/after comparisons on real reviews; they do not establish a speed improvement by themselves.
 Task-only calibration can opt into bounded sanitized timing and tool/candidate events; the opt-in and exact bounds are owned by the header of `bin/fm-crosscheck-pi-reviewer.py`.
 These diagnostics are not stored in the admission ledger and cannot establish the absence of unreported reasoning or events omitted by truncation or an early guest failure.

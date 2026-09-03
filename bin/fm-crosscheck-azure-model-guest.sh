@@ -378,8 +378,8 @@ def safe_link(path, target):
 manifest_name = "repository/.crosscheck-snapshot/manifest.json"
 with tarfile.open(source, "r:gz") as archive:
     members = archive.getmembers()
-    # 15,000 tracked files, one generated exact-diff member, and the manifest.
-    if len(members) > 15002:
+    # 15,000 tracked files, two generated review-metadata members, and the manifest.
+    if len(members) > 15003:
         raise SystemExit("model guest: repository snapshot exceeds member bound")
     names = [member.name for member in members]
     if len(names) != len(set(names)) or manifest_name not in names:
@@ -410,8 +410,8 @@ with tarfile.open(source, "r:gz") as archive:
     if (
         len(included) != declared["file_count"]
         or len(exclusions) != declared["excluded_count"]
-        or manifest.get("virtual_file_count") != 1
-        or manifest.get("tracked_file_count") != len(included) + len(exclusions) - 1
+        or manifest.get("virtual_file_count") != 2
+        or manifest.get("tracked_file_count") != len(included) + len(exclusions) - 2
         or manifest["tracked_file_count"] > 15000
     ):
         raise SystemExit("model guest: repository snapshot manifest counts mismatch")
@@ -429,7 +429,9 @@ with tarfile.open(source, "r:gz") as archive:
             raise SystemExit("model guest: repository snapshot uses reserved metadata path")
         if record["kind"] not in {"file", "executable", "symlink", "metadata"}:
             raise SystemExit("model guest: repository snapshot file kind is invalid")
-        if record["kind"] == "metadata" and record["path"] != ".crosscheck-review/exact.diff":
+        if record["kind"] == "metadata" and record["path"] not in {
+            ".crosscheck-review/exact.diff", ".crosscheck-review/navigation.json"
+        }:
             raise SystemExit("model guest: repository snapshot metadata path is invalid")
         if record["kind"] != "metadata" and path.parts[0] == ".crosscheck-review":
             raise SystemExit("model guest: repository snapshot uses reserved review metadata")

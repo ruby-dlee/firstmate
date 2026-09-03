@@ -392,6 +392,66 @@ def replay_tool_log(
     lookup_request: list[dict[str, str]] | None = None
     repository_text_cache: dict[str, str] = {}
     search_scanned_bytes = 0
+    retrieval_paths: set[str] = set()
+    retrieval_ranges: set[tuple[str, int, int]] = set()
+    retrieval = {
+        "read_calls": 0, "search_calls": 0, "navigation_calls": 0,
+        "unique_paths": 0, "repeated_paths": 0,
+        "unique_ranges": 0, "repeated_ranges": 0,
+        "response_bytes": 0, "truncated_results": 0, "navigation_hits": 0,
+    }
+
+    def remember_path(path: str) -> None:
+        if path in retrieval_paths:
+            retrieval["repeated_paths"] += 1
+        else:
+            retrieval_paths.add(path)
+            retrieval["unique_paths"] += 1
+
+    def remember_retrieval(name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
+        retrieval["response_bytes"] += len(canonical_bytes(result))
+        units = (
+            [arguments] if name in {"repo_read", "repo_search"}
+            else arguments.get("reads", []) if name == "repo_read_batch"
+            else arguments.get("searches", []) if name == "repo_search_batch"
+            else []
+        )
+        if name.startswith("repo_read"):
+            retrieval["read_calls"] += len(units)
+            results = [result] if name == "repo_read" else result.get("results", [])
+            for unit, read_result in zip(units, results):
+                path = safe_relative(unit.get("path"))
+                remember_path(path)
+                start = read_result.get("start_line", unit.get("start_line", 1))
+                end = read_result.get("end_line", unit.get("end_line", start))
+                key = (path, start, end)
+                if key in retrieval_ranges:
+                    retrieval["repeated_ranges"] += 1
+                else:
+                    retrieval_ranges.add(key)
+                    retrieval["unique_ranges"] += 1
+                if path == ".crosscheck-review/navigation.json":
+                    retrieval["navigation_calls"] += 1
+                    try:
+                        nav = json.loads("\n".join(item["text"] for item in read_result.get("lines", [])))
+                        retrieval["navigation_hits"] += len(nav.get("locations", []))
+                    except (ValueError, TypeError, KeyError, AttributeError):
+                        pass
+        elif name.startswith("repo_search"):
+            retrieval["search_calls"] += len(units)
+            results = [result] if name == "repo_search" else result.get("results", [])
+            for unit, search_result in zip(units, results):
+                observed = {
+                    safe_relative(match.get("path"))
+                    for match in search_result.get("matches", [])
+                    if isinstance(match, dict)
+                }
+                observed.update(safe_relative(path) for path in unit.get("paths", []))
+                for path in sorted(observed):
+                    remember_path(path)
+            retrieval["truncated_results"] += sum(
+                1 for item in results if isinstance(item, dict) and item.get("truncated") is True
+            )
 
     def nonempty(value: Any, label: str, limit: int = 8192) -> str:
         if (
@@ -694,6 +754,8 @@ def replay_tool_log(
             result = {"finalized": True}
         if event["result_sha256"] != value_digest(result):
             raise ReviewError("model guest: Pi tool result digest mismatch")
+        if name in {"repo_search", "repo_search_batch", "repo_read", "repo_read_batch"}:
+            remember_retrieval(name, arguments, result)
         if source_excerpts is not None:
             reads = (
                 [result] if name == "repo_read"
@@ -706,7 +768,7 @@ def replay_tool_log(
     if lookup_request is not None:
         if records[-1].get("name") != "request_lookup":
             raise ReviewError("model guest: lookup request was not the final tool event")
-        return {"lookup_request": lookup_request}
+        return {"lookup_request": lookup_request, "_retrieval": retrieval}
     if finish is None or records[-1].get("name") != "finish_review":
         raise ReviewError("model guest: Pi review did not finish exactly once")
     updated_ids = {update["id"] for update in updates}
@@ -728,6 +790,7 @@ def replay_tool_log(
             "model guest: finish verdict contradicts the accepted review items"
         )
     return {
+        "_retrieval": retrieval,
         "verdict": {
             "schema": "firstmate.crosscheck-review.v2",
             "head_sha": head_sha,
@@ -860,7 +923,7 @@ def merge_telemetry(attempts: list[dict[str, Any]]) -> dict[str, Any]:
         costs[name] = round(sum(values), 12) if complete else None
         costs[source_name] = source if complete else "unavailable"
 
-    return {
+    merged = {
         "tokens": {
             **tokens,
             "source": "pi-turn-end-message-usage" if tokens_complete else "unavailable",
@@ -869,6 +932,13 @@ def merge_telemetry(attempts: list[dict[str, Any]]) -> dict[str, Any]:
         "turns": sum(attempt["turns"] for attempt in attempts),
         "finish_repairs": max(0, len(attempts) - 1),
     }
+    retrieval_rows = [attempt.get("retrieval") for attempt in attempts]
+    if retrieval_rows and all(isinstance(row, dict) for row in retrieval_rows):
+        merged["retrieval"] = {
+            key: sum(row.get(key, 0) for row in retrieval_rows)
+            for key in retrieval_rows[0]
+        }
+    return merged
 
 
 def remember_source_excerpt(
@@ -1161,6 +1231,15 @@ def bounded_challenge_projection(result: Any) -> dict[str, Any]:
 
 def combine_stage_telemetry(stages: list[dict[str, Any]]) -> dict[str, Any]:
     combined = merge_telemetry(stages)
+    retrieval_keys = (
+        "read_calls", "search_calls", "navigation_calls", "unique_paths",
+        "repeated_paths", "unique_ranges", "repeated_ranges", "response_bytes",
+        "truncated_results", "navigation_hits",
+    )
+    combined["retrieval"] = {
+        key: sum(stage.get("retrieval", {}).get(key, 0) for stage in stages)
+        for key in retrieval_keys
+    }
     combined["finish_repairs"] = sum(
         telemetry.get("finish_repairs", 0)
         for telemetry in stages
@@ -1175,6 +1254,9 @@ def combine_stage_telemetry(stages: list[dict[str, Any]]) -> dict[str, Any]:
                 "stage": stage,
                 "elapsed_ms": telemetry["stage_elapsed_ms"],
                 "turns": telemetry["turns"],
+                "tokens": telemetry["tokens"],
+                "costs_usd": telemetry["costs_usd"],
+                "retrieval": telemetry.get("retrieval", {}),
             }
             for stage, telemetry in zip(("challenge", "synthesis"), stages)
         ],
@@ -1917,6 +1999,7 @@ def run(argv: list[str]) -> int:
                 allow_lookup_request=lookup_allowed,
                 source_excerpts=source_excerpts if stage == "challenge" else None,
             )
+            completion["telemetry"]["retrieval"] = replayed.pop("_retrieval")
             terminal_calls = (
                 completion["lookups"]
                 if "lookup_request" in replayed

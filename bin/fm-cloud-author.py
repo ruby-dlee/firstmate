@@ -744,9 +744,47 @@ def matching_open_pr(binary, slug, base_branch, branch, head_oid):
     ]
     if len(matches) > 1:
         raise AuthorError("gh-axi returned multiple exact open pull requests for the publication head")
+    if matches:
+        return matches[0]
     if conflicts:
         raise AuthorError("gh-axi returned conflicting open pull request publication data")
-    return matches[0] if matches else None
+    return None
+
+
+def publication_receipt(task, remote, slug, base_branch, base, branch, tip, url):
+    value = {
+        "schema": PUBLICATION_SCHEMA,
+        "task": task,
+        "remote": remote,
+        "repository": slug,
+        "base_branch": base_branch,
+        "base_commit": base,
+        "branch": branch,
+        "head": tip,
+        "url": url,
+    }
+    value["receipt_digest"] = sha256(canonical(value))
+    return value
+
+
+def retained_publication(path, task, remote, slug, base_branch, base, branch, tip):
+    if not path.exists():
+        if path.is_symlink():
+            raise AuthorError("cloud publication receipt is redirected")
+        return None
+    body = read_regular(path, "cloud publication receipt", 1024 * 1024)
+    try:
+        value = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AuthorError("cloud publication receipt is unreadable: {}".format(exc))
+    url = value.get("url") if isinstance(value, dict) else None
+    pr_number_from_url(url, slug)
+    expected = publication_receipt(
+        task, remote, slug, base_branch, base, branch, tip, url,
+    )
+    if body != canonical(expected) + b"\n":
+        raise AuthorError("cloud publication receipt diverged")
+    return expected
 
 
 def write_meta_pr(meta_path, url):
@@ -901,6 +939,28 @@ def publish(args):
 
     slug = remote_slug(worktree, remote)
     binary = os.environ.get("FM_GH_AXI_BIN", "gh-axi")
+    publication_path = home / "data" / args.task / "cloud-publication.json"
+    retained = retained_publication(
+        publication_path, args.task, remote, slug, base_branch, base, branch, tip,
+    )
+    if retained is not None:
+        # The receipt proves the PR matched the original base at publication.
+        # A trusted host may retarget that PR later when consolidating a chain,
+        # so replay revalidates its immutable repository and exact returned head
+        # without rediscovering or creating another PR for the old base.
+        number = pr_number_from_url(retained["url"], slug)
+        view = gh_pr_api(binary, slug, number, retained["url"])
+        if view is None or (
+            view["state"].lower() != "open"
+            or view["headRefName"] != branch
+            or view["headRefOid"] != tip
+        ):
+            raise AuthorError("retained publication no longer names the exact open returned head")
+        write_meta_pr(meta_path, retained["url"])
+        write_done(state / (args.task + ".status"), retained["url"])
+        print(retained["url"])
+        return
+
     view = matching_open_pr(binary, slug, base_branch, branch, tip)
     if view is None:
         report = home / "data" / args.task / "completion.md"
@@ -928,19 +988,9 @@ def publish(args):
         or pr_number_from_url(view["url"], slug) != view["number"]
     ):
         raise AuthorError("existing pull request does not match the exact returned publication")
-    receipt = {
-        "schema": PUBLICATION_SCHEMA,
-        "task": args.task,
-        "remote": remote,
-        "repository": slug,
-        "base_branch": base_branch,
-        "base_commit": base,
-        "branch": branch,
-        "head": tip,
-        "url": view["url"],
-    }
-    receipt["receipt_digest"] = sha256(canonical(receipt))
-    publication_path = home / "data" / args.task / "cloud-publication.json"
+    receipt = publication_receipt(
+        args.task, remote, slug, base_branch, base, branch, tip, view["url"],
+    )
     receipt_body = canonical(receipt) + b"\n"
     if publication_path.exists():
         if read_regular(publication_path, "cloud publication receipt", 1024 * 1024) != receipt_body:

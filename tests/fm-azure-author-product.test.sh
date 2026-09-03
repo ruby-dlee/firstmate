@@ -171,7 +171,7 @@ case "${1:-} ${2:-}" in
       unresolved)
         print_rows 1 '18,"Unresolved",open,ruby-labs,no,none,"https://github.com/ruby-labs/b2c/pull/18"'
         ;;
-      ambiguous)
+      ambiguous|exact-with-other-base)
         if [ "$head_filter" -eq 1 ]; then
           print_rows 2 "$published_row" "$second_row"
         else
@@ -258,7 +258,10 @@ EOF
     exit 1
     ;;
   'api /repos/ruby-labs/b2c/pulls/99')
-    if [ -f "${FM_TEST_PR_API:?}" ]; then
+    if [ "${FM_TEST_GH_LIST_MODE:-ok}" = retargeted-receipt ]; then
+      head=$(git --git-dir="${FM_TEST_REMOTE:?}" rev-parse refs/heads/fm/b2c-current)
+      print_api 99 open main fm/b2c-current "$head" ruby-labs/b2c ruby-labs/b2c
+    elif [ -f "${FM_TEST_PR_API:?}" ]; then
       cat "$FM_TEST_PR_API"
     else
       printf '%s\n' 'error: pull request not found' >&2
@@ -268,7 +271,9 @@ EOF
   'api /repos/ruby-labs/b2c/pulls/100')
     head=$(git --git-dir="${FM_TEST_REMOTE:?}" rev-parse refs/heads/fm/b2c-current)
     base=env/develop
-    [ "${FM_TEST_GH_LIST_MODE:-ok}" != conflicting-head ] || base=main
+    case "${FM_TEST_GH_LIST_MODE:-ok}" in
+      conflicting-head|exact-with-other-base) base=main ;;
+    esac
     [ "${FM_TEST_GH_LIST_MODE:-ok}" != conflicting-oid ] || head=${FM_TEST_PR_HEAD:?}
     print_api 100 open "$base" fm/b2c-current "$head" ruby-labs/b2c ruby-labs/b2c
     ;;
@@ -604,6 +609,33 @@ publish_out=$(python3 "$AUTHOR" publish --state "$HOME_DIR/state" --task "$ID" 2
   || fail "initial existing-PR publication was not repeatable: $publish_out"
 test "$(grep -c '^pr create ' "$FM_TEST_GH_LOG")" -eq 0 \
   || fail "repeated existing-PR publication attempted a duplicate create"
+test "$(grep -c '^pr list ' "$FM_TEST_GH_LOG")" -eq 1 \
+  || fail "retained publication replay rediscovered the already-bound PR"
+
+: > "$FM_TEST_GH_LOG"
+publish_out=$(FM_TEST_GH_LIST_MODE=retargeted-receipt python3 "$AUTHOR" publish \
+  --state "$HOME_DIR/state" --task "$ID" 2>&1) \
+  || fail "retained publication did not survive a trusted-host base retarget: $publish_out"
+assert_contains "$publish_out" 'https://github.com/ruby-labs/b2c/pull/99' \
+  "retained publication did not return its bound PR after a base retarget"
+test "$(grep -c '^api /repos/ruby-labs/b2c/pulls/99$' "$FM_TEST_GH_LOG")" -eq 1 \
+  || fail "retained publication did not resolve its exact numeric PR once"
+if grep -q '^pr \(list\|create\) ' "$FM_TEST_GH_LOG"; then
+  fail "retained publication rediscovered or recreated a PR after a base retarget"
+fi
+
+rm "$HOME_DIR/data/$ID/cloud-publication.json"
+: > "$FM_TEST_GH_LOG"
+publish_out=$(FM_TEST_GH_LIST_MODE=exact-with-other-base python3 "$AUTHOR" publish \
+  --state "$HOME_DIR/state" --task "$ID" 2>&1) \
+  || fail "host publication did not select the exact PR beside another-base sibling: $publish_out"
+assert_contains "$publish_out" 'https://github.com/ruby-labs/b2c/pull/99' \
+  "publication did not return the exact PR beside another-base sibling"
+test "$(grep -c '^pr create ' "$FM_TEST_GH_LOG")" -eq 0 \
+  || fail "publication attempted a duplicate create beside another-base sibling"
+assert_present "$HOME_DIR/data/$ID/cloud-publication.json" \
+  "exact publication beside another-base sibling did not persist its receipt"
+rm "$HOME_DIR/data/$ID/cloud-publication.json"
 
 if publish_out=$(FM_TEST_GH_LIST_MODE=ambiguous python3 "$AUTHOR" publish \
   --state "$HOME_DIR/state" --task "$ID" 2>&1); then
@@ -632,8 +664,8 @@ assert_grep 'pr=https://github.com/ruby-labs/b2c/pull/99' "$HOME_DIR/state/$ID.m
   "host publication did not bind the PR into task metadata"
 assert_grep 'done: PR https://github.com/ruby-labs/b2c/pull/99' "$HOME_DIR/state/$ID.status" \
   "host publication did not replace the pending status with the real PR"
-assert_present "$HOME_DIR/data/$ID/cloud-publication.json" \
-  "host publication did not persist its retry receipt"
+assert_absent "$HOME_DIR/data/$ID/cloud-publication.json" \
+  "a refused publication persisted a receipt"
 
 rm "$FM_TEST_PR_API"
 : > "$FM_TEST_GH_LOG"

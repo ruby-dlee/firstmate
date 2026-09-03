@@ -71,6 +71,7 @@ MAX_REVIEW_GUIDANCE_BYTES = 8 * 1024
 MAX_REVIEW_GUIDANCE_FILE_BYTES = 3 * 1024
 MAX_REVIEW_GUIDANCE_FILES_BYTES = 6 * 1024
 MAX_REVIEW_GUIDANCE_SOURCE_BYTES = 16 * 1024 * 1024
+MAX_REVIEW_GUIDANCE_MATCH_STATES = 2_000_000
 MAX_NAVIGATION_CARD_BYTES = 16 * 1024
 MAX_NAVIGATION_SYMBOLS = 48
 MAX_NAVIGATION_SCAN_BYTES = 64 * 1024 * 1024
@@ -380,8 +381,9 @@ def _path_matches(path: str, pattern: str) -> bool:
             return path_index == len(path_parts)
         part = pattern_parts[pattern_index]
         if part == "**":
-            return any(match(next_index, pattern_index + 1)
-                       for next_index in range(path_index, len(path_parts) + 1))
+            return match(path_index, pattern_index + 1) or (
+                path_index < len(path_parts) and match(path_index + 1, pattern_index)
+            )
         return (
             path_index < len(path_parts)
             and fnmatch.fnmatchcase(path_parts[path_index], part)
@@ -393,9 +395,19 @@ def _path_matches(path: str, pattern: str) -> bool:
 
 def _instruction_match(source: str, changed_paths: set[str]) -> bool:
     patterns = _instruction_patterns(source)
+    return _patterns_match(patterns, changed_paths)
+
+
+def _patterns_match(patterns: list[str], changed_paths: set[str]) -> bool:
     return any(
         _path_matches(path, pattern)
-        for path in changed_paths for pattern in patterns
+        for path in sorted(changed_paths) for pattern in patterns
+    )
+
+
+def _match_state_bound(patterns: list[str], changed_paths: set[str]) -> int:
+    return sum(len(path.split("/")) + 1 for path in changed_paths) * sum(
+        len(pattern.split("/")) + 1 for pattern in patterns
     )
 
 
@@ -448,11 +460,18 @@ def _review_guidance(
             raw = blob_batch.read(blob_id, size)
             source_bytes += size
             sources[path] = raw.decode("utf-8")
+        match_states = 0
         for path in candidates:
             if path in sources:
                 source = sources[path]
-                if _instruction_match(source, changed_paths):
-                    selected[path].update(_instruction_patterns(source))
+                patterns = _instruction_patterns(source)
+                states = _match_state_bound(patterns, changed_paths)
+                if match_states + states > MAX_REVIEW_GUIDANCE_MATCH_STATES:
+                    omitted.append(path)
+                else:
+                    match_states += states
+                    if patterns and _patterns_match(patterns, changed_paths):
+                        selected[path].update(patterns)
                 continue
             blob_id, size = blobs[path]
             if size > 2 * 1024 * 1024 or source_bytes + size > MAX_REVIEW_GUIDANCE_SOURCE_BYTES:
@@ -462,8 +481,14 @@ def _review_guidance(
             source_bytes += size
             source = raw.decode("utf-8")
             sources[path] = source
-            if _instruction_match(source, changed_paths):
-                selected[path] = set(_instruction_patterns(source))
+            patterns = _instruction_patterns(source)
+            states = _match_state_bound(patterns, changed_paths)
+            if match_states + states > MAX_REVIEW_GUIDANCE_MATCH_STATES:
+                omitted.append(path)
+                continue
+            match_states += states
+            if patterns and _patterns_match(patterns, changed_paths):
+                selected[path] = set(patterns)
     except UnicodeError as exc:
         raise AzureCrosscheckError("merge-base guidance is not UTF-8") from exc
     finally:

@@ -2588,6 +2588,8 @@ with tempfile.TemporaryDirectory() as temporary:
     assert module._instruction_patterns('---\r\napplyTo: "**/*.py"\r\n---') == ["**/*.py"]
     hostile_glob = "/".join(["**"] * 24 + ["never"])
     assert not module._path_matches("/".join(["segment"] * 64), hostile_glob)
+    hostile_paths = {"/".join(["segment"] * 64 + [str(index)]) for index in range(200)}
+    assert module._match_state_bound([hostile_glob] * 16, hostile_paths) > module.MAX_REVIEW_GUIDANCE_MATCH_STATES
     (scoped / "src/a").mkdir()
     (scoped / "src/b").mkdir()
     (scoped / "src/a/REVIEW.md").write_text("shared scoped rule\n")
@@ -2631,6 +2633,21 @@ with tempfile.TemporaryDirectory() as temporary:
     assert len(many_guidance_raw.encode()) <= module.MAX_REVIEW_GUIDANCE_BYTES
     assert many_guidance["files"] == [] and many_guidance["omitted_count"] == 400
     assert 0 < len(many_guidance["omitted_paths"]) < 400
+    (many / ".github/instructions").mkdir(parents=True)
+    for index in range(20):
+        (many / f".github/instructions/rule-{index:02d}.instructions.md").write_text(
+            '---\napplyTo: "**/*.py"\n---\nsmall rule\n')
+    git(many, "add", ".")
+    git(many, "commit", "-qm", "many path instructions")
+    bounded_base = git(many, "rev-parse", "HEAD")
+    original_match_bound = module.MAX_REVIEW_GUIDANCE_MATCH_STATES
+    module.MAX_REVIEW_GUIDANCE_MATCH_STATES = 10000
+    try:
+        bounded_guidance = json.loads(module.review_guidance(
+            many, bounded_base, many_paths)["content"])
+    finally:
+        module.MAX_REVIEW_GUIDANCE_MATCH_STATES = original_match_bound
+    assert bounded_guidance["omitted_count"] >= 418
     with tarfile.open(first, "r:gz") as archive:
         names = archive.getnames()
         assert all(".git" not in Path(name).parts for name in names)

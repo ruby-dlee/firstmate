@@ -9011,26 +9011,25 @@ spec.loader.exec_module(module)
 spawn = Path(sys.argv[2]).read_text(encoding="utf-8")
 monitor = Path(sys.argv[3]).read_text(encoding="utf-8")
 
-# STRUCTURAL GUARD, FAIL CLOSED: every basename bin/fm-spawn.sh writes into the
-# cloud payload directory must be admitted by the compartment bounds.
+# STRUCTURAL GUARD, FAIL CLOSED: every literal basename bin/fm-spawn.sh names
+# under the cloud payload directory must be admitted by at least one durable
+# role's payload bounds.
 #
 # SCOPE: this is a DRIFT DETECTOR, not the security control. It reads text, so
 # any staging that refers to the directory as a whole (tar -C, cd, cp -R src/.,
 # a variable alias) is invisible to it; it fails closed on the ones it can see
 # but cannot claim to see all of them. The control that actually bounds what
-# reaches a guest is staged_directory_manifest at dispatch, which refuses an
-# unadmitted entry however it was spelled.
+# reaches a guest is staged_directory_manifest at dispatch, which selects the
+# durable worker role and refuses an unadmitted entry however it was spelled.
 #
 # This classifies EVERY occurrence of the payload directory and refuses the ones
 # it cannot read, because a guard whose silence is ambiguous between "nothing
-# unadmitted" and "I could not parse that" is not a control at all. An earlier
-# version matched only a literal basename written straight after the literal
-# directory path, so `.../cloud-payload/$NAME` and the ordinary
-# `cp src .../cloud-payload/` idiom both slipped past it while it printed green.
-# The authoritative check is effect-shaped and lives in
-# tests/fm-secondmate-cloud-monitor.test.sh, which runs this same validator over
-# the directory a real fm-spawn.sh actually produced; this one is the cheap
-# static companion that names the offending line.
+# unadmitted" and "I could not parse that" is not a control at all. The shell
+# contains both role branches and host-side reads of payload files, so this
+# static companion cannot infer that a literal is a write or which role owns it.
+# Role-specific executable checks below keep the two admission sets narrow,
+# while this exact-entry guard checks each literal against the lifecycle-owned
+# union and names an offending line.
 spawn_lines = spawn.splitlines()
 staged_names = set()
 unreadable = []
@@ -9043,7 +9042,7 @@ for site in re.finditer(r"\.cloud-payload", spawn):
         # `cp -R src/. <dir>` all name the directory this way and DO stage.
         # This guard cannot see those, which is why it is a drift detector and
         # not the control. The control is staged_directory_manifest at dispatch,
-        # and the effect-shaped check in the compartment monitor suite.
+        # with the effect-shaped compartment check covering the real producer.
         continue
     named = re.match(r"/([A-Za-z0-9][A-Za-z0-9._-]*)\"", tail)
     if named:
@@ -9056,9 +9055,13 @@ assert not unreadable, (
     "it cannot prove what gets staged. Fail closed rather than pass blind; use a "
     "literal basename or teach the guard:\n" + "\n".join(unreadable))
 assert staged_names, "no payload staging destinations found in bin/fm-spawn.sh"
-unbounded = sorted(staged_names - set(module.COMPARTMENT_PAYLOAD_FILE_BOUNDS))
+reviewed_names = set()
+for role in ("author", "secondmate"):
+    bounds, _required = module.payload_contract(role)
+    reviewed_names.update(bounds)
+unbounded = sorted(staged_names - reviewed_names)
 assert not unbounded, (
-    "bin/fm-spawn.sh stages payload entries the reviewed set does not admit: "
+    "bin/fm-spawn.sh names payload entries no reviewed lifecycle lane admits: "
     "{}".format(unbounded))
 
 # THIRD ENCODING: the compartment monitor's leg argv names these same two files

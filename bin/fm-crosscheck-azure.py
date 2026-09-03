@@ -3661,8 +3661,10 @@ def validate_azure_reviewer_record(
         if (
             identity["repository_snapshot_head_sha"] != identity["head_sha"]
             or identity["repository_snapshot_base_sha"] != identity["base_sha"]
-            or identity["review_guidance_source"]
-            != identity["base_sha"] + ":selective-guidance-v1"
+            or identity["review_guidance_source"] not in {
+                identity["base_sha"] + ":AGENTS.md",
+                identity["base_sha"] + ":selective-guidance-v1",
+            }
             or identity["review_guidance_digest"]
             != digest_bytes(identity["review_guidance"].encode("utf-8"))
         ):

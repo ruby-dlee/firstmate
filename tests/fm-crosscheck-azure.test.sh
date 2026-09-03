@@ -1701,6 +1701,15 @@ snapshot_identity["review_generation"] = module.digest_bytes(
     )
 ).split(":", 1)[1][:24]
 module.validate_azure_reviewer_record(snapshot_bound, run, "snapshot-bound")
+legacy_snapshot = copy.deepcopy(snapshot_bound)
+legacy_snapshot_identity = legacy_snapshot["azure_identity"]
+legacy_snapshot_identity["review_guidance_source"] = "b" * 40 + ":AGENTS.md"
+legacy_snapshot_identity["review_generation"] = module.digest_bytes(
+    module.canonical_bytes(
+        {field: legacy_snapshot_identity[field] for field in snapshot_generation_fields}
+    )
+).split(":", 1)[1][:24]
+module.validate_azure_reviewer_record(legacy_snapshot, run, "legacy-snapshot-bound")
 snapshot_capacity = copy.deepcopy(snapshot_bound)
 snapshot_capacity_identity = snapshot_capacity["azure_identity"]
 snapshot_capacity_identity["repository_snapshot_file_count"] = str(

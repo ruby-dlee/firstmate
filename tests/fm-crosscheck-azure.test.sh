@@ -2486,14 +2486,12 @@ with tempfile.TemporaryDirectory() as temporary:
     assert exclusions["binary.dat"]["reason"] == "binary"
     assert exclusions["ordinary-big.txt"]["reason"] == "oversized"
     included = {item["path"]: item for item in built["manifest"]["included"]}
-    assert built["manifest"]["virtual_file_count"] == 2
+    assert built["manifest"]["virtual_file_count"] == 1
     assert included["changed.txt"]["changed"] is True
     assert included["changed.txt"]["size"] == 3 * 1024 * 1024
     assert included["safe-link"]["kind"] == "symlink"
     exact_diff = included[".crosscheck-review/exact.diff"]
     assert exact_diff["kind"] == "metadata" and exact_diff["changed"] is True
-    navigation = included[".crosscheck-review/navigation.json"]
-    assert navigation["kind"] == "metadata" and navigation["changed"] is True
     manifest_bytes = module.canonical_bytes(built["manifest"]) + b"\n"
     assert built["uncompressed_bytes"] == (
         sum(item["size"] for item in built["manifest"]["included"])
@@ -2520,31 +2518,6 @@ with tempfile.TemporaryDirectory() as temporary:
         repo, reversed_guidance, {"changed.txt"})["content"])
     assert malformed_guidance["files"] == []
     git(repo, "checkout", "-q", head)
-    card = json.loads(module.build_navigation_card(
-        b"diff --git a/src/a.py b/src/a.py\n+++ b/src/a.py\n+def calculate_total(value):\n",
-        [({"path": "src/a.py", "kind": "file"}, b"def calculate_total(value):\n    return value\n"),
-         ({"path": "src/caller.py", "kind": "file"}, b"from a import calculate_total\ncalculate_total(1)\n")],
-        {"src/a.py"},
-    ))
-    assert card["changed_paths"] == ["src/a.py"] and card["omitted_paths"] == 0
-    assert {(row["path"], row["line"], row["kind"]) for row in card["locations"]} == {
-        ("src/a.py", 1, "definition"), ("src/caller.py", 1, "import"),
-        ("src/caller.py", 2, "reference"),
-    }
-    assert len(module.canonical_bytes(card)) + 1 <= module.MAX_NAVIGATION_CARD_BYTES
-    original_card_bound = module.MAX_NAVIGATION_CARD_BYTES
-    module.MAX_NAVIGATION_CARD_BYTES = 512
-    try:
-        dense = json.loads(module.build_navigation_card(
-            b"diff --git a/dense.py b/dense.py\n+++ b/dense.py\n+const repeated_symbol = 1\n",
-            [({"path": "dense.py", "kind": "file"},
-              ("repeated_symbol\n" * 100000).encode())],
-            {"dense.py"},
-        ))
-    finally:
-        module.MAX_NAVIGATION_CARD_BYTES = original_card_bound
-    assert dense["omitted_locations"] > 99000
-    assert len(module.canonical_bytes(dense)) + 1 <= 512
 
     scoped = root / "scoped-guidance"
     scoped.mkdir()
@@ -2654,7 +2627,6 @@ with tempfile.TemporaryDirectory() as temporary:
         assert all(".git" not in Path(name).parts for name in names)
         assert "repository/.crosscheck-snapshot/manifest.json" in names
         assert "repository/.crosscheck-review/exact.diff" in names
-        assert "repository/.crosscheck-review/navigation.json" in names
         archived_diff = archive.extractfile(
             "repository/.crosscheck-review/exact.diff"
         ).read()

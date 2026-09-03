@@ -396,10 +396,10 @@ def replay_tool_log(
     retrieval_ranges: set[tuple[str, int, int]] = set()
     retrieval = {
         "complete": True,
-        "read_calls": 0, "search_calls": 0, "navigation_calls": 0,
+        "read_calls": 0, "search_calls": 0,
         "unique_paths": 0, "repeated_paths": 0,
         "unique_ranges": 0, "repeated_ranges": 0,
-        "response_bytes": 0, "truncated_results": 0, "navigation_hits": 0,
+        "response_bytes": 0, "truncated_results": 0,
     }
 
     def remember_path(path: str) -> None:
@@ -431,13 +431,6 @@ def replay_tool_log(
                 else:
                     retrieval_ranges.add(key)
                     retrieval["unique_ranges"] += 1
-                if path == ".crosscheck-review/navigation.json":
-                    retrieval["navigation_calls"] += 1
-                    try:
-                        nav = json.loads("\n".join(item["text"] for item in read_result.get("lines", [])))
-                        retrieval["navigation_hits"] += len(nav.get("locations", []))
-                    except (ValueError, TypeError, KeyError, AttributeError):
-                        pass
         elif name.startswith("repo_search"):
             retrieval["search_calls"] += len(units)
             results = [result] if name == "repo_search" else result.get("results", [])
@@ -1238,9 +1231,9 @@ def bounded_challenge_projection(result: Any) -> dict[str, Any]:
 def combine_stage_telemetry(stages: list[dict[str, Any]]) -> dict[str, Any]:
     combined = merge_telemetry(stages)
     retrieval_keys = (
-        "read_calls", "search_calls", "navigation_calls", "unique_paths",
+        "read_calls", "search_calls", "unique_paths",
         "repeated_paths", "unique_ranges", "repeated_ranges", "response_bytes",
-        "truncated_results", "navigation_hits",
+        "truncated_results",
     )
     combined["retrieval"] = {
         "complete": all(stage.get("retrieval", {}).get("complete") is True for stage in stages),

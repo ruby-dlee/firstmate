@@ -700,9 +700,9 @@ def validate_run_telemetry(value: Any, label: str) -> None:
             f"{label}.finish_repairs must be a nonnegative integer",
         )
     retrieval_fields = {
-        "complete", "read_calls", "search_calls", "navigation_calls", "unique_paths",
+        "complete", "read_calls", "search_calls", "unique_paths",
         "repeated_paths", "unique_ranges", "repeated_ranges", "response_bytes",
-        "truncated_results", "navigation_hits",
+        "truncated_results",
     }
     if "retrieval" in value:
         retrieval = value["retrieval"]

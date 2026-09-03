@@ -410,8 +410,8 @@ with tarfile.open(source, "r:gz") as archive:
     if (
         len(included) != declared["file_count"]
         or len(exclusions) != declared["excluded_count"]
-        or manifest.get("virtual_file_count") != 2
-        or manifest.get("tracked_file_count") != len(included) + len(exclusions) - 2
+        or manifest.get("virtual_file_count") != 1
+        or manifest.get("tracked_file_count") != len(included) + len(exclusions) - 1
         or manifest["tracked_file_count"] > 15000
     ):
         raise SystemExit("model guest: repository snapshot manifest counts mismatch")
@@ -430,7 +430,7 @@ with tarfile.open(source, "r:gz") as archive:
         if record["kind"] not in {"file", "executable", "symlink", "metadata"}:
             raise SystemExit("model guest: repository snapshot file kind is invalid")
         if record["kind"] == "metadata" and record["path"] not in {
-            ".crosscheck-review/exact.diff", ".crosscheck-review/navigation.json"
+            ".crosscheck-review/exact.diff"
         }:
             raise SystemExit("model guest: repository snapshot metadata path is invalid")
         if record["kind"] != "metadata" and path.parts[0] == ".crosscheck-review":

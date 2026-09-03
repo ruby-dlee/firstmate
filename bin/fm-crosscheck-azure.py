@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import fnmatch
+import functools
 import gzip
 import hashlib
 import importlib.util
@@ -69,6 +70,7 @@ MAX_SNAPSHOT_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_GUIDANCE_BYTES = 8 * 1024
 MAX_REVIEW_GUIDANCE_FILE_BYTES = 3 * 1024
 MAX_REVIEW_GUIDANCE_FILES_BYTES = 6 * 1024
+MAX_REVIEW_GUIDANCE_SOURCE_BYTES = 16 * 1024 * 1024
 MAX_NAVIGATION_CARD_BYTES = 16 * 1024
 MAX_NAVIGATION_SYMBOLS = 48
 MAX_NAVIGATION_SCAN_BYTES = 64 * 1024 * 1024
@@ -331,19 +333,6 @@ def _safe_snapshot_symlink(path: PurePosixPath, target: str) -> None:
         )
 
 
-def _base_text(repository: Path, base_sha: str, path: str) -> str | None:
-    result = run_command(
-        ["git", "-C", str(repository), "show", f"{base_sha}:{path}"],
-        timeout=60, maximum_output=2 * 1024 * 1024, check=False,
-    )
-    if result.returncode != 0:
-        return None
-    try:
-        return result.stdout.decode("utf-8")
-    except UnicodeError as exc:
-        raise AzureCrosscheckError(f"merge-base guidance is not UTF-8 at {path}") from exc
-
-
 def _guidance_excerpt(path: str, source: str) -> str:
     starts = source.count(SNAPSHOT_GUIDANCE_START)
     ends = source.count(SNAPSHOT_GUIDANCE_END)
@@ -362,35 +351,74 @@ def _guidance_excerpt(path: str, source: str) -> str:
 
 
 def _instruction_patterns(source: str) -> list[str]:
-    match = re.search(r"(?m)^applyTo:\s*[\"']?([^\n\"']+)", source[:2048])
-    if match is None:
+    header = source[:2048].replace("\r\n", "\n")
+    if not header.startswith("---\n"):
         return []
-    return [item.strip() for item in match.group(1).split(",") if item.strip()]
+    end = header.find("\n---", 4)
+    if end < 0:
+        return []
+    matches = re.findall(r"(?m)^applyTo:\s*[\"']?([^\n\"']+)", header[4:end])
+    if len(matches) != 1:
+        return []
+    patterns = [item.strip() for item in matches[0].split(",") if item.strip()]
+    if (
+        len(patterns) > 16
+        or any(len(item.encode("utf-8")) > 256 or len(item.split("/")) > 32
+               or ".." in item.split("/") for item in patterns)
+    ):
+        return []
+    return patterns
+
+
+def _path_matches(path: str, pattern: str) -> bool:
+    path_parts = path.split("/")
+    pattern_parts = pattern.split("/")
+
+    @functools.lru_cache(maxsize=4096)
+    def match(path_index: int, pattern_index: int) -> bool:
+        if pattern_index == len(pattern_parts):
+            return path_index == len(path_parts)
+        part = pattern_parts[pattern_index]
+        if part == "**":
+            return any(match(next_index, pattern_index + 1)
+                       for next_index in range(path_index, len(path_parts) + 1))
+        return (
+            path_index < len(path_parts)
+            and fnmatch.fnmatchcase(path_parts[path_index], part)
+            and match(path_index + 1, pattern_index + 1)
+        )
+
+    return match(0, 0)
 
 
 def _instruction_match(source: str, changed_paths: set[str]) -> bool:
     patterns = _instruction_patterns(source)
     return any(
-        fnmatch.fnmatchcase(path, pattern)
-        or (pattern.startswith("**/") and fnmatch.fnmatchcase(path, pattern[3:]))
+        _path_matches(path, pattern)
         for path in changed_paths for pattern in patterns
     )
 
 
-def review_guidance(
+def _review_guidance(
     repository: Path, base_sha: str, changed_paths: set[str]
 ) -> dict[str, Any]:
     """Project only applicable, bounded guidance from the proven merge base."""
 
     tree = run_command(
-        ["git", "-C", str(repository), "ls-tree", "-rz", "--name-only", base_sha],
+        ["git", "-C", str(repository), "ls-tree", "-rz", "-l", base_sha],
         timeout=60, maximum_output=8 * 1024 * 1024, check=True,
     )
     try:
-        paths = {
-            item.decode("utf-8") for item in tree.stdout.split(b"\0") if item
-        }
-    except UnicodeError as exc:
+        blobs = {}
+        for raw in tree.stdout.split(b"\0"):
+            if not raw:
+                continue
+            metadata, encoded_path = raw.split(b"\t", 1)
+            mode, object_type, blob_id, size = metadata.decode("ascii").split()
+            if object_type == "blob" and mode in {"100644", "100755"}:
+                blobs[encoded_path.decode("utf-8")] = (blob_id, int(size))
+        paths = set(blobs)
+    except (UnicodeError, ValueError) as exc:
         raise AzureCrosscheckError("merge-base guidance tree is not UTF-8") from exc
     selected: dict[str, set[str]] = {"AGENTS.md": {"**"}} if "AGENTS.md" in paths else {}
     for changed in changed_paths:
@@ -403,29 +431,49 @@ def review_guidance(
                 for item in nearest:
                     selected.setdefault(item, set()).add(prefix + "**")
                 break
-    instruction_lines = run_command(
-        ["git", "-C", str(repository), "grep", "-n", "-I", "-e", "^applyTo:",
-         base_sha, "--", ".github/instructions/*.instructions.md"],
-        timeout=60, maximum_output=8 * 1024 * 1024, check=False,
-    )
-    if instruction_lines.returncode not in {0, 1}:
-        raise AzureCrosscheckError("merge-base path-guidance selection failed")
+    omitted = []
+    sources: dict[str, str] = {}
+    source_bytes = 0
+    blob_batch = _GitBlobBatch(repository)
+    candidates = [
+        path for path in sorted(paths)
+        if path.startswith(".github/instructions/") and path.endswith(".instructions.md")
+    ]
     try:
-        instruction_output = instruction_lines.stdout.decode("utf-8")
+        for path in selected:
+            blob_id, size = blobs[path]
+            if size > 2 * 1024 * 1024 or source_bytes + size > MAX_REVIEW_GUIDANCE_SOURCE_BYTES:
+                omitted.append(path)
+                continue
+            raw = blob_batch.read(blob_id, size)
+            source_bytes += size
+            sources[path] = raw.decode("utf-8")
+        for path in candidates:
+            if path in sources:
+                source = sources[path]
+                if _instruction_match(source, changed_paths):
+                    selected[path].update(_instruction_patterns(source))
+                continue
+            blob_id, size = blobs[path]
+            if size > 2 * 1024 * 1024 or source_bytes + size > MAX_REVIEW_GUIDANCE_SOURCE_BYTES:
+                omitted.append(path)
+                continue
+            raw = blob_batch.read(blob_id, size)
+            source_bytes += size
+            source = raw.decode("utf-8")
+            sources[path] = source
+            if _instruction_match(source, changed_paths):
+                selected[path] = set(_instruction_patterns(source))
     except UnicodeError as exc:
-        raise AzureCrosscheckError("merge-base path guidance is not UTF-8") from exc
-    for line in instruction_output.split("\n"):
-        match = re.match(r"^[^:]+:(.+\.instructions\.md):\d+:(applyTo:.*)$", line)
-        if match and _instruction_match(match.group(2), changed_paths):
-            selected.setdefault(match.group(1), set()).update(
-                _instruction_patterns(match.group(2))
-            )
+        raise AzureCrosscheckError("merge-base guidance is not UTF-8") from exc
+    finally:
+        blob_batch.close()
     records = []
     by_digest: dict[str, dict[str, Any]] = {}
-    omitted = []
     for path in sorted(selected, key=lambda value: (value.count("/"), value)):
-        source = _base_text(repository, base_sha, path)
-        excerpt = _guidance_excerpt(path, source or "")
+        if path not in sources:
+            continue
+        excerpt = _guidance_excerpt(path, sources.get(path, ""))
         if not excerpt:
             omitted.append(path)
             continue
@@ -480,6 +528,25 @@ def review_guidance(
         "digest": digest_bytes(encoded),
         "source": f"{base_sha}:selective-guidance-v1",
     }
+
+
+def review_guidance(
+    repository: Path, base_sha: str, changed_paths: set[str]
+) -> dict[str, Any]:
+    """Best-effort optional guidance; never prevent the core exact-head review."""
+
+    try:
+        return _review_guidance(repository, base_sha, changed_paths)
+    except (AzureCrosscheckError, OSError, UnicodeError, ValueError):
+        content = canonical_bytes({
+            "files": [], "omitted_count": 0, "omitted_paths": [],
+            "omitted_digest": digest_bytes(canonical_bytes([])),
+        }).decode("utf-8")
+        return {
+            "content": content,
+            "digest": digest_bytes(content.encode("utf-8")),
+            "source": f"{base_sha}:selective-guidance-v1",
+        }
 
 
 def build_navigation_card(

@@ -2507,12 +2507,9 @@ with tempfile.TemporaryDirectory() as temporary:
     git(repo, "add", "AGENTS.md")
     git(repo, "commit", "-qm", "reversed guidance")
     reversed_guidance = git(repo, "rev-parse", "HEAD")
-    try:
-        module.review_guidance(repo, reversed_guidance, {"changed.txt"})
-    except module.AzureCrosscheckError as exc:
-        assert "reversed" in str(exc)
-    else:
-        raise AssertionError("reversed guidance markers raw-raised or validated")
+    malformed_guidance = json.loads(module.review_guidance(
+        repo, reversed_guidance, {"changed.txt"})["content"])
+    assert malformed_guidance["files"] == []
     git(repo, "checkout", "-q", head)
     card = json.loads(module.build_navigation_card(
         b"diff --git a/src/a.py b/src/a.py\n+++ b/src/a.py\n+def calculate_total(value):\n",
@@ -2552,7 +2549,12 @@ with tempfile.TemporaryDirectory() as temporary:
     (scoped / "src/REVIEW.md").write_text("review rule\n")
     (scoped / ".github/instructions/python.instructions.md").write_text(
         '---\napplyTo: "**/*.py"\n---\n<!-- crosscheck-review:start -->\n'
-        'path rule\n<!-- crosscheck-review:end -->\n')
+        'path rule\napplyTo: "**"\n<!-- crosscheck-review:end -->\n')
+    (scoped / ".github/instructions/café.instructions.md").write_text(
+        '---\napplyTo: "**/*.js"\n---\n<!-- crosscheck-review:start -->\n'
+        'unicode path rule\n<!-- crosscheck-review:end -->\n')
+    (scoped / ".github/instructions/duplicate.instructions.md").write_text(
+        '---\napplyTo: "**/*.py"\napplyTo: "**"\n---\nduplicate rule\n')
     (scoped / "src/service/code.py").write_text("value = 1\n")
     git(scoped, "add", ".")
     git(scoped, "commit", "-qm", "base")
@@ -2563,9 +2565,20 @@ with tempfile.TemporaryDirectory() as temporary:
         [{"path": "AGENTS.md", "scopes": ["**"]}],
         [{"path": "src/AGENTS.md", "scopes": ["src/**"]}],
         [{"path": "src/REVIEW.md", "scopes": ["src/**"]}],
+        [{"path": ".github/instructions/café.instructions.md", "scopes": ["**/*.js"]}],
         [{"path": ".github/instructions/python.instructions.md", "scopes": ["**/*.py"]}],
     ]
     assert scoped_guidance["omitted_count"] == 0
+    assert all("duplicate.instructions.md" not in source["path"]
+               for row in scoped_guidance["files"] for source in row["sources"])
+    assert next(row for row in scoped_guidance["files"]
+                if row["content"].startswith("path rule"))["sources"][0]["scopes"] == ["**/*.py"]
+    assert module._instruction_match('---\napplyTo: "*.py"\n---\n', {"root.py"})
+    assert not module._instruction_match('---\napplyTo: "*.py"\n---\n', {"web/b.py"})
+    assert module._instruction_match('---\napplyTo: "**/*.py"\n---\n', {"root.py", "web/b.py"})
+    assert module._instruction_patterns('---\r\napplyTo: "**/*.py"\r\n---') == ["**/*.py"]
+    hostile_glob = "/".join(["**"] * 24 + ["never"])
+    assert not module._path_matches("/".join(["segment"] * 64), hostile_glob)
     (scoped / "src/a").mkdir()
     (scoped / "src/b").mkdir()
     (scoped / "src/a/REVIEW.md").write_text("shared scoped rule\n")

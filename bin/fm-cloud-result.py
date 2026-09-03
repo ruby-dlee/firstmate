@@ -28,6 +28,8 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SAFE_TASK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SAFE_GENERATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+SAFE_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
+REPOSITORY_SCHEMA = "fm.azure-author-repository/v1"
 REQUIRED_SECTIONS = (
     "Summary", "What changed", "Verification", "Visual evidence", "Artifacts", "Follow-ups",
 )
@@ -144,6 +146,80 @@ def exactly(values, key):
     if len(found) != 1 or not found[0]:
         raise ReturnError("task metadata {} is not exact".format(key))
     return found[0]
+
+
+def host_repository_contract(state, task, repository_generation):
+    """Return a current host-authored publication contract when one exists.
+
+    Existing-task-disk recovery cannot restage a payload, so its new execution
+    request may omit publication fields even though the original host payload
+    remains authoritative. Pre-cutover payloads have no repository descriptor;
+    absence is therefore the explicit legacy-return signal, not an error.
+    """
+    path = state / (task + ".cloud-payload") / "repository.json"
+    if not path.exists():
+        if path.is_symlink():
+            raise ReturnError("host repository contract is redirected")
+        return None
+    body = read_regular(path, "host repository contract", 1024 * 1024)
+    try:
+        value = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReturnError("host repository contract is unreadable: {}".format(exc))
+    required = {
+        "schema", "task", "remote", "base_branch", "base_ref", "base_commit",
+        "task_branch", "bundle_base_ref", "preserved_refs",
+    }
+    remote = value.get("remote") if isinstance(value, dict) else None
+    base_branch = value.get("base_branch") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("schema") != REPOSITORY_SCHEMA
+        or value.get("task") != task
+        or not isinstance(remote, str)
+        or not SAFE_TASK.fullmatch(remote)
+        or not isinstance(base_branch, str)
+        or not SAFE_BRANCH.fullmatch(base_branch)
+        or value.get("base_ref") != "refs/remotes/{}/{}".format(remote, base_branch)
+        or value.get("base_commit") != repository_generation
+        or value.get("task_branch") != "fm/{}".format(task)
+        or not isinstance(value.get("preserved_refs"), list)
+        or len(value["preserved_refs"]) > 100
+    ):
+        raise ReturnError("host repository contract binding differs")
+    return {
+        "remote": remote,
+        "base_branch": base_branch,
+        "base_commit": repository_generation,
+    }
+
+
+def publication_contract(state, task, result, manifest):
+    fields = {"remote", "base_branch", "base_commit"}
+    present = fields.intersection(manifest)
+    if present and present != fields:
+        raise ReturnError("worker return publication contract is partial")
+    returned = None
+    if present:
+        if (
+            manifest.get("branch") != "fm/{}".format(task)
+            or manifest.get("base_commit") != result["repository_generation"]
+            or not isinstance(manifest.get("base_branch"), str)
+            or not SAFE_BRANCH.fullmatch(manifest["base_branch"])
+            or not isinstance(manifest.get("remote"), str)
+            or not SAFE_TASK.fullmatch(manifest["remote"])
+        ):
+            raise ReturnError(
+                "worker return publication contract differs from the host-authored repository contract"
+            )
+        returned = {field: manifest[field] for field in fields}
+    hosted = host_repository_contract(state, task, result["repository_generation"])
+    if returned is not None and hosted is not None and returned != hosted:
+        raise ReturnError(
+            "worker return publication contract differs from the host-authored repository contract"
+        )
+    return returned or hosted
 
 
 def fetch_return_refs(worktree, bundle, result, task, generation):
@@ -504,16 +580,11 @@ def collect(args):
     if manifest.get("report_path") != expected_report or manifest.get("status_path") != expected_status:
         raise ReturnError("worker return authorized paths differ from the local task contract")
     mode = exactly(values, "mode")
+    publication = None
     if kind == "ship" and mode == "direct-PR":
-        if (
-            manifest.get("branch") != "fm/{}".format(args.task)
-            or manifest.get("base_commit") != result["repository_generation"]
-            or not isinstance(manifest.get("base_branch"), str)
-            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}", manifest["base_branch"])
-            or not isinstance(manifest.get("remote"), str)
-            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", manifest["remote"])
-        ):
-            raise ReturnError("worker return publication contract differs from the host-authored repository contract")
+        if manifest.get("branch") != "fm/{}".format(args.task):
+            raise ReturnError("worker return task branch differs from the local task contract")
+        publication = publication_contract(state, args.task, result, manifest)
     data_root = home / "data"
     data_dir = data_root / args.task
     check_directory(data_root)
@@ -561,7 +632,7 @@ def collect(args):
         and (kind != "ship" or int(result.get("outcome_commits", 0)) > 0)
     )
     if succeeded:
-        if kind == "ship" and mode == "direct-PR":
+        if kind == "ship" and mode == "direct-PR" and publication is not None:
             terminal = "working: cloud outcome returned to local custody; host publication pending"
         else:
             terminal = "done: cloud outcome returned to local custody"

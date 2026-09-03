@@ -68,6 +68,9 @@ SECONDMATE_BUNDLE_NAME = re.compile(r"^bundle-[0-9]{8}-([0-9a-f]{64})\.bundle$")
 SECONDMATE_MAX_MESSAGE_BYTES = 256 * 1024
 SECONDMATE_MAX_BUNDLE_BYTES = 256 * 1024 * 1024
 SECONDMATE_MAX_STATE_BYTES = 16 * 1024 * 1024
+AZURE_AUTHOR_REPOSITORY_SCHEMA = "fm.azure-author-repository/v1"
+AZURE_AUTHOR_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+AZURE_AUTHOR_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
 
 
 class AuthorityError(RuntimeError):
@@ -195,6 +198,69 @@ def worktree_evidence(task, values):
     return "{}\0{}\0{}".format(worktree, common.resolve(), git(worktree, "rev-parse", "HEAD")).encode(), worktree
 
 
+def host_publication_contract(home, task, repository_generation):
+    path = home / "state" / (task + ".cloud-payload") / "repository.json"
+    if not path.exists():
+        if path.is_symlink():
+            raise AuthorityError("cloud return host repository contract is redirected")
+        return None
+    if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 1024 * 1024:
+        raise AuthorityError("cloud return host repository contract is unavailable")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AuthorityError("cloud return host repository contract is unreadable: {}".format(exc))
+    required = {
+        "schema", "task", "remote", "base_branch", "base_ref", "base_commit",
+        "task_branch", "bundle_base_ref", "preserved_refs",
+    }
+    remote = value.get("remote") if isinstance(value, dict) else None
+    base_branch = value.get("base_branch") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("schema") != AZURE_AUTHOR_REPOSITORY_SCHEMA
+        or value.get("task") != task
+        or not isinstance(remote, str)
+        or not AZURE_AUTHOR_ID.fullmatch(remote)
+        or not isinstance(base_branch, str)
+        or not AZURE_AUTHOR_BRANCH.fullmatch(base_branch)
+        or value.get("base_ref") != "refs/remotes/{}/{}".format(remote, base_branch)
+        or value.get("base_commit") != repository_generation
+        or value.get("task_branch") != "fm/{}".format(task)
+        or not isinstance(value.get("preserved_refs"), list)
+        or len(value["preserved_refs"]) > 100
+    ):
+        raise AuthorityError("cloud return host repository contract binding differs")
+    return {
+        "remote": remote,
+        "base_branch": base_branch,
+        "base_commit": repository_generation,
+    }
+
+
+def return_publication_contract(home, task, repository_generation, manifest):
+    fields = {"remote", "base_branch", "base_commit"}
+    present = fields.intersection(manifest)
+    if present and present != fields:
+        raise AuthorityError("cloud return host-publication binding is partial")
+    returned = None
+    if present:
+        if (
+            manifest.get("base_commit") != repository_generation
+            or not isinstance(manifest.get("base_branch"), str)
+            or not AZURE_AUTHOR_BRANCH.fullmatch(manifest["base_branch"])
+            or not isinstance(manifest.get("remote"), str)
+            or not AZURE_AUTHOR_ID.fullmatch(manifest["remote"])
+        ):
+            raise AuthorityError("cloud return host-publication binding differs")
+        returned = {field: manifest[field] for field in fields}
+    hosted = host_publication_contract(home, task, repository_generation)
+    if returned is not None and hosted is not None and returned != hosted:
+        raise AuthorityError("cloud return host-publication binding differs")
+    return returned or hosted
+
+
 def cloud_return_evidence(
     home, task, generation, assignment, kind, mode, worktree, repository_generation,
 ):
@@ -260,15 +326,11 @@ def cloud_return_evidence(
     for field, value in manifest_expected.items():
         if manifest_value.get(field) != value:
             raise AuthorityError("cloud return manifest {} binding differs".format(field))
+    publication = None
     if kind == "ship" and mode == "direct-PR":
-        if (
-            manifest_value.get("base_commit") != repository_generation
-            or not isinstance(manifest_value.get("base_branch"), str)
-            or not manifest_value["base_branch"]
-            or not isinstance(manifest_value.get("remote"), str)
-            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", manifest_value["remote"])
-        ):
-            raise AuthorityError("cloud return host-publication binding differs")
+        publication = return_publication_contract(
+            home, task, repository_generation, manifest_value,
+        )
     artifacts = manifest_value.get("artifacts")
     if not isinstance(artifacts, dict):
         raise AuthorityError("cloud return manifest artifact bindings are malformed")
@@ -281,6 +343,7 @@ def cloud_return_evidence(
         == "working: cloud outcome returned to local custody; host publication pending"
         and kind == "ship"
         and mode == "direct-PR"
+        and publication is not None
     )
     if not status_lines or (not re.match(r"^(done|failed):", status_lines[-1]) and not publication_pending):
         raise AuthorityError("cloud return has no local custody status")

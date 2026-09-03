@@ -11,6 +11,7 @@ make_return_case() {  # <name> <id> <kind> <report yes|no|empty> <scratch yes|no
   local name=$1 id=$2 kind=$3 report=$4 scratch=$5 commit=$6
   local visuals=${7:-no}
   local mode=${8:-local-only}
+  local publication=${9:-current}
   local root home repo worker state
   root=$(fm_test_tmproot "fm-cloud-result-$name")
   home="$root/home"
@@ -23,7 +24,7 @@ make_return_case() {  # <name> <id> <kind> <report yes|no|empty> <scratch yes|no
   git clone --quiet "$repo" "$worker/task/repo"
   fm_git_identity "$worker/task/repo"
   git -C "$worker/task/repo" checkout --quiet --detach
-  python3 - "$ROOT/bin/fm-worker-supervisor.py" "$root" "$id" "$kind" "$report" "$scratch" "$commit" "$visuals" "$mode" <<'PY'
+  python3 - "$ROOT/bin/fm-worker-supervisor.py" "$root" "$id" "$kind" "$report" "$scratch" "$commit" "$visuals" "$mode" "$publication" <<'PY'
 import hashlib
 import importlib.util
 import json
@@ -32,7 +33,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-supervisor_path, root_text, task, kind, with_report, with_scratch, with_commit, with_visuals, mode = sys.argv[1:]
+supervisor_path, root_text, task, kind, with_report, with_scratch, with_commit, with_visuals, mode, publication = sys.argv[1:]
 root = Path(root_text)
 spec = importlib.util.spec_from_file_location("worker_supervisor", supervisor_path)
 module = importlib.util.module_from_spec(spec)
@@ -102,10 +103,14 @@ request = {
         "branch": "fm/{}".format(task) if kind == "ship" else "",
     },
 }
-if kind == "ship" and mode == "direct-PR":
+if kind == "ship" and mode == "direct-PR" and publication == "current":
     request["return_contract"].update({
         "remote": "origin", "base_branch": "env/develop", "base_commit": base,
     })
+if publication == "recovery":
+    request.pop("payload_files")
+    request["existing_task_disk"] = True
+    request["supervisor_sha256"] = hashlib.sha256(Path(supervisor_path).read_bytes()).hexdigest()
 request["request_digest"] = hashlib.sha256(
     json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 ).hexdigest()
@@ -155,6 +160,30 @@ EOF
 run_collect() {  # <home> <id>
   python3 "$ROOT/bin/fm-cloud-result.py" collect --state "$1/state" --task "$2" \
     --task-generation spawn:gen-1 --assignment-generation asg-00000001
+}
+
+seed_host_repository_contract() {  # <home> <id>
+  python3 - "$1" "$2" <<'PY'
+import json
+from pathlib import Path
+import sys
+home, task = Path(sys.argv[1]), sys.argv[2]
+result = json.loads((home / "state" / (task + ".worker-result.json")).read_text())
+value = {
+    "schema": "fm.azure-author-repository/v1",
+    "task": task,
+    "remote": "origin",
+    "base_branch": "env/develop",
+    "base_ref": "refs/remotes/origin/env/develop",
+    "base_commit": result["repository_generation"],
+    "task_branch": "fm/" + task,
+    "bundle_base_ref": "refs/fm-cloud-payload/{}/fixture/base".format(task),
+    "preserved_refs": [],
+}
+path = home / "state" / (task + ".cloud-payload") / "repository.json"
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+PY
 }
 
 test_ship_success_and_replay() {
@@ -223,6 +252,69 @@ evidence = module.cloud_return_evidence(
 assert evidence and b'"terminal":"working: cloud outcome returned' in evidence
 PY
   pass "direct-PR collection retains one bound working state until trusted host publication"
+}
+
+test_existing_disk_return_uses_the_retained_host_publication_contract() {
+  local record root home repo id out
+  id=cloud-return-existing-disk
+  record=$(make_return_case existing-disk "$id" ship yes no yes no direct-PR recovery)
+  IFS='|' read -r root home repo <<EOF
+$record
+EOF
+  seed_host_repository_contract "$home" "$id"
+
+  out=$(run_collect "$home" "$id" 2>&1) \
+    || fail "existing-disk return should recover its retained host publication contract: $out"
+  assert_contains "$out" 'working: cloud outcome returned to local custody; host publication pending' \
+    "existing-disk return was not retained for host publication"
+  python3 - "$home/data/$id/cloud-return.json" <<'PY' \
+    || fail "existing-disk return manifest was rewritten outside its digest binding"
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert not {"remote", "base_branch", "base_commit"}.intersection(value), value
+PY
+  python3 - "$ROOT/bin/fm-worker-authority.py" "$home" "$repo" "$id" <<'PY' \
+    || fail "existing-disk return was not accepted from its retained host contract"
+import importlib.util, json, pathlib, sys
+spec = importlib.util.spec_from_file_location("worker_authority", sys.argv[1])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+home, repo, task = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4]
+result = json.loads((home / "state" / (task + ".worker-result.json")).read_text())
+evidence = module.cloud_return_evidence(
+    home, task, "spawn:gen-1", "asg-00000001", "ship", "direct-PR", repo,
+    result["repository_generation"],
+)
+assert evidence and b'"terminal":"working: cloud outcome returned' in evidence
+PY
+  pass "existing-task-disk return recovers publication from the retained host contract"
+}
+
+test_pre_cutover_direct_pr_return_keeps_its_legacy_terminal() {
+  local record root home repo id out
+  id=cloud-return-pre-cutover
+  record=$(make_return_case pre-cutover "$id" ship yes no yes no direct-PR legacy)
+  IFS='|' read -r root home repo <<EOF
+$record
+EOF
+
+  out=$(run_collect "$home" "$id" 2>&1) \
+    || fail "pre-cutover direct-PR return should retain legacy collection: $out"
+  assert_contains "$out" 'done: cloud outcome returned to local custody' \
+    "pre-cutover return was stranded behind host publication"
+  python3 - "$ROOT/bin/fm-worker-authority.py" "$home" "$repo" "$id" <<'PY' \
+    || fail "pre-cutover direct-PR return was not accepted as legacy local custody"
+import importlib.util, json, pathlib, sys
+spec = importlib.util.spec_from_file_location("worker_authority", sys.argv[1])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+home, repo, task = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4]
+result = json.loads((home / "state" / (task + ".worker-result.json")).read_text())
+evidence = module.cloud_return_evidence(
+    home, task, "spawn:gen-1", "asg-00000001", "ship", "direct-PR", repo,
+    result["repository_generation"],
+)
+assert evidence and b'"terminal":"done: cloud outcome returned' in evidence
+PY
+  pass "pre-cutover direct-PR return remains collectable without invented publication fields"
 }
 
 test_ship_materializes_an_already_checked_out_task_branch() {
@@ -645,7 +737,7 @@ test_monitor_retries_release_and_removes_credentials() {
   local record root home repo id out subscription
   id=cloud-return-release
   subscription=11111111-1111-4111-8111-111111111111
-  record=$(make_return_case release-retry "$id" ship yes no yes)
+  record=$(make_return_case release-retry "$id" ship yes no yes no direct-PR legacy)
   IFS='|' read -r root home repo <<EOF
 $record
 EOF
@@ -704,11 +796,15 @@ SH
   assert_contains "$out" "assignment is released" "release did not converge to complete"
   assert_absent "$home/state/$id.cloud-account/auth.json" "released return leaked its staged credential"
   assert_absent "$home/state/$id.worker-result.json" "released return kept stale convergence state"
-  pass "release retries idempotently and frees the account state after local custody"
+  assert_not_contains "$out" "host publication is not complete" \
+    "pre-cutover return was sent through the new host publication lane"
+  pass "pre-cutover release retries idempotently and frees account state without publication"
 }
 
 test_ship_success_and_replay
 test_direct_pr_ship_waits_for_host_publication
+test_existing_disk_return_uses_the_retained_host_publication_contract
+test_pre_cutover_direct_pr_return_keeps_its_legacy_terminal
 test_ship_materializes_an_already_checked_out_task_branch
 test_scout_success_with_uncommitted_scratch
 test_terminal_status_stays_last_on_replay

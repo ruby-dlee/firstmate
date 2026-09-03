@@ -80,8 +80,10 @@ fm_cloud_state_lease_paths() {  # <state_dir> <task_id>
 }
 # -----------------------------------------------------------------------------
 
-# Remove one task's cloud state at the end of its life. Args: state_dir task_id
-fm_cloud_state_remove() {
+# Remove only provider credentials after execution authority has ended. Host-side
+# publication may still need the payload, result, and lease state for a retry,
+# so that boundary must not use the task-end remover below.
+fm_cloud_state_remove_credentials() {  # <state_dir> <task_id>
   local state=${1:?cloud state directory is required} id=${2:?task id is required}
   local path
   while IFS= read -r path; do
@@ -89,6 +91,23 @@ fm_cloud_state_remove() {
   done <<EOF
 $(fm_cloud_state_credential_paths "$state" "$id")
 EOF
+  while IFS= read -r path; do
+    if [ -e "$path" ]; then
+      echo "error: $id could not remove its staged provider credential at $path" >&2
+    fi
+  done <<EOF
+$(fm_cloud_state_credential_paths "$state" "$id")
+EOF
+  # Callers converge under `set -e`; credential cleanup must be loud without
+  # aborting the remaining host-custody work.
+  return 0
+}
+
+# Remove one task's cloud state at the end of its life. Args: state_dir task_id
+fm_cloud_state_remove() {
+  local state=${1:?cloud state directory is required} id=${2:?task id is required}
+  local path
+  fm_cloud_state_remove_credentials "$state" "$id"
   while IFS= read -r path; do
     rm -rf "$path" || true
   done <<EOF
@@ -101,13 +120,6 @@ $(fm_cloud_state_dispatch_paths "$state" "$id")
 $(fm_cloud_state_result_paths "$state" "$id")
 $(fm_cloud_state_lease_paths "$state" "$id")
 EOF
-  # Callers run under `set -e` and finish removing task metadata AFTER this.
-  # Aborting there would leave a half-torn-down task AND the credential, so a
-  # failure is reported loudly and teardown continues.
-  if [ -e "$state/$id.cloud-account/auth.json" ]; then
-    echo "error: $id could not remove its staged provider credential at $state/$id.cloud-account/auth.json" >&2
-    return 0
-  fi
   return 0
 }
 

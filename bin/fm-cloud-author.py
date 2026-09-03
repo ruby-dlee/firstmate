@@ -609,6 +609,68 @@ def write_done(status_path, url):
         atomic_write(status_path, body)
 
 
+def host_repository_publication(state, task, repository_generation):
+    path = state / (task + ".cloud-payload") / "repository.json"
+    if not path.exists():
+        if path.is_symlink():
+            raise AuthorError("host repository contract is redirected")
+        return None
+    body = read_regular(path, "host repository contract", 1024 * 1024)
+    try:
+        value = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AuthorError("host repository contract is unreadable: {}".format(exc))
+    required = {
+        "schema", "task", "remote", "base_branch", "base_ref", "base_commit",
+        "task_branch", "bundle_base_ref", "preserved_refs",
+    }
+    remote = value.get("remote") if isinstance(value, dict) else None
+    base_branch = value.get("base_branch") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("schema") != REPOSITORY_SCHEMA
+        or value.get("task") != task
+        or not isinstance(remote, str)
+        or not SAFE_TASK.fullmatch(remote)
+        or not isinstance(base_branch, str)
+        or not SAFE_BRANCH.fullmatch(base_branch)
+        or value.get("base_ref") != "refs/remotes/{}/{}".format(remote, base_branch)
+        or value.get("base_commit") != repository_generation
+        or value.get("task_branch") != "fm/{}".format(task)
+        or not isinstance(value.get("preserved_refs"), list)
+        or len(value["preserved_refs"]) > 100
+    ):
+        raise AuthorError("host repository contract binding differs")
+    return {
+        "remote": remote,
+        "base_branch": base_branch,
+        "base_commit": repository_generation,
+    }
+
+
+def return_publication(state, task, repository_generation, manifest):
+    fields = {"remote", "base_branch", "base_commit"}
+    present = fields.intersection(manifest)
+    if present and present != fields:
+        raise AuthorError("returned publication contract is partial")
+    returned = None
+    if present:
+        returned = {field: manifest[field] for field in fields}
+        if returned["base_commit"] != repository_generation:
+            raise AuthorError("returned publication base commit differs from its repository generation")
+        validate_branch(returned["base_branch"], "returned base branch")
+        if not isinstance(returned["remote"], str) or not SAFE_TASK.fullmatch(returned["remote"]):
+            raise AuthorError("returned publication remote is malformed")
+    hosted = host_repository_publication(state, task, repository_generation)
+    if returned is not None and hosted is not None and returned != hosted:
+        raise AuthorError("returned publication contract differs from its host repository contract")
+    publication = returned or hosted
+    if publication is None:
+        raise AuthorError("host publication contract is absent for this legacy return")
+    return publication
+
+
 def publish(args):
     if not SAFE_TASK.fullmatch(args.task):
         raise AuthorError("task identity is malformed")
@@ -638,18 +700,15 @@ def publish(args):
     ):
         raise AuthorError("cloud return manifest is not one exact ship outcome")
     branch = validate_branch(manifest.get("branch"), "returned task branch")
-    base_branch = validate_branch(manifest.get("base_branch"), "returned base branch")
-    remote = manifest.get("remote")
-    if not isinstance(remote, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", remote):
-        raise AuthorError("returned publication remote is malformed")
     if branch != "fm/{}".format(args.task):
         raise AuthorError("returned task branch is not exact")
     tip = manifest.get("outcome_tip")
     base = manifest.get("repository_generation")
     if not SHA40.fullmatch(str(tip)) or not SHA40.fullmatch(str(base)):
         raise AuthorError("returned publication commits are malformed")
-    if manifest.get("base_commit") != base:
-        raise AuthorError("returned publication base commit differs from its repository generation")
+    publication = return_publication(state, args.task, base, manifest)
+    base_branch = publication["base_branch"]
+    remote = publication["remote"]
     local_tip = git(worktree, "rev-parse", "--verify", "refs/heads/{}".format(branch)).stdout.decode().strip()
     if local_tip != tip:
         raise AuthorError("host task branch moved away from the exact returned tip")

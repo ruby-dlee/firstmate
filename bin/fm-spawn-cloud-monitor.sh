@@ -324,6 +324,11 @@ publish_author_return() {
   status_line=$(grep -E '^(working|done|failed):' "$STATE/$ID.status" 2>/dev/null | tail -1)
   case "$status_line" in
     failed:*) return 0 ;;
+    'done: cloud outcome returned to local custody')
+      # A pre-cutover return has no host publication contract. Its historical
+      # terminal remains authoritative; do not strand it by inventing fields.
+      return 0
+      ;;
     'working: cloud outcome returned to local custody; host publication pending'|done:\ PR\ *) : ;;
     *)
       echo "cloud-crewmate $ID: returned ship has no exact host-publication status; retaining it for retry"
@@ -339,11 +344,11 @@ publish_author_return() {
   return 0
 }
 
-remove_released_credential() {
+remove_released_credentials() {
   # Once the controller says complete, no later retry may execute on the
   # worker. Remove provider material immediately even if forge publication
   # must retry; the result, payload manifest, and outcome bundle remain.
-  rm -f "$STATE/$ID.cloud-account/auth.json" "$STATE/$ID.cloud-account/settings.json"
+  fm_cloud_state_remove_credentials "$STATE" "$ID"
 }
 
 finalize_authorized_return() {
@@ -378,7 +383,7 @@ finalize_authorized_return() {
       ;;
     releasing) : ;;
     complete)
-      remove_released_credential
+      remove_released_credentials
       publish_author_return || return 1
       fm_cloud_state_remove "$STATE" "$ID"
       echo "cloud-crewmate $ID: return is finalized locally and the worker assignment is released"
@@ -398,7 +403,7 @@ finalize_authorized_return() {
     echo "cloud-crewmate $ID: worker release is '$status'; retrying until account and capacity are free"
     return 1
   fi
-  remove_released_credential
+  remove_released_credentials
   publish_author_return || return 1
   fm_cloud_state_remove "$STATE" "$ID"
   echo "cloud-crewmate $ID: return is finalized locally and the worker assignment is released"

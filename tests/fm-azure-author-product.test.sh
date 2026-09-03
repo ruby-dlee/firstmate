@@ -265,11 +265,12 @@ assert_contains "$publish_out" 'base commit differs' \
 if git --git-dir="$REMOTE" show-ref --verify --quiet "refs/heads/fm/$ID"; then
   fail "host publication pushed before verifying the returned base contract"
 fi
-python3 - "$HOME_DIR/data/$ID/cloud-return.json" "$BASE" <<'PY'
+python3 - "$HOME_DIR/data/$ID/cloud-return.json" <<'PY'
 import json, sys
-path, base = sys.argv[1:]
+path = sys.argv[1]
 value = json.load(open(path))
-value["base_commit"] = base
+for field in ("remote", "base_branch", "base_commit"):
+    value.pop(field)
 open(path, "w").write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
 PY
 
@@ -296,6 +297,6 @@ test "$(grep -c '^done: PR https://github.com/ruby-labs/b2c/pull/99$' "$HOME_DIR
   || fail "host publication retry duplicated terminal status"
 assert_grep 'Crosscheck must stay untouched.' "$HOME_DIR/config/crosscheck-azure.json" \
   "Azure author preparation or publication changed Crosscheck configuration"
-pass "trusted host publication pushes one exact fast-forward, recovers create retries, and leaves Crosscheck untouched"
+pass "trusted host publication recovers retained-disk contracts and create retries without touching Crosscheck"
 
 echo "# fm-azure-author-product.test.sh: all assertions passed"

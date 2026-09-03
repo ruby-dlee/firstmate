@@ -10,6 +10,7 @@ fm_git_identity
 make_return_case() {  # <name> <id> <kind> <report yes|no|empty> <scratch yes|no> <commit yes|no>
   local name=$1 id=$2 kind=$3 report=$4 scratch=$5 commit=$6
   local visuals=${7:-no}
+  local mode=${8:-local-only}
   local root home repo worker state
   root=$(fm_test_tmproot "fm-cloud-result-$name")
   home="$root/home"
@@ -22,7 +23,7 @@ make_return_case() {  # <name> <id> <kind> <report yes|no|empty> <scratch yes|no
   git clone --quiet "$repo" "$worker/task/repo"
   fm_git_identity "$worker/task/repo"
   git -C "$worker/task/repo" checkout --quiet --detach
-  python3 - "$ROOT/bin/fm-worker-supervisor.py" "$root" "$id" "$kind" "$report" "$scratch" "$commit" "$visuals" <<'PY'
+  python3 - "$ROOT/bin/fm-worker-supervisor.py" "$root" "$id" "$kind" "$report" "$scratch" "$commit" "$visuals" "$mode" <<'PY'
 import hashlib
 import importlib.util
 import json
@@ -31,7 +32,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-supervisor_path, root_text, task, kind, with_report, with_scratch, with_commit, with_visuals = sys.argv[1:]
+supervisor_path, root_text, task, kind, with_report, with_scratch, with_commit, with_visuals, mode = sys.argv[1:]
 root = Path(root_text)
 spec = importlib.util.spec_from_file_location("worker_supervisor", supervisor_path)
 module = importlib.util.module_from_spec(spec)
@@ -101,6 +102,10 @@ request = {
         "branch": "fm/{}".format(task) if kind == "ship" else "",
     },
 }
+if kind == "ship" and mode == "direct-PR":
+    request["return_contract"].update({
+        "remote": "origin", "base_branch": "env/develop", "base_commit": base,
+    })
 request["request_digest"] = hashlib.sha256(
     json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 ).hexdigest()
@@ -139,6 +144,7 @@ PY
 window=fm-$id
 worktree=$repo
 kind=$kind
+mode=$mode
 placement=azure
 generation_id=spawn:gen-1
 report_required=1
@@ -176,6 +182,47 @@ EOF
   test "$(grep -c '^done: cloud outcome returned to local custody$' "$home/state/$id.status")" -eq 1 \
     || fail "duplicate replay appended a second terminal status"
   pass "ship return reconstructs and preserves its continued branch, transports deliverables, synthesizes status, and replays idempotently"
+}
+
+test_direct_pr_ship_waits_for_host_publication() {
+  local record root home repo id out
+  id=cloud-return-direct-pr
+  record=$(make_return_case direct-pr "$id" ship yes no yes no direct-PR)
+  IFS='|' read -r root home repo <<EOF
+$record
+EOF
+  out=$(run_collect "$home" "$id" 2>&1) \
+    || fail "direct-PR ship return should localize before host publication: $out"
+  assert_contains "$out" 'working: cloud outcome returned to local custody; host publication pending' \
+    "direct-PR collection falsely reported terminal completion"
+  assert_grep 'working: cloud outcome returned to local custody; host publication pending' \
+    "$home/state/$id.status" "direct-PR custody status was not persisted"
+  assert_no_grep 'done: cloud outcome returned to local custody' "$home/state/$id.status" \
+    "direct-PR collection claimed done before host publication"
+  python3 - "$home/data/$id/cloud-return.json" "$id" <<'PY' \
+    || fail "direct-PR return lost its host publication contract"
+import json, sys
+value = json.load(open(sys.argv[1]))
+assert value["task"] == sys.argv[2]
+assert value["branch"] == "fm/" + sys.argv[2]
+assert value["remote"] == "origin"
+assert value["base_branch"] == "env/develop"
+assert value["base_commit"] == value["repository_generation"]
+PY
+  python3 - "$ROOT/bin/fm-worker-authority.py" "$home" "$repo" "$id" <<'PY' \
+    || fail "direct-PR pending publication was not accepted as exact local custody"
+import importlib.util, json, pathlib, sys
+spec = importlib.util.spec_from_file_location("worker_authority", sys.argv[1])
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+home, repo, task = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), sys.argv[4]
+result = json.loads((home / "state" / (task + ".worker-result.json")).read_text())
+evidence = module.cloud_return_evidence(
+    home, task, "spawn:gen-1", "asg-00000001", "ship", "direct-PR", repo,
+    result["repository_generation"],
+)
+assert evidence and b'"terminal":"working: cloud outcome returned' in evidence
+PY
+  pass "direct-PR collection retains one bound working state until trusted host publication"
 }
 
 test_ship_materializes_an_already_checked_out_task_branch() {
@@ -428,8 +475,8 @@ spec.loader.exec_module(module)
 home = Path(home_text)
 result = json.loads((home / "state" / (task + ".worker-result.json")).read_text())
 evidence = module.cloud_return_evidence(
-    home, task, "spawn:gen-1", "asg-00000001", "ship", Path(repo_text),
-    result["repository_generation"],
+    home, task, "spawn:gen-1", "asg-00000001", "ship", "local-only",
+    Path(repo_text), result["repository_generation"],
 )
 assert evidence and b'"outcome_commits":1' in evidence, evidence
 PY
@@ -470,6 +517,20 @@ status.write_text("failed: actual returned report was invalid\n", encoding="utf-
 os.environ["FAKE_TMUX_STATE"] = "present"
 evidence = module.endpoint_evidence(home, "task-x", values)
 assert b"cloud-return-localized" in evidence, evidence
+values.update({"kind": ["ship"], "mode": ["direct-PR"]})
+status.write_text(
+    "working: cloud outcome returned to local custody; host publication pending\n",
+    encoding="utf-8",
+)
+evidence = module.endpoint_evidence(home, "task-x", values)
+assert b"cloud-return-localized" in evidence, evidence
+values["mode"] = ["local-only"]
+try:
+    module.endpoint_evidence(home, "task-x", values)
+except module.AuthorityError:
+    pass
+else:
+    raise AssertionError("a local-only task borrowed the direct-PR pending authority")
 status.write_text("working: return not localized yet\n", encoding="utf-8")
 try:
     module.endpoint_evidence(home, "task-x", values)
@@ -569,8 +630,8 @@ home = Path(home_text)
 result = json.loads((home / "state" / (task + ".worker-result.json")).read_text())
 try:
     module.cloud_return_evidence(
-        home, task, "spawn:gen-1", "asg-00000001", "scout", Path(repo_text),
-        result["repository_generation"],
+        home, task, "spawn:gen-1", "asg-00000001", "scout", "local-only",
+        Path(repo_text), result["repository_generation"],
     )
 except module.AuthorityError as exc:
     assert "scratch custody is absent" in str(exc), exc
@@ -647,6 +708,7 @@ SH
 }
 
 test_ship_success_and_replay
+test_direct_pr_ship_waits_for_host_publication
 test_ship_materializes_an_already_checked_out_task_branch
 test_scout_success_with_uncommitted_scratch
 test_terminal_status_stays_last_on_replay

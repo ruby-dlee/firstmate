@@ -102,10 +102,14 @@ def read_request(path):
         raise SupervisorError("ordinary execution cannot select a recovery supervisor")
     return_contract = request.get("return_contract")
     if return_contract is not None:
-        if not isinstance(return_contract, dict) or set(return_contract) != {
+        base_return_fields = {
             "schema", "kind", "report_required", "report_path", "status_path",
             "visuals_path", "branch",
-        }:
+        }
+        publication_fields = {"remote", "base_branch", "base_commit"}
+        if not isinstance(return_contract, dict) or set(return_contract) not in (
+            base_return_fields, base_return_fields.union(publication_fields),
+        ):
             raise SupervisorError("execution return contract is malformed")
         if return_contract.get("schema") != "fm.worker-return-contract/v1":
             raise SupervisorError("execution return contract schema is not supported")
@@ -124,6 +128,16 @@ def read_request(path):
         if return_contract["kind"] == "ship":
             if not isinstance(branch, str) or not branch.startswith("fm/") or not SAFE_ID.fullmatch(branch[3:]):
                 raise SupervisorError("execution return branch is malformed")
+            if publication_fields.issubset(return_contract):
+                if (
+                    not isinstance(return_contract.get("remote"), str)
+                    or not SAFE_ID.fullmatch(return_contract["remote"])
+                    or not isinstance(return_contract.get("base_branch"), str)
+                    or not return_contract["base_branch"]
+                    or not isinstance(return_contract.get("base_commit"), str)
+                    or return_contract["base_commit"] != request["repository_generation"]
+                ):
+                    raise SupervisorError("execution publication contract is malformed")
         elif branch != "":
             raise SupervisorError("a scout return contract must not name a task branch")
         if not outcome_expected:
@@ -192,6 +206,10 @@ MAX_RETURN_STATUS_BYTES = 4 * 1024 * 1024
 MAX_RETURN_VISUAL_BYTES = 20 * 1024 * 1024
 MAX_RETURN_VISUAL_ENTRIES = 512
 MAX_RETURN_SCRATCH_BYTES = 128 * 1024 * 1024
+MAX_CONTEXT_BYTES = 33 * 1024 * 1024
+MAX_CONTEXT_ENTRIES = 256
+REPOSITORY_CONTEXT_SCHEMA = "fm.azure-author-repository/v1"
+AUTHOR_CONTEXT_SCHEMA = "fm.azure-author-context/v1"
 
 # Every bounded step that runs OUTSIDE the wall, named once and used at the
 # call site, so the budget below is the same number the code actually spends.
@@ -289,6 +307,163 @@ def extract_staged_archive(body, manifest, target, label):
         raise SupervisorError("{} staging archive lacks bound files: {}".format(label, ", ".join(missing)))
 
 
+def _read_staged_json(path, label, maximum=1024 * 1024):
+    if path.is_symlink() or not path.is_file():
+        raise SupervisorError("{} is absent or redirected".format(label))
+    body = path.read_bytes()
+    if not body or len(body) > maximum:
+        raise SupervisorError("{} has an invalid byte count".format(label))
+    try:
+        value = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SupervisorError("{} is unreadable: {}".format(label, exc))
+    if not isinstance(value, dict):
+        raise SupervisorError("{} is malformed".format(label))
+    return value
+
+
+def _stage_author_context(staging, worktree, request):
+    context = _read_staged_json(staging / "context.json", "author context manifest")
+    if (
+        context.get("schema") != AUTHOR_CONTEXT_SCHEMA
+        or context.get("task") != request["task"]
+        or context.get("base_commit") != request["repository_generation"]
+        or context.get("task_branch") != "fm/{}".format(request["task"])
+    ):
+        raise SupervisorError("author context manifest binding differs")
+    entries = context.get("entries")
+    if not isinstance(entries, list) or len(entries) > MAX_CONTEXT_ENTRIES:
+        raise SupervisorError("author context manifest entries are malformed")
+    expected = {}
+    total = 0
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"path", "bytes", "sha256"}:
+            raise SupervisorError("author context entry is malformed")
+        name = entry.get("path")
+        relative = Path(name) if isinstance(name, str) else Path("/")
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            raise SupervisorError("author context path is unsafe")
+        if not all(SAFE_STAGED_NAME.fullmatch(part) for part in relative.parts):
+            raise SupervisorError("author context path is unsupported")
+        size = entry.get("bytes")
+        digest_value = entry.get("sha256")
+        if (
+            not isinstance(size, int) or isinstance(size, bool) or size < 0
+            or not isinstance(digest_value, str) or not HEX.fullmatch(digest_value)
+            or name in expected
+        ):
+            raise SupervisorError("author context entry binding is malformed")
+        total += size
+        expected[name] = entry
+    if total > MAX_CONTEXT_BYTES:
+        raise SupervisorError("author context exceeds its byte bound")
+    archive_path = staging / "context.tar"
+    if archive_path.is_symlink() or not archive_path.is_file() or archive_path.stat().st_size > MAX_CONTEXT_BYTES:
+        raise SupervisorError("author context archive is absent, redirected, or oversized")
+    destination = worktree / ".fm-context"
+    if destination.exists() or destination.is_symlink():
+        if destination.is_symlink() or not destination.is_dir():
+            raise SupervisorError("author context destination is redirected")
+        shutil.rmtree(destination)
+    destination.mkdir(mode=0o700, parents=True)
+    seen = set()
+    try:
+        with tarfile.open(str(archive_path), mode="r:") as archive:
+            members = archive.getmembers()
+            if len(members) != len(expected):
+                raise SupervisorError("author context archive entry count differs")
+            for member in members:
+                if not member.isreg() or member.name not in expected:
+                    raise SupervisorError("author context archive member is unauthorized")
+                handle = archive.extractfile(member)
+                body = handle.read() if handle else b""
+                binding = expected[member.name]
+                if len(body) != binding["bytes"] or hashlib.sha256(body).hexdigest() != binding["sha256"]:
+                    raise SupervisorError("author context artifact differs from its bound digest")
+                target = destination / member.name
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                target.write_bytes(body)
+                target.chmod(0o600)
+                seen.add(member.name)
+    except tarfile.TarError as exc:
+        raise SupervisorError("author context archive is malformed: {}".format(exc))
+    if seen != set(expected):
+        raise SupervisorError("author context archive lacks a bound artifact")
+
+
+def _stage_author_repository(staging, worktree, request):
+    contract = _read_staged_json(staging / "repository.json", "author repository manifest")
+    expected_task_branch = "fm/{}".format(request["task"])
+    if (
+        contract.get("schema") != REPOSITORY_CONTEXT_SCHEMA
+        or contract.get("task") != request["task"]
+        or contract.get("base_commit") != request["repository_generation"]
+        or contract.get("task_branch") != expected_task_branch
+        or not isinstance(contract.get("base_branch"), str)
+        or not isinstance(contract.get("remote"), str)
+    ):
+        raise SupervisorError("author repository manifest binding differs")
+    base_ref = contract.get("bundle_base_ref")
+    preserved = contract.get("preserved_refs")
+    if not isinstance(base_ref, str) or not isinstance(preserved, list) or len(preserved) > 100:
+        raise SupervisorError("author repository ref manifest is malformed")
+    bundle = staging / "repo.bundle"
+    listed = subprocess.run(
+        ["git", "-C", str(worktree), "bundle", "list-heads", str(bundle)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=GIT_HEAD_TIMEOUT, check=False,
+    )
+    if listed.returncode != 0:
+        raise SupervisorError("staged repository bundle heads are unreadable")
+    heads = {}
+    for line in listed.stdout.decode("utf-8", errors="strict").splitlines():
+        commit, separator, reference = line.partition(" ")
+        if not separator or reference in heads:
+            raise SupervisorError("staged repository bundle heads are malformed")
+        heads[reference] = commit
+    if heads.get(base_ref) != request["repository_generation"]:
+        raise SupervisorError("staged repository base ref differs from the bound generation")
+    fetch_specs = ["+{}:refs/fm-payload/base".format(base_ref)]
+    for index, item in enumerate(preserved, start=1):
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"source_ref", "label", "bundle_ref", "commit"}
+            or heads.get(item.get("bundle_ref")) != item.get("commit")
+        ):
+            raise SupervisorError("staged preserved repository ref differs")
+        fetch_specs.append(
+            "+{}:refs/fm-preserved/{:04d}".format(item["bundle_ref"], index)
+        )
+    repo = worktree / "repo"
+    if repo.exists():
+        if repo.is_symlink() or not repo.is_dir():
+            raise SupervisorError("staged repository target is not a removable directory")
+        shutil.rmtree(repo)
+    repo.mkdir(mode=0o700)
+    initialized = subprocess.run(
+        ["git", "-C", str(repo), "init", "--quiet"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=GIT_HEAD_TIMEOUT, check=False,
+    )
+    if initialized.returncode != 0:
+        raise SupervisorError("staged repository could not be initialized")
+    fetched = git_in(repo, "fetch", "--quiet", "--no-tags", str(bundle), *fetch_specs, timeout=REPO_CLONE_TIMEOUT)
+    if fetched.returncode != 0:
+        raise SupervisorError(
+            "staged repository bundle fetch failed: {}".format(
+                fetched.stderr.decode("utf-8", errors="replace")[-500:]
+            )
+        )
+    checked_out = git_in(
+        repo, "checkout", "--quiet", "-b", expected_task_branch,
+        request["repository_generation"], timeout=GIT_HEAD_TIMEOUT,
+    )
+    if checked_out.returncode != 0:
+        raise SupervisorError("staged task branch could not be checked out")
+    _stage_author_context(staging, worktree, request)
+    return repo
+
+
 def stage_payload(request, worktree, account_home):
     """Materialize a new payload or bind an explicitly retained task disk."""
     if request.get("existing_task_disk"):
@@ -318,26 +493,30 @@ def stage_payload(request, worktree, account_home):
     extract_staged_archive(fetch_archive("payload"), payload_manifest, staging, "payload")
     account_target = account_home / "pi-agent"
     extract_staged_archive(fetch_archive("account"), account_manifest, account_target, "account")
-    repo = worktree / "repo"
-    if repo.exists():
-        # Explicit retained-disk recovery returned above and can never reach
-        # this remover. Ordinary staging gets here only for the repository its
-        # own payload is replacing, typically debris from interrupted staging.
-        if repo.is_symlink() or not repo.is_dir():
-            raise SupervisorError("staged repository target is not a removable directory")
-        shutil.rmtree(repo)
-    bundle = staging / "repo.bundle"
-    clone = subprocess.run(
-        ["git", "clone", "--quiet", str(bundle), str(repo)],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        timeout=REPO_CLONE_TIMEOUT, check=False,
-    )
-    if clone.returncode != 0:
-        raise SupervisorError(
-            "staged repository bundle clone failed: {}".format(
-                clone.stderr.decode("utf-8", errors="replace")[-500:]
-            )
+    if (staging / "repository.json").exists():
+        repo = _stage_author_repository(staging, worktree, request)
+    else:
+        # Compatibility for retained assignments staged before the labelled
+        # author repository contract landed. New author spawns always take the
+        # manifest branch above; secondmate compartments keep this historical
+        # single-HEAD payload because their session protocol owns its own refs.
+        repo = worktree / "repo"
+        if repo.exists():
+            if repo.is_symlink() or not repo.is_dir():
+                raise SupervisorError("staged repository target is not a removable directory")
+            shutil.rmtree(repo)
+        bundle = staging / "repo.bundle"
+        clone = subprocess.run(
+            ["git", "clone", "--quiet", str(bundle), str(repo)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=REPO_CLONE_TIMEOUT, check=False,
         )
+        if clone.returncode != 0:
+            raise SupervisorError(
+                "staged repository bundle clone failed: {}".format(
+                    clone.stderr.decode("utf-8", errors="replace")[-500:]
+                )
+            )
     head = git_in(repo, "rev-parse", "HEAD", timeout=GIT_HEAD_TIMEOUT)
     if head.returncode != 0 or head.stdout.decode().strip() != request["repository_generation"]:
         raise SupervisorError("staged repository head differs from the bound repository generation")
@@ -623,6 +802,9 @@ def collect_outcome(request, repo, worktree_root):
             "uncommitted_changes": bool(dirty.stdout.strip()),
             "artifacts": manifest_artifacts,
         }
+        for field in ("remote", "base_branch", "base_commit"):
+            if field in contract:
+                manifest[field] = contract[field]
         manifest_body = canonical(manifest) + b"\n"
         artifact_bodies["manifest.json"] = manifest_body
         return_commit = _return_commit(repo, base, artifact_bodies, request)

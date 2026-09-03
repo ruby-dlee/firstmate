@@ -140,15 +140,23 @@ def endpoint_evidence(home, task, values):
     # A cloud endpoint is only the local tracking monitor. Once the exact
     # digest-bound return has reached local custody it has no guest process or
     # steering authority left, and release must not wait on its own process to
-    # disappear before it can free the remote lease. The terminal status is
-    # produced only after report and branch custody, and unknown still refuses.
+    # disappear before it can free the remote lease. A direct-PR ship remains
+    # truthfully working while trusted host publication is pending; the other
+    # authorities independently prove report and branch custody. Unknown still
+    # refuses.
     placement = values.get("placement", [])
     if result.returncode == 0 and endpoint_state == "present" and placement == ["azure"]:
         status = home / "state" / (task + ".status")
         if status.is_symlink() or not status.is_file():
             raise AuthorityError("cloud endpoint authority has no local terminal custody status")
         lines = [line.strip() for line in status.read_text(encoding="utf-8").splitlines() if line.strip()]
-        if not lines or not re.match(r"^(done|failed):", lines[-1]):
+        publication_pending = (
+            lines and lines[-1]
+            == "working: cloud outcome returned to local custody; host publication pending"
+            and values.get("kind") == ["ship"]
+            and values.get("mode") == ["direct-PR"]
+        )
+        if not lines or (not re.match(r"^(done|failed):", lines[-1]) and not publication_pending):
             raise AuthorityError("cloud endpoint authority has no local terminal custody status")
         return "{}\0{}\0{}\0cloud-return-localized".format(backend, target, expected).encode()
     raise AuthorityError("endpoint authority did not prove the exact task endpoint absent or return-localized")
@@ -187,7 +195,9 @@ def worktree_evidence(task, values):
     return "{}\0{}\0{}".format(worktree, common.resolve(), git(worktree, "rev-parse", "HEAD")).encode(), worktree
 
 
-def cloud_return_evidence(home, task, generation, assignment, kind, worktree, repository_generation):
+def cloud_return_evidence(
+    home, task, generation, assignment, kind, mode, worktree, repository_generation,
+):
     """Prove local custody before releasing remote worker capacity.
 
     This is intentionally not ordinary forge landing. The returned commits
@@ -250,15 +260,30 @@ def cloud_return_evidence(home, task, generation, assignment, kind, worktree, re
     for field, value in manifest_expected.items():
         if manifest_value.get(field) != value:
             raise AuthorityError("cloud return manifest {} binding differs".format(field))
+    if kind == "ship" and mode == "direct-PR":
+        if (
+            manifest_value.get("base_commit") != repository_generation
+            or not isinstance(manifest_value.get("base_branch"), str)
+            or not manifest_value["base_branch"]
+            or not isinstance(manifest_value.get("remote"), str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", manifest_value["remote"])
+        ):
+            raise AuthorityError("cloud return host-publication binding differs")
     artifacts = manifest_value.get("artifacts")
     if not isinstance(artifacts, dict):
         raise AuthorityError("cloud return manifest artifact bindings are malformed")
     status_path = home / "state" / (task + ".status")
     if status_path.is_symlink() or not status_path.is_file():
-        raise AuthorityError("cloud return has no local terminal status")
+        raise AuthorityError("cloud return has no local custody status")
     status_lines = [line.strip() for line in status_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    if not status_lines or not re.match(r"^(done|failed):", status_lines[-1]):
-        raise AuthorityError("cloud return has no local terminal status")
+    publication_pending = (
+        status_lines and status_lines[-1]
+        == "working: cloud outcome returned to local custody; host publication pending"
+        and kind == "ship"
+        and mode == "direct-PR"
+    )
+    if not status_lines or (not re.match(r"^(done|failed):", status_lines[-1]) and not publication_pending):
+        raise AuthorityError("cloud return has no local custody status")
     commits = result.get("outcome_commits")
     if not isinstance(commits, int) or isinstance(commits, bool) or commits < 0:
         raise AuthorityError("cloud return commit count is malformed")
@@ -1065,7 +1090,9 @@ def main():
         if worker_placement == "azure":
             landing_authority = lambda: cloud_return_evidence(
                 home, args.task, generation, args.assignment_generation,
-                ordinary_kind, worktree, worker["bindings"]["repository_generation"],
+                ordinary_kind,
+                values.get("mode", [""])[0] if len(values.get("mode", [])) == 1 else "",
+                worktree, worker["bindings"]["repository_generation"],
             )
         else:
             landing_authority = lambda: landing_evidence(

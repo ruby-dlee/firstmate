@@ -4870,48 +4870,44 @@ spawn_cloud_persist_convergence_artifacts() {
     # crewmate-shaped entrypoint here could tempt a future converged dispatch
     # into running the wrong thing.
     [ "$KIND" = secondmate ] || printf '%s\n' "$CLOUD_WORKER_LAUNCH" > "$STATE/$ID.cloud-entrypoint" || exit 1
-    # Crewmate payload: the repository as a credential-free bundle of the
-    # leased worktree's exact HEAD, plus the two task files the entrypoint
-    # reads; and the provider-account material the worker stages onto its
-    # encrypted account disk. Both directories are digest-manifested into
-    # the execute request by the lifecycle, so every staged byte is verified
-    # on the guest before the entrypoint runs.
+    # Crewmate payload: a credential-free repository bundle and brief, plus
+    # the author-only labelled repository/context contract or the secondmate
+    # session files selected below; and the provider-account material the
+    # worker stages onto its encrypted account disk. Both directories are
+    # digest-manifested into the execute request by the lifecycle, so every
+    # staged byte is verified on the guest before the entrypoint runs.
     install -d -m 0700 "$STATE/$ID.cloud-payload" "$STATE/$ID.cloud-account" \
       "$STATE/$ID.cloud-outcome" || exit 1
     # The landing side of the round trip: the leased local worktree this
     # bundle came from is where the crewmate's commits come back to, and the
     # tracking monitor (which outlives the spawn) needs it by path.
     printf '%s\n' "$WT" > "$STATE/$ID.cloud-worktree" || exit 1
-    git -C "$WT" bundle create "$STATE/$ID.cloud-payload/repo.bundle" HEAD >/dev/null 2>&1 || {
-      echo "error: cloud payload repository bundle failed for $ID" >&2
-      exit 1
-    }
-    if [ -f "$DATA/$ID/brief.md" ]; then
-      if [ "$KIND" = secondmate ]; then
+    if [ "$KIND" = secondmate ]; then
+      git -C "$WT" bundle create "$STATE/$ID.cloud-payload/repo.bundle" HEAD >/dev/null 2>&1 || {
+        echo "error: cloud payload repository bundle failed for $ID" >&2
+        exit 1
+      }
+      if [ -f "$DATA/$ID/brief.md" ]; then
         cp "$DATA/$ID/brief.md" "$STATE/$ID.cloud-payload/brief.md" || exit 1
-      else
-        # The generated brief names the task home's authorized report, visual,
-        # and status paths. Those host paths do not exist on a worker. Rewrite
-        # only the exact task-home prefix into the fixed return staging root;
-        # the guest collector later accepts only the digest-bound task paths,
-        # so this does not authorize arbitrary worker files to come home.
-        python3 - "$DATA/$ID/brief.md" "$STATE/$ID.cloud-payload/brief.md" "$TASK_HOME" <<'PY' || exit 1
-from pathlib import Path
-import sys
-source, destination, task_home = sys.argv[1:]
-body = Path(source).read_bytes()
-prefix = task_home.encode()
-Path(destination).write_bytes(body.replace(prefix, b"/mnt/task/.fm-return"))
-PY
-      fi
-    elif [ "$KIND" = secondmate ] && [ -f "$WT/data/charter.md" ]; then
+      elif [ -f "$WT/data/charter.md" ]; then
       # A secondmate's standing brief is its persistent charter in the home;
       # the compartment payload carries a copy so the cloud agent's brief is
       # the same document the local launch would have read.
-      cp "$WT/data/charter.md" "$STATE/$ID.cloud-payload/brief.md" || exit 1
+        cp "$WT/data/charter.md" "$STATE/$ID.cloud-payload/brief.md" || exit 1
+      else
+        echo "error: no brief for cloud payload of $ID (looked for $DATA/$ID/brief.md)" >&2
+        exit 1
+      fi
     else
-      echo "error: no brief for cloud payload of $ID (looked for $DATA/$ID/brief.md)" >&2
-      exit 1
+      # The host author helper fetches and checks out the brief's exact current
+      # integration base, stages only explicitly referenced data artifacts,
+      # captures bounded open-PR/preserved-ref context when requested, labels
+      # every bundled ref, and rewrites the brief to the credentialless return
+      # and host-publication contract. The lifecycle then binds every produced
+      # byte into the execute request before the guest sees it.
+      python3 "$SCRIPT_DIR/fm-cloud-author.py" prepare \
+        --home "$TASK_HOME" --task "$ID" --worktree "$WT" \
+        --payload "$STATE/$ID.cloud-payload" --brief "$DATA/$ID/brief.md" || exit 1
     fi
     if [ "$KIND" = secondmate ]; then
       # The compartment payload additionally ships the session runner and the

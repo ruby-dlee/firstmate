@@ -192,7 +192,7 @@ JSON
 }
 
 retained_create_recovery_contract() {
-  python3 - "$CONTROLLER" "$SUB" <<'PY' || fail "retained create recovery contract failed"
+  python3 - "$CONTROLLER" "$SUB" "$ROOT/bin/fm-azure-worker-provider.py" <<'PY' || fail "retained create recovery contract failed"
 import argparse
 import contextlib
 import copy
@@ -207,6 +207,9 @@ spec = importlib.util.spec_from_file_location("retain_lifecycle", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 subscription = sys.argv[2]
+provider_spec = importlib.util.spec_from_file_location("retained_provider", sys.argv[3])
+provider = importlib.util.module_from_spec(provider_spec)
+provider_spec.loader.exec_module(provider)
 
 with tempfile.TemporaryDirectory() as root_text:
     root = Path(root_text)
@@ -327,8 +330,78 @@ with tempfile.TemporaryDirectory() as root_text:
     after_reconcile = json.loads(env["state_path"].read_text())
     assert after_reconcile["pending_actions"]["1"] == action
     assert after_reconcile["pending_actions"]["2"] == action2
+
+    # Retention is recoverable once two fresh, identical provider observations
+    # and controller state prove this exact create never reached assignment or
+    # execution. Dark resources retain their exact identities for ordinary
+    # cleanup; absent resources close immediately. Both paths are replay-safe.
+    release1 = argparse.Namespace(
+        task="never-started", task_generation="gen-1", slot="1",
+        idempotency_key=action["idempotency_key"],
+        confirm_release_retained=True, confirm_subscription=subscription,
+        task_home_out=None,
+    )
+    release_output = io.StringIO()
+    with contextlib.redirect_stdout(release_output):
+        module.command_release_retained(env, release1)
+    assert "FM-RELEASED-NO-EXECUTION never-started gen-1" in release_output.getvalue()
+    released_dark = json.loads(env["state_path"].read_text())
+    dark_item = released_dark["queue"]["never-started@gen-1"]
+    dark_worker = released_dark["workers"]["1"]
+    proof = dark_item["no_execution_release"]
+    assert dark_item["status"] == "releasing"
+    assert dark_worker["phase"] == "release-proved"
+    assert dark_worker["assigned_at"] is None
+    assert "1" not in released_dark["pending_actions"]
+    assert proof == dark_worker["release_proof"]
+    assert proof["provider_disposition"] == "dark"
+    module.verify_no_execution_release_against_worker(proof, dark_worker)
+    cleanup_action = {
+        "slot": dark_worker["slot"],
+        "bindings": dark_worker["bindings"],
+        "cloud_instance_id": dark_worker["cloud_instance_id"],
+        "service_cancel_proof": proof,
+    }
+    assert provider.service_cancel_allows_missing_task_command(cleanup_action)
+    classification, _note = module.reconciled_worker_classification(
+        released_dark, dark_worker, cloud)
+    assert classification == "deallocated", classification
+    residual = copy.deepcopy(cloud)
+    for kind in module.RELEASED_ABSENT_RESOURCE_KINDS:
+        residual["resources"].pop(kind, None)
+    classification, _note = module.reconciled_worker_classification(
+        released_dark, dark_worker, residual)
+    assert classification == "orphaned-safe-to-delete", classification
+    tampered_action = copy.deepcopy(cleanup_action)
+    tampered_action["service_cancel_proof"]["slot"] = 16
+    assert not provider.service_cancel_allows_missing_task_command(tampered_action)
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.command_release_retained(env, release1)
+    assert json.loads(env["state_path"].read_text()) == released_dark
+
+    module.provider_call = lambda _env, operation, action=None: {
+        "inventory": {"workers": [], "conflicts": [], "metrics": {}}
+    }
+    release2 = argparse.Namespace(
+        task="now-absent", task_generation="gen-2", slot="2",
+        idempotency_key=action2["idempotency_key"],
+        confirm_release_retained=True, confirm_subscription=subscription,
+        task_home_out=None,
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.command_release_retained(env, release2)
+    released_absent = json.loads(env["state_path"].read_text())
+    absent_item = released_absent["queue"]["now-absent@gen-2"]
+    assert absent_item["status"] == "complete"
+    assert absent_item["no_execution_release"]["provider_disposition"] == "absent"
+    assert "2" not in released_absent["workers"]
+    assert "2" not in released_absent["pending_actions"]
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.command_release_retained(env, release2)
+    assert json.loads(env["state_path"].read_text()) == released_absent
+    assert provider_mutations == []
 PY
-  pass "deallocated never-started creates retain task state and exact claims without replay"
+  pass "retained never-started creates release idempotently after exact dark or absent proof"
 }
 
 cloud_state_receipt_cleanup_contract() {

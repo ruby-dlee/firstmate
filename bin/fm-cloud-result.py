@@ -503,6 +503,17 @@ def collect(args):
     expected_status = "state/{}.status".format(args.task)
     if manifest.get("report_path") != expected_report or manifest.get("status_path") != expected_status:
         raise ReturnError("worker return authorized paths differ from the local task contract")
+    mode = exactly(values, "mode")
+    if kind == "ship" and mode == "direct-PR":
+        if (
+            manifest.get("branch") != "fm/{}".format(args.task)
+            or manifest.get("base_commit") != result["repository_generation"]
+            or not isinstance(manifest.get("base_branch"), str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}", manifest["base_branch"])
+            or not isinstance(manifest.get("remote"), str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", manifest["remote"])
+        ):
+            raise ReturnError("worker return publication contract differs from the host-authored repository contract")
     data_root = home / "data"
     data_dir = data_root / args.task
     check_directory(data_root)
@@ -550,7 +561,10 @@ def collect(args):
         and (kind != "ship" or int(result.get("outcome_commits", 0)) > 0)
     )
     if succeeded:
-        terminal = "done: cloud outcome returned to local custody"
+        if kind == "ship" and mode == "direct-PR":
+            terminal = "working: cloud outcome returned to local custody; host publication pending"
+        else:
+            terminal = "done: cloud outcome returned to local custody"
     else:
         reasons = []
         if result.get("timed_out"):

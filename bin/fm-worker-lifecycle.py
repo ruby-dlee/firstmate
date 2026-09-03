@@ -62,6 +62,7 @@ EXECUTION_TERMINAL_SCHEMA = "fm.worker-execution-terminal/v1"
 EXECUTE_ABANDON_MARKER = "execute-abandon-action"
 RELEASE_SCHEMA = "fm.worker-release/v2"
 RELEASED_ABSENCE_SCHEMA = "fm.worker-released-absence/v1"
+NO_EXECUTION_RELEASE_SCHEMA = "fm.worker-no-execution-release/v1"
 AUTHORITY_SCHEMA = "fm.worker-authority/v1"
 CAPACITY_RESERVATION_SCHEMA = "fm.capacity-reservation/v1"
 CAPACITY_FENCE_RETIREMENT_SCHEMA = "fm.capacity-fence-retirement/v1"
@@ -1670,7 +1671,7 @@ def recorded_unlanded_executions(state, worker):
 
 
 def released_absent_data_adoption(state, worker, cloud):
-    """Recognize only an exact surrender whose data and compute are already gone.
+    """Recognize only an exact release whose data and compute are already gone.
 
     The release proof remains bound to the durable pre-absence identities.  A
     fresh provider inventory must still prove every residual identity and tag;
@@ -1683,7 +1684,10 @@ def released_absent_data_adoption(state, worker, cloud):
         return False, "released absence worker is not in release-proved phase"
     proof = worker.get("release_proof")
     try:
-        verify_surrender_release_against_worker(proof, worker)
+        if isinstance(proof, dict) and proof.get("schema") == NO_EXECUTION_RELEASE_SCHEMA:
+            verify_no_execution_release_against_worker(proof, worker)
+        else:
+            verify_surrender_release_against_worker(proof, worker)
     except LifecycleError as exc:
         return False, "released absence proof is not exact: {}".format(exc)
     item = state.get("queue", {}).get(worker.get("queue_key"))
@@ -1704,7 +1708,7 @@ def released_absent_data_adoption(state, worker, cloud):
         return False, "released absence has recorded unlanded outcome: {}".format(
             ", ".join(recorded or discarded)
         )
-    return True, "exact surrendered worker data and compute are authoritatively absent"
+    return True, "exact released worker data and compute are authoritatively absent"
 
 
 def reconciled_worker_classification(state, worker, cloud, now=None):
@@ -1733,7 +1737,8 @@ def released_absence_evidence(worker):
     }
 
 
-def adopt_cloud_resources(worker, cloud):
+def adopt_cloud_resource_identities(worker, cloud):
+    """Bind an exact provider inventory without implying guest assignment."""
     resources = cloud.get("resources") or {}
     if set(resources) != set(REQUIRED_RESOURCE_KINDS):
         raise LifecycleError("created worker did not return the complete exact resource set")
@@ -1743,8 +1748,11 @@ def adopt_cloud_resources(worker, cloud):
     exact, reason = resources_exact(worker, cloud)
     if not exact:
         raise LifecycleError("created worker identity is not exact: {}".format(reason))
-    vm = resources["vm"]
-    worker["cloud_instance_id"] = vm["immutable_id"]
+    worker["cloud_instance_id"] = resources["vm"]["immutable_id"]
+
+
+def adopt_cloud_resources(worker, cloud):
+    adopt_cloud_resource_identities(worker, cloud)
     worker["phase"] = "assigned"
     worker["assigned_at"] = worker.get("assigned_at") or iso_utc()
     worker["last_classification"] = "assigned"
@@ -2255,7 +2263,9 @@ def make_action(env, action_type, worker=None, item=None, **fields):
         if (
             action_type == "delete-compute"
             and isinstance(service_cancel_proof, dict)
-            and service_cancel_proof.get("schema") == "fm.worker-service-cancel/v1"
+            and service_cancel_proof.get("schema") in (
+                "fm.worker-service-cancel/v1", NO_EXECUTION_RELEASE_SCHEMA,
+            )
             and service_cancel_proof.get("verdict") == "cancelled-before-execution"
         ):
             action["service_cancel_proof"] = copy.deepcopy(service_cancel_proof)
@@ -3076,6 +3086,30 @@ def verify_release_against_worker(proof, worker):
             raise LifecycleError("worker release proof {} binding is not exact".format(field))
 
 
+def verify_no_execution_release_against_worker(proof, worker):
+    if not isinstance(proof, dict) or proof.get("schema") != NO_EXECUTION_RELEASE_SCHEMA:
+        raise LifecycleError("no-execution release proof schema is not exact")
+    unsigned = dict(proof)
+    supplied = unsigned.pop("proof_digest", None)
+    bindings = worker.get("bindings") or {}
+    if supplied != digest_value(unsigned):
+        raise LifecycleError("no-execution release proof digest is not exact")
+    expected = {
+        "verdict": "cancelled-before-execution",
+        "task": bindings.get("task"),
+        "task_generation": bindings.get("task_generation"),
+        "assignment_generation": worker.get("assignment_generation"),
+        "cloud_instance_id": worker.get("cloud_instance_id"),
+        "slot": worker.get("slot"),
+    }
+    for field, value in expected.items():
+        if proof.get(field) != value:
+            raise LifecycleError("no-execution release proof {} binding differs".format(field))
+    require_binding("no-execution claim idempotency key", proof.get("claim_idempotency_key"))
+    if proof.get("provider_disposition") not in ("dark", "absent"):
+        raise LifecycleError("no-execution release proof provider disposition is malformed")
+
+
 def verify_surrender_release_against_worker(proof, worker):
     """Validate the stored surrender bytes before absence can authorize reset."""
     if not isinstance(proof, dict) or proof.get("schema") != RELEASE_SCHEMA:
@@ -3769,6 +3803,17 @@ def parser():
     retain_create.add_argument("--idempotency-key", required=True)
     retain_create.add_argument("--confirm-retain", action="store_true")
     retain_create.add_argument("--confirm-subscription", required=True)
+    release_retained = sub.add_parser(
+        "release-retained",
+        help="release an operator-retained create after exact no-execution proof",
+    )
+    release_retained.add_argument("--task", required=True)
+    release_retained.add_argument("--task-generation", required=True)
+    release_retained.add_argument("--slot", required=True)
+    release_retained.add_argument("--idempotency-key", required=True)
+    release_retained.add_argument("--confirm-release-retained", action="store_true")
+    release_retained.add_argument("--confirm-subscription", required=True)
+    release_retained.add_argument("--task-home-out", default=None, help=argparse.SUPPRESS)
 
     reconcile_parser = sub.add_parser("reconcile", help="plan or apply bounded convergence")
     reconcile_parser.add_argument("--apply", action="store_true")
@@ -4841,15 +4886,25 @@ def command_capacity_retire_fence(env, args):
             print("specialized capacity fence already retired with exact identity")
 
 
-# What an ORDINARY crewmate payload may contain: the repository as a
-# credential-free bundle, plus the one task file its entrypoint reads. This set
-# is deliberately NOT widened for the compartment lane; see below.
-PAYLOAD_FILE_BOUNDS = {
+# Every payload carries a credential-free repository bundle and one brief.
+# Author-only repository/context descriptors are separate from the compartment
+# set so a compartment cannot broaden its payload by selecting author files.
+BASE_PAYLOAD_FILE_BOUNDS = {
     "repo.bundle": 512 * 1024 * 1024,
     "brief.md": 256 * 1024,
 }
+PAYLOAD_FILE_BOUNDS = {
+    **BASE_PAYLOAD_FILE_BOUNDS,
+    # New Azure author spawns carry these three host-produced, request-bound
+    # files. They stay optional here only so an already-assigned pre-cutover
+    # task can still return through its retained supervisor; fm-spawn always
+    # emits the complete trio and the guest refuses a partial trio.
+    "repository.json": 1024 * 1024,
+    "context.json": 1024 * 1024,
+    "context.tar": 33 * 1024 * 1024,
+}
 PAYLOAD_REQUIRED = ("repo.bundle", "brief.md")
-# What a SECONDMATE COMPARTMENT payload may contain: the ordinary set plus the
+# What a SECONDMATE COMPARTMENT payload may contain: the base set plus the
 # two files bin/fm-spawn.sh stages only for KIND=secondmate - the session runner
 # and the spawn-intent pi extension, which the compartment monitor's leg argv
 # names by path at /mnt/task/.fm-task/. Bounds are the smallest round numbers
@@ -4857,7 +4912,7 @@ PAYLOAD_REQUIRED = ("repo.bundle", "brief.md")
 # azaccept compartment): a bound is a security control, so headroom buys against
 # ordinary source growth, not against a file becoming a different KIND of thing.
 COMPARTMENT_PAYLOAD_FILE_BOUNDS = {
-    **PAYLOAD_FILE_BOUNDS,
+    **BASE_PAYLOAD_FILE_BOUNDS,
     "fm-secondmate-session.py": 256 * 1024,
     "fm-secondmate-spawn.pi-ext.ts": 64 * 1024,
 }
@@ -4924,6 +4979,36 @@ def staged_directory_manifest(label, directory, bounds=None, total_bound=None, r
     return manifest
 
 
+def author_repository_contract(directory, task, repository_generation):
+    """Read the host-authored publication fields from the staged payload."""
+    path = Path(directory) / "repository.json"
+    if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 1024 * 1024:
+        raise LifecycleError("author repository manifest is unavailable or redirected")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LifecycleError("author repository manifest is unreadable: {}".format(exc))
+    required = {
+        "schema", "task", "remote", "base_branch", "base_ref", "base_commit",
+        "task_branch", "bundle_base_ref", "preserved_refs",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise LifecycleError("author repository manifest fields are not exact")
+    if (
+        value.get("schema") != "fm.azure-author-repository/v1"
+        or value.get("task") != task
+        or value.get("base_commit") != repository_generation
+        or value.get("task_branch") != "fm/{}".format(task)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", str(value.get("remote", "")))
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}", str(value.get("base_branch", "")))
+    ):
+        raise LifecycleError("author repository manifest binding differs")
+    preserved = value.get("preserved_refs")
+    if not isinstance(preserved, list) or len(preserved) > 100:
+        raise LifecycleError("author repository preserved refs are malformed")
+    return value
+
+
 def command_execute(env, args):
     if not args.confirm_execute:
         raise LifecycleError("--confirm-execute is required")
@@ -4950,7 +5035,7 @@ def command_execute(env, args):
         outcome_root = Path(args.outcome_dir)
         if outcome_root.is_symlink() or not outcome_root.is_dir():
             raise LifecycleError("outcome directory is unavailable: {}".format(args.outcome_dir))
-    payload_manifest = account_manifest = None
+    payload_manifest = account_manifest = repository_contract = None
     inventory = provider_call(env, "inventory")["inventory"]
     with contextlib.ExitStack() as stack:
       with controller_lock(env):
@@ -4986,6 +5071,14 @@ def command_execute(env, args):
             account_manifest = staged_directory_manifest(
                 "account", args.account_dir, total_bound=ACCOUNT_TOTAL_BOUND,
             )
+            author_files = {"repository.json", "context.json", "context.tar"}
+            present_author_files = author_files.intersection(payload_manifest)
+            if present_author_files and present_author_files != author_files:
+                raise LifecycleError("Azure author payload has a partial repository/context contract")
+            if worker_role == "author" and present_author_files:
+                repository_contract = author_repository_contract(
+                    args.payload_dir, args.task, worker["bindings"]["repository_generation"]
+                )
         request = {
             "schema": EXECUTION_SCHEMA,
             **worker["bindings"],
@@ -5021,6 +5114,12 @@ def command_execute(env, args):
                 "visuals_path": "data/{}/visuals".format(args.task),
                 "branch": "fm/{}".format(args.task) if args.return_kind == "ship" else "",
             }
+            if args.return_kind == "ship" and repository_contract is not None:
+                request["return_contract"].update({
+                    "remote": repository_contract["remote"],
+                    "base_branch": repository_contract["base_branch"],
+                    "base_commit": repository_contract["base_commit"],
+                })
         request["request_digest"] = digest_value(request)
         existing = state["executions"].get(request["request_digest"])
         if existing is not None:
@@ -5568,6 +5667,176 @@ def write_surrender_output(path, proof):
     )
 
 
+def no_execution_release_proof(worker, claim_key, disposition):
+    bindings = worker["bindings"]
+    proof = {
+        "schema": NO_EXECUTION_RELEASE_SCHEMA,
+        "verdict": "cancelled-before-execution",
+        "task": bindings["task"],
+        "task_generation": bindings["task_generation"],
+        "assignment_generation": worker["assignment_generation"],
+        "cloud_instance_id": worker.get("cloud_instance_id"),
+        "slot": worker.get("slot"),
+        "claim_idempotency_key": claim_key,
+        "provider_disposition": disposition,
+        "proved_at": iso_utc(),
+    }
+    proof["proof_digest"] = digest_value(proof)
+    return proof
+
+
+def command_release_retained(env, args):
+    """Free a retained create after two exact views prove no execution.
+
+    retain-create deliberately makes an ambiguous create inert. It must not be
+    the end of the state machine: once two fresh inventories agree that the
+    exact capacity is dark or absent, and controller state still proves the
+    assignment and execution never began, this command retires the create
+    claim. Dark exact resources enter the ordinary fenced cleanup planner;
+    complete absence closes the queue and its private account projection
+    directly because there is no provider resource left to mutate.
+    """
+    if not args.confirm_release_retained:
+        raise LifecycleError("--confirm-release-retained is required")
+    if args.confirm_subscription != env["subscription"]:
+        raise LifecycleError("--confirm-subscription must exactly match FM_AZURE_SUBSCRIPTION_ID")
+    task = require_id("task", args.task)
+    generation = require_id("task generation", args.task_generation)
+    key = request_key(task, generation)
+    slot = str(args.slot)
+    if not slot.isdigit() or not 1 <= int(slot) <= MAX_WORKERS:
+        raise LifecycleError("release-retained requires one exact worker slot")
+    claim_key = require_binding("retained create idempotency key", args.idempotency_key)
+
+    with slot_lease(env, slot):
+        with controller_lock(env):
+            state = load_state(env)
+            item = state.get("queue", {}).get(key)
+            worker = state.get("workers", {}).get(slot)
+            if isinstance(item, dict) and item.get("status") in ("releasing", "complete"):
+                proof = item.get("no_execution_release")
+                if (
+                    isinstance(proof, dict)
+                    and proof.get("schema") == NO_EXECUTION_RELEASE_SCHEMA
+                    and proof.get("claim_idempotency_key") == claim_key
+                    and proof.get("task") == task
+                    and proof.get("task_generation") == generation
+                    and proof.get("slot") == int(slot)
+                ):
+                    unsigned = dict(proof)
+                    supplied = unsigned.pop("proof_digest", None)
+                    if supplied != digest_value(unsigned):
+                        raise LifecycleError("existing no-execution release proof digest differs")
+                    if item.get("status") == "releasing":
+                        if not isinstance(worker, dict):
+                            raise LifecycleError("releasing no-execution worker is absent")
+                        verify_no_execution_release_against_worker(proof, worker)
+                    print("FM-RELEASED-NO-EXECUTION {} {}".format(task, generation))
+                    write_task_home_receipt(
+                        getattr(args, "task_home_out", None), item, worker)
+                    return
+            action = (state.get("pending_actions") or {}).get(slot)
+            if not retained_create_claim(state, slot, action):
+                raise LifecycleError("release-retained requires one operator-retained create")
+            if action.get("idempotency_key") != claim_key or action.get("type") != "create":
+                raise LifecycleError("release-retained create claim is not exact")
+            if worker.get("queue_key") != key or item is None:
+                raise LifecycleError("release-retained task ownership is not exact")
+            bindings = worker.get("bindings") or {}
+            if bindings.get("task") != task or bindings.get("task_generation") != generation:
+                raise LifecycleError("release-retained task generation binding differs")
+            if (
+                worker.get("assigned_at") is not None
+                or worker.get("last_execution_at")
+                or worker.get("last_execution_digest")
+                or any(
+                    execution.get("task") == task
+                    and execution.get("task_generation") == generation
+                    and execution.get("assignment_generation")
+                    == worker.get("assignment_generation")
+                    for execution in state.get("executions", {}).values()
+                    if isinstance(execution, dict)
+                )
+            ):
+                raise LifecycleError("release-retained refuses any assignment or execution evidence")
+        observations = []
+        for _index in range(2):
+            inventory = provider_call(env, "inventory")["inventory"]
+            if int(slot) in inventory_conflict_slots(inventory):
+                raise LifecycleError("release-retained refuses a provider conflict in the exact slot")
+            cloud = inventory_by_slot(inventory).get(int(slot))
+            if cloud is None:
+                observations.append(("absent", None))
+                continue
+            exact, reason = resources_exact(worker, cloud, allow_missing_compute=False)
+            if not exact:
+                raise LifecycleError(
+                    "release-retained live identity proof failed: {}".format(reason))
+            power = str(((cloud.get("resources") or {}).get("vm") or {}).get("power_state", "")).lower()
+            if "deallocated" not in power and "stopped" not in power:
+                raise LifecycleError("release-retained requires exact dark compute or complete absence")
+            identities = {
+                name: resource_identity(value)
+                for name, value in sorted((cloud.get("resources") or {}).items())
+            }
+            observations.append(("dark", (identities, cloud)))
+        if observations[0][0] != observations[1][0]:
+            raise LifecycleError("release-retained provider observations changed; retry")
+        disposition = observations[0][0]
+        if disposition == "dark" and observations[0][1][0] != observations[1][1][0]:
+            raise LifecycleError("release-retained exact resource identity changed; retry")
+
+        with controller_lock(env):
+            state = load_state(env)
+            action = (state.get("pending_actions") or {}).get(slot)
+            worker = state.get("workers", {}).get(slot)
+            item = state.get("queue", {}).get(key)
+            if (
+                not retained_create_claim(state, slot, action)
+                or action.get("idempotency_key") != claim_key
+                or worker.get("queue_key") != key
+            ):
+                raise LifecycleError("release-retained ownership changed during proof; retry")
+            if (
+                worker.get("assigned_at") is not None
+                or worker.get("last_execution_at")
+                or worker.get("last_execution_digest")
+                or any(
+                    execution.get("task") == task
+                    and execution.get("task_generation") == generation
+                    and execution.get("assignment_generation")
+                    == worker.get("assignment_generation")
+                    for execution in state.get("executions", {}).values()
+                    if isinstance(execution, dict)
+                )
+            ):
+                raise LifecycleError("release-retained assignment state changed during proof; retry")
+            if disposition == "dark":
+                adopt_cloud_resource_identities(worker, observations[1][1][1])
+            proof = no_execution_release_proof(worker, claim_key, disposition)
+            item["no_execution_release"] = proof
+            item["slot"] = worker["slot"]
+            item["assignment_generation"] = worker["assignment_generation"]
+            state["pending_actions"].pop(slot, None)
+            if disposition == "absent":
+                cleanup_placement_projection(env, item)
+                item["status"] = "complete"
+                item["completed_at"] = iso_utc()
+                state["workers"].pop(slot, None)
+            else:
+                worker["release_proof"] = proof
+                worker["released_at"] = proof["proved_at"]
+                worker["phase"] = "release-proved"
+                item["status"] = "releasing"
+            save_state(env, state)
+    print("FM-RELEASED-NO-EXECUTION {} {}".format(task, generation))
+    write_task_home_receipt(getattr(args, "task_home_out", None), item, worker)
+    if disposition == "absent":
+        print("retained no-execution request and private profile projection are complete")
+    else:
+        print("retained no-execution request released; reconcile owns exact dark-resource cleanup")
+
+
 def command_retain_create(env, args):
     """Make a deallocated never-assigned create inert without dropping its claim.
 
@@ -5578,8 +5847,8 @@ def command_retain_create(env, args):
     is deallocated, proves controller execution never began, moves the request
     to retained-for-investigation, and leaves the original claim byte-exact.
     Ordinary reconcile recognizes that retained transition and never replays
-    the claim. A later replay still requires the separate explicit exact-key
-    abandon-claim authority.
+    the claim. The explicit release-retained path can later retire it only
+    after two fresh exact no-execution observations.
     """
     if not args.confirm_retain:
         raise LifecycleError("--confirm-retain is required")
@@ -6206,6 +6475,8 @@ def main(argv=None):
         command_abandon_claim(env, args)
     elif args.command == "retain-create":
         command_retain_create(env, args)
+    elif args.command == "release-retained":
+        command_release_retained(env, args)
     elif args.command == "resume":
         command_resume(env, args)
     elif args.command == "steer":

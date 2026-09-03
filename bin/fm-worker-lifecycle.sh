@@ -46,6 +46,7 @@
 #   fm-worker-lifecycle.sh withdraw --task <id> --task-generation <id> --confirm-withdraw --confirm-subscription <uuid>
 #   fm-worker-lifecycle.sh abandon-claim --slot <n> --idempotency-key <sha256> --confirm-abandon --confirm-subscription <uuid>
 #   fm-worker-lifecycle.sh retain-create --task <id> --task-generation <id> --slot <n> --idempotency-key <sha256> --confirm-retain --confirm-subscription <uuid>
+#   fm-worker-lifecycle.sh release-retained --task <id> --task-generation <id> --slot <n> --idempotency-key <sha256> --confirm-release-retained --confirm-subscription <uuid>
 #   fm-worker-lifecycle.sh surrender --task <id> --task-generation <id> --reason <text> --output <json> --confirm-surrender --confirm-subscription <uuid> [--confirm-discard-unlanded] [--confirm-orphan-children]
 #   fm-worker-lifecycle.sh resume <exact recovery flags>
 #   fm-worker-lifecycle.sh steer <exact assignment flags>
@@ -197,6 +198,30 @@ case "${1:-}" in
       fm_cloud_state_remove "$staged_root" "$withdraw_receipt"
       if fm_worker_receipt_credential_remains "$task_home_file" "$withdraw_receipt" "$state_root"; then
         echo "ELASTIC WORKER REFUSED: withdrew $withdraw_receipt but its staged provider credential remains" >&2
+        rm -f "$task_home_file"
+        exit 4
+      fi
+    fi
+    rm -f "$task_home_file"
+    exit 0
+    ;;
+  release-retained)
+    # This is the terminal counterpart to retain-create. Its receipt means two
+    # fresh provider views plus the controller proved no assignment/execution,
+    # so no task work exists to preserve and the task-private staged credential
+    # has no remaining owner. Cloud resources, when present, stay behind the
+    # release proof for ordinary reconcile; only local convergence state leaves.
+    task_home_file=$(mktemp "${TMPDIR:-/tmp}/fm-task-home.XXXXXX") || exit 1
+    release_output=$(python3 "$SCRIPT_DIR/fm-worker-lifecycle.py" "$@" \
+      --task-home-out "$task_home_file")
+    printf '%s\n' "$release_output"
+    release_receipt=$(printf '%s\n' "$release_output" | awk '$1 == "FM-RELEASED-NO-EXECUTION" { print $2; exit }')
+    if [ -n "$release_receipt" ]; then
+      state_root="${FM_STATE_OVERRIDE:-${FM_HOME:?FM_HOME is required}/state}"
+      staged_root=$(fm_worker_receipt_state_dir "$task_home_file" "$state_root")
+      fm_cloud_state_remove "$staged_root" "$release_receipt"
+      if fm_worker_receipt_credential_remains "$task_home_file" "$release_receipt" "$state_root"; then
+        echo "ELASTIC WORKER REFUSED: released $release_receipt but its staged provider credential remains" >&2
         rm -f "$task_home_file"
         exit 4
       fi

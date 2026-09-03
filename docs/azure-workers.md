@@ -225,10 +225,16 @@ A visible VM with another task or assignment binding refuses instead of being ad
 
 ## Outcome collection and landing
 
-A crewmate on a worker holds no forge or provider credential, so the work comes home as bytes, not as a push: nothing on the worker pushes anywhere, and the local side keeps the landing authority.
+A crewmate on a worker holds no forge or provider credential, so the work comes home as bytes, not as a push: nothing on the worker pushes anywhere, and the local side keeps the landing and publication authority.
+Before an author dispatch, `bin/fm-cloud-author.py prepare` fetches the intended integration branch, detaches the leased host worktree at that exact commit, and builds a labelled bundle containing that base plus only explicitly required preserved branch and open-PR refs.
+The optional task-local `data/<task>/cloud-context.json` uses schema `fm.azure-author-context-config/v1`; it may name `base_branch`, `remote`, `preserved_refs`, additional traversal-free `data/` artifact paths, and whether to capture a bounded open-PR snapshot through host `gh-axi`.
+A brief that asks for preserved branches or refs without naming them refuses until this file supplies the exact grant rather than silently receiving an incomplete or all-branches payload.
+The helper also discovers existing regular data artifacts named by absolute path in the brief, excludes the task's own return directory, refuses redirects and bounds the resulting files, then carries them under `/mnt/task/.fm-context` with per-file digests.
+Configuration outside `data/`, canonical provider-account pools, and forge credentials are never part of that context grant.
+The guest initializes its repository from the labelled bundle, creates `fm/<task>` at the exact dispatched base, and preserves every required extra commit under a manifest-labelled local ref without configuring a forge remote.
+The cloud-specific brief replaces host-only paths and generic local publication instructions, states that guest `done:` means only ready-to-return committed bytes, and reserves push and PR creation for trusted host code.
 `execute --outcome-dir --return-kind <ship|scout>` records both `outcome_expected` and one closed `fm.worker-return-contract/v1` inside the digest-bound execution request.
-The contract authorizes only that task's report, status trail, visual directory, required ship branch, and repository scratch.
-The spawned brief rewrites only the exact task-home prefix to `/mnt/task/.fm-return`, so its authorized completion paths exist on the guest without making arbitrary guest paths returnable.
+The contract authorizes only that task's report, status trail, visual directory, required ship branch, and repository scratch; author publication fields additionally bind the remote, intended base branch, and exact base commit copied from the host-produced repository manifest.
 The provider mints one short-lived user-delegation SAS with create/write on exactly one blob name, delivered as a protected Run Command parameter.
 That SAS scopes the credential, not the guest: the worker identity already holds Storage Blob Data Contributor on its whole state container, so what makes a landing safe is the digest in the signed result, not the narrowness of the SAS.
 Because the expectation is digest-bound, a stripped parameter cannot silently downgrade a landing task: the guest refuses before the argv runs.
@@ -245,7 +251,11 @@ The controller downloads the blob only after the digest-bound result commits to 
 For ship work it creates or fast-forwards `fm/<task>` and checks that branch out only when the leased worktree and any existing task branch have not diverged; a divergence keeps the fetched custody ref and never overwrites local work.
 For scout work it leaves the scratch worktree on its dispatched generation and stores any returned patch and untracked archive with the report.
 A missing or invalid authored report retains the assignment and produces no generated report or local terminal authority; collection and release resume only after the actual returned report and branch or scratch custody validate.
-Replaying the same result converges on the same refs, files, branch, and one terminal status line.
+Replaying the same result converges on the same refs, files, branch, and one custody status line.
+A successful direct-PR ship remains `working: cloud outcome returned to local custody; host publication pending` until trusted host publication completes.
+After remote worker release, `bin/fm-cloud-author.py publish` verifies the local task branch is the exact returned descendant, refuses dirty or divergent work, pushes only that commit to `fm/<task>`, and opens or reuses a PR against the bound base through host `gh-axi`.
+Publication retries resolve the PR by branch after every create attempt, including the accepted-server/client-failure seam, and converge on one digest receipt, one metadata URL, and one final `done: PR ...` event.
+A publication failure removes the released provider credential but retains the result, payload metadata, local branch, report, scratch, and monitor state for retry.
 An assigned worker whose earlier supervisor could not return its task disk uses the explicit `execute --existing-task-disk` recovery lane.
 That request carries no payload or account archive, binds the exact landed recovery-supervisor digest, and runs one bounded continuation or no-op collection command against the retained repository instead of replacing it.
 The Azure adapter executes those bound supervisor bytes from a task-command-local recovery path without changing the originally bootstrapped supervisor; when public main has advanced, it resolves the requested digest only from the bounded landed default-branch history.
@@ -261,9 +271,9 @@ On explicitly absence-tolerant child inventory reads, Azure's generic `NotFound`
 The controller never infers safe deletion from a terminal chat line, a missing VM, elapsed time, or budget pressure.
 The ordinary Firstmate owners first establish the task's required local authorities, then release the provider account and complete their normal cleanup checks.
 For a local placement, that still means endpoint absence, report publication, and forge-reachable landing before release.
-For an Azure author return, the exact local tracking endpoint may still be alive only while it performs this finalization: the digest-bound result has ended remote execution, and the endpoint receipt accepts that narrow return-localized state after the terminal status exists.
-The Azure landing receipt proves local custody rather than forge landing: the return bundle and manifest match the result, the required report and terminal status exist, ship commits are reachable from the checked-out `fm/<task>` branch, and any declared uncommitted scratch has a retained artifact.
-This releases billable remote capacity without weakening the ordinary later teardown gate, which still protects the unpushed local task branch until it reaches a remote or default branch.
+For an Azure author return, the exact local tracking endpoint may still be alive only while it performs this finalization: the digest-bound result has ended remote execution, and the endpoint receipt accepts the narrow return-localized status even while trusted publication is still pending.
+The Azure landing receipt proves local custody rather than forge landing: the return bundle and manifest match the result, the required report and custody status exist, ship commits are reachable from the checked-out `fm/<task>` branch, and any declared uncommitted scratch has a retained artifact.
+This releases billable remote capacity without weakening publication safety: the unpushed local task branch and return artifacts remain until host code confirms the exact remote branch and matching PR.
 `authority-receipt` invokes `bin/fm-worker-authority.py`, which reads the ordinary task metadata, endpoint backend oracle, completion-report contract, Git landing or cloud-return custody graph, account task/home binding, and clean exact worktree root rather than accepting operator-entered digests.
 For Azure placement, the task's `account_home` is the canonical Pi pool selected above, so account authority requires the task-recorded profile and assignment-private home to equal the controller queue's exact snapshot record, then reads its owner-private credential without following links and reproduces the reusable upstream-account binding.
 It produces an `fm.worker-release/v2` bundle with five independently canonical `fm.worker-authority/v1` receipts for endpoint absence, report validity, landed work, account ownership, and writable-worktree cleanliness, plus the exact home, task, generations, cloud instance, account, worktree, repository, and every resource identity.
@@ -400,7 +410,20 @@ The home lock now covers only short read-validate-claim and apply sections; ever
 Reconcile drains stranded claims AFTER convergence, skipping any slot whose claim a live process still owns, so a wedged or hours-long replay cannot stop the fleet.
 `abandon-claim` can record and clear an exact-key provider result whose apply deterministically refuses, including a script-bound Failed or Canceled execution disposition that names the claimed task-command resource; an exact-key `REFUSED-IDENTITY` replay whose recorded resource identity can never bind again; or an execute that two fresh Azure views prove never started while the VM is deallocated and the assignment blobs are still initial. The never-started exit durably marks the exact key and every future execute refuses that marker; ordinary dark-VM cleanup then cascades the empty Run Command child.
 `retain-create` is the distinct non-replay recovery for a pending create whose VM an operator already deallocated or removed before assignment: it requires exact task, generation, slot, claim key, subscription, and confirmation; proves either the complete live identity and dark power state or a complete inventory with neither that worker nor an exact-slot conflict; refuses any assignment or execution evidence; moves the queue and worker to retained-for-investigation; and preserves the pending claim byte-for-byte.
-Reconcile and strict pending-claim drains refuse that retained create without calling the provider, so ordinary reconciliation cannot restart its compute and only a later fresh explicit exact-key operator action can replay it.
+Reconcile and strict pending-claim drains refuse that retained create without calling the provider, so ordinary reconciliation cannot restart its compute.
+`release-retained` is its idempotent terminal path once two fresh provider inventories agree on either the complete exact resource identity in a deallocated or stopped state or complete slot absence, controller state still proves no assignment or execution, and the operator repeats the exact task, generation, slot, claim key, subscription, and confirmation.
+Azure documents Instance View as its run-time state API and warns that power state is last-known and can be intermittently unavailable, so this exit retries rather than treating one observation or an unknown state as proof: [VM states and billing](https://learn.microsoft.com/en-us/azure/virtual-machines/states-billing) and [Virtual Machines - Instance View](https://learn.microsoft.com/en-us/rest/api/compute/virtual-machines/instance-view).
+Complete absence closes the queue entry and private profile projection immediately; exact dark resources receive a digest-bound no-execution release proof and enter ordinary fenced cleanup without ever being marked assigned.
+The shell wrapper consumes the controller-authored task-home receipt and removes the task's staged provider credential and transport state; a command replay returns the same receipt instead of retaining the profile again.
+
+```sh
+bin/fm-worker-lifecycle.sh release-retained \
+  --task <id> --task-generation <generation> \
+  --slot <n> --idempotency-key <retained-create-key> \
+  --confirm-release-retained \
+  --confirm-subscription "$FM_AZURE_SUBSCRIPTION_ID"
+```
+
 Both abandonment dispositions are recorded in `cleanup_refusals` before the claim is cleared, while an ordinary transient provider failure and a retained create keep the exact claim unchanged.
 Azure may omit `source.script` even for the freshly created async preflight stub. That shape permits its one initial submission only while both staging blobs still carry the exact assignment/pending sentinels and instance view is Failed with exit `-202` and no result marker. The execution update atomically tags the Run Command with its request digest and idempotency key; a replay bearing those tags is bound even when source remains absent. A crash after staging changes but before the tagged update stays fail-closed. Every other missing, non-string, empty, or whitespace-only source is ambiguous unless a digest-valid result proves a differently tagged prior execution completed. An exact-bound Run Command that is still Updating or Running, reports Succeeded without a digest-valid request-bound result marker, or returns a terminal disposition naming a foreign task-command resource likewise retains the claim without submitting the command again.
 Each reconcile refreshes Azure before selecting the next action and stops after 64 actions even if a provider never converges.
@@ -452,6 +475,16 @@ The complete acceptance must record all of these outcomes:
 7. Force actual and separately forecast budget pressure and prove new discretionary launches stop while existing active and unlanded work remains untouched.
 8. Prove every VM has no public IP or public ingress and cannot see another task's credential disk, worktree disk, browser state, process, socket, cache, provider lease, or cloud identity.
 9. Execute one representative private command through the pinned supervisor, collect its exact result, close the real endpoint, validate/publish the report, prove landing, account release, and clean worktree through `authority-receipt`, then record bounded status plus actual and forecast cost evidence before, during, and after the exercise.
+
+### Post-merge author publication smoke
+
+The first post-merge author smoke must use a disposable registered project and a current non-default integration branch so the exact-base behavior is observable rather than implied by the default branch.
+Create a task brief that requests one harmless tracked text-file change and a valid six-section report, names one small authorized `data/` artifact, and names its integration branch; record the branch's remote tip immediately before spawn.
+Set `data/<task>/cloud-context.json` to that branch, one harmless preserved branch, and `include_open_prs: true`, then dispatch one ordinary Azure author through the normal spawn path without supplying any forge or canonical account-pool material to the guest.
+Accept only if the returned project history contains exactly one new task commit whose parent is the recorded integration tip, the host worktree fast-forwards to that exact commit, the host pushes `fm/<task>`, and host `gh-axi` opens one real PR whose base, head branch, and head OID exactly match the return manifest.
+Repeat the host publication step and require the same PR URL with no second create, then confirm the report, return bundle, and publication receipt remain readable while the task-private staged credential is absent.
+Record the real PR URL, base and head OIDs, assignment and return generations, pre/during/post cost snapshots, and cleanup result; fixtures alone never mark Azure author use accepted.
+This smoke does not read, mutate, stop, deallocate, or otherwise drive the separate Crosscheck configuration or resources.
 
 Every acceptance leg needs a positive control that proves the check detects the unsafe state.
 Positive controls include a planted public-IP relation, a foreign immutable ID, a stale task generation, a duplicated projection binding, a duplicated worktree digest, a deliberately retained dirty disk, a repeated provider action, a forecast above policy, and planted cross-task files, processes, sockets, browser data, cloud identities, or credentials.

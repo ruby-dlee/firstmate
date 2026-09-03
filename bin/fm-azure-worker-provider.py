@@ -2917,13 +2917,19 @@ def service_cancel_allows_missing_task_command(action):
     supplied = unsigned.pop("proof_digest", None)
     bindings = action.get("bindings") or {}
     return (
-        proof.get("schema") == "fm.worker-service-cancel/v1"
+        proof.get("schema") in (
+            "fm.worker-service-cancel/v1", "fm.worker-no-execution-release/v1",
+        )
         and proof.get("verdict") == "cancelled-before-execution"
         and supplied == hashlib.sha256(canonical_bytes(unsigned)).hexdigest()
         and proof.get("task") == bindings.get("task")
         and proof.get("task_generation") == bindings.get("task_generation")
         and proof.get("assignment_generation") == bindings.get("assignment_generation")
         and proof.get("cloud_instance_id") == action.get("cloud_instance_id")
+        and (
+            proof.get("schema") != "fm.worker-no-execution-release/v1"
+            or proof.get("slot") == action.get("slot")
+        )
     )
 
 

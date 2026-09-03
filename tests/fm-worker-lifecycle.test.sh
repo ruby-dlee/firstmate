@@ -9092,10 +9092,17 @@ for name in ("fm-secondmate-session.py", "fm-secondmate-spawn.pi-ext.ts"):
     assert actual <= bound, "{} is {} bytes, over its {}-byte bound".format(
         name, actual, bound)
 
-# LANE SPLIT: the ordinary crewmate lane is exactly as narrow as before.
+# LANE SPLIT: author-only context is bounded independently and cannot enter a
+# secondmate compartment. The author trio stays optional at this validator only
+# so retained pre-cutover assignments with the historical two-file payload can
+# still return; current fm-spawn.sh emits all three or fails before dispatch.
 assert module.payload_contract("author") == (
     module.PAYLOAD_FILE_BOUNDS, module.PAYLOAD_REQUIRED)
-assert set(module.PAYLOAD_FILE_BOUNDS) == {"repo.bundle", "brief.md"}
+assert set(module.PAYLOAD_FILE_BOUNDS) == {
+    "repo.bundle", "brief.md", "repository.json", "context.json", "context.tar",
+}
+assert {"repository.json", "context.json", "context.tar"}.isdisjoint(
+    module.COMPARTMENT_PAYLOAD_FILE_BOUNDS)
 assert module.payload_contract("secondmate") == (
     module.COMPARTMENT_PAYLOAD_FILE_BOUNDS, module.COMPARTMENT_PAYLOAD_REQUIRED)
 
@@ -9316,13 +9323,21 @@ for name, size in LIVE.items():
     assert compartment[name] == {
         "sha256": hashlib.sha256(body).hexdigest(), "bytes": size}, compartment[name]
 
-# The ordinary crewmate payload is unchanged: same two entries, same digests.
+# Historical retained author payloads remain admissible, while the current
+# labelled repository/context trio is independently digest-bound when present.
 ordinary = manifest("author", stage(ORDINARY))
 assert sorted(ordinary) == ["brief.md", "repo.bundle"], sorted(ordinary)
 assert all(ordinary[name] == compartment[name] for name in ORDINARY), ordinary
+author_files = dict(ORDINARY, **{
+    "repository.json": 731, "context.json": 509, "context.tar": 10240,
+})
+author = manifest("author", stage(author_files))
+assert sorted(author) == sorted(author_files), sorted(author)
+assert "not in the reviewed set: repository.json" in refusal(
+    "secondmate", stage(dict(LIVE, **{"repository.json": 731})))
 
-# ...and the crewmate lane is NOT widened: a session runner staged onto an
-# ordinary worker is still refused, exactly as on the base revision.
+# ...and the crewmate lane is NOT widened to executable compartment material:
+# a session runner staged onto an author worker is still refused.
 assert "not in the reviewed set: fm-secondmate-session.py" in refusal(
     "author", stage(LIVE))
 

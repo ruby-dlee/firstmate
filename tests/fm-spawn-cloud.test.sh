@@ -425,6 +425,12 @@ make_cloud_case() {
   printf '%s\n' manual > "$home/config/backlog-backend"
   write_azure_controller_config "$home/config/azure-controller.env"
   fm_git_init_commit "$project"
+  git init --quiet --bare "$case_dir/remote.git"
+  git -C "$project" remote add origin "$case_dir/remote.git"
+  git -C "$project" push --quiet -u origin HEAD
+  git --git-dir="$case_dir/remote.git" symbolic-ref HEAD \
+    "refs/heads/$(git -C "$project" branch --show-current)"
+  git -C "$project" remote set-head origin --auto >/dev/null
   git -C "$project" worktree add --quiet --detach "$worktree"
   touch "$home/state/.last-watcher-beat"
   mkdir -p "$home/data/$id"
@@ -1689,6 +1695,12 @@ make_child_case() {  # <name> <child-id> <parent-id> -> record
   printf '%s\n' manual > "$primary/config/backlog-backend"
   write_azure_controller_config "$primary/config/azure-controller.env"
   fm_git_init_commit "$project"
+  git init --quiet --bare "$case_dir/remote.git"
+  git -C "$project" remote add origin "$case_dir/remote.git"
+  git -C "$project" push --quiet -u origin HEAD
+  git --git-dir="$case_dir/remote.git" symbolic-ref HEAD \
+    "refs/heads/$(git -C "$project" branch --show-current)"
+  git -C "$project" remote set-head origin --auto >/dev/null
   git -C "$project" worktree add --quiet --detach "$worktree"
   fm_git_init_commit "$foreign_project"
   git -C "$foreign_project" worktree add --quiet --detach "$foreign_worktree"

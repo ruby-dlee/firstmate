@@ -68,6 +68,9 @@ SECONDMATE_BUNDLE_NAME = re.compile(r"^bundle-[0-9]{8}-([0-9a-f]{64})\.bundle$")
 SECONDMATE_MAX_MESSAGE_BYTES = 256 * 1024
 SECONDMATE_MAX_BUNDLE_BYTES = 256 * 1024 * 1024
 SECONDMATE_MAX_STATE_BYTES = 16 * 1024 * 1024
+AZURE_AUTHOR_REPOSITORY_SCHEMA = "fm.azure-author-repository/v1"
+AZURE_AUTHOR_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+AZURE_AUTHOR_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
 
 
 class AuthorityError(RuntimeError):
@@ -140,15 +143,23 @@ def endpoint_evidence(home, task, values):
     # A cloud endpoint is only the local tracking monitor. Once the exact
     # digest-bound return has reached local custody it has no guest process or
     # steering authority left, and release must not wait on its own process to
-    # disappear before it can free the remote lease. The terminal status is
-    # produced only after report and branch custody, and unknown still refuses.
+    # disappear before it can free the remote lease. A direct-PR ship remains
+    # truthfully working while trusted host publication is pending; the other
+    # authorities independently prove report and branch custody. Unknown still
+    # refuses.
     placement = values.get("placement", [])
     if result.returncode == 0 and endpoint_state == "present" and placement == ["azure"]:
         status = home / "state" / (task + ".status")
         if status.is_symlink() or not status.is_file():
             raise AuthorityError("cloud endpoint authority has no local terminal custody status")
         lines = [line.strip() for line in status.read_text(encoding="utf-8").splitlines() if line.strip()]
-        if not lines or not re.match(r"^(done|failed):", lines[-1]):
+        publication_pending = (
+            lines and lines[-1]
+            == "working: cloud outcome returned to local custody; host publication pending"
+            and values.get("kind") == ["ship"]
+            and values.get("mode") == ["direct-PR"]
+        )
+        if not lines or (not re.match(r"^(done|failed):", lines[-1]) and not publication_pending):
             raise AuthorityError("cloud endpoint authority has no local terminal custody status")
         return "{}\0{}\0{}\0cloud-return-localized".format(backend, target, expected).encode()
     raise AuthorityError("endpoint authority did not prove the exact task endpoint absent or return-localized")
@@ -187,7 +198,72 @@ def worktree_evidence(task, values):
     return "{}\0{}\0{}".format(worktree, common.resolve(), git(worktree, "rev-parse", "HEAD")).encode(), worktree
 
 
-def cloud_return_evidence(home, task, generation, assignment, kind, worktree, repository_generation):
+def host_publication_contract(home, task, repository_generation):
+    path = home / "state" / (task + ".cloud-payload") / "repository.json"
+    if not path.exists():
+        if path.is_symlink():
+            raise AuthorityError("cloud return host repository contract is redirected")
+        return None
+    if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= 1024 * 1024:
+        raise AuthorityError("cloud return host repository contract is unavailable")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AuthorityError("cloud return host repository contract is unreadable: {}".format(exc))
+    required = {
+        "schema", "task", "remote", "base_branch", "base_ref", "base_commit",
+        "task_branch", "bundle_base_ref", "preserved_refs",
+    }
+    remote = value.get("remote") if isinstance(value, dict) else None
+    base_branch = value.get("base_branch") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("schema") != AZURE_AUTHOR_REPOSITORY_SCHEMA
+        or value.get("task") != task
+        or not isinstance(remote, str)
+        or not AZURE_AUTHOR_ID.fullmatch(remote)
+        or not isinstance(base_branch, str)
+        or not AZURE_AUTHOR_BRANCH.fullmatch(base_branch)
+        or value.get("base_ref") != "refs/remotes/{}/{}".format(remote, base_branch)
+        or value.get("base_commit") != repository_generation
+        or value.get("task_branch") != "fm/{}".format(task)
+        or not isinstance(value.get("preserved_refs"), list)
+        or len(value["preserved_refs"]) > 100
+    ):
+        raise AuthorityError("cloud return host repository contract binding differs")
+    return {
+        "remote": remote,
+        "base_branch": base_branch,
+        "base_commit": repository_generation,
+    }
+
+
+def return_publication_contract(home, task, repository_generation, manifest):
+    fields = {"remote", "base_branch", "base_commit"}
+    present = fields.intersection(manifest)
+    if present and present != fields:
+        raise AuthorityError("cloud return host-publication binding is partial")
+    returned = None
+    if present:
+        if (
+            manifest.get("base_commit") != repository_generation
+            or not isinstance(manifest.get("base_branch"), str)
+            or not AZURE_AUTHOR_BRANCH.fullmatch(manifest["base_branch"])
+            or not isinstance(manifest.get("remote"), str)
+            or not AZURE_AUTHOR_ID.fullmatch(manifest["remote"])
+        ):
+            raise AuthorityError("cloud return host-publication binding differs")
+        returned = {field: manifest[field] for field in fields}
+    hosted = host_publication_contract(home, task, repository_generation)
+    if returned is not None and hosted is not None and returned != hosted:
+        raise AuthorityError("cloud return host-publication binding differs")
+    return returned or hosted
+
+
+def cloud_return_evidence(
+    home, task, generation, assignment, kind, mode, worktree, repository_generation,
+):
     """Prove local custody before releasing remote worker capacity.
 
     This is intentionally not ordinary forge landing. The returned commits
@@ -250,15 +326,27 @@ def cloud_return_evidence(home, task, generation, assignment, kind, worktree, re
     for field, value in manifest_expected.items():
         if manifest_value.get(field) != value:
             raise AuthorityError("cloud return manifest {} binding differs".format(field))
+    publication = None
+    if kind == "ship" and mode == "direct-PR":
+        publication = return_publication_contract(
+            home, task, repository_generation, manifest_value,
+        )
     artifacts = manifest_value.get("artifacts")
     if not isinstance(artifacts, dict):
         raise AuthorityError("cloud return manifest artifact bindings are malformed")
     status_path = home / "state" / (task + ".status")
     if status_path.is_symlink() or not status_path.is_file():
-        raise AuthorityError("cloud return has no local terminal status")
+        raise AuthorityError("cloud return has no local custody status")
     status_lines = [line.strip() for line in status_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    if not status_lines or not re.match(r"^(done|failed):", status_lines[-1]):
-        raise AuthorityError("cloud return has no local terminal status")
+    publication_pending = (
+        status_lines and status_lines[-1]
+        == "working: cloud outcome returned to local custody; host publication pending"
+        and kind == "ship"
+        and mode == "direct-PR"
+        and publication is not None
+    )
+    if not status_lines or (not re.match(r"^(done|failed):", status_lines[-1]) and not publication_pending):
+        raise AuthorityError("cloud return has no local custody status")
     commits = result.get("outcome_commits")
     if not isinstance(commits, int) or isinstance(commits, bool) or commits < 0:
         raise AuthorityError("cloud return commit count is malformed")
@@ -1065,7 +1153,9 @@ def main():
         if worker_placement == "azure":
             landing_authority = lambda: cloud_return_evidence(
                 home, args.task, generation, args.assignment_generation,
-                ordinary_kind, worktree, worker["bindings"]["repository_generation"],
+                ordinary_kind,
+                values.get("mode", [""])[0] if len(values.get("mode", [])) == 1 else "",
+                worktree, worker["bindings"]["repository_generation"],
             )
         else:
             landing_authority = lambda: landing_evidence(

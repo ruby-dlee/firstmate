@@ -20,6 +20,7 @@
 22300	tests/fm-auto-reap.test.sh
 5950	tests/fm-autocompact.test.sh
 2000	tests/fm-azure-assignment-stall.test.sh
+2000	tests/fm-azure-author-product.test.sh
 1000	tests/fm-azure-cell-image.test.sh
 1000	tests/fm-azure-pilot.test.sh
 5000	tests/fm-azure-runner.test.sh

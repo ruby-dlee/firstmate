@@ -44,6 +44,34 @@ run_cloud_credential_is_removed() {
   pass "teardown removes the cloud account credential and its transport state"
 }
 
+run_credential_only_removal_preserves_publication_custody() {
+  local tmp state id
+  fm_test_tmproot_into tmp fm-cloud-state-credentials-only
+  state="$tmp/state"
+  id=cloud-task-publication
+  mkdir -p "$state/$id.cloud-account" "$state/$id.cloud-payload" \
+    "$state/$id.cloud-outcome"
+  printf '{"refresh":"secret"}\n' > "$state/$id.cloud-account/auth.json"
+  printf '{}\n' > "$state/$id.cloud-account/settings.json"
+  printf 'bundle\n' > "$state/$id.cloud-payload/repo.bundle"
+  printf '{}\n' > "$state/$id.worker-result.json"
+  printf 'commits\n' > "$state/$id.cloud-outcome/outcome.bundle"
+
+  fm_cloud_state_remove_credentials "$state" "$id"
+
+  assert_absent "$state/$id.cloud-account/auth.json" \
+    "released worker retained its provider authorization"
+  assert_absent "$state/$id.cloud-account/settings.json" \
+    "released worker retained its provider settings"
+  assert_present "$state/$id.cloud-payload/repo.bundle" \
+    "credential removal destroyed publication payload"
+  assert_present "$state/$id.worker-result.json" \
+    "credential removal destroyed the returned result"
+  assert_present "$state/$id.cloud-outcome/outcome.bundle" \
+    "credential removal destroyed unlanded commits"
+  pass "credential-only removal preserves every artifact needed for publication retry"
+}
+
 run_teardown_actually_calls_the_owner() {
   # Driving the library proves the function works and NOT that anything calls
   # it. The first version of this check counted a literal string, so it stayed
@@ -517,6 +545,7 @@ SHADOW
 }
 
 run_cloud_credential_is_removed
+run_credential_only_removal_preserves_publication_custody
 run_teardown_actually_calls_the_owner
 run_cloud_state_survives_set_e
 run_cloud_credential_survives_a_symlinked_directory

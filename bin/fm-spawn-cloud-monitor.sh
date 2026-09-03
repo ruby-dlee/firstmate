@@ -316,6 +316,41 @@ run_return_lifecycle() {
   )
 }
 
+publish_author_return() {
+  local kind mode status_line publication
+  kind=$(sed -n 's/^kind=//p' "$STATE/$ID.meta" 2>/dev/null | head -1)
+  mode=$(sed -n 's/^mode=//p' "$STATE/$ID.meta" 2>/dev/null | head -1)
+  [ "$kind" = ship ] && [ "$mode" = direct-PR ] || return 0
+  status_line=$(grep -E '^(working|done|failed):' "$STATE/$ID.status" 2>/dev/null | tail -1)
+  case "$status_line" in
+    failed:*) return 0 ;;
+    'done: cloud outcome returned to local custody')
+      # A pre-cutover return has no host publication contract. Its historical
+      # terminal remains authoritative; do not strand it by inventing fields.
+      return 0
+      ;;
+    'working: cloud outcome returned to local custody; host publication pending'|done:\ PR\ *) : ;;
+    *)
+      echo "cloud-crewmate $ID: returned ship has no exact host-publication status; retaining it for retry"
+      return 1
+      ;;
+  esac
+  if ! publication=$(python3 "$SCRIPT_DIR/fm-cloud-author.py" publish \
+    --state "$STATE" --task "$ID" 2>&1); then
+    echo "cloud-crewmate $ID: host publication is not complete; retained for retry: $publication"
+    return 1
+  fi
+  echo "cloud-crewmate $ID: host publication complete: $publication"
+  return 0
+}
+
+remove_released_credentials() {
+  # Once the controller says complete, no later retry may execute on the
+  # worker. Remove provider material immediately even if forge publication
+  # must retry; the result, payload manifest, and outcome bundle remain.
+  fm_cloud_state_remove_credentials "$STATE" "$ID"
+}
+
 finalize_authorized_return() {
   local assignment status proof
   assignment=$(result_field assignment_generation)
@@ -348,8 +383,10 @@ finalize_authorized_return() {
       ;;
     releasing) : ;;
     complete)
+      remove_released_credentials
+      publish_author_return || return 1
       fm_cloud_state_remove "$STATE" "$ID"
-      echo "cloud-crewmate $ID: return is local and the worker assignment is released"
+      echo "cloud-crewmate $ID: return is finalized locally and the worker assignment is released"
       return 0
       ;;
     *)
@@ -366,17 +403,18 @@ finalize_authorized_return() {
     echo "cloud-crewmate $ID: worker release is '$status'; retrying until account and capacity are free"
     return 1
   fi
+  remove_released_credentials
+  publish_author_return || return 1
   fm_cloud_state_remove "$STATE" "$ID"
-  echo "cloud-crewmate $ID: return is local and the worker assignment is released"
+  echo "cloud-crewmate $ID: return is finalized locally and the worker assignment is released"
   return 0
 }
 
 land_outcome_bundle() {
-  # Landing v1: the crewmate committed on the worker's copy of the leased
-  # worktree and the bundle came home digest-verified. The landing authority
-  # stays local, so all that happens here is a fast-forward of the same branch
-  # the bundle was cut from; the ordinary landing flow (push, PR, teardown's
-  # landed-work check) then proceeds unchanged.
+  # Compatibility landing for supervisors predating the return contract: the
+  # crewmate committed on the worker's copy and the bundle came home verified.
+  # Current author spawns take finalize_authorized_return above, which keeps
+  # publication pending until the trusted host pushes and opens the PR.
   local bundle wt base head error tip
   if ! python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$RESULT" 2>/dev/null; then
     # A refusal string or a torn write is not a result. Say so: silence here

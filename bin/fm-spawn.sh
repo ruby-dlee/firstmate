@@ -4898,16 +4898,6 @@ spawn_cloud_persist_convergence_artifacts() {
         echo "error: no brief for cloud payload of $ID (looked for $DATA/$ID/brief.md)" >&2
         exit 1
       fi
-    else
-      # The host author helper fetches and checks out the brief's exact current
-      # integration base, stages only explicitly referenced data artifacts,
-      # captures bounded open-PR/preserved-ref context when requested, labels
-      # every bundled ref, and rewrites the brief to the credentialless return
-      # and host-publication contract. The lifecycle then binds every produced
-      # byte into the execute request before the guest sees it.
-      python3 "$SCRIPT_DIR/fm-cloud-author.py" prepare \
-        --home "$TASK_HOME" --task "$ID" --worktree "$WT" \
-        --payload "$STATE/$ID.cloud-payload" --brief "$DATA/$ID/brief.md" || exit 1
     fi
     if [ "$KIND" = secondmate ]; then
       # The compartment payload additionally ships the session runner and the
@@ -4969,7 +4959,58 @@ spawn_cloud_persist_convergence_artifacts() {
         printf 'export %s=%q\n' "$var" "${!var}"
       done
     } > "$STATE/$ID.cloud-env"
+    if [ "$KIND" != secondmate ]; then
+      # The host author helper runs last because its final preparation step may
+      # move the clean detached lease to a configured non-default base. The
+      # caller adopts that exact bound tip before any later preflight work.
+      python3 "$SCRIPT_DIR/fm-cloud-author.py" prepare \
+        --home "$TASK_HOME" --task "$ID" --worktree "$WT" \
+        --payload "$STATE/$ID.cloud-payload" --brief "$DATA/$ID/brief.md" || exit 1
+    fi
   ) || return 1
+}
+spawn_cloud_adopt_author_rollback_tip() {
+  local contract prepared_tip
+  [ "$KIND" != secondmate ] || return 0
+  contract="$STATE/$ID.cloud-payload/repository.json"
+  prepared_tip=$(python3 - "$contract" "$ID" <<'PY'
+import json
+import os
+import re
+import stat
+import sys
+
+path, task = sys.argv[1:]
+try:
+    metadata = os.lstat(path)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+        raise ValueError
+    with open(path, encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError
+    tip = value.get("base_commit")
+    if (
+        value.get("schema") != "fm.azure-author-repository/v1"
+        or value.get("task") != task
+        or value.get("task_branch") != "fm/" + task
+        or not isinstance(tip, str)
+        or re.fullmatch(r"[0-9a-f]{40}", tip) is None
+    ):
+        raise ValueError
+except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    raise SystemExit(1)
+print(tip)
+PY
+  ) || {
+    echo "error: prepared Azure author base binding is unavailable for $ID" >&2
+    return 1
+  }
+  spawn_checkout_refresh verify-returnable "$WT" "${PROJ_ABS_REAL:-$PROJ_ABS}" "$prepared_tip" || {
+    echo "error: prepared Azure author worktree does not match its exact base binding for $ID" >&2
+    return 1
+  }
+  WORKTREE_EXPECTED_TIP=$prepared_tip
 }
 spawn_cloud_claim_execute_dispatch() {
   # Exactly-once execute dispatch, shared with the tracking monitor: whichever
@@ -4988,6 +5029,7 @@ spawn_cloud_dispatch() {
     echo "error: cloud worker convergence artifacts could not be persisted for $ID" >&2
     return 1
   }
+  spawn_cloud_adopt_author_rollback_tip || return 1
   role_args=()
   # A --secondmate spawn on the cloud lane queues a COMPARTMENT: role=
   # secondmate on an ordinary author slot (R2/R3 B.1). The controller's

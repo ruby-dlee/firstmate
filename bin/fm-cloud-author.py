@@ -255,6 +255,49 @@ def referenced_artifacts(home, task, brief_text, config):
     return files
 
 
+def listed_pr_urls(body, slug):
+    try:
+        document = body.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise AuthorError("open pull request list is not UTF-8: {}".format(exc))
+    headers = re.findall(
+        r"^(?:pull_requests)?\[(0|[1-9][0-9]*)\]\{url\}:$",
+        document,
+        flags=re.MULTILINE,
+    )
+    empty = re.findall(r"^pull_requests\[\]: \[\]$", document, flags=re.MULTILINE)
+    urls = re.findall(
+        r"https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+/pull/[0-9]+",
+        document,
+    )
+    if empty:
+        if len(empty) != 1 or headers or urls:
+            raise AuthorError("gh-axi returned malformed open pull request URL data")
+    elif len(headers) != 1 or int(headers[0]) != len(urls):
+        raise AuthorError("gh-axi returned malformed open pull request URL data")
+    if len(set(urls)) != len(urls):
+        raise AuthorError("gh-axi returned malformed open pull request URL data")
+    count_lines = re.findall(r"^count:.*$", document, flags=re.MULTILINE)
+    counts = re.findall(
+        r"^count: ([0-9]+) \(showing first ([0-9]+)\)$",
+        document,
+        flags=re.MULTILINE,
+    )
+    if count_lines and (
+        len(count_lines) != 1
+        or len(counts) != 1
+        or int(counts[0][0]) < int(counts[0][1])
+        or int(counts[0][1]) != len(urls)
+    ):
+        raise AuthorError("gh-axi returned malformed open pull request URL data")
+    expected = "https://github.com/{}/pull/".format(slug)
+    if any(not url.startswith(expected) for url in urls):
+        raise AuthorError("gh-axi returned an open pull request from another repository")
+    if len(urls) > 100:
+        raise AuthorError("open pull request context exceeds its entry bound")
+    return urls
+
+
 def open_pr_context(worktree, remote, required):
     if not required:
         return None, []
@@ -262,22 +305,53 @@ def open_pr_context(worktree, remote, required):
     binary = os.environ.get("FM_GH_AXI_BIN", "gh-axi")
     result = run(
         [binary, "pr", "list", "--repo", slug, "--state", "open", "--limit", "100",
-         "--fields", "number,title,url,headRefName,headRefOid,baseRefName"],
+         "--fields", "url"],
         check=True,
         limit=MAX_PR_CONTEXT_BYTES,
     )
-    body = result.stdout
-    if not body or len(body) > MAX_PR_CONTEXT_BYTES:
+    if not result.stdout or len(result.stdout) > MAX_PR_CONTEXT_BYTES:
         raise AuthorError("open pull request context is absent or oversized")
+    urls = listed_pr_urls(result.stdout, slug)
+    records = []
     numbers = []
-    for line in body.decode("utf-8", errors="strict").splitlines()[1:]:
-        match = re.match(r"^[ ]*([0-9]+),", line)
-        if match:
-            number = int(match.group(1))
-            if number not in numbers:
-                numbers.append(number)
-    if len(numbers) > 100:
-        raise AuthorError("open pull request context exceeds its entry bound")
+    for url in urls:
+        view = gh_pr_view(binary, slug, url)
+        if view is None:
+            raise AuthorError("gh-axi could not resolve listed pull request {}".format(url))
+        if (
+            view["url"] != url
+            or view["state"].lower() != "open"
+            or not PR_URL.fullmatch(view["url"])
+            or not SHA40.fullmatch(view["headRefOid"])
+        ):
+            raise AuthorError("gh-axi listed pull request context is not exact")
+        validate_branch(view["baseRefName"], "open pull request base branch")
+        validate_branch(view["headRefName"], "open pull request head branch")
+        number = int(url.rsplit("/", 1)[1])
+        numbers.append(number)
+        records.append({
+            "number": number,
+            "url": url,
+            "baseRefName": view["baseRefName"],
+            "headRefName": view["headRefName"],
+            "headRefOid": view["headRefOid"],
+        })
+    lines = [
+        "pull_requests[{}]{{number,url,baseRefName,headRefName,headRefOid}}:".format(
+            len(records)
+        )
+    ]
+    for record in records:
+        lines.append("  {},{},{},{},{}".format(
+            record["number"],
+            json.dumps(record["url"], ensure_ascii=False),
+            json.dumps(record["baseRefName"], ensure_ascii=False),
+            json.dumps(record["headRefName"], ensure_ascii=False),
+            json.dumps(record["headRefOid"], ensure_ascii=False),
+        ))
+    body = ("\n".join(lines) + "\n").encode("utf-8")
+    if len(body) > MAX_PR_CONTEXT_BYTES:
+        raise AuthorError("open pull request context is oversized")
     return body, numbers
 
 
@@ -434,8 +508,6 @@ def prepare(args):
     base_commit = git(worktree, "rev-parse", "--verify", "{}^{{commit}}".format(base_ref)).stdout.decode().strip()
     if not SHA40.fullmatch(base_commit):
         raise AuthorError("fetched base commit is malformed")
-    git(worktree, "checkout", "--quiet", "--detach", base_commit)
-
     files = referenced_artifacts(home, args.task, brief_text, config)
     wants_prs = config.get("include_open_prs", bool(re.search(r"\bopen PRs?\b", brief_text, re.IGNORECASE)))
     pr_body, pr_numbers = open_pr_context(worktree, remote, wants_prs)
@@ -520,6 +592,10 @@ def prepare(args):
     atomic_write(payload / "context.json", context_body)
     atomic_write(payload / "context.tar", context_archive)
     atomic_write(payload / "brief.md", rendered)
+    # Moving the lease is the final fallible preparation step. A context or
+    # bundle refusal therefore leaves the clean lease at its acquisition tip,
+    # while the caller can adopt this exact prepared tip before later work.
+    git(worktree, "checkout", "--quiet", "--detach", base_commit)
     print(json.dumps({
         "base_branch": base_branch,
         "base_commit": base_commit,

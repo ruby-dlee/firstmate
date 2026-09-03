@@ -53,6 +53,7 @@ PR_HEAD=$(git -C "$SOURCE" rev-parse HEAD)
 git --git-dir="$REMOTE" update-ref refs/pull/17/head "$PR_HEAD"
 git clone --quiet "$REMOTE" "$WORKTREE"
 fm_git_identity "$WORKTREE"
+DEFAULT=$(git -C "$WORKTREE" rev-parse HEAD)
 
 cat > "$HOME_DIR/data/$ID/brief.md" <<EOF
 You are in a disposable worktree of Ruby-Labs/ruby-b2c-app on a clean detached default base.
@@ -76,10 +77,34 @@ set -u
 printf '%s\n' "$*" >> "${FM_TEST_GH_LOG:?}"
 case "${1:-} ${2:-}" in
   'pr list')
-    printf '[1]{number,title,url,headRefName,headRefOid,baseRefName}:\n'
-    printf '  17,"Queued idempotency","https://github.com/ruby-labs/b2c/pull/17","pr/open-candidate","%s","env/develop"\n' "${FM_TEST_PR_HEAD:?}"
+    if [ "${FM_TEST_GH_LIST_MODE:-ok}" = unsupported ]; then
+      printf '%s\n' 'error: "Unknown field(s): number, title, headRefName, headRefOid, baseRefName. Available: body, createdAt, labels, mergedAt, milestone, url"' >&2
+      exit 1
+    fi
+    [ "$*" = 'pr list --repo ruby-labs/b2c --state open --limit 100 --fields url' ] || {
+      printf '%s\n' 'error: "Unknown field(s): number, title, headRefName, headRefOid, baseRefName. Available: body, createdAt, labels, mergedAt, milestone, url"' >&2
+      exit 1
+    }
+    if [ "${FM_TEST_GH_LIST_MODE:-ok}" = empty ]; then
+      printf '%s\n' 'count: 0 (showing first 0)' 'pull_requests[]: []'
+      exit 0
+    fi
+    printf '%s\n' 'count: 1 (showing first 1)'
+    printf '%s\n' 'pull_requests[1]{url}:'
+    printf '%s\n' '  https://github.com/ruby-labs/b2c/pull/17'
     ;;
   'pr view')
+    [ "${7:-}" = 'url,state,baseRefName,headRefName,headRefOid' ] || exit 2
+    if [ "${3:-}" = 'https://github.com/ruby-labs/b2c/pull/17' ]; then
+      cat <<EOF
+url: https://github.com/ruby-labs/b2c/pull/17
+state: OPEN
+baseRefName: env/develop
+headRefName: pr/open-candidate
+headRefOid: ${FM_TEST_PR_HEAD:?}
+EOF
+      exit 0
+    fi
     [ -f "${FM_TEST_PR_VIEW:?}" ] || exit 1
     cat "$FM_TEST_PR_VIEW"
     ;;
@@ -119,6 +144,23 @@ assert_contains "$prepare_out" 'requires preserved refs but cloud-context.json n
   "B2C payload did not diagnose the missing preserved-ref grant"
 mv "$HOME_DIR/data/$ID/cloud-context.saved" "$HOME_DIR/data/$ID/cloud-context.json"
 
+if prepare_out=$(FM_TEST_GH_LIST_MODE=unsupported python3 "$AUTHOR" prepare \
+  --home "$HOME_DIR" --task "$ID" --worktree "$WORKTREE" \
+  --payload "$PAYLOAD" --brief "$HOME_DIR/data/$ID/brief.md" 2>&1); then
+  fail "B2C payload ignored the installed gh-axi list-field refusal: $prepare_out"
+fi
+assert_contains "$prepare_out" 'Unknown field(s): number, title, headRefName, headRefOid, baseRefName' \
+  "B2C payload did not reproduce the live gh-axi list-field refusal"
+test "$(git -C "$WORKTREE" rev-parse HEAD)" = "$DEFAULT" \
+  || fail "failed host context capture moved the lease away from its acquisition tip"
+prepare_out=$(FM_TEST_GH_LIST_MODE=empty python3 "$AUTHOR" prepare \
+  --home "$HOME_DIR" --task "$ID" --worktree "$WORKTREE" \
+  --payload "$PAYLOAD" --brief "$HOME_DIR/data/$ID/brief.md" 2>&1) \
+  || fail "empty open-PR context preparation failed: $prepare_out"
+assert_grep 'pull_requests[0]' <(tar -xOf "$PAYLOAD/context.tar" forge/open-prs.toon) \
+  "empty open-PR context did not produce a bounded empty snapshot"
+
+: > "$FM_TEST_GH_LOG"
 prepare_out=$(python3 "$AUTHOR" prepare --home "$HOME_DIR" --task "$ID" \
   --worktree "$WORKTREE" --payload "$PAYLOAD" --brief "$HOME_DIR/data/$ID/brief.md" 2>&1) \
   || fail "B2C payload preparation failed: $prepare_out"
@@ -164,6 +206,27 @@ assert_no_grep 'Use an isolated branch and PR.' "$PAYLOAD/brief.md" \
   "cloud brief still requires the guest to create a PR"
 assert_grep 'PR-URL or PR-readiness requirement is a host completion criterion' \
   "$PAYLOAD/brief.md" "cloud brief does not classify custom PR wording truthfully"
+assert_grep 'https://github.com/ruby-labs/b2c/pull/17' <(tar -xOf "$PAYLOAD/context.tar" forge/open-prs.toon) \
+  "cloud PR context omitted the exact pull request URL"
+assert_grep 'env/develop' <(tar -xOf "$PAYLOAD/context.tar" forge/open-prs.toon) \
+  "cloud PR context omitted the exact base branch"
+assert_grep 'pr/open-candidate' <(tar -xOf "$PAYLOAD/context.tar" forge/open-prs.toon) \
+  "cloud PR context omitted the exact head branch"
+assert_grep "$PR_HEAD" <(tar -xOf "$PAYLOAD/context.tar" forge/open-prs.toon) \
+  "cloud PR context omitted the exact head commit"
+cp "$PAYLOAD/context.json" "$TMP_ROOT/context.first.json"
+cp "$PAYLOAD/context.tar" "$TMP_ROOT/context.first.tar"
+prepare_out=$(python3 "$AUTHOR" prepare --home "$HOME_DIR" --task "$ID" \
+  --worktree "$WORKTREE" --payload "$PAYLOAD" --brief "$HOME_DIR/data/$ID/brief.md" 2>&1) \
+  || fail "repeated B2C payload preparation failed: $prepare_out"
+cmp -s "$TMP_ROOT/context.first.json" "$PAYLOAD/context.json" \
+  || fail "repeated open-PR context capture changed its manifest"
+cmp -s "$TMP_ROOT/context.first.tar" "$PAYLOAD/context.tar" \
+  || fail "repeated open-PR context capture changed its bounded snapshot"
+test "$(grep -c '^pr list .* --fields url$' "$FM_TEST_GH_LOG")" -eq 2 \
+  || fail "repeated context capture did not use the supported gh-axi list field twice"
+test "$(grep -c '^pr view https://github.com/ruby-labs/b2c/pull/17 ' "$FM_TEST_GH_LOG")" -eq 2 \
+  || fail "repeated context capture did not resolve exact PR details twice"
 if grep -R -F 'Canonical pool must not travel.' "$PAYLOAD" >/dev/null; then
   fail "canonical account pool bytes entered the guest payload"
 fi
@@ -190,7 +253,11 @@ assert {sys.argv[5], sys.argv[6]}.issubset(set(held)), (held, sys.argv[5:7])
 assert (guest / ".fm-context/data/product-resumption-plan-2026-08-31.md").read_text() == "Plan section 6.\n"
 assert (guest / ".fm-context/data/b2c-app-freshness-v4/report.md").read_text() == "Freshness report v4.\n"
 assert (guest / ".fm-context/data/b2c-current/producer-contract.txt").read_text() == "Task-specific producer contract.\n"
-assert "Queued idempotency" in (guest / ".fm-context/forge/open-prs.toon").read_text()
+pr_context = (guest / ".fm-context/forge/open-prs.toon").read_text()
+assert "https://github.com/ruby-labs/b2c/pull/17" in pr_context
+assert "env/develop" in pr_context
+assert "pr/open-candidate" in pr_context
+assert sys.argv[6] in pr_context
 PY
 pass "B2C Azure payload carries exact current base, named refs, PR context, and bounded data without pool credentials"
 

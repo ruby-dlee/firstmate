@@ -749,6 +749,58 @@ PY
   pass "cloud staging prevents a guest from becoming a second OAuth refresh authority"
 }
 
+test_nondefault_author_base_rolls_back_from_its_prepared_tip() {
+  local record id out status default_branch base
+  id=cloud-author-base-c2f
+  record=$(make_cloud_case author-base-rollback "$id")
+  read_cloud_case "$record"
+  default_branch=$(git -C "$PROJECT_DIR" branch --show-current)
+  git -C "$PROJECT_DIR" checkout --quiet -b integration/author
+  printf 'author integration base\n' > "$PROJECT_DIR/author-base.txt"
+  git -C "$PROJECT_DIR" add author-base.txt
+  git -C "$PROJECT_DIR" commit --quiet -m 'test: add author integration base'
+  git -C "$PROJECT_DIR" push --quiet origin integration/author
+  base=$(git -C "$PROJECT_DIR" rev-parse HEAD)
+  git -C "$PROJECT_DIR" checkout --quiet "$default_branch"
+  cat > "$HOME_DIR/data/$id/cloud-context.json" <<'EOF'
+{"schema":"fm.azure-author-context-config/v1","base_branch":"integration/author"}
+EOF
+  python3 - "$TMP_ROOT/treehouse-state.json" "$WORKTREE_DIR" "$id" <<'PY'
+import json
+import sys
+
+path, worktree, task = sys.argv[1:]
+value = {
+    "worktrees": [{
+        "path": worktree,
+        "leased": True,
+        "lease_holder": "firstmate-" + task,
+    }]
+}
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(value, stream)
+PY
+  out=$(FM_ACCOUNT_DIRECTORY_TEST_LAB=firstmate-account-directory-test-lab-v1 \
+    FM_TEST_CLOUD_ACCOUNT_BIND_FAIL=1 \
+    run_cloud_spawn "$CASE_DIR" "$HOME_DIR" "$WORKTREE_DIR" "$FAKEBIN_DIR" "$id" "$PROJECT_DIR")
+  status=$?
+  rm -f "$TMP_ROOT/treehouse-state.json"
+  expect_code 1 "$status" "a post-preparation cloud preflight failure should fail: $out"
+  test "$(git -C "$WORKTREE_DIR" rev-parse HEAD)" = "$base" \
+    || fail "Azure author preparation did not leave the lease at the exact configured base"
+  test -z "$(git -C "$WORKTREE_DIR" branch --show-current)" \
+    || fail "Azure author preparation attached the leased worktree to a branch"
+  assert_grep 'TREEHOUSE return .' "$CASE_DIR/treehouse-calls.log" \
+    "spawn rollback did not return the clean lease from its prepared author base"
+  assert_no_grep 'return --force' "$CASE_DIR/treehouse-calls.log" \
+    "spawn rollback used the forcing Treehouse return path"
+  assert_not_contains "$out" 'changed from expected detached tip' \
+    "spawn rollback still compared the prepared author base with the default tip"
+  assert_not_contains "$out" 'retained acquired worktree' \
+    "spawn rollback falsely retained the clean prepared author worktree"
+  pass "non-default Azure author bases become the exact safe rollback tip"
+}
+
 test_cloud_spawn_stays_durably_queued_without_admission() {
   local record id out status meta
   id=cloud-queue-c3
@@ -2140,12 +2192,19 @@ test_compartment_child_withdraw_removes_the_staged_credential() {
   pass "withdrawing a compartment child removes the credential from the home it staged it in"
 }
 
+if [ "${FM_TEST_FOCUSED:-}" = author-base-rollback ]; then
+  test_nondefault_author_base_rolls_back_from_its_prepared_tip
+  echo "# fm-spawn-cloud.test.sh: focused assertions passed"
+  exit 0
+fi
+
 test_cloud_switch_off_keeps_the_local_path_and_metadata_shape
 test_cloud_spawn_places_worker_and_runs_the_entrypoint
 test_cloud_spawn_uses_the_dedicated_azure_account_pool
 test_cloud_spawn_refuses_an_unsafe_azure_account_pool_path
 test_cloud_spawn_refuses_a_gap_in_the_azure_account_pool
 test_cloud_spawn_refuses_a_credential_that_could_refresh_on_the_guest
+test_nondefault_author_base_rolls_back_from_its_prepared_tip
 test_monitor_lands_the_outcome_bundle
 test_monitor_reports_an_already_landed_outcome
 test_monitor_reports_a_crewmate_that_never_committed

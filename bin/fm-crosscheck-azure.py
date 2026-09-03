@@ -405,8 +405,8 @@ def _patterns_match(patterns: list[str], changed_paths: set[str]) -> bool:
     )
 
 
-def _match_state_bound(patterns: list[str], changed_paths: set[str]) -> int:
-    return sum(len(path.split("/")) + 1 for path in changed_paths) * sum(
+def _match_state_bound(patterns: list[str], changed_path_width: int) -> int:
+    return changed_path_width * sum(
         len(pattern.split("/")) + 1 for pattern in patterns
     )
 
@@ -461,11 +461,14 @@ def _review_guidance(
             source_bytes += size
             sources[path] = raw.decode("utf-8")
         match_states = 0
+        changed_path_width = sum(
+            len(path.split("/")) + 1 for path in changed_paths
+        )
         for path in candidates:
             if path in sources:
                 source = sources[path]
                 patterns = _instruction_patterns(source)
-                states = _match_state_bound(patterns, changed_paths)
+                states = _match_state_bound(patterns, changed_path_width)
                 if match_states + states > MAX_REVIEW_GUIDANCE_MATCH_STATES:
                     omitted.append(path)
                 else:
@@ -482,7 +485,7 @@ def _review_guidance(
             source = raw.decode("utf-8")
             sources[path] = source
             patterns = _instruction_patterns(source)
-            states = _match_state_bound(patterns, changed_paths)
+            states = _match_state_bound(patterns, changed_path_width)
             if match_states + states > MAX_REVIEW_GUIDANCE_MATCH_STATES:
                 omitted.append(path)
                 continue

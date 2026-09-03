@@ -2589,7 +2589,8 @@ with tempfile.TemporaryDirectory() as temporary:
     hostile_glob = "/".join(["**"] * 24 + ["never"])
     assert not module._path_matches("/".join(["segment"] * 64), hostile_glob)
     hostile_paths = {"/".join(["segment"] * 64 + [str(index)]) for index in range(200)}
-    assert module._match_state_bound([hostile_glob] * 16, hostile_paths) > module.MAX_REVIEW_GUIDANCE_MATCH_STATES
+    hostile_width = sum(len(path.split("/")) + 1 for path in hostile_paths)
+    assert module._match_state_bound([hostile_glob] * 16, hostile_width) > module.MAX_REVIEW_GUIDANCE_MATCH_STATES
     (scoped / "src/a").mkdir()
     (scoped / "src/b").mkdir()
     (scoped / "src/a/REVIEW.md").write_text("shared scoped rule\n")

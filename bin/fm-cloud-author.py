@@ -27,7 +27,10 @@ CONFIG_SCHEMA = "fm.azure-author-context-config/v1"
 SAFE_TASK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SAFE_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
-PR_URL = re.compile(r"https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+/pull/[0-9]+")
+PR_URL = re.compile(
+    r"https://github\.com/(?P<repository>[A-Za-z0-9-]+/[A-Za-z0-9._-]+)/pull/"
+    r"(?P<number>[1-9][0-9]*)"
+)
 MAX_BRIEF_BYTES = 256 * 1024
 MAX_CONTEXT_BYTES = 32 * 1024 * 1024
 MAX_CONTEXT_ENTRIES = 256
@@ -255,54 +258,70 @@ def referenced_artifacts(home, task, brief_text, config):
     return files
 
 
+def pr_number_from_url(url, slug):
+    match = PR_URL.fullmatch(url) if isinstance(url, str) else None
+    if match is None:
+        raise AuthorError("gh-axi returned malformed open pull request URL data")
+    if match.group("repository") != slug:
+        raise AuthorError("gh-axi returned an open pull request from another repository")
+    return match.group("number")
+
+
 def listed_pr_urls(body, slug):
     try:
         document = body.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
         raise AuthorError("open pull request list is not UTF-8: {}".format(exc))
-    headers = re.findall(
-        r"^(?:pull_requests)?\[(0|[1-9][0-9]*)\]\{url\}:$",
-        document,
-        flags=re.MULTILINE,
-    )
-    empty = re.findall(r"^pull_requests\[\]: \[\]$", document, flags=re.MULTILINE)
-    urls = re.findall(
-        r"https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+/pull/[0-9]+",
-        document,
-    )
-    if empty:
-        if len(empty) != 1 or headers or urls:
+    if not document or "\r" in document:
+        raise AuthorError("gh-axi returned malformed open pull request URL data")
+    lines = document.splitlines()
+    if not lines:
+        raise AuthorError("gh-axi returned malformed open pull request URL data")
+    index = 0
+    shown = None
+    if lines[0].startswith("count:"):
+        count = re.fullmatch(r"count: ([0-9]+) \(showing first ([0-9]+)\)", lines[0])
+        if count is None:
             raise AuthorError("gh-axi returned malformed open pull request URL data")
-    elif len(headers) != 1 or int(headers[0]) != len(urls):
+        total = int(count.group(1))
+        shown = int(count.group(2))
+        if total != shown:
+            raise AuthorError("gh-axi open pull request URL listing is incomplete")
+        index = 1
+    remaining = lines[index:]
+    if remaining == ["pull_requests[]: []"]:
+        if shown not in (None, 0):
+            raise AuthorError("gh-axi returned malformed open pull request URL data")
+        return []
+    if not remaining:
         raise AuthorError("gh-axi returned malformed open pull request URL data")
-    if len(set(urls)) != len(urls):
-        raise AuthorError("gh-axi returned malformed open pull request URL data")
-    count_lines = re.findall(r"^count:.*$", document, flags=re.MULTILINE)
-    counts = re.findall(
-        r"^count: ([0-9]+) \(showing first ([0-9]+)\)$",
-        document,
-        flags=re.MULTILINE,
+    header = re.fullmatch(
+        r"(?:pull_requests)?\[(0|[1-9][0-9]*)\]\{url\}:", remaining[0]
     )
-    if count_lines and (
-        len(count_lines) != 1
-        or len(counts) != 1
-        or int(counts[0][0]) < int(counts[0][1])
-        or int(counts[0][1]) != len(urls)
-    ):
+    if header is None or int(header.group(1)) != len(remaining) - 1:
         raise AuthorError("gh-axi returned malformed open pull request URL data")
-    expected = "https://github.com/{}/pull/".format(slug)
-    if any(not url.startswith(expected) for url in urls):
-        raise AuthorError("gh-axi returned an open pull request from another repository")
-    if len(urls) > 100:
+    if shown is not None and shown != len(remaining) - 1:
+        raise AuthorError("gh-axi returned malformed open pull request URL data")
+    if len(remaining) - 1 > 100:
         raise AuthorError("open pull request context exceeds its entry bound")
-    return urls
+    entries = []
+    seen_urls = set()
+    seen_numbers = set()
+    for row in remaining[1:]:
+        value = re.fullmatch(r"  (\S+)", row)
+        if value is None:
+            raise AuthorError("gh-axi returned malformed open pull request URL data")
+        url = value.group(1)
+        number = pr_number_from_url(url, slug)
+        if url in seen_urls or number in seen_numbers:
+            raise AuthorError("gh-axi returned duplicate open pull request URL data")
+        seen_urls.add(url)
+        seen_numbers.add(number)
+        entries.append((url, number))
+    return entries
 
 
-def open_pr_context(worktree, remote, required):
-    if not required:
-        return None, []
-    slug = remote_slug(worktree, remote)
-    binary = os.environ.get("FM_GH_AXI_BIN", "gh-axi")
+def listed_open_prs(binary, slug):
     result = run(
         [binary, "pr", "list", "--repo", slug, "--state", "open", "--limit", "100",
          "--fields", "url"],
@@ -311,40 +330,48 @@ def open_pr_context(worktree, remote, required):
     )
     if not result.stdout or len(result.stdout) > MAX_PR_CONTEXT_BYTES:
         raise AuthorError("open pull request context is absent or oversized")
-    urls = listed_pr_urls(result.stdout, slug)
     records = []
-    numbers = []
-    for url in urls:
-        view = gh_pr_view(binary, slug, url)
+    for url, number in listed_pr_urls(result.stdout, slug):
+        view = gh_pr_view(binary, slug, number)
         if view is None:
             raise AuthorError("gh-axi could not resolve listed pull request {}".format(url))
         if (
             view["url"] != url
             or view["state"].lower() != "open"
-            or not PR_URL.fullmatch(view["url"])
+            or pr_number_from_url(view["url"], slug) != number
             or not SHA40.fullmatch(view["headRefOid"])
         ):
             raise AuthorError("gh-axi listed pull request context is not exact")
         validate_branch(view["baseRefName"], "open pull request base branch")
         validate_branch(view["headRefName"], "open pull request head branch")
-        number = int(url.rsplit("/", 1)[1])
-        numbers.append(number)
         records.append({
             "number": number,
             "url": url,
+            "state": view["state"],
             "baseRefName": view["baseRefName"],
             "headRefName": view["headRefName"],
             "headRefOid": view["headRefOid"],
         })
+    return records
+
+
+def open_pr_context(worktree, remote, required):
+    if not required:
+        return None, []
+    slug = remote_slug(worktree, remote)
+    binary = os.environ.get("FM_GH_AXI_BIN", "gh-axi")
+    records = listed_open_prs(binary, slug)
+    numbers = [record["number"] for record in records]
     lines = [
-        "pull_requests[{}]{{number,url,baseRefName,headRefName,headRefOid}}:".format(
+        "pull_requests[{}]{{number,url,state,baseRefName,headRefName,headRefOid}}:".format(
             len(records)
         )
     ]
     for record in records:
-        lines.append("  {},{},{},{},{}".format(
+        lines.append("  {},{},{},{},{},{}".format(
             record["number"],
             json.dumps(record["url"], ensure_ascii=False),
+            json.dumps(record["state"], ensure_ascii=False),
             json.dumps(record["baseRefName"], ensure_ascii=False),
             json.dumps(record["headRefName"], ensure_ascii=False),
             json.dumps(record["headRefOid"], ensure_ascii=False),
@@ -642,9 +669,11 @@ def parse_pr_view(document):
     return values
 
 
-def gh_pr_view(binary, slug, branch):
+def gh_pr_view(binary, slug, number):
+    if not isinstance(number, str) or not re.fullmatch(r"[1-9][0-9]*", number):
+        raise AuthorError("gh-axi pull request selector is not a canonical decimal number")
     result = run(
-        [binary, "pr", "view", branch, "--repo", slug, "--fields",
+        [binary, "pr", "view", number, "--repo", slug, "--fields",
          "url,state,baseRefName,headRefName,headRefOid"],
         check=False,
         limit=MAX_PR_CONTEXT_BYTES,
@@ -652,6 +681,16 @@ def gh_pr_view(binary, slug, branch):
     if result.returncode != 0:
         return None
     return parse_pr_view(result.stdout.decode("utf-8", errors="strict"))
+
+
+def matching_open_pr(binary, slug, branch):
+    matches = [
+        record for record in listed_open_prs(binary, slug)
+        if record["headRefName"] == branch
+    ]
+    if len(matches) > 1:
+        raise AuthorError("gh-axi returned multiple open pull requests for the publication head")
+    return matches[0] if matches else None
 
 
 def write_meta_pr(meta_path, url):
@@ -806,7 +845,7 @@ def publish(args):
 
     slug = remote_slug(worktree, remote)
     binary = os.environ.get("FM_GH_AXI_BIN", "gh-axi")
-    view = gh_pr_view(binary, slug, branch)
+    view = matching_open_pr(binary, slug, branch)
     if view is None:
         report = home / "data" / args.task / "completion.md"
         title = git(worktree, "show", "-s", "--format=%s", tip).stdout.decode("utf-8", errors="replace").strip()
@@ -819,9 +858,9 @@ def publish(args):
             limit=MAX_PR_CONTEXT_BYTES,
         )
         # A create may have succeeded server-side before the client failed or
-        # before this process could persist a receipt.  Always resolve by the
-        # branch after the attempt; this makes retry and the crash seam one path.
-        view = gh_pr_view(binary, slug, branch)
+        # before this process could persist a receipt. Always rediscover the
+        # exact head through the same bounded list and numeric-view path.
+        view = matching_open_pr(binary, slug, branch)
         if view is None:
             detail = (created.stderr or created.stdout).decode("utf-8", errors="replace").strip()
             raise AuthorError("pull request creation did not converge: {}".format(detail[-500:] or "no diagnostic"))
@@ -830,7 +869,7 @@ def publish(args):
         or view["baseRefName"] != base_branch
         or view["headRefName"] != branch
         or view["headRefOid"] != tip
-        or not PR_URL.fullmatch(view["url"])
+        or pr_number_from_url(view["url"], slug) != view["number"]
     ):
         raise AuthorError("existing pull request does not match the exact returned publication")
     receipt = {

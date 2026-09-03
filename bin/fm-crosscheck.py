@@ -704,10 +704,17 @@ def validate_run_telemetry(value: Any, label: str) -> None:
         "repeated_paths", "unique_ranges", "repeated_ranges", "response_bytes",
         "truncated_results",
     }
+    legacy_retrieval_fields = retrieval_fields | {"navigation_calls", "navigation_hits"}
     if "retrieval" in value:
         retrieval = value["retrieval"]
         require(isinstance(retrieval, dict), f"{label}.retrieval must be an object")
-        require_exact_keys(retrieval, retrieval_fields, f"{label}.retrieval")
+        require(
+            frozenset(retrieval) in {
+                frozenset(retrieval_fields), frozenset(legacy_retrieval_fields)
+            },
+            f"{label}.retrieval has unknown fields: "
+            f"{sorted(set(retrieval) - legacy_retrieval_fields)}",
+        )
         require(isinstance(retrieval["complete"], bool), f"{label}.retrieval.complete must be boolean")
         for name, measured in retrieval.items():
             if name == "complete":
@@ -798,7 +805,13 @@ def validate_run_telemetry(value: Any, label: str) -> None:
                     require_string(stage_costs[name], f"{stage_label}.costs_usd.{name}")
                 stage_retrieval = measured["retrieval"]
                 require(isinstance(stage_retrieval, dict), f"{stage_label}.retrieval must be an object")
-                require_exact_keys(stage_retrieval, retrieval_fields, f"{stage_label}.retrieval")
+                require(
+                    frozenset(stage_retrieval) in {
+                        frozenset(retrieval_fields), frozenset(legacy_retrieval_fields)
+                    },
+                    f"{stage_label}.retrieval has unknown fields: "
+                    f"{sorted(set(stage_retrieval) - legacy_retrieval_fields)}",
+                )
                 require(
                     isinstance(stage_retrieval["complete"], bool),
                     f"{stage_label}.retrieval.complete must be boolean",

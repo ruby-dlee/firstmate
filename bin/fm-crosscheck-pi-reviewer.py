@@ -1717,7 +1717,7 @@ def run(argv: list[str]) -> int:
                 repository, trust_repository_manifest=environment.get("FM_CROSSCHECK_TRUST_SNAPSHOT_MANIFEST") == "1"
             ).items() if record.get("kind") in {"file", "executable", "metadata"}}
         except (OSError, ValueError, ReviewError):
-            pass  # Missing navigation is not a new review gate.
+            pass  # Optional diagnostic inventory is not a new review gate.
     if stage == "synthesis":
         challenge_prompt = result.with_name("challenge-prompt.txt")
         challenge_result = result.with_name("challenge-result.json")

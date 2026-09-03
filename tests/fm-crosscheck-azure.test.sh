@@ -1701,6 +1701,26 @@ snapshot_identity["review_generation"] = module.digest_bytes(
     )
 ).split(":", 1)[1][:24]
 module.validate_azure_reviewer_record(snapshot_bound, run, "snapshot-bound")
+snapshot_capacity = copy.deepcopy(snapshot_bound)
+snapshot_capacity_identity = snapshot_capacity["azure_identity"]
+snapshot_capacity_identity["repository_snapshot_file_count"] = str(
+    module.MAX_SNAPSHOT_FILES + module.SNAPSHOT_VIRTUAL_FILES
+)
+snapshot_capacity_identity["review_generation"] = module.digest_bytes(
+    module.canonical_bytes(
+        {field: snapshot_capacity_identity[field] for field in snapshot_generation_fields}
+    )
+).split(":", 1)[1][:24]
+module.validate_azure_reviewer_record(snapshot_capacity, run, "snapshot-capacity")
+snapshot_capacity_identity["repository_snapshot_file_count"] = str(
+    module.MAX_SNAPSHOT_FILES + module.SNAPSHOT_VIRTUAL_FILES + 1
+)
+try:
+    module.validate_azure_reviewer_record(snapshot_capacity, run, "snapshot-over-capacity")
+except RuntimeError as exc:
+    assert "measurement exceeds" in str(exc)
+else:
+    raise AssertionError("snapshot virtual-file boundary exceeded its declared maximum")
 lookup_bound = copy.deepcopy(snapshot_bound)
 lookup_identity = lookup_bound["azure_identity"]
 lookup_identity.update({

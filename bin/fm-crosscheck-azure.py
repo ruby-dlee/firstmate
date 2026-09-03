@@ -72,6 +72,7 @@ MAX_NAVIGATION_CARD_BYTES = 16 * 1024
 MAX_NAVIGATION_SYMBOLS = 48
 MAX_NAVIGATION_SCAN_BYTES = 64 * 1024 * 1024
 SNAPSHOT_NAVIGATION_PATH = ".crosscheck-review/navigation.json"
+SNAPSHOT_VIRTUAL_FILES = 2
 SNAPSHOT_SCHEMA = "fm.azure-crosscheck-snapshot/v1"
 SNAPSHOT_GUIDANCE_START = "<!-- crosscheck-review:start -->"
 SNAPSHOT_GUIDANCE_END = "<!-- crosscheck-review:end -->"
@@ -731,7 +732,7 @@ def build_repository_snapshot(
         "head_sha": head_sha,
         "base_sha": base_sha,
         "tracked_file_count": len(raw_entries),
-        "virtual_file_count": 2,
+        "virtual_file_count": SNAPSHOT_VIRTUAL_FILES,
         "included": included,
         "exclusions": exclusions,
     }
@@ -3565,7 +3566,7 @@ def validate_azure_reviewer_record(
             or int(identity["repository_snapshot_uncompressed_bytes"])
             > MAX_SNAPSHOT_UNCOMPRESSED_BYTES
             or int(identity["repository_snapshot_file_count"])
-            > MAX_SNAPSHOT_FILES + 1
+            > MAX_SNAPSHOT_FILES + SNAPSHOT_VIRTUAL_FILES
             or int(identity["repository_snapshot_excluded_count"])
             > MAX_SNAPSHOT_FILES
         ):

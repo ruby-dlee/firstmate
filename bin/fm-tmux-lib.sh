@@ -1,25 +1,19 @@
 #!/usr/bin/env bash
 # fm-tmux-lib.sh — shared tmux pane primitives for firstmate.
 #
-# ONE source of truth for: busy detection, composer-empty (pending-input)
-# detection, and a verify-and-retry-Enter submit. Sourced by both the terminal-
-# backed away-mode compatibility path and bin/fm-send.sh so composer/submit logic
-# cannot drift between the two.
+# ONE source of truth for busy detection, composer-empty (pending-input)
+# detection, and a verify-and-retry-Enter submit. The tmux backend and
+# bin/fm-send.sh share these primitives so composer and submit logic cannot drift.
 #
-# Why this exists (incident afk-invx-i5): the daemon's old composer check only
-# recognized a BARE prompt glyph ("> ") as an empty composer. claude draws its
-# input box with box-drawing borders ("│ > … │"), so every idle claude pane read
-# as "pending input" and the away-mode daemon deferred 100% of escalations for
-# 9.5 hours with no escape. The detector below strips the box borders before
-# deciding, so a bordered-but-empty composer is correctly seen as empty. The same
-# corrected detector backs the submit acknowledgement (a submit "landed" iff the
-# composer is empty afterward), fixing the parallel false "Enter swallowed".
+# Claude draws its input box with box-drawing borders ("│ > … │"). The detector
+# below strips those borders before deciding, so a bordered-but-empty composer is
+# correctly seen as empty. The same detector backs submit acknowledgement: a
+# submit landed only when the composer is empty afterward.
 #
 # Ghost text (incident composer-robust): claude renders a predicted-next-prompt
 # "suggestion" as dim/faint text inside an otherwise-empty composer. A plain
 # capture cannot tell it apart from text a human typed, so the old reader saw an
-# idle pane as holding pending input and the daemon deferred injection / firstmate
-# misjudged the pane. The composer reader now captures just the cursor line WITH
+# idle pane as holding pending input. The composer reader now captures just the cursor line WITH
 # ANSI styling (tmux capture-pane -e) and extracts the real typed content with the
 # shared, fleet-wide fm_composer_strip_ghost (bin/fm-composer-lib.sh), which drops
 # every de-emphasised run - dim/faint (SGR 2) AND a dark/muted truecolor
@@ -28,12 +22,12 @@
 # surfaced (fm-peek and every human/LLM-facing path stay plain), and only the
 # single composer row is captured, so no escape-laden pane bulk is produced. This
 # is harness-generic: any harness that de-emphasises placeholder/ghost text
-# benefits, and the herdr adapter routes through the same owner (task
-# afk-herdr-false-pending), so the two backends cannot drift.
+# benefits, and the herdr adapter routes through the same owner so the two
+# backends cannot drift.
 #
 # Per-harness override: FM_COMPOSER_IDLE_RE matches an empty composer after
 # ghost and structural border stripping. FM_BUSY_REGEX overrides the busy
-# footer set (mirrors fm-watch.sh / the daemon).
+# footer set (mirrors fm-watch.sh).
 #
 # All functions are `set -u` and `set -e` safe (guarded tmux calls, explicit
 # returns) so they can be sourced into either context.

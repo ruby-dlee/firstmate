@@ -2,16 +2,12 @@
 # Shared wake classifier: the common source of truth for captain-relevant status
 # tests, declared-external-wait vocabulary, and the working/paused absorb
 # classification that makes no-verb signal and stale-pane wakes safe to absorb.
-# Sourced by BOTH the always-on watcher
-# (bin/fm-watch.sh) and the away-mode daemon (bin/fm-supervise-daemon.sh) so the
-# overlapping triage policy lives in one place instead of two copies that can
-# drift apart.
+# Sourced by the watcher (`bin/fm-watch.sh`) so status and pane wake policy has
+# one owner.
 #
 # Most functions are pure, side-effect-free reads of status files: each takes
 # what it needs as arguments and touches no globals beyond the optional
-# FM_CAPTAIN_RE override. Consumers layer their own dedup/marker state on top (the
-# daemon keeps its escalation-digest seen-markers; the watcher keeps its .seen-*
-# signatures).
+# FM_CAPTAIN_RE override. The watcher layers its own deduplication markers on top.
 #
 # The one exception is the absorb classification (crew_absorb_class and its
 # working/paused wrappers). It is NOT a pure status-file read: it reuses
@@ -32,9 +28,8 @@ _FM_CLASSIFY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)"
 FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
 
 # Captain-relevant status verbs. A status line carrying any of these is work
-# firstmate must see. Lines without these verbs are no-verb signals: the watcher
-# absorbs them only with positive provably-working evidence, while the daemon uses
-# its away-mode classification. FM_CAPTAIN_RE overrides the whole set when a home
+# firstmate must see. Lines without these verbs are no-verb signals that the watcher
+# absorbs only with positive provably-working evidence. FM_CAPTAIN_RE overrides the whole set when a home
 # needs a custom verb vocabulary; absent, this default applies.
 FM_CLASSIFY_CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'
 
@@ -46,9 +41,8 @@ FM_CLASSIFY_CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|
 # the stale path absorbs it instead of escalating a possible wedge. It is
 # deliberately NOT in the captain-relevant set above: a pause is a "stop
 # wedge-nagging this idle pane" signal, not work to keep surfacing. This constant
-# is the ONE definition of the verb; both the watcher and the daemon read it here
-# (status_is_paused) rather than hardcoding the literal, so the vocabulary cannot
-# drift between the two consumers. FM_CLASSIFY_PAUSED_VERB overrides it.
+# is the ONE definition of the verb; the watcher reads it here through
+# status_is_paused rather than hardcoding the literal. FM_CLASSIFY_PAUSED_VERB overrides it.
 #
 # The pause verb alone is NOT sufficient to prove a deliberate wait: see the
 # failure-pause discriminator immediately below.
@@ -82,9 +76,9 @@ FM_CLASSIFY_PAUSE_HEAD_WORDS_DEFAULT=8
 # Bounded re-surface cadence for a declared pause. Far longer than the wedge
 # threshold (FM_STALE_ESCALATE_SECS, default 240s) so a deliberate wait is not
 # nagged like a wedge, yet finite so a forgotten pause cannot rot invisibly - it
-# re-surfaces once for a recheck every window. One hour by default; both consumers
-# read FM_PAUSE_RESURFACE_SECS with this default so the cadence has one owner.
-# shellcheck disable=SC2034 # Read by the watcher and daemon (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
+# re-surfaces once for a recheck every window. One hour by default; the watcher
+# reads FM_PAUSE_RESURFACE_SECS with this default so the cadence has one owner.
+# shellcheck disable=SC2034 # Read by fm-watch.sh, not this library.
 FM_PAUSE_RESURFACE_SECS_DEFAULT=3600
 
 # The resolution verb that CLOSES a keyed decision opened by needs-decision or
@@ -172,8 +166,7 @@ status_pause_is_failure() {  # <status-line>
 }
 
 # 0 if a status line declares a DELIBERATE external wait (paused: <reason>). A pure
-# read of the line itself, so the daemon's classify_stale can reuse the last line
-# it already read without a fm-crew-state.sh call. Matches only the verb before the
+# read of the line itself. Matches only the verb before the
 # first colon, so a reason mentioning "paused" elsewhere does not false-match, and
 # rejects a failure reported under the pause verb (status_pause_is_failure) so a
 # failure can never be absorbed as a wait.
@@ -566,8 +559,7 @@ signal_crew_provably_working() {  # <file> ...
 
 # 0 (terminal/actionable) if a stale window's last status line is
 # captain-relevant; 1 otherwise, including the no-status case. A 1 only means
-# "non-terminal"; the always-on watcher then applies crew_is_provably_working,
-# while the away-mode daemon applies its persistence recheck.
+# "non-terminal"; the watcher then applies crew_is_provably_working.
 stale_is_terminal() {  # <window> <state>
   local win=$1 state=$2 last
   last=$(last_status_line "$state/$(window_to_task "$win" "$state").status")
@@ -575,10 +567,9 @@ stale_is_terminal() {  # <window> <state>
 }
 
 # Print "<file>\t<task>\t<last-line>" for every state/*.status whose last line is
-# captain-relevant. This is the cheap fleet-scan both supervisors run as a
-# catch-all backstop for a captain-relevant status the per-wake path might miss.
-# No dedup is applied here: each consumer dedupes against its own seen-state (the
-# daemon against .subsuper-seen-status-*, the watcher against .seen-* signatures).
+# captain-relevant. This is the watcher's cheap fleet-scan backstop for a
+# captain-relevant status the per-wake path might miss.
+# No dedup is applied here; the watcher compares its own surfaced markers.
 scan_captain_relevant_statuses() {  # <state>
   local state=$1 f last task
   for f in "$state"/*.status; do

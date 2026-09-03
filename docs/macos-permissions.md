@@ -20,8 +20,6 @@ Apple describes the four controls in [Privacy & Security settings](https://suppo
 
 The default tmux backend controls panes through the tmux Unix socket, so tmux window creation, capture, and `send-keys` require none of these four TCC grants.
 
-The default macOS wedge notification uses `osascript` to display a notification, not to control System Events or another application, so that notification does not require an Automation relationship.
-
 `chrome-devtools-axi` takes page screenshots through the Chrome DevTools Protocol, so those screenshots do not require macOS Screen & System Audio Recording.
 
 Native desktop capture and Codex Computer Use are different because they read pixels outside the browser protocol.

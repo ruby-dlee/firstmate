@@ -94,7 +94,6 @@ Use targeted current-state reads and the recorded backend inventory.
 
 For a dead or missing ordinary endpoint, load `stuck-crewmate-recovery` and preserve its worktree and unlanded work while restoring ownership.
 For a secondmate, load `secondmate-provisioning` and reconcile only that direct report, never its whole child tree from the main home.
-If away mode is present, load `/afk`; its daemon owns supervision until the captain returns.
 Surface only a current captain decision, review-ready outcome, failure, credential need, or proven blocker.
 Otherwise restore live supervision and continue.
 
@@ -135,7 +134,6 @@ Load `crew-steering` before briefing or steering a crewmate, and `harness-adapte
 No turn ends blind while work is active, including a turn described as holding or waiting.
 For a stale, permission-stalled, looping, confused, or unresponsive worker, or a failed steer, load `stuck-crewmate-recovery`.
 Secondmate idle is healthy.
-While `state/.afk` exists, load `/afk` and let its daemon own supervision.
 On an X-mode mention, X-mode error, or X-linked milestone or terminal event, load `fmx-respond` before replying or cleaning up.
 `docs/architecture.md`, the emitted supervision block, `harness-adapters`, and script help own supervision cycles, wake handling, backend mechanics, watcher repair, and harness-specific waits.
 

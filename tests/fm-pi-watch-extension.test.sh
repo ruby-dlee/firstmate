@@ -587,29 +587,18 @@ if (admittedMessages[1]?.customType !== "firstmate-watcher-wake" || admittedMess
 writeFileSync(`${process.env.FM_HOME}/state/.wake-queue`, "");
 await waitFor(() => !queuePending(), "second queue drain");
 
-writeFileSync(`${process.env.FM_HOME}/state/.afk`, "away\n");
-await waitFor(() => !alive(armPid(3)), "away-mode arm stop");
-const awayLaunchCount = launchCount();
-await sleep(80);
-if (launchCount() !== awayLaunchCount) throw new Error("away mode restarted the Pi-owned watcher cycle");
-writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
-await import("node:fs/promises").then(({ unlink }) => unlink(`${process.env.FM_HOME}/state/.afk`));
-await tool.execute("arm-after-away", {}, undefined, undefined, ctx);
-await waitFor(() => launchCount() === awayLaunchCount + 1 && alive(armPid(4)), "arm after away exit");
-assertSingleLiveArm(4);
-
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, "999999\n");
-await waitFor(() => !alive(armPid(4)), "session-lock-loss arm stop");
+await waitFor(() => !alive(armPid(3)), "session-lock-loss arm stop");
 const lockLossCount = launchCount();
 await sleep(80);
 if (launchCount() !== lockLossCount) throw new Error("lock loss restarted the Pi-owned watcher cycle");
 writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
 await tool.execute("arm-after-lock", {}, undefined, undefined, ctx);
-await waitFor(() => launchCount() === lockLossCount + 1 && alive(armPid(5)), "arm after lock reacquisition");
-assertSingleLiveArm(5);
+await waitFor(() => launchCount() === lockLossCount + 1 && alive(armPid(4)), "arm after lock reacquisition");
+assertSingleLiveArm(4);
 
 await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
-await waitFor(() => !alive(armPid(5)), "session-shutdown arm cleanup");
+await waitFor(() => !alive(armPid(4)), "session-shutdown arm cleanup");
 for (let number = 1; number <= launchCount(); number += 1) {
   if (alive(armPid(number))) throw new Error(`arm child ${number} survived cleanup`);
 }

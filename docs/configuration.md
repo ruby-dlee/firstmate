@@ -98,29 +98,12 @@ The caller-facing label remains `fm-<id>`, but the actual cmux workspace title i
 Test cleanup must use the guarded path described in [`docs/cmux-backend.md`](cmux-backend.md)'s "Test safety" section, never enumerate-and-close every workspace.
 The `config/backend` file is not inherited by secondmate homes.
 
-## Away-mode supervisor backend (FM_SUPERVISOR_BACKEND / FM_SUPERVISOR_TARGET)
+## Primary session endpoint overrides (FM_SUPERVISOR_BACKEND / FM_SUPERVISOR_TARGET)
 
-These settings apply only to the terminal-backed compatibility path used by a harness without a native tracked-background completion notification.
-Native tracked delivery completes the away daemon task and does not resolve or inspect a supervisor pane.
-The compatibility path injects escalation digests into firstmate's own pane independently of where new task endpoints are spawned and currently supports only `tmux` and `herdr` supervisor panes.
-Set `FM_SUPERVISOR_BACKEND=tmux|herdr` and `FM_SUPERVISOR_TARGET=<target>` to override both axes explicitly; for herdr the target is `"<session>:<pane-id>"`.
-Without overrides, backend detection uses `$TMUX_PANE` first, then `HERDR_ENV=1` with `HERDR_PANE_ID`, then falls back to `tmux`.
-That keeps a tmux pane nested inside herdr on the tmux transport, matching the runtime backend's innermost-first rule.
-Target detection uses `FM_SUPERVISOR_TARGET`, then `$TMUX_PANE`, then `"${HERDR_SESSION:-default}:${HERDR_PANE_ID}"` under herdr, then the legacy `firstmate:0` tmux fallback with a warning.
-Selecting any other supervisor backend, including `zellij`, `orca`, or `cmux`, refuses compatibility delivery at daemon startup instead of trying tmux injection primitives against a non-tmux pane.
-
-## Away-mode wedge alarm channels (config/wedge-alarm)
-
-When terminal-backed compatibility injection wedges past `FM_MAX_DEFER_SECS`, the sub-supervisor raises a loud, rate-limited alarm.
-Beyond the durable `state/.subsuper-inject-wedged` marker and the tmux status-line flash, it attempts a configured backend-independent active alert that can reach the captain even when every pane and its backend status-line is unreadable.
-`config/wedge-alarm` (local, gitignored) lists channel directives, one per non-empty, non-comment line; every listed non-`off` channel fires, best-effort.
-`FM_WEDGE_ALARM_CHANNEL` overrides the file with a single directive.
-Directives are `off` (a position-independent kill switch that disables every active alert), `auto`/`default`, `osascript` (macOS Notification Center banner), `herdr` (herdr UI notification), and `command:<cmd>` (run `<cmd>` via `sh -c`, summary on `$1` and stdin).
-An absent file means `auto`, i.e. default-on on macOS: the alarm exists precisely so a wedged compatibility delivery is never silent, and it fires at most once per max-defer window after a genuine wedge.
-Native tracked delivery does not use these channels because a due batch completes the task directly without a pane-dependent defer condition.
-A missing or failing channel logs and falls through to the next, never crashing the daemon.
-See [`wedge-alarm.md`](wedge-alarm.md) for the channel reference and macOS verification evidence, and [`examples/wedge-alarm`](examples/wedge-alarm) for a copyable config.
-
+`fm-lock.sh` records a home-bound terminal route only when it can prove that the session's harness process descends from the resolved endpoint.
+`FM_SUPERVISOR_BACKEND` and `FM_SUPERVISOR_TARGET` override automatic endpoint discovery for that lock record.
+Without overrides, discovery checks `$TMUX_PANE`, then `HERDR_ENV=1` with `HERDR_PANE_ID`, then falls back to the legacy tmux target `firstmate:0`.
+The current ownership proof supports tmux; an unsupported or unverified route is simply omitted from the lock.
 
 ## Crosscheck reviewer
 
@@ -591,11 +574,9 @@ It writes `state/x-watch.check.sh`, a check shim that runs `bin/fm-x-poll.sh`, a
 This section is the single owner of the X-mode cadence contract: an X instance polls every 30 seconds instead of the default 300, only an X instance speeds up because a non-X home has no `config/x-mode.env`, and the session-start supervision operating block includes the cadence instruction when that file exists.
 The active primary-harness supervision protocol owns how that sourced cadence reaches the watcher process.
 Because `bin/fm-watch.sh` reads `FM_CHECK_INTERVAL` only at process start, a cadence transition - opt-in while a watcher is already running, or opt-out - is applied by restarting the home-scoped watcher through the emitted harness protocol; bootstrap deliberately never restarts the watcher itself.
-While away mode is active the daemon owns the watcher and its default cadence applies; away-mode X cadence is a deferred follow-up.
 When the token is removed or empty, the next locked session-start bootstrap step removes those artifacts.
 Steady-state off is silent and writes nothing.
-X mode is purely additive: no edit is made to `bin/fm-watch.sh`, `bin/fm-watch-arm.sh`, `bin/fm-wake-lib.sh`, or the afk daemon (`bin/fm-supervise-daemon.sh` and the `afk` skill).
-It lives entirely in X-specific `bin/` scripts, the `fmx-respond` skill, and the generated local artifacts above.
+X mode lives in X-specific `bin/` scripts, the `fmx-respond` skill, and the generated local artifacts above.
 
 `bin/fm-x-poll.sh` calls `GET /connector/poll` with `Authorization: Bearer <FMX_PAIRING_TOKEN>`.
 HTTP 204 is silent.
@@ -733,11 +714,11 @@ FM_ARM_ATTACH_POLL=0.5  # seconds between checks while fm-watch-arm is attached 
 FM_OPENCODE_ARM_READY_TIMEOUT_MS=12000   # milliseconds the OpenCode primary watcher plugin waits for an arm attempt to report started, healthy, wake, or failure
 FM_WATCHER_STALE_GRACE=300   # defaults to FM_GUARD_GRACE; seconds a live watcher lock may have a stale beacon before re-arm errors
 FM_SIGNAL_GRACE=30      # seconds to coalesce nearby status and turn-end signals into one wake
-FM_CAPTAIN_RE='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'   # status regex that makes watcher and daemon signal/stale/scan output captain-relevant
+FM_CAPTAIN_RE='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'   # status regex that makes watcher signal/stale/scan output captain-relevant
 FM_CLASSIFY_PAUSED_VERB=paused     # leading status verb for a declared external wait; excluded from FM_CAPTAIN_RE and distinct from blocked
 FM_STALE_ESCALATE_SECS=240         # idle seconds before a provably-working stale pane escalates; stale panes whose crewmate is not provably working surface immediately unless they declare the pause verb
 FM_PERMISSION_STALL_ESCALATE_SECS=900 # busy seconds without meaningful pane/status/turn-end progress before a possible macOS permission/system-dialog block surfaces; timeout heuristic, not direct OS detection
-FM_PAUSE_RESURFACE_SECS=3600       # seconds before an idle declared external wait re-surfaces for a recheck in the watcher or away-mode daemon
+FM_PAUSE_RESURFACE_SECS=3600       # seconds before an idle declared external wait re-surfaces for a watcher recheck
 FM_WEDGE_DEMAND_INSPECT_COUNT=3    # consecutive unchanged wedge or permission-stall escalations before demand-deep-inspection is added
 FM_WATCH_TRIAGE_LOG_MAX_BYTES=262144   # size cap for the watcher's absorbed-wake debug log
 FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT=     # optional seconds allowed for bootstrap's best-effort clone refresh; unset/blank defaults to max(20, 5 + 3 * origin-backed-project-count)
@@ -763,26 +744,8 @@ GROK_HOME=              # optional Grok config home for firstmate's global grok 
 FM_SEND_RETRIES=3       # fm-send Enter-retry attempts after typing the line once
 FM_SEND_SLEEP=0.4       # seconds between fm-send submit checks
 FM_SEND_SETTLE=1        # seconds fm-send waits after a successful text submit; 0 disables
-# sub-supervisor (bin/fm-supervise-daemon.sh); presence-gated via /afk
-FM_SUPERVISOR_BACKEND=             # terminal-backed compatibility only: optional supervisor pane backend override; tmux/herdr only, otherwise detects $TMUX_PANE then HERDR_ENV/HERDR_PANE_ID before tmux fallback
-FM_SUPERVISOR_TARGET=              # terminal-backed compatibility only: optional supervisor pane target override; tmux target or herdr <session>:<pane-id>, otherwise auto-detected
-FM_INJECT_SKIP=heartbeat           # |-prefixes force-self-handled bypassing classification; empty disables
-FM_ESCALATE_BATCH_SECS=90          # buffer window for batched escalation digests; 0 = flush immediately
-FM_MAX_DEFER_SECS=300              # terminal-backed compatibility only: max buffered escalation age before retry plus wedge alarm; 0 disables
-FM_WEDGE_ALARM_CHANNEL=            # terminal-backed compatibility only: override config/wedge-alarm with one active-alert directive for the wedge alarm; off|auto|osascript|herdr|command:<cmd>; absent = auto (macOS -> an OS notification)
-FM_WEDGE_ALARM_EXEC=              # terminal-backed compatibility only: notifier seam routing every channel through `<cmd> <channel> <summary>`; "discard" fires nothing; unset in production; sourced tests default to "discard" (docs/wedge-alarm.md)
-FM_WEDGE_ALARM_TIMEOUT_SECS=10    # terminal-backed compatibility only: maximum seconds per notifier before its watchdog terminates it and continues; invalid or zero values use 10
-FM_INJECT_FAIL_SLEEP=30            # terminal-backed compatibility only: seconds to back off when the supervisor pane is unavailable
-FM_INJECT_CONFIRM_RETRIES=3        # terminal-backed compatibility only: Enter-retry attempts after typing a digest once
-FM_INJECT_CONFIRM_SLEEP=0.5        # terminal-backed compatibility only: seconds between submit checks
-FM_HEARTBEAT_SCAN_SECS=300         # cadence of the catch-all status scan for missed captain verbs
-FM_HOUSEKEEPING_TICK=15            # seconds between batch-flush, stale/pause-recheck, and scan passes
-FM_CRASH_THRESHOLD=10              # watcher crashes allowed inside FM_CRASH_WINDOW before daemon backoff
-FM_CRASH_WINDOW=60                 # seconds in the crash-loop detection window
-FM_CRASH_BACKOFF=60                # seconds to wait after crossing the crash threshold
-FM_CRASH_NORMAL_SLEEP=5            # seconds to wait after an isolated watcher crash
-FM_LOG_MAX_BYTES=1048576           # daemon log size that triggers trimming
-FM_LOG_KEEP_LINES=2000             # daemon log lines kept when trimming
+FM_SUPERVISOR_BACKEND=             # optional primary endpoint backend override for the session lock route
+FM_SUPERVISOR_TARGET=              # optional primary endpoint target override for the session lock route
 ```
 
 `FM_CREW_STATE_GH_TIMEOUT` accepts only strictly positive whole seconds, defaults to 10 seconds, and clamps every numerically zero, negative, whitespace-padded, or unparseable value to that same 10-second default because an indefinitely hung supervision state reader would stall wedge detection.

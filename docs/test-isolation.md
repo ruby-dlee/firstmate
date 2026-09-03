@@ -7,11 +7,10 @@ Every test sources `tests/test-entry.sh` in its header, so direct execution re-e
 `tests/test-capabilities.tsv` declares exactly one lifecycle capability for every behavior test.
 `hermetic` means the test cannot reach a real Herdr lifecycle.
 `herdr-lab` means the runner must establish an owned, named, never-default Herdr lab before the test starts.
-`herdr-mixed` means the complete test requires that same lab, while the explicit non-Herdr path still runs its hermetic assertions.
 An added, removed, undeclared, duplicate, or incorrectly wired test makes admission fail with exit 97.
 
 Before provisioning any lab, the runner verifies the complete registry and statically refuses raw Herdr server or session lifecycle commands.
-For each admitted `herdr-lab` or `herdr-mixed` test on the complete path, it creates a unique session through `bin/fm-herdr-lab.sh`, installs cleanup before preparation, provisions through that helper, and binds the test to the exact session.
+For each admitted `herdr-lab` test on the complete path, it creates a unique session through `bin/fm-herdr-lab.sh`, installs cleanup before preparation, provisions through that helper, and binds the test to the exact session.
 `tests/herdr-guard-bin/herdr` then routes non-lifecycle Herdr calls through the same helper and rejects raw server/session lifecycle or any foreign/default session selector at command execution.
 The only permitted lifecycle helpers inside a real-Herdr test are the wrappers in `tests/herdr-test-safety.sh`.
 
@@ -72,6 +71,6 @@ Any Azure caller that runs the suite owns its explicit environment declaration u
 Every skip prints one `FM_HOST_CAPABILITY_SKIP` line on stdout and stderr naming the test, the unit, the capability, what the capability is, and why it was unavailable, and `tests/run.sh` prints the whole declaration once per invocation.
 
 Use `tests/run.sh --skip-herdr` for the explicit non-Herdr path.
-That option reports each skipped `herdr-lab` test, runs every `hermetic` test normally, and runs only the hermetic assertions in each `herdr-mixed` test.
+That option reports each skipped `herdr-lab` test and runs every `hermetic` test normally.
 CI selects the same path explicitly with `FM_TEST_SKIP_HERDR=1` on each sealed shard command because its disposable image does not provide Herdr.
 The authoritative runner requires every declared real-Herdr test to prove an owned lab or fail closed.

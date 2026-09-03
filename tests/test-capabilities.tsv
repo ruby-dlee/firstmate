@@ -3,10 +3,6 @@ bridge-cutover-python.test.sh	hermetic
 fm-account-directory.test.sh	hermetic
 fm-account-routing-a.test.sh	hermetic
 fm-account-routing-b.test.sh	hermetic
-fm-afk-inject-e2e.test.sh	hermetic
-fm-afk-inject-herdr-e2e.test.sh	herdr-lab
-fm-afk-launch.test.sh	herdr-mixed
-fm-afk-reap-wake-e2e.test.sh	hermetic
 fm-arm-pretool-check.test.sh	hermetic
 fm-auto-reap-herdr-e2e.test.sh	herdr-lab
 fm-auto-reap.test.sh	hermetic
@@ -51,7 +47,6 @@ fm-crew-state.test.sh	hermetic
 fm-crosscheck-azure.test.sh	hermetic
 fm-crosscheck-slack.test.sh	hermetic
 fm-crosscheck.test.sh	hermetic
-fm-daemon.test.sh	hermetic
 fm-decision-pretool-check.test.sh	hermetic
 fm-dispatch-select.test.sh	hermetic
 fm-ensure-agents-md.test.sh	hermetic
@@ -104,13 +99,13 @@ fm-spawn-dispatch-profile.test.sh	hermetic
 fm-spawn-provision.test.sh	hermetic
 fm-supervision-events.test.sh	hermetic
 fm-supervision-instructions.test.sh	hermetic
+fm-supervision-mode-retirement.test.sh	hermetic
 fm-tangle-guard.test.sh	hermetic
 fm-teardown-a.test.sh	hermetic
 fm-teardown-b.test.sh	hermetic
 fm-transition-lib.test.sh	hermetic
 fm-turnend-guard.test.sh	hermetic
 fm-update.test.sh	hermetic
-fm-wake-daemon-lifecycle-e2e.test.sh	hermetic
 fm-wake-queue.test.sh	hermetic
 fm-watch-checkpoint.test.sh	hermetic
 fm-watch-pause-absorb.test.sh	hermetic

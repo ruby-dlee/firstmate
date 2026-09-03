@@ -206,14 +206,9 @@ for requested in "$@"; do
       run_admitted "$test_script" "$capability" || result=1
       check_cloud_reach || result=1
       ;;
-    herdr-lab|herdr-mixed)
+    herdr-lab)
       if [ "$skip_herdr" -eq 1 ]; then
-        if [ "$capability" = herdr-mixed ]; then
-          run_admitted "$test_script" "$capability" || result=1
-          check_cloud_reach || result=1
-        else
-          printf 'skip: %s declares real Herdr lifecycle; --skip-herdr selected\n' "${test_script#"$ROOT/"}"
-        fi
+        printf 'skip: %s declares real Herdr lifecycle; --skip-herdr selected\n' "${test_script#"$ROOT/"}"
       elif [ -z "$real_herdr" ] || ! command -v jq >/dev/null 2>&1; then
         printf 'test admission refused: %s declares real Herdr lifecycle, but herdr and jq are not both available; use --skip-herdr explicitly\n' \
           "${test_script#"$ROOT/"}" >&2

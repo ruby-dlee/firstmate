@@ -64,6 +64,33 @@ class CrosscheckLedgerValidationTests(unittest.TestCase):
                 with self.assertRaises(CROSSCHECK.CrosscheckError):
                     CROSSCHECK.validate_run_telemetry(value, "test")
 
+        retrieval = {
+            "complete": True, "read_calls": 1, "search_calls": 2,
+            "unique_paths": 1, "repeated_paths": 0, "unique_ranges": 1,
+            "repeated_ranges": 0, "response_bytes": 80, "truncated_results": 0,
+        }
+        legacy_retrieval = {**retrieval, "navigation_calls": 1, "navigation_hits": 4}
+        tokens = {
+            "input": 10, "output": 2, "cache_read": 3, "cache_write": 0,
+            "source": "fixture",
+        }
+        costs = {
+            "provider_reported": None, "provider_reported_source": "unavailable",
+            "pi_calculated": 0.01, "pi_calculated_source": "fixture",
+            "declared": 0.01, "declared_source": "fixture",
+        }
+        compatible = copy.deepcopy(run["telemetry"])
+        compatible["retrieval"] = legacy_retrieval
+        compatible["review_process"] = {
+            **old_process,
+            "stage_metrics": [
+                {"stage": stage, "elapsed_ms": 1, "turns": 1, "tokens": tokens,
+                 "costs_usd": costs, "retrieval": legacy_retrieval}
+                for stage in ("challenge", "synthesis")
+            ],
+        }
+        CROSSCHECK.validate_run_telemetry(compatible, "legacy-navigation")
+
     def test_impact_policy_is_shared_by_prompt_and_finding_tool_schema(self) -> None:
         snapshot = {
             "head_sha": "a" * 40,

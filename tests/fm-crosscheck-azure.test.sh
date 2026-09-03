@@ -1680,7 +1680,7 @@ snapshot_identity.update({
     "repository_snapshot_excluded_count": "1",
     "review_guidance": "review exact behavior",
     "review_guidance_digest": module.digest_bytes(b"review exact behavior"),
-    "review_guidance_source": "b" * 40 + ":AGENTS.md",
+    "review_guidance_source": "b" * 40 + ":selective-guidance-v1",
 })
 snapshot_generation_fields = generation_fields + (
     "repository_snapshot_digest",
@@ -1701,6 +1701,35 @@ snapshot_identity["review_generation"] = module.digest_bytes(
     )
 ).split(":", 1)[1][:24]
 module.validate_azure_reviewer_record(snapshot_bound, run, "snapshot-bound")
+legacy_snapshot = copy.deepcopy(snapshot_bound)
+legacy_snapshot_identity = legacy_snapshot["azure_identity"]
+legacy_snapshot_identity["review_guidance_source"] = "b" * 40 + ":AGENTS.md"
+legacy_snapshot_identity["review_generation"] = module.digest_bytes(
+    module.canonical_bytes(
+        {field: legacy_snapshot_identity[field] for field in snapshot_generation_fields}
+    )
+).split(":", 1)[1][:24]
+module.validate_azure_reviewer_record(legacy_snapshot, run, "legacy-snapshot-bound")
+snapshot_capacity = copy.deepcopy(snapshot_bound)
+snapshot_capacity_identity = snapshot_capacity["azure_identity"]
+snapshot_capacity_identity["repository_snapshot_file_count"] = str(
+    module.MAX_SNAPSHOT_FILES + module.SNAPSHOT_VIRTUAL_FILES
+)
+snapshot_capacity_identity["review_generation"] = module.digest_bytes(
+    module.canonical_bytes(
+        {field: snapshot_capacity_identity[field] for field in snapshot_generation_fields}
+    )
+).split(":", 1)[1][:24]
+module.validate_azure_reviewer_record(snapshot_capacity, run, "snapshot-capacity")
+snapshot_capacity_identity["repository_snapshot_file_count"] = str(
+    module.MAX_SNAPSHOT_FILES + module.SNAPSHOT_VIRTUAL_FILES + 1
+)
+try:
+    module.validate_azure_reviewer_record(snapshot_capacity, run, "snapshot-over-capacity")
+except RuntimeError as exc:
+    assert "measurement exceeds" in str(exc)
+else:
+    raise AssertionError("snapshot virtual-file boundary exceeded its declared maximum")
 lookup_bound = copy.deepcopy(snapshot_bound)
 lookup_identity = lookup_bound["azure_identity"]
 lookup_identity.update({
@@ -2468,11 +2497,15 @@ with tempfile.TemporaryDirectory() as temporary:
         sum(item["size"] for item in built["manifest"]["included"])
         + len(manifest_bytes)
     )
-    assert module.review_guidance(repo, base) == {
-        "content": "check exact behavior",
-        "digest": module.digest_bytes(b"check exact behavior"),
-        "source": base + ":AGENTS.md",
+    guidance = module.review_guidance(repo, base, {"changed.txt"})
+    assert json.loads(guidance["content"]) == {
+        "files": [{"sources": [{"path": "AGENTS.md", "scopes": ["**"]}],
+                   "content": "check exact behavior"}],
+        "omitted_count": 0, "omitted_paths": [],
+        "omitted_digest": module.digest_bytes(module.canonical_bytes([])),
     }
+    assert guidance["digest"] == module.digest_bytes(guidance["content"].encode())
+    assert guidance["source"] == base + ":selective-guidance-v1"
     (repo / "AGENTS.md").write_text(
         "<!-- crosscheck-review:end -->\nreversed\n"
         "<!-- crosscheck-review:start -->\n",
@@ -2481,13 +2514,114 @@ with tempfile.TemporaryDirectory() as temporary:
     git(repo, "add", "AGENTS.md")
     git(repo, "commit", "-qm", "reversed guidance")
     reversed_guidance = git(repo, "rev-parse", "HEAD")
-    try:
-        module.review_guidance(repo, reversed_guidance)
-    except module.AzureCrosscheckError as exc:
-        assert "reversed" in str(exc)
-    else:
-        raise AssertionError("reversed guidance markers raw-raised or validated")
+    malformed_guidance = json.loads(module.review_guidance(
+        repo, reversed_guidance, {"changed.txt"})["content"])
+    assert malformed_guidance["files"] == []
     git(repo, "checkout", "-q", head)
+
+    scoped = root / "scoped-guidance"
+    scoped.mkdir()
+    git(scoped, "init", "-q")
+    git(scoped, "config", "user.name", "guidance fixture")
+    git(scoped, "config", "user.email", "guidance@example.invalid")
+    (scoped / "src/service").mkdir(parents=True)
+    (scoped / ".github/instructions").mkdir(parents=True)
+    (scoped / "AGENTS.md").write_text("root rule\n")
+    (scoped / "src/AGENTS.md").write_text("nearest rule\n")
+    (scoped / "src/REVIEW.md").write_text("review rule\n")
+    (scoped / ".github/instructions/python.instructions.md").write_text(
+        '---\napplyTo: "**/*.py"\n---\n<!-- crosscheck-review:start -->\n'
+        'path rule\napplyTo: "**"\n<!-- crosscheck-review:end -->\n')
+    (scoped / ".github/instructions/café.instructions.md").write_text(
+        '---\napplyTo: "**/*.js"\n---\n<!-- crosscheck-review:start -->\n'
+        'unicode path rule\n<!-- crosscheck-review:end -->\n')
+    (scoped / ".github/instructions/duplicate.instructions.md").write_text(
+        '---\napplyTo: "**/*.py"\napplyTo: "**"\n---\nduplicate rule\n')
+    (scoped / "src/service/code.py").write_text("value = 1\n")
+    git(scoped, "add", ".")
+    git(scoped, "commit", "-qm", "base")
+    scoped_base = git(scoped, "rev-parse", "HEAD")
+    scoped_guidance = json.loads(module.review_guidance(
+        scoped, scoped_base, {"src/service/code.py", "web/b.js"})["content"])
+    assert [row["sources"] for row in scoped_guidance["files"]] == [
+        [{"path": "AGENTS.md", "scopes": ["**"]}],
+        [{"path": "src/AGENTS.md", "scopes": ["src/**"]}],
+        [{"path": "src/REVIEW.md", "scopes": ["src/**"]}],
+        [{"path": ".github/instructions/café.instructions.md", "scopes": ["**/*.js"]}],
+        [{"path": ".github/instructions/python.instructions.md", "scopes": ["**/*.py"]}],
+    ]
+    assert scoped_guidance["omitted_count"] == 0
+    assert all("duplicate.instructions.md" not in source["path"]
+               for row in scoped_guidance["files"] for source in row["sources"])
+    assert next(row for row in scoped_guidance["files"]
+                if row["content"].startswith("path rule"))["sources"][0]["scopes"] == ["**/*.py"]
+    assert module._instruction_match('---\napplyTo: "*.py"\n---\n', {"root.py"})
+    assert not module._instruction_match('---\napplyTo: "*.py"\n---\n', {"web/b.py"})
+    assert module._instruction_match('---\napplyTo: "**/*.py"\n---\n', {"root.py", "web/b.py"})
+    assert module._instruction_patterns('---\r\napplyTo: "**/*.py"\r\n---') == ["**/*.py"]
+    hostile_glob = "/".join(["**"] * 24 + ["never"])
+    assert not module._path_matches("/".join(["segment"] * 64), hostile_glob)
+    hostile_paths = {"/".join(["segment"] * 64 + [str(index)]) for index in range(200)}
+    hostile_width = sum(len(path.split("/")) + 1 for path in hostile_paths)
+    assert module._match_state_bound([hostile_glob] * 16, hostile_width) > module.MAX_REVIEW_GUIDANCE_MATCH_STATES
+    (scoped / "src/a").mkdir()
+    (scoped / "src/b").mkdir()
+    (scoped / "src/a/REVIEW.md").write_text("shared scoped rule\n")
+    (scoped / "src/b/REVIEW.md").write_text("shared scoped rule\n")
+    git(scoped, "add", ".")
+    git(scoped, "commit", "-qm", "duplicate scoped guidance")
+    duplicate_base = git(scoped, "rev-parse", "HEAD")
+    duplicate_guidance = json.loads(module.review_guidance(
+        scoped, duplicate_base, {"src/a/x.py", "src/b/y.py"})["content"])
+    shared = [row for row in duplicate_guidance["files"] if row["content"] == "shared scoped rule"]
+    assert shared == [{"sources": [
+        {"path": "src/a/REVIEW.md", "scopes": ["src/a/**"]},
+        {"path": "src/b/REVIEW.md", "scopes": ["src/b/**"]}],
+                       "content": "shared scoped rule"}]
+    (scoped / "src/café").mkdir()
+    (scoped / "src/café/AGENTS.md").write_text("unicode scoped rule\n")
+    git(scoped, "add", ".")
+    git(scoped, "commit", "-qm", "unicode scoped guidance")
+    unicode_base = git(scoped, "rev-parse", "HEAD")
+    unicode_guidance = json.loads(module.review_guidance(
+        scoped, unicode_base, {"src/café/code.py"})["content"])
+    assert any(row["sources"] == [{"path": "src/café/AGENTS.md", "scopes": ["src/café/**"]}]
+               for row in unicode_guidance["files"])
+
+    many = root / "many-guidance"
+    many.mkdir()
+    git(many, "init", "-q")
+    git(many, "config", "user.name", "guidance scale fixture")
+    git(many, "config", "user.email", "guidance-scale@example.invalid")
+    many_paths = set()
+    for index in range(400):
+        directory = many / f"area-{index:04d}"
+        directory.mkdir()
+        (directory / "REVIEW.md").write_text("x" * 4000)
+        many_paths.add(f"area-{index:04d}/code.py")
+    git(many, "add", ".")
+    git(many, "commit", "-qm", "many omitted guidance files")
+    many_base = git(many, "rev-parse", "HEAD")
+    many_guidance_raw = module.review_guidance(many, many_base, many_paths)["content"]
+    many_guidance = json.loads(many_guidance_raw)
+    assert len(many_guidance_raw.encode()) <= module.MAX_REVIEW_GUIDANCE_BYTES
+    assert many_guidance["files"] == [] and many_guidance["omitted_count"] == 400
+    assert 0 < len(many_guidance["omitted_paths"]) < 400
+    (many / ".github/instructions").mkdir(parents=True)
+    for index in range(20):
+        (many / f".github/instructions/rule-{index:02d}.instructions.md").write_text(
+            '---\napplyTo: "**/*.py"\n---\nsmall rule\n')
+    git(many, "add", ".")
+    git(many, "commit", "-qm", "many path instructions")
+    bounded_base = git(many, "rev-parse", "HEAD")
+    original_match_bound = module.MAX_REVIEW_GUIDANCE_MATCH_STATES
+    module.MAX_REVIEW_GUIDANCE_MATCH_STATES = 10000
+    try:
+        bounded_guidance = json.loads(module.review_guidance(
+            many, bounded_base, many_paths)["content"])
+    finally:
+        module.MAX_REVIEW_GUIDANCE_MATCH_STATES = original_match_bound
+    assert bounded_guidance["omitted_count"] >= 418
     with tarfile.open(first, "r:gz") as archive:
         names = archive.getnames()
         assert all(".git" not in Path(name).parts for name in names)
@@ -5602,6 +5736,28 @@ print(json.dumps({"type": "agent_end"}))
     metrics = telemetry["review_process"]["stage_metrics"]
     assert [row["stage"] for row in metrics] == ["challenge", "synthesis"]
     assert all(row["elapsed_ms"] >= 0 and row["turns"] == 1 for row in metrics)
+    assert [row["tokens"]["input"] for row in metrics] == [10, 10]
+    assert [row["costs_usd"]["declared"] for row in metrics] == [0.00002336, 0.00002336]
+    assert metrics[0]["retrieval"]["read_calls"] == 3
+    assert metrics[0]["retrieval"]["unique_paths"] == 2
+    assert metrics[0]["retrieval"]["repeated_paths"] == 1
+    assert metrics[0]["retrieval"]["unique_ranges"] == 2
+    assert metrics[0]["retrieval"]["repeated_ranges"] == 1
+    assert metrics[1]["retrieval"]["read_calls"] == 0
+    assert telemetry["retrieval"]["response_bytes"] > 0
+    rejected = module.usage_telemetry(
+        {"input": 3, "output": 1, "cache_read": 0, "cache_write": 0},
+        tokens_complete=True, pi_cost=0.0, cost_complete=True, turns=1,
+    )
+    admitted = module.usage_telemetry(
+        {"input": 4, "output": 1, "cache_read": 0, "cache_write": 0},
+        tokens_complete=True, pi_cost=0.0, cost_complete=True, turns=1,
+    )
+    admitted["retrieval"] = {**metrics[0]["retrieval"], "read_calls": 2}
+    repaired = module.merge_telemetry([rejected, admitted])
+    assert repaired["finish_repairs"] == 1
+    assert repaired["retrieval"]["complete"] is False
+    assert repaired["retrieval"]["read_calls"] == 2
 
     completed, launches, value = execute("diagnostics")
     assert completed.returncode == 0, completed.stderr

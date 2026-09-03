@@ -378,7 +378,7 @@ def safe_link(path, target):
 manifest_name = "repository/.crosscheck-snapshot/manifest.json"
 with tarfile.open(source, "r:gz") as archive:
     members = archive.getmembers()
-    # 15,000 tracked files, one generated exact-diff member, and the manifest.
+    # 15,000 tracked files, one generated review-metadata member, and the manifest.
     if len(members) > 15002:
         raise SystemExit("model guest: repository snapshot exceeds member bound")
     names = [member.name for member in members]
@@ -429,7 +429,9 @@ with tarfile.open(source, "r:gz") as archive:
             raise SystemExit("model guest: repository snapshot uses reserved metadata path")
         if record["kind"] not in {"file", "executable", "symlink", "metadata"}:
             raise SystemExit("model guest: repository snapshot file kind is invalid")
-        if record["kind"] == "metadata" and record["path"] != ".crosscheck-review/exact.diff":
+        if record["kind"] == "metadata" and record["path"] not in {
+            ".crosscheck-review/exact.diff"
+        }:
             raise SystemExit("model guest: repository snapshot metadata path is invalid")
         if record["kind"] != "metadata" and path.parts[0] == ".crosscheck-review":
             raise SystemExit("model guest: repository snapshot uses reserved review metadata")

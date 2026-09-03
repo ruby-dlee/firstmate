@@ -76,52 +76,125 @@ cat > "$FAKEBIN/gh-axi" <<'SH'
 set -u
 printf '%s\n' "$*" >> "${FM_TEST_GH_LOG:?}"
 
-print_urls() {
-  local count=$# url
-  if [ "$count" -eq 0 ]; then
-    printf '%s\n' 'count: 0 (showing first 0)' 'pull_requests[]: []'
-    return
-  fi
-  printf 'count: %s (showing first %s)\n' "$count" "$count"
-  printf 'pull_requests[%s]{url}:\n' "$count"
-  for url in "$@"; do
-    printf '  %s\n' "$url"
-  done
+print_footer() {
+  printf '%s\n' \
+    'help[2]:' \
+    '  Run `gh-axi -R ruby-labs/b2c pr view <number>` to view details' \
+    '  Run `gh-axi -R ruby-labs/b2c pr create --title "..." --body-file <path>` to create'
 }
+
+print_rows() {
+  local count=$1 row
+  shift
+  printf 'count: %s\n' "$count"
+  printf 'pull_requests[%s]{number,title,state,author,draft,review,url}:\n' "$count"
+  for row in "$@"; do
+    printf '  %s\n' "$row"
+  done
+  print_footer
+}
+
+print_api() {
+  local number=$1 state=$2 base=$3 head=$4 sha=$5 head_repo=$6 base_repo=$7
+  cat <<EOF
+number: $number
+state: $state
+title: "PR $number"
+body: "Exact REST details."
+merged: false
+head:
+  label: "ruby-labs:$head"
+  ref: $head
+  sha: $sha
+  repo:
+    full_name: $head_repo
+base:
+  label: "ruby-labs:$base"
+  ref: $base
+  sha: ${FM_TEST_BASE:?}
+  repo:
+    full_name: $base_repo
+EOF
+}
+
+context_row='17,"Context, ""quoted"" repair",open,ruby-labs,no,none,"https://github.com/ruby-labs/b2c/pull/17"'
+published_row='99,"Published repair",open,ruby-labs,no,none,"https://github.com/ruby-labs/b2c/pull/99"'
+second_row='100,"Published repair duplicate",open,ruby-labs,no,none,"https://github.com/ruby-labs/b2c/pull/100"'
 
 case "${1:-} ${2:-}" in
   'pr list')
-    if [ "${FM_TEST_GH_LIST_MODE:-ok}" = unsupported ]; then
-      printf '%s\n' 'error: "Unknown field(s): number, title, headRefName, headRefOid, baseRefName. Available: body, createdAt, labels, mergedAt, milestone, url"' >&2
-      exit 1
-    fi
-    [ "$*" = 'pr list --repo ruby-labs/b2c --state open --limit 100 --fields url' ] || {
-      printf '%s\n' 'error: "Unknown field(s): number, title, headRefName, headRefOid, baseRefName. Available: body, createdAt, labels, mergedAt, milestone, url"' >&2
-      exit 1
-    }
+    case "$*" in
+      'pr list --repo ruby-labs/b2c --state open --limit 100 --fields url') head_filter=0 ;;
+      'pr list --repo ruby-labs/b2c --state open --head fm/b2c-current --limit 100 --fields url') head_filter=1 ;;
+      *) printf '%s\n' 'error: unsupported fake gh-axi list invocation' >&2; exit 2 ;;
+    esac
     case "${FM_TEST_GH_LIST_MODE:-ok}" in
-      empty) print_urls ;;
-      duplicate)
-        print_urls \
-          'https://github.com/ruby-labs/b2c/pull/17' \
-          'https://github.com/ruby-labs/b2c/pull/17'
+      legacy)
+        printf '%s\n' 'count: 1 (showing first 1)' 'pull_requests[1]{url}:' \
+          '  https://github.com/ruby-labs/b2c/pull/17'
         ;;
-      foreign) print_urls 'https://github.com/other/b2c/pull/17' ;;
-      malformed) print_urls 'https://github.com/ruby-labs/b2c/pull/017' ;;
-      unresolved) print_urls 'https://github.com/ruby-labs/b2c/pull/18' ;;
+      count-mismatch)
+        printf '%s\n' 'count: 2' \
+          'pull_requests[1]{number,title,state,author,draft,review,url}:' \
+          "  $context_row"
+        print_footer
+        ;;
+      bad-schema)
+        printf '%s\n' 'count: 1' 'pull_requests[1]{number,state,url}:' \
+          '  17,open,"https://github.com/ruby-labs/b2c/pull/17"'
+        print_footer
+        ;;
+      bad-help)
+        printf '%s\n' 'count: 1' \
+          'pull_requests[1]{number,title,state,author,draft,review,url}:' \
+          "  $context_row" 'help[1]:' '  Try another command'
+        ;;
+      bad-csv)
+        print_rows 1 '17,"unterminated,open,ruby-labs,no,none,"https://github.com/ruby-labs/b2c/pull/17"'
+        ;;
+      empty) print_rows 0 ;;
+      too-many)
+        printf '%s\n' 'count: 101' \
+          'pull_requests[101]{number,title,state,author,draft,review,url}:'
+        print_footer
+        ;;
+      duplicate) print_rows 2 "$context_row" "$context_row" ;;
+      foreign)
+        print_rows 1 '17,"Foreign",open,ruby-labs,no,none,"https://github.com/other/b2c/pull/17"'
+        ;;
+      malformed)
+        print_rows 1 '017,"Malformed",open,ruby-labs,no,none,"https://github.com/ruby-labs/b2c/pull/017"'
+        ;;
+      conflicting-list)
+        print_rows 1 '17,"Conflict",open,ruby-labs,no,none,"https://github.com/ruby-labs/b2c/pull/18"'
+        ;;
+      unresolved)
+        print_rows 1 '18,"Unresolved",open,ruby-labs,no,none,"https://github.com/ruby-labs/b2c/pull/18"'
+        ;;
       ambiguous)
-        print_urls \
-          'https://github.com/ruby-labs/b2c/pull/17' \
-          'https://github.com/ruby-labs/b2c/pull/99' \
-          'https://github.com/ruby-labs/b2c/pull/100'
+        if [ "$head_filter" -eq 1 ]; then
+          print_rows 2 "$published_row" "$second_row"
+        else
+          print_rows 3 "$context_row" "$published_row" "$second_row"
+        fi
+        ;;
+      conflicting-head|conflicting-oid)
+        if [ "$head_filter" -eq 1 ]; then
+          print_rows 1 "$second_row"
+        else
+          print_rows 2 "$context_row" "$second_row"
+        fi
         ;;
       *)
-        if [ -f "${FM_TEST_PR_VIEW:?}" ]; then
-          published=$(awk '$1 == "url:" {print $2; exit}' "$FM_TEST_PR_VIEW")
-          print_urls 'https://github.com/ruby-labs/b2c/pull/17' "$published"
-        else
-          print_urls 'https://github.com/ruby-labs/b2c/pull/17'
+        rows=()
+        [ "$head_filter" -eq 1 ] || rows+=("$context_row")
+        if [ -f "${FM_TEST_PR_API:?}" ]; then
+          rows+=("$published_row")
         fi
+        if [ -f "${FM_TEST_AMBIGUOUS_CREATED:?}" ]; then
+          rows+=("$second_row")
+        fi
+        print_rows "${#rows[@]}" "${rows[@]}"
         ;;
     esac
     ;;
@@ -131,36 +204,73 @@ case "${1:-} ${2:-}" in
       printf '%s\n' 'error: Missing PR number' 'code: VALIDATION_ERROR' >&2
       exit 1
     fi
-    [ "${7:-}" = 'url,state,baseRefName,headRefName,headRefOid' ] || exit 2
-    if [ "$selector" = 17 ]; then
-      cat <<EOF
-url: https://github.com/ruby-labs/b2c/pull/17
-state: OPEN
-baseRefName: env/develop
-headRefName: pr/open-candidate
-headRefOid: ${FM_TEST_PR_HEAD:?}
+    cat <<EOF
+pull_request:
+  number: $selector
+  title: "Installed rich summary"
+  state: open
+  author: ruby-labs
+  draft: no
+  merged: no
+  body: "No exact branch or OID fields are exposed."
+  comment_count: 0 — use --comments to see full comments
+  review_count: 0 — use --reviews to see full reviews
 EOF
-      exit 0
-    fi
-    if [ "${FM_TEST_GH_LIST_MODE:-ok}" = ambiguous ] \
-      && { [ "$selector" = 99 ] || [ "$selector" = 100 ]; }; then
-      head=$(git --git-dir="${FM_TEST_REMOTE:?}" rev-parse refs/heads/fm/b2c-current)
-      cat <<EOF
-url: https://github.com/ruby-labs/b2c/pull/$selector
-state: OPEN
-baseRefName: env/develop
-headRefName: fm/b2c-current
-headRefOid: $head
+    ;;
+  'api /repos/ruby-labs/b2c/pulls/17')
+    case "${FM_TEST_GH_LIST_MODE:-ok}" in
+      incomplete-api)
+        cat <<EOF
+number: 17
+state: open
+head:
+  ref: pr/open-candidate
+  repo:
+    full_name: ruby-labs/b2c
+base:
+  ref: env/develop
+  repo:
+    full_name: ruby-labs/b2c
 EOF
-      exit 0
-    fi
-    if [ -f "${FM_TEST_PR_VIEW:?}" ] \
-      && grep -q "^url: https://github.com/ruby-labs/b2c/pull/$selector$" "$FM_TEST_PR_VIEW"; then
-      cat "$FM_TEST_PR_VIEW"
-      exit 0
-    fi
+        ;;
+      foreign-api)
+        print_api 17 open env/develop pr/open-candidate "${FM_TEST_PR_HEAD:?}" other/b2c ruby-labs/b2c
+        ;;
+      bad-oid)
+        print_api 17 open env/develop pr/open-candidate abc ruby-labs/b2c ruby-labs/b2c
+        ;;
+      bad-branch)
+        print_api 17 open env/develop 'bad branch' "${FM_TEST_PR_HEAD:?}" ruby-labs/b2c ruby-labs/b2c
+        ;;
+      conflict-number)
+        print_api 19 open env/develop pr/open-candidate "${FM_TEST_PR_HEAD:?}" ruby-labs/b2c ruby-labs/b2c
+        ;;
+      closed-api)
+        print_api 17 closed env/develop pr/open-candidate "${FM_TEST_PR_HEAD:?}" ruby-labs/b2c ruby-labs/b2c
+        ;;
+      *)
+        print_api 17 open env/develop pr/open-candidate "${FM_TEST_PR_HEAD:?}" ruby-labs/b2c ruby-labs/b2c
+        ;;
+    esac
+    ;;
+  'api /repos/ruby-labs/b2c/pulls/18')
     printf '%s\n' 'error: pull request not found' >&2
     exit 1
+    ;;
+  'api /repos/ruby-labs/b2c/pulls/99')
+    if [ -f "${FM_TEST_PR_API:?}" ]; then
+      cat "$FM_TEST_PR_API"
+    else
+      printf '%s\n' 'error: pull request not found' >&2
+      exit 1
+    fi
+    ;;
+  'api /repos/ruby-labs/b2c/pulls/100')
+    head=$(git --git-dir="${FM_TEST_REMOTE:?}" rev-parse refs/heads/fm/b2c-current)
+    base=env/develop
+    [ "${FM_TEST_GH_LIST_MODE:-ok}" != conflicting-head ] || base=main
+    [ "${FM_TEST_GH_LIST_MODE:-ok}" != conflicting-oid ] || head=${FM_TEST_PR_HEAD:?}
+    print_api 100 open "$base" fm/b2c-current "$head" ruby-labs/b2c ruby-labs/b2c
     ;;
   'pr create')
     if [ "${FM_TEST_GH_CREATE_MODE:-accepted}" = no-server-result ]; then
@@ -168,15 +278,13 @@ EOF
       exit 75
     fi
     head=$(git --git-dir="${FM_TEST_REMOTE:?}" rev-parse refs/heads/fm/b2c-current)
-    cat > "${FM_TEST_PR_VIEW:?}" <<EOF
-url: https://github.com/ruby-labs/b2c/pull/99
-state: OPEN
-baseRefName: env/develop
-headRefName: fm/b2c-current
-headRefOid: $head
-EOF
+    print_api 99 open env/develop fm/b2c-current "$head" ruby-labs/b2c ruby-labs/b2c \
+      > "${FM_TEST_PR_API:?}"
+    if [ "${FM_TEST_GH_CREATE_MODE:-accepted}" = ambiguous ]; then
+      : > "${FM_TEST_AMBIGUOUS_CREATED:?}"
+    fi
     # Model a client failure after GitHub accepted the create. The host helper
-    # must rediscover by bounded listing plus numeric view and not duplicate it.
+    # must rediscover through the bounded rich list plus numeric REST API.
     exit 75
     ;;
   *) exit 2 ;;
@@ -187,7 +295,9 @@ chmod +x "$FAKEBIN/gh-axi"
 export FM_GH_AXI_BIN="$FAKEBIN/gh-axi"
 export FM_TEST_GH_LOG="$TMP_ROOT/gh.log"
 export FM_TEST_PR_HEAD="$PR_HEAD"
-export FM_TEST_PR_VIEW="$TMP_ROOT/pr-view.toon"
+export FM_TEST_BASE="$BASE"
+export FM_TEST_PR_API="$TMP_ROOT/pr-api.toon"
+export FM_TEST_AMBIGUOUS_CREATED="$TMP_ROOT/ambiguous-created"
 export FM_TEST_REMOTE="$REMOTE"
 export FM_CLOUD_AUTHOR_TEST_HOOKS=azure-author-tests-v1
 export FM_CLOUD_AUTHOR_TEST_REPOSITORY=ruby-labs/b2c
@@ -201,6 +311,13 @@ for selector in 'https://github.com/ruby-labs/b2c/pull/17' 'fm/b2c-current'; do
   test "$selector_out" = $'error: Missing PR number\ncode: VALIDATION_ERROR' \
     || fail "fake gh-axi did not reproduce the installed non-numeric selector refusal"
 done
+selector_out=$("$FM_GH_AXI_BIN" pr view 17 --repo ruby-labs/b2c \
+  --fields url,state,baseRefName,headRefName,headRefOid) \
+  || fail "fake gh-axi rejected the installed numeric view surface"
+assert_contains "$selector_out" 'pull_request:' \
+  "fake gh-axi did not reproduce the installed rich numeric view summary"
+assert_not_contains "$selector_out" 'headRefOid' \
+  "fake gh-axi invented exact detail fields unsupported by gh-axi 0.1.25"
 
 mv "$HOME_DIR/data/$ID/cloud-context.json" "$HOME_DIR/data/$ID/cloud-context.saved"
 if prepare_out=$(python3 "$AUTHOR" prepare --home "$HOME_DIR" --task "$ID" \
@@ -211,13 +328,13 @@ assert_contains "$prepare_out" 'requires preserved refs but cloud-context.json n
   "B2C payload did not diagnose the missing preserved-ref grant"
 mv "$HOME_DIR/data/$ID/cloud-context.saved" "$HOME_DIR/data/$ID/cloud-context.json"
 
-if prepare_out=$(FM_TEST_GH_LIST_MODE=unsupported python3 "$AUTHOR" prepare \
+if prepare_out=$(FM_TEST_GH_LIST_MODE=legacy python3 "$AUTHOR" prepare \
   --home "$HOME_DIR" --task "$ID" --worktree "$WORKTREE" \
   --payload "$PAYLOAD" --brief "$HOME_DIR/data/$ID/brief.md" 2>&1); then
-  fail "B2C payload ignored the installed gh-axi list-field refusal: $prepare_out"
+  fail "B2C payload accepted the obsolete URL-only list shape: $prepare_out"
 fi
-assert_contains "$prepare_out" 'Unknown field(s): number, title, headRefName, headRefOid, baseRefName' \
-  "B2C payload did not reproduce the live gh-axi list-field refusal"
+assert_contains "$prepare_out" 'malformed open pull request list data' \
+  "B2C payload did not require the installed rich gh-axi list schema"
 test "$(git -C "$WORKTREE" rev-parse HEAD)" = "$DEFAULT" \
   || fail "failed host context capture moved the lease away from its acquisition tip"
 
@@ -233,14 +350,38 @@ assert_pr_context_refusal() {
     || fail "$label moved the lease away from its acquisition tip"
 }
 
-assert_pr_context_refusal duplicate 'duplicate open pull request URL data' \
-  'duplicate open-PR URL context'
+assert_pr_context_refusal too-many 'exceeds its entry bound' \
+  'over-limit open-PR list context'
+assert_pr_context_refusal count-mismatch 'malformed open pull request list data' \
+  'inconsistent open-PR row counts'
+assert_pr_context_refusal bad-schema 'malformed open pull request list data' \
+  'wrong rich open-PR table schema'
+assert_pr_context_refusal bad-help 'malformed open pull request list data' \
+  'missing installed open-PR help footer'
+assert_pr_context_refusal bad-csv 'malformed open pull request CSV data' \
+  'malformed quoted open-PR CSV row'
+assert_pr_context_refusal duplicate 'duplicate open pull request list data' \
+  'duplicate open-PR list context'
 assert_pr_context_refusal foreign 'open pull request from another repository' \
   'foreign-repository open-PR URL context'
-assert_pr_context_refusal malformed 'malformed open pull request URL data' \
-  'non-canonical open-PR URL context'
+assert_pr_context_refusal malformed 'malformed open pull request list data' \
+  'non-canonical open-PR number context'
+assert_pr_context_refusal conflicting-list 'conflicting open pull request list data' \
+  'conflicting open-PR number and URL context'
 assert_pr_context_refusal unresolved 'could not resolve listed pull request' \
   'unresolved numeric open-PR context'
+assert_pr_context_refusal incomplete-api 'lacks exact head.sha' \
+  'incomplete open-PR API context'
+assert_pr_context_refusal foreign-api 'pull request from another repository' \
+  'foreign-repository open-PR API context'
+assert_pr_context_refusal bad-oid 'malformed pull request API head OID' \
+  'malformed open-PR head OID context'
+assert_pr_context_refusal bad-branch 'pull request API head branch is malformed' \
+  'malformed open-PR head branch context'
+assert_pr_context_refusal conflict-number 'conflicting pull request API number' \
+  'conflicting open-PR API number context'
+assert_pr_context_refusal closed-api 'conflicting open pull request state data' \
+  'conflicting open-PR API state context'
 
 prepare_out=$(FM_TEST_GH_LIST_MODE=empty python3 "$AUTHOR" prepare \
   --home "$HOME_DIR" --task "$ID" --worktree "$WORKTREE" \
@@ -297,7 +438,7 @@ assert_grep 'PR-URL or PR-readiness requirement is a host completion criterion' 
   "$PAYLOAD/brief.md" "cloud brief does not classify custom PR wording truthfully"
 assert_grep 'https://github.com/ruby-labs/b2c/pull/17' <(tar -xOf "$PAYLOAD/context.tar" forge/open-prs.toon) \
   "cloud PR context omitted the exact pull request URL"
-assert_grep '"OPEN"' <(tar -xOf "$PAYLOAD/context.tar" forge/open-prs.toon) \
+assert_grep '"open"' <(tar -xOf "$PAYLOAD/context.tar" forge/open-prs.toon) \
   "cloud PR context omitted the exact pull request state"
 assert_grep 'env/develop' <(tar -xOf "$PAYLOAD/context.tar" forge/open-prs.toon) \
   "cloud PR context omitted the exact base branch"
@@ -315,12 +456,11 @@ cmp -s "$TMP_ROOT/context.first.json" "$PAYLOAD/context.json" \
 cmp -s "$TMP_ROOT/context.first.tar" "$PAYLOAD/context.tar" \
   || fail "repeated open-PR context capture changed its bounded snapshot"
 test "$(grep -c '^pr list .* --fields url$' "$FM_TEST_GH_LOG")" -eq 2 \
-  || fail "repeated context capture did not use the supported gh-axi list field twice"
-test "$(grep -c '^pr view 17 --repo ruby-labs/b2c --fields url,state,baseRefName,headRefName,headRefOid$' "$FM_TEST_GH_LOG")" -eq 2 \
-  || fail "repeated context capture did not resolve exact PR details numerically twice"
-if grep '^pr view ' "$FM_TEST_GH_LOG" \
-  | grep -Ev '^pr view [1-9][0-9]* --repo ruby-labs/b2c --fields ' >/dev/null; then
-  fail "open-PR context used a non-numeric gh-axi pr view selector"
+  || fail "repeated context capture did not use the bounded rich gh-axi list twice"
+test "$(grep -c '^api /repos/ruby-labs/b2c/pulls/17$' "$FM_TEST_GH_LOG")" -eq 2 \
+  || fail "repeated context capture did not resolve exact PR details through the numeric API"
+if grep -q '^pr view ' "$FM_TEST_GH_LOG"; then
+  fail "open-PR context used the unsupported gh-axi pr view detail surface"
 fi
 if grep -R -F 'Canonical pool must not travel.' "$PAYLOAD" >/dev/null; then
   fail "canonical account pool bytes entered the guest payload"
@@ -436,12 +576,22 @@ for field in ("remote", "base_branch", "base_commit"):
 open(path, "w").write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
 PY
 
-cat > "$FM_TEST_PR_VIEW" <<EOF
-url: https://github.com/ruby-labs/b2c/pull/99
-state: OPEN
-baseRefName: env/develop
-headRefName: fm/b2c-current
-headRefOid: $TIP
+cat > "$FM_TEST_PR_API" <<EOF
+number: 99
+state: open
+title: "Existing publication"
+body: "Exact REST details."
+merged: false
+head:
+  ref: fm/b2c-current
+  sha: $TIP
+  repo:
+    full_name: ruby-labs/b2c
+base:
+  ref: env/develop
+  sha: $BASE
+  repo:
+    full_name: ruby-labs/b2c
 EOF
 : > "$FM_TEST_GH_LOG"
 publish_out=$(python3 "$AUTHOR" publish --state "$HOME_DIR/state" --task "$ID" 2>&1) \
@@ -459,8 +609,22 @@ if publish_out=$(FM_TEST_GH_LIST_MODE=ambiguous python3 "$AUTHOR" publish \
   --state "$HOME_DIR/state" --task "$ID" 2>&1); then
   fail "host publication guessed among multiple matching open PRs: $publish_out"
 fi
-assert_contains "$publish_out" 'multiple open pull requests for the publication head' \
-  "host publication did not diagnose matching-head ambiguity"
+assert_contains "$publish_out" 'multiple exact open pull requests for the publication head' \
+  "host publication did not diagnose exact matching-head ambiguity"
+
+if publish_out=$(FM_TEST_GH_LIST_MODE=conflicting-head python3 "$AUTHOR" publish \
+  --state "$HOME_DIR/state" --task "$ID" 2>&1); then
+  fail "host publication accepted conflicting same-head PR details: $publish_out"
+fi
+assert_contains "$publish_out" 'conflicting open pull request publication data' \
+  "host publication did not diagnose conflicting same-head details"
+
+if publish_out=$(FM_TEST_GH_LIST_MODE=conflicting-oid python3 "$AUTHOR" publish \
+  --state "$HOME_DIR/state" --task "$ID" 2>&1); then
+  fail "host publication accepted a same-head PR at another OID: $publish_out"
+fi
+assert_contains "$publish_out" 'conflicting open pull request publication data' \
+  "host publication did not diagnose a conflicting publication head OID"
 
 test "$(git --git-dir="$REMOTE" rev-parse refs/heads/fm/$ID)" = "$TIP" \
   || fail "host publication did not push the exact returned tip"
@@ -471,7 +635,16 @@ assert_grep 'done: PR https://github.com/ruby-labs/b2c/pull/99' "$HOME_DIR/state
 assert_present "$HOME_DIR/data/$ID/cloud-publication.json" \
   "host publication did not persist its retry receipt"
 
-rm "$FM_TEST_PR_VIEW"
+rm "$FM_TEST_PR_API"
+: > "$FM_TEST_GH_LOG"
+if publish_out=$(FM_TEST_GH_CREATE_MODE=ambiguous python3 "$AUTHOR" publish \
+  --state "$HOME_DIR/state" --task "$ID" 2>&1); then
+  fail "host publication accepted multiple exact PRs after create: $publish_out"
+fi
+assert_contains "$publish_out" 'multiple exact open pull requests for the publication head' \
+  "host publication did not diagnose post-create exact-head ambiguity"
+rm "$FM_TEST_PR_API" "$FM_TEST_AMBIGUOUS_CREATED"
+
 : > "$FM_TEST_GH_LOG"
 if publish_out=$(FM_TEST_GH_CREATE_MODE=no-server-result python3 "$AUTHOR" publish \
   --state "$HOME_DIR/state" --task "$ID" 2>&1); then
@@ -495,12 +668,13 @@ publish_out=$(python3 "$AUTHOR" publish --state "$HOME_DIR/state" --task "$ID" 2
   || fail "post-create publication retry was not idempotent: $publish_out"
 test "$(grep -c '^pr create ' "$FM_TEST_GH_LOG")" -eq 1 \
   || fail "post-create publication retry created a duplicate PR"
-test "$(grep -c '^pr view 99 --repo ruby-labs/b2c --fields url,state,baseRefName,headRefName,headRefOid$' "$FM_TEST_GH_LOG")" -ge 2 \
-  || fail "publication did not inspect the discovered PR by numeric selector"
-if grep '^pr view ' "$FM_TEST_GH_LOG" \
-  | grep -Ev '^pr view [1-9][0-9]* --repo ruby-labs/b2c --fields ' >/dev/null; then
-  fail "publication used a non-numeric gh-axi pr view selector"
+test "$(grep -c '^api /repos/ruby-labs/b2c/pulls/99$' "$FM_TEST_GH_LOG")" -ge 2 \
+  || fail "publication did not inspect the discovered PR through the numeric API"
+if grep -q '^pr view ' "$FM_TEST_GH_LOG"; then
+  fail "publication used the unsupported gh-axi pr view detail surface"
 fi
+assert_grep 'pr list --repo ruby-labs/b2c --state open --head fm/b2c-current --limit 100 --fields url' \
+  "$FM_TEST_GH_LOG" "publication did not use bounded server-side head filtering"
 test "$(grep -c '^pr=https://github.com/ruby-labs/b2c/pull/99$' "$HOME_DIR/state/$ID.meta")" -eq 1 \
   || fail "host publication retry duplicated task PR metadata"
 test "$(grep -c '^done: PR https://github.com/ruby-labs/b2c/pull/99$' "$HOME_DIR/state/$ID.status")" -eq 1 \

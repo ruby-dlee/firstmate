@@ -2492,7 +2492,7 @@ with tempfile.TemporaryDirectory() as temporary:
     )
     guidance = module.review_guidance(repo, base, {"changed.txt"})
     assert json.loads(guidance["content"]) == {
-        "files": [{"path": "AGENTS.md", "content": "check exact behavior"}],
+        "files": [{"paths": ["AGENTS.md"], "content": "check exact behavior"}],
         "omitted": [],
     }
     assert guidance["digest"] == module.digest_bytes(guidance["content"].encode())
@@ -2543,11 +2543,23 @@ with tempfile.TemporaryDirectory() as temporary:
     scoped_base = git(scoped, "rev-parse", "HEAD")
     scoped_guidance = json.loads(module.review_guidance(
         scoped, scoped_base, {"src/service/code.py"})["content"])
-    assert [row["path"] for row in scoped_guidance["files"]] == [
-        "AGENTS.md", "src/AGENTS.md", "src/REVIEW.md",
-        ".github/instructions/python.instructions.md",
+    assert [row["paths"] for row in scoped_guidance["files"]] == [
+        ["AGENTS.md"], ["src/AGENTS.md"], ["src/REVIEW.md"],
+        [".github/instructions/python.instructions.md"],
     ]
     assert scoped_guidance["omitted"] == []
+    (scoped / "src/a").mkdir()
+    (scoped / "src/b").mkdir()
+    (scoped / "src/a/REVIEW.md").write_text("shared scoped rule\n")
+    (scoped / "src/b/REVIEW.md").write_text("shared scoped rule\n")
+    git(scoped, "add", ".")
+    git(scoped, "commit", "-qm", "duplicate scoped guidance")
+    duplicate_base = git(scoped, "rev-parse", "HEAD")
+    duplicate_guidance = json.loads(module.review_guidance(
+        scoped, duplicate_base, {"src/a/x.py", "src/b/y.py"})["content"])
+    shared = [row for row in duplicate_guidance["files"] if row["content"] == "shared scoped rule"]
+    assert shared == [{"paths": ["src/a/REVIEW.md", "src/b/REVIEW.md"],
+                       "content": "shared scoped rule"}]
     with tarfile.open(first, "r:gz") as archive:
         names = archive.getnames()
         assert all(".git" not in Path(name).parts for name in names)
@@ -5672,6 +5684,19 @@ print(json.dumps({"type": "agent_end"}))
     assert metrics[0]["retrieval"]["repeated_ranges"] == 1
     assert metrics[1]["retrieval"]["read_calls"] == 0
     assert telemetry["retrieval"]["response_bytes"] > 0
+    rejected = module.usage_telemetry(
+        {"input": 3, "output": 1, "cache_read": 0, "cache_write": 0},
+        tokens_complete=True, pi_cost=0.0, cost_complete=True, turns=1,
+    )
+    admitted = module.usage_telemetry(
+        {"input": 4, "output": 1, "cache_read": 0, "cache_write": 0},
+        tokens_complete=True, pi_cost=0.0, cost_complete=True, turns=1,
+    )
+    admitted["retrieval"] = {**metrics[0]["retrieval"], "read_calls": 2}
+    repaired = module.merge_telemetry([rejected, admitted])
+    assert repaired["finish_repairs"] == 1
+    assert repaired["retrieval"]["complete"] is False
+    assert repaired["retrieval"]["read_calls"] == 2
 
     completed, launches, value = execute("diagnostics")
     assert completed.returncode == 0, completed.stderr

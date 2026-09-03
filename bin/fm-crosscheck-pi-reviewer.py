@@ -395,6 +395,7 @@ def replay_tool_log(
     retrieval_paths: set[str] = set()
     retrieval_ranges: set[tuple[str, int, int]] = set()
     retrieval = {
+        "complete": True,
         "read_calls": 0, "search_calls": 0, "navigation_calls": 0,
         "unique_paths": 0, "repeated_paths": 0,
         "unique_ranges": 0, "repeated_ranges": 0,
@@ -933,10 +934,15 @@ def merge_telemetry(attempts: list[dict[str, Any]]) -> dict[str, Any]:
         "finish_repairs": max(0, len(attempts) - 1),
     }
     retrieval_rows = [attempt.get("retrieval") for attempt in attempts]
-    if retrieval_rows and all(isinstance(row, dict) for row in retrieval_rows):
+    present_retrieval = [row for row in retrieval_rows if isinstance(row, dict)]
+    if present_retrieval:
         merged["retrieval"] = {
-            key: sum(row.get(key, 0) for row in retrieval_rows)
-            for key in retrieval_rows[0]
+            "complete": len(present_retrieval) == len(retrieval_rows)
+            and all(row.get("complete") is True for row in present_retrieval),
+            **{
+                key: sum(row.get(key, 0) for row in present_retrieval)
+                for key in present_retrieval[0] if key != "complete"
+            },
         }
     return merged
 
@@ -1237,8 +1243,11 @@ def combine_stage_telemetry(stages: list[dict[str, Any]]) -> dict[str, Any]:
         "truncated_results", "navigation_hits",
     )
     combined["retrieval"] = {
-        key: sum(stage.get("retrieval", {}).get(key, 0) for stage in stages)
-        for key in retrieval_keys
+        "complete": all(stage.get("retrieval", {}).get("complete") is True for stage in stages),
+        **{
+            key: sum(stage.get("retrieval", {}).get(key, 0) for stage in stages)
+            for key in retrieval_keys
+        },
     }
     combined["finish_repairs"] = sum(
         telemetry.get("finish_repairs", 0)

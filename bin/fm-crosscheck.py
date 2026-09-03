@@ -700,7 +700,7 @@ def validate_run_telemetry(value: Any, label: str) -> None:
             f"{label}.finish_repairs must be a nonnegative integer",
         )
     retrieval_fields = {
-        "read_calls", "search_calls", "navigation_calls", "unique_paths",
+        "complete", "read_calls", "search_calls", "navigation_calls", "unique_paths",
         "repeated_paths", "unique_ranges", "repeated_ranges", "response_bytes",
         "truncated_results", "navigation_hits",
     }
@@ -708,7 +708,10 @@ def validate_run_telemetry(value: Any, label: str) -> None:
         retrieval = value["retrieval"]
         require(isinstance(retrieval, dict), f"{label}.retrieval must be an object")
         require_exact_keys(retrieval, retrieval_fields, f"{label}.retrieval")
+        require(isinstance(retrieval["complete"], bool), f"{label}.retrieval.complete must be boolean")
         for name, measured in retrieval.items():
+            if name == "complete":
+                continue
             require(
                 isinstance(measured, int) and not isinstance(measured, bool) and measured >= 0,
                 f"{label}.retrieval.{name} must be a nonnegative integer",
@@ -796,7 +799,13 @@ def validate_run_telemetry(value: Any, label: str) -> None:
                 stage_retrieval = measured["retrieval"]
                 require(isinstance(stage_retrieval, dict), f"{stage_label}.retrieval must be an object")
                 require_exact_keys(stage_retrieval, retrieval_fields, f"{stage_label}.retrieval")
+                require(
+                    isinstance(stage_retrieval["complete"], bool),
+                    f"{stage_label}.retrieval.complete must be boolean",
+                )
                 for name, number in stage_retrieval.items():
+                    if name == "complete":
+                        continue
                     require(
                         isinstance(number, int) and not isinstance(number, bool) and number >= 0,
                         f"{stage_label}.retrieval.{name} is invalid",

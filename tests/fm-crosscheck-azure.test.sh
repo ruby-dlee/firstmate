@@ -2492,8 +2492,10 @@ with tempfile.TemporaryDirectory() as temporary:
     )
     guidance = module.review_guidance(repo, base, {"changed.txt"})
     assert json.loads(guidance["content"]) == {
-        "files": [{"paths": ["AGENTS.md"], "content": "check exact behavior"}],
-        "omitted": [],
+        "files": [{"sources": [{"path": "AGENTS.md", "scopes": ["**"]}],
+                   "content": "check exact behavior"}],
+        "omitted_count": 0, "omitted_paths": [],
+        "omitted_digest": module.digest_bytes(module.canonical_bytes([])),
     }
     assert guidance["digest"] == module.digest_bytes(guidance["content"].encode())
     assert guidance["source"] == base + ":selective-guidance-v1"
@@ -2524,6 +2526,19 @@ with tempfile.TemporaryDirectory() as temporary:
         ("src/caller.py", 2, "reference"),
     }
     assert len(module.canonical_bytes(card)) + 1 <= module.MAX_NAVIGATION_CARD_BYTES
+    original_card_bound = module.MAX_NAVIGATION_CARD_BYTES
+    module.MAX_NAVIGATION_CARD_BYTES = 512
+    try:
+        dense = json.loads(module.build_navigation_card(
+            b"diff --git a/dense.py b/dense.py\n+++ b/dense.py\n+const repeated_symbol = 1\n",
+            [({"path": "dense.py", "kind": "file"},
+              ("repeated_symbol\n" * 100000).encode())],
+            {"dense.py"},
+        ))
+    finally:
+        module.MAX_NAVIGATION_CARD_BYTES = original_card_bound
+    assert dense["omitted_locations"] > 99000
+    assert len(module.canonical_bytes(dense)) + 1 <= 512
 
     scoped = root / "scoped-guidance"
     scoped.mkdir()
@@ -2536,18 +2551,21 @@ with tempfile.TemporaryDirectory() as temporary:
     (scoped / "src/AGENTS.md").write_text("nearest rule\n")
     (scoped / "src/REVIEW.md").write_text("review rule\n")
     (scoped / ".github/instructions/python.instructions.md").write_text(
-        '---\napplyTo: "**/*.py"\n---\npath rule\n')
+        '---\napplyTo: "**/*.py"\n---\n<!-- crosscheck-review:start -->\n'
+        'path rule\n<!-- crosscheck-review:end -->\n')
     (scoped / "src/service/code.py").write_text("value = 1\n")
     git(scoped, "add", ".")
     git(scoped, "commit", "-qm", "base")
     scoped_base = git(scoped, "rev-parse", "HEAD")
     scoped_guidance = json.loads(module.review_guidance(
-        scoped, scoped_base, {"src/service/code.py"})["content"])
-    assert [row["paths"] for row in scoped_guidance["files"]] == [
-        ["AGENTS.md"], ["src/AGENTS.md"], ["src/REVIEW.md"],
-        [".github/instructions/python.instructions.md"],
+        scoped, scoped_base, {"src/service/code.py", "web/b.js"})["content"])
+    assert [row["sources"] for row in scoped_guidance["files"]] == [
+        [{"path": "AGENTS.md", "scopes": ["**"]}],
+        [{"path": "src/AGENTS.md", "scopes": ["src/**"]}],
+        [{"path": "src/REVIEW.md", "scopes": ["src/**"]}],
+        [{"path": ".github/instructions/python.instructions.md", "scopes": ["**/*.py"]}],
     ]
-    assert scoped_guidance["omitted"] == []
+    assert scoped_guidance["omitted_count"] == 0
     (scoped / "src/a").mkdir()
     (scoped / "src/b").mkdir()
     (scoped / "src/a/REVIEW.md").write_text("shared scoped rule\n")
@@ -2558,8 +2576,39 @@ with tempfile.TemporaryDirectory() as temporary:
     duplicate_guidance = json.loads(module.review_guidance(
         scoped, duplicate_base, {"src/a/x.py", "src/b/y.py"})["content"])
     shared = [row for row in duplicate_guidance["files"] if row["content"] == "shared scoped rule"]
-    assert shared == [{"paths": ["src/a/REVIEW.md", "src/b/REVIEW.md"],
+    assert shared == [{"sources": [
+        {"path": "src/a/REVIEW.md", "scopes": ["src/a/**"]},
+        {"path": "src/b/REVIEW.md", "scopes": ["src/b/**"]}],
                        "content": "shared scoped rule"}]
+    (scoped / "src/café").mkdir()
+    (scoped / "src/café/AGENTS.md").write_text("unicode scoped rule\n")
+    git(scoped, "add", ".")
+    git(scoped, "commit", "-qm", "unicode scoped guidance")
+    unicode_base = git(scoped, "rev-parse", "HEAD")
+    unicode_guidance = json.loads(module.review_guidance(
+        scoped, unicode_base, {"src/café/code.py"})["content"])
+    assert any(row["sources"] == [{"path": "src/café/AGENTS.md", "scopes": ["src/café/**"]}]
+               for row in unicode_guidance["files"])
+
+    many = root / "many-guidance"
+    many.mkdir()
+    git(many, "init", "-q")
+    git(many, "config", "user.name", "guidance scale fixture")
+    git(many, "config", "user.email", "guidance-scale@example.invalid")
+    many_paths = set()
+    for index in range(400):
+        directory = many / f"area-{index:04d}"
+        directory.mkdir()
+        (directory / "REVIEW.md").write_text("x" * 4000)
+        many_paths.add(f"area-{index:04d}/code.py")
+    git(many, "add", ".")
+    git(many, "commit", "-qm", "many omitted guidance files")
+    many_base = git(many, "rev-parse", "HEAD")
+    many_guidance_raw = module.review_guidance(many, many_base, many_paths)["content"]
+    many_guidance = json.loads(many_guidance_raw)
+    assert len(many_guidance_raw.encode()) <= module.MAX_REVIEW_GUIDANCE_BYTES
+    assert many_guidance["files"] == [] and many_guidance["omitted_count"] == 400
+    assert 0 < len(many_guidance["omitted_paths"]) < 400
     with tarfile.open(first, "r:gz") as archive:
         names = archive.getnames()
         assert all(".git" not in Path(name).parts for name in names)

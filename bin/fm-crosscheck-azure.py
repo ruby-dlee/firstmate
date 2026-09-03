@@ -68,6 +68,7 @@ MAX_SNAPSHOT_PATH_BYTES = 512
 MAX_SNAPSHOT_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_GUIDANCE_BYTES = 8 * 1024
 MAX_REVIEW_GUIDANCE_FILE_BYTES = 3 * 1024
+MAX_REVIEW_GUIDANCE_FILES_BYTES = 6 * 1024
 MAX_NAVIGATION_CARD_BYTES = 16 * 1024
 MAX_NAVIGATION_SYMBOLS = 48
 MAX_NAVIGATION_SCAN_BYTES = 64 * 1024 * 1024
@@ -360,11 +361,15 @@ def _guidance_excerpt(path: str, source: str) -> str:
     return source.strip() if len(encoded) <= MAX_REVIEW_GUIDANCE_FILE_BYTES else ""
 
 
-def _instruction_match(source: str, changed_paths: set[str]) -> bool:
+def _instruction_patterns(source: str) -> list[str]:
     match = re.search(r"(?m)^applyTo:\s*[\"']?([^\n\"']+)", source[:2048])
     if match is None:
-        return False
-    patterns = [item.strip() for item in match.group(1).split(",") if item.strip()]
+        return []
+    return [item.strip() for item in match.group(1).split(",") if item.strip()]
+
+
+def _instruction_match(source: str, changed_paths: set[str]) -> bool:
+    patterns = _instruction_patterns(source)
     return any(
         fnmatch.fnmatchcase(path, pattern)
         or (pattern.startswith("**/") and fnmatch.fnmatchcase(path, pattern[3:]))
@@ -378,14 +383,16 @@ def review_guidance(
     """Project only applicable, bounded guidance from the proven merge base."""
 
     tree = run_command(
-        ["git", "-C", str(repository), "ls-tree", "-r", "--name-only", base_sha],
+        ["git", "-C", str(repository), "ls-tree", "-rz", "--name-only", base_sha],
         timeout=60, maximum_output=8 * 1024 * 1024, check=True,
     )
     try:
-        paths = set(tree.stdout.decode("utf-8").splitlines())
+        paths = {
+            item.decode("utf-8") for item in tree.stdout.split(b"\0") if item
+        }
     except UnicodeError as exc:
         raise AzureCrosscheckError("merge-base guidance tree is not UTF-8") from exc
-    selected = {"AGENTS.md"} if "AGENTS.md" in paths else set()
+    selected: dict[str, set[str]] = {"AGENTS.md": {"**"}} if "AGENTS.md" in paths else {}
     for changed in changed_paths:
         parents = list(PurePosixPath(changed).parents)
         for parent in parents:
@@ -393,14 +400,26 @@ def review_guidance(
             candidates = [prefix + "AGENTS.md", prefix + "REVIEW.md"]
             nearest = [item for item in candidates if item in paths]
             if nearest:
-                selected.update(nearest)
+                for item in nearest:
+                    selected.setdefault(item, set()).add(prefix + "**")
                 break
-    for path in sorted(paths):
-        if not (path.startswith(".github/instructions/") and path.endswith(".instructions.md")):
-            continue
-        source = _base_text(repository, base_sha, path)
-        if source is not None and _instruction_match(source, changed_paths):
-            selected.add(path)
+    instruction_lines = run_command(
+        ["git", "-C", str(repository), "grep", "-n", "-I", "-e", "^applyTo:",
+         base_sha, "--", ".github/instructions/*.instructions.md"],
+        timeout=60, maximum_output=8 * 1024 * 1024, check=False,
+    )
+    if instruction_lines.returncode not in {0, 1}:
+        raise AzureCrosscheckError("merge-base path-guidance selection failed")
+    try:
+        instruction_output = instruction_lines.stdout.decode("utf-8")
+    except UnicodeError as exc:
+        raise AzureCrosscheckError("merge-base path guidance is not UTF-8") from exc
+    for line in instruction_output.split("\n"):
+        match = re.match(r"^[^:]+:(.+\.instructions\.md):\d+:(applyTo:.*)$", line)
+        if match and _instruction_match(match.group(2), changed_paths):
+            selected.setdefault(match.group(1), set()).update(
+                _instruction_patterns(match.group(2))
+            )
     records = []
     by_digest: dict[str, dict[str, Any]] = {}
     omitted = []
@@ -413,23 +432,44 @@ def review_guidance(
         digest = digest_bytes(excerpt.encode("utf-8"))
         if digest in by_digest:
             record = by_digest[digest]
-            proposed = {**record, "paths": [*record["paths"], path]}
+            proposed = {
+                **record,
+                "sources": [*record["sources"], {
+                    "path": path, "scopes": sorted(selected[path]),
+                }],
+            }
             candidate_records = [proposed if item is record else item for item in records]
-            if len(canonical_bytes({"files": candidate_records, "omitted": omitted})) > MAX_REVIEW_GUIDANCE_BYTES:
+            if len(canonical_bytes({"files": candidate_records})) > MAX_REVIEW_GUIDANCE_FILES_BYTES:
                 omitted.append(path)
             else:
-                record["paths"].append(path)
+                record["sources"].append(
+                    {"path": path, "scopes": sorted(selected[path])}
+                )
             continue
-        candidate = {"paths": [path], "content": excerpt}
-        if len(canonical_bytes({"files": [*records, candidate], "omitted": omitted})) > MAX_REVIEW_GUIDANCE_BYTES:
+        candidate = {
+            "sources": [{"path": path, "scopes": sorted(selected[path])}],
+            "content": excerpt,
+        }
+        if len(canonical_bytes({"files": [*records, candidate]})) > MAX_REVIEW_GUIDANCE_FILES_BYTES:
             omitted.append(path)
             continue
         records.append(candidate)
         by_digest[digest] = candidate
-    content = canonical_bytes({"files": records, "omitted": omitted}).decode("utf-8")
-    while len(content.encode("utf-8")) > MAX_REVIEW_GUIDANCE_BYTES and records:
-        omitted.extend(records.pop()["paths"])
-        content = canonical_bytes({"files": records, "omitted": sorted(omitted)}).decode("utf-8")
+    omitted = sorted(omitted)
+    omission_digest = digest_bytes(canonical_bytes(omitted))
+    omitted_paths: list[str] = []
+    for path in omitted:
+        candidate = {
+            "files": records, "omitted_count": len(omitted),
+            "omitted_paths": [*omitted_paths, path], "omitted_digest": omission_digest,
+        }
+        if len(canonical_bytes(candidate)) > MAX_REVIEW_GUIDANCE_BYTES:
+            break
+        omitted_paths.append(path)
+    content = canonical_bytes({
+        "files": records, "omitted_count": len(omitted),
+        "omitted_paths": omitted_paths, "omitted_digest": omission_digest,
+    }).decode("utf-8")
     encoded = content.encode("utf-8")
     if len(encoded) > MAX_REVIEW_GUIDANCE_BYTES:
         raise AzureCrosscheckError(
@@ -480,6 +520,7 @@ def build_navigation_card(
             omitted_paths += 1
     locations: list[dict[str, Any]] = []
     omitted = 0
+    card_full = False
     omitted_scan_files = 0
     scanned = 0
     roots = {path.split("/", 1)[0] for path in changed_paths}
@@ -517,6 +558,9 @@ def build_navigation_card(
                     else "reference"
                 )
                 candidate = {"symbol": symbol, "path": path, "line": line_number, "kind": kind}
+                if card_full:
+                    omitted += 1
+                    continue
                 proposed = {
                     "schema": "fm.crosscheck-navigation/v1",
                     "changed_paths": projected_paths,
@@ -525,10 +569,11 @@ def build_navigation_card(
                     "omitted_locations": omitted,
                     "omitted_scan_files": omitted_scan_files,
                 }
-                if len(canonical_bytes(proposed)) <= MAX_NAVIGATION_CARD_BYTES:
-                    locations.append(candidate)
-                else:
+                if len(canonical_bytes(proposed)) > MAX_NAVIGATION_CARD_BYTES:
+                    card_full = True
                     omitted += 1
+                else:
+                    locations.append(candidate)
     card = {
         "schema": "fm.crosscheck-navigation/v1",
         "changed_paths": projected_paths,

@@ -9,6 +9,7 @@ set -u
 
 AUTHOR="$ROOT/bin/fm-cloud-author.py"
 SUPERVISOR="$ROOT/bin/fm-worker-supervisor.py"
+LIVE_EMPTY_FIXTURE="$ROOT/tests/fixtures/gh-axi-v0.1.25-pr-list-empty.toon"
 TMP_ROOT=$(fm_test_tmproot fm-azure-author-product)
 HOME_DIR="$TMP_ROOT/home"
 REMOTE="$TMP_ROOT/remote.git"
@@ -114,6 +115,18 @@ print_empty() {
   print_footer
 }
 
+print_live_empty_footer() {
+  printf '%s\n' \
+    'help[2]:' \
+    '  - Run `gh-axi -R ruby-labs/b2c pr create --title "..." --body-file <path>` to create a PR' \
+    '  - Run `gh-axi -R ruby-labs/b2c pr list --state closed` to see closed PRs'
+}
+
+print_live_empty() {
+  printf '%s\n' 'count: 0' 'pull_requests: []'
+  print_live_empty_footer
+}
+
 print_api() {
   local number=$1 state=$2 base=$3 head=$4 sha=$5 head_repo=$6 base_repo=$7
   cat <<EOF
@@ -193,6 +206,20 @@ case "${1:-} ${2:-}" in
           "  $context_row"
         print_footer
         ;;
+      live-empty-malformed)
+        printf '%s\n' 'count: 0' 'pull_requests: [unexpected]'
+        print_live_empty_footer
+        ;;
+      live-empty-mixed)
+        printf '%s\n' 'count: 0 (showing first 0)' 'pull_requests: []'
+        print_live_empty_footer
+        ;;
+      live-empty-unexpected)
+        printf '%s\n' 'count: 0' 'pull_requests: []' 'help[2]:' \
+          '  - Run `gh-axi -R ruby-labs/b2c pr create --title "..." --body-file <path>` to create a PR' \
+          '  - Run `gh-axi -R ruby-labs/b2c pr list --state merged` to see merged PRs'
+        ;;
+      live-empty) print_live_empty ;;
       empty) print_empty ;;
       too-many)
         printf '%s\n' 'count: 101' \
@@ -349,6 +376,20 @@ export FM_CLOUD_AUTHOR_TEST_HOOKS=azure-author-tests-v1
 export FM_CLOUD_AUTHOR_TEST_REPOSITORY=ruby-labs/b2c
 mkdir -p "$PAYLOAD"
 
+python3 - "$AUTHOR" "$LIVE_EMPTY_FIXTURE" <<'PY' \
+  || fail "Azure author parser rejected the exact installed empty-list fixture"
+import importlib.util
+from pathlib import Path
+import sys
+
+spec = importlib.util.spec_from_file_location("fm_cloud_author", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert module.listed_pr_rows(
+    Path(sys.argv[2]).read_bytes(), "ruby-dlee/firstmate"
+) == []
+PY
+
 for selector in 'https://github.com/ruby-labs/b2c/pull/17' 'fm/b2c-current'; do
   if selector_out=$("$FM_GH_AXI_BIN" pr view "$selector" --repo ruby-labs/b2c \
     --fields url,state,baseRefName,headRefName,headRefOid 2>&1); then
@@ -436,6 +477,12 @@ assert_pr_context_refusal zero-rich-header 'malformed open pull request list dat
   'invented counted table for an empty open-PR list'
 assert_pr_context_refusal empty-with-row 'malformed open pull request list data' \
   'inline empty open-PR list followed by a hidden row'
+assert_pr_context_refusal live-empty-malformed 'malformed open pull request list data' \
+  'malformed installed empty-list array'
+assert_pr_context_refusal live-empty-mixed 'malformed open pull request list data' \
+  'mixed installed and bounded empty-list forms'
+assert_pr_context_refusal live-empty-unexpected 'malformed open pull request list data' \
+  'unexpected installed empty-list help footer'
 
 prepare_out=$(FM_TEST_GH_LIST_MODE=bounded-header python3 "$AUTHOR" prepare \
   --home "$HOME_DIR" --task "$ID" --worktree "$WORKTREE" \
@@ -451,6 +498,13 @@ prepare_out=$(FM_TEST_GH_LIST_MODE=empty python3 "$AUTHOR" prepare \
   || fail "empty open-PR context preparation failed: $prepare_out"
 assert_grep 'pull_requests[0]' <(tar -xOf "$PAYLOAD/context.tar" forge/open-prs.toon) \
   "empty open-PR context did not produce a bounded empty snapshot"
+
+prepare_out=$(FM_TEST_GH_LIST_MODE=live-empty python3 "$AUTHOR" prepare \
+  --home "$HOME_DIR" --task "$ID" --worktree "$WORKTREE" \
+  --payload "$PAYLOAD" --brief "$HOME_DIR/data/$ID/brief.md" 2>&1) \
+  || fail "installed empty open-PR context preparation failed: $prepare_out"
+assert_grep 'pull_requests[0]' <(tar -xOf "$PAYLOAD/context.tar" forge/open-prs.toon) \
+  "installed empty open-PR response did not produce a bounded empty snapshot"
 
 : > "$FM_TEST_GH_LOG"
 prepare_out=$(python3 "$AUTHOR" prepare --home "$HOME_DIR" --task "$ID" \

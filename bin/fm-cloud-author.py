@@ -279,6 +279,17 @@ def listed_pr_rows(body, slug):
     if not document or "\r" in document:
         raise AuthorError("gh-axi returned malformed open pull request list data")
     lines = document.splitlines()
+    live_empty = [
+        "count: 0",
+        "pull_requests: []",
+        "help[2]:",
+        "  - Run `gh-axi -R {} pr create --title \"...\" --body-file <path>` to create a PR".format(
+            slug
+        ),
+        "  - Run `gh-axi -R {} pr list --state closed` to see closed PRs".format(slug),
+    ]
+    if lines == live_empty:
+        return []
     # Bounded gh-axi lists may add an exact showing-first count, and its TOON
     # encoder collapses an empty named array to the inline pull_requests[] form.
     count_match = (

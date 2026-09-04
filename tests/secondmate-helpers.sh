@@ -54,7 +54,15 @@ case "${1:-}" in
       prev=$arg
       format=$arg
     done
-    if [ -n "$target" ] && [ -f "$FM_FAKE_TMUX_LOG.killed" ] && grep -qxF "$target" "$FM_FAKE_TMUX_LOG.killed"; then
+    # Compare against the killed log in tmux's PLAIN target spelling. Firstmate
+    # resolves a window with tmux's exact-match syntax ("=session:=window") so a
+    # name can never resolve by fnmatch, and real tmux treats that spelling and
+    # the plain one identically - both fail once the window is killed. This stub
+    # matches the recorded kill-window target literally, so without normalising
+    # the "=" markers it would report a killed window as still alive.
+    probe_target=$(printf '%s' "$target" | tr -d '=')
+    if [ -n "$probe_target" ] && [ -f "$FM_FAKE_TMUX_LOG.killed" ] \
+      && grep -qxF "$probe_target" "$FM_FAKE_TMUX_LOG.killed"; then
       exit 1
     fi
     case "$format" in

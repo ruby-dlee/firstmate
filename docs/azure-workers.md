@@ -255,6 +255,7 @@ Replaying the same result converges on the same refs, files, branch, and one cus
 A successful direct-PR ship remains `working: cloud outcome returned to local custody; host publication pending` until trusted host publication completes.
 After remote worker release, `bin/fm-cloud-author.py publish` verifies the local task branch is the exact returned descendant, refuses dirty or divergent work, pushes only that commit to `fm/<task>`, and opens or reuses a PR against the bound base through host `gh-axi`.
 Publication retries resolve the PR by branch after every create attempt, including the accepted-server/client-failure seam, and converge on one digest receipt, one metadata URL, and one final `done: PR ...` event.
+Once that exact receipt exists, a retry resolves its numeric PR directly and revalidates the open repository and returned head without recreating a PR when a trusted host has since retargeted its base.
 A publication failure removes the released provider credential but retains the result, payload metadata, local branch, report, scratch, and monitor state for retry.
 An assigned worker whose earlier supervisor could not return its task disk uses the explicit `execute --existing-task-disk` recovery lane.
 That request carries no payload or account archive, binds the exact landed recovery-supervisor digest, and runs one bounded continuation or no-op collection command against the retained repository instead of replacing it.

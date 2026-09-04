@@ -118,8 +118,8 @@ print_empty() {
 print_live_empty_footer() {
   printf '%s\n' \
     'help[2]:' \
-    '  - Run `gh-axi -R ruby-labs/b2c pr create --title "..." --body-file <path>` to create a PR' \
-    '  - Run `gh-axi -R ruby-labs/b2c pr list --state closed` to see closed PRs'
+    '  Run `gh-axi -R ruby-labs/b2c pr create --title "..." --body-file <path>` to create a PR' \
+    '  Run `gh-axi -R ruby-labs/b2c pr list --state closed` to see closed PRs'
 }
 
 print_live_empty() {
@@ -214,10 +214,15 @@ case "${1:-} ${2:-}" in
         printf '%s\n' 'count: 0 (showing first 0)' 'pull_requests: []'
         print_live_empty_footer
         ;;
-      live-empty-unexpected)
+      live-empty-hyphenated)
         printf '%s\n' 'count: 0' 'pull_requests: []' 'help[2]:' \
           '  - Run `gh-axi -R ruby-labs/b2c pr create --title "..." --body-file <path>` to create a PR' \
-          '  - Run `gh-axi -R ruby-labs/b2c pr list --state merged` to see merged PRs'
+          '  - Run `gh-axi -R ruby-labs/b2c pr list --state closed` to see closed PRs'
+        ;;
+      live-empty-unexpected)
+        printf '%s\n' 'count: 0' 'pull_requests: []' 'help[2]:' \
+          '  Run `gh-axi -R ruby-labs/b2c pr create --title "..." --body-file <path>` to create a PR' \
+          '  Run `gh-axi -R ruby-labs/b2c pr list --state merged` to see merged PRs'
         ;;
       live-empty) print_live_empty ;;
       empty) print_empty ;;
@@ -481,6 +486,8 @@ assert_pr_context_refusal live-empty-malformed 'malformed open pull request list
   'malformed installed empty-list array'
 assert_pr_context_refusal live-empty-mixed 'malformed open pull request list data' \
   'mixed installed and bounded empty-list forms'
+assert_pr_context_refusal live-empty-hyphenated 'malformed open pull request list data' \
+  'hyphenated installed empty-list help footer'
 assert_pr_context_refusal live-empty-unexpected 'malformed open pull request list data' \
   'unexpected installed empty-list help footer'
 

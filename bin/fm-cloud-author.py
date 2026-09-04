@@ -283,10 +283,10 @@ def listed_pr_rows(body, slug):
         "count: 0",
         "pull_requests: []",
         "help[2]:",
-        "  - Run `gh-axi -R {} pr create --title \"...\" --body-file <path>` to create a PR".format(
+        "  Run `gh-axi -R {} pr create --title \"...\" --body-file <path>` to create a PR".format(
             slug
         ),
-        "  - Run `gh-axi -R {} pr list --state closed` to see closed PRs".format(slug),
+        "  Run `gh-axi -R {} pr list --state closed` to see closed PRs".format(slug),
     ]
     if lines == live_empty:
         return []

@@ -279,13 +279,24 @@ def listed_pr_rows(body, slug):
     if not document or "\r" in document:
         raise AuthorError("gh-axi returned malformed open pull request list data")
     lines = document.splitlines()
-    count_match = re.fullmatch(r"count: (0|[1-9][0-9]*)", lines[0]) if lines else None
+    # Bounded gh-axi lists may add an exact showing-first count, and its TOON
+    # encoder collapses an empty named array to the inline pull_requests[] form.
+    count_match = (
+        re.fullmatch(
+            r"count: (0|[1-9][0-9]*)(?: \(showing first (0|[1-9][0-9]*)\))?",
+            lines[0],
+        )
+        if lines
+        else None
+    )
     if count_match is None:
         raise AuthorError("gh-axi returned malformed open pull request list data")
     count = int(count_match.group(1))
-    if count > 100:
+    shown = int(count_match.group(2)) if count_match.group(2) is not None else count
+    if count > 100 or shown > 100:
         raise AuthorError("open pull request context exceeds its entry bound")
-    header = "pull_requests[{}]{{{}}}:".format(count, ",".join(RICH_PR_LIST_FIELDS))
+    if shown != count:
+        raise AuthorError("gh-axi returned malformed open pull request list data")
     footer = [
         "help[2]:",
         "  Run `gh-axi -R {} pr view <number>` to view details".format(slug),
@@ -293,12 +304,24 @@ def listed_pr_rows(body, slug):
             slug
         ),
     ]
-    if len(lines) != count + 5 or lines[1] != header or lines[-3:] != footer:
+    if len(lines) < 5 or lines[-3:] != footer:
         raise AuthorError("gh-axi returned malformed open pull request list data")
+    table = lines[1:-3]
+    if count == 0:
+        if table != ["pull_requests[]: []"]:
+            raise AuthorError("gh-axi returned malformed open pull request list data")
+        rows = []
+    else:
+        header = "pull_requests[{}]{{{}}}:".format(
+            count, ",".join(RICH_PR_LIST_FIELDS)
+        )
+        if len(table) != count + 1 or table[0] != header:
+            raise AuthorError("gh-axi returned malformed open pull request list data")
+        rows = table[1:]
     records = []
     seen_urls = set()
     seen_numbers = set()
-    for line_number, raw in enumerate(lines[2:-3], start=3):
+    for line_number, raw in enumerate(rows, start=3):
         if not raw.startswith("  ") or raw.startswith("   "):
             raise AuthorError("gh-axi returned malformed open pull request list data")
         try:

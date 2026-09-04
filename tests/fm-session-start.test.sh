@@ -11,8 +11,7 @@
 #     skipped (including bootstrap's four mutating sweeps, verified by their
 #     ABSENCE), the digest still completes
 #   - output section ordering: diagnostics/banners lead, bulk file dumps follow
-#   - context-aware next-step guidance for read-only, AFK, X mode, and normal
-#     watcher ownership
+#   - context-aware next-step guidance for read-only, X mode, and normal watcher ownership
 #   - status-tail bounding, default and FM_SESSION_START_STATUS_TAIL override
 #   - orphan status logs whose task meta has already disappeared
 #   - per-task endpoint-liveness lines for a live and a dead recorded target,
@@ -609,9 +608,8 @@ EOF
 
   out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
   assert_contains "$out" "(none)" "empty fleet did not report (none) for in-flight tasks"
-  assert_contains "$out" "absent" "empty fleet's AFK section did not report absent"
 
-  pass "an empty fleet reports (none) for in-flight tasks and an absent AFK flag"
+  pass "an empty fleet reports (none) for in-flight tasks"
 }
 
 test_next_step_sources_x_mode_cadence() {
@@ -633,27 +631,6 @@ EOF
   assert_contains "$out" "Follow the supervision operating instructions block above" "next step did not point back to the emitted supervision block"
 
   pass "session start emits X-mode cadence guidance in the harness supervision block"
-}
-
-test_next_step_afk_delegates_to_daemon() {
-  local rec root home fakebin out
-  rec=$(new_world next-step-afk)
-  IFS='|' read -r root home fakebin <<EOF
-$rec
-EOF
-  make_fake_toolchain "$fakebin"
-  make_fake_ps_claude "$fakebin"
-  : > "$home/state/.afk"
-
-  out=$(run_session_start "$home" "$root" "$fakebin:$BASE_PATH")
-
-  assert_contains "$out" "away-mode supervision is active" "AFK digest did not report away mode"
-  assert_contains "$out" "Away mode is active" "next step did not switch to AFK guidance"
-  assert_contains "$out" "daemon owns the watcher" "next step did not delegate watcher ownership to the daemon"
-  assert_contains "$out" "- Away mode: active" "supervision block did not include active AFK state"
-  assert_not_contains "$out" "  bin/fm-watch-arm.sh" "AFK next step still told the agent to arm the watcher directly"
-
-  pass "next step delegates watcher ownership to the AFK daemon"
 }
 
 test_supervision_block_exactly_one_and_pi_diagnostic() {
@@ -798,7 +775,6 @@ test_endpoint_liveness_herdr
 test_composition_invokes_real_scripts
 test_fleet_digest_empty_fleet
 test_next_step_sources_x_mode_cadence
-test_next_step_afk_delegates_to_daemon
 test_supervision_block_exactly_one_and_pi_diagnostic
 test_pi_diagnostic_rejects_stale_loaded_marker
 test_pi_diagnostic_accepts_prelock_loaded_marker

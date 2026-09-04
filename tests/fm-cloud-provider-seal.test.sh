@@ -102,9 +102,9 @@ unit_run_sh_wires_the_seal() {
     || soft_fail "tests/run.sh does not export the reach log on BOTH admission lanes"
   [ "$(grep -c 'herdr-guard-bin:\$cloud_guard_bin:\$original_path' "$RUN_SH")" -eq 2 ] \
     || soft_fail "tests/run.sh does not put the cloud guard on BOTH admission lanes' PATH"
-  # Three dispatch arms run a test (hermetic, skip-herdr mixed, real lab); each
-  # must be followed by the reach check.
-  [ "$(grep -c 'check_cloud_reach || result=1' "$RUN_SH")" -eq 3 ] \
+  # Two dispatch arms run a test (hermetic and real lab); each must be followed
+  # by the reach check.
+  [ "$(grep -c 'check_cloud_reach || result=1' "$RUN_SH")" -eq 2 ] \
     || soft_fail "tests/run.sh does not check for a cloud reach after every lane that runs a test"
   pass "tests/run.sh wires the ambient seal, the refusing provider, the guard PATH, and the reach check"
 }

@@ -1,6 +1,6 @@
 Mode: Grok background-notify supervision.
 
-When this session owns supervision and away mode is not active:
+When this session owns supervision:
 1. Drain first with `bin/fm-wake-drain.sh`.
 2. Source `__FM_X_MODE_ENV__` first when X mode is active.
 3. Arm with Grok's tracked background tool, as its own call:

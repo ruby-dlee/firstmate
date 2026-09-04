@@ -165,11 +165,10 @@ Full architecture - the supervision engine, worktree isolation, secondmates, dis
 ## Built-in skills
 
 Firstmate ships these user-invocable built-in skills.
-Claude and grok use the slash form shown here; codex uses the same names with `$`, such as `$afk`.
+Claude and grok use the slash form shown here; codex uses the same names with `$`, such as `$bearings`.
 
 | Skill              | What it does                                                                                                                                  |
 | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/afk`             | Enter away-mode supervision: the sub-supervisor self-handles routine wakes in bash and wakes the parked first mate with a batched digest only for captain-relevant events and bounded declared-external-wait rechecks |
 | `/bearings`        | Generate a "pick up where I left off" status report from the read-only fleet snapshot - backlog, per-task crewmate state, open PRs, scout reports, pending decisions, and date-gated queued work - written to a dated file in `data/` and surfaced concisely in chat; read-mostly, mutates no task state |
 | `/reports`         | Browse, search, open, or summarize the machine-global completion report stack, including visual evidence and follow-ups                        |
 | `/updatefirstmate` | Self-update the running firstmate and its secondmates to the latest from origin with fast-forward-only pulls, then re-read instructions and nudge secondmates |
@@ -191,7 +190,6 @@ Firstmate's skills live in two separate places with different audiences:
 
 - [docs/architecture.md](docs/architecture.md) - how crewmates, supervision, worktrees, secondmates, account routing, completion reports, and project modes work.
 - [docs/configuration.md](docs/configuration.md) - environment variables, `FM_HOME`, runtime backend and Agent Fleet account routing, optional X mode, the files you set, and harness support.
-- [docs/wedge-alarm.md](docs/wedge-alarm.md) - configure the active alert for wedged terminal-backed away-mode compatibility delivery.
 - [docs/tmux-backend.md](docs/tmux-backend.md) - setup guide for the tmux reference backend: prerequisites, attaching, and watching crewmate windows.
 - [docs/herdr-backend.md](docs/herdr-backend.md) - setup guide for the experimental herdr backend, plus its verification notes and known gaps.
 - [docs/zellij-backend.md](docs/zellij-backend.md) - setup guide for the experimental zellij backend, plus its verification notes and known gaps.

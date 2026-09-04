@@ -6,8 +6,7 @@
 # enqueue-before-suppressor ordering, atomic double-drain, duplicate collapse,
 # and the drain-time watcher-liveness assertion.
 # Nothing is lost and nothing is double-consumed. General watcher/lock liveness
-# lives in fm-watcher-lock.test.sh; daemon classification/injection in
-# fm-daemon.test.sh.
+# lives in fm-watcher-lock.test.sh.
 set -u
 
 # shellcheck source=tests/wake-helpers.sh

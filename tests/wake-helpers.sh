@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# tests/wake-helpers.sh - shared fixtures and mocks for the wake-queue,
-# watcher/lock, and supervise-daemon suites. The fake tmux surfaces here encode
-# watcher/daemon/composer behavior, so they live here rather than in the generic
-# tests/lib.sh. Generic reporters/assertions come from lib.sh, pulled in below.
+# tests/wake-helpers.sh - shared fixtures and mocks for the wake-queue and
+# watcher/lock suites. The fake terminal surfaces here encode watcher behavior,
+# so they live here rather than in the generic tests/lib.sh.
 
 # shellcheck source=tests/lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -35,31 +34,6 @@ fi
 # this path explicitly with the fixture they exercise.
 fm_test_tmproot_into FM_CONFIG_OVERRIDE fm-wake-config
 export FM_CONFIG_OVERRIDE
-
-# Wedge-alarm notifier recorder (safety seam). The away-mode wedge alarm fires a
-# real OS-level desktop notification by default. Point its FM_WEDGE_ALARM_EXEC
-# seam at a recorder for every
-# daemon/wake suite, so no test - present or future - can post a real macOS,
-# herdr, or command: notification: it is impossible to forget, because sourcing this harness
-# installs it. The recorder is an on-disk script (a real daemon a test spawns
-# inherits the path and records too). It logs "<channel>\t<summary>" to
-# $FM_WEDGE_ALARM_LOG, which a test sets to its own file to assert on; unset means
-# /dev/null. FM_WEDGE_ALARM_FAIL=<channel> makes the recorder exit non-zero for
-# that channel, to exercise graceful degradation. Suites that do not source this
-# harness still cannot fire a real notification: the daemon defaults the seam to
-# "discard" whenever it is sourced (its library-mode guard).
-# Create and register the recorder directory in this shell so it shares the
-# suite's run-owned cleanup lifecycle.
-_fm_wedge_rec_dir=
-fm_test_tmproot_into _fm_wedge_rec_dir fm-wedge-rec
-cat > "$_fm_wedge_rec_dir/rec" <<'REC'
-#!/usr/bin/env bash
-printf '%s\t%s\n' "${1:-}" "${2:-}" >> "${FM_WEDGE_ALARM_LOG:-/dev/null}"
-case " ${FM_WEDGE_ALARM_FAIL:-} " in *" ${1:-} "*) exit 1 ;; esac
-exit 0
-REC
-chmod +x "$_fm_wedge_rec_dir/rec"
-export FM_WEDGE_ALARM_EXEC="$_fm_wedge_rec_dir/rec"
 
 # append_wake <state> <kind> <key> <payload>: append a wake record to the durable
 # queue in a subshell scoped to <state>, using the production wake library.

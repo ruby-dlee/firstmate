@@ -86,11 +86,31 @@ print_footer() {
 print_rows() {
   local count=$1 row
   shift
+  if [ "$count" -eq 0 ]; then
+    print_empty
+    return
+  fi
   printf 'count: %s\n' "$count"
   printf 'pull_requests[%s]{number,title,state,author,draft,review,url}:\n' "$count"
   for row in "$@"; do
     printf '  %s\n' "$row"
   done
+  print_footer
+}
+
+print_bounded_rows() {
+  local count=$1 row
+  shift
+  printf 'count: %s (showing first %s)\n' "$count" "$count"
+  printf 'pull_requests[%s]{number,title,state,author,draft,review,url}:\n' "$count"
+  for row in "$@"; do
+    printf '  %s\n' "$row"
+  done
+  print_footer
+}
+
+print_empty() {
+  printf '%s\n' 'count: 0 (showing first 0)' 'pull_requests[]: []'
   print_footer
 }
 
@@ -152,7 +172,28 @@ case "${1:-} ${2:-}" in
       bad-csv)
         print_rows 1 '17,"unterminated,open,ruby-labs,no,none,"https://github.com/ruby-labs/b2c/pull/17"'
         ;;
-      empty) print_rows 0 ;;
+      bounded-header) print_bounded_rows 1 "$context_row" ;;
+      shown-count-mismatch)
+        printf '%s\n' 'count: 1 (showing first 0)' \
+          'pull_requests[1]{number,title,state,author,draft,review,url}:' \
+          "  $context_row"
+        print_footer
+        ;;
+      inline-nonempty)
+        printf '%s\n' 'count: 1 (showing first 1)' 'pull_requests[]: []'
+        print_footer
+        ;;
+      zero-rich-header)
+        printf '%s\n' 'count: 0' \
+          'pull_requests[0]{number,title,state,author,draft,review,url}:'
+        print_footer
+        ;;
+      empty-with-row)
+        printf '%s\n' 'count: 0 (showing first 0)' 'pull_requests[]: []' \
+          "  $context_row"
+        print_footer
+        ;;
+      empty) print_empty ;;
       too-many)
         printf '%s\n' 'count: 101' \
           'pull_requests[101]{number,title,state,author,draft,review,url}:'
@@ -387,6 +428,22 @@ assert_pr_context_refusal conflict-number 'conflicting pull request API number' 
   'conflicting open-PR API number context'
 assert_pr_context_refusal closed-api 'conflicting open pull request state data' \
   'conflicting open-PR API state context'
+assert_pr_context_refusal shown-count-mismatch 'malformed open pull request list data' \
+  'inconsistent bounded open-PR count header'
+assert_pr_context_refusal inline-nonempty 'malformed open pull request list data' \
+  'nonempty count paired with the inline empty-list form'
+assert_pr_context_refusal zero-rich-header 'malformed open pull request list data' \
+  'invented counted table for an empty open-PR list'
+assert_pr_context_refusal empty-with-row 'malformed open pull request list data' \
+  'inline empty open-PR list followed by a hidden row'
+
+prepare_out=$(FM_TEST_GH_LIST_MODE=bounded-header python3 "$AUTHOR" prepare \
+  --home "$HOME_DIR" --task "$ID" --worktree "$WORKTREE" \
+  --payload "$PAYLOAD" --brief "$HOME_DIR/data/$ID/brief.md" 2>&1) \
+  || fail "bounded-count open-PR context preparation failed: $prepare_out"
+assert_grep 'https://github.com/ruby-labs/b2c/pull/17' \
+  <(tar -xOf "$PAYLOAD/context.tar" forge/open-prs.toon) \
+  "bounded-count open-PR context omitted its exact pull request"
 
 prepare_out=$(FM_TEST_GH_LIST_MODE=empty python3 "$AUTHOR" prepare \
   --home "$HOME_DIR" --task "$ID" --worktree "$WORKTREE" \

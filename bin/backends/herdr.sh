@@ -2930,8 +2930,8 @@ fm_backend_herdr_send_key() {  # <target> <key> [expected-label]
 # is smaller than the pane's current viewport height (observed threshold ~23
 # rows for a default-sized pane), instead of clamping to the last N lines - it
 # does not merely ignore the bound, it drops the read entirely. This silently
-# broke exactly the small bounded reads this adapter relies on most (including
-# the composer-state guard/fallback reads around submit and injection). Workaround:
+# broke exactly the small bounded reads this adapter relies on most, including
+# the composer-state guard and fallback reads around submit. Workaround:
 # always request a generous fetch far above any realistic viewport height, then
 # trim to the caller's requested bound ourselves with `tail`.
 fm_backend_herdr_capture() {  # <target> <lines> [expected-label]
@@ -3221,25 +3221,20 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
 # the caller's <settle> before the first Enter matters here the same way it
 # does for tmux.
 #
-# Confirmation signal (rewritten for the 2026-07-07 incident below;
-# superseded a composer-content read that itself replaced a delta-based check
-# for the 2026-07-03 incident): when the target is legibly idle before Enter,
+# Confirmation signal: when the target is legibly idle before Enter,
 # submission is confirmed by fm_backend_herdr_wait_for_working observing a
 # submit-active agent_status after Enter, NOT by reading the composer's own
 # row. This makes the normal confirmation path cross-agent: it is the same
 # semantic signal regardless of what text a harness's idle composer happens
 # to display.
 #
-# Incident (2026-07-07, followed up on 2026-07-08): a redelivery loop in the
-# away-mode daemon. Root cause: composer-content submit confirmation was too
-# sensitive to harness rendering details. Real claude/codex use bare prompt
-# rows, and real codex adds dynamic idle suggestions after `›`; the later
-# ANSI-aware composer classifier now handles the compatibility pre-injection
-# guard for that Codex shape, but idle-baseline submit confirmation deliberately
-# stays on native agent-state so delivery does not depend on composer text.
-# Composer content is retained for other callers (the terminal-backed away-mode
-# compatibility path's empty-box guard, still dispatched via fm_backend_composer_state /
-# fm_backend_herdr_composer_state) and for submit attempts whose pre-Enter
+# Composer-content submit confirmation was too sensitive to harness rendering
+# details. Real claude/codex use bare prompt rows, and real codex adds dynamic
+# idle suggestions after `›`. The ANSI-aware composer classifier handles that
+# shape, but idle-baseline submit confirmation deliberately stays on native
+# agent-state so delivery does not depend on composer text. Composer content is
+# retained for pre-submit guards through fm_backend_composer_state /
+# fm_backend_herdr_composer_state and for submit attempts whose pre-Enter
 # agent-state baseline is not legibly idle.
 #
 # This also still correctly handles the earlier 2026-07-03 incident (a
@@ -3264,11 +3259,9 @@ fm_backend_herdr_composer_state() {  # <target> -> empty|pending|unknown
 #     window, so this has not been observed in practice. On the (unobserved)
 #     residual chance it happens, the verdict is "pending" and the caller
 #     never retypes - only re-sends Enter, which lands on an already-empty
-#     composer and is a no-op, not a duplicate delivery of <text> (see
-#     fm-send.sh/fm-supervise-daemon.sh: retyping only happens if a caller
-#     re-invokes this function from scratch with the same text after seeing
-#     an error, which is a human/escalation decision, not an automatic
-#     retry).
+#     composer and is a no-op, not a duplicate delivery of <text>. Retyping
+#     happens only if a caller re-invokes this function from scratch with the
+#     same text after seeing an error; it is not part of this automatic retry.
 # Echoes empty|pending|unknown|send-failed, the SAME vocabulary fm-send.sh
 # already branches on for tmux ("empty" means "confirmed submitted" for every
 # backend; how each backend confirms it is an internal decision - herdr's is

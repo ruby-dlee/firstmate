@@ -15,8 +15,8 @@
 # never re-implements their logic; all sequencing/formatting logic added here
 # stays local to this file. Those three scripts remain fully working
 # standalone with unchanged default behavior - other flows (fm-bootstrap.sh
-# install <tools> after consent, /updatefirstmate, the afk daemon, existing
-# tests) still call them directly. The one seam this script needed -
+# install <tools> after consent, /updatefirstmate, and existing tests) still
+# call them directly. The one seam this script needed -
 # bootstrap running its detect-only diagnostics without its five mutating
 # sweeps - is an opt-in FM_BOOTSTRAP_DETECT_ONLY=1 flag on fm-bootstrap.sh
 # itself (default unset/0 = unchanged behavior), not a fork.
@@ -35,8 +35,8 @@
 #   4. context digest - data/projects.md, data/secondmates.md, data/captain.md,
 #                       data/learnings.md: read-only, always safe, always runs.
 #   5. fleet digest   - data/backlog.md, every state/*.meta, a bounded
-#                       state/*.status tail, state/.afk, and a cheap
-#                       per-task endpoint-liveness read: read-only, always runs.
+#                       state/*.status tail, and a cheap per-task endpoint-
+#                       liveness read: read-only, always runs.
 #   6. closing reminder - prints the context-specific watcher next step; this
 #                       script points back to the emitted harness supervision
 #                       block and deliberately never arms the watcher itself.
@@ -202,8 +202,6 @@ else
 fi
 
 # --- 4. supervision operating instructions ----------------------------------
-AFK_PRESENT=0
-[ -e "$STATE/.afk" ] && AFK_PRESENT=1
 X_MODE_PRESENT=0
 [ -f "$CONFIG/x-mode.env" ] && X_MODE_PRESENT=1
 
@@ -223,7 +221,6 @@ fi
 "$SCRIPT_DIR/fm-supervision-instructions.sh" \
   --harness "$PRIMARY_HARNESS" \
   --read-only "$READ_ONLY" \
-  --afk "$AFK_PRESENT" \
   --x-mode "$X_MODE_PRESENT"
 
 # --- 4. context digest -----------------------------------------------------
@@ -280,13 +277,6 @@ for status in "$STATE"/*.status; do
 done
 [ "$ORPHAN_STATUS_FOUND" -eq 1 ] || printf '(none)\n'
 
-subsection "AFK"
-if [ -e "$STATE/.afk" ]; then
-  printf 'present - away-mode supervision is active; the daemon owns the watcher.\n'
-else
-  printf 'absent\n'
-fi
-
 # --- 6. closing reminder -----------------------------------------------
 section "NEXT STEP"
 if [ "$READ_ONLY" -eq 1 ]; then
@@ -294,13 +284,6 @@ if [ "$READ_ONLY" -eq 1 ]; then
 This session did not acquire the fleet lock. Stay read-only: do not arm,
 drain, spawn, steer, merge, or repair fleet state from here. The session
 holding the lock owns mutable follow-up.
-
-EOF
-elif [ "$AFK_PRESENT" -eq 1 ]; then
-  cat <<'EOF'
-Away mode is active. Follow the supervision operating instructions block above:
-load /afk and ensure the daemon is running, because the daemon owns watcher
-supervision.
 
 EOF
 elif [ -f "$CONFIG/x-mode.env" ]; then

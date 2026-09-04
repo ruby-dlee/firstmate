@@ -14,10 +14,29 @@ WATCH="$ROOT/bin/fm-watch.sh"
 WATCH_ARM="$ROOT/bin/fm-watch-arm.sh"
 DRAIN="$ROOT/bin/fm-wake-drain.sh"
 LIB="$ROOT/bin/fm-wake-lib.sh"
-# shellcheck source=bin/fm-supervise-daemon.sh
-. "$ROOT/bin/fm-supervise-daemon.sh"
 
 fm_test_tmproot_into TMP_ROOT fm-watcher-lock-tests
+
+stop_watcher_with_children() {  # <watcher-pid>
+  local watcher_pid=$1 child current_parent i children=""
+  while read -r child; do
+    [ -n "$child" ] || continue
+    current_parent=$(ps -o ppid= -p "$child" 2>/dev/null | tr -d '[:space:]')
+    [ "$current_parent" = "$watcher_pid" ] || continue
+    children="${children}${children:+ }$child"
+    kill -TERM "$child" 2>/dev/null || true
+  done < <(ps -axo pid=,ppid= | awk -v parent="$watcher_pid" '$2 == parent { print $1 }')
+  for child in $children; do
+    i=0
+    while [ "$i" -lt 50 ]; do
+      current_parent=$(ps -o ppid= -p "$child" 2>/dev/null | tr -d '[:space:]')
+      [ "$current_parent" = "$watcher_pid" ] || break
+      sleep 0.1
+      i=$((i + 1))
+    done
+  done
+  kill -TERM "$watcher_pid" 2>/dev/null || true
+}
 
 
 test_singleton_start() {
@@ -982,7 +1001,7 @@ test_watcher_bounded_command_reaped_on_owner_shutdown() {
   bounded_owner=$(ps -axo pid=,ppid= | awk -v parent="$owner" '$2 == parent { print $1; exit }')
   [ -n "$bounded_owner" ] \
     || { kill "$owner" 2>/dev/null || true; wait "$owner" 2>/dev/null || true; fail "bounded watcher owner was not observable"; }
-  fm_super_stop_watcher "$owner"
+  stop_watcher_with_children "$owner"
   wait "$owner" 2>/dev/null || true
   i=0
   while [ "$i" -lt 50 ] && is_live_non_zombie "$child"; do

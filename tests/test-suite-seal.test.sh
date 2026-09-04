@@ -141,16 +141,6 @@ assert_contains "$direct_out" "declares real Herdr lifecycle; --skip-herdr selec
   "direct lifecycle-capable invocation did not hit the same admission control"
 pass "direct lifecycle-capable invocation reaches the same preflight and explicit skip path"
 
-mixed_out=$(FM_TEST_SKIP_HERDR=1 FM_TEST_FOCUSED=afk-lock-aba \
-  env -u FM_TEST_RUNNER_ACTIVE -u FM_TEST_RUNNER_PID \
-  -u FM_TEST_RUNNER_TOKEN -u FM_TEST_SUITE_ROOT -u FM_TEST_REPO_ROOT \
-  -u FM_TEST_CURRENT_TEST -u FM_TEST_HERDR_CAPABILITY \
-  bash "$ROOT/tests/fm-afk-launch.test.sh") \
-  || fail "mixed lifecycle invocation did not execute its hermetic portion"
-assert_contains "$mixed_out" "launcher lock serializes concurrent stale-lock reclamation" \
-  "mixed lifecycle invocation skipped its hermetic assertions"
-pass "explicit non-Herdr mode executes mixed entrypoint hermetic assertions"
-
 shard_fixture=$TMP_ROOT/shard-route
 shard_admissions=$TMP_ROOT/shard-admissions.log
 mkdir -p "$shard_fixture/bin" "$shard_fixture/tests"

@@ -11,10 +11,6 @@
 71100	tests/fm-account-directory.test.sh
 423936	tests/fm-account-routing-a.test.sh
 335548	tests/fm-account-routing-b.test.sh
-33600	tests/fm-afk-inject-e2e.test.sh
-20	tests/fm-afk-inject-herdr-e2e.test.sh
-16500	tests/fm-afk-launch.test.sh
-6900	tests/fm-afk-reap-wake-e2e.test.sh
 26565	tests/fm-arm-pretool-check.test.sh
 180	tests/fm-auto-reap-herdr-e2e.test.sh
 22300	tests/fm-auto-reap.test.sh
@@ -59,7 +55,6 @@
 5000	tests/fm-crosscheck-azure.test.sh
 20000	tests/fm-crosscheck-slack.test.sh
 94232	tests/fm-crosscheck.test.sh
-13991	tests/fm-daemon.test.sh
 340	tests/fm-decision-pretool-check.test.sh
 685	tests/fm-dispatch-select.test.sh
 156	tests/fm-ensure-agents-md.test.sh
@@ -112,13 +107,13 @@
 20000	tests/fm-spawn-provision.test.sh
 500	tests/fm-supervision-events.test.sh
 95	tests/fm-supervision-instructions.test.sh
+250	tests/fm-supervision-mode-retirement.test.sh
 10408	tests/fm-tangle-guard.test.sh
 321224	tests/fm-teardown-a.test.sh
 321224	tests/fm-teardown-b.test.sh
 600	tests/fm-transition-lib.test.sh
 1849	tests/fm-turnend-guard.test.sh
 1511	tests/fm-update.test.sh
-4597	tests/fm-wake-daemon-lifecycle-e2e.test.sh
 36178	tests/fm-wake-queue.test.sh
 4510	tests/fm-watch-checkpoint.test.sh
 180000	tests/fm-watch-pause-absorb.test.sh

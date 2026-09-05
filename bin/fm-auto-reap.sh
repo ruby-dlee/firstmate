@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Automatically reap terminal crewmate resources through fm-teardown.sh.
 #
-# `task <id> <pr-merged|scout-done|local-merged>` validates the terminal event,
-# delegates endpoint, cleanliness, landing, report, and Treehouse-return proofs to ordinary
-# teardown without --force.
+# `task <id> <pr-merged|scout-done|local-merged>` validates the terminal event.
+# A merged on-demand Crosscheck-only task retires its exact task-local poll,
+# coordinator, and metadata state without fabricating ordinary task status or
+# entering worktree teardown.
+# Every ordinary task still delegates endpoint, cleanliness, landing, report,
+# and Treehouse-return proofs to ordinary teardown without --force.
 #
 # `maintenance` recovers pre-metadata Treehouse acquisitions left by a crashed
 # spawn. A record is eligible only after an age threshold and exact PID/start-time
@@ -21,9 +24,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 AUTO_REAP_STALE_SECS=${FM_AUTO_REAP_STALE_SECS:-300}
 AUTO_REAP_COMMAND_TIMEOUT=${FM_AUTO_REAP_COMMAND_TIMEOUT:-20}
 AUTO_REAP_MAINTENANCE=0
+CROSSCHECK_TASK_META_SCHEMA=firstmate.crosscheck-task.v1
+CROSSCHECK_REAP_REGISTRATION_LOCK=
+CROSSCHECK_REAP_URL=
+CROSSCHECK_REAP_HEAD=
+CROSSCHECK_REAP_GENERATION=
 
 # shellcheck source=bin/fm-account-routing-lib.sh
 . "$SCRIPT_DIR/fm-account-routing-lib.sh"
@@ -100,6 +109,14 @@ refuse() {
   return 1
 }
 
+release_crosscheck_reap_registration_lock() {
+  if [ -n "$CROSSCHECK_REAP_REGISTRATION_LOCK" ]; then
+    fm_account_meta_lock_release "$CROSSCHECK_REAP_REGISTRATION_LOCK" >/dev/null 2>&1 || true
+    CROSSCHECK_REAP_REGISTRATION_LOCK=
+  fi
+}
+trap release_crosscheck_reap_registration_lock EXIT
+
 log_result() {
   local line=$1 log="$STATE/.auto-reap.log" size tmp
   [ ! -L "$log" ] && { [ ! -e "$log" ] || [ -f "$log" ]; } || return 0
@@ -168,6 +185,186 @@ pr_is_merged() {  # <meta>
   }
 }
 
+crosscheck_only_identity() {  # <meta> <task>
+  local meta=$1 task=$2 bytes lines schema recorded_task crosscheck_pr pr head generation
+  bytes=$(wc -c < "$meta" 2>/dev/null | tr -d '[:space:]') || {
+    refuse "Crosscheck-only task metadata is unreadable"
+    return 1
+  }
+  case "$bytes" in ''|*[!0-9]*) refuse "Crosscheck-only task metadata size is invalid"; return 1 ;; esac
+  [ "$bytes" -le 65536 ] || {
+    refuse "Crosscheck-only task metadata exceeds its 65536-byte bound"
+    return 1
+  }
+  lines=$(awk 'END { print NR + 0 }' "$meta") || {
+    refuse "Crosscheck-only task metadata is unreadable"
+    return 1
+  }
+  [ "$lines" -eq 6 ] || {
+    refuse "Crosscheck-only task metadata must contain exactly its six identity fields"
+    return 1
+  }
+  schema=$(single_meta_value "$meta" crosscheck_schema) || {
+    refuse "Crosscheck-only task metadata has malformed schema identity"
+    return 1
+  }
+  recorded_task=$(single_meta_value "$meta" crosscheck_task_id) || {
+    refuse "Crosscheck-only task metadata has malformed task identity"
+    return 1
+  }
+  crosscheck_pr=$(single_meta_value "$meta" crosscheck_pull_request) || {
+    refuse "Crosscheck-only task metadata has malformed PR identity"
+    return 1
+  }
+  generation=$(single_meta_value "$meta" generation_id) || {
+    refuse "Crosscheck-only task metadata has malformed generation identity"
+    return 1
+  }
+  pr=$(single_meta_value "$meta" pr) || {
+    refuse "Crosscheck-only task metadata has malformed registered PR identity"
+    return 1
+  }
+  head=$(single_meta_value "$meta" pr_head) || {
+    refuse "Crosscheck-only task metadata has malformed registered head identity"
+    return 1
+  }
+  [ "$schema" = "$CROSSCHECK_TASK_META_SCHEMA" ] || {
+    refuse "Crosscheck-only task metadata schema is unsupported"
+    return 1
+  }
+  [ "$recorded_task" = "$task" ] || {
+    refuse "Crosscheck-only task metadata belongs to a different task"
+    return 1
+  }
+  [ "$crosscheck_pr" = "$pr" ] && parse_pr_url "$pr" || {
+    refuse "Crosscheck-only task metadata has mismatched or invalid PR identity"
+    return 1
+  }
+  [ "${#head}" -eq 40 ] || {
+    refuse "Crosscheck-only task metadata has invalid exact head identity"
+    return 1
+  }
+  case "$head" in *[!0-9a-f]*) refuse "Crosscheck-only task metadata has invalid exact head identity"; return 1 ;; esac
+  [ -n "$generation" ] && [ "${#generation}" -le 512 ] || {
+    refuse "Crosscheck-only task metadata has invalid generation identity"
+    return 1
+  }
+  if printf '%s' "$generation" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    refuse "Crosscheck-only task metadata has invalid generation identity"
+    return 1
+  fi
+  [ ! -e "$STATE/$task.status" ] && [ ! -L "$STATE/$task.status" ] || {
+    refuse "Crosscheck-only task unexpectedly has ordinary task status"
+    return 1
+  }
+  [ -f "$DATA/$task/crosscheck.md" ] && [ ! -L "$DATA/$task/crosscheck.md" ] \
+    && [ -f "$DATA/$task/crosscheck-ledger.json" ] \
+    && [ ! -L "$DATA/$task/crosscheck-ledger.json" ] || {
+      refuse "Crosscheck-only task has no safe durable report and ledger"
+      return 1
+    }
+  CROSSCHECK_REAP_URL=$pr
+  CROSSCHECK_REAP_HEAD=$head
+  CROSSCHECK_REAP_GENERATION=$generation
+}
+
+crosscheck_reap_log_has_completion() {  # <task> [generation]
+  local task=$1 generation=${2:-} log="$STATE/.auto-reap.log" marker
+  [ -f "$log" ] && [ ! -L "$log" ] || return 1
+  marker=" auto-reaped Crosscheck-only task $task generation="
+  [ -z "$generation" ] || marker="$marker$generation"
+  grep -Fq "$marker" "$log"
+}
+
+crosscheck_reap_already_complete() {  # <task>
+  local task=$1 path
+  [ ! -e "$STATE/$task.meta" ] && [ ! -L "$STATE/$task.meta" ] || return 1
+  [ ! -e "$STATE/$task.status" ] && [ ! -L "$STATE/$task.status" ] || return 1
+  for path in \
+    "$STATE/$task.check.sh" \
+    "$STATE/$task.crosscheck-autostart.request.json" \
+    "$STATE/$task.crosscheck-autostart.json" \
+    "$STATE/$task.crosscheck-autostart.log" \
+    "$STATE/.$task.crosscheck-autostart-handoff.lock" \
+    "$STATE/.$task.crosscheck-autostart.lock"; do
+    [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+  done
+  [ -f "$DATA/$task/crosscheck.md" ] && [ ! -L "$DATA/$task/crosscheck.md" ] \
+    && [ -f "$DATA/$task/crosscheck-ledger.json" ] \
+    && [ ! -L "$DATA/$task/crosscheck-ledger.json" ] \
+    && crosscheck_reap_log_has_completion "$task"
+}
+
+reap_crosscheck_only() {  # <task> <trigger>
+  local task=$1 trigger=$2 meta saved_url saved_head saved_generation output
+  [ "$trigger" = pr-merged ] || return 2
+  meta="$STATE/$task.meta"
+  if [ ! -e "$meta" ] && [ ! -L "$meta" ]; then
+    if crosscheck_reap_already_complete "$task"; then
+      printf 'auto-reaped %s (Crosscheck-only state was already retired)\n' "$task"
+      return 0
+    fi
+    return 2
+  fi
+  [ -f "$meta" ] && [ ! -L "$meta" ] || return 2
+  grep -q '^crosscheck_' "$meta" || return 2
+
+  CROSSCHECK_REAP_REGISTRATION_LOCK=$(fm_account_lock_acquire "$STATE" "$task" pr-registration \
+    "PR registration retirement" "${FM_ACCOUNT_META_LOCK_WAIT_SECONDS:-10}") || {
+      refuse "could not serialize Crosscheck-only retirement"
+      return 1
+    }
+  if [ ! -e "$meta" ] && [ ! -L "$meta" ]; then
+    if crosscheck_reap_already_complete "$task"; then
+      release_crosscheck_reap_registration_lock
+      printf 'auto-reaped %s (Crosscheck-only state was already retired)\n' "$task"
+      return 0
+    fi
+    refuse "Crosscheck-only task metadata disappeared during retirement"
+    return 1
+  fi
+  [ -f "$meta" ] && [ ! -L "$meta" ] || {
+    refuse "Crosscheck-only task metadata became unsafe during retirement"
+    return 1
+  }
+  crosscheck_only_identity "$meta" "$task" || return 1
+  saved_url=$CROSSCHECK_REAP_URL
+  saved_head=$CROSSCHECK_REAP_HEAD
+  saved_generation=$CROSSCHECK_REAP_GENERATION
+  if [ "${AUTO_REAP_PR_VERIFIED:-0}" != 1 ]; then
+    pr_is_merged "$meta" || return 1
+  fi
+  if ! output=$("$FM_ROOT/bin/fm-crosscheck-autostart.py" retire \
+      "$task" "$saved_generation" --expected-pr "$saved_url" \
+      --expected-head "$saved_head" 2>&1); then
+    [ -z "$output" ] || printf '%s\n' "$output" >&2
+    refuse "exact Crosscheck coordinator retirement refused; retained poll and metadata"
+    return 1
+  fi
+  [ -z "$output" ] || printf '%s\n' "$output"
+  crosscheck_only_identity "$meta" "$task" || return 1
+  [ "$CROSSCHECK_REAP_URL" = "$saved_url" ] \
+    && [ "$CROSSCHECK_REAP_HEAD" = "$saved_head" ] \
+    && [ "$CROSSCHECK_REAP_GENERATION" = "$saved_generation" ] || {
+      refuse "Crosscheck-only task identity changed during retirement"
+      return 1
+    }
+  if ! rm -f "$STATE/$task.check.sh"; then
+    refuse "could not remove the exact Crosscheck-only merge poll"
+    return 1
+  fi
+  log_result "auto-reaped Crosscheck-only task $task generation=$saved_generation"
+  crosscheck_reap_log_has_completion "$task" "$saved_generation" || {
+    refuse "could not record the completed Crosscheck-only retirement"
+    return 1
+  }
+  if ! rm -f "$meta"; then
+    refuse "could not remove retired Crosscheck-only task metadata"
+    return 1
+  fi
+  release_crosscheck_reap_registration_lock
+  printf 'auto-reaped %s (merged Crosscheck-only task)\n' "$task"
+}
 
 run_teardown() {  # <task>
   local task=$1 teardown output
@@ -184,9 +381,15 @@ run_teardown() {  # <task>
 }
 
 reap_task() {  # <task> <trigger>
-  local id=$1 trigger=$2 meta kind mode
+  local id=$1 trigger=$2 meta kind mode crosscheck_status
   AUTO_REAP_ID=$id
   fm_account_valid_id "$id" || refuse "invalid task id"
+  if reap_crosscheck_only "$id" "$trigger"; then
+    return 0
+  else
+    crosscheck_status=$?
+  fi
+  [ "$crosscheck_status" -eq 2 ] || return "$crosscheck_status"
   meta="$STATE/$id.meta"
   [ -f "$meta" ] && [ ! -L "$meta" ] || refuse "task metadata is unavailable"
   kind=$(meta_value "$meta" kind)

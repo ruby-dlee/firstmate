@@ -90,6 +90,110 @@ test_merged_task_tears_down() {
   pass "ordinary attached ship branch tears down after its PR is merged"
 }
 
+make_crosscheck_only_task() {  # <id>
+  local id=$1 url=https://github.com/acme/repo/pull/7
+  local head=1111111111111111111111111111111111111111 generation=legacy:a1234567890abcd
+  mkdir -p "$HOME_DIR/data/$id"
+  printf '# Crosscheck\n\nCLEAR for %s.\n' "$head" > "$HOME_DIR/data/$id/crosscheck.md"
+  printf '{"schema":"fixture-ledger","task_id":"%s","pull_request":"%s"}\n' \
+    "$id" "$url" > "$HOME_DIR/data/$id/crosscheck-ledger.json"
+  cat > "$HOME_DIR/state/$id.meta" <<EOF
+crosscheck_schema=firstmate.crosscheck-task.v1
+crosscheck_task_id=$id
+crosscheck_pull_request=$url
+generation_id=$generation
+pr=$url
+pr_head=$head
+EOF
+  printf '#!/usr/bin/env bash\necho merged\n' > "$HOME_DIR/state/$id.check.sh"
+  chmod +x "$HOME_DIR/state/$id.check.sh"
+  cat > "$HOME_DIR/state/$id.crosscheck-autostart.request.json" <<EOF
+{"schema":"firstmate.crosscheck-autostart-request.v1","task_id":"$id","pull_request":"$url","head_sha":"$head","generation_id":"$generation"}
+EOF
+  cat > "$HOME_DIR/state/$id.crosscheck-autostart.json" <<EOF
+{"schema":"firstmate.crosscheck-autostart.v1","task_id":"$id","pull_request":"$url","head_sha":"$head","generation_id":"$generation"}
+EOF
+  printf 'fixture coordinator log\n' > "$HOME_DIR/state/$id.crosscheck-autostart.log"
+  : > "$HOME_DIR/state/.$id.crosscheck-autostart-handoff.lock"
+  : > "$HOME_DIR/state/.$id.crosscheck-autostart.lock"
+  : > "$HOME_DIR/state/.$id.crosscheck.lock"
+}
+
+test_merged_crosscheck_only_task_retires_without_status_or_teardown() {
+  local id=crosscheck-only out rc path
+  reset_logs
+  make_crosscheck_only_task "$id"
+  cp "$HOME_DIR/data/$id/crosscheck.md" "$TMP/$id-report.before"
+  cp "$HOME_DIR/data/$id/crosscheck-ledger.json" "$TMP/$id-ledger.before"
+
+  out=$("$AUTO_REAP" task "$id" pr-merged 2>&1); rc=$?
+  expect_code 0 "$rc" "merged Crosscheck-only auto-reap"
+  assert_contains "$out" "merged Crosscheck-only task" \
+    "Crosscheck-only retirement did not report its dedicated path"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] \
+    || fail "Crosscheck-only retirement entered ordinary teardown"
+  for path in \
+    "$HOME_DIR/state/$id.meta" \
+    "$HOME_DIR/state/$id.check.sh" \
+    "$HOME_DIR/state/$id.crosscheck-autostart.request.json" \
+    "$HOME_DIR/state/$id.crosscheck-autostart.json" \
+    "$HOME_DIR/state/$id.crosscheck-autostart.log" \
+    "$HOME_DIR/state/.$id.crosscheck-autostart-handoff.lock" \
+    "$HOME_DIR/state/.$id.crosscheck-autostart.lock"; do
+    assert_absent "$path" "Crosscheck-only retirement retained disposable state"
+  done
+  assert_present "$HOME_DIR/state/.$id.crosscheck.lock" \
+    "Crosscheck-only retirement removed state outside the existing coordinator cleanup contract"
+  cmp -s "$TMP/$id-report.before" "$HOME_DIR/data/$id/crosscheck.md" \
+    || fail "Crosscheck-only retirement changed its durable report"
+  cmp -s "$TMP/$id-ledger.before" "$HOME_DIR/data/$id/crosscheck-ledger.json" \
+    || fail "Crosscheck-only retirement changed its durable ledger"
+
+  out=$("$AUTO_REAP" task "$id" pr-merged 2>&1); rc=$?
+  expect_code 0 "$rc" "repeated Crosscheck-only auto-reap"
+  assert_contains "$out" "already retired" \
+    "repeated Crosscheck-only retirement did not converge"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] \
+    || fail "repeated Crosscheck-only retirement entered ordinary teardown"
+  pass "merged Crosscheck-only state retires idempotently without ordinary teardown"
+}
+
+test_crosscheck_only_identity_and_shape_mismatches_refuse() {
+  local id=crosscheck-malformed mismatch=crosscheck-mismatch out rc staged
+  reset_logs
+  make_crosscheck_only_task "$id"
+  printf 'pr_head=2222222222222222222222222222222222222222\n' \
+    >> "$HOME_DIR/state/$id.meta"
+  out=$("$AUTO_REAP" task "$id" pr-merged 2>&1); rc=$?
+  expect_code 1 "$rc" "malformed Crosscheck-only metadata refusal"
+  assert_contains "$out" "exactly its six identity fields" \
+    "malformed Crosscheck-only metadata refusal was not actionable"
+  assert_present "$HOME_DIR/state/$id.meta" \
+    "malformed Crosscheck-only metadata was removed"
+  assert_present "$HOME_DIR/state/$id.check.sh" \
+    "malformed Crosscheck-only metadata lost its merge poll"
+
+  reset_logs
+  make_crosscheck_only_task "$mismatch"
+  staged="$HOME_DIR/state/.$mismatch.request-mismatch"
+  sed 's#/pull/7#/pull/8#' \
+    "$HOME_DIR/state/$mismatch.crosscheck-autostart.request.json" > "$staged"
+  mv "$staged" "$HOME_DIR/state/$mismatch.crosscheck-autostart.request.json"
+  out=$("$AUTO_REAP" task "$mismatch" pr-merged 2>&1); rc=$?
+  expect_code 1 "$rc" "mismatched Crosscheck coordinator identity refusal"
+  assert_contains "$out" "different exact PR identity" \
+    "mismatched Crosscheck coordinator identity refusal was not actionable"
+  assert_present "$HOME_DIR/state/$mismatch.meta" \
+    "mismatched Crosscheck coordinator identity removed task metadata"
+  assert_present "$HOME_DIR/state/$mismatch.check.sh" \
+    "mismatched Crosscheck coordinator identity removed the merge poll"
+  assert_present "$HOME_DIR/state/$mismatch.crosscheck-autostart.request.json" \
+    "mismatched Crosscheck coordinator identity removed coordinator state"
+  [ ! -s "$FM_FAKE_TEARDOWN_LOG" ] \
+    || fail "refused Crosscheck-only retirement entered ordinary teardown"
+  pass "Crosscheck-only retirement refuses malformed and mismatched identity state"
+}
+
 test_open_pr_refuses_without_teardown() {
   local out rc
   reset_logs
@@ -777,6 +881,8 @@ test_local_merge_immediately_auto_reaps() {
 }
 
 test_merged_task_tears_down
+test_merged_crosscheck_only_task_retires_without_status_or_teardown
+test_crosscheck_only_identity_and_shape_mismatches_refuse
 test_open_pr_refuses_without_teardown
 test_retired_mode_never_auto_reaps
 test_scout_done_uses_ordinary_teardown

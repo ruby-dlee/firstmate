@@ -5777,19 +5777,28 @@ fi
 
 # The worktree is now safely returned (or the provider worktree is gone), but
 # task metadata still supplies the exact generation. Stop the detached
-# coordinator before removing that identity and its task-local state. Use the
-# same task-local fence as PR registration and retain it through state removal,
-# so a new coordinator cannot be published between cancellation and unlink.
+# coordinator and let its owner retire the task-local coordinator state before
+# removing the task identity. Use the same task-local fence as PR registration
+# and retain it through state removal, so a new coordinator cannot be published
+# between cancellation and unlink.
 PR_REGISTRATION_LOCK=$(fm_account_lock_acquire "$STATE" "$ID" pr-registration \
   "PR registration retirement" "${FM_ACCOUNT_META_LOCK_WAIT_SECONDS:-10}") || exit 1
 if [ -e "$STATE/$ID.crosscheck-autostart.request.json" ] \
+    || [ -L "$STATE/$ID.crosscheck-autostart.request.json" ] \
     || [ -e "$STATE/$ID.crosscheck-autostart.json" ] \
-    || [ -e "$STATE/.$ID.crosscheck-autostart.lock" ]; then
+    || [ -L "$STATE/$ID.crosscheck-autostart.json" ] \
+    || [ -e "$STATE/.$ID.crosscheck-autostart.lock" ] \
+    || [ -L "$STATE/.$ID.crosscheck-autostart.lock" ]; then
   [ -n "$TASK_GENERATION" ] || {
     echo "error: Crosscheck coordinator state has no exact task generation for $ID" >&2
     exit 1
   }
-  "$FM_ROOT/bin/fm-crosscheck-autostart.py" cancel "$ID" "$TASK_GENERATION" || exit 1
+  "$FM_ROOT/bin/fm-crosscheck-autostart.py" retire "$ID" "$TASK_GENERATION" || exit 1
+elif [ -e "$STATE/$ID.crosscheck-autostart.log" ] \
+    || [ -L "$STATE/$ID.crosscheck-autostart.log" ] \
+    || [ -e "$STATE/.$ID.crosscheck-autostart-handoff.lock" ] \
+    || [ -L "$STATE/.$ID.crosscheck-autostart-handoff.lock" ]; then
+  "$FM_ROOT/bin/fm-crosscheck-autostart.py" retire "$ID" '' || exit 1
 fi
 
 if [ "$DIRECT_SPAWN_CLEANUP" = pending ] && [ -n "$DIRECT_SPAWN_BACKUP" ]; then
@@ -5868,10 +5877,7 @@ fm_backend_clear_transition "$BACKEND" "$STATE" "$T" || true
 # Remove the exact recorded per-generation task temp root, including gotmp.
 # Read before the state-file rm below; empty (pre-fix tasks without tasktmp=) is a no-op.
 [ -z "$TASK_TMP" ] || safe_remove_task_tmp "$TASK_TMP" || exit 1
-rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log" \
-  "$STATE/$ID.crosscheck-autostart.request.json" "$STATE/$ID.crosscheck-autostart.json" \
-  "$STATE/$ID.crosscheck-autostart.log" "$STATE/.$ID.crosscheck-autostart-handoff.lock" \
-  "$STATE/.$ID.crosscheck-autostart.lock"
+rm -f "$STATE/$ID.status" "$STATE/$ID.turn-ended" "$STATE/$ID.check.sh" "$STATE/$ID.meta" "$STATE/$ID.pi-ext.ts" "$STATE/$ID.grok-turnend-token" "$STATE/$ID.provision.log"
 [ -z "$PR_REGISTRATION_LOCK" ] || fm_account_meta_lock_release "$PR_REGISTRATION_LOCK" >/dev/null 2>&1 || true
 PR_REGISTRATION_LOCK=
 [ -z "$ACCOUNT_DELETE_LOCK" ] || fm_account_lifecycle_lock_release "$ACCOUNT_DELETE_LOCK" >/dev/null 2>&1 || true

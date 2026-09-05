@@ -1067,6 +1067,7 @@ state = {
     "resources": {"vm_instance_id": "11111111-1111-1111-1111-111111111111"},
     "expected_boot_id": "22222222-2222-2222-2222-222222222222",
 }
+
 result = {
     "exit_code": 0,
     "timed_out": False,
@@ -1085,6 +1086,38 @@ assert "boot_id=22222222-2222-2222-2222-222222222222" in line, line
 assert "unrecorded" not in line, line
 PY
   pass "the run-owned step log carries the verified Azure VM instance and boot identities beside the verdict"
+}
+
+admission_operation_ceiling_unit() {
+  python3 - "$HOST" <<'PY'
+import importlib.util, json, pathlib, sys, tempfile
+spec=importlib.util.spec_from_file_location("runner",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+state_dir=pathlib.Path(tempfile.mkdtemp())
+env={"state_dir":state_dir,"home_binding":"sha256:"+"a"*64,"deployment_generation":"gen"}
+ledger={
+    "schema":"fm.azure-operation-ledger/v1",
+    "home_binding":env["home_binding"],
+    "deployment_generation":"gen",
+    "bootstrap":{"control":m.RUNNER_CONTROL_OPERATION_CEILING,"storage":0},
+    "invocations":{},
+}
+(state_dir/"operation-ledger.json").write_text(json.dumps(ledger),encoding="utf-8")
+
+# Exhausted historical context-free accounting cannot brick a new request.
+attempt=m.begin_admission_operation_context(env)
+m.record_azure_operation(env,["account","show"])
+updated=json.loads((state_dir/"operation-ledger.json").read_text(encoding="utf-8"))
+assert updated["bootstrap"]["control"]==m.RUNNER_CONTROL_OPERATION_CEILING
+assert updated["invocations"][attempt]["counts"]=={"control":1,"storage":0}
+
+# The new attempt is still a strict, restart-resistant runaway bound.
+updated["invocations"][attempt]["counts"]["control"]=m.RUNNER_CONTROL_OPERATION_CEILING
+(state_dir/"operation-ledger.json").write_text(json.dumps(updated),encoding="utf-8")
+try: m.record_azure_operation(env,["account","show"])
+except m.RunnerError as exc: assert "attempt lineage" in str(exc) and "ceiling exhausted" in str(exc)
+else: raise AssertionError("one admission attempt exceeded its durable control-operation ceiling")
+PY
+  pass "Crosscheck admission uses a fresh durable operation lineage without resetting exhausted history"
 }
 
 environment_mode_defaults
@@ -1106,6 +1139,7 @@ quota_snapshot_unit
 shared_allocator_bridge_unit
 commissioning_admission_unit
 run_owned_execution_proof_contract
+admission_operation_ceiling_unit
 runner_document_contract() {
   python3 - "$ROOT/docs/azure-runner.md" <<'PY' \
     || fail "the runner document no longer pins the execution-proof contract"

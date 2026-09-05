@@ -183,7 +183,7 @@ Azure auto-shutdown therefore deallocates the VM no later than 24 hours after pr
 The guest shutdown Run Command remains defense in depth, while itemized OS-disk, storage, NAT, public-IP, private-endpoint, private-DNS, and monitoring floors remain visible after compute deallocation.
 Every host subprocess and Azure CLI call has a five-minute deadline.
 Before every Azure call, an atomic home-scoped ledger durably increments either the control or storage category under the state lock.
-The ledger is bound to the home/deployment generation and to each invocation, fence, parent, and retry-lineage root, never decrements on failure or timeout, and enforces independent 2,000-operation lineage ceilings that process restart cannot reset.
+The ledger is bound to the home/deployment generation and to each invocation, fence, parent, and retry-lineage root, never decrements on failure or timeout, and enforces independent 20,000-operation lineage ceilings that process restart cannot reset. Crosscheck's foundation preflight binds its calls to a fresh admission-attempt lineage before its first Azure operation, so a healthy long-lived deployment generation cannot consume one shared lifetime allowance while each individual attempt remains strictly bounded.
 Repository-controlled execution is networkless, so untrusted code cannot create an unbounded egress charge.
 An unreadable actual cost, forecast, retail rate, quota, or active inventory fails closed.
 Budget pressure blocks new invocations only.

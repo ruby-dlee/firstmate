@@ -53,7 +53,7 @@ jobs:
         run: |
           set -eu
           command -v tmux >/dev/null || {
-            echo "::error::tmux is required for real afk injection e2e coverage"
+            echo "::error::tmux is required for tmux-backed behavior coverage"
             exit 1
           }
           tmux -V

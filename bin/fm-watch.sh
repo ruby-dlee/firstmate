@@ -8,12 +8,10 @@
 # otherwise, so a crewmate that finishes (or stops and waits) without a current
 # working signal is never silently swallowed. A declared external-wait pause is
 # the separate idle absorb case and re-surfaces only on its long bounded cadence,
-# although its initial no-verb status signal still surfaces in normal mode.
-# While state/.afk exists, the daemon owns triage and this watcher queues and exits
-# on every wake. Printed reason lines:
+# although its initial no-verb status signal still surfaces. Printed reason lines:
 #   signal: <file>...      status/turn-end signals, surfaced when a listed status
 #                          has a captain-relevant verb OR a no-verb signal's crewmate
-#                          is not provably working, unless afk is active
+#                          is not provably working
 #   stale: <window>        a provably-working stale is ALWAYS absorbed (with a wedge
 #                          timer) regardless of what the status log says - an active
 #                          busy pane outranks even a captain-relevant log line. A declared
@@ -33,15 +31,14 @@
 #                          A pane that remains busy without meaningful output,
 #                          status, or turn-end progress surfaces after
 #                          FM_PERMISSION_STALL_ESCALATE_SECS as a possible macOS
-#                          permission/system-dialog block. Unless afk is active.
+#                          permission/system-dialog block.
 #   check: <script>: <out> per-task check output, always actionable
 #                          A merged-PR check first attempts fail-closed automatic
 #                          teardown; its success or refusal is included here.
 #   auto-reap: <out>       stale crashed-spawn acquisition recovery made progress
 #                          or refused and retained state for operator inspection
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
-#                          status or a dead/unknown command-step liveness reading,
-#                          unless afk is active
+#                          status or a dead/unknown command-step liveness reading
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock.
@@ -64,9 +61,8 @@ mkdir -p "$STATE"
 
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
-# Shared wake classifier (captain-relevant verbs + signal/stale/heartbeat
-# predicates), the SAME library the away-mode daemon uses, so the triage policy
-# has one definition.
+# Shared wake classifier for captain-relevant verbs and signal, stale, and
+# heartbeat predicates.
 # shellcheck source=bin/fm-classify-lib.sh
 . "$SCRIPT_DIR/fm-classify-lib.sh"
 # The DEFAULT EVENT SOURCE: this watcher's poll loop over the pull primitives
@@ -148,10 +144,7 @@ BUSY_REGEX=${FM_BUSY_REGEX:-'esc (to )?interrupt|Working\.\.\.|Ctrl\+c:cancel'}
 # signal, a no-verb signal whose crewmate is not provably working, any check, a stale
 # pane whose crewmate is not provably working, a provably-working stale past the
 # threshold, or anything unknown) is written to the durable queue and exits, which
-# is what wakes the LLM through the background-task completion. The same classifier
-# (fm-classify-lib.sh) backs the away-mode daemon; while state/.afk exists the
-# daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
-# wake) and never double-triages - and never runs the costly provably-working read.
+# is what wakes the LLM through the background-task completion.
 STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provably-working stale escalates as a possible wedge
 # A macOS TCC/system dialog can block a foreground tool while the harness keeps
 # rendering its busy footer, so ordinary stale detection never starts. Track a
@@ -185,12 +178,6 @@ EVENT_CAP_FAIL_MAX=${FM_EVENT_CAP_FAIL_MAX:-3}
 _event_cap_key=""
 _event_cap_ok=0
 _event_cap_fails=0
-
-# afk_present: 0 while the away-mode flag exists. When set, the daemon wraps this
-# watcher and owns triage, so the watcher must behave one-shot (enqueue + exit on
-# every wake) and let the daemon classify - never absorb here, or the daemon's
-# digest/injection layer would never see the wake.
-afk_present() { [ -e "$STATE/.afk" ]; }
 
 # Append one line to the triage debug log explaining an absorbed (benign) wake,
 # size-capped so a long benign stretch cannot grow it without bound. Best-effort:
@@ -484,11 +471,9 @@ pause_absorb_class() {  # <window> <task>
 # wake() and exit. This is deliberately separate from the pane sweep: checks and
 # signals precede that sweep, so a chatty sibling used to starve pause registration
 # indefinitely. The same pre-wake pass owns the bounded recheck, which keeps a busy
-# fleet from making a registered pause permanently invisible. Away mode is excluded
-# because its daemon owns pause tracking and rechecks.
+# fleet from making a registered pause permanently invisible.
 reconcile_declared_pauses() {
   local w task key last class was_registered
-  afk_present && return 0
   while IFS= read -r w; do
     task=$(window_to_task "$w" "$STATE")
     key=$(printf '%s' "$w" | tr ':/.' '___')
@@ -898,8 +883,7 @@ report_retention_owner_is_fresh() {
 
 # Surfaced-marker bookkeeping for the heartbeat backstop. The watcher records the
 # captain-relevant status line it SURFACED (woke firstmate for) in
-# .hb-surfaced-<task>, the watcher's analogue of the daemon's
-# .subsuper-seen-status. Unlike .seen-* (a size:mtime signature advanced on BOTH
+# .hb-surfaced-<task>. Unlike .seen-* (a size:mtime signature advanced on BOTH
 # surface and absorb), .hb-surfaced is advanced ONLY on surface, so the heartbeat
 # fleet-scan can tell apart a captain-relevant status that already woke firstmate
 # from one that has not - the latter being a per-wake-path miss it must surface.
@@ -928,8 +912,8 @@ mark_all_captain_relevant_surfaced() {
   done < <(scan_captain_relevant_statuses "$STATE")
 }
 
-# Heartbeat fleet-scan (the always-on twin of the daemon's catch-all). Status
-# events retain their surfaced-marker dedup. Command-step liveness is handled as
+# Heartbeat fleet-scan. Status events retain their surfaced-marker dedup.
+# Command-step liveness is handled as
 # three explicit states: alive is healthy, while dead and unknown both surface
 # because neither may be absorbed as positive evidence. A line with no liveness
 # observation keeps its prior behavior.
@@ -1212,8 +1196,7 @@ EOF
           ;;
       esac
     done
-    # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
-    #   - the away-mode daemon owns triage (afk) and wants every wake;
+    # Triage: a signal is ACTIONABLE when either of these holds:
     #   - any status file carries a captain-relevant verb;
     #   - or it is a no-verb wake (a bare turn-end, a working: note) whose crewmate is
     #     NOT provably working - the crewmate stopped its turn with no actively-running
@@ -1223,9 +1206,9 @@ EOF
     # Actionable -> enqueue, advance .seen-* markers, exit. Benign (a no-verb wake
     # whose crewmate IS provably working) in always-on mode -> advance the markers so it
     # will not re-fire, log, and keep blocking without enqueuing. The provably-working
-    # check is evaluated only for a non-afk, no-captain-verb signal.
+    # check is evaluated only for a no-captain-verb signal.
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
-    if afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
+    if signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
         fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
@@ -1281,7 +1264,7 @@ EOF
     # first, so a permission-shaped Herdr pane woke on every changing capture
     # without ever creating .paused-<key>. Authoritative working state still
     # outranks a stale paused log and falls through to ordinary stale handling.
-    if ! afk_present && [ "$window_busy" != 1 ] && status_is_paused "$last"; then
+    if [ "$window_busy" != 1 ] && status_is_paused "$last"; then
       case "$(pause_absorb_class "$w" "$task")" in
         paused)
           handle_paused_stale "$w" "$task" "$h"
@@ -1335,13 +1318,6 @@ EOF
             none) clear_pause_tracking "$w" ;;
             *)      clear_pause_tracking "$w" ;;
           esac
-        elif afk_present; then
-          # Daemon owns triage: one-shot per distinct stale hash, as before.
-          if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
-            fm_wake_append stale "$w" "stale: $w" || exit 1
-            printf '%s' "$h" > "$sf"
-            wake "stale: $w"
-          fi
         elif stale_is_terminal "$w" "$STATE"; then
           # The log's last line is captain-relevant - but that alone is not
           # proof the crewmate is actually done: a crewmate's own status log gets no
@@ -1433,7 +1409,7 @@ EOF
       echo 0 > "$cf"
       rm -f "$ssf" "$ewf"
       task=$(window_to_task "$w" "$STATE")
-      if ! afk_present && status_is_paused "$(last_status_line "$STATE/$task.status")" && [ "$window_busy" != 1 ]; then
+      if status_is_paused "$(last_status_line "$STATE/$task.status")" && [ "$window_busy" != 1 ]; then
         case "$(pause_absorb_class "$w" "$task")" in
           paused) handle_paused_stale "$w" "$task" "$h" ;;
           working) ;;
@@ -1459,13 +1435,8 @@ EOF
     # Triage: in always-on mode a heartbeat is benign unless the fleet-scan turns
     # up a captain-relevant status or a dead/unknown command-step liveness reading.
     # Unknown is grouped with actionable here because a heartbeat needs only the
-    # binary absorb/surface decision, and unknown is not proof of health. The
-    # away-mode daemon, when present, owns triage and wants every heartbeat.
-    if afk_present; then
-      fm_wake_append heartbeat heartbeat heartbeat || exit 1
-      safe_touch_marker_or_log "$STATE/.last-heartbeat" "watcher heartbeat" || true
-      wake "heartbeat"
-    elif heartbeat_scan_finds_actionable; then
+    # binary absorb/surface decision, and unknown is not proof of health.
+    if heartbeat_scan_finds_actionable; then
       # Backstop: a captain-relevant status the per-wake path absorbed by mistake.
       # Enqueue first, then mark every captain-relevant status surfaced so the next
       # heartbeat does not re-fire them (enqueue-before-suppress preserved).

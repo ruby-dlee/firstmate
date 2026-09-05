@@ -8,6 +8,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 LOCK="$ROOT/bin/fm-lock.sh"
+TARGET_LIB="$ROOT/bin/fm-supervisor-target-lib.sh"
 fm_test_tmproot_into TMP_ROOT fm-lock
 FM_LOCK_TEST_PIDS=()
 
@@ -232,6 +233,36 @@ test_legacy_one_line_lock_live_holder_blocks() {
   pass "fm-lock falls back to harness liveness for a legacy one-line lock"
 }
 
+test_supervisor_endpoint_discovery_precedence() {
+  local out
+  # shellcheck source=bin/fm-supervisor-target-lib.sh
+  . "$TARGET_LIB"
+
+  out=$(FM_SUPERVISOR_BACKEND=herdr TMUX_PANE='%9' HERDR_ENV=1 HERDR_PANE_ID=w1:p1 discover_supervisor_backend)
+  [ "$out" = herdr ] || fail "explicit supervisor backend did not win: $out"
+  out=$(FM_SUPERVISOR_BACKEND='' TMUX_PANE='%9' HERDR_ENV=1 HERDR_PANE_ID=w1:p1 discover_supervisor_backend)
+  [ "$out" = tmux ] || fail "tmux pane did not win backend auto-detection: $out"
+  out=$(FM_SUPERVISOR_BACKEND='' TMUX_PANE='' HERDR_ENV=1 HERDR_PANE_ID=w1:p1 discover_supervisor_backend)
+  [ "$out" = herdr ] || fail "Herdr environment did not select its backend: $out"
+  if out=$(FM_SUPERVISOR_BACKEND='' TMUX_PANE='' HERDR_ENV='' HERDR_PANE_ID='' discover_supervisor_backend); then
+    fail "backend fallback unexpectedly reported positive discovery"
+  fi
+  [ "$out" = tmux ] || fail "backend fallback was not tmux: $out"
+
+  out=$(FM_SUPERVISOR_TARGET=explicit:target TMUX_PANE='' HERDR_ENV=1 HERDR_PANE_ID=w1:p9 discover_supervisor_target)
+  [ "$out" = explicit:target ] || fail "explicit supervisor target did not win: $out"
+  out=$(FM_SUPERVISOR_TARGET='' TMUX_PANE='%3' HERDR_ENV=1 HERDR_PANE_ID=w1:p9 discover_supervisor_target)
+  [ "$out" = '%3' ] || fail "tmux pane did not win target auto-detection: $out"
+  out=$(FM_SUPERVISOR_TARGET='' TMUX_PANE='' HERDR_ENV=1 HERDR_PANE_ID=w1:p9 HERDR_SESSION=iso1 discover_supervisor_target)
+  [ "$out" = iso1:w1:p9 ] || fail "Herdr target composition was wrong: $out"
+  if out=$(FM_SUPERVISOR_TARGET='' TMUX_PANE='' HERDR_ENV='' HERDR_PANE_ID='' discover_supervisor_target); then
+    fail "target fallback unexpectedly reported positive discovery"
+  fi
+  [ "$out" = firstmate:0 ] || fail "target fallback was not firstmate:0: $out"
+  pass "primary session endpoint discovery preserves override and runtime precedence"
+}
+
+test_supervisor_endpoint_discovery_precedence
 test_pid_reuse_with_mismatched_start_time_acquires
 test_live_same_identity_blocks_another_session
 test_same_session_reacquire_succeeds

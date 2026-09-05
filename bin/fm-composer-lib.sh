@@ -7,12 +7,10 @@
 # carried their own copy of the "is this composer row empty / pending / not an
 # agent composer" decision, and the copies drifted. The dangerous drift: a BARE
 # shell prompt glyph (`>`, `$`, `%`, `#`) - what a pane shows once its agent has
-# exited to a plain login shell - was treated as an empty, ready-to-inject
-# AGENT composer. The terminal-backed away-mode compatibility injector reads
-# composer-emptiness to decide whether a pane is a safe injection target, so a
-# dead-shell pane misread as "empty" meant an escalation could be typed into (and,
-# worst case, executed by) that shell. Consolidating the one decision here means
-# the safety rule cannot silently drift across adapters again.
+# exited to a plain login shell - was treated as an empty agent composer. A
+# dead-shell pane misread as "empty" could receive and execute automated input.
+# Consolidating the one decision here means the safety rule cannot silently
+# drift across adapters again.
 #
 # THE SAFETY RULE this owner enforces: a bare shell prompt glyph is a genuine
 # empty agent composer ONLY when it appears INSIDE a real agent-composer
@@ -25,13 +23,12 @@
 # the deliberate exception: every non-empty glyph is typed input and therefore
 # `pending`, while only a truly blank content row is `empty`.
 #
-# GHOST/PLACEHOLDER TEXT is the other half of this owner (task
-# afk-herdr-false-pending): a harness fills an otherwise-empty composer with
-# de-emphasized ghost text - claude's rotating prompt suggestion, codex's idle
-# suggestion, grok's placeholder - which a plain capture cannot tell apart from
-# text a human typed, so the compatibility injector reads the idle pane as
-# "pending input" and defers every escalation (the overnight wedge that motivated
-# this consolidation). fm_composer_strip_ghost is the ONE ANSI-aware extractor of
+# GHOST/PLACEHOLDER TEXT is the other half of this owner: a harness fills an
+# otherwise-empty composer with de-emphasized ghost text - claude's rotating
+# prompt suggestion, codex's idle suggestion, or grok's placeholder - which a
+# plain capture cannot tell apart from text a human typed. Without shared ANSI
+# handling, safe delivery paths can misread an idle pane as pending.
+# fm_composer_strip_ghost is the ONE ANSI-aware extractor of
 # "real typed content": it drops every de-emphasized run - dim/faint (SGR 2, how
 # claude and codex render ghost text) AND a dark/muted TRUECOLOR foreground (how
 # grok renders placeholder/hint text) - and keeps only normal-intensity,

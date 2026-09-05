@@ -27,9 +27,6 @@ capability	system-openat-binding	Darwin,Linux	a system C preprocessor (/usr/bin/
 capability	origin-egress	Darwin,Linux	outbound DNS resolution and network reach to the origin remote's host, which bin/fm-teardown.sh's secondmate_remote_identity must complete before any secondmate upstream-authority probe can run; a sandbox whose repository-command egress is deny-all by design, as the Azure validation cell's is, can never provide it
 unit	tests/fm-backend-tmux-smoke.test.sh	whole-file	real-tmux-server
 unit	tests/fm-backend-tmux-target-exists.test.sh	whole-file	real-tmux-server
-unit	tests/fm-afk-inject-e2e.test.sh	whole-file	real-tmux-server
-unit	tests/fm-afk-launch.test.sh	unit_concurrent_start_serialized	real-tmux-server
-unit	tests/fm-afk-launch.test.sh	e2e_tmux	real-tmux-server
 unit	tests/fm-azure-runner.test.sh	linux_systemd_drop_integration	passwordless-root-escalation
 unit	tests/fm-account-directory.test.sh	test_claude_approval_marker_contract	system-openat-binding
 unit	tests/fm-account-directory.test.sh	test_claude_rotates_eligible_accounts_without_treating_usage_as_health	system-openat-binding

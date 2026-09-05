@@ -187,22 +187,12 @@ const config = process.env.FM_CONFIG_OVERRIDE || `${fmHome}/config`;
 const armScript = `${fmRoot}/bin/fm-watch-arm.sh`;
 const marker = `${state}/.pi-watch-extension-loaded`;
 const wakeQueue = `${state}/.wake-queue`;
-const awayMarker = `${state}/.afk`;
 const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(extensionFile)).digest("hex")}`;
 
 function positiveInteger(value: string | undefined, fallback: number): number {
   if (!value || !/^[0-9]+$/.test(value)) return fallback;
   const parsed = Number(value);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function pathPresent(path: string): boolean {
-  try {
-    lstatSync(path);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function wakeQueuePending(): boolean {
@@ -356,7 +346,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function cycleCanRun(): boolean {
-    return cycleActive && !shuttingDown && !pathPresent(awayMarker) && sessionOwnsLock();
+    return cycleActive && !shuttingDown && sessionOwnsLock();
   }
 
   function wakeDeliveryId(message: unknown): string | undefined {
@@ -512,9 +502,7 @@ export default function (pi: ExtensionAPI) {
   function startArmChild(): ArmResult {
     if (!cycleCanRun()) {
       stopCycle();
-      return { ok: false, message: pathPresent(awayMarker)
-        ? "watcher: away - the away-mode daemon owns supervision"
-        : "watcher: read-only - session lock is held by another firstmate session" };
+      return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };
     }
     if (child) return { ok: true, message: "watcher: healthy - Pi extension already has an arm child" };
     clearArmRestartTimer();
@@ -563,7 +551,7 @@ export default function (pi: ExtensionAPI) {
 
   function reconcileControlState(): void {
     if (!cycleActive || shuttingDown) return;
-    if (pathPresent(awayMarker) || !sessionOwnsLock()) {
+    if (!sessionOwnsLock()) {
       stopCycle();
       return;
     }
@@ -575,7 +563,7 @@ export default function (pi: ExtensionAPI) {
     try {
       controlWatcher = watch(state, { persistent: false }, (_event, filename) => {
         const name = filename?.toString();
-        if (name && name !== ".lock" && name !== ".afk" && name !== ".wake-queue") return;
+        if (name && name !== ".lock" && name !== ".wake-queue") return;
         reconcileControlState();
       });
       controlWatcher.on("error", () => {
@@ -589,10 +577,6 @@ export default function (pi: ExtensionAPI) {
   }
 
   function startArm(): ArmResult {
-    if (pathPresent(awayMarker)) {
-      stopCycle();
-      return { ok: false, message: "watcher: away - the away-mode daemon owns supervision" };
-    }
     if (!sessionOwnsLock()) {
       stopCycle();
       return { ok: false, message: "watcher: read-only - session lock is held by another firstmate session" };

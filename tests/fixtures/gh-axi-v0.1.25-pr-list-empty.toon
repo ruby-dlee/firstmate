@@ -1,0 +1,5 @@
+count: 0
+pull_requests: []
+help[2]:
+  Run `gh-axi -R ruby-dlee/firstmate pr create --title "..." --body-file <path>` to create a PR
+  Run `gh-axi -R ruby-dlee/firstmate pr list --state closed` to see closed PRs

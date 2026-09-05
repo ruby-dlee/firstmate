@@ -1,23 +1,13 @@
 #!/usr/bin/env bash
-# fm-supervisor-target-lib.sh - the single owner of supervisor-pane discovery.
+# fm-supervisor-target-lib.sh - the single owner of primary session endpoint discovery.
 #
-# The terminal-backed away-mode compatibility path must know which pane runs
-# firstmate itself, both to inject escalations into it and to validate that
-# target at startup. Native tracked delivery never resolves a pane. The launcher
-# (bin/fm-afk-launch.sh) must resolve the SAME captain pane BEFORE it creates a
-# separate, non-visible terminal for the daemon, so it can pass that pane in as
-# FM_SUPERVISOR_TARGET (otherwise the daemon, running in its own terminal, would
-# auto-discover its OWN pane and inject there instead of into the captain's).
-#
-# Because both callers need the identical resolution, it lives here once. The
-# function names and precedence are unchanged from when this logic lived inline
-# in bin/fm-supervise-daemon.sh, so its unit tests (tests/fm-daemon.test.sh)
-# keep exercising the same names after the daemon sources this file.
+# The session lock records a verified terminal route when the harness process is
+# a descendant of that endpoint. Home-bound visible delivery can then use the
+# recorded route without guessing which active terminal belongs to this home.
 
 # Default supervisor pane target/backend when nothing is configured or detected.
-# "firstmate:0" is a tmux session:window name, so the bare fallback (nothing
-# configured, nothing detected) assumes tmux - matching the daemon's pre-herdr
-# behavior byte-for-byte when run outside both tmux and herdr.
+# "firstmate:0" is a tmux session:window name, so the bare fallback assumes tmux
+# when no runtime endpoint is detected.
 FM_SUPERVISOR_TARGET_DEFAULT="firstmate:0"
 FM_SUPERVISOR_BACKEND_DEFAULT="tmux"
 
@@ -27,14 +17,14 @@ FM_SUPERVISOR_BACKEND_DEFAULT="tmux"
 #      to know which).
 #   2. $TMUX_PANE - tmux sets this in every pane's environment; inherited by a
 #      process launched from firstmate's own pane.
-#   3. $HERDR_ENV=1 + $HERDR_PANE_ID - herdr injects both into every process it
+#   3. $HERDR_ENV=1 + $HERDR_PANE_ID - herdr sets both on every process it
 #      manages a pane for; compose the "<session>:<pane-id>" target from
 #      $HERDR_SESSION (defaulting to "default", mirroring bin/backends/herdr.sh's
 #      fm_backend_herdr_session) and $HERDR_PANE_ID. Checked after $TMUX_PANE so a
 #      tmux pane nested inside herdr still resolves to tmux, matching
 #      fm_backend_detect's innermost-first rule.
 #   4. FM_SUPERVISOR_TARGET_DEFAULT - legacy tmux fallback (may not resolve if the
-#      session is named differently). Returns 1 so the caller can warn.
+#      session is named differently). Returns 1 so the caller treats it as unverified.
 discover_supervisor_target() {
   if [ -n "${FM_SUPERVISOR_TARGET:-}" ]; then
     printf '%s' "$FM_SUPERVISOR_TARGET"

@@ -1,6 +1,6 @@
 Mode: Claude background-notify supervision.
 
-When this session owns supervision and away mode is not active:
+When this session owns supervision:
 1. Drain first with `bin/fm-wake-drain.sh`.
 2. Source `__FM_X_MODE_ENV__` first when X mode is active.
 3. Run `bin/fm-watch-arm.sh` as its own Claude Code background task.
@@ -22,8 +22,3 @@ When this session owns supervision and away mode is not active:
 Claude Code's background task completion is the wake mechanism.
 The watcher itself remains `bin/fm-watch.sh`, and `bin/fm-watch-arm.sh` is only the verified background arm wrapper.
 Re-arm attaches to an existing healthy cycle when one is already present, so the background task stays live until that cycle ends.
-
-When `state/.afk` exists, the away daemon replaces `bin/fm-watch-arm.sh` as the tracked background task and owns the watcher as its child.
-Routine wakes stay inside the daemon's bash triage and leave that task parked.
-A captain-relevant batch completes the task with an `afk-reap-wake:` reason, which uses this same native completion notification without typing into the Claude composer.
-Drain `state/.wake-queue`, handle the batch, and restart the away daemon as a fresh native tracked background task if away mode remains active.

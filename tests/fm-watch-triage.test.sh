@@ -12,12 +12,10 @@
 # provably-working stale panes absorbed-then-escalated past the threshold,
 # terminal-looking stale status lines overridden by an active run, the heartbeat
 # backstop fail-safe, direct harness-permission prompt escalation, the bounded
-# busy/no-progress system-dialog heuristic, the failure-pause discriminator (a failure
-# reported under the pause verb escalates while a deliberate wait still absorbs), and
-# afk coherence (no double-triage while the away-mode daemon owns supervision).
+# busy/no-progress system-dialog heuristic, and the failure-pause discriminator (a
+# failure reported under the pause verb escalates while a deliberate wait still absorbs).
 #
-# Daemon-side classification/injection lives in fm-daemon.test.sh; watcher/lock
-# liveness in fm-watcher-lock.test.sh; the durable-queue safety matrix in
+# Watcher/lock liveness lives in fm-watcher-lock.test.sh; the durable-queue safety matrix in
 # fm-wake-queue.test.sh; the full declared-pause truth table - live-idle, dead,
 # open-decision, and closed-decision panes - in fm-watch-pause-absorb.test.sh.
 set -u
@@ -1715,72 +1713,6 @@ test_beacon_stays_fresh_while_absorbing() {
   pass "the liveness beacon stays fresh while the watcher absorbs benign wakes (fm-guard never false-alarms)"
 }
 
-# --- afk coherence: the daemon owns triage; the watcher does not double-triage ---
-
-test_afk_present_reverts_watcher_to_one_shot() {
-  local dir state fakebin out drain_out status_file pid
-  dir=$(make_case afk-coherence); state="$dir/state"; fakebin="$dir/fakebin"
-  out="$dir/watch.out"; drain_out="$dir/drain.out"
-  status_file="$state/task.status"
-  printf 'working: routine note\n' > "$status_file"
-  date '+%s' > "$state/.afk"   # away mode: the supervise-daemon owns triage
-  # Set a PROVABLY-WORKING verdict: if afk failed to bypass the provably-working
-  # check, this no-verb signal would be absorbed (not surfaced). The test asserting
-  # a surface therefore also proves afk reverts to one-shot and skips the costly read.
-  export FM_FAKE_CREW_STATE='state: working · source: run-step · validating (running)'
-  watch_bg "$state" "$fakebin" "$out"
-  pid=$!
-  wait_for_exit "$pid" 40 || fail "with .afk present the watcher did not exit one-shot for a benign signal"
-  grep -F "signal: $status_file" "$out" >/dev/null || fail "afk-mode watcher did not surface the signal for the daemon"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the afk-mode signal failed"
-  grep "$(printf '\tsignal\t')" "$drain_out" | grep -F "$status_file" >/dev/null \
-    || fail "afk-mode benign signal was not queued for the daemon to classify"
-  pass "with .afk present the watcher reverts to one-shot so the daemon owns triage (no double-triage)"
-}
-
-# A paused pane can first appear as a changed hash. In AFK mode that initial path
-# must still hand off the plain window identity to the daemon, rather than running
-# the normal-mode pause re-surface and decorating the stale identity.
-test_afk_paused_changed_pane_hands_off_plain_stale() {
-  local dir state fakebin out drain_out capture_file statusf window key sig pid back i
-  dir=$(make_case afk-paused-changed-pane); state="$dir/state"; fakebin="$dir/fakebin"
-  out="$dir/watch.out"; drain_out="$dir/drain.out"; capture_file="$dir/pane.txt"
-  window="test:fm-afk-held"
-  printf 'idle, awaiting upstream\n' > "$capture_file"
-  printf 'window=%s\nkind=ship\n' "$window" > "$state/afk-held.meta"
-  statusf="$state/afk-held.status"
-  printf 'paused: awaiting the upstream tool release\n' > "$statusf"
-  back=$(( $(date +%s) - 500 ))
-  if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$statusf"
-  else touch -m -d "@$back" "$statusf"; fi
-  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-afk-held_status"
-  date '+%s' > "$state/.afk"
-  touch "$state/.last-check" "$state/.last-account-session-sync" "$state/.last-report-retention"
-  key=$(printf '%s' "$window" | tr '.:/' '___')
-
-  # Deliberately do not seed .hash-*: this is the changed-pane path that used to
-  # call handle_paused_stale before AFK's one-shot daemon handoff.
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
-    FM_FAKE_CREW_STATE='state: paused · source: status-log · awaiting the upstream tool release' \
-    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
-    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
-  pid=$!
-  i=0
-  while [ "$i" -lt 100 ] && [ ! -e "$state/.last-watcher-beat" ]; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  [ -e "$state/.last-watcher-beat" ] || fail "AFK watcher did not enter its supervision loop"
-  wait_for_exit "$pid" 40 || fail "AFK paused changed pane did not hand off a stale wake"
-  grep -Fx "stale: $window" "$out" >/dev/null || fail "AFK paused stale did not preserve its plain window identity: $(cat "$out")"
-  grep -F "awaiting external" "$out" >/dev/null && fail "AFK watcher decorated a stale identity instead of handing it to the daemon"
-  [ ! -e "$state/.paused-$key" ] || fail "AFK watcher recorded normal-mode pause tracking instead of handing off"
-  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after AFK paused stale failed"
-  grep "$(printf '\tstale\t')" "$drain_out" | grep -F "stale: $window" >/dev/null \
-    || fail "AFK paused stale was not queued with the plain window identity"
-  pass "AFK changed paused panes hand off plain stale identities for daemon-owned pause triage"
-}
-
 test_account_session_sync_is_bounded_and_cadenced() {
   local dir state fake_root sync_bin calls query_timeout_file task_timeout_file elapsed_file sync_cadence_file elapsed count
   dir=$(make_case account-session-sync); state="$dir/state"
@@ -1963,11 +1895,6 @@ if [ "${FM_TEST_FOCUSED:-}" = permission-prompts ]; then
   exit 0
 fi
 
-if [ "${FM_TEST_FOCUSED:-}" = afk-paused-handoff ]; then
-  test_afk_paused_changed_pane_hands_off_plain_stale
-  exit 0
-fi
-
 if [ "${FM_TEST_FOCUSED:-}" = pause-regressions ]; then
   test_declared_pause_preempts_permission_prompt_stale
   test_nonterminal_stale_not_working_surfaced
@@ -2039,8 +1966,6 @@ test_heartbeat_no_change_absorbed
 test_heartbeat_backstop_surfaces_unsurfaced_status
 test_heartbeat_surfaces_dead_and_unknown_liveness
 test_beacon_stays_fresh_while_absorbing
-test_afk_present_reverts_watcher_to_one_shot
-test_afk_paused_changed_pane_hands_off_plain_stale
 test_account_session_sync_is_bounded_and_cadenced
 test_watcher_markers_refuse_symlinks
 test_watcher_timeout_wrapper_uses_hard_kill_fallback

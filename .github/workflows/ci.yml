@@ -73,11 +73,17 @@ jobs:
       - name: Install Pi for the credential-store contract
         run: |
           set -eu
-          npm install -g @earendil-works/pi-coding-agent
+          # The published CLI imports its experimental server package, which
+          # is distributed separately rather than declared as a dependency.
+          pi_version="$(npm view @earendil-works/pi-coding-agent version)"
+          npm install -g \
+            "@earendil-works/pi-coding-agent@$pi_version" \
+            "@earendil-works/pi-server@$pi_version"
           # By absolute path: a bare specifier does not resolve from the global
           # prefix, and FM_PI_PACKAGE_DIR spares the test a PATH lookup for a
           # binary it never runs.
           root="$(npm root -g)/@earendil-works/pi-coding-agent"
+          test "$(node -p "require('$(npm root -g)/@earendil-works/pi-server/package.json').version")" = "$pi_version"
           test -f "$root/dist/core/auth-storage.js"
           node -e "console.log(require('$root/package.json').version)"
           {

@@ -1122,6 +1122,7 @@ def verify_scope_and_foundation(config: dict[str, Any]) -> Any:
     runner = load_runner()
     try:
         runner_env = runner.environment()
+        runner.begin_admission_operation_context(runner_env)
         runner.scope_gate(runner_env)
         runner.foundation_gate(runner_env)
         runner.budget_gate(

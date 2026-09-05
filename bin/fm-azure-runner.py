@@ -88,11 +88,10 @@ METER_RATE_CEILINGS_USD = {
     "provisioning_control_interval": 0.01,
 }
 # Runaway-automation backstops, not budgets: spend is governed by the
-# durable reservations and the dollar limit. The original 2000-op
-# lifetime bootstrap bucket was legitimately exhausted by the
-# multi-generation commissioning campaign (generation 054 ground
-# truth), so the ceilings now sit an order of magnitude above any
-# single campaign while still bounding a runaway loop.
+# durable reservations and the dollar limit. Each admitted control attempt
+# gets its own durable lineage below; the home bootstrap bucket is reserved
+# for genuinely context-free foundation operations rather than ordinary
+# requests in a healthy long-lived deployment generation.
 RUNNER_CONTROL_OPERATION_CEILING = 20_000
 RUNNER_STORAGE_OPERATION_CEILING = 20_000
 STORAGE_OPERATION_RESERVE_USD = 5.0
@@ -631,6 +630,18 @@ def bind_operation_context(env, state):
         "parent_invocation": state.get("parent_invocation"),
         "lineage_root": request.get("lineage_root_invocation", state["invocation"]),
     }
+
+
+def begin_admission_operation_context(env):
+    """Bind preflight Azure calls to one new, durably bounded attempt."""
+    invocation = new_invocation()
+    env["operation_context"] = {
+        "invocation": invocation,
+        "fence": "sha256:" + sha256_bytes(os.urandom(32)),
+        "parent_invocation": None,
+        "lineage_root": invocation,
+    }
+    return invocation
 
 
 def operation_category(args):

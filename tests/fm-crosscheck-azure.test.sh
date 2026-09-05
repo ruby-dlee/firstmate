@@ -5805,7 +5805,29 @@ PY
   pass "two fresh Pi stages reuse bounded exact source excerpts without sharing verdict authority"
 }
 
+admission_attempt_binding_unit() {
+  python3 - "$ADAPTER" <<'PY' || fail "Crosscheck preflight did not bind a bounded operation attempt"
+import importlib.util, sys, types
+spec=importlib.util.spec_from_file_location("adapter",sys.argv[1]); adapter=importlib.util.module_from_spec(spec); spec.loader.exec_module(adapter)
+calls=[]
+class RunnerError(Exception): pass
+runner=types.SimpleNamespace(
+    RunnerError=RunnerError,
+    environment=lambda: {"fixture": True},
+    begin_admission_operation_context=lambda env: calls.append(("begin",env)),
+    scope_gate=lambda env: calls.append(("scope",env)),
+    foundation_gate=lambda env: calls.append(("foundation",env)),
+    budget_gate=lambda env,limits: calls.append(("budget",env,limits)),
+)
+adapter.load_runner=lambda:runner
+assert adapter.verify_scope_and_foundation({"reviewer_sku":"Standard_D4as_v6"}) is runner
+assert [row[0] for row in calls]==["begin","scope","foundation","budget"],calls
+PY
+  pass "Crosscheck binds its operation attempt before any Azure preflight call"
+}
+
 python3 "$ROOT/tests/fm-crosscheck-pi-transport.py" "$ROOT" || fail "Pi inactivity transport or diagnostics regression"
+admission_attempt_binding_unit
 pi_review_handoff_unit
 shared_host_contract_unit
 parameter_contract_unit

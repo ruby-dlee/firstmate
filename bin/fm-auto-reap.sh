@@ -236,10 +236,10 @@ crosscheck_only_identity() {  # <meta> <task>
     refuse "Crosscheck-only task metadata belongs to a different task"
     return 1
   }
-  [ "$crosscheck_pr" = "$pr" ] && parse_pr_url "$pr" || {
+  if [ "$crosscheck_pr" != "$pr" ] || ! parse_pr_url "$pr"; then
     refuse "Crosscheck-only task metadata has mismatched or invalid PR identity"
     return 1
-  }
+  fi
   [ "${#head}" -eq 40 ] || {
     refuse "Crosscheck-only task metadata has invalid exact head identity"
     return 1

@@ -3,6 +3,10 @@
 
 `fm-pr-check.sh` owns the public registration surface.
 This helper persists the latest requested exact head, keeps one coordinator per task, and runs Crosscheck outside the caller.
+Its internal `retire` command cancels the exact generation, proves the
+coordinator and Crosscheck operation inactive, and removes only the disposable
+coordinator records while the caller holds the task's PR-registration retirement
+fence.
 Coordinator and operation locks are task-local, while the existing Azure lane and cost admission remain the spending authority.
 """
 
@@ -967,7 +971,12 @@ def process_group_is_active(process_group: int) -> bool:
     return False
 
 
-def cancel(task_id: str, generation: str) -> int:
+def cancel(
+    task_id: str,
+    generation: str,
+    expected_url: Optional[str] = None,
+    expected_head: Optional[str] = None,
+) -> int:
     """Stop one exact task generation's detached coordinator and process group."""
     if ID_RE.fullmatch(task_id) is None:
         fail(f"invalid task id: {task_id!r}")
@@ -977,12 +986,21 @@ def cancel(task_id: str, generation: str) -> int:
         or any(character in generation for character in "\0\r\n")
     ):
         fail("invalid task generation identity")
+    if (expected_url is None) != (expected_head is None):
+        fail("expected Crosscheck PR and head identity must be supplied together")
+    if expected_url is not None and expected_head is not None:
+        validate_identity(task_id, expected_url, expected_head, generation)
     _root, _home, state = runtime_paths()
     paths = task_paths(state, task_id)
     with task_handoff(paths):
         request = load_json(paths["request"], REQUEST_SCHEMA)
         record = load_json(paths["state"], SCHEMA)
         if request is None and record is None:
+            if (
+                paths["coordinator_lock"].exists()
+                or paths["coordinator_lock"].is_symlink()
+            ) and lock_is_active(paths["coordinator_lock"]):
+                fail("active Crosscheck coordinator has no exact identity state")
             print(f"crosscheck autostart: no coordinator state for {task_id}")
             return 0
         for label, value in (("request", request), ("state", record)):
@@ -1000,6 +1018,10 @@ def cancel(task_id: str, generation: str) -> int:
             validate_identity(stored_task, stored_url, stored_head, stored_generation)
             if stored_task != task_id or stored_generation != generation:
                 fail(f"Crosscheck autostart {label} belongs to a different task generation")
+            if expected_url is not None and (
+                stored_url != expected_url or stored_head != expected_head
+            ):
+                fail(f"Crosscheck autostart {label} belongs to a different exact PR identity")
         if not lock_is_active(paths["coordinator_lock"]):
             print(f"crosscheck autostart: coordinator already inactive for {task_id}")
             return 0
@@ -1066,6 +1088,10 @@ def cancel(task_id: str, generation: str) -> int:
         if not isinstance(latest_url, str) or not isinstance(latest_head, str):
             fail("Crosscheck coordinator state lost its exact PR identity after cancellation")
         validate_identity(task_id, latest_url, latest_head, generation)
+        if expected_url is not None and (
+            latest_url != expected_url or latest_head != expected_head
+        ):
+            fail("Crosscheck coordinator changed exact PR identity during cancellation")
         write_state(
             paths["state"],
             task_id,
@@ -1082,6 +1108,81 @@ def cancel(task_id: str, generation: str) -> int:
         return 0
 
 
+def retire(
+    task_id: str,
+    generation: str,
+    expected_url: Optional[str] = None,
+    expected_head: Optional[str] = None,
+) -> int:
+    """Cancel and remove one task's disposable Crosscheck coordinator state."""
+    if generation:
+        cancel(task_id, generation, expected_url, expected_head)
+    else:
+        if ID_RE.fullmatch(task_id) is None:
+            fail(f"invalid task id: {task_id!r}")
+        if expected_url is not None or expected_head is not None:
+            fail("expected Crosscheck identity requires an exact task generation")
+
+    _root, _home, state = runtime_paths()
+    paths = task_paths(state, task_id)
+    disposable = (
+        paths["request"],
+        paths["state"],
+        paths["log"],
+        paths["coordinator_lock"],
+    )
+    with task_handoff(paths):
+        request = load_json(paths["request"], REQUEST_SCHEMA)
+        record = load_json(paths["state"], SCHEMA)
+        if not generation and (request is not None or record is not None):
+            fail("Crosscheck coordinator state has no exact task generation")
+        coordinator_lock_present = (
+            paths["coordinator_lock"].exists()
+            or paths["coordinator_lock"].is_symlink()
+        )
+        if coordinator_lock_present and lock_is_active(paths["coordinator_lock"]):
+            fail("Crosscheck coordinator remained active at retirement")
+        crosscheck_lock_present = (
+            paths["crosscheck_lock"].exists()
+            or paths["crosscheck_lock"].is_symlink()
+        )
+        if crosscheck_lock_present and lock_is_active(paths["crosscheck_lock"]):
+            fail("Crosscheck operation remained active at coordinator retirement")
+        for path in disposable:
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                fail(
+                    "cannot inspect disposable Crosscheck coordinator state at "
+                    f"{path}: {exc}"
+                )
+            if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+                fail(f"unsafe disposable Crosscheck coordinator state at {path}")
+        for path in disposable:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                fail(
+                    "cannot remove disposable Crosscheck coordinator state at "
+                    f"{path}: {exc}"
+                )
+    try:
+        paths["handoff_lock"].unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        fail(
+            "cannot remove Crosscheck coordinator handoff state at "
+            f"{paths['handoff_lock']}: {exc}"
+        )
+    print(f"crosscheck autostart: retired coordinator state for {task_id}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1092,9 +1193,12 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("pr_url")
         command.add_argument("head_sha")
         command.add_argument("generation_id")
-    cancel_parser = subparsers.add_parser("cancel")
-    cancel_parser.add_argument("task_id")
-    cancel_parser.add_argument("generation_id")
+    for command_name in ("cancel", "retire"):
+        command_parser = subparsers.add_parser(command_name)
+        command_parser.add_argument("task_id")
+        command_parser.add_argument("generation_id")
+        command_parser.add_argument("--expected-pr")
+        command_parser.add_argument("--expected-head")
     worker_parser = subparsers.add_parser("worker")
     worker_parser.add_argument("lock_descriptor", type=int)
     worker_parser.add_argument("task_id")
@@ -1120,7 +1224,19 @@ def main() -> int:
                 args.generation_id,
             )
         if args.command == "cancel":
-            return cancel(args.task_id, args.generation_id)
+            return cancel(
+                args.task_id,
+                args.generation_id,
+                args.expected_pr,
+                args.expected_head,
+            )
+        if args.command == "retire":
+            return retire(
+                args.task_id,
+                args.generation_id,
+                args.expected_pr,
+                args.expected_head,
+            )
         return worker(args.lock_descriptor, args.task_id, args.attempt)
     except AutostartError as exc:
         print(

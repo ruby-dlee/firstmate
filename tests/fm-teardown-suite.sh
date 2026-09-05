@@ -1728,9 +1728,15 @@ test_teardown_fences_crosscheck_registration_through_state_removal() {
   cat > "$source/bin/fm-crosscheck-autostart.py" <<'SH'
 #!/usr/bin/env bash
 set -u
-[ "${1:-}" = cancel ] || exit 97
+[ "${1:-}" = retire ] || exit 97
+id=${2:?}
 touch "${FM_TEST_CANCEL_MARKER:?}"
 while [ ! -f "${FM_TEST_CANCEL_RELEASE:?}" ]; do sleep 0.02; done
+rm -f "${FM_STATE_OVERRIDE:?}/$id.crosscheck-autostart.request.json" \
+  "$FM_STATE_OVERRIDE/$id.crosscheck-autostart.json" \
+  "$FM_STATE_OVERRIDE/$id.crosscheck-autostart.log" \
+  "$FM_STATE_OVERRIDE/.$id.crosscheck-autostart-handoff.lock" \
+  "$FM_STATE_OVERRIDE/.$id.crosscheck-autostart.lock"
 SH
   cat > "$source/bin/fm-github-pr.py" <<'SH'
 #!/usr/bin/env bash
